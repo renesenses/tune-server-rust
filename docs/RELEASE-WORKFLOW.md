@@ -45,6 +45,26 @@ train. Ce train :
 Le tarball serveur attesté est embarqué dans chaque image OS. Le premier
 démarrage n'interroge ni `releases/latest`, ni une branche flottante.
 
+### Deux tags morts, à ne jamais republier
+
+**`v0.9.86` et `v0.9.87` existent, et aucun des deux n'a jamais été publié.**
+Les testeurs sont restés en 0.9.85 pendant toute cette période. Les tags sont
+**conservés à dessein** : ils portent la mémoire de deux pannes qui ont chacune
+laissé un garde-fou encore en service.
+
+| tag | mort de quoi | ce qui en est resté |
+|---|---|---|
+| `v0.9.86` | build Windows : le module d'appairage AirPlay 2 était compilé sans condition alors que ses six dépendances sont déclarées sous `[target.'cfg(unix)'.dependencies]` | `#[cfg(unix)]` sur `pub mod pairing;` (#1933). La même famille a bloqué la **v0.9.130** trois mois plus tard — voir #3116. |
+| `v0.9.87` | `apt-get` bloqué **six heures** sur un runner Ubuntu, jusqu'au plafond GitHub. Six jobs sur sept étaient verts, Windows compris : le code était bon, c'est l'infrastructure qui a lâché. `githubstatus.com` affichait « All Systems Operational ». | garde-fou apt (#1937) : 3 essais bornés, cache purgé entre deux, abandon en ~6 min avec un `::error::` qui nomme la cause. |
+
+⛔ **Ne jamais republier ces deux tags, ne jamais les supprimer.** Ils sont
+protégés par le gel `refs/tags/v*`, qui interdit création, modification **et**
+suppression, sans aucune dérogation.
+
+⚠️ **Si un job échoue sur `apt` : ce n'est probablement pas votre code.**
+Vérifiez si d'autres exécutions Ubuntu échouent au même endroit au même moment,
+et attendez la reprise plutôt que de relancer en boucle.
+
 ## 4. Promotion
 
 `Promote staged release` est le seul workflow qui déplace des canaux stables.

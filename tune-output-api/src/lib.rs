@@ -10,6 +10,7 @@
 //! `outputs::traits` so in-tree code is unaffected.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Version du contrat de capacités compris par ce binaire.
 pub const OUTPUT_CAPABILITIES_VERSION: u16 = 1;
@@ -353,6 +354,137 @@ pub struct OutputDspMetrics {
     pub eq_non_finite_samples: u64,
 }
 
+/// Famine de l'anneau, telle que le rappel audio temps réel l'a vécue (#3205).
+///
+/// « Famine » désigne ici une chose précise et une seule : le pilote a réclamé
+/// N échantillons au rappel, l'anneau en a rendu moins, et le manque a été
+/// comblé par des **zéros**. C'est un trou audible, et c'est le seul chiffre
+/// qui dise que l'audio a réellement sauté — quelle qu'en soit la cause :
+/// ordonnancement du noyau, réseau, décodage ou convolution.
+///
+/// ⚠️ **À ne pas confondre avec l'« underrun » ALSA** que cpal remonte en
+/// `StreamError` et que `make_stream_error_cb` laisse délibérément passer sans
+/// démonter le flux (« ALSA underruns are routine »). Celui-là décrit le
+/// PILOTE qui n'a pas été servi à temps par le processus ; il est routinier,
+/// il est remonté par une couche qui ne voit pas l'anneau, et il ne dit pas si
+/// des zéros sont partis vers le DAC. Additionner les deux produirait un
+/// nombre que plus rien ne permettrait d'interpréter — et c'est précisément ce
+/// nombre qui doit décider du sort du noyau `PREEMPT_RT` de Tune OS. Les deux
+/// vivent donc sous deux noms distincts et ne sont jamais cumulés.
+///
+/// Un compteur d'ÉVÉNEMENTS seul ne distingue pas un micro-trou d'une coupure
+/// d'une seconde, et un compteur brut ne se compare pas d'une machine à
+/// l'autre ; d'où les quatre champs : les deux premiers disent la gravité, les
+/// deux derniers donnent le dénominateur qui rend le taux calculable après une
+/// heure de lecture (`events` par heure, `missing_samples / served_samples`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputRingStarvation {
+    /// Rappels qui ont manqué de données depuis le démarrage du flux.
+    pub events: u64,
+    /// Échantillons entrelacés manquants, cumulés sur tous les événements.
+    pub missing_samples: u64,
+    /// Échantillons entrelacés réclamés par le pilote depuis le démarrage.
+    /// Dénominateur de `missing_samples`.
+    pub served_samples: u64,
+    /// Durée d'audio écoulée depuis le démarrage du flux, en millisecondes,
+    /// déduite de `served_samples` et de la cadence (taux × canaux).
+    ///
+    /// Déduite du COMPTE d'échantillons plutôt que d'une horloge : le rappel
+    /// audio est temps réel et n'a pas le droit de lire l'heure, et le temps
+    /// consommé par le pilote est de toute façon la seule base honnête pour un
+    /// taux d'événements par heure de lecture.
+    pub stream_ms: u64,
+}
+
+/// Les compteurs vivants derrière [`OutputRingStarvation`], partagés entre le
+/// rappel audio et le fil qui répond à `/api/v1/system/diagnostics`.
+///
+/// ⚠️ **Contrat temps réel.** [`record`](Self::record) est appelé DEPUIS le
+/// rappel du pilote. Il n'a le droit de rien allouer, de rien verrouiller et
+/// de rien journaliser : uniquement des atomiques en `Ordering::Relaxed`. Une
+/// seule ligne de log ici fabriquerait la famine qu'elle prétend mesurer. Le
+/// test `drains_temps_reel_ne_font_aucune_allocation` (outputs/local.rs) tient
+/// cette garde : il enveloppe les drains dans un allocateur instrumenté.
+///
+/// `Relaxed` suffit : ces compteurs ne publient aucune donnée, ils ne font que
+/// se compter eux-mêmes. Un lecteur peut voir deux champs d'instants
+/// légèrement différents ; sur un compteur d'incidents cumulé, c'est sans
+/// conséquence, et c'est le prix à ne pas payer dans le rappel.
+#[derive(Debug, Default)]
+pub struct RingStarvation {
+    /// Le flux a-t-il vraiment démarré ? Tant qu'un premier rappel n'a pas été
+    /// servi ENTIÈREMENT, rien n'est compté : au démarrage l'anneau est vide
+    /// par construction, et compter ce silence-là ferait passer chaque début
+    /// de piste pour un incident.
+    armed: AtomicBool,
+    events: AtomicU64,
+    missing_samples: AtomicU64,
+    served_samples: AtomicU64,
+    /// Échantillons entrelacés par seconde (taux × canaux). Posé hors du
+    /// rappel par [`begin_stream`](Self::begin_stream).
+    samples_per_second: AtomicU32,
+}
+
+impl RingStarvation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Armer un flux neuf : remet les compteurs à zéro et enregistre la
+    /// cadence. Appelé par le producteur, JAMAIS depuis le rappel.
+    pub fn begin_stream(&self, sample_rate: u32, channels: u16) {
+        self.armed.store(false, Ordering::Relaxed);
+        self.events.store(0, Ordering::Relaxed);
+        self.missing_samples.store(0, Ordering::Relaxed);
+        self.served_samples.store(0, Ordering::Relaxed);
+        self.samples_per_second.store(
+            sample_rate.saturating_mul(u32::from(channels)),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Comptabiliser UN rappel : `demande` = ce que le pilote a réclamé,
+    /// `rendu` = ce que l'anneau a effectivement fourni. La différence part en
+    /// zéros vers le DAC.
+    ///
+    /// Chemin temps réel — voir le contrat sur le type.
+    #[inline]
+    pub fn record(&self, demande: usize, rendu: usize) {
+        if !self.armed.load(Ordering::Relaxed) {
+            // Le flux n'a pas encore démarré : on n'arme qu'au premier rappel
+            // servi en entier, ce qui donne le même point de départ à tous les
+            // backends, qu'ils aient ou non leur propre garde de pré-remplissage.
+            if demande == 0 || rendu < demande {
+                return;
+            }
+            self.armed.store(true, Ordering::Relaxed);
+        }
+        self.served_samples
+            .fetch_add(demande as u64, Ordering::Relaxed);
+        if rendu < demande {
+            self.events.fetch_add(1, Ordering::Relaxed);
+            self.missing_samples
+                .fetch_add((demande - rendu) as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Relevé hors chemin temps réel.
+    pub fn snapshot(&self) -> OutputRingStarvation {
+        let served = self.served_samples.load(Ordering::Relaxed);
+        let cadence = u64::from(self.samples_per_second.load(Ordering::Relaxed));
+        OutputRingStarvation {
+            events: self.events.load(Ordering::Relaxed),
+            missing_samples: self.missing_samples.load(Ordering::Relaxed),
+            served_samples: served,
+            stream_ms: if cadence == 0 {
+                0
+            } else {
+                served.saturating_mul(1000) / cadence
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputSampleTransport {
@@ -624,11 +756,18 @@ pub trait OutputTarget: Send + Sync {
     ///
     /// Push-based outputs do their work on a background thread: by the time
     /// the device refuses to open, `play_url()` has long since returned `Ok`.
-    /// Without a channel like this one the failure stays invisible until the
-    /// poller's stall heuristics give up — roughly 73 seconds later — and
-    /// meanwhile the UI shows a track advancing in total silence (Yacine,
-    /// 8 Aug 2026: a DAC his account had no permission to open, and an hour
-    /// spent looking for the cause because nothing said so).
+    /// Without a channel like this one the failure stays invisible while the
+    /// UI shows a track advancing in total silence (Yacine, 8 Aug 2026: a DAC
+    /// his account had no permission to open, and an hour spent looking for
+    /// the cause because nothing said so).
+    ///
+    /// This doc used to promise a safety net that does not exist for a local
+    /// output: "the poller's stall heuristics give up — roughly 73 seconds
+    /// later". Measured on #3108: the frozen-position watchdog
+    /// (`dlna_playing_stall_eligible`) is gated on `output_type == "dlna"`, so
+    /// a local zone whose position stops advancing is caught by NOTHING and
+    /// stays "playing" forever. This channel is not a shortcut to a slower
+    /// path — for a local output it is the ONLY path.
     ///
     /// The message is user-facing and returned **once**: the implementation
     /// clears it, so the caller owns it and no stale error can kill the next
@@ -680,6 +819,14 @@ pub trait OutputTarget: Send + Sync {
 
     /// Compteurs DSP de la piste courante, quand la sortie peut les observer.
     fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
+        None
+    }
+    /// Famine de l'anneau observée par le rappel temps réel de cette sortie
+    /// (#3205), ou `None` quand la sortie ne rend pas l'audio elle-même — un
+    /// renderer réseau reçoit un flux déjà encodé et n'a aucun anneau à
+    /// affamer. Défaut `None`, donc une sortie hors-arbre existante compile et
+    /// se comporte exactement comme avant.
+    fn ring_starvation(&self) -> Option<OutputRingStarvation> {
         None
     }
 }

@@ -845,6 +845,17 @@ async fn play_radio(
 
     repo.record_play(id).ok();
 
+    // #3164 — meme regle que les charges utiles de zone : cette reponse rendait
+    // `PlayResult::stream_url`, rempli pour TOUTES les zones, a un client web
+    // qui n'a le droit de l'ouvrir que sur une zone navigateur.
+    let output_type = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    let stream_url = stream_url
+        .filter(|_| crate::routes::zones::zone_recoit_l_adresse_du_flux(output_type.as_deref()));
+
     let zone_state = state.playback.get_state(zone_id).await;
     Json(json!({
         "zone_id": zone_id,
@@ -1102,24 +1113,136 @@ async fn export_radios_m3u(State(state): State<AppState>) -> impl IntoResponse {
     (axum::http::StatusCode::OK, headers, m3u).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Import en masse : les deux dernières portes, et ce qu'elles disent tout haut
+// ---------------------------------------------------------------------------
+
+/// Au plus tant d'entrées écartées sont NOMMÉES dans le compte rendu.
+///
+/// Un fichier M3U trouvé sur Internet peut en compter des centaines : les
+/// citer toutes ferait une réponse illisible. Le décompte `rejected`, lui,
+/// reste exact — c'est la liste qui est tronquée, jamais le compte, et
+/// `rejected_truncated` le dit.
+const REJETS_NOMMES_AU_PLUS: usize = 50;
+
+/// Ce qu'un import a fait, et surtout ce qu'il a refusé de faire.
+///
+/// Trois seaux DISJOINTS dont la somme vaut le nombre d'entrées lues :
+///
+/// * `imported` — entrées écrites en base ;
+/// * `skipped` — hors sujet : une playlist porte légitimement des chemins de
+///   fichiers locaux, qui ne sont pas des radios ratées ;
+/// * `rejected` — des radios qui VOULAIENT entrer et ne le pouvaient pas.
+///
+/// Le troisième seau est tout le correctif. Avant lui, `POST /radios/import`
+/// ne rendait qu'un `imported`, et l'import M3U rangeait l'adresse de Tades
+/// dans un `skipped` anonyme doublé d'un `debug!` — personne n'ouvre le
+/// journal d'un serveur audio. Chaque rejet est donc nommé : son rang, son
+/// nom, l'adresse fautive, le code stable et le message traduit (#2097).
+#[derive(Default)]
+struct BilanImport {
+    imported: i64,
+    skipped: i64,
+    rejected: i64,
+    nommes: Vec<Value>,
+}
+
+impl BilanImport {
+    fn rejeter(&mut self, index: usize, nom: &str, url: &str, code: &str, message: String) {
+        self.rejected += 1;
+        if self.nommes.len() < REJETS_NOMMES_AU_PLUS {
+            self.nommes.push(json!({
+                "index": index,
+                "name": nom,
+                "url": url,
+                "code": code,
+                "message": message,
+            }));
+        }
+    }
+
+    /// Le compte rendu, et le code qui l'accompagne.
+    ///
+    /// **201 dès qu'une seule station est entrée.** Refuser en bloc un fichier
+    /// de deux cents lignes parce que trois sont fautives rendrait l'import
+    /// inutilisable sur une playlist trouvée sur Internet — et l'utilisateur
+    /// n'a aucun moyen de réparer un fichier qu'il n'a pas écrit. Les bonnes
+    /// entrent, les autres sont nommées.
+    ///
+    /// **400 quand RIEN n'est entré alors que quelque chose a été refusé.**
+    /// C'est le cas d'une station unique poussée par l'API — exactement la
+    /// situation de Tades s'il était passé par cette route. Un 201 y dirait
+    /// « créé » sur une base inchangée, ce qui est le défaut d'origine sous un
+    /// autre nom.
+    fn reponse(self, total: usize, lang: &str) -> Response {
+        let tronquee = (self.nommes.len() as i64) < self.rejected;
+        let code = if self.imported == 0 && self.rejected > 0 {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::CREATED
+        };
+        let mut corps = json!({
+            "imported": self.imported,
+            "skipped": self.skipped,
+            "rejected": self.rejected,
+            "total": total,
+            "rejected_entries": self.nommes,
+            "rejected_truncated": tronquee,
+        });
+        if self.rejected > 0 {
+            corps["message"] = json!(
+                crate::i18n::t(lang, "radio.import.refusees")
+                    .replace("{refusees}", &self.rejected.to_string())
+                    .replace("{total}", &total.to_string())
+            );
+        }
+        (code, Json(corps)).into_response()
+    }
+}
+
+/// Le code porté par un rejet dû à la BASE et non à l'adresse : la ligne était
+/// lisible, l'écriture a échoué (doublon, base en lecture seule…).
+const CODE_ECHEC_ECRITURE: &str = "radio_import_echec_ecriture";
+
 #[derive(Deserialize)]
 struct ImportRadiosBody {
     stations: Vec<CreateRadio>,
 }
 
 async fn import_radios(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(body): Json<ImportRadiosBody>,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let mut imported = 0i64;
-    for s in &body.stations {
+    let mut bilan = BilanImport::default();
+    for (rang, s) in body.stations.iter().enumerate() {
+        let index = rang + 1;
+        // Quatrième porte d'entrée, même serrure que la saisie unitaire : une
+        // adresse impossible arrivée par un import de masse produit la même
+        // station muette qu'une adresse tapée à la main (#2097). Elle est
+        // écartée SEULE — les autres entrent.
+        let url = match valider_url_flux(&s.url) {
+            Ok(url) => url,
+            Err(probleme) => {
+                bilan.rejeter(
+                    index,
+                    &s.name,
+                    &s.url,
+                    probleme.code(),
+                    probleme.message(&lang),
+                );
+                continue;
+            }
+        };
+        let logo = s.logo_url.clone().or_else(|| favicon_from_url(&url));
         let station = RadioStation {
             id: None,
             name: s.name.clone(),
-            url: s.url.clone(),
+            url,
             homepage: s.homepage.clone(),
-            logo_url: s.logo_url.clone().or_else(|| favicon_from_url(&s.url)),
+            logo_url: logo,
             country: s.country.clone(),
             language: s.language.clone(),
             genre: s.genre.clone(),
@@ -1129,31 +1252,75 @@ async fn import_radios(
             last_played: None,
             play_count: 0,
         };
-        if repo.create(&station).is_ok() {
-            imported += 1;
+        match repo.create(&station) {
+            Ok(_) => bilan.imported += 1,
+            Err(e) => bilan.rejeter(index, &s.name, &station.url, CODE_ECHEC_ECRITURE, e),
         }
     }
-    (StatusCode::CREATED, Json(json!({ "imported": imported }))).into_response()
+    tracing::info!(
+        imported = bilan.imported,
+        rejected = bilan.rejected,
+        total = body.stations.len(),
+        "radio_import_complete"
+    );
+    bilan.reponse(body.stations.len(), &lang)
 }
 
 async fn import_radios_m3u(
+    headers: HeaderMap,
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let entries = tune_core::library::m3u_parser::parse_m3u_content(&body, true);
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let mut imported = 0i64;
-    let mut skipped = 0i64;
-    for entry in &entries {
-        if !entry.is_url {
-            skipped += 1;
-            continue;
-        }
+    let mut bilan = BilanImport::default();
+    for (rang, entry) in entries.iter().enumerate() {
+        let index = rang + 1;
         let name = entry
             .title
             .clone()
             .or_else(|| entry.extra_attrs.get("tvg-name").cloned())
             .unwrap_or_else(|| entry.path.clone());
+        // Cinquième et dernière porte. Le tri n'est plus fait par le drapeau
+        // `is_url` du classeur de playlist mais par le validateur lui-même,
+        // parce que ce drapeau se trompait dans les deux sens :
+        //
+        // * `http;//…` — le cas de Tades — ne commence pas par « http:// »,
+        //   donc `is_url` valait `false` et la ligne tombait dans un `skipped`
+        //   muet : l'import ne disait rien du tout ;
+        // * `mms://…` et `rtsp://…` faisaient au contraire `is_url = true` et
+        //   étaient IMPORTÉS, alors qu'aucun chemin de lecture ne sait les
+        //   ouvrir — une station de plus qui ne joue jamais.
+        let url = match valider_url_flux(&entry.path) {
+            Ok(url) => url,
+            Err(probleme) => {
+                // Une playlist porte légitimement des chemins de fichiers
+                // locaux : `/musique/piste.flac` n'est pas une radio ratée,
+                // c'est une ligne hors sujet. La nommer noierait le compte
+                // rendu sous des centaines de faux reproches — elle reste dans
+                // `skipped`, comme avant.
+                //
+                // Deux formes font exception, et ce sont les seules qui
+                // comptent : ce que le classeur a reconnu comme une adresse, et
+                // le SÉPARATEUR faux, que le validateur sait distinguer d'un
+                // chemin local justement parce qu'il y voit un schéma suivi
+                // d'une mauvaise ponctuation. Toutes deux voulaient être des
+                // radios ; elles sont donc nommées.
+                if entry.is_url || matches!(probleme, ProblemeUrlFlux::SeparateurFaux { .. }) {
+                    bilan.rejeter(
+                        index,
+                        &name,
+                        &entry.path,
+                        probleme.code(),
+                        probleme.message(&lang),
+                    );
+                } else {
+                    bilan.skipped += 1;
+                }
+                continue;
+            }
+        };
         // Playlists use several logo attribute spellings (tvg-logo / url-logo /
         // logo); PLS carries none. Fall back to the stream host favicon so every
         // imported radio shows art (Bilou: "pourquoi ne pas les reprendre").
@@ -1163,12 +1330,12 @@ async fn import_radios_m3u(
             .or_else(|| entry.extra_attrs.get("url-logo"))
             .or_else(|| entry.extra_attrs.get("logo"))
             .cloned()
-            .or_else(|| favicon_from_url(&entry.path));
+            .or_else(|| favicon_from_url(&url));
         let group = entry.extra_attrs.get("group-title").cloned();
         let station = RadioStation {
             id: None,
-            name,
-            url: entry.path.clone(),
+            name: name.clone(),
+            url,
             homepage: None,
             logo_url: logo,
             country: None,
@@ -1181,24 +1348,23 @@ async fn import_radios_m3u(
             play_count: 0,
         };
         match repo.create(&station) {
-            Ok(_) => imported += 1,
+            Ok(_) => bilan.imported += 1,
             Err(e) => {
                 tracing::debug!(url = %entry.path, error = %e, "radio_import_m3u_entry_failed");
-                skipped += 1;
+                // Et pas seulement dans le journal : l'échec d'écriture est
+                // rendu à l'appelant comme les autres rejets.
+                bilan.rejeter(index, &name, &station.url, CODE_ECHEC_ECRITURE, e);
             }
         }
     }
     tracing::info!(
-        imported,
-        skipped,
+        imported = bilan.imported,
+        skipped = bilan.skipped,
+        rejected = bilan.rejected,
         total = entries.len(),
         "radio_import_m3u_complete"
     );
-    (
-        StatusCode::CREATED,
-        Json(json!({ "imported": imported, "skipped": skipped, "total": entries.len() })),
-    )
-        .into_response()
+    bilan.reponse(entries.len(), &lang)
 }
 
 // ---------------------------------------------------------------------------

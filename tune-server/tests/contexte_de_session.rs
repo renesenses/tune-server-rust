@@ -24,6 +24,28 @@
 //! il survit aux avances automatiques — la deuxième piste d'un album reste
 //! une écoute « album » — alors que `current_track` change à chaque piste.
 //!
+//! ## Un chemin corrigé, l'autre nu
+//!
+//! Nommer l'album ne suffit pas à le ROUVRIR. `session_context_id` est une
+//! chaîne nue, et les deux gestes que `contexte_de_lecture` reconnaît la
+//! remplissent depuis des espaces de noms différents :
+//!
+//! - album de BIBLIOTHÈQUE → `album_id`, un `i64` de la table `albums` ;
+//! - album de SERVICE → `streaming_album_id`, l'identifiant Qobuz/Tidal.
+//!
+//! Le chemin local marchait donc tout seul : la bibliothèque est l'espace de
+//! noms implicite, `"42"` s'ouvre par `GET /albums/42`. Le chemin Qobuz,
+//! lui, restait nu — `("album", "0060254735822")` ne dit pas chez QUI cet
+//! identifiant a un sens, et `GET /streaming/{service}/albums/{id}` réclame
+//! ce `{service}`. Le client web ne pouvait que le DEVINER, en supposant que
+//! le service ouvert à l'écran (`activeStreamingService`) est celui qui joue
+//! — la même devinette que #1284 a condamnée pour l'album (« Entreat (2010) »
+//! ouvrait la page de The Cure).
+//!
+//! `session_context_source` la supprime : le service part avec l'identifiant,
+//! et il vaut `"local"` — le mot que `current_track.source` emploie déjà —
+//! quand le geste portait sur la bibliothèque. Le triplet se suffit.
+//!
 //! ⚠️ `tune-server` porte `autotests = false` — ce fichier n'est compilé que
 //! parce qu'il est déclaré dans l'agrégateur `server_contracts.rs`. Voir
 //! `tests_orphelins.rs`.
@@ -173,12 +195,20 @@ async fn sans_geste_de_lecture_le_contexte_est_nul_et_non_absent() {
             "{chemin} : le champ doit être présent même vide — {body}"
         );
         assert!(
+            obj.contains_key("session_context_source"),
+            "{chemin} : le champ doit être présent même vide — {body}"
+        );
+        assert!(
             z["session_context_type"].is_null(),
             "{chemin} : sans geste, la nature doit être nulle — {body}"
         );
         assert!(
             z["session_context_id"].is_null(),
             "{chemin} : sans geste, l'identifiant doit être nul — {body}"
+        );
+        assert!(
+            z["session_context_source"].is_null(),
+            "{chemin} : sans geste, le service doit être nul — {body}"
         );
     }
 }
@@ -204,5 +234,114 @@ async fn temoin_les_champs_historiques_de_zone_sont_intacts() {
                 "{chemin} : le champ historique `{champ}` a disparu — {body}"
             );
         }
+    }
+}
+
+/// LE fait de base de #1361 : l'album Qobuz en cours est ROUVRABLE.
+///
+/// Ce que Cyrille Moutia demande n'est pas « nommer l'album », c'est « y
+/// revenir ». Y revenir veut dire construire une adresse, et l'adresse d'un
+/// album de service s'écrit `GET /streaming/{service}/albums/{id}` : il faut
+/// les DEUX. La zone rendait `("album", "0060254735822")` et rien d'autre —
+/// un identifiant sans espace de noms, donc pas une adresse.
+///
+/// Le client ne pouvait combler le trou qu'en supposant que le service
+/// affiché à l'écran est celui qui joue. C'est faux dès qu'on regarde Tidal
+/// en écoutant Qobuz, et c'est exactement la classe de devinette que #1284 a
+/// condamnée.
+#[tokio::test]
+async fn chaque_surface_de_zone_nomme_le_service_qui_ouvre_l_album() {
+    let app = app();
+    let id = zone(&app).await;
+    demander_l_album(&app, id).await;
+    for chemin in surfaces(id) {
+        let (status, body) = get(&app, &chemin).await;
+        assert_eq!(status, StatusCode::OK, "{chemin} : {body}");
+        let z = la_zone(&body);
+        assert_eq!(
+            z["session_context_source"].as_str(),
+            Some("qobuz"),
+            "{chemin} : sans le service, l'identifiant n'ouvre rien — {body}"
+        );
+    }
+}
+
+/// Témoin vert de l'autre côté : le chemin LOCAL, qui marchait déjà, marche
+/// toujours — et il se nomme.
+///
+/// Le geste porte `album_id`, un `i64` de la table `albums`. Le contexte doit
+/// donc rendre cet entier tel quel, et dire `"local"` — le mot que
+/// `current_track.source` emploie pour une piste de bibliothèque. Sans ce
+/// témoin, écrire `"qobuz"` partout serait vert au test précédent et enverrait
+/// l'album local sur une route de streaming.
+#[tokio::test]
+async fn temoin_l_album_local_dit_local_et_garde_son_entier() {
+    let app = app();
+    let id = zone(&app).await;
+    let (status, _) = post(
+        &app,
+        &format!("/api/v1/zones/{id}/play"),
+        json!({ "album_id": 7 }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "la route de lecture doit exister"
+    );
+    for chemin in surfaces(id) {
+        let (status, body) = get(&app, &chemin).await;
+        assert_eq!(status, StatusCode::OK, "{chemin} : {body}");
+        let z = la_zone(&body);
+        assert_eq!(
+            z["session_context_type"].as_str(),
+            Some("album"),
+            "{chemin} : {body}"
+        );
+        assert_eq!(
+            z["session_context_id"].as_str(),
+            Some("7"),
+            "{chemin} : l'identifiant de bibliothèque a bougé — {body}"
+        );
+        assert_eq!(
+            z["session_context_source"].as_str(),
+            Some("local"),
+            "{chemin} : un album de bibliothèque n'est chez aucun service — {body}"
+        );
+    }
+}
+
+/// Un geste de lecture qui ne se laisse pas trancher n'invente pas de service.
+///
+/// Une liste de `track_ids` nue rend déjà `(None, None)` : le service doit
+/// suivre. Écrire `"local"` ici dirait « bibliothèque » là où le serveur ne
+/// sait rien, et le raccourci s'armerait sur du vide.
+#[tokio::test]
+async fn sans_nature_reconnue_le_service_reste_nul() {
+    let app = app();
+    let id = zone(&app).await;
+    let (status, _) = post(
+        &app,
+        &format!("/api/v1/zones/{id}/play"),
+        json!({ "track_ids": [1, 2, 3] }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "la route de lecture doit exister"
+    );
+    for chemin in surfaces(id) {
+        let (status, body) = get(&app, &chemin).await;
+        assert_eq!(status, StatusCode::OK, "{chemin} : {body}");
+        let z = la_zone(&body);
+        assert!(
+            z["session_context_type"].is_null(),
+            "{chemin} : une intention devinée est pire qu'une absence — {body}"
+        );
+        assert!(
+            z["session_context_source"].is_null(),
+            "{chemin} : sans nature, pas de service — {body}"
+        );
     }
 }

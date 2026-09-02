@@ -150,3 +150,31 @@ path = "tests/panne_sql_journalisee.rs"
 [[test]]
 name = "cles_developpeur_hors_journal"
 path = "tests/cles_developpeur_hors_journal.rs"
+
+# Meme raison, mot pour mot : abonne `tracing` GLOBAL, donc un binaire a lui
+# seul et un seul essai dedans. Celui-ci compte les lignes qu'un sondeur
+# HQPlayer en panne coute au journal, et les tours de boucle qu'il fait sur
+# vingt-quatre heures (#2566).
+[[test]]
+name = "journal_sondage_hqplayer"
+path = "tests/journal_sondage_hqplayer.rs"
+# Les requêtes SQL de `tune-server` sur une VRAIE base PostgreSQL (#3123).
+# Cible à elle seule, derrière `required-features`, pour deux raisons : elle
+# monte un `AppState` sur le moteur PostgreSQL (impossible sans la feature), et
+# `test-postgres.yml` la lance seule, avec `TUNE_TEST_PG_URL` posée, sans
+# rejouer les 467 contrats SQLite de `server_contracts`.
+[[test]]
+name = "pg_routes_serveur"
+path = "tests/pg_routes_serveur.rs"
+required-features = ["postgres"]
+
+# Depuis #3039, la fenetre des ajouts recents est un parametre borne.
+[[test]]
+name = "ajouts_recents_fenetre"
+path = "tests/ajouts_recents_fenetre.rs"
+
+# Canal stable / beta : quelles versions `/update/check` a le droit de proposer
+# (#2266). Le defaut `auto` reproduit le comportement d'avant.
+[[test]]
+name = "canal_de_mise_a_jour"
+path = "tests/canal_de_mise_a_jour.rs"

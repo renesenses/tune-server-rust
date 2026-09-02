@@ -57,12 +57,12 @@
 //! ## Aucun réseau
 //!
 //! Le test n'ouvre aucune socket et ne parle à aucun appareil. Il appelle
-//! `JournalSondageRepos`, qui **est** le point d'émission du sondeur — pas une
+//! `JournalSondage`, qui **est** le point d'émission du sondeur — pas une
 //! copie —, et compte les lignes que `tracing` reçoit vraiment.
 
 use std::sync::{Arc, Mutex};
 
-use tune_core::poller::{ECHECS_SONDAGE_DETAILLES, JournalSondageRepos};
+use tune_core::poller::{ECHECS_SONDAGE_DETAILLES, JournalSondage};
 
 /// Le nombre d'échecs consécutifs relevé chez Dimitri.
 const ECHECS_DIMITRI: u32 = 79;
@@ -123,7 +123,7 @@ fn une_panne_durable_se_dit_quelques_fois_puis_se_recapitule() {
     // Il passe EN PREMIER, et il est vert des deux côtés de la contre-épreuve.
     // C'est le cas de l'écrasante majorité des zones : les rendre bavardes
     // serait une régression bien pire que le bruit qu'on retire.
-    let mut nominal = JournalSondageRepos::default();
+    let mut nominal = JournalSondage::default();
     for _ in 0..1_000 {
         nominal.succes(ZONE, APPAREIL);
     }
@@ -137,7 +137,7 @@ fn une_panne_durable_se_dit_quelques_fois_puis_se_recapitule() {
     //
     // Une zone dont l'appareil vient d'être éteint doit encore produire sa
     // ligne complète, avec l'erreur. Vert des deux côtés lui aussi.
-    let mut isole = JournalSondageRepos::default();
+    let mut isole = JournalSondage::default();
     isole.echec(ZONE, APPAREIL, &ERREUR, 2);
     let texte = capture.texte();
     assert_eq!(
@@ -163,7 +163,7 @@ fn une_panne_durable_se_dit_quelques_fois_puis_se_recapitule() {
 
     // ── La mesure : les 79 échecs de Dimitri ─────────────────────────────
     let repere = capture.texte().len();
-    let mut panne = JournalSondageRepos::default();
+    let mut panne = JournalSondage::default();
     for n in 1..=ECHECS_DIMITRI {
         // `skip_ticks` reproduit le recul réel : 2, 4, 8, 16, puis 32 saturé.
         let skip_ticks = 1u8 << n.min(5);
@@ -242,7 +242,7 @@ fn une_panne_durable_se_dit_quelques_fois_puis_se_recapitule() {
     // c'étaient ~870 lignes pour une SEULE zone, à comparer au quart de
     // fenêtre que l'export accorde à tout le module (#1974).
     let repere = capture.texte().len();
-    let mut nuit = JournalSondageRepos::default();
+    let mut nuit = JournalSondage::default();
     let echecs_nuit = (8 * 3600) / 33; // 872
     for _ in 0..echecs_nuit {
         nuit.echec(ZONE, APPAREIL, &ERREUR, 32);

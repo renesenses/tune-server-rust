@@ -55,13 +55,135 @@ impl ReleaseInfo {
     }
 }
 
+/// Le canal de mise à jour : ce que `/system/update/check` a le DROIT de
+/// proposer à ce serveur (#2266).
+///
+/// Le filtrage stable/bêta existait déjà, mais il n'était pas *pilotable* : il
+/// se déduisait de la version du binaire en cours d'exécution
+/// (`current_version.contains('-')`). Deux impasses en découlaient, toutes deux
+/// signalées par des testeurs :
+///
+/// * un testeur sur une release **stable** ne pouvait pas demander les RC —
+///   il fallait installer une RC à la main pour « entrer » sur le canal ;
+/// * un testeur qui avait pris **une RC cassée** ne pouvait plus en sortir :
+///   son binaire porte un suffixe, donc il reste sur le canal bêta et se voit
+///   proposer la RC suivante, indéfiniment. C'est le « aucun moyen de rester
+///   sur du stable » du ticket.
+///
+/// Le réglage est persisté sous la clé [`UpdateChannel::SETTING_KEY`] dans la
+/// table `settings`. **Son absence vaut [`UpdateChannel::Auto`]**, qui reproduit
+/// EXACTEMENT le comportement historique : un serveur qui n'a jamais touché à
+/// ce réglage se comporte comme avant, bit pour bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    /// Déduit du binaire en cours : un binaire à suffixe de préversion voit les
+    /// préversions, un binaire stable ne voit que le stable. Comportement
+    /// historique, et valeur par défaut.
+    #[default]
+    Auto,
+    /// Jamais de préversion, MÊME si le binaire en cours en est une. C'est la
+    /// sortie de secours d'un testeur coincé sur une RC.
+    Stable,
+    /// Les préversions sont proposées, même à un binaire stable.
+    Beta,
+}
+
+impl UpdateChannel {
+    /// Clé du réglage persisté. Une constante, pour que la route et le cœur ne
+    /// puissent pas diverger sur son orthographe.
+    pub const SETTING_KEY: &'static str = "update_channel";
+
+    /// Lecture tolérante d'une valeur stockée ou reçue. Rend `None` sur une
+    /// valeur inconnue — l'appelant décide alors s'il refuse (route) ou s'il
+    /// retombe sur `Auto` (lecture d'une base écrite par plus tard).
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "stable" => Some(Self::Stable),
+            "beta" => Some(Self::Beta),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+
+    /// Ce serveur a-t-il le droit d'installer une préversion ?
+    ///
+    /// C'est le SEUL endroit où `Auto` consulte la version du binaire ; le
+    /// reste du code ne connaît que la réponse.
+    pub fn allows_prerelease(self, current_version: &str) -> bool {
+        match self {
+            Self::Auto => current_version.contains('-'),
+            Self::Stable => false,
+            Self::Beta => true,
+        }
+    }
+
+    /// Le canal EFFECTIF, une fois `Auto` résolu contre le binaire en cours :
+    /// `"beta"` ou `"stable"`. C'est ce que l'écran doit montrer, parce que
+    /// « auto » ne dit pas à l'utilisateur ce qu'il va recevoir.
+    pub fn effective(self, current_version: &str) -> &'static str {
+        if self.allows_prerelease(current_version) {
+            "beta"
+        } else {
+            "stable"
+        }
+    }
+}
+
+/// Choisit, dans une liste de releases, la plus récente que ce binaire a le
+/// droit d'installer sur ce canal — ou `None` s'il est déjà à jour.
+///
+/// Extrait de [`UpdateChecker::check`] pour être éprouvable sans réseau : c'est
+/// la fonction de production que les tests du canal interrogent.
+pub fn select_release<'a>(
+    releases: &'a [serde_json::Value],
+    current_version: &str,
+    channel: UpdateChannel,
+) -> Option<&'a serde_json::Value> {
+    let allows_pre = channel.allows_prerelease(current_version);
+
+    let mut best: Option<&serde_json::Value> = None;
+    let mut best_version = current_version.to_string();
+    for rel in releases {
+        let is_pre = rel["prerelease"].as_bool().unwrap_or(false);
+        if is_pre && !allows_pre {
+            continue; // un canal stable ne voit jamais de préversion
+        }
+        let version = rel["tag_name"]
+            .as_str()
+            .unwrap_or("")
+            .trim_start_matches('v');
+        if version.is_empty() || !is_newer(version, &best_version) {
+            continue;
+        }
+        best_version = version.to_string();
+        best = Some(rel);
+    }
+    best
+}
+
 pub struct UpdateChecker {
     client: reqwest::Client,
     current_version: String,
+    channel: UpdateChannel,
 }
 
 impl UpdateChecker {
     pub fn new() -> Self {
+        Self::with_channel(UpdateChannel::default())
+    }
+
+    /// Le constructeur que les routes utilisent : le canal vient du réglage
+    /// persisté. `new()` reste `Auto`, c'est-à-dire le comportement d'avant.
+    pub fn with_channel(channel: UpdateChannel) -> Self {
         Self {
             client: crate::http::client::builder()
                 .timeout(Duration::from_secs(15))
@@ -69,7 +191,12 @@ impl UpdateChecker {
                 .build()
                 .unwrap(),
             current_version: crate::version().to_string(),
+            channel,
         }
+    }
+
+    pub fn channel(&self) -> UpdateChannel {
+        self.channel
     }
 
     pub async fn check(&self) -> Result<Option<ReleaseInfo>, String> {
@@ -82,31 +209,7 @@ impl UpdateChecker {
             }
         };
 
-        // Channel: a build whose own version carries a prerelease suffix
-        // (e.g. "0.9.0-rc2") is on the beta channel and may install prereleases;
-        // a stable build only ever sees stable (non-prerelease) releases.
-        let on_beta = self.current_version.contains('-');
-
-        // Pick the newest release the client is allowed to install.
-        let mut best: Option<serde_json::Value> = None;
-        let mut best_version = self.current_version.clone();
-        for rel in releases {
-            let is_pre = rel["prerelease"].as_bool().unwrap_or(false);
-            if is_pre && !on_beta {
-                continue; // stable clients never see prereleases
-            }
-            let version = rel["tag_name"]
-                .as_str()
-                .unwrap_or("")
-                .trim_start_matches('v');
-            if version.is_empty() || !is_newer(version, &best_version) {
-                continue;
-            }
-            best_version = version.to_string();
-            best = Some(rel);
-        }
-
-        let Some(data) = best else {
+        let Some(data) = select_release(&releases, &self.current_version, self.channel) else {
             return Ok(None);
         };
 
@@ -263,6 +366,101 @@ mod tests {
         // A genuinely higher version wins regardless of prerelease state.
         assert!(is_newer("0.9.1", "0.9.0-rc2"));
         assert!(is_newer("0.10.0-rc1", "0.9.0"));
+    }
+
+    fn rel(tag: &str, prerelease: bool) -> serde_json::Value {
+        serde_json::json!({ "tag_name": tag, "prerelease": prerelease })
+    }
+
+    /// Le catalogue servi par l'API : un stable et une préversion plus haute.
+    fn catalogue() -> Vec<serde_json::Value> {
+        vec![
+            rel("v0.9.130", false),
+            rel("v0.9.131-rc1", true),
+            rel("v0.9.129", false),
+        ]
+    }
+
+    fn choisi(current: &str, canal: UpdateChannel) -> Option<String> {
+        select_release(&catalogue(), current, canal)
+            .map(|r| r["tag_name"].as_str().unwrap_or("").to_string())
+    }
+
+    /// LE TÉMOIN. `Auto` est la valeur par défaut, donc celle d'un serveur qui
+    /// n'a jamais touché au réglage : il doit voir exactement ce qu'il voyait
+    /// avant #2266 — le stable pour un binaire stable, la préversion pour un
+    /// binaire de préversion.
+    #[test]
+    fn canal_auto_reproduit_le_comportement_historique() {
+        assert_eq!(UpdateChannel::default(), UpdateChannel::Auto);
+        assert_eq!(
+            choisi("0.9.129", UpdateChannel::Auto).as_deref(),
+            Some("v0.9.130"),
+            "binaire stable en auto : jamais de préversion"
+        );
+        assert_eq!(
+            choisi("0.9.130-rc1", UpdateChannel::Auto).as_deref(),
+            Some("v0.9.131-rc1"),
+            "binaire de préversion en auto : les préversions restent visibles"
+        );
+        assert!(
+            !UpdateChannel::Auto.allows_prerelease("0.9.129"),
+            "auto sur stable = stable"
+        );
+        assert!(
+            UpdateChannel::Auto.allows_prerelease("0.9.130-rc1"),
+            "auto sur rc = beta"
+        );
+    }
+
+    /// La moitié du ticket qui protège : un testeur COINCÉ sur une RC cassée
+    /// demande `stable` et cesse de se voir proposer des RC. Sans le réglage,
+    /// son binaire à suffixe le maintenait sur le canal bêta à vie.
+    #[test]
+    fn canal_stable_sort_un_binaire_de_preversion_du_canal_beta() {
+        assert_eq!(
+            choisi("0.9.130-rc1", UpdateChannel::Stable).as_deref(),
+            Some("v0.9.130"),
+            "stable forcé : la release finale, jamais la RC plus haute"
+        );
+        assert!(!UpdateChannel::Stable.allows_prerelease("0.9.130-rc1"));
+    }
+
+    /// L'autre moitié : un testeur sur du stable peut DEMANDER les RC sans
+    /// devoir en installer une à la main pour « entrer » sur le canal.
+    #[test]
+    fn canal_beta_ouvre_les_preversions_a_un_binaire_stable() {
+        assert_eq!(
+            choisi("0.9.129", UpdateChannel::Beta).as_deref(),
+            Some("v0.9.131-rc1")
+        );
+        assert!(UpdateChannel::Beta.allows_prerelease("0.9.129"));
+    }
+
+    /// Un canal ne fabrique pas de mise à jour : à jour reste à jour, et un
+    /// canal stable sur le dernier stable ne descend pas vers la RC.
+    #[test]
+    fn canal_ne_propose_jamais_une_version_plus_ancienne() {
+        assert_eq!(choisi("0.9.130", UpdateChannel::Stable), None);
+        assert_eq!(choisi("0.9.200", UpdateChannel::Beta), None);
+    }
+
+    #[test]
+    fn canal_aller_retour_texte() {
+        for c in [
+            UpdateChannel::Auto,
+            UpdateChannel::Stable,
+            UpdateChannel::Beta,
+        ] {
+            assert_eq!(UpdateChannel::parse(c.as_str()), Some(c));
+        }
+        assert_eq!(UpdateChannel::parse("  BETA "), Some(UpdateChannel::Beta));
+        assert_eq!(UpdateChannel::parse("nightly"), None);
+        assert_eq!(UpdateChannel::parse(""), None);
+        assert_eq!(UpdateChannel::Auto.effective("0.9.130-rc1"), "beta");
+        assert_eq!(UpdateChannel::Auto.effective("0.9.130"), "stable");
+        assert_eq!(UpdateChannel::Stable.effective("0.9.130-rc1"), "stable");
+        assert_eq!(UpdateChannel::Beta.effective("0.9.130"), "beta");
     }
 
     #[test]

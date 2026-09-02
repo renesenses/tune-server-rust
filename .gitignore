@@ -25,6 +25,13 @@ tune_server.db-shm
 tune_server.db-wal
 tune_server.db.bak.*
 
+# Rapport de scan écrit par le serveur — et par le test de bout en bout du
+# scan de démarrage — quand `TUNE_DB_PATH` n'est pas posé : il atterrit alors
+# dans le répertoire courant, c'est-à-dire la racine du dépôt. Même classe que
+# `tune_server.db` ci-dessus : un artefact d'exécution, jamais versionné.
+tune-scan-report.json
+*-scan-report.json
+
 # Client web : il n'appartient PAS à ce dépôt (#1690). Il est construit depuis
 # renesenses/tune-web-client (branche `main`, cf. CLAUDE.md) et livré comme
 # asset de release. Une copie commitée ici est un leurre crédible — bon nom,

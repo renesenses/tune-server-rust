@@ -1,4 +1,16 @@
 {
+  "premium.required": {
+    "fr": "« {feature} » nécessite Tune Premium.",
+    "en": "{feature} requires Tune Premium.",
+    "de": "„{feature}“ erfordert Tune Premium.",
+    "es": "«{feature}» requiere Tune Premium.",
+    "it": "«{feature}» richiede Tune Premium.",
+    "zh": "“{feature}”需要 Tune Premium。",
+    "ja": "「{feature}」には Tune Premium が必要です。",
+    "ko": "'{feature}'에는 Tune Premium이 필요합니다.",
+    "ro": "„{feature}” necesită Tune Premium.",
+    "sv": "”{feature}” kräver Tune Premium."
+  },
   "metafield.album_artist": {
     "fr": "Artiste de l'album",
     "en": "Album Artist",
@@ -1818,6 +1830,18 @@
     "ko": "스트림 주소에 공백이 들어 있습니다. 스트림 주소에는 공백이 없습니다. 붙여넣을 때 잘리지 않았는지 확인하세요.",
     "ro": "Adresa fluxului conține un spațiu, ceea ce nu se întâmplă niciodată la o adresă de flux. Verificați dacă nu a fost tăiată la lipire.",
     "sv": "Strömadressen innehåller ett mellanslag, vilket en strömadress aldrig gör. Kontrollera att den inte klipptes av vid inklistringen."
+  },
+  "radio.import.refusees": {
+    "fr": "{refusees} station(s) sur {total} n'ont pas \u00e9t\u00e9 import\u00e9es : leur adresse de flux ne peut pas \u00eatre ouverte. Chacune est list\u00e9e ci-dessous avec l'adresse fautive et ce qu'il faut y corriger.",
+    "en": "{refusees} of {total} stations were not imported: their stream address cannot be opened. Each one is listed below with the faulty address and what to fix in it.",
+    "de": "{refusees} von {total} Sendern wurden nicht importiert: Ihre Stream-Adresse l\u00e4sst sich nicht \u00f6ffnen. Jeder ist unten mit der fehlerhaften Adresse und dem n\u00f6tigen Korrekturhinweis aufgef\u00fchrt.",
+    "es": "{refusees} de {total} emisoras no se importaron: su direcci\u00f3n de flujo no se puede abrir. Cada una aparece abajo con la direcci\u00f3n err\u00f3nea y lo que hay que corregir.",
+    "it": "{refusees} stazioni su {total} non sono state importate: il loro indirizzo di flusso non pu\u00f2 essere aperto. Ciascuna \u00e8 elencata sotto con l'indirizzo errato e cosa correggere.",
+    "zh": "{total} \u4e2a\u7535\u53f0\u4e2d\u6709 {refusees} \u4e2a\u672a\u5bfc\u5165\uff1a\u5176\u6d41\u5730\u5740\u65e0\u6cd5\u6253\u5f00\u3002\u4e0b\u65b9\u9010\u4e00\u5217\u51fa\u4e86\u9519\u8bef\u5730\u5740\u53ca\u9700\u8981\u4fee\u6b63\u4e4b\u5904\u3002",
+    "ja": "{total} \u5c40\u4e2d {refusees} \u5c40\u304c\u30a4\u30f3\u30dd\u30fc\u30c8\u3055\u308c\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u30b9\u30c8\u30ea\u30fc\u30e0\u306e\u30a2\u30c9\u30ec\u30b9\u3092\u958b\u3051\u307e\u305b\u3093\u3002\u8aa4\u3063\u305f\u30a2\u30c9\u30ec\u30b9\u3068\u4fee\u6b63\u70b9\u3092\u4e0b\u306b\u4e00\u89a7\u3057\u3066\u3044\u307e\u3059\u3002",
+    "ko": "{total}\uac1c \ubc29\uc1a1\uad6d \uc911 {refusees}\uac1c\ub97c \uac00\uc838\uc624\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4. \uc2a4\ud2b8\ub9bc \uc8fc\uc18c\ub97c \uc5f4 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4. \uac01\uac01\uc758 \uc798\ubabb\ub41c \uc8fc\uc18c\uc640 \uace0\uccd0\uc57c \ud560 \ubd80\ubd84\uc744 \uc544\ub798\uc5d0 \uc801\uc5b4 \ub450\uc5c8\uc2b5\ub2c8\ub2e4.",
+    "ro": "{refusees} din {total} posturi nu au fost importate: adresa fluxului lor nu poate fi deschis\u0103. Fiecare este listat mai jos cu adresa gre\u0219it\u0103 \u0219i ce trebuie corectat.",
+    "sv": "{refusees} av {total} stationer importerades inte: deras str\u00f6madress g\u00e5r inte att \u00f6ppna. Var och en listas nedan med den felaktiga adressen och vad som m\u00e5ste r\u00e4ttas."
   },
   "podcasts.radiofrance.cleAbsente": {
     "fr": "La source Radio France nécessite une clé API. Renseignez le réglage « radiofrance_api_key » pour l'activer.",

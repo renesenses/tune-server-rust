@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::state::AppState;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::profile_repo::ProfileRepo;
+use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
 
 use super::query_multi::track_filter_from_raw;
@@ -76,6 +77,28 @@ fn apply_metadata_to_track(
     track.disc_subtitle = m.disc_subtitle.clone();
 }
 
+/// Recopie le Dynamic Range PAR PISTE sur des pistes sérialisées (#1388).
+///
+/// Le tag `DYNAMIC RANGE` est lu au scan et rangé dans
+/// `track_metadata['dr_track']` (#1806). Depuis #2809 il ressortait sur les
+/// pistes d'un album — et sur elles SEULES : la table des titres et la fiche
+/// d'une piste, qui affichent pourtant la même ligne de qualité, sortaient
+/// nues. C'est le trou que ce chemin ferme.
+///
+/// Même clé, même contrat que sur les pistes d'un album : `dynamic_range` est
+/// ABSENTE quand la piste n'a pas le tag — jamais `null`, jamais `0`, DR0
+/// étant la mesure d'un master saturé et non une absence.
+///
+/// Une seule requête indexée par page, et aucune du tout sur une page vide
+/// (`get_key_for_tracks` court-circuite sur une liste d'identifiants vide).
+fn joindre_dr_par_piste(state: &AppState, items: Vec<tune_core::db::models::Track>) -> Vec<Value> {
+    let track_ids: Vec<i64> = items.iter().filter_map(|t| t.id).collect();
+    let dr = TrackMetadataRepo::with_backend(state.backend.clone())
+        .get_key_for_tracks("dr_track", &track_ids)
+        .unwrap_or_default();
+    super::albums::attach_track_tags(items, &[("dynamic_range", &dr)])
+}
+
 #[derive(Deserialize)]
 pub(super) struct QuickFavQuery {
     profile_id: Option<i64>,
@@ -140,9 +163,12 @@ pub(super) async fn list_tracks(
     // que faisait `?favorite=1` avant #2168.
     if filter.is_active() {
         match repo.list_filtered(&filter, limit, offset) {
-            Ok((items, total)) => Ok(Json(
-                json!({"items": items, "total": total, "limit": limit, "offset": offset}),
-            )),
+            Ok((items, total)) => {
+                let items = joindre_dr_par_piste(&state, items);
+                Ok(Json(
+                    json!({"items": items, "total": total, "limit": limit, "offset": offset}),
+                ))
+            }
             Err(e) => {
                 tracing::error!(error = %e, "list_tracks_filtered_query_failed");
                 Ok(Json(
@@ -167,6 +193,7 @@ pub(super) async fn list_tracks(
                 Vec::new()
             }
         };
+        let items = joindre_dr_par_piste(&state, items);
         Ok(Json(
             json!({"items": items, "total": total, "limit": limit, "offset": offset}),
         ))
@@ -232,7 +259,16 @@ pub(super) async fn get_track(
 ) -> impl IntoResponse {
     let repo = TrackRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(track)) => Json(json!(track)).into_response(),
+        Ok(Some(track)) => {
+            // Dynamic Range par piste (#1388) : la fiche d'une piste rend le
+            // même champ que les pistes d'un album. Sans tag, la clé reste
+            // absente et la charge utile est celle d'avant, au bit près.
+            let v = joindre_dr_par_piste(&state, vec![track])
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            Json(v).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

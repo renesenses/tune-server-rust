@@ -1278,12 +1278,254 @@ mod tests {
         http_handle.abort();
     }
 
-    fn make_test_wav() -> Vec<u8> {
+    /// La contre-épreuve de bout en bout du #3163, sur un fait de base : **un
+    /// flux dont la longueur n'est pas un multiple de la taille de trame
+    /// aboutit, et le nombre d'octets réellement délivrés est celui attendu.**
+    ///
+    /// Steve Taylor (fil 1641, 0.9.130), endpoint OAAT + Allo DigiOne
+    /// Signature : deux fins de piste sur 7, la lecture s'arrête net alors que
+    /// la suivante est annoncée « gapless ready » depuis 18 s. Le journal donne
+    /// la chaîne complète — `PCM stream ended with 2 byte(s) outside a complete
+    /// 4-byte source frame`, puis `output_reported_failure_stopping_zone`, puis
+    /// `oaat: stop`, et **jamais** `oaat: gapless transition`.
+    ///
+    /// Le banc sert un corps WAV de 8 820 trames **plus 2 octets** avec un
+    /// `Content-Length` exact : le client voit une fin de corps propre, et
+    /// l'adaptateur se retrouve avec 2 octets orphelins — la situation
+    /// qu'`StreamInfo::wav_content_length()` fabriquait en annonçant
+    /// `durée_ms × débit / 1000` sans arrondi sur la trame.
+    ///
+    /// Deux propriétés, une par défaut :
+    ///
+    /// 1. **Un paquet `LAST_PACKET` arrive.** Avant le correctif, le `break` de
+    ///    la branche EOF sautait `extraire_payloads_fin_flux` : aucun paquet
+    ///    final n'était jamais émis, et l'endpoint restait pendu.
+    /// 2. **Le total des payloads vaut exactement 8 820 × 4 octets.** Les 2
+    ///    octets orphelins sont jetés — pas complétés par des zéros, ce qui
+    ///    inventerait un échantillon et donc un clic — et aucune trame complète
+    ///    n'est perdue au passage.
+    #[tokio::test]
+    async fn un_residu_de_fin_de_flux_ne_coupe_plus_la_piste_et_delivre_tout_l_audio() {
+        use oaat_core::format::AudioFormat as FormatOaat;
+        use oaat_core::wire::PacketFlags;
+
+        const TRAMES: usize = 8_820; // 200 ms en 44,1 kHz
+        const OCTETS_ATTENDUS: usize = TRAMES * 4;
+        const ORPHELINS: usize = 2; // le reliquat mesuré à 21:57:32
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_port = tcp.local_addr().unwrap().port();
+        let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let audio_port = audio_udp.local_addr().unwrap().port();
+        let clock_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let clock_port = clock_udp.local_addr().unwrap().port();
+
+        let audio_rx = tokio::spawn(async move {
+            let mut total = 0usize;
+            let mut dernier_vu = false;
+            let mut datagram = vec![0u8; 8192];
+            loop {
+                let Ok(Ok(n)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    audio_udp.recv(&mut datagram),
+                )
+                .await
+                else {
+                    break;
+                };
+                if n < AUDIO_HEADER_SIZE {
+                    continue;
+                }
+                let header_bytes: [u8; AUDIO_HEADER_SIZE] =
+                    datagram[..AUDIO_HEADER_SIZE].try_into().unwrap();
+                let Ok(header) = AudioPacketHeader::decode(&header_bytes) else {
+                    continue;
+                };
+                total += n - AUDIO_HEADER_SIZE;
+                if header.flags.contains(PacketFlags::LAST_PACKET) {
+                    dernier_vu = true;
+                    break;
+                }
+            }
+            (total, dernier_vu)
+        });
+
+        let endpoint_handle = tokio::spawn(async move {
+            let _clock = tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                loop {
+                    match clock_udp.recv_from(&mut buf).await {
+                        Ok((n, peer)) if n >= 28 => {
+                            let _ = clock_udp.send_to(&buf[..n], peer).await;
+                        }
+                        _ => break,
+                    }
+                }
+            });
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), tcp.accept()).await
+            else {
+                return;
+            };
+            let mut codec = FrameCodec::new();
+            let mut read_buf = [0u8; 8192];
+            let n = stream.read(&mut read_buf).await.unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            codec.feed(&read_buf[..n]);
+            if !matches!(codec.decode_next(), Ok(Some(Message::Hello(_)))) {
+                return;
+            }
+            let ack = Message::HelloAck(HelloAck {
+                protocol_version: oaat_core::PROTOCOL_VERSION,
+                endpoint_id: "mock-ep-3163".into(),
+                endpoint_name: "Mock DigiOneSig".into(),
+                capabilities: EndpointCapabilities {
+                    pcm_max_rate: 192000,
+                    pcm_max_bits: 32,
+                    dsd_max_rate: None,
+                    channels_max: 2,
+                    formats: vec![FormatOaat::PcmS16le, FormatOaat::PcmS24le],
+                    volume: None,
+                    gapless: true,
+                    seek: false,
+                },
+                audio_port,
+                clock_port,
+                buffer_size_ms: 100,
+            });
+            let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
+            loop {
+                let n = match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.read(&mut read_buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => n,
+                };
+                codec.feed(&read_buf[..n]);
+                while let Ok(Some(msg)) = codec.decode_next() {
+                    if let Message::FormatPropose(fp) = msg {
+                        let accept = Message::FormatAccept(FormatAccept {
+                            stream_id: fp.stream_id,
+                        });
+                        let _ = stream.write_all(&FrameCodec::encode(&accept)).await;
+                    }
+                }
+            }
+        });
+
+        // Le corps : en-tête WAV, 8 820 trames, puis 2 octets orphelins. La
+        // taille du chunk `data` les annonce, comme le `Content-Length` que le
+        // serveur calculait depuis la durée en bibliothèque.
+        let mut wav = make_test_wav_body(TRAMES as u32 * 4 + ORPHELINS as u32);
+        assert_ne!(
+            (wav.len() - 44) % 4,
+            0,
+            "le banc doit servir un corps qui N'EST PAS un multiple de la trame"
+        );
+        for (index, octet) in wav[44..].iter_mut().enumerate() {
+            *octet = (index % 251) as u8;
+        }
+
+        let http_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_tcp.local_addr().unwrap().port();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requests_srv = requests.clone();
+        let corps = wav.clone();
+        let http_handle = tokio::spawn(async move {
+            loop {
+                let Ok(Ok((mut s, _))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(20), http_tcp.accept())
+                        .await
+                else {
+                    break;
+                };
+                // Lire la requête ENTIÈRE avant de répondre (sinon RST, #1358).
+                let mut req = Vec::new();
+                let mut byte = [0u8; 1];
+                while !req.ends_with(b"\r\n\r\n") {
+                    match s.read(&mut byte).await {
+                        Ok(1) => req.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                requests_srv
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req).into_owned());
+                // Content-Length EXACT : la fin de corps est propre, donc le
+                // reliquat vient bien du découpage en trames, pas d'une
+                // troncature réseau.
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+                    corps.len()
+                );
+                let _ = s.write_all(hdr.as_bytes()).await;
+                let _ = s.write_all(&corps).await;
+                let _ = s.shutdown().await;
+            }
+        });
+
+        let output = OaatOutput::new(
+            "Mock DigiOneSig".into(),
+            "127.0.0.1".into(),
+            control_port,
+            "mock-ep-3163".into(),
+        );
+        let url = format!("http://127.0.0.1:{http_port}/culture-of-fear.wav");
+        output
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/wav",
+                title: Some("Culture Of Fear"),
+                duration_ms: Some(200),
+                ..Default::default()
+            })
+            .await
+            .expect("play_media");
+
+        let (octets, dernier_vu) = audio_rx.await.expect("collecteur audio");
+
+        assert!(
+            dernier_vu,
+            "aucun LAST_PACKET : la branche EOF a été quittée par le `break` du refus, \
+             sautant le vidage final ET la transition gapless (#3163)"
+        );
+        assert_eq!(
+            octets, OCTETS_ATTENDUS,
+            "le nombre d'octets délivrés doit être celui des trames complètes : \
+             ni les {ORPHELINS} octets orphelins, ni une trame perdue"
+        );
+
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "un reliquat de fin de flux n'est pas une panne de transport — {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r.to_ascii_lowercase().contains("range:")),
+            "aucune reprise par Range ne doit être tentée — {seen:?}"
+        );
+
+        output.stop().await.ok();
+        endpoint_handle.abort();
+        http_handle.abort();
+    }
+
+    /// En-tête WAV 44,1 kHz / 16 bits / stéréo suivi de `data_size` octets de
+    /// données — `data_size` n'est PAS contraint à un multiple de la trame,
+    /// c'est tout l'objet du banc.
+    fn make_test_wav_body(data_size: u32) -> Vec<u8> {
         let sr = 44100u32;
         let ch = 2u16;
         let bits = 16u16;
-        let duration_samples = sr / 5; // 200ms
-        let data_size = duration_samples * ch as u32 * (bits as u32 / 8);
         let byte_rate = sr * ch as u32 * bits as u32 / 8;
         let block_align = ch * bits / 8;
 
@@ -1303,6 +1545,10 @@ mod tests {
         b.extend_from_slice(&data_size.to_le_bytes());
         b.resize(b.len() + data_size as usize, 0);
         b
+    }
+
+    fn make_test_wav() -> Vec<u8> {
+        make_test_wav_body(44100 / 5 * 2 * 2) // 200 ms, 16 bits, stéréo
     }
 
     /// Same shape as `make_test_wav`, with the bit depth and length chosen by
@@ -2266,18 +2512,31 @@ mod tests {
         );
         assert_eq!(r.stream_id, flux, "le refus doit nommer le flux concerne");
 
-        // 6. reponse hors sujet -> refus : on ne joue pas sur une reponse
-        //    qu'on n'a pas comprise.
+        // 6. reponse hors sujet -> HORS NEGOCIATION, ni accord ni refus.
+        //
+        //    Cette ligne attendait un refus. C'est ce qu'elle gardait qui a
+        //    coupe la zone du Zicmu (#2758) : une trame qui n'exprime AUCUN
+        //    avis sur le format — statistiques de flux, signal de prefetch —
+        //    etait comptee comme un refus non reconnectable, et le poller
+        //    arretait la lecture pour cela.
+        //
+        //    « On ne joue pas sur une reponse qu'on n'a pas comprise » reste
+        //    vrai, et c'est bien ce qui se passe : on ne joue pas dessus, on
+        //    l'ecarte et on continue d'attendre la vraie reponse. Ce qui
+        //    change, c'est qu'on ne la prend plus pour un NON.
         let hors_sujet = EndpointResponse::NextTrackReady(oaat_core::message::NextTrackReady {
             stream_id: flux.clone(),
         });
-        assert!(
+        assert_eq!(
             juger_reponse(
                 &contrat,
                 ReponseNegociation::Recue(&hors_sujet),
                 PolitiqueAdaptation::ExacteSeulement,
             )
-            .is_err()
+            .expect("une trame hors negociation n'exprime pas un refus (#2758)"),
+            Verdict::HorsNegociation {
+                trame: "NextTrackReady"
+            }
         );
 
         // 7. endpoint ferme.
@@ -2396,5 +2655,283 @@ mod tests {
                 "un {nom} etranger doit s'ecarter en nommant son flux"
             );
         }
+    }
+
+    /// Des statistiques de flux, avec le BON identifiant.
+    ///
+    /// C'est le cas que le filtre de #2730 ne pouvait pas voir : la, le
+    /// `stream_id` etait etranger et le message s'ecartait. Ici il concorde
+    /// — l'endpoint parle bien de la session en cours — mais la trame ne
+    /// repond pas a la proposition de format. Le fourre-tout la classait en
+    /// refus non reconnectable, le poller arretait la zone.
+    #[cfg(feature = "oaat")]
+    fn stats_de(stream_id: &str) -> oaat_controller::EndpointResponse {
+        oaat_controller::EndpointResponse::StreamStats(oaat_core::message::StreamStats {
+            stream_id: stream_id.into(),
+            buffer_frames: 0,
+            drift_us: 0,
+            corrections_net_frames: 0,
+            packets_lost: 0,
+            packets_recovered: 0,
+            bit_perfect: true,
+        })
+    }
+
+    /// #2758 — les DEUX sens, sur la vraie `juger_reponse`.
+    ///
+    /// Zicmu / SMSL Sanskrit 10th MkII, 29/08/2026, 0.9.121 : au premier Play
+    /// comme a la transition gapless, l'endpoint emet ses `StreamStats` sur
+    /// `tune-1` pendant qu'on negocie `tune-1`. Journal :
+    ///
+    /// ```text
+    /// raison=reponse inattendue pendant la negociation de format :
+    /// StreamStats(StreamStats { stream_id: "tune-1", buffer_frames: 0, ...,
+    /// bit_perfect: true })
+    /// ... output_reported_failure_stopping_zone zone_id=6
+    /// ```
+    ///
+    /// ## Les deux sens sont dans ce test, et c'est deliberé
+    ///
+    /// Fermer la porte a tout ce qui n'est pas `FormatAccept` etait le defaut.
+    /// L'ouvrir a tout serait une regression pire, et SILENCIEUSE : la zone ne
+    /// s'arreterait plus, mais elle jouerait par-dessus un refus. La seconde
+    /// moitie du test verifie donc que le refus coupe toujours.
+    #[test]
+    #[cfg(feature = "oaat")]
+    fn une_trame_hors_negociation_du_bon_flux_s_ecarte_mais_un_vrai_refus_coupe() {
+        use crate::outputs::oaat::output::{
+            PolitiqueAdaptation, ReponseNegociation, Verdict, juger_reponse,
+        };
+        use oaat_controller::EndpointResponse;
+
+        let contrat = contrat_pcm();
+        let notre = contrat.stream_id.clone();
+
+        // --- Sens 1 : les trames qui ne parlent pas de format s'ecartent.
+        let reformat_a_nous = oaat_core::message::NextTrackReformat {
+            stream_id: notre.clone(),
+            format: contrat.format,
+            // Volontairement DIFFERENT du contrat : meme quand elle annonce un
+            // autre format, cette trame parle de la piste SUIVANTE. Elle est
+            // traitee par `settle_prefetch`, pas par la negociation en cours.
+            sample_rate: 48_000,
+        };
+
+        let inoffensives = [
+            ("StreamStats", stats_de(&notre)),
+            (
+                "NextTrackReady",
+                EndpointResponse::NextTrackReady(oaat_core::message::NextTrackReady {
+                    stream_id: notre.clone(),
+                }),
+            ),
+            (
+                "NextTrackReformat",
+                EndpointResponse::NextTrackReformat(reformat_a_nous),
+            ),
+        ];
+
+        for (trame, reponse) in inoffensives {
+            let verdict = juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&reponse),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .unwrap_or_else(|refus| {
+                panic!(
+                    "un {trame} du flux {notre} — le NOTRE — ne repond pas a la \
+                     proposition de format, mais ne la refuse pas non plus : le \
+                     classer en refus arretait la zone (#2758). Recu : {}",
+                    refus.raison
+                )
+            });
+            assert_eq!(
+                verdict,
+                Verdict::HorsNegociation { trame },
+                "la trame ecartee doit etre NOMMEE : sans cela le journal ne dit pas \
+                 ce qui a ete jete"
+            );
+        }
+
+        // --- Sens 2 : ce qui refuse vraiment refuse toujours.
+        //
+        // Sans ces quatre cas, « ne plus arreter la zone » se satisferait d'un
+        // `Ok(...)` inconditionnel, et Tune jouerait par-dessus un refus.
+        let refus_franc = EndpointResponse::FormatReject(oaat_core::message::FormatReject {
+            stream_id: notre.clone(),
+            reason: "cadence non supportee".into(),
+        });
+        let r = juger_reponse(
+            &contrat,
+            ReponseNegociation::Recue(&refus_franc),
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect_err("un FormatReject de NOTRE flux reste un refus");
+        assert!(
+            r.raison.contains("cadence non supportee"),
+            "le motif du DAC doit remonter tel quel, recu : {}",
+            r.raison
+        );
+
+        let mut contre_ecartee = contre_de(&contrat);
+        contre_ecartee.sample_rate = 44_100;
+        juger_reponse(
+            &contrat,
+            ReponseNegociation::Recue(&EndpointResponse::FormatCounter(contre_ecartee)),
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect_err("une contre-proposition non produisible reste un refus");
+
+        juger_reponse(
+            &contrat,
+            ReponseNegociation::Timeout,
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect_err("le silence n'est pas un accord");
+
+        juger_reponse(
+            &contrat,
+            ReponseNegociation::Fermee,
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect_err("un endpoint ferme n'est pas un accord");
+    }
+
+    /// La meme chose au niveau de l'ATTENTE, sur la vraie boucle.
+    ///
+    /// `attendre_accord_format` ne fait que passer `endpoint.response_rx` a
+    /// `attendre_accord_format_sur` : c'est cette derniere qui est la
+    /// mecanique, et c'est elle qu'on appelle ici — pas une transcription de
+    /// son corps. Le canal est un `mpsc` ordinaire, alimente a la main : aucun
+    /// DAC, aucune socket.
+    ///
+    /// Trois choses a prouver d'un coup :
+    /// 1. un `StreamStats` traverse et la negociation ABOUTIT ;
+    /// 2. la trame est CONSOMMEE — elle ne reste pas dans le canal pour
+    ///    empoisonner le Play suivant, ce qui etait la deuxieme moitie du
+    ///    defaut (les relances de 12:23:27 a 12:25:15 basculaient en #2730) ;
+    /// 3. un `FormatReject` arrivant derriere un `StreamStats` coupe quand
+    ///    meme, avec SON motif — pas celui de la trame en retard.
+    #[tokio::test]
+    #[cfg(feature = "oaat")]
+    async fn la_boucle_traverse_les_stats_les_consomme_et_laisse_passer_les_refus() {
+        use crate::outputs::oaat::output::attendre_accord_format_sur;
+
+        let contrat = contrat_pcm();
+        let notre = contrat.stream_id.clone();
+
+        // 1 et 2 — stats puis accord.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(stats_de(&notre)).await.unwrap();
+        tx.send(oaat_controller::EndpointResponse::FormatAccept(
+            oaat_core::message::FormatAccept {
+                stream_id: notre.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let arrete = attendre_accord_format_sur(
+            &mut rx,
+            "Zicmu",
+            &contrat,
+            crate::outputs::oaat::output::PolitiqueAdaptation::ExacteSeulement,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .expect(
+            "un StreamStats emis juste apres le handshake, sur NOTRE flux, arretait la \
+             zone au premier Play (#2758)",
+        );
+        assert_eq!(arrete.stream_id, notre);
+        assert_eq!(arrete.sample_rate, contrat.sample_rate);
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "le StreamStats doit avoir ete CONSOMME : laisse dans le canal, il devient \
+             le reliquat qui fera echouer la negociation suivante (#2730)"
+        );
+        drop(tx);
+
+        // 3 — stats puis refus franc.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(stats_de(&notre)).await.unwrap();
+        tx.send(oaat_controller::EndpointResponse::FormatReject(
+            oaat_core::message::FormatReject {
+                stream_id: notre.clone(),
+                reason: "cadence non supportee".into(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let refus = attendre_accord_format_sur(
+            &mut rx,
+            "Zicmu",
+            &contrat,
+            crate::outputs::oaat::output::PolitiqueAdaptation::ExacteSeulement,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .expect_err("un refus derriere des statistiques reste un refus");
+        assert!(
+            refus.raison.contains("cadence non supportee"),
+            "c'est le motif du DAC qui doit remonter, pas la trame de statistiques \
+             qui le precedait — le journal collait `DSD format non accepte` sur une \
+             raison qui n'etait pas un refus de format. Recu : {}",
+            refus.raison
+        );
+        drop(tx);
+    }
+
+    /// La borne contre l'endpoint bavard.
+    ///
+    /// Ecarter au lieu de refuser ouvre une boucle. L'echeance globale borne le
+    /// TEMPS ; elle ne borne pas le nombre de tours, et un endpoint qui deverse
+    /// ses statistiques en rafale ferait tourner Tune — et grossir le journal —
+    /// jusqu'a l'echeance. `MAX_TRAMES_ECARTEES` borne le TRAVAIL.
+    ///
+    /// Le test envoie une trame de plus que la borne, garde l'emetteur en vie
+    /// (sinon la fermeture du canal deciderait a la place de la borne) et exige
+    /// que le motif nomme le COMPTE. Sans cette derniere exigence, un simple
+    /// `is_err()` serait vert meme sans borne : la boucle finirait par tomber
+    /// en timeout, et le test ne distinguerait pas les deux.
+    #[tokio::test(start_paused = true)]
+    #[cfg(feature = "oaat")]
+    async fn un_endpoint_bavard_ne_fait_pas_tourner_la_negociation_sans_fin() {
+        use crate::outputs::oaat::output::{MAX_TRAMES_ECARTEES, attendre_accord_format_sur};
+
+        let contrat = contrat_pcm();
+        let notre = contrat.stream_id.clone();
+        let debit = MAX_TRAMES_ECARTEES as usize + 1;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(debit + 4);
+        for _ in 0..debit {
+            tx.send(stats_de(&notre)).await.unwrap();
+        }
+
+        let refus = attendre_accord_format_sur(
+            &mut rx,
+            "Zicmu",
+            &contrat,
+            crate::outputs::oaat::output::PolitiqueAdaptation::ExacteSeulement,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .expect_err("un endpoint qui ne repond jamais doit finir par etre abandonne");
+        assert!(
+            refus.raison.contains(&format!("{debit} trames")),
+            "c'est la BORNE qui doit trancher, pas l'echeance : le motif doit nommer \
+             les {debit} trames ecartees. Recu : {}",
+            refus.raison
+        );
+        assert!(
+            !refus.reconnectable,
+            "rejouer aveuglement une negociation face a un endpoint muet ne mene nulle part"
+        );
+        drop(tx);
     }
 }

@@ -12,7 +12,7 @@
 //! valeur *élargissant* et l'ajout d'une facette *restreignant* — sans quoi
 //! cocher une seconde case ne pourrait que vider la liste.
 //!
-//! # Deux pièges, tous deux déjà rencontrés dans ce dépôt
+//! # Trois pièges, tous déjà rencontrés dans ce dépôt
 //!
 //! 1. **Une liste vide ne doit produire AUCUN prédicat.** Ni `IN ()` (erreur de
 //!    syntaxe sur les deux moteurs), ni un `1 = 1` de complaisance qui rendrait
@@ -28,6 +28,12 @@
 //!    [`Placeholders`] tient ce compteur une fois pour toutes, et l'appelant
 //!    n'a qu'une règle à respecter : **empiler les valeurs dans l'ordre exact
 //!    où les marqueurs ont été demandés**.
+//!
+//! 3. **Un `OU` de mille termes est refusé par SQLite et accepté par
+//!    PostgreSQL.** La chaîne plate `a OR b OR c …` a une profondeur d'arbre
+//!    égale à son nombre de termes, et SQLite plafonne à 1 000. Le même filtre
+//!    rendait donc la bonne liste sur PostgreSQL et une liste VIDE sur SQLite.
+//!    [`ou_equilibre`] ramène la profondeur à `log2(n)`.
 
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
@@ -112,6 +118,8 @@ impl Placeholders {
     /// (label, compositeur), où la valeur liée est déjà un motif `%…%`.
     /// Parenthésé : sans quoi le `OU` interne se ferait manger par le `ET`
     /// entre facettes. `None` si la liste est vide.
+    ///
+    /// Les termes sont assemblés par [`ou_equilibre`] — voir le piège n°3.
     pub fn or_like_ci(&mut self, expr: &str, n: usize) -> Option<String> {
         if n == 0 {
             return None;
@@ -119,12 +127,66 @@ impl Placeholders {
         if n == 1 {
             return Some(format!("LOWER({expr}) LIKE LOWER({})", self.take()));
         }
-        let parts = (0..n)
+        // ⚠️ Les marqueurs sont pris ICI, dans l'ordre 1..n, AVANT tout
+        // réassemblage : `ou_equilibre` ne fait que reparenthéser une suite
+        // qu'il conserve de gauche à droite. L'ordre de liaison attendu par
+        // l'appelant est donc exactement celui d'avant.
+        let parts: Vec<String> = (0..n)
             .map(|_| format!("LOWER({expr}) LIKE LOWER({})", self.take()))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        Some(format!("({parts})"))
+            .collect();
+        Some(ou_equilibre(parts))
     }
+}
+
+/// Assemble des prédicats en **OU** sous forme d'arbre ÉQUILIBRÉ —
+/// `((a OU b) OU (c OU d))` — au lieu de la chaîne plate `a OU b OU c OU d`.
+///
+/// # Le piège n°3 : SQLite compte la PROFONDEUR, pas le nombre de termes
+///
+/// `a OR b OR c OR …` s'analyse en un arbre binaire qui penche à gauche : sa
+/// profondeur vaut le nombre de termes. Au-delà de **1000**, SQLite refuse la
+/// requête à la préparation :
+///
+/// ```text
+/// prepare: Expression tree is too large (maximum depth 1000)
+/// ```
+///
+/// PostgreSQL, lui, avale la même chaîne sans broncher (mesuré jusqu'à 12 000
+/// termes). Une facette « contient » à mille valeurs rendait donc **deux
+/// résultats différents selon le moteur** : la bonne liste sur PostgreSQL, et
+/// sur SQLite une requête en échec — avalée par `ou_defaut_journalise` (#2861)
+/// et servie en `200 OK` avec `total = 0`. C'est-à-dire le pire cas que ce
+/// module combat : un filtre actif qui rend une liste VIDE en silence.
+///
+/// L'arbre équilibré ramène la profondeur à `log2(n)` : 6 549 termes — le
+/// maximum qu'une URL puisse porter, `http::Uri` refusant au-delà de 64 Kio —
+/// tiennent en profondeur 13. Mesuré sur SQLite : la chaîne plate échoue dès
+/// 1 000 termes, l'arbre équilibré passe jusqu'à 32 000, où c'est l'autre
+/// limite qui parle (`too many SQL variables`, 32 766). Le maximum atteignable
+/// par une requête HTTP étant de 13 098 marqueurs, la marge est de 2,5×.
+///
+/// **L'ordre est conservé.** Le réassemblage ne fait que déplacer des
+/// parenthèses : le i-ème terme reste le i-ème, donc les marqueurs `$1..$n`
+/// sortent toujours dans l'ordre et la pile de valeurs de l'appelant n'a pas à
+/// changer — la règle de liaison de SQLite (voir le piège n°2) est intacte.
+///
+/// Pour `n <= 2` le résultat est mot pour mot celui d'avant.
+fn ou_equilibre(mut parts: Vec<String>) -> String {
+    debug_assert!(!parts.is_empty(), "appelé sur une liste non vide seulement");
+    while parts.len() > 1 {
+        let mut etage = Vec::with_capacity(parts.len().div_ceil(2));
+        let mut it = parts.into_iter();
+        while let Some(gauche) = it.next() {
+            match it.next() {
+                Some(droite) => etage.push(format!("({gauche} OR {droite})")),
+                // Terme orphelin de l'étage : il remonte tel quel, ce qui
+                // garde l'arbre équilibré et l'ordre inchangé.
+                None => etage.push(gauche),
+            }
+        }
+        parts = etage;
+    }
+    parts.pop().unwrap_or_default()
 }
 
 /// Assemble en **OU** des prédicats déjà écrits, sans marqueur — pour les
@@ -454,6 +516,64 @@ mod tests {
             "(LOWER(t.label) LIKE LOWER(?) OR LOWER(t.label) LIKE LOWER(?))"
         );
         assert_eq!(sq.next_index(), 5);
+    }
+
+    /// Le piège n°3, à la source : la PROFONDEUR du `OU` reste logarithmique.
+    ///
+    /// C'est ce que SQLite compte, et ce qu'il plafonne à 1 000. On mesure ici
+    /// l'imbrication maximale de parenthèses du prédicat rendu ; le fait que la
+    /// requête s'exécute vraiment est prouvé un cran plus haut, par
+    /// `facettes_multivaleurs::une_facette_a_mille_valeurs_rend_encore_lunion`.
+    #[test]
+    fn le_ou_dune_facette_reste_peu_profond() {
+        fn profondeur(sql: &str) -> usize {
+            let (mut cour, mut max) = (0usize, 0usize);
+            for c in sql.chars() {
+                match c {
+                    '(' => {
+                        cour += 1;
+                        max = max.max(cour);
+                    }
+                    ')' => cour = cour.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            max
+        }
+        // 6 549 : le plus grand nombre de valeurs qu'une URL puisse porter pour
+        // une facette (`http::Uri` refuse au-delà de 64 Kio).
+        let mut ph = Placeholders::new(Engine::Sqlite);
+        let sql = ph.or_like_ci("t.genres", 6549).unwrap();
+        // `LOWER(…)` pose déjà 2 niveaux par terme ; l'arbre lui-même en ajoute
+        // ceil(log2(6549)) = 13. Une chaîne plate en aurait ajouté 6 549.
+        assert!(
+            profondeur(&sql) < 40,
+            "profondeur {} : le OU n'est plus équilibré, SQLite refusera au-delà de 1 000",
+            profondeur(&sql)
+        );
+        // Tous les marqueurs sont bien là, une fois chacun.
+        assert_eq!(sql.matches("LIKE").count(), 6549);
+        assert_eq!(ph.next_index(), 6550);
+
+        // Rétrocompatibilité stricte : à une et deux valeurs, mot pour mot le
+        // SQL d'avant.
+        let mut pg = Placeholders::new(Engine::Postgres);
+        assert_eq!(
+            pg.or_like_ci("t.label", 1).unwrap(),
+            "LOWER(t.label) LIKE LOWER($1)"
+        );
+        assert_eq!(
+            pg.or_like_ci("t.label", 2).unwrap(),
+            "(LOWER(t.label) LIKE LOWER($2) OR LOWER(t.label) LIKE LOWER($3))"
+        );
+        // Trois valeurs : l'arbre penche à gauche, l'ORDRE des marqueurs suit
+        // toujours 1, 2, 3 — c'est la seule chose que SQLite regarde.
+        assert_eq!(
+            pg.or_like_ci("t.label", 3).unwrap(),
+            "((LOWER(t.label) LIKE LOWER($4) OR LOWER(t.label) LIKE LOWER($5)) \
+             OR LOWER(t.label) LIKE LOWER($6))"
+        );
+        assert_eq!(pg.next_index(), 7);
     }
 
     /// Le piège n°1 : une facette sans valeur ne produit RIEN. Pas de `IN ()`

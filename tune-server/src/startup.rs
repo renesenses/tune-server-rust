@@ -675,14 +675,22 @@ async fn restore_queue_metadata(state: &AppState, config: &TuneConfig) {
     for snap in &snapshots {
         let zone_id = snap.zone_id;
 
-        // Determine queue length from DB (authoritative after restore_all_queues).
-        let local_count = queue_repo.count(zone_id).unwrap_or(0);
-        let streaming_count = queue_repo.count_streaming(zone_id).unwrap_or(0);
-        let queue_len = if local_count > 0 {
-            local_count
-        } else {
-            streaming_count
-        };
+        // Longueur de la file lue en base (autoritaire apres restore_all_queues).
+        //
+        // 🔴 #2055 — `if local > 0 { local } else { streaming }` etait le
+        // dernier reste de l'ancienne regle « un seul type de file active par
+        // zone ». Depuis la migration 53 la file est UNE suite de positions
+        // 0..N-1 ou lignes locales et lignes de service se melangent :
+        // l'autoplay du sondeur ajoute des pistes de service derriere l'album
+        // en cours. Sur une telle file, cette formule ne comptait que l'album,
+        // et les pistes ajoutees redevenaient injoignables au premier
+        // redemarrage — le sondeur concluait « file terminee » a la fin de
+        // l'album.
+        //
+        // `count_all`, la meme source que `Orchestrator::play_from_queue` :
+        // c'est lui qui RESOUT la position que `next_position` calcule a
+        // partir de cette longueur. Les deux doivent compter les memes lignes.
+        let queue_len = queue_repo.count_all(zone_id).unwrap_or(0);
 
         if queue_len > 0 {
             state

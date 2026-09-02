@@ -1177,20 +1177,149 @@ async fn la_capacite_de_mode_exclusif_est_publiee_et_suit_la_plateforme() {
 #[cfg(all(feature = "local-audio", not(target_os = "windows")))]
 #[tokio::test]
 async fn une_valeur_windows_persistee_retombe_sur_auto_hors_windows() {
-    let app = make_app();
-    let (status, _) = patch_json(
-        &app,
-        "/api/v1/system/config",
-        json!({ "local_audio_backend": "wasapi" }),
-    )
-    .await;
-    assert!(status.is_success(), "écriture refusée : {status}");
+    // Écriture DIRECTE en base, et non par la route : c'est bien ce que le
+    // commentaire ci-dessus décrit — une ligne apportée par la bibliothèque
+    // migrée, pas une demande d'un client. La route, elle, refuse désormais
+    // cette valeur (test suivant) ; passer par elle ne prouverait plus rien du
+    // repli d'affichage, qui doit continuer de couvrir les bases existantes.
+    let (app, state) = make_app_with_state();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    settings.set("local_audio_backend", "wasapi").unwrap();
 
     let (_, config) = get(&app, "/api/v1/system/config").await;
     assert_eq!(
         config.get("local_audio_backend").and_then(|v| v.as_str()),
         Some("auto"),
         "une valeur Windows persistée doit retomber sur `auto` hors Windows"
+    );
+
+    // On ne réécrit pas la base derrière l'utilisateur : c'est la RÉPONSE qui
+    // est corrigée, comme pour `audio_backend` plus bas.
+    assert_eq!(
+        settings.get("local_audio_backend").unwrap().as_deref(),
+        Some("wasapi"),
+        "le repli est un repli d'affichage, pas une réécriture de la table"
+    );
+}
+
+// #1268, volet ÉCRITURE — la moitié qui manquait.
+//
+// Le serveur publie la liste vraie depuis #2806, mais `tune-web-client` écrit
+// toujours ses trois `<option>` en dur (Auto/WASAPI/ASIO) : Lapinou sous Debian
+// et Benjithom sous Fedora peuvent donc encore CHOISIR WASAPI. Ce que faisait
+// le serveur : il l'acceptait, l'inscrivait en base, ouvrait le host par défaut
+// quand même, et `GET /system/config` la ramenait à `auto` — sans un mot. Le
+// choix disparaissait en silence, et c'est précisément la question que le
+// ticket laissait ouverte (« refusé, ignoré, ou plus de son ? »).
+#[cfg(all(feature = "local-audio", not(target_os = "windows")))]
+#[tokio::test]
+async fn un_backend_d_une_autre_plateforme_est_refuse_a_l_ecriture() {
+    let (app, state) = make_app_with_state();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+
+    for demande in ["wasapi", "ASIO"] {
+        let (status, corps) = patch_json(
+            &app,
+            "/api/v1/system/config",
+            json!({ "local_audio_backend": demande }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "« {demande} » n'est ouvrable sur aucune plateforme non-Windows : \
+             l'accepter inscrit un réglage que la lecture n'honorera jamais"
+        );
+        let message = corps.to_string();
+        assert!(
+            message.contains("supported_audio_backends"),
+            "le refus doit dire où lire les valeurs acceptées par CETTE \
+             plateforme, sinon il renvoie l'écran à la devinette : {message}"
+        );
+        assert!(
+            message.contains("auto"),
+            "le refus doit nommer au moins une valeur acceptable ici : {message}"
+        );
+        assert_eq!(
+            settings.get("local_audio_backend").unwrap(),
+            None,
+            "un réglage refusé ne doit rien laisser en base"
+        );
+    }
+}
+
+// Témoin vert des deux côtés, sur TOUTES les plateformes : la garde ci-dessus
+// n'enferme personne. Le défaut reste écrivable, il reste proposé, et un refus
+// n'emporte pas le reste du lot.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn le_backend_par_defaut_reste_ecrivable_et_propose_partout() {
+    let (app, state) = make_app_with_state();
+    let (status, _) = patch_json(
+        &app,
+        "/api/v1/system/config",
+        json!({ "local_audio_backend": "auto", "prefetch_mode": "60s" }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "le défaut doit rester écrivable partout : {status}"
+    );
+
+    let (_, config) = get(&app, "/api/v1/system/config").await;
+    assert_eq!(
+        config.get("local_audio_backend").and_then(|v| v.as_str()),
+        Some("auto")
+    );
+    assert_eq!(
+        config.get("prefetch_mode").and_then(|v| v.as_str()),
+        Some("60s"),
+        "le lot entier doit passer : la garde ne doit se déclencher que sur la \
+         valeur qu'elle vise"
+    );
+
+    let backends = config
+        .get("supported_audio_backends")
+        .and_then(|v| v.as_array())
+        .expect("la liste publiée reste là");
+    assert!(
+        backends
+            .iter()
+            .any(|b| b.get("value").and_then(|v| v.as_str()) == Some("auto")),
+        "la liste ne doit jamais devenir vide ni perdre son défaut : c'est ce \
+         que le sélecteur affichera"
+    );
+    assert_eq!(
+        state.effective_audio_backend(),
+        "auto",
+        "et c'est bien ce backend-là que la lecture ouvrira"
+    );
+}
+
+// #1268, volet « un chemin corrigé, les autres nus ».
+//
+// La règle « asio ⇒ mode exclusif » ne demandait pas si ASIO existait sur cette
+// machine. Une ligne `asio` héritée d'une bibliothèque Windows armait donc le
+// mode exclusif sur un serveur macOS — le hog mode CoreAudio, bien réel là-bas
+// — pour un backend que la plateforme ne peut de toute façon pas ouvrir.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn une_valeur_asio_heritee_n_arme_pas_le_mode_exclusif_hors_windows() {
+    let (_, state) = make_app_with_state();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    settings.set("local_audio_backend", "asio").unwrap();
+
+    assert!(
+        !state.effective_exclusive_mode(),
+        "hors Windows, `asio` est une valeur héritée : elle ne peut ouvrir \
+         aucun host ASIO et ne doit armer aucun chemin exclusif"
+    );
+
+    // Témoin : un mode exclusif RÉELLEMENT demandé reste honoré.
+    settings.set("local_exclusive_mode", "true").unwrap();
+    assert!(
+        state.effective_exclusive_mode(),
+        "le réglage explicite doit rester le seul maître du mode exclusif"
     );
 }
 

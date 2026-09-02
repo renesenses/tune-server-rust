@@ -282,7 +282,16 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // advertise it via `scan_status` and honour cooperative cancellation.
         // The guards reset the persisted status before releasing the unique
         // owner on every exit path, including panic unwind.
-        let _ = settings.set("scan_status", "scanning");
+        // L'annonce passe par le chemin PARTAGÉ avec le scan manuel : elle
+        // pose l'horodatage ET le statut. Écrire le statut seul, comme on le
+        // faisait, rendait ce scan indatable : le garde-fou de mise à jour
+        // traitait « scanning sans horodatage » comme frais indéfiniment, si
+        // bien qu'un processus tué ici — coupure de courant, `kill -9`, ou un
+        // plantage au démarrage (#2302) — différait les mises à jour POUR
+        // TOUJOURS. `ScanStatusGuard` ne rattrape pas ce cas : il ne s'exécute
+        // que sur les sorties de la tâche, jamais sur une mort du processus
+        // (#2976).
+        crate::routes::system::scan::marquer_scan_en_cours(&db);
         let _scan_status_guard = ScanStatusGuard(db.clone());
 
         let exclude_patterns = scan_exclude_patterns(&db);
@@ -416,8 +425,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
         let mut inserted = 0u64;
         let mut updated = 0u64;
-        let mut db_insert_failed = 0u64;
-        let mut db_update_failed = 0u64;
+        // `db_insert_failed` / `db_update_failed` sont désormais agrégés par le
+        // parcours, à partir de ce que chaque lot rend (#2939) : voir plus bas,
+        // après `scan_files_batched`.
         // `skipped` stays the aggregate the UI already shows; the per-cause
         // counters make the report actionable ("skipped 1200" alone doesn't
         // say whether the library is healthy or half the NAS failed to read).
@@ -447,7 +457,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // skip all remaining batches so the startup scan drains quickly
                 // (same pattern as the manual scan, #1129/#1197).
                 if crate::routes::system::scan::scan_cancel_requested() {
-                    return;
+                    // Rien présenté à la base, donc rien de refusé (#2939).
+                    return tune_core::scanner::walker::EcrituresDuLot::SANS_PERTE;
                 }
                 let mut to_insert: Vec<Track> = Vec::with_capacity(batch.len());
                 let mut to_update: Vec<Track> = Vec::with_capacity(batch.len() / 4);
@@ -578,8 +589,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         }
                     }
                 }
-                db_insert_failed += to_insert.len() as u64 - batch_inserted;
-                db_update_failed += to_update.len() as u64 - batch_updated;
+                // Le manque à écrire de ce lot, rendu au parcours à la fin de
+                // la fermeture — sœur exacte du scan manuel (#2939).
+                let ecritures = tune_core::scanner::walker::EcrituresDuLot::manque(
+                    to_insert.len(),
+                    batch_inserted as usize,
+                )
+                .avec_manque_a_la_mise_a_jour(to_update.len(), batch_updated as usize);
                 inserted += batch_inserted;
                 updated += batch_updated;
 
@@ -649,8 +665,14 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         }),
                     );
                 }
+
+                ecritures
             },
         );
+
+        // Une seule source pour le journal et pour le rapport (#2939).
+        let db_insert_failed = stats.db_insert_failed as u64;
+        let db_update_failed = stats.db_update_failed as u64;
 
         for (format, count) in &stats.unsupported_by_ext {
             *skipped_by_ext.entry(format.clone()).or_insert(0) += count;
@@ -1142,6 +1164,39 @@ mod registre_du_scan_tests {
         );
         assert_eq!(corps.matches("suivi.echec").count(), 1);
         assert_eq!(corps.matches("suivi.terminer").count(), 1);
+    }
+
+    /// #2976 : le scan de demarrage doit annoncer son etat par le chemin
+    /// PARTAGE (`scan::marquer_scan_en_cours`), qui pose l'horodatage EN MEME
+    /// TEMPS que le statut. Une annonce ecrite a la main ici reposerait
+    /// `scan_status = "scanning"` sans date, et un scan sans date ne peut etre
+    /// declare perime par personne : un processus tue pendant ce scan
+    /// differerait les mises a jour a vie.
+    ///
+    /// Ce garde regarde l'APPELANT, pas la fonction appelee : c'est
+    /// exactement le defaut « ecrit mais pas branche » qu'il existe pour
+    /// empecher de revenir.
+    #[test]
+    fn le_scan_de_demarrage_annonce_son_etat_par_le_chemin_partage() {
+        let source = include_str!("auto_scan.rs");
+        let corps = source
+            .split("pub fn spawn_auto_scan")
+            .nth(1)
+            .expect("spawn_auto_scan introuvable")
+            .split("\n    scan_done\n}")
+            .next()
+            .expect("fin de spawn_auto_scan introuvable");
+        assert_eq!(
+            corps.matches("marquer_scan_en_cours(").count(),
+            1,
+            "le scan de demarrage annonce son etat par le chemin partage, une seule fois"
+        );
+        let annonce_a_la_main = format!("set({:?}, {:?})", "scan_status", "scanning");
+        assert!(
+            !corps.contains(&annonce_a_la_main),
+            "aucune annonce ecrite a la main dans le scan de demarrage : \
+             elle poserait le statut sans horodatage (#2976)"
+        );
     }
 
     /// Le rapport de scan contient les chemins de l'utilisateur
