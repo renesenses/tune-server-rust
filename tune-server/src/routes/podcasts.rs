@@ -178,11 +178,33 @@ async fn unsubscribe(State(state): State<AppState>, Path(id): Path<i64>) -> impl
 async fn radiofrance_podcasts() -> Json<Value> {
     Json(json!(PodcastService::curated_french_podcasts()))
 }
-/// GET /discover — curated French podcasts + optional Apple top chart enrichment.
-async fn discover_podcasts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let curated = PodcastService::curated_french_podcasts();
+/// GET /discover?country={cc} — sélection éditoriale et palmarès du PAYS.
+///
+/// 🔴 Deux fautes corrigées ici le 02/09/2026, signalées par Bertrand
+/// (« quand je sélectionne USA : rien ! ») :
+///
+///  1. la route n'acceptait AUCUN paramètre : changer de pays dans l'interface
+///     ne pouvait rien changer, puisque rien n'était transmis ;
+///  2. le palmarès était figé sur `"us"`, en dur. Un utilisateur français
+///     voyait donc « Crime Junkie » et « The Daily » sous l'intitulé
+///     « Populaires », sans que rien n'indique qu'il regardait le classement
+///     américain.
+///
+/// La SÉLECTION, elle, reste une liste française choisie à la main : elle n'a
+/// pas d'équivalent par pays. On ne la rend donc que pour la France, plutôt que
+/// de servir des émissions de France Inter à qui a choisi les États-Unis.
+async fn discover_podcasts(
+    State(state): State<AppState>,
+    Query(q): Query<TopQuery>,
+) -> Result<Json<Value>, AppError> {
+    let cc = q.country.to_lowercase();
+    let curated = if cc == "fr" {
+        PodcastService::curated_french_podcasts()
+    } else {
+        Vec::new()
+    };
     let svc = PodcastService::with_client(state.http_client.clone());
-    let top = svc.top_podcasts(None, "us").await.unwrap_or_default();
+    let top = svc.top_podcasts(None, &cc).await.unwrap_or_default();
     Ok(Json(json!({
         "curated": curated,
         "top": top,

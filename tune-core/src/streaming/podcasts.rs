@@ -8,6 +8,8 @@ use tracing::debug;
 
 const ITUNES_SEARCH_URL: &str = "https://itunes.apple.com/search";
 const APPLE_TOP_BASE: &str = "https://rss.marketingtools.apple.com/api/v2";
+/// Ancien flux RSS d'Apple — le SEUL qui respecte `genre`. Voir `top_podcasts`.
+const APPLE_LEGACY_RSS: &str = "https://itunes.apple.com";
 const USER_AGENT: &str = "Tune/2.0 (https://mozaiklabs.fr)";
 /// Cache TTL for top podcasts (1 hour).
 const TOP_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -134,6 +136,64 @@ pub struct PodcastEpisode {
 
 pub struct PodcastService {
     client: Client,
+}
+
+/// 🔴 DEUX points d'entrée, parce qu'un seul ne sait pas filtrer.
+///
+/// `rss.marketingtools.apple.com` IGNORE le paramètre `genre`. On le lui
+/// passait pourtant depuis toujours : Musique, Actualités, Tech et
+/// Fiction rendaient le classement identique, et le filtre par genre des
+/// deux clients était purement décoratif.
+///
+/// Mesuré le 02/09/2026 sur le magasin français : avec ou sans
+/// `?genre=1310`, les cinquante mêmes émissions, et l'`id` du flux rendu
+/// par Apple ne porte même pas le paramètre.
+///
+/// Le point d'entrée HISTORIQUE, lui, filtre :
+///
+/// ```text
+/// genre=1310 (Musique) → NUMBERS, Very Good Trip, La Canción
+/// genre=1318 (Tech)    → Silicon Carne, Underscore_
+/// genre=1306 (Cuisine) → On va déguster, Business of Bouffe
+/// ```
+///
+/// On garde `marketingtools` SANS genre : c'est lui qui sert le
+/// classement général, et sa forme est déjà éprouvée.
+pub(crate) fn url_palmares(genre: Option<u32>, cc: &str) -> String {
+    match genre {
+        Some(gid) => {
+            format!("{APPLE_LEGACY_RSS}/{cc}/rss/toppodcasts/limit=50/genre={gid}/json")
+        }
+        None => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcasts.json"),
+    }
+}
+
+/// Traduit une entrée de l'ancien flux RSS d'Apple vers la forme du moderne.
+///
+/// L'ancien est de l'Atom converti en JSON : chaque champ est un objet
+/// `{ "label": "…" }`, et les attributs vivent sous `attributes`. Le moderne
+/// est plat. On rend la forme MODERNE, pour que l'analyse en aval n'ait qu'un
+/// seul cas à traiter.
+///
+/// La pochette arrive en plusieurs tailles ; on prend la DERNIÈRE, qui est la
+/// plus grande, puis la construction en aval la porte à 600 px comme pour
+/// l'autre point d'entrée.
+fn normaliser_entree_ancienne(e: &serde_json::Value) -> serde_json::Value {
+    let label = |v: &serde_json::Value| v["label"].as_str().unwrap_or("").to_string();
+    let image = e["im:image"]
+        .as_array()
+        .and_then(|a| a.last())
+        .map(label)
+        .unwrap_or_default();
+    serde_json::json!({
+        // `im:id` est l'identifiant de collection Apple — le même que celui du
+        // point d'entrée moderne, donc `source_id` reste comparable.
+        "id": e["id"]["attributes"]["im:id"].as_str().unwrap_or(""),
+        "name": label(&e["im:name"]),
+        "artistName": label(&e["im:artist"]),
+        "artworkUrl100": image,
+        "genres": [{ "name": e["category"]["attributes"]["label"].as_str().unwrap_or("") }],
+    })
 }
 
 impl PodcastService {
@@ -618,10 +678,7 @@ impl PodcastService {
         country: &str,
     ) -> Result<Vec<Podcast>, String> {
         let cc = country.to_lowercase();
-        let url = match genre {
-            Some(gid) => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcasts.json?genre={gid}"),
-            None => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcasts.json"),
-        };
+        let url = url_palmares(genre, &cc);
         let cache_key = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&cc, &mut h);
@@ -661,10 +718,27 @@ impl PodcastService {
             .await
             .map_err(|e| format!("apple top podcasts parse: {e}"))?;
 
-        let results = body["feed"]["results"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        // Les deux points d'entrée ne rendent pas la même forme. Le moderne
+        // range ses entrées sous `feed.results` avec des champs plats ; l'ancien
+        // sous `feed.entry`, en Atom traduit en JSON — d'où `im:name.label`.
+        //
+        // On NORMALISE ici plutôt que dans la construction du `Podcast` : une
+        // seule branche à écrire ensuite, et le jour où Apple retire l'un des
+        // deux, c'est cette fonction seule qui bouge.
+        let results = if body["feed"]["results"].is_array() {
+            body["feed"]["results"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            body["feed"]["entry"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(normaliser_entree_ancienne)
+                .collect()
+        };
 
         let podcasts: Vec<Podcast> = results
             .iter()
@@ -941,5 +1015,76 @@ mod tests {
         let genres = PodcastService::available_genres();
         assert!(genres.len() >= 18);
         assert!(genres.iter().any(|g| g["name"] == "Music"));
+    }
+}
+
+#[cfg(test)]
+mod tests_palmares_par_genre {
+    use super::*;
+
+    /// L'ancien flux d'Apple est de l'Atom traduit en JSON : chaque champ est un
+    /// objet `{ "label": … }`. Le moderne est plat. La normalisation doit rendre
+    /// la forme MODERNE, sinon l'analyse en aval ne trouve rien et le palmarès
+    /// par genre sort vide.
+    ///
+    /// Entrée RELEVÉE le 02/09/2026 sur
+    /// `itunes.apple.com/fr/rss/toppodcasts/limit=50/genre=1306/json`.
+    #[test]
+    fn une_entree_ancienne_prend_la_forme_moderne() {
+        let brut = serde_json::json!({
+            "im:name": { "label": "On va déguster" },
+            "im:artist": { "label": "France Inter" },
+            "im:image": [
+                { "label": "https://is1.mzstatic.com/55x55bb.png" },
+                { "label": "https://is1.mzstatic.com/60x60bb.png" },
+                { "label": "https://is1.mzstatic.com/100x100bb.png" }
+            ],
+            "category": { "attributes": { "label": "Cuisine" } },
+            "id": { "attributes": { "im:id": "1191775646" } }
+        });
+        let n = normaliser_entree_ancienne(&brut);
+        assert_eq!(n["name"], "On va déguster");
+        assert_eq!(n["artistName"], "France Inter");
+        assert_eq!(n["id"], "1191775646");
+        assert_eq!(n["genres"][0]["name"], "Cuisine");
+        // La PLUS GRANDE des pochettes : la première ferait une vignette de
+        // 55 px, illisible, et le passage à 600 px en aval ne la rattraperait
+        // pas — il ne remplace que « 100x100bb ».
+        assert_eq!(n["artworkUrl100"], "https://is1.mzstatic.com/100x100bb.png");
+    }
+
+    /// Une entrée amputée ne doit ni paniquer ni inventer.
+    #[test]
+    fn une_entree_ancienne_incomplete_ne_panique_pas() {
+        let n = normaliser_entree_ancienne(&serde_json::json!({}));
+        assert_eq!(n["name"], "");
+        assert_eq!(n["id"], "");
+        assert_eq!(n["artworkUrl100"], "");
+    }
+
+    /// 🔴 Le point d'entrée dépend du GENRE, et c'est tout le correctif.
+    ///
+    /// `rss.marketingtools.apple.com` ignore `?genre=` : avec ou sans, les
+    /// cinquante mêmes émissions (mesuré sur le magasin français le
+    /// 02/09/2026). Le filtre par genre des deux clients était décoratif.
+    #[test]
+    fn le_genre_change_de_point_d_entree() {
+        // ⚠️ On appelle la PRODUCTION. Ce test reconstruisait les deux URL
+        // lui-même : remettre `marketingtools` dans la branche « avec genre »
+        // le laissait VERT, et il ne gardait donc rien de ce qu'il annonçait.
+        let sans = url_palmares(None, "fr");
+        let avec = url_palmares(Some(1310), "fr");
+        assert!(
+            sans.contains("marketingtools"),
+            "le classement général a changé de source"
+        );
+        assert!(
+            avec.contains("itunes.apple.com") && avec.contains("genre=1310"),
+            "le palmarès par genre ne passe plus par le flux qui filtre : {avec}"
+        );
+        assert!(
+            !sans.contains("genre="),
+            "le classement général porte un genre : il serait ignoré, comme avant"
+        );
     }
 }
