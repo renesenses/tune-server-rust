@@ -391,14 +391,20 @@ pub mod sql {
         "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.bio IS NULL OR a.bio = '') AND (a.musicbrainz_release_group_id IS NULL OR a.musicbrainz_release_group_id = '') AND a.source = 'local' ORDER BY a.id"
     }
 
+    /// Le PRÉDICAT de la recherche d'albums, sans projection ni bornes.
+    ///
+    /// Extrait pour que la liste rendue et le total annoncé portent
+    /// littéralement le même filtre (#3189).
+    ///
     /// Le OU des critères est PARENTHÉSÉ pour recevoir le filtre « pas
     /// masqué » en ET — et ce filtre s'applique APRÈS la passe FTS : les
     /// index `albums_fts` contiennent tout, les reconstruire à chaque
     /// masquage serait le mauvais échange (#1391).
-    pub fn search<D: SqlDialect>(d: &D) -> String {
+    ///
+    /// Emplacements 1..=6.
+    pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE (({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})))) AND {} LIMIT {}",
-            select_album(),
+            "(({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})))) AND {}",
             d.fts_where("albums", "a", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3),
@@ -406,6 +412,28 @@ pub mod sql {
             d.placeholder(5),
             d.placeholder(6),
             crate::db::facet_filter::hidden_albums_excluded(),
+        )
+    }
+
+    /// Recherche d'albums, PAGINÉE. `ORDER BY a.id` est un ordre total —
+    /// sans lui une page peut redonner ce que la précédente avait déjà rendu.
+    /// Emplacements 7 et 8 : `LIMIT` et `OFFSET`.
+    pub fn search<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE {} ORDER BY a.id LIMIT {} OFFSET {}",
+            select_album(),
+            search_where(d),
+            d.placeholder(7),
+            d.placeholder(8)
+        )
+    }
+
+    /// Le NOMBRE d'albums correspondants, borné (emplacement 7). La borne est
+    /// DANS la sous-requête : autour du `COUNT`, elle ne bornerait rien.
+    pub fn search_count<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM (SELECT a.id FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE {} LIMIT {}) AS borne",
+            search_where(d),
             d.placeholder(7)
         )
     }
@@ -2220,14 +2248,44 @@ impl AlbumRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, TuneError> {
+        self.search_page(query, limit, 0)
+    }
+
+    /// Une PAGE de la recherche d'albums : `limit` albums à partir de
+    /// `offset`, dans un ordre total (#3189).
+    pub fn search_page(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Album>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
         let trimmed = query.trim();
+        let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 7] =
-            [&fts_query, &like, &like, &like, &trimmed, &like, &limit];
+        let params: [&dyn ToSqlValue; 8] = [
+            &fts_query, &like, &like, &like, &trimmed, &like, &limit, &offset,
+        ];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
+    }
+
+    /// Le nombre d'albums correspondants, borné à `plafond` — un `COUNT` sur
+    /// le même prédicat, indépendant de `limit`. Rendre `plafond` signifie
+    /// « au moins `plafond` ».
+    pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
+        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
+        let like = format!("%{query}%");
+        let trimmed = query.trim();
+        let sql = self.dialect_sql(sql::search_count, sql::search_count);
+        let params: [&dyn ToSqlValue; 7] =
+            [&fts_query, &like, &like, &like, &trimmed, &like, &plafond];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
     }
 }
 
@@ -3588,6 +3646,52 @@ mod tests {
         assert!(s_sql.contains("a.id IN (SELECT rowid FROM albums_fts WHERE albums_fts MATCH ?)"));
         let p_sql = sql::search(&PostgresDialect);
         assert!(p_sql.contains("a.search_tsv @@ to_tsquery('simple', unaccent($1))"));
+        // #3189 — ordre TOTAL et pagination. Garde de texte : sur SQLite le
+        // plan rend de toute façon les lignes dans l'ordre des rowid, donc
+        // aucun garde de comportement local ne verrait l'`ORDER BY` partir.
+        for sql in [&s_sql, &p_sql] {
+            assert!(sql.contains("ORDER BY a.id"), "{sql}");
+            assert!(sql.contains("OFFSET"), "{sql}");
+        }
+        // Le compte porte LITTÉRALEMENT le prédicat de la liste.
+        assert!(s_sql.contains(&sql::search_where(&SqliteDialect)));
+        assert!(sql::search_count(&SqliteDialect).contains(&sql::search_where(&SqliteDialect)));
+        assert!(p_sql.contains(&sql::search_where(&PostgresDialect)));
+        assert!(sql::search_count(&PostgresDialect).contains(&sql::search_where(&PostgresDialect)));
+    }
+
+    /// #3189 — le total des albums est le nombre de correspondances, et les
+    /// pages ne se recouvrent pas.
+    #[test]
+    fn le_compte_et_la_pagination_des_albums() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        for i in 0..23 {
+            repo.create(&Album::new(format!("Autumn Sessions {i:03}")))
+                .unwrap();
+        }
+        for i in 0..9 {
+            repo.create(&Album::new(format!("Winter Sessions {i:03}")))
+                .unwrap();
+        }
+
+        assert_eq!(repo.search("Autumn", 5).unwrap().len(), 5);
+        assert_eq!(repo.search_count("Autumn", 1_000).unwrap(), 23);
+        // Témoin : le compte ne ramasse pas les neuf albums hors sujet.
+        assert_eq!(repo.search_count("Winter", 1_000).unwrap(), 9);
+        assert_eq!(
+            repo.search_count("Autumn", 4).unwrap(),
+            4,
+            "le plafond borne"
+        );
+
+        let mut vus = std::collections::HashSet::new();
+        for offset in [0, 5, 10, 15, 20] {
+            for a in repo.search_page("Autumn", 5, offset).unwrap() {
+                assert!(vus.insert(a.id.unwrap()), "album rendu deux fois");
+            }
+        }
+        assert_eq!(vus.len(), 23);
     }
 
     #[test]

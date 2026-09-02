@@ -95,6 +95,8 @@ mod radios_recherche_distinction;
 mod radios_validation_url;
 #[path = "rbac.rs"]
 mod rbac;
+#[path = "recherche_totaux_i3189.rs"]
+mod recherche_totaux_i3189;
 #[path = "reidentification_album.rs"]
 mod reidentification_album;
 #[path = "reprise_position_au_demarrage.rs"]

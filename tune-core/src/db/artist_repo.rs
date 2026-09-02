@@ -251,12 +251,35 @@ pub mod sql {
         )
     }
 
-    /// Engine-agnostic full-text search.
+    /// Le PRÉDICAT de la recherche d'artistes (emplacements 1 et 2), extrait
+    /// pour que la liste rendue et le total annoncé portent le même filtre
+    /// (#3189).
+    pub fn search_where<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} OR LOWER(unaccent(a.name)) LIKE LOWER(unaccent({}))",
+            d.fts_where("artists", "a", &d.placeholder(1)),
+            d.placeholder(2)
+        )
+    }
+
+    /// Engine-agnostic full-text search, PAGINÉE. `ORDER BY a.id` est un
+    /// ordre total : sans lui, deux pages successives peuvent se recouvrir.
+    /// Emplacements 3 et 4 : `LIMIT` et `OFFSET`.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {COLS} FROM artists a WHERE {} OR LOWER(unaccent(a.name)) LIKE LOWER(unaccent({})) LIMIT {}",
-            d.fts_where("artists", "a", &d.placeholder(1)),
-            d.placeholder(2),
+            "SELECT {COLS} FROM artists a WHERE {} ORDER BY a.id LIMIT {} OFFSET {}",
+            search_where(d),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
+    /// Le NOMBRE d'artistes correspondants, borné (emplacement 3). La borne
+    /// est DANS la sous-requête, sinon elle ne borne rien.
+    pub fn search_count<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM (SELECT a.id FROM artists a WHERE {} LIMIT {}) AS borne",
+            search_where(d),
             d.placeholder(3)
         )
     }
@@ -782,12 +805,37 @@ impl ArtistRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, TuneError> {
+        self.search_page(query, limit, 0)
+    }
+
+    /// Une PAGE de la recherche d'artistes, dans un ordre total (#3189).
+    pub fn search_page(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Artist>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
+        let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 3] = [&fts_query, &like, &limit];
+        let params: [&dyn ToSqlValue; 4] = [&fts_query, &like, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_artist).collect())
+    }
+
+    /// Le nombre d'artistes correspondants, borné à `plafond` — indépendant
+    /// de `limit`. Rendre `plafond` signifie « au moins `plafond` ».
+    pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
+        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
+        let like = format!("%{query}%");
+        let sql = self.dialect_sql(sql::search_count, sql::search_count);
+        let params: [&dyn ToSqlValue; 3] = [&fts_query, &like, &plafond];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
     }
 }
 
@@ -1232,6 +1280,51 @@ mod tests {
         assert!(p_sql.contains("a.search_tsv @@ to_tsquery('simple', unaccent($1))"));
         assert!(s_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent(?))"));
         assert!(p_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent($2))"));
+        // #3189 — ordre TOTAL et pagination, plus le prédicat partagé avec le
+        // compte. Garde de texte : sur SQLite, l'ordre des rowid masque la
+        // disparition d'un `ORDER BY`.
+        for sql in [&s_sql, &p_sql] {
+            assert!(sql.contains("ORDER BY a.id"), "{sql}");
+            assert!(sql.contains("OFFSET"), "{sql}");
+        }
+        assert!(s_sql.contains(&sql::search_where(&SqliteDialect)));
+        assert!(sql::search_count(&SqliteDialect).contains(&sql::search_where(&SqliteDialect)));
+        assert!(p_sql.contains(&sql::search_where(&PostgresDialect)));
+        assert!(sql::search_count(&PostgresDialect).contains(&sql::search_where(&PostgresDialect)));
+    }
+
+    /// #3189 — le total des artistes est le nombre de correspondances, et les
+    /// pages ne se recouvrent pas.
+    #[test]
+    fn le_compte_et_la_pagination_des_artistes() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        for i in 0..17 {
+            repo.create(&Artist::new(format!("Autumn Trio {i:03}")))
+                .unwrap();
+        }
+        for i in 0..6 {
+            repo.create(&Artist::new(format!("Winter Duo {i:03}")))
+                .unwrap();
+        }
+
+        assert_eq!(repo.search("Autumn", 5).unwrap().len(), 5);
+        assert_eq!(repo.search_count("Autumn", 1_000).unwrap(), 17);
+        // Témoin : les six artistes hors sujet ne sont pas comptés.
+        assert_eq!(repo.search_count("Winter", 1_000).unwrap(), 6);
+        assert_eq!(
+            repo.search_count("Autumn", 3).unwrap(),
+            3,
+            "le plafond borne"
+        );
+
+        let mut vus = std::collections::HashSet::new();
+        for offset in [0, 5, 10, 15] {
+            for a in repo.search_page("Autumn", 5, offset).unwrap() {
+                assert!(vus.insert(a.id.unwrap()), "artiste rendu deux fois");
+            }
+        }
+        assert_eq!(vus.len(), 17);
     }
 
     #[test]
