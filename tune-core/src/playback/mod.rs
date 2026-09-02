@@ -27,6 +27,20 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
 
+/// Combien d'observations CONSÉCUTIVES sous la position publiée avant que la
+/// garde de monotonie ne cède au renderer (#3229).
+///
+/// Le sondeur interroge la sortie toutes les secondes (`POLL_INTERVAL_MS`), et
+/// c'est déjà le quorum qu'il applique quand il doit décider si un `Stopped`
+/// répété est une vraie fin de piste (`STOPPED_TICKS_THRESHOLD = 5`). Même
+/// grandeur ici, et pour la même raison : cinq tours de suite disent une
+/// insistance, un tour isolé dit une secousse.
+///
+/// Le curseur ne peut donc jamais rester faux plus de cinq secondes, alors que
+/// la secousse de fin de piste — celle que Jean Valjean a vue — dure moins que
+/// cela et se termine par un changement de piste.
+const OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER: u8 = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlayState {
@@ -131,6 +145,25 @@ pub struct ZoneState {
     pub state: PlayState,
     pub now_playing: Option<NowPlaying>,
     pub position_ms: i64,
+    /// Observations du renderer CONSÉCUTIVES situées sous [`Self::position_ms`].
+    ///
+    /// C'est la soupape de la garde de monotonie posée par
+    /// [`PlaybackManager::update_position`] (#3229). Le plancher ne peut être
+    /// relevé que par une OBSERVATION, et une observation peut être fausse :
+    /// certains renderers annoncent la position de la session précédente
+    /// pendant les premières secondes (DMP-A6/A8, voir `stale_start_position`
+    /// dans le sondeur), et cette valeur-là est publiée AVANT que le sondeur ne
+    /// la rejette. Sans soupape, un tel plancher figerait le curseur jusqu'à la
+    /// fin de la piste.
+    ///
+    /// Ce compteur borne le mensonge : après
+    /// [`OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER`] observations consécutives sous
+    /// le plancher, c'est le renderer qui a raison et le plancher cède. Remis à
+    /// zéro par toute observation qui progresse, et par toute commande.
+    ///
+    /// Interne : `#[serde(skip)]`, aucun client ne le lit.
+    #[serde(skip)]
+    pub reculs_de_position: u8,
     /// Position rendue par la BASE au démarrage, en attente d'être jouée (#2876).
     ///
     /// `zones.last_position_ms` est écrit tout au long de la lecture par le
@@ -391,6 +424,7 @@ impl Default for ZoneState {
             output_signal_path: None,
             output_dsp_metrics: None,
             position_ms: 0,
+            reculs_de_position: 0,
             pending_resume_ms: None,
             volume: 0.5,
             muted: false,
@@ -539,6 +573,8 @@ impl PlaybackManager {
         // On tient une URL jouable : la recherche est finie.
         state.resolving = false;
         state.position_ms = position_ms;
+        // Une position POSÉE par Tune repart d'un plancher neuf (#3229).
+        state.reculs_de_position = 0;
         // #2876 — armer la reprise. Sans ce marqueur, la position ci-dessus
         // n'est plus qu'un affichage : les chemins « Lecture après arrêt »
         // construisent leur `PlayRequest` avec `seek_ms: None` et le morceau
@@ -688,6 +724,9 @@ impl PlaybackManager {
         if !is_recent_seek {
             state.position_ms = 0;
         }
+        // Nouveau flux : le plancher de monotonie repart de la position qu'on
+        // vient d'écrire (0, ou la cible du déplacement en cours) — #3229.
+        state.reculs_de_position = 0;
         // La position restaurée au démarrage est à usage unique : ce flux-ci
         // l'a consommée (si l'appelant l'a demandée) ou l'a rendue caduque (il
         // joue autre chose). Dans les deux cas elle ne vaut plus (#2876).
@@ -784,6 +823,7 @@ impl PlaybackManager {
             state.paused_at = None;
             state.now_playing = None;
             state.position_ms = 0;
+            state.reculs_de_position = 0;
             // La file est vide : il n'y a plus rien à reprendre (#2876).
             state.pending_resume_ms = None;
             state.metadata_changed_at_ms = None;
@@ -840,6 +880,10 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.position_ms = position_ms;
+            // Le déplacement est le recul DEMANDÉ : il abaisse le plancher de
+            // monotonie lui-même, donc la garde de `update_position` n'a rien à
+            // retenir et le curseur suit immédiatement (#3229).
+            state.reculs_de_position = 0;
             state.last_seek_at = Some(Instant::now());
         }
         self.emit(PlaybackEvent {
@@ -990,10 +1034,89 @@ impl PlaybackManager {
         z.session_context_source = context_source;
     }
 
-    pub async fn update_position(&self, zone_id: i64, position_ms: i64) {
+    /// Publier une position OBSERVÉE sur le renderer, et rendre celle qui a
+    /// réellement été retenue.
+    ///
+    /// # La position publiée ne recule pas dans une piste (#3229)
+    ///
+    /// Jean Valjean (fil 893, 02/07/2026) : « le temps affiché dépasse la durée
+    /// de la piste, puis RECULE (3:02 → 2:59) ». Le dépassement est borné
+    /// depuis, côté sondeur, mais rien n'empêchait la valeur brute rendue par le
+    /// renderer de DIMINUER : elle était recopiée telle quelle.
+    ///
+    /// ## Ce qui distingue un recul SUBI d'un recul DEMANDÉ
+    ///
+    /// La distinction n'est pas un seuil ni une heuristique : elle est
+    /// STRUCTURELLE, et elle tient en une phrase.
+    ///
+    /// > Une COMMANDE réécrit le plancher. Une OBSERVATION ne peut que le
+    /// > relever.
+    ///
+    /// Tous les reculs demandés passent par un chemin qui écrit `position_ms`
+    /// directement, sans passer par ici, et abaissent donc le plancher au
+    /// moment même où l'utilisateur le demande :
+    ///
+    /// - déplacement arrière : [`PlaybackManager::seek`] pose la cible ;
+    /// - retour au début / changement de piste : [`PlaybackManager::play`]
+    ///   remet à 0 ;
+    /// - avance gapless (qui ne passe PAS par `play`, donc ne remet ni la
+    ///   génération ni la position) : `advance_queue_metadata` appelle
+    ///   [`PlaybackManager::reset_position`] ;
+    /// - reprise au démarrage : [`PlaybackManager::restore_position`] ;
+    /// - file vidée : [`PlaybackManager::stop_and_clear`].
+    ///
+    /// Il ne reste donc SOUS cette garde que ce qui vient du renderer. Un
+    /// `max()` posé ici ne peut pas figer le curseur après un déplacement
+    /// volontaire — ce qui serait un défaut pire que celui-ci, parce que
+    /// permanent et visible de tous.
+    ///
+    /// ## Et si le plancher lui-même est faux
+    ///
+    /// Il peut l'être : le sondeur publie la position AVANT d'appliquer sa
+    /// garde `stale_start_position`, si bien qu'un renderer qui rejoue la
+    /// position de la session précédente (DMP-A6/A8) peut relever le plancher
+    /// d'un coup. [`ZoneState::reculs_de_position`] borne ce mensonge : après
+    /// [`OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER`] observations consécutives sous
+    /// le plancher, le renderer a raison et le plancher cède. La garde
+    /// n'immobilise donc jamais le curseur durablement.
+    ///
+    /// Rend la position RETENUE : l'appelant doit émettre celle-là, sinon
+    /// l'état servi par `GET /zones` et l'évènement `position` divergeraient et
+    /// l'écran reculerait quand même.
+    pub async fn update_position(&self, zone_id: i64, position_ms: i64) -> i64 {
+        let mut zones = self.zones.lock().await;
+        let Some(state) = zones.get_mut(&zone_id) else {
+            return position_ms;
+        };
+        if position_ms >= state.position_ms {
+            state.reculs_de_position = 0;
+            state.position_ms = position_ms;
+            return position_ms;
+        }
+        state.reculs_de_position = state.reculs_de_position.saturating_add(1);
+        if state.reculs_de_position >= OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER {
+            state.reculs_de_position = 0;
+            state.position_ms = position_ms;
+            return position_ms;
+        }
+        state.position_ms
+    }
+
+    /// Reposer la position d'une zone SANS garde de monotonie — le geste vient
+    /// de Tune, pas du renderer.
+    ///
+    /// Pendant du contrat décrit par [`PlaybackManager::update_position`] : ce
+    /// qui descend le plancher doit le dire. L'avance gapless est le seul
+    /// changement de piste qui n'emprunte pas [`PlaybackManager::play`] (elle
+    /// évite exprès le rebond de `track_generation`, voir
+    /// `advance_queue_metadata`) : sans ce chemin explicite, la remise à 0 de la
+    /// piste suivante serait prise pour un recul du renderer et le curseur
+    /// resterait collé à la fin de la piste précédente (#3229).
+    pub async fn reset_position(&self, zone_id: i64, position_ms: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.position_ms = position_ms;
+            state.reculs_de_position = 0;
         }
     }
 
@@ -1147,6 +1270,7 @@ mod tests {
                 ..Default::default()
             }),
             position_ms: 0,
+            reculs_de_position: 0,
             pending_resume_ms: None,
             volume: 1.0,
             muted: false,
@@ -1564,6 +1688,150 @@ mod tests {
             pm.get_state(4).await.position_ms,
             151_000,
             "le curseur doit suivre le son, pas retomber à 0:00 (#2876)"
+        );
+    }
+
+    // ── #3229 — la position publiée ne recule pas DANS une piste ────────────
+    //
+    // Jean Valjean, fil 893, 02/07/2026, v0.8.233 : « le temps affiché dépasse
+    // la durée de la piste, puis RECULE (3:02 → 2:59) ».
+    //
+    // Les quatre épreuves qui suivent tiennent ensemble ou pas du tout : la
+    // première seule serait satisfaite par un curseur figé, ce qui est un
+    // défaut PIRE — permanent, et visible de tout le monde.
+
+    /// La piste de Jean Valjean : 2:59 au compteur, un renderer qui redescend.
+    fn la_piste_du_fil_893() -> super::NowPlaying {
+        super::NowPlaying {
+            track_id: Some(893),
+            title: "Fil 893".into(),
+            duration_ms: 179_000,
+            ..Default::default()
+        }
+    }
+
+    /// 1. RECUL SUBI — aucun geste de l'auditeur, le renderer se contredit.
+    ///
+    /// Signature exacte de Jean Valjean : la position atteint la durée, puis le
+    /// renderer rend 2:59 puis 2:56. Rien ne doit redescendre à l'écran.
+    #[tokio::test]
+    async fn un_recul_du_renderer_ne_descend_pas_a_l_ecran() {
+        let pm = super::PlaybackManager::new();
+        pm.play(1, la_piste_du_fil_893()).await;
+
+        assert_eq!(pm.update_position(1, 176_000).await, 176_000);
+        assert_eq!(pm.update_position(1, 179_000).await, 179_000);
+
+        // Le renderer redescend — 3:02 borné à 2:59, puis 2:56.
+        assert_eq!(
+            pm.update_position(1, 176_000).await,
+            179_000,
+            "le recul subi ne doit pas être publié (#3229)"
+        );
+        assert_eq!(
+            pm.get_state(1).await.position_ms,
+            179_000,
+            "l'état servi par GET /zones doit dire la même chose que l'évènement"
+        );
+    }
+
+    /// 2. CONTRE-ÉPREUVE — un déplacement ARRIÈRE est suivi immédiatement.
+    ///
+    /// C'est l'épreuve qui interdit le `max()` naïf. Le déplacement abaisse le
+    /// plancher lui-même : aucune tolérance, aucun délai, aucun tour de sonde à
+    /// attendre.
+    #[tokio::test]
+    async fn un_deplacement_arriere_est_suivi_immediatement() {
+        let pm = super::PlaybackManager::new();
+        pm.play(1, la_piste_du_fil_893()).await;
+        assert_eq!(pm.update_position(1, 170_000).await, 170_000);
+
+        // L'auditeur revient à 0:30.
+        pm.seek(1, 30_000).await;
+        assert_eq!(pm.get_state(1).await.position_ms, 30_000);
+
+        // Et le renderer repart de là : DÈS la première observation.
+        assert_eq!(
+            pm.update_position(1, 31_000).await,
+            31_000,
+            "après un déplacement arrière le curseur doit suivre, pas rester \
+             collé au maximum atteint (#3229)"
+        );
+    }
+
+    /// 3. CHANGEMENT DE PISTE — la position repart de zéro. Par les DEUX
+    /// chemins, car ils ne sont pas le même.
+    ///
+    /// `play()` est le chemin ordinaire. L'avance gapless, elle, n'y passe
+    /// PAS : `advance_queue_metadata` évite exprès le rebond de
+    /// `track_generation` et repose la position par `reset_position`. Un garde
+    /// qui n'aurait connu que `play()` aurait figé le curseur à la fin de la
+    /// piste précédente sur tout un album enchaîné.
+    #[tokio::test]
+    async fn un_changement_de_piste_repart_de_zero_par_les_deux_chemins() {
+        let pm = super::PlaybackManager::new();
+
+        // (a) Chemin ordinaire.
+        pm.play(1, la_piste_du_fil_893()).await;
+        assert_eq!(pm.update_position(1, 179_000).await, 179_000);
+        pm.play(1, la_piste_du_fil_893()).await;
+        assert_eq!(pm.get_state(1).await.position_ms, 0);
+        assert_eq!(
+            pm.update_position(1, 1_000).await,
+            1_000,
+            "la piste suivante doit pouvoir compter depuis 0:00"
+        );
+
+        // (b) Avance gapless — ce que fait `advance_queue_metadata`.
+        pm.play(2, la_piste_du_fil_893()).await;
+        assert_eq!(pm.update_position(2, 179_000).await, 179_000);
+        pm.update_now_playing(2, la_piste_du_fil_893()).await;
+        pm.reset_position(2, 0).await;
+        assert_eq!(
+            pm.update_position(2, 1_000).await,
+            1_000,
+            "une avance gapless ne passe pas par play() : sans reset_position \
+             le curseur resterait collé à la fin de la piste précédente (#3229)"
+        );
+    }
+
+    /// 4. LA SOUPAPE — un plancher faux ne fige pas le curseur pour toujours.
+    ///
+    /// Le sondeur publie la position AVANT d'appliquer `stale_start_position` :
+    /// un renderer qui rejoue la position de la session précédente (DMP-A6/A8)
+    /// peut donc relever le plancher d'un coup. Après
+    /// `OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER` observations consécutives sous ce
+    /// plancher, c'est le renderer qui a raison.
+    #[tokio::test]
+    async fn un_renderer_qui_insiste_finit_par_etre_suivi() {
+        let pm = super::PlaybackManager::new();
+        pm.play(1, la_piste_du_fil_893()).await;
+
+        // Plancher empoisonné par un fantôme de la session précédente.
+        assert_eq!(pm.update_position(1, 174_000).await, 174_000);
+
+        // Le renderer, lui, joue vraiment le début de la piste.
+        for (tour, honnete) in [3_000, 4_000, 5_000, 6_000].into_iter().enumerate() {
+            assert_eq!(
+                pm.update_position(1, honnete).await,
+                174_000,
+                "tour {} : le plancher tient encore",
+                tour + 1
+            );
+        }
+        assert_eq!(
+            pm.update_position(1, 7_000).await,
+            7_000,
+            "au cinquième tour consécutif sous le plancher, le renderer a \
+             raison : la garde ne fige jamais le curseur durablement (#3229)"
+        );
+
+        // Et le compteur est reparti à zéro : la garde protège de nouveau.
+        assert_eq!(pm.update_position(1, 8_000).await, 8_000);
+        assert_eq!(
+            pm.update_position(1, 7_500).await,
+            8_000,
+            "une secousse isolée redevient inoffensive après que le plancher a cédé"
         );
     }
 }
