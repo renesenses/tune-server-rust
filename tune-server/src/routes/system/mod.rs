@@ -113,6 +113,12 @@ pub fn router() -> Router<AppState> {
         .route("/backups/encrypt", post(backup::create_encrypted_backup))
         .route("/database/export", get(database::export_database))
         .route("/update/check", get(update::update_check))
+        // Stable ou bêta : QUELLES versions `/update/check` a le droit de
+        // proposer (#2266). Défaut `auto` = comportement historique.
+        .route(
+            "/update/channel",
+            get(update::update_channel_get).put(update::update_channel_set),
+        )
         .route("/changelog", get(update::changelog))
         .route(
             "/peers",
