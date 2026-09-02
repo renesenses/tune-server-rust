@@ -1316,8 +1316,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let cache_dir = crate::routes::library::artwork_cache_dir();
         let mut inserted = 0i64;
         let mut updated = 0i64;
-        let mut db_insert_failed = 0i64;
-        let mut db_update_failed = 0i64;
+        // `db_insert_failed` / `db_update_failed` ne sont plus tenus ici : le
+        // lot REND son manque à écrire au parcours, qui l'agrège dans
+        // `ScanStats` (#2939). Un compteur tenu de ce côté-ci restait invisible
+        // au résumé publié par `batched_scan_complete` — la ligne du journal
+        // qui annonçait `metadata_failed=0` douze millisecondes avant quatorze
+        // refus d'insertion.
         // `skipped` stays the aggregate the UI already shows. Each cause is
         // broken out below, including only those duplicate candidates whose
         // complete files were confirmed byte-for-byte.
@@ -1365,7 +1369,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // batches were already read by the walker, but no DB work is
                 // done for them.
                 if scan_cancel_requested() {
-                    return;
+                    // Rien n'a été présenté à la base : rien n'a pu être
+                    // refusé. Un scan arrêté n'est pas un scan qui perd.
+                    return tune_core::scanner::walker::EcrituresDuLot::SANS_PERTE;
                 }
                 // Collect tracks to batch-insert and batch-update
                 let mut to_insert: Vec<tune_core::db::models::Track> =
@@ -1534,8 +1540,15 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         }
                     }
                 }
-                db_insert_failed += to_insert.len() as i64 - batch_inserted;
-                db_update_failed += to_update.len() as i64 - batch_updated;
+                // Le manque à écrire de ce lot. Il repart au parcours à la fin
+                // de la fermeture : c'est LUI qui publie le résumé de fin de
+                // scan, et c'est ce résumé qui annonçait « sans erreur »
+                // pendant que quatorze pistes étaient refusées (#2939).
+                let ecritures = tune_core::scanner::walker::EcrituresDuLot::manque(
+                    to_insert.len(),
+                    batch_inserted as usize,
+                )
+                .avec_manque_a_la_mise_a_jour(to_update.len(), batch_updated as usize);
                 inserted += batch_inserted;
                 updated += batch_updated;
 
@@ -1642,8 +1655,18 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         }),
                     );
                 }
+
+                ecritures
             },
         );
+
+        // Ce que la base a refusé d'écrire, agrégé par le parcours sur tous
+        // les lots (#2939). Une seule source pour la ligne de journal
+        // `batched_scan_complete` et pour les trois consommateurs du rapport
+        // de fin de scan — deux décomptes séparés, c'est deux décomptes qui
+        // divergent.
+        let db_insert_failed = scan_stats.db_insert_failed as i64;
+        let db_update_failed = scan_stats.db_update_failed as i64;
 
         // Les extensions manifestement non prises en charge sont comptées dès
         // le parcours. Le cas DFF/DST exige une lecture d'en-tête : elle est

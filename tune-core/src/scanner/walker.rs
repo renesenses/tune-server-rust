@@ -314,6 +314,84 @@ pub struct ScanStats {
     /// manque pour instruire « des fichiers présents dans l'explorateur sont
     /// absents de Tune » (#2365, #2802).
     pub unsupported_paths: Vec<String>,
+    /// Les lignes que la BASE a refusées à l'insertion, sur l'ensemble du scan
+    /// (#2939).
+    ///
+    /// Ce compteur-ci n'est pas de la même nature que les précédents et c'est
+    /// tout son intérêt. `metadata_failed` compte des LECTURES de fichier :
+    /// il vaut 0 dès que les balises se lisent, quoi qu'il advienne ensuite.
+    /// Chez Alain Bonnel (fil 1313), les quatorze fichiers d'un album se sont
+    /// lus sans une erreur — `metadata_ok=14 metadata_failed=0` — puis les
+    /// quatorze insertions ont été refusées (`UNIQUE constraint failed:
+    /// tracks.file_path`). Le résumé de fin de scan annonçait donc un scan
+    /// sans le moindre défaut alors qu'un album entier venait d'être perdu.
+    ///
+    /// L'écriture en base n'est pas faite par ce module : elle est faite par
+    /// la fermeture passée à [`scan_files_batched`]. C'est pourquoi cette
+    /// fermeture REND désormais son verdict d'écriture ([`EcrituresDuLot`])
+    /// au lieu de ne rien rendre — le compteur ne peut plus rester à zéro
+    /// pendant que l'appelant, lui, sait très bien qu'il a perdu des pistes.
+    pub db_insert_failed: usize,
+    /// Les lignes que la base a refusées à la MISE À JOUR — même mécanique et
+    /// même raison que [`Self::db_insert_failed`].
+    pub db_update_failed: usize,
+}
+
+impl ScanStats {
+    /// Le scan a-t-il perdu quelque chose en chemin ?
+    ///
+    /// Un seul endroit pour répondre, parce que la question s'est déjà posée
+    /// à trois endroits recopiés à la main (#2012). « Sans erreur » ne veut
+    /// pas dire « toutes les balises se sont lues » : un fichier lu puis
+    /// refusé par la base est perdu tout autant qu'un fichier illisible.
+    pub fn a_perdu_des_pistes(&self) -> bool {
+        self.metadata_failed > 0 || self.db_insert_failed > 0 || self.db_update_failed > 0
+    }
+}
+
+/// Ce qu'un lot a réellement réussi à ÉCRIRE, rendu par la fermeture
+/// d'importation à [`scan_files_batched`] (#2939).
+///
+/// Le parcours lit des fichiers ; il n'écrit rien en base. Sans ce retour, le
+/// résumé qu'il publie ne peut parler que de lecture — et c'est exactement ce
+/// qui s'est produit : `batched_scan_complete total=14 metadata_ok=14
+/// metadata_failed=0` pour un lot dont les quatorze insertions ont été
+/// refusées. Un `()` en valeur de retour ne pose aucune question à
+/// l'appelant ; cette structure-ci l'oblige à répondre.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EcrituresDuLot {
+    /// Lignes présentées à l'insertion et refusées par la base.
+    pub insert_failed: usize,
+    /// Lignes présentées à la mise à jour et refusées par la base.
+    pub update_failed: usize,
+}
+
+impl EcrituresDuLot {
+    /// Le lot n'a rien perdu — la valeur d'un import qui s'est bien passé.
+    pub const SANS_PERTE: Self = Self {
+        insert_failed: 0,
+        update_failed: 0,
+    };
+
+    /// Le manque à écrire d'un lot : ce qui a été présenté moins ce qui est
+    /// entré. Écrit une fois ici plutôt que soustrait à la main chez chacun
+    /// des deux appelants — c'est la soustraction qui diverge.
+    pub fn manque(presentees_a_l_insertion: usize, insertions_reussies: usize) -> Self {
+        Self {
+            insert_failed: presentees_a_l_insertion.saturating_sub(insertions_reussies),
+            update_failed: 0,
+        }
+    }
+
+    /// Ajoute le manque à la mise à jour, sur le même modèle.
+    pub fn avec_manque_a_la_mise_a_jour(
+        mut self,
+        presentees: usize,
+        mises_a_jour_reussies: usize,
+    ) -> Self {
+        self.update_failed = presentees.saturating_sub(mises_a_jour_reussies);
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -1376,6 +1454,12 @@ pub fn scan_files_parallel(
         unsupported_by_ext,
         unsupported_reasons,
         unsupported_paths,
+        // Ce parcours-ci n'écrit rien en base : il rend les fichiers lus à son
+        // appelant, qui importe ensuite. Il ne peut donc rien constater sur
+        // les écritures — seul le chemin PAR LOTS reçoit ce verdict de sa
+        // fermeture d'import (#2939).
+        db_insert_failed: 0,
+        db_update_failed: 0,
     };
     if !failed.is_empty() {
         let listing: Vec<String> = failed
@@ -1423,12 +1507,19 @@ pub const SCAN_BATCH_SIZE: usize = 500;
 /// It runs on a rayon worker thread, so the caller must ensure any shared
 /// state (DB handle, caches) is `Send + Sync`.
 ///
+/// Elle REND ce qu'elle a réellement écrit ([`EcrituresDuLot`]) : le parcours
+/// ne touche pas à la base et ne peut donc pas mesurer lui-même ce qu'elle a
+/// refusé. Sans ce retour, le résumé publié plus bas ne parle que de lecture
+/// de balises et annonce un scan sans erreur alors qu'un album entier vient
+/// d'être refusé à l'insertion (#2939, Alain Bonnel, fil 1313). Un import qui
+/// n'a rien perdu rend [`EcrituresDuLot::SANS_PERTE`].
+///
 /// Returns aggregate `ScanStats` over all batches.
 pub fn scan_files_batched(
     files: &[PathBuf],
     with_hash: bool,
     batch_size: usize,
-    mut on_batch: impl FnMut(Vec<ScannedFile>, usize, usize),
+    mut on_batch: impl FnMut(Vec<ScannedFile>, usize, usize) -> EcrituresDuLot,
 ) -> ScanStats {
     let total = files.len();
     let batch_sz = if batch_size == 0 {
@@ -1608,7 +1699,20 @@ pub fn scan_files_batched(
             "scan_batch_complete"
         );
 
-        on_batch(batch, batch_idx, total);
+        // Ce que l'import a REFUSÉ d'écrire entre ici et le résumé de fin
+        // (#2939). Le parcours ne le sait que parce que la fermeture le lui
+        // dit ; il ne peut pas le déduire.
+        let ecritures = on_batch(batch, batch_idx, total);
+        aggregate.db_insert_failed += ecritures.insert_failed;
+        aggregate.db_update_failed += ecritures.update_failed;
+        if ecritures.insert_failed > 0 || ecritures.update_failed > 0 {
+            warn!(
+                batch = batch_idx,
+                insert_failed = ecritures.insert_failed,
+                update_failed = ecritures.update_failed,
+                "scan_batch_writes_refused — la base a refusé des lignes de ce lot"
+            );
+        }
     }
 
     if aggregate.metadata_timeout > 0 {
@@ -1619,11 +1723,19 @@ pub fn scan_files_batched(
         );
     }
 
+    // `metadata_failed` ne répond pas à « ce scan a-t-il perdu des pistes ? » —
+    // il répond à « les balises se sont-elles lues ? ». Les deux compteurs
+    // d'écriture sont là pour que cette ligne, la seule qu'on aura entre les
+    // mains la prochaine fois, ne puisse plus annoncer un scan sans défaut
+    // pendant qu'un album entier est refusé par la base (#2939).
     info!(
         total = aggregate.total_files,
         metadata_ok = aggregate.metadata_ok,
         metadata_failed = aggregate.metadata_failed,
         metadata_timeout = aggregate.metadata_timeout,
+        db_insert_failed = aggregate.db_insert_failed,
+        db_update_failed = aggregate.db_update_failed,
+        pistes_perdues = aggregate.a_perdu_des_pistes(),
         "batched_scan_complete"
     );
 
@@ -2199,10 +2311,16 @@ mod tests {
         let mut batch_files = Vec::new();
         let batch_stats = scan_files_batched(&listed.files, false, 1, |batch, _, _| {
             batch_files.extend(batch);
+            EcrituresDuLot::SANS_PERTE
         });
         assert_eq!(batch_files.len(), 1);
         assert!(batch_files[0].unsupported.is_some());
         assert_eq!(batch_stats.metadata_failed, 0);
+        // Un import qui ne perd rien laisse les deux compteurs d'écriture à
+        // zéro : le résumé ne doit pas devenir alarmiste (#2939).
+        assert_eq!(batch_stats.db_insert_failed, 0);
+        assert_eq!(batch_stats.db_update_failed, 0);
+        assert!(!batch_stats.a_perdu_des_pistes());
         assert_eq!(batch_stats.unsupported_by_ext.get("dff-dst"), Some(&1));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -185,6 +185,13 @@ path = "tests/ape_incremental_i2505.rs"
 name = "ape_pic_memoire_i2505"
 path = "tests/ape_pic_memoire_i2505.rs"
 
+# `autotests = false` : sans cette cible, le fichier ne serait jamais compile.
+# Il tient le resume de fin de scan (#2939) — un scan qui perd des pistes ne
+# peut plus annoncer zero echec, et un scan qui reussit annonce toujours zero.
+[[test]]
+name = "scan_refus_insertion_comptes_2939"
+path = "tests/scan_refus_insertion_comptes_2939.rs"
+
 [[bench]]
 name = "dsd_to_pcm"
 harness = false
