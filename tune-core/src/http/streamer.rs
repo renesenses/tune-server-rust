@@ -475,6 +475,156 @@ pub fn forget_radio_now(stream_id: &str) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Par où le renderer apprend qu'un morceau a changé (#2991)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `publish_radio_now` ci-dessus DÉPOSE le titre courant. Il ne dit rien de ce
+// qui va le RELIRE. Or le seul canal qui puisse porter un changement de morceau
+// jusqu'à un renderer DLNA en cours de flux est la fenêtre ICY, et elle ne
+// s'ouvre que si trois choses se rencontrent :
+//
+//   1. le now-playing de la zone porte un `stream_id` — sans lui, le dépôt
+//      ci-dessus n'a même pas lieu (la garde du poller) ;
+//   2. la requête du renderer a été servie par la branche « flux » de
+//      `handle_stream` — les branches fichier et mandataire n'insèrent AUCUN
+//      bloc ICY, quoi que le renderer ait demandé ;
+//   3. le renderer a demandé les métadonnées en cours de flux (en-tête ICY de
+//      requête) et la fenêtre `icy-metaint` lui a été accordée.
+//
+// Quand l'une des trois manque, tout continue de fonctionner CÔTÉ TUNE — le
+// now-playing de l'interface est mis à jour par un autre chemin — et l'écran du
+// lecteur réseau reste figé sur le premier morceau. C'est exactement le tableau
+// décrit par Serge Asselin (Hifi Rose RS250A, fil 1529) : « dans Tune ça
+// fonctionne, mais sur le RS250A l'écran demeure avec la pochette et le titre de
+// la première écoute ».
+//
+// On ne pouvait pas trancher laquelle des trois mordait : rien ne les
+// rapprochait. Ce registre le fait, par le `stream_id`, la seule clé que le
+// gestionnaire de flux et le poller partagent déjà — même patron que
+// `RADIO_NOW`, et la même durée de vie (voir `remove_session`).
+
+/// La branche de `handle_stream` qui a servi la requête. Seule [`VOIE_FLUX`]
+/// sait découper le corps et y insérer des blocs ICY (`decoupe_icy`) ; les deux
+/// autres recopient des octets et ne peuvent, par construction, porter aucune
+/// mise à jour de métadonnées.
+pub const VOIE_FLUX: &str = "flux";
+/// Branche fichier (`serve_file`) : Range, `Content-Length`, aucun ICY.
+pub const VOIE_FICHIER: &str = "fichier";
+/// Branche mandataire (`proxy_stream`) : recopie de l'amont, aucun ICY.
+pub const VOIE_MANDATAIRE: &str = "mandataire";
+
+/// Ce qui a été négocié avec le renderer sur une session de flux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanalIcy {
+    /// Le renderer a demandé les métadonnées en cours de flux (en-tête ICY de
+    /// requête ; le gestionnaire de flux le lit sous le nom `wants_icy`).
+    pub demande: bool,
+    /// La fenêtre `icy-metaint` lui a effectivement été annoncée.
+    pub accorde: bool,
+    /// La branche qui l'a servi (une des trois constantes ci-dessus).
+    pub voie: &'static str,
+}
+
+static ICY_NEGOCIE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, CanalIcy>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Noter ce qui a été négocié pour une session. Appelé par le gestionnaire de
+/// flux sur les TROIS branches — y compris celles qui ne portent pas d'ICY :
+/// « aucune trace » et « servi par une voie sans ICY » sont deux diagnostics
+/// différents, et c'est justement celui-là qu'on n'avait pas.
+pub fn note_icy_channel(stream_id: &str, demande: bool, accorde: bool, voie: &'static str) {
+    if let Ok(mut map) = ICY_NEGOCIE.lock() {
+        map.insert(
+            stream_id.to_string(),
+            CanalIcy {
+                demande,
+                accorde,
+                voie,
+            },
+        );
+    }
+}
+
+/// Relire ce qui a été négocié, si un renderer s'est connecté à ce flux.
+pub fn icy_channel(stream_id: &str) -> Option<CanalIcy> {
+    ICY_NEGOCIE.lock().ok()?.get(stream_id).copied()
+}
+
+/// Oublier une session terminée (même vie que [`forget_radio_now`]).
+pub fn forget_icy_channel(stream_id: &str) {
+    if let Ok(mut map) = ICY_NEGOCIE.lock() {
+        map.remove(stream_id);
+    }
+}
+
+/// Le verdict : par où — ou par où PAS — le changement de morceau atteint le
+/// renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanalRadio {
+    /// Fenêtre ICY accordée : les blocs partent, l'écran peut suivre.
+    Icy,
+    /// Servi par une branche qui n'insère aucun bloc ICY (fichier, mandataire).
+    VoieSansIcy,
+    /// Le renderer n'a pas demandé les métadonnées en cours de flux.
+    IcyNonDemande,
+    /// Demandé, mais la session ne remplissait pas les conditions d'ouverture.
+    IcyRefuse,
+    /// Un `stream_id` existe, mais aucun renderer ne s'y est encore connecté.
+    AucuneConnexion,
+    /// Le now-playing ne porte AUCUN `stream_id` : rien n'est même publié.
+    SansStreamId,
+}
+
+impl CanalRadio {
+    /// Le changement de morceau atteint-il réellement le renderer ?
+    pub fn atteint_le_renderer(self) -> bool {
+        matches!(self, CanalRadio::Icy)
+    }
+
+    /// Le libellé qui part au journal. Écrit pour être lu SEUL : une seule
+    /// ligne doit suffire à savoir laquelle des branches mord.
+    ///
+    /// L'en-tête de requête n'y est pas épelé : le garde #3018
+    /// (`tune-core/tests/pochette_radio_source_unique.rs`) réserve cette chaîne
+    /// à `src/radio_metadata.rs`, pour qu'une recherche dans le code ne trouve
+    /// qu'UN endroit où l'on lit les métadonnées radio. Le gestionnaire de flux
+    /// le nomme, lui, dans `icy_metadata_negotiated`.
+    pub fn libelle(self) -> &'static str {
+        match self {
+            CanalRadio::Icy => "icy — fenêtre accordée, les blocs partent",
+            CanalRadio::VoieSansIcy => {
+                "aucun — servi par une voie qui n'insère aucun bloc ICY (fichier ou mandataire)"
+            }
+            CanalRadio::IcyNonDemande => {
+                "aucun — le renderer n'a pas demandé les métadonnées en cours de flux"
+            }
+            CanalRadio::IcyRefuse => "aucun — métadonnées demandées, fenêtre ICY refusée",
+            CanalRadio::AucuneConnexion => "aucun — aucun renderer connecté à ce flux",
+            CanalRadio::SansStreamId => "aucun — le now-playing ne porte pas de stream_id",
+        }
+    }
+}
+
+/// Trancher, pour le `stream_id` d'un now-playing radio, par où le changement
+/// de morceau va passer.
+///
+/// Fonction PURE au sens qui compte ici : elle ne lit que les deux registres et
+/// se prouve donc sans réseau, sans renderer et sans Hifi Rose. C'est elle que
+/// le poller appelle, et c'est elle que les épreuves appellent.
+pub fn canal_radio(stream_id: Option<&str>) -> CanalRadio {
+    let Some(sid) = stream_id else {
+        return CanalRadio::SansStreamId;
+    };
+    match icy_channel(sid) {
+        None => CanalRadio::AucuneConnexion,
+        Some(c) if c.accorde => CanalRadio::Icy,
+        Some(c) if c.voie != VOIE_FLUX => CanalRadio::VoieSansIcy,
+        Some(c) if c.demande => CanalRadio::IcyRefuse,
+        Some(_) => CanalRadio::IcyNonDemande,
+    }
+}
+
 pub struct AudioStreamer {
     sessions: Arc<Mutex<HashMap<String, Arc<StreamSession>>>>,
     port: u16,
@@ -769,6 +919,8 @@ impl AudioStreamer {
         // Le registre des titres radio suit la vie de la session : sans ça il
         // grossirait d'une entree par flux ecoute, et pour toujours.
         forget_radio_now(stream_id);
+        // Même vie pour le canal négocié (#2991) : une entrée par flux écouté.
+        forget_icy_channel(stream_id);
         // Clean up temp transcode files created by the pre-transcode pipeline.
         // Only delete files under the system temp dir with the tune-transcode prefix
         // to avoid accidentally removing actual music files.
@@ -1828,5 +1980,91 @@ mod tests {
 
         assert_eq!(retires, 0);
         assert!(session_presente(&streamer, &id).await);
+    }
+
+    // ────────────── #2991 — par où le renderer apprend le changement ─────────
+    //
+    // Ces épreuves appellent `canal_radio`, la fonction que le poller appelle.
+    // Chaque identifiant porte la clé de l'agent : les deux registres sont des
+    // `static`, partagés par toutes les épreuves du même binaire.
+
+    /// La branche que la garde du poller traversait EN SILENCE. Sans
+    /// `stream_id`, rien n'est publié — et il faut que ça se sache.
+    #[test]
+    fn sans_stream_id_le_canal_le_dit_au_lieu_de_se_taire() {
+        assert_eq!(canal_radio(None), CanalRadio::SansStreamId);
+        assert!(!canal_radio(None).atteint_le_renderer());
+        assert!(
+            canal_radio(None).libelle().contains("stream_id"),
+            "le libellé doit nommer la cause, il est lu SEUL au journal"
+        );
+    }
+
+    /// Un `stream_id` connu du poller mais auquel aucun renderer ne s'est
+    /// connecté ne prouve rien : ce n'est ni un succès ni un refus d'ICY.
+    #[test]
+    fn sans_connexion_le_canal_ne_conclut_pas_a_l_icy() {
+        let sid = "i2991-a4f218-jamais-connecte";
+        forget_icy_channel(sid);
+        assert_eq!(canal_radio(Some(sid)), CanalRadio::AucuneConnexion);
+    }
+
+    /// Les deux hypothèses ouvertes du ticket, que rien ne distinguait :
+    /// « le renderer n'a pas demandé l'ICY » et « il l'a demandé et on le lui a
+    /// accordé ». Elles rendent maintenant deux verdicts différents.
+    #[test]
+    fn le_canal_distingue_l_icy_accorde_du_non_demande() {
+        let accorde = "i2991-a4f218-accorde";
+        note_icy_channel(accorde, true, true, VOIE_FLUX);
+        assert_eq!(canal_radio(Some(accorde)), CanalRadio::Icy);
+        assert!(canal_radio(Some(accorde)).atteint_le_renderer());
+
+        let muet = "i2991-a4f218-non-demande";
+        note_icy_channel(muet, false, false, VOIE_FLUX);
+        assert_eq!(canal_radio(Some(muet)), CanalRadio::IcyNonDemande);
+        assert!(!canal_radio(Some(muet)).atteint_le_renderer());
+
+        let refuse = "i2991-a4f218-refuse";
+        note_icy_channel(refuse, true, false, VOIE_FLUX);
+        assert_eq!(canal_radio(Some(refuse)), CanalRadio::IcyRefuse);
+
+        forget_icy_channel(accorde);
+        forget_icy_channel(muet);
+        forget_icy_channel(refuse);
+    }
+
+    /// Les branches fichier et mandataire ne découpent pas le corps : elles ne
+    /// peuvent porter AUCUN bloc, même à un renderer qui a demandé l'ICY. Ce
+    /// verdict-là ne doit pas être confondu avec un refus.
+    #[test]
+    fn une_voie_sans_decoupe_ne_porte_aucun_bloc_meme_si_l_icy_est_demande() {
+        for voie in [VOIE_FICHIER, VOIE_MANDATAIRE] {
+            let sid = format!("i2991-a4f218-voie-{voie}");
+            note_icy_channel(&sid, true, false, voie);
+            assert_eq!(
+                canal_radio(Some(&sid)),
+                CanalRadio::VoieSansIcy,
+                "la voie « {voie} » n'insère aucun bloc ICY"
+            );
+            forget_icy_channel(&sid);
+        }
+    }
+
+    /// Le registre suit la vie de la session, comme `RADIO_NOW` : sinon il
+    /// grossirait d'une entrée par flux écouté, et un `stream_id` réémployé
+    /// hériterait du verdict d'un autre appareil.
+    #[tokio::test]
+    async fn retirer_une_session_oublie_son_canal() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready, _session) = streamer.create_radio_session(info_de_test(), 8).await;
+        note_icy_channel(&id, true, true, VOIE_FLUX);
+        assert_eq!(canal_radio(Some(&id)), CanalRadio::Icy);
+
+        streamer.remove_session(&id).await;
+        assert_eq!(
+            canal_radio(Some(&id)),
+            CanalRadio::AucuneConnexion,
+            "le canal négocié doit mourir avec la session"
+        );
     }
 }

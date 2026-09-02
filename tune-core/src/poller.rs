@@ -373,6 +373,40 @@ pub(crate) mod decisions {
         TenueDuRenderer::AutreApplication
     }
 
+    /// Retrouver, dans l'URI qu'un renderer déclare jouer, le `stream_id` de la
+    /// session Tune qu'il tire.
+    ///
+    /// ── Pourquoi cette fonction existe (#2991) ──
+    ///
+    /// La reprise « le renderer joue, Tune ne le croyait pas » reconstruit un
+    /// now-playing depuis la BASE (`last_track_source`, `last_track_source_id`)
+    /// et pose `stream_id: None` — la base ne mémorise pas l'identifiant d'une
+    /// session, qui est éphémère. Pour une piste locale c'est sans conséquence.
+    /// Pour une RADIO, c'est la panne : `refresh_radio_metadata` recopie ce
+    /// `None` dans chaque now-playing suivant, et la garde qui publie le titre
+    /// vers le flux ne mord plus JAMAIS de toute la session. L'interface Tune,
+    /// elle, continue d'être servie par `update_now_playing`, qui ne dépend pas
+    /// du `stream_id` — d'où « dans Tune ça fonctionne, sur le lecteur réseau
+    /// non » (Serge Asselin, Hifi Rose RS250A, fil 1529).
+    ///
+    /// L'identifiant n'est pas perdu : le renderer l'annonce lui-même, dans
+    /// l'URI qu'il est en train de tirer. On ne l'invente pas, on le RELIT — et
+    /// l'appelant vérifie ensuite auprès du gestionnaire de flux que cette
+    /// session est bien l'une des NÔTRES (une URI `/stream/…` peut venir d'un
+    /// autre Tune du réseau, cf. [`TenueDuRenderer::AutreServeurTune`]).
+    ///
+    /// La découpe `<id>.<ext>` est celle du serveur de flux lui-même
+    /// ([`crate::http::streamer::extract_stream_id`]), appelée et non recopiée :
+    /// le jour où la convention change, les deux bougent ensemble.
+    pub fn stream_id_de_l_uri(current_uri: Option<&str>) -> Option<String> {
+        let uri = current_uri?.trim();
+        let apres = uri.rsplit_once("/stream/")?.1;
+        // Un renderer peut recopier une chaîne de requête ou une ancre.
+        let sans_suffixe = apres.split(['?', '#']).next().unwrap_or(apres);
+        let id = crate::http::streamer::extract_stream_id(sans_suffixe);
+        (!id.is_empty()).then(|| id.to_string())
+    }
+
     use super::{
         DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_STUCK_THRESHOLD,
         GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
@@ -2908,12 +2942,54 @@ impl PositionPoller {
                             // et c'est cette classe d'écart silencieux entre le
                             // producteur et le consommateur qui a produit ce
                             // ticket. Ici, l'écart n'est plus représentable.
+                            //
+                            // ── Et ce que cette garde TAISAIT (#2991) ──
+                            //
+                            // Sans `stream_id`, le `if let` ci-dessous ne
+                            // publiait rien — en silence. L'interface Tune, elle,
+                            // était mise à jour deux lignes plus bas par
+                            // `update_now_playing`, qui ne dépend pas du
+                            // `stream_id`. « Dans Tune ça fonctionne, sur le
+                            // RS250A non » est le symptôme EXACT de cet écart, et
+                            // rien au journal ne permettait de le distinguer d'un
+                            // renderer qui n'aurait pas demandé l'ICY. Deux causes
+                            // opposées, une seule absence de trace.
+                            //
+                            // On lit donc le canal AVANT de publier, et on
+                            // journalise dans TOUS les cas — y compris celui qui
+                            // marche, sans quoi « pas de ligne » resterait
+                            // ambigu.
+                            let canal = crate::http::streamer::canal_radio(np.stream_id.as_deref());
                             if let Some(sid) = np.stream_id.as_deref() {
                                 crate::http::streamer::publish_radio_now(
                                     sid,
                                     new_np.artist_name.clone(),
                                     new_np.title.clone(),
                                     new_np.cover_path.clone(),
+                                );
+                            }
+                            // UNE ligne doit suffire à savoir laquelle des
+                            // branches mord la prochaine fois qu'un testeur
+                            // signale un écran figé. Même nom d'évènement dans
+                            // les deux cas — seul le niveau change — pour qu'un
+                            // `grep radio_refresh_channel` les ramène ensemble.
+                            let sid_journal = np.stream_id.as_deref().unwrap_or("absent");
+                            if canal.atteint_le_renderer() {
+                                debug!(
+                                    zone_id,
+                                    station = %station_name,
+                                    stream_id = sid_journal,
+                                    canal = canal.libelle(),
+                                    "radio_refresh_channel"
+                                );
+                            } else {
+                                warn!(
+                                    zone_id,
+                                    station = %station_name,
+                                    stream_id = sid_journal,
+                                    canal = canal.libelle(),
+                                    "radio_refresh_channel — le morceau a changé mais l'écran du \
+                                     lecteur réseau ne l'apprendra pas"
                                 );
                             }
                             self.playback.update_now_playing(zone_id, new_np).await;
@@ -3314,6 +3390,27 @@ impl PositionPoller {
                         .map(|t| t.title.clone())
                         .or_else(|| status.track_title.clone());
 
+                    // #2991 — ce chemin posait `stream_id: None` en dur. Sur une
+                    // RADIO, ce `None` se recopie ensuite dans chaque
+                    // now-playing produit par `refresh_radio_metadata`, et le
+                    // titre cesse définitivement d'être publié vers le flux :
+                    // l'écran du lecteur réseau reste figé sur le premier
+                    // morceau pendant que l'interface Tune, elle, suit.
+                    //
+                    // Le renderer annonce l'URI qu'il tire ; on y RELIT
+                    // l'identifiant, puis on ne l'adopte que si le gestionnaire
+                    // de flux connaît cette session — `streamer_bytes_sent`
+                    // rend `None` pour un flux inconnu, ce qui écarte l'URI
+                    // d'un AUTRE serveur Tune du réseau.
+                    let stream_id_repris =
+                        match decisions::stream_id_de_l_uri(status.current_uri.as_deref()) {
+                            Some(sid)
+                                if self.orchestrator.streamer_bytes_sent(&sid).await.is_some() =>
+                            {
+                                Some(sid)
+                            }
+                            _ => None,
+                        };
                     // Only recover if we actually know what is playing — otherwise
                     // skip so a titleless device blip never surfaces as a phantom.
                     if let Some(title) = title {
@@ -3332,11 +3429,18 @@ impl PositionPoller {
                                 .unwrap_or(status.duration_ms as i64),
                             source: last_source,
                             source_id: last_source_id,
-                            stream_id: None,
+                            stream_id: stream_id_repris,
                             ..Default::default()
                         };
+                        let stream_id_journal =
+                            np.stream_id.as_deref().unwrap_or("absent").to_string();
                         self.playback.play(zone_id, np).await;
-                        info!(zone_id, device = %device_id, "playback_recovered_from_device");
+                        info!(
+                            zone_id,
+                            device = %device_id,
+                            stream_id = %stream_id_journal,
+                            "playback_recovered_from_device"
+                        );
                     } else {
                         debug!(
                             zone_id,
@@ -6382,6 +6486,67 @@ mod tests {
             assert_eq!(
                 v,
                 TenueDuRenderer::AutreServeurTune("tune.local:8888".into())
+            );
+        }
+    }
+
+    /// #2991 — l'identifiant de session que la reprise « le renderer joue, Tune
+    /// ne le croyait pas » posait à `None`, alors que le renderer l'annonce.
+    mod stream_id_repris_de_l_uri {
+        use crate::poller::decisions::stream_id_de_l_uri;
+
+        /// Le cas nominal, celui d'un RS250A qui tire une radio transcodée.
+        #[test]
+        fn l_uri_dun_flux_tune_rend_son_identifiant() {
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://192.168.1.18:8888/stream/20dd4336-813d.wav")),
+                Some("20dd4336-813d".to_string()),
+                "l'extension doit tomber, comme le fait le serveur de flux"
+            );
+        }
+
+        /// Une chaîne de requête ou une ancre recopiée par l'appareil ne doit
+        /// pas se retrouver COLLÉE à l'identifiant : la clé ne correspondrait
+        /// plus à aucune session et la reprise retomberait sur `None`.
+        #[test]
+        fn une_requete_ou_une_ancre_ne_colle_pas_a_l_identifiant() {
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://h:8888/stream/abc-1.flac?x=1")),
+                Some("abc-1".to_string())
+            );
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://h:8888/stream/abc-1#t=0")),
+                Some("abc-1".to_string())
+            );
+        }
+
+        /// Rien à relire : on ne devine pas. Ces trois cas doivent rendre
+        /// `None`, sans quoi la reprise adopterait un identifiant inventé.
+        #[test]
+        fn rien_a_relire_ne_devine_rien() {
+            assert_eq!(stream_id_de_l_uri(None), None);
+            assert_eq!(stream_id_de_l_uri(Some("")), None);
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://192.168.1.30:57645/song/42.mp3")),
+                None,
+                "l'URI d'une autre application ne porte aucun stream_id"
+            );
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://h:8888/stream/")),
+                None,
+                "un chemin sans identifiant ne doit pas rendre la chaîne vide"
+            );
+        }
+
+        /// L'URI d'un AUTRE serveur Tune rend bien un identifiant — c'est
+        /// volontaire, et c'est l'appelant qui écarte le cas en demandant au
+        /// gestionnaire de flux s'il connaît cette session. Cette épreuve fixe
+        /// ce partage des rôles pour qu'il ne se perde pas.
+        #[test]
+        fn le_flux_dun_autre_tune_rend_un_identifiant_que_l_appelant_devra_ecarter() {
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://192.168.1.18:8888/stream/etranger-9.wav")),
+                Some("etranger-9".to_string())
             );
         }
     }
@@ -10206,5 +10371,79 @@ mod lire_ensuite_dans_la_fenetre_gapless {
         // absence — un « périmé » de trop fait payer un blanc à qui n'a rien
         // demandé.
         assert!(!decisions::gapless_arm_outdated(Some(7), None));
+    }
+}
+
+/// Garde-fou #2991 — les DEUX branchements que ce ticket a posés vivent chacun
+/// à un EMPLACEMENT précis d'une boucle de dix mille lignes. Retirés, ils
+/// restent compilés, testés et verts — et plus personne ne les appelle : le
+/// registre du canal ne serait plus lu, et la reprise reposerait `None`. C'est
+/// exactement la classe de régression silencieuse que ce ticket décrit.
+///
+/// Relecture de source, même procédé et même raison que
+/// `annonce_navigateur_guard` ci-dessus.
+#[cfg(test)]
+mod canal_radio_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe à ce module pour que
+    /// les motifs cherchés ne puissent pas se trouver eux-mêmes dans les
+    /// messages d'assertion ci-dessous (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("poller.rs");
+        const BORNE: &str = "mod canal_radio_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    fn position(motif: &str) -> usize {
+        code_de_production().find(motif).unwrap_or_else(|| {
+            panic!(
+                "motif introuvable dans poller.rs : « {motif} ».\n\
+                 Le code a été remanié ; ce garde-fou ne garde plus rien tant \
+                 qu'il n'a pas suivi. Voir #2991."
+            )
+        })
+    }
+
+    /// Le verdict doit être PRIS sur le `stream_id` qui sert à publier, et
+    /// JOURNALISÉ, avant que le now-playing ne parte vers l'interface. Sans
+    /// cette ligne, la garde `if let Some(sid)` redevient muette et « dans Tune
+    /// ça fonctionne, sur le lecteur réseau non » redevient indiagnosticable.
+    #[test]
+    fn le_changement_de_titre_journalise_par_ou_il_passe() {
+        let verdict =
+            position("let canal = crate::http::streamer::canal_radio(np.stream_id.as_deref());");
+        let publication = position("crate::http::streamer::publish_radio_now(");
+        let ligne = position("radio_refresh_channel — le morceau a changé");
+        let vers_l_interface = position("self.playback.update_now_playing(zone_id, new_np).await;");
+        assert!(
+            verdict < publication && publication < ligne && ligne < vers_l_interface,
+            "le canal doit être établi puis journalisé DANS la branche du \
+             changement de titre, avant que le now-playing ne parte à \
+             l'interface (#2991)."
+        );
+    }
+
+    /// La reprise « le renderer joue, Tune ne le croyait pas » doit relire
+    /// l'identifiant de session dans l'URI annoncée par l'appareil. Remise à
+    /// `None`, elle rend le défaut PERMANENT pour toute la session radio :
+    /// `refresh_radio_metadata` recopie ce `None` dans chaque now-playing
+    /// suivant.
+    #[test]
+    fn la_reprise_depuis_lappareil_ne_perd_plus_lidentifiant_de_session() {
+        let relecture = position("decisions::stream_id_de_l_uri(status.current_uri.as_deref())");
+        let pose = position("stream_id: stream_id_repris,");
+        let annonce = position("\"playback_recovered_from_device\"");
+        assert!(
+            relecture < pose && pose < annonce,
+            "la reprise depuis l'appareil doit reposer l'identifiant relu dans \
+             l'URI, et non `None` (#2991)."
+        );
+        assert!(
+            !code_de_production().contains("stream_id: None,\n                            ..Default::default()\n                        };\n                        self.playback.play(zone_id, np).await;"),
+            "le `stream_id: None` en dur est revenu dans la reprise depuis \
+             l'appareil (#2991)."
+        );
     }
 }

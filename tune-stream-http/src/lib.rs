@@ -314,12 +314,29 @@ pub async fn handle_stream(
     // File serving with Range support
     let file_path = session.file_path.lock().await.clone();
     if let Some(ref path) = file_path {
+        // Cette branche ne découpe pas le corps : `Icy-MetaData: 1` a beau
+        // avoir été demandé, aucun bloc ne partira jamais. On le NOTE au lieu
+        // de laisser le poller conclure « aucun renderer connecté » (#2991).
+        tune_core::http::streamer::note_icy_channel(
+            stream_id,
+            wants_icy,
+            false,
+            tune_core::http::streamer::VOIE_FICHIER,
+        );
         return serve_file(path, &session.info, &req_headers, session.clone()).await;
     }
 
     // Proxy mode
     let proxy_url = session.proxy_url.lock().await.clone();
     if let Some(ref url) = proxy_url {
+        // Idem : le mandataire recopie l'amont octet pour octet. C'est la voie
+        // que prend une radio non transcodée, et elle est SANS ICY (#2991).
+        tune_core::http::streamer::note_icy_channel(
+            stream_id,
+            wants_icy,
+            false,
+            tune_core::http::streamer::VOIE_MANDATAIRE,
+        );
         return proxy_stream(
             url,
             &session.info,
@@ -468,6 +485,16 @@ pub async fn handle_stream(
     if has_icy {
         headers.insert("icy-metaint", HeaderValue::from(ICY_METAINT as u64));
     }
+
+    // Ce que le poller n'avait aucun moyen de savoir : il publie un titre dans
+    // `radio_now` sans jamais apprendre si quelqu'un est en mesure de le
+    // relire. Le voici noté sous la clé qu'ils partagent (#2991).
+    tune_core::http::streamer::note_icy_channel(
+        stream_id,
+        wants_icy,
+        has_icy,
+        tune_core::http::streamer::VOIE_FLUX,
+    );
 
     // Sans cette ligne, ce défaut n'est pas diagnosticable à distance : le
     // journal du testeur ne disait ni si son renderer avait demandé l'ICY, ni
@@ -2302,6 +2329,128 @@ mod tests {
             corps[44..].iter().all(|o| *o == 0xAA),
             "aucun octet de métadonnées ne doit s'être glissé dans le son"
         );
+    }
+
+    // ───────── #2991 — le poller doit pouvoir SAVOIR ce qui a été négocié ────
+    //
+    // Ces épreuves passent par `handle_stream`, la fonction de production, et
+    // relisent le verdict par `canal_radio`, celle que le poller appelle. Rien
+    // n'est transcrit : si la note cessait d'être posée dans `handle_stream`,
+    // le poller conclurait « aucun renderer connecté » sur un renderer bel et
+    // bien connecté — exactement le diagnostic qu'on cherche à rendre sûr.
+
+    /// TÉMOIN. Le chemin qui marche aujourd'hui : un renderer qui demande
+    /// `Icy-MetaData: 1` obtient la fenêtre, ET le poller l'apprend.
+    #[tokio::test]
+    async fn un_renderer_qui_demande_l_icy_est_note_comme_servi() {
+        use tune_core::http::streamer::{CanalRadio, canal_radio, forget_icy_channel};
+
+        let sid = "i2991-a4f218-icy-accorde";
+        forget_icy_channel(sid);
+        let (entetes, _) = corps_radio(
+            sid,
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            true,
+            4096,
+        )
+        .await;
+
+        assert_eq!(
+            entetes.get("icy-metaint").and_then(|v| v.to_str().ok()),
+            Some("16384"),
+            "témoin : la fenêtre ICY doit rester accordée exactement comme avant"
+        );
+        assert_eq!(
+            canal_radio(Some(sid)),
+            CanalRadio::Icy,
+            "handle_stream doit avoir noté le canal accordé — sans cette note, \
+             le poller ne peut pas distinguer « ça marche » de « personne n'écoute »"
+        );
+        forget_icy_channel(sid);
+    }
+
+    /// L'HYPOTHÈSE nº 1 du ticket, jamais vérifiée sur aucun appareil depuis le
+    /// 22/08 : le renderer ne demande pas `Icy-MetaData: 1`. Elle laissait
+    /// exactement la même trace que l'hypothèse nº 2 (pas de `stream_id`) —
+    /// c'est-à-dire aucune. Elle rend maintenant un verdict qui lui est propre.
+    #[tokio::test]
+    async fn un_renderer_muet_sur_l_icy_est_note_comme_tel() {
+        use tune_core::http::streamer::{CanalRadio, canal_radio, forget_icy_channel};
+
+        let sid = "i2991-a4f218-icy-non-demande";
+        forget_icy_channel(sid);
+        let (entetes, _) = corps_radio(
+            sid,
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            false,
+            4096,
+        )
+        .await;
+
+        assert!(
+            entetes.get("icy-metaint").is_none(),
+            "témoin : rien ne change pour un renderer qui n'a pas demandé l'ICY"
+        );
+        assert_eq!(
+            canal_radio(Some(sid)),
+            CanalRadio::IcyNonDemande,
+            "le journal doit pouvoir NOMMER cette cause, au lieu de laisser \
+             Bertrand hésiter entre deux branches"
+        );
+        forget_icy_channel(sid);
+    }
+
+    /// La branche fichier ne découpe pas le corps : elle ne peut porter aucun
+    /// bloc, `Icy-MetaData: 1` ou non. « Servi par une voie sans ICY » et
+    /// « aucun renderer connecté » sont deux diagnostics différents, et c'est
+    /// justement celui-là qu'on n'avait pas.
+    #[tokio::test]
+    async fn la_branche_fichier_est_notee_comme_voie_sans_icy() {
+        use axum::extract::{Path, State};
+        use tune_core::http::streamer::{
+            CanalRadio, SharedSessions, canal_radio, forget_icy_channel,
+        };
+
+        let sid = "i2991-a4f218-voie-fichier";
+        forget_icy_channel(sid);
+
+        // Fichier réel, dans un dossier unique par appel que `Drop` emporte —
+        // panique comprise (#3030). D'autres agents tournent sur la même
+        // machine et le répertoire temporaire est partagé.
+        let bac = tune_core::test_scratch::scratch_dir("tune-i2991-a4f218");
+        let chemin = bac.join("voie-fichier.wav");
+        std::fs::write(&chemin, b"RIFF____WAVE").expect("fixture");
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new(sid.to_string(), info, false, 8));
+        *session.file_path.lock().await = Some(chemin.to_string_lossy().to_string());
+
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), session)].into_iter().collect(),
+        ));
+
+        let mut req = axum::http::HeaderMap::new();
+        // Le renderer DEMANDE l'ICY : c'est le cas piégeux, celui qu'on aurait
+        // pris pour un succès.
+        req.insert("Icy-MetaData", "1".parse().unwrap());
+        let _ = super::handle_stream(Path(format!("{sid}.wav")), State(sessions), req).await;
+
+        assert_eq!(
+            canal_radio(Some(sid)),
+            CanalRadio::VoieSansIcy,
+            "servi par la branche fichier : aucun bloc ne partira, quoi que le \
+             renderer ait demandé"
+        );
+
+        forget_icy_channel(sid);
+        drop(bac);
     }
 
     /// La frontière tombe exactement sur la fin d'un morceau : le bloc part
