@@ -8694,6 +8694,48 @@ impl PlaybackOrchestrator {
         applique_a_chaud
     }
 
+    /// La position de lecture de cette zone est-elle ENTRETENUE ?
+    ///
+    /// #2595 — Pierre M, zone 987 : basculer en mode Audiophile pendant
+    /// l'écoute fait repartir le morceau **du début**.
+    ///
+    /// [`Self::schedule_eq_replay`] relit `position_ms` pour rejouer « là où on
+    /// en était ». Or cette valeur n'est entretenue que par l'unique
+    /// `update_position` de production du sondeur — et la boucle de transport
+    /// de `poller.rs` s'ouvre sur `get_zone_device_id`, dont la branche `None`
+    /// fait `continue` **avant** cet appel. Une zone sans périphérique de
+    /// sortie — une zone navigateur, « Cet ordinateur », par conception : le
+    /// client web tire `stream_url` lui-même — n'est donc jamais observée. Son
+    /// `position_ms` reste figé sur ce que la dernière COMMANDE y a écrit,
+    /// c'est-à-dire 0 depuis `play()`, pendant que le morceau avance dans
+    /// l'onglet.
+    ///
+    /// Zéro n'est alors pas une position : c'est une absence de mesure.
+    /// Rejouer dessus n'est pas « reprendre », c'est recommencer.
+    ///
+    /// Le prédicat est **celui du sondeur, à l'identique** et à dessein, et il
+    /// est STRUCTUREL — pas un seuil, pas une heuristique sur la valeur : la
+    /// question posée est « quelqu'un observe-t-il cette zone ? ».
+    /// Périphérique présent ⇒ le sondeur passe ⇒ la position est mesurée à la
+    /// seconde. Pas de périphérique ⇒ personne ne la mesure, et le serveur ne
+    /// sait pas où en est la lecture. Rien ici ne confond « zéro » et « je ne
+    /// sais pas » : les deux cas ne se lisent pas dans la même valeur.
+    ///
+    /// Le seul autre gisement possible serait le client lui-même — c'est
+    /// l'onglet qui joue, donc lui seul connaît sa position. Aucune route ne la
+    /// remonte aujourd'hui (`SeekRequest` est une COMMANDE, pas un rapport), et
+    /// l'inventer côté serveur à partir de `streamer_bytes_sent` mesurerait le
+    /// TÉLÉCHARGEMENT, pas l'écoute — un lecteur qui tamponne en avance donnerait
+    /// une position en avance. Tant que le client ne la déclare pas, la réponse
+    /// honnête est « je ne sais pas ».
+    fn position_entretenue_par_le_sondeur(&self, zone_id: i64) -> bool {
+        ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id)
+            .is_some()
+    }
     /// Délai d'anti-rebond avant de redémarrer un flux sur changement d'EQ.
     ///
     /// Assez long pour qu'un curseur qu'on fait glisser ne produise qu'un seul
@@ -8722,7 +8764,30 @@ impl PlaybackOrchestrator {
     /// Rend immédiatement : le redémarrage est différé dans une tâche. La
     /// valeur dit si un redémarrage a été **programmé**, pas s'il a eu lieu —
     /// une demande plus récente peut encore l'annuler.
+    ///
+    /// **Ne programme rien quand la position de la zone n'est pas mesurée**
+    /// (#2595) : voir [`Self::position_entretenue_par_le_sondeur`].
     pub fn schedule_eq_replay(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        // #2595 — ne pas rejouer à une position INCONNUE.
+        //
+        // Ce redémarrage ne vaut que par sa promesse : reprendre là où on en
+        // était. Sur une zone dont personne ne mesure la position, la promesse
+        // est vide et le geste devient destructeur — il ramène l'auditeur au
+        // début du morceau, ce qu'a signalé Pierre M.
+        //
+        // Renoncer est ici le geste le MOINS destructeur. Le réglage prendra
+        // effet à la piste suivante, ce que la réponse dit déjà
+        // (`applied_live: false`) et ce que le client sait déjà afficher. Un
+        // morceau qui continue vaut mieux qu'un morceau qui recommence.
+        //
+        // On ne comble surtout PAS la source : une zone sans périphérique n'a
+        // aucune source de vérité côté serveur sur sa position. Y écrire une
+        // valeur reconstituée ferait passer une supposition pour une mesure —
+        // exactement le défaut qu'on corrige.
+        if !self.position_entretenue_par_le_sondeur(zone_id) {
+            info!(zone_id, "eq_replay_skipped_position_inconnue");
+            return false;
+        }
         let generation = {
             let mut gens = self.eq_replay_gen.lock().unwrap();
             let g = gens.entry(zone_id).or_insert(0);
@@ -16020,9 +16085,13 @@ mod tests {
     /// Rend `(orchestrateur, zone_id, répertoire)` — le répertoire doit rester
     /// vivant tant que le test tourne, sinon le fichier disparaît sous la zone
     /// et `resolve_local_track` échoue en `file_not_found`.
+    ///
+    /// `output_type` et `device_id` sont facultatifs (#2595) : une zone
+    /// navigateur — « Cet ordinateur » — n'a PAS de périphérique de sortie, et
+    /// c'est précisément cette forme-là que le sondeur laisse sans position.
     async fn zone_qui_joue_un_flac(
-        output_type: &str,
-        device_id: &str,
+        output_type: Option<&str>,
+        device_id: Option<&str>,
     ) -> (PlaybackOrchestrator, i64, tempfile::TempDir) {
         let orch = test_orchestrator();
 
@@ -16057,16 +16126,20 @@ mod tests {
 
         let zone_repo = ZoneRepo::with_backend(orch.db.clone());
         let zone_id = zone_repo
-            .create("Marantz ND8006", Some(output_type), Some(device_id))
+            .create("Marantz ND8006", output_type, device_id)
             .unwrap();
         // FLAC natif imposé : la sortie factice n'est pas un `DlnaOutput`, la
         // négociation `GetProtocolInfo` serait donc non concluante et
         // basculerait en WAV. On veut le passthrough du testeur.
         zone_repo.update_dlna_native_flac(zone_id, true).unwrap();
 
-        orch.outputs.lock().await.register(Box::new(
-            MockOutput::new(device_id, "Marantz ND8006").with_type(output_type),
-        ));
+        // Pas de périphérique, pas de sortie à enregistrer : la zone navigateur
+        // n'en a aucune, et lui en inventer une effacerait le défaut testé.
+        if let (Some(device_id), Some(output_type)) = (device_id, output_type) {
+            orch.outputs.lock().await.register(Box::new(
+                MockOutput::new(device_id, "Marantz ND8006").with_type(output_type),
+            ));
+        }
 
         orch.playback
             .play(
@@ -16334,7 +16407,7 @@ mod tests {
     #[tokio::test]
     async fn bascule_pure_sur_dlna_le_renderer_recoit_le_seek_vers_la_position() {
         let device_id = "dlna:uuid-56fcb4ae-2893";
-        let (orch, zone_id, _dir) = zone_qui_joue_un_flac("dlna", device_id).await;
+        let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
 
         orch.replay_zone_at_position(zone_id, 94_000, "eq_change")
             .await
@@ -16357,7 +16430,7 @@ mod tests {
     #[tokio::test]
     async fn une_relecture_sur_sortie_locale_n_envoie_aucun_seek() {
         let device_id = "local:Sortie 2893";
-        let (orch, zone_id, _dir) = zone_qui_joue_un_flac("local", device_id).await;
+        let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("local"), Some(device_id)).await;
 
         orch.replay_zone_at_position(zone_id, 94_000, "eq_change")
             .await
@@ -16367,6 +16440,110 @@ mod tests {
             position_vue_par_la_sortie(&orch, device_id).await,
             0,
             "sortie locale : le flux est pré-seeké à la source, un Seek de plus doublerait l'offset (#1518)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #2595 — la bascule Audiophile ne repart pas d'une position INCONNUE.
+    // ------------------------------------------------------------------
+
+    /// Laisser passer l'anti-rebond de `schedule_eq_replay`, plus la relecture
+    /// elle-même (le chemin local s'accorde 300 ms d'arrêt de sortie).
+    async fn laisser_passer_l_anti_rebond() {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PlaybackOrchestrator::EQ_REPLAY_DEBOUNCE_MS + 900,
+        ))
+        .await;
+    }
+
+    /// Le prédicat qui tranche, sur les deux formes de zone. Témoin : la zone
+    /// AVEC périphérique reste du côté « position mesurée » — le correctif ne
+    /// doit rien lui retirer.
+    #[tokio::test]
+    async fn le_predicat_de_position_suit_la_presence_d_un_peripherique() {
+        let orch = test_orchestrator();
+        let zr = ZoneRepo::with_backend(orch.db.clone());
+        let avec = zr
+            .create("Salon", Some("dlna"), Some("dlna:uuid-2595"))
+            .unwrap();
+        let sans = zr.create("Cet ordinateur", Some("browser"), None).unwrap();
+        assert!(
+            orch.position_entretenue_par_le_sondeur(avec),
+            "le sondeur interroge toute zone qui a un périphérique : sa position est mesurée à la seconde"
+        );
+        assert!(
+            !orch.position_entretenue_par_le_sondeur(sans),
+            "sans périphérique, `poller.rs` fait `continue` avant son unique `update_position` : rien ne mesure cette zone"
+        );
+    }
+
+    /// Cas NOMINAL, inchangé : sur une zone observée, la bascule reprend à la
+    /// position mesurée. C'est la contre-épreuve de la garde — si elle mordait
+    /// trop large, ce test tomberait.
+    #[tokio::test]
+    async fn la_bascule_pure_reprend_a_la_position_mesuree() {
+        let (orch, zone_id, _dir) =
+            zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-2595-temoin")).await;
+        let orch = Arc::new(orch);
+        let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
+        // Ce que le sondeur écrit chaque seconde sur une zone observée.
+        orch.playback.update_position(zone_id, 137_000).await;
+
+        assert!(
+            !orch.apply_audiophile_change(zone_id).await,
+            "chemin réseau : la bascule passe par un redémarrage programmé, donc pas d'application à chaud"
+        );
+        laisser_passer_l_anti_rebond().await;
+
+        let apres = orch.playback.get_state(zone_id).await;
+        assert_eq!(
+            apres.position_ms, 137_000,
+            "la relecture doit repartir de la position MESURÉE, pas de zéro"
+        );
+        assert_ne!(
+            apres.track_generation, generation_avant,
+            "la relecture doit bien avoir eu lieu : sans elle, ce test ne prouverait rien du cas nominal"
+        );
+    }
+
+    /// LE défaut de Pierre M (#2595), zone 987 : « Cet ordinateur », donc AUCUN
+    /// périphérique de sortie, donc aucune position mesurée. La bascule ne doit
+    /// pas prétendre reprendre : elle renonce, le dit dans le journal
+    /// (`eq_replay_skipped_position_inconnue`), et laisse le morceau courir.
+    ///
+    /// Avant le correctif, `position_ms` valait 0 — non parce que le morceau
+    /// était au début, mais parce que personne ne l'avait jamais mesuré — et la
+    /// relecture repartait de là.
+    #[tokio::test]
+    async fn la_bascule_pure_sans_peripherique_ne_repart_pas_de_zero() {
+        let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("browser"), None).await;
+        let orch = Arc::new(orch);
+        let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.position_ms,
+            0,
+            "point de départ du défaut : la zone joue et le serveur croit être à 0"
+        );
+
+        assert!(
+            !orch.apply_audiophile_change(zone_id).await,
+            "rien n'est appliqué à chaud sur une zone navigateur"
+        );
+        laisser_passer_l_anti_rebond().await;
+
+        let apres = orch.playback.get_state(zone_id).await;
+        assert!(
+            apres.last_seek_at.is_none(),
+            "aucune relecture ne doit avoir été TENTÉE : `replay_zone_at_position` pose un `seek` \
+             avant toute autre chose, y compris quand elle échoue ensuite (#2595)"
+        );
+        assert_eq!(
+            apres.track_generation, generation_avant,
+            "le morceau ne doit pas avoir été relancé — c'est exactement ce que Pierre M entend comme « ça repart du début »"
+        );
+        assert!(
+            !orch.eq_replay_gen.lock().unwrap().contains_key(&zone_id),
+            "la relecture ne doit même pas être armée quand la position est inconnue"
         );
     }
 
