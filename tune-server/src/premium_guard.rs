@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use tracing::info;
@@ -9,22 +9,71 @@ use tune_core::license::{Feature, LicenseManager};
 /// d'un module réutilise l'adresse que `require_premium` sert déjà.
 const UPGRADE_URL: &str = "https://mozaiklabs.fr/pricing";
 
+/// La clé de traduction du refus premium, dans `i18n_server.json`. Elle porte
+/// un `{feature}` que l'appelant remplace par le nom du droit manquant — même
+/// idiome que `ai.nextTrack` (`routes/ai.rs`).
+const CLE_REFUS: &str = "premium.required";
+
+/// Le corps du refus 402, **seul** constructeur de cette forme.
+///
+/// `lang` est déjà résolu (`i18n::lang_from_header`). Le nom du droit reste
+/// tel quel : « DSP & EQ », « Cloud Relay » sont des noms de produit, pas des
+/// phrases — c'est la PHRASE qui se traduit, et elle seule.
+fn corps_du_refus(feature: Feature, lang: &str) -> Value {
+    json!({
+        "error": "premium_required",
+        // Le CODE est le terme stable du contrat : un client qui porte ses
+        // propres traductions l'utilise et ignore `message`. Même doctrine que
+        // `ModuleRefusal::code` (#2392), et la moitié durable de #2419 — un
+        // client hors ligne, ou plus récent que son serveur, traduit sans
+        // dépendre de ce que le serveur sait dire.
+        "code": feature.code(),
+        "feature": feature.display_name(),
+        // Traduit ici pour les clients qui affichent `message` tel quel — ce
+        // que fait le client web aujourd'hui (`api.ts`, `notifications.error(
+        // body?.message)`). C'est ce qui affichait « … requires Tune Premium »
+        // en anglais dans une interface traduite en dix langues (#2419).
+        "message": crate::i18n::t(lang, CLE_REFUS).replace("{feature}", feature.display_name()),
+        "upgrade_url": UPGRADE_URL,
+    })
+}
+
 /// Check that a premium feature is enabled.  Returns `Ok(())` when the
 /// feature is available, or an `Err(Response)` with HTTP 402 and a
 /// structured JSON body when it is not.
+///
+/// Le refus est composé en **français**, le défaut de l'application, faute de
+/// requête sous la main. Une route qui tient ses en-têtes doit préférer
+/// [`require_premium_localise`] : le `message` y suit la langue choisie par
+/// l'utilisateur. Le `code`, lui, est le même par les deux chemins.
 pub async fn require_premium(license: &LicenseManager, feature: Feature) -> Result<(), Response> {
+    require_premium_dans_la_langue(license, feature, "fr").await
+}
+
+/// Comme [`require_premium`], mais le `message` du refus suit l'en-tête
+/// `Accept-Language` de la requête — celui où le client web envoie la locale
+/// **choisie dans l'application**, pas le défaut du navigateur (`i18n.rs`).
+pub async fn require_premium_localise(
+    license: &LicenseManager,
+    feature: Feature,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let lang = crate::i18n::lang_from_header(headers);
+    require_premium_dans_la_langue(license, feature, &lang).await
+}
+
+async fn require_premium_dans_la_langue(
+    license: &LicenseManager,
+    feature: Feature,
+    lang: &str,
+) -> Result<(), Response> {
     if license.check_feature(feature).await {
         Ok(())
     } else {
         info!(feature = feature.display_name(), "premium_feature_blocked");
         Err((
             StatusCode::PAYMENT_REQUIRED,
-            axum::Json(json!({
-                "error": "premium_required",
-                "feature": feature.display_name(),
-                "message": format!("{} requires Tune Premium", feature.display_name()),
-                "upgrade_url": UPGRADE_URL
-            })),
+            axum::Json(corps_du_refus(feature, lang)),
         )
             .into_response())
     }
@@ -72,10 +121,11 @@ impl ModuleRefusal {
 
     /// Le **code** stable, seul terme du contrat avec le client.
     ///
-    /// Piège relevé sur #2419 : `require_premium` compose son `message` en
-    /// anglais (`"… requires Tune Premium"`) et l'interface l'affiche tel quel
-    /// dans un écran traduit. On ne le reproduit pas ici — le client traduit
-    /// ce code, et ne lit `message` que pour un journal.
+    /// Piège relevé sur #2419 : `require_premium` composait son `message` en
+    /// anglais (`"… requires Tune Premium"`) et l'interface l'affichait tel
+    /// quel dans un écran traduit. Ce guide-ci a tenu le premier ; depuis
+    /// #2419 `require_premium` porte lui aussi un `code`, et sa phrase suit
+    /// l'`Accept-Language`. Les deux familles de refus se lisent pareil.
     pub fn code(self) -> &'static str {
         match self {
             Self::AccountNotLinked => "module_account_not_linked",

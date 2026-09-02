@@ -37,6 +37,8 @@ mod credits_enrichissement_statut;
 mod enrich_artiste_langue_entete;
 #[path = "enrichissement_repertoire.rs"]
 mod enrichissement_repertoire;
+#[path = "eq_refus_premium_localise.rs"]
+mod eq_refus_premium_localise;
 #[path = "etiquettes_types_et_playlists.rs"]
 mod etiquettes_types_et_playlists;
 #[path = "explorateur_dossiers.rs"]

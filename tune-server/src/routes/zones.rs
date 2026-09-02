@@ -522,12 +522,18 @@ fn read_crossfeed_config(settings: &tune_core::db::settings_repo::SettingsRepo, 
 async fn set_zone_dsp(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
+    // Premium gate: DSP & EQ mutations require Premium. Le refus parle la
+    // langue de l'application (#2419) — c'est le même écran « Égaliseur » que
+    // `POST /zones/{id}/eq`, et il tire ses deux moitiés d'ici et de là.
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
     {
         return resp;
     }
