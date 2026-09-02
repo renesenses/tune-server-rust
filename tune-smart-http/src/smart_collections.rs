@@ -186,47 +186,81 @@ async fn list_collections(
             // propre de la collection — une vignette de quatre cases n'est pas
             // un aperçu du classement, et rejouer le tri complet ici coûterait
             // une jointure de plus pour un gain invisible.
-            // Groupe sur l'ALBUM — artiste + titre, insensibles a la casse — et
-            // non sur le chemin de la pochette.
-            //
-            // Un coffret est stocke comme PLUSIEURS albums, chacun avec son
-            // propre fichier de pochette en cache : quatre chemins differents,
-            // une seule image. Groupe sur le chemin, les quatre disques
-            // remplissaient la mosaique a eux seuls — vecu sur la collection
-            // « Classique » de Bertrand, coffret Gorecki « A Nonesuch
-            // Retrospective » (02/09/2026).
-            //
-            // On demande DOUZE groupes pour n'en garder que quatre : deux
-            // albums distincts peuvent partager un chemin (une compilation et
-            // sa reedition), et sans marge la mosaique tomberait a trois.
-            let covers_sql = format!(
-                "SELECT MIN(al.cover_path) AS cover, MIN(al.title) AS t FROM albums al \
-                 LEFT JOIN artists ar ON al.artist_id = ar.id \
-                 LEFT JOIN tracks t ON t.album_id = al.id {where_clause} \
-                 GROUP BY LOWER(COALESCE(ar.name, '')), LOWER(COALESCE(al.title, '')) \
-                 HAVING MIN(al.cover_path) IS NOT NULL AND MIN(al.cover_path) <> '' \
-                 ORDER BY t LIMIT 12"
-            );
-            let mut covers: Vec<String> = Vec::new();
-            if let Ok(rs) = state.backend.query_many(&covers_sql, &[]) {
-                for r in &rs {
-                    let Some(c) = r.first().and_then(|v| v.as_string()) else {
-                        continue;
-                    };
-                    if covers.len() == 4 {
-                        break;
-                    }
-                    if !covers.iter().any(|x| x == &c) {
-                        covers.push(c);
-                    }
-                }
-            }
+            let covers = pochettes_mosaique(&state.backend, &where_clause);
             col["covers"] = json!(covers);
 
             col
         })
         .collect();
     Ok(Json(json!(items)))
+}
+
+/// Les quatre pochettes de la mosaïque d'une collection intelligente.
+///
+/// Extraite du corps de la route pour être TESTABLE contre une vraie base. Les
+/// deux tests plus bas en portaient chacun une copie mot pour mot : une copie
+/// ne garde rien — elle reste verte pendant que la production dérive.
+///
+/// `where_clause` est celle de la règle. Elle est TANTÔT VIDE, tantôt un
+/// `WHERE …` : d'où le `HAVING`, et non un `AND` accolé, qui produirait
+/// « … AND al.cover_path … » sans `WHERE` sur une collection sans règle — donc
+/// une erreur SQL sur le cas le plus banal.
+///
+/// L'ordre par `MIN(al.title)` est déterministe, donc la mosaïque ne change pas
+/// d'un rafraîchissement à l'autre. Ce n'est PAS le tri propre de la
+/// collection : une vignette de quatre cases n'est pas un aperçu du classement.
+fn pochettes_mosaique(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    where_clause: &str,
+) -> Vec<String> {
+    // Groupe sur le TITRE de l'album, insensible a la casse, et non sur
+    // le chemin de la pochette.
+    //
+    // Un meme disque est stocke comme PLUSIEURS lignes d'`albums`, une
+    // par artiste credite, chacune avec son propre fichier de pochette
+    // en cache : autant de chemins, une seule image. Groupe sur le
+    // chemin, un seul disque remplissait la mosaique — la collection
+    // « Classique » de Bertrand montrait quatre fois le coffret Gorecki
+    // parmi ses 139 albums (02/09/2026).
+    //
+    // 🔴 Le titre SEUL, sans l'artiste : c'est l'artiste qui varie d'une
+    // ligne a l'autre. « Les indispensables du piano » en compte treize,
+    // un par pianiste. Grouper sur artiste + titre les laissait passer
+    // tous les treize.
+    //
+    // On demande SEIZE groupes pour n'en garder que quatre. La marge
+    // sert deux fois : deux titres distincts peuvent partager un chemin
+    // (une compilation et sa reedition), et `cle_pochette` en rapproche
+    // d'autres encore en retirant les suffixes « (24bit) ».
+    let covers_sql = format!(
+        "SELECT MIN(al.cover_path) AS cover, MIN(al.title) AS t FROM albums al \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN tracks t ON t.album_id = al.id {where_clause} \
+         GROUP BY LOWER(COALESCE(al.title, al.cover_path, '')) \
+         HAVING MIN(al.cover_path) IS NOT NULL AND MIN(al.cover_path) <> '' \
+         ORDER BY t LIMIT 16"
+    );
+    let mut covers: Vec<String> = Vec::new();
+    let mut cles: Vec<String> = Vec::new();
+    if let Ok(rs) = backend.query_many(&covers_sql, &[]) {
+        for r in &rs {
+            let Some(c) = r.first().and_then(|v| v.as_string()) else {
+                continue;
+            };
+            if covers.len() == 4 {
+                break;
+            }
+            let titre = r.get(1).and_then(|v| v.as_string());
+            let cle = tune_core::library::mosaique::cle_pochette(titre.as_deref(), &c);
+            if cles.iter().any(|k| k == &cle) || covers.iter().any(|x| x == &c) {
+                continue;
+            }
+            cles.push(cle);
+            covers.push(c);
+        }
+    }
+
+    covers
 }
 
 async fn create_collection(
@@ -1089,30 +1123,11 @@ mod tests {
         )
         .unwrap();
 
-        let requete = |where_clause: &str| -> Vec<String> {
-            // La requete de production, mot pour mot.
-            let sql = format!(
-                "SELECT MIN(al.cover_path) AS cover, MIN(al.title) AS t FROM albums al \
-                 LEFT JOIN artists ar ON al.artist_id = ar.id \
-                 LEFT JOIN tracks t ON t.album_id = al.id {where_clause} \
-                 GROUP BY LOWER(COALESCE(ar.name, '')), LOWER(COALESCE(al.title, '')) \
-                 HAVING MIN(al.cover_path) IS NOT NULL AND MIN(al.cover_path) <> '' \
-                 ORDER BY t LIMIT 12"
-            );
-            let mut out: Vec<String> = Vec::new();
-            for r in &db.query_many(&sql, &[]).unwrap() {
-                let Some(c) = r.first().and_then(|v| v.as_string()) else {
-                    continue;
-                };
-                if out.len() == 4 {
-                    break;
-                }
-                if !out.iter().any(|x| x == &c) {
-                    out.push(c);
-                }
-            }
-            out
-        };
+        // La fonction de PRODUCTION, pas une copie. Ce test en portait une
+        // recopie mot pour mot : elle serait restee verte pendant que la route
+        // changeait de cle de groupement — c'est exactement ce qui est arrive.
+        let backend: std::sync::Arc<dyn DbBackend> = std::sync::Arc::new(db);
+        let requete = |where_clause: &str| super::pochettes_mosaique(&backend, where_clause);
 
         // Clause VIDE — une collection sans regle. C'est le cas qui casserait
         // avec un `AND` accole.
@@ -1130,7 +1145,7 @@ mod tests {
         );
 
         // Et le plafond mord vraiment : sans LIMIT on en aurait cinq.
-        let sans_plafond = db
+        let sans_plafond = backend
             .query_many(
                 "SELECT al.cover_path FROM albums al GROUP BY al.cover_path \
                  HAVING al.cover_path IS NOT NULL AND al.cover_path <> ''",
@@ -1141,56 +1156,137 @@ mod tests {
         assert_eq!(sans_plafond, 5, "cinq pochettes distinctes en base");
     }
 
-    /// Un COFFRET ne remplit pas la mosaique a lui seul.
+    /// Un meme DISQUE ne remplit pas la mosaique a lui seul.
     ///
-    /// Quatre disques du meme coffret = quatre ALBUMS, chacun avec son propre
-    /// fichier de pochette en cache. Quatre chemins differents, une seule
-    /// image. Groupe sur le chemin, ils prenaient les quatre cases — vecu sur
-    /// la collection « Classique » de Bertrand (02/09/2026).
+    /// Un disque est stocke comme PLUSIEURS lignes d'`albums`, une par artiste
+    /// credite, chacune avec son propre fichier de pochette en cache : autant
+    /// de chemins, une seule image.
+    ///
+    /// Les donnees ci-dessous sont RELEVEES sur le serveur de Bertrand le
+    /// 02/09/2026, collection « Classique », 139 albums — dont la mosaique
+    /// montrait quatre fois la meme pochette.
+    ///
+    /// ⚠️ Ma premiere version groupait sur artiste + titre et laissait passer
+    /// les quatre : l'artiste est justement ce qui VARIE. C'est pourquoi les
+    /// quatre lignes du coffret portent ici quatre artistes differents, comme
+    /// en base — avec un seul artiste, la version fautive serait passee.
     #[test]
-    fn un_coffret_ne_prend_qu_une_case_dans_une_collection() {
+    fn un_meme_disque_ne_prend_qu_une_case_dans_une_collection() {
         use tune_core::db::backend::DbBackend;
         use tune_core::db::sqlite::SqliteDb;
 
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db.execute_batch(
-            "INSERT INTO artists (id, name) VALUES (1,'Gorecki'),(2,'Autre'); \
+            "INSERT INTO artists (id, name) VALUES \
+               (1,'Henryk Gorecki'),(2,'Dawn Upshaw'),(3,'Kronos Quartet'), \
+               (4,'London Philharmonic Orchestra'),(9,'Autre'); \
              INSERT INTO albums (id, title, artist_id, cover_path) VALUES \
                (1,'A Nonesuch Retrospective',1,'C1'), \
-               (2,'A Nonesuch Retrospective',1,'C2'), \
-               (3,'a nonesuch retrospective',1,'C3'), \
-               (4,'A Nonesuch Retrospective',1,'C4'), \
-               (5,'Zeta',2,'D'),(6,'Zeta Deux',2,'E');",
+               (2,'A Nonesuch Retrospective',2,'C2'), \
+               (3,'a nonesuch retrospective',3,'C3'), \
+               (4,'A Nonesuch Retrospective',4,'C4'), \
+               (5,'A Nonesuch Retrospective (24bit)',2,'C5'), \
+               (6,'Zeta',9,'D'),(7,'Zeta Deux',9,'E');",
         )
         .unwrap();
 
-        let sql = "SELECT MIN(al.cover_path) AS cover, MIN(al.title) AS t FROM albums al \
-                   LEFT JOIN artists ar ON al.artist_id = ar.id \
-                   LEFT JOIN tracks t ON t.album_id = al.id \
-                   GROUP BY LOWER(COALESCE(ar.name, '')), LOWER(COALESCE(al.title, '')) \
-                   HAVING MIN(al.cover_path) IS NOT NULL AND MIN(al.cover_path) <> '' \
-                   ORDER BY t LIMIT 12";
-        let mut out: Vec<String> = Vec::new();
-        for r in &db.query_many(sql, &[]).unwrap() {
-            let Some(c) = r.first().and_then(|v| v.as_string()) else {
-                continue;
-            };
-            if out.len() == 4 {
-                break;
-            }
-            if !out.iter().any(|x| x == &c) {
-                out.push(c);
-            }
-        }
+        let backend: std::sync::Arc<dyn DbBackend> = std::sync::Arc::new(db);
+        let out = super::pochettes_mosaique(&backend, "");
         assert_eq!(
             out.len(),
             3,
-            "le coffret ne doit compter que pour UNE case : {out:?}"
+            "le disque, ses quatre artistes et sa reedition 24 bits ne doivent \
+             compter que pour UNE case : {out:?}"
         );
         assert!(
             out.contains(&"D".to_string()) && out.contains(&"E".to_string()),
             "les deux autres albums doivent y figurer : {out:?}"
+        );
+    }
+
+    /// Le `GROUP BY` protege la FENETRE, pas le dedoublonnage.
+    ///
+    /// ⚠️ Constat qui a coute une reecriture : remettre la cle fautive
+    /// (artiste + titre) dans la requete laissait les deux tests ci-dessus au
+    /// VERT. `cle_pochette`, cote Rust, rattrapait tout — les gardes ne
+    /// gardaient donc rien de ce qu'ils annoncaient.
+    ///
+    /// Ce que le groupement SQL tient vraiment : les seize lignes remontees.
+    /// Groupees par titre, un disque n'en occupe qu'UNE et les albums suivants
+    /// atteignent la mosaique. Groupees par artiste + titre, un disque assez
+    /// credite remplit la fenetre a lui seul, et le Rust n'a plus rien a
+    /// dedoublonner — il ne voit jamais les autres albums.
+    ///
+    /// Vingt artistes ici, la ou le plus gros cas mesure chez Bertrand en
+    /// compte quatorze (« I Give It A Year », 02/09/2026). La marge est mince :
+    /// six credits de plus sur un disque et la mosaique tombait a une case.
+    #[test]
+    fn un_disque_tres_credite_ne_mange_pas_la_fenetre() {
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let mut sql = String::from("INSERT INTO artists (id, name) VALUES (99,'Divers')");
+        for i in 1..=20 {
+            sql.push_str(&format!(",({i},'Credite {i}')"));
+        }
+        sql.push_str("; INSERT INTO albums (id, title, artist_id, cover_path) VALUES ");
+        // Titre en « A… » : ces vingt lignes trient AVANT les autres.
+        for i in 1..=20 {
+            sql.push_str(&format!("({i},'A Un Seul Disque',{i},'P{i}'),"));
+        }
+        sql.push_str("(30,'Zeta',99,'D'),(31,'Zeta Deux',99,'E');");
+        db.execute_batch(&sql).unwrap();
+
+        let backend: std::sync::Arc<dyn DbBackend> = std::sync::Arc::new(db);
+        let out = super::pochettes_mosaique(&backend, "");
+        assert!(
+            out.contains(&"D".to_string()) && out.contains(&"E".to_string()),
+            "un disque a vingt credits a mange les seize lignes de la fenetre : \
+             les albums suivants n'atteignent plus la mosaique. Obtenu {out:?}"
+        );
+    }
+
+    /// Treize pianistes, un seul disque — le cas le plus gros mesure.
+    ///
+    /// « Les indispensables du piano (96kHz/24bit) » existe en treize lignes
+    /// d'album sur le serveur de Bertrand. Sans les albums voisins, la mosaique
+    /// de « Classique » n'aurait qu'une seule case remplie treize fois.
+    #[test]
+    fn treize_lignes_d_un_meme_disque_laissent_la_place_aux_autres() {
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let mut sql = String::from("INSERT INTO artists (id, name) VALUES (99,'Divers')");
+        for i in 1..=13 {
+            sql.push_str(&format!(",({i},'Pianiste {i}')"));
+        }
+        sql.push_str("; INSERT INTO albums (id, title, artist_id, cover_path) VALUES ");
+        // Les treize lignes trient AVANT les autres : sans regroupement elles
+        // prennent les quatre cases. C'est le piege qui avait rendu vert un
+        // premier test — le doublon triait apres le plafond.
+        for i in 1..=13 {
+            sql.push_str(&format!(
+                "({i},'Les indispensables du piano (96kHz/24bit)',{i},'P{i}'),"
+            ));
+        }
+        sql.push_str("(20,'Zeta',99,'D'),(21,'Zeta Deux',99,'E');");
+        db.execute_batch(&sql).unwrap();
+
+        let backend: std::sync::Arc<dyn DbBackend> = std::sync::Arc::new(db);
+        let out = super::pochettes_mosaique(&backend, "");
+        assert_eq!(
+            out.len(),
+            3,
+            "treize lignes d'un meme disque ne valent qu'une case : {out:?}"
+        );
+        assert!(
+            out.contains(&"D".to_string()) && out.contains(&"E".to_string()),
+            "les albums qui suivent doivent atteindre la mosaique : {out:?}"
         );
     }
 
