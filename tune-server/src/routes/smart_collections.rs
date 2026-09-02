@@ -704,13 +704,16 @@ fn execute_album_query(
     limit_clause: &str,
 ) -> Result<Vec<Value>, AppError> {
     let sql = format!(
+        // `al.is_compilation` (#1957) est dans le GROUP BY comme les autres
+        // colonnes d'album : PostgreSQL refuse une colonne ni groupée ni
+        // agrégée, SQLite l'accepterait. Écrire pour les deux.
         "SELECT al.id, al.title, ar.name, al.year, al.cover_path, al.genre, \
-         COUNT(t.id) AS track_count \
+         COUNT(t.id) AS track_count, al.is_compilation \
          FROM albums al \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
          LEFT JOIN tracks t ON t.album_id = al.id \
          {} \
-         GROUP BY al.id, al.title, ar.name, al.year, al.cover_path, al.genre \
+         GROUP BY al.id, al.title, ar.name, al.year, al.cover_path, al.genre, al.is_compilation \
          {} {}",
         where_clause, order, limit_clause
     );
@@ -732,6 +735,10 @@ fn execute_album_query(
                 "cover_path": r.get(4).and_then(|v| v.as_string()),
                 "genre": r.get(5).and_then(|v| v.as_string()),
                 "track_count": r.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
+                // Même nom et même décodeur que `Album::to_json` (#1957) :
+                // une collection intelligente rend le drapeau comme la liste
+                // d'albums. NUL ⇒ `false`, jamais `null`.
+                "is_compilation": tune_core::db::album_repo::drapeau_compilation(r.get(7)),
             })
         })
         .collect())
