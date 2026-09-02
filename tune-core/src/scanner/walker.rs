@@ -50,6 +50,60 @@ const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 // for the mtime pre-check (#619).
 const SCAN_IO_CONCURRENCY: usize = 32;
 
+// Concurrence retenue quand les fichiers scannés vivent sur un MONTAGE RÉSEAU
+// (CIFS/SMB, NFS, sshfs…).
+//
+// D'où vient ce nombre, puisqu'on ne peut pas mesurer le NAS de chacun :
+//
+// * borne basse — les plateaux valent 4 (`concurrence_pour_disque`, mesuré chez
+//   Yacine, #1948). Un partage cache un disque qu'on ne peut PAS sonder : chez
+//   Pierre M (QNAP, fil 1043) ce sont des plateaux, avec un saut réseau en plus.
+//   Descendre plus bas que 4 n'aurait donc aucune justification mesurée ;
+// * borne haute — au-delà du nombre de fils de service du NAS, les requêtes
+//   supplémentaires ne se recouvrent plus : elles font la queue dans le backlog
+//   du serveur, et c'est exactement là que le client voit des time-outs en
+//   rafale plutôt qu'une simple lenteur. Le `nfsd` des NAS grand public tourne
+//   par défaut à 8 fils (RPCNFSDCOUNT=8 chez Debian/Ubuntu, valeur par défaut
+//   de nfs-utils), et un smbd de NAS 2 baies est du même ordre.
+//
+// On reste donc au-dessus des plateaux — la latence réseau, elle, SE recouvre,
+// contrairement aux déplacements de tête — et sous le point où l'on remplit la
+// file d'attente du NAS. Ce n'est pas une mesure faite chez Pierre M : c'est un
+// encadrement entre deux repères, et `TUNE_SCAN_IO_CONCURRENCY` reste le dernier
+// mot pour qui mesure mieux sur SA machine.
+const SCAN_IO_CONCURRENCY_RESEAU: usize = 8;
+
+/// Systèmes de fichiers qui parlent au travers du réseau.
+///
+/// Liste explicite plutôt qu'un préfixe : `fuse.` couvre aussi bien `fuse.sshfs`
+/// (réseau) que `fuse.ntfs-3g` ou `fuse.mergerfs` (parfaitement locaux), donc on
+/// nomme les cas réseau un par un. Un type inconnu est traité comme local — même
+/// prudence que `disque_rotatif`, qui ne dégrade personne sur une supposition.
+const SYSTEMES_DE_FICHIERS_RESEAU: &[&str] = &[
+    "9p",
+    "afp",
+    "afpfs",
+    "afs",
+    "ceph",
+    "cifs",
+    "coda",
+    "davfs",
+    "fuse.davfs2",
+    "fuse.rclone",
+    "fuse.s3fs",
+    "fuse.smbnetfs",
+    "fuse.sshfs",
+    "glusterfs",
+    "ncpfs",
+    "nfs",
+    "nfs4",
+    "smb2",
+    "smb3",
+    "smbfs",
+    "sshfs",
+    "webdav",
+];
+
 /// Resolve the scan I/O concurrency, honouring an optional `TUNE_SCAN_IO_CONCURRENCY`
 /// override. The fixed default (32) is a good fit for a fast SSD NAS, but the
 /// sweet spot is storage-specific: a weak 2-bay HDD NAS (Synology DS218Play,
@@ -88,7 +142,172 @@ fn concurrence_depuis_reglage(reglage: Option<&str>) -> usize {
     {
         return n;
     }
-    concurrence_pour_disque(disque_rotatif())
+    concurrence_pour_stockage(mountinfo().as_deref(), &racine_scannee(), disque_rotatif())
+}
+
+/// La décision complète, une fois le réglage manuel écarté : type de disque ET
+/// nature du montage.
+///
+/// Fonction PURE — elle reçoit le CONTENU de `mountinfo`, le chemin scanné et le
+/// verdict de la sonde `/sys`. C'est ce qui rend la règle éprouvable sans monter
+/// un partage CIFS, chose impossible sur la machine de compilation. Même patron
+/// que `resolve_local_audio_backend`, qui prend son `lookup` en paramètre.
+///
+/// On garde le MINIMUM des deux verdicts : ils décrivent deux goulots
+/// indépendants (l'actionneur d'un côté, la file du serveur de l'autre) et le
+/// plus étroit commande. Un `mountinfo` absent ou illisible ne change donc rien
+/// au comportement d'avant.
+pub(crate) fn concurrence_pour_stockage(
+    mountinfo: Option<&str>,
+    chemin: &std::path::Path,
+    rotatif: Option<bool>,
+) -> usize {
+    let reseau = mountinfo
+        .and_then(|m| systeme_de_fichiers_du_chemin(m, chemin))
+        .is_some_and(|fs| est_systeme_de_fichiers_reseau(&fs));
+    let par_le_montage = if reseau {
+        SCAN_IO_CONCURRENCY_RESEAU
+    } else {
+        SCAN_IO_CONCURRENCY
+    };
+    par_le_montage.min(concurrence_pour_disque(rotatif))
+}
+
+/// Le type de système de fichiers est-il un accès réseau ?
+///
+/// Comparaison insensible à la casse, sur la liste explicite ci-dessus.
+pub(crate) fn est_systeme_de_fichiers_reseau(systeme: &str) -> bool {
+    let systeme = systeme.trim().to_ascii_lowercase();
+    SYSTEMES_DE_FICHIERS_RESEAU.contains(&systeme.as_str())
+}
+
+/// Type de système de fichiers portant `chemin`, d'après le contenu de
+/// `/proc/self/mountinfo`.
+///
+/// Fonction PURE : le contenu du fichier arrive en argument.
+///
+/// Format d'une ligne (`Documentation/filesystems/proc.rst`) :
+/// `36 35 98:0 /mnt1 /mnt rw,noatime <champs optionnels> - ext3 /dev/root rw`.
+/// Le point de montage est le 5ᵉ champ ; le type vient JUSTE APRÈS le séparateur
+/// ` - `, dont l'existence même est là pour absorber un nombre variable de
+/// champs optionnels (`shared:`, `master:`…). Découper naïvement à l'index 8
+/// donnerait le type d'à côté sur un montage partagé.
+///
+/// C'est le point de montage **le plus long** qui préfixe le chemin qui gagne :
+/// avec `/` en ext4 et `/mnt/nas` en cifs, un appariement sur le premier préfixe
+/// venu rendrait `ext4` pour tout le monde. La comparaison se fait par
+/// COMPOSANTS (`Path::starts_with`), sinon `/mnt/nasty` passerait pour du
+/// `/mnt/nas`.
+pub(crate) fn systeme_de_fichiers_du_chemin(
+    mountinfo: &str,
+    chemin: &std::path::Path,
+) -> Option<String> {
+    let mut meilleur: Option<(usize, String)> = None;
+    for ligne in mountinfo.lines() {
+        // Une ligne tronquée ou inattendue est SAUTÉE, jamais fatale : elle ne
+        // doit pas faire perdre les montages parfaitement lisibles d'à côté.
+        let Some((avant, apres)) = separer_champs_mountinfo(ligne) else {
+            continue;
+        };
+        let (Some(brut), Some(systeme)) = (
+            avant.split_whitespace().nth(4),
+            apres.split_whitespace().next(),
+        ) else {
+            continue;
+        };
+        let point_de_montage = std::path::PathBuf::from(demasquer_octal(brut));
+        if !chemin.starts_with(&point_de_montage) {
+            continue;
+        }
+        let profondeur = point_de_montage.components().count();
+        if meilleur.as_ref().is_none_or(|(p, _)| profondeur >= *p) {
+            meilleur = Some((profondeur, systeme.to_string()));
+        }
+    }
+    meilleur.map(|(_, systeme)| systeme)
+}
+
+/// Coupe une ligne de `mountinfo` au séparateur ` - `.
+///
+/// Le dernier séparateur fait foi : un point de montage peut légitimement
+/// contenir ` - ` (il serait alors masqué en octal pour l'espace… mais les
+/// options de super-bloc, elles, ne contiennent jamais d'espace nu).
+fn separer_champs_mountinfo(ligne: &str) -> Option<(&str, &str)> {
+    let position = ligne.rfind(" - ")?;
+    Some((&ligne[..position], &ligne[position + 3..]))
+}
+
+/// Rend les échappements octaux de `mountinfo` : le noyau y masque l'espace, la
+/// tabulation, le saut de ligne et l'antislash. Un dossier « /mnt/My Music »
+/// apparaît en `/mnt/My\040Music`, et sans ce décodage il ne s'apparierait avec
+/// rien.
+fn demasquer_octal(brut: &str) -> String {
+    let mut sortie = String::with_capacity(brut.len());
+    let mut reste = brut;
+    while let Some(position) = reste.find('\\') {
+        sortie.push_str(&reste[..position]);
+        let suite = &reste[position + 1..];
+        match suite
+            .get(..3)
+            .and_then(|octal| u8::from_str_radix(octal, 8).ok())
+        {
+            Some(octet) => {
+                sortie.push(octet as char);
+                reste = &suite[3..];
+            }
+            None => {
+                sortie.push('\\');
+                reste = suite;
+            }
+        }
+    }
+    sortie.push_str(reste);
+    sortie
+}
+
+/// Premier dossier de musique configuré — le chemin dont on veut connaître le
+/// stockage. Partagé avec `disque_rotatif` pour que les deux sondes parlent bien
+/// du MÊME chemin. Repli sur `/` quand rien n'est configuré.
+pub(crate) fn racine_scannee() -> std::path::PathBuf {
+    std::env::var("TUNE_MUSIC_DIRS")
+        .ok()
+        .and_then(|v| {
+            serde_json::from_str::<Vec<String>>(&v)
+                .ok()
+                .and_then(|d| d.into_iter().next())
+        })
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
+/// Contenu de `/proc/self/mountinfo`, ou `None`.
+///
+/// Linux seulement, et volontairement : macOS (`statfs.f_fstypename`) et Windows
+/// (`WNetGetConnection`, `GetDriveType`) exposent l'information par des API
+/// totalement différentes, non compilables ni éprouvables ici. Ils rendent donc
+/// `None` et gardent les 32 lectures d'avant — la RÈGLE, elle, est déjà partagée
+/// et n'attendra qu'une sonde le jour où l'un des deux sera mesurable.
+///
+/// Un `/proc` illisible n'empêche jamais un scan : on journalise et on retombe
+/// sur le comportement d'origine.
+fn mountinfo() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string("/proc/self/mountinfo") {
+            Ok(contenu) => Some(contenu),
+            Err(e) => {
+                warn!(
+                    erreur = %e,
+                    "/proc/self/mountinfo illisible : concurrence de scan non adaptée au montage réseau"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// Concurrence adaptée au type de disque, une fois le réglage manuel écarté.
@@ -122,19 +341,17 @@ pub(crate) fn concurrence_pour_disque(rotatif: Option<bool>) -> usize {
 /// n'est qu'une heuristique de performance, elle ne doit jamais empêcher un
 /// scan. Lue une seule fois par processus — le pool n'est construit qu'une
 /// fois, et un disque ne change pas de nature en cours de route.
+///
+/// AVEUGLE AUX MONTAGES RÉSEAU, par construction : un partage CIFS ou NFS n'a
+/// pas de périphérique bloc, `/sys/dev/block/<maj>:<min>` n'existe donc pas et
+/// cette sonde rend `None` — c'est-à-dire « garde 32 », sur le lien réseau d'un
+/// NAS grand public (Pierre M, fil 1043 : time-outs en rafale). C'est
+/// `systeme_de_fichiers_du_chemin` qui couvre ce cas, en parallèle.
 pub(crate) fn disque_rotatif() -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
-        let racine = std::env::var("TUNE_MUSIC_DIRS")
-            .ok()
-            .and_then(|v| {
-                serde_json::from_str::<Vec<String>>(&v)
-                    .ok()
-                    .and_then(|d| d.into_iter().next())
-            })
-            .unwrap_or_else(|| "/".to_string());
-        let dev = std::fs::metadata(&racine).ok()?.dev();
+        let dev = std::fs::metadata(racine_scannee()).ok()?.dev();
         let (majeur, mineur) = (unsafe { libc::major(dev) }, unsafe { libc::minor(dev) });
         let base = format!("/sys/dev/block/{majeur}:{mineur}");
         for chemin in [
@@ -1787,6 +2004,167 @@ mod tests {
         assert!((1..=256).contains(&n), "concurrence hors bornes : {n}");
     }
 
+    /// Un `/proc/self/mountinfo` réaliste : racine ext4, un `/mnt` ext4 qui
+    /// PORTE un `/mnt/nas` en cifs (le piège de l'appariement), un NFSv4, un
+    /// point de montage à espace masqué, et un `/mnt/nasty` local dont le nom
+    /// commence par les mêmes lettres que `/mnt/nas`.
+    const MOUNTINFO: &str = concat!(
+        "21 26 0:20 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw\n",
+        "26 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw,errors=remount-ro\n",
+        "40 26 8:17 / /mnt rw,relatime shared:22 - ext4 /dev/sdb1 rw\n",
+        "55 40 0:52 / /mnt/nas rw,relatime shared:29 - cifs //192.168.1.20/musique rw,vers=3.1.1\n",
+        "56 26 0:53 / /mnt/nfs rw,relatime shared:30 - nfs4 192.168.1.30:/export rw\n",
+        "57 26 0:54 / /mnt/My\\040Music rw,relatime shared:31 - cifs //192.168.1.20/mm rw\n",
+        "58 26 8:33 / /mnt/nasty rw,relatime shared:32 - btrfs /dev/sdc1 rw\n",
+    );
+
+    fn concurrence(chemin: &str) -> usize {
+        concurrence_pour_stockage(Some(MOUNTINFO), std::path::Path::new(chemin), Some(false))
+    }
+
+    /// Le correctif lui-même : un fichier sur un partage CIFS ou NFS ne doit
+    /// plus être lu à 32 en parallèle. C'est le NAS QNAP de Pierre M (fil 1043,
+    /// #2934) : la sonde `/sys` ne voit rien d'un montage réseau — pas de
+    /// périphérique bloc — donc elle rendait `None`, c'est-à-dire « garde 32 ».
+    #[test]
+    fn un_montage_reseau_reduit_la_concurrence() {
+        assert_eq!(concurrence("/mnt/nas/musique/album/01.flac"), 8);
+        assert_eq!(concurrence("/mnt/nfs/musique/album/01.flac"), 8);
+        // Et bien en dessous de la valeur locale, sinon le correctif ne corrige
+        // rien du tout.
+        assert!(concurrence("/mnt/nas/musique") < SCAN_IO_CONCURRENCY);
+    }
+
+    /// LE TÉMOIN. Un disque local rapide garde ses 32 lectures parallèles :
+    /// c'est ce qui rend supportable le scan d'une grosse bibliothèque locale,
+    /// et le correctif ne doit surtout pas le dégrader « par prudence ».
+    #[test]
+    fn un_montage_local_garde_les_trente_deux() {
+        assert_eq!(concurrence("/home/tune/Musique/album/01.flac"), 32);
+        assert_eq!(concurrence("/mnt/photos/album/01.flac"), 32);
+        assert_eq!(concurrence("/mnt/nasty/album/01.flac"), 32);
+        // Les types locaux des trois plateformes ne sont jamais pris pour du
+        // réseau — y compris celui de macOS, que la liste doit ignorer.
+        for local in ["ext4", "btrfs", "apfs", "xfs", "ntfs", "vfat", "zfs"] {
+            assert!(
+                !est_systeme_de_fichiers_reseau(local),
+                "{local} pris pour un montage réseau"
+            );
+        }
+    }
+
+    /// L'APPARIEMENT LE PLUS LONG GAGNE. `/` et `/mnt` sont en ext4, `/mnt/nas`
+    /// en cifs : un appariement sur le premier préfixe venu rendrait « ext4 »
+    /// pour tout le monde, et le correctif serait mort-né.
+    ///
+    /// La comparaison se fait par COMPOSANTS : `/mnt/nasty` commence par les
+    /// mêmes lettres que `/mnt/nas` sans être dessous.
+    #[test]
+    fn le_point_de_montage_le_plus_long_gagne() {
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(
+                MOUNTINFO,
+                std::path::Path::new("/mnt/nas/musique/album/01.flac")
+            )
+            .as_deref(),
+            Some("cifs")
+        );
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(MOUNTINFO, std::path::Path::new("/mnt/photos"))
+                .as_deref(),
+            Some("ext4")
+        );
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(MOUNTINFO, std::path::Path::new("/mnt/nasty/x.flac"))
+                .as_deref(),
+            Some("btrfs")
+        );
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(MOUNTINFO, std::path::Path::new("/var/lib/tune"))
+                .as_deref(),
+            Some("ext4")
+        );
+    }
+
+    /// Le type vient APRÈS le séparateur ` - `, jamais à un index fixe : le
+    /// nombre de champs optionnels (`shared:`, `master:`…) varie d'une ligne à
+    /// l'autre, c'est précisément la raison d'être de ce séparateur.
+    #[test]
+    fn le_type_est_lu_apres_le_separateur_meme_sans_champ_optionnel() {
+        let sans_champ_optionnel =
+            "55 40 0:52 / /mnt/nas rw,relatime - cifs //192.168.1.20/musique rw\n";
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(
+                sans_champ_optionnel,
+                std::path::Path::new("/mnt/nas/x.flac")
+            )
+            .as_deref(),
+            Some("cifs")
+        );
+    }
+
+    /// Un point de montage à espace — « /mnt/My Music » — arrive masqué en
+    /// `\040` ; sans décodage il ne s'apparierait avec rien et le partage
+    /// repasserait à 32.
+    #[test]
+    fn les_echappements_octaux_sont_rendus() {
+        assert_eq!(demasquer_octal("/mnt/My\\040Music"), "/mnt/My Music");
+        assert_eq!(demasquer_octal("/mnt/nas"), "/mnt/nas");
+        // Un antislash qui n'introduit pas un octal valide est gardé tel quel.
+        assert_eq!(demasquer_octal("/mnt/a\\zb"), "/mnt/a\\zb");
+        assert_eq!(concurrence("/mnt/My Music/album/01.flac"), 8);
+    }
+
+    /// `mountinfo` absent (hors Linux, `/proc` non monté) ou illisible : repli
+    /// EXACT sur le comportement d'avant, quel que soit le type de disque. La
+    /// lecture, elle, journalise son échec — voir `mountinfo()`.
+    #[test]
+    fn sans_mountinfo_le_comportement_d_origine_est_conserve() {
+        for rotatif in [Some(true), Some(false), None] {
+            assert_eq!(
+                concurrence_pour_stockage(None, std::path::Path::new("/mnt/nas/x.flac"), rotatif),
+                concurrence_pour_disque(rotatif)
+            );
+        }
+        // Contenu illisible : aucune ligne exploitable, donc aucun verdict.
+        let charabia = "pas du tout un mountinfo\n\n???\n";
+        assert_eq!(
+            concurrence_pour_stockage(
+                Some(charabia),
+                std::path::Path::new("/mnt/nas/x.flac"),
+                Some(false)
+            ),
+            SCAN_IO_CONCURRENCY
+        );
+        // Une ligne tronquée ne doit pas faire perdre les lignes saines d'à côté.
+        let partiellement_casse = concat!(
+            "ligne tronquee sans separateur\n",
+            "55 40 0:52 / /mnt/nas rw - cifs //nas/musique rw\n",
+        );
+        assert_eq!(
+            concurrence_pour_stockage(
+                Some(partiellement_casse),
+                std::path::Path::new("/mnt/nas/x.flac"),
+                Some(false)
+            ),
+            8
+        );
+    }
+
+    /// Les deux verdicts décrivent deux goulots différents ; le plus étroit
+    /// commande. Un partage monté depuis un disque à plateaux local reste à 4.
+    #[test]
+    fn le_verdict_le_plus_etroit_commande() {
+        assert_eq!(
+            concurrence_pour_stockage(
+                Some(MOUNTINFO),
+                std::path::Path::new("/mnt/nas/x.flac"),
+                Some(true)
+            ),
+            4
+        );
+    }
+
     /// Le réglage manuel est éprouvé SANS toucher à l'environnement.
     ///
     /// Ce test écrivait dans `TUNE_SCAN_IO_CONCURRENCY` avec `set_var`, en se
@@ -1801,7 +2179,8 @@ mod tests {
         // Sans variable, c'est le TYPE DE DISQUE qui décide (#1948) — plus la
         // constante. Comparer à la constante ferait passer ce test par chance
         // sur un runner à SSD, et échouer sur une machine à plateaux.
-        let sans_variable = concurrence_pour_disque(disque_rotatif());
+        let sans_variable =
+            concurrence_pour_stockage(mountinfo().as_deref(), &racine_scannee(), disque_rotatif());
         assert_eq!(concurrence_depuis_reglage(None), sans_variable);
 
         assert_eq!(concurrence_depuis_reglage(Some("8")), 8);
