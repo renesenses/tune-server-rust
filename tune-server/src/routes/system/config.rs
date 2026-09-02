@@ -399,6 +399,24 @@ pub(super) async fn get_config(
             "local_exclusive_mode_supported".to_string(),
             json!(tune_core::outputs::local::LocalOutput::supports_exclusive_mode()),
         );
+        // #3192 — la CONTRAINTE, à côté du RÉGLAGE et de la CAPACITÉ. Même
+        // canal, même intention, troisième couche : le client n'a pas à
+        // déduire d'un nom de backend que la bascule ne sera pas honorée, il
+        // le lit.
+        //
+        // jfpaquet (Asus Essence STX II) perdait le son de toutes ses autres
+        // applications parce que Tune prenait le périphérique en exclusivité
+        // alors qu'il avait DÉCOCHÉ « mode exclusif ». La règle a raison —
+        // ASIO n'a pas de mode partagé — mais elle s'appliquait en silence, et
+        // aucune surface ne pouvait dire pourquoi la case ne servait à rien.
+        //
+        // On ne CORRIGE pas la règle (un pilote ASIO ouvert en partagé
+        // n'existe pas, le retirer ferait échouer l'ouverture — un défaut pire
+        // et silencieux lui aussi) : on la rend visible.
+        config.insert(
+            "local_exclusive_mode_status".to_string(),
+            serde_json::to_value(state.exclusive_mode_status()).unwrap_or(json!(null)),
+        );
     }
     #[cfg(not(feature = "local-audio"))]
     {
@@ -407,6 +425,18 @@ pub(super) async fn get_config(
         // de mode exclusif. On le dit au lieu d'omettre la clé : une clé
         // absente se lit « je ne sais pas », pas « non ».
         config.insert("local_exclusive_mode_supported".to_string(), json!(false));
+        // Et donc aucune contrainte à annoncer : pas de sortie locale, pas de
+        // pilote à prendre en exclusivité. La clé est publiée quand même, pour
+        // la même raison que la ligne ci-dessus.
+        config.insert(
+            "local_exclusive_mode_status".to_string(),
+            serde_json::to_value(tune_core::config::exclusive_mode_status(
+                &state.effective_audio_backend(),
+                state.requested_exclusive_mode(),
+                false,
+            ))
+            .unwrap_or(json!(null)),
+        );
     }
     config
         .entry("server_version".to_string())

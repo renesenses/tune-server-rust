@@ -1169,6 +1169,107 @@ async fn la_capacite_de_mode_exclusif_est_publiee_et_suit_la_plateforme() {
     );
 }
 
+// #3192 — la CONTRAINTE doit sortir par le même canal que la capacité.
+//
+// jfpaquet (Asus Essence STX II, Windows) : « Tune coupe le son de toutes les
+// autres applications ». Décocher « mode exclusif » n'y changeait rien dès que
+// le backend était ASIO — et rien, nulle part, ne le lui disait. La règle est
+// juste (un pilote ASIO ouvert en partagé n'existe pas) ; ce qui manquait,
+// c'est qu'elle se déclare. `/system/config` publie déjà le RÉGLAGE et la
+// CAPACITÉ : la contrainte se range à côté, elle n'invente pas un second
+// canal.
+#[tokio::test]
+async fn la_contrainte_de_mode_exclusif_est_publiee_avec_le_reglage() {
+    let app = make_app();
+    let (status, config) = get(&app, "/api/v1/system/config").await;
+    assert!(status.is_success(), "statut {status}");
+    let statut = config.get("local_exclusive_mode_status").expect(
+        "/system/config doit publier `local_exclusive_mode_status` : sans lui, \
+         l'écran ne peut pas dire que la case « mode exclusif » ne sera pas \
+         honorée, et l'utilisateur perd le son de ses autres applications sans \
+         le moindre avertissement (#3192)",
+    );
+    for champ in ["requested", "effective", "forced"] {
+        assert!(
+            statut.get(champ).and_then(|v| v.as_bool()).is_some(),
+            "`local_exclusive_mode_status.{champ}` doit être un booléen : {statut}"
+        );
+    }
+    // Le réglage et la capacité restent publiés : on ajoute une lecture, on ne
+    // déplace rien.
+    assert!(config.get("local_exclusive_mode").is_some());
+    assert!(config.get("local_exclusive_mode_supported").is_some());
+}
+
+// Le champ doit être BRANCHÉ sur ce que la lecture appliquera, pas recopié à
+// côté : une constante posée là dirait « rien n'est imposé » partout, y
+// compris sur la machine de jfpaquet, sans que rien ne rougisse.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn la_contrainte_publiee_est_celle_que_la_lecture_appliquera() {
+    let (app, state) = make_app_with_state();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    settings.set("local_audio_backend", "asio").unwrap();
+    settings.set("local_exclusive_mode", "false").unwrap();
+
+    let (status, config) = get(&app, "/api/v1/system/config").await;
+    assert!(status.is_success(), "statut {status}");
+    let statut = config
+        .get("local_exclusive_mode_status")
+        .expect("la contrainte doit être publiée");
+
+    assert_eq!(
+        statut.get("requested").and_then(|v| v.as_bool()),
+        Some(false),
+        "`requested` doit rester le choix de l'utilisateur, même écrasé — \
+         sinon l'écran ne peut pas dire QUE son choix a été écrasé"
+    );
+    assert_eq!(
+        statut.get("effective").and_then(|v| v.as_bool()),
+        Some(state.effective_exclusive_mode()),
+        "la charge utile doit dire ce que la lecture appliquera, sur la MÊME \
+         cible : c'est ce lien qui empêche la contrainte de redevenir \
+         décorative"
+    );
+
+    // Sous Windows la contrainte s'applique et doit être EXPLIQUÉE ; ailleurs,
+    // `asio` est une valeur héritée (#1268) qui n'arme rien — témoin que ce
+    // ticket ne change rien pour les plateformes non-Windows.
+    let impose = statut.get("forced").and_then(|v| v.as_bool()).unwrap();
+    assert_eq!(
+        impose,
+        cfg!(target_os = "windows"),
+        "la contrainte est une notion Windows et seulement Windows"
+    );
+    if impose {
+        assert_eq!(
+            statut.get("reason").and_then(|v| v.as_str()),
+            Some(tune_core::config::ExclusiveModeConstraint::AsioAlwaysExclusive.code()),
+            "le code doit être le code stable, celui que le client traduit"
+        );
+        assert!(
+            statut
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .is_some_and(|d| !d.is_empty()),
+            "une contrainte sans explication reste un réglage qui ment"
+        );
+    } else {
+        assert_eq!(statut.get("reason"), Some(&serde_json::Value::Null));
+    }
+
+    // Témoin : sur un backend qui a bien un mode partagé, le réglage décoché
+    // est honoré et rien n'est imposé.
+    settings.set("local_audio_backend", "wasapi").unwrap();
+    let (_, config) = get(&app, "/api/v1/system/config").await;
+    let statut = config.get("local_exclusive_mode_status").unwrap();
+    assert_eq!(
+        statut.get("effective").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(statut.get("forced").and_then(|v| v.as_bool()), Some(false));
+}
+
 // #1268, volet compatibilité : une bibliothèque migrée d'une machine Windows
 // peut arriver avec `local_audio_backend = "wasapi"` en base. Sur un serveur
 // non-Windows, la lecture joue déjà via le host par défaut (repli de
