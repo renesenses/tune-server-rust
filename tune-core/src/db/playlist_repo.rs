@@ -64,17 +64,32 @@ pub mod sql {
     /// sortiraient dans un ordre laissé au moteur, et la mosaïque changerait
     /// d'un rafraîchissement à l'autre.
     ///
+    /// `COALESCE(t.cover_path, al.cover_path)` : la pochette de la PISTE, et à
+    /// défaut celle de son ALBUM. Bertrand a formulé la règle comme « les 4
+    /// premières distinctes parmi les ALBUMS » (02/09/2026), et un fichier peut
+    /// n'embarquer aucune pochette alors que son album en a une. Sans ce repli,
+    /// une piste nue ferait perdre une case — silencieusement, puisque la
+    /// mosaïque afficherait simplement une image de moins.
+    ///
+    /// Mesuré sur le serveur de test : 135 pistes, AUCUNE sans pochette, donc
+    /// aucun changement visible là-bas. Le repli protège les bibliothèques
+    /// moins régulières, pas celle qui a servi à écrire ceci.
+    ///
     /// Le `GROUP BY` dédoublonne côté base : un album de douze titres ne fait
     /// pas douze lignes. Le découpage à quatre reste à l'appelant — la base
     /// n'a pas à connaître la forme de la vignette.
     pub fn covers_for_page<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT pt.playlist_id, t.cover_path, MIN(pt.position) AS pos \
+            "SELECT pt.playlist_id, COALESCE(t.cover_path, al.cover_path) AS cover, \
+             MIN(pt.position) AS pos \
              FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id \
-             WHERE t.cover_path IS NOT NULL AND t.cover_path <> '' \
+             LEFT JOIN albums al ON al.id = t.album_id \
+             WHERE COALESCE(t.cover_path, al.cover_path) IS NOT NULL \
+             AND COALESCE(t.cover_path, al.cover_path) <> '' \
              AND pt.playlist_id IN (SELECT p.id FROM playlists p WHERE p.profile_id = {} \
              ORDER BY LOWER(p.name) LIMIT {} OFFSET {}) \
-             GROUP BY pt.playlist_id, t.cover_path ORDER BY pt.playlist_id, pos",
+             GROUP BY pt.playlist_id, COALESCE(t.cover_path, al.cover_path) \
+             ORDER BY pt.playlist_id, pos",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3)
@@ -593,6 +608,43 @@ mod tests {
             map.get(&pl).cloned().unwrap_or_default(),
             vec!["A", "B", "C", "D"],
             "ordre d'apparition, doublons ecartes, plafond a quatre"
+        );
+    }
+
+    /// Une piste sans pochette prend celle de son ALBUM.
+    ///
+    /// Regle de Bertrand : « les 4 premieres distinctes parmi les ALBUMS ». Un
+    /// fichier peut n'embarquer aucune pochette alors que son album en a une —
+    /// sans repli, cette piste ferait perdre une case, et en silence : la
+    /// mosaique afficherait simplement une image de moins.
+    #[test]
+    fn une_piste_nue_prend_la_pochette_de_son_album() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db.clone());
+
+        // L'album 1 porte « ALB » ; sa piste, elle, n'a aucune pochette.
+        db.execute_batch("INSERT INTO albums (id, title, cover_path) VALUES (1,'Album','ALB');")
+            .unwrap();
+        let mut nue = TrackModel::new("nue".into());
+        nue.file_path = Some("/nue.flac".into());
+        nue.album_id = Some(1);
+        nue.cover_path = None;
+        let id_nue = track_repo.create(&nue).unwrap();
+
+        let id_avec = piste(&track_repo, "avec", Some("PISTE"));
+
+        let pl = repo.create("Melange", None, 1).unwrap();
+        repo.add_tracks(pl, &[id_nue, id_avec], None).unwrap();
+
+        assert_eq!(
+            repo.covers_for_page(1, 50, 0, 4)
+                .unwrap()
+                .get(&pl)
+                .cloned()
+                .unwrap_or_default(),
+            vec!["ALB", "PISTE"],
+            "la piste nue doit apporter la pochette de son album, en premiere position"
         );
     }
 
