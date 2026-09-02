@@ -128,6 +128,45 @@ impl Feature {
         }
     }
 
+    /// Le **code stable** du droit, tel qu'il voyage dans un refus 402.
+    ///
+    /// `display_name` est une étiquette anglaise destinée à l'œil et au
+    /// journal ; elle peut être reformulée sans prévenir. Ce code-ci ne le
+    /// peut pas : c'est le terme du contrat qu'un client traduit avec ses
+    /// propres chaînes (#2419), au même titre que `ModuleRefusal::code` pour
+    /// les modules payants (#2392). Le renommer casse la traduction des
+    /// clients déjà installés.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Feature::UnlimitedZones => "unlimited_zones",
+            Feature::MultiroomSync => "multiroom_sync",
+            Feature::DspEq => "dsp_eq",
+            Feature::CloudRelay => "cloud_relay",
+            Feature::OaatProtocol => "oaat_protocol",
+            Feature::CloudBackup => "cloud_backup",
+            Feature::SyncedLyrics => "synced_lyrics",
+            Feature::ListeningStats => "listening_stats",
+            Feature::MultiScrobbling => "multi_scrobbling",
+            Feature::AiRecommendations => "ai_recommendations",
+            Feature::AcousticAnalysis => "acoustic_analysis",
+            Feature::PlaylistTransfer => "playlist_transfer",
+            Feature::AdvancedAlarms => "advanced_alarms",
+            Feature::MultiProfiles => "multi_profiles",
+            Feature::WeeklyDigest => "weekly_digest",
+            Feature::AutoEnrichment => "auto_enrichment",
+            Feature::RoomCorrection => "room_correction",
+            Feature::CloudConfigBackup => "cloud_config_backup",
+            Feature::SocialSharing => "social_sharing",
+            Feature::DeveloperApi => "developer_api",
+            Feature::PluginMarketplace => "plugin_marketplace",
+            Feature::MultiServer => "multi_server",
+            Feature::DacCalibration => "dac_calibration",
+            Feature::BatchConverter => "batch_converter",
+            Feature::PlaylistsHub => "playlists_hub",
+            Feature::Declick => "declick",
+        }
+    }
+
     /// Whether the feature is actually available / functional right now — a
     /// PRODUCT decision, independent of licence entitlement. The Premium
     /// "Fonctionnalités" grid colours each widget from this combined with the

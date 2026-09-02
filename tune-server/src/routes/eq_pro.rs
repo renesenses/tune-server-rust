@@ -194,12 +194,16 @@ impl EqBand {
 /// Create a new EQ preset.
 async fn create_preset(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreatePresetBody>,
 ) -> Result<impl IntoResponse, AppError> {
     // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
     {
         return Ok(resp);
     }
@@ -241,12 +245,16 @@ async fn get_preset(State(state): State<AppState>, Path(id): Path<String>) -> im
 async fn update_preset(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreatePresetBody>,
 ) -> Result<impl IntoResponse, AppError> {
     // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
     {
         return Ok(resp);
     }
@@ -281,11 +289,15 @@ async fn update_preset(
 async fn delete_preset(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
     {
         return Ok(resp);
     }
@@ -355,11 +367,15 @@ async fn activate_preset(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
     {
         return resp;
     }
@@ -487,12 +503,16 @@ struct ImportAutoEqBody {
 /// porte alors un `warning` plutôt que de se taire.
 async fn import_autoeq(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ImportAutoEqBody>,
 ) -> Result<impl IntoResponse, AppError> {
     // Même porte que la création d'un préréglage : c'est ce que cette route est.
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
     {
         return Ok(resp);
     }

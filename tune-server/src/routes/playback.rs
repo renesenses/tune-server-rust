@@ -2792,6 +2792,20 @@ fn eq_bands_json(profile: &tune_core::audio::eq::EqProfile) -> Vec<Value> {
 /// POSTed here, the server echoed the body back and persisted NOTHING — the
 /// UI showed the EQ as applied with zero audible effect (found by measuring
 /// the stream served by .18: EQ on/off captures were md5-identical).
+///
+/// **Cette lecture est GRATUITE, et c'est délibéré (#2419).** La tentation est
+/// de la garder comme l'écriture puisqu'elles se suivent — ce serait une
+/// régression. `EqualizerView.svelte` appelle `api.getEq(zoneId)` dans son
+/// `onMount`, **sans condition de licence**, pour dessiner la courbe réelle
+/// derrière le bandeau `premium-gate` qu'il affiche juste au-dessus quand
+/// `!$isPremium`. Un 402 ici viderait cet écran de son contenu ET déclencherait
+/// la fenêtre premium de `fetchJSON` à la simple OUVERTURE de l'égaliseur,
+/// avant tout geste de l'utilisateur.
+///
+/// C'est aussi la règle uniforme du domaine : `get_zone_dsp`, `eq_status`,
+/// `list_presets`, `get_preset`, `get_bands` et `get_expert_settings` lisent
+/// sans droit ; seules les écritures passent `require_premium`. Voir
+/// [`set_eq`], juste en dessous, pour l'autre moitié.
 async fn get_eq(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let profile: tune_core::audio::eq::EqProfile = settings
@@ -2812,14 +2826,22 @@ async fn get_eq(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json
 /// Persist the zone's expert-mode EQ bands into the SAME per-zone profile the
 /// orchestrator reads (`zone_{id}_eq_profile`), preserving the profiler tilt
 /// fields. Same premium gate as the /dsp path.
+///
+/// `headers` sert au seul refus : sa phrase suit la langue choisie dans
+/// l'application (#2419). L'ordre des extracteurs compte — `Json` consomme le
+/// corps, il reste donc dernier.
 async fn set_eq(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<EqSettings>,
 ) -> axum::response::Response {
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
     {
         return resp;
     }

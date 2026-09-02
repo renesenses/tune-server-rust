@@ -1,4 +1,16 @@
 {
+  "premium.required": {
+    "fr": "« {feature} » nécessite Tune Premium.",
+    "en": "{feature} requires Tune Premium.",
+    "de": "„{feature}“ erfordert Tune Premium.",
+    "es": "«{feature}» requiere Tune Premium.",
+    "it": "«{feature}» richiede Tune Premium.",
+    "zh": "“{feature}”需要 Tune Premium。",
+    "ja": "「{feature}」には Tune Premium が必要です。",
+    "ko": "'{feature}'에는 Tune Premium이 필요합니다.",
+    "ro": "„{feature}” necesită Tune Premium.",
+    "sv": "”{feature}” kräver Tune Premium."
+  },
   "metafield.album_artist": {
     "fr": "Artiste de l'album",
     "en": "Album Artist",
