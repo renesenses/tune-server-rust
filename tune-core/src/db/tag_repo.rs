@@ -36,7 +36,29 @@ use super::sqlite::SqliteDb;
 /// c'est précisément la panne silencieuse que cette liste ferme. Étiqueter un
 /// label demande une décision de modèle — l'aligner sur `favorite_facets`, ou
 /// donner enfin une identité aux labels — qui n'appartient pas à ce correctif.
-pub const TAGGABLE_ITEM_TYPES: [&str; 4] = ["album", "artist", "playlist", "track"];
+/// 🔴 DEUX types pour les collections, et non un seul.
+///
+/// Les deux sortes ont des espaces d'identifiants INDÉPENDANTS qui se
+/// recouvrent. Mesuré sur le serveur de Bertrand le 02/09/2026 : l'id 1 est à
+/// la fois la collection normale « favorites » et la collection intelligente
+/// « 💎 Audiophile ».
+///
+/// Un `item_type = "collection"` unique désignerait donc les deux à la fois :
+/// étiqueter « Audiophile » poserait l'étiquette sur « favorites », et
+/// personne ne verrait pourquoi. C'est la panne silencieuse décrite plus haut
+/// pour les labels, sur un autre type.
+///
+/// Les deux sortes n'ont d'ailleurs rien en commun côté stockage — une table
+/// pour l'intelligente, un blob JSON de `settings` pour la normale — et l'API
+/// les sépare déjà (`/library/collections` et `/library/smart-collections`).
+pub const TAGGABLE_ITEM_TYPES: [&str; 6] = [
+    "album",
+    "artist",
+    "collection",
+    "playlist",
+    "smart_collection",
+    "track",
+];
 
 /// Vrai si `item_type` est un type d'objet étiquetable connu.
 pub fn is_taggable_item_type(item_type: &str) -> bool {
