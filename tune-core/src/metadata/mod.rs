@@ -2624,6 +2624,13 @@ pub struct MetadataUpdate {
     pub year: Option<u32>,
     pub composer: Option<String>,
     pub label: Option<String>,
+    /// MBID de l'**enregistrement** MusicBrainz.
+    ///
+    /// Il désigne une prise, pas le rang d'une piste dans une édition :
+    /// c'est la seule clé qui dise « ce morceau-ci est le même que
+    /// celui-là » d'une édition à l'autre. Écrit tel quel, jamais déduit
+    /// d'un titre.
+    pub musicbrainz_recording_id: Option<String>,
 }
 
 impl MetadataUpdate {
@@ -2649,6 +2656,11 @@ impl MetadataUpdate {
         clean("genre", &mut update.genre, &mut corrections);
         clean("composer", &mut update.composer, &mut corrections);
         clean("label", &mut update.label, &mut corrections);
+        clean(
+            "musicbrainz_recording_id",
+            &mut update.musicbrainz_recording_id,
+            &mut corrections,
+        );
         (update, corrections)
     }
 }
@@ -2707,6 +2719,12 @@ pub fn write_metadata(path: &Path, update: &MetadataUpdate) -> Result<(), String
     }
     if let Some(ref v) = update.label {
         tag.insert(TagItem::new(ItemKey::Label, ItemValue::Text(v.clone())));
+    }
+    if let Some(ref v) = update.musicbrainz_recording_id {
+        tag.insert(TagItem::new(
+            ItemKey::MusicBrainzRecordingId,
+            ItemValue::Text(v.clone()),
+        ));
     }
 
     tag.save_to_path(path, WriteOptions::default())
@@ -3096,6 +3114,7 @@ mod tests {
             year: None,
             composer: None,
             label: None,
+            musicbrainz_recording_id: None,
         };
         let (clean, corrections) = update.sanitized();
         assert_eq!(clean.title.as_deref(), Some("A B"));
@@ -3557,6 +3576,7 @@ mod tests {
             year: Some(2024),
             composer: Some("Composer".into()),
             label: None,
+            musicbrainz_recording_id: None,
         };
         assert_eq!(update.title.as_deref(), Some("New Title"));
         assert_eq!(update.year, Some(2024));
@@ -4365,6 +4385,55 @@ mod tests {
         let taille = 4_800_000u64;
         let duree_reelle_a_320k = taille * 8 * 1000 / 320_000;
         assert_eq!(duree_reelle_a_320k, taille / 40);
+    }
+    /// L'identifiant d'enregistrement écrit par [`write_metadata`] doit
+    /// ressortir de [`try_read_metadata`]. C'est le maillon qui relie
+    /// l'ingestion au parcours : le parcours ne lit que le FICHIER, donc un
+    /// identifiant qui n'atteint pas l'étiquette n'atteindra jamais la base.
+    ///
+    /// L'assertion porte sur le CONTENU relu, jamais sur le code de retour :
+    /// un `Ok(())` ne prouverait pas qu'une étiquette a été posée.
+    #[test]
+    fn l_identifiant_d_enregistrement_ecrit_est_relu_depuis_le_fichier() {
+        let dir = tempfile::tempdir().unwrap();
+        let fichier = dir.path().join("piste.flac");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac"),
+            &fichier,
+        )
+        .unwrap();
+
+        assert_eq!(
+            try_read_metadata(&fichier)
+                .unwrap()
+                .musicbrainz_recording_id,
+            None,
+            "la fixture porte deja un identifiant : le test ne prouverait rien"
+        );
+
+        let update = MetadataUpdate {
+            title: None,
+            artist: None,
+            album: None,
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            year: None,
+            composer: None,
+            label: None,
+            musicbrainz_recording_id: Some("11111111-2222-3333-4444-555555555555".into()),
+        };
+        write_metadata(&fichier, &update).expect("ecriture refusee");
+
+        assert_eq!(
+            try_read_metadata(&fichier)
+                .unwrap()
+                .musicbrainz_recording_id
+                .as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "l'identifiant n'a pas ete inscrit dans l'etiquette du fichier"
+        );
     }
 }
 
