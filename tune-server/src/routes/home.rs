@@ -70,15 +70,37 @@ fn ph(engine: Engine, idx: usize) -> String {
 /// a sa place. Conséquences a l'ecran, jamais signalees comme des pannes :
 /// « A decouvrir » retombait sur des albums AU HASARD (`reason: "random"`)
 /// au lieu des genres ecoutes, et `/home/top-mixes` rendait toujours `[]`.
+///
+/// # Pourquoi la casse est repliee
+///
+/// Mesure sur une bibliotheque reelle (.18, 639 ecoutes) des que la requete
+/// s'est remise a repondre : `Pop-Rock` (51) et `Pop-rock` (20) sont le MEME
+/// genre, et occupaient DEUX des cinq places — l'accueil aurait affiche
+/// « Mix Pop-Rock » et « Mix Pop-rock » cote a cote. Le regroupement se fait
+/// donc sur `LOWER(g)`.
+///
+/// Trois colonnes, et non deux : le libelle a AFFICHER, l'effectif, et la
+/// CLE repliee. L'aval doit comparer sur la clé (`LOWER(a.genre) = ...`),
+/// sinon replier le classement perdrait justement les albums de l'autre
+/// graphie — l'inverse du but recherche.
+///
+/// Le libelle affiche est `MIN(g)` : arbitraire, mais DETERMINISTE et
+/// identique sur les deux moteurs. En ASCII il fait tomber la graphie
+/// capitalisee (`Pop-Rock` avant `Pop-rock`), ce qui est le bon hasard.
+///
+/// Limite connue : `LOWER` de SQLite ne replie que l'ASCII, celui de
+/// PostgreSQL suit la locale. Deux graphies qui ne different que par un
+/// accent resteront donc separees sur SQLite. Le defaut mesure, lui, est
+/// bien replie.
 fn sql_top_genres() -> String {
     format!(
-        "SELECT h.g AS genre, COUNT(*) as cnt \
+        "SELECT MIN(h.g) AS genre, COUNT(*) as cnt, LOWER(h.g) AS cle \
          FROM (SELECT COALESCE(t.genre, a.genre) as g \
                FROM listen_history lh \
                LEFT JOIN tracks t ON lh.track_id = t.id \
                LEFT JOIN albums a ON {HISTORIQUE_VERS_ALBUM}) AS h \
          WHERE h.g IS NOT NULL AND h.g != '' \
-         GROUP BY h.g ORDER BY cnt DESC LIMIT 5"
+         GROUP BY LOWER(h.g) ORDER BY cnt DESC LIMIT 5"
     )
 }
 
@@ -834,6 +856,56 @@ mod tests_homonymes {
         // (#2731). La jointure corrigee etait ecrite depuis longtemps ; tant
         // que la requete echouait, RIEN ne pouvait le verifier.
         assert_eq!(lignes[0][1].as_i64(), Some(1), "l'homonyme ne compte pas");
+        assert_eq!(
+            lignes[0][2].as_string().as_deref(),
+            Some("rock"),
+            "la 3e colonne est la CLE repliee, celle sur laquelle l'aval compare"
+        );
+    }
+
+    /// Mesure sur la bibliotheque de la .18 des que la requete s'est remise a
+    /// repondre : `Pop-Rock` (51) et `Pop-rock` (20) sont le meme genre, et
+    /// prenaient DEUX des cinq places du classement. L'accueil aurait affiche
+    /// « Mix Pop-Rock » et « Mix Pop-rock » cote a cote.
+    #[test]
+    fn deux_graphies_du_meme_genre_ne_font_qu_une_ligne() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        let poser = |artiste: &str, genre: &str| -> i64 {
+            b.execute(
+                "INSERT INTO artists (name) VALUES (?1)",
+                &[&artiste as &dyn ToSqlValue],
+            )
+            .unwrap();
+            let artiste_id = b.last_insert_rowid();
+            b.execute(
+                "INSERT INTO albums (title, artist_id, track_count, genre) \
+                 VALUES (?1, ?2, 5, ?3)",
+                &[
+                    &artiste as &dyn ToSqlValue,
+                    &artiste_id as &dyn ToSqlValue,
+                    &genre as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        // Deux albums distincts, deux graphies du meme genre.
+        let a1 = poser("Blur", "Pop-Rock");
+        let a2 = poser("Pulp", "Pop-rock");
+        ecoute(&state, "Song 2", Some("Blur"), Some(a1));
+        ecoute(&state, "Common People", Some("Pulp"), Some(a2));
+
+        let lignes = state.backend.query_many(&sql_top_genres(), &[]).unwrap();
+
+        assert_eq!(lignes.len(), 1, "une seule ligne, pas deux graphies");
+        assert_eq!(lignes[0][1].as_i64(), Some(2), "les deux ecoutes comptent");
+        assert_eq!(
+            lignes[0][0].as_string().as_deref(),
+            Some("Pop-Rock"),
+            "MIN retient la graphie capitalisee en ASCII"
+        );
+        assert_eq!(lignes[0][2].as_string().as_deref(), Some("pop-rock"));
     }
 }
 
@@ -1435,13 +1507,15 @@ async fn home_recommendations(
 fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
 
-    // Find top genres from listen history
+    // Find top genres from listen history. On retient la CLE repliee (3e
+    // colonne) et non le libelle : comparer sur le libelle perdrait les albums
+    // de l'autre graphie, ce que le repli de casse cherche justement a eviter.
     let top_genres: Vec<String> = state
         .backend
         .query_many(&sql_top_genres(), &[])
         .ou_defaut_journalise()
         .into_iter()
-        .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
+        .filter_map(|cols| cols.get(2).and_then(|v| v.as_string()))
         .collect();
 
     if top_genres.is_empty() {
@@ -1486,7 +1560,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
         "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
          FROM albums a \
          LEFT JOIN artists ar ON a.artist_id = ar.id \
-         WHERE a.genre IN ({genre_placeholders}) \
+         WHERE LOWER(a.genre) IN ({genre_placeholders}) \
            AND NOT EXISTS (SELECT 1 FROM listen_history lh \
                            WHERE {HISTORIQUE_VERS_ALBUM}) \
          ORDER BY RANDOM() \
@@ -1527,7 +1601,10 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     let engine = state.backend.engine();
 
     // Get top 5 genres from history
-    let top_genres: Vec<(String, i64)> = state
+    // Le libelle sert au TITRE du mix, la cle repliee a la SELECTION des
+    // pistes : « Mix Pop-Rock » doit contenir aussi les pistes taguees
+    // « Pop-rock ».
+    let top_genres: Vec<(String, i64, String)> = state
         .backend
         .query_many(&sql_top_genres(), &[])
         .ou_defaut_journalise()
@@ -1535,7 +1612,8 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
         .filter_map(|cols| {
             let genre = cols.first()?.as_string()?;
             let cnt = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
-            Some((genre, cnt))
+            let cle = cols.get(2).and_then(|v| v.as_string())?;
+            Some((genre, cnt, cle))
         })
         .collect();
 
@@ -1547,14 +1625,14 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
-         WHERE t.genre = {p1} OR al.genre = {p2} \
+         WHERE LOWER(t.genre) = {p1} OR LOWER(al.genre) = {p2} \
          ORDER BY RANDOM() LIMIT 20"
     );
 
     let mixes: Vec<Value> = top_genres
         .into_iter()
-        .filter_map(|(genre, play_count)| {
-            let params: [&dyn ToSqlValue; 2] = [&genre, &genre];
+        .filter_map(|(genre, play_count, cle)| {
+            let params: [&dyn ToSqlValue; 2] = [&cle, &cle];
             let tracks: Vec<Value> = state
                 .backend
                 .query_many(&tracks_sql, &params)
