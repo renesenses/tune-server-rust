@@ -71,6 +71,21 @@ impl OpenHomeOutput {
         self.service_urls.get(key)
     }
 
+    /// Le service `av.openhome.org:Pins:1` de ce renderer, s'il en publie un
+    /// (#2722).
+    ///
+    /// Rend `None` — SANS le moindre aller-retour réseau — dès que le
+    /// descriptif collecté à la découverte ne porte pas ce service. C'est le
+    /// cas de la grande majorité des appareils, et c'est ce qui permet à la
+    /// fiche de zone de répondre « non pris en charge » sans attendre.
+    pub fn pins_service(&self) -> Option<super::openhome_pins::PinsService> {
+        let url = self.svc_url(super::openhome_pins::PINS_SERVICE_KEY)?;
+        Some(super::openhome_pins::PinsService::new(
+            url.clone(),
+            self.client.clone(),
+        ))
+    }
+
     async fn soap_call(
         &self,
         url: &str,
@@ -350,6 +365,13 @@ impl OutputTarget for OpenHomeOutput {
         Some(&self.host_addr)
     }
 
+    /// Sans cette redescente, le défaut de `OutputTarget` rend `&()` et une
+    /// route ne peut PAS retrouver l'`OpenHomeOutput` enregistré — donc pas
+    /// atteindre son service `Pins:1` (#2722).
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         self.unsubscribe_events().await;
         self.oh_stop().await.ok();
@@ -585,7 +607,11 @@ impl OutputTarget for OpenHomeOutput {
     }
 }
 
-fn extract_tag(xml: &str, tag: &str) -> Option<String> {
+/// Extrait le texte d'une balise d'une réponse SOAP.
+///
+/// `pub(crate)` depuis #2722 : le client `Pins:1` (`openhome_pins.rs`) dissèque
+/// les mêmes enveloppes et n'a aucune raison d'en recopier une seconde.
+pub(crate) fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();

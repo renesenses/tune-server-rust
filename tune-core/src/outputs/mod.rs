@@ -22,6 +22,7 @@ pub mod mock;
 pub mod oaat;
 pub mod oh_events;
 pub mod openhome;
+pub mod openhome_pins;
 pub mod registry;
 pub mod slimproto;
 pub mod squeezebox;

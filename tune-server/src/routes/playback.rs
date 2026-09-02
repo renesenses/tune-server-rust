@@ -3283,8 +3283,29 @@ fn get_zone_device_id(state: &AppState, zone_id: i64) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Zone Pins
 // ---------------------------------------------------------------------------
+//
+// #2722 — deux défauts vivaient ici, dont un seul se voyait.
+//
+// 1. `GET /zones/{id}/pins` rendait `Json(json!(pins))`, un TABLEAU NU, alors
+//    que le contrat web (`docs/contrat-web.json`) exige l'enveloppe
+//    `{ supported, pins, max_slots }`. `supported` valait `undefined` et
+//    l'écran concluait que les Pins n'étaient pas pris en charge.
+//
+// 2. Le défaut profond : ces routes STOCKAIENT des objets dans `settings` et
+//    n'appelaient JAMAIS le service `av.openhome.org:Pins:1` du renderer.
+//    Corriger la seule enveloppe aurait affiché une capacité que l'appareil
+//    n'a jamais annoncée — « inventer `max_slots` côté Tune rendrait seulement
+//    le test vert ».
+//
+// Depuis #2722, quand le renderer de la zone publie `Pins:1`, ce sont SES
+// actions qui sont appelées (`GetDeviceMax`, `GetIdArray`, `ReadList`,
+// `SetDevice`, `InvokeIndex`, `Clear`) et `max_slots` est ce qu'IL annonce.
+// Sinon `supported` vaut `false` sans un octet de réseau, et le stockage
+// historique dans `settings` reste tel quel pour ne rien casser.
 
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::outputs::openhome::OpenHomeOutput;
+use tune_core::outputs::openhome_pins::{PinWrite, PinsService};
 
 #[derive(Deserialize, serde::Serialize, Clone)]
 struct ZonePin {
@@ -3293,6 +3314,57 @@ struct ZonePin {
     uri: String,
     #[serde(rename = "type")]
     pin_type: String,
+    /// Champs du contrat OpenHome `SetDevice`. Optionnels : le corps que le
+    /// client web envoie aujourd'hui (`index`, `title`, `uri`, `type`) se
+    /// désérialise inchangé.
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    artwork_uri: String,
+    #[serde(default)]
+    shuffle: bool,
+}
+
+impl ZonePin {
+    fn to_device_write(&self) -> PinWrite {
+        PinWrite {
+            index: self.index,
+            mode: self.mode.clone(),
+            pin_type: self.pin_type.clone(),
+            uri: self.uri.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            artwork_uri: self.artwork_uri.clone(),
+            shuffle: self.shuffle,
+        }
+    }
+}
+
+/// Le service `Pins:1` du renderer branché à cette zone, s'il existe.
+///
+/// Aucun aller-retour réseau ici : la présence du service se lit dans le
+/// descriptif déjà collecté à la découverte, recopié dans l'`OpenHomeOutput`
+/// enregistré. Une zone navigateur, une sortie locale, un renderer DLNA ou un
+/// OpenHome sans `Pins:1` rendent `None` immédiatement — c'est le chemin le
+/// plus fréquenté, et la fiche de zone n'y attend rien.
+async fn zone_pins_service(state: &AppState, zone_id: i64) -> Option<PinsService> {
+    let device_id = get_zone_device_id(state, zone_id)?;
+    let output = { state.outputs.lock().await.get(&device_id) }?;
+    // Le verrou de la sortie ne tient QUE la lecture de l'URL : le client rendu
+    // est autonome, les allers-retours SOAP se font hors verrou.
+    let guard = output.lock().await;
+    guard
+        .as_any()
+        .downcast_ref::<OpenHomeOutput>()?
+        .pins_service()
+}
+
+/// Réponse d'un appareil injoignable ou qui refuse l'action.
+fn pins_erreur_renderer(zone_id: i64, erreur: String) -> axum::response::Response {
+    warn!(zone_id, error = %erreur, "zone_pins_service_renderer_en_echec");
+    (StatusCode::BAD_GATEWAY, Json(json!({ "error": erreur }))).into_response()
 }
 
 fn pins_key(zone_id: i64) -> String {
@@ -3319,9 +3391,40 @@ fn save_pins(state: &AppState, zone_id: i64, pins: &[ZonePin]) {
         .ok();
 }
 
+/// `GET /zones/{id}/pins` → `{ supported, pins, max_slots }`.
+///
+/// `max_slots` est ce que l'appareil ANNONCE par `GetDeviceMax`. Il n'existe
+/// aucun littéral côté Tune : sans service `Pins:1` la capacité vaut 0 et
+/// `supported` vaut `false`. Les pins historiques rangés dans `settings` sont
+/// tout de même rendus dans ce cas — les taire ferait disparaître du contenu
+/// déjà enregistré —, mais ils ne prétendent à AUCUNE capacité d'appareil.
 async fn get_zone_pins(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let pins = load_pins(&state, zone_id);
-    Json(json!(pins))
+    let Some(service) = zone_pins_service(&state, zone_id).await else {
+        return Json(json!({
+            "supported": false,
+            "pins": load_pins(&state, zone_id),
+            "max_slots": 0,
+        }));
+    };
+    match service.snapshot().await {
+        Ok(snapshot) => Json(json!({
+            "supported": true,
+            "pins": snapshot.pins,
+            "max_slots": snapshot.device_max,
+        })),
+        Err(erreur) => {
+            // L'appareil publie bien `Pins:1` mais ne répond pas : on ne
+            // devine NI sa capacité NI sa liste. `supported: false` est ici la
+            // seule réponse honnête, et `error` dit pourquoi.
+            warn!(zone_id, error = %erreur, "zone_pins_lecture_renderer_echouee");
+            Json(json!({
+                "supported": false,
+                "pins": [],
+                "max_slots": 0,
+                "error": erreur,
+            }))
+        }
+    }
 }
 
 async fn set_zone_pin(
@@ -3329,6 +3432,14 @@ async fn set_zone_pin(
     Path(zone_id): Path<i64>,
     Json(body): Json<ZonePin>,
 ) -> impl IntoResponse {
+    // Renderer porteur de `Pins:1` : c'est `SetDevice` qui pose le pin, pas
+    // `settings`.
+    if let Some(service) = zone_pins_service(&state, zone_id).await {
+        return match service.set_device(&body.to_device_write()).await {
+            Ok(()) => (StatusCode::CREATED, Json(json!(body))).into_response(),
+            Err(erreur) => pins_erreur_renderer(zone_id, erreur),
+        };
+    }
     let mut pins = load_pins(&state, zone_id);
     // Replace at index or append
     if let Some(existing) = pins.iter_mut().find(|p| p.index == body.index) {
@@ -3344,16 +3455,45 @@ async fn clear_zone_pin(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
 ) -> impl IntoResponse {
+    // `Clear` du contrat OpenHome prend un IDENTIFIANT, pas un rang : on lit
+    // d'abord `GetIdArray` pour traduire le rang que porte l'URL. Un
+    // emplacement vide (identifiant 0) n'est pas une erreur d'appareil, c'est
+    // un 404.
+    if let Some(service) = zone_pins_service(&state, zone_id).await {
+        let ids = match service.id_array().await {
+            Ok(ids) => ids,
+            Err(erreur) => return pins_erreur_renderer(zone_id, erreur),
+        };
+        let Some(id) = ids.get(index).copied().filter(|id| *id != 0) else {
+            return (StatusCode::NOT_FOUND, "pin not found").into_response();
+        };
+        return match service.clear(id).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(erreur) => pins_erreur_renderer(zone_id, erreur),
+        };
+    }
     let mut pins = load_pins(&state, zone_id);
     pins.retain(|p| p.index != index);
     save_pins(&state, zone_id, &pins);
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn invoke_zone_pin(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
 ) -> impl IntoResponse {
+    // `InvokeIndex` : l'appareil déclenche lui-même sa source. Tune n'a rien à
+    // orchestrer, et surtout rien à acquitter à sa place.
+    if let Some(service) = zone_pins_service(&state, zone_id).await {
+        return match service.invoke_index(index).await {
+            Ok(()) => (
+                StatusCode::ACCEPTED,
+                Json(json!({ "invoked": index, "by": "openhome_pins" })),
+            )
+                .into_response(),
+            Err(erreur) => pins_erreur_renderer(zone_id, erreur),
+        };
+    }
     let pins = load_pins(&state, zone_id);
     let Some(pin) = pins.iter().find(|p| p.index == index) else {
         return (StatusCode::NOT_FOUND, "pin not found").into_response();
@@ -3393,6 +3533,20 @@ async fn save_queue_as_pin(
     Path(zone_id): Path<i64>,
     Json(body): Json<ZonePin>,
 ) -> impl IntoResponse {
+    // Épingler la file Tune dans un emplacement de l'APPAREIL demanderait une
+    // adresse que l'appareil sache ouvrir ; `queue:zone:{id}` n'en est pas
+    // une. Plutôt que d'écrire dans `settings` un pin que `GET` n'affichera
+    // jamais pour cette zone, on le dit (#2722, reste à porter).
+    if zone_pins_service(&state, zone_id).await.is_some() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "openhome_pins_from_queue_non_supporte",
+                "message": "Cette zone porte le service OpenHome Pins : un emplacement de l'appareil demande une adresse qu'il sache ouvrir, ce que la file Tune ne fournit pas encore.",
+            })),
+        )
+            .into_response();
+    }
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
     if items.is_empty() {
@@ -3404,6 +3558,10 @@ async fn save_queue_as_pin(
         title: body.title,
         uri: format!("queue:zone:{zone_id}"),
         pin_type: "queue".into(),
+        mode: body.mode,
+        description: body.description,
+        artwork_uri: body.artwork_uri,
+        shuffle: body.shuffle,
     };
     if let Some(existing) = pins.iter_mut().find(|p| p.index == pin.index) {
         *existing = pin.clone();
