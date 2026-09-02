@@ -23,6 +23,32 @@ const REQUEST_TIMEOUT_SECS: u64 = 10;
 
 // ── Upload payload ────────────────────────────────────────────────────────────
 
+/// ⚠ `musicbrainz_id` est **volontairement** non optionnel ici, là où
+/// [`AlbumBioEntry`] le déclare `Option<String>` (#2258).
+///
+/// Ce n'est pas une inattention : c'est la seule différence de contrat entre
+/// les deux côtés du fonds communautaire.
+///
+/// - **Albums** : le fonds accepte une SECONDE clé. `download_album_bios`
+///   fait deux phases — `?musicbrainz_ids=…` d'abord, puis
+///   `?titles=[{title, artist_name}]` pour ceux qui n'ont pas de MBID. Un
+///   album sans MBID reste donc servi, par son titre et son artiste.
+/// - **Artistes** : il n'y en a qu'une. `download_artist_bios` ne connaît que
+///   `?musicbrainz_ids=…`. Le fonds est indexé par MBID **et rien d'autre**
+///   pour les artistes.
+///
+/// Rendre ce champ optionnel ferait donc partir des clés nulles vers un index
+/// qui n'a pas de repli : au mieux un rejet, au pire une biographie rattachée
+/// au mauvais artiste chez tous les utilisateurs. Le filtre SQL en amont
+/// (`ArtistRepo::artists_with_bio_and_mbid`) est la garde qui rend ce type
+/// tenable, et les deux se lisent ensemble.
+///
+/// Ouvrir une seconde clé par NOM NORMALISÉ pour les artistes changerait le
+/// contrat de l'API du nuage — ce n'est pas livrable depuis ce seul dépôt.
+/// Ce qui l'est, et ce que #2258 livre, c'est de **compter et nommer** les
+/// artistes que cette clé écarte :
+/// `ArtistRepo::hors_fonds_communautaire`, servi par
+/// `GET /system/enrichment/status` et `POST /system/enrich-bios`.
 #[derive(Debug, Serialize)]
 struct ArtistBioEntry {
     name: String,

@@ -84,6 +84,51 @@ async fn pg_artists_round_trip() {
     assert_eq!(by_name.and_then(|a| a.id), Some(id));
 }
 
+/// #2258 — le compte des artistes hors du fonds communautaire, sur le VRAI
+/// moteur PostgreSQL.
+///
+/// Deux `COUNT(*)` sans paramètre lié : rien à numéroter, donc rien à
+/// désaligner entre les `?` de SQLite et les `$n` de PostgreSQL. Ce qui reste
+/// à prouver ici, c'est que le `COUNT(*)` revient bien en `i64` à travers le
+/// pont `SqlValue` — sur PostgreSQL il arrive en `bigint`, et un `as_i64` qui
+/// retomberait sur son `unwrap_or(0)` rendrait deux zéros parfaitement
+/// silencieux. C'est exactement le genre de vert contre rien que ce test
+/// interdit : les nombres attendus sont NON NULS.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_hors_fonds_communautaire_compte_les_artistes_sans_mbid() {
+    use crate::db::artist_repo::ArtistRepo;
+    use crate::db::models::Artist;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let repo = ArtistRepo::with_backend(db);
+
+    // Identifié + bio : téléversé, donc PAS compté.
+    let mut identifie = Artist::new("Pink Floyd".into());
+    identifie.musicbrainz_id = Some("83d91898-7763-47d7-b03b-b92132375c47".into());
+    identifie.bio = Some("Groupe de rock anglais.".into());
+    repo.create(&identifie).unwrap();
+
+    // Bio SANS MBID : la passe d'envoi ne la verra jamais.
+    let mut bio_orpheline = Artist::new("Alan Stivell".into());
+    bio_orpheline.bio = Some("Harpiste et chanteur breton.".into());
+    repo.create(&bio_orpheline).unwrap();
+
+    // Ni bio ni MBID : même pas candidats au téléchargement.
+    for nom in ["Bagad Kemper", "Sonerien Du"] {
+        repo.create(&Artist::new(nom.into())).unwrap();
+    }
+
+    let hors = repo.hors_fonds_communautaire().unwrap();
+    assert_eq!(hors.bios_non_partagees, 1);
+    assert_eq!(hors.artistes_non_servis, 2);
+
+    // Témoin : l'artiste identifié reste téléversé, exactement comme avant.
+    let televerses = repo.artists_with_bio_and_mbid().unwrap();
+    assert_eq!(televerses.len(), 1);
+    assert_eq!(televerses[0].0, "Pink Floyd");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_albums_round_trip() {
     use crate::db::album_repo::AlbumRepo;
