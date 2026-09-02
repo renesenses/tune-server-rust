@@ -203,3 +203,12 @@ path = "tests/portee_unicite_file_path_2939.rs"
 [[test]]
 name = "base_unique_lancement_i3185"
 path = "tests/base_unique_lancement_i3185.rs"
+
+# La migration Windows vers %LOCALAPPDATA% copiait le `.db` SEUL, sans son
+# `-wal` ni son `-shm`. `autotests = false` plus haut — sans cette cible, le
+# fichier ne serait jamais compile, donc vert contre rien. Et le test lui-meme
+# ne porte AUCUN `cfg` : il eprouve sur Linux la regle et ses effets de bord,
+# que `#[cfg(target_os = "windows")]` derobait a toute machine de compilation.
+[[test]]
+name = "migration_windows_annexes_sqlite"
+path = "tests/migration_windows_annexes_sqlite.rs"
