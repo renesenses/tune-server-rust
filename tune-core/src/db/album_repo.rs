@@ -323,6 +323,14 @@ pub mod sql {
          GROUP BY COALESCE(NULLIF(source, ''), 'local') ORDER BY 1"
     }
 
+    /// Existence NUE d'une liste d'identifiants : pas de jointure, pas une
+    /// colonne d'album. Sert à séparer « l'album n'est plus là » de « la base
+    /// a refusé de répondre » sans relire N albums entiers (#3285).
+    pub fn ids_existants<D: SqlDialect>(d: &D, n: usize) -> String {
+        let places: Vec<String> = (1..=n).map(|i| d.placeholder(i)).collect();
+        format!("SELECT id FROM albums WHERE id IN ({})", places.join(", "))
+    }
+
     /// Compteur de la GRILLE : même exclusion des albums masqués que
     /// `list_filtered`, sinon le `total` de la pagination ment et la grille
     /// saute ou duplique des pages (#1391).
@@ -515,6 +523,40 @@ impl AlbumRepo {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
+    }
+
+    /// Parmi `ids`, ceux qui désignent encore un album EXISTANT.
+    ///
+    /// 🔴 #3285 — une panne de base remonte au lieu de se déguiser en absence.
+    /// Les dossiers « Collections » gardent une liste d'identifiants nue dans
+    /// le réglage `collections` ; rien ne la nettoie quand un album disparaît,
+    /// et la route qui rendait ces albums confondait les deux cas.
+    ///
+    /// Paquets de 500 : plafond de 65535 paramètres côté PostgreSQL, 999 par
+    /// défaut côté SQLite. Une liste dédoublonnée avant, parce qu'un dossier
+    /// mal recollé peut répéter un identifiant.
+    pub fn ids_existants(&self, ids: &[i64]) -> Result<std::collections::HashSet<i64>, TuneError> {
+        let mut trouves: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        if ids.is_empty() {
+            return Ok(trouves);
+        }
+        let mut uniques: Vec<i64> = ids.to_vec();
+        uniques.sort_unstable();
+        uniques.dedup();
+        for paquet in uniques.chunks(500) {
+            let sql = self.dialect_sql(
+                |d| sql::ids_existants(d, paquet.len()),
+                |d| sql::ids_existants(d, paquet.len()),
+            );
+            let params: Vec<&dyn ToSqlValue> =
+                paquet.iter().map(|v| v as &dyn ToSqlValue).collect();
+            for row in self.db.query_many(&sql, &params)? {
+                if let Some(id) = row.first().and_then(|v| v.as_i64()) {
+                    trouves.insert(id);
+                }
+            }
+        }
+        Ok(trouves)
     }
 
     pub fn get_by_title(&self, title: &str) -> Result<Option<Album>, TuneError> {
@@ -3665,6 +3707,46 @@ mod tests {
         assert!(sql::get_by_title(&p).contains("LOWER(a.title) = LOWER($1)"));
         assert!(sql::create_minimal(&p).contains("VALUES ($1, $2, $3)"));
         assert!(!sql::list_by_artist(&p).contains("COLLATE"));
+        // #3285 — la liste `IN` est bâtie à la main : elle doit numéroter les
+        // paramètres sur PostgreSQL, pas répéter `?`.
+        assert_eq!(
+            sql::ids_existants(&s, 3),
+            "SELECT id FROM albums WHERE id IN (?, ?, ?)"
+        );
+        assert_eq!(
+            sql::ids_existants(&p, 3),
+            "SELECT id FROM albums WHERE id IN ($1, $2, $3)"
+        );
+    }
+
+    /// #3285 — un identifiant mort est ABSENT du résultat, et un identifiant
+    /// vivant y est. Sans quoi la route ne saurait toujours pas distinguer.
+    #[test]
+    fn ids_existants_ne_rend_que_les_albums_encore_la() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        let vivant = repo
+            .create(&Album::new("Kind of Blue".to_string()))
+            .unwrap();
+        let condamne = repo
+            .create(&Album::new("Perdu au rescan".to_string()))
+            .unwrap();
+        repo.delete(condamne).unwrap();
+
+        let trouves = repo.ids_existants(&[vivant, condamne, 999_999]).unwrap();
+        assert!(trouves.contains(&vivant));
+        assert!(
+            !trouves.contains(&condamne),
+            "un album supprimé n'existe plus"
+        );
+        assert!(
+            !trouves.contains(&999_999),
+            "un identifiant jamais créé non plus"
+        );
+        assert_eq!(trouves.len(), 1);
+
+        // Liste vide : aucune requête, aucun `IN ()` invalide.
+        assert!(repo.ids_existants(&[]).unwrap().is_empty());
     }
 
     #[test]
