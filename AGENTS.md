@@ -1,6 +1,9 @@
 # Agents Tune
 
-Le workflow commun est décrit dans `docs/RELEASE-WORKFLOW.md`. Il s'applique
+Le workflow commun est décrit dans `docs/RELEASE-WORKFLOW.md`. La doctrine
+canonique est
+[`tune-gouvernance/regles/RELEASE.md`](https://github.com/renesenses/tune-gouvernance/blob/main/regles/RELEASE.md)
+et le runbook opératoire est `docs/RELEASE-OPERATIONS.md`. Ils s'appliquent
 aux agents OpenAI/Codex, Claude et aux humains.
 
 Avant toute modification :
@@ -25,6 +28,10 @@ Règles non négociables :
 - `ci:full` est obligatoire pour les changements CI, release ou transversaux ;
 - seule une RC peut cibler `main` ;
 - un agent de correctif ne merge pas, ne tague pas et ne publie pas ;
+- sans instruction humaine explicite portant sur l'étape précise, aucun agent
+  ne modifie ruleset, environnement, secret ou variable d'armement ;
+- un dry-run vert ne donne jamais l'autorisation de franchir le STOP humain
+  suivant ;
 - un échec, un check absent ou une situation inconnue bloque le travail ;
 - les instructions locales peuvent durcir ces règles, jamais les assouplir.
 
