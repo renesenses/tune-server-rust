@@ -38,6 +38,12 @@ pub(crate) fn is_various_artists(s: &str) -> bool {
 /// album_artist, which otherwise splits into one album (and cover) per artist.
 ///
 /// Keys are `(folder, album_title.to_lowercase())`.
+///
+/// ⚠️ N'ALIMENTER qu'avec des valeurs venues des BALISES. Un fichier dont les
+/// tags n'ont pas pu être lus arrive avec un artiste déduit du nom de dossier
+/// (`TrackMetadata::artist_from_path`) : compté ici, ce faux second artiste
+/// bascule l'album entier en compilation (#3232). Le filtrage se fait chez
+/// l'appelant, [`TrackImporter::begin_batch`].
 pub(crate) fn decide_compilation_albums<'a>(
     items: impl Iterator<Item = (String, &'a str, Option<&'a str>, bool)>,
 ) -> HashMap<(String, String), bool> {
@@ -72,6 +78,11 @@ pub(crate) fn decide_compilation_albums<'a>(
 ///
 /// `items` yields `(folder, artist, album)`; `artist` = the album_artist tag if
 /// present, else the track artist.
+///
+/// ⚠️ Même règle que [`decide_compilation_albums`] : rien qui ne vienne des
+/// BALISES. Un fichier en repli « tout depuis le chemin » doit entrer avec
+/// `(dossier, None, None)` — c'est LUI qui fabriquait le second artiste et
+/// faisait sortir le tag « compilation » au hasard (#3232).
 pub(crate) fn decide_compilation_folders<'a>(
     items: impl Iterator<Item = (String, Option<&'a str>, Option<&'a str>)>,
 ) -> HashMap<String, (bool, bool)> {
@@ -269,6 +280,15 @@ pub struct TrackImporter {
     /// artists — which the `(folder, album)` decision above misses because mixed
     /// album tags split every group down to one track (JP Borderies).
     folder_comp: HashMap<String, (bool, bool)>,
+    /// Par DOSSIER du lot : l'unique artiste d'album **étiqueté**, quand le
+    /// dossier n'en porte qu'un.
+    ///
+    /// Il sert d'artiste d'album aux fichiers dont les balises n'ont pas pu
+    /// être lues. Sans lui, un fichier en délai dépassé retombait sur
+    /// `dir_album_artist`, épinglé par le PREMIER fichier vu du dossier —
+    /// donc sur le nom du dossier si c'était lui le premier — et partait dans
+    /// un album à part (#3232).
+    folder_tagged_artist: HashMap<String, String>,
     artwork_extracted: u64,
     /// « Scan complet » : relire la pochette depuis les fichiers et **écraser**
     /// celle de la base.
@@ -298,6 +318,7 @@ impl TrackImporter {
             dir_album_artist: HashMap::new(),
             comp_decision: HashMap::new(),
             folder_comp: HashMap::new(),
+            folder_tagged_artist: HashMap::new(),
             artwork_extracted: 0,
             force_artwork: false,
         }
@@ -321,27 +342,94 @@ impl TrackImporter {
 
     /// Compute the per-`(folder, album)` compilation decision for this batch so
     /// every track of an album agrees on its album artist regardless of
-    /// inconsistent per-track `album_artist` tags. Files are walked in directory
-    /// order, so an album's tracks are contiguous and land in the same batch.
+    /// inconsistent per-track `album_artist` tags.
+    ///
+    /// La décision porte sur le DOSSIER ENTIER, et non sur ce que le hasard du
+    /// découpage a mis dans ce lot : c'est
+    /// [`tune_core::scanner::walker::lots_alignes_sur_les_dossiers`] qui le
+    /// garantit, en n'ouvrant jamais un lot au milieu d'un dossier.
+    /// L'ancienne rédaction affirmait ici que « les pistes d'un album sont
+    /// contiguës, donc dans le même lot » — c'était faux deux fois : un album
+    /// de plus de `SCAN_BATCH_SIZE = 500` pistes coupé en deux, et surtout
+    /// tout album à cheval sur une frontière de lot. Le dossier était alors
+    /// jugé DEUX FOIS sur deux populations différentes, et le tag
+    /// « compilation » sortait au hasard (Pierre M, fil 1043, #3232).
+    ///
+    /// Second volet du même défaut : un fichier dont les balises n'ont pas pu
+    /// être lues (délai dépassé sur un NAS) arrive avec un artiste déduit du
+    /// nom de dossier. Il n'entre dans AUCUNE des deux décisions — elles
+    /// dépendent des balises, et il n'en a pas. Ce faux artiste suffisait à
+    /// basculer un dossier entier en « Various Artists », et comme les délais
+    /// dépassés changent d'un scan à l'autre, le basculement aussi.
     pub fn begin_batch(&mut self, batch: &[ScannedFile]) {
-        self.comp_decision = decide_compilation_albums(batch.iter().filter_map(|sf| {
-            let meta = sf.metadata.as_ref()?;
-            let album = meta.album.as_deref()?;
-            let dir = std::path::Path::new(&sf.path)
+        // Les balises de ce fichier ont-elles été lues ? Sinon, son artiste
+        // n'est qu'un nom de dossier : il ne pèse dans aucune décision.
+        let etiquete = |sf: &ScannedFile| sf.metadata.as_ref().is_some_and(|m| !m.artist_from_path);
+        let dossier = |sf: &ScannedFile| {
+            std::path::Path::new(&sf.path)
                 .parent()
                 .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            Some((dir, album, meta.album_artist.as_deref(), meta.compilation))
+                .unwrap_or_default()
+        };
+        self.comp_decision = decide_compilation_albums(batch.iter().filter_map(|sf| {
+            let meta = sf.metadata.as_ref()?;
+            if !etiquete(sf) {
+                return None;
+            }
+            let album = meta.album.as_deref()?;
+            Some((
+                dossier(sf),
+                album,
+                meta.album_artist.as_deref(),
+                meta.compilation,
+            ))
         }));
         self.folder_comp = decide_compilation_folders(batch.iter().filter_map(|sf| {
             let meta = sf.metadata.as_ref()?;
-            let dir = std::path::Path::new(&sf.path)
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            // Le dossier reste connu (il faut savoir qu'il existe), mais un
+            // fichier sans balises n'y apporte ni artiste ni titre d'album.
+            if !etiquete(sf) {
+                return Some((dossier(sf), None, None));
+            }
             let artist = meta.album_artist.as_deref().or(meta.artist.as_deref());
-            Some((dir, artist, meta.album.as_deref()))
+            Some((dossier(sf), artist, meta.album.as_deref()))
         }));
+        // L'unique artiste d'album ÉTIQUETÉ de chaque dossier, quand il n'y en
+        // a qu'un : c'est lui qu'adoptera un fichier sans balises, au lieu du
+        // nom de son dossier.
+        let mut par_dossier: HashMap<String, Option<String>> = HashMap::new();
+        for sf in batch {
+            let Some(meta) = sf.metadata.as_ref() else {
+                continue;
+            };
+            if !etiquete(sf) {
+                continue;
+            }
+            let Some(aa) = meta
+                .album_artist
+                .as_deref()
+                .or(meta.artist.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            match par_dossier.entry(dossier(sf)) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(Some(aa.to_string()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    // Deux artistes étiquetés : plus d'artiste unique à offrir.
+                    if o.get().as_deref() != Some(aa) {
+                        o.insert(None);
+                    }
+                }
+            }
+        }
+        self.folder_tagged_artist = par_dossier
+            .into_iter()
+            .filter_map(|(dir, artiste)| artiste.map(|a| (dir, a)))
+            .collect();
     }
 
     /// Resolve artist + album, extract album cover / artist image as a side
@@ -388,6 +476,23 @@ impl TrackImporter {
             "Various Artists".to_string()
         } else if let Some(aa) = meta.album_artist.as_deref() {
             aa.to_string()
+        } else if meta.artist_from_path {
+            // Les balises de ce fichier n'ont pas pu être lues : son « artiste »
+            // est le nom d'un dossier. Il prend l'artiste d'album étiqueté du
+            // dossier quand il n'y en a qu'un — sinon son album partait tout
+            // seul, à côté de celui de ses voisines (#3232). Il n'ÉPINGLE
+            // jamais le dossier : une valeur inventée ne doit pas devenir la
+            // référence des fichiers qui, eux, portent des balises.
+            self.folder_tagged_artist
+                .get(&album_dir)
+                .cloned()
+                .or_else(|| self.dir_album_artist.get(&album_dir).cloned())
+                .unwrap_or_else(|| {
+                    meta.artist
+                        .as_deref()
+                        .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME)
+                        .to_string()
+                })
         } else {
             // No album_artist tag: pin the album artist to the first track
             // artist seen in this folder so all of the album's tracks resolve to
@@ -1207,5 +1312,290 @@ mod tests {
             track.file_path.as_deref(),
             Some("/m/Jacobs, Lisa\u{feff}The Strings/01.flac")
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #3232 — « le tag compilation est pris en compte au hasard, dans un même
+    // répertoire » (Pierre M, fil 1043, 14/07/2026).
+    //
+    // Deux causes, deux volets, et un témoin sans lequel on livrerait le
+    // défaut symétrique (tout devient une compilation, ou plus rien).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Un dossier importé, rendu comme `chemin → (artiste d'album résolu,
+    /// drapeau compilation de la ligne album, identifiant d'album)`.
+    ///
+    /// Passe par le VRAI découpage en lots
+    /// (`lots_alignes_sur_les_dossiers`) puis par le vrai `begin_batch` /
+    /// `import`, base neuve à chaque appel : c'est le trajet de production,
+    /// pas une reconstitution.
+    fn importer_par_lots(
+        fichiers: &[ScannedFile],
+        taille_de_lot: usize,
+        cache: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, (String, bool, i64)> {
+        use std::sync::Arc;
+        use tune_core::db::album_repo::AlbumRepo;
+        use tune_core::db::artist_repo::ArtistRepo;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let albums = AlbumRepo::with_backend(backend.clone());
+        let artistes = ArtistRepo::with_backend(backend.clone());
+        let mut imp = TrackImporter::new(backend.clone(), true, cache.to_path_buf());
+
+        let chemins: Vec<std::path::PathBuf> =
+            fichiers.iter().map(|f| f.path.clone().into()).collect();
+        let par_chemin: std::collections::HashMap<&str, &ScannedFile> =
+            fichiers.iter().map(|f| (f.path.as_str(), f)).collect();
+
+        let mut rendu = std::collections::BTreeMap::new();
+        for lot in
+            tune_core::scanner::walker::lots_alignes_sur_les_dossiers(&chemins, taille_de_lot)
+        {
+            let lot: Vec<ScannedFile> = lot
+                .iter()
+                .map(|p| (*par_chemin[p.to_str().unwrap()]).clone())
+                .collect();
+            imp.begin_batch(&lot);
+            for f in &lot {
+                let (_piste, album_id) = imp.import(f).expect("import");
+                let album_id = album_id.expect("un album");
+                let album = albums.get(album_id).unwrap().unwrap();
+                let nom = artistes
+                    .get(album.artist_id.expect("un artiste d'album"))
+                    .unwrap()
+                    .unwrap()
+                    .name;
+                rendu.insert(f.path.clone(), (nom, album.is_compilation, album_id));
+            }
+        }
+        rendu
+    }
+
+    /// Fichier étiqueté : les balises ont été lues.
+    fn fichier_etiquete(chemin: &str, artiste: &str, album: &str, piste: u32) -> ScannedFile {
+        let mut f = sf(chemin);
+        f.metadata = Some(TrackMetadata {
+            title: Some(format!("{album} {piste}")),
+            artist: Some(artiste.to_string()),
+            album: Some(album.to_string()),
+            album_artist: Some(artiste.to_string()),
+            track_number: Some(piste),
+            ..Default::default()
+        });
+        f
+    }
+
+    /// ÉPREUVE 1 + ÉPREUVE 3 — le verdict « compilation » ne dépend plus du
+    /// découpage en lots, et les deux témoins restent ce qu'ils sont.
+    ///
+    /// `/anthologie` est la compilation faite main de Pierre M : trois pistes,
+    /// DEUX artistes seulement, dont l'un porte deux pistes. Coupée en lots de
+    /// deux, elle se présentait comme deux populations d'un seul artiste
+    /// chacune — donc deux fois « pas une compilation ». Vue entière, elle en
+    /// est une. C'est tout le défaut : le même dossier, jugé sur ce que le
+    /// hasard du découpage avait mis dans le lot.
+    ///
+    /// Ce test ÉCHOUE contre le code d'avant : il suffit de rendre
+    /// `lots_alignes_sur_les_dossiers` à un `chunks()` pour le voir tomber.
+    #[test]
+    fn le_verdict_compilation_ne_depend_pas_du_decoupage_en_lots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let racine = tmp.path();
+        let d = |nom: &str| racine.join(nom);
+        for nom in ["anthologie", "Kind of Blue", "Woodstock"] {
+            std::fs::create_dir_all(d(nom)).unwrap();
+        }
+        let c =
+            |dossier: &str, fichier: &str| d(dossier).join(fichier).to_string_lossy().into_owned();
+
+        let mut fichiers = Vec::new();
+        // La compilation faite main : deux artistes, trois pistes.
+        fichiers.push(fichier_etiquete(
+            &c("anthologie", "01.flac"),
+            "Angela Brown",
+            "Just Fabulous",
+            1,
+        ));
+        fichiers.push(fichier_etiquete(
+            &c("anthologie", "02.flac"),
+            "Angela Brown",
+            "Just Fabulous",
+            2,
+        ));
+        fichiers.push(fichier_etiquete(
+            &c("anthologie", "03.flac"),
+            "Aretha Franklin",
+            "Amazing Grace",
+            3,
+        ));
+        // TÉMOIN A — un vrai album d'un seul artiste. Il ne doit JAMAIS
+        // basculer : sans lui, « tout est une compilation » passerait le test.
+        for n in 1..=3u32 {
+            fichiers.push(fichier_etiquete(
+                &c("Kind of Blue", &format!("0{n}.flac")),
+                "Miles Davis",
+                "Kind of Blue",
+                n,
+            ));
+        }
+        // TÉMOIN B — une vraie compilation, elle, reste une compilation : trois
+        // artistes sous un seul titre d'album.
+        for (n, artiste) in ["Jimi Hendrix", "Santana", "Janis Joplin"]
+            .iter()
+            .enumerate()
+        {
+            fichiers.push(fichier_etiquete(
+                &c("Woodstock", &format!("0{}.flac", n + 1)),
+                artiste,
+                "Woodstock",
+                n as u32 + 1,
+            ));
+        }
+
+        // Le découpage varie ; le verdict, non. La borne basse est la taille du
+        // plus gros dossier (3) : un lot plus petit qu'un dossier ne peut pas
+        // le contenir, et le scan réel travaille par 500.
+        let mut reference = None;
+        for taille in 3..=9usize {
+            let rendu = importer_par_lots(&fichiers, taille, &tmp.path().join("cache"));
+            let verdicts: std::collections::BTreeMap<String, (String, bool)> = rendu
+                .iter()
+                .map(|(k, (a, c, _))| (k.clone(), (a.clone(), *c)))
+                .collect();
+
+            for (chemin, (artiste, compilation)) in &verdicts {
+                if chemin.contains("anthologie") {
+                    assert_eq!(
+                        (artiste.as_str(), *compilation),
+                        ("Various Artists", true),
+                        "lots de {taille} : la compilation faite main doit être vue ENTIÈRE ({chemin})"
+                    );
+                } else if chemin.contains("Kind of Blue") {
+                    assert_eq!(
+                        (artiste.as_str(), *compilation),
+                        ("Miles Davis", false),
+                        "lots de {taille} : témoin — un album d'un seul artiste le reste ({chemin})"
+                    );
+                } else {
+                    assert_eq!(
+                        (artiste.as_str(), *compilation),
+                        ("Various Artists", true),
+                        "lots de {taille} : témoin — une vraie compilation le reste ({chemin})"
+                    );
+                }
+            }
+
+            // Et pas seulement « correct » : IDENTIQUE d'un découpage à l'autre.
+            match &reference {
+                None => reference = Some(verdicts),
+                Some(attendu) => assert_eq!(
+                    &verdicts, attendu,
+                    "lots de {taille} : le verdict a changé avec le découpage"
+                ),
+            }
+        }
+
+        // Une compilation, un seul album : le dossier ne s'est pas éclaté.
+        let rendu = importer_par_lots(&fichiers, 4, &tmp.path().join("cache2"));
+        let albums_anthologie: std::collections::BTreeSet<i64> = rendu
+            .iter()
+            .filter(|(k, _)| k.contains("anthologie"))
+            .map(|(_, (_, _, id))| *id)
+            .collect();
+        assert_eq!(
+            albums_anthologie.len(),
+            1,
+            "les trois pistes de l'anthologie tiennent dans un seul album"
+        );
+    }
+
+    /// ÉPREUVE 2 — un fichier dont les balises n'ont pas pu être lues ne
+    /// bascule pas son dossier en « Various Artists ».
+    ///
+    /// C'est le lien que personne n'avait fait : Pierre M signalait, dans le
+    /// MÊME message, des délais dépassés en rafale sur son NAS. Un fichier en
+    /// délai dépassé est indexé par `tagless_fallback_no_props`, qui déduisait
+    /// du chemin un `album_artist` — « Beatles », le nom du dossier parent, là
+    /// où les autres pistes portent « The Beatles ». Deux artistes dans un
+    /// dossier : compilation. Et comme les délais changent d'un scan à
+    /// l'autre, le basculement aussi — « au hasard ».
+    ///
+    /// Le repli est appelé ICI, tel quel : c'est bien la fonction de
+    /// production qui fabrique la métadonnée de l'épreuve.
+    ///
+    /// Ce test ÉCHOUE contre le code d'avant.
+    #[test]
+    fn un_fichier_sans_balises_ne_bascule_pas_le_dossier_en_various_artists() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Le dossier ne s'écrit pas comme le tag : c'est le cas ordinaire.
+        let dossier = tmp.path().join("Beatles").join("Abbey Road");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let c = |n: &str| dossier.join(n).to_string_lossy().into_owned();
+
+        let mut fichiers = vec![
+            fichier_etiquete(&c("01.flac"), "The Beatles", "Abbey Road", 1),
+            fichier_etiquete(&c("02.flac"), "The Beatles", "Abbey Road", 2),
+        ];
+        // Le fichier en délai dépassé, monté par la VRAIE fonction de repli.
+        let chemin_muet = c("03.wav");
+        let muet =
+            tune_core::metadata::tagless_fallback_no_props(std::path::Path::new(&chemin_muet));
+        assert!(
+            muet.artist_from_path,
+            "le repli doit se dénoncer, sinon la décision ne peut pas l'écarter"
+        );
+        assert_eq!(
+            muet.artist.as_deref(),
+            Some("Beatles"),
+            "le nom déduit du chemin diffère bien du tag — c'est ce qui fabriquait le second artiste"
+        );
+        let mut f = sf(&chemin_muet);
+        f.metadata = Some(muet);
+        fichiers.push(f);
+
+        let rendu = importer_par_lots(&fichiers, 8, &tmp.path().join("cache"));
+        for (chemin, (artiste, compilation, _)) in &rendu {
+            assert_eq!(
+                (artiste.as_str(), *compilation),
+                ("The Beatles", false),
+                "un fichier illisible ne fait pas d'Abbey Road une compilation ({chemin})"
+            );
+        }
+        let albums: std::collections::BTreeSet<i64> =
+            rendu.values().map(|(_, _, id)| *id).collect();
+        assert_eq!(
+            albums.len(),
+            1,
+            "et il ne part pas non plus dans un album à lui tout seul"
+        );
+
+        // TÉMOIN — une VRAIE compilation reste une compilation, même quand un
+        // de ses fichiers est illisible. Sans ce témoin, écarter purement et
+        // simplement les fichiers en repli passerait pour une correction.
+        let dossier = tmp.path().join("Various").join("Woodstock");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let c = |n: &str| dossier.join(n).to_string_lossy().into_owned();
+        let mut fichiers = vec![
+            fichier_etiquete(&c("01.flac"), "Jimi Hendrix", "Woodstock", 1),
+            fichier_etiquete(&c("02.flac"), "Santana", "Woodstock", 2),
+        ];
+        let chemin_muet = c("03.wav");
+        let mut f = sf(&chemin_muet);
+        f.metadata = Some(tune_core::metadata::tagless_fallback_no_props(
+            std::path::Path::new(&chemin_muet),
+        ));
+        fichiers.push(f);
+        let rendu = importer_par_lots(&fichiers, 8, &tmp.path().join("cache3"));
+        for (chemin, (artiste, compilation, _)) in &rendu {
+            assert_eq!(
+                (artiste.as_str(), *compilation),
+                ("Various Artists", true),
+                "témoin : une vraie compilation le reste, fichier illisible compris ({chemin})"
+            );
+        }
     }
 }

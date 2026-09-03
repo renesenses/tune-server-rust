@@ -97,6 +97,25 @@ pub struct TrackMetadata {
     pub cover_art: Option<(Vec<u8>, String)>,
     pub credits: Vec<TrackCredit>,
     pub comment: Option<String>,
+    /// Vrai quand `artist` (et donc l'artiste d'album) ne vient PAS des
+    /// balises mais du CHEMIN : les tags n'ont pas pu être lus du tout — délai
+    /// dépassé sur le stockage, ou lofty incapable d'ouvrir le fichier. Seuls
+    /// les replis « tout depuis le chemin » le posent :
+    /// [`tagless_fallback_no_props`], [`tagless_fallback`] et `m4a_fallback`.
+    ///
+    /// Il existe parce qu'un nom de dossier n'est pas un artiste : compté
+    /// comme tel, il fabrique un DEUXIÈME artiste dans un dossier qui n'en a
+    /// qu'un et fait basculer l'album entier en « Various Artists ». Le
+    /// symptôme est intermittent — les délais dépassés changent d'un scan à
+    /// l'autre — et c'est le « au hasard » rapporté par Pierre M (#3232).
+    /// Toute décision qui dépend des balises doit donc ÉCARTER ce fichier :
+    /// voir `decide_compilation_folders` / `decide_compilation_albums`.
+    ///
+    /// `dsf_dff_fallback` ne le pose pas : il lit de VRAIES balises ID3v2 et
+    /// n'emprunte au chemin que les champs manquants — il avait d'ailleurs
+    /// déjà cessé d'en déduire `album_artist` (#1656).
+    #[serde(default)]
+    pub artist_from_path: bool,
 }
 
 /// One unsafe character removed from untrusted metadata.
@@ -1882,6 +1901,9 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         cover_art: None,
         credits,
         comment: None,
+        // Ce repli lit de VRAIES balises ID3v2 : rien n'est fabriqué depuis
+        // le chemin côté artiste d'album (#1656).
+        artist_from_path: false,
     })
 }
 
@@ -1913,8 +1935,13 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
     Some(TrackMetadata {
         title,
         album,
-        artist: artist.clone(),
-        album_artist: artist,
+        artist,
+        // Déduit du CHEMIN, donc jamais présenté comme un artiste d'album :
+        // même arbitrage que le repli DSD (#1656) et même motif que #3232 —
+        // un nom de dossier compté comme artiste bascule le dossier entier en
+        // « Various Artists ». Absent, le champ laisse le scan épingler
+        // l'artiste réel du dossier.
+        album_artist: None,
         album_artist_sort: None,
         track_number,
         disc_number,
@@ -1927,6 +1954,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         original_date: None,
         genre: None,
         genres: vec![],
+        artist_from_path: true,
         format: Some("alac".to_string()),
         file_size,
         sample_rate: None,
@@ -2046,8 +2074,10 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
     TrackMetadata {
         title,
         album,
-        artist: artist.clone(),
-        album_artist: artist,
+        artist,
+        // Voir `TrackMetadata::artist_from_path` : déduit du chemin, ce nom
+        // n'est pas un artiste d'album (#1656, #3232).
+        album_artist: None,
         album_artist_sort: None,
         track_number,
         disc_number,
@@ -2060,6 +2090,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         original_date: None,
         genre: None,
         genres: vec![],
+        artist_from_path: true,
         format,
         file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
             .ok()
@@ -2110,8 +2141,14 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
     TrackMetadata {
         title,
         album,
-        artist: artist.clone(),
-        album_artist: artist,
+        artist,
+        // C'est CE repli qu'emprunte un fichier dont la lecture des balises a
+        // dépassé le délai sur un NAS lent. Lui donner le nom du dossier pour
+        // artiste d'album fabriquait un second artiste dans le dossier et
+        // basculait l'album en « Various Artists » un scan sur deux — le
+        // « au hasard » de Pierre M (#3232). Absent : voir
+        // `TrackMetadata::artist_from_path`.
+        album_artist: None,
         album_artist_sort: None,
         track_number,
         disc_number,
@@ -2124,6 +2161,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         original_date: None,
         genre: None,
         genres: vec![],
+        artist_from_path: true,
         format: Some(ext),
         file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
             .ok()
@@ -2747,6 +2785,8 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         }),
         credits,
         comment: tag.comment().map(|s| s.to_string()),
+        // Chemin nominal : les balises ont été lues.
+        artist_from_path: false,
     })
 }
 
@@ -3421,6 +3461,9 @@ mod tests_dossier_de_disque {
         assert_eq!(m.album.as_deref(), Some("VA-Best of 80s"));
         assert_eq!(m.artist.as_deref(), Some("Various Artists"));
         assert_eq!(m.disc_number, Some(2));
+        // #3232 : ce repli se dénonce, et n'invente plus d'artiste d'album.
+        assert!(m.artist_from_path);
+        assert_eq!(m.album_artist, None);
     }
 }
 
@@ -4174,7 +4217,21 @@ mod tests {
         assert_eq!(meta.title.as_deref(), Some("Untagged Song"));
         assert_eq!(meta.album.as_deref(), Some("Best Of"));
         assert_eq!(meta.artist.as_deref(), Some("Jean-Luc"));
-        assert_eq!(meta.album_artist.as_deref(), Some("Jean-Luc"));
+        // ÉPINGLAGE CORRIGÉ (#3232). Ce test exigeait auparavant
+        // `album_artist == Some("Jean-Luc")` — c'est-à-dire le nom du DOSSIER
+        // présenté comme un artiste d'album. Compté par la décision
+        // « compilation », ce faux artiste bascule un dossier entier en
+        // « Various Artists » dès qu'un seul de ses fichiers passe par ce
+        // repli. Le champ reste donc ABSENT, exactement comme le repli DSD
+        // depuis #1656, et le drapeau dit POURQUOI.
+        assert_eq!(
+            meta.album_artist, None,
+            "un nom de dossier n'est pas un artiste d'album (#1656, #3232)"
+        );
+        assert!(
+            meta.artist_from_path,
+            "le repli sans balises doit se dénoncer comme déduit du chemin"
+        );
         assert_eq!(meta.track_number, Some(7));
         // Holds through both fallback paths: tagless_fallback (lofty parsed props)
         // and tagless_fallback_no_props (lofty failed) both normalise to "wav".
