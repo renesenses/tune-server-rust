@@ -247,3 +247,12 @@ path = "tests/pg_3182_moteur_annonce_dans_le_rapport.rs"
 [[test]]
 name = "recherche_sources_i3226"
 path = "tests/recherche_sources_i3226.rs"
+
+# #2746 : `/system/peers` n'itérait que le registre manuel. `discovered_tune_peers()`
+# existait et n'avait aucun appelant du côté du panneau, donc l'écran annonçait
+# « aucun serveur Tune détecté » sur un réseau où mDNS voyait des serveurs.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait jamais
+# compilé, donc vert contre rien.
+[[test]]
+name = "pairs_decouverts_i2746"
+path = "tests/pairs_decouverts_i2746.rs"

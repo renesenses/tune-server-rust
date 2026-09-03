@@ -221,11 +221,18 @@ pub(super) async fn admin_zones(State(state): State<AppState>) -> Json<Value> {
 // Other Tune servers on the network ("Serveurs Tune sur le réseau")
 // ---------------------------------------------------------------------------
 //
-// Peers are added manually by IP:port and persisted. This is the robust path
-// for the environments where the reporter hit an empty list (Docker macvlan +
-// Windows), because those block the multicast that any auto-discovery relies on.
-// mDNS auto-discovery (`_tune-server._tcp`, already advertised via
-// `register_self`) can layer on top later without changing this contract.
+// Peers come from TWO sources, united by `peers_payload` (#2746).
+//
+// Manually added by IP:port and persisted: the robust path for the environments
+// where the reporter hit an empty list (Docker macvlan + Windows), because those
+// block the multicast that any auto-discovery relies on.
+//
+// And discovered over mDNS (`_tune-server._tcp`, already advertised via
+// `register_self`): the zero-config path, which was written and left unwired to
+// this route — `/system/peers` iterated the manual registry alone, so a network
+// where multicast DOES pass still displayed "no Tune server detected".
+//
+// The two layer without changing the contract: same bare array, same fields.
 
 /// Settings key: JSON array of manually-added `{host, port}` peers.
 const TUNE_PEERS_KEY: &str = "tune_peers";
@@ -320,17 +327,95 @@ fn peer_json(host: &str, port: u16, info: Option<&Value>) -> Value {
     }
 }
 
-pub(super) async fn system_peers(State(state): State<AppState>) -> Json<Value> {
+/// L'ADRESSE d'un pair découvert : `host` ET `port`, jamais l'un des deux.
+///
+/// C'est la clef de déduplication de [`peers_payload`], et c'est le COUPLE
+/// parce que rien d'autre n'est commun aux deux sources. L'hôte seul ne
+/// convient pas : deux serveurs Tune cohabitent couramment sur une même
+/// machine (conteneurs, un serveur de test à côté du serveur de salon), et
+/// regrouper par IP les écraserait l'un l'autre — la faute exacte relevée sur
+/// le #2942. L'identité annoncée ne convient pas non plus : seule la
+/// découverte mDNS publie un `id`, une entrée manuelle n'en a aucun, donc
+/// comparer sur elle ne dédoublonnerait jamais rien.
+fn peer_addr_of(peer: &Value) -> Option<PeerAddr> {
+    let host = peer.get("host")?.as_str()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let port = u16::try_from(peer.get("port")?.as_u64()?).ok()?;
+    Some(PeerAddr {
+        host: host.to_string(),
+        port,
+    })
+}
+
+/// Corps de `GET /system/peers` : le registre manuel UNI à la découverte mDNS.
+///
+/// Les deux sources décrivent la même chose — « les autres serveurs Tune » —
+/// et l'écran n'a qu'une liste. Jusqu'au #2746 cette route n'itérait que
+/// [`load_peers`] : sur un réseau où le multicast passe et où mDNS voit
+/// d'autres serveurs, le panneau affichait quand même « aucun serveur Tune
+/// détecté », parce qu'aucun appelant de `discovered_tune_peers()` n'était la
+/// route du panneau.
+///
+/// Trois invariants que le correctif ne doit pas perdre :
+///
+/// 1. **La forme reste un TABLEAU NU.** `tune-web-client` affecte la réponse
+///    directement à `TunePeer[]` (`src/lib/api.ts`, `getTunePeers`), puis lit
+///    `.length` et l'itère dans `SettingsView.svelte`. Une enveloppe
+///    `{items, total, …}` ne serait pas itérable et viderait l'écran.
+/// 2. **`tracks` et `zones` ne sont pas inventés.** Ils sortent de
+///    `/system/peer-info` interrogé sur le pair lui-même — le même chemin que
+///    pour une entrée manuelle. Un pair injoignable est rendu `online: false`
+///    avec des compteurs à zéro, ce que [`peer_json`] fait déjà.
+/// 3. **Le registre manuel n'est pas retiré.** Il reste le repli des réseaux
+///    qui bloquent le multicast (Docker macvlan, pare-feu Windows) — c'est-à-dire
+///    précisément les installations qui ont ouvert le ticket.
+///
+/// `discovered` est un paramètre et non une lecture interne pour que le test
+/// puisse MESURER ce corps en pilotant la découverte : `MdnsScanner` n'expose
+/// aucun point d'injection, et un test qui recopierait la fusion au lieu de
+/// l'appeler ne la garderait pas.
+pub async fn peers_payload(state: &AppState, discovered: &[Value]) -> Value {
     let self_ip = tune_core::discovery::ssdp::get_local_ip().map(|ip| ip.to_string());
-    let mut out = Vec::new();
-    for p in load_peers(&state) {
-        if self_ip.as_deref() == Some(p.host.as_str()) {
+
+    let mut adresses: Vec<PeerAddr> = Vec::new();
+    for addr in load_peers(state)
+        .into_iter()
+        .chain(discovered.iter().filter_map(peer_addr_of))
+    {
+        if self_ip.as_deref() == Some(addr.host.as_str()) {
             continue; // never list ourselves
         }
-        let info = fetch_peer_info(&p.host, p.port).await;
-        out.push(peer_json(&p.host, p.port, info.as_ref()));
+        if !adresses.contains(&addr) {
+            adresses.push(addr);
+        }
     }
-    Json(json!(out))
+
+    // Un aller-retour HTTP par pair, mais TOUS EN PARALLÈLE. En série, la
+    // découverte aurait payé son propre succès : dix serveurs sur le réseau,
+    // trois secondes de délai chacun, et la route dépassait les huit secondes
+    // après lesquelles le client abandonne (`withTimeout(…, 8_000)`) — l'écran
+    // serait redevenu vide, par un autre chemin.
+    let fiches = futures_util::future::join_all(
+        adresses
+            .iter()
+            .map(|a| async move { fetch_peer_info(&a.host, a.port).await }),
+    )
+    .await;
+
+    json!(
+        adresses
+            .iter()
+            .zip(fiches.iter())
+            .map(|(a, info)| peer_json(&a.host, a.port, info.as_ref()))
+            .collect::<Vec<_>>()
+    )
+}
+
+pub(super) async fn system_peers(State(state): State<AppState>) -> Json<Value> {
+    let discovered = state.discovered_tune_peers().await;
+    Json(peers_payload(&state, &discovered).await)
 }
 
 #[derive(Deserialize)]
