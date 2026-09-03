@@ -69,6 +69,8 @@ mod karaoke_plugin;
 mod licence_activation_immediate;
 #[path = "licence_grace_visible.rs"]
 mod licence_grace_visible;
+#[path = "mono_downmix_dit_son_indisponibilite.rs"]
+mod mono_downmix_dit_son_indisponibilite;
 #[path = "notarisation_bornes.rs"]
 mod notarisation_bornes;
 #[path = "nuage_limite_dit_la_limite.rs"]
