@@ -1101,10 +1101,112 @@ pub struct AudioDevice {
     /// The audio backend this device was enumerated from.
     #[serde(default)]
     pub backend: String,
+    /// De quoi distinguer deux sorties qui portent le MÊME nom (#2272).
+    ///
+    /// Marco Polo voit deux « Haut-Parleurs » et ne peut pas dire lequel est
+    /// lequel. Le suffixe `(2)` que pose [`disambiguate_display_name`] est un
+    /// rang d'énumération, pas une identité : il peut changer d'un démarrage à
+    /// l'autre, et il ne nomme rien. Ce champ porte le nom du CONTRÔLEUR
+    /// derrière la sortie — « Topping D10s », « Realtek High Definition
+    /// Audio » — c'est-à-dire ce qu'Audirvana affiche et que Tune jetait.
+    ///
+    /// `None` quand rien de distinctif n'est disponible, et `None` est alors
+    /// ABSENT de la charge utile (`skip_serializing_if`) plutôt que publié
+    /// comme chaîne vide : un renseignement manquant ne doit pas se faire
+    /// passer pour un renseignement.
+    ///
+    /// **Ce champ ne remplace pas `name` et ne le modifie pas.** Le nom
+    /// d'affichage reste mot pour mot celui d'avant, suffixe `(n)` compris,
+    /// parce que c'est LUI que les zones ont mémorisé et que [`resolve_device`]
+    /// le reconstruit à l'identique (étape 2, via
+    /// [`disambiguate_display_name`]). Renommer les périphériques renverrait
+    /// toutes les zones existantes sur `NotFound` — le défaut que Jean Marie a
+    /// vécu sur macOS (#3185). L'écran compose ; le serveur ne renomme pas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_detail: Option<String>,
 }
 
 fn sample_rates_measured_default() -> bool {
     true
+}
+
+/// Le renseignement qui distingue deux sorties homonymes, ou rien (#2272).
+///
+/// ## Pourquoi la règle reçoit tout en paramètres
+///
+/// Les trois plateformes ne rapportent pas la même chose, et deux d'entre
+/// elles ne se compilent pas sur la machine de compilation. La RÈGLE est donc
+/// une fonction pure, éprouvable partout. La COLLECTE, elle, n'a même pas
+/// besoin d'un `cfg` : cpal 0.17 la fait déjà, dans le `DeviceDescription` que
+/// [`list_audio_devices_uncached`] obtenait puis jetait après n'en avoir lu
+/// que le seul `name()`.
+///
+/// ## Ce que chaque plateforme met dans ces paramètres
+///
+/// - **Windows / WASAPI** — `driver` porte
+///   `DEVPKEY_DeviceInterface_FriendlyName`, que cpal lit lui-même
+///   (`host/wasapi/device.rs`, `builder.driver(iface_name)`). C'est exactement
+///   la propriété que réclame #2272 : le nom du contrôleur, « Topping D10s ».
+///   Et c'est bien là que le défaut mord, parce que cpal choisit
+///   `DEVPKEY_Device_DeviceDesc` comme `name` — « Haut-Parleurs », générique
+///   par construction, identique pour deux DAC différents.
+/// - **Linux / ALSA** — `driver` porte le PCM (`hw:CARD=…`), que `endpoint_id`
+///   porte DÉJÀ. Il ne distingue rien de plus, et la règle l'écarte : Linux
+///   retombe mot pour mot sur le comportement d'avant, dédoublonnage PipeWire
+///   compris.
+/// - **macOS / CoreAudio** — cpal 0.17.3 ne renseigne ni `manufacturer` ni
+///   `driver` (`host/coreaudio/macos/device.rs::description` ne pose que le
+///   nom, la direction et le cas `Aggregate`). La règle rend `None` sans rien
+///   casser. `kAudioDevicePropertyModelUID` reste donc à collecter.
+///
+/// `manufacturer` passe avant `driver` : aucun backend de cpal 0.17.3 ne le
+/// renseigne aujourd'hui — `grep manufacturer src/host/` ne rend rien — mais
+/// c'est le champ dont la sémantique est exactement celle qu'on cherche, et le
+/// jour où un backend le remplit il doit gagner sans qu'on y revienne.
+///
+/// ## Les deux motifs de refus
+///
+/// 1. **Vide.** Une chaîne blanche n'est pas un renseignement.
+/// 2. **Déjà connu de l'appelant.** Un candidat que le nom d'affichage ou
+///    l'identifiant d'endpoint contient déjà n'ajoute rien. C'est ce qui écarte
+///    le PCM ALSA, et ce qui empêche d'écrire « Haut-Parleurs » à côté de
+///    « Haut-Parleurs ».
+pub fn hardware_detail(
+    manufacturer: Option<&str>,
+    driver: Option<&str>,
+    display_name: &str,
+    endpoint_id: &str,
+) -> Option<String> {
+    let deja_connu = |candidat: &str| {
+        let candidat = candidat.to_lowercase();
+        display_name.to_lowercase().contains(&candidat)
+            || endpoint_id.to_lowercase().contains(&candidat)
+    };
+    [manufacturer, driver]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|candidat| !candidat.is_empty() && !deja_connu(candidat))
+        .map(str::to_string)
+}
+
+/// La même règle, branchée sur ce que cpal rend.
+///
+/// Un SEUL endroit lit un `DeviceDescription` pour cette question, et il reste
+/// éprouvable sans matériel : `cpal::DeviceDescriptionBuilder` est public, si
+/// bien que les épreuves fabriquent mot pour mot les descriptions que WASAPI,
+/// ALSA et CoreAudio rendent.
+fn hardware_detail_from_description(
+    description: &cpal::DeviceDescription,
+    display_name: &str,
+    endpoint_id: &str,
+) -> Option<String> {
+    hardware_detail(
+        description.manufacturer(),
+        description.driver(),
+        display_name,
+        endpoint_id,
+    )
 }
 
 /// Une variante ALSA d'un même nom de périphérique, telle que l'énumération la
@@ -1224,6 +1326,7 @@ fn merge_linux_duplicate_variant(
     candidate_max_channels: u16,
     candidate_sample_rates: Vec<u32>,
     candidate_sample_rates_measured: bool,
+    candidate_hardware_detail: Option<String>,
 ) -> bool {
     let retenue = AlsaVariant {
         endpoint_id: existing.endpoint_id.clone(),
@@ -1248,6 +1351,10 @@ fn merge_linux_duplicate_variant(
         // faisait présenter les cadences d'un `hw:` comme non mesurées — ou,
         // pire, celles d'un `dmix:` comme mesurées (#1655).
         existing.sample_rates_measured = candidate_sample_rates_measured;
+        // Et le renseignement matériel avec elles (#2272) : il désigne le
+        // contrôleur de l'endpoint retenu. Le laisser en arrière l'accrocherait
+        // au greffon qu'on vient précisément d'écarter.
+        existing.hardware_detail = candidate_hardware_detail;
     }
     if candidate_is_default {
         existing.is_default = true;
@@ -1388,11 +1495,19 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
     match host.output_devices() {
         Ok(output_devices) => {
             for device in output_devices {
-                let raw_name = device
-                    .description()
+                let description = device.description().ok();
+                let raw_name = description
+                    .as_ref()
                     .map(|desc| desc.name().to_string())
-                    .unwrap_or_else(|_| "Unknown".into());
+                    .unwrap_or_else(|| "Unknown".into());
                 let endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
+                // #2272 — ce que cpal sait déjà du CONTRÔLEUR, et que cette
+                // énumération jetait en ne lisant que le nom. Calculé sur le nom
+                // BRUT, avant toute désambiguïsation : le suffixe `(n)` vient de
+                // nous et n'a rien à dire sur le matériel.
+                let hardware_detail = description.as_ref().and_then(|desc| {
+                    hardware_detail_from_description(desc, &raw_name, &endpoint_id)
+                });
 
                 // Skip ALSA null/dummy sinks that produce no audio
                 if is_null_sink(&raw_name) {
@@ -1476,6 +1591,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                             max_channels,
                             sample_rates,
                             rates_evidence.is_measured(),
+                            hardware_detail,
                         );
                         let retenu_materiel =
                             alsa_pcm_is_direct_hardware(&devices[idx].endpoint_id);
@@ -1540,6 +1656,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     sample_rates,
                     sample_rates_measured: rates_evidence.is_measured(),
                     backend: host_name.to_string(),
+                    hardware_detail,
                 });
                 #[cfg(target_os = "linux")]
                 linux_by_name.insert(raw_name.clone(), devices.len() - 1);
@@ -9950,7 +10067,8 @@ mod tests {
     /// s'applique mot pour mot. C'est exactement le cas d'une machine où
     /// PipeWire est le seul chemin praticable. Il a gagné un sixième argument
     /// (`candidate_sample_rates_measured`) parce que la preuve doit désormais
-    /// basculer avec l'identité et les capacités.
+    /// basculer avec l'identité et les capacités, puis un septième
+    /// (`candidate_hardware_detail`, #2272) pour la même raison.
     #[test]
     fn linux_duplicate_keeps_the_rich_variant_identity_with_its_capabilities() {
         let mut retained = AudioDevice {
@@ -9961,6 +10079,7 @@ mod tests {
             sample_rates: vec![44_100, 48_000],
             sample_rates_measured: true,
             backend: "ALSA".into(),
+            hardware_detail: None,
         };
         assert!(
             !alsa_pcm_is_direct_hardware("alsa:first-48k")
@@ -9975,6 +10094,7 @@ mod tests {
             32,
             vec![44_100, 48_000, 96_000, 192_000, 384_000],
             true,
+            None,
         ));
         assert_eq!(retained.endpoint_id, "alsa:rich-384k");
         assert_eq!(retained.max_channels, 32);
@@ -10172,6 +10292,7 @@ mod tests {
             sample_rates: cadences_du_greffon(),
             sample_rates_measured: false,
             backend: "Alsa".into(),
+            hardware_detail: None,
         };
         assert!(merge_linux_duplicate_variant(
             &mut publie,
@@ -10180,6 +10301,7 @@ mod tests {
             2,
             cadences_du_materiel(),
             true,
+            None,
         ));
         assert_eq!(publie.endpoint_id, "hw:CARD=DACZ8,DEV=0");
         assert_eq!(publie.max_channels, 2);
@@ -10200,6 +10322,7 @@ mod tests {
             sample_rates: cadences_du_materiel(),
             sample_rates_measured: true,
             backend: "Alsa".into(),
+            hardware_detail: None,
         };
         assert!(!merge_linux_duplicate_variant(
             &mut publie,
@@ -10208,6 +10331,7 @@ mod tests {
             32,
             cadences_du_greffon(),
             false,
+            None,
         ));
         assert_eq!(publie.endpoint_id, "hw:CARD=DACZ8,DEV=0");
         assert_eq!(publie.max_channels, 2);
@@ -10395,6 +10519,7 @@ mod tests {
             sample_rates: cadences.clone(),
             sample_rates_measured: sample_rate_evidence("Wasapi").is_measured(),
             backend: "Wasapi".into(),
+            hardware_detail: None,
         };
         let json = serde_json::to_value(&windows).expect("AudioDevice sérialisable");
         assert_eq!(
@@ -13688,5 +13813,374 @@ mod enumeration_asio_occupee_tests {
             "le chemin ServeCache doit rendre le dernier inventaire connu, pas une liste vide : \
              une zone ASIO active ferait autrement disparaître toutes les sorties de l'interface"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2272 — deux sorties locales homonymes, et rien pour dire laquelle est laquelle
+//
+// Marco Polo, forum du 2026-06-08 : « Voici comment Tune présente mes
+// "haut-parleurs" locaux : comment savoir lequel est lequel ? » Deux DAC USB
+// sous WASAPI s'annoncent tous deux « Haut-Parleurs » ; la découverte suffixait
+// « (2) » au second — un rang d'énumération, qui évite qu'un périphérique
+// disparaisse (#1084) mais ne nomme rien et peut changer au redémarrage.
+//
+// Ce qui manquait n'était pas une propriété système : cpal la lisait déjà. Le
+// `DeviceDescription` que l'énumération obtenait portait
+// `DEVPKEY_DeviceInterface_FriendlyName` dans son champ `driver` — et
+// l'énumération n'en lisait que `name()`.
+// ---------------------------------------------------------------------------
+
+/// La garde de site : le renseignement est-il vraiment BRANCHÉ ?
+///
+/// Les épreuves ci-dessous exercent la règle et l'adaptateur, mais aucune ne
+/// peut voir la seule chose qui reste : que l'énumération les APPELLE, et que
+/// le périphérique qu'elle publie porte le résultat. Une règle juste, calculée
+/// puis jetée, les laisserait toutes vertes. On relit donc la source — même
+/// procédé et même raison que `position_publiee_guard` dans `poller.rs`.
+#[cfg(test)]
+mod renseignement_materiel_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe à ce module pour que
+    /// les motifs cherchés ne puissent pas se trouver eux-mêmes dans les
+    /// messages d'assertion ni dans les épreuves qui suivent (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("local.rs");
+        const BORNE: &str = "mod renseignement_materiel_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    #[test]
+    fn l_enumeration_garde_la_description_entiere() {
+        assert!(
+            code_de_production().contains("let description = device.description().ok();"),
+            "l'énumération doit CONSERVER le `DeviceDescription` de cpal. Le \
+             réduire à son `name()` est précisément ce qui jetait le nom du \
+             contrôleur que Windows y met déjà (#2272)."
+        );
+    }
+
+    #[test]
+    fn le_renseignement_est_calcule_sur_le_nom_brut_et_l_endpoint() {
+        assert!(
+            code_de_production()
+                .contains("hardware_detail_from_description(desc, &raw_name, &endpoint_id)"),
+            "la règle doit être nourrie du nom BRUT et de l'identifiant \
+             d'endpoint. Lui passer le nom déjà désambiguïsé lui ferait \
+             comparer le candidat à un suffixe « (2) » qui vient de nous, et \
+             lui cacher que le PCM ALSA répète l'endpoint (#2272)."
+        );
+    }
+
+    #[test]
+    fn le_peripherique_publie_porte_le_renseignement() {
+        let code = code_de_production();
+        let debut = code
+            .find("devices.push(AudioDevice {")
+            .expect("l'énumération ne construit plus l'AudioDevice qu'elle publie");
+        let bloc = &code[debut..];
+        let fin = bloc
+            .find("});")
+            .expect("le littéral AudioDevice de l'énumération n'est plus délimité");
+        assert!(
+            bloc[..fin].contains("hardware_detail,"),
+            "l'énumération construit le périphérique publié SANS y porter le \
+             renseignement matériel : la règle serait calculée puis jetée, et \
+             Marco Polo verrait toujours deux « Haut-Parleurs » (#2272)."
+        );
+    }
+}
+
+#[cfg(test)]
+mod renseignement_materiel_tests {
+    use super::{
+        AudioDevice, hardware_detail, hardware_detail_from_description,
+        merge_linux_duplicate_variant,
+    };
+    use cpal::{DeviceDescription, DeviceDescriptionBuilder};
+
+    /// Ce que cpal rend sur WASAPI : `name` vient de
+    /// `DEVPKEY_Device_DeviceDesc` (générique — « Haut-Parleurs »), `driver` de
+    /// `DEVPKEY_DeviceInterface_FriendlyName` (le contrôleur).
+    fn description_wasapi(nom: &str, controleur: &str) -> DeviceDescription {
+        DeviceDescriptionBuilder::new(nom)
+            .driver(controleur)
+            .build()
+    }
+
+    /// Le périphérique tel que l'énumération le publie, renseignement compris.
+    /// `raw_name` est le nom du pilote ; `display_name` celui qu'a posé la
+    /// désambiguïsation — c'est bien le BRUT qui nourrit la règle.
+    fn peripherique_publie(
+        raw_name: &str,
+        display_name: &str,
+        endpoint_id: &str,
+        description: &DeviceDescription,
+    ) -> AudioDevice {
+        AudioDevice {
+            name: display_name.to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            is_default: false,
+            max_channels: 2,
+            sample_rates: vec![44_100, 48_000],
+            sample_rates_measured: false,
+            backend: "Wasapi".to_string(),
+            hardware_detail: hardware_detail_from_description(description, raw_name, endpoint_id),
+        }
+    }
+
+    /// L'ÉPREUVE. Deux homonymes de contrôleurs différents doivent être
+    /// distinguables dans ce que le serveur PUBLIE — pas seulement dans ce que
+    /// la règle rend.
+    #[test]
+    fn deux_homonymes_de_controleurs_differents_sont_distinguables() {
+        let topping = description_wasapi("Haut-Parleurs", "Topping D10s");
+        let realtek = description_wasapi("Haut-Parleurs", "Realtek High Definition Audio");
+
+        // Le second reçoit le suffixe « (2) » de la découverte : c'est
+        // exactement l'écran de Marco Polo.
+        let un = peripherique_publie(
+            "Haut-Parleurs",
+            "Haut-Parleurs",
+            "Wasapi:{0.0.0.00000000}.{aaaaaaaa}",
+            &topping,
+        );
+        let deux = peripherique_publie(
+            "Haut-Parleurs",
+            "Haut-Parleurs (2)",
+            "Wasapi:{0.0.0.00000000}.{bbbbbbbb}",
+            &realtek,
+        );
+
+        let charge_un = serde_json::to_value(&un).expect("AudioDevice sérialisable");
+        let charge_deux = serde_json::to_value(&deux).expect("AudioDevice sérialisable");
+
+        assert_eq!(
+            charge_un["hardware_detail"],
+            serde_json::json!("Topping D10s"),
+            "la charge utile doit nommer le contrôleur du premier DAC. Reçu : {charge_un}"
+        );
+        assert_eq!(
+            charge_deux["hardware_detail"],
+            serde_json::json!("Realtek High Definition Audio"),
+            "la charge utile doit nommer le contrôleur du second. Reçu : {charge_deux}"
+        );
+        assert_ne!(
+            charge_un["hardware_detail"], charge_deux["hardware_detail"],
+            "deux périphériques homonymes doivent être DISTINGUABLES dans ce \
+             que le serveur publie : c'est toute la demande de #2272."
+        );
+
+        // Et le nom d'affichage n'a pas bougé d'un caractère : c'est lui que
+        // les zones ont mémorisé et que `resolve_device` reconstruit (#3185).
+        assert_eq!(charge_un["name"], serde_json::json!("Haut-Parleurs"));
+        assert_eq!(charge_deux["name"], serde_json::json!("Haut-Parleurs (2)"));
+    }
+
+    /// Un renseignement absent ne casse rien, et ne publie AUCUN champ vide.
+    /// C'est le cas de macOS aujourd'hui : cpal 0.17.3 n'y renseigne ni
+    /// `manufacturer` ni `driver`.
+    #[test]
+    fn sans_renseignement_le_champ_est_absent_de_la_charge_utile() {
+        let macos = DeviceDescriptionBuilder::new("USB Audio DAC").build();
+        let publie = peripherique_publie(
+            "USB Audio DAC",
+            "USB Audio DAC",
+            "CoreAudio:AppleUSBAudioEngine:1,2",
+            &macos,
+        );
+
+        assert_eq!(publie.hardware_detail, None);
+        let charge = serde_json::to_value(&publie).expect("AudioDevice sérialisable");
+        assert!(
+            charge.get("hardware_detail").is_none(),
+            "un renseignement absent doit être ABSENT de la charge utile, pas \
+             publié comme `null` ou comme chaîne vide : sinon l'écran affiche \
+             un tiret et le vide se fait passer pour une information. \
+             Reçu : {charge}"
+        );
+        // Le reste de la charge utile est intacte.
+        assert_eq!(charge["name"], serde_json::json!("USB Audio DAC"));
+        assert_eq!(
+            charge["endpoint_id"],
+            serde_json::json!("CoreAudio:AppleUSBAudioEngine:1,2")
+        );
+    }
+
+    /// Sur ALSA, cpal met le PCM dans `driver` — la même chaîne que
+    /// `endpoint_id` porte déjà, préfixe d'hôte en plus. Ce n'est pas un nom de
+    /// contrôleur, et le publier comme tel serait du bruit.
+    #[test]
+    fn le_pcm_alsa_ne_se_fait_pas_passer_pour_un_controleur() {
+        let alsa = DeviceDescriptionBuilder::new("HDA Intel PCH, ALC257 Analog")
+            .driver("hw:CARD=PCH,DEV=0")
+            .build();
+        assert_eq!(
+            hardware_detail_from_description(
+                &alsa,
+                "HDA Intel PCH, ALC257 Analog",
+                "Alsa:hw:CARD=PCH,DEV=0"
+            ),
+            None,
+            "le PCM ALSA est déjà l'identifiant d'endpoint : il ne distingue \
+             rien de plus, et Linux doit retomber mot pour mot sur le \
+             comportement d'avant"
+        );
+    }
+
+    #[test]
+    fn le_fabricant_l_emporte_sur_le_pilote() {
+        assert_eq!(
+            hardware_detail(
+                Some("Topping"),
+                Some("USB Audio Device"),
+                "Haut-Parleurs",
+                "Wasapi:{0.0.0.00000000}.{aaaaaaaa}"
+            ),
+            Some("Topping".to_string()),
+            "aucun backend de cpal 0.17.3 ne renseigne `manufacturer`, mais \
+             c'est le champ dont la sémantique est la bonne : le jour où l'un \
+             le remplit, il doit gagner sans qu'on y revienne"
+        );
+    }
+
+    #[test]
+    fn un_candidat_que_le_nom_porte_deja_n_ajoute_rien() {
+        assert_eq!(
+            hardware_detail(None, Some("Topping D10s"), "Topping D10s", "Wasapi:{aaaa}"),
+            None
+        );
+        assert_eq!(
+            hardware_detail(None, Some("topping d10s"), "Topping D10s", "Wasapi:{aaaa}"),
+            None,
+            "la comparaison ignore la casse : WASAPI et le pilote n'ont pas \
+             toujours la même"
+        );
+    }
+
+    #[test]
+    fn un_renseignement_blanc_n_est_pas_un_renseignement() {
+        assert_eq!(
+            hardware_detail(Some("   "), Some(""), "Haut-Parleurs", "Wasapi:{aaaa}"),
+            None
+        );
+        assert_eq!(
+            hardware_detail(
+                Some("  Topping D10s  "),
+                None,
+                "Haut-Parleurs",
+                "Wasapi:{aaaa}"
+            ),
+            Some("Topping D10s".to_string()),
+            "un renseignement encadré de blancs reste un renseignement, mais \
+             il est publié propre"
+        );
+    }
+
+    /// LE TÉMOIN. Un périphérique unique dont le nom porte déjà son identité
+    /// ne change de rien : ni de nom, ni de champ inventé.
+    #[test]
+    fn temoin_un_peripherique_unique_ne_change_de_rien() {
+        let seul = description_wasapi("Topping D10s", "Topping D10s");
+        let publie = peripherique_publie(
+            "Topping D10s",
+            "Topping D10s",
+            "Wasapi:{0.0.0.00000000}.{cccccccc}",
+            &seul,
+        );
+        assert_eq!(
+            publie.name, "Topping D10s",
+            "le nom d'affichage ne bouge pas : c'est lui que les zones ont \
+             mémorisé (#3185)"
+        );
+        assert_eq!(
+            publie.hardware_detail, None,
+            "quand le nom porte déjà l'identité, il n'y a rien à ajouter — et \
+             surtout pas « Topping D10s — Topping D10s »"
+        );
+        let charge = serde_json::to_value(&publie).expect("AudioDevice sérialisable");
+        assert!(charge.get("hardware_detail").is_none());
+    }
+
+    /// LE TÉMOIN, suite : le dédoublonnage Linux ne change pas de conduite.
+    /// Quand le PCM matériel supplante le greffon (#3240/#1655), l'identité
+    /// bascule ENTIÈREMENT — endpoint, capacités, preuve, et désormais le
+    /// renseignement matériel. Le laisser en arrière l'accrocherait au greffon
+    /// qu'on vient d'écarter.
+    #[test]
+    fn l_identite_qui_bascule_emporte_le_renseignement_materiel() {
+        let mut publie = AudioDevice {
+            name: "Eversolo DAC-Z8, USB Audio".into(),
+            endpoint_id: "Alsa:sysdefault:CARD=DACZ8,DEV=0".into(),
+            is_default: false,
+            max_channels: 32,
+            sample_rates: vec![44_100, 384_000],
+            sample_rates_measured: false,
+            backend: "Alsa".into(),
+            hardware_detail: Some("greffon".into()),
+        };
+        assert!(
+            merge_linux_duplicate_variant(
+                &mut publie,
+                "Alsa:hw:CARD=DACZ8,DEV=0".into(),
+                false,
+                2,
+                vec![44_100, 48_000],
+                true,
+                Some("Eversolo DAC-Z8".into()),
+            ),
+            "le PCM matériel doit l'emporter sur le greffon (#3240)"
+        );
+        assert_eq!(publie.endpoint_id, "Alsa:hw:CARD=DACZ8,DEV=0");
+        assert_eq!(
+            publie.hardware_detail.as_deref(),
+            Some("Eversolo DAC-Z8"),
+            "le renseignement matériel est le quatrième membre de l'identité \
+             qui bascule : il doit suivre l'endpoint retenu"
+        );
+
+        // Et dans l'autre sens : le greffon qui arrive après ne reprend rien au
+        // matériel déjà retenu, renseignement compris.
+        let mut publie = AudioDevice {
+            name: "Eversolo DAC-Z8, USB Audio".into(),
+            endpoint_id: "Alsa:hw:CARD=DACZ8,DEV=0".into(),
+            is_default: false,
+            max_channels: 2,
+            sample_rates: vec![44_100, 48_000],
+            sample_rates_measured: true,
+            backend: "Alsa".into(),
+            hardware_detail: Some("Eversolo DAC-Z8".into()),
+        };
+        assert!(!merge_linux_duplicate_variant(
+            &mut publie,
+            "Alsa:dmix:CARD=DACZ8,DEV=0".into(),
+            true,
+            32,
+            vec![44_100, 384_000],
+            false,
+            Some("greffon".into()),
+        ));
+        assert_eq!(publie.endpoint_id, "Alsa:hw:CARD=DACZ8,DEV=0");
+        assert_eq!(publie.hardware_detail.as_deref(), Some("Eversolo DAC-Z8"));
+    }
+
+    /// Un enregistrement écrit avant ce champ reste lisible, et ne se voit pas
+    /// attribuer un renseignement qu'il n'a pas.
+    #[test]
+    fn un_enregistrement_anterieur_reste_lisible_sans_renseignement() {
+        let ancien = serde_json::json!({
+            "name": "Haut-Parleurs",
+            "endpoint_id": "",
+            "is_default": true,
+            "max_channels": 2,
+            "sample_rates": [44_100, 48_000],
+            "backend": "Wasapi",
+        });
+        let relu: AudioDevice =
+            serde_json::from_value(ancien).expect("AudioDevice reste rétro-compatible");
+        assert_eq!(relu.hardware_detail, None);
+        assert_eq!(relu.name, "Haut-Parleurs");
     }
 }
