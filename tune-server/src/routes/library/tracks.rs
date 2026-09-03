@@ -301,6 +301,29 @@ pub(super) async fn stream_track_audio(
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
+    // Seconde frontière de lecture, et la plus trompeuse (#3234). Le chemin
+    // de l'orchestrateur n'est pas le seul : c'est PAR ICI que le lecteur du
+    // navigateur et le serveur média UPnP demandent les octets. Sur un ISO
+    // SACD, `from_extension` rend `None`, le `Content-Type` retombe sur
+    // `application/octet-stream`, et la route rend un 200 parfait suivi de
+    // 4 Go d'image disque : le lecteur reste muet sans qu'aucune erreur ne
+    // soit jamais rendue.
+    //
+    // Le fichier existe et il est lisible — un 404 mentirait. Ce qui manque
+    // est un outil que Tune ne fournit pas, et le motif rendu ici est mot pour
+    // mot celui du rapport de parcours (#2992) et celui de la route de
+    // lecture, pour que l'utilisateur ne lise pas trois phrases différentes
+    // pour un seul empêchement.
+    if let Some(motif) = tune_core::audio::iso_sacd::refus_de_lecture(path) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "format_not_playable",
+                "message": motif,
+            })),
+        )
+            .into_response();
+    }
     let mime = track
         .format
         .as_deref()
