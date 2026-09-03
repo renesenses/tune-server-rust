@@ -22,6 +22,7 @@ pub mod digest;
 pub mod discogs;
 pub mod eq_pro;
 pub mod export;
+pub(crate) mod filtre_sources;
 pub mod graphql;
 pub mod history;
 pub mod home;

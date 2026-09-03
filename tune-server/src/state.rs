@@ -465,9 +465,14 @@ impl AppState {
     /// [`crate::discovery_setup::spawn_mdns_handler`], which browses peers tagged
     /// [`OutputType::Local`]) and drops our own advertisement. Returns an empty
     /// list before discovery starts or when multicast is blocked (Docker macvlan,
-    /// Windows firewall) — the manually-added peer list (`/system/peers`) is the
-    /// robust fallback for those networks. Shared by `/peers` and
-    /// `/system/discover-servers`.
+    /// Windows firewall) — the manually-added peer list is the robust fallback
+    /// for those networks.
+    ///
+    /// Read by `/peers`, `/system/discover-servers`, and — since #2746 —
+    /// `/system/peers`, which unites this list with the manual registry. That
+    /// last one is the panel's route, and it was the one caller this function
+    /// never had: written, wired twice, and still absent from the screen that
+    /// needed it.
     pub async fn discovered_tune_peers(&self) -> Vec<serde_json::Value> {
         use tune_core::discovery::device::OutputType;
         let scanner = { self.mdns_scanner.lock().unwrap().clone() };
