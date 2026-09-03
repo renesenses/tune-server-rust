@@ -1655,6 +1655,25 @@ fn runtime_signal_reason_detail(status: &OutputSignalPathStatus) -> Option<Strin
     (!details.is_empty()).then(|| details.join(" ; "))
 }
 
+/// Le nom PRÉSENTABLE d'un transport que le `match` de `build_signal_path` ne
+/// nomme pas par un bras.
+///
+/// Le bras par défaut rendait le second membre du tuple — la chaîne BRUTE de
+/// la colonne `zones.output_type` — comme nom de transport. Le panneau d'Alex
+/// Campbell affichait donc « hqplayer » en minuscules là où toutes les autres
+/// sorties affichent « DLNA/UPnP », « BluOS » ou « CoreAudio » (#2189).
+///
+/// Les types INCONNUS gardent leur chaîne : un greffon hors dépôt enregistre
+/// le nom qu'il veut, et aucune règle de mise en forme ne saurait deviner sa
+/// capitalisation. Inventer un libellé serait pire que de rendre le sien.
+fn libelle_de_transport(output_type: &str) -> &str {
+    match output_type {
+        "hqplayer" => "HQPlayer",
+        "diretta" => "Diretta",
+        autre => autre,
+    }
+}
+
 fn build_signal_path(
     ps: &ZoneState,
     zone: &Zone,
@@ -1842,10 +1861,16 @@ fn build_signal_path(
 
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
     // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
-    let is_network_output = matches!(
-        output_type,
-        "dlna" | "openhome" | "chromecast" | "bluos" | "squeezebox"
-    );
+    //
+    // ⚠️ Cette liste ÉTAIT recopiée ici. `orchestrator.rs` porte pourtant, en
+    // toutes lettres, « l'unique exemplaire de cette liste » — et cette
+    // quatrième copie avait déjà dérivé : cinq types au lieu de six,
+    // `slimproto` manquant. Une zone Slimproto était donc « réseau » pour le
+    // chemin audio (qui lui applique les forçages WAV/LPCM et le plafond
+    // 16 bits) et « inconnue » pour le panneau, qui la déclarait non
+    // bit-perfect sans jamais lire ces réglages. Le miroir suit désormais la
+    // décision, par la MÊME fonction (#2189, même faute que #3183).
+    let is_network_output = tune_core::orchestrator::is_network_output_type(Some(output_type));
     // Passthrough DSD natif : l'orchestrateur sert le .dsf/.dff brut au
     // renderer (`orchestrator.rs` `dsd_passthrough`). Constaté sur le fil, pas
     // deviné — cf. `wire_carries_raw_dsd`. Sans ce miroir, une piste DSD128
@@ -2009,7 +2034,14 @@ fn build_signal_path(
                 if oaat_transcodes { "WAV" } else { format_name },
             )
         }
+        // AirPlay 1 comme AirPlay 2 : le protocole impose de l'ALAC 44,1/16.
+        // La conversion a lieu POUR DE VRAI, le verdict `false` est donc juste
+        // — c'est le LIBELLÉ qui manquait : sans ce bras, une zone AirPlay 2
+        // (créée par `discovery_setup.rs`, `(Some(Box::new(ap2)), "airplay2")`)
+        // tombait dans le fourre-tout et affichait « airplay2 » en minuscules
+        // comme nom de transport (#2189).
         "airplay" => (false, "AirPlay", "ALAC"),
+        "airplay2" => (false, "AirPlay 2", "ALAC"),
         "chromecast" => {
             if needs_transcode_for_output {
                 let target = source_format.unwrap().dlna_transcode_target();
@@ -2026,12 +2058,23 @@ fn build_signal_path(
                 (true, "BluOS", format_name)
             }
         }
-        "squeezebox" => {
+        // `slimproto` EST le protocole Squeezebox, et l'orchestrateur les
+        // traite déjà à l'identique (`is_network_output_type` les liste tous
+        // les deux). Le panneau, lui, ne nommait que `squeezebox` : une zone
+        // créée par le serveur Slimproto (`tune-core/src/slimproto/mod.rs`,
+        // `get_or_create(&player_name, Some("slimproto"), …)`) tombait dans le
+        // fourre-tout et sortait « non bit-perfect » quoi qu'il arrive (#2189).
+        "squeezebox" | "slimproto" => {
+            let transport = if output_type == "slimproto" {
+                "Slimproto"
+            } else {
+                "Squeezebox"
+            };
             if needs_transcode_for_output {
                 let target = source_format.unwrap().dlna_transcode_target();
-                (false, "Squeezebox", target.display_name())
+                (false, transport, target.display_name())
             } else {
-                (true, "Squeezebox", format_name)
+                (true, transport, format_name)
             }
         }
         "browser" => (true, "Browser", format_name),
@@ -2052,7 +2095,34 @@ fn build_signal_path(
                 format_name,
             )
         }
-        other => (false, other, format_name),
+        // Tout le reste est une sortie PULL : elle va CHERCHER le flux
+        // elle-même et reçoit nos octets TELS QUELS — `hqplayer`, `diretta`,
+        // et tout greffon hors dépôt. Ce bras rendait `false`
+        // INCONDITIONNELLEMENT, et son second membre — la chaîne brute de la
+        // base — servait de nom de transport.
+        //
+        // Alex Campbell (Tune 0.9.98, Linux, sortie HQPlayer, fil 1524) :
+        // « When playing local **or streaming** music files to HQPlayer, Tune
+        // is reporting that it is transcoding. » Le « local OU streaming » est
+        // le fait qui tranche : le symptôme est inconditionnel, ce qu'aucune
+        // règle dépendant du format ne produirait. Une zone HQPlayer était
+        // déclarée non bit-perfect sur un FLAC 44,1/16 servi octet pour octet,
+        // sans EQ ni ReplayGain, sans qu'aucun transcodage n'ait lieu (#2189).
+        //
+        // Le verdict n'est plus écrit ici : il est LU du chemin audio, par la
+        // fonction que celui-ci utilise pour décider
+        // (`orchestrator::is_pull_dsp_output_type`, extraite de
+        // `pull_output_needs_dsp_transcode`). Sur ces sorties le transport ne
+        // touche aucun échantillon ; le seul traitement possible est celui que
+        // cette même fonction force — EQ, correction de pièce, ReplayGain — et
+        // il est déjà compté plus bas par `dsp_applique` et `replaygain_step`.
+        // Le verdict global retombe donc à `false` dès qu'un égaliseur est
+        // armé, exactement là où le transcodage a réellement lieu.
+        other => (
+            tune_core::orchestrator::is_pull_dsp_output_type(Some(other)),
+            libelle_de_transport(other),
+            format_name,
+        ),
     };
 
     // Detect sample rate capping (DSD excluded — the DSD→PCM transcode
@@ -2143,7 +2213,9 @@ fn build_signal_path(
     let wire_transcode = wire_wav && !matches!(format_name, "WAV");
     let transcode_active = needs_transcode_for_output
         || oaat_transcodes
-        || output_type == "airplay"
+        // AirPlay 2 encode en ALAC 44,1/16 comme AirPlay 1 : l'étape est la
+        // même, et elle manquait ici aussi (#2189).
+        || matches!(output_type, "airplay" | "airplay2")
         || dlna_lpcm
         || dlna_wav24
         || dlna_cap_16bit

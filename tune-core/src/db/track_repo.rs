@@ -312,6 +312,33 @@ pub mod sql {
         "SELECT COUNT(*) FROM tracks"
     }
 
+    /// Le compte des pistes VENTILÉ par `source` — `local`, `qobuz`, `tidal`,
+    /// `radio`, `podcast`, `bandcamp` (#2147).
+    ///
+    /// [`count()`] ci-dessus répond « combien de pistes ? » sans dire de quoi
+    /// elles sont faites, et c'est là toute l'affaire de #2147 : le tableau de
+    /// bord comptait la table ENTIÈRE pendant que le rapport de scan ne
+    /// comptait que ce qui existe sur le disque. Deux populations, deux
+    /// nombres, aucun moyen de les rapprocher — jusqu'ici aucune requête du
+    /// dépôt n'exposait la ventilation qui les réconcilie.
+    ///
+    /// `COALESCE(NULLIF(source, ''), 'local')` normalise les lignes anciennes :
+    /// la colonne est `DEFAULT 'local'` et `Track::new` pose `"local"`, mais
+    /// une base migrée peut porter des `NULL` ou des chaînes vides. Les ranger
+    /// sous `local` — comme le fait déjà `metadata/auto_fix.rs` — garantit
+    /// l'invariant qui rend ce compte vérifiable : **la somme des seaux égale
+    /// toujours `count()`**. Sans normalisation, un `NULL` disparaîtrait du
+    /// `GROUP BY` et la ventilation mentirait par omission.
+    ///
+    /// L'expression est répétée dans le `GROUP BY` au lieu d'un alias, et
+    /// l'ordre est donné par `ORDER BY 1` : les deux formes sont acceptées par
+    /// SQLite comme par PostgreSQL, alors qu'un `GROUP BY` sur alias ne l'est
+    /// pas partout de la même façon.
+    pub fn count_by_source() -> &'static str {
+        "SELECT COALESCE(NULLIF(source, ''), 'local'), COUNT(*) FROM tracks \
+         GROUP BY COALESCE(NULLIF(source, ''), 'local') ORDER BY 1"
+    }
+
     /// Compteur de la VUE pistes : exclut les pistes d'albums masqués, comme
     /// la liste qu'il pagine (#1391). `count()` reste le compte COMPLET.
     pub fn count_visible() -> String {
@@ -872,6 +899,23 @@ impl TrackRepo {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
+    }
+
+    /// Le compte des pistes ventilé par source, trié par nom de source (#2147).
+    /// Voir [`sql::count_by_source`] pour la normalisation et l'invariant.
+    pub fn count_by_source(&self) -> Result<Vec<(String, i64)>, TuneError> {
+        let rows = self.db.query_many(sql::count_by_source(), &[])?;
+        Ok(rows
+            .iter()
+            .map(|cols| {
+                (
+                    cols.first()
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_else(|| "local".to_string()),
+                    cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                )
+            })
+            .collect())
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
