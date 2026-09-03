@@ -22,7 +22,10 @@ mod ratings;
 mod reidentify;
 mod reports;
 mod search;
-mod stats;
+// `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
+// compteurs que `/library/stats` sur un autre écran et doit les ventiler par
+// source de la même façon. Un seul point de vérité, partagé (#2147).
+pub(crate) mod stats;
 mod tracks;
 pub(crate) mod write_tags;
 

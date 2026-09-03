@@ -104,6 +104,7 @@ use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
 
+use crate::routes::filtre_sources::FiltreSources;
 use crate::state::AppState;
 
 /// Plafond des `COUNT` de la bibliothèque locale.
@@ -150,31 +151,17 @@ struct SearchParams {
     sources: Option<String>,
 }
 
-/// Le jeton qui désigne la bibliothèque de la machine dans `sources`. C'est
-/// celui que les clients envoient déjà pour leur pilule « Local ».
-const JETON_LOCAL: &str = "local";
-
-/// Le joker : « toutes les sources ». Le serveur l'acceptait déjà pour les
-/// services ; il vaut donc aussi pour le local, sans quoi `sources=all`
-/// rendrait moins que `sources` absent.
-const JETON_TOUTES: &str = "all";
-
-/// La bibliothèque locale (et les radios) entre-t-elle dans cette réponse ?
-///
-/// La liste est prise en PARAMÈTRE, et non relue depuis `SearchParams` : c'est
-/// ce qui permet d'éprouver la règle seule, sans monter un routeur. `None` =
-/// paramètre absent = « Tous », le comportement d'avant #3226.
-///
-/// Une liste présente est une sélection EXPLICITE : elle ne se replie pas sur
-/// « tout » quand elle ne reconnaît rien. Un `sources=service-inexistant` ne
-/// rend donc aucun service — ce qu'il faisait déjà — ET aucun local, ce qui
-/// est la même règle appliquée aux deux moitiés.
-fn le_local_est_demande(sources: Option<&[String]>) -> bool {
-    match sources {
-        None => true,
-        Some(liste) => liste.iter().any(|s| s == JETON_LOCAL || s == JETON_TOUTES),
-    }
-}
+// Les jetons `local` / `all` et la règle qui les lit vivaient ICI, sous la
+// forme de deux constantes et d'un `le_local_est_demande` local à ce fichier.
+// Ils sont partis dans `routes::filtre_sources`, SANS changer de sémantique —
+// jeton pour jeton et bord pour bord.
+//
+// La raison : `/home/other-versions`, `/home/artist-releases` et
+// `/library/tracks/{id}/versions` mélangeaient local et streaming exactement
+// comme cette route, et devaient recevoir LE MÊME contrat. Le réécrire à côté
+// aurait fait deux implémentations d'une même règle — le défaut qu'on passe
+// la semaine à corriger ailleurs. Il n'en existe donc qu'une, et c'est elle
+// que les quatre routes appellent.
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/", get(federated_search))
@@ -189,11 +176,8 @@ async fn federated_search(
 
     // #3226 — LU EN PREMIER. Tant que ce parsing vivait sous les recherches
     // locales, il ne pouvait par construction gouverner qu'elles seules.
-    let requested_sources: Option<Vec<String>> = p
-        .sources
-        .as_deref()
-        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
-    let local_demande = le_local_est_demande(requested_sources.as_deref());
+    let filtre = FiltreSources::depuis(p.sources.as_deref());
+    let local_demande = filtre.local_demande();
 
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
@@ -324,10 +308,7 @@ async fn federated_search(
     {
         let registry = state.services.lock().await;
         for svc_name in registry.list() {
-            if let Some(ref sources) = requested_sources
-                && !sources.contains(&svc_name)
-                && !sources.contains(&JETON_TOUTES.to_string())
-            {
+            if !filtre.service_demande(&svc_name) {
                 continue;
             }
 

@@ -152,7 +152,14 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
     .await
     .unwrap_or(0);
 
-    Json(json!({
+    // C'est CET écran que le testeur de #2147 avait sous les yeux : Réglages →
+    // Bibliothèque affiche ces compteurs et, une soixantaine de lignes plus
+    // bas dans la même section, le `total_files` du rapport de scan. Les deux
+    // nombres ne comptent pas la même chose — des LIGNES de `tracks` ici, des
+    // FICHIERS TROUVÉS SUR LE DISQUE là-bas — et rien ne le disait. La
+    // ventilation est la même que celle de `/library/stats` : même code, mêmes
+    // champs, pour que les deux écrans ne puissent pas diverger.
+    let mut corps = json!({
         "artists": artists,
         "albums": albums,
         "tracks": tracks,
@@ -162,7 +169,12 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
         "outputs": outputs,
         "server_version": tune_core::version(),
         "server_engine": "rust",
-    }))
+    });
+    crate::routes::library::stats::ajouter_ventilation(
+        &mut corps,
+        &crate::routes::library::stats::VentilationParSource::lire(&state),
+    );
+    Json(corps)
 }
 
 /// `audio_backend` n'est PAS le réglage de la sortie locale — et cette route
