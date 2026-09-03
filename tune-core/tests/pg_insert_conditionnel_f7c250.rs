@@ -313,14 +313,56 @@ fn sqlite_3248_contre_epreuve_du_nombre_de_lignes() {
 /// où PostgreSQL n'est pas branché (le `cargo test` ordinaire de la CI). Les
 /// mentions de `fetch_one` en commentaire sont écrites entre accents graves
 /// et ne ressemblent donc pas à un appel `.fetch_one(`.
+///
+/// # Évolution (#3256) — la garde est RESSERRÉE, pas relâchée
+///
+/// Elle exigeait ZÉRO `.fetch_one(` dans tout le fichier. #3256 y a introduit
+/// une sonde de schéma (`table_a_une_colonne_id`, qui demande à PostgreSQL si
+/// la table visée porte une colonne `id` avant d'ajouter ` RETURNING id`), et
+/// cette sonde emploie `fetch_one` À BON DROIT : son `SELECT EXISTS (…)` rend
+/// TOUJOURS exactement une ligne, donc la `RowNotFound` de #3248 y est
+/// impossible. Le danger de #3248 est ailleurs — c'est un `fetch_one` sur un
+/// `RETURNING`, qui lui peut ne rendre AUCUNE ligne.
+///
+/// Plutôt que de monter le compte autorisé de 0 à 1 — ce qui ouvrirait la
+/// porte à n'importe quel `fetch_one`, y compris le mauvais —, la garde
+/// DÉCOUPE le fichier : le corps de la sonde est retiré, et le reste doit
+/// toujours être à ZÉRO. Elle interdit donc strictement plus qu'avant.
 #[test]
 fn garde_de_site_3248() {
     const SOURCE: &str = include_str!("../src/db/backend.rs");
 
-    let appels_fetch_one = SOURCE.matches(".fetch_one(").count();
+    // Découper le corps de la sonde de schéma de #3256 : c'est le seul
+    // endroit du fichier où `fetch_one` est légitime.
+    let debut_sonde = SOURCE.find("async fn table_a_une_colonne_id").expect(
+        "#3256 — la sonde de schéma `table_a_une_colonne_id` a disparu de \
+             `db/backend.rs`. Sans elle, ` RETURNING id` redevient inconditionnel \
+             et tout INSERT vers une table sans colonne `id` (`task_runs`, \
+             `streaming_auth`) est refusé par PostgreSQL.",
+    );
+    // Fin de la fonction : la première accolade fermante en colonne 0.
+    let fin_sonde = debut_sonde
+        + SOURCE[debut_sonde..]
+            .find("\n}\n")
+            .expect("fin de `table_a_une_colonne_id` introuvable")
+        + 3;
+    let hors_sonde = format!("{}{}", &SOURCE[..debut_sonde], &SOURCE[fin_sonde..]);
+
+    // La sonde elle-même n'a droit qu'à UN `fetch_one`, pas davantage.
+    let dans_sonde = SOURCE[debut_sonde..fin_sonde]
+        .matches(".fetch_one(")
+        .count();
+    assert_eq!(
+        dans_sonde, 1,
+        "#3256 — la sonde de schéma doit contenir exactement 1 `.fetch_one(` \
+         (son `SELECT EXISTS` rend toujours une ligne), trouvé {dans_sonde}."
+    );
+
+    let appels_fetch_one = hors_sonde.matches(".fetch_one(").count();
     assert_eq!(
         appels_fetch_one, 0,
-        "#3248 — `.fetch_one(` est revenu dans `db/backend.rs` ({appels_fetch_one} appel(s)). \
+        "#3248 — `.fetch_one(` est revenu dans `db/backend.rs` HORS de la sonde de \
+         schéma ({appels_fetch_one} appel(s)). \
          Sur un INSERT conditionnel qui n'écrit rien il lève `RowNotFound`, et dans une \
          transaction cette erreur annule TOUT. Utiliser `fetch_all` et compter les lignes."
     );
