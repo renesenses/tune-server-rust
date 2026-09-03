@@ -510,6 +510,72 @@ pub fn asio_implies_exclusive(backend: &str, exclusive_mode: &mut bool) {
     *exclusive_mode = exclusive_mode_status(backend, *exclusive_mode, true).effective;
 }
 
+/// Le backend sous lequel une sortie locale peut RÉELLEMENT être ouverte,
+/// sachant l'hôte audio qui a ÉNUMÉRÉ son nom.
+///
+/// `configured` est le réglage `local_audio_backend` ; `origin_host` est
+/// `AudioDevice::backend`, c'est-à-dire le nom de l'hôte cpal qui a produit ce
+/// nom de périphérique (« ASIO », « WASAPI », « CoreAudio », « ALSA »).
+/// `None` ou vide = origine inconnue, et le réglage passe tel quel.
+///
+/// # Pourquoi cette règle existe (#1770)
+///
+/// Deux chemins énumèrent en WASAPI alors qu'ASIO est configuré, et les DEUX
+/// sont voulus :
+///
+/// - `tune-server/src/startup.rs` : quand l'hôte ASIO répond mais n'expose
+///   aucune sortie, on ré-énumère en WASAPI pour que l'utilisateur ait quand
+///   même des sorties ;
+/// - `tune-server/src/background.rs` : le rescan à chaud force WASAPI, parce
+///   que resonder ASIO en cours de session peut faire appeler `abort()` au
+///   pilote et tuer le processus.
+///
+/// Les noms ainsi obtenus (« Speakers », « Haut-parleurs ») sont des noms
+/// WASAPI. Les étiqueter `asio` les rend INOUVRABLES, sur chacun des
+/// consommateurs de ce champ, sans exception :
+///
+/// - `select_host(audio_backend)` n'ouvre l'hôte ASIO que pour `"asio"` ; un
+///   nom WASAPI n'y figure pas, et `resolve_device` REFUSE sans repli parce
+///   que l'hôte d'origine diffère de l'hôte ouvert (#3230) ;
+/// - la branche `exclusive_mode && audio_backend == "asio"` envoie ce nom à
+///   `AsioExclusiveOutput::new`, qui ne peut que le refuser — mesuré chez
+///   jfpaquet le 02/09 en 0.9.130 :
+///   `asio_device_not_found_listing_available requested=Speakers
+///   available=["Essence STX II ASIO(64)"]`, deux fois en une minute ;
+/// - `LocalOutput::is_available` interroge le même `select_host` : la zone est
+///   annoncée hors ligne alors que le périphérique est là ;
+/// - même le délai de relâchement (500 ms « ASIO » contre 200 ms) est faux.
+///
+/// Aucun consommateur n'a besoin de la valeur CONFIGURÉE : tous ont besoin de
+/// l'hôte réellement ouvrable. C'est ce que rend cette fonction.
+///
+/// La réciproque n'est pas traitée, et c'est délibéré : seul `configured ==
+/// "asio"` ouvre l'hôte ASIO (`select_host`), donc rien d'autre ne peut
+/// produire des noms ASIO. Promouvoir un réglage vers `asio` sur la foi d'une
+/// étiquette d'origine ARMERAIT le mode exclusif ASIO que personne n'a
+/// demandé ; on laisse la valeur intacte.
+///
+/// `on_windows` n'est pas un paramètre parce qu'aucune plateforme n'entre dans
+/// cette règle : elle ne compare que deux chaînes. Hors Windows, `configured`
+/// vaut rarement `asio` (valeur héritée, #1268) et `origin_host` ne vaudra
+/// jamais `ASIO` — le repli sur `"wasapi"` y est alors sans effet, puisque
+/// `select_host` ouvre de toute façon l'hôte par défaut pour toute valeur
+/// autre que `asio`.
+pub fn openable_local_backend(configured: &str, origin_host: Option<&str>) -> String {
+    let Some(origin) = origin_host.map(str::trim).filter(|h| !h.is_empty()) else {
+        return configured.to_string();
+    };
+    if configured.eq_ignore_ascii_case("asio") && !origin.eq_ignore_ascii_case("asio") {
+        // `"wasapi"` plutôt que le nom de l'hôte d'origine : c'est le
+        // vocabulaire que le reste du code compare (`audio_backend == "asio"`,
+        // `audio_backend != "asio"`), et `select_host` traite toute valeur
+        // autre que `asio` de la même façon — elle ouvre l'hôte par défaut,
+        // celui-là même qui a énuméré ce nom.
+        return "wasapi".to_string();
+    }
+    configured.to_string()
+}
+
 fn env_str(key: &str, target: &mut String) {
     if let Ok(val) = std::env::var(key) {
         *target = val;
@@ -876,5 +942,84 @@ mod tests {
         let back: TuneConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.api_port, 8888);
         assert_eq!(back.max_sample_rate, 192_000);
+    }
+}
+
+/// #1770 — la règle « une sortie s'ouvre sous l'hôte qui l'a énumérée ».
+///
+/// Ces essais ne dépendent d'aucune plateforme : la règle ne compare que deux
+/// chaînes, et c'est précisément pour ça qu'elle vit ici et pas dans le chemin
+/// Windows qu'aucune porte de ce dépôt ne compile.
+#[cfg(test)]
+mod backend_ouvrable_i1770 {
+    use super::openable_local_backend;
+
+    /// Le cas de jfpaquet. ASIO configuré, endpoint trouvé par l'énumération
+    /// WASAPI de repli : l'étiqueter `asio` l'envoie à `AsioExclusiveOutput`,
+    /// qui ne peut que le refuser.
+    #[test]
+    fn un_nom_wasapi_sous_asio_ne_reste_pas_asio() {
+        assert_eq!(
+            openable_local_backend("asio", Some("WASAPI")),
+            "wasapi",
+            "un nom énuméré par WASAPI doit s'ouvrir sous WASAPI, sinon ni \
+             select_host ni AsioExclusiveOutput ne le retrouvent (#1770)"
+        );
+    }
+
+    /// TÉMOIN — un vrai périphérique ASIO ne bouge pas d'un iota. Si cet essai
+    /// tombe, le correctif a désarmé le chemin ASIO au lieu de le protéger.
+    #[test]
+    fn temoin_un_nom_asio_sous_asio_reste_asio() {
+        assert_eq!(
+            openable_local_backend("asio", Some("ASIO")),
+            "asio",
+            "un périphérique réellement énuméré par ASIO doit garder ASIO"
+        );
+    }
+
+    /// Origine inconnue : on ne sait rien, on ne touche à rien. C'est le cas de
+    /// `PlaybackOrchestrator::recreate_local_and_play`, qui recrée une sortie à
+    /// partir du seul `device_id` sans jamais avoir vu d'`AudioDevice`.
+    #[test]
+    fn origine_inconnue_laisse_le_reglage_intact() {
+        for origine in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                openable_local_backend("asio", origine),
+                "asio",
+                "sans hôte d'origine il n'y a rien à corriger : {origine:?}"
+            );
+        }
+    }
+
+    /// La réciproque n'est PAS traitée, délibérément : promouvoir vers `asio`
+    /// armerait le mode exclusif ASIO que personne n'a demandé.
+    #[test]
+    fn un_reglage_non_asio_n_est_jamais_promu_en_asio() {
+        for configure in ["wasapi", "auto", ""] {
+            assert_eq!(
+                openable_local_backend(configure, Some("ASIO")),
+                configure,
+                "aucune étiquette d'origine ne doit promouvoir un réglage vers \
+                 ASIO — seul le réglage ouvre l'hôte ASIO"
+            );
+        }
+    }
+
+    /// Les hôtes des autres plateformes traversent sans effet de bord : le
+    /// réglage y est déjà celui qui ouvre l'hôte par défaut.
+    #[test]
+    fn les_hotes_hors_windows_ne_changent_rien() {
+        assert_eq!(openable_local_backend("auto", Some("CoreAudio")), "auto");
+        assert_eq!(openable_local_backend("auto", Some("ALSA")), "auto");
+        assert_eq!(openable_local_backend("wasapi", Some("WASAPI")), "wasapi");
+    }
+
+    /// La casse du réglage vient de la base et de l'environnement, pas d'un
+    /// littéral : `ASIO` doit être reconnu comme `asio`.
+    #[test]
+    fn la_casse_du_reglage_et_de_l_hote_est_ignoree() {
+        assert_eq!(openable_local_backend("ASIO", Some("Wasapi")), "wasapi");
+        assert_eq!(openable_local_backend("Asio", Some("asio")), "Asio");
     }
 }
