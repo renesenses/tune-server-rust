@@ -178,6 +178,19 @@ name = "pg_3181_sections_accueil"
 path = "tests/pg_3181_sections_accueil.rs"
 required-features = ["postgres"]
 
+# #2372 : la route par piste `GET /library/tracks/{id}/versions`. Ce n'est PAS
+# la route de `pg_3181_sections_accueil` — sa SQL est distincte et n'a jamais
+# porté de `DISTINCT`. Depuis ce lot, le TRI des versions descend de la requête
+# vers Rust : `ORDER BY al.title` ne range pas pareil sous la collation binaire
+# de SQLite et sous la collation locale de PostgreSQL. Cette cible sème
+# exactement les titres qui divergent et exige le même ordre des deux côtés.
+# `autotests = false` plus haut — sans cette entrée, le fichier ne serait
+# jamais compilé, donc vert contre rien.
+[[test]]
+name = "pg_2372_versions_par_piste"
+path = "tests/pg_2372_versions_par_piste.rs"
+required-features = ["postgres"]
+
 # Depuis #3039, la fenetre des ajouts recents est un parametre borne.
 [[test]]
 name = "ajouts_recents_fenetre"
