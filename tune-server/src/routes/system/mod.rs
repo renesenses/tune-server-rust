@@ -1,4 +1,10 @@
 mod admin;
+// Même raison, mot pour mot, que `pub mod scan` plus bas : le corps de
+// `GET /system/peers` doit être atteignable depuis un test d'intégration, qui
+// est une caisse EXTERNE. La fusion « registre manuel ∪ découverte mDNS » du
+// #2746 ne se mesure pas autrement : `MdnsScanner` n'a aucun point d'injection,
+// et un test qui recopierait la fusion la répliquerait au lieu de la garder.
+pub use admin::peers_payload;
 mod backup;
 mod config;
 mod config_backup;

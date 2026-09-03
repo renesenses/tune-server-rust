@@ -21,12 +21,16 @@ mod bios_bilan_visible;
 mod bios_langue_album;
 #[path = "bios_langue_entete.rs"]
 mod bios_langue_entete;
+#[path = "bit_perfect_sortie_pull_2189.rs"]
+mod bit_perfect_sortie_pull_2189;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
 #[path = "cles_developpeur_persistance.rs"]
 mod cles_developpeur_persistance;
 #[path = "collections_couleur_persistee.rs"]
 mod collections_couleur_persistee;
+#[path = "collections_ids_orphelins.rs"]
+mod collections_ids_orphelins;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
 #[path = "compilation_dans_les_reponses_album.rs"]
@@ -39,6 +43,8 @@ mod contexte_de_session;
 mod credits_enrichissement_statut;
 #[path = "crossfeed_dit_son_indisponibilite.rs"]
 mod crossfeed_dit_son_indisponibilite;
+#[path = "echec_de_decodage_dit_pourquoi_i3270.rs"]
+mod echec_de_decodage_dit_pourquoi_i3270;
 #[path = "enrich_artiste_langue_entete.rs"]
 mod enrich_artiste_langue_entete;
 #[path = "enrichissement_repertoire.rs"]
