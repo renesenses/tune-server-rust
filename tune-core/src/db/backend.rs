@@ -24,6 +24,9 @@
 //!
 //! See `docs/POSTGRES-PLAN.md` for the full phase-5 plan.
 
+#[cfg(feature = "postgres")]
+use std::collections::HashMap;
+
 use crate::db::engine::Engine;
 
 /// A handle that can execute SQL against either SQLite or Postgres.
@@ -764,10 +767,118 @@ impl DbTxHandle for SqliteTxHandle<'_> {
 /// qui annulerait la transaction entière. Le compte rendu est le nombre de
 /// lignes rendues par `RETURNING`, donc le vrai nombre de lignes écrites —
 /// même contrat que `rows_affected()` sur SQLite.
+///
+/// # `RETURNING id` seulement là où la colonne EXISTE (#3256)
+///
+/// La détection syntaxique n'excluait qu'`ON CONFLICT` et un `RETURNING` déjà
+/// présent. Elle ajoutait donc ` RETURNING id` aux INSERT visant des tables
+/// qui n'ont PAS de colonne `id` — `task_runs` (clef `(boot_id, task, seq)`),
+/// `streaming_auth` (clef `service`) — et PostgreSQL refusait la requête
+/// entière : `ERROR: column "id" does not exist`. Sur ces tables l'écriture
+/// échouait SYSTÉMATIQUEMENT, pas seulement quand elle n'écrivait rien : le
+/// correctif de #3248 (`fetch_all`) n'y changeait rien, la requête est refusée
+/// avant tout résultat.
+///
+/// La clause n'est donc ajoutée que si la table porte réellement une colonne
+/// `id`, question posée au SCHÉMA (`to_regclass` + `pg_attribute`) et
+/// mémorisée dans [`PostgresBackend::tables_avec_id`].
+///
+/// **Le coût** : un aller-retour supplémentaire la PREMIÈRE fois qu'un nom de
+/// table est inséré, puis plus jamais — le cache est partagé par le pool ET
+/// par les transactions (même `Arc`). Une trentaine de tables, donc une
+/// trentaine d'allers-retours sur toute la vie du processus.
+///
+/// **Pourquoi pas une liste en dur** : elle vieillirait à la première
+/// migration, et une migration qui ajoute une table sans `id` la casserait en
+/// silence. Le schéma, lui, ne peut pas se désynchroniser de lui-même.
+///
+/// **Pourquoi pas « que l'appelant demande l'identifiant »** — plus honnête en
+/// principe, écarté ici après recensement : le seul consommateur de production
+/// du `last_insert_rowid()` émulé est le défaut de
+/// [`DbBackend::execute_returning_id`] (`write_tx` + `tx.execute` +
+/// `tx.last_insert_rowid`), partagé par une trentaine d'appelants, plus
+/// `playlist_repo::create_with_tracks` et `radio_favorites`. Leur faire
+/// déclarer l'intention veut dire un nouveau point de passage sur
+/// [`DbTxHandle`], trait PUBLIC réimplémenté par des doublures qui délèguent
+/// `execute` — une doublure qui n'a pas repris le nouveau point de passage
+/// rendrait alors `0` au lieu d'un identifiant. Cela remplacerait un échec
+/// BRUYANT par un succès MUET, exactement la classe de dégât que #3248 a
+/// coûté. Le contrat de tous ces appelants reste ici inchangé octet pour
+/// octet : sur une table à `id`, la SQL produite est la même qu'avant.
 #[cfg(feature = "postgres")]
 pub struct PostgresBackend {
     pool: sqlx::PgPool,
     last_id: std::sync::Arc<std::sync::Mutex<i64>>,
+    /// Mémo `nom de table -> la table porte-t-elle une colonne `id` ?`.
+    /// Partagé avec les [`PgTxHandle`] ouverts par `write_tx`, pour qu'une
+    /// table déjà sondée hors transaction ne le soit pas une seconde fois
+    /// dedans.
+    tables_avec_id: std::sync::Arc<std::sync::Mutex<HashMap<String, bool>>>,
+}
+
+/// Nom de la table visée par un `INSERT INTO …`, tel qu'écrit dans la SQL.
+///
+/// Rend `None` dès que l'énoncé n'est pas un INSERT nu reconnaissable — et
+/// `None` veut dire « ne rien ajouter », le refus par défaut.
+///
+/// Le nom est rendu TEL QUEL (guillemets compris) : c'est `to_regclass` qui
+/// l'interprète, avec les mêmes règles de `search_path` et de casse que
+/// l'INSERT lui-même. Un `INSERT INTO "MaTable"` et un `INSERT INTO matable`
+/// désignent deux tables différentes pour PostgreSQL, et deux entrées
+/// différentes du cache — c'est correct.
+#[cfg(feature = "postgres")]
+fn nom_de_table_insert(sql: &str) -> Option<String> {
+    let reste = sql.trim_start();
+    // `INSERT` puis `INTO`, insensibles à la casse, séparés par du blanc.
+    let mut mots = reste.split_whitespace();
+    if !mots.next()?.eq_ignore_ascii_case("INSERT") {
+        return None;
+    }
+    if !mots.next()?.eq_ignore_ascii_case("INTO") {
+        return None;
+    }
+    // Le mot suivant peut être collé à sa parenthèse : `artists (name)`.
+    let brut = mots.next()?;
+    let nom = brut.split('(').next().unwrap_or(brut).trim_end_matches(',');
+    if nom.is_empty() {
+        None
+    } else {
+        Some(nom.to_string())
+    }
+}
+
+/// La question posée au schéma. Volontairement à part : les deux chemins
+/// (pool et transaction) doivent poser EXACTEMENT la même.
+#[cfg(feature = "postgres")]
+const SQL_TABLE_A_UNE_COLONNE_ID: &str = "SELECT EXISTS (\
+     SELECT 1 FROM pg_attribute \
+     WHERE attrelid = to_regclass($1) AND attname = 'id' \
+     AND attnum > 0 AND NOT attisdropped)";
+
+/// La sonde de schéma de #3256, générique sur l'exécuteur pour que le chemin
+/// du pool et celui de la transaction posent la question par le MÊME code.
+///
+/// ⚠️ C'est le SEUL `fetch_one` autorisé dans ce fichier, et
+/// `garde_de_site_3248` le vérifie site par site. Il est légitime ici et
+/// nulle part ailleurs : `SELECT EXISTS (…)` rend TOUJOURS exactement une
+/// ligne, donc `RowNotFound` est impossible. Sur un INSERT, au contraire,
+/// `RETURNING` peut ne rendre aucune ligne, et c'est précisément le
+/// `fetch_one` qui annulait la transaction entière (#3248).
+///
+/// `to_regclass` rend NULL quand la table n'existe pas : la sonde répond alors
+/// « pas de colonne `id` », aucune clause n'est ajoutée, et l'INSERT échoue
+/// avec sa propre erreur honnête (`relation … does not exist`) au lieu d'une
+/// erreur de colonne trompeuse.
+#[cfg(feature = "postgres")]
+async fn table_a_une_colonne_id<'e, E>(executeur: E, table: &str) -> Result<bool, String>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar(SQL_TABLE_A_UNE_COLONNE_ID)
+        .bind(table.to_string())
+        .fetch_one(executeur)
+        .await
+        .map_err(|e| format!("pg colonne id de {table} : {e}"))
 }
 
 #[cfg(feature = "postgres")]
@@ -776,6 +887,19 @@ impl PostgresBackend {
         Self {
             pool,
             last_id: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            tables_avec_id: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Lecture du mémo. Le verrou n'est JAMAIS tenu à travers un `.await` :
+    /// on lit, on relâche, et on ne sonde qu'ensuite.
+    fn memo_lire(cache: &std::sync::Mutex<HashMap<String, bool>>, table: &str) -> Option<bool> {
+        cache.lock().ok()?.get(table).copied()
+    }
+
+    fn memo_ecrire(cache: &std::sync::Mutex<HashMap<String, bool>>, table: &str, a_un_id: bool) {
+        if let Ok(mut m) = cache.lock() {
+            m.insert(table.to_string(), a_un_id);
         }
     }
 
@@ -917,23 +1041,54 @@ impl DbBackend for PostgresBackend {
         // syntactic: case-insensitive INSERT INTO prefix, no existing
         // RETURNING clause. Statements that already specify RETURNING
         // (or that aren't INSERTs) pass through unchanged.
+        //
+        // #3256 : la syntaxe ne suffit PAS. Une table sans colonne `id`
+        // (`task_runs`, `streaming_auth`, …) fait refuser la requête entière
+        // par PostgreSQL. La table doit donc AUSSI porter une colonne `id`,
+        // question posée au schéma puis mémorisée.
         let upper = sql_owned.to_ascii_uppercase();
         let trimmed = upper.trim_end_matches(';').trim_end();
         let is_insert = trimmed.trim_start().starts_with("INSERT INTO");
         let has_returning = trimmed.contains("RETURNING");
         let has_on_conflict = trimmed.contains("ON CONFLICT");
-        if is_insert && !has_returning && !has_on_conflict {
-            let trailing_semi = sql_owned.ends_with(';');
-            sql_owned = sql_owned.trim_end().trim_end_matches(';').to_string();
-            sql_owned.push_str(" RETURNING id");
-            if trailing_semi {
-                sql_owned.push(';');
-            }
-        }
-        let returning = (is_insert && !has_on_conflict) || trimmed.ends_with("RETURNING ID");
+        let candidate = is_insert && !has_returning && !has_on_conflict;
+        let table = if candidate {
+            nom_de_table_insert(&sql_owned)
+        } else {
+            None
+        };
+        let cache = self.tables_avec_id.clone();
+        // Un `RETURNING` ÉCRIT PAR L'APPELANT continue d'être lu en scalaire,
+        // exactement comme avant : la seule chose que #3256 retire, c'est la
+        // clause AJOUTÉE d'office à une table qui n'a pas de colonne `id`.
+        let deja_returning =
+            (is_insert && has_returning && !has_on_conflict) || trimmed.ends_with("RETURNING ID");
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
+                // Sonde du schéma AVANT toute décision : hors du verrou, et
+                // une seule fois par nom de table pour la vie du processus.
+                let mut ajoute = false;
+                if let Some(table) = table {
+                    let a_un_id = match Self::memo_lire(&cache, &table) {
+                        Some(v) => v,
+                        None => {
+                            let v = table_a_une_colonne_id(&pool, &table).await?;
+                            Self::memo_ecrire(&cache, &table, v);
+                            v
+                        }
+                    };
+                    if a_un_id {
+                        let trailing_semi = sql_owned.ends_with(';');
+                        sql_owned = sql_owned.trim_end().trim_end_matches(';').to_string();
+                        sql_owned.push_str(" RETURNING id");
+                        if trailing_semi {
+                            sql_owned.push(';');
+                        }
+                        ajoute = true;
+                    }
+                }
+                let returning = ajoute || deja_returning;
                 if returning {
                     let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql_owned));
                     for v in &owned {
@@ -1043,6 +1198,7 @@ impl DbBackend for PostgresBackend {
     ) -> Result<(), String> {
         let pool = self.pool.clone();
         let last_id_handle = self.last_id.clone();
+        let cache = self.tables_avec_id.clone();
 
         // Bridge async sqlx transaction into the sync closure boundary.
         // `block_in_place` is safe here because Tune runs on a
@@ -1058,6 +1214,7 @@ impl DbBackend for PostgresBackend {
                 let handle = PgTxHandle {
                     tx: &tx_cell,
                     last_id: last_id_handle.clone(),
+                    tables_avec_id: cache.clone(),
                 };
 
                 let result = f(&handle);
@@ -1095,6 +1252,9 @@ impl DbBackend for PostgresBackend {
 struct PgTxHandle<'a> {
     tx: &'a std::cell::RefCell<sqlx::Transaction<'static, sqlx::Postgres>>,
     last_id: std::sync::Arc<std::sync::Mutex<i64>>,
+    /// Même `Arc` que [`PostgresBackend::tables_avec_id`] : une table déjà
+    /// sondée hors transaction ne l'est pas une seconde fois dedans.
+    tables_avec_id: std::sync::Arc<std::sync::Mutex<HashMap<String, bool>>>,
 }
 
 #[cfg(feature = "postgres")]
@@ -1105,25 +1265,50 @@ impl DbTxHandle for PgTxHandle<'_> {
         let last_id_handle = self.last_id.clone();
 
         // Auto-append RETURNING id for bare INSERTs (same logic as
-        // PostgresBackend::execute).
+        // PostgresBackend::execute) — y compris la garde #3256 : seulement si
+        // la table porte réellement une colonne `id`.
         let upper = sql_owned.to_ascii_uppercase();
         let trimmed = upper.trim_end_matches(';').trim_end();
         let is_insert = trimmed.trim_start().starts_with("INSERT INTO");
         let has_returning = trimmed.contains("RETURNING");
         let has_on_conflict = trimmed.contains("ON CONFLICT");
-        if is_insert && !has_returning && !has_on_conflict {
-            let trailing_semi = sql_owned.ends_with(';');
-            sql_owned = sql_owned.trim_end().trim_end_matches(';').to_string();
-            sql_owned.push_str(" RETURNING id");
-            if trailing_semi {
-                sql_owned.push(';');
-            }
-        }
-        let returning = (is_insert && !has_on_conflict) || trimmed.ends_with("RETURNING ID");
+        let candidate = is_insert && !has_returning && !has_on_conflict;
+        let table = if candidate {
+            nom_de_table_insert(&sql_owned)
+        } else {
+            None
+        };
+        let cache = self.tables_avec_id.clone();
+        let deja_returning =
+            (is_insert && has_returning && !has_on_conflict) || trimmed.ends_with("RETURNING ID");
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let mut tx_guard = self.tx.borrow_mut();
+                // La sonde tourne SUR la transaction : c'est une lecture, elle
+                // ne peut pas l'avorter, et elle voit le schéma tel que la
+                // transaction le voit (une migration DDL en cours comprise).
+                let mut ajoute = false;
+                if let Some(table) = table {
+                    let a_un_id = match PostgresBackend::memo_lire(&cache, &table) {
+                        Some(v) => v,
+                        None => {
+                            let v = table_a_une_colonne_id(&mut **tx_guard, &table).await?;
+                            PostgresBackend::memo_ecrire(&cache, &table, v);
+                            v
+                        }
+                    };
+                    if a_un_id {
+                        let trailing_semi = sql_owned.ends_with(';');
+                        sql_owned = sql_owned.trim_end().trim_end_matches(';').to_string();
+                        sql_owned.push_str(" RETURNING id");
+                        if trailing_semi {
+                            sql_owned.push(';');
+                        }
+                        ajoute = true;
+                    }
+                }
+                let returning = ajoute || deja_returning;
                 if returning {
                     let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql_owned));
                     for v in &owned {
