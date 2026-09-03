@@ -609,6 +609,76 @@ fn la_ci_n_utilise_qu_un_cache_rust_et_la_release_peut_le_renouveler() {
     );
 }
 
+/// Le job `test` de `ci.yml` doit NOMMER `bandcamp` dans son `--features`.
+///
+/// Mesure : run **33702848850**, job `Test`, PR #3257. La ligne y etait
+/// `--no-default-features --features oaat,cloud-relay`, et
+/// `tune-server/tests/bandcamp_file_de_zone_i2702.rs` — cinq essais de #2702
+/// et #2778 — se compilait SANS le service qu'il eprouve : registre a cinq
+/// services, cinq rouges, aucun defaut. Le meme jeu de features rendait la
+/// meme suite rouge sous `Test (PostgreSQL)`.
+///
+/// Le fichier porte desormais `#![cfg(feature = "bandcamp")]`, ce qui est la
+/// verite : `bandcamp = ["dep:tune-bandcamp"]`, dependance OPTIONNELLE, donc
+/// sans la fonctionnalite `BandcampService` n'existe pas. Mais un `cfg` seul
+/// aurait remplace cinq rouges par cinq essais INVISIBLES sur toute PR vers
+/// `batch/*` — `test-shipped-features`, la seule autre porte qui active
+/// `bandcamp` en EXECUTION, est differee jusqu'a `full`.
+///
+/// Ce garde est donc la moitie qui manque au `cfg` : il refuse qu'on retire
+/// la fonctionnalite de la porte qui, elle, tourne sur chaque correctif Rust.
+/// Meme role que `toute_feature_declaree_est_activee_par_une_porte_clippy`
+/// pour les lints (#2865), applique a l'EXECUTION.
+#[test]
+fn le_job_test_de_la_ci_active_bandcamp() {
+    let ci = workflow("ci.yml");
+    let jobs = jobs(&ci);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de ci.yml"))
+    };
+    let features = |corps: &str| -> String {
+        let ligne = corps
+            .lines()
+            .find(|l| l.contains("cargo test"))
+            .expect("ce job ne lance plus `cargo test`");
+        ligne
+            .split("--features ")
+            .nth(1)
+            .expect("ce job ne nomme plus de `--features`")
+            .trim()
+            .to_owned()
+    };
+
+    let test = features(corps("test"));
+    assert!(
+        test.split(',').any(|f| f.trim() == "bandcamp"),
+        "le job `test` de ci.yml n'active plus `bandcamp` : \
+         tune-server/tests/bandcamp_file_de_zone_i2702.rs porte \
+         `#![cfg(feature = \"bandcamp\")]` et ne serait plus compile — les \
+         cinq essais de #2702/#2778 disparaitraient sans un seul rouge.\n  \
+         --features {test}"
+    );
+
+    // Contre-epreuve du detecteur, dans les deux sens : il doit voir une
+    // fonctionnalite ABSENTE de cette porte-ci, et la voir PRESENTE sur la
+    // porte du jeu livre. Sans ces deux la, un extracteur casse (qui rendrait
+    // toujours la ligne entiere, ou toujours vide) passerait a vide.
+    assert!(
+        !test.split(',').any(|f| f.trim() == "karaoke"),
+        "detecteur casse : il voit `karaoke`, que le job `test` ne porte pas \
+         — --features {test}"
+    );
+    let livre = features(corps("test-shipped-features"));
+    assert!(
+        livre.split(',').any(|f| f.trim() == "karaoke"),
+        "detecteur casse : `karaoke` est bien dans le jeu livre — \
+         --features {livre}"
+    );
+}
+
 #[test]
 fn postgres_et_widget_ne_sont_plus_doubles_dans_la_ci_generale() {
     let ci = workflow("ci.yml");
