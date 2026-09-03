@@ -119,6 +119,8 @@ mod rbac;
 mod recherche_totaux_i3189;
 #[path = "refus_de_peripherique_partage_dit_pourquoi.rs"]
 mod refus_de_peripherique_partage_dit_pourquoi;
+#[path = "refus_exclusif_dit_sa_cause_i3108.rs"]
+mod refus_exclusif_dit_sa_cause_i3108;
 #[path = "reidentification_album.rs"]
 mod reidentification_album;
 #[path = "reprise_position_au_demarrage.rs"]
