@@ -21,6 +21,8 @@ mod bios_bilan_visible;
 mod bios_langue_album;
 #[path = "bios_langue_entete.rs"]
 mod bios_langue_entete;
+#[path = "bit_perfect_sortie_pull_2189.rs"]
+mod bit_perfect_sortie_pull_2189;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
 #[path = "cles_developpeur_persistance.rs"]
