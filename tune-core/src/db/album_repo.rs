@@ -312,6 +312,17 @@ pub mod sql {
         "SELECT COUNT(*) FROM albums"
     }
 
+    /// Le compte des albums VENTILÉ par `source` (#2147) — même normalisation
+    /// et même invariant que [`crate::db::track_repo::sql::count_by_source`] :
+    /// la somme des seaux égale toujours [`count()`]. La table `albums` porte
+    /// la même colonne `source TEXT DEFAULT 'local'` que `tracks`, et le
+    /// tableau de bord affiche les deux nombres côte à côte : les ventiler
+    /// tous les deux, ou l'album resterait le chiffre inexplicable.
+    pub fn count_by_source() -> &'static str {
+        "SELECT COALESCE(NULLIF(source, ''), 'local'), COUNT(*) FROM albums \
+         GROUP BY COALESCE(NULLIF(source, ''), 'local') ORDER BY 1"
+    }
+
     /// Existence NUE d'une liste d'identifiants : pas de jointure, pas une
     /// colonne d'album. Sert à séparer « l'album n'est plus là » de « la base
     /// a refusé de répondre » sans relire N albums entiers (#3285).
@@ -1276,6 +1287,22 @@ impl AlbumRepo {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
+    }
+
+    /// Le compte des albums ventilé par source, trié par nom de source (#2147).
+    pub fn count_by_source(&self) -> Result<Vec<(String, i64)>, TuneError> {
+        let rows = self.db.query_many(sql::count_by_source(), &[])?;
+        Ok(rows
+            .iter()
+            .map(|cols| {
+                (
+                    cols.first()
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_else(|| "local".to_string()),
+                    cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                )
+            })
+            .collect())
     }
 
     /// Compteur de pagination de la grille d'albums : exclut les masqués,

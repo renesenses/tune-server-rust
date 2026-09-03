@@ -1549,7 +1549,13 @@ fn streaming_pretranscode_format(renderer_supports_mime: bool) -> &'static str {
 /// [`PlaybackOrchestrator::seek`] — et #2893 en réclamait une quatrième. Toutes
 /// y passent désormais : un renderer ajouté ici l'est partout, alors qu'une
 /// copie oubliée serait restée MUETTE (un morceau qui repart du début).
-fn is_network_output_type(output_type: Option<&str>) -> bool {
+///
+/// `pub` depuis #2189 : il existait une QUATRIÈME copie, hors de cette caisse
+/// — `build_signal_path` (`tune-server/src/routes/zones.rs`) — et elle avait
+/// déjà dérivé : cinq types au lieu de six, `slimproto` manquant. Le panneau
+/// et le chemin audio répondaient donc à deux questions différentes sur la
+/// même zone. Le miroir d'affichage appelle maintenant CETTE fonction.
+pub fn is_network_output_type(output_type: Option<&str>) -> bool {
     matches!(
         output_type,
         Some("dlna")
@@ -1559,6 +1565,26 @@ fn is_network_output_type(output_type: Option<&str>) -> bool {
             | Some("squeezebox")
             | Some("slimproto")
     )
+}
+
+/// La sortie va CHERCHER le flux elle-même et reçoit donc nos octets **tels
+/// quels** : `hqplayer`, `airplay2`, `diretta`, tout greffon hors dépôt.
+///
+/// C'est la troisième famille de [`pull_output_needs_dsp_transcode`], extraite
+/// telle quelle — ni élargie, ni rétrécie. Elle existe séparément parce que le
+/// panneau du chemin du signal en a besoin SANS les drapeaux d'exécution
+/// (`is_local`, `is_oaat`, format source) : il n'a que le type de la zone.
+///
+/// La conséquence pour l'affichage est directe et c'est tout le sujet de
+/// #2189 : sur ces sorties, le transport ne touche AUCUN échantillon, donc il
+/// est bit-perfect. Le seul traitement qui puisse s'y appliquer est celui que
+/// [`pull_output_needs_dsp_transcode`] force — EQ, correction de pièce,
+/// ReplayGain — et le panneau le compte déjà à part. Le bras par défaut de
+/// `build_signal_path` rendait `false` inconditionnellement : une zone
+/// HQPlayer était déclarée « non bit-perfect » sur un FLAC 44,1/16 servi
+/// octet pour octet (Alex Campbell, 0.9.98 Linux, fil 1524).
+pub fn is_pull_dsp_output_type(output_type: Option<&str>) -> bool {
+    output_type.is_some() && !is_network_output_type(output_type) && output_type != Some("browser")
 }
 
 /// Après une recréation de flux à une position donnée, faut-il ENCORE envoyer
@@ -1840,11 +1866,13 @@ fn pull_output_needs_dsp_transcode(
     is_oaat: bool,
     source_format: Option<AudioFormat>,
 ) -> bool {
-    output_type.is_some()
+    // La part « type de sortie » vit dans [`is_pull_dsp_output_type`], d'où le
+    // panneau du chemin du signal la lit aussi (#2189). Même ensemble, à la
+    // lettre : `is_push_uri_output_type` n'est qu'un alias de
+    // `is_network_output_type`, que la fonction extraite appelle.
+    is_pull_dsp_output_type(output_type)
         && !is_local
         && !is_oaat
-        && !is_push_uri_output_type(output_type)
-        && output_type != Some("browser")
         && source_format.is_some()
         && source_format != Some(AudioFormat::Dsd)
 }
@@ -13434,10 +13462,10 @@ mod tests {
 
     use super::{
         PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, is_network_output_type,
-        is_push_uri_output_type, message_session_perdue, passthrough_didl_duration_ms,
-        pull_output_needs_dsp_transcode, replay_needs_output_seek, reprise_de_session,
-        requete_de_retablissement, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
-        streaming_pretranscode_format, use_file_transcode_for,
+        is_pull_dsp_output_type, is_push_uri_output_type, message_session_perdue,
+        passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, replay_needs_output_seek,
+        reprise_de_session, requete_de_retablissement, spawn_streaming_dsp_relay,
+        streaming_needs_pretranscode, streaming_pretranscode_format, use_file_transcode_for,
     };
 
     #[test]
@@ -13520,6 +13548,54 @@ mod tests {
 
         // Unregistered device (output_type_of returned None): never coalesce.
         assert!(!is_push_uri_output_type(None));
+    }
+
+    /// La part « type de sortie » de [`pull_output_needs_dsp_transcode`],
+    /// extraite pour que le panneau du chemin du signal la LISE au lieu de la
+    /// recopier (#2189).
+    ///
+    /// L'extraction doit être à la lettre : ce test compare les deux, format
+    /// source et drapeaux d'exécution neutres, sur tous les types que ce dépôt
+    /// sait produire.
+    #[test]
+    fn is_pull_dsp_output_type_est_la_part_type_de_pull_output_needs_dsp_transcode() {
+        use crate::audio::formats::AudioFormat;
+        let flac = Some(AudioFormat::Flac);
+
+        for t in [
+            "dlna",
+            "openhome",
+            "chromecast",
+            "bluos",
+            "squeezebox",
+            "slimproto",
+            "browser",
+            "local",
+            "oaat",
+            "oaat-multiroom",
+            "airplay",
+            "airplay2",
+            "hqplayer",
+            "diretta",
+            "un-greffon-hors-depot",
+        ] {
+            assert_eq!(
+                is_pull_dsp_output_type(Some(t)),
+                pull_output_needs_dsp_transcode(Some(t), false, false, flac),
+                "{t} : le prédicat extrait doit rendre exactement ce que \
+                 rendait la condition d'origine"
+            );
+        }
+        assert!(!is_pull_dsp_output_type(None));
+
+        // Et le fait qui fonde le correctif #2189 : HQPlayer, AirPlay 2 et
+        // tout greffon hors dépôt sont des sorties PULL — elles reçoivent nos
+        // octets intacts, donc le transport y est bit-perfect.
+        assert!(is_pull_dsp_output_type(Some("hqplayer")));
+        assert!(is_pull_dsp_output_type(Some("airplay2")));
+        assert!(is_pull_dsp_output_type(Some("diretta")));
+        // `slimproto` n'en est PAS une : elle reçoit une URI, comme Squeezebox.
+        assert!(!is_pull_dsp_output_type(Some("slimproto")));
     }
 
     #[test]
