@@ -75,6 +75,8 @@ mod generateur_playlists_sans_ia;
 mod http_client_seam;
 #[path = "integration.rs"]
 mod integration;
+#[path = "journal_pcm_alsa_ouvert.rs"]
+mod journal_pcm_alsa_ouvert;
 #[path = "karaoke_plugin.rs"]
 mod karaoke_plugin;
 #[path = "licence_activation_immediate.rs"]

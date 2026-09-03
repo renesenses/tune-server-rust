@@ -5002,6 +5002,22 @@ impl OutputTarget for LocalOutput {
                     );
                 }
 
+                // Sur ALSA, `endpoint_id` EST le nom de PCM ouvert
+                // (`hw:CARD=…` atteint le pilote ; `default`, `dmix:`,
+                // `plughw:` passent par un greffon qui reechantillonne en
+                // silence). Le chemin PCM le journalise depuis #1655 — pas
+                // celui-ci, qui ouvre pourtant le meme peripherique. Un releve
+                // de terrain y etait donc aveugle : il ne pouvait pas dire si
+                // Tune avait ouvert le materiel ou un reechantillonneur
+                // (#3209). Une ligne de journal, rien d'autre : le choix du
+                // peripherique n'est pas touche ici.
+                let opened_endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
+                info!(
+                    backend = %host.id().name(),
+                    endpoint_id = %opened_endpoint_id,
+                    "local_audio_compressed_open_endpoint"
+                );
+
                 // Prefer device's default rate and resample if needed.
                 // Same rationale as the WAV path: opening at the source
                 // rate in shared mode is unreliable on macOS/Windows.
@@ -6588,6 +6604,19 @@ impl OutputTarget for LocalOutput {
                     // Le périphérique y est déjà : aucune conversion, et rien à
                     // régler côté matériel.
                     (LocalRateOpening::DeviceAlreadyAtSourceRate, Some(cfg), _) => {
+                        // Le bras NOMINAL — et le plus frequent : le DAC est
+                        // deja a la cadence de la source. Les trois autres bras
+                        // journalisent `endpoint_id` depuis #1655 ; celui-ci ne
+                        // disait rien, si bien qu'un releve de terrain n'aurait
+                        // vu QUE les cas anormaux et aurait conclu de travers
+                        // sur la part de `hw:` dans le parc (#3209).
+                        info!(
+                            source_sr = sample_rate,
+                            backend = %host_id_name,
+                            endpoint_id = %opened_endpoint_id,
+                            rate_support_measured = rate_evidence.is_measured(),
+                            "local_audio_open_device_already_at_source_rate"
+                        );
                         (cfg, sample_rate, None)
                     }
                     // L'énumération est une MESURE et elle retient la cadence :
