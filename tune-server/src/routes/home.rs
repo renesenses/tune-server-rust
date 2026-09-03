@@ -1824,7 +1824,7 @@ async fn other_versions(
     // SQLite et PostgreSQL rendent le meme ensemble DANS LE MEME ORDRE.
     let sql = format!(
         "SELECT lh.title, lh.artist_name, lh.album_title, \
-                t.id, al.id, al.title, al.cover_path, t.duration_ms \
+                t.id, al.id, al.title, al.cover_path, t.duration_ms, t.title \
         FROM (SELECT title, artist_name, album_title, MAX(listened_at) AS listened_at \
               FROM (SELECT title, artist_name, album_title, listened_at \
                     FROM listen_history \
@@ -1855,6 +1855,11 @@ async fn other_versions(
             "album_title": cols.get(5).and_then(|v| v.as_string()),
             "cover_path": cols.get(6).and_then(|v| v.as_string()),
             "duration_ms": cols.get(7).and_then(|v| v.as_i64()),
+            // Le titre RETROUVE. Depuis que ` - ` ouvre un suffixe d'edition
+            // (#2372), « Smooth Operator - 2011 Remastered » est une version
+            // de « Smooth Operator » : le libelle du groupe ne vaut plus pour
+            // chacune de ses lignes.
+            "title": cols.get(8).and_then(|v| v.as_string()),
         });
         match groupes.iter_mut().find(|g| {
             g["title"].as_str() == Some(titre.as_str())
@@ -1902,8 +1907,17 @@ async fn other_versions(
         .collect();
 
     for (titre, artiste, album) in recentes {
-        let trouvees =
-            crate::routes::versions::versions_streaming(&state, &titre, &artiste, &album).await;
+        // Le vivier de cette route est `listen_history` : il ne porte ni ISRC
+        // ni duree ni annee. La reference part donc sans signaux, et le score
+        // ne repose ici que sur le titre — c'est moins que sur la route par
+        // piste, et c'est assume : inventer une duree serait pire.
+        let reference = crate::routes::versions::Reference {
+            titre: titre.clone(),
+            artiste: artiste.clone(),
+            album: album.clone(),
+            ..Default::default()
+        };
+        let trouvees = crate::routes::versions::versions_streaming(&state, &reference).await;
         if trouvees.is_empty() {
             continue;
         }
