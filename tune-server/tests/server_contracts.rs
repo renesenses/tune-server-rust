@@ -3,6 +3,8 @@
 //! Ces modules utilisent des bases et routeurs isolés ; ils peuvent donc
 //! partager un binaire de tests sans partager leurs données.
 
+#[path = "album_lecture_en_double.rs"]
+mod album_lecture_en_double;
 #[path = "annonce_forum_bornes.rs"]
 mod annonce_forum_bornes;
 #[path = "auth_security.rs"]
