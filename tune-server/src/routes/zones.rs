@@ -7168,6 +7168,13 @@ mod backend_local_annonce_tests {
             // ABSENCE de la charge utile qui serait la régression — le client
             // n'aurait de nouveau que le journal pour savoir où sort le son.
             "device",
+            // #3233 — la CADENCE réellement ouverte, face à celle de la
+            // source. Même raison que `device` : quand Tune refuse la cadence
+            // de la source parce que les capacités du périphérique sont
+            // SUPPOSÉES et non mesurées, il convertit — et sans ce champ le
+            // client affiche « DSD64 » pendant qu'autre chose part au DAC.
+            // `null` tant que rien n'a joué en partagé, ce qui est honnête.
+            "rate",
         ] {
             assert!(v.get(champ).is_some(), "champ « {champ} » absent de {v}");
         }
