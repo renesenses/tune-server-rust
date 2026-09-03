@@ -239,3 +239,11 @@ path = "tests/migration_windows_annexes_sqlite.rs"
 [[test]]
 name = "pg_3182_moteur_annonce_dans_le_rapport"
 path = "tests/pg_3182_moteur_annonce_dans_le_rapport.rs"
+
+# #3226 : `sources` ne gouvernait que la boucle des services, jamais le bloc
+# `local` ni les radios — la pilule « Qobuz » rendait donc `local + qobuz`.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait jamais
+# compile, donc vert contre rien.
+[[test]]
+name = "recherche_sources_i3226"
+path = "tests/recherche_sources_i3226.rs"
