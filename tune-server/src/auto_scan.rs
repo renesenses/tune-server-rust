@@ -31,7 +31,7 @@ pub fn build_track_from_metadata(
     artist_repo: &ArtistRepo,
     album_repo: &AlbumRepo,
 ) -> Option<(Track, Option<i64>)> {
-    build_track_from_metadata_opts(sf, artist_repo, album_repo, true, None)
+    build_track_from_metadata_opts(sf, artist_repo, album_repo, true, None, None)
 }
 
 pub fn build_track_from_metadata_opts(
@@ -45,6 +45,12 @@ pub fn build_track_from_metadata_opts(
     // various-artists compilation whose tracks each carry their own artist as
     // album_artist from splitting into one album per artist (JP Borderies).
     compilation_override: Option<bool>,
+    // L'unique artiste d'album ÉTIQUETÉ du dossier, quand le dossier n'en a
+    // qu'un. Il ne sert QU'aux fichiers dont les balises n'ont pas pu être
+    // lues (`TrackMetadata::artist_from_path`) : sans lui, un fichier en délai
+    // dépassé se rangeait sous le nom de son dossier, donc dans un album à
+    // part de ses voisines (#3232). `None` = comportement d'avant.
+    folder_tagged_artist: Option<&str>,
 ) -> Option<(Track, Option<i64>)> {
     let meta = sf.metadata.as_ref()?;
 
@@ -64,6 +70,13 @@ pub fn build_track_from_metadata_opts(
         "Various Artists"
     } else {
         meta.album_artist.as_deref().unwrap_or_else(|| {
+            // Balises illisibles : `meta.artist` n'est que le nom d'un dossier.
+            // Le vrai artiste du dossier, s'il n'y en a qu'un, vaut mieux.
+            if meta.artist_from_path
+                && let Some(a) = folder_tagged_artist
+            {
+                return a;
+            }
             meta.artist
                 .as_deref()
                 .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME)
@@ -348,7 +361,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // with an empty map every file on disk looks new, so a transient DB
         // hiccup would re-insert the whole library as duplicates. (The
         // ScanStatusGuard resets scan_status on this early return.)
-        let existing_tracks = match track_repo.get_all_local_file_info() {
+        let existing_tracks = match track_repo.get_all_file_info_by_path() {
             Ok(map) => map,
             Err(e) => {
                 tracing::error!(error = %e, "auto_scan_aborted_existing_tracks_read_failed");
@@ -462,6 +475,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 }
                 let mut to_insert: Vec<Track> = Vec::with_capacity(batch.len());
                 let mut to_update: Vec<Track> = Vec::with_capacity(batch.len() / 4);
+                // Lignes posées par un importateur que ce lot reprend (#2939).
+                let mut a_adopter: Vec<i64> = Vec::new();
 
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
@@ -503,29 +518,38 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         continue;
                     }
 
-                    // Early-exit: skip unchanged files BEFORE resolving artist/album.
-                    // Without this, build_track_from_metadata can create a ghost album
-                    // (with cover but no tracks) for files that are ultimately skipped.
-                    if let Some(&(_existing_id, existing_mtime, existing_size)) =
-                        existing_tracks.get(&sf.path)
-                    {
-                        let file_changed = existing_mtime
-                            .is_none_or(|m| (m - sf.mtime as f64).abs() > 0.5)
-                            || (existing_size != Some(sf.file_size as i64));
-                        if !file_changed {
-                            skipped += 1;
-                            skipped_unchanged += 1;
-                            continue;
-                        }
+                    // Insertion, mise à jour ou rien : la MÊME règle que le scan
+                    // manuel, appelée et non recopiée (#2939). Prise avant
+                    // `importer.import`, sans quoi un album fantôme (pochette,
+                    // zéro piste) naît pour un fichier qu'on va écarter.
+                    // `force` est faux ici : le scan automatique ne re-résout
+                    // jamais les album_id d'un fichier inchangé.
+                    let verdict = crate::routes::system::scan::verdict_ecriture(
+                        &sf.path,
+                        sf.mtime,
+                        sf.file_size,
+                        false,
+                        &existing_tracks,
+                    );
+                    if verdict == crate::routes::system::scan::VerdictEcriture::Inchange {
+                        skipped += 1;
+                        skipped_unchanged += 1;
+                        continue;
                     }
 
                     let Some((mut track, _album_id)) = importer.import(sf) else {
                         continue;
                     };
 
-                    // File already exists and has changed — collect for batch update
-                    if let Some(&(existing_id, _, _)) = existing_tracks.get(&sf.path) {
-                        track.id = Some(existing_id);
+                    if let crate::routes::system::scan::VerdictEcriture::MettreAJour {
+                        id,
+                        adopter,
+                    } = verdict
+                    {
+                        track.id = Some(id);
+                        if adopter {
+                            a_adopter.push(id);
+                        }
                         to_update.push(track);
                         continue;
                     }
@@ -577,6 +601,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                // Reprise des lignes d'importation relues sur le disque — sœur
+                // exacte du scan manuel (#2939).
+                match track_repo.adopter_en_local(&a_adopter) {
+                    Ok(0) => {}
+                    Ok(adoptees) => tracing::info!(
+                        adoptees,
+                        "auto_scan_lignes_importees_adoptees — ces pistes existaient sous une \
+                         source d'importation au même chemin : le scan les a mises à jour et \
+                         reprises."
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "auto_scan_adoption_locale_failed"),
+                }
                 if batch_inserted == to_insert.len() as u64 {
                     for track in &to_insert {
                         if let (Some(hash), Some(album_id), Some(path)) =
@@ -716,7 +752,16 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // du service, précisément au moment où un montage SMB peut ne pas
             // encore être là. Le point de montage existe, il est lisible, il
             // est vide — et la bibliothèque partait avec (#1652).
-            let existing_refs: Vec<&str> = existing_tracks.keys().map(|s| s.as_str()).collect();
+            // Comme dans le scan manuel : la carte couvre toute la table (la
+            // portée de `file_path TEXT UNIQUE`), mais la purge ne retire que
+            // ce que le scan a posé. Le filtre est explicite, et la purge se
+            // comporte exactement comme avant #2939.
+            let pistes_locales: std::collections::HashMap<&str, i64> = existing_tracks
+                .iter()
+                .filter(|(_, info)| info.est_locale())
+                .map(|(chemin, info)| (chemin.as_str(), info.id))
+                .collect();
+            let existing_refs: Vec<&str> = pistes_locales.keys().copied().collect();
             racines_videes = crate::routes::system::scan::roots_gone_empty(
                 &music_dirs,
                 &existing_refs,
@@ -754,9 +799,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             let mut protected = 0i64;
             let mut hors_perimetre = 0i64;
             let mut a_supprimer: Vec<i64> = Vec::new();
-            let examinees = existing_tracks.len();
-            for (db_path, &(track_id, _, _)) in &existing_tracks {
-                if !discovered_paths.contains(db_path.as_str()) {
+            let examinees = pistes_locales.len();
+            for (&db_path, &track_id) in &pistes_locales {
+                if !discovered_paths.contains(db_path) {
                     match verdict_purge(
                         db_path,
                         &music_dirs,
@@ -1666,12 +1711,24 @@ pub fn spawn_file_watcher(
                                 // one file, so it reconstructs the folder view
                                 // from the DB. Any doubt → None → per-file
                                 // self-decide (previous behaviour, no regression).
-                                let comp_override: Option<bool> =
-                                    sf.metadata.as_ref().and_then(|meta| {
+                                // Rendu : `(compilation ?, artiste d'album unique
+                                // du dossier)`. Le second sert au seul fichier
+                                // dont les balises n'ont pas pu être lues (#3232).
+                                let (comp_override, folder_tagged_artist): (
+                                    Option<bool>,
+                                    Option<String>,
+                                ) = sf
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|meta| {
                                         let dir = std::path::Path::new(&sf.path).parent()?;
                                         let mut comp = meta.compilation;
                                         let mut artists: std::collections::HashSet<String> =
                                             std::collections::HashSet::new();
+                                        // La casse d'origine du premier artiste
+                                        // vu : `artists` est en minuscules, or
+                                        // ce nom peut devenir celui de l'album.
+                                        let mut premier: Option<String> = None;
                                         let mut note = |aa: Option<&str>| {
                                             if let Some(a) =
                                                 aa.map(str::trim).filter(|s| !s.is_empty())
@@ -1679,10 +1736,18 @@ pub fn spawn_file_watcher(
                                                 if crate::scan_import::is_various_artists(a) {
                                                     comp = true;
                                                 }
-                                                artists.insert(a.to_lowercase());
+                                                if artists.insert(a.to_lowercase())
+                                                    && premier.is_none()
+                                                {
+                                                    premier = Some(a.to_string());
+                                                }
                                             }
                                         };
-                                        note(meta.album_artist.as_deref());
+                                        // Un artiste déduit du CHEMIN n'est pas
+                                        // une balise : il ne compte pas.
+                                        if !meta.artist_from_path {
+                                            note(meta.album_artist.as_deref());
+                                        }
                                         let siblings = track_repo
                                             .siblings_album_artists(&dir.to_string_lossy())
                                             .ok()?;
@@ -1694,14 +1759,18 @@ pub fn spawn_file_watcher(
                                             }
                                             note(aa.as_deref());
                                         }
-                                        Some(comp || artists.len() >= 2)
-                                    });
+                                        let unique =
+                                            if artists.len() == 1 { premier } else { None };
+                                        Some((Some(comp || artists.len() >= 2), unique))
+                                    })
+                                    .unwrap_or((None, None));
                                 let Some((track, album_id)) = build_track_from_metadata_opts(
                                     sf,
                                     &artist_repo,
                                     &album_repo,
                                     watcher_quality_split,
                                     comp_override,
+                                    folder_tagged_artist.as_deref(),
                                 ) else {
                                     tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
                                     continue;

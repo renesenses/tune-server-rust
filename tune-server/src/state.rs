@@ -207,27 +207,55 @@ impl AppState {
     /// `local_exclusive_mode: true`, which is what arms the ASIO exclusive
     /// path, so it was silently lost too.
     pub fn effective_exclusive_mode(&self) -> bool {
-        let stored = tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
+        self.exclusive_mode_status().effective
+    }
+
+    /// Le réglage tel que l'utilisateur l'a DEMANDÉ, avant toute contrainte de
+    /// plateforme : la base d'abord, le fichier de config en repli.
+    ///
+    /// Séparé de [`Self::effective_exclusive_mode`] parce que la page de
+    /// réglages doit pouvoir montrer les deux — c'est tout l'objet de #3192 :
+    /// tant qu'un seul nombre existait, l'écran ne pouvait pas dire que le
+    /// choix affiché n'était pas celui qui s'appliquait.
+    pub fn requested_exclusive_mode(&self) -> bool {
+        tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
             .get("local_exclusive_mode")
             .ok()
             .flatten()
-            .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"));
-        let exclusive = stored.unwrap_or(self.config.local_exclusive_mode);
-        // ASIO is exclusive by nature — the shared path can't drive it.
-        // Mirrors the same rule applied to the config file at load time.
-        //
-        // #1268 — mais c'est une notion WINDOWS, et cette règle ne le disait
-        // pas. `local_audio_backend = "asio"` se trouve en base sur des
-        // serveurs macOS et Linux : une bibliothèque migrée depuis une machine
-        // Windows l'y apporte telle quelle, et le sélecteur du client web
-        // propose encore ASIO partout (c'est le symptôme du ticket). Aucun de
-        // ces serveurs ne peut ouvrir un host ASIO — `select_host` sort par le
-        // host par défaut — mais cette ligne armait quand même le mode
-        // exclusif, c'est-à-dire, sur macOS, le hog mode CoreAudio que
-        // personne n'avait demandé. Sous Windows, rien ne change.
-        exclusive
-            || (cfg!(target_os = "windows")
-                && self.effective_audio_backend().eq_ignore_ascii_case("asio"))
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(self.config.local_exclusive_mode)
+    }
+
+    /// Ce que le mode exclusif vaut réellement, ce qui a été demandé, et
+    /// pourquoi les deux diffèrent quand c'est le cas.
+    ///
+    /// ASIO is exclusive by nature — the shared path can't drive it. Mirrors
+    /// the same rule applied to the config file at load time.
+    ///
+    /// #1268 — mais c'est une notion WINDOWS, et cette règle ne le disait
+    /// pas. `local_audio_backend = "asio"` se trouve en base sur des
+    /// serveurs macOS et Linux : une bibliothèque migrée depuis une machine
+    /// Windows l'y apporte telle quelle, et le sélecteur du client web
+    /// propose encore ASIO partout (c'est le symptôme du ticket). Aucun de
+    /// ces serveurs ne peut ouvrir un host ASIO — `select_host` sort par le
+    /// host par défaut — mais cette ligne armait quand même le mode
+    /// exclusif, c'est-à-dire, sur macOS, le hog mode CoreAudio que
+    /// personne n'avait demandé. Sous Windows, rien ne change.
+    ///
+    /// #3192 — jfpaquet, Asus Essence STX II : sous Windows, ce même « rien ne
+    /// change » avait un coût que personne ne lui annonçait. Décocher « mode
+    /// exclusif » restait sans effet dès que le backend était ASIO, Tune
+    /// prenait le périphérique en entier, et le son de toutes les autres
+    /// applications disparaissait sans un mot. La RÈGLE est juste — un pilote
+    /// ASIO ouvert en partagé n'existe pas — et elle ne bouge pas d'un iota
+    /// ici. Ce qui change, c'est qu'elle se DÉCLARE : la contrainte sort par
+    /// `/system/config` pour que la case soit verrouillée et expliquée au
+    /// lieu d'être ignorée en silence.
+    pub fn exclusive_mode_status(&self) -> tune_core::config::ExclusiveModeStatus {
+        tune_core::config::local_exclusive_mode_status(
+            &self.effective_audio_backend(),
+            self.requested_exclusive_mode(),
+        )
     }
 
     /// The audio backend local outputs *should* be built with: the stored
@@ -318,6 +346,25 @@ impl AppState {
         services.register(Box::new(
             tune_core::streaming::youtube::YouTubeService::new(),
         ));
+        // 🔴 #2702 / #2778 — Bandcamp n'était NULLE PART dans ce registre.
+        // Les deux seules routes qui construisent une file complète
+        // (`POST /zones/{id}/play` avec `streaming_album_id` ou
+        // `streaming_playlist_id`) commencent par `registry.get(source)` et
+        // répondaient donc `400 unknown service: bandcamp` : il ne restait que
+        // le chemin « piste distante seule », qui pose une file d'exactement
+        // UNE piste — d'où « les morceaux ne s'enchaînent pas » (Sevy Tabroc).
+        //
+        // L'inscription est INCONDITIONNELLE, comme les cinq autres, et non
+        // gardée par l'état du greffon : `ServiceRegistry::get` ne consulte
+        // jamais `enabled`, et le service rend `enabled() == false` tant que
+        // personne ne l'a activé — il apparaît donc comme disponible et non
+        // connecté, exactement comme le greffon opt-in dont il est la seconde
+        // face. La LECTURE, elle, ne change pas de chemin : `resolve_stream`
+        // route toujours `source == "bandcamp"` vers `resolve_direct_url`.
+        #[cfg(feature = "bandcamp")]
+        services.register(Box::new(tune_bandcamp::BandcampService::new(
+            backend.clone(),
+        )));
 
         let services = Arc::new(Mutex::new(services));
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));

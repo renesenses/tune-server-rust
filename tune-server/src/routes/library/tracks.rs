@@ -301,6 +301,29 @@ pub(super) async fn stream_track_audio(
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
+    // Seconde frontière de lecture, et la plus trompeuse (#3234). Le chemin
+    // de l'orchestrateur n'est pas le seul : c'est PAR ICI que le lecteur du
+    // navigateur et le serveur média UPnP demandent les octets. Sur un ISO
+    // SACD, `from_extension` rend `None`, le `Content-Type` retombe sur
+    // `application/octet-stream`, et la route rend un 200 parfait suivi de
+    // 4 Go d'image disque : le lecteur reste muet sans qu'aucune erreur ne
+    // soit jamais rendue.
+    //
+    // Le fichier existe et il est lisible — un 404 mentirait. Ce qui manque
+    // est un outil que Tune ne fournit pas, et le motif rendu ici est mot pour
+    // mot celui du rapport de parcours (#2992) et celui de la route de
+    // lecture, pour que l'utilisateur ne lise pas trois phrases différentes
+    // pour un seul empêchement.
+    if let Some(motif) = tune_core::audio::iso_sacd::refus_de_lecture(path) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "format_not_playable",
+                "message": motif,
+            })),
+        )
+            .into_response();
+    }
     let mime = track
         .format
         .as_deref()
@@ -1308,9 +1331,16 @@ pub(super) async fn rassembler_versions(
     // a l'auditeur) et l'album lui-meme. L'artiste d'album n'est qu'un repli :
     // sur une compilation « Artistes divers », le premier ferait precisement
     // perdre les versions de l'interprete reel (#2638).
+    //
+    // L'ISRC, la duree et l'annee viennent avec : ce sont les signaux qui
+    // CLASSENT les candidats (`routes::versions::score_version`). La section
+    // d'accueil ne les a pas — son vivier est `listen_history` —, cette
+    // route-ci les a, et c'est tout l'interet de partir d'une vraie ligne de
+    // `tracks`.
     let e = state.backend.engine();
     let sql = format!(
-        "SELECT t.title, COALESCE(ar2.name, ar.name, ''), COALESCE(al.title, '') \
+        "SELECT t.title, COALESCE(ar2.name, ar.name, ''), COALESCE(al.title, ''), \
+                t.isrc, t.duration_ms, al.year \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -1323,20 +1353,18 @@ pub(super) async fn rassembler_versions(
         .query_one(&sql, &[&id as &dyn ToSqlValue])
         .ok()
         .flatten()?;
-    let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
-    let artiste = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
-    let album = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+    let reference = crate::routes::versions::Reference {
+        titre: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+        artiste: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        album: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+        isrc: cols.get(3).and_then(|v| v.as_string()),
+        duree_ms: cols.get(4).and_then(|v| v.as_i64()),
+        annee: cols.get(5).and_then(|v| v.as_i64()),
+    };
 
-    let locales = crate::routes::versions::versions_locales(
-        state,
-        &titre,
-        &artiste,
-        &album,
-        Some(id),
-        limite,
-    );
+    let locales = crate::routes::versions::versions_locales(state, &reference, Some(id), limite);
     let streaming = if avec_streaming {
-        crate::routes::versions::versions_streaming(state, &titre, &artiste, &album).await
+        crate::routes::versions::versions_streaming(state, &reference).await
     } else {
         Vec::new()
     };
@@ -1345,9 +1373,9 @@ pub(super) async fn rassembler_versions(
     // dessine deja la section d'accueil rend celui-ci sans une ligne de plus.
     Some(json!({
         "track_id": id,
-        "title": titre,
-        "artist_name": artiste,
-        "played_album": album,
+        "title": reference.titre,
+        "artist_name": reference.artiste,
+        "played_album": reference.album,
         "versions": locales,
         "streaming": streaming,
     }))
@@ -1608,6 +1636,202 @@ mod tests_versions_piste {
             rassembler_versions(&state, 999_999, 50, false)
                 .await
                 .is_none()
+        );
+    }
+
+    /// La bibliothèque de Gros Bidon (#2372, fil 1627) : le titre de base, son
+    /// remaster nommé AVEC UN TIRET comme le nomment Qobuz, Tidal et Deezer,
+    /// et — le piège — un homonyme d'un autre artiste, remasterisé lui aussi.
+    ///
+    /// Rend l'id de la piste de base.
+    fn bibliotheque_remasters(state: &AppState) -> i64 {
+        let b = &state.backend;
+        let artiste = |nom: &str| {
+            b.execute(
+                "INSERT INTO artists (name) VALUES (?1)",
+                &[&nom as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let album = |titre: &str, artiste_id: i64, annee: i64| {
+            b.execute(
+                "INSERT INTO albums (title, artist_id, year) VALUES (?1, ?2, ?3)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &artiste_id as &dyn ToSqlValue,
+                    &annee as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let piste = |titre: &str, album_id: i64, artiste_id: i64, duree: i64, isrc: &str| {
+            b.execute(
+                "INSERT INTO tracks (title, album_id, artist_id, duration_ms, isrc, file_path) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                    &artiste_id as &dyn ToSqlValue,
+                    &duree as &dyn ToSqlValue,
+                    &isrc as &dyn ToSqlValue,
+                    &format!("/{titre}-{album_id}.flac") as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+
+        let sade = artiste("Sade");
+        let autre = artiste("The Smooth Operators");
+        let diamond = album("Diamond Life", sade, 1984);
+        let ultimate = album("The Ultimate Collection", sade, 2011);
+        let ailleurs = album("Ailleurs", autre, 2011);
+
+        let base = piste("Smooth Operator", diamond, sade, 291_000, "GBAAA8400001");
+        piste(
+            "Smooth Operator - 2011 Remastered",
+            ultimate,
+            sade,
+            291_000,
+            "GBAAA8400001",
+        );
+        // L'HOMONYME : même titre, même suffixe, autre artiste. Le
+        // rapprochement local nomme l'artiste depuis #2497 — il ne doit pas
+        // sortir.
+        piste(
+            "Smooth Operator - 2011 Remastered",
+            ailleurs,
+            autre,
+            180_000,
+            "FRXXX1100001",
+        );
+        base
+    }
+
+    /// ⭐ ÉPREUVE 1 — le cas de Gros Bidon : un titre remasterisé, avec tiret,
+    /// est reconnu comme une version du titre de base.
+    ///
+    /// Avant ce lot, `titre_est_base_de` n'acceptait que ` (` et ` [` : cette
+    /// liste était VIDE, et « Autres versions » ratait la convention de
+    /// nommage la plus répandue des remasters.
+    #[tokio::test]
+    async fn un_remaster_avec_tiret_est_une_autre_version() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let base = bibliotheque_remasters(&state);
+
+        let v = rassembler_versions(&state, base, 50, false)
+            .await
+            .expect("la piste existe");
+        let versions = v["versions"].as_array().expect("versions locales");
+        assert_eq!(
+            versions.len(),
+            1,
+            "une seule autre version attendue, obtenu {versions:?}"
+        );
+        assert_eq!(
+            versions[0]["title"].as_str(),
+            Some("Smooth Operator - 2011 Remastered"),
+            "le titre RETROUVÉ doit être rendu tel quel : {versions:?}"
+        );
+        assert_eq!(
+            versions[0]["album_title"].as_str(),
+            Some("The Ultimate Collection")
+        );
+    }
+
+    /// ⭐ ÉPREUVE 2 — l'artiste compte : deux morceaux de même titre par des
+    /// artistes différents ne sont pas mélangés.
+    ///
+    /// C'est la contre-épreuve du SABOTAGE : retirer la condition d'artiste de
+    /// `predicat_rapprochement` fait tomber CE test, et lui seul dit pourquoi.
+    ///
+    /// La définition retenue est écrite en toutes lettres : dans la
+    /// BIBLIOTHÈQUE, « autre version » veut dire **même titre, MÊME artiste,
+    /// autre album**. La reprise par un autre interprète n'entre pas ici — elle
+    /// n'entre que par le STREAMING, où elle est étiquetée `reprise` et où le
+    /// libellé permet à l'auditeur de la distinguer.
+    #[tokio::test]
+    async fn l_homonyme_d_un_autre_artiste_n_entre_pas_dans_les_versions_locales() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let base = bibliotheque_remasters(&state);
+
+        let v = rassembler_versions(&state, base, 50, false)
+            .await
+            .expect("la piste existe");
+        let versions = v["versions"].as_array().expect("versions locales");
+        for version in versions {
+            assert_ne!(
+                version["album_title"].as_str(),
+                Some("Ailleurs"),
+                "un homonyme d'un AUTRE artiste est sorti : {versions:?}"
+            );
+        }
+        assert_eq!(
+            versions.len(),
+            1,
+            "l'artiste n'est plus dans le rapprochement : {versions:?}"
+        );
+    }
+
+    /// Le score classe ce que l'arbre binaire laissait dans l'ordre du moteur.
+    ///
+    /// La version qui partage l'ISRC de la référence passe devant celle qui ne
+    /// le partage pas, même quand les deux sont également « même artiste,
+    /// autre album ». Avant ce lot les deux étaient indiscernables.
+    #[tokio::test]
+    async fn la_version_de_meme_isrc_passe_devant() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Sade')", &[])
+            .unwrap();
+        let sade = b.last_insert_rowid();
+        let album = |titre: &str| {
+            b.execute(
+                "INSERT INTO albums (title, artist_id) VALUES (?1, ?2)",
+                &[&titre as &dyn ToSqlValue, &sade as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        // « Abbey » AVANT « Zenith » dans tous les ordres alphabétiques : si
+        // le score ne comptait pas, c'est « Abbey » qui sortirait en tête.
+        let abbey = album("Abbey");
+        let zenith = album("Zenith");
+        let diamond = album("Diamond Life");
+        let piste = |titre: &str, album_id: i64, isrc: &str, chemin: &str| {
+            b.execute(
+                "INSERT INTO tracks (title, album_id, artist_id, duration_ms, isrc, file_path) \
+                 VALUES (?1, ?2, ?3, 291000, ?4, ?5)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                    &sade as &dyn ToSqlValue,
+                    &isrc as &dyn ToSqlValue,
+                    &chemin as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let base = piste("Smooth Operator", diamond, "GBAAA8400001", "/base.flac");
+        piste("Smooth Operator", abbey, "USXXX9900001", "/abbey.flac");
+        piste("Smooth Operator", zenith, "GBAAA8400001", "/zenith.flac");
+
+        let v = rassembler_versions(&state, base, 50, false)
+            .await
+            .expect("la piste existe");
+        let versions = v["versions"].as_array().expect("versions locales");
+        assert_eq!(versions.len(), 2, "versions rendues : {versions:?}");
+        assert_eq!(
+            versions[0]["album_title"].as_str(),
+            Some("Zenith"),
+            "l'ISRC identique doit passer devant l'ordre alphabétique : {versions:?}"
+        );
+        assert!(
+            versions[0]["score"].as_i64() > versions[1]["score"].as_i64(),
+            "le score doit être décroissant : {versions:?}"
         );
     }
 }

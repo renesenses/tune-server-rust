@@ -176,6 +176,144 @@ impl CrossfeedProcessor {
     }
 }
 
+/// Contrainte qui prive le réglage « crossfeed » de son effet.
+///
+/// #2742 — Tades : « Crossfeed n'a aucune action ». Le serveur avait raison sur
+/// le fond — le crossfeed est un effet de CASQUE, il n'est appliqué que par la
+/// sortie locale — mais il l'imposait EN SILENCE. `GET /zones/{id}/dsp` rend le
+/// réglage pour n'importe quelle zone, `PUT` le persiste pour n'importe quelle
+/// zone, et les TROIS sites qui installent réellement un `CrossfeedProcessor`
+/// (`orchestrator.rs` : le chemin de lecture, `refresh_zone_crossfeed`,
+/// `refresh_zone_pure_dsp`) sont tous derrière la même double garde
+/// `device_id.starts_with("local:")` + `downcast_ref::<LocalOutput>()`. Sur une
+/// zone réseau le crossfeed n'a littéralement aucun chemin de code : la case
+/// s'allume, la valeur part en base, et rien ne se passe.
+///
+/// Même défaut que #3192 (« mode exclusif » décoché sans effet sous ASIO) :
+/// le défaut n'est pas la règle, c'est que le réglage MENT. D'où le même
+/// vocabulaire — un `code()` stable pour la machine, un `detail()` en clair
+/// pour un écran sans table de traduction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossfeedConstraint {
+    /// La zone ne joue pas par une sortie LOCALE. Le crossfeed n'est appliqué
+    /// que par `LocalOutput` (`apply_local_dsp` / `flush_local_dsp`) ; le
+    /// chemin réseau passe par `transcode_source_to_file`, dont la signature
+    /// ne porte que l'égaliseur, le convolveur et le ReplayGain — jamais de
+    /// crossfeed. Couvre aussi la zone dont aucun périphérique n'est résolu :
+    /// elle ne joue nulle part, donc pas davantage par une sortie locale.
+    NonLocalOutput,
+    /// Le mode PURE (audiophile) désarme volontairement le crossfeed pour
+    /// garder le chemin bit-perfect (`load_crossfeed_processor` rend `None`).
+    /// C'est un choix assumé, pas une panne — mais tant qu'il dure, le réglage
+    /// est sans effet et l'écran doit le dire.
+    PureMode,
+}
+
+impl CrossfeedConstraint {
+    /// Code stable, celui que porte la charge utile JSON.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NonLocalOutput => "non_local_output",
+            Self::PureMode => "pure_mode",
+        }
+    }
+
+    /// Phrase courte, dans la langue du chemin du signal — le serveur y écrit
+    /// déjà ses `detail` en français.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::NonLocalOutput => {
+                "Le crossfeed est un effet de casque : il n'est appliqué que par \
+                 une sortie LOCALE (DAC USB ou carte son de la machine). Cette \
+                 zone ne joue pas par une sortie locale, le réglage est \
+                 enregistré mais n'atteint pas le son. Pour l'entendre, écoutez \
+                 sur une zone à sortie locale."
+            }
+            Self::PureMode => {
+                "Le mode PURE garde le chemin bit-perfect : aucun traitement ne \
+                 touche le signal, crossfeed compris. Le réglage est conservé et \
+                 reprendra effet dès que le mode PURE sera désactivé."
+            }
+        }
+    }
+
+    /// Toutes les variantes. Sert la contre-épreuve permanente : une contrainte
+    /// ajoutée sans code ni libellé fait tomber le test qui parcourt cette liste.
+    pub const ALL: [Self; 2] = [Self::NonLocalOutput, Self::PureMode];
+}
+
+/// Ce que le crossfeed VAUT réellement pour une zone, à côté de ce que le
+/// réglage demande — et pourquoi, quand les deux diffèrent.
+///
+/// Additif : aucun champ ne remplace l'objet `crossfeed` de
+/// `GET/PUT /zones/{id}/dsp`, qui reste publié tel quel. Un client qui ne lit
+/// pas cette structure voit le même écran qu'avant.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CrossfeedStatus {
+    /// Ce que l'utilisateur a demandé (la case `enabled` du réglage persisté).
+    pub requested: bool,
+    /// Ce qui sera réellement appliqué au son de cette zone.
+    pub effective: bool,
+    /// `true` dès que la contrainte s'applique — **y compris quand la case
+    /// était déjà décochée**. C'est ce champ qui doit VERROUILLER le contrôle :
+    /// la question n'est pas « le réglage a-t-il été changé ? » mais « ce
+    /// réglage a-t-il encore un sens sur cette zone ? ».
+    pub unavailable: bool,
+    /// Pourquoi. `None` = le réglage est honoré tel quel.
+    pub reason: Option<CrossfeedConstraint>,
+    /// La même chose en clair, pour un écran qui n'a pas de table de traduction.
+    pub detail: Option<&'static str>,
+}
+
+/// Le prédicat des trois sites d'installation, écrit UNE fois.
+///
+/// `orchestrator.rs` garde chacun d'eux par `device_id.starts_with("local:")`,
+/// et `create_zone` le dit noir sur blanc : « une sortie locale s'identifie par
+/// `local:{nom}` — c'est ce préfixe, et lui seul, qui dit à l'orchestrateur
+/// "carte son" plutôt que "renderer réseau" ». Le statut publié doit donc
+/// interroger EXACTEMENT ce préfixe, sinon l'écran et le son se répondraient
+/// sur deux règles différentes.
+///
+/// `None` (zone sans périphérique résolu) rend `false` : elle ne joue nulle
+/// part, donc pas davantage par une sortie locale.
+pub fn crossfeed_runs_on_output(output_device_id: Option<&str>) -> bool {
+    output_device_id.is_some_and(|d| d.starts_with("local:"))
+}
+
+/// La règle, isolée de toute base de données pour être vérifiable partout.
+///
+/// `output_is_local` et `audiophile` sont des PARAMÈTRES, pas des lectures : la
+/// règle doit être éprouvable sans monter une zone ni une sortie, et sur une
+/// cible compilée sans `local-audio` — où les trois sites d'installation
+/// n'existent même pas, ce qui ne rend le réglage que plus muet. Même intention
+/// que le `on_windows` d'`exclusive_mode_status` (#3192).
+///
+/// Ordre des motifs : une zone réseau ne verra JAMAIS de crossfeed, PURE ou
+/// non ; c'est donc `NonLocalOutput` qui prime, parce que c'est celui qui ne
+/// se lève pas en décochant une case.
+pub fn crossfeed_status(
+    requested: bool,
+    output_is_local: bool,
+    audiophile: bool,
+) -> CrossfeedStatus {
+    let reason = if !output_is_local {
+        Some(CrossfeedConstraint::NonLocalOutput)
+    } else if audiophile {
+        Some(CrossfeedConstraint::PureMode)
+    } else {
+        None
+    };
+    let unavailable = reason.is_some();
+    CrossfeedStatus {
+        requested,
+        effective: requested && !unavailable,
+        unavailable,
+        reason,
+        detail: reason.map(CrossfeedConstraint::detail),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +517,289 @@ mod tests {
         let mut neuf2 = CrossfeedProcessor::new(48000, 0.3, 0.0);
         neuf2.inherit_state_from(&prec2);
         assert!(neuf2.ring_l.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // #2742 — le réglage « crossfeed » ne doit plus MENTIR.
+    //
+    // Ces essais portent sur `crossfeed_status`, qui prend le type de sortie
+    // et le mode PURE en PARAMÈTRES. C'est délibéré : les trois sites qui
+    // installent un `CrossfeedProcessor` sont derrière
+    // `#[cfg(feature = "local-audio")]`, et un essai entouré du même `cfg` ne
+    // serait exécuté par aucune des cibles qui compilent sans — vert contre
+    // rien, alors que c'est justement là que le réglage est le plus muet.
+    // -----------------------------------------------------------------
+
+    /// Le TÉMOIN de la règle : sortie locale, hors PURE, le réglage est honoré
+    /// tel quel et **rien** ne vient s'ajouter à l'écran. Si ce test rougit,
+    /// c'est qu'on a désarmé le cas nominal en corrigeant le cas réseau.
+    #[test]
+    fn une_sortie_locale_honore_le_crossfeed_sans_rien_annoncer() {
+        let s = crossfeed_status(true, true, false);
+        assert!(
+            s.effective,
+            "sortie locale hors PURE : le crossfeed s'applique"
+        );
+        assert!(
+            !s.unavailable,
+            "le contrôle doit rester ACTIF : c'est le cas nominal"
+        );
+        assert_eq!(s.reason, None);
+        assert_eq!(s.detail, None);
+        assert!(s.requested);
+
+        // Décoché sur une sortie locale : rien à annoncer non plus.
+        let eteint = crossfeed_status(false, true, false);
+        assert!(!eteint.effective);
+        assert!(!eteint.unavailable);
+        assert_eq!(eteint.reason, None);
+    }
+
+    /// 1. Zone réseau + case COCHÉE : le réglage est sans effet, **et la raison
+    ///    est donnée**. C'est tout le ticket : avant, le premier point était
+    ///    vrai et le second manquait.
+    #[test]
+    fn une_sortie_reseau_dit_que_le_crossfeed_n_agit_pas() {
+        let s = crossfeed_status(true, false, false);
+        assert!(
+            !s.effective,
+            "aucun des trois sites d'installation n'est atteignable hors sortie locale"
+        );
+        assert!(
+            s.unavailable,
+            "et le contrôle doit être annoncé comme INDISPONIBLE, pas honoré"
+        );
+        assert_eq!(s.reason, Some(CrossfeedConstraint::NonLocalOutput));
+        let detail = s
+            .detail
+            .expect("une contrainte sans explication, c'est le défaut de #2742");
+        assert!(
+            detail.contains("locale"),
+            "l'explication doit dire à l'utilisateur ce qu'il PEUT faire \
+             (écouter sur une zone locale), pas seulement ce qu'il subit : {detail}"
+        );
+        assert!(
+            s.requested,
+            "`requested` doit rester ce que l'utilisateur a demandé, sinon \
+             l'écran ne peut pas dire que son choix est resté lettre morte"
+        );
+    }
+
+    /// 2. Zone réseau + case DÉCOCHÉE : `unavailable` se lève quand même. La
+    ///    question n'est pas « le réglage a-t-il été changé ? » mais « ce
+    ///    réglage a-t-il encore un sens ici ? » — sinon le client ne verrouille
+    ///    le contrôle qu'APRÈS que l'utilisateur a cliqué pour rien.
+    #[test]
+    fn une_sortie_reseau_verrouille_meme_case_decochee() {
+        let s = crossfeed_status(false, false, false);
+        assert!(!s.effective);
+        assert!(s.unavailable);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::NonLocalOutput));
+    }
+
+    /// 3. Le mode PURE désarme le crossfeed sur une sortie locale, et le dit.
+    ///    `load_crossfeed_processor` rend déjà `None` en PURE ; ce qui manquait
+    ///    était de l'annoncer.
+    #[test]
+    fn le_mode_pure_desarme_le_crossfeed_et_le_dit() {
+        let s = crossfeed_status(true, true, true);
+        assert!(!s.effective);
+        assert!(s.unavailable);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::PureMode));
+        assert!(
+            s.detail.is_some_and(|d| d.contains("PURE")),
+            "l'explication doit nommer le mode qui désarme"
+        );
+    }
+
+    /// 4. Zone réseau ET en PURE : c'est `NonLocalOutput` qui prime. PURE se
+    ///    lève en décochant une case ; la sortie réseau, non — annoncer PURE
+    ///    laisserait croire qu'il suffit de le désactiver pour entendre le
+    ///    crossfeed.
+    #[test]
+    fn la_sortie_reseau_prime_sur_le_mode_pure() {
+        let s = crossfeed_status(true, false, true);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::NonLocalOutput));
+    }
+
+    /// Le prédicat publié doit être EXACTEMENT celui des trois sites
+    /// d'installation : `starts_with("local:")`, et rien d'autre. Un `dlna:` ou
+    /// un nom nu ne doit jamais passer pour une sortie locale — c'est
+    /// précisément la confusion que `create_zone` documente.
+    #[test]
+    fn seul_le_prefixe_local_fait_courir_le_crossfeed() {
+        assert!(crossfeed_runs_on_output(Some("local:Realtek")));
+        assert!(crossfeed_runs_on_output(Some("local:")));
+        assert!(!crossfeed_runs_on_output(Some("dlna:uuid-1234")));
+        assert!(!crossfeed_runs_on_output(Some("chromecast:salon")));
+        assert!(!crossfeed_runs_on_output(Some("Realtek")));
+        assert!(!crossfeed_runs_on_output(Some("browser:1")));
+        assert!(
+            !crossfeed_runs_on_output(None),
+            "une zone sans périphérique ne joue nulle part"
+        );
+    }
+
+    /// Contre-épreuve permanente : toute contrainte doit porter un code STABLE,
+    /// unique, et une explication non vide. Une variante ajoutée sans être
+    /// décrite fait tomber ce test.
+    #[test]
+    fn chaque_contrainte_a_un_code_unique_et_une_explication() {
+        let mut codes: Vec<&str> = Vec::new();
+        for c in CrossfeedConstraint::ALL {
+            assert!(!c.code().is_empty(), "code vide");
+            assert!(
+                !c.detail().trim().is_empty(),
+                "contrainte sans explication : {}",
+                c.code()
+            );
+            assert!(!codes.contains(&c.code()), "code dupliqué : {}", c.code());
+            codes.push(c.code());
+        }
+        assert_eq!(codes.len(), CrossfeedConstraint::ALL.len());
+    }
+
+    /// Le code stable doit être celui que porte le JSON — pas une chaîne
+    /// recopiée à côté. C'est ce que le client lira pour choisir sa traduction.
+    #[test]
+    fn le_code_serialise_est_le_code_stable() {
+        let s = crossfeed_status(true, false, false);
+        let v = serde_json::to_value(&s).expect("le statut doit être sérialisable");
+        assert_eq!(
+            v["reason"].as_str(),
+            Some(CrossfeedConstraint::NonLocalOutput.code()),
+            "le client lit ce code, il ne doit pas dériver du nom Rust"
+        );
+        assert_eq!(v["unavailable"].as_bool(), Some(true));
+        assert_eq!(v["requested"].as_bool(), Some(true));
+        assert_eq!(v["effective"].as_bool(), Some(false));
+        assert!(v["detail"].as_str().is_some_and(|d| !d.is_empty()));
+
+        // Le cas nominal ne publie AUCUN motif : `null`, pas une chaîne vide.
+        let nominal = serde_json::to_value(crossfeed_status(true, true, false)).unwrap();
+        assert!(nominal["reason"].is_null());
+        assert!(nominal["detail"].is_null());
+    }
+
+    /// ⭐ GARDE DE SITE — la prémisse de toute la règle, relue dans le code de
+    /// PRODUCTION.
+    ///
+    /// `crossfeed_status` affirme « hors sortie locale, le crossfeed n'a aucun
+    /// chemin de code ». Cette affirmation n'est vraie que tant que le chemin
+    /// réseau n'installe pas de crossfeed. Si quelqu'un porte un jour le
+    /// crossfeed sur `transcode_source_to_file` sans revenir ici, le serveur se
+    /// mettrait à mentir dans l'AUTRE sens : un écran qui annonce « sans effet »
+    /// pendant que le DAC reçoit un signal traité.
+    ///
+    /// On relit donc `orchestrator.rs` — le fichier réel, par `include_str!`,
+    /// l'idiome du dépôt — et on vérifie que tout appel qui INSTALLE un
+    /// crossfeed est bien précédé, de peu, de la garde `local:`.
+    #[test]
+    fn aucun_site_d_installation_du_crossfeed_hors_de_la_garde_locale() {
+        const ORCHESTRATEUR: &str = include_str!("../orchestrator.rs");
+        // Témoin : si `include_str!` pointait sur un fichier vide ou faux, tout
+        // le reste passerait pour vert sans rien avoir lu.
+        assert!(
+            ORCHESTRATEUR.contains("fn load_crossfeed_processor"),
+            "include_str! ne lit pas l'orchestrateur attendu"
+        );
+        let lignes: Vec<&str> = ORCHESTRATEUR.lines().collect();
+
+        // Début d'une fonction — la BORNE de la recherche en amont. Une garde
+        // posée dans une AUTRE fonction ne garde rien ; sans cette borne, une
+        // simple fenêtre de N lignes attraperait le `local:` du voisin et
+        // resterait verte contre une garde supprimée.
+        fn debut_de_fonction(l: &str) -> bool {
+            let t = l.trim_start();
+            [
+                "fn ",
+                "pub fn ",
+                "async fn ",
+                "pub async fn ",
+                "pub(crate) fn ",
+                "pub(crate) async fn ",
+            ]
+            .iter()
+            .any(|p| t.starts_with(p))
+        }
+
+        // Remonter depuis `depuis` (exclu) jusqu'à `motif`, sans franchir le
+        // début de la fonction courante. Rend la ligne trouvée, ou `None`.
+        fn remonter(lignes: &[&str], depuis: usize, motif: &str) -> Option<usize> {
+            for i in (0..depuis).rev() {
+                if lignes[i].contains(motif) {
+                    return Some(i);
+                }
+                if debut_de_fonction(lignes[i]) {
+                    return None;
+                }
+            }
+            None
+        }
+
+        let mut sites = 0usize;
+        for (i, ligne) in lignes.iter().enumerate() {
+            // Les APPELS, pas les définitions ni les commentaires.
+            let nu = ligne.trim_start();
+            let appel = (ligne.contains(".set_crossfeed(")
+                || ligne.contains(".replace_crossfeed_live("))
+                && !nu.starts_with("//");
+            if !appel {
+                continue;
+            }
+            sites += 1;
+            let downcast = remonter(
+                &lignes,
+                i,
+                "downcast_ref::<crate::outputs::local::LocalOutput>()",
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "site d'installation du crossfeed sans `LocalOutput` dans sa \
+                     propre fonction (orchestrator.rs, ligne {}) : {}",
+                    i + 1,
+                    ligne.trim()
+                )
+            });
+            assert!(
+                remonter(&lignes, downcast, "starts_with(\"local:\")").is_some(),
+                "site d'installation du crossfeed sans garde `local:` dans sa \
+                 propre fonction (orchestrator.rs, ligne {}) : {}\n\
+                 Si le crossfeed atteint désormais une sortie NON locale, \
+                 `crossfeed_status` ment et doit être corrigé AVEC ce site.",
+                i + 1,
+                ligne.trim()
+            );
+        }
+        // Le compte est un plancher VÉRIFIÉ, pas une supposition : au 03/09/2026
+        // il y a exactement trois sites — le chemin de lecture,
+        // `refresh_zone_crossfeed` et `refresh_zone_pure_dsp`. Un quatrième est
+        // le bienvenu ; zéro signifierait que ce test ne mesure plus rien.
+        assert!(
+            sites >= 3,
+            "seulement {sites} site(s) d'installation trouvé(s) : le test ne \
+             garde plus le chemin qu'il prétend garder"
+        );
+
+        // La prémisse INVERSE, et c'est la plus importante : le chemin réseau
+        // ne doit pas se mettre à appliquer un crossfeed dans notre dos.
+        // `transcode_source_to_file` est la seule porte du chemin transcodé
+        // (DLNA, OpenHome, Chromecast, BluOS…) ; sa signature ne porte que
+        // l'égaliseur, le convolveur et le ReplayGain. Le jour où l'on y ajoute
+        // le crossfeed, `crossfeed_status` mentira dans l'AUTRE sens — un écran
+        // qui annonce « sans effet » pendant que le DAC reçoit un signal
+        // traité — et ce test doit l'exiger AVANT que ça n'arrive.
+        let (_, apres) = ORCHESTRATEUR
+            .split_once("async fn transcode_source_to_file(")
+            .expect("la porte du chemin transcodé doit exister");
+        let (signature, _) = apres
+            .split_once(") -> ")
+            .expect("signature de transcode_source_to_file illisible");
+        assert!(
+            !signature.contains("crossfeed"),
+            "le chemin transcodé accepte désormais un crossfeed : \
+             `CrossfeedConstraint::NonLocalOutput` n'est plus vrai et doit \
+             être revu ici AVANT d'être publié à l'écran.\nsignature : {signature}"
+        );
     }
 }

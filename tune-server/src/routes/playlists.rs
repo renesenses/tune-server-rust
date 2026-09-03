@@ -606,7 +606,12 @@ async fn import_m3u_file(
     // empty map, so EVERY line fell through to "not found" and the import
     // answered 201 with 0 matched — a success that describes nothing that
     // happened (#2798, same shape as #2119). Refuse before writing anything.
-    let path_to_id = match track_repo.get_all_local_file_info() {
+    // Toutes sources : la question posée par une ligne de .m3u est « quelle
+    // ligne de la base possède ce chemin ? », et une seule peut le posséder
+    // (`file_path TEXT UNIQUE`). Restreindre à `source = 'local'` faisait
+    // retomber sur la recherche FTS — ou sur « introuvable » — une piste que la
+    // base tenait pourtant sous une source d'importation (#2939).
+    let path_to_id = match track_repo.get_all_file_info_by_path() {
         Ok(map) => map,
         Err(e) => {
             tracing::warn!(error = %e, "m3u_import_file_index_unavailable");
@@ -640,8 +645,8 @@ async fn import_m3u_file(
         total_entries += 1;
 
         // Exact path match (O(1) map lookup).
-        if let Some((id, _, _)) = path_to_id.get(line) {
-            track_ids.push(*id);
+        if let Some(info) = path_to_id.get(line) {
+            track_ids.push(info.id);
             matched += 1;
             continue;
         }

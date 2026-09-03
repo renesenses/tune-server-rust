@@ -73,10 +73,10 @@ pub fn extract_iso_to_dsf(iso_path: &Path) -> Result<Vec<PathBuf>, String> {
 ///
 /// Le Master TOC occupe le LSN 510 d'une image SACD ; un secteur fait 0x800
 /// octets. La signature `SACDMTOC` s'y trouve à l'octet zéro.
-const DECALAGE_MASTER_TOC_SACD: u64 = 0x800 * 510;
+pub(crate) const DECALAGE_MASTER_TOC_SACD: u64 = 0x800 * 510;
 
 /// Signature du Master TOC d'un disque SACD.
-const SIGNATURE_MASTER_TOC_SACD: &[u8; 8] = b"SACDMTOC";
+pub(crate) const SIGNATURE_MASTER_TOC_SACD: &[u8; 8] = b"SACDMTOC";
 
 /// Dit si ce chemin est réellement une image SACD, signature à l'appui.
 ///
@@ -111,6 +111,41 @@ pub fn is_sacd_iso(path: &Path) -> bool {
     // `read_exact` échoue proprement sur une image trop courte pour porter un
     // Master TOC : pas besoin de tester la taille séparément.
     fichier.read_exact(&mut signature).is_ok() && &signature == SIGNATURE_MASTER_TOC_SACD
+}
+
+/// Motif qui interdit la LECTURE de ce chemin, ou `None` si Tune sait le rendre.
+///
+/// Le parcours de bibliothèque refuse déjà les `.iso` qu'il n'a pas su extraire,
+/// et il les NOMME dans son rapport (#2992). La demande de LECTURE, elle, n'avait
+/// aucune garde : une ligne `tracks` qui pointe encore un `.iso` — parcours
+/// antérieur à ce correctif, base restaurée, ajout hors parcours — traversait
+/// toute la résolution sans un mot. `AudioFormat::from_extension("iso")` rend
+/// `None`, le transcodage retombe alors sur `unwrap_or(AudioFormat::Flac)`, et la
+/// sortie reçoit une image disque à la place d'un flux : la zone reste muette et
+/// rien à l'écran ne l'explique (#3234, JeromeQ, fil 1206).
+///
+/// Le chemin est un PARAMÈTRE et la décision ne lit ni la zone, ni la
+/// plateforme, ni un réglage : elle est éprouvable telle quelle.
+///
+/// Ne coûte rien hors `.iso` : l'extension est testée avant toute ouverture, et
+/// un FLAC ou un DSF ressort par le `return None` sans qu'un octet soit lu.
+pub fn refus_de_lecture(path: &Path) -> Option<&'static str> {
+    let est_iso = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"));
+    if !est_iso {
+        return None;
+    }
+    // Les deux motifs sont ceux du rapport de parcours, mot pour mot : un
+    // utilisateur qui lit « extraction impossible » dans son rapport de scan
+    // doit lire la MÊME phrase quand il clique sur l'album, sans quoi il croit
+    // à deux défauts distincts.
+    Some(if is_sacd_iso(path) {
+        MOTIF_ISO_SACD_NON_EXTRAIT
+    } else {
+        MOTIF_ISO_SANS_ZONE_SACD
+    })
 }
 
 fn find_sacd_extract() -> Option<PathBuf> {

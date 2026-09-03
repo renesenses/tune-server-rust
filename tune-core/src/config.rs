@@ -389,14 +389,125 @@ pub fn local_audio_backend_from_env() -> Option<String> {
     resolve_local_audio_backend(|key| std::env::var(key).ok())
 }
 
+/// Contrainte de plateforme qui prive le réglage « mode exclusif » de son
+/// effet.
+///
+/// #3192 — jfpaquet (Asus Essence STX II, Windows) : Tune coupe le son de
+/// toutes les autres applications, et DÉCOCHER « mode exclusif » n'y change
+/// rien. Le serveur avait raison sur le fond — un pilote ASIO ne s'ouvre pas
+/// en partagé, ça n'existe pas — mais il l'imposait EN SILENCE. Le défaut
+/// n'est pas la règle, c'est que le réglage ment : l'utilisateur décoche une
+/// case, elle reste sans effet, et rien ne le lui dit.
+///
+/// Les codes sont **stables** et destinés à la machine (le client les
+/// traduit), sur le modèle de `LocalBackendFallback` et de `runtime_reasons`
+/// du chemin du signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusiveModeConstraint {
+    /// ASIO n'a **pas** de mode partagé : le pilote se prend en entier ou pas
+    /// du tout. Ce n'est pas un choix de Tune, c'est la nature du pilote —
+    /// d'où « imposé » et non « ignoré ».
+    AsioAlwaysExclusive,
+}
+
+impl ExclusiveModeConstraint {
+    /// Code stable, celui que porte la charge utile JSON.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::AsioAlwaysExclusive => "asio_always_exclusive",
+        }
+    }
+
+    /// Phrase courte, dans la langue du chemin du signal — le serveur y écrit
+    /// déjà ses `detail` en français.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::AsioAlwaysExclusive => {
+                "ASIO prend le périphérique en exclusivité : son pilote n'a pas \
+                 de mode partagé. Les autres applications n'auront plus de son \
+                 sur ce périphérique. Pour le partager, choisissez un autre \
+                 backend (WASAPI)."
+            }
+        }
+    }
+
+    /// Toutes les variantes. Sert la contre-épreuve permanente : une
+    /// contrainte ajoutée sans code ni libellé fait tomber le test qui
+    /// parcourt cette liste.
+    pub const ALL: [Self; 1] = [Self::AsioAlwaysExclusive];
+}
+
+/// Ce que le mode exclusif VAUT réellement, à côté de ce que le réglage
+/// demande — et pourquoi, quand les deux diffèrent.
+///
+/// Additif : aucun champ ne remplace `local_exclusive_mode`, qui reste publié
+/// tel quel. Un client qui ne lit pas cette structure voit le même écran
+/// qu'avant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExclusiveModeStatus {
+    /// Ce que l'utilisateur a demandé (la case, ou le fichier de config).
+    pub requested: bool,
+    /// Ce qui sera réellement appliqué à l'ouverture du périphérique.
+    pub effective: bool,
+    /// `true` dès que la contrainte s'applique — **y compris quand la case
+    /// était déjà cochée**. C'est ce champ qui doit VERROUILLER le contrôle :
+    /// la question n'est pas « le réglage a-t-il été changé ? » mais « ce
+    /// réglage a-t-il encore un sens ? ».
+    pub forced: bool,
+    /// Pourquoi. `None` = le réglage est honoré tel quel.
+    pub reason: Option<ExclusiveModeConstraint>,
+    /// La même chose en clair, pour un écran qui n'a pas de table de
+    /// traduction.
+    pub detail: Option<&'static str>,
+}
+
+/// La règle, isolée de toute plateforme pour être vérifiable partout.
+///
+/// `on_windows` est un PARAMÈTRE, pas un `cfg!` : le chemin ASIO ne se compile
+/// et ne s'exécute que sous Windows, donc un essai entouré du même `cfg`
+/// serait vert contre rien. Même intention que le `lookup` de
+/// [`resolve_local_audio_backend`] — la règle doit être éprouvable sans
+/// dépendre de la machine qui l'éprouve.
+///
+/// Le `cfg!` reste au CÂBLAGE, dans [`local_exclusive_mode_status`].
+pub fn exclusive_mode_status(
+    backend: &str,
+    requested: bool,
+    on_windows: bool,
+) -> ExclusiveModeStatus {
+    // Hors Windows, `asio` est une valeur héritée (#1268) : aucun host ASIO ne
+    // s'y ouvre, donc rien n'est imposé et le réglage est honoré tel quel.
+    let reason = (on_windows && backend.eq_ignore_ascii_case("asio"))
+        .then_some(ExclusiveModeConstraint::AsioAlwaysExclusive);
+    let forced = reason.is_some();
+    ExclusiveModeStatus {
+        requested,
+        effective: requested || forced,
+        forced,
+        reason,
+        detail: reason.map(ExclusiveModeConstraint::detail),
+    }
+}
+
+/// Même règle, câblée sur la plateforme de ce binaire.
+pub fn local_exclusive_mode_status(backend: &str, requested: bool) -> ExclusiveModeStatus {
+    exclusive_mode_status(backend, requested, cfg!(target_os = "windows"))
+}
+
 /// ASIO est exclusif par nature : le demander implique le mode exclusif.
 ///
 /// Partagé par les deux chemins de configuration (`tune-core` et
 /// `tune-server`) pour qu'ils ne puissent pas diverger.
+///
+/// ⚠️ Ce chemin-ci — le fichier de config et l'environnement — n'a **jamais**
+/// eu de garde de plateforme, contrairement à `AppState::effective_exclusive_mode`
+/// qui en a reçu une avec #1268. Il délègue donc avec `on_windows = true`,
+/// c'est-à-dire exactement ce qu'il faisait déjà : une seule règle, une seule
+/// écriture, et l'écart entre les deux chemins devient visible ici au lieu
+/// d'être enfoui dans deux copies.
 pub fn asio_implies_exclusive(backend: &str, exclusive_mode: &mut bool) {
-    if backend.eq_ignore_ascii_case("asio") && !*exclusive_mode {
-        *exclusive_mode = true;
-    }
+    *exclusive_mode = exclusive_mode_status(backend, *exclusive_mode, true).effective;
 }
 
 fn env_str(key: &str, target: &mut String) {
@@ -548,6 +659,157 @@ mod tests {
         let mut off = false;
         asio_implies_exclusive("wasapi", &mut off);
         assert!(!off);
+    }
+
+    // -----------------------------------------------------------------
+    // #3192 — le réglage « mode exclusif » ne doit plus MENTIR.
+    //
+    // Ces essais portent sur `exclusive_mode_status`, qui prend la plateforme
+    // en paramètre. C'est délibéré : le chemin ASIO ne se compile que sous
+    // Windows, et un essai entouré du même `cfg` ne serait exécuté par aucune
+    // des cibles Linux/macOS de la CI — vert contre rien.
+    // -----------------------------------------------------------------
+
+    /// 1. ASIO + case DÉCOCHÉE : la contrainte l'emporte (c'est la nature du
+    ///    pilote), **et la raison est donnée**. C'est tout le ticket : avant,
+    ///    le premier point était vrai et le second manquait.
+    #[test]
+    fn asio_impose_l_exclusif_et_dit_pourquoi() {
+        let s = exclusive_mode_status("asio", false, true);
+        assert!(
+            s.effective,
+            "ASIO n'a pas de mode partagé : l'exclusif s'applique"
+        );
+        assert!(
+            s.forced,
+            "et le contrôle doit être annoncé comme IMPOSÉ, pas honoré"
+        );
+        assert_eq!(s.reason, Some(ExclusiveModeConstraint::AsioAlwaysExclusive));
+        let detail = s
+            .detail
+            .expect("une contrainte sans explication, c'est le défaut de #3192");
+        assert!(
+            detail.contains("WASAPI"),
+            "l'explication doit dire à l'utilisateur ce qu'il PEUT faire \
+             (changer de backend), pas seulement ce qu'il subit : {detail}"
+        );
+        assert!(
+            !s.requested,
+            "`requested` doit rester ce que l'utilisateur a demandé, sinon \
+             l'écran ne peut pas dire que son choix a été écrasé"
+        );
+    }
+
+    /// 2. WASAPI + case décochée : le réglage est honoré, rien n'est imposé,
+    ///    et le son des autres applications reste.
+    #[test]
+    fn wasapi_decoche_reste_partage() {
+        let s = exclusive_mode_status("wasapi", false, true);
+        assert!(!s.effective, "le réglage de l'utilisateur doit être honoré");
+        assert!(!s.forced);
+        assert_eq!(s.reason, None);
+        assert_eq!(s.detail, None);
+    }
+
+    /// 3. WASAPI + case cochée : l'exclusif demandé reste l'exclusif appliqué,
+    ///    et il n'est pas présenté comme imposé — l'utilisateur l'a choisi.
+    #[test]
+    fn wasapi_coche_reste_exclusif_et_choisi() {
+        let s = exclusive_mode_status("wasapi", true, true);
+        assert!(s.effective);
+        assert!(
+            !s.forced,
+            "un exclusif CHOISI ne doit pas se présenter comme subi : sinon \
+             l'écran verrouillerait une case que l'utilisateur peut décocher"
+        );
+        assert_eq!(s.reason, None);
+    }
+
+    /// 4. **Le témoin.** Hors Windows rien ne change : une valeur `asio`
+    ///    héritée d'une bibliothèque migrée (#1268) n'impose rien, parce
+    ///    qu'aucun host ASIO ne s'y ouvrira jamais.
+    #[test]
+    fn hors_windows_rien_n_est_impose() {
+        let s = exclusive_mode_status("asio", false, false);
+        assert!(
+            !s.effective,
+            "hors Windows, `asio` est une valeur morte : elle ne doit armer \
+             aucun chemin exclusif (le hog mode CoreAudio, bien réel sur macOS)"
+        );
+        assert!(!s.forced);
+        assert_eq!(s.reason, None);
+        assert_eq!(s.detail, None);
+        // Et l'exclusif explicitement demandé reste honoré, partout.
+        assert!(exclusive_mode_status("alsa", true, false).effective);
+        assert!(!exclusive_mode_status("alsa", true, false).forced);
+    }
+
+    /// La case DÉJÀ cochée sous ASIO reste `forced` : l'écran doit la
+    /// verrouiller aussi dans ce cas, sinon l'utilisateur la décoche et
+    /// retombe exactement dans le défaut.
+    #[test]
+    fn asio_deja_coche_reste_impose() {
+        let s = exclusive_mode_status("ASIO", true, true);
+        assert!(s.effective);
+        assert!(
+            s.forced,
+            "`forced` répond à « ce réglage a-t-il encore un sens ? », pas à \
+             « a-t-il été changé ? »"
+        );
+        assert!(s.requested, "et le choix de l'utilisateur reste lisible");
+    }
+
+    /// Contre-épreuve permanente : toute contrainte ajoutée doit avoir un code
+    /// distinct et une explication non vide. Une variante posée sans câblage
+    /// fait rougir ceci.
+    #[test]
+    fn toute_contrainte_a_un_code_distinct_et_une_explication() {
+        let mut codes: Vec<&str> = Vec::new();
+        for c in ExclusiveModeConstraint::ALL {
+            assert!(!c.code().is_empty(), "code vide pour {c:?}");
+            assert!(
+                c.detail().len() > 20,
+                "explication trop courte pour {c:?} : elle est destinée à un \
+                 humain qui vient de perdre le son de sa visioconférence"
+            );
+            assert!(!codes.contains(&c.code()), "code dupliqué : {}", c.code());
+            codes.push(c.code());
+        }
+        assert_eq!(codes.len(), ExclusiveModeConstraint::ALL.len());
+    }
+
+    /// Le code stable doit être celui que porte le JSON — pas une chaîne
+    /// recopiée à côté.
+    #[test]
+    fn le_code_serialise_est_le_code_stable() {
+        let s = exclusive_mode_status("asio", false, true);
+        let v = serde_json::to_value(&s).expect("le statut doit être sérialisable");
+        assert_eq!(
+            v["reason"].as_str(),
+            Some(ExclusiveModeConstraint::AsioAlwaysExclusive.code()),
+            "le client lit ce code, il ne doit pas dériver du nom Rust"
+        );
+        assert_eq!(v["forced"].as_bool(), Some(true));
+        assert_eq!(v["requested"].as_bool(), Some(false));
+        assert_eq!(v["effective"].as_bool(), Some(true));
+    }
+
+    /// Une seule règle : le raccourci historique du chemin de configuration
+    /// doit rendre exactement ce que rend la règle. S'ils divergent, un `.env`
+    /// et la page de réglages ne diront plus la même chose.
+    #[test]
+    fn asio_implies_exclusive_est_la_meme_regle() {
+        for backend in ["asio", "ASIO", "wasapi", "auto", ""] {
+            for demande in [false, true] {
+                let mut par_le_raccourci = demande;
+                asio_implies_exclusive(backend, &mut par_le_raccourci);
+                assert_eq!(
+                    par_le_raccourci,
+                    exclusive_mode_status(backend, demande, true).effective,
+                    "divergence sur ({backend:?}, {demande})"
+                );
+            }
+        }
     }
 
     #[test]

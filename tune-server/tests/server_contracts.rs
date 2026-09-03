@@ -13,6 +13,8 @@ mod annonce_forum_bornes;
 mod auth_security;
 #[path = "autoeq_import_route.rs"]
 mod autoeq_import_route;
+#[path = "bandcamp_file_de_zone_i2702.rs"]
+mod bandcamp_file_de_zone_i2702;
 #[path = "bios_bilan_visible.rs"]
 mod bios_bilan_visible;
 #[path = "bios_langue_album.rs"]
@@ -35,6 +37,8 @@ mod config_secrets_et_roles;
 mod contexte_de_session;
 #[path = "credits_enrichissement_statut.rs"]
 mod credits_enrichissement_statut;
+#[path = "crossfeed_dit_son_indisponibilite.rs"]
+mod crossfeed_dit_son_indisponibilite;
 #[path = "enrich_artiste_langue_entete.rs"]
 mod enrich_artiste_langue_entete;
 #[path = "enrichissement_repertoire.rs"]
@@ -45,12 +49,16 @@ mod eq_refus_premium_localise;
 mod etiquettes_types_et_playlists;
 #[path = "explorateur_dossiers.rs"]
 mod explorateur_dossiers;
+#[path = "extraction_cd_ne_promet_pas_ce_qu_elle_ne_fait_pas.rs"]
+mod extraction_cd_ne_promet_pas_ce_qu_elle_ne_fait_pas;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
 #[path = "favoris_cloisonnement_par_profil.rs"]
 mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
 mod favoris_facettes_routes;
+#[path = "file_promet_l_enchainement.rs"]
+mod file_promet_l_enchainement;
 #[path = "fonds_communautaire_par_mbid.rs"]
 mod fonds_communautaire_par_mbid;
 #[path = "generateur_playlists_sans_ia.rs"]
@@ -65,6 +73,8 @@ mod karaoke_plugin;
 mod licence_activation_immediate;
 #[path = "licence_grace_visible.rs"]
 mod licence_grace_visible;
+#[path = "mono_downmix_dit_son_indisponibilite.rs"]
+mod mono_downmix_dit_son_indisponibilite;
 #[path = "notarisation_bornes.rs"]
 mod notarisation_bornes;
 #[path = "nuage_limite_dit_la_limite.rs"]
@@ -95,6 +105,8 @@ mod radios_recherche_distinction;
 mod radios_validation_url;
 #[path = "rbac.rs"]
 mod rbac;
+#[path = "recherche_totaux_i3189.rs"]
+mod recherche_totaux_i3189;
 #[path = "reidentification_album.rs"]
 mod reidentification_album;
 #[path = "reprise_position_au_demarrage.rs"]

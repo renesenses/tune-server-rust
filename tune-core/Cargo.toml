@@ -219,12 +219,48 @@ postgres = ["dep:sqlx"]
 # untouched. The onnxruntime shared lib + model are provided at runtime.
 audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
 
+# #3248 : sur PostgreSQL, un INSERT conditionnel qui n'ecrit rien annulait la
+# transaction entiere, et la branche `returning` rendait `Ok(1)` en dur.
+# `autotests = false` ci-dessus — sans cette cible le fichier ne serait JAMAIS
+# compile, et la porte rendrait un vert contre rien. La garde de site et la
+# contre-epreuve SQLite s executent SANS base ; les trois epreuves PostgreSQL
+# demandent `TUNE_TEST_PG_URL` (absente = saut annonce, posee mais injoignable
+# = echec).
+[[test]]
+name = "pg_insert_conditionnel_f7c250"
+path = "tests/pg_insert_conditionnel_f7c250.rs"
+
+# #3256 : sur PostgreSQL, ` RETURNING id` etait ajoute a TOUT INSERT nu, y
+# compris vers les tables qui n'ont pas de colonne `id` (`task_runs`,
+# `streaming_auth`), et PostgreSQL refusait la requete entiere. `autotests =
+# false` ci-dessus — sans cette cible le fichier ne serait JAMAIS compile, et
+# la porte rendrait un vert contre rien. La garde de site et la contre-epreuve
+# SQLite s executent SANS base ; les quatre epreuves PostgreSQL demandent
+# `TUNE_TEST_PG_URL` (absente = saut annonce, posee mais injoignable = echec).
+[[test]]
+name = "pg_returning_id_hors_table_a_id_3256"
+path = "tests/pg_returning_id_hors_table_a_id_3256.rs"
+
 # #3205 : compteur de famine de l'anneau audio. `autotests = false` ci-dessus —
 # sans cette cible le fichier ne serait JAMAIS compile, et la porte rendrait un
 # vert contre rien.
 [[test]]
 name = "famine_anneau_i3205"
 path = "tests/famine_anneau_i3205.rs"
+
+# #3180 : une pochette de plus d un mebioctet n emporte plus le titre et l
+# artiste d un DSF. `autotests = false` ci-dessus — sans cette cible le fichier
+# ne serait JAMAIS compile, et la porte rendrait un vert contre rien.
+[[test]]
+name = "dsf_tag_volumineux_i3180_e7d445"
+path = "tests/dsf_tag_volumineux_i3180_e7d445.rs"
+
+# Meme famille que #2665 / #2890 : abonne `tracing` GLOBAL, donc un binaire a
+# lui seul et UN SEUL test dedans. Il tient les deux bords du journal du lecteur
+# de tag DSF — un tag ecarte nomme son motif, un fichier ordinaire se tait.
+[[test]]
+name = "journal_dsf_tag_ecarte_i3180_e7d445"
+path = "tests/journal_dsf_tag_ecarte_i3180_e7d445.rs"
 
 [build-dependencies]
 cc = "1"

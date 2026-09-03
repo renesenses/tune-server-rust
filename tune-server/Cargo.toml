@@ -168,6 +168,29 @@ name = "pg_routes_serveur"
 path = "tests/pg_routes_serveur.rs"
 required-features = ["postgres"]
 
+# Les deux sections d'accueil de #3181 sur PostgreSQL, et la contre-epreuve
+# SQLite dans le meme test. Cible separee de `pg_routes_serveur`, qui sonde une
+# bibliotheque VIDE et n'exige qu'un statut : celle-ci seme des lignes et exige
+# qu'elles ressortent, ce qu'un test de statut ne peut pas voir quand la panne
+# est avalee en `200 []`.
+[[test]]
+name = "pg_3181_sections_accueil"
+path = "tests/pg_3181_sections_accueil.rs"
+required-features = ["postgres"]
+
+# #2372 : la route par piste `GET /library/tracks/{id}/versions`. Ce n'est PAS
+# la route de `pg_3181_sections_accueil` — sa SQL est distincte et n'a jamais
+# porté de `DISTINCT`. Depuis ce lot, le TRI des versions descend de la requête
+# vers Rust : `ORDER BY al.title` ne range pas pareil sous la collation binaire
+# de SQLite et sous la collation locale de PostgreSQL. Cette cible sème
+# exactement les titres qui divergent et exige le même ordre des deux côtés.
+# `autotests = false` plus haut — sans cette entrée, le fichier ne serait
+# jamais compilé, donc vert contre rien.
+[[test]]
+name = "pg_2372_versions_par_piste"
+path = "tests/pg_2372_versions_par_piste.rs"
+required-features = ["postgres"]
+
 # Depuis #3039, la fenetre des ajouts recents est un parametre borne.
 [[test]]
 name = "ajouts_recents_fenetre"
@@ -178,3 +201,49 @@ path = "tests/ajouts_recents_fenetre.rs"
 [[test]]
 name = "canal_de_mise_a_jour"
 path = "tests/canal_de_mise_a_jour.rs"
+
+# #2939 : la carte de dedoublonnage du scan et la contrainte `file_path UNIQUE`
+# n'avaient pas la meme portee. `autotests = false` plus haut — sans cette
+# cible, le fichier ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "portee_unicite_file_path_2939"
+path = "tests/portee_unicite_file_path_2939.rs"
+
+# #3185 : la base ne doit plus dependre du repertoire de lancement (fil forum
+# 616). La regle et sa migration vivent hors de tout `cfg`, donc ce fichier
+# s'execute sur Linux comme sur macOS. `autotests = false` plus haut — sans
+# cette cible, il ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "base_unique_lancement_i3185"
+path = "tests/base_unique_lancement_i3185.rs"
+
+# La migration Windows vers %LOCALAPPDATA% copiait le `.db` SEUL, sans son
+# `-wal` ni son `-shm`. `autotests = false` plus haut — sans cette cible, le
+# fichier ne serait jamais compile, donc vert contre rien. Et le test lui-meme
+# ne porte AUCUN `cfg` : il eprouve sur Linux la regle et ses effets de bord,
+# que `#[cfg(target_os = "windows")]` derobait a toute machine de compilation.
+[[test]]
+name = "migration_windows_annexes_sqlite"
+path = "tests/migration_windows_annexes_sqlite.rs"
+
+# #3182 : le rapport de diagnostic se declarait « sqlite » sur toute
+# installation PostgreSQL, et « Migration version: 0 » sur une base de 77 291
+# pistes. `autotests = false` plus haut — sans cette cible, le fichier ne
+# serait jamais compile, donc vert contre rien.
+#
+# PAS de `required-features`, contrairement a `pg_routes_serveur` et
+# `pg_3181_sections_accueil` : la contre-epreuve SQLite de ce fichier ne
+# demande aucune base externe, et doit tourner dans le `cargo test --workspace`
+# ordinaire — sinon reparer PostgreSQL en cassant SQLite passerait toutes les
+# portes. Seule l'epreuve PostgreSQL porte `#[cfg(feature = "postgres")]`.
+[[test]]
+name = "pg_3182_moteur_annonce_dans_le_rapport"
+path = "tests/pg_3182_moteur_annonce_dans_le_rapport.rs"
+
+# #3226 : `sources` ne gouvernait que la boucle des services, jamais le bloc
+# `local` ni les radios — la pilule « Qobuz » rendait donc `local + qobuz`.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait jamais
+# compile, donc vert contre rien.
+[[test]]
+name = "recherche_sources_i3226"
+path = "tests/recherche_sources_i3226.rs"
