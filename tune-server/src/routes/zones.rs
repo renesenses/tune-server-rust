@@ -361,6 +361,14 @@ async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> imp
     // Headphone crossfeed config (local output only). Defaults when unset:
     // disabled, amount 0.30, delay 0.30 ms.
     let crossfeed = read_crossfeed_config(&settings, id);
+    // …et ce que ce réglage VAUT sur CETTE zone (#2742). Additif : l'objet
+    // `crossfeed` ci-dessus est publié tel quel, un client qui ignore ce
+    // champ voit le même écran qu'avant.
+    let crossfeed_status = crossfeed_status_de_zone(
+        &state.backend,
+        id,
+        crossfeed["enabled"].as_bool().unwrap_or(false),
+    );
 
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
@@ -369,12 +377,14 @@ async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> imp
             "dsp_enabled": enabled,
             "eq_profile": eq_profile.unwrap_or_default(),
             "crossfeed": crossfeed,
+            "crossfeed_status": crossfeed_status,
         }))
         .into_response(),
         Err(_) => Json(json!({
             "zone_id": id,
             "eq_profile": eq_profile.unwrap_or_default(),
             "crossfeed": crossfeed,
+            "crossfeed_status": crossfeed_status,
         }))
         .into_response(),
     }
@@ -519,6 +529,38 @@ fn read_crossfeed_config(settings: &tune_core::db::settings_repo::SettingsRepo, 
     })
 }
 
+/// Ce que le crossfeed VAUT sur cette zone-ci, à côté de ce que le réglage
+/// demande — #2742.
+///
+/// Le crossfeed n'est installé qu'à trois endroits, tous derrière la même
+/// double garde `device_id.starts_with("local:")` +
+/// `downcast_ref::<LocalOutput>()` (`orchestrator.rs` : chemin de lecture,
+/// `refresh_zone_crossfeed`, `refresh_zone_pure_dsp`). Une zone réseau n'a donc
+/// aucun chemin de code — pendant que cette route-ci offrait le réglage, le
+/// persistait, et le relisait sans un mot. Tades : « Crossfeed n'a aucune
+/// action ».
+///
+/// La règle elle-même vit dans `tune_core::audio::crossfeed` et ne lit aucune
+/// base : ici on ne fait que lui passer les deux faits qu'elle attend — la
+/// sortie de la zone et son mode PURE. Une seule règle, donc pas de dérive
+/// possible entre cet écran et le son.
+fn crossfeed_status_de_zone(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    requested: bool,
+) -> tune_core::audio::crossfeed::CrossfeedStatus {
+    let device = ZoneRepo::with_backend(backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id);
+    tune_core::audio::crossfeed::crossfeed_status(
+        requested,
+        tune_core::audio::crossfeed::crossfeed_runs_on_output(device.as_deref()),
+        tune_core::audio::audiophile::zone_enabled(backend, zone_id),
+    )
+}
+
 async fn set_zone_dsp(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -561,6 +603,9 @@ async fn set_zone_dsp(
     // amount 0..0.5, delay_ms 0..5. Persisted to `zone_{id}_crossfeed`.
     let mut crossfeed_saved: Option<Value> = None;
     let mut cf_applique_a_chaud = false;
+    // #2742 — publié dès que le corps porte un `crossfeed`, pour que la réponse
+    // au CLIC dise déjà si le réglage aura le moindre effet.
+    let mut crossfeed_status: Option<tune_core::audio::crossfeed::CrossfeedStatus> = None;
     if let Some(cf_val) = body.get("crossfeed") {
         let enabled = cf_val
             .get("enabled")
@@ -592,6 +637,22 @@ async fn set_zone_dsp(
         // `delay_ms` en ecoutant ne changeait rien avant la piste suivante
         // (#1786).
         cf_applique_a_chaud = state.orchestrator.refresh_zone_crossfeed(id).await;
+        // #2742 — et si la zone ne peut PAS faire tourner de crossfeed, le
+        // serveur le dit au lieu d'enregistrer en silence. Journalisé au
+        // moment du CLIC, pas à la lecture : c'est ici que l'utilisateur
+        // croit avoir obtenu quelque chose.
+        let statut = crossfeed_status_de_zone(&state.backend, id, enabled);
+        if statut.unavailable {
+            warn!(
+                zone_id = id,
+                requested = enabled,
+                reason = statut
+                    .reason
+                    .map(tune_core::audio::crossfeed::CrossfeedConstraint::code),
+                "zone_crossfeed_sans_effet"
+            );
+        }
+        crossfeed_status = Some(statut);
     }
 
     let preset_id = body["dsp_preset_id"].as_i64();
@@ -605,6 +666,11 @@ async fn set_zone_dsp(
         "dsp_enabled": enabled,
         "eq_profile": body.get("eq_profile"),
         "crossfeed": crossfeed_saved,
+        // #2742 — la moitié qui manquait : ce que ce réglage VAUT sur cette
+        // zone. `null` quand le corps ne portait pas de `crossfeed` (rien n'a
+        // été demandé, il n'y a rien à répondre). `unavailable: true` doit
+        // VERROUILLER le contrôle côté client, `detail` l'expliquer.
+        "crossfeed_status": crossfeed_status,
         // Meme contrat que `POST /zones/{id}/eq` : vrai quand le reglage vient
         // d'atteindre le son d'un flux en cours. Faux ne signale PAS un echec
         // (rien ne joue, zone non locale, mode PURE) — c'est ce qui permet a un
