@@ -27,6 +27,8 @@ mod bump_natifs_android;
 mod cles_developpeur_persistance;
 #[path = "collections_couleur_persistee.rs"]
 mod collections_couleur_persistee;
+#[path = "collections_ids_orphelins.rs"]
+mod collections_ids_orphelins;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
 #[path = "compilation_dans_les_reponses_album.rs"]
