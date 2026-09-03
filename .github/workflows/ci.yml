@@ -217,7 +217,35 @@ jobs:
       #
       # Garde : `le_job_test_de_la_ci_active_bandcamp`
       # (tune-server/tests/workflows_bornes.rs).
-      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay,bandcamp
+      #
+      # #3266 — les sept caisses qui suivent n'etaient nommees par AUCUNE porte
+      # `cargo test` du depot. Croisement du 03/09/2026 : quatorze membres au
+      # manifeste, sept `-p`. `tune-bandcamp`, `tune-karaoke`, `tune-dj`,
+      # `tune-concerts`, `tune-plugin-runtime-wasm`, `tune-cli` et `tune-ffi`
+      # n'apparaissaient que sur des lignes `cargo clippy` ou `cargo check` :
+      # lues, jamais EXECUTEES. Leurs tests ne tournaient que sous
+      # `cargo test --workspace`, que la CI ne joue nulle part — verts par
+      # accident.
+      #
+      # Le cout le plus visible : les deux gardes de site par `include_str!`
+      # ecrites pour #2778 (`plugins/tune-bandcamp/src/lib.rs`). Une garde de
+      # site existe pour crier quand un motif interdit revient dans le code de
+      # production ; celles-la ne pouvaient pas crier.
+      #
+      # `tune-bandcamp` etait deja COMPILEE ici (`--features bandcamp` tire
+      # `dep:tune-bandcamp`) — mais compiler n'est pas executer : sans son
+      # propre `-p`, cargo ne lance pas son binaire de test.
+      #
+      # Rien de nouveau a installer sur ce runner : aucune de ces caisses ne
+      # tire l'audio ni le systeme. Elles declarent axum, serde, serde_json,
+      # reqwest, tokio, tracing, async-trait, clap (tune-cli) et wasmtime
+      # (tune-plugin-runtime-wasm, sans composant ni async). `local-audio`
+      # reste absent : `tune-ffi` prend `tune-server` en
+      # `default-features = false`, et la porte n'active pas la feature.
+      #
+      # Garde : `toute_caisse_du_workspace_est_nommee_par_une_porte_cargo_test`
+      # (tune-server/tests/workflows_bornes.rs).
+      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge -p tune-cli -p tune-ffi -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,cloud-relay,bandcamp
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
