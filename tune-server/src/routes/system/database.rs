@@ -9,7 +9,6 @@ use serde_json::{Value, json};
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
-use tune_core::db::migrations;
 use tune_core::db::track_repo::TrackRepo;
 
 use crate::error::AppError;
@@ -18,13 +17,20 @@ use crate::state::AppState;
 pub(super) async fn database_status(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    // The migration version is a SQLite notion; PG tracks its own and reports 0.
-    let version = state
-        .db
-        .as_ref()
-        .and_then(|db| migrations::current_version(db).ok())
-        .unwrap_or(0);
-    let latest = migrations::latest_version();
+    // #3182 : le commentaire d'origine — « the migration version is a SQLite
+    // notion; PG tracks its own and reports 0 » — décrivait le défaut au lieu
+    // de le corriger. PostgreSQL tient bien SA table `schema_version`, elle est
+    // lisible, et « 0 » face à un `latest` SQLite rendait `up_to_date: false`
+    // à demeure sur une base parfaitement à jour.
+    let engine = state.backend.engine();
+    let version = super::version_de_schema(&state);
+    let latest = super::version_de_schema_cible(engine);
+    // `null` quand l'un des deux manque : une comparaison impossible ne rend
+    // pas `false`, elle ne rend rien.
+    let up_to_date = match (version, latest) {
+        (Some(v), Some(l)) => Some(v >= l),
+        _ => None,
+    };
     let row = state.backend.query_one(
         "SELECT \
          (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
@@ -42,12 +48,11 @@ pub(super) async fn database_status(
         })
         .unwrap_or((0, 0, 0));
 
-    let engine_name = format!("{:?}", state.backend.engine()).to_lowercase();
     Ok(Json(json!({
-        "engine": engine_name,
+        "engine": engine.as_str(),
         "migration_version": version,
         "latest_version": latest,
-        "up_to_date": version >= latest,
+        "up_to_date": up_to_date,
         "artists": artists,
         "albums": albums,
         "tracks": tracks,

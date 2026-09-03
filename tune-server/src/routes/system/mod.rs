@@ -23,7 +23,13 @@ mod playlist_hub;
 mod plugins;
 mod profile;
 mod remote;
-pub(crate) mod scan;
+// `pub` et non `pub(crate)` : la décision « insertion ou mise à jour »
+// (`verdict_ecriture`) doit être atteignable depuis un test d'intégration, qui
+// est une caisse EXTERNE. Sans cette couture, le garde de #2939 aurait dû
+// recopier la règle au lieu de l'appeler — un test qui réplique le code ne le
+// garde pas. Les items du module restent `pub(crate)` sauf ceux exposés
+// expressément.
+pub mod scan;
 mod tags;
 pub(crate) mod update;
 mod youtube;
@@ -342,6 +348,70 @@ async fn recommendations_generate_handler(
             "count": recs.len(),
         })),
         Err(e) => axum::Json(serde_json::json!({"recommendations": [], "error": e})),
+    }
+}
+
+/// La version de schéma RÉELLEMENT appliquée par la base active, quel que
+/// soit le moteur. `None` quand elle n'a pas pu être lue.
+///
+/// **`None` et pas `0`, et c'est tout le sujet de #3182.** Les trois rapports
+/// — `/system/diagnostics`, `/system/bug-report` et `/system/database/status`
+/// — calculaient cette valeur par `if engine == Sqlite { … } else { 0 }`.
+/// Sur PostgreSQL ils annonçaient donc « Migration version: 0 », qui ne se lit
+/// pas « inconnue » mais « base jamais migrée » : c'est ce que le rapport de
+/// jfpaquet disait de sa base de 77 291 pistes, et cette ligne a failli faire
+/// écarter #3181 — une issue qui n'existe QUE parce que le moteur est
+/// PostgreSQL.
+///
+/// Chaque moteur tient sa propre table :
+///
+/// - SQLite : `schema_migrations`, lue par `migrations::current_version` ;
+/// - PostgreSQL : `schema_version`, que `migrations::run_pg_migrations`
+///   alimente à chaque script appliqué.
+///
+/// Un `MAX(version)` NUL (table présente mais vide) reste `None` : il vaut
+/// « rien d'appliqué, ou rien de lisible », et le rendre en `0` remplacerait
+/// un mensonge par l'autre. La lecture passe par `state.backend`, donc
+/// par le pool réellement ouvert — pas par `state.db`, qui est `None` dès que
+/// le serveur ne tourne pas sur SQLite.
+pub(crate) fn version_de_schema(state: &AppState) -> Option<i32> {
+    match state.backend.engine() {
+        tune_core::db::engine::Engine::Sqlite => state
+            .db
+            .as_ref()
+            .and_then(|db| tune_core::db::migrations::current_version(db).ok()),
+        tune_core::db::engine::Engine::Postgres => state
+            .backend
+            .query_one("SELECT MAX(version) FROM schema_version", &[])
+            .ok()
+            .flatten()
+            .and_then(|ligne| ligne.first().and_then(|v| v.as_i64()))
+            .and_then(|v| i32::try_from(v).ok()),
+    }
+}
+
+/// La version de schéma que le binaire SAIT appliquer, pour le moteur actif.
+///
+/// Pendant du dessus, et même règle : `None` plutôt qu'un chiffre emprunté à
+/// l'autre moteur. Les deux listes de migrations sont distinctes et ne se
+/// suivent pas — comparer la version PostgreSQL d'une base au dernier numéro
+/// SQLite du binaire, ce que faisait `/system/database/status`, produisait un
+/// `up_to_date: false` permanent sur une base parfaitement à jour.
+pub(crate) fn version_de_schema_cible(engine: tune_core::db::engine::Engine) -> Option<i32> {
+    match engine {
+        tune_core::db::engine::Engine::Sqlite => Some(tune_core::db::migrations::latest_version()),
+        // Sans la feature `postgres` le binaire n'embarque aucun script PG :
+        // il n'a alors rien à dire sur la cible, et le dit.
+        tune_core::db::engine::Engine::Postgres => {
+            #[cfg(feature = "postgres")]
+            {
+                Some(tune_core::db::migrations::pg_latest_version())
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                None
+            }
+        }
     }
 }
 

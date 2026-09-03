@@ -217,7 +217,19 @@ mod like_escape_tests {
 pub mod sql {
     use super::SqlDialect;
 
-    pub fn select_track() -> &'static str {
+    /// Le corps `FROM` des requêtes de pistes, sans la projection.
+    ///
+    /// Isolé pour que les COMPTAGES portent les MÊMES jointures que la liste
+    /// qu'ils comptent — le prédicat de recherche lit `ar.name` et `al.year`,
+    /// il ne tient pas sur `tracks` seul — sans traîner les 31 colonnes.
+    /// Les trois jointures sont des `LEFT JOIN` sur une clé primaire : elles ne
+    /// peuvent pas multiplier une ligne, donc `COUNT(*)` sur ce `FROM` compte
+    /// bien des PISTES.
+    pub fn track_from() -> &'static str {
+        " FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN artists aal ON al.artist_id = aal.id"
+    }
+
+    pub fn select_track() -> String {
         // `album_artist` falls back to the album's canonical artist (`albums.
         // artist_id`, e.g. "Various Artists" for a compilation) when the per-file
         // ALBUMARTIST tag is missing. Without this, the Oxygen "by genre" view —
@@ -225,7 +237,10 @@ pub mod sql {
         // no album_artist to key on and shows track 1's artist for compilations
         // whose files carry no ALBUMARTIST tag (Bilou). The column keeps its
         // position, so row parsing is unchanged.
-        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN artists aal ON al.artist_id = aal.id"
+        format!(
+            "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments{}",
+            track_from()
+        )
     }
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
@@ -448,8 +463,31 @@ pub mod sql {
         "SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL"
     }
 
-    pub fn get_all_local_file_info() -> &'static str {
-        "SELECT id, file_path, file_mtime, file_size FROM tracks WHERE source = 'local' AND file_path IS NOT NULL"
+    /// Qui possède déjà ce `file_path` ? **Toutes sources confondues.**
+    ///
+    /// La portée de cette requête doit être celle de la contrainte qui va
+    /// trancher l'écriture, et cette contrainte est `file_path TEXT UNIQUE`
+    /// sur la table ENTIÈRE (`sqlite.rs`, `pg_migrate.rs`) — sans la moindre
+    /// condition sur `source`. Un `WHERE source = 'local'` ici rendait la
+    /// carte aveugle à des lignes que la base, elle, voyait parfaitement :
+    /// le scan les envoyait à l'INSERTION, et l'insertion se faisait refuser
+    /// (#2939).
+    ///
+    /// `source` fait partie du résultat parce que les consommateurs n'ont pas
+    /// tous la même question. « Qui possède ce chemin ? » se pose sur toute la
+    /// table ; « qu'ai-je le droit de retirer ? » ne se pose que sur les
+    /// lignes que le scan a lui-même posées. Le second filtre ici,
+    /// explicitement, au lieu de compter sur une requête qui ne dit pas
+    /// laquelle des deux questions elle répond.
+    pub fn get_all_file_info_by_path() -> &'static str {
+        "SELECT id, file_path, file_mtime, file_size, source FROM tracks WHERE file_path IS NOT NULL"
+    }
+
+    pub fn adopter_en_local<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET source = 'local' WHERE id = {} AND source <> 'local'",
+            d.placeholder(1)
+        )
     }
 
     pub fn get_existing_audio_hash_album_pairs() -> &'static str {
@@ -463,20 +501,62 @@ pub mod sql {
            AND album_id IS NOT NULL AND file_path IS NOT NULL"
     }
 
-    /// Engine-agnostic search.
+    /// Le PRÉDICAT de la recherche de pistes, sans projection ni bornes.
+    ///
+    /// Extrait pour que la LISTE rendue et le COMPTE annoncé portent
+    /// littéralement le même filtre : deux rédactions divergentes feraient
+    /// annoncer un total qui n'est le total de rien (#3189).
+    ///
     /// Le OU des critères est PARENTHÉSÉ pour recevoir le filtre « pas dans
     /// un album masqué » en ET — appliqué APRÈS la passe FTS, les index
     /// `tracks_fts` contiennent tout (#1391).
-    pub fn search<D: SqlDialect>(d: &D) -> String {
+    ///
+    /// Emplacements 1..=5 : requête FTS, puis trois `LIKE`, puis l'année.
+    pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE ({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {} LIMIT {}",
-            select_track(),
+            "({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {}",
             d.fts_where("tracks", "t", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
             crate::db::facet_filter::hidden_tracks_excluded(),
+        )
+    }
+
+    /// Engine-agnostic search, PAGINÉE.
+    ///
+    /// `ORDER BY t.id` est un ordre TOTAL — `tracks.id` est la clé primaire.
+    /// Sans lui, aucun des deux moteurs ne promet un ordre stable d'un appel
+    /// à l'autre : une même ligne pourrait revenir page 2 après être passée
+    /// page 1, et une autre ne jamais paraître. La requête n'en portait AUCUN
+    /// avant #3189 — ce qui était sans conséquence tant qu'il n'existait
+    /// qu'une seule page.
+    ///
+    /// Emplacements 6 et 7 : `LIMIT` et `OFFSET`.
+    pub fn search<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE {} ORDER BY t.id LIMIT {} OFFSET {}",
+            select_track(),
+            search_where(d),
+            d.placeholder(6),
+            d.placeholder(7),
+        )
+    }
+
+    /// Le NOMBRE de pistes que [`search`] parcourrait, borné.
+    ///
+    /// La borne est dans la sous-requête, pas autour du `COUNT` : un
+    /// `COUNT(*) … LIMIT n` compterait TOUT puis bornerait la ligne unique du
+    /// résultat, ce qui ne borne rien. Ici le moteur cesse de lire dès la
+    /// n-ième ligne trouvée, et le total rendu vaut alors « au moins n ».
+    ///
+    /// Emplacement 6 : le plafond.
+    pub fn search_count<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM (SELECT t.id{} WHERE {} LIMIT {}) AS borne",
+            track_from(),
+            search_where(d),
             d.placeholder(6),
         )
     }
@@ -546,6 +626,37 @@ pub(crate) const ID_INLINE_BATCH: usize = 5_000;
 /// (~205 pistes en base pour ~779 sur le disque, JP Borderies). Même patron
 /// que `scan_walk_errors_truncated` dans `scanner::walker`.
 const ECHECS_DETAILLES: usize = 10;
+
+/// Ce que la base sait déjà du fichier qui vit à un `file_path` donné.
+///
+/// Rendue par [`TrackRepo::get_all_file_info_by_path`], une entrée par chemin —
+/// la contrainte `file_path TEXT UNIQUE` garantit qu'il ne peut y en avoir
+/// qu'une.
+///
+/// `source` est porté jusqu'ici **exprès**. La carte couvre toute la table,
+/// parce que c'est la portée de la contrainte qui va accepter ou refuser
+/// l'écriture ; mais tout consommateur n'a pas le droit d'en faire le même
+/// usage. La purge de fin de scan, en particulier, ne doit retirer que des
+/// lignes `source = 'local'`, et elle le décide en lisant ce champ plutôt qu'en
+/// espérant qu'une requête ait filtré pour elle (#2939).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InfoFichier {
+    /// `tracks.id` de la ligne qui possède ce chemin.
+    pub id: i64,
+    /// `file_mtime` enregistré au dernier scan, s'il l'a été.
+    pub mtime: Option<f64>,
+    /// `file_size` enregistré au dernier scan, s'il l'a été.
+    pub taille: Option<i64>,
+    /// `tracks.source` de la ligne : `local`, ou l'importateur qui l'a posée.
+    pub source: String,
+}
+
+impl InfoFichier {
+    /// La ligne appartient-elle au scan ? Seules celles-là sont purgeables.
+    pub fn est_locale(&self) -> bool {
+        self.source == "local"
+    }
+}
 
 pub struct TrackRepo {
     db: Arc<dyn DbBackend>,
@@ -1237,13 +1348,47 @@ impl TrackRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, TuneError> {
+        self.search_page(query, limit, 0)
+    }
+
+    /// Une PAGE de la recherche : `limit` pistes à partir de `offset`.
+    ///
+    /// L'ordre est total (voir [`sql::search`]) : parcourir 0, `limit`,
+    /// 2·`limit`… rend chaque piste correspondante une fois et une seule.
+    pub fn search_page(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Track>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
         let trimmed = query.trim();
+        let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 6] = [&fts_query, &like, &like, &like, &trimmed, &limit];
+        let params: [&dyn ToSqlValue; 7] =
+            [&fts_query, &like, &like, &like, &trimmed, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// Le nombre de pistes que [`Self::search_page`] parcourrait, borné à
+    /// `plafond`.
+    ///
+    /// Ce n'est PAS la longueur d'une liste rendue : c'est un `COUNT` sur le
+    /// même prédicat, indépendant de `limit`. Un résultat égal à `plafond`
+    /// signifie « au moins `plafond` », jamais « exactement ».
+    pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
+        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
+        let like = format!("%{query}%");
+        let trimmed = query.trim();
+        let sql = self.dialect_sql(sql::search_count, sql::search_count);
+        let params: [&dyn ToSqlValue; 6] = [&fts_query, &like, &like, &like, &trimmed, &plafond];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
     }
 
     pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, TuneError> {
@@ -1845,21 +1990,63 @@ impl TrackRepo {
             .collect())
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn get_all_local_file_info(
-        &self,
-    ) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, TuneError> {
-        let rows = self.db.query_many(sql::get_all_local_file_info(), &[])?;
+    /// La carte `file_path` → ligne qui le possède, **toutes sources**.
+    ///
+    /// Voir [`sql::get_all_file_info_by_path`] pour la raison — c'est la
+    /// portée de `file_path TEXT UNIQUE`, et rien d'autre ne peut décider si
+    /// un fichier rencontré par le scan est une insertion ou une mise à jour.
+    pub fn get_all_file_info_by_path(&self) -> Result<HashMap<String, InfoFichier>, TuneError> {
+        let rows = self.db.query_many(sql::get_all_file_info_by_path(), &[])?;
         Ok(rows
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first().and_then(|v| v.as_i64())?;
                 let path = cols.get(1).and_then(|v| v.as_string())?;
                 let mtime = cols.get(2).and_then(|v| v.as_f64());
-                let size = cols.get(3).and_then(|v| v.as_i64());
-                Some((path, (id, mtime, size)))
+                let taille = cols.get(3).and_then(|v| v.as_i64());
+                // Une ligne sans `source` n'existe pas (colonne NOT NULL
+                // DEFAULT 'local'), mais un moteur qui rendrait NULL ne doit
+                // pas faire passer la ligne pour locale : « inconnue » est le
+                // choix sûr, il ne donne aucun droit de purge.
+                let source = cols
+                    .get(4)
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_else(|| "inconnue".to_string());
+                Some((
+                    path,
+                    InfoFichier {
+                        id,
+                        mtime,
+                        taille,
+                        source,
+                    },
+                ))
             })
             .collect())
+    }
+
+    /// Le scan prend possession des lignes qu'il vient de relire sur le disque.
+    ///
+    /// Une ligne posée par un importateur de bibliothèque (`roon_import`,
+    /// `plex_import`, `jriver`) décrit un fichier local ; dès que le scan l'a
+    /// rouverte et remise à jour depuis ses balises, elle EST une piste locale.
+    /// Sans cette adoption, elle resterait invisible à toutes les requêtes de
+    /// tenue de compte du scan — dont la purge — et le désaccord de portée que
+    /// corrige #2939 se rejouerait à chaque scan suivant.
+    ///
+    /// `AND source <> 'local'` : une ligne déjà locale n'est pas touchée, donc
+    /// le compte rendu est le nombre d'adoptions RÉELLES.
+    pub fn adopter_en_local(&self, ids: &[i64]) -> Result<usize, TuneError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let sql = self.dialect_sql(sql::adopter_en_local, sql::adopter_en_local);
+        let mut adoptees = 0usize;
+        for id in ids {
+            let params: [&dyn ToSqlValue; 1] = [id];
+            adoptees += self.db.execute(&sql, &params)?;
+        }
+        Ok(adoptees)
     }
 
     /// List all local tracks (with file_path set). Used by rescan-metadata to
@@ -2590,6 +2777,82 @@ mod tests {
                 best * 1e6 / n as f64
             );
         }
+    }
+
+    /// #3189 — la requête paginée doit porter un ordre TOTAL, et le compte le
+    /// MÊME prédicat que la liste.
+    ///
+    /// Garde de TEXTE, délibérément, et voici pourquoi : le garde de
+    /// comportement existe (`tune-server/tests/recherche_totaux_i3189.rs`, la
+    /// pagination sans doublon ni trou) mais il ne mord pas sur SQLite —
+    /// mesuré le 02/09/2026 : `ORDER BY t.id` retiré, les six tests restent
+    /// verts, parce que le plan de SQLite rend de toute façon les lignes dans
+    /// l'ordre des `rowid`. PostgreSQL, lui, ne promet rien de tel, et c'est
+    /// précisément le moteur de jfpaquet. Sans cette assertion, l'`ORDER BY`
+    /// pourrait disparaître sans qu'aucune porte locale rougisse.
+    #[test]
+    fn la_recherche_paginee_porte_un_ordre_total_et_le_compte_le_meme_predicat() {
+        for sql in [sql::search(&SqliteDialect), sql::search(&PostgresDialect)] {
+            assert!(
+                sql.contains("ORDER BY t.id"),
+                "sans ordre total, une page peut redonner ce que la précédente \
+                 a déjà rendu : {sql}"
+            );
+            assert!(
+                sql.contains("OFFSET"),
+                "la recherche doit être paginable : {sql}"
+            );
+        }
+        // Le compte et la liste partagent LITTÉRALEMENT le prédicat : deux
+        // rédactions divergentes feraient annoncer le total de rien.
+        let sqlite = sql::search_where(&SqliteDialect);
+        assert!(sql::search(&SqliteDialect).contains(&sqlite));
+        assert!(sql::search_count(&SqliteDialect).contains(&sqlite));
+        let postgres = sql::search_where(&PostgresDialect);
+        assert!(sql::search(&PostgresDialect).contains(&postgres));
+        assert!(sql::search_count(&PostgresDialect).contains(&postgres));
+        // La borne est DANS la sous-requête : autour du COUNT, elle ne
+        // bornerait rien du tout.
+        assert!(
+            sql::search_count(&PostgresDialect).ends_with("LIMIT $6) AS borne"),
+            "{}",
+            sql::search_count(&PostgresDialect)
+        );
+    }
+
+    /// #3189 — le compte est le nombre de correspondances, pas la longueur de
+    /// la liste, et la pagination ne perd ni ne double aucune ligne.
+    #[test]
+    fn le_compte_et_la_pagination_de_la_recherche() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        for i in 0..37 {
+            let mut t = Track::new(format!("Autumn Leaves {i:03}"));
+            t.file_path = Some(format!("/autumn-{i:03}.flac"));
+            repo.create(&t).unwrap();
+        }
+        // Du bruit, pour qu'un compte de la table entière se voie.
+        for i in 0..11 {
+            let mut t = Track::new(format!("Winter Sun {i:03}"));
+            t.file_path = Some(format!("/winter-{i:03}.flac"));
+            repo.create(&t).unwrap();
+        }
+
+        assert_eq!(repo.search("Autumn", 10).unwrap().len(), 10);
+        assert_eq!(repo.search_count("Autumn", 1_000).unwrap(), 37);
+        // Le témoin : sous le plafond, le compte est exact ; il n'a pas
+        // ramassé les onze pistes hors sujet.
+        assert_eq!(repo.search_count("Winter", 1_000).unwrap(), 11);
+        // Et le plafond borne VRAIMENT — « au moins 5 ».
+        assert_eq!(repo.search_count("Autumn", 5).unwrap(), 5);
+
+        let mut vus = std::collections::HashSet::new();
+        for offset in [0, 10, 20, 30] {
+            for t in repo.search_page("Autumn", 10, offset).unwrap() {
+                assert!(vus.insert(t.id.unwrap()), "piste rendue deux fois");
+            }
+        }
+        assert_eq!(vus.len(), 37, "le parcours doit rendre l'ensemble");
     }
 
     #[test]

@@ -720,10 +720,7 @@ pub(crate) mod decisions {
         if output_type != "dlna" {
             return false;
         }
-        let is_dsd = current_format.is_some_and(|f| {
-            let f = f.to_lowercase();
-            f.contains("dsd") || f.contains("dsf") || f.contains("dff")
-        });
+        let is_dsd = current_format.is_some_and(crate::playback::gapless::est_dsd);
         is_dsd && peak_reached_end(track_duration_ms, peak_position_ms)
     }
 
@@ -740,6 +737,30 @@ pub(crate) mod decisions {
     /// Without this the queue advanced only after half of each track's DURATION
     /// had elapsed, and a rip ran at half of listening speed instead of network
     /// speed.
+    ///
+    /// # `peak_reached_end` était écrit pour Jean Valjean, et ne l'atteignait pas (#3229)
+    ///
+    /// [`peak_reached_end`] n'avait qu'UN appelant de production : la branche
+    /// `status.ended_naturally` du bras `Stopped`, dont le commentaire dit
+    /// lui-même « Local outputs (WASAPI/ALSA/CoreAudio) signal ended_naturally
+    /// when the audio stream reaches EOF ». Or **DLNA ne rend JAMAIS
+    /// `ended_naturally`** — c'est écrit noir sur blanc dans
+    /// [`dlna_dsd_reached_end`], qui n'existe que pour cette raison. Le seul
+    /// autre usage, [`dlna_dsd_reached_end`], est réservé au DSD.
+    ///
+    /// Le correctif écrit POUR le signalement de Jean Valjean ne mordait donc
+    /// sur aucune zone DLNA en PCM/FLAC : là, la fin de piste retombe ici,
+    /// après `STOPPED_TICKS_THRESHOLD` sondes `Stopped`. Et ici, `played_enough`
+    /// exige un plancher d'horloge murale que l'avance gapless vient justement
+    /// de fausser (elle remet `track_started_at`) — la vraie fin était rejetée,
+    /// et la zone partait vers la branche d'ÉCHEC qui l'arrête.
+    ///
+    /// `peak_reached_end` est la même mesure que `played_enough` SANS ce
+    /// plancher d'horloge, et elle reste plus étroite que lui sur les deux
+    /// autres axes : elle exige une durée connue (`> 0`) et le même
+    /// [`MIN_PLAYED_FRACTION`]. L'ajouter ici ne change RIEN au calendrier — on
+    /// est toujours après les cinq sondes `Stopped` — mais change le VERDICT :
+    /// une piste dont le pic a atteint sa fin est une fin, pas une panne.
     pub fn natural_end(
         played_enough: bool,
         repeat_active: bool,
@@ -753,6 +774,10 @@ pub(crate) mod decisions {
             track_duration_ms > 0 && track_duration_ms < MIN_TRACK_WALL_SECS * 1000;
         let repeat_end = repeat_active && peak_position_ms > 5_000;
         played_enough
+            // Le pic a atteint la fin : la piste est finie, quoi qu'en dise
+            // l'horloge murale. C'est ce qui branche enfin le correctif sur le
+            // chemin DLNA — le seul que Jean Valjean ait jamais emprunté.
+            || peak_reached_end(track_duration_ms, peak_position_ms)
             || repeat_end
             || (ended_naturally
                 && (!realtime || ended_naturally_wall_ok(wall_elapsed, track_duration_ms)))
@@ -4054,8 +4079,15 @@ impl PositionPoller {
                 } else {
                     status.position_ms as i64
                 };
-                self.playback.update_position(zone_id, reported).await;
-                self.playback.emit_position(zone_id, reported);
+                // La garde de monotonie vit dans `update_position` : elle sait,
+                // elle, quels chemins ont le droit d'abaisser le plancher (une
+                // COMMANDE — déplacement, changement de piste, avance gapless —
+                // et jamais une observation). Elle rend la position RETENUE, et
+                // c'est celle-là qu'il faut émettre : émettre `reported` ferait
+                // diverger l'évènement `position` de l'état servi par
+                // `GET /zones`, et l'écran reculerait quand même (#3229).
+                let publiee = self.playback.update_position(zone_id, reported).await;
+                self.playback.emit_position(zone_id, publiee);
             }
 
             // Sync volume from device (skip if fixed_volume)
@@ -6099,8 +6131,7 @@ impl PositionPoller {
                     // output keeps its internal DSD gapless chain untouched.
                     if output.output_type() == "dlna" {
                         let url_lc = resolved.url.to_lowercase();
-                        let next_is_dsd = resolved.mime_type.contains("dsd")
-                            || resolved.mime_type.contains("dsf")
+                        let next_is_dsd = crate::playback::gapless::est_dsd(&resolved.mime_type)
                             || url_lc.ends_with(".dsf")
                             || url_lc.ends_with(".dff");
                         if next_is_dsd {
@@ -7448,6 +7479,50 @@ mod tests {
         assert!(!decisions::natural_end(
             false, false, 0, false, 0, 300_000, true
         ));
+    }
+
+    /// #3229 — la fin de piste vue par le pic vaut AUSSI sur le chemin DLNA.
+    ///
+    /// Jean Valjean, fil 893 : `peak = durée + 5000 ms`, six fois dans ses
+    /// journaux. `peak_reached_end` a été écrit pour cette signature-là — et son
+    /// unique appelant de production était la branche `status.ended_naturally`,
+    /// que **DLNA ne lève jamais** (c'est la raison d'être de
+    /// `dlna_dsd_reached_end`, qui ne couvre que le DSD). Une zone DLNA en
+    /// PCM/FLAC retombait donc ici, sur `natural_end`, où `played_enough` exige
+    /// un plancher d'horloge murale que l'avance gapless vient de fausser : la
+    /// vraie fin était rejetée et la zone partait vers la branche d'ÉCHEC.
+    #[test]
+    fn natural_end_reconnait_le_pic_sur_le_chemin_dlna() {
+        // Signature exacte du fil 893 : le pic dépasse la durée de 5 s.
+        let dur = 714_906u64;
+        let peak = 719_906u64;
+
+        // L'horloge murale a été remise par une avance gapless : elle
+        // sous-compte, et le prédicat qui en dépend rejette une piste finie.
+        assert!(
+            !decisions::played_enough(dur, peak, 2),
+            "témoin : c'est bien l'horloge murale faussée qui rejetait la fin"
+        );
+
+        // DLNA ne rend pas `ended_naturally` (4ᵉ argument à false) et la piste
+        // n'est pas courte. Avant #3229, aucune clause ne mordait ici.
+        assert!(
+            decisions::natural_end(false, false, peak, false, 2, dur, true),
+            "sur DLNA, un pic qui a atteint la fin de la piste EST une fin \
+             naturelle — sinon la zone est arrêtée comme si elle avait \
+             échoué (#3229)"
+        );
+
+        // Et la garde reste étroite : elle n'accepte pas une piste à peine
+        // commencée, ni une durée inconnue.
+        assert!(
+            !decisions::natural_end(false, false, 30_000, false, 2, dur, true),
+            "un pic à 30 s sur une piste de 12 min n'est pas une fin"
+        );
+        assert!(
+            !decisions::natural_end(false, false, 500_000, false, 2, 0, true),
+            "durée inconnue : aucun pic ne prouve une fin"
+        );
     }
 
     // DSD-over-DLNA end-of-track fast path (Benjithom, RS130: ~5s gap between DSD
@@ -10444,6 +10519,53 @@ mod canal_radio_guard {
             !code_de_production().contains("stream_id: None,\n                            ..Default::default()\n                        };\n                        self.playback.play(zone_id, np).await;"),
             "le `stream_id: None` en dur est revenu dans la reprise depuis \
              l'appareil (#2991)."
+        );
+    }
+}
+
+/// #3229 — le sondeur doit ÉMETTRE la position qu'il a fait publier.
+///
+/// La garde de monotonie vit dans `PlaybackManager::update_position`, qui rend
+/// la position retenue. Deux surfaces portent cette position jusqu'à l'écran, et
+/// elles sont écrites l'une sous l'autre : l'état de zone (`GET /zones`) et
+/// l'évènement `position`. Réémettre la valeur BRUTE au lieu de la valeur
+/// retenue rendrait la garde inopérante là où elle compte le plus — le curseur
+/// reculerait quand même, pendant que l'API dirait le contraire.
+///
+/// Aucune épreuve de comportement ne peut voir cet écart-là : les deux appels
+/// réussissent, avec des valeurs différentes. On relit donc la source, même
+/// procédé et même raison que `canal_radio_guard` ci-dessus.
+#[cfg(test)]
+mod position_publiee_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe à ce module pour que
+    /// les motifs cherchés ne puissent pas se trouver eux-mêmes dans les
+    /// messages d'assertion ci-dessous (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("poller.rs");
+        const BORNE: &str = "mod position_publiee_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    #[test]
+    fn l_evenement_position_porte_la_valeur_retenue_par_la_garde() {
+        let code = code_de_production();
+        assert!(
+            code.contains("let publiee = self.playback.update_position(zone_id, reported).await;"),
+            "le sondeur doit RECUEILLIR la position retenue par la garde de \
+             monotonie (#3229)."
+        );
+        assert!(
+            code.contains("self.playback.emit_position(zone_id, publiee);"),
+            "l'évènement `position` doit porter la valeur retenue, pas la valeur \
+             brute du renderer : sinon l'écran recule quand même et l'état de \
+             zone le contredit (#3229)."
+        );
+        assert!(
+            !code.contains("self.playback.emit_position(zone_id, reported);"),
+            "la valeur brute est revenue dans l'évènement `position` (#3229)."
         );
     }
 }

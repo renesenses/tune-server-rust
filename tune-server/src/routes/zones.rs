@@ -230,6 +230,7 @@ fn inject_device_identity(
     obj: &mut serde_json::Map<String, Value>,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     zone_id: i64,
+    output_device_id: Option<&str>,
     detected: Option<&tune_core::discovery::device::DiscoveredDevice>,
 ) {
     let settings = SettingsRepo::with_backend(backend.clone());
@@ -287,6 +288,26 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("mono_downmix".into(), json!(mono_downmix));
+    // #3254 — …et ce que ce réglage VAUT sur cette zone-ci. Le champ ci-dessus
+    // était accepté et relu pour n'importe quelle zone, alors que les trois
+    // seuls sites qui poussent le repli exigent une sortie `local:` et un
+    // `LocalOutput` : sur une zone réseau, accepté, persisté, relu… et sans
+    // effet. Le chemin du signal disait déjà la vérité (`zone_mono_downmix_step`
+    // rend `None` hors sortie locale) ; c'est le RÉGLAGE qui se taisait.
+    //
+    // Strictement ADDITIF : `mono_downmix` reste publié tel quel, à sa valeur
+    // persistée. Un client qui ne lit pas ce statut voit le même écran qu'avant.
+    // Même vocabulaire que `local_exclusive_mode_status` (#3192) : `reason`
+    // stable pour la machine, `detail` en clair pour un écran sans table de
+    // traduction.
+    obj.insert(
+        "mono_downmix_status".into(),
+        json!(tune_core::audio::mono_downmix::mono_downmix_status(
+            mono_downmix,
+            tune_core::audio::mono_downmix::mono_downmix_runs_on_output(output_device_id),
+            tune_core::audio::audiophile::zone_enabled(backend, zone_id),
+        )),
+    );
     obj.insert(
         "detected_manufacturer".into(),
         json!(detected.and_then(|d| d.manufacturer.clone())),
@@ -361,6 +382,14 @@ async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> imp
     // Headphone crossfeed config (local output only). Defaults when unset:
     // disabled, amount 0.30, delay 0.30 ms.
     let crossfeed = read_crossfeed_config(&settings, id);
+    // …et ce que ce réglage VAUT sur CETTE zone (#2742). Additif : l'objet
+    // `crossfeed` ci-dessus est publié tel quel, un client qui ignore ce
+    // champ voit le même écran qu'avant.
+    let crossfeed_status = crossfeed_status_de_zone(
+        &state.backend,
+        id,
+        crossfeed["enabled"].as_bool().unwrap_or(false),
+    );
 
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
@@ -369,12 +398,14 @@ async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> imp
             "dsp_enabled": enabled,
             "eq_profile": eq_profile.unwrap_or_default(),
             "crossfeed": crossfeed,
+            "crossfeed_status": crossfeed_status,
         }))
         .into_response(),
         Err(_) => Json(json!({
             "zone_id": id,
             "eq_profile": eq_profile.unwrap_or_default(),
             "crossfeed": crossfeed,
+            "crossfeed_status": crossfeed_status,
         }))
         .into_response(),
     }
@@ -519,6 +550,38 @@ fn read_crossfeed_config(settings: &tune_core::db::settings_repo::SettingsRepo, 
     })
 }
 
+/// Ce que le crossfeed VAUT sur cette zone-ci, à côté de ce que le réglage
+/// demande — #2742.
+///
+/// Le crossfeed n'est installé qu'à trois endroits, tous derrière la même
+/// double garde `device_id.starts_with("local:")` +
+/// `downcast_ref::<LocalOutput>()` (`orchestrator.rs` : chemin de lecture,
+/// `refresh_zone_crossfeed`, `refresh_zone_pure_dsp`). Une zone réseau n'a donc
+/// aucun chemin de code — pendant que cette route-ci offrait le réglage, le
+/// persistait, et le relisait sans un mot. Tades : « Crossfeed n'a aucune
+/// action ».
+///
+/// La règle elle-même vit dans `tune_core::audio::crossfeed` et ne lit aucune
+/// base : ici on ne fait que lui passer les deux faits qu'elle attend — la
+/// sortie de la zone et son mode PURE. Une seule règle, donc pas de dérive
+/// possible entre cet écran et le son.
+fn crossfeed_status_de_zone(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    requested: bool,
+) -> tune_core::audio::crossfeed::CrossfeedStatus {
+    let device = ZoneRepo::with_backend(backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id);
+    tune_core::audio::crossfeed::crossfeed_status(
+        requested,
+        tune_core::audio::crossfeed::crossfeed_runs_on_output(device.as_deref()),
+        tune_core::audio::audiophile::zone_enabled(backend, zone_id),
+    )
+}
+
 async fn set_zone_dsp(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -561,6 +624,9 @@ async fn set_zone_dsp(
     // amount 0..0.5, delay_ms 0..5. Persisted to `zone_{id}_crossfeed`.
     let mut crossfeed_saved: Option<Value> = None;
     let mut cf_applique_a_chaud = false;
+    // #2742 — publié dès que le corps porte un `crossfeed`, pour que la réponse
+    // au CLIC dise déjà si le réglage aura le moindre effet.
+    let mut crossfeed_status: Option<tune_core::audio::crossfeed::CrossfeedStatus> = None;
     if let Some(cf_val) = body.get("crossfeed") {
         let enabled = cf_val
             .get("enabled")
@@ -592,6 +658,22 @@ async fn set_zone_dsp(
         // `delay_ms` en ecoutant ne changeait rien avant la piste suivante
         // (#1786).
         cf_applique_a_chaud = state.orchestrator.refresh_zone_crossfeed(id).await;
+        // #2742 — et si la zone ne peut PAS faire tourner de crossfeed, le
+        // serveur le dit au lieu d'enregistrer en silence. Journalisé au
+        // moment du CLIC, pas à la lecture : c'est ici que l'utilisateur
+        // croit avoir obtenu quelque chose.
+        let statut = crossfeed_status_de_zone(&state.backend, id, enabled);
+        if statut.unavailable {
+            warn!(
+                zone_id = id,
+                requested = enabled,
+                reason = statut
+                    .reason
+                    .map(tune_core::audio::crossfeed::CrossfeedConstraint::code),
+                "zone_crossfeed_sans_effet"
+            );
+        }
+        crossfeed_status = Some(statut);
     }
 
     let preset_id = body["dsp_preset_id"].as_i64();
@@ -605,6 +687,11 @@ async fn set_zone_dsp(
         "dsp_enabled": enabled,
         "eq_profile": body.get("eq_profile"),
         "crossfeed": crossfeed_saved,
+        // #2742 — la moitié qui manquait : ce que ce réglage VAUT sur cette
+        // zone. `null` quand le corps ne portait pas de `crossfeed` (rien n'a
+        // été demandé, il n'y a rien à répondre). `unavailable: true` doit
+        // VERROUILLER le contrôle côté client, `detail` l'expliquer.
+        "crossfeed_status": crossfeed_status,
         // Meme contrat que `POST /zones/{id}/eq` : vrai quand le reglage vient
         // d'atteindre le son d'un flux en cours. Faux ne signale PAS un echec
         // (rien ne joue, zone non locale, mode PURE) — c'est ce qui permet a un
@@ -1078,6 +1165,23 @@ pub(crate) async fn output_capabilities(
     Some(output.lock().await.capabilities())
 }
 
+/// La sortie enregistrée pour une zone ne sait-elle mettre en attente qu'un
+/// FICHIER local ? (`prefers_local_file_gapless`, OAAT en DSD natif / PCM direct)
+///
+/// `false` pour une sortie inconnue, comme pour l'immense majorité des sorties :
+/// c'est le comportement par défaut du trait.
+pub(crate) async fn output_prefers_local_file_gapless(
+    state: &AppState,
+    output_device_id: Option<&str>,
+) -> bool {
+    let Some(device_id) = output_device_id else {
+        return false;
+    };
+    let Some(output) = ({ state.outputs.lock().await.get(device_id) }) else {
+        return false;
+    };
+    output.lock().await.prefers_local_file_gapless()
+}
 /// Motif pour lequel la sortie d'une zone ne peut pas tenir une consigne en dB.
 ///
 /// `None` = rien à redire : sortie inconnue (zone navigateur, sortie
@@ -2426,7 +2530,13 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 .output_device_id
                 .as_deref()
                 .and_then(|did| devices.iter().find(|d| d.id == did));
-            inject_device_identity(obj, &state.backend, zone_id, detected_dev);
+            inject_device_identity(
+                obj,
+                &state.backend,
+                zone_id,
+                z.output_device_id.as_deref(),
+                detected_dev,
+            );
             let online = match z.output_type.as_deref() {
                 // Browser zones have no output device by design (the web
                 // client pulls stream_url itself) — always online.
@@ -2587,7 +2697,13 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     .output_device_id
                     .as_deref()
                     .and_then(|did| devices.iter().find(|d| d.id == did));
-                inject_device_identity(obj, &state.backend, id, detected_dev);
+                inject_device_identity(
+                    obj,
+                    &state.backend,
+                    id,
+                    zone.output_device_id.as_deref(),
+                    detected_dev,
+                );
                 let online = match zone.output_type.as_deref() {
                     // Same rules as list_zones: browser zones need no device;
                     // a local zone without output_device_id is an orphan that
@@ -3130,6 +3246,38 @@ async fn patch_zone(
             settings.delete(&key)
         };
         ecrire!("mono_downmix", enabled, r);
+        // #3254 — dire au JOURNAL, au moment du clic, que ce clic n'obtiendra
+        // rien. La réponse porte déjà `mono_downmix_status` (la route rend la
+        // fiche complète via `get_zone`), mais c'est ici que l'utilisateur croit
+        // avoir obtenu quelque chose.
+        //
+        // ⚠️ On ne se sert PAS de la valeur rendue par `refresh_zone_mono_downmix`
+        // comme signal de disponibilité : elle vaut `false` aussi bien parce que
+        // la zone n'est pas locale que parce qu'aucune sortie n'est ouverte — la
+        // même ambiguïté que `crossfeed_applied_live`. La règle, elle, ne dépend
+        // que de la zone.
+        let statut = tune_core::audio::mono_downmix::mono_downmix_status(
+            enabled,
+            tune_core::audio::mono_downmix::mono_downmix_runs_on_output(
+                // La zone RELUE, pas `zone_before` : le même PATCH a pu changer
+                // `output_device_id` quelques lignes plus haut, et c'est la
+                // sortie d'APRÈS qui décide si le repli agira.
+                repo.get(id)
+                    .ok()
+                    .flatten()
+                    .and_then(|z| z.output_device_id)
+                    .as_deref(),
+            ),
+            tune_core::audio::audiophile::zone_enabled(&state.backend, id),
+        );
+        if statut.unavailable {
+            warn!(
+                zone_id = id,
+                requested = enabled,
+                reason = statut.reason.map(|r| r.code()).unwrap_or_default(),
+                "zone_mono_downmix_sans_effet — le réglage est enregistré mais rien ne l'applique sur cette zone"
+            );
+        }
         // Persister ne suffit pas : sans ceci, cocher la case en écoutant ne
         // changerait rien avant la piste suivante (#1725, #1786). Or ce
         // réglage-ci se vérifie précisément à l'oreille, musique en cours.
@@ -7151,6 +7299,13 @@ mod backend_local_annonce_tests {
             // ABSENCE de la charge utile qui serait la régression — le client
             // n'aurait de nouveau que le journal pour savoir où sort le son.
             "device",
+            // #3233 — la CADENCE réellement ouverte, face à celle de la
+            // source. Même raison que `device` : quand Tune refuse la cadence
+            // de la source parce que les capacités du périphérique sont
+            // SUPPOSÉES et non mesurées, il convertit — et sans ce champ le
+            // client affiche « DSD64 » pendant qu'autre chose part au DAC.
+            // `null` tant que rien n'a joué en partagé, ce qui est honnête.
+            "rate",
         ] {
             assert!(v.get(champ).is_some(), "champ « {champ} » absent de {v}");
         }

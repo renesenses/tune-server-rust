@@ -23,8 +23,15 @@ name: Preflight
 # - cargo_deny: licenses and duplicate-dep checks pass
 # - web_api_contract: le client web n'appelle aucune route que le serveur
 #   ne sert pas (scripts/preflight-web-contract.py, lu depuis main)
-# - ci_status: all check-runs on the commit are green (skipped for
-#   workflow_dispatch on a branch that hasn't had CI yet)
+# - ci_status: les PORTES DE RELEASE du commit sont vertes (skipped for
+#   workflow_dispatch on a branch that hasn't had CI yet). Portes = les
+#   executions de `ci.yml`, `test-postgres.yml` et `widget-ci.yml` sur ce
+#   commit, et elles seules : les sondes planifiees, les robots d'issues, la
+#   machinerie du train et les AUDITS de gouvernance s'accrochent au meme
+#   commit sans etre des tests. « Derive des garde-fous » rougit par
+#   construction pendant un train (gel des tags ouvert, armement a `true`) et
+#   a bloque v0.9.131 ; voir le commentaire de `RELEASE_GATE_WORKFLOWS` dans
+#   scripts/preflight-check.py. Une absence de porte reconnue est un REFUS.
 
 on:
   workflow_call:

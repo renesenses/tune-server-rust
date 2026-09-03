@@ -1788,20 +1788,56 @@ async fn other_versions(
         "lh.artist_name",
         "lh.album_title",
     );
+    // ── Pourquoi un `GROUP BY` et non le `SELECT DISTINCT` d'avant (#3181) ──
+    //
+    // La forme precedente triait sur `lh.listened_at` SANS le selectionner :
+    // PostgreSQL la refuse — « for SELECT DISTINCT, ORDER BY expressions must
+    // appear in select list » — et la section partait VIDE chez tout
+    // utilisateur PG, l'echec avale par `ou_defaut_journalise`.
+    //
+    // Ajouter `listened_at` a la liste de selection aurait rendu la requete
+    // legale et le resultat FAUX : le `DISTINCT` ne dedoublonnait plus la meme
+    // chose. Il ne portait de fait que sur (titre, artiste, album, `t.id`) —
+    // les quatre autres colonnes sont fonctionnellement determinees par
+    // `t.id` — et son role etait d'effondrer les REECOUTES du meme morceau,
+    // qui ne different que par `listened_at`. Le rendre distinct fait
+    // reapparaitre une ligne par ecoute : mesure sur trois lignes d'historique
+    // dont deux reecoutes, 3 lignes au lieu de 2, la meme version listee deux
+    // fois, et le `LIMIT` mange par les repetitions.
+    //
+    // Le dedoublonnage descend donc dans le vivier, AVANT la jointure, avec le
+    // patron deja utilise seize lignes plus bas par `sql_recentes` :
+    // `GROUP BY` sur les trois colonnes du `DISTINCT`, `MAX(listened_at)` pour
+    // la cle de tri. Meme ensemble qu'avant sur les deux moteurs, et plus
+    // aucun `DISTINCT` a satisfaire — `lh` est unique sur ses trois colonnes,
+    // `t.id` est unique, et `al`/`ar`/`ar2` se joignent par cle primaire.
+    //
+    // `MAX(listened_at)` est ici la DERNIERE ecoute (chaine ISO-8601, cf.
+    // ci-dessus) : c'est ce que « les dernieres ecoutes » veut dire, et c'est
+    // desormais defini, la ou le `DISTINCT` laissait le moteur choisir
+    // n'importe laquelle des valeurs effondrees.
+    //
+    // `t.id` en second critere de tri n'est pas un ornement : une meme ecoute
+    // se deplie en PLUSIEURS versions qui partagent toutes son `listened_at`,
+    // donc sans departage l'ordre de ces lignes — et ce que le `LIMIT`
+    // retient — depend du plan de chaque moteur. C'est la condition pour que
+    // SQLite et PostgreSQL rendent le meme ensemble DANS LE MEME ORDRE.
     let sql = format!(
-        "SELECT DISTINCT lh.title, lh.artist_name, lh.album_title, \
-                t.id, al.id, al.title, al.cover_path, t.duration_ms \
-        FROM (SELECT title, artist_name, album_title, listened_at \
-              FROM listen_history \
-              WHERE artist_name IS NOT NULL \
-              ORDER BY listened_at DESC \
-              LIMIT {ECOUTES_EXAMINEES}) lh \
+        "SELECT lh.title, lh.artist_name, lh.album_title, \
+                t.id, al.id, al.title, al.cover_path, t.duration_ms, t.title \
+        FROM (SELECT title, artist_name, album_title, MAX(listened_at) AS listened_at \
+              FROM (SELECT title, artist_name, album_title, listened_at \
+                    FROM listen_history \
+                    WHERE artist_name IS NOT NULL \
+                    ORDER BY listened_at DESC \
+                    LIMIT {ECOUTES_EXAMINEES}) le \
+              GROUP BY title, artist_name, album_title) lh \
         CROSS JOIN tracks t \
         JOIN albums al ON t.album_id = al.id \
         LEFT JOIN artists ar ON al.artist_id = ar.id \
         LEFT JOIN artists ar2 ON t.artist_id = ar2.id \
         WHERE {predicat} \
-        ORDER BY lh.listened_at DESC \
+        ORDER BY lh.listened_at DESC, t.id \
         LIMIT {limit}"
     );
 
@@ -1819,6 +1855,11 @@ async fn other_versions(
             "album_title": cols.get(5).and_then(|v| v.as_string()),
             "cover_path": cols.get(6).and_then(|v| v.as_string()),
             "duration_ms": cols.get(7).and_then(|v| v.as_i64()),
+            // Le titre RETROUVE. Depuis que ` - ` ouvre un suffixe d'edition
+            // (#2372), « Smooth Operator - 2011 Remastered » est une version
+            // de « Smooth Operator » : le libelle du groupe ne vaut plus pour
+            // chacune de ses lignes.
+            "title": cols.get(8).and_then(|v| v.as_string()),
         });
         match groupes.iter_mut().find(|g| {
             g["title"].as_str() == Some(titre.as_str())
@@ -1866,8 +1907,17 @@ async fn other_versions(
         .collect();
 
     for (titre, artiste, album) in recentes {
-        let trouvees =
-            crate::routes::versions::versions_streaming(&state, &titre, &artiste, &album).await;
+        // Le vivier de cette route est `listen_history` : il ne porte ni ISRC
+        // ni duree ni annee. La reference part donc sans signaux, et le score
+        // ne repose ici que sur le titre — c'est moins que sur la route par
+        // piste, et c'est assume : inventer une duree serait pire.
+        let reference = crate::routes::versions::Reference {
+            titre: titre.clone(),
+            artiste: artiste.clone(),
+            album: album.clone(),
+            ..Default::default()
+        };
+        let trouvees = crate::routes::versions::versions_streaming(&state, &reference).await;
         if trouvees.is_empty() {
             continue;
         }
@@ -1960,6 +2010,80 @@ mod tests_other_versions {
             Some("Before The Dawn")
         );
     }
+
+    /// Trois REECOUTES du meme morceau ne proposent qu'UNE fois sa version
+    /// (#3181).
+    ///
+    /// C'est le travail que faisait le `SELECT DISTINCT`, et c'est ce qu'on
+    /// perd en le rendant simplement legal sur PostgreSQL : ajouter
+    /// `listened_at` a la liste de selection rend trois lignes la ou il en
+    /// faut une, la meme version apparait trois fois dans le groupe, et le
+    /// `LIMIT` se remplit de repetitions. Ce garde est ecrit du cote SQLite —
+    /// le moteur qui acceptait l'ancienne forme — pour qu'une correction
+    /// PostgreSQL ne puisse pas payer sa legalite avec ce dedoublonnage.
+    #[tokio::test]
+    async fn autres_versions_effondre_les_reecoutes_du_meme_morceau() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+
+        b.execute("INSERT INTO artists (name) VALUES ('Kate Bush')", &[])
+            .unwrap();
+        let kate = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Before The Dawn', ?1)",
+            &[&kate as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let before = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('Running Up That Hill', ?1, ?2, 296000, '/i3181-before.flac')",
+            &[&before as &dyn ToSqlValue, &kate as &dyn ToSqlValue],
+        )
+        .unwrap();
+        // Trois ecoutes du meme morceau depuis une compilation : trois lignes
+        // d'historique qui ne different QUE par `listened_at`.
+        for horodatage in [
+            "2026-08-28T09:32:00Z",
+            "2026-08-29T18:04:00Z",
+            "2026-08-30T07:11:00Z",
+        ] {
+            b.execute(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, listened_at) \
+                 VALUES ('Running Up That Hill', 'Kate Bush', 'Hit Collection', ?1)",
+                &[&horodatage as &dyn ToSqlValue],
+            )
+            .unwrap();
+        }
+
+        let resultat = other_versions(
+            State(state),
+            Query(HomeParams {
+                limit: Some(20),
+                zone_id: None,
+            }),
+        )
+        .await;
+        // `AppError` n'implemente pas `Debug` : un `expect` ne compile pas.
+        let Json(groupes) = match resultat {
+            Ok(reponse) => reponse,
+            Err(_) => panic!("la route doit repondre"),
+        };
+
+        let groupes = groupes.as_array().expect("groupes de versions");
+        assert_eq!(groupes.len(), 1, "groupes rendus : {groupes:?}");
+        let versions = groupes[0]["versions"]
+            .as_array()
+            .expect("versions du groupe");
+        assert_eq!(
+            versions.len(),
+            1,
+            "trois reecoutes ont produit {} versions au lieu d'une : {versions:?}",
+            versions.len()
+        );
+        assert_eq!(versions[0]["album_title"].as_str(), Some("Before The Dawn"));
+    }
 }
 
 /// Favorite radios + recently played radios.
@@ -1978,12 +2102,26 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
         .map(|r| json!(r))
         .collect();
 
+    // `is_favorite = '0'` et non `= 0` (#3181). La colonne n'a pas le meme type
+    // selon l'origine de la base : `SMALLINT` sur une installation PostgreSQL
+    // neuve (`migrations/postgres/005_additional_tables.sql`), mais `TEXT` sur
+    // une base VENUE DE SQLITE (`pg_migrate.rs` la declare `is_favorite TEXT
+    // DEFAULT 0`, et aucune des migrations numeriques 010/011/013 ne la
+    // reconvertit — elles ne reprennent que `bitrate` et `play_count`). Sur ce
+    // second chemin, `is_favorite = 0` leve « operator does not exist: text =
+    // integer » et la section « radios recemment ecoutees » partait vide, sans
+    // rien dire. Le litteral QUOTE, lui, reste non type a l'analyse et se
+    // resout dans les deux cas : `text = text` ici, `smallint = smallint` la.
+    // C'est deja l'idiome du depot — `RadioRepo::sql::favorites()` ecrit
+    // `WHERE is_favorite = '1'` — et sur SQLite l'affinite INTEGER de la
+    // colonne convertit `'0'` en `0` : meme lignes qu'avant, NULL exclus des
+    // deux cotes comme avant.
     let recent: Vec<Value> = state
         .backend
         .query_many(
             "SELECT id, name, url, logo_url, genre, last_played, play_count \
              FROM radio_stations \
-             WHERE is_favorite = 0 AND last_played IS NOT NULL \
+             WHERE is_favorite = '0' AND last_played IS NOT NULL \
              ORDER BY last_played DESC LIMIT 10",
             &[],
         )
@@ -2005,6 +2143,71 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
 
     items.extend(recent);
     Ok(items)
+}
+
+#[cfg(test)]
+mod tests_3181_radios_recentes {
+    use super::*;
+
+    /// « Radios recemment ecoutees » : les non-favorites datees, et elles
+    /// seules (#3181).
+    ///
+    /// Le litteral quote `= '0'` doit selectionner EXACTEMENT ce que `= 0`
+    /// selectionnait sur SQLite : la favorite est ecartee du bloc « recentes »
+    /// (elle arrive par `favorites()`, pas ici), et une station jamais jouee
+    /// n'y figure pas. Les stations semees par les migrations ont toutes
+    /// `last_played` NUL, donc aucune ne s'invite.
+    #[test]
+    fn radios_recentes_gardent_les_non_favorites_datees() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+
+        b.execute(
+            "INSERT INTO radio_stations (name, url, is_favorite, last_played) \
+             VALUES ('i3181 Favorite', 'http://i3181/fav', 1, '2026-09-01T10:00:00Z')",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO radio_stations (name, url, is_favorite, last_played) \
+             VALUES ('i3181 Recente', 'http://i3181/rec', 0, '2026-09-02T10:00:00Z')",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO radio_stations (name, url, is_favorite, last_played) \
+             VALUES ('i3181 Jamais jouee', 'http://i3181/jamais', 0, NULL)",
+            &[],
+        )
+        .unwrap();
+
+        // `AppError` n'implemente pas `Debug` : un `expect` ne compile pas.
+        let items = match fetch_radio_picks(&state) {
+            Ok(items) => items,
+            Err(_) => panic!("la section doit repondre"),
+        };
+
+        // Le bloc « recentes » est celui dont `is_favorite` est rendu `false`
+        // par le gestionnaire ; `favorites()` rend la station complete.
+        let recentes: Vec<&str> = items
+            .iter()
+            .filter(|i| i["is_favorite"].as_bool() == Some(false))
+            .filter_map(|i| i["name"].as_str())
+            .collect();
+
+        assert_eq!(
+            recentes,
+            vec!["i3181 Recente"],
+            "radios recemment ecoutees rendues : {recentes:?}"
+        );
+        // Temoin : la favorite est bien servie, par l'autre moitie.
+        assert!(
+            items
+                .iter()
+                .any(|i| i["name"].as_str() == Some("i3181 Favorite")),
+            "la radio favorite a disparu de la section : {items:?}"
+        );
+    }
 }
 
 fn fetch_top_tracks(state: &AppState, limit: i64) -> Vec<Value> {

@@ -551,12 +551,9 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 /// The manual scan and the auto/watcher scan MUST share this one implementation
 /// so they can't diverge again — they previously held two copies and only one
 /// received the NFC fix.
-pub(crate) fn file_needs_scan(
-    path: &std::path::Path,
-    existing_tracks: &std::collections::HashMap<String, (i64, Option<f64>, Option<i64>)>,
-) -> bool {
+pub fn file_needs_scan(path: &std::path::Path, existing_tracks: &CarteDesChemins) -> bool {
     let path_str: String = path.to_string_lossy().nfc().collect();
-    if let Some(&(_, existing_mtime, existing_size)) = existing_tracks.get(path_str.as_str()) {
+    if let Some(info) = existing_tracks.get(path_str.as_str()) {
         if let Ok(file_meta) = path.metadata() {
             let mtime = file_meta
                 .modified()
@@ -564,12 +561,84 @@ pub(crate) fn file_needs_scan(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let unchanged = existing_mtime.map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
-                && existing_size.map_or(false, |s| s == file_meta.len() as i64);
+            let unchanged = info.mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
+                && info.taille.is_some_and(|s| s == file_meta.len() as i64);
             return !unchanged;
         }
     }
     true
+}
+
+/// `file_path` → la ligne de `tracks` qui le possède, toutes sources.
+///
+/// Voir [`tune_core::db::track_repo::InfoFichier`] : la carte a la portée de
+/// la contrainte `file_path TEXT UNIQUE`, et chaque consommateur qui veut une
+/// portée plus étroite la découpe lui-même.
+pub type CarteDesChemins =
+    std::collections::HashMap<String, tune_core::db::track_repo::InfoFichier>;
+
+/// Ce que le scan doit faire du fichier qu'il vient de rencontrer.
+///
+/// # Pourquoi cette décision est une fonction, et une seule
+///
+/// C'est ICI que #2939 se jouait. La règle est simple — « une ligne possède
+/// déjà ce `file_path` ? alors on la met à jour, sinon on insère » — mais elle
+/// était écrite deux fois (scan manuel et scan automatique) et elle
+/// s'appuyait, dans les deux copies, sur une carte chargée avec
+/// `WHERE source = 'local'`. La contrainte qui tranche vraiment,
+/// `file_path TEXT UNIQUE`, ne connaît pas `source`. Une ligne posée par un
+/// importateur de bibliothèque (`roon_import`, `plex_import`, `jriver` — les
+/// seules sources non locales qui portent un `file_path`, les flux Qobuz/Tidal
+/// n'en ont jamais et le cache hors-ligne vit dans sa propre table
+/// `offline_cache`) était donc invisible à la carte, visible à la contrainte :
+/// insertion demandée, insertion refusée, piste perdue.
+///
+/// Chez Alain Bonnel (fil 1313, 08/08/2026) c'est un album entier — les
+/// quatorze pistes de *As We Once Were* — qui n'est jamais entré en
+/// bibliothèque, pendant que le scan se déclarait sans erreur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictEcriture {
+    /// Le fichier n'a pas bougé depuis le dernier scan : ne pas relire ses
+    /// balises. (Jamais rendu en mode `force`.)
+    Inchange,
+    /// Une ligne possède déjà ce chemin : c'est ELLE qu'on met à jour.
+    MettreAJour {
+        /// `tracks.id` de cette ligne.
+        id: i64,
+        /// Vrai quand elle n'était pas encore `source = 'local'` : le scan
+        /// vient de la relire sur le disque, il l'adopte.
+        adopter: bool,
+    },
+    /// Personne ne possède ce chemin : insertion.
+    Inserer,
+}
+
+/// Applique la règle ci-dessus à un fichier du lot.
+///
+/// `mtime` et `taille` sont ceux lus sur le disque par le parcours ; `force`
+/// désactive le raccourci « inchangé » pour que les album_id soient
+/// re-résolus.
+pub fn verdict_ecriture(
+    chemin: &str,
+    mtime: u64,
+    taille: u64,
+    force: bool,
+    carte: &CarteDesChemins,
+) -> VerdictEcriture {
+    let Some(info) = carte.get(chemin) else {
+        return VerdictEcriture::Inserer;
+    };
+    if !force {
+        let a_change = info.mtime.is_none_or(|m| (m - mtime as f64).abs() > 0.5)
+            || info.taille != Some(taille as i64);
+        if !a_change {
+            return VerdictEcriture::Inchange;
+        }
+    }
+    VerdictEcriture::MettreAJour {
+        id: info.id,
+        adopter: !info.est_locale(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1219,7 +1288,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // A DB read error must ABORT the scan, not degrade into an empty map:
         // with an empty map every file on disk looks new, so a transient DB
         // hiccup would re-insert the whole library as duplicates.
-        let existing_tracks = match track_repo.get_all_local_file_info() {
+        let existing_tracks = match track_repo.get_all_file_info_by_path() {
             Ok(map) => map,
             Err(e) => {
                 tracing::error!(error = %e, "scan_aborted_existing_tracks_read_failed");
@@ -1378,6 +1447,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     Vec::with_capacity(batch.len());
                 let mut to_update: Vec<tune_core::db::models::Track> =
                     Vec::with_capacity(batch.len() / 4);
+                // Lignes de ce lot qui existaient sous une source d'importation
+                // et que le scan reprend à son compte (#2939).
+                let mut a_adopter: Vec<i64> = Vec::new();
 
                 // BEGIN transaction for this batch (SQLite only — PG uses autocommit
                 // to avoid "current transaction is aborted" cascading failures)
@@ -1437,35 +1509,33 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         continue;
                     }
 
-                    // Early-exit: skip unchanged files BEFORE resolving artist/album.
-                    // Without this, get_or_create_with_mbid can create a ghost album
-                    // entry (with cover art but no tracks) for files that are ultimately
-                    // skipped — the root cause of "duplicate covers after rescan" (#593).
-                    // Force mode bypasses this so album_id gets re-resolved.
-                    if !force {
-                        if let Some(&(_existing_id, existing_mtime, existing_size)) =
-                            existing_tracks.get(&sf.path)
-                        {
-                            let file_changed = existing_mtime
-                                .map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
-                                || existing_size.map_or(true, |s| s != sf.file_size as i64);
-                            if !file_changed {
-                                skipped += 1;
-                                skipped_unchanged += 1;
-                                continue;
-                            }
-                        }
+                    // Insertion, mise à jour ou rien : UNE règle, partagée avec
+                    // le scan automatique (#2939). Prise AVANT
+                    // `importer.import` — sans quoi `get_or_create_with_mbid`
+                    // fabrique un album fantôme (pochette, zéro piste) pour un
+                    // fichier qu'on va finalement écarter (#593). Le mode
+                    // `force` désactive le raccourci « inchangé » pour que les
+                    // album_id soient re-résolus.
+                    let verdict =
+                        verdict_ecriture(&sf.path, sf.mtime, sf.file_size, force, &existing_tracks);
+                    if verdict == VerdictEcriture::Inchange {
+                        skipped += 1;
+                        skipped_unchanged += 1;
+                        continue;
                     }
 
                     let Some((mut track, _album_id)) = importer.import(sf) else {
                         continue;
                     };
 
-                    // File already exists and has changed → batch update;
-                    // otherwise a new file → batch insert. (Unchanged files were
-                    // already skipped by the early-exit above.)
-                    if let Some(&(existing_id, _, _)) = existing_tracks.get(&sf.path) {
-                        track.id = Some(existing_id);
+                    if let VerdictEcriture::MettreAJour { id, adopter } = verdict {
+                        track.id = Some(id);
+                        if adopter {
+                            // Le scan vient de relire ce fichier sur le disque :
+                            // la ligne, posée par un importateur de
+                            // bibliothèque, lui appartient désormais.
+                            a_adopter.push(id);
+                        }
                         to_update.push(track);
                     } else {
                         // The sampled hash only narrows the candidates. A track
@@ -1526,6 +1596,22 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
+                // Les lignes reprises à un importateur deviennent locales : sans
+                // cela elles resteraient hors de portée de la tenue de compte du
+                // scan (dont la purge) et le désaccord se rejouerait à chaque
+                // scan (#2939). Un échec ici ne perd aucune piste — la mise à
+                // jour, elle, est déjà passée — donc il se journalise et ne
+                // remonte pas dans le manque à écrire.
+                match track_repo.adopter_en_local(&a_adopter) {
+                    Ok(0) => {}
+                    Ok(adoptees) => tracing::info!(
+                        adoptees,
+                        batch = batch_idx,
+                        "scan_lignes_importees_adoptees — ces pistes existaient sous une source \
+                         d'importation au même chemin : le scan les a mises à jour et reprises."
+                    ),
+                    Err(e) => tracing::warn!(error = %e, batch = batch_idx, "scan_adoption_locale_failed"),
+                }
                 // Only successful whole batches enter the in-memory index. A
                 // failed insert must never cause a later file to be hidden.
                 if batch_inserted == to_insert.len() as i64 {
@@ -1719,11 +1805,23 @@ pub(crate) async fn spawn_library_scan_confirmee(
         if scan_cancel_requested() {
             tracing::info!("post_scan_prune_skipped_cancelled");
         } else {
+            // La purge — et les gardes qui la retiennent — ne raisonne QUE sur
+            // les lignes que le scan a lui-même posées. `existing_tracks`
+            // couvre désormais toute la table (c'est la portée de
+            // `file_path TEXT UNIQUE`, et c'est ce qu'il fallait pour décider
+            // insertion ou mise à jour, #2939) ; la question posée ici est
+            // l'autre : « qu'ai-je le droit de retirer ? ». Le filtre est donc
+            // remis explicitement, et le comportement de la purge est
+            // exactement celui d'avant le correctif.
+            let pistes_locales: std::collections::HashMap<&str, i64> = existing_tracks
+                .iter()
+                .filter(|(_, info)| info.est_locale())
+                .map(|(chemin, info)| (chemin.as_str(), info.id))
+                .collect();
             // Racines devenues vides : un partage non monté est LISIBLE et
             // vide, donc invisible pour `missing_dirs`. Sans ce garde, le
             // nettoyage ci-dessous efface la bibliothèque entière (#1652).
-            let existing_refs: Vec<&str> =
-                existing_tracks.keys().map(|s| s.as_str()).collect();
+            let existing_refs: Vec<&str> = pistes_locales.keys().copied().collect();
             racines_videes = roots_gone_empty(&scan_dirs, &existing_refs, &discovered_paths);
             let emptied_roots = &racines_videes;
             // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
@@ -1753,7 +1851,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             // boucle ne se rattrape pas.
             let mut a_supprimer: Vec<i64> = Vec::new();
             let mut examinees = 0usize;
-            for (db_path, &(track_id, _, _)) in &existing_tracks {
+            for (&db_path, &track_id) in &pistes_locales {
                 // Targeted scan: only consider tracks under the scanned sub-tree.
                 // `discovered_paths` only holds files below that folder, so a
                 // track anywhere else would look "missing" and get wrongly
@@ -1764,7 +1862,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     }
                 }
                 examinees += 1;
-                if !discovered_paths.contains(db_path.as_str()) {
+                if !discovered_paths.contains(db_path) {
                     match verdict_purge(
                         db_path,
                         &scan_dirs,

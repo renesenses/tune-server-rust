@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -50,6 +50,60 @@ const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 // for the mtime pre-check (#619).
 const SCAN_IO_CONCURRENCY: usize = 32;
 
+// Concurrence retenue quand les fichiers scannés vivent sur un MONTAGE RÉSEAU
+// (CIFS/SMB, NFS, sshfs…).
+//
+// D'où vient ce nombre, puisqu'on ne peut pas mesurer le NAS de chacun :
+//
+// * borne basse — les plateaux valent 4 (`concurrence_pour_disque`, mesuré chez
+//   Yacine, #1948). Un partage cache un disque qu'on ne peut PAS sonder : chez
+//   Pierre M (QNAP, fil 1043) ce sont des plateaux, avec un saut réseau en plus.
+//   Descendre plus bas que 4 n'aurait donc aucune justification mesurée ;
+// * borne haute — au-delà du nombre de fils de service du NAS, les requêtes
+//   supplémentaires ne se recouvrent plus : elles font la queue dans le backlog
+//   du serveur, et c'est exactement là que le client voit des time-outs en
+//   rafale plutôt qu'une simple lenteur. Le `nfsd` des NAS grand public tourne
+//   par défaut à 8 fils (RPCNFSDCOUNT=8 chez Debian/Ubuntu, valeur par défaut
+//   de nfs-utils), et un smbd de NAS 2 baies est du même ordre.
+//
+// On reste donc au-dessus des plateaux — la latence réseau, elle, SE recouvre,
+// contrairement aux déplacements de tête — et sous le point où l'on remplit la
+// file d'attente du NAS. Ce n'est pas une mesure faite chez Pierre M : c'est un
+// encadrement entre deux repères, et `TUNE_SCAN_IO_CONCURRENCY` reste le dernier
+// mot pour qui mesure mieux sur SA machine.
+const SCAN_IO_CONCURRENCY_RESEAU: usize = 8;
+
+/// Systèmes de fichiers qui parlent au travers du réseau.
+///
+/// Liste explicite plutôt qu'un préfixe : `fuse.` couvre aussi bien `fuse.sshfs`
+/// (réseau) que `fuse.ntfs-3g` ou `fuse.mergerfs` (parfaitement locaux), donc on
+/// nomme les cas réseau un par un. Un type inconnu est traité comme local — même
+/// prudence que `disque_rotatif`, qui ne dégrade personne sur une supposition.
+const SYSTEMES_DE_FICHIERS_RESEAU: &[&str] = &[
+    "9p",
+    "afp",
+    "afpfs",
+    "afs",
+    "ceph",
+    "cifs",
+    "coda",
+    "davfs",
+    "fuse.davfs2",
+    "fuse.rclone",
+    "fuse.s3fs",
+    "fuse.smbnetfs",
+    "fuse.sshfs",
+    "glusterfs",
+    "ncpfs",
+    "nfs",
+    "nfs4",
+    "smb2",
+    "smb3",
+    "smbfs",
+    "sshfs",
+    "webdav",
+];
+
 /// Resolve the scan I/O concurrency, honouring an optional `TUNE_SCAN_IO_CONCURRENCY`
 /// override. The fixed default (32) is a good fit for a fast SSD NAS, but the
 /// sweet spot is storage-specific: a weak 2-bay HDD NAS (Synology DS218Play,
@@ -88,7 +142,172 @@ fn concurrence_depuis_reglage(reglage: Option<&str>) -> usize {
     {
         return n;
     }
-    concurrence_pour_disque(disque_rotatif())
+    concurrence_pour_stockage(mountinfo().as_deref(), &racine_scannee(), disque_rotatif())
+}
+
+/// La décision complète, une fois le réglage manuel écarté : type de disque ET
+/// nature du montage.
+///
+/// Fonction PURE — elle reçoit le CONTENU de `mountinfo`, le chemin scanné et le
+/// verdict de la sonde `/sys`. C'est ce qui rend la règle éprouvable sans monter
+/// un partage CIFS, chose impossible sur la machine de compilation. Même patron
+/// que `resolve_local_audio_backend`, qui prend son `lookup` en paramètre.
+///
+/// On garde le MINIMUM des deux verdicts : ils décrivent deux goulots
+/// indépendants (l'actionneur d'un côté, la file du serveur de l'autre) et le
+/// plus étroit commande. Un `mountinfo` absent ou illisible ne change donc rien
+/// au comportement d'avant.
+pub(crate) fn concurrence_pour_stockage(
+    mountinfo: Option<&str>,
+    chemin: &std::path::Path,
+    rotatif: Option<bool>,
+) -> usize {
+    let reseau = mountinfo
+        .and_then(|m| systeme_de_fichiers_du_chemin(m, chemin))
+        .is_some_and(|fs| est_systeme_de_fichiers_reseau(&fs));
+    let par_le_montage = if reseau {
+        SCAN_IO_CONCURRENCY_RESEAU
+    } else {
+        SCAN_IO_CONCURRENCY
+    };
+    par_le_montage.min(concurrence_pour_disque(rotatif))
+}
+
+/// Le type de système de fichiers est-il un accès réseau ?
+///
+/// Comparaison insensible à la casse, sur la liste explicite ci-dessus.
+pub(crate) fn est_systeme_de_fichiers_reseau(systeme: &str) -> bool {
+    let systeme = systeme.trim().to_ascii_lowercase();
+    SYSTEMES_DE_FICHIERS_RESEAU.contains(&systeme.as_str())
+}
+
+/// Type de système de fichiers portant `chemin`, d'après le contenu de
+/// `/proc/self/mountinfo`.
+///
+/// Fonction PURE : le contenu du fichier arrive en argument.
+///
+/// Format d'une ligne (`Documentation/filesystems/proc.rst`) :
+/// `36 35 98:0 /mnt1 /mnt rw,noatime <champs optionnels> - ext3 /dev/root rw`.
+/// Le point de montage est le 5ᵉ champ ; le type vient JUSTE APRÈS le séparateur
+/// ` - `, dont l'existence même est là pour absorber un nombre variable de
+/// champs optionnels (`shared:`, `master:`…). Découper naïvement à l'index 8
+/// donnerait le type d'à côté sur un montage partagé.
+///
+/// C'est le point de montage **le plus long** qui préfixe le chemin qui gagne :
+/// avec `/` en ext4 et `/mnt/nas` en cifs, un appariement sur le premier préfixe
+/// venu rendrait `ext4` pour tout le monde. La comparaison se fait par
+/// COMPOSANTS (`Path::starts_with`), sinon `/mnt/nasty` passerait pour du
+/// `/mnt/nas`.
+pub(crate) fn systeme_de_fichiers_du_chemin(
+    mountinfo: &str,
+    chemin: &std::path::Path,
+) -> Option<String> {
+    let mut meilleur: Option<(usize, String)> = None;
+    for ligne in mountinfo.lines() {
+        // Une ligne tronquée ou inattendue est SAUTÉE, jamais fatale : elle ne
+        // doit pas faire perdre les montages parfaitement lisibles d'à côté.
+        let Some((avant, apres)) = separer_champs_mountinfo(ligne) else {
+            continue;
+        };
+        let (Some(brut), Some(systeme)) = (
+            avant.split_whitespace().nth(4),
+            apres.split_whitespace().next(),
+        ) else {
+            continue;
+        };
+        let point_de_montage = std::path::PathBuf::from(demasquer_octal(brut));
+        if !chemin.starts_with(&point_de_montage) {
+            continue;
+        }
+        let profondeur = point_de_montage.components().count();
+        if meilleur.as_ref().is_none_or(|(p, _)| profondeur >= *p) {
+            meilleur = Some((profondeur, systeme.to_string()));
+        }
+    }
+    meilleur.map(|(_, systeme)| systeme)
+}
+
+/// Coupe une ligne de `mountinfo` au séparateur ` - `.
+///
+/// Le dernier séparateur fait foi : un point de montage peut légitimement
+/// contenir ` - ` (il serait alors masqué en octal pour l'espace… mais les
+/// options de super-bloc, elles, ne contiennent jamais d'espace nu).
+fn separer_champs_mountinfo(ligne: &str) -> Option<(&str, &str)> {
+    let position = ligne.rfind(" - ")?;
+    Some((&ligne[..position], &ligne[position + 3..]))
+}
+
+/// Rend les échappements octaux de `mountinfo` : le noyau y masque l'espace, la
+/// tabulation, le saut de ligne et l'antislash. Un dossier « /mnt/My Music »
+/// apparaît en `/mnt/My\040Music`, et sans ce décodage il ne s'apparierait avec
+/// rien.
+fn demasquer_octal(brut: &str) -> String {
+    let mut sortie = String::with_capacity(brut.len());
+    let mut reste = brut;
+    while let Some(position) = reste.find('\\') {
+        sortie.push_str(&reste[..position]);
+        let suite = &reste[position + 1..];
+        match suite
+            .get(..3)
+            .and_then(|octal| u8::from_str_radix(octal, 8).ok())
+        {
+            Some(octet) => {
+                sortie.push(octet as char);
+                reste = &suite[3..];
+            }
+            None => {
+                sortie.push('\\');
+                reste = suite;
+            }
+        }
+    }
+    sortie.push_str(reste);
+    sortie
+}
+
+/// Premier dossier de musique configuré — le chemin dont on veut connaître le
+/// stockage. Partagé avec `disque_rotatif` pour que les deux sondes parlent bien
+/// du MÊME chemin. Repli sur `/` quand rien n'est configuré.
+pub(crate) fn racine_scannee() -> std::path::PathBuf {
+    std::env::var("TUNE_MUSIC_DIRS")
+        .ok()
+        .and_then(|v| {
+            serde_json::from_str::<Vec<String>>(&v)
+                .ok()
+                .and_then(|d| d.into_iter().next())
+        })
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
+/// Contenu de `/proc/self/mountinfo`, ou `None`.
+///
+/// Linux seulement, et volontairement : macOS (`statfs.f_fstypename`) et Windows
+/// (`WNetGetConnection`, `GetDriveType`) exposent l'information par des API
+/// totalement différentes, non compilables ni éprouvables ici. Ils rendent donc
+/// `None` et gardent les 32 lectures d'avant — la RÈGLE, elle, est déjà partagée
+/// et n'attendra qu'une sonde le jour où l'un des deux sera mesurable.
+///
+/// Un `/proc` illisible n'empêche jamais un scan : on journalise et on retombe
+/// sur le comportement d'origine.
+fn mountinfo() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string("/proc/self/mountinfo") {
+            Ok(contenu) => Some(contenu),
+            Err(e) => {
+                warn!(
+                    erreur = %e,
+                    "/proc/self/mountinfo illisible : concurrence de scan non adaptée au montage réseau"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// Concurrence adaptée au type de disque, une fois le réglage manuel écarté.
@@ -122,19 +341,17 @@ pub(crate) fn concurrence_pour_disque(rotatif: Option<bool>) -> usize {
 /// n'est qu'une heuristique de performance, elle ne doit jamais empêcher un
 /// scan. Lue une seule fois par processus — le pool n'est construit qu'une
 /// fois, et un disque ne change pas de nature en cours de route.
+///
+/// AVEUGLE AUX MONTAGES RÉSEAU, par construction : un partage CIFS ou NFS n'a
+/// pas de périphérique bloc, `/sys/dev/block/<maj>:<min>` n'existe donc pas et
+/// cette sonde rend `None` — c'est-à-dire « garde 32 », sur le lien réseau d'un
+/// NAS grand public (Pierre M, fil 1043 : time-outs en rafale). C'est
+/// `systeme_de_fichiers_du_chemin` qui couvre ce cas, en parallèle.
 pub(crate) fn disque_rotatif() -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
-        let racine = std::env::var("TUNE_MUSIC_DIRS")
-            .ok()
-            .and_then(|v| {
-                serde_json::from_str::<Vec<String>>(&v)
-                    .ok()
-                    .and_then(|d| d.into_iter().next())
-            })
-            .unwrap_or_else(|| "/".to_string());
-        let dev = std::fs::metadata(&racine).ok()?.dev();
+        let dev = std::fs::metadata(racine_scannee()).ok()?.dev();
         let (majeur, mineur) = (unsafe { libc::major(dev) }, unsafe { libc::minor(dev) });
         let base = format!("/sys/dev/block/{majeur}:{mineur}");
         for chemin in [
@@ -413,7 +630,7 @@ enum ReadFileError {
 /// duration instead of leaving the track at duration 0. (Pierre M's NAS,
 /// Philippe Landes' RS130 SSD)
 fn read_file_with_retry(
-    path: &PathBuf,
+    path: &Path,
     with_hash: bool,
 ) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
     let result = match read_file_with_timeout(path, with_hash, FILE_TIMEOUT) {
@@ -487,14 +704,14 @@ fn probe_dsd_header_duration_bounded(path: &std::path::Path) -> Option<u64> {
 }
 
 fn read_file_with_timeout(
-    path: &PathBuf,
+    path: &Path,
     with_hash: bool,
     tag_timeout: Duration,
 ) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
     // Phase 1 — read the tags. This is fast even on a NAS (only the header /
     // tag blocks are read), so `tag_timeout` is plenty. A timeout here means the
     // tags are genuinely unreadable → caller falls back to filename metadata.
-    let meta_path = path.clone();
+    let meta_path = path.to_path_buf();
     let (mtx, mrx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = match crate::audio::support::library_audio_support(&meta_path) {
@@ -524,7 +741,7 @@ fn read_file_with_timeout(
     // and just skip the hash (audio_hash = None) instead of dropping the track
     // to filename-only metadata. Dedup is degraded for that one file, nothing
     // more.
-    let hash_path = path.clone();
+    let hash_path = path.to_path_buf();
     let (htx, hrx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = htx.send(compute_audio_hash(&hash_path));
@@ -1497,6 +1714,90 @@ pub fn scan_files_parallel(
 /// Balances memory usage vs. rayon thread-pool efficiency.
 pub const SCAN_BATCH_SIZE: usize = 500;
 
+/// Répartit `files` en lots d'au plus `batch_size` chemins **sans jamais
+/// séparer les fichiers d'un même dossier**.
+///
+/// Le scan décide « ce dossier est-il une compilation ? » sur le LOT qu'on lui
+/// donne (`TrackImporter::begin_batch`). Le découpage précédent — un
+/// `chunks(500)` sur l'ordre de parcours — coupait donc les albums de plus de
+/// 500 pistes, mais surtout **tous** ceux qui tombaient à cheval sur une
+/// frontière : le même dossier était jugé deux fois, sur deux populations
+/// différentes, et le tag « compilation » sortait « au hasard » d'un scan à
+/// l'autre (Pierre M, fil 1043, #3232).
+///
+/// Le regroupement est aussi nécessaire dans l'autre sens : `WalkDir` descend
+/// en profondeur, donc les fichiers d'un dossier ne sont même pas contigus dès
+/// qu'un sous-dossier (`CD2/`) s'intercale entre deux d'entre eux. La
+/// contiguïté supposée par l'ancien commentaire n'a jamais existé.
+///
+/// Garanties :
+/// - aucun lot ne dépasse `batch_size` — le plafond mémoire du scan (un lot de
+///   `ScannedFile` en vol, pochettes embarquées comprises, celles qui ont fait
+///   sauter la machine de JeromeQ) est **inchangé** ;
+/// - l'ordre est déterministe : les dossiers sortent dans l'ordre de leur
+///   PREMIER fichier, et les fichiers d'un dossier dans l'ordre du parcours ;
+/// - seul un dossier qui contient à lui seul plus de `batch_size` fichiers est
+///   encore coupé — il ne tiendrait pas dans un lot sans lever le plafond. Le
+///   cas est journalisé, et il ne concerne pas un album (500 pistes dans UN
+///   dossier).
+///
+/// Le coût est en RÉFÉRENCES, pas en métadonnées : deux `&Path` par fichier et
+/// une entrée de table par dossier, soit quelques mégaoctets pour une
+/// bibliothèque de 58 000 fichiers — sans commune mesure avec les 6,1 Gio d'un
+/// lot de pochettes.
+pub fn lots_alignes_sur_les_dossiers(files: &[PathBuf], batch_size: usize) -> Vec<Vec<&Path>> {
+    let taille = if batch_size == 0 {
+        SCAN_BATCH_SIZE
+    } else {
+        batch_size
+    };
+    // Ordre de première apparition des dossiers + leurs fichiers.
+    let mut ordre: Vec<&Path> = Vec::new();
+    let mut par_dossier: HashMap<&Path, Vec<&Path>> = HashMap::new();
+    for f in files {
+        let dossier = f.parent().unwrap_or_else(|| Path::new(""));
+        par_dossier
+            .entry(dossier)
+            .or_insert_with(|| {
+                ordre.push(dossier);
+                Vec::new()
+            })
+            .push(f.as_path());
+    }
+
+    let mut lots: Vec<Vec<&Path>> = Vec::new();
+    let mut courant: Vec<&Path> = Vec::new();
+    for dossier in ordre {
+        let mut groupe = par_dossier.remove(dossier).unwrap_or_default();
+        if groupe.len() > taille {
+            // Plus gros qu'un lot entier : le garder d'un bloc lèverait le
+            // plafond mémoire du scan. On le coupe, et on le DIT — c'est le
+            // seul cas où la décision « compilation » reste partielle.
+            warn!(
+                dossier = %dossier.display(),
+                fichiers = groupe.len(),
+                taille_de_lot = taille,
+                "scan_dossier_plus_gros_qu_un_lot — la décision « compilation » de ce dossier sera prise par morceaux"
+            );
+            if !courant.is_empty() {
+                lots.push(std::mem::take(&mut courant));
+            }
+            for morceau in groupe.chunks(taille) {
+                lots.push(morceau.to_vec());
+            }
+            continue;
+        }
+        if !courant.is_empty() && courant.len() + groupe.len() > taille {
+            lots.push(std::mem::take(&mut courant));
+        }
+        courant.append(&mut groupe);
+    }
+    if !courant.is_empty() {
+        lots.push(courant);
+    }
+    lots
+}
+
 /// Scan files in batches, calling `on_batch` after each chunk is parsed.
 ///
 /// This enables **progressive availability**: each batch can be committed to
@@ -1506,6 +1807,12 @@ pub const SCAN_BATCH_SIZE: usize = 500;
 /// The callback receives `(batch: Vec<ScannedFile>, batch_index: usize, total_files: usize)`.
 /// It runs on a rayon worker thread, so the caller must ensure any shared
 /// state (DB handle, caches) is `Send + Sync`.
+///
+/// Les lots sont **alignés sur les dossiers** — voir
+/// [`lots_alignes_sur_les_dossiers`]. `batch_size` reste un PLAFOND : un lot
+/// peut être plus petit pour ne pas couper un dossier en deux, mais jamais
+/// plus gros. C'est ce qui rend la décision « compilation » indépendante du
+/// découpage (#3232).
 ///
 /// Elle REND ce qu'elle a réellement écrit ([`EcrituresDuLot`]) : le parcours
 /// ne touche pas à la base et ne peut donc pas mesurer lui-même ce qu'elle a
@@ -1536,7 +1843,14 @@ pub fn scan_files_batched(
     // back to the default rayon pool if it couldn't be built.
     let io_pool = scan_io_pool();
 
-    for (batch_idx, chunk) in files.chunks(batch_sz).enumerate() {
+    // Un DOSSIER ne doit pas être coupé entre deux lots : la décision
+    // « compilation » se prend sur le lot, et un album à cheval était jugé
+    // deux fois sur deux populations différentes (#3232).
+    let mut deja_lus = 0usize;
+    for (batch_idx, chunk) in lots_alignes_sur_les_dossiers(files, batch_sz)
+        .into_iter()
+        .enumerate()
+    {
         // Parse metadata in parallel within this chunk
         let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let batch_timeout_counter = AtomicUsize::new(0);
@@ -1545,6 +1859,7 @@ pub fn scan_files_batched(
             chunk
                 .par_iter()
                 .map(|path| {
+                    let path: &Path = path;
                     // NFC-normalize: see comment in scan_files_parallel
                     let path_str: String = path.to_string_lossy().nfc().collect();
                     warn_unsafe_path_text(&path_str);
@@ -1691,10 +2006,15 @@ pub fn scan_files_batched(
             );
         }
 
+        // Compteur RÉEL de fichiers lus. Les lots n'ont plus tous la même
+        // taille (ils s'arrêtent aux frontières de dossier), donc
+        // `(batch_idx + 1) * batch_sz` annoncerait plus de fichiers lus qu'il
+        // n'y en a — et jusqu'à `total` bien avant la fin.
+        deja_lus += batch.len();
         info!(
             batch = batch_idx,
             batch_size = batch.len(),
-            scanned = (batch_idx + 1) * batch_sz,
+            scanned = deja_lus,
             total,
             "scan_batch_complete"
         );
@@ -1787,6 +2107,167 @@ mod tests {
         assert!((1..=256).contains(&n), "concurrence hors bornes : {n}");
     }
 
+    /// Un `/proc/self/mountinfo` réaliste : racine ext4, un `/mnt` ext4 qui
+    /// PORTE un `/mnt/nas` en cifs (le piège de l'appariement), un NFSv4, un
+    /// point de montage à espace masqué, et un `/mnt/nasty` local dont le nom
+    /// commence par les mêmes lettres que `/mnt/nas`.
+    const MOUNTINFO: &str = concat!(
+        "21 26 0:20 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw\n",
+        "26 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw,errors=remount-ro\n",
+        "40 26 8:17 / /mnt rw,relatime shared:22 - ext4 /dev/sdb1 rw\n",
+        "55 40 0:52 / /mnt/nas rw,relatime shared:29 - cifs //192.168.1.20/musique rw,vers=3.1.1\n",
+        "56 26 0:53 / /mnt/nfs rw,relatime shared:30 - nfs4 192.168.1.30:/export rw\n",
+        "57 26 0:54 / /mnt/My\\040Music rw,relatime shared:31 - cifs //192.168.1.20/mm rw\n",
+        "58 26 8:33 / /mnt/nasty rw,relatime shared:32 - btrfs /dev/sdc1 rw\n",
+    );
+
+    fn concurrence(chemin: &str) -> usize {
+        concurrence_pour_stockage(Some(MOUNTINFO), std::path::Path::new(chemin), Some(false))
+    }
+
+    /// Le correctif lui-même : un fichier sur un partage CIFS ou NFS ne doit
+    /// plus être lu à 32 en parallèle. C'est le NAS QNAP de Pierre M (fil 1043,
+    /// #2934) : la sonde `/sys` ne voit rien d'un montage réseau — pas de
+    /// périphérique bloc — donc elle rendait `None`, c'est-à-dire « garde 32 ».
+    #[test]
+    fn un_montage_reseau_reduit_la_concurrence() {
+        assert_eq!(concurrence("/mnt/nas/musique/album/01.flac"), 8);
+        assert_eq!(concurrence("/mnt/nfs/musique/album/01.flac"), 8);
+        // Et bien en dessous de la valeur locale, sinon le correctif ne corrige
+        // rien du tout.
+        assert!(concurrence("/mnt/nas/musique") < SCAN_IO_CONCURRENCY);
+    }
+
+    /// LE TÉMOIN. Un disque local rapide garde ses 32 lectures parallèles :
+    /// c'est ce qui rend supportable le scan d'une grosse bibliothèque locale,
+    /// et le correctif ne doit surtout pas le dégrader « par prudence ».
+    #[test]
+    fn un_montage_local_garde_les_trente_deux() {
+        assert_eq!(concurrence("/home/tune/Musique/album/01.flac"), 32);
+        assert_eq!(concurrence("/mnt/photos/album/01.flac"), 32);
+        assert_eq!(concurrence("/mnt/nasty/album/01.flac"), 32);
+        // Les types locaux des trois plateformes ne sont jamais pris pour du
+        // réseau — y compris celui de macOS, que la liste doit ignorer.
+        for local in ["ext4", "btrfs", "apfs", "xfs", "ntfs", "vfat", "zfs"] {
+            assert!(
+                !est_systeme_de_fichiers_reseau(local),
+                "{local} pris pour un montage réseau"
+            );
+        }
+    }
+
+    /// L'APPARIEMENT LE PLUS LONG GAGNE. `/` et `/mnt` sont en ext4, `/mnt/nas`
+    /// en cifs : un appariement sur le premier préfixe venu rendrait « ext4 »
+    /// pour tout le monde, et le correctif serait mort-né.
+    ///
+    /// La comparaison se fait par COMPOSANTS : `/mnt/nasty` commence par les
+    /// mêmes lettres que `/mnt/nas` sans être dessous.
+    #[test]
+    fn le_point_de_montage_le_plus_long_gagne() {
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(
+                MOUNTINFO,
+                std::path::Path::new("/mnt/nas/musique/album/01.flac")
+            )
+            .as_deref(),
+            Some("cifs")
+        );
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(MOUNTINFO, std::path::Path::new("/mnt/photos"))
+                .as_deref(),
+            Some("ext4")
+        );
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(MOUNTINFO, std::path::Path::new("/mnt/nasty/x.flac"))
+                .as_deref(),
+            Some("btrfs")
+        );
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(MOUNTINFO, std::path::Path::new("/var/lib/tune"))
+                .as_deref(),
+            Some("ext4")
+        );
+    }
+
+    /// Le type vient APRÈS le séparateur ` - `, jamais à un index fixe : le
+    /// nombre de champs optionnels (`shared:`, `master:`…) varie d'une ligne à
+    /// l'autre, c'est précisément la raison d'être de ce séparateur.
+    #[test]
+    fn le_type_est_lu_apres_le_separateur_meme_sans_champ_optionnel() {
+        let sans_champ_optionnel =
+            "55 40 0:52 / /mnt/nas rw,relatime - cifs //192.168.1.20/musique rw\n";
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(
+                sans_champ_optionnel,
+                std::path::Path::new("/mnt/nas/x.flac")
+            )
+            .as_deref(),
+            Some("cifs")
+        );
+    }
+
+    /// Un point de montage à espace — « /mnt/My Music » — arrive masqué en
+    /// `\040` ; sans décodage il ne s'apparierait avec rien et le partage
+    /// repasserait à 32.
+    #[test]
+    fn les_echappements_octaux_sont_rendus() {
+        assert_eq!(demasquer_octal("/mnt/My\\040Music"), "/mnt/My Music");
+        assert_eq!(demasquer_octal("/mnt/nas"), "/mnt/nas");
+        // Un antislash qui n'introduit pas un octal valide est gardé tel quel.
+        assert_eq!(demasquer_octal("/mnt/a\\zb"), "/mnt/a\\zb");
+        assert_eq!(concurrence("/mnt/My Music/album/01.flac"), 8);
+    }
+
+    /// `mountinfo` absent (hors Linux, `/proc` non monté) ou illisible : repli
+    /// EXACT sur le comportement d'avant, quel que soit le type de disque. La
+    /// lecture, elle, journalise son échec — voir `mountinfo()`.
+    #[test]
+    fn sans_mountinfo_le_comportement_d_origine_est_conserve() {
+        for rotatif in [Some(true), Some(false), None] {
+            assert_eq!(
+                concurrence_pour_stockage(None, std::path::Path::new("/mnt/nas/x.flac"), rotatif),
+                concurrence_pour_disque(rotatif)
+            );
+        }
+        // Contenu illisible : aucune ligne exploitable, donc aucun verdict.
+        let charabia = "pas du tout un mountinfo\n\n???\n";
+        assert_eq!(
+            concurrence_pour_stockage(
+                Some(charabia),
+                std::path::Path::new("/mnt/nas/x.flac"),
+                Some(false)
+            ),
+            SCAN_IO_CONCURRENCY
+        );
+        // Une ligne tronquée ne doit pas faire perdre les lignes saines d'à côté.
+        let partiellement_casse = concat!(
+            "ligne tronquee sans separateur\n",
+            "55 40 0:52 / /mnt/nas rw - cifs //nas/musique rw\n",
+        );
+        assert_eq!(
+            concurrence_pour_stockage(
+                Some(partiellement_casse),
+                std::path::Path::new("/mnt/nas/x.flac"),
+                Some(false)
+            ),
+            8
+        );
+    }
+
+    /// Les deux verdicts décrivent deux goulots différents ; le plus étroit
+    /// commande. Un partage monté depuis un disque à plateaux local reste à 4.
+    #[test]
+    fn le_verdict_le_plus_etroit_commande() {
+        assert_eq!(
+            concurrence_pour_stockage(
+                Some(MOUNTINFO),
+                std::path::Path::new("/mnt/nas/x.flac"),
+                Some(true)
+            ),
+            4
+        );
+    }
+
     /// Le réglage manuel est éprouvé SANS toucher à l'environnement.
     ///
     /// Ce test écrivait dans `TUNE_SCAN_IO_CONCURRENCY` avec `set_var`, en se
@@ -1801,7 +2282,8 @@ mod tests {
         // Sans variable, c'est le TYPE DE DISQUE qui décide (#1948) — plus la
         // constante. Comparer à la constante ferait passer ce test par chance
         // sur un runner à SSD, et échouer sur une machine à plateaux.
-        let sans_variable = concurrence_pour_disque(disque_rotatif());
+        let sans_variable =
+            concurrence_pour_stockage(mountinfo().as_deref(), &racine_scannee(), disque_rotatif());
         assert_eq!(concurrence_depuis_reglage(None), sans_variable);
 
         assert_eq!(concurrence_depuis_reglage(Some("8")), 8);
@@ -2956,5 +3438,92 @@ mod tests {
             1 + distinctes.len(),
             "retenues : {retenues:?}"
         );
+    }
+
+    /// #3232 — un DOSSIER ne peut plus être coupé entre deux lots.
+    ///
+    /// L'ordre d'entrée est celui de `WalkDir`, qui descend en profondeur : les
+    /// fichiers de `/album` sont séparés par ceux de `/album/CD2`. Ils n'ont
+    /// donc jamais été contigus, contrairement à ce qu'affirmait le
+    /// commentaire de `begin_batch`.
+    #[test]
+    fn un_dossier_n_est_jamais_coupe_entre_deux_lots() {
+        let entree: Vec<PathBuf> = [
+            "/m/album/01.flac",
+            "/m/album/02.flac",
+            "/m/album/CD2/01.flac", // WalkDir s'engouffre dans le sous-dossier…
+            "/m/album/CD2/02.flac",
+            "/m/album/03.flac", // …et revient ensuite au dossier parent.
+            "/m/autre/01.flac",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+
+        for taille in 1..=8usize {
+            let lots = lots_alignes_sur_les_dossiers(&entree, taille);
+            // Rien n'est perdu, rien n'est dupliqué.
+            let mut vus: Vec<&Path> = lots.iter().flatten().copied().collect();
+            vus.sort_unstable();
+            let mut attendus: Vec<&Path> = entree.iter().map(|p| p.as_path()).collect();
+            attendus.sort_unstable();
+            assert_eq!(
+                vus, attendus,
+                "taille {taille} : la liste doit être intacte"
+            );
+            // Le plafond mémoire du scan est inchangé.
+            for lot in &lots {
+                assert!(
+                    lot.len() <= taille,
+                    "taille {taille} : un lot de {} dépasse le plafond",
+                    lot.len()
+                );
+            }
+            if taille < 3 {
+                // Un lot plus petit que le dossier ne peut pas le contenir :
+                // c'est le seul cas dégradé, et il est journalisé.
+                continue;
+            }
+            // Chaque dossier tient dans UN lot et un seul.
+            let mut lot_du_dossier: HashMap<&Path, usize> = HashMap::new();
+            for (i, lot) in lots.iter().enumerate() {
+                for f in lot {
+                    let dossier = f.parent().unwrap();
+                    let precedent = lot_du_dossier.entry(dossier).or_insert(i);
+                    assert_eq!(
+                        *precedent,
+                        i,
+                        "taille {taille} : {} est réparti sur deux lots",
+                        dossier.display()
+                    );
+                }
+            }
+            assert_eq!(lot_du_dossier.len(), 3, "trois dossiers distincts");
+        }
+    }
+
+    /// Le seul cas dégradé, nommé : un dossier plus gros qu'un lot entier ne
+    /// tient pas dans un lot. Il est coupé — lever le plafond ferait rentrer
+    /// des milliers de pochettes embarquées en mémoire d'un coup — mais aucun
+    /// lot ne dépasse la taille demandée, et les autres dossiers restent
+    /// entiers.
+    #[test]
+    fn un_dossier_plus_gros_qu_un_lot_est_coupe_sans_lever_le_plafond() {
+        let mut entree: Vec<PathBuf> = (0..7)
+            .map(|n| PathBuf::from(format!("/m/gros/{n:02}.flac")))
+            .collect();
+        entree.push(PathBuf::from("/m/petit/01.flac"));
+
+        let lots = lots_alignes_sur_les_dossiers(&entree, 3);
+        assert!(lots.iter().all(|l| l.len() <= 3));
+        assert_eq!(lots.iter().map(|l| l.len()).sum::<usize>(), 8);
+        // Le petit dossier, lui, n'est pas dispersé.
+        let lots_du_petit: Vec<usize> = lots
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.iter().any(|f| f.starts_with("/m/petit")))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(lots_du_petit.len(), 1);
     }
 }

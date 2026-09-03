@@ -127,6 +127,22 @@ fn queue_stayed_empty(add_body: &str) -> bool {
     xml_attr(add_body, "playlist", "length") == Some("0")
 }
 
+/// Le Node a-t-il ACQUITTE un `/Clear` sans vider sa file ?
+///
+/// La BluOS Custom Integration API (v1.7, § 5.4 « Clear Queue ») documente la
+/// reponse d'un Clear reussi : `<playlist modified="0" length="0" id="1056"/>`
+/// — la longueur annoncee est 0. Une longueur qu'on sait lire et qui n'est PAS
+/// nulle dit donc que la file est restee pleine, et que l'entree 0 que le
+/// `/Play?id=0` de `play_media` va jouer n'est pas celle qu'on vient
+/// d'ajouter : c'est une piste de l'album precedent (Scordia).
+///
+/// Une reponse qu'on ne sait pas lire ne signale rien — meme sens de defaut
+/// que `queue_stayed_empty`, on ne declare personne en panne sur notre
+/// ignorance du dialecte.
+fn clear_laisse_la_file_pleine(clear_body: &str) -> bool {
+    xml_attr(clear_body, "playlist", "length").is_some_and(|l| l != "0")
+}
+
 /// Le Node a-t-il refuse la piste tout en repondant 200 ?
 ///
 /// Vrai seulement quand les DEUX reponses concordent : la file annoncee par
@@ -179,8 +195,40 @@ impl OutputTarget for BluosOutput {
         // auto-advanced onto them at every track transition (Scordia: a new CD
         // plays track 1, then jumps to the previous CD's tracks — "in memory"
         // yet absent from Tune's own queue/history, because they live on the
-        // Node). Fire-and-forget: a failed Clear must not block playback.
-        let _ = self.api_get("Clear", &[]).await;
+        // Node).
+        //
+        // Le resultat etait JETE (`let _ = …`). Qu'un Clear rate n'empeche pas
+        // la lecture est le sens voulu et on le garde ; qu'il soit MUET ne l'est
+        // pas. Quand le Node est injoignable ou repond 500, ses pistes restent
+        // en file et le `/Play?id=0` plus bas joue l'entree 0 — donc une piste
+        // de l'album precedent, exactement le defaut que ce Clear existe pour
+        // empecher. Et la garde des deux signaux de #1514 ne peut pas le voir :
+        // la file n'est pas vide et l'appareil joue. Sans cette ligne de
+        // journal, la seule commande qui a echoue ne laisse aucune trace.
+        //
+        // L'ORDRE, lui, etait deja garanti par le `.await` : l'`Add` ne part
+        // qu'une fois la reponse du Clear recue. Cf le temoin
+        // `l_add_ne_part_pas_avant_que_le_clear_ait_rendu`.
+        match self.api_get("Clear", &[]).await {
+            Ok(corps) => {
+                if clear_laisse_la_file_pleine(&corps) {
+                    // Acquitte n'est pas applique : 200, et une file encore
+                    // pleine. L'entree 0 n'est pas la notre.
+                    warn!(
+                        device = %self.name,
+                        reply = %truncate_body(&corps),
+                        "bluos_clear_acquitte_file_non_videe"
+                    );
+                } else {
+                    debug!(
+                        device = %self.name,
+                        reply = %truncate_body(&corps),
+                        "bluos_clear_reply"
+                    );
+                }
+            }
+            Err(e) => warn!(device = %self.name, error = %e, "bluos_clear_echec"),
+        }
 
         // Play THROUGH the Node's queue (/Add then /Play?id=0), not as a
         // /Play?url= custom stream. The custom stream lives OUTSIDE the queue:
@@ -518,6 +566,38 @@ mod tests {
     const PLAY_PAUSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?> <state>pause</state>"#;
     const PLAY_STREAM: &str = r#"<?xml version="1.0" encoding="UTF-8"?> <state>stream</state>"#;
 
+    // ── Le `Clear` qui precede l'`Add` : son resultat etait jete (#1996) ──
+    //
+    // `let _ = self.api_get("Clear", &[]).await` : tir-et-oublie AU SENS DU
+    // RESULTAT. Un Clear qui echoue laisse les pistes de l'album precedent en
+    // file ; le `/Play?id=0` qui suit joue alors l'entree 0, pas la notre — et
+    // Tune voit une file pleine et un appareil qui joue, donc la garde des deux
+    // signaux ne signale rien. Le seul temoin possible etait ce journal.
+
+    /// La reponse d'un `/Clear` reussi, telle que la documente la BluOS Custom
+    /// Integration API v1.7, § 5.4 « Clear Queue ».
+    const CLEAR_OK: &str =
+        r#"<?xml version="1.0" encoding="UTF-8"?> <playlist modified="0" length="0" id="1056"/>"#;
+    /// Le meme appel ACQUITTE — 200 — mais la file est restee pleine.
+    const CLEAR_FILE_PLEINE: &str =
+        r#"<?xml version="1.0" encoding="UTF-8"?> <playlist modified="1" length="3" id="1056"/>"#;
+
+    #[test]
+    fn un_clear_qui_vide_la_file_ne_signale_rien() {
+        assert!(!clear_laisse_la_file_pleine(CLEAR_OK));
+    }
+
+    #[test]
+    fn un_clear_acquitte_qui_laisse_la_file_pleine_est_detecte() {
+        assert!(clear_laisse_la_file_pleine(CLEAR_FILE_PLEINE));
+    }
+
+    #[test]
+    fn une_reponse_de_clear_illisible_ne_signale_rien() {
+        assert!(!clear_laisse_la_file_pleine("<ok/>"));
+        assert!(!clear_laisse_la_file_pleine(""));
+    }
+
     #[test]
     fn file_vide_et_pause_est_un_refus() {
         assert!(add_play_rejected(ADD_EMPTY, PLAY_PAUSE));
@@ -678,10 +758,34 @@ mod tests {
 
     #[derive(Clone)]
     struct NodeBouchon {
-        /// Les URI `/Add` recues, path + query, telles quelles.
+        /// Les URI recues, path + query, DANS L'ORDRE — `/Clear`, `/Add` et
+        /// `/Play` y passent tous les trois. C'est ce qui permet d'eprouver que
+        /// l'`Add` ne part pas avant que le `Clear` ait rendu.
         recues: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         code_add: axum::http::StatusCode,
         corps_add: String,
+        code_clear: axum::http::StatusCode,
+        corps_clear: String,
+        corps_play: String,
+        /// Le temps que le Node met a repondre au `/Clear`. Le bouchon
+        /// n'inscrit l'appel qu'APRES cette latence : un `Add` lance sans
+        /// attendre s'inscrirait donc AVANT lui.
+        latence_clear: std::time::Duration,
+    }
+
+    impl Default for NodeBouchon {
+        /// Un Node NOMINAL : il vide sa file, prend la piste, et joue.
+        fn default() -> Self {
+            Self {
+                recues: Default::default(),
+                code_add: axum::http::StatusCode::OK,
+                corps_add: ADD_OK.to_string(),
+                code_clear: axum::http::StatusCode::OK,
+                corps_clear: CLEAR_OK.to_string(),
+                corps_play: PLAY_STREAM.to_string(),
+                latence_clear: std::time::Duration::ZERO,
+            }
+        }
     }
 
     async fn add_bouchon(
@@ -692,17 +796,28 @@ mod tests {
         (etat.code_add, etat.corps_add.clone())
     }
 
+    async fn clear_bouchon(
+        axum::extract::State(etat): axum::extract::State<NodeBouchon>,
+        uri: axum::http::Uri,
+    ) -> (axum::http::StatusCode, String) {
+        tokio::time::sleep(etat.latence_clear).await;
+        etat.recues.lock().unwrap().push(uri.to_string());
+        (etat.code_clear, etat.corps_clear.clone())
+    }
+
+    async fn play_bouchon(
+        axum::extract::State(etat): axum::extract::State<NodeBouchon>,
+        uri: axum::http::Uri,
+    ) -> (axum::http::StatusCode, String) {
+        etat.recues.lock().unwrap().push(uri.to_string());
+        (axum::http::StatusCode::OK, etat.corps_play.clone())
+    }
+
     async fn demarrer_bouchon(etat: NodeBouchon) -> (u16, tokio::task::JoinHandle<()>) {
         let app = axum::Router::new()
             .route("/Add", axum::routing::get(add_bouchon))
-            .route(
-                "/Clear",
-                axum::routing::get(|| async { ADD_EMPTY.to_string() }),
-            )
-            .route(
-                "/Play",
-                axum::routing::get(|| async { PLAY_PAUSE.to_string() }),
-            )
+            .route("/Clear", axum::routing::get(clear_bouchon))
+            .route("/Play", axum::routing::get(play_bouchon))
             .with_state(etat);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -725,6 +840,7 @@ mod tests {
             recues: recues.clone(),
             code_add: axum::http::StatusCode::OK,
             corps_add: ADD_EMPTY.to_string(),
+            ..Default::default()
         })
         .await;
         let node = BluosOutput::new("Salon".into(), "d".into(), "127.0.0.1".into(), port);
@@ -784,6 +900,7 @@ mod tests {
             recues,
             code_add: axum::http::StatusCode::NOT_FOUND,
             corps_add: "<nothing/>".to_string(),
+            ..Default::default()
         })
         .await;
         let node = BluosOutput::new("Salon".into(), "d".into(), "127.0.0.1".into(), port);
@@ -806,6 +923,161 @@ mod tests {
         assert!(
             log.contains("968625a7-3a25-48a1-a86a-b962ce981046.flac"),
             "le refus par code HTTP doit nommer l'URL envoyee : {log}"
+        );
+    }
+
+    /// Joue la piste de Bilou sur un Node bouchonne.
+    ///
+    /// Rend l'issue, le journal de niveau WARN, et les URI recues DANS L'ORDRE.
+    async fn jouer_sur_bouchon(etat: NodeBouchon) -> (Result<(), String>, String, Vec<String>) {
+        let recues = etat.recues.clone();
+        let (port, tache) = demarrer_bouchon(etat).await;
+        let node = BluosOutput::new("Salon".into(), "d".into(), "127.0.0.1".into(), port);
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        // `set_default` et non `with_default` : cf le test gapless plus haut.
+        let garde = tracing::subscriber::set_default(abonne);
+        let issue = node.play_media(&media_bilou(FLUX_BILOU)).await;
+        drop(garde);
+        tache.abort();
+
+        let appels = recues.lock().unwrap().clone();
+        (issue, journal.texte(), appels)
+    }
+
+    #[tokio::test]
+    async fn un_clear_refuse_par_le_node_est_ecrit_dans_le_journal() {
+        // Le Node repond 500 au Clear : ses pistes restent en file, et
+        // `/Play?id=0` va jouer l'entree 0 — celle de l'album precedent.
+        // C'etait un silence COMPLET : `let _ =` jetait l'`Err`.
+        let (issue, log, appels) = jouer_sur_bouchon(NodeBouchon {
+            code_clear: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            corps_clear: "<error/>".to_string(),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(
+            log.contains("bluos_clear_echec"),
+            "un Clear refuse par le Node doit etre journalise : {log}"
+        );
+        // Non bloquant : un Clear rate ne doit pas empecher la lecture.
+        assert!(issue.is_ok(), "{issue:?}");
+        assert!(
+            appels.iter().any(|u| u.starts_with("/Add?")),
+            "l'Add doit partir quand meme : {appels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_clear_acquitte_sans_vider_la_file_est_signale() {
+        // Acquitte n'est pas applique : 200, et `length="3"`. Rien n'echoue au
+        // sens HTTP, et pourtant l'entree 0 n'est plus la notre.
+        let (issue, log, _) = jouer_sur_bouchon(NodeBouchon {
+            corps_clear: CLEAR_FILE_PLEINE.to_string(),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(
+            log.contains("bluos_clear_acquitte_file_non_videe"),
+            "un Clear acquitte qui laisse la file pleine doit etre signale : {log}"
+        );
+        assert!(issue.is_ok(), "{issue:?}");
+    }
+
+    #[tokio::test]
+    async fn l_add_ne_part_pas_avant_que_le_clear_ait_rendu() {
+        // Le bouchon n'inscrit le `/Clear` qu'apres 150 ms. Un `Add` lance sans
+        // attendre la reponse s'inscrirait donc en premier.
+        let (issue, _, appels) = jouer_sur_bouchon(NodeBouchon {
+            latence_clear: std::time::Duration::from_millis(150),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(issue.is_ok(), "{issue:?}");
+        assert_eq!(appels.len(), 3, "{appels:?}");
+        assert!(appels[0].starts_with("/Clear"), "{appels:?}");
+        assert!(appels[1].starts_with("/Add?"), "{appels:?}");
+        assert!(appels[2].starts_with("/Play?"), "{appels:?}");
+    }
+
+    #[tokio::test]
+    async fn le_temoin_un_node_nominal_ne_change_pas_de_conduite() {
+        // Contre-epreuve : quand tout se passe bien, RIEN ne doit s'ecrire en
+        // WARN, et les trois memes appels partent, dans le meme ordre qu'avant.
+        let (issue, log, appels) = jouer_sur_bouchon(NodeBouchon::default()).await;
+
+        assert!(issue.is_ok(), "{issue:?}");
+        assert!(
+            log.trim().is_empty(),
+            "le cas nominal doit rester muet : {log}"
+        );
+        assert_eq!(appels.len(), 3, "{appels:?}");
+        assert!(appels[2].contains("id=0"), "{appels:?}");
+    }
+
+    // ── Garde de site : plus aucune commande du Node jetee en silence ──────
+
+    /// La partie PRODUCTION de ce fichier, sans le module de test.
+    ///
+    /// `include_str!` rend le fichier ENTIER, ce module compris — ou le motif
+    /// cherche apparait en toutes lettres, dans le garde-fou lui-meme. Sans la
+    /// coupe, il se prouverait tout seul et resterait vert quoi qu'il arrive au
+    /// code de production.
+    fn production_de_ce_fichier(source: &str) -> &str {
+        source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(avant, _)| avant)
+            .expect("la coupe `#[cfg(test)] mod tests {` doit exister")
+    }
+
+    #[test]
+    fn aucune_commande_envoyee_au_node_ne_jette_son_resultat() {
+        let production = production_de_ce_fichier(include_str!("bluos.rs"));
+        for (i, ligne) in production.lines().enumerate() {
+            assert!(
+                !ligne.contains("let _ = self.api_get("),
+                "bluos.rs:{} — `{}` : le resultat d'une commande envoyee au Node \
+                 est jete. Un Clear qui echoue laisse les pistes de l'album \
+                 precedent en file, et le `/Play?id=0` qui suit joue l'entree 0 \
+                 (#1996). Journaliser l'echec, ou le remonter.",
+                i + 1,
+                ligne.trim()
+            );
+        }
+    }
+
+    #[test]
+    fn le_garde_de_site_mord_vraiment() {
+        // Contre-epreuve du detecteur : il doit voir le motif en production, et
+        // ne PAS se prouver sur le module de test qui le contient.
+        let en_production = concat!(
+            "fn f() {\n",
+            "    let _ = self.api_get(\"Clear\", &[]).await;\n",
+            "}\n",
+            "#[cfg(test)]\nmod tests {\n}\n"
+        );
+        assert!(
+            production_de_ce_fichier(en_production).contains("let _ = self.api_get("),
+            "le detecteur doit voir le motif en production"
+        );
+
+        let seulement_dans_les_tests = concat!(
+            "fn f() {}\n",
+            "#[cfg(test)]\nmod tests {\n",
+            "    // let _ = self.api_get(\n",
+            "}\n"
+        );
+        assert!(
+            !production_de_ce_fichier(seulement_dans_les_tests).contains("let _ = self.api_get("),
+            "le detecteur ne doit pas se prouver sur son propre module de test"
         );
     }
 }

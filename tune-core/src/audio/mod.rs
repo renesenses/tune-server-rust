@@ -33,6 +33,9 @@ pub mod iso_sacd;
 pub mod levels;
 pub mod m4a;
 pub mod mixer;
+/// Le repli mono dit quand il n'agit pas (#3254) — la disponibilité par zone du
+/// réglage `zone_{id}_mono_downmix` (#2362).
+pub mod mono_downmix;
 pub mod opus_ogg;
 pub mod pipeline;
 pub mod replaygain;
