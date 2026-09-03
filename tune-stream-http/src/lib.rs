@@ -726,6 +726,19 @@ pub async fn handle_stream(
             // chunk de plus.
             let my_epoch = session.claim_channel_consumer();
 
+            // ── Qui faisait attendre la sortie locale ? ──
+            //
+            // `stream_producer_ran_dry` ne couvre que le producteur à sec. Si
+            // les octets sont DÉJÀ dans le canal et que c'est le corps HTTP
+            // qui n'avance plus, le canal reste PLEIN et cette alerte se tait
+            // — pendant que la sortie locale, elle, attend sans limite de
+            // temps. Les deux attentes se mesurent ici, au même endroit :
+            // celle passée DANS `recv_chunk()` (le canal était vide) et celle
+            // passée DANS le `yield` (les octets étaient en main, c'est en
+            // aval qu'ils n'avançaient pas). Voir
+            // `StreamSession::note_delivery_stall`.
+            let mut attente_transport = std::time::Duration::ZERO;
+
             // ── L'en-tête WAV doit survivre aux connexions de sonde ──
             //
             // Sur une conversion, l'en-tête est le premier chunk DU CANAL : la
@@ -781,7 +794,8 @@ pub async fn handle_stream(
                 // Le regroupement est INTACT tant que le producteur est en
                 // avance : `buffered > 0` laisse le tampon se remplir et les
                 // trames de 64 Ko partent comme avant.
-                if let Some((buffered, max)) = session.channel_fill().await {
+                let remplissage = session.channel_fill().await;
+                if let Some((buffered, max)) = remplissage {
                     if session.note_channel_fill(buffered, max) {
                         warn!(
                             stream_id = %session.id,
@@ -795,21 +809,46 @@ pub async fn handle_stream(
                     }
                     if buffered == 0 && !coalesce_buf.is_empty() {
                         let restant = std::mem::take(&mut coalesce_buf);
+                        let avant_yield = tokio::time::Instant::now();
                         yield Ok(bytes::Bytes::from(restant));
+                        attente_transport += avant_yield.elapsed();
                     }
                 }
 
+                let avant_recv = tokio::time::Instant::now();
                 tokio::select! {
                     biased;
                     _ = &mut superseded => continue,
                     maybe_chunk = session.recv_chunk() => {
+                        let attente_producteur = avant_recv.elapsed();
+                        if session.note_delivery_stall(attente_producteur, attente_transport) {
+                            // `channel_max = 0` ne peut pas décrire un canal
+                            // vivant (sa capacité vaut au moins 1) : c'est le
+                            // marqueur d'un canal déjà fermé.
+                            let (buffered, channel_max) = remplissage.unwrap_or((0, 0));
+                            warn!(
+                                stream_id = %session.id,
+                                attente_producteur_ms = attente_producteur.as_millis() as u64,
+                                attente_transport_ms = attente_transport.as_millis() as u64,
+                                buffered,
+                                channel_max,
+                                bytes_sent = session
+                                    .bytes_sent
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                "stream_delivery_stall — le flux interne s'est arrêté de \
+                                 délivrer : `attente_producteur_ms` dit que le canal était vide \
+                                 et qu'on attendait le décodeur, `attente_transport_ms` que les \
+                                 octets étaient là et ne partaient pas"
+                            );
+                        }
+                        attente_transport = std::time::Duration::ZERO;
                         let Some(chunk) = maybe_chunk else {
                             // Canal fermé : fin de piste. Vider ce qui reste.
                             if !coalesce_buf.is_empty() {
                                 let restant = std::mem::take(&mut coalesce_buf);
                                 yield Ok(bytes::Bytes::from(restant));
                             }
-                            break;
+                            break; // fin de flux : plus rien à mesurer.
                         };
                         // Mettre l'en-tête de côté au passage, pour les
                         // connexions suivantes. `set` n'écrit qu'une fois.
@@ -828,7 +867,9 @@ pub async fn handle_stream(
                                 }
                                 while coalesce_buf.len() >= MIN_HTTP_CHUNK {
                                     let flushed: Vec<u8> = coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
+                                    let avant_yield = tokio::time::Instant::now();
                                     yield Ok(bytes::Bytes::from(flushed));
+                                    attente_transport += avant_yield.elapsed();
                                 }
                                 continue;
                             }
@@ -836,7 +877,9 @@ pub async fn handle_stream(
                         coalesce_buf.extend_from_slice(&chunk);
                         while coalesce_buf.len() >= MIN_HTTP_CHUNK {
                             let flushed: Vec<u8> = coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
+                            let avant_yield = tokio::time::Instant::now();
                             yield Ok(bytes::Bytes::from(flushed));
+                            attente_transport += avant_yield.elapsed();
                         }
                     }
                 }
@@ -1744,6 +1787,144 @@ mod tests {
                  producteur était en avance"
             );
         }
+    }
+
+    /// Prépare une session de conversion pré-remplie de `morceaux` blocs de
+    /// 32 768 octets, et rend la session plus la carte de sessions.
+    ///
+    /// Le canal est laissé OUVERT : ce n'est pas une fin de piste.
+    #[cfg(test)]
+    async fn session_pleine(
+        id: &str,
+        morceaux: usize,
+    ) -> (
+        std::sync::Arc<StreamSession>,
+        tune_core::http::streamer::SharedSessions,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new(id.into(), info, false, 16));
+        session.wav_header_included.store(true, SeqCst);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        for _ in 0..morceaux {
+            tx.send(vec![0xEE; 32_768]).await.expect("morceau");
+        }
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [(id.to_string(), session.clone())].into_iter().collect(),
+        ));
+        (session, sessions)
+    }
+
+    /// GARDE #2952 — un blocage EN AVAL du canal doit laisser une trace.
+    ///
+    /// `stream_producer_ran_dry` ne dit quelque chose que si le canal se VIDE.
+    /// Quand les octets sont déjà décodés et que c'est le corps HTTP qui
+    /// n'avance plus — réacteur affamé, socket qui ne se vide pas — le canal
+    /// reste PLEIN, l'alerte du producteur se tait, et RIEN côté serveur ne
+    /// dit pourquoi la sortie locale attend dans son `reader.read()` sans
+    /// limite de temps. C'est la moitié du ticket qui n'était pas instrumentée.
+    ///
+    /// Ici le producteur est en avance (canal plein) et c'est le CONSOMMATEUR
+    /// qui cesse de lire pendant 30 s. L'horloge est arrêtée puis avancée à la
+    /// main : le vert ne dépend pas de la charge de la machine.
+    #[tokio::test]
+    async fn un_blocage_du_transport_est_journalise_meme_avec_le_canal_plein() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (session, sessions) = session_pleine("aval", 6).await;
+
+        let rep = super::handle_stream(
+            Path("aval.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+
+        // Première trame : régime sain, rien à signaler.
+        let premiere = corps.next().await.expect("corps terminé").expect("flux");
+        assert_eq!(premiere.len(), 65_536);
+        assert!(
+            !session.stall_alert_emitted.load(Relaxed),
+            "une trame livrée normalement ne doit RIEN signaler"
+        );
+
+        // Le corps est suspendu DANS son `yield` : personne ne vient chercher
+        // la suite pendant 30 s, alors que le canal est plein.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::time::resume();
+
+        let seconde = corps.next().await.expect("corps terminé").expect("flux");
+        assert_eq!(seconde.len(), 65_536);
+        assert!(
+            session.stall_alert_emitted.load(Relaxed),
+            "30 s sans que les octets DÉJÀ décodés ne partent, et le serveur \
+             n'en dit rien : c'est le trou d'instrumentation de #2952"
+        );
+        assert!(
+            !session.dry_alert_emitted.load(Relaxed),
+            "le producteur était en avance : ne pas lui imputer le blocage"
+        );
+    }
+
+    /// TÉMOIN VERT du précédent : un flux lu au fil de l'eau ne signale rien.
+    /// Sans lui, une alerte posée sur « toute attente » passerait aussi.
+    #[tokio::test]
+    async fn un_flux_lu_au_fil_de_l_eau_ne_signale_aucun_blocage() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (session, sessions) = session_pleine("sain", 6).await;
+
+        let rep = super::handle_stream(
+            Path("sain.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+
+        for _ in 0..3 {
+            let trame = corps.next().await.expect("corps terminé").expect("flux");
+            assert_eq!(trame.len(), 65_536);
+        }
+        assert!(
+            !session.stall_alert_emitted.load(Relaxed),
+            "aucune attente n'a dépassé le seuil : rien ne doit être signalé"
+        );
+    }
+
+    /// Le seuil et la règle « une seule ligne par session » sont le contrat de
+    /// `note_delivery_stall`. Une attente sous le seuil ne dit rien ; la
+    /// première au-dessus alerte ; les suivantes se taisent.
+    #[test]
+    fn le_seuil_de_blocage_alerte_une_seule_fois() {
+        use std::time::Duration;
+        use tune_core::http::streamer::DELIVERY_STALL_THRESHOLD;
+
+        let info = StreamInfo::default();
+        let session = StreamSession::new("seuil".into(), info, false, 4);
+        let sous = DELIVERY_STALL_THRESHOLD - Duration::from_millis(1);
+
+        assert!(!session.note_delivery_stall(sous, sous));
+        assert!(
+            session.note_delivery_stall(Duration::ZERO, DELIVERY_STALL_THRESHOLD),
+            "une attente de transport au seuil doit alerter"
+        );
+        assert!(
+            !session.note_delivery_stall(DELIVERY_STALL_THRESHOLD * 10, Duration::ZERO),
+            "une seule ligne par session"
+        );
     }
 
     /// TÉMOIN VERT : une fin de piste reste une fin de piste, pas un trou. Le
