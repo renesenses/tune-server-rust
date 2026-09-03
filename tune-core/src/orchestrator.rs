@@ -1718,17 +1718,42 @@ pub(crate) fn requete_de_retablissement(
 /// les trois choses que l'auditeur ne peut pas deviner — quelle piste, à quelle
 /// position, et pourquoi la session n'est plus là.
 ///
+/// `position_ms` est FACULTATIF (#3244). Sur une zone navigateur personne ne
+/// mesure la position — le sondeur ne passe pas — et `position_ms` y vaut 0
+/// depuis `play()`. Écrire « ne peut pas reprendre à 0:00 » ferait passer cette
+/// absence de mesure pour une mesure, et désignerait le début du morceau alors
+/// que l'auditeur en était peut-être à la moitié. `None` dit « je ne sais pas »
+/// et la phrase le dit aussi : c'est la même distinction que
+/// [`PlaybackOrchestrator::position_entretenue_par_le_sondeur`] pose pour
+/// #2595, au site voisin.
+///
 /// Fonction PURE, éprouvée sans orchestrateur.
-pub(crate) fn message_session_perdue(titre: &str, position_ms: u64, cause: Option<&str>) -> String {
-    let secondes = position_ms / 1000;
-    let mut phrase = format!(
-        "La lecture de « {titre} » ne peut pas reprendre à {}:{:02} : sa session de \
-         flux n'a pas survécu à la pause (le serveur la libère après {} minutes \
-         sans lecture). Relancez la piste.",
-        secondes / 60,
-        secondes % 60,
-        crate::http::streamer::SESSION_IDLE_TIMEOUT.as_secs() / 60,
-    );
+pub(crate) fn message_session_perdue(
+    titre: &str,
+    position_ms: Option<u64>,
+    cause: Option<&str>,
+) -> String {
+    let minutes = crate::http::streamer::SESSION_IDLE_TIMEOUT.as_secs() / 60;
+    let mut phrase = match position_ms {
+        Some(ms) => {
+            let secondes = ms / 1000;
+            format!(
+                "La lecture de « {titre} » ne peut pas reprendre à {}:{:02} : sa session de \
+                 flux n'a pas survécu à la pause (le serveur la libère après {minutes} minutes \
+                 sans lecture). Relancez la piste.",
+                secondes / 60,
+                secondes % 60,
+            )
+        }
+        // Position non mesurée : on nomme la piste et la cause, jamais un
+        // horodatage inventé.
+        None => format!(
+            "La lecture de « {titre} » ne peut pas reprendre là où elle en était : sa \
+             session de flux n'a pas survécu à la pause (le serveur la libère après \
+             {minutes} minutes sans lecture), et cette zone est lue par le navigateur — \
+             le serveur n'y mesure pas la position de lecture. Relancez la piste."
+        ),
+    };
     if let Some(cause) = cause {
         phrase.push_str(&format!(" Cause : {cause}"));
     }
@@ -9786,11 +9811,13 @@ impl PlaybackOrchestrator {
         &self,
         zone_id: i64,
         titre: &str,
-        position_ms: u64,
+        position_ms: Option<u64>,
         cause: Option<&str>,
     ) -> OutputCommandError {
         let message = message_session_perdue(titre, position_ms, cause);
-        warn!(zone_id, position_ms, %message, "resume_stream_session_lost");
+        // `?position_ms` et non `position_ms` : le journal doit distinguer
+        // `Some(137000)` de `None`, pas écrire un `0` de plus (#3244).
+        warn!(zone_id, ?position_ms, %message, "resume_stream_session_lost");
         if let Some(ref bus) = self.event_bus {
             bus.emit(
                 "zone.playback_error",
@@ -9808,6 +9835,38 @@ impl PlaybackOrchestrator {
         // know where to resume from.
         let state = self.playback.get_state(zone_id).await;
         let position_ms = state.position_ms.max(0) as u64;
+        // #3244 — cette valeur est-elle une MESURE ?
+        //
+        // Jumeau de #2595 : `position_ms` n'est entretenue que par l'unique
+        // `update_position` de production du sondeur, et la boucle de transport
+        // de `poller.rs` `continue` avant lui quand la zone n'a pas de
+        // périphérique. Sur une zone navigateur la valeur reste donc figée à 0
+        // depuis `play()` pendant que le morceau avance dans l'onglet : zéro n'y
+        // est pas une position, c'est une absence de mesure.
+        //
+        // Ce que `resume` en fait, site par site :
+        //
+        // - `requete_de_retablissement` (le seul geste qui RELANCE à la
+        //   position) et le rattrapage `checked_seek` des renderers DLNA sont
+        //   déjà gardés par la présence d'une SORTIE — `did` / `device_id`. Or
+        //   cette présence est exactement le prédicat de
+        //   `position_entretenue_par_le_sondeur` : sans périphérique, aucune des
+        //   deux branches n'est atteinte. `resume` ne peut donc PAS relancer une
+        //   zone navigateur au début, et le défaut annoncé par #3244 n'est pas
+        //   atteignable par là ;
+        // - reste `dire_session_perdue`, qui ANNONCE la position à l'auditeur —
+        //   et celle-là n'est gardée par rien. Une zone navigateur dont la
+        //   session a été ramassée s'entendait dire « ne peut pas reprendre à
+        //   0:00 », un horodatage inventé qui désigne le début du morceau. C'est
+        //   ce que ce correctif ferme.
+        //
+        // On ne comble surtout pas la source : `streamer_bytes_sent` mesure le
+        // TÉLÉCHARGEMENT, pas l'écoute. Seul le client connaît sa position, et
+        // aucune route ne la remonte aujourd'hui (`SeekRequest` est une
+        // COMMANDE, pas un rapport).
+        let position_mesuree = self
+            .position_entretenue_par_le_sondeur(zone_id)
+            .then_some(position_ms);
 
         // Une reprise « sur place » suppose que la SESSION DE FLUX qui alimentait
         // la sortie a survécu à la pause. Deux façons d'y échouer, deux remèdes.
@@ -9917,7 +9976,7 @@ impl PlaybackOrchestrator {
                                 return Err(self.dire_session_perdue(
                                     zone_id,
                                     &np.title,
-                                    position_ms,
+                                    position_mesuree,
                                     Some(&e),
                                 ));
                             }
@@ -9928,7 +9987,7 @@ impl PlaybackOrchestrator {
                         return Err(self.dire_session_perdue(
                             zone_id,
                             &np.title,
-                            position_ms,
+                            position_mesuree,
                             None,
                         ));
                     }
@@ -15442,12 +15501,24 @@ mod tests {
     /// : « aucun son, volume dans le vide », et pas une ligne pour l'expliquer.
     #[test]
     fn le_message_de_session_perdue_nomme_la_piste_et_la_position() {
-        let seche = message_session_perdue("Sur la piste", 137_000, None);
+        let seche = message_session_perdue("Sur la piste", Some(137_000), None);
         assert!(seche.contains("Sur la piste"), "{seche}");
         assert!(seche.contains("2:17"), "la position doit y être : {seche}");
         assert!(seche.contains("30 minutes"), "{seche}");
-        let detaille = message_session_perdue("X", 0, Some("piste introuvable"));
+        let detaille = message_session_perdue("X", Some(0), Some("piste introuvable"));
         assert!(detaille.contains("piste introuvable"), "{detaille}");
+        // #3244 — position NON mesurée. Le message ne perd que l'horodatage :
+        // la piste, le délai et la cause restent, parce qu'ils sont connus.
+        // Les assertions ci-dessus n'ont pas bougé : seule leur signature a
+        // suivi le passage à `Option`, et un cas s'ajoute.
+        let inconnue = message_session_perdue("Sur la piste", None, Some("piste introuvable"));
+        assert!(inconnue.contains("Sur la piste"), "{inconnue}");
+        assert!(inconnue.contains("30 minutes"), "{inconnue}");
+        assert!(inconnue.contains("piste introuvable"), "{inconnue}");
+        assert!(
+            !inconnue.contains("0:00"),
+            "« 0:00 » n'est pas une position, c'est une absence de mesure : {inconnue}"
+        );
     }
 
     /// Prépare une zone qui JOUE une piste locale via une session de flux, puis
@@ -15456,14 +15527,31 @@ mod tests {
         track_id: Option<i64>,
         position_ms: i64,
     ) -> (PlaybackOrchestrator, i64, String) {
+        zone_en_pause_sur_une_piste_avec_sortie(track_id, position_ms, true).await
+    }
+    /// Même préparation, la SORTIE en moins quand `avec_sortie` est faux : une
+    /// zone NAVIGATEUR, sans `output_device_id`. C'est la forme que le sondeur
+    /// laisse sans position (#3244) — lui inventer une sortie effacerait le
+    /// défaut éprouvé.
+    async fn zone_en_pause_sur_une_piste_avec_sortie(
+        track_id: Option<i64>,
+        position_ms: i64,
+        avec_sortie: bool,
+    ) -> (PlaybackOrchestrator, i64, String) {
         let orch = test_orchestrator();
         let zone_id = ZoneRepo::with_backend(orch.db.clone())
-            .create("Salon", Some("mock"), Some("mock-salon"))
+            .create(
+                "Salon",
+                avec_sortie.then_some("mock"),
+                avec_sortie.then_some("mock-salon"),
+            )
             .unwrap();
-        orch.outputs
-            .lock()
-            .await
-            .register(Box::new(MockOutput::new("mock-salon", "Mock Salon")));
+        if avec_sortie {
+            orch.outputs
+                .lock()
+                .await
+                .register(Box::new(MockOutput::new("mock-salon", "Mock Salon")));
+        }
         // Une session de PISTE — `create_session`, pas `create_radio_session` :
         // c'est celle que le ramasse-miettes a le droit de prendre.
         let (sid, _tx, _ready) = orch
@@ -15607,6 +15695,49 @@ mod tests {
             mock.play_call_count().await,
             0,
             "session vivante ⇒ reprise sur place, aucune relecture"
+        );
+    }
+    /// #3244 — jumeau de #2595, site `resume`. Une zone NAVIGATEUR n'a pas de
+    /// position mesurée : la reprise ne doit ni relancer au début, ni ANNONCER
+    /// « 0:00 » comme si elle savait où on en était.
+    ///
+    /// La position vaut 0 parce que personne ne l'a jamais écrite — le sondeur
+    /// `continue` avant son `update_position` faute de périphérique — pendant
+    /// que le morceau avançait dans l'onglet.
+    #[tokio::test]
+    async fn la_reprise_dune_zone_navigateur_n_annonce_pas_une_position_inventee() {
+        let (orch, zone_id, sid) =
+            zone_en_pause_sur_une_piste_avec_sortie(Some(4242), 0, false).await;
+        // Sans ça l'épreuve ne mesurerait rien : c'est le prédicat de #3242 qui
+        // dit que cette zone-là n'est observée par personne.
+        assert!(
+            !orch.position_entretenue_par_le_sondeur(zone_id),
+            "une zone sans périphérique n'est pas sondée : sa position n'est pas mesurée"
+        );
+        le_ramasse_miettes_passe(&orch, &sid).await;
+        let erreur = orch
+            .resume(zone_id, None)
+            .await
+            .expect_err("session morte : la reprise doit le dire au lieu de se taire");
+        let message = erreur.to_string();
+        assert!(
+            !message.contains("0:00"),
+            "position INCONNUE annoncée comme une mesure — « 0:00 » désigne le début \
+             du morceau, pas le point de la pause : {message}"
+        );
+        assert!(
+            message.contains("Sur la piste"),
+            "la piste reste nommée, elle, on la connaît : {message}"
+        );
+        let etat = orch.playback.get_state(zone_id).await;
+        assert_eq!(
+            etat.state,
+            PlayState::Paused,
+            "une reprise qui n'a pas abouti ne doit pas s'annoncer en lecture"
+        );
+        assert!(
+            etat.last_seek_at.is_none(),
+            "aucune relance à une position inconnue ne doit avoir été TENTÉE"
         );
     }
 
