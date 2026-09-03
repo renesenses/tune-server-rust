@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use reqwest::Client;
@@ -6,12 +8,46 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use super::didl::{DidlBuilder, ProtocolStyle};
+use super::oh_events::{EventState, UpnpEventListener};
 use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 use crate::http::error as http_error;
 
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const RENDERING_CONTROL_URN: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
 const SOAP_MAX_RETRIES: usize = 2;
+
+/// Convertit une durée UPnP `H:MM:SS[.mmm]` en millisecondes. `0` si la forme
+/// n'est pas reconnue — ce que rend aussi `NOT_IMPLEMENTED`, la réponse
+/// normalisée d'un renderer qui ignore sa propre durée.
+///
+/// Fonction libre parce que les évènements GENA en ont besoin autant que les
+/// réponses SOAP : `CurrentTrackDuration` et `RelativeTimePosition` arrivent
+/// dans le `LastChange` sous exactement la même forme que dans un
+/// `GetPositionInfo` (#2263).
+pub fn parse_upnp_time(time_str: &str) -> u64 {
+    let parts: Vec<&str> = time_str.split(':').collect();
+    if parts.len() == 3 {
+        let h: u64 = parts[0].parse().unwrap_or(0);
+        let m: u64 = parts[1].parse().unwrap_or(0);
+        let s_parts: Vec<&str> = parts[2].split('.').collect();
+        let s: u64 = s_parts[0].parse().unwrap_or(0);
+        let frac_ms: u64 = if s_parts.len() > 1 {
+            let frac = s_parts[1];
+            let val: u64 = frac.parse().unwrap_or(0);
+            match frac.len() {
+                1 => val * 100,
+                2 => val * 10,
+                3 => val,
+                _ => val / 10u64.pow(frac.len() as u32 - 3),
+            }
+        } else {
+            0
+        };
+        (h * 3600 + m * 60 + s) * 1000 + frac_ms
+    } else {
+        0
+    }
+}
 
 /// Préfixe des erreurs SOAP dues à un **timeout**, par opposition à un refus de
 /// connexion.
@@ -96,6 +132,100 @@ pub struct DlnaOutput {
     /// URL for the ConnectionManager service (used to query GetProtocolInfo).
     /// Falls back to av_transport_url if not available.
     connection_manager_url: Option<String>,
+    /// Récepteur GENA partagé, `None` quand l'écoute n'a pas pu démarrer.
+    /// Absent = comportement d'avant #2263, tout en sondage.
+    event_listener: Option<Arc<UpnpEventListener>>,
+    /// `eventSubURL` absolues des services abonnables, par clé de service
+    /// (`avtransport`, `renderingcontrol`).
+    event_sub_urls: HashMap<String, String>,
+    /// État poussé par le renderer. Partagé avec le récepteur.
+    event_state: Arc<tokio::sync::Mutex<EventState>>,
+    event_sub_ids: tokio::sync::Mutex<Vec<String>>,
+    /// « Silence UPnP » : opt-in par zone. Coupe le dernier `GetPositionInfo`
+    /// et fait donc tomber le trafic à ZÉRO action pendant la lecture, au prix
+    /// d'une position EXTRAPOLÉE. Voir [`DlnaOutput::etat_evenements`].
+    upnp_silence: AtomicBool,
+    /// Ancre d'extrapolation de la position en mode « silence UPnP ».
+    ancre_position: tokio::sync::Mutex<AncrePosition>,
+    /// Depuis quand l'état poussé et la position mesurée se contredisent.
+    ///
+    /// Compté en HORLOGE MURALE, jamais en sondages : la cadence du sondeur
+    /// n'appartient pas à cette couche, et un compteur de tours changerait de
+    /// sens si elle bougeait.
+    incoherence_depuis: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// Dernière position mesurée en SOAP. `u64::MAX` = aucune mesure encore.
+    derniere_position_ms: AtomicU64,
+    /// Dernier volume que **Tune** a posé, en pour-cent. `u64::MAX` = jamais.
+    /// Seule valeur disponible en mode silence si le renderer n'a jamais
+    /// poussé de `Volume`.
+    dernier_volume_pct: AtomicU64,
+    /// La position rendue par le dernier `get_status` était-elle extrapolée ?
+    /// Lu par `GET /api/devices/{id}/status` pour que l'estimation ne se fasse
+    /// jamais passer pour une mesure.
+    position_extrapolee: AtomicBool,
+    /// Durée que TUNE connaît pour une URI donnée, depuis sa bibliothèque.
+    ///
+    /// Le mode silence n'a que l'évènement pour connaître la durée, et un
+    /// renderer qui ne pousse pas `CurrentTrackDuration` la laisserait à zéro —
+    /// une TROISIÈME dégradation, celle-là non annoncée. Or Tune connaît la
+    /// durée avant même d'envoyer l'URI : il n'a aucune raison de la demander
+    /// à l'appareil.
+    ///
+    /// **Appariée à son URI, jamais servie seule.** Une durée de la piste
+    /// précédente appliquée à la suivante ferait pire que zéro : elle
+    /// déclencherait la garde « position au-delà de la fin » du sondeur au
+    /// milieu du morceau. Le couple n'est donc utilisé que si l'URI en cours
+    /// est bien celle qu'il décrit.
+    duree_annoncee: tokio::sync::Mutex<Option<(String, u64)>>,
+}
+
+/// Au bout de combien de temps de contradiction entre l'état poussé et la
+/// position mesurée on va trancher en SOAP. Deux secondes : assez pour laisser
+/// passer un tour de sondage où la position n'a pas eu le temps de bouger,
+/// assez court pour que le sondeur ne bâtisse rien sur un état faux.
+const INCOHERENCE_AVANT_ARBITRAGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Ancre d'extrapolation de la position en mode « silence UPnP ».
+#[derive(Debug, Clone)]
+struct AncrePosition {
+    position_ms: u64,
+    instant: std::time::Instant,
+    /// La lecture avançait-elle à l'instant de l'ancrage ? Replié à chaque
+    /// changement d'état, pour qu'une pause de trois minutes ne se retrouve
+    /// pas ajoutée à la position au moment de la reprise.
+    avance: bool,
+    /// URI ancrée. Un changement d'URI (piste suivante, gapless) remet la
+    /// position à zéro : sans cela la deuxième piste démarrerait à la position
+    /// finale de la première.
+    uri: Option<String>,
+}
+
+impl Default for AncrePosition {
+    fn default() -> Self {
+        Self {
+            position_ms: 0,
+            instant: std::time::Instant::now(),
+            avance: false,
+            uri: None,
+        }
+    }
+}
+
+/// Ce que le chemin DLNA sait de ses évènements, à l'instant où on le demande.
+///
+/// Rendu tel quel par `GET /api/devices/{id}/status` : le mode « silence »
+/// dégrade deux choses, et les taire derrière un interrupteur muet reviendrait
+/// à laisser un client afficher une position estimée comme une position
+/// mesurée.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct EtatEvenementsUpnp {
+    /// Un abonnement GENA est tenu et le renderer a déjà poussé un état.
+    pub abonne: bool,
+    /// L'option « silence UPnP » est armée sur cette zone.
+    pub silence: bool,
+    /// La position rendue par le dernier `get_status` est une ESTIMATION
+    /// (ancre + horloge murale), pas une mesure lue sur l'appareil.
+    pub position_extrapolee: bool,
 }
 
 impl DlnaOutput {
@@ -146,12 +276,281 @@ impl DlnaOutput {
             muted: AtomicBool::new(false),
             micromega_ip,
             connection_manager_url,
+            event_listener: None,
+            event_sub_urls: HashMap::new(),
+            event_state: Arc::new(tokio::sync::Mutex::new(EventState::default())),
+            event_sub_ids: tokio::sync::Mutex::new(Vec::new()),
+            upnp_silence: AtomicBool::new(false),
+            ancre_position: tokio::sync::Mutex::new(AncrePosition::default()),
+            incoherence_depuis: tokio::sync::Mutex::new(None),
+            derniere_position_ms: AtomicU64::new(u64::MAX),
+            dernier_volume_pct: AtomicU64::new(u64::MAX),
+            position_extrapolee: AtomicBool::new(false),
+            duree_annoncee: tokio::sync::Mutex::new(None),
         }
     }
 
     pub fn with_play_delay(self, delay_ms: u64) -> Self {
         self.play_delay_ms.store(delay_ms, Ordering::Relaxed);
         self
+    }
+
+    /// Branche les évènements GENA sur cette sortie.
+    ///
+    /// `event_sub_urls` porte les `eventSubURL` du descripteur, DÉJÀ résolues
+    /// en absolu — même règle que les `controlURL` : une radio Frontier
+    /// Silicon (Ruark, Stream 94i) publie des URL absolues que concaténer à
+    /// `host:port` rendrait injoignables.
+    ///
+    /// Sans appel à cette méthode, la sortie se comporte exactement comme
+    /// avant #2263 : tout en sondage. C'est le repli, jamais une panne.
+    pub fn with_upnp_events(
+        mut self,
+        listener: Option<Arc<UpnpEventListener>>,
+        event_sub_urls: HashMap<String, String>,
+    ) -> Self {
+        self.event_listener = listener;
+        self.event_sub_urls = event_sub_urls;
+        self
+    }
+
+    /// Arme le « silence UPnP » à la construction (opt-in de zone relu au
+    /// moment où la sortie est enregistrée). Même forme que
+    /// [`DlnaOutput::with_play_delay`].
+    pub fn with_upnp_silence(self, silence: bool) -> Self {
+        self.upnp_silence.store(silence, Ordering::Relaxed);
+        self
+    }
+
+    /// Arme ou désarme le « silence UPnP » sur une sortie DÉJÀ enregistrée
+    /// (même forme que [`DlnaOutput::set_play_delay`], appelée depuis
+    /// `PATCH /zones/{id}` par abaissement de type).
+    pub fn set_upnp_silence(&self, silence: bool) {
+        self.upnp_silence.store(silence, Ordering::Relaxed);
+    }
+
+    /// Opt-in « silence UPnP » armé pour cette sortie.
+    pub fn upnp_silence(&self) -> bool {
+        self.upnp_silence.load(Ordering::Relaxed)
+    }
+
+    /// État des évènements, pour l'exposer au client (voir
+    /// [`EtatEvenementsUpnp`]).
+    pub async fn etat_evenements(&self) -> EtatEvenementsUpnp {
+        EtatEvenementsUpnp {
+            abonne: self.event_state.lock().await.is_live(),
+            silence: self.upnp_silence.load(Ordering::Relaxed),
+            position_extrapolee: self.position_extrapolee.load(Ordering::Relaxed),
+        }
+    }
+
+    /// La sortie peut-elle s'abonner ? (récepteur présent ET au moins
+    /// l'`eventSubURL` d'AVTransport annoncée par le descripteur).
+    pub fn peut_s_abonner(&self) -> bool {
+        self.event_listener.is_some()
+            && self
+                .event_sub_urls
+                .get("avtransport")
+                .is_some_and(|u| !u.is_empty())
+    }
+
+    /// S'abonne à `AVTransport` (état du transport, piste, durée) et à
+    /// `RenderingControl` (volume, coupure).
+    ///
+    /// Même patron que `OpenHomeOutput::subscribe_events` : on s'abonne au
+    /// moment du `play_media`, on se désabonne au `stop`. Le renderer n'a rien
+    /// à pousser tant qu'il ne joue pas, et l'abonnement au repos coûterait un
+    /// renouvellement toutes les 250 s pour rien.
+    async fn subscribe_events(&self) {
+        let Some(listener) = &self.event_listener else {
+            return;
+        };
+        // Repartir d'un état vierge : les valeurs de la piste précédente ne
+        // doivent pas passer pour l'actualité de la nouvelle le temps que le
+        // premier NOTIFY arrive.
+        *self.event_state.lock().await = EventState::default();
+        *self.incoherence_depuis.lock().await = None;
+        self.derniere_position_ms.store(u64::MAX, Ordering::Relaxed);
+
+        let mut sub_ids = self.event_sub_ids.lock().await;
+        let mut count = 0u32;
+        for svc in ["avtransport", "renderingcontrol"] {
+            if let Some(url) = self.event_sub_urls.get(svc).filter(|u| !u.is_empty())
+                && let Some(path_id) = listener.subscribe(url, self.event_state.clone()).await
+            {
+                sub_ids.push(path_id);
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            info!(
+                device = %self.name,
+                count,
+                silence = self.upnp_silence.load(Ordering::Relaxed),
+                "dlna_events_subscribed"
+            );
+        } else {
+            debug!(device = %self.name, "dlna_events_indisponibles_sondage");
+        }
+    }
+
+    async fn unsubscribe_events(&self) {
+        let Some(listener) = &self.event_listener else {
+            return;
+        };
+        let mut sub_ids = self.event_sub_ids.lock().await;
+        for path_id in sub_ids.drain(..) {
+            listener.unsubscribe(&path_id).await;
+        }
+        self.event_state.lock().await.alive = false;
+    }
+
+    /// Repose l'ancre d'extrapolation sur une position CONNUE.
+    async fn ancrer_position(&self, position_ms: u64, avance: bool, uri: Option<String>) {
+        *self.ancre_position.lock().await = AncrePosition {
+            position_ms,
+            instant: std::time::Instant::now(),
+            avance,
+            uri,
+        };
+    }
+
+    /// Retient la durée que Tune connaît pour cette URI (voir
+    /// [`DlnaOutput::duree_annoncee`]).
+    async fn annoncer_duree(&self, url: &str, duration_ms: Option<u64>) {
+        if let Some(d) = duration_ms.filter(|d| *d > 0) {
+            *self.duree_annoncee.lock().await = Some((url.to_string(), d));
+        }
+    }
+
+    /// Durée connue pour l'URI en cours, si c'est bien celle qu'on a annoncée.
+    async fn duree_connue_pour(&self, uri: Option<&String>) -> Option<u64> {
+        let annoncee = self.duree_annoncee.lock().await;
+        let (url, d) = annoncee.as_ref()?;
+        match uri {
+            Some(u) if u == url => Some(*d),
+            // Sans URI en cours, on ne peut pas apparier : on préfère ne rien
+            // dire à dire la durée d'une autre piste.
+            _ => None,
+        }
+    }
+
+    /// Position extrapolée du mode « silence », et entretien de l'ancre.
+    ///
+    /// Trois recalages, dans cet ordre :
+    /// 1. le renderer a poussé une `RelativeTimePosition` → elle prime, c'est
+    ///    une mesure ;
+    /// 2. l'URI a changé → nouvelle piste, on repart de zéro ;
+    /// 3. l'état a basculé (lecture ⇄ pause/arrêt) → on replie le temps déjà
+    ///    couru dans l'ancre avant de changer de régime.
+    async fn extrapoler_position(
+        &self,
+        etat: TransportState,
+        uri: Option<&String>,
+        position_poussee: Option<(u64, std::time::Instant)>,
+    ) -> u64 {
+        let avance = etat == TransportState::Playing;
+        let mut ancre = self.ancre_position.lock().await;
+
+        if let Some((p, at)) = position_poussee
+            && at >= ancre.instant
+        {
+            *ancre = AncrePosition {
+                position_ms: p,
+                instant: at,
+                avance,
+                uri: uri.cloned(),
+            };
+        } else if uri.is_some() && ancre.uri.as_ref() != uri {
+            *ancre = AncrePosition {
+                position_ms: 0,
+                instant: std::time::Instant::now(),
+                avance,
+                uri: uri.cloned(),
+            };
+        } else if ancre.avance != avance {
+            let couru = if ancre.avance {
+                ancre.instant.elapsed().as_millis() as u64
+            } else {
+                0
+            };
+            *ancre = AncrePosition {
+                position_ms: ancre.position_ms + couru,
+                instant: std::time::Instant::now(),
+                avance,
+                uri: ancre.uri.clone(),
+            };
+        }
+
+        if ancre.avance {
+            ancre.position_ms + ancre.instant.elapsed().as_millis() as u64
+        } else {
+            ancre.position_ms
+        }
+    }
+
+    /// Retient le volume que Tune vient de poser, sur les TROIS voies qui
+    /// peuvent aboutir (Micromega en TCP propriétaire, Sonos en
+    /// `GroupRenderingControl`, `RenderingControl` pour tout le monde).
+    ///
+    /// Sert deux choses : ne pas laisser l'état poussé en retard d'un
+    /// évènement, et donner au mode silence une valeur honnête quand le
+    /// renderer n'émet pas de `Volume`.
+    async fn memoriser_volume(&self, niveau_pct: u64) {
+        let niveau_pct = niveau_pct.min(100);
+        self.dernier_volume_pct.store(niveau_pct, Ordering::Relaxed);
+        self.event_state.lock().await.volume = Some(niveau_pct as u32);
+    }
+
+    /// Lit le volume du renderer, sur la voie qu'il faut.
+    ///
+    /// Sonos refuse `RenderingControl::GetVolume` sur une zone groupée et ne
+    /// répond que sur `GroupRenderingControl` : la distinction existait déjà
+    /// dans `get_status`, elle est ici pour que les DEUX régimes de lecture
+    /// l'appliquent, pas seulement celui qui sonde.
+    async fn lire_volume(&self) -> Result<f64, String> {
+        let volume_resp = if self.device_id.contains("RINCON") {
+            let grc_url = self
+                .rendering_control_url
+                .replace("/RenderingControl/", "/GroupRenderingControl/");
+            self.soap_action(
+                &grc_url,
+                "urn:schemas-upnp-org:service:GroupRenderingControl:1",
+                "GetGroupVolume",
+                "<InstanceID>0</InstanceID>",
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            self.rc_action(
+                "GetVolume",
+                "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+            )
+            .await?
+        };
+        Ok(extract_tag(&volume_resp, "CurrentVolume")
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v / 100.0)
+            .unwrap_or(0.5))
+    }
+
+    /// L'état poussé contredit-il la position mesurée ?
+    ///
+    /// Un renderer peut accepter un abonnement et cesser d'émettre : l'état
+    /// gelé passerait alors pour l'actualité. Les deux sens comptent, et c'est
+    /// le point : un `Playing` figé retient la file pour toujours, un `Stopped`
+    /// de trop la fait sauter une piste. La contradiction n'est retenue que si
+    /// elle DURE — un tour où la position n'a pas eu le temps de bouger n'est
+    /// pas une preuve.
+    fn etat_contredit_la_position(etat: TransportState, position_a_bouge: bool) -> bool {
+        match etat {
+            TransportState::Playing => !position_a_bouge,
+            TransportState::Stopped | TransportState::Paused => position_a_bouge,
+            // Transitoire par nature : la position peut aussi bien être figée
+            // (chargement) que sauter (nouvelle piste). On ne conclut rien.
+            TransportState::Transitioning => false,
+        }
     }
 
     /// Update the SetAVTransportURI→Play delay on an already-registered output
@@ -334,6 +733,24 @@ impl DlnaOutput {
         .await
     }
 
+    /// Le battement que CET appareil a déclaré nécessaire entre un
+    /// `SetAVTransportURI` et le `Play` qui le suit — réglage `dlna_play_delay_ms`
+    /// (panneau renderer, `[device_delays]`, catalogue d'appareils : 800 ms pour
+    /// un Yamaha R-N2000A).
+    ///
+    /// Il n'était tenu que sur la PREMIÈRE pose d'URI. Les deux reprises qui en
+    /// reposent une — le réarmement d'un 701 (#2581) et la relance d'un `Play`
+    /// jamais appliqué — enchaînaient le `Play` sans lui, c'est-à-dire dans la
+    /// fenêtre exacte que ce réglage existe pour éviter, et sur les deux chemins
+    /// qui ne s'exécutent QUE lorsque l'appareil est déjà en train de refuser.
+    /// À 0 — le défaut de tout le monde — cette fonction ne fait rien.
+    async fn attendre_apres_set_uri(&self) {
+        let delai = self.play_delay_ms.load(Ordering::Relaxed);
+        if delai > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delai)).await;
+        }
+    }
+
     fn didl_metadata(media: &PlayMedia<'_>, item_id: &str) -> String {
         Self::didl_metadata_mime(media, item_id, media.mime_type)
     }
@@ -370,13 +787,31 @@ impl DlnaOutput {
     /// quand les mêmes octets passent en une seule trame. Ce DIDL-ci tient
     /// l'enveloppe sous un segment. Le protocolInfo reste : sans lui, le
     /// DMP-A8 accepte l'URI d'un `.dsf` mais ne vient jamais le chercher.
+    ///
+    /// Le protocolInfo doit être JUSTE, pas seulement présent. Le profil
+    /// `DLNA.ORG_PN=LPCM` n'est défini que pour 16 bits (#1137) et pour 44,1 /
+    /// 48 kHz (#1458) : l'annoncer sur un WAV 24 bits ou hi-res fait rabattre
+    /// le flux sur le profil déclaré, lire des échantillons désalignés, et
+    /// jouer du SILENCE. Or ce DIDL-ci ne transmettait NI la profondeur NI la
+    /// fréquence : `dlna_flags_for_mime_bd_sr(mime, None, None)` retombait donc
+    /// sur `PN=LPCM` quoi qu'il arrive, et les deux correctifs restaient sans
+    /// effet dès que l'appareil avait appris le niveau réduit — c'est-à-dire à
+    /// chaque piste, définitivement (`didl_niveau_appris`, #2394).
+    ///
+    /// `sans_attributs_audio` rend les valeurs au calcul du profil sans écrire
+    /// `sampleFrequency` / `bitsPerSample` dans `<res>` : le budget d'un
+    /// segment TCP est préservé — la variante sans `PN` est même plus courte.
     fn didl_metadata_minimale(media: &PlayMedia<'_>, item_id: &str, mime: &str) -> String {
+        let is_dsd = mime.contains("dsd") || mime.contains("dsf");
         DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, mime)
             .protocol_style(ProtocolStyle::Dlna)
             .live_stream(media.live_stream)
             .byte_seekable(media.byte_seekable)
             .item_id(item_id)
             .duration_ms_opt(media.duration_ms)
+            .sample_rate_opt(if is_dsd { None } else { media.sample_rate })
+            .bit_depth_opt(if is_dsd { None } else { media.bit_depth })
+            .sans_attributs_audio()
             .build_escaped()
     }
 
@@ -410,28 +845,7 @@ impl DlnaOutput {
     }
 
     fn parse_time(time_str: &str) -> u64 {
-        let parts: Vec<&str> = time_str.split(':').collect();
-        if parts.len() == 3 {
-            let h: u64 = parts[0].parse().unwrap_or(0);
-            let m: u64 = parts[1].parse().unwrap_or(0);
-            let s_parts: Vec<&str> = parts[2].split('.').collect();
-            let s: u64 = s_parts[0].parse().unwrap_or(0);
-            let frac_ms: u64 = if s_parts.len() > 1 {
-                let frac = s_parts[1];
-                let val: u64 = frac.parse().unwrap_or(0);
-                match frac.len() {
-                    1 => val * 100,
-                    2 => val * 10,
-                    3 => val,
-                    _ => val / 10u64.pow(frac.len() as u32 - 3),
-                }
-            } else {
-                0
-            };
-            (h * 3600 + m * 60 + s) * 1000 + frac_ms
-        } else {
-            0
-        }
+        parse_upnp_time(time_str)
     }
 
     fn format_time(ms: u64) -> String {
@@ -458,7 +872,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, true, true, true, true)
+        OutputCapabilities::v1(true, true, true, true, true, true).with_percent_volume()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -470,6 +884,10 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        // Les abonnements de la piste précédente d'abord : sans ce retrait,
+        // chaque lecture en empilerait deux de plus dans le récepteur, tous
+        // renouvelés toutes les 250 s pour un flux mort.
+        self.unsubscribe_events().await;
         // Fire-and-forget Stop with a tight deadline: give the renderer up to
         // 500ms to acknowledge Stop, then proceed regardless.  Most renderers
         // accept SetAVTransportURI while playing (implicit stop), but we still
@@ -676,9 +1094,7 @@ impl OutputTarget for DlnaOutput {
         }
 
         let play_delay = self.play_delay_ms.load(Ordering::Relaxed);
-        if play_delay > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(play_delay)).await;
-        }
+        self.attendre_apres_set_uri().await;
 
         // Retry Play with backoff — some renderers (Revox S100, stagefright-based)
         // reject Play immediately after SetAVTransportURI while still loading the URI.
@@ -720,6 +1136,9 @@ impl OutputTarget for DlnaOutput {
                         let _ = self
                             .reposer_uri(media, item_id, &attempt_mime, niveau_didl)
                             .await;
+                        // Même battement que la pose initiale : reposer l'URI
+                        // puis jouer aussitôt, c'est refabriquer le « trop tôt ».
+                        self.attendre_apres_set_uri().await;
                     }
                     // Chargement en cours, ou barème historique hors du premier
                     // essai : ne rien envoyer de plus.
@@ -773,46 +1192,71 @@ impl OutputTarget for DlnaOutput {
         // cas d'écart, UNE relance complète, puis un échec VISIBLE plutôt
         // qu'un état menteur. Une URI qu'on ne sait pas interpréter (renderer
         // qui réécrit) ne conclut rien — zéro régression sur ces appareils.
-        let mut applique = UriVerdict::Indeterminee;
-        let mut uri_tenue: Option<String> = None;
-        'verif: for relance in 0..2u32 {
-            for essai in 0..3u32 {
-                let resp = self
-                    .av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+        // La verification est EXTRAITE dans `verifier_uri_appliquee` : un test
+        // qui la retranscrirait resterait vert pendant que CE chemin-ci se
+        // degrade. Elle ne recoit que les deux actions qu'elle pilote — relire
+        // `CurrentURI`, et reposer l'URI puis rejouer — pour qu'un banc puisse
+        // les simuler sans renderer (#2749).
+        let moi = &*self;
+        let media_verif = media;
+        let mime_relance = attempt_mime.as_str();
+        let verif = verifier_uri_appliquee(
+            media.url,
+            BUDGET_REVEIL_STANDBY,
+            || async move {
+                moi.av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+                    .await
+                    .map(|xml| extract_tag(&xml, "CurrentURI"))
+            },
+            || async move {
+                warn!(device = %moi.name, url = media_verif.url, ctrl = %moi.av_transport_url, "dlna_play_acquitte_mais_pas_applique_relance");
+                let _ = moi
+                    .reposer_uri(media_verif, item_id, mime_relance, niveau_didl)
                     .await;
-                let uri = match &resp {
-                    Ok(xml) => extract_tag(xml, "CurrentURI"),
-                    // Un renderer sans GetMediaInfo ne doit rien bloquer.
-                    Err(_) => break 'verif,
-                };
-                uri_tenue = uri.clone();
-                applique = verdict_uri_appliquee(uri.as_deref(), media.url);
-                match applique {
-                    UriVerdict::Appliquee | UriVerdict::Indeterminee => break 'verif,
-                    UriVerdict::PasAppliquee if essai < 2 => {
-                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                    }
-                    UriVerdict::PasAppliquee => {}
-                }
-            }
-            if relance == 0 {
-                warn!(device = %self.name, url = media.url, ctrl = %self.av_transport_url, "dlna_play_acquitte_mais_pas_applique_relance");
-                let _ = self
-                    .reposer_uri(media, item_id, &attempt_mime, niveau_didl)
-                    .await;
-                let _ = self
+                moi.attendre_apres_set_uri().await;
+                match moi
                     .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
-                    .await;
+                    .await
+                {
+                    Ok(resp) if resp.contains("UPnPError") || resp.contains("<errorCode>") => {
+                        warn!(device = %moi.name, response = %resp, "dlna_relance_play_refuse");
+                        Some(resp)
+                    }
+                    _ => None,
+                }
+            },
+        )
+        .await;
+        let applique = verif.verdict;
+        let uri_tenue = verif.uri_tenue.clone();
+        let refus_relance = verif.refus_relance.clone();
+        if matches!(applique, UriVerdict::PasAppliquee | UriVerdict::PasEncore) {
+            // Deux pannes, deux journaux. « Jamais applique » decrit un
+            // renderer qui TIENT autre chose ; l'URI restee VIDE decrit un
+            // appareil qui ne tient RIEN — un reveil qui n'a pas abouti. Le
+            // meme evenement pour les deux rendait le tri impossible cote
+            // support (#2749).
+            if applique == UriVerdict::PasEncore {
+                warn!(
+                    device = %self.name,
+                    url = media.url,
+                    ctrl = %self.av_transport_url,
+                    attente_ms = verif.attente_ms,
+                    relances = verif.relances,
+                    soap_muet = verif.soap_muet,
+                    "dlna_play_uri_restee_vide"
+                );
+            } else {
+                warn!(
+                    device = %self.name,
+                    url = media.url,
+                    ctrl = %self.av_transport_url,
+                    tenue = uri_tenue.as_deref().unwrap_or("-"),
+                    attente_ms = verif.attente_ms,
+                    relances = verif.relances,
+                    "dlna_play_jamais_applique"
+                );
             }
-        }
-        if applique == UriVerdict::PasAppliquee {
-            warn!(
-                device = %self.name,
-                url = media.url,
-                ctrl = %self.av_transport_url,
-                tenue = uri_tenue.as_deref().unwrap_or("-"),
-                "dlna_play_jamais_applique"
-            );
             // Si le renderer tient un flux de NOTRE serveur, ce flux va mourir
             // avec la session que l'appelant s'apprête à démonter — et le
             // DMP-A8 ressasse une URI morte en zombie (PLAYING/TRANSITIONING,
@@ -838,6 +1282,45 @@ impl OutputTarget for DlnaOutput {
                     )
                     .await;
             }
+            // Le renderer a-t-il ACQUITTÉ, ou REFUSÉ ? Les deux échouent ici,
+            // mais ils n'appellent pas la même conduite : un refus nomme un
+            // état (701 « Transition not available » : pas cette transition,
+            // maintenant), un acquittement sans effet désigne une URI restée en
+            // place. Dire l'un pour l'autre envoie l'utilisateur chercher là où
+            // il n'y a rien.
+            if let Some(resp) = &refus_relance {
+                return Err(format!(
+                    "Le renderer a REFUSÉ le Play de la relance{} : {resp}",
+                    if est_701(resp) {
+                        " (701 « Transition not available » : il n'accepte pas cette transition dans son état actuel)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            // #2749 — une URI VIDE n'est pas « une autre source ».
+            //
+            // Un Denon/HEOS en veille reseau garde sa pile UPnP vivante : il
+            // acquitte tout, et ne tient RIEN. Lui dire qu'il « joue une autre
+            // source » envoie l'utilisateur chercher un conflit qui n'existe
+            // pas — c'est la meme faute que #2396, sur le meme message.
+            if applique == UriVerdict::PasEncore {
+                let secondes = verif.attente_ms / 1000;
+                return Err(if verif.soap_muet {
+                    format!(
+                        "Le renderer a acquitté Play, n'a jamais appliqué l'URI (CurrentURI resté vide) \
+                         puis a CESSÉ de répondre en SOAP au bout de {secondes} s — appareil éteint, \
+                         débranché ou sorti du réseau ?"
+                    )
+                } else {
+                    format!(
+                        "Le renderer a acquitté Play mais ne tient toujours AUCUN média après {secondes} s \
+                         (CurrentURI vide) : il ne joue pas autre chose, il n'a rien chargé. Un ampli en \
+                         veille réseau (Denon/HEOS) met 15 à 30 s à sortir de veille et à basculer sur son \
+                         entrée réseau — allumez-le, puis relancez"
+                    )
+                });
+            }
             let detail = match uri_tenue.as_deref() {
                 Some(u) if !u.trim().is_empty() => format!("il tient encore : {u}"),
                 _ => "URI non appliquée après relance".to_string(),
@@ -848,6 +1331,13 @@ impl OutputTarget for DlnaOutput {
         }
 
         info!(device = %self.name, url = media.url, ctrl = %self.av_transport_url, delay_ms = play_delay, "dlna_play");
+        // La piste tourne : on s'abonne, et l'ancre repart de zéro sur cette
+        // URI. Même moment que `OpenHomeOutput::play_media` — un abonnement
+        // pris avant que le renderer ait la piste ne décrirait rien.
+        self.ancrer_position(0, true, Some(media.url.to_string()))
+            .await;
+        self.annoncer_duree(media.url, media.duration_ms).await;
+        self.subscribe_events().await;
         Ok(())
     }
 
@@ -864,6 +1354,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn stop(&self) -> Result<(), String> {
+        self.unsubscribe_events().await;
         self.av_action("Stop", "<InstanceID>0</InstanceID>").await?;
         info!(device = %self.name, "dlna_stop");
         Ok(())
@@ -876,6 +1367,12 @@ impl OutputTarget for DlnaOutput {
             &format!("<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{target}</Target>"),
         )
         .await?;
+        // Seul déplacement que le mode silence voit tout de suite : celui qui
+        // passe par Tune. Celui fait sur la façade de l'appareil attendra le
+        // prochain évènement — c'est le prix annoncé de l'option.
+        let ancre = self.ancre_position.lock().await.clone();
+        self.ancrer_position(position_ms, ancre.avance, ancre.uri)
+            .await;
         Ok(())
     }
 
@@ -891,6 +1388,7 @@ impl OutputTarget for DlnaOutput {
                     let _ = stream.write_all(msg.as_bytes()).await;
                     let _ = stream.shutdown().await;
                     debug!(device = %self.name, volume = target_vol, "micromega_volume_set");
+                    self.memoriser_volume(target_vol.round() as u64).await;
                 }
                 Ok(Err(e)) => {
                     warn!(device = %self.name, volume = target_vol, error = %e, "micromega_volume_error");
@@ -930,6 +1428,7 @@ impl OutputTarget for DlnaOutput {
                     ));
                 }
                 debug!(device = %self.name, level, "sonos_group_volume_ok");
+                self.memoriser_volume(level as u64).await;
                 return Ok(());
             }
             // The renderer answered, and said no. Reporting Ok() here — as this
@@ -944,6 +1443,7 @@ impl OutputTarget for DlnaOutput {
             ));
         }
         debug!(device = %self.name, level, "dlna_set_volume_ok");
+        self.memoriser_volume(level as u64).await;
         Ok(())
     }
 
@@ -952,6 +1452,10 @@ impl OutputTarget for DlnaOutput {
         self.rc_action("SetMute", &format!(
             "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>{val}</DesiredMute>"
         )).await?;
+        // Même geste que `OpenHomeOutput::set_mute` : l'état poussé porte
+        // désormais la coupure, on ne le laisse pas en retard d'un évènement
+        // sur ce que Tune vient d'obtenir.
+        self.event_state.lock().await.muted = Some(muted);
         // Mémorisé seulement après un SetMute accepté : `get_status` ne
         // redemande plus rien au renderer (#2263), donc ce champ est la seule
         // source du `muted` rendu — il ne doit jamais annoncer une coupure que
@@ -960,45 +1464,180 @@ impl OutputTarget for DlnaOutput {
         Ok(())
     }
 
+    /// Trois régimes, du plus bavard au plus muet — et le plus bavard est
+    /// toujours celui du repli.
+    ///
+    /// | régime | conditions | actions SOAP par appel |
+    /// |---|---|---|
+    /// | sondage | pas d'abonnement tenu | **3** (comme avant #2263) |
+    /// | évènements | abonnement tenu | **1** (`GetPositionInfo`) |
+    /// | silence UPnP | abonnement tenu + opt-in de zone | **0** |
+    ///
+    /// Le régime « évènements » ne prend aux évènements que ce qu'ils savent
+    /// dire mieux que le sondage — l'état du transport, le volume, la coupure —
+    /// et continue de MESURER la position. C'est délibéré : la position n'est
+    /// pas une variable évènementielle obligatoire d'`AVTransport:1`, presque
+    /// aucun renderer ne la pousse, et l'inventer par défaut changerait la
+    /// vérité de l'état pour tout le monde sans que personne l'ait demandé.
+    ///
+    /// Le régime « silence » l'invente, justement, et c'est tout son prix : la
+    /// position devient une EXTRAPOLATION (dernière ancre + horloge murale), et
+    /// un déplacement fait sur la façade de l'appareil ne se voit qu'au
+    /// prochain évènement. Les deux conséquences remontent au client par
+    /// [`DlnaOutput::etat_evenements`], jamais tues.
     async fn get_status(&self) -> Result<OutputStatus, String> {
+        let (
+            evt_vivant,
+            evt_etat,
+            evt_volume,
+            evt_muted,
+            evt_uri,
+            evt_duree,
+            evt_titre,
+            evt_artiste,
+            evt_position,
+        ) = {
+            let es = self.event_state.lock().await;
+            (
+                es.is_live(),
+                es.transport_state,
+                es.volume,
+                es.muted,
+                es.track_uri.clone(),
+                es.duration_ms,
+                es.track_title.clone(),
+                es.track_artist.clone(),
+                es.position_ms.zip(es.position_at),
+            )
+        };
+        let silence = self.upnp_silence.load(Ordering::Relaxed);
+
+        if evt_vivant && silence {
+            // ── Silence UPnP : zéro action ────────────────────────────────
+            let etat = evt_etat.unwrap_or(TransportState::Stopped);
+            let position_ms = self
+                .extrapoler_position(etat, evt_uri.as_ref(), evt_position)
+                .await;
+            self.position_extrapolee.store(true, Ordering::Relaxed);
+            let volume = match evt_volume {
+                Some(v) => v as f64 / 100.0,
+                // Le renderer n'a jamais poussé de volume (RenderingControl
+                // absent ou muet). On rend le dernier que Tune a posé — et à
+                // défaut la même valeur de repli que le chemin de sondage quand
+                // la réponse est illisible. Interroger l'appareil ici
+                // trahirait le silence promis.
+                None => match self.dernier_volume_pct.load(Ordering::Relaxed) {
+                    u64::MAX => 0.5,
+                    v => v as f64 / 100.0,
+                },
+            };
+            return Ok(OutputStatus {
+                state: etat,
+                position_ms,
+                duration_ms: match evt_duree {
+                    Some(d) => d,
+                    None => self.duree_connue_pour(evt_uri.as_ref()).await.unwrap_or(0),
+                },
+                volume,
+                muted: evt_muted.unwrap_or_else(|| self.muted.load(Ordering::Relaxed)),
+                current_uri: evt_uri,
+                track_title: evt_titre,
+                track_artist: evt_artiste,
+                ended_naturally: false,
+                realtime: true,
+                dop_active: false,
+            });
+        }
+
         let position_resp = self
             .av_action("GetPositionInfo", "<InstanceID>0</InstanceID>")
             .await?;
+
+        if evt_vivant {
+            // ── Évènements : une seule action, la position ────────────────
+            let position_ms = extract_tag(&position_resp, "RelTime")
+                .map(|t| Self::parse_time(&t))
+                .unwrap_or(0);
+            let precedente = self
+                .derniere_position_ms
+                .swap(position_ms, Ordering::Relaxed);
+            let position_a_bouge = precedente != u64::MAX && position_ms != precedente;
+
+            let mut etat = evt_etat.unwrap_or(TransportState::Stopped);
+            if Self::etat_contredit_la_position(etat, position_a_bouge) && precedente != u64::MAX {
+                let mut depuis = self.incoherence_depuis.lock().await;
+                let debut = depuis.get_or_insert_with(std::time::Instant::now);
+                if debut.elapsed() >= INCOHERENCE_AVANT_ARBITRAGE {
+                    // On tranche à la source, exactement comme le chemin de
+                    // sondage — une action de plus, seulement le temps que la
+                    // contradiction dure.
+                    if let Ok(resp) = self
+                        .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
+                        .await
+                    {
+                        let arbitre = etat_du_transport(&resp);
+                        if arbitre != etat {
+                            warn!(
+                                device = %self.name,
+                                evenement = ?etat,
+                                mesure = ?arbitre,
+                                "dlna_evenement_contredit_par_le_transport"
+                            );
+                        }
+                        etat = arbitre;
+                    }
+                }
+            } else {
+                *self.incoherence_depuis.lock().await = None;
+            }
+
+            let duration_ms = extract_tag(&position_resp, "TrackDuration")
+                .map(|t| Self::parse_time(&t))
+                .unwrap_or(0);
+            let current_uri = extract_tag(&position_resp, "TrackURI").or(evt_uri);
+            // Tenir l'ancre à jour même hors mode silence : basculer l'option
+            // en pleine lecture ne doit pas repartir d'une ancre périmée.
+            self.ancrer_position(
+                position_ms,
+                etat == TransportState::Playing,
+                current_uri.clone(),
+            )
+            .await;
+            self.position_extrapolee.store(false, Ordering::Relaxed);
+
+            let volume = match evt_volume {
+                Some(v) => v as f64 / 100.0,
+                // Le RenderingControl n'a rien poussé : on ne devine pas, on
+                // demande — comme avant. Un abonnement AVTransport tenu ne
+                // dispense pas d'avoir un volume juste.
+                None => self.lire_volume().await?,
+            };
+
+            return Ok(OutputStatus {
+                state: etat,
+                position_ms,
+                duration_ms,
+                volume,
+                muted: evt_muted.unwrap_or_else(|| self.muted.load(Ordering::Relaxed)),
+                current_uri,
+                track_title: extract_tag(&position_resp, "dc:title").or(evt_titre),
+                track_artist: extract_tag(&position_resp, "dc:creator").or(evt_artiste),
+                ended_naturally: false,
+                realtime: true,
+                dop_active: false,
+            });
+        }
+
+        // ── Sondage : le chemin d'avant #2263, mot pour mot ───────────────
         let transport_resp = self
             .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
             .await?;
-        let volume_resp = if self.device_id.contains("RINCON") {
-            let grc_url = self
-                .rendering_control_url
-                .replace("/RenderingControl/", "/GroupRenderingControl/");
-            self.soap_action(
-                &grc_url,
-                "urn:schemas-upnp-org:service:GroupRenderingControl:1",
-                "GetGroupVolume",
-                "<InstanceID>0</InstanceID>",
-            )
-            .await
-            .unwrap_or_default()
-        } else {
-            self.rc_action(
-                "GetVolume",
-                "<InstanceID>0</InstanceID><Channel>Master</Channel>",
-            )
-            .await?
-        };
         // Pas de `GetMute` ici. Le poller passe par cette fonction une fois
         // par seconde et par zone pendant TOUTE la lecture : l'action valait
         // un quart du trafic SOAP envoyé au renderer, pour une valeur que
         // personne ne lisait (#2263). L'état coupé se lit maintenant en local.
-        let state = if transport_resp.contains("PLAYING") {
-            TransportState::Playing
-        } else if transport_resp.contains("PAUSED") {
-            TransportState::Paused
-        } else if transport_resp.contains("TRANSITIONING") {
-            TransportState::Transitioning
-        } else {
-            TransportState::Stopped
-        };
+        let volume = self.lire_volume().await?;
+        let state = etat_du_transport(&transport_resp);
 
         let position_ms = extract_tag(&position_resp, "RelTime")
             .map(|t| Self::parse_time(&t))
@@ -1006,12 +1645,21 @@ impl OutputTarget for DlnaOutput {
         let duration_ms = extract_tag(&position_resp, "TrackDuration")
             .map(|t| Self::parse_time(&t))
             .unwrap_or(0);
-        let volume = extract_tag(&volume_resp, "CurrentVolume")
-            .and_then(|v| v.parse::<f64>().ok())
-            .map(|v| v / 100.0)
-            .unwrap_or(0.5);
         let muted = self.muted.load(Ordering::Relaxed);
         let current_uri = extract_tag(&position_resp, "TrackURI");
+
+        // Même entretien que dans le régime « évènements » : l'ancre suit la
+        // mesure, pour qu'un abonnement qui s'établit en pleine lecture (ou une
+        // option armée en cours de route) ne reparte pas de zéro.
+        self.derniere_position_ms
+            .store(position_ms, Ordering::Relaxed);
+        self.ancrer_position(
+            position_ms,
+            state == TransportState::Playing,
+            current_uri.clone(),
+        )
+        .await;
+        self.position_extrapolee.store(false, Ordering::Relaxed);
 
         Ok(OutputStatus {
             state,
@@ -1076,6 +1724,11 @@ impl OutputTarget for DlnaOutput {
             warn!(device = %self.name, response = %resp, "dlna_set_next_rejected");
             return Err(format!("SetNextAVTransportURI rejected: {resp}"));
         }
+        // Chemin SŒUR du `play_media` : en gapless, le renderer passe à la
+        // piste suivante tout seul et l'URI change sans repasser par là-bas.
+        // Sans cette ligne, le mode silence retomberait à zéro sur la durée dès
+        // la deuxième piste d'une file.
+        self.annoncer_duree(media.url, media.duration_ms).await;
         info!(device = %self.name, url = media.url, "dlna_set_next");
         Ok(())
     }
@@ -1414,6 +2067,29 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     Some(xml[start..end].to_string())
 }
 
+/// État du transport lu dans une réponse `GetTransportInfo`.
+///
+/// Extrait de `get_status` pour que les deux régimes de lecture (sondage, et
+/// arbitrage d'une contradiction en régime évènementiel) rendent le MÊME
+/// verdict sur la même réponse. Deux copies auraient divergé au premier
+/// renderer exotique.
+///
+/// Le test d'inclusion, et son ordre, sont ceux d'avant #2263 : `PAUSED` avant
+/// `TRANSITIONING` parce que `PAUSED_PLAYBACK` ne contient pas l'autre, et tout
+/// le reste — `STOPPED`, `NO_MEDIA_PRESENT`, une réponse illisible — vaut
+/// arrêté.
+fn etat_du_transport(transport_resp: &str) -> TransportState {
+    if transport_resp.contains("PLAYING") {
+        TransportState::Playing
+    } else if transport_resp.contains("PAUSED") {
+        TransportState::Paused
+    } else if transport_resp.contains("TRANSITIONING") {
+        TransportState::Transitioning
+    } else {
+        TransportState::Stopped
+    }
+}
+
 /// Le renderer a-t-il réellement cessé de jouer, d'après sa réponse
 /// `GetTransportInfo` ? Un Stop acquitté n'est pas un Stop appliqué :
 /// l'Eversolo répond OK puis met ~1-2 s à s'arrêter, et un
@@ -1423,14 +2099,50 @@ fn arret_effectif(transport_resp: &str) -> bool {
     !transport_resp.contains("PLAYING") && !transport_resp.contains("TRANSITIONING")
 }
 
+/// Combien de temps laisser a un renderer qui a ACQUITTE `Play` et ne tient
+/// encore AUCUN media (`CurrentURI` vide) pour finir de se reveiller (#2749).
+///
+/// **Pourquoi 30 s.** Un ampli Denon/HEOS en veille reseau garde sa pile UPnP
+/// vivante : il repond 200 a `SetAVTransportURI` puis a `Play` alors qu'il
+/// n'est pas sorti de veille, n'a pas bascule sur son entree reseau et ne tient
+/// rien. Le releve de terrain (AVR-X1600H, 0.9.121) donne 15 a 30 s entre
+/// l'ordre et l'URI reellement posee : une borne PRISE DANS cette plage ne
+/// corrigerait qu'une partie des cas, elle doit donc la couvrir en entier.
+///
+/// **Pourquoi pas plus.** La borne haute n'est pas un gout. `play()` a DEJA
+/// bascule la zone en lecture et arme la grace de chargement du sondeur
+/// (`TRACK_LOAD_GRACE_SECS` = 45 s, `poller.rs`) : tant que l'attente reste
+/// franchement sous cette grace, le sondeur ne peut pas conclure « demarrage
+/// mort » pendant qu'on attend encore — une seule instance decide. Sur CE
+/// chemin (le `Play` a ete acquitte du premier coup, sinon on a deja rendu
+/// `Err`) le reste de `play_media` tient sous ~2 s : ~32 s au pire, sous les
+/// 45 s de la grace comme sous le budget HTTP de l'appelant.
+const BUDGET_REVEIL_STANDBY: std::time::Duration = std::time::Duration::from_secs(30);
+/// Battement entre deux relectures de `CurrentURI` pendant le reveil. Une
+/// seconde : le reveil se compte en dizaines de secondes, et chaque lecture est
+/// une action SOAP de plus sur un appareil qui demarre.
+const CADENCE_REVEIL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Intervalle entre deux `SetAVTransportURI` + `Play` de rearmement pendant le
+/// reveil. Un HEOS qui finit de demarrer a pu perdre l'URI posee avant son
+/// reveil : la reposer periodiquement est ce qui la fait prendre.
+const INTERVALLE_RELANCE_REVEIL: std::time::Duration = std::time::Duration::from_secs(8);
+/// Battement du bareme historique (#2390), quand le renderer tient une AUTRE
+/// source. Inchange.
+const CADENCE_URI_ETRANGERE: std::time::Duration = std::time::Duration::from_millis(400);
 /// Verdict sur l'URI que le renderer dit tenir après notre Play.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UriVerdict {
     /// C'est bien la nôtre : le Play est appliqué.
     Appliquee,
-    /// Vide, ou un flux Tune qui n'est pas le nôtre : le renderer a acquitté
-    /// toute la séquence et joue toujours autre chose.
+    /// Un flux Tune qui n'est pas le nôtre : le renderer a acquitté toute la
+    /// séquence et joue toujours autre chose.
     PasAppliquee,
+    /// `CurrentURI` VIDE : le renderer ne tient AUCUN media. Il ne joue pas
+    /// autre chose — il n'a RIEN charge. C'est ce que rend un ampli HEOS en
+    /// veille reseau dont la pile SOAP repond deja alors que l'appareil se
+    /// reveille encore (#2749) ; le confondre avec `PasAppliquee` faisait
+    /// couper la zone en 13 s sur un message faux.
+    PasEncore,
     /// Une URI étrangère qu'on ne sait pas interpréter (un renderer qui
     /// réécrit, un GetMediaInfo exotique) : on ne conclut rien.
     Indeterminee,
@@ -1452,7 +2164,8 @@ fn verdict_uri_appliquee(current_uri: Option<&str>, url_attendue: &str) -> UriVe
     };
     let uri = uri.trim();
     if uri.is_empty() {
-        return UriVerdict::PasAppliquee;
+        // #2749 — VIDE veut dire « aucun media », pas « un autre media ».
+        return UriVerdict::PasEncore;
     }
     if uri.contains(chemin_du_flux(url_attendue)) {
         return UriVerdict::Appliquee;
@@ -1463,6 +2176,140 @@ fn verdict_uri_appliquee(current_uri: Option<&str>, url_attendue: &str) -> UriVe
         return UriVerdict::PasAppliquee;
     }
     UriVerdict::Indeterminee
+}
+
+/// Ce que la verification d'apres-`Play` a etabli.
+#[derive(Debug, Clone)]
+struct VerifUri {
+    verdict: UriVerdict,
+    /// La derniere `CurrentURI` lue.
+    uri_tenue: Option<String>,
+    /// Le refus SOAP rendu par le `Play` d'une relance, s'il y en a eu un.
+    refus_relance: Option<String>,
+    /// L'appareil a repondu au moins une fois, PUIS s'est tu. C'est la
+    /// difference entre « il se reveille encore » et « il n'est plus la »
+    /// (#2749) : un renderer qui n'implemente pas `GetMediaInfo` echoue des la
+    /// PREMIERE lecture et ne met donc jamais ce drapeau — il ne bloque rien,
+    /// exactement comme avant.
+    soap_muet: bool,
+    /// Duree totale de la verification, en ms — le chiffre que le journal doit
+    /// porter pour qu'on puisse lire un vrai temps de reveil.
+    attente_ms: u64,
+    /// Nombre de `SetAVTransportURI` + `Play` de relance envoyes.
+    relances: u32,
+}
+
+/// La verification d'apres-`Play`, en DEUX temps.
+///
+/// **Temps 1 — bareme historique (#2390), inchange.** Trois lectures de
+/// `CurrentURI` espacees de 400 ms, une relance complete, trois lectures de
+/// plus. C'est ce qui rattrape la course des 5 ms de l'Eversolo, et c'est ce
+/// qui fait echouer un renderer zombie (#2394) : il tient un flux Tune perime,
+/// verdict `PasAppliquee`, on n'attend rien de plus.
+///
+/// **Temps 2 — fenetre de reveil (#2749), NOUVEAU.** On n'y entre que si le
+/// temps 1 se termine sur `PasEncore` : `CurrentURI` VIDE, donc aucun media
+/// tenu, donc rien a quoi notre flux se disputerait la place. On relit alors a
+/// `CADENCE_REVEIL` et on repose l'URI toutes les `INTERVALLE_RELANCE_REVEIL`,
+/// jusqu'a `budget_reveil`.
+///
+/// La condition « tant que SOAP repond » est EFFECTIVE : des que `lire_uri`
+/// rend `Err` — l'appareil a ete eteint ou debranche pendant l'attente — on
+/// sort immediatement au lieu de bruler le budget. Un refus SOAP sur le `Play`
+/// d'une relance sort aussi : un appareil qui REFUSE la transition nomme un
+/// etat (701), il ne dort pas.
+///
+/// Les deux actions sont passees en parametres pour que cette boucle-ci — celle
+/// de production — soit eprouvable sans renderer.
+async fn verifier_uri_appliquee<L, LF, R, RF>(
+    url_attendue: &str,
+    budget_reveil: std::time::Duration,
+    mut lire_uri: L,
+    mut relancer: R,
+) -> VerifUri
+where
+    L: FnMut() -> LF,
+    LF: std::future::Future<Output = Result<Option<String>, String>>,
+    R: FnMut() -> RF,
+    RF: std::future::Future<Output = Option<String>>,
+{
+    let debut = tokio::time::Instant::now();
+    let mut v = VerifUri {
+        verdict: UriVerdict::Indeterminee,
+        uri_tenue: None,
+        refus_relance: None,
+        soap_muet: false,
+        attente_ms: 0,
+        relances: 0,
+    };
+    let mut une_lecture_a_repondu = false;
+
+    // ── Temps 1 : le bareme de #2390, au battement pres. ──────────────────
+    'bareme: for relance in 0..2u32 {
+        for essai in 0..3u32 {
+            match lire_uri().await {
+                Ok(uri) => {
+                    une_lecture_a_repondu = true;
+                    v.uri_tenue = uri.clone();
+                    v.verdict = verdict_uri_appliquee(uri.as_deref(), url_attendue);
+                }
+                // Un renderer sans GetMediaInfo ne doit rien bloquer : si RIEN
+                // n'a jamais repondu, on ne conclut rien. S'il avait repondu et
+                // se tait maintenant, c'est un appareil qui a disparu.
+                Err(_) => {
+                    v.soap_muet = une_lecture_a_repondu;
+                    break 'bareme;
+                }
+            }
+            match v.verdict {
+                UriVerdict::Appliquee | UriVerdict::Indeterminee => break 'bareme,
+                UriVerdict::PasAppliquee | UriVerdict::PasEncore if essai < 2 => {
+                    tokio::time::sleep(CADENCE_URI_ETRANGERE).await;
+                }
+                _ => {}
+            }
+        }
+        if relance == 0 {
+            v.relances += 1;
+            v.refus_relance = relancer().await;
+        }
+    }
+
+    // ── Temps 2 : la fenetre de reveil. ───────────────────────────────────
+    if v.verdict == UriVerdict::PasEncore && v.refus_relance.is_none() && !v.soap_muet {
+        let debut_reveil = tokio::time::Instant::now();
+        let mut derniere_relance = debut_reveil;
+        while debut_reveil.elapsed() < budget_reveil {
+            tokio::time::sleep(CADENCE_REVEIL).await;
+            match lire_uri().await {
+                Ok(uri) => {
+                    v.uri_tenue = uri.clone();
+                    v.verdict = verdict_uri_appliquee(uri.as_deref(), url_attendue);
+                }
+                Err(_) => {
+                    // « Tant que SOAP repond » : il ne repond plus. On rend la
+                    // main TOUT DE SUITE — faire patienter 30 s devant un
+                    // appareil debranche serait un second defaut.
+                    v.soap_muet = true;
+                    break;
+                }
+            }
+            if v.verdict != UriVerdict::PasEncore {
+                break;
+            }
+            if derniere_relance.elapsed() >= INTERVALLE_RELANCE_REVEIL {
+                derniere_relance = tokio::time::Instant::now();
+                v.relances += 1;
+                v.refus_relance = relancer().await;
+                if v.refus_relance.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    v.attente_ms = debut.elapsed().as_millis() as u64;
+    v
 }
 
 /// Un refus SOAP portant le code UPnP **701 « Transition not available »**.
@@ -1819,14 +2666,28 @@ mod tests {
         );
     }
 
+    /// **Ce test a CHANGE de conclusion sur un point, et un seul : l'URI
+    /// VIDE.** Il epinglait `Some("") => PasAppliquee`, c'est-a-dire « le
+    /// renderer joue une autre source ». C'etait faux, et c'est la cause de
+    /// #2749 : un Denon/HEOS en veille reseau acquitte `Play` puis rend une
+    /// `CurrentURI` vide parce qu'il n'a RIEN charge — pas parce qu'il joue
+    /// autre chose. Tune coupait la zone en 13 s sur ce contresens.
+    ///
+    /// Le vide vaut desormais `PasEncore` (voir `UriVerdict`). Le reste du test
+    /// est INTACT : un flux Tune perime, ou celui d'un autre serveur, reste
+    /// `PasAppliquee` — c'est ce qui fait echouer le zombie du DMP-A8 (#2394),
+    /// et ce verdict-la ne bouge pas d'un pouce.
     #[test]
     fn verdict_uri_vide_ou_flux_perime_n_est_pas_applique() {
         let url = "http://192.168.1.42:8888/stream/abc-123.wav";
-        // L'Eversolo qui garde l'URI d'avant : vide, ou un autre flux Tune.
+        // Vide = AUCUN media tenu : pas encore applique (#2749), pas « autre
+        // source ». Les espaces seuls comptent pour du vide, `trim` oblige.
+        assert_eq!(verdict_uri_appliquee(Some(""), url), UriVerdict::PasEncore);
         assert_eq!(
-            verdict_uri_appliquee(Some(""), url),
-            UriVerdict::PasAppliquee
+            verdict_uri_appliquee(Some("   "), url),
+            UriVerdict::PasEncore
         );
+        // L'Eversolo qui garde l'URI d'avant : un AUTRE flux Tune.
         assert_eq!(
             verdict_uri_appliquee(Some("http://192.168.1.42:8888/stream/vieux-flux.flac"), url),
             UriVerdict::PasAppliquee
@@ -1848,6 +2709,224 @@ mod tests {
             UriVerdict::Indeterminee
         );
         assert_eq!(verdict_uri_appliquee(None, url), UriVerdict::Indeterminee);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #2749 — un renderer EN VEILLE n'est pas un renderer qui joue autre chose
+    //
+    // Tout ce qui suit fait tourner `verifier_uri_appliquee`, LA boucle que
+    // `play_media` appelle. Un banc qui retranscrirait le mecanisme resterait
+    // vert pendant que le code de production se degrade (mesure le 01/09) :
+    // c'est bien la fonction branchee qui est eprouvee ici, avec ses vraies
+    // constantes, sous `start_paused` pour qu'une attente de 30 s ne coute
+    // rien.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Le flux que Tune vient d'envoyer — la radio FIP du releve.
+    const URL_2749: &str = "http://192.168.1.18:8888/stream/fip-2749.wav";
+    /// Un flux Tune PERIME, celui qu'un renderer zombie ne lache pas (#2394).
+    const URI_PERIMEE_2749: &str = "http://192.168.1.42:8888/stream/vieux-flux.flac";
+
+    /// Fait tourner la boucle de production contre un renderer SCRIPTE :
+    /// chaque element de `reponses` est ce que rend le `GetMediaInfo` suivant,
+    /// la derniere reponse etant rejouee indefiniment — un appareil ne change
+    /// pas d'avis tout seul. `refus_relance` est ce que rend le `Play` de
+    /// chaque relance.
+    ///
+    /// Rend le verdict, le nombre de lectures et le nombre de relances.
+    async fn eprouver_2749(
+        reponses: Vec<Result<Option<&'static str>, &'static str>>,
+        refus_relance: Option<&'static str>,
+    ) -> (VerifUri, u32, u32) {
+        let file: std::cell::RefCell<std::collections::VecDeque<_>> =
+            std::cell::RefCell::new(reponses.into_iter().collect());
+        let derniere: std::cell::RefCell<Result<Option<&'static str>, &'static str>> =
+            std::cell::RefCell::new(Ok(None));
+        let lectures = std::cell::Cell::new(0u32);
+        let relances = std::cell::Cell::new(0u32);
+        let (file_r, derniere_r, lectures_r, relances_r) = (&file, &derniere, &lectures, &relances);
+        let v = verifier_uri_appliquee(
+            URL_2749,
+            BUDGET_REVEIL_STANDBY,
+            || async move {
+                lectures_r.set(lectures_r.get() + 1);
+                if let Some(r) = file_r.borrow_mut().pop_front() {
+                    *derniere_r.borrow_mut() = r;
+                }
+                let r = *derniere_r.borrow();
+                r.map(|u| u.map(str::to_string)).map_err(str::to_string)
+            },
+            || async move {
+                relances_r.set(relances_r.get() + 1);
+                refus_relance.map(str::to_string)
+            },
+        )
+        .await;
+        (v, lectures.get(), relances.get())
+    }
+
+    /// TEMOIN 1 — `CurrentURI` vide, puis la BONNE URI : la zone joue.
+    ///
+    /// L'AVR-X1600H en veille reseau acquitte tout et ne tient rien pendant une
+    /// vingtaine de secondes, puis pose enfin l'URI. Avant #2749, Tune coupait
+    /// la zone au bout de 13,5 s en affirmant qu'il « jouait une autre
+    /// source ».
+    #[tokio::test(start_paused = true)]
+    async fn i2749_uri_vide_puis_reveil_la_zone_n_est_pas_coupee() {
+        let mut reponses: Vec<Result<Option<&'static str>, &'static str>> = vec![Ok(Some("")); 25];
+        reponses.push(Ok(Some(URL_2749)));
+        let (v, lectures, relances) = eprouver_2749(reponses, None).await;
+        assert_eq!(
+            v.verdict,
+            UriVerdict::Appliquee,
+            "l'ampli a fini par poser NOTRE URI : la lecture doit aboutir, \
+             pas etre coupee ({} lectures, {} ms)",
+            lectures,
+            v.attente_ms
+        );
+        assert!(!v.soap_muet, "l'appareil a repondu tout du long");
+        assert!(
+            v.attente_ms > 15_000 && v.attente_ms < 30_000,
+            "le reveil observe sur HEOS tient entre 15 et 30 s : {} ms",
+            v.attente_ms
+        );
+        assert!(
+            relances >= 2,
+            "l'URI doit etre REPOSEE plusieurs fois pendant l'attente, pas une \
+             seule comme dans le bareme de #2390 : {relances}"
+        );
+    }
+
+    /// TEMOIN 2 — une AUTRE URI reellement tenue : rien ne change.
+    ///
+    /// C'est le zombie du DMP-A8 (#2394), meme journal
+    /// `dlna_play_jamais_applique` mais cause appareil : il tient un flux Tune
+    /// PERIME et ne le lachera pas. Le correctif de #2749 ne doit RIEN lui
+    /// offrir — ni attente, ni relance de plus, ni message adouci.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_une_autre_source_reellement_tenue_echoue_comme_avant() {
+        let (v, lectures, relances) = eprouver_2749(vec![Ok(Some(URI_PERIMEE_2749))], None).await;
+        assert_eq!(
+            v.verdict,
+            UriVerdict::PasAppliquee,
+            "un flux Tune perime reste « pas applique » : le zombie doit \
+             continuer d'echouer"
+        );
+        assert_eq!(v.uri_tenue.as_deref(), Some(URI_PERIMEE_2749));
+        assert_eq!(
+            lectures, 6,
+            "le bareme de #2390 fait SIX lectures, pas une de plus"
+        );
+        assert_eq!(relances, 1, "UNE relance, exactement comme avant #2749");
+        assert!(
+            v.attente_ms < 3_000,
+            "aucune fenetre de reveil ne doit s'ouvrir sur une AUTRE source : {} ms",
+            v.attente_ms
+        );
+    }
+
+    /// TEMOIN 3 — `CurrentURI` reste vide ET SOAP cesse de repondre :
+    /// on abandonne, sans attendre la borne complete.
+    ///
+    /// C'est la condition « tant que SOAP repond » du rapporteur, rendue
+    /// EFFECTIVE : un appareil debranche en cours d'attente ne doit pas faire
+    /// patienter 30 s pour rien.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_uri_vide_puis_soap_muet_abandonne_sans_bruler_la_borne() {
+        let mut reponses: Vec<Result<Option<&'static str>, &'static str>> = vec![Ok(Some("")); 8];
+        reponses.push(Err(
+            "soap send: error trying to connect: connection refused",
+        ));
+        let (v, _lectures, _relances) = eprouver_2749(reponses, None).await;
+        assert_eq!(v.verdict, UriVerdict::PasEncore);
+        assert!(
+            v.soap_muet,
+            "l'appareil avait repondu, puis s'est tu : c'est un appareil qui \
+             disparait, pas un appareil qui dort"
+        );
+        assert!(
+            v.attente_ms < 10_000,
+            "l'abandon doit etre IMMEDIAT, pas au bout des 30 s : {} ms",
+            v.attente_ms
+        );
+    }
+
+    /// La borne, quand la veille n'aboutit jamais : on echoue — mais APRES
+    /// l'avoir vraiment attendue, et sous la grace de chargement du sondeur
+    /// (45 s), pour qu'une seule instance decide.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_une_veille_qui_n_aboutit_pas_echoue_a_la_borne() {
+        let (v, _lectures, relances) = eprouver_2749(vec![Ok(Some(""))], None).await;
+        assert_eq!(v.verdict, UriVerdict::PasEncore);
+        assert!(
+            !v.soap_muet,
+            "l'appareil repond toujours, il ne se reveille pas"
+        );
+        assert!(
+            v.attente_ms >= 30_000,
+            "une attente plus courte que la borne ne corrige rien : {} ms",
+            v.attente_ms
+        );
+        assert!(
+            v.attente_ms < 40_000,
+            "l'attente doit rester franchement sous la grace de chargement du \
+             sondeur (TRACK_LOAD_GRACE_SECS = 45 s) : {} ms",
+            v.attente_ms
+        );
+        assert!(
+            relances >= 3,
+            "l'URI est reposee toutes les 8 s pendant l'attente : {relances}"
+        );
+    }
+
+    /// Contre-epreuve — un renderer qui n'implemente PAS `GetMediaInfo` ne
+    /// bloque toujours rien. Rien n'a jamais repondu : on ne conclut pas a un
+    /// appareil disparu, et surtout on ne fait pas echouer la lecture.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_un_renderer_sans_get_media_info_ne_bloque_toujours_rien() {
+        let (v, lectures, relances) = eprouver_2749(vec![Err("soap send: 501")], None).await;
+        assert_eq!(v.verdict, UriVerdict::Indeterminee);
+        assert!(
+            !v.soap_muet,
+            "aucune lecture n'avait abouti : ce n'est pas un appareil qui se tait"
+        );
+        assert_eq!(lectures, 1);
+        assert_eq!(relances, 0);
+    }
+
+    /// Contre-epreuve — un REFUS SOAP sur le `Play` de la relance n'ouvre pas
+    /// la fenetre de reveil. Un appareil qui refuse la transition NOMME un
+    /// etat (701, #2581) ; il ne dort pas. Sans cette porte, le 701 de FabienM
+    /// aurait ete travesti en veille et l'utilisateur aurait attendu 30 s.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_un_refus_sur_la_relance_n_ouvre_pas_la_fenetre_de_reveil() {
+        let (v, _lectures, relances) = eprouver_2749(
+            vec![Ok(Some(""))],
+            Some("<errorCode>701</errorCode>Transition not available"),
+        )
+        .await;
+        assert_eq!(v.verdict, UriVerdict::PasEncore);
+        assert!(
+            v.refus_relance.is_some(),
+            "le refus doit etre remonte tel quel"
+        );
+        assert_eq!(relances, 1);
+        assert!(
+            v.attente_ms < 3_000,
+            "un refus n'est pas une veille : pas d'attente : {} ms",
+            v.attente_ms
+        );
+    }
+
+    /// Contre-epreuve — une URI reecrite (Sonos) ne conclut toujours RIEN, et
+    /// n'ouvre aucune attente.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_une_uri_reecrite_ne_conclut_toujours_rien() {
+        let (v, lectures, relances) =
+            eprouver_2749(vec![Ok(Some("x-rincon-queue:RINCON_123#0"))], None).await;
+        assert_eq!(v.verdict, UriVerdict::Indeterminee);
+        assert_eq!(lectures, 1);
+        assert_eq!(relances, 0);
     }
 
     #[test]

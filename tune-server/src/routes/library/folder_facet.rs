@@ -2,6 +2,7 @@ use axum::Json;
 use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::{SqlValue, ToSqlValue};
 use tune_core::db::engine::Engine;
@@ -51,13 +52,14 @@ pub(super) async fn folder_facet(
     // Cumulative narrowing by the OTHER facets. exclude="folder" so the caller's
     // own folder selection isn't double-applied — this endpoint scopes by the
     // `path` prefix below instead. An active collection selection is resolved to
-    // album ids so it narrows the folder children too.
-    let coll_ids: Option<Vec<i64>> = filters
+    // its member set — la MÊME résolution que la liste et que le rail (#1864),
+    // collections intelligentes comprises — so it narrows the folder children too.
+    let coll = filters
         .collection
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|name| super::facets::collection_album_ids(&state, name));
-    let (conds, params) = build_conditions(&filters, engine, "folder", coll_ids.as_deref());
+        .map(|name| super::facets::resolve_collection(&state, name));
+    let (conds, params) = build_conditions(&filters, engine, "folder", coll.as_ref());
 
     let path = p
         .path
@@ -110,7 +112,7 @@ fn where_with_prefix(
     let mut parts: Vec<String> = conds.to_vec();
     parts.push(format!(
         "t.file_path LIKE {like_ph}{}",
-        tune_core::db::track_repo::like_escape_clause(engine)
+        tune_core::db::track_repo::like_escape_clause()
     ));
     (parts.join(" AND "), all)
 }
@@ -246,7 +248,7 @@ fn folder_children(
     let (where_sql, all) = where_with_prefix(engine, conds, params, &folder_like_pattern(&base));
     let sql = format!("SELECT t.file_path FROM tracks t WHERE {where_sql}");
     let refs: Vec<&dyn ToSqlValue> = all.iter().map(|v| v as &dyn ToSqlValue).collect();
-    let rows = state.backend.query_many(&sql, &refs).unwrap_or_default();
+    let rows = state.backend.query_many(&sql, &refs).ou_defaut_journalise();
 
     // Aggregate the immediate child segment (portable: no engine-specific SQL
     // string surgery, no case/normalization equality traps). A row with no

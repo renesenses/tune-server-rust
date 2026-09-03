@@ -8,6 +8,7 @@ mod better_quality;
 mod browse;
 mod collections;
 mod credits;
+pub(crate) mod credits_mb;
 mod duplicates;
 mod enrich;
 mod facets;
@@ -21,7 +22,10 @@ mod ratings;
 mod reidentify;
 mod reports;
 mod search;
-mod stats;
+// `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
+// compteurs que `/library/stats` sur un autre écran et doit les ventiler par
+// source de la même façon. Un seul point de vérité, partagé (#2147).
+pub(crate) mod stats;
 mod tracks;
 pub(crate) mod write_tags;
 
@@ -184,6 +188,21 @@ pub fn router() -> Router<AppState> {
         )
         .route("/albums/batch-update", post(albums::batch_update_albums))
         .route("/albums/count", get(albums::album_count))
+        // Masquage d'album (#1391). `/albums/hidden` AVANT `/albums/{id}` par
+        // hygiène de lecture — axum fait de toute façon primer le segment
+        // statique, comme pour `/albums/count` et `/albums/recent`.
+        .route("/albums/hidden", get(albums::list_hidden_albums))
+        .route(
+            "/albums/{id}/hide",
+            post(albums::hide_album).delete(albums::unhide_album),
+        )
+        // « Ces deux albums ne sont pas des doublons » (#1276). Même hygiène
+        // que `/albums/hidden` : le segment statique d'abord.
+        .route("/albums/distinct", get(albums::list_distinct_pairs))
+        .route(
+            "/albums/{id}/distinct/{other_id}",
+            post(albums::declare_albums_distinct).delete(albums::revoke_albums_distinct),
+        )
         .route("/albums/filters", get(albums::album_filters))
         .route("/facets", get(facets::library_facets))
         .route("/albums-detailed", get(albums_detailed::albums_detailed))
@@ -239,6 +258,13 @@ pub fn router() -> Router<AppState> {
             post(credits::enrich_album_credits),
         )
         .route("/enrich-credits", post(credits::enrich_all_credits))
+        // Avancement de la passe ci-dessus (#2799). Même forme que
+        // `/enrich-all/status` : sans elle, le `task_id` rendu par le 202
+        // n'était interrogeable nulle part et l'écran ne pouvait qu'espérer.
+        .route(
+            "/enrich-credits/status",
+            get(credits::enrich_credits_status),
+        )
         // Generic metadata reports (wrong cover / credit / bio / image).
         .route(
             "/reports",
@@ -383,7 +409,9 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/collections/{id}",
-            get(collections::get_collection).delete(collections::delete_collection),
+            get(collections::get_collection)
+                .put(collections::update_collection)
+                .delete(collections::delete_collection),
         )
         .route(
             "/collections/{id}/albums",

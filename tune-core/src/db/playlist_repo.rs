@@ -26,6 +26,19 @@ pub mod sql {
         )
     }
 
+    /// Same projection as [`get_by_id`], but the row must ALSO belong to the
+    /// asking profile. Playlist ids are small sequential integers, so `WHERE id
+    /// = ?` alone lets any caller walk the whole household's playlists (#2794).
+    /// The ownership test belongs in the statement, not in a prior read: a
+    /// check-then-act pair can be raced, and it is one more place to forget.
+    pub fn get_by_id_scoped<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p WHERE p.id = {} AND p.profile_id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn list<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p WHERE p.profile_id = {} ORDER BY LOWER(p.name) LIMIT {} OFFSET {}",
@@ -39,11 +52,28 @@ pub mod sql {
         format!("DELETE FROM playlists WHERE id = {}", d.placeholder(1))
     }
 
+    pub fn delete_scoped<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM playlists WHERE id = {} AND profile_id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn update_field<D: SqlDialect>(d: &D, field: &str) -> String {
         format!(
             "UPDATE playlists SET {field} = {} WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2)
+        )
+    }
+
+    pub fn update_field_scoped<D: SqlDialect>(d: &D, field: &str) -> String {
+        format!(
+            "UPDATE playlists SET {field} = {} WHERE id = {} AND profile_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
         )
     }
 
@@ -146,6 +176,23 @@ impl PlaylistRepo {
             .map(row_to_playlist))
     }
 
+    /// Read a playlist **only if it belongs to `profile_id`**.
+    ///
+    /// [`get`] is kept for the internal paths that legitimately have no caller
+    /// identity (scan-sync of folder playlists, the public share-token route).
+    /// Every HTTP handler that acts on behalf of somebody must use this one:
+    /// `WHERE id = ?` alone is not an access control, since the ids are
+    /// sequential (#2794).
+    pub fn get_for_profile(&self, id: i64, profile_id: i64) -> Result<Option<Playlist>, String> {
+        let sql = self.dialect_sql(sql::get_by_id_scoped, sql::get_by_id_scoped);
+        let params: [&dyn ToSqlValue; 2] = [&id, &profile_id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(row_to_playlist))
+    }
+
     pub fn list(&self, profile_id: i64, limit: i64, offset: i64) -> Result<Vec<Playlist>, String> {
         let sql = self.dialect_sql(sql::list, sql::list);
         let params: [&dyn ToSqlValue; 3] = [&profile_id, &limit, &offset];
@@ -183,6 +230,49 @@ impl PlaylistRepo {
             self.db.execute(&sql, &params)?;
         }
         Ok(())
+    }
+
+    /// Delete a playlist **only if it belongs to `profile_id`**. Returns
+    /// whether a row was actually removed, so the caller answers `404` instead
+    /// of a `204` that deleted nothing — the silent no-op is exactly how a
+    /// missing access control stays invisible.
+    pub fn delete_for_profile(&self, id: i64, profile_id: i64) -> Result<bool, String> {
+        let sql = self.dialect_sql(sql::delete_scoped, sql::delete_scoped);
+        let params: [&dyn ToSqlValue; 2] = [&id, &profile_id];
+        Ok(self.db.execute(&sql, &params)? > 0)
+    }
+
+    /// Update a playlist **only if it belongs to `profile_id`**. Returns
+    /// whether the playlist was reachable by that profile at all — a body with
+    /// neither field still answers that question, by reading the row back.
+    pub fn update_for_profile(
+        &self,
+        id: i64,
+        profile_id: i64,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<bool, String> {
+        if name.is_none() && description.is_none() {
+            return Ok(self.get_for_profile(id, profile_id)?.is_some());
+        }
+        let mut touched = false;
+        if let Some(n) = name {
+            let sql = self.dialect_sql(
+                |d| sql::update_field_scoped(d, "name"),
+                |d| sql::update_field_scoped(d, "name"),
+            );
+            let params: [&dyn ToSqlValue; 3] = [&n, &id, &profile_id];
+            touched |= self.db.execute(&sql, &params)? > 0;
+        }
+        if let Some(d) = description {
+            let sql = self.dialect_sql(
+                |dlc| sql::update_field_scoped(dlc, "description"),
+                |dlc| sql::update_field_scoped(dlc, "description"),
+            );
+            let params: [&dyn ToSqlValue; 3] = [&d, &id, &profile_id];
+            touched |= self.db.execute(&sql, &params)? > 0;
+        }
+        Ok(touched)
     }
 
     pub fn add_tracks(
@@ -238,6 +328,58 @@ impl PlaylistRepo {
             return Ok(Vec::new());
         }
         self.add_tracks(playlist_id, &to_add, position)
+    }
+
+    /// Create a playlist AND fill it, in ONE transaction: either the playlist
+    /// exists with its tracks, or nothing was written at all.
+    ///
+    /// The two-step `create()` + `add_tracks…()` shape used by duplication and
+    /// by the playlist imports could not be honest: when the second step
+    /// failed, the empty playlist stayed in the database and the route dropped
+    /// the error with `.ok()`, so the caller got `201 Created` for a playlist
+    /// that holds nothing (#2798). Here a failed track insert rolls the
+    /// playlist row back with it.
+    ///
+    /// `track_ids` is de-duplicated in order (first occurrence wins), like
+    /// `add_tracks_deduped` — the playlist is brand new, so there is nothing
+    /// else to dedup against. Returns the new id **and the ids actually
+    /// written**, so the caller reports what is persisted instead of what it
+    /// hoped to persist.
+    pub fn create_with_tracks(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        profile_id: i64,
+        track_ids: &[i64],
+    ) -> Result<(i64, Vec<i64>), String> {
+        let create_sql = self.dialect_sql(sql::create, sql::create);
+        let insert_sql = self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track);
+
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let to_add: Vec<i64> = track_ids
+            .iter()
+            .copied()
+            .filter(|tid| seen.insert(*tid))
+            .collect();
+
+        let mut new_id = 0i64;
+        {
+            let new_id_ref = &mut new_id;
+            let to_add_ref = &to_add;
+            self.db.write_tx(&mut |tx| {
+                let cp: [&dyn ToSqlValue; 3] = [&name, &description, &profile_id];
+                tx.execute(&create_sql, &cp)?;
+                let id = tx.last_insert_rowid();
+                *new_id_ref = id;
+                for (i, tid) in to_add_ref.iter().enumerate() {
+                    let pos = i as i64;
+                    let p: [&dyn ToSqlValue; 3] = [&id, tid, &pos];
+                    tx.execute(&insert_sql, &p)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok((new_id, to_add))
     }
 
     pub fn remove_tracks_at_positions(
@@ -464,6 +606,51 @@ mod tests {
         assert_eq!(p2.len(), 2);
     }
 
+    /// #2794 — le test ci-dessus ne couvrait que `list` et `count`, c'est-à-dire
+    /// exactement les deux seules opérations qui étaient cloisonnées. Les accès
+    /// **par id**, eux, ignoraient le profil.
+    #[test]
+    fn access_by_id_is_scoped_by_profile() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+        let id = repo.create("Privee du profil 1", None, 1).unwrap();
+
+        // Lecture
+        assert!(repo.get_for_profile(id, 1).unwrap().is_some());
+        assert!(
+            repo.get_for_profile(id, 2).unwrap().is_none(),
+            "le profil 2 a lu la playlist du profil 1"
+        );
+
+        // Modification : refusée ET sans effet en base.
+        assert!(
+            !repo
+                .update_for_profile(id, 2, Some("Detournee"), None)
+                .unwrap()
+        );
+        assert_eq!(repo.get(id).unwrap().unwrap().name, "Privee du profil 1");
+        // Un corps vide répond quand même « cette playlist ne vous est pas
+        // accessible » plutôt que de mentir par un succès.
+        assert!(!repo.update_for_profile(id, 2, None, None).unwrap());
+        assert!(repo.update_for_profile(id, 1, None, None).unwrap());
+
+        // Suppression : refusée ET la ligne est toujours là.
+        assert!(!repo.delete_for_profile(id, 2).unwrap());
+        assert!(repo.get(id).unwrap().is_some());
+
+        // Témoin : le propriétaire, lui, modifie et supprime.
+        assert!(
+            repo.update_for_profile(id, 1, Some("Renommee"), None)
+                .unwrap()
+        );
+        assert_eq!(repo.get(id).unwrap().unwrap().name, "Renommee");
+        assert!(repo.delete_for_profile(id, 1).unwrap());
+        assert!(repo.get(id).unwrap().is_none());
+        // Une seconde suppression n'a plus rien à supprimer : `false`, pas un
+        // succès silencieux.
+        assert!(!repo.delete_for_profile(id, 1).unwrap());
+    }
+
     #[test]
     fn playlist_list_pagination() {
         let db = test_db();
@@ -654,5 +841,94 @@ mod tests {
         let repo = PlaylistRepo::with_backend(backend);
         let id = repo.create("X", None, 1).unwrap();
         assert!(repo.get(id).unwrap().is_some());
+    }
+
+    // --- #2798 : création + remplissage, tout ou rien -------------------
+
+    /// Ce que `create_with_tracks` rend décrit ce qui est EN BASE : les
+    /// positions sont contiguës et les répétitions du lot sont écartées, donc
+    /// le nombre rendu ne peut pas dépasser le nombre de lignes écrites.
+    #[test]
+    fn create_with_tracks_persiste_exactement_ce_qu_il_annonce() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let mut t = TrackModel::new(format!("T{i}"));
+            t.file_path = Some(format!("/t{i}.flac"));
+            ids.push(track_repo.create(&t).unwrap());
+        }
+
+        // ids[0] apparaît deux fois : un import M3U peut lister deux fois le
+        // même fichier.
+        let (plid, written) = repo
+            .create_with_tracks("Import", None, 1, &[ids[0], ids[1], ids[0], ids[2]])
+            .unwrap();
+
+        assert_eq!(written, vec![ids[0], ids[1], ids[2]]);
+        assert_eq!(repo.get_track_ids(plid).unwrap(), written);
+        assert_eq!(repo.get(plid).unwrap().unwrap().track_count, 3);
+    }
+
+    /// Le cœur de #2798 : un échec APRÈS la création de la playlist ne doit
+    /// laisser aucune playlist derrière lui.
+    ///
+    /// L'échec est injecté sans mock : `playlist_tracks.track_id` référence
+    /// `tracks(id)` et `PRAGMA foreign_keys=ON`, donc insérer une piste
+    /// inexistante échoue — de façon déterministe, sans horloge ni ordre
+    /// d'exécution. La deuxième piste est valide : l'échec survient bien au
+    /// MILIEU du remplissage, pas au premier insert.
+    #[test]
+    fn create_with_tracks_ne_laisse_rien_quand_une_piste_echoue() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let mut t = TrackModel::new("Bonne".into());
+        t.file_path = Some("/bonne.flac".into());
+        let bonne = track_repo.create(&t).unwrap();
+
+        let avant = repo.count(1).unwrap();
+
+        let err = repo
+            .create_with_tracks("Copie", None, 1, &[bonne, 999_999_999, bonne + 1])
+            .expect_err("un track_id inexistant doit faire échouer la transaction");
+
+        assert_eq!(
+            repo.count(1).unwrap(),
+            avant,
+            "une playlist partielle a survécu à l'échec ({err})"
+        );
+        assert!(
+            repo.list(1, 100, 0)
+                .unwrap()
+                .iter()
+                .all(|p| p.name != "Copie"),
+            "la playlist « Copie » est restée en base après l'échec"
+        );
+    }
+
+    /// Contre-épreuve : l'ancienne séquence (create() puis add_tracks()) laisse
+    /// bel et bien la playlist vide derrière elle. Si ce test devenait vert
+    /// sans `create_with_tracks`, c'est que l'échec n'est plus injecté et que
+    /// le test ci-dessus ne prouve plus rien.
+    #[test]
+    fn contre_epreuve_l_ancienne_sequence_laisse_une_playlist_orpheline() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+
+        let avant = repo.count(1).unwrap();
+        let plid = repo.create("Copie ancienne", None, 1).unwrap();
+        let echec = repo.add_tracks(plid, &[999_999_999], None);
+
+        assert!(echec.is_err(), "l'échec doit bien être injecté");
+        assert_eq!(
+            repo.count(1).unwrap(),
+            avant + 1,
+            "l'ancienne séquence laissait une playlist vide — c'est le défaut #2798"
+        );
+        assert!(repo.get_track_ids(plid).unwrap().is_empty());
     }
 }

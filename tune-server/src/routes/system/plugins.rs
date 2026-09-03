@@ -2,18 +2,17 @@ use axum::Json;
 use axum::extract::State;
 use serde_json::{Value, json};
 
-use tune_core::db::settings_repo::SettingsRepo;
-
 use crate::state::AppState;
 
+/// Alias historique de la liste `/plugins`, restreint aux fiches héritées de
+/// la clef de réglages `plugins`.
+///
+/// Il lisait cette clef **directement**, donc sans le tri : c'était la seconde
+/// porte par laquelle une fiche de l'ère Python revenait, y compris sur un
+/// serveur où `/plugins` l'écarte. Les deux passent désormais par
+/// [`crate::routes::plugins::fiches_locales_honorables`] — un seul tri, une
+/// seule vérité (#2132).
 pub(super) async fn list_system_plugins(State(state): State<AppState>) -> Json<Value> {
-    // Alias for /plugins list
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let plugins: Vec<Value> = settings
-        .get("plugins")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let plugins = crate::routes::plugins::fiches_locales_honorables(&state).await;
     Json(json!(plugins))
 }

@@ -15,3 +15,8 @@ reqwest = { workspace = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+# Le service simulé des essais implémente le trait `StreamingService`,
+# annoté `#[async_trait]` dans tune-core.
+async-trait = { workspace = true }

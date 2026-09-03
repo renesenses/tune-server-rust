@@ -130,8 +130,35 @@ pub mod sql {
         "SELECT id, name FROM artists WHERE (image_path IS NULL OR image_path = '') AND (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
     }
 
+    /// Les artistes dépourvus de biographie — **avec ou sans** identifiant
+    /// MusicBrainz.
+    ///
+    /// ## Ce que la clause `musicbrainz_id != ''` faisait ici (#1311)
+    ///
+    /// Elle écartait de la sélection tout artiste sans MBID. Deux
+    /// conséquences, qui se renforcent :
+    ///
+    /// 1. `batch_enrich_artist_bios` ne les voyait **jamais**. La branche
+    ///    « pas de MBID → tenter Last.fm par le nom » que cette fonction
+    ///    contient était du code mort : la requête garantissait `mbid` non
+    ///    vide, donc la condition `mbid.is_empty()` ne pouvait pas être vraie.
+    /// 2. `enrichment_status` calcule `artists_with_bio = total - len()`
+    ///    (`routes/system/enrich.rs`). Tout artiste sans MBID était donc
+    ///    compté comme *pourvu* d'une biographie. Sur .18, la couverture MBID
+    ///    mesurée est de 0,9 % : le panneau d'enrichissement annonçait donc
+    ///    ~99 % de biographies devant des fiches vides, et
+    ///    `POST /system/enrich-bios` renvoyait un `artists_without_bio`
+    ///    minuscule.
+    ///
+    /// Le pendant image de cette requête, `list_without_image_no_mbid`,
+    /// existe déjà et alimente la « phase 3 » de l'enrichissement des
+    /// vignettes (Discogs + Last.fm par le nom) : le chemin bio n'avait
+    /// jamais reçu le même traitement.
+    ///
+    /// `COALESCE` garde la troisième colonne non nulle : l'appelant lit une
+    /// `String` et reconnaît « pas de MBID » à la chaîne vide.
     pub fn list_without_bio() -> &'static str {
-        "SELECT id, name, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
+        "SELECT id, name, COALESCE(musicbrainz_id, '') FROM artists WHERE (bio IS NULL OR bio = '') ORDER BY id"
     }
 
     pub fn count_with_bio() -> &'static str {
@@ -144,6 +171,50 @@ pub mod sql {
 
     pub fn list_without_bio_with_mbid() -> &'static str {
         "SELECT id, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
+    }
+
+    /// Les bios locales que le fonds communautaire ne recevra JAMAIS (#2258).
+    ///
+    /// Complément EXACT de [`list_with_bio_and_mbid`] parmi les artistes
+    /// pourvus d'une biographie : `bio` non vide, MBID absent ou vide. Ce que
+    /// cette requête compte n'est pas une anomalie de la requête sœur — c'est
+    /// la conséquence, mesurée, de la clé qu'elle applique.
+    ///
+    /// ## Pourquoi le filtre reste, et pourquoi seul le COMPTE bouge
+    ///
+    /// `cloud::bio_sync::download_artist_bios` interroge le fonds par
+    /// `"{artist_url}?musicbrainz_ids={}"` : **le fonds est indexé par MBID**.
+    /// Retirer `musicbrainz_id != ''` de la requête d'envoi ferait partir des
+    /// clés vides vers une API qui s'en sert d'index — au mieux un rejet, au
+    /// pire une biographie rattachée au mauvais artiste chez tous les
+    /// utilisateurs. La clé n'est donc pas discutée ici ; ce qui l'est, c'est
+    /// que son effet soit **dit** au lieu d'être subi en silence.
+    ///
+    /// ## Le compte suit la requête AU MOT, pas l'intention
+    ///
+    /// Pas de `TRIM` : `list_with_bio_and_mbid` n'en fait pas. Un MBID réduit à
+    /// des espaces passe donc son filtre et **est** téléversé ; le compter ici
+    /// comme exclu ferait mentir le chiffre dans l'autre sens. (Que ce MBID
+    /// blanc soit lui-même douteux est le sujet de `usable_musicbrainz_id`
+    /// plus bas, pas celui-ci.)
+    pub fn count_bio_sans_mbid() -> &'static str {
+        "SELECT COUNT(*) FROM artists WHERE bio IS NOT NULL AND bio != '' AND (musicbrainz_id IS NULL OR musicbrainz_id = '')"
+    }
+
+    /// Les artistes qu'aucune biographie communautaire ne pourra servir (#2258).
+    ///
+    /// Complément EXACT de [`list_without_bio_with_mbid`] parmi les artistes
+    /// dépourvus de biographie. L'exclusion joue donc **des deux côtés** : ces
+    /// artistes-là ne sont ni contributeurs ni bénéficiaires du fonds.
+    ///
+    /// À ne pas confondre avec le `sans_source` du bilan de passe
+    /// (`metadata::bio_batch::bilan_de_passe`), qui compte tout autre chose :
+    /// les artistes sans MBID **et** sans clé Last.fm, c'est-à-dire ceux que
+    /// les sources LOCALES ne peuvent pas servir. Poser une clé Last.fm remet
+    /// `sans_source` à zéro et ne change **rien** ici : le fonds communautaire
+    /// reste hors d'atteinte tant qu'il n'y a pas de MBID.
+    pub fn count_sans_bio_sans_mbid() -> &'static str {
+        "SELECT COUNT(*) FROM artists WHERE (bio IS NULL OR bio = '') AND (musicbrainz_id IS NULL OR musicbrainz_id = '')"
     }
 
     /// ⚠ L'ordre DÉCLARÉ doit suivre l'ordre LIÉ.
@@ -180,12 +251,35 @@ pub mod sql {
         )
     }
 
-    /// Engine-agnostic full-text search.
+    /// Le PRÉDICAT de la recherche d'artistes (emplacements 1 et 2), extrait
+    /// pour que la liste rendue et le total annoncé portent le même filtre
+    /// (#3189).
+    pub fn search_where<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} OR LOWER(unaccent(a.name)) LIKE LOWER(unaccent({}))",
+            d.fts_where("artists", "a", &d.placeholder(1)),
+            d.placeholder(2)
+        )
+    }
+
+    /// Engine-agnostic full-text search, PAGINÉE. `ORDER BY a.id` est un
+    /// ordre total : sans lui, deux pages successives peuvent se recouvrir.
+    /// Emplacements 3 et 4 : `LIMIT` et `OFFSET`.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {COLS} FROM artists a WHERE {} OR LOWER(unaccent(a.name)) LIKE LOWER(unaccent({})) LIMIT {}",
-            d.fts_where("artists", "a", &d.placeholder(1)),
-            d.placeholder(2),
+            "SELECT {COLS} FROM artists a WHERE {} ORDER BY a.id LIMIT {} OFFSET {}",
+            search_where(d),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
+    /// Le NOMBRE d'artistes correspondants, borné (emplacement 3). La borne
+    /// est DANS la sous-requête, sinon elle ne borne rien.
+    pub fn search_count<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM (SELECT a.id FROM artists a WHERE {} LIMIT {}) AS borne",
+            search_where(d),
             d.placeholder(3)
         )
     }
@@ -193,6 +287,27 @@ pub mod sql {
 
 pub struct ArtistRepo {
     db: Arc<dyn DbBackend>,
+}
+
+/// Ce que la CLÉ du fonds communautaire écarte, des deux côtés (#2258).
+///
+/// Le fonds de biographies de mozaiklabs.fr est indexé par identifiant
+/// MusicBrainz — `download_artist_bios` l'interroge par
+/// `?musicbrainz_ids=…`. Un artiste sans MBID en est donc structurellement
+/// absent : sa biographie ne part jamais, et aucune biographie ne lui revient.
+///
+/// Cette exclusion était **totalement muette**. L'utilisateur voyait des
+/// fiches vides sans pouvoir savoir que la cause n'était ni une panne, ni une
+/// source avare, mais un choix de clé. Ces deux nombres la nomment et la
+/// chiffrent ; ils ne la lèvent pas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HorsFondsCommunautaire {
+    /// Bios locales qu'aucun autre utilisateur ne recevra jamais : elles
+    /// existent, elles sont bonnes, et la passe d'envoi ne les voit pas.
+    pub bios_non_partagees: i64,
+    /// Artistes qu'aucune bio communautaire ne pourra servir : ils ne sont
+    /// même pas candidats au téléchargement.
+    pub artistes_non_servis: i64,
 }
 
 /// Un identifiant externe vide n'est pas une identité.
@@ -406,6 +521,34 @@ impl ArtistRepo {
                 )
             })
             .collect())
+    }
+
+    /// Combien d'artistes la clé du fonds communautaire écarte, des deux
+    /// côtés (#2258).
+    ///
+    /// Les deux nombres sont les compléments EXACTS des deux requêtes
+    /// ci-dessus : `artists_with_bio_and_mbid` (envoi) et
+    /// `artists_without_bio_with_mbid` (candidats au téléchargement). Ils se
+    /// lisent donc l'un contre l'autre sans recoupement possible — ce que
+    /// l'une laisse partir, l'autre le compte comme resté à quai.
+    ///
+    /// Deux `COUNT(*)` séparés plutôt qu'un `SUM(CASE …)` : aucun paramètre
+    /// lié, donc aucun `placeholder` à numéroter, donc rien à désaligner entre
+    /// SQLite (qui rend `?` et ne compte que la position) et PostgreSQL (qui
+    /// numérote ses `$n`). Le piège de `update_mbid` ne peut pas se rejouer
+    /// ici.
+    pub fn hors_fonds_communautaire(&self) -> Result<HorsFondsCommunautaire, TuneError> {
+        let compter = |requete: &str| -> Result<i64, TuneError> {
+            Ok(self
+                .db
+                .query_one(requete, &[])?
+                .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+                .unwrap_or(0))
+        };
+        Ok(HorsFondsCommunautaire {
+            bios_non_partagees: compter(sql::count_bio_sans_mbid())?,
+            artistes_non_servis: compter(sql::count_sans_bio_sans_mbid())?,
+        })
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Artist>, TuneError> {
@@ -662,12 +805,37 @@ impl ArtistRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, TuneError> {
+        self.search_page(query, limit, 0)
+    }
+
+    /// Une PAGE de la recherche d'artistes, dans un ordre total (#3189).
+    pub fn search_page(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Artist>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
+        let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 3] = [&fts_query, &like, &limit];
+        let params: [&dyn ToSqlValue; 4] = [&fts_query, &like, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_artist).collect())
+    }
+
+    /// Le nombre d'artistes correspondants, borné à `plafond` — indépendant
+    /// de `limit`. Rendre `plafond` signifie « au moins `plafond` ».
+    pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
+        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
+        let like = format!("%{query}%");
+        let sql = self.dialect_sql(sql::search_count, sql::search_count);
+        let params: [&dyn ToSqlValue; 3] = [&fts_query, &like, &plafond];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
     }
 }
 
@@ -736,6 +904,155 @@ mod tests {
         let a2 = repo.get_or_create("Beatles", None, None).unwrap();
         assert_eq!(a1.id, a2.id);
         assert_eq!(repo.count().unwrap(), 1);
+    }
+
+    /// #1311 — un artiste sans identifiant MusicBrainz est un artiste sans
+    /// biographie comme un autre.
+    ///
+    /// La requête exigeait un MBID non vide. Elle rendait donc invisibles à
+    /// l'enrichissement la quasi-totalité des artistes d'une bibliothèque
+    /// réelle (0,9 % de MBID mesurés sur .18), et faisait compter chacun
+    /// d'eux comme *pourvu* d'une biographie dans `enrichment_status`.
+    ///
+    /// Contre-épreuve : remettre `AND musicbrainz_id IS NOT NULL AND
+    /// musicbrainz_id != ''` dans `sql::list_without_bio` fait rougir ce
+    /// test, et lui seul.
+    #[test]
+    fn un_artiste_sans_mbid_compte_parmi_ceux_sans_bio() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+
+        // Avec MBID, sans bio — le seul cas que la requête retenait.
+        let mut avec_mbid = Artist::new("Pink Floyd".into());
+        avec_mbid.musicbrainz_id = Some("83d91898-7763-47d7-b03b-b92132375c47".into());
+        repo.create(&avec_mbid).unwrap();
+
+        // Sans MBID, sans bio — le cas courant, jusqu'ici écarté.
+        repo.create(&Artist::new("Bagad Kemper".into())).unwrap();
+
+        // Sans MBID mais AVEC bio — ne doit pas ressortir : c'est bien
+        // l'absence de biographie que la requête sélectionne.
+        let mut deja_pourvu = Artist::new("Alan Stivell".into());
+        deja_pourvu.bio = Some("Harpiste et chanteur breton.".into());
+        repo.create(&deja_pourvu).unwrap();
+
+        let sans_bio = repo.list_without_bio().unwrap();
+        let noms: Vec<&str> = sans_bio.iter().map(|(_, nom, _)| nom.as_str()).collect();
+        assert_eq!(
+            noms,
+            vec!["Pink Floyd", "Bagad Kemper"],
+            "un artiste sans MBID et sans bio doit figurer parmi ceux à enrichir"
+        );
+
+        // La colonne MBID reste lisible pour l'appelant : chaîne vide, pas NULL.
+        let (_, _, mbid_sans) = &sans_bio[1];
+        assert_eq!(
+            mbid_sans, "",
+            "l'absence de MBID doit se lire comme une chaîne vide, pas comme un NULL avalé"
+        );
+    }
+
+    /// Une bibliothèque comme celle de Bilou : quelques artistes identifiés,
+    /// beaucoup qui ne le sont pas.
+    ///
+    /// Deux avec MBID (un pourvu d'une bio, un non) — ce sont EUX que les deux
+    /// requêtes du fonds communautaire retiennent. Trois sans MBID dont une
+    /// bio, quatre sans MBID ni bio : sept artistes hors du dispositif, dans
+    /// les deux sens.
+    fn semer_bibliotheque_de_bilou(repo: &ArtistRepo) {
+        let mut identifie_avec_bio = Artist::new("Pink Floyd".into());
+        identifie_avec_bio.musicbrainz_id = Some("83d91898-7763-47d7-b03b-b92132375c47".into());
+        identifie_avec_bio.bio = Some("Groupe de rock anglais.".into());
+        repo.create(&identifie_avec_bio).unwrap();
+
+        let mut identifie_sans_bio = Artist::new("Miles Davis".into());
+        identifie_sans_bio.musicbrainz_id = Some("561d854a-6a28-4aa7-8c99-323e6ce46c2a".into());
+        repo.create(&identifie_sans_bio).unwrap();
+
+        for nom in ["Bagad Kemper", "Alan Stivell", "Denez Prigent"] {
+            let mut a = Artist::new(nom.into());
+            a.bio = Some(format!("Notice locale de {nom}."));
+            repo.create(&a).unwrap();
+        }
+        for nom in ["Sonerien Du", "Startijenn", "Carlos Núñez", "Kepa"] {
+            repo.create(&Artist::new(nom.into())).unwrap();
+        }
+    }
+
+    /// #2258 — l'exclusion par la clé du fonds communautaire se COMPTE.
+    ///
+    /// `artists_with_bio_and_mbid` et `artists_without_bio_with_mbid` exigent
+    /// toutes deux un MBID non vide, parce que le fonds de mozaiklabs.fr est
+    /// indexé par MBID (`?musicbrainz_ids=…`). Les artistes sans MBID sont
+    /// donc écartés des DEUX côtés — et personne ne le leur disait.
+    ///
+    /// Contre-épreuve : remettre `AND musicbrainz_id IS NOT NULL AND
+    /// musicbrainz_id != ''` dans l'une ou l'autre des deux requêtes de compte
+    /// fait rougir ce test.
+    #[test]
+    fn le_compte_des_artistes_hors_du_fonds_communautaire() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        semer_bibliotheque_de_bilou(&repo);
+
+        let hors = repo.hors_fonds_communautaire().unwrap();
+        assert_eq!(
+            hors.bios_non_partagees, 3,
+            "trois bios locales que la passe d'envoi ne verra jamais"
+        );
+        assert_eq!(
+            hors.artistes_non_servis, 4,
+            "quatre artistes qu'aucune bio communautaire ne pourra servir"
+        );
+    }
+
+    /// TÉMOIN — le chemin qui marche ne bouge pas.
+    ///
+    /// Un artiste AVEC MBID reste exactement là où il était : téléversé s'il a
+    /// une bio, candidat au téléchargement s'il n'en a pas. Le compte de
+    /// #2258 s'ajoute à côté, il ne se substitue à rien.
+    ///
+    /// Ce test est vert AVANT comme APRÈS le correctif : il tombe si le compte
+    /// a été obtenu en desserrant l'une des deux requêtes de production.
+    #[test]
+    fn temoin_un_artiste_avec_mbid_est_traite_comme_avant() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        semer_bibliotheque_de_bilou(&repo);
+
+        let televerses = repo.artists_with_bio_and_mbid().unwrap();
+        let noms: Vec<&str> = televerses.iter().map(|e| e.0.as_str()).collect();
+        assert_eq!(
+            noms,
+            vec!["Pink Floyd"],
+            "seul l'artiste identifié part vers le fonds — et il en part toujours"
+        );
+        assert_eq!(
+            televerses[0].1, "83d91898-7763-47d7-b03b-b92132375c47",
+            "la clé envoyée reste le MBID, jamais une chaîne vide"
+        );
+
+        let candidats = repo.artists_without_bio_with_mbid().unwrap();
+        assert_eq!(candidats.len(), 1, "un seul candidat au téléchargement");
+        assert_eq!(candidats[0].1, "561d854a-6a28-4aa7-8c99-323e6ce46c2a");
+    }
+
+    /// Un garde qui ne trouve rien doit le dire : sur une bibliothèque
+    /// entièrement identifiée, les deux comptes valent zéro — et ce zéro-là
+    /// est une mesure, pas un repli d'erreur.
+    #[test]
+    fn une_bibliotheque_entierement_identifiee_n_exclut_personne() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        let mut a = Artist::new("Pink Floyd".into());
+        a.musicbrainz_id = Some("83d91898-7763-47d7-b03b-b92132375c47".into());
+        a.bio = Some("Groupe de rock anglais.".into());
+        repo.create(&a).unwrap();
+
+        assert_eq!(
+            repo.hors_fonds_communautaire().unwrap(),
+            HorsFondsCommunautaire::default()
+        );
     }
 
     #[test]
@@ -963,6 +1280,51 @@ mod tests {
         assert!(p_sql.contains("a.search_tsv @@ to_tsquery('simple', unaccent($1))"));
         assert!(s_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent(?))"));
         assert!(p_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent($2))"));
+        // #3189 — ordre TOTAL et pagination, plus le prédicat partagé avec le
+        // compte. Garde de texte : sur SQLite, l'ordre des rowid masque la
+        // disparition d'un `ORDER BY`.
+        for sql in [&s_sql, &p_sql] {
+            assert!(sql.contains("ORDER BY a.id"), "{sql}");
+            assert!(sql.contains("OFFSET"), "{sql}");
+        }
+        assert!(s_sql.contains(&sql::search_where(&SqliteDialect)));
+        assert!(sql::search_count(&SqliteDialect).contains(&sql::search_where(&SqliteDialect)));
+        assert!(p_sql.contains(&sql::search_where(&PostgresDialect)));
+        assert!(sql::search_count(&PostgresDialect).contains(&sql::search_where(&PostgresDialect)));
+    }
+
+    /// #3189 — le total des artistes est le nombre de correspondances, et les
+    /// pages ne se recouvrent pas.
+    #[test]
+    fn le_compte_et_la_pagination_des_artistes() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        for i in 0..17 {
+            repo.create(&Artist::new(format!("Autumn Trio {i:03}")))
+                .unwrap();
+        }
+        for i in 0..6 {
+            repo.create(&Artist::new(format!("Winter Duo {i:03}")))
+                .unwrap();
+        }
+
+        assert_eq!(repo.search("Autumn", 5).unwrap().len(), 5);
+        assert_eq!(repo.search_count("Autumn", 1_000).unwrap(), 17);
+        // Témoin : les six artistes hors sujet ne sont pas comptés.
+        assert_eq!(repo.search_count("Winter", 1_000).unwrap(), 6);
+        assert_eq!(
+            repo.search_count("Autumn", 3).unwrap(),
+            3,
+            "le plafond borne"
+        );
+
+        let mut vus = std::collections::HashSet::new();
+        for offset in [0, 5, 10, 15] {
+            for a in repo.search_page("Autumn", 5, offset).unwrap() {
+                assert!(vus.insert(a.id.unwrap()), "artiste rendu deux fois");
+            }
+        }
+        assert_eq!(vus.len(), 17);
     }
 
     #[test]

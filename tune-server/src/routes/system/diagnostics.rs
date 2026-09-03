@@ -6,7 +6,6 @@ use serde_json::{Value, json};
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
-use tune_core::db::migrations;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 
@@ -142,6 +141,52 @@ const BUG_REPORT_SUBMIT_URL: &str = "https://mozaiklabs.fr/api/v1/community/bug-
 /// The community endpoint caps the thread body at 50k chars; keep headroom.
 const BUG_REPORT_MAX_BODY_CHARS: usize = 49_000;
 
+/// Relevé de la famine de l'anneau audio, sortie par sortie (#3205).
+///
+/// Ce qui est compté : un rappel du pilote à qui l'anneau a rendu MOINS
+/// d'échantillons qu'il n'en demandait, le reste étant parti en zéros vers le
+/// DAC. C'est un trou audible, et il capture toutes les causes à la fois —
+/// ordonnancement du noyau, réseau, décodage, convolution.
+///
+/// Ce qui n'est PAS compté ici : l'« underrun » ALSA que cpal remonte en
+/// `StreamError` et que la sortie locale laisse délibérément passer sans
+/// démonter le flux (« ALSA underruns are routine »). Celui-là parle du
+/// PILOTE, pas de l'anneau ; il est routinier, et additionné au précédent il
+/// rendrait le chiffre inexploitable. Les deux vivent sous deux noms
+/// distincts, ici comme dans le contrat de sortie.
+///
+/// Pourquoi ce chiffre existe : Tune OS paie le Secure Boot et un dépôt COPR
+/// non signé pour un noyau `PREEMPT_RT` dont le bénéfice n'a jamais été
+/// mesuré. Avec un anneau de deux secondes et une garde de 500 ms, une latence
+/// d'ordonnancement de quelques millisecondes est invisible ; ce qui se voit,
+/// c'est le nombre de fois où le rappel a manqué de données. S'il reste à zéro
+/// une semaine sur un parc réel en noyau standard, le noyau RT est un coût
+/// sans gain.
+///
+/// `try_lock` et non `lock` : un diagnostic ne doit jamais attendre derrière
+/// une sortie en train de jouer — même choix que la section OAAT du rapport de
+/// bogue.
+async fn releve_famine_anneau(state: &AppState) -> Vec<Value> {
+    let outputs = state.outputs.lock().await;
+    outputs
+        .list()
+        .iter()
+        .filter_map(|id| {
+            let output = outputs.get(id)?;
+            let output = output.try_lock().ok()?;
+            let famine = output.ring_starvation()?;
+            Some(json!({
+                "output_id": id,
+                "output_name": output.name(),
+                "ring_starvation_events": famine.events,
+                "ring_starvation_missing_samples": famine.missing_samples,
+                "served_samples": famine.served_samples,
+                "stream_ms": famine.stream_ms,
+            }))
+        })
+        .collect()
+}
+
 pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let artists = ArtistRepo::with_backend(state.backend.clone())
         .count()
@@ -152,15 +197,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
-    let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        state
-            .db
-            .as_ref()
-            .and_then(|db| migrations::current_version(db).ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    // #3182 : lue sur le moteur ACTIF, et `null` quand elle n'est pas lisible.
+    // Le `else { 0 }` d'avant faisait dire à toute base PostgreSQL qu'elle
+    // n'avait jamais été migrée. Voir `super::version_de_schema`.
+    let db_version = super::version_de_schema(&state);
     let music_dirs = super::get_music_dirs_list(&state.backend);
     let uptime_secs = state.started_at.elapsed().as_secs();
 
@@ -188,7 +228,7 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
 
     // Audio outputs
     let audio_backend_pref = &state.display_audio_backend();
-    let (audio_outputs, audio_backend_name, asio_avail) = {
+    let (audio_outputs, audio_backend_name, asio_avail, audio_backend_status) = {
         #[cfg(feature = "local-audio")]
         {
             let devs: Vec<String> =
@@ -198,12 +238,21 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
                     .collect();
             let name = tune_core::outputs::local::active_backend_name(audio_backend_pref);
             let asio = tune_core::outputs::local::asio_available();
-            (devs, name, asio)
+            // #1395 — le rapport de diagnostic est ce que le testeur colle sur
+            // le forum. Il portait le backend ACTIF sans jamais dire lequel
+            // avait été DEMANDÉ ni pourquoi il n'avait pas été honoré : c'est
+            // une capture de journal qu'il a fallu réclamer à Bilou pour
+            // apprendre que son pilote ASIO n'exposait aucune sortie.
+            let status = serde_json::to_value(tune_core::outputs::local::active_backend_status(
+                audio_backend_pref,
+            ))
+            .unwrap_or(serde_json::Value::Null);
+            (devs, name, asio, status)
         }
         #[cfg(not(feature = "local-audio"))]
         {
             let _ = audio_backend_pref;
-            (Vec::<String>::new(), "none", false)
+            (Vec::<String>::new(), "none", false, serde_json::Value::Null)
         }
     };
 
@@ -223,12 +272,18 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     // Memory RSS
     let rss_mb = get_rss_mb();
 
-    // DB backend
-    let db_backend = settings
-        .get("db_engine")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "sqlite".into());
+    // #3205 — le seul chiffre qui dise si l'audio a réellement sauté.
+    let ring_starvation = releve_famine_anneau(&state).await;
+
+    // DB backend — #3182.
+    //
+    // Il se lisait dans un réglage `settings.db_engine` que RIEN n'écrit :
+    // aucun `set("db_engine", …)` n'existe dans l'arbre (le seul autre point
+    // qui porte ce nom, `routes/system/config.rs`, le CALCULE déjà depuis le
+    // backend). La seule branche jamais empruntée était donc le
+    // `unwrap_or("sqlite")`, et `db_backend` — recopié dans `db.engine` plus
+    // bas — annonçait « sqlite » sur toute installation PostgreSQL.
+    let db_backend = state.backend.engine().as_str();
 
     Json(json!({
         "server_version": tune_core::version(),
@@ -253,7 +308,18 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "connectors": connectors,
         "audio_outputs_available": audio_outputs,
         "audio_backend": audio_backend_name,
+        // #1395 — `audio_backend` dit ce qui TOURNE ; il ne disait pas ce qui
+        // avait été DEMANDÉ, ni pourquoi les deux diffèrent. `null` sans
+        // sortie locale compilée.
+        "audio_backend_status": audio_backend_status,
         "asio_available": asio_avail,
+        // #3205 — famine de l'anneau par sortie : `ring_starvation_events`
+        // compte les rappels comblés par des zéros, `..._missing_samples`
+        // dit combien d'échantillons ont manqué (un micro-trou et une
+        // coupure d'une seconde ne se ressemblent pas), et `served_samples`
+        // / `stream_ms` donnent le dénominateur qui rend le taux calculable.
+        // À NE PAS confondre avec l'underrun ALSA : voir `releve_famine_anneau`.
+        "ring_starvation": ring_starvation,
         // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
         // une ligne WARN que l'utilisateur ne verra jamais.
         "asio_warm_scan": crate::startup::asio_warm_status(),
@@ -289,7 +355,12 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
             "metadata_engine": "lofty",
             "discovery_engine": "mdns-sd + socket2",
             "scanner_engine": "walkdir + rayon",
-            "db_engine": "rusqlite",
+            // #3182 : le PILOTE, pas une constante. `rusqlite` n'est même pas
+            // lié au processus quand le serveur tourne sur PostgreSQL.
+            "db_engine": match state.backend.engine() {
+                tune_core::db::engine::Engine::Sqlite => "rusqlite",
+                tune_core::db::engine::Engine::Postgres => "sqlx",
+            },
         },
     }))
 }
@@ -382,6 +453,12 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
     Json(json!({
         "discovered_devices": devices.len(),
         "registered_outputs": output_count,
+        // L'etat du canal TCP de SlimProto (port 3483). Sans ce champ, un bind
+        // refuse ne vivait que dans une ligne de journal, dans une tache
+        // detachee : le testeur n'avait AUCUN moyen de savoir que ses platines
+        // Squeezebox ne pourraient jamais se connecter (#2938). `null` tant
+        // qu'aucune tentative d'ecoute n'a eu lieu.
+        "slimproto": tune_core::slimproto::etat_ecoute(),
         "devices": devices.iter().map(|d| json!({
             "id": d.id,
             "name": d.name,
@@ -432,7 +509,7 @@ pub(super) async fn health_monitor(State(state): State<AppState>) -> Json<Value>
 
 pub(super) async fn health_alerts(State(state): State<AppState>) -> Json<Value> {
     let alerts = state.health_monitor.alerts().await;
-    Json(json!({ "alerts": alerts }))
+    Json(json!(alerts))
 }
 
 #[derive(Deserialize)]
@@ -997,6 +1074,21 @@ pub(super) async fn set_log_level(
     }))
 }
 
+/// Ce qu'un rapport écrit à la place d'une version de schéma illisible.
+///
+/// Surtout pas `0` : le rapport est lu par un humain qui instruit un ticket, et
+/// `0` s'y lit « base jamais migrée ». « Inconnue » et « jamais migrée » sont
+/// deux états différents, et #3182 est né de les avoir confondus.
+const VERSION_DE_SCHEMA_INCONNUE: &str = "unknown";
+
+/// Rend une version de schéma telle qu'elle sera lue dans le markdown.
+///
+/// Fonction NUE — elle ne prend pas d'`AppState` — pour qu'une épreuve puisse
+/// la sonder sans base ; c'est le rendu qui est éprouvé, pas la condition.
+fn version_de_schema_affichee(version: Option<i32>) -> String {
+    version.map_or_else(|| VERSION_DE_SCHEMA_INCONNUE.to_string(), |v| v.to_string())
+}
+
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
@@ -1010,15 +1102,10 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         .count()
         .unwrap_or(0);
     let uptime_secs = state.started_at.elapsed().as_secs();
-    let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        state
-            .db
-            .as_ref()
-            .and_then(|db| migrations::current_version(db).ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    // #3182 — voir `super::version_de_schema`. Ce rapport est ce que le
+    // testeur COLLE sur le forum : « Migration version: 0 » y était lu comme
+    // une base jamais migrée.
+    let db_version = super::version_de_schema(&state);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let music_dirs = super::get_music_dirs_list(&state.backend);
     let scan_status = settings
@@ -1105,6 +1192,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     };
 
     // Build markdown text
+    let ring_starvation = releve_famine_anneau(&state).await;
     let mut md = String::new();
     md.push_str("# Tune Bug Report\n\n");
     md.push_str(&format!(
@@ -1178,6 +1266,31 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str("## Network\n");
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
+    // #2938 : cinq testeurs ont joint un journal ou le bind TCP 3483 echoue.
+    // La ligne existait, noyee dans le journal et en anglais ; personne ne l'a
+    // reliee a « ma platine n'apparait pas ». Ici elle est en haut du rapport,
+    // avec sa cause sondee.
+    match tune_core::slimproto::etat_ecoute() {
+        Some(etat) if !etat.ecoute => {
+            md.push_str(&format!(
+                "- **⚠ SlimProto (Squeezebox) HORS SERVICE** — port {} : {}\n",
+                etat.port,
+                etat.message.as_deref().unwrap_or("cause inconnue"),
+            ));
+            if let Some(err) = etat.erreur_systeme.as_deref() {
+                md.push_str(&format!("  - erreur systeme : {err}\n"));
+            }
+        }
+        Some(etat) => {
+            md.push_str(&format!(
+                "- SlimProto (Squeezebox): en ecoute sur {}\n",
+                etat.port
+            ));
+        }
+        None => {
+            md.push_str("- SlimProto (Squeezebox): aucune tentative d'ecoute\n");
+        }
+    }
     md.push('\n');
 
     // #2392 : c'est CE bloc qui aurait épargné au bêta-testeur du module
@@ -1206,9 +1319,37 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         md.push('\n');
     }
 
+    // #3205 : sans cette section, une famine ne laissait AUCUNE trace dans ce
+    // que le testeur colle sur le forum — et c'est ce rapport, sur un parc
+    // réel, qui doit décider si le noyau RT de Tune OS sert à quelque chose.
+    if !ring_starvation.is_empty() {
+        md.push_str("## Ring starvation (famine de l'anneau audio)\n");
+        for s in &ring_starvation {
+            md.push_str(&format!(
+                "- {} : {} événement(s), {} échantillon(s) manquant(s) sur {} servis ({} ms de flux)\n",
+                s["output_name"].as_str().unwrap_or("?"),
+                s["ring_starvation_events"].as_u64().unwrap_or(0),
+                s["ring_starvation_missing_samples"].as_u64().unwrap_or(0),
+                s["served_samples"].as_u64().unwrap_or(0),
+                s["stream_ms"].as_u64().unwrap_or(0),
+            ));
+        }
+        md.push_str(
+            "  (un événement = un rappel audio comblé par des zéros ; sans rapport avec \
+             l'underrun ALSA, routinier et compté ailleurs)\n\n",
+        );
+    }
     md.push_str("## Database\n");
-    md.push_str(&format!("- Engine: sqlite\n"));
-    md.push_str(&format!("- Migration version: {db_version}\n"));
+    // #3182 : c'était `format!("- Engine: sqlite\n")` — un `format!` sans
+    // argument, donc une chaîne littérale, et toute installation PostgreSQL
+    // se déclarait SQLite dans son propre rapport. Sur le ticket 71 de
+    // jfpaquet cette ligne a failli faire écarter #3181, qui n'existe que
+    // parce que le moteur est PostgreSQL.
+    md.push_str(&format!("- Engine: {}\n", state.backend.engine()));
+    md.push_str(&format!(
+        "- Migration version: {}\n",
+        version_de_schema_affichee(db_version)
+    ));
 
     // Recent logs (tail) — the single most useful part of a bug report. Reuses
     // the same collector as the /logs endpoint so the report matches what the
@@ -1261,10 +1402,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         "network": {
             "discovered_devices": devices.len(),
             "registered_outputs": output_count,
+            "slimproto": tune_core::slimproto::etat_ecoute(),
         },
         "oaat_endpoints": oaat_endpoints,
+        "ring_starvation": ring_starvation,
         "database": {
-            "engine": "sqlite",
+            // #3182 : même mensonge que la ligne markdown ci-dessus, dans le
+            // corps JSON que le client lit.
+            "engine": state.backend.engine().as_str(),
             "migration_version": db_version,
         },
         "markdown": md,
@@ -2307,5 +2452,37 @@ mod fournisseurs_de_sortie {
             section_fournisseurs_de_sortie(&serde_json::json!({ "providers": [] })),
             ""
         );
+    }
+}
+
+/// #3182 — « inconnue » n'est pas `0`.
+#[cfg(test)]
+mod version_de_schema_rendue {
+    use super::*;
+
+    /// Le distinguo qui fait tout le défaut : une version illisible s'écrit en
+    /// toutes lettres, jamais en `0`. `0` est une version PLAUSIBLE — celle
+    /// d'une base neuve jamais migrée — et c'est exactement ainsi que le
+    /// rapport de jfpaquet a été lu sur sa base de 77 291 pistes.
+    #[test]
+    fn une_version_illisible_ne_se_rend_pas_en_zero() {
+        let rendu = version_de_schema_affichee(None);
+        assert_ne!(rendu, "0");
+        assert_eq!(rendu, VERSION_DE_SCHEMA_INCONNUE);
+        // Et le rendu ne doit pas être un nombre : un lecteur qui compare
+        // « la version annoncée » à un numéro attendu doit buter dessus.
+        assert!(
+            rendu.parse::<i64>().is_err(),
+            "« {rendu} » se lit comme un numéro de migration"
+        );
+    }
+
+    /// La contre-épreuve : une version connue se rend telle quelle, `0`
+    /// compris. Une base SQLite neuve EST à la version 0, et le rapport doit
+    /// pouvoir le dire — c'est la lecture, pas le chiffre, qui était fausse.
+    #[test]
+    fn une_version_connue_se_rend_telle_quelle() {
+        assert_eq!(version_de_schema_affichee(Some(0)), "0");
+        assert_eq!(version_de_schema_affichee(Some(49)), "49");
     }
 }

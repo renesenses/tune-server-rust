@@ -10,6 +10,8 @@ name: Preflight
 # Checks performed (each independently pass/fail):
 # - semver: tag follows vMAJOR.MINOR.PATCH[-PRE]
 # - version_bump: tag > Cargo.toml workspace version
+# - release_identity: bump author/committer do not mix known maintainers'
+#   names and addresses
 # - no_p0_issues: no blocking P0 issue open; merged fixes awaiting release
 #   verification (release:verification-pending) are reported but do not create
 #   a release/closure deadlock, and P0 suspended for want of field information
@@ -21,8 +23,15 @@ name: Preflight
 # - cargo_deny: licenses and duplicate-dep checks pass
 # - web_api_contract: le client web n'appelle aucune route que le serveur
 #   ne sert pas (scripts/preflight-web-contract.py, lu depuis main)
-# - ci_status: all check-runs on the commit are green (skipped for
-#   workflow_dispatch on a branch that hasn't had CI yet)
+# - ci_status: les PORTES DE RELEASE du commit sont vertes (skipped for
+#   workflow_dispatch on a branch that hasn't had CI yet). Portes = les
+#   executions de `ci.yml`, `test-postgres.yml` et `widget-ci.yml` sur ce
+#   commit, et elles seules : les sondes planifiees, les robots d'issues, la
+#   machinerie du train et les AUDITS de gouvernance s'accrochent au meme
+#   commit sans etre des tests. « Derive des garde-fous » rougit par
+#   construction pendant un train (gel des tags ouvert, armement a `true`) et
+#   a bloque v0.9.131 ; voir le commentaire de `RELEASE_GATE_WORKFLOWS` dans
+#   scripts/preflight-check.py. Une absence de porte reconnue est un REFUS.
 
 on:
   workflow_call:
@@ -87,13 +96,25 @@ jobs:
       # Le web et le serveur sortent dans la MÊME version, mais rien ne
       # vérifiait leur contrat : deux fois en trois jours, un écran web
       # fusionné a failli partir en appelant une route serveur encore en PR
-      # (Dynamic Range en 0.9.82, Oxygen/Helium en 0.9.84). On lit main, la
-      # branche depuis laquelle la release construit son bundle.
+      # (Dynamic Range en 0.9.82, Oxygen/Helium en 0.9.84). Le manifeste
+      # identifie désormais le commit web exact construit par la release.
+      - name: Lire le SHA web du manifeste
+        id: web
+        env:
+          RELEASE_VERSION: ${{ steps.resolve.outputs.version }}
+        shell: bash
+        run: |
+          PLAN=".release/$RELEASE_VERSION.json"
+          test -f "$PLAN" || { echo "::error::manifeste absent: $PLAN"; exit 1; }
+          WEB_SHA="$(jq -r '.components.web.sha' "$PLAN")"
+          [[ "$WEB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA web invalide"; exit 1; }
+          echo "sha=$WEB_SHA" >> "$GITHUB_OUTPUT"
+
       - name: Checkout web client
         uses: actions/checkout@v4
         with:
           repository: renesenses/tune-web-client
-          ref: main
+          ref: ${{ steps.web.outputs.sha }}
           path: .web-client
 
       - name: Contrat d'API web ↔ serveur

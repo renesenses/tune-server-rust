@@ -8,7 +8,7 @@ use tune_core::discovery::renderer_identity::{
     IdentityVerdict, RendererIdentity, compare_at_same_location,
 };
 use tune_core::outputs::OutputRegistry;
-use tune_core::outputs::oh_events::OpenHomeEventListener;
+use tune_core::outputs::oh_events::UpnpEventListener;
 
 use tune_core::event_bus::EventBus;
 use tune_core::event_types::EventType;
@@ -26,7 +26,36 @@ use crate::state::AppState;
 /// token became `PORThttp`, the URL failed to parse, and every SOAP call died with
 /// `soap send: builder error` (Yves: no sound, UI stuck on "loading title"). This
 /// mirrors the MediaServer handling in `ssdp.rs`.
-fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
+/// Les deux services DLNA dont Tune sait lire les évènements : l'état du
+/// transport et le volume. Le `ConnectionManager` n'a rien à pousser qui nous
+/// intéresse — s'y abonner coûterait un renouvellement toutes les 250 s pour
+/// rien.
+pub(crate) const SERVICES_EVENEMENTS_DLNA: [&str; 2] = ["avtransport", "renderingcontrol"];
+
+/// `eventSubURL` absolues des services abonnables, à partir des chemins bruts
+/// du descripteur.
+///
+/// Passe par [`resolve_control_url`] pour la MÊME raison que les `controlURL` :
+/// une radio Frontier Silicon (Ruark, Stream 94i) publie des URL déjà absolues,
+/// que concaténer à `host:port` rendrait injoignables. Le piège avait déjà
+/// mordu sur les URL de contrôle ; le corriger d'un seul côté l'aurait
+/// simplement déplacé.
+pub(crate) fn urls_evenements_dlna(
+    host: &str,
+    port: u16,
+    brut: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    SERVICES_EVENEMENTS_DLNA
+        .iter()
+        .filter_map(|svc| {
+            brut.get(*svc)
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| ((*svc).to_string(), resolve_control_url(host, port, p)))
+        })
+        .collect()
+}
+
+pub(crate) fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
     if control_url.starts_with("http://") || control_url.starts_with("https://") {
         control_url.to_string()
     } else {
@@ -42,23 +71,51 @@ fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
 /// Register a discovered output and notify controllers as one operation. Zone
 /// creation is deliberately independent: hidden devices and devices for which
 /// automatic zone creation is disabled must still appear in Settings > Network.
+///
+/// `annonce` dit LEQUEL des deux noms part sur le fil. Une re-resolution mDNS
+/// d'un appareil deja connu n'est pas une decouverte : elle passait pourtant
+/// sous `device.discovered`, et `MdnsEvent::DeviceUpdated` restait purement
+/// interne — `OnboardingView.svelte` ecoute pourtant `device.updated` par son
+/// nom (#2870). La charge utile est la meme dans les deux cas : le client ne la
+/// lit pas, il recharge sa liste.
+///
+/// Les deux `emit_typed` NOMMENT leur variante en toutes lettres, plutot que de
+/// relayer un `EventType` recu en parametre : c'est ce qui rend l'emission
+/// visible a un `git grep` — et au garde-fou de `event_types.rs`, qui exige de
+/// trouver le nom en PREMIER argument d'un `emit`.
 fn register_discovered_output(
     registry: &mut OutputRegistry,
     output: Box<dyn tune_core::outputs::OutputTarget>,
     event_bus: &EventBus,
     dev: &tune_core::discovery::device::DiscoveredDevice,
     device_type: &str,
+    annonce: AnnonceAppareil,
 ) {
     registry.register(output);
-    event_bus.emit_typed(
-        EventType::DeviceDiscovered,
-        serde_json::json!({
-            "device_id": &dev.id,
-            "name": &dev.name,
-            "device_type": device_type,
-            "host": &dev.host,
-        }),
-    );
+    let charge = serde_json::json!({
+        "device_id": &dev.id,
+        "name": &dev.name,
+        "device_type": device_type,
+        "host": &dev.host,
+    });
+    match annonce {
+        AnnonceAppareil::Decouverte => {
+            event_bus.emit_typed(EventType::DeviceDiscovered, charge);
+        }
+        AnnonceAppareil::MiseAJour => {
+            event_bus.emit_typed(EventType::DeviceUpdated, charge);
+        }
+    }
+}
+
+/// L'appareil qu'on enregistre est-il NOUVEAU, ou deja connu et simplement
+/// re-resolu ?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnonceAppareil {
+    /// Premiere apparition — `device.discovered`.
+    Decouverte,
+    /// Deja vu, informations rafraichies — `device.updated`.
+    MiseAJour,
 }
 
 /// Registre des serveurs multimédia, tel que le porte `AppState`.
@@ -258,7 +315,7 @@ fn persist_known_renderer(
 pub fn spawn_ssdp_handler(
     state: &AppState,
     config: &TuneConfig,
-    oh_listener: Option<Arc<OpenHomeEventListener>>,
+    oh_listener: Option<Arc<UpnpEventListener>>,
 ) {
     let (ssdp_tx, mut ssdp_rx) = tokio::sync::mpsc::channel(64);
     {
@@ -470,13 +527,34 @@ fn nos_adresses_depuis(
     v
 }
 
+/// #1280 — l'utilisateur a fait taire cet APPAREIL.
+///
+/// Consulté AVANT tout enregistrement de sortie et toute création de zone, sur
+/// les quatre chemins qui en créent (SSDP, mDNS, fournisseurs hors arbre,
+/// re-sondage au démarrage). Le masquage de zone de #1281 ne suffisait pas :
+/// il n'agit qu'après l'enregistrement de la sortie, donc l'appareil restait
+/// proposé, et il n'a rien à masquer quand aucune zone n'a jamais été créée.
+///
+/// Best-effort par construction (`matching` avale l'erreur d'une base
+/// pré-migration) : un défaut de lecture ne doit jamais interrompre la
+/// découverte.
+pub(crate) fn appareil_ignore(
+    db: &Arc<dyn DbBackend>,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) -> bool {
+    tune_core::db::ignored_device_repo::IgnoredDeviceRepo::with_backend(db.clone()).is_ignored(
+        tune_core::db::ignored_device_repo::DeviceIdentity::new(&dev.id, &dev.host, &dev.name)
+            .with_mac(dev.mac_address.as_deref()),
+    )
+}
+
 async fn handle_ssdp_discovered(
     dev: &tune_core::discovery::device::DiscoveredDevice,
     outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>,
     db: &Arc<dyn DbBackend>,
     config: &TuneConfig,
     event_bus: &Arc<tune_core::event_bus::EventBus>,
-    oh_listener: &Option<Arc<OpenHomeEventListener>>,
+    oh_listener: &Option<Arc<UpnpEventListener>>,
     playback: &Arc<tune_core::playback::PlaybackManager>,
     _license: &Arc<tune_core::license::LicenseManager>,
     seen_hosts: &mut std::collections::HashSet<String>,
@@ -516,6 +594,15 @@ async fn handle_ssdp_discovered(
         return;
     }
 
+    // #1280 — appareil que l'utilisateur a fait taire. Le garde-fou est ICI,
+    // AVANT l'enregistrement de la sortie : le masquage de zone (#1281) plus
+    // bas arrive trop tard, l'appareil y est déjà enregistré, donc encore
+    // proposé dans `GET /devices` et dans le sélecteur de zone.
+    if appareil_ignore(db, dev) {
+        debug!(id = %dev.id, name = %dev.name, host = %dev.host, "ssdp_appareil_ignore");
+        return;
+    }
+
     let svc_urls = dev
         .capabilities
         .get("service_urls")
@@ -546,7 +633,14 @@ async fn handle_ssdp_discovered(
             evt_urls,
         );
         let mut reg = outputs.lock().await;
-        register_discovered_output(&mut reg, Box::new(oh), event_bus, dev, "openhome");
+        register_discovered_output(
+            &mut reg,
+            Box::new(oh),
+            event_bus,
+            dev,
+            "openhome",
+            AnnonceAppareil::Decouverte,
+        );
         registered = true;
         info!(name = %dev.name, id = %dev.id, "openhome_output_registered");
     } else {
@@ -581,6 +675,14 @@ async fn handle_ssdp_discovered(
                 );
             }
             let delay = crate::config::resolve_play_delay(db, config, &dev.id, &dev.name);
+            let evt_urls = dev
+                .capabilities
+                .get("event_sub_urls")
+                .and_then(|v| {
+                    serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone())
+                        .ok()
+                })
+                .unwrap_or_default();
             let dlna = tune_core::outputs::dlna::DlnaOutput::new(
                 dev.name.clone(),
                 dev.id.clone(),
@@ -589,9 +691,21 @@ async fn handle_ssdp_discovered(
                 rc,
                 cm_url,
             )
-            .with_play_delay(delay);
+            .with_play_delay(delay)
+            .with_upnp_events(
+                oh_listener.clone(),
+                urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
+            )
+            .with_upnp_silence(crate::config::resolve_upnp_silence(db, &dev.id));
             let mut reg = outputs.lock().await;
-            register_discovered_output(&mut reg, Box::new(dlna), event_bus, dev, "dlna");
+            register_discovered_output(
+                &mut reg,
+                Box::new(dlna),
+                event_bus,
+                dev,
+                "dlna",
+                AnnonceAppareil::Decouverte,
+            );
             registered = true;
             info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
             drop(reg);
@@ -651,7 +765,7 @@ async fn handle_ssdp_discovered(
         seen_hosts.insert(dev.host.clone());
         set_zone_online(event_bus, db, &dev.id, true);
         if let Some(zone_id) = zone.id {
-            let vol = zone.volume as f64 / 100.0;
+            let vol = zone.volume / 100.0;
             playback.set_volume(zone_id, vol).await;
             // Backfill the host on zones created before host-based dedup existed,
             // so a later UUID change (Denon restart) can reconnect by host (#942).
@@ -682,7 +796,7 @@ async fn handle_ssdp_discovered(
             .get(existing_zone_id)
             .ok()
             .flatten()
-            .map(|z| z.volume as f64 / 100.0);
+            .map(|z| z.volume / 100.0);
         if let Some(vol) = vol {
             playback.set_volume(existing_zone_id, vol).await;
         }
@@ -714,6 +828,32 @@ async fn handle_ssdp_discovered(
             return;
         }
 
+        let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
+
+        // #1281 — l'appareil s'annonce sous PLUSIEURS identités SSDP (DLNA +
+        // OpenHome, ou deux UUID : buchardt A700). Supprimer sa zone la masque
+        // sous UNE de ces identités — `is_device_hidden` plus haut — mais la
+        // jumelle retombait ici et recréait la zone au scan suivant : « je la
+        // supprime, elle revient ». Une zone masquée à cet hôte qui porte
+        // encore le nom annoncé vaut suppression pour TOUTES les identités de
+        // l'appareil. Le nom est exigé pour ne pas bloquer un NOUVEL appareil
+        // qui hérite de l'adresse par le DHCP (leçon du ré-ancrage #1651 : une
+        // IP seule n'identifie rien).
+        if let Some((zid, _)) = zone_repo
+            .hidden_zones_by_host(&dev.host)
+            .into_iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(&dev.name) || n.eq_ignore_ascii_case(short_name))
+        {
+            tracing::debug!(
+                name = %dev.name,
+                id = %dev.id,
+                host = %dev.host,
+                zone_id = zid,
+                "ssdp_zone_hidden_twin_identity_skipping"
+            );
+            return;
+        }
+
         // Auto-created zones start dormant; the free-tier cap is enforced at
         // first play (orchestrator.play), so discovery always registers.
 
@@ -725,7 +865,6 @@ async fn handle_ssdp_discovered(
             return;
         }
 
-        let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
         let existing_zones = zone_repo.list().unwrap_or_default();
         let name_taken = existing_zones.iter().any(|z| z.name == short_name);
         let zone_name = if name_taken {
@@ -866,15 +1005,18 @@ pub async fn reregister_known_renderers(state: &AppState) {
     }
     info!(count = renderers.len(), "reregistering_known_renderers");
 
-    // No OpenHome event listener here: the live SSDP handler's listener isn't
-    // reachable from AppState, and creating a second one would race it for the
-    // fixed :8890 bind at boot (`OpenHomeEventListener::new` falls back to an
-    // ephemeral port when 8890 is taken) — a subtle regression on the primary
-    // listener. DLNA renderers (the #1126 case, e.g. Cyrus Stream X2) ignore the
-    // listener entirely; an OpenHome renderer re-attached here gets its push
-    // events back on its next SSDP advertise (which re-registers it with the real
-    // listener) and polls its state until then.
-    let oh_listener: Option<Arc<OpenHomeEventListener>> = None;
+    // LE récepteur du processus, pas un second.
+    //
+    // Ce chemin s'en passait : celui du gestionnaire SSDP n'était pas
+    // atteignable depuis `AppState`, et en créer un autre aurait couru contre
+    // lui pour le port fixe 8890 (`UpnpEventListener::new` retombe alors sur un
+    // port éphémère). L'argument tenait tant que DLNA ignorait les évènements ;
+    // depuis #2263 il ne les ignore plus, et un renderer récupéré ICI — le cas
+    // #1126, le Cyrus Stream X2 qui ne répond plus au multicast après un
+    // redémarrage — serait resté le seul à sonder à trois actions par seconde.
+    // `create_oh_listener` est mémoïsé : il rend le récepteur déjà en place, ou
+    // le crée si ce chemin arrive le premier.
+    let oh_listener: Option<Arc<UpnpEventListener>> = crate::startup::create_oh_listener().await;
 
     let mut seen_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut recovered = 0usize;
@@ -1025,8 +1167,24 @@ pub fn spawn_mdns_handler(
         use tune_core::discovery::device::OutputType;
         use tune_core::discovery::mdns::MdnsEvent;
         while let Some(event) = mdns_rx.recv().await {
+            // Les deux cas suivent le MEME chemin (enregistrement de la sortie,
+            // reconnexion ou creation de zone) : seul le NOM annonce au client
+            // differe. On le retient avant le `match`, qui consomme l'evenement.
+            let annonce = if matches!(event, MdnsEvent::DeviceUpdated(_)) {
+                AnnonceAppareil::MiseAJour
+            } else {
+                AnnonceAppareil::Decouverte
+            };
             match event {
                 MdnsEvent::DeviceDiscovered(dev) | MdnsEvent::DeviceUpdated(dev) => {
+                    // #1280 — appareil que l'utilisateur a fait taire. Le
+                    // parc de Patatorz est DLNA + AirPlay + Chromecast : le
+                    // garde-fou doit donc vivre sur CE chemin aussi, et
+                    // AVANT l'enregistrement de la sortie.
+                    if appareil_ignore(&db, &dev) {
+                        debug!(id = %dev.id, name = %dev.name, host = %dev.host, "mdns_appareil_ignore");
+                        continue;
+                    }
                     // Set when an AirPlay 2 device falls back to the legacy
                     // AirPlay output (daemon unavailable / deviceid unknown):
                     // the output is registered but no zone is auto-created.
@@ -1146,6 +1304,16 @@ pub fn spawn_mdns_handler(
                                 settings.set("lms_host", &lms_addr).ok();
                                 settings.set("squeezebox_host", &lms_addr).ok();
                                 settings.set("squeezebox_enabled", "true").ok();
+                                // On mémorise l'ADRESSE trouvée, pas un simple
+                                // « oui » : le panneau des réglages n'affiche
+                                // « Auto-détecté : … » que si l'adresse en
+                                // vigueur est encore celle-là. Un drapeau
+                                // booléen resterait vrai après une saisie
+                                // manuelle, et il faudrait l'effacer depuis la
+                                // route de configuration générique — un second
+                                // écrivain, donc un second endroit à oublier
+                                // (#2066).
+                                settings.set("lms_host_auto", &lms_addr).ok();
                                 info!(host = %lms_addr, "mdns_lms_discovered_auto_configured");
                             }
                             (None, "squeezebox")
@@ -1161,6 +1329,7 @@ pub fn spawn_mdns_handler(
                             &event_bus,
                             &dev,
                             output_type_str,
+                            annonce,
                         );
                         info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
 
@@ -1205,7 +1374,7 @@ pub fn spawn_mdns_handler(
                         } else if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
                             set_zone_online(&event_bus, &db, &dev.id, true);
                             if let Some(zone_id) = zone.id {
-                                let vol = zone.volume as f64 / 100.0;
+                                let vol = zone.volume / 100.0;
                                 playback.set_volume(zone_id, vol).await;
                             }
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
@@ -1770,6 +1939,19 @@ pub fn spawn_output_providers(
                     let dev_id = output.device_id().to_string();
                     let name = output.name().to_string();
                     let otype = output.output_type().to_string();
+                    // #1280 — appareil ignoré. Un fournisseur hors arbre
+                    // n'expose ni hôte ni MAC : seule l'identité exacte
+                    // s'applique ici, ce qui suffit — c'est celle que le
+                    // client transmet en faisant taire l'appareil.
+                    if tune_core::db::ignored_device_repo::IgnoredDeviceRepo::with_backend(
+                        db.clone(),
+                    )
+                    .is_ignored(
+                        tune_core::db::ignored_device_repo::DeviceIdentity::new(&dev_id, "", &name),
+                    ) {
+                        debug!(id = %dev_id, name = %name, "provider_appareil_ignore");
+                        continue;
+                    }
                     {
                         let mut reg = outputs.lock().await;
                         if reg.contains(&dev_id) {
@@ -1793,7 +1975,7 @@ pub fn spawn_output_providers(
                     if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev_id) {
                         set_zone_online(&event_bus, &db, &dev_id, true);
                         if let Some(zone_id) = zone.id {
-                            let vol = zone.volume as f64 / 100.0;
+                            let vol = zone.volume / 100.0;
                             playback.set_volume(zone_id, vol).await;
                         }
                         info!(name = %name, id = %dev_id, "provider_zone_reconnected");
@@ -1962,8 +2144,8 @@ fn refus_nommes(instantane: &serde_json::Value) -> Vec<(String, String, String)>
 #[cfg(test)]
 mod tests {
     use super::{
-        find_cross_protocol_zone_conflict, may_reanchor, refus_nommes, register_discovered_output,
-        resolve_control_url, statut_du_fournisseur,
+        AnnonceAppareil, find_cross_protocol_zone_conflict, may_reanchor, refus_nommes,
+        register_discovered_output, resolve_control_url, statut_du_fournisseur,
     };
     use tune_core::db::zone_repo::Zone;
     use tune_core::discovery::device::{DiscoveredDevice, OutputType};
@@ -1975,7 +2157,7 @@ mod tests {
             name: name.to_string(),
             output_type: Some(output_type.to_string()),
             output_device_id: Some(device_id.to_string()),
-            volume: 50,
+            volume: 50.0,
             muted: false,
             online: true,
             gapless_enabled: true,
@@ -2014,7 +2196,14 @@ mod tests {
         );
         let mut registry = tune_core::outputs::OutputRegistry::new();
 
-        register_discovered_output(&mut registry, Box::new(output), &bus, &dev, "chromecast");
+        register_discovered_output(
+            &mut registry,
+            Box::new(output),
+            &bus,
+            &dev,
+            "chromecast",
+            AnnonceAppareil::Decouverte,
+        );
 
         let event = events.recv().await.expect("device event");
         assert!(registry.contains("cast-living-room"));
@@ -2027,6 +2216,63 @@ mod tests {
                 "device_type": "chromecast",
                 "host": "192.0.2.42",
             })
+        );
+    }
+
+    /// #2870 : une RE-RESOLUTION mDNS d'un appareil deja connu doit partir sous
+    /// `device.updated`, pas sous `device.discovered`.
+    ///
+    /// `MdnsEvent::DeviceUpdated` existait — c'est lui qui porte la reparation
+    /// d'adresse IPv6→IPv4 des enceintes AirPlay — mais il restait INTERNE :
+    /// les deux cas tombaient dans la meme branche et annoncaient une
+    /// decouverte. `OnboardingView.svelte` ecoute pourtant `device.updated` par
+    /// son nom, et aucun serveur ne l'a jamais emis.
+    ///
+    /// La charge utile est la MEME dans les deux sens : le client ne la lit pas,
+    /// il recharge sa liste — et c'est le seul contrat qu'il faut tenir.
+    #[tokio::test]
+    async fn une_re_resolution_annonce_device_updated_et_pas_discovered() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let dev = DiscoveredDevice::new(
+            "airplay-192.0.2.7-7000".into(),
+            "Phantom SALON".into(),
+            OutputType::Airplay,
+            "192.0.2.7".into(),
+            7000,
+        );
+        let output = tune_core::outputs::chromecast::ChromecastOutput::new(
+            dev.name.clone(),
+            dev.id.clone(),
+            dev.host.clone(),
+            dev.port,
+        );
+        let mut registry = tune_core::outputs::OutputRegistry::new();
+
+        register_discovered_output(
+            &mut registry,
+            Box::new(output),
+            &bus,
+            &dev,
+            "airplay",
+            AnnonceAppareil::MiseAJour,
+        );
+
+        let event = events.recv().await.expect("device event");
+        assert_eq!(
+            event.event_type, "device.updated",
+            "une mise a jour annoncee comme une decouverte, c'est le defaut #2870"
+        );
+        assert_ne!(event.event_type, "device.discovered");
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "device_id": "airplay-192.0.2.7-7000",
+                "name": "Phantom SALON",
+                "device_type": "airplay",
+                "host": "192.0.2.7",
+            }),
+            "meme contrat de charge utile que device.discovered"
         );
     }
 
@@ -2830,5 +3076,306 @@ mod retrait_serveur_multimedia {
             "aucun événement ne doit être publié pour un identifiant inconnu"
         );
         assert_eq!(registre.lock().await.len(), 1);
+    }
+}
+
+/// #1281 — dédoublonnage des identités SSDP d'un même appareil physique.
+#[cfg(test)]
+mod dedup_identites_ssdp_1281 {
+    use super::UpnpEventListener;
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    /// Un renderer SSDP synthétique complet : les URLs de service suffisent à
+    /// passer l'enregistrement DLNA/OpenHome, pas besoin du matériel (#1281).
+    fn renderer_ssdp(id: &str, name: &str, ty: OutputType, host: &str) -> DiscoveredDevice {
+        let mut dev = DiscoveredDevice::new(id.into(), name.into(), ty, host.into(), 49152);
+        dev.capabilities.insert(
+            "service_urls".into(),
+            serde_json::json!({"avtransport": "/av", "renderingcontrol": "/rc"}),
+        );
+        dev
+    }
+
+    /// Une PASSE de découverte à part entière : `seen_hosts` neuf à chaque
+    /// appel, comme entre deux scans réels — le garde intra-passe ne peut
+    /// donc pas masquer le défaut.
+    async fn annoncer(state: &crate::state::AppState, dev: &DiscoveredDevice) {
+        let mut seen = std::collections::HashSet::new();
+        let listener: Option<std::sync::Arc<UpnpEventListener>> = None;
+        super::handle_ssdp_discovered(
+            dev,
+            &state.outputs,
+            &state.backend,
+            &state.config,
+            &state.event_bus,
+            &listener,
+            &state.playback,
+            &state.license,
+            &mut seen,
+        )
+        .await;
+    }
+
+    /// #1281 — un buchardt A700 s'annonce sous DEUX identités SSDP (DLNA +
+    /// OpenHome, deux UUID, même hôte), chacune dans sa propre passe. Un seul
+    /// appareil physique = une seule zone.
+    #[tokio::test]
+    async fn deux_identites_ssdp_du_meme_appareil_ne_font_qu_une_zone() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let dlna = renderer_ssdp(
+            "uuid:a700-dlna",
+            "buchardt A700",
+            OutputType::Dlna,
+            "192.168.1.50",
+        );
+        let oh = renderer_ssdp(
+            "uuid:a700-oh",
+            "buchardt A700",
+            OutputType::Openhome,
+            "192.168.1.50",
+        );
+
+        annoncer(&state, &dlna).await;
+        annoncer(&state, &oh).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        assert_eq!(
+            repo.list().unwrap().len(),
+            1,
+            "un seul appareil physique = une seule zone, quelles que soient \
+             ses identités SSDP"
+        );
+    }
+
+    /// #1281, second volet — « I try deleting one and they both disappear »,
+    /// et au scan suivant la zone revenait : la suppression ne masquait que
+    /// l'identité exacte, la jumelle recréait la zone. Une zone supprimée doit
+    /// le rester pour TOUTES les identités du même appareil (même hôte, même
+    /// nom annoncé).
+    #[tokio::test]
+    async fn une_zone_supprimee_ne_renait_pas_sous_la_seconde_identite() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+
+        let dlna = renderer_ssdp(
+            "uuid:a700-dlna",
+            "buchardt A700",
+            OutputType::Dlna,
+            "192.168.1.50",
+        );
+        annoncer(&state, &dlna).await;
+        let zid = repo.list().unwrap()[0].id.expect("zone auto-créée");
+        repo.delete(zid).unwrap(); // suppression utilisateur = masquage
+
+        let oh = renderer_ssdp(
+            "uuid:a700-oh",
+            "buchardt A700",
+            OutputType::Openhome,
+            "192.168.1.50",
+        );
+        annoncer(&state, &oh).await;
+
+        assert!(
+            repo.list().unwrap().is_empty(),
+            "la suppression doit tenir face à la seconde identité SSDP de \
+             l'appareil"
+        );
+    }
+}
+
+/// #1280 — « ignorer cet appareil » : faire taire un APPAREIL, pas chasser ses
+/// zones une par une.
+///
+/// Le couple de tests qui compte est
+/// [`un_appareil_ignore_ne_cree_ni_zone_ni_sortie`] et
+/// [`le_meme_scenario_sans_blocage_cree_bien_la_zone`] : le SECOND est la
+/// contre-épreuve PERMANENTE du premier. Les deux jouent exactement le même
+/// scénario, seule la ligne d'ignorance change. Un garde-fou neutralisé en
+/// « toujours faux » rend le premier rouge ; neutralisé en « toujours vrai »,
+/// il rend le second rouge. Aucune constante ne peut satisfaire les deux, donc
+/// aucun des deux ne peut rester vert sur un correctif mort.
+#[cfg(test)]
+mod appareils_ignores_1280 {
+    use super::UpnpEventListener;
+    use tune_core::db::ignored_device_repo::{IgnoredDevice, IgnoredDeviceRepo};
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    fn renderer_ssdp(id: &str, name: &str, ty: OutputType, host: &str) -> DiscoveredDevice {
+        let mut dev = DiscoveredDevice::new(id.into(), name.into(), ty, host.into(), 49152);
+        dev.capabilities.insert(
+            "service_urls".into(),
+            serde_json::json!({"avtransport": "/av", "renderingcontrol": "/rc"}),
+        );
+        dev
+    }
+
+    /// Une PASSE de découverte à part entière : `seen_hosts` neuf, comme entre
+    /// deux scans réels.
+    async fn annoncer(state: &crate::state::AppState, dev: &DiscoveredDevice) {
+        let mut seen = std::collections::HashSet::new();
+        let listener: Option<std::sync::Arc<UpnpEventListener>> = None;
+        super::handle_ssdp_discovered(
+            dev,
+            &state.outputs,
+            &state.backend,
+            &state.config,
+            &state.event_bus,
+            &listener,
+            &state.playback,
+            &state.license,
+            &mut seen,
+        )
+        .await;
+    }
+
+    fn faire_taire(state: &crate::state::AppState, device_id: &str, host: &str, name: &str) {
+        IgnoredDeviceRepo::with_backend(state.backend.clone())
+            .ignore(&IgnoredDevice {
+                device_id: device_id.into(),
+                mac: String::new(),
+                host: host.into(),
+                name: name.into(),
+                device_type: "dlna".into(),
+                created_at: None,
+            })
+            .unwrap();
+    }
+
+    fn sonos(id: &str, ty: OutputType) -> DiscoveredDevice {
+        renderer_ssdp(id, "Chambre - Sonos One", ty, "192.168.1.50")
+    }
+
+    /// Le ticket, littéralement : l'appareil ignoré ne crée AUCUNE zone au
+    /// scan — et, ce que le masquage de zone (#1281) ne faisait pas, il n'entre
+    /// même pas dans le registre des sorties, donc il cesse d'être proposé.
+    #[tokio::test]
+    async fn un_appareil_ignore_ne_cree_ni_zone_ni_sortie() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        faire_taire(
+            &state,
+            "uuid:sonos-dlna",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+
+        annoncer(&state, &sonos("uuid:sonos-dlna", OutputType::Dlna)).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        assert!(
+            repo.list().unwrap().is_empty(),
+            "un appareil ignoré ne doit créer aucune zone"
+        );
+        assert!(
+            !state.outputs.lock().await.contains("uuid:sonos-dlna"),
+            "un appareil ignoré ne doit pas être enregistré comme sortie : \
+             c'est ce qui le faisait rester proposé (#1280)"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE PERMANENTE du test ci-dessus : le MÊME scénario, sans la
+    /// ligne d'ignorance, crée bien la zone et la sortie. Un garde-fou bloqué
+    /// sur « toujours ignoré » rend ce test rouge.
+    #[tokio::test]
+    async fn le_meme_scenario_sans_blocage_cree_bien_la_zone() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+
+        annoncer(&state, &sonos("uuid:sonos-dlna", OutputType::Dlna)).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        assert_eq!(
+            repo.list().unwrap().len(),
+            1,
+            "sans blocage, le même appareil doit produire sa zone"
+        );
+        assert!(
+            state.outputs.lock().await.contains("uuid:sonos-dlna"),
+            "sans blocage, la sortie doit être enregistrée"
+        );
+    }
+
+    /// Le cœur du ticket : un Sonos s'annonce sous plusieurs identités. Faire
+    /// taire l'appareil doit valoir pour TOUTES, sinon l'utilisateur en chasse
+    /// une et la jumelle recrée la zone au scan suivant.
+    #[tokio::test]
+    async fn une_autre_identite_du_meme_appareil_reste_ignoree() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        faire_taire(
+            &state,
+            "uuid:sonos-dlna",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+
+        annoncer(&state, &sonos("uuid:sonos-openhome", OutputType::Openhome)).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        assert!(
+            repo.list().unwrap().is_empty(),
+            "la seconde identité SSDP du même appareil doit rester ignorée"
+        );
+        assert!(!state.outputs.lock().await.contains("uuid:sonos-openhome"));
+    }
+
+    /// GARDE-FOU ANTI-DHCP (#1651) : un appareil DIFFÉRENT qui hérite de
+    /// l'adresse du Sonos ignoré doit être découvert normalement. Sans
+    /// l'exigence de nom, l'utilisateur perdrait un appareil qu'il n'a jamais
+    /// bloqué — un faux blocage est pire que le défaut d'origine.
+    #[tokio::test]
+    async fn un_autre_appareil_au_meme_hote_apres_bail_dhcp_est_bien_cree() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        faire_taire(
+            &state,
+            "uuid:sonos-dlna",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+
+        let nouvel_occupant = renderer_ssdp(
+            "uuid:cabasse",
+            "Cabasse Pearl Akoya",
+            OutputType::Dlna,
+            "192.168.1.50",
+        );
+        annoncer(&state, &nouvel_occupant).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        let zones = repo.list().unwrap();
+        assert_eq!(zones.len(), 1, "le nouvel occupant du bail doit être créé");
+        assert_eq!(zones[0].name, "Cabasse Pearl Akoya");
+    }
+
+    /// Le déblocage doit être possible, sinon l'utilisateur se piège lui-même.
+    /// Il libère TOUTES les identités de l'appareil, et le scan suivant le
+    /// ramène.
+    #[tokio::test]
+    async fn debloquer_fait_revenir_l_appareil_au_scan_suivant() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo_ignores = IgnoredDeviceRepo::with_backend(state.backend.clone());
+        faire_taire(
+            &state,
+            "uuid:sonos-dlna",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+        faire_taire(
+            &state,
+            "uuid:sonos-openhome",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+
+        // Débloquer par UNE des deux identités libère les deux.
+        let liberes = repo_ignores.unignore("uuid:sonos-dlna").unwrap();
+        assert_eq!(liberes.len(), 2, "les deux identités doivent être libérées");
+        assert!(repo_ignores.list().unwrap().is_empty());
+
+        annoncer(&state, &sonos("uuid:sonos-openhome", OutputType::Openhome)).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        assert_eq!(
+            repo.list().unwrap().len(),
+            1,
+            "après déblocage, l'appareil revient au scan suivant"
+        );
     }
 }

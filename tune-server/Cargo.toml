@@ -46,16 +46,22 @@ karaoke = ["dep:tune-karaoke"]
 # (`catalogued() == false`), donc jamais proposés à l'installation tant qu'aucun
 # écran ne les atteint. Voir docs/plugins/README.md.
 bandcamp = ["dep:tune-bandcamp"]
+# Concerts (#2363) : la tache d'abonnement et la route de lecture, sorties du
+# coeur toujours-compile. Hors catalogue tant qu'aucun ecran ne les consomme.
+concerts = ["dep:tune-concerts"]
 
 [dependencies]
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
+tune-http-types = { path = "../tune-http-types" }
+tune-smart-http = { path = "../tune-smart-http" }
 tune-stream-http = { path = "../tune-stream-http" }
 tune-streaming-http = { path = "../tune-streaming-http" }
 tune-plugin-runtime-wasm = { path = "../tune-plugin-runtime-wasm", optional = true }
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
+tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
@@ -99,6 +105,16 @@ chrono = { workspace = true }
 # tests/plugin_routes.rs.
 async-trait = { workspace = true }
 tempfile = "3"
+# Test-only : fabriquer de vraies pochettes JPEG/PNG et relire les dimensions
+# servies, pour que la contre-épreuve de `?size=` porte sur des pixels et non
+# sur une longueur d'octets (#2996).
+image = { workspace = true }
+# Test-only : `#[tokio::test(start_paused = true)]`. La sonde d'avancement des
+# images d'artistes se relit toutes les trois secondes et la passe qu'elle
+# observe dure des heures — sans horloge virtuelle, l'éprouver coûterait ce
+# temps-là pour de vrai (routes/library/artwork.rs, #2073). `test-util` n'entre
+# que dans les cibles de test : le binaire publié ne le compile pas.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
 name = "server_contracts"
@@ -116,3 +132,154 @@ path = "tests/plugin_contracts.rs"
 name = "plugin_wasm_contracts"
 path = "tests/plugin_wasm_contracts.rs"
 required-features = ["plugins-wasm"]
+
+# Cible à elle seule, et NON un module de `server_contracts` : le test installe
+# un abonné `tracing` GLOBAL pour lire le journal. `tracing` met en cache, pour
+# tout le processus, la décision « ce point d'appel intéresse-t-il quelqu'un ? »
+# — un abonné posé au milieu d'un binaire qui lance des tests en parallèle rend
+# des captures vides de façon imprévisible (leçon de
+# `tune-core/tests/journal_descriptif_illisible.rs`). Un binaire, un test.
+[[test]]
+name = "panne_sql_journalisee"
+path = "tests/panne_sql_journalisee.rs"
+
+# Même raison, mot pour mot : abonné `tracing` GLOBAL, donc un binaire à lui
+# seul et un seul essai dedans. Celui-ci lit le journal au niveau TRACE pour
+# prouver qu'aucune clef d'API développeur ni chemin d'adresse de webhook n'y
+# apparaît (#2795).
+[[test]]
+name = "cles_developpeur_hors_journal"
+path = "tests/cles_developpeur_hors_journal.rs"
+
+# Meme raison, mot pour mot : abonne `tracing` GLOBAL, donc un binaire a lui
+# seul et un seul essai dedans. Celui-ci compte les lignes qu'un sondeur
+# HQPlayer en panne coute au journal, et les tours de boucle qu'il fait sur
+# vingt-quatre heures (#2566).
+[[test]]
+name = "journal_sondage_hqplayer"
+path = "tests/journal_sondage_hqplayer.rs"
+# Les requêtes SQL de `tune-server` sur une VRAIE base PostgreSQL (#3123).
+# Cible à elle seule, derrière `required-features`, pour deux raisons : elle
+# monte un `AppState` sur le moteur PostgreSQL (impossible sans la feature), et
+# `test-postgres.yml` la lance seule, avec `TUNE_TEST_PG_URL` posée, sans
+# rejouer les 467 contrats SQLite de `server_contracts`.
+[[test]]
+name = "pg_routes_serveur"
+path = "tests/pg_routes_serveur.rs"
+required-features = ["postgres"]
+
+# Les deux sections d'accueil de #3181 sur PostgreSQL, et la contre-epreuve
+# SQLite dans le meme test. Cible separee de `pg_routes_serveur`, qui sonde une
+# bibliotheque VIDE et n'exige qu'un statut : celle-ci seme des lignes et exige
+# qu'elles ressortent, ce qu'un test de statut ne peut pas voir quand la panne
+# est avalee en `200 []`.
+[[test]]
+name = "pg_3181_sections_accueil"
+path = "tests/pg_3181_sections_accueil.rs"
+required-features = ["postgres"]
+
+# #2372 : la route par piste `GET /library/tracks/{id}/versions`. Ce n'est PAS
+# la route de `pg_3181_sections_accueil` — sa SQL est distincte et n'a jamais
+# porté de `DISTINCT`. Depuis ce lot, le TRI des versions descend de la requête
+# vers Rust : `ORDER BY al.title` ne range pas pareil sous la collation binaire
+# de SQLite et sous la collation locale de PostgreSQL. Cette cible sème
+# exactement les titres qui divergent et exige le même ordre des deux côtés.
+# `autotests = false` plus haut — sans cette entrée, le fichier ne serait
+# jamais compilé, donc vert contre rien.
+[[test]]
+name = "pg_2372_versions_par_piste"
+path = "tests/pg_2372_versions_par_piste.rs"
+required-features = ["postgres"]
+
+# Depuis #3039, la fenetre des ajouts recents est un parametre borne.
+[[test]]
+name = "ajouts_recents_fenetre"
+path = "tests/ajouts_recents_fenetre.rs"
+
+# Canal stable / beta : quelles versions `/update/check` a le droit de proposer
+# (#2266). Le defaut `auto` reproduit le comportement d'avant.
+[[test]]
+name = "canal_de_mise_a_jour"
+path = "tests/canal_de_mise_a_jour.rs"
+
+# #2939 : la carte de dedoublonnage du scan et la contrainte `file_path UNIQUE`
+# n'avaient pas la meme portee. `autotests = false` plus haut — sans cette
+# cible, le fichier ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "portee_unicite_file_path_2939"
+path = "tests/portee_unicite_file_path_2939.rs"
+
+# #3185 : la base ne doit plus dependre du repertoire de lancement (fil forum
+# 616). La regle et sa migration vivent hors de tout `cfg`, donc ce fichier
+# s'execute sur Linux comme sur macOS. `autotests = false` plus haut — sans
+# cette cible, il ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "base_unique_lancement_i3185"
+path = "tests/base_unique_lancement_i3185.rs"
+
+# La migration Windows vers %LOCALAPPDATA% copiait le `.db` SEUL, sans son
+# `-wal` ni son `-shm`. `autotests = false` plus haut — sans cette cible, le
+# fichier ne serait jamais compile, donc vert contre rien. Et le test lui-meme
+# ne porte AUCUN `cfg` : il eprouve sur Linux la regle et ses effets de bord,
+# que `#[cfg(target_os = "windows")]` derobait a toute machine de compilation.
+[[test]]
+name = "migration_windows_annexes_sqlite"
+path = "tests/migration_windows_annexes_sqlite.rs"
+
+# #3182 : le rapport de diagnostic se declarait « sqlite » sur toute
+# installation PostgreSQL, et « Migration version: 0 » sur une base de 77 291
+# pistes. `autotests = false` plus haut — sans cette cible, le fichier ne
+# serait jamais compile, donc vert contre rien.
+#
+# PAS de `required-features`, contrairement a `pg_routes_serveur` et
+# `pg_3181_sections_accueil` : la contre-epreuve SQLite de ce fichier ne
+# demande aucune base externe, et doit tourner dans le `cargo test --workspace`
+# ordinaire — sinon reparer PostgreSQL en cassant SQLite passerait toutes les
+# portes. Seule l'epreuve PostgreSQL porte `#[cfg(feature = "postgres")]`.
+[[test]]
+name = "pg_3182_moteur_annonce_dans_le_rapport"
+path = "tests/pg_3182_moteur_annonce_dans_le_rapport.rs"
+
+# #3226 : `sources` ne gouvernait que la boucle des services, jamais le bloc
+# `local` ni les radios — la pilule « Qobuz » rendait donc `local + qobuz`.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait jamais
+# compile, donc vert contre rien.
+[[test]]
+name = "recherche_sources_i3226"
+path = "tests/recherche_sources_i3226.rs"
+
+# #2746 : `/system/peers` n'itérait que le registre manuel. `discovered_tune_peers()`
+# existait et n'avait aucun appelant du côté du panneau, donc l'écran annonçait
+# « aucun serveur Tune détecté » sur un réseau où mDNS voyait des serveurs.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait jamais
+# compilé, donc vert contre rien.
+[[test]]
+name = "pairs_decouverts_i2746"
+path = "tests/pairs_decouverts_i2746.rs"
+
+# #2147 : le compteur de pistes comptait la table ENTIERE pendant que le
+# rapport de scan ne comptait que les fichiers du disque — 142 pistes d'ecart
+# chez le testeur, sans explication. `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait jamais compile, donc vert contre rien.
+#
+# PAS de `required-features`, meme motif que la cible PostgreSQL de #3182
+# ci-dessus : l'epreuve SQLite ne demande aucune base externe et doit tourner
+# dans le `cargo test --workspace` ordinaire — sinon reparer PostgreSQL en
+# cassant SQLite passerait toutes les portes. Seule l'epreuve PostgreSQL de ce
+# fichier porte `#[cfg(feature = "postgres")]`.
+[[test]]
+name = "comptes_par_source_2147"
+path = "tests/comptes_par_source_2147.rs"
+
+# #3226 generalise : `sources` gouverne desormais AUSSI le bloc local de
+# `/home/other-versions`, `/home/artist-releases` et
+# `/library/tracks/{id}/versions`, la ou il ne filtrait que la boucle des
+# services (quand il existait). `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+#
+# Pas de `required-features` : le banc monte deux services factices et une
+# base SQLite en memoire, il ne demande aucune base externe et doit tourner
+# dans le `cargo test --workspace` ordinaire.
+[[test]]
+name = "sources_trois_routes_i3226"
+path = "tests/sources_trois_routes_i3226.rs"

@@ -104,25 +104,36 @@ const POLL_INTERVAL_MS: u64 = 1000;
 /// deux tentatives quand l'appareil ne répond plus. Assez pour cesser de le
 /// noyer, assez court pour repérer une lecture démarrée depuis sa façade.
 const IDLE_BACKOFF_MAX_SHIFT: u8 = 5;
-/// Cadence de sondage d'une zone **arrêtée dont le renderer répond**, en
-/// secondes d'horloge murale.
+/// Cadence de sondage d'une zone **que Tune ne croit pas en lecture et dont
+/// le renderer répond**, en secondes d'horloge murale.
 ///
 /// Une zone qui ne joue rien n'est sondée que pour une seule raison : repérer
 /// une lecture démarrée hors de Tune (façade de l'appareil, autre
 /// application). Tout ce que la branche « repos » sait faire est verrouillé
-/// derrière un transport ACTIF — l'adoption du volume réglé sur l'appareil
-/// comme la reprise d'état exigent l'une et l'autre
-/// `status.state == TransportState::Playing`. Face à un renderer qui répond
-/// `Stopped`, les trois actions SOAP d'un tick ne produisent donc rien, et
-/// elles partaient chaque seconde, indéfiniment : sur une installation qui se
-/// repose 20 h par jour pour 4 h de lecture, c'est le premier poste de
-/// dépense UPnP, loin devant la lecture elle-même (#2263).
+/// derrière `status.state == TransportState::Playing` — l'adoption du volume
+/// réglé sur l'appareil comme la reprise d'état l'exigent l'une et l'autre.
+/// Face à un renderer qui répond `Stopped`, les trois actions SOAP d'un tick
+/// ne produisent donc rien, et elles partaient chaque seconde, indéfiniment :
+/// sur une installation qui se repose 20 h par jour pour 4 h de lecture,
+/// c'est le premier poste de dépense UPnP, loin devant la lecture elle-même
+/// (#2263).
 ///
-/// Ce qui est échangé : le délai de détection d'une lecture lancée depuis la
-/// façade de l'appareil passe de 1 s à 5 s au pire. Dès que le renderer
-/// annonce autre chose que `Stopped`, la cadence repart à plein régime au
-/// tick suivant — reprise d'état, synchronisation du volume et détection de
-/// conflit gardent exactement le rythme qu'elles ont aujourd'hui.
+/// **La pause était le trou laissé par ce premier correctif.** Une zone en
+/// pause n'est pas `PlayState::Playing` : elle passe par la branche « repos »
+/// exactement comme une zone arrêtée. Mais son renderer répond
+/// `PAUSED_PLAYBACK`, que le recul comptait comme un « transport actif », et
+/// la zone restait donc sondée à CHAQUE tick, sans fin — 3 actions SOAP par
+/// seconde, 259 200 par tranche de 24 h, le prix exact qu'une zone arrêtée
+/// payait avant. Or aucun consommateur de la branche ne regarde un statut en
+/// pause : les deux seuls, l'adoption du volume et la reprise d'état, exigent
+/// `Playing`. Le plein rythme y payait donc une lecture que personne ne fait.
+///
+/// Ce qui est échangé : le délai de détection d'une lecture — ou d'une
+/// reprise — lancée depuis la façade de l'appareil passe de 1 s à 5 s au
+/// pire. Dès que le renderer annonce `Playing` ou `Transitioning`, la cadence
+/// repart à plein régime au tick suivant — reprise d'état, synchronisation du
+/// volume et détection de conflit gardent exactement le rythme qu'elles ont
+/// aujourd'hui.
 ///
 /// Écrit en secondes, converti en ticks à la compilation. `POLL_INTERVAL_MS`
 /// est le facteur de conversion implicite entre les garde-fous du sondeur
@@ -360,6 +371,40 @@ pub(crate) mod decisions {
             return TenueDuRenderer::AutreServeurTune(hote);
         }
         TenueDuRenderer::AutreApplication
+    }
+
+    /// Retrouver, dans l'URI qu'un renderer déclare jouer, le `stream_id` de la
+    /// session Tune qu'il tire.
+    ///
+    /// ── Pourquoi cette fonction existe (#2991) ──
+    ///
+    /// La reprise « le renderer joue, Tune ne le croyait pas » reconstruit un
+    /// now-playing depuis la BASE (`last_track_source`, `last_track_source_id`)
+    /// et pose `stream_id: None` — la base ne mémorise pas l'identifiant d'une
+    /// session, qui est éphémère. Pour une piste locale c'est sans conséquence.
+    /// Pour une RADIO, c'est la panne : `refresh_radio_metadata` recopie ce
+    /// `None` dans chaque now-playing suivant, et la garde qui publie le titre
+    /// vers le flux ne mord plus JAMAIS de toute la session. L'interface Tune,
+    /// elle, continue d'être servie par `update_now_playing`, qui ne dépend pas
+    /// du `stream_id` — d'où « dans Tune ça fonctionne, sur le lecteur réseau
+    /// non » (Serge Asselin, Hifi Rose RS250A, fil 1529).
+    ///
+    /// L'identifiant n'est pas perdu : le renderer l'annonce lui-même, dans
+    /// l'URI qu'il est en train de tirer. On ne l'invente pas, on le RELIT — et
+    /// l'appelant vérifie ensuite auprès du gestionnaire de flux que cette
+    /// session est bien l'une des NÔTRES (une URI `/stream/…` peut venir d'un
+    /// autre Tune du réseau, cf. [`TenueDuRenderer::AutreServeurTune`]).
+    ///
+    /// La découpe `<id>.<ext>` est celle du serveur de flux lui-même
+    /// ([`crate::http::streamer::extract_stream_id`]), appelée et non recopiée :
+    /// le jour où la convention change, les deux bougent ensemble.
+    pub fn stream_id_de_l_uri(current_uri: Option<&str>) -> Option<String> {
+        let uri = current_uri?.trim();
+        let apres = uri.rsplit_once("/stream/")?.1;
+        // Un renderer peut recopier une chaîne de requête ou une ancre.
+        let sans_suffixe = apres.split(['?', '#']).next().unwrap_or(apres);
+        let id = crate::http::streamer::extract_stream_id(sans_suffixe);
+        (!id.is_empty()).then(|| id.to_string())
     }
 
     use super::{
@@ -675,10 +720,7 @@ pub(crate) mod decisions {
         if output_type != "dlna" {
             return false;
         }
-        let is_dsd = current_format.is_some_and(|f| {
-            let f = f.to_lowercase();
-            f.contains("dsd") || f.contains("dsf") || f.contains("dff")
-        });
+        let is_dsd = current_format.is_some_and(crate::playback::gapless::est_dsd);
         is_dsd && peak_reached_end(track_duration_ms, peak_position_ms)
     }
 
@@ -695,6 +737,30 @@ pub(crate) mod decisions {
     /// Without this the queue advanced only after half of each track's DURATION
     /// had elapsed, and a rip ran at half of listening speed instead of network
     /// speed.
+    ///
+    /// # `peak_reached_end` était écrit pour Jean Valjean, et ne l'atteignait pas (#3229)
+    ///
+    /// [`peak_reached_end`] n'avait qu'UN appelant de production : la branche
+    /// `status.ended_naturally` du bras `Stopped`, dont le commentaire dit
+    /// lui-même « Local outputs (WASAPI/ALSA/CoreAudio) signal ended_naturally
+    /// when the audio stream reaches EOF ». Or **DLNA ne rend JAMAIS
+    /// `ended_naturally`** — c'est écrit noir sur blanc dans
+    /// [`dlna_dsd_reached_end`], qui n'existe que pour cette raison. Le seul
+    /// autre usage, [`dlna_dsd_reached_end`], est réservé au DSD.
+    ///
+    /// Le correctif écrit POUR le signalement de Jean Valjean ne mordait donc
+    /// sur aucune zone DLNA en PCM/FLAC : là, la fin de piste retombe ici,
+    /// après `STOPPED_TICKS_THRESHOLD` sondes `Stopped`. Et ici, `played_enough`
+    /// exige un plancher d'horloge murale que l'avance gapless vient justement
+    /// de fausser (elle remet `track_started_at`) — la vraie fin était rejetée,
+    /// et la zone partait vers la branche d'ÉCHEC qui l'arrête.
+    ///
+    /// `peak_reached_end` est la même mesure que `played_enough` SANS ce
+    /// plancher d'horloge, et elle reste plus étroite que lui sur les deux
+    /// autres axes : elle exige une durée connue (`> 0`) et le même
+    /// [`MIN_PLAYED_FRACTION`]. L'ajouter ici ne change RIEN au calendrier — on
+    /// est toujours après les cinq sondes `Stopped` — mais change le VERDICT :
+    /// une piste dont le pic a atteint sa fin est une fin, pas une panne.
     pub fn natural_end(
         played_enough: bool,
         repeat_active: bool,
@@ -708,6 +774,10 @@ pub(crate) mod decisions {
             track_duration_ms > 0 && track_duration_ms < MIN_TRACK_WALL_SECS * 1000;
         let repeat_end = repeat_active && peak_position_ms > 5_000;
         played_enough
+            // Le pic a atteint la fin : la piste est finie, quoi qu'en dise
+            // l'horloge murale. C'est ce qui branche enfin le correctif sur le
+            // chemin DLNA — le seul que Jean Valjean ait jamais emprunté.
+            || peak_reached_end(track_duration_ms, peak_position_ms)
             || repeat_end
             || (ended_naturally
                 && (!realtime || ended_naturally_wall_ok(wall_elapsed, track_duration_ms)))
@@ -785,6 +855,32 @@ pub(crate) mod decisions {
     /// cote serveur et l'adresse ne repond plus : il faut repreparer.
     pub fn gapless_stage_expired(gapless_sent: bool, age_secs: Option<u64>) -> bool {
         gapless_sent && age_secs.is_some_and(|a| a > GAPLESS_STAGE_MAX_AGE_SECS)
+    }
+
+    /// La preparation gapless deja acceptee par le renderer vise-t-elle encore
+    /// la piste que la file designe MAINTENANT comme suivante ? (#3026)
+    ///
+    /// `armed_row_id` est l'identifiant de LIGNE de file (`queue_items.id`)
+    /// realement passe a `SetNextAVTransportURI` ; `row_id_at_next` celui que
+    /// `next_position` designe a cet instant. Une ligne, et non une position :
+    /// « Lire ensuite » DECALE les positions — `insert_at` ouvre un trou par un
+    /// `UPDATE position = position + 1`, il ne reecrit pas les lignes — donc la
+    /// piste armee change de position sans changer de piste, et l'index+1
+    /// designe alors quelqu'un d'autre.
+    ///
+    /// Ni l'identifiant de piste ni le titre ne feraient l'affaire : la meme
+    /// piste peut occuper deux lignes de la file (journal Sandro du 01/09 :
+    /// `Hold Me` ajoute deux fois, positions 4 puis 5), et ces deux lignes-la
+    /// doivent rester distinctes.
+    ///
+    /// Sens de defaut : sans les DEUX identifiants on ne conclut rien. Un
+    /// « perime » de trop desarmerait un enchainement valide, c'est-a-dire
+    /// ferait payer un blanc a qui n'a rien demande.
+    pub fn gapless_arm_outdated(armed_row_id: Option<i64>, row_id_at_next: Option<i64>) -> bool {
+        match (armed_row_id, row_id_at_next) {
+            (Some(arme), Some(suivant)) => arme != suivant,
+            _ => false,
+        }
     }
 
     /// The renderer-reported duration for the CURRENT track, sanitised against
@@ -2174,6 +2270,236 @@ pub mod fsm {
 struct IdlePollBackoff {
     consecutive_errors: u8,
     remaining: u8,
+    /// Comptabilité du journal — distincte du recul, qui lui n'est pas en cause.
+    journal: JournalSondage,
+}
+
+/// Combien d'échecs consécutifs sont **détaillés** avant de passer au
+/// récapitulatif (#2566).
+///
+/// Cinq lignes suffisent à établir la cause : l'erreur est la même à chaque
+/// tour — c'est la définition d'une panne durable — et les quatre premières
+/// donnent en plus la montée du recul (`skip_ticks` 2, 4, 8, 16), donc de quoi
+/// vérifier qu'il fonctionne. Un échec isolé est le n° 1 : il reste dit.
+pub const ECHECS_SONDAGE_DETAILLES: u32 = 5;
+
+/// Ce que la comptabilité décide de faire d'un échec de plus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceEchecSondage {
+    /// Sous le plafond : la ligne complète est émise.
+    Detaille,
+    /// Au-dessus du plafond, à un palier : une ligne de récapitulatif portant
+    /// le TOTAL est émise à la place.
+    Recapitulatif,
+    /// Au-dessus du plafond, hors palier : rien n'est émis.
+    Muet,
+}
+
+/// Comptabilité du journal d'un sondage qui échoue, tour après tour (#2566).
+///
+/// ## Les trois sites, et pourquoi un seul compteur
+///
+/// | site | fichier | ce qu'un appareil muet coûtait |
+/// |---|---|---|
+/// | zone au repos | `poller.rs`, branche « repos » | 1 ligne / 33 s — les 79 de Dimitri |
+/// | zone **en lecture** | `poller.rs`, branche « lecture » | 1 ligne / 17 s, soit ~212 / h |
+/// | HQPlayer | `tune-server/src/background.rs` | 1 ligne / 60 s, **sans aucun recul** |
+///
+/// Le premier a été borné en v0.9.129 ; le commit qui l'a fait nommait les deux
+/// autres comme non traités, et ce sont eux que ce passage-ci rejoint. Le
+/// compteur est le même pour les trois — c'est la même panne vue de trois
+/// boucles —, mais **l'émission reste locale à chaque site** : `tracing` fige
+/// la cible du module au point d'appel, et l'export de diagnostic compte par
+/// module (`QUOTA_PAR_MODULE`, #1974). Émettre le bruit d'HQPlayer depuis
+/// `tune_core::poller` l'aurait imputé au poller, c'est-à-dire au module qu'on
+/// lit précisément quand une lecture ne démarre pas.
+///
+/// ## Le défaut mesuré
+///
+/// Dimitri, macOS, v0.9.115, fil 1577 : une zone Chromecast a produit **79
+/// lignes `idle_poll_failed_backing_off` identiques**, une par tentative. Le
+/// recul exponentiel n'est pas en cause — il plafonnait correctement à
+/// `2^IDLE_BACKOFF_MAX_SHIFT` = 32 ticks, et l'extrait le montre
+/// (`skip_ticks=32`, 33 s entre deux lignes). C'est le JOURNAL qui n'avait
+/// aucun plafond : une ligne par tentative, indéfiniment.
+///
+/// Au rythme du recul saturé — 32 ticks sautés + 1 tick de tentative, à
+/// `POLL_INTERVAL_MS` = 1000 ms — cela fait **une ligne toutes les 33 s et par
+/// zone**, soit ~109 lignes par heure. Les 79 échecs de Dimitri couvrent
+/// **41 min 16 s**. Un appareil laissé éteint une nuit de 8 h en produit
+/// **~870**, et rien ne l'arrête : `consecutive_errors` est un `u8` qui sature
+/// à 255 sans jamais cesser de journaliser.
+///
+/// L'export de diagnostic borne chaque module à un quart de la fenêtre
+/// (`QUOTA_PAR_MODULE`, #1974) : 79 lignes prennent déjà un tiers du quota de
+/// `tune_core::poller` — le module qu'on lit précisément quand une lecture ne
+/// démarre pas.
+///
+/// ## Le patron, repris de #2890
+///
+/// Quelques lignes détaillées plafonnées, puis un récapitulatif portant le
+/// total — comme `track_insert_failures_truncated` dans `db::track_repo`, et
+/// `scan_walk_errors_truncated` dans `scanner::walker`. Une seule différence :
+/// là-bas la boucle a une fin (500 pistes), ici elle n'en a pas. Le
+/// récapitulatif est donc émis **aux paliers de doublement** — échecs 8, 16,
+/// 32, 64, 128… — au lieu d'une fois en sortie de boucle. Une panne coûte
+/// ainsi un nombre de lignes **logarithmique** en sa durée, et non linéaire :
+/// 79 échecs → 9 lignes, 870 échecs → 12 lignes.
+///
+/// La fin de panne, elle, est un vrai événement ponctuel : `succes` émet le
+/// récapitulatif de clôture avec le total, exactement comme #2890 en sortie de
+/// lot.
+///
+/// ## Ce que cela ne change pas
+///
+/// Ni la cadence, ni le recul, ni le nombre de tentatives : **aucune décision
+/// de sondage ne passe par ici**. Seul le volume du journal change. Un échec
+/// isolé reste dit en entier, et un sondage qui réussit sans échec préalable
+/// n'émet toujours rien.
+#[derive(Debug, Default, Clone)]
+pub struct JournalSondage {
+    /// Échecs consécutifs, en `u32` : `IdlePollBackoff::consecutive_errors`
+    /// est un `u8` qui sature à 255, ce qui rendrait le total faux et les
+    /// paliers erratiques au-delà de deux heures de panne.
+    echecs: u32,
+}
+
+impl JournalSondage {
+    /// Un échec de plus. Rend ce qu'il faut en dire.
+    ///
+    /// Publique parce que c'est la **décision** partagée par les trois sites :
+    /// chacun l'interroge, puis émet sa propre ligne, avec ses propres champs
+    /// et sous sa propre cible de module.
+    pub fn compter_echec(&mut self) -> TraceEchecSondage {
+        self.echecs = self.echecs.saturating_add(1);
+        if self.echecs <= ECHECS_SONDAGE_DETAILLES {
+            TraceEchecSondage::Detaille
+        } else if self.echecs.is_power_of_two() {
+            TraceEchecSondage::Recapitulatif
+        } else {
+            TraceEchecSondage::Muet
+        }
+    }
+
+    /// Total d'échecs consécutifs en cours.
+    pub fn echecs(&self) -> u32 {
+        self.echecs
+    }
+
+    /// Un échec de plus, et la trace qui convient est **émise**.
+    ///
+    /// C'est le point d'émission réel du sondeur : le garde
+    /// `tests/journal_sondage_repos.rs` appelle cette fonction-ci, pas une
+    /// copie, et compte les lignes que `tracing` reçoit.
+    pub fn echec(
+        &mut self,
+        zone_id: i64,
+        device: &str,
+        error: &dyn std::fmt::Display,
+        skip_ticks: u8,
+    ) {
+        match self.compter_echec() {
+            TraceEchecSondage::Detaille => debug!(
+                zone_id,
+                device = %device,
+                error = %error,
+                consecutive_errors = self.echecs,
+                skip_ticks,
+                "idle_poll_failed_backing_off"
+            ),
+            TraceEchecSondage::Recapitulatif => debug!(
+                zone_id,
+                device = %device,
+                error = %error,
+                echecs = self.echecs,
+                detaillees = ECHECS_SONDAGE_DETAILLES,
+                skip_ticks,
+                "idle_poll_still_failing"
+            ),
+            TraceEchecSondage::Muet => {}
+        }
+    }
+
+    /// Le sondage repasse. Émet la clôture de panne s'il y en avait une à
+    /// clore, et rien du tout sinon — un sondage qui a toujours réussi ne doit
+    /// pas changer d'un iota.
+    pub fn succes(&mut self, zone_id: i64, device: &str) {
+        if let Some(echecs) = self.cloturer() {
+            debug!(
+                zone_id,
+                device = %device,
+                echecs,
+                "idle_poll_recovered"
+            );
+        }
+    }
+
+    /// Le sondage repasse : remet le compteur à zéro et rend le total à
+    /// annoncer, ou `None` s'il n'y a **rien à clore**.
+    ///
+    /// Rien à clore, c'est le cas de l'écrasante majorité des tours : un
+    /// sondage qui a toujours réussi, et un échec isolé déjà dit en entier. La
+    /// clôture n'existe que pour la panne qu'on a cessé de détailler — sans
+    /// elle, plafonner masquerait l'ampleur, et un plafond deviendrait une
+    /// censure.
+    pub fn cloturer(&mut self) -> Option<u32> {
+        let echecs = std::mem::take(&mut self.echecs);
+        (echecs > ECHECS_SONDAGE_DETAILLES).then_some(echecs)
+    }
+
+    /// Un échec de plus sur une zone **en lecture**, et la trace qui convient
+    /// est émise.
+    ///
+    /// Jumelle de [`Self::echec`], et volontairement pas une paramétrisation de
+    /// celle-ci : le nom d'un évènement `tracing` est figé au point d'appel,
+    /// avec sa cible et son niveau. Le rendre variable ferait de
+    /// `poll_failed_backing_off` et `idle_poll_failed_backing_off` un seul et
+    /// même point d'appel, indiscernables dans un filtre par cible — pour
+    /// n'économiser que l'invocation d'une macro.
+    ///
+    /// Les champs de la ligne détaillée sont **inchangés** (`zone_id`,
+    /// `device`, `error`, `backoff`) : c'est le texte que les journaux déjà
+    /// versés portent, et qu'on relit en cherchant une panne.
+    pub fn echec_lecture(
+        &mut self,
+        zone_id: i64,
+        device: &str,
+        error: &dyn std::fmt::Display,
+        backoff: u8,
+    ) {
+        match self.compter_echec() {
+            TraceEchecSondage::Detaille => debug!(
+                zone_id,
+                device = %device,
+                error = %error,
+                backoff,
+                "poll_failed_backing_off"
+            ),
+            TraceEchecSondage::Recapitulatif => debug!(
+                zone_id,
+                device = %device,
+                error = %error,
+                echecs = self.echecs,
+                detaillees = ECHECS_SONDAGE_DETAILLES,
+                backoff,
+                "poll_still_failing"
+            ),
+            TraceEchecSondage::Muet => {}
+        }
+    }
+
+    /// Le sondage d'une zone en lecture repasse. Muet s'il n'avait pas cessé
+    /// de parler.
+    pub fn succes_lecture(&mut self, zone_id: i64, device: &str) {
+        if let Some(echecs) = self.cloturer() {
+            debug!(
+                zone_id,
+                device = %device,
+                echecs,
+                "poll_recovered"
+            );
+        }
+    }
 }
 
 impl IdlePollBackoff {
@@ -2189,18 +2515,28 @@ impl IdlePollBackoff {
 
     /// Sondage réussi. La suite dépend de ce que l'appareil a répondu.
     ///
-    /// Un transport actif — `Playing`, `Paused`, `Transitioning` — veut dire
-    /// qu'il se passe quelque chose sur l'appareil : plein rythme, comme
-    /// avant. Un transport `Stopped` ne peut rien produire de plus au tick
-    /// suivant qu'à celui-ci (toute la branche « repos » est verrouillée
-    /// derrière un transport actif) : la zone retombe à la cadence de repos
+    /// Le plein rythme est réservé aux états que la branche « repos » sait
+    /// EXPLOITER, pas à ceux qu'on appellerait volontiers « actifs » :
+    ///
+    /// - `Playing` — reprise d'état, adoption du volume et détection de
+    ///   conflit s'y déclenchent, et elles y sont toutes conditionnées ;
+    /// - `Transitioning` — transitoire par définition : le freiner
+    ///   retarderait l'état qui va suivre, une seconde plus tard.
+    ///
+    /// `Stopped` et `Paused` ne peuvent rien produire de plus au tick suivant
+    /// qu'à celui-ci : la zone retombe à la cadence de repos
     /// [`IDLE_REPOS_POLL_TICKS`] jusqu'à ce que l'appareil bouge (#2263).
+    ///
+    /// La pause était restée du côté « actif » au motif que la ralentir
+    /// ralentirait aussi la reprise d'état et l'adoption du volume. Le motif
+    /// ne tenait pas : ces deux-là exigent `status.state == Playing` et ne
+    /// font donc RIEN d'un statut en pause. Une zone laissée en pause était
+    /// sondée une fois par seconde, sans fin, pour rien.
     fn record_success(&mut self, etat: TransportState) {
         self.consecutive_errors = 0;
-        self.remaining = if etat == TransportState::Stopped {
-            IDLE_REPOS_POLL_TICKS - 1
-        } else {
-            0
+        self.remaining = match etat {
+            TransportState::Stopped | TransportState::Paused => IDLE_REPOS_POLL_TICKS - 1,
+            TransportState::Playing | TransportState::Transitioning => 0,
         };
     }
 
@@ -2229,6 +2565,11 @@ struct ZonePollState {
     /// After N failures, skip 2^min(N,4) ticks before retrying.
     consecutive_errors: u8,
     backoff_remaining: u8,
+    /// Comptabilité du journal (#2566), sans effet sur les deux champs
+    /// ci-dessus : le recul et le compte d'erreurs sont tenus par le site
+    /// d'appel, avant elle, et ce sont eux que lisent `poll_failed_past_end`
+    /// et l'arrêt de zone. Voir [`JournalSondage`].
+    journal: JournalSondage,
     total_polls: u64,
     total_errors: u64,
     last_latency_ms: u32,
@@ -2347,6 +2688,18 @@ struct ZonePollState {
     /// inexactes — fausse transition garantie. Cleared au changement de
     /// génération et à chaque transition, comme `gapless_arm_logged`.
     gapless_dsd_skip_pos: Option<i64>,
+    /// La LIGNE de file (`queue_items.id`) que le renderer a ACCEPTEE comme
+    /// piste suivante, et la position qu'elle occupait alors (#3026).
+    ///
+    /// L'armement ne laissait aucune trace de ce qu'il avait arme. A la
+    /// transition, le poller avancait donc sur `next_position()` — l'index+1
+    /// COURANT — qui n'est plus la piste armee des que la file a bouge entre
+    /// les deux. Un « Lire ensuite » dans les 30 dernieres secondes suffit : le
+    /// renderer joue ce qu'on lui a envoye, l'ecran nomme l'inseree, et le
+    /// compteur de fin de piste adopte la duree de l'INSEREE — d'ou la coupure
+    /// de l'audio reellement en cours (`dlna_frozen_end=true`, journal Sandro
+    /// du 01/09 a 14:23:10).
+    gapless_armed: Option<ArmedNext>,
 }
 
 impl ZonePollState {
@@ -2365,6 +2718,7 @@ impl ZonePollState {
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -2393,6 +2747,7 @@ impl ZonePollState {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         }
     }
 }
@@ -2402,9 +2757,23 @@ impl ZonePollState {
 /// cette position — verrou `gapless_dsd_skip_pos`, #2394) ».
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GaplessPrep {
-    Armed,
+    /// Le renderer a accepte la piste suivante. Porte la LIGNE de file
+    /// reellement envoyee (`None` si la file n'a pas su la rendre) : c'est
+    /// elle, et non l'index, qui decide ou avancer a la transition (#3026).
+    Armed(Option<ArmedNext>),
     DsdNextSkipped,
     NotArmed,
+}
+
+/// Ce que le renderer a ACCEPTE comme piste suivante — a distinguer de ce que
+/// la file designe comme suivante : les deux divergent des qu'on insere (#3026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArmedNext {
+    /// `queue_items.id`. Stable quand `insert_at` decale les positions.
+    row_id: i64,
+    /// La position occupee AU MOMENT de l'armement. Journalisee seule : elle
+    /// dit de combien la file a glisse sous l'armement.
+    position: i64,
 }
 
 /// Retrouver en base la station qui joue, a partir du `source_id` du
@@ -2572,8 +2941,6 @@ impl PositionPoller {
                             || np.artist_name != meta.artist
                             || np.cover_path != pochette;
                         if title_changed {
-                            let title_for_icy = meta.title.clone();
-                            let artist_for_icy = meta.artist.clone();
                             let new_np = crate::playback::NowPlaying {
                                 track_id: None,
                                 title: meta.title,
@@ -2586,21 +2953,71 @@ impl PositionPoller {
                                 stream_id: np.stream_id.clone(),
                                 ..Default::default()
                             };
-                            self.playback.update_now_playing(zone_id, new_np).await;
-                            // Le renderer, lui, ne lit pas le
-                            // now-playing : il reçoit des blocs ICY
-                            // dans le flux. On publie donc aussi le
-                            // titre là où le gestionnaire de flux
-                            // saura le relire, sinon l'appareil
-                            // reste figé sur le morceau qui passait
-                            // à sa connexion.
+                            // Le renderer, lui, ne lit pas le now-playing : il
+                            // reçoit des blocs ICY dans le flux. On publie donc
+                            // titre ET pochette là où le gestionnaire de flux
+                            // saura les relire, sinon l'appareil reste figé sur
+                            // le morceau qui passait à sa connexion (#2161).
+                            //
+                            // On lit ces trois valeurs SUR `new_np`, et non sur
+                            // des copies prises plus haut : ce sont exactement
+                            // celles que l'interface Tune va recevoir. Trois
+                            // variables `*_for_icy` parallèles pouvaient diverger
+                            // du now-playing sans qu'aucune épreuve ne le voie —
+                            // et c'est cette classe d'écart silencieux entre le
+                            // producteur et le consommateur qui a produit ce
+                            // ticket. Ici, l'écart n'est plus représentable.
+                            //
+                            // ── Et ce que cette garde TAISAIT (#2991) ──
+                            //
+                            // Sans `stream_id`, le `if let` ci-dessous ne
+                            // publiait rien — en silence. L'interface Tune, elle,
+                            // était mise à jour deux lignes plus bas par
+                            // `update_now_playing`, qui ne dépend pas du
+                            // `stream_id`. « Dans Tune ça fonctionne, sur le
+                            // RS250A non » est le symptôme EXACT de cet écart, et
+                            // rien au journal ne permettait de le distinguer d'un
+                            // renderer qui n'aurait pas demandé l'ICY. Deux causes
+                            // opposées, une seule absence de trace.
+                            //
+                            // On lit donc le canal AVANT de publier, et on
+                            // journalise dans TOUS les cas — y compris celui qui
+                            // marche, sans quoi « pas de ligne » resterait
+                            // ambigu.
+                            let canal = crate::http::streamer::canal_radio(np.stream_id.as_deref());
                             if let Some(sid) = np.stream_id.as_deref() {
                                 crate::http::streamer::publish_radio_now(
                                     sid,
-                                    artist_for_icy,
-                                    title_for_icy,
+                                    new_np.artist_name.clone(),
+                                    new_np.title.clone(),
+                                    new_np.cover_path.clone(),
                                 );
                             }
+                            // UNE ligne doit suffire à savoir laquelle des
+                            // branches mord la prochaine fois qu'un testeur
+                            // signale un écran figé. Même nom d'évènement dans
+                            // les deux cas — seul le niveau change — pour qu'un
+                            // `grep radio_refresh_channel` les ramène ensemble.
+                            let sid_journal = np.stream_id.as_deref().unwrap_or("absent");
+                            if canal.atteint_le_renderer() {
+                                debug!(
+                                    zone_id,
+                                    station = %station_name,
+                                    stream_id = sid_journal,
+                                    canal = canal.libelle(),
+                                    "radio_refresh_channel"
+                                );
+                            } else {
+                                warn!(
+                                    zone_id,
+                                    station = %station_name,
+                                    stream_id = sid_journal,
+                                    canal = canal.libelle(),
+                                    "radio_refresh_channel — le morceau a changé mais l'écran du \
+                                     lecteur réseau ne l'apprendra pas"
+                                );
+                            }
+                            self.playback.update_now_playing(zone_id, new_np).await;
                             debug!(zone_id, station = %station_name, "radio_metadata_updated");
                         }
                     }
@@ -2808,10 +3225,11 @@ impl PositionPoller {
                 };
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
                     Ok((s, signal_path, dsp_metrics)) => {
-                        idle_backoff
-                            .entry(zone_id)
-                            .or_default()
-                            .record_success(s.state);
+                        let b = idle_backoff.entry(zone_id).or_default();
+                        b.record_success(s.state);
+                        // Clôture de panne (#2566) : muette si le sondage
+                        // n'avait jamais échoué.
+                        b.journal.succes(zone_id, &device_id);
                         // Le curseur de volume est inerte tant que dure le DoP :
                         // l'état de zone doit le dire au client (#1735).
                         self.playback.set_dop_active(zone_id, s.dop_active).await;
@@ -2826,14 +3244,12 @@ impl PositionPoller {
                     Err(e) => {
                         let b = idle_backoff.entry(zone_id).or_default();
                         b.record_failure();
-                        debug!(
-                            zone_id,
-                            device = %device_id,
-                            error = %e,
-                            consecutive_errors = b.consecutive_errors,
-                            skip_ticks = b.remaining,
-                            "idle_poll_failed_backing_off"
-                        );
+                        // Plafonné, sur le modèle de #2890 (#2566) : une panne
+                        // durable dit sa cause quelques fois, puis se
+                        // récapitule aux paliers de doublement. Le recul
+                        // lui-même, lui, ne change pas d'un tick.
+                        let skip_ticks = b.remaining;
+                        b.journal.echec(zone_id, &device_id, &e, skip_ticks);
                         continue;
                     }
                 }
@@ -2859,7 +3275,7 @@ impl PositionPoller {
                 && status.volume < 0.999
                 && status.state == TransportState::Playing
             {
-                let db_vol = zone.volume as f64 / 100.0;
+                let db_vol = zone.volume / 100.0;
                 let prev_device_vol = poll_states.get(&zone_id).and_then(|p| p.last_device_volume);
                 // Edge-triggered: adopt the renderer's volume only when it
                 // actually moved since the last poll (see decisions::
@@ -2867,9 +3283,11 @@ impl PositionPoller {
                 // Devialet stuck at 50%) can't overwrite the saved volume.
                 if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol) {
                     self.playback.set_volume(zone_id, status.volume).await;
-                    let vol_int = (status.volume * 100.0) as i32;
+                    // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
+                    // tombait a 0 sous 0,01 lineaire (-40 dB).
+                    let vol_pct = status.volume * 100.0;
                     crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-                        .update_volume(zone_id, vol_int)
+                        .update_volume(zone_id, vol_pct)
                         .ok();
                 }
                 // Remember what the renderer reported so the next tick can
@@ -2997,6 +3415,27 @@ impl PositionPoller {
                         .map(|t| t.title.clone())
                         .or_else(|| status.track_title.clone());
 
+                    // #2991 — ce chemin posait `stream_id: None` en dur. Sur une
+                    // RADIO, ce `None` se recopie ensuite dans chaque
+                    // now-playing produit par `refresh_radio_metadata`, et le
+                    // titre cesse définitivement d'être publié vers le flux :
+                    // l'écran du lecteur réseau reste figé sur le premier
+                    // morceau pendant que l'interface Tune, elle, suit.
+                    //
+                    // Le renderer annonce l'URI qu'il tire ; on y RELIT
+                    // l'identifiant, puis on ne l'adopte que si le gestionnaire
+                    // de flux connaît cette session — `streamer_bytes_sent`
+                    // rend `None` pour un flux inconnu, ce qui écarte l'URI
+                    // d'un AUTRE serveur Tune du réseau.
+                    let stream_id_repris =
+                        match decisions::stream_id_de_l_uri(status.current_uri.as_deref()) {
+                            Some(sid)
+                                if self.orchestrator.streamer_bytes_sent(&sid).await.is_some() =>
+                            {
+                                Some(sid)
+                            }
+                            _ => None,
+                        };
                     // Only recover if we actually know what is playing — otherwise
                     // skip so a titleless device blip never surfaces as a phantom.
                     if let Some(title) = title {
@@ -3015,11 +3454,18 @@ impl PositionPoller {
                                 .unwrap_or(status.duration_ms as i64),
                             source: last_source,
                             source_id: last_source_id,
-                            stream_id: None,
+                            stream_id: stream_id_repris,
                             ..Default::default()
                         };
+                        let stream_id_journal =
+                            np.stream_id.as_deref().unwrap_or("absent").to_string();
                         self.playback.play(zone_id, np).await;
-                        info!(zone_id, device = %device_id, "playback_recovered_from_device");
+                        info!(
+                            zone_id,
+                            device = %device_id,
+                            stream_id = %stream_id_journal,
+                            "playback_recovered_from_device"
+                        );
                     } else {
                         debug!(
                             zone_id,
@@ -3179,6 +3625,7 @@ impl PositionPoller {
                 // Force one gapless_arm_trace line at the start of the new track.
                 ps.gapless_arm_logged = None;
                 ps.gapless_dsd_skip_pos = None;
+                ps.gapless_armed = None;
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -3246,10 +3693,15 @@ impl PositionPoller {
             let poll_start = Instant::now();
 
             // A push-based output that failed on its own thread reports it
-            // here. Handle it before any status-based reasoning: the stall
-            // heuristics below would eventually stop the zone too, but only
-            // after ~73 s of a track apparently playing in silence, and
-            // without ever telling the user why (Yacine, 8 Aug 2026).
+            // here. Handle it before any status-based reasoning (Yacine,
+            // 8 Aug 2026).
+            //
+            // Ce commentaire disait « les heuristiques de blocage plus bas
+            // finiraient par arrêter la zone, en ~73 s ». MESURÉ FAUX sur
+            // #3108 : `dlna_playing_stall_eligible` exige
+            // `output_type == "dlna"`. Pour une sortie LOCALE, ce bloc n'est
+            // pas le raccourci d'un filet plus lent — c'est le seul filet.
+            // Une zone locale dont la position se fige n'est reprise par rien.
             {
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
@@ -3308,6 +3760,9 @@ impl PositionPoller {
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
                     Ok((s, signal_path, dsp_metrics)) => {
                         ps.consecutive_errors = 0;
+                        // Clôture de panne (#2566) : muette si le sondage
+                        // n'avait jamais cessé de répondre.
+                        ps.journal.succes_lecture(zone_id, &device_id);
                         let latency = poll_start.elapsed().as_millis() as u32;
                         ps.last_latency_ms = latency;
                         if latency > ps.max_latency_ms {
@@ -3329,13 +3784,17 @@ impl PositionPoller {
                         ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);
                         ps.total_errors += 1;
                         ps.backoff_remaining = 1u8 << ps.consecutive_errors.min(4);
-                        debug!(
-                            zone_id,
-                            device = %device_id,
-                            error = %e,
-                            backoff = ps.backoff_remaining,
-                            "poll_failed_backing_off"
-                        );
+                        // Les trois compteurs ci-dessus sont tenus AVANT, et le
+                        // journal n'en touche aucun : une panne qui cesse
+                        // d'être dite continue d'être comptée, donc le repli de
+                        // fin de piste (`poll_failed_past_end`) et l'arrêt de
+                        // zone décident sur exactement les mêmes chiffres
+                        // qu'avant (#2566). Seul le volume du journal change :
+                        // 1 ligne toutes les 17 s pour un appareil muet, sans
+                        // fin, devient 5 lignes détaillées puis un récapitulatif
+                        // aux paliers de doublement.
+                        let backoff = ps.backoff_remaining;
+                        ps.journal.echec_lecture(zone_id, &device_id, &e, backoff);
 
                         // Poll-fail end-of-track fallback for a DLNA renderer
                         // whose status poll errors outright (LMS UPnP bridge:
@@ -3437,10 +3896,12 @@ impl PositionPoller {
                         )
                     {
                         self.playback.set_volume(zone_id, status.volume).await;
-                        let vol_int = (status.volume * 100.0) as i32;
+                        // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
+                        // tombait a 0 sous 0,01 lineaire (-40 dB).
+                        let vol_pct = status.volume * 100.0;
                         let db = self.db.clone();
                         crate::db::zone_repo::ZoneRepo::with_backend(db)
-                            .update_volume(zone_id, vol_int)
+                            .update_volume(zone_id, vol_pct)
                             .ok();
                     }
                     ps.last_device_volume = Some(status.volume);
@@ -3618,8 +4079,15 @@ impl PositionPoller {
                 } else {
                     status.position_ms as i64
                 };
-                self.playback.update_position(zone_id, reported).await;
-                self.playback.emit_position(zone_id, reported);
+                // La garde de monotonie vit dans `update_position` : elle sait,
+                // elle, quels chemins ont le droit d'abaisser le plancher (une
+                // COMMANDE — déplacement, changement de piste, avance gapless —
+                // et jamais une observation). Elle rend la position RETENUE, et
+                // c'est celle-là qu'il faut émettre : émettre `reported` ferait
+                // diverger l'évènement `position` de l'état servi par
+                // `GET /zones`, et l'écran reculerait quand même (#3229).
+                let publiee = self.playback.update_position(zone_id, reported).await;
+                self.playback.emit_position(zone_id, publiee);
             }
 
             // Sync volume from device (skip if fixed_volume)
@@ -3642,10 +4110,12 @@ impl PositionPoller {
                 )
             {
                 self.playback.set_volume(zone_id, status.volume).await;
-                let vol_int = (status.volume * 100.0) as i32;
+                // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
+                // tombait a 0 sous 0,01 lineaire (-40 dB).
+                let vol_pct = status.volume * 100.0;
                 let db = self.db.clone();
                 crate::db::zone_repo::ZoneRepo::with_backend(db)
-                    .update_volume(zone_id, vol_int)
+                    .update_volume(zone_id, vol_pct)
                     .ok();
             }
             // Edge-triggered like the stopped/radio paths: record the reported
@@ -3813,6 +4283,9 @@ impl PositionPoller {
                     );
                     ps.gapless_sent = false;
                     ps.gapless_sent_at = None;
+                    // Retire de l'etat, gardee sous la main : c'est elle qui
+                    // dit ou avancer (#3026).
+                    let arme_avant = ps.gapless_armed.take();
                     ps.stopped_ticks = 0;
                     ps.past_end_ticks = 0;
                     ps.peak_position_ms = 0;
@@ -3842,7 +4315,10 @@ impl PositionPoller {
                         .unwrap_or(false);
                     if recently_restarted {
                         info!(zone_id, "gapless_advance_suppressed_after_restart");
-                    } else if let Some(next_pos) = Self::next_position(zone_state) {
+                    } else if let Some(next_pos) = self
+                        .position_a_avancer(zone_id, zone_state, arme_avant)
+                        .await
+                    {
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
                         if let Err(e) = self
                             .orchestrator
@@ -4009,6 +4485,7 @@ impl PositionPoller {
                             // play_from_queue which handles metadata correctly.
                             info!(zone_id, "gapless_guard_stopped_pending_confirmation");
                             ps.gapless_sent = false;
+                            ps.gapless_armed = None;
                             ps.gapless_sent_at = None;
                             ps.stopped_ticks = 0;
                             ps.peak_position_ms = 0;
@@ -4156,6 +4633,7 @@ impl PositionPoller {
                                     // play_from_queue which handles metadata itself.
                                     info!(zone_id, "gapless_natural_end_waiting_for_transition");
                                     ps.gapless_sent = false;
+                                    ps.gapless_armed = None;
                                     ps.gapless_sent_at = None;
                                     ps.stopped_ticks = 0;
                                     ps.peak_position_ms = 0;
@@ -4189,6 +4667,7 @@ impl PositionPoller {
                                     {
                                         fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
                                         ps.gapless_sent = false;
+                                        ps.gapless_armed = None;
                                         track_ended = true;
                                         motif_fin_de_piste =
                                             decisions::motif_fin::FIN_NATURELLE_APRES_STOPPED;
@@ -4459,6 +4938,8 @@ impl PositionPoller {
                         );
                         ps.gapless_sent = false;
                         ps.gapless_sent_at = None;
+                        // Voir `position_a_avancer` (#3026).
+                        let arme_avant = ps.gapless_armed.take();
                         ps.peak_position_ms = 0;
                         ps.last_position_ms = 0;
                         ps.last_bytes_sent = 0;
@@ -4473,7 +4954,10 @@ impl PositionPoller {
                         // re-arm the once-per-track gapless_arm_trace line.
                         ps.gapless_arm_logged = None;
                         ps.gapless_dsd_skip_pos = None;
-                        if let Some(next_pos) = Self::next_position(zone_state) {
+                        if let Some(next_pos) = self
+                            .position_a_avancer(zone_id, zone_state, arme_avant)
+                            .await
+                        {
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
                                 .orchestrator
@@ -4509,6 +4993,56 @@ impl PositionPoller {
                             );
                             ps.gapless_sent = false;
                             ps.gapless_sent_at = None;
+                            ps.gapless_armed = None;
+                        }
+                        // « Lire ensuite » PENDANT la fenetre d'armement : la
+                        // piste que le renderer a acceptee n'est plus celle que
+                        // la file annonce comme suivante (#3026).
+                        //
+                        // Le geste explicite de l'utilisateur gagne. On desarme,
+                        // et la condition ci-dessous re-arme DANS LE MEME TICK
+                        // avec la piste inseree : un nouveau
+                        // `SetNextAVTransportURI` part vers le renderer.
+                        //
+                        // Le blanc eventuel est celui que l'utilisateur a
+                        // lui-meme provoque, et lui seul : tant que personne ne
+                        // touche a la file, les deux identifiants sont egaux,
+                        // rien n'est desarme, et l'enchainement sans blanc est
+                        // intact. C'est tout l'ecart avec le faux correctif —
+                        // desarmer des qu'on touche a la file — qui supprimerait
+                        // le defaut en supprimant la fonctionnalite.
+                        if ps.gapless_sent {
+                            let suivant = Self::next_position(zone_state);
+                            let ligne_au_suivant = suivant.and_then(|p| {
+                                crate::db::play_queue_repo::PlayQueueRepo::with_backend(
+                                    self.db.clone(),
+                                )
+                                .get_at(zone_id, p)
+                                .ok()
+                                .flatten()
+                                .map(|e| e.id)
+                            });
+                            if decisions::gapless_arm_outdated(
+                                ps.gapless_armed.map(|a| a.row_id),
+                                ligne_au_suivant,
+                            ) {
+                                info!(
+                                    zone_id,
+                                    armed_row = ?ps.gapless_armed.map(|a| a.row_id),
+                                    armed_pos = ?ps.gapless_armed.map(|a| a.position),
+                                    next_pos = ?suivant,
+                                    row_at_next = ?ligne_au_suivant,
+                                    "gapless_rearm_queue_changed"
+                                );
+                                ps.gapless_sent = false;
+                                ps.gapless_sent_at = None;
+                                ps.gapless_armed = None;
+                                // Une ligne de trace neuve pour le nouvel
+                                // armement : sans cela le journal garderait
+                                // « already_armed » et ne dirait pas ce qui
+                                // vient d'etre renvoye.
+                                ps.gapless_arm_logged = None;
+                            }
                         }
                         decisions::should_arm_gapless(
                             ps.gapless_sent,
@@ -4548,6 +5082,10 @@ impl PositionPoller {
                             if !can_internal_gapless {
                                 info!(zone_id, "gapless_skipped_exclusive_output");
                                 ps.gapless_sent = true;
+                                // Le drapeau est pose pour cesser de re-tenter,
+                                // pas parce qu'une piste est partie : ne rien
+                                // laisser croire le contraire (#3026).
+                                ps.gapless_armed = None;
                             } else if decisions::dsd_skip_latched(
                                 ps.gapless_dsd_skip_pos,
                                 Self::next_position(zone_state),
@@ -4559,9 +5097,13 @@ impl PositionPoller {
                                 // piste explicitement en fin de morceau.
                             } else {
                                 match self.prepare_gapless(zone_id, zone_state, &device_id).await {
-                                    GaplessPrep::Armed => {
+                                    GaplessPrep::Armed(arme) => {
                                         ps.gapless_sent_at = Some(Instant::now());
                                         ps.gapless_sent = true;
+                                        // Ce que le renderer a ACCEPTE. Pose
+                                        // apres `set_next_media` seulement :
+                                        // un envoi refuse n'arme rien (#3026).
+                                        ps.gapless_armed = arme;
                                     }
                                     GaplessPrep::DsdNextSkipped => {
                                         ps.gapless_dsd_skip_pos = Self::next_position(zone_state);
@@ -5361,6 +5903,61 @@ impl PositionPoller {
     /// fail transiently (network blip, DASH parse, token refreshed mid-flight);
     /// previously a single failure silently abandoned gapless, producing an
     /// audible Stop+Play gap. The happy path is unchanged (first-try success).
+    /// Ou avancer les metadonnees a la transition : la ou est passee la piste
+    /// que le renderer a REELLEMENT acceptee (#3026).
+    ///
+    /// Cas courant — personne n'a touche a la file : la ligne armee EST celle
+    /// que l'index designe, et cette fonction rend exactement `next_position`.
+    /// Rien ne change, pour aucune sortie.
+    ///
+    /// Cas de la course : l'insertion tombe ENTRE deux sondages. Aucun tick n'a
+    /// pu re-armer, le renderer joue donc toujours la piste armee — et c'est
+    /// ELLE que l'ecran doit nommer. Avancer sur l'index+1 courant nommerait
+    /// l'inseree : l'ecran ment, puis le compteur de fin de piste adopte la
+    /// duree de l'inseree et coupe l'audio reel avant sa fin.
+    ///
+    /// L'insertion n'est pas perdue, elle garde sa ligne dans la file ; elle
+    /// perd son tour. C'est le prix de la course, et il se paie une fois : des
+    /// qu'un tick separe le geste de la transition — 15 s et 18 s dans les deux
+    /// occurrences du journal — le re-armement rend son tour a l'inseree.
+    async fn position_a_avancer(
+        &self,
+        zone_id: i64,
+        zone_state: &crate::playback::ZoneState,
+        arme: Option<ArmedNext>,
+    ) -> Option<i64> {
+        let par_index = Self::next_position(zone_state);
+        let arme = arme?;
+        let repo = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
+        let ligne_au_suivant = par_index
+            .and_then(|p| repo.get_at(zone_id, p).ok().flatten())
+            .map(|e| e.id);
+        if !decisions::gapless_arm_outdated(Some(arme.row_id), ligne_au_suivant) {
+            return par_index;
+        }
+        // La ligne armee a glisse : la retrouver PAR SON IDENTITE.
+        match repo
+            .get_ordered(zone_id)
+            .ok()
+            .and_then(|file| file.into_iter().find(|e| e.id == arme.row_id))
+        {
+            Some(e) => {
+                info!(
+                    zone_id,
+                    armed_row = arme.row_id,
+                    armed_pos = arme.position,
+                    now_pos = e.position,
+                    by_index = ?par_index,
+                    "gapless_advance_follows_armed_track"
+                );
+                Some(e.position)
+            }
+            // La piste armee a quitte la file : plus rien a suivre. On retombe
+            // sur l'index, c'est-a-dire sur le comportement d'avant.
+            None => par_index,
+        }
+    }
+
     async fn resolve_gapless_next(
         &self,
         zone_id: i64,
@@ -5390,6 +5987,18 @@ impl PositionPoller {
         let Some(next_pos) = Self::next_position(zone_state) else {
             return GaplessPrep::NotArmed;
         };
+
+        // L'identite de ce qu'on s'apprete a armer, lue AVANT de le resoudre :
+        // une ligne de file, pas une position (#3026). C'est la seule trace de
+        // ce que le renderer aura reellement accepte.
+        let arme = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
+            .get_at(zone_id, next_pos)
+            .ok()
+            .flatten()
+            .map(|e| ArmedNext {
+                row_id: e.id,
+                position: next_pos,
+            });
 
         // Local-file gapless (OAAT native DSD): the output reads the next
         // track's `.dsf` directly, so resolve it as a local file WITHOUT a
@@ -5449,7 +6058,7 @@ impl PositionPoller {
                                 resolve_ms = t0.elapsed().as_millis() as u64,
                                 "gapless_next_set_local_file"
                             );
-                            GaplessPrep::Armed
+                            GaplessPrep::Armed(arme)
                         }
                         Err(e) => {
                             warn!(zone_id, error = %e, "gapless_set_next_local_file_failed");
@@ -5522,8 +6131,7 @@ impl PositionPoller {
                     // output keeps its internal DSD gapless chain untouched.
                     if output.output_type() == "dlna" {
                         let url_lc = resolved.url.to_lowercase();
-                        let next_is_dsd = resolved.mime_type.contains("dsd")
-                            || resolved.mime_type.contains("dsf")
+                        let next_is_dsd = crate::playback::gapless::est_dsd(&resolved.mime_type)
                             || url_lc.ends_with(".dsf")
                             || url_lc.ends_with(".dff");
                         if next_is_dsd {
@@ -5567,7 +6175,7 @@ impl PositionPoller {
                             streaming = is_streaming,
                             "gapless_next_set"
                         );
-                        GaplessPrep::Armed
+                        GaplessPrep::Armed(arme)
                     }
                 } else {
                     GaplessPrep::NotArmed
@@ -5913,6 +6521,67 @@ mod tests {
         }
     }
 
+    /// #2991 — l'identifiant de session que la reprise « le renderer joue, Tune
+    /// ne le croyait pas » posait à `None`, alors que le renderer l'annonce.
+    mod stream_id_repris_de_l_uri {
+        use crate::poller::decisions::stream_id_de_l_uri;
+
+        /// Le cas nominal, celui d'un RS250A qui tire une radio transcodée.
+        #[test]
+        fn l_uri_dun_flux_tune_rend_son_identifiant() {
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://192.168.1.18:8888/stream/20dd4336-813d.wav")),
+                Some("20dd4336-813d".to_string()),
+                "l'extension doit tomber, comme le fait le serveur de flux"
+            );
+        }
+
+        /// Une chaîne de requête ou une ancre recopiée par l'appareil ne doit
+        /// pas se retrouver COLLÉE à l'identifiant : la clé ne correspondrait
+        /// plus à aucune session et la reprise retomberait sur `None`.
+        #[test]
+        fn une_requete_ou_une_ancre_ne_colle_pas_a_l_identifiant() {
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://h:8888/stream/abc-1.flac?x=1")),
+                Some("abc-1".to_string())
+            );
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://h:8888/stream/abc-1#t=0")),
+                Some("abc-1".to_string())
+            );
+        }
+
+        /// Rien à relire : on ne devine pas. Ces trois cas doivent rendre
+        /// `None`, sans quoi la reprise adopterait un identifiant inventé.
+        #[test]
+        fn rien_a_relire_ne_devine_rien() {
+            assert_eq!(stream_id_de_l_uri(None), None);
+            assert_eq!(stream_id_de_l_uri(Some("")), None);
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://192.168.1.30:57645/song/42.mp3")),
+                None,
+                "l'URI d'une autre application ne porte aucun stream_id"
+            );
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://h:8888/stream/")),
+                None,
+                "un chemin sans identifiant ne doit pas rendre la chaîne vide"
+            );
+        }
+
+        /// L'URI d'un AUTRE serveur Tune rend bien un identifiant — c'est
+        /// volontaire, et c'est l'appelant qui écarte le cas en demandant au
+        /// gestionnaire de flux s'il connaît cette session. Cette épreuve fixe
+        /// ce partage des rôles pour qu'il ne se perde pas.
+        #[test]
+        fn le_flux_dun_autre_tune_rend_un_identifiant_que_l_appelant_devra_ecarter() {
+            assert_eq!(
+                stream_id_de_l_uri(Some("http://192.168.1.18:8888/stream/etranger-9.wav")),
+                Some("etranger-9".to_string())
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -6095,6 +6764,7 @@ mod tests {
             gapless_cooldown: 4,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -6123,6 +6793,7 @@ mod tests {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -6154,6 +6825,7 @@ mod tests {
             gapless_cooldown: 3,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -6182,6 +6854,7 @@ mod tests {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         };
 
         // Simulates entering Playing state
@@ -6458,6 +7131,7 @@ mod tests {
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -6486,6 +7160,7 @@ mod tests {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -6804,6 +7479,50 @@ mod tests {
         assert!(!decisions::natural_end(
             false, false, 0, false, 0, 300_000, true
         ));
+    }
+
+    /// #3229 — la fin de piste vue par le pic vaut AUSSI sur le chemin DLNA.
+    ///
+    /// Jean Valjean, fil 893 : `peak = durée + 5000 ms`, six fois dans ses
+    /// journaux. `peak_reached_end` a été écrit pour cette signature-là — et son
+    /// unique appelant de production était la branche `status.ended_naturally`,
+    /// que **DLNA ne lève jamais** (c'est la raison d'être de
+    /// `dlna_dsd_reached_end`, qui ne couvre que le DSD). Une zone DLNA en
+    /// PCM/FLAC retombait donc ici, sur `natural_end`, où `played_enough` exige
+    /// un plancher d'horloge murale que l'avance gapless vient de fausser : la
+    /// vraie fin était rejetée et la zone partait vers la branche d'ÉCHEC.
+    #[test]
+    fn natural_end_reconnait_le_pic_sur_le_chemin_dlna() {
+        // Signature exacte du fil 893 : le pic dépasse la durée de 5 s.
+        let dur = 714_906u64;
+        let peak = 719_906u64;
+
+        // L'horloge murale a été remise par une avance gapless : elle
+        // sous-compte, et le prédicat qui en dépend rejette une piste finie.
+        assert!(
+            !decisions::played_enough(dur, peak, 2),
+            "témoin : c'est bien l'horloge murale faussée qui rejetait la fin"
+        );
+
+        // DLNA ne rend pas `ended_naturally` (4ᵉ argument à false) et la piste
+        // n'est pas courte. Avant #3229, aucune clause ne mordait ici.
+        assert!(
+            decisions::natural_end(false, false, peak, false, 2, dur, true),
+            "sur DLNA, un pic qui a atteint la fin de la piste EST une fin \
+             naturelle — sinon la zone est arrêtée comme si elle avait \
+             échoué (#3229)"
+        );
+
+        // Et la garde reste étroite : elle n'accepte pas une piste à peine
+        // commencée, ni une durée inconnue.
+        assert!(
+            !decisions::natural_end(false, false, 30_000, false, 2, dur, true),
+            "un pic à 30 s sur une piste de 12 min n'est pas une fin"
+        );
+        assert!(
+            !decisions::natural_end(false, false, 500_000, false, 2, 0, true),
+            "durée inconnue : aucun pic ne prouve une fin"
+        );
     }
 
     // DSD-over-DLNA end-of-track fast path (Benjithom, RS130: ~5s gap between DSD
@@ -7257,6 +7976,7 @@ mod tests {
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -7285,6 +8005,7 @@ mod tests {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -7397,21 +8118,39 @@ mod tests {
         );
     }
 
-    /// Le frein ne s'applique QU'AU repos : tout transport actif — y compris
-    /// une pause ou une transition — garde le plein rythme, sans quoi la
-    /// reprise d'état et l'adoption du volume ralentiraient elles aussi.
+    /// Le plein rythme est réservé à ce que la branche « repos » sait
+    /// EXPLOITER : un renderer qui joue — reprise d'état, adoption du volume
+    /// et détection de conflit y sont toutes conditionnées à `Playing` — et
+    /// une transition, transitoire par définition.
+    ///
+    /// La pause en est SORTIE (#2263). Elle y figurait au motif que « la
+    /// reprise d'état et l'adoption du volume ralentiraient elles aussi » ;
+    /// or ni l'une ni l'autre ne regarde un statut en pause. Voir
+    /// `la_pause_retombe_a_la_cadence_de_repos` juste dessous, et la mesure
+    /// sur la vraie boucle dans `cadence_de_repos_tests`.
     #[test]
-    fn un_transport_actif_garde_le_plein_rythme() {
-        for etat in [
-            TransportState::Playing,
-            TransportState::Paused,
-            TransportState::Transitioning,
-        ] {
+    fn seuls_la_lecture_et_la_transition_gardent_le_plein_rythme() {
+        for etat in [TransportState::Playing, TransportState::Transitioning] {
             let mut b = super::IdlePollBackoff::default();
             b.record_success(etat);
             assert!(
                 !b.should_skip(),
                 "{etat:?} : un appareil qui bouge doit rester sondé à chaque tick"
+            );
+        }
+    }
+
+    /// CONTRE-ÉPREUVE de la ligne ci-dessus : la pause tombe à la cadence de
+    /// repos, au même titre que l'arrêt. Sans ce cas, retirer `Paused` du bras
+    /// lent laisserait le test précédent entièrement vert.
+    #[test]
+    fn la_pause_retombe_a_la_cadence_de_repos() {
+        for etat in [TransportState::Stopped, TransportState::Paused] {
+            let mut b = super::IdlePollBackoff::default();
+            b.record_success(etat);
+            assert!(
+                b.should_skip(),
+                "{etat:?} : rien à en apprendre au tick suivant, il doit être sauté"
             );
         }
     }
@@ -7565,6 +8304,7 @@ mod tests {
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -7593,6 +8333,7 @@ mod tests {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)
@@ -7765,8 +8506,12 @@ mod cadence_de_repos_tests {
     /// Renderer poli : il répond toujours, et il répond ce qu'on lui dit de
     /// répondre. Il compte les `get_status` reçus — c'est exactement le
     /// trafic SOAP que #2263 mesure.
+    ///
+    /// Son état est PARTAGÉ et modifiable en cours de banc : c'est la seule
+    /// façon de mesurer ce que coûte une pause, puis ce qu'elle rapporte quand
+    /// l'appareil en ressort — sans qu'aucune horloge n'entre dans le test.
     struct Compteur {
-        etat: TransportState,
+        etat: Arc<std::sync::Mutex<TransportState>>,
         appels: Arc<AtomicU32>,
     }
     #[async_trait::async_trait]
@@ -7800,8 +8545,9 @@ mod cadence_de_repos_tests {
         }
         async fn get_status(&self) -> Result<OutputStatus, String> {
             self.appels.fetch_add(1, Ordering::Relaxed);
+            let state = *self.etat.lock().expect("état du renderer bouchonné");
             Ok(OutputStatus {
-                state: self.etat,
+                state,
                 ..Default::default()
             })
         }
@@ -7810,51 +8556,91 @@ mod cadence_de_repos_tests {
         }
     }
 
-    /// Joue `ticks` tours de la vraie boucle `tick()` sur une zone arrêtée
-    /// câblée à un renderer qui répond `etat`, et rend le nombre de sondages
-    /// qu'il a réellement subis.
-    async fn sondages_sur(etat: TransportState, ticks: u32) -> u32 {
-        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
-        db.init_schema().unwrap();
-        crate::db::migrations::run_migrations(&db).unwrap();
-        let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
-        let device_id = "test:compteur";
-        ZoneRepo::with_backend(db.clone())
-            .create("Salon", Some("test"), Some(device_id))
-            .unwrap();
+    /// Le banc : la VRAIE boucle `tick()`, câblée à un renderer qui compte les
+    /// sondages qu'il subit.
+    ///
+    /// Aucune horloge n'y intervient — on y compte des TOURS, jamais des
+    /// secondes. Un test de cadence qui dormirait pour de bon serait
+    /// intermittent, et il empoisonnerait la suite entière.
+    struct Banc {
+        poller: PositionPoller,
+        appels: Arc<AtomicU32>,
+        etat: Arc<std::sync::Mutex<TransportState>>,
+        poll_states: HashMap<i64, ZonePollState>,
+        idle_backoff: HashMap<i64, IdlePollBackoff>,
+        startup_at: Instant,
+    }
 
-        let appels = Arc::new(AtomicU32::new(0));
-        let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
-        outputs.lock().await.register(Box::new(Compteur {
-            etat,
-            appels: appels.clone(),
-        }));
-        let playback = Arc::new(crate::playback::PlaybackManager::new());
-        let orchestrator = Arc::new(PlaybackOrchestrator::new(
-            db.clone(),
-            playback.clone(),
-            Arc::new(crate::http::streamer::AudioStreamer::new(0)),
-            Arc::new(Mutex::new(crate::streaming::ServiceRegistry::new())),
-            outputs.clone(),
-            None,
-        ));
-        let poller = PositionPoller::new(
-            orchestrator,
-            playback,
-            outputs.clone(),
-            db.clone(),
-            Arc::new(Mutex::new(HashMap::new())),
-        );
-
-        let mut poll_states: HashMap<i64, ZonePollState> = HashMap::new();
-        let mut idle_backoff: HashMap<i64, IdlePollBackoff> = HashMap::new();
-        let startup_at = Instant::now();
-        for _ in 0..ticks {
-            poller
-                .tick(&mut poll_states, &mut idle_backoff, &startup_at)
-                .await;
+    impl Banc {
+        async fn neuf(etat: TransportState) -> Self {
+            let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            crate::db::migrations::run_migrations(&db).unwrap();
+            let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+            let device_id = "test:compteur";
+            ZoneRepo::with_backend(db.clone())
+                .create("Salon", Some("test"), Some(device_id))
+                .unwrap();
+            let appels = Arc::new(AtomicU32::new(0));
+            let etat = Arc::new(std::sync::Mutex::new(etat));
+            let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+            outputs.lock().await.register(Box::new(Compteur {
+                etat: etat.clone(),
+                appels: appels.clone(),
+            }));
+            let playback = Arc::new(crate::playback::PlaybackManager::new());
+            let orchestrator = Arc::new(PlaybackOrchestrator::new(
+                db.clone(),
+                playback.clone(),
+                Arc::new(crate::http::streamer::AudioStreamer::new(0)),
+                Arc::new(Mutex::new(crate::streaming::ServiceRegistry::new())),
+                outputs.clone(),
+                None,
+            ));
+            let poller = PositionPoller::new(
+                orchestrator,
+                playback,
+                outputs.clone(),
+                db.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
+            );
+            Self {
+                poller,
+                appels,
+                etat,
+                poll_states: HashMap::new(),
+                idle_backoff: HashMap::new(),
+                startup_at: Instant::now(),
+            }
         }
-        appels.load(Ordering::Relaxed)
+
+        /// Ce que le renderer répondra à partir du prochain sondage.
+        fn poser_etat(&self, etat: TransportState) {
+            *self.etat.lock().expect("état du renderer bouchonné") = etat;
+        }
+
+        /// Joue `ticks` tours et rend le nombre de sondages subis PENDANT
+        /// ceux-là : le compteur repart de zéro à l'entrée.
+        async fn jouer(&mut self, ticks: u32) -> u32 {
+            self.appels.store(0, Ordering::Relaxed);
+            for _ in 0..ticks {
+                self.poller
+                    .tick(
+                        &mut self.poll_states,
+                        &mut self.idle_backoff,
+                        &self.startup_at,
+                    )
+                    .await;
+            }
+            self.appels.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Joue `ticks` tours de la vraie boucle `tick()` sur une zone que Tune ne
+    /// croit pas en lecture, câblée à un renderer qui répond `etat`, et rend le
+    /// nombre de sondages qu'il a réellement subis.
+    async fn sondages_sur(etat: TransportState, ticks: u32) -> u32 {
+        Banc::neuf(etat).await.jouer(ticks).await
     }
 
     /// Le défaut de #2263, mesuré sur la vraie boucle : une zone arrêtée dont
@@ -7880,6 +8666,54 @@ mod cadence_de_repos_tests {
     #[tokio::test]
     async fn un_renderer_qui_joue_reste_sonde_a_chaque_tick() {
         assert_eq!(sondages_sur(TransportState::Playing, 10).await, 10);
+    }
+
+    /// LA MESURE de cette passe : une zone laissée EN PAUSE.
+    ///
+    /// Elle n'est pas `PlayState::Playing`, donc elle passe par la branche
+    /// « repos » ; et son renderer répond `PAUSED_PLAYBACK`, que le recul
+    /// comptait comme un transport actif — plein rythme, indéfiniment.
+    /// Soixante tours de pause coûtaient donc 60 sondages, soit 180 actions
+    /// SOAP par minute (`GetPositionInfo` + `GetTransportInfo` + `GetVolume`)
+    /// pour n'apprendre rien : la branche ne fait RIEN d'un statut en pause,
+    /// ses deux seuls consommateurs exigeant `Playing` (#2263).
+    #[tokio::test]
+    async fn une_zone_en_pause_est_sondee_a_la_cadence_de_repos() {
+        let sondages = sondages_sur(TransportState::Paused, 60).await;
+        let attendu = 60u32.div_ceil(IDLE_REPOS_POLL_TICKS as u32);
+        assert_eq!(
+            sondages, attendu,
+            "60 tours en pause doivent tenir en {attendu} sondages, pas {sondages}"
+        );
+        assert!(
+            sondages < 60,
+            "60 sondages par minute étaient le défaut corrigé, or {sondages}"
+        );
+    }
+
+    /// TÉMOIN, vert des deux côtés : le frein ne troque pas un gaspillage
+    /// contre une cécité.
+    ///
+    /// Un doigt sur la façade de l'appareil sort la zone de sa pause. Cette
+    /// reprise doit être VUE, dans le délai ANNONCÉ — au plus
+    /// [`IDLE_REPOS_POLL_TICKS`] tours — et la cadence repartir aussitôt à
+    /// plein régime. Sans ce cas, ralentir la pause au point de ne plus
+    /// jamais la resonder passerait aussi.
+    #[tokio::test]
+    async fn une_pause_qui_repart_est_vue_puis_rend_le_plein_rythme() {
+        let mut banc = Banc::neuf(TransportState::Paused).await;
+        banc.jouer(20).await;
+        banc.poser_etat(TransportState::Playing);
+        let vus = banc.jouer(IDLE_REPOS_POLL_TICKS as u32).await;
+        assert!(
+            vus >= 1,
+            "la reprise doit être vue en au plus {IDLE_REPOS_POLL_TICKS} tours, or 0 sondage"
+        );
+        assert_eq!(
+            banc.jouer(10).await,
+            10,
+            "une fois la lecture vue, plus aucun frein"
+        );
     }
 }
 #[cfg(test)]
@@ -8380,6 +9214,269 @@ mod annonce_navigateur_guard {
 /// La ligne de crête est ici : une zone navigateur n'a JAMAIS de périphérique
 /// et joue pourtant pour de vrai. Le verdict ne porte donc pas sur l'appareil
 /// mais sur la CONSOMMATION du flux — la preuve que #2657 a déjà introduite.
+/// #3108 — le maillon 2 de la chaîne : le poller draine-t-il vraiment
+/// `take_output_failure()`, et l'écran reçoit-il de quoi parler ?
+///
+/// Rien ne le couvrait. Le bloc qui émet `zone.playback_error` vivait dans
+/// `tick()` sans un seul test : on pouvait en retirer le `bus.emit` et toute la
+/// suite restait verte, pendant qu'un refus de sortie exclusive redevenait
+/// muet. C'est exactement le motif du dépôt — « le champ que l'écran ne lit
+/// pas » — et il faut une porte, pas une lecture de code.
+///
+/// La position n'est jamais observée en dormant : le banc pose l'état, appelle
+/// `tick()` UNE fois, et compte ce qui en sort.
+#[cfg(test)]
+mod remontee_des_pannes_de_sortie_tests {
+    use super::{IdlePollBackoff, OutputStatus, PositionPoller, TransportState, ZonePollState};
+    use crate::db::migrations::run_migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::zone_repo::ZoneRepo;
+    use crate::event_bus::EventBus;
+    use crate::http::streamer::AudioStreamer;
+    use crate::orchestrator::PlaybackOrchestrator;
+    use crate::outputs::registry::OutputRegistry;
+    use crate::outputs::traits::OutputTarget;
+    use crate::playback::{NowPlaying, PlayState, PlaybackManager};
+    use crate::streaming::ServiceRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
+
+    const DEVICE_ID: &str = "local:dac-usb";
+
+    /// La sortie du constat : elle dit « en lecture », sa position ne bouge
+    /// plus, et elle porte — ou non — un échec sur le canal du poller.
+    struct SortieLocale {
+        echec: std::sync::Mutex<Option<String>>,
+        position_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl OutputTarget for SortieLocale {
+        fn name(&self) -> &str {
+            "DAC USB"
+        }
+        fn device_id(&self) -> &str {
+            DEVICE_ID
+        }
+        fn output_type(&self) -> &str {
+            "local"
+        }
+        async fn pause(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn resume(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn seek(&self, _position_ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_volume(&self, _volume: f64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_mute(&self, _muted: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn get_status(&self) -> Result<OutputStatus, String> {
+            Ok(OutputStatus {
+                state: TransportState::Playing,
+                position_ms: self.position_ms,
+                duration_ms: 240_000,
+                ..Default::default()
+            })
+        }
+        fn take_output_failure(&self) -> Option<String> {
+            self.echec.lock().unwrap().take()
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    struct Banc {
+        poller: PositionPoller,
+        playback: Arc<PlaybackManager>,
+        zone_id: i64,
+        recu: tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+    }
+
+    impl Banc {
+        /// Une zone locale en lecture sur `DEVICE_ID`, dont la sortie porte
+        /// `echec` (ou rien du tout pour le témoin vert).
+        async fn monter(echec: Option<&str>) -> Self {
+            let db = SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            run_migrations(&db).unwrap();
+            let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+            let zone_id = ZoneRepo::with_backend(db.clone())
+                .create("Salon", Some("local"), Some(DEVICE_ID))
+                .unwrap();
+
+            let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+            outputs.lock().await.register(Box::new(SortieLocale {
+                echec: std::sync::Mutex::new(echec.map(|e| e.to_string())),
+                // La position du constat : deux secondes, et plus rien.
+                position_ms: 2_000,
+            }));
+
+            let playback = Arc::new(PlaybackManager::new());
+            let orchestrator = Arc::new(PlaybackOrchestrator::new(
+                db.clone(),
+                playback.clone(),
+                Arc::new(AudioStreamer::new(0)),
+                Arc::new(Mutex::new(ServiceRegistry::new())),
+                outputs.clone(),
+                None,
+            ));
+            let bus = Arc::new(EventBus::new());
+            let recu = bus.subscribe();
+            let poller = PositionPoller::new(
+                orchestrator,
+                playback.clone(),
+                outputs,
+                db.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
+            )
+            .with_event_bus(bus);
+
+            playback
+                .play(
+                    zone_id,
+                    NowPlaying {
+                        title: "Never Make It on Time".into(),
+                        source: "local".into(),
+                        duration_ms: 240_000,
+                        ..Default::default()
+                    },
+                )
+                .await;
+
+            Self {
+                poller,
+                playback,
+                zone_id,
+                recu,
+            }
+        }
+
+        async fn un_tick(&self) {
+            let mut poll_states: HashMap<i64, ZonePollState> = HashMap::new();
+            let mut idle_backoff: HashMap<i64, IdlePollBackoff> = HashMap::new();
+            self.poller
+                .tick(&mut poll_states, &mut idle_backoff, &Instant::now())
+                .await;
+        }
+
+        /// Ce que l'écran reçoit pour cette zone : le message, et son `fatal`.
+        fn erreur(&mut self) -> Option<(String, bool)> {
+            let mut trouvee = None;
+            while let Ok(ev) = self.recu.try_recv() {
+                if ev.event_type == "zone.playback_error"
+                    && ev.data.get("zone_id").and_then(|v| v.as_i64()) == Some(self.zone_id)
+                {
+                    trouvee = Some((
+                        ev.data
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        ev.data.get("fatal").and_then(|v| v.as_bool()) == Some(true),
+                    ));
+                }
+            }
+            trouvee
+        }
+    }
+
+    /// LE FAIT DE BASE : une sortie qui a posé un échec sur son canal fait
+    /// parler l'écran, et la zone s'arrête. Sans le `bus.emit` de `tick()`,
+    /// ce test tombe.
+    #[tokio::test]
+    async fn un_echec_de_sortie_atteint_l_ecran_et_arrete_la_zone() {
+        let mut banc = Banc::monter(Some(
+            "Sortie « DAC USB » : le périphérique a accepté l'ouverture CoreAudio \
+             puis a cessé de recevoir l'audio ; la lecture est restée figée à 2000 ms.",
+        ))
+        .await;
+
+        banc.un_tick().await;
+
+        let (message, fatal) = banc
+            .erreur()
+            .expect("un échec de sortie doit atteindre l'écran");
+        assert!(
+            message.contains("DAC USB") && message.contains("2000 ms"),
+            "le message doit dire la cause, pas « une erreur est survenue » : {message}"
+        );
+        assert!(
+            fatal,
+            "sans `fatal`, la fenêtre de grâce du client avale le message et \
+             l'utilisateur n'a, une fois de plus, que le silence"
+        );
+        assert_ne!(
+            banc.playback.get_state(banc.zone_id).await.state,
+            PlayState::Playing,
+            "une zone dont la sortie a lâché ne doit pas rester « en lecture »"
+        );
+    }
+
+    /// TÉMOIN VERT : la même zone, la même sortie, la même position figée — mais
+    /// aucun échec posé. Rien ne doit être dit, et la lecture continue.
+    /// C'est la garde contre un correctif qui crierait au loup.
+    #[tokio::test]
+    async fn une_sortie_sans_echec_ne_dit_rien_et_continue_de_jouer() {
+        let mut banc = Banc::monter(None).await;
+
+        banc.un_tick().await;
+
+        assert!(
+            banc.erreur().is_none(),
+            "aucun échec posé : rien ne doit remonter à l'écran"
+        );
+        assert_eq!(
+            banc.playback.get_state(banc.zone_id).await.state,
+            PlayState::Playing,
+            "une lecture saine ne doit pas être coupée"
+        );
+    }
+
+    /// Le canal est à usage unique : le tick suivant ne re-coupe pas une zone
+    /// que l'utilisateur vient de relancer.
+    #[tokio::test]
+    async fn un_echec_deja_remonte_ne_recoupe_pas_la_lecture_suivante() {
+        let mut banc = Banc::monter(Some("Sortie « DAC USB » : figée à 2000 ms.")).await;
+        banc.un_tick().await;
+        assert!(banc.erreur().is_some(), "premier tick : le message part");
+
+        banc.playback
+            .play(
+                banc.zone_id,
+                NowPlaying {
+                    title: "La piste d'après".into(),
+                    source: "local".into(),
+                    duration_ms: 240_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        banc.un_tick().await;
+
+        assert!(
+            banc.erreur().is_none(),
+            "un échec ne doit jamais être remonté deux fois"
+        );
+        assert_eq!(
+            banc.playback.get_state(banc.zone_id).await.state,
+            PlayState::Playing,
+            "la piste relancée ne doit pas mourir de l'erreur de la précédente"
+        );
+    }
+}
+
 #[cfg(test)]
 mod lecture_sans_destination_tests {
     use super::{DELAI_SILENCE_ETABLI, PositionPoller, decisions};
@@ -8784,6 +9881,691 @@ mod depassement_duree_nagit_pas_guard {
             "le seuil du constat doit rester STRICTEMENT au-dessus de celui des \
              detecteurs de fin de piste, sinon il double-signale une fin de \
              piste parfaitement normale."
+        );
+    }
+}
+
+/// #3026 — « Lire ensuite » pendant la fenêtre gapless de 30 s.
+///
+/// Sandro, 0.9.127 Linux, Diretta Renderer, fil forum 1622. Deux occurrences à
+/// 24 h d'intervalle, même forme exacte : `dlna_set_next` part, l'utilisateur
+/// insère une piste 15 s (puis 18 s) plus tard, et **rien ne repart vers le
+/// renderer** — le journal ne porte aucun `dlna_set_next`, `dlna_set_uri_ok` ni
+/// `dlna_play` entre l'insertion et la transition. L'écran avance alors sur
+/// l'index+1 courant — l'insérée — pendant que le renderer joue ce qu'on lui
+/// avait envoyé. Le 01/09 la conséquence devient audible : le compteur de fin
+/// de piste adopte la durée de l'INSÉRÉE et coupe le flux réellement en cours
+/// (`position_past_end_advancing … dlna_frozen_end=true` à 14:23:10).
+///
+/// Ces tests mesurent LE FAIT DE BASE : **quelle piste part réellement au
+/// renderer après le geste, et dans quel ordre**, sur un renderer factice qui
+/// note ce qu'il reçoit. Aucun code HTTP n'y sert de preuve.
+///
+/// **Aucun `sleep`.** La fenêtre des trente secondes est atteinte en écrivant
+/// la position du renderer et l'horloge de piste du poller — deux champs
+/// d'état. Un test qui attendrait trente secondes est un test qu'on finirait
+/// par désarmer.
+#[cfg(test)]
+mod lire_ensuite_dans_la_fenetre_gapless {
+    use super::*;
+    use crate::db::migrations::run_migrations;
+    use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+    use crate::db::zone_repo::ZoneRepo;
+    use crate::event_bus::EventBus;
+    use crate::http::streamer::AudioStreamer;
+    use crate::orchestrator::PlaybackOrchestrator;
+    use crate::outputs::OutputRegistry;
+    use crate::outputs::mock::MockOutput;
+    use crate::playback::{NowPlaying, PlaybackManager};
+    use crate::streaming::ServiceRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    const APPAREIL: &str = "dlna:diretta-renderer-88782b77cab17717";
+    /// La piste en cours. Longue, pour que la fenêtre des 30 s soit un vrai
+    /// intervalle et non toute la piste.
+    const DUREE_COURANTE_MS: i64 = 300_000;
+    /// Toutes les SUIVANTES ont la même durée, exprès : après la transition le
+    /// renderer annonce cette durée quelle que soit celle des trois qu'il joue,
+    /// donc la durée rapportée ne peut pas trahir la réponse qu'on cherche.
+    const DUREE_SUIVANTE_MS: i64 = 200_000;
+
+    /// Les quatre titres du banc, tous DISTINCTS et sur quatre pistes
+    /// distinctes : les gardes anti-doublon de la lecture coalescent une
+    /// relecture du même identifiant de piste, et un test qui rejouerait deux
+    /// fois la même piste serait vert sans rien prouver.
+    const COURANTE: &str = "Voir un ami pleurer";
+    const ARMEE: &str = "Script Switch Trigger";
+    const SUITE: &str = "Hold Me";
+    const INSEREE: &str = "Freddie Freeloader";
+
+    /// Un WAV minuscule mais réel : `resolve_stream` ouvre le fichier, un
+    /// chemin qui ne mène à rien ne s'armerait pas.
+    fn ecrire_wav(chemin: &std::path::Path) {
+        use std::io::Write;
+        let octets_data: u32 = 44_100 * 4 / 5; // 200 ms, 16 bits stéréo
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + octets_data).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&2u16.to_le_bytes());
+        v.extend_from_slice(&44_100u32.to_le_bytes());
+        v.extend_from_slice(&(44_100u32 * 4).to_le_bytes());
+        v.extend_from_slice(&4u16.to_le_bytes());
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&octets_data.to_le_bytes());
+        v.extend(std::iter::repeat_n(0u8, octets_data as usize));
+        let mut f = std::fs::File::create(chemin).unwrap();
+        f.write_all(&v).unwrap();
+        f.flush().unwrap();
+    }
+
+    struct Banc {
+        poller: PositionPoller,
+        playback: Arc<PlaybackManager>,
+        db: Arc<dyn crate::db::backend::DbBackend>,
+        outputs: Arc<Mutex<OutputRegistry>>,
+        zone_id: i64,
+        pistes: Vec<i64>,
+        _fichiers: Vec<tempfile::NamedTempFile>,
+        poll_states: HashMap<i64, ZonePollState>,
+        idle: HashMap<i64, IdlePollBackoff>,
+    }
+
+    impl Banc {
+        /// Une zone DLNA en lecture de `COURANTE`, file `[COURANTE, ARMEE,
+        /// SUITE]`. `INSEREE` existe en bibliothèque mais pas encore en file :
+        /// c'est elle que le geste ajoutera.
+        async fn monter() -> Self {
+            let db = SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            run_migrations(&db).unwrap();
+            let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+
+            let zone_id = ZoneRepo::with_backend(db.clone())
+                .create("Salon", Some("dlna"), Some(APPAREIL))
+                .unwrap();
+
+            let depot = TrackRepo::with_backend(db.clone());
+            let mut fichiers = Vec::new();
+            let mut pistes = Vec::new();
+            for (n, titre) in [COURANTE, ARMEE, SUITE, INSEREE].iter().enumerate() {
+                let f = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+                ecrire_wav(f.path());
+                let mut piste = crate::db::models::Track::new((*titre).to_string());
+                piste.file_path = Some(f.path().to_str().unwrap().to_string());
+                piste.format = Some("wav".into());
+                piste.sample_rate = Some(44_100);
+                piste.bit_depth = Some(16);
+                piste.channels = 2;
+                piste.track_number = n as i32 + 1;
+                piste.duration_ms = if n == 0 {
+                    DUREE_COURANTE_MS
+                } else {
+                    DUREE_SUIVANTE_MS
+                };
+                pistes.push(depot.create(&piste).unwrap());
+                fichiers.push(f);
+            }
+            PlayQueueRepo::with_backend(db.clone())
+                .set_queue(zone_id, &pistes[..3])
+                .unwrap();
+
+            let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+            outputs.lock().await.register(Box::new(
+                MockOutput::new(APPAREIL, "Diretta Renderer").with_type("dlna"),
+            ));
+            let playback = Arc::new(PlaybackManager::new());
+            let orchestrator = Arc::new(PlaybackOrchestrator::new(
+                db.clone(),
+                playback.clone(),
+                Arc::new(AudioStreamer::new(0)),
+                Arc::new(Mutex::new(ServiceRegistry::new())),
+                outputs.clone(),
+                None,
+            ));
+            let poller = PositionPoller::new(
+                orchestrator,
+                playback.clone(),
+                outputs.clone(),
+                db.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
+            )
+            .with_event_bus(Arc::new(EventBus::new()));
+
+            playback
+                .play(
+                    zone_id,
+                    NowPlaying {
+                        track_id: Some(pistes[0]),
+                        title: COURANTE.into(),
+                        source: "local".into(),
+                        duration_ms: DUREE_COURANTE_MS,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            playback.update_queue_info(zone_id, 0, 3).await;
+
+            let generation = playback.get_state(zone_id).await.track_generation;
+            let mut poll_states = HashMap::new();
+            poll_states.insert(zone_id, ZonePollState::new(generation));
+
+            Self {
+                poller,
+                playback,
+                db,
+                outputs,
+                zone_id,
+                pistes,
+                _fichiers: fichiers,
+                poll_states,
+                idle: HashMap::new(),
+            }
+        }
+
+        /// Porter la lecture à `position_ms` SANS attendre : la position du
+        /// renderer et l'horloge de fin de piste du poller sont deux champs, on
+        /// les écrit. C'est l'injection réclamée — pas un `sleep` déguisé.
+        async fn a(&mut self, position_ms: u64) {
+            {
+                let reg = self.outputs.lock().await;
+                let arc = reg.get(APPAREIL).unwrap();
+                let sortie = arc.lock().await;
+                let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
+                mock.set_state(crate::outputs::traits::TransportState::Playing)
+                    .await;
+                mock.set_duration(DUREE_COURANTE_MS as u64);
+                mock.set_position(position_ms);
+            }
+            let ps = self.poll_states.get_mut(&self.zone_id).unwrap();
+            // Le mur d'horloge de `played_enough` (30 s) et celui de
+            // `stale_start_position` : on les franchit en datant le début de la
+            // piste, pas en dormant.
+            ps.track_started_at = Some(Instant::now() - Duration::from_secs(320));
+            ps.peak_position_ms = position_ms;
+            ps.last_position_ms = position_ms;
+        }
+
+        async fn tic(&mut self) {
+            self.poller
+                .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
+                .await;
+        }
+
+        /// Le renderer enchaîne : il passe sur l'URI qu'on lui a armée et
+        /// repart de zéro. C'est la chute de position du journal
+        /// (`gapless_position_reset_detected prev_pos=… new_pos=0`).
+        async fn le_renderer_enchaine(&mut self) {
+            let reg = self.outputs.lock().await;
+            let arc = reg.get(APPAREIL).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<MockOutput>()
+                .unwrap()
+                .simulate_gapless_transition(DUREE_SUIVANTE_MS as u64)
+                .await;
+        }
+
+        /// « Lire ensuite » : exactement ce que fait la route — `insert_at` à la
+        /// position demandée, puis `update_queue_info` avec le nouveau total.
+        async fn lire_ensuite(&self, indice_piste: usize, position: i64) {
+            let depot = PlayQueueRepo::with_backend(self.db.clone());
+            depot
+                .insert_at(
+                    self.zone_id,
+                    &[QueueInput::Local {
+                        track_id: self.pistes[indice_piste],
+                    }],
+                    Some(position),
+                )
+                .unwrap();
+            let total = depot.count_all(self.zone_id).unwrap();
+            let courante = self.playback.get_state(self.zone_id).await.queue_position;
+            self.playback
+                .update_queue_info(self.zone_id, courante, total)
+                .await;
+        }
+
+        /// « + File » : le même ajout, mais en FIN de file. Rien ne bouge avant
+        /// la piste armée.
+        async fn ajouter_en_fin(&self, indice_piste: usize) {
+            let depot = PlayQueueRepo::with_backend(self.db.clone());
+            depot
+                .append(
+                    self.zone_id,
+                    &[QueueInput::Local {
+                        track_id: self.pistes[indice_piste],
+                    }],
+                )
+                .unwrap();
+            let total = depot.count_all(self.zone_id).unwrap();
+            let courante = self.playback.get_state(self.zone_id).await.queue_position;
+            self.playback
+                .update_queue_info(self.zone_id, courante, total)
+                .await;
+        }
+
+        /// Ce qui est PARTI au renderer par `SetNextAVTransportURI`, dans
+        /// l'ordre. La mesure du ticket.
+        async fn armees(&self) -> Vec<String> {
+            let reg = self.outputs.lock().await;
+            let arc = reg.get(APPAREIL).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<MockOutput>()
+                .unwrap()
+                .set_next_titles()
+                .await
+        }
+
+        /// Ce que le renderer JOUE réellement, nommé par le titre qu'on lui a
+        /// donné avec l'URI.
+        async fn joue_par_le_renderer(&self) -> Option<String> {
+            let reg = self.outputs.lock().await;
+            let arc = reg.get(APPAREIL).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<MockOutput>()
+                .unwrap()
+                .current_title()
+                .await
+        }
+
+        /// Les `Play` complets envoyés au renderer. Un enchaînement sans blanc
+        /// n'en produit AUCUN : dès qu'il y en a un, il y a eu un arrêt et une
+        /// relance, c'est-à-dire un blanc.
+        async fn play_complets(&self) -> Vec<String> {
+            let reg = self.outputs.lock().await;
+            let arc = reg.get(APPAREIL).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<MockOutput>()
+                .unwrap()
+                .play_titles()
+                .await
+        }
+
+        /// Ce que l'écran affiche : la position dans la file, et le titre.
+        async fn ecran(&self) -> (i64, String) {
+            let etat = self.playback.get_state(self.zone_id).await;
+            (
+                etat.queue_position,
+                etat.now_playing.map(|np| np.title).unwrap_or_default(),
+            )
+        }
+
+        /// La file telle qu'elle est rendue à l'écran, dans l'ordre.
+        async fn file_affichee(&self) -> Vec<String> {
+            PlayQueueRepo::with_backend(self.db.clone())
+                .get_ordered(self.zone_id)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.title.unwrap_or_default())
+                .collect()
+        }
+    }
+
+    /// **LE FAIT DE BASE.** « Lire ensuite » à quinze secondes de la fin — la
+    /// chronologie exacte du journal du 31/08.
+    ///
+    /// Ce qui doit partir au renderer, dans l'ordre : la piste armée d'abord
+    /// (personne n'avait rien demandé), puis **l'insérée**, parce que le geste
+    /// de l'utilisateur est explicite et postérieur. Et à la transition, la
+    /// piste que le renderer joue doit être celle que l'écran nomme.
+    ///
+    /// Sans le correctif, la seconde ligne n'existe pas : le renderer garde la
+    /// piste armée, l'écran part sur l'insérée, et les deux se contredisent.
+    #[tokio::test]
+    async fn le_geste_de_l_utilisateur_atteint_le_renderer_et_l_ecran_dit_vrai() {
+        let mut banc = Banc::monter().await;
+
+        // 14:10:46 — l'armement, quinze secondes avant l'insertion.
+        banc.a(275_000).await;
+        banc.tic().await;
+        assert_eq!(
+            banc.armees().await,
+            vec![ARMEE.to_string()],
+            "la fenêtre d'armement doit avoir envoyé la piste suivante au renderer"
+        );
+
+        // 14:11:01 — « Lire ensuite ». L'insérée prend la position 1, la piste
+        // armée glisse en 2 : même ligne, autre position.
+        banc.lire_ensuite(3, 1).await;
+        assert_eq!(
+            banc.file_affichee().await,
+            vec![
+                COURANTE.to_string(),
+                INSEREE.to_string(),
+                ARMEE.to_string(),
+                SUITE.to_string()
+            ],
+            "la file doit porter l'insérée juste après la piste en cours"
+        );
+
+        // Le tick suivant, toujours dans la fenêtre.
+        banc.a(276_000).await;
+        banc.tic().await;
+        assert_eq!(
+            banc.armees().await,
+            vec![ARMEE.to_string(), INSEREE.to_string()],
+            "LE FAIT DE BASE : après le geste, c'est l'INSÉRÉE qui doit partir              au renderer, et après la piste déjà armée — pas à sa place, pas              jamais"
+        );
+
+        // 14:11:16 — le renderer enchaîne.
+        banc.le_renderer_enchaine().await;
+        banc.tic().await;
+
+        let (position, titre) = banc.ecran().await;
+        assert_eq!(
+            banc.joue_par_le_renderer().await.as_deref(),
+            Some(INSEREE),
+            "le renderer doit jouer l'insérée : c'est la dernière URI qu'on lui              a donnée"
+        );
+        assert_eq!(
+            titre, INSEREE,
+            "l'écran doit nommer ce qui joue, pas un index de file"
+        );
+        assert_eq!(position, 1, "et pointer la ligne de file correspondante");
+    }
+
+    /// **LA COURSE, dans sa forme la plus serrée** : l'insertion tombe ENTRE
+    /// deux sondages. Aucun tick n'a pu ré-armer, le renderer joue donc encore
+    /// la piste armée — et c'est ELLE que l'écran doit nommer.
+    ///
+    /// C'est le cas qui produisait la coupure du 01/09 : avancer sur l'index+1
+    /// nommait l'insérée, dont la durée devenait la limite du compteur de fin
+    /// de piste ; à 346 s d'un flux qu'on croyait long de 340 s, Tune coupait
+    /// l'audio réel (`dlna_frozen_end=true`). L'insertion garde sa ligne dans
+    /// la file ; elle perd son tour. C'est le seul prix de la course.
+    #[tokio::test]
+    async fn insertion_entre_deux_sondages_l_ecran_suit_ce_qui_joue() {
+        let mut banc = Banc::monter().await;
+        banc.a(275_000).await;
+        banc.tic().await;
+        assert_eq!(banc.armees().await, vec![ARMEE.to_string()]);
+
+        // Le geste, puis la transition, sans un seul tick entre les deux.
+        banc.lire_ensuite(3, 1).await;
+        banc.le_renderer_enchaine().await;
+        banc.tic().await;
+
+        let (position, titre) = banc.ecran().await;
+        assert_eq!(
+            banc.joue_par_le_renderer().await.as_deref(),
+            Some(ARMEE),
+            "aucun tick n'a pu ré-armer : le renderer joue toujours la piste armée"
+        );
+        assert_eq!(
+            titre, ARMEE,
+            "l'écran doit dire la piste ARMÉE — la nommer autrement, c'est ce              qui faisait adopter la durée de l'insérée et couper l'audio réel"
+        );
+        assert_eq!(
+            position, 2,
+            "la piste armée a glissé en position 2 ; c'est là que l'écran doit              pointer, pas sur l'index+1 courant"
+        );
+        assert_eq!(
+            banc.armees().await,
+            vec![ARMEE.to_string()],
+            "rien de neuf n'est parti au renderer : il n'y avait pas de tick pour              le faire"
+        );
+    }
+
+    /// **TÉMOIN VERT — l'enchaînement sans blanc reste intact.** Personne ne
+    /// touche à la file : dix sondages dans la fenêtre ne doivent produire
+    /// qu'UN seul `SetNextAVTransportURI`, et la transition ne doit produire
+    /// AUCUN `Play` complet.
+    ///
+    /// C'est la garde contre le faux correctif : désarmer le gapless dès qu'on
+    /// touche à la file supprimerait le défaut en supprimant la fonctionnalité.
+    #[tokio::test]
+    async fn sans_geste_l_enchainement_sans_blanc_est_intact() {
+        let mut banc = Banc::monter().await;
+        for ms in 0..10u64 {
+            banc.a(275_000 + ms * 1_000).await;
+            banc.tic().await;
+        }
+        assert_eq!(
+            banc.armees().await,
+            vec![ARMEE.to_string()],
+            "un seul armement par piste : re-préparer à chaque tick, c'est              re-résoudre et re-télécharger la suivante une fois par seconde"
+        );
+
+        banc.le_renderer_enchaine().await;
+        banc.tic().await;
+
+        let (position, titre) = banc.ecran().await;
+        assert_eq!(
+            titre, ARMEE,
+            "l'enchaînement normal doit avancer d'une piste"
+        );
+        assert_eq!(position, 1);
+        assert_eq!(
+            banc.joue_par_le_renderer().await.as_deref(),
+            Some(ARMEE),
+            "et le renderer joue bien cette piste-là"
+        );
+        assert!(
+            banc.play_complets().await.is_empty(),
+            "aucun `Play` complet : un enchaînement qui repasse par un arrêt et              une relance, c'est précisément le blanc qu'on ne veut pas payer"
+        );
+    }
+
+    /// **TÉMOIN VERT — un ajout en FIN de file ne coûte rien.** La question 2
+    /// posée au testeur, tranchée par la mesure : « + File » pendant la fenêtre
+    /// ne déplace rien avant la piste armée, donc ne doit RIEN désarmer.
+    #[tokio::test]
+    async fn un_ajout_en_fin_de_file_ne_desarme_rien() {
+        let mut banc = Banc::monter().await;
+        banc.a(275_000).await;
+        banc.tic().await;
+        assert_eq!(banc.armees().await, vec![ARMEE.to_string()]);
+
+        banc.ajouter_en_fin(3).await;
+        banc.a(276_000).await;
+        banc.tic().await;
+        assert_eq!(
+            banc.armees().await,
+            vec![ARMEE.to_string()],
+            "la file a changé mais la piste armée est toujours la suivante :              rien ne doit repartir au renderer"
+        );
+
+        banc.le_renderer_enchaine().await;
+        banc.tic().await;
+        assert_eq!(banc.ecran().await, (1, ARMEE.to_string()));
+        assert!(
+            banc.play_complets().await.is_empty(),
+            "l'enchaînement sans blanc doit survivre à un ajout en fin de file"
+        );
+    }
+
+    /// **TÉMOIN VERT — hors de la fenêtre, rien ne change.** À mi-morceau, rien
+    /// n'est armé : « Lire ensuite » se comporte exactement comme avant, et
+    /// c'est l'insérée qui sera armée le moment venu.
+    ///
+    /// C'est la question 1 posée au testeur, celle qui tranche : le défaut est
+    /// bien circonscrit aux trente dernières secondes.
+    #[tokio::test]
+    async fn hors_de_la_fenetre_lire_ensuite_se_comporte_comme_avant() {
+        let mut banc = Banc::monter().await;
+
+        // Mi-morceau : la fenêtre s'ouvre à 270 s, on est loin.
+        banc.a(150_000).await;
+        banc.tic().await;
+        assert!(
+            banc.armees().await.is_empty(),
+            "hors fenêtre, rien ne doit être armé"
+        );
+
+        banc.lire_ensuite(3, 1).await;
+        banc.a(151_000).await;
+        banc.tic().await;
+        assert!(
+            banc.armees().await.is_empty(),
+            "un geste hors fenêtre ne doit rien envoyer au renderer : il n'y a              rien à corriger"
+        );
+
+        // La fenêtre s'ouvre enfin.
+        banc.a(275_000).await;
+        banc.tic().await;
+        assert_eq!(
+            banc.armees().await,
+            vec![INSEREE.to_string()],
+            "et c'est l'insérée qui est armée, une seule fois, au moment normal"
+        );
+
+        banc.le_renderer_enchaine().await;
+        banc.tic().await;
+        assert_eq!(banc.ecran().await, (1, INSEREE.to_string()));
+        assert_eq!(banc.joue_par_le_renderer().await.as_deref(), Some(INSEREE));
+    }
+
+    /// Le prédicat seul, sur ses quatre cas. Il décide de désarmer un
+    /// enchaînement déjà accepté par le renderer : son sens de défaut doit être
+    /// écrit noir sur blanc.
+    #[test]
+    fn le_predicat_ne_conclut_rien_sans_les_deux_identifiants() {
+        // La ligne armée est toujours la suivante : on ne touche à rien.
+        assert!(!decisions::gapless_arm_outdated(Some(7), Some(7)));
+        // Une AUTRE ligne occupe la place : le geste a bougé la file.
+        assert!(decisions::gapless_arm_outdated(Some(7), Some(9)));
+        // Rien n'a été armé : il n'y a rien à désarmer.
+        assert!(!decisions::gapless_arm_outdated(None, Some(9)));
+        // La file ne rend plus rien à cette position : on ne désarme pas sur une
+        // absence — un « périmé » de trop fait payer un blanc à qui n'a rien
+        // demandé.
+        assert!(!decisions::gapless_arm_outdated(Some(7), None));
+    }
+}
+
+/// Garde-fou #2991 — les DEUX branchements que ce ticket a posés vivent chacun
+/// à un EMPLACEMENT précis d'une boucle de dix mille lignes. Retirés, ils
+/// restent compilés, testés et verts — et plus personne ne les appelle : le
+/// registre du canal ne serait plus lu, et la reprise reposerait `None`. C'est
+/// exactement la classe de régression silencieuse que ce ticket décrit.
+///
+/// Relecture de source, même procédé et même raison que
+/// `annonce_navigateur_guard` ci-dessus.
+#[cfg(test)]
+mod canal_radio_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe à ce module pour que
+    /// les motifs cherchés ne puissent pas se trouver eux-mêmes dans les
+    /// messages d'assertion ci-dessous (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("poller.rs");
+        const BORNE: &str = "mod canal_radio_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    fn position(motif: &str) -> usize {
+        code_de_production().find(motif).unwrap_or_else(|| {
+            panic!(
+                "motif introuvable dans poller.rs : « {motif} ».\n\
+                 Le code a été remanié ; ce garde-fou ne garde plus rien tant \
+                 qu'il n'a pas suivi. Voir #2991."
+            )
+        })
+    }
+
+    /// Le verdict doit être PRIS sur le `stream_id` qui sert à publier, et
+    /// JOURNALISÉ, avant que le now-playing ne parte vers l'interface. Sans
+    /// cette ligne, la garde `if let Some(sid)` redevient muette et « dans Tune
+    /// ça fonctionne, sur le lecteur réseau non » redevient indiagnosticable.
+    #[test]
+    fn le_changement_de_titre_journalise_par_ou_il_passe() {
+        let verdict =
+            position("let canal = crate::http::streamer::canal_radio(np.stream_id.as_deref());");
+        let publication = position("crate::http::streamer::publish_radio_now(");
+        let ligne = position("radio_refresh_channel — le morceau a changé");
+        let vers_l_interface = position("self.playback.update_now_playing(zone_id, new_np).await;");
+        assert!(
+            verdict < publication && publication < ligne && ligne < vers_l_interface,
+            "le canal doit être établi puis journalisé DANS la branche du \
+             changement de titre, avant que le now-playing ne parte à \
+             l'interface (#2991)."
+        );
+    }
+
+    /// La reprise « le renderer joue, Tune ne le croyait pas » doit relire
+    /// l'identifiant de session dans l'URI annoncée par l'appareil. Remise à
+    /// `None`, elle rend le défaut PERMANENT pour toute la session radio :
+    /// `refresh_radio_metadata` recopie ce `None` dans chaque now-playing
+    /// suivant.
+    #[test]
+    fn la_reprise_depuis_lappareil_ne_perd_plus_lidentifiant_de_session() {
+        let relecture = position("decisions::stream_id_de_l_uri(status.current_uri.as_deref())");
+        let pose = position("stream_id: stream_id_repris,");
+        let annonce = position("\"playback_recovered_from_device\"");
+        assert!(
+            relecture < pose && pose < annonce,
+            "la reprise depuis l'appareil doit reposer l'identifiant relu dans \
+             l'URI, et non `None` (#2991)."
+        );
+        assert!(
+            !code_de_production().contains("stream_id: None,\n                            ..Default::default()\n                        };\n                        self.playback.play(zone_id, np).await;"),
+            "le `stream_id: None` en dur est revenu dans la reprise depuis \
+             l'appareil (#2991)."
+        );
+    }
+}
+
+/// #3229 — le sondeur doit ÉMETTRE la position qu'il a fait publier.
+///
+/// La garde de monotonie vit dans `PlaybackManager::update_position`, qui rend
+/// la position retenue. Deux surfaces portent cette position jusqu'à l'écran, et
+/// elles sont écrites l'une sous l'autre : l'état de zone (`GET /zones`) et
+/// l'évènement `position`. Réémettre la valeur BRUTE au lieu de la valeur
+/// retenue rendrait la garde inopérante là où elle compte le plus — le curseur
+/// reculerait quand même, pendant que l'API dirait le contraire.
+///
+/// Aucune épreuve de comportement ne peut voir cet écart-là : les deux appels
+/// réussissent, avec des valeurs différentes. On relit donc la source, même
+/// procédé et même raison que `canal_radio_guard` ci-dessus.
+#[cfg(test)]
+mod position_publiee_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe à ce module pour que
+    /// les motifs cherchés ne puissent pas se trouver eux-mêmes dans les
+    /// messages d'assertion ci-dessous (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("poller.rs");
+        const BORNE: &str = "mod position_publiee_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    #[test]
+    fn l_evenement_position_porte_la_valeur_retenue_par_la_garde() {
+        let code = code_de_production();
+        assert!(
+            code.contains("let publiee = self.playback.update_position(zone_id, reported).await;"),
+            "le sondeur doit RECUEILLIR la position retenue par la garde de \
+             monotonie (#3229)."
+        );
+        assert!(
+            code.contains("self.playback.emit_position(zone_id, publiee);"),
+            "l'évènement `position` doit porter la valeur retenue, pas la valeur \
+             brute du renderer : sinon l'écran recule quand même et l'état de \
+             zone le contredit (#3229)."
+        );
+        assert!(
+            !code.contains("self.playback.emit_position(zone_id, reported);"),
+            "la valeur brute est revenue dans l'évènement `position` (#3229)."
         );
     }
 }

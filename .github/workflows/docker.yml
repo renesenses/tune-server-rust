@@ -1,23 +1,65 @@
 name: Docker
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      version:
+        description: Version sans le prefixe v
+        required: true
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
   workflow_dispatch:
+    inputs:
+      version:
+        description: Version sans le prefixe v
+        required: true
+        type: string
 
 env:
   REGISTRY: docker.io
   IMAGE_NAME: renesenses/tune
+  TUNE_VERSION: ${{ inputs.version }}
 
 jobs:
   build-and-push:
     name: Build & Push (multi-arch)
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verifier la ref et lire le manifeste
+        id: train
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          VERSION="$RELEASE_VERSION"
+          [ "$GITHUB_REF" = "refs/tags/v$VERSION" ] || {
+            echo "::error::ce workflow doit etre lance sur refs/tags/v$VERSION"
+            exit 1
+          }
+          PLAN=".release/v$VERSION.json"
+          test -f "$PLAN" || { echo "::error::manifeste absent: $PLAN"; exit 1; }
+          WEB_SHA="$(jq -r '.components.web.sha' "$PLAN")"
+          [[ "$WEB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA web invalide"; exit 1; }
+          {
+            echo "version=v$VERSION"
+            echo "web_sha=$WEB_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: renesenses/tune-web-client
+          ref: ${{ steps.train.outputs.web_sha }}
+          path: _web
 
       # Compile the binaries on the host, not inside an emulated arm64 image:
       # amd64 native + arm64 via `cross` (same proven path as release.yml). QEMU
@@ -40,24 +82,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          else
-            echo "version=dev" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Set TUNE_VERSION from git tag
-        run: echo "TUNE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-
       - name: Build web client
         run: |
-          # Mirror the server branch topology: RC tags build the web client's
-          # release/v0.9 (0.9.x), everything else its main (v0.8.x).
-          WEB_BRANCH="${{ contains(github.ref_name, '-rc') && 'release/v0.9' || 'main' }}"
-          git clone --depth 1 -b "$WEB_BRANCH" https://github.com/renesenses/tune-web-client.git _web
           cd _web && npm ci && npm run build && cd ..
           rm -rf web && mv _web/dist web
           rm -rf _web
@@ -130,28 +156,31 @@ jobs:
             sleep 20
           done
           cargo install --git https://github.com/renesenses/airplay2-rs \
-            --rev d87396a07ea8c3e16aa1d0525f5ef6d1a7626686 \
+            --rev a7d7ad6637507eaedd61de7461574adfb7b0a987 \
             airplay-daemon --root /tmp/ap --locked
           cp /tmp/ap/bin/airplay-daemon dist/amd64/airplay-daemon
           touch dist/arm64/airplay-daemon
 
-      - uses: docker/build-push-action@v6
+      - id: image
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.dist
           platforms: linux/amd64,linux/arm64
-          # Only push on a real tag. A manual workflow_dispatch (e.g. to validate
-          # the multi-arch build) still builds BOTH platforms but doesn't push,
-          # so it can't clobber the `latest` tag with a "dev" image.
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ !contains(github.ref_name, '-') && format('{0}:latest', env.IMAGE_NAME) || '' }}
+          # Le tag de staging n'est consomme par aucun canal stable. La
+          # promotion le recopie ensuite par digest, sans reconstruire.
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:staging-${{ steps.train.outputs.version }}
           labels: |
             org.opencontainers.image.title=Tune Server
             org.opencontainers.image.description=Music server for audiophiles — DLNA, Chromecast, streaming services
             org.opencontainers.image.vendor=Mozaik Labs
             org.opencontainers.image.source=https://github.com/renesenses/tune-server-rust
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ steps.train.outputs.version }}
           cache-from: type=gha,scope=docker-v2
           cache-to: type=gha,scope=docker-v2,mode=max
+
+      - name: Attester le digest staged
+        run: |
+          test -n "${{ steps.image.outputs.digest }}"
+          echo "Docker staging-${{ steps.train.outputs.version }} = ${{ steps.image.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

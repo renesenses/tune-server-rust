@@ -247,6 +247,14 @@ async fn sso_callback(
         .set_account_premium(user.premium, user.license_expires_at.clone())
         .await;
 
+    // Droits de MODULE payants (SKU distincts du palier, ex. la sortie
+    // Diretta). Ils voyagent avec le compte, jamais avec la clé : sans cet
+    // appel, `set_modules` n'avait qu'un seul appelant — le battement de fond
+    // (`background.rs`, HEARTBEAT_INTERVAL = 1 h). Un compte qui vient d'être
+    // lié s'entendait donc répondre « module_not_owned / purchase_module »
+    // pendant une heure pour un module qu'il possède (#2138).
+    state.license.set_modules(user.modules.clone()).await;
+
     // Qobuz endpoint order (founder flag): persist and push into the live
     // QobuzService so the order applies without a restart.
     state
@@ -421,6 +429,7 @@ async fn marketplace_list(State(state): State<AppState>) -> Json<Value> {
 async fn marketplace_install(
     Path(name): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
@@ -465,7 +474,7 @@ async fn marketplace_install(
         }
         Err(e) => {
             warn!(plugin = %name, error = %e, "marketplace_install_failed");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response()
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
         }
     }
 }
@@ -478,6 +487,7 @@ struct VoteRequest {
 async fn marketplace_vote(
     Path(name): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<VoteRequest>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -486,7 +496,9 @@ async fn marketplace_vote(
 
     match mp.vote(&name, body.up).await {
         Ok(()) => Json(json!({"name": name, "voted": true, "up": body.up})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
+        }
     }
 }
 
@@ -502,6 +514,7 @@ struct ArtistImageReport {
 
 async fn report_artist_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<ArtistImageReport>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -515,7 +528,9 @@ async fn report_artist_image(
     .await
     {
         Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
+        }
     }
 }
 
@@ -533,6 +548,7 @@ struct CoverSubmitRequest {
 
 async fn submit_community_cover(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CoverSubmitRequest>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -572,7 +588,7 @@ async fn submit_community_cover(
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => {
             warn!(error = %e, "community_cover_submit_failed");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response()
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
         }
     }
 }
@@ -584,6 +600,7 @@ struct CoverSyncRequest {
 
 async fn sync_community_covers(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CoverSyncRequest>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
@@ -601,7 +618,12 @@ async fn sync_community_covers(
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "community_covers_sync_failed");
-                return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
+                return crate::routes::cloud_error::reponse(
+                    &e,
+                    &headers,
+                    StatusCode::BAD_GATEWAY,
+                    json!({}),
+                );
             }
         };
 
@@ -857,6 +879,33 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// POST /cloud/license/activate — enregistre la clé **et** la fait confirmer en
+/// ligne dans le même aller-retour.
+///
+/// C'est la route qu'appelle le panneau « Tune Premium License » du client web
+/// (`activateLicense()`), et la seule que ce panneau appelle au moment où
+/// l'utilisateur colle sa clé.
+///
+/// Elle se contentait de `set_license_key`, qui depuis c15dcc61 (« require
+/// online validation before Premium ») stocke la clé **en attente** — palier
+/// Free, aucune validation. La route rendait donc `tier: "free"` pour une clé
+/// parfaitement valide, et le panneau annonçait « invalide » au premier essai
+/// (#1279, Alex Campbell, licence Lifetime). Il fallait ensuite actionner
+/// « Valider » (`/cloud/license/validate`) pour obtenir l'aller-retour manquant.
+/// La route jumelle `POST /system/license` avait, elle, reçu l'appel à
+/// `validate_stored_license` dans ce même commit ; celle-ci était restée en
+/// arrière. Les deux font désormais la même chose.
+///
+/// Ce n'est pas un simple confort d'affichage : le battement de cœur, seul
+/// autre chemin qui promeut une clé en attente, ne part pas quand la télémétrie
+/// est refusée (`heartbeat_plan`, `send_heartbeat: false`). Sans validation
+/// ici, une clé posée sur une machine sans télémétrie restait en attente
+/// indéfiniment.
+///
+/// Le palier rendu est le palier **effectif** relu après validation, jamais une
+/// promesse locale : serveur de licences injoignable ou clé refusée ⇒ `pending`
+/// et Free, exactement comme avant. Aucune clé ne débloque quoi que ce soit
+/// sans confirmation en ligne.
 async fn license_activate(
     State(state): State<AppState>,
     Json(body): Json<Value>,
@@ -872,14 +921,22 @@ async fn license_activate(
     if let Err(e) = state.license.set_license_key(key).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
     }
+    let tier = validate_stored_license(&state).await;
+    let premium = tier == tune_core::license::Tier::Premium;
     let ls = state.license.license_state().await;
-    state.event_bus.emit(
-        "license.updated",
-        json!({"tier": ls.tier, "expires_at": ls.expires_at}),
-    );
+    // `validate_stored_license` a déjà émis l'événement quand le serveur de
+    // licences a tranché. On ne l'émet ici que dans le cas contraire : la clé a
+    // tout de même changé, les écoutants doivent relire le statut.
+    if !premium {
+        state.event_bus.emit(
+            "license.updated",
+            json!({"tier": ls.tier, "expires_at": ls.expires_at}),
+        );
+    }
     Json(json!({
-        "status": "activated",
+        "status": if premium { "activated" } else { "pending" },
         "tier": ls.tier,
+        "expires_at": ls.expires_at,
         "license_key": key,
     }))
     .into_response()
@@ -892,6 +949,23 @@ async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
         json!({"tier": "free", "expires_at": null}),
     );
     Json(json!({"status": "deactivated", "tier": "free"}))
+}
+
+/// URL du point de validation de licence chez mozaiklabs.fr.
+///
+/// Le réglage `mozaik_base_url` la redirige — le même réglage que le SSO, le
+/// marché de greffons et les couvertures communautaires honorent déjà partout
+/// dans ce fichier. L'URL était la seule de cloud.rs à rester en dur, ce qui
+/// rendait l'activation de licence intestable autrement qu'en appelant le
+/// serveur de licences de production.
+fn license_validate_url(settings: &SettingsRepo) -> String {
+    let base = settings
+        .get("mozaik_base_url")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://mozaiklabs.fr".to_string());
+    format!("{}/api/v1/license/validate", base.trim_end_matches('/'))
 }
 
 /// Validate the currently-stored license key against mozaiklabs.fr and apply
@@ -918,7 +992,7 @@ pub(crate) async fn validate_stored_license(state: &AppState) -> tune_core::lice
 
     let resp = state
         .http_client
-        .post("https://mozaiklabs.fr/api/v1/license/validate")
+        .post(license_validate_url(&settings))
         .timeout(std::time::Duration::from_secs(10))
         .json(&payload)
         .send()
@@ -990,7 +1064,7 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
 
     let resp = match state
         .http_client
-        .post("https://mozaiklabs.fr/api/v1/license/validate")
+        .post(license_validate_url(&settings))
         .timeout(std::time::Duration::from_secs(10))
         .json(&payload)
         .send()

@@ -497,15 +497,17 @@ mod tests {
         let pcm = sine_stereo_i16(44100, seconds);
         let m4a = encode_aac_m4a(&pcm, 2, 44100, 192_000).expect("encode");
 
-        let dir = std::env::temp_dir().join(format!("tune-aac-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Jumeau du défaut #2864 : `tune-aac-test-{pid}/rt.m4a` était fixe.
+        // Un seul test l'écrivait aujourd'hui, mais le prochain cas ajouté
+        // ici aurait visé le même fichier — c'est exactement comme ça que
+        // l'ALAC a fini instable.
+        let dir = crate::test_scratch::scratch_dir("tune-aac-test");
         let path = dir.join("rt.m4a");
         std::fs::write(&path, &m4a).unwrap();
 
         let decoded =
             crate::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, f64::MAX)
                 .expect("decode back");
-        let _ = std::fs::remove_file(&path);
 
         assert_eq!(decoded.sample_rate, 44100);
         assert_eq!(decoded.channels, 2);

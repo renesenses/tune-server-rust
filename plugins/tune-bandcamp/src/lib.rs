@@ -48,6 +48,15 @@ use serde_json::{Value, json};
 use tune_core::event_bus::TuneEvent;
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
+/// Bandcamp vu par le registre des services de streaming (#2702, #2778).
+///
+/// Le greffon monte des ROUTES ; l'adaptateur inscrit Bandcamp dans
+/// `AppState::services`, seul endroit d'où les routes de file savent tirer un
+/// album entier. Deux faces du même service, un seul extracteur de page.
+pub mod service;
+
+pub use service::BandcampService;
+
 const BC_SEARCH_API: &str = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic";
 const BC_DISCOVER_API: &str = "https://bandcamp.com/api/discover/3/get_web";
 
@@ -145,9 +154,9 @@ fn routes_publiques() -> Router<()> {
         .route("/tag/{tag}", get(bc_tag_releases))
 }
 
-/// Réponse d'erreur commune aux trois appels sortants.
+/// Réponse d'erreur commune aux appels sortants.
 ///
-/// Les trois faisaient le même `match` de six lignes ; le factoriser évite
+/// Ils faisaient tous le même `match` de six lignes ; le factoriser évite
 /// qu'une amélioration n'atterrisse que dans l'un d'eux.
 fn passerelle_en_echec(detail: String) -> axum::response::Response {
     (StatusCode::BAD_GATEWAY, Json(json!({ "error": detail }))).into_response()
@@ -330,6 +339,147 @@ struct SearchQuery {
     q: String,
 }
 
+/// Le plafond de `autocomplete_elastic`, **mesuré** le 31/08/2026 et non
+/// supposé : **50 résultats par réponse**, quel que soit le filtre.
+///
+/// Ce n'est pas le même cas que Qobuz (#2867/PR #2983), où le seuil de 500 se
+/// franchissait à l'`offset`. Ici il n'y a **rien à paginer** : sondées le
+/// 31/08/2026, treize clés de volume ou de curseur — `size`, `limit`, `num`,
+/// `count`, `n`, `from`, `offset`, `page`, `start`, `page_size`, `per_page`,
+/// `results_per_page`, `rows` — font toutes rendre **zéro** résultat, tout
+/// comme une clé absurde (`zzzznimportequoi`) prise pour témoin de méthode :
+/// l'API refuse en bloc toute clé hors de sa liste blanche. `full_page: true`
+/// ne change rien non plus. Reprendre le `detail_pagine` de la #2983 ici
+/// n'aurait donc rien eu à quoi s'accrocher.
+const BC_PLAFOND_RECHERCHE: usize = 50;
+
+/// Les trois onglets de l'écran, et le `search_filter` que Bandcamp attend
+/// pour chacun. `b` = *band* (artiste), `a` = album, `t` = piste — c'est aussi
+/// la valeur du champ `type` de chaque résultat rendu.
+const ONGLETS_RECHERCHE: [(&str, &str); 3] = [("b", "artistes"), ("a", "albums"), ("t", "pistes")];
+
+/// Un résultat de recherche, réduit aux champs que l'écran lit.
+fn resultat_normalise(r: &Value) -> Value {
+    json!({
+        "id": r.get("id"),
+        "titre": r.get("name"),
+        "artiste": r.get("band_name"),
+        "url": r.get("item_url_path").or_else(|| r.get("item_url_root")),
+        "pochette": pochette_de_resultat(r),
+        "lieu": r.get("location"),
+        "album": r.get("album_name"),
+    })
+}
+
+/// Une catégorie, demandée à Bandcamp pour elle seule.
+///
+/// `filtre` est passé en `search_filter` : c'est ce qui réserve les 50 places
+/// de la réponse à ce seul genre. Le filtrage sur `type` qui suit n'est pas
+/// redondant — Bandcamp glisse d'autres genres (`f` pour un fan, `p` pour une
+/// page) dans une réponse filtrée, et l'ancien code les écartait déjà.
+async fn chercher_une_categorie(
+    api: &str,
+    texte: &str,
+    filtre: &str,
+) -> Result<Vec<Value>, String> {
+    let client = tune_core::http::client::shared();
+    let reponse = client
+        .post(api)
+        .json(&json!({
+            "search_text": texte,
+            "search_filter": filtre,
+            "full_page": false,
+            "fan_id": null,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !reponse.status().is_success() {
+        let status = reponse.status();
+        let corps = reponse.text().await.unwrap_or_default();
+        return Err(format!("HTTP {status}: {corps}"));
+    }
+
+    let brut: Value = reponse.json().await.map_err(|e| e.to_string())?;
+    Ok(brut
+        .get("auto")
+        .and_then(|a| a.get("results"))
+        .and_then(|r| r.as_array())
+        .map(|rs| {
+            rs.iter()
+                .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some(filtre))
+                .map(resultat_normalise)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// La recherche des trois onglets, **une requête par onglet**.
+///
+/// C'est le correctif de la #3003. Avec `search_filter: ""`, Bandcamp
+/// distribue ses 50 places entre artistes, albums et pistes selon SA
+/// pertinence : sur `somebody`, mesuré le 31/08/2026, cela donnait 26
+/// artistes, 24 albums et **zéro piste** — alors que la même requête en
+/// `search_filter: "t"` en rend 50. Un onglet vide ne voulait donc pas dire
+/// « Bandcamp n'a rien », mais « les deux autres onglets ont tout pris ».
+///
+/// Répartition retenue : **chaque onglet a son propre budget de 50**, jamais
+/// pris sur celui des voisins. Ce qu'elle coûte : trois allers-retours HTTP au
+/// lieu d'un — mais lancés **ensemble** (`tokio::join!`), donc une latence de
+/// la plus lente des trois et non de leur somme. Trois fois le trafic pour
+/// jusqu'à trois fois les résultats, et surtout aucune éviction.
+///
+/// Dégradation : un onglet qui échoue ne fait pas tomber les deux autres, il
+/// arrive vide et se nomme dans `degrade`. Les trois en échec rendent
+/// l'erreur, comme avant.
+async fn recherche_repartie(api: &str, texte: &str) -> Result<Value, String> {
+    let (art, alb, pis) = tokio::join!(
+        chercher_une_categorie(api, texte, ONGLETS_RECHERCHE[0].0),
+        chercher_une_categorie(api, texte, ONGLETS_RECHERCHE[1].0),
+        chercher_une_categorie(api, texte, ONGLETS_RECHERCHE[2].0),
+    );
+
+    let mut sortie = json!({
+        "q": texte,
+        "qualite": BC_STREAM_QUALITY,
+        "lossless": false,
+    });
+    let mut degrade = Vec::new();
+    let mut tronques = Vec::new();
+    let mut echecs = Vec::new();
+
+    for (issue, (_, onglet)) in [art, alb, pis].into_iter().zip(ONGLETS_RECHERCHE) {
+        match issue {
+            Ok(items) => {
+                // Bandcamp ne rend ni `total` ni `has_more` : une réponse
+                // PLEINE est le seul indice de troncature dont on dispose.
+                // Le dire vaut mieux que couper en silence — c'est le défaut
+                // que la #3003 reproche, autant que le quota lui-même.
+                if items.len() >= BC_PLAFOND_RECHERCHE {
+                    tronques.push(onglet);
+                }
+                sortie[onglet] = Value::Array(items);
+            }
+            Err(e) => {
+                tracing::warn!("bandcamp_recherche_onglet_en_echec onglet={onglet} erreur={e}");
+                echecs.push(e);
+                degrade.push(onglet);
+                sortie[onglet] = Value::Array(Vec::new());
+            }
+        }
+    }
+
+    if degrade.len() == ONGLETS_RECHERCHE.len() {
+        return Err(echecs.join(" ; "));
+    }
+
+    sortie["degrade"] = json!(degrade);
+    sortie["tronques"] = json!(tronques);
+    sortie["plafond_par_onglet"] = json!(BC_PLAFOND_RECHERCHE);
+    Ok(sortie)
+}
+
 /// Recherche Bandcamp.
 ///
 /// **POST**, et non GET : `autocomplete_elastic` répond 404 à un GET, ce qui
@@ -337,61 +487,10 @@ struct SearchQuery {
 /// contre l'API réelle avant réécriture — les deux erreurs venaient d'une
 /// signature supposée et jamais vérifiée.
 async fn bc_search(Query(q): Query<SearchQuery>) -> impl IntoResponse {
-    let client = tune_core::http::client::shared();
-    let resp = client
-        .post(BC_SEARCH_API)
-        .json(&json!({
-            "search_text": q.q,
-            "search_filter": "",
-            "full_page": false,
-            "fan_id": null,
-        }))
-        .send()
-        .await;
-
-    let brut = match json_sortant(resp).await {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    let resultats = brut
-        .get("auto")
-        .and_then(|a| a.get("results"))
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    // Bandcamp mélange les trois genres dans une seule liste, distingués par
-    // `type`. Les séparer ici plutôt que dans l'écran : c'est une convention
-    // de leur API, pas une affaire d'affichage.
-    let (mut artistes, mut albums, mut pistes) = (vec![], vec![], vec![]);
-    for r in &resultats {
-        let commun = json!({
-            "id": r.get("id"),
-            "titre": r.get("name"),
-            "artiste": r.get("band_name"),
-            "url": r.get("item_url_path").or_else(|| r.get("item_url_root")),
-            "pochette": pochette_de_resultat(r),
-            "lieu": r.get("location"),
-            "album": r.get("album_name"),
-        });
-        match r.get("type").and_then(|t| t.as_str()) {
-            Some("b") => artistes.push(commun),
-            Some("a") => albums.push(commun),
-            Some("t") => pistes.push(commun),
-            _ => {}
-        }
+    match recherche_repartie(BC_SEARCH_API, &q.q).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => passerelle_en_echec(e),
     }
-
-    Json(json!({
-        "q": q.q,
-        "artistes": artistes,
-        "albums": albums,
-        "pistes": pistes,
-        "qualite": BC_STREAM_QUALITY,
-        "lossless": false,
-    }))
-    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -573,23 +672,45 @@ struct AlbumQuery {
     url: String,
 }
 
-/// `GET /album?url=…` — résout une page Bandcamp en album jouable.
+/// Pourquoi la résolution d'un album a échoué.
 ///
-/// Query et non segment de chemin : une adresse Bandcamp contient des `/` et
-/// ne tient pas dans un `{id}`.
-async fn bc_album_par_url(Query(q): Query<AlbumQuery>) -> impl IntoResponse {
-    if !q.url.starts_with("https://") || !q.url.contains("bandcamp.com") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "url must be an https bandcamp.com address",
-            })),
-        )
-            .into_response();
+/// Deux natures, et pas une chaîne unique, parce que les deux appelants n'en
+/// font pas la même chose : la route rend **400** sur une adresse mal formée
+/// et **502** sur un échec de la passerelle, et cette distinction existait
+/// avant d'être extraite ici — la perdre dégraderait la route.
+pub(crate) enum EchecAlbum {
+    /// L'adresse n'est pas une page Bandcamp : rien n'a été tenté.
+    UrlInvalide(String),
+    /// L'appel sortant, ou la page rendue, n'a pas donné d'album.
+    Passerelle(String),
+}
+
+impl EchecAlbum {
+    /// Le message, quelle que soit la nature — ce que les appelants qui ne
+    /// distinguent pas les deux (l'adaptateur `StreamingService`) remontent.
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::UrlInvalide(m) | Self::Passerelle(m) => m,
+        }
+    }
+}
+
+/// Résoudre une page Bandcamp en album jouable.
+///
+/// Extrait de `bc_album_par_url` **sans en changer une ligne de logique** : la
+/// route en reste l'appelant, et l'adaptateur `StreamingService` (#2702) en
+/// devient le second. Ce corps est le SEUL endroit qui sait lire une page
+/// Bandcamp ; le dupliquer côté adaptateur aurait fait deux extracteurs à
+/// maintenir, dont un seul aurait reçu le prochain correctif de `data-tralbum`.
+pub(crate) async fn album_depuis_url(url: &str) -> Result<Value, EchecAlbum> {
+    if !url.starts_with("https://") || !url.contains("bandcamp.com") {
+        return Err(EchecAlbum::UrlInvalide(
+            "url must be an https bandcamp.com address".into(),
+        ));
     }
     let client = tune_core::http::client::shared();
     let reponse = client
-        .get(&q.url)
+        .get(url)
         // Bandcamp rend une page réduite, sans `data-tralbum`, à un client
         // qui ne s'annonce pas comme un navigateur.
         .header("User-Agent", "Mozilla/5.0 (compatible; Tune)")
@@ -597,15 +718,29 @@ async fn bc_album_par_url(Query(q): Query<AlbumQuery>) -> impl IntoResponse {
         .await;
     let page = match reponse {
         Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
-        Ok(r) => return passerelle_en_echec(format!("HTTP {}", r.status())),
-        Err(e) => return passerelle_en_echec(e.to_string()),
+        Ok(r) => return Err(EchecAlbum::Passerelle(format!("HTTP {}", r.status()))),
+        Err(e) => return Err(EchecAlbum::Passerelle(e.to_string())),
     };
     match extraire_tralbum(&page) {
-        Some(t) => Json(album_jouable(&t)).into_response(),
-        None => passerelle_en_echec(
+        Some(t) => Ok(album_jouable(&t)),
+        None => Err(EchecAlbum::Passerelle(
             "page Bandcamp sans bloc `data-tralbum` — la page a changé, ou ce n'est pas un album"
                 .into(),
-        ),
+        )),
+    }
+}
+
+/// `GET /album?url=…` — résout une page Bandcamp en album jouable.
+///
+/// Query et non segment de chemin : une adresse Bandcamp contient des `/` et
+/// ne tient pas dans un `{id}`.
+async fn bc_album_par_url(Query(q): Query<AlbumQuery>) -> impl IntoResponse {
+    match album_depuis_url(&q.url).await {
+        Ok(album) => Json(album).into_response(),
+        Err(EchecAlbum::UrlInvalide(m)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": m }))).into_response()
+        }
+        Err(EchecAlbum::Passerelle(m)) => passerelle_en_echec(m),
     }
 }
 
@@ -950,22 +1085,46 @@ struct LierBody {
     username: String,
 }
 
-/// `POST /collection/link` — mémoriser un pseudo et résoudre son `fan_id`.
+/// Pourquoi une liaison de compte a échoué.
 ///
-/// Aucun mot de passe, aucun cookie : le pseudo suffit, parce que la page de
-/// profil est publique. C'est délibéré et non une limitation subie — voir la
-/// note de portée en tête de module.
-async fn bc_lier_compte(
-    axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
-    Json(body): Json<LierBody>,
-) -> impl IntoResponse {
-    let pseudo = body.username.trim().to_string();
+/// 🔴 #2778 — la variante qui manquait est [`EchecLiaison::Ecriture`]. Les deux
+/// écritures de réglages étaient jetées par `let _ = …` : une base en lecture
+/// seule, pleine, ou verrouillée laissait la route répondre
+/// `{"linked": true}` sur un enregistrement qui n'avait PAS eu lieu. C'est
+/// exactement ce que FabienM décrit — « identifiant perdu, rien de jouable » :
+/// l'écran affichait le compte lié, `GET /collection` répondait ensuite
+/// « aucun compte Bandcamp lié », et RIEN dans le journal ne reliait les deux.
+pub(crate) enum EchecLiaison {
+    /// Pseudo vide ou contenant un `/`.
+    PseudoInvalide,
+    /// Bandcamp ne connaît pas ce profil public.
+    ProfilIntrouvable(String),
+    /// L'appel sortant a échoué, ou la page n'a pas livré de `fan_id`.
+    Passerelle(String),
+    /// Le profil a été résolu mais n'a pas pu être ÉCRIT.
+    Ecriture(String),
+}
+
+/// Le compte Bandcamp lié, tel qu'il est mémorisé.
+pub(crate) struct CompteLie {
+    pub(crate) pseudo: String,
+    pub(crate) fan_id: i64,
+}
+
+/// Résoudre un pseudo Bandcamp en `fan_id` et le mémoriser.
+///
+/// Un seul corps pour les deux appelants — la route `POST /collection/link` et
+/// `BandcampService::authenticate` (#2702). Ce qui compte ici : **aucun
+/// `Result` n'est jeté**. Les deux `SettingsRepo::set` remontent, et la
+/// réussite comme l'échec laissent une ligne de journal, parce qu'un compte
+/// « lié » qui ne l'est pas était jusqu'ici totalement muet.
+pub(crate) async fn lier_compte(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    pseudo_brut: &str,
+) -> Result<CompteLie, EchecLiaison> {
+    let pseudo = pseudo_brut.trim().to_string();
     if pseudo.is_empty() || pseudo.contains('/') {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "username invalide"})),
-        )
-            .into_response();
+        return Err(EchecLiaison::PseudoInvalide);
     }
     let client = tune_core::http::client::shared();
     let url = format!("https://bandcamp.com/{pseudo}");
@@ -977,24 +1136,116 @@ async fn bc_lier_compte(
     let page = match reponse {
         Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
         Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("aucun profil Bandcamp public pour « {pseudo} »")})),
-            )
-                .into_response();
+            tracing::warn!(pseudo = %pseudo, "bandcamp_liaison_profil_introuvable");
+            return Err(EchecLiaison::ProfilIntrouvable(format!(
+                "aucun profil Bandcamp public pour « {pseudo} »"
+            )));
         }
-        Ok(r) => return passerelle_en_echec(format!("HTTP {}", r.status())),
-        Err(e) => return passerelle_en_echec(e.to_string()),
+        Ok(r) => {
+            let detail = format!("HTTP {}", r.status());
+            tracing::warn!(pseudo = %pseudo, erreur = %detail, "bandcamp_liaison_passerelle_en_echec");
+            return Err(EchecLiaison::Passerelle(detail));
+        }
+        Err(e) => {
+            let detail = e.to_string();
+            tracing::warn!(pseudo = %pseudo, erreur = %detail, "bandcamp_liaison_passerelle_en_echec");
+            return Err(EchecLiaison::Passerelle(detail));
+        }
     };
     let Some(fan_id) = extraire_fan_id(&page) else {
-        return passerelle_en_echec(
+        tracing::warn!(pseudo = %pseudo, "bandcamp_liaison_sans_fan_id");
+        return Err(EchecLiaison::Passerelle(
             "profil trouvé mais sans fan_id — la page a changé, ou le profil est privé".into(),
-        );
+        ));
     };
-    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone());
-    let _ = reglages.set(CLE_PSEUDO, &pseudo);
-    let _ = reglages.set(CLE_FAN_ID, &fan_id.to_string());
-    Json(json!({ "username": pseudo, "fan_id": fan_id, "linked": true })).into_response()
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    // 🔴 #2778 — ces deux `?` remplacent deux `let _ = …`. Un échec d'écriture
+    // NOMME désormais la clé fautive au lieu de rendre `linked: true` sur
+    // rien.
+    for (cle, valeur) in [
+        (CLE_PSEUDO, pseudo.clone()),
+        (CLE_FAN_ID, fan_id.to_string()),
+    ] {
+        if let Err(e) = reglages.set(cle, &valeur) {
+            tracing::error!(pseudo = %pseudo, cle, erreur = %e, "bandcamp_liaison_ecriture_en_echec");
+            return Err(EchecLiaison::Ecriture(format!(
+                "compte résolu mais non mémorisé ({cle}) : {e}"
+            )));
+        }
+    }
+    tracing::info!(pseudo = %pseudo, fan_id, "bandcamp_compte_lie");
+    Ok(CompteLie { pseudo, fan_id })
+}
+
+/// Le compte lié, relu depuis les réglages.
+///
+/// `Err` = la base n'a pas répondu ; `Ok(None)` = aucun compte lié. Les deux se
+/// distinguent, alors qu'un `.ok().flatten()` les confondait : une base
+/// illisible se lisait « aucun compte Bandcamp lié », et faisait re-saisir un
+/// pseudo qui était pourtant bien enregistré (#2778).
+pub(crate) fn compte_lie(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Result<Option<CompteLie>, String> {
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    let fan_id = reglages.get(CLE_FAN_ID)?;
+    let pseudo = reglages.get(CLE_PSEUDO)?;
+    let Some(fan_id) = fan_id.as_deref().and_then(|v| v.parse::<i64>().ok()) else {
+        return Ok(None);
+    };
+    Ok(Some(CompteLie {
+        pseudo: pseudo.unwrap_or_default(),
+        fan_id,
+    }))
+}
+
+/// Oublier le compte lié. Les deux suppressions remontent, comme les écritures.
+pub(crate) fn delier_compte(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Result<(), String> {
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    for cle in [CLE_PSEUDO, CLE_FAN_ID] {
+        reglages.delete(cle).map_err(|e| {
+            tracing::error!(cle, erreur = %e, "bandcamp_deliaison_en_echec");
+            format!("compte non oublié ({cle}) : {e}")
+        })?;
+    }
+    tracing::info!("bandcamp_compte_delie");
+    Ok(())
+}
+
+/// `POST /collection/link` — mémoriser un pseudo et résoudre son `fan_id`.
+///
+/// Aucun mot de passe, aucun cookie : le pseudo suffit, parce que la page de
+/// profil est publique. C'est délibéré et non une limitation subie — voir la
+/// note de portée en tête de module.
+async fn bc_lier_compte(
+    axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
+    Json(body): Json<LierBody>,
+) -> impl IntoResponse {
+    match lier_compte(&etat.backend, &body.username).await {
+        Ok(compte) => Json(json!({
+            "username": compte.pseudo,
+            "fan_id": compte.fan_id,
+            "linked": true,
+        }))
+        .into_response(),
+        Err(EchecLiaison::PseudoInvalide) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "username invalide"})),
+        )
+            .into_response(),
+        Err(EchecLiaison::ProfilIntrouvable(m)) => {
+            (StatusCode::NOT_FOUND, Json(json!({ "error": m }))).into_response()
+        }
+        Err(EchecLiaison::Passerelle(m)) => passerelle_en_echec(m),
+        // 500 et non 502 : la panne est CHEZ NOUS, pas chez Bandcamp — et
+        // surtout, ce n'est plus un 200 `linked: true` sur du vide (#2778).
+        Err(EchecLiaison::Ecriture(m)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": m, "linked": false })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1019,41 +1270,74 @@ async fn bc_collection(
     axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
     Query(q): Query<CollectionQuery>,
 ) -> impl IntoResponse {
-    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone());
-    let fan_id = reglages
-        .get(CLE_FAN_ID)
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<i64>().ok());
-    let Some(fan_id) = fan_id else {
-        return (
-            StatusCode::PRECONDITION_REQUIRED,
-            Json(json!({
-                "error": "aucun compte Bandcamp lié",
-                "detail": "POST /collection/link avec {\"username\": \"…\"} d'abord.",
-            })),
-        )
-            .into_response();
+    // 🔴 #2778 — `.ok().flatten()` confondait « base illisible » et « aucun
+    // compte lié ». Les deux se disent maintenant séparément.
+    let fan_id = match compte_lie(&etat.backend) {
+        Ok(Some(c)) => c.fan_id,
+        Ok(None) => {
+            return (
+                StatusCode::PRECONDITION_REQUIRED,
+                Json(json!({
+                    "error": "aucun compte Bandcamp lié",
+                    "detail": "POST /collection/link avec {\"username\": \"…\"} d'abord.",
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(erreur = %e, "bandcamp_collection_reglages_illisibles");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "réglages Bandcamp illisibles",
+                    "detail": e,
+                })),
+            )
+                .into_response();
+        }
     };
     let jeton = q
         .older_than_token
         .unwrap_or_else(|| BC_JETON_DEBUT.to_string());
+    match page_de_collection(fan_id, &jeton, q.count).await {
+        Ok(brut) => Json(collection_mise_en_forme(&brut, fan_id)).into_response(),
+        Err(e) => passerelle_en_echec(e),
+    }
+}
+
+/// Une page brute de la collection d'un acheteur.
+///
+/// Extraite pour que `bc_collection` et `BandcampService::get_user_albums`
+/// (#2778) tirent la MÊME page : un seul appel sortant à maintenir, et la
+/// collection devient jouable par la route de file standard.
+pub(crate) async fn page_de_collection(
+    fan_id: i64,
+    jeton: &str,
+    count: u32,
+) -> Result<Value, String> {
     let client = tune_core::http::client::shared();
     let reponse = client
         .post(BC_COLLECTION_API)
         .json(&json!({
             "fan_id": fan_id,
             "older_than_token": jeton,
-            "count": q.count.clamp(1, 100),
+            "count": count.clamp(1, 100),
         }))
         .send()
         .await;
-    let brut: Value = match reponse {
-        Ok(r) if r.status().is_success() => r.json().await.unwrap_or(json!({})),
-        Ok(r) => return passerelle_en_echec(format!("HTTP {}", r.status())),
-        Err(e) => return passerelle_en_echec(e.to_string()),
-    };
-    Json(collection_mise_en_forme(&brut, fan_id)).into_response()
+    match reponse {
+        Ok(r) if r.status().is_success() => Ok(r.json().await.unwrap_or(json!({}))),
+        Ok(r) => {
+            let detail = format!("HTTP {}", r.status());
+            tracing::warn!(fan_id, erreur = %detail, "bandcamp_collection_en_echec");
+            Err(detail)
+        }
+        Err(e) => {
+            let detail = e.to_string();
+            tracing::warn!(fan_id, erreur = %detail, "bandcamp_collection_en_echec");
+            Err(detail)
+        }
+    }
 }
 
 /// Mettre une page de collection en forme pour un client Tune.
@@ -1085,6 +1369,67 @@ fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
         "more_available": brut["more_available"].as_bool().unwrap_or(false),
         "last_token": brut["last_token"],
     })
+}
+
+#[cfg(test)]
+mod garde_de_site_ecritures {
+    /// 🔴 #2778 — aucune écriture de réglage n'est jetée sur le chemin de
+    /// liaison.
+    ///
+    /// Garde de SITE, et non d'unité : le défaut de FabienM n'était pas une
+    /// valeur mal calculée, c'était `let _ = reglages.set(…)` deux fois de
+    /// suite. Une base en lecture seule, pleine ou verrouillée laissait la
+    /// route répondre `{"linked": true}` sur un enregistrement qui n'avait pas
+    /// eu lieu, et RIEN n'en restait — ni dans la réponse, ni au journal. Un
+    /// test d'unité sur `lier_compte` resterait vert pendant qu'un `let _ =`
+    /// réintroduit ailleurs rejouerait exactement la panne ; c'est la SOURCE
+    /// qu'il faut tenir. Même idiome que `terminologie_eq.rs` et
+    /// `position_publiee_guard`.
+    ///
+    /// Sabotage : remettre `let _ = reglages.set(CLE_PSEUDO, &pseudo);` dans
+    /// `lier_compte` fait tomber ce test.
+    #[test]
+    fn aucun_resultat_de_reglage_n_est_jete() {
+        let source = include_str!("lib.rs");
+        let fautifs: Vec<(usize, &str)> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let l = l.trim_start();
+                // `let _ = <quelque chose>.set(` / `.delete(` : une écriture
+                // de réglage dont le `Result` part à la poubelle.
+                l.starts_with("let _ =") && (l.contains(".set(") || l.contains(".delete("))
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            fautifs.is_empty(),
+            "un `Result` d'écriture de réglage est jeté — la liaison Bandcamp \
+             redeviendrait muette (#2778) : {fautifs:?}"
+        );
+    }
+
+    /// Le chemin de liaison LAISSE UNE TRACE, en réussite comme en échec.
+    ///
+    /// Il n'y avait qu'UNE seule ligne de journal dans tout le fichier, et
+    /// elle portait sur la recherche. Un échec de liaison ne s'écrivait nulle
+    /// part : impossible de dire à FabienM pourquoi son compte n'était pas
+    /// mémorisé.
+    #[test]
+    fn le_chemin_de_liaison_se_journalise() {
+        let source = include_str!("lib.rs");
+        for evenement in [
+            "bandcamp_compte_lie",
+            "bandcamp_liaison_ecriture_en_echec",
+            "bandcamp_liaison_passerelle_en_echec",
+            "bandcamp_liaison_profil_introuvable",
+        ] {
+            assert!(
+                source.contains(evenement),
+                "le journal doit nommer `{evenement}` (#2778)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1495,6 +1840,253 @@ mod tests {
         assert_eq!(decoder_entites("&quot;a&quot;"), "\"a\"");
         assert_eq!(decoder_entites("d&#39;ici"), "d'ici");
         assert_eq!(decoder_entites("a &lt;b&gt; c"), "a <b> c");
+    }
+}
+
+/// Les trois onglets ne se partagent plus 50 places (#3003).
+///
+/// Aucun de ces essais ne touche Bandcamp : ils parlent à un serveur simulé
+/// lié sur `127.0.0.1:0` qui reproduit le contrat **mesuré le 31/08/2026** —
+/// `search_filter: ""` distribue 50 places entre les genres selon la
+/// pertinence, un `search_filter` nommé rend 50 résultats de ce seul genre, et
+/// aucune clé de volume ou de curseur n'est acceptée. Le simulé **journalise
+/// les `search_filter` reçus** : la preuve porte sur la requête CONSTRUITE et
+/// sur l'assemblage des trois réponses, jamais sur l'amont réel.
+#[cfg(test)]
+mod tests_repartition_recherche {
+    use super::*;
+    use axum::routing::post;
+    use std::sync::{Arc, Mutex};
+
+    /// Les `search_filter` reçus par le simulé, dans l'ordre d'arrivée.
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    /// Un résultat tel que Bandcamp le rend, réduit aux champs lus.
+    fn resultat(genre: &str, n: usize) -> Value {
+        json!({
+            "type": genre,
+            "id": n,
+            "name": format!("{genre}-{n}"),
+            "band_name": "Un artiste",
+            "item_url_path": format!("https://x.bandcamp.com/{genre}/{n}"),
+            "art_id": 4214215264_i64,
+            "location": "Dijon",
+            "album_name": "Un album",
+        })
+    }
+
+    /// Le contrat mesuré, en une fonction.
+    ///
+    /// `filtre` vide : 50 places distribuées `b`/`a` par la pertinence de
+    /// Bandcamp, **et zéro `t`** — c'est le cas `somebody` du ticket, celui
+    /// qui vidait l'onglet Pistes. Filtre nommé : 50 de ce genre, plafonnés
+    /// par ce que le catalogue simulé contient (`dispo`).
+    fn reponse_simulee(filtre: &str, dispo: &std::collections::HashMap<String, usize>) -> Value {
+        let items: Vec<Value> = if filtre.is_empty() {
+            let b = 26.min(*dispo.get("b").unwrap_or(&0));
+            let a = (BC_PLAFOND_RECHERCHE - b).min(*dispo.get("a").unwrap_or(&0));
+            (0..b)
+                .map(|n| resultat("b", n))
+                .chain((0..a).map(|n| resultat("a", n)))
+                .collect()
+        } else {
+            let n = (*dispo.get(filtre).unwrap_or(&0)).min(BC_PLAFOND_RECHERCHE);
+            (0..n).map(|i| resultat(filtre, i)).collect()
+        };
+        json!({ "auto": { "results": items, "time_ms": 3 } })
+    }
+
+    /// Un Bandcamp simulé. `dispo` dit combien d'items existent par genre.
+    ///
+    /// Rend l'URL COMPLÈTE du point d'entrée, chemin compris : si le code
+    /// visait le mauvais chemin, aucune route ne répondrait.
+    async fn bandcamp_simule(dispo: Vec<(&str, usize)>) -> (String, Journal) {
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let dispo: std::collections::HashMap<String, usize> =
+            dispo.into_iter().map(|(g, n)| (g.to_string(), n)).collect();
+
+        let j = journal.clone();
+        let app = Router::new().route(
+            "/api/bcsearch_public_api/1/autocomplete_elastic",
+            post(move |Json(corps): Json<Value>| {
+                let (j, dispo) = (j.clone(), dispo.clone());
+                async move {
+                    let filtre = corps
+                        .get("search_filter")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    j.lock().expect("verrou d'essai").push(filtre.clone());
+                    Json(reponse_simulee(&filtre, &dispo))
+                }
+            }),
+        );
+
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (
+            format!("http://{adresse}/api/bcsearch_public_api/1/autocomplete_elastic"),
+            journal,
+        )
+    }
+
+    fn compte(v: &Value, onglet: &str) -> usize {
+        v[onglet].as_array().expect("onglet présent").len()
+    }
+
+    /// L'ANCIEN code, reproduit tel quel pour servir de contre-épreuve.
+    ///
+    /// Une requête à `search_filter: ""`, puis répartition des résultats par
+    /// leur champ `type` — c'est exactement ce que faisait `bc_search` avant
+    /// la #3003. Le garder ici rend la comparaison vérifiable au lieu d'être
+    /// affirmée : les deux voies parlent au MÊME serveur simulé.
+    async fn ancienne_recherche(api: &str) -> (usize, usize, usize) {
+        let client = tune_core::http::client::shared();
+        let brut: Value = client
+            .post(api)
+            .json(&json!({
+                "search_text": "somebody",
+                "search_filter": "",
+                "full_page": false,
+                "fan_id": null,
+            }))
+            .send()
+            .await
+            .expect("simulé")
+            .json()
+            .await
+            .expect("json");
+        let rs = brut["auto"]["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let genre = |g: &str| rs.iter().filter(|r| r["type"].as_str() == Some(g)).count();
+        (genre("b"), genre("a"), genre("t"))
+    }
+
+    /// LE défaut de la #3003, sur le cas mesuré du ticket.
+    ///
+    /// Bandcamp a 60 artistes, 80 albums et 200 pistes pour ce mot-clé. Avec
+    /// l'ancienne requête à filtre vide, les 50 places allaient à 26 artistes
+    /// + 24 albums et **l'onglet Pistes arrivait vide**. Chaque onglet a
+    /// désormais son propre budget.
+    #[tokio::test]
+    async fn les_trois_onglets_ne_se_partagent_plus_cinquante_places() {
+        let (api, journal) = bandcamp_simule(vec![("b", 60), ("a", 80), ("t", 200)]).await;
+
+        // ROUGE — l'ancien code, contre le MÊME serveur simulé.
+        let (b, a, t) = ancienne_recherche(&api).await;
+        assert_eq!((b, a, t), (26, 24, 0), "les 50 places, partagées");
+        assert_eq!(b + a + t, BC_PLAFOND_RECHERCHE, "un seul budget pour trois");
+        assert_eq!(
+            journal.lock().expect("verrou d'essai").clone(),
+            vec!["".to_string()],
+            "une requête, à filtre vide"
+        );
+        journal.lock().expect("verrou d'essai").clear();
+
+        // VERT — le correctif.
+
+        let v = recherche_repartie(&api, "somebody").await.expect("simulé");
+
+        assert_eq!(compte(&v, "artistes"), 50);
+        assert_eq!(compte(&v, "albums"), 50);
+        assert_eq!(
+            compte(&v, "pistes"),
+            50,
+            "avant le correctif : 0 piste, évincées par les deux autres onglets"
+        );
+
+        let mut vus = journal.lock().expect("verrou d'essai").clone();
+        vus.sort();
+        assert_eq!(
+            vus,
+            vec!["a".to_string(), "b".to_string(), "t".to_string()],
+            "une requête filtrée par onglet, et aucune à filtre vide"
+        );
+    }
+
+    /// TÉMOIN anti-régression : une recherche qui tient dans une page rend
+    /// exactement ce qu'elle rendait, sans onglet perdu ni champ changé.
+    ///
+    /// 3 + 4 + 5 = 12 résultats, très en dessous de 50 : rien n'est tronqué,
+    /// rien n'est dégradé, et les champs de chaque entrée sont ceux d'avant.
+    #[tokio::test]
+    async fn une_recherche_courte_rend_la_meme_chose() {
+        let (api, journal) = bandcamp_simule(vec![("b", 3), ("a", 4), ("t", 5)]).await;
+
+        let v = recherche_repartie(&api, "mot rare").await.expect("simulé");
+
+        assert_eq!(compte(&v, "artistes"), 3);
+        assert_eq!(compte(&v, "albums"), 4);
+        assert_eq!(compte(&v, "pistes"), 5);
+        assert_eq!(v["q"], "mot rare");
+        assert_eq!(v["qualite"], BC_STREAM_QUALITY);
+        assert_eq!(v["lossless"], false);
+        assert_eq!(
+            v["tronques"],
+            json!([]),
+            "rien n'est plein, rien n'est coupé"
+        );
+        assert_eq!(v["degrade"], json!([]));
+
+        // Les champs d'une entrée, inchangés depuis `resultat_normalise`.
+        let a = &v["albums"][0];
+        assert_eq!(a["titre"], "a-0");
+        assert_eq!(a["artiste"], "Un artiste");
+        assert_eq!(a["url"], "https://x.bandcamp.com/a/0");
+        assert_eq!(a["album"], "Un album");
+        assert_eq!(a["lieu"], "Dijon");
+        assert_eq!(a["pochette"], "https://f4.bcbits.com/img/a4214215264_2.jpg");
+
+        assert_eq!(
+            journal.lock().expect("verrou d'essai").len(),
+            3,
+            "trois onglets, trois requêtes — le coût assumé du correctif"
+        );
+    }
+
+    /// La troncature est DITE, faute de pouvoir être franchie.
+    ///
+    /// Bandcamp ne rend ni `total` ni `has_more`, et n'accepte aucun curseur :
+    /// une réponse pleine est le seul indice disponible. Le taire est le
+    /// second grief du ticket.
+    #[tokio::test]
+    async fn un_onglet_plein_se_declare_tronque() {
+        let (api, _) = bandcamp_simule(vec![("b", 2), ("a", 999), ("t", 50)]).await;
+
+        let v = recherche_repartie(&api, "jazz").await.expect("simulé");
+
+        assert_eq!(v["plafond_par_onglet"], 50);
+        let tronques = v["tronques"].as_array().expect("liste");
+        assert!(tronques.contains(&json!("albums")));
+        assert!(tronques.contains(&json!("pistes")), "exactement 50 = plein");
+        assert!(
+            !tronques.contains(&json!("artistes")),
+            "2 résultats sur 50 : rien n'est coupé"
+        );
+    }
+
+    /// Un onglet en panne n'emporte pas les deux autres.
+    ///
+    /// C'est la contrepartie des trois requêtes : trois occasions d'échouer.
+    /// Le simulé ne connaît que le vrai chemin, donc une base pointant
+    /// ailleurs rend 404 sur les trois — les trois en échec doivent rendre
+    /// l'erreur, comme le faisait la requête unique.
+    #[tokio::test]
+    async fn trois_onglets_en_echec_rendent_l_erreur() {
+        let (api, _) = bandcamp_simule(vec![("b", 5), ("a", 5), ("t", 5)]).await;
+        let egare = api.replace("autocomplete_elastic", "chemin_inconnu");
+
+        let e = recherche_repartie(&egare, "peu importe")
+            .await
+            .expect_err("404 sur les trois");
+        assert!(e.contains("404"), "l'erreur dit ce qui s'est passé : {e}");
     }
 }
 

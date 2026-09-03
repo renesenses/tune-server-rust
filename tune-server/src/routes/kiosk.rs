@@ -3,6 +3,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -180,7 +181,7 @@ async fn kiosk_screensaver(
              ORDER BY RANDOM() LIMIT ?",
             &[&limit as &dyn tune_core::db::backend::ToSqlValue],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .map(|row| {
             json!({

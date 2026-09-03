@@ -10,10 +10,19 @@ use serde_json::{Value, json};
 use crate::state::AppState;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::profile_repo::ProfileRepo;
+use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
 
 use super::query_multi::track_filter_from_raw;
 use crate::error::AppError;
+use crate::routes::filtre_sources::FiltreSources;
+
+/// Identifiant de la passe de relecture des métadonnées au registre
+/// `background_tasks` (#2129).
+const TACHE_RESCAN_METADATA: &str = "rescan_metadata";
+
+/// Cadence de publication de l'avancement au registre.
+const JALON_AVANCEMENT_RESCAN: usize = 50;
 
 /// Build a JSON array string for the `genres` column from parsed metadata.
 fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
@@ -69,6 +78,28 @@ fn apply_metadata_to_track(
     track.disc_subtitle = m.disc_subtitle.clone();
 }
 
+/// Recopie le Dynamic Range PAR PISTE sur des pistes sérialisées (#1388).
+///
+/// Le tag `DYNAMIC RANGE` est lu au scan et rangé dans
+/// `track_metadata['dr_track']` (#1806). Depuis #2809 il ressortait sur les
+/// pistes d'un album — et sur elles SEULES : la table des titres et la fiche
+/// d'une piste, qui affichent pourtant la même ligne de qualité, sortaient
+/// nues. C'est le trou que ce chemin ferme.
+///
+/// Même clé, même contrat que sur les pistes d'un album : `dynamic_range` est
+/// ABSENTE quand la piste n'a pas le tag — jamais `null`, jamais `0`, DR0
+/// étant la mesure d'un master saturé et non une absence.
+///
+/// Une seule requête indexée par page, et aucune du tout sur une page vide
+/// (`get_key_for_tracks` court-circuite sur une liste d'identifiants vide).
+fn joindre_dr_par_piste(state: &AppState, items: Vec<tune_core::db::models::Track>) -> Vec<Value> {
+    let track_ids: Vec<i64> = items.iter().filter_map(|t| t.id).collect();
+    let dr = TrackMetadataRepo::with_backend(state.backend.clone())
+        .get_key_for_tracks("dr_track", &track_ids)
+        .unwrap_or_default();
+    super::albums::attach_track_tags(items, &[("dynamic_range", &dr)])
+}
+
 #[derive(Deserialize)]
 pub(super) struct QuickFavQuery {
     profile_id: Option<i64>,
@@ -112,25 +143,19 @@ pub(super) async fn list_tracks(
     // a SMART collection resolves to concrete track ids (its compiled rule query).
     // Manual wins on a name clash. An unknown name → empty album set → matches
     // nothing (the requested collection is simply empty).
-    let (collection_ids, collection_track_ids): (Option<Vec<i64>>, Option<Vec<i64>>) =
-        match p.collection.as_deref().filter(|s| !s.is_empty()) {
-            None => (None, None),
-            Some(name) => {
-                let album_ids = super::facets::collection_album_ids(&state, name);
-                if !album_ids.is_empty() {
-                    (Some(album_ids), None)
-                } else if let Some(track_ids) =
-                    super::facets::smart_collection_track_ids(&state, name)
-                {
-                    (None, Some(track_ids))
-                } else {
-                    (Some(Vec::new()), None)
-                }
-            }
-        };
+    //
+    // ⚠️ Résolution PARTAGÉE avec le compteur de facettes (#1864) : les deux
+    // routes doivent désigner le même ensemble, sinon le rail annonce des
+    // effectifs que cette liste ne rend pas.
+    let scope = p
+        .collection
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|name| super::facets::resolve_collection(&state, name))
+        .unwrap_or_default();
 
-    filter.collection_ids = collection_ids;
-    filter.collection_track_ids = collection_track_ids;
+    filter.collection_ids = scope.albums;
+    filter.collection_track_ids = scope.tracks;
 
     // ⚠️ `is_active()` doit rester le MIROIR EXACT des prédicats que
     // `list_filtered` va produire. S'il rend `true` sans qu'aucun prédicat ne
@@ -139,9 +164,12 @@ pub(super) async fn list_tracks(
     // que faisait `?favorite=1` avant #2168.
     if filter.is_active() {
         match repo.list_filtered(&filter, limit, offset) {
-            Ok((items, total)) => Ok(Json(
-                json!({"items": items, "total": total, "limit": limit, "offset": offset}),
-            )),
+            Ok((items, total)) => {
+                let items = joindre_dr_par_piste(&state, items);
+                Ok(Json(
+                    json!({"items": items, "total": total, "limit": limit, "offset": offset}),
+                ))
+            }
             Err(e) => {
                 tracing::error!(error = %e, "list_tracks_filtered_query_failed");
                 Ok(Json(
@@ -150,8 +178,10 @@ pub(super) async fn list_tracks(
             }
         }
     } else {
-        let total = repo.count().unwrap_or(0);
-        let items = match repo.list(limit, offset) {
+        // Même exclusion des albums masqués que le chemin facetté (#1391) :
+        // sans elle, la vue par défaut fuirait ce que la vue filtrée cache.
+        let total = repo.count_visible().unwrap_or(0);
+        let items = match repo.list_visible(limit, offset) {
             Ok(tracks) => tracks,
             Err(e) => {
                 tracing::error!(
@@ -164,6 +194,7 @@ pub(super) async fn list_tracks(
                 Vec::new()
             }
         };
+        let items = joindre_dr_par_piste(&state, items);
         Ok(Json(
             json!({"items": items, "total": total, "limit": limit, "offset": offset}),
         ))
@@ -229,7 +260,16 @@ pub(super) async fn get_track(
 ) -> impl IntoResponse {
     let repo = TrackRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(track)) => Json(json!(track)).into_response(),
+        Ok(Some(track)) => {
+            // Dynamic Range par piste (#1388) : la fiche d'une piste rend le
+            // même champ que les pistes d'un album. Sans tag, la clé reste
+            // absente et la charge utile est celle d'avant, au bit près.
+            let v = joindre_dr_par_piste(&state, vec![track])
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            Json(v).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -250,12 +290,41 @@ pub(super) async fn stream_track_audio(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let path = std::path::Path::new(file_path);
+    // La graphie du disque, pas celle de la base : sur un nom décomposé
+    // (macOS, SMB/CIFS), `metadata()` échouait et la route rendait 404 pour un
+    // fichier présent — la même piste partant pourtant sans broncher par le
+    // chemin de lecture de l'orchestrateur, qui, lui, replie déjà (#1865).
+    let file_path = tune_core::library::local_path::resolve_existing_local_path(file_path)
+        .unwrap_or_else(|| file_path.clone());
+    let path = std::path::Path::new(&file_path);
     let file_size = match tokio::fs::metadata(path).await {
         Ok(m) => m.len(),
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
+    // Seconde frontière de lecture, et la plus trompeuse (#3234). Le chemin
+    // de l'orchestrateur n'est pas le seul : c'est PAR ICI que le lecteur du
+    // navigateur et le serveur média UPnP demandent les octets. Sur un ISO
+    // SACD, `from_extension` rend `None`, le `Content-Type` retombe sur
+    // `application/octet-stream`, et la route rend un 200 parfait suivi de
+    // 4 Go d'image disque : le lecteur reste muet sans qu'aucune erreur ne
+    // soit jamais rendue.
+    //
+    // Le fichier existe et il est lisible — un 404 mentirait. Ce qui manque
+    // est un outil que Tune ne fournit pas, et le motif rendu ici est mot pour
+    // mot celui du rapport de parcours (#2992) et celui de la route de
+    // lecture, pour que l'utilisateur ne lise pas trois phrases différentes
+    // pour un seul empêchement.
+    if let Some(motif) = tune_core::audio::iso_sacd::refus_de_lecture(path) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "format_not_playable",
+                "message": motif,
+            })),
+        )
+            .into_response();
+    }
     let mime = track
         .format
         .as_deref()
@@ -304,7 +373,10 @@ pub(super) async fn rescan_track(
         return (StatusCode::BAD_REQUEST, "no file path").into_response();
     };
 
-    let meta = tune_core::metadata::read_metadata(std::path::Path::new(file_path));
+    // #1865 : le chemin stocké est en NFC, le disque peut porter le NFD.
+    let file_path = tune_core::library::local_path::resolve_existing_local_path(file_path)
+        .unwrap_or_else(|| file_path.clone());
+    let meta = tune_core::metadata::read_metadata(std::path::Path::new(&file_path));
     match meta {
         Some(m) => {
             apply_metadata_to_track(&mut track, &m);
@@ -362,9 +434,13 @@ pub(super) async fn track_all_tags(
 
     let mut result = serde_json::to_value(&track).unwrap_or_default();
 
-    // Try reading raw file tags with lofty
-    if let Some(ref path) = track.file_path {
-        if let Ok(tagged) = lofty::read_from_path(path) {
+    // Try reading raw file tags with lofty — sur la graphie du disque (#1865).
+    if let Some(path) = track
+        .file_path
+        .as_deref()
+        .and_then(tune_core::library::local_path::resolve_existing_local_path)
+    {
+        if let Ok(tagged) = lofty::read_from_path(&path) {
             let tags: Vec<Value> = tagged
                 .tags()
                 .iter()
@@ -698,6 +774,12 @@ pub(super) async fn track_waveform(
         }
     };
 
+    // Le décodeur reçoit la graphie du disque, pas celle de la base : sur les
+    // pistes dont le nom est décomposé, `generate_waveform` rendait un vecteur
+    // vide et la route répondait « file unreadable » pour un fichier qui se
+    // joue très bien (#1865).
+    let file_path = tune_core::library::local_path::resolve_existing_local_path(&file_path)
+        .unwrap_or(file_path);
     let points = tune_core::audio::analyzer::generate_waveform(&file_path, 200).await;
     if points.is_empty() {
         return Json(json!({ "track_id": id, "waveform": null, "error": "file unreadable or unsupported format" })).into_response();
@@ -719,7 +801,19 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
     let backend = state.backend.clone();
     let event_bus = state.event_bus.clone();
 
+    // Inscription au registre des tâches de fond (#2129). `rescan_metadata_status`
+    // vaut « running » pendant toute la passe, mais ce réglage ne se lit que
+    // depuis l'écran qui l'a lancée : relire les étiquettes de chaque fichier
+    // d'une bibliothèque dure longtemps, et rien ne le disait ailleurs.
+    let garde_tache = state.background_tasks.begin(
+        TACHE_RESCAN_METADATA,
+        "Relecture des métadonnées des fichiers…",
+        "maintenance",
+    );
+    let taches = state.background_tasks.clone();
+
     tokio::spawn(async move {
+        let _garde_tache = garde_tache; // libère la tâche à la fin de ce futur
         let backend_inner = backend.clone();
         let result = tokio::task::spawn_blocking(move || {
             let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend_inner.clone());
@@ -741,18 +835,41 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
             let mut updated = 0usize;
             let mut skipped = 0usize;
             let mut errors = 0usize;
+            taches.update_progress(TACHE_RESCAN_METADATA, 0, total as u64, "Métadonnées");
 
             for track in tracks {
+                // Jalon en TÊTE de boucle, pas en queue : trois branches de ce
+                // corps sortent par `continue` (pas de chemin, fichier absent,
+                // étiquettes illisibles). Placé en queue, l'avancement resterait
+                // à 0 sur une bibliothèque dont le disque est démonté — le cas
+                // où l'on a justement besoin de voir que la passe tourne.
+                // Un jalon, pas une publication par piste : le registre émet un
+                // événement WebSocket à chaque changement.
+                let traitees = updated + skipped + errors;
+                if traitees % JALON_AVANCEMENT_RESCAN == 0 {
+                    taches.update_progress(
+                        TACHE_RESCAN_METADATA,
+                        traitees as u64,
+                        total as u64,
+                        "Métadonnées",
+                    );
+                }
+
                 let Some(ref file_path) = track.file_path else {
                     skipped += 1;
                     continue;
                 };
 
-                let path = std::path::Path::new(file_path);
-                if !path.exists() {
+                // Passe de fond : sans le repli, toute une bibliothèque venue
+                // d'un Mac est comptée « sautée » et ne voit jamais ses
+                // étiquettes relues — 147 pistes sur 46 877 pour `.18` (#1865).
+                let Some(reel) =
+                    tune_core::library::local_path::resolve_existing_local_path(file_path)
+                else {
                     skipped += 1;
                     continue;
-                }
+                };
+                let path = std::path::Path::new(&reel);
 
                 let Some(meta) = tune_core::metadata::read_metadata(path) else {
                     errors += 1;
@@ -1143,6 +1260,7 @@ mod filtre_actif_tests {
             ("mood", "mood=calme"),
             ("source_media", "source_media=CD"),
             ("original_year", "original_year=1969"),
+            ("dr", "dr=14"),
             ("rating", "rating=4"),
             ("favorite", "favorite=track"),
             ("playlist", "playlist=Ma+liste"),
@@ -1196,7 +1314,40 @@ pub(super) struct VersionsParams {
     /// coeur de la demande de FabienM (« pour les curieux, proposer les
     /// versions trouvees dans les services streaming »). Le client peut le
     /// couper pour un premier rendu immediat.
+    ///
+    /// ⚠️ CONSERVE, et deliberement. `sources` ci-dessous le recouvre presque
+    /// entierement — `streaming=false` dit la meme chose que `sources=local` —
+    /// mais presque n'est pas assez : ce parametre est publie et
+    /// `tune-web-client` l'envoie a CHAQUE appel (`getTrackVersions`,
+    /// `src/lib/api.ts`, toujours `?streaming=true`). Un parametre qu'on
+    /// casse est une regression silencieuse pour qui l'appelle deja.
     streaming: Option<bool>,
+    /// D'ou viennent les versions rendues — le meme `sources` que
+    /// `GET /search` (#3226), `GET /home/other-versions` et
+    /// `GET /home/artist-releases`. Absent = « Tous », soit exactement le
+    /// comportement d'avant. Contrat complet dans
+    /// [`crate::routes::filtre_sources`].
+    ///
+    /// ## Comment il cohabite avec `streaming`
+    ///
+    /// `streaming=false` est un VETO sur la moitie streaming, jamais une
+    /// autorisation. Il ne peut que RETIRER des services, et il ne ressuscite
+    /// jamais le local. Les deux parametres commutent donc, et aucun des
+    /// appels d'aujourd'hui ne change de reponse :
+    ///
+    /// | appel                           | `versions` (local) | `streaming` |
+    /// |---------------------------------|--------------------|-------------|
+    /// | (rien)                          | rendues            | rendues     |
+    /// | `streaming=false`               | rendues            | **vide**    |
+    /// | `streaming=true`                | rendues            | rendues     |
+    /// | `sources=local`                 | rendues            | **vide**    |
+    /// | `sources=qobuz`                 | **vide**           | Qobuz seul  |
+    /// | `sources=qobuz&streaming=false` | **vide**           | **vide**    |
+    ///
+    /// Les trois premieres lignes sont mot pour mot ce que la route rendait
+    /// avant : `streaming` seul ne consulte jamais `sources`, et `sources`
+    /// absent vaut [`FiltreSources::tout`].
+    sources: Option<String>,
 }
 
 /// Rassemble les autres versions d'une piste. Rend `None` si la piste
@@ -1209,14 +1360,22 @@ pub(super) async fn rassembler_versions(
     id: i64,
     limite: i64,
     avec_streaming: bool,
+    filtre: &FiltreSources,
 ) -> Option<Value> {
     // Le morceau de reference : son titre, son artiste de piste (celui affiche
     // a l'auditeur) et l'album lui-meme. L'artiste d'album n'est qu'un repli :
     // sur une compilation « Artistes divers », le premier ferait precisement
     // perdre les versions de l'interprete reel (#2638).
+    //
+    // L'ISRC, la duree et l'annee viennent avec : ce sont les signaux qui
+    // CLASSENT les candidats (`routes::versions::score_version`). La section
+    // d'accueil ne les a pas — son vivier est `listen_history` —, cette
+    // route-ci les a, et c'est tout l'interet de partir d'une vraie ligne de
+    // `tracks`.
     let e = state.backend.engine();
     let sql = format!(
-        "SELECT t.title, COALESCE(ar2.name, ar.name, ''), COALESCE(al.title, '') \
+        "SELECT t.title, COALESCE(ar2.name, ar.name, ''), COALESCE(al.title, ''), \
+                t.isrc, t.duration_ms, al.year \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -1229,20 +1388,29 @@ pub(super) async fn rassembler_versions(
         .query_one(&sql, &[&id as &dyn ToSqlValue])
         .ok()
         .flatten()?;
-    let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
-    let artiste = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
-    let album = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+    let reference = crate::routes::versions::Reference {
+        titre: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+        artiste: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        album: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+        isrc: cols.get(3).and_then(|v| v.as_string()),
+        duree_ms: cols.get(4).and_then(|v| v.as_i64()),
+        annee: cols.get(5).and_then(|v| v.as_i64()),
+    };
 
-    let locales = crate::routes::versions::versions_locales(
-        state,
-        &titre,
-        &artiste,
-        &album,
-        Some(id),
-        limite,
-    );
+    // ⚠️ La ligne `tracks` ci-dessus est lue QUOI QU'IL ARRIVE, meme quand le
+    // local n'est pas demande : c'est l'ENTREE de la question — le titre,
+    // l'artiste, l'ISRC, la duree —, pas une reponse. Sous `sources=qobuz`,
+    // cette route doit chercher les versions Qobuz DE CETTE PISTE, pas
+    // repondre 404 parce qu'on n'a pas demande le local. Vivier n'est pas
+    // contenu.
+    let locales = if filtre.local_demande() {
+        crate::routes::versions::versions_locales(state, &reference, Some(id), limite)
+    } else {
+        // Pas « calculer puis jeter » : la requete ne part pas.
+        Vec::new()
+    };
     let streaming = if avec_streaming {
-        crate::routes::versions::versions_streaming(state, &titre, &artiste, &album).await
+        crate::routes::versions::versions_streaming(state, &reference, filtre).await
     } else {
         Vec::new()
     };
@@ -1251,9 +1419,9 @@ pub(super) async fn rassembler_versions(
     // dessine deja la section d'accueil rend celui-ci sans une ligne de plus.
     Some(json!({
         "track_id": id,
-        "title": titre,
-        "artist_name": artiste,
-        "played_album": album,
+        "title": reference.titre,
+        "artist_name": reference.artiste,
+        "played_album": reference.album,
         "versions": locales,
         "streaming": streaming,
     }))
@@ -1279,7 +1447,8 @@ pub(super) async fn track_versions(
 ) -> impl IntoResponse {
     let limite = p.limit.unwrap_or(50).clamp(1, 200);
     let avec_streaming = p.streaming.unwrap_or(true);
-    match rassembler_versions(&state, id, limite, avec_streaming).await {
+    let filtre = FiltreSources::depuis(p.sources.as_deref());
+    match rassembler_versions(&state, id, limite, avec_streaming, &filtre).await {
         Some(v) => Json(v).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -1288,6 +1457,11 @@ pub(super) async fn track_versions(
 #[cfg(test)]
 mod tests_versions_piste {
     use super::rassembler_versions;
+    // `FiltreSources::tout()` = `sources` absent = « Tous ». Ces essais
+    // portaient sur le rapprochement, pas sur la provenance : ils disent
+    // desormais explicitement qu'ils ne filtrent rien, et gardent donc le
+    // meme sens qu'avant l'ajout du parametre.
+    use crate::routes::filtre_sources::FiltreSources;
     use crate::state::AppState;
     use tune_core::db::backend::ToSqlValue;
 
@@ -1359,7 +1533,7 @@ mod tests_versions_piste {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let seed = bibliotheque_de_test(&state);
 
-        let v = rassembler_versions(&state, seed, 50, false)
+        let v = rassembler_versions(&state, seed, 50, false, &FiltreSources::tout())
             .await
             .expect("la piste existe");
 
@@ -1383,7 +1557,9 @@ mod tests_versions_piste {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let seed = bibliotheque_de_test(&state);
 
-        let v = rassembler_versions(&state, seed, 50, false).await.unwrap();
+        let v = rassembler_versions(&state, seed, 50, false, &FiltreSources::tout())
+            .await
+            .unwrap();
         let versions = v["versions"].as_array().unwrap();
         for ver in versions {
             assert_ne!(
@@ -1470,7 +1646,7 @@ mod tests_versions_piste {
         );
         piste("Running up that hill", reprise, thomas, "/reprise.flac");
 
-        let v = rassembler_versions(&state, seed, 50, false)
+        let v = rassembler_versions(&state, seed, 50, false, &FiltreSources::tout())
             .await
             .expect("la piste existe");
         assert_eq!(v["artist_name"].as_str(), Some("Kate Bush"));
@@ -1500,7 +1676,9 @@ mod tests_versions_piste {
             .and_then(|c| c.first().and_then(|v| v.as_i64()))
             .unwrap();
 
-        let v = rassembler_versions(&state, id, 50, false).await.unwrap();
+        let v = rassembler_versions(&state, id, 50, false, &FiltreSources::tout())
+            .await
+            .unwrap();
         assert_eq!(v["versions"].as_array().map(Vec::len), Some(0));
         assert_eq!(v["streaming"].as_array().map(Vec::len), Some(0));
     }
@@ -1511,9 +1689,256 @@ mod tests_versions_piste {
     async fn une_piste_inconnue_n_est_pas_un_groupe_vide() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         assert!(
-            rassembler_versions(&state, 999_999, 50, false)
+            rassembler_versions(&state, 999_999, 50, false, &FiltreSources::tout())
                 .await
                 .is_none()
         );
+    }
+
+    /// La bibliothèque de Gros Bidon (#2372, fil 1627) : le titre de base, son
+    /// remaster nommé AVEC UN TIRET comme le nomment Qobuz, Tidal et Deezer,
+    /// et — le piège — un homonyme d'un autre artiste, remasterisé lui aussi.
+    ///
+    /// Rend l'id de la piste de base.
+    fn bibliotheque_remasters(state: &AppState) -> i64 {
+        let b = &state.backend;
+        let artiste = |nom: &str| {
+            b.execute(
+                "INSERT INTO artists (name) VALUES (?1)",
+                &[&nom as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let album = |titre: &str, artiste_id: i64, annee: i64| {
+            b.execute(
+                "INSERT INTO albums (title, artist_id, year) VALUES (?1, ?2, ?3)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &artiste_id as &dyn ToSqlValue,
+                    &annee as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let piste = |titre: &str, album_id: i64, artiste_id: i64, duree: i64, isrc: &str| {
+            b.execute(
+                "INSERT INTO tracks (title, album_id, artist_id, duration_ms, isrc, file_path) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                    &artiste_id as &dyn ToSqlValue,
+                    &duree as &dyn ToSqlValue,
+                    &isrc as &dyn ToSqlValue,
+                    &format!("/{titre}-{album_id}.flac") as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+
+        let sade = artiste("Sade");
+        let autre = artiste("The Smooth Operators");
+        let diamond = album("Diamond Life", sade, 1984);
+        let ultimate = album("The Ultimate Collection", sade, 2011);
+        let ailleurs = album("Ailleurs", autre, 2011);
+
+        let base = piste("Smooth Operator", diamond, sade, 291_000, "GBAAA8400001");
+        piste(
+            "Smooth Operator - 2011 Remastered",
+            ultimate,
+            sade,
+            291_000,
+            "GBAAA8400001",
+        );
+        // L'HOMONYME : même titre, même suffixe, autre artiste. Le
+        // rapprochement local nomme l'artiste depuis #2497 — il ne doit pas
+        // sortir.
+        piste(
+            "Smooth Operator - 2011 Remastered",
+            ailleurs,
+            autre,
+            180_000,
+            "FRXXX1100001",
+        );
+        base
+    }
+
+    /// ⭐ ÉPREUVE 1 — le cas de Gros Bidon : un titre remasterisé, avec tiret,
+    /// est reconnu comme une version du titre de base.
+    ///
+    /// Avant ce lot, `titre_est_base_de` n'acceptait que ` (` et ` [` : cette
+    /// liste était VIDE, et « Autres versions » ratait la convention de
+    /// nommage la plus répandue des remasters.
+    #[tokio::test]
+    async fn un_remaster_avec_tiret_est_une_autre_version() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let base = bibliotheque_remasters(&state);
+
+        let v = rassembler_versions(&state, base, 50, false, &FiltreSources::tout())
+            .await
+            .expect("la piste existe");
+        let versions = v["versions"].as_array().expect("versions locales");
+        assert_eq!(
+            versions.len(),
+            1,
+            "une seule autre version attendue, obtenu {versions:?}"
+        );
+        assert_eq!(
+            versions[0]["title"].as_str(),
+            Some("Smooth Operator - 2011 Remastered"),
+            "le titre RETROUVÉ doit être rendu tel quel : {versions:?}"
+        );
+        assert_eq!(
+            versions[0]["album_title"].as_str(),
+            Some("The Ultimate Collection")
+        );
+    }
+
+    /// ⭐ ÉPREUVE 2 — l'artiste compte : deux morceaux de même titre par des
+    /// artistes différents ne sont pas mélangés.
+    ///
+    /// C'est la contre-épreuve du SABOTAGE : retirer la condition d'artiste de
+    /// `predicat_rapprochement` fait tomber CE test, et lui seul dit pourquoi.
+    ///
+    /// La définition retenue est écrite en toutes lettres : dans la
+    /// BIBLIOTHÈQUE, « autre version » veut dire **même titre, MÊME artiste,
+    /// autre album**. La reprise par un autre interprète n'entre pas ici — elle
+    /// n'entre que par le STREAMING, où elle est étiquetée `reprise` et où le
+    /// libellé permet à l'auditeur de la distinguer.
+    #[tokio::test]
+    async fn l_homonyme_d_un_autre_artiste_n_entre_pas_dans_les_versions_locales() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let base = bibliotheque_remasters(&state);
+
+        let v = rassembler_versions(&state, base, 50, false, &FiltreSources::tout())
+            .await
+            .expect("la piste existe");
+        let versions = v["versions"].as_array().expect("versions locales");
+        for version in versions {
+            assert_ne!(
+                version["album_title"].as_str(),
+                Some("Ailleurs"),
+                "un homonyme d'un AUTRE artiste est sorti : {versions:?}"
+            );
+        }
+        assert_eq!(
+            versions.len(),
+            1,
+            "l'artiste n'est plus dans le rapprochement : {versions:?}"
+        );
+    }
+
+    /// Le score classe ce que l'arbre binaire laissait dans l'ordre du moteur.
+    ///
+    /// La version qui partage l'ISRC de la référence passe devant celle qui ne
+    /// le partage pas, même quand les deux sont également « même artiste,
+    /// autre album ». Avant ce lot les deux étaient indiscernables.
+    #[tokio::test]
+    async fn la_version_de_meme_isrc_passe_devant() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Sade')", &[])
+            .unwrap();
+        let sade = b.last_insert_rowid();
+        let album = |titre: &str| {
+            b.execute(
+                "INSERT INTO albums (title, artist_id) VALUES (?1, ?2)",
+                &[&titre as &dyn ToSqlValue, &sade as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        // « Abbey » AVANT « Zenith » dans tous les ordres alphabétiques : si
+        // le score ne comptait pas, c'est « Abbey » qui sortirait en tête.
+        let abbey = album("Abbey");
+        let zenith = album("Zenith");
+        let diamond = album("Diamond Life");
+        let piste = |titre: &str, album_id: i64, isrc: &str, chemin: &str| {
+            b.execute(
+                "INSERT INTO tracks (title, album_id, artist_id, duration_ms, isrc, file_path) \
+                 VALUES (?1, ?2, ?3, 291000, ?4, ?5)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                    &sade as &dyn ToSqlValue,
+                    &isrc as &dyn ToSqlValue,
+                    &chemin as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let base = piste("Smooth Operator", diamond, "GBAAA8400001", "/base.flac");
+        piste("Smooth Operator", abbey, "USXXX9900001", "/abbey.flac");
+        piste("Smooth Operator", zenith, "GBAAA8400001", "/zenith.flac");
+
+        let v = rassembler_versions(&state, base, 50, false, &FiltreSources::tout())
+            .await
+            .expect("la piste existe");
+        let versions = v["versions"].as_array().expect("versions locales");
+        assert_eq!(versions.len(), 2, "versions rendues : {versions:?}");
+        assert_eq!(
+            versions[0]["album_title"].as_str(),
+            Some("Zenith"),
+            "l'ISRC identique doit passer devant l'ordre alphabétique : {versions:?}"
+        );
+        assert!(
+            versions[0]["score"].as_i64() > versions[1]["score"].as_i64(),
+            "le score doit être décroissant : {versions:?}"
+        );
+    }
+}
+
+/// Inscription de la relecture des métadonnées au registre des tâches de fond
+/// (#2129).
+///
+/// **Hermétique : aucun accès disque, aucun appel réseau.** La base en mémoire
+/// ne contient aucune piste locale, donc la passe ne lit aucun fichier.
+#[cfg(test)]
+mod tests_tache_de_fond_rescan_metadata {
+    use super::*;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// `rescan_metadata_status` vaut « running » pendant toute la passe, mais
+    /// ce réglage n'est lu que par l'écran qui l'a lancée. Relire les
+    /// étiquettes de chaque fichier d'une bibliothèque de dizaines de milliers
+    /// de pistes prend un temps long, et rien ne le signalait ailleurs.
+    #[tokio::test]
+    async fn la_relecture_des_metadonnees_s_inscrit_au_registre() {
+        let state = etat();
+        let _ = rescan_metadata(State(state.clone())).await;
+
+        let ids: Vec<String> = state
+            .background_tasks
+            .snapshot()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(
+            ids.contains(&TACHE_RESCAN_METADATA.to_string()),
+            "la relecture des métadonnées doit figurer au registre des tâches \
+             de fond, sinon le bandeau global ne peut pas l'afficher (#2129) — \
+             registre observé : {ids:?}"
+        );
+    }
+
+    /// Témoin anti-régression : la route garde son 202 et son message.
+    #[tokio::test]
+    async fn le_contrat_de_la_route_est_inchange() {
+        let state = etat();
+        let reponse = rescan_metadata(State(state.clone())).await.into_response();
+        assert_eq!(reponse.status(), StatusCode::ACCEPTED);
+
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let corps: Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(corps["status"], "rescan_metadata_started");
     }
 }

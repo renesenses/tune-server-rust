@@ -137,8 +137,20 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT",
-    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT",
-    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT",
+    // BIGINT, pas TEXT : `albums.id` est BIGINT, et la jointure de « Continuer
+    // l'ecoute » compare les deux. En TEXT, PostgreSQL rend `operator does not
+    // exist: text = bigint` et la section disparait en silence (#2860). Sur une
+    // base existante ou la colonne est deja TEXT, cet ADD est un no-op et c'est
+    // la migration 047 qui la convertit.
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id BIGINT",
+    // BIGINT, pas TEXT : `profiles.id` est BIGINT et `history_repo` filtre par
+    // `profile_id = <entier>`. En TEXT, PostgreSQL rend `operator does not
+    // exist: text = bigint` et l'historique du profil rend une liste vide.
+    // Meme mecanisme exact qu'`album_id` juste au-dessus (#2860, #2995) : la
+    // colonne n'arrive par aucun script numerote, la 012 ne l'a jamais vue.
+    // Sur une base existante ou elle est deja TEXT, cet ADD est un no-op et
+    // c'est la migration 049 qui la convertit.
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id BIGINT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source TEXT",
@@ -151,7 +163,13 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT",
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT",
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT",
-    "ALTER TABLE playlists ADD COLUMN IF NOT EXISTS profile_id TEXT NOT NULL DEFAULT '1'",
+    // BIGINT, pas TEXT : `PlaylistRepo::list()` et `count()` lient le profil en
+    // `i64` (`WHERE p.profile_id = $1`). En TEXT, PostgreSQL rend `operator
+    // does not exist: text = bigint` et la liste des playlists est vide sur
+    // toute installation PostgreSQL native (#2995). Sur une base existante ou
+    // elle est deja TEXT, cet ADD est un no-op et c'est la migration 049 qui la
+    // convertit.
+    "ALTER TABLE playlists ADD COLUMN IF NOT EXISTS profile_id BIGINT NOT NULL DEFAULT 1",
     // #1706: heals a queue_items that predates the numbering columns —
     // the CREATE above only fires on a database that has no queue_items
     // at all. BIGINT (not TEXT): the values are bound as i64 and read

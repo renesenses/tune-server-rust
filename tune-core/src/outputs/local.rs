@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::traits::{
-    OutputCapabilities, OutputDspMetrics, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    TransportState,
+    OutputCapabilities, OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus,
+    OutputStatus, OutputTarget, RingStarvation, TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -144,28 +144,32 @@ pub fn select_host(backend: &str) -> cpal::Host {
             "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
                 Ok(host) => {
                     let device_count = host.output_devices().map(|d| d.count()).unwrap_or(0);
-                    if device_count > 0 {
+                    let (active, fallback) = asio_outcome(Some(device_count));
+                    if fallback.is_none() {
                         info!(
                             backend = "asio",
                             devices = device_count,
                             "local_audio_host_selected"
                         );
-                        note_observed_backend("ASIO");
+                        note_observed_backend(active, fallback);
                         return host;
                     }
                     warn!(
+                        fallback_reason = LocalBackendFallback::AsioNoDevices.code(),
                         "local_audio_asio_no_devices — ASIO host OK but no output devices found, falling back to WASAPI"
                     );
-                    note_observed_backend("WASAPI");
+                    note_observed_backend(active, fallback);
                     return cpal::default_host();
                 }
                 Err(e) => {
+                    let (active, fallback) = asio_outcome(None);
                     warn!(
                         error = %e,
+                        fallback_reason = LocalBackendFallback::AsioHostUnavailable.code(),
                         "local_audio_asio_host_unavailable — check ASIO driver installation"
                     );
                     info!(backend = "wasapi", "local_audio_host_fallback");
-                    note_observed_backend("WASAPI");
+                    note_observed_backend(active, fallback);
                     return cpal::default_host();
                 }
             },
@@ -176,12 +180,12 @@ pub fn select_host(backend: &str) -> cpal::Host {
                 // (the canonical name; the older TUNE_AUDIO_BACKEND is still
                 // honoured as a fallback, but should not be recommended).
                 info!(backend = "wasapi", "local_audio_host_selected_auto");
-                note_observed_backend("WASAPI");
+                note_observed_backend("WASAPI", None);
                 return cpal::default_host();
             }
             _ => {
                 info!(backend = "wasapi", "local_audio_host_selected");
-                note_observed_backend("WASAPI");
+                note_observed_backend("WASAPI", None);
                 return cpal::default_host();
             }
         }
@@ -189,13 +193,21 @@ pub fn select_host(backend: &str) -> cpal::Host {
 
     #[cfg(not(all(target_os = "windows", feature = "asio")))]
     {
-        let _ = &backend_lower;
-        if backend_lower == "asio" {
+        // Le membre de la famille qui n'enregistrait RIEN. Un binaire Windows
+        // construit sans la feature `asio`, ou une bibliothèque migrée sur un
+        // serveur Linux/macOS avec `local_audio_backend=asio` déjà persisté,
+        // ouvrait le host par défaut sans laisser la moindre trace côté API :
+        // le sélecteur continuait d'afficher ASIO, la lecture sortait ailleurs,
+        // et le seul indice vivait dans une ligne WARN.
+        let (active, fallback) = unsupported_outcome(&backend_lower);
+        if let Some(reason) = fallback {
             warn!(
+                fallback_reason = reason.code(),
                 "local_audio_asio_requested_but_not_available — \
                  ASIO requires Windows and the `asio` cargo feature"
             );
         }
+        note_observed_backend(active, fallback);
         cpal::default_host()
     }
 }
@@ -209,19 +221,509 @@ pub fn select_host(backend: &str) -> cpal::Host {
 /// rien ne remontait cette bascule : l'interface continuait d'annoncer le
 /// backend *demandé*, si bien qu'un utilisateur ayant choisi ASIO se voyait
 /// confirmer « ASIO » alors que le son sortait en WASAPI (signalement Bilou).
-static OBSERVED_BACKEND: std::sync::RwLock<Option<&'static str>> = std::sync::RwLock::new(None);
+static OBSERVED_BACKEND: std::sync::RwLock<Option<ObservedBackend>> = std::sync::RwLock::new(None);
 
-/// Enregistre le backend réellement ouvert. Appelé par `select_host` seul.
+/// Ce que le dernier `select_host` a réellement ouvert, et pourquoi il n'a pas
+/// pu honorer la demande quand c'est le cas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedBackend {
+    name: &'static str,
+    fallback_reason: Option<LocalBackendFallback>,
+}
+
+/// Le PÉRIPHÉRIQUE réellement ouvert par la dernière lecture locale, face à
+/// celui que la zone demandait.
 ///
-/// Ses seuls appelants vivent dans la branche `windows + feature asio` de
-/// `select_host` : ailleurs, il n'y a aucun choix de backend à observer, donc
-/// aucun appel — d'où un `dead_code` sur toutes les autres cibles. On l'autorise
-/// explicitement plutôt que de placer la fonction sous le même `cfg`, pour
-/// qu'un futur appel depuis une autre plateforme n'ait pas à la ressusciter.
-#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
-fn note_observed_backend(name: &'static str) {
+/// Frère jumeau d'[`OBSERVED_BACKEND`], et pour la même raison : le serveur
+/// SAVAIT déjà ce qu'il avait ouvert — `WasapiExclusiveOutput::opened_device_name`
+/// existe depuis #2207 — mais sa seule lecture était une ligne de journal
+/// (`wasapi_exclusive_playing`). Aucun client n'a jamais pu voir l'écart.
+///
+/// Or l'écart existe : sur Windows, le chemin exclusif WASAPI appelle
+/// `GetDefaultAudioEndpoint` quand la résolution par nom échoue, et le chemin
+/// cpal partagé retombe explicitement sur le périphérique système
+/// (`audio_device_not_found_falling_back_to_default`). Une zone réglée sur un
+/// DAC peut donc jouer sur les haut-parleurs, sans que rien ne le dise.
+///
+/// ⚠️ Ce verrou porte la DERNIÈRE ouverture observée et n'est pas effacé à
+/// l'arrêt — exactement comme `OBSERVED_BACKEND`. C'est pour cela que le nom
+/// demandé est mémorisé **au même instant** que le nom ouvert : la paire reste
+/// cohérente entre elle même si le réglage de la zone change ensuite.
+static OBSERVED_DEVICE: std::sync::RwLock<Option<ObservedDevice>> = std::sync::RwLock::new(None);
+
+/// Ce que la dernière ouverture de périphérique a demandé, et ce qu'elle a eu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedDevice {
+    backend: &'static str,
+    requested: String,
+    /// Vide quand rien n'a été ouvert — voir [`LocalDeviceStatus::opened`].
+    opened: String,
+    opened_id: Option<String>,
+    reason: Option<LocalDeviceFallback>,
+}
+
+/// La CADENCE de la dernière ouverture partagée : celle de la source, celle
+/// réellement ouverte, et le motif de l'écart quand il y en a un.
+///
+/// #3233 — même famille que [`OBSERVED_DEVICE`], et pour la même raison : une
+/// décision qui change ce qui part au DAC ne doit pas rester dans le seul
+/// journal. Pierre M (fil 1043) lit « DSD64 » sur son écran pendant que Tune a
+/// choisi d'ouvrir ailleurs ; sans ce verrou, il faut ses journaux pour le
+/// savoir.
+///
+/// ⚠️ Ne concerne que le chemin cpal **partagé**. Les chemins exclusifs
+/// (WASAPI exclusif, ASIO, hog CoreAudio) n'arbitrent pas : ils ouvrent à la
+/// cadence de la source ou échouent, donc ils n'écrivent rien ici.
+///
+/// ⚠️ Comme `OBSERVED_DEVICE`, ce verrou porte la DERNIÈRE ouverture observée
+/// et n'est pas effacé à l'arrêt.
+static OBSERVED_RATE: std::sync::RwLock<Option<ObservedRate>> = std::sync::RwLock::new(None);
+
+/// Ce que la dernière ouverture partagée a demandé comme cadence, et ce qu'elle
+/// a ouvert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedRate {
+    source_sample_rate: u32,
+    opened_sample_rate: u32,
+    reason: Option<LocalRateFallback>,
+    evidence_measured: bool,
+}
+
+/// Nom du backend tel que `select_host` l'a observé, ou `"local"` faute d'avoir
+/// encore ouvert quoi que ce soit. Sert à étiqueter l'ouverture d'un
+/// périphérique par le chemin cpal, qui ne connaît que la variante cpal.
+fn observed_backend_name() -> &'static str {
+    OBSERVED_BACKEND
+        .read()
+        .ok()
+        .and_then(|g| *g)
+        .map(|o| o.name)
+        .unwrap_or("local")
+}
+
+/// Enregistre le périphérique réellement ouvert. **Appelé par chaque chemin
+/// d'ouverture** : cpal partagé, WASAPI exclusif, ASIO exclusif, CoreAudio
+/// exclusif.
+///
+/// `opened_id` vaut `None` quand le backend n'expose aucun identifiant stable
+/// (ASIO et CoreAudio exclusif : l'`AudioDeviceID` de CoreAudio est un entier
+/// réattribué au redémarrage, ce n'est pas une identité). Un champ absent est
+/// honnête ; un champ inventé ne l'est pas.
+fn note_opened_device(
+    backend: &'static str,
+    requested: &str,
+    opened: &str,
+    opened_id: Option<&str>,
+) {
+    note_device_outcome(backend, requested, opened, opened_id, None);
+}
+
+/// Enregistre une ouverture qui n'a **pas** honoré la demande, avec son motif.
+///
+/// `opened` vide = rien n'a été ouvert du tout (refus). Sinon, quelque chose a
+/// bien joué, mais pas ce que la zone nommait.
+fn note_device_outcome(
+    backend: &'static str,
+    requested: &str,
+    opened: &str,
+    opened_id: Option<&str>,
+    reason: Option<LocalDeviceFallback>,
+) {
+    if let Ok(mut slot) = OBSERVED_DEVICE.write() {
+        *slot = Some(ObservedDevice {
+            backend,
+            requested: requested.to_string(),
+            opened: opened.to_string(),
+            opened_id: opened_id.filter(|id| !id.is_empty()).map(str::to_string),
+            reason,
+        });
+    }
+}
+
+/// Pourquoi la sortie locale ne tourne pas sur le backend demandé.
+///
+/// #1395 — le nom du backend actif ne suffit pas. Bilou règle sa zone « Ce PC /
+/// Hauts Parleurs » sur ASIO, la lecture sort en WASAPI, et la seule trace du
+/// basculement est une ligne `local_audio_asio_no_devices` dans le journal : il
+/// a fallu qu'il poste une capture de ses logs sur le forum pour que quiconque
+/// sache pourquoi. Le motif existe côté serveur ; il n'était simplement remonté
+/// nulle part.
+///
+/// Les codes sont **stables** et destinés à la machine (le client les traduit),
+/// sur le modèle de `runtime_reasons` du chemin du signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalBackendFallback {
+    /// L'hôte ASIO s'ouvre mais n'expose **aucune** sortie. Cas de Bilou : un
+    /// pilote ASIO ne s'ouvre que dans un seul processus, donc une autre
+    /// application qui le tient le fait disparaître de l'énumération.
+    AsioNoDevices,
+    /// L'hôte ASIO ne s'ouvre pas du tout — pilote absent ou non enregistré.
+    AsioHostUnavailable,
+    /// ASIO a été demandé sur un binaire qui ne peut pas l'honorer : hors
+    /// Windows, ou Windows compilé sans la feature `asio`. Connu à la
+    /// compilation, donc affirmable sans avoir ouvert le moindre périphérique.
+    AsioUnsupportedBuild,
+}
+
+impl LocalBackendFallback {
+    /// Code stable, celui que porte la charge utile JSON et les journaux.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::AsioNoDevices => "asio_no_devices",
+            Self::AsioHostUnavailable => "asio_host_unavailable",
+            Self::AsioUnsupportedBuild => "asio_unsupported_build",
+        }
+    }
+
+    /// Phrase courte, dans la langue du chemin du signal — le serveur y écrit
+    /// déjà ses `detail` en français (`runtime_signal_reason_detail`).
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::AsioNoDevices => {
+                "ASIO demandé : pilote présent mais aucune sortie exposée \
+                 (une autre application le tient peut-être) — repli WASAPI"
+            }
+            Self::AsioHostUnavailable => {
+                "ASIO demandé : pilote ASIO introuvable ou non ouvrable — repli WASAPI"
+            }
+            Self::AsioUnsupportedBuild => {
+                "ASIO demandé : cette version du serveur n'embarque pas ASIO — \
+                 sortie par le backend natif de la plateforme"
+            }
+        }
+    }
+
+    /// Toutes les variantes. Sert la contre-épreuve permanente : un motif
+    /// ajouté sans être câblé fait tomber le test qui parcourt cette liste.
+    pub const ALL: [Self; 3] = [
+        Self::AsioNoDevices,
+        Self::AsioHostUnavailable,
+        Self::AsioUnsupportedBuild,
+    ];
+}
+
+/// Pourquoi la zone ne joue pas sur le périphérique qu'elle NOMME.
+///
+/// Frère de [`LocalBackendFallback`], et volontairement bâti sur le même
+/// modèle : un `code()` stable pour la machine, un `detail()` en clair pour un
+/// écran sans table de traduction. Ce n'est pas un troisième canal — les deux
+/// motifs voyagent dans le **même** [`LocalBackendStatus`], l'un sur le
+/// backend, l'autre sur le périphérique.
+///
+/// #3230 — Jean Valjean règle sa zone sur « Haut-parleurs », un nom WASAPI.
+/// `select_host("asio")` élit l'hôte ASIO dès qu'il expose une sortie, la
+/// résolution cherche « Haut-parleurs » parmi les seules sorties ASIO, ne le
+/// trouve pas, et ouvre **le périphérique ASIO par défaut**. Le son part
+/// ailleurs, ou nulle part, et rien ne le dit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalDeviceFallback {
+    /// Le nom mémorisé par la zone vient d'un AUTRE hôte que celui qui est
+    /// ouvert. Aucun appariement n'est possible : un nom WASAPI ne désigne
+    /// aucune sortie ASIO. La demande est **refusée**, pas détournée.
+    ForeignHost,
+    /// Le nom vient bien de cet hôte (ou son origine est inconnue) mais aucune
+    /// sortie ne le porte plus : débranché, renommé, routage macOS changé.
+    /// C'est le cas historique de #2207 — on ouvre le périphérique système et
+    /// on le DIT.
+    NotFoundFellBackToDefault,
+}
+
+impl LocalDeviceFallback {
+    /// Code stable, celui que porte la charge utile JSON et les journaux.
+    ///
+    /// Il doit rester **identique** à la représentation `serde` de la variante,
+    /// comme pour [`LocalBackendFallback`] : un client qui lit le JSON et un
+    /// journal qui lit `code()` doivent parler du même motif. Le test
+    /// `chaque_motif_de_repli_de_peripherique_est_cable` tient cette égalité.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ForeignHost => "foreign_host",
+            Self::NotFoundFellBackToDefault => "not_found_fell_back_to_default",
+        }
+    }
+
+    /// Phrase courte, dans la langue du chemin du signal.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::ForeignHost => {
+                "le périphérique enregistré par la zone vient d'un autre hôte audio \
+                 que celui qui est ouvert — rien n'a été ouvert plutôt que de jouer \
+                 sur un périphérique que la zone n'a jamais désigné"
+            }
+            Self::NotFoundFellBackToDefault => {
+                "le périphérique enregistré par la zone est introuvable \
+                 (débranché, renommé) — lecture sur la sortie système"
+            }
+        }
+    }
+
+    /// Toutes les variantes. Sert la contre-épreuve permanente : un motif
+    /// ajouté sans être câblé fait tomber le test qui parcourt cette liste.
+    pub const ALL: [Self; 2] = [Self::ForeignHost, Self::NotFoundFellBackToDefault];
+}
+
+/// Ce que la sortie locale fait vraiment, à côté de ce qu'on lui a demandé.
+///
+/// Additif : `active` reprend exactement ce que rend [`active_backend_name`],
+/// les deux autres champs sont nouveaux. Un client qui ne les lit pas voit le
+/// même écran qu'avant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalBackendStatus {
+    /// Backend réellement ouvert : `"ASIO"`, `"WASAPI"`, `"CoreAudio"`, `"ALSA"`.
+    pub active: &'static str,
+    /// Ce que le réglage demandait, normalisé en minuscules (`"asio"`, `"auto"`…).
+    pub requested: String,
+    /// `true` dès que l'actif ne correspond pas au demandé.
+    pub fell_back: bool,
+    /// Pourquoi, quand le serveur le sait. `None` = aucun repli constaté.
+    pub fallback_reason: Option<LocalBackendFallback>,
+    /// La même chose en clair, pour un écran qui n'a pas de table de traduction.
+    pub fallback_detail: Option<&'static str>,
+    /// Le PÉRIPHÉRIQUE réellement ouvert, face à celui qui était demandé.
+    ///
+    /// `None` = aucune ouverture observée depuis le démarrage (rien n'a encore
+    /// joué en local), ou backend incapable de dire ce qu'il a ouvert. Absent
+    /// plutôt que faux : c'est la seule réponse honnête.
+    ///
+    /// ⚠️ **À ne pas confondre avec `fell_back`**, qui parle du BACKEND
+    /// (ASIO → WASAPI). Les deux replis sont indépendants : une zone peut
+    /// tourner sur le backend demandé et sur un autre périphérique.
+    pub device: Option<LocalDeviceStatus>,
+    /// La CADENCE réellement ouverte, face à celle de la source (#3233).
+    ///
+    /// `None` = aucune ouverture partagée observée depuis le démarrage, ou
+    /// sortie exclusive (qui n'arbitre pas). Troisième repli indépendant des
+    /// deux autres : une zone peut jouer sur le bon backend, le bon
+    /// périphérique, et à une autre cadence que la source.
+    pub rate: Option<LocalRateStatus>,
+}
+
+/// Ce que la sortie locale a réellement OUVERT, face à ce que la zone
+/// demandait — la moitié manquante de [`LocalBackendStatus`].
+///
+/// #2207 : le chemin exclusif WASAPI appelle `GetDefaultAudioEndpoint` dès que
+/// la résolution par nom échoue, et le chemin cpal partagé retombe sur le
+/// périphérique système. Une zone réglée sur un DAC peut donc jouer sur les
+/// haut-parleurs. Le serveur le savait — deux accesseurs, une ligne de journal
+/// — mais aucun écran ne pouvait le dire. **La zone doit dire la vérité, pas la
+/// consigne.**
+///
+/// Ce type ne CORRIGE pas la résolution : il la rend visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalDeviceStatus {
+    /// Le backend qui a ouvert ce périphérique (`"WASAPI"`, `"ASIO"`,
+    /// `"CoreAudio"`, `"ALSA"`).
+    pub backend: &'static str,
+    /// Le nom demandé au moment de l'ouverture. `"default"` = périphérique
+    /// système, demandé explicitement — ce n'est pas un repli.
+    pub requested: String,
+    /// Le nom réellement ouvert, tel que le pilote le rend.
+    ///
+    /// **Vide** quand rien n'a été ouvert : c'est le cas d'un refus
+    /// ([`LocalDeviceFallback::ForeignHost`]), où l'honnêteté impose de ne
+    /// nommer aucun périphérique plutôt que d'en nommer un que la zone n'a
+    /// jamais désigné. `reason` porte alors le pourquoi.
+    pub opened: String,
+    /// Identifiant d'endpoint quand le backend en expose un de stable (WASAPI,
+    /// cpal). `None` pour ASIO et CoreAudio exclusif : ils n'en ont pas.
+    pub opened_id: Option<String>,
+    /// `true` dès que les deux noms diffèrent — c'est LE fait à montrer.
+    pub differs: bool,
+    /// Pourquoi la zone ne joue pas sur le périphérique qu'elle nomme.
+    /// `None` = le périphérique demandé a bien été celui ouvert.
+    ///
+    /// Même vocabulaire que `fallback_reason` du backend : un code stable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<LocalDeviceFallback>,
+    /// La même chose en clair, comme `fallback_detail` pour le backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<&'static str>,
+}
+
+impl LocalDeviceStatus {
+    /// Un `"default"` demandé n'est jamais un écart : l'utilisateur a demandé
+    /// « le périphérique système », il l'a eu. Partout ailleurs, deux noms
+    /// différents sont un écart, même sans motif connu.
+    fn from_observed(observed: ObservedDevice) -> Self {
+        let differs = observed.reason.is_some()
+            || (observed.requested != "default" && observed.requested != observed.opened);
+        Self {
+            backend: observed.backend,
+            requested: observed.requested,
+            opened: observed.opened,
+            opened_id: observed.opened_id,
+            differs,
+            reason: observed.reason,
+            detail: observed.reason.map(LocalDeviceFallback::detail),
+        }
+    }
+}
+
+/// Pourquoi la sortie locale partagée n'a **pas** ouvert à la cadence de la
+/// source.
+///
+/// #3233 — Pierre M (fil 1043, 14/07/2026) : « DSD : le temps défile, pas de
+/// son ». Un DSD64 décode à 176 400 Hz ; le chemin partagé ouvrait à cette
+/// cadence dès que l'énumération de cpal la « retenait », sans regarder ce que
+/// cette réponse valait. Sur WASAPI elle ne vaut rien (voir
+/// [`sample_rate_evidence`]) : la liste est fabriquée, la branche était donc
+/// toujours prise, `needs_resample` restait faux et rubato ne tournait jamais.
+///
+/// Les codes sont **stables** et destinés à la machine (le client les traduit),
+/// exactement comme [`LocalBackendFallback`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalRateFallback {
+    /// Le périphérique « retient » la cadence, mais **rien ne l'a vérifiée** :
+    /// hôte dont l'énumération est fabriquée (WASAPI), ou PCM ALSA qui passe
+    /// par un greffon rééchantillonneur. Tune refuse de fonder l'ouverture sur
+    /// une capacité supposée et convertit lui-même.
+    CapabilitiesUnverified,
+    /// Le périphérique ne retient pas la cadence : l'écart est constaté, pas
+    /// supposé. C'est le comportement de toujours, nommé.
+    RateNotSupported,
+}
+
+impl LocalRateFallback {
+    /// Code stable, celui que porte la charge utile JSON et les journaux.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::CapabilitiesUnverified => "capabilities_unverified",
+            Self::RateNotSupported => "rate_not_supported",
+        }
+    }
+
+    /// Phrase courte, dans la langue du chemin du signal — le serveur y écrit
+    /// déjà ses `detail` en français (`runtime_signal_reason_detail`).
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::CapabilitiesUnverified => {
+                "Cadence source annoncée par le périphérique mais jamais vérifiée : \
+                 ouverture à la cadence du périphérique et rééchantillonnage par Tune"
+            }
+            Self::RateNotSupported => {
+                "Cadence source non retenue par le périphérique : ouverture à la \
+                 cadence du périphérique et rééchantillonnage par Tune"
+            }
+        }
+    }
+
+    /// Toutes les variantes. Sert la contre-épreuve permanente : un motif
+    /// ajouté sans être câblé fait tomber le test qui parcourt cette liste.
+    pub const ALL: [Self; 2] = [Self::CapabilitiesUnverified, Self::RateNotSupported];
+}
+
+/// À quelle cadence la sortie locale partagée a réellement ouvert, face à celle
+/// de la source — et pourquoi, quand les deux diffèrent.
+///
+/// Additif, comme [`LocalDeviceStatus`] : un client qui ne lit pas ce champ voit
+/// le même écran qu'avant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LocalRateStatus {
+    /// Cadence du flux décodé (176 400 Hz pour un DSD64, 352 800 pour un
+    /// DSD128/256/512).
+    pub source_sample_rate: u32,
+    /// Cadence à laquelle le flux cpal a été ouvert.
+    pub opened_sample_rate: u32,
+    /// `true` dès que les deux diffèrent : Tune convertit, ce n'est plus le
+    /// train d'échantillons de la source qui part au DAC.
+    pub resampled: bool,
+    /// Pourquoi, quand la conversion est une DÉCISION de Tune. `None` = aucune
+    /// conversion, ou aucune décision à justifier.
+    pub reason: Option<LocalRateFallback>,
+    /// La même chose en clair, pour un écran sans table de traduction.
+    pub detail: Option<&'static str>,
+    /// La liste de cadences sur laquelle la décision s'est appuyée avait-elle
+    /// été **mesurée** ? Faux sur WASAPI et sur les greffons ALSA (#2862,
+    /// #1655). C'est le fait qui distingue les deux motifs.
+    pub evidence_measured: bool,
+}
+
+impl LocalRateStatus {
+    fn from_observed(observed: ObservedRate) -> Self {
+        Self {
+            source_sample_rate: observed.source_sample_rate,
+            opened_sample_rate: observed.opened_sample_rate,
+            resampled: observed.opened_sample_rate != observed.source_sample_rate,
+            reason: observed.reason,
+            detail: observed.reason.map(LocalRateFallback::detail),
+            evidence_measured: observed.evidence_measured,
+        }
+    }
+}
+
+/// Enregistre la cadence réellement ouverte par le chemin cpal **partagé**.
+///
+/// Appelé une fois par ouverture, juste après [`decide_local_rate_opening`] :
+/// la décision et sa trace ne se séparent pas.
+fn note_rate_decision(observed: ObservedRate) {
+    if let Ok(mut slot) = OBSERVED_RATE.write() {
+        *slot = Some(observed);
+    }
+}
+
+/// Enregistre le backend réellement ouvert, et le motif du repli s'il y en a un.
+/// Appelé par `select_host` seul, sur **toutes** les cibles.
+fn note_observed_backend(name: &'static str, fallback_reason: Option<LocalBackendFallback>) {
     if let Ok(mut slot) = OBSERVED_BACKEND.write() {
-        *slot = Some(name);
+        *slot = Some(ObservedBackend {
+            name,
+            fallback_reason,
+        });
+    }
+}
+
+/// Issue d'une demande `asio` sur une cible qui embarque ASIO.
+///
+/// `asio_devices` : `None` = l'hôte ASIO ne s'ouvre pas ; `Some(0)` = il
+/// s'ouvre mais n'expose aucune sortie ; `Some(n > 0)` = ASIO joue.
+///
+/// Isolée de cpal exprès : la branche appelante vit sous
+/// `#[cfg(all(target_os = "windows", feature = "asio"))]` et ne peut être
+/// exécutée ni sur macOS ni sur Linux. La décision, elle, se joue partout.
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+fn asio_outcome(asio_devices: Option<usize>) -> (&'static str, Option<LocalBackendFallback>) {
+    match asio_devices {
+        Some(n) if n > 0 => ("ASIO", None),
+        Some(_) => ("WASAPI", Some(LocalBackendFallback::AsioNoDevices)),
+        None => ("WASAPI", Some(LocalBackendFallback::AsioHostUnavailable)),
+    }
+}
+
+/// Issue d'une demande sur une cible qui n'embarque **pas** ASIO.
+#[cfg_attr(all(target_os = "windows", feature = "asio"), allow(dead_code))]
+fn unsupported_outcome(requested_lower: &str) -> (&'static str, Option<LocalBackendFallback>) {
+    let active = platform_default_backend_name();
+    if requested_lower == "asio" {
+        (active, Some(LocalBackendFallback::AsioUnsupportedBuild))
+    } else {
+        (active, None)
+    }
+}
+
+/// Le backend qu'ouvre `cpal::default_host()` sur cette plateforme.
+///
+/// Sur Windows+ASIO, seul [`unsupported_outcome`] — lui-même inerte sur cette
+/// cible — s'en sert : d'où le `dead_code` autorisé plutôt qu'un `cfg` de plus.
+#[cfg_attr(all(target_os = "windows", feature = "asio"), allow(dead_code))]
+fn platform_default_backend_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "WASAPI"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "CoreAudio"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "ALSA"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        "default"
     }
 }
 
@@ -230,7 +732,29 @@ fn note_observed_backend(name: &'static str) {
 /// Ce qui a été *observé* prime sur ce qui a été *demandé* : c'est la seule
 /// réponse qui corresponde à ce que l'utilisateur entend réellement.
 pub fn active_backend_name(backend: &str) -> &'static str {
-    backend_display_name(OBSERVED_BACKEND.read().ok().and_then(|g| *g), backend)
+    backend_display_name(
+        OBSERVED_BACKEND
+            .read()
+            .ok()
+            .and_then(|g| *g)
+            .map(|o| o.name),
+        backend,
+    )
+}
+
+/// Ce que la sortie locale fait, ce qu'on lui a demandé, et l'écart s'il existe.
+///
+/// C'est la réponse à #1395 : `active_backend_name` disait déjà la vérité sur le
+/// backend, mais un utilisateur qui lit « WASAPI » alors qu'il a réglé « ASIO »
+/// n'a toujours aucun moyen de savoir s'il s'est trompé de réglage ou si le
+/// serveur a basculé — ni pourquoi.
+pub fn active_backend_status(requested: &str) -> LocalBackendStatus {
+    backend_status_with_rate(
+        OBSERVED_BACKEND.read().ok().and_then(|g| *g),
+        OBSERVED_DEVICE.read().ok().and_then(|g| g.clone()),
+        OBSERVED_RATE.read().ok().and_then(|g| *g),
+        requested,
+    )
 }
 
 /// Règle d'arbitrage entre observé et demandé, isolée pour être testable sans
@@ -243,36 +767,165 @@ fn backend_display_name(observed: Option<&'static str>, backend: &str) -> &'stat
     {
         match backend.to_lowercase().as_str() {
             "asio" => "ASIO",
-            "wasapi" => "WASAPI",
-            "auto" => "WASAPI",
             _ => "WASAPI",
         }
     }
     #[cfg(not(all(target_os = "windows", feature = "asio")))]
     {
         let _ = backend;
-        #[cfg(target_os = "windows")]
-        {
-            "WASAPI"
-        }
-        #[cfg(target_os = "macos")]
-        {
-            "CoreAudio"
-        }
-        #[cfg(target_os = "linux")]
-        {
-            "ALSA"
-        }
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        {
-            "default"
-        }
+        platform_default_backend_name()
+    }
+}
+
+/// Même isolement pour le statut complet : aucune lecture de l'état global,
+/// aucun périphérique ouvert, donc jouable sur n'importe quelle plateforme.
+///
+/// Raccourci des tests de la famille #1395, qui n'ont rien à dire de la
+/// cadence : c'est [`backend_status_with_rate`] sans observation de cadence.
+#[cfg(test)]
+fn backend_status(
+    observed: Option<ObservedBackend>,
+    observed_device: Option<ObservedDevice>,
+    requested: &str,
+) -> LocalBackendStatus {
+    backend_status_with_rate(observed, observed_device, None, requested)
+}
+
+/// Même isolement pour le statut complet : aucune lecture de l'état global,
+/// aucun périphérique ouvert, donc jouable sur n'importe quelle plateforme.
+fn backend_status_with_rate(
+    observed: Option<ObservedBackend>,
+    observed_device: Option<ObservedDevice>,
+    observed_rate: Option<ObservedRate>,
+    requested: &str,
+) -> LocalBackendStatus {
+    let requested_lower = requested.to_lowercase();
+    let active = backend_display_name(observed.map(|o| o.name), requested);
+
+    let fallback_reason = match observed {
+        // Une OBSERVATION est autoritaire, y compris quand elle ne porte aucun
+        // motif : `select_host` a ouvert un périphérique et sait ce qu'il a
+        // ouvert. Retomber sur la déduction ici rajouterait un motif à un
+        // backend qui joue — la faute exactement inverse de celle qu'on
+        // corrige, et c'est ce test qui l'a attrapée.
+        Some(o) => o.fallback_reason,
+        // Sans observation, un seul motif est affirmable, parce qu'il est
+        // décidé à la COMPILATION : un binaire sans ASIO ne pourra jamais
+        // honorer « asio ». On n'en devine aucun autre.
+        None => (requested_lower == "asio" && !asio_available())
+            .then_some(LocalBackendFallback::AsioUnsupportedBuild),
+    };
+
+    // L'écart se voit sans motif : un réglage sur « asio » et un actif
+    // « WASAPI » suffisent à le dire, même quand la cause n'est pas connue
+    // (réglage changé, flux pas encore rouvert).
+    let fell_back = fallback_reason.is_some()
+        || !(requested_lower == "auto"
+            || requested_lower.is_empty()
+            || requested_lower.eq_ignore_ascii_case(active));
+
+    LocalBackendStatus {
+        active,
+        requested: requested_lower,
+        fell_back,
+        fallback_reason,
+        fallback_detail: fallback_reason.map(LocalBackendFallback::detail),
+        device: observed_device.map(LocalDeviceStatus::from_observed),
+        rate: observed_rate.map(LocalRateStatus::from_observed),
     }
 }
 
 /// Returns `true` if this build includes ASIO support.
 pub fn asio_available() -> bool {
     cfg!(all(target_os = "windows", feature = "asio"))
+}
+
+/// Un choix de backend audio local, tel que le sélecteur de l'interface doit
+/// le proposer : la valeur à persister dans `local_audio_backend`, et un
+/// libellé technique (des noms propres — pas de traduction à faire côté
+/// client, hormis « Auto »).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BackendChoice {
+    pub value: &'static str,
+    pub label: &'static str,
+}
+
+/// Les backends de sortie locale réellement sélectionnables sur CETTE machine.
+///
+/// #1268 ([Forum HiFi], Lapinou sous Debian puis Benjithom sous Fedora) : le
+/// sélecteur « Backend audio » du client web proposait Auto/WASAPI/ASIO — deux
+/// technologies Windows — parce que ces trois `<option>` étaient écrites en
+/// dur et que le serveur n'exposait nulle part la liste vraie. La voici,
+/// calculée à la compilation par plateforme, pour que l'interface n'ait plus
+/// rien à deviner.
+///
+/// `auto` est toujours présent et toujours premier : c'est le défaut, et c'est
+/// aussi le repli de [`select_host`] pour toute valeur inconnue — y compris
+/// une valeur Windows persistée avant qu'une bibliothèque ne migre vers une
+/// machine Linux.
+pub fn supported_backends() -> &'static [BackendChoice] {
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        &[
+            BackendChoice {
+                value: "auto",
+                label: "Auto (WASAPI)",
+            },
+            BackendChoice {
+                value: "wasapi",
+                label: "WASAPI",
+            },
+            BackendChoice {
+                value: "asio",
+                label: "ASIO (bit-perfect)",
+            },
+        ]
+    }
+    #[cfg(all(target_os = "windows", not(feature = "asio")))]
+    {
+        &[
+            BackendChoice {
+                value: "auto",
+                label: "Auto (WASAPI)",
+            },
+            BackendChoice {
+                value: "wasapi",
+                label: "WASAPI",
+            },
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &[BackendChoice {
+            value: "auto",
+            label: "Auto (CoreAudio)",
+        }]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        &[BackendChoice {
+            value: "auto",
+            label: "Auto (ALSA)",
+        }]
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        &[BackendChoice {
+            value: "auto",
+            label: "Auto",
+        }]
+    }
+}
+
+/// Cette valeur de `local_audio_backend` correspond-elle à un backend
+/// sélectionnable sur cette machine ? Sert au repli d'affichage : une valeur
+/// Windows persistée sur un serveur Linux ne doit pas laisser le sélecteur
+/// sur un choix qui n'existe plus ([`select_host`] jouera de toute façon via
+/// le host par défaut de la plateforme).
+pub fn backend_value_is_supported(value: &str) -> bool {
+    supported_backends()
+        .iter()
+        .any(|b| b.value.eq_ignore_ascii_case(value))
 }
 
 /// List ASIO audio output devices specifically.
@@ -433,16 +1086,238 @@ pub struct AudioDevice {
     pub is_default: bool,
     pub max_channels: u16,
     pub sample_rates: Vec<u32>,
+    /// `sample_rates` a-t-il été confronté au matériel ?
+    ///
+    /// Faux sur WASAPI, où cpal fabrique la liste sans rien demander au pilote
+    /// (#2862) : l'écran ne doit pas présenter ces cadences comme une capacité
+    /// constatée. Voir [`sample_rate_evidence`].
+    ///
+    /// `serde(default)` rend `true` : les enregistrements écrits avant ce champ
+    /// ne peuvent plus être requalifiés, et le champ n'est de toute façon
+    /// jamais persisté — il n'existe que sur le fil de `GET
+    /// /api/v1/devices/audio`.
+    #[serde(default = "sample_rates_measured_default")]
+    pub sample_rates_measured: bool,
     /// The audio backend this device was enumerated from.
     #[serde(default)]
     pub backend: String,
+    /// De quoi distinguer deux sorties qui portent le MÊME nom (#2272).
+    ///
+    /// Marco Polo voit deux « Haut-Parleurs » et ne peut pas dire lequel est
+    /// lequel. Le suffixe `(2)` que pose [`disambiguate_display_name`] est un
+    /// rang d'énumération, pas une identité : il peut changer d'un démarrage à
+    /// l'autre, et il ne nomme rien. Ce champ porte le nom du CONTRÔLEUR
+    /// derrière la sortie — « Topping D10s », « Realtek High Definition
+    /// Audio » — c'est-à-dire ce qu'Audirvana affiche et que Tune jetait.
+    ///
+    /// `None` quand rien de distinctif n'est disponible, et `None` est alors
+    /// ABSENT de la charge utile (`skip_serializing_if`) plutôt que publié
+    /// comme chaîne vide : un renseignement manquant ne doit pas se faire
+    /// passer pour un renseignement.
+    ///
+    /// **Ce champ ne remplace pas `name` et ne le modifie pas.** Le nom
+    /// d'affichage reste mot pour mot celui d'avant, suffixe `(n)` compris,
+    /// parce que c'est LUI que les zones ont mémorisé et que [`resolve_device`]
+    /// le reconstruit à l'identique (étape 2, via
+    /// [`disambiguate_display_name`]). Renommer les périphériques renverrait
+    /// toutes les zones existantes sur `NotFound` — le défaut que Jean Marie a
+    /// vécu sur macOS (#3185). L'écran compose ; le serveur ne renomme pas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_detail: Option<String>,
+}
+
+fn sample_rates_measured_default() -> bool {
+    true
+}
+
+/// Le renseignement qui distingue deux sorties homonymes, ou rien (#2272).
+///
+/// ## Pourquoi la règle reçoit tout en paramètres
+///
+/// Les trois plateformes ne rapportent pas la même chose, et deux d'entre
+/// elles ne se compilent pas sur la machine de compilation. La RÈGLE est donc
+/// une fonction pure, éprouvable partout. La COLLECTE, elle, n'a même pas
+/// besoin d'un `cfg` : cpal 0.17 la fait déjà, dans le `DeviceDescription` que
+/// [`list_audio_devices_uncached`] obtenait puis jetait après n'en avoir lu
+/// que le seul `name()`.
+///
+/// ## Ce que chaque plateforme met dans ces paramètres
+///
+/// - **Windows / WASAPI** — `driver` porte
+///   `DEVPKEY_DeviceInterface_FriendlyName`, que cpal lit lui-même
+///   (`host/wasapi/device.rs`, `builder.driver(iface_name)`). C'est exactement
+///   la propriété que réclame #2272 : le nom du contrôleur, « Topping D10s ».
+///   Et c'est bien là que le défaut mord, parce que cpal choisit
+///   `DEVPKEY_Device_DeviceDesc` comme `name` — « Haut-Parleurs », générique
+///   par construction, identique pour deux DAC différents.
+/// - **Linux / ALSA** — `driver` porte le PCM (`hw:CARD=…`), que `endpoint_id`
+///   porte DÉJÀ. Il ne distingue rien de plus, et la règle l'écarte : Linux
+///   retombe mot pour mot sur le comportement d'avant, dédoublonnage PipeWire
+///   compris.
+/// - **macOS / CoreAudio** — cpal 0.17.3 ne renseigne ni `manufacturer` ni
+///   `driver` (`host/coreaudio/macos/device.rs::description` ne pose que le
+///   nom, la direction et le cas `Aggregate`). La règle rend `None` sans rien
+///   casser. `kAudioDevicePropertyModelUID` reste donc à collecter.
+///
+/// `manufacturer` passe avant `driver` : aucun backend de cpal 0.17.3 ne le
+/// renseigne aujourd'hui — `grep manufacturer src/host/` ne rend rien — mais
+/// c'est le champ dont la sémantique est exactement celle qu'on cherche, et le
+/// jour où un backend le remplit il doit gagner sans qu'on y revienne.
+///
+/// ## Les deux motifs de refus
+///
+/// 1. **Vide.** Une chaîne blanche n'est pas un renseignement.
+/// 2. **Déjà connu de l'appelant.** Un candidat que le nom d'affichage ou
+///    l'identifiant d'endpoint contient déjà n'ajoute rien. C'est ce qui écarte
+///    le PCM ALSA, et ce qui empêche d'écrire « Haut-Parleurs » à côté de
+///    « Haut-Parleurs ».
+pub fn hardware_detail(
+    manufacturer: Option<&str>,
+    driver: Option<&str>,
+    display_name: &str,
+    endpoint_id: &str,
+) -> Option<String> {
+    let deja_connu = |candidat: &str| {
+        let candidat = candidat.to_lowercase();
+        display_name.to_lowercase().contains(&candidat)
+            || endpoint_id.to_lowercase().contains(&candidat)
+    };
+    [manufacturer, driver]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|candidat| !candidat.is_empty() && !deja_connu(candidat))
+        .map(str::to_string)
+}
+
+/// La même règle, branchée sur ce que cpal rend.
+///
+/// Un SEUL endroit lit un `DeviceDescription` pour cette question, et il reste
+/// éprouvable sans matériel : `cpal::DeviceDescriptionBuilder` est public, si
+/// bien que les épreuves fabriquent mot pour mot les descriptions que WASAPI,
+/// ALSA et CoreAudio rendent.
+fn hardware_detail_from_description(
+    description: &cpal::DeviceDescription,
+    display_name: &str,
+    endpoint_id: &str,
+) -> Option<String> {
+    hardware_detail(
+        description.manufacturer(),
+        description.driver(),
+        display_name,
+        endpoint_id,
+    )
+}
+
+/// Une variante ALSA d'un même nom de périphérique, telle que l'énumération la
+/// rend.
+///
+/// Le NOM n'est pas un champ : c'est la clef de regroupement, identique pour
+/// tous les membres d'un groupe. La règle ne le lit jamais — elle départage des
+/// variantes dont on sait déjà qu'elles portent le même nom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlsaVariant {
+    /// Le PCM ALSA : `hw:CARD=X,DEV=0`, `sysdefault:CARD=X`, `dmix:CARD=X`…
+    /// C'est la SEULE chose qui distingue ces variantes entre elles.
+    pub endpoint_id: String,
+    /// Voies annoncées par l'énumération — pas forcément par le matériel.
+    pub max_channels: u16,
+    /// Cadences annoncées par l'énumération — pas forcément par le matériel.
+    pub sample_rates: Vec<u32>,
+}
+
+/// Le candidat doit-il remplacer la variante retenue ? (#3209, #1655)
+///
+/// ## Pourquoi « la plus riche » était le défaut lui-même
+///
+/// `snd_device_name_hint` expose une carte sous une dizaine de PCM qui
+/// partagent tous la même première ligne de description — c'est ce qui force le
+/// regroupement par nom. Seul `hw:` atteint le pilote ; tous les autres passent
+/// par un greffon (`plug`, `dmix`, `sysdefault`, `front`…) qui **accepte tout**.
+///
+/// Interroger un greffon cadence par cadence rend donc « oui » partout, et voie
+/// par voie jusqu'à 32 pour un DAC stéréo. Le greffon annonçait ainsi des
+/// capacités **plus riches que le matériel**, gagnait le départage, et imposait
+/// son identité : Tune publiait « 44,1 → 384 kHz mesurées » puis ouvrait un
+/// `dmix` verrouillé à 48 kHz (`defaults.pcm.dmix.rate 48000`). Un FLAC 44,1
+/// était rééchantillonné en silence (GgB, Eversolo DAC-Z8 sous Fedora, #1655 ;
+/// audit #3209 : « rien ne guide vers `hw:` »).
+///
+/// **Une capacité annoncée par un greffon n'est pas une capacité mesurée, et ne
+/// doit jamais gagner un départage contre le matériel.**
+///
+/// ## L'ordre total appliqué
+///
+/// 1. **Le PCM matériel d'abord**, quelles que soient les capacités annoncées.
+/// 2. À classe égale seulement, la variante la plus riche (voies, puis nombre
+///    de cadences) — le comportement d'avant, intact.
+/// 3. À capacités égales, le `pcm_id` le plus petit. Sans ce dernier cran, la
+///    variante retenue serait la **première énumérée**, donc dépendante de
+///    l'ordre d'alsa-lib.
+///
+/// Ces trois critères forment un ordre total : le vainqueur ne dépend pas de
+/// l'ordre du parcours.
+///
+/// ## Ce que cette règle ne change PAS
+///
+/// Elle ne change ni le nombre de périphériques publiés (le regroupement par
+/// nom reste entier — 43 fantômes → 48 zones chez JeromeQ, Ubuntu 24.04), ni
+/// le périphérique d'une zone déjà configurée : la résolution
+/// ([`resolve_device`]) travaille sur la liste BRUTE de `output_devices()`,
+/// jamais sur cette liste fusionnée, et apparie d'abord par `endpoint_id`. Une
+/// zone qui a mémorisé `sysdefault:…` continue donc d'ouvrir `sysdefault:…`.
+/// Seules les zones créées ensuite héritent du PCM matériel.
+///
+/// Quand aucune variante du groupe n'est un `hw:` — le cas d'une machine où
+/// PipeWire est le seul chemin praticable — le critère 1 ne départage rien et
+/// le comportement d'avant s'applique mot pour mot.
+fn variante_alsa_candidate_l_emporte(retenue: &AlsaVariant, candidate: &AlsaVariant) -> bool {
+    let retenue_materielle = alsa_pcm_is_direct_hardware(&retenue.endpoint_id);
+    let candidate_materielle = alsa_pcm_is_direct_hardware(&candidate.endpoint_id);
+    if candidate_materielle != retenue_materielle {
+        return candidate_materielle;
+    }
+    if candidate.max_channels != retenue.max_channels {
+        return candidate.max_channels > retenue.max_channels;
+    }
+    if candidate.sample_rates.len() != retenue.sample_rates.len() {
+        return candidate.sample_rates.len() > retenue.sample_rates.len();
+    }
+    candidate.endpoint_id < retenue.endpoint_id
+}
+
+/// Laquelle de ces variantes homonymes doit être retenue ? Indice, ou `None`
+/// si la liste est vide.
+///
+/// Fonction PURE : aucun appel à alsa-lib, aucun périphérique, aucune variable
+/// d'environnement. Le `cfg` et l'interrogation du pilote restent du câblage,
+/// sur le patron de `resolve_local_audio_backend` — pour que la règle soit
+/// vérifiable sans matériel. Voir `variante_alsa_candidate_l_emporte` pour
+/// l'ordre appliqué et ce qu'il ne change pas.
+pub fn retenir_variante_alsa(variantes: &[AlsaVariant]) -> Option<usize> {
+    let mut gagnante: Option<usize> = None;
+    for (index, variante) in variantes.iter().enumerate() {
+        match gagnante {
+            None => gagnante = Some(index),
+            Some(courante) => {
+                if variante_alsa_candidate_l_emporte(&variantes[courante], variante) {
+                    gagnante = Some(index);
+                }
+            }
+        }
+    }
+    gagnante
 }
 
 /// Regroupe deux variantes Linux qui représentent le même nom de périphérique.
 ///
 /// PipeWire/ALSA peut exposer plusieurs entrées homonymes avec des capacités
-/// différentes. La variante retenue doit rester un tout : son identité et ses
-/// capacités ne peuvent pas provenir de deux entrées différentes.
+/// différentes. La variante retenue doit rester un tout : son identité, ses
+/// capacités **et ce que vaut la liste de cadences** ne peuvent pas provenir de
+/// trois entrées différentes.
+///
+/// Le départage lui-même est délégué à [`variante_alsa_candidate_l_emporte`] —
+/// une seule règle, éprouvable sans matériel.
 #[cfg(any(target_os = "linux", test))]
 fn merge_linux_duplicate_variant(
     existing: &mut AudioDevice,
@@ -450,22 +1325,41 @@ fn merge_linux_duplicate_variant(
     candidate_is_default: bool,
     candidate_max_channels: u16,
     candidate_sample_rates: Vec<u32>,
+    candidate_sample_rates_measured: bool,
+    candidate_hardware_detail: Option<String>,
 ) -> bool {
-    let richer = candidate_max_channels > existing.max_channels
-        || (candidate_max_channels == existing.max_channels
-            && candidate_sample_rates.len() > existing.sample_rates.len());
-    if richer {
+    let retenue = AlsaVariant {
+        endpoint_id: existing.endpoint_id.clone(),
+        max_channels: existing.max_channels,
+        sample_rates: existing.sample_rates.clone(),
+    };
+    let candidate = AlsaVariant {
+        endpoint_id: candidate_endpoint_id,
+        max_channels: candidate_max_channels,
+        sample_rates: candidate_sample_rates,
+    };
+    let bascule = variante_alsa_candidate_l_emporte(&retenue, &candidate);
+    if bascule {
         // L'identité bascule avec les capacités. Conserver l'endpoint de la
         // première variante ferait rouvrir en lecture un autre périphérique
         // que celui dont on vient de publier les capacités.
-        existing.endpoint_id = candidate_endpoint_id;
-        existing.max_channels = candidate_max_channels;
-        existing.sample_rates = candidate_sample_rates;
+        existing.endpoint_id = candidate.endpoint_id;
+        existing.max_channels = candidate.max_channels;
+        existing.sample_rates = candidate.sample_rates;
+        // Et la PREUVE bascule avec elles : `sample_rates_measured` avait été
+        // calculé pour l'endpoint de la première variante. Le laisser en place
+        // faisait présenter les cadences d'un `hw:` comme non mesurées — ou,
+        // pire, celles d'un `dmix:` comme mesurées (#1655).
+        existing.sample_rates_measured = candidate_sample_rates_measured;
+        // Et le renseignement matériel avec elles (#2272) : il désigne le
+        // contrôleur de l'endpoint retenu. Le laisser en arrière l'accrocherait
+        // au greffon qu'on vient précisément d'écarter.
+        existing.hardware_detail = candidate_hardware_detail;
     }
     if candidate_is_default {
         existing.is_default = true;
     }
-    richer
+    bascule
 }
 
 static SCAN_GUARD: std::sync::Mutex<Option<(std::time::Instant, Vec<AudioDevice>)>> =
@@ -477,10 +1371,70 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
     list_audio_devices_with_backend("auto")
 }
 
+/// Ce que doit faire une énumération de périphériques quand le pilote ASIO —
+/// qui ne s'ouvre qu'UNE fois, tous processus confondus — est déjà pris.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsioEnumerationPlan {
+    /// Interroger le matériel : aucun pilote ASIO n'est en jeu, ou il est libre.
+    Probe,
+    /// Servir le dernier inventaire connu sans toucher au pilote.
+    ServeCache,
+}
+
+/// #1267 — l'énumération générique doit-elle s'écarter du pilote ASIO ?
+///
+/// Le pilote ASIO ne supporte qu'un seul ouvreur. Le rouvrir pour DRESSER LA
+/// LISTE pendant qu'une session exclusive tente de le verrouiller le fait
+/// tourner en rond — `connect → getBufferSize → disconnect`, sans jamais
+/// atteindre `createBuffers`/`start` : la sortie ne se verrouille JAMAIS.
+/// C'est le symptôme rapporté par `zaurux` sur la sortie Diretta ASIO, et la
+/// panne déjà observée sur le Diretta SOtM.
+///
+/// [`list_asio_devices`] se gardait déjà (cf. `try_with_asio_device_lock`).
+/// L'autre porte, celle-ci, ne se gardait pas — et c'est elle qu'empruntent la
+/// page Diagnostic, `/devices/audio` et le rescan à chaud. La page Diagnostic
+/// est précisément celle qu'on ouvre quand la sortie refuse de se verrouiller :
+/// elle rouvrait le pilote et entretenait la panne qu'elle devait documenter.
+///
+/// Seule la valeur `asio` ouvre le host ASIO : `auto` passe par WASAPI (cf.
+/// [`select_host`]), et toute autre valeur également.
+pub fn plan_audio_enumeration(backend: &str, asio_device_busy: bool) -> AsioEnumerationPlan {
+    if asio_device_busy && backend.eq_ignore_ascii_case("asio") {
+        AsioEnumerationPlan::ServeCache
+    } else {
+        AsioEnumerationPlan::Probe
+    }
+}
+
+/// Une session de lecture exclusive tient-elle le pilote ASIO ?
+///
+/// Toujours `false` là où il n'y a pas d'ASIO : macOS, Linux, et Windows
+/// compilé sans la fonctionnalité `asio`.
+fn asio_device_busy() -> bool {
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        super::asio_exclusive::asio_device_is_busy()
+    }
+    #[cfg(not(all(target_os = "windows", feature = "asio")))]
+    {
+        false
+    }
+}
+
 /// List audio devices using the specified backend preference.
 /// Protected by a global Mutex + 5s cache to prevent concurrent ASIO
 /// driver enumeration which crashes on Windows (non-reentrant COM STA).
 pub fn list_audio_devices_with_backend(backend: &str) -> Vec<AudioDevice> {
+    // Avant tout : ne pas rouvrir un pilote ASIO qu'une lecture exclusive est
+    // en train de verrouiller (#1267). Le cooldown de 5 s ci-dessous ne suffit
+    // pas — passé ce délai il relance un balayage complet en pleine session.
+    if plan_audio_enumeration(backend, asio_device_busy()) == AsioEnumerationPlan::ServeCache {
+        debug!(
+            backend = %backend,
+            "local_audio_enumeration_skipped_asio_device_busy"
+        );
+        return cached_audio_devices();
+    }
     let mut guard = SCAN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((last_scan, ref cached)) = *guard {
         if last_scan.elapsed().as_secs() < SCAN_COOLDOWN_SECS {
@@ -541,11 +1495,19 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
     match host.output_devices() {
         Ok(output_devices) => {
             for device in output_devices {
-                let raw_name = device
-                    .description()
+                let description = device.description().ok();
+                let raw_name = description
+                    .as_ref()
                     .map(|desc| desc.name().to_string())
-                    .unwrap_or_else(|_| "Unknown".into());
+                    .unwrap_or_else(|| "Unknown".into());
                 let endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
+                // #2272 — ce que cpal sait déjà du CONTRÔLEUR, et que cette
+                // énumération jetait en ne lisant que le nom. Calculé sur le nom
+                // BRUT, avant toute désambiguïsation : le suffixe `(n)` vient de
+                // nous et n'a rien à dire sur le matériel.
+                let hardware_detail = description.as_ref().and_then(|desc| {
+                    hardware_detail_from_description(desc, &raw_name, &endpoint_id)
+                });
 
                 // Skip ALSA null/dummy sinks that produce no audio
                 if is_null_sink(&raw_name) {
@@ -582,7 +1544,13 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                                 );
                                 probe_device_fallback_caps(&device, &raw_name)
                             } else {
-                                // Enumerated caps are real → safe to collapse on.
+                                // Ces capacités viennent bien d'une énumération —
+                                // ce qui ne veut PAS dire qu'elles ont été
+                                // mesurées : sur WASAPI l'énumération est
+                                // fabriquée (#2862, voir `sample_rate_evidence`).
+                                // `caps_reliable` répond seulement « pas la
+                                // supposition de dernier recours », ce qui reste
+                                // vrai ici et suffit au dédoublonnage Linux.
                                 (max_ch, rates, true)
                             }
                         }
@@ -596,9 +1564,14 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     };
 
                 let is_default = raw_name == default_name;
-                // caps_reliable was only read by the removed (name, caps) collapse
-                // (Linux collapses by name; Windows/macOS now keep every device).
-                let _ = caps_reliable;
+                // Ce que vaut la liste qu'on s'apprête à publier. Sur WASAPI
+                // elle n'a jamais été confrontée au matériel (#2862) ; sur ALSA
+                // elle ne vaut que si le PCM interrogé EST le matériel, et pas
+                // un `dmix:`/`plughw:` qui accepte tout (#1655). Et une liste
+                // SUPPOSÉE (`caps_reliable = false`) n'a jamais rien mesuré —
+                // ce drapeau était calculé puis jeté.
+                let rates_evidence =
+                    sample_rate_evidence_for_device(&host_name, &endpoint_id, caps_reliable);
 
                 // Collapse duplicates. On Linux PipeWire lists the same physical
                 // output repeatedly with varying caps, so collapse by NAME and
@@ -609,17 +1582,36 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                 #[cfg(target_os = "linux")]
                 {
                     if let Some(&idx) = linux_by_name.get(&raw_name) {
-                        let richer = merge_linux_duplicate_variant(
+                        let ancien_endpoint = devices[idx].endpoint_id.clone();
+                        let ancien_materiel = alsa_pcm_is_direct_hardware(&ancien_endpoint);
+                        let bascule = merge_linux_duplicate_variant(
                             &mut devices[idx],
                             endpoint_id,
                             is_default,
                             max_channels,
                             sample_rates,
+                            rates_evidence.is_measured(),
+                            hardware_detail,
                         );
+                        let retenu_materiel =
+                            alsa_pcm_is_direct_hardware(&devices[idx].endpoint_id);
+                        if bascule && retenu_materiel && !ancien_materiel {
+                            // Chemin bit-perfect : ce groupe publiera désormais
+                            // le PCM du DAC au lieu d'un greffon qui accepte
+                            // tout. Une décision qui change ce qui sera OUVERT
+                            // ne passe jamais en silence (#3209, #1655).
+                            info!(
+                                device = %raw_name,
+                                greffon_ecarte = %ancien_endpoint,
+                                endpoint_retenu = %devices[idx].endpoint_id,
+                                "local_audio_alsa_hardware_pcm_preferred"
+                            );
+                        }
                         debug!(
                             device = %raw_name,
                             retained_endpoint_id = %devices[idx].endpoint_id,
-                            richer,
+                            bascule,
+                            retenu_materiel,
                             "local_audio_device_collapsed_pipewire_duplicate"
                         );
                         continue;
@@ -652,6 +1644,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     is_default,
                     max_channels,
                     sample_rates = ?sample_rates,
+                    sample_rates_measured = rates_evidence.is_measured(),
                     "local_audio_device_found"
                 );
 
@@ -661,7 +1654,9 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     is_default,
                     max_channels,
                     sample_rates,
+                    sample_rates_measured: rates_evidence.is_measured(),
                     backend: host_name.to_string(),
+                    hardware_detail,
                 });
                 #[cfg(target_os = "linux")]
                 linux_by_name.insert(raw_name.clone(), devices.len() - 1);
@@ -798,6 +1793,15 @@ pub struct LocalOutput {
     /// **avant** le nom, seule façon de survivre à un renommage (#2269) et de
     /// ne pas confondre deux périphériques homonymes (#2272).
     endpoint_id: Option<String>,
+    /// L'hôte audio qui a énuméré `device_name` (`AudioDevice::backend`).
+    ///
+    /// #3230 : le nom seul ne dit pas d'où il vient. Une zone née d'une
+    /// énumération WASAPI garde un nom WASAPI ; si la lecture ouvre ensuite
+    /// l'hôte ASIO — ce que `select_host("asio")` fait dès qu'ASIO expose une
+    /// sortie — ce nom ne désigne plus rien, et le repli envoyait le son sur
+    /// le périphérique ASIO par défaut. `None` = origine inconnue (sortie
+    /// recréée à la volée, zone d'avant ce correctif) : on ne refuse rien.
+    origin_host: Option<String>,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     /// What the playback callbacks actually multiply by: the user volume
@@ -929,6 +1933,35 @@ pub struct LocalOutput {
     /// PURE) and only when the stream is stereo. Set per-play by the
     /// orchestrator via `set_crossfeed`.
     crossfeed: Arc<std::sync::Mutex<Option<super::super::audio::crossfeed::CrossfeedProcessor>>>,
+    /// Repli mono de la zone en cours de lecture sur cette sortie (#2362).
+    ///
+    /// Quand il est armé, la chaîne somme `M = (L + R) / 2` et réémet `M` sur
+    /// les DEUX voies stéréo, **en dernier** — après l'égaliseur, le convolveur
+    /// et le crossfeed, qui ont tous besoin de leur contexte stéréo pour
+    /// travailler. La duplication tombe donc juste avant l'adaptation au
+    /// périphérique, et le contrat du DAC (deux canaux) ne change pas.
+    ///
+    /// Défaut `false` : sans geste de l'utilisateur, le comportement est
+    /// strictement celui d'avant. Posé par piste par l'orchestrateur, comme
+    /// `pure_bypass` et `crossfeed`, et rafraîchissable en vol
+    /// (`refresh_zone_mono_downmix`).
+    ///
+    /// Ce n'est PAS du bit-perfect, et c'est assumé : le panneau « Chemin du
+    /// signal » affiche l'étape « Mono » et le verdict tombe.
+    mono_downmix: Arc<AtomicBool>,
+    /// Durée, en millisecondes, de la rampe de gain anti-« ploc » appliquée à la
+    /// pause, à la reprise et à l'arrêt (#1590).
+    ///
+    /// `0` = coupure franche, c'est-à-dire le comportement d'avant #1590 au bit
+    /// près. Posée par piste par l'orchestrateur comme `pure_bypass` et
+    /// `mono_downmix` ; l'orchestrateur y met déjà `0` pour une zone PURE.
+    ///
+    /// Ce n'est **pas** le seul verrou : les callbacks relisent aussi
+    /// `dop_active` et `pure_bypass` à chaque tampon, parce qu'un DoP se
+    /// découvre en cours de piste et que le mode PURE se bascule en vol. Le
+    /// verdict est tranché en un point unique,
+    /// [`crate::audio::soft_mute::armed_ms`].
+    soft_mute_ms: Arc<AtomicU32>,
     /// True while the PCM currently flowing through this output is a **DoP**
     /// (DSD over PCM) payload, as detected on the bytes themselves by
     /// [`is_dop_pcm`].
@@ -962,6 +1995,14 @@ pub struct LocalOutput {
     /// `play_url()` — a failure belongs to the track that provoked it, and
     /// must never travel to the next one.
     open_failure: Arc<std::sync::Mutex<Option<String>>>,
+    /// Combien de fois le rappel audio a manqué de données depuis le début du
+    /// flux, et combien d'échantillons sont partis en zéros (#3205).
+    ///
+    /// Le même `Arc` est confié à l'anneau de CHAQUE backend au moment où il
+    /// est créé, quelle que soit la branche empruntée ; il survit donc aux
+    /// replis (rate de repli, cascade entière) parce qu'il appartient à la
+    /// sortie, pas au flux.
+    starvation: Arc<RingStarvation>,
 }
 
 /// What the render callbacks multiply every sample by, in thousandths.
@@ -1060,6 +2101,51 @@ impl LocalOutput {
         Self::with_options_and_endpoint(device_name, None, exclusive_mode, audio_backend)
     }
 
+    /// Rattacher cette sortie à l'hôte audio qui a énuméré son nom.
+    ///
+    /// À appeler partout où le nom vient d'un [`AudioDevice`] : sans cette
+    /// étiquette, un nom ne porte rien et la résolution ne peut pas refuser un
+    /// hôte étranger (#3230). Une chaîne vide est traitée comme « inconnu ».
+    ///
+    /// # Elle RECTIFIE aussi le backend (#1770)
+    ///
+    /// Connaître l'hôte d'origine, c'est savoir sous quel hôte ce nom est
+    /// ouvrable — et donc pouvoir refuser d'en ouvrir un autre. La règle est
+    /// dans [`crate::config::openable_local_backend`], avec le détail de ce
+    /// qu'elle répare.
+    ///
+    /// Elle est appliquée ICI, à la construction, et non chez les appelants :
+    /// c'est le seul endroit où l'origine est connue, et le recensement des
+    /// sites d'enregistrement est un PLANCHER, jamais un plafond. Un site
+    /// ajouté demain qui étiquette correctement son origine est corrigé sans
+    /// rien avoir à savoir de cette règle ; un site qui ne l'étiquette pas
+    /// n'est pas corrigé — et c'est ce que garde
+    /// `les_deux_sites_d_enregistrement_local_etiquettent_l_hote_d_origine`
+    /// dans `tune-server/src/background.rs`.
+    #[must_use]
+    pub fn with_origin_host(mut self, origin_host: &str) -> Self {
+        self.origin_host = (!origin_host.is_empty()).then(|| origin_host.to_string());
+        self.audio_backend =
+            crate::config::openable_local_backend(&self.audio_backend, self.origin_host.as_deref());
+        self
+    }
+
+    /// Le backend sous lequel cette sortie sera OUVERTE.
+    ///
+    /// Ce n'est pas forcément le réglage `local_audio_backend` : quand l'hôte
+    /// d'origine est connu, [`Self::with_origin_host`] l'a rectifié (#1770).
+    /// C'est cette valeur-là que consomment `select_host`, la branche ASIO
+    /// exclusive et [`crate::outputs::OutputTarget::is_available`].
+    pub fn audio_backend(&self) -> &str {
+        &self.audio_backend
+    }
+
+    /// L'hôte audio qui a énuméré le nom que porte cette sortie, s'il est
+    /// connu (#3230).
+    pub fn origin_host(&self) -> Option<&str> {
+        self.origin_host.as_deref()
+    }
+
     /// Create a local output bound to the stable backend endpoint discovered
     /// alongside its display name.
     pub fn with_options_and_endpoint(
@@ -1073,6 +2159,7 @@ impl LocalOutput {
             device_name,
             device_id,
             endpoint_id,
+            origin_host: None,
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1000)),
@@ -1103,10 +2190,16 @@ impl LocalOutput {
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            mono_downmix: Arc::new(AtomicBool::new(false)),
+            // Désarmée tant que l'orchestrateur n'a pas posé la valeur de la
+            // zone : une sortie construite hors chemin de lecture se comporte
+            // exactement comme avant #1590.
+            soft_mute_ms: Arc::new(AtomicU32::new(0)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
+            starvation: Arc::new(RingStarvation::new()),
         }
     }
 
@@ -1262,6 +2355,62 @@ impl LocalOutput {
         self.pure_bypass.store(bypass, Ordering::Relaxed);
     }
 
+    /// Armer (ou désarmer) le repli mono de la zone qui joue sur cette sortie
+    /// (#2362). Posé par l'orchestrateur, exactement comme `set_pure_bypass`.
+    ///
+    /// Un simple `store` suffit et se fait aussi bien en début de piste qu'en
+    /// pleine lecture : contrairement au crossfeed ou à l'égaliseur, le repli
+    /// n'a AUCUN état à emporter — pas de ligne à retard, pas d'historique de
+    /// biquad. Il n'y a donc pas de `replace_..._live` séparé, et la bascule
+    /// ne peut pas claquer.
+    pub fn set_mono_downmix(&self, mono: bool) {
+        self.mono_downmix.store(mono, Ordering::Relaxed);
+    }
+
+    /// Le repli mono est-il armé sur cette sortie ?
+    pub fn has_mono_downmix(&self) -> bool {
+        self.mono_downmix.load(Ordering::Relaxed)
+    }
+
+    /// Régler la durée de la rampe anti-« ploc » de la zone qui joue sur cette
+    /// sortie (#1590). `0` désarme et rétablit la coupure franche.
+    ///
+    /// Comme `set_mono_downmix`, un `store` suffit et se fait aussi bien en
+    /// début de piste qu'en pleine lecture : la rampe n'a pas d'état à
+    /// reconstruire, et [`crate::audio::soft_mute::SoftMuteRamp::arm`] ne
+    /// recalcule son incrément que si la durée a changé.
+    ///
+    /// La valeur est bornée ici aussi, et pas seulement chez l'appelant : c'est
+    /// la sortie qui doit garantir qu'un réglage aberrant ne rend pas la pause
+    /// molle.
+    pub fn set_soft_mute_ms(&self, ms: u32) {
+        self.soft_mute_ms.store(
+            ms.min(crate::audio::soft_mute::SOFT_MUTE_MAX_MS),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Durée de rampe **réellement applicable** en cet instant, gardes
+    /// bit-perfect comprises. C'est ce que lisent les callbacks et `stop()`.
+    fn armed_soft_mute_ms(&self) -> u32 {
+        crate::audio::soft_mute::armed_ms(
+            self.soft_mute_ms.load(Ordering::Relaxed),
+            self.dop_active.load(Ordering::Relaxed),
+            self.pure_bypass.load(Ordering::Relaxed),
+            self.exclusive_mode,
+        )
+    }
+
+    /// La porte que les callbacks de rendu relisent à chaque tampon.
+    fn soft_mute_gate(&self) -> crate::audio::soft_mute::SoftMuteGate {
+        crate::audio::soft_mute::SoftMuteGate::new(
+            self.soft_mute_ms.clone(),
+            self.dop_active.clone(),
+            self.pure_bypass.clone(),
+            self.exclusive_mode,
+        )
+    }
+
     /// Install (or clear with `None`) the headphone crossfeed processor for the
     /// zone about to play on this output. Set per-play by the orchestrator,
     /// mirroring `set_pure_bypass`: the orchestrator passes `None` when the zone
@@ -1305,9 +2454,16 @@ impl LocalOutput {
         self.convolver_config.lock().unwrap().is_some()
     }
 
-    /// Returns `true` if exclusive/bit-perfect mode is supported on this platform.
+    /// Le mode exclusif / bit-perfect est-il disponible sur CETTE cible ?
+    ///
+    /// Le verdict vient de [`exclusive_mode_support`], à qui la plateforme est
+    /// **passée** : sans cela la décision Windows ne serait compilée que sous
+    /// Windows et aucun test joué ailleurs ne pourrait la contredire — même
+    /// raison que pour [`sample_rate_evidence`] (#2862), même angle mort que
+    /// #1837 et #2056. Ce site est le seul à lire la valeur réelle de la
+    /// machine.
     pub fn supports_exclusive_mode() -> bool {
-        cfg!(target_os = "macos") || cfg!(all(target_os = "windows", feature = "asio"))
+        exclusive_mode_support(std::env::consts::OS, cfg!(feature = "asio")).any()
     }
 
     pub fn set_pending_start_position_ms(&self, position_ms: u64) {
@@ -1371,6 +2527,16 @@ pub struct RingBuf {
     write: AtomicU64,
     /// Read position (audio callback reads here)
     read: AtomicU64,
+    /// Compteur de famine (#3205), partagé avec la sortie qui possède cet
+    /// anneau.
+    ///
+    /// Il est porté par l'ANNEAU et non par chaque rappel parce que l'anneau
+    /// est le seul objet que TOUS les backends partagent : cpal partagé,
+    /// repli entier, chemin compressé, CoreAudio exclusif, ASIO et WASAPI
+    /// exclusif reçoivent tous ce même `Arc`. Compter dans le drain couvre
+    /// donc les six d'un seul geste, sans toucher à la signature d'un seul
+    /// backend, et rend impossible l'oubli d'un site futur.
+    starvation: Arc<RingStarvation>,
 }
 
 /// Integer SPSC ring used by Windows exclusive backends when the source must
@@ -1385,6 +2551,9 @@ pub(crate) struct NativePcmRing {
     buf: Box<[UnsafeCell<i32>]>,
     write: AtomicU64,
     read: AtomicU64,
+    /// Même compteur de famine que `RingBuf` (#3205) : les backends exclusifs
+    /// Windows drainent cet anneau-ci.
+    starvation: Arc<RingStarvation>,
 }
 
 // SAFETY: same strict SPSC contract and Acquire/Release cursor discipline as
@@ -1398,6 +2567,11 @@ unsafe impl Sync for NativePcmRing {}
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl NativePcmRing {
     pub(crate) fn new(capacity: usize) -> Self {
+        Self::new_metered(capacity, Arc::new(RingStarvation::new()))
+    }
+
+    /// Jumeau de `RingBuf::new_metered` (#3205).
+    pub(crate) fn new_metered(capacity: usize, starvation: Arc<RingStarvation>) -> Self {
         Self {
             buf: (0..capacity)
                 .map(|_| UnsafeCell::new(0i32))
@@ -1405,6 +2579,7 @@ impl NativePcmRing {
                 .into_boxed_slice(),
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
+            starvation,
         }
     }
 
@@ -1463,6 +2638,7 @@ impl NativePcmRing {
             *target = map(unsafe { *self.buf[idx].get() });
         }
         self.read.store(r + n as u64, Ordering::Release);
+        self.starvation.record(out.len(), n);
         n
     }
 
@@ -1488,6 +2664,9 @@ impl NativePcmRing {
             out[offset..offset + bytes_per_sample].copy_from_slice(&native[4 - bytes_per_sample..]);
         }
         self.read.store(r + count as u64, Ordering::Release);
+        // Compté en ÉCHANTILLONS comme partout ailleurs, pas en octets : le
+        // chiffre doit se comparer d'un backend à l'autre (#3205).
+        self.starvation.record(out.len() / bytes_per_sample, count);
         count * bytes_per_sample
     }
 }
@@ -1604,6 +2783,13 @@ unsafe impl Sync for RingBuf {}
 
 impl RingBuf {
     pub fn new(capacity: usize) -> Self {
+        Self::new_metered(capacity, Arc::new(RingStarvation::new()))
+    }
+
+    /// Anneau dont la famine est comptée dans un compteur PARTAGÉ avec la
+    /// sortie, seul moyen pour `/api/v1/system/diagnostics` de lire ce que le
+    /// rappel a vécu.
+    pub fn new_metered(capacity: usize, starvation: Arc<RingStarvation>) -> Self {
         Self {
             buf: (0..capacity)
                 .map(|_| UnsafeCell::new(0.0f32))
@@ -1611,6 +2797,7 @@ impl RingBuf {
                 .into_boxed_slice(),
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
+            starvation,
         }
     }
 
@@ -1679,6 +2866,10 @@ impl RingBuf {
             out[i] = map(unsafe { *self.buf[idx].get() });
         }
         self.read.store(r + n as u64, Ordering::Release);
+        // #3205 : `n < out.len()` ICI, c'est exactement le `read < data.len()`
+        // que les rappels comblent avec des zéros. Trois atomiques `Relaxed`,
+        // rien d'autre — voir le contrat sur `RingStarvation`.
+        self.starvation.record(out.len(), n);
         n
     }
 }
@@ -1905,9 +3096,58 @@ mod ringbuf_tests {
     }
 }
 
+/// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
+///
+/// `decode_compressed_stream` rendait `None` pour QUATRE causes distinctes, et
+/// le fil de lecture n'en tirait qu'un `warn!` : la zone s'arrêtait, le
+/// sondeur ne recevait rien, et l'écran restait muet. Le motif nommé est ce
+/// qui permet à `record_compressed_decode_failure` de dire à l'utilisateur
+/// laquelle des quatre s'est produite.
+///
+/// Même forme que [`WindowsExclusivePcmError`] : un événement de journal
+/// stable pour la fouille, une phrase française pour l'écran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressedDecodeFailure {
+    /// Aucun démultiplexeur de symphonia n'a reconnu le conteneur.
+    ContainerUnrecognised,
+    /// Conteneur lisible, mais il ne porte aucune piste audio exploitable.
+    NoAudioTrack,
+    /// La piste audio existe ; son codec n'a pas de décodeur ici.
+    CodecUnsupported,
+    /// Le décodage a tourné et n'a produit aucun échantillon (flux tronqué).
+    NoSamplesDecoded,
+}
+
+impl CompressedDecodeFailure {
+    fn log_event(self) -> &'static str {
+        match self {
+            Self::ContainerUnrecognised => "local_audio_decode_container_unrecognised",
+            Self::NoAudioTrack => "local_audio_decode_no_audio_track",
+            Self::CodecUnsupported => "local_audio_decode_codec_unsupported",
+            Self::NoSamplesDecoded => "local_audio_decode_no_samples",
+        }
+    }
+
+    fn user_message(self, device: &str) -> String {
+        let reason = match self {
+            Self::ContainerUnrecognised => "aucun décodeur n'a reconnu le format de ce flux",
+            Self::NoAudioTrack => "le flux ne contient aucune piste audio lisible",
+            Self::CodecUnsupported => "le codec de cette piste n'est pas pris en charge",
+            Self::NoSamplesDecoded => {
+                "le décodage n'a produit aucun échantillon, le flux est tronqué ou vide"
+            }
+        };
+        format!(
+            "Sortie « {device} » : impossible de décoder la piste, {reason}. La lecture a été arrêtée avant l'ouverture du périphérique ; choisissez une autre version du fichier ou vérifiez qu'il n'est pas endommagé"
+        )
+    }
+}
+
 /// Decode a compressed audio stream (FLAC, MP3, AAC, etc.) into f32 samples using symphonia.
-/// Returns (channels, sample_rate, samples) or None if decoding fails.
-fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
+///
+/// Rend `Err(motif)` plutôt que `None` : l'appelant doit pouvoir DIRE pourquoi
+/// il s'arrête (#3270), et un `Option` ne portait rien à dire.
+fn decode_compressed_stream(data: &[u8]) -> Result<(u16, u32, Vec<f32>), CompressedDecodeFailure> {
     use std::io::Cursor;
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -1928,12 +3168,14 @@ fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
                 FormatOptions::default(),
                 MetadataOptions::default(),
             )
-            .ok()?;
+            .map_err(|_| CompressedDecodeFailure::ContainerUnrecognised)?;
 
-    let track = format.default_track(TrackType::Audio)?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or(CompressedDecodeFailure::NoAudioTrack)?;
     let audio_params = match &track.codec_params {
         Some(CodecParameters::Audio(params)) => params.clone(),
-        _ => return None,
+        _ => return Err(CompressedDecodeFailure::NoAudioTrack),
     };
     let track_id = track.id;
     let sample_rate = audio_params.sample_rate.unwrap_or(44100);
@@ -1945,7 +3187,7 @@ fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
 
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
-        .ok()?;
+        .map_err(|_| CompressedDecodeFailure::CodecUnsupported)?;
 
     let mut all_samples: Vec<f32> = Vec::new();
 
@@ -1972,7 +3214,7 @@ fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
     }
 
     if all_samples.is_empty() {
-        return None;
+        return Err(CompressedDecodeFailure::NoSamplesDecoded);
     }
 
     info!(
@@ -1982,7 +3224,7 @@ fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
         "local_audio_decoded_compressed_stream"
     );
 
-    Some((channels, sample_rate, all_samples))
+    Ok((channels, sample_rate, all_samples))
 }
 
 /// WAV format tag constants.
@@ -1997,10 +3239,17 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 /// `wValidBitsPerSample` is used instead of the container size.
 ///
 /// The `bit_depth` returned is the *effective* bit depth for PCM
-/// interpretation:
-///   - PCM integer: `wBitsPerSample` (or `wValidBitsPerSample` for EXTENSIBLE)
+/// interpretation, et il est **toujours** l'un de `0`, `16`, `24`, `32` :
+///   - PCM entier : la largeur du CONTENEUR (`nBlockAlign / nChannels`),
+///     validée par [`pcm_container_bit_depth`] ; tout autre conteneur rend
+///     `None` et part au décodeur symphonia ;
 ///   - IEEE Float 32-bit: returns 0 as a sentinel so `pcm_bytes_to_f32`
 ///     uses the float path.
+///
+/// Cet ensemble fermé est un contrat, pas une commodité : `bytes_per_sample`,
+/// `frame_bytes` et toutes les conversions d'échantillons du fichier
+/// n'énumèrent que ces valeurs, et leurs branches par défaut se contredisent
+/// (bruit ici, silence là).
 /// Whether a failed header read should be retried rather than treated as a hard
 /// failure. When a gapless/next track's transcode session has just started, its
 /// WAV header isn't emitted yet, so the first reads return `TimedOut`/
@@ -2013,6 +3262,45 @@ fn header_read_should_retry(kind: std::io::ErrorKind) -> bool {
         kind,
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
     )
+}
+
+/// Profondeur PCM entière que le reste du fichier sait réellement décoder,
+/// déduite du CONTENEUR (`nBlockAlign / nChannels`) et non des bits annoncés.
+///
+/// Tout ce qui suit — `bytes_per_sample`, `frame_bytes`, l'alignement des
+/// trames, [`pcm_bytes_to_f32`], [`pcm_bytes_to_native_i32`],
+/// [`native_i32_to_pcm_bytes`], [`f32_to_native_i32`],
+/// [`NativePcmRing::pop_pcm_bytes`] — n'énumère que 16, 24 et 32 bits (plus le
+/// sentinelle 0 pour le flottant). Une profondeur en dehors de cet ensemble
+/// n'est donc pas « moins précise » : elle est **incohérente**, et de deux
+/// façons opposées selon le chemin.
+///
+/// - `pcm_bytes_to_f32` retombe sur la lecture 16 bits : elle consomme deux
+///   octets par échantillon là où l'appelant en a compté `bit_depth / 8`.
+///   Chaque trame est alors lue au mauvais décalage, et la sortie locale rend
+///   du **bruit blanc avec la musique derrière** — exactement le symptôme
+///   d'un désaccord de format sur une chaîne numérique.
+/// - `pcm_bytes_to_native_i32` et `f32_to_native_i32` rendent un `Vec` vide :
+///   le chemin exclusif Windows, lui, rend du **silence**.
+///
+/// Un conteneur nul (`nBlockAlign < nChannels`, en-tête corrompu) est le pire
+/// des cas : il produit `0`, qui est précisément le sentinelle « IEEE float
+/// 32 bits ». Du PCM entier serait alors réinterprété comme des flottants —
+/// du bruit à pleine échelle vers un amplificateur.
+///
+/// On refuse donc l'en-tête plutôt que de le mal décoder. `None` renvoie le
+/// flux au décodeur symphonia, ce que ce fichier fait déjà pour le flottant
+/// 64 bits qu'il ne sait pas porter non plus.
+fn pcm_container_bit_depth(block_align: u16, channels: u16) -> Option<u16> {
+    if channels == 0 {
+        return None;
+    }
+    match block_align / channels {
+        2 => Some(16),
+        3 => Some(24),
+        4 => Some(32),
+        _ => None,
+    }
 }
 
 fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
@@ -2045,19 +3333,21 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
             channels = u16::from_le_bytes([fmt[2], fmt[3]]);
             sample_rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]);
             let block_align = u16::from_le_bytes([fmt[12], fmt[13]]);
-            let w_bits_per_sample = u16::from_le_bytes([fmt[14], fmt[15]]);
+            // `wBitsPerSample` n'est plus lu : c'est une ANNONCE, pas un pas
+            // d'avancement. Seul `nBlockAlign` dit ce que le flux fait
+            // réellement, et c'est lui que [`pcm_container_bit_depth`] valide.
 
             match format_tag {
                 WAVE_FORMAT_PCM => {
                     // Use nBlockAlign to determine the actual byte width per
                     // sample, which may differ from wBitsPerSample / 8 in
                     // edge cases (e.g. 20-bit in 24-bit container).
-                    if channels > 0 {
-                        let container_bytes = block_align / channels;
-                        bit_depth = (container_bytes * 8).min(32);
-                    } else {
-                        bit_depth = w_bits_per_sample;
-                    }
+                    //
+                    // `.min(32)` mentait sur le pas d'avancement : un conteneur
+                    // de 8 octets était annoncé 32 bits et lu à la moitié de sa
+                    // largeur, et un conteneur nul produisait le sentinelle
+                    // flottant. Voir [`pcm_container_bit_depth`].
+                    bit_depth = pcm_container_bit_depth(block_align, channels)?;
                 }
                 WAVE_FORMAT_IEEE_FLOAT => {
                     // Signal to pcm_bytes_to_f32 that the data is already
@@ -2118,24 +3408,29 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
                             // annoncée signale un en-tête incohérent, et on
                             // suit alors le conteneur, qui est ce que le flux
                             // fait réellement.
-                            if channels > 0 {
-                                let container_bytes = block_align / channels;
-                                debug_assert!(
-                                    valid_bits <= container_bytes * 8,
-                                    "wValidBitsPerSample > conteneur : en-tête incohérent"
-                                );
-                                bit_depth = match container_bytes {
-                                    0..=2 => 16,
-                                    3 => 24,
-                                    _ => 32,
-                                };
-                            } else {
-                                bit_depth = w_bits_per_sample;
-                            }
+                            //
+                            // Les bornes ouvertes `0..=2 => 16` et `_ => 32`
+                            // rattrapaient un conteneur absurde en ANNONÇANT un
+                            // pas que le flux ne fait pas : un conteneur d'un
+                            // octet lu par pas de deux, un conteneur de huit lu
+                            // par pas de quatre. L'alignement des trames est
+                            // faux dès le premier échantillon, et la sortie
+                            // locale rend du bruit. Un conteneur hors 2/3/4
+                            // octets n'est pas rattrapable ici : on rend `None`
+                            // et symphonia le décode.
+                            let container_bytes = block_align / channels.max(1);
+                            debug_assert!(
+                                valid_bits <= container_bytes * 8,
+                                "wValidBitsPerSample > conteneur : en-tête incohérent"
+                            );
+                            bit_depth = pcm_container_bit_depth(block_align, channels)?;
                         }
                     } else {
-                        // Truncated EXTENSIBLE — fall back to container size
-                        bit_depth = w_bits_per_sample;
+                        // Truncated EXTENSIBLE — fall back to container size.
+                        // `wBitsPerSample` n'est ici qu'une annonce : elle peut
+                        // valoir 20 ou 0, que rien en aval ne sait décoder.
+                        // C'est `nBlockAlign` qui dit ce que le flux fait.
+                        bit_depth = pcm_container_bit_depth(block_align, channels)?;
                     }
                 }
                 _ => {
@@ -2266,6 +3561,7 @@ struct LocalPcmProcessor<'a> {
     convolver: &'a std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &'a AtomicBool,
+    mono_downmix: &'a AtomicBool,
     dop_active: &'a AtomicBool,
     volume: &'a AtomicU32,
     user_volume: &'a AtomicU32,
@@ -2313,6 +3609,7 @@ impl LocalPcmProcessor<'_> {
             self.convolver,
             self.crossfeed,
             self.pure_bypass,
+            self.mono_downmix,
             channels,
             dop,
         );
@@ -2406,6 +3703,72 @@ fn record_exclusive_open_failure(
     }
 }
 
+/// Le périphérique s'est OUVERT puis a cessé de tirer l'audio : dire lequel,
+/// et où la lecture s'est arrêtée.
+///
+/// Distinct de [`record_exclusive_open_failure`] parce que la cause l'est :
+/// là-bas rien n'a jamais été envoyé, ici le rappel de rendu a accepté
+/// l'ouverture puis s'est tu. Vu de l'utilisateur les deux se ressemblent —
+/// « ça ne joue pas » — mais le geste diffère (rebrancher/rallumer contre
+/// choisir une autre sortie), et c'est ce que dit le message.
+///
+/// `frozen_position_ms` n'est pas décoratif : c'est la position à laquelle
+/// l'écran est resté figé, donc le seul chiffre qui relie ce que le testeur
+/// voit à ce que le journal dit. Sur un anneau exclusif dimensionné à deux
+/// secondes d'audio, il vaut 2000 — le « figée à 2 s » du constat.
+///
+/// Passe par `failure_slot`, c'est-à-dire par `take_output_failure()` : le
+/// canal que le poller draine déjà à chaque tick pour émettre
+/// `zone.playback_error` avec `fatal: true`. Aucun second canal n'est ouvert.
+fn record_feed_stall_failure(
+    backend: &str,
+    device: &str,
+    frozen_position_ms: u64,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        backend,
+        device,
+        frozen_position_ms,
+        stall_timeout_secs = FEED_STALL_TIMEOUT.as_secs(),
+        "output_feed_stall_consumer_dead"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(format!(
+            "Sortie « {device} » : le périphérique a accepté l'ouverture {backend} puis a cessé de recevoir l'audio ; la lecture est restée figée à {frozen_position_ms} ms. {}",
+            OpenFailure::DeviceGone.user_message()
+        ));
+    }
+}
+
+/// Le DÉCODAGE a échoué : la zone ne jouera pas, et c'est le seul endroit qui
+/// sait pourquoi (#3270).
+///
+/// Quatrième membre de la famille `record_*` de ce fichier, et pour la même
+/// raison que les trois autres : `failure_slot` est le canal que
+/// `take_output_failure()` draine à chaque tick du sondeur, qui émet alors
+/// `zone.playback_error` avec `fatal: true`. Sans cet appel il ne restait
+/// qu'un `warn!` dans le journal du serveur — invisible depuis l'écran.
+///
+/// Contrairement aux trois autres, la panne n'est PAS celle du périphérique :
+/// il n'a jamais été ouvert. La sortie est nommée quand même, parce que c'est
+/// par elle que l'utilisateur désigne la zone qui s'est tue.
+fn record_compressed_decode_failure(
+    error: CompressedDecodeFailure,
+    device: &str,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        device,
+        refusal_event = error.log_event(),
+        reason = ?error,
+        "local_audio_decode_compressed_failed"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(error.user_message(device));
+    }
+}
+
 /// Last preparation step before the f32 ring used by Windows exclusive
 /// backends.
 ///
@@ -2425,6 +3788,7 @@ fn prepare_windows_exclusive_pcm(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> Result<Option<Vec<f32>>, WindowsExclusivePcmError> {
     let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
     if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
@@ -2441,6 +3805,7 @@ fn prepare_windows_exclusive_pcm(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
         channels,
         false,
     );
@@ -2476,6 +3841,7 @@ fn feed_windows_exclusive_leftover(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     ring: &RingBuf,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
@@ -2494,6 +3860,7 @@ fn feed_windows_exclusive_leftover(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
     )?
     else {
         // The raw bytes remain staged until the first 24-bit probe reaches a
@@ -2555,6 +3922,7 @@ fn feed_windows_native_exclusive_leftover(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     ring: &NativePcmRing,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
@@ -2575,6 +3943,7 @@ fn feed_windows_native_exclusive_leftover(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
     )?;
 
     *must_classify_24_bit = false;
@@ -2605,6 +3974,7 @@ fn feed_selected_windows_exclusive_leftover(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     ring: WindowsExclusiveRingRef<'_>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
@@ -2623,6 +3993,7 @@ fn feed_selected_windows_exclusive_leftover(
             convolver,
             crossfeed,
             pure_bypass,
+            mono_downmix,
             ring,
             stop_rx,
             paused,
@@ -2639,6 +4010,7 @@ fn feed_selected_windows_exclusive_leftover(
                 convolver,
                 crossfeed,
                 pure_bypass,
+                mono_downmix,
                 ring,
                 stop_rx,
                 paused,
@@ -2767,6 +4139,7 @@ fn flush_local_dsp(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     channels: u16,
     dop: bool,
 ) -> Vec<f32> {
@@ -2791,6 +4164,13 @@ fn flush_local_dsp(
     {
         c.process_interleaved(&mut queue);
     }
+    // Même ordre que `apply_local_dsp` : sans ceci la queue du convolveur
+    // sortirait en stéréo pendant que le corps de la piste sort en mono, et
+    // l'auditeur à une seule enceinte entendrait la fin de chaque piste
+    // s'appauvrir (#2362).
+    if channels == 2 && mono_downmix.load(Ordering::Relaxed) {
+        crate::audio::channels::fold_stereo_to_mono_in_place(&mut queue);
+    }
     queue
 }
 
@@ -2800,6 +4180,7 @@ fn apply_local_dsp(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     channels: u16,
     dop: bool,
 ) {
@@ -2824,6 +4205,14 @@ fn apply_local_dsp(
                 c.process_interleaved(samples);
             }
         }
+    }
+    // Repli mono EN DERNIER (#2362) : les trois traitements ci-dessus ont tous
+    // besoin de leur contexte stéréo — le crossfeed travaille sur la
+    // DIFFÉRENCE des voies et n'aurait plus rien à traiter après la somme, le
+    // convolveur applique une IR par canal, l'égaliseur des gains par canal.
+    // La duplication tombe donc juste avant l'adaptation au périphérique.
+    if channels == 2 && mono_downmix.load(Ordering::Relaxed) {
+        crate::audio::channels::fold_stereo_to_mono_in_place(samples);
     }
 }
 
@@ -2946,11 +4335,17 @@ fn local_dsp_is_identity(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> bool {
     if pure_bypass.load(Ordering::Relaxed) {
         return true;
     }
-    eq.lock().is_ok_and(|guard| guard.is_none())
+    // Le repli mono compte comme les autres (#2362) : il RÉÉCRIT chaque
+    // échantillon. Sans lui ici, le producteur Windows prendrait la branche
+    // « octets source conservés » et le repli ne serait jamais appliqué — le
+    // réglage serait accepté et resterait sans effet.
+    !mono_downmix.load(Ordering::Relaxed)
+        && eq.lock().is_ok_and(|guard| guard.is_none())
         && convolver.lock().is_ok_and(|guard| guard.is_none())
         && crossfeed.lock().is_ok_and(|guard| guard.is_none())
 }
@@ -2961,6 +4356,7 @@ fn local_dsp_runtime_state(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     dop: bool,
 ) -> OutputDspState {
     if dop {
@@ -2968,6 +4364,12 @@ fn local_dsp_runtime_state(
     }
     if pure_bypass.load(Ordering::Relaxed) {
         return OutputDspState::BypassedPure;
+    }
+    // Le repli mono est une vraie transformation : il doit APPARAÎTRE dans le
+    // verdict, sans quoi le panneau annoncerait un chemin intouché pendant que
+    // chaque échantillon est réécrit (#2362, famille de #1548/#1559/#1627).
+    if mono_downmix.load(Ordering::Relaxed) {
+        return OutputDspState::Applied;
     }
     let (Ok(eq), Ok(convolver), Ok(crossfeed)) = (eq.lock(), convolver.lock(), crossfeed.lock())
     else {
@@ -2997,13 +4399,14 @@ fn windows_signal_path_status(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> OutputSignalPathStatus {
     let sample_transport = if native_transport {
         OutputSampleTransport::NativeInteger
     } else {
         OutputSampleTransport::Float
     };
-    let dsp = local_dsp_runtime_state(eq, convolver, crossfeed, pure_bypass, dop);
+    let dsp = local_dsp_runtime_state(eq, convolver, crossfeed, pure_bypass, mono_downmix, dop);
     let volume = if dop {
         OutputVolumeState::BypassedDop
     } else if volume_units == 1000 {
@@ -3046,6 +4449,7 @@ fn publish_windows_signal_path_status(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> OutputSignalPathStatus {
     let mut status = windows_signal_path_status(
         native_transport,
@@ -3055,6 +4459,7 @@ fn publish_windows_signal_path_status(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
     );
     // Le verdict du producteur est autoritaire : il a choisi la branche raw
     // ou flottante pour CE buffer. La lecture des verrous ci-dessus décrit
@@ -3096,6 +4501,7 @@ fn prepare_windows_native_pcm(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> Option<PreparedNativePcm> {
     let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
     if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
@@ -3104,7 +4510,8 @@ fn prepare_windows_native_pcm(
 
     let dop = dop_latched || (bit_depth == 24 && is_dop_pcm(bytes, bit_depth, channels));
     let bit_perfect = dop
-        || (volume_units == 1000 && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass));
+        || (volume_units == 1000
+            && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass, mono_downmix));
     let samples = if bit_perfect {
         pcm_bytes_to_native_i32(bytes, bit_depth)
     } else {
@@ -3115,6 +4522,7 @@ fn prepare_windows_native_pcm(
             convolver,
             crossfeed,
             pure_bypass,
+            mono_downmix,
             channels,
             false,
         );
@@ -3157,6 +4565,7 @@ impl OutputTarget for LocalOutput {
             true,
             self.supports_internal_gapless(),
         )
+        .with_linear_volume(1000)
     }
 
     /// Exclusive-mode playback (ASIO / WASAPI exclusive) uses a dedicated loop
@@ -3326,10 +4735,16 @@ impl OutputTarget for LocalOutput {
         // s'en sert désormais pour retrouver un périphérique renommé (#2269) et
         // pour ne pas confondre deux homonymes (#2272).
         let endpoint_id = self.endpoint_id.clone();
+        // #3230 : l'hôte dont vient `device_name`. Sans lui, la résolution ne
+        // peut pas distinguer « introuvable ici » de « n'a jamais été d'ici ».
+        let origin_host = self.origin_host.clone();
         let url = url.to_string();
         let playing = self.playing.clone();
         let paused = self.paused.clone();
         let volume = self.volume.clone();
+        // #3205 : le compteur de famine suit le flux dans le fil de lecture et
+        // sera confié à l'anneau de la branche effectivement retenue.
+        let starvation = self.starvation.clone();
         let position_ms = self.position_ms.clone();
         let mut seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
         let seek_offset_arc = self.seek_offset_ms.clone();
@@ -3342,8 +4757,13 @@ impl OutputTarget for LocalOutput {
         let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
         let pure_bypass = self.pure_bypass.clone();
+        let mono_downmix = self.mono_downmix.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
+        // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
+        // plutôt que trois atomiques de plus dans des fermetures qui en portent
+        // déjà huit.
+        let soft_mute = self.soft_mute_gate();
         // Les deux composantes du volume effectif, pour pouvoir le recalculer
         // depuis la boucle d'alimentation quand le flux entre ou sort du DoP —
         // `recompute_effective_volume` est une méthode et n'est pas atteignable
@@ -3478,14 +4898,20 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
-                // Decode the compressed audio
-                let Some((dec_channels, dec_sample_rate, decoded_samples)) =
-                    decode_compressed_stream(&all_data)
-                else {
-                    warn!("local_audio_decode_compressed_failed");
-                    playing.store(false, Ordering::SeqCst);
-                    return;
-                };
+                // Decode the compressed audio.
+                //
+                // #3270 : l'échec passe par `open_failure`, le canal que le
+                // sondeur draine. Un `return` nu laissait la zone s'arrêter
+                // sans que l'écran apprenne jamais pourquoi.
+                let (dec_channels, dec_sample_rate, decoded_samples) =
+                    match decode_compressed_stream(&all_data) {
+                        Ok(decoded) => decoded,
+                        Err(reason) => {
+                            record_compressed_decode_failure(reason, &device_name, &open_failure);
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    };
 
                 // Now play the decoded f32 samples using cpal shared mode
                 let dec_ch = dec_channels;
@@ -3493,9 +4919,12 @@ impl OutputTarget for LocalOutput {
                 let decoded_len = decoded_samples.len();
 
                 let host = select_host(&audio_backend);
-                let Some((device, fell_back)) =
-                    find_device_with_fallback(&host, &device_name, endpoint_id.as_deref())
-                else {
+                let Some((device, fell_back)) = find_device_with_fallback(
+                    &host,
+                    &device_name,
+                    endpoint_id.as_deref(),
+                    origin_host.as_deref(),
+                ) else {
                     warn!(name = %device_name, "audio_device_not_found_compressed");
                     playing.store(false, Ordering::SeqCst);
                     return;
@@ -3537,12 +4966,15 @@ impl OutputTarget for LocalOutput {
                 let output_ch = output_config.channels;
 
                 let ring_cap = (output_sr as usize) * (output_ch as usize) * 2;
-                let ring = Arc::new(RingBuf::new(ring_cap));
+                starvation.begin_stream(output_sr, output_ch);
+                let ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
                 ring.clear(); // Defensive: zero-fill before callback can read
                 let ring_cb = ring.clone();
                 let vol_cb = volume.clone();
                 let paused_cb = paused.clone();
                 let silent_cb = force_silent.clone();
+                let soft_mute_cb = soft_mute.clone();
+                let mut ramp_cb = soft_mute_cb.ramp(output_sr, output_ch);
                 // Gate: output silence until enough real data has been buffered.
                 // Prevents stale/garbage audio during track transitions.
                 // Minimum: ~500ms of audio at the output sample rate.
@@ -3555,7 +4987,15 @@ impl OutputTarget for LocalOutput {
                 let stream = match device.build_output_stream(
                     &output_config,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
+                        // Rampe anti-« ploc » (#1590) : au lieu de sauter de
+                        // l'amplitude courante à zéro, le gain glisse sur
+                        // quelques dizaines de millisecondes. `arm(0)` — DoP,
+                        // PURE, sortie exclusive — rend exactement la coupure
+                        // franche d'avant.
+                        ramp_cb.arm(soft_mute_cb.armed_ms());
+                        let silence =
+                            paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
+                        if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
                             data.fill(0.0);
                             return;
                         }
@@ -3572,9 +5012,7 @@ impl OutputTarget for LocalOutput {
                         }
                         let read = ring_cb.pop(data);
                         let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                        for sample in &mut data[..read] {
-                            *sample *= v;
-                        }
+                        ramp_cb.apply(&mut data[..read], v);
                         if read < data.len() {
                             data[read..].fill(0.0);
                         }
@@ -3643,6 +5081,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     dec_ch,
                     false,
                 );
@@ -3651,7 +5090,14 @@ impl OutputTarget for LocalOutput {
                 // DSP, la queue du convolveur peut donc etre ajoutee ici — elle
                 // suivra la meme adaptation de canaux et le meme
                 // reechantillonnage que le reste (#2209).
-                let queue = flush_local_dsp(&convolver, &crossfeed, &pure_bypass, dec_ch, false);
+                let queue = flush_local_dsp(
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    &mono_downmix,
+                    dec_ch,
+                    false,
+                );
                 samples.extend_from_slice(&queue);
 
                 // Adapt channels and resample if needed (using rubato
@@ -3749,11 +5195,8 @@ impl OutputTarget for LocalOutput {
                 // ring stays full and this loop used to spin until restart.
                 // Deadline = queued audio duration + 5s margin, mirroring the
                 // asio_drain_timeout guard of the exclusive path.
-                let drain_deadline = std::time::Duration::from_millis(
-                    (ring.available() as u64 * 1000)
-                        / ((output_sr as u64).max(1) * (output_ch as u64).max(1))
-                        + 5000,
-                );
+                let drain_deadline =
+                    drain_deadline_for(ring.available(), output_sr as u64, output_ch as u64);
                 let drain_started = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
@@ -3831,7 +5274,8 @@ impl OutputTarget for LocalOutput {
 
                 // Ring buffer: ~2 seconds of audio at source sample rate
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let ring = Arc::new(RingBuf::new(ring_cap));
+                starvation.begin_stream(sample_rate, channels);
+                let ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
                 ring.clear(); // Defensive: zero-fill before callback reads
 
                 let exclusive = match ExclusiveOutput::new(
@@ -3857,6 +5301,17 @@ impl OutputTarget for LocalOutput {
                 };
 
                 info!(device = %device_name, url = %url, "local_audio_exclusive_playing");
+                // CoreAudio exclusif : `resolve_output_device` retombe sur le
+                // périphérique système quand le nom stocké n'existe plus (DAC
+                // débranché, renommé, routage macOS changé). `opened_id` reste
+                // `None` : l'`AudioDeviceID` est un entier réattribué au
+                // redémarrage, ce n'est pas une identité qu'on peut afficher.
+                note_opened_device(
+                    "CoreAudio",
+                    &device_name,
+                    &exclusive.format_info().device_name,
+                    None,
+                );
 
                 // Feed audio data (no resampling needed -- hardware is set to source rate)
                 let pcm_data = if data_offset < header_buf.len() {
@@ -3876,6 +5331,7 @@ impl OutputTarget for LocalOutput {
                     convolver: &convolver,
                     crossfeed: &crossfeed,
                     pure_bypass: &pure_bypass,
+                    mono_downmix: &mono_downmix,
                     dop_active: &dop_active,
                     volume: &volume,
                     user_volume: &user_volume_ref,
@@ -3883,6 +5339,13 @@ impl OutputTarget for LocalOutput {
                 };
 
                 // Process leftover from header read
+                // #3108 — le verdict de blocage était JETÉ aux trois sites de
+                // ce chemin, seul de tous les chemins de lecture. Conséquence
+                // exacte du constat : l'anneau exclusif tient deux secondes
+                // d'audio (`ring_cap` ci-dessus), il se remplit une fois, le
+                // rappel de rendu ne tire rien, et la position reste sur 2 000
+                // ms pour toujours — sans un mot.
+                let mut feed_stalled = false;
                 if let Some(processed) = pcm_processor.process_pcm_chunk(
                     &mut leftover,
                     frame_bytes,
@@ -3890,18 +5353,20 @@ impl OutputTarget for LocalOutput {
                     channels,
                     &mut pcm_kind,
                 ) {
-                    feed_ring_abortable(
+                    if !feed_ring_abortable(
                         &ring,
                         &processed.samples,
                         &stop_rx,
                         &paused,
                         Some(&force_silent),
-                    );
+                    ) {
+                        feed_stalled = true;
+                    }
                     total_frames_fed += processed.source_frames;
                 }
 
                 let mut http_eof_excl = false;
-                loop {
+                while !feed_stalled {
                     if stop_rx.try_recv().is_ok() {
                         break;
                     }
@@ -3947,19 +5412,35 @@ impl OutputTarget for LocalOutput {
                         continue;
                     };
 
-                    feed_ring_abortable(
+                    if !feed_ring_abortable(
                         &ring,
                         &processed.samples,
                         &stop_rx,
                         &paused,
                         Some(&force_silent),
-                    );
+                    ) {
+                        feed_stalled = true;
+                        break;
+                    }
 
                     total_frames_fed += processed.source_frames;
 
                     let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
                         + seek_offset;
                     position_ms.store(pos, Ordering::Relaxed);
+                }
+
+                if feed_stalled {
+                    // La piste n'a PAS fini : `http_eof_excl` reste faux, donc
+                    // aucune fin naturelle n'est signalée et la file n'avance
+                    // pas vers un morceau qui heurterait le même périphérique
+                    // mort. Le seul mot dit à l'utilisateur part d'ici.
+                    record_feed_stall_failure(
+                        "CoreAudio",
+                        &device_name,
+                        position_ms.load(Ordering::Relaxed),
+                        &open_failure,
+                    );
                 }
 
                 if http_eof_excl {
@@ -3974,10 +5455,11 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
-                if !queue.is_empty() {
+                if !queue.is_empty() && !feed_stalled {
                     feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
                     total_frames_fed += (queue.len() / channels.max(1) as usize) as u64;
                 }
@@ -3991,7 +5473,15 @@ impl OutputTarget for LocalOutput {
                     TRACK_END_NOTIFY.notify_one();
                 }
 
-                // Wait for ring buffer to drain
+                // Wait for ring buffer to drain — JAMAIS sans fin (#3108).
+                // Les chemins ASIO, WASAPI et partagé bornaient déjà leur
+                // vidage ; celui-ci, seul, tournait tant que l'anneau n'était
+                // pas vide. Face à un rappel de rendu mort il ne se vide
+                // jamais : le fil restait vivant, la zone « en lecture », et le
+                // réexamen des branchements gelé avec elle.
+                let drain_deadline =
+                    drain_deadline_for(ring.available(), sample_rate as u64, channels as u64);
+                let drain_started = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -4000,6 +5490,14 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
+                        break;
+                    }
+                    if drain_started.elapsed() >= drain_deadline {
+                        warn!(
+                            device = %device_name,
+                            remaining_samples = ring.available(),
+                            "local_audio_exclusive_drain_timeout"
+                        );
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -4033,8 +5531,10 @@ impl OutputTarget for LocalOutput {
 
                 // Ring buffer: ~2 seconds of audio at source sample rate
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let float_ring = Arc::new(RingBuf::new(ring_cap));
-                let native_ring = Arc::new(NativePcmRing::new(ring_cap));
+                starvation.begin_stream(sample_rate, channels);
+                let float_ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
+                let native_ring =
+                    Arc::new(NativePcmRing::new_metered(ring_cap, starvation.clone()));
                 float_ring.clear();
                 native_ring.clear();
 
@@ -4077,6 +5577,10 @@ impl OutputTarget for LocalOutput {
                 }
 
                 info!(device = %device_name, url = %url, "local_audio_asio_exclusive_playing");
+                // ASIO exclusif : résolution par sous-chaîne, et `"default"`
+                // prend le premier pilote listé. `opened_id` reste `None` :
+                // ASIO n'expose aucun identifiant d'endpoint.
+                note_opened_device("ASIO", &device_name, exclusive.opened_device_name(), None);
 
                 // Feed audio data (no resampling needed -- hardware is set to source rate)
                 let pcm_data = if data_offset < header_buf.len() {
@@ -4135,6 +5639,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     selected_ring,
                     &stop_rx,
                     &paused,
@@ -4162,6 +5667,7 @@ impl OutputTarget for LocalOutput {
                             &convolver,
                             &crossfeed,
                             &pure_bypass,
+                            &mono_downmix,
                         );
                         bit_perfect_state = Some(runtime.bit_perfect);
                         info!(
@@ -4374,6 +5880,7 @@ impl OutputTarget for LocalOutput {
                         &convolver,
                         &crossfeed,
                         &pure_bypass,
+                        &mono_downmix,
                         selected_ring,
                         &stop_rx,
                         &paused,
@@ -4401,6 +5908,7 @@ impl OutputTarget for LocalOutput {
                                 &convolver,
                                 &crossfeed,
                                 &pure_bypass,
+                                &mono_downmix,
                             );
                             if bit_perfect_state != Some(runtime.bit_perfect) {
                                 bit_perfect_state = Some(runtime.bit_perfect);
@@ -4483,6 +5991,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
@@ -4592,7 +6101,8 @@ impl OutputTarget for LocalOutput {
                 );
 
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let ring = Arc::new(NativePcmRing::new(ring_cap));
+                starvation.begin_stream(sample_rate, channels);
+                let ring = Arc::new(NativePcmRing::new_metered(ring_cap, starvation.clone()));
                 ring.clear();
 
                 match WasapiExclusiveOutput::new(
@@ -4621,6 +6131,15 @@ impl OutputTarget for LocalOutput {
                                 endpoint_id = %wasapi.opened_device_id(),
                                 info = %wasapi.format_info(),
                                 "wasapi_exclusive_playing"
+                            );
+                            // Ces deux accesseurs existaient depuis #2207 et
+                            // n'avaient que cette ligne de journal pour
+                            // lecteur. La zone les porte désormais.
+                            note_opened_device(
+                                "WASAPI",
+                                &device_name,
+                                wasapi.opened_device_name(),
+                                Some(wasapi.opened_device_id()),
                             );
 
                             let pcm_data = if data_offset < header_buf.len() {
@@ -4660,6 +6179,7 @@ impl OutputTarget for LocalOutput {
                                 &convolver,
                                 &crossfeed,
                                 &pure_bypass,
+                                &mono_downmix,
                                 &ring,
                                 &stop_rx,
                                 &paused,
@@ -4689,6 +6209,7 @@ impl OutputTarget for LocalOutput {
                                     &convolver,
                                     &crossfeed,
                                     &pure_bypass,
+                                    &mono_downmix,
                                 );
                                 if bit_perfect_state != Some(runtime.bit_perfect) {
                                     bit_perfect_state = Some(runtime.bit_perfect);
@@ -4742,6 +6263,7 @@ impl OutputTarget for LocalOutput {
                                                 &convolver,
                                                 &crossfeed,
                                                 &pure_bypass,
+                                                &mono_downmix,
                                                 &ring,
                                                 &stop_rx,
                                                 &paused,
@@ -4774,6 +6296,7 @@ impl OutputTarget for LocalOutput {
                                                 &convolver,
                                                 &crossfeed,
                                                 &pure_bypass,
+                                                &mono_downmix,
                                             );
                                             if bit_perfect_state != Some(runtime.bit_perfect) {
                                                 bit_perfect_state = Some(runtime.bit_perfect);
@@ -4838,6 +6361,7 @@ impl OutputTarget for LocalOutput {
                                 &convolver,
                                 &crossfeed,
                                 &pure_bypass,
+                                &mono_downmix,
                                 channels,
                                 false,
                             );
@@ -4907,9 +6431,15 @@ impl OutputTarget for LocalOutput {
 
             // ------- Open cpal device (shared mode) -------
             let host = select_host(&audio_backend);
-            let Some((device, fell_back)) =
-                find_device_with_fallback(&host, &device_name, endpoint_id.as_deref())
-            else {
+            // Nom de la VARIANTE cpal ("Wasapi", "Alsa", "Asio", "CoreAudio").
+            // `&'static str`, donc aucun emprunt sur `host`.
+            let host_id_name: &'static str = host.id().name();
+            let Some((device, fell_back)) = find_device_with_fallback(
+                &host,
+                &device_name,
+                endpoint_id.as_deref(),
+                origin_host.as_deref(),
+            ) else {
                 warn!(
                     requested = %device_name,
                     "audio_device_not_found_no_fallback"
@@ -4952,79 +6482,158 @@ impl OutputTarget for LocalOutput {
                 let default_cfg = device.default_output_config().ok().map(|c| c.config());
                 let default_sr = default_cfg.as_ref().map(|c| c.sample_rate);
 
-                if default_sr == Some(sample_rate) {
-                    // Device is already at the source rate — use it directly
-                    default_cfg.unwrap()
-                } else if let Some(cfg) = find_matching_config(&device, channels, sample_rate)
-                    .filter(|c| c.sample_rate == sample_rate)
-                {
-                    // Device SUPPORTS the source rate even though its current
-                    // default differs — open at the source rate for bit-perfect
-                    // output and to avoid an extreme realtime resample.  A DSD256
-                    // file decodes to 352.8kHz; on a DAC left at 44.1kHz by the
-                    // OS the old code resampled 352.8k→44.1k in real time, the
-                    // sinc resampler underran and no sound came out (Cyrille,
-                    // FiiO K3 which natively supports 352.8kHz, iFi Neo iDSD).
-                    info!(
-                        source_sr = sample_rate,
-                        device_default_sr = ?default_sr,
-                        "local_audio_open_at_source_rate_supported"
-                    );
-                    // macOS: cpal's CoreAudio backend does NOT switch the device's
-                    // hardware nominal rate for output streams (see the note
-                    // above), so opening the cpal stream "at the source rate"
-                    // leaves the DAC clocked at the OS rate and CoreAudio silently
-                    // converts — which yields SILENCE for high-rate DSD→PCM
-                    // (DSD128/256/512 all decode to 352.8kHz; only DSD64's 176.4k
-                    // survived). We reach this branch precisely when the device
-                    // SUPPORTS the source rate but its default differs, so set the
-                    // hardware nominal rate explicitly (what the exclusive/hog path
-                    // already does) — the DAC then actually clocks at 352.8kHz.
-                    // Best-effort: if the device can't be resolved/set we fall
-                    // through to today's behavior (no regression). Cyrille: iFi
-                    // Neo iDSD / FiiO K3, DSD128+ silent.
-                    #[cfg(target_os = "macos")]
-                    {
-                        use coreaudio::audio_unit::macos_helpers;
-                        if let Some(dev_id) =
-                            macos_helpers::get_device_id_from_name(&device_name, false)
+                // Ce que l'énumération de cpal RÉPOND. Le filtre est
+                // TAUTOLOGIQUE quand l'énumération est fabriquée :
+                // `find_matching_config` recopie la cadence demandée dans le
+                // `StreamConfig` qu'il rend, donc `c.sample_rate ==
+                // sample_rate` est vrai par construction dès qu'une plage
+                // quelconque a été retenue — et sur WASAPI toutes les plages
+                // sont retenues sans test (#2862). Cette réponse n'est donc
+                // plus qu'une ENTRÉE de la décision (#3233) : c'est
+                // `decide_local_rate_opening` qui tranche, en regardant ce que
+                // la réponse vaut. Elle n'est calculée que si le périphérique
+                // n'est pas déjà à la bonne cadence — sur WASAPI l'énumération
+                // déroule 147 formats, sur ASIO elle touche le pilote.
+                let enumerated = if default_sr == Some(sample_rate) {
+                    None
+                } else {
+                    find_matching_config(&device, channels, sample_rate)
+                        .filter(|c| c.sample_rate == sample_rate)
+                };
+                // Sur ALSA, `endpoint_id` est le nom de PCM (`hw:CARD=…`,
+                // `dmix:CARD=…`) : c'est LUI qui dit si le « oui » vient du
+                // pilote ou d'un rééchantillonneur (#1655). Le journaliser
+                // ici est la ligne qui manquait pour trancher un relevé de
+                // terrain sans y retourner.
+                let opened_endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
+                let rate_evidence =
+                    sample_rate_evidence_for_device(host_id_name, &opened_endpoint_id, true);
+                let decision = decide_local_rate_opening(
+                    sample_rate,
+                    default_sr,
+                    enumerated.is_some(),
+                    rate_evidence,
+                );
+
+                // Ce que la décision ouvre RÉELLEMENT — la seule chose qu'on ait
+                // le droit de remonter.
+                let (chosen, opened_sr, reason) = match (decision, default_cfg, enumerated) {
+                    // Le périphérique y est déjà : aucune conversion, et rien à
+                    // régler côté matériel.
+                    (LocalRateOpening::DeviceAlreadyAtSourceRate, Some(cfg), _) => {
+                        (cfg, sample_rate, None)
+                    }
+                    // L'énumération est une MESURE et elle retient la cadence :
+                    // on ouvre à la cadence de la source, exactement comme
+                    // avant. Témoin du cas nominal.
+                    //
+                    // A DSD256 file decodes to 352.8kHz; on a DAC left at
+                    // 44.1kHz by the OS the old code resampled 352.8k→44.1k in
+                    // real time, the sinc resampler underran and no sound came
+                    // out (Cyrille, FiiO K3 which natively supports 352.8kHz,
+                    // iFi Neo iDSD).
+                    (LocalRateOpening::AtSourceRateMeasured, _, Some(cfg)) => {
+                        info!(
+                            source_sr = sample_rate,
+                            device_default_sr = ?default_sr,
+                            backend = %host_id_name,
+                            endpoint_id = %opened_endpoint_id,
+                            rate_support_measured = rate_evidence.is_measured(),
+                            "local_audio_open_at_source_rate_reported_supported"
+                        );
+                        // macOS: cpal's CoreAudio backend does NOT switch the
+                        // device's hardware nominal rate for output streams (see
+                        // the note above), so opening the cpal stream "at the
+                        // source rate" leaves the DAC clocked at the OS rate and
+                        // CoreAudio silently converts — which yields SILENCE for
+                        // high-rate DSD→PCM (DSD128/256/512 all decode to
+                        // 352.8kHz; only DSD64's 176.4k survived). We reach this
+                        // branch precisely when the device SUPPORTS the source
+                        // rate but its default differs, so set the hardware
+                        // nominal rate explicitly (what the exclusive/hog path
+                        // already does) — the DAC then actually clocks at
+                        // 352.8kHz. Best-effort: if the device can't be
+                        // resolved/set we fall through to today's behavior (no
+                        // regression). Cyrille: iFi Neo iDSD / FiiO K3, DSD128+
+                        // silent.
+                        #[cfg(target_os = "macos")]
                         {
-                            let want = cfg.sample_rate as f64;
-                            match macos_helpers::set_device_sample_rate(dev_id, want) {
-                                Ok(_) => info!(
-                                    device = %device_name,
-                                    to = cfg.sample_rate,
-                                    "local_audio_coreaudio_nominal_rate_set_shared"
-                                ),
-                                Err(e) => warn!(
-                                    error = %e,
-                                    wanted = cfg.sample_rate,
-                                    "local_audio_coreaudio_set_rate_failed"
-                                ),
+                            use coreaudio::audio_unit::macos_helpers;
+                            if let Some(dev_id) =
+                                macos_helpers::get_device_id_from_name(&device_name, false)
+                            {
+                                let want = cfg.sample_rate as f64;
+                                match macos_helpers::set_device_sample_rate(dev_id, want) {
+                                    Ok(_) => info!(
+                                        device = %device_name,
+                                        to = cfg.sample_rate,
+                                        "local_audio_coreaudio_nominal_rate_set_shared"
+                                    ),
+                                    Err(e) => warn!(
+                                        error = %e,
+                                        wanted = cfg.sample_rate,
+                                        "local_audio_coreaudio_set_rate_failed"
+                                    ),
+                                }
                             }
                         }
+                        (cfg, sample_rate, None)
                     }
-                    cfg
-                } else if let Some(cfg) = default_cfg {
-                    // Device does not support the source rate — open at device
-                    // rate, rubato will resample.
-                    info!(
-                        source_sr = sample_rate,
-                        device_sr = cfg.sample_rate,
-                        "local_audio_rate_mismatch_will_resample"
-                    );
-                    cfg
-                } else {
-                    // No default config available — try source rate as last
-                    // resort (PipeWire, etc.).
-                    find_matching_config(&device, channels, sample_rate).unwrap_or(
-                        cpal::StreamConfig {
-                            channels,
-                            sample_rate,
-                            buffer_size: cpal::BufferSize::Default,
+                    // On refuse la cadence de la source : rubato convertit. Une
+                    // décision qui change ce qui part au DAC ne passe jamais en
+                    // silence (#3209, #1655, #3233).
+                    (
+                        LocalRateOpening::ResampleToDeviceRate {
+                            device_sample_rate,
+                            reason,
                         },
-                    )
-                }
+                        Some(cfg),
+                        _,
+                    ) => {
+                        warn!(
+                            source_sr = sample_rate,
+                            device_sr = device_sample_rate,
+                            backend = %host_id_name,
+                            endpoint_id = %opened_endpoint_id,
+                            rate_support_measured = rate_evidence.is_measured(),
+                            reason = reason.code(),
+                            "local_audio_rate_mismatch_will_resample"
+                        );
+                        (cfg, device_sample_rate, Some(reason))
+                    }
+                    // Aucune cadence de périphérique connue : rien vers quoi
+                    // rééchantillonner, on ouvre à la cadence de la source en
+                    // dernier recours (PipeWire, etc.). Les bras `Some(cfg)`
+                    // ci-dessus étant exhaustifs pour `default_cfg = Some(..)`,
+                    // ce bras ne se prend qu'avec `default_cfg = None` — sauf
+                    // `AtSourceRateMeasured` sans `enumerated`, que
+                    // `decide_local_rate_opening` ne peut pas produire.
+                    _ => {
+                        let cfg = find_matching_config(&device, channels, sample_rate).unwrap_or(
+                            cpal::StreamConfig {
+                                channels,
+                                sample_rate,
+                                buffer_size: cpal::BufferSize::Default,
+                            },
+                        );
+                        let opened = cfg.sample_rate;
+                        info!(
+                            source_sr = sample_rate,
+                            opened_sr = opened,
+                            backend = %host_id_name,
+                            endpoint_id = %opened_endpoint_id,
+                            "local_audio_rate_last_resort_no_device_default"
+                        );
+                        (cfg, opened, None)
+                    }
+                };
+                note_rate_decision(ObservedRate {
+                    source_sample_rate: sample_rate,
+                    opened_sample_rate: opened_sr,
+                    reason,
+                    evidence_measured: rate_evidence.is_measured(),
+                });
+                chosen
             };
 
             // Build output stream at the chosen rate.
@@ -5033,45 +6642,53 @@ impl OutputTarget for LocalOutput {
             // has been buffered in the ring buffer.  This prevents stale or
             // garbage audio from reaching the DAC during track transitions.
             let data_started_shared = Arc::new(AtomicBool::new(false));
-            let build_stream = |cfg: &cpal::StreamConfig,
-                                ring_cb: Arc<RingBuf>,
-                                vol_cb: Arc<AtomicU32>,
-                                paused_cb: Arc<AtomicBool>,
-                                _finished_cb: Arc<AtomicBool>,
-                                silent_cb: Arc<AtomicBool>,
-                                ds_cb: Arc<AtomicBool>,
-                                min_buf: usize| {
-                device.build_output_stream(
-                    cfg,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
-                            data.fill(0.0);
-                            return;
-                        }
-                        // Wait for a minimum amount of data before starting
-                        // to read from the ring buffer. This prevents the
-                        // audio device from playing stale/garbage samples
-                        // during track transitions.
-                        if !ds_cb.load(Ordering::Acquire) {
-                            if ring_cb.available() < min_buf {
+            let build_stream =
+                |cfg: &cpal::StreamConfig,
+                 ring_cb: Arc<RingBuf>,
+                 vol_cb: Arc<AtomicU32>,
+                 paused_cb: Arc<AtomicBool>,
+                 _finished_cb: Arc<AtomicBool>,
+                 silent_cb: Arc<AtomicBool>,
+                 ds_cb: Arc<AtomicBool>,
+                 min_buf: usize,
+                 soft_mute_cb: crate::audio::soft_mute::SoftMuteGate| {
+                    let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
+                    device.build_output_stream(
+                        cfg,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            // Rampe anti-« ploc » (#1590) — voir le callback du
+                            // chemin compressé pour le détail. `arm(0)` rétablit la
+                            // coupure franche sur DoP, PURE et sortie exclusive.
+                            ramp_cb.arm(soft_mute_cb.armed_ms());
+                            let silence = paused_cb.load(Ordering::Relaxed)
+                                || silent_cb.load(Ordering::Relaxed);
+                            if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent
+                            {
                                 data.fill(0.0);
                                 return;
                             }
-                            ds_cb.store(true, Ordering::Release);
-                        }
-                        let read = ring_cb.pop(data);
-                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                        for sample in &mut data[..read] {
-                            *sample *= v;
-                        }
-                        if read < data.len() {
-                            data[read..].fill(0.0);
-                        }
-                    },
-                    make_stream_error_cb(device_gone.clone()),
-                    None,
-                )
-            };
+                            // Wait for a minimum amount of data before starting
+                            // to read from the ring buffer. This prevents the
+                            // audio device from playing stale/garbage samples
+                            // during track transitions.
+                            if !ds_cb.load(Ordering::Acquire) {
+                                if ring_cb.available() < min_buf {
+                                    data.fill(0.0);
+                                    return;
+                                }
+                                ds_cb.store(true, Ordering::Release);
+                            }
+                            let read = ring_cb.pop(data);
+                            let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+                            ramp_cb.apply(&mut data[..read], v);
+                            if read < data.len() {
+                                data[read..].fill(0.0);
+                            }
+                        },
+                        make_stream_error_cb(device_gone.clone()),
+                        None,
+                    )
+                };
 
             // Bit-perfect USB DACs (XMOS/Totaldac, Nagra, …) frequently reject
             // float and only accept integer PCM: cpal's f32 build_output_stream
@@ -5091,6 +6708,7 @@ impl OutputTarget for LocalOutput {
                 ds_cb: Arc<AtomicBool>,
                 min_buf: usize,
                 device_gone: Arc<AtomicBool>,
+                soft_mute_cb: crate::audio::soft_mute::SoftMuteGate,
             ) -> Result<cpal::Stream, cpal::BuildStreamError>
             where
                 T: cpal::SizedSample + Send + 'static,
@@ -5099,11 +6717,19 @@ impl OutputTarget for LocalOutput {
                 use symphonia::core::audio::conv::IntoSample;
                 let zero: T = 0.0f32.into_sample();
                 let mut scratch: Vec<f32> = Vec::new();
+                let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
                 device.build_output_stream(
                     cfg,
                     move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                         let n = data.len();
-                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
+                        // Rampe anti-« ploc » (#1590). Ce chemin sert les DAC
+                        // qui refusent le flottant : la rampe y est armée par la
+                        // même porte, donc toujours désarmée sur DoP, en PURE et
+                        // en sortie exclusive.
+                        ramp_cb.arm(soft_mute_cb.armed_ms());
+                        let silence =
+                            paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
+                        if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
                             data.fill(zero);
                             return;
                         }
@@ -5120,8 +6746,13 @@ impl OutputTarget for LocalOutput {
                         let buf = &mut scratch[..n];
                         let read = ring_cb.pop(buf);
                         let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+                        // La rampe module le tampon f32 AVANT la conversion en
+                        // mot entier : convertir puis multiplier ferait le
+                        // produit dans le format du DAC, hors du contrat de
+                        // `IntoSample`.
+                        ramp_cb.apply(&mut buf[..read], v);
                         for (o, s) in data[..read].iter_mut().zip(&buf[..read]) {
-                            *o = (*s * v).into_sample();
+                            *o = (*s).into_sample();
                         }
                         data[read..].fill(zero);
                     },
@@ -5134,7 +6765,8 @@ impl OutputTarget for LocalOutput {
 
             let ring_cap =
                 (output_config.sample_rate as usize) * (output_config.channels as usize) * 2;
-            let ring_buf = Arc::new(RingBuf::new(ring_cap));
+            starvation.begin_stream(output_config.sample_rate, output_config.channels);
+            let ring_buf = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
             ring_buf.clear(); // Defensive: zero-fill before callback can read
             // Minimum buffer: ~200ms of audio before the callback starts reading.
             // sr * ch / 5 = 200ms of interleaved samples.
@@ -5149,6 +6781,7 @@ impl OutputTarget for LocalOutput {
                 silent_cb_outer.clone(),
                 data_started_shared.clone(),
                 min_buffer,
+                soft_mute.clone(),
             );
 
             let (stream, actual_config, ring) = match stream_result {
@@ -5163,7 +6796,8 @@ impl OutputTarget for LocalOutput {
                     };
                     let ring_cap_fb =
                         (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) * 2;
-                    let ring_fb = Arc::new(RingBuf::new(ring_cap_fb));
+                    starvation.begin_stream(source_cfg.sample_rate, source_cfg.channels);
+                    let ring_fb = Arc::new(RingBuf::new_metered(ring_cap_fb, starvation.clone()));
                     ring_fb.clear();
                     data_started_shared.store(false, Ordering::SeqCst);
                     let min_buffer_fb =
@@ -5177,6 +6811,7 @@ impl OutputTarget for LocalOutput {
                         silent_cb_outer.clone(),
                         data_started_shared.clone(),
                         min_buffer_fb,
+                        soft_mute.clone(),
                     ) {
                         Ok(s) => {
                             info!(
@@ -5208,7 +6843,8 @@ impl OutputTarget for LocalOutput {
                                 let min_buf =
                                     (cand.sample_rate as usize) * (cand.channels as usize) / 5;
                                 for is_i32 in [true, false] {
-                                    let r = Arc::new(RingBuf::new(cap));
+                                    starvation.begin_stream(cand.sample_rate, cand.channels);
+                                    let r = Arc::new(RingBuf::new_metered(cap, starvation.clone()));
                                     r.clear();
                                     data_started_shared.store(false, Ordering::SeqCst);
                                     let res = if is_i32 {
@@ -5222,6 +6858,7 @@ impl OutputTarget for LocalOutput {
                                             data_started_shared.clone(),
                                             min_buf,
                                             device_gone.clone(),
+                                            soft_mute.clone(),
                                         )
                                     } else {
                                         build_int_stream::<i16>(
@@ -5234,6 +6871,7 @@ impl OutputTarget for LocalOutput {
                                             data_started_shared.clone(),
                                             min_buf,
                                             device_gone.clone(),
+                                            soft_mute.clone(),
                                         )
                                     };
                                     if let Ok(s) = res {
@@ -5402,6 +7040,7 @@ impl OutputTarget for LocalOutput {
                 convolver: &convolver,
                 crossfeed: &crossfeed,
                 pure_bypass: &pure_bypass,
+                mono_downmix: &mono_downmix,
                 dop_active: &dop_active,
                 volume: &volume,
                 user_volume: &user_volume_ref,
@@ -5630,6 +7269,16 @@ impl OutputTarget for LocalOutput {
                         total_bytes_read,
                         "local_audio_stopped_feed_stall"
                     );
+                    // …et sans celle-ci, il s'arrêtait SANS RIEN DIRE (#3108).
+                    // `device_gone` ne comble pas le trou : sur macOS le rappel
+                    // d'erreur cpal ne se déclenche jamais à l'arrachage, donc
+                    // le seul témoin est le blocage qu'on vient de constater.
+                    record_feed_stall_failure(
+                        "CPAL",
+                        &device_name,
+                        position_ms.load(Ordering::Relaxed),
+                        &open_failure,
+                    );
                     break;
                 }
 
@@ -5826,6 +7475,7 @@ impl OutputTarget for LocalOutput {
                         &convolver,
                         &crossfeed,
                         &pure_bypass,
+                        &mono_downmix,
                         prev_ch,
                         dop_active.load(Ordering::Relaxed),
                     );
@@ -6086,6 +7736,15 @@ impl OutputTarget for LocalOutput {
                                     total_bytes_read,
                                     "local_audio_gapless_stopped_feed_stall"
                                 );
+                                // Même canal que la boucle principale (#3108) :
+                                // une piste enchaînée qui meurt en silence est
+                                // aussi muette qu'une première piste.
+                                record_feed_stall_failure(
+                                    "CPAL",
+                                    &device_name,
+                                    position_ms.load(Ordering::Relaxed),
+                                    &open_failure,
+                                );
                                 http_eof = false;
                                 break;
                             }
@@ -6163,6 +7822,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
@@ -6231,11 +7891,8 @@ impl OutputTarget for LocalOutput {
             // the zone "Playing" and freezing the hotplug rescan. Deadline =
             // queued audio duration + 5s margin (same guard as the ASIO
             // exclusive path's asio_drain_timeout).
-            let drain_deadline = std::time::Duration::from_millis(
-                (ring.available() as u64 * 1000)
-                    / ((output_sr as u64).max(1) * (output_ch as u64).max(1))
-                    + 5000,
-            );
+            let drain_deadline =
+                drain_deadline_for(ring.available(), output_sr as u64, output_ch as u64);
             let drain_started = std::time::Instant::now();
             loop {
                 if stop_rx.try_recv().is_ok() {
@@ -6288,10 +7945,15 @@ impl OutputTarget for LocalOutput {
             // the zone shows a clear message instead of silently stopping.
             if device_gone.load(Ordering::Relaxed) {
                 if let Ok(mut slot) = open_failure.lock() {
-                    *slot = Some(format!(
-                        "Sortie « {device_name} » : {}.",
-                        OpenFailure::DeviceGone.user_message()
-                    ));
+                    // Ne pas écraser un constat déjà posé : le blocage de
+                    // l'anneau (#3108) dit la même panne AVEC la position où
+                    // l'écran s'est figé, et il est arrivé le premier.
+                    if slot.is_none() {
+                        *slot = Some(format!(
+                            "Sortie « {device_name} » : {}.",
+                            OpenFailure::DeviceGone.user_message()
+                        ));
+                    }
                 }
             }
 
@@ -6338,6 +8000,24 @@ impl OutputTarget for LocalOutput {
             .lock()
             .unwrap()
             .store(true, Ordering::SeqCst);
+        // Laisser la rampe anti-« ploc » finir sa descente avant de relâcher le
+        // flux (#1590). `force_silent` vient d'être armé : le callback est déjà
+        // en train de descendre. Sans cette attente, le fil de lecture peut
+        // détruire le flux cpal au milieu de la rampe et le clic revient — le
+        // fondu à l'arrêt serait alors une loterie.
+        //
+        // L'attente est bornée par la rampe elle-même : nulle quand elle est
+        // désarmée (DoP, PURE, sortie exclusive, réglage à zéro), nulle quand
+        // rien ne joue, et jamais plus que `SOFT_MUTE_MAX_MS`. À la valeur par
+        // défaut cela fait 20 ms, à comparer aux 2 000 ms que `stop()` accepte
+        // déjà d'attendre juste après pour la sortie du fil.
+        let drain_ms = crate::audio::soft_mute::stop_drain_ms(
+            self.armed_soft_mute_ms(),
+            self.playing.load(Ordering::SeqCst),
+        );
+        if drain_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(drain_ms)).await;
+        }
         // Send the stop signal via channel (belt-and-suspenders with force_silent)
         if let Some(tx) = self.stop_tx.lock().unwrap().take() {
             let _ = tx.send(());
@@ -6513,6 +8193,9 @@ impl OutputTarget for LocalOutput {
             .and_then(|status| status.clone())
     }
 
+    fn ring_starvation(&self) -> Option<OutputRingStarvation> {
+        Some(self.starvation.snapshot())
+    }
     fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
         self.eq.lock().ok().and_then(|eq| {
             eq.as_ref().map(|processor| {
@@ -6591,6 +8274,12 @@ fn make_stream_error_cb(
     }
 }
 
+/// Seuil du détecteur de blocage : au-delà, le consommateur de l'anneau est
+/// tenu pour mort. Très au-dessus de toute contre-pression normale (le rappel
+/// de rendu vide un anneau plein en quelques périodes de tampon), donc jamais
+/// atteint par une lecture saine.
+const FEED_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Feed samples into the ring buffer, blocking (with sleep) when full.
 /// Checks the stop signal, abort flag, and pause state periodically.
 /// Returns immediately when abort is signaled or stop is received.
@@ -6605,6 +8294,30 @@ fn feed_ring_abortable(
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
     abort: Option<&AtomicBool>,
+) -> bool {
+    feed_ring_abortable_with_stall_timeout(
+        ring,
+        samples,
+        stop_rx,
+        paused,
+        abort,
+        FEED_STALL_TIMEOUT,
+    )
+}
+
+/// Le corps réel de [`feed_ring_abortable`], avec son seuil de blocage en
+/// paramètre.
+///
+/// Le seuil est injecté pour UNE raison : le vérifier sans dormir cinq
+/// secondes. Un test qui passe `Duration::ZERO` traverse exactement le même
+/// code que la production — c'est la boucle de production, pas une réplique.
+fn feed_ring_abortable_with_stall_timeout(
+    ring: &RingBuf,
+    samples: &[f32],
+    stop_rx: &std::sync::mpsc::Receiver<()>,
+    paused: &AtomicBool,
+    abort: Option<&AtomicBool>,
+    stall_timeout: std::time::Duration,
 ) -> bool {
     let mut offset = 0;
     // Wedge detector: if the render callback stops consuming, the ring stays
@@ -6637,7 +8350,7 @@ fn feed_ring_abortable(
         let written = ring.push(&samples[offset..]);
         offset += written;
         if written == 0 {
-            if last_progress_at.elapsed() >= std::time::Duration::from_secs(5) {
+            if last_progress_at.elapsed() >= stall_timeout {
                 warn!(
                     remaining_samples = samples.len() - offset,
                     "asio_feed_ring_stall_timeout"
@@ -6651,6 +8364,23 @@ fn feed_ring_abortable(
         }
     }
     true
+}
+
+/// Combien de temps accorder au vidage d'un anneau qui contient encore
+/// `queued_samples` échantillons entrelacés.
+///
+/// Durée de l'audio en attente + 5 s de marge. Extrait des deux chemins
+/// partagés qui la calculaient déjà en ligne (#1626) pour que le chemin
+/// CoreAudio exclusif — le seul qui n'en avait AUCUNE — s'y raccroche sans
+/// recopier l'arithmétique.
+fn drain_deadline_for(
+    queued_samples: usize,
+    sample_rate: u64,
+    channels: u64,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        (queued_samples as u64 * 1000) / (sample_rate.max(1) * channels.max(1)) + 5000,
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -6700,6 +8430,15 @@ fn feed_native_ring_abortable(
 pub(crate) struct DeviceIdentity {
     pub(crate) endpoint_id: String,
     pub(crate) raw_name: String,
+    /// L'hôte audio qui a ÉNUMÉRÉ ce périphérique (`"Wasapi"`, `"Asio"`,
+    /// `"Alsa"`, `"CoreAudio"` — la variante cpal, telle que
+    /// `cpal::Host::id().name()` la rend).
+    ///
+    /// #3230 : sans ce champ, un nom n'était rattaché à rien. « Haut-parleurs »
+    /// est un nom WASAPI ; le chercher parmi des sorties ASIO n'a aucun sens,
+    /// et échouer y renvoyait la zone sur le périphérique ASIO par défaut. Un
+    /// nom porte désormais l'hôte dont il vient, et la résolution les apparie.
+    pub(crate) host: String,
 }
 
 /// Par quoi une zone a été rattachée à son périphérique. Le rang porté par
@@ -6724,6 +8463,26 @@ impl DeviceMatch {
     }
 }
 
+/// Le verdict de [`resolve_device`]. Trois issues, pas deux : « introuvable »
+/// et « pas d'ici » n'appellent pas la même conduite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeviceResolution {
+    /// Le périphérique de la zone a été retrouvé sur l'hôte ouvert.
+    Matched(DeviceMatch),
+    /// Le nom de la zone vient d'un AUTRE hôte. Aucun appariement n'est
+    /// possible, et le repli sur le défaut serait un détournement : c'est
+    /// exactement lui qui envoyait Jean Valjean sur une sortie ASIO qu'il
+    /// n'avait jamais choisie (#3230). L'appelant doit **refuser**.
+    ForeignHost {
+        requested_host: String,
+        open_host: String,
+    },
+    /// Le bon hôte, mais plus aucun périphérique de ce nom : débranché,
+    /// renommé, routage macOS changé. L'appelant retombe sur la sortie
+    /// système — en le disant (#2207).
+    NotFound,
+}
+
 /// Résoudre le périphérique qu'une zone désigne.
 ///
 /// Le nom d'affichage n'est **pas** une identité : il n'est ni unique (deux
@@ -6744,21 +8503,73 @@ impl DeviceMatch {
 ///    par sous-chaîne est précisément ce qui envoyait le son sur le mauvais
 ///    DAC en silence.
 ///
-/// `None` veut dire « je ne sais pas », et non « prends le premier venu » :
-/// l'appelant retombe alors sur la sortie par défaut, mais en le **disant**.
+/// [`DeviceResolution::NotFound`] veut dire « je ne sais pas », et non « prends
+/// le premier venu » : l'appelant retombe alors sur la sortie par défaut, mais
+/// en le **disant**.
+///
+/// # L'hôte, avant tout le reste (#3230)
+///
+/// Un nom de périphérique n'a de sens **que** rapporté à l'hôte qui l'a
+/// énuméré. « Haut-parleurs » est un nom WASAPI ; aucune sortie ASIO ne le
+/// porte, ne l'a jamais porté, et ne le portera jamais. Quand la zone sait de
+/// quel hôte vient son nom (`requested_host`) et que cet hôte n'est pas celui
+/// qui est ouvert, les trois étapes ci-dessous sont **sautées** et la demande
+/// est refusée : c'est le seul verdict honnête, et c'est ce qui empêche le
+/// repli de détourner la zone vers le périphérique par défaut d'un hôte
+/// qu'elle n'a jamais choisi.
+///
+/// `requested_host = None` (origine inconnue : zone d'avant ce correctif, ou
+/// sortie recréée à la volée) rend exactement le comportement d'avant. Une
+/// machine à un seul hôte ne voit donc **aucune** différence : l'hôte
+/// d'origine y est toujours celui qui est ouvert.
 pub(crate) fn resolve_device(
     requested: &str,
     requested_endpoint_id: Option<&str>,
+    requested_host: Option<&str>,
+    open_host: &str,
     candidates: &[DeviceIdentity],
-) -> Option<DeviceMatch> {
+) -> DeviceResolution {
+    // 0. L'hôte. Un nom qui vient d'ailleurs ne s'apparie à rien ici, et
+    //    surtout ne doit pas glisser jusqu'au repli sur le défaut.
+    //
+    //    L'hôte ouvert est un PARAMÈTRE et non une déduction sur les
+    //    candidates : une énumération vide — pilote ASIO happé par une autre
+    //    application entre l'élection de l'hôte et l'ouverture — ne doit pas
+    //    faire disparaître le refus. Un fait connu de l'appelant ne se redevine
+    //    pas ici.
+    if let Some(origin) = requested_host.filter(|h| !h.is_empty())
+        && !open_host.is_empty()
+        && !open_host.eq_ignore_ascii_case(origin)
+    {
+        return DeviceResolution::ForeignHost {
+            requested_host: origin.to_string(),
+            open_host: open_host.to_string(),
+        };
+    }
+
+    // Seules les candidates du bon hôte sont appariables. Les rangs `(n)` sont
+    // reconstruits sur cette même liste, comme la découverte les a calculés.
+    let matchable: Vec<(usize, &DeviceIdentity)> = candidates
+        .iter()
+        .enumerate()
+        .filter(
+            |(_, candidate)| match requested_host.filter(|h| !h.is_empty()) {
+                Some(origin) => {
+                    candidate.host.is_empty() || candidate.host.eq_ignore_ascii_case(origin)
+                }
+                None => true,
+            },
+        )
+        .collect();
+
     // 1. L'identifiant d'endpoint stable, quand la zone en connaît un. C'est
     //    le seul appariement qui traverse un renommage ou un réordonnancement.
     if let Some(endpoint_id) = requested_endpoint_id.filter(|id| !id.is_empty())
-        && let Some(index) = candidates
+        && let Some(&(index, _)) = matchable
             .iter()
-            .position(|candidate| candidate.endpoint_id == endpoint_id)
+            .find(|(_, candidate)| candidate.endpoint_id == endpoint_id)
     {
-        return Some(DeviceMatch::ByEndpointId(index));
+        return DeviceResolution::Matched(DeviceMatch::ByEndpointId(index));
     }
 
     let search = requested.to_lowercase();
@@ -6766,10 +8577,10 @@ pub(crate) fn resolve_device(
     // 2. Le nom d'affichage, reconstruit avec la convention de la découverte —
     //    c'est ce nom-là, suffixe compris, qui a été stocké dans la zone.
     let mut seen_names = std::collections::HashSet::new();
-    for (index, candidate) in candidates.iter().enumerate() {
+    for &(index, candidate) in &matchable {
         let display_name = disambiguate_display_name(&candidate.raw_name, &mut seen_names);
         if display_name.to_lowercase() == search {
-            return Some(DeviceMatch::ByDisplayName(index));
+            return DeviceResolution::Matched(DeviceMatch::ByDisplayName(index));
         }
     }
 
@@ -6778,17 +8589,17 @@ pub(crate) fn resolve_device(
     //    laisser glisser renvoyait « Haut-Parleurs (2) » sur le premier
     //    « Haut-Parleurs » — le mauvais DAC, en silence (#2272).
     if looks_disambiguated(requested) {
-        return None;
+        return DeviceResolution::NotFound;
     }
-    let mut ambigus = candidates.iter().enumerate().filter(|(_, candidate)| {
+    let mut ambigus = matchable.iter().filter(|(_, candidate)| {
         let lower = candidate.raw_name.to_lowercase();
         lower.contains(&search) || search.contains(&lower)
     });
     match (ambigus.next(), ambigus.next()) {
-        (Some((index, _)), None) => Some(DeviceMatch::BySubstring(index)),
+        (Some(&(index, _)), None) => DeviceResolution::Matched(DeviceMatch::BySubstring(index)),
         // Deux candidates : choisir la première, c'est rejouer le même défaut
         // sous un autre nom. On préfère l'aveu d'ignorance.
-        _ => None,
+        _ => DeviceResolution::NotFound,
     }
 }
 
@@ -6849,18 +8660,41 @@ fn looks_disambiguated(requested: &str) -> bool {
 ///
 /// Returns `(device, fell_back)` where `fell_back` is `true` if the default
 /// device was used instead of the requested one.
+///
+/// `origin_host` est l'hôte qui a ÉNUMÉRÉ le nom que porte la zone
+/// (`AudioDevice::backend`). Quand il est connu et qu'il diffère de l'hôte
+/// ouvert, la fonction rend `None` **sans repli** : c'est le refus de #3230.
+/// `None` = origine inconnue, comportement d'avant.
 fn find_device_with_fallback(
     host: &cpal::Host,
     device_name: &str,
     endpoint_id: Option<&str>,
+    origin_host: Option<&str>,
 ) -> Option<(cpal::Device, bool)> {
     if device_name == "default" {
-        return host.default_output_device().map(|d| (d, false));
+        return host.default_output_device().map(|d| {
+            // Demander « default » et obtenir le périphérique système n'est pas
+            // un écart — mais l'écran doit quand même pouvoir NOMMER ce qui a
+            // été ouvert : « default » ne dit rien à personne.
+            note_opened_device(
+                observed_backend_name(),
+                device_name,
+                &d.description()
+                    .map(|desc| desc.name().to_string())
+                    .unwrap_or_else(|_| "unknown".into()),
+                d.id().ok().map(|id| id.to_string()).as_deref(),
+            );
+            (d, false)
+        });
     }
 
     // La même liste que la découverte, puits nuls écartés compris : c'est la
     // condition pour que les rangs `(n)` reconstruits ici soient ceux qui ont
     // été stockés dans la zone.
+    // L'hôte qui énumère est celui qui a produit ces noms — c'est lui qu'un nom
+    // « porte », et c'est cette étiquette-là que la résolution apparie.
+    let open_host: &'static str = host.id().name();
+
     let (devices, identities): (Vec<cpal::Device>, Vec<DeviceIdentity>) = host
         .output_devices()
         .map(|devs| devs.collect::<Vec<_>>())
@@ -6873,13 +8707,49 @@ fn find_device_with_fallback(
                     .description()
                     .map(|desc| desc.name().to_string())
                     .unwrap_or_else(|_| "Unknown".into()),
+                host: open_host.to_string(),
             };
             (device, identity)
         })
         .filter(|(_, identity)| !is_null_sink(&identity.raw_name))
         .unzip();
 
-    if let Some(matched) = resolve_device(device_name, endpoint_id, &identities) {
+    let resolution = resolve_device(
+        device_name,
+        endpoint_id,
+        origin_host,
+        open_host,
+        &identities,
+    );
+
+    // Le nom vient d'un autre hôte : REFUS. Retomber sur le défaut de l'hôte
+    // ouvert, c'est le détournement de #3230 — la zone se met à jouer sur un
+    // périphérique qu'elle n'a jamais nommé, sans que rien ne le dise.
+    if let DeviceResolution::ForeignHost {
+        requested_host,
+        open_host: opened,
+    } = &resolution
+    {
+        warn!(
+            requested = %device_name,
+            requested_host = %requested_host,
+            open_host = %opened,
+            fallback_reason = LocalDeviceFallback::ForeignHost.code(),
+            "audio_device_foreign_host_refused — \
+             the device this zone remembers was enumerated by another audio host; \
+             refusing to hijack the zone onto this host's default output"
+        );
+        note_device_outcome(
+            observed_backend_name(),
+            device_name,
+            "",
+            None,
+            Some(LocalDeviceFallback::ForeignHost),
+        );
+        return None;
+    }
+
+    if let DeviceResolution::Matched(matched) = resolution {
         let index = matched.index();
         debug!(
             requested = %device_name,
@@ -6887,6 +8757,16 @@ fn find_device_with_fallback(
             endpoint_id = %identities[index].endpoint_id,
             matched_by = ?matched,
             "audio_device_resolved"
+        );
+        // Le nom RÉSOLU, pas le nom demandé : la résolution accepte les
+        // correspondances approchées (endpoint id, rang `(n)`, casse), donc les
+        // deux peuvent légitimement différer — et c'est précisément ce que
+        // l'utilisateur doit voir plutôt que de le déduire d'un `debug!`.
+        note_opened_device(
+            observed_backend_name(),
+            device_name,
+            &identities[index].raw_name,
+            Some(identities[index].endpoint_id.as_str()),
         );
         // `nth` plutôt qu'un clone : `cpal::Device` n'est pas clonable sur tous
         // les hôtes, et on n'a plus besoin des autres.
@@ -6913,6 +8793,16 @@ fn find_device_with_fallback(
              the configured device is unavailable (unplugged, renamed, or \
              macOS audio routing changed); using the system default output \
              device instead"
+        );
+        // LE cas de #2207, rendu visible : la zone demandait un DAC, la lecture
+        // part sur le périphérique système. `differs` vaudra `true`, et le
+        // motif nomme désormais la cause plutôt que de la laisser deviner.
+        note_device_outcome(
+            observed_backend_name(),
+            device_name,
+            &default_name,
+            default_device.id().ok().map(|id| id.to_string()).as_deref(),
+            Some(LocalDeviceFallback::NotFoundFellBackToDefault),
         );
         Some((default_device, true))
     } else {
@@ -6973,6 +8863,302 @@ fn probe_device_fallback_caps(device: &cpal::Device, name: &str) -> (u16, Vec<u3
             "local_audio_device_fallback_to_assumed_stereo_44100_48000"
         );
         (2, vec![44100, 48000], false)
+    }
+}
+
+/// Ce que vaut la liste de cadences qu'une sortie locale annonce.
+///
+/// `supported_output_configs()` de cpal n'a pas le même sens selon l'hôte :
+///
+/// - **ALSA** interroge le pilote cadence par cadence (`hw_params.test_rate`)
+///   et écarte celles qu'il refuse ;
+/// - **ASIO** fait de même (`driver.can_sample_rate`, `continue` si non) ;
+/// - **WASAPI** ne demande rien à personne. `is_format_supported` rend
+///   `Ok(true)` sans regarder le format — commentaire d'origine dans
+///   `cpal-0.17.3/src/host/wasapi/device.rs:192-200` : « Checking formats is
+///   not needed for shared mode with auto-conversion, therefore this check has
+///   been removed » — et `supported_formats()` déroule alors le produit
+///   cartésien des 21 `COMMON_SAMPLE_RATES` par les 7 formats d'échantillon.
+///   Chaque entrée est une plage ponctuelle (`min == max`), si bien que deux
+///   DAC Windows différents reçoivent exactement la MÊME liste de 147 entrées.
+///
+/// Tune ne peut pas corriger cpal. Il peut cesser de présenter cette liste
+/// comme une capacité constatée (#2862).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleRateEvidence {
+    /// Le pilote a été interrogé, cadence par cadence.
+    Measured,
+    /// Aucune confrontation au matériel : la liste est une supposition.
+    Unverified,
+}
+
+impl SampleRateEvidence {
+    /// Vrai seulement quand la liste vient d'une interrogation du pilote.
+    pub fn is_measured(self) -> bool {
+        matches!(self, Self::Measured)
+    }
+}
+
+/// L'énumération de cpal est-elle une MESURE, pour cet hôte ?
+///
+/// La plateforme est un **paramètre**, jamais un `cfg!` refermé dans le corps :
+/// sinon la décision Windows ne serait compilée que sous Windows, et aucun test
+/// joué sur Linux ne pourrait la contredire — l'angle mort de #1837 et #2056.
+/// Un seul appelant passe la valeur réelle de la machine.
+///
+/// `backend` est ce que rend `cpal::HostId::name()`, c'est-à-dire le nom de la
+/// **variante** (`"Wasapi"`, `"Alsa"`, `"Asio"`, `"CoreAudio"`) et non un
+/// libellé d'affichage : `name()` est un `stringify!` sur l'identifiant de
+/// variante. La comparaison est insensible à la casse pour ne pas dépendre de
+/// ce détail.
+pub fn sample_rate_evidence(backend: &str) -> SampleRateEvidence {
+    match backend.to_ascii_lowercase().as_str() {
+        "alsa" | "asio" | "coreaudio" | "jack" => SampleRateEvidence::Measured,
+        // « wasapi » : cpal ne teste rien (voir ci-dessus). Et tout hôte
+        // inconnu tombe ici volontairement — on ne prête pas une mesure à un
+        // backend dont on ignore ce qu'il fait.
+        _ => SampleRateEvidence::Unverified,
+    }
+}
+
+/// Le nom de PCM ALSA porté par un `endpoint_id`, sans le préfixe d'hôte.
+///
+/// cpal rend `DeviceId` sous la forme `«hôte»:«pcm»` (`Display`, `cpal-0.17.3`
+/// `src/lib.rs:255`), et le `pcm` d'ALSA est lui-même préfixé par son greffon
+/// (`hw:CARD=…`, `dmix:CARD=…`). On ne retire donc QUE le préfixe d'hôte, et
+/// seulement s'il est présent : certains enregistrements ne portent que le PCM.
+fn alsa_pcm_name(endpoint_id: &str) -> &str {
+    let Some((tete, reste)) = endpoint_id.split_once(':') else {
+        return endpoint_id;
+    };
+    if tete.eq_ignore_ascii_case("alsa") {
+        reste
+    } else {
+        endpoint_id
+    }
+}
+
+/// Ce PCM ALSA parle-t-il au MATÉRIEL, ou à un convertisseur logiciel ?
+///
+/// `snd_device_name_hint` expose la même carte sous une dizaine de noms qui
+/// partagent tous la même première ligne de description — c'est pourquoi le
+/// dédoublonnage Linux les regroupe. Un seul de ces noms atteint le pilote sans
+/// conversion : `hw:`. Tous les autres (`default`, `sysdefault:`, `plughw:`,
+/// `dmix:`, `plug:`, `front:`, `iec958:`, `pipewire`, `pulse`, `jack`) passent
+/// par un greffon qui ACCEPTE tout et rééchantillonne.
+///
+/// La distinction n'est pas cosmétique : `dmix` fixe la cadence de son esclave
+/// (`defaults.pcm.dmix.rate 48000` dans `alsa.conf`). Interroger un tel PCM
+/// cadence par cadence rend « oui » pour 44,1 → 384 kHz, mais c'est le
+/// convertisseur qui répond, pas le DAC.
+pub fn alsa_pcm_is_direct_hardware(endpoint_id: &str) -> bool {
+    alsa_pcm_name(endpoint_id)
+        .split(':')
+        .next()
+        .is_some_and(|greffon| greffon.eq_ignore_ascii_case("hw"))
+}
+
+/// Ce que vaut la liste de cadences d'UN périphérique — pas seulement de son hôte.
+///
+/// [`sample_rate_evidence`] répond pour l'hôte ; elle ne peut pas voir deux
+/// faits qui, eux, sont propres au périphérique :
+///
+/// 1. **Le PCM interrogé n'est pas forcément le matériel.** Sur ALSA, cpal
+///    interroge bien le pilote (`hw_params.test_rate`) — mais le « pilote »
+///    d'un `dmix:` ou d'un `plughw:` est un rééchantillonneur logiciel. GgB
+///    (#1655, Eversolo DAC-Z8) : l'écran annonce 44,1 → 384 kHz « mesurées »,
+///    `local_audio_stream_config` note `output_sr=192000`, et
+///    `/proc/asound/card0/stream0` montre l'endpoint USB à 48 kHz nominal.
+///    C'est le greffon qui a dit oui.
+/// 2. **La liste peut être une SUPPOSITION.** Quand l'énumération échoue,
+///    [`probe_device_fallback_caps`] invente `(2, [44100, 48000])` et le
+///    signale par `caps_reliable = false` — un drapeau que l'énumération
+///    calculait puis jetait (`let _ = caps_reliable`).
+///
+/// Aucune de ces deux réserves ne change ce qui est JOUÉ : elles changent ce
+/// que l'écran a le droit d'affirmer.
+pub fn sample_rate_evidence_for_device(
+    backend: &str,
+    endpoint_id: &str,
+    enumeration_answered: bool,
+) -> SampleRateEvidence {
+    if !enumeration_answered {
+        return SampleRateEvidence::Unverified;
+    }
+    if backend.eq_ignore_ascii_case("alsa") && !alsa_pcm_is_direct_hardware(endpoint_id) {
+        return SampleRateEvidence::Unverified;
+    }
+    sample_rate_evidence(backend)
+}
+
+/// À quelle cadence le chemin cpal **partagé** doit ouvrir le flux.
+///
+/// #3233 — Pierre M, fil 1043 : « DSD : le temps défile, pas de son ». La
+/// décision se fondait sur `find_matching_config(..).filter(|c| c.sample_rate
+/// == sample_rate)`, un filtre **tautologique** dès que l'énumération est
+/// fabriquée : `find_matching_config` recopie la cadence demandée dans le
+/// `StreamConfig` qu'il rend, donc l'égalité est vraie par construction. Sur
+/// WASAPI, cpal retient les 21 `COMMON_SAMPLE_RATES` sans rien demander à
+/// personne ([`sample_rate_evidence`]) — la branche était TOUJOURS prise, un
+/// DSD64 décodé à 176 400 Hz était ouvert à 176 400 Hz quoi que sache faire
+/// l'endpoint, `needs_resample` restait faux et rubato ne tournait jamais.
+///
+/// **#2862 a rendu la liste honnête ; il n'a pas changé la décision qui s'en
+/// sert.** C'est ce que fait cette fonction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRateOpening {
+    /// Le périphérique **tourne déjà** à la cadence de la source : sa
+    /// configuration par défaut le dit, et celle-là est un fait mesuré sur
+    /// toutes les plateformes (`GetMixFormat` sur WASAPI). Aucune conversion,
+    /// aucune preuve à réclamer.
+    DeviceAlreadyAtSourceRate,
+    /// L'énumération retient la cadence **et** elle est une MESURE (ALSA `hw:`,
+    /// ASIO, CoreAudio) : on ouvre à la cadence de la source, comme avant. Le
+    /// témoin du cas nominal.
+    AtSourceRateMeasured,
+    /// On n'ouvre pas à la cadence de la source : le flux est ouvert à celle du
+    /// périphérique et rubato convertit. La conversion est une DÉCISION, elle
+    /// est journalisée et remontée au client.
+    ResampleToDeviceRate {
+        device_sample_rate: u32,
+        reason: LocalRateFallback,
+    },
+    /// Le périphérique n'annonce **aucune** cadence par défaut (PipeWire,
+    /// énumération muette) : il n'y a rien vers quoi rééchantillonner. On ouvre
+    /// à la cadence de la source en dernier recours — comportement de toujours,
+    /// aucune régression.
+    LastResortSourceRate,
+}
+
+/// La règle, isolée de cpal pour être éprouvée depuis n'importe quelle machine.
+///
+/// L'hôte n'est pas un `cfg!` : il entre par `evidence`, sur le modèle de
+/// [`exclusive_mode_support`] et de [`sample_rate_evidence`]. Une décision
+/// Windows enfermée dans un `cfg!` ne serait pas compilée sur Linux, et le test
+/// qui l'interroge y serait vert pour la mauvaise raison (#1837, #2056).
+///
+/// `enumeration_accepts_source_rate` est ce que répond `find_matching_config`,
+/// filtre compris. Cette réponse n'est plus SUFFISANTE : elle n'est prise au
+/// mot que lorsque `evidence` dit qu'elle a été mesurée. Le drapeau n'est
+/// consulté qu'à défaut de `device_default_rate == Some(source_sample_rate)`,
+/// cas où l'appelant n'a même pas besoin d'énumérer.
+///
+/// **Ce qu'on renonce à faire, et pourquoi.** Sonder réellement l'endpoint
+/// serait le plus juste, mais aucune sonde n'existe sur ce chemin : cpal a
+/// retiré son `IsFormatSupported` en mode partagé (« Checking formats is not
+/// needed for shared mode with auto-conversion »,
+/// `cpal-0.17.3/src/host/wasapi/device.rs:192-200`) et
+/// `build_output_stream` réussit de toute façon, puisque le flux est initialisé
+/// avec `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`. Une sonde par ouverture serait
+/// donc **elle aussi tautologique** — et coûteuse. On retient donc le seul fait
+/// que le périphérique livre vraiment : sa cadence par défaut.
+///
+/// **Ce que ça coûte au bit-perfect.** Rien qui existait. En mode partagé
+/// WASAPI le moteur de Windows reçoit `AUTOCONVERTPCM` et convertit lui-même
+/// vers la cadence du mélangeur : ouvrir « à la cadence source » ne recadençait
+/// pas le DAC, ça déplaçait seulement la conversion chez un convertisseur
+/// opaque, non mesuré, et parfois muet. La conversion revient à rubato (sinc,
+/// paramètres déjà réglés pour 176,4 → 48 kHz), et surtout elle devient
+/// VISIBLE : journal dédié et [`LocalRateStatus`] remonté au client. Le vrai
+/// bit-perfect Windows reste le mode exclusif / ASIO, chemins que cette
+/// fonction ne touche pas.
+pub fn decide_local_rate_opening(
+    source_sample_rate: u32,
+    device_default_rate: Option<u32>,
+    enumeration_accepts_source_rate: bool,
+    evidence: SampleRateEvidence,
+) -> LocalRateOpening {
+    if device_default_rate == Some(source_sample_rate) {
+        return LocalRateOpening::DeviceAlreadyAtSourceRate;
+    }
+    if enumeration_accepts_source_rate && evidence.is_measured() {
+        return LocalRateOpening::AtSourceRateMeasured;
+    }
+    let reason = if enumeration_accepts_source_rate {
+        LocalRateFallback::CapabilitiesUnverified
+    } else {
+        LocalRateFallback::RateNotSupported
+    };
+    match device_default_rate {
+        Some(device_sample_rate) => LocalRateOpening::ResampleToDeviceRate {
+            device_sample_rate,
+            reason,
+        },
+        None => LocalRateOpening::LastResortSourceRate,
+    }
+}
+
+/// Quels chemins de sortie **exclusive** sont réellement COMPILÉS pour une
+/// cible donnée.
+///
+/// Ce n'est pas une opinion : chaque champ correspond à un `#[cfg]` de ce
+/// fichier, et à un seul.
+///
+/// | champ | branche | garde exacte |
+/// |---|---|---|
+/// | `coreaudio` | `coreaudio_exclusive::ExclusiveOutput` | `#[cfg(target_os = "macos")]` |
+/// | `asio` | `asio_exclusive::AsioExclusiveOutput` | `#[cfg(all(target_os = "windows", feature = "asio"))]` |
+/// | `wasapi` | `wasapi_exclusive::WasapiExclusiveOutput` | `#[cfg(target_os = "windows")]` — **sans condition de feature** |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExclusiveModeSupport {
+    /// macOS : hog mode CoreAudio.
+    pub coreaudio: bool,
+    /// Windows compilé avec la feature `asio`.
+    pub asio: bool,
+    /// Windows, quelle que soit la feature `asio`.
+    pub wasapi: bool,
+}
+
+impl ExclusiveModeSupport {
+    /// Aucun chemin exclusif compilé — le cas de Linux.
+    const AUCUN: Self = Self {
+        coreaudio: false,
+        asio: false,
+        wasapi: false,
+    };
+
+    /// Au moins un chemin exclusif existe sur cette cible.
+    pub fn any(self) -> bool {
+        self.coreaudio || self.asio || self.wasapi
+    }
+}
+
+/// Le mode exclusif est-il compilé, pour ce couple (système, feature `asio`) ?
+///
+/// La plateforme est un **paramètre**, jamais un `cfg!` refermé dans le corps —
+/// même raison que [`sample_rate_evidence`] : une décision Windows enfermée
+/// dans un `cfg!` n'est pas compilée sur Linux, et le test qui l'interroge y
+/// serait vert pour la mauvaise raison (l'angle mort de #1837 et #2056). Un
+/// seul appelant, [`LocalOutput::supports_exclusive_mode`], passe la valeur
+/// réelle de la machine.
+///
+/// **#2868** : la règle précédente était
+/// `cfg!(macos) || cfg!(all(windows, asio))`. Elle rendait `false` sur un
+/// Windows bâti **sans** la feature `asio` — alors que la branche WASAPI
+/// exclusive vit sous `#[cfg(target_os = "windows")]` seul et se prend dès que
+/// `exclusive_mode && audio_backend != "asio"`. L'utilisateur se voyait donc
+/// refuser une capacité que son binaire portait.
+///
+/// `target_os` est ce que rend `std::env::consts::OS`, c'est-à-dire le nom de
+/// cible (`"windows"`, `"macos"`, `"linux"`), en minuscules. Un système inconnu
+/// est classé sans mode exclusif : on ne prête pas un chemin à une cible dont
+/// on n'a pas écrit la branche.
+pub fn exclusive_mode_support(target_os: &str, asio_feature: bool) -> ExclusiveModeSupport {
+    match target_os {
+        "macos" => ExclusiveModeSupport {
+            coreaudio: true,
+            ..ExclusiveModeSupport::AUCUN
+        },
+        // La feature `asio` AJOUTE un chemin ; elle n'en conditionne aucun.
+        // WASAPI exclusif est là dans les deux cas.
+        "windows" => ExclusiveModeSupport {
+            coreaudio: false,
+            asio: asio_feature,
+            wasapi: true,
+        },
+        // Linux inclus : `asio_feature` seule ne compile RIEN, sa garde exige
+        // `target_os = "windows"` en plus.
+        _ => ExclusiveModeSupport::AUCUN,
     }
 }
 
@@ -7252,6 +9438,7 @@ mod tests {
             &sortie.convolver,
             &sortie.crossfeed,
             &sortie.pure_bypass,
+            &sortie.mono_downmix,
             2,
             false,
         );
@@ -7261,6 +9448,107 @@ mod tests {
             .expect("un EQ actif doit exposer ses compteurs");
         assert_eq!(metrics.eq_non_finite_samples, 1);
         assert_eq!(metrics.eq_overs, 0);
+    }
+
+    // ---- #2362 : sortie mono sur la chaîne locale ---------------------------
+
+    /// Fait traverser la chaîne DSP locale RÉELLE à un tampon, sans égaliseur,
+    /// sans convolveur, sans crossfeed : seul le repli mono peut donc en
+    /// changer le contenu.
+    fn chaine_locale_nue(mono: bool, pure: bool, dop: bool, pcm: &mut Vec<f32>) {
+        let sortie = LocalOutput::new("DAC test".to_string());
+        sortie.set_mono_downmix(mono);
+        sortie.set_pure_bypass(pure);
+        apply_local_dsp(
+            pcm,
+            &sortie.eq,
+            &sortie.convolver,
+            &sortie.crossfeed,
+            &sortie.pure_bypass,
+            &sortie.mono_downmix,
+            2,
+            dop,
+        );
+    }
+
+    /// Armé, le repli somme réellement les deux voies DANS la chaîne locale.
+    ///
+    /// La deuxième trame est la mutation discriminante : elle ne porte du
+    /// signal QUE sur la voie droite. Un « mono » qui garderait la voie gauche
+    /// — le piège nommé au point 2 de #2362 — rendrait `0.0` et laisserait
+    /// Nicolas Tardif, dont l'unique enceinte est câblée à gauche, aussi sourd
+    /// qu'avant à tout ce qui est panné à droite.
+    #[test]
+    fn le_repli_mono_somme_les_deux_voies_dans_la_chaine_locale() {
+        let mut pcm = vec![0.5, 0.3, 0.0, 0.8, 1.0, 1.0];
+        chaine_locale_nue(true, false, false, &mut pcm);
+        assert_eq!(pcm, vec![0.4, 0.4, 0.4, 0.4, 1.0, 1.0]);
+    }
+
+    /// CONTRE-ÉPREUVE — désarmé (le défaut), la chaîne est l'identité BIT À
+    /// BIT. C'est l'engagement de l'issue : « comportement actuel strictement
+    /// inchangé » tant que personne ne coche.
+    #[test]
+    fn sans_repli_la_chaine_locale_est_identite_bit_a_bit() {
+        let origine = vec![0.5, 0.3, 0.0, 0.8, 1.0, 1.0];
+        let mut pcm = origine.clone();
+        chaine_locale_nue(false, false, false, &mut pcm);
+        assert_eq!(
+            pcm.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            origine.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PURE court-circuite le repli comme il court-circuite l'égaliseur et le
+    /// crossfeed. `zone_mono_downmix` rend déjà `false` en PURE, mais la garde
+    /// de la chaîne doit tenir seule : c'est elle qui promet le bit-perfect.
+    #[test]
+    fn le_mode_pure_court_circuite_le_repli_mono() {
+        let origine = vec![0.5, 0.3, 0.0, 0.8];
+        let mut pcm = origine.clone();
+        chaine_locale_nue(true, true, false, &mut pcm);
+        assert_eq!(pcm, origine);
+    }
+
+    /// DoP n'est pas de l'audio : sommer ses voies détruirait le marqueur et le
+    /// DAC se TAIRAIT (famille de #1408). La garde existante doit couvrir le
+    /// repli comme elle couvre les trois autres traitements.
+    #[test]
+    fn le_dop_court_circuite_le_repli_mono() {
+        let origine = vec![0.5, 0.3, 0.0, 0.8];
+        let mut pcm = origine.clone();
+        chaine_locale_nue(true, false, true, &mut pcm);
+        assert_eq!(pcm, origine);
+    }
+
+    /// Le verdict d'exécution doit NOMMER le repli. Sans ceci, le producteur
+    /// entier de Windows prendrait la branche « octets source conservés » : le
+    /// réglage serait accepté, la case cochée, et le son inchangé.
+    #[test]
+    fn le_repli_mono_casse_l_identite_et_marque_le_dsp_comme_applique() {
+        let eq = std::sync::Mutex::new(None);
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+        let mono = AtomicBool::new(true);
+
+        assert!(!local_dsp_is_identity(
+            &eq, &convolver, &crossfeed, &pure, &mono
+        ));
+        assert_eq!(
+            local_dsp_runtime_state(&eq, &convolver, &crossfeed, &pure, &mono, false),
+            OutputDspState::Applied
+        );
+
+        // Témoin : le même état, repli désarmé, reste une identité inactive.
+        mono.store(false, Ordering::Relaxed);
+        assert!(local_dsp_is_identity(
+            &eq, &convolver, &crossfeed, &pure, &mono
+        ));
+        assert_eq!(
+            local_dsp_runtime_state(&eq, &convolver, &crossfeed, &pure, &mono, false),
+            OutputDspState::Inactive
+        );
     }
 
     fn stereo_sine_8k(frames: usize) -> Vec<f32> {
@@ -7300,11 +9588,27 @@ mod tests {
         // Une piste d'exactement un bloc, en stéréo.
         let piste: Vec<f32> = (0..bloc * 2).map(|i| (i as f32 + 1.0) / 16.0).collect();
         let mut tampon = piste.clone();
-        apply_local_dsp(&mut tampon, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut tampon,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
 
         // Le buffer rendu est le silence d'amorçage : c'est la latence, et
         // c'est exactement ce que l'ancien code ne rendait jamais visible.
-        let queue = flush_local_dsp(&convolver, &crossfeed, &pure, 2, false);
+        let queue = flush_local_dsp(
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
 
         let mut restitue = tampon.clone();
         restitue.extend_from_slice(&queue);
@@ -7370,14 +9674,32 @@ mod tests {
 
         // Première piste : un bloc bien reconnaissable, jamais drainé.
         let mut piste1 = vec![1.0f32; bloc * 2];
-        apply_local_dsp(&mut piste1, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut piste1,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
 
         // Frontière.
         reset_local_dsp(&convolver);
 
         // Seconde piste : du silence. Rien de la première ne doit en sortir.
         let mut piste2 = vec![0.0f32; bloc * 2];
-        apply_local_dsp(&mut piste2, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut piste2,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         for (i, v) in piste2.iter().enumerate() {
             assert!(
                 v.abs() < 1e-6,
@@ -7395,7 +9717,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(4096);
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         // On saute les 512 premières trames (établissement du filtre).
         let after = rms(&samples[1024..]);
 
@@ -7417,7 +9748,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         assert_eq!(samples, before);
     }
 
@@ -7432,7 +9772,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         assert_eq!(samples, before);
     }
 
@@ -7464,7 +9813,16 @@ mod tests {
             })
             .collect();
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 1, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            1,
+            false,
+        );
         let after = rms(&samples[1024..]);
         assert!(20.0 * (after / before).log10() < -8.0);
     }
@@ -7507,6 +9865,7 @@ mod tests {
             &std::sync::Mutex::new(None),
             &std::sync::Mutex::new(None),
             &AtomicBool::new(pure),
+            &AtomicBool::new(false),
         )
     }
 
@@ -7568,6 +9927,7 @@ mod tests {
             &std::sync::Mutex::new(None),
             &std::sync::Mutex::new(None),
             &AtomicBool::new(false),
+            &AtomicBool::new(false),
         );
 
         assert!(!status.bit_perfect);
@@ -7612,6 +9972,222 @@ mod tests {
         bytes
     }
 
+    /// Construit un en-tête WAV canonique : `RIFF/WAVE`, un `fmt ` de
+    /// `fmt_chunk_size` octets, puis un `data` vide. `ext` porte
+    /// `(wValidBitsPerSample, sous-format)` quand le `fmt ` est assez long.
+    fn wav_header(
+        format_tag: u16,
+        channels: u16,
+        sample_rate: u32,
+        block_align: u16,
+        bits_per_sample: u16,
+        fmt_chunk_size: u32,
+        ext: Option<(u16, u16)>,
+    ) -> Vec<u8> {
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&format_tag.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&sample_rate.to_le_bytes());
+        fmt.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&bits_per_sample.to_le_bytes());
+        if let Some((valid_bits, sub_format)) = ext {
+            fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+            fmt.extend_from_slice(&valid_bits.to_le_bytes());
+            fmt.extend_from_slice(&0x0000_0003u32.to_le_bytes()); // dwChannelMask
+            fmt.extend_from_slice(&sub_format.to_le_bytes());
+            fmt.extend_from_slice(&[0u8; 14]); // reste du GUID de sous-format
+        }
+        fmt.resize(fmt_chunk_size as usize, 0);
+
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(36u32 + fmt_chunk_size).to_le_bytes());
+        header.extend_from_slice(b"WAVE");
+        header.extend_from_slice(b"fmt ");
+        header.extend_from_slice(&fmt_chunk_size.to_le_bytes());
+        header.extend_from_slice(&fmt);
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.resize(header.len().max(44), 0);
+        header
+    }
+
+    /// Le pas d'avancement que le RESTE du fichier appliquera pour cette
+    /// profondeur : `bytes_per_sample` tel que la boucle d'alimentation le
+    /// calcule (`local.rs`, sentinelle 0 = flottant 32 bits).
+    fn declared_stride(bit_depth: u16) -> usize {
+        if bit_depth == 0 {
+            4
+        } else {
+            usize::from(bit_depth / 8)
+        }
+    }
+
+    /// Les profondeurs que l'analyseur d'en-tête est autorisé à rendre sont
+    /// exactement celles que le décodeur d'échantillons sait lire.
+    ///
+    /// Ce n'est pas un détail de forme. Une profondeur hors de cet ensemble se
+    /// propage jusqu'à l'ampli : `pcm_bytes_to_f32` retombe sur un pas de deux
+    /// octets là où l'appelant en a compté `bit_depth / 8`, et la sortie rend
+    /// du bruit blanc avec la musique derrière.
+    #[test]
+    fn un_en_tete_wav_ne_rend_que_des_profondeurs_que_le_decodeur_sait_lire() {
+        // Sous-format PCM / IEEE float des en-têtes EXTENSIBLE.
+        const SUB_PCM: u16 = 1;
+        const SUB_FLOAT: u16 = 3;
+
+        // --- Ce qui doit continuer de passer, à toutes les profondeurs ---
+        let acceptes: [(&str, Vec<u8>, u16); 6] = [
+            ("PCM 16", wav_header(1, 2, 44_100, 4, 16, 16, None), 16),
+            ("PCM 24", wav_header(1, 2, 96_000, 6, 24, 16, None), 24),
+            ("PCM 32", wav_header(1, 2, 192_000, 8, 32, 16, None), 32),
+            (
+                "IEEE float 32",
+                wav_header(3, 2, 44_100, 8, 32, 16, None),
+                0,
+            ),
+            (
+                "EXTENSIBLE 24 dans 32",
+                wav_header(0xFFFE, 2, 384_000, 8, 32, 40, Some((24, SUB_PCM))),
+                32,
+            ),
+            (
+                "EXTENSIBLE float 32",
+                wav_header(0xFFFE, 2, 44_100, 8, 32, 40, Some((32, SUB_FLOAT))),
+                0,
+            ),
+        ];
+        for (etiquette, header, attendu) in acceptes {
+            let parsed = parse_wav_header(&header)
+                .unwrap_or_else(|| panic!("{etiquette} : en-tête valide refusé"));
+            assert_eq!(parsed.2, attendu, "{etiquette} : mauvaise profondeur");
+            assert_eq!(parsed.0, 2, "{etiquette} : mauvais nombre de voies");
+        }
+
+        // --- Ce qui doit être REFUSÉ plutôt que mal décodé ---
+        //
+        // `block_align = 2` sur deux voies = un conteneur d'UN octet (WAV
+        // 8 bits, licite). L'ancien code rendait 8 : le pas annoncé valait un
+        // octet, la lecture en consommait deux.
+        //
+        // `block_align = 0` est le pire : l'ancien calcul rendait 0, qui est
+        // précisément le sentinelle « IEEE float 32 bits ». Du PCM entier
+        // aurait été réinterprété comme des flottants.
+        let refuses: [(&str, Vec<u8>); 6] = [
+            (
+                "PCM conteneur 1 octet",
+                wav_header(1, 2, 44_100, 2, 8, 16, None),
+            ),
+            (
+                "PCM conteneur nul",
+                wav_header(1, 2, 44_100, 0, 16, 16, None),
+            ),
+            (
+                "PCM conteneur 8 octets",
+                wav_header(1, 2, 44_100, 16, 64, 16, None),
+            ),
+            ("PCM zéro voie", wav_header(1, 0, 44_100, 4, 16, 16, None)),
+            (
+                "EXTENSIBLE conteneur 1 octet",
+                wav_header(0xFFFE, 2, 44_100, 2, 8, 40, Some((8, SUB_PCM))),
+            ),
+            (
+                "EXTENSIBLE conteneur 8 octets",
+                wav_header(0xFFFE, 2, 44_100, 16, 64, 40, Some((64, SUB_PCM))),
+            ),
+        ];
+        for (etiquette, header) in refuses {
+            assert!(
+                parse_wav_header(&header).is_none(),
+                "{etiquette} : en-tête indécodable accepté — le flux partira en bruit"
+            );
+        }
+
+        // Un EXTENSIBLE tronqué annonçait `wBitsPerSample` tel quel : 20 bits
+        // n'est décodé nulle part. C'est le conteneur qui fait foi.
+        let tronque = wav_header(0xFFFE, 2, 96_000, 6, 20, 18, None);
+        assert_eq!(
+            parse_wav_header(&tronque).map(|p| p.2),
+            Some(24),
+            "EXTENSIBLE tronqué : la profondeur doit suivre le conteneur"
+        );
+    }
+
+    /// Contre-épreuve de bout en bout : pour CHAQUE en-tête que l'analyseur
+    /// accepte, le décodeur d'échantillons doit consommer exactement le pas que
+    /// l'analyseur a annoncé.
+    ///
+    /// C'est l'invariant que la sortie locale suppose partout sans jamais le
+    /// vérifier — et sa violation est, littéralement, du bruit.
+    #[test]
+    fn le_decodeur_consomme_exactement_le_pas_annonce_par_l_en_tete() {
+        let candidats: [(&str, Vec<u8>); 9] = [
+            ("PCM 16", wav_header(1, 2, 44_100, 4, 16, 16, None)),
+            ("PCM 24", wav_header(1, 2, 96_000, 6, 24, 16, None)),
+            ("PCM 32", wav_header(1, 2, 192_000, 8, 32, 16, None)),
+            ("IEEE float 32", wav_header(3, 2, 44_100, 8, 32, 16, None)),
+            (
+                "EXTENSIBLE 24 dans 32",
+                wav_header(0xFFFE, 2, 384_000, 8, 32, 40, Some((24, 1))),
+            ),
+            (
+                "EXTENSIBLE float 32",
+                wav_header(0xFFFE, 2, 44_100, 8, 32, 40, Some((32, 3))),
+            ),
+            // Les trois pièges. S'ils sont acceptés, l'invariant doit tenir —
+            // et il ne tient pas, ce qui est tout l'objet du correctif.
+            (
+                "PCM conteneur 1 octet",
+                wav_header(1, 2, 44_100, 2, 8, 16, None),
+            ),
+            (
+                "PCM conteneur nul",
+                wav_header(1, 2, 44_100, 0, 16, 16, None),
+            ),
+            (
+                "EXTENSIBLE tronqué 20 bits",
+                wav_header(0xFFFE, 2, 96_000, 6, 20, 18, None),
+            ),
+        ];
+
+        for (etiquette, header) in candidats {
+            let Some((channels, _, bit_depth, _)) = parse_wav_header(&header) else {
+                continue; // refusé : il part au décodeur symphonia, pas au DAC.
+            };
+            let stride = declared_stride(bit_depth);
+            assert_ne!(stride, 0, "{etiquette} : pas d'avancement nul");
+            assert_ne!(
+                channels, 0,
+                "{etiquette} : zéro voie, trame de taille nulle"
+            );
+
+            // 64 trames d'octets non nuls, alignées sur le pas ANNONCÉ.
+            let frame_bytes = usize::from(channels) * stride;
+            let pcm: Vec<u8> = (0..frame_bytes * 64).map(|i| (i % 251 + 1) as u8).collect();
+            let samples = pcm_bytes_to_f32(&pcm, bit_depth);
+
+            assert_eq!(
+                samples.len() * stride,
+                pcm.len(),
+                "{etiquette} ({bit_depth} bits) : le décodeur consomme {} octets par échantillon \
+                 alors que l'en-tête en annonce {stride} — chaque trame est lue au mauvais \
+                 décalage, et la sortie locale rend du bruit",
+                pcm.len() as f64 / samples.len().max(1) as f64,
+            );
+        }
+    }
+
+    /// Épingle « la plus riche l'emporte » — le départage d'avant #3209.
+    ///
+    /// Ce test reste vrai APRÈS #3209, et ce n'est pas un hasard : ni
+    /// `alsa:first-48k` ni `alsa:rich-384k` n'est un PCM `hw:`, donc le
+    /// critère « le matériel d'abord » ne départage rien et l'ancienne règle
+    /// s'applique mot pour mot. C'est exactement le cas d'une machine où
+    /// PipeWire est le seul chemin praticable. Il a gagné un sixième argument
+    /// (`candidate_sample_rates_measured`) parce que la preuve doit désormais
+    /// basculer avec l'identité et les capacités, puis un septième
+    /// (`candidate_hardware_detail`, #2272) pour la même raison.
     #[test]
     fn linux_duplicate_keeps_the_rich_variant_identity_with_its_capabilities() {
         let mut retained = AudioDevice {
@@ -7620,22 +10196,991 @@ mod tests {
             is_default: false,
             max_channels: 2,
             sample_rates: vec![44_100, 48_000],
+            sample_rates_measured: true,
             backend: "ALSA".into(),
+            hardware_detail: None,
         };
-
+        assert!(
+            !alsa_pcm_is_direct_hardware("alsa:first-48k")
+                && !alsa_pcm_is_direct_hardware("alsa:rich-384k"),
+            "ce test n'épingle l'ANCIENNE règle que tant qu'aucun des deux PCM \
+             n'atteint le matériel ; sinon il vérifierait autre chose que son nom",
+        );
         assert!(merge_linux_duplicate_variant(
             &mut retained,
             "alsa:rich-384k".into(),
             true,
             32,
             vec![44_100, 48_000, 96_000, 192_000, 384_000],
+            true,
+            None,
         ));
-
         assert_eq!(retained.endpoint_id, "alsa:rich-384k");
         assert_eq!(retained.max_channels, 32);
         assert_eq!(retained.sample_rates.last(), Some(&384_000));
         assert!(retained.is_default);
     }
+
+    // -----------------------------------------------------------------------
+    // #3209 / #1655 — sur ALSA, le greffon ne gagne plus contre le matériel.
+    //
+    // Le mécanisme : `snd_device_name_hint` rend la même carte sous une
+    // dizaine de PCM homonymes, le dédoublonnage Linux les regroupe par nom, et
+    // le départage retenait « le plus riche ». Or un `plug`/`dmix` ACCEPTE
+    // tout : il annonce 32 voies pour un DAC stéréo et toutes les cadences. Il
+    // gagnait donc, puis imposait son identité — et alsa-lib rééchantillonnait
+    // en silence à 48 kHz (`defaults.pcm.dmix.rate 48000`) pendant que Tune
+    // croyait jouer en natif.
+    //
+    // La règle est PURE : elle reçoit des variantes (pcm_id, voies, cadences)
+    // et rend l'indice de celle qui doit être retenue. Aucun appel à alsa-lib,
+    // aucun périphérique — elle est donc éprouvable sur une machine sans DAC,
+    // et sur toutes les cibles, pas seulement Linux.
+    // -----------------------------------------------------------------------
+
+    /// Les cadences qu'un `plug` accepte : toutes. C'est le mensonge du
+    /// greffon, et il ne doit plus rien gagner.
+    fn cadences_du_greffon() -> Vec<u32> {
+        vec![
+            8_000, 16_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800,
+            384_000,
+        ]
+    }
+
+    /// Ce que le DAC annonce vraiment : deux voies, 44,1 → 384.
+    fn cadences_du_materiel() -> Vec<u32> {
+        vec![
+            44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+        ]
+    }
+
+    /// LE CAS D'OR. `sysdefault:CARD=X` annonce 32 voies et TOUTES les
+    /// cadences ; `hw:CARD=X` annonce 2 voies et 44,1 → 384. Le greffon est
+    /// strictement plus riche sur les deux axes — et perd quand même.
+    #[test]
+    fn alsa_le_pcm_materiel_bat_le_greffon_meme_plus_riche() {
+        let greffon = AlsaVariant {
+            endpoint_id: "sysdefault:CARD=DACZ8,DEV=0".into(),
+            max_channels: 32,
+            sample_rates: cadences_du_greffon(),
+        };
+        let materiel = AlsaVariant {
+            endpoint_id: "hw:CARD=DACZ8,DEV=0".into(),
+            max_channels: 2,
+            sample_rates: cadences_du_materiel(),
+        };
+        assert!(
+            greffon.max_channels > materiel.max_channels
+                && greffon.sample_rates.len() > materiel.sample_rates.len(),
+            "le témoin ne vaut que si le greffon est STRICTEMENT plus riche : \
+             c'est ce que l'ancienne règle regardait",
+        );
+
+        // alsa-lib rend `sysdefault` avant `hw` — mais la règle ne doit pas
+        // dépendre de cet ordre, sans quoi elle serait vraie par accident.
+        for (etiquette, variantes) in [
+            ("greffon en tête", vec![greffon.clone(), materiel.clone()]),
+            ("matériel en tête", vec![materiel.clone(), greffon.clone()]),
+        ] {
+            let indice = retenir_variante_alsa(&variantes)
+                .unwrap_or_else(|| panic!("{etiquette} : aucune variante retenue"));
+            assert_eq!(
+                variantes[indice].endpoint_id, "hw:CARD=DACZ8,DEV=0",
+                "{etiquette} : c'est le greffon qui a été retenu — alsa-lib \
+                 rééchantillonnera un FLAC 44,1 kHz en silence (#1655)",
+            );
+            assert_eq!(
+                variantes[indice].max_channels, 2,
+                "{etiquette} : les capacités retenues doivent être celles du \
+                 DAC, pas les 32 voies inventées par le greffon",
+            );
+        }
+    }
+
+    /// LE TÉMOIN PIPEWIRE. Plusieurs variantes homonymes SANS aucun `hw:` :
+    /// le comportement d'avant est conservé, et le regroupement continue de
+    /// rendre UNE seule variante (43 fantômes → 48 zones chez JeromeQ sur
+    /// Ubuntu 24.04 — c'est ce que le regroupement par nom a arrêté).
+    #[test]
+    fn alsa_sans_pcm_materiel_le_dedoublonnage_pipewire_est_inchange() {
+        let variantes = vec![
+            AlsaVariant {
+                endpoint_id: "sysdefault:CARD=PCH".into(),
+                max_channels: 2,
+                sample_rates: vec![44_100, 48_000],
+            },
+            AlsaVariant {
+                endpoint_id: "pipewire".into(),
+                max_channels: 32,
+                sample_rates: vec![44_100, 48_000, 96_000, 192_000],
+            },
+            AlsaVariant {
+                endpoint_id: "pulse".into(),
+                max_channels: 2,
+                sample_rates: vec![48_000],
+            },
+            AlsaVariant {
+                endpoint_id: "default".into(),
+                max_channels: 8,
+                sample_rates: vec![44_100, 48_000],
+            },
+            AlsaVariant {
+                endpoint_id: "plughw:CARD=PCH,DEV=0".into(),
+                max_channels: 2,
+                sample_rates: vec![44_100, 48_000, 96_000],
+            },
+        ];
+        assert!(
+            variantes
+                .iter()
+                .all(|v| !alsa_pcm_is_direct_hardware(&v.endpoint_id)),
+            "aucune de ces variantes ne doit atteindre le matériel, sinon le \
+             témoin ne parle plus du cas PipeWire",
+        );
+
+        // La plus riche l'emporte, exactement comme avant #3209 — et une
+        // SEULE variante est retenue, quel que soit l'ordre d'énumération.
+        let mut tournee = variantes.clone();
+        for _ in 0..variantes.len() {
+            tournee.rotate_left(1);
+            let indice = retenir_variante_alsa(&tournee).expect("une variante retenue");
+            assert_eq!(
+                tournee[indice].endpoint_id, "pipewire",
+                "le départage PipeWire a changé : une machine où PipeWire est \
+                 le seul chemin praticable ne doit rien voir de #3209",
+            );
+        }
+
+        // Et la règle rend UN indice, jamais une liste : le regroupement par
+        // nom reste entier. Sans lui, 43 périphériques → 48 zones.
+        assert!(retenir_variante_alsa(&[]).is_none());
+    }
+
+    /// L'ÉGALITÉ. Deux variantes de capacités identiques : la règle est
+    /// déterministe et ne dépend pas de l'ordre d'énumération. Sans le
+    /// départage par `pcm_id`, c'est la PREMIÈRE énumérée qui gardait tout —
+    /// et alsa-lib rend `sysdefault` avant `hw`.
+    #[test]
+    fn alsa_l_egalite_se_departage_sans_dependre_de_l_ordre() {
+        for (etiquette, a, b, attendu) in [
+            (
+                "deux sorties matérielles de la même carte",
+                "hw:CARD=DACZ8,DEV=1",
+                "hw:CARD=DACZ8,DEV=0",
+                "hw:CARD=DACZ8,DEV=0",
+            ),
+            (
+                "deux greffons homonymes",
+                "sysdefault:CARD=PCH,DEV=0",
+                "front:CARD=PCH,DEV=0",
+                "front:CARD=PCH,DEV=0",
+            ),
+        ] {
+            let fabriquer = |id: &str| AlsaVariant {
+                endpoint_id: id.into(),
+                max_channels: 2,
+                sample_rates: vec![44_100, 48_000],
+            };
+            for (ordre, variantes) in [
+                ("a puis b", vec![fabriquer(a), fabriquer(b)]),
+                ("b puis a", vec![fabriquer(b), fabriquer(a)]),
+            ] {
+                let indice = retenir_variante_alsa(&variantes).expect("une variante retenue");
+                assert_eq!(
+                    variantes[indice].endpoint_id, attendu,
+                    "{etiquette} ({ordre}) : à capacités égales le vainqueur \
+                     dépend encore de l'ordre rendu par alsa-lib",
+                );
+            }
+        }
+    }
+
+    /// Le câblage : quand le PCM matériel l'emporte, l'AudioDevice publié
+    /// bascule ENTIÈREMENT — identité, capacités, et la preuve qui les
+    /// accompagne. Publier « 32 voies mesurées » sous l'endpoint d'un `hw:`
+    /// stéréo serait un troisième périphérique, qui n'existe pas.
+    #[test]
+    fn alsa_le_materiel_retenu_emporte_ses_capacites_et_sa_preuve() {
+        // L'ordre d'alsa-lib : le greffon est publié en premier, ses cadences
+        // ne valent rien (`sample_rates_measured = false`, #1655).
+        let mut publie = AudioDevice {
+            name: "Eversolo DAC-Z8, USB Audio".into(),
+            endpoint_id: "sysdefault:CARD=DACZ8,DEV=0".into(),
+            is_default: false,
+            max_channels: 32,
+            sample_rates: cadences_du_greffon(),
+            sample_rates_measured: false,
+            backend: "Alsa".into(),
+            hardware_detail: None,
+        };
+        assert!(merge_linux_duplicate_variant(
+            &mut publie,
+            "hw:CARD=DACZ8,DEV=0".into(),
+            false,
+            2,
+            cadences_du_materiel(),
+            true,
+            None,
+        ));
+        assert_eq!(publie.endpoint_id, "hw:CARD=DACZ8,DEV=0");
+        assert_eq!(publie.max_channels, 2);
+        assert_eq!(publie.sample_rates, cadences_du_materiel());
+        assert!(
+            publie.sample_rates_measured,
+            "les cadences d'un `hw:` SONT mesurées : la preuve doit basculer \
+             avec l'identité, pas rester celle du greffon",
+        );
+
+        // Et dans l'autre sens : le greffon qui arrive après ne reprend rien
+        // au matériel déjà retenu — ni l'identité, ni ses 32 voies inventées.
+        let mut publie = AudioDevice {
+            name: "Eversolo DAC-Z8, USB Audio".into(),
+            endpoint_id: "hw:CARD=DACZ8,DEV=0".into(),
+            is_default: false,
+            max_channels: 2,
+            sample_rates: cadences_du_materiel(),
+            sample_rates_measured: true,
+            backend: "Alsa".into(),
+            hardware_detail: None,
+        };
+        assert!(!merge_linux_duplicate_variant(
+            &mut publie,
+            "dmix:CARD=DACZ8,DEV=0".into(),
+            true,
+            32,
+            cadences_du_greffon(),
+            false,
+            None,
+        ));
+        assert_eq!(publie.endpoint_id, "hw:CARD=DACZ8,DEV=0");
+        assert_eq!(publie.max_channels, 2);
+        assert!(publie.sample_rates_measured);
+        // `is_default` reste transmis : c'est un fait sur le NOM, pas sur le
+        // PCM — le comportement d'avant est conservé.
+        assert!(publie.is_default);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2862 — les « cadences supportées » d'une zone Windows sont fabriquées.
+    //
+    // `is_format_supported` de cpal rend `Ok(true)` sans regarder le format sur
+    // l'hôte WASAPI. `supported_formats()` déroule donc le produit cartésien
+    // des 21 `COMMON_SAMPLE_RATES` par 7 formats, et deux DAC différents
+    // reçoivent la même liste. Tune ne peut pas corriger cpal ; il peut cesser
+    // de présenter cette liste comme une capacité constatée.
+    //
+    // Ces tests portent sur des fonctions PURES et sur la charge utile
+    // sérialisée : ils tournent sur Linux comme sur Windows. La plateforme est
+    // un paramètre de `sample_rate_evidence`, jamais un `cfg!` interne — sans
+    // quoi la décision Windows ne serait pas compilée ici et le test serait
+    // vert pour la mauvaise raison (#1837, #2056).
+    // -----------------------------------------------------------------------
+
+    /// Les hôtes cpal dont on sait ce que fait l'énumération.
+    const HOTES_CPAL_CONNUS: &[&str] = &["Alsa", "Asio", "CoreAudio", "Jack", "Wasapi"];
+
+    #[test]
+    fn wasapi_ne_presente_plus_ses_cadences_comme_mesurees() {
+        assert_eq!(
+            sample_rate_evidence("Wasapi"),
+            SampleRateEvidence::Unverified,
+            "cpal ne teste RIEN sur WASAPI : is_format_supported rend Ok(true) \
+             sans regarder le format, et supported_formats() fabrique les 21 \
+             cadences. Les annoncer comme mesurées, c'est affirmer ce que \
+             personne n'a vérifié (#2862)"
+        );
+
+        // Témoin anti-régression : les hôtes qui INTERROGENT réellement le
+        // pilote — ALSA par `hw_params.test_rate`, ASIO par
+        // `driver.can_sample_rate` — ne bougent pas d'un iota.
+        for hote in ["Alsa", "Asio", "CoreAudio", "Jack"] {
+            assert!(
+                sample_rate_evidence(hote).is_measured(),
+                "l'hôte « {hote} » confronte ses cadences au matériel : le \
+                 rétrograder en « non vérifié » ferait perdre à Linux et macOS \
+                 une information qu'ils avaient bel et bien"
+            );
+        }
+
+        // Un hôte qu'on ne connaît pas ne se voit pas PRÊTER une mesure.
+        assert!(
+            !sample_rate_evidence("UnHoteQuiNExistePasEncore").is_measured(),
+            "un backend inconnu doit tomber du côté « non vérifié » : on ne \
+             sait pas s'il interroge le pilote, donc on ne l'affirme pas"
+        );
+
+        // La casse du nom d'hôte n'est pas un contrat.
+        assert!(!sample_rate_evidence("WASAPI").is_measured());
+        assert!(sample_rate_evidence("alsa").is_measured());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1655 — sur ALSA, « le pilote a répondu » ne veut pas dire « le DAC a
+    // répondu ».
+    //
+    // Relevé de GgB du 30/08/2026, sur 0.9.127, pendant la lecture d'un
+    // fichier 192 kHz / 24 bits (`/proc/asound/card0/stream0`) :
+    //
+    //     Momentary freq = 48001 Hz (0x6.0008)
+    //     Packet Size = 72
+    //     Rates: 44100, 48000, …, 705600, 768000
+    //
+    // `Momentary freq` n'est pas une cadence nominale : c'est `freqm`, le
+    // compteur de rétroaction de l'endpoint USB, en 16.16 échantillon par
+    // micro-trame (noyau Linux, `sound/usb/proc.c`, `proc_dump_ep_status` →
+    // `get_high_speed_hz(x) = (x * 125 + (1 << 9)) >> 10`). 0x6.0008 vaut
+    // 6,000122 échantillon par micro-trame de 125 µs, soit 48 000 Hz nominal
+    // dérivant de +0,002 % — la dérive NORMALE d'un endpoint asynchrone
+    // (`ASYNC`, `Feedback Format = 16.16`) asservi à l'horloge du DAC. Le
+    // 48001 n'est donc pas le défaut. Le défaut est le 48 000 nominal qu'il
+    // révèle : un flux 192 kHz demanderait ≈24 échantillons par micro-trame
+    // (0x18.xxxx), et ne tiendrait pas dans un paquet de 72 octets
+    // (24 × 2 canaux × 4 octets = 192 octets minimum).
+    //
+    // Côté Tune, le journal du même appareil dit `output_sr=192000` et
+    // `max_channels=32` — or ce DAC est stéréo. 32 est le PLAFOND que cpal
+    // impose (`cpal-0.17.3` `src/host/alsa/mod.rs:556`) : seul un greffon
+    // logiciel annonce autant de canaux. Et le journal porte
+    // `ALSA lib pcm_direct.c … snd1_pcm_direct_slave_recover`, c'est-à-dire
+    // `dmix` — dont `alsa.conf` fixe l'esclave à `defaults.pcm.dmix.rate
+    // 48000`. L'écran affiche donc, comme MESURÉES, les cadences qu'un
+    // rééchantillonneur a bien voulu accepter.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn un_pcm_alsa_convertisseur_ne_peut_pas_annoncer_une_cadence_mesuree() {
+        for pcm in [
+            "ALSA:default",
+            "ALSA:sysdefault:CARD=DACZ8",
+            "ALSA:plughw:CARD=DACZ8,DEV=0",
+            "ALSA:dmix:CARD=DACZ8,DEV=0",
+            "ALSA:front:CARD=DACZ8,DEV=0",
+            "ALSA:iec958:CARD=DACZ8,DEV=0",
+            "ALSA:pipewire",
+            "ALSA:pulse",
+        ] {
+            assert!(
+                !sample_rate_evidence_for_device("Alsa", pcm, true).is_measured(),
+                "« {pcm} » n'est pas le DAC : c'est un greffon qui accepte tout \
+                 et rééchantillonne. Présenter ses cadences comme mesurées, \
+                 c'est faire dire au matériel ce que le convertisseur a \
+                 répondu — l'écran de GgB annonce 44,1 → 384 kHz pendant que \
+                 l'endpoint USB tourne à 48 kHz (#1655)"
+            );
+        }
+    }
+
+    #[test]
+    fn le_pcm_materiel_direct_reste_une_mesure_et_la_supposition_jamais() {
+        // Témoin : `hw:` atteint le pilote sans conversion. Le rétrograder
+        // ferait perdre à Linux une information qu'il avait bel et bien.
+        assert!(
+            sample_rate_evidence_for_device("Alsa", "ALSA:hw:CARD=DACZ8,DEV=0", true).is_measured()
+        );
+        // Le préfixe d'hôte est facultatif : le PCM reste lisible sans lui.
+        assert!(sample_rate_evidence_for_device("Alsa", "hw:CARD=DACZ8,DEV=0", true).is_measured());
+        assert!(alsa_pcm_is_direct_hardware("hw:CARD=DACZ8,DEV=0"));
+        assert!(!alsa_pcm_is_direct_hardware("dmix:CARD=DACZ8,DEV=0"));
+
+        // Une liste SUPPOSÉE n'a mesuré personne — quel que soit l'hôte ou le
+        // PCM. C'est le drapeau que `probe_device_fallback_caps` calculait et
+        // que l'énumération jetait (`let _ = caps_reliable`) : les 40
+        // `local_audio_device_fallback_to_assumed_stereo_44100_48000` du
+        // journal de GgB étaient publiés comme des mesures.
+        assert!(
+            !sample_rate_evidence_for_device("Alsa", "ALSA:hw:CARD=DACZ8,DEV=0", false)
+                .is_measured()
+        );
+        assert!(
+            !sample_rate_evidence_for_device("CoreAudio", "CoreAudio:Engine", false).is_measured()
+        );
+
+        // Les hôtes non-ALSA ne dépendent pas d'un nom de PCM : leur verdict
+        // reste celui de `sample_rate_evidence`, inchangé.
+        assert!(sample_rate_evidence_for_device("CoreAudio", "", true).is_measured());
+        assert!(sample_rate_evidence_for_device("Asio", "", true).is_measured());
+        assert!(!sample_rate_evidence_for_device("Wasapi", "", true).is_measured());
+    }
+
+    /// La table est indexée sur `cpal::HostId::name()`, qui rend le nom de la
+    /// VARIANTE (`stringify!`) et non un libellé d'affichage. Si cpal renomme
+    /// une variante, la table devient muette et l'hôte retombe silencieusement
+    /// dans le cas « inconnu ». Ce test attrape ce glissement sur la machine
+    /// qui compile, quelle qu'elle soit.
+    #[test]
+    fn la_table_est_indexee_sur_le_vrai_nom_d_hote_cpal() {
+        // `HostTrait` vient du glob `use super::*` : la re-importer ici est
+        // refusee par le `#![deny(unused_imports)]` de la caisse.
+        let nom = cpal::default_host().id().name();
+        assert!(
+            HOTES_CPAL_CONNUS.contains(&nom),
+            "cpal rend « {nom} » comme nom d'hôte, absent de la table de \
+             sample_rate_evidence {HOTES_CPAL_CONNUS:?}. Tant qu'il n'y figure \
+             pas, cet hôte est classé « non vérifié » — ce qui est prudent mais \
+             faux s'il interroge le pilote"
+        );
+    }
+
+    /// Ce que la zone reçoit vraiment sur `GET /api/v1/devices/audio` : la
+    /// liste, et désormais ce qu'elle vaut. Sans ce champ, huit cadences
+    /// inventées et huit cadences constatées sont indiscernables sur le fil.
+    #[test]
+    fn la_charge_utile_dit_si_les_cadences_ont_ete_mesurees() {
+        let cadences = vec![
+            44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+        ];
+
+        let windows = AudioDevice {
+            name: "Haut-Parleurs".into(),
+            endpoint_id: String::new(),
+            is_default: true,
+            max_channels: 2,
+            sample_rates: cadences.clone(),
+            sample_rates_measured: sample_rate_evidence("Wasapi").is_measured(),
+            backend: "Wasapi".into(),
+            hardware_detail: None,
+        };
+        let json = serde_json::to_value(&windows).expect("AudioDevice sérialisable");
+        assert_eq!(
+            json["sample_rates_measured"],
+            serde_json::json!(false),
+            "la zone Windows annonce jusqu'à 384 kHz sans que rien ne l'ait \
+             vérifié : la charge utile doit le dire, sinon l'écran affirme une \
+             capacité qu'il ne connaît pas (#2862). Reçu : {json}"
+        );
+        assert_eq!(
+            json["sample_rates"],
+            serde_json::json!(cadences),
+            "la liste elle-même n'est pas amputée : on la qualifie, on ne la \
+             retire pas — la lecture continue de s'appuyer dessus"
+        );
+
+        // Témoin : Linux/macOS gardent exactement le sens qu'ils avaient.
+        let linux = AudioDevice {
+            backend: "Alsa".into(),
+            sample_rates_measured: sample_rate_evidence("Alsa").is_measured(),
+            ..windows.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&linux).expect("AudioDevice sérialisable")["sample_rates_measured"],
+            serde_json::json!(true),
+            "ALSA teste chaque cadence sur le pilote : rien ne doit changer là"
+        );
+
+        // Un enregistrement écrit avant ce champ reste lisible.
+        let ancien = serde_json::json!({
+            "name": "Haut-Parleurs",
+            "endpoint_id": "",
+            "is_default": true,
+            "max_channels": 2,
+            "sample_rates": [44_100, 48_000],
+            "backend": "Alsa",
+        });
+        let relu: AudioDevice =
+            serde_json::from_value(ancien).expect("le champ ajouté doit avoir un défaut serde");
+        assert!(relu.sample_rates_measured);
+    }
+
+    /// Un indice qui n'est pas BRANCHÉ ne vaut rien. Ce test lit le contenu du
+    /// fichier, comme les gardes voisines, pour attraper le seul retour en
+    /// arrière qui compte : quelqu'un qui recâble le champ sur une constante,
+    /// et l'API réannonce « mesuré » sur toutes les plateformes.
+    ///
+    /// Les aiguilles sont assemblées à l'exécution : écrites en clair, elles
+    /// figureraient dans ce fichier et le test serait vert grâce à sa propre
+    /// source.
+    #[test]
+    fn l_indice_de_mesure_est_calcule_et_non_ecrit_en_dur() {
+        let source = include_str!("local.rs");
+
+        let champ_derive = ["sample_rates_measured: ", "rates_evidence.is_measured(),"].concat();
+        assert!(
+            source.contains(&champ_derive),
+            "le seul site qui construit un AudioDevice de production doit \
+             dériver `sample_rates_measured` de `sample_rate_evidence` ; écrit \
+             en dur, il redit « mesuré » sur WASAPI (#2862)"
+        );
+
+        let filtre_tautologique = [".filter(|c| c.sample_rate", " == sample_rate)"].concat();
+        let apres = source
+            .split_once(filtre_tautologique.as_str())
+            .expect("la branche « ouvrir à la cadence source » a disparu")
+            .1;
+        // Decoupe en CARACTERES : ce fichier est accentue, une coupe a
+        // l octet pres tomberait au milieu d un caractere et paniquerait.
+        let branche: String = apres.chars().take(4_000).collect();
+        let appel_indice = ["sample_rate_evidence_for_device(", "host_id_name,"].concat();
+        assert!(
+            branche.contains(&appel_indice),
+            "le site qui décide d'ouvrir à la cadence source doit savoir ce que \
+             vaut le « oui » du périphérique. Sur WASAPI le filtre est \
+             TAUTOLOGIQUE — find_matching_config recopie la cadence demandée — \
+             et sur ALSA le « oui » d'un `dmix:` n'est pas celui du DAC. Sans \
+             cet appel, l'indice n'est ni journalisé (#2862, #1655) ni \
+             consultable par la décision (#3233)"
+        );
+        let pcm_journalise = ["endpoint_id = %", "opened_endpoint_id,"].concat();
+        assert!(
+            branche.contains(&pcm_journalise),
+            "sans le nom du PCM ALSA dans le journal, un relevé de terrain ne \
+             peut pas dire si Tune a ouvert le matériel ou un \
+             rééchantillonneur — c'est la ligne qui manquait à #1655"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3233 — la décision, pas seulement l'indice
+    //
+    // Pierre M (fil forum 1043, 14/07/2026) : « DSD : le temps défile, pas de
+    // son ». Un DSD64 décode à 176 400 Hz. Le chemin partagé ouvrait à cette
+    // cadence dès que `find_matching_config(..).filter(|c| c.sample_rate ==
+    // sample_rate)` répondait — un filtre TAUTOLOGIQUE, puisque
+    // `find_matching_config` recopie la cadence demandée dans le config qu'il
+    // rend. Sur WASAPI, cpal retient les 21 COMMON_SAMPLE_RATES sans rien
+    // demander au pilote, la branche était donc TOUJOURS prise quel que soit le
+    // matériel, `needs_resample` restait faux et rubato ne tournait jamais.
+    //
+    // #2862 avait rendu la LISTE honnête (`sample_rate_evidence`). La DÉCISION
+    // qui s'en sert n'avait pas bougé.
+    //
+    // `decide_local_rate_opening` est PURE et prend la preuve en paramètre :
+    // ces tests contredisent réellement la décision WASAPI depuis Linux, au
+    // lieu d'être verts parce que la branche n'y est pas compilée (#1837,
+    // #2056), et sans le moindre `cfg`.
+    // -----------------------------------------------------------------------
+
+    /// La preuve WASAPI, telle que la machine la calcule vraiment — jamais
+    /// écrite en dur ici, sinon le test répliquerait la règle au lieu de s'y
+    /// confronter.
+    fn preuve_wasapi() -> SampleRateEvidence {
+        sample_rate_evidence_for_device("Wasapi", "", true)
+    }
+
+    /// La preuve ALSA d'un PCM matériel — le cas nominal.
+    fn preuve_alsa_materielle() -> SampleRateEvidence {
+        sample_rate_evidence_for_device("Alsa", "ALSA:hw:CARD=DACZ8,DEV=0", true)
+    }
+
+    /// **Essai 1** — capacités fabriquées, cadence que le matériel ne tient
+    /// pas. Le cas de Pierre M : DSD64 → 176 400 Hz, DAC Windows dont le
+    /// mélangeur tourne à 48 kHz, et une énumération qui dit « oui » à tout.
+    #[test]
+    fn capacites_fabriquees_la_cadence_source_n_est_pas_ouverte_telle_quelle() {
+        let decision = decide_local_rate_opening(176_400, Some(48_000), true, preuve_wasapi());
+        assert_eq!(
+            decision,
+            LocalRateOpening::ResampleToDeviceRate {
+                device_sample_rate: 48_000,
+                reason: LocalRateFallback::CapabilitiesUnverified,
+            },
+            "l'énumération WASAPI est fabriquée : ouvrir à 176 400 Hz sur cette \
+             seule foi, c'est ce qui fait défiler le temps sans un son (#3233). \
+             La décision doit refuser la cadence source ET dire pourquoi"
+        );
+    }
+
+    /// **Essai 2 — LE TÉMOIN.** Capacités mesurées, cadence retenue :
+    /// l'ouverture ne change pas d'un iota. Un correctif qui rééchantillonnerait
+    /// aussi ici serait exactement le défaut que Tune combat.
+    #[test]
+    fn temoin_capacites_mesurees_ouvrent_toujours_a_la_cadence_source() {
+        assert_eq!(
+            decide_local_rate_opening(176_400, Some(48_000), true, preuve_alsa_materielle()),
+            LocalRateOpening::AtSourceRateMeasured,
+            "ALSA interroge le pilote cadence par cadence sur un PCM `hw:` : ce \
+             « oui » est une MESURE, la cadence source doit s'ouvrir telle \
+             quelle comme avant (Cyrille, FiiO K3 / iFi Neo iDSD)"
+        );
+        // La famille entière des hôtes qui mesurent, pas un seul représentant.
+        for hote in ["Alsa", "Asio", "CoreAudio", "Jack"] {
+            assert_eq!(
+                decide_local_rate_opening(
+                    352_800,
+                    Some(44_100),
+                    true,
+                    sample_rate_evidence_for_device(hote, "hw:CARD=X,DEV=0", true),
+                ),
+                LocalRateOpening::AtSourceRateMeasured,
+                "l'hôte « {hote} » interroge le pilote : rien ne doit changer là"
+            );
+        }
+    }
+
+    /// **Essai 3** — capacités fabriquées, mais la cadence est RÉELLEMENT
+    /// tenue : le périphérique y tourne déjà. Ne pas dégrader inutilement.
+    ///
+    /// C'est le seul fait que WASAPI livre vraiment — `GetMixFormat` décrit le
+    /// format que le moteur fait tourner, il n'est pas fabriqué.
+    #[test]
+    fn capacites_fabriquees_mais_cadence_tenue_n_est_pas_degradee() {
+        assert_eq!(
+            decide_local_rate_opening(176_400, Some(176_400), true, preuve_wasapi()),
+            LocalRateOpening::DeviceAlreadyAtSourceRate,
+            "le périphérique TOURNE à 176 400 Hz : lui imposer un aller-retour \
+             par rubato dégraderait sans rien corriger"
+        );
+        // Et même sans le « oui » de l'énumération : le fait prime sur la liste.
+        assert_eq!(
+            decide_local_rate_opening(176_400, Some(176_400), false, preuve_wasapi()),
+            LocalRateOpening::DeviceAlreadyAtSourceRate,
+        );
+    }
+
+    /// Le cas constaté — le périphérique ne retient pas la cadence — garde son
+    /// comportement de toujours, et gagne un motif distinct du précédent.
+    #[test]
+    fn cadence_non_retenue_reste_un_reechantillonnage_mais_nomme() {
+        for preuve in [preuve_wasapi(), preuve_alsa_materielle()] {
+            assert_eq!(
+                decide_local_rate_opening(176_400, Some(48_000), false, preuve),
+                LocalRateOpening::ResampleToDeviceRate {
+                    device_sample_rate: 48_000,
+                    reason: LocalRateFallback::RateNotSupported,
+                },
+                "un refus CONSTATÉ n'est pas une capacité SUPPOSÉE : les deux \
+                 motifs doivent rester distincts sur l'écran de la zone"
+            );
+        }
+    }
+
+    /// Sans cadence de périphérique, il n'y a **rien vers quoi**
+    /// rééchantillonner : refuser la cadence source ne ferait que casser la
+    /// lecture. Le dernier recours ouvre donc à la cadence source, comme avant
+    /// (PipeWire, énumération muette). Aucune régression n'est introduite là —
+    /// et c'est la limite assumée du correctif : quand le périphérique ne dit
+    /// rien du tout, Tune n'a plus aucun fait sur lequel s'appuyer.
+    #[test]
+    fn sans_cadence_de_peripherique_le_dernier_recours_est_inchange() {
+        assert_eq!(
+            decide_local_rate_opening(176_400, None, true, preuve_wasapi()),
+            LocalRateOpening::LastResortSourceRate,
+            "capacités supposées ET aucune cadence connue : dégrader vers rien \
+             n'a pas de sens, on ouvre comme avant"
+        );
+        for enumere in [true, false] {
+            assert_eq!(
+                decide_local_rate_opening(176_400, None, enumere, preuve_wasapi()),
+                LocalRateOpening::LastResortSourceRate,
+            );
+        }
+        assert_eq!(
+            decide_local_rate_opening(176_400, None, false, preuve_alsa_materielle()),
+            LocalRateOpening::LastResortSourceRate,
+        );
+        // Témoin : une énumération MESURÉE qui retient la cadence reste une
+        // ouverture à la cadence source, même sans configuration par défaut —
+        // c'est exactement ce que faisait le code d'avant.
+        assert_eq!(
+            decide_local_rate_opening(176_400, None, true, preuve_alsa_materielle()),
+            LocalRateOpening::AtSourceRateMeasured,
+            "un « oui » mesuré n'a pas besoin d'une cadence par défaut pour \
+             valoir : rien ne doit changer sur ALSA `hw:` / ASIO / CoreAudio"
+        );
+    }
+
+    /// Contre-épreuve PERMANENTE (leçon #1864) : chaque motif déclaré doit être
+    /// réellement PRODUIT par la fonction de décision. Un motif ajouté à
+    /// l'énumération sans être câblé fait tomber ce test.
+    #[test]
+    fn chaque_motif_de_cadence_est_reellement_produit() {
+        let mut produits: Vec<LocalRateFallback> = Vec::new();
+        for source in [44_100u32, 176_400, 352_800] {
+            for defaut in [None, Some(44_100u32), Some(48_000), Some(176_400)] {
+                for enumere in [true, false] {
+                    for preuve in [preuve_wasapi(), preuve_alsa_materielle()] {
+                        if let LocalRateOpening::ResampleToDeviceRate { reason, .. } =
+                            decide_local_rate_opening(source, defaut, enumere, preuve)
+                        {
+                            produits.push(reason);
+                        }
+                    }
+                }
+            }
+        }
+        for motif in LocalRateFallback::ALL {
+            assert!(
+                produits.contains(&motif),
+                "le motif {motif:?} est déclaré mais AUCUN chemin de décision ne \
+                 le construit — il ne gardera jamais rien"
+            );
+        }
+    }
+
+    /// Les motifs sont ce que le client reçoit et traduit : codes distincts,
+    /// en `snake_case`, et un texte qui dit ce qui a changé pour le son.
+    #[test]
+    fn tous_les_motifs_de_cadence_ont_un_code_et_un_texte_utilisables() {
+        let mut codes: Vec<&str> = Vec::new();
+        for motif in LocalRateFallback::ALL {
+            let code = motif.code();
+            assert!(
+                !code.is_empty()
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                "code « {code} » inutilisable comme clef de traduction"
+            );
+            assert!(!codes.contains(&code), "code « {code} » en double");
+            codes.push(code);
+            assert!(
+                motif.detail().len() > 20,
+                "le motif {motif:?} doit expliquer ce qui change pour le son"
+            );
+        }
+    }
+
+    /// Ce que la zone REÇOIT : la cadence ouverte à côté de celle de la source.
+    /// Sans ce champ, Pierre M lit « DSD64 » pendant que Tune convertit, et il
+    /// faut ses journaux pour le savoir.
+    #[test]
+    fn le_statut_de_zone_porte_la_cadence_reellement_ouverte() {
+        let degrade = backend_status_with_rate(
+            None,
+            None,
+            Some(ObservedRate {
+                source_sample_rate: 176_400,
+                opened_sample_rate: 48_000,
+                reason: Some(LocalRateFallback::CapabilitiesUnverified),
+                evidence_measured: false,
+            }),
+            "auto",
+        );
+        let rate = degrade.rate.expect("la cadence observée doit être publiée");
+        assert!(rate.resampled, "176 400 → 48 000 est une conversion");
+        assert_eq!(rate.reason, Some(LocalRateFallback::CapabilitiesUnverified));
+        assert_eq!(
+            rate.detail,
+            Some(LocalRateFallback::CapabilitiesUnverified.detail()),
+            "l'écran sans table de traduction doit avoir la phrase"
+        );
+        assert!(!rate.evidence_measured);
+        let json = serde_json::to_value(&degrade).expect("LocalBackendStatus sérialisable");
+        assert_eq!(json["rate"]["resampled"], serde_json::json!(true));
+        assert_eq!(
+            json["rate"]["reason"],
+            serde_json::json!("capabilities_unverified"),
+            "le code doit partir en snake_case, comme fallback_reason : {json}"
+        );
+
+        // Témoin : une ouverture à la cadence source ne signale aucun écart.
+        let intact = backend_status_with_rate(
+            None,
+            None,
+            Some(ObservedRate {
+                source_sample_rate: 176_400,
+                opened_sample_rate: 176_400,
+                reason: None,
+                evidence_measured: true,
+            }),
+            "auto",
+        );
+        let rate = intact.rate.expect("la cadence observée doit être publiée");
+        assert!(!rate.resampled);
+        assert_eq!(rate.reason, None);
+        assert_eq!(rate.detail, None);
+
+        // Rien n'a encore joué : le champ existe et vaut `null`, ce qui est la
+        // seule réponse honnête — comme `device` (#2207).
+        assert!(
+            backend_status_with_rate(None, None, None, "auto")
+                .rate
+                .is_none()
+        );
+    }
+
+    /// GARDE DE SITE — la fonction peut être parfaite et n'être appelée nulle
+    /// part, ou être court-circuitée par le filtre d'origine remis devant elle.
+    /// Ce test relit la PRODUCTION (idiome du dépôt : `terminologie_eq.rs`,
+    /// `position_publiee_guard`), parce qu'aucun test d'unité ne peut attraper
+    /// ça : `decide_local_rate_opening` resterait verte pendant que le chemin
+    /// réel l'ignore.
+    ///
+    /// Les aiguilles sont assemblées à l'exécution : écrites en clair, elles
+    /// figureraient dans ce fichier et le test serait vert grâce à sa propre
+    /// source.
+    #[test]
+    fn la_decision_de_cadence_est_branchee_sur_le_chemin_reel() {
+        // Source normalisée : on retire tous les blancs, pour que la garde
+        // survive à un passage de rustfmt qui recasserait les lignes — même
+        // idiome que `les_quatre_charges_utiles_de_zone_appellent_le_contrat`.
+        let source: String = include_str!("local.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        // L'APPEL de production, avec ses arguments : la signature seule ne
+        // prouverait rien, et un appel de test non plus.
+        let appel_reel = [
+            "decide_local_rate_opening(sample_rate,default_sr,",
+            "enumerated.is_some(),rate_evidence,)",
+        ]
+        .concat();
+        assert!(
+            source.contains(&appel_reel),
+            "le chemin cpal partagé doit passer par `decide_local_rate_opening` \
+             en lui donnant la cadence de la source, celle du périphérique, la \
+             réponse de l'énumération ET la preuve qui dit ce qu'elle vaut. \
+             Sans la preuve, la décision redit oui à une liste fabriquée \
+             (#3233, Pierre M, fil 1043)"
+        );
+
+        // Le retour en arrière EXACT : réutiliser le résultat du filtre comme
+        // CONDITION d'ouverture, au lieu de le passer à la décision.
+        let court_circuit = [
+            "}elseifletSome(cfg)=find_matching_config(&device,channels,sample_rate)",
+            ".filter(|c|c.sample_rate==sample_rate)",
+        ]
+        .concat();
+        assert!(
+            !source.contains(&court_circuit),
+            "le filtre tautologique est redevenu la CONDITION d'ouverture : \
+             `find_matching_config` recopie la cadence demandée dans le config \
+             qu'il rend, donc sur WASAPI la branche est prise quel que soit le \
+             matériel, `needs_resample` reste faux et rubato ne tourne jamais"
+        );
+
+        // La conversion décidée doit être remontée, pas seulement journalisée.
+        assert!(
+            source.contains("note_rate_decision(ObservedRate{"),
+            "une décision qui change ce qui part au DAC doit atteindre le \
+             client : sans `note_rate_decision`, il ne reste que le journal — \
+             c'est exactement ce qui a coûté #1395 et #2207"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2868 — Windows sans feature `asio` : le mode exclusif EXISTE
+    //
+    // Même famille que #2862 : ce que l'écran dit d'une capacité ne
+    // correspondait pas à ce que le binaire porte. La branche WASAPI exclusive
+    // vit sous `#[cfg(target_os = "windows")]` SEUL ; `supports_exclusive_mode`
+    // exigeait pourtant `feature = "asio"` pour l'admettre.
+    //
+    // Ces tests portent sur une fonction PURE dont la plateforme est un
+    // paramètre : ils contredisent réellement la décision Windows depuis Linux,
+    // au lieu d'être verts parce que la branche n'y est pas compilée (#1837,
+    // #2056).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn windows_sans_asio_garde_son_mode_exclusif_wasapi() {
+        let sans_asio = exclusive_mode_support("windows", false);
+        assert!(
+            sans_asio.wasapi,
+            "`WasapiExclusiveOutput` est gardé par `#[cfg(target_os = \
+             \"windows\")]` seul et se prend dès que `exclusive_mode && \
+             audio_backend != \"asio\"` : la feature `asio` ne le conditionne \
+             pas (#2868)"
+        );
+        assert!(
+            !sans_asio.asio,
+            "sans la feature, `AsioExclusiveOutput` n'est pas dans le binaire"
+        );
+        assert!(
+            sans_asio.any(),
+            "c'est le cœur de #2868 : un Windows bâti sans `asio` se voyait \
+             répondre « mode exclusif non supporté » alors que le chemin WASAPI \
+             exclusif était compilé et fonctionnel"
+        );
+
+        // Avec la feature, les DEUX chemins coexistent : ASIO ne remplace pas
+        // WASAPI exclusif, il s'y ajoute (le choix se fait sur `audio_backend`).
+        let avec_asio = exclusive_mode_support("windows", true);
+        assert!(avec_asio.asio && avec_asio.wasapi);
+        assert!(avec_asio.any());
+    }
+
+    /// Témoin anti-régression : les deux plateformes qui répondaient JUSTE
+    /// avant #2868 doivent répondre exactement pareil après.
+    #[test]
+    fn macos_et_linux_ne_bougent_pas_d_un_iota() {
+        for asio in [false, true] {
+            assert!(
+                exclusive_mode_support("macos", asio).coreaudio,
+                "macOS ouvre le hog mode CoreAudio sous `#[cfg(target_os = \
+                 \"macos\")]`, sans condition de feature"
+            );
+            assert!(exclusive_mode_support("macos", asio).any());
+
+            assert!(
+                !exclusive_mode_support("linux", asio).any(),
+                "aucune branche exclusive n'est compilée pour Linux : \
+                 l'annoncer serait la promesse fantôme que #2868 corrige, à \
+                 l'envers. `asio = {asio}` n'y change rien — la garde de la \
+                 branche ASIO exige `target_os = \"windows\"` EN PLUS de la \
+                 feature"
+            );
+        }
+
+        // Une cible dont personne n'a écrit la branche ne se voit pas prêter
+        // un chemin exclusif.
+        assert!(!exclusive_mode_support("freebsd", true).any());
+        assert!(!exclusive_mode_support("", true).any());
+    }
+
+    /// `std::env::consts::OS` est le seul vocabulaire que comprend
+    /// `exclusive_mode_support`. S'il rendait « Windows » ou « win32 », le
+    /// correctif retomberait silencieusement dans le bras « inconnu » et
+    /// n'aurait plus aucun effet — exactement le piège de casse relevé sur
+    /// `HostId::name()` en #2862. Ce test l'attrape sur la machine qui compile.
+    #[test]
+    fn le_nom_de_systeme_lu_est_celui_que_la_table_indexe() {
+        let os = std::env::consts::OS;
+        assert!(
+            ["linux", "macos", "windows"].contains(&os),
+            "`std::env::consts::OS` rend « {os} », absent de la table de \
+             exclusive_mode_support. Tant qu'il n'y figure pas, cette cible est \
+             classée « sans mode exclusif » — prudent, mais faux si elle porte \
+             une branche"
+        );
+        assert_eq!(
+            LocalOutput::supports_exclusive_mode(),
+            exclusive_mode_support(os, cfg!(feature = "asio")).any(),
+            "le prédicat public doit dire ce que dit la fonction pure, sinon \
+             la preuve ci-dessus ne parle pas du code appelé"
+        );
+    }
+
+    /// La règle ne doit pas se recomposer en `cfg!` dans le corps du prédicat :
+    /// elle redeviendrait invisible depuis Linux, et #2868 pourrait revenir
+    /// sans qu'aucun test ne rougisse.
+    ///
+    /// Les aiguilles sont assemblées à l'exécution — écrites en clair, elles
+    /// figureraient dans ce fichier et le test serait vert grâce à sa propre
+    /// source.
+    #[test]
+    fn le_predicat_de_mode_exclusif_ne_se_recompose_pas_en_cfg() {
+        let source = include_str!("local.rs");
+
+        let entete = ["pub fn supports_exclusive_mode()", " -> bool {"].concat();
+        let apres = source
+            .split_once(entete.as_str())
+            .expect("le prédicat public de mode exclusif a disparu")
+            .1;
+        // Découpe en CARACTÈRES : ce fichier est accentué, une coupe à l'octet
+        // près tomberait au milieu d'un caractère et paniquerait.
+        let corps: String = apres.chars().take(200).collect();
+
+        let appel = ["exclusive_mode_support(", "std::env::consts::OS"].concat();
+        assert!(
+            corps.contains(&appel),
+            "le prédicat doit déléguer à la fonction pure en lui PASSANT le \
+             système ; reçu : {corps}"
+        );
+        let cfg_os = ["cfg!(target_os", " = "].concat();
+        assert!(
+            !corps.contains(&cfg_os),
+            "un `cfg!(target_os …)` ici enferme à nouveau la décision Windows \
+             dans une branche non compilée ailleurs : c'est exactement ce qui a \
+             laissé passer #2868. Reçu : {corps}"
+        );
+    }
+
+    /// Les noms que `cpal::Host::id().name()` rend sur Windows. Ce sont les
+    /// mêmes chaînes que l'énumération stocke dans `AudioDevice::backend` et
+    /// que la résolution apparie — un seul et même vocabulaire.
+    const HOTE_WASAPI: &str = "Wasapi";
+    const HOTE_ASIO: &str = "Asio";
 
     /// Deux DAC USB qui s'annoncent tous deux « Haut-Parleurs », plus une
     /// sortie HDMI. C'est la configuration d'Alain (#1084) et celle de Marco
@@ -7645,14 +11190,17 @@ mod tests {
             DeviceIdentity {
                 endpoint_id: "{ugreen}".into(),
                 raw_name: "Haut-Parleurs".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{topping}".into(),
                 raw_name: "Haut-Parleurs".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{hdmi}".into(),
                 raw_name: "Téléviseur".into(),
+                host: HOTE_WASAPI.into(),
             },
         ]
     }
@@ -7668,13 +11216,13 @@ mod tests {
         // 1. Les homonymes ne se confondent pas. Le suffixe « (2) » que la
         //    découverte a posé désigne le SECOND, jamais le premier.
         assert_eq!(
-            resolve_device("Haut-Parleurs", None, &enumeres),
-            Some(DeviceMatch::ByDisplayName(0)),
+            resolve_device("Haut-Parleurs", None, None, HOTE_WASAPI, &enumeres),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(0)),
             "« Haut-Parleurs » doit désigner le premier homonyme"
         );
         assert_eq!(
-            resolve_device("Haut-Parleurs (2)", None, &enumeres),
-            Some(DeviceMatch::ByDisplayName(1)),
+            resolve_device("Haut-Parleurs (2)", None, None, HOTE_WASAPI, &enumeres),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(1)),
             "« Haut-Parleurs (2) » doit désigner le SECOND homonyme, \
              pas retomber sur le premier par sous-chaîne"
         );
@@ -7687,8 +11235,14 @@ mod tests {
             enumeres[2].clone(),
         ];
         assert_eq!(
-            resolve_device("Haut-Parleurs (2)", Some("{topping}"), &apres_redemarrage),
-            Some(DeviceMatch::ByEndpointId(0)),
+            resolve_device(
+                "Haut-Parleurs (2)",
+                Some("{topping}"),
+                None,
+                HOTE_WASAPI,
+                &apres_redemarrage
+            ),
+            DeviceResolution::Matched(DeviceMatch::ByEndpointId(0)),
             "après réordonnancement, l'identifiant stable doit primer sur le rang"
         );
 
@@ -7699,15 +11253,23 @@ mod tests {
             DeviceIdentity {
                 endpoint_id: "{ugreen}".into(),
                 raw_name: "Haut-Parleurs".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{topping}".into(),
                 raw_name: "Topping D10s (96 kHz)".into(),
+                host: HOTE_WASAPI.into(),
             },
         ];
         assert_eq!(
-            resolve_device("Haut-Parleurs (2)", Some("{topping}"), &apres_rebranchement),
-            Some(DeviceMatch::ByEndpointId(1)),
+            resolve_device(
+                "Haut-Parleurs (2)",
+                Some("{topping}"),
+                None,
+                HOTE_WASAPI,
+                &apres_rebranchement
+            ),
+            DeviceResolution::Matched(DeviceMatch::ByEndpointId(1)),
             "un renommage ne doit pas casser une zone qui connaît son endpoint"
         );
 
@@ -7716,8 +11278,14 @@ mod tests {
         //    donc un repli SIGNALÉ — au premier « Haut-Parleurs » venu choisi
         //    en silence.
         assert_eq!(
-            resolve_device("Haut-Parleurs (2)", None, &apres_rebranchement),
-            None,
+            resolve_device(
+                "Haut-Parleurs (2)",
+                None,
+                None,
+                HOTE_WASAPI,
+                &apres_rebranchement
+            ),
+            DeviceResolution::NotFound,
             "sans identifiant, un « (2) » orphelin ne doit PAS glisser sur le (1)"
         );
 
@@ -7727,20 +11295,28 @@ mod tests {
             DeviceIdentity {
                 endpoint_id: "{builtin}".into(),
                 raw_name: "MacBook Pro Speakers".into(),
+                host: "CoreAudio".into(),
             },
             DeviceIdentity {
                 endpoint_id: "{hdmi}".into(),
                 raw_name: "Téléviseur".into(),
+                host: "CoreAudio".into(),
             },
         ];
         assert_eq!(
-            resolve_device("MacBook Pro Speakers (2)", None, &coreaudio),
-            None,
+            resolve_device(
+                "MacBook Pro Speakers (2)",
+                None,
+                None,
+                "CoreAudio",
+                &coreaudio
+            ),
+            DeviceResolution::NotFound,
             "un suffixe posé par Tune ne se rattrape pas par sous-chaîne"
         );
         assert_eq!(
-            resolve_device("MacBook Pro", None, &coreaudio),
-            Some(DeviceMatch::BySubstring(0)),
+            resolve_device("MacBook Pro", None, None, "CoreAudio", &coreaudio),
+            DeviceResolution::Matched(DeviceMatch::BySubstring(0)),
             "un nom tronqué sans ambiguïté reste résolu"
         );
     }
@@ -7753,13 +11329,18 @@ mod tests {
             DeviceIdentity {
                 endpoint_id: "{a}".into(),
                 raw_name: "Realtek Digital Output".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{b}".into(),
                 raw_name: "Realtek Digital Output (Optical)".into(),
+                host: HOTE_WASAPI.into(),
             },
         ];
-        assert_eq!(resolve_device("Realtek", None, &ambigus), None);
+        assert_eq!(
+            resolve_device("Realtek", None, None, HOTE_WASAPI, &ambigus),
+            DeviceResolution::NotFound
+        );
     }
 
     /// L'appariement par nom doit employer la convention `(n)` **exacte** de
@@ -7772,25 +11353,352 @@ mod tests {
             DeviceIdentity {
                 endpoint_id: "{a1}".into(),
                 raw_name: "A".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{a2}".into(),
                 raw_name: "A (2)".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{a3}".into(),
                 raw_name: "A".into(),
+                host: HOTE_WASAPI.into(),
             },
         ];
         assert_eq!(
-            resolve_device("A (2)", None, &colision),
-            Some(DeviceMatch::ByDisplayName(1)),
+            resolve_device("A (2)", None, None, HOTE_WASAPI, &colision),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(1)),
             "« A (2) » est le nom BRUT du deuxième, il lui appartient"
         );
         assert_eq!(
-            resolve_device("A (3)", None, &colision),
-            Some(DeviceMatch::ByDisplayName(2)),
+            resolve_device("A (3)", None, None, HOTE_WASAPI, &colision),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(2)),
             "le troisième reçoit « A (3) », comme à la découverte"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3230 — un nom porte l'hôte dont il vient
+    //
+    // Jean Valjean (forum 893, v0.8.235) : sa zone « Haut-parleurs » est un nom
+    // WASAPI. `select_host("asio")` élit l'hôte ASIO dès qu'il expose une
+    // sortie, la résolution cherche ce nom parmi les seules sorties ASIO, ne le
+    // trouve pas, et ouvrait **le périphérique ASIO par défaut**.
+    //
+    // La branche `select_host("asio")` ne se compile que sous Windows avec le
+    // SDK Steinberg. La DÉCISION, elle, est ici : une fonction pure qui reçoit
+    // l'hôte d'origine, l'hôte ouvert et les candidates. Elle s'éprouve donc
+    // sur n'importe quelle plateforme — Shrek compris.
+    // -----------------------------------------------------------------------
+
+    /// Ce que l'hôte ASIO expose chez Jean Valjean : sa carte, et rien qui
+    /// s'appelle « Haut-parleurs ».
+    fn sorties_asio_fixture() -> Vec<DeviceIdentity> {
+        vec![
+            DeviceIdentity {
+                // Un pilote ASIO n'expose aucun identifiant d'endpoint stable :
+                // `cpal::Device::id()` y échoue, d'où la chaîne vide.
+                endpoint_id: String::new(),
+                raw_name: "RME Fireface UCX".into(),
+                host: HOTE_ASIO.into(),
+            },
+            DeviceIdentity {
+                endpoint_id: String::new(),
+                raw_name: "ASIO4ALL v2".into(),
+                host: HOTE_ASIO.into(),
+            },
+        ]
+    }
+
+    /// ESSAI 1 — hôte ASIO élu, nom demandé venant de WASAPI : **refus**.
+    ///
+    /// Le fait à tenir n'est pas « ça ne trouve rien » : c'est que le verdict
+    /// est distinct de « introuvable ». `NotFound` fait retomber l'appelant sur
+    /// la sortie par défaut de l'hôte ouvert — le détournement même de #3230.
+    #[test]
+    fn un_nom_wasapi_ne_s_apparie_pas_a_une_sortie_asio() {
+        let asio = sorties_asio_fixture();
+
+        let verdict = resolve_device("Haut-parleurs", None, Some(HOTE_WASAPI), HOTE_ASIO, &asio);
+
+        assert_eq!(
+            verdict,
+            DeviceResolution::ForeignHost {
+                requested_host: HOTE_WASAPI.into(),
+                open_host: HOTE_ASIO.into(),
+            },
+            "un nom WASAPI présenté à un hôte ASIO doit être REFUSÉ, pas déclaré \
+             introuvable : « introuvable » autorise le repli sur le défaut ASIO, \
+             et c'est ce repli-là qui a détourné la zone de Jean Valjean (#3230)"
+        );
+        assert!(
+            !matches!(verdict, DeviceResolution::Matched(_)),
+            "aucun appariement ne doit survivre au changement d'hôte"
+        );
+
+        // Et la sous-chaîne ne doit pas non plus servir de porte dérobée : un
+        // nom d'hôte étranger est écarté AVANT les trois étapes d'appariement.
+        assert_eq!(
+            resolve_device("ASIO4ALL", None, Some(HOTE_WASAPI), HOTE_ASIO, &asio),
+            DeviceResolution::ForeignHost {
+                requested_host: HOTE_WASAPI.into(),
+                open_host: HOTE_ASIO.into(),
+            },
+            "même un nom qui RESSEMBLE à une sortie ASIO ne s'apparie pas s'il \
+             est présenté comme venant de WASAPI"
+        );
+
+        // Et le refus tient même quand l'hôte ouvert n'énumère RIEN : un pilote
+        // ASIO happé par une autre application entre l'élection de l'hôte et
+        // l'ouverture ne doit pas faire disparaître le refus. C'est pour cela
+        // que l'hôte ouvert est un paramètre, et non une déduction sur la liste.
+        assert_eq!(
+            resolve_device("Haut-parleurs", None, Some(HOTE_WASAPI), HOTE_ASIO, &[]),
+            DeviceResolution::ForeignHost {
+                requested_host: HOTE_WASAPI.into(),
+                open_host: HOTE_ASIO.into(),
+            },
+            "une énumération vide ne doit pas rendre le nom étranger appariable"
+        );
+    }
+
+    /// ESSAI 2 — hôte ASIO élu, nom demandé venant d'ASIO : ouverture normale.
+    #[test]
+    fn un_nom_asio_s_apparie_bien_a_sa_sortie_asio() {
+        let asio = sorties_asio_fixture();
+
+        assert_eq!(
+            resolve_device("RME Fireface UCX", None, Some(HOTE_ASIO), HOTE_ASIO, &asio),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(0)),
+            "un nom qui vient de l'hôte ouvert doit s'apparier comme avant"
+        );
+        assert_eq!(
+            resolve_device("ASIO4ALL v2", None, Some(HOTE_ASIO), HOTE_ASIO, &asio),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(1)),
+        );
+        // La casse du nom d'hôte ne doit pas décider du son qui sort.
+        assert_eq!(
+            resolve_device("RME Fireface UCX", None, Some("ASIO"), HOTE_ASIO, &asio),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(0)),
+            "l'appariement d'hôte est insensible à la casse"
+        );
+    }
+
+    /// ESSAI 3 — LE TÉMOIN. Une machine à un seul hôte se comporte **exactement**
+    /// comme avant : l'hôte d'origine y est toujours celui qui est ouvert.
+    ///
+    /// Le témoin compare terme à terme le verdict avec origine connue et le
+    /// verdict sans origine — c'est-à-dire le comportement d'avant le
+    /// correctif. Le moindre écart ici serait une régression pour l'immense
+    /// majorité des installations, qui n'ont jamais vu deux hôtes.
+    #[test]
+    fn temoin_un_seul_hote_ne_change_rien() {
+        let enumeres = homonymes_fixture();
+
+        for demande in [
+            "Haut-Parleurs",
+            "Haut-Parleurs (2)",
+            "Téléviseur",
+            "Haut-Parleurs (9)",
+            "inexistant",
+        ] {
+            let avant = resolve_device(demande, None, None, HOTE_WASAPI, &enumeres);
+            let apres = resolve_device(demande, None, Some(HOTE_WASAPI), HOTE_WASAPI, &enumeres);
+            assert_eq!(
+                avant, apres,
+                "« {demande} » : sur une machine à un seul hôte, connaître \
+                 l'hôte d'origine ne doit RIEN changer"
+            );
+        }
+
+        // Idem pour l'appariement par identifiant d'endpoint, qui passe devant
+        // le nom : le filtre d'hôte ne doit pas l'écarter.
+        assert_eq!(
+            resolve_device(
+                "nom devenu faux",
+                Some("{topping}"),
+                None,
+                HOTE_WASAPI,
+                &enumeres
+            ),
+            resolve_device(
+                "nom devenu faux",
+                Some("{topping}"),
+                Some(HOTE_WASAPI),
+                HOTE_WASAPI,
+                &enumeres
+            ),
+            "l'identifiant stable doit primer de la même façon avec ou sans hôte"
+        );
+
+        // Et une zone d'AVANT ce correctif — qui ne connaît pas son hôte
+        // d'origine — n'est jamais refusée : `None` veut dire « je ne sais
+        // pas », et on ne refuse pas sur une ignorance.
+        assert_eq!(
+            resolve_device(
+                "Haut-parleurs",
+                None,
+                None,
+                HOTE_ASIO,
+                &sorties_asio_fixture()
+            ),
+            DeviceResolution::NotFound,
+            "sans origine connue, on retombe sur le comportement d'avant : \
+             introuvable, donc repli SIGNALÉ — jamais un refus"
+        );
+    }
+
+    /// ESSAI 4 — le repli est observable par le client.
+    ///
+    /// Le canal est celui de #2207 : `LocalBackendStatus.device`, déjà servi
+    /// par `/system/config`. Ce correctif n'en ouvre pas un deuxième — il y
+    /// ajoute le motif, avec le même vocabulaire que `fallback_reason` du
+    /// backend : un `code()` stable et un `detail()` en clair.
+    #[test]
+    fn le_repli_de_peripherique_remonte_au_client() {
+        // a) Refus d'hôte étranger : RIEN n'a été ouvert. `opened` est vide —
+        //    nommer un périphérique ici serait mentir — et le motif le dit.
+        let refus = LocalDeviceStatus::from_observed(ObservedDevice {
+            backend: "ASIO",
+            requested: "Haut-parleurs".into(),
+            opened: String::new(),
+            opened_id: None,
+            reason: Some(LocalDeviceFallback::ForeignHost),
+        });
+        assert!(refus.differs, "un refus est un écart, et doit se voir");
+        assert_eq!(refus.reason, Some(LocalDeviceFallback::ForeignHost));
+        assert_eq!(
+            refus.detail,
+            Some(LocalDeviceFallback::ForeignHost.detail())
+        );
+        assert!(
+            refus.opened.is_empty(),
+            "un refus n'ouvre rien : aucun nom de périphérique ne doit être avancé"
+        );
+
+        // La charge utile porte bien le code stable, pas le nom de la variante.
+        let json = serde_json::to_value(&refus).expect("sérialisable");
+        assert_eq!(json["reason"], "foreign_host");
+        assert_eq!(json["differs"], true);
+
+        // b) Le cas historique #2207 : le nom est introuvable sur le BON hôte,
+        //    on ouvre la sortie système — et on le dit désormais avec un motif.
+        let repli = LocalDeviceStatus::from_observed(ObservedDevice {
+            backend: "WASAPI",
+            requested: "Topping D10s".into(),
+            opened: "Haut-parleurs".into(),
+            opened_id: Some("{speakers}".into()),
+            reason: Some(LocalDeviceFallback::NotFoundFellBackToDefault),
+        });
+        assert!(repli.differs);
+        assert_eq!(
+            repli.reason,
+            Some(LocalDeviceFallback::NotFoundFellBackToDefault)
+        );
+        assert_eq!(
+            serde_json::to_value(&repli).expect("sérialisable")["reason"],
+            "not_found_fell_back_to_default"
+        );
+
+        // c) Le cas nominal reste muet : aucun motif, aucun écart. Un écran qui
+        //    ne lit que `differs` voit exactement ce qu'il voyait avant.
+        let nominal = LocalDeviceStatus::from_observed(ObservedDevice {
+            backend: "ALSA",
+            requested: "Topping D10s".into(),
+            opened: "Topping D10s".into(),
+            opened_id: Some("hw:CARD=D10s".into()),
+            reason: None,
+        });
+        assert!(!nominal.differs);
+        assert_eq!(nominal.reason, None);
+        assert_eq!(nominal.detail, None);
+        let json = serde_json::to_value(&nominal).expect("sérialisable");
+        assert!(
+            json.get("reason").is_none() && json.get("detail").is_none(),
+            "sans motif, les deux champs sont ABSENTS de la charge utile : un \
+             client d'avant voit le même objet qu'avant"
+        );
+    }
+
+    /// Chaque motif de repli de périphérique est câblé : un code stable, non
+    /// vide, unique, et un libellé en clair. Même contre-épreuve permanente que
+    /// pour `LocalBackendFallback` — un motif ajouté sans être décrit tombe.
+    #[test]
+    fn chaque_motif_de_repli_de_peripherique_est_cable() {
+        let mut codes = std::collections::HashSet::new();
+        for motif in LocalDeviceFallback::ALL {
+            assert!(!motif.code().is_empty(), "{motif:?} sans code");
+            assert!(!motif.detail().is_empty(), "{motif:?} sans libellé");
+            assert!(
+                codes.insert(motif.code()),
+                "code dupliqué : {} — un client ne pourrait plus distinguer \
+                 les deux motifs",
+                motif.code()
+            );
+            // Le code voyage en JSON : il doit être celui-là, pas le nom Rust.
+            assert_eq!(
+                serde_json::to_value(motif).expect("sérialisable"),
+                serde_json::Value::String(motif.code().to_string()),
+            );
+        }
+    }
+
+    /// GARDE DE SITE — la production doit vraiment PASSER l'hôte d'origine.
+    ///
+    /// La branche ASIO de `select_host` ne se compile pas sur Shrek, donc aucun
+    /// test d'intégration ne peut constater le refus de bout en bout ici. Ce
+    /// que ce test tient, c'est le câblage : `find_device_with_fallback` doit
+    /// transmettre `origin_host` à `resolve_device`, et refuser sans repli sur
+    /// `ForeignHost`. Rebrancher le nom étranger dans la production — passer
+    /// `None`, ou traiter `ForeignHost` comme `NotFound` — fait tomber ce test
+    /// même là où la scène complète n'est pas jouable.
+    ///
+    /// Idiome du dépôt : relire la production par `include_str!`, comme
+    /// `terminologie_eq.rs` et `position_publiee_guard`.
+    #[test]
+    fn find_device_with_fallback_passe_bien_l_hote_d_origine() {
+        let source = include_str!("local.rs");
+        let debut = source
+            .find("fn find_device_with_fallback(")
+            .expect("find_device_with_fallback introuvable");
+        let corps = &source[debut..debut + 4000];
+
+        assert!(
+            corps.contains("origin_host: Option<&str>"),
+            "find_device_with_fallback doit RECEVOIR l'hôte d'origine : sans lui, \
+             un nom ne porte rien et #3230 revient"
+        );
+        let appel = corps
+            .find("resolve_device(")
+            .map(|i| &corps[i..i + 200])
+            .expect("l'appel à resolve_device doit rester dans cette fonction");
+        assert!(
+            appel.contains("origin_host"),
+            "l'appel à resolve_device doit LUI PASSER origin_host ; reçu : {appel}"
+        );
+        assert!(
+            appel.contains("open_host"),
+            "l'appel à resolve_device doit aussi LUI PASSER l'hôte ouvert : le \
+             déduire de la liste énumérée ferait disparaître le refus quand \
+             cette liste est vide ; reçu : {appel}"
+        );
+        assert!(
+            corps.contains("DeviceResolution::ForeignHost"),
+            "le refus d'hôte étranger doit être traité ici, pas confondu avec \
+             « introuvable » — c'est ce dernier qui déclenche le repli sur le \
+             périphérique par défaut de l'hôte ouvert"
+        );
+        // Le refus doit COUPER : pas de repli derrière lui.
+        let refus = corps
+            .find("DeviceResolution::ForeignHost")
+            .map(|i| &corps[i..])
+            .expect("bloc de refus");
+        let fin_refus = refus.find("return None;").unwrap_or(usize::MAX);
+        let repli = refus.find("default_output_device").unwrap_or(usize::MAX);
+        assert!(
+            fin_refus < repli,
+            "le refus doit rendre None AVANT tout repli sur la sortie par défaut"
         );
     }
 
@@ -7957,7 +11865,17 @@ mod tests {
             let crossfeed = std::sync::Mutex::new(None);
             let pure = AtomicBool::new(false);
             let prepared = prepare_windows_native_pcm(
-                &source, bit_depth, 2, true, false, 1000, &eq, &convolver, &crossfeed, &pure,
+                &source,
+                bit_depth,
+                2,
+                true,
+                false,
+                1000,
+                &eq,
+                &convolver,
+                &crossfeed,
+                &pure,
+                &AtomicBool::new(false),
             )
             .expect("fenêtre PCM complète");
             assert!(prepared.bit_perfect);
@@ -7979,7 +11897,17 @@ mod tests {
         ));
         let pure = AtomicBool::new(false);
         let prepared = prepare_windows_native_pcm(
-            &source, 24, 2, true, false, 250, &eq, &convolver, &crossfeed, &pure,
+            &source,
+            24,
+            2,
+            true,
+            false,
+            250,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
         )
         .expect("DoP complet");
         assert!(prepared.dop);
@@ -8001,7 +11929,17 @@ mod tests {
         let crossfeed = std::sync::Mutex::new(None);
         let pure = AtomicBool::new(false);
         let prepared = prepare_windows_native_pcm(
-            &source, 24, 2, true, false, 500, &eq, &convolver, &crossfeed, &pure,
+            &source,
+            24,
+            2,
+            true,
+            false,
+            500,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
         )
         .expect("PCM complet");
         assert!(!prepared.dop);
@@ -8028,6 +11966,7 @@ mod tests {
             &convolver,
             &crossfeed,
             &pure,
+            &AtomicBool::new(false),
         );
         assert!(matches!(pending, Ok(None)));
         assert_eq!(ring.available(), 0);
@@ -8035,7 +11974,15 @@ mod tests {
         // Once the byte window is conclusive, rejection happens at the last
         // preparation boundary — still before conversion, DSP and ring feed.
         let rejected = prepare_windows_exclusive_pcm(
-            &fixture, 24, 2, true, &eq, &convolver, &crossfeed, &pure,
+            &fixture,
+            24,
+            2,
+            true,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
         );
         assert!(matches!(
             rejected,
@@ -8087,10 +12034,19 @@ mod tests {
         let crossfeed = std::sync::Mutex::new(None);
         let pure = AtomicBool::new(false);
 
-        let prepared =
-            prepare_windows_exclusive_pcm(&pcm, 24, 2, true, &eq, &convolver, &crossfeed, &pure)
-                .expect("PCM ordinaire accepté")
-                .expect("fenêtre de détection complète");
+        let prepared = prepare_windows_exclusive_pcm(
+            &pcm,
+            24,
+            2,
+            true,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+        )
+        .expect("PCM ordinaire accepté")
+        .expect("fenêtre de détection complète");
 
         let ring = RingBuf::new(prepared.len());
         assert_eq!(ring.push(&prepared), prepared.len());
@@ -8186,6 +12142,7 @@ mod tests {
         let baseline_convolver = std::sync::Mutex::new(None);
         let baseline_crossfeed = std::sync::Mutex::new(None);
         let baseline_pure = AtomicBool::new(false);
+        let baseline_mono = AtomicBool::new(false);
         let baseline_dop = AtomicBool::new(false);
         let baseline_volume = AtomicU32::new(500);
         let baseline_user = AtomicU32::new(500);
@@ -8195,6 +12152,7 @@ mod tests {
             convolver: &baseline_convolver,
             crossfeed: &baseline_crossfeed,
             pure_bypass: &baseline_pure,
+            mono_downmix: &baseline_mono,
             dop_active: &baseline_dop,
             volume: &baseline_volume,
             user_volume: &baseline_user,
@@ -8211,6 +12169,7 @@ mod tests {
         let split_convolver = std::sync::Mutex::new(None);
         let split_crossfeed = std::sync::Mutex::new(None);
         let split_pure = AtomicBool::new(false);
+        let split_mono = AtomicBool::new(false);
         let split_dop = AtomicBool::new(false);
         let split_volume = AtomicU32::new(500);
         let split_user = AtomicU32::new(500);
@@ -8220,6 +12179,7 @@ mod tests {
             convolver: &split_convolver,
             crossfeed: &split_crossfeed,
             pure_bypass: &split_pure,
+            mono_downmix: &split_mono,
             dop_active: &split_dop,
             volume: &split_volume,
             user_volume: &split_user,
@@ -8252,6 +12212,7 @@ mod tests {
             crate::audio::crossfeed::CrossfeedProcessor::new(176400, 0.3, 0.3),
         ));
         let pure = AtomicBool::new(false);
+        let mono = AtomicBool::new(false);
         let dop_active = AtomicBool::new(false);
         let volume = AtomicU32::new(400);
         let user = AtomicU32::new(500);
@@ -8261,6 +12222,7 @@ mod tests {
             convolver: &convolver,
             crossfeed: &crossfeed,
             pure_bypass: &pure,
+            mono_downmix: &mono,
             dop_active: &dop_active,
             volume: &volume,
             user_volume: &user,
@@ -8318,7 +12280,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, true);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            true,
+        );
         assert_eq!(samples, before);
     }
 
@@ -8333,7 +12304,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(4096);
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         assert!(20.0 * (rms(&samples[1024..]) / before).log10() < -8.0);
     }
 
@@ -9015,6 +12995,233 @@ mod open_failure_tests {
     }
 }
 
+/// #3270 — « la piste ne joue pas, et rien ne le dit ».
+///
+/// Le refus d'OUVERTURE avait son canal, le blocage d'APRÈS l'ouverture aussi.
+/// Ce qui n'en avait aucun, c'est l'échec de DÉCODAGE : le flux compressé est
+/// chargé en entier, symphonia refuse, et le fil rendait la main sur un
+/// `warn!`, un drapeau à `false` et un `return` nu. Le périphérique n'ayant
+/// jamais été ouvert, aucune des heuristiques du sondeur ne rattrapait la
+/// zone — et cette branche n'est pas un vestige : Bandcamp, les podcasts,
+/// l'UPnP et les fichiers téléversés y passent sans transcodage WAV.
+#[cfg(test)]
+mod decode_failure_tests {
+    use super::{
+        CompressedDecodeFailure, decode_compressed_stream, record_compressed_decode_failure,
+    };
+
+    const TOUS: [CompressedDecodeFailure; 4] = [
+        CompressedDecodeFailure::ContainerUnrecognised,
+        CompressedDecodeFailure::NoAudioTrack,
+        CompressedDecodeFailure::CodecUnsupported,
+        CompressedDecodeFailure::NoSamplesDecoded,
+    ];
+
+    /// Le motif doit être NOMMÉ : quatre causes, quatre phrases distinctes.
+    /// Un message unique pour les quatre ne dirait rien de plus que le silence
+    /// qu'il remplace.
+    #[test]
+    fn chaque_cause_a_sa_phrase_et_son_evenement() {
+        let mut phrases = std::collections::BTreeSet::new();
+        let mut evenements = std::collections::BTreeSet::new();
+        for cause in TOUS {
+            let m = cause.user_message("DAC USB");
+            assert!(m.contains("DAC USB"), "sortie absente de {cause:?} : {m}");
+            assert!(
+                m.contains("décoder"),
+                "la cause doit être nommée dans {cause:?} : {m}"
+            );
+            phrases.insert(m);
+            evenements.insert(cause.log_event());
+        }
+        assert_eq!(phrases.len(), 4, "deux causes rendent la même phrase");
+        assert_eq!(evenements.len(), 4, "deux causes rendent le même événement");
+    }
+
+    /// Le canal est celui du sondeur : `take_output_failure()` le draine, une
+    /// seule fois. C'est la contre-épreuve du `return` nu.
+    #[test]
+    fn l_echec_de_decodage_passe_par_le_canal_que_le_sondeur_draine() {
+        use super::super::traits::OutputTarget;
+        let sortie = super::LocalOutput::new("DAC USB".into());
+        assert!(
+            sortie.take_output_failure().is_none(),
+            "TÉMOIN VERT : une sortie saine ne remonte rien"
+        );
+
+        record_compressed_decode_failure(
+            CompressedDecodeFailure::ContainerUnrecognised,
+            "DAC USB",
+            &sortie.open_failure,
+        );
+        let remonte = sortie
+            .take_output_failure()
+            .expect("l'échec de décodage doit remonter par le canal du sondeur");
+        assert!(remonte.contains("DAC USB"), "got: {remonte}");
+        assert!(
+            sortie.take_output_failure().is_none(),
+            "un échec ne doit jamais être remonté deux fois"
+        );
+    }
+
+    /// La production, pas une maquette : des octets qui ne sont ni FLAC ni MP3
+    /// ni AAC doivent rendre le motif « conteneur non reconnu », et non un
+    /// `None` muet.
+    #[test]
+    fn un_flux_illisible_rend_le_motif_conteneur_non_reconnu() {
+        let poubelle = vec![0x42u8; 8192];
+        assert_eq!(
+            decode_compressed_stream(&poubelle),
+            Err(CompressedDecodeFailure::ContainerUnrecognised)
+        );
+    }
+
+    /// TÉMOIN VERT : un flux vide ne doit pas, lui non plus, rendre `Ok`.
+    #[test]
+    fn un_flux_vide_ne_rend_jamais_un_succes() {
+        assert!(decode_compressed_stream(&[]).is_err());
+    }
+}
+
+/// #3108 — « la zone reste figée à 2 s, sans message ».
+///
+/// Le refus d'OUVERTURE avait déjà son canal (`record_exclusive_open_failure`).
+/// Ce qui n'en avait aucun, c'est la panne d'APRÈS l'ouverture : le
+/// périphérique accepte, puis son rappel de rendu se tait. L'anneau se remplit
+/// une fois — deux secondes d'audio, par construction — et plus rien ne bouge.
+///
+/// Les trois fonctions éprouvées ici sont celles de la production, compilées
+/// sur toutes les cibles. Aucune ne dort : le seuil de blocage est injecté.
+#[cfg(test)]
+mod feed_stall_tests {
+    use super::{
+        FEED_STALL_TIMEOUT, OpenFailure, RingBuf, drain_deadline_for,
+        feed_ring_abortable_with_stall_timeout, record_feed_stall_failure,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    /// La boucle de production, avec son seuil ramené à zéro : un anneau plein
+    /// que personne ne vide rend le verdict « consommateur mort » — tout de
+    /// suite, sans dormir cinq secondes.
+    #[test]
+    fn un_anneau_que_personne_ne_vide_rend_le_verdict_de_blocage() {
+        let ring = RingBuf::new(4);
+        ring.push(&[0.0; 4]); // plein, et personne ne tirera jamais
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        let debut = std::time::Instant::now();
+        assert!(
+            !feed_ring_abortable_with_stall_timeout(
+                &ring,
+                &[0.5f32; 8],
+                &rx,
+                &paused,
+                None,
+                std::time::Duration::ZERO,
+            ),
+            "un anneau plein et jamais vidé doit être déclaré bloqué"
+        );
+        assert!(
+            debut.elapsed() < std::time::Duration::from_secs(1),
+            "le seuil injecté doit rendre le verdict sans attendre"
+        );
+    }
+
+    /// TÉMOIN VERT : le même appel, sur un anneau qui a de la place, ne
+    /// déclare rien. Le détecteur ne doit pas devenir un couperet.
+    #[test]
+    fn un_anneau_qui_accepte_tout_ne_declare_aucun_blocage() {
+        let ring = RingBuf::new(16);
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        assert!(feed_ring_abortable_with_stall_timeout(
+            &ring,
+            &[0.5f32; 8],
+            &rx,
+            &paused,
+            None,
+            std::time::Duration::ZERO,
+        ));
+        assert_eq!(ring.available(), 8);
+    }
+
+    /// Le seuil réel n'est pas nul : un test qui l'injecterait à zéro partout
+    /// masquerait une production devenue instantanément couperet.
+    #[test]
+    fn le_seuil_de_production_laisse_le_temps_a_la_contre_pression() {
+        assert_eq!(FEED_STALL_TIMEOUT, std::time::Duration::from_secs(5));
+    }
+
+    /// Le message doit nommer la sortie, la position où l'écran s'est figé, et
+    /// le geste à faire. « Une erreur est survenue » ne répare rien.
+    #[test]
+    fn le_blocage_dit_la_sortie_la_position_et_le_geste() {
+        let slot = std::sync::Mutex::new(None);
+        record_feed_stall_failure("CoreAudio", "DAC USB", 2000, &slot);
+        let message = slot.lock().unwrap().clone().expect("le canal doit porter");
+        assert!(message.contains("DAC USB"), "sortie absente : {message}");
+        assert!(
+            message.contains("CoreAudio"),
+            "transport absent : {message}"
+        );
+        assert!(
+            message.contains("2000 ms"),
+            "la position figée est le chiffre qui relie l'écran au journal : {message}"
+        );
+        assert!(
+            message.contains(OpenFailure::DeviceGone.user_message()),
+            "le geste à faire est absent : {message}"
+        );
+    }
+
+    /// Le canal est celui du poller : `take_output_failure()` le draine, une
+    /// fois, et le tick suivant ne re-stoppe pas la zone.
+    #[test]
+    fn le_blocage_passe_par_le_canal_que_le_poller_draine() {
+        use super::super::traits::OutputTarget;
+        let sortie = super::LocalOutput::new("DAC USB".into());
+        assert!(
+            sortie.take_output_failure().is_none(),
+            "TÉMOIN VERT : une sortie saine ne remonte rien"
+        );
+
+        record_feed_stall_failure("CoreAudio", "DAC USB", 2000, &sortie.open_failure);
+        let remonte = sortie
+            .take_output_failure()
+            .expect("le blocage doit remonter par le canal du poller");
+        assert!(remonte.contains("2000 ms"), "got: {remonte}");
+        assert!(
+            sortie.take_output_failure().is_none(),
+            "un échec ne doit jamais être remonté deux fois"
+        );
+    }
+
+    /// Le vidage borné : durée de l'audio en attente + 5 s de marge.
+    #[test]
+    fn le_delai_de_vidage_couvre_l_audio_en_attente_plus_la_marge() {
+        // Deux secondes de stéréo à 44,1 kHz = 176 400 échantillons entrelacés.
+        assert_eq!(
+            drain_deadline_for(44_100 * 2 * 2, 44_100, 2),
+            std::time::Duration::from_millis(7000)
+        );
+        // Anneau vide : la marge seule.
+        assert_eq!(
+            drain_deadline_for(0, 44_100, 2),
+            std::time::Duration::from_millis(5000)
+        );
+    }
+
+    /// Une cadence ou un nombre de canaux nuls ne doivent pas diviser par zéro
+    /// — ce serait tuer le fil de lecture au lieu de borner son vidage.
+    #[test]
+    fn une_cadence_nulle_ne_divise_pas_par_zero() {
+        assert_eq!(
+            drain_deadline_for(0, 0, 0),
+            std::time::Duration::from_millis(5000)
+        );
+    }
+}
+
 #[cfg(test)]
 mod backend_display_tests {
     use super::backend_display_name;
@@ -9044,6 +13251,579 @@ mod backend_display_tests {
             matches!(name, "ASIO" | "WASAPI" | "CoreAudio" | "ALSA" | "default"),
             "nom inattendu: {name}"
         );
+    }
+}
+
+/// #1395 — le motif du repli, pas seulement son résultat.
+///
+/// Toutes les fonctions éprouvées ici sont **pures** et compilées sur toutes les
+/// cibles : la branche ASIO de `select_host` vit sous
+/// `#[cfg(all(target_os = "windows", feature = "asio"))]` et n'est exécutable ni
+/// sur macOS, ni sur Linux, ni en CI. Sortir la décision de cpal est ce qui rend
+/// la FAMILLE entière testable ailleurs que sur la machine du testeur.
+#[cfg(test)]
+mod backend_fallback_tests {
+    use super::{
+        LocalBackendFallback, ObservedBackend, ObservedDevice, asio_available, asio_outcome,
+        backend_status, platform_default_backend_name, unsupported_outcome,
+    };
+
+    fn observed(
+        name: &'static str,
+        reason: Option<LocalBackendFallback>,
+    ) -> Option<ObservedBackend> {
+        Some(ObservedBackend {
+            name,
+            fallback_reason: reason,
+        })
+    }
+
+    /// Une ouverture de périphérique observée : ce qui était demandé, ce qui a
+    /// été ouvert. `opened_id` optionnel — ASIO et CoreAudio n'en ont pas.
+    fn ouvert(
+        backend: &'static str,
+        requested: &str,
+        opened: &str,
+        opened_id: Option<&str>,
+    ) -> Option<ObservedDevice> {
+        Some(ObservedDevice {
+            backend,
+            requested: requested.to_string(),
+            opened: opened.to_string(),
+            opened_id: opened_id.map(str::to_string),
+            // Une ouverture qui a abouti sur le nom demandé n'a aucun motif :
+            // les motifs sont éprouvés à part, dans les tests de #3230.
+            reason: None,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // La famille, membre par membre — jamais un seul représentant.
+    // ------------------------------------------------------------------
+
+    /// Contre-épreuve PERMANENTE (leçon #1864) : chaque motif déclaré doit être
+    /// réellement PRODUIT par l'une des deux fonctions de décision. Un motif
+    /// ajouté à l'énumération sans être câblé dans `select_host` fait tomber ce
+    /// test — c'est exactement le défaut où 15 prédicats sur 17 n'étaient
+    /// jamais construits pendant leur propre test.
+    #[test]
+    fn chaque_motif_declare_est_reellement_produit() {
+        let mut produits: Vec<LocalBackendFallback> = Vec::new();
+        // Toutes les issues possibles du sondage ASIO.
+        for probe in [None, Some(0usize), Some(1usize), Some(7usize)] {
+            if let (_, Some(reason)) = asio_outcome(probe) {
+                produits.push(reason);
+            }
+        }
+        // Toutes les demandes possibles sur une cible sans ASIO.
+        for requested in ["asio", "auto", "wasapi", "", "n'importe quoi"] {
+            if let (_, Some(reason)) = unsupported_outcome(requested) {
+                produits.push(reason);
+            }
+        }
+
+        for motif in LocalBackendFallback::ALL {
+            assert!(
+                produits.contains(&motif),
+                "le motif {motif:?} est déclaré mais AUCUN chemin de décision ne le construit — \
+                 il ne gardera jamais rien"
+            );
+        }
+    }
+
+    /// Les trois motifs doivent rester distincts, non vides, en `snake_case`,
+    /// et nommer ASIO : ce sont eux que le client reçoit et traduit.
+    #[test]
+    fn tous_les_motifs_ont_un_code_et_un_texte_utilisables() {
+        let mut codes: Vec<&str> = Vec::new();
+        for motif in LocalBackendFallback::ALL {
+            let code = motif.code();
+            assert!(!code.is_empty(), "{motif:?} : code vide");
+            assert!(
+                code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{motif:?} : code non snake_case ({code})"
+            );
+            assert!(
+                code.starts_with("asio_"),
+                "{motif:?} : le code doit nommer le backend demandé ({code})"
+            );
+            assert!(!codes.contains(&code), "code dupliqué : {code}");
+            codes.push(code);
+
+            let detail = motif.detail();
+            assert!(!detail.is_empty(), "{motif:?} : détail vide");
+            assert!(
+                detail.contains("ASIO"),
+                "{motif:?} : le détail ne dit pas ce qui a été demandé ({detail})"
+            );
+        }
+        assert_eq!(codes.len(), LocalBackendFallback::ALL.len());
+    }
+
+    /// Le contrat JSON, pour la famille entière : `serde` doit rendre
+    /// exactement `code()`. Un renommage de variante casserait le client sans
+    /// ce test.
+    #[test]
+    fn la_serialisation_json_suit_le_code_pour_chaque_motif() {
+        for motif in LocalBackendFallback::ALL {
+            let json = serde_json::to_string(&motif).expect("sérialisation");
+            assert_eq!(
+                json,
+                format!("\"{}\"", motif.code()),
+                "{motif:?} : la charge utile ne porte pas son code stable"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Les décisions, cas par cas.
+    // ------------------------------------------------------------------
+
+    /// LE cas Bilou (réponse forum 5217, 10/08, v0.9.65) : hôte ASIO ouvert,
+    /// zéro sortie exposée, repli WASAPI. Le journal le disait déjà
+    /// (`local_audio_asio_no_devices`) ; l'API se taisait.
+    #[test]
+    fn asio_ouvert_sans_peripherique_replie_en_nommant_la_cause() {
+        assert_eq!(
+            asio_outcome(Some(0)),
+            ("WASAPI", Some(LocalBackendFallback::AsioNoDevices))
+        );
+    }
+
+    /// L'autre membre : l'hôte ne s'ouvre pas du tout. Motif DIFFÉRENT — c'est
+    /// tout l'intérêt, Bertrand avait dû demander deux fois à Bilou laquelle
+    /// des deux lignes il voyait.
+    #[test]
+    fn hote_asio_inouvrable_donne_un_motif_distinct() {
+        assert_eq!(
+            asio_outcome(None),
+            ("WASAPI", Some(LocalBackendFallback::AsioHostUnavailable))
+        );
+        assert_ne!(
+            LocalBackendFallback::AsioHostUnavailable.code(),
+            LocalBackendFallback::AsioNoDevices.code()
+        );
+    }
+
+    /// Et le cas qui marche : aucun repli, aucun motif. On n'annonce pas une
+    /// panne quand il n'y en a pas.
+    #[test]
+    fn asio_qui_joue_ne_declare_aucun_repli() {
+        assert_eq!(asio_outcome(Some(1)), ("ASIO", None));
+        assert_eq!(asio_outcome(Some(9)), ("ASIO", None));
+    }
+
+    /// Le membre qui n'enregistrait RIEN avant ce correctif : un binaire sans
+    /// ASIO. Il ne pouvait pas honorer la demande, et ne le disait nulle part.
+    #[test]
+    fn binaire_sans_asio_nomme_la_cause() {
+        assert_eq!(
+            unsupported_outcome("asio"),
+            (
+                platform_default_backend_name(),
+                Some(LocalBackendFallback::AsioUnsupportedBuild)
+            )
+        );
+    }
+
+    /// Contre-épreuve : sur la même cible, une demande qui n'est PAS ASIO ne
+    /// doit produire aucun motif. Plusieurs membres mutés, pas un seul.
+    #[test]
+    fn binaire_sans_asio_ne_crie_pas_sur_les_autres_demandes() {
+        for requested in ["auto", "wasapi", "", "valeur inconnue"] {
+            assert_eq!(
+                unsupported_outcome(requested),
+                (platform_default_backend_name(), None),
+                "demande « {requested} » : motif inventé"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // L'arbitrage complet.
+    // ------------------------------------------------------------------
+
+    /// Le statut rendu à l'API dit les trois choses : ce qui tourne, ce qui
+    /// était demandé, et pourquoi ça diffère.
+    #[test]
+    fn le_statut_porte_lactif_le_demande_et_la_cause() {
+        let s = backend_status(
+            observed("WASAPI", Some(LocalBackendFallback::AsioNoDevices)),
+            None,
+            "ASIO",
+        );
+        assert_eq!(s.active, "WASAPI");
+        assert_eq!(s.requested, "asio");
+        assert!(s.fell_back);
+        assert_eq!(s.fallback_reason, Some(LocalBackendFallback::AsioNoDevices));
+        assert_eq!(
+            s.fallback_detail,
+            Some(LocalBackendFallback::AsioNoDevices.detail())
+        );
+    }
+
+    /// Contre-épreuve : ASIO qui joue vraiment ne doit produire ni repli ni
+    /// motif. Le garde-fou doit savoir se taire.
+    #[test]
+    fn asio_honore_ne_declare_ni_repli_ni_motif() {
+        let s = backend_status(observed("ASIO", None), None, "asio");
+        assert_eq!(s.active, "ASIO");
+        assert!(!s.fell_back, "repli annoncé alors qu'ASIO joue");
+        assert_eq!(s.fallback_reason, None);
+        assert_eq!(s.fallback_detail, None);
+    }
+
+    /// Contre-épreuve, sur plusieurs membres : les demandes honorées par le
+    /// backend natif de la plateforme ne déclarent rien non plus.
+    #[test]
+    fn les_demandes_honorees_ne_declarent_rien() {
+        let natif = platform_default_backend_name();
+        let natif_minuscules = natif.to_lowercase();
+        for requested in ["auto", "", natif, natif_minuscules.as_str()] {
+            let s = backend_status(observed(natif, None), None, requested);
+            assert!(
+                !s.fell_back,
+                "demande « {requested} » sur {natif} : repli annoncé à tort"
+            );
+            assert_eq!(s.fallback_reason, None);
+        }
+    }
+
+    /// Sans aucune observation, un seul motif est affirmable — celui qui se
+    /// décide à la COMPILATION. Sur une cible sans ASIO il doit sortir ; sur
+    /// une cible avec ASIO il ne doit surtout pas être inventé.
+    #[test]
+    fn sans_observation_seul_le_motif_de_compilation_est_affirme() {
+        let s = backend_status(None, None, "asio");
+        if asio_available() {
+            assert_eq!(
+                s.fallback_reason, None,
+                "motif inventé sur une cible qui embarque ASIO"
+            );
+        } else {
+            assert_eq!(
+                s.fallback_reason,
+                Some(LocalBackendFallback::AsioUnsupportedBuild)
+            );
+            assert!(s.fell_back);
+        }
+    }
+
+    /// Une observation contredit toujours la déduction de compilation : si un
+    /// jour ASIO s'ouvre, plus aucun motif ne doit traîner.
+    #[test]
+    fn lobservation_prime_sur_la_deduction() {
+        let s = backend_status(observed("ASIO", None), None, "asio");
+        assert_eq!(s.fallback_reason, None);
+        assert_eq!(s.active, "ASIO");
+    }
+
+    // ------------------------------------------------------------------
+    // Le PÉRIPHÉRIQUE — l'autre moitié de la vérité (#2207).
+    // ------------------------------------------------------------------
+
+    /// **Le fait de base.** Quand le backend ouvre un autre périphérique que
+    /// celui demandé, le statut porte LES DEUX noms et le dit.
+    ///
+    /// C'est exactement la situation de #2207 : le chemin exclusif WASAPI
+    /// appelle `GetDefaultAudioEndpoint` quand la résolution par nom échoue,
+    /// donc une zone réglée sur un DAC joue sur les haut-parleurs. Le serveur
+    /// le savait déjà (`opened_device_name`), personne ne pouvait le lire.
+    #[test]
+    fn un_peripherique_different_du_demande_porte_les_deux_noms() {
+        let s = backend_status(
+            observed("WASAPI", None),
+            ouvert(
+                "WASAPI",
+                "Topping D90 SE",
+                "Haut-parleurs (Realtek Audio)",
+                Some("{0.0.0.00000000}.{aaaa}"),
+            ),
+            "wasapi",
+        );
+        let d = s
+            .device
+            .expect("le statut doit porter le périphérique observé");
+        assert_eq!(d.requested, "Topping D90 SE");
+        assert_eq!(d.opened, "Haut-parleurs (Realtek Audio)");
+        assert_eq!(d.backend, "WASAPI");
+        assert_eq!(d.opened_id.as_deref(), Some("{0.0.0.00000000}.{aaaa}"));
+        assert!(d.differs, "l'écart doit être signalé, c'est tout l'intérêt");
+    }
+
+    /// **Le témoin.** Le périphérique demandé est bien celui ouvert : aucun
+    /// écart ne doit être annoncé. Un garde-fou qui crie toujours ne sert à
+    /// rien — c'est la faute qu'ont déjà coûtée #2053 et #1315.
+    #[test]
+    fn un_peripherique_honore_nannonce_aucun_ecart() {
+        let s = backend_status(
+            observed("ALSA", None),
+            ouvert(
+                "ALSA",
+                "Topping D90 SE",
+                "Topping D90 SE",
+                Some("hw:CARD=D90"),
+            ),
+            "auto",
+        );
+        let d = s.device.expect("périphérique observé");
+        assert!(!d.differs, "écart annoncé alors que le DAC demandé joue");
+    }
+
+    /// Demander « default », c'est demander le périphérique système : le
+    /// recevoir n'est PAS un écart. Mais l'écran doit quand même pouvoir le
+    /// NOMMER — « default » ne dit rien à personne.
+    #[test]
+    fn default_demande_nest_pas_un_ecart_mais_reste_nomme() {
+        let s = backend_status(
+            observed("CoreAudio", None),
+            ouvert("CoreAudio", "default", "MacBook Pro Speakers", None),
+            "auto",
+        );
+        let d = s.device.expect("périphérique observé");
+        assert!(!d.differs, "« default » honoré n'est pas un repli");
+        assert_eq!(d.opened, "MacBook Pro Speakers");
+        assert_eq!(
+            d.opened_id, None,
+            "CoreAudio n'expose aucun identifiant stable : le champ doit rester absent, pas inventé"
+        );
+    }
+
+    /// **L'honnêteté de l'absence.** Rien n'a encore été ouvert : le champ est
+    /// absent, pas rempli d'une valeur plausible.
+    #[test]
+    fn sans_ouverture_observee_le_peripherique_est_absent() {
+        let s = backend_status(observed("ALSA", None), None, "auto");
+        assert!(
+            s.device.is_none(),
+            "un périphérique annoncé sans qu'aucun n'ait été ouvert est une invention"
+        );
+    }
+
+    /// **Le faux ami.** `fell_back` parle du BACKEND (ASIO → WASAPI), `differs`
+    /// parle du PÉRIPHÉRIQUE. Les deux replis sont indépendants : le backend
+    /// demandé peut jouer et le DAC demandé être introuvable, et
+    /// réciproquement. Confondre les deux, c'est ré-annoncer #1395 à la place
+    /// de #2207.
+    #[test]
+    fn le_repli_de_backend_et_celui_de_peripherique_sont_independants() {
+        // Backend honoré, périphérique dévié.
+        let a = backend_status(
+            observed("WASAPI", None),
+            ouvert("WASAPI", "DAC USB", "Haut-parleurs", None),
+            "wasapi",
+        );
+        assert!(!a.fell_back, "aucun repli de BACKEND ici");
+        assert!(a.device.expect("périphérique").differs);
+
+        // Backend dévié, périphérique honoré.
+        let b = backend_status(
+            observed("WASAPI", Some(LocalBackendFallback::AsioNoDevices)),
+            ouvert("WASAPI", "DAC USB", "DAC USB", None),
+            "asio",
+        );
+        assert!(b.fell_back, "repli de BACKEND attendu");
+        assert!(!b.device.expect("périphérique").differs);
+    }
+
+    /// La charge utile JSON — ce que l'écran reçoit réellement — porte bien les
+    /// deux noms sous `device`. Un `assert` sur la structure Rust ne prouverait
+    /// rien du champ sérialisé.
+    #[test]
+    fn la_charge_utile_json_porte_les_deux_noms() {
+        let s = backend_status(
+            observed("WASAPI", None),
+            ouvert("WASAPI", "Topping D90 SE", "Haut-parleurs", None),
+            "wasapi",
+        );
+        let v = serde_json::to_value(&s).expect("statut sérialisable");
+        assert_eq!(v["device"]["requested"], "Topping D90 SE");
+        assert_eq!(v["device"]["opened"], "Haut-parleurs");
+        assert_eq!(v["device"]["differs"], true);
+        assert_eq!(v["device"]["backend"], "WASAPI");
+        // Les champs de #1395 restent en place : cet ajout est additif.
+        assert_eq!(v["active"], "WASAPI");
+        assert_eq!(v["requested"], "wasapi");
+    }
+
+    /// **Le VERROU de branchement**, pour les chemins que Linux ne compile
+    /// pas : WASAPI exclusif, ASIO exclusif et CoreAudio exclusif vivent tous
+    /// trois sous un `#[cfg]` inatteignable depuis la machine de compilation.
+    /// Sans ce garde, on pourrait retirer un `note_opened_device` et tout
+    /// resterait vert — c'est LITTÉRALEMENT le défaut qu'on corrige : deux
+    /// accesseurs justes, un seul lecteur, une ligne de journal.
+    ///
+    /// Même procédé que `chaque_sortie_de_select_host_enregistre_le_backend_ouvert`.
+    #[test]
+    fn chaque_chemin_douverture_enregistre_le_peripherique_ouvert() {
+        let src = std::fs::read_to_string(std::path::Path::new("src/outputs/local.rs"))
+            .expect("local.rs doit être lisible depuis la racine du crate");
+
+        // 1. Les trois chemins EXCLUSIFS : chacun annonce sa lecture par une
+        //    ligne `…_playing`, chacun doit enregistrer juste après.
+        for (marqueur, backend) in [
+            ("\"wasapi_exclusive_playing\"", "WASAPI"),
+            ("\"local_audio_asio_exclusive_playing\"", "ASIO"),
+            ("\"local_audio_exclusive_playing\"", "CoreAudio"),
+        ] {
+            let debut = src
+                .find(marqueur)
+                .unwrap_or_else(|| panic!("marqueur {marqueur} introuvable dans local.rs"));
+            let fenetre = &src[debut..src.len().min(debut + 900)];
+            assert!(
+                fenetre.contains("note_opened_device(")
+                    && fenetre.contains(&format!("\"{backend}\"")),
+                "le chemin {marqueur} joue sans dire QUEL périphérique il a ouvert \
+                 (attendu : un note_opened_device(\"{backend}\", …) juste après) : \
+                 la zone continuerait d'afficher la consigne au lieu de la vérité (#2207)"
+            );
+        }
+
+        // 2. Le chemin cpal PARTAGÉ (ALSA, CoreAudio partagé, WASAPI partagé) :
+        //    `find_device_with_fallback` a QUATRE sorties qui décident du son —
+        //    « default » demandé, nom résolu, refus d'hôte étranger (#3230, la
+        //    seule qui n'ouvre rien), repli sur le périphérique système
+        //    (#2207). Les quatre doivent enregistrer : une sortie muette, c'est
+        //    une zone qui affiche la consigne au lieu de la vérité.
+        let debut = src
+            .find("fn find_device_with_fallback(")
+            .expect("find_device_with_fallback introuvable");
+        let fin = src[debut..]
+            .find("\n/// Probe a device's capabilities")
+            .map(|i| debut + i)
+            .expect("le corps de find_device_with_fallback doit précéder `Probe a device`");
+        let corps = &src[debut..fin];
+        let enregistrements = corps.matches("note_opened_device(").count()
+            + corps.matches("note_device_outcome(").count();
+        assert_eq!(
+            enregistrements, 4,
+            "find_device_with_fallback décide du son par quatre chemins mais n'en \
+             enregistre que {enregistrements} : une sortie repart sans dire ce qu'elle a fait"
+        );
+        assert!(
+            corps.contains("audio_device_not_found_falling_back_to_default"),
+            "le repli sur le périphérique système a disparu — le cas à rendre visible n'existe plus"
+        );
+        assert!(
+            corps.contains("audio_device_foreign_host_refused"),
+            "le refus d'hôte étranger a disparu — un nom WASAPI redeviendrait \
+             appariable à une sortie ASIO (#3230)"
+        );
+    }
+
+    /// Le VERROU de branchement, pour la seule branche que PERSONNE ne peut
+    /// compiler ici.
+    ///
+    /// La branche `#[cfg(all(target_os = "windows", feature = "asio"))]` de
+    /// `select_host` ne se compile qu'avec le SDK Steinberg et Visual Studio :
+    /// ni ce Mac, ni la machine de compilation Linux ne peuvent la toucher —
+    /// seul le job `windows-latest` de la CI y arrive. Les tests ci-dessus
+    /// éprouvent donc la DÉCISION (`asio_outcome`), pas son BRANCHEMENT. Sans
+    /// ce garde, on pourrait supprimer un `note_observed_backend` dans cette
+    /// branche et tout resterait vert sur trois plateformes sur quatre.
+    ///
+    /// Même procédé que `contrat_des_retours_anticipes` côté serveur : on lit
+    /// la source, faute de pouvoir l'exécuter.
+    #[test]
+    fn chaque_sortie_de_select_host_enregistre_le_backend_ouvert() {
+        let src = std::fs::read_to_string(std::path::Path::new("src/outputs/local.rs"))
+            .expect("local.rs doit être lisible depuis la racine du crate");
+        let debut = src
+            .find("pub fn select_host(")
+            .expect("select_host introuvable");
+        let fin = src[debut..]
+            .find("static OBSERVED_BACKEND")
+            .map(|i| debut + i)
+            .expect("le corps de select_host doit précéder OBSERVED_BACKEND");
+        let corps = &src[debut..fin];
+
+        // Une sortie = un host rendu. Chacune doit avoir dit LEQUEL avant de
+        // le rendre, sinon l'API annonce de nouveau le backend demandé.
+        let sorties =
+            corps.matches("cpal::default_host()").count() + corps.matches("return host;").count();
+        let enregistrements = corps.matches("note_observed_backend(").count();
+        assert_eq!(
+            enregistrements, sorties,
+            "select_host rend {sorties} host(s) mais n'enregistre que {enregistrements} backend(s) : \
+             un chemin repart sans dire ce qu'il a ouvert (c'est exactement le défaut de #1395)"
+        );
+
+        // Et la décision doit rester celle qu'on éprouve plus haut, pas une
+        // règle réécrite en ligne dans la branche non compilable.
+        for attendu in [
+            "asio_outcome(Some(device_count))",
+            "asio_outcome(None)",
+            "unsupported_outcome(&backend_lower)",
+        ] {
+            assert!(
+                corps.contains(attendu),
+                "select_host ne passe plus par « {attendu} » — la décision testée n'est plus celle jouée"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod backends_supportes_tests {
+    use super::{backend_value_is_supported, supported_backends};
+
+    // #1268 — le cas Lapinou/Benjithom : sur Debian et Fedora, le sélecteur
+    // proposait WASAPI et ASIO. La liste que le serveur publie ne doit JAMAIS
+    // contenir un backend d'une autre plateforme.
+    #[test]
+    fn aucun_backend_windows_hors_windows() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let interdits = ["wasapi", "asio"];
+            for b in supported_backends() {
+                assert!(
+                    !interdits.contains(&b.value),
+                    "backend Windows « {} » proposé sur une plateforme non-Windows",
+                    b.value
+                );
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                supported_backends().iter().any(|b| b.value == "wasapi"),
+                "WASAPI doit rester proposé sous Windows"
+            );
+        }
+    }
+
+    // `auto` est le défaut ET le repli de select_host : toujours présent,
+    // toujours premier, sur toutes les plateformes.
+    #[test]
+    fn auto_toujours_present_et_premier() {
+        let backends = supported_backends();
+        assert!(!backends.is_empty());
+        assert_eq!(backends[0].value, "auto");
+        assert!(backend_value_is_supported("auto"));
+        assert!(backend_value_is_supported("AUTO"), "casse indifférente");
+    }
+
+    // ASIO n'apparaît que si le binaire sait réellement l'ouvrir — même
+    // vérité que `asio_available()`, qui voyage déjà dans la même réponse.
+    #[test]
+    fn asio_propose_ssi_disponible() {
+        assert_eq!(
+            supported_backends().iter().any(|b| b.value == "asio"),
+            super::asio_available()
+        );
+    }
+
+    // Le repli d'affichage : une valeur Windows persistée sur un serveur
+    // Linux/macOS est déclarée non supportée, pour que /system/config la
+    // ramène à `auto` au lieu de la resservir au sélecteur.
+    #[test]
+    fn une_valeur_d_une_autre_plateforme_est_declaree_non_supportee() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(!backend_value_is_supported("wasapi"));
+            assert!(!backend_value_is_supported("asio"));
+        }
+        assert!(!backend_value_is_supported("n_importe_quoi"));
     }
 }
 
@@ -9150,5 +13930,582 @@ mod chemin_compresse_dsp_tests {
                  les frequences de coupure."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod enumeration_asio_occupee_tests {
+    use super::{AsioEnumerationPlan, plan_audio_enumeration};
+
+    /// #1267 — pendant qu'une session exclusive verrouille le pilote ASIO,
+    /// l'énumération générique doit servir le cache, pas rouvrir le pilote.
+    #[test]
+    fn le_pilote_asio_occupe_fait_servir_le_cache() {
+        assert_eq!(
+            plan_audio_enumeration("asio", true),
+            AsioEnumerationPlan::ServeCache
+        );
+        // La valeur vient de la base ou de l'environnement : la casse varie.
+        assert_eq!(
+            plan_audio_enumeration("ASIO", true),
+            AsioEnumerationPlan::ServeCache
+        );
+        assert_eq!(
+            plan_audio_enumeration("Asio", true),
+            AsioEnumerationPlan::ServeCache
+        );
+    }
+
+    /// Pilote libre : rien ne change, on interroge le matériel. Sans cela le
+    /// correctif transformerait la panne en une liste figée à vie.
+    #[test]
+    fn le_pilote_asio_libre_laisse_sonder() {
+        assert_eq!(
+            plan_audio_enumeration("asio", false),
+            AsioEnumerationPlan::Probe
+        );
+    }
+
+    /// Les autres backends n'ouvrent JAMAIS le host ASIO — `auto` passe par
+    /// WASAPI. Les priver de balayage parce qu'une zone ASIO joue ferait
+    /// disparaître les DAC USB de la liste (défaut #1084, à ne pas rejouer).
+    #[test]
+    fn les_autres_backends_sondent_meme_pilote_asio_occupe() {
+        for backend in ["auto", "wasapi", "AUTO", "coreaudio", "alsa", ""] {
+            assert_eq!(
+                plan_audio_enumeration(backend, true),
+                AsioEnumerationPlan::Probe,
+                "« {backend} » n'ouvre pas le host ASIO : il doit continuer à sonder"
+            );
+        }
+    }
+
+    /// Le VERROU de branchement.
+    ///
+    /// La décision ci-dessus est éprouvée partout ; son BRANCHEMENT, lui, ne
+    /// se voit qu'à l'exécution sous Windows avec un pilote ASIO réel, que
+    /// personne ne peut jouer en CI. Sans ce garde on pourrait supprimer le
+    /// retour anticipé de `list_audio_devices_with_backend` et les trois tests
+    /// ci-dessus resteraient verts pendant que #1267 reviendrait.
+    ///
+    /// Même procédé que `chaque_sortie_de_select_host_enregistre_le_backend_ouvert`.
+    #[test]
+    fn list_audio_devices_with_backend_consulte_le_plan_avant_de_sonder() {
+        let source = include_str!("local.rs");
+        let debut = source
+            .find("pub fn list_audio_devices_with_backend(")
+            .expect("list_audio_devices_with_backend introuvable");
+        let corps = &source[debut..];
+        let fin = corps
+            .find("\n}\n")
+            .expect("fin du corps de list_audio_devices_with_backend introuvable");
+        let corps = &corps[..fin];
+
+        let pos_plan = corps
+            .find("plan_audio_enumeration(backend, asio_device_busy())")
+            .expect(
+                "list_audio_devices_with_backend ne consulte plus le plan : la page Diagnostic \
+             rouvrira le pilote ASIO pendant que la sortie tente de se verrouiller (#1267)",
+            );
+        let pos_sonde = corps
+            .find("list_audio_devices_uncached(")
+            .expect("le balayage matériel a disparu du corps");
+        assert!(
+            pos_plan < pos_sonde,
+            "le plan doit être consulté AVANT le balayage matériel, sinon le pilote est \
+             déjà rouvert quand on décide de ne pas le rouvrir (#1267)"
+        );
+        assert!(
+            corps.contains("return cached_audio_devices();"),
+            "le chemin ServeCache doit rendre le dernier inventaire connu, pas une liste vide : \
+             une zone ASIO active ferait autrement disparaître toutes les sorties de l'interface"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2272 — deux sorties locales homonymes, et rien pour dire laquelle est laquelle
+//
+// Marco Polo, forum du 2026-06-08 : « Voici comment Tune présente mes
+// "haut-parleurs" locaux : comment savoir lequel est lequel ? » Deux DAC USB
+// sous WASAPI s'annoncent tous deux « Haut-Parleurs » ; la découverte suffixait
+// « (2) » au second — un rang d'énumération, qui évite qu'un périphérique
+// disparaisse (#1084) mais ne nomme rien et peut changer au redémarrage.
+//
+// Ce qui manquait n'était pas une propriété système : cpal la lisait déjà. Le
+// `DeviceDescription` que l'énumération obtenait portait
+// `DEVPKEY_DeviceInterface_FriendlyName` dans son champ `driver` — et
+// l'énumération n'en lisait que `name()`.
+// ---------------------------------------------------------------------------
+
+/// La garde de site : le renseignement est-il vraiment BRANCHÉ ?
+///
+/// Les épreuves ci-dessous exercent la règle et l'adaptateur, mais aucune ne
+/// peut voir la seule chose qui reste : que l'énumération les APPELLE, et que
+/// le périphérique qu'elle publie porte le résultat. Une règle juste, calculée
+/// puis jetée, les laisserait toutes vertes. On relit donc la source — même
+/// procédé et même raison que `position_publiee_guard` dans `poller.rs`.
+#[cfg(test)]
+mod renseignement_materiel_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe à ce module pour que
+    /// les motifs cherchés ne puissent pas se trouver eux-mêmes dans les
+    /// messages d'assertion ni dans les épreuves qui suivent (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("local.rs");
+        const BORNE: &str = "mod renseignement_materiel_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    #[test]
+    fn l_enumeration_garde_la_description_entiere() {
+        assert!(
+            code_de_production().contains("let description = device.description().ok();"),
+            "l'énumération doit CONSERVER le `DeviceDescription` de cpal. Le \
+             réduire à son `name()` est précisément ce qui jetait le nom du \
+             contrôleur que Windows y met déjà (#2272)."
+        );
+    }
+
+    #[test]
+    fn le_renseignement_est_calcule_sur_le_nom_brut_et_l_endpoint() {
+        assert!(
+            code_de_production()
+                .contains("hardware_detail_from_description(desc, &raw_name, &endpoint_id)"),
+            "la règle doit être nourrie du nom BRUT et de l'identifiant \
+             d'endpoint. Lui passer le nom déjà désambiguïsé lui ferait \
+             comparer le candidat à un suffixe « (2) » qui vient de nous, et \
+             lui cacher que le PCM ALSA répète l'endpoint (#2272)."
+        );
+    }
+
+    #[test]
+    fn le_peripherique_publie_porte_le_renseignement() {
+        let code = code_de_production();
+        let debut = code
+            .find("devices.push(AudioDevice {")
+            .expect("l'énumération ne construit plus l'AudioDevice qu'elle publie");
+        let bloc = &code[debut..];
+        let fin = bloc
+            .find("});")
+            .expect("le littéral AudioDevice de l'énumération n'est plus délimité");
+        assert!(
+            bloc[..fin].contains("hardware_detail,"),
+            "l'énumération construit le périphérique publié SANS y porter le \
+             renseignement matériel : la règle serait calculée puis jetée, et \
+             Marco Polo verrait toujours deux « Haut-Parleurs » (#2272)."
+        );
+    }
+}
+
+#[cfg(test)]
+mod renseignement_materiel_tests {
+    use super::{
+        AudioDevice, hardware_detail, hardware_detail_from_description,
+        merge_linux_duplicate_variant,
+    };
+    use cpal::{DeviceDescription, DeviceDescriptionBuilder};
+
+    /// Ce que cpal rend sur WASAPI : `name` vient de
+    /// `DEVPKEY_Device_DeviceDesc` (générique — « Haut-Parleurs »), `driver` de
+    /// `DEVPKEY_DeviceInterface_FriendlyName` (le contrôleur).
+    fn description_wasapi(nom: &str, controleur: &str) -> DeviceDescription {
+        DeviceDescriptionBuilder::new(nom)
+            .driver(controleur)
+            .build()
+    }
+
+    /// Le périphérique tel que l'énumération le publie, renseignement compris.
+    /// `raw_name` est le nom du pilote ; `display_name` celui qu'a posé la
+    /// désambiguïsation — c'est bien le BRUT qui nourrit la règle.
+    fn peripherique_publie(
+        raw_name: &str,
+        display_name: &str,
+        endpoint_id: &str,
+        description: &DeviceDescription,
+    ) -> AudioDevice {
+        AudioDevice {
+            name: display_name.to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            is_default: false,
+            max_channels: 2,
+            sample_rates: vec![44_100, 48_000],
+            sample_rates_measured: false,
+            backend: "Wasapi".to_string(),
+            hardware_detail: hardware_detail_from_description(description, raw_name, endpoint_id),
+        }
+    }
+
+    /// L'ÉPREUVE. Deux homonymes de contrôleurs différents doivent être
+    /// distinguables dans ce que le serveur PUBLIE — pas seulement dans ce que
+    /// la règle rend.
+    #[test]
+    fn deux_homonymes_de_controleurs_differents_sont_distinguables() {
+        let topping = description_wasapi("Haut-Parleurs", "Topping D10s");
+        let realtek = description_wasapi("Haut-Parleurs", "Realtek High Definition Audio");
+
+        // Le second reçoit le suffixe « (2) » de la découverte : c'est
+        // exactement l'écran de Marco Polo.
+        let un = peripherique_publie(
+            "Haut-Parleurs",
+            "Haut-Parleurs",
+            "Wasapi:{0.0.0.00000000}.{aaaaaaaa}",
+            &topping,
+        );
+        let deux = peripherique_publie(
+            "Haut-Parleurs",
+            "Haut-Parleurs (2)",
+            "Wasapi:{0.0.0.00000000}.{bbbbbbbb}",
+            &realtek,
+        );
+
+        let charge_un = serde_json::to_value(&un).expect("AudioDevice sérialisable");
+        let charge_deux = serde_json::to_value(&deux).expect("AudioDevice sérialisable");
+
+        assert_eq!(
+            charge_un["hardware_detail"],
+            serde_json::json!("Topping D10s"),
+            "la charge utile doit nommer le contrôleur du premier DAC. Reçu : {charge_un}"
+        );
+        assert_eq!(
+            charge_deux["hardware_detail"],
+            serde_json::json!("Realtek High Definition Audio"),
+            "la charge utile doit nommer le contrôleur du second. Reçu : {charge_deux}"
+        );
+        assert_ne!(
+            charge_un["hardware_detail"], charge_deux["hardware_detail"],
+            "deux périphériques homonymes doivent être DISTINGUABLES dans ce \
+             que le serveur publie : c'est toute la demande de #2272."
+        );
+
+        // Et le nom d'affichage n'a pas bougé d'un caractère : c'est lui que
+        // les zones ont mémorisé et que `resolve_device` reconstruit (#3185).
+        assert_eq!(charge_un["name"], serde_json::json!("Haut-Parleurs"));
+        assert_eq!(charge_deux["name"], serde_json::json!("Haut-Parleurs (2)"));
+    }
+
+    /// Un renseignement absent ne casse rien, et ne publie AUCUN champ vide.
+    /// C'est le cas de macOS aujourd'hui : cpal 0.17.3 n'y renseigne ni
+    /// `manufacturer` ni `driver`.
+    #[test]
+    fn sans_renseignement_le_champ_est_absent_de_la_charge_utile() {
+        let macos = DeviceDescriptionBuilder::new("USB Audio DAC").build();
+        let publie = peripherique_publie(
+            "USB Audio DAC",
+            "USB Audio DAC",
+            "CoreAudio:AppleUSBAudioEngine:1,2",
+            &macos,
+        );
+
+        assert_eq!(publie.hardware_detail, None);
+        let charge = serde_json::to_value(&publie).expect("AudioDevice sérialisable");
+        assert!(
+            charge.get("hardware_detail").is_none(),
+            "un renseignement absent doit être ABSENT de la charge utile, pas \
+             publié comme `null` ou comme chaîne vide : sinon l'écran affiche \
+             un tiret et le vide se fait passer pour une information. \
+             Reçu : {charge}"
+        );
+        // Le reste de la charge utile est intacte.
+        assert_eq!(charge["name"], serde_json::json!("USB Audio DAC"));
+        assert_eq!(
+            charge["endpoint_id"],
+            serde_json::json!("CoreAudio:AppleUSBAudioEngine:1,2")
+        );
+    }
+
+    /// Sur ALSA, cpal met le PCM dans `driver` — la même chaîne que
+    /// `endpoint_id` porte déjà, préfixe d'hôte en plus. Ce n'est pas un nom de
+    /// contrôleur, et le publier comme tel serait du bruit.
+    #[test]
+    fn le_pcm_alsa_ne_se_fait_pas_passer_pour_un_controleur() {
+        let alsa = DeviceDescriptionBuilder::new("HDA Intel PCH, ALC257 Analog")
+            .driver("hw:CARD=PCH,DEV=0")
+            .build();
+        assert_eq!(
+            hardware_detail_from_description(
+                &alsa,
+                "HDA Intel PCH, ALC257 Analog",
+                "Alsa:hw:CARD=PCH,DEV=0"
+            ),
+            None,
+            "le PCM ALSA est déjà l'identifiant d'endpoint : il ne distingue \
+             rien de plus, et Linux doit retomber mot pour mot sur le \
+             comportement d'avant"
+        );
+    }
+
+    #[test]
+    fn le_fabricant_l_emporte_sur_le_pilote() {
+        assert_eq!(
+            hardware_detail(
+                Some("Topping"),
+                Some("USB Audio Device"),
+                "Haut-Parleurs",
+                "Wasapi:{0.0.0.00000000}.{aaaaaaaa}"
+            ),
+            Some("Topping".to_string()),
+            "aucun backend de cpal 0.17.3 ne renseigne `manufacturer`, mais \
+             c'est le champ dont la sémantique est la bonne : le jour où l'un \
+             le remplit, il doit gagner sans qu'on y revienne"
+        );
+    }
+
+    #[test]
+    fn un_candidat_que_le_nom_porte_deja_n_ajoute_rien() {
+        assert_eq!(
+            hardware_detail(None, Some("Topping D10s"), "Topping D10s", "Wasapi:{aaaa}"),
+            None
+        );
+        assert_eq!(
+            hardware_detail(None, Some("topping d10s"), "Topping D10s", "Wasapi:{aaaa}"),
+            None,
+            "la comparaison ignore la casse : WASAPI et le pilote n'ont pas \
+             toujours la même"
+        );
+    }
+
+    #[test]
+    fn un_renseignement_blanc_n_est_pas_un_renseignement() {
+        assert_eq!(
+            hardware_detail(Some("   "), Some(""), "Haut-Parleurs", "Wasapi:{aaaa}"),
+            None
+        );
+        assert_eq!(
+            hardware_detail(
+                Some("  Topping D10s  "),
+                None,
+                "Haut-Parleurs",
+                "Wasapi:{aaaa}"
+            ),
+            Some("Topping D10s".to_string()),
+            "un renseignement encadré de blancs reste un renseignement, mais \
+             il est publié propre"
+        );
+    }
+
+    /// LE TÉMOIN. Un périphérique unique dont le nom porte déjà son identité
+    /// ne change de rien : ni de nom, ni de champ inventé.
+    #[test]
+    fn temoin_un_peripherique_unique_ne_change_de_rien() {
+        let seul = description_wasapi("Topping D10s", "Topping D10s");
+        let publie = peripherique_publie(
+            "Topping D10s",
+            "Topping D10s",
+            "Wasapi:{0.0.0.00000000}.{cccccccc}",
+            &seul,
+        );
+        assert_eq!(
+            publie.name, "Topping D10s",
+            "le nom d'affichage ne bouge pas : c'est lui que les zones ont \
+             mémorisé (#3185)"
+        );
+        assert_eq!(
+            publie.hardware_detail, None,
+            "quand le nom porte déjà l'identité, il n'y a rien à ajouter — et \
+             surtout pas « Topping D10s — Topping D10s »"
+        );
+        let charge = serde_json::to_value(&publie).expect("AudioDevice sérialisable");
+        assert!(charge.get("hardware_detail").is_none());
+    }
+
+    /// LE TÉMOIN, suite : le dédoublonnage Linux ne change pas de conduite.
+    /// Quand le PCM matériel supplante le greffon (#3240/#1655), l'identité
+    /// bascule ENTIÈREMENT — endpoint, capacités, preuve, et désormais le
+    /// renseignement matériel. Le laisser en arrière l'accrocherait au greffon
+    /// qu'on vient d'écarter.
+    #[test]
+    fn l_identite_qui_bascule_emporte_le_renseignement_materiel() {
+        let mut publie = AudioDevice {
+            name: "Eversolo DAC-Z8, USB Audio".into(),
+            endpoint_id: "Alsa:sysdefault:CARD=DACZ8,DEV=0".into(),
+            is_default: false,
+            max_channels: 32,
+            sample_rates: vec![44_100, 384_000],
+            sample_rates_measured: false,
+            backend: "Alsa".into(),
+            hardware_detail: Some("greffon".into()),
+        };
+        assert!(
+            merge_linux_duplicate_variant(
+                &mut publie,
+                "Alsa:hw:CARD=DACZ8,DEV=0".into(),
+                false,
+                2,
+                vec![44_100, 48_000],
+                true,
+                Some("Eversolo DAC-Z8".into()),
+            ),
+            "le PCM matériel doit l'emporter sur le greffon (#3240)"
+        );
+        assert_eq!(publie.endpoint_id, "Alsa:hw:CARD=DACZ8,DEV=0");
+        assert_eq!(
+            publie.hardware_detail.as_deref(),
+            Some("Eversolo DAC-Z8"),
+            "le renseignement matériel est le quatrième membre de l'identité \
+             qui bascule : il doit suivre l'endpoint retenu"
+        );
+
+        // Et dans l'autre sens : le greffon qui arrive après ne reprend rien au
+        // matériel déjà retenu, renseignement compris.
+        let mut publie = AudioDevice {
+            name: "Eversolo DAC-Z8, USB Audio".into(),
+            endpoint_id: "Alsa:hw:CARD=DACZ8,DEV=0".into(),
+            is_default: false,
+            max_channels: 2,
+            sample_rates: vec![44_100, 48_000],
+            sample_rates_measured: true,
+            backend: "Alsa".into(),
+            hardware_detail: Some("Eversolo DAC-Z8".into()),
+        };
+        assert!(!merge_linux_duplicate_variant(
+            &mut publie,
+            "Alsa:dmix:CARD=DACZ8,DEV=0".into(),
+            true,
+            32,
+            vec![44_100, 384_000],
+            false,
+            Some("greffon".into()),
+        ));
+        assert_eq!(publie.endpoint_id, "Alsa:hw:CARD=DACZ8,DEV=0");
+        assert_eq!(publie.hardware_detail.as_deref(), Some("Eversolo DAC-Z8"));
+    }
+
+    /// Un enregistrement écrit avant ce champ reste lisible, et ne se voit pas
+    /// attribuer un renseignement qu'il n'a pas.
+    #[test]
+    fn un_enregistrement_anterieur_reste_lisible_sans_renseignement() {
+        let ancien = serde_json::json!({
+            "name": "Haut-Parleurs",
+            "endpoint_id": "",
+            "is_default": true,
+            "max_channels": 2,
+            "sample_rates": [44_100, 48_000],
+            "backend": "Wasapi",
+        });
+        let relu: AudioDevice =
+            serde_json::from_value(ancien).expect("AudioDevice reste rétro-compatible");
+        assert_eq!(relu.hardware_detail, None);
+        assert_eq!(relu.name, "Haut-Parleurs");
+    }
+}
+
+/// #1770 — une zone créée à partir d'une énumération WASAPI alors qu'ASIO est
+/// configuré ne pouvait JAMAIS jouer.
+///
+/// Ces essais construisent la sortie par l'EXPRESSION EXACTE des deux sites
+/// d'enregistrement (`tune-server/src/startup.rs::register_local_outputs` et
+/// `tune-server/src/background.rs::rescan_local_audio_devices`) et mesurent ce
+/// que la sortie portera à l'ouverture. Ils ne rappellent aucune condition :
+/// `LocalOutput::audio_backend()` est la valeur que lisent `select_host`, la
+/// branche `exclusive_mode && audio_backend == "asio"` et `is_available`.
+///
+/// La branche ASIO exclusive elle-même vit sous
+/// `#[cfg(all(target_os = "windows", feature = "asio"))]` : elle ne se compile
+/// ni sur Shrek ni sur aucune porte de ce dépôt. Élargir ce `cfg` serait INERTE
+/// ici — la caisse `cpal/asio` ne se lie pas hors Windows. C'est donc la valeur
+/// D'ENTRÉE de cette branche qui est tenue, pas la branche.
+#[cfg(test)]
+mod zone_backend_asio_i1770 {
+    use super::LocalOutput;
+
+    /// Le cas mesuré chez jfpaquet le 02/09 en 0.9.130 :
+    /// `asio_device_not_found_listing_available requested=Speakers
+    /// available=["Essence STX II ASIO(64)"]`, deux fois en une minute, sans
+    /// aucun repli.
+    ///
+    /// `exclusive_mode = true` n'est pas un choix de l'essai : sous ASIO,
+    /// `AppState::effective_exclusive_mode()` le rend vrai PAR CONSTRUCTION
+    /// (`config::exclusive_mode_status`), que la case soit cochée ou non.
+    #[test]
+    fn un_endpoint_wasapi_sous_asio_ne_part_pas_dans_le_chemin_asio() {
+        let sortie = LocalOutput::with_options_and_endpoint(
+            "Speakers".to_string(),
+            Some("{0.0.0.00000000}.{a1b2c3d4}".to_string()),
+            true,
+            "asio",
+        )
+        .with_origin_host("WASAPI");
+
+        assert_ne!(
+            sortie.audio_backend(),
+            "asio",
+            "`AsioExclusiveOutput::new` ne reçoit un nom que par \
+             `audio_backend == \"asio\"` : tant que cette sortie porte `asio`, \
+             un nom WASAPI y est envoyé et ne peut qu'être refusé (#1770)"
+        );
+        assert_eq!(
+            sortie.audio_backend(),
+            "wasapi",
+            "et `select_host` doit rouvrir l'hôte qui a énuméré ce nom, sans \
+             quoi `resolve_device` refuse pour hôte étranger (#3230)"
+        );
+        assert_eq!(
+            sortie.origin_host(),
+            Some("WASAPI"),
+            "l'étiquette d'origine reste posée : c'est elle qui arme le refus \
+             de #3230 sur le chemin cpal"
+        );
+    }
+
+    /// TÉMOIN — backend ASIO, périphérique ASIO réel : comportement INCHANGÉ.
+    ///
+    /// C'est le périphérique de jfpaquet lui-même. Si cet essai tombe, le
+    /// correctif a désarmé ASIO au lieu de le protéger, et il n'y a plus de
+    /// lecture bit-perfect du tout.
+    #[test]
+    fn temoin_un_endpoint_asio_reel_reste_sur_le_chemin_asio() {
+        let sortie = LocalOutput::with_options_and_endpoint(
+            "Essence STX II ASIO(64)".to_string(),
+            None,
+            true,
+            "asio",
+        )
+        .with_origin_host("ASIO");
+
+        assert_eq!(
+            sortie.audio_backend(),
+            "asio",
+            "un périphérique réellement énuméré par ASIO doit continuer de \
+             partir dans la branche ASIO exclusive"
+        );
+        assert_eq!(sortie.origin_host(), Some("ASIO"));
+    }
+
+    /// Sans étiquette d'origine, rien n'est rectifié : on ne devine pas.
+    ///
+    /// C'est le cas de `PlaybackOrchestrator::recreate_local_and_play`, qui
+    /// reconstruit une sortie à partir du seul `device_id`.
+    #[test]
+    fn sans_hote_d_origine_le_reglage_passe_tel_quel() {
+        let sortie =
+            LocalOutput::with_options_and_endpoint("Speakers".to_string(), None, true, "asio");
+        assert_eq!(sortie.audio_backend(), "asio");
+        assert_eq!(sortie.origin_host(), None);
+
+        // Une chaîne vide vaut « inconnu », comme pour `origin_host`.
+        let vide =
+            LocalOutput::with_options_and_endpoint("Speakers".to_string(), None, true, "asio")
+                .with_origin_host("");
+        assert_eq!(vide.audio_backend(), "asio");
+        assert_eq!(vide.origin_host(), None);
+    }
+
+    /// Le mode exclusif n'est PAS touché : il reste ce que
+    /// `effective_exclusive_mode()` a décidé. Une sortie WASAPI rectifiée part
+    /// donc dans le chemin WASAPI exclusif (`exclusive_mode && audio_backend
+    /// != "asio"`), qui lui, sait l'ouvrir.
+    #[test]
+    fn le_mode_exclusif_reste_celui_qu_on_a_recu() {
+        let sortie =
+            LocalOutput::with_options_and_endpoint("Speakers".to_string(), None, true, "asio")
+                .with_origin_host("WASAPI");
+        assert!(
+            sortie.exclusive_mode,
+            "rectifier le backend ne doit pas décider à la place de \
+             l'utilisateur ce que vaut le mode exclusif"
+        );
     }
 }

@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -11,6 +12,8 @@ use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::zone_repo::ZoneRepo;
+
+use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSourceMode};
 
 use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
@@ -23,41 +26,102 @@ pub(super) async fn version() -> Json<Value> {
     }))
 }
 
-pub(super) async fn health(State(state): State<AppState>) -> Json<Value> {
+/// Sonde de santé publique (#2796).
+///
+/// ## Ce que la route prétendait, et ce qu'elle vérifiait
+///
+/// Elle annonçait `status: "ok"` en dur, dans un `Json` donc toujours en
+/// **HTTP 200**, quel que soit l'état de la base. Le seul reflet du réel était
+/// le champ `db`, calculé sur la seule sonde `tracks` : une panne sur
+/// `albums`, ou sur la lecture du réglage `server_name`, était convertie en
+/// zéro ou en nom par défaut sans dégrader quoi que ce soit. Les trois
+/// affirmations de la réponse — code HTTP, champ `status`, détail par
+/// composant — pouvaient donc se contredire, et deux d'entre elles mentaient.
+///
+/// ## Qui lit cette route, et pourquoi le code HTTP se dose
+///
+/// Elle n'est pas seulement une sonde de supervision : c'est le **test
+/// d'existence d'un serveur Tune**. La découverte réseau du client Flutter
+/// (`server_discovery.dart`) n'enregistre un hôte que si elle obtient
+/// exactement `200`; la télécommande macOS conditionne toute sa connexion à
+/// cet appel; les clients iOS/iPadOS lèvent sur non-2xx; la barre latérale web
+/// y prend le numéro de version; `SettingsView` s'en sert pour savoir quand le
+/// serveur est revenu après un redémarrage. Un 503 rend donc le serveur
+/// **invisible**, il ne le signale pas « en peine ».
+///
+/// D'où la gradation, qui reste dans le contrat demandé sans transformer une
+/// requête malchanceuse en disparition :
+///
+/// - toutes les sondes passent → `ok`, HTTP 200 ;
+/// - une partie échoue (la base répond encore, une requête a échoué : verrou
+///   SQLite pris pendant un balayage, par exemple) → `degraded`, HTTP **200** ;
+/// - **toutes** échouent, c'est-à-dire base indisponible → `error`, HTTP 503.
+///
+/// Les conteneurs ne rebouclent pas là-dessus : les `HEALTHCHECK` des deux
+/// `Dockerfile` visent `/system/stats`, pas cette route.
+///
+/// ## Pourquoi `components` et pas un nouveau vocabulaire
+///
+/// Le détail par composant existe déjà **côté clients** et n'a jamais été
+/// servi : `SystemHealth.components: Record<string, boolean>` est déclaré dans
+/// le client web (`types.ts`), rendu en grille par `DiagnosticsView` et
+/// `SettingsView`, et déclaré dans les modèles iOS et macOS. La bannière web
+/// distingue déjà `ok` de `degraded`. On remplit ce contrat-là ; on n'en
+/// invente pas un second. La santé « avancée » (mémoire, disque, blocage de
+/// lecture) reste où elle est, sur `/system/health/monitor`, et n'entre pas
+/// ici : ses sondes lancent un sous-processus `df`, ce qu'une route sollicitée
+/// par la découverte réseau et par une boucle de 700 ms ne peut pas payer.
+pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let tracks_result = TrackRepo::with_backend(state.backend.clone()).count();
     let albums_result = AlbumRepo::with_backend(state.backend.clone()).count();
     let uptime_secs = state.started_at.elapsed().as_secs();
-
-    let db_status = if tracks_result.is_ok() {
-        "connected"
-    } else {
-        "error"
-    };
-    let tracks = tracks_result.unwrap_or(0);
-    let albums = albums_result.unwrap_or(0);
 
     // Le nom voyage AVEC la version (#2110). C'est la même requête que la barre
     // latérale fait déjà pour afficher « v0.9.117 » : la plainte d'origine est
     // qu'elle annonce une version sans dire de quelle machine elle parle. Les
     // séparer imposerait un second appel — et laisserait l'étiquette absente
-    // tant qu'il n'a pas répondu.
-    let server_name = resolve_server_name(
-        SettingsRepo::with_backend(state.backend.clone())
-            .get("server_name")
-            .ok()
-            .flatten()
-            .as_deref(),
-    );
+    // tant qu'il n'a pas répondu. C'est aussi la troisième sonde de la base :
+    // elle touche `settings`, une table que les deux comptages ne lisent pas.
+    let name_result = SettingsRepo::with_backend(state.backend.clone()).get("server_name");
+    let server_name = resolve_server_name(name_result.as_ref().ok().and_then(|v| v.as_deref()));
 
-    Json(json!({
-        "status": "ok",
-        "version": tune_core::version(),
-        "server_name": server_name,
-        "uptime_seconds": uptime_secs,
-        "db": db_status,
-        "tracks": tracks,
-        "albums": albums,
-    }))
+    let sondes = [
+        ("db_tracks", tracks_result.is_ok()),
+        ("db_albums", albums_result.is_ok()),
+        ("db_settings", name_result.is_ok()),
+    ];
+    let echecs = sondes.iter().filter(|(_, ok)| !*ok).count();
+
+    // Une panne SQL ne doit pas rester muette dans le journal (#2861) : les
+    // valeurs de repli partent quand même dans la réponse, mais accompagnées
+    // du `components` qui les contredit, et d'une trace côté serveur.
+    let tracks = tracks_result.ou_defaut_journalise();
+    let albums = albums_result.ou_defaut_journalise();
+
+    let (code, status, db_status) = match echecs {
+        0 => (StatusCode::OK, "ok", "connected"),
+        n if n == sondes.len() => (StatusCode::SERVICE_UNAVAILABLE, "error", "error"),
+        _ => (StatusCode::OK, "degraded", "degraded"),
+    };
+
+    let components: serde_json::Map<String, Value> = sondes
+        .iter()
+        .map(|(nom, ok)| ((*nom).to_string(), Value::Bool(*ok)))
+        .collect();
+
+    (
+        code,
+        Json(json!({
+            "status": status,
+            "version": tune_core::version(),
+            "server_name": server_name,
+            "uptime_seconds": uptime_secs,
+            "db": db_status,
+            "tracks": tracks,
+            "albums": albums,
+            "components": components,
+        })),
+    )
 }
 
 pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
@@ -88,7 +152,14 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
     .await
     .unwrap_or(0);
 
-    Json(json!({
+    // C'est CET écran que le testeur de #2147 avait sous les yeux : Réglages →
+    // Bibliothèque affiche ces compteurs et, une soixantaine de lignes plus
+    // bas dans la même section, le `total_files` du rapport de scan. Les deux
+    // nombres ne comptent pas la même chose — des LIGNES de `tracks` ici, des
+    // FICHIERS TROUVÉS SUR LE DISQUE là-bas — et rien ne le disait. La
+    // ventilation est la même que celle de `/library/stats` : même code, mêmes
+    // champs, pour que les deux écrans ne puissent pas diverger.
+    let mut corps = json!({
         "artists": artists,
         "albums": albums,
         "tracks": tracks,
@@ -98,9 +169,76 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
         "outputs": outputs,
         "server_version": tune_core::version(),
         "server_engine": "rust",
-    }))
+    });
+    crate::routes::library::stats::ajouter_ventilation(
+        &mut corps,
+        &crate::routes::library::stats::VentilationParSource::lire(&state),
+    );
+    Json(corps)
 }
 
+/// `audio_backend` n'est PAS le réglage de la sortie locale — et cette route
+/// ne doit jamais le laisser passer pour tel (#2265).
+///
+/// Dans cette API, `audio_backend` nomme le backend **réellement ouvert**,
+/// après un éventuel repli ASIO → WASAPI : c'est ce que rendent
+/// `/system/diagnostics`, `/system/profile`, `/zones` et l'instantané
+/// WebSocket. Le RÉGLAGE, lui, s'appelle `local_audio_backend` — c'est le seul
+/// nom que la lecture consulte (`AppState::effective_audio_backend`, qui
+/// interroge la clé `local_audio_backend` et rien d'autre).
+///
+/// Or les deux extrémités de cette route sont ouvertes : `update_config`
+/// persiste ses clés sans liste blanche, et `get_config` renvoie la table
+/// `settings` telle quelle. Une ligne `audio_backend` écrite là voyagerait
+/// donc dans la réponse **comme si elle était le réglage**, alors qu'aucun
+/// chemin de lecture ne la lit.
+///
+/// Elle aurait un lecteur, et c'est ce qui la rend coûteuse : le client web
+/// livré aujourd'hui lit `data.audio_backend ?? data.local_audio_backend` —
+/// **l'ancien nom d'abord**. Une telle ligne lui ferait afficher, et garder
+/// sélectionné, un backend que le serveur n'ouvrira jamais. C'est l'annonce
+/// fantôme que #2053 et #1315 ont déjà coûtée.
+///
+/// D'où les deux gardes, aux deux bouts : on refuse d'en créer une, et on ne
+/// publie pas celle qui existerait déjà. Rien n'est effacé en base — même
+/// discipline que le repli de `local_audio_backend` juste en dessous : on
+/// corrige la RÉPONSE, pas le contenu de la table.
+pub(super) const BACKEND_ACTIF_PAS_UN_REGLAGE: &str = "audio_backend";
+
+/// Le message rendu à qui tente d'écrire `audio_backend` : ce qui se passe,
+/// et quoi faire à la place. Un 400 muet renverrait le client à la devinette.
+pub(super) fn refus_backend_actif() -> String {
+    format!(
+        "'{BACKEND_ACTIF_PAS_UN_REGLAGE}' is not a setting: it reports the backend the local \
+         output actually opened, after any ASIO to WASAPI fallback. Writing it would store a \
+         value that playback never reads. The setting is 'local_audio_backend' — send \
+         {{\"local_audio_backend\": \"...\"}} and pick a value from 'supported_audio_backends' \
+         in GET /system/config."
+    )
+}
+
+/// Le message rendu à qui règle un backend que CETTE machine ne sait pas
+/// ouvrir : ce qui aurait eu lieu, et la liste des valeurs acceptées ici.
+///
+/// #1268 — le serveur publie la liste vraie depuis #2806, mais le sélecteur du
+/// client web écrit toujours ses trois choix en dur (Auto/WASAPI/ASIO). Un
+/// testeur sous Debian ou Fedora peut donc encore demander WASAPI, et le
+/// serveur ne peut pas l'en empêcher depuis ici. Il peut en revanche refuser de
+/// RETENIR un réglage qu'il n'honorera jamais, et dire lesquels il honore.
+#[cfg(feature = "local-audio")]
+pub(super) fn refus_backend_non_supporte(demande: &str) -> String {
+    let acceptes: Vec<&str> = tune_core::outputs::local::supported_backends()
+        .iter()
+        .map(|b| b.value)
+        .collect();
+    let acceptes = acceptes.join(", ");
+    format!(
+        "'local_audio_backend' value '{demande}' is not available on this server's platform: the \
+         local output would silently fall back to the default host and the setting would be shown \
+         back as 'auto'. Accepted here: {acceptes} — the same list published as \
+         'supported_audio_backends' in GET /system/config."
+    )
+}
 pub(super) async fn get_config(
     headers: axum::http::HeaderMap,
     State(state): State<AppState>,
@@ -110,6 +248,17 @@ pub(super) async fn get_config(
     let all = settings.all().unwrap_or_default();
     let mut config = serde_json::Map::new();
     for (k, v) in all {
+        // Voir `BACKEND_ACTIF_PAS_UN_REGLAGE` : une ligne écrite sous ce nom
+        // n'est le réglage de personne, et la publier ici la ferait passer
+        // pour le réglage auprès du client qui lit ce nom en premier.
+        if k == BACKEND_ACTIF_PAS_UN_REGLAGE {
+            tracing::warn!(
+                cle = BACKEND_ACTIF_PAS_UN_REGLAGE,
+                valeur = %v,
+                "reglage_fantome_non_publie"
+            );
+            continue;
+        }
         if let Ok(parsed) = serde_json::from_str::<Value>(&v) {
             config.insert(k, parsed);
         } else {
@@ -156,11 +305,28 @@ pub(super) async fn get_config(
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),
         ("prefetch_mode", json!("30s")),
+        // Plafond de la lecture aléatoire (#2901) : combien de pistes
+        // « tout lire en aléatoire » enfile au maximum. Réglage audio
+        // comme les trois ci-dessus, même mécanisme (settings + PATCH),
+        // défaut 500 — la valeur que #2228 avait figée dans le code.
+        (
+            tune_core::playback::queue::SHUFFLE_MAX_TRACKS_KEY,
+            json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_DEFAULT),
+        ),
         // ReplayGain application at playback. Off by default: it multiplies
         // every sample, so it must be an explicit choice, never a surprise.
         ("replaygain_mode", json!("off")),
         ("replaygain_preamp_db", json!(0.0)),
         ("replaygain_prevent_clipping", json!(true)),
+        // Plafond dBTP de l'anti-écrêtage (#1694) : 0 (défaut, comportement
+        // historique), -0.5 ou -1. Persisté par PATCH /config comme les
+        // autres ; honoré dans `gain_factor` (tune-core).
+        ("replaygain_true_peak_ceiling_db", json!(0.0)),
+        // `replaygain_analysis_enabled` n'est PAS ici : il est publié plus bas
+        // avec le bloc `replaygain_source`, par un `insert` inconditionnel qui
+        // normalise en plus la valeur persistée (`"false"` → `false`). Une
+        // entrée `or_insert` ici serait morte — la contre-épreuve de #1627 l'a
+        // montrée : la retirer ne cassait aucun test.
         (
             "local_audio_backend",
             json!(state.config.local_audio_backend),
@@ -172,6 +338,117 @@ pub(super) async fn get_config(
     ];
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
+    }
+
+    // Le plafond de la lecture aléatoire, tel qu'il s'APPLIQUERA (#2901).
+    //
+    // `PATCH /config` persiste sans valider : `0`, `-1` ou `99999` peuvent
+    // se trouver en base. `shuffle_all` les ramène dans les bornes à la
+    // lecture ; l'affichage doit dire la MÊME chose, sinon l'utilisateur lit
+    // un chiffre que le serveur n'honore pas. Même repli propre que
+    // `local_audio_backend` juste en dessous : corrigé dans la RÉPONSE, pas
+    // en base — on ne réécrit pas le choix de l'utilisateur derrière son dos.
+    let plafond_effectif = tune_core::playback::queue::resolve_shuffle_max_tracks(
+        config
+            .get(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_KEY)
+            .map(|v| match v.as_str() {
+                Some(s) => s.to_string(),
+                None => v.to_string(),
+            })
+            .as_deref(),
+    );
+    config.insert(
+        tune_core::playback::queue::SHUFFLE_MAX_TRACKS_KEY.to_string(),
+        json!(plafond_effectif),
+    );
+    // Les bornes elles-mêmes ne sont pas un réglage : ce sont les valeurs
+    // que le contrôle doit respecter. On les publie pour que le client web
+    // n'ait pas à les écrire en dur, exactement comme `supported_audio_backends`
+    // plus bas (#1268) — le client avait codé ses trois backends à la main et
+    // les proposait sur des plateformes qui ne les avaient pas.
+    config.insert(
+        "shuffle_max_tracks_min".to_string(),
+        json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_FLOOR),
+    );
+    config.insert(
+        "shuffle_max_tracks_max".to_string(),
+        json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_CEILING),
+    );
+    // #1268 — le sélecteur « Backend audio » du client web écrivait ses trois
+    // choix en dur (Auto/WASAPI/ASIO) et les proposait tels quels sur Debian
+    // et Fedora. On publie ici la liste vraie, filtrée par la plateforme du
+    // serveur, pour que l'interface la lise au lieu de deviner.
+    //
+    // Repli propre : une valeur Windows persistée (bibliothèque migrée d'une
+    // machine Windows vers Linux) est ramenée à `auto` dans la RÉPONSE — pas
+    // en base : `select_host` joue déjà via le host par défaut pour toute
+    // valeur inconnue, l'affichage doit dire la même chose au lieu de laisser
+    // le sélecteur sur un choix qui n'existe plus.
+    #[cfg(feature = "local-audio")]
+    {
+        let persisted_supported = config
+            .get("local_audio_backend")
+            .and_then(|v| v.as_str())
+            .is_none_or(tune_core::outputs::local::backend_value_is_supported);
+        if !persisted_supported {
+            config.insert("local_audio_backend".to_string(), json!("auto"));
+        }
+        config.insert(
+            "supported_audio_backends".to_string(),
+            serde_json::to_value(tune_core::outputs::local::supported_backends())
+                .unwrap_or_else(|_| json!([])),
+        );
+        // #2868 — la CAPACITÉ, à côté du RÉGLAGE `local_exclusive_mode` publié
+        // plus haut. Même intention que `supported_audio_backends` (#1268) : le
+        // client n'a pas à déduire d'un nom de plateforme si la bascule « mode
+        // exclusif » a un sens, il le lit.
+        //
+        // Le prédicat lui-même était faux : il exigeait la feature `asio`,
+        // alors que la branche WASAPI exclusive est compilée sur TOUT Windows.
+        // Un Windows sans `asio` s'entendait donc répondre « non supporté »
+        // pour une capacité qu'il avait.
+        config.insert(
+            "local_exclusive_mode_supported".to_string(),
+            json!(tune_core::outputs::local::LocalOutput::supports_exclusive_mode()),
+        );
+        // #3192 — la CONTRAINTE, à côté du RÉGLAGE et de la CAPACITÉ. Même
+        // canal, même intention, troisième couche : le client n'a pas à
+        // déduire d'un nom de backend que la bascule ne sera pas honorée, il
+        // le lit.
+        //
+        // jfpaquet (Asus Essence STX II) perdait le son de toutes ses autres
+        // applications parce que Tune prenait le périphérique en exclusivité
+        // alors qu'il avait DÉCOCHÉ « mode exclusif ». La règle a raison —
+        // ASIO n'a pas de mode partagé — mais elle s'appliquait en silence, et
+        // aucune surface ne pouvait dire pourquoi la case ne servait à rien.
+        //
+        // On ne CORRIGE pas la règle (un pilote ASIO ouvert en partagé
+        // n'existe pas, le retirer ferait échouer l'ouverture — un défaut pire
+        // et silencieux lui aussi) : on la rend visible.
+        config.insert(
+            "local_exclusive_mode_status".to_string(),
+            serde_json::to_value(state.exclusive_mode_status()).unwrap_or(json!(null)),
+        );
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        config.insert("supported_audio_backends".to_string(), json!([]));
+        // Sans `local-audio`, il n'y a pas de sortie locale du tout — donc pas
+        // de mode exclusif. On le dit au lieu d'omettre la clé : une clé
+        // absente se lit « je ne sais pas », pas « non ».
+        config.insert("local_exclusive_mode_supported".to_string(), json!(false));
+        // Et donc aucune contrainte à annoncer : pas de sortie locale, pas de
+        // pilote à prendre en exclusivité. La clé est publiée quand même, pour
+        // la même raison que la ligne ci-dessus.
+        config.insert(
+            "local_exclusive_mode_status".to_string(),
+            serde_json::to_value(tune_core::config::exclusive_mode_status(
+                &state.effective_audio_backend(),
+                state.requested_exclusive_mode(),
+                false,
+            ))
+            .unwrap_or(json!(null)),
+        );
     }
     config
         .entry("server_version".to_string())
@@ -197,6 +474,52 @@ pub(super) async fn get_config(
         .and_then(|v| v.as_str().map(|s| s == "true").or_else(|| v.as_bool()))
         .unwrap_or(false);
     config.insert("dsd_lpcm_stream".to_string(), json!(dsd_lpcm_stream));
+    // Les TROIS modes ReplayGain de #1627 — « néant / tags du fichier /
+    // calcul » — publiés comme UN seul fait, en LECTURE.
+    //
+    // Rien de nouveau n'est persisté et aucune sémantique ne bouge : les deux
+    // axes existants (`replaygain_mode` × `replaygain_analysis_enabled`)
+    // restent la seule vérité, et restent les seuls écrivables. Ce bloc dit
+    // seulement lequel des trois modes en RÉSULTE, pour que l'interface cesse
+    // d'avoir à recomposer la règle de son côté — et de la recomposer faux :
+    // depuis #2496, « Désactivé » arrête aussi le balayage, ce qu'un client
+    // qui lisait les deux réglages séparément ne pouvait pas savoir.
+    //
+    // `analysis_enabled` = l'état de la bascule ; `analysis_effective` = ce qui
+    // se passe vraiment. Même distinction que `community_contribution`
+    // ci-dessous, et pour la même raison : promettre une analyse qui n'aura
+    // pas lieu est aussi trompeur que de la cacher.
+    let rg_source_mode = tune_core::audio::replaygain::active_source_mode(&state.backend);
+    let rg_analysis_effective = tune_core::audio::replaygain::analysis_enabled(&state.backend);
+    //
+    // `analysis_enabled` est publié ici et NULLE PART ailleurs : l'insertion
+    // est inconditionnelle, donc elle publie le défaut (`true`) sur une base
+    // fraîche ET normalise le `"false"` persisté en booléen. C'était le trou —
+    // la clé était simplement absente de la réponse, et le client devait
+    // deviner son défaut.
+    let rg_analysis_enabled = config
+        .get(tune_core::audio::replaygain::ANALYSIS_ENABLED_KEY)
+        .and_then(|v| v.as_str().map(|s| s != "false").or_else(|| v.as_bool()))
+        .unwrap_or(true);
+    config.insert(
+        tune_core::audio::replaygain::ANALYSIS_ENABLED_KEY.to_string(),
+        json!(rg_analysis_enabled),
+    );
+    config.insert(
+        "replaygain_source".to_string(),
+        json!({
+            "mode": rg_source_mode.as_str(),
+            "analysis_enabled": rg_analysis_enabled,
+            "analysis_effective": rg_analysis_effective,
+            // Les deux réglages qui COMPOSENT ce mode, nommés pour que le
+            // client sache quoi écrire au lieu de deviner les clés.
+            "setting_keys": [
+                tune_core::audio::replaygain::MODE_KEY,
+                tune_core::audio::replaygain::ANALYSIS_ENABLED_KEY,
+            ],
+            "label": crate::i18n::t(&lang, &format!("settings.replayGainSource.{}", rg_source_mode.as_str())),
+        }),
+    );
     // Consentement de contribution. Deux valeurs, et elles ne disent pas la
     // meme chose :
     //   - `enabled`   : le choix de l'utilisateur, relu sur la valeur BRUTE en
@@ -300,18 +623,18 @@ pub(super) async fn get_config(
     );
     config.insert("zone_limit".to_string(), zone_limit);
     config.insert("license_key_masked".to_string(), json!(license_key_masked));
-    // Redact secrets before returning. The verbatim settings dump above includes
-    // raw credentials that the web client never reads (it uses discogs_token_set,
-    // license_key_masked and the streaming status store). Never expose them.
-    config.remove("license_key");
-    config.remove("discogs_token");
-    if let Some(Value::Object(qobuz)) = config.get_mut("auth_tokens_qobuz") {
-        for k in ["stored_password", "user_auth_token", "app_secret"] {
-            if qobuz.contains_key(k) {
-                qobuz.insert(k.to_string(), json!("********"));
-            }
-        }
-    }
+    // Caviardage des secrets, EN DERNIER — après `discogs_token_set` et
+    // `license_key_masked`, qui se calculent sur les valeurs en clair.
+    //
+    // Cette route recopie la table `settings` telle quelle : tout ce qu'une
+    // fonctionnalité y écrit sort par ici. Il y avait à la place une liste de
+    // deux retraits et trois sous-champs Qobuz nommés à la main, et elle avait
+    // pris du retard sur ce que la table contient (#2793) — la graine Ed25519
+    // d'un appairage AirPlay (`airplay2_pairing:<id>`) et les clés `tunedev_`
+    // de l'API développeur (`developer_api_keys`) sortaient en clair. La règle
+    // vit désormais dans `tune_core::secrets`, qui classe sur le NOM et couvre
+    // donc aussi le réglage ajouté demain.
+    tune_core::secrets::caviarder_carte(&mut config);
     Json(Value::Object(config))
 }
 
@@ -373,12 +696,105 @@ fn volume_lock_confirmation_required(
     enables_volume_lock(body) && !already_enabled && !confirmed
 }
 
+/// Le champ qui porte les trois modes de #1627 dans un `PATCH /config`.
+///
+/// Même nom que le bloc publié par `GET /config` : ce qui se lit se réécrit.
+const REPLAYGAIN_SOURCE_FIELD: &str = "replaygain_source";
+
+/// Traduit `replaygain_source` en les deux réglages qui EXISTENT (#1627).
+///
+/// Avant : `GET /config` savait dire lequel des trois modes était actif, mais
+/// aucune route ne savait en POSER un. Le champ tombait dans la boucle
+/// d'écriture générique de [`update_config`], qui persiste n'importe quelle
+/// clé : `{"replaygain_source": "file_tags"}` créait une ligne morte
+/// `replaygain_source = file_tags` dans `settings`, ne changeait aucun des
+/// deux axes, et répondait `{"ok": true}`. Le client était renvoyé « c'est
+/// fait » sur un réglage qui n'avait pas bougé.
+///
+/// Après : le champ est retiré du corps et remplacé par les deux clés que tout
+/// le serveur lit déjà. Rien de nouveau n'est persisté, aucune migration,
+/// aucun chemin d'application du gain n'est touché.
+///
+/// `granularite_persistee` est l'axe piste/album tel qu'il est en base ; un
+/// `replaygain_mode` explicite dans le MÊME corps prime, ce qui permet de
+/// changer la source et la granularité d'un seul appel.
+fn expand_replaygain_source(
+    values: &mut serde_json::Map<String, Value>,
+    granularite_persistee: ReplayGainMode,
+) -> Result<Option<ReplayGainSourceMode>, AppError> {
+    let Some(brut) = values.remove(REPLAYGAIN_SOURCE_FIELD) else {
+        return Ok(None);
+    };
+    // Deux formes acceptées : la chaîne (`"file_tags"`), et l'OBJET que
+    // `GET /config` publie — un client qui relit la config puis la renvoie
+    // entière nous le repasse tel quel, et ce va-et-vient honnête ne doit pas
+    // finir en 400.
+    let demande = match &brut {
+        Value::String(s) => Some(s.as_str()),
+        Value::Object(o) => o.get("mode").and_then(|m| m.as_str()),
+        _ => None,
+    };
+    let Some(demande) = demande else {
+        return Err(AppError::bad_request(
+            "replaygain_source expects one of: off, file_tags, tags_then_analysis",
+        ));
+    };
+    // Aucun repli : un mode inconnu est refusé, jamais réinterprété. Le
+    // ReplayGain multiplie chaque échantillon — deviner y coûterait un niveau
+    // faux envoyé vers un ampli.
+    let Some(mode) = ReplayGainSourceMode::from_setting(demande) else {
+        return Err(AppError::bad_request(format!(
+            "unknown replaygain_source '{demande}': expected off, file_tags or tags_then_analysis"
+        )));
+    };
+    let granularite = values
+        .get(tune_core::audio::replaygain::MODE_KEY)
+        .and_then(|v| v.as_str())
+        .map(ReplayGainMode::from_setting)
+        .unwrap_or(granularite_persistee);
+    for (cle, valeur) in tune_core::audio::replaygain::source_mode_settings(mode, granularite) {
+        values.insert(cle.to_string(), Value::String(valeur.to_string()));
+    }
+    Ok(Some(mode))
+}
+
 pub(super) async fn update_config(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut values = body.0;
+    // #2265 — refuser d'inscrire le nom du backend ACTIF comme s'il était un
+    // réglage. Aucun repli, aucune réinterprétation vers `local_audio_backend` :
+    // les deux informations sont différentes, et deviner laquelle est demandée
+    // reviendrait à changer la sortie audio sur un malentendu de vocabulaire.
+    // Même discipline que `replaygain_source` plus bas — on refuse en disant
+    // quoi envoyer.
+    if values.contains_key(BACKEND_ACTIF_PAS_UN_REGLAGE) {
+        return Err(AppError::bad_request(refus_backend_actif()));
+    }
+    // #1268 — et la même discipline pour le RÉGLAGE lui-même : une valeur que
+    // la plateforme du serveur ne peut pas ouvrir n'est plus retenue.
+    //
+    // Elle l'était : la ligne s'installait en base, `select_host` ouvrait le
+    // host par défaut, et `GET /system/config` la ramenait à `auto` dans sa
+    // réponse — sans un mot. Le choix du testeur disparaissait donc en
+    // silence, ce qui est exactement ce que le ticket demandait de trancher
+    // (« refusé, ignoré, ou plus de son ? »). Il est désormais refusé, et le
+    // refus nomme les valeurs acceptables ICI.
+    //
+    // Rien n'est réécrit en base : une ligne héritée d'une machine Windows
+    // reste, et le diagnostic continue de la rapporter telle quelle (#1395).
+    #[cfg(feature = "local-audio")]
+    if let Some(demande) = values.get("local_audio_backend").and_then(|v| v.as_str())
+        && !demande.trim().is_empty()
+        && !tune_core::outputs::local::backend_value_is_supported(demande.trim())
+    {
+        tracing::warn!(demande = %demande, "reglage_backend_non_supporte_refuse");
+        return Err(AppError::bad_request(refus_backend_non_supporte(
+            demande.trim(),
+        )));
+    }
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
@@ -394,6 +810,14 @@ pub(super) async fn update_config(
             .into_response());
     }
 
+    // #1627 — le sélecteur à trois valeurs, traduit vers les deux axes AVANT
+    // la boucle générique. Sans ce passage, le champ serait persisté tel quel
+    // comme une ligne morte et le mode ne bougerait pas.
+    let source_appliquee = expand_replaygain_source(
+        &mut values,
+        tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend).mode,
+    )?;
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     for (key, value) in values {
         let str_val = if value.is_string() {
@@ -408,7 +832,13 @@ pub(super) async fn update_config(
             return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
         }
     }
-    Ok(Json(json!({"ok": true})).into_response())
+    let mut reponse = json!({"ok": true});
+    // Écho du mode réellement posé : le client n'a pas à relire `GET /config`
+    // pour savoir si sa demande a été comprise.
+    if let Some(mode) = source_appliquee {
+        reponse[REPLAYGAIN_SOURCE_FIELD] = json!(mode.as_str());
+    }
+    Ok(Json(reponse).into_response())
 }
 
 #[cfg(test)]
@@ -567,7 +997,17 @@ pub(super) struct ExportConfigQuery {
     include_secrets: bool,
 }
 
+/// `GET /system/config/export` — sauvegarde de la table `settings`.
+///
+/// **Réservée à l'administrateur** (#2793). Sans `RequireAdmin`, le
+/// middleware d'authentification se contentait de vérifier qu'un jeton était
+/// valide : n'importe quel compte, même sans rôle, obtenait le dump complet —
+/// et `?include_secrets=true` le lui rendait en clair, secret de signature JWT
+/// compris. `RequireAdmin` laisse passer sans condition quand l'authentification
+/// est désactivée (`auth.rs:502`), donc l'installation mono-utilisateur, qui est
+/// le cas courant, ne voit aucun changement.
 pub(super) async fn export_config(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Query(q): Query<ExportConfigQuery>,
 ) -> Json<Value> {
@@ -586,32 +1026,63 @@ pub(super) async fn export_config(
     // payload), so restoring a redacted backup to the SAME server leaves the
     // existing secrets untouched. Pass ?include_secrets=true for a full backup
     // when migrating to a fresh server.
+    //
+    // La liste de trois retraits nommés à la main a été remplacée par la même
+    // règle que `get_config` : c'était la seconde des « listes partielles » de
+    // #2793, et elle ne connaissait ni la graine AirPlay ni les clés
+    // développeur.
+    //
+    // On RETIRE, on ne masque pas — c'est la différence avec `get_config`, et
+    // elle est délibérée : une sauvegarde se ré-importe. Poser `********` à la
+    // place de `jwt_secret` écraserait le vrai secret de signature à la
+    // restauration ; l'absence de la clé, elle, est ce que `import_config` sait
+    // déjà ignorer.
     if !q.include_secrets {
-        config.remove("license_key");
-        config.remove("discogs_token");
-        config.remove("auth_tokens_qobuz");
+        tune_core::secrets::retirer_les_secrets(&mut config);
     }
     Json(Value::Object(config))
 }
 
+/// `POST /system/config/import` — restauration de réglages.
+///
+/// **Réservée à l'administrateur** (#2793) : la route appelait `settings.set`
+/// sur chaque clé reçue, donc un utilisateur standard pouvait poster
+/// `{"auth_enabled": "false"}` et éteindre l'authentification du serveur.
+///
+/// L'application est en DEUX TEMPS : tout le corps est validé et converti
+/// d'abord, et rien n'est écrit tant qu'une entrée est refusée. Avant, la
+/// validation vivait dans la boucle d'écriture, donc un corps dont la dixième
+/// entrée était invalide laissait les neuf premières appliquées.
+///
+/// Une écriture qui échoue en cours de route est désormais DITE (`500`) avec
+/// le nombre de clés déjà appliquées, au lieu d'être avalée par un
+/// `if ….is_ok()` qui rendait `200` et un compte silencieusement trop bas :
+/// l'appelant croyait sa restauration complète.
 pub(super) async fn import_config(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
+    let mut a_ecrire: Vec<(String, String)> = Vec::with_capacity(body.len());
+    for (key, value) in body {
+        if key.trim().is_empty() {
+            return Err(AppError::bad_request("empty setting key"));
+        }
+        let str_val = match value {
+            Value::String(s) => s,
+            other => other.to_string(),
+        };
+        a_ecrire.push((key, str_val));
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut imported = 0;
-    for (key, value) in body {
-        let str_val = if value.is_string() {
-            value
-                .as_str()
-                .ok_or_else(|| AppError::bad_request("expected string"))?
-                .to_string()
-        } else {
-            value.to_string()
-        };
-        if settings.set(&key, &str_val).is_ok() {
-            imported += 1;
-        }
+    for (key, str_val) in a_ecrire {
+        settings.set(&key, &str_val).map_err(|e| {
+            AppError::internal(format!(
+                "import stopped after {imported} settings: writing '{key}' failed: {e}"
+            ))
+        })?;
+        imported += 1;
     }
     Ok(Json(json!({ "imported": imported })))
 }
@@ -668,7 +1139,28 @@ pub(super) struct BrowseDirsQuery {
     path: Option<String>,
 }
 
-pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value> {
+/// Explorateur de dossiers servi par le serveur (#1275) — la moitié serveur du
+/// sélecteur de dossiers des réglages Bibliothèque.
+///
+/// C'est une route de LECTURE DU SYSTÈME DE FICHIERS de la machine serveur.
+/// Elle porte donc deux gardes, et pas une :
+///
+/// 1. **Le rôle.** `RequireAdmin`, comme la route d'écriture qu'elle alimente
+///    (`POST /system/music-dirs`). Elle en était dépourvue : n'importe quel
+///    porteur de jeton — y compris un compte créé par `/auth/register`, qui
+///    est public et ne crée que des non-administrateurs — pouvait énumérer le
+///    disque, alors que le geste qu'elle prépare, lui, exige admin.
+/// 2. **Le périmètre.** Le rôle ne suffit pas : sur une installation par
+///    défaut `auth_enabled` est absent, `RequireAdmin` laisse donc passer, et
+///    la route redevient anonyme sur le réseau local. Les arbres système sont
+///    refusés indépendamment de l'authentification — voir
+///    [`super::explorateur`] pour le périmètre retenu et sa justification.
+pub(super) async fn browse_dirs(
+    _admin: crate::auth::RequireAdmin,
+    Query(q): Query<BrowseDirsQuery>,
+) -> (StatusCode, Json<Value>) {
+    use super::explorateur;
+
     let base = q.path.unwrap_or_else(|| {
         if cfg!(target_os = "windows") {
             "C:\\".into()
@@ -677,10 +1169,38 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
         }
     });
 
+    if let Err(refus) = explorateur::verifier_le_chemin_demande(&base) {
+        tracing::warn!(path = %base, motif = ?refus, "browse_dirs_refuse");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "dirs": [], "parent": null, "current": base, "error": refus.libelle(),
+            })),
+        );
+    }
+
     let base_path = std::path::Path::new(&base);
     if !base_path.exists() || !base_path.is_dir() {
-        return Json(
-            json!({ "dirs": [], "parent": null, "current": base, "error": "not a directory" }),
+        // Un seul et même refus pour « n'existe pas » et « existe mais n'est
+        // pas un dossier » : les distinguer donnerait de quoi sonder la
+        // présence d'un fichier sans jamais le lire.
+        return (
+            StatusCode::OK,
+            Json(
+                json!({ "dirs": [], "parent": null, "current": base, "error": "not a directory" }),
+            ),
+        );
+    }
+    // Le texte du chemin est irréprochable ; sa CIBLE peut ne pas l'être — un
+    // lien symbolique posé dans une racine de bibliothèque suffit.
+    if !explorateur::la_cible_reste_dans_le_perimetre(base_path) {
+        tracing::warn!(path = %base, "browse_dirs_refuse_cible_hors_perimetre");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "dirs": [], "parent": null, "current": base,
+                "error": explorateur::Refus::ArbreSysteme.libelle(),
+            })),
         );
     }
 
@@ -701,7 +1221,10 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
                 }));
             }
         }
-        return Json(json!({ "dirs": dirs, "parent": null, "current": base }));
+        return (
+            StatusCode::OK,
+            Json(json!({ "dirs": dirs, "parent": null, "current": base })),
+        );
     }
 
     if let Ok(entries) = std::fs::read_dir(base_path) {
@@ -715,6 +1238,23 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
             if name.starts_with('.')
                 || name == "$RECYCLE.BIN"
                 || name == "System Volume Information"
+            {
+                continue;
+            }
+            // Les arbres système disparaissent aussi de la LISTE, pas seulement
+            // de la navigation : les énumérer les nomme, et nommer `/root` ou
+            // `C:\ProgramData` sur une machine de réseau local est déjà la
+            // moitié d'une reconnaissance. Le filtre passe avant le sondage
+            // `has_children`, qui sinon irait lire `/proc` et `/sys`.
+            let texte = path.to_string_lossy();
+            if explorateur::dans_un_arbre_systeme(&texte) {
+                continue;
+            }
+            // Un lien symbolique ne coûte une forme canonique que s'il en est
+            // un : la calculer pour chaque entrée d'une racine réseau serait
+            // payer un aller-retour par dossier.
+            if entry.file_type().is_ok_and(|t| t.is_symlink())
+                && !explorateur::la_cible_reste_dans_le_perimetre(&path)
             {
                 continue;
             }
@@ -737,11 +1277,14 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
             .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
     });
 
-    Json(json!({
-        "dirs": dirs,
-        "parent": parent,
-        "current": base_path.to_string_lossy(),
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "dirs": dirs,
+            "parent": parent,
+            "current": base_path.to_string_lossy(),
+        })),
+    )
 }
 
 #[derive(Deserialize)]
@@ -814,10 +1357,55 @@ pub(super) async fn add_music_dir(
     Ok(Json(json!({ "dirs": dirs })).into_response())
 }
 
+#[derive(Deserialize)]
+pub(super) struct RemoveMusicDir {
+    path: String,
+    /// Nombre de pistes que l'utilisateur accepte de perdre **avec** le
+    /// dossier.
+    ///
+    /// Absent — le cas de tout client existant, qui n'envoie que `path` — le
+    /// retrait ne supprime rien et se contente de dire ce qu'il laisse
+    /// derrière lui. Présent, c'est le geste que le fil réclamait : « retirer
+    /// un dossier des réglages devrait proposer de retirer aussi ce qu'il
+    /// contenait », en un aller-retour au lieu de trois.
+    ///
+    /// Un NOMBRE et non un booléen, même contrat que `/scan?confirm_purge=N`
+    /// (#1943) et que `/music-dirs/purge-orphans` : une confirmation prise sur
+    /// un écran périmé ne peut pas autoriser une purge plus large que celle
+    /// qui a été montrée.
+    #[serde(default)]
+    confirm_purge: Option<u64>,
+}
+
+/// `POST /system/music-dirs/remove` — retirer une racine, et ce qu'elle
+/// emporte si on le demande.
+///
+/// # Le garde-fou, ici, n'est pas celui de `/purge-orphans`
+///
+/// `refus_de_purge` protège la route de rattrapage parce que celle-ci peut
+/// NOMMER n'importe quel chemin sans que l'utilisateur ait rien retiré : un
+/// montage tombé y est hors d'atteinte parce qu'il est, par définition,
+/// encore dans `music_dirs`.
+///
+/// Ce raisonnement ne se transpose pas ici : le retrait EST le signal
+/// utilisateur qui manquait à #2149, et il vient de s'exécuter. Ce qui
+/// protège cet appel, c'est autre chose, et c'est plus fort :
+///
+/// 1. l'ensemble supprimé est calculé par [`orphelines_parmi`] **contre les
+///    racines qui restent** — une racine imbriquée ou chevauchante ne peut pas
+///    perdre une piste, sans qu'aucun refus n'ait à l'intercepter ;
+/// 2. `confirm_purge` doit couvrir le nombre EXACT constaté, sinon le plafond
+///    de #1943 ([`super::scan::purge_refusee`]) refuse tout ;
+/// 3. le disque n'est jamais consulté — ni son état ni sa lisibilité n'entrent
+///    dans la décision, exactement comme sur `/purge-orphans`.
+///
+/// Le retrait lui-même réussit toujours : il rend 200 avec la nouvelle liste.
+/// Un refus de purge se lit dans le corps (`purge_refused`), jamais dans le
+/// code HTTP — sans quoi un client conclurait que le dossier est encore là.
 pub(super) async fn remove_music_dir(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
-    Json(body): Json<AddMusicDir>,
+    Json(body): Json<RemoveMusicDir>,
 ) -> Result<Json<Value>, AppError> {
     let normalized = tune_core::scanner::walker::normalize_path(&body.path);
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -837,21 +1425,107 @@ pub(super) async fn remove_music_dir(
         .set("music_dirs", &serde_json::to_string(&dirs)?)
         .ok();
 
-    // Le retrait ne supprime RIEN, et c'est délibéré (voir le module
-    // `purge_hors_perimetre` plus bas). Mais il DIT ce qu'il laisse derrière
-    // lui : sans ce compte, l'écran des réglages n'a aucun moyen de proposer
-    // le nettoyage, et les pistes entrent dans l'angle mort décrit en #2149.
-    let restantes = pistes_sous(&state, &normalized).len() as i64;
-    if restantes > 0 {
-        tracing::info!(
-            dossier = %normalized,
-            pistes = restantes,
-            "music_dir_removed_tracks_left_behind — ces pistes ne sont plus sous aucune racine \
-             configurée. Le scan ne les visitera plus et ne les purgera jamais (HorsPerimetre, \
-             #1943) : seul un appel explicite à /music-dirs/purge-orphans peut les retirer."
-        );
+    // Les pistes DEVENUES orphelines : sous le dossier retiré, et sous aucune
+    // des racines qui RESTENT. Le compte se mesurait auparavant sur le seul
+    // dossier retiré : retirer `/media/disque` alors que
+    // `/media/disque/Classique` reste configuré annonçait les pistes de
+    // `Classique` comme orphelines, puis `/purge-orphans` refusait en bloc
+    // (`ContientUneRacine`) — l'utilisateur restait devant un nombre qu'aucun
+    // geste ne pouvait honorer. C'est l'angle mort de #2149.
+    let orphelines = pistes_orphelines_sous(&state, &normalized, &dirs);
+    let plan = impact(&state, &orphelines);
+
+    // Sans confirmation : on DIT, on ne touche à rien. Comportement de tout
+    // client existant, inchangé.
+    let Some(confirmee) = body.confirm_purge else {
+        if plan.tracks > 0 {
+            tracing::info!(
+                dossier = %normalized,
+                pistes = plan.tracks,
+                "music_dir_removed_tracks_left_behind — ces pistes ne sont plus sous aucune \
+                 racine configurée. Le scan ne les visitera plus et ne les purgera jamais \
+                 (HorsPerimetre, #1943) : seul un geste explicite — ce même appel avec \
+                 confirm_purge=N, ou /music-dirs/purge-orphans — peut les retirer."
+            );
+        }
+        return Ok(Json(json!({
+            "dirs": dirs,
+            "orphan_tracks": plan.tracks,
+            "impact": impact_json(&plan),
+            "confirm_purge_required": plan.tracks,
+        })));
+    };
+
+    if orphelines.is_empty() {
+        return Ok(Json(json!({
+            "dirs": dirs,
+            "orphan_tracks": 0,
+            "purged": 0,
+            "purge_refused": false,
+            "impact": impact_json(&plan),
+        })));
     }
-    Ok(Json(json!({ "dirs": dirs, "orphan_tracks": restantes })))
+
+    // Le plafond de #1943 s'applique à ce geste comme aux autres, par la
+    // fonction de PRODUCTION et non par une copie.
+    let total_local = pistes_locales(&state).len();
+    if super::scan::purge_refusee(orphelines.len(), total_local, Some(confirmee)) {
+        tracing::error!(
+            dossier = %normalized,
+            candidats = orphelines.len(),
+            total_local,
+            confirmee,
+            "music_dir_removed_purge_refusee — la confirmation ne couvre pas l'ampleur \
+             constatée. Le dossier est retiré des réglages ; aucune piste n'a été supprimée."
+        );
+        return Ok(Json(json!({
+            "dirs": dirs,
+            "orphan_tracks": plan.tracks,
+            "purged": 0,
+            "purge_refused": true,
+            "purge_refused_reason": "confirmation_insuffisante",
+            "confirm_purge_required": plan.tracks,
+            "impact": impact_json(&plan),
+            "message": format!(
+                "Le dossier a bien été retiré des réglages. En revanche la confirmation \
+                 reçue ne couvre pas les {} pistes concernées : aucune n'a été supprimée. \
+                 Confirmez ce nombre exact pour les retirer aussi.",
+                plan.tracks
+            ),
+        })));
+    }
+
+    let r = executer_purge(&state, &orphelines);
+    tracing::warn!(
+        dossier = %normalized,
+        purgees = r.purgees,
+        albums_orphelins = r.albums_orphelins,
+        artistes_orphelins = r.artistes_orphelins,
+        favoris_rerattaches = r.favoris_rerattaches,
+        favoris_non_resolus = r.favoris_non_resolus,
+        masques_rerattaches = r.masques_rerattaches,
+        masques_non_resolus = r.masques_non_resolus,
+        paires_distinctes_rerattachees = r.paires_distinctes_rerattachees,
+        paires_distinctes_non_resolues = r.paires_distinctes_non_resolues,
+        "music_dir_removed_avec_purge — retrait du dossier et suppression de son contenu, \
+         explicitement confirmée par l'utilisateur (#2149)."
+    );
+
+    Ok(Json(json!({
+        "dirs": dirs,
+        "orphan_tracks": plan.tracks,
+        "purged": r.purgees,
+        "purge_refused": false,
+        "orphan_albums_removed": r.albums_orphelins,
+        "orphan_artists_removed": r.artistes_orphelins,
+        "favorites_relinked": r.favoris_rerattaches,
+        "favorites_unresolved": r.favoris_non_resolus,
+        "hidden_relinked": r.masques_rerattaches,
+        "hidden_unresolved": r.masques_non_resolus,
+        "distinct_pairs_relinked": r.paires_distinctes_rerattachees,
+        "distinct_pairs_unresolved": r.paires_distinctes_non_resolues,
+        "impact": impact_json(&plan),
+    })))
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -875,6 +1549,27 @@ pub(super) async fn remove_music_dir(
 // ABSENTE au scan et une racine RETIRÉE par l'utilisateur produisent le même
 // état en base et ne veulent pas dire la même chose. Ce qui manquait n'est pas
 // une permission de plus donnée au scan, c'est un SIGNAL utilisateur.
+//
+// ## Deux portes d'entrée, UNE suppression
+//
+// - `POST /music-dirs/remove` avec `confirm_purge=N` — le geste en une fois,
+//   pour qui retire un dossier maintenant ;
+// - `POST /music-dirs/purge-orphans` — le rattrapage, pour qui a retiré son
+//   ancien NAS il y a trois versions et ne peut plus le désigner par un
+//   retrait (le cas de Rhorn).
+//
+// Les deux calculent l'ensemble à supprimer par la même fonction
+// [`orphelines_parmi`] et l'exécutent par le même [`executer_purge`]. Un
+// second chemin de purge, c'était la garantie que l'un des deux oublierait les
+// albums vides, les favoris ou les marqueurs de masquage.
+//
+// `orphelines_parmi` intersecte toujours avec les racines qui RESTENT : une
+// racine imbriquée ou chevauchante ne peut pas perdre une piste **par
+// construction**, et pas seulement parce qu'un refus l'a interceptée. C'est ce
+// qui manquait au premier correctif : le compte rendu par `remove_music_dir`
+// se mesurait sur le seul dossier retiré, annonçait des pistes vivantes comme
+// orphelines, et le nettoyage promis se heurtait ensuite à
+// `RefusPurge::ContientUneRacine`.
 //
 // ## Le garde-fou, et pourquoi il est structurel
 //
@@ -1039,7 +1734,7 @@ fn pistes_locales(state: &AppState) -> Vec<(i64, String)> {
             "SELECT id, file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| {
             let id = r.first()?.as_i64()?;
@@ -1049,22 +1744,66 @@ fn pistes_locales(state: &AppState) -> Vec<(i64, String)> {
         .collect()
 }
 
-/// Pistes locales dont le chemin est sous `dossier`.
+/// Pistes qui vivent sous `dossier` **et sous aucune** des racines encore
+/// configurées.
 ///
-/// Le filtrage se fait en Rust, jamais en SQL : un `LIKE` sur un chemin
-/// Windows fait de l'antislash un caractère d'échappement côté PostgreSQL, et
-/// c'est déjà ce qui avait rendu des dossiers vides. `sous_le_dossier`
-/// accepte les deux séparateurs.
-fn pistes_sous(state: &AppState, dossier: &str) -> Vec<i64> {
+/// Fonction PURE : c'est elle qui décide ce qu'une purge emporte, et elle se
+/// vérifie sans base ni disque.
+///
+/// # Pourquoi l'intersection avec les racines restantes
+///
+/// « Sous le dossier retiré » ne veut pas dire « orpheline ».
+/// `music_dirs = ["/media/disque", "/media/disque/Classique"]` est un réglage
+/// courant — on indexe un disque entier, puis on ajoute un sous-dossier pour
+/// le traiter à part. Retirer `/media/disque` laisse `Classique` configuré :
+/// ses pistes sont vivantes. Sans cette intersection, elles étaient comptées
+/// comme orphelines par `remove_music_dir` (#2149), et l'utilisateur se
+/// voyait proposer un nettoyage que `refus_de_purge` refusait ensuite en bloc
+/// (`ContientUneRacine`) — l'angle mort entre les deux moitiés.
+///
+/// Une racine imbriquée ou chevauchante ne peut donc pas perdre une piste
+/// **par construction**, et pas seulement par un refus en amont.
+///
+/// # Pourquoi en Rust et pas en SQL
+///
+/// Un `LIKE` sur un chemin Windows fait de l'antislash un caractère
+/// d'échappement côté PostgreSQL, et c'est déjà ce qui avait rendu des
+/// dossiers vides (#1753, #2016). `sous_le_dossier` — l'unique
+/// implémentation, partagée avec `enrich_scope` (#1660) — accepte les deux
+/// séparateurs et refuse un simple préfixe de nom.
+pub(crate) fn orphelines_parmi(
+    pistes: &[(i64, String)],
+    dossier: &str,
+    racines_restantes: &[String],
+) -> Vec<i64> {
     let d = dossier.trim_end_matches(['/', '\\']);
     if d.is_empty() {
         return Vec::new();
     }
-    pistes_locales(state)
-        .into_iter()
+    let restantes: Vec<String> = racines_restantes
+        .iter()
+        .map(|r| tune_core::scanner::walker::normalize_path(r))
+        .filter(|r| !r.trim_end_matches(['/', '\\']).is_empty())
+        .collect();
+    pistes
+        .iter()
         .filter(|(_, p)| super::scan::sous_le_dossier(p, d))
-        .map(|(id, _)| id)
+        .filter(|(_, p)| {
+            !restantes
+                .iter()
+                .any(|r| super::scan::sous_le_dossier(p, r.trim_end_matches(['/', '\\'])))
+        })
+        .map(|(id, _)| *id)
         .collect()
+}
+
+/// [`orphelines_parmi`] appliquée à la base.
+fn pistes_orphelines_sous(
+    state: &AppState,
+    dossier: &str,
+    racines_restantes: &[String],
+) -> Vec<i64> {
+    orphelines_parmi(&pistes_locales(state), dossier, racines_restantes)
 }
 
 /// Compter les lignes d'une table liée qui référencent ces pistes.
@@ -1151,6 +1890,90 @@ fn impact(state: &AppState, ids: &[i64]) -> ImpactPurge {
             ids,
         ),
     }
+}
+
+/// Ce qu'une purge a emporté, et ce qu'elle a réparé.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ResultatPurge {
+    purgees: i64,
+    albums_orphelins: i64,
+    artistes_orphelins: i64,
+    favoris_rerattaches: i64,
+    favoris_non_resolus: i64,
+    masques_rerattaches: i64,
+    masques_non_resolus: i64,
+    paires_distinctes_rerattachees: i64,
+    paires_distinctes_non_resolues: i64,
+}
+
+/// **LE** chemin de purge — il n'en existe qu'un.
+///
+/// `POST /music-dirs/purge-orphans` (rattrapage d'un dossier retiré autrefois)
+/// et `POST /music-dirs/remove` avec `confirm_purge` (le geste en une fois)
+/// l'appellent tous les deux. Deux portes d'entrée, une seule suppression :
+/// écrire un second chemin, c'était garantir que l'un des deux oublierait les
+/// albums vides, les favoris ou les marqueurs de masquage.
+///
+/// L'appelant a déjà tranché *quoi* supprimer ([`orphelines_parmi`]) et *si*
+/// l'utilisateur l'a confirmé ([`super::scan::purge_refusee`]). Ici on
+/// exécute, et on répare les tables sans clé étrangère.
+fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+    let mut r = ResultatPurge::default();
+    for id in ids {
+        if track_repo.delete(*id).is_ok() {
+            r.purgees += 1;
+        }
+    }
+
+    // Les albums et artistes devenus vides partent avec elles — sans quoi la
+    // bibliothèque garde des albums à zéro piste, ce que #593 avait déjà
+    // montré à l'écran.
+    r.albums_orphelins = AlbumRepo::with_backend(state.backend.clone())
+        .delete_orphans()
+        .unwrap_or(0);
+    r.artistes_orphelins = ArtistRepo::with_backend(state.backend.clone())
+        .cleanup_orphans()
+        .unwrap_or(0);
+
+    // `favorites` n'a pas de clé étrangère : sans cette réconciliation, les
+    // cœurs pointeraient des ids morts. `false` = ne JAMAIS supprimer un
+    // favori qu'on n'a pas su re-rattacher.
+    let favoris = tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(
+        state.backend.clone(),
+    )
+    .run(false)
+    .unwrap_or_default();
+    r.favoris_rerattaches = favoris.relinked as i64;
+    r.favoris_non_resolus = favoris.unresolved as i64;
+
+    // Même absence de clé étrangère, même règle pour les albums masqués
+    // (#1391) : la purge fait mourir des `albums.id`, donc des marqueurs
+    // `hidden_items` deviennent orphelins. On les re-rattache par identité —
+    // c'est le cinquième ancrage de la réconciliation, après le démarrage,
+    // `scan.rs`, `auto_scan.rs` et la purge d'orphelines de fin de scan.
+    // `false` = on ne SUPPRIME jamais un marqueur ici : un album masqué que
+    // l'on ne retrouve pas peut revenir au prochain scan, et la liste de
+    // révision le montre entre-temps grâce à son instantané.
+    let masques = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+        .reconcile(false)
+        .unwrap_or_default();
+    r.masques_rerattaches = masques.relinked as i64;
+    r.masques_non_resolus = masques.unresolved as i64;
+
+    // Même absence de clé étrangère, même règle pour les paires « ces deux
+    // albums ne sont pas des doublons » (#1276) : la purge fait mourir des
+    // `albums.id`, donc des paires deviennent orphelines. `false` = on ne
+    // SUPPRIME jamais un arbitrage ici — le perdre laisserait
+    // `merge-duplicates` fusionner (et supprimer) au prochain passage.
+    let distinctes =
+        tune_core::db::album_distinct_repo::AlbumDistinctRepo::with_backend(state.backend.clone())
+            .reconcile(false)
+            .unwrap_or_default();
+    r.paires_distinctes_rerattachees = distinctes.relinked as i64;
+    r.paires_distinctes_non_resolues = distinctes.unresolved as i64;
+
+    r
 }
 
 fn impact_json(i: &ImpactPurge) -> Value {
@@ -1265,7 +2088,10 @@ pub(super) async fn purge_orphan_tracks(
             .into_response());
     }
 
-    let ids = pistes_sous(&state, &cible);
+    // `refus_de_purge` a déjà garanti qu'aucune racine configurée ne vit sous
+    // la cible : l'intersection est ici un no-op, et c'est voulu — une seule
+    // définition de « piste orpheline » pour les deux portes d'entrée.
+    let ids = pistes_orphelines_sous(&state, &cible, &racines);
     let plan = impact(&state, &ids);
     let total_local = pistes_locales(&state).len();
 
@@ -1325,50 +2151,33 @@ pub(super) async fn purge_orphan_tracks(
             .into_response());
     }
 
-    let track_repo = TrackRepo::with_backend(state.backend.clone());
-    let mut purgees = 0i64;
-    for id in &ids {
-        if track_repo.delete(*id).is_ok() {
-            purgees += 1;
-        }
-    }
-
-    // Les albums et artistes devenus vides partent avec elles — sans quoi la
-    // bibliothèque garde des albums à zéro piste, ce que #593 avait déjà
-    // montré à l'écran.
-    let albums_orphelins = AlbumRepo::with_backend(state.backend.clone())
-        .delete_orphans()
-        .unwrap_or(0);
-    let artistes_orphelins = ArtistRepo::with_backend(state.backend.clone())
-        .cleanup_orphans()
-        .unwrap_or(0);
-
-    // `favorites` n'a pas de clé étrangère : sans cette réconciliation, les
-    // cœurs pointeraient des ids morts. `false` = ne JAMAIS supprimer un
-    // favori qu'on n'a pas su re-rattacher.
-    let favoris = tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(
-        state.backend.clone(),
-    )
-    .run(false)
-    .unwrap_or_default();
+    let r = executer_purge(&state, &ids);
 
     tracing::warn!(
         cible = %cible,
-        purgees,
-        albums_orphelins,
-        artistes_orphelins,
-        favoris_rerattaches = favoris.relinked,
-        favoris_non_resolus = favoris.unresolved,
+        purgees = r.purgees,
+        albums_orphelins = r.albums_orphelins,
+        artistes_orphelins = r.artistes_orphelins,
+        favoris_rerattaches = r.favoris_rerattaches,
+        favoris_non_resolus = r.favoris_non_resolus,
+        masques_rerattaches = r.masques_rerattaches,
+        masques_non_resolus = r.masques_non_resolus,
+        paires_distinctes_rerattachees = r.paires_distinctes_rerattachees,
+        paires_distinctes_non_resolues = r.paires_distinctes_non_resolues,
         "purge_orphelines_effectuee — suppression explicitement confirmée par l'utilisateur."
     );
 
     Ok(Json(json!({
-        "purged": purgees,
+        "purged": r.purgees,
         "refused": false,
-        "orphan_albums_removed": albums_orphelins,
-        "orphan_artists_removed": artistes_orphelins,
-        "favorites_relinked": favoris.relinked,
-        "favorites_unresolved": favoris.unresolved,
+        "orphan_albums_removed": r.albums_orphelins,
+        "orphan_artists_removed": r.artistes_orphelins,
+        "favorites_relinked": r.favoris_rerattaches,
+        "favorites_unresolved": r.favoris_non_resolus,
+        "hidden_relinked": r.masques_rerattaches,
+        "hidden_unresolved": r.masques_non_resolus,
+        "distinct_pairs_relinked": r.paires_distinctes_rerattachees,
+        "distinct_pairs_unresolved": r.paires_distinctes_non_resolues,
         "impact": impact_json(&plan),
     }))
     .into_response())
@@ -1826,7 +2635,7 @@ pub(crate) fn resolve_server_name(configured: Option<&str>) -> String {
 /// (inutile sur Android, mais pratique partout ailleurs). L'IP est recalculée
 /// à chaque appel (elle change en cas de bascule filaire↔WiFi) ; le hostname
 /// est mis en cache.
-pub(super) fn server_urls(port: u16) -> Vec<String> {
+pub(crate) fn server_urls(port: u16) -> Vec<String> {
     let mut urls = Vec::new();
     if let Ok(ip) = std::env::var("TUNE_ADVERTISE_IP") {
         if !ip.is_empty() {
@@ -1858,7 +2667,10 @@ pub(super) fn server_urls(port: u16) -> Vec<String> {
 
 #[cfg(test)]
 mod purge_hors_perimetre_tests {
-    use super::{AddMusicDir, PurgeOrphans, RefusPurge, refus_de_purge, regrouper_hors_perimetre};
+    use super::{
+        PurgeOrphans, RefusPurge, RemoveMusicDir, orphelines_parmi, refus_de_purge,
+        regrouper_hors_perimetre,
+    };
     use crate::auth::RequireAdmin;
     use crate::state::AppState;
     use axum::Json;
@@ -1917,16 +2729,34 @@ mod purge_hors_perimetre_tests {
     }
 
     async fn retirer(state: &AppState, chemin: &str) -> serde_json::Value {
+        retirer_avec(state, chemin, None).await
+    }
+
+    async fn retirer_avec(
+        state: &AppState,
+        chemin: &str,
+        confirm: Option<u64>,
+    ) -> serde_json::Value {
         super::remove_music_dir(
             RequireAdmin,
             State(state.clone()),
-            Json(AddMusicDir {
+            Json(RemoveMusicDir {
                 path: chemin.to_string(),
+                confirm_purge: confirm,
             }),
         )
         .await
         .unwrap_or_else(|_| panic!("remove_music_dir a échoué"))
         .0
+    }
+
+    fn albums(state: &AppState) -> i64 {
+        state
+            .backend
+            .query_one("SELECT COUNT(*) FROM albums", &[])
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap()
     }
 
     async fn purger(
@@ -2331,5 +3161,572 @@ mod purge_hors_perimetre_tests {
         assert_eq!(g.len(), 1, "{r}");
         assert_eq!(g[0]["path"].as_str(), Some(n("/vieux_nas").as_str()), "{r}");
         assert_eq!(g[0]["tracks"].as_i64(), Some(4), "{r}");
+    }
+
+    // ── Racines imbriquées : l'angle mort restant de #2149 ───────────────
+
+    /// Retirer une racine PARENTE ne rend pas orpheline la piste d'une racine
+    /// imbriquée encore configurée.
+    ///
+    /// `music_dirs = ["/media/disque", "/media/disque/Classique"]` est un
+    /// réglage courant : on indexe un disque entier, puis on ajoute un
+    /// sous-dossier pour le traiter à part. Le jour où l'on retire le disque
+    /// des réglages, `Classique` reste configuré — ses pistes sont vivantes.
+    ///
+    /// Le compte annoncé se mesurait sur le seul dossier retiré, sans
+    /// intersecter les racines RESTANTES : il comptait les pistes de
+    /// `Classique` comme orphelines, puis `/purge-orphans` refusait en bloc
+    /// (`ContientUneRacine`). L'utilisateur restait devant un nombre qu'aucun
+    /// geste ne pouvait honorer.
+    #[tokio::test]
+    async fn retirer_une_racine_parente_ne_compte_pas_la_racine_imbriquee() {
+        let state = etat();
+        racines(&state, &["/media/disque", "/media/disque/Classique"]);
+        piste(&state, "/media/disque/Pop/01.flac");
+        piste(&state, "/media/disque/Classique/Bach/01.flac");
+
+        let rep = retirer(&state, "/media/disque").await;
+        assert_eq!(
+            rep["orphan_tracks"].as_i64(),
+            Some(1),
+            "seule la piste hors de la racine restante est orpheline : {rep}"
+        );
+        assert_eq!(compte(&state), 2, "le retrait seul ne supprime rien");
+    }
+
+    /// **Le cœur du danger.** La purge en un geste ne peut pas prendre une
+    /// piste qui appartient à une AUTRE racine — imbriquée, chevauchante ou
+    /// simplement voisine. Ce n'est pas un refus en amont : l'ensemble
+    /// supprimé est calculé contre les racines restantes, donc la piste
+    /// vivante n'est jamais candidate.
+    #[tokio::test]
+    async fn la_purge_du_parent_epargne_la_racine_imbriquee() {
+        let state = etat();
+        racines(
+            &state,
+            &["/media/disque", "/media/disque/Classique", "/nas2/Musique"],
+        );
+        let morte = piste(&state, "/media/disque/Pop/01.flac");
+        let imbriquee = piste(&state, "/media/disque/Classique/Bach/01.flac");
+        let voisine = piste(&state, "/nas2/Musique/Jazz/01.flac");
+
+        let rep = retirer_avec(&state, "/media/disque", Some(1)).await;
+        assert_eq!(rep["purged"].as_i64(), Some(1), "{rep}");
+        assert_eq!(rep["purge_refused"].as_bool(), Some(false), "{rep}");
+        assert!(!existe(&state, morte), "la piste devenue orpheline reste");
+        assert!(
+            existe(&state, imbriquee),
+            "la piste de la racine IMBRIQUÉE encore configurée a été détruite : {rep}"
+        );
+        assert!(
+            existe(&state, voisine),
+            "la piste d'une autre racine a été détruite"
+        );
+
+        // Et la racine imbriquée reste configurée : on n'a retiré qu'elle.
+        let dirs: Vec<String> = rep["dirs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(dirs, vec![n("/media/disque/Classique"), n("/nas2/Musique")]);
+    }
+
+    /// Le chevauchement dans l'autre sens : retirer la racine ENFANT alors que
+    /// la parente reste configurée ne rend rien orphelin — les pistes sont
+    /// toujours dans le périmètre, elles y restent.
+    #[tokio::test]
+    async fn retirer_une_racine_couverte_par_sa_parente_ne_rend_rien_orphelin() {
+        let state = etat();
+        racines(&state, &["/media/disque", "/media/disque/Classique"]);
+        let sous_les_deux = piste(&state, "/media/disque/Classique/Bach/01.flac");
+
+        let rep = retirer_avec(&state, "/media/disque/Classique", Some(1)).await;
+        assert_eq!(rep["orphan_tracks"].as_i64(), Some(0), "{rep}");
+        assert_eq!(rep["purged"].as_i64(), Some(0), "{rep}");
+        assert!(existe(&state, sous_les_deux), "{rep}");
+    }
+
+    /// La fonction qui décide, prise seule : pas de base, pas de disque.
+    /// Les deux séparateurs, et un préfixe de nom qui n'est pas un dossier.
+    #[test]
+    fn orphelines_parmi_epargne_les_racines_restantes() {
+        let pistes: Vec<(i64, String)> = [
+            (1, n("/media/disque/Pop/01.flac")),
+            (2, n("/media/disque/Classique/Bach/01.flac")),
+            (3, n("/media/disque2/Autre/01.flac")),
+            (4, n("/ailleurs/01.flac")),
+        ]
+        .into_iter()
+        .collect();
+
+        // `/media/disque2` n'est PAS sous `/media/disque` : préfixe de nom.
+        let ids = orphelines_parmi(
+            &pistes,
+            &n("/media/disque"),
+            &[n("/media/disque/Classique")],
+        );
+        assert_eq!(ids, vec![1], "attendu la seule piste devenue orpheline");
+
+        // Sans racine restante, tout ce qui est sous la cible est orphelin.
+        let ids = orphelines_parmi(&pistes, &n("/media/disque"), &[]);
+        assert_eq!(ids, vec![1, 2]);
+
+        // Une cible vide ne purge JAMAIS « tout ».
+        assert!(orphelines_parmi(&pistes, "", &[]).is_empty());
+        assert!(orphelines_parmi(&pistes, "/", &[]).is_empty());
+
+        // Une racine restante vide ne doit pas neutraliser le filtre.
+        let ids = orphelines_parmi(&pistes, &n("/ailleurs"), &["".into(), "/".into()]);
+        assert_eq!(ids, vec![4]);
+    }
+
+    // ── Le geste en une fois ────────────────────────────────────────────
+
+    /// La promesse du fil : « retirer un dossier des réglages devrait proposer
+    /// de retirer aussi ce qu'il contenait ». Un aller-retour pour le plan,
+    /// un second pour l'exécution — et les albums et artistes vidés partent
+    /// avec les pistes, par LE chemin de purge, pas par un second.
+    #[tokio::test]
+    async fn le_retrait_confirme_emporte_pistes_albums_et_artistes() {
+        let state = etat();
+        racines(&state, &["/vieux_nas/Musique", "/nas2/Musique"]);
+        let bd = &state.backend;
+        bd.execute("INSERT INTO artists (name) VALUES ('Bach')", &[])
+            .unwrap();
+        let bach = bd.last_insert_rowid();
+        bd.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES ('Toccata', ?, 1)",
+            &[&bach as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let album = bd.last_insert_rowid();
+        let repo = TrackRepo::with_backend(bd.clone());
+        let mut t = Track::new("01".into());
+        t.file_path = Some(n("/vieux_nas/Musique/Bach/01.flac"));
+        t.album_id = Some(album);
+        t.artist_id = Some(bach);
+        let morte = repo.create(&t).unwrap();
+        let gardee = piste(&state, "/nas2/Musique/vivante.flac");
+
+        // 1er appel : le plan, rien n'est touché.
+        let plan = retirer(&state, "/vieux_nas/Musique").await;
+        assert_eq!(plan["orphan_tracks"].as_i64(), Some(1), "{plan}");
+        assert_eq!(plan["confirm_purge_required"].as_i64(), Some(1), "{plan}");
+        assert_eq!(plan["impact"]["tracks"].as_i64(), Some(1), "{plan}");
+        assert!(existe(&state, morte), "un essai à blanc a supprimé");
+        assert_eq!(albums(&state), 1);
+
+        // 2e appel : confirmé. (Le dossier est déjà hors des réglages.)
+        let rep = retirer_avec(&state, "/vieux_nas/Musique", Some(1)).await;
+        assert_eq!(rep["purged"].as_i64(), Some(1), "{rep}");
+        assert_eq!(rep["orphan_albums_removed"].as_i64(), Some(1), "{rep}");
+        assert_eq!(rep["orphan_artists_removed"].as_i64(), Some(1), "{rep}");
+        assert!(!existe(&state, morte), "{rep}");
+        assert!(existe(&state, gardee), "{rep}");
+        assert_eq!(albums(&state), 0, "l'album vidé devait partir : {rep}");
+    }
+
+    /// Un client qui n'envoie que `path` — c'est-à-dire TOUS ceux qui
+    /// existent aujourd'hui — ne perd jamais rien. La purge est un opt-in.
+    #[tokio::test]
+    async fn un_client_qui_n_envoie_que_le_chemin_ne_perd_rien() {
+        let state = etat();
+        racines(&state, &["/vieux_nas", "/nas2"]);
+        for i in 0..5 {
+            piste(&state, &format!("/vieux_nas/{i}.flac"));
+        }
+        let corps: RemoveMusicDir = serde_json::from_str(r#"{"path":"/vieux_nas"}"#).unwrap();
+        let rep = super::remove_music_dir(RequireAdmin, State(state.clone()), Json(corps))
+            .await
+            .unwrap_or_else(|_| panic!("remove_music_dir a échoué"))
+            .0;
+        assert_eq!(rep["orphan_tracks"].as_i64(), Some(5), "{rep}");
+        assert!(
+            rep["purged"].is_null(),
+            "aucune purge ne doit avoir eu lieu : {rep}"
+        );
+        assert_eq!(compte(&state), 5);
+    }
+
+    /// Le plafond de #1943 vaut aussi pour ce geste-ci. Et le RETRAIT, lui,
+    /// réussit quand même : le refus ne porte que sur la suppression, sans
+    /// quoi un client conclurait que le dossier est encore configuré.
+    #[tokio::test]
+    async fn le_plafond_1943_s_applique_au_retrait_confirme() {
+        let state = etat();
+        racines(&state, &["/nas1", "/vieux_nas"]);
+        for i in 0..60 {
+            piste(&state, &format!("/nas1/{i}.flac"));
+        }
+        for i in 0..40 {
+            piste(&state, &format!("/vieux_nas/{i}.flac"));
+        }
+
+        let rep = retirer_avec(&state, "/vieux_nas", Some(10)).await;
+        assert_eq!(rep["purge_refused"].as_bool(), Some(true), "{rep}");
+        assert_eq!(
+            rep["purge_refused_reason"].as_str(),
+            Some("confirmation_insuffisante"),
+            "{rep}"
+        );
+        assert_eq!(rep["confirm_purge_required"].as_i64(), Some(40), "{rep}");
+        assert_eq!(compte(&state), 100, "des pistes sont parties sur un refus");
+        assert_eq!(
+            rep["dirs"].as_array().map(Vec::len),
+            Some(1),
+            "le retrait du dossier, lui, doit avoir réussi : {rep}"
+        );
+    }
+
+    // ── Les marqueurs sans clé étrangère ────────────────────────────────
+
+    /// Un album MASQUÉ (#1391) dont les pistes sont purgées ne laisse pas un
+    /// marqueur pendant : la purge est le cinquième ancrage de la
+    /// réconciliation par identité. Chez Rhorn, l'album existe toujours sous
+    /// le nouveau NAS — le masquage doit le suivre, pas mourir avec l'ancien.
+    #[tokio::test]
+    async fn un_album_masque_suit_la_purge_de_ses_pistes() {
+        let state = etat();
+        racines(&state, &["/vieux_nas", "/nas2"]);
+        let bd = &state.backend;
+        bd.execute("INSERT INTO artists (name) VALUES ('Talvin Singh')", &[])
+            .unwrap();
+        let ar = bd.last_insert_rowid();
+        let album = |titre: &str| {
+            bd.execute(
+                "INSERT INTO albums (title, artist_id, track_count) VALUES (?, ?, 1)",
+                &[&titre as &dyn ToSqlValue, &ar as &dyn ToSqlValue],
+            )
+            .unwrap();
+            bd.last_insert_rowid()
+        };
+        let repo = TrackRepo::with_backend(bd.clone());
+        let pose = |chemin: &str, al: i64| {
+            let mut t = Track::new("OK 01".into());
+            t.file_path = Some(n(chemin));
+            t.album_id = Some(al);
+            t.artist_id = Some(ar);
+            repo.create(&t).unwrap()
+        };
+        // Le MÊME album, des deux côtés de la migration.
+        let ancien = album("OK");
+        pose("/vieux_nas/Talvin Singh/OK/01.flac", ancien);
+        let nouveau = album("OK");
+        pose("/nas2/Talvin Singh/OK/01.flac", nouveau);
+
+        let masques = tune_core::db::hidden_repo::HiddenRepo::with_backend(bd.clone());
+        assert!(masques.hide_album(ancien).unwrap());
+
+        let rep = retirer_avec(&state, "/vieux_nas", Some(1)).await;
+        assert_eq!(rep["purged"].as_i64(), Some(1), "{rep}");
+        assert_eq!(rep["hidden_relinked"].as_i64(), Some(1), "{rep}");
+        assert!(
+            masques.is_album_hidden(nouveau).unwrap(),
+            "le masquage devait suivre l'album vivant : {rep}"
+        );
+        assert!(!masques.is_album_hidden(ancien).unwrap(), "{rep}");
+        // Aucun marqueur pendant : la table ne référence que du vivant.
+        let restants = bd
+            .query_many(
+                "SELECT item_id FROM hidden_items WHERE item_id NOT IN (SELECT id FROM albums)",
+                &[],
+            )
+            .unwrap();
+        assert!(restants.is_empty(), "marqueur hidden_items orphelin laissé");
+    }
+}
+
+/// #1627 — les trois modes ReplayGain publiés comme UN fait, en lecture.
+///
+/// La demande d'origine (« 1- néant, 2- fichier, 3- calcul ») n'a jamais eu de
+/// réglage unique côté serveur, et n'en gagne pas ici : ce bloc DÉRIVE le mode
+/// des deux axes existants. Ce qu'il apporte, et que le client ne pouvait pas
+/// obtenir seul : le défaut de `replaygain_analysis_enabled` n'était publié
+/// nulle part, et la règle a changé (#2496 — « Désactivé » arrête aussi le
+/// balayage). Un client qui recomposait la règle de son côté présentait donc le
+/// mauvais mode comme actif sur toute base fraîche.
+#[cfg(test)]
+mod replaygain_source_tests {
+    use super::get_config;
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    async fn config_de(state: &AppState) -> serde_json::Value {
+        get_config(HeaderMap::new(), State(state.clone())).await.0
+    }
+
+    #[tokio::test]
+    async fn les_trois_modes_voyagent_dans_get_config() {
+        let state = etat();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+
+        // Base fraîche : rien n'est écrit, et pourtant le mode est dit.
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "off");
+        assert_eq!(c["replaygain_source"]["label"], "Désactivé");
+        // Le défaut de la coche est publié — c'était le trou : absent de la
+        // réponse, il obligeait le client à le deviner.
+        assert_eq!(c["replaygain_analysis_enabled"], true);
+        // ... mais rien ne tourne tant que le mode est « Désactivé » (#2496).
+        assert_eq!(c["replaygain_source"]["analysis_effective"], false);
+        assert_eq!(
+            c["replaygain_source"]["setting_keys"],
+            serde_json::json!(["replaygain_mode", "replaygain_analysis_enabled"]),
+            "le client doit savoir QUOI écrire : ce bloc est en lecture seule"
+        );
+
+        // 3- calcul.
+        settings.set("replaygain_mode", "track").unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
+        assert_eq!(c["replaygain_source"]["analysis_effective"], true);
+        assert_eq!(
+            c["replaygain_source"]["label"],
+            "Tags des fichiers, puis analyse"
+        );
+
+        // 2- fichier.
+        settings
+            .set("replaygain_analysis_enabled", "false")
+            .unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "file_tags");
+        assert_eq!(c["replaygain_analysis_enabled"], false);
+        assert_eq!(c["replaygain_source"]["analysis_effective"], false);
+        assert_eq!(c["replaygain_source"]["label"], "Tags des fichiers");
+
+        // Les deux axes restent intacts et publiés tels quels : ce bloc
+        // n'a rien remplacé.
+        assert_eq!(c["replaygain_mode"], "track");
+    }
+
+    /// Le libellé suit la langue de l'app (`Accept-Language`), comme le reste
+    /// des chaînes que l'API renvoie déjà.
+    #[tokio::test]
+    async fn le_libelle_du_mode_est_traduit() {
+        let state = etat();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("replaygain_mode", "album")
+            .unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("accept-language", "en-GB,en;q=0.9".parse().unwrap());
+
+        let c = get_config(h, State(state.clone())).await.0;
+        assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
+        assert_eq!(c["replaygain_source"]["label"], "File tags, then analysis");
+    }
+
+    // ---- l'autre moitié de #1627 : ÉCRIRE l'un des trois modes -------------
+
+    /// Rejoue EXACTEMENT ce que fait `update_config` : la traduction du champ
+    /// à trois valeurs, puis la boucle d'écriture générique, inchangée.
+    fn patch(state: &AppState, corps: serde_json::Value) -> Result<Option<String>, String> {
+        let mut values = corps.as_object().expect("objet JSON").clone();
+        let granularite =
+            tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend).mode;
+        let applique = super::expand_replaygain_source(&mut values, granularite)
+            .map_err(|_| "bad_request".to_string())?;
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (cle, valeur) in values {
+            let brut = match valeur.as_str() {
+                Some(s) => s.to_string(),
+                None => valeur.to_string(),
+            };
+            settings.set(&cle, &brut).unwrap();
+        }
+        Ok(applique.map(|m| m.as_str().to_string()))
+    }
+
+    /// AVANT : `{"replaygain_source": "..."}` tombait dans la boucle générique,
+    /// créait une ligne morte `replaygain_source` dans `settings`, ne touchait
+    /// NI `replaygain_mode` NI `replaygain_analysis_enabled` — et répondait
+    /// `{"ok": true}`. Le client croyait avoir posé un mode.
+    ///
+    /// APRÈS : le champ écrit les deux axes existants, et rien d'autre.
+    #[tokio::test]
+    async fn les_trois_modes_s_ecrivent_par_un_seul_champ() {
+        let state = etat();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        assert_eq!(config_de(&state).await["replaygain_source"]["mode"], "off");
+
+        // 3- calcul.
+        assert_eq!(
+            patch(
+                &state,
+                serde_json::json!({"replaygain_source": "tags_then_analysis"})
+            )
+            .unwrap(),
+            Some("tags_then_analysis".to_string()),
+            "la réponse doit dire le mode posé"
+        );
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
+        assert_eq!(
+            c["replaygain_mode"], "track",
+            "depuis « néant », la granularité par défaut est la piste — \
+             réécrire `off` ne changerait rien en répondant « ok »"
+        );
+        assert_eq!(c["replaygain_analysis_enabled"], true);
+        assert_eq!(c["replaygain_source"]["analysis_effective"], true);
+
+        // Aucune clé nouvelle en base : les deux axes restent la seule vérité.
+        assert_eq!(
+            settings.get("replaygain_source").unwrap(),
+            None,
+            "`replaygain_source` ne doit JAMAIS être persisté : c'est une vue"
+        );
+
+        // 2- fichier, en conservant la granularité que l'utilisateur avait.
+        patch(&state, serde_json::json!({"replaygain_mode": "album"})).unwrap();
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "file_tags"}),
+        )
+        .unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "file_tags");
+        assert_eq!(
+            c["replaygain_mode"], "album",
+            "changer de source ne doit pas reculer l'album vers la piste"
+        );
+        assert_eq!(c["replaygain_analysis_enabled"], false);
+
+        // 1- néant : le gain s'arrête, la coche d'analyse n'est pas écrasée.
+        settings.set("replaygain_analysis_enabled", "true").unwrap();
+        patch(&state, serde_json::json!({"replaygain_source": "off"})).unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "off");
+        assert_eq!(c["replaygain_mode"], "off");
+        assert_eq!(
+            c["replaygain_analysis_enabled"], true,
+            "« néant » ne touche qu'un seul des deux axes"
+        );
+        assert_eq!(c["replaygain_source"]["analysis_effective"], false);
+    }
+
+    /// Source ET granularité dans le même appel, et aller-retour du bloc que
+    /// `GET /config` publie : un client qui relit puis renvoie la config
+    /// entière ne doit pas se faire refuser.
+    #[tokio::test]
+    async fn la_granularite_du_meme_corps_prime_et_l_objet_relu_est_accepte() {
+        let state = etat();
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "file_tags", "replaygain_mode": "album"}),
+        )
+        .unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_mode"], "album");
+        assert_eq!(c["replaygain_source"]["mode"], "file_tags");
+
+        // Aller-retour : on renvoie tel quel le bloc publié.
+        let bloc = c["replaygain_source"].clone();
+        patch(&state, serde_json::json!({ "replaygain_source": bloc })).unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(
+            c["replaygain_source"]["mode"], "file_tags",
+            "relire puis renvoyer la config ne doit rien changer"
+        );
+        assert_eq!(c["replaygain_mode"], "album");
+    }
+
+    /// Un mode inconnu est REFUSÉ, et rien n'est écrit. Le ReplayGain
+    /// multiplie chaque échantillon : deviner y coûterait un niveau faux.
+    #[tokio::test]
+    async fn un_mode_inconnu_est_refuse_sans_rien_ecrire() {
+        let state = etat();
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "tags_then_analysis"}),
+        )
+        .unwrap();
+        let avant = config_de(&state).await;
+        assert_eq!(avant["replaygain_source"]["mode"], "tags_then_analysis");
+        assert_eq!(avant["replaygain_mode"], "track");
+
+        for mauvais in [
+            serde_json::json!("calcul"),
+            serde_json::json!("neant"),
+            serde_json::json!("track"),
+            serde_json::json!(true),
+            serde_json::json!(3),
+            serde_json::json!({"granularity": "track"}),
+        ] {
+            let r = patch(&state, serde_json::json!({ "replaygain_source": mauvais }));
+            assert!(
+                r.is_err(),
+                "cette valeur doit être refusée, pas interprétée"
+            );
+        }
+
+        // Rien n'a bougé, et aucune ligne morte n'a été créée.
+        let apres = config_de(&state).await;
+        assert_eq!(apres["replaygain_source"]["mode"], "tags_then_analysis");
+        assert_eq!(apres["replaygain_mode"], "track");
+        assert_eq!(
+            SettingsRepo::with_backend(state.backend.clone())
+                .get("replaygain_source")
+                .unwrap(),
+            None
+        );
+
+        // Espaces et casse restent tolérés — c'est bien une valeur VALIDE.
+        patch(&state, serde_json::json!({"replaygain_source": "  OFF "})).unwrap();
+        assert_eq!(config_de(&state).await["replaygain_mode"], "off");
+    }
+
+    /// TÉMOIN ANTI-RÉGRESSION — vert avant comme après.
+    ///
+    /// Ceux qui écoutent aujourd'hui pilotent le ReplayGain par les deux
+    /// réglages historiques. Un `PATCH` sans `replaygain_source` doit se
+    /// comporter EXACTEMENT comme avant : chaque axe écrit seul, aucun autre
+    /// touché, et le niveau appliqué inchangé.
+    #[tokio::test]
+    async fn temoin_un_patch_sans_le_nouveau_champ_ne_change_rien() {
+        let state = etat();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+
+        patch(&state, serde_json::json!({"replaygain_mode": "album"})).unwrap();
+        assert_eq!(
+            settings.get("replaygain_analysis_enabled").unwrap(),
+            None,
+            "écrire la granularité seule ne doit pas poser la coche d'analyse"
+        );
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_mode"], "album");
+
+        patch(
+            &state,
+            serde_json::json!({"replaygain_analysis_enabled": "false"}),
+        )
+        .unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(
+            c["replaygain_mode"], "album",
+            "écrire la coche seule ne doit pas toucher la granularité"
+        );
+        assert_eq!(c["replaygain_analysis_enabled"], false);
+
+        // Le niveau lui-même : préampli et anti-écrêtage voyagent intacts.
+        patch(
+            &state,
+            serde_json::json!({"replaygain_preamp_db": "-3.5", "replaygain_prevent_clipping": "false"}),
+        )
+        .unwrap();
+        let applique = tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend);
+        assert_eq!(
+            applique.mode,
+            tune_core::audio::replaygain::ReplayGainMode::Album
+        );
+        assert!((applique.preamp_db - (-3.5)).abs() < 1e-9);
+        assert!(!applique.prevent_clipping);
     }
 }

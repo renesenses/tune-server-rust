@@ -4,6 +4,7 @@ use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
+use tune_http_types::panne_sql::OuDefautJournalise;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::AppError;
@@ -36,18 +37,18 @@ pub(super) async fn browse_roots(
         .map(|d| {
             let norm = tune_core::scanner::walker::normalize_path(d);
             let norm_nfc: String = norm.nfc().collect();
-            let sep = std::path::MAIN_SEPARATOR;
-            // Trim any trailing separator so a library pointed at a drive/share
-            // root ("D:\" or "\\NAS\") doesn't produce a double separator in the
-            // LIKE pattern ("D:\\%") that matches nothing → "0 pistes".
-            let base = norm_nfc.trim_end_matches(|c| c == '/' || c == '\\');
-            let pattern = format!("{base}{sep}%");
+            // Un seul constructeur de motif pour tout le fichier : il replie en
+            // NFC (la forme dans laquelle le scanner écrit `file_path`) et rogne
+            // le séparateur final, sans quoi une bibliothèque pointée sur une
+            // racine de lecteur ou de partage (« D:\ », « \\NAS\ ») produit un
+            // séparateur doublé (« D:\\% ») qui ne correspond à rien → 0 piste.
+            let pattern = tune_core::db::track_repo::folder_like_pattern(&norm);
             let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
                 "$1"
             } else {
                 "?1"
             };
-            let esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine());
+            let esc = tune_core::db::track_repo::like_escape_clause();
             let count: i64 = match state.backend.query_one(
                 &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}{esc}"),
                 &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
@@ -119,7 +120,7 @@ pub(super) async fn browse_roots(
             } else {
                 "?1"
             };
-            let esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine());
+            let esc = tune_core::db::track_repo::like_escape_clause();
             let count: i64 = state
                 .backend
                 .query_one(
@@ -176,6 +177,21 @@ fn resolve_browse_path(raw: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// `fichier` est-il un enfant **direct** du répertoire `repertoire_nfc` ?
+///
+/// Le `LIKE` qui précède est récursif : il ramène aussi les pistes des
+/// sous-dossiers, et ce filtre les écarte. Les deux côtés sont repliés en NFC
+/// avant comparaison — `repertoire_nfc` vient du disque (donc potentiellement
+/// décomposé), `fichier` vient de `tracks.file_path` (composé par le scanner).
+/// Comparer deux formes différentes rendait `false` pour CHAQUE piste du
+/// dossier, et l'écran annonçait « aucune piste » sur un dossier scanné.
+fn est_enfant_direct(fichier: &str, repertoire_nfc: &str) -> bool {
+    std::path::Path::new(fichier)
+        .parent()
+        .and_then(|p| p.to_str())
+        .is_some_and(|parent| parent.nfc().collect::<String>() == repertoire_nfc)
 }
 
 pub(super) async fn browse_directory(
@@ -249,9 +265,7 @@ pub(super) async fn browse_directory(
                     if name.starts_with('.') {
                         continue;
                     }
-                    let sep = std::path::MAIN_SEPARATOR;
-                    let base = dir_path.trim_end_matches(|c| c == '/' || c == '\\');
-                    let pattern = format!("{base}{sep}%");
+                    let pattern = tune_core::db::track_repo::folder_like_pattern(&dir_path);
                     let track_count: i64 = match state.backend.query_one(
                         &format!(
                             "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}{}",
@@ -260,7 +274,7 @@ pub(super) async fn browse_directory(
                             } else {
                                 "?1"
                             },
-                            tune_core::db::track_repo::like_escape_clause(state.backend.engine())
+                            tune_core::db::track_repo::like_escape_clause()
                         ),
                         &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
                     ) {
@@ -294,11 +308,23 @@ pub(super) async fn browse_directory(
     });
 
     // List tracks in this directory (not recursive — only direct children)
-    let sep = std::path::MAIN_SEPARATOR;
-    let dir_prefix = format!(
-        "{}{sep}%",
-        normalized_query.trim_end_matches(|c| c == '/' || c == '\\')
-    );
+    //
+    // `normalized_query` est la forme qui EXISTE SUR LE DISQUE : `resolve_browse_path`
+    // essaie NFC puis NFD et rend la première que le système de fichiers ouvre.
+    // Sur un partage sensible à la forme — SMB Synology, volume venu de macOS —
+    // un dossier accentué n'existe qu'en NFD, et c'est donc du NFD qui ressort.
+    // La base, elle, ne contient que du NFC : le scanner replie chaque chemin
+    // avant de l'insérer. Les comparer tels quels ne rapproche pas un octet.
+    //
+    // Le correctif #1329 a réparé les deux premiers usages de ce chemin —
+    // l'ouverture du dossier et le contrôle d'appartenance aux dossiers
+    // musicaux — et a laissé les deux derniers nus : le motif `LIKE` ci-dessous
+    // et la comparaison `parent == …` du filtre `is_direct`. Résultat : le
+    // dossier s'ouvrait, ses SOUS-dossiers s'affichaient avec le bon compte
+    // (eux passent par `folder_like_pattern`, qui replie), et sa propre liste de
+    // pistes restait vide. Les deux points manquants sont repliés ici.
+    let repertoire_nfc: String = normalized_query.nfc().collect();
+    let dir_prefix = tune_core::db::track_repo::folder_like_pattern(&repertoire_nfc);
     let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
         "$1"
     } else {
@@ -312,7 +338,7 @@ pub(super) async fn browse_directory(
                LEFT JOIN artists ar ON t.artist_id = ar.id \
                WHERE t.file_path LIKE {ph}{esc} \
                ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
-        esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine())
+        esc = tune_core::db::track_repo::like_escape_clause()
     );
     let rows = state
         .backend
@@ -320,20 +346,14 @@ pub(super) async fn browse_directory(
             &sql,
             &[&dir_prefix as &dyn tune_core::db::backend::ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let tracks: Vec<Value> = rows
         .iter()
         .filter_map(|cols| {
             let file_path = cols.get(9).and_then(|v| v.as_string());
             let is_direct = file_path
                 .as_ref()
-                .map(|fp| {
-                    let parent = std::path::Path::new(fp)
-                        .parent()
-                        .and_then(|p| p.to_str())
-                        .unwrap_or("");
-                    parent == normalized_query
-                })
+                .map(|fp| est_enfant_direct(fp, &repertoire_nfc))
                 .unwrap_or(false);
             if !is_direct {
                 return None;
@@ -418,7 +438,7 @@ mod browse_path_tests {
     /// que le client renvoie la forme composée ou décomposée.
     #[test]
     fn an_accented_directory_resolves_from_either_normalization_form() {
-        let tmp = std::env::temp_dir().join(format!("tune-browse-{}", std::process::id()));
+        let tmp = tune_core::test_scratch::scratch_dir("tune-browse");
         let nfd_name: String = "CDThèque Yves".nfd().collect();
         let dir = tmp.join(&nfd_name);
         std::fs::create_dir_all(&dir).expect("création du dossier de test");
@@ -433,8 +453,80 @@ mod browse_path_tests {
                 "forme non résolue : {form:?}"
             );
         }
+    }
 
-        std::fs::remove_dir_all(&tmp).ok();
+    /// La suite du cas Yves, laissée nue par #1329 : le dossier s'ouvrait, mais
+    /// sa liste de pistes restait vide.
+    ///
+    /// Le disque ne porte que la forme **décomposée** ; le scanner, lui, a
+    /// écrit ses chemins en forme **composée**. `resolve_browse_path` rend donc
+    /// du NFD — la seule forme ouvrable — et tout ce qui est ensuite confronté à
+    /// la base doit être replié, sinon aucune ligne ne correspond.
+    ///
+    /// Les deux écritures sont construites ici, jamais tapées : un test qui
+    /// n'en porterait qu'une laisserait l'autre nue.
+    #[test]
+    fn les_pistes_d_un_dossier_decompose_sont_cherchees_en_forme_composee() {
+        let tmp = tune_core::test_scratch::scratch_dir("tune-browse-nfd-pistes");
+        // Chostakovitch dirigé par Bernstein : accent porté par le DOSSIER.
+        let nfd_nom: String = "Chostakovitch dirigé par Bernstein".nfd().collect();
+        let nfc_nom: String = "Chostakovitch dirigé par Bernstein".nfc().collect();
+        assert_ne!(
+            nfd_nom, nfc_nom,
+            "les deux écritures doivent différer octet à octet"
+        );
+        let dossier = tmp.join(&nfd_nom);
+        std::fs::create_dir_all(&dossier).expect("création du dossier de test");
+
+        // Ce que le client renvoie : la forme composée que Tune lui a servie.
+        let demande: String = dossier.to_string_lossy().nfc().collect();
+        let resolu = resolve_browse_path(&demande).expect("le dossier doit être atteignable");
+
+        // Ce que le scanner a écrit en base pour la piste de ce dossier.
+        let repertoire_nfc: String = resolu.nfc().collect();
+        let en_base = format!(
+            "{}{}01. Symphonie no 5.flac",
+            repertoire_nfc,
+            std::path::MAIN_SEPARATOR
+        );
+
+        // Le motif est construit à partir de la forme RENDUE PAR LE DISQUE —
+        // c'est ce que faisait le handler avant le correctif, et c'est ce que
+        // `folder_like_pattern` doit rattraper de lui-même.
+        let motif = tune_core::db::track_repo::folder_like_pattern(&resolu);
+        assert!(
+            en_base.starts_with(motif.trim_end_matches('%')),
+            "le motif LIKE {motif:?} ne couvre pas le chemin stocké {en_base:?}"
+        );
+        assert!(
+            super::est_enfant_direct(&en_base, &repertoire_nfc),
+            "la piste du dossier n'est pas reconnue comme enfant direct"
+        );
+
+        // Et le sens inverse : une ligne restée décomposée en base doit être
+        // reconnue elle aussi.
+        let en_base_nfd: String = en_base.nfd().collect();
+        assert!(
+            super::est_enfant_direct(&en_base_nfd, &repertoire_nfc),
+            "une ligne décomposée en base doit être reconnue"
+        );
+    }
+
+    /// Le motif `LIKE` est confronté à `tracks.file_path`, que le scanner écrit
+    /// en NFC : il doit sortir en NFC quelle que soit la forme reçue.
+    #[test]
+    fn le_motif_like_sort_toujours_en_forme_composee() {
+        let nfd: String = "/musique/Chostakovitch dirigé/".nfd().collect();
+        let nfc: String = "/musique/Chostakovitch dirigé".nfc().collect();
+        let attendu = format!("{nfc}{}%", std::path::MAIN_SEPARATOR);
+        assert_eq!(
+            tune_core::db::track_repo::folder_like_pattern(&nfd),
+            attendu
+        );
+        assert_eq!(
+            tune_core::db::track_repo::folder_like_pattern(&nfc),
+            attendu
+        );
     }
 
     #[test]

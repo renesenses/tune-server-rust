@@ -133,9 +133,16 @@ pub fn spawn(identite: IdentiteServeur) {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 // Un LMS déjà installé sur la machine tient peut-être ce port :
-                // le dire, plutôt qu'échouer en silence — le TCP, lui,
-                // fonctionne toujours.
-                warn!(port, error = %e, "slimproto_discovery_bind_failed — la découverte UDP des Squeezebox est désactivée ; les lecteurs devront recevoir l'adresse du serveur à la main");
+                // le dire, plutôt qu'échouer en silence.
+                //
+                // ⚠️ Ce message affirmait « le TCP, lui, fonctionne toujours ».
+                // Le terrain le contredit : cinq journaux de testeurs, deux
+                // systèmes, montrent le bind TCP 3483 qui échoue lui aussi, et
+                // deux d'entre eux le montrent tomber en MÊME TEMPS que l'UDP
+                // (#2938). Rassurer sur le TCP ici, c'est mentir juste au
+                // moment où le canal de lecture est mort. L'état réel du TCP se
+                // lit désormais dans `super::etat_ecoute()`.
+                warn!(port, error = %e, "slimproto_discovery_bind_failed — la découverte UDP des Squeezebox est désactivée ; les lecteurs devront recevoir l'adresse du serveur à la main. L'état du canal TCP est à vérifier séparément (/system/diagnostics/network, champ « slimproto »)");
                 return;
             }
         };

@@ -6,6 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -255,7 +256,7 @@ async fn auto_number_album(
             "SELECT id, path, title FROM tracks WHERE album_id = $1 ORDER BY path ASC",
             &[&album_id as &dyn ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
 
     let tracks: Vec<(i64, String, Option<String>)> = rows
         .into_iter()
@@ -332,7 +333,7 @@ async fn set_album_genre(
             "SELECT id, path FROM tracks WHERE album_id = $1",
             &[&album_id as &dyn ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let paths: Vec<(i64, String)> = rows
         .into_iter()
         .filter_map(|r| {
@@ -394,7 +395,7 @@ async fn set_album_year(
             "SELECT id, path FROM tracks WHERE album_id = $1",
             &[&album_id as &dyn ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let paths: Vec<(i64, String)> = rows
         .into_iter()
         .filter_map(|r| {

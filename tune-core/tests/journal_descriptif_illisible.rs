@@ -45,8 +45,15 @@ const PAGE_HTML: &str = "<!DOCTYPE html>\n<html lang=\"fr\">\n<head>\n\
 
 const NOM_DE_RESEAU: &str = "Livebox-4F2A";
 
+/// Page d'erreur d'un serveur web quelconque : du HTML, comme la précédente,
+/// mais rendu avec un statut 404. Sans le statut dans la trace, cette
+/// réponse-ci et celle du dessus sont indiscernables dans le journal, alors
+/// qu'elles ne s'expliquent pas du tout pareil (#2417).
+const PAGE_404: &str =
+    "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"></head>\n<body>404</body></html>\n";
+
 /// Un serveur web ordinaire à l'adresse annoncée : il rend `PAGE_HTML` sur
-/// `chemin`, et 404 partout ailleurs.
+/// `chemin`, et une page d'erreur 404 partout ailleurs.
 async fn serveur_web(chemin: &'static str) -> std::net::SocketAddr {
     // Port éphémère sur la boucle locale : pas d'IPv6, aucun chemin fixe, deux
     // exécutions concurrentes ne se disputent rien.
@@ -80,8 +87,10 @@ async fn serveur_web(chemin: &'static str) -> std::net::SocketAddr {
                         PAGE_HTML.len()
                     )
                 } else {
-                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_string()
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE_404}",
+                        PAGE_404.len()
+                    )
                 };
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.flush().await;
@@ -183,5 +192,52 @@ async fn le_journal_dit_l_adresse_le_genre_la_taille_et_borne_l_extrait() {
     assert!(
         ligne.contains("occurrences_tues=0"),
         "la première occurrence doit s'annoncer comme telle : {ligne}"
+    );
+
+    // ── Ce que `curl -i` montre, et que la trace taisait (#2417) ───────────
+    //
+    // Le journal de Jean Valjean donne la même adresse rendant un descriptif
+    // valide deux fois puis du HTML une fois, dans la même session. Sans le
+    // statut ni le type de contenu, on ne peut pas dire si la route a répondu
+    // 404 (elle n'existe pas à cette adresse) ou 200 avec autre chose (un
+    // repli d'itinéraire a servi à sa place) — deux causes distinctes, deux
+    // correctifs distincts.
+    assert!(
+        ligne.contains("statut=200"),
+        "la trace doit dire le code de statut : une page HTML rendue en 200 \
+         n'est pas une page d'erreur : {ligne}"
+    );
+    assert!(
+        ligne.contains("type_mime=text/html"),
+        "la trace doit dire le type de contenu annoncé : {ligne}"
+    );
+
+    // Contre-cas : MÊME genre de corps (une page HTML), MÊME serveur, mais un
+    // statut différent. C'est ce qui prouve que le champ rapporte la réponse
+    // réelle et n'est pas une constante.
+    let absente = format!("http://{addr}/upnp/description.xml");
+    let _ = fetch_device_description(&absente)
+        .await
+        .expect_err("une page d'erreur 404 ne peut pas produire un descriptif UPnP");
+
+    let texte = capture.texte();
+    let ligne_404 = texte
+        .lines()
+        .find(|l| l.contains("upnp_description_unreadable") && l.contains(&absente))
+        .unwrap_or_else(|| {
+            panic!("aucune trace pour l'adresse absente.\njournal capturé :\n{texte}")
+        });
+    assert!(
+        ligne_404.contains("statut=404"),
+        "un 404 doit se lire comme tel dans la trace, sinon il est \
+         indiscernable du 200 ci-dessus : {ligne_404}"
+    );
+    assert!(
+        ligne_404.contains("type_mime=text/html; charset=utf-8"),
+        "le type de contenu doit être recopié tel qu'annoncé : {ligne_404}"
+    );
+    assert!(
+        ligne_404.contains("page HTML"),
+        "le genre du corps reste dit, statut ou pas : {ligne_404}"
     );
 }

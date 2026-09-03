@@ -4,6 +4,7 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -129,6 +130,46 @@ pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoRes
 }
 
 // ---------------------------------------------------------------------------
+// Le fonds communautaire est indexé par MBID (#2258)
+// ---------------------------------------------------------------------------
+
+/// Ce que la clé du fonds communautaire de biographies écarte, dit à
+/// l'utilisateur (#2258).
+///
+/// `cloud::bio_sync::download_artist_bios` interroge mozaiklabs.fr par
+/// `?musicbrainz_ids=…` : **le fonds est indexé par MBID**. Les deux requêtes
+/// qui l'alimentent — envoi et candidats au téléchargement — exigent donc un
+/// MBID non vide, et un artiste qui n'en a pas est écarté des deux côtés.
+///
+/// Ce n'est pas un défaut de ces requêtes : c'est la conséquence d'un choix de
+/// clé, et la lever enverrait des identifiants vides à une API qui s'en sert
+/// d'index. Ce qui était un défaut, c'est que cette exclusion soit
+/// **totalement silencieuse** : le testeur voyait cent vingt fiches vides sans
+/// pouvoir distinguer une panne, une source avare et une clé qu'il ne possède
+/// pas.
+///
+/// Deux nombres, donc, et le nom de la clé qui les produit. Le remède est
+/// nommé lui aussi : `batch_match_artist_mbids` existe déjà et tourne dans
+/// `POST /system/enrich` comme dans `POST /system/enrichment/run` — il
+/// n'accepte un appariement par le nom qu'au-dessus d'un score MusicBrainz de
+/// 90 (`metadata::matcher::lookup_artist`), précisément parce qu'un mauvais
+/// MBID rattacherait une biographie étrangère.
+///
+/// ⚠ À ne pas confondre avec `bio_last_run.artists.sans_source`, qui compte
+/// les artistes que les sources LOCALES ne peuvent pas servir (ni MBID ni clé
+/// Last.fm). Poser une clé Last.fm remet celui-là à zéro et ne change rien à
+/// celui-ci.
+fn fonds_communautaire(artist_repo: &ArtistRepo) -> Value {
+    let hors = artist_repo.hors_fonds_communautaire().unwrap_or_default();
+    json!({
+        "cle": "musicbrainz_id",
+        "bios_non_partagees": hors.bios_non_partagees,
+        "artistes_non_servis": hors.artistes_non_servis,
+        "remede": "artist_mbid_matching",
+    })
+}
+
+// ---------------------------------------------------------------------------
 // POST /system/enrich-bios — bio enrichment
 // ---------------------------------------------------------------------------
 
@@ -149,6 +190,9 @@ pub(super) async fn enrich_bios(
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let without_artist_bio = artist_repo.list_without_bio().unwrap_or_default().len();
     let without_album_bio = album_repo.list_without_bio().unwrap_or_default().len();
+    // Le compte est pris AVANT que les passes soient lancées : il décrit la
+    // bibliothèque telle que l'utilisateur vient de la soumettre.
+    let hors_fonds = fonds_communautaire(&artist_repo);
 
     // One task registered for both bio passes; it clears when the last of the
     // two spawned futures drops its Arc clone of the guard.
@@ -178,6 +222,11 @@ pub(super) async fn enrich_bios(
             "artists_without_bio": without_artist_bio,
             "albums_without_bio": without_album_bio,
             "premium": is_premium,
+            // #2258 — une part de `artists_without_bio` ne peut RIEN attendre
+            // du fonds communautaire, faute de MBID. Le dire ici, dans la
+            // réponse même du bouton, plutôt que de laisser l'utilisateur
+            // conclure d'un écran vide.
+            "fonds_communautaire": hors_fonds,
         })),
     )
 }
@@ -201,7 +250,7 @@ pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> i
                 "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL AND source = 'local'",
                 &[],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first()?.as_i64()?;
@@ -271,7 +320,15 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
     let total_artists = artist_repo.count().unwrap_or(0);
     let total_albums = album_repo.count().unwrap_or(0);
 
-    // Artists with bios
+    // Artists with bios — par soustraction, ce chiffre ne vaut que ce que vaut
+    // la requête retranchée.
+    //
+    // `list_without_bio` exigeait un identifiant MusicBrainz non vide : tout
+    // artiste sans MBID sortait de `v` et se retrouvait donc compté ICI, du
+    // côté des artistes « pourvus d'une biographie ». Avec 0,9 % de couverture
+    // MBID mesurée sur une bibliothèque réelle, le panneau annonçait ~99 % de
+    // biographies devant des fiches vides (#1311). La requête ne filtre plus
+    // sur le MBID ; ce calcul devient exact sans changer de forme.
     let artists_with_bio = artist_repo
         .list_without_bio()
         .map(|v| total_artists - v.len() as i64)
@@ -324,6 +381,22 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
     // Last enrichment run timestamp
     let last_run = settings.get("enrichment_last_run").ok().flatten();
 
+    // Le bilan des deux passes de biographies (#1311).
+    //
+    // `bio_batch` rangeait déjà ces deux clés à la fin de chaque passe, et
+    // **personne ne les relisait** : une recherche de `artist_bio_enrich_result`
+    // dans tout le dépôt ne rendait que la ligne de l'écriture. Le serveur
+    // savait donc dire pourquoi une passe était rentrée à vide, et ne le disait
+    // à personne — c'est le vrai défaut derrière « les bios ne sont pas
+    // disponibles » : pas un décompte faux, une absence de retour.
+    //
+    // Les voici, sous une clé qui leur est propre pour ne rien déplacer de ce
+    // que `stats` promet déjà.
+    let bio_last_run = json!({
+        "artists": bilan_bio(&settings, "artist_bio_enrich_result"),
+        "albums": bilan_bio(&settings, "album_bio_enrich_result"),
+    });
+
     Json(json!({
         "premium": is_premium,
         "daily_used": daily_used,
@@ -339,7 +412,29 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
             "albums_with_bio": albums_with_bio,
         },
         "last_run": last_run,
+        "bio_last_run": bio_last_run,
+        // #2258 — la part de la bibliothèque que la clé du fonds
+        // communautaire écarte, des deux côtés. Sous une clé propre : ce n'est
+        // pas un décompte de bibliothèque comme ceux de `stats`, c'est la
+        // mesure d'une exclusion et le nom de sa cause.
+        "fonds_communautaire": fonds_communautaire(&artist_repo),
     }))
+}
+
+/// Le bilan de la dernière passe de biographies rangé sous `cle`, tel que
+/// `tune_core::metadata::bio_batch::bilan_de_passe` l'a écrit.
+///
+/// Rend `null` quand la clé est absente (aucune passe n'a encore tourné) ou
+/// quand sa valeur n'est pas du JSON lisible : un bilan illisible ne doit pas
+/// faire tomber tout le panneau d'enrichissement, qui porte aussi les
+/// décomptes de la bibliothèque.
+fn bilan_bio(settings: &SettingsRepo, cle: &str) -> Value {
+    settings
+        .get(cle)
+        .ok()
+        .flatten()
+        .and_then(|brut| serde_json::from_str::<Value>(&brut).ok())
+        .unwrap_or(Value::Null)
 }
 
 /// Helper to produce a JSON null for the daily_limit field on Premium.
@@ -387,53 +482,165 @@ fn now_utc_str() -> String {
 // POST /system/enrichment/run — trigger full enrichment run
 // ---------------------------------------------------------------------------
 
+/// Corps optionnel de `POST /system/enrichment/run`. Sans corps (ou sans
+/// `path`), la passe couvre toute la bibliothèque — contrat historique.
+#[derive(serde::Deserialize, Default)]
+pub(super) struct EnrichmentRunBody {
+    /// Répertoire (sous une racine musicale) auquel limiter la passe (#1660).
+    pub(super) path: Option<String>,
+}
+
+/// Résout et valide le `path` demandé : normalisation, refus de toute
+/// composante `..`, et appartenance à une racine musicale configurée — même
+/// garde que le scan ciblé, mais en REFUS franc plutôt qu'en repli silencieux :
+/// ici un repli enrichirait toute la bibliothèque, exactement ce que
+/// l'utilisateur demandait d'éviter (#1660).
+///
+/// `pub(crate)` : `/library/enrich-all` — la route que le bouton
+/// « Enrichir les métadonnées » de `SettingsView.svelte` appelle réellement —
+/// valide son `path` avec CETTE fonction, pas une copie.
+pub(crate) fn resoudre_portee(
+    state: &AppState,
+    path: &str,
+) -> Result<tune_core::metadata::enrich_scope::EnrichScope, (StatusCode, Json<Value>)> {
+    let dir = tune_core::scanner::walker::normalize_path(path);
+    if dir.is_empty() || dir.split(['/', '\\']).any(|c| c == "..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_path", "path": path })),
+        ));
+    }
+    let music_dirs: Vec<String> = super::get_music_dirs_list(&state.backend)
+        .iter()
+        .map(|d| tune_core::scanner::walker::normalize_path(d))
+        .filter(|d| !d.is_empty())
+        .collect();
+    if !music_dirs
+        .iter()
+        .any(|root| super::scan::sous_le_dossier(&dir, root))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "path_outside_music_dirs",
+                "path": dir,
+                "music_dirs": music_dirs,
+            })),
+        ));
+    }
+    Ok(tune_core::metadata::enrich_scope::EnrichScope::from_directory(&state.backend, &dir))
+}
+
+/// Attend que TOUTES les passes d'une exécution soient retombées, puis annonce
+/// la fin une fois et une seule.
+///
+/// Le nom de l'événement est un contrat INTER-DÉPÔTS : c'est le client qui
+/// écoutait `library.enrich.completed` en premier. Il passe donc par
+/// `EventType::EnrichComplete`, verrouillé par `as_str_matches_wire_contract`
+/// dans `tune-core/src/event_types.rs` — jamais par une chaîne libre.
+///
+/// Une passe qui panique ne retient PAS l'annonce : les autres ont travaillé,
+/// la bibliothèque a bougé, et l'écran doit relire ses compteurs de toute
+/// façon. C'est pourquoi le résultat du `await` est délibérément ignoré.
+async fn annoncer_fin_de_passe(
+    taches: Vec<tokio::task::JoinHandle<()>>,
+    event_bus: std::sync::Arc<tune_core::event_bus::EventBus>,
+    charge: Value,
+) {
+    for tache in taches {
+        if let Err(e) = tache.await {
+            tracing::warn!(error = %e, "enrichment_run_passe_interrompue");
+        }
+    }
+    event_bus.emit_typed(tune_core::event_types::EventType::EnrichComplete, charge);
+    tracing::info!("enrichment_run_completed_event_emitted");
+}
+
 pub(super) async fn enrichment_run(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Option<Json<EnrichmentRunBody>>,
 ) -> impl IntoResponse {
     let bio_lang = crate::i18n::lang_from_header(&headers);
+
+    // Portée par répertoire (#1660) — validée AVANT le gate de quota : un
+    // chemin invalide ne consomme rien.
+    let scope = match body
+        .and_then(|Json(b)| b.path)
+        .filter(|p| !p.trim().is_empty())
+    {
+        Some(p) => match resoudre_portee(&state, &p) {
+            Ok(s) => Some(s),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+
     let is_premium = match gate_enrichment(&state).await {
         Ok(p) => p,
         Err(resp) => return resp,
     };
 
-    // Record the run timestamp
+    // Record the run timestamp — passe COMPLÈTE seulement : une passe limitée
+    // à un répertoire ne doit pas faire dire au panneau Métadonnées que toute
+    // la bibliothèque vient d'être traitée.
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let now = now_utc_str();
-    settings.set("enrichment_last_run", &now).ok();
+    if scope.is_none() {
+        let now = now_utc_str();
+        settings.set("enrichment_last_run", &now).ok();
+    }
 
     // 1. Artwork enrichment
     let db1 = state.backend.clone();
     let cache_dir = crate::routes::library::artwork_cache_dir();
     let cache_dir2 = cache_dir.clone();
-    tokio::spawn(async move {
-        tune_core::library::artwork::batch_enrich_artwork(db1, cache_dir).await;
+    let scope1 = scope.clone();
+    let tache_pochettes = tokio::spawn(async move {
+        tune_core::library::artwork::batch_enrich_artwork_scoped(db1, cache_dir, scope1).await;
     });
 
     // 2. Artist MBID matching + artist artwork
     let mbid_db = state.backend.clone();
     let art_db = state.backend.clone();
     let art_cache = cache_dir2.clone();
-    tokio::spawn(async move {
+    let scope_mbid = scope.clone();
+    let scope_art = scope.clone();
+    let tache_artistes = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        tune_core::metadata::matcher::batch_match_artist_mbids(mbid_db).await;
+        tune_core::metadata::matcher::batch_match_artist_mbids_scoped(mbid_db, scope_mbid).await;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        tune_core::library::artwork::batch_enrich_artist_artwork(art_db, art_cache).await;
+        tune_core::library::artwork::batch_enrich_artist_artwork_scoped(
+            art_db, art_cache, scope_art,
+        )
+        .await;
     });
 
     // 3. Bio enrichment
     let bio_artist_db = state.backend.clone();
     let bio_album_db = state.backend.clone();
-    tokio::spawn(async move {
+    let scope_bio_artist = scope.clone();
+    let scope_bio_album = scope.clone();
+    let tache_bios = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-        tune_core::metadata::bio_batch::batch_enrich_artist_bios(bio_artist_db, &bio_lang).await;
+        tune_core::metadata::bio_batch::batch_enrich_artist_bios_scoped(
+            bio_artist_db,
+            &bio_lang,
+            scope_bio_artist,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        tune_core::metadata::bio_batch::batch_enrich_album_bios(bio_album_db, &bio_lang).await;
+        tune_core::metadata::bio_batch::batch_enrich_album_bios_scoped(
+            bio_album_db,
+            &bio_lang,
+            scope_bio_album,
+        )
+        .await;
     });
 
     // 4. Extended file metadata
     let ext_db = state.backend.clone();
-    tokio::spawn(async move {
+    let scope_ext = scope.clone();
+    let tache_metadonnees = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         let meta_repo =
             tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(ext_db.clone());
@@ -442,11 +649,19 @@ pub(super) async fn enrichment_run(
                 "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL AND source = 'local'",
                 &[],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first()?.as_i64()?;
                 let path = cols.get(1)?.as_string()?;
+                // Portée par répertoire (#1660) : les pistes hors du
+                // répertoire demandé ne sont pas candidates.
+                if scope_ext
+                    .as_ref()
+                    .is_some_and(|s| !s.contient_chemin(&path))
+                {
+                    return None;
+                }
                 Some((id, path))
             })
             .collect();
@@ -486,12 +701,45 @@ pub(super) async fn enrichment_run(
         tracing::info!(total, enriched, "enrichment_run_extended_metadata_complete");
     });
 
+    // 5. Point d'achèvement UNIQUE de la passe (#2259).
+    //
+    // Les quatre passes ci-dessus tournent en parallèle et ne rendent aucun
+    // compte : la route répondait 202 puis n'émettait plus rien, alors que le
+    // client écoute `library.enrich.completed` depuis la v0.8
+    // (`MetadataView.svelte`, `SettingsView.svelte`). #2543 a réparé l'AUTRE
+    // chemin d'enrichissement (`/library/enrich-all`) et a laissé celui-ci de
+    // côté, faute justement d'un instant « c'est fini » : deux tâches
+    // concurrentes, aucun point de jonction. Ce superviseur est ce point —
+    // une seule source de vérité, sur le modèle du rapport de fin de scan
+    // (#2827), plutôt qu'une émission par passe qui ferait clignoter l'écran
+    // quatre fois et annoncerait « terminé » trois fois trop tôt.
+    let bus_fin = state.event_bus.clone();
+    let repertoire = scope.as_ref().map(|s| s.dir.clone());
+    tokio::spawn(async move {
+        annoncer_fin_de_passe(
+            vec![
+                tache_pochettes,
+                tache_artistes,
+                tache_bios,
+                tache_metadonnees,
+            ],
+            bus_fin,
+            json!({ "directory": repertoire }),
+        )
+        .await;
+    });
+
     (
         StatusCode::ACCEPTED,
         Json(json!({
             "status": "enrichment_run_started",
             "premium": is_premium,
             "scope": if is_premium { "full_library" } else { "limited" },
+            // Portée par répertoire (#1660) — null quand la passe est complète.
+            "directory": scope.as_ref().map(|s| s.dir.clone()),
+            "directory_tracks": scope.as_ref().map(|s| s.track_count),
+            "directory_albums": scope.as_ref().map(|s| s.album_ids.len()),
+            "directory_artists": scope.as_ref().map(|s| s.artist_ids.len()),
         })),
     )
 }
@@ -544,7 +792,7 @@ fn merge_duplicate_albums(
     let dupe_rows = db.query_many(
         "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
         &[],
-    ).unwrap_or_default();
+    ).ou_defaut_journalise();
     let dupes: Vec<(String, String)> = dupe_rows
         .iter()
         .map(|r| {
@@ -607,7 +855,7 @@ fn cleanup_orphan_artwork(
          UNION SELECT image_path FROM artists WHERE image_path IS NOT NULL",
             &[],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &rows {
         if let Some(path) = r[0].as_string() {
@@ -635,4 +883,97 @@ fn cleanup_orphan_artwork(
         tracing::info!(deleted, "orphan_artwork_cleaned");
     }
     Ok(deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Le motif que ce correctif ferme : `/system/enrichment/run` lance quatre
+    /// passes en parallèle et le client attend `library.enrich.completed`.
+    /// L'annonce doit tomber APRÈS la dernière passe — une annonce anticipée
+    /// ferait relire des compteurs encore inchangés, c'est-à-dire exactement le
+    /// symptôme de #2259 sous une autre forme.
+    #[tokio::test]
+    async fn la_fin_de_passe_est_annoncee_apres_la_derniere_tache() {
+        let bus = Arc::new(tune_core::event_bus::EventBus::new());
+        let mut rx = bus.subscribe();
+        let faites = Arc::new(AtomicUsize::new(0));
+
+        // Des durées volontairement désordonnées : la plus longue n'est pas la
+        // dernière lancée, donc un `await` oublié se voit.
+        let taches = [40u64, 10, 60, 20]
+            .into_iter()
+            .map(|ms| {
+                let faites = faites.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    faites.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+
+        // Le compteur se relève À L'INSTANT de la réception, jamais après coup.
+        // Lu après le retour de la fonction il vaudrait 4 même si l'annonce
+        // était partie en premier : c'est exactement ce qu'a montré la
+        // contre-épreuve, où déplacer l'émission avant la jonction laissait le
+        // test au vert. Un guetteur concurrent est le seul montage qui date
+        // l'annonce par rapport aux passes.
+        let temoin = faites.clone();
+        let guetteur = tokio::spawn(async move {
+            let ev = rx
+                .recv()
+                .await
+                .expect("aucun evenement de fin de passe emis");
+            let a_l_annonce = temoin.load(Ordering::SeqCst);
+            let encore = rx.try_recv().is_ok();
+            (ev.event_type, a_l_annonce, encore)
+        });
+
+        annoncer_fin_de_passe(taches, bus.clone(), json!({ "directory": null })).await;
+
+        let (nom, faites_a_l_annonce, encore) = guetteur.await.unwrap();
+        assert_eq!(
+            nom, "library.enrich.completed",
+            "nom attendu par MetadataView.svelte et SettingsView.svelte"
+        );
+        assert_eq!(
+            faites_a_l_annonce, 4,
+            "annonce emise avant la fin des quatre passes"
+        );
+        assert!(!encore, "la fin de passe s'annonce une seule fois");
+    }
+
+    /// Une passe qui panique ne doit pas laisser l'écran figé pour toujours :
+    /// les autres ont travaillé, la bibliothèque a bougé.
+    #[tokio::test]
+    async fn une_passe_qui_panique_ne_retient_pas_l_annonce() {
+        let bus = Arc::new(tune_core::event_bus::EventBus::new());
+        let mut rx = bus.subscribe();
+
+        let taches = vec![
+            tokio::spawn(async { panic!("passe en echec") }),
+            tokio::spawn(async {}),
+        ];
+
+        annoncer_fin_de_passe(taches, bus.clone(), json!({ "directory": null })).await;
+
+        let ev = rx.try_recv().expect("une panique a supprime l'annonce");
+        assert_eq!(ev.event_type, "library.enrich.completed");
+    }
+
+    /// La portée par répertoire (#1660) voyage dans la charge : un client qui a
+    /// demandé un dossier doit pouvoir ne rafraîchir que lui.
+    #[tokio::test]
+    async fn la_portee_voyage_dans_la_charge() {
+        let bus = Arc::new(tune_core::event_bus::EventBus::new());
+        let mut rx = bus.subscribe();
+
+        annoncer_fin_de_passe(vec![], bus.clone(), json!({ "directory": "/music/Jazz" })).await;
+
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.data["directory"].as_str(), Some("/music/Jazz"));
+    }
 }

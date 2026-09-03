@@ -1,0 +1,317 @@
+name: Promote staged release
+
+run-name: Promote v${{ inputs.version }}${{ inputs.dry_run && ' (dry-run)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version sans le prefixe v
+        required: true
+        type: string
+      dry_run:
+        description: Verifier sans deplacer de canal public
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: release-promotion
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  promote:
+    name: Verify once, promote once
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.dry_run && 'release-dry-run' || 'release-promotion' }}
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: v${{ inputs.version }}
+      PLAN: .release/v${{ inputs.version }}.json
+      APPLY: ${{ !inputs.dry_run }}
+      CONTROLLER_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN }}
+      OS_TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Verifier le train staged et ses quatre tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::lancer depuis main"; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version invalide"; exit 1; }
+          [ -f "$PLAN" ] || { echo "::error::manifeste absent"; exit 1; }
+          jq -e --arg version "$VERSION" '.version == $version and .ready == true' "$PLAN" >/dev/null \
+            || { echo "::error::manifeste non pret"; exit 1; }
+          [ -n "$CONTROLLER_TOKEN" ] || { echo "::error::RELEASE_CONTROLLER_TOKEN absent"; exit 1; }
+          [ -n "$OS_TOKEN" ] || { echo "::error::TUNE_OS_DISPATCH_TOKEN absent"; exit 1; }
+
+          tag_target() {
+            local repo="$1" tag="$2" object type
+            object="$(GH_TOKEN="$CONTROLLER_TOKEN" gh api "repos/$repo/git/ref/tags/$tag" --jq .object.sha)"
+            type="$(GH_TOKEN="$CONTROLLER_TOKEN" gh api "repos/$repo/git/ref/tags/$tag" --jq .object.type)"
+            if [ "$type" = tag ]; then
+              GH_TOKEN="$CONTROLLER_TOKEN" gh api "repos/$repo/git/tags/$object" --jq .object.sha
+            else
+              printf '%s\n' "$object"
+            fi
+          }
+
+          while IFS=$'\t' read -r name repo sha tag; do
+            [ "$sha" != self ] || sha="$(git rev-list -n1 "$TAG")"
+            actual="$(tag_target "$repo" "$tag")"
+            [ "$actual" = "$sha" ] || { echo "::error::$name: $tag pointe sur $actual, attendu $sha"; exit 1; }
+          done < <(jq -r '.components | to_entries[] | [.key,.value.repository,.value.sha,.value.tag] | @tsv' "$PLAN")
+
+          git merge-base --is-ancestor "$TAG" origin/main \
+            || { echo "::error::$TAG n'est pas contenu dans main"; exit 1; }
+          git show "$TAG:$PLAN" > /tmp/tag-plan.json
+          cmp -s "$PLAN" /tmp/tag-plan.json \
+            || { echo "::error::le manifeste de main differe de celui du tag"; exit 1; }
+
+          DRAFT="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+          [ "$DRAFT" = true ] || { [ "$APPLY" = true ] && [ "$DRAFT" = false ]; } \
+            || { echo "::error::release serveur absente ou deja publique"; exit 1; }
+          ASSETS="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          for asset in \
+            "tune-server-$TAG-linux-x86_64.tar.gz" \
+            "tune-server-$TAG-linux-aarch64.tar.gz" \
+            "tune-server-$TAG-macos-x86_64.tar.gz" \
+            "tune-server-$TAG-macos-x86_64.dmg" \
+            "tune-server-$TAG-macos-aarch64.tar.gz" \
+            "tune-server-$TAG-macos-aarch64.dmg" \
+            "tune-server-$TAG-windows-x86_64.zip" \
+            "tune-server-$TAG-windows-x86_64-setup.exe" \
+            SHA256SUMS SHA256SUMS.minisig; do
+            grep -qx "$asset" <<<"$ASSETS" || { echo "::error::actif serveur absent: $asset"; exit 1; }
+          done
+
+          OS_TAG="$(jq -r .components.os.tag "$PLAN")"
+
+          # ⚠️ `GET /releases/tags/{tag}` rend 404 sur une release BROUILLON :
+          # un brouillon n'a pas de tag git, il n'est joignable que par la
+          # liste. Or c'est precisement un brouillon qu'on verifie ici — la
+          # promotion est justement le geste qui le publie. Ces deux appels ne
+          # pouvaient donc JAMAIS reussir. Mesure du 31/08/2026 sur
+          # tune-os-rpi-v0.9.129 : par tag -> 404, par la liste -> trouve,
+          # draft=true, 6 artefacts.
+          #
+          # Meme defaut, meme correctif que dans trigger-os-images.yml.
+          #
+          # `--paginate` avec `--jq` applique le filtre PAGE PAR PAGE : il faut
+          # agreger avec `jq -s 'add'`, sinon la seconde page ecrase la
+          # premiere par un tableau vide.
+          OS_RELEASES="$(GH_TOKEN="$OS_TOKEN" gh api --paginate \
+            "repos/renesenses/tune-os/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"$OS_TAG\") | {draft, assets: [.assets[].name]}]" \
+            | jq -s 'add // []')"
+          OS_COMBIEN="$(jq 'length' <<<"$OS_RELEASES")"
+
+          # Un homonyme de plus n'est pas arbitrable par une machine : `gh
+          # release upload` en choisit un au hasard, et on pourrait publier une
+          # release OS SANS IMAGE. On refuse, on ne devine pas.
+          if [ "$OS_COMBIEN" -ne 1 ]; then
+            echo "::error::$OS_COMBIEN releases portent le tag $OS_TAG chez tune-os, il en faut exactement une"
+            jq -r '.[] | "::error::  draft=\(.draft) assets=\(.assets | length)"' <<<"$OS_RELEASES"
+            exit 1
+          fi
+
+          OS_DRAFT="$(jq -r '.[0].draft' <<<"$OS_RELEASES")"
+          [ "$OS_DRAFT" = true ] || { [ "$APPLY" = true ] && [ "$OS_DRAFT" = false ]; } \
+            || { echo "::error::release OS absente ou deja publique"; exit 1; }
+          OS_ASSETS="$(jq -r '.[0].assets[]' <<<"$OS_RELEASES")"
+          grep -Eq 'x86_64.*\.iso$' <<<"$OS_ASSETS" || { echo "::error::ISO OS absente"; exit 1; }
+          grep -Eq 'x86_64-image.*\.raw\.xz$' <<<"$OS_ASSETS" || { echo "::error::image OS x86 absente"; exit 1; }
+          grep -Eq 'aarch64.*\.raw\.xz$' <<<"$OS_ASSETS" || { echo "::error::image OS ARM absente"; exit 1; }
+          [ "$(grep -Ec '\.sha256$' <<<"$OS_ASSETS")" -ge 3 ] || { echo "::error::checksums OS incomplets"; exit 1; }
+
+          docker buildx imagetools inspect "renesenses/tune:staging-$TAG" >/dev/null \
+            || { echo "::error::image Docker staged absente"; exit 1; }
+
+      - name: Telecharger les checksums avant publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$TAG" --pattern SHA256SUMS --output /tmp/SHA256SUMS --clobber
+
+      - uses: actions/checkout@v4
+        with:
+          repository: renesenses/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Preparer la formule Homebrew depuis les checksums staged
+        working-directory: homebrew-tap
+        shell: bash
+        run: |
+          set -euo pipefail
+          F=Formula/tune-server.rb
+          checksum() {
+            local asset="$1"
+            awk -v wanted="$asset" '{ name=$2; sub(/^.*\//, "", name); if (name == wanted) print $1 }' /tmp/SHA256SUMS
+          }
+          MAC_ARM="$(checksum "tune-server-$TAG-macos-aarch64.tar.gz")"
+          MAC_X86="$(checksum "tune-server-$TAG-macos-x86_64.tar.gz")"
+          LIN_ARM="$(checksum "tune-server-$TAG-linux-aarch64.tar.gz")"
+          LIN_X86="$(checksum "tune-server-$TAG-linux-x86_64.tar.gz")"
+          for sha in "$MAC_ARM" "$MAC_X86" "$LIN_ARM" "$LIN_X86"; do
+            [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::checksum Homebrew absent"; exit 1; }
+          done
+          awk -v version="$VERSION" -v mac_arm="$MAC_ARM" -v mac_x86="$MAC_X86" \
+              -v lin_arm="$LIN_ARM" -v lin_x86="$LIN_X86" '
+            /^  version "/ { sub(/"[^"]+"/, "\"" version "\"") }
+            /url "/ {
+              gsub(/v[0-9]+\.[0-9]+\.[0-9]+/, "v" version)
+              if ($0 ~ /macos-aarch64/) pending=mac_arm
+              else if ($0 ~ /macos-x86_64/) pending=mac_x86
+              else if ($0 ~ /linux-aarch64/) pending=lin_arm
+              else if ($0 ~ /linux-x86_64/) pending=lin_x86
+            }
+            /sha256 "/ && pending != "" { sub(/sha256 "[^"]+"/, "sha256 \"" pending "\""); pending="" }
+            { gsub(/Tune Server v[0-9]+\.[0-9]+\.[0-9]+/, "Tune Server v" version); print }
+          ' "$F" > "$F.new"
+          mv "$F.new" "$F"
+          grep -q "version \"$VERSION\"" "$F"
+          [ "$(grep -c "sha256 \"" "$F")" -eq 4 ]
+          git diff --check
+          git diff -- "$F" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Refuser une promotion non armee
+        if: ${{ !inputs.dry_run }}
+        run: |
+          [ "${{ vars.RELEASE_PROMOTION_ENABLED }}" = true ] || {
+            echo "::error::RELEASE_PROMOTION_ENABLED doit valoir true"
+            exit 1
+          }
+
+      - name: Promouvoir tous les canaux stables
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Aucune reconstruction : les deux tags publics recopient le digest
+          # exact construit sous staging-vX.Y.Z.
+          docker buildx imagetools create \
+            --tag "renesenses/tune:$TAG" --tag renesenses/tune:latest \
+            "renesenses/tune:staging-$TAG"
+
+          OS_TAG="$(jq -r .components.os.tag "$PLAN")"
+
+          # ⚠️ Meme piege que dans l'etape de verification, mais ici il etait
+          # SILENCIEUX — et c'etait le plus grave des deux.
+          #
+          # `GET /releases/tags/{tag}` rend 404 sur un BROUILLON, or c'est
+          # exactement ce qu'on s'apprete a publier. Et comme l'appel vivait
+          # dans la condition d'un `if`, `set -e` ne s'y appliquait pas : la
+          # substitution rendait une chaine vide, le test etait faux, la
+          # release OS n'etait JAMAIS publiee — et le workflow sortait en
+          # SUCCES. Verifie le 31/08/2026 :
+          #   if [ "$(gh_qui_404)" = true ]; then ... fi
+          #   -> ne publie rien, le script continue, code=0
+          # Les images OS seraient restees invisibles pendant que le serveur,
+          # Docker et Homebrew basculaient en public.
+          #
+          # On lit donc par la LISTE, dans une affectation (ou `set -e` mord),
+          # et on refuse d'avancer si le brouillon reste introuvable.
+          OS_ID="$(GH_TOKEN="$OS_TOKEN" gh api --paginate \
+            "repos/renesenses/tune-os/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"$OS_TAG\") | {id, draft}]" \
+            | jq -s 'add // []' \
+            | jq -r 'if length == 1 then (if .[0].draft then .[0].id else empty end) else empty end')"
+          if [ -n "$OS_ID" ]; then
+            GH_TOKEN="$OS_TOKEN" gh api --method PATCH \
+              "repos/renesenses/tune-os/releases/$OS_ID" \
+              -F draft=false -F make_latest=false >/dev/null
+            echo "release OS $OS_TAG publiee (id=$OS_ID)"
+          else
+            # Ni un brouillon unique, ni une release deja publique : on le DIT.
+            # Le silence d'avant est precisement ce qu'on corrige.
+            OS_ETAT="$(GH_TOKEN="$OS_TOKEN" gh api --paginate \
+              "repos/renesenses/tune-os/releases?per_page=100" \
+              --jq "[.[] | select(.tag_name == \"$OS_TAG\") | {draft}]" | jq -s 'add // []')"
+            if [ "$(jq 'length' <<<"$OS_ETAT")" -eq 1 ] && [ "$(jq -r '.[0].draft' <<<"$OS_ETAT")" = false ]; then
+              echo "release OS $OS_TAG deja publique, rien a faire"
+            else
+              echo "::error::release OS $OS_TAG introuvable ou en double : $(jq -c . <<<"$OS_ETAT")"
+              exit 1
+            fi
+          fi
+
+          cd homebrew-tap
+          git config user.email "renesenses-bot@users.noreply.github.com"
+          git config user.name "renesenses-bot"
+          git add Formula/tune-server.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "tune-server v$VERSION"
+            git push origin HEAD
+          fi
+          cd ..
+
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ]; then
+            gh release edit "$TAG" --draft=false --latest
+          fi
+
+          [ -n "$WEBHOOK_SECRET" ] || { echo "::error::WEBHOOK_SECRET absent"; exit 1; }
+          RELEASE="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          BODY="$(jq -n --arg action published --argjson release "$RELEASE" \
+            --arg name tune-server-rust --arg full "$GITHUB_REPOSITORY" \
+            '{action:$action,release:$release,repository:{name:$name,full_name:$full}}')"
+          SIGNATURE="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $2}')"
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -H 'X-GitHub-Event: release' -H "X-Hub-Signature-256: $SIGNATURE" \
+            -d "$BODY" https://mozaiklabs.fr/webhooks/github/release
+
+          {
+            echo "## v$VERSION promue"
+            echo
+            echo "- GitHub Release serveur publique"
+            echo "- release Tune OS publique"
+            echo "- Docker $TAG et latest sur le digest staged"
+            echo "- Homebrew mis a jour"
+            echo "- site notifie"
+            echo "- Android inchange : absent du manifeste a quatre composants"
+            echo "- paquet .deb : job \`deb\` de ce meme run"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Le paquet Debian, dans le MEME run que la promotion.
+  #
+  # `deb.yml` ecoute `release: [published]` depuis toujours, et ce declencheur
+  # n'a jamais tire une seule fois : GitHub ne declenche aucun workflow depuis
+  # un evenement produit avec le `GITHUB_TOKEN` par defaut, et c'est ce jeton
+  # qui publie la release ci-dessus. Le `.deb` partait donc a la main, apres
+  # coup, quand quelqu'un y pensait.
+  #
+  # Un `uses:` ne passe par aucun evenement : c'est le meme run qui continue,
+  # l'anti-recursion ne s'y applique pas. C'est exactement ce que release.yml
+  # fait deja pour `docker.yml` et `trigger-os-images.yml`.
+  #
+  # En aval de tout : si l'empaquetage tombe, la release reste promue et le
+  # paquet se rejoue seul par `workflow_dispatch`, comme avant.
+  deb:
+    name: Paquet Debian
+    needs: promote
+    if: ${{ !inputs.dry_run }}
+    uses: ./.github/workflows/deb.yml
+    with:
+      tag: v${{ inputs.version }}
+      publish: true

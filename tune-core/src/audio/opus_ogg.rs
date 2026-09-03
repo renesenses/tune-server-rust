@@ -1,7 +1,7 @@
 //! Native Ogg Opus file encoder (#1525).
 //!
 //! Encodes interleaved PCM to a `.opus` file (Opus packets in an Ogg
-//! container) entirely in-process: libopus via the `audiopus` crate for the
+//! container) entirely in-process: libopus via the `opus` crate for the
 //! packets, and a minimal hand-rolled Ogg page writer for the container.
 //! This replaces the converter's `opusenc`/ffmpeg subprocesses.
 //!
@@ -9,8 +9,7 @@
 //! rejected loudly — the old external path was never exercised for them on a
 //! standard install anyway (no opusenc/ffmpeg on PATH).
 
-use audiopus::coder::Encoder;
-use audiopus::{Application, Bitrate, Channels, SampleRate};
+use opus::{Application, Bitrate, Channels, Encoder};
 use tracing::info;
 
 /// Opus operates internally at 48 kHz; callers must resample first
@@ -44,13 +43,13 @@ pub fn encode_ogg_opus(
     };
     let chu = channels as usize;
 
-    let mut encoder = Encoder::new(SampleRate::Hz48000, ch, Application::Audio)
+    let mut encoder = Encoder::new(OPUS_SAMPLE_RATE, ch, Application::Audio)
         .map_err(|e| format!("opus encoder init: {e}"))?;
     encoder
-        .set_bitrate(Bitrate::BitsPerSecond((bitrate_kbps * 1000) as i32))
+        .set_bitrate(Bitrate::Bits((bitrate_kbps * 1000) as i32))
         .map_err(|e| format!("opus set_bitrate: {e}"))?;
     // Encoder delay, advertised as pre-skip so decoders trim it.
-    let pre_skip: u16 = encoder.lookahead().map(|l| l as u16).unwrap_or(312);
+    let pre_skip: u16 = encoder.get_lookahead().map(|l| l as u16).unwrap_or(312);
 
     // --- Encode all packets first ---------------------------------------
     let mut packets: Vec<Vec<u8>> = Vec::new();
@@ -197,8 +196,9 @@ fn ogg_crc32(data: &[u8]) -> u32 {
 /// Énergie du signal à la fréquence `freq`, par l'algorithme de Goertzel
 /// (#2251).
 ///
-/// Pourquoi cet outil ici : `audiopus_sys` est abandonné et devra être remplacé
-/// un jour. Or **remplacer un décodeur ne casse pas la compilation** — il rend
+/// Pourquoi cet outil ici : la liaison libopus a été remplacée (`audiopus_sys`
+/// abandonné → `opus`/`opusic-sys`, #2251). Or **remplacer un décodeur ne casse
+/// pas la compilation** — il rend
 /// un son faux, et les contrôles existants (durée, cadence, « pas du
 /// silence ») laissent passer un canal inversé, un repli mono, un gain faux ou
 /// un flux brouillé. Une empreinte spectrale, elle, ne laisse rien passer, et
@@ -303,15 +303,13 @@ mod tests {
         let pcm = sine_48k_stereo(seconds);
         let bytes = encode_ogg_opus(&pcm, 2, 128, 48000).expect("encode");
 
-        let dir = std::env::temp_dir().join(format!("tune-opus-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::scratch_dir("tune-opus-test");
         let path = dir.join("roundtrip.opus");
         std::fs::write(&path, &bytes).unwrap();
 
         let decoded =
             crate::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, f64::MAX)
                 .expect("decode back");
-        let _ = std::fs::remove_file(&path);
 
         assert_eq!(decoded.sample_rate, 48000);
         assert_eq!(decoded.channels, 2);
@@ -344,7 +342,7 @@ mod tests {
             .collect()
     }
 
-    /// Harnais de preuve pour le remplacement d'`audiopus_sys` (#2251).
+    /// Harnais de preuve du remplacement d'`audiopus_sys` (#2251).
     ///
     /// `round_trip_through_project_decoder` ci-dessus vérifie qu'il sort *du*
     /// son ; il ne vérifie pas que c'est *le bon* son. Ce test-ci encode deux
@@ -359,28 +357,27 @@ mod tests {
     ///
     /// Ici les attendus sont **calculés**, pas relevés : la source est
     /// synthétique, donc le RMS visé vaut exactement `AMP/√2`. Rien n'est donc
-    /// lié à une version de libopus en particulier — utile, car
-    /// `audiopus_sys` sonde `pkg-config` et ne lie pas la même libopus d'une
-    /// machine à l'autre.
+    /// lié à une version de libopus en particulier — ce qui est précisément ce
+    /// qui a permis à ce test de valider le passage d'`audiopus_sys 0.2.2`
+    /// (libopus embarquée de 2021, ou celle de `pkg-config`) à
+    /// `opusic-sys 0.7.5` (libopus 1.6.1 embarquée, toujours statique) sans
+    /// retoucher un seul attendu.
     ///
-    /// Valeurs relevées à titre indicatif sur `audiopus 0.3.0-rc.0` /
-    /// `audiopus_sys 0.2.2` (libopus 1.6.1 via Homebrew) : séparation des
-    /// canaux > 7·10⁷, RMS 11315 / 11302 pour une source à 11314. Les seuils
-    /// ci-dessous gardent quatre ordres de grandeur de marge.
+    /// Valeurs relevées à titre indicatif : séparation des canaux > 7·10⁷,
+    /// RMS 11315 / 11302 pour une source à 11314. Les seuils ci-dessous
+    /// gardent quatre ordres de grandeur de marge.
     #[test]
     fn round_trip_garde_la_frequence_et_l_ordre_des_canaux() {
         const AMP: f64 = 16000.0;
         let pcm = two_tone_48k_stereo(1.0, 440.0, 880.0, AMP);
         let bytes = encode_ogg_opus(&pcm, 2, 128, 48000).expect("encode");
 
-        let dir = std::env::temp_dir().join(format!("tune-opus-tones-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::scratch_dir("tune-opus-tones");
         let path = dir.join("two-tone.opus");
         std::fs::write(&path, &bytes).unwrap();
         let decoded =
             crate::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, f64::MAX)
                 .expect("decode back");
-        let _ = std::fs::remove_file(&path);
 
         assert_eq!(decoded.sample_rate, 48_000);
         assert_eq!(decoded.channels, 2);

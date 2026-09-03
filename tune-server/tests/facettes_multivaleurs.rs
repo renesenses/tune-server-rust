@@ -333,6 +333,236 @@ async fn les_cartes_album_voient_la_meme_selection() {
     );
 }
 
+/// Une bibliothèque à ALBUMS, pour raisonner sur l'ensemble rendu plutôt que
+/// sur un compteur de pistes.
+///
+/// | album | genres des pistes | format | pistes |
+/// |-------|-------------------|--------|--------|
+/// | Bleu  | Jazz ×2, Rock ×1  | aiff   | 3      |
+/// | Rouge | Jazz ×3           | aiff   | 3      |
+/// | Vert  | Rock ×2           | flac   | 2      |
+/// | Gris  | Blues ×2          | wav    | 2      |
+///
+/// **« Bleu » porte les DEUX genres** : c'est lui qui rend le test « sans
+/// doublon » réel. `genre=Jazz` rend {Bleu, Rouge}, `genre=Rock` rend
+/// {Bleu, Vert} ; leur union est {Bleu, Rouge, Vert} — Bleu UNE fois.
+fn bibliotheque_albums() -> axum::Router {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let mut n = 0;
+    for (titre, pistes) in [
+        (
+            "Bleu",
+            &[("Jazz", "aiff"), ("Jazz", "aiff"), ("Rock", "aiff")][..],
+        ),
+        (
+            "Rouge",
+            &[("Jazz", "aiff"), ("Jazz", "aiff"), ("Jazz", "aiff")][..],
+        ),
+        ("Vert", &[("Rock", "flac"), ("Rock", "flac")][..]),
+        ("Gris", &[("Blues", "wav"), ("Blues", "wav")][..]),
+    ] {
+        state
+            .backend
+            .execute(
+                &format!("INSERT INTO albums (title, artist_id) VALUES ('{titre}', NULL)"),
+                &[],
+            )
+            .expect("insertion d'album");
+        let album_id = state.backend.last_insert_rowid();
+        for (genre, format) in pistes {
+            n += 1;
+            state
+                .backend
+                .execute(
+                    &format!(
+                        "INSERT INTO tracks (title, album_id, artist_id, file_path, duration_ms, \
+                         format, genre, sample_rate) \
+                         VALUES ('Piste {n}', {album_id}, NULL, '/music/p{n}.{format}', 200000, \
+                         '{format}', '{genre}', 44100)"
+                    ),
+                    &[],
+                )
+                .expect("insertion de piste");
+        }
+    }
+    tune_server::routes::router(state)
+}
+
+/// Les titres d'albums rendus par `/library/albums-detailed`, triés.
+fn albums_rendus(body: &Value) -> Vec<String> {
+    let mut v: Vec<String> = body
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("la liste d'albums doit être rendue")
+        .iter()
+        .map(|a| {
+            a.get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Bourrage : `n` valeurs distinctes qu'aucune piste ne porte.
+fn bourrage(cle: &str, n: usize) -> String {
+    let mut s = String::new();
+    for i in 0..n {
+        s.push_str(&format!("&{cle}=z{i}"));
+    }
+    s
+}
+
+/// ⚠️ **La facette « contient » à mille valeurs rendait une liste VIDE sur
+/// SQLite et la bonne liste sur PostgreSQL.**
+///
+/// `genre` teste la colonne `t.genre` (un `IN`) OU le tableau `t.genres` (une
+/// chaîne de `LIKE` en OU). Au-delà de 1 000 termes, cette chaîne dépasse la
+/// profondeur d'arbre maximale de SQLite — `Expression tree is too large
+/// (maximum depth 1000)` — la requête échoue à la préparation, l'échec est
+/// avalé par `ou_defaut_journalise` (#2861), et la route sert un `200 OK` dont
+/// la liste d'albums est VIDE. PostgreSQL, lui, avale la même chaîne (mesuré à
+/// 12 000 termes) et rend la bonne liste. Même URL, deux réponses.
+///
+/// L'épreuve porte donc sur un FAIT DE BASE — l'ensemble des albums rendus —
+/// et jamais sur un code HTTP, qui valait déjà 200 avant la correction.
+#[tokio::test]
+async fn une_facette_a_mille_valeurs_rend_encore_lunion() {
+    let app = bibliotheque_albums();
+
+    // Le témoin de référence : deux valeurs, l'union, sans doublon.
+    let (st, deux) = get(
+        &app,
+        "/api/v1/library/albums-detailed?genre=Jazz&genre=Rock",
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        albums_rendus(&deux),
+        vec!["Bleu", "Rouge", "Vert"],
+        "Jazz {{Bleu, Rouge}} ∪ Rock {{Bleu, Vert}} — et Bleu UNE seule fois"
+    );
+
+    // La même sélection, noyée dans 1 500 valeurs qui ne désignent rien. Le
+    // résultat doit être RIGOUREUSEMENT le même : ni plus, ni moins, ni doublon.
+    let url = format!(
+        "/api/v1/library/albums-detailed?genre=Jazz&genre=Rock{}",
+        bourrage("genre", 1500)
+    );
+    let (st, mille) = get(&app, &url).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        albums_rendus(&mille),
+        albums_rendus(&deux),
+        "1 500 valeurs de plus qui ne désignent rien ne changent pas l'ensemble rendu"
+    );
+
+    // Et la liste de pistes, qui passe par l'AUTRE constructeur de prédicats,
+    // doit tenir le même ensemble : 8 pistes Jazz ou Rock sur 10.
+    let (_, pistes) = get(
+        &app,
+        &format!(
+            "/api/v1/library/tracks?limit=100&genre=Jazz&genre=Rock{}",
+            bourrage("genre", 1500)
+        ),
+    )
+    .await;
+    assert_eq!(total(&pistes), 8, "3 Jazz + 3 Jazz + 2 Rock");
+}
+
+/// Les trois témoins, tous verts AVANT comme APRÈS : la correction ne touche
+/// que le cas au-delà de mille termes.
+#[tokio::test]
+async fn les_temoins_de_la_facette_profonde_restent_verts() {
+    let app = bibliotheque_albums();
+
+    // 1. UNE seule valeur rend exactement ce qu'elle rendait.
+    for (url, attendu) in [
+        (
+            "/api/v1/library/albums-detailed?genre=Jazz",
+            vec!["Bleu", "Rouge"],
+        ),
+        (
+            "/api/v1/library/albums-detailed?genre=Rock",
+            vec!["Bleu", "Vert"],
+        ),
+        ("/api/v1/library/albums-detailed?genre=Blues", vec!["Gris"]),
+    ] {
+        let (st, r) = get(&app, url).await;
+        assert_eq!(st, StatusCode::OK, "{url}");
+        assert_eq!(albums_rendus(&r), attendu, "{url}");
+    }
+
+    // 2. Deux facettes DIFFÉRENTES se combinent en ET, jamais en OU — y compris
+    //    quand la facette profonde est bourrée. (Jazz OU Rock) ET flac ne laisse
+    //    que Vert ; une union en aurait rendu trois.
+    let (st, croise) = get(
+        &app,
+        &format!(
+            "/api/v1/library/albums-detailed?genre=Jazz&genre=Rock&format=flac{}",
+            bourrage("genre", 1500)
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        albums_rendus(&croise),
+        vec!["Vert"],
+        "le OU de la facette a débordé sur le ET"
+    );
+
+    // 3. ZÉRO valeur ne filtre rien : une facette vide n'est pas un filtre, et
+    //    surtout pas un filtre qui ne rend rien.
+    let (_, nue) = get(&app, "/api/v1/library/albums-detailed").await;
+    let (_, vide) = get(&app, "/api/v1/library/albums-detailed?genre=&genre=").await;
+    assert_eq!(
+        albums_rendus(&vide),
+        albums_rendus(&nue),
+        "une facette sans valeur doit se comporter comme l'absence de facette"
+    );
+    assert_eq!(albums_rendus(&nue), vec!["Bleu", "Gris", "Rouge", "Vert"]);
+}
+
+/// Les deux autres facettes « contient » — `label` et `composer` — passent par
+/// le même assembleur et se cassaient donc de la même façon.
+#[tokio::test]
+async fn les_facettes_label_et_compositeur_tiennent_aussi_le_millier() {
+    let app = bibliotheque_albums();
+
+    for cle in ["label", "composer"] {
+        // Aucune piste ne porte ces valeurs : l'ensemble attendu est VIDE.
+        // Ce qui est prouvé ici, c'est qu'il est vide PARCE QUE rien ne
+        // correspond, et non parce que la requête a échoué — le témoin juste
+        // au-dessous, qui trouve bien son album, le distingue.
+        let (st, r) = get(
+            &app,
+            &format!(
+                "/api/v1/library/albums-detailed?{}",
+                &bourrage(cle, 1500)[1..]
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{cle}");
+        assert!(albums_rendus(&r).is_empty(), "{cle}");
+    }
+
+    // Le témoin qui distingue « vide » de « en panne » : une valeur qui existe,
+    // noyée dans le même bourrage, doit être TROUVÉE.
+    let app2 = bibliotheque_albums();
+    let (st, r) = get(
+        &app2,
+        &format!(
+            "/api/v1/library/albums-detailed?genre=Blues{}",
+            bourrage("genre", 1500)
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(albums_rendus(&r), vec!["Gris"]);
+}
+
 /// **Rétrocompatibilité.** Une URL ou un état enregistré d'avant #2168 ne porte
 /// qu'une valeur par facette : il doit continuer de rendre exactement la même
 /// chose.
@@ -477,4 +707,415 @@ async fn une_valeur_a_virgule_reste_filtrable() {
     )
     .await;
     assert_eq!(total(&r), 8, "1 + 7");
+}
+
+/// Une bibliothèque minuscule mais complète : chaque famille de facette a au
+/// moins une valeur, et une piste sans étiquettes alimente `untagged`.
+///
+/// Les identifiants sont explicites pour que les collections, favoris et
+/// listes de lecture puissent viser les mêmes lignes sans dépendre de l'ordre
+/// d'insertion ni du contenu semé par les migrations.
+fn bibliotheque_contrat_facettes() -> axum::Router {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    for sql in [
+        "INSERT INTO artists (id, name) VALUES (93001, 'ArtisteA')",
+        "INSERT INTO artists (id, name) VALUES (93002, 'ArtisteB')",
+        "INSERT INTO albums (id, title, artist_id, original_year, cover_path) \
+         VALUES (92001, 'AlbumA', 93001, 1959, '/covers/a.jpg')",
+        "INSERT INTO albums (id, title, artist_id, original_year, cover_path) \
+         VALUES (92002, 'AlbumB', 93002, 1960, NULL)",
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91001, 'PisteA', 92001, 93001, '/contrat/a.flac', 1000, 'flac', 96000, \
+          24, 'local', 'Jazz', 'Bach', 1959, 'ECM')",
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91002, 'PisteB', 92002, 93002, '/contrat/b.flac', 1000, 'flac', 44100, \
+          16, 'qobuz', 'Rock', 'Ravel', 1960, 'BlueNote')",
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91003, 'PisteC', 92001, 93001, '/contrat/c.aiff', 1000, 'aiff', 48000, \
+          24, 'local', 'Jazz', 'Bach', 1959, 'ECM')",
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91004, 'SansTags', NULL, NULL, '/contrat/sans-tags.flac', 1000, 'flac', \
+          44100, 16, 'local', NULL, NULL, NULL, NULL)",
+        // Casse DIFFÉRENTE de « Jazz »/« flac » : sans elle, désaccorder
+        // `in_list_ci` en `in_list` d'un seul côté ne changeait RIEN et le
+        // garde-fou restait vert (#1864).
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91005, 'PisteD', 92001, 93001, '/contrat/d.flac', 1000, 'FLAC', 96000, \
+          24, 'local', 'JAZZ', 'Bach', 1959, 'ECM')",
+        // Genre MULTIVALUÉ dans la colonne JSON `genres`, et volontairement
+        // « Jazzy » : le motif juste (`%\"Jazz\"%`) ne le prend pas, un motif
+        // relâché (`%Jazz%`) le prendrait — c'est ce qui rend la divergence
+        // détectable.
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, genres, composer, year, label) VALUES \
+         (91006, 'PisteE', NULL, NULL, '/contrat/e.aiff', 1000, 'aiff', 48000, \
+          24, 'local', NULL, '[\"Jazzy\"]', NULL, NULL, NULL)",
+        // #1821 — un disque dont le tag porte PLUSIEURS genres. C'est ce
+        // qu'écrivent nativement Vorbis Comment (champ `GENRE` répété) et MP4
+        // (atome `©gen` répété) : la colonne `genre` garde le principal, le
+        // tableau `genres` les garde tous. Le rail ne comptait que la colonne,
+        // donc « Fusion » n'apparaissait nulle part — alors que le filtre, lui,
+        // savait le trouver.
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, genres, composer, year, label) VALUES \
+         (91008, 'PisteF', 92001, 93001, '/contrat/g.flac', 1000, 'flac', 96000, \
+          24, 'local', 'Jazz', '[\"Jazz\",\"Fusion\"]', 'Bach', 1959, 'ECM')",
+        // Même genre secondaire, CASSE différente, et seulement dans le
+        // tableau JSON : sans `LOWER()` des deux côtés du `LIKE`, cette ligne
+        // est trouvée sur SQLite et perdue sur PostgreSQL.
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, genres, composer, year, label) VALUES \
+         (91009, 'PisteG', NULL, NULL, '/contrat/h.flac', 1000, 'flac', 44100, \
+          16, 'local', NULL, '[\"FUSION\"]', NULL, NULL, NULL)",
+        // Titre ACCENTUÉ : la liste passe par `unaccent()`, le compteur doit
+        // en faire autant, sinon `q=cafe` compte sans cette piste.
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91007, 'Café Bleu', 92002, 93002, '/contrat/f.wav', 1000, 'wav', 44100, \
+          16, 'local', 'Rock', 'Ravel', 1960, 'BlueNote')",
+        // Collection INTELLIGENTE : elle ne résout AUCUN album, seulement des
+        // pistes. Le compteur qui n'en connaissait que les collections
+        // manuelles posait `1 = 0` et vidait tout le rail (#1864).
+        "INSERT INTO smart_collections (name, rules, match_mode) VALUES \
+         ('CollectionSmart', '[{\"field\":\"artist_name\",\"op\":\"=\",\"value\":\"ArtisteB\"}]', 'all')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'release_country', 'FR')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'mood', 'Calme')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'source_media', 'CD')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91002, 'release_country', 'US')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91002, 'mood', 'Intense')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91002, 'source_media', 'SACD')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91003, 'release_country', 'FR')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91003, 'mood', 'Calme')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91003, 'source_media', 'Vinyle')",
+        // Dynamic Range (#2144). Le tag décrit l'ALBUM mais vit dans le
+        // magasin ouvert, par PISTE : une seule piste taguée suffit à donner
+        // son DR à tout l'album, et les autres pistes du même album doivent
+        // donc être comptées ET rendues sous cette valeur. C'est précisément
+        // ce que le garde-fou ci-dessous éprouve.
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'dr_album', '14')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91002, 'dr_album', '8')",
+        // Valeur NON numérique sur le même album que « 8 » : elle doit être
+        // écartée des DEUX côtés à l'identique. Écartée d'un seul, le rail
+        // annoncerait une pastille « DR0 » (CAST SQLite) que la liste ne
+        // rendrait pas — ou ferait tomber la requête entière en PostgreSQL.
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91007, 'dr_album', 'DR12.5')",
+        "INSERT OR IGNORE INTO profiles (id, username) VALUES (1, 'contrat-facettes')",
+        "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES (92001, 1, 5)",
+        "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES (92002, 1, 4)",
+        "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'track', 91001)",
+        "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'album', 92002)",
+        "INSERT INTO playlists (id, name, profile_id) VALUES (94001, 'ListeA', 1)",
+        "INSERT INTO playlists (id, name, profile_id) VALUES (94002, 'ListeB', 1)",
+        "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (94001, 91001, 0)",
+        "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (94001, 91004, 1)",
+        "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (94002, 91002, 0)",
+    ] {
+        state.backend.execute(sql, &[]).expect(sql);
+    }
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set(
+            "collections",
+            r#"[{"name":"CollectionA","album_ids":[92001]},{"name":"CollectionB","album_ids":[92002]}]"#,
+        )
+        .expect("collections d'épreuve");
+    tune_server::routes::router(state)
+}
+
+/// #1864 : pour chaque valeur annoncée par le rail, cocher cette valeur doit
+/// rendre exactement le nombre de pistes promis par le rail.
+///
+/// Ce test traverse les deux constructeurs SQL réels — `build_conditions`
+/// pour les effectifs et `TrackRepo::list_filtered` pour les pistes — au lieu
+/// de comparer leurs chaînes. Une divergence de colonne, de jointure ou de
+/// paramètre rougit donc sur la facette précise qui a dérivé.
+#[tokio::test]
+async fn chaque_effectif_de_facette_est_tenu_par_la_liste_filtree() {
+    let app = bibliotheque_contrat_facettes();
+
+    for (champ, cle) in FACETTES {
+        // La facette comptée s'auto-exclut. Un filtre croisé la force à
+        // emprunter aussi le chemin cumulatif ; pour `format`, on croise par
+        // genre afin de ne pas filtrer la facette avant son propre comptage.
+        let croise = if champ == "format" {
+            "genre=Jazz"
+        } else {
+            "format=flac"
+        };
+        let chemin = format!("/api/v1/library/facets?fields={champ}&limit=0&{croise}");
+        let (status, facettes) = get(&app, &chemin).await;
+        assert_eq!(status, StatusCode::OK, "facette {champ}");
+        let valeurs = facettes
+            .get(champ)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("facette {champ} absente : {facettes}"));
+        assert!(
+            !valeurs.is_empty(),
+            "la fixture doit exercer la facette {champ}"
+        );
+
+        for entree in valeurs {
+            let valeur = entree
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("valeur absente pour {champ}: {entree}"));
+            let annonce = entree.get("count").and_then(Value::as_i64).unwrap_or(-1);
+            let valeur = urlencoding::encode(valeur);
+            let chemin = format!("/api/v1/library/tracks?limit=1000&{croise}&{cle}={valeur}");
+            let (status, pistes) = get(&app, &chemin).await;
+            assert_eq!(status, StatusCode::OK, "{champ}={valeur}");
+            assert_eq!(
+                total(&pistes),
+                annonce,
+                "la facette {champ}={valeur} annonce {annonce}, mais sa liste rend {}",
+                total(&pistes)
+            );
+        }
+    }
+}
+
+/// Les 18 facettes du rail, avec la clé de filtre qui leur correspond dans la
+/// chaîne de requête. `source` est le nom public de la métadonnée
+/// `source_media` ; la clé de filtre reste explicitement `source_media`.
+const FACETTES: [(&str, &str); 18] = [
+    ("genre", "genre"),
+    ("label", "label"),
+    ("composer", "composer"),
+    ("year", "year"),
+    ("artist", "artist"),
+    ("format", "format"),
+    ("sample_rate", "sample_rate"),
+    ("bit_depth", "bit_depth"),
+    ("country", "country"),
+    ("mood", "mood"),
+    ("source", "source_media"),
+    ("rating", "rating"),
+    ("collection", "collection"),
+    ("original_year", "original_year"),
+    ("favorite", "favorite"),
+    ("playlist", "playlist"),
+    ("untagged", "untagged"),
+    // Dynamic Range (#2144) : la dernière arrivée, et celle dont les deux
+    // prédicats sont les PLUS éloignés l'un de l'autre — table dérivée jointe
+    // pour compter, sous-requête `IN` pour filtrer. Sans ce garde-fou, rien ne
+    // les tiendrait ensemble.
+    ("dr", "dr"),
+];
+
+/// Somme des effectifs annoncés pour une facette MONOVALUÉE et toujours
+/// renseignée : elle vaut donc le nombre de pistes du jeu courant.
+fn somme_effectifs(rail: &Value, champ: &str) -> i64 {
+    rail.get(champ)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("facette témoin {champ} absente : {rail}"))
+        .iter()
+        .map(|e| {
+            e.get("count")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| panic!("effectif absent : {e}"))
+        })
+        .sum()
+}
+
+/// #1864 — le garde-fou qui MORD.
+///
+/// `chaque_effectif_de_facette_est_tenu_par_la_liste_filtree` ne croisait
+/// qu'UNE facette (`format`, ou `genre` quand c'est `format` qu'on compte), et
+/// la facette comptée s'auto-exclut : les QUINZE autres prédicats du compteur
+/// n'étaient donc jamais construits pendant le test. Contre-épreuve mesurée le
+/// 30/08 : trois désaccords posés sur le seul compteur — colonne
+/// (`t.sample_rate` → `t.bit_depth`), casse (`in_list_ci` → `in_list`), motif
+/// multivalué (`%"g"%` → `%g%`) — le laissaient VERT tous les trois.
+///
+/// Ici, chaque facette est mise en position de FILTRE, et l'on compare le rail
+/// qu'elle produit à la liste qu'elle rend. Le témoin est une facette
+/// monovaluée et toujours renseignée, dont la somme des effectifs vaut donc
+/// exactement le nombre de pistes retenues : désaccorder un prédicat d'un seul
+/// côté déplace l'une des deux mesures et pas l'autre.
+#[tokio::test]
+async fn filtrer_par_une_facette_narrow_le_rail_comme_la_liste() {
+    let app = bibliotheque_contrat_facettes();
+
+    for (champ, cle) in FACETTES {
+        // Le témoin ne doit pas être la facette qu'on met en position de
+        // filtre : elle s'auto-exclurait et le prédicat testé disparaîtrait.
+        let temoin = if champ == "format" {
+            "bit_depth"
+        } else {
+            "format"
+        };
+        let (status, facettes) = get(
+            &app,
+            &format!("/api/v1/library/facets?fields={champ}&limit=0"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "facette {champ}");
+        let valeurs = facettes
+            .get(champ)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("facette {champ} absente : {facettes}"));
+        assert!(
+            !valeurs.is_empty(),
+            "la fixture doit exercer la facette {champ}"
+        );
+
+        for entree in valeurs {
+            let valeur = entree
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("valeur absente pour {champ}: {entree}"));
+            let encodee = urlencoding::encode(valeur);
+
+            let (status, rail) = get(
+                &app,
+                &format!("/api/v1/library/facets?fields={temoin}&limit=0&{cle}={encodee}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "rail sous {cle}={valeur}");
+            let compte = somme_effectifs(&rail, temoin);
+
+            let (status, pistes) = get(
+                &app,
+                &format!("/api/v1/library/tracks?limit=1000&{cle}={encodee}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "liste sous {cle}={valeur}");
+            let rendu = total(&pistes);
+
+            assert_eq!(
+                compte, rendu,
+                "sous {cle}={valeur}, le rail « {temoin} » totalise {compte} \
+                 mais la liste rend {rendu}"
+            );
+            assert!(
+                rendu > 0,
+                "la fixture doit rendre au moins une piste sous {cle}={valeur}"
+            );
+        }
+    }
+}
+
+/// #1864 — la recherche libre `q` narrow AUSSI les effectifs du rail, et elle
+/// s'écrit elle aussi deux fois.
+///
+/// Le compteur l'écrivait sans `unaccent()` là où `TrackRepo::list_filtered`
+/// l'écrivait avec : `q=cafe` comptait sans « Café Bleu », mais la liste le
+/// rendait. Aucune facette n'exerçait ce prédicat, donc rien ne le tenait.
+#[tokio::test]
+async fn la_recherche_libre_narrow_le_rail_comme_la_liste() {
+    let app = bibliotheque_contrat_facettes();
+
+    for recherche in ["cafe", "café", "CAFE", "Bleu"] {
+        let encodee = urlencoding::encode(recherche);
+        let (status, rail) = get(
+            &app,
+            &format!("/api/v1/library/facets?fields=format&limit=0&q={encodee}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "rail q={recherche}");
+        let compte = somme_effectifs(&rail, "format");
+
+        let (status, pistes) = get(
+            &app,
+            &format!("/api/v1/library/tracks?limit=1000&q={encodee}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "liste q={recherche}");
+        let rendu = total(&pistes);
+
+        assert_eq!(
+            compte, rendu,
+            "sous q={recherche}, le rail « format » totalise {compte} \
+             mais la liste rend {rendu}"
+        );
+        assert!(
+            rendu > 0,
+            "« Café Bleu » doit répondre à q={recherche} des DEUX côtés"
+        );
+    }
+}
+
+/// #1821 — le rail « Genre » d'Oxygen doit annoncer les genres SECONDAIRES.
+///
+/// DEvir, ambassadeur : « songs purchased from different platforms or labels
+/// end up being categorized under different genres ». La cause mesurée est
+/// l'encodage du tag, pas le vocabulaire des marchands : « ce disque est du
+/// Jazz ET de la Fusion » s'écrit soit en plusieurs valeurs (Vorbis, MP4,
+/// ID3v2.4), soit en une chaîne séparée (ID3v2.3), et Tune ne rangeait le
+/// disque sous ses deux genres que dans le second cas.
+///
+/// Côté serveur, le rail groupait sur la seule colonne `t.genre` tandis que son
+/// filtre jumeau testait AUSSI le tableau `t.genres` : « Fusion » n'était donc
+/// proposé par aucune carte, alors que le cocher aurait bien rendu des pistes.
+#[tokio::test]
+async fn le_rail_genre_annonce_les_genres_secondaires() {
+    let app = bibliotheque_contrat_facettes();
+
+    let (status, facettes) = get(&app, "/api/v1/library/facets?fields=genre&limit=0").await;
+    assert_eq!(status, StatusCode::OK);
+    let rail = effectifs(&facettes, "genre");
+
+    // « Fusion » n'est le genre PRINCIPAL d'aucune piste : il ne vit que dans
+    // le tableau multivalué. Il doit malgré tout être proposé.
+    let fusion = rail
+        .iter()
+        .find(|(v, _)| v.eq_ignore_ascii_case("Fusion"))
+        .unwrap_or_else(|| panic!("« Fusion » absent du rail : {rail:?}"));
+
+    // Les DEUX pistes qui le portent, quelle que soit la casse écrite dans le
+    // tableau : c'est la même intention, gravée par deux logiciels différents.
+    assert_eq!(
+        fusion.1, 2,
+        "« Fusion » doit compter les deux gravures : {rail:?}"
+    );
+
+    // Et le compteur ne ment pas : cocher la carte rend exactement ce nombre.
+    let encodee = urlencoding::encode(&fusion.0);
+    let (status, pistes) = get(
+        &app,
+        &format!("/api/v1/library/tracks?limit=1000&genre={encodee}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        total(&pistes),
+        fusion.1,
+        "le rail annonce {} pour « {} », la liste en rend {}",
+        fusion.1,
+        fusion.0,
+        total(&pistes)
+    );
+
+    // La piste 91008 porte « Jazz » ET « Fusion » : elle compte une fois dans
+    // chaque carte, jamais deux fois dans la même.
+    let jazz = rail
+        .iter()
+        .find(|(v, _)| v.eq_ignore_ascii_case("Jazz"))
+        .unwrap_or_else(|| panic!("« Jazz » absent du rail : {rail:?}"));
+    let encodee = urlencoding::encode(&jazz.0);
+    let (_, pistes) = get(
+        &app,
+        &format!("/api/v1/library/tracks?limit=1000&genre={encodee}"),
+    )
+    .await;
+    assert_eq!(
+        total(&pistes),
+        jazz.1,
+        "« Jazz » : rail {} contre liste {}",
+        jazz.1,
+        total(&pistes)
+    );
 }

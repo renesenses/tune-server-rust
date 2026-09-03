@@ -922,14 +922,32 @@ mod deadline_tests {
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 
-    /// #2566 — le message ne doit plus envoyer chercher une ressource occupée.
+    /// #2566 — ce que le POLLER reçoit ne porte aucun errno.
     ///
-    /// Le pair TCP accepte la connexion puis se tait : la poignée de main TLS
-    /// écrit son `ClientHello`, puis attend une réponse qui ne vient jamais.
-    /// C'est EXACTEMENT le chemin de Dimitri — un délai de socket qui expire
-    /// pendant un read — et avant le correctif il produisait
-    /// `Resource temporarily unavailable (os error 11)` sur Linux,
-    /// `(os error 35)` sur macOS.
+    /// ⚠️ **Ce test ne TIENT pas la traduction de l'errno**, contrairement à
+    /// ce qu'affirmait sa description d'origine (« EXACTEMENT le chemin de
+    /// Dimitri — un délai de socket qui expire pendant un read »). Son verdict
+    /// dépend d'une COURSE, parce que [`run_cast_command_inner`] arme DEUX
+    /// horloges sur la même échéance : le délai posé sur la socket, et le
+    /// `tokio::time::timeout` qui garde la tâche bloquante.
+    ///
+    /// Mesuré le 30/08 sur Shrek en neutralisant
+    /// `DeadlineTcpStream::as_deadline_error`, deux passages ont donné deux
+    /// verdicts opposés :
+    ///
+    /// | horloge gagnante | message obtenu | verdict |
+    /// |---|---|---|
+    /// | `tokio::time::timeout` | `chromecast command deadline elapsed (after 120ms of 120ms budget)` | **vert** — la traduction manquait pourtant |
+    /// | délai de socket | `connect receiver: Resource temporarily unavailable (os error 11) (after …)` | rouge |
+    ///
+    /// Un garde-fou qui rend un tour sur deux ne garde rien. Ce test reste
+    /// utile pour ce qu'il éprouve VRAIMENT — le **message rendu au poller**,
+    /// dont aucune des deux issues ne doit nommer une ressource occupée — mais
+    /// il ne peut pas servir de preuve du correctif.
+    ///
+    /// La traduction elle-même est tenue par
+    /// [`le_delai_de_la_socket_est_traduit_avant_de_quitter_la_chaine_cast`],
+    /// où aucune horloge asynchrone ne peut prendre les devants.
     ///
     /// L'assertion négative porte sur **`os error`** et non sur le texte
     /// anglais : le texte de l'errno est traduit par la libc selon la locale,
@@ -955,6 +973,67 @@ mod deadline_tests {
             "le message doit nommer l'échéance dépassée : {error}"
         );
         server.abort();
+    }
+
+    /// #2566 — le garde-fou qui exerce VRAIMENT la traduction de l'errno.
+    ///
+    /// **Le chemin de Dimitri, sans horloge concurrente.** Sa ligne portait
+    /// `media status: Resource temporarily unavailable (os error 35)` : le
+    /// délai posé sur la socket par `DeadlineTcpStream` expire PENDANT un read,
+    /// la socket rend `WouldBlock` — `EAGAIN`, numéro 35 sur macOS — et ce
+    /// texte remontait tel quel jusqu'au journal. C'est cette traduction-là que
+    /// le correctif pose, et c'est elle qui n'était tenue par aucun test :
+    /// tous les autres passent par [`run_cast_command`], dont le
+    /// `tokio::time::timeout` expire à la même échéance et gagne la course.
+    ///
+    /// Ici on tient la chaîne Cast en direct, exactement comme le fait la tâche
+    /// bloquante : le pair accepte la connexion TCP puis se tait, la poignée de
+    /// main TLS écrit son `ClientHello` et attend une réponse qui ne viendra
+    /// pas. Le seul délai en jeu est celui de la socket, donc le message ne
+    /// peut venir que de la traduction.
+    ///
+    /// **Portable entre Linux et macOS, par construction.** Le même événement
+    /// sort en `EAGAIN` numéro **11 sur Linux**, **35 sur macOS**, et en
+    /// `TimedOut` sur Windows ; le texte de l'errno est en plus traduit par la
+    /// libc selon la locale. Aucune de ces trois formes n'est écrite ici :
+    /// l'assertion porte sur le suffixe `(os error` que **Rust** ajoute
+    /// lui-même à tout errno brut, seule signature stable d'un bout à l'autre.
+    /// Le correctif fait le même choix — `is_socket_deadline_error` teste
+    /// `ErrorKind`, jamais un entier.
+    #[test]
+    fn le_delai_de_la_socket_est_traduit_avant_de_quitter_la_chaine_cast() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            // Accepter, puis se taire : garder la socket vivante le temps que
+            // le client épuise son délai. La lâcher plus tôt ferait partir un
+            // FIN, et l'échec ne serait plus une échéance.
+            let accepted = listener.accept();
+            std::thread::sleep(Duration::from_millis(600));
+            drop(accepted);
+        });
+
+        let device = rust_cast::CastDevice::connect_without_host_verification_with_deadline(
+            "127.0.0.1".into(),
+            &[address],
+            Instant::now() + Duration::from_millis(150),
+        )
+        .expect("le pair accepte la connexion TCP");
+        let error = device
+            .connection
+            .connect("receiver-0")
+            .expect_err("le pair ne répond jamais")
+            .to_string();
+
+        assert!(
+            !error.contains("os error"),
+            "l'errno brut ne doit plus quitter la couche Cast : {error}"
+        );
+        assert!(
+            error.contains("Cast command deadline elapsed"),
+            "l'expiration du délai de socket doit se nommer : {error}"
+        );
+        peer.join().expect("le faux pair doit se terminer");
     }
 
     /// #2566 — l'échec porte la mesure qui manquait au journal de Dimitri.
@@ -1017,7 +1096,12 @@ mod deadline_tests {
                     // client échoue à l'écriture et non à la lecture.
                     let mut bytes = [0u8; 1024];
                     let _ = socket.read(&mut bytes).await;
-                    let _ = socket.set_linger(Some(Duration::ZERO));
+                    // `TcpStream::set_linger` est déprécié depuis tokio 1.53 :
+                    // SO_LINGER fait BLOQUER le fil à la fermeture. Ici c'est
+                    // le pair de test qui veut ce RST, pas Tune — on passe donc
+                    // par `socket2`, la voie que tokio désigne, plutôt que de
+                    // renoncer au seul moyen d'obtenir un vrai `ECONNRESET`.
+                    let _ = socket2::SockRef::from(&socket).set_linger(Some(Duration::ZERO));
                     drop(socket);
                 });
             }

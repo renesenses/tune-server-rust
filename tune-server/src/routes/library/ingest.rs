@@ -288,6 +288,7 @@ async fn read_source(source: &str) -> Result<(Vec<SourceTrack>, Vec<String>), Ap
                     track.duration_ms = m.duration_ms;
                     track.format = m.format;
                     track.has_cover = m.has_cover;
+                    track.musicbrainz_recording_id = m.musicbrainz_recording_id;
                 }
                 track
             })
@@ -434,6 +435,7 @@ pub(super) async fn release_tracks(
             disc: t.disc,
             position: t.position,
             title: t.title.clone(),
+            recording_id: t.recording_id.clone(),
         })
         .collect();
 
@@ -750,6 +752,7 @@ async fn write_placed_tags(
             year: album.year,
             composer: None,
             label: None,
+            musicbrainz_recording_id: source.and_then(|s| s.musicbrainz_recording_id.clone()),
         };
 
         let nothing_to_write = update.album.is_none()
@@ -758,7 +761,8 @@ async fn write_placed_tags(
             && update.genre.is_none()
             && update.title.is_none()
             && update.track_number.is_none()
-            && update.disc_number.is_none();
+            && update.disc_number.is_none()
+            && update.musicbrainz_recording_id.is_none();
         if nothing_to_write {
             continue;
         }
@@ -996,4 +1000,59 @@ fn new_job_id() -> String {
 
 fn now_iso() -> String {
     super::now_iso_utc()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tune_core::library::ingest::{IngestReport, MovedFile};
+
+    /// L'identifiant retenu pour un fichier doit finir INSCRIT dans le
+    /// fichier posé. C'est le câblage qui compte : le parcours déclenché
+    /// juste après ne lit que l'étiquette, donc un identifiant qui reste
+    /// en mémoire n'atteindra jamais `tracks.musicbrainz_recording_id`.
+    ///
+    /// L'assertion relit le fichier sur le disque, jamais la valeur qu'on
+    /// vient d'écrire : c'est la seule preuve que l'étiquette existe.
+    #[tokio::test]
+    async fn l_identifiant_retenu_est_inscrit_dans_le_fichier_pose() {
+        let dir = tempfile::tempdir().unwrap();
+        let pose = dir.path().join("01 - Intro.flac");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tune-core/tests/fixtures/test.flac"),
+            &pose,
+        )
+        .unwrap();
+
+        let source_path = dir.path().join("source.flac").to_string_lossy().to_string();
+        let report = IngestReport {
+            moved: vec![MovedFile {
+                source_path: source_path.clone(),
+                dest_path: pose.to_string_lossy().to_string(),
+            }],
+            ..Default::default()
+        };
+        let album = AlbumSummary {
+            album: Some("Absolution".into()),
+            ..Default::default()
+        };
+        let tracks = vec![SourceTrack {
+            source_path,
+            title: Some("Intro".into()),
+            musicbrainz_recording_id: Some("rec-intro-2374".into()),
+            ..Default::default()
+        }];
+
+        assert_eq!(write_placed_tags(&report, &album, &tracks).await, 1);
+
+        let relu =
+            tune_core::metadata::try_read_metadata(&pose).expect("relecture du fichier pose");
+        assert_eq!(
+            relu.musicbrainz_recording_id.as_deref(),
+            Some("rec-intro-2374"),
+            "l'identifiant retenu n'a pas ete inscrit dans le fichier pose"
+        );
+        assert_eq!(relu.title.as_deref(), Some("Intro"), "le reste est intact");
+    }
 }

@@ -1,7 +1,7 @@
 use axum::Json;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -68,13 +68,15 @@ pub(super) async fn artist_bio(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(q): Query<LangQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let repo = ArtistRepo::with_backend(state.backend.clone());
     let artist = repo.get(id).ok().flatten();
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let lang = q.lang.as_deref().unwrap_or("fr");
+    let lang = langue_demandee(q.lang.as_deref(), &headers);
+    let lang = lang.as_str();
 
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy — this surfaces the sourced Wikipedia/Last.fm/Qobuz/
@@ -138,6 +140,33 @@ pub(super) async fn artist_bio(
         }
         _ => repli_sur_la_bio_stockee(&artist.name, artist.bio.as_deref(), prov),
     }
+}
+
+/// Quelle langue la requête demande-t-elle, pour les deux routes « bio » ?
+///
+/// Précédence, dans cet ordre :
+/// 1. le paramètre `?lang=` explicite — un appel qui nomme sa langue gagne ;
+/// 2. l'en-tête `Accept-Language`, via [`crate::i18n::lang_from_header`], la
+///    MÊME lecture que `browse.rs` et `system/enrich.rs` ;
+/// 3. `fr`, repli déjà porté par `lang_from_header`.
+///
+/// Sans l'étape 2, les deux routes repliaient droit sur `"fr"` (#1849) : le
+/// client web n'envoie `?lang=` sur aucune des deux, il transmet sa locale par
+/// l'en-tête sur CHAQUE requête (`tune-web-client/src/lib/api.ts`). Un
+/// utilisateur en interface anglaise obtenait donc `lang = "fr"`,
+/// `langue_convient(Some("fr"), "fr")` était vrai, et la bio française lui
+/// était resservie — le garde-fou de langue livré au-dessus n'ayant jamais
+/// l'occasion de jouer.
+///
+/// Un `?lang=` vide (`?lang=`) est traité comme absent : il ne nomme aucune
+/// langue, et le laisser passer donnerait `lang = ""`, qui ne convient à
+/// aucune bio estampillée et déclencherait un appel réseau pour rien.
+pub(super) fn langue_demandee(param: Option<&str>, headers: &HeaderMap) -> String {
+    param
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::i18n::lang_from_header(headers))
 }
 
 /// La langue d'une bio stockée convient-elle à celle qu'on demande ?
@@ -328,12 +357,33 @@ pub(super) async fn artist_image(
     axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}")).into_response()
 }
 
-pub(super) async fn artist_image_upload(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    mut multipart: Multipart,
-) -> impl IntoResponse {
-    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+/// Taille maximale d'une image d'artiste deposee a la main.
+///
+/// Le `DefaultBodyLimit` global (50 Mo) laisse passer n'importe quelle photo
+/// d'appareil. Elle serait ecrite dans le cache, puis relue entierement a
+/// chaque vignette. Au-dela de cette borne la route le DIT, au lieu de
+/// repondre 200 (#3102).
+pub(super) const IMAGE_ARTISTE_MAX_OCTETS: usize = 10 * 1024 * 1024;
+
+/// Le coeur de [`artist_image_upload`], repertoire de cache donne.
+///
+/// Separe du gestionnaire pour etre eprouve sans variable d'environnement :
+/// `artwork_cache_dir()` lit `TUNE_ARTWORK_DIR`, commun a tout le processus et
+/// donc inutilisable depuis des essais paralleles. Meme decoupage que
+/// `serve_artwork_from`, juste en face.
+///
+/// La reponse porte l'ARTISTE RELU EN BASE — `image_path` compris. Elle ne
+/// portait que `artist_id`, `hash` et `size` : le client la lit pourtant comme
+/// un artiste complet (`api.ts:1390` la type `Promise<Artist>`,
+/// `ArtistEditModal.svelte:49` fait `updated.image_path ?? null`), donc
+/// `image_path` valait `undefined`, l'apercu retombait sur le gabarit vide, et
+/// le testeur voyait « enregistre » avec une vignette vide (#3102, Fuccaro).
+pub(super) fn enregistrer_image_artiste(
+    artist_repo: &ArtistRepo,
+    id: i64,
+    data: &[u8],
+    cache_dir: &std::path::Path,
+) -> Response {
     let mut artist = match artist_repo.get(id) {
         Ok(Some(a)) => a,
         _ => {
@@ -344,19 +394,98 @@ pub(super) async fn artist_image_upload(
                 .into_response();
         }
     };
+
+    if data.len() > IMAGE_ARTISTE_MAX_OCTETS {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": "image too large",
+                "size": data.len(),
+                "max_size": IMAGE_ARTISTE_MAX_OCTETS,
+            })),
+        )
+            .into_response();
+    }
+
+    // Le format vient des OCTETS, jamais du `content-type` annonce par le
+    // client : celui-ci n'etait consulte que pour y chercher « png », et tout
+    // le reste — WebP de Discogs compris — etait ecrit sous `.jpg` puis servi
+    // `image/jpeg`. Un format que la lecture ne sait pas resservir est refuse
+    // EN LE DISANT (#3102).
+    let Some(ext) = tune_core::library::artwork::sniff_image_ext(data) else {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({
+                "error": "unsupported image format",
+                "supported": tune_core::library::artwork::FORMATS_IMAGE_SERVABLES,
+            })),
+        )
+            .into_response();
+    };
+
+    // Condensat de CONTENU, plus d'identite figee (#1444) : sous
+    // `artwork_hash("artist-{id}")`, remplacer l'image gardait la meme URL
+    // servie `immutable` — l'ancienne image restait affichee. Voir le
+    // commentaire complet dans `artwork.rs::upload_album_artwork`.
+    let hash = tune_core::library::artwork::content_hash(data);
+    if tune_core::library::artwork::save_to_cache(data, cache_dir, &hash, ext).is_none() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to save image"})),
+        )
+            .into_response();
+    }
+
+    artist.image_path = Some(hash.clone());
+    artist.image_source = Some("upload".into());
+    // L'ecriture etait jetee par un `.ok()` : une base en echec repondait
+    // quand meme 200 avec le meme corps, et le prochain chargement perdait
+    // l'image sans que rien ne l'ait dit.
+    if let Err(e) = artist_repo.update(&artist) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("update failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    // On rend l'artiste RELU, pas celui qu'on vient de construire : la reponse
+    // dit alors ce que le prochain chargement lira, et non ce qu'on esperait
+    // avoir ecrit.
+    let enregistre = match artist_repo.get(id) {
+        Ok(Some(a)) if a.image_path.as_deref() == Some(hash.as_str()) => a,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "image saved but not indexed"})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut corps = json!(enregistre);
+    if let Some(obj) = corps.as_object_mut() {
+        // Les trois cles historiques restent : d'autres clients les lisent.
+        obj.insert("artist_id".into(), json!(id));
+        obj.insert("hash".into(), json!(hash));
+        obj.insert("size".into(), json!(data.len()));
+    }
+    Json(corps).into_response()
+}
+
+pub(super) async fn artist_image_upload(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
     let mut image_data: Option<Vec<u8>> = None;
-    let mut ext = "jpg".to_string();
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
         if name == "image" || name == "file" {
-            if let Some(ct) = field.content_type() {
-                if ct.contains("png") {
-                    ext = "png".to_string();
-                }
-            }
             image_data = field.bytes().await.ok().map(|b| b.to_vec());
         }
     }
+
     let Some(data) = image_data else {
         return (
             StatusCode::BAD_REQUEST,
@@ -364,26 +493,9 @@ pub(super) async fn artist_image_upload(
         )
             .into_response();
     };
-    let cache_dir = artwork_cache_dir();
-    std::fs::create_dir_all(&cache_dir).ok();
-    let hash = tune_core::library::artwork::artwork_hash(&format!("artist-{id}"));
-    let path = cache_dir.join(format!("{hash}.{ext}"));
-    if std::fs::write(&path, &data).is_err() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "failed to save image"})),
-        )
-            .into_response();
-    }
-    artist.image_path = Some(hash.clone());
-    artist.image_source = Some("upload".into());
-    artist_repo.update(&artist).ok();
-    Json(json!({
-        "artist_id": id,
-        "hash": hash,
-        "size": data.len(),
-    }))
-    .into_response()
+
+    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+    enregistrer_image_artiste(&artist_repo, id, &data, &artwork_cache_dir())
 }
 
 pub(super) async fn artist_image_report(
@@ -537,5 +649,269 @@ mod tests_langue_bio {
         assert!(langue_convient(None, "en"));
         assert!(langue_convient(Some(""), "en"));
         assert!(langue_convient(Some("   "), "en"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3102 — l'image d'artiste posee a la main.
+// ---------------------------------------------------------------------------
+//
+// Fuccaro, fil forum 1317, 01/09/2026, PC sous Windows 11 : « J'essaye de les
+// ajouter manuellement via le bouton "editer l'artiste", en telechargeant une
+// image sur Discogs. Le message est : "enregistre" mais je n'ai pas l'image
+// qui s'affiche. »
+//
+// Aucun essai ici ne se contente d'un code HTTP — le symptome est justement
+// que le 200 mentait. Chacun va chercher les OCTETS que la route de service
+// rend a l'adresse que la reponse annonce.
+#[cfg(test)]
+mod tests_image_artiste_televersee {
+    use super::*;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::models::Artist;
+
+    fn base_memoire() -> Arc<dyn DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn artiste(repo: &ArtistRepo, nom: &str) -> i64 {
+        repo.create(&Artist::new(nom.into()))
+            .expect("insert artist")
+    }
+
+    /// Un PNG 1x1 VALIDE, fabrique ici octet par octet. Aucune image de
+    /// testeur n'entre dans ce depot.
+    fn png_1x1() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    /// Le format que Discogs sert de plus en plus, et que l'ancien
+    /// gestionnaire rangeait sous `.jpg`.
+    fn webp_minimal() -> Vec<u8> {
+        let mut v = b"RIFF".to_vec();
+        v.extend_from_slice(&[0x14, 0, 0, 0]);
+        v.extend_from_slice(b"WEBPVP8 ");
+        v.extend_from_slice(b"octets-webp");
+        v
+    }
+
+    async fn json_de(reponse: Response) -> (StatusCode, Value) {
+        let statut = reponse.status();
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            statut,
+            serde_json::from_slice(&octets).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Ce que le navigateur obtient reellement a l'adresse annoncee : le code,
+    /// le type MIME, et les octets. C'est la route de service de production
+    /// (`serve_artwork_from`), pas une relecture de fichier a la main.
+    async fn servi(cache: &std::path::Path, hash: &str) -> (StatusCode, String, Vec<u8>) {
+        let reponse = super::super::artwork::serve_artwork_from(cache, hash, None).await;
+        let statut = reponse.status();
+        let mime = reponse
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (statut, mime, octets)
+    }
+
+    /// L'EPREUVE QUI TRANCHE.
+    ///
+    /// Apres televersement, l'adresse rendue par la reponse sert reellement
+    /// l'image televersee — et un second chargement, qui repart de la base
+    /// comme le fait l'ecran apres un F5, la rend encore.
+    ///
+    /// Avant correctif la reponse ne portait que `artist_id`, `hash` et
+    /// `size` : `body["image_path"]` etait absent, l'assertion tombe des la
+    /// premiere ligne. Remettre ces trois cles seules dans
+    /// `enregistrer_image_artiste` la fait retomber.
+    #[tokio::test]
+    async fn l_adresse_rendue_sert_l_image_televersee_et_la_rend_encore() {
+        let cache = tune_core::test_scratch::scratch_dir("tune-3102-adresse");
+        let repo = ArtistRepo::with_backend(base_memoire());
+        let id = artiste(&repo, "Taj Mahal");
+        let octets = png_1x1();
+
+        let (statut, corps) =
+            json_de(enregistrer_image_artiste(&repo, id, &octets, cache.path())).await;
+        assert_eq!(statut, StatusCode::OK, "corps: {corps}");
+
+        let adresse = corps["image_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("la reponse ne porte pas l'adresse de l'image : {corps}"))
+            .to_string();
+
+        // Premier chargement : ce que l'apercu du modal demande sur-le-champ.
+        let (code, mime, servis) = servi(cache.path(), &adresse).await;
+        assert_eq!(code, StatusCode::OK, "l'adresse annoncee n'est pas servie");
+        assert_eq!(mime, "image/png");
+        assert_eq!(servis, octets, "ce ne sont pas les octets televerses");
+
+        // Second chargement : la fiche relue en base, comme apres un F5.
+        let relu = repo.get(id).unwrap().expect("artiste present");
+        assert_eq!(
+            relu.image_path.as_deref(),
+            Some(adresse.as_str()),
+            "la base ne connait pas l'adresse que la reponse a annoncee"
+        );
+        assert_eq!(relu.image_source.as_deref(), Some("upload"));
+        let (code2, _, servis2) = servi(cache.path(), relu.image_path.as_deref().unwrap()).await;
+        assert_eq!(code2, StatusCode::OK);
+        assert_eq!(servis2, octets, "le second chargement perd l'image");
+    }
+
+    /// Le format se lit dans les octets : un WebP est servi `image/webp`, pas
+    /// range sous `.jpg` et annonce `image/jpeg`.
+    #[tokio::test]
+    async fn un_webp_est_servi_comme_un_webp() {
+        let cache = tune_core::test_scratch::scratch_dir("tune-3102-webp");
+        let repo = ArtistRepo::with_backend(base_memoire());
+        let id = artiste(&repo, "Stretch");
+        let octets = webp_minimal();
+
+        let (statut, corps) =
+            json_de(enregistrer_image_artiste(&repo, id, &octets, cache.path())).await;
+        assert_eq!(statut, StatusCode::OK, "corps: {corps}");
+        let adresse = corps["image_path"].as_str().expect("adresse").to_string();
+
+        let (code, mime, servis) = servi(cache.path(), &adresse).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(mime, "image/webp", "l'extension ecrite ment sur le contenu");
+        assert_eq!(servis, octets);
+
+        // TEMOIN de l'enrichissement automatique : c'est le predicat exact sur
+        // lequel `batch_enrich_artist_artwork_inner` decide de remettre un
+        // artiste dans sa file — donc d'ecraser l'image posee a la main.
+        assert!(
+            tune_core::library::artwork::cached_artwork_exists(cache.path(), &adresse),
+            "la passe automatique croirait le cache vide et ecraserait l'image"
+        );
+    }
+
+    /// TEMOIN : un artiste sans image n'en a toujours aucune, proprement.
+    /// Aucune entree fantome, aucun condensat annonce dans le vide.
+    #[tokio::test]
+    async fn un_artiste_sans_image_n_en_annonce_aucune() {
+        let cache = tune_core::test_scratch::scratch_dir("tune-3102-vide");
+        let repo = ArtistRepo::with_backend(base_memoire());
+        let id = artiste(&repo, "Charades");
+
+        let relu = repo.get(id).unwrap().expect("artiste present");
+        assert_eq!(relu.image_path, None);
+        assert!(!tune_core::library::artwork::cached_artwork_exists(
+            cache.path(),
+            "ffffffffffffffffffffffffffffffff"
+        ));
+        let (code, _, _) = servi(cache.path(), "ffffffffffffffffffffffffffffffff").await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    /// TEMOIN : un fichier refuse echoue EN LE DISANT. Pas de 200, et surtout
+    /// pas d'adresse annoncee en base pour un fichier que la lecture ne
+    /// saurait pas resservir.
+    #[tokio::test]
+    async fn un_fichier_qui_n_est_pas_une_image_est_refuse_en_le_disant() {
+        let cache = tune_core::test_scratch::scratch_dir("tune-3102-format");
+        let repo = ArtistRepo::with_backend(base_memoire());
+        let id = artiste(&repo, "Sam Cooke");
+
+        let (statut, corps) = json_de(enregistrer_image_artiste(
+            &repo,
+            id,
+            b"<!doctype html><title>page Discogs</title>",
+            cache.path(),
+        ))
+        .await;
+        assert_eq!(statut, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(corps["error"], "unsupported image format");
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().image_path,
+            None,
+            "un refus ne doit rien indexer"
+        );
+    }
+
+    /// TEMOIN : trop gros echoue en le disant, avec la borne dans le corps.
+    #[tokio::test]
+    async fn une_image_trop_grosse_est_refusee_en_le_disant() {
+        let cache = tune_core::test_scratch::scratch_dir("tune-3102-taille");
+        let repo = ArtistRepo::with_backend(base_memoire());
+        let id = artiste(&repo, "Quarterflash");
+
+        let mut enorme = png_1x1();
+        enorme.resize(IMAGE_ARTISTE_MAX_OCTETS + 1, 0);
+        let (statut, corps) =
+            json_de(enregistrer_image_artiste(&repo, id, &enorme, cache.path())).await;
+        assert_eq!(statut, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(corps["max_size"], IMAGE_ARTISTE_MAX_OCTETS);
+        assert_eq!(repo.get(id).unwrap().unwrap().image_path, None);
+        assert_eq!(
+            std::fs::read_dir(cache.path())
+                .into_iter()
+                .flatten()
+                .count(),
+            0,
+            "rien ne doit etre ecrit dans le cache"
+        );
+    }
+
+    /// TEMOIN : un artiste qui n'existe pas reste un 404, et le cache reste
+    /// vide — le refus precede toute ecriture.
+    #[tokio::test]
+    async fn un_artiste_inconnu_reste_un_404() {
+        let cache = tune_core::test_scratch::scratch_dir("tune-3102-inconnu");
+        let repo = ArtistRepo::with_backend(base_memoire());
+        let (statut, corps) = json_de(enregistrer_image_artiste(
+            &repo,
+            4242,
+            &png_1x1(),
+            cache.path(),
+        ))
+        .await;
+        assert_eq!(statut, StatusCode::NOT_FOUND);
+        assert_eq!(corps["error"], "artist not found");
+        assert_eq!(
+            std::fs::read_dir(cache.path())
+                .into_iter()
+                .flatten()
+                .count(),
+            0
+        );
+    }
+
+    /// Le contrat de compatibilite : les trois cles que la reponse portait
+    /// avant #3102 sont toujours la, a cote de l'artiste.
+    #[tokio::test]
+    async fn les_trois_cles_historiques_restent_dans_la_reponse() {
+        let cache = tune_core::test_scratch::scratch_dir("tune-3102-cles");
+        let repo = ArtistRepo::with_backend(base_memoire());
+        let id = artiste(&repo, "Jermaine Jackson");
+        let octets = png_1x1();
+
+        let (_, corps) = json_de(enregistrer_image_artiste(&repo, id, &octets, cache.path())).await;
+        assert_eq!(corps["artist_id"], id);
+        assert_eq!(corps["size"], octets.len());
+        assert_eq!(corps["hash"], corps["image_path"]);
+        assert_eq!(corps["name"], "Jermaine Jackson");
     }
 }

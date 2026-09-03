@@ -208,18 +208,23 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn tmp_source(bytes: usize) -> String {
-        // A unique real file so metadata() succeeds; content size varies the key.
-        let p =
-            std::env::temp_dir().join(format!("tcache-src-{}-{}.flac", std::process::id(), bytes));
+    /// A unique real file so metadata() succeeds; content size varies the key.
+    ///
+    /// Rendu comme `ScratchFile` et non comme `String` : le fichier vit à la
+    /// racine de `temp_dir()` — c'est là que l'éviction balaie, un
+    /// sous-dossier retirerait sa substance au test — et il doit malgré tout
+    /// disparaître à la sortie du test, panique comprise (#3030).
+    fn tmp_source(bytes: usize) -> crate::test_scratch::ScratchFile {
+        let p = crate::test_scratch::scratch_file("tcache-src", &format!("-{bytes}.flac"));
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(&vec![0u8; bytes]).unwrap();
-        p.to_string_lossy().to_string()
+        p
     }
 
     #[test]
     fn cache_path_is_deterministic_and_param_sensitive() {
-        let src = tmp_source(100);
+        let fichier = tmp_source(100);
+        let src = fichier.to_string_lossy();
         let a = cache_path(&src, "flac", 44100, 16, 2).unwrap();
         let b = cache_path(&src, "flac", 44100, 16, 2).unwrap();
         assert_eq!(a, b, "same inputs → same path");
@@ -231,7 +236,6 @@ mod tests {
         assert_ne!(a, cache_path(&src, "flac", 48000, 16, 2).unwrap());
         assert_ne!(a, cache_path(&src, "flac", 44100, 24, 2).unwrap());
         assert_ne!(a, cache_path(&src, "flac", 44100, 16, 1).unwrap());
-        let _ = std::fs::remove_file(&src);
     }
 
     #[test]
@@ -287,28 +291,24 @@ mod tests {
 
     #[test]
     fn is_hit_requires_completed_file() {
-        let p = std::env::temp_dir().join(format!("tune-tcache-hit-{}.flac", std::process::id()));
+        let p = crate::test_scratch::scratch_file("tune-tcache-hit", ".flac");
         let ps = p.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&p);
         assert!(!is_hit(&ps), "missing → miss");
         std::fs::write(&p, vec![0u8; 10]).unwrap();
         assert!(!is_hit(&ps), "tiny file → miss");
         std::fs::write(&p, vec![0u8; 2048]).unwrap();
         assert!(is_hit(&ps), "completed file → hit");
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn evict_never_removes_recent_files() {
         // A freshly written cache file is younger than EVICT_MIN_AGE_SECS, so
         // even with a 0-byte cap it must survive (it may be streaming).
-        let p =
-            std::env::temp_dir().join(format!("tune-tcache-recent-{}.flac", std::process::id()));
+        let p = crate::test_scratch::scratch_file("tune-tcache-recent", ".flac");
         std::fs::write(&p, vec![0u8; 4096]).unwrap();
         // Cap of 0 forces eviction pressure; the file is younger than
         // EVICT_MIN_AGE_SECS so it must still survive.
         evict_with_cap(0);
         assert!(p.exists(), "recent file must not be evicted");
-        let _ = std::fs::remove_file(&p);
     }
 }

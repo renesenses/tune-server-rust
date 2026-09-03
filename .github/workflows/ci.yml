@@ -2,15 +2,7 @@ name: CI
 
 on:
   push:
-    # La ligne de release doit etre couverte comme main : c'est d'elle que
-    # sortent les tags v0.9.x. Sans cela, une PR vers release/v0.9 n'etait
-    # verifiee que par test-postgres.yml (seul workflow dont le trigger
-    # pull_request n'a pas de filtre de branche) — donc ni fmt, ni clippy, ni
-    # cargo test, ni compilation. Trois defauts sont passes ainsi le 8 aout
-    # 2026 et n'ont ete revels qu'en construisant la branche elle-meme : un
-    # test OAAT instable (#1358), une migration PG non declaree (#1364), et
-    # l'incident #875 en juillet avait deja le meme mecanisme.
-    branches: [main, release/v0.9]
+    branches: [main]
   # Toutes les PR, y compris les PR empilees dont la base est une branche de
   # travail. L'ancien filtre main/release laissait ces PR avec PostgreSQL seul.
   pull_request:
@@ -54,6 +46,7 @@ jobs:
         env:
           EVENEMENT: ${{ github.event_name }}
           BASE_REF_CI: ${{ github.base_ref }}
+          HEAD_REF_CI: ${{ github.head_ref }}
           FORCER_COMPLET: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -74,6 +67,14 @@ jobs:
           else
             echo "full=true" >> "$GITHUB_OUTPUT"
             echo "profil complet : $EVENEMENT vers ${BASE_REF_CI:-sans-base}"
+          fi
+
+          # Une promotion RC -> main valide toujours le serveur entier, meme
+          # si le dernier diff ne touche que la CI ou les versions.
+          if [ "$EVENEMENT" = pull_request ] && [ "$BASE_REF_CI" = main ] && [[ "$HEAD_REF_CI" = rc/* ]]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "promotion $HEAD_REF_CI -> main : batterie complete"
+            exit 0
           fi
 
           case "$EVENEMENT" in
@@ -128,6 +129,16 @@ jobs:
           bash scripts/verifier-refs-issues.sh --autotest
           python3 scripts/preflight-check.py --self-test
           python3 scripts/measure-compile.py --self-test
+          python3 scripts/verser-message-forum.py --self-test
+          python3 scripts/synchroniser-release-main.py --self-test
+
+      # Contre-epreuve du critere de selection des rondes de tri (#2910),
+      # rejouee hors ligne sur la fenetre reelle du 28 au 30/08/2026 : le
+      # critere retire rate les reponses 5922, 5949 et 5958, le critere par
+      # message les selectionne, et le fil temoin 1588 reste hors lot des
+      # deux cotes. Aucun reseau, aucune ecriture sur le forum.
+      - name: Contre-épreuve de la ronde de tri
+        run: python3 scripts/nouveautes-forum.py --self-test
 
       - name: Syntaxe des scripts de garde-fou
         run: |
@@ -181,7 +192,56 @@ jobs:
       # `cloud-relay`, absent de tous les jeux de fonctionnalites de la CI.
       # Le relayage des flux y est donc reste un `TODO Phase 2` sans que rien
       # ne rougisse : une requete de flux distante finissait en 504, muette.
-      - run: cargo test -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay
+      #
+      # `-p tune-http-types` et `-p tune-smart-http` : deux caisses extraites
+      # par ce lot. Sans elles ici, le decoupage aurait retire du code de la
+      # porte au lieu de l'y garder — la liste est un inventaire, pas un
+      # echantillon (cf #2865).
+      #
+      # `bandcamp` : meme motif que `local-audio` cote clippy (#2865).
+      # `tune-server/tests/bandcamp_file_de_zone_i2702.rs`
+      # vit derriere `#![cfg(feature = "bandcamp")]` parce que la caisse
+      # `tune-bandcamp` est une dependance OPTIONNELLE
+      # (`bandcamp = ["dep:tune-bandcamp"]`) : sans la fonctionnalite, ni le
+      # service ni son inscription dans `state.rs` n'existent. La retirer
+      # d'ici ne rendrait pas ces cinq essais rouges — elle les rendrait
+      # INVISIBLES, et #2702/#2778 redeviendraient verts contre rien. Ils ne
+      # tourneraient alors que dans `test-shipped-features`, differe jusqu'a
+      # `full`, donc JAMAIS sur une PR vers `batch/*`.
+      #
+      # La fonctionnalite est dans le `default` de `tune-server` et dans TOUS
+      # les binaires publies ; c'est `--no-default-features` qui la retirait
+      # ici. Elle ne tire aucune caisse audio ni systeme
+      # (`plugins/tune-bandcamp/Cargo.toml` : axum, serde, reqwest, tokio,
+      # tracing) : rien de plus a installer sur ce runner.
+      #
+      # Garde : `le_job_test_de_la_ci_active_bandcamp`
+      # (tune-server/tests/workflows_bornes.rs).
+      #
+      # #3266 — les SEPT paquets ci-dessus etaient les seuls que la CI
+      # EXECUTAIT. Un membre du workspace qu'aucun `-p` ne nomme n'est jamais
+      # lance : ses tests ne peuvent ni passer ni echouer. Recense le
+      # 03/09/2026 sur les trois workflows qui lancent `cargo test`
+      # (`ci.yml`, `test-postgres.yml`, `widget-ci.yml` — ce dernier tourne
+      # dans un AUTRE workspace) : `tune-bandcamp` (47 essais, dont les DEUX
+      # gardes de site de #2778, qui ne pouvaient donc pas crier),
+      # `tune-plugin-runtime-wasm` (8), `tune-ffi` (3), `tune-karaoke` (3)
+      # n'etaient nommes NULLE PART. Verts sous `cargo test --workspace`, que
+      # personne ne joue.
+      #
+      # `tune-cli`, `tune-dj` et `tune-concerts` sont nommes ici SANS avoir de
+      # test aujourd'hui : c'est la place qui manquait, pas les essais. Le
+      # premier `#[test]` qu'on y ecrira tournera des sa PR au lieu d'attendre
+      # qu'on repense a elargir la porte.
+      #
+      # Aucune de ces caisses ne tire de dependance audio ni systeme (axum,
+      # serde, reqwest, tokio, tracing, clap, wasmtime) : rien de plus a
+      # installer sur ce runner.
+      #
+      # Garde : `tout_membre_du_workspace_est_execute_par_une_porte_cargo_test`
+      # (tune-server/tests/workflows_bornes.rs) relit `members` du Cargo.toml
+      # racine et tombe des qu'un membre n'est nomme par aucune porte.
+      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge -p tune-cli -p tune-ffi -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,cloud-relay,bandcamp
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -218,7 +278,15 @@ jobs:
           done
           echo "::error::apt injoignable apres 3 essais"
           exit 1
-      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+      # #3266 — les quatre greffons in-tree et le moteur WASM sont deja
+      # COMPILES ici, tires par `dj,karaoke,bandcamp,concerts,plugins-wasm` en
+      # tant que dependances optionnelles de `tune-server`. Ce qui manquait,
+      # c'est de les SELECTIONNER : sans `-p`, cargo construit leur `lib` et ne
+      # construit jamais leur binaire de test. Les nommer ici ne rajoute donc
+      # aucune dependance a compiler — seulement les harnais — et fait tourner
+      # leurs essais avec le jeu de fonctionnalites LIVRE, en plus du jeu
+      # reduit du job `test`.
+      - run: cargo test --no-fail-fast -p tune-server -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This
@@ -268,15 +336,36 @@ jobs:
           echo "::error::apt injoignable apres 3 essais"
           exit 1
       - run: cargo check -p tune-server --features audio-embedding
-      - run: cargo test -p tune-core --features audio-embedding
+      - run: cargo test --no-fail-fast -p tune-core --features audio-embedding
 
-  # Signal Windows sur une PR complete : les deux configurations qui ont deja
-  # casse uniquement sur cet OS sont compilees sur l'integration du lot, ou
-  # immediatement avec `ci:full`. La matrice de livraison les rejoue au push.
+  # Signal Windows sur TOUTE PR qui touche du Rust — plus seulement sur une PR
+  # « complete » (#3123).
+  #
+  # Ce que la condition `full` a coute, mesure : le commit 93186f81 (#3074)
+  # appelait `rand_core::OsRng` depuis `tune-core/src/db/album_repo.rs`, du code
+  # sans garde de plateforme, alors que `rand_core` n'est declare que sous
+  # `[target.'cfg(unix)'.dependencies]`. Une PR vers `batch/*` ne porte pas
+  # `full` : le defaut a traverse SA PROPRE PR, puis le lot, puis la RC sans
+  # qu'aucune compilation Windows ne l'ait vu. La promotion `rc/v0.9.130 -> main`
+  # (#3112) est la premiere a porter `full` : elle est partie rouge, et le train
+  # de la 0.9.130 s'est arrete.
+  #
+  # Le cout est un `cargo check`, pas une matrice de livraison. Mesure sur les
+  # executions du 01/09/2026 qui ont reellement lance ces deux jobs (#3112 et
+  # les trois promotions rc/v0.9.130) : `windows-pr` 7 min 55 / 9 min 45 /
+  # 10 min 20 / 10 min 34, `macos-pr` 3 min 19 / 5 min 19 / 5 min 22 / 6 min 08.
+  # Les jobs sont paralleles : sur une PR de lot, le mur passe de ~5 min 40 (le
+  # job `test`, le plus long aujourd'hui) a ~10 min 40, et `macos-pr` reste sous
+  # le mur existant. Le depot est PUBLIC : ces minutes de runner ne sont pas
+  # facturees.
+  #
+  # Deliberement PAS la piste « poser `ci:full` quand un Cargo.toml change » :
+  # #3074 ne touchait aucun manifeste — la caisse etait deja declaree sous son
+  # `cfg(unix)`, seul l'APPEL etait neuf. Ce garde-la n'aurait rien vu.
   windows-pr:
     name: Windows + ASIO (compilation PR)
     needs: impact
-    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -305,13 +394,19 @@ jobs:
       - name: ASIO
         run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
 
-  # Un seul ABI/configuration macOS suffit sur une PR complete : les deux
-  # architectures partagent le meme cfg Rust. Les deux vrais binaires restent
-  # construits au push, puis par le workflow qui fabrique la release taguee.
+  # Un seul ABI/configuration macOS suffit : les deux architectures partagent le
+  # meme cfg Rust. Les deux vrais binaires restent construits au push, puis par
+  # le workflow qui fabrique la release taguee.
+  #
+  # Arme sur toute PR qui touche du Rust, comme `windows-pr` ci-dessus (#3123).
+  # `cfg(target_os = "macos")` est l'autre famille de code que Linux ne compile
+  # jamais ; la laisser derriere `full` reproduirait exactement le trou de
+  # #3074, une plateforme plus loin. Mesure : 3 min 19 a 6 min 08, donc sous le
+  # mur deja pose par le job `test` — ce job n'allonge pas la PR.
   macos-pr:
     name: macOS (compilation PR)
     needs: impact
-    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -375,7 +470,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux' && !matrix.cross
@@ -400,11 +495,11 @@ jobs:
 
       - name: Build (native, Linux with local-audio)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
       - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       # The `asio` feature (Windows-only, cfg(all(windows, feature="asio"))) is
       # NOT covered by the build above, so ASIO code compiled only at release
@@ -426,7 +521,7 @@ jobs:
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,bandcamp,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,bandcamp,concerts,plugins-wasm
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -450,12 +545,29 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.zip
 
+  # La liste `--features` de cette porte est un INVENTAIRE, pas un echantillon :
+  # avec `--no-default-features`, une feature absente d'ici n'est lue par AUCUN
+  # lint. Le test `toute_feature_declaree_est_activee_par_une_porte_clippy`
+  # (tune-server/tests/workflows_bornes.rs) refuse desormais toute feature
+  # declaree qui n'y figure pas — ou qui n'est pas inscrite avec sa raison.
+  #
+  # Mesure du 31/08/2026 (#2865), avant cet elargissement — quatre features
+  # nues : `local-audio` (16 fichiers, dont `outputs/local.rs` et ses 10 826
+  # lignes), `postgres` (11), `audio-embedding` (3), `asio` (3).
+  #
+  # L'issue ne citait que `audio-embedding`. Le plus gros trou etait ailleurs :
+  # `local-audio` est dans le `default` des deux crates, et c'est precisement
+  # `--no-default-features` qui la retirait. Deux agents ont du relancer clippy
+  # a la main sur `local.rs` dans la nuit du 30 au 31/08.
+  #
+  # `asio` reste dehors — `cpal/asio` ne se compile que sous Windows ; le job
+  # `windows-pr` la couvre en `cargo check`.
   clippy:
     name: Clippy
     needs: impact
     if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # clippy — 2 min observe
+    timeout-minutes: 45  # clippy — 4 min observe (2 min avant #2865)
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -463,7 +575,32 @@ jobs:
           components: clippy
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
-      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
+      # `local-audio` tire cpal, qui lie ALSA : sans ce paquet la porte s'arrete
+      # sur « Package alsa was not found in the pkg-config search path ».
+      # Meme boucle de reprises que les autres jobs — cf release.yml.
+      - name: Install ALSA dev (retry — voir release.yml)
+        timeout-minutes: 18
+        run: |
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais"
+          exit 1
+      # UNION des deux cotes, jamais un camp. La liste des paquets et celle des
+      # features sont deux inventaires, pas des echantillons (#2865) :
+      #  - `-p tune-http-types` et `-p tune-smart-http` viennent de ce lot,
+      #    deux caisses extraites ; les en sortir retirerait ce code de la
+      #    porte en le decoupant — c'est precisement ce que cette porte a
+      #    attrape apres la fusion precedente ;
+      #  - `concerts` vient de `rc` (#2768, 12987dbd) ; l'en sortir rouvrirait
+      #    l'angle mort que ce commit-la venait de fermer, et
+      #    `toute_feature_declaree_est_activee_par_une_porte_clippy` rougirait.
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
@@ -495,9 +632,13 @@ jobs:
         with:
           denyWarnings: true
           # Avis « unmaintained » sans correctif disponible, chacun justifie
-          # dans .cargo/audit.toml : paste et instant (transitifs, hors chemin
-          # d'execution), audiopus_sys (arbitrage ouvert, cf #2251).
-          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384,RUSTSEC-2026-0150
+          # dans .cargo/audit.toml : paste et instant, tous deux transitifs et
+          # hors du chemin d'execution.
+          #
+          # RUSTSEC-2026-0150 (audiopus_sys) a quitte cette liste : la
+          # dependance a ete remplacee par `opus` / `opusic-sys`, maintenus
+          # (#2251). Il n'y a plus d'avis a taire.
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
 
   ffi:
     name: FFI mobile (compilation)
@@ -584,3 +725,49 @@ jobs:
           cargo check -p tune-ffi --target aarch64-linux-android
         env:
           RUSTFLAGS: ""
+
+  # Check unique exige sur main. Les PR unitaires vers rc/* gardent le profil
+  # rapide ; seule une RC peut atteindre main et elle doit rendre toute la
+  # batterie complete ci-dessus en succes. PostgreSQL reste un required check
+  # separe, porte par test-postgres.yml.
+  release-gate:
+    name: release-gate
+    if: always() && github.event_name == 'pull_request' && github.base_ref == 'main'
+    needs:
+      - impact
+      - fmt
+      - test
+      - test-shipped-features
+      - audio-embedding
+      - windows-pr
+      - macos-pr
+      - clippy
+      - audit
+      - ffi
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Refuser une branche autre qu'une RC
+        if: startsWith(github.head_ref, 'rc/') == false
+        run: |
+          echo "::error::main n'accepte que les promotions rc/*"
+          exit 1
+
+      - name: Refuser un job absent, ignore ou rouge
+        if: >-
+          needs.impact.result != 'success' ||
+          needs.fmt.result != 'success' ||
+          needs.test.result != 'success' ||
+          needs.test-shipped-features.result != 'success' ||
+          needs.audio-embedding.result != 'success' ||
+          needs.windows-pr.result != 'success' ||
+          needs.macos-pr.result != 'success' ||
+          needs.clippy.result != 'success' ||
+          needs.audit.result != 'success' ||
+          needs.ffi.result != 'success'
+        run: |
+          echo "::error::la batterie complete n'est pas entierement verte"
+          exit 1
+
+      - name: Confirmer la promotion
+        run: echo "RC verte, eligible a la promotion vers main"

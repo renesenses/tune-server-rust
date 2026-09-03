@@ -51,6 +51,17 @@ P0_VERIFICATION_PENDING_LABEL = "release:verification-pending"
 # seulement dans le journal, que personne ne deroule.
 P0_FIELD_BLOCKED_LABEL = "bloque:terrain"
 
+# Known people may use more than one clone or process, but these two addresses
+# must never cross owners. Keep this deliberately narrow: the release gate is
+# meant to reject the mixed pairs that have already forged attribution, not to
+# turn every future contributor into an allow-list entry.
+MIXED_IDENTITY_PAIRS = {
+    ("bertrand", "jp@robbe.net"),
+    ("renesenses", "jp@robbe.net"),
+    ("jean-philippe robbe", "renesenses@gmail.com"),
+    ("jprobbe", "renesenses@gmail.com"),
+}
+
 
 @dataclass
 class CheckResult:
@@ -132,6 +143,125 @@ def check_version_bump(tag: str) -> CheckResult:
         True,
         f"tag {tag_tuple} >= Cargo.toml {cur_tuple}",
     )
+
+
+def check_identity_contract(
+    identities: list[tuple[str, str, str]], name: str
+) -> CheckResult:
+    """Reject known name/email mixtures without imposing a contributor allow-list."""
+    mixed = [
+        f"{role}={person} <{email}>"
+        for role, person, email in identities
+        if (person.strip().casefold(), email.strip().casefold())
+        in MIXED_IDENTITY_PAIRS
+    ]
+    rendered = "; ".join(
+        f"{role}={person} <{email}>" for role, person, email in identities
+    )
+    if mixed:
+        return CheckResult(
+            name,
+            False,
+            "mixed Git identity: " + "; ".join(mixed),
+        )
+    return CheckResult(name, True, rendered)
+
+
+def check_release_commit_identity() -> CheckResult:
+    """Validate the author and committer stored on the commit being released."""
+    revision = os.environ.get("GITHUB_SHA") or "HEAD"
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "show",
+                "-s",
+                "--format=%an%x00%ae%x00%cn%x00%ce",
+                revision,
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return CheckResult("release_identity", False, f"cannot read Git identity: {exc}")
+    fields = proc.stdout.rstrip("\n").split("\x00")
+    if proc.returncode != 0 or len(fields) != 4:
+        detail = proc.stderr.strip() or "unexpected git show output"
+        return CheckResult("release_identity", False, detail)
+    return check_identity_contract(
+        [("author", fields[0], fields[1]), ("committer", fields[2], fields[3])],
+        "release_identity",
+    )
+
+
+def _parse_git_var_identity(value: str) -> Optional[tuple[str, str]]:
+    """Parse `git var GIT_*_IDENT` without depending on its timestamp."""
+    match = re.match(r"^(.*) <([^<>]+)> \d+ [+-]\d{4}$", value.strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def check_planned_git_identity() -> CheckResult:
+    """Validate the identities Git would use for the next local commit."""
+    identities: list[tuple[str, str, str]] = []
+    for role, variable in [
+        ("author", "GIT_AUTHOR_IDENT"),
+        ("committer", "GIT_COMMITTER_IDENT"),
+    ]:
+        try:
+            proc = subprocess.run(
+                ["git", "var", variable],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return CheckResult("planned_identity", False, f"cannot run git var: {exc}")
+        parsed = _parse_git_var_identity(proc.stdout) if proc.returncode == 0 else None
+        if parsed is None:
+            detail = proc.stderr.strip() or f"cannot parse {variable}"
+            return CheckResult("planned_identity", False, detail)
+        identities.append((role, parsed[0], parsed[1]))
+    return check_identity_contract(identities, "planned_identity")
+
+
+def self_test_identity_contract() -> None:
+    valid = check_identity_contract(
+        [
+            ("author", "Jean-Philippe ROBBE", "jp@robbe.net"),
+            ("committer", "Bertrand", "renesenses@gmail.com"),
+        ],
+        "test",
+    )
+    assert valid.passed, valid
+
+    forged_author = check_identity_contract(
+        [("author", "Bertrand", "jp@robbe.net")], "test"
+    )
+    assert not forged_author.passed, forged_author
+    assert "Bertrand <jp@robbe.net>" in forged_author.detail
+
+    forged_committer = check_identity_contract(
+        [("committer", "Jean-Philippe ROBBE", "renesenses@gmail.com")], "test"
+    )
+    assert not forged_committer.passed, forged_committer
+
+    # Unknown contributors remain valid: this is a consistency guard, not an
+    # allow-list that silently bars a new maintainer from making a release.
+    unknown = check_identity_contract(
+        [("author", "Nouvelle Mainteneuse", "maintainer@example.org")], "test"
+    )
+    assert unknown.passed, unknown
+
+    assert _parse_git_var_identity("Bertrand <renesenses@gmail.com> 1 +0200") == (
+        "Bertrand",
+        "renesenses@gmail.com",
+    )
+    assert _parse_git_var_identity("invalid") is None
 
 
 def classify_open_p0_issues(
@@ -467,20 +597,107 @@ def check_cargo_deny() -> CheckResult:
     return CheckResult("cargo_deny", True, "licenses + duplicates clean")
 
 
-def check_ci_status(repo: str, sha: str, token: Optional[str]) -> CheckResult:
-    """Check that all completed CI check-runs on the tag commit are success."""
-    try:
+# ─── Portes de release ────────────────────────────────────────────────
+#
+# `ci_status` regardait TOUTE execution terminee du commit tague. Ce n'est pas
+# un detail de tri : sur le commit d'une release, GitHub accroche aussi les
+# sondes planifiees (`uptime-watch`, `forum-watch`), les robots d'issues
+# (`fermeture-issues`), la machinerie du train (`release-controller`,
+# `release` — donc le preflight LUI-MEME) et les AUDITS de gouvernance.
+#
+# Le 02/09, v0.9.131 a ete bloquee par trois « echecs » dont aucun n'etait un
+# test : une tentative du controleur rejouee avec succes ensuite, la conclusion
+# precedente du preflight lui-meme, et « Derive des garde-fous » — un audit
+# declenche par le `push` de la promotion vers `main` (le commit touche
+# `.github/workflows/**`), demarre 6 secondes apres le commit. Cet audit rougit
+# PAR CONSTRUCTION pendant un train : il constate que le gel des tags est
+# ouvert et que l'armement est a `true`, c'est-a-dire l'etat normal d'une
+# release en cours. Les deux gardes se contredisent par definition.
+#
+# v0.9.130 avait le MEME audit en echec sur son commit ; elle est passee parce
+# que l'audit n'y a tourne que 5 h apres son preflight (planification, pas
+# `push` : sa promotion ne touchait pas de workflow). Ce n'etait donc pas une
+# regression mais une course, gagnee par hasard de calendrier une fois et
+# perdue la fois suivante.
+#
+# La regle retenue est une LISTE BLANCHE de WORKFLOWS, pas de noms de jobs.
+# C'est le compromis qui evite le faux vert la ou le changement est routinier :
+# ajouter un job a `ci.yml` (« Audio embedding feature », « Impact et
+# garde-fous legers », une cible `Build …` de plus) arrive toutes les semaines
+# et se retrouve compte AUTOMATIQUEMENT, alors qu'une liste blanche de noms
+# l'aurait laisse tomber en silence. Seule la creation d'un nouveau FICHIER de
+# workflow-porte demande de venir l'inscrire ici — un acte rare et delibere,
+# visible en revue. Une liste noire d'audits connus a ete ecartee : ce depot
+# ajoute des audits en permanence, et le prochain rebloquerait un train.
+RELEASE_GATE_WORKFLOWS: tuple[str, ...] = (
+    ".github/workflows/ci.yml",
+    ".github/workflows/test-postgres.yml",
+    ".github/workflows/widget-ci.yml",
+)
+
+# `ci.yml` est la seule des trois sans filtre `paths` sur `push: [main]` : elle
+# tourne sur TOUT commit promu. Son absence n'est donc jamais « rien a
+# signaler », c'est un garde qui ne trouve pas sa porte — et un garde qui ne
+# trouve rien doit refuser. Les deux autres ont un filtre `paths` et peuvent
+# legitimement manquer.
+MANDATORY_GATE_WORKFLOW = ".github/workflows/ci.yml"
+
+
+def release_gate_suites(repo: str, sha: str, token: Optional[str]) -> dict[int, str]:
+    """Renvoie {check_suite_id: fichier de workflow} pour les seules portes."""
+    suites: dict[int, str] = {}
+    for workflow in RELEASE_GATE_WORKFLOWS:
+        filename = workflow.rsplit("/", 1)[-1]
         data = github_api(
-            f"/repos/{repo}/commits/{sha}/check-runs?per_page=100",
+            f"/repos/{repo}/actions/workflows/{filename}/runs"
+            f"?head_sha={sha}&per_page=100",
             token,
         )
+        for wrun in data.get("workflow_runs", []):
+            suite_id = wrun.get("check_suite_id")
+            if suite_id is not None:
+                suites[suite_id] = workflow
+    return suites
+
+
+def check_ci_status(repo: str, sha: str, token: Optional[str]) -> CheckResult:
+    """Check that the release GATES on the tag commit are green.
+
+    Les check-runs sont lus SUITE PAR SUITE (`/check-suites/{id}/check-runs`)
+    et non via `/commits/{sha}/check-runs`. Ce dernier renvoie tout ce qui
+    s'accroche au commit — 148 entrees sur le commit de la v0.9.130, donc
+    au-dela de la premiere page : filtrer apres coup une liste tronquee ferait
+    disparaitre les portes elles-memes. Interroger les suites des portes borne
+    la lecture a ce qui compte.
+    """
+    try:
+        gates = release_gate_suites(repo, sha, token)
+        runs: list[dict] = []
+        for suite_id in gates:
+            data = github_api(
+                f"/repos/{repo}/check-suites/{suite_id}/check-runs?per_page=100",
+                token,
+            )
+            runs.extend(data.get("check_runs", []))
     except HTTPError as e:
         return CheckResult("ci_status", False, f"GitHub API error: {e.code}")
     except Exception as e:
         return CheckResult("ci_status", False, f"GitHub API error: {e}")
-    runs = data.get("check_runs", [])
+
+    if MANDATORY_GATE_WORKFLOW not in gates.values():
+        return CheckResult(
+            "ci_status",
+            False,
+            f"aucune execution de {MANDATORY_GATE_WORKFLOW} sur ce commit : "
+            "porte de release introuvable",
+        )
     if not runs:
-        return CheckResult("ci_status", False, "no CI check-runs found on this commit")
+        return CheckResult(
+            "ci_status",
+            False,
+            "aucun check-run de porte de release sur ce commit",
+        )
+
     failures = [
         r["name"]
         for r in runs
@@ -497,17 +714,172 @@ def check_ci_status(repo: str, sha: str, token: Optional[str]) -> CheckResult:
     # Only actually-failed runs (handled above) block. Release itself cannot
     # start building before this reusable workflow has succeeded.
     pending = [r["name"] for r in runs if r.get("status") != "completed"]
+    gate_names = ", ".join(sorted({w.rsplit("/", 1)[-1] for w in gates.values()}))
     if pending:
         return CheckResult(
             "ci_status",
             True,
-            f"completed check-runs green ({len(pending)} still running: {', '.join(pending[:5])})",
+            f"portes de release vertes ({gate_names}) — "
+            f"{len(pending)} encore en cours : {', '.join(pending[:5])}",
         )
     return CheckResult(
         "ci_status",
         True,
-        f"all {len(runs)} check-runs green",
+        f"{len(runs)} check-runs verts sur les portes de release ({gate_names})",
     )
+
+
+def self_test_ci_status_gates() -> None:
+    """Contre-epreuves du filtre : un audit ne bloque pas, une porte si."""
+
+    def suite_runs(*names_states: tuple) -> dict:
+        return {
+            "check_runs": [
+                {"name": name, "status": status, "conclusion": conclusion}
+                for name, status, conclusion in names_states
+            ]
+        }
+
+    # Suites reelles du commit b362f854 (v0.9.131). Les portes, la machinerie
+    # du train et l'audit de gouvernance vivent dans des suites A PART.
+    CI_SUITE = 91193662811
+    PG_SUITE = 91193662862
+    WIDGET_SUITE = 91193662822
+    RELEASE_SUITE = 91208945815
+    CONTROLLER_SUITE = 91207339518
+    AUDIT_SUITE = 91300000001
+
+    ci_gate_runs = suite_runs(
+        ("Test", "completed", "success"),
+        ("Clippy", "completed", "success"),
+        ("Format", "completed", "success"),
+        ("Build x86_64-unknown-linux-gnu", "completed", "success"),
+        ("release-gate", "completed", "skipped"),
+    )
+    pg_gate_runs = suite_runs(("Test (PostgreSQL)", "completed", "success"))
+    widget_gate_runs = suite_runs(("Widget (compilation)", "completed", "success"))
+
+    # Le commit TEL QU'IL EST : les portes, plus tout ce qui s'y accroche sans
+    # etre un test. La fausse API sert n'importe quel workflow demande — donc
+    # elargir `RELEASE_GATE_WORKFLOWS` fait bel et bien rentrer le bruit, et
+    # c'est ce qui rend le sabotage detectable.
+    commit_suites = {
+        "ci.yml": [CI_SUITE],
+        "test-postgres.yml": [PG_SUITE],
+        "widget-ci.yml": [WIDGET_SUITE],
+        "release.yml": [RELEASE_SUITE],
+        "release-controller.yml": [CONTROLLER_SUITE],
+        "audit-derive.yml": [AUDIT_SUITE],
+    }
+    commit_bodies = {
+        CI_SUITE: ci_gate_runs,
+        PG_SUITE: pg_gate_runs,
+        WIDGET_SUITE: widget_gate_runs,
+        # La conclusion PRECEDENTE du preflight lui-meme.
+        RELEASE_SUITE: suite_runs(
+            ("Preflight / Pre-release checks", "completed", "failure"),
+        ),
+        # Un essai du controleur, bloque par un gel de tags, rejoue ensuite.
+        CONTROLLER_SUITE: suite_runs(
+            ("Verifier et taguer le train", "completed", "failure"),
+        ),
+        # L'audit de gouvernance, rouge PAR CONSTRUCTION pendant un train.
+        AUDIT_SUITE: suite_runs(("Dérive des garde-fous", "completed", "failure")),
+    }
+
+    def make_api(workflow_suites: dict[str, list[int]], suite_bodies: dict[int, dict]):
+        def fake(path: str, _token: Optional[str] = None):
+            if "/actions/workflows/" in path:
+                name = path.split("/actions/workflows/", 1)[1].split("/runs", 1)[0]
+                return {
+                    "workflow_runs": [
+                        {"check_suite_id": sid}
+                        for sid in workflow_suites.get(name, [])
+                    ]
+                }
+            if "/check-suites/" in path:
+                sid = int(path.split("/check-suites/", 1)[1].split("/", 1)[0])
+                return suite_bodies[sid]
+            # Notamment /commits/{sha}/check-runs : le tout-venant du commit
+            # ne doit plus etre lu du tout.
+            raise AssertionError(f"appel API inattendu: {path}")
+
+        return fake
+
+    original_github_api = globals()["github_api"]
+    try:
+        # Contrat 1 — LE BLOCAGE DU 02/09. Les vraies portes sont vertes ;
+        # l'audit de gouvernance, la tentative du controleur et la conclusion
+        # precedente du preflight sont rouges. Le preflight doit PASSER.
+        globals()["github_api"] = make_api(commit_suites, commit_bodies)
+        tonight = check_ci_status("owner/repo", "b362f854", None)
+        assert tonight.passed, tonight
+        assert "Dérive" not in tonight.detail, tonight
+        assert "Verifier et taguer le train" not in tonight.detail, tonight
+        assert "ci.yml" in tonight.detail, tonight
+
+        # Contrat 2 — LA PORTE GARDE TOUJOURS. Une vraie porte rouge refuse,
+        # sans quoi on aurait desarme le controle au lieu de l'affiner.
+        broken_ci = dict(commit_bodies)
+        broken_ci[CI_SUITE] = suite_runs(
+            ("Test", "completed", "success"),
+            ("Clippy", "completed", "failure"),
+        )
+        globals()["github_api"] = make_api(commit_suites, broken_ci)
+        red = check_ci_status("owner/repo", "b362f854", None)
+        assert not red.passed, red
+        assert "Clippy" in red.detail, red
+
+        # Une porte rouge dans une AUTRE suite-porte refuse aussi.
+        broken_pg = dict(commit_bodies)
+        broken_pg[PG_SUITE] = suite_runs(("Test (PostgreSQL)", "completed", "failure"))
+        globals()["github_api"] = make_api(commit_suites, broken_pg)
+        red_pg = check_ci_status("owner/repo", "b362f854", None)
+        assert not red_pg.passed, red_pg
+        assert "Test (PostgreSQL)" in red_pg.detail, red_pg
+
+        # Contrat 3 — LE CAS VIDE. Aucune porte reconnue sur le commit :
+        # c'est un REFUS, pas un « rien a signaler ». Le bruit reste present
+        # et vert, et ne doit pas suffire a faire passer le controle.
+        no_gates = dict(commit_suites)
+        no_gates.update({"ci.yml": [], "test-postgres.yml": [], "widget-ci.yml": []})
+        globals()["github_api"] = make_api(no_gates, commit_bodies)
+        empty = check_ci_status("owner/repo", "b362f854", None)
+        assert not empty.passed, empty
+        assert MANDATORY_GATE_WORKFLOW in empty.detail, empty
+
+        # Variante : une porte facultative a tourne, mais pas `ci.yml`, qui
+        # n'a pas de filtre `paths` et tourne donc sur tout commit promu.
+        # Refus egalement — la porte obligatoire manque.
+        only_optional = dict(commit_suites)
+        only_optional["ci.yml"] = []
+        globals()["github_api"] = make_api(only_optional, commit_bodies)
+        partial = check_ci_status("owner/repo", "b362f854", None)
+        assert not partial.passed, partial
+        assert MANDATORY_GATE_WORKFLOW in partial.detail, partial
+
+        # Et une suite-porte VIDE de check-runs refuse aussi.
+        hollow_bodies = dict(commit_bodies)
+        hollow_bodies[CI_SUITE] = {"check_runs": []}
+        globals()["github_api"] = make_api(
+            {"ci.yml": [CI_SUITE], "test-postgres.yml": [], "widget-ci.yml": []},
+            hollow_bodies,
+        )
+        hollow = check_ci_status("owner/repo", "b362f854", None)
+        assert not hollow.passed, hollow
+
+        # Contrat 4 — un job de porte encore en cours ne bloque pas.
+        pending_bodies = dict(commit_bodies)
+        pending_bodies[CI_SUITE] = suite_runs(
+            ("Test", "completed", "success"),
+            ("Build aarch64-apple-darwin", "in_progress", None),
+        )
+        globals()["github_api"] = make_api(commit_suites, pending_bodies)
+        running = check_ci_status("owner/repo", "b362f854", None)
+        assert running.passed, running
+        assert "Build aarch64-apple-darwin" in running.detail, running
+    finally:
+        globals()["github_api"] = original_github_api
 
 
 # ─── Resume du job ────────────────────────────────────────────────────
@@ -608,6 +980,11 @@ def main() -> int:
         help="run local counter-examples without GitHub or cargo",
     )
     ap.add_argument(
+        "--identity-only",
+        action="store_true",
+        help="validate the author/committer Git would use for the next commit",
+    )
+    ap.add_argument(
         "--skip",
         default="",
         help="comma-separated check names to skip (advanced, use sparingly)",
@@ -621,10 +998,17 @@ def main() -> int:
 
     if args.self_test:
         self_test_p0_classification()
-        print("preflight P0 classification self-test: PASS")
+        self_test_identity_contract()
+        self_test_ci_status_gates()
+        print("preflight self-tests: PASS")
         return 0
+    if args.identity_only:
+        result = check_planned_git_identity()
+        marker = "PASS" if result.passed else "FAIL"
+        print(f"[{marker}] {result.name} — {result.detail}")
+        return 0 if result.passed else 1
     if not args.version:
-        ap.error("--version is required unless --self-test is used")
+        ap.error("--version is required unless --self-test or --identity-only is used")
 
     tag = args.version
     if not tag.startswith("v"):
@@ -645,6 +1029,7 @@ def main() -> int:
 
     run("semver", lambda: check_semver(tag))
     run("version_bump", lambda: check_version_bump(tag))
+    run("release_identity", check_release_commit_identity)
     run("no_p0_issues", lambda: check_no_p0_issues(repo, token))
     run("no_release_todos", check_no_release_todos)
     run("cahier_de_recette", lambda: check_cahier_de_recette(tag))

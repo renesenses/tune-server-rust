@@ -1,0 +1,1094 @@
+//! Générateur de playlists — déterministe, par critères. **Aucune IA ici.**
+//!
+//! Fabien, forum : « Quelle est la différence entre les playlists Smart AI et
+//! le bouton flottant Tune AI ? » (#1360). La réponse : tout. Le bouton
+//! flottant (`POST /ai/query`) est un vrai assistant adossé à Claude ; ce
+//! module-ci repère des mots-clés et construit des **conditions SQL** sur la
+//! bibliothèque locale. Les cinq variantes — ambiance, invite, historique,
+//! découverte, tempo — sont des générateurs déterministes.
+//!
+//! Le nom retenu côté produit est **« Générateur de playlists » / "Playlist
+//! generator"** : c'est celui que le client web livre déjà (tune-web-client
+//! PR #384, sur `main`, dans les onze locales sous la clé `smartai.title`). Ne
+//! pas en inventer un autre — deux noms pour la même chose est le défaut
+//! qu'on corrige.
+//!
+//! ⚠️ **Le préfixe de route `/smart-ai` reste tel quel, volontairement.** Ce
+//! n'est pas un libellé, c'est l'IDENTIFIANT que trois bases de code clientes
+//! comparent littéralement — `tune-web-client/src/lib/api.ts` (les cinq
+//! appels), `tune-server-flutter/lib/services/tune_api_client.dart:1425`,
+//! `tune-server-ipados/…/TuneAPIClient+SmartAutoPlay.swift:14` — et qu'un
+//! contrat publié fige (`docs/contrat-web.json`). Le renommer casserait les
+//! cinq écrans sans rien gagner : aucun utilisateur ne lit une URL d'API. On
+//! garde la valeur, on change le libellé.
+
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
+
+use tune_core::db::backend::ToSqlValue;
+use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+
+use crate::SmartHttpState;
+use tune_http_types::AppError;
+
+pub fn router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    SmartHttpState: axum::extract::FromRef<S>,
+{
+    Router::new()
+        .route("/generate", post(generate_smart_playlist))
+        .route("/mood", post(mood_playlist))
+        .route("/similar-to", post(similar_to_playlist))
+        .route("/history-based", post(history_based_playlist))
+        .route("/tempo-match", post(tempo_match_playlist))
+        .route("/discovery", post(discovery_playlist))
+}
+
+/// Returns a positional placeholder for the engine.
+fn ph(engine: Engine, idx: usize) -> String {
+    match engine {
+        Engine::Sqlite => SqliteDialect.placeholder(idx),
+        Engine::Postgres => PostgresDialect.placeholder(idx),
+    }
+}
+
+/// Build a `listened_at >= now - N days` fragment for the engine.
+/// `days` is embedded numerically in the SQL (safe: it's an i64 from the user body).
+fn since_days_sql(engine: Engine, column: &str, days: i64) -> String {
+    match engine {
+        Engine::Sqlite => SqliteDialect.since_days(column, days),
+        Engine::Postgres => PostgresDialect.since_days(column, days),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generate from natural language prompt
+// ---------------------------------------------------------------------------
+
+/// Pick the longest library artist name that appears in the (already lowercased)
+/// prompt, so "tracks by serge lama" resolves to the artist "Serge Lama" and the
+/// longest match wins (avoids a short name shadowing a specific one). Names under
+/// 3 chars are skipped to avoid spurious substring hits. (#699)
+fn pick_artist_from_prompt(prompt_lc: &str, artist_names: &[String]) -> Option<String> {
+    artist_names
+        .iter()
+        .filter(|name| name.len() >= 3 && prompt_lc.contains(&name.to_lowercase()))
+        .max_by_key(|name| name.len())
+        .cloned()
+}
+
+#[derive(Deserialize)]
+struct GenerateRequest {
+    prompt: String,
+    limit: Option<i64>,
+}
+
+async fn generate_smart_playlist(
+    State(state): State<SmartHttpState>,
+    Json(body): Json<GenerateRequest>,
+) -> Result<Json<Value>, AppError> {
+    let limit = body.limit.unwrap_or(30);
+    let prompt = body.prompt.to_lowercase();
+    let engine = state.backend.engine();
+
+    // Parse keywords from prompt to build SQL conditions
+    let mut conditions = Vec::new();
+    let mut order_by = "RANDOM()";
+
+    // Detect genre keywords
+    let genre_keywords = [
+        ("jazz", "jazz"),
+        ("classical", "classical"),
+        ("rock", "rock"),
+        ("pop", "pop"),
+        ("electronic", "electronic"),
+        ("ambient", "ambient"),
+        ("blues", "blues"),
+        ("soul", "soul"),
+        ("funk", "funk"),
+        ("hip hop", "hip hop"),
+        ("hip-hop", "hip hop"),
+        ("r&b", "r&b"),
+        ("country", "country"),
+        ("folk", "folk"),
+        ("metal", "metal"),
+        ("punk", "punk"),
+        ("reggae", "reggae"),
+        ("disco", "disco"),
+        ("latin", "latin"),
+        ("world", "world"),
+        ("chanson", "chanson"),
+        ("variété", "variété"),
+    ];
+
+    for (keyword, genre) in &genre_keywords {
+        if prompt.contains(keyword) {
+            conditions.push(format!(
+                "(t.genre LIKE '%{}%' OR t.genres LIKE '%{}%')",
+                genre.replace('\'', "''"),
+                genre.replace('\'', "''"),
+            ));
+        }
+    }
+
+    // Detect mood/time-of-day keywords and map to BPM ranges
+    let bpm_cast = if engine == Engine::Postgres {
+        "CAST(t.bpm AS float8)"
+    } else {
+        "t.bpm"
+    };
+
+    if prompt.contains("relax") || prompt.contains("calm") || prompt.contains("chill") {
+        conditions.push(format!(
+            "({bpm_cast} IS NULL OR {bpm_cast} BETWEEN 50 AND 100)"
+        ));
+        order_by = "t.bpm ASC NULLS LAST";
+    }
+    if prompt.contains("evening") || prompt.contains("night") || prompt.contains("soir") {
+        conditions.push(format!(
+            "({bpm_cast} IS NULL OR {bpm_cast} BETWEEN 50 AND 110)"
+        ));
+    }
+    if prompt.contains("morning") || prompt.contains("matin") {
+        conditions.push(format!(
+            "({bpm_cast} IS NULL OR {bpm_cast} BETWEEN 80 AND 130)"
+        ));
+    }
+    if prompt.contains("energi") || prompt.contains("workout") || prompt.contains("sport") {
+        conditions.push(format!(
+            "({bpm_cast} IS NULL OR {bpm_cast} BETWEEN 120 AND 180)"
+        ));
+        order_by = "t.bpm DESC NULLS LAST";
+    }
+    if prompt.contains("focus") || prompt.contains("study") || prompt.contains("concentr") {
+        conditions.push(format!(
+            "({bpm_cast} IS NULL OR {bpm_cast} BETWEEN 70 AND 120)"
+        ));
+    }
+
+    // Detect decade keywords
+    if prompt.contains("80s") || prompt.contains("eighties") {
+        conditions.push("(t.year BETWEEN 1980 AND 1989)".into());
+    }
+    if prompt.contains("90s") || prompt.contains("nineties") {
+        conditions.push("(t.year BETWEEN 1990 AND 1999)".into());
+    }
+    if prompt.contains("70s") || prompt.contains("seventies") {
+        conditions.push("(t.year BETWEEN 1970 AND 1979)".into());
+    }
+    if prompt.contains("60s") || prompt.contains("sixties") {
+        conditions.push("(t.year BETWEEN 1960 AND 1969)".into());
+    }
+    if prompt.contains("recent") || prompt.contains("new") || prompt.contains("modern") {
+        conditions.push("(t.year >= 2015)".into());
+    }
+
+    // Detect quality keywords
+    if prompt.contains("hi-res") || prompt.contains("hires") || prompt.contains("high res") {
+        conditions.push("(t.sample_rate > 48000 OR t.bit_depth > 16)".into());
+    }
+
+    // Match a library artist named in the prompt (e.g. "tracks by Serge Lama").
+    // The keyword table above only recognises genres/moods/decades, so a query
+    // naming an artist matched nothing and fell through to `ORDER BY RANDOM()`,
+    // returning unrelated tracks (FabienM, #699). Bound as a parameter — the
+    // prompt is user input, unlike the hardcoded genre fragments above.
+    let artist_names: Vec<String> = state
+        .backend
+        .query_many("SELECT name FROM artists", &[])
+        .ou_defaut_journalise()
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_string()))
+        .collect();
+    let artist_filter = pick_artist_from_prompt(&prompt, &artist_names);
+
+    // Placeholders: the artist (if matched) binds as $1 and LIMIT follows.
+    let (where_clause, limit_ph) = if artist_filter.is_some() {
+        conditions.push(format!("LOWER(ar.name) = LOWER({})", ph(engine, 1)));
+        (format!("WHERE {}", conditions.join(" AND ")), ph(engine, 2))
+    } else if conditions.is_empty() {
+        (String::new(), ph(engine, 1))
+    } else {
+        (format!("WHERE {}", conditions.join(" AND ")), ph(engine, 1))
+    };
+
+    let sql = format!(
+        "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
+         t.genre, t.year, CAST(t.bpm AS float8), al.cover_path, t.format \
+         FROM tracks t \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         LEFT JOIN artists ar ON t.artist_id = ar.id \
+         {where_clause} \
+         ORDER BY {order_by} \
+         LIMIT {limit_ph}",
+    );
+
+    let mut params: Vec<&dyn ToSqlValue> = Vec::new();
+    if let Some(ref artist) = artist_filter {
+        params.push(artist as &dyn ToSqlValue);
+    }
+    params.push(&limit as &dyn ToSqlValue);
+    let rows = state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise();
+    let tracks: Vec<Value> = rows
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "title": cols.get(1).and_then(|v| v.as_string()),
+                "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                "album_title": cols.get(3).and_then(|v| v.as_string()),
+                "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                "genre": cols.get(5).and_then(|v| v.as_string()),
+                "year": cols.get(6).and_then(|v| v.as_i64()).map(|y| y as i32),
+                "bpm": cols.get(7).and_then(|v| v.as_f64()),
+                "cover_path": cols.get(8).and_then(|v| v.as_string()),
+                "format": cols.get(9).and_then(|v| v.as_string()),
+            })
+        })
+        .collect();
+
+    // `name` est un LIBELLÉ affiché, pas un identifiant : il portait « AI: … »
+    // alors que rien ici n'appelle un modèle (#1360). On rend l'invite telle
+    // quelle — exactement ce que l'écran web affiche déjà
+    // (`SmartAIView.svelte`, `playlistName = prompt`), pour qu'une même
+    // génération porte un seul nom sur tous les clients.
+    Ok(Json(json!({
+        "name": body.prompt.clone(),
+        "prompt": body.prompt,
+        "tracks": tracks,
+        "total": tracks.len(),
+        "parsed_conditions": conditions.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Mood-based playlist
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MoodRequest {
+    mood: String,
+    limit: Option<i64>,
+}
+
+async fn mood_playlist(
+    State(state): State<SmartHttpState>,
+    Json(body): Json<MoodRequest>,
+) -> Result<Json<Value>, AppError> {
+    let limit = body.limit.unwrap_or(20);
+    let engine = state.backend.engine();
+
+    let (genres, bpm_min, bpm_max): (&[&str], f64, f64) = match body.mood.as_str() {
+        "happy" => (&["pop", "funk", "disco", "soul", "dance"], 110.0, 140.0),
+        "sad" => (
+            &["blues", "ballad", "acoustic", "folk", "singer-songwriter"],
+            50.0,
+            90.0,
+        ),
+        "energetic" => (
+            &["rock", "electronic", "dance", "punk", "metal"],
+            120.0,
+            180.0,
+        ),
+        "calm" | "relaxed" => (
+            &["jazz", "classical", "ambient", "new age", "lounge"],
+            50.0,
+            90.0,
+        ),
+        "focus" => (
+            &[
+                "ambient",
+                "classical",
+                "electronic",
+                "instrumental",
+                "post-rock",
+            ],
+            70.0,
+            120.0,
+        ),
+        "romantic" => (
+            &["soul", "r&b", "jazz", "bossa nova", "chanson"],
+            60.0,
+            110.0,
+        ),
+        _ => (&["pop", "rock", "jazz", "electronic"], 80.0, 140.0),
+    };
+
+    let genre_conditions: Vec<String> = genres
+        .iter()
+        .map(|g| {
+            format!(
+                "t.genre LIKE '%{}%' OR t.genres LIKE '%{}%'",
+                g.replace('\'', "''"),
+                g.replace('\'', "''"),
+            )
+        })
+        .collect();
+    let genre_where = if genre_conditions.is_empty() {
+        "1=1".to_string()
+    } else {
+        format!("({})", genre_conditions.join(" OR "))
+    };
+
+    let bpm_cast = if engine == Engine::Postgres {
+        "CAST(t.bpm AS float8)"
+    } else {
+        "t.bpm"
+    };
+    let p1 = ph(engine, 1);
+    let p2 = ph(engine, 2);
+    let p3 = ph(engine, 3);
+
+    let sql = format!(
+        "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
+         t.genre, t.year, CAST(t.bpm AS float8), al.cover_path \
+         FROM tracks t \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         LEFT JOIN artists ar ON t.artist_id = ar.id \
+         WHERE ({genre_where}) AND ({bpm_cast} IS NULL OR {bpm_cast} BETWEEN {p1} AND {p2}) \
+         ORDER BY RANDOM() \
+         LIMIT {p3}",
+    );
+
+    let rows = state
+        .backend
+        .query_many(
+            &sql,
+            &[
+                &bpm_min as &dyn ToSqlValue,
+                &bpm_max as &dyn ToSqlValue,
+                &limit as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "smart_ai_mood_query_failed");
+            vec![]
+        });
+
+    let decode_track_row = |cols: &Vec<tune_core::db::backend::SqlValue>| {
+        json!({
+            "id": cols.get(0).and_then(|v| v.as_i64()),
+            "title": cols.get(1).and_then(|v| v.as_string()),
+            "artist_name": cols.get(2).and_then(|v| v.as_string()),
+            "album_title": cols.get(3).and_then(|v| v.as_string()),
+            "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+            "genre": cols.get(5).and_then(|v| v.as_string()),
+            "year": cols.get(6).and_then(|v| v.as_i64()).map(|y| y as i32),
+            "bpm": cols.get(7).and_then(|v| v.as_f64()),
+            "cover_path": cols.get(8).and_then(|v| v.as_string()),
+        })
+    };
+
+    let tracks: Vec<Value> = rows.iter().map(decode_track_row).collect();
+
+    // If genre filter returned too few results, fall back to BPM-only
+    let tracks = if tracks.len() < 5 {
+        let fallback_sql = format!(
+            "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
+             t.genre, t.year, CAST(t.bpm AS float8), al.cover_path \
+             FROM tracks t \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             WHERE ({bpm_cast} IS NULL OR {bpm_cast} BETWEEN {p1} AND {p2}) \
+             ORDER BY RANDOM() \
+             LIMIT {p3}",
+        );
+        state
+            .backend
+            .query_many(
+                &fallback_sql,
+                &[
+                    &bpm_min as &dyn ToSqlValue,
+                    &bpm_max as &dyn ToSqlValue,
+                    &limit as &dyn ToSqlValue,
+                ],
+            )
+            .ou_defaut_journalise()
+            .iter()
+            .map(decode_track_row)
+            .collect()
+    } else {
+        tracks
+    };
+
+    Ok(Json(json!({
+        "name": format!("{} Mix", capitalize(&body.mood)),
+        "mood": body.mood,
+        "tracks": tracks,
+        "total": tracks.len(),
+        "bpm_range": [bpm_min, bpm_max],
+        "target_genres": genres,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Similar-to playlist
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SimilarToRequest {
+    track_id: Option<i64>,
+    album_id: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn similar_to_playlist(
+    State(state): State<SmartHttpState>,
+    Json(body): Json<SimilarToRequest>,
+) -> Result<Json<Value>, AppError> {
+    let limit = body.limit.unwrap_or(20);
+    let engine = state.backend.engine();
+
+    // Get the reference track/album attributes
+    let (genre, artist_id, year, bpm): (Option<String>, Option<i64>, Option<i64>, Option<f64>) =
+        if let Some(track_id) = body.track_id {
+            let p1 = ph(engine, 1);
+            let sql = format!(
+                "SELECT t.genre, t.artist_id, t.year, CAST(t.bpm AS float8) FROM tracks t WHERE t.id = {p1}"
+            );
+            state
+                .backend
+                .query_one(&sql, &[&track_id as &dyn ToSqlValue])
+                .unwrap_or(None)
+                .map(|cols| {
+                    (
+                        cols.get(0).and_then(|v| v.as_string()),
+                        cols.get(1).and_then(|v| v.as_i64()),
+                        cols.get(2).and_then(|v| v.as_i64()),
+                        cols.get(3).and_then(|v| v.as_f64()),
+                    )
+                })
+                .unwrap_or((None, None, None, None))
+        } else if let Some(album_id) = body.album_id {
+            let p1 = ph(engine, 1);
+            let sql = format!(
+                "SELECT al.genre, al.artist_id, al.year, NULL FROM albums al WHERE al.id = {p1}"
+            );
+            state
+                .backend
+                .query_one(&sql, &[&album_id as &dyn ToSqlValue])
+                .unwrap_or(None)
+                .map(|cols| {
+                    (
+                        cols.get(0).and_then(|v| v.as_string()),
+                        cols.get(1).and_then(|v| v.as_i64()),
+                        cols.get(2).and_then(|v| v.as_i64()),
+                        None,
+                    )
+                })
+                .unwrap_or((None, None, None, None))
+        } else {
+            return Err(AppError::bad_request("provide track_id or album_id"));
+        };
+
+    // Build similarity conditions with scoring
+    let mut conditions = Vec::new();
+    let mut score_parts = Vec::new();
+
+    if let Some(ref g) = genre {
+        let escaped = g.replace('\'', "''");
+        conditions.push(format!(
+            "(t.genre LIKE '%{escaped}%' OR t.genres LIKE '%{escaped}%')"
+        ));
+        score_parts.push(format!(
+            "CASE WHEN t.genre LIKE '%{escaped}%' THEN 3 ELSE 0 END"
+        ));
+    }
+    if let Some(aid) = artist_id {
+        score_parts.push(format!("CASE WHEN t.artist_id = {aid} THEN 5 ELSE 0 END"));
+    }
+    if let Some(y) = year {
+        score_parts.push(format!(
+            "CASE WHEN t.year BETWEEN {} AND {} THEN 2 ELSE 0 END",
+            y - 5,
+            y + 5
+        ));
+    }
+    if let Some(b) = bpm {
+        let bpm_cast = if engine == Engine::Postgres {
+            "CAST(t.bpm AS float8)"
+        } else {
+            "t.bpm"
+        };
+        score_parts.push(format!(
+            "CASE WHEN {bpm_cast} BETWEEN {} AND {} THEN 2 ELSE 0 END",
+            b - 15.0,
+            b + 15.0
+        ));
+    }
+
+    let score_expr = if score_parts.is_empty() {
+        "0".to_string()
+    } else {
+        format!("({})", score_parts.join(" + "))
+    };
+
+    // Exclude the source track/album
+    let exclude = if let Some(tid) = body.track_id {
+        format!("t.id != {tid}")
+    } else if let Some(aid) = body.album_id {
+        format!("t.album_id != {aid}")
+    } else {
+        "1=1".into()
+    };
+
+    let where_clause = if conditions.is_empty() {
+        exclude
+    } else {
+        format!("{} AND {}", conditions.join(" AND "), exclude)
+    };
+
+    let p1 = ph(engine, 1);
+    let sql = format!(
+        "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
+         t.genre, t.year, CAST(t.bpm AS float8), al.cover_path, \
+         {score_expr} as similarity_score \
+         FROM tracks t \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         LEFT JOIN artists ar ON t.artist_id = ar.id \
+         WHERE {where_clause} \
+         ORDER BY similarity_score DESC, RANDOM() \
+         LIMIT {p1}",
+    );
+
+    let rows = state
+        .backend
+        .query_many(&sql, &[&limit as &dyn ToSqlValue])
+        .ou_defaut_journalise();
+    let tracks: Vec<Value> = rows
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "title": cols.get(1).and_then(|v| v.as_string()),
+                "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                "album_title": cols.get(3).and_then(|v| v.as_string()),
+                "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                "genre": cols.get(5).and_then(|v| v.as_string()),
+                "year": cols.get(6).and_then(|v| v.as_i64()).map(|y| y as i32),
+                "bpm": cols.get(7).and_then(|v| v.as_f64()),
+                "cover_path": cols.get(8).and_then(|v| v.as_string()),
+                "similarity_score": cols.get(9).and_then(|v| v.as_i64()),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "name": "Similar Tracks",
+        "reference": {
+            "track_id": body.track_id,
+            "album_id": body.album_id,
+            "genre": genre,
+            "year": year,
+            "bpm": bpm,
+        },
+        "tracks": tracks,
+        "total": tracks.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// History-based "Your Mix"
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct HistoryBasedRequest {
+    limit: Option<i64>,
+    days: Option<i64>,
+}
+
+async fn history_based_playlist(
+    State(state): State<SmartHttpState>,
+    Json(body): Json<HistoryBasedRequest>,
+) -> Result<Json<Value>, AppError> {
+    let limit = body.limit.unwrap_or(30);
+    let days = body.days.unwrap_or(30);
+    let engine = state.backend.engine();
+
+    // Build the date filter fragment (days is embedded numerically)
+    let date_filter = since_days_sql(engine, "lh.listened_at", days);
+
+    // Get top genres from listening history
+    let top_genres_sql = format!(
+        "SELECT t.genre, COUNT(*) as cnt \
+         FROM listen_history lh \
+         JOIN tracks t ON lh.track_id = t.id \
+         WHERE t.genre IS NOT NULL \
+           AND {date_filter} \
+         GROUP BY t.genre \
+         ORDER BY cnt DESC \
+         LIMIT 5"
+    );
+    let top_genres: Vec<String> = state
+        .backend
+        .query_many(&top_genres_sql, &[])
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
+        .collect();
+
+    // Get top artists from history
+    let top_artists_sql = format!(
+        "SELECT t.artist_id, COUNT(*) as cnt \
+         FROM listen_history lh \
+         JOIN tracks t ON lh.track_id = t.id \
+         WHERE t.artist_id IS NOT NULL \
+           AND {date_filter} \
+         GROUP BY t.artist_id \
+         ORDER BY cnt DESC \
+         LIMIT 10"
+    );
+    let top_artist_ids: Vec<i64> = state
+        .backend
+        .query_many(&top_artists_sql, &[])
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_i64()))
+        .collect();
+
+    // Build a mix: 60% from top artists, 40% from top genres (unplayed)
+    let artist_limit = (limit * 60 / 100).max(1);
+    let genre_limit = limit - artist_limit;
+
+    let mut all_tracks = Vec::new();
+
+    if !top_artist_ids.is_empty() {
+        let placeholders: Vec<String> = top_artist_ids.iter().map(|id| id.to_string()).collect();
+        let in_clause = placeholders.join(",");
+        let p1 = ph(engine, 1);
+        let sql = format!(
+            "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
+             t.genre, t.year, CAST(t.bpm AS float8), al.cover_path \
+             FROM tracks t \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             WHERE t.artist_id IN ({in_clause}) \
+             ORDER BY RANDOM() \
+             LIMIT {p1}",
+        );
+        let artist_tracks: Vec<Value> = state
+            .backend
+            .query_many(&sql, &[&artist_limit as &dyn ToSqlValue])
+            .ou_defaut_journalise()
+            .iter()
+            .map(|cols| {
+                json!({
+                    "id": cols.get(0).and_then(|v| v.as_i64()),
+                    "title": cols.get(1).and_then(|v| v.as_string()),
+                    "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                    "album_title": cols.get(3).and_then(|v| v.as_string()),
+                    "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "genre": cols.get(5).and_then(|v| v.as_string()),
+                    "year": cols.get(6).and_then(|v| v.as_i64()).map(|y| y as i32),
+                    "bpm": cols.get(7).and_then(|v| v.as_f64()),
+                    "cover_path": cols.get(8).and_then(|v| v.as_string()),
+                    "source_reason": "top_artist",
+                })
+            })
+            .collect();
+        all_tracks.extend(artist_tracks);
+    }
+
+    if !top_genres.is_empty() {
+        let genre_conditions: Vec<String> = top_genres
+            .iter()
+            .map(|g| format!("t.genre LIKE '%{}%'", g.replace('\'', "''")))
+            .collect();
+        let genre_where = genre_conditions.join(" OR ");
+
+        let p1 = ph(engine, 1);
+        // Get unplayed tracks from those genres
+        let sql = format!(
+            "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
+             t.genre, t.year, CAST(t.bpm AS float8), al.cover_path \
+             FROM tracks t \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             WHERE ({genre_where}) \
+               AND t.id NOT IN (SELECT DISTINCT track_id FROM listen_history WHERE track_id IS NOT NULL) \
+             ORDER BY RANDOM() \
+             LIMIT {p1}",
+        );
+        let genre_tracks: Vec<Value> = state
+            .backend
+            .query_many(&sql, &[&genre_limit as &dyn ToSqlValue])
+            .ou_defaut_journalise()
+            .iter()
+            .map(|cols| {
+                json!({
+                    "id": cols.get(0).and_then(|v| v.as_i64()),
+                    "title": cols.get(1).and_then(|v| v.as_string()),
+                    "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                    "album_title": cols.get(3).and_then(|v| v.as_string()),
+                    "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "genre": cols.get(5).and_then(|v| v.as_string()),
+                    "year": cols.get(6).and_then(|v| v.as_i64()).map(|y| y as i32),
+                    "bpm": cols.get(7).and_then(|v| v.as_f64()),
+                    "cover_path": cols.get(8).and_then(|v| v.as_string()),
+                    "source_reason": "genre_discovery",
+                })
+            })
+            .collect();
+        all_tracks.extend(genre_tracks);
+    }
+
+    // If history is empty, fall back to random selection
+    if all_tracks.is_empty() {
+        let p1 = ph(engine, 1);
+        let sql = format!(
+            "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
+             t.genre, t.year, CAST(t.bpm AS float8), al.cover_path \
+             FROM tracks t \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             ORDER BY RANDOM() \
+             LIMIT {p1}",
+        );
+        all_tracks = state
+            .backend
+            .query_many(&sql, &[&limit as &dyn ToSqlValue])
+            .ou_defaut_journalise()
+            .iter()
+            .map(|cols| {
+                json!({
+                    "id": cols.get(0).and_then(|v| v.as_i64()),
+                    "title": cols.get(1).and_then(|v| v.as_string()),
+                    "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                    "album_title": cols.get(3).and_then(|v| v.as_string()),
+                    "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "genre": cols.get(5).and_then(|v| v.as_string()),
+                    "year": cols.get(6).and_then(|v| v.as_i64()).map(|y| y as i32),
+                    "bpm": cols.get(7).and_then(|v| v.as_f64()),
+                    "cover_path": cols.get(8).and_then(|v| v.as_string()),
+                    "source_reason": "random_fallback",
+                })
+            })
+            .collect();
+    }
+
+    Ok(Json(json!({
+        "name": "Your Mix",
+        "tracks": all_tracks,
+        "total": all_tracks.len(),
+        "top_genres": top_genres,
+        "top_artist_count": top_artist_ids.len(),
+        "days_analyzed": days,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Tempo-matching playlist
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct TempoMatchRequest {
+    target_bpm: f64,
+    tolerance: Option<f64>,
+    limit: Option<i64>,
+}
+
+async fn tempo_match_playlist(
+    State(state): State<SmartHttpState>,
+    Json(body): Json<TempoMatchRequest>,
+) -> Result<Json<Value>, AppError> {
+    let tolerance = body.tolerance.unwrap_or(10.0);
+    let limit = body.limit.unwrap_or(20);
+    let bpm_min = body.target_bpm - tolerance;
+    let bpm_max = body.target_bpm + tolerance;
+    let engine = state.backend.engine();
+
+    let bpm_cast = if engine == Engine::Postgres {
+        "CAST(t.bpm AS float8)"
+    } else {
+        "t.bpm"
+    };
+    let p1 = ph(engine, 1);
+    let p2 = ph(engine, 2);
+    let p3 = ph(engine, 3);
+    let p4 = ph(engine, 4);
+
+    let sql = format!(
+        "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
+         t.genre, t.year, CAST(t.bpm AS float8), al.cover_path \
+         FROM tracks t \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         LEFT JOIN artists ar ON t.artist_id = ar.id \
+         WHERE t.bpm IS NOT NULL AND {bpm_cast} BETWEEN {p1} AND {p2} \
+         ORDER BY ABS({bpm_cast} - {p3}) ASC \
+         LIMIT {p4}",
+    );
+
+    let rows = state
+        .backend
+        .query_many(
+            &sql,
+            &[
+                &bpm_min as &dyn ToSqlValue,
+                &bpm_max as &dyn ToSqlValue,
+                &body.target_bpm as &dyn ToSqlValue,
+                &limit as &dyn ToSqlValue,
+            ],
+        )
+        .ou_defaut_journalise();
+    let tracks: Vec<Value> = rows
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "title": cols.get(1).and_then(|v| v.as_string()),
+                "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                "album_title": cols.get(3).and_then(|v| v.as_string()),
+                "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                "genre": cols.get(5).and_then(|v| v.as_string()),
+                "year": cols.get(6).and_then(|v| v.as_i64()).map(|y| y as i32),
+                "bpm": cols.get(7).and_then(|v| v.as_f64()),
+                "cover_path": cols.get(8).and_then(|v| v.as_string()),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "name": format!("{}BPM Mix", body.target_bpm as i32),
+        "target_bpm": body.target_bpm,
+        "tolerance": tolerance,
+        "bpm_range": [bpm_min, bpm_max],
+        "tracks": tracks,
+        "total": tracks.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Discovery playlist: unplayed tracks from genres you like
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DiscoveryRequest {
+    limit: Option<i64>,
+}
+
+async fn discovery_playlist(
+    State(state): State<SmartHttpState>,
+    Json(body): Json<DiscoveryRequest>,
+) -> Result<Json<Value>, AppError> {
+    let limit = body.limit.unwrap_or(30);
+    let engine = state.backend.engine();
+
+    // Get top genres from full history
+    let top_genres: Vec<String> = state
+        .backend
+        .query_many(
+            "SELECT t.genre, COUNT(*) as cnt \
+             FROM listen_history lh \
+             JOIN tracks t ON lh.track_id = t.id \
+             WHERE t.genre IS NOT NULL \
+             GROUP BY t.genre \
+             ORDER BY cnt DESC \
+             LIMIT 5",
+            &[],
+        )
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
+        .collect();
+
+    if top_genres.is_empty() {
+        // No history: return random unplayed tracks
+        let p1 = ph(engine, 1);
+        let sql = format!(
+            "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
+             t.genre, t.year, CAST(t.bpm AS float8), al.cover_path \
+             FROM tracks t \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             WHERE t.id NOT IN (SELECT DISTINCT track_id FROM listen_history WHERE track_id IS NOT NULL) \
+             ORDER BY RANDOM() \
+             LIMIT {p1}",
+        );
+        let tracks: Vec<Value> = state
+            .backend
+            .query_many(&sql, &[&limit as &dyn ToSqlValue])
+            .ou_defaut_journalise()
+            .iter()
+            .map(|cols| {
+                json!({
+                    "id": cols.get(0).and_then(|v| v.as_i64()),
+                    "title": cols.get(1).and_then(|v| v.as_string()),
+                    "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                    "album_title": cols.get(3).and_then(|v| v.as_string()),
+                    "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "genre": cols.get(5).and_then(|v| v.as_string()),
+                    "year": cols.get(6).and_then(|v| v.as_i64()).map(|y| y as i32),
+                    "bpm": cols.get(7).and_then(|v| v.as_f64()),
+                    "cover_path": cols.get(8).and_then(|v| v.as_string()),
+                })
+            })
+            .collect();
+
+        return Ok(Json(json!({
+            "name": "Discovery Mix",
+            "tracks": tracks,
+            "total": tracks.len(),
+            "top_genres": [],
+            "message": "No listening history yet - showing random unplayed tracks",
+        })));
+    }
+
+    // Find unplayed tracks from favorite genres
+    let genre_conditions: Vec<String> = top_genres
+        .iter()
+        .map(|g| format!("t.genre LIKE '%{}%'", g.replace('\'', "''")))
+        .collect();
+    let genre_where = genre_conditions.join(" OR ");
+
+    let p1 = ph(engine, 1);
+    let sql = format!(
+        "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
+         t.genre, t.year, CAST(t.bpm AS float8), al.cover_path \
+         FROM tracks t \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         LEFT JOIN artists ar ON t.artist_id = ar.id \
+         WHERE ({genre_where}) \
+           AND t.id NOT IN (SELECT DISTINCT track_id FROM listen_history WHERE track_id IS NOT NULL) \
+         ORDER BY RANDOM() \
+         LIMIT {p1}",
+    );
+
+    let tracks: Vec<Value> = state
+        .backend
+        .query_many(&sql, &[&limit as &dyn ToSqlValue])
+        .ou_defaut_journalise()
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "title": cols.get(1).and_then(|v| v.as_string()),
+                "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                "album_title": cols.get(3).and_then(|v| v.as_string()),
+                "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                "genre": cols.get(5).and_then(|v| v.as_string()),
+                "year": cols.get(6).and_then(|v| v.as_i64()).map(|y| y as i32),
+                "bpm": cols.get(7).and_then(|v| v.as_f64()),
+                "cover_path": cols.get(8).and_then(|v| v.as_string()),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "name": "Discovery Mix",
+        "tracks": tracks,
+        "total": tracks.len(),
+        "top_genres": top_genres,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names() -> Vec<String> {
+        ["Serge Lama", "Serge Gainsbourg", "Lama", "U2", "Air"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn picks_the_named_artist_from_prompt_699() {
+        // "tracks by serge lama" must resolve to the correctly-tagged artist
+        // instead of falling through to random tracks (#699).
+        assert_eq!(
+            pick_artist_from_prompt("tracks by serge lama", &names()).as_deref(),
+            Some("Serge Lama")
+        );
+    }
+
+    #[test]
+    fn prefers_the_longest_match() {
+        // "serge lama" contains "lama" too — the longer, more specific name wins.
+        assert_eq!(
+            pick_artist_from_prompt("serge lama live", &names()).as_deref(),
+            Some("Serge Lama")
+        );
+    }
+
+    #[test]
+    fn no_artist_in_prompt_returns_none() {
+        assert_eq!(
+            pick_artist_from_prompt("relaxing jazz for the evening", &names()),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_names_under_three_chars() {
+        // "U2" (2 chars) must not match on an incidental "u2" substring.
+        assert_eq!(pick_artist_from_prompt("music from u2 era", &names()), None);
+    }
+
+    /// Le helper `ou_defaut_journalise` (#2861) est visible depuis CETTE
+    /// caisse, et rend le même contrat que côté `tune-server`.
+    ///
+    /// ## Ce que ce test empêche de reperdre
+    ///
+    /// `panne_sql` est né dans `tune-server/src/routes/`. Une fusion de
+    /// `rc/v0.9.130` dans le lot d'extraction a rejoué, par détection de
+    /// renommage et **sans conflit**, les modifications écrites pour l'ANCIEN
+    /// emplacement : les vingt appels ci-dessus sont arrivés ici avec un
+    /// `use crate::routes::panne_sql::…` qui n'a de sens que dans
+    /// `tune-server`. Trente erreurs de compilation, aucune ligne signalée par
+    /// git.
+    ///
+    /// Le helper vit désormais dans `tune-http-types`, la caisse que les DEUX
+    /// caisses de routes voient déjà. Ce test nomme cette dépendance : si
+    /// quelqu'un le remonte dans `tune-server` — ou en pose une seconde copie
+    /// ici — il rougit avant la fusion, pas après.
+    #[test]
+    fn les_deux_caisses_de_routes_voient_le_meme_helper() {
+        use tune_http_types::panne_sql::OuDefautJournalise;
+
+        // Le `Ok` passe tel quel : le helper n'est pas un `unwrap_or_default`
+        // déguisé qui écraserait aussi les succès.
+        let ok: Result<Vec<i64>, String> = Ok(vec![7]);
+        assert_eq!(ok.ou_defaut_journalise(), vec![7]);
+
+        // L'`Err` rend le défaut — même réponse HTTP qu'avant la #2861, seule
+        // la trace s'ajoute.
+        let echec: Result<Vec<i64>, String> = Err("no such table: tracks".into());
+        assert!(echec.ou_defaut_journalise().is_empty());
+    }
+
+    /// Même verrou pour le canon d'instrument (#2799 §4), descendu dans
+    /// `tune-core` par la même fusion.
+    ///
+    /// `regle_credit_instrument_canonisee_comme_a_l_ecriture`
+    /// (`smart_collections.rs`) prouve que la RÈGLE l'applique ; celui-ci
+    /// prouve que la table elle-même est bien la table partagée, et non une
+    /// copie locale qui divergerait au premier instrument ajouté.
+    #[test]
+    fn le_canon_d_instrument_est_celui_de_tune_core() {
+        use tune_core::metadata::instruments::canoniser_instrument;
+
+        assert_eq!(canoniser_instrument("Grand Piano"), "piano");
+        assert_eq!(canoniser_instrument("bass drum"), "drums");
+    }
+}

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -253,6 +254,113 @@ fn favicon_from_url(url: &str) -> Option<String> {
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
+}
+
+// ---------------------------------------------------------------------------
+// Ce qu'a donné une recherche de station — et pourquoi la question se pose
+// ---------------------------------------------------------------------------
+
+/// Les trois issues d'une recherche dans le catalogue de stations.
+///
+/// La route rendait `Json(json!(repo.search(&q.q).unwrap_or_default()))` : un
+/// `[]` disait à la fois « aucune station de ce nom » et « la requête n'a pas
+/// abouti », puisque le `unwrap_or_default()` avalait l'erreur du dépôt. Deux
+/// situations, deux suites à donner, un seul corps de réponse pour les porter.
+///
+/// Ce n'est pas une hypothèse : le 21/08/2026 (fil forum 1506), Belkadi Yacine
+/// cherche « radio paradise », obtient une liste vide et ouvre un ticket
+/// « radio paradise ne fonctionne pas » ; Bilou, qui a la station dans SON
+/// catalogue pour l'y avoir mise, répond « fonctionne parfaitement chez moi ».
+/// Aucun des deux n'a tort, et rien à l'écran ne les départage (#2119).
+///
+/// Chaque variante porte un code stable — l'appelant programme contre le code,
+/// pas contre la prose — et un message traduit, dans la langue de l'interface,
+/// selon le même contrat que [`ProblemeUrlFlux`] plus haut dans ce fichier.
+///
+/// **Portée.** La recherche n'interroge que le catalogue LOCAL ; c'est un
+/// relevé, pas un choix pris ici. La réponse le dit désormais (`portee`), pour
+/// qu'« absente de ce Tune » ne se lise plus « inexistante ».
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IssueRecherche {
+    /// Le catalogue local connaît au moins une station correspondante.
+    Resultats,
+    /// Le catalogue local a répondu, et ne connaît aucune station de ce nom.
+    /// C'est un fait sur CE catalogue, pas sur la station.
+    Aucune,
+    /// La recherche n'a pas pu aboutir — dépôt injoignable, schéma absent,
+    /// requête refusée. On ne sait RIEN du catalogue, et surtout pas qu'il
+    /// serait vide.
+    Echec(String),
+}
+
+impl IssueRecherche {
+    /// Le statut porté par la réponse, lisible sans table de correspondance.
+    pub(crate) fn statut(&self) -> &'static str {
+        match self {
+            Self::Resultats => "resultats",
+            Self::Aucune => "aucun_resultat",
+            Self::Echec(_) => "echec",
+        }
+    }
+
+    /// Code stable, pour l'appelant qui programme contre l'API.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Resultats => "radio_recherche_resultats",
+            Self::Aucune => "radio_recherche_aucun_resultat",
+            Self::Echec(_) => "radio_recherche_echec",
+        }
+    }
+
+    /// Le statut HTTP : une recherche qui aboutit sur zéro station a réussi ;
+    /// une recherche qui n'aboutit pas est une panne, et doit se lire comme
+    /// telle même par un client qui ne regarde que le code de retour.
+    pub(crate) fn statut_http(&self) -> StatusCode {
+        match self {
+            Self::Resultats | Self::Aucune => StatusCode::OK,
+            Self::Echec(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Le message montré à l'utilisateur, ou `None` quand il y a des résultats
+    /// — la liste se suffit alors à elle-même.
+    pub(crate) fn message(&self, lang: &str) -> Option<String> {
+        match self {
+            Self::Resultats => None,
+            Self::Aucune => Some(crate::i18n::t(lang, "radio.recherche.aucunResultat")),
+            Self::Echec(_) => Some(crate::i18n::t(lang, "radio.recherche.echec")),
+        }
+    }
+}
+
+/// Le seul endroit interrogé par `/radios/search` aujourd'hui.
+///
+/// Nommé dans la réponse pour que « pas trouvé » soit qualifié. L'annuaire
+/// public de mozaiklabs.fr n'est joint qu'au démarrage, et seulement pour les
+/// logos ([`refresh_radio_logos`]) : l'étendre à la recherche est une décision
+/// produit, pas une omission de code (#2119).
+pub(crate) const PORTEE_RECHERCHE: &str = "catalogue_local";
+
+/// Le corps rendu par `/radios/search`, quelle que soit l'issue.
+///
+/// La forme ne change pas d'une issue à l'autre — `items` est toujours là,
+/// éventuellement vide — pour qu'un client n'ait pas à deviner la structure
+/// avant de savoir ce qui s'est passé.
+pub(crate) fn corps_recherche(issue: &IssueRecherche, items: &[RadioStation], lang: &str) -> Value {
+    let mut corps = json!({
+        "statut": issue.statut(),
+        "code": issue.code(),
+        "portee": PORTEE_RECHERCHE,
+        "count": items.len(),
+        "items": items,
+        "message": issue.message(lang),
+    });
+    if let IssueRecherche::Echec(detail) = issue {
+        // La cause technique, pour le journal et le rapport de bogue — jamais
+        // pour l'écran : le message traduit est là pour ça.
+        corps["detail"] = json!(detail);
+    }
+    corps
 }
 
 #[derive(Deserialize)]
@@ -737,6 +845,17 @@ async fn play_radio(
 
     repo.record_play(id).ok();
 
+    // #3164 — meme regle que les charges utiles de zone : cette reponse rendait
+    // `PlayResult::stream_url`, rempli pour TOUTES les zones, a un client web
+    // qui n'a le droit de l'ouvrir que sur une zone navigateur.
+    let output_type = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    let stream_url = stream_url
+        .filter(|_| crate::routes::zones::zone_recoit_l_adresse_du_flux(output_type.as_deref()));
+
     let zone_state = state.playback.get_state(zone_id).await;
     Json(json!({
         "zone_id": zone_id,
@@ -749,10 +868,34 @@ async fn play_radio(
     .into_response()
 }
 
-async fn search_radios(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> Json<Value> {
+/// Cherche une station dans le catalogue local, et DIT ce qui s'est passé.
+///
+/// Voir [`IssueRecherche`] pour le pourquoi : jusqu'ici, « aucune station de ce
+/// nom » et « la recherche a échoué » sortaient tous deux sous la forme d'un
+/// tableau vide (#2119).
+async fn search_radios(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> Response {
+    let lang = crate::i18n::lang_from_header(&headers);
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let items = repo.search(&q.q).unwrap_or_default();
-    Json(json!(items))
+    let (issue, items) = match repo.search(&q.q) {
+        Ok(items) if items.is_empty() => (IssueRecherche::Aucune, items),
+        Ok(items) => (IssueRecherche::Resultats, items),
+        Err(erreur) => {
+            // Tracé, parce qu'une recherche qui échoue en silence est
+            // exactement ce que ce correctif supprime côté client : elle ne
+            // doit pas non plus disparaître côté serveur.
+            tracing::warn!(query = %q.q, erreur = %erreur, "radio_search_failed");
+            (IssueRecherche::Echec(erreur), Vec::new())
+        }
+    };
+    (
+        issue.statut_http(),
+        Json(corps_recherche(&issue, &items, &lang)),
+    )
+        .into_response()
 }
 
 async fn list_favorites(State(state): State<AppState>) -> Json<Value> {
@@ -931,10 +1074,12 @@ async fn set_radio_artwork(
     };
 
     let cache_dir = crate::routes::library::artwork_cache_dir();
-    std::fs::create_dir_all(&cache_dir).ok();
-    let hash = tune_core::library::artwork::artwork_hash(&format!("radio-upload-{id}"));
-    let path = cache_dir.join(format!("{hash}.{ext}"));
-    if std::fs::write(&path, &data).is_err() {
+    // Condensat de CONTENU, plus d'identité figée (#1444) : sous
+    // `artwork_hash("radio-upload-{id}")`, remplacer le logo gardait la même
+    // URL servie `immutable` — l'ancienne image restait affichée. Voir le
+    // commentaire complet dans `library/artwork.rs::upload_album_artwork`.
+    let hash = tune_core::library::artwork::content_hash(&data);
+    if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, &ext).is_none() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to save image"})),
@@ -968,24 +1113,136 @@ async fn export_radios_m3u(State(state): State<AppState>) -> impl IntoResponse {
     (axum::http::StatusCode::OK, headers, m3u).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Import en masse : les deux dernières portes, et ce qu'elles disent tout haut
+// ---------------------------------------------------------------------------
+
+/// Au plus tant d'entrées écartées sont NOMMÉES dans le compte rendu.
+///
+/// Un fichier M3U trouvé sur Internet peut en compter des centaines : les
+/// citer toutes ferait une réponse illisible. Le décompte `rejected`, lui,
+/// reste exact — c'est la liste qui est tronquée, jamais le compte, et
+/// `rejected_truncated` le dit.
+const REJETS_NOMMES_AU_PLUS: usize = 50;
+
+/// Ce qu'un import a fait, et surtout ce qu'il a refusé de faire.
+///
+/// Trois seaux DISJOINTS dont la somme vaut le nombre d'entrées lues :
+///
+/// * `imported` — entrées écrites en base ;
+/// * `skipped` — hors sujet : une playlist porte légitimement des chemins de
+///   fichiers locaux, qui ne sont pas des radios ratées ;
+/// * `rejected` — des radios qui VOULAIENT entrer et ne le pouvaient pas.
+///
+/// Le troisième seau est tout le correctif. Avant lui, `POST /radios/import`
+/// ne rendait qu'un `imported`, et l'import M3U rangeait l'adresse de Tades
+/// dans un `skipped` anonyme doublé d'un `debug!` — personne n'ouvre le
+/// journal d'un serveur audio. Chaque rejet est donc nommé : son rang, son
+/// nom, l'adresse fautive, le code stable et le message traduit (#2097).
+#[derive(Default)]
+struct BilanImport {
+    imported: i64,
+    skipped: i64,
+    rejected: i64,
+    nommes: Vec<Value>,
+}
+
+impl BilanImport {
+    fn rejeter(&mut self, index: usize, nom: &str, url: &str, code: &str, message: String) {
+        self.rejected += 1;
+        if self.nommes.len() < REJETS_NOMMES_AU_PLUS {
+            self.nommes.push(json!({
+                "index": index,
+                "name": nom,
+                "url": url,
+                "code": code,
+                "message": message,
+            }));
+        }
+    }
+
+    /// Le compte rendu, et le code qui l'accompagne.
+    ///
+    /// **201 dès qu'une seule station est entrée.** Refuser en bloc un fichier
+    /// de deux cents lignes parce que trois sont fautives rendrait l'import
+    /// inutilisable sur une playlist trouvée sur Internet — et l'utilisateur
+    /// n'a aucun moyen de réparer un fichier qu'il n'a pas écrit. Les bonnes
+    /// entrent, les autres sont nommées.
+    ///
+    /// **400 quand RIEN n'est entré alors que quelque chose a été refusé.**
+    /// C'est le cas d'une station unique poussée par l'API — exactement la
+    /// situation de Tades s'il était passé par cette route. Un 201 y dirait
+    /// « créé » sur une base inchangée, ce qui est le défaut d'origine sous un
+    /// autre nom.
+    fn reponse(self, total: usize, lang: &str) -> Response {
+        let tronquee = (self.nommes.len() as i64) < self.rejected;
+        let code = if self.imported == 0 && self.rejected > 0 {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::CREATED
+        };
+        let mut corps = json!({
+            "imported": self.imported,
+            "skipped": self.skipped,
+            "rejected": self.rejected,
+            "total": total,
+            "rejected_entries": self.nommes,
+            "rejected_truncated": tronquee,
+        });
+        if self.rejected > 0 {
+            corps["message"] = json!(
+                crate::i18n::t(lang, "radio.import.refusees")
+                    .replace("{refusees}", &self.rejected.to_string())
+                    .replace("{total}", &total.to_string())
+            );
+        }
+        (code, Json(corps)).into_response()
+    }
+}
+
+/// Le code porté par un rejet dû à la BASE et non à l'adresse : la ligne était
+/// lisible, l'écriture a échoué (doublon, base en lecture seule…).
+const CODE_ECHEC_ECRITURE: &str = "radio_import_echec_ecriture";
+
 #[derive(Deserialize)]
 struct ImportRadiosBody {
     stations: Vec<CreateRadio>,
 }
 
 async fn import_radios(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(body): Json<ImportRadiosBody>,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let mut imported = 0i64;
-    for s in &body.stations {
+    let mut bilan = BilanImport::default();
+    for (rang, s) in body.stations.iter().enumerate() {
+        let index = rang + 1;
+        // Quatrième porte d'entrée, même serrure que la saisie unitaire : une
+        // adresse impossible arrivée par un import de masse produit la même
+        // station muette qu'une adresse tapée à la main (#2097). Elle est
+        // écartée SEULE — les autres entrent.
+        let url = match valider_url_flux(&s.url) {
+            Ok(url) => url,
+            Err(probleme) => {
+                bilan.rejeter(
+                    index,
+                    &s.name,
+                    &s.url,
+                    probleme.code(),
+                    probleme.message(&lang),
+                );
+                continue;
+            }
+        };
+        let logo = s.logo_url.clone().or_else(|| favicon_from_url(&url));
         let station = RadioStation {
             id: None,
             name: s.name.clone(),
-            url: s.url.clone(),
+            url,
             homepage: s.homepage.clone(),
-            logo_url: s.logo_url.clone().or_else(|| favicon_from_url(&s.url)),
+            logo_url: logo,
             country: s.country.clone(),
             language: s.language.clone(),
             genre: s.genre.clone(),
@@ -995,31 +1252,75 @@ async fn import_radios(
             last_played: None,
             play_count: 0,
         };
-        if repo.create(&station).is_ok() {
-            imported += 1;
+        match repo.create(&station) {
+            Ok(_) => bilan.imported += 1,
+            Err(e) => bilan.rejeter(index, &s.name, &station.url, CODE_ECHEC_ECRITURE, e),
         }
     }
-    (StatusCode::CREATED, Json(json!({ "imported": imported }))).into_response()
+    tracing::info!(
+        imported = bilan.imported,
+        rejected = bilan.rejected,
+        total = body.stations.len(),
+        "radio_import_complete"
+    );
+    bilan.reponse(body.stations.len(), &lang)
 }
 
 async fn import_radios_m3u(
+    headers: HeaderMap,
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let entries = tune_core::library::m3u_parser::parse_m3u_content(&body, true);
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let mut imported = 0i64;
-    let mut skipped = 0i64;
-    for entry in &entries {
-        if !entry.is_url {
-            skipped += 1;
-            continue;
-        }
+    let mut bilan = BilanImport::default();
+    for (rang, entry) in entries.iter().enumerate() {
+        let index = rang + 1;
         let name = entry
             .title
             .clone()
             .or_else(|| entry.extra_attrs.get("tvg-name").cloned())
             .unwrap_or_else(|| entry.path.clone());
+        // Cinquième et dernière porte. Le tri n'est plus fait par le drapeau
+        // `is_url` du classeur de playlist mais par le validateur lui-même,
+        // parce que ce drapeau se trompait dans les deux sens :
+        //
+        // * `http;//…` — le cas de Tades — ne commence pas par « http:// »,
+        //   donc `is_url` valait `false` et la ligne tombait dans un `skipped`
+        //   muet : l'import ne disait rien du tout ;
+        // * `mms://…` et `rtsp://…` faisaient au contraire `is_url = true` et
+        //   étaient IMPORTÉS, alors qu'aucun chemin de lecture ne sait les
+        //   ouvrir — une station de plus qui ne joue jamais.
+        let url = match valider_url_flux(&entry.path) {
+            Ok(url) => url,
+            Err(probleme) => {
+                // Une playlist porte légitimement des chemins de fichiers
+                // locaux : `/musique/piste.flac` n'est pas une radio ratée,
+                // c'est une ligne hors sujet. La nommer noierait le compte
+                // rendu sous des centaines de faux reproches — elle reste dans
+                // `skipped`, comme avant.
+                //
+                // Deux formes font exception, et ce sont les seules qui
+                // comptent : ce que le classeur a reconnu comme une adresse, et
+                // le SÉPARATEUR faux, que le validateur sait distinguer d'un
+                // chemin local justement parce qu'il y voit un schéma suivi
+                // d'une mauvaise ponctuation. Toutes deux voulaient être des
+                // radios ; elles sont donc nommées.
+                if entry.is_url || matches!(probleme, ProblemeUrlFlux::SeparateurFaux { .. }) {
+                    bilan.rejeter(
+                        index,
+                        &name,
+                        &entry.path,
+                        probleme.code(),
+                        probleme.message(&lang),
+                    );
+                } else {
+                    bilan.skipped += 1;
+                }
+                continue;
+            }
+        };
         // Playlists use several logo attribute spellings (tvg-logo / url-logo /
         // logo); PLS carries none. Fall back to the stream host favicon so every
         // imported radio shows art (Bilou: "pourquoi ne pas les reprendre").
@@ -1029,12 +1330,12 @@ async fn import_radios_m3u(
             .or_else(|| entry.extra_attrs.get("url-logo"))
             .or_else(|| entry.extra_attrs.get("logo"))
             .cloned()
-            .or_else(|| favicon_from_url(&entry.path));
+            .or_else(|| favicon_from_url(&url));
         let group = entry.extra_attrs.get("group-title").cloned();
         let station = RadioStation {
             id: None,
-            name,
-            url: entry.path.clone(),
+            name: name.clone(),
+            url,
             homepage: None,
             logo_url: logo,
             country: None,
@@ -1047,24 +1348,23 @@ async fn import_radios_m3u(
             play_count: 0,
         };
         match repo.create(&station) {
-            Ok(_) => imported += 1,
+            Ok(_) => bilan.imported += 1,
             Err(e) => {
                 tracing::debug!(url = %entry.path, error = %e, "radio_import_m3u_entry_failed");
-                skipped += 1;
+                // Et pas seulement dans le journal : l'échec d'écriture est
+                // rendu à l'appelant comme les autres rejets.
+                bilan.rejeter(index, &name, &station.url, CODE_ECHEC_ECRITURE, e);
             }
         }
     }
     tracing::info!(
-        imported,
-        skipped,
+        imported = bilan.imported,
+        skipped = bilan.skipped,
+        rejected = bilan.rejected,
         total = entries.len(),
         "radio_import_m3u_complete"
     );
-    (
-        StatusCode::CREATED,
-        Json(json!({ "imported": imported, "skipped": skipped, "total": entries.len() })),
-    )
-        .into_response()
+    bilan.reponse(entries.len(), &lang)
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,6 +1577,44 @@ struct CreatePlaylistFromFavBody {
     limit: Option<usize>,
 }
 
+/// Les trois compteurs que l'écran « Favoris radio → Créer une playlist »
+/// affiche : `matched` / `approximate` / `not_found`.
+///
+/// ⚠ Ils manquaient de la réponse, et c'est TOUT le défaut de #3022. Le
+/// panneau lisait `createResult.matched || 0`, `.approximate || 0`,
+/// `.not_found || 0` (`RadioFavoritesView.svelte:145-147`) et le serveur ne
+/// rendait que `matched_tracks` + le rapport par favori. Les trois lectures
+/// retombaient sur `|| 0` : **0 trouvés / 0 approximatifs / 0 non trouvés en
+/// toutes circonstances**, playlist Qobuz créée et remplie ou pas (Reivax66,
+/// fil 1628). Même motif exact que #3002 et #2574 : rien n'échoue, tout ment.
+///
+/// L'information existait déjà — chaque entrée du rapport porte son `status`.
+/// On l'agrège ici, à partir de la MÊME source que le rapport rendu, pour
+/// qu'un compteur ne puisse pas diverger de la ligne qu'il résume.
+///
+/// La répartition couvre l'intégralité des favoris (`matched + approximate +
+/// not_found == favorites.len()`), parce que c'est ce que le panneau à trois
+/// cases laisse entendre :
+/// - `matched` : `matched`, et `duplicate` — le favori EST dans la playlist,
+///   simplement déjà mis là par un favori précédent ;
+/// - `approximate` : la bande 0,6–0,7 de la cible streaming ;
+/// - `not_found` : tout le reste — `not_found`, `rejected` (candidat refusé au
+///   seuil), `search_failed`, `add_failed`. Le détail par favori reste dans le
+///   rapport, qui seul distingue ces quatre raisons.
+fn compter_par_statut(rapport: &[Value]) -> (usize, usize, usize) {
+    let mut matched = 0usize;
+    let mut approximate = 0usize;
+    let mut not_found = 0usize;
+    for entree in rapport {
+        match entree.get("status").and_then(|s| s.as_str()).unwrap_or("") {
+            "matched" | "duplicate" => matched += 1,
+            "approximate" => approximate += 1,
+            _ => not_found += 1,
+        }
+    }
+    (matched, approximate, not_found)
+}
+
 async fn create_playlist_from_favorites(
     State(state): State<AppState>,
     body: Option<Json<CreatePlaylistFromFavBody>>,
@@ -1287,7 +1625,7 @@ async fn create_playlist_from_favorites(
             "SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|r| {
             (
@@ -1474,14 +1812,28 @@ async fn create_playlist_from_favorites(
         "radio_fav_local_playlist_done"
     );
 
+    let (nb_matched, nb_approx, nb_not_found) = compter_par_statut(&report);
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
             "id": playlist_id,
+            // `playlist_id` sous le nom que l'écran lit pour son bandeau
+            // « Playlist créée avec succès ! » (`{#if createResult.playlist_id}`).
+            // `id` reste, personne ne casse.
+            "playlist_id": playlist_id,
             "name": name,
             "favorites_count": favorites.len(),
             "matched_tracks": matched,
-            "results": report,
+            "matched": nb_matched,
+            "approximate": nb_approx,
+            "not_found": nb_not_found,
+            // Le rapport par favori sortait sous DEUX noms selon `service` :
+            // `results` ici, `details` sur la cible streaming — même route, même
+            // contenu, deux clés. On rend les deux des deux côtés ; un seul nom
+            // suffit désormais à un client, quelle que soit la cible.
+            "results": report.clone(),
+            "details": report,
         })),
     )
         .into_response())
@@ -1645,12 +1997,17 @@ async fn create_streaming_playlist_from_favorites(
                     error = %e,
                     "radio_fav_create_playlist_failed (service may not support write)"
                 );
+                let (m, a, nf) = compter_par_statut(&details);
                 return Ok((
                     StatusCode::BAD_GATEWAY,
                     Json(json!({
                         "error": format!("could not create playlist on '{service}': {e}"),
                         "matched_tracks": matched_ids.len(),
-                        "details": details,
+                        "matched": m,
+                        "approximate": a,
+                        "not_found": nf,
+                        "details": details.clone(),
+                        "results": details,
                     })),
                 )
                     .into_response());
@@ -1658,15 +2015,26 @@ async fn create_streaming_playlist_from_favorites(
         }
     }
 
+    let (nb_matched, nb_approx, nb_not_found) = compter_par_statut(&details);
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
             "service": service,
             "name": name,
             "favorites_count": favorites.len(),
+            // `matched_tracks` = ce qui a été POUSSÉ dans la playlist distante,
+            // sûrs ET approximatifs confondus. `matched` ci-dessous ne compte
+            // que les sûrs : les deux nombres diffèrent légitimement dès qu'un
+            // favori tombe dans la bande 0,6–0,7.
             "matched_tracks": matched_ids.len(),
-            "remote_playlist_id": remote_playlist_id,
-            "details": details,
+            "matched": nb_matched,
+            "approximate": nb_approx,
+            "not_found": nb_not_found,
+            "remote_playlist_id": remote_playlist_id.clone(),
+            "playlist_id": remote_playlist_id,
+            "details": details.clone(),
+            "results": details,
         })),
     )
         .into_response())

@@ -3,7 +3,22 @@ pub mod crossfade;
 pub mod dj_player;
 pub mod gapless;
 pub mod queue;
-pub mod radio_handler;
+// `radio_handler` a été retiré ici (#3018). C'était une SECONDE lecture des
+// métadonnées radio, sans aucun appelant depuis sa création : un
+// `RadioMetadataHandler` complet, avec sa propre structure `IcyMetadata`
+// homonyme de la vraie, dont `fetch_icy_metadata` rendait `cover_url: None`
+// sans condition. La lecture vivante est `crate::radio_metadata` — elle relit
+// `visual` (Radio France), `cover` (Radio Paradise) et `StreamUrl` (ICY), et
+// c'est `crate::poller::vignette_du_pas_radio` qui arbitre pochette du titre
+// contre logo de la station.
+//
+// Pourquoi la suppression compte : le 30/08/2026, une réponse au fil forum 104
+// se réclamant explicitement d'une lecture du code a affirmé au testeur
+// Reivax66 que « rien n'est allé chercher la pochette du disque », huit jours
+// après la livraison de #2109 et quatre heures après la publication de la
+// v0.9.127 qui la contient. Ce fichier mort disait exactement cela, en Rust.
+// Le garde `tests/pochette_radio_source_unique.rs` empêche qu'un deuxième
+// réapparaisse.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +26,20 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
+
+/// Combien d'observations CONSÉCUTIVES sous la position publiée avant que la
+/// garde de monotonie ne cède au renderer (#3229).
+///
+/// Le sondeur interroge la sortie toutes les secondes (`POLL_INTERVAL_MS`), et
+/// c'est déjà le quorum qu'il applique quand il doit décider si un `Stopped`
+/// répété est une vraie fin de piste (`STOPPED_TICKS_THRESHOLD = 5`). Même
+/// grandeur ici, et pour la même raison : cinq tours de suite disent une
+/// insistance, un tour isolé dit une secousse.
+///
+/// Le curseur ne peut donc jamais rester faux plus de cinq secondes, alors que
+/// la secousse de fin de piste — celle que Jean Valjean a vue — dure moins que
+/// cela et se termine par un changement de piste.
+const OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -116,6 +145,45 @@ pub struct ZoneState {
     pub state: PlayState,
     pub now_playing: Option<NowPlaying>,
     pub position_ms: i64,
+    /// Observations du renderer CONSÉCUTIVES situées sous [`Self::position_ms`].
+    ///
+    /// C'est la soupape de la garde de monotonie posée par
+    /// [`PlaybackManager::update_position`] (#3229). Le plancher ne peut être
+    /// relevé que par une OBSERVATION, et une observation peut être fausse :
+    /// certains renderers annoncent la position de la session précédente
+    /// pendant les premières secondes (DMP-A6/A8, voir `stale_start_position`
+    /// dans le sondeur), et cette valeur-là est publiée AVANT que le sondeur ne
+    /// la rejette. Sans soupape, un tel plancher figerait le curseur jusqu'à la
+    /// fin de la piste.
+    ///
+    /// Ce compteur borne le mensonge : après
+    /// [`OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER`] observations consécutives sous
+    /// le plancher, c'est le renderer qui a raison et le plancher cède. Remis à
+    /// zéro par toute observation qui progresse, et par toute commande.
+    ///
+    /// Interne : `#[serde(skip)]`, aucun client ne le lit.
+    #[serde(skip)]
+    pub reculs_de_position: u8,
+    /// Position rendue par la BASE au démarrage, en attente d'être jouée (#2876).
+    ///
+    /// `zones.last_position_ms` est écrit tout au long de la lecture par le
+    /// poller, puis réinjecté au démarrage par `restore_playback_positions` :
+    /// c'est ce qui fait que le curseur affiche déjà le bon endroit à
+    /// l'ouverture de l'interface. Mais aucun chemin de lecture ne s'en
+    /// servait, et « Lecture » repartait à 0:00 alors que l'écran annonçait
+    /// 2:31 (Sandro, fil 1610, sortie Diretta UPnP).
+    ///
+    /// Ce marqueur porte cette position-là, et elle seule : posé UNIQUEMENT par
+    /// [`PlaybackManager::restore_position`], effacé par le premier
+    /// [`PlaybackManager::play`] réel. Il ne dit donc rien de la position
+    /// conservée par un Stop en cours de session — celle-là garde son
+    /// comportement d'aujourd'hui, sans quoi un clic sur la même piste depuis
+    /// la bibliothèque (ou une file arrivée à son terme, dont la position vaut
+    /// la durée) se serait mis à sauter en avant.
+    ///
+    /// Interne au serveur : aucun client ne le lit.
+    #[serde(skip)]
+    pub pending_resume_ms: Option<i64>,
     pub volume: f64,
     pub muted: bool,
     pub shuffle: bool,
@@ -242,6 +310,32 @@ pub struct ZoneState {
     pub session_context_type: Option<String>,
     #[serde(default)]
     pub session_context_id: Option<String>,
+    /// Le SERVICE auquel `session_context_id` appartient — `"qobuz"`,
+    /// `"tidal"`, … — ou `"local"` quand le geste portait sur la
+    /// bibliothèque.
+    ///
+    /// L'identifiant seul ne suffit pas à ROUVRIR ce qui joue. C'est une
+    /// chaîne nue, et les gestes que `contexte_de_lecture` reconnaît la
+    /// remplissent depuis deux espaces de noms distincts : un `i64` de la
+    /// table `albums`, ou l'identifiant d'édition d'un service. Le chemin
+    /// local s'en sortait — la bibliothèque est l'espace de noms implicite,
+    /// `"42"` s'ouvre par `GET /albums/42`. Le chemin de service, non :
+    /// `("album", "0060254735822")` ne dit pas chez QUI cet identifiant a un
+    /// sens, alors que `GET /streaming/{service}/albums/{id}` réclame ce
+    /// `{service}`.
+    ///
+    /// Le client web ne pouvait combler le trou qu'en supposant que le
+    /// service ouvert à l'écran est celui qui joue — faux dès qu'on regarde
+    /// Tidal en écoutant Qobuz, et la même classe de devinette que #1284 a
+    /// condamnée pour l'album (« Entreat (2010) » ouvrait la page de The
+    /// Cure). Cyrille Moutia réclame le retour à l'album en cours depuis le
+    /// 30/06/2026 (#1361).
+    ///
+    /// `None` quand la nature du geste est elle-même inconnue : nommer un
+    /// service là où le serveur ne sait rien armerait le raccourci sur du
+    /// vide. `#[serde(default)]` comme ses deux voisins.
+    #[serde(default)]
+    pub session_context_source: Option<String>,
     /// Instant de la dernière mise en pause (`None` hors pause). Pour une
     /// RADIO, l'orchestrateur compare cet instant à un seuil à la reprise :
     /// un flux live continue de se périmer pendant la pause (connexion
@@ -330,6 +424,8 @@ impl Default for ZoneState {
             output_signal_path: None,
             output_dsp_metrics: None,
             position_ms: 0,
+            reculs_de_position: 0,
+            pending_resume_ms: None,
             volume: 0.5,
             muted: false,
             shuffle: false,
@@ -348,6 +444,7 @@ impl Default for ZoneState {
             session_profile_id: None,
             session_context_type: None,
             session_context_id: None,
+            session_context_source: None,
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
         }
@@ -394,6 +491,9 @@ pub struct PlaybackEvent {
 pub struct PlaybackManager {
     zones: Arc<Mutex<HashMap<i64, ZoneState>>>,
     event_tx: broadcast::Sender<PlaybackEvent>,
+    /// Inhibition de veille agrégée : une zone qui s'arrête ne la relâche pas
+    /// tant qu'une autre joue encore (#2108).
+    sleep_inhibitor: crate::system_sleep::SystemSleepInhibitor,
     /// Un [`crate::audio::tap::ZoneTap`] par zone — le tap PCM que le
     /// forwarder de niveaux alimente et que les plugins d'analyse consomment.
     /// Verrou synchrone : accès courts, jamais tenus à travers un await.
@@ -417,6 +517,7 @@ impl PlaybackManager {
         Self {
             zones: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
+            sleep_inhibitor: crate::system_sleep::SystemSleepInhibitor::new(),
             zone_taps: std::sync::Mutex::new(HashMap::new()),
             levels_gens: std::sync::Mutex::new(HashMap::new()),
         }
@@ -472,8 +573,25 @@ impl PlaybackManager {
         // On tient une URL jouable : la recherche est finie.
         state.resolving = false;
         state.position_ms = position_ms;
+        // Une position POSÉE par Tune repart d'un plancher neuf (#3229).
+        state.reculs_de_position = 0;
+        // #2876 — armer la reprise. Sans ce marqueur, la position ci-dessus
+        // n'est plus qu'un affichage : les chemins « Lecture après arrêt »
+        // construisent leur `PlayRequest` avec `seek_ms: None` et le morceau
+        // repart de zéro. Voir `ZoneState::pending_resume_ms`.
+        state.pending_resume_ms = (position_ms > 0).then_some(position_ms);
         state.now_playing = Some(np);
         state.state = PlayState::Stopped;
+    }
+
+    /// La position rendue par la base au démarrage, tant qu'elle n'a pas été
+    /// jouée. Voir [`ZoneState::pending_resume_ms`].
+    pub async fn pending_resume_ms(&self, zone_id: i64) -> Option<i64> {
+        self.zones
+            .lock()
+            .await
+            .get(&zone_id)
+            .and_then(|s| s.pending_resume_ms)
     }
 
     pub async fn all_states(&self) -> Vec<ZoneState> {
@@ -606,6 +724,13 @@ impl PlaybackManager {
         if !is_recent_seek {
             state.position_ms = 0;
         }
+        // Nouveau flux : le plancher de monotonie repart de la position qu'on
+        // vient d'écrire (0, ou la cible du déplacement en cours) — #3229.
+        state.reculs_de_position = 0;
+        // La position restaurée au démarrage est à usage unique : ce flux-ci
+        // l'a consommée (si l'appelant l'a demandée) ou l'a rendue caduque (il
+        // joue autre chose). Dans les deux cas elle ne vaut plus (#2876).
+        state.pending_resume_ms = None;
         // Stamp the (re)start instant so the orchestrator can coalesce a
         // redundant controller double-dispatch of this same track (#1271).
         state.last_play_started_at = Some(Instant::now());
@@ -627,6 +752,7 @@ impl PlaybackManager {
         }
 
         let data = now_playing_event_data(state);
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "started".into(),
             zone_id,
@@ -640,6 +766,7 @@ impl PlaybackManager {
             state.state = PlayState::Paused;
             state.paused_at = Some(Instant::now());
         }
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "paused".into(),
             zone_id,
@@ -653,6 +780,7 @@ impl PlaybackManager {
             state.state = PlayState::Playing;
             state.paused_at = None;
         }
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "resumed".into(),
             zone_id,
@@ -677,6 +805,7 @@ impl PlaybackManager {
         } else {
             serde_json::json!({})
         };
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "stopped".into(),
             zone_id,
@@ -694,13 +823,25 @@ impl PlaybackManager {
             state.paused_at = None;
             state.now_playing = None;
             state.position_ms = 0;
+            state.reculs_de_position = 0;
+            // La file est vide : il n'y a plus rien à reprendre (#2876).
+            state.pending_resume_ms = None;
             state.metadata_changed_at_ms = None;
         }
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "stopped".into(),
             zone_id,
             data: serde_json::json!({}),
         });
+    }
+
+    fn sync_sleep_inhibition(&self, zones: &HashMap<i64, ZoneState>) {
+        self.sleep_inhibitor.set_active(
+            zones
+                .values()
+                .any(|state| state.state == PlayState::Playing),
+        );
     }
 
     /// Stamp a stall-recovery restart for this zone. Called by the OAAT stall
@@ -739,6 +880,10 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.position_ms = position_ms;
+            // Le déplacement est le recul DEMANDÉ : il abaisse le plancher de
+            // monotonie lui-même, donc la garde de `update_position` n'a rien à
+            // retenir et le curseur suit immédiatement (#3229).
+            state.reculs_de_position = 0;
             state.last_seek_at = Some(Instant::now());
         }
         self.emit(PlaybackEvent {
@@ -781,27 +926,34 @@ impl PlaybackManager {
         });
     }
 
+    /// `entry` pour la même raison que [`Self::update_queue_info`] : les trois
+    /// appels de `restore_queue_metadata` (longueur, répétition, aléatoire) se
+    /// suivent au démarrage, sur une zone qui n'est pas encore en mémoire. Les
+    /// laisser en `get_mut` reviendrait à corriger un des trois et laisser ses
+    /// deux sœurs jeter la valeur restaurée en silence.
     pub async fn set_shuffle(&self, zone_id: i64, enabled: bool) {
         {
             let mut zones = self.zones.lock().await;
-            if let Some(state) = zones.get_mut(&zone_id) {
-                state.shuffle = enabled;
-                if enabled {
-                    // Build a fresh order around the currently playing track so
-                    // the next advance goes to a different track.
-                    state.shuffle_order = generate_shuffle_order(
-                        state.queue_length.max(0) as usize,
-                        state.queue_position.max(0) as usize,
-                    );
-                    state.shuffle_index = if state.shuffle_order.is_empty() {
-                        -1
-                    } else {
-                        0
-                    };
+            let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            });
+            state.shuffle = enabled;
+            if enabled {
+                // Build a fresh order around the currently playing track so
+                // the next advance goes to a different track.
+                state.shuffle_order = generate_shuffle_order(
+                    state.queue_length.max(0) as usize,
+                    state.queue_position.max(0) as usize,
+                );
+                state.shuffle_index = if state.shuffle_order.is_empty() {
+                    -1
                 } else {
-                    state.shuffle_order.clear();
-                    state.shuffle_index = -1;
-                }
+                    0
+                };
+            } else {
+                state.shuffle_order.clear();
+                state.shuffle_index = -1;
             }
         }
         self.emit(PlaybackEvent {
@@ -811,12 +963,19 @@ impl PlaybackManager {
         });
     }
 
+    /// `entry` : voir [`Self::update_queue_info`]. Le mode de répétition
+    /// restauré au démarrage tombait dans le vide sur une zone pas encore en
+    /// mémoire, alors que le journal annonçait la restauration.
     pub async fn set_repeat(&self, zone_id: i64, mode: RepeatMode) {
         {
             let mut zones = self.zones.lock().await;
-            if let Some(state) = zones.get_mut(&zone_id) {
-                state.repeat = mode;
-            }
+            zones
+                .entry(zone_id)
+                .or_insert_with(|| ZoneState {
+                    zone_id,
+                    ..Default::default()
+                })
+                .repeat = mode;
         }
         self.emit(PlaybackEvent {
             event: "repeat".into(),
@@ -851,6 +1010,11 @@ impl PlaybackManager {
     /// remplace le precedent. Sans cela, jouer une piste isolee apres une
     /// playlist laisserait la piste marquee « playlist ».
     ///
+    /// `context_source` va avec `context_id` et jamais sans lui : c'est
+    /// l'espace de noms qui rend l'identifiant ROUVRABLE (#1361). Il s'ecrase
+    /// avec les deux autres, pour la meme raison — un geste laisse derriere
+    /// lui un contexte entier, ou aucun.
+    ///
     /// Aucun evenement emis — c'est de l'attribution interne, pas de l'etat
     /// d'interface.
     pub async fn set_session_context(
@@ -858,6 +1022,7 @@ impl PlaybackManager {
         zone_id: i64,
         context_type: Option<String>,
         context_id: Option<String>,
+        context_source: Option<String>,
     ) {
         let mut zones = self.zones.lock().await;
         let z = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -866,41 +1031,143 @@ impl PlaybackManager {
         });
         z.session_context_type = context_type;
         z.session_context_id = context_id;
+        z.session_context_source = context_source;
     }
 
-    pub async fn update_position(&self, zone_id: i64, position_ms: i64) {
+    /// Publier une position OBSERVÉE sur le renderer, et rendre celle qui a
+    /// réellement été retenue.
+    ///
+    /// # La position publiée ne recule pas dans une piste (#3229)
+    ///
+    /// Jean Valjean (fil 893, 02/07/2026) : « le temps affiché dépasse la durée
+    /// de la piste, puis RECULE (3:02 → 2:59) ». Le dépassement est borné
+    /// depuis, côté sondeur, mais rien n'empêchait la valeur brute rendue par le
+    /// renderer de DIMINUER : elle était recopiée telle quelle.
+    ///
+    /// ## Ce qui distingue un recul SUBI d'un recul DEMANDÉ
+    ///
+    /// La distinction n'est pas un seuil ni une heuristique : elle est
+    /// STRUCTURELLE, et elle tient en une phrase.
+    ///
+    /// > Une COMMANDE réécrit le plancher. Une OBSERVATION ne peut que le
+    /// > relever.
+    ///
+    /// Tous les reculs demandés passent par un chemin qui écrit `position_ms`
+    /// directement, sans passer par ici, et abaissent donc le plancher au
+    /// moment même où l'utilisateur le demande :
+    ///
+    /// - déplacement arrière : [`PlaybackManager::seek`] pose la cible ;
+    /// - retour au début / changement de piste : [`PlaybackManager::play`]
+    ///   remet à 0 ;
+    /// - avance gapless (qui ne passe PAS par `play`, donc ne remet ni la
+    ///   génération ni la position) : `advance_queue_metadata` appelle
+    ///   [`PlaybackManager::reset_position`] ;
+    /// - reprise au démarrage : [`PlaybackManager::restore_position`] ;
+    /// - file vidée : [`PlaybackManager::stop_and_clear`].
+    ///
+    /// Il ne reste donc SOUS cette garde que ce qui vient du renderer. Un
+    /// `max()` posé ici ne peut pas figer le curseur après un déplacement
+    /// volontaire — ce qui serait un défaut pire que celui-ci, parce que
+    /// permanent et visible de tous.
+    ///
+    /// ## Et si le plancher lui-même est faux
+    ///
+    /// Il peut l'être : le sondeur publie la position AVANT d'appliquer sa
+    /// garde `stale_start_position`, si bien qu'un renderer qui rejoue la
+    /// position de la session précédente (DMP-A6/A8) peut relever le plancher
+    /// d'un coup. [`ZoneState::reculs_de_position`] borne ce mensonge : après
+    /// [`OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER`] observations consécutives sous
+    /// le plancher, le renderer a raison et le plancher cède. La garde
+    /// n'immobilise donc jamais le curseur durablement.
+    ///
+    /// Rend la position RETENUE : l'appelant doit émettre celle-là, sinon
+    /// l'état servi par `GET /zones` et l'évènement `position` divergeraient et
+    /// l'écran reculerait quand même.
+    pub async fn update_position(&self, zone_id: i64, position_ms: i64) -> i64 {
+        let mut zones = self.zones.lock().await;
+        let Some(state) = zones.get_mut(&zone_id) else {
+            return position_ms;
+        };
+        if position_ms >= state.position_ms {
+            state.reculs_de_position = 0;
+            state.position_ms = position_ms;
+            return position_ms;
+        }
+        state.reculs_de_position = state.reculs_de_position.saturating_add(1);
+        if state.reculs_de_position >= OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER {
+            state.reculs_de_position = 0;
+            state.position_ms = position_ms;
+            return position_ms;
+        }
+        state.position_ms
+    }
+
+    /// Reposer la position d'une zone SANS garde de monotonie — le geste vient
+    /// de Tune, pas du renderer.
+    ///
+    /// Pendant du contrat décrit par [`PlaybackManager::update_position`] : ce
+    /// qui descend le plancher doit le dire. L'avance gapless est le seul
+    /// changement de piste qui n'emprunte pas [`PlaybackManager::play`] (elle
+    /// évite exprès le rebond de `track_generation`, voir
+    /// `advance_queue_metadata`) : sans ce chemin explicite, la remise à 0 de la
+    /// piste suivante serait prise pour un recul du renderer et le curseur
+    /// resterait collé à la fin de la piste précédente (#3229).
+    pub async fn reset_position(&self, zone_id: i64, position_ms: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.position_ms = position_ms;
+            state.reculs_de_position = 0;
         }
     }
 
+    /// Longueur et position de la file pour cette zone.
+    ///
+    /// `entry` et non `get_mut` : la zone n'est PAS forcément déjà en mémoire
+    /// quand on lui annonce sa file. Au démarrage, `restore_queue_metadata`
+    /// appelle cette fonction AVANT que quoi que ce soit n'ait créé l'état de
+    /// zone — et `restore_playback_positions`, qui le crée d'habitude, saute
+    /// justement les zones dont la dernière piste venait d'un service (pas de
+    /// `last_track_id`) ou dont la piste a disparu de la bibliothèque. La
+    /// longueur restaurée partait alors à la poubelle en silence, la zone
+    /// démarrait avec `queue_length = 0`, et `next_position()` — qui rend
+    /// `None` dès que la file est vide — concluait « file terminée » à la fin
+    /// du premier morceau : le sondeur arrêtait la zone alors que l'écran, lui,
+    /// lit la file en base et affichait toujours les pistes suivantes.
+    ///
+    /// C'est ce piège exact que deux appelants de `routes/playback.rs`
+    /// contournaient déjà chacun dans leur coin, en réaffirmant la longueur
+    /// APRÈS `play()` (« silent no-op when the zone's in-memory state doesn't
+    /// exist yet »). Leurs sœurs — `Orchestrator::play_from_queue`, le repli
+    /// « Lire » sans corps de requête, `queue_add` — ne l'avaient pas. On
+    /// bouche le trou une fois, à la source.
     pub async fn update_queue_info(&self, zone_id: i64, position: i64, length: i64) {
         let mut zones = self.zones.lock().await;
-        if let Some(state) = zones.get_mut(&zone_id) {
-            state.queue_position = position;
-            state.queue_length = length;
-            if state.shuffle {
-                let len = length.max(0) as usize;
-                let pos = position.max(0) as usize;
-                if len == 0 {
-                    state.shuffle_order.clear();
-                    state.shuffle_index = -1;
-                } else if state.shuffle_order.len() != len {
-                    // Queue length changed (tracks added/removed, or the order
-                    // was lost across a restart — it is not persisted). Rebuild
-                    // around the current track.
-                    state.shuffle_order = generate_shuffle_order(len, pos);
-                    state.shuffle_index = 0;
-                } else if let Some(idx) = state.shuffle_order.iter().position(|&p| p == pos) {
-                    // Sync the cursor to the track now playing so the next
-                    // advance follows the order from here.
-                    state.shuffle_index = idx as i64;
-                } else {
-                    // Position not in the order (shouldn't happen) — rebuild.
-                    state.shuffle_order = generate_shuffle_order(len, pos);
-                    state.shuffle_index = 0;
-                }
+        let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        state.queue_position = position;
+        state.queue_length = length;
+        if state.shuffle {
+            let len = length.max(0) as usize;
+            let pos = position.max(0) as usize;
+            if len == 0 {
+                state.shuffle_order.clear();
+                state.shuffle_index = -1;
+            } else if state.shuffle_order.len() != len {
+                // Queue length changed (tracks added/removed, or the order
+                // was lost across a restart — it is not persisted). Rebuild
+                // around the current track.
+                state.shuffle_order = generate_shuffle_order(len, pos);
+                state.shuffle_index = 0;
+            } else if let Some(idx) = state.shuffle_order.iter().position(|&p| p == pos) {
+                // Sync the cursor to the track now playing so the next
+                // advance follows the order from here.
+                state.shuffle_index = idx as i64;
+            } else {
+                // Position not in the order (shouldn't happen) — rebuild.
+                state.shuffle_order = generate_shuffle_order(len, pos);
+                state.shuffle_index = 0;
             }
         }
     }
@@ -1003,6 +1270,8 @@ mod tests {
                 ..Default::default()
             }),
             position_ms: 0,
+            reculs_de_position: 0,
+            pending_resume_ms: None,
             volume: 1.0,
             muted: false,
             shuffle: false,
@@ -1021,6 +1290,7 @@ mod tests {
             session_profile_id: None,
             session_context_type: None,
             session_context_id: None,
+            session_context_source: None,
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
         };
@@ -1151,6 +1421,67 @@ mod tests {
         assert_eq!(ev.data["mode"], "all");
     }
 
+    /// #1924 (Tades, fil forum 1471) — « je vois bien la piste que je souhaite
+    /// écouter dans la file d'attente et la lecture en cours est finie depuis
+    /// cinq minutes », et rien ne part.
+    ///
+    /// Le scénario reproduit ici est celui du démarrage du serveur.
+    /// `restore_queue_metadata` (tune-server/src/startup.rs) annonce à la zone
+    /// sa longueur de file, son mode de répétition et son aléatoire — dans cet
+    /// ordre — avant que quoi que ce soit n'ait créé son état en mémoire. Le
+    /// créateur habituel, `restore_playback_positions`, saute justement les
+    /// zones dont la dernière piste venait d'un service (pas de
+    /// `last_track_id`) ou dont la piste a disparu de la bibliothèque.
+    ///
+    /// Les trois écritures se faisaient alors en `get_mut` : trois no-op
+    /// silencieux, suivis d'un `info!` qui annonçait la restauration. La zone
+    /// démarrait avec `queue_length = 0`, `next_position()` rendait `None` dès
+    /// le premier `if queue_length == 0`, et le sondeur concluait « file
+    /// terminée » à la fin du premier morceau — alors que l'écran, qui lit la
+    /// file en base, affichait toujours les suivantes.
+    ///
+    /// Aucune horloge, aucune course : le test tient sur l'ordre des appels.
+    #[tokio::test]
+    async fn la_file_restauree_au_demarrage_survit_a_une_zone_pas_encore_en_memoire() {
+        let pm = PlaybackManager::new();
+
+        pm.update_queue_info(7, 0, 3).await;
+        pm.set_repeat(7, RepeatMode::Off).await;
+        pm.set_shuffle(7, false).await;
+
+        let state = pm.get_state(7).await;
+        assert_eq!(
+            state.queue_length, 3,
+            "la longueur restaurée doit atteindre l'état de zone, pas le vide"
+        );
+        assert_eq!(state.queue_position, 0);
+        assert_eq!(
+            crate::poller::PositionPoller::next_position(&state),
+            Some(1),
+            "sans la longueur, next_position rend None et le sondeur arrête la \
+             zone à la fin du premier morceau, file pleine à l'écran"
+        );
+    }
+
+    /// Les deux sœurs du même trio. Corriger `update_queue_info` seule aurait
+    /// laissé la répétition et l'aléatoire restaurés tomber dans le vide sur
+    /// une zone dont l'état n'existe pas encore.
+    #[tokio::test]
+    async fn repetition_et_aleatoire_restaures_atteignent_une_zone_pas_encore_en_memoire() {
+        let pm = PlaybackManager::new();
+
+        pm.set_repeat(9, RepeatMode::All).await;
+        pm.set_shuffle(9, true).await;
+
+        let state = pm.get_state(9).await;
+        assert_eq!(
+            state.repeat,
+            RepeatMode::All,
+            "le mode de répétition restauré doit tenir"
+        );
+        assert!(state.shuffle, "l'aléatoire restauré doit tenir");
+    }
+
     #[test]
     fn generate_shuffle_order_is_a_permutation_with_current_first() {
         let order = generate_shuffle_order(10, 4);
@@ -1269,5 +1600,238 @@ mod tests {
         pm.set_resolving(2, true).await;
         pm.stop_and_clear(2).await;
         assert!(!pm.get_state(2).await.resolving);
+    }
+
+    /// #2108 — la garde de veille appartient à l'ensemble des zones, pas à la
+    /// dernière commande reçue. Une pause ne doit jamais endormir le serveur
+    /// si une autre zone continue de jouer.
+    #[tokio::test]
+    async fn inhibition_de_veille_suit_la_derniere_zone_qui_joue() {
+        let pm = super::PlaybackManager::new();
+        assert!(!pm.sleep_inhibitor.requested());
+
+        pm.play(1, super::NowPlaying::default()).await;
+        assert!(pm.sleep_inhibitor.requested());
+
+        pm.play(2, super::NowPlaying::default()).await;
+        pm.pause(1).await;
+        assert!(
+            pm.sleep_inhibitor.requested(),
+            "la zone 2 joue encore : la pause de la zone 1 ne libère rien"
+        );
+
+        pm.stop(2).await;
+        assert!(
+            !pm.sleep_inhibitor.requested(),
+            "la dernière zone active est arrêtée : la garde doit être libérée"
+        );
+
+        pm.resume(1).await;
+        assert!(pm.sleep_inhibitor.requested());
+        pm.stop_and_clear(1).await;
+        assert!(!pm.sleep_inhibitor.requested());
+    }
+
+    /// #2876 — le marqueur de reprise vit exactement le temps qu'il faut.
+    ///
+    /// Posé par la restauration du démarrage, effacé par la première lecture
+    /// réelle. Un Stop en cours de session ne le pose PAS : la position qu'il
+    /// conserve sert l'affichage, et la faire rejouer ferait sauter en avant un
+    /// clic sur la même piste depuis la bibliothèque, ou une file arrivée à son
+    /// terme (dont la position vaut la durée).
+    #[tokio::test]
+    async fn le_marqueur_de_reprise_est_a_usage_unique() {
+        let pm = super::PlaybackManager::new();
+        let np = super::NowPlaying {
+            track_id: Some(42),
+            duration_ms: 300_000,
+            ..Default::default()
+        };
+
+        pm.restore_position(1, 151_000, np.clone()).await;
+        assert_eq!(
+            pm.pending_resume_ms(1).await,
+            Some(151_000),
+            "la position rendue par la base doit être offerte à la première lecture (#2876)"
+        );
+        assert_eq!(pm.get_state(1).await.position_ms, 151_000);
+
+        pm.play(1, np.clone()).await;
+        assert_eq!(
+            pm.pending_resume_ms(1).await,
+            None,
+            "le flux est parti : la position restaurée est consommée, pas rejouable"
+        );
+
+        // Témoin : un Stop en session conserve la position pour l'écran mais
+        // n'arme aucune reprise.
+        pm.stop(1).await;
+        assert_eq!(pm.pending_resume_ms(1).await, None);
+
+        // Une position nulle n'arme rien non plus.
+        pm.restore_position(2, 0, np.clone()).await;
+        assert_eq!(pm.pending_resume_ms(2).await, None);
+
+        // File vidée : plus rien à reprendre.
+        pm.restore_position(3, 90_000, np.clone()).await;
+        assert_eq!(pm.pending_resume_ms(3).await, Some(90_000));
+        pm.stop_and_clear(3).await;
+        assert_eq!(pm.pending_resume_ms(3).await, None);
+
+        // L'ancrage que fait la route avant de demander la lecture : sans le
+        // `seek()`, `play()` remettrait le curseur à zéro et l'écran
+        // recommencerait à mentir — dans l'autre sens cette fois.
+        pm.restore_position(4, 151_000, np.clone()).await;
+        pm.seek(4, 151_000).await;
+        pm.play(4, np).await;
+        assert_eq!(
+            pm.get_state(4).await.position_ms,
+            151_000,
+            "le curseur doit suivre le son, pas retomber à 0:00 (#2876)"
+        );
+    }
+
+    // ── #3229 — la position publiée ne recule pas DANS une piste ────────────
+    //
+    // Jean Valjean, fil 893, 02/07/2026, v0.8.233 : « le temps affiché dépasse
+    // la durée de la piste, puis RECULE (3:02 → 2:59) ».
+    //
+    // Les quatre épreuves qui suivent tiennent ensemble ou pas du tout : la
+    // première seule serait satisfaite par un curseur figé, ce qui est un
+    // défaut PIRE — permanent, et visible de tout le monde.
+
+    /// La piste de Jean Valjean : 2:59 au compteur, un renderer qui redescend.
+    fn la_piste_du_fil_893() -> super::NowPlaying {
+        super::NowPlaying {
+            track_id: Some(893),
+            title: "Fil 893".into(),
+            duration_ms: 179_000,
+            ..Default::default()
+        }
+    }
+
+    /// 1. RECUL SUBI — aucun geste de l'auditeur, le renderer se contredit.
+    ///
+    /// Signature exacte de Jean Valjean : la position atteint la durée, puis le
+    /// renderer rend 2:59 puis 2:56. Rien ne doit redescendre à l'écran.
+    #[tokio::test]
+    async fn un_recul_du_renderer_ne_descend_pas_a_l_ecran() {
+        let pm = super::PlaybackManager::new();
+        pm.play(1, la_piste_du_fil_893()).await;
+
+        assert_eq!(pm.update_position(1, 176_000).await, 176_000);
+        assert_eq!(pm.update_position(1, 179_000).await, 179_000);
+
+        // Le renderer redescend — 3:02 borné à 2:59, puis 2:56.
+        assert_eq!(
+            pm.update_position(1, 176_000).await,
+            179_000,
+            "le recul subi ne doit pas être publié (#3229)"
+        );
+        assert_eq!(
+            pm.get_state(1).await.position_ms,
+            179_000,
+            "l'état servi par GET /zones doit dire la même chose que l'évènement"
+        );
+    }
+
+    /// 2. CONTRE-ÉPREUVE — un déplacement ARRIÈRE est suivi immédiatement.
+    ///
+    /// C'est l'épreuve qui interdit le `max()` naïf. Le déplacement abaisse le
+    /// plancher lui-même : aucune tolérance, aucun délai, aucun tour de sonde à
+    /// attendre.
+    #[tokio::test]
+    async fn un_deplacement_arriere_est_suivi_immediatement() {
+        let pm = super::PlaybackManager::new();
+        pm.play(1, la_piste_du_fil_893()).await;
+        assert_eq!(pm.update_position(1, 170_000).await, 170_000);
+
+        // L'auditeur revient à 0:30.
+        pm.seek(1, 30_000).await;
+        assert_eq!(pm.get_state(1).await.position_ms, 30_000);
+
+        // Et le renderer repart de là : DÈS la première observation.
+        assert_eq!(
+            pm.update_position(1, 31_000).await,
+            31_000,
+            "après un déplacement arrière le curseur doit suivre, pas rester \
+             collé au maximum atteint (#3229)"
+        );
+    }
+
+    /// 3. CHANGEMENT DE PISTE — la position repart de zéro. Par les DEUX
+    /// chemins, car ils ne sont pas le même.
+    ///
+    /// `play()` est le chemin ordinaire. L'avance gapless, elle, n'y passe
+    /// PAS : `advance_queue_metadata` évite exprès le rebond de
+    /// `track_generation` et repose la position par `reset_position`. Un garde
+    /// qui n'aurait connu que `play()` aurait figé le curseur à la fin de la
+    /// piste précédente sur tout un album enchaîné.
+    #[tokio::test]
+    async fn un_changement_de_piste_repart_de_zero_par_les_deux_chemins() {
+        let pm = super::PlaybackManager::new();
+
+        // (a) Chemin ordinaire.
+        pm.play(1, la_piste_du_fil_893()).await;
+        assert_eq!(pm.update_position(1, 179_000).await, 179_000);
+        pm.play(1, la_piste_du_fil_893()).await;
+        assert_eq!(pm.get_state(1).await.position_ms, 0);
+        assert_eq!(
+            pm.update_position(1, 1_000).await,
+            1_000,
+            "la piste suivante doit pouvoir compter depuis 0:00"
+        );
+
+        // (b) Avance gapless — ce que fait `advance_queue_metadata`.
+        pm.play(2, la_piste_du_fil_893()).await;
+        assert_eq!(pm.update_position(2, 179_000).await, 179_000);
+        pm.update_now_playing(2, la_piste_du_fil_893()).await;
+        pm.reset_position(2, 0).await;
+        assert_eq!(
+            pm.update_position(2, 1_000).await,
+            1_000,
+            "une avance gapless ne passe pas par play() : sans reset_position \
+             le curseur resterait collé à la fin de la piste précédente (#3229)"
+        );
+    }
+
+    /// 4. LA SOUPAPE — un plancher faux ne fige pas le curseur pour toujours.
+    ///
+    /// Le sondeur publie la position AVANT d'appliquer `stale_start_position` :
+    /// un renderer qui rejoue la position de la session précédente (DMP-A6/A8)
+    /// peut donc relever le plancher d'un coup. Après
+    /// `OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER` observations consécutives sous ce
+    /// plancher, c'est le renderer qui a raison.
+    #[tokio::test]
+    async fn un_renderer_qui_insiste_finit_par_etre_suivi() {
+        let pm = super::PlaybackManager::new();
+        pm.play(1, la_piste_du_fil_893()).await;
+
+        // Plancher empoisonné par un fantôme de la session précédente.
+        assert_eq!(pm.update_position(1, 174_000).await, 174_000);
+
+        // Le renderer, lui, joue vraiment le début de la piste.
+        for (tour, honnete) in [3_000, 4_000, 5_000, 6_000].into_iter().enumerate() {
+            assert_eq!(
+                pm.update_position(1, honnete).await,
+                174_000,
+                "tour {} : le plancher tient encore",
+                tour + 1
+            );
+        }
+        assert_eq!(
+            pm.update_position(1, 7_000).await,
+            7_000,
+            "au cinquième tour consécutif sous le plancher, le renderer a \
+             raison : la garde ne fige jamais le curseur durablement (#3229)"
+        );
+
+        // Et le compteur est reparti à zéro : la garde protège de nouveau.
+        assert_eq!(pm.update_position(1, 8_000).await, 8_000);
+        assert_eq!(
+            pm.update_position(1, 7_500).await,
+            8_000,
+            "une secousse isolée redevient inoffensive après que le plancher a cédé"
+        );
     }
 }

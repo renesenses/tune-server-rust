@@ -3,6 +3,7 @@ use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -48,7 +49,7 @@ pub(super) async fn export_ratings(
     let rows = state
         .backend
         .query_many(&sql, &[&profile_id as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {

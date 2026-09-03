@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -50,6 +50,60 @@ const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 // for the mtime pre-check (#619).
 const SCAN_IO_CONCURRENCY: usize = 32;
 
+// Concurrence retenue quand les fichiers scannés vivent sur un MONTAGE RÉSEAU
+// (CIFS/SMB, NFS, sshfs…).
+//
+// D'où vient ce nombre, puisqu'on ne peut pas mesurer le NAS de chacun :
+//
+// * borne basse — les plateaux valent 4 (`concurrence_pour_disque`, mesuré chez
+//   Yacine, #1948). Un partage cache un disque qu'on ne peut PAS sonder : chez
+//   Pierre M (QNAP, fil 1043) ce sont des plateaux, avec un saut réseau en plus.
+//   Descendre plus bas que 4 n'aurait donc aucune justification mesurée ;
+// * borne haute — au-delà du nombre de fils de service du NAS, les requêtes
+//   supplémentaires ne se recouvrent plus : elles font la queue dans le backlog
+//   du serveur, et c'est exactement là que le client voit des time-outs en
+//   rafale plutôt qu'une simple lenteur. Le `nfsd` des NAS grand public tourne
+//   par défaut à 8 fils (RPCNFSDCOUNT=8 chez Debian/Ubuntu, valeur par défaut
+//   de nfs-utils), et un smbd de NAS 2 baies est du même ordre.
+//
+// On reste donc au-dessus des plateaux — la latence réseau, elle, SE recouvre,
+// contrairement aux déplacements de tête — et sous le point où l'on remplit la
+// file d'attente du NAS. Ce n'est pas une mesure faite chez Pierre M : c'est un
+// encadrement entre deux repères, et `TUNE_SCAN_IO_CONCURRENCY` reste le dernier
+// mot pour qui mesure mieux sur SA machine.
+const SCAN_IO_CONCURRENCY_RESEAU: usize = 8;
+
+/// Systèmes de fichiers qui parlent au travers du réseau.
+///
+/// Liste explicite plutôt qu'un préfixe : `fuse.` couvre aussi bien `fuse.sshfs`
+/// (réseau) que `fuse.ntfs-3g` ou `fuse.mergerfs` (parfaitement locaux), donc on
+/// nomme les cas réseau un par un. Un type inconnu est traité comme local — même
+/// prudence que `disque_rotatif`, qui ne dégrade personne sur une supposition.
+const SYSTEMES_DE_FICHIERS_RESEAU: &[&str] = &[
+    "9p",
+    "afp",
+    "afpfs",
+    "afs",
+    "ceph",
+    "cifs",
+    "coda",
+    "davfs",
+    "fuse.davfs2",
+    "fuse.rclone",
+    "fuse.s3fs",
+    "fuse.smbnetfs",
+    "fuse.sshfs",
+    "glusterfs",
+    "ncpfs",
+    "nfs",
+    "nfs4",
+    "smb2",
+    "smb3",
+    "smbfs",
+    "sshfs",
+    "webdav",
+];
+
 /// Resolve the scan I/O concurrency, honouring an optional `TUNE_SCAN_IO_CONCURRENCY`
 /// override. The fixed default (32) is a good fit for a fast SSD NAS, but the
 /// sweet spot is storage-specific: a weak 2-bay HDD NAS (Synology DS218Play,
@@ -60,15 +114,200 @@ const SCAN_IO_CONCURRENCY: usize = 32;
 /// something we cannot benchmark centrally. Empty/invalid/zero → the default;
 /// clamped to 1..=256 so a typo can't spawn a pathological number of OS threads.
 pub fn scan_io_concurrency() -> usize {
-    if let Some(n) = std::env::var("TUNE_SCAN_IO_CONCURRENCY")
-        .ok()
+    concurrence_depuis_reglage(std::env::var("TUNE_SCAN_IO_CONCURRENCY").ok().as_deref())
+}
+
+/// La décision, séparée de la LECTURE du réglage.
+///
+/// Fonction PURE, comme [`concurrence_pour_disque`] juste en dessous, et pour
+/// une raison plus forte qu'un principe : son test l'éprouvait en écrivant
+/// dans l'environnement du processus. Or `set_var` est `unsafe` depuis
+/// l'édition 2024 parce qu'il n'est pas sûr entre fils d'exécution — et il
+/// réécrit le bloc `environ` que TOUS les autres fils lisent au même moment.
+/// Le parcours de bibliothèque en lit un à chaque fichier rencontré
+/// (`is_tune_temp_file` appelle `std::env::temp_dir()`), donc le test faisait
+/// courir la totalité du scanner contre une réécriture d'environnement.
+///
+/// Ce n'était pas théorique : mesuré sur Shrek, l'ajout de deux parcours de
+/// test supplémentaires suffisait à faire tomber **dix** tests de parcours
+/// d'un coup, tous avec « 0 fichier trouvé », dans la suite `--workspace`
+/// seule. Le même test passait en `-p tune-core` isolé, et disparaissait avec
+/// `--skip scan_io_concurrency_env_override`. Prendre le réglage en argument
+/// supprime la course à sa source, sans rien retirer à la couverture.
+fn concurrence_depuis_reglage(reglage: Option<&str>) -> usize {
+    if let Some(n) = reglage
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .map(|n| n.clamp(1, 256))
     {
         return n;
     }
-    concurrence_pour_disque(disque_rotatif())
+    concurrence_pour_stockage(mountinfo().as_deref(), &racine_scannee(), disque_rotatif())
+}
+
+/// La décision complète, une fois le réglage manuel écarté : type de disque ET
+/// nature du montage.
+///
+/// Fonction PURE — elle reçoit le CONTENU de `mountinfo`, le chemin scanné et le
+/// verdict de la sonde `/sys`. C'est ce qui rend la règle éprouvable sans monter
+/// un partage CIFS, chose impossible sur la machine de compilation. Même patron
+/// que `resolve_local_audio_backend`, qui prend son `lookup` en paramètre.
+///
+/// On garde le MINIMUM des deux verdicts : ils décrivent deux goulots
+/// indépendants (l'actionneur d'un côté, la file du serveur de l'autre) et le
+/// plus étroit commande. Un `mountinfo` absent ou illisible ne change donc rien
+/// au comportement d'avant.
+pub(crate) fn concurrence_pour_stockage(
+    mountinfo: Option<&str>,
+    chemin: &std::path::Path,
+    rotatif: Option<bool>,
+) -> usize {
+    let reseau = mountinfo
+        .and_then(|m| systeme_de_fichiers_du_chemin(m, chemin))
+        .is_some_and(|fs| est_systeme_de_fichiers_reseau(&fs));
+    let par_le_montage = if reseau {
+        SCAN_IO_CONCURRENCY_RESEAU
+    } else {
+        SCAN_IO_CONCURRENCY
+    };
+    par_le_montage.min(concurrence_pour_disque(rotatif))
+}
+
+/// Le type de système de fichiers est-il un accès réseau ?
+///
+/// Comparaison insensible à la casse, sur la liste explicite ci-dessus.
+pub(crate) fn est_systeme_de_fichiers_reseau(systeme: &str) -> bool {
+    let systeme = systeme.trim().to_ascii_lowercase();
+    SYSTEMES_DE_FICHIERS_RESEAU.contains(&systeme.as_str())
+}
+
+/// Type de système de fichiers portant `chemin`, d'après le contenu de
+/// `/proc/self/mountinfo`.
+///
+/// Fonction PURE : le contenu du fichier arrive en argument.
+///
+/// Format d'une ligne (`Documentation/filesystems/proc.rst`) :
+/// `36 35 98:0 /mnt1 /mnt rw,noatime <champs optionnels> - ext3 /dev/root rw`.
+/// Le point de montage est le 5ᵉ champ ; le type vient JUSTE APRÈS le séparateur
+/// ` - `, dont l'existence même est là pour absorber un nombre variable de
+/// champs optionnels (`shared:`, `master:`…). Découper naïvement à l'index 8
+/// donnerait le type d'à côté sur un montage partagé.
+///
+/// C'est le point de montage **le plus long** qui préfixe le chemin qui gagne :
+/// avec `/` en ext4 et `/mnt/nas` en cifs, un appariement sur le premier préfixe
+/// venu rendrait `ext4` pour tout le monde. La comparaison se fait par
+/// COMPOSANTS (`Path::starts_with`), sinon `/mnt/nasty` passerait pour du
+/// `/mnt/nas`.
+pub(crate) fn systeme_de_fichiers_du_chemin(
+    mountinfo: &str,
+    chemin: &std::path::Path,
+) -> Option<String> {
+    let mut meilleur: Option<(usize, String)> = None;
+    for ligne in mountinfo.lines() {
+        // Une ligne tronquée ou inattendue est SAUTÉE, jamais fatale : elle ne
+        // doit pas faire perdre les montages parfaitement lisibles d'à côté.
+        let Some((avant, apres)) = separer_champs_mountinfo(ligne) else {
+            continue;
+        };
+        let (Some(brut), Some(systeme)) = (
+            avant.split_whitespace().nth(4),
+            apres.split_whitespace().next(),
+        ) else {
+            continue;
+        };
+        let point_de_montage = std::path::PathBuf::from(demasquer_octal(brut));
+        if !chemin.starts_with(&point_de_montage) {
+            continue;
+        }
+        let profondeur = point_de_montage.components().count();
+        if meilleur.as_ref().is_none_or(|(p, _)| profondeur >= *p) {
+            meilleur = Some((profondeur, systeme.to_string()));
+        }
+    }
+    meilleur.map(|(_, systeme)| systeme)
+}
+
+/// Coupe une ligne de `mountinfo` au séparateur ` - `.
+///
+/// Le dernier séparateur fait foi : un point de montage peut légitimement
+/// contenir ` - ` (il serait alors masqué en octal pour l'espace… mais les
+/// options de super-bloc, elles, ne contiennent jamais d'espace nu).
+fn separer_champs_mountinfo(ligne: &str) -> Option<(&str, &str)> {
+    let position = ligne.rfind(" - ")?;
+    Some((&ligne[..position], &ligne[position + 3..]))
+}
+
+/// Rend les échappements octaux de `mountinfo` : le noyau y masque l'espace, la
+/// tabulation, le saut de ligne et l'antislash. Un dossier « /mnt/My Music »
+/// apparaît en `/mnt/My\040Music`, et sans ce décodage il ne s'apparierait avec
+/// rien.
+fn demasquer_octal(brut: &str) -> String {
+    let mut sortie = String::with_capacity(brut.len());
+    let mut reste = brut;
+    while let Some(position) = reste.find('\\') {
+        sortie.push_str(&reste[..position]);
+        let suite = &reste[position + 1..];
+        match suite
+            .get(..3)
+            .and_then(|octal| u8::from_str_radix(octal, 8).ok())
+        {
+            Some(octet) => {
+                sortie.push(octet as char);
+                reste = &suite[3..];
+            }
+            None => {
+                sortie.push('\\');
+                reste = suite;
+            }
+        }
+    }
+    sortie.push_str(reste);
+    sortie
+}
+
+/// Premier dossier de musique configuré — le chemin dont on veut connaître le
+/// stockage. Partagé avec `disque_rotatif` pour que les deux sondes parlent bien
+/// du MÊME chemin. Repli sur `/` quand rien n'est configuré.
+pub(crate) fn racine_scannee() -> std::path::PathBuf {
+    std::env::var("TUNE_MUSIC_DIRS")
+        .ok()
+        .and_then(|v| {
+            serde_json::from_str::<Vec<String>>(&v)
+                .ok()
+                .and_then(|d| d.into_iter().next())
+        })
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
+/// Contenu de `/proc/self/mountinfo`, ou `None`.
+///
+/// Linux seulement, et volontairement : macOS (`statfs.f_fstypename`) et Windows
+/// (`WNetGetConnection`, `GetDriveType`) exposent l'information par des API
+/// totalement différentes, non compilables ni éprouvables ici. Ils rendent donc
+/// `None` et gardent les 32 lectures d'avant — la RÈGLE, elle, est déjà partagée
+/// et n'attendra qu'une sonde le jour où l'un des deux sera mesurable.
+///
+/// Un `/proc` illisible n'empêche jamais un scan : on journalise et on retombe
+/// sur le comportement d'origine.
+fn mountinfo() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string("/proc/self/mountinfo") {
+            Ok(contenu) => Some(contenu),
+            Err(e) => {
+                warn!(
+                    erreur = %e,
+                    "/proc/self/mountinfo illisible : concurrence de scan non adaptée au montage réseau"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// Concurrence adaptée au type de disque, une fois le réglage manuel écarté.
@@ -102,19 +341,17 @@ pub(crate) fn concurrence_pour_disque(rotatif: Option<bool>) -> usize {
 /// n'est qu'une heuristique de performance, elle ne doit jamais empêcher un
 /// scan. Lue une seule fois par processus — le pool n'est construit qu'une
 /// fois, et un disque ne change pas de nature en cours de route.
+///
+/// AVEUGLE AUX MONTAGES RÉSEAU, par construction : un partage CIFS ou NFS n'a
+/// pas de périphérique bloc, `/sys/dev/block/<maj>:<min>` n'existe donc pas et
+/// cette sonde rend `None` — c'est-à-dire « garde 32 », sur le lien réseau d'un
+/// NAS grand public (Pierre M, fil 1043 : time-outs en rafale). C'est
+/// `systeme_de_fichiers_du_chemin` qui couvre ce cas, en parallèle.
 pub(crate) fn disque_rotatif() -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
-        let racine = std::env::var("TUNE_MUSIC_DIRS")
-            .ok()
-            .and_then(|v| {
-                serde_json::from_str::<Vec<String>>(&v)
-                    .ok()
-                    .and_then(|d| d.into_iter().next())
-            })
-            .unwrap_or_else(|| "/".to_string());
-        let dev = std::fs::metadata(&racine).ok()?.dev();
+        let dev = std::fs::metadata(racine_scannee()).ok()?.dev();
         let (majeur, mineur) = (unsafe { libc::major(dev) }, unsafe { libc::minor(dev) });
         let base = format!("/sys/dev/block/{majeur}:{mineur}");
         for chemin in [
@@ -253,6 +490,29 @@ pub struct ScannedFile {
     pub mtime: u64,
 }
 
+/// Combien de chemins écartés une liste du rapport de scan retient au plus.
+///
+/// Le rapport doit répondre « lesquels ? », pas « tous » : une bibliothèque
+/// dont 40 000 fichiers `.cue` sont écartés produirait sinon un rapport de
+/// plusieurs mégaoctets, relu à chaque `GET /scan/report`. Les compteurs
+/// (`skipped_unsupported`, `skipped_no_metadata`, `skipped_duplicate`,
+/// `skipped_unsupported_by_ext`) restent, eux, exhaustifs : le plafond borne
+/// l'échantillon nominatif, jamais le décompte.
+pub const PLAFOND_CHEMINS_ECARTES: usize = 500;
+
+/// Ajoute un chemin écarté tant que la liste n'a pas atteint son plafond.
+///
+/// Une seule définition pour les six endroits qui écartent un fichier — deux
+/// dans ce parcours, deux dans la phase de métadonnées, deux dans les boucles
+/// d'import. Le motif « un chemin corrigé, les autres nus » est la façon dont
+/// ce rapport a déjà divergé trois fois (#2012) ; un plafond recopié à la main
+/// six fois divergerait de la même manière.
+pub fn pousser_chemin_ecarte(liste: &mut Vec<String>, chemin: impl Into<String>) {
+    if liste.len() < PLAFOND_CHEMINS_ECARTES {
+        liste.push(chemin.into());
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ScanStats {
     pub total_files: usize,
@@ -263,6 +523,92 @@ pub struct ScanStats {
     pub failed_paths: Vec<String>,
     pub unsupported_by_ext: std::collections::HashMap<String, usize>,
     pub unsupported_reasons: std::collections::HashMap<String, String>,
+    /// Les CHEMINS des fichiers dont le format a été reconnu à la lecture mais
+    /// n'est pas décodable, plafonnés par [`PLAFOND_CHEMINS_ECARTES`].
+    ///
+    /// `unsupported_by_ext` dit « 280 fichiers `.mpc` » ; seul ceci dit
+    /// LESQUELS. C'est la question posée par le testeur (#2050) et celle qui
+    /// manque pour instruire « des fichiers présents dans l'explorateur sont
+    /// absents de Tune » (#2365, #2802).
+    pub unsupported_paths: Vec<String>,
+    /// Les lignes que la BASE a refusées à l'insertion, sur l'ensemble du scan
+    /// (#2939).
+    ///
+    /// Ce compteur-ci n'est pas de la même nature que les précédents et c'est
+    /// tout son intérêt. `metadata_failed` compte des LECTURES de fichier :
+    /// il vaut 0 dès que les balises se lisent, quoi qu'il advienne ensuite.
+    /// Chez Alain Bonnel (fil 1313), les quatorze fichiers d'un album se sont
+    /// lus sans une erreur — `metadata_ok=14 metadata_failed=0` — puis les
+    /// quatorze insertions ont été refusées (`UNIQUE constraint failed:
+    /// tracks.file_path`). Le résumé de fin de scan annonçait donc un scan
+    /// sans le moindre défaut alors qu'un album entier venait d'être perdu.
+    ///
+    /// L'écriture en base n'est pas faite par ce module : elle est faite par
+    /// la fermeture passée à [`scan_files_batched`]. C'est pourquoi cette
+    /// fermeture REND désormais son verdict d'écriture ([`EcrituresDuLot`])
+    /// au lieu de ne rien rendre — le compteur ne peut plus rester à zéro
+    /// pendant que l'appelant, lui, sait très bien qu'il a perdu des pistes.
+    pub db_insert_failed: usize,
+    /// Les lignes que la base a refusées à la MISE À JOUR — même mécanique et
+    /// même raison que [`Self::db_insert_failed`].
+    pub db_update_failed: usize,
+}
+
+impl ScanStats {
+    /// Le scan a-t-il perdu quelque chose en chemin ?
+    ///
+    /// Un seul endroit pour répondre, parce que la question s'est déjà posée
+    /// à trois endroits recopiés à la main (#2012). « Sans erreur » ne veut
+    /// pas dire « toutes les balises se sont lues » : un fichier lu puis
+    /// refusé par la base est perdu tout autant qu'un fichier illisible.
+    pub fn a_perdu_des_pistes(&self) -> bool {
+        self.metadata_failed > 0 || self.db_insert_failed > 0 || self.db_update_failed > 0
+    }
+}
+
+/// Ce qu'un lot a réellement réussi à ÉCRIRE, rendu par la fermeture
+/// d'importation à [`scan_files_batched`] (#2939).
+///
+/// Le parcours lit des fichiers ; il n'écrit rien en base. Sans ce retour, le
+/// résumé qu'il publie ne peut parler que de lecture — et c'est exactement ce
+/// qui s'est produit : `batched_scan_complete total=14 metadata_ok=14
+/// metadata_failed=0` pour un lot dont les quatorze insertions ont été
+/// refusées. Un `()` en valeur de retour ne pose aucune question à
+/// l'appelant ; cette structure-ci l'oblige à répondre.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EcrituresDuLot {
+    /// Lignes présentées à l'insertion et refusées par la base.
+    pub insert_failed: usize,
+    /// Lignes présentées à la mise à jour et refusées par la base.
+    pub update_failed: usize,
+}
+
+impl EcrituresDuLot {
+    /// Le lot n'a rien perdu — la valeur d'un import qui s'est bien passé.
+    pub const SANS_PERTE: Self = Self {
+        insert_failed: 0,
+        update_failed: 0,
+    };
+
+    /// Le manque à écrire d'un lot : ce qui a été présenté moins ce qui est
+    /// entré. Écrit une fois ici plutôt que soustrait à la main chez chacun
+    /// des deux appelants — c'est la soustraction qui diverge.
+    pub fn manque(presentees_a_l_insertion: usize, insertions_reussies: usize) -> Self {
+        Self {
+            insert_failed: presentees_a_l_insertion.saturating_sub(insertions_reussies),
+            update_failed: 0,
+        }
+    }
+
+    /// Ajoute le manque à la mise à jour, sur le même modèle.
+    pub fn avec_manque_a_la_mise_a_jour(
+        mut self,
+        presentees: usize,
+        mises_a_jour_reussies: usize,
+    ) -> Self {
+        self.update_failed = presentees.saturating_sub(mises_a_jour_reussies);
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -284,7 +630,7 @@ enum ReadFileError {
 /// duration instead of leaving the track at duration 0. (Pierre M's NAS,
 /// Philippe Landes' RS130 SSD)
 fn read_file_with_retry(
-    path: &PathBuf,
+    path: &Path,
     with_hash: bool,
 ) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
     let result = match read_file_with_timeout(path, with_hash, FILE_TIMEOUT) {
@@ -358,14 +704,14 @@ fn probe_dsd_header_duration_bounded(path: &std::path::Path) -> Option<u64> {
 }
 
 fn read_file_with_timeout(
-    path: &PathBuf,
+    path: &Path,
     with_hash: bool,
     tag_timeout: Duration,
 ) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
     // Phase 1 — read the tags. This is fast even on a NAS (only the header /
     // tag blocks are read), so `tag_timeout` is plenty. A timeout here means the
     // tags are genuinely unreadable → caller falls back to filename metadata.
-    let meta_path = path.clone();
+    let meta_path = path.to_path_buf();
     let (mtx, mrx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = match crate::audio::support::library_audio_support(&meta_path) {
@@ -395,7 +741,7 @@ fn read_file_with_timeout(
     // and just skip the hash (audio_hash = None) instead of dropping the track
     // to filename-only metadata. Dedup is degraded for that one file, nothing
     // more.
-    let hash_path = path.clone();
+    let hash_path = path.to_path_buf();
     let (htx, hrx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = htx.send(compute_audio_hash(&hash_path));
@@ -427,6 +773,28 @@ pub struct ListAudioResult {
     pub skipped_by_ext: std::collections::HashMap<String, usize>,
     /// Motif stable associé à chaque clé de `skipped_by_ext`.
     pub skipped_reasons: std::collections::HashMap<String, String>,
+    /// Les CHEMINS écartés par ce parcours, plafonnés par
+    /// [`PLAFOND_CHEMINS_ECARTES`] et suffixés de leur motif.
+    ///
+    /// C'est ici que la liste demandée se perdait : le parcours classait le
+    /// fichier, incrémentait `skipped_by_ext`, puis jetait le chemin (#2050).
+    pub skipped_paths: Vec<String>,
+    /// Les dossiers qui portent au moins une feuille CUE, triés et dédoublés.
+    ///
+    /// Le parcours voit passer chaque `.cue`, le compte comme non lu, et jette
+    /// l'information (#1763). Or une feuille est la seule chose qui explique un
+    /// album entier absent, et savoir CE QU'ELLE DÉCRIT demande de la lire —
+    /// ce qui ne peut pas se faire ici : le parcours doit rester une opération
+    /// de répertoire, sans lecture bloquante par fichier sur un NAS. On retient
+    /// donc les dossiers, et [`super::cue_album::inventorier`] les relit après
+    /// coup, une fois le parcours terminé.
+    ///
+    /// Non plafonné : c'est une liste de DOSSIERS, bornée par l'arborescence
+    /// que le parcours vient de traverser, et bien plus courte que `files`.
+    /// Le plafond est posé plus loin, sur la RELECTURE, qui elle coûte une
+    /// ouverture de fichier par feuille — voir
+    /// [`super::cue_album::PLAFOND_DOSSIERS_INVENTORIES`].
+    pub dossiers_avec_feuille_cue: Vec<PathBuf>,
 }
 
 impl ListAudioResult {
@@ -469,6 +837,232 @@ pub struct ProgressionParcours<'a> {
 /// l'émission par lots de la phase d'import (`scan.rs`), pour que l'écran
 /// reçoive un flux régulier d'un bout à l'autre du scan.
 pub const CADENCE_PROGRESSION_PARCOURS: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Pourquoi une racine configurée n'est pas parcourue pour elle-même.
+///
+/// Ce n'est PAS un rejet : ses fichiers sont bien parcourus, par la racine qui
+/// la couvre. La distinction compte pour le rapport — une racine absorbée ne
+/// doit jamais être confondue avec une racine illisible, qui déclenche, elle,
+/// la protection de purge (#2356).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotifAbsorption {
+    /// Deux écritures du MÊME dossier : chaîne différente, dossier identique.
+    Identique,
+    /// Sous-dossier d'une autre racine déjà parcourue.
+    Imbriquee,
+}
+
+impl MotifAbsorption {
+    /// L'étiquette stable posée au journal — lisible dans un export de
+    /// testeur, et cherchable.
+    pub fn etiquette(self) -> &'static str {
+        match self {
+            MotifAbsorption::Identique => "meme_dossier",
+            MotifAbsorption::Imbriquee => "sous_dossier",
+        }
+    }
+}
+
+/// Une racine configurée que le parcours n'ouvrira pas, et celle qui la couvre.
+#[derive(Debug, Clone)]
+pub struct RacineAbsorbee {
+    /// La racine telle que l'utilisateur l'a déclarée.
+    pub racine: String,
+    /// La racine qui la contient, telle qu'elle a été déclarée elle aussi.
+    pub couverte_par: String,
+    pub motif: MotifAbsorption,
+}
+
+/// Le verdict du dédoublonnage : ce qui sera parcouru, et ce qui a été absorbé.
+///
+/// Les deux listes sont rendues ensemble à dessein. Une déduplication ne se
+/// juge pas aux doublons qu'elle évite : elle se juge aussi aux racines
+/// légitimes qu'elle confond. Rendre `absorbees` permet de compter les deux.
+#[derive(Debug, Default)]
+pub struct RacinesDedoublonnees {
+    /// Les racines à parcourir, dans l'ordre où l'utilisateur les a déclarées
+    /// et sous leur écriture d'origine — le parcours les normalise lui-même,
+    /// et le journal doit nommer ce que l'utilisateur a saisi.
+    pub retenues: Vec<String>,
+    pub absorbees: Vec<RacineAbsorbee>,
+}
+
+/// Ce que le dédoublonnage sait d'une racine avant de décider.
+struct RacineSondee {
+    /// Chemin canonique : liens symboliques résolus, `..` réduits, relatif
+    /// rendu absolu. `None` si le chemin n'existe pas ou n'est pas résoluble.
+    canonique: Option<PathBuf>,
+    /// Identité du dossier au sens du système de fichiers. Elle attrape ce que
+    /// la chaîne manque : deux montages du même partage, un `mount --bind`,
+    /// une casse différente sur un volume insensible à la casse. `None` hors
+    /// Unix, où `std` n'expose pas d'identifiant stable.
+    identite: Option<(u64, u64)>,
+    /// Le chemin désigne bien un dossier.
+    est_dossier: bool,
+    /// `read_dir` répond. Seule une racine lisible peut en absorber une autre.
+    lisible: bool,
+}
+
+#[cfg(unix)]
+fn identite_de_dossier(chemin: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(chemin).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn identite_de_dossier(_chemin: &std::path::Path) -> Option<(u64, u64)> {
+    // Windows n'expose pas d'identifiant de fichier stable par `std`. La
+    // comparaison retombe sur le chemin canonique, qui couvre déjà les
+    // jonctions et les chemins UNC résolus par `canonicalize`.
+    None
+}
+
+fn sonder_racine(brut: &str) -> RacineSondee {
+    let normalisee = normalize_path(brut);
+    let chemin = std::path::Path::new(&normalisee);
+    RacineSondee {
+        canonique: std::fs::canonicalize(chemin).ok(),
+        identite: identite_de_dossier(chemin),
+        est_dossier: chemin.is_dir(),
+        // Le parcours refera cette sonde quelques lignes plus loin pour en
+        // tirer le MOTIF de l'échec (`obstacle::obstacle_de_lecture`), qui
+        // demande l'`io::Error` lui-même. On ne la partage pas : `read_dir`
+        // n'est qu'un `openat` sur la racine — O(1), aucune entrée lue — et
+        // le coût est sans commune mesure avec le parcours qui suit.
+        lisible: std::fs::read_dir(chemin).is_ok(),
+    }
+}
+
+/// Réduit les racines configurées à celles qu'il faut réellement parcourir.
+///
+/// # Le défaut corrigé (#2889)
+///
+/// La boucle de parcours itérait sur les racines telles quelles. Chez JeromeQ,
+/// `/mnt/eversolo_nvme` et `/mnt/eversolo_nvme/77A6-799D` étaient tous deux
+/// déclarés : le second sous-arbre était donc parcouru DEUX fois — une fois
+/// pour lui-même, une fois à travers le premier. Chaque fichier entrait deux
+/// fois dans `files`, donc deux fois dans la phase de lecture des métadonnées,
+/// la plus longue du scan (48 minutes chez lui pour 30 000 fichiers).
+///
+/// # Ce que la clé couvre
+///
+/// - la même chaîne déclarée deux fois, aux espaces et à la barre finale près
+///   ([`normalize_path`]) ;
+/// - les allers-retours `.` et `..`, et un chemin relatif contre son absolu
+///   (`canonicalize`) ;
+/// - les liens symboliques, dans les deux sens — une racine lien vers une
+///   autre racine, ou une racine sous un parent traversé par lien
+///   (`canonicalize`) ;
+/// - sur Unix : deux montages distincts du même partage, un `mount --bind`,
+///   et une casse différente sur un volume insensible à la casse — ces
+///   trois-là par l'identité `(device, inode)`, que la chaîne ne voit pas.
+///
+/// # Ce qu'elle ne couvre PAS
+///
+/// - **hors Unix**, la casse : `D:\Musique` et `d:\musique` restent deux
+///   racines sous Windows, faute d'identifiant de fichier exposé par `std` ;
+/// - l'**imbrication** à travers une identité plutôt qu'un chemin : si
+///   `/mnt/a` et `/mnt/b` montent le même partage, `/mnt/a` et
+///   `/mnt/b/Jazz` ne sont pas rapprochés — seules les racines *égales* le
+///   sont. Le cas exact de #2889 (parent et enfant sous le même montage) est,
+///   lui, couvert ;
+/// - les **fichiers** atteignables par deux arbres (liens physiques). Le
+///   dédoublonnage porte sur les racines, pas sur les feuilles ; c'est le
+///   hachage audio qui répond de ce cas-là, plus loin dans le scan.
+///
+/// # Ce qui reste intact
+///
+/// Une racine **injoignable** — inexistante, NAS tombé, droits refusés — est
+/// TOUJOURS retenue : elle doit atteindre la sonde du parcours pour être
+/// rapportée dans `missing_dirs` avec son motif, ce qui déclenche
+/// `VerdictPurge::ProtegeIllisible` et empêche la purge de supprimer ses
+/// pistes (#2356). Elle n'absorbe personne non plus : un parent illisible ne
+/// parcourra rien, et avaler son enfant lisible perdrait un sous-arbre sain.
+pub fn dedoublonner_racines(dirs: &[String]) -> RacinesDedoublonnees {
+    let sondees: Vec<RacineSondee> = dirs.iter().map(|d| sonder_racine(d)).collect();
+
+    // Du plus court au plus long chemin canonique, pour qu'un parent soit
+    // toujours examiné avant ses enfants : sans cet ordre, déclarer l'enfant
+    // en premier ferait absorber le PARENT, et tout ce qu'il contient en
+    // dehors de l'enfant disparaîtrait de la bibliothèque. L'indice sert de
+    // départage pour que le résultat ne dépende pas de l'ordre de tri.
+    let mut ordre: Vec<usize> = (0..sondees.len()).collect();
+    ordre.sort_by_key(|&i| {
+        let profondeur = sondees[i]
+            .canonique
+            .as_ref()
+            .map(|c| c.components().count())
+            .unwrap_or(usize::MAX);
+        (profondeur, i)
+    });
+
+    let mut couverture: Vec<Option<(usize, MotifAbsorption)>> = vec![None; sondees.len()];
+    let mut retenues_idx: Vec<usize> = Vec::new();
+
+    for &i in &ordre {
+        let candidate = &sondees[i];
+        let Some(candidate_c) = candidate.canonique.as_ref() else {
+            retenues_idx.push(i);
+            continue;
+        };
+        if !candidate.est_dossier {
+            // Un chemin qui n'est pas un dossier doit atteindre le parcours
+            // pour y être nommé dans `missing_dirs` (#2356).
+            retenues_idx.push(i);
+            continue;
+        }
+
+        let mut couverte = None;
+        for &j in &retenues_idx {
+            let deja = &sondees[j];
+            if !deja.lisible {
+                continue;
+            }
+            let Some(deja_c) = deja.canonique.as_ref() else {
+                continue;
+            };
+            if candidate_c == deja_c
+                || (candidate.identite.is_some() && candidate.identite == deja.identite)
+            {
+                couverte = Some((j, MotifAbsorption::Identique));
+                break;
+            }
+            // `Path::starts_with` compare COMPOSANT par composant, jamais
+            // caractère par caractère : `/nas/Musique-2` ne commence pas par
+            // `/nas/Musique`. C'est ce qui distingue ce test d'un
+            // `str::starts_with`, qui fusionnerait deux bibliothèques
+            // voisines aux noms proches.
+            if candidate_c.starts_with(deja_c) {
+                couverte = Some((j, MotifAbsorption::Imbriquee));
+                break;
+            }
+        }
+        match couverte {
+            Some(c) => couverture[i] = Some(c),
+            None => retenues_idx.push(i),
+        }
+    }
+
+    // Rendues dans l'ordre de DÉCLARATION, pas dans l'ordre de tri : le
+    // journal, le rapport et l'écran doivent refléter ce que l'utilisateur a
+    // saisi.
+    let mut verdict = RacinesDedoublonnees::default();
+    for (i, dir) in dirs.iter().enumerate() {
+        match couverture[i] {
+            None => verdict.retenues.push(dir.clone()),
+            Some((j, motif)) => verdict.absorbees.push(RacineAbsorbee {
+                racine: dir.clone(),
+                couverte_par: dirs[j].clone(),
+                motif,
+            }),
+        }
+    }
+    verdict
+}
 
 pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
     list_audio_files_with_excludes(dirs, &[])
@@ -520,6 +1114,10 @@ pub fn list_audio_files_avec_progression(
         std::collections::HashMap::new();
     let mut skipped_reasons: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut skipped_paths: Vec<String> = Vec::new();
+    // `BTreeSet` et non `HashSet` : le rapport de scan doit être reproductible
+    // d'un scan à l'autre, et l'ordre d'un `HashSet` ne l'est pas.
+    let mut dossiers_cue: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     let mut missing_dirs = Vec::new();
     let mut missing_dir_reasons: Vec<String> = Vec::new();
     let mut error_dirs: Vec<String> = Vec::new();
@@ -527,6 +1125,10 @@ pub fn list_audio_files_avec_progression(
     // trouble (NAS died mid-walk) — protect the entire root instead of
     // accumulating an unbounded list.
     const MAX_ERROR_SCOPES: usize = 50;
+    // Lignes nominatives émises pour les ISO SACD non extraits avant de passer
+    // au récapitulatif. Même valeur que le plafond des erreurs de parcours :
+    // assez pour montrer des exemples, pas assez pour noyer le journal.
+    const MAX_ISO_WARN: usize = 5;
     // Horloge des annonces de progression, partagée par TOUTES les racines :
     // la cadence doit valoir pour le parcours entier, pas se réarmer à chaque
     // racine. Initialisée dans le passé pour qu'une première annonce parte
@@ -536,7 +1138,22 @@ pub fn list_audio_files_avec_progression(
     let mut derniere_annonce = std::time::Instant::now()
         .checked_sub(cadence)
         .unwrap_or_else(std::time::Instant::now);
-    for dir in dirs {
+
+    // Une racine imbriquée dans une autre était parcourue DEUX fois — une fois
+    // pour elle-même, une fois à travers sa parente (#2889). Le dédoublonnage
+    // se fait ici, au seul goulot par lequel passent les quatre appelants du
+    // parcours : `auto_scan`, `export`, `ingest` et le scan principal.
+    let racines = dedoublonner_racines(dirs);
+    for absorbee in &racines.absorbees {
+        info!(
+            racine = %absorbee.racine,
+            couverte_par = %absorbee.couverte_par,
+            motif = %absorbee.motif.etiquette(),
+            "scan_root_absorbed — racine déjà couverte par une autre, parcourue une seule fois"
+        );
+    }
+
+    for dir in &racines.retenues {
         let normalized = normalize_path(dir);
         let dir_path = std::path::Path::new(&normalized);
 
@@ -594,6 +1211,7 @@ pub fn list_audio_files_avec_progression(
 
         let mut dir_file_count = 0usize;
         let mut dir_error_count = 0usize;
+        let mut dir_iso_error_count = 0usize;
 
         let walker = WalkDir::new(&normalized)
             .follow_links(true)
@@ -677,6 +1295,22 @@ pub fn list_audio_files_avec_progression(
                             *skipped_by_ext
                                 .entry(unsupported.report_key.clone())
                                 .or_insert(0) += 1;
+                            // Le chemin, pas seulement le décompte : « 280
+                            // fichiers .mpc » ne dit pas lesquels, et c'est
+                            // lesquels que le testeur demande (#2050).
+                            pousser_chemin_ecarte(
+                                &mut skipped_paths,
+                                format!("{} ({})", path.display(), unsupported.reason),
+                            );
+                            // Une feuille CUE n'est pas un fichier ignoré comme
+                            // un autre : c'est la description d'un album. Le
+                            // dossier est retenu ici et relu après le parcours
+                            // (#1763) — voir `dossiers_avec_feuille_cue`.
+                            if unsupported.report_key == "cue" {
+                                if let Some(parent) = path.parent() {
+                                    dossiers_cue.insert(parent.to_path_buf());
+                                }
+                            }
                             skipped_reasons
                                 .entry(unsupported.report_key)
                                 .or_insert_with(|| unsupported.reason.to_string());
@@ -688,18 +1322,83 @@ pub fn list_audio_files_avec_progression(
 
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         // ISO SACD: extract DSF tracks instead of adding the ISO directly
-                        if ext.eq_ignore_ascii_case("iso")
-                            && crate::audio::iso_sacd::is_sacd_iso(path)
-                        {
-                            match crate::audio::iso_sacd::extract_iso_to_dsf(path) {
-                                Ok(dsf_files) => {
-                                    dir_file_count += dsf_files.len();
-                                    files.extend(dsf_files);
+                        if ext.eq_ignore_ascii_case("iso") {
+                            if crate::audio::iso_sacd::is_sacd_iso(path) {
+                                match crate::audio::iso_sacd::extract_iso_to_dsf(path) {
+                                    Ok(dsf_files) => {
+                                        dir_file_count += dsf_files.len();
+                                        files.extend(dsf_files);
+                                    }
+                                    Err(e) => {
+                                        // Le fichier n'entre en base par AUCUN
+                                        // chemin : ni comme ISO, ni comme
+                                        // pistes extraites. Il doit donc être
+                                        // COMPTÉ et NOMMÉ dans le rapport de
+                                        // scan, faute de quoi l'album
+                                        // disparaît sans qu'aucun écran ne le
+                                        // dise — 22 albums SACD chez JeromeQ,
+                                        // pour la seule trace d'un `warn!`
+                                        // dans un fichier de journal (#2992).
+                                        dir_iso_error_count += 1;
+                                        // Quelques lignes détaillées, puis un
+                                        // récapitulatif : un `warn!` par
+                                        // fichier noierait le journal.
+                                        if dir_iso_error_count <= MAX_ISO_WARN {
+                                            warn!(path = %path.display(), error = %e, "sacd_iso_extract_failed");
+                                        }
+                                        *skipped_by_ext
+                                            .entry(
+                                                crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD
+                                                    .to_string(),
+                                            )
+                                            .or_insert(0) += 1;
+                                        // Le motif technique exact accompagne
+                                        // le CHEMIN — « sacd_extract not
+                                        // found » et « sacd_extract failed »
+                                        // ne demandent pas le même geste.
+                                        pousser_chemin_ecarte(
+                                            &mut skipped_paths,
+                                            format!("{} ({e})", path.display()),
+                                        );
+                                        skipped_reasons
+                                            .entry(
+                                                crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD
+                                                    .to_string(),
+                                            )
+                                            .or_insert_with(|| {
+                                                crate::audio::iso_sacd::MOTIF_ISO_SACD_NON_EXTRAIT
+                                                    .to_string()
+                                            });
+                                        dir_error_count += 1;
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!(path = %path.display(), error = %e, "sacd_iso_extract_failed");
-                                    dir_error_count += 1;
-                                }
+                            } else {
+                                // `.iso` sans zone SACD : une image de données.
+                                // Elle ne devient pas une piste — la pousser
+                                // dans `files` enverrait une image
+                                // d'installation de 5 Go traverser la phase de
+                                // métadonnées pour finir en piste fantôme.
+                                // Elle est écartée, mais NOMMÉE (#2992).
+                                *skipped_by_ext
+                                    .entry(
+                                        crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES.to_string(),
+                                    )
+                                    .or_insert(0) += 1;
+                                pousser_chemin_ecarte(
+                                    &mut skipped_paths,
+                                    format!(
+                                        "{} ({})",
+                                        path.display(),
+                                        crate::audio::iso_sacd::MOTIF_ISO_SANS_ZONE_SACD
+                                    ),
+                                );
+                                skipped_reasons
+                                    .entry(
+                                        crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES.to_string(),
+                                    )
+                                    .or_insert_with(|| {
+                                        crate::audio::iso_sacd::MOTIF_ISO_SANS_ZONE_SACD.to_string()
+                                    });
                             }
                         } else {
                             files.push(path.to_path_buf());
@@ -744,6 +1443,17 @@ pub fn list_audio_files_avec_progression(
             );
         }
 
+        // Même patron que ci-dessus : quelques lignes nominatives plafonnées,
+        // puis une ligne qui porte le TOTAL. Sans elle, le journal de JeromeQ
+        // aurait montré cinq ISO là où vingt-deux albums manquaient (#2992).
+        if dir_iso_error_count > MAX_ISO_WARN {
+            warn!(
+                dir = %normalized,
+                total_errors = dir_iso_error_count,
+                "sacd_iso_extract_errors_truncated — additional SACD ISO failures suppressed"
+            );
+        }
+
         info!(
             dir = %normalized,
             files = dir_file_count,
@@ -755,6 +1465,11 @@ pub fn list_audio_files_avec_progression(
     info!(
         count = files.len(),
         dirs = dirs.len(),
+        // Ce que le parcours a réellement ouvert, et ce qu'il a économisé.
+        // Sans ces deux champs, un `count` divisé par deux d'un scan à l'autre
+        // resterait inexplicable dans un journal de testeur (#2889).
+        parcourues = racines.retenues.len(),
+        absorbees = racines.absorbees.len(),
         missing = missing_dirs.len(),
         walk_errors = error_dirs.len(),
         "audio_files_listed"
@@ -791,6 +1506,8 @@ pub fn list_audio_files_avec_progression(
         missing_dir_reasons,
         skipped_by_ext,
         skipped_reasons,
+        skipped_paths,
+        dossiers_avec_feuille_cue: dossiers_cue.into_iter().collect(),
     }
 }
 
@@ -924,10 +1641,19 @@ pub fn scan_files_parallel(
         .collect();
     let mut unsupported_by_ext = std::collections::HashMap::new();
     let mut unsupported_reasons = std::collections::HashMap::new();
-    for unsupported in results.iter().filter_map(|file| file.unsupported.as_ref()) {
+    let mut unsupported_paths: Vec<String> = Vec::new();
+    for file in results.iter() {
+        let Some(unsupported) = file.unsupported.as_ref() else {
+            continue;
+        };
         *unsupported_by_ext
             .entry(unsupported.report_key.clone())
             .or_insert(0) += 1;
+        // Le chemin était disponible ici depuis toujours, et jeté (#2050).
+        pousser_chemin_ecarte(
+            &mut unsupported_paths,
+            format!("{} ({})", file.path, unsupported.reason),
+        );
         unsupported_reasons
             .entry(unsupported.report_key.clone())
             .or_insert_with(|| unsupported.reason.to_string());
@@ -944,6 +1670,13 @@ pub fn scan_files_parallel(
         failed_paths,
         unsupported_by_ext,
         unsupported_reasons,
+        unsupported_paths,
+        // Ce parcours-ci n'écrit rien en base : il rend les fichiers lus à son
+        // appelant, qui importe ensuite. Il ne peut donc rien constater sur
+        // les écritures — seul le chemin PAR LOTS reçoit ce verdict de sa
+        // fermeture d'import (#2939).
+        db_insert_failed: 0,
+        db_update_failed: 0,
     };
     if !failed.is_empty() {
         let listing: Vec<String> = failed
@@ -981,6 +1714,90 @@ pub fn scan_files_parallel(
 /// Balances memory usage vs. rayon thread-pool efficiency.
 pub const SCAN_BATCH_SIZE: usize = 500;
 
+/// Répartit `files` en lots d'au plus `batch_size` chemins **sans jamais
+/// séparer les fichiers d'un même dossier**.
+///
+/// Le scan décide « ce dossier est-il une compilation ? » sur le LOT qu'on lui
+/// donne (`TrackImporter::begin_batch`). Le découpage précédent — un
+/// `chunks(500)` sur l'ordre de parcours — coupait donc les albums de plus de
+/// 500 pistes, mais surtout **tous** ceux qui tombaient à cheval sur une
+/// frontière : le même dossier était jugé deux fois, sur deux populations
+/// différentes, et le tag « compilation » sortait « au hasard » d'un scan à
+/// l'autre (Pierre M, fil 1043, #3232).
+///
+/// Le regroupement est aussi nécessaire dans l'autre sens : `WalkDir` descend
+/// en profondeur, donc les fichiers d'un dossier ne sont même pas contigus dès
+/// qu'un sous-dossier (`CD2/`) s'intercale entre deux d'entre eux. La
+/// contiguïté supposée par l'ancien commentaire n'a jamais existé.
+///
+/// Garanties :
+/// - aucun lot ne dépasse `batch_size` — le plafond mémoire du scan (un lot de
+///   `ScannedFile` en vol, pochettes embarquées comprises, celles qui ont fait
+///   sauter la machine de JeromeQ) est **inchangé** ;
+/// - l'ordre est déterministe : les dossiers sortent dans l'ordre de leur
+///   PREMIER fichier, et les fichiers d'un dossier dans l'ordre du parcours ;
+/// - seul un dossier qui contient à lui seul plus de `batch_size` fichiers est
+///   encore coupé — il ne tiendrait pas dans un lot sans lever le plafond. Le
+///   cas est journalisé, et il ne concerne pas un album (500 pistes dans UN
+///   dossier).
+///
+/// Le coût est en RÉFÉRENCES, pas en métadonnées : deux `&Path` par fichier et
+/// une entrée de table par dossier, soit quelques mégaoctets pour une
+/// bibliothèque de 58 000 fichiers — sans commune mesure avec les 6,1 Gio d'un
+/// lot de pochettes.
+pub fn lots_alignes_sur_les_dossiers(files: &[PathBuf], batch_size: usize) -> Vec<Vec<&Path>> {
+    let taille = if batch_size == 0 {
+        SCAN_BATCH_SIZE
+    } else {
+        batch_size
+    };
+    // Ordre de première apparition des dossiers + leurs fichiers.
+    let mut ordre: Vec<&Path> = Vec::new();
+    let mut par_dossier: HashMap<&Path, Vec<&Path>> = HashMap::new();
+    for f in files {
+        let dossier = f.parent().unwrap_or_else(|| Path::new(""));
+        par_dossier
+            .entry(dossier)
+            .or_insert_with(|| {
+                ordre.push(dossier);
+                Vec::new()
+            })
+            .push(f.as_path());
+    }
+
+    let mut lots: Vec<Vec<&Path>> = Vec::new();
+    let mut courant: Vec<&Path> = Vec::new();
+    for dossier in ordre {
+        let mut groupe = par_dossier.remove(dossier).unwrap_or_default();
+        if groupe.len() > taille {
+            // Plus gros qu'un lot entier : le garder d'un bloc lèverait le
+            // plafond mémoire du scan. On le coupe, et on le DIT — c'est le
+            // seul cas où la décision « compilation » reste partielle.
+            warn!(
+                dossier = %dossier.display(),
+                fichiers = groupe.len(),
+                taille_de_lot = taille,
+                "scan_dossier_plus_gros_qu_un_lot — la décision « compilation » de ce dossier sera prise par morceaux"
+            );
+            if !courant.is_empty() {
+                lots.push(std::mem::take(&mut courant));
+            }
+            for morceau in groupe.chunks(taille) {
+                lots.push(morceau.to_vec());
+            }
+            continue;
+        }
+        if !courant.is_empty() && courant.len() + groupe.len() > taille {
+            lots.push(std::mem::take(&mut courant));
+        }
+        courant.append(&mut groupe);
+    }
+    if !courant.is_empty() {
+        lots.push(courant);
+    }
+    lots
+}
+
 /// Scan files in batches, calling `on_batch` after each chunk is parsed.
 ///
 /// This enables **progressive availability**: each batch can be committed to
@@ -991,12 +1808,25 @@ pub const SCAN_BATCH_SIZE: usize = 500;
 /// It runs on a rayon worker thread, so the caller must ensure any shared
 /// state (DB handle, caches) is `Send + Sync`.
 ///
+/// Les lots sont **alignés sur les dossiers** — voir
+/// [`lots_alignes_sur_les_dossiers`]. `batch_size` reste un PLAFOND : un lot
+/// peut être plus petit pour ne pas couper un dossier en deux, mais jamais
+/// plus gros. C'est ce qui rend la décision « compilation » indépendante du
+/// découpage (#3232).
+///
+/// Elle REND ce qu'elle a réellement écrit ([`EcrituresDuLot`]) : le parcours
+/// ne touche pas à la base et ne peut donc pas mesurer lui-même ce qu'elle a
+/// refusé. Sans ce retour, le résumé publié plus bas ne parle que de lecture
+/// de balises et annonce un scan sans erreur alors qu'un album entier vient
+/// d'être refusé à l'insertion (#2939, Alain Bonnel, fil 1313). Un import qui
+/// n'a rien perdu rend [`EcrituresDuLot::SANS_PERTE`].
+///
 /// Returns aggregate `ScanStats` over all batches.
 pub fn scan_files_batched(
     files: &[PathBuf],
     with_hash: bool,
     batch_size: usize,
-    mut on_batch: impl FnMut(Vec<ScannedFile>, usize, usize),
+    mut on_batch: impl FnMut(Vec<ScannedFile>, usize, usize) -> EcrituresDuLot,
 ) -> ScanStats {
     let total = files.len();
     let batch_sz = if batch_size == 0 {
@@ -1013,7 +1843,14 @@ pub fn scan_files_batched(
     // back to the default rayon pool if it couldn't be built.
     let io_pool = scan_io_pool();
 
-    for (batch_idx, chunk) in files.chunks(batch_sz).enumerate() {
+    // Un DOSSIER ne doit pas être coupé entre deux lots : la décision
+    // « compilation » se prend sur le lot, et un album à cheval était jugé
+    // deux fois sur deux populations différentes (#3232).
+    let mut deja_lus = 0usize;
+    for (batch_idx, chunk) in lots_alignes_sur_les_dossiers(files, batch_sz)
+        .into_iter()
+        .enumerate()
+    {
         // Parse metadata in parallel within this chunk
         let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let batch_timeout_counter = AtomicUsize::new(0);
@@ -1022,6 +1859,7 @@ pub fn scan_files_batched(
             chunk
                 .par_iter()
                 .map(|path| {
+                    let path: &Path = path;
                     // NFC-normalize: see comment in scan_files_parallel
                     let path_str: String = path.to_string_lossy().nfc().collect();
                     warn_unsafe_path_text(&path_str);
@@ -1120,11 +1958,20 @@ pub fn scan_files_batched(
             .count();
         aggregate.metadata_timeout += batch_timeouts;
         aggregate.hash_ok += batch.iter().filter(|f| f.audio_hash.is_some()).count();
-        for unsupported in batch.iter().filter_map(|file| file.unsupported.as_ref()) {
+        for file in batch.iter() {
+            let Some(unsupported) = file.unsupported.as_ref() else {
+                continue;
+            };
             *aggregate
                 .unsupported_by_ext
                 .entry(unsupported.report_key.clone())
                 .or_insert(0) += 1;
+            // Sœur de la variante par lot ci-dessus : c'est ce chemin-là que
+            // l'un des deux aurait oublié (#2050).
+            pousser_chemin_ecarte(
+                &mut aggregate.unsupported_paths,
+                format!("{} ({})", file.path, unsupported.reason),
+            );
             aggregate
                 .unsupported_reasons
                 .entry(unsupported.report_key.clone())
@@ -1159,15 +2006,33 @@ pub fn scan_files_batched(
             );
         }
 
+        // Compteur RÉEL de fichiers lus. Les lots n'ont plus tous la même
+        // taille (ils s'arrêtent aux frontières de dossier), donc
+        // `(batch_idx + 1) * batch_sz` annoncerait plus de fichiers lus qu'il
+        // n'y en a — et jusqu'à `total` bien avant la fin.
+        deja_lus += batch.len();
         info!(
             batch = batch_idx,
             batch_size = batch.len(),
-            scanned = (batch_idx + 1) * batch_sz,
+            scanned = deja_lus,
             total,
             "scan_batch_complete"
         );
 
-        on_batch(batch, batch_idx, total);
+        // Ce que l'import a REFUSÉ d'écrire entre ici et le résumé de fin
+        // (#2939). Le parcours ne le sait que parce que la fermeture le lui
+        // dit ; il ne peut pas le déduire.
+        let ecritures = on_batch(batch, batch_idx, total);
+        aggregate.db_insert_failed += ecritures.insert_failed;
+        aggregate.db_update_failed += ecritures.update_failed;
+        if ecritures.insert_failed > 0 || ecritures.update_failed > 0 {
+            warn!(
+                batch = batch_idx,
+                insert_failed = ecritures.insert_failed,
+                update_failed = ecritures.update_failed,
+                "scan_batch_writes_refused — la base a refusé des lignes de ce lot"
+            );
+        }
     }
 
     if aggregate.metadata_timeout > 0 {
@@ -1178,11 +2043,19 @@ pub fn scan_files_batched(
         );
     }
 
+    // `metadata_failed` ne répond pas à « ce scan a-t-il perdu des pistes ? » —
+    // il répond à « les balises se sont-elles lues ? ». Les deux compteurs
+    // d'écriture sont là pour que cette ligne, la seule qu'on aura entre les
+    // mains la prochaine fois, ne puisse plus annoncer un scan sans défaut
+    // pendant qu'un album entier est refusé par la base (#2939).
     info!(
         total = aggregate.total_files,
         metadata_ok = aggregate.metadata_ok,
         metadata_failed = aggregate.metadata_failed,
         metadata_timeout = aggregate.metadata_timeout,
+        db_insert_failed = aggregate.db_insert_failed,
+        db_update_failed = aggregate.db_update_failed,
+        pistes_perdues = aggregate.a_perdu_des_pistes(),
         "batched_scan_complete"
     );
 
@@ -1234,37 +2107,204 @@ mod tests {
         assert!((1..=256).contains(&n), "concurrence hors bornes : {n}");
     }
 
+    /// Un `/proc/self/mountinfo` réaliste : racine ext4, un `/mnt` ext4 qui
+    /// PORTE un `/mnt/nas` en cifs (le piège de l'appariement), un NFSv4, un
+    /// point de montage à espace masqué, et un `/mnt/nasty` local dont le nom
+    /// commence par les mêmes lettres que `/mnt/nas`.
+    const MOUNTINFO: &str = concat!(
+        "21 26 0:20 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw\n",
+        "26 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw,errors=remount-ro\n",
+        "40 26 8:17 / /mnt rw,relatime shared:22 - ext4 /dev/sdb1 rw\n",
+        "55 40 0:52 / /mnt/nas rw,relatime shared:29 - cifs //192.168.1.20/musique rw,vers=3.1.1\n",
+        "56 26 0:53 / /mnt/nfs rw,relatime shared:30 - nfs4 192.168.1.30:/export rw\n",
+        "57 26 0:54 / /mnt/My\\040Music rw,relatime shared:31 - cifs //192.168.1.20/mm rw\n",
+        "58 26 8:33 / /mnt/nasty rw,relatime shared:32 - btrfs /dev/sdc1 rw\n",
+    );
+
+    fn concurrence(chemin: &str) -> usize {
+        concurrence_pour_stockage(Some(MOUNTINFO), std::path::Path::new(chemin), Some(false))
+    }
+
+    /// Le correctif lui-même : un fichier sur un partage CIFS ou NFS ne doit
+    /// plus être lu à 32 en parallèle. C'est le NAS QNAP de Pierre M (fil 1043,
+    /// #2934) : la sonde `/sys` ne voit rien d'un montage réseau — pas de
+    /// périphérique bloc — donc elle rendait `None`, c'est-à-dire « garde 32 ».
+    #[test]
+    fn un_montage_reseau_reduit_la_concurrence() {
+        assert_eq!(concurrence("/mnt/nas/musique/album/01.flac"), 8);
+        assert_eq!(concurrence("/mnt/nfs/musique/album/01.flac"), 8);
+        // Et bien en dessous de la valeur locale, sinon le correctif ne corrige
+        // rien du tout.
+        assert!(concurrence("/mnt/nas/musique") < SCAN_IO_CONCURRENCY);
+    }
+
+    /// LE TÉMOIN. Un disque local rapide garde ses 32 lectures parallèles :
+    /// c'est ce qui rend supportable le scan d'une grosse bibliothèque locale,
+    /// et le correctif ne doit surtout pas le dégrader « par prudence ».
+    #[test]
+    fn un_montage_local_garde_les_trente_deux() {
+        assert_eq!(concurrence("/home/tune/Musique/album/01.flac"), 32);
+        assert_eq!(concurrence("/mnt/photos/album/01.flac"), 32);
+        assert_eq!(concurrence("/mnt/nasty/album/01.flac"), 32);
+        // Les types locaux des trois plateformes ne sont jamais pris pour du
+        // réseau — y compris celui de macOS, que la liste doit ignorer.
+        for local in ["ext4", "btrfs", "apfs", "xfs", "ntfs", "vfat", "zfs"] {
+            assert!(
+                !est_systeme_de_fichiers_reseau(local),
+                "{local} pris pour un montage réseau"
+            );
+        }
+    }
+
+    /// L'APPARIEMENT LE PLUS LONG GAGNE. `/` et `/mnt` sont en ext4, `/mnt/nas`
+    /// en cifs : un appariement sur le premier préfixe venu rendrait « ext4 »
+    /// pour tout le monde, et le correctif serait mort-né.
+    ///
+    /// La comparaison se fait par COMPOSANTS : `/mnt/nasty` commence par les
+    /// mêmes lettres que `/mnt/nas` sans être dessous.
+    #[test]
+    fn le_point_de_montage_le_plus_long_gagne() {
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(
+                MOUNTINFO,
+                std::path::Path::new("/mnt/nas/musique/album/01.flac")
+            )
+            .as_deref(),
+            Some("cifs")
+        );
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(MOUNTINFO, std::path::Path::new("/mnt/photos"))
+                .as_deref(),
+            Some("ext4")
+        );
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(MOUNTINFO, std::path::Path::new("/mnt/nasty/x.flac"))
+                .as_deref(),
+            Some("btrfs")
+        );
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(MOUNTINFO, std::path::Path::new("/var/lib/tune"))
+                .as_deref(),
+            Some("ext4")
+        );
+    }
+
+    /// Le type vient APRÈS le séparateur ` - `, jamais à un index fixe : le
+    /// nombre de champs optionnels (`shared:`, `master:`…) varie d'une ligne à
+    /// l'autre, c'est précisément la raison d'être de ce séparateur.
+    #[test]
+    fn le_type_est_lu_apres_le_separateur_meme_sans_champ_optionnel() {
+        let sans_champ_optionnel =
+            "55 40 0:52 / /mnt/nas rw,relatime - cifs //192.168.1.20/musique rw\n";
+        assert_eq!(
+            systeme_de_fichiers_du_chemin(
+                sans_champ_optionnel,
+                std::path::Path::new("/mnt/nas/x.flac")
+            )
+            .as_deref(),
+            Some("cifs")
+        );
+    }
+
+    /// Un point de montage à espace — « /mnt/My Music » — arrive masqué en
+    /// `\040` ; sans décodage il ne s'apparierait avec rien et le partage
+    /// repasserait à 32.
+    #[test]
+    fn les_echappements_octaux_sont_rendus() {
+        assert_eq!(demasquer_octal("/mnt/My\\040Music"), "/mnt/My Music");
+        assert_eq!(demasquer_octal("/mnt/nas"), "/mnt/nas");
+        // Un antislash qui n'introduit pas un octal valide est gardé tel quel.
+        assert_eq!(demasquer_octal("/mnt/a\\zb"), "/mnt/a\\zb");
+        assert_eq!(concurrence("/mnt/My Music/album/01.flac"), 8);
+    }
+
+    /// `mountinfo` absent (hors Linux, `/proc` non monté) ou illisible : repli
+    /// EXACT sur le comportement d'avant, quel que soit le type de disque. La
+    /// lecture, elle, journalise son échec — voir `mountinfo()`.
+    #[test]
+    fn sans_mountinfo_le_comportement_d_origine_est_conserve() {
+        for rotatif in [Some(true), Some(false), None] {
+            assert_eq!(
+                concurrence_pour_stockage(None, std::path::Path::new("/mnt/nas/x.flac"), rotatif),
+                concurrence_pour_disque(rotatif)
+            );
+        }
+        // Contenu illisible : aucune ligne exploitable, donc aucun verdict.
+        let charabia = "pas du tout un mountinfo\n\n???\n";
+        assert_eq!(
+            concurrence_pour_stockage(
+                Some(charabia),
+                std::path::Path::new("/mnt/nas/x.flac"),
+                Some(false)
+            ),
+            SCAN_IO_CONCURRENCY
+        );
+        // Une ligne tronquée ne doit pas faire perdre les lignes saines d'à côté.
+        let partiellement_casse = concat!(
+            "ligne tronquee sans separateur\n",
+            "55 40 0:52 / /mnt/nas rw - cifs //nas/musique rw\n",
+        );
+        assert_eq!(
+            concurrence_pour_stockage(
+                Some(partiellement_casse),
+                std::path::Path::new("/mnt/nas/x.flac"),
+                Some(false)
+            ),
+            8
+        );
+    }
+
+    /// Les deux verdicts décrivent deux goulots différents ; le plus étroit
+    /// commande. Un partage monté depuis un disque à plateaux local reste à 4.
+    #[test]
+    fn le_verdict_le_plus_etroit_commande() {
+        assert_eq!(
+            concurrence_pour_stockage(
+                Some(MOUNTINFO),
+                std::path::Path::new("/mnt/nas/x.flac"),
+                Some(true)
+            ),
+            4
+        );
+    }
+
+    /// Le réglage manuel est éprouvé SANS toucher à l'environnement.
+    ///
+    /// Ce test écrivait dans `TUNE_SCAN_IO_CONCURRENCY` avec `set_var`, en se
+    /// croyant protégé parce qu'il restaurait la valeur d'origine. Il ne l'était
+    /// pas : `set_var` réécrit le bloc `environ` que tous les autres fils
+    /// lisent, et le parcours de bibliothèque en lit un PAR FICHIER
+    /// (`is_tune_temp_file` → `std::env::temp_dir()`). Sauver et restaurer LA
+    /// variable ne protège de rien — c'est la réécriture elle-même qui est
+    /// dangereuse. Voir [`concurrence_depuis_reglage`].
     #[test]
     fn scan_io_concurrency_env_override() {
-        // Serialize env mutation and always restore, so this can't race or leak
-        // into other tests that read the same variable.
-        let key = "TUNE_SCAN_IO_CONCURRENCY";
-        let saved = std::env::var(key).ok();
-
         // Sans variable, c'est le TYPE DE DISQUE qui décide (#1948) — plus la
         // constante. Comparer à la constante ferait passer ce test par chance
         // sur un runner à SSD, et échouer sur une machine à plateaux.
-        let sans_variable = concurrence_pour_disque(disque_rotatif());
-        unsafe { std::env::remove_var(key) };
-        assert_eq!(scan_io_concurrency(), sans_variable);
+        let sans_variable =
+            concurrence_pour_stockage(mountinfo().as_deref(), &racine_scannee(), disque_rotatif());
+        assert_eq!(concurrence_depuis_reglage(None), sans_variable);
 
-        unsafe { std::env::set_var(key, "8") };
-        assert_eq!(scan_io_concurrency(), 8);
+        assert_eq!(concurrence_depuis_reglage(Some("8")), 8);
+        // Les espaces autour du nombre sont tolérés : un réglage recopié dans
+        // un fichier d'unité systemd en traîne souvent.
+        assert_eq!(concurrence_depuis_reglage(Some(" 8 ")), 8);
 
         // Zero, garbage and empty all fall back to the default.
-        unsafe { std::env::set_var(key, "0") };
-        assert_eq!(scan_io_concurrency(), sans_variable);
-        unsafe { std::env::set_var(key, "abc") };
-        assert_eq!(scan_io_concurrency(), sans_variable);
+        assert_eq!(concurrence_depuis_reglage(Some("0")), sans_variable);
+        assert_eq!(concurrence_depuis_reglage(Some("abc")), sans_variable);
+        assert_eq!(concurrence_depuis_reglage(Some("")), sans_variable);
 
         // Over-large is clamped, not honoured verbatim.
-        unsafe { std::env::set_var(key, "100000") };
-        assert_eq!(scan_io_concurrency(), 256);
+        assert_eq!(concurrence_depuis_reglage(Some("100000")), 256);
 
-        match saved {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
+        // Et la fonction publique branche bien la variable sur cette décision :
+        // une LECTURE de l'environnement, jamais une écriture.
+        assert_eq!(
+            scan_io_concurrency(),
+            concurrence_depuis_reglage(std::env::var("TUNE_SCAN_IO_CONCURRENCY").ok().as_deref())
+        );
     }
 
     #[test]
@@ -1353,6 +2393,366 @@ mod tests {
         assert!(!result.skipped_by_ext.contains_key("jpg"));
     }
 
+    /// #2060 — un format que le decodeur sait lire ne doit jamais sortir du
+    /// parcours SANS TRACE.
+    ///
+    /// Le contrat des deux listes n’etait verrouille que dans un sens : tout
+    /// format catalogue possede un decodeur. Le sens inverse ne l’etait pas,
+    /// et `.oga` — l’extension Ogg que le decodeur, l’ecrivain de tags et la
+    /// decision de transcodage reconnaissent tous — n’etait NI catalogue NI
+    /// declare non lu. Il retombait donc sur `LibraryAudioSupport::NotAudio`,
+    /// c’est-a-dire un `continue` muet : aucune piste, aucun compteur, aucune
+    /// ligne de rapport. C’est la seule facon dont un fichier disparait sans
+    /// laisser de quoi le chercher.
+    ///
+    /// Le temoin `album.ogg` est le jumeau exact du fichier fautif : meme
+    /// conteneur, meme dossier, meme contenu, meme appel. S’il tombait avec
+    /// lui, ce test mesurerait la fixture et non le defaut.
+    #[test]
+    fn un_fichier_oga_entre_en_bibliotheque_comme_son_jumeau_ogg() {
+        // Pas sous temp_dir() : `is_tune_temp_file` y ecarte TOUT.
+        let base = crate::test_scratch::scratch_dir_in(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+            "walker-oga-2060",
+        );
+        for name in ["album.ogg", "album.oga"] {
+            std::fs::write(base.join(name), b"fixture").unwrap();
+        }
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let noms: Vec<String> = result
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        // Temoin : vert avant comme apres le correctif.
+        assert!(
+            noms.iter().any(|n| n == "album.ogg"),
+            "temoin album.ogg perdu — la fixture ou le parcours est en cause, pas .oga : {noms:?}"
+        );
+        assert!(
+            noms.iter().any(|n| n == "album.oga"),
+            "album.oga absent du resultat du scan : {noms:?}"
+        );
+        // Et il ne doit pas davantage etre annonce « non lu » : il est lu.
+        assert!(
+            !result.skipped_by_ext.contains_key("oga"),
+            "oga annonce non lu alors qu’il est indexe : {:?}",
+            result.skipped_by_ext
+        );
+    }
+
+    /// Le parcours retient les DOSSIERS porteurs de feuilles CUE (#1763).
+    ///
+    /// Une feuille est la seule chose qui explique un album entier absent, et
+    /// le parcours la comptait comme un fichier non lu de plus avant de jeter
+    /// son chemin. Il ne peut PAS la lire au passage — le parcours doit rester
+    /// une opération de répertoire, sans lecture bloquante par fichier sur un
+    /// NAS — mais il peut retenir où elle est, pour que l'inventaire la relise
+    /// après coup.
+    ///
+    /// Le témoin `temoin.flac` est là exprès : ce test échouerait aussi si la
+    /// reconnaissance des formats DÉJÀ lus régressait en chemin.
+    #[test]
+    fn le_parcours_retient_les_dossiers_porteurs_de_feuilles_cue() {
+        // Chemin suffixé de la clé de tâche : deux agents ont déjà détruit
+        // mutuellement leurs fixtures sous un nom commun.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_dossiers_cue_p2_1763");
+        let _ = std::fs::remove_dir_all(&base);
+        let avec = base.join("Camel - Stationary Traveller");
+        let sans = base.join("Genesis - Trespass");
+        std::fs::create_dir_all(&avec).unwrap();
+        std::fs::create_dir_all(&sans).unwrap();
+        // Deux feuilles dans le MÊME dossier : le dossier ne doit être retenu
+        // qu'une fois, sinon l'inventaire relirait deux fois le même dossier
+        // et compterait ses albums en double.
+        std::fs::write(avec.join("face-a.cue"), b"fixture").unwrap();
+        std::fs::write(avec.join("face-b.cue"), b"fixture").unwrap();
+        std::fs::write(avec.join("image.flac"), b"fixture").unwrap();
+        std::fs::write(sans.join("temoin.flac"), b"fixture").unwrap();
+        std::fs::write(sans.join("album.wma"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            result.dossiers_avec_feuille_cue.len(),
+            1,
+            "un dossier porteur, et un seul, quel que soit le nombre de feuilles \
+             qu'il contient — obtenu : {:?}",
+            result.dossiers_avec_feuille_cue
+        );
+        assert!(
+            result.dossiers_avec_feuille_cue[0].ends_with("Camel - Stationary Traveller"),
+            "c'est le dossier de la feuille qui est retenu, pas la feuille : {:?}",
+            result.dossiers_avec_feuille_cue
+        );
+        // Témoin anti-régression : le `.cue` reste compté comme non lu — cette
+        // brique AJOUTE une information, elle n'en retire aucune.
+        assert_eq!(result.skipped_by_ext.get("cue"), Some(&2));
+        // Témoin anti-régression : les formats déjà reconnus le restent, et le
+        // `.wma` déjà écarté l'est toujours.
+        let noms: Vec<String> = result
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            noms.contains(&"temoin.flac".to_string()),
+            "obtenu : {noms:?}"
+        );
+        assert!(
+            noms.contains(&"image.flac".to_string()),
+            "obtenu : {noms:?}"
+        );
+        assert_eq!(noms.len(), 2, "obtenu : {noms:?}");
+        assert_eq!(result.skipped_by_ext.get("wma"), Some(&1));
+    }
+
+    /// Une bibliothèque sans la moindre feuille ne paie rien (#1763).
+    #[test]
+    fn une_bibliotheque_sans_feuille_cue_ne_retient_aucun_dossier() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_sans_cue_p2_1763");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("temoin.flac"), b"fixture").unwrap();
+        std::fs::write(base.join("album.mpc"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(result.dossiers_avec_feuille_cue.is_empty());
+        // Le Musepack reste compté et nommé : c'est tout ce que Tune peut en
+        // dire, faute de décodeur (#1763, Rhorn).
+        assert_eq!(result.skipped_by_ext.get("mpc"), Some(&1));
+    }
+
+    /// Le parcours retient LESQUELS, pas seulement COMBIEN (#2050).
+    ///
+    /// C'est ici que la liste demandée se perdait : le parcours classait le
+    /// fichier, incrémentait `skipped_by_ext`, puis faisait `continue` — le
+    /// chemin n'était écrit nulle part, ni en journal ni en rapport. Le
+    /// décompte « 280 fichiers .mpc » ne permet pas de retrouver un album.
+    #[test]
+    fn le_parcours_nomme_les_fichiers_ecartes_pas_seulement_leur_nombre() {
+        // Chemin suffixé de la clé de tâche : deux agents ont déjà détruit
+        // mutuellement leurs fixtures sous un nom commun.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_chemins_ecartes_i2050");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for name in ["album.wma", "sacd.dst", "temoin.flac", "cover.jpg"] {
+            std::fs::write(base.join(name), b"fixture").unwrap();
+        }
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let ecartes = result.skipped_paths.join("\n");
+        assert!(
+            ecartes.contains("album.wma"),
+            "le chemin du .wma écarté doit figurer dans le rapport, pas seulement \
+             son décompte — c'est la demande de #2050.\nListe obtenue :\n{ecartes}"
+        );
+        assert!(
+            ecartes.contains("sacd.dst"),
+            "le .dst écarté doit être nommé lui aussi : un seul motif instrumenté \
+             sur deux laisse l'utilisateur devant une liste incomplète\n{ecartes}"
+        );
+        // Le motif accompagne le chemin : « pourquoi » sans « lequel » ne
+        // servait à rien, « lequel » sans « pourquoi » ne sert pas plus.
+        assert!(
+            ecartes.contains("aucun décodeur"),
+            "chaque chemin doit porter son motif\n{ecartes}"
+        );
+        // Contre-épreuve : le bruit d'une bibliothèque ne doit pas noyer la
+        // liste. Une pochette n'est pas un fichier « ignoré ».
+        assert!(
+            !ecartes.contains("cover.jpg"),
+            "les fichiers non audio n'ont rien à faire dans la liste\n{ecartes}"
+        );
+        assert!(
+            !ecartes.contains("temoin.flac"),
+            "un fichier LU ne doit jamais apparaître comme écarté\n{ecartes}"
+        );
+    }
+
+    /// Écrit une image `.iso` creuse de plus de 4 Mo, avec ou sans Master TOC.
+    ///
+    /// Plus de 4 Mo à dessein : c'est le seuil de l'ancien `is_sacd_iso`, celui
+    /// qui prenait toute image de données pour un SACD. Une fixture plus petite
+    /// laisserait la contre-épreuve passer par un autre chemin que celui du
+    /// défaut (#2992).
+    fn image_iso_de_test(dossier: &std::path::Path, nom: &str, sacd: bool) -> std::path::PathBuf {
+        use std::io::{Seek, SeekFrom, Write};
+        let chemin = dossier.join(nom);
+        let mut fichier = std::fs::File::create(&chemin).unwrap();
+        fichier.seek(SeekFrom::Start(0x800 * 510)).unwrap();
+        fichier
+            .write_all(if sacd { b"SACDMTOC" } else { b"CD001\0\0\0" })
+            .unwrap();
+        // Fichier creux : la taille est annoncée, les octets ne sont pas
+        // écrits — le test ne consomme pas 4 Mo sur disque.
+        fichier.set_len(4_200_000).unwrap();
+        fichier.flush().unwrap();
+        chemin
+    }
+
+    /// Un ISO qui n'entre pas en base doit être COMPTÉ et NOMMÉ (#2992).
+    ///
+    /// Vingt-deux albums SACD de JeromeQ ont disparu de sa bibliothèque sans
+    /// qu'aucun écran ne le dise : la branche `Err` de l'extraction émettait un
+    /// `warn!` et n'alimentait aucun compteur du rapport de scan. Un scan qui
+    /// rend « fichiers=N, erreurs=0 » alors que vingt-deux fichiers ne sont
+    /// jamais entrés est un mensonge.
+    #[test]
+    fn les_iso_ecartes_sont_comptes_et_nommes_dans_le_rapport() {
+        // Sous `target/`, jamais sous `/tmp` : `is_tune_temp_file` écarte tout
+        // ce qui vit dans le dossier temporaire du système, et une fixture
+        // posée là ne serait jamais parcourue. Nom suffixé de la clé de tâche
+        // pour ne pas détruire la fixture d'un autre agent.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_iso_ecartes_n2992");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base = base.as_path();
+
+        // Une image portant bien un Master TOC SACD. L'extraction échouera —
+        // `sacd_extract` n'est pas fourni avec Tune, et le contenu est creux —
+        // et c'est exactement le cas du journal de JeromeQ.
+        image_iso_de_test(base, "Breakfast In America.iso", true);
+        // Le faux positif du même journal : une image d'installation.
+        image_iso_de_test(base, "ubuntu-26.04-desktop-amd64.iso", false);
+        std::fs::write(base.join("temoin.flac"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(base);
+
+        // Aucun des deux ISO ne devient une piste : ni comme ISO brut, ni comme
+        // pistes extraites. C'est le fait à expliquer, pas à taire.
+        assert_eq!(
+            result.files.len(),
+            1,
+            "seul le .flac est une piste ; les deux ISO doivent rester dehors.\n\
+             Fichiers retenus : {:?}",
+            result.files
+        );
+        assert!(result.files[0].ends_with("temoin.flac"));
+
+        // 1) L'ISO SACD non extrait est compté sous sa propre clé.
+        assert_eq!(
+            result
+                .skipped_by_ext
+                .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD),
+            Some(&1),
+            "sans ce compteur, le rapport annonce « erreurs : 0 » et l'album \
+             disparaît en silence.\nCompteurs obtenus : {:?}",
+            result.skipped_by_ext
+        );
+        // 2) L'image de données est comptée à part : ce n'est pas le même
+        //    problème et ce n'est pas le même geste pour l'utilisateur.
+        assert_eq!(
+            result
+                .skipped_by_ext
+                .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES),
+            Some(&1),
+            "une image ISO sans zone SACD doit être signalée comme non audio, \
+             pas confondue avec un SACD illisible.\nCompteurs : {:?}",
+            result.skipped_by_ext
+        );
+
+        // 3) Les motifs sont rendus en clair : « sacd_extract » ne dit rien à
+        //    qui lit un rapport de scan.
+        let motif_sacd = result
+            .skipped_reasons
+            .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            motif_sacd.contains("ISO SACD"),
+            "le motif doit nommer le format concerné : {motif_sacd:?}"
+        );
+        assert!(
+            result
+                .skipped_reasons
+                .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES)
+                .is_some_and(|motif| motif.contains("pas de l'audio")),
+            "motifs obtenus : {:?}",
+            result.skipped_reasons
+        );
+
+        // 4) LESQUELS, pas seulement COMBIEN — « 22 ISO écartés » ne permet pas
+        //    de retrouver un album.
+        let ecartes = result.skipped_paths.join("\n");
+        assert!(
+            ecartes.contains("Breakfast In America.iso"),
+            "le chemin du SACD écarté doit figurer au rapport\n{ecartes}"
+        );
+        assert!(
+            ecartes.contains("ubuntu-26.04-desktop-amd64.iso"),
+            "le chemin de l'image de données doit y figurer aussi\n{ecartes}"
+        );
+        // Le motif technique exact accompagne le chemin : « outil absent » et
+        // « extraction en échec » n'appellent pas la même réponse.
+        assert!(
+            ecartes.contains("sacd_extract"),
+            "la cause technique doit accompagner le chemin\n{ecartes}"
+        );
+        assert!(
+            !ecartes.contains("temoin.flac"),
+            "un fichier LU ne doit jamais apparaître comme écarté\n{ecartes}"
+        );
+    }
+
+    /// Témoin anti-régression : sans ISO, le parcours rend exactement ce qu'il
+    /// rendait — aucun compteur d'écart n'apparaît de nulle part (#2992).
+    #[test]
+    fn une_bibliotheque_sans_iso_ne_gagne_aucun_ecart() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_sans_iso_n2992");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for nom in ["a.flac", "b.mp3", "c.dsf"] {
+            std::fs::write(base.join(nom), b"fixture").unwrap();
+        }
+        std::fs::write(base.join("cover.jpg"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(result.files.len(), 3);
+        assert!(
+            result.skipped_by_ext.is_empty(),
+            "aucun écart ne doit être inventé sur une bibliothèque saine : {:?}",
+            result.skipped_by_ext
+        );
+        assert!(result.skipped_paths.is_empty());
+        assert!(result.error_dirs.is_empty());
+    }
+
+    /// Le plafond borne la liste, et le compteur reste exhaustif (#2050).
+    #[test]
+    fn le_plafond_borne_la_liste_sans_borner_le_compte() {
+        let mut liste = Vec::new();
+        for i in 0..(PLAFOND_CHEMINS_ECARTES + 25) {
+            pousser_chemin_ecarte(&mut liste, format!("/musique/{i}.mpc"));
+        }
+        assert_eq!(
+            liste.len(),
+            PLAFOND_CHEMINS_ECARTES,
+            "sans plafond, une bibliothèque de 40 000 fichiers écartés produirait \
+             un rapport de plusieurs mégaoctets relu à chaque /scan/report"
+        );
+        // Contre-épreuve : en deçà du plafond, RIEN n'est perdu.
+        let mut courte = Vec::new();
+        for i in 0..3 {
+            pousser_chemin_ecarte(&mut courte, format!("/musique/{i}.mpc"));
+        }
+        assert_eq!(courte.len(), 3);
+        assert_eq!(courte[0], "/musique/0.mpc");
+    }
+
     #[test]
     fn dff_dst_est_inventorie_sans_io_puis_refuse_dans_la_phase_bornee() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1393,10 +2793,16 @@ mod tests {
         let mut batch_files = Vec::new();
         let batch_stats = scan_files_batched(&listed.files, false, 1, |batch, _, _| {
             batch_files.extend(batch);
+            EcrituresDuLot::SANS_PERTE
         });
         assert_eq!(batch_files.len(), 1);
         assert!(batch_files[0].unsupported.is_some());
         assert_eq!(batch_stats.metadata_failed, 0);
+        // Un import qui ne perd rien laisse les deux compteurs d'écriture à
+        // zéro : le résumé ne doit pas devenir alarmiste (#2939).
+        assert_eq!(batch_stats.db_insert_failed, 0);
+        assert_eq!(batch_stats.db_update_failed, 0);
+        assert!(!batch_stats.a_perdu_des_pistes());
         assert_eq!(batch_stats.unsupported_by_ext.get("dff-dst"), Some(&1));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1714,5 +3120,410 @@ mod tests {
     fn normalize_path_windows_unc() {
         assert_eq!(normalize_path("\\\\NAS\\Musique"), "\\\\NAS\\Musique");
         assert_eq!(normalize_path("//NAS/Musique"), "\\\\NAS\\Musique");
+    }
+
+    // ————————————————————————————————————————————————————————————————
+    // #2889 — deux racines imbriquées énuméraient deux fois le même fichier
+    // ————————————————————————————————————————————————————————————————
+
+    /// Une racine de bibliothèque de test, **hors du dossier temporaire du
+    /// système**, et supprimée par `Drop` (#3030).
+    ///
+    /// Le « hors de `temp_dir()` » n'est pas un détail de confort : le parcours
+    /// écarte tout fichier situé sous le dossier temporaire du système
+    /// (`scanner::is_tune_temp_file`, dernière ligne — `path.starts_with(temp_dir())`),
+    /// pour qu'une bibliothèque enracinée au-dessus de `%TEMP%` n'indexe pas
+    /// les transcodages de Tune. Une fixture posée dans `temp_dir()` rendrait
+    /// donc un parcours VIDE — mesuré : les six cas de #2889 rendaient `[]`
+    /// avec `tempfile::tempdir()`, un rouge qui ne prouvait rien du défaut
+    /// visé. `target/` est le seul emplacement à la fois inscriptible,
+    /// hors `temp_dir()`, et déjà ignoré par git.
+    fn racine_de_test(etiquette: &str) -> crate::test_scratch::ScratchDir {
+        let sous_target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&sous_target).expect("création de target/");
+        crate::test_scratch::scratch_dir_in(sous_target, etiquette)
+    }
+
+    /// Pose un fichier d'extension audio reconnue. Le parcours ne lit AUCUN
+    /// octet — il classe par extension — donc un fichier vide suffit et le test
+    /// reste une opération de répertoire, sans fixture binaire.
+    fn poser_piste(dossier: &std::path::Path, nom: &str) -> PathBuf {
+        std::fs::create_dir_all(dossier).expect("création du dossier de test");
+        let chemin = dossier.join(nom);
+        std::fs::write(&chemin, b"").expect("écriture de la piste de test");
+        chemin
+    }
+
+    /// Le fait de base du ticket : avec une racine imbriquée dans une autre,
+    /// chaque fichier n'est énuméré qu'une fois.
+    ///
+    /// Chez JeromeQ, `/mnt/eversolo_nvme` et `/mnt/eversolo_nvme/77A6-799D`
+    /// étaient tous deux déclarés. La boucle `for dir in dirs` parcourait la
+    /// seconde racine une fois pour elle-même et une fois à travers la
+    /// première : chaque fichier du sous-arbre entrait deux fois dans `files`,
+    /// donc deux fois dans la phase de métadonnées, la plus coûteuse du scan.
+    #[test]
+    fn une_racine_imbriquee_n_enumere_pas_deux_fois_le_meme_fichier() {
+        // `TempDir` nettoie par `Drop` — jamais de chemin temporaire composé à
+        // la main (#3030).
+        let base = racine_de_test("p2a2889-imbriquee");
+        let parent = base.join("bibliotheque");
+        let enfant = parent.join("montage");
+        poser_piste(&parent, "au-dessus.flac");
+        poser_piste(&enfant, "en-dessous.flac");
+
+        let result = list_audio_files(&[
+            parent.to_string_lossy().to_string(),
+            enfant.to_string_lossy().to_string(),
+        ]);
+
+        let en_dessous = result
+            .files
+            .iter()
+            .filter(|f| f.ends_with("en-dessous.flac"))
+            .count();
+        assert_eq!(
+            en_dessous, 1,
+            "le fichier de la racine imbriquée est énuméré {en_dessous} fois : {:?}",
+            result.files
+        );
+        assert_eq!(
+            result.files.len(),
+            2,
+            "l'union des deux racines vaut deux fichiers : {:?}",
+            result.files
+        );
+        // La racine absorbée n'est pas « manquante » : ses fichiers sont bien
+        // là, par la racine parente. La confondre avec une racine illisible
+        // déclencherait la protection de purge sur un sous-arbre sain.
+        assert!(
+            result.missing_dirs.is_empty(),
+            "racine absorbée comptée comme manquante : {:?}",
+            result.missing_dirs
+        );
+    }
+
+    /// Le TÉMOIN, vert des deux côtés du correctif : deux racines réellement
+    /// distinctes restent deux, même quand leurs noms se ressemblent.
+    ///
+    /// C'est le contrôle de collision demandé par le dépôt : une clé de
+    /// déduplication trop large fusionnerait `Musique` et `Musique-2`, ou
+    /// `Jazz` et `Jazz Live`, et ferait disparaître une bibliothèque entière.
+    #[test]
+    fn deux_racines_reellement_distinctes_restent_deux() {
+        let base = racine_de_test("p2a2889-distinctes");
+        // Des noms qui se ressemblent par préfixe de CHAÎNE — c'est
+        // exactement le piège d'un `starts_with` posé sur du texte.
+        let noms = [
+            "Musique",
+            "Musique-2",
+            "Musique 2",
+            "Musiques",
+            "MusiqueBis",
+            "Jazz",
+            "Jazz Live",
+        ];
+        let mut racines = Vec::new();
+        for nom in noms {
+            let dossier = base.join(nom);
+            poser_piste(&dossier, "piste.flac");
+            racines.push(dossier.to_string_lossy().to_string());
+        }
+
+        let result = list_audio_files(&racines);
+
+        assert_eq!(
+            result.files.len(),
+            noms.len(),
+            "{} racines distinctes doivent rendre {} fichiers, obtenu {:?}",
+            noms.len(),
+            noms.len(),
+            result.files
+        );
+        for nom in noms {
+            let attendu = base.join(nom).join("piste.flac");
+            assert!(
+                result.files.iter().any(|f| f == &attendu),
+                "la racine {nom} a été avalée : {:?}",
+                result.files
+            );
+        }
+    }
+
+    /// Le cas symétrique : deux racines qui désignent le MÊME dossier par des
+    /// chemins différents. La chaîne brute ne les rapproche pas ; le chemin
+    /// canonique, si.
+    #[test]
+    fn deux_chemins_pour_le_meme_dossier_ne_font_qu_une_racine() {
+        let base = racine_de_test("p2a2889-meme-dossier");
+        let reel = base.join("bibliotheque");
+        poser_piste(&reel, "unique.flac");
+
+        // Trois écritures du même dossier : telle quelle, avec un aller-retour
+        // `..`, et avec une barre finale.
+        let detour = base.join("bibliotheque/../bibliotheque");
+        let racines = vec![
+            reel.to_string_lossy().to_string(),
+            detour.to_string_lossy().to_string(),
+            format!("{}/", reel.to_string_lossy()),
+        ];
+
+        let result = list_audio_files(&racines);
+        assert_eq!(
+            result.files.len(),
+            1,
+            "le même dossier écrit de trois façons rend {:?}",
+            result.files
+        );
+    }
+
+    /// Même cas symétrique, par lien symbolique — la forme qu'on rencontre
+    /// réellement sur un serveur : `/music` pointant vers `/mnt/nas/music`.
+    #[cfg(unix)]
+    #[test]
+    fn un_lien_symbolique_vers_une_racine_ne_la_double_pas() {
+        let base = racine_de_test("p2a2889-symlink");
+        let reel = base.join("bibliotheque");
+        poser_piste(&reel, "unique.flac");
+        let lien = base.join("raccourci");
+        std::os::unix::fs::symlink(&reel, &lien).expect("lien symbolique");
+
+        let result = list_audio_files(&[
+            reel.to_string_lossy().to_string(),
+            lien.to_string_lossy().to_string(),
+        ]);
+        assert_eq!(
+            result.files.len(),
+            1,
+            "la racine et son lien symbolique rendent {:?}",
+            result.files
+        );
+    }
+
+    /// Une racine injoignable reste retenue : elle DOIT atteindre la sonde
+    /// `read_dir` pour être rapportée dans `missing_dirs` avec son motif — ce
+    /// qui déclenche `VerdictPurge::ProtegeIllisible` et empêche la purge de
+    /// supprimer ses pistes (#2356). Le dédoublonnage ne doit rien y changer.
+    #[test]
+    fn une_racine_injoignable_traverse_le_dedoublonnage() {
+        let base = racine_de_test("p2a2889-injoignable");
+        let reel = base.join("bibliotheque");
+        poser_piste(&reel, "unique.flac");
+        let absente = base.join("montage-tombe");
+
+        let result = list_audio_files(&[
+            reel.to_string_lossy().to_string(),
+            absente.to_string_lossy().to_string(),
+        ]);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(
+            result.missing_dirs.len(),
+            1,
+            "la racine injoignable doit être rapportée : {:?}",
+            result.missing_dirs
+        );
+        assert_eq!(result.missing_dir_reasons.len(), 1);
+    }
+
+    /// Une racine parente ILLISIBLE ne doit pas avaler son enfant lisible :
+    /// sans quoi le sous-arbre sain ne serait parcouru par personne.
+    #[cfg(unix)]
+    #[test]
+    fn une_racine_parente_illisible_n_avale_pas_son_enfant_lisible() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = racine_de_test("p2a2889-parent-illisible");
+        let parent = base.join("parent");
+        let enfant = parent.join("enfant");
+        poser_piste(&enfant, "piste.flac");
+        // 0o300 : traversable (`x`) mais non listable (`r`) — `read_dir` échoue,
+        // le chemin de l'enfant reste atteignable.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300))
+            .expect("droits du parent");
+
+        let result = list_audio_files(&[
+            parent.to_string_lossy().to_string(),
+            enfant.to_string_lossy().to_string(),
+        ]);
+        // Remettre les droits AVANT les assertions, sinon le `Drop` du
+        // `TempDir` échoue à nettoyer et le test fuit un dossier (#3030).
+        let _ = std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700));
+
+        assert_eq!(
+            result.files.len(),
+            1,
+            "l'enfant lisible doit rester parcouru : {:?}",
+            result.files
+        );
+        assert_eq!(
+            result.missing_dirs.len(),
+            1,
+            "le parent illisible doit être rapporté : {:?}",
+            result.missing_dirs
+        );
+    }
+
+    /// Le décompte que la revue réclame, mesuré et non estimé : combien de
+    /// racines la nouvelle clé ABSORBE, et combien elle en fait COLLISIONNER.
+    ///
+    /// Une déduplication ne se juge pas aux doublons qu'elle évite : elle se
+    /// juge aussi aux racines légitimes qu'elle confond. Les deux chiffres
+    /// sortent ici du même jeu de racines.
+    #[test]
+    fn le_dedoublonnage_compte_ses_absorptions_et_ses_collisions() {
+        let base = racine_de_test("p2a2889-comptes");
+        let bibliotheque = base.join("Musique");
+        let imbriquee = bibliotheque.join("Jazz");
+        std::fs::create_dir_all(&imbriquee).expect("arborescence");
+        let distinctes = [
+            base.join("Musique-2"),
+            base.join("Musiques"),
+            base.join("Jazz"),
+        ];
+        for d in &distinctes {
+            std::fs::create_dir_all(d).expect("arborescence");
+        }
+
+        let racines: Vec<String> = std::iter::once(bibliotheque.clone())
+            .chain(std::iter::once(imbriquee.clone()))
+            // le même dossier, écrit deux fois
+            .chain(std::iter::once(bibliotheque.clone()))
+            .chain(distinctes.iter().cloned())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        let verdict = dedoublonner_racines(&racines);
+
+        // CHIFFRE 1 — doublons évités : la racine imbriquée, plus la
+        // répétition littérale de la racine parente.
+        assert_eq!(
+            verdict.absorbees.len(),
+            2,
+            "absorptions inattendues : {:?}",
+            verdict.absorbees
+        );
+        assert!(
+            verdict
+                .absorbees
+                .iter()
+                .any(|a| a.motif == MotifAbsorption::Imbriquee),
+            "l'imbrication n'a pas été reconnue : {:?}",
+            verdict.absorbees
+        );
+        assert!(
+            verdict
+                .absorbees
+                .iter()
+                .any(|a| a.motif == MotifAbsorption::Identique),
+            "la répétition littérale n'a pas été reconnue : {:?}",
+            verdict.absorbees
+        );
+
+        // CHIFFRE 2 — collisions : aucune racine réellement distincte ne doit
+        // disparaître. C'est le chiffre que la règle du dépôt réclame à côté
+        // du premier, et il doit valoir zéro.
+        let retenues: Vec<&str> = verdict.retenues.iter().map(String::as_str).collect();
+        let mut collisions = 0usize;
+        for d in &distinctes {
+            let attendu = d.to_string_lossy().to_string();
+            if !retenues.contains(&attendu.as_str()) {
+                collisions += 1;
+            }
+        }
+        assert_eq!(
+            collisions, 0,
+            "{collisions} racine(s) distincte(s) avalée(s) : attendu {distinctes:?}, retenues {retenues:?}"
+        );
+        assert_eq!(
+            verdict.retenues.len(),
+            1 + distinctes.len(),
+            "retenues : {retenues:?}"
+        );
+    }
+
+    /// #3232 — un DOSSIER ne peut plus être coupé entre deux lots.
+    ///
+    /// L'ordre d'entrée est celui de `WalkDir`, qui descend en profondeur : les
+    /// fichiers de `/album` sont séparés par ceux de `/album/CD2`. Ils n'ont
+    /// donc jamais été contigus, contrairement à ce qu'affirmait le
+    /// commentaire de `begin_batch`.
+    #[test]
+    fn un_dossier_n_est_jamais_coupe_entre_deux_lots() {
+        let entree: Vec<PathBuf> = [
+            "/m/album/01.flac",
+            "/m/album/02.flac",
+            "/m/album/CD2/01.flac", // WalkDir s'engouffre dans le sous-dossier…
+            "/m/album/CD2/02.flac",
+            "/m/album/03.flac", // …et revient ensuite au dossier parent.
+            "/m/autre/01.flac",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+
+        for taille in 1..=8usize {
+            let lots = lots_alignes_sur_les_dossiers(&entree, taille);
+            // Rien n'est perdu, rien n'est dupliqué.
+            let mut vus: Vec<&Path> = lots.iter().flatten().copied().collect();
+            vus.sort_unstable();
+            let mut attendus: Vec<&Path> = entree.iter().map(|p| p.as_path()).collect();
+            attendus.sort_unstable();
+            assert_eq!(
+                vus, attendus,
+                "taille {taille} : la liste doit être intacte"
+            );
+            // Le plafond mémoire du scan est inchangé.
+            for lot in &lots {
+                assert!(
+                    lot.len() <= taille,
+                    "taille {taille} : un lot de {} dépasse le plafond",
+                    lot.len()
+                );
+            }
+            if taille < 3 {
+                // Un lot plus petit que le dossier ne peut pas le contenir :
+                // c'est le seul cas dégradé, et il est journalisé.
+                continue;
+            }
+            // Chaque dossier tient dans UN lot et un seul.
+            let mut lot_du_dossier: HashMap<&Path, usize> = HashMap::new();
+            for (i, lot) in lots.iter().enumerate() {
+                for f in lot {
+                    let dossier = f.parent().unwrap();
+                    let precedent = lot_du_dossier.entry(dossier).or_insert(i);
+                    assert_eq!(
+                        *precedent,
+                        i,
+                        "taille {taille} : {} est réparti sur deux lots",
+                        dossier.display()
+                    );
+                }
+            }
+            assert_eq!(lot_du_dossier.len(), 3, "trois dossiers distincts");
+        }
+    }
+
+    /// Le seul cas dégradé, nommé : un dossier plus gros qu'un lot entier ne
+    /// tient pas dans un lot. Il est coupé — lever le plafond ferait rentrer
+    /// des milliers de pochettes embarquées en mémoire d'un coup — mais aucun
+    /// lot ne dépasse la taille demandée, et les autres dossiers restent
+    /// entiers.
+    #[test]
+    fn un_dossier_plus_gros_qu_un_lot_est_coupe_sans_lever_le_plafond() {
+        let mut entree: Vec<PathBuf> = (0..7)
+            .map(|n| PathBuf::from(format!("/m/gros/{n:02}.flac")))
+            .collect();
+        entree.push(PathBuf::from("/m/petit/01.flac"));
+
+        let lots = lots_alignes_sur_les_dossiers(&entree, 3);
+        assert!(lots.iter().all(|l| l.len() <= 3));
+        assert_eq!(lots.iter().map(|l| l.len()).sum::<usize>(), 8);
+        // Le petit dossier, lui, n'est pas dispersé.
+        let lots_du_petit: Vec<usize> = lots
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.iter().any(|f| f.starts_with("/m/petit")))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(lots_du_petit.len(), 1);
     }
 }

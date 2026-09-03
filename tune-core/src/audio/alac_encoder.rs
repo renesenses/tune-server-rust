@@ -140,6 +140,33 @@ mod tests {
         out
     }
 
+    /// A scratch directory of its own for EVERY call — never one shared by
+    /// shape. The harness runs these round-trips in parallel threads of the
+    /// same process, so a name built from `(bit_depth, channels,
+    /// sample_rate)` alone collides: two cases share `(16, 2, 44100)` — the
+    /// 1.7 s one and the exact-packet-boundary one — and each overwrote and
+    /// then deleted the other's file mid-decode. Measured on Shrek before
+    /// this fix: 1 failure in 100 runs, the 8192-frame case decoding 150000
+    /// samples, i.e. exactly the other test's 75000 frames.
+    ///
+    /// The shape stays in the name for readability; the counter inside
+    /// `test_scratch` is what makes it unique, and the pid it adds keeps
+    /// concurrent test binaries apart.
+    ///
+    /// Le compteur vivait ici en propre ; il est passé dans
+    /// `crate::test_scratch` (#2864) pour que les autres tests du dépôt
+    /// s'appuient sur le même mécanisme au lieu de le réinventer — ou de
+    /// l'oublier.
+    fn scratch_dir(
+        bit_depth: u16,
+        channels: u16,
+        sample_rate: u32,
+    ) -> crate::test_scratch::ScratchDir {
+        crate::test_scratch::scratch_dir(&format!(
+            "tune-alac-test-{bit_depth}-{channels}-{sample_rate}"
+        ))
+    }
+
     fn round_trip(bit_depth: u16, channels: u16, sample_rate: u32, frames: usize) {
         let amplitude = match bit_depth {
             16 => 16_000,
@@ -149,15 +176,13 @@ mod tests {
         let samples = test_signal(frames, channels as usize, amplitude);
         let m4a = encode_alac_m4a(&samples, bit_depth, channels, sample_rate).expect("encode");
 
-        let dir = std::env::temp_dir().join(format!("tune-alac-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("rt-{bit_depth}-{channels}-{sample_rate}.m4a"));
+        let dir = scratch_dir(bit_depth, channels, sample_rate);
+        let path = dir.join("round-trip.m4a");
         std::fs::write(&path, &m4a).unwrap();
 
         let decoded =
             crate::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, f64::MAX)
                 .expect("decode back");
-        let _ = std::fs::remove_file(&path);
 
         assert_eq!(decoded.sample_rate, sample_rate);
         assert_eq!(decoded.channels as u16, channels);
@@ -192,6 +217,26 @@ mod tests {
         // Exactly 2 packets of 4096 frames — the "last partial" entry in
         // stts must still describe a real packet, not a phantom.
         round_trip(16, 2, 44100, 8192);
+    }
+
+    /// Contre-épreuve PERMANENTE du faux rouge intermittent : deux
+    /// round-trips de MÊME forme ne doivent jamais partager de fichier.
+    /// Rejouer cette assertion avec l'ancienne implémentation (un dossier
+    /// par `(profondeur, canaux, fréquence)`) la fait échouer sur-le-champ.
+    #[test]
+    fn two_round_trips_of_the_same_shape_never_share_a_file() {
+        let a = scratch_dir(16, 2, 44100);
+        let b = scratch_dir(16, 2, 44100);
+        assert_ne!(
+            a.path(),
+            b.path(),
+            "deux appels de même forme partagent un dossier"
+        );
+        assert_ne!(
+            a.join("round-trip.m4a"),
+            b.join("round-trip.m4a"),
+            "deux appels de même forme partagent un fichier"
+        );
     }
 
     #[test]

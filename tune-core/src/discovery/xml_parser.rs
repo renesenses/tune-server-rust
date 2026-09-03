@@ -438,15 +438,31 @@ pub async fn fetch_device_description(location: &str) -> Result<DeviceDescriptio
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
 
-    let xml = client
-        .get(location)
-        .send()
-        .await
-        .map_err(|e| {
-            let rendered = crate::http::error::chain(&e);
-            crate::http::error::hint_if_local_network_denied(&rendered);
-            format!("HTTP fetch {location}: {rendered}")
-        })?
+    let reponse = client.get(location).send().await.map_err(|e| {
+        let rendered = crate::http::error::chain(&e);
+        crate::http::error::hint_if_local_network_denied(&rendered);
+        format!("HTTP fetch {location}: {rendered}")
+    })?;
+
+    // Ce que `curl -i` montre et que la trace taisait encore : le code de
+    // statut et le type de contenu annoncé.
+    //
+    // Sans eux, une page d'erreur 404 et l'`index.html` d'un client web servi
+    // en 200 laissent EXACTEMENT la même ligne de journal — « page HTML, n
+    // octets ». Or les deux ne s'expliquent pas pareil : la première dit que
+    // la route n'existe pas à cette adresse, la seconde qu'un repli
+    // d'itinéraire a répondu à sa place. Le journal de Jean Valjean (#2417,
+    // fil forum 1585, v0.9.116) bute précisément là : la MÊME adresse
+    // (`http://192.168.1.10:8888/upnp/description.xml`) rend un descriptif
+    // valide deux fois, puis du HTML une fois, dans la même session — et rien
+    // dans le journal ne dit laquelle des deux situations se produit. Le
+    // ticket réclame de « rejouer `curl -i` en boucle serrée » pour trancher ;
+    // ces deux champs rendent la manipulation inutile la prochaine fois, sans
+    // rien demander à un testeur.
+    let statut = reponse.status().as_u16();
+    let type_mime = entete_type_de_contenu(&reponse);
+
+    let xml = reponse
         .text()
         .await
         .map_err(|e| format!("HTTP body {location}: {}", crate::http::error::chain(&e)))?;
@@ -459,21 +475,56 @@ pub async fn fetch_device_description(location: &str) -> Result<DeviceDescriptio
         // (`ssdp::probe_renderer`, `background::spawn_ssdp_startup_scan`,
         // `routes::devices::scan_devices`) : la trace est émise ICI, une fois,
         // pour tous (#2665).
-        report_unreadable_description(location, &xml, &e);
+        report_unreadable_description(location, statut, &type_mime, &xml, &e);
         // L'extrait du corps reste dans le journal LOCAL et n'entre pas dans
         // la chaîne d'erreur : celle-ci remonte jusqu'aux réponses HTTP de
-        // l'API (`routes/devices.rs`, ajout manuel d'un DLNA). Le genre et la
-        // taille suffisent à qualifier l'échec côté client.
+        // l'API (`routes/devices.rs`, ajout manuel d'un DLNA). Le genre, le
+        // statut et la taille suffisent à qualifier l'échec côté client.
+        //
+        // Le statut entre ici parce que cette chaîne-là est ce que
+        // `ssdp_device_create_failed` recopie dans `error=` (#2417) : c'est la
+        // ligne que le testeur nous envoie en premier, et elle doit se suffire.
+        // Le type de contenu, lui, reste au journal local — un champ de plus
+        // dans une réponse d'API n'apporterait rien à qui clique un bouton.
         format!(
-            "XML parse {location}: {e} — {}, {} octets reçus",
+            "XML parse {location}: HTTP {statut} — {e} — {}, {} octets reçus",
             describe_unreadable_body(&xml).kind.label(),
             xml.len()
         )
     })
 }
 
-/// Journalise un descriptif illisible : l'adresse interrogée, ce que le corps
-/// était réellement, sa taille, et un début borné.
+/// Ce qu'on recopie d'un en-tête `Content-Type` dans le journal.
+///
+/// C'est une valeur écrite par la machine d'en face. `HeaderValue::to_str`
+/// garantit déjà de l'ASCII visible — reste la longueur, qu'un en-tête
+/// fantaisiste pourrait pousser loin ; 80 octets couvrent largement
+/// `text/html; charset=utf-8`.
+const MIME_LABEL_LIMIT: usize = 80;
+
+/// Le `Content-Type` annoncé, borné, ou `(absent)`.
+///
+/// L'absence est elle-même une information : plus d'un équipement domestique
+/// sert sa console d'administration sans annoncer de type du tout.
+fn entete_type_de_contenu(reponse: &reqwest::Response) -> String {
+    let brut = reponse
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if brut.is_empty() {
+        return "(absent)".to_string();
+    }
+    brut[..char_boundary_at_or_before(brut, MIME_LABEL_LIMIT)].to_string()
+}
+
+/// Journalise un descriptif illisible : l'adresse interrogée, le statut HTTP
+/// et le type de contenu qu'on a reçus, ce que le corps était réellement, sa
+/// taille, et un début borné.
+///
+/// Statut et type de contenu séparent le 404 d'un chemin qui n'existe pas du
+/// 200 d'un repli d'itinéraire qui sert autre chose — deux causes distinctes
+/// que la trace confondait (#2417).
 ///
 /// Niveau `warn` — et non `debug` comme l'ancien `xml_parse_error` — parce que
 /// `log_level` vaut `info` par défaut (`tune-core/src/config.rs:219`) : au
@@ -482,7 +533,13 @@ pub async fn fetch_device_description(location: &str) -> Result<DeviceDescriptio
 /// des lecteurs sans une ligne. Le niveau ne coûte pas de bruit : un échec
 /// d'ANALYSE suppose que quelque chose a bel et bien répondu avec autre chose
 /// qu'un descriptif — les pannes réseau, elles, ne passent pas par ici.
-fn report_unreadable_description(location: &str, body: &str, parse_error: &str) {
+fn report_unreadable_description(
+    location: &str,
+    statut: u16,
+    type_mime: &str,
+    body: &str,
+    parse_error: &str,
+) {
     let admis = match FAILURE_LOG.lock() {
         Ok(mut log) => log.admit(location, Instant::now()),
         // Verrou empoisonné : on préfère une ligne de trop au silence.
@@ -494,6 +551,8 @@ fn report_unreadable_description(location: &str, body: &str, parse_error: &str) 
     let diag = describe_unreadable_body(body);
     warn!(
         location = %location,
+        statut = statut,
+        type_mime = %type_mime,
         corps = %diag.kind.label(),
         octets = diag.total_bytes,
         extrait_octets = diag.excerpt_bytes,
@@ -1114,6 +1173,13 @@ mod descriptif_illisible {
         assert!(
             err.contains(&format!("{} octets", PAGE_HTML.len())),
             "l'erreur ne dit pas la taille reçue : {err}"
+        );
+        // C'est cette chaîne-là que `ssdp_device_create_failed` recopie dans
+        // `error=` : le statut doit y être, sinon une page d'erreur et un
+        // repli d'itinéraire se ressemblent (#2417).
+        assert!(
+            err.contains("HTTP 200"),
+            "l'erreur ne dit pas avec quel statut le corps a été rendu : {err}"
         );
         assert!(
             !err.contains(NOM_DE_RESEAU),

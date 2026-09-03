@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use tune_core::outputs::oh_events::OpenHomeEventListener;
+use tune_core::outputs::oh_events::UpnpEventListener;
 
 use crate::config::TuneConfig;
 use crate::state::AppState;
@@ -310,9 +310,14 @@ fn reset_zones_offline(state: &AppState) {
 /// Réglages d'avancement d'enrichissement dont l'état « en cours » est écrit en
 /// base. Chacun ne connaît que deux écritures : `running` au lancement et à
 /// chaque jalon, `done` à la fin NORMALE de la boucle.
-const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 3] = [
+const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 4] = [
     "enrich_all_status",
     "artist_artwork_enrich_result",
+    // Passe « crédits MusicBrainz » (#2799). Elle dure des heures sur une
+    // grosse bibliothèque à 1 req/s : un arrêt en cours de route est le cas
+    // NORMAL, pas l'exception. Sans cette ligne, `running` resterait en base
+    // pour toujours — le défaut #2002, à l'identique.
+    crate::routes::library::credits_mb::REGLAGE_AVANCEMENT_CREDITS,
     // Passe de fond « paroles » (#2172) : sans cette ligne, un arrêt en cours
     // de passe laisserait `status: "running"` en base pour toujours et le
     // bouton de relance grisé — exactement le défaut #2002. La constante
@@ -341,7 +346,12 @@ const DRAPEAUX_AVANCEMENT_ENRICHISSEMENT: [&str; 2] =
 /// ⚠️ Les compteurs sont CONSERVÉS. « Interrompu à 5 650 / 16 261 » se
 /// comprend ; un réglage effacé ne dirait plus rien du tout, et l'utilisateur
 /// ne saurait pas où sa passe s'est arrêtée.
-fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
+/// `pub(crate)` parce que le démarrage n'est plus le seul déclencheur : la fin
+/// d'une passe d'images d'artistes qui s'est arrêtée sans écrire son `done`
+/// applique la MÊME réécriture, tout de suite, sans attendre un redémarrage
+/// (`routes::library::artwork::FinDePasseArtistes`, #2073). Deux règles
+/// séparées auraient divergé au premier champ neutralisé.
+pub(crate) fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
     let mut valeur = match serde_json::from_str::<serde_json::Value>(brut) {
         Ok(v) => v,
         Err(_) => {
@@ -511,6 +521,45 @@ fn reconcile_favorites(state: &AppState) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "favorites_reconcile_failed"),
     }
+    // Les albums masqués (#1391) suivent la MÊME mécanique d'instantané et
+    // les mêmes règles de re-rattachement : au démarrage on ne supprime
+    // jamais un marqueur introuvable — un volume pas encore monté peut encore
+    // ramener l'album, et un album masqué qui réapparaîtrait visible est
+    // précisément le bug que la table évite.
+    match tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+        .reconcile(false)
+    {
+        Ok(stats) if stats.changed() > 0 || stats.unresolved > 0 => {
+            info!(
+                scanned = stats.scanned,
+                relinked = stats.relinked,
+                deduplicated = stats.deduplicated,
+                unresolved = stats.unresolved,
+                "hidden_albums_reconciled_at_startup"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "hidden_albums_reconcile_failed"),
+    }
+    // Les paires « ces deux albums ne sont pas des doublons » (#1276) suivent
+    // la MÊME mécanique et la même règle : au démarrage on ne supprime jamais
+    // une paire introuvable. Perdre l'arbitrage rouvrirait la fusion
+    // destructrice de `merge-duplicates`, qui SUPPRIME la ligne perdante.
+    match tune_core::db::album_distinct_repo::AlbumDistinctRepo::with_backend(state.backend.clone())
+        .reconcile(false)
+    {
+        Ok(stats) if stats.changed() > 0 || stats.unresolved > 0 => {
+            info!(
+                scanned = stats.scanned,
+                relinked = stats.relinked,
+                deduplicated = stats.deduplicated,
+                unresolved = stats.unresolved,
+                "album_distinct_pairs_reconciled_at_startup"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "album_distinct_pairs_reconcile_failed"),
+    }
 }
 
 fn cleanup_orphan_queues(state: &AppState) {
@@ -626,14 +675,22 @@ async fn restore_queue_metadata(state: &AppState, config: &TuneConfig) {
     for snap in &snapshots {
         let zone_id = snap.zone_id;
 
-        // Determine queue length from DB (authoritative after restore_all_queues).
-        let local_count = queue_repo.count(zone_id).unwrap_or(0);
-        let streaming_count = queue_repo.count_streaming(zone_id).unwrap_or(0);
-        let queue_len = if local_count > 0 {
-            local_count
-        } else {
-            streaming_count
-        };
+        // Longueur de la file lue en base (autoritaire apres restore_all_queues).
+        //
+        // 🔴 #2055 — `if local > 0 { local } else { streaming }` etait le
+        // dernier reste de l'ancienne regle « un seul type de file active par
+        // zone ». Depuis la migration 53 la file est UNE suite de positions
+        // 0..N-1 ou lignes locales et lignes de service se melangent :
+        // l'autoplay du sondeur ajoute des pistes de service derriere l'album
+        // en cours. Sur une telle file, cette formule ne comptait que l'album,
+        // et les pistes ajoutees redevenaient injoignables au premier
+        // redemarrage — le sondeur concluait « file terminee » a la fin de
+        // l'album.
+        //
+        // `count_all`, la meme source que `Orchestrator::play_from_queue` :
+        // c'est lui qui RESOUT la position que `next_position` calcule a
+        // partir de cette longueur. Les deux doivent compter les memes lignes.
+        let queue_len = queue_repo.count_all(zone_id).unwrap_or(0);
 
         if queue_len > 0 {
             state
@@ -737,7 +794,7 @@ async fn restore_zone_volumes(state: &AppState) {
     if let Ok(zones) = zone_repo.list() {
         for zone in &zones {
             if let Some(id) = zone.id {
-                let vol = (zone.volume as f64) / 100.0;
+                let vol = zone.volume / 100.0;
                 if zone.fixed_volume {
                     // Contrat « Volume fixe (bit-perfect) » : 100 % est un
                     // ENGAGEMENT, pas un oubli — le DoP meurt au moindre gain
@@ -826,7 +883,7 @@ async fn restore_oaat_groups(state: &AppState) {
         .ok()
         .flatten()
         .unwrap_or_else(|| "[]".into());
-    let mut groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
+    let groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
 
     let mut restored = 0usize;
     let mut to_probe: Vec<(String, String, Vec<(String, u16)>)> = Vec::new();
@@ -945,18 +1002,36 @@ async fn restore_oaat_groups(state: &AppState) {
 #[cfg(not(feature = "oaat"))]
 async fn restore_oaat_groups(_state: &AppState) {}
 
-/// Create the OpenHome event listener (shared between SSDP handler and outputs).
-pub async fn create_oh_listener() -> Option<Arc<OpenHomeEventListener>> {
-    let server_ip = tune_core::discovery::ssdp::get_local_ip()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "127.0.0.1".into());
-    match OpenHomeEventListener::new(server_ip).await {
-        Ok(l) => Some(Arc::new(l)),
-        Err(e) => {
-            tracing::warn!(error = %e, "oh_event_listener_init_failed");
-            None
-        }
-    }
+/// LE récepteur GENA du processus. Créé une seule fois, quel que soit l'appelant.
+///
+/// La mémoïsation n'est pas un raffinement : elle lève l'obstacle qui privait
+/// d'évènements tout renderer récupéré au redémarrage (#1126). Ce chemin-là
+/// n'atteignait pas le récepteur du gestionnaire SSDP depuis `AppState`, et en
+/// créer un second aurait couru contre lui pour le port fixe 8890 —
+/// [`UpnpEventListener::new`] retombant alors sur un port éphémère, au
+/// détriment du premier. Une cellule unique rend le même récepteur aux deux, et
+/// la course disparaît au lieu d'être contournée (#2263).
+static RECEPTEUR_EVENEMENTS: tokio::sync::OnceCell<Option<Arc<UpnpEventListener>>> =
+    tokio::sync::OnceCell::const_new();
+
+/// Create the UPnP (GENA) event listener, shared between the SSDP handler,
+/// the restart-recovery path and the outputs. Idempotent.
+pub async fn create_oh_listener() -> Option<Arc<UpnpEventListener>> {
+    RECEPTEUR_EVENEMENTS
+        .get_or_init(|| async {
+            let server_ip = tune_core::discovery::ssdp::get_local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            match UpnpEventListener::new(server_ip).await {
+                Ok(l) => Some(Arc::new(l)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "oh_event_listener_init_failed");
+                    None
+                }
+            }
+        })
+        .await
+        .clone()
 }
 
 /// Persist music_dirs and discogs_token from config/env into the settings DB.
@@ -1076,15 +1151,56 @@ async fn resolve_ytdlp(state: &AppState) {
 /// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
 /// fonctionnalités.
 #[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
-fn seed_volume_for(zone_volume: i32, fixed_volume: bool) -> f64 {
+fn seed_volume_for(zone_volume: f64, fixed_volume: bool) -> f64 {
     if fixed_volume {
         1.0
     } else {
-        (zone_volume as f64 / 100.0).clamp(0.0, 1.0)
+        (zone_volume / 100.0).clamp(0.0, 1.0)
     }
 }
 
-/// Register local audio output devices (USB DAC, headphones, speakers) and auto-create zones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalZoneAction {
+    Create,
+    Reconnect,
+    Skip,
+}
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) fn first_system_default_name<'a>(
+    devices: impl IntoIterator<Item = (&'a str, bool)>,
+) -> Option<&'a str> {
+    devices
+        .into_iter()
+        .find_map(|(name, is_default)| is_default.then_some(name))
+}
+
+/// Décide quoi faire d'une sortie locale sans toucher à la base.
+///
+/// `is_system_default` ne doit être vrai que pour l'unique sortie sélectionnée
+/// par l'appelant parmi celles que le backend marque `is_default`. Cette
+/// sélection préalable empêche un backend défectueux qui en marquerait deux de
+/// recréer le défaut « une zone par périphérique ».
+pub(crate) fn local_zone_action(
+    zone_exists: bool,
+    auto_create: bool,
+    is_system_default: bool,
+) -> LocalZoneAction {
+    if zone_exists {
+        return LocalZoneAction::Reconnect;
+    }
+    if auto_create && is_system_default {
+        LocalZoneAction::Create
+    } else {
+        LocalZoneAction::Skip
+    }
+}
+
+/// Register local audio output devices (USB DAC, headphones, speakers).
+///
+/// Sur une base neuve, seule la sortie système reçoit automatiquement une
+/// zone. Les autres sorties restent enregistrées dans `OutputRegistry`, donc
+/// proposées par l'interface pour une création manuelle.
 #[cfg(feature = "local-audio")]
 pub async fn register_local_outputs(state: &AppState) {
     // Prefer DB-persisted backend (set via UI) over config/env default
@@ -1152,15 +1268,36 @@ pub async fn register_local_outputs(state: &AppState) {
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        let auto_create =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("zone_auto_create")
+                .ok()
+                .flatten()
+                .map(|v| v != "false")
+                .unwrap_or(true);
+        // Un backend est censé marquer une seule sortie par défaut. `find`
+        // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
+        let system_default_device_id = first_system_default_name(
+            devices
+                .iter()
+                .map(|dev| (dev.name.as_str(), dev.is_default)),
+        )
+        .map(|name| format!("local:{name}"));
 
         for dev in &devices {
             let device_id = format!("local:{}", dev.name);
+            // `dev.backend` est l'hôte qui a énuméré ce nom. Il compte ici plus
+            // qu'ailleurs : quand ASIO n'expose rien, la boucle ci-dessus a
+            // ré-énuméré en WASAPI, si bien que ces noms-là sont des noms
+            // WASAPI alors que la lecture demandera toujours l'hôte « asio »
+            // (#3230).
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
                 exclusive_mode,
                 audio_backend,
-            );
+            )
+            .with_origin_host(&dev.backend);
             // Ensemencer la sortie avec le volume stocké.
             //
             // `LocalOutput` naît à `user_volume = 1.0` et rien ne le rectifiait :
@@ -1202,34 +1339,20 @@ pub async fn register_local_outputs(state: &AppState) {
                 dev.name.clone()
             };
 
-            // « Creer les zones automatiquement » vaut ICI aussi.
-            //
-            // Les trois autres chemins de decouverte — SSDP, mDNS et le chemin
-            // fournisseur — consultent tous `zone_auto_create` avant de creer.
-            // Celui-ci, le seul qui s'execute au DEMARRAGE du serveur, ne le
-            // consultait pas : une sortie audio locale se voyait donc attribuer
-            // une zone a chaque lancement, donc a chaque mise a jour, meme
-            // reglage decoche. Une zone deja existante n'est pas concernee
-            // (`get_or_create` la renvoie telle quelle) : on ne bloque que la
-            // creation, jamais la reconnexion.
-            let auto_create =
-                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                    .get("zone_auto_create")
-                    .ok()
-                    .flatten()
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
-            if !auto_create
-                && zone_repo
-                    .get_by_device_id(&device_id)
-                    .ok()
-                    .flatten()
-                    .is_none()
-            {
+            let zone_exists = zone_repo
+                .get_by_device_id(&device_id)
+                .ok()
+                .flatten()
+                .is_some();
+            let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
+            let action = local_zone_action(zone_exists, auto_create, is_system_default);
+            if action == LocalZoneAction::Skip {
                 info!(
                     name = %zone_name,
                     device_id = %device_id,
-                    "local_audio_zone_auto_create_disabled_skipping"
+                    default = is_system_default,
+                    auto_create,
+                    "local_audio_zone_manual_creation_required"
                 );
                 continue;
             }
@@ -1304,10 +1427,13 @@ pub async fn register_local_outputs(state: &AppState) {
 /// musique.
 ///
 /// ⚠️ On lit la table que les ROUTES ecrivent (`mount_type/server/share/…/
-/// active`), pas celle de `mount_manager.rs` (`host/share_name/…/auto_mount`),
-/// qui porte le meme nom, des colonnes differentes, et n'est construite nulle
-/// part hors tests. Batir le remontage sur `auto_mount` interrogerait une table
-/// que le serveur ne remplit jamais.
+/// active`). Une SECONDE definition de `network_mounts` a longtemps coexiste,
+/// dans `tune-core/src/mount_manager.rs` (`host/share_name/…/auto_mount`) :
+/// meme nom, colonnes differentes, jamais construite hors tests. Elle a ete
+/// supprimee par #1914 ; le test `network_mounts_n_a_qu_une_definition_par_moteur`
+/// (tune-core, `db/migrations.rs`) empeche desormais qu'une concurrente
+/// reapparaisse. Batir le remontage sur `auto_mount` interrogerait donc une
+/// colonne qui n'existe plus.
 ///
 /// Chaque montage est independant : un partage injoignable est journalise et
 /// n'empeche ni les autres ni le demarrage. Un NAS eteint ne doit pas empecher
@@ -1515,7 +1641,7 @@ mod restore_zone_volumes_tests {
     use super::*;
     use tune_core::db::zone_repo::ZoneRepo;
 
-    fn state_with_zone(volume: i32, fixed: bool) -> (AppState, i64) {
+    fn state_with_zone(volume: f64, fixed: bool) -> (AppState, i64) {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let repo = ZoneRepo::with_backend(state.backend.clone());
         let id = repo
@@ -1534,7 +1660,7 @@ mod restore_zone_volumes_tests {
     /// d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
     async fn fixed_volume_zone_restarts_at_full_scale() {
-        let (state, id) = state_with_zone(100, true);
+        let (state, id) = state_with_zone(100.0, true);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
@@ -1552,7 +1678,7 @@ mod restore_zone_volumes_tests {
     /// le code d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
     async fn non_fixed_zone_at_full_scale_is_restored_verbatim() {
-        let (state, id) = state_with_zone(100, false);
+        let (state, id) = state_with_zone(100.0, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
@@ -1565,11 +1691,11 @@ mod restore_zone_volumes_tests {
     /// le désaccord que #1548 a soigné côté affichage sans le supprimer.
     #[tokio::test]
     async fn memory_agrees_with_db_for_every_stored_level() {
-        for stocke in [0, 20, 55, 99, 100] {
+        for stocke in [0.0, 20.0, 55.0, 99.0, 100.0] {
             let (state, id) = state_with_zone(stocke, false);
             restore_zone_volumes(&state).await;
             let vol = state.playback.get_state(id).await.volume;
-            let attendu = stocke as f64 / 100.0;
+            let attendu = stocke / 100.0;
             assert!(
                 (vol - attendu).abs() < 1e-9,
                 "base {stocke} % / mémoire {vol} — les deux doivent dire la même chose"
@@ -1584,34 +1710,154 @@ mod restore_zone_volumes_tests {
     /// le seul endroit où le volume stocké atteint vraiment le son.
     #[test]
     fn local_output_is_seeded_with_the_stored_level() {
-        assert!((seed_volume_for(30, false) - 0.30).abs() < 1e-9);
-        assert!((seed_volume_for(0, false) - 0.0).abs() < 1e-9);
-        assert!((seed_volume_for(100, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(30.0, false) - 0.30).abs() < 1e-9);
+        assert!((seed_volume_for(0.0, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, false) - 1.0).abs() < 1e-9);
     }
 
     /// Une zone bit-perfect ne s'ensemence jamais autrement qu'à pleine échelle,
     /// quelle que soit la valeur qui traîne en base (forum 1320, Cyrille).
     #[test]
     fn fixed_volume_output_is_seeded_at_full_scale() {
-        assert!((seed_volume_for(20, true) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(100, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(20.0, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, true) - 1.0).abs() < 1e-9);
     }
 
     /// Une valeur aberrante en base ne doit pas amplifier — le gain est un
     /// multiplicateur appliqué à chaque échantillon.
     #[test]
     fn out_of_range_stored_level_never_amplifies() {
-        assert!((seed_volume_for(150, false) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(-5, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(150.0, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(-5.0, false) - 0.0).abs() < 1e-9);
+    }
+
+    /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.
+    ///
+    /// `restore_zone_volumes` est le pont entre la colonne et le son après un
+    /// redémarrage. Avec `zones.volume` en `INTEGER`, tout réglage sous
+    /// **0,005 linéaire — soit −46,0205999133 dB exactement** — était persisté
+    /// à 0 : la zone revenait à zéro, indiscernable d'un mute volontaire.
+    ///
+    /// Ce test balaie les deux côtés du seuil mesuré et exige que le niveau
+    /// restauré soit celui qui a été stocké, à l'ulp près.
+    #[tokio::test]
+    async fn un_volume_sous_le_seuil_mesure_ne_revient_pas_muet() {
+        const SEUIL_DB: f64 = -46.020_599_913_279_62;
+        assert!(
+            (20.0 * 0.005f64.log10() - SEUIL_DB).abs() < 1e-12,
+            "le seuil est 20·log10(0,005)"
+        );
+
+        for cible_db in [-40.0, -46.0, SEUIL_DB, SEUIL_DB - 0.001, -48.0, -60.0] {
+            let lineaire: f64 = 10f64.powf(cible_db / 20.0);
+            let (state, id) = state_with_zone(lineaire * 100.0, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            assert!(
+                vol > 0.0,
+                "{cible_db} dB : la zone se rallume MUETTE (volume restauré {vol})"
+            );
+            assert!(
+                (vol - lineaire).abs() < 1e-12,
+                "{cible_db} dB : restauré à {vol} au lieu de {lineaire}"
+            );
+            // Et le chemin qui atteint vraiment le son dit la même chose.
+            assert!((seed_volume_for(lineaire * 100.0, false) - lineaire).abs() < 1e-12);
+        }
+    }
+
+    /// Témoin anti-régression #2886 : les volumes USUELS ne bougent pas d'un
+    /// iota. Multiples exacts de 1 %, donc déjà parfaits avant le correctif.
+    #[tokio::test]
+    async fn les_volumes_usuels_reviennent_identiques() {
+        for pour_cent in [
+            0.0, 1.0, 5.0, 10.0, 20.0, 30.0, 50.0, 70.0, 90.0, 99.0, 100.0,
+        ] {
+            let (state, id) = state_with_zone(pour_cent, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            let attendu = pour_cent / 100.0;
+            assert!(
+                (vol - attendu).abs() < 1e-12,
+                "{pour_cent} % restauré à {vol} au lieu de {attendu}"
+            );
+        }
     }
 
     /// Un volume ordinaire est restauré tel quel, fixed ou pas.
     #[tokio::test]
     async fn ordinary_volume_is_restored_verbatim() {
-        let (state, id) = state_with_zone(55, false);
+        let (state, id) = state_with_zone(55.0, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!((vol - 0.55).abs() < 1e-9, "volume restauré: {vol}");
+    }
+}
+
+#[cfg(test)]
+mod local_zone_creation_policy_tests {
+    use super::*;
+
+    /// #1770 — témoin exact d'une base neuve avec plusieurs sorties : une
+    /// sortie ordinaire ne devient pas une zone, même si l'auto-création est
+    /// laissée à sa valeur par défaut (`true`).
+    #[test]
+    fn fresh_install_creates_only_the_system_default_zone() {
+        assert_eq!(local_zone_action(false, true, false), LocalZoneAction::Skip);
+        assert_eq!(
+            local_zone_action(false, true, true),
+            LocalZoneAction::Create
+        );
+    }
+
+    /// Un backend fautif peut marquer plusieurs sorties `is_default`. Tune en
+    /// choisit une seule au lieu de recréer le défaut en bloc.
+    #[test]
+    fn even_two_backend_defaults_select_only_one_system_device() {
+        let devices = [("Speakers", false), ("DAC A", true), ("DAC B", true)];
+        assert_eq!(
+            first_system_default_name(devices),
+            Some("DAC A"),
+            "la première sortie système est l'unique candidate"
+        );
+    }
+
+    /// Le réglage d'opt-out conserve son sens : même la sortie système ne doit
+    /// pas être imposée quand l'utilisateur a coupé l'auto-création.
+    #[test]
+    fn disabled_auto_creation_creates_no_default_zone() {
+        assert_eq!(local_zone_action(false, false, true), LocalZoneAction::Skip);
+    }
+
+    /// Le scénario ASIO → WASAPI de DEvir passe ici : un rescan peut découvrir
+    /// dix sorties mais seule la sortie système devient une zone. Un DAC qui
+    /// devient la sortie système reste donc immédiatement utilisable.
+    #[test]
+    fn hotplug_creates_the_system_zone_but_not_the_other_outputs() {
+        assert_eq!(local_zone_action(false, true, false), LocalZoneAction::Skip);
+        assert_eq!(
+            local_zone_action(false, true, true),
+            LocalZoneAction::Create
+        );
+    }
+
+    /// Contre-épreuve installation existante : le nouveau contrat ne supprime
+    /// ni ne masque les zones déjà enregistrées. Démarrage ou hotplug, elles
+    /// reprennent le chemin `get_or_create` et sont remises en ligne.
+    #[test]
+    fn existing_non_default_zone_is_reconnected_in_both_phases() {
+        assert_eq!(
+            local_zone_action(true, false, false),
+            LocalZoneAction::Reconnect
+        );
+    }
+
+    /// Aucun repli silencieux vers « le premier périphérique » si le backend
+    /// ne sait pas identifier sa sortie système.
+    #[test]
+    fn no_backend_default_means_no_automatic_candidate() {
+        let devices = [("DAC A", false), ("DAC B", false)];
+        assert_eq!(first_system_default_name(devices), None);
     }
 }
 

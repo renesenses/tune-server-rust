@@ -164,6 +164,13 @@ struct LoudnessAccumulator {
     block_powers: Vec<f64>,
     /// Running linear sample peak on the *un-weighted* samples.
     peak: f64,
+    /// Running linear TRUE peak (inter-sample, 4×) on the un-weighted
+    /// samples — Catmull-Rom interpolation, see [`Self::true_peak_feed`].
+    true_peak: f64,
+    /// Per-channel history of the last 3 raw samples, so the interpolation
+    /// stays continuous across `feed` calls (same guarantee as the
+    /// K-weighting filter state).
+    tp_hist: Vec<[f64; 3]>,
     total_frames: usize,
 }
 
@@ -182,8 +189,36 @@ impl LoudnessAccumulator {
                 .collect(),
             block_powers: Vec::new(),
             peak: 0.0,
+            true_peak: 0.0,
+            tp_hist: vec![[0.0; 3]; channels],
             total_frames: 0,
         }
+    }
+
+    /// True peak inter-échantillons (#1694) : suréchantillonnage 4× par
+    /// interpolation Catmull-Rom, évaluée entre les deux derniers
+    /// échantillons du canal. Assez proche de l'interpolateur BS.1770-4 pour
+    /// l'usage (plafond `prevent_clipping`), et peu coûteux dans
+    /// l'accumulateur déjà streaming — pas de FIR polyphase ni de tampon.
+    ///
+    /// L'histoire par canal traverse les appels `feed`, donc le résultat est
+    /// invariant au découpage, comme le reste de l'accumulateur. Les 3
+    /// zéros initiaux équivalent à un amorçage sur du silence : aucun over ne
+    /// peut s'y inventer.
+    fn true_peak_feed(&mut self, c: usize, raw: f64) {
+        let [p0, p1, p2] = self.tp_hist[c];
+        let p3 = raw;
+        // Catmull-Rom entre p1 et p2, évalué en t = 1/4, 1/2, 3/4.
+        let a = -p0 + 3.0 * p1 - 3.0 * p2 + p3;
+        let b = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
+        let cc = p2 - p0;
+        let d = 2.0 * p1;
+        for t in [0.25f64, 0.5, 0.75] {
+            let v = 0.5 * (((a * t + b) * t + cc) * t + d);
+            self.true_peak = self.true_peak.max(v.abs());
+        }
+        self.true_peak = self.true_peak.max(raw.abs());
+        self.tp_hist[c] = [p1, p2, p3];
     }
 
     /// Feed interleaved normalized samples. Emits every complete 400 ms block
@@ -198,6 +233,7 @@ impl LoudnessAccumulator {
             for c in 0..self.channels {
                 let raw = interleaved[f * self.channels + c];
                 self.peak = self.peak.max(raw.abs());
+                self.true_peak_feed(c, raw);
                 let (s1, s2) = &mut self.filters[c];
                 self.bufs[c].push_back(s2.process(s1.process(raw)));
             }
@@ -224,10 +260,16 @@ impl LoudnessAccumulator {
         }
     }
 
-    /// Integrated loudness (LUFS, rounded to 0.1) + peak (clamped to 1.0). `None`
-    /// for silence / below-threshold / empty input.
-    fn finish(self) -> Option<(f64, f64)> {
+    /// Integrated loudness (LUFS, rounded to 0.1) + sample peak (clamped to
+    /// 1.0) + TRUE peak (4×, volontairement NON borné à 1.0 : les overs
+    /// inter-échantillons au-dessus de 0 dBFS sont précisément l'information
+    /// que `prevent_clipping` doit voir, #1694). `None` for silence /
+    /// below-threshold / empty input.
+    fn finish(self) -> Option<(f64, f64, f64)> {
         let peak = self.peak.min(1.0);
+        // Le vrai pic englobe le sample peak par construction (chaque
+        // échantillon brut y participe) ; on le republie tel quel.
+        let true_peak = self.true_peak;
 
         // Too short for even one 400 ms block: simple loudness over all samples
         // (nothing was drained, so the buffers still hold the whole signal).
@@ -246,7 +288,7 @@ impl LoudnessAccumulator {
                 return None;
             }
             let lufs = -0.691 + 10.0 * power_sum.log10();
-            return Some(((lufs * 10.0).round() / 10.0, peak));
+            return Some(((lufs * 10.0).round() / 10.0, peak, true_peak));
         }
 
         // Absolute gating: keep blocks above -70 LUFS.
@@ -277,7 +319,7 @@ impl LoudnessAccumulator {
             return None;
         }
         let lufs = -0.691 + 10.0 * mean_rel.log10();
-        Some(((lufs * 10.0).round() / 10.0, peak))
+        Some(((lufs * 10.0).round() / 10.0, peak, true_peak))
     }
 }
 
@@ -290,9 +332,13 @@ fn pcm_scale(bit_depth: u16) -> f64 {
     }
 }
 
-/// Integrated loudness (LUFS) from already-normalized interleaved samples — the
-/// pure math, shared by tests and (via [`LoudnessAccumulator`]) the streaming
-/// file path.
+/// Integrated loudness (LUFS) from already-normalized interleaved samples.
+///
+/// Enveloppe d'un seul appel autour de [`LoudnessAccumulator`], utilisée par le
+/// seul test d'équivalence « une passe = par morceaux » : le chemin fichier
+/// pilote l'accumulateur lui-même, par segments bornés (#1109). Portée `test`
+/// pour le dire — hors test, plus personne n'appelle par ici.
+#[cfg(test)]
 fn integrated_loudness_from_samples(
     samples: &[f64],
     sample_rate: usize,
@@ -300,7 +346,7 @@ fn integrated_loudness_from_samples(
 ) -> Option<f64> {
     let mut acc = LoudnessAccumulator::new(sample_rate, channels);
     acc.feed(samples);
-    acc.finish().map(|(lufs, _)| lufs)
+    acc.finish().map(|(lufs, _, _)| lufs)
 }
 
 /// Measure EBU R128 integrated loudness (in LUFS) using native decoding.
@@ -313,14 +359,15 @@ fn integrated_loudness_from_samples(
 pub async fn measure_loudness(file_path: &str) -> Option<f64> {
     measure_loudness_and_peak(file_path)
         .await
-        .map(|(lufs, _)| lufs)
+        .map(|(lufs, _, _)| lufs)
 }
 
-/// Measure both the EBU R128 integrated loudness (LUFS) and the linear sample
-/// peak (0.0–1.0) in a SINGLE decode pass — used by the ReplayGain analysis to
-/// derive `rg_track_gain` (reference − LUFS) and `rg_track_peak` without decoding
-/// the file twice.
-pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64)> {
+/// Measure the EBU R128 integrated loudness (LUFS), the linear sample peak
+/// (0.0–1.0) and the linear TRUE peak (4× inter-sample, may exceed 1.0) in a
+/// SINGLE decode pass — used by the ReplayGain analysis to derive
+/// `rg_track_gain` (reference − LUFS), `rg_track_peak` and
+/// `rg_track_true_peak` (#1694) without decoding the file twice.
+pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64, f64)> {
     // Analyse in bounded time segments and stream them through the accumulator,
     // so memory never scales with track length. Decoding a whole long 24/192
     // track into RAM cost several GB and OOM-killed the server in a crash-loop
@@ -879,10 +926,83 @@ mod tests {
         for chunk in f64s.chunks(777 * 2) {
             acc.feed(chunk);
         }
-        let (chunked, _) = acc.finish().unwrap();
+        let (chunked, _, _) = acc.finish().unwrap();
         assert!(
             (chunked - reference).abs() < 1e-9,
             "chunked {chunked} != reference {reference}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1694 — true peak inter-échantillons (4×, Catmull-Rom)
+    // -----------------------------------------------------------------------
+
+    /// Le cas d'école de l'over inter-échantillons : une sinusoïde à fs/4
+    /// déphasée de π/4 n'est échantillonnée QUE sur ±0,707 alors que le
+    /// signal continu culmine à 1,0. Le sample peak la sous-estime de 3 dB ;
+    /// le true peak 4× doit voir l'essentiel de la crête manquée
+    /// (Catmull-Rom en retrouve ~0,88 — pas un sinc, et c'est assumé :
+    /// l'usage est le plafond `prevent_clipping`, pas la métrologie).
+    #[test]
+    fn true_peak_sees_the_inter_sample_over_that_sample_peak_misses() {
+        let sr = 48_000usize;
+        let n = sr; // 1 s
+        let mut samples = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let v = (std::f64::consts::PI / 4.0
+                + 2.0 * std::f64::consts::PI * (sr as f64 / 4.0) * i as f64 / sr as f64)
+                .sin();
+            samples.push(v); // L
+            samples.push(v); // R
+        }
+        let mut acc = LoudnessAccumulator::new(sr, 2);
+        acc.feed(&samples);
+        let (_, peak, true_peak) = acc.finish().unwrap();
+
+        // 1/√2 : c'est EXACTEMENT ce que le test veut dire — une sinusoïde à
+        // fs/4 déphasée de π/4 n'est échantillonnée que sur ±1/√2, soit
+        // −3 dB sous le vrai maximum du signal continu.
+        assert!(
+            (peak - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-3,
+            "sample peak {peak}"
+        );
+        assert!(
+            true_peak > 0.85,
+            "le true peak doit dépasser nettement le sample peak : {true_peak}"
+        );
+        assert!(
+            true_peak >= peak,
+            "le true peak englobe le sample peak par construction"
+        );
+    }
+
+    /// L'histoire d'interpolation traverse les appels `feed` : nourrir le
+    /// même signal en morceaux impairs doit rendre EXACTEMENT le même true
+    /// peak qu'en un seul passage — même garantie que la sonie (#1109).
+    #[test]
+    fn true_peak_is_chunk_invariant() {
+        let sr = 48_000usize;
+        let n = sr / 2;
+        let mut samples = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            let v = 0.9 * (2.0 * std::f64::consts::PI * 11_987.0 * t).sin();
+            samples.push(v);
+            samples.push(v * 0.5);
+        }
+        let mut one = LoudnessAccumulator::new(sr, 2);
+        one.feed(&samples);
+        let (_, _, tp_one) = one.finish().unwrap();
+
+        let mut chunked = LoudnessAccumulator::new(sr, 2);
+        for chunk in samples.chunks(101 * 2) {
+            chunked.feed(chunk);
+        }
+        let (_, _, tp_chunked) = chunked.finish().unwrap();
+
+        assert!(
+            (tp_one - tp_chunked).abs() < 1e-12,
+            "one-shot {tp_one} != chunked {tp_chunked}"
         );
     }
 

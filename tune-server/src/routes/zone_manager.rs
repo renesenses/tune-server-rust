@@ -140,7 +140,9 @@ async fn overview(State(state): State<AppState>) -> Json<Value> {
             "name": z.name,
             "output_type": z.output_type,
             "output_device_id": z.output_device_id,
-            "volume": z.volume as f64 / 100.0,
+            "volume": z.volume / 100.0,
+            // #1274 — lecture en dB du volume ci-dessus, `null` = silence.
+            "volume_db": tune_core::audio::volume_scale::linear_to_db(z.volume / 100.0),
             "muted": z.muted,
             "state": match ps.state {
                 tune_core::playback::PlayState::Playing => "playing",
@@ -192,7 +194,9 @@ async fn list_managed_zones(State(state): State<AppState>) -> Json<Value> {
             "name": z.name,
             "output_type": z.output_type,
             "output_device_id": z.output_device_id,
-            "volume": z.volume as f64 / 100.0,
+            "volume": z.volume / 100.0,
+            // #1274 — lecture en dB du volume ci-dessus, `null` = silence.
+            "volume_db": tune_core::audio::volume_scale::linear_to_db(z.volume / 100.0),
             "muted": z.muted,
             "state": match ps.state {
                 tune_core::playback::PlayState::Playing => "playing",
@@ -583,7 +587,9 @@ struct ZoneProfileEntry {
     zone_id: i64,
     output_device_id: Option<String>,
     output_type: Option<String>,
-    volume: Option<i32>,
+    // #2886 — a virgule : un profil de zone doit pouvoir porter un volume
+    // sous -46 dB sans le voir tomber a zero.
+    volume: Option<f64>,
     muted: Option<bool>,
 }
 
@@ -744,10 +750,10 @@ async fn activate_zone_profile(
             .ok()
             .flatten()
             .and_then(|zone| zone.output_device_id);
-        if let Some(vol) = zc.get("volume").and_then(|v| v.as_i64()) {
+        if let Some(vol) = zc.get("volume").and_then(|v| v.as_f64()) {
             if let Err(error) = state
                 .orchestrator
-                .set_volume(zone_id, vol as f64 / 100.0, device_id.as_deref())
+                .set_volume(zone_id, vol / 100.0, device_id.as_deref())
                 .await
             {
                 return crate::routes::playback::output_command_error_response(error);

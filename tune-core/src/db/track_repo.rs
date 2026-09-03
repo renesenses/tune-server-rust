@@ -4,7 +4,9 @@ use std::sync::Arc;
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 pub use super::facet_filter::TrackFilter;
-use super::facet_filter::{Placeholders, any_of, favorite_condition, untagged_condition};
+use super::facet_filter::{
+    Placeholders, any_of, favorite_condition, hidden_tracks_excluded, untagged_condition,
+};
 use super::models::Track;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
@@ -15,37 +17,101 @@ use crate::TuneError;
 /// nothing (same trap handled in `browse.rs`). The server's `MAIN_SEPARATOR` is
 /// the separator stored in `tracks.file_path` (paths are absolute local paths on
 /// the scanning host), so both the flat filter and the folder facet agree.
+///
+/// Le préfixe est replié en **NFC**, parce que c'est la forme sous laquelle le
+/// scanner écrit `tracks.file_path` (`scanner::walker` et `routes/system/scan`
+/// appellent tous deux `.nfc()` avant d'insérer). Un préfixe qui vient du
+/// *disque* — et non de la base — peut arriver en **NFD** : un dossier accentué
+/// créé côté NAS, ou copié depuis macOS, n'existe qu'en forme décomposée, et
+/// c'est cette forme-là que `resolve_browse_path` rend puisque c'est la seule
+/// que le système de fichiers accepte d'ouvrir. Les deux chaînes s'affichent à
+/// l'identique et ne partagent pas un octet : sans ce repli, le `LIKE` ne
+/// ramène **aucune** ligne pour un dossier pourtant scanné, et l'écran annonce
+/// un répertoire vide.
+///
+/// Sur un préfixe déjà NFC — tout ce qui sort de la base — le repli est un
+/// no-op par construction.
 pub fn folder_like_pattern(prefix: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
     let sep = std::path::MAIN_SEPARATOR;
-    let base = prefix.trim_end_matches(['/', '\\']);
-    format!("{base}{sep}%")
+    let base: String = prefix.trim_end_matches(['/', '\\']).nfc().collect();
+    // Le chemin est du TEXTE, pas un motif : seul le `%` final est un joker.
+    // Le séparateur est échappé comme le reste, parce que sous Windows c'est
+    // l'antislash — c'est-à-dire le caractère d'échappement lui-même.
+    format!(
+        "{}{}%",
+        echapper_jokers_like(&base),
+        echapper_jokers_like(&sep.to_string())
+    )
+}
+
+/// Neutralise dans `texte` les trois caractères que `LIKE` interprète : `%`
+/// (n'importe quelle suite), `_` (n'importe quel caractère) et l'antislash,
+/// qui sert ici de caractère d'échappement et doit donc se doubler.
+///
+/// **C'est la moitié « valeur » d'un contrat en deux moitiés** : tout motif
+/// construit ici DOIT être suivi de [`like_escape_clause`], et réciproquement.
+/// Séparées, chacune casse l'autre — un motif échappé lu sans clause `ESCAPE`
+/// sur SQLite rendrait les antislashs littéraux et ne trouverait plus rien.
+///
+/// Pourquoi il le fallait : un nom de dossier peut légalement contenir `%` ou
+/// `_`, et ces deux-là sont exactement les jokers de `LIKE`. Sans échappement,
+/// « `100% Live` » produisait le motif `…/100% Live/%`, dont le premier `%`
+/// avale n'importe quelle suite : sélectionner ce répertoire rendait aussi le
+/// contenu de `…/1000 Autres/`. Un filtre qui ne filtre pas rend PLUS que
+/// demandé, et le testeur voit « toute la bibliothèque » là où il attendait un
+/// dossier (#3101). Le `_` a le même défaut, d'un caractère : `Disc_1` ramenait
+/// `DiscX1`. Sur des bibliothèques de dizaines de milliers de fichiers, ces
+/// deux caractères sont partout dans les noms de dossiers d'albums.
+///
+/// Les surcoûts sont bornés : au pire un antislash par caractère.
+pub fn echapper_jokers_like(texte: &str) -> String {
+    let mut sortie = String::with_capacity(texte.len());
+    for c in texte.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            sortie.push('\\');
+        }
+        sortie.push(c);
+    }
+    sortie
 }
 
 /// SQL suffix that must follow every `LIKE` whose pattern is a **file path**.
 ///
-/// Postgres treats a backslash inside a `LIKE` pattern as the default escape
-/// character; SQLite has no default escape character at all. Folder patterns
-/// are built from absolute paths, so on a Windows host the pattern reads
-/// `G:\Blues 2\%` — Postgres consumes the trailing `\%` as a *literal* percent
-/// sign, the pattern degrades to the literal string `G:Blues 2%`, and it
-/// matches no row. Every folder then reports "0 pistes" while the library is
-/// perfectly scanned (JF, Windows + Postgres: all four roots empty in
-/// Répertoires, and the data-derived fallback root fell to zero too because it
-/// reuses the same pattern).
+/// **Moitié « clause » du contrat ouvert par [`echapper_jokers_like`]** : la
+/// valeur liée a été échappée à l'antislash, et cette clause dit aux DEUX
+/// moteurs de le lire ainsi. Les deux moitiés voyagent ensemble ou pas du tout.
 ///
-/// `ESCAPE ''` selects *no* escape character, which is exactly SQLite's
-/// behaviour — so both engines now read the backslash literally. SQLite rejects
-/// an empty ESCAPE string, hence the bare `LIKE` there: its semantics are
-/// already the target ones, so this is a no-op on SQLite by construction.
+/// # Ce qu'elle règle, et qu'il ne faut pas ré-ouvrir
 ///
-/// Known and unchanged on both engines: `%` and `_` inside a real folder name
-/// still act as wildcards (over-match, never under-match). Escaping them would
-/// require an escape character, which is what we are deliberately giving up.
-pub fn like_escape_clause(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Postgres => " ESCAPE ''",
-        Engine::Sqlite => "",
-    }
+/// 1. **`%` et `_` dans un nom de dossier** (#3101). Ce sont les jokers de
+///    `LIKE`. Ils sont désormais neutralisés dans la valeur, ce que seule une
+///    clause `ESCAPE` explicite rend possible : sélectionner `100% Live` ne
+///    ramène plus le contenu de `1000 Autres`.
+/// 2. **L'antislash de Windows** (#1752). Postgres traite l'antislash comme son
+///    caractère d'échappement par défaut ; SQLite n'en a aucun. Un motif brut
+///    `G:\Blues 2\%` se dégradait donc, côté Postgres, en la chaîne littérale
+///    `G:Blues 2%` qui ne correspond à rien : tous les répertoires annoncés
+///    « 0 piste » alors que la bibliothèque était parfaitement scannée (JF,
+///    Windows + Postgres). La réponse d'alors était `ESCAPE ''` — *aucun*
+///    caractère d'échappement — ce qui rendait l'antislash littéral mais
+///    interdisait du même coup de neutraliser `%` et `_`. Ici l'antislash est
+///    DOUBLÉ dans la valeur, donc littéral lui aussi, et les jokers redeviennent
+///    échappables. Les deux moteurs lisent la même chose.
+///
+/// # Pourquoi la même chaîne pour les deux moteurs
+///
+/// `ESCAPE '\'` est déjà le comportement par défaut de Postgres et une clause
+/// que SQLite accepte : le suffixe est identique de part et d'autre, ce qui
+/// supprime la divergence de dialecte qui avait produit #1752. Le paramètre
+/// `engine` a donc disparu — un appelant ne peut plus se tromper de moteur.
+///
+/// ⚠️ Sur SQLite, une clause `ESCAPE` désactive l'optimisation d'index de
+/// `LIKE`. Elle était déjà inapplicable ici (elle exige un index en
+/// `COLLATE NOCASE`, or `idx_tracks_file_path` est en collation binaire) : le
+/// plan est un parcours complet avant comme après, mesuré, pas supposé.
+pub fn like_escape_clause() -> &'static str {
+    " ESCAPE '\\'"
 }
 
 /// The longest common directory prefix of all `tracks.file_path` — the real
@@ -112,28 +178,33 @@ mod common_root_tests {
 
 #[cfg(test)]
 mod like_escape_tests {
-    use super::{Engine, like_escape_clause};
+    use super::{echapper_jokers_like, like_escape_clause};
 
-    /// Regression guard for the Windows + Postgres "Dossier vide" bug: a folder
-    /// pattern built from `G:\Blues 2` ends in `\%`, which Postgres reads as an
-    /// escaped — hence literal — percent sign unless the escape mechanism is
-    /// switched off. Verified against PostgreSQL 15: without the clause the
-    /// count is 0, with it the count is right. Deleting this suffix silently
-    /// empties the Répertoires view and the Oxygen folder drill-down for every
-    /// Windows user on Postgres — and only for them, which is why it went
-    /// unnoticed.
+    /// Les deux moitiés du contrat sont indissociables : la clause dit
+    /// « l'antislash échappe », la valeur doit donc doubler les siens.
     #[test]
-    fn postgres_disables_the_backslash_escape() {
-        assert_eq!(like_escape_clause(Engine::Postgres), " ESCAPE ''");
+    fn la_clause_est_la_meme_pour_les_deux_moteurs() {
+        assert_eq!(like_escape_clause(), " ESCAPE '\\'");
     }
 
-    /// SQLite has no default escape character, so a bare LIKE already reads the
-    /// backslash literally — and it *rejects* an empty ESCAPE string
-    /// ("ESCAPE expression must be a single character"). The clause must stay
-    /// empty here: this is a correctness constraint, not a style choice.
+    /// #3101 — les deux jokers de `LIKE` sont neutralisés dans la valeur.
     #[test]
-    fn sqlite_keeps_the_bare_like() {
-        assert_eq!(like_escape_clause(Engine::Sqlite), "");
+    fn les_jokers_sont_neutralises() {
+        assert_eq!(echapper_jokers_like("100% Live"), "100\\% Live");
+        assert_eq!(echapper_jokers_like("Disc_1"), "Disc\\_1");
+        assert_eq!(echapper_jokers_like("sans joker"), "sans joker");
+    }
+
+    /// #1752 — l'antislash de Windows est DOUBLÉ, donc littéral sur les deux
+    /// moteurs. C'est ce que `ESCAPE ''` obtenait autrefois en renonçant à tout
+    /// échappement ; on l'obtient maintenant sans renoncer aux jokers.
+    #[test]
+    fn l_antislash_de_windows_reste_litteral() {
+        assert_eq!(
+            echapper_jokers_like("G:\\Blues 2"),
+            "G:\\\\Blues 2",
+            "un antislash de chemin doit sortir doublé, jamais nu"
+        );
     }
 }
 
@@ -146,7 +217,19 @@ mod like_escape_tests {
 pub mod sql {
     use super::SqlDialect;
 
-    pub fn select_track() -> &'static str {
+    /// Le corps `FROM` des requêtes de pistes, sans la projection.
+    ///
+    /// Isolé pour que les COMPTAGES portent les MÊMES jointures que la liste
+    /// qu'ils comptent — le prédicat de recherche lit `ar.name` et `al.year`,
+    /// il ne tient pas sur `tracks` seul — sans traîner les 31 colonnes.
+    /// Les trois jointures sont des `LEFT JOIN` sur une clé primaire : elles ne
+    /// peuvent pas multiplier une ligne, donc `COUNT(*)` sur ce `FROM` compte
+    /// bien des PISTES.
+    pub fn track_from() -> &'static str {
+        " FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN artists aal ON al.artist_id = aal.id"
+    }
+
+    pub fn select_track() -> String {
         // `album_artist` falls back to the album's canonical artist (`albums.
         // artist_id`, e.g. "Various Artists" for a compilation) when the per-file
         // ALBUMARTIST tag is missing. Without this, the Oxygen "by genre" view —
@@ -154,7 +237,10 @@ pub mod sql {
         // no album_artist to key on and shows track 1's artist for compilations
         // whose files carry no ALBUMARTIST tag (Bilou). The column keeps its
         // position, so row parsing is unchanged.
-        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN artists aal ON al.artist_id = aal.id"
+        format!(
+            "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments{}",
+            track_from()
+        )
     }
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
@@ -226,6 +312,42 @@ pub mod sql {
         "SELECT COUNT(*) FROM tracks"
     }
 
+    /// Le compte des pistes VENTILÉ par `source` — `local`, `qobuz`, `tidal`,
+    /// `radio`, `podcast`, `bandcamp` (#2147).
+    ///
+    /// [`count()`] ci-dessus répond « combien de pistes ? » sans dire de quoi
+    /// elles sont faites, et c'est là toute l'affaire de #2147 : le tableau de
+    /// bord comptait la table ENTIÈRE pendant que le rapport de scan ne
+    /// comptait que ce qui existe sur le disque. Deux populations, deux
+    /// nombres, aucun moyen de les rapprocher — jusqu'ici aucune requête du
+    /// dépôt n'exposait la ventilation qui les réconcilie.
+    ///
+    /// `COALESCE(NULLIF(source, ''), 'local')` normalise les lignes anciennes :
+    /// la colonne est `DEFAULT 'local'` et `Track::new` pose `"local"`, mais
+    /// une base migrée peut porter des `NULL` ou des chaînes vides. Les ranger
+    /// sous `local` — comme le fait déjà `metadata/auto_fix.rs` — garantit
+    /// l'invariant qui rend ce compte vérifiable : **la somme des seaux égale
+    /// toujours `count()`**. Sans normalisation, un `NULL` disparaîtrait du
+    /// `GROUP BY` et la ventilation mentirait par omission.
+    ///
+    /// L'expression est répétée dans le `GROUP BY` au lieu d'un alias, et
+    /// l'ordre est donné par `ORDER BY 1` : les deux formes sont acceptées par
+    /// SQLite comme par PostgreSQL, alors qu'un `GROUP BY` sur alias ne l'est
+    /// pas partout de la même façon.
+    pub fn count_by_source() -> &'static str {
+        "SELECT COALESCE(NULLIF(source, ''), 'local'), COUNT(*) FROM tracks \
+         GROUP BY COALESCE(NULLIF(source, ''), 'local') ORDER BY 1"
+    }
+
+    /// Compteur de la VUE pistes : exclut les pistes d'albums masqués, comme
+    /// la liste qu'il pagine (#1391). `count()` reste le compte COMPLET.
+    pub fn count_visible() -> String {
+        format!(
+            "SELECT COUNT(*) FROM tracks t WHERE {}",
+            crate::db::facet_filter::hidden_tracks_excluded()
+        )
+    }
+
     pub fn list_paginated<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} ORDER BY t.id LIMIT {} OFFSET {}",
@@ -243,11 +365,15 @@ pub mod sql {
         )
     }
 
+    /// Vue « pistes de l'artiste » : les pistes d'un album masqué en sortent
+    /// aussi (#1391) — contrairement à `list_by_album`, qui reste ENTIER pour
+    /// que l'album masqué demeure jouable depuis une file ou une playlist.
     pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.artist_id = {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
+            "{} WHERE t.artist_id = {} AND {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
             select_track(),
-            d.placeholder(1)
+            d.placeholder(1),
+            crate::db::facet_filter::hidden_tracks_excluded()
         )
     }
 
@@ -364,8 +490,31 @@ pub mod sql {
         "SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL"
     }
 
-    pub fn get_all_local_file_info() -> &'static str {
-        "SELECT id, file_path, file_mtime, file_size FROM tracks WHERE source = 'local' AND file_path IS NOT NULL"
+    /// Qui possède déjà ce `file_path` ? **Toutes sources confondues.**
+    ///
+    /// La portée de cette requête doit être celle de la contrainte qui va
+    /// trancher l'écriture, et cette contrainte est `file_path TEXT UNIQUE`
+    /// sur la table ENTIÈRE (`sqlite.rs`, `pg_migrate.rs`) — sans la moindre
+    /// condition sur `source`. Un `WHERE source = 'local'` ici rendait la
+    /// carte aveugle à des lignes que la base, elle, voyait parfaitement :
+    /// le scan les envoyait à l'INSERTION, et l'insertion se faisait refuser
+    /// (#2939).
+    ///
+    /// `source` fait partie du résultat parce que les consommateurs n'ont pas
+    /// tous la même question. « Qui possède ce chemin ? » se pose sur toute la
+    /// table ; « qu'ai-je le droit de retirer ? » ne se pose que sur les
+    /// lignes que le scan a lui-même posées. Le second filtre ici,
+    /// explicitement, au lieu de compter sur une requête qui ne dit pas
+    /// laquelle des deux questions elle répond.
+    pub fn get_all_file_info_by_path() -> &'static str {
+        "SELECT id, file_path, file_mtime, file_size, source FROM tracks WHERE file_path IS NOT NULL"
+    }
+
+    pub fn adopter_en_local<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET source = 'local' WHERE id = {} AND source <> 'local'",
+            d.placeholder(1)
+        )
     }
 
     pub fn get_existing_audio_hash_album_pairs() -> &'static str {
@@ -379,16 +528,62 @@ pub mod sql {
            AND album_id IS NOT NULL AND file_path IS NOT NULL"
     }
 
-    /// Engine-agnostic search.
-    pub fn search<D: SqlDialect>(d: &D) -> String {
+    /// Le PRÉDICAT de la recherche de pistes, sans projection ni bornes.
+    ///
+    /// Extrait pour que la LISTE rendue et le COMPTE annoncé portent
+    /// littéralement le même filtre : deux rédactions divergentes feraient
+    /// annoncer un total qui n'est le total de rien (#3189).
+    ///
+    /// Le OU des critères est PARENTHÉSÉ pour recevoir le filtre « pas dans
+    /// un album masqué » en ET — appliqué APRÈS la passe FTS, les index
+    /// `tracks_fts` contiennent tout (#1391).
+    ///
+    /// Emplacements 1..=5 : requête FTS, puis trois `LIKE`, puis l'année.
+    pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE {} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {} LIMIT {}",
-            select_track(),
+            "({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {}",
             d.fts_where("tracks", "t", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
+            crate::db::facet_filter::hidden_tracks_excluded(),
+        )
+    }
+
+    /// Engine-agnostic search, PAGINÉE.
+    ///
+    /// `ORDER BY t.id` est un ordre TOTAL — `tracks.id` est la clé primaire.
+    /// Sans lui, aucun des deux moteurs ne promet un ordre stable d'un appel
+    /// à l'autre : une même ligne pourrait revenir page 2 après être passée
+    /// page 1, et une autre ne jamais paraître. La requête n'en portait AUCUN
+    /// avant #3189 — ce qui était sans conséquence tant qu'il n'existait
+    /// qu'une seule page.
+    ///
+    /// Emplacements 6 et 7 : `LIMIT` et `OFFSET`.
+    pub fn search<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE {} ORDER BY t.id LIMIT {} OFFSET {}",
+            select_track(),
+            search_where(d),
+            d.placeholder(6),
+            d.placeholder(7),
+        )
+    }
+
+    /// Le NOMBRE de pistes que [`search`] parcourrait, borné.
+    ///
+    /// La borne est dans la sous-requête, pas autour du `COUNT` : un
+    /// `COUNT(*) … LIMIT n` compterait TOUT puis bornerait la ligne unique du
+    /// résultat, ce qui ne borne rien. Ici le moteur cesse de lire dès la
+    /// n-ième ligne trouvée, et le total rendu vaut alors « au moins n ».
+    ///
+    /// Emplacement 6 : le plafond.
+    pub fn search_count<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM (SELECT t.id{} WHERE {} LIMIT {}) AS borne",
+            track_from(),
+            search_where(d),
             d.placeholder(6),
         )
     }
@@ -452,6 +647,69 @@ pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
         }
     }
     out
+}
+
+/// Nombre d'ids inlinés par requête `WHERE t.id IN (…)`.
+///
+/// Les ids sont des `i64` issus de nos propres requêtes : les inliner ne
+/// consomme **aucun** paramètre lié, donc aucune requête ne peut atteindre la
+/// limite de paramètres d'un moteur — SQLite `SQLITE_MAX_VARIABLE_NUMBER`
+/// (999 avant 3.32, 32766 depuis) ni PostgreSQL (65535 paramètres par message
+/// Bind, le champ de comptage étant un entier 16 bits non signé).
+///
+/// Reste la limite de *longueur* d'instruction de SQLite (`SQLITE_MAX_SQL_LENGTH`,
+/// 1 Mo par défaut) : d'où le découpage. 5000 ids × 20 caractères ≈ 100 Ko au
+/// pire, soit un ordre de grandeur de marge. Même valeur que la matérialisation
+/// de page d'`AlbumRepo::list_filtered` (#1269), pour ne pas multiplier les
+/// constantes de découpage dans le dépôt.
+pub(crate) const ID_INLINE_BATCH: usize = 5_000;
+
+/// Combien d'échecs d'insertion/mise à jour un lot détaille avant de basculer
+/// sur un récapitulatif (#2890).
+///
+/// Un lot de scan fait `SCAN_BATCH_SIZE` = 500 pistes, et quand il échoue, il
+/// échoue pour UNE cause — une FK périmée, une base verrouillée, un disque
+/// plein — répétée 500 fois à l'identique. Or l'export de diagnostic borne
+/// chaque module à un quart de la fenêtre (`QUOTA_PAR_MODULE`, #1974) : ces
+/// 500 lignes prennent 250 lignes sur 1000, arrachées aux modules qu'on
+/// cherchait justement à lire.
+///
+/// Dix suffisent à établir la cause et à donner des chemins de fichiers à
+/// rejouer ; le récapitulatif qui suit donne le TOTAL, si bien qu'aucune perte
+/// de piste n'est masquée — c'était tout l'intérêt de ces avertissements
+/// (~205 pistes en base pour ~779 sur le disque, JP Borderies). Même patron
+/// que `scan_walk_errors_truncated` dans `scanner::walker`.
+const ECHECS_DETAILLES: usize = 10;
+
+/// Ce que la base sait déjà du fichier qui vit à un `file_path` donné.
+///
+/// Rendue par [`TrackRepo::get_all_file_info_by_path`], une entrée par chemin —
+/// la contrainte `file_path TEXT UNIQUE` garantit qu'il ne peut y en avoir
+/// qu'une.
+///
+/// `source` est porté jusqu'ici **exprès**. La carte couvre toute la table,
+/// parce que c'est la portée de la contrainte qui va accepter ou refuser
+/// l'écriture ; mais tout consommateur n'a pas le droit d'en faire le même
+/// usage. La purge de fin de scan, en particulier, ne doit retirer que des
+/// lignes `source = 'local'`, et elle le décide en lisant ce champ plutôt qu'en
+/// espérant qu'une requête ait filtré pour elle (#2939).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InfoFichier {
+    /// `tracks.id` de la ligne qui possède ce chemin.
+    pub id: i64,
+    /// `file_mtime` enregistré au dernier scan, s'il l'a été.
+    pub mtime: Option<f64>,
+    /// `file_size` enregistré au dernier scan, s'il l'a été.
+    pub taille: Option<i64>,
+    /// `tracks.source` de la ligne : `local`, ou l'importateur qui l'a posée.
+    pub source: String,
+}
+
+impl InfoFichier {
+    /// La ligne appartient-elle au scan ? Seules celles-là sont purgeables.
+    pub fn est_locale(&self) -> bool {
+        self.source == "local"
+    }
 }
 
 pub struct TrackRepo {
@@ -670,6 +928,23 @@ impl TrackRepo {
         }
     }
 
+    /// Le compte des pistes ventilé par source, trié par nom de source (#2147).
+    /// Voir [`sql::count_by_source`] pour la normalisation et l'invariant.
+    pub fn count_by_source(&self) -> Result<Vec<(String, i64)>, TuneError> {
+        let rows = self.db.query_many(sql::count_by_source(), &[])?;
+        Ok(rows
+            .iter()
+            .map(|cols| {
+                (
+                    cols.first()
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_else(|| "local".to_string()),
+                    cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                )
+            })
+            .collect())
+    }
+
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
         let sql = format!(
             "{} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
@@ -686,6 +961,38 @@ impl TrackRepo {
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// Chemin NON facetté de `GET /library/tracks` : mêmes lignes et même
+    /// ordre que [`Self::list`], moins les pistes d'albums masqués — le
+    /// miroir du prédicat que `list_filtered` pose toujours, sans quoi la vue
+    /// par défaut fuirait ce que la vue facettée cache (#1391). `list` reste
+    /// ENTIER pour la maintenance (export, résolutions internes).
+    pub fn list_visible(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
+        let sql = format!(
+            "{} WHERE {} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
+            sql::select_track(),
+            hidden_tracks_excluded(),
+            match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(1),
+                Engine::Postgres => PostgresDialect.placeholder(1),
+            },
+            match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(2),
+                Engine::Postgres => PostgresDialect.placeholder(2),
+            }
+        );
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// Compteur de la vue pistes : exclut comme [`Self::list_visible`].
+    pub fn count_visible(&self) -> Result<i64, TuneError> {
+        match self.db.query_one(&sql::count_visible(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
     }
 
     /// Filtered track listing with optional WHERE clauses.
@@ -721,10 +1028,13 @@ impl TrackRepo {
             let in_part = ph
                 .in_list_ci("t.genre", n)
                 .expect("liste non vide déjà vérifiée");
-            let like_part = (0..n)
-                .map(|_| format!("t.genres LIKE {}", ph.take()))
-                .collect::<Vec<_>>()
-                .join(" OR ");
+            // ⚠️ Insensible à la casse des DEUX côtés, comme le `in_list_ci`
+            // ci-dessus : un `LIKE` nu l'est en SQLite, mais PAS en
+            // PostgreSQL. Jumeau strict du rail (`facets::build_conditions`),
+            // qui a reçu la même correction (#1821).
+            let like_part = ph
+                .or_like_ci("t.genres", n)
+                .expect("liste non vide déjà vérifiée");
             conditions.push(format!("({in_part} OR {like_part})"));
             for g in &f.genres {
                 owned_params.push(SqlValue::Text(g.clone()));
@@ -823,7 +1133,7 @@ impl TrackRepo {
             conditions.push(format!(
                 "t.file_path LIKE {}{}",
                 ph.take(),
-                like_escape_clause(engine)
+                like_escape_clause()
             ));
             owned_params.push(SqlValue::Text(folder_like_pattern(fld)));
         }
@@ -877,6 +1187,21 @@ impl TrackRepo {
                 "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND {c})"
             ));
             for v in &f.original_years {
+                owned_params.push(SqlValue::Int(*v));
+            }
+        }
+
+        // Dynamic Range (#2144) : le tag décrit l'ALBUM mais vit dans le
+        // magasin ouvert `track_metadata`, donc ni colonne ni jointure directe.
+        // La règle de lecture est celle de la grille d'albums, mot pour mot —
+        // voir `facet_filter::dr_album_in`. Le JUMEAU de ce prédicat est dans
+        // `facets::build_facet_conditions`.
+        if let Some(c) = ph.in_list(
+            crate::db::facet_filter::DR_ALBUM_VALUE,
+            f.dynamic_ranges.len(),
+        ) {
+            conditions.push(crate::db::facet_filter::dr_album_in(engine, &c));
+            for v in &f.dynamic_ranges {
                 owned_params.push(SqlValue::Int(*v));
             }
         }
@@ -941,6 +1266,13 @@ impl TrackRepo {
             owned_params.push(SqlValue::Text(like.clone()));
             owned_params.push(SqlValue::Text(like));
         }
+
+        // Albums masqués (#1391) : leurs pistes sortent de la vue filtrée,
+        // TOUJOURS — ce prédicat n'est pas une facette (il n'entre pas dans
+        // `is_active`), c'est le socle de la vue. Le compteur juste en
+        // dessous partage `where_clause`, donc liste et total ne peuvent pas
+        // diverger.
+        conditions.push(hidden_tracks_excluded().to_string());
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -1087,13 +1419,47 @@ impl TrackRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, TuneError> {
+        self.search_page(query, limit, 0)
+    }
+
+    /// Une PAGE de la recherche : `limit` pistes à partir de `offset`.
+    ///
+    /// L'ordre est total (voir [`sql::search`]) : parcourir 0, `limit`,
+    /// 2·`limit`… rend chaque piste correspondante une fois et une seule.
+    pub fn search_page(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Track>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
         let trimmed = query.trim();
+        let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 6] = [&fts_query, &like, &like, &like, &trimmed, &limit];
+        let params: [&dyn ToSqlValue; 7] =
+            [&fts_query, &like, &like, &like, &trimmed, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// Le nombre de pistes que [`Self::search_page`] parcourrait, borné à
+    /// `plafond`.
+    ///
+    /// Ce n'est PAS la longueur d'une liste rendue : c'est un `COUNT` sur le
+    /// même prédicat, indépendant de `limit`. Un résultat égal à `plafond`
+    /// signifie « au moins `plafond` », jamais « exactement ».
+    pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
+        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
+        let like = format!("%{query}%");
+        let trimmed = query.trim();
+        let sql = self.dialect_sql(sql::search_count, sql::search_count);
+        let params: [&dyn ToSqlValue; 6] = [&fts_query, &like, &like, &like, &trimmed, &plafond];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
     }
 
     pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, TuneError> {
@@ -1115,10 +1481,12 @@ impl TrackRepo {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
         };
-        let esc = like_escape_clause(self.db.engine());
+        let esc = like_escape_clause();
         let sql =
             format!("SELECT file_path, album_artist FROM tracks WHERE file_path LIKE {ph}{esc}");
-        let like = format!("{dir_prefix}%");
+        // Même contrat que `folder_like_pattern` : le préfixe est du texte, le
+        // `%` final est le seul joker.
+        let like = format!("{}%", echapper_jokers_like(dir_prefix));
         let params: [&dyn ToSqlValue; 1] = [&like];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows
@@ -1191,6 +1559,115 @@ impl TrackRepo {
             .collect())
     }
 
+    /// Tirage aléatoire borné DANS un répertoire, avec le total MESURÉ de ce
+    /// répertoire : `(ids, total)`.
+    ///
+    /// C'est le jumeau, restreint à un sous-arbre, du couple
+    /// `random_ids(plafond)` + `count()` que la lecture aléatoire emploie pour
+    /// la bibliothèque entière. Deux propriétés en découlent, et ce sont elles
+    /// qui justifient une méthode plutôt qu'un appel à `list_filtered` :
+    ///
+    /// 1. **Le tirage est aléatoire, pas un préfixe.** `list_filtered` trie par
+    ///    artiste/album/disque/piste puis coupe à `LIMIT` : un répertoire de
+    ///    2 473 pistes plafonné à 500 rendrait TOUJOURS les mêmes 500, et
+    ///    « lecture aléatoire » deux fois de suite jouerait le même cinquième
+    ///    du répertoire dans un ordre différent.
+    /// 2. **Le total est compté, jamais deviné.** `COUNT(*)` ignore le plafond,
+    ///    donc la réponse peut dire « 500 sur 2 473 » — la règle de #2250 et de
+    ///    `compte_rendu_selection` : la valeur mesurée, ou rien.
+    ///
+    /// Les TROIS prédicats sont les JUMEAUX de ceux de `list_filtered` (mot
+    /// pour mot) : c'est la route `/library/tracks?folder=` qui alimente la
+    /// liste affichée quand la pastille de répertoire est active, et une
+    /// lecture aléatoire qui sélectionnerait autrement que la liste qu'elle
+    /// prétend jouer serait pire qu'une portée absente. Le test
+    /// `le_tirage_par_repertoire_selectionne_exactement_ce_que_list_filtered_rend`
+    /// tient cette égalité, y compris sur les deux pièges qu'on ne voit pas :
+    ///
+    /// * **Les albums masqués (#1391) sortent aussi d'ici.** Ils ne sont pas
+    ///   une facette : ils sont le socle de la vue filtrée. Les oublier ferait
+    ///   jouer à la lecture aléatoire des pistes que l'écran refuse d'afficher.
+    /// * **La recherche libre lie DEUX valeurs, pas une réutilisée.** En SQLite
+    ///   chaque `?` consomme un indice ; un marqueur écrit deux fois pour une
+    ///   seule valeur empilée fait échouer la requête entière
+    ///   (`InvalidParameterCount`) — le défaut préexistant relevé et corrigé
+    ///   dans `list_filtered`, à ne pas réintroduire par recopie.
+    ///
+    /// Le compteur de marqueurs est le `Placeholders` partagé, pour la raison
+    /// donnée dans `facet_filter` : en SQLite seul l'ORDRE de liaison compte,
+    /// donc un compteur tenu à la main donne du SQL juste sur SQLite et FAUX
+    /// sur PostgreSQL.
+    ///
+    /// `terme` est la recherche libre de l'écran, qui ne fait que RESTREINDRE
+    /// le sous-arbre affiché ; `None` ou vide = tout le sous-arbre.
+    pub fn random_ids_in_folder(
+        &self,
+        folder: &str,
+        terme: Option<&str>,
+        limit: i64,
+    ) -> Result<(Vec<i64>, i64), TuneError> {
+        let engine = self.db.engine();
+        let mut ph = Placeholders::new(engine);
+
+        let mut conditions: Vec<String> = Vec::new();
+        let mut owned_params: Vec<SqlValue> = Vec::new();
+
+        // Jumeau du prédicat `folder` de `list_filtered`.
+        conditions.push(format!(
+            "t.file_path LIKE {}{}",
+            ph.take(),
+            like_escape_clause()
+        ));
+        owned_params.push(SqlValue::Text(folder_like_pattern(folder)));
+
+        // Jumeau du prédicat `q` de `list_filtered` — deux marqueurs, deux
+        // valeurs liées.
+        if let Some(query) = terme.filter(|s| !s.is_empty()) {
+            let like = format!("%{query}%");
+            let p = ph.take();
+            let p2 = ph.take();
+            conditions.push(format!(
+                "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p2})))"
+            ));
+            owned_params.push(SqlValue::Text(like.clone()));
+            owned_params.push(SqlValue::Text(like));
+        }
+
+        // Jumeau du socle de la vue filtrée : les albums masqués n'en sont pas.
+        conditions.push(hidden_tracks_excluded().to_string());
+
+        // La jointure `artists` est inconditionnelle — comme dans
+        // `list_filtered` — pour que le compte et le tirage lisent la MÊME
+        // forme de requête, avec ou sans terme de recherche.
+        let from = "FROM tracks t LEFT JOIN artists ar ON t.artist_id = ar.id";
+        let where_clause = format!(" WHERE {}", conditions.join(" AND "));
+
+        let count_sql = format!("SELECT COUNT(*) {from}{where_clause}");
+        let refs: Vec<&dyn ToSqlValue> =
+            owned_params.iter().map(|v| v as &dyn ToSqlValue).collect();
+        let total = self
+            .db
+            .query_one(&count_sql, &refs)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+
+        let data_sql = format!(
+            "SELECT t.id {from}{where_clause} ORDER BY random() LIMIT {}",
+            ph.take()
+        );
+        let mut all_params = owned_params;
+        all_params.push(SqlValue::Int(limit));
+        let all_refs: Vec<&dyn ToSqlValue> =
+            all_params.iter().map(|v| v as &dyn ToSqlValue).collect();
+        let rows = self.db.query_many(&data_sql, &all_refs)?;
+        let ids = rows
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+            .collect();
+        Ok((ids, total))
+    }
+
     pub fn count_doubtful(&self) -> Result<i64, TuneError> {
         let sql = format!(
             "SELECT COUNT(*) FROM tracks t \
@@ -1228,32 +1705,53 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// Hydrate tracks for `ids`, **in the caller's order**, duplicates kept.
+    ///
+    /// Deux défauts corrigés (#2797) :
+    ///
+    /// 1. **Quadratique.** La réindexation faisait un
+    ///    `tracks.iter().find(...)` par id demandé : O(n²) comparaisons sur
+    ///    une grosse playlist. Elle passe par une `HashMap<i64, Track>`,
+    ///    donc une seule passe, O(n).
+    /// 2. **Limite de paramètres SQL.** Un placeholder par id faisait
+    ///    échouer la requête au-delà de la limite du moteur — SQLite
+    ///    `SQLITE_MAX_VARIABLE_NUMBER` (999 avant 3.32, 32766 depuis),
+    ///    PostgreSQL 65535 paramètres par message Bind — et les routes
+    ///    playlists rendaient alors une liste vide. Les ids sont des `i64`
+    ///    issus de nos propres requêtes : ils sont **inlinés** (zéro
+    ///    paramètre lié, même rationale que `list_by_ids`), ce qui met la
+    ///    requête hors d'atteinte des deux limites, et découpés en lots pour
+    ///    rester sous la limite de *longueur* d'instruction de SQLite (1 Mo
+    ///    par défaut) : `ID_INLINE_BATCH` ids × 20 caractères au pire.
+    ///
+    /// Contrat inchangé : ordre du tableau d'entrée, doublons reproduits,
+    /// ids absents simplement omis.
     pub fn get_multiple(&self, ids: &[i64]) -> Result<Vec<Track>, TuneError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let make_ph = |i: usize| match self.db.engine() {
-            Engine::Sqlite => SqliteDialect.placeholder(i),
-            Engine::Postgres => PostgresDialect.placeholder(i),
-        };
-        let placeholders: Vec<String> = (1..=ids.len()).map(make_ph).collect();
-        let sql = format!(
-            "{} WHERE t.id IN ({})",
-            sql::select_track(),
-            placeholders.join(",")
-        );
-        let owned: Vec<SqlValue> = ids.iter().map(|id| SqlValue::Int(*id)).collect();
-        let refs: Vec<&dyn ToSqlValue> = owned.iter().map(|v| v as &dyn ToSqlValue).collect();
-        let rows = self.db.query_many(&sql, &refs)?;
-        let tracks: Vec<Track> = rows.iter().map(row_to_track).collect();
-        // Preserve caller's ordering
-        let mut ordered = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(t) = tracks.iter().find(|t| t.id == Some(*id)) {
-                ordered.push(t.clone());
+        // 1er temps : hydrater chaque id DISTINCT une seule fois, par lots.
+        let mut wanted: Vec<i64> = ids.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut by_id: HashMap<i64, Track> = HashMap::with_capacity(wanted.len());
+        for chunk in wanted.chunks(ID_INLINE_BATCH) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("{} WHERE t.id IN ({id_list})", sql::select_track());
+            let rows = self.db.query_many(&sql, &[])?;
+            for row in &rows {
+                let track = row_to_track(row);
+                if let Some(id) = track.id {
+                    by_id.insert(id, track);
+                }
             }
         }
-        Ok(ordered)
+        // 2e temps : réordonner en mémoire — un accès haché par id, O(n).
+        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
     // ─── Group B/C: write_tx + simple inline ──────────────────────
@@ -1268,18 +1766,9 @@ impl TrackRepo {
     pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let insert_sql = self.dialect_sql(sql::insert, sql::insert);
         let mut count = 0usize;
+        let mut echecs = 0usize;
         let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
         for track in tracks {
-            if track.title.to_lowercase().contains("personal jesus") {
-                tracing::warn!(
-                    title = %track.title,
-                    album_id = ?track.album_id,
-                    artist_id = ?track.artist_id,
-                    album_artist = ?track.album_artist,
-                    file = ?track.file_path,
-                    "BUG_TRACE_insert_personal_jesus"
-                );
-            }
             let params: [&dyn ToSqlValue; 28] = [
                 &track.title,
                 &track.album_id,
@@ -1327,14 +1816,76 @@ impl TrackRepo {
                 // after a delete + full rescan). Log it so the drop is visible
                 // and the root cause (stale album_id/artist_id FK from an
                 // importer cache surviving a batch rollback) is diagnosable.
-                Err(e) => tracing::warn!(
-                    file = ?track.file_path,
-                    album_id = ?track.album_id,
-                    artist_id = ?track.artist_id,
-                    error = %e,
-                    "track_insert_failed_in_batch"
-                ),
+                // Plafonné, sur le modèle de `scan_walk_errors_truncated`
+                // (#2890) : la cause d'un lot qui échoue est la MÊME pour les
+                // 500 lignes (FK périmée, base verrouillée, disque plein).
+                // Les premières la disent ; les 490 suivantes ne font que
+                // manger le quart de fenêtre alloué à ce module. Le total est
+                // récapitulé juste après — aucune perte n'est masquée.
+                Err(e) => {
+                    echecs += 1;
+                    if echecs <= ECHECS_DETAILLES {
+                        tracing::warn!(
+                            file = ?track.file_path,
+                            album_id = ?track.album_id,
+                            artist_id = ?track.artist_id,
+                            error = %e,
+                            "track_insert_failed_in_batch"
+                        );
+                    }
+                }
             }
+        }
+        if echecs > ECHECS_DETAILLES {
+            tracing::warn!(
+                echecs,
+                detaillees = ECHECS_DETAILLES,
+                pistes = tracks.len(),
+                "track_insert_failures_truncated"
+            );
+        }
+        // ── Ce que la sonde retirée voulait voir (#2890) ──────────────────
+        //
+        // Un `warn!` par piste vivait en tête de la boucle ci-dessus depuis le
+        // 01/07/2026 (commit e57c9acc, message `diag:`) : il testait le TITRE
+        // de chaque piste contre « personal jesus » en dur et sortait
+        // `album_id`/`artist_id` quand ça mordait. Le doute d'origine — un
+        // album éclaté entre deux `album_id` à l'insertion — reste ouvert ; la
+        // sonde, non, pour trois raisons :
+        //
+        // 1. `warn!` est un niveau LIVRÉ. L'export de diagnostic borne chaque
+        //    module à un quart de la fenêtre (`QUOTA_PAR_MODULE`, #1974) : une
+        //    ligne par piste peut prendre 250 lignes sur 1000, arrachées à
+        //    tous les autres modules — et `db::track_repo` est justement celui
+        //    qu'on lit quand un scan perd des pistes (#2939).
+        // 2. Le prédicat était un titre en dur, l'un des plus repris du
+        //    répertoire : original, remixes, compilations et reprises mordent
+        //    tous, et `to_lowercase()` allouait une `String` par piste insérée
+        //    pour un test faux dans la quasi-totalité des cas.
+        // 3. La même question se répond PAR LOT. Un dossier scanné qui rend
+        //    plus d'un `album_id` EST la signature de l'album éclaté ; c'est
+        //    ce compte qui instruit, pas la répétition piste à piste.
+        //
+        // D'où ce récapitulatif : une ligne par appel (500 fichiers,
+        // `SCAN_BATCH_SIZE`) au lieu d'une par piste, et en `debug!` — sous le
+        // niveau livré, donc à activer quand on enquête, comme toute sonde.
+        // Les échecs d'insertion réels, eux, restent en `warn!` juste au-dessus.
+        if !tracks.is_empty() {
+            tracing::debug!(
+                pistes = tracks.len(),
+                inserees = count,
+                albums_distincts = tracks
+                    .iter()
+                    .map(|t| t.album_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                artistes_distincts = tracks
+                    .iter()
+                    .map(|t| t.artist_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                "track_batch_inserted"
+            );
         }
         Ok(count)
     }
@@ -1382,11 +1933,28 @@ impl TrackRepo {
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
         }
+        let mut echecs = 0usize;
         for res in self.db.execute_many(&update_sql, &row_params) {
             match res {
                 Ok(_) => count += 1,
-                Err(e) => tracing::warn!(error = %e, "track_update_failed_in_batch"),
+                // Même plafond que `create_batch` ci-dessus (#2890), et pour
+                // la même raison : un lot qui échoue échoue pour une seule
+                // cause, répétée à l'identique.
+                Err(e) => {
+                    echecs += 1;
+                    if echecs <= ECHECS_DETAILLES {
+                        tracing::warn!(error = %e, "track_update_failed_in_batch");
+                    }
+                }
             }
+        }
+        if echecs > ECHECS_DETAILLES {
+            tracing::warn!(
+                echecs,
+                detaillees = ECHECS_DETAILLES,
+                pistes = tracks.len(),
+                "track_update_failures_truncated"
+            );
         }
         Ok(count)
     }
@@ -1493,21 +2061,63 @@ impl TrackRepo {
             .collect())
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn get_all_local_file_info(
-        &self,
-    ) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, TuneError> {
-        let rows = self.db.query_many(sql::get_all_local_file_info(), &[])?;
+    /// La carte `file_path` → ligne qui le possède, **toutes sources**.
+    ///
+    /// Voir [`sql::get_all_file_info_by_path`] pour la raison — c'est la
+    /// portée de `file_path TEXT UNIQUE`, et rien d'autre ne peut décider si
+    /// un fichier rencontré par le scan est une insertion ou une mise à jour.
+    pub fn get_all_file_info_by_path(&self) -> Result<HashMap<String, InfoFichier>, TuneError> {
+        let rows = self.db.query_many(sql::get_all_file_info_by_path(), &[])?;
         Ok(rows
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first().and_then(|v| v.as_i64())?;
                 let path = cols.get(1).and_then(|v| v.as_string())?;
                 let mtime = cols.get(2).and_then(|v| v.as_f64());
-                let size = cols.get(3).and_then(|v| v.as_i64());
-                Some((path, (id, mtime, size)))
+                let taille = cols.get(3).and_then(|v| v.as_i64());
+                // Une ligne sans `source` n'existe pas (colonne NOT NULL
+                // DEFAULT 'local'), mais un moteur qui rendrait NULL ne doit
+                // pas faire passer la ligne pour locale : « inconnue » est le
+                // choix sûr, il ne donne aucun droit de purge.
+                let source = cols
+                    .get(4)
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_else(|| "inconnue".to_string());
+                Some((
+                    path,
+                    InfoFichier {
+                        id,
+                        mtime,
+                        taille,
+                        source,
+                    },
+                ))
             })
             .collect())
+    }
+
+    /// Le scan prend possession des lignes qu'il vient de relire sur le disque.
+    ///
+    /// Une ligne posée par un importateur de bibliothèque (`roon_import`,
+    /// `plex_import`, `jriver`) décrit un fichier local ; dès que le scan l'a
+    /// rouverte et remise à jour depuis ses balises, elle EST une piste locale.
+    /// Sans cette adoption, elle resterait invisible à toutes les requêtes de
+    /// tenue de compte du scan — dont la purge — et le désaccord de portée que
+    /// corrige #2939 se rejouerait à chaque scan suivant.
+    ///
+    /// `AND source <> 'local'` : une ligne déjà locale n'est pas touchée, donc
+    /// le compte rendu est le nombre d'adoptions RÉELLES.
+    pub fn adopter_en_local(&self, ids: &[i64]) -> Result<usize, TuneError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let sql = self.dialect_sql(sql::adopter_en_local, sql::adopter_en_local);
+        let mut adoptees = 0usize;
+        for id in ids {
+            let params: [&dyn ToSqlValue; 1] = [id];
+            adoptees += self.db.execute(&sql, &params)?;
+        }
+        Ok(adoptees)
     }
 
     /// List all local tracks (with file_path set). Used by rescan-metadata to
@@ -1689,6 +2299,76 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    /// #1391 — les pistes d'un album masqué sortent de la vue pistes (les
+    /// deux chemins de `GET /library/tracks`), de la recherche et de la vue
+    /// artiste ; une piste SANS album reste visible ; `list_by_album` reste
+    /// ENTIER pour que l'album masqué demeure jouable.
+    #[test]
+    fn les_pistes_d_un_album_masque_sortent_des_vues() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Massive Attack".into()))
+            .unwrap();
+        let albums = AlbumRepo::new(db.clone());
+        let album_id = albums
+            .get_or_create("Mezzanine", artist_id, None)
+            .unwrap()
+            .id
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+
+        let mut cachee = Track::new("Teardrop".into());
+        cachee.album_id = Some(album_id);
+        cachee.artist_id = Some(artist_id);
+        cachee.file_path = Some("/music/Mezzanine/teardrop.flac".into());
+        let cachee_id = repo.create(&cachee).unwrap();
+
+        // Une piste sans album : le filtre ne doit PAS l'avaler (piège du
+        // `t.album_id` NULL).
+        let mut libre = Track::new("Sans album".into());
+        libre.artist_id = Some(artist_id);
+        libre.file_path = Some("/music/loose.flac".into());
+        let libre_id = repo.create(&libre).unwrap();
+
+        crate::db::hidden_repo::HiddenRepo::new(db.clone())
+            .hide_album(album_id)
+            .unwrap();
+
+        // Chemin non facetté.
+        let visibles = repo.list_visible(100, 0).unwrap();
+        assert_eq!(
+            visibles.iter().filter_map(|t| t.id).collect::<Vec<_>>(),
+            vec![libre_id],
+            "seule la piste sans album reste visible"
+        );
+        assert_eq!(repo.count_visible().unwrap(), 1);
+        assert_eq!(repo.count().unwrap(), 2, "le compte COMPLET reste entier");
+
+        // Chemin facetté : même exclusion, et le total suit la liste.
+        let filtre = crate::db::facet_filter::TrackFilter {
+            artists: vec!["Massive Attack".into()],
+            ..Default::default()
+        };
+        let (pistes, total) = repo.list_filtered(&filtre, 100, 0).unwrap();
+        assert!(pistes.iter().all(|t| t.id != Some(cachee_id)));
+        assert_eq!(total, pistes.len() as i64);
+
+        // Recherche et vue artiste.
+        assert!(
+            repo.search("Teardrop", 10).unwrap().is_empty(),
+            "la recherche ne doit pas trahir la piste masquée"
+        );
+        assert!(
+            repo.list_by_artist(artist_id)
+                .unwrap()
+                .iter()
+                .all(|t| t.id != Some(cachee_id))
+        );
+
+        // Masqué n'est pas supprimé : l'album se joue toujours.
+        assert_eq!(repo.list_by_album(album_id).unwrap().len(), 1);
     }
 
     /// Forum #1312. A track filed under a folder-named album must be able to
@@ -2019,6 +2699,233 @@ mod tests {
         assert_eq!(result[2].title, "Beta");
     }
 
+    /// Sème `n` pistes d'ids 1..=n en quelques `execute_batch`, sans passer par
+    /// `create` (une transaction par piste serait le coût dominant du test).
+    fn seed_pistes(db: &SqliteDb, n: usize) {
+        let mut sql = String::with_capacity(1 << 22);
+        sql.push_str("BEGIN;\n");
+        for id in 1..=n {
+            sql.push_str(&format!(
+                "INSERT INTO tracks (id, title, file_path, duration_ms) \
+                 VALUES ({id}, 'piste {id}', '/musique/{id}.flac', {id});\n"
+            ));
+            if sql.len() > (1 << 22) {
+                sql.push_str("COMMIT;\n");
+                db.execute_batch(&sql).unwrap();
+                sql.clear();
+                sql.push_str("BEGIN;\n");
+            }
+        }
+        sql.push_str("COMMIT;\n");
+        db.execute_batch(&sql).unwrap();
+    }
+
+    /// #2797, défaut n°2 — la limite de paramètres SQL.
+    ///
+    /// L'ancienne forme posait UN placeholder par id. Au-delà de la limite du
+    /// moteur (SQLite `SQLITE_MAX_VARIABLE_NUMBER` : 999 avant 3.32, 32766
+    /// depuis ; PostgreSQL : 65535), la requête est refusée et les routes
+    /// playlists rendaient une liste VIDE. 40 000 ids dépassent les deux
+    /// seuils SQLite, quelle que soit la version liée.
+    ///
+    /// Contre-épreuve : en réinjectant la forme à placeholders, ce test
+    /// échoue avec « too many SQL variables ».
+    #[test]
+    fn get_multiple_tient_au_dela_de_la_limite_de_parametres_2797() {
+        let db = test_db();
+        seed_pistes(&db, 6);
+        let repo = TrackRepo::new(db);
+
+        // 40 000 ids demandés, dont 6 seulement existent, disséminés.
+        let mut ids: Vec<i64> = (1_000_000..1_040_000).collect();
+        ids[0] = 4;
+        ids[9_999] = 1;
+        ids[19_999] = 6;
+        ids[29_999] = 3;
+        ids[39_998] = 5;
+        ids[39_999] = 2;
+        assert!(ids.len() > 32_766, "le test doit dépasser les deux seuils");
+
+        let result = repo.get_multiple(&ids).expect("aucune erreur de moteur");
+        let titles: Vec<&str> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "piste 4", "piste 1", "piste 6", "piste 3", "piste 5", "piste 2"
+            ],
+            "résultat complet, dans l'ordre demandé, ids absents omis"
+        );
+    }
+
+    /// #2797 — le contrat de sortie : ordre d'entrée, doublons reproduits,
+    /// ids absents omis. La réindexation par `HashMap` ne doit rien changer
+    /// à ce qu'observaient les appelants (positions de playlist, rang
+    /// acoustique de `library/search`).
+    #[test]
+    fn get_multiple_reproduit_les_doublons_et_omet_les_absents_2797() {
+        let db = test_db();
+        seed_pistes(&db, 3);
+        let repo = TrackRepo::new(db);
+
+        let result = repo.get_multiple(&[3, 1, 999, 1, 2, 3, 1]).unwrap();
+        let titles: Vec<&str> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "piste 3", "piste 1", "piste 1", "piste 2", "piste 3", "piste 1"
+            ]
+        );
+        assert!(repo.get_multiple(&[]).unwrap().is_empty());
+    }
+
+    /// #2797, défaut n°1 — la réindexation était quadratique
+    /// (`tracks.iter().find(...)` par id demandé).
+    ///
+    /// Contre-épreuve de complexité : on mesure le même appel à `n` puis à
+    /// `4n`. Un coût linéaire multiplie le temps par ~4 ; un coût quadratique
+    /// par ~16. Le seuil est à 8× — à mi-chemin en échelle log, donc ~2×
+    /// de marge de chaque côté pour ne pas devenir instable sur une machine
+    /// de CI chargée. Meilleure de 3 passes, pour la même raison.
+    #[test]
+    fn get_multiple_ne_coute_pas_de_maniere_quadratique_2797() {
+        use std::time::Instant;
+
+        const N: usize = 4_000;
+        let db = test_db();
+        seed_pistes(&db, 4 * N);
+        let repo = TrackRepo::new(db);
+
+        let petit: Vec<i64> = (1..=N as i64).collect();
+        let grand: Vec<i64> = (1..=(4 * N) as i64).collect();
+
+        let mesure = |ids: &[i64]| {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                let out = repo.get_multiple(ids).unwrap();
+                let dt = t0.elapsed().as_secs_f64();
+                assert_eq!(out.len(), ids.len());
+                best = best.min(dt);
+            }
+            best
+        };
+
+        let t_petit = mesure(&petit);
+        let t_grand = mesure(&grand);
+        let ratio = t_grand / t_petit.max(1e-6);
+        assert!(
+            ratio < 8.0,
+            "coût quadratique : n={N} {:.1} ms, 4n={} {:.1} ms → ×{ratio:.1} (linéaire ≈ ×4)",
+            t_petit * 1e3,
+            4 * N,
+            t_grand * 1e3,
+        );
+    }
+
+    /// Mesure de référence pour #2797 : le coût par piste doit rester plat.
+    /// `--ignored`, hors CI (build release, plusieurs dizaines de milliers de
+    /// lignes semées) — c'est la table de preuve de la PR, pas un garde-fou.
+    #[test]
+    #[ignore]
+    fn bench_get_multiple_2797() {
+        use std::time::Instant;
+
+        let db = test_db();
+        seed_pistes(&db, 100_000);
+        let repo = TrackRepo::new(db);
+        for n in [1_000usize, 5_000, 20_000, 50_000, 100_000] {
+            let ids: Vec<i64> = (1..=n as i64).collect();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                let out = repo.get_multiple(&ids).unwrap();
+                assert_eq!(out.len(), n);
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "BENCH2797 n={n:>7} total={:>9.1} ms par_piste={:>7.3} µs",
+                best * 1e3,
+                best * 1e6 / n as f64
+            );
+        }
+    }
+
+    /// #3189 — la requête paginée doit porter un ordre TOTAL, et le compte le
+    /// MÊME prédicat que la liste.
+    ///
+    /// Garde de TEXTE, délibérément, et voici pourquoi : le garde de
+    /// comportement existe (`tune-server/tests/recherche_totaux_i3189.rs`, la
+    /// pagination sans doublon ni trou) mais il ne mord pas sur SQLite —
+    /// mesuré le 02/09/2026 : `ORDER BY t.id` retiré, les six tests restent
+    /// verts, parce que le plan de SQLite rend de toute façon les lignes dans
+    /// l'ordre des `rowid`. PostgreSQL, lui, ne promet rien de tel, et c'est
+    /// précisément le moteur de jfpaquet. Sans cette assertion, l'`ORDER BY`
+    /// pourrait disparaître sans qu'aucune porte locale rougisse.
+    #[test]
+    fn la_recherche_paginee_porte_un_ordre_total_et_le_compte_le_meme_predicat() {
+        for sql in [sql::search(&SqliteDialect), sql::search(&PostgresDialect)] {
+            assert!(
+                sql.contains("ORDER BY t.id"),
+                "sans ordre total, une page peut redonner ce que la précédente \
+                 a déjà rendu : {sql}"
+            );
+            assert!(
+                sql.contains("OFFSET"),
+                "la recherche doit être paginable : {sql}"
+            );
+        }
+        // Le compte et la liste partagent LITTÉRALEMENT le prédicat : deux
+        // rédactions divergentes feraient annoncer le total de rien.
+        let sqlite = sql::search_where(&SqliteDialect);
+        assert!(sql::search(&SqliteDialect).contains(&sqlite));
+        assert!(sql::search_count(&SqliteDialect).contains(&sqlite));
+        let postgres = sql::search_where(&PostgresDialect);
+        assert!(sql::search(&PostgresDialect).contains(&postgres));
+        assert!(sql::search_count(&PostgresDialect).contains(&postgres));
+        // La borne est DANS la sous-requête : autour du COUNT, elle ne
+        // bornerait rien du tout.
+        assert!(
+            sql::search_count(&PostgresDialect).ends_with("LIMIT $6) AS borne"),
+            "{}",
+            sql::search_count(&PostgresDialect)
+        );
+    }
+
+    /// #3189 — le compte est le nombre de correspondances, pas la longueur de
+    /// la liste, et la pagination ne perd ni ne double aucune ligne.
+    #[test]
+    fn le_compte_et_la_pagination_de_la_recherche() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        for i in 0..37 {
+            let mut t = Track::new(format!("Autumn Leaves {i:03}"));
+            t.file_path = Some(format!("/autumn-{i:03}.flac"));
+            repo.create(&t).unwrap();
+        }
+        // Du bruit, pour qu'un compte de la table entière se voie.
+        for i in 0..11 {
+            let mut t = Track::new(format!("Winter Sun {i:03}"));
+            t.file_path = Some(format!("/winter-{i:03}.flac"));
+            repo.create(&t).unwrap();
+        }
+
+        assert_eq!(repo.search("Autumn", 10).unwrap().len(), 10);
+        assert_eq!(repo.search_count("Autumn", 1_000).unwrap(), 37);
+        // Le témoin : sous le plafond, le compte est exact ; il n'a pas
+        // ramassé les onze pistes hors sujet.
+        assert_eq!(repo.search_count("Winter", 1_000).unwrap(), 11);
+        // Et le plafond borne VRAIMENT — « au moins 5 ».
+        assert_eq!(repo.search_count("Autumn", 5).unwrap(), 5);
+
+        let mut vus = std::collections::HashSet::new();
+        for offset in [0, 10, 20, 30] {
+            for t in repo.search_page("Autumn", 10, offset).unwrap() {
+                assert!(vus.insert(t.id.unwrap()), "piste rendue deux fois");
+            }
+        }
+        assert_eq!(vus.len(), 37, "le parcours doit rendre l'ensemble");
+    }
+
     #[test]
     fn search_tracks() {
         let db = test_db();
@@ -2117,5 +3024,218 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2801 — la portée de répertoire de la lecture aléatoire
+    // -----------------------------------------------------------------------
+
+    /// Bibliothèque de test taillée sur le signalement de Marco Polo : un
+    /// répertoire visé, un répertoire voisin dont le nom PRÉFIXE le premier
+    /// (« Disco » vs « Disco Pack » — le piège du séparateur), et un
+    /// sous-répertoire, puisque la portée est récursive.
+    ///
+    /// Les chemins sont construits avec `MAIN_SEPARATOR`, comme
+    /// `folder_like_pattern` : un test écrit en dur avec `/` passerait sur
+    /// Linux et macOS et mentirait sur Windows.
+    fn bibliotheque_de_repertoires(repo: &TrackRepo, artist_id: i64) -> Vec<(String, i64)> {
+        let s = std::path::MAIN_SEPARATOR;
+        let fichiers = [
+            format!("{s}music{s}Disco Pack{s}vol051{s}Funkytown.flac"),
+            format!("{s}music{s}Disco Pack{s}vol051{s}Le Freak.flac"),
+            format!("{s}music{s}Disco Pack{s}vol056{s}Funky Nassau.flac"),
+            // Voisin dont le nom préfixe celui du répertoire visé.
+            format!("{s}music{s}Disco Pack Live{s}Funkytown (live).flac"),
+            format!("{s}music{s}Autre{s}Funkytown (reprise).flac"),
+        ];
+        fichiers
+            .iter()
+            .map(|p| {
+                let titre = p.rsplit(s).next().unwrap().trim_end_matches(".flac");
+                let mut t = Track::new(titre.into());
+                t.artist_id = Some(artist_id);
+                t.file_path = Some(p.clone());
+                (p.clone(), repo.create(&t).unwrap())
+            })
+            .collect()
+    }
+
+    /// Le défaut de #2801 : la lecture aléatoire tirait dans TOUTE la table
+    /// `tracks`. Le tirage par répertoire ne doit rendre que le sous-arbre —
+    /// ni le voisin dont le nom le préfixe, ni le reste de la bibliothèque —
+    /// et rendre le compte EXACT du sous-arbre, pas celui de la sélection.
+    #[test]
+    fn le_tirage_par_repertoire_ne_sort_pas_du_sous_arbre() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        let cree = bibliotheque_de_repertoires(&repo, artist_id);
+        assert_eq!(repo.count().unwrap(), 5, "témoin : la table entière");
+
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Disco Pack");
+        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+
+        let attendus: std::collections::HashSet<i64> = cree
+            .iter()
+            .filter(|(p, _)| p.starts_with(&format!("{vise}{s}")))
+            .map(|(_, id)| *id)
+            .collect();
+        assert_eq!(
+            attendus.len(),
+            3,
+            "témoin : trois pistes sous le répertoire"
+        );
+        assert_eq!(
+            ids.iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            attendus,
+            "le tirage doit rendre le sous-arbre entier, et RIEN d'autre — \
+             ni « Disco Pack Live », qui commence pourtant par le même texte"
+        );
+        assert_eq!(
+            total, 3,
+            "le total est celui du répertoire, pas de la table"
+        );
+    }
+
+    /// Le plafond borne la file, jamais le total annoncé : c'est ce qui permet
+    /// à la réponse de dire « 500 sur 2 473 » au lieu de « 500 » tout court
+    /// (#2228/#2901). Un total qui suivrait le plafond rendrait `capped` faux.
+    #[test]
+    fn le_plafond_borne_la_file_mais_pas_le_total_annonce() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        bibliotheque_de_repertoires(&repo, artist_id);
+
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Disco Pack");
+        let (ids, total) = repo.random_ids_in_folder(&vise, None, 2).unwrap();
+        assert_eq!(ids.len(), 2, "la file est bornée par le plafond");
+        assert_eq!(total, 3, "le total reste celui du répertoire entier");
+    }
+
+    /// La zone de recherche ne fait que RESTREINDRE le répertoire affiché : le
+    /// terme doit s'appliquer DANS le sous-arbre, sans jamais en faire sortir
+    /// — « Funkytown » existe aussi hors du répertoire, et ne doit pas revenir.
+    #[test]
+    fn le_terme_de_recherche_restreint_le_repertoire_sans_en_sortir() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        bibliotheque_de_repertoires(&repo, artist_id);
+
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Disco Pack");
+        let (ids, total) = repo
+            .random_ids_in_folder(&vise, Some("funkytown"), 500)
+            .unwrap();
+        assert_eq!(ids.len(), 1, "une seule « Funkytown » sous ce répertoire");
+        assert_eq!(total, 1);
+
+        let titre = repo.get(ids[0]).unwrap().unwrap().title;
+        assert_eq!(
+            titre, "Funkytown",
+            "ni la version live du répertoire voisin, ni la reprise d'ailleurs"
+        );
+    }
+
+    /// Le socle de la vue filtrée, pas une facette : un album masqué (#1391) ne
+    /// s'affiche pas, donc la lecture aléatoire du répertoire ne doit pas le
+    /// jouer — ni le compter. C'est le prédicat qu'une recopie « des deux
+    /// filtres » aurait naturellement oublié.
+    #[test]
+    fn un_album_masque_ne_part_pas_en_lecture_aleatoire_de_repertoire() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let albums = AlbumRepo::new(db.clone());
+        let album_id = albums
+            .get_or_create("vol051", artist_id, None)
+            .unwrap()
+            .id
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Disco Pack");
+
+        let mut visible = Track::new("Le Freak".into());
+        visible.artist_id = Some(artist_id);
+        visible.file_path = Some(format!("{vise}{s}vol056{s}Le Freak.flac"));
+        let visible_id = repo.create(&visible).unwrap();
+
+        let mut masquee = Track::new("Funkytown".into());
+        masquee.artist_id = Some(artist_id);
+        masquee.album_id = Some(album_id);
+        masquee.file_path = Some(format!("{vise}{s}vol051{s}Funkytown.flac"));
+        repo.create(&masquee).unwrap();
+
+        // Témoin : avant le masquage, les deux pistes partent.
+        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+        assert_eq!(ids.len(), 2, "témoin : les deux pistes sont éligibles");
+        assert_eq!(total, 2);
+
+        crate::db::hidden_repo::HiddenRepo::new(db.clone())
+            .hide_album(album_id)
+            .unwrap();
+
+        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+        assert_eq!(
+            ids,
+            vec![visible_id],
+            "l'album masqué ne s'affiche pas : il ne doit pas se jouer non plus"
+        );
+        assert_eq!(total, 1, "et il ne doit pas se compter non plus");
+    }
+
+    /// Le garde-fou contre la DIVERGENCE : `random_ids_in_folder` duplique les
+    /// prédicats `folder`, `q` et « albums masqués » de `list_filtered` pour
+    /// pouvoir tirer au hasard et compter au-delà du plafond. Deux copies d'un
+    /// prédicat, c'est deux occasions de se contredire — et une lecture
+    /// aléatoire qui jouerait autre chose que la liste affichée serait pire
+    /// qu'une portée absente. Ce test tient l'égalité des DEUX ensembles, avec
+    /// et sans terme de recherche.
+    #[test]
+    fn le_tirage_par_repertoire_selectionne_exactement_ce_que_list_filtered_rend() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        bibliotheque_de_repertoires(&repo, artist_id);
+
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Disco Pack");
+
+        for terme in [None, Some("funkytown")] {
+            let (ids, total) = repo.random_ids_in_folder(&vise, terme, 500).unwrap();
+            let filtre = TrackFilter {
+                folder: Some(vise.clone()),
+                q: terme.map(str::to_string),
+                ..Default::default()
+            };
+            let (items, total_liste) = repo.list_filtered(&filtre, 500, 0).unwrap();
+            let attendus: std::collections::HashSet<i64> =
+                items.into_iter().filter_map(|t| t.id).collect();
+            assert_eq!(
+                ids.into_iter().collect::<std::collections::HashSet<_>>(),
+                attendus,
+                "tirage et liste doivent porter sur le MÊME ensemble (terme = {terme:?})"
+            );
+            assert_eq!(
+                total, total_liste,
+                "et sur le même total (terme = {terme:?})"
+            );
+        }
     }
 }

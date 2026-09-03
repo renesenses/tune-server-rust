@@ -82,6 +82,23 @@ pub async fn list(
     let lb_payload = svc_mgr.load_token("listenbrainz").ok().flatten();
     let genius_payload = svc_mgr.load_token("genius").ok().flatten();
 
+    // Radio France (#1026) — sans clé, les trois routes GraphQL de l'écran
+    // Podcasts répondent `412 radiofrance_cle_absente` en nommant le réglage
+    // `radiofrance_api_key`. Ce renvoi ne menait nulle part : la source
+    // n'était offerte par AUCUN écran, donc la clé qu'elle réclame n'était
+    // saisissable nulle part.
+    //
+    // « Configuré » se lit EXACTEMENT là où `get_rf_api_key` la lit — le
+    // réglage `radiofrance_api_key`, vide compte comme absent. Le badge ne
+    // peut donc pas annoncer une source active que l'écran Podcasts refuse.
+    let radiofrance_payload = svc_mgr.load_token("radiofrance").ok().flatten();
+    let radiofrance_configured = settings
+        .get("radiofrance_api_key")
+        .ok()
+        .flatten()
+        .filter(|k| !k.is_empty())
+        .is_some();
+
     let discogs_db_configured = settings.get("discogs_token").ok().flatten().is_some()
         || state
             .config
@@ -161,6 +178,22 @@ pub async fn list(
             "fields": [{"key": "token", "label": "Access Token", "type": "password"}],
             "help_url": "https://genius.com/api-clients",
             "help_steps": [tr("svctok.genius.step1"), tr("svctok.genius.step2"), tr("svctok.genius.step3")],
+        }),
+        json!({
+            "id": "radiofrance", "name": "Radio France", "kind": "api_key",
+            "purpose": tr("svctok.radiofrance.purpose"),
+            "pricing": "free", "pricing_note": tr("svctok.radiofrance.pricing"),
+            "configured": radiofrance_configured,
+            "source": if radiofrance_configured { json!("db") } else { serde_json::Value::Null },
+            "valid": radiofrance_payload.as_ref().and_then(|p| p.valid),
+            "validated_at": radiofrance_payload.as_ref().and_then(|p| p.validated_at),
+            "validation_message": radiofrance_payload.as_ref().and_then(|p| p.validation_message.clone()),
+            // `save()` écrit `{id}_{clé}` : « radiofrance » + « api_key »
+            // donne `radiofrance_api_key`, le réglage exact que nomme le 412
+            // et que lit `get_rf_api_key` (routes/podcasts.rs).
+            "fields": [{"key": "api_key", "label": "API Key", "type": "password"}],
+            "help_url": "https://developers.radiofrance.fr/",
+            "help_steps": [tr("svctok.radiofrance.step1"), tr("svctok.radiofrance.step2"), tr("svctok.radiofrance.step3")],
         }),
         json!({
             "id": "tidal", "name": "Tidal", "kind": "oauth",
@@ -333,6 +366,21 @@ pub async fn test(
                     json!({ "valid": false, "validation_message": tr("svctok.err.lastfmNotConfigured") }),
                 ),
             }
+        }
+        // Jumelle du bras « genius » : une vérification LOCALE, sans réseau.
+        // On relit le réglage exact que lit l'écran Podcasts, pour que
+        // « Tester » et la source disent la même chose (#1026).
+        "radiofrance" => {
+            let configured = settings
+                .get("radiofrance_api_key")
+                .ok()
+                .flatten()
+                .filter(|k| !k.is_empty())
+                .is_some();
+            Json(json!({
+                "valid": configured,
+                "validation_message": if configured { tr("svctok.err.tokenConfiguredNoValidation") } else { tr("svctok.err.radiofranceNotConfigured") },
+            }))
         }
         "genius" => {
             let configured = svc_mgr.get_credential("genius", "token").is_some()

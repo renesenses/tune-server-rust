@@ -12,7 +12,7 @@
 //! valeur *élargissant* et l'ajout d'une facette *restreignant* — sans quoi
 //! cocher une seconde case ne pourrait que vider la liste.
 //!
-//! # Deux pièges, tous deux déjà rencontrés dans ce dépôt
+//! # Trois pièges, tous déjà rencontrés dans ce dépôt
 //!
 //! 1. **Une liste vide ne doit produire AUCUN prédicat.** Ni `IN ()` (erreur de
 //!    syntaxe sur les deux moteurs), ni un `1 = 1` de complaisance qui rendrait
@@ -28,6 +28,12 @@
 //!    [`Placeholders`] tient ce compteur une fois pour toutes, et l'appelant
 //!    n'a qu'une règle à respecter : **empiler les valeurs dans l'ordre exact
 //!    où les marqueurs ont été demandés**.
+//!
+//! 3. **Un `OU` de mille termes est refusé par SQLite et accepté par
+//!    PostgreSQL.** La chaîne plate `a OR b OR c …` a une profondeur d'arbre
+//!    égale à son nombre de termes, et SQLite plafonne à 1 000. Le même filtre
+//!    rendait donc la bonne liste sur PostgreSQL et une liste VIDE sur SQLite.
+//!    [`ou_equilibre`] ramène la profondeur à `log2(n)`.
 
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
@@ -112,6 +118,8 @@ impl Placeholders {
     /// (label, compositeur), où la valeur liée est déjà un motif `%…%`.
     /// Parenthésé : sans quoi le `OU` interne se ferait manger par le `ET`
     /// entre facettes. `None` si la liste est vide.
+    ///
+    /// Les termes sont assemblés par [`ou_equilibre`] — voir le piège n°3.
     pub fn or_like_ci(&mut self, expr: &str, n: usize) -> Option<String> {
         if n == 0 {
             return None;
@@ -119,12 +127,66 @@ impl Placeholders {
         if n == 1 {
             return Some(format!("LOWER({expr}) LIKE LOWER({})", self.take()));
         }
-        let parts = (0..n)
+        // ⚠️ Les marqueurs sont pris ICI, dans l'ordre 1..n, AVANT tout
+        // réassemblage : `ou_equilibre` ne fait que reparenthéser une suite
+        // qu'il conserve de gauche à droite. L'ordre de liaison attendu par
+        // l'appelant est donc exactement celui d'avant.
+        let parts: Vec<String> = (0..n)
             .map(|_| format!("LOWER({expr}) LIKE LOWER({})", self.take()))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        Some(format!("({parts})"))
+            .collect();
+        Some(ou_equilibre(parts))
     }
+}
+
+/// Assemble des prédicats en **OU** sous forme d'arbre ÉQUILIBRÉ —
+/// `((a OU b) OU (c OU d))` — au lieu de la chaîne plate `a OU b OU c OU d`.
+///
+/// # Le piège n°3 : SQLite compte la PROFONDEUR, pas le nombre de termes
+///
+/// `a OR b OR c OR …` s'analyse en un arbre binaire qui penche à gauche : sa
+/// profondeur vaut le nombre de termes. Au-delà de **1000**, SQLite refuse la
+/// requête à la préparation :
+///
+/// ```text
+/// prepare: Expression tree is too large (maximum depth 1000)
+/// ```
+///
+/// PostgreSQL, lui, avale la même chaîne sans broncher (mesuré jusqu'à 12 000
+/// termes). Une facette « contient » à mille valeurs rendait donc **deux
+/// résultats différents selon le moteur** : la bonne liste sur PostgreSQL, et
+/// sur SQLite une requête en échec — avalée par `ou_defaut_journalise` (#2861)
+/// et servie en `200 OK` avec `total = 0`. C'est-à-dire le pire cas que ce
+/// module combat : un filtre actif qui rend une liste VIDE en silence.
+///
+/// L'arbre équilibré ramène la profondeur à `log2(n)` : 6 549 termes — le
+/// maximum qu'une URL puisse porter, `http::Uri` refusant au-delà de 64 Kio —
+/// tiennent en profondeur 13. Mesuré sur SQLite : la chaîne plate échoue dès
+/// 1 000 termes, l'arbre équilibré passe jusqu'à 32 000, où c'est l'autre
+/// limite qui parle (`too many SQL variables`, 32 766). Le maximum atteignable
+/// par une requête HTTP étant de 13 098 marqueurs, la marge est de 2,5×.
+///
+/// **L'ordre est conservé.** Le réassemblage ne fait que déplacer des
+/// parenthèses : le i-ème terme reste le i-ème, donc les marqueurs `$1..$n`
+/// sortent toujours dans l'ordre et la pile de valeurs de l'appelant n'a pas à
+/// changer — la règle de liaison de SQLite (voir le piège n°2) est intacte.
+///
+/// Pour `n <= 2` le résultat est mot pour mot celui d'avant.
+fn ou_equilibre(mut parts: Vec<String>) -> String {
+    debug_assert!(!parts.is_empty(), "appelé sur une liste non vide seulement");
+    while parts.len() > 1 {
+        let mut etage = Vec::with_capacity(parts.len().div_ceil(2));
+        let mut it = parts.into_iter();
+        while let Some(gauche) = it.next() {
+            match it.next() {
+                Some(droite) => etage.push(format!("({gauche} OR {droite})")),
+                // Terme orphelin de l'étage : il remonte tel quel, ce qui
+                // garde l'arbre équilibré et l'ordre inchangé.
+                None => etage.push(gauche),
+            }
+        }
+        parts = etage;
+    }
+    parts.pop().unwrap_or_default()
 }
 
 /// Assemble en **OU** des prédicats déjà écrits, sans marqueur — pour les
@@ -191,6 +253,103 @@ pub fn favorite_condition(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// La règle de lecture du tag **Dynamic Range d'album** (#2144), écrite UNE
+/// fois pour les trois lieux qui s'en servent : la grille d'albums
+/// (`AlbumRepo::dr_album_join`), le rail de facettes (`facets::dr_facet`) et la
+/// liste filtrée (`TrackRepo::list_filtered`). Une facette qui compterait
+/// autrement que la liste qu'elle filtre serait pire qu'une facette absente.
+///
+/// Le DR vit dans le magasin ouvert `track_metadata`, sous la clé `dr_album`,
+/// en **TEXTE** déjà normalisé au scan (« DR12 », « DR 12 » → « 12 », commit
+/// 7cdc93ff). Trois gardes avant le `CAST`, parce qu'un magasin ouvert accepte
+/// n'importe quelle chaîne : non vide, trois caractères au plus, et **rien que
+/// des chiffres**. Sans le troisième, `CAST('abc' AS INTEGER)` vaut `0` en
+/// SQLite (donc « DR0 », une valeur de facette inventée) et **lève** en
+/// PostgreSQL (donc la requête entière échoue) — la 17ᵉ divergence PG/SQLite
+/// qu'on refuse d'ajouter.
+///
+/// L'alias de `track_metadata` est `tm`, celui de `tracks` est `tdr` : jamais
+/// `t`, qui est déjà pris par la requête ENGLOBANTE côté pistes.
+pub fn dr_tag_where(engine: Engine) -> String {
+    let only_digits = match engine {
+        // SQLite n'a pas de `~` ; GLOB est son motif sensible à la casse, et
+        // `[^0-9]` y est une classe de caractères niée.
+        Engine::Sqlite => "tm.value NOT GLOB '*[^0-9]*'",
+        Engine::Postgres => "tm.value ~ '^[0-9]+$'",
+    };
+    format!("tm.key = 'dr_album' AND tm.value <> '' AND LENGTH(tm.value) <= 3 AND {only_digits}")
+}
+
+/// Le DR d'un album à partir de ses pistes : le **maximum**.
+///
+/// Le tag est un tag d'ALBUM recopié sur chaque piste ; en théorie toutes les
+/// pistes portent la même valeur. Quand elles divergent (album ré-tagué à
+/// moitié), le maximum donne une valeur stable et reproductible plutôt qu'une
+/// valeur au hasard du plan d'exécution.
+pub const DR_ALBUM_VALUE: &str = "MAX(CAST(tm.value AS INTEGER))";
+
+/// La table dérivée « un album, son DR » — à joindre sur `album_id`.
+///
+/// Elle ne balaie que les lignes `dr_album` de `track_metadata`, c'est-à-dire
+/// une poignée sur une bibliothèque réelle : c'est ce qui la rend jointe-able
+/// sans coût, là où une sous-requête CORRÉLÉE par piste referait le travail
+/// des centaines de milliers de fois.
+pub fn dr_album_source(engine: Engine) -> String {
+    format!(
+        "SELECT tdr.album_id AS album_id, {DR_ALBUM_VALUE} AS dr \
+           FROM track_metadata tm JOIN tracks tdr ON tdr.id = tm.track_id \
+          WHERE {} GROUP BY tdr.album_id",
+        dr_tag_where(engine)
+    )
+}
+
+/// Prédicat « l'album de CETTE piste porte l'un des DR sélectionnés » — sur
+/// l'alias `t` des requêtes de pistes (#2144).
+///
+/// `having` est le `IN (…)` déjà construit par [`Placeholders::in_list`] sur
+/// [`DR_ALBUM_VALUE`] : l'appelant tient son compteur de marqueurs, ce module
+/// n'en fabrique aucun.
+///
+/// Sous-requête NON corrélée : le moteur l'évalue une fois. Un album sans tag
+/// n'en fait jamais partie — la facette est toujours RESTRICTIVE, comme la
+/// tranche `DrRange` de la grille d'albums.
+pub fn dr_album_in(engine: Engine, having: &str) -> String {
+    format!(
+        "t.album_id IN (SELECT tdr.album_id FROM track_metadata tm \
+           JOIN tracks tdr ON tdr.id = tm.track_id \
+          WHERE {} GROUP BY tdr.album_id HAVING {having})",
+        dr_tag_where(engine)
+    )
+}
+
+/// Prédicat « cet album n'est PAS masqué » (#1391), pour les requêtes
+/// d'ALBUMS — alias `a`, celui de `AlbumRepo::sql::select_album()`.
+///
+/// Vit ici, à côté de [`favorite_condition`], et pour la même raison : c'est
+/// le littéral qu'on recopierait une fois de trop. La liste d'albums, son
+/// compteur de pagination et la recherche doivent exclure EXACTEMENT le même
+/// ensemble, sinon la grille pagine faux.
+///
+/// `hidden_items` référence l'album par rowid, réconcilié après chaque scan
+/// (`hidden_repo::reconcile`) — même mécanique que `favorites`. `profile_id`
+/// n'est volontairement PAS lu : le masquage est global (aucune vue
+/// bibliothèque ne connaît le profil aujourd'hui, cf. `active_profile.rs`).
+pub fn hidden_albums_excluded() -> &'static str {
+    "NOT EXISTS (SELECT 1 FROM hidden_items h \
+     WHERE h.item_type = 'album' AND h.item_id = a.id)"
+}
+
+/// Prédicat « la piste n'appartient PAS à un album masqué » (#1391), pour les
+/// requêtes de PISTES — alias `t`, celui de `TrackRepo::sql::select_track()`.
+///
+/// Une piste SANS album (`t.album_id` NULL) reste visible : le `NOT EXISTS`
+/// est vrai quand la sous-requête ne trouve rien, NULL compris — pas besoin
+/// du détour `COALESCE` qu'imposerait un `LEFT JOIN albums`.
+pub fn hidden_tracks_excluded() -> &'static str {
+    "NOT EXISTS (SELECT 1 FROM hidden_items h \
+     WHERE h.item_type = 'album' AND h.item_id = t.album_id)"
+}
+
 /// Prédicat SQL d'une étiquette manquante. Liste FERMÉE : toute autre valeur
 /// rend `None` et ne filtre rien, plutôt que d'injecter quoi que ce soit.
 ///
@@ -239,6 +398,15 @@ pub struct TrackFilter {
     pub source_medias: Vec<String>,
     pub ratings: Vec<i64>,
     pub original_years: Vec<i64>,
+    /// Dynamic Range de l'ALBUM (#2144), une valeur entière par pastille.
+    ///
+    /// **C'est là que vivent les « tranches » du ticket.** Plusieurs valeurs
+    /// cochées se combinent en OU comme toute facette : cocher 12, 13 et 14
+    /// EST la tranche « DR12 à DR14 ». Le serveur ne grave donc aucune borne
+    /// nommée — l'issue n'en fixe aucune, les bornes de MinimServer citées en
+    /// modèle n'ont jamais été relevées, et un découpage inventé ici
+    /// survivrait dans le contrat HTTP à la mesure qui le contredirait.
+    pub dynamic_ranges: Vec<i64>,
     /// `track` et/ou `album` (profil 1).
     pub favorites: Vec<String>,
     pub playlists: Vec<String>,
@@ -284,6 +452,7 @@ impl TrackFilter {
             || !self.source_medias.is_empty()
             || !self.ratings.is_empty()
             || !self.original_years.is_empty()
+            || !self.dynamic_ranges.is_empty()
             // Vocabulaires FERMÉS : une valeur inconnue ne produit aucun
             // prédicat, donc elle ne doit pas non plus activer le chemin filtré.
             || self.favorites.iter().any(|k| favorite_condition(k).is_some())
@@ -347,6 +516,64 @@ mod tests {
             "(LOWER(t.label) LIKE LOWER(?) OR LOWER(t.label) LIKE LOWER(?))"
         );
         assert_eq!(sq.next_index(), 5);
+    }
+
+    /// Le piège n°3, à la source : la PROFONDEUR du `OU` reste logarithmique.
+    ///
+    /// C'est ce que SQLite compte, et ce qu'il plafonne à 1 000. On mesure ici
+    /// l'imbrication maximale de parenthèses du prédicat rendu ; le fait que la
+    /// requête s'exécute vraiment est prouvé un cran plus haut, par
+    /// `facettes_multivaleurs::une_facette_a_mille_valeurs_rend_encore_lunion`.
+    #[test]
+    fn le_ou_dune_facette_reste_peu_profond() {
+        fn profondeur(sql: &str) -> usize {
+            let (mut cour, mut max) = (0usize, 0usize);
+            for c in sql.chars() {
+                match c {
+                    '(' => {
+                        cour += 1;
+                        max = max.max(cour);
+                    }
+                    ')' => cour = cour.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            max
+        }
+        // 6 549 : le plus grand nombre de valeurs qu'une URL puisse porter pour
+        // une facette (`http::Uri` refuse au-delà de 64 Kio).
+        let mut ph = Placeholders::new(Engine::Sqlite);
+        let sql = ph.or_like_ci("t.genres", 6549).unwrap();
+        // `LOWER(…)` pose déjà 2 niveaux par terme ; l'arbre lui-même en ajoute
+        // ceil(log2(6549)) = 13. Une chaîne plate en aurait ajouté 6 549.
+        assert!(
+            profondeur(&sql) < 40,
+            "profondeur {} : le OU n'est plus équilibré, SQLite refusera au-delà de 1 000",
+            profondeur(&sql)
+        );
+        // Tous les marqueurs sont bien là, une fois chacun.
+        assert_eq!(sql.matches("LIKE").count(), 6549);
+        assert_eq!(ph.next_index(), 6550);
+
+        // Rétrocompatibilité stricte : à une et deux valeurs, mot pour mot le
+        // SQL d'avant.
+        let mut pg = Placeholders::new(Engine::Postgres);
+        assert_eq!(
+            pg.or_like_ci("t.label", 1).unwrap(),
+            "LOWER(t.label) LIKE LOWER($1)"
+        );
+        assert_eq!(
+            pg.or_like_ci("t.label", 2).unwrap(),
+            "(LOWER(t.label) LIKE LOWER($2) OR LOWER(t.label) LIKE LOWER($3))"
+        );
+        // Trois valeurs : l'arbre penche à gauche, l'ORDRE des marqueurs suit
+        // toujours 1, 2, 3 — c'est la seule chose que SQLite regarde.
+        assert_eq!(
+            pg.or_like_ci("t.label", 3).unwrap(),
+            "((LOWER(t.label) LIKE LOWER($4) OR LOWER(t.label) LIKE LOWER($5)) \
+             OR LOWER(t.label) LIKE LOWER($6))"
+        );
+        assert_eq!(pg.next_index(), 7);
     }
 
     /// Le piège n°1 : une facette sans valeur ne produit RIEN. Pas de `IN ()`
@@ -432,6 +659,93 @@ mod tests {
             assert!(untagged_condition(hostile).is_none(), "{hostile:?}");
             assert!(favorite_condition(hostile).is_none(), "{hostile:?}");
         }
+    }
+
+    /// #1391 — les deux prédicats de masquage sont des littéraux SANS
+    /// marqueur (ils n'avancent aucun compteur) et visent chacun l'alias de
+    /// SA famille de requêtes : `a` pour les albums, `t` pour les pistes. Une
+    /// piste sans album reste visible par construction (`NOT EXISTS` sur un
+    /// `album_id` NULL est vrai).
+    #[test]
+    fn les_predicats_de_masquage_visent_le_bon_alias() {
+        let a = hidden_albums_excluded();
+        assert!(a.contains("h.item_id = a.id"), "{a}");
+        let t = hidden_tracks_excluded();
+        assert!(t.contains("h.item_id = t.album_id"), "{t}");
+        for cond in [a, t] {
+            assert!(cond.starts_with("NOT EXISTS"), "{cond}");
+            assert!(cond.contains("h.item_type = 'album'"), "{cond}");
+            assert!(
+                !cond.contains('?') && !cond.contains('$'),
+                "littéral sans marqueur : {cond}"
+            );
+        }
+    }
+
+    /// Le piège n°2, éprouvé sur la facette la plus jeune (#2144).
+    ///
+    /// En SQLite tous les marqueurs s'écrivent `?` et seul l'ORDRE compte : un
+    /// `IN (…)` qui oublie d'avancer le compteur y passe inaperçu et se
+    /// trompe de valeurs en PostgreSQL. On l'éprouve donc en PostgreSQL, le
+    /// seul moteur où l'indice se VOIT.
+    #[test]
+    fn la_facette_dr_numerote_ses_marqueurs_en_postgresql() {
+        // Le compteur est déjà entamé, comme dans le vrai WHERE où trois
+        // facettes précèdent le DR.
+        let mut ph = Placeholders::resuming_at(Engine::Postgres, 4);
+        let having = ph.in_list(DR_ALBUM_VALUE, 3).expect("liste non vide");
+        let sql = dr_album_in(Engine::Postgres, &having);
+        assert!(
+            sql.contains("HAVING MAX(CAST(tm.value AS INTEGER)) IN ($4, $5, $6)"),
+            "les trois marqueurs se suivent : {sql}"
+        );
+        assert_eq!(
+            ph.next_index(),
+            7,
+            "trois marqueurs consommés, pas un de plus"
+        );
+        // Chaque moteur garde son dialecte de « que des chiffres ».
+        assert!(sql.contains("tm.value ~ '^[0-9]+$'"), "{sql}");
+        let sqlite = dr_album_in(Engine::Sqlite, "1 = 1");
+        assert!(sqlite.contains("NOT GLOB"), "{sqlite}");
+        assert!(!sqlite.contains('~'), "{sqlite}");
+        // L'alias interne n'est JAMAIS `t` : c'est celui de la requête
+        // englobante, et le masquer rendrait le prédicat toujours vrai.
+        assert!(!sql.contains("tracks t "), "{sql}");
+        assert!(sql.contains("tracks tdr"), "{sql}");
+    }
+
+    /// La règle de lecture du tag n'est écrite QU'UNE fois : la table dérivée
+    /// de la grille d'albums et le prédicat des pistes la partagent.
+    #[test]
+    fn la_grille_et_le_rail_lisent_le_dr_de_la_meme_facon() {
+        for engine in [Engine::Sqlite, Engine::Postgres] {
+            let regle = dr_tag_where(engine);
+            assert!(dr_album_source(engine).contains(&regle));
+            assert!(dr_album_in(engine, "1 = 1").contains(&regle));
+            // Les trois gardes AVANT le CAST, sur les deux moteurs.
+            assert!(regle.contains("tm.key = 'dr_album'"));
+            assert!(regle.contains("tm.value <> ''"));
+            assert!(regle.contains("LENGTH(tm.value) <= 3"));
+        }
+    }
+
+    /// Une facette DR sans valeur ne produit AUCUN prédicat et n'active pas le
+    /// chemin filtré — le piège n°1, appliqué au dernier arrivé.
+    #[test]
+    fn une_facette_dr_vide_nactive_rien() {
+        let mut ph = Placeholders::new(Engine::Sqlite);
+        assert!(ph.in_list(DR_ALBUM_VALUE, 0).is_none());
+        let vide = TrackFilter {
+            dynamic_ranges: normalize_ints(&[]),
+            ..Default::default()
+        };
+        assert!(!vide.is_active());
+        let actif = TrackFilter {
+            dynamic_ranges: vec![14],
+            ..Default::default()
+        };
+        assert!(actif.is_active());
     }
 
     #[test]

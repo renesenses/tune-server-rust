@@ -4,11 +4,15 @@ pub mod alac_encoder;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
+pub mod autoeq;
 pub mod channels;
 pub mod convolver;
 pub mod crossfeed;
 pub mod dash_growth;
 pub mod decode;
+/// Balise d'avancement du décodage (#3140) — le débit réel de l'hôte, mesuré
+/// sur le décodage en cours, sans le coûter.
+pub mod decode_progress;
 pub mod dff;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
@@ -21,12 +25,17 @@ pub mod encoder;
 pub mod eq;
 pub mod eq_presets;
 pub mod faststart;
+/// Mémoire du volume d'avant l'armement du mode bit-perfect (#2395).
+pub mod fixed_volume;
 pub mod formats;
 pub mod http_range;
 pub mod iso_sacd;
 pub mod levels;
 pub mod m4a;
 pub mod mixer;
+/// Le repli mono dit quand il n'agit pas (#3254) — la disponibilité par zone du
+/// réglage `zone_{id}_mono_downmix` (#2362).
+pub mod mono_downmix;
 pub mod opus_ogg;
 pub mod pipeline;
 pub mod replaygain;
@@ -34,6 +43,8 @@ pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
+/// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
+pub mod soft_mute;
 pub mod staged_growth;
 pub mod support;
 pub mod tap;
@@ -41,6 +52,8 @@ pub mod tap;
 #[cfg(feature = "audio-embedding")]
 pub mod text_embedding;
 pub mod thermal;
+/// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).
+pub mod volume_scale;
 pub mod wav;
 pub mod wavpack;
 

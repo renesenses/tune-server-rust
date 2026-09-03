@@ -1,4 +1,10 @@
 mod admin;
+// Même raison, mot pour mot, que `pub mod scan` plus bas : le corps de
+// `GET /system/peers` doit être atteignable depuis un test d'intégration, qui
+// est une caisse EXTERNE. La fusion « registre manuel ∪ découverte mDNS » du
+// #2746 ne se mesure pas autrement : `MdnsScanner` n'a aucun point d'injection,
+// et un test qui recopierait la fusion la répliquerait au lieu de la garder.
+pub use admin::peers_payload;
 mod backup;
 mod config;
 mod config_backup;
@@ -6,15 +12,30 @@ mod convert;
 mod database;
 mod diagnostics;
 mod enrich;
+/// Périmètre de l'explorateur de dossiers (#1275).
+pub(crate) mod explorateur;
 // Shared enrichment quota/premium gate, reused by /library/enrich-all so the
 // full-library MusicBrainz path isn't a free bypass of the same operation.
 pub(crate) use enrich::gate_enrichment;
+// Même partage, même raison, pour la PORTÉE par répertoire (#1660) : les deux
+// routes d'enrichissement doivent valider un `path` à l'identique — refus des
+// composantes `..`, appartenance à une racine musicale, refus franc plutôt que
+// repli sur la bibliothèque entière. Une seconde validation écrite à côté
+// finirait par diverger, et un repli silencieux enrichirait justement ce que
+// l'utilisateur voulait épargner.
+pub(crate) use enrich::resoudre_portee;
 mod import;
 mod playlist_hub;
 mod plugins;
 mod profile;
 mod remote;
-pub(crate) mod scan;
+// `pub` et non `pub(crate)` : la décision « insertion ou mise à jour »
+// (`verdict_ecriture`) doit être atteignable depuis un test d'intégration, qui
+// est une caisse EXTERNE. Sans cette couture, le garde de #2939 aurait dû
+// recopier la règle au lieu de l'appeler — un test qui réplique le code ne le
+// garde pas. Les items du module restent `pub(crate)` sauf ceux exposés
+// expressément.
+pub mod scan;
 mod tags;
 pub(crate) mod update;
 mod youtube;
@@ -24,6 +45,12 @@ mod youtube;
 /// `/system/config` (l'étiquette de l'interface), `/system/peer-info`
 /// (ce que les autres serveurs lisent) et les zones unifiées multi-serveur.
 pub(crate) use config::resolve_server_name;
+
+/// Adresses complètes — schéma ET port — auxquelles ce serveur répond depuis
+/// un autre appareil. Réexporté parce que le démarrage les imprime aussi
+/// (#1272) : elles ne doivent exister qu'en UN endroit, sans quoi la console
+/// et l'interface finiraient par annoncer deux adresses différentes.
+pub(crate) use config::server_urls;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -98,6 +125,12 @@ pub fn router() -> Router<AppState> {
         .route("/backups/encrypt", post(backup::create_encrypted_backup))
         .route("/database/export", get(database::export_database))
         .route("/update/check", get(update::update_check))
+        // Stable ou bêta : QUELLES versions `/update/check` a le droit de
+        // proposer (#2266). Défaut `auto` = comportement historique.
+        .route(
+            "/update/channel",
+            get(update::update_channel_get).put(update::update_channel_set),
+        )
         .route("/changelog", get(update::changelog))
         .route(
             "/peers",
@@ -187,7 +220,15 @@ pub fn router() -> Router<AppState> {
         .route("/enrich-metadata", post(enrich::enrich_extended_metadata))
         .route("/enrichment/status", get(enrich::enrichment_status))
         .route("/enrichment/run", post(enrich::enrichment_run))
-        .route("/database/import", post(database::database_import))
+        // La limite globale (50 Mo) coupait l'import bien avant le handler :
+        // l'export d'une bibliothèque ordinaire pèse 256 Mo. Cf #2849 et
+        // `database::IMPORT_DB_BODY_LIMIT`.
+        .route(
+            "/database/import",
+            post(database::database_import).layer(axum::extract::DefaultBodyLimit::max(
+                database::IMPORT_DB_BODY_LIMIT,
+            )),
+        )
         .route("/plugins", get(plugins::list_system_plugins))
         .route("/supported-tags", get(tags::supported_tags))
         .route(
@@ -229,8 +270,6 @@ pub fn router() -> Router<AppState> {
             "/config-backup/cloud-status",
             get(config_backup::cloud_status),
         )
-        // Concert alerts — upcoming concerts for library artists
-        .route("/concerts", get(concerts_handler))
         // Weekly digest — new releases from library artists
         .route("/new-releases", get(new_releases_handler))
         // AI Recommendations — discover new music based on library
@@ -241,28 +280,11 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-/// GET /system/concerts — upcoming concerts for artists in the local library.
-async fn concerts_handler(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> axum::Json<serde_json::Value> {
-    let instance_id = SettingsRepo::with_backend(state.backend.clone())
-        .get("instance_id")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-
-    match tune_core::cloud::concert_alerts::get_upcoming_concerts(&state.http_client, &instance_id)
-        .await
-    {
-        Ok(concerts) => axum::Json(serde_json::json!({"concerts": concerts})),
-        Err(e) => axum::Json(serde_json::json!({"concerts": [], "error": e})),
-    }
-}
-
 /// GET /system/new-releases — new album releases from library artists (digest).
 async fn new_releases_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> axum::Json<serde_json::Value> {
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     let instance_id = SettingsRepo::with_backend(state.backend.clone())
         .get("instance_id")
         .ok()
@@ -270,15 +292,25 @@ async fn new_releases_handler(
         .unwrap_or_default();
 
     match tune_core::cloud::digest::get_new_releases(&state.http_client, &instance_id).await {
-        Ok(releases) => axum::Json(serde_json::json!({"releases": releases})),
-        Err(e) => axum::Json(serde_json::json!({"releases": [], "error": e})),
+        Ok(releases) => {
+            axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+                "releases": releases
+            })))
+        }
+        Err(e) => crate::routes::cloud_error::reponse(
+            &e,
+            &headers,
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "releases": [] }),
+        ),
     }
 }
 
 /// GET /system/recommendations — get cached recommendations from cloud.
 async fn recommendations_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> axum::Json<serde_json::Value> {
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     let instance_id = SettingsRepo::with_backend(state.backend.clone())
         .get("instance_id")
         .ok()
@@ -288,8 +320,15 @@ async fn recommendations_handler(
     match tune_core::cloud::recommendations::get_recommendations(&state.http_client, &instance_id)
         .await
     {
-        Ok(recs) => axum::Json(serde_json::json!({"recommendations": recs})),
-        Err(e) => axum::Json(serde_json::json!({"recommendations": [], "error": e})),
+        Ok(recs) => axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+            "recommendations": recs
+        }))),
+        Err(e) => crate::routes::cloud_error::reponse(
+            &e,
+            &headers,
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "recommendations": [] }),
+        ),
     }
 }
 
@@ -315,6 +354,70 @@ async fn recommendations_generate_handler(
             "count": recs.len(),
         })),
         Err(e) => axum::Json(serde_json::json!({"recommendations": [], "error": e})),
+    }
+}
+
+/// La version de schéma RÉELLEMENT appliquée par la base active, quel que
+/// soit le moteur. `None` quand elle n'a pas pu être lue.
+///
+/// **`None` et pas `0`, et c'est tout le sujet de #3182.** Les trois rapports
+/// — `/system/diagnostics`, `/system/bug-report` et `/system/database/status`
+/// — calculaient cette valeur par `if engine == Sqlite { … } else { 0 }`.
+/// Sur PostgreSQL ils annonçaient donc « Migration version: 0 », qui ne se lit
+/// pas « inconnue » mais « base jamais migrée » : c'est ce que le rapport de
+/// jfpaquet disait de sa base de 77 291 pistes, et cette ligne a failli faire
+/// écarter #3181 — une issue qui n'existe QUE parce que le moteur est
+/// PostgreSQL.
+///
+/// Chaque moteur tient sa propre table :
+///
+/// - SQLite : `schema_migrations`, lue par `migrations::current_version` ;
+/// - PostgreSQL : `schema_version`, que `migrations::run_pg_migrations`
+///   alimente à chaque script appliqué.
+///
+/// Un `MAX(version)` NUL (table présente mais vide) reste `None` : il vaut
+/// « rien d'appliqué, ou rien de lisible », et le rendre en `0` remplacerait
+/// un mensonge par l'autre. La lecture passe par `state.backend`, donc
+/// par le pool réellement ouvert — pas par `state.db`, qui est `None` dès que
+/// le serveur ne tourne pas sur SQLite.
+pub(crate) fn version_de_schema(state: &AppState) -> Option<i32> {
+    match state.backend.engine() {
+        tune_core::db::engine::Engine::Sqlite => state
+            .db
+            .as_ref()
+            .and_then(|db| tune_core::db::migrations::current_version(db).ok()),
+        tune_core::db::engine::Engine::Postgres => state
+            .backend
+            .query_one("SELECT MAX(version) FROM schema_version", &[])
+            .ok()
+            .flatten()
+            .and_then(|ligne| ligne.first().and_then(|v| v.as_i64()))
+            .and_then(|v| i32::try_from(v).ok()),
+    }
+}
+
+/// La version de schéma que le binaire SAIT appliquer, pour le moteur actif.
+///
+/// Pendant du dessus, et même règle : `None` plutôt qu'un chiffre emprunté à
+/// l'autre moteur. Les deux listes de migrations sont distinctes et ne se
+/// suivent pas — comparer la version PostgreSQL d'une base au dernier numéro
+/// SQLite du binaire, ce que faisait `/system/database/status`, produisait un
+/// `up_to_date: false` permanent sur une base parfaitement à jour.
+pub(crate) fn version_de_schema_cible(engine: tune_core::db::engine::Engine) -> Option<i32> {
+    match engine {
+        tune_core::db::engine::Engine::Sqlite => Some(tune_core::db::migrations::latest_version()),
+        // Sans la feature `postgres` le binaire n'embarque aucun script PG :
+        // il n'a alors rien à dire sur la cible, et le dit.
+        tune_core::db::engine::Engine::Postgres => {
+            #[cfg(feature = "postgres")]
+            {
+                Some(tune_core::db::migrations::pg_latest_version())
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                None
+            }
+        }
     }
 }
 

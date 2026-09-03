@@ -84,6 +84,51 @@ async fn pg_artists_round_trip() {
     assert_eq!(by_name.and_then(|a| a.id), Some(id));
 }
 
+/// #2258 — le compte des artistes hors du fonds communautaire, sur le VRAI
+/// moteur PostgreSQL.
+///
+/// Deux `COUNT(*)` sans paramètre lié : rien à numéroter, donc rien à
+/// désaligner entre les `?` de SQLite et les `$n` de PostgreSQL. Ce qui reste
+/// à prouver ici, c'est que le `COUNT(*)` revient bien en `i64` à travers le
+/// pont `SqlValue` — sur PostgreSQL il arrive en `bigint`, et un `as_i64` qui
+/// retomberait sur son `unwrap_or(0)` rendrait deux zéros parfaitement
+/// silencieux. C'est exactement le genre de vert contre rien que ce test
+/// interdit : les nombres attendus sont NON NULS.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_hors_fonds_communautaire_compte_les_artistes_sans_mbid() {
+    use crate::db::artist_repo::ArtistRepo;
+    use crate::db::models::Artist;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let repo = ArtistRepo::with_backend(db);
+
+    // Identifié + bio : téléversé, donc PAS compté.
+    let mut identifie = Artist::new("Pink Floyd".into());
+    identifie.musicbrainz_id = Some("83d91898-7763-47d7-b03b-b92132375c47".into());
+    identifie.bio = Some("Groupe de rock anglais.".into());
+    repo.create(&identifie).unwrap();
+
+    // Bio SANS MBID : la passe d'envoi ne la verra jamais.
+    let mut bio_orpheline = Artist::new("Alan Stivell".into());
+    bio_orpheline.bio = Some("Harpiste et chanteur breton.".into());
+    repo.create(&bio_orpheline).unwrap();
+
+    // Ni bio ni MBID : même pas candidats au téléchargement.
+    for nom in ["Bagad Kemper", "Sonerien Du"] {
+        repo.create(&Artist::new(nom.into())).unwrap();
+    }
+
+    let hors = repo.hors_fonds_communautaire().unwrap();
+    assert_eq!(hors.bios_non_partagees, 1);
+    assert_eq!(hors.artistes_non_servis, 2);
+
+    // Témoin : l'artiste identifié reste téléversé, exactement comme avant.
+    let televerses = repo.artists_with_bio_and_mbid().unwrap();
+    assert_eq!(televerses.len(), 1);
+    assert_eq!(televerses[0].0, "Pink Floyd");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_albums_round_trip() {
     use crate::db::album_repo::AlbumRepo;
@@ -198,6 +243,238 @@ async fn pg_tracks_round_trip() {
     assert!(paths.contains("/music/time.flac"));
 }
 
+/// #2168 — **la même facette profonde doit rendre le même ensemble sur les
+/// DEUX moteurs.**
+///
+/// Une facette « contient » (genre, label, compositeur) assemble un `OU` de
+/// `LIKE`. En chaîne plate, sa profondeur d'arbre vaut son nombre de termes :
+/// SQLite refuse au-delà de 1 000 (`Expression tree is too large`) tandis que
+/// PostgreSQL accepte la même chaîne. Le filtre rendait donc la bonne liste ici
+/// et une liste VIDE là-bas — la divergence entre moteurs que
+/// `facet_filter::ou_equilibre` supprime.
+///
+/// Le jumeau SQLite de cette épreuve est
+/// `facettes_multivaleurs::une_facette_a_mille_valeurs_rend_encore_lunion`
+/// (crate `tune-server`). Les deux mesurent le MÊME fait — l'ensemble rendu —
+/// pour qu'une correction d'un seul côté se voie.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2168_facette_profonde_rend_le_meme_ensemble_que_sqlite() {
+    use crate::db::facet_filter::TrackFilter;
+    use crate::db::models::Track;
+    use crate::db::track_repo::TrackRepo;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let repo = TrackRepo::with_backend(db);
+
+    // 3 Jazz, 2 Rock, 2 Blues.
+    for (titre, genre) in [
+        ("J1", "Jazz"),
+        ("J2", "Jazz"),
+        ("J3", "Jazz"),
+        ("R1", "Rock"),
+        ("R2", "Rock"),
+        ("B1", "Blues"),
+        ("B2", "Blues"),
+    ] {
+        let mut t = Track::new(titre.into());
+        t.file_path = Some(format!("/music/{titre}.flac"));
+        t.duration_ms = 1000;
+        t.format = Some("flac".into());
+        t.genre = Some(genre.into());
+        repo.create(&t).unwrap();
+    }
+
+    let titres = |f: &TrackFilter| -> Vec<String> {
+        let (items, total) = repo.list_filtered(f, 100, 0).unwrap();
+        assert_eq!(items.len() as i64, total, "la liste doit tenir son total");
+        let mut v: Vec<String> = items.into_iter().map(|t| t.title).collect();
+        v.sort();
+        v
+    };
+
+    // Le témoin : deux valeurs, l'union, sans doublon.
+    let deux = TrackFilter {
+        genres: vec!["Jazz".into(), "Rock".into()],
+        ..Default::default()
+    };
+    assert_eq!(titres(&deux), vec!["J1", "J2", "J3", "R1", "R2"]);
+
+    // La même sélection noyée dans 1 500 valeurs qui ne désignent rien : sur
+    // SQLite, la chaîne plate échouait ici et rendait zéro piste.
+    let mut profond = deux.clone();
+    profond.genres.extend((0..1500).map(|i| format!("z{i}")));
+    assert_eq!(
+        titres(&profond),
+        titres(&deux),
+        "PostgreSQL doit rendre exactement le même ensemble que la sélection à deux valeurs"
+    );
+
+    // Témoin ET : (Jazz OU Rock) ET un format absent ne rend rien — le OU de la
+    // facette ne doit pas déborder sur le ET.
+    let mut croise = profond.clone();
+    croise.formats = vec!["aiff".into()];
+    assert!(titres(&croise).is_empty());
+
+    // Témoin ZÉRO : une facette vide ne filtre rien.
+    let rien = TrackFilter::default();
+    assert!(!rien.is_active());
+}
+
+/// #3101 — la portée de répertoire sur le SECOND moteur : sélectionner un
+/// dossier rend ce dossier et rien d'autre, jokers compris.
+///
+/// Le jumeau SQLite est `portee_repertoire_jokers` (crate `tune-server`), qui
+/// mesure la même chose à travers la route `GET /library/tracks?folder=`. Cette
+/// route-là vit dans `tune-server`, que la matrice `Test (PostgreSQL)` ne
+/// compile pas : la mesure sur PostgreSQL porte donc sur la fonction que la
+/// route appelle, `TrackRepo::list_filtered`, et sur le même fait de base —
+/// **l'ensemble des fichiers rendus**.
+///
+/// Sans échappement, `%` et `_` restaient les jokers de `LIKE` : `100% Live`
+/// ramenait `1000/Best Of Live` (un autre sous-arbre, le `%` traversant les
+/// séparateurs) et `Disc_1` ramenait `DiscX1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3101_les_jokers_du_nom_de_dossier_ne_filtrent_pas_plus_large() {
+    use crate::db::facet_filter::TrackFilter;
+    use crate::db::models::Track;
+    use crate::db::track_repo::TrackRepo;
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let repo = TrackRepo::with_backend(db);
+
+    // Mêmes effectifs que l'épreuve SQLite : 2 + 1 + 3 + 4 + 5 = 15, toutes
+    // sommes deux à deux distinctes pour qu'aucun compte juste ne le soit par
+    // accident.
+    let mut n = 0;
+    for (dossier, combien) in [
+        ("/musique/100% Live", 2),
+        ("/musique/100% Live/Bonus", 1),
+        ("/musique/1000/Best Of Live", 3),
+        ("/musique/Disc_1", 4),
+        ("/musique/DiscX1", 5),
+    ] {
+        for _ in 0..combien {
+            n += 1;
+            let mut t = Track::new(format!("P{n}"));
+            t.file_path = Some(format!("{dossier}/p{n}.flac"));
+            t.duration_ms = 1000;
+            t.format = Some("flac".into());
+            repo.create(&t).unwrap();
+        }
+    }
+    assert_eq!(n, 15);
+
+    let sous = |dossier: &str| -> Vec<String> {
+        let f = TrackFilter {
+            folder: Some(dossier.to_string()),
+            ..Default::default()
+        };
+        assert!(f.is_active(), "un dossier doit activer le chemin filtré");
+        let (items, total) = repo.list_filtered(&f, 500, 0).unwrap();
+        assert_eq!(
+            items.len() as i64,
+            total,
+            "le compteur partage le prédicat de la liste"
+        );
+        let mut v: Vec<String> = items.into_iter().filter_map(|t| t.file_path).collect();
+        v.sort();
+        v
+    };
+
+    // LE FAIT : `%` dans le nom ne fait pas déborder la portée sur un voisin.
+    let cent_pour_cent = sous("/musique/100% Live");
+    assert!(
+        cent_pour_cent
+            .iter()
+            .all(|f| f.starts_with("/musique/100% Live/")),
+        "des fichiers hors du répertoire sélectionné : {cent_pour_cent:?}"
+    );
+    assert_eq!(cent_pour_cent.len(), 3, "{cent_pour_cent:?}");
+
+    // Et `_`, qui ne vaut qu'un caractère : `Disc_1` n'est pas `DiscX1`.
+    let disc = sous("/musique/Disc_1");
+    assert!(
+        disc.iter().all(|f| f.starts_with("/musique/Disc_1/")),
+        "des fichiers hors du répertoire sélectionné : {disc:?}"
+    );
+    assert_eq!(disc.len(), 4, "{disc:?}");
+
+    // Témoin imbriqué : le sous-dossier rend son contenu, pas celui du parent.
+    let bonus = sous("/musique/100% Live/Bonus");
+    assert_eq!(bonus, vec!["/musique/100% Live/Bonus/p3.flac".to_string()]);
+
+    // Témoin vide : zéro proprement, pas une erreur.
+    assert!(sous("/musique/Vide").is_empty());
+
+    // Témoin sans portée : toute la bibliothèque, toujours.
+    let rien = TrackFilter::default();
+    assert!(!rien.is_active());
+    let (tout, total) = repo.list_filtered(&rien, 500, 0).unwrap();
+    assert_eq!(tout.len(), 15);
+    assert_eq!(total, 15);
+}
+
+/// #1752 — l'antislash de Windows reste LITTÉRAL sur PostgreSQL, maintenant que
+/// la clause n'est plus `ESCAPE ''` mais `ESCAPE '\'`.
+///
+/// C'était le défaut d'origine : Postgres traite l'antislash comme son
+/// caractère d'échappement par défaut, donc un motif brut `G:\Blues 2\%` se
+/// dégradait en la chaîne littérale `G:Blues 2%` et tous les répertoires
+/// annonçaient « 0 piste » (JF, Windows + Postgres). L'ancienne réponse coupait
+/// l'échappement ; la nouvelle DOUBLE l'antislash dans la valeur.
+///
+/// L'épreuve construit le motif à la main parce que `folder_like_pattern` pose
+/// le séparateur de l'HÔTE : sur le Linux qui fait tourner cette suite, elle ne
+/// produirait jamais d'antislash. Ce qui est écrit ici est, caractère pour
+/// caractère, ce qu'elle produit sur un hôte Windows.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_1752_l_antislash_de_windows_reste_litteral() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::models::Track;
+    use crate::db::track_repo::{TrackRepo, echapper_jokers_like, like_escape_clause};
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let repo = TrackRepo::with_backend(db.clone());
+
+    for (n, chemin) in [
+        r"G:\Blues 2\aa.flac",
+        r"G:\Blues 2\Sous\bb.flac",
+        r"G:\Jazz\cc.flac",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut t = Track::new(format!("W{n}"));
+        t.file_path = Some((*chemin).to_string());
+        t.duration_ms = 1000;
+        repo.create(&t).unwrap();
+    }
+
+    // Ce que `folder_like_pattern` produit sur un hôte Windows pour `G:\Blues 2`.
+    let motif = format!(
+        "{}{}%",
+        echapper_jokers_like(r"G:\Blues 2"),
+        echapper_jokers_like("\\")
+    );
+    assert_eq!(motif, r"G:\\Blues 2\\%", "antislashs doublés, `%` final nu");
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM tracks WHERE file_path LIKE $1{}",
+        like_escape_clause()
+    );
+    let compte = db
+        .query_one(&sql, &[&motif as &dyn ToSqlValue])
+        .unwrap()
+        .and_then(|c| c.first().and_then(|v| v.as_i64()))
+        .unwrap_or(-1);
+    assert_eq!(
+        compte, 2,
+        "le sous-arbre `G:\\Blues 2` porte deux pistes ; 0 = l'antislash a été \
+         consommé comme échappement (#1752), 3 = le motif ne filtre plus rien"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_zones_round_trip() {
     use crate::db::zone_repo::ZoneRepo;
@@ -211,10 +488,27 @@ async fn pg_zones_round_trip() {
         .unwrap();
     let z = repo.get(id).unwrap().unwrap();
     assert_eq!(z.name, "Living Room");
-    assert_eq!(z.volume, 50);
+    assert_eq!(z.volume, 50.0);
 
-    repo.update_volume(id, 75).unwrap();
-    assert_eq!(repo.get(id).unwrap().unwrap().volume, 75);
+    repo.update_volume(id, 75.0).unwrap();
+    assert_eq!(repo.get(id).unwrap().unwrap().volume, 75.0);
+    // #2886 — la colonne est a virgule des DEUX cotes. Sur PG c'est la
+    // migration 048 qui le garantit : sans elle, ecrire un f64 dans une
+    // colonne `integer` echoue purement et simplement.
+    repo.update_volume(id, 0.398_107_170_553_497_2 * 100.0)
+        .unwrap();
+    let relu = repo.get(id).unwrap().unwrap().volume / 100.0;
+    assert!(
+        (relu - 0.398_107_170_553_497_2).abs() < 1e-12,
+        "-8 dB persiste puis relu a {relu}"
+    );
+    repo.update_volume(id, 10f64.powf(-48.0 / 20.0) * 100.0)
+        .unwrap();
+    assert!(
+        repo.get(id).unwrap().unwrap().volume > 0.0,
+        "-48 dB : la zone se rallumerait MUETTE sur PostgreSQL"
+    );
+    repo.update_volume(id, 75.0).unwrap();
 
     // The WAL fallback `query_many_strong` doesn't change behavior on
     // PG (same pool either way) — confirm list() works.
@@ -274,6 +568,7 @@ async fn pg_history_round_trip() {
         profile_id: None,
         context_type: None,
         context_id: None,
+        context_position: None,
     };
     repo.record(&rec).unwrap();
     repo.record(&rec).unwrap();
@@ -348,7 +643,8 @@ async fn pg_1220_numeric_columns_have_numeric_types() {
         // 011 (listen_history)
         ("listen_history", "duration_ms", &["bigint"]),
         // 013 (the rest)
-        ("zones", "volume", &["integer"]),
+        // #2886 — a virgule : l'entier coupait le son sous -46,02 dB.
+        ("zones", "volume", &["double precision"]),
         ("zones", "last_position_ms", &["bigint"]),
         ("queue_items", "position", &["integer"]),
         ("track_source_links", "confidence", &["double precision"]),
@@ -557,4 +853,649 @@ async fn pg_1706_ensure_schema_heals_queue_items_numbering() {
         .execute(db.pool())
         .await
         .ok();
+}
+
+/// #2860 — « Continuer l'écoute » et « Ajoutés récemment » étaient vides sur
+/// TOUTE installation PostgreSQL, et sans un seul message.
+///
+/// Les trois défauts, mesurés sur une base réelle. Chacun porte ici sa
+/// contre-épreuve : on rejoue la forme d'AVANT et on exige l'erreur exacte,
+/// pour qu'un retour en arrière ne puisse pas passer inaperçu.
+///
+/// 1. `listen_history.album_id` TEXT contre `albums.id` BIGINT —
+///    `operator does not exist: text = bigint`. La migration 012 convertit
+///    déjà cette colonne, mais elle ne l'a JAMAIS vue : `album_id` n'arrive
+///    par aucun script numéroté, seulement par `ENSURE_COLUMNS`, rejoué APRÈS.
+///    Réparé par la 047.
+/// 2. `GROUP BY a.id` en sélectionnant `ar.name` —
+///    `column "ar.name" must appear in the GROUP BY clause…`.
+/// 3. `HAVING listened_tracks < …` — un alias de la liste SELECT n'existe pas
+///    quand le HAVING est évalué : `column "listened_tracks" does not exist`.
+///
+/// Les trois erreurs étaient avalées par le `unwrap_or_default()` de
+/// `tune-server/src/routes/home.rs` : la section ne s'expliquait pas, elle
+/// disparaissait.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2860_continuer_lecoute_et_ajouts_recents() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::engine::Engine;
+    use crate::db::home_queries::{continue_listening_albums_deduits, recently_added};
+    use crate::db::migrations::PG_MIGRATIONS;
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    // Le pool brut EN PLUS du backend : `execute_batch` decoupe sur les
+    // point-virgules, ce qui hacherait le bloc `DO $migration$ … $migration$`
+    // de la 047. Les scripts numerotes passent par `raw_sql`, comme le fait
+    // deja le test #1706.
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool.clone()));
+    reset_schema(&db);
+
+    let type_album_id = |db: &Arc<dyn DbBackend>| -> String {
+        db.query_many(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_name = 'listen_history' AND column_name = 'album_id'",
+            &[],
+        )
+        .unwrap()
+        .first()
+        .and_then(|r| r.first().and_then(|v| v.as_string()))
+        .unwrap_or_else(|| "<absente>".into())
+    };
+
+    // ── Reconstituer la dérive : la colonne telle qu'ENSURE_COLUMNS la posait ──
+    db.execute(
+        "ALTER TABLE listen_history DROP COLUMN IF EXISTS album_id",
+        &[],
+    )
+    .unwrap();
+    db.execute("ALTER TABLE listen_history ADD COLUMN album_id TEXT", &[])
+        .unwrap();
+    assert_eq!(type_album_id(&db), "text", "la dérive n'a pas été reposée");
+
+    let limite: i64 = 10;
+    let sql_cl = continue_listening_albums_deduits(Engine::Postgres, "");
+    let sql_ra = recently_added(Engine::Postgres);
+
+    // ── CONTRE-ÉPREUVE 1 — sans la migration 047, la requête ne compile même pas.
+    let err = db
+        .query_many(&sql_cl, &[&limite as &dyn ToSqlValue])
+        .expect_err("`text = bigint` doit être refusé par PostgreSQL");
+    assert!(
+        err.contains("operator does not exist") && err.contains("text") && err.contains("bigint"),
+        "erreur attendue « operator does not exist: text = bigint », obtenue : {err}"
+    );
+
+    // ── La migration 047, rejouée telle quelle (elle est idempotente) ──
+    let (_, _, sql_047) = PG_MIGRATIONS
+        .iter()
+        .find(|(v, _, _)| *v == 47)
+        .expect("la migration 047 doit être inscrite dans PG_MIGRATIONS");
+    sqlx::raw_sql(*sql_047)
+        .execute(&pool)
+        .await
+        .expect("la migration 047 doit être rejouable");
+    assert_eq!(
+        type_album_id(&db),
+        "bigint",
+        "la 047 n'a pas converti listen_history.album_id"
+    );
+
+    // ── Les données : les deux « Live » de Tades, dont un seul est écouté ──
+    let id_de = |sql: &str| -> i64 {
+        db.query_many(sql, &[])
+            .unwrap()
+            .first()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap()
+    };
+    let police = id_de("INSERT INTO artists (name) VALUES ('The Police') RETURNING id");
+    let pulp = id_de("INSERT INTO artists (name) VALUES ('Pulp') RETURNING id");
+    let live_police = id_de(&format!(
+        "INSERT INTO albums (title, artist_id, track_count) \
+         VALUES ('Live', {police}, 5) RETURNING id"
+    ));
+    let live_pulp = id_de(&format!(
+        "INSERT INTO albums (title, artist_id, track_count) \
+         VALUES ('Live', {pulp}, 5) RETURNING id"
+    ));
+    for piste in ["Piste 1", "Piste 2"] {
+        db.execute(
+            &format!(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, listened_at) \
+                 VALUES ('{piste}', 'Pulp', 'Live', {live_pulp}, '2026-08-28T22:45:00Z')"
+            ),
+            &[],
+        )
+        .unwrap();
+    }
+
+    // ── « Continuer l'écoute » rend le disque de Pulp, 2 pistes sur 5 ──
+    let lignes = db
+        .query_many(&sql_cl, &[&limite as &dyn ToSqlValue])
+        .expect("la requête corrigée doit s'exécuter sur PostgreSQL");
+    assert_eq!(
+        lignes.len(),
+        1,
+        "un seul album écouté et non fini était attendu, obtenu : {lignes:?}"
+    );
+    let l = &lignes[0];
+    assert_eq!(
+        l[0].as_i64(),
+        Some(live_pulp),
+        "ce n'est pas le Live de Pulp"
+    );
+    assert_ne!(
+        l[0].as_i64(),
+        Some(live_police),
+        "l'homonyme de Police est remonté (#2731)"
+    );
+    assert_eq!(l[1].as_string().as_deref(), Some("Live"));
+    assert_eq!(
+        l[2].as_string().as_deref(),
+        Some("Pulp"),
+        "`ar.name` doit être rendue — c'est la colonne qui faisait tomber la requête"
+    );
+    assert_eq!(l[6].as_i64(), Some(2), "2 pistes distinctes écoutées");
+    assert_eq!(l[7].as_i64(), Some(5), "sur 5");
+
+    // ── « Ajoutés récemment » : même défaut, même écran ──
+    let piste = id_de(&format!(
+        "INSERT INTO tracks (title, album_id, artist_id, file_path, file_mtime) \
+         VALUES ('Piste 1', {live_pulp}, {pulp}, '/x/1.flac', 9999999999) RETURNING id"
+    ));
+    assert!(piste > 0);
+    let depuis: i64 = 0;
+    let recents = db
+        .query_many(
+            &sql_ra,
+            &[&depuis as &dyn ToSqlValue, &limite as &dyn ToSqlValue],
+        )
+        .expect("« Ajoutés récemment » doit s'exécuter sur PostgreSQL");
+    assert_eq!(recents.len(), 1, "obtenu : {recents:?}");
+    assert_eq!(recents[0][2].as_string().as_deref(), Some("Pulp"));
+
+    // ── CONTRE-ÉPREUVE 2 — `GROUP BY a.id` seul, la forme d'avant ──
+    let avant_group_by = sql_cl.replace(
+        "GROUP BY a.id, a.title, ar.name, a.year, a.cover_path, a.genre, a.track_count",
+        "GROUP BY a.id",
+    );
+    assert_ne!(avant_group_by, sql_cl, "la substitution n'a rien remplacé");
+    let err = db
+        .query_many(&avant_group_by, &[&limite as &dyn ToSqlValue])
+        .expect_err("`GROUP BY a.id` avec `ar.name` doit être refusé");
+    assert!(
+        err.contains("ar.name") && err.contains("GROUP BY"),
+        "erreur attendue sur « ar.name », obtenue : {err}"
+    );
+
+    // ── CONTRE-ÉPREUVE 3 — l'alias de la liste SELECT dans le HAVING ──
+    let avant_having = sql_cl.replace(
+        "HAVING COUNT(DISTINCT lh.title) < a.track_count",
+        "HAVING listened_tracks < a.track_count",
+    );
+    assert_ne!(avant_having, sql_cl, "la substitution n'a rien remplacé");
+    let err = db
+        .query_many(&avant_having, &[&limite as &dyn ToSqlValue])
+        .expect_err("un alias de la liste SELECT dans le HAVING doit être refusé");
+    assert!(
+        err.contains("listened_tracks") && err.contains("does not exist"),
+        "erreur attendue « column \"listened_tracks\" does not exist », obtenue : {err}"
+    );
+}
+
+/// Restauration de sauvegarde : le volume fixe ne se rearme jamais, et le
+/// volume d'une zone armee ne se propage pas (#2395, #2477).
+///
+/// La requete `UPDATE` de `import_zones` est BATIE — elle porte ou non la
+/// colonne `volume` selon la sauvegarde. Une requete batie doit rendre le meme
+/// resultat sur les deux moteurs : ces scenarios sont exactement ceux que le
+/// `mod tests` de `config_backup` joue sur SQLite, rejoues ici sur une VRAIE
+/// base PostgreSQL. Sans cette etape, seul le moteur par defaut serait exerce.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_config_backup_zones_volume_fixe() {
+    use crate::config_backup::scenarios_zones;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+
+    scenarios_zones::une_zone_armee_ne_revient_ni_armee_ni_a_100(&db);
+    scenarios_zones::une_zone_armee_absente_prend_le_defaut_du_schema(&db);
+    scenarios_zones::temoin_une_sauvegarde_desarmee_repose_son_volume(&db);
+    scenarios_zones::temoin_les_autres_champs_du_bloc_ne_bougent_pas(&db);
+}
+
+/// #2441 — « Continuer l'ecoute » sur une VRAIE base PostgreSQL : les
+/// contextes, leur ordre, et l'avancement que le client dessine.
+///
+/// # Pourquoi ce test manquait
+///
+/// Le correctif de #2441 (PR #2479 puis #2936) a mis « Continuer l'ecoute » a
+/// partir de `listen_history` et de son contexte de lecture. Les DEUX requetes
+/// qui le portent — la derniere ecoute de chaque contexte, et la resolution
+/// des albums locaux avec leur avancement — etaient redigees dans
+/// `tune-server/src/routes/home.rs`. Or ce job lance `cargo test -p tune-core`
+/// et ne compile PAS `tune-server` : elles n'avaient donc jamais ete jouees
+/// sur PostgreSQL, exactement comme les requetes de #2860 avant elles, et pour
+/// la meme raison. Leurs erreurs seraient avalees par le
+/// `unwrap_or_default()` de l'appelant : pas un message, juste une section
+/// vide.
+///
+/// Elles sont descendues dans `db/home_queries.rs`, et ce test les EXECUTE.
+///
+/// # Ce qu'il etablit
+///
+/// 1. Les deux requetes s'executent sur PostgreSQL.
+/// 2. Un historique couvrant TROIS albums en rend trois, du plus recent au
+///    plus ancien, sans doublon — le fait de base du ticket.
+/// 3. `progression_pourcent` rend 60 / 40 / 20 — **les memes nombres** que le
+///    test SQLite `plusieurs_albums_entames_rendent_chacun_leur_avancement`
+///    (tune-server/src/routes/home.rs). C'est la comparaison des deux moteurs.
+/// 4. TEMOIN : le cas a un seul album rend exactement cet album.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2441_continuer_lecoute_contextes_et_progression() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::engine::Engine;
+    use crate::db::home_queries::{
+        continue_listening_albums_du_contexte, continue_listening_contextes, progression_pourcent,
+    };
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+
+    let id_de = |sql: &str| -> i64 {
+        db.query_many(sql, &[])
+            .unwrap()
+            .first()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap()
+    };
+
+    // ── Trois disques de cinq pistes, entames de 1, 2 et 3 pistes ──
+    let mut albums = Vec::new();
+    for (rang, nom) in ["Un", "Deux", "Trois"].iter().enumerate() {
+        let artiste = id_de(&format!(
+            "INSERT INTO artists (name) VALUES ('Artiste {nom}') RETURNING id"
+        ));
+        let album = id_de(&format!(
+            "INSERT INTO albums (title, artist_id, track_count) \
+             VALUES ('Disque {nom}', {artiste}, 5) RETURNING id"
+        ));
+        // Le plus ANCIEN est le moins ecoute : l'ordre attendu est celui de
+        // l'ecoute, pas celui de l'avancement.
+        for piste in 0..=rang {
+            db.execute(
+                &format!(
+                    "INSERT INTO listen_history \
+                     (title, artist_name, album_title, album_id, source, \
+                      context_type, context_id, listened_at) \
+                     VALUES ('{nom}{piste}', 'Artiste {nom}', 'Disque {nom}', \
+                             {album}, 'local', 'album', '{album}', \
+                             '2026-08-2{rang}T10:0{piste}:00Z')"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        albums.push(album);
+    }
+    let (un, deux, trois) = (albums[0], albums[1], albums[2]);
+
+    // ── 1. La requete des contextes s'execute, et rend les TROIS ──
+    let marge: i64 = 40;
+    let sql_ctx = continue_listening_contextes(Engine::Postgres, "");
+    let lignes = db
+        .query_many(&sql_ctx, &[&marge as &dyn ToSqlValue])
+        .expect("`continue_listening_contextes` doit s'executer sur PostgreSQL");
+
+    let contextes: Vec<(String, String)> = lignes
+        .iter()
+        .filter_map(|c| {
+            Some((
+                c.first().and_then(|v| v.as_string())?,
+                c.get(1).and_then(|v| v.as_string())?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        contextes.len(),
+        3,
+        "les trois contextes album etaient attendus, obtenu : {contextes:?}"
+    );
+
+    // 2. Le bon ordre — du plus recent au plus ancien — et sans doublon.
+    let ids: Vec<String> = contextes.iter().map(|(_, id)| id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec![trois.to_string(), deux.to_string(), un.to_string()],
+        "l'ordre doit etre celui de la derniere ecoute"
+    );
+    let uniques: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(ids.len(), uniques.len(), "un contexte remonte deux fois");
+    assert!(
+        contextes.iter().all(|(nature, _)| nature == "album"),
+        "toutes les entrees sont de nature album : {contextes:?}"
+    );
+
+    // ── 3. L'avancement : les memes nombres que sur SQLite ──
+    let sql_alb = continue_listening_albums_du_contexte(&[un, deux, trois]);
+    let resolus = db
+        .query_many(&sql_alb, &[])
+        .expect("`continue_listening_albums_du_contexte` doit s'executer sur PostgreSQL");
+
+    let mut pourcents = std::collections::HashMap::new();
+    for cols in &resolus {
+        let id = cols.first().and_then(|v| v.as_i64()).unwrap();
+        let ecoutees = cols.get(6).and_then(|v| v.as_i64());
+        let total = cols.get(7).and_then(|v| v.as_i64());
+        pourcents.insert(id, progression_pourcent(ecoutees, total));
+    }
+    assert_eq!(
+        (
+            pourcents.get(&trois).copied().flatten(),
+            pourcents.get(&deux).copied().flatten(),
+            pourcents.get(&un).copied().flatten()
+        ),
+        (Some(60), Some(40), Some(20)),
+        "PostgreSQL doit rendre le MEME avancement que SQLite (3/5, 2/5, 1/5), \
+         obtenu : {pourcents:?}"
+    );
+
+    // ── 4. TEMOIN — un seul album rend exactement cet album ──
+    reset_schema(&db);
+    let artiste = id_de("INSERT INTO artists (name) VALUES ('Pulp') RETURNING id");
+    let seul = id_de(&format!(
+        "INSERT INTO albums (title, artist_id, track_count) \
+         VALUES ('Live', {artiste}, 5) RETURNING id"
+    ));
+    for piste in ["Common People", "Disco 2000"] {
+        db.execute(
+            &format!(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, source, \
+                  context_type, context_id, listened_at) \
+                 VALUES ('{piste}', 'Pulp', 'Live', {seul}, 'local', \
+                         'album', '{seul}', '2026-08-28T22:45:00Z')"
+            ),
+            &[],
+        )
+        .unwrap();
+    }
+
+    let lignes = db
+        .query_many(&sql_ctx, &[&marge as &dyn ToSqlValue])
+        .expect("la requete des contextes doit s'executer");
+
+    // Les deux pistes portent la MEME `listened_at` — a la seconde pres, ce
+    // qu'un enchainement produit — et la jointure sur le MAX les rend donc
+    // TOUTES LES DEUX. Mesure du 01/09 sur PostgreSQL 15 : la requete rend
+    // bien deux lignes ici. Le dedoublonnage est en Rust, chez l'appelant
+    // (`contextes_recents`, tune-server/src/routes/home.rs) qui garde la
+    // premiere, l'ordre etant deja decroissant. On rejoue cette regle pour
+    // verifier le contrat REEL de la requete, pas un contrat imagine.
+    let mut vues = std::collections::HashSet::new();
+    let distincts: Vec<String> = lignes
+        .iter()
+        .filter_map(|c| {
+            let nature = c.first().and_then(|v| v.as_string())?;
+            let id = c.get(1).and_then(|v| v.as_string())?;
+            vues.insert((nature, id.clone())).then_some(id)
+        })
+        .collect();
+    assert_eq!(
+        distincts,
+        vec![seul.to_string()],
+        "le temoin doit rendre exactement l'album ecoute : {lignes:?}"
+    );
+
+    let resolus = db
+        .query_many(&continue_listening_albums_du_contexte(&[seul]), &[])
+        .expect("la resolution d'album doit s'executer");
+    assert_eq!(resolus.len(), 1);
+    assert_eq!(
+        progression_pourcent(
+            resolus[0].get(6).and_then(|v| v.as_i64()),
+            resolus[0].get(7).and_then(|v| v.as_i64())
+        ),
+        Some(40),
+        "2 pistes sur 5, comme sur SQLite : {resolus:?}"
+    );
+}
+
+/// #3039 — la fenetre des « Ajouts recents » sur une VRAIE base PostgreSQL.
+///
+/// Deux choses se jouent ici, qu'aucun test SQLite ne peut trancher :
+///
+/// 1. **Que les requetes s'EXECUTENT.** Elles portent desormais
+///    `COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '')
+///    AS DOUBLE PRECISION))` — la forme exacte d'`ADDED_AT_JOIN`, qui existe
+///    parce qu'un `COALESCE(double, text)` est une erreur DURE sur les
+///    installations ou `tracks.file_mtime` est reste TEXT (#550), et
+///    `NULLIF(double, '')` une erreur a l'analyse sur celles ou il est DOUBLE
+///    (.15). SQLite avale les deux sans un mot. Le decompte y ajoute
+///    `CAST(SUM(...) AS BIGINT)`, parce que `SUM` rend NUMERIC sur PostgreSQL.
+///
+/// 2. **Que la fenetre est bien LIEE** en `$1` et non ecrite en dur.
+///
+/// Pas de `reset_schema` : ce test n'a besoin d'aucune base vide et ne doit
+/// pas vider celle des autres. Il pose ses propres chemins, prefixes d'un
+/// marqueur unique, et ne conclut que sur les lignes qu'il a lui-meme ecrites.
+/// Ni `pg_or_skip!` : la variable ABSENTE saute, mais une connexion qui ECHOUE
+/// fait TOMBER le test — un banc mal branche ne s'affiche pas vert.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3039_fenetre_et_decompte_des_ajouts_recents() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::engine::Engine;
+    use crate::db::home_queries::{recently_added, recently_added_totaux};
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL absente — epreuve PostgreSQL sautee");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("TUNE_TEST_PG_URL posee : la connexion doit aboutir");
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool));
+
+    // La table de premiere vue arrive par `ENSURE_TABLES` au demarrage, pas
+    // par un script numerote (#473) : la poser ici rend le test independant
+    // du millesime du banc.
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS file_first_seen \
+         (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL)",
+        &[],
+    )
+    .expect("file_first_seen");
+
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let il_y_a = |jours: f64| maintenant - jours * 24.0 * 3600.0;
+    // Marqueur unique : les tests de ce fichier partagent une base et tournent
+    // en parallele. Rien de ce qui suit ne depend des lignes des autres.
+    let marque = format!("i3039-{}", maintenant as i64);
+
+    let id_de = |sql: &str| -> i64 {
+        db.query_many(sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"))
+            .first()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap()
+    };
+    let artiste = id_de(&format!(
+        "INSERT INTO artists (name) VALUES ('{marque}') RETURNING id"
+    ));
+    // Les quatre cas du ticket, tels que le test SQLite les pose.
+    let cas: [(&str, f64, Option<f64>); 4] = [
+        ("Recent", 2.0, None),
+        ("Vieux", 60.0, None),
+        ("Restaure", 800.0, Some(3.0)),
+        ("Recopie", 1.0, Some(200.0)),
+    ];
+    let mut ids = Vec::new();
+    for (nom, mtime_j, vue_j) in cas {
+        let titre = format!("{marque} {nom}");
+        let album = id_de(&format!(
+            "INSERT INTO albums (title, artist_id, track_count) \
+             VALUES ('{titre}', {artiste}, 1) RETURNING id"
+        ));
+        let chemin = format!("/{marque}/{nom}.flac");
+        db.execute(
+            &format!(
+                "INSERT INTO tracks (title, album_id, artist_id, file_path, file_mtime, duration_ms) \
+                 VALUES ('{titre}', {album}, {artiste}, '{chemin}', {}, 60000)",
+                il_y_a(mtime_j)
+            ),
+            &[],
+        )
+        .expect("piste");
+        if let Some(j) = vue_j {
+            db.execute(
+                &format!(
+                    "INSERT INTO file_first_seen (file_path, first_seen_at) \
+                     VALUES ('{chemin}', {})",
+                    il_y_a(j)
+                ),
+                &[],
+            )
+            .expect("premiere vue");
+        }
+        ids.push((nom, album));
+    }
+
+    // ── La requete s'execute sur PostgreSQL, avec la fenetre LIEE en $1 ──
+    let sql = recently_added(Engine::Postgres);
+    let limite: i64 = 5000;
+    let titres = |depuis: f64| -> Vec<String> {
+        db.query_many(
+            &sql,
+            &[&depuis as &dyn ToSqlValue, &limite as &dyn ToSqlValue],
+        )
+        .unwrap_or_else(|e| panic!("« Ajoutes recemment » doit s'executer sur PostgreSQL : {e}"))
+        .iter()
+        .filter_map(|r| r.get(1).and_then(|v| v.as_string()))
+        .filter(|t| t.starts_with(&marque))
+        .collect()
+    };
+
+    // ── Fenetre de 7 jours : le temoin, celle d'avant #3039 ──
+    let a7 = titres(il_y_a(7.0));
+    assert!(
+        a7.contains(&format!("{marque} Recent")),
+        "7 jours : `Recent` (J-2) manque — obtenu {a7:?}"
+    );
+    assert!(
+        a7.contains(&format!("{marque} Restaure")),
+        "7 jours : une sauvegarde remise en place (mtime J-800, premiere vue \
+         J-3) doit entrer. La jointure `file_first_seen` ne porte donc pas sur \
+         PostgreSQL — obtenu {a7:?}"
+    );
+    assert!(
+        !a7.contains(&format!("{marque} Recopie")),
+        "7 jours : un `rsync -a` (mtime J-1, premiere vue J-200) ne doit PAS \
+         entrer — obtenu {a7:?}"
+    );
+    assert!(
+        !a7.contains(&format!("{marque} Vieux")),
+        "7 jours : `Vieux` (J-60) doit rester dehors — obtenu {a7:?}"
+    );
+
+    // ── La fenetre est SERVIE : $1 change, le resultat change ──
+    let a61 = titres(il_y_a(61.0));
+    assert!(
+        a61.contains(&format!("{marque} Vieux")),
+        "61 jours : `Vieux` (J-60) doit entrer. S'il n'entre pas, `$1` n'est \
+         pas lu et la fenetre reste ecrite en dur (#3039) — obtenu {a61:?}"
+    );
+    assert!(
+        a61.len() > a7.len(),
+        "une fenetre plus large doit rendre PLUS d'albums : 7 j → {a7:?}, \
+         61 j → {a61:?}"
+    );
+
+    // ── Le decompte : il s'execute, et il suit la meme fenetre ──
+    let sql_t = recently_added_totaux(Engine::Postgres);
+    let compte = |depuis: f64| -> (i64, i64, i64) {
+        let lignes = db
+            .query_many(&sql_t, &[&depuis as &dyn ToSqlValue])
+            .unwrap_or_else(|e| panic!("le decompte doit s'executer sur PostgreSQL : {e}"));
+        let l = lignes.first().expect("le decompte rend une ligne");
+        (
+            l[0].as_i64().expect("albums est un entier"),
+            l[1].as_i64().expect("pistes est un entier"),
+            // `SUM` rend NUMERIC sur PostgreSQL : sans le CAST explicite de la
+            // requete, cette lecture rendrait `None` et le test tomberait ici.
+            l[2].as_i64()
+                .expect("duration_ms est un entier — CAST … AS BIGINT"),
+        )
+    };
+    let (alb7, pis7, dur7) = compte(il_y_a(7.0));
+    let (alb61, pis61, dur61) = compte(il_y_a(61.0));
+    assert!(
+        alb61 > alb7 && pis61 > pis7 && dur61 > dur7,
+        "le decompte doit suivre la fenetre : 7 j → ({alb7}, {pis7}, {dur7}), \
+         61 j → ({alb61}, {pis61}, {dur61})"
+    );
+    assert!(
+        dur7 >= 120_000,
+        "la duree cumulee doit compter les 60 000 ms de chaque piste, \
+         obtenu {dur7}"
+    );
+
+    // ── CONTRE-EPREUVE — la forme d'AVANT #3039 se trompe deux fois ──
+    //
+    // Le filtre sur le seul `mtime`, tel qu'il s'ecrivait, fait entrer la
+    // recopie et sortir la restauration. C'est le defaut que le testeur
+    // aurait vu ; on verifie ici qu'il etait bien la, sur PostgreSQL aussi.
+    let avant = sql
+        .replace(
+            &format!(
+                "LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
+                 WHERE {} > $1",
+                crate::db::home_queries::DATE_D_AJOUT
+            ),
+            "WHERE t.file_mtime IS NOT NULL AND t.file_mtime > $1",
+        )
+        .replace(
+            &format!("MAX({}) as added_at", crate::db::home_queries::DATE_D_AJOUT),
+            "MAX(t.file_mtime) as added_at",
+        );
+    assert_ne!(avant, sql, "la substitution n'a rien remplace");
+    let depuis = il_y_a(7.0);
+    let anciens: Vec<String> = db
+        .query_many(
+            &avant,
+            &[&depuis as &dyn ToSqlValue, &limite as &dyn ToSqlValue],
+        )
+        .expect("la forme d'avant doit rester executable")
+        .iter()
+        .filter_map(|r| r.get(1).and_then(|v| v.as_string()))
+        .filter(|t| t.starts_with(&marque))
+        .collect();
+    assert!(
+        anciens.contains(&format!("{marque} Recopie")),
+        "la forme d'avant DEVAIT faire entrer la recopie — sans quoi la \
+         contre-epreuve ne prouve rien : {anciens:?}"
+    );
+    assert!(
+        !anciens.contains(&format!("{marque} Restaure")),
+        "la forme d'avant DEVAIT laisser la restauration dehors : {anciens:?}"
+    );
+
+    // ── Menage : ce test ne vide pas les tables des autres, il retire les
+    // siennes.
+    for (_, album) in &ids {
+        let _ = db.execute(&format!("DELETE FROM tracks WHERE album_id = {album}"), &[]);
+        let _ = db.execute(&format!("DELETE FROM albums WHERE id = {album}"), &[]);
+    }
+    let _ = db.execute(
+        &format!("DELETE FROM file_first_seen WHERE file_path LIKE '/{marque}/%'"),
+        &[],
+    );
+    let _ = db.execute(&format!("DELETE FROM artists WHERE id = {artiste}"), &[]);
 }

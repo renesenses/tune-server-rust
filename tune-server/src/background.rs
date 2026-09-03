@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use tune_core::outputs::OutputRegistry;
+use tune_core::poller::{JournalSondage, TraceEchecSondage};
 
 use crate::config::TuneConfig;
 use crate::state::AppState;
@@ -33,7 +34,6 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     #[cfg(feature = "audio-embedding")]
     spawn_audio_embedding(state);
     spawn_radio_logo_refresh(state);
-    spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
     // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
@@ -448,6 +448,13 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 if location.is_empty() || outputs.contains(&d.id) {
                     continue;
                 }
+                // #1280 — appareil que l'utilisateur a fait taire : ce lot de
+                // démarrage enregistrait la sortie sans rien demander, donc
+                // l'appareil revenait proposé à chaque redémarrage.
+                if crate::discovery_setup::appareil_ignore(&state.backend, d) {
+                    info!(name = %d.name, device_id = %d.id, "ssdp_startup_appareil_ignore");
+                    continue;
+                }
                 if let Ok(desc) =
                     tune_core::discovery::xml_parser::fetch_device_description(location).await
                 {
@@ -469,6 +476,17 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                                 format!("{base}{av}"),
                                 format!("{base}{rc}"),
                                 cm_url,
+                            )
+                            .with_upnp_events(
+                                crate::startup::create_oh_listener().await,
+                                crate::discovery_setup::urls_evenements_dlna(
+                                    &d.host,
+                                    d.port,
+                                    &desc.event_sub_urls(),
+                                ),
+                            )
+                            .with_upnp_silence(
+                                crate::config::resolve_upnp_silence(&state.backend, &d.id),
                             );
                             outputs.register(Box::new(dlna));
                             registered += 1;
@@ -487,6 +505,12 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 // (Fabien: "Salon: AIRPLAY" zone came back after update).
                 if zone_repo.is_device_hidden(&d.id) {
                     info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_hidden_skipping");
+                    continue;
+                }
+                // #1280 — appareil ignoré : aucune zone, sous aucune de ses
+                // identités.
+                if crate::discovery_setup::appareil_ignore(&state.backend, d) {
+                    info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_appareil_ignore");
                     continue;
                 }
 
@@ -544,6 +568,104 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
     });
 }
 
+/// Plein rythme d'un sondeur d'intégration : l'hôte répond, on le rappelle
+/// chaque minute.
+pub const SONDAGE_INTERVALLE_BASE_SECS: u64 = 60;
+/// Plancher de fréquence quand il ne répond plus. Dix minutes : un hôte éteint
+/// ne coûte plus que six connexions perdues par heure.
+pub const SONDAGE_INTERVALLE_MAX_SECS: u64 = 600;
+
+/// Cadence du prochain tour d'un sondeur d'intégration.
+///
+/// Écrite en clair dans `spawn_squeezebox_poller`, elle en est extraite parce
+/// qu'il fallait la donner **aussi** à `spawn_hqplayer_poller` (#2566) : ce
+/// dernier était le seul sondeur sans aucun recul. Un hôte HQPlayer saisi puis
+/// débranché était rappelé toutes les soixante secondes, sans fin — **1 440
+/// connexions perdues et 1 440 lignes de journal par jour**, pour un appareil
+/// dont on savait depuis la première seconde qu'il ne répondait pas.
+///
+/// Le retour au plein rythme est immédiat, et il ne dépend pas d'un succès :
+/// une intégration coupée ou un hôte vidé y ramènent aussi, pour qu'un hôte
+/// fraîchement saisi soit pris tout de suite.
+///
+/// Fonction pure, et testée comme telle (`journal_sondage_hqplayer.rs`) : une
+/// cadence éprouvée par de vraies attentes est un test qui dure dix minutes et
+/// qui clignote.
+pub fn prochain_intervalle_sondage(actuel_secs: u64, echec: bool) -> u64 {
+    if echec {
+        actuel_secs
+            .saturating_mul(2)
+            .min(SONDAGE_INTERVALLE_MAX_SECS)
+    } else {
+        SONDAGE_INTERVALLE_BASE_SECS
+    }
+}
+
+/// Point d'émission du journal d'un sondage HQPlayer en échec (#2566).
+///
+/// Fonction à part, et publique, pour une seule raison : le garde
+/// `tests/journal_sondage_hqplayer.rs` compte les lignes que `tracing` reçoit
+/// de **ce point-ci**, pas d'une copie. Elle reste dans `tune_server::background`
+/// pour que la cible du module — celle que l'export de diagnostic comptabilise
+/// (`QUOTA_PAR_MODULE`, #1974) — désigne bien le sondeur d'intégration et non
+/// le poller.
+///
+/// Ce que le journal dit désormais, pour un HQPlayer débranché :
+/// les **cinq premiers** échecs en entier, avec l'erreur, l'hôte et la cadence
+/// suivante — de quoi établir la cause et vérifier que le recul monte —, puis
+/// un récapitulatif portant le TOTAL aux paliers 8, 16, 32… Un échec isolé
+/// reste dit en entier : c'est le n° 1.
+pub fn journaliser_echec_hqplayer(
+    journal: &mut JournalSondage,
+    host: &str,
+    error: &dyn std::fmt::Display,
+    next_retry_secs: u64,
+) {
+    match journal.compter_echec() {
+        TraceEchecSondage::Detaille => tracing::debug!(
+            error = %error,
+            host = %host,
+            next_retry_secs,
+            "hqplayer_poll_failed"
+        ),
+        TraceEchecSondage::Recapitulatif => tracing::debug!(
+            error = %error,
+            host = %host,
+            echecs = journal.echecs(),
+            detaillees = tune_core::poller::ECHECS_SONDAGE_DETAILLES,
+            next_retry_secs,
+            "hqplayer_poll_still_failing"
+        ),
+        TraceEchecSondage::Muet => {}
+    }
+}
+
+/// Point d'émission du journal d'un sondage HQPlayer qui répond (#2566).
+///
+/// `hqplayer_poll_registered` partait à **chaque tour**, au niveau `INFO` : un
+/// HQPlayer qui marche écrivait 1 440 lignes par jour pour dire qu'il marchait
+/// toujours. C'est le même défaut que les 79 lignes du ticket, à l'envers — un
+/// journal qui crie pour rien noie celui qui dirait quelque chose — et il est
+/// ici plus grave, parce qu'`INFO` traverse les filtres par défaut.
+///
+/// Reste dit : la **première** découverte, et chaque **retour** après une panne
+/// qu'on avait cessé de détailler, avec le total d'échecs.
+pub fn journaliser_succes_hqplayer(
+    journal: &mut JournalSondage,
+    host: &str,
+    deja_annonce: &mut bool,
+) {
+    let retour = journal.cloturer();
+    if retour.is_some() || !*deja_annonce {
+        info!(
+            host = %host,
+            echecs = retour.unwrap_or(0),
+            "hqplayer_poll_registered"
+        );
+        *deja_annonce = true;
+    }
+}
+
 fn spawn_squeezebox_poller(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -555,9 +677,9 @@ fn spawn_squeezebox_poller(state: &AppState) {
         // with `lms_cli_command: TCP connect failed` every minute. Backing off
         // stops the spam and the wasted connects; a reachable LMS is polled
         // normally and recovery resets the interval immediately.
-        const BASE_INTERVAL_SECS: u64 = 60;
-        const MAX_INTERVAL_SECS: u64 = 600; // 10 min ceiling for a dead LMS
-        let mut interval_secs = BASE_INTERVAL_SECS;
+        // Cadence partagée avec le sondeur HQPlayer : voir
+        // `prochain_intervalle_sondage` (60 s de base, 600 s de plancher).
+        let mut interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
         loop {
             let settings =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -581,10 +703,10 @@ fn spawn_squeezebox_poller(state: &AppState) {
                             info!(count = players.len(), lms = %host, "squeezebox_poll_discovered");
                         }
                         // Reachable → back to normal cadence.
-                        interval_secs = BASE_INTERVAL_SECS;
+                        interval_secs = prochain_intervalle_sondage(interval_secs, false);
                     }
                     Err(e) => {
-                        interval_secs = (interval_secs * 2).min(MAX_INTERVAL_SECS);
+                        interval_secs = prochain_intervalle_sondage(interval_secs, true);
                         tracing::debug!(
                             error = %e,
                             lms = %host,
@@ -596,7 +718,7 @@ fn spawn_squeezebox_poller(state: &AppState) {
             } else {
                 // Integration off / no host configured — idle at base cadence so
                 // a freshly configured host is picked up promptly.
-                interval_secs = BASE_INTERVAL_SECS;
+                interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
@@ -608,6 +730,13 @@ fn spawn_hqplayer_poller(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        // Même cadence et même comptabilité de journal que le sondeur
+        // Squeezebox ci-dessus (#2566). Ce sondeur-ci était le seul à n'avoir
+        // ni l'une ni l'autre : 1 440 tours et 1 440 lignes par jour, que
+        // l'hôte réponde ou non.
+        let mut interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
+        let mut journal = JournalSondage::default();
+        let mut deja_annonce = false;
         loop {
             let settings =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -626,15 +755,21 @@ fn spawn_hqplayer_poller(state: &AppState) {
             if enabled && !host.is_empty() {
                 match crate::routes::hqplayer::discover_and_register(&state).await {
                     Ok(_) => {
-                        info!(host = %host, "hqplayer_poll_registered");
+                        journaliser_succes_hqplayer(&mut journal, &host, &mut deja_annonce);
+                        interval_secs = prochain_intervalle_sondage(interval_secs, false);
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, host = %host, "hqplayer_poll_failed");
+                        interval_secs = prochain_intervalle_sondage(interval_secs, true);
+                        journaliser_echec_hqplayer(&mut journal, &host, &e, interval_secs);
                     }
                 }
+            } else {
+                // Intégration coupée ou hôte non saisi : plein rythme, pour
+                // qu'un hôte fraîchement configuré soit pris tout de suite.
+                interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
         }
     });
 }
@@ -1590,15 +1725,6 @@ fn spawn_audio_embedding(state: &AppState) {
     tune_core::audio::embedding::spawn(state.backend.clone(), state.license.clone());
 }
 
-fn spawn_concert_alerts(state: &AppState) {
-    tune_core::cloud::concert_alerts::spawn(state.backend.clone());
-
-    // Veille Bandcamp : un appel reseau par artiste, donc en arriere-plan et
-    // sur les seuls favoris. Sans le plugin, la fonction n'existe pas.
-    #[cfg(feature = "bandcamp")]
-    crate::bandcamp_sweep::spawn(state.backend.clone());
-}
-
 fn spawn_cloud_library_sync(state: &AppState) {
     tune_core::cloud::library_sync::spawn(state.backend.clone(), state.license.clone());
     // L'arbitrage part apres la synchronisation : demander des propositions
@@ -1640,6 +1766,11 @@ fn spawn_memory_diagnostics(
     streamer: Arc<tune_core::http::streamer::AudioStreamer>,
 ) {
     tokio::spawn(async move {
+        // Le relevé lui-même n'existe que sur Linux (`/proc/self/statm`) : la
+        // base de comparaison suit la même portée, sinon elle est déclarée et
+        // jamais lue ailleurs. `rss_delta_mb` reste donc mesuré partout où la
+        // trace tourne — c'est-à-dire sur Linux, et nulle part ailleurs.
+        #[cfg(target_os = "linux")]
         let mut rss_initial_mb: Option<u64> = None;
         loop {
             #[cfg(target_os = "linux")]
@@ -1823,12 +1954,14 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             }
 
             // New device found — register it
+            // L'hôte qui a énuméré ce nom voyage avec lui (#3230).
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
                 state.effective_exclusive_mode(),
                 &configured_backend,
-            );
+            )
+            .with_origin_host(&dev.backend);
             outputs.register(Box::new(local_out));
             registered_count += 1;
 
@@ -1920,6 +2053,19 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // Phase 2: Create zones and emit events (no lock held)
     if !new_devices_to_zone.is_empty() {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        let auto_create =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("zone_auto_create")
+                .ok()
+                .flatten()
+                .map(|v| v != "false")
+                .unwrap_or(true);
+        let system_default_device_id = crate::startup::first_system_default_name(
+            new_devices_to_zone
+                .iter()
+                .map(|(device_id, _, is_default)| (device_id.as_str(), *is_default)),
+        )
+        .map(str::to_owned);
 
         for (device_id, dev_name, is_default) in &new_devices_to_zone {
             // When ASIO is configured, don't create new zones for WASAPI
@@ -1936,44 +2082,33 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                 dev_name.clone()
             };
 
-            // « Creer les zones automatiquement » vaut ICI aussi.
-            //
-            // Ce chemin etait le SEUL des cinq a ne pas consulter le reglage :
-            // `startup.rs`, et les trois chemins de decouverte de
-            // `discovery_setup.rs` (SSDP, mDNS, fournisseur) le lisent tous.
-            // #1577 n'avait couvert que le demarrage.
-            //
-            // Le defaut se voit surtout au basculement ASIO -> WASAPI (#1770,
-            // DEvir). Tant qu'ASIO est configure, le `continue` ci-dessus
-            // suspend la creation : les endpoints WASAPI sont enregistres dans
-            // l'`OutputRegistry` mais n'obtiennent AUCUNE ligne en base. Au
-            // premier tick apres la bascule, la retenue saute d'un coup et
-            // chaque endpoint reclame sa zone. Supprimer toutes les zones juste
-            // avant ne protege de rien : `delete_all` masque des lignes, or il
-            // n'y en avait aucune a masquer. L'utilisateur cree UNE zone et en
-            // voit apparaitre une par peripherique dans les deux minutes.
-            //
-            // On ne bloque que la CREATION : une zone deja existante est
-            // renvoyee telle quelle par `get_or_create`, donc la reconnexion
-            // d'un peripherique connu reste intacte, reglage decoche ou non.
-            let auto_create =
-                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                    .get("zone_auto_create")
-                    .ok()
-                    .flatten()
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
-            if !auto_create
-                && zone_repo
-                    .get_by_device_id(device_id)
-                    .ok()
-                    .flatten()
-                    .is_none()
-            {
+            // #1770 : le rescan peut créer au plus UNE zone, celle de la sortie
+            // système. Les autres sorties restent enregistrées pour que
+            // l'interface puisse les proposer à la création manuelle. Une zone
+            // déjà connue est reconnectée normalement.
+            let zone_exists = zone_repo
+                .get_by_device_id(device_id)
+                .ok()
+                .flatten()
+                .is_some();
+            let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
+            let action =
+                crate::startup::local_zone_action(zone_exists, auto_create, is_system_default);
+            if action == crate::startup::LocalZoneAction::Skip {
                 info!(
                     name = %zone_name,
                     device_id = %device_id,
-                    "local_audio_hotplug_zone_auto_create_disabled_skipping"
+                    "local_audio_hotplug_zone_manual_creation_required"
+                );
+                state.event_bus.emit(
+                    "device.discovered",
+                    serde_json::json!({
+                        "id": device_id,
+                        "name": dev_name,
+                        "type": "local",
+                        "hotplug": true,
+                        "zone_creation": "manual",
+                    }),
                 );
                 continue;
             }
@@ -2330,5 +2465,134 @@ mod heartbeat_server_id_tests {
                 );
             }
         }
+    }
+}
+
+/// GARDE DE SITE (#1770) — les deux chemins qui enregistrent une sortie locale
+/// à partir d'une énumération doivent ÉTIQUETER l'hôte qui a énuméré le nom.
+///
+/// C'est la précondition du correctif. La rectification du backend vit dans
+/// `LocalOutput::with_origin_host` (tune-core), donc une sortie qui n'étiquette
+/// pas son origine n'est pas rectifiée : elle repart avec `asio` sur un nom
+/// WASAPI, et `AsioExclusiveOutput` la refuse — c'est exactement la panne de
+/// jfpaquet.
+///
+/// Pourquoi une garde textuelle et pas une épreuve de bout en bout : les deux
+/// fonctions visées sont derrière `#[cfg(feature = "local-audio")]` et
+/// demandent un `AppState` complet plus de vrais périphériques. La garde lit le
+/// code de PRODUCTION seul — le module de test est retranché avant l'examen,
+/// sans quoi il se prouverait lui-même. Sa propre contre-épreuve est
+/// `la_garde_refuse_un_site_sans_etiquette` : le détecteur doit rougir sur un
+/// extrait fabriqué qui n'étiquette rien.
+#[cfg(test)]
+mod etiquette_hote_origine_i1770 {
+    /// Les sites d'enregistrement de ce fichier qui n'enchaînent PAS
+    /// `.with_origin_host(...)` sur le constructeur, rendus par numéro de
+    /// ligne (1-indexé) dans le fichier d'origine.
+    fn sites_sans_etiquette(source: &str) -> Vec<usize> {
+        // Aiguille construite à l'exécution : écrite en clair, ce module se
+        // compterait lui-même dès qu'on le relit par `include_str!`.
+        let marqueur_test = format!("#[cfg({})]", "test");
+        let production = source.split(&marqueur_test).next().unwrap_or("");
+
+        const CONSTRUCTEUR: &str = "LocalOutput::with_options_and_endpoint(";
+        const ETIQUETTE: &str = ".with_origin_host(";
+
+        let mut manquants = Vec::new();
+        let mut curseur = 0usize;
+        while let Some(pos) = production[curseur..].find(CONSTRUCTEUR) {
+            let debut = curseur + pos;
+            // La chaîne d'appel tient largement dans 800 octets : le plus long
+            // des deux sites en fait moins de 300. La borne est reculée sur une
+            // frontière de caractère — ces fichiers sont pleins d'accents et de
+            // tirets cadratins, et trancher au milieu d'un « — » panique.
+            let mut fin = (debut + 800).min(production.len());
+            while fin > debut && !production.is_char_boundary(fin) {
+                fin -= 1;
+            }
+            if !production[debut..fin].contains(ETIQUETTE) {
+                manquants.push(production[..debut].lines().count());
+            }
+            curseur = debut + CONSTRUCTEUR.len();
+        }
+        manquants
+    }
+
+    /// Combien de sites ce fichier porte, étiquetés ou non.
+    fn nombre_de_sites(source: &str) -> usize {
+        let marqueur_test = format!("#[cfg({})]", "test");
+        source
+            .split(&marqueur_test)
+            .next()
+            .unwrap_or("")
+            .matches("LocalOutput::with_options_and_endpoint(")
+            .count()
+    }
+
+    #[test]
+    fn les_deux_sites_d_enregistrement_local_etiquettent_l_hote_d_origine() {
+        let fichiers = [
+            (
+                "tune-server/src/background.rs",
+                include_str!("background.rs"),
+            ),
+            ("tune-server/src/startup.rs", include_str!("startup.rs")),
+        ];
+
+        let mut total = 0usize;
+        for (chemin, source) in fichiers {
+            total += nombre_de_sites(source);
+            let manquants = sites_sans_etiquette(source);
+            assert!(
+                manquants.is_empty(),
+                "{chemin} enregistre une sortie locale sans étiqueter l'hôte \
+                 qui a énuméré son nom, ligne(s) {manquants:?}. Sans \
+                 `.with_origin_host(&dev.backend)`, \
+                 `config::openable_local_backend` n'est jamais consultée : la \
+                 sortie repart avec le backend CONFIGURÉ (`asio`) sur un nom \
+                 énuméré par WASAPI, et `AsioExclusiveOutput::new` ne peut que \
+                 la refuser (#1770, jfpaquet, 0.9.130)"
+            );
+        }
+
+        assert_eq!(
+            total, 2,
+            "les deux seuls sites d'enregistrement d'une sortie locale issue \
+             d'une énumération sont `register_local_outputs` (startup.rs) et \
+             `rescan_local_audio_devices` (background.rs). Un site de plus ou \
+             de moins : reprendre le recensement de #1770 avant de toucher à \
+             ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur lui-même. Sans elle, `sites_sans_etiquette`
+    /// pourrait ne rien détecter du tout et la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_un_site_sans_etiquette() {
+        let sain = "let o = LocalOutput::with_options_and_endpoint(\n    n, e, x, b,\n)\n.with_origin_host(&dev.backend);\n";
+        assert!(
+            sites_sans_etiquette(sain).is_empty(),
+            "le détecteur doit accepter un site correctement étiqueté"
+        );
+
+        let malade = "let o = LocalOutput::with_options_and_endpoint(\n    n, e, x, &configured_backend,\n);\noutputs.register(Box::new(o));\n";
+        assert_eq!(
+            sites_sans_etiquette(malade),
+            vec![1],
+            "le détecteur doit nommer la ligne d'un site qui n'étiquette pas \
+             son hôte d'origine"
+        );
+
+        // Et il ne doit pas se laisser sauver par une étiquette posée
+        // très loin, sur un AUTRE appel.
+        let loin = format!(
+            "let o = LocalOutput::with_options_and_endpoint(n, e, x, b);\n{}\n.with_origin_host(&dev.backend);\n",
+            "// remplissage\n".repeat(80)
+        );
+        assert_eq!(
+            sites_sans_etiquette(&loin),
+            vec![1],
+            "une étiquette hors de la chaîne d'appel ne doit pas compter"
+        );
     }
 }

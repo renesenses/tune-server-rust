@@ -29,8 +29,10 @@ use axum::Json;
 use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
+use crate::routes::filtre_sources::FiltreSources;
 use crate::state::AppState;
 
 /// Les services qui servent un vrai fil de nouveautés daté.
@@ -44,6 +46,14 @@ const SERVICES: [&str; 4] = ["qobuz", "tidal", "deezer", "spotify"];
 #[derive(Deserialize)]
 pub(super) struct Params {
     limit: Option<usize>,
+    /// D'ou viennent les parutions — le meme `sources` que `GET /search`,
+    /// `GET /home/other-versions` et `GET /library/tracks/{id}/versions`.
+    /// Contrat complet dans [`crate::routes::filtre_sources`].
+    ///
+    /// ⚠️ **Cette route-ci n'a pas de moitie locale a rendre.** Voir la note
+    /// « Ce que `sources` peut et ne peut pas dire ici » sur
+    /// [`artist_releases`].
+    sources: Option<String>,
 }
 
 /// Normalise un nom d'artiste pour le rapprochement.
@@ -122,11 +132,68 @@ pub(super) fn est_un_fourre_tout(nom_normalise_: &str) -> bool {
 }
 
 /// `GET /home/artist-releases` — les parutions récentes des artistes connus.
+///
+/// ## ⚠️ Ce que `sources` peut et ne peut pas dire ici
+///
+/// Cette route est la seule des quatre ou le melange local/streaming n'est
+/// PAS un melange de contenu. **Tout ce qu'elle rend vient d'un service** :
+/// chaque `releases[]` est une parution de Qobuz, Tidal, Deezer, Spotify ou
+/// Bandcamp. La bibliotheque n'y est jamais du contenu — elle est le FILTRE
+/// (quels artistes on possede ou suit) et l'ANNOTATION (`library_albums`,
+/// `is_favorite`).
+///
+/// Les lignes du contrat s'y lisent donc ainsi :
+///
+/// - `sources=qobuz` : « le bloc local est vide » est vrai **par
+///   construction**, il n'y a pas de bloc local. Ce qui change reellement,
+///   et c'est le vrai apport ici, c'est que seules les parutions Qobuz
+///   remontent.
+/// - `sources=local` : aucun service ne repond, donc **aucune parution** :
+///   la route rend `[]`. C'est la lecture fidele du contrat — « services :
+///   aucun » — et non un contournement : une section de nouveautes de
+///   streaming sans streaming n'a rien a montrer. Le tableau vide est deja
+///   une reponse que cette route sait rendre (bibliotheque vide, plus bas).
+/// - valeur inconnue, ou vide : `[]`, meme raison.
+///
+/// **Si cette lecture n'est pas celle voulue, c'est une decision de produit,
+/// pas de code** : la seule autre lecture defendable serait que `sources`
+/// n'ait aucun effet sur cette route, ce qui la laisserait sans filtre de
+/// service alors que c'est precisement ce qu'on lui demande.
+///
+/// ## ⚠️ Ce que `sources` NE filtre PAS ici, deliberement
+///
+/// La collecte des artistes AIMES (etape 1 bis) interroge tous les services
+/// connectes, `sources` ou pas. C'est le modele de gout — QUI suivre —, pas
+/// du contenu rendu. Le filtrer ferait qu'un artiste suivi sur Tidal
+/// cesserait de faire remonter sa parution QOBUZ sous `sources=qobuz`, ce qui
+/// retirerait des resultats du service explicitement demande. Vivier n'est
+/// pas contenu.
 pub(super) async fn artist_releases(
     State(state): State<AppState>,
     Query(p): Query<Params>,
 ) -> Result<Json<Value>, AppError> {
     let limite = p.limit.unwrap_or(20).clamp(1, 100);
+    let filtre = FiltreSources::depuis(p.sources.as_deref());
+
+    // Les services qui repondront. Etabli AVANT tout appel reseau : quand la
+    // liste est vide et que Bandcamp est ecarte lui aussi, il n'y a rien a
+    // aller chercher, et la collecte des artistes aimes — un appel par
+    // service — n'a pas lieu d'etre payee pour rendre `[]`.
+    let services_demandes: Vec<&str> = SERVICES
+        .iter()
+        .copied()
+        .filter(|s| filtre.service_demande(s))
+        .collect();
+    // Bandcamp n'est consulte que si la fonctionnalite est compilee ; sans
+    // elle, il n'est demande par personne, et la constante evite une variable
+    // inutilisee dans ce jeu de features.
+    #[cfg(feature = "bandcamp")]
+    let bandcamp_demande = filtre.service_demande("bandcamp");
+    #[cfg(not(feature = "bandcamp"))]
+    let bandcamp_demande = false;
+    if services_demandes.is_empty() && !bandcamp_demande {
+        return Ok(Json(json!([])));
+    }
 
     // 1. Les artistes qu'on aime : les favoris explicites, plus l'artiste des
     //    albums et morceaux mis en favori. Ils passeront devant les autres.
@@ -135,7 +202,7 @@ pub(super) async fn artist_releases(
         "SELECT DISTINCT item_name FROM favorites WHERE item_type = 'artist' AND item_name IS NOT NULL",
         "SELECT DISTINCT item_artist FROM favorites WHERE item_artist IS NOT NULL AND item_artist != ''",
     ] {
-        for cols in state.backend.query_many(sql, &[]).unwrap_or_default() {
+        for cols in state.backend.query_many(sql, &[]).ou_defaut_journalise() {
             if let Some(n) = cols.first().and_then(|v| v.as_string()) {
                 let cle = nom_normalise(&n);
                 if !est_un_fourre_tout(&cle) {
@@ -185,7 +252,7 @@ pub(super) async fn artist_releases(
     for cols in state
         .backend
         .query_many(sql_biblio, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
     {
         if let Some(nom) = cols.first().and_then(|v| v.as_string()) {
             let cle = nom_normalise(&nom);
@@ -201,9 +268,11 @@ pub(super) async fn artist_releases(
         return Ok(Json(json!([])));
     }
 
-    // 3. Un appel par service connecte, jamais par artiste.
+    // 3. Un appel par service connecte, jamais par artiste. La liste est
+    //    celle que `sources` a retenue — c'est ICI que le filtre mord, sur ce
+    //    qui PRODUIT des parutions.
     let mut groupes: Vec<Value> = Vec::new();
-    for nom_service in SERVICES {
+    for nom_service in services_demandes.iter().copied() {
         let arc = {
             let registre = state.services.lock().await;
             registre.get(nom_service)
@@ -271,8 +340,17 @@ pub(super) async fn artist_releases(
     //        reglage coute une requete SQL ; aller voir Bandcamp couterait un
     //        appel reseau par artiste, sur une page qui se charge a chaque
     //        ouverture.
+    // Le depot n'est meme pas LU quand Bandcamp n'est pas demande : c'est une
+    // requete SQL de moins, et surtout la garantie qu'aucune parution d'un
+    // service ecarte ne peut se glisser dans la reponse.
     #[cfg(feature = "bandcamp")]
-    for depot in crate::bandcamp_sweep::nouveautes_deposees(&state.backend) {
+    let depots_bandcamp = if bandcamp_demande {
+        crate::bandcamp_sweep::nouveautes_deposees(&state.backend)
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "bandcamp")]
+    for depot in depots_bandcamp {
         let Some(nom) = depot.get("artist_name").and_then(|v| v.as_str()) else {
             continue;
         };

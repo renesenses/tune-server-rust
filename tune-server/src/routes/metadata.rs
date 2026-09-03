@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -53,6 +54,24 @@ fn auto_fix_unavailable() -> axum::response::Response {
 pub(crate) struct TrackEdit {
     title: Option<String>,
     artist: Option<String>,
+    /// Rattacher la piste à un artiste EXISTANT par son id.
+    ///
+    /// Jumeau non corrigé d'`album_id` ci-dessous, et même défaut exactement
+    /// (#2574). `MetadataView.svelte` appelle `api.updateTrack(id, {
+    /// artist_id })` à trois endroits — l. 338 (`applyArtistAndAlbum`),
+    /// l. 1042 et l. 1135 — et `artist_id` y est la SEULE clé du corps.
+    /// `api.ts:1579` le déclare d'ailleurs dans la signature de `updateTrack`.
+    ///
+    /// Le champ n'étant pas déclaré ici, serde l'écartait en silence : les
+    /// onze champs restaient `None`, `edit_track` réécrivait la piste
+    /// INCHANGÉE et répondait quand même `200 {"status":"ok"}`. L'écran, qui
+    /// met sa liste à jour de façon optimiste, affichait l'artiste assigné —
+    /// un rechargement le remettait à « Unknown ».
+    ///
+    /// Rien ne s'y opposait côté base : `Track::artist_id` existe
+    /// (`tune-core/src/db/models.rs`) et `TrackRepo::update` écrit bien
+    /// `artist_id` (`track_repo.rs`, `UPDATE tracks SET … artist_id = …`).
+    artist_id: Option<i64>,
     album: Option<String>,
     /// Reattach the track to an existing album by id. The web Metadata
     /// Manager has always sent this (grouping loose tracks under a new
@@ -265,7 +284,7 @@ fn pistes_mp3(state: &AppState) -> Vec<(i64, String, Option<i64>, Option<i64>)> 
             "SELECT id, file_path, duration_ms, file_size FROM tracks              WHERE file_path IS NOT NULL AND LOWER(file_path) LIKE '%.mp3'",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .filter_map(|r| {
             Some((
@@ -502,6 +521,7 @@ pub(crate) async fn edit_track(
             year: body.year,
             composer: body.composer.clone(),
             label: body.label.clone(),
+            musicbrainz_recording_id: None,
         };
 
         if let Err(e) = write_metadata(std::path::Path::new(file_path), &update) {
@@ -521,6 +541,30 @@ pub(crate) async fn edit_track(
     }
     if let Some(ref v) = body.album {
         track.album_title = Some(v.clone());
+    }
+    // #2574 — même geste que pour `album_id` juste en dessous : on rattache, et
+    // on rafraîchit le nom porté par la piste pour que l'écran qui la relit
+    // affiche l'artiste réellement enregistré, pas l'ancien.
+    //
+    // Un id d'artiste inconnu est REFUSÉ plutôt que rattaché : écrire une clé
+    // étrangère qui ne désigne rien ferait disparaître la piste de la
+    // bibliothèque, et le client verrait encore un `200`. C'est le défaut que
+    // cette correction combat, on ne le réintroduit pas par l'autre bout.
+    if let Some(aid) = body.artist_id {
+        match ArtistRepo::with_backend(state.backend.clone()).get(aid) {
+            Ok(Some(artist)) => {
+                track.artist_id = Some(aid);
+                track.artist_name = Some(artist.name);
+            }
+            _ => {
+                tracing::warn!(track_id = id, artist_id = aid, "edit_track_unknown_artist");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("Aucun artiste ne porte l'identifiant {aid}."),
+                )
+                    .into_response();
+            }
+        }
     }
     if let Some(aid) = body.album_id {
         track.album_id = Some(aid);
@@ -547,7 +591,18 @@ pub(crate) async fn edit_track(
         track.label = Some(v.clone());
     }
 
-    repo.update(&track).ok();
+    // `.ok()` jetait l'erreur d'écriture et laissait passer le `"status": "ok"`
+    // juste en dessous : une base en lecture seule, ou un disque plein,
+    // répondaient « c'est fait » (#2574). Même motif que le champ ignoré
+    // ci-dessus, à l'autre bout de la route.
+    if let Err(e) = repo.update(&track) {
+        tracing::warn!(track_id = id, error = %e, "edit_track_update_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Enregistrement de la piste impossible : {e}"),
+        )
+            .into_response();
+    }
 
     Json(json!({ "status": "ok", "track_id": id })).into_response()
 }
@@ -913,7 +968,44 @@ async fn auto_apply_suggestions(
 // Artist Enrichment
 // ---------------------------------------------------------------------------
 
-async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+/// Quelle langue demander aux sources de biographie, et dans quel ordre
+/// interroger les Wikipédia — les deux tirées de `Accept-Language`.
+///
+/// La lecture est celle de tout le reste du serveur
+/// ([`crate::i18n::lang_from_header`]) : la MÊME que `library/artists.rs`,
+/// `library/browse.rs` et `system/enrich.rs`, pas une seconde façon de lire la
+/// langue. Elle replie déjà sur `fr` quand l'en-tête est absent ou nomme une
+/// locale que l'interface ne parle pas.
+///
+/// Le défaut réparé ici (#1849, même famille que #2874) : cette route
+/// n'extrayait AUCUN en-tête. Elle demandait `("lang", "fr")` à Last.fm,
+/// estampillait `bio_lang: "fr"` en dur, et interrogeait `en.wikipedia` AVANT
+/// `fr.wikipedia`. Les deux sens du défaut en découlaient :
+///
+/// * interface **française**, Last.fm sans notice → la notice **anglaise** de
+///   Wikipédia sortait la première et était retenue ;
+/// * interface **anglaise** → Last.fm répondait en **français**, et un extrait
+///   anglais court (< 50) pouvait ensuite être écrasé par le français, plus
+///   long.
+///
+/// L'ordre rendu place donc la langue de l'utilisateur d'abord et l'anglais en
+/// repli universel — sans le répéter quand c'est déjà la même.
+fn langue_et_encyclopedies(headers: &axum::http::HeaderMap) -> (String, Vec<String>) {
+    let lang = crate::i18n::lang_from_header(headers);
+    let mut encyclopedies = vec![lang.clone()];
+    if lang != "en" {
+        encyclopedies.push("en".to_string());
+    }
+    (lang, encyclopedies)
+}
+
+async fn enrich_artist(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (lang, encyclopedies) = langue_et_encyclopedies(&headers);
+
     let repo = ArtistRepo::with_backend(state.backend.clone());
     let artist = match repo.get(id) {
         Ok(Some(a)) => a,
@@ -929,7 +1021,18 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
         .unwrap_or_default();
 
     if lastfm_key.is_empty() {
-        return Json(json!({"error": "no lastfm api key configured"})).into_response();
+        // Même forme que l'absence de clé Radio France (`podcasts.rs`) : un
+        // code stable pour qui programme contre l'API, le nom exact du réglage
+        // qui active la source, et un message dans la langue de l'interface —
+        // là où ne partait qu'une phrase technique anglaise. Le statut reste
+        // 200 : le client déployé lit `data`/`bio`, ne trouve rien et annonce
+        // « aucune information trouvée », exactement comme avant.
+        return Json(json!({
+            "error": "lastfm_cle_absente",
+            "message": crate::i18n::t(&lang, "metadata.enrich.cleLastfmAbsente"),
+            "setting": "lastfm_api_key",
+        }))
+        .into_response();
     }
 
     // Client partagé : voir `tune_core::http::client`. Apporte aussi un délai
@@ -942,7 +1045,8 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
             ("artist", &artist.name),
             ("api_key", &lastfm_key),
             ("format", "json"),
-            ("lang", "fr"),
+            // La langue de l'interface, plus « fr » en dur (#1849).
+            ("lang", lang.as_str()),
         ])
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -1001,53 +1105,40 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
                 if !bio.is_empty() {
                     bio_source = "lastfm".to_string();
                     bio_license = "CC-BY-SA-3.0".to_string();
-                    bio_lang = "fr".to_string();
+                    // Last.fm a répondu dans la langue demandée juste au-dessus.
+                    bio_lang = lang.clone();
                     bio_url = data["artist"]["url"].as_str().map(String::from);
                 }
 
-                // Fallback to Wikipedia if Last.fm bio is empty
+                // Fallback to Wikipedia if Last.fm bio is empty.
+                //
+                // Une seule boucle sur `encyclopedies` (langue de l'interface
+                // d'abord, anglais en repli) là où deux blocs jumeaux codaient
+                // `en` puis `fr` en dur.
                 if bio.is_empty() || bio.len() < 20 {
-                    if let Ok(wiki) = client
-                        .get(&format!(
-                            "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
-                            urlencoding::encode(&artist.name)
-                        ))
-                        .timeout(std::time::Duration::from_secs(10))
-                        .send()
-                        .await
-                    {
-                        if let Ok(wd) = wiki.json::<serde_json::Value>().await {
-                            if let Some(extract) = wd["extract"].as_str() {
-                                if extract.len() > bio.len() {
-                                    bio = extract.to_string();
-                                    bio_source = "wikipedia".to_string();
-                                    bio_license = "CC-BY-SA-4.0".to_string();
-                                    bio_lang = "en".to_string();
-                                    bio_url = wd["content_urls"]["desktop"]["page"]
-                                        .as_str()
-                                        .map(String::from);
-                                }
-                            }
+                    for (rang, wiki_lang) in encyclopedies.iter().enumerate() {
+                        // Le premier passage est déjà autorisé par la garde
+                        // ci-dessus ; les suivants ne servent que si ce qu'on
+                        // tient reste maigre — le seuil d'avant.
+                        if rang > 0 && !(bio.is_empty() || bio.len() < 50) {
+                            break;
                         }
-                    }
-                    // Try French Wikipedia too
-                    if bio.is_empty() || bio.len() < 50 {
-                        if let Ok(wiki_fr) = client
+                        if let Ok(wiki) = client
                             .get(&format!(
-                                "https://fr.wikipedia.org/api/rest_v1/page/summary/{}",
+                                "https://{wiki_lang}.wikipedia.org/api/rest_v1/page/summary/{}",
                                 urlencoding::encode(&artist.name)
                             ))
                             .timeout(std::time::Duration::from_secs(10))
                             .send()
                             .await
                         {
-                            if let Ok(wd) = wiki_fr.json::<serde_json::Value>().await {
+                            if let Ok(wd) = wiki.json::<serde_json::Value>().await {
                                 if let Some(extract) = wd["extract"].as_str() {
                                     if extract.len() > bio.len() {
                                         bio = extract.to_string();
                                         bio_source = "wikipedia".to_string();
                                         bio_license = "CC-BY-SA-4.0".to_string();
-                                        bio_lang = "fr".to_string();
+                                        bio_lang = wiki_lang.clone();
                                         bio_url = wd["content_urls"]["desktop"]["page"]
                                             .as_str()
                                             .map(String::from);
@@ -1077,6 +1168,13 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
                 return Json(json!({
                     "data": {
                         "bio": bio,
+                        // La langue réellement obtenue, comme le
+                        // `bio_provenance.lang` de la route sœur
+                        // `/library/artists/{id}/bio` : sans elle, un client
+                        // ne peut pas savoir si la notice qu'il affiche est
+                        // bien dans la langue qu'il a demandée. Champ ajouté,
+                        // aucun retiré.
+                        "bio_lang": bio_lang,
                         "bio_summary": bio_summary,
                         "tags": tags,
                         "similar_artists": similar,
@@ -2165,8 +2263,12 @@ async fn fetch_album_cover(
     if let Some(ref mbid_val) = mbid {
         if let Some(data) = tune_core::library::artwork::fetch_cover_art(mbid_val).await {
             let cache_dir = super::library::artwork_cache_dir();
-            let hash = tune_core::library::artwork::artwork_hash(mbid_val);
-            if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, "jpg").is_some()
+            // Adressage par le CONTENU (#1444). Route de RE-téléchargement
+            // (`force_update_cover_path`) : écrire sous `artwork_hash(mbid)`
+            // gardait l'adresse déjà distribuée, servie `immutable,
+            // max-age=31536000` — la nouvelle pochette n'apparaissait pas.
+            if let Some(hash) =
+                tune_core::library::artwork::cache_fetched_image(&data, &cache_dir, "jpg")
             {
                 repo.force_update_cover_path(id, &hash).ok();
                 return Json(json!({
@@ -2200,12 +2302,32 @@ async fn fetch_album_cover(
         )
         .await
         {
-            // Extract filename as hash or use the path
-            let hash = std::path::Path::new(&path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&path)
-                .to_string();
+            // `fetch_cover_from_discogs` dépose son fichier dans le MÊME
+            // répertoire que le cache de pochettes, mais sous un nom PRÉFIXÉ
+            // (`discogs_{md5}.jpg`), et cette route annonçait le radical
+            // (`discogs_{md5}`) comme `cover_path`. Ce n'est pas un condensat :
+            // `is_hex_hash` le refuse (le souligné n'est pas un hexdigit), donc
+            // la lecture le traitait comme un CHEMIN et cherchait
+            // `md5("discogs_{md5}").jpg` — un fichier qui n'a jamais existé.
+            // Toute pochette trouvée par cette route était écrite puis servie
+            // en 404 (`artwork_cache_miss`). C'est le défaut #2567, et le seul
+            // endroit du dépôt où il subsistait.
+            //
+            // Ré-adressée par le CONTENU (#1444) : le condensat annoncé est
+            // celui des octets, donc toujours servable. Le fichier préfixé
+            // reste sur le disque, orphelin comme les autres (purge : ticket
+            // séparé).
+            let Ok(octets) = std::fs::read(&path) else {
+                return Json(json!({"ok": false, "error": "cover fetched but unreadable"}))
+                    .into_response();
+            };
+            let cache_dir = super::library::artwork_cache_dir();
+            let Some(hash) =
+                tune_core::library::artwork::cache_fetched_image(&octets, &cache_dir, "jpg")
+            else {
+                return Json(json!({"ok": false, "error": "failed to save to cache"}))
+                    .into_response();
+            };
             repo.force_update_cover_path(id, &hash).ok();
             return Json(json!({
                 "ok": true,
@@ -2511,7 +2633,7 @@ fn known_genres(state: &AppState) -> Vec<String> {
              WHERE genre IS NOT NULL AND genre <> '' ORDER BY genre",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| row.into_iter().next().and_then(|v| v.as_string()))
         .filter(|g| g.chars().count() >= 3)
@@ -2530,7 +2652,7 @@ fn tracks_missing_genre(state: &AppState) -> Vec<(i64, String, String)> {
                AND file_path IS NOT NULL AND file_path <> ''",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -2685,5 +2807,112 @@ mod genre_from_path_tests {
             genre_from_path("/mnt/music/Miles Davis/Kind of Blue/01.flac", &genres()),
             None
         );
+    }
+}
+
+/// La langue des biographies suit `Accept-Language` (#1849, famille de #2874).
+///
+/// La route `GET /metadata/artists/{id}/enrich` n'extrayait aucun en-tête :
+/// `("lang", "fr")` à Last.fm, `bio_lang: "fr"` en dur, et `en.wikipedia`
+/// interrogée AVANT `fr.wikipedia`. Ces cas pincent les deux décisions que la
+/// poignée tire désormais de l'en-tête, et rien d'autre — aucun appel réseau.
+#[cfg(test)]
+mod langue_des_bios {
+    use super::langue_et_encyclopedies;
+    use axum::http::HeaderMap;
+    use axum::http::header::ACCEPT_LANGUAGE;
+
+    /// Construit une requête avec — ou sans — en-tête : un `None` doit
+    /// produire une carte VIDE, pas un en-tête vide.
+    fn entetes(valeur: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(v) = valeur {
+            h.insert(ACCEPT_LANGUAGE, v.parse().unwrap());
+        }
+        h
+    }
+
+    /// Le cas exact du défaut : interface anglaise, aucun `?lang=` (le client
+    /// n'en envoie sur aucune route « bio »). L'ancien code retenait `fr` et
+    /// interrogeait `en` puis `fr` ; ici l'anglais gouverne, et il n'y a rien
+    /// à répéter derrière lui.
+    #[test]
+    fn en_interface_anglaise_la_langue_est_l_anglais() {
+        let (lang, wikis) = langue_et_encyclopedies(&entetes(Some("en")));
+        assert_eq!(lang, "en", "Last.fm doit être interrogée en anglais");
+        assert_eq!(
+            wikis,
+            vec!["en".to_string()],
+            "l'anglais étant déjà la langue demandée, il ne se répète pas"
+        );
+    }
+
+    /// L'autre sens du défaut : interface française et Last.fm muette. Avant,
+    /// `en.wikipedia` répondait la première et sa notice ANGLAISE était
+    /// retenue — un texte anglais dans une interface française.
+    #[test]
+    fn en_interface_francaise_le_francais_est_interroge_avant_l_anglais() {
+        let (lang, wikis) = langue_et_encyclopedies(&entetes(Some("fr-FR,fr;q=0.9,en;q=0.8")));
+        assert_eq!(lang, "fr");
+        assert_eq!(
+            wikis,
+            vec!["fr".to_string(), "en".to_string()],
+            "la langue de l'utilisateur passe la première, l'anglais reste le repli"
+        );
+    }
+
+    /// Une langue ni française ni anglaise doit être servie la première, avec
+    /// l'anglais en repli — et l'en-tête pondéré réduit à sa base.
+    #[test]
+    fn une_locale_ponderee_est_reduite_a_sa_base() {
+        let (lang, wikis) = langue_et_encyclopedies(&entetes(Some("de-DE,de;q=0.9,en;q=0.8")));
+        assert_eq!(lang, "de");
+        assert_eq!(wikis, vec!["de".to_string(), "en".to_string()]);
+    }
+
+    /// Aucun en-tête : le repli reste `fr`, celui que porte déjà
+    /// `lang_from_header` — le comportement d'avant pour un client muet.
+    #[test]
+    fn sans_entete_le_repli_reste_le_francais() {
+        let (lang, wikis) = langue_et_encyclopedies(&entetes(None));
+        assert_eq!(lang, "fr");
+        assert_eq!(wikis, vec!["fr".to_string(), "en".to_string()]);
+    }
+
+    /// Une locale que l'interface ne parle pas retombe sur `fr`, comme
+    /// partout ailleurs : la liste des encyclopédies suit ce repli, elle n'est
+    /// jamais construite sur la locale refusée.
+    #[test]
+    fn une_locale_non_supportee_retombe_sur_le_repli() {
+        let (lang, wikis) = langue_et_encyclopedies(&entetes(Some("pt-BR,pt;q=0.9")));
+        assert_eq!(lang, "fr");
+        assert_eq!(wikis, vec!["fr".to_string(), "en".to_string()]);
+        assert!(
+            !wikis.iter().any(|w| w == "pt"),
+            "aucune Wikipédia « pt » ne doit être interrogée : la locale est refusée en amont"
+        );
+    }
+
+    /// Aucune langue supportée ne doit produire de liste vide, ni une liste
+    /// qui répète deux fois la même encyclopédie.
+    #[test]
+    fn aucune_langue_ne_produit_de_liste_vide_ni_de_doublon() {
+        for langue in crate::i18n::SUPPORTED {
+            let (lang, wikis) = langue_et_encyclopedies(&entetes(Some(langue)));
+            assert_eq!(&lang.as_str(), langue);
+            assert!(!wikis.is_empty(), "«{langue}» n'interroge aucune source");
+            let mut vues = wikis.clone();
+            vues.sort();
+            vues.dedup();
+            assert_eq!(vues.len(), wikis.len(), "«{langue}» répète une source");
+            assert_eq!(
+                wikis[0], *langue,
+                "«{langue}» doit être interrogée la première"
+            );
+            assert!(
+                wikis.iter().any(|w| w == "en"),
+                "«{langue}» doit garder l'anglais en repli universel"
+            );
+        }
     }
 }

@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 use unicode_normalization::UnicodeNormalization;
 
 use tune_core::db::artist_repo::ArtistRepo;
@@ -60,6 +61,12 @@ impl ScanGate {
                     return Some(ScanLease {
                         gate: self,
                         generation,
+                        // Le balayage acoustique s'efface devant le scan tant
+                        // que cette marque vit (#2469, point 3). Elle est posée
+                        // ICI, dans la seule branche qui délivre un jeton, et
+                        // baissée par le `Drop` du jeton : les deux gestes ne
+                        // peuvent pas se désynchroniser.
+                        _marque_acoustique: tune_core::scanner::activite::MarqueDeScan::poser(),
                     });
                 }
                 Err(current) => observed = current,
@@ -121,6 +128,10 @@ impl ScanGate {
 pub(crate) struct ScanLease<'a> {
     gate: &'a ScanGate,
     generation: u64,
+    /// Tenue pour sa durée de vie seule : elle dit au balayage acoustique qu'un
+    /// scan de bibliothèque tourne. Son `Drop` s'exécute avec celui du jeton,
+    /// donc aussi quand la tâche de scan panique.
+    _marque_acoustique: tune_core::scanner::activite::MarqueDeScan,
 }
 
 impl Drop for ScanLease<'_> {
@@ -145,11 +156,24 @@ pub(crate) fn scan_cancel_requested() -> bool {
 mod scan_gate_tests {
     use super::ScanGate;
 
+    /// Chaque `ScanGate` de test est local, mais le drapeau que son jeton lève
+    /// pour le balayage acoustique est un COMPTEUR DE PROCESSUS (#2469,
+    /// point 3). Deux tests qui tiennent un jeton en même temps se voient donc
+    /// mutuellement, et `le_jeton_de_scan_efface_le_balayage_acoustique`
+    /// deviendrait intermittent. Tout test qui prend un jeton prend d'abord ce
+    /// verrou.
+    static PORTE_SERIALISEE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serialiser() -> std::sync::MutexGuard<'static, ()> {
+        PORTE_SERIALISEE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Reproduit directement #2459 : Stop est demandé sur A, puis une seconde
     /// requête tente de démarrer B. Le refus de B ne doit jamais remettre le
     /// bit d'annulation de A à zéro.
     #[test]
     fn un_second_depart_refuse_ne_desarme_pas_stop() {
+        let _serialise = serialiser();
         let gate = ScanGate::new();
         let scan_a = gate.try_acquire().expect("le premier scan doit demarrer");
 
@@ -171,10 +195,43 @@ mod scan_gate_tests {
         );
     }
 
+    /// #2469, point 3 — le jeton de scan doit RENDRE VISIBLE le scan au
+    /// balayage acoustique, et le lui cacher dès qu'il est rendu.
+    ///
+    /// C'est le câblage qui fait vivre la priorité demandée par Thierry
+    /// Clemont : sans lui, `scan_bibliotheque_en_cours()` resterait faux à
+    /// jamais et la garde ajoutée dans `embedding.rs` serait du code mort —
+    /// exactement le défaut que #2469 a déjà rencontré une fois, quand
+    /// `spawn_scan_scheduler` n'était appelé de nulle part.
+    #[test]
+    fn le_jeton_de_scan_efface_le_balayage_acoustique() {
+        use tune_core::scanner::activite::scan_bibliotheque_en_cours;
+
+        let _serialise = serialiser();
+        let gate = ScanGate::new();
+        assert!(
+            !scan_bibliotheque_en_cours(),
+            "aucun scan ne tourne avant d'avoir pris la porte"
+        );
+
+        let scan = gate.try_acquire().expect("le scan doit demarrer");
+        assert!(
+            scan_bibliotheque_en_cours(),
+            "un scan qui tourne doit etre visible du balayage acoustique"
+        );
+
+        drop(scan);
+        assert!(
+            !scan_bibliotheque_en_cours(),
+            "la fin du scan doit rendre la main au balayage acoustique"
+        );
+    }
+
     /// Une requête Stop sans propriétaire ne doit pas empoisonner le prochain
     /// scan. C'est l'autre moitié de l'attachement à une génération précise.
     #[test]
     fn stop_sans_scan_actif_ne_fuit_pas_vers_le_suivant() {
+        let _serialise = serialiser();
         let gate = ScanGate::new();
         assert!(!gate.request_cancel());
         let _scan = gate.try_acquire().expect("le scan doit demarrer");
@@ -188,6 +245,7 @@ mod scan_gate_tests {
     fn deux_departs_concurrents_n_ont_qu_un_proprietaire() {
         use std::sync::{Arc, Barrier, mpsc};
 
+        let _serialise = serialiser();
         let gate = ScanGate::new();
         let depart = Arc::new(Barrier::new(3));
         let maintien = Arc::new(Barrier::new(3));
@@ -362,13 +420,12 @@ pub(crate) fn roots_gone_empty(
 /// fait `replace('/', "\\")` sous `cfg(windows)`, et `track_repo.rs` le dit —
 /// « the server's `MAIN_SEPARATOR` is the separator stored in
 /// `tracks.file_path` », avec l'exemple `G:\Blues 2\%`.
+///
+/// L'implémentation vit désormais dans `tune_core::metadata::enrich_scope` :
+/// l'enrichissement par répertoire (#1660) a besoin du MÊME contrat, et deux
+/// copies de ce prédicat ont déjà divergé trois fois sur le séparateur (#2016).
 pub(crate) fn sous_le_dossier(path: &str, dossier: &str) -> bool {
-    let d = dossier.trim_end_matches(['/', '\\']);
-    if path == d {
-        return true;
-    }
-    path.strip_prefix(d)
-        .is_some_and(|reste| reste.starts_with('/') || reste.starts_with('\\'))
+    tune_core::metadata::enrich_scope::sous_le_dossier(path, dossier)
 }
 
 /// Ce que la purge de fin de scan a le droit de faire d'une piste absente du
@@ -494,12 +551,9 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 /// The manual scan and the auto/watcher scan MUST share this one implementation
 /// so they can't diverge again — they previously held two copies and only one
 /// received the NFC fix.
-pub(crate) fn file_needs_scan(
-    path: &std::path::Path,
-    existing_tracks: &std::collections::HashMap<String, (i64, Option<f64>, Option<i64>)>,
-) -> bool {
+pub fn file_needs_scan(path: &std::path::Path, existing_tracks: &CarteDesChemins) -> bool {
     let path_str: String = path.to_string_lossy().nfc().collect();
-    if let Some(&(_, existing_mtime, existing_size)) = existing_tracks.get(path_str.as_str()) {
+    if let Some(info) = existing_tracks.get(path_str.as_str()) {
         if let Ok(file_meta) = path.metadata() {
             let mtime = file_meta
                 .modified()
@@ -507,12 +561,84 @@ pub(crate) fn file_needs_scan(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let unchanged = existing_mtime.map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
-                && existing_size.map_or(false, |s| s == file_meta.len() as i64);
+            let unchanged = info.mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
+                && info.taille.is_some_and(|s| s == file_meta.len() as i64);
             return !unchanged;
         }
     }
     true
+}
+
+/// `file_path` → la ligne de `tracks` qui le possède, toutes sources.
+///
+/// Voir [`tune_core::db::track_repo::InfoFichier`] : la carte a la portée de
+/// la contrainte `file_path TEXT UNIQUE`, et chaque consommateur qui veut une
+/// portée plus étroite la découpe lui-même.
+pub type CarteDesChemins =
+    std::collections::HashMap<String, tune_core::db::track_repo::InfoFichier>;
+
+/// Ce que le scan doit faire du fichier qu'il vient de rencontrer.
+///
+/// # Pourquoi cette décision est une fonction, et une seule
+///
+/// C'est ICI que #2939 se jouait. La règle est simple — « une ligne possède
+/// déjà ce `file_path` ? alors on la met à jour, sinon on insère » — mais elle
+/// était écrite deux fois (scan manuel et scan automatique) et elle
+/// s'appuyait, dans les deux copies, sur une carte chargée avec
+/// `WHERE source = 'local'`. La contrainte qui tranche vraiment,
+/// `file_path TEXT UNIQUE`, ne connaît pas `source`. Une ligne posée par un
+/// importateur de bibliothèque (`roon_import`, `plex_import`, `jriver` — les
+/// seules sources non locales qui portent un `file_path`, les flux Qobuz/Tidal
+/// n'en ont jamais et le cache hors-ligne vit dans sa propre table
+/// `offline_cache`) était donc invisible à la carte, visible à la contrainte :
+/// insertion demandée, insertion refusée, piste perdue.
+///
+/// Chez Alain Bonnel (fil 1313, 08/08/2026) c'est un album entier — les
+/// quatorze pistes de *As We Once Were* — qui n'est jamais entré en
+/// bibliothèque, pendant que le scan se déclarait sans erreur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictEcriture {
+    /// Le fichier n'a pas bougé depuis le dernier scan : ne pas relire ses
+    /// balises. (Jamais rendu en mode `force`.)
+    Inchange,
+    /// Une ligne possède déjà ce chemin : c'est ELLE qu'on met à jour.
+    MettreAJour {
+        /// `tracks.id` de cette ligne.
+        id: i64,
+        /// Vrai quand elle n'était pas encore `source = 'local'` : le scan
+        /// vient de la relire sur le disque, il l'adopte.
+        adopter: bool,
+    },
+    /// Personne ne possède ce chemin : insertion.
+    Inserer,
+}
+
+/// Applique la règle ci-dessus à un fichier du lot.
+///
+/// `mtime` et `taille` sont ceux lus sur le disque par le parcours ; `force`
+/// désactive le raccourci « inchangé » pour que les album_id soient
+/// re-résolus.
+pub fn verdict_ecriture(
+    chemin: &str,
+    mtime: u64,
+    taille: u64,
+    force: bool,
+    carte: &CarteDesChemins,
+) -> VerdictEcriture {
+    let Some(info) = carte.get(chemin) else {
+        return VerdictEcriture::Inserer;
+    };
+    if !force {
+        let a_change = info.mtime.is_none_or(|m| (m - mtime as f64).abs() > 0.5)
+            || info.taille != Some(taille as i64);
+        if !a_change {
+            return VerdictEcriture::Inchange;
+        }
+    }
+    VerdictEcriture::MettreAJour {
+        id: info.id,
+        adopter: !info.est_locale(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -650,6 +776,244 @@ impl SuiteDuScan {
         })
     }
 }
+
+/// Les chiffres d'un scan complet, rassemblés UNE fois pour les trois
+/// consommateurs du rapport de fin de scan (#2012).
+///
+/// Ces trois consommateurs sont :
+///
+/// | consommateur | forme | lu par |
+/// |---|---|---|
+/// | réglage `scan_result` | `settings.set("scan_result", …)` | `GET /scan/status` |
+/// | bus d'événements | `library.scan.completed` | le bandeau de fin de scan |
+/// | fichier de rapport | `<db>-scan-report.json` | `GET /scan/report` |
+///
+/// Ils étaient trois `json!` d'une vingtaine de clés, recopiés à la main. Le
+/// mode d'échec est silencieux par construction : ajouter une clé à deux
+/// exemplaires sur trois ne casse aucune compilation et ne fait échouer aucun
+/// test fonctionnel — le champ manque simplement chez un consommateur, et
+/// personne ne s'en aperçoit avant de chercher pourquoi une information
+/// « qu'on envoie pourtant » n'arrive pas. C'est arrivé trois fois :
+///
+/// - `skipped_unsupported_by_ext` et `skipped_unsupported_reasons` (#1763),
+///   dans le seul fichier de rapport — écart VOULU, voir
+///   [`ChiffresDeFinDeScan::rapport_du_fichier`] ;
+/// - `metadata_failed`, dans `scan_result` et le fichier mais PAS sur le bus —
+///   écart non voulu, jamais décidé, résorbé ici en publiant la clé partout ;
+/// - `removed` (#2146), qui ne figurait dans aucun des trois.
+///
+/// Ce type ne DÉCIDE rien : il nomme les chiffres et les met en forme. Les
+/// émissions dégradées de `library.scan.completed` (sorties d'échec précoces,
+/// annulation) ne passent pas par ici — leur charge utile réduite est voulue,
+/// et les uniformiser les rendrait indiscernables d'un scan abouti.
+pub(crate) struct ChiffresDeFinDeScan<'a> {
+    pub(crate) total_discovered: usize,
+    pub(crate) missing_dirs: &'a [String],
+    pub(crate) missing_dir_reasons: &'a [String],
+    pub(crate) error_dirs: &'a [String],
+    /// Ce que la purge a effectivement retiré : le client lit cette clé pour
+    /// le bandeau de fin de scan (#2146).
+    pub(crate) pistes_supprimees: i64,
+    pub(crate) racines_videes: &'a [String],
+    pub(crate) sous_arbres_proteges: &'a [String],
+    pub(crate) pistes_protegees: i64,
+    pub(crate) pistes_hors_perimetre: i64,
+    /// Le plafond volumétrique a-t-il refusé, et sur quel nombre ? C'est ce
+    /// nombre qu'il faut renvoyer dans `?confirm_purge=` pour autoriser la
+    /// purge. 0 = pas de refus. Sans ça, le refus n'existe que dans les logs :
+    /// l'utilisateur ne peut pas connaître le geste à faire.
+    pub(crate) purge_refusee_candidats: i64,
+    pub(crate) scan_stats: &'a tune_core::scanner::walker::ScanStats,
+    pub(crate) inserted: i64,
+    pub(crate) updated: i64,
+    pub(crate) skipped: i64,
+    pub(crate) skipped_unchanged: i64,
+    pub(crate) skipped_duplicate: i64,
+    pub(crate) skipped_no_metadata: i64,
+    pub(crate) skipped_unsupported: i64,
+    pub(crate) db_insert_failed: i64,
+    pub(crate) db_update_failed: i64,
+    pub(crate) artwork_extracted: i64,
+    /// Le sort de la passe d'enrichissement (#2507) — [`SuiteDuScan::rapport`].
+    pub(crate) auto_enrichment: Value,
+    /// Fichiers audio rencontrés mais dont Tune ne lit pas le format, comptés
+    /// par extension (`{"mpc": 280, "cue": 132}`) — #1763.
+    pub(crate) skipped_by_ext: &'a std::collections::HashMap<String, usize>,
+    /// Motif lisible associé à chaque compteur ci-dessus.
+    pub(crate) skipped_reasons: &'a std::collections::HashMap<String, String>,
+    /// Les CHEMINS des fichiers écartés, une liste par motif (#2050).
+    ///
+    /// Les compteurs disent COMBIEN, jamais LESQUELS. Le testeur qui demande
+    /// « la liste des fichiers ignorés » ne peut aujourd'hui l'obtenir pour
+    /// aucun des trois motifs : `skipped_unsupported` n'existe qu'en décompte
+    /// par extension, `skipped_no_metadata` n'existe qu'en `warn!` un fichier
+    /// à la fois, et `skipped_duplicate` n'existe qu'en `debug!` — donc nulle
+    /// part, au niveau de journalisation livré.
+    ///
+    /// Plafonnées à [`tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES`] :
+    /// un échantillon nominatif, adossé à des compteurs exhaustifs.
+    pub(crate) skipped_unsupported_paths: &'a [String],
+    pub(crate) skipped_no_metadata_paths: &'a [String],
+    pub(crate) skipped_duplicate_paths: &'a [String],
+    /// Ce que les feuilles CUE de la bibliothèque décrivent réellement (#1763).
+    ///
+    /// Sans cela le rapport dit « 2 600 fichiers `.cue` ignorés » et s'arrête
+    /// là — un chiffre qui ne distingue pas la feuille prête à être découpée
+    /// de celle qui a perdu son FLAC, alors que c'est toute la différence
+    /// entre un album récupérable et un album fantôme.
+    pub(crate) cue: &'a tune_core::scanner::cue_album::InventaireCue,
+}
+
+impl ChiffresDeFinDeScan<'_> {
+    /// Le rapport de fin de scan, tel que le lisent les trois consommateurs.
+    ///
+    /// Une seule vérité : `scan_result` et `library.scan.completed` le
+    /// publient tel quel, le fichier de `/scan/report` l'étend de deux clés
+    /// (voir [`Self::rapport_du_fichier`]). Toute clé ajoutée ici arrive donc
+    /// chez les trois d'un coup — c'est tout l'objet de ce type.
+    pub(crate) fn rapport(&self) -> Value {
+        json!({
+            "total_files": self.total_discovered,
+            "missing_dirs": self.missing_dirs,
+            "missing_dir_reasons": self.missing_dir_reasons,
+            "error_dirs": self.error_dirs,
+            "removed": self.pistes_supprimees,
+            "emptied_roots": self.racines_videes,
+            "protected_subtrees": self.sous_arbres_proteges,
+            "tracks_protected": self.pistes_protegees,
+            "tracks_out_of_scope": self.pistes_hors_perimetre,
+            "purge_refused": self.purge_refusee_candidats > 0,
+            "purge_refused_candidates": self.purge_refusee_candidats,
+            "parsed": self.scan_stats.total_files,
+            "metadata_ok": self.scan_stats.metadata_ok,
+            // Manquait sur le bus d'événements, et sur lui seul. Aucune
+            // décision ne l'en avait écarté : une recopie a sauté la ligne.
+            "metadata_failed": self.scan_stats.metadata_failed,
+            "metadata_timeout": self.scan_stats.metadata_timeout,
+            "inserted": self.inserted,
+            "updated": self.updated,
+            "skipped": self.skipped,
+            "skipped_unchanged": self.skipped_unchanged,
+            "skipped_duplicate": self.skipped_duplicate,
+            "skipped_no_metadata": self.skipped_no_metadata,
+            "skipped_unsupported": self.skipped_unsupported,
+            "db_insert_failed": self.db_insert_failed,
+            "db_update_failed": self.db_update_failed,
+            "artwork_extracted": self.artwork_extracted,
+            "auto_enrichment": self.auto_enrichment,
+            "failed_paths": self.scan_stats.failed_paths,
+            // Des COMPTEURS, donc ils partent chez les trois consommateurs —
+            // comme tous les autres. Seule la liste nominative des feuilles
+            // écartées reste au fichier (`cue_sheets_skipped_paths`), pour la
+            // même raison que les autres chemins : le bus d'événements est
+            // diffusé à tous les clients connectés.
+            "cue_sheets": self.cue_sheets(),
+        })
+    }
+
+    /// Les compteurs des feuilles CUE, sous une clé unique (#1763).
+    ///
+    /// Un objet plutôt que huit clés à plat : ces chiffres ne se lisent que
+    /// les uns par rapport aux autres — « 14 écartées » ne veut rien dire sans
+    /// « sur 132 vues ».
+    fn cue_sheets(&self) -> Value {
+        json!({
+            "folders": self.cue.dossiers,
+            "folders_not_inventoried": self.cue.dossiers_non_inventories,
+            "albums": self.cue.albums,
+            "albums_multi_sheet": self.cue.albums_multi_feuilles,
+            "sheets_used": self.cue.feuilles_retenues,
+            "tracks": self.cue.pistes,
+            "sheets_skipped": self.cue.feuilles_ecartees,
+            "sheets_skipped_by_reason": self.cue.ecarts_par_cle,
+        })
+    }
+
+    /// Le rapport écrit dans `<db>-scan-report.json`, lu par `GET /scan/report`.
+    ///
+    /// Seul écart légitime avec [`Self::rapport`] : l'inventaire des formats
+    /// non lus (#1763). Presque toujours vide ; quand il ne l'est pas, c'est
+    /// la seule chose qui explique à l'utilisateur pourquoi des albums
+    /// manquent, au lieu de le laisser chercher un bug de scanner. Il tient
+    /// dans un fichier qu'on va chercher, pas dans un réglage relu à chaque
+    /// `/scan/status` ni dans un événement diffusé à tous les clients.
+    pub(crate) fn rapport_du_fichier(&self) -> Value {
+        let mut rapport = self.rapport();
+        rapport["skipped_unsupported_by_ext"] = json!(self.skipped_by_ext);
+        // Motif lisible associé à chaque compteur. Additif pour les clients
+        // existants qui ne connaissent que `skipped_unsupported_by_ext`.
+        rapport["skipped_unsupported_reasons"] = json!(self.skipped_reasons);
+        // La liste demandée (#2050). Elle sort par le FICHIER seulement, pour
+        // la même raison que l'inventaire des formats : ce sont des chemins de
+        // l'utilisateur, et le bus d'événements les diffuserait à tous les
+        // clients connectés à chaque fin de scan.
+        rapport["skipped_unsupported_paths"] = json!(self.skipped_unsupported_paths);
+        rapport["skipped_no_metadata_paths"] = json!(self.skipped_no_metadata_paths);
+        rapport["skipped_duplicate_paths"] = json!(self.skipped_duplicate_paths);
+        // LESQUELLES, pas seulement combien (#1763). Même règle que ci-dessus :
+        // ce sont des chemins de l'utilisateur, ils sortent par le fichier.
+        rapport["cue_sheets_skipped_paths"] = json!(self.cue.chemins_ecartes);
+        // Dire que la liste est un échantillon, plutôt que de laisser croire
+        // qu'elle est complète : une liste muette de 500 entrées face à
+        // 40 000 fichiers écartés se lit comme un rapport faux.
+        rapport["skipped_paths_truncated"] = json!(self.chemins_tronques());
+        rapport
+    }
+
+    /// Au moins une liste de chemins a-t-elle atteint son plafond ?
+    ///
+    /// Comparer aux compteurs ne marcherait pas : `skipped_unsupported` ne
+    /// compte que les fichiers écartés dans la boucle d'import, alors que la
+    /// liste fusionne aussi ceux que le PARCOURS a écartés sans jamais les
+    /// faire entrer dans la boucle. Le plafond, lui, est la même constante des
+    /// deux côtés.
+    fn chemins_tronques(&self) -> bool {
+        const PLAFOND: usize = tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES;
+        self.skipped_unsupported_paths.len() >= PLAFOND
+            || self.skipped_no_metadata_paths.len() >= PLAFOND
+            || self.skipped_duplicate_paths.len() >= PLAFOND
+            // La quatrième liste (#1763) obéit au même plafond et se serait
+            // tronquée en silence : c'est exactement le défaut « un chemin
+            // corrigé, les autres nus » que cette clé existe pour éviter.
+            || self.cue.chemins_ecartes.len() >= PLAFOND
+    }
+}
+
+/// Annonce un scan en cours : l'horodatage PUIS le statut.
+///
+/// Chemin d'annonce UNIQUE, partagé par les trois scans — manuel, planifié et
+/// de démarrage. C'est le défaut de #2976 : le scan de démarrage écrivait
+/// `scan_status = "scanning"` tout seul, sans jamais poser `scan_started_at`.
+/// Le garde-fou de mise à jour (`system::update::scan_in_progress`) borne le
+/// report par une fenêtre d'ancienneté de 12 h, mais cette fenêtre n'a rien à
+/// mesurer sans date : un processus tué pendant le scan de démarrage laissait
+/// « scanning » en base pour toujours et différait les mises à jour à vie, en
+/// promettant une reprise « une fois le scan terminé » d'un scan mort depuis
+/// des semaines.
+///
+/// L'ORDRE des deux écritures n'est pas cosmétique. Le garde-fou lit d'abord
+/// `scan_status` et n'ouvre `scan_started_at` que si le premier vaut
+/// "scanning" : écrire le statut en premier laisserait une fenêtre — courte,
+/// mais réelle — où un scan bien vivant se présente sans date, donc comme
+/// périmé depuis #2976. En posant la date d'abord, « scanning » n'est jamais
+/// observable sans elle.
+///
+/// Si l'écriture de la date échoue, le statut est tout de même posé et le scan
+/// retombera du côté « périmé » du garde-fou : la mise à jour passera et
+/// pourra couper ce scan. C'est le compromis voulu — un scan coupé se relance,
+/// un blocage de mise à jour sans date ne se répare jamais tout seul.
+pub(crate) fn marquer_scan_en_cours(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    if let Err(e) = settings.set("scan_started_at", &chrono_now()) {
+        tracing::warn!(error = %e, "scan_started_at_set_failed");
+    }
+    if let Err(e) = settings.set("scan_status", "scanning") {
+        tracing::warn!(error = %e, "scan_status_set_failed");
+    }
+}
+
 /// Spawn a background library scan (fire-and-forget). Shared by the `/scan`
 /// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
@@ -684,13 +1048,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Err(e) = settings.set("scan_status", "scanning") {
-        tracing::warn!(error = %e, "scan_status_set_failed");
-    }
-    if let Err(e) = settings.set("scan_started_at", &chrono_now()) {
-        tracing::warn!(error = %e, "scan_started_at_set_failed");
-    }
+    marquer_scan_en_cours(&state.backend);
 
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
@@ -719,6 +1077,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // spawn_blocking panique. Le Drop du jeton libère alors la génération.
         let _scan_lease = scan_lease;
         let db_for_panic = db.clone();
+        // Le bus est MOVÉ dans la tâche bloquante ci-dessous : sans cette
+        // copie, la sortie par panique n'a plus rien pour parler.
+        let event_bus_pour_panne = event_bus.clone();
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
         let raw_dirs = super::get_music_dirs_list(&db);
@@ -847,6 +1208,26 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let error_dirs = list_result.error_dirs;
         let mut skipped_by_ext = list_result.skipped_by_ext;
         let mut skipped_reasons = list_result.skipped_reasons;
+        let mut skipped_unsupported_paths = list_result.skipped_paths;
+        // Les feuilles CUE, relues APRÈS le parcours (#1763). Le parcours les
+        // a comptées comme des fichiers non lus et n'en a retenu que les
+        // dossiers — les ouvrir pendant le parcours ajouterait une lecture
+        // bloquante par fichier sur un NAS, ce que le parcours s'interdit.
+        // Aucune écriture en base : c'est le rapport qui gagne la vérité, pas
+        // la bibliothèque. Presque toujours instantané, parce que la liste est
+        // vide dans l'immense majorité des bibliothèques.
+        let inventaire_cue =
+            tune_core::scanner::cue_album::inventorier(&list_result.dossiers_avec_feuille_cue);
+        if inventaire_cue.dossiers > 0 {
+            tracing::info!(
+                dossiers = inventaire_cue.dossiers,
+                albums = inventaire_cue.albums,
+                albums_multi_feuilles = inventaire_cue.albums_multi_feuilles,
+                pistes = inventaire_cue.pistes,
+                feuilles_ecartees = inventaire_cue.feuilles_ecartees,
+                "scan_cue_sheets_inventoried — feuilles CUE : ce qu'elles décrivent"
+            );
+        }
         let files = list_result.files;
         let total_discovered = files.len();
 
@@ -907,7 +1288,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // A DB read error must ABORT the scan, not degrade into an empty map:
         // with an empty map every file on disk looks new, so a transient DB
         // hiccup would re-insert the whole library as duplicates.
-        let existing_tracks = match track_repo.get_all_local_file_info() {
+        let existing_tracks = match track_repo.get_all_file_info_by_path() {
             Ok(map) => map,
             Err(e) => {
                 tracing::error!(error = %e, "scan_aborted_existing_tracks_read_failed");
@@ -1004,8 +1385,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let cache_dir = crate::routes::library::artwork_cache_dir();
         let mut inserted = 0i64;
         let mut updated = 0i64;
-        let mut db_insert_failed = 0i64;
-        let mut db_update_failed = 0i64;
+        // `db_insert_failed` / `db_update_failed` ne sont plus tenus ici : le
+        // lot REND son manque à écrire au parcours, qui l'agrège dans
+        // `ScanStats` (#2939). Un compteur tenu de ce côté-ci restait invisible
+        // au résumé publié par `batched_scan_complete` — la ligne du journal
+        // qui annonçait `metadata_failed=0` douze millisecondes avant quatorze
+        // refus d'insertion.
         // `skipped` stays the aggregate the UI already shows. Each cause is
         // broken out below, including only those duplicate candidates whose
         // complete files were confirmed byte-for-byte.
@@ -1014,6 +1399,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut skipped_duplicate = 0i64;
         let mut skipped_no_metadata = 0i64;
         let mut skipped_unsupported = 0i64;
+        // Les CHEMINS, en regard des compteurs ci-dessus (#2050). Plafonnés :
+        // voir `PLAFOND_CHEMINS_ECARTES`.
+        let mut skipped_no_metadata_paths: Vec<String> = Vec::new();
+        let mut skipped_duplicate_paths: Vec<String> = Vec::new();
         let total_to_scan = files_to_scan.len() as i64;
         let total = total_to_scan + pre_skipped;
         let mut last_progress_emit = std::time::Instant::now();
@@ -1023,8 +1412,16 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // startup + watcher scans. Owns the cross-batch caches (artist, album,
         // covers, per-folder album-artist pinning), the per-batch compilation
         // decision, and the artwork-extracted counter.
+        // `force` commande aussi la relecture des POCHETTES : sans lui, le
+        // « Scan complet » relit bien les fichiers mais la sonde héritée du
+        // cache (adressée par le chemin) rend l'ancienne image et le `COALESCE`
+        // de `update_cover_path` refuse de la remplacer en base. Remplacer sa
+        // `cover.jpg` n'avait alors aucun chemin vers l'écran (#3028). Même
+        // arbitrage que le genre d'album plus bas : un scan forcé est une
+        // demande explicite de reconstruire depuis les fichiers.
         let mut importer =
-            crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
+            crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone())
+                .with_force_artwork(force);
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
 
@@ -1041,13 +1438,18 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // batches were already read by the walker, but no DB work is
                 // done for them.
                 if scan_cancel_requested() {
-                    return;
+                    // Rien n'a été présenté à la base : rien n'a pu être
+                    // refusé. Un scan arrêté n'est pas un scan qui perd.
+                    return tune_core::scanner::walker::EcrituresDuLot::SANS_PERTE;
                 }
                 // Collect tracks to batch-insert and batch-update
                 let mut to_insert: Vec<tune_core::db::models::Track> =
                     Vec::with_capacity(batch.len());
                 let mut to_update: Vec<tune_core::db::models::Track> =
                     Vec::with_capacity(batch.len() / 4);
+                // Lignes de ce lot qui existaient sous une source d'importation
+                // et que le scan reprend à son compte (#2939).
+                let mut a_adopter: Vec<i64> = Vec::new();
 
                 // BEGIN transaction for this batch (SQLite only — PG uses autocommit
                 // to avoid "current transaction is aborted" cascading failures)
@@ -1098,38 +1500,42 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         // file made the progress bar stop short of 100%.
                         skipped += 1;
                         skipped_no_metadata += 1;
+                        // Le chemin ne vivait que dans ce `warn!` : hors de
+                        // portée de qui lit le rapport (#2050).
+                        tune_core::scanner::walker::pousser_chemin_ecarte(
+                            &mut skipped_no_metadata_paths,
+                            sf.path.clone(),
+                        );
                         continue;
                     }
 
-                    // Early-exit: skip unchanged files BEFORE resolving artist/album.
-                    // Without this, get_or_create_with_mbid can create a ghost album
-                    // entry (with cover art but no tracks) for files that are ultimately
-                    // skipped — the root cause of "duplicate covers after rescan" (#593).
-                    // Force mode bypasses this so album_id gets re-resolved.
-                    if !force {
-                        if let Some(&(_existing_id, existing_mtime, existing_size)) =
-                            existing_tracks.get(&sf.path)
-                        {
-                            let file_changed = existing_mtime
-                                .map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
-                                || existing_size.map_or(true, |s| s != sf.file_size as i64);
-                            if !file_changed {
-                                skipped += 1;
-                                skipped_unchanged += 1;
-                                continue;
-                            }
-                        }
+                    // Insertion, mise à jour ou rien : UNE règle, partagée avec
+                    // le scan automatique (#2939). Prise AVANT
+                    // `importer.import` — sans quoi `get_or_create_with_mbid`
+                    // fabrique un album fantôme (pochette, zéro piste) pour un
+                    // fichier qu'on va finalement écarter (#593). Le mode
+                    // `force` désactive le raccourci « inchangé » pour que les
+                    // album_id soient re-résolus.
+                    let verdict =
+                        verdict_ecriture(&sf.path, sf.mtime, sf.file_size, force, &existing_tracks);
+                    if verdict == VerdictEcriture::Inchange {
+                        skipped += 1;
+                        skipped_unchanged += 1;
+                        continue;
                     }
 
                     let Some((mut track, _album_id)) = importer.import(sf) else {
                         continue;
                     };
 
-                    // File already exists and has changed → batch update;
-                    // otherwise a new file → batch insert. (Unchanged files were
-                    // already skipped by the early-exit above.)
-                    if let Some(&(existing_id, _, _)) = existing_tracks.get(&sf.path) {
-                        track.id = Some(existing_id);
+                    if let VerdictEcriture::MettreAJour { id, adopter } = verdict {
+                        track.id = Some(id);
+                        if adopter {
+                            // Le scan vient de relire ce fichier sur le disque :
+                            // la ligne, posée par un importateur de
+                            // bibliothèque, lui appartient désormais.
+                            a_adopter.push(id);
+                        }
                         to_update.push(track);
                     } else {
                         // The sampled hash only narrows the candidates. A track
@@ -1153,6 +1559,13 @@ pub(crate) async fn spawn_library_scan_confirmee(
                                 );
                                 skipped += 1;
                                 skipped_duplicate += 1;
+                                // Ce chemin n'était journalisé qu'en `debug!` :
+                                // invisible au niveau livré, donc introuvable
+                                // même en fouillant les journaux (#2050).
+                                tune_core::scanner::walker::pousser_chemin_ecarte(
+                                    &mut skipped_duplicate_paths,
+                                    format!("{} (identique à {})", sf.path, existing_path),
+                                );
                                 continue;
                             }
                             if !candidates.is_empty() {
@@ -1183,6 +1596,22 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
+                // Les lignes reprises à un importateur deviennent locales : sans
+                // cela elles resteraient hors de portée de la tenue de compte du
+                // scan (dont la purge) et le désaccord se rejouerait à chaque
+                // scan (#2939). Un échec ici ne perd aucune piste — la mise à
+                // jour, elle, est déjà passée — donc il se journalise et ne
+                // remonte pas dans le manque à écrire.
+                match track_repo.adopter_en_local(&a_adopter) {
+                    Ok(0) => {}
+                    Ok(adoptees) => tracing::info!(
+                        adoptees,
+                        batch = batch_idx,
+                        "scan_lignes_importees_adoptees — ces pistes existaient sous une source \
+                         d'importation au même chemin : le scan les a mises à jour et reprises."
+                    ),
+                    Err(e) => tracing::warn!(error = %e, batch = batch_idx, "scan_adoption_locale_failed"),
+                }
                 // Only successful whole batches enter the in-memory index. A
                 // failed insert must never cause a later file to be hidden.
                 if batch_inserted == to_insert.len() as i64 {
@@ -1197,8 +1626,15 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         }
                     }
                 }
-                db_insert_failed += to_insert.len() as i64 - batch_inserted;
-                db_update_failed += to_update.len() as i64 - batch_updated;
+                // Le manque à écrire de ce lot. Il repart au parcours à la fin
+                // de la fermeture : c'est LUI qui publie le résumé de fin de
+                // scan, et c'est ce résumé qui annonçait « sans erreur »
+                // pendant que quatorze pistes étaient refusées (#2939).
+                let ecritures = tune_core::scanner::walker::EcrituresDuLot::manque(
+                    to_insert.len(),
+                    batch_inserted as usize,
+                )
+                .avec_manque_a_la_mise_a_jour(to_update.len(), batch_updated as usize);
                 inserted += batch_inserted;
                 updated += batch_updated;
 
@@ -1305,8 +1741,18 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         }),
                     );
                 }
+
+                ecritures
             },
         );
+
+        // Ce que la base a refusé d'écrire, agrégé par le parcours sur tous
+        // les lots (#2939). Une seule source pour la ligne de journal
+        // `batched_scan_complete` et pour les trois consommateurs du rapport
+        // de fin de scan — deux décomptes séparés, c'est deux décomptes qui
+        // divergent.
+        let db_insert_failed = scan_stats.db_insert_failed as i64;
+        let db_update_failed = scan_stats.db_update_failed as i64;
 
         // Les extensions manifestement non prises en charge sont comptées dès
         // le parcours. Le cas DFF/DST exige une lecture d'en-tête : elle est
@@ -1316,6 +1762,15 @@ pub(crate) async fn spawn_library_scan_confirmee(
             *skipped_by_ext.entry(format.clone()).or_insert(0) += count;
         }
         skipped_reasons.extend(scan_stats.unsupported_reasons.clone());
+        // Même fusion pour les chemins que pour les décomptes : les deux
+        // sources d'« écarté faute de décodeur » aboutissent à une seule liste
+        // (#2050). Le plafond s'applique aussi à la fusion.
+        for chemin in &scan_stats.unsupported_paths {
+            tune_core::scanner::walker::pousser_chemin_ecarte(
+                &mut skipped_unsupported_paths,
+                chemin.clone(),
+            );
+        }
 
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted() as i64;
@@ -1350,11 +1805,23 @@ pub(crate) async fn spawn_library_scan_confirmee(
         if scan_cancel_requested() {
             tracing::info!("post_scan_prune_skipped_cancelled");
         } else {
+            // La purge — et les gardes qui la retiennent — ne raisonne QUE sur
+            // les lignes que le scan a lui-même posées. `existing_tracks`
+            // couvre désormais toute la table (c'est la portée de
+            // `file_path TEXT UNIQUE`, et c'est ce qu'il fallait pour décider
+            // insertion ou mise à jour, #2939) ; la question posée ici est
+            // l'autre : « qu'ai-je le droit de retirer ? ». Le filtre est donc
+            // remis explicitement, et le comportement de la purge est
+            // exactement celui d'avant le correctif.
+            let pistes_locales: std::collections::HashMap<&str, i64> = existing_tracks
+                .iter()
+                .filter(|(_, info)| info.est_locale())
+                .map(|(chemin, info)| (chemin.as_str(), info.id))
+                .collect();
             // Racines devenues vides : un partage non monté est LISIBLE et
             // vide, donc invisible pour `missing_dirs`. Sans ce garde, le
             // nettoyage ci-dessous efface la bibliothèque entière (#1652).
-            let existing_refs: Vec<&str> =
-                existing_tracks.keys().map(|s| s.as_str()).collect();
+            let existing_refs: Vec<&str> = pistes_locales.keys().copied().collect();
             racines_videes = roots_gone_empty(&scan_dirs, &existing_refs, &discovered_paths);
             let emptied_roots = &racines_videes;
             // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
@@ -1384,7 +1851,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             // boucle ne se rattrape pas.
             let mut a_supprimer: Vec<i64> = Vec::new();
             let mut examinees = 0usize;
-            for (db_path, &(track_id, _, _)) in &existing_tracks {
+            for (&db_path, &track_id) in &pistes_locales {
                 // Targeted scan: only consider tracks under the scanned sub-tree.
                 // `discovered_paths` only holds files below that folder, so a
                 // track anywhere else would look "missing" and get wrongly
@@ -1395,7 +1862,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     }
                 }
                 examinees += 1;
-                if !discovered_paths.contains(db_path.as_str()) {
+                if !discovered_paths.contains(db_path) {
                     match verdict_purge(
                         db_path,
                         &scan_dirs,
@@ -1569,7 +2036,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                      WHERE source = 'local' \
                      GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
                     &[],
-                ).unwrap_or_default();
+                ).ou_defaut_journalise();
                 let dupes: Vec<(String, String)> = dupe_rows.iter().map(|r| {
                     (r[0].as_string().unwrap_or_default(), r[1].as_string().unwrap_or_default())
                 }).collect();
@@ -1708,6 +2175,47 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "post_scan_favorites_reconcile_failed"),
             }
+            // Les albums masqués (#1391) suivent la même mécanique et la même
+            // garde `full_scan_ok` : re-rattachés par identité après un
+            // renouvellement de rowid, purgés seulement sur scan complet sain.
+            match tune_core::db::hidden_repo::HiddenRepo::with_backend(db.clone())
+                .reconcile(full_scan_ok)
+            {
+                Ok(h) if h.changed() > 0 || h.unresolved > 0 => {
+                    tracing::info!(
+                        scanned = h.scanned,
+                        relinked = h.relinked,
+                        deduplicated = h.deduplicated,
+                        deleted = h.deleted,
+                        unresolved = h.unresolved,
+                        "post_scan_hidden_albums_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_hidden_albums_reconcile_failed"),
+            }
+            // Les paires « ces deux albums ne sont pas des doublons » (#1276)
+            // suivent la même mécanique et la même garde `full_scan_ok` : le
+            // scan est précisément le moment où les rowids d'albums meurent et
+            // renaissent, donc celui où l'arbitrage doit être re-rattaché.
+            match tune_core::db::album_distinct_repo::AlbumDistinctRepo::with_backend(db.clone())
+                .reconcile(full_scan_ok)
+            {
+                Ok(d) if d.changed() > 0 || d.unresolved > 0 => {
+                    tracing::info!(
+                        scanned = d.scanned,
+                        relinked = d.relinked,
+                        deduplicated = d.deduplicated,
+                        deleted = d.deleted,
+                        unresolved = d.unresolved,
+                        "post_scan_album_distinct_pairs_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "post_scan_album_distinct_pairs_reconcile_failed")
+                }
+            }
         }
 
         // Backfill embedded cover art for local albums still missing a cover.
@@ -1790,127 +2298,56 @@ pub(crate) async fn spawn_library_scan_confirmee(
             "scan_and_import_complete"
         );
 
+        // UNE seule construction pour les trois consommateurs (#2012). Les
+        // trois `json!` recopiés à la main qui vivaient ici avaient déjà
+        // divergé : `metadata_failed` manquait sur le bus d'événements, et
+        // `skipped_unsupported_by_ext` n'existait que dans le fichier.
+        //
+        // #1943 : ce que la purge a REFUSÉ de faire, et pourquoi, est publié
+        // par `purge_refused*` — voir `ChiffresDeFinDeScan`.
+        let chiffres = ChiffresDeFinDeScan {
+            total_discovered,
+            missing_dirs: &missing_dirs,
+            missing_dir_reasons: &missing_dir_reasons,
+            error_dirs: &error_dirs,
+            pistes_supprimees,
+            racines_videes: &racines_videes,
+            sous_arbres_proteges: &sous_arbres_proteges,
+            pistes_protegees,
+            pistes_hors_perimetre,
+            purge_refusee_candidats,
+            scan_stats: &scan_stats,
+            inserted,
+            updated,
+            skipped,
+            skipped_unchanged,
+            skipped_duplicate,
+            skipped_no_metadata,
+            skipped_unsupported,
+            db_insert_failed,
+            db_update_failed,
+            artwork_extracted,
+            auto_enrichment: suite_du_scan.rapport(),
+            skipped_by_ext: &skipped_by_ext,
+            skipped_reasons: &skipped_reasons,
+            skipped_unsupported_paths: &skipped_unsupported_paths,
+            skipped_no_metadata_paths: &skipped_no_metadata_paths,
+            skipped_duplicate_paths: &skipped_duplicate_paths,
+            cue: &inventaire_cue,
+        };
+        let rapport_scan = chiffres.rapport();
+
         settings
-            .set(
-                "scan_result",
-                &json!({
-                    "total_files": total_discovered,
-                    "missing_dirs": missing_dirs.clone(),
-                    "missing_dir_reasons": missing_dir_reasons.clone(),
-                    "error_dirs": error_dirs.clone(),
-                    // #1943 : ce que la purge a REFUSÉ de faire, et pourquoi.
-                    // (Ces quatre clés étaient écrites DEUX fois — deux
-                    // sessions ont ajouté le même bloc ; `json!` gardait
-                    // silencieusement la dernière.)
-                    // Ce que la purge a effectivement retiré. Le client lit
-                    // cette clé pour le bandeau de fin de scan (#2146).
-                    "removed": pistes_supprimees,
-                    "emptied_roots": racines_videes.clone(),
-                    "protected_subtrees": sous_arbres_proteges.clone(),
-                    "tracks_protected": pistes_protegees,
-                    "tracks_out_of_scope": pistes_hors_perimetre,
-                    // Le plafond volumétrique a-t-il refusé, et sur quel
-                    // nombre ? C'est ce nombre qu'il faut renvoyer dans
-                    // `?confirm_purge=` pour autoriser la purge. 0 = pas de
-                    // refus. Sans ça, le refus n'existe que dans les logs :
-                    // l'utilisateur ne peut pas connaître le geste à faire.
-                    "purge_refused": purge_refusee_candidats > 0,
-                    "purge_refused_candidates": purge_refusee_candidats,
-                    "parsed": scan_stats.total_files,
-                    "metadata_ok": scan_stats.metadata_ok,
-                    "metadata_failed": scan_stats.metadata_failed,
-                    "metadata_timeout": scan_stats.metadata_timeout,
-                    "inserted": inserted,
-                    "updated": updated,
-                    "skipped": skipped,
-                    "skipped_unchanged": skipped_unchanged,
-                    "skipped_duplicate": skipped_duplicate,
-                    "skipped_no_metadata": skipped_no_metadata,
-                    "skipped_unsupported": skipped_unsupported,
-                    "db_insert_failed": db_insert_failed,
-                    "db_update_failed": db_update_failed,
-                    "artwork_extracted": artwork_extracted,
-                    "auto_enrichment": suite_du_scan.rapport(),
-                    "failed_paths": scan_stats.failed_paths,
-                })
-                .to_string(),
-            )
+            .set("scan_result", &rapport_scan.to_string())
             .ok();
 
-        event_bus.emit(
-            "library.scan.completed",
-            json!({
-                "total_files": total_discovered,
-                "missing_dirs": missing_dirs.clone(),
-                "missing_dir_reasons": missing_dir_reasons.clone(),
-                "error_dirs": error_dirs.clone(),
-                "removed": pistes_supprimees,
-                "emptied_roots": racines_videes.clone(),
-                "protected_subtrees": sous_arbres_proteges.clone(),
-                "tracks_protected": pistes_protegees,
-                "tracks_out_of_scope": pistes_hors_perimetre,
-                "purge_refused": purge_refusee_candidats > 0,
-                "purge_refused_candidates": purge_refusee_candidats,
-                "parsed": scan_stats.total_files,
-                "metadata_ok": scan_stats.metadata_ok,
-                "metadata_timeout": scan_stats.metadata_timeout,
-                "inserted": inserted,
-                "updated": updated,
-                "skipped": skipped,
-                "skipped_unchanged": skipped_unchanged,
-                "skipped_duplicate": skipped_duplicate,
-                "skipped_no_metadata": skipped_no_metadata,
-                "skipped_unsupported": skipped_unsupported,
-                "db_insert_failed": db_insert_failed,
-                "db_update_failed": db_update_failed,
-                "artwork_extracted": artwork_extracted,
-                "auto_enrichment": suite_du_scan.rapport(),
-                "failed_paths": scan_stats.failed_paths,
-            }),
-        );
+        event_bus.emit("library.scan.completed", rapport_scan);
 
         // Launch batch artwork enrichment as a background task
         // This fetches covers from MusicBrainz Cover Art Archive for albums
         // that don't have embedded cover art.
         // Write scan report JSON for the /scan/report endpoint
-        let report = serde_json::json!({
-            "total_files": total_discovered,
-            "missing_dirs": missing_dirs.clone(),
-            "missing_dir_reasons": missing_dir_reasons.clone(),
-            "error_dirs": error_dirs.clone(),
-            "removed": pistes_supprimees,
-            "emptied_roots": racines_videes.clone(),
-            "protected_subtrees": sous_arbres_proteges.clone(),
-            "tracks_protected": pistes_protegees,
-            "tracks_out_of_scope": pistes_hors_perimetre,
-            "purge_refused": purge_refusee_candidats > 0,
-            "purge_refused_candidates": purge_refusee_candidats,
-            "parsed": scan_stats.total_files,
-            "metadata_ok": scan_stats.metadata_ok,
-            "metadata_failed": scan_stats.metadata_failed,
-            "metadata_timeout": scan_stats.metadata_timeout,
-            "inserted": inserted,
-            "updated": updated,
-            "skipped": skipped,
-            "skipped_unchanged": skipped_unchanged,
-            "skipped_duplicate": skipped_duplicate,
-            "skipped_no_metadata": skipped_no_metadata,
-            "skipped_unsupported": skipped_unsupported,
-            "db_insert_failed": db_insert_failed,
-            "db_update_failed": db_update_failed,
-            "artwork_extracted": artwork_extracted,
-            "auto_enrichment": suite_du_scan.rapport(),
-            "failed_paths": scan_stats.failed_paths,
-            // Fichiers audio rencontrés mais dont Tune ne lit pas le format,
-            // comptés par extension ({"mpc": 280, "cue": 132}). Presque toujours
-            // vide ; quand il ne l'est pas, c'est la seule chose qui explique à
-            // l'utilisateur pourquoi des albums manquent, au lieu de le laisser
-            // chercher un bug de scanner (#1763).
-            "skipped_unsupported_by_ext": skipped_by_ext,
-            // Motif lisible associé à chaque compteur. Additif pour les clients
-            // existants qui ne connaissent que `skipped_unsupported_by_ext`.
-            "skipped_unsupported_reasons": skipped_reasons,
-        });
+        let report = chiffres.rapport_du_fichier();
         let report_path = std::env::var("TUNE_DB_PATH")
             .unwrap_or_else(|_| "tune.db".into())
             .replace(".db", "-scan-report.json");
@@ -1953,12 +2390,46 @@ pub(crate) async fn spawn_library_scan_confirmee(
         }).await;
         if let Err(e) = result {
             tracing::error!("scan_task_panicked — {:?}", e);
-            if let Err(e2) = SettingsRepo::with_backend(db_for_panic).set("scan_status", "idle") {
-                tracing::warn!(error = %e2, "scan_status_panic_reset_failed");
-            }
+            cloturer_scan_interrompu(db_for_panic, &event_bus_pour_panne, "panic");
         }
     });
     true
+}
+
+/// Clôt un scan qui s'est arrêté sur une **panique**, et le fait SAVOIR.
+///
+/// La tâche de scan a quatre sorties. Trois annoncent `library.scan.completed` :
+/// la fin normale, l'absence de dossier configuré (#1129) et l'annulation. La
+/// quatrième — la panique de `spawn_blocking` — se contentait de remettre
+/// `scan_status` à `idle` et ne disait rien sur le bus.
+///
+/// Ce n'est pas un cas de figure théorique : les lots sont insérés au fur et à
+/// mesure par `scan_files_batched`, donc une panique SURVENUE APRÈS le premier
+/// lot laisse des albums NEUFS en base et aucun signal pour les annoncer.
+/// L'écran garde son bandeau « scan en cours » et sa liste d'avant, et
+/// l'auditeur ne voit ses nouveautés qu'en rechargeant la page — le symptôme
+/// exact rapporté par Eric (#1393, fil forum, Windows v0.9.61).
+///
+/// `scan_status` retombe bien à `idle`, lui : c'est ce qui rend la panne
+/// silencieuse. Le sondage HTTP dit « plus de scan », le bus ne dit rien, et
+/// les deux surfaces se contredisent sans que personne ne s'en aperçoive.
+///
+/// La charge utile est volontairement DÉGRADÉE, comme celles de l'annulation
+/// (`{"cancelled": true}`) et de l'absence de dossiers (`{"no_dirs": true}`) :
+/// les chiffres d'un scan qui a paniqué ne veulent rien dire, et les habiller
+/// en rapport complet les rendrait indiscernables d'un scan abouti.
+pub(crate) fn cloturer_scan_interrompu(
+    backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    event_bus: &tune_core::event_bus::EventBus,
+    motif: &str,
+) {
+    if let Err(e) = SettingsRepo::with_backend(backend).set("scan_status", "idle") {
+        tracing::warn!(error = %e, "scan_status_panic_reset_failed");
+    }
+    event_bus.emit(
+        "library.scan.completed",
+        json!({ "interrupted": true, "reason": motif }),
+    );
 }
 
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
@@ -3175,91 +3646,425 @@ mod tests {
     }
 }
 
-/// Garde-fou : le rapport de fin de scan est construit QUATRE fois, et les
-/// quatre doivent publier ce que la purge a retiré.
+/// Le rapport de fin de scan complet n'est plus construit qu'UNE fois (#2012).
 ///
-/// Le bandeau de fin de scan annonçait « 0 supprimés » quoi que la purge ait
-/// fait : le client lit `d.removed`, et aucune des constructions du rapport
-/// n'envoyait cette clé (#2146). Le compte existait pourtant — il mourait avec
-/// le bloc qui le calculait.
+/// Il l'était trois : `scan_result`, `library.scan.completed` et le fichier de
+/// `/scan/report` étaient trois `json!` d'une vingtaine de clés recopiés à la
+/// main. Ils avaient déjà divergé trois fois — `removed` (#2146) absent des
+/// trois, `metadata_failed` absent du seul bus, `skipped_unsupported_by_ext`
+/// (#1763) présent dans le seul fichier.
 ///
-/// Ces constructions ne sont reliées par rien de mécanique : ce sont quatre
-/// `json!` recopiés à la main, et ils ont DÉJÀ divergé une fois
-/// (`skipped_unsupported_by_ext`, qui n'existe que dans un seul — #2012).
-/// Ajouter une clé à trois d'entre eux et pas au quatrième ne casse aucune
-/// compilation et ne fait échouer aucun test fonctionnel : le champ manque
-/// simplement chez un consommateur, en silence. D'où ce test, sur le modèle de
-/// `tests/smb_dialect_seam.rs`.
-///
-/// Le quatrième exemplaire est celui du scan AUTOMATIQUE (`auto_scan.rs`) :
-/// l'issue ne le comptait pas parmi les trois, mais il purge (`pruned`) et il
-/// émet `library.scan.completed`, donc il alimente le même bandeau.
+/// Ces tests jugent la construction elle-même, pas le texte du fichier : ils
+/// comparent ce que les trois consommateurs reçoivent réellement. Le garde-fou
+/// textuel qui les précédait n'a plus lieu d'être ici — il ne reste qu'un
+/// exemplaire écrit à la main, celui du scan AUTOMATIQUE (`auto_scan.rs`), et
+/// c'est lui seul que le dernier test surveille.
 #[cfg(test)]
-mod rapport_de_scan_publie_la_purge {
+mod rapport_de_fin_de_scan {
+    use super::{ChiffresDeFinDeScan, SuiteDuScan};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
 
-    /// Une clé de rapport, sous sa forme littérale exacte. `"removed"` tout
-    /// court apparaît aussi dans les noms d'événements de journal
-    /// (`post_scan_stale_tracks_removed`) : chercher le mot nu ferait passer
-    /// le test sans qu'aucune clé soit publiée.
-    const CLE_PURGE: &str = "\"removed\":";
-
-    /// Présent dans les quatre rapports, et nulle part ailleurs : sert à
-    /// reconnaître un rapport de fin de scan sans compter d'accolades.
-    const MARQUEUR_RAPPORT: &str = "\"artwork_extracted\":";
-
-    fn source(chemin: &str) -> String {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(chemin);
-        fs::read_to_string(&p).unwrap_or_else(|e| panic!("lecture de {} : {e}", p.display()))
+    /// Des chiffres tous DISTINCTS : un rapport qui rangerait deux compteurs
+    /// sous la mauvaise clé passerait inaperçu si tout valait zéro.
+    fn chiffres(stats: &tune_core::scanner::walker::ScanStats) -> ChiffresDeFinDeScan<'_> {
+        // Fuites volontaires : ces `Box::leak` durent le temps du test et
+        // évitent d'écrire une structure porteuse rien que pour tenir les
+        // emprunts.
+        let missing: &[String] = Box::leak(Box::new(["/Volumes/absent".to_string()]));
+        let raisons: &[String] = Box::leak(Box::new(["not mounted".to_string()]));
+        let erreurs: &[String] = Box::leak(Box::new(["/Volumes/erreur".to_string()]));
+        let racines: &[String] = Box::leak(Box::new(["/Volumes/vidée".to_string()]));
+        let proteges: &[String] = Box::leak(Box::new(["/Volumes/protégé".to_string()]));
+        let par_ext: &HashMap<String, usize> =
+            Box::leak(Box::new(HashMap::from([("mpc".to_string(), 280usize)])));
+        let motifs: &HashMap<String, String> = Box::leak(Box::new(HashMap::from([(
+            "mpc".to_string(),
+            "format non pris en charge".to_string(),
+        )])));
+        let non_lus: &[String] = Box::leak(Box::new([
+            "/Volumes/musique/album.mpc (format non pris en charge)".to_string(),
+        ]));
+        let sans_metadonnees: &[String] =
+            Box::leak(Box::new(["/Volumes/musique/muet.wav".to_string()]));
+        let doublons: &[String] = Box::leak(Box::new([
+            "/Volumes/musique/copie.flac (identique à /Volumes/musique/piste.flac)".to_string(),
+        ]));
+        let cue: &tune_core::scanner::cue_album::InventaireCue =
+            Box::leak(Box::new(tune_core::scanner::cue_album::InventaireCue {
+                dossiers: 120,
+                dossiers_non_inventories: 121,
+                albums: 122,
+                albums_multi_feuilles: 123,
+                feuilles_retenues: 124,
+                pistes: 125,
+                feuilles_ecartees: 126,
+                ecarts_par_cle: std::collections::BTreeMap::from([("cue-image-introuvable", 126)]),
+                chemins_ecartes: vec![
+                    "/Volumes/musique/orphelin.cue (feuille CUE sans son fichier audio : \
+                     rien à découper)"
+                        .to_string(),
+                ],
+            }));
+        ChiffresDeFinDeScan {
+            total_discovered: 1_651,
+            missing_dirs: missing,
+            missing_dir_reasons: raisons,
+            error_dirs: erreurs,
+            pistes_supprimees: 41,
+            racines_videes: racines,
+            sous_arbres_proteges: proteges,
+            pistes_protegees: 7,
+            pistes_hors_perimetre: 13,
+            purge_refusee_candidats: 900,
+            scan_stats: stats,
+            inserted: 101,
+            updated: 102,
+            skipped: 103,
+            skipped_unchanged: 104,
+            skipped_duplicate: 105,
+            skipped_no_metadata: 106,
+            skipped_unsupported: 107,
+            db_insert_failed: 108,
+            db_update_failed: 109,
+            artwork_extracted: 110,
+            auto_enrichment: SuiteDuScan::decider(true, true).rapport(),
+            skipped_by_ext: par_ext,
+            skipped_reasons: motifs,
+            skipped_unsupported_paths: non_lus,
+            skipped_no_metadata_paths: sans_metadonnees,
+            skipped_duplicate_paths: doublons,
+            cue,
+        }
     }
 
-    /// Le corps du `json!` qui précède le marqueur, commentaires ÔTÉS.
+    fn stats_de_scan() -> tune_core::scanner::walker::ScanStats {
+        tune_core::scanner::walker::ScanStats {
+            total_files: 1_600,
+            metadata_ok: 1_500,
+            metadata_failed: 60,
+            metadata_timeout: 40,
+            failed_paths: vec!["/Volumes/musique/piste.flac".to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// Le cœur de #2012 : les trois consommateurs lisent le MÊME rapport.
     ///
-    /// Les commentaires nomment le défaut corrigé — « le client lit
-    /// `d.removed` » — et raconter l'histoire ne doit pas suffire à faire
-    /// passer le test. Seul le code compte.
-    fn corps_du_rapport(texte: &str, fin: usize) -> String {
-        let debut = texte[..fin]
-            .rfind("json!(")
-            .expect("un rapport doit être construit par un json!(");
-        texte[debut..fin]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// `scan_result` et `library.scan.completed` reçoivent la valeur telle
+    /// quelle ; le fichier de `/scan/report` l'étend. Sur les clés communes,
+    /// aucun écart n'est tolérable — c'est exactement ce qui a été perdu trois
+    /// fois par recopie.
+    #[test]
+    fn les_trois_consommateurs_recoivent_le_meme_rapport() {
+        let stats = stats_de_scan();
+        let c = chiffres(&stats);
+
+        // Ce que reçoivent les trois, dans leur forme réelle.
+        let reglage: serde_json::Value =
+            serde_json::from_str(&c.rapport().to_string()).expect("scan_result est du JSON");
+        let evenement = c.rapport();
+        let fichier = c.rapport_du_fichier();
+
+        assert_eq!(
+            reglage, evenement,
+            "`scan_result` et `library.scan.completed` doivent être identiques (#2012)"
+        );
+
+        let commun = evenement.as_object().expect("un objet");
+        let du_fichier = fichier.as_object().expect("un objet");
+        for (cle, valeur) in commun {
+            assert_eq!(
+                du_fichier.get(cle),
+                Some(valeur),
+                "`{cle}` diverge entre le bus d'événements et le fichier de /scan/report (#2012)"
+            );
+        }
+
+        // Le seul écart, et il est voulu : l'inventaire des formats non lus
+        // (#1763) ne sort que par le fichier. Le test le NOMME, pour qu'un
+        // écart ajouté par mégarde ne se glisse pas dans son ombre.
+        let ajouts: Vec<&String> = du_fichier
+            .keys()
+            .filter(|k| !commun.contains_key(*k))
+            .collect();
+        assert_eq!(
+            ajouts,
+            // Ordre alphabétique : c'est celui des clés d'un objet
+            // `serde_json`, pas celui où on les a écrites.
+            vec![
+                "cue_sheets_skipped_paths",
+                "skipped_duplicate_paths",
+                "skipped_no_metadata_paths",
+                "skipped_paths_truncated",
+                "skipped_unsupported_by_ext",
+                "skipped_unsupported_paths",
+                "skipped_unsupported_reasons",
+            ],
+            "seuls l'inventaire des formats non lus (#1763) et la liste nominative des \
+             fichiers écartés (#2050) doivent distinguer /scan/report — les chemins de \
+             l'utilisateur ne partent pas sur le bus, qui est diffusé à tous les clients"
+        );
     }
 
+    /// Les valeurs sont justes, et rangées sous la bonne clé.
+    ///
+    /// Une factorisation qui intervertirait deux compteurs produirait un
+    /// rapport unique — et faux partout à la fois.
     #[test]
-    fn les_quatre_constructions_du_rapport_publient_la_cle_lue_par_le_client() {
-        let fichiers = ["src/routes/system/scan.rs", "src/auto_scan.rs"];
+    fn les_valeurs_publiees_sont_celles_du_scan() {
+        let stats = stats_de_scan();
+        let c = chiffres(&stats);
+        let r = c.rapport_du_fichier();
+
+        assert_eq!(r["total_files"], serde_json::json!(1_651));
+        assert_eq!(r["parsed"], serde_json::json!(1_600));
+        assert_eq!(r["metadata_ok"], serde_json::json!(1_500));
+        // Manquait sur le bus d'événements, et sur lui seul, avant #2012.
+        assert_eq!(r["metadata_failed"], serde_json::json!(60));
+        assert_eq!(r["metadata_timeout"], serde_json::json!(40));
+        // Le bandeau de fin de scan lit `removed` (#2146).
+        assert_eq!(r["removed"], serde_json::json!(41));
+        assert_eq!(r["emptied_roots"], serde_json::json!(["/Volumes/vidée"]));
+        assert_eq!(
+            r["protected_subtrees"],
+            serde_json::json!(["/Volumes/protégé"])
+        );
+        assert_eq!(r["tracks_protected"], serde_json::json!(7));
+        assert_eq!(r["tracks_out_of_scope"], serde_json::json!(13));
+        // Le nombre à renvoyer dans `?confirm_purge=` (#1943).
+        assert_eq!(r["purge_refused"], serde_json::json!(true));
+        assert_eq!(r["purge_refused_candidates"], serde_json::json!(900));
+        assert_eq!(r["inserted"], serde_json::json!(101));
+        assert_eq!(r["updated"], serde_json::json!(102));
+        assert_eq!(r["skipped"], serde_json::json!(103));
+        assert_eq!(r["skipped_unchanged"], serde_json::json!(104));
+        assert_eq!(r["skipped_duplicate"], serde_json::json!(105));
+        assert_eq!(r["skipped_no_metadata"], serde_json::json!(106));
+        assert_eq!(r["skipped_unsupported"], serde_json::json!(107));
+        assert_eq!(r["db_insert_failed"], serde_json::json!(108));
+        assert_eq!(r["db_update_failed"], serde_json::json!(109));
+        assert_eq!(r["artwork_extracted"], serde_json::json!(110));
+        assert_eq!(r["auto_enrichment"]["started"], serde_json::json!(true));
+        assert_eq!(r["missing_dirs"], serde_json::json!(["/Volumes/absent"]));
+        assert_eq!(r["missing_dir_reasons"], serde_json::json!(["not mounted"]));
+        assert_eq!(r["error_dirs"], serde_json::json!(["/Volumes/erreur"]));
+        assert_eq!(
+            r["failed_paths"],
+            serde_json::json!(["/Volumes/musique/piste.flac"])
+        );
+        assert_eq!(
+            r["skipped_unsupported_by_ext"],
+            serde_json::json!({"mpc": 280})
+        );
+        assert_eq!(
+            r["skipped_unsupported_reasons"],
+            serde_json::json!({"mpc": "format non pris en charge"})
+        );
+        // Ce que les feuilles CUE décrivent (#1763). Huit chiffres tous
+        // distincts : un rapport qui rangerait « albums » sous « pistes »
+        // passerait inaperçu s'ils se ressemblaient.
+        assert_eq!(
+            r["cue_sheets"],
+            serde_json::json!({
+                "folders": 120,
+                "folders_not_inventoried": 121,
+                "albums": 122,
+                "albums_multi_sheet": 123,
+                "sheets_used": 124,
+                "tracks": 125,
+                "sheets_skipped": 126,
+                "sheets_skipped_by_reason": {"cue-image-introuvable": 126},
+            })
+        );
+        assert_eq!(
+            r["cue_sheets_skipped_paths"],
+            serde_json::json!([
+                "/Volumes/musique/orphelin.cue (feuille CUE sans son fichier audio : \
+                 rien à découper)"
+            ])
+        );
+        // La liste demandée (#2050) : LESQUELS, pas seulement COMBIEN. Trois
+        // listes distinctes — un rapport qui rangerait les doublons sous les
+        // formats non lus passerait inaperçu si elles se ressemblaient.
+        assert_eq!(
+            r["skipped_unsupported_paths"],
+            serde_json::json!(["/Volumes/musique/album.mpc (format non pris en charge)"])
+        );
+        assert_eq!(
+            r["skipped_no_metadata_paths"],
+            serde_json::json!(["/Volumes/musique/muet.wav"])
+        );
+        assert_eq!(
+            r["skipped_duplicate_paths"],
+            serde_json::json!([
+                "/Volumes/musique/copie.flac (identique à /Volumes/musique/piste.flac)"
+            ])
+        );
+        // Trois listes d'un élément : rien n'est tronqué, et le rapport le dit.
+        assert_eq!(r["skipped_paths_truncated"], serde_json::json!(false));
+    }
+
+    /// Le rapport DIT qu'il est tronqué quand il l'est (#2050).
+    ///
+    /// Sans ce drapeau, un rapport qui nomme 500 fichiers écartés sur 40 000
+    /// se lit comme la liste complète : l'utilisateur conclut que sa
+    /// bibliothèque va bien, et referme le seul outil qui pouvait le
+    /// détromper. Sa contre-épreuve est dans le test précédent, où trois
+    /// listes d'un élément publient `false`.
+    #[test]
+    fn une_liste_au_plafond_est_annoncee_comme_tronquee() {
+        const PLAFOND: usize = tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES;
+        let stats = stats_de_scan();
+        let mut c = chiffres(&stats);
+
+        let pleine: Vec<String> = (0..PLAFOND).map(|i| format!("/musique/{i}.mpc")).collect();
+        let pleine: &[String] = Box::leak(Box::new(pleine));
+        c.skipped_unsupported_paths = pleine;
+
+        let r = c.rapport_du_fichier();
+        assert_eq!(
+            r["skipped_paths_truncated"],
+            serde_json::json!(true),
+            "une liste arrivée au plafond doit être annoncée comme un échantillon"
+        );
+        assert_eq!(
+            r["skipped_unsupported_paths"]
+                .as_array()
+                .expect("un tableau")
+                .len(),
+            PLAFOND,
+            "le plafond borne la liste publiée"
+        );
+        // Les décomptes, eux, restent exhaustifs : c'est ce qui rend
+        // l'échantillon lisible.
+        assert_eq!(r["skipped_unsupported"], serde_json::json!(107));
+    }
+
+    /// Les DEUX scans publient la même liste de fichiers écartés (#2050).
+    ///
+    /// Le scan manuel (`ChiffresDeFinDeScan::rapport_du_fichier`) et le scan
+    /// automatique (`auto_scan.rs`) écrivent le MÊME fichier
+    /// `<db>-scan-report.json`, lu par le même `GET /scan/report`. Une clé
+    /// posée d'un seul côté rend la réponse dépendante de QUEL scan a tourné
+    /// en dernier — l'utilisateur voit sa liste disparaître au redémarrage
+    /// suivant, sans rien avoir changé.
+    ///
+    /// C'est exactement le mode d'échec de #2012, et il ne casse aucune
+    /// compilation : d'où ce garde-fou textuel, le seul qui puisse voir une
+    /// clé manquante dans un `json!` voisin.
+    #[test]
+    fn les_deux_scans_publient_les_memes_listes_de_fichiers_ecartes() {
+        /// Sous leur forme littérale de clé JSON. Chercher le mot nu
+        /// attraperait le nom de la variable Rust et passerait sans qu'aucune
+        /// clé ne soit publiée.
+        const CLES: [&str; 6] = [
+            "\"skipped_unsupported_paths\"",
+            "\"skipped_no_metadata_paths\"",
+            "\"skipped_duplicate_paths\"",
+            "\"skipped_paths_truncated\"",
+            // Les feuilles CUE (#1763) : mêmes deux clés des deux côtés, pour
+            // la même raison. Le compteur part chez les trois consommateurs,
+            // la liste nominative par le seul fichier.
+            "\"cue_sheets\"",
+            "\"cue_sheets_skipped_paths\"",
+        ];
+
+        for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fichier);
+            let texte = fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("lecture de {} : {e}", p.display()));
+            // Commentaires ôtés : raconter l'histoire du défaut ne doit pas
+            // suffire à faire passer le test.
+            let code = texte
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for cle in CLES {
+                assert!(
+                    code.contains(cle),
+                    "{fichier} ne publie pas {cle} — le rapport de /scan/report \
+                     dépendrait alors de quel scan l'a écrit en dernier (#2050)"
+                );
+            }
+        }
+    }
+
+    /// Les trois motifs sont pourvus, pas un seul (#2050).
+    ///
+    /// « Un chemin corrigé, les autres nus » est le défaut qui revient : le
+    /// scan écarte pour trois motifs distincts, et n'en instrumenter qu'un
+    /// laisse l'utilisateur devant une liste qui ne contient pas son fichier,
+    /// sans lui dire que deux autres listes existaient.
+    #[test]
+    fn les_trois_motifs_d_ecart_ont_chacun_leur_liste() {
+        let stats = stats_de_scan();
+        let r = chiffres(&stats).rapport_du_fichier();
+        for cle in [
+            "skipped_unsupported_paths",
+            "skipped_no_metadata_paths",
+            "skipped_duplicate_paths",
+        ] {
+            let liste = r[cle].as_array().unwrap_or_else(|| panic!("{cle} absente"));
+            assert!(!liste.is_empty(), "{cle} est publiée mais toujours vide");
+        }
+    }
+
+    /// Il ne reste qu'UNE construction manuscrite : celle du scan automatique.
+    ///
+    /// `auto_scan.rs` publie son propre rapport — moins de clés, d'autres
+    /// variables — et il émet lui aussi `library.scan.completed`, donc il
+    /// alimente le même bandeau. Il doit porter `removed` (#2146). Ce garde-fou
+    /// vérifie aussi qu'il n'y a plus qu'un exemplaire à surveiller : si un
+    /// second réapparaissait dans `scan.rs`, le compte le dirait.
+    #[test]
+    fn une_seule_construction_manuscrite_subsiste_et_elle_publie_la_purge() {
+        /// La clé, sous sa forme littérale exacte. `"removed"` tout court
+        /// apparaît aussi dans les noms d'événements de journal
+        /// (`post_scan_stale_tracks_removed`) : chercher le mot nu ferait
+        /// passer le test sans qu'aucune clé soit publiée.
+        const CLE_PURGE: &str = "\"removed\":";
+        /// Présent dans tout rapport de fin de scan, et nulle part ailleurs.
+        const MARQUEUR_RAPPORT: &str = "\"artwork_extracted\":";
+
         let mut examines = 0usize;
-        for fichier in fichiers {
-            let texte = source(fichier);
+        for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fichier);
+            let texte = fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("lecture de {} : {e}", p.display()));
             let mut depuis = 0usize;
             while let Some(rel) = texte[depuis..].find(MARQUEUR_RAPPORT) {
                 let fin = depuis + rel;
                 examines += 1;
-                let corps = corps_du_rapport(&texte, fin);
+                let debut = texte[..fin]
+                    .rfind("json!(")
+                    .expect("un rapport doit être construit par un json!(");
+                // Commentaires ôtés : raconter l'histoire du défaut ne doit
+                // pas suffire à faire passer le test.
+                let corps = texte[debut..fin]
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 assert!(
                     corps.contains(CLE_PURGE),
                     "{fichier} : la construction de rapport n° {examines} ne publie pas \
-                     {CLE_PURGE}\nLe client lit `d.removed` pour le bandeau de fin de scan. \
-                     Un rapport qui ne l'envoie pas fait annoncer « 0 supprimés » quoi que la \
-                     purge ait fait (#2146). Les quatre constructions doivent porter la clé \
-                     (#2012)."
+                     {CLE_PURGE}\nLe client lit `d.removed` pour le bandeau de fin de scan (#2146)."
                 );
                 depuis = fin + MARQUEUR_RAPPORT.len();
             }
         }
         // Contrôle positif : sans lui, un marqueur renommé ferait passer le
-        // test en n'examinant RIEN. Quatre, c'est `scan_result`,
-        // `library.scan.completed`, `/scan/report`, et le rapport du scan
-        // automatique.
+        // test en n'examinant RIEN. Deux, c'est la construction unique de
+        // `ChiffresDeFinDeScan::rapport` et celle du scan automatique. Un
+        // troisième compte signale une recopie réintroduite (#2012).
         assert_eq!(
-            examines, 4,
-            "quatre constructions de rapport attendues, {examines} trouvée(s) — le marqueur \
-             {MARQUEUR_RAPPORT} a dû être renommé, ou un exemplaire ajouté/supprimé"
+            examines, 2,
+            "deux constructions attendues (la source unique de scan.rs et celle d'auto_scan.rs), \
+             {examines} trouvée(s) — le marqueur {MARQUEUR_RAPPORT} a dû être renommé, ou une \
+             recopie manuelle réintroduite (#2012)"
         );
     }
 }
@@ -3766,63 +4571,116 @@ mod suite_du_scan_apres_scan {
     }
 }
 
-/// La clé doit être dans les TROIS rapports de fin de scan complet.
+/// Le sort de la passe d'enrichissement est publié — #2507.
 ///
-/// `scan_result` (lu par `/scan/status`), `library.scan.completed` (le bandeau
-/// de fin de scan) et le fichier de `/scan/report` sont trois `json!` recopiés
-/// à la main. Ils ont déjà divergé deux fois — `skipped_unsupported_by_ext`
-/// (#2012) puis `removed` (#2146) — et une clé posée dans deux d'entre eux sur
-/// trois ne casse aucune compilation : elle manque simplement chez un
-/// consommateur, en silence. Même garde que
-/// `rapport_de_scan_publie_la_purge`, sur la clé de #2507.
+/// Sans cette clé, une installation sans licence scanne, ne voit aucune
+/// vignette d'artiste, et rien ne lui dit que la passe n'a pas eu lieu.
+///
+/// Ce test était un garde-fou textuel comptant TROIS `json!` recopiés à la
+/// main ; il n'y en a plus qu'un (#2012), et la clé se vérifie désormais sur
+/// la valeur construite plutôt que sur le texte du fichier.
 #[cfg(test)]
 mod rapport_de_scan_publie_le_sort_de_lenrichissement {
-    use std::fs;
-    use std::path::PathBuf;
+    use super::SuiteDuScan;
 
-    /// La clé, sous sa forme littérale exacte. `auto_enrichment` tout court
-    /// apparaît aussi dans le nom de l'événement de journal
-    /// (`auto_enrichment_after_scan_skipped`) : chercher le mot nu ferait
-    /// passer le test sans qu'aucun rapport ne publie quoi que ce soit.
-    const CLE: &str = "\"auto_enrichment\": suite_du_scan.rapport(),";
-    /// Dernière clé commune aux trois rapports, et postérieure à celle-ci :
-    /// borne la portion de texte examinée.
-    const MARQUEUR: &str = "\"failed_paths\": scan_stats.failed_paths,";
-
+    /// Les trois motifs de `SuiteDuScan` traversent le rapport intacts.
     #[test]
-    fn les_trois_rapports_du_scan_complet_publient_la_cle() {
-        let chemin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/routes/system/scan.rs");
-        let texte = fs::read_to_string(&chemin)
-            .unwrap_or_else(|e| panic!("lecture de {} : {e}", chemin.display()));
-        let mut examines = 0usize;
-        let mut depuis = 0usize;
-        while let Some(rel) = texte[depuis..].find(MARQUEUR) {
-            let fin = depuis + rel;
-            examines += 1;
-            let debut = texte[..fin]
-                .rfind("json!(")
-                .expect("un rapport doit être construit par un json!(");
-            let corps = texte[debut..fin]
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                corps.contains(CLE),
-                "rapport n° {examines} : {CLE} manque.\nSans cette clé, une \
-                 installation sans licence scanne, ne voit aucune vignette \
-                 d'artiste, et rien ne lui dit que la passe n'a pas eu lieu \
-                 (#2507)."
+    fn le_rapport_porte_le_sort_de_la_passe() {
+        for (sous_licence, reglage, motif) in [
+            (true, true, None),
+            (true, false, Some("disabled_by_setting")),
+            (false, true, Some("premium_required")),
+        ] {
+            let bloc = SuiteDuScan::decider(reglage, sous_licence).rapport();
+            assert_eq!(bloc["started"], serde_json::json!(motif.is_none()));
+            assert_eq!(
+                bloc["skipped_reason"],
+                match motif {
+                    Some(m) => serde_json::json!(m),
+                    None => serde_json::Value::Null,
+                },
+                "le motif doit rester lisible par le client (#2507)"
             );
-            depuis = fin + MARQUEUR.len();
         }
-        // Contrôle positif : sans lui, un marqueur renommé ferait passer le
-        // test en n'examinant RIEN. Trois, c'est `scan_result`,
-        // `library.scan.completed` et le fichier de `/scan/report`.
+    }
+}
+
+/// #1393 — la sortie par PANIQUE de la tâche de scan ne disait rien au client.
+///
+/// Les deux tests partagent le même harnais et le même appel ; c'est délibéré.
+/// Le premier est le TÉMOIN : la remise de `scan_status` à `idle` existait
+/// déjà avant le correctif, elle est verte des deux côtés, et elle prouve que
+/// le second n'échoue pas parce que le harnais serait cassé, la base absente
+/// ou l'appel jamais atteint. Le second est le FAIT : sans l'émission,
+/// `rx.recv()` expire, et l'auditeur ne voit ses albums qu'en rechargeant la
+/// page.
+#[cfg(test)]
+mod fin_de_scan_interrompu {
+    use super::cloturer_scan_interrompu;
+    use crate::state::AppState;
+    use std::time::Duration;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("AppState en mémoire")
+    }
+
+    /// TÉMOIN — vert avant comme après le correctif.
+    #[tokio::test]
+    async fn un_scan_interrompu_repose_le_statut_a_idle() {
+        let etat = etat();
+        SettingsRepo::with_backend(etat.backend.clone())
+            .set("scan_status", "scanning")
+            .expect("le réglage doit être inscriptible");
+
+        cloturer_scan_interrompu(etat.backend.clone(), &etat.event_bus, "panic");
+
+        let statut = SettingsRepo::with_backend(etat.backend.clone())
+            .get("scan_status")
+            .expect("le réglage doit être lisible");
         assert_eq!(
-            examines, 3,
-            "trois rapports attendus, {examines} trouvé(s) — le marqueur \
-             {MARQUEUR} a dû être renommé, ou un exemplaire ajouté/supprimé"
+            statut.as_deref(),
+            Some("idle"),
+            "un scan qui a paniqué ne doit pas laisser `scan_status` à `scanning`"
+        );
+    }
+
+    /// LE FAIT — rouge avant le correctif.
+    #[tokio::test]
+    async fn une_panique_de_scan_annonce_quand_meme_la_fin_du_scan() {
+        let etat = etat();
+        let mut rx = etat.event_bus.subscribe();
+
+        cloturer_scan_interrompu(etat.backend.clone(), &etat.event_bus, "panic");
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect(
+                "aucun événement n'est parti : une panique de scan laisse le client \
+                 avec son bandeau et sa liste d'avant, et les albums insérés par les \
+                 lots déjà passés restent invisibles jusqu'au rechargement (#1393)",
+            )
+            .expect("le bus d'événements s'est fermé");
+
+        assert_eq!(
+            ev.event_type,
+            tune_core::event_types::EventType::ScanComplete.as_str(),
+            "c'est le SEUL nom sur lequel le client fait retomber son bandeau de \
+             fin de scan et recharge ses listes"
+        );
+        assert_eq!(
+            ev.data.get("interrupted").and_then(|v| v.as_bool()),
+            Some(true),
+            "le rapport doit se DIRE interrompu : sans ce drapeau il est \
+             indiscernable d'un scan abouti, et le client annoncerait un \
+             succès (charge utile réelle : {})",
+            ev.data
+        );
+        assert_eq!(
+            ev.data.get("reason").and_then(|v| v.as_str()),
+            Some("panic"),
+            "le motif nomme la sortie empruntée (charge utile réelle : {})",
+            ev.data
         );
     }
 }

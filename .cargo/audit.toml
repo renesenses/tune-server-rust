@@ -30,22 +30,10 @@ ignore = [
     # web-time. Transitif uniquement ; un build natif ne touche jamais son
     # chemin wasm.
     "RUSTSEC-2024-0384",
-    # audiopus_sys 0.2.2 — non maintenu (RUSTSEC-2026-0150, 21/05/2026).
-    # Dependance DURE de tune-core (`audiopus 0.3.0-rc.0`), donc de toutes les
-    # cibles livrees et du .so Android. Aucune vulnerabilite : l'avis ne
-    # reproche que l'abandon et un `cmake_minimum_required` anterieur a 3.5 que
-    # CMake 4.x refuse.
-    #
-    # Ce seul defaut concret est DEJA neutralise dans ce depot :
-    # `.cargo/config.toml` pose `CMAKE_POLICY_VERSION_MINIMUM=3.5` pour tous
-    # les builds, et `Cross.toml` le repasse dans le conteneur musl.
-    #
-    # Le remplacement lui-meme (fork maintenu, ou bascule vers un backend
-    # libopus pur Rust) est un arbitrage ouvert : voir #2251. Cette ligne saute
-    # le jour ou un CVE tombe sur audiopus_sys — a ce moment-la ce n'est plus
-    # un avis informatif et `deny = ["warnings"]` ne le couvre plus de toute
-    # facon.
-    "RUSTSEC-2026-0150",
+    # RUSTSEC-2026-0150 (audiopus_sys 0.2.2 abandonne) a ete RETIRE d'ici : la
+    # dependance elle-meme a disparu. `tune-core` passe par `opus 0.4.0` /
+    # `opusic-sys 0.7.5`, tous deux maintenus (#2251). Il n'y a donc plus
+    # d'exception a porter, et `cargo tree -i audiopus_sys` ne rend plus rien.
 ]
 
 [output]

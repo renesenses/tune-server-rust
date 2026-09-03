@@ -154,6 +154,18 @@ const MIGRATION_TABLES: &[&str] = &[
     // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
     // seraient perdus à la bascule SQLite → PostgreSQL.
     "favorite_facets",
+    // Albums masqués (#1391). Sans cette ligne, les albums masqués
+    // réapparaîtraient tous à la bascule SQLite → PostgreSQL.
+    "hidden_items",
+    // « Ces deux albums ne sont pas des doublons » (#1276). Sans cette ligne,
+    // l'arbitrage serait perdu à la bascule SQLite → PostgreSQL, et la fusion
+    // de doublons emporterait au scan suivant ce que l'utilisateur avait
+    // explicitement protégé.
+    "album_distinct_pairs",
+    // Appareils ignorés (#1280). Sans cette ligne, tous les appareils que
+    // l'utilisateur a fait taire réapparaîtraient à la bascule
+    // SQLite → PostgreSQL.
+    "ignored_devices",
     "album_ratings",
     "smart_playlists",
     "smart_collections",
@@ -435,7 +447,8 @@ CREATE TABLE IF NOT EXISTS listen_history (
     album_id TEXT,
     profile_id TEXT,
     context_type TEXT,
-    context_id TEXT
+    context_id TEXT,
+    context_position TEXT
 );
 
 CREATE TABLE IF NOT EXISTS radio_stations (
@@ -511,6 +524,47 @@ CREATE TABLE IF NOT EXISTS favorites (
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_name TEXT;
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_artist TEXT;
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_path TEXT;
+
+-- Albums masqués (#1391). Tout en TEXT comme le reste de ce schéma (la copie
+-- lie chaque valeur en texte) ; la migration 041 ramène `profile_id` et
+-- `item_id` en BIGINT après coup, comme 038 pour `favorite_facets`.
+CREATE TABLE IF NOT EXISTS hidden_items (
+    profile_id TEXT NOT NULL DEFAULT '1',
+    item_type TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    item_name TEXT,
+    item_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, item_type, item_id)
+);
+
+-- « Ces deux albums ne sont pas des doublons » (#1276). Tout en TEXT comme le
+-- reste de ce schéma (la copie lie chaque valeur en texte) ; la migration 042
+-- ramène `profile_id`, `album_a_id` et `album_b_id` en BIGINT après coup,
+-- comme 041 pour `hidden_items`.
+CREATE TABLE IF NOT EXISTS album_distinct_pairs (
+    profile_id TEXT NOT NULL DEFAULT '1',
+    album_a_id TEXT NOT NULL,
+    album_b_id TEXT NOT NULL,
+    a_name TEXT,
+    a_artist TEXT,
+    b_name TEXT,
+    b_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, album_a_id, album_b_id)
+);
+
+-- Appareils ignorés (#1280). Tout en TEXT — comme la migration 044, qui
+-- déclare exactement les mêmes colonnes : rien à rattraper après la copie,
+-- contrairement à `hidden_items` et `favorite_facets`.
+CREATE TABLE IF NOT EXISTS ignored_devices (
+    device_id TEXT PRIMARY KEY,
+    mac TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    device_type TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
 
 CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq;
 CREATE TABLE IF NOT EXISTS streaming_favorites (
@@ -827,6 +881,9 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;
 -- listen_history: ce que l'auditeur a demande (SQLite migration v84, #2441)
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT;
+-- listen_history: ou l'auditeur en etait dans cet objet (SQLite migration v94,
+-- #2441). TEXT comme album_id / profile_id ici : ce schema porte tout en TEXT.
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_position TEXT;
 
 -- smart_playlists: match_mode (SQLite migration v48)
 ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DEFAULT 'all';
@@ -1176,53 +1233,16 @@ fn get_sqlite_columns(db: &SqliteDb, table: &str) -> Result<Vec<String>, String>
     Ok(cols)
 }
 
-/// After migrating data with explicit IDs, the PG sequences are still
-/// at 1. Reset them to MAX(id)+1 so new inserts don't collide.
-async fn reset_sequences(pool: &PgPool) -> Result<(), String> {
-    // Tables with TEXT PRIMARY KEY named "id"
-    let tables = [
-        "artists",
-        "albums",
-        "tracks",
-        "track_credits",
-        "playlists",
-        "playlist_tracks",
-        "zones",
-        "play_queue",
-        "streaming_queue",
-        "listen_history",
-        "radio_stations",
-        "radio_favorites",
-        "profiles",
-        "favorites",
-        "tags",
-        "item_tags",
-        "album_ratings",
-        "smart_playlists",
-        "smart_collections",
-        "bookmarks",
-        "alarms",
-        "network_mounts",
-        "podcast_subscriptions",
-        "offline_cache",
-        "sync_links",
-        "sync_link_snapshots",
-        "track_source_links",
-    ];
-
-    for table in &tables {
-        let seq_name = format!("{table}_id_seq");
-        let sql = format!(
-            "SELECT setval('{seq_name}', COALESCE((SELECT MAX(id) FROM {table}), 0) + 1, false)"
-        );
-        match sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await {
-            Ok(_) => {}
-            Err(e) => {
-                // Sequence might not exist for tables without BIGSERIAL
-                info!(table, error = %e, "pg_sequence_reset_skipped");
-            }
-        }
-    }
-
-    Ok(())
-}
+// `reset_sequences` vivait ici : après une migration qui insère des `id`
+// explicites, elle repositionnait chaque séquence PostgreSQL à MAX(id)+1.
+// Elle n'a plus d'appelant depuis « PG migration — TEXT PRIMARY KEY for all
+// tables, remove sequences » (7b947b01), et elle ne pourrait plus servir telle
+// quelle : sa liste de tables décrit le schéma BIGSERIAL d'avant, et son
+// `MAX(id) + 1` sur une colonne devenue TEXT n'a pas d'opérateur en PG — les
+// erreurs partaient en `pg_sequence_reset_skipped`, donc en silence.
+//
+// ⚠️ Il reste TROIS séquences vivantes que rien ne repositionne après une
+// migration SQLite → PG : `zones_id_seq` (ici l.350), `streaming_favorites_id_seq`
+// (ici l.569 et db/postgres.rs) et `queue_items_id_seq` (db/postgres.rs). Le
+// correctif demande un PostgreSQL réel pour être prouvé ; il n'est PAS fait ici,
+// et rebrancher cette fonction-là ne l'aurait pas fait non plus.

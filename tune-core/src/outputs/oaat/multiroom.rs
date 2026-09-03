@@ -217,7 +217,7 @@ impl OutputTarget for OaatMultiroomOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, false, true, true, false)
+        OutputCapabilities::v1(true, true, false, true, true, false).with_percent_volume()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

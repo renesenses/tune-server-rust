@@ -3,14 +3,12 @@ use std::time::Instant;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
-use tune_core::db::migrations;
-use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 
 use crate::error::AppError;
@@ -19,13 +17,20 @@ use crate::state::AppState;
 pub(super) async fn database_status(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    // The migration version is a SQLite notion; PG tracks its own and reports 0.
-    let version = state
-        .db
-        .as_ref()
-        .and_then(|db| migrations::current_version(db).ok())
-        .unwrap_or(0);
-    let latest = migrations::latest_version();
+    // #3182 : le commentaire d'origine — « the migration version is a SQLite
+    // notion; PG tracks its own and reports 0 » — décrivait le défaut au lieu
+    // de le corriger. PostgreSQL tient bien SA table `schema_version`, elle est
+    // lisible, et « 0 » face à un `latest` SQLite rendait `up_to_date: false`
+    // à demeure sur une base parfaitement à jour.
+    let engine = state.backend.engine();
+    let version = super::version_de_schema(&state);
+    let latest = super::version_de_schema_cible(engine);
+    // `null` quand l'un des deux manque : une comparaison impossible ne rend
+    // pas `false`, elle ne rend rien.
+    let up_to_date = match (version, latest) {
+        (Some(v), Some(l)) => Some(v >= l),
+        _ => None,
+    };
     let row = state.backend.query_one(
         "SELECT \
          (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
@@ -43,12 +48,11 @@ pub(super) async fn database_status(
         })
         .unwrap_or((0, 0, 0));
 
-    let engine_name = format!("{:?}", state.backend.engine()).to_lowercase();
     Ok(Json(json!({
-        "engine": engine_name,
+        "engine": engine.as_str(),
         "migration_version": version,
         "latest_version": latest,
-        "up_to_date": version >= latest,
+        "up_to_date": up_to_date,
         "artists": artists,
         "albums": albums,
         "tracks": tracks,
@@ -167,16 +171,87 @@ pub(super) async fn export_database(
     }
 }
 
+/// Plafond de corps propre à l'import de base.
+///
+/// La limite globale du serveur est de 50 Mo (`routes/mod.rs`), soit cinq fois
+/// moins que ce que pèse l'export d'une bibliothèque ordinaire : **256 Mo pour
+/// 47 000 pistes**, mesuré le 30/08/2026. Au-dessus, la requête était coupée
+/// avant d'atteindre ce handler et le testeur recevait « no file provided »
+/// alors qu'il avait bien fourni un fichier (#2849, Johannes Henke, Synology).
+/// Comme `support.rs`, la route pose donc sa propre limite, au-dessus de la
+/// globale. 2 Gio et pas davantage : la valeur tient dans un `usize` 32 bits,
+/// que la cible armv7 utilise encore.
+pub(super) const IMPORT_DB_BODY_LIMIT: usize = 2 * 1024 * 1024 * 1024;
+
+/// Rend l'erreur multipart telle qu'elle est, au lieu de la déguiser.
+///
+/// L'ancienne boucle `while let Ok(Some(field))` sortait silencieusement sur
+/// une `Err`, et `field.bytes().await.ok()` en faisait un `None` : **toute**
+/// panne de transport — dépassement de taille compris — ressortait en
+/// `400 no file provided`, le message le plus trompeur possible pour qui vient
+/// justement de fournir un fichier. Un dépassement sort maintenant en 413.
+fn multipart_failure(err: axum::extract::multipart::MultipartError) -> Response {
+    let status = err.status();
+    let detail = err.body_text();
+    tracing::warn!(status = %status, error = %detail, "database_import_multipart_error");
+    let hint = (status == StatusCode::PAYLOAD_TOO_LARGE).then(|| {
+        format!(
+            "the uploaded database exceeds this route's limit of {} MB",
+            IMPORT_DB_BODY_LIMIT / (1024 * 1024)
+        )
+    });
+    (status, Json(json!({"error": detail, "hint": hint}))).into_response()
+}
+
+/// Remplace la base active par un fichier SQLite téléversé.
+///
+/// Avant le 30/08/2026 ce handler écrivait le fichier reçu dans `/tmp`, comptait
+/// trois tables et s'arrêtait là : la base active n'était jamais remplacée,
+/// aucune sauvegarde n'était prise, et le chemin mémorisé (`last_imported_db`)
+/// n'était relu nulle part. L'écran annonçait pourtant « Import successful ».
+/// Les trois promesses du dialogue de confirmation — remplacer la base, prendre
+/// une sauvegarde de sécurité, redémarrer ensuite — sont désormais tenues.
 pub(super) async fn database_import(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
-    let mut file_bytes: Option<Vec<u8>> = None;
+    // Le fichier reçu est une base SQLite : en PostgreSQL le serveur n'ouvre
+    // même plus `db_path`, et l'écraser donnerait à l'opérateur l'illusion
+    // d'une restauration. Même refus explicite que les sauvegardes fichier.
+    if state.db.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "database import is SQLite-only; this server runs on PostgreSQL — \
+                          use pg_restore against TUNE_DATABASE_URL",
+            })),
+        )
+            .into_response();
+    }
+    let db_path = state.config.db_path.clone();
+    if db_path == ":memory:" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "cannot import into an in-memory database"})),
+        )
+            .into_response();
+    }
 
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let name = field.name().unwrap_or("").to_string();
-        if name == "file" || name == "database" {
-            file_bytes = field.bytes().await.ok().map(|b| b.to_vec());
+    let mut file_bytes: Option<Vec<u8>> = None;
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let name = field.name().unwrap_or("").to_string();
+                if name == "file" || name == "database" {
+                    match field.bytes().await {
+                        Ok(b) => file_bytes = Some(b.to_vec()),
+                        Err(e) => return multipart_failure(e),
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return multipart_failure(e),
         }
     }
 
@@ -198,47 +273,107 @@ pub(super) async fn database_import(
             .into_response();
     }
 
-    // Open the imported DB and count rows
-    let import_db = match rusqlite::Connection::open_with_flags(
-        &tmp_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) {
+    // Contrôles avant de toucher à la base en service. Un refus ici laisse
+    // l'installation intacte ; un fichier tronqué appliqué, non.
+    let counts = match inspect_import_candidate(&tmp_path) {
         Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("not a valid SQLite file: {e}")})),
-            )
-                .into_response();
+        Err(refusal) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": refusal}))).into_response();
         }
     };
 
-    let track_count: i64 = import_db
-        .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))
-        .unwrap_or(0);
-    let album_count: i64 = import_db
-        .query_row("SELECT COUNT(*) FROM albums", [], |r| r.get(0))
-        .unwrap_or(0);
-    let artist_count: i64 = import_db
-        .query_row("SELECT COUNT(*) FROM artists", [], |r| r.get(0))
-        .unwrap_or(0);
-    drop(import_db);
+    // La sauvegarde de sécurité que le dialogue de confirmation promet.
+    let safety = tune_core::db_backup::create_backup(&db_path);
+    if safety.is_none() {
+        tracing::warn!("database_import_safety_backup_failed");
+    }
 
-    let tmp_str = tmp_path.to_string_lossy();
+    // Vider le WAL de la base sortante : sans cela SQLite le rejoue par-dessus
+    // le fichier fraîchement copié et rend un mélange des deux bases.
+    if let Ok(db) = state.sqlite() {
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+    }
 
-    // Store the import path for potential restore
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    settings.set("last_imported_db", &tmp_str).ok();
+    match tune_core::db_backup::replace_database(&db_path, &tmp_path) {
+        Ok(size) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            tracing::info!(
+                size,
+                tracks = counts.tracks,
+                backup = safety.as_ref().map(|b| b.filename.as_str()).unwrap_or("-"),
+                "database_imported"
+            );
+            Json(json!({
+                "imported": true,
+                "engine": "sqlite",
+                "size": size,
+                "restart_required": true,
+                "backup": safety.map(|b| b.filename),
+                "tracks": counts.tracks,
+                "albums": counts.albums,
+                "artists": counts.artists,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            tracing::warn!(error = %e, "database_import_replace_failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("could not replace the active database: {e}")})),
+            )
+                .into_response()
+        }
+    }
+}
 
-    Json(json!({
-        "status": "imported",
-        "temp_path": tmp_str,
-        "tracks": track_count,
-        "albums": album_count,
-        "artists": artist_count,
-        "message": "Database file received. Use /system/backups to restore or merge manually.",
-    }))
-    .into_response()
+/// Ce qu'un candidat à l'import contient, une fois jugé applicable.
+#[derive(Debug)]
+struct ImportCounts {
+    tracks: i64,
+    albums: i64,
+    artists: i64,
+}
+
+/// Juge un fichier reçu AVANT de remplacer quoi que ce soit.
+///
+/// Rend le motif de refus, en clair, quand le fichier n'est pas une base Tune :
+/// un fichier tronqué s'ouvre sans broncher (SQLite ne lit l'en-tête qu'à la
+/// première requête), et une base d'un autre logiciel s'ouvre parfaitement.
+fn inspect_import_candidate(path: &std::path::Path) -> Result<ImportCounts, String> {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("not a valid SQLite file: {e}"))?;
+
+    let integrity: String = db
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .map_err(|e| format!("not a valid SQLite file: {e}"))?;
+    if integrity != "ok" {
+        return Err(format!("the uploaded database is corrupt: {integrity}"));
+    }
+
+    for table in ["tracks", "albums", "artists"] {
+        let present: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if present == 0 {
+            return Err(format!(
+                "this file is a SQLite database but not a Tune one: table `{table}` is missing"
+            ));
+        }
+    }
+
+    let count = |sql: &str| -> i64 { db.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+    Ok(ImportCounts {
+        tracks: count("SELECT COUNT(*) FROM tracks"),
+        albums: count("SELECT COUNT(*) FROM albums"),
+        artists: count("SELECT COUNT(*) FROM artists"),
+    })
 }
 
 /// Turn a raw PostgreSQL connection error into a user-facing message. When the
@@ -476,6 +611,13 @@ fn persist_database_url(url: &str) -> Result<std::path::PathBuf, String> {
 /// PostgreSQL. Unlike the update flow there is no binary swap involved, so
 /// spawning the SAME executable is safe on Windows too (the update path must
 /// NOT spawn — see update.rs — but here no .bat is waiting on our exit).
+///
+/// Même portée que [`persist_database_url`] juste au-dessus : la migration
+/// SQLite → PostgreSQL n'existe que sous `postgres`, et son unique appelant
+/// vit dans le bloc `#[cfg(feature = "postgres")]` de `migrate_database`.
+/// L'attribut manquait ici seul — d'où une fonction sans appelant dans toutes
+/// les configurations de la CI, qui ne compile pas `postgres`.
+#[cfg(feature = "postgres")]
 fn restart_after_migration() {
     tokio::spawn(async {
         // Let the HTTP response flush to the client first.
@@ -657,5 +799,75 @@ pub(super) async fn migrate_database(
             })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests_import {
+    use super::*;
+
+    /// Le plafond de cette route doit dépasser la limite globale, sinon il ne
+    /// sert à rien : la requête est coupée avant d'arriver au handler.
+    ///
+    /// Le repère de 256 Mo n'est pas théorique — c'est l'export mesuré le
+    /// 30/08/2026 d'une bibliothèque de 47 000 pistes.
+    #[test]
+    fn plafond_import_depasse_la_limite_globale_et_un_export_reel() {
+        const LIMITE_GLOBALE: usize = 50 * 1024 * 1024;
+        const EXPORT_MESURE: usize = 256 * 1024 * 1024;
+        assert!(IMPORT_DB_BODY_LIMIT > LIMITE_GLOBALE);
+        assert!(IMPORT_DB_BODY_LIMIT > EXPORT_MESURE);
+    }
+
+    fn base_tune_minimale(chemin: &std::path::Path) {
+        let db = rusqlite::Connection::open(chemin).unwrap();
+        db.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY);
+             CREATE TABLE albums (id INTEGER PRIMARY KEY);
+             CREATE TABLE tracks (id INTEGER PRIMARY KEY);
+             INSERT INTO tracks (id) VALUES (1), (2);
+             INSERT INTO albums (id) VALUES (1);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn une_base_tune_est_acceptee_et_comptee() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("candidate.db");
+        base_tune_minimale(&chemin);
+
+        let counts = inspect_import_candidate(&chemin).expect("une base Tune doit passer");
+        assert_eq!(counts.tracks, 2);
+        assert_eq!(counts.albums, 1);
+        assert_eq!(counts.artists, 0);
+    }
+
+    /// Contre-épreuve du test précédent : ce qui n'est pas une base Tune doit
+    /// être REFUSÉ, et refusé avec le motif exact. Sans ces deux cas, le test
+    /// d'acceptation ne prouverait rien — une fonction qui dit toujours oui le
+    /// passerait aussi.
+    #[test]
+    fn un_fichier_qui_n_est_pas_une_base_tune_est_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. Pas du SQLite du tout : le refus tombe à la lecture de l'en-tête.
+        let texte = dir.path().join("notes.txt");
+        std::fs::write(&texte, b"ceci n'est pas une base de donnees").unwrap();
+        let motif = inspect_import_candidate(&texte).unwrap_err();
+        assert!(
+            motif.contains("not a valid SQLite file") || motif.contains("corrupt"),
+            "motif inattendu: {motif}"
+        );
+
+        // 2. Du SQLite valide, mais d'un autre logiciel : les tables manquent.
+        let etrangere = dir.path().join("autre.db");
+        let db = rusqlite::Connection::open(&etrangere).unwrap();
+        db.execute_batch("CREATE TABLE recettes (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        drop(db);
+        let motif = inspect_import_candidate(&etrangere).unwrap_err();
+        assert!(motif.contains("not a Tune one"), "motif inattendu: {motif}");
+        assert!(motif.contains("tracks"), "le motif doit nommer la table");
     }
 }

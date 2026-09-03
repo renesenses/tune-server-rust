@@ -86,6 +86,34 @@ impl LrclibRaw {
     }
 }
 
+/// Position de lecture à utiliser pour choisir la ligne de paroles active,
+/// une fois appliqué le décalage `zones.lyrics_offset_ms` de la zone.
+///
+/// **Implémentation de référence unique** du réglage (#2997) : tout code qui
+/// surligne une ligne de paroles pour une zone doit passer par ici plutôt que
+/// de comparer les horodatages à la position brute.
+///
+/// `offset_ms` positif = paroles **retardées**. Le serveur apprend le titre
+/// avant que l'auditeur ne l'entende (tampon de Tune, puis du renderer), donc
+/// les paroles défilent en avance et il faut les retarder : on recule la
+/// position d'autant, ce qui revient à avancer d'autant l'instant où chaque
+/// ligne devient active. Décalage **par zone**, parce que la profondeur du
+/// tampon appartient à l'appareil ; à ne pas confondre avec `sync_delay_ms`,
+/// qui décale l'AUDIO pour aligner deux pièces.
+///
+/// Deux propriétés dont les appelants dépendent :
+/// - un décalage de **zéro** rend la position inchangée, donc exactement le
+///   comportement d'avant ce réglage ;
+/// - le résultat ne descend jamais sous zéro — une position négative n'existe
+///   pas, et laisserait le début du morceau sans ligne active.
+///
+/// C'est le calcul que le client web tient déjà dans `TvView.svelte`
+/// (`syncPos = max(0, pos - lyricsOffsetMs)`) : cette fonction est la même
+/// règle, côté serveur, pour les surfaces qui connaissent la zone.
+pub fn sync_position_ms(position_ms: i64, offset_ms: i32) -> i64 {
+    position_ms.saturating_sub(offset_ms as i64).max(0)
+}
+
 // ---------------------------------------------------------------------------
 // LRC parser (canonical implementation lives in metadata::lyrics)
 // ---------------------------------------------------------------------------
@@ -448,6 +476,48 @@ pub async fn get_lyrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #2997 : sémantique du décalage de paroles par zone ─────────────────
+
+    #[test]
+    fn decalage_nul_rend_la_position_inchangee() {
+        // TÉMOIN : c'est le cas de toutes les zones existantes. Zéro doit être
+        // l'identité, sinon le correctif déplacerait les paroles de tout le
+        // monde en prétendant ne rien changer.
+        for pos in [0, 1, 12_340, 16_000, 3_600_000] {
+            assert_eq!(sync_position_ms(pos, 0), pos, "position {pos}");
+        }
+    }
+
+    #[test]
+    fn decalage_positif_retarde_les_paroles() {
+        // Positif = paroles retardées : on lit les horodatages comme si l'on
+        // était PLUS TÔT dans le morceau, donc chaque ligne s'active plus tard.
+        assert_eq!(sync_position_ms(16_000, 3_000), 13_000);
+        assert_eq!(sync_position_ms(60_000, 60_000), 0);
+    }
+
+    #[test]
+    fn decalage_negatif_avance_les_paroles() {
+        assert_eq!(sync_position_ms(28_000, -3_000), 31_000);
+    }
+
+    #[test]
+    fn la_position_corrigee_ne_descend_jamais_sous_zero() {
+        // Au tout début d'un morceau, un décalage positif dépasse la position.
+        // Une position négative n'existe pas et laisserait le début du morceau
+        // sans ligne active.
+        assert_eq!(sync_position_ms(1_000, 5_000), 0);
+        assert_eq!(sync_position_ms(0, 60_000), 0);
+    }
+
+    #[test]
+    fn les_bornes_du_reglage_ne_debordent_pas() {
+        // Le réglage est borné à ±60 s par la route ; ces bornes doivent
+        // rester sans surprise même à des positions extrêmes.
+        assert_eq!(sync_position_ms(i64::MAX, -60_000), i64::MAX);
+        assert_eq!(sync_position_ms(i64::MIN, 60_000), 0);
+    }
 
     #[test]
     fn parse_lrc_basic() {

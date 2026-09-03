@@ -47,15 +47,15 @@ fn rendre_executable(chemin: &Path) {
 ///
 /// `version_pubspec` et `version_manifeste` sont dissociables a dessein : c'est
 /// exactement la derive que le pre-vol doit refuser.
+/// `racine` est le GARDE, pas un simple chemin : il supprime l'arborescence a
+/// la destruction de `FauxDev`, panique comprise (#3030).
 struct FauxDev {
-    racine: PathBuf,
+    racine: tune_core::test_scratch::ScratchDir,
 }
 
 impl FauxDev {
     fn nouveau(nom: &str, version_pubspec: &str, version_manifeste: &str) -> Self {
-        let racine =
-            std::env::temp_dir().join(format!("tune-bump-natifs-{}-{}", nom, std::process::id()));
-        let _ = fs::remove_dir_all(&racine);
+        let racine = tune_core::test_scratch::scratch_dir(&format!("tune-bump-natifs-{nom}"));
 
         let rust = racine.join("tune-server-rust");
         ecrire(
@@ -132,10 +132,21 @@ exit {code_sortie}
     }
 
     fn lancer(&self, arguments: &[&str]) -> Output {
+        self.lancer_avec_identite(arguments, "Jean-Philippe ROBBE", "jp@robbe.net")
+    }
+
+    fn lancer_avec_identite(&self, arguments: &[&str], nom: &str, email: &str) -> Output {
         Command::new("bash")
             .arg(script())
             .args(arguments)
             .env("TUNE_DEV_DIR", &self.racine)
+            // Le runner GitHub n'a volontairement aucune identite globale. Le
+            // faux releaseur doit donc en fournir une, comme une vraie machine
+            // de release ; les tests de #2781 peuvent ensuite la corrompre.
+            .env("GIT_AUTHOR_NAME", nom)
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_COMMITTER_NAME", nom)
+            .env("GIT_COMMITTER_EMAIL", email)
             // `cargo fmt` / `cargo update` sur le faux depot ne servent a rien
             // et le script les tolere deja ; PATH ampute pour ne pas les lancer.
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
@@ -156,14 +167,30 @@ exit {code_sortie}
     }
 }
 
-impl Drop for FauxDev {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.racine);
-    }
-}
-
 const IPAD_YML: &str =
     "name: Tune\nsettings:\n  MARKETING_VERSION: \"0.9.90\"\n  CURRENT_PROJECT_VERSION: 90\n";
+
+/// #2781 : l'identite est verifiee avant la premiere reecriture. Le couple qui
+/// a fausse les releases 0.9.29 a 0.9.125 doit laisser tous les manifestes
+/// byte-for-byte intacts.
+#[test]
+fn un_couple_nom_email_melange_est_refuse_avant_le_bump() {
+    let dev = FauxDev::nouveau("identite-melangee", "0.9.90", "0.9.90").avec_leurre_build(0);
+    let cargo_avant = dev.cargo();
+
+    let sortie = dev.lancer_avec_identite(
+        &["0.9.91", "--skip-web-drift-check"],
+        "Bertrand",
+        "jp@robbe.net",
+    );
+    assert!(!sortie.status.success(), "le couple forge doit etre refuse");
+    assert_eq!(dev.cargo(), cargo_avant, "le refus arrive avant le bump");
+    assert!(
+        String::from_utf8_lossy(&sortie.stdout).contains("mixed Git identity"),
+        "le diagnostic doit nommer la vraie cause. stdout: {}",
+        String::from_utf8_lossy(&sortie.stdout)
+    );
+}
 
 /// Le cas nominal : le bump entraine la reconstruction, dans la meme execution.
 #[test]

@@ -12,6 +12,8 @@
 # ============================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # --- Configuration ---
 TUNE_VERSION="${1:---version}"
 if [[ "$TUNE_VERSION" == "--version" ]]; then
@@ -243,19 +245,31 @@ ACTION=="add", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesys
 ACTION=="remove", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/bin/systemd-umount /media/%k"
 EOF
 
-# SSH: enable but disable password auth by default (key only)
+# SSH password login stays available for a headless appliance, but the account
+# starts locked. first-boot generates a unique temporary password and expires
+# it immediately; there is no public credential window before that service.
 mkdir -p "${ROOTFS}/etc/ssh/sshd_config.d"
 cat > "${ROOTFS}/etc/ssh/sshd_config.d/tune.conf" <<EOF
 PermitRootLogin no
 PasswordAuthentication yes
 EOF
 
-# Create tune user
+# Create the tune user locked. Never bake a reusable password into an image.
 chroot "$ROOTFS" bash -c "
     useradd -m -s /bin/bash -G sudo,audio,plugdev tune
-    echo 'tune:tune' | chpasswd
     echo 'tune ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/tune
 "
+
+install -D -m 0755 "${SCRIPT_DIR}/tune-os-password.sh" \
+    "${ROOTFS}/usr/local/sbin/tune-os-password"
+cat > "${ROOTFS}/etc/profile.d/tune-password-notice.sh" <<'EOF'
+# Remove the physical-console notice only after shadow confirms that the
+# forced password change has happened.
+if [ "${USER:-}" = tune ] && command -v sudo >/dev/null 2>&1; then
+    sudo -n /usr/local/sbin/tune-os-password --acknowledge >/dev/null 2>&1 || true
+fi
+EOF
+chmod 0644 "${ROOTFS}/etc/profile.d/tune-password-notice.sh"
 
 # ALSA: set USB audio as default if present
 cat > "${ROOTFS}/etc/asound.conf" <<'EOF'
@@ -402,12 +416,36 @@ PrivateTmp=yes
 PrivateNetwork=no
 EOF
 
+# Password initialization is a separate fail-closed boot unit. sshd requires
+# its success, rather than merely being ordered after it.
+cat > "${ROOTFS}/etc/systemd/system/tune-first-boot-password.service" <<EOF
+[Unit]
+Description=Tune OS First Boot SSH Password
+After=local-fs.target
+Before=ssh.service getty@tty1.service
+ConditionPathExists=!/var/lib/tune-os/ssh-password-v2
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tune-os-password --first-boot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+mkdir -p "${ROOTFS}/etc/systemd/system/ssh.service.d"
+cat > "${ROOTFS}/etc/systemd/system/ssh.service.d/tune-password.conf" <<EOF
+[Unit]
+Requires=tune-first-boot-password.service
+After=tune-first-boot-password.service
+EOF
+
 # Enable services
 chroot "$ROOTFS" systemctl enable tune.service
 chroot "$ROOTFS" systemctl enable NetworkManager
 chroot "$ROOTFS" systemctl enable avahi-daemon
 chroot "$ROOTFS" systemctl enable ssh
 chroot "$ROOTFS" systemctl enable tune-web80.socket
+chroot "$ROOTFS" systemctl enable tune-first-boot-password.service
 
 ok "Tune systemd service installed"
 
@@ -475,7 +513,7 @@ cat > "${ROOTFS}/etc/motd" <<EOF
   WiFi:      web UI → Settings → Network (first boot: ethernet)
   Config:    /opt/tune/tune.toml
   Logs:      journalctl -u tune -f
-  User:      tune / tune
+  SSH user:  tune (temporary password shown on the physical console at first boot)
 
 EOF
 
@@ -604,5 +642,5 @@ echo ""
 echo "  Flash to NUC: sudo dd if=${FINAL_IMG} of=/dev/sdX bs=4M status=progress"
 echo "  Or use:       balenaEtcher / Rufus with the .img file"
 echo ""
-echo "  Default login: tune / tune"
+echo "  SSH login: tune / temporary password generated on first boot (physical console)"
 echo "  Web UI:        http://tune.local:8888"

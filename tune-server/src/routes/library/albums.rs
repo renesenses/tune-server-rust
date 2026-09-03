@@ -1,14 +1,16 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
-use tune_core::db::album_repo::AlbumRepo;
+use tune_core::db::album_distinct_repo::{AlbumDistinctRepo, DistinctPairSet};
+use tune_core::db::album_repo::{AlbumRepo, DrRange};
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
@@ -31,6 +33,31 @@ pub(super) struct AlbumFilters {
     /// `?compilation=true` ne rend que les compilations, `false` que le reste,
     /// absent = tout (#1957).
     compilation: Option<bool>,
+    /// `?include_hidden=true` rend AUSSI les albums masqués (#1391). Absent
+    /// ou `false` : ils sont exclus — un client qui ignore le paramètre voit
+    /// simplement l'album disparaître, sans rien changer chez lui.
+    include_hidden: Option<bool>,
+    /// Tranche de Dynamic Range, bornes INCLUSES (#2144). Les deux sont
+    /// facultatives et indépendantes : `?dr_min=14` = « DR14 et au-dessus »,
+    /// `?dr_max=7` = « DR7 et en dessous », les deux = une tranche fermée.
+    /// Aucune des deux = aucun filtre, réponse identique à avant.
+    ///
+    /// Le serveur ne connaît PAS de tranches nommées : l'issue n'en fixe
+    /// aucune (voir `DrRange`). `GET /library/albums/filters` rend les valeurs
+    /// réellement présentes, à charge du client de dessiner ses pastilles.
+    dr_min: Option<i64>,
+    dr_max: Option<i64>,
+    /// Graine du tri aleatoire (#3074). N'a de sens qu'avec `sort=random`.
+    ///
+    /// Absente, le serveur en tire une et la RENVOIE dans la reponse
+    /// (`"seed"`) : le client doit la repasser sur les pages suivantes, sinon
+    /// chaque `offset` re-tire et la grille montre des albums en double tout
+    /// en en cachant d'autres — la vue Bibliotheque charge ses albums en
+    /// quatre requetes (offset 0/100, puis 0, 2000, 4000).
+    ///
+    /// Le « bouton de re-tirage » demande au fil 1635 n'est donc rien d'autre
+    /// que « redemander la page 0 sans graine », ou avec une autre.
+    seed: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -64,8 +91,25 @@ pub(super) async fn list_albums(
     let offset = p.offset.unwrap_or(0);
     let sort = p.sort.as_deref().unwrap_or("added_at");
     let order = p.order.as_deref().unwrap_or("asc");
-    let total = repo.count().unwrap_or(0);
-    let items = match repo.list_filtered(
+    let include_hidden = p.include_hidden.unwrap_or(false);
+    let dr = DrRange::new(p.dr_min, p.dr_max);
+    // Le total suit la même exclusion que la liste, sinon la grille pagine
+    // faux (#1391) — et la même TRANCHE de DR, sinon elle pagine encore plus
+    // faux (#2144) : le tag DR n'existe que sur une poignée d'albums, un
+    // `total` de 45 000 sur une liste de douze donnerait des centaines de
+    // pages vides.
+    let total = match dr {
+        Some(range) => repo.count_in_dr_range(range, include_hidden).unwrap_or(0),
+        None if include_hidden => repo.count().unwrap_or(0),
+        None => repo.count_visible().unwrap_or(0),
+    };
+    // #3074 — `sort=random` : la graine EST le contrat. Le serveur en tire une
+    // quand le client n'en donne pas, et la lui rend toujours, pour que les
+    // pages suivantes retombent sur le meme tirage. Hors tri aleatoire elle
+    // reste `None` et la reponse ne bouge pas d'un octet pour les clients deja
+    // livres (iOS, macOS, Android, client web, UPnP).
+    let seed = (sort == "random").then(|| p.seed.unwrap_or_else(AlbumRepo::graine_aleatoire));
+    let items = match repo.list_filtered_seeded(
         limit,
         offset,
         sort,
@@ -73,6 +117,9 @@ pub(super) async fn list_albums(
         p.format.as_deref(),
         p.quality.as_deref(),
         p.compilation,
+        include_hidden,
+        dr,
+        seed,
     ) {
         Ok(albums) => albums,
         Err(e) => {
@@ -98,7 +145,13 @@ pub(super) async fn list_albums(
             j
         })
         .collect();
-    Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+    let mut corps = json!({"items": items, "total": total, "limit": limit, "offset": offset});
+    if let Some(graine) = seed {
+        // Ajoutee SEULEMENT en tri aleatoire : un client qui ignore #3074 lit
+        // exactement la reponse d'avant.
+        corps["seed"] = json!(graine);
+    }
+    Json(corps)
 }
 
 pub(super) async fn album_count(State(state): State<AppState>) -> Json<Value> {
@@ -106,6 +159,48 @@ pub(super) async fn album_count(State(state): State<AppState>) -> Json<Value> {
         .count()
         .unwrap_or(0);
     Json(json!({ "count": count }))
+}
+
+/// `POST /library/albums/{id}/hide` — masque l'album (#1391).
+///
+/// Masquer n'est PAS supprimer : les fichiers restent intacts, `GET
+/// /albums/{id}`, ses pistes et la lecture restent opérants (files d'attente
+/// et playlists continuent de jouer) ; l'album sort des vues de découverte
+/// (grilles, pistes, recherche, facettes). Réversible par DELETE. Idempotent.
+pub(super) async fn hide_album(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match repo.hide_album(id) {
+        Ok(true) => Ok(Json(json!({"album_id": id, "hidden": true}))),
+        Ok(false) => Err(AppError::not_found(format!("album {id} not found"))),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
+/// `DELETE /library/albums/{id}/hide` — démasque. Idempotent : démasquer un
+/// album non masqué rend simplement `hidden: false`.
+pub(super) async fn unhide_album(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match repo.unhide_album(id) {
+        Ok(_) => Ok(Json(json!({"album_id": id, "hidden": false}))),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
+/// `GET /library/albums/hidden` — la liste de révision : tout ce qui est
+/// masqué, y compris les marqueurs momentanément orphelins (racine démontée),
+/// rendus avec l'instantané d'identité pour rester démasquables.
+pub(super) async fn list_hidden_albums(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    let items = repo.list_hidden_albums().map_err(AppError::internal)?;
+    Ok(Json(json!({"total": items.len(), "items": items})))
 }
 
 #[derive(Deserialize)]
@@ -190,7 +285,7 @@ pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<
              ORDER BY LOWER(TRIM(format))",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| row.into_iter().next()?.as_string())
         .collect();
@@ -200,12 +295,21 @@ pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<
             "SELECT DISTINCT sample_rate FROM albums WHERE sample_rate IS NOT NULL ORDER BY sample_rate",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| row.into_iter().next()?.as_i64())
         .collect();
+    // Dynamic Range (#2144) : les valeurs RÉELLEMENT présentes, croissantes.
+    // C'est la matière des tranches, et la mesure que l'issue réclamait — un
+    // tableau vide dit qu'aucun album n'est tagué, et l'écran n'a alors aucune
+    // facette DR à proposer plutôt qu'une facette qui ne rendrait rien.
+    // La clé s'ajoute au JSON existant : un client qui l'ignore ne voit aucun
+    // changement.
+    let dynamic_ranges = AlbumRepo::with_backend(state.backend.clone())
+        .dynamic_range_values()
+        .unwrap_or_default();
     Ok(Json(
-        json!({ "formats": formats, "sample_rates": sample_rates }),
+        json!({ "formats": formats, "sample_rates": sample_rates, "dynamic_ranges": dynamic_ranges }),
     ))
 }
 
@@ -267,21 +371,42 @@ pub(super) async fn album_tracks(
     // absente du JSON — ce qui laisse le contrat inchangé pour les clients qui
     // ne la connaissent pas.
     let track_ids: Vec<i64> = items.iter().filter_map(|t| t.id).collect();
-    let grouping = TrackMetadataRepo::with_backend(state.backend.clone())
+    let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
+    let grouping = meta_repo
         .get_key_for_tracks("grouping", &track_ids)
         .unwrap_or_default();
 
-    Json(json!(attach_grouping(items, &grouping)))
+    // Dynamic Range par piste (#1388) : le tag `DYNAMIC RANGE` est lu au scan
+    // (#1806, `track_metadata['dr_track']`) mais n'était ressorti par aucune
+    // liste de pistes — seul l'agrégat album sortait sur la fiche (#1809).
+    // Même clé de sortie `dynamic_range` que sur l'album, même contrat :
+    // absente quand la piste n'a pas de tag, présente pour DR0 qui est une
+    // vraie mesure (celle d'un master saturé).
+    let dynamic_range = meta_repo
+        .get_key_for_tracks("dr_track", &track_ids)
+        .unwrap_or_default();
+
+    Json(json!(attach_track_tags(
+        items,
+        &[("grouping", &grouping), ("dynamic_range", &dynamic_range)]
+    )))
 }
 
-/// Recopie le tag GROUPING sur les pistes sérialisées d'un album.
+/// Recopie des tags étendus (`track_metadata`) sur les pistes sérialisées
+/// d'un album : GROUPING (#2130) et Dynamic Range (#1388).
 ///
-/// La clé n'est ajoutée que pour les pistes qui en portent réellement une
+/// Une clé n'est ajoutée que pour les pistes qui en portent réellement une
 /// (`get_key_for_tracks` a déjà écarté les valeurs vides) : une piste sans
-/// GROUPING sort exactement comme avant, sans champ supplémentaire.
-fn attach_grouping(
+/// tag sort exactement comme avant, sans champ supplémentaire.
+///
+/// ⚠️ `pub(super)` et non privée : les AUTRES surfaces de pistes
+/// (`super::tracks`) ressortent le MÊME champ sous le MÊME nom (#1388). Un
+/// second recopieur écrit à côté aurait fini par diverger — l'écran aurait vu
+/// `dynamic_range` sur les pistes d'un album et rien, ou autre chose, dans la
+/// table des titres.
+pub(super) fn attach_track_tags(
     items: Vec<tune_core::db::models::Track>,
-    grouping: &std::collections::HashMap<i64, String>,
+    tags: &[(&str, &std::collections::HashMap<i64, String>)],
 ) -> Vec<Value> {
     items
         .into_iter()
@@ -289,8 +414,10 @@ fn attach_grouping(
             let track_id = t.id;
             let mut v = serde_json::to_value(&t).unwrap_or_default();
             if let (Some(track_id), Some(obj)) = (track_id, v.as_object_mut()) {
-                if let Some(g) = grouping.get(&track_id) {
-                    obj.insert("grouping".into(), json!(g));
+                for (key, map) in tags {
+                    if let Some(val) = map.get(&track_id) {
+                        obj.insert((*key).into(), json!(val));
+                    }
                 }
             }
             v
@@ -384,13 +511,17 @@ pub(super) async fn album_bio(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(q): Query<LangQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let album = match album_repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let lang = q.lang.as_deref().unwrap_or("fr");
+    // Même précédence que la route artiste : `?lang=` explicite, puis
+    // `Accept-Language`, puis `fr`. Cf. `super::artists::langue_demandee`.
+    let lang = super::artists::langue_demandee(q.lang.as_deref(), &headers);
+    let lang = lang.as_str();
 
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy.
@@ -533,6 +664,77 @@ pub(super) async fn album_similar(
     }
 }
 
+/// `POST /library/albums/{id}/distinct/{other_id}` — « ces deux albums ne sont
+/// pas des doublons » (#1276).
+///
+/// L'arbitrage vaut pour les DEUX chemins qui rapprochent des albums :
+/// `GET /library/albums/grouped` cesse de signaler la paire, et
+/// `POST /library/albums/merge-duplicates` refuse de la fusionner. Il est
+/// persisté par identité (titre + artiste des deux côtés) et réconcilié aux
+/// mêmes ancrages que les masquages : il survit au rescan, au déplacement de
+/// racine et à la mort/renaissance d'une ligne `albums`.
+///
+/// Idempotent, et insensible à l'ordre des deux ids.
+pub(super) async fn declare_albums_distinct(
+    State(state): State<AppState>,
+    Path((id, other_id)): Path<(i64, i64)>,
+) -> Result<Json<Value>, AppError> {
+    let repo = AlbumDistinctRepo::with_backend(state.backend.clone());
+    match repo.declarer_distincts(id, other_id) {
+        Ok(true) => Ok(Json(
+            json!({"album_a_id": id.min(other_id), "album_b_id": id.max(other_id), "distinct": true}),
+        )),
+        Ok(false) if id == other_id => Err(AppError::bad_request(
+            "un album n'est pas un doublon de lui-même",
+        )),
+        Ok(false) => Err(AppError::not_found(format!(
+            "album {id} ou {other_id} not found"
+        ))),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
+/// `DELETE /library/albums/{id}/distinct/{other_id}` — révoque l'arbitrage :
+/// la paire redevient candidate au rapprochement. Idempotent.
+pub(super) async fn revoke_albums_distinct(
+    State(state): State<AppState>,
+    Path((id, other_id)): Path<(i64, i64)>,
+) -> Result<Json<Value>, AppError> {
+    let repo = AlbumDistinctRepo::with_backend(state.backend.clone());
+    match repo.revoquer(id, other_id) {
+        Ok(_) => Ok(Json(
+            json!({"album_a_id": id.min(other_id), "album_b_id": id.max(other_id), "distinct": false}),
+        )),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
+/// `GET /library/albums/distinct` — la liste de révision : toutes les paires
+/// arbitrées, y compris celles momentanément orphelines (racine démontée),
+/// rendues avec leur instantané d'identité pour rester révocables.
+pub(super) async fn list_distinct_pairs(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let repo = AlbumDistinctRepo::with_backend(state.backend.clone());
+    let items = repo.lister().map_err(AppError::internal)?;
+    Ok(Json(json!({"total": items.len(), "items": items})))
+}
+
+/// Les paires que l'utilisateur a déclarées distinctes (#1276), chargées en
+/// UNE requête pour interrogation en mémoire.
+///
+/// Un échec de lecture rend l'ensemble VIDE, donc le comportement d'avant
+/// #1276 : le rapprochement continue de fonctionner. Le sens inverse (tout
+/// bloquer) transformerait une base en défaut en fonctionnalité muette.
+fn paires_distinctes(state: &AppState) -> DistinctPairSet {
+    AlbumDistinctRepo::with_backend(state.backend.clone())
+        .charger_ensemble()
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "album_distinct_pairs_load_failed");
+            DistinctPairSet::default()
+        })
+}
+
 pub(super) async fn merge_duplicate_albums_route(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
@@ -558,7 +760,7 @@ pub(super) async fn merge_duplicate_albums_route(
     let dupes: Vec<(String, String)> = state
         .backend
         .query_many(&dupes_sql, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let title = row.first()?.as_string()?;
@@ -567,7 +769,14 @@ pub(super) async fn merge_duplicate_albums_route(
         })
         .collect();
 
+    // #1276 : l'utilisateur a pu déclarer que deux de ces albums sont des
+    // releases DIFFÉRENTES. Une requête, un `HashSet` — le coût par candidat
+    // reste nul, et aucun `LOWER` n'est ajouté à ce chemin (#2848 y a mesuré
+    // ×4000 pour un `LOWER` non indexé).
+    let distinctes = paires_distinctes(&state);
+
     let mut deleted = 0i64;
+    let mut protegees = 0i64;
     for (_title, ids_str) in &dupes {
         let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
         if ids.len() < 2 {
@@ -592,20 +801,33 @@ pub(super) async fn merge_duplicate_albums_route(
         let update_sql = format!("UPDATE tracks SET album_id = {p1} WHERE album_id = {p2}");
         let delete_sql = format!("DELETE FROM albums WHERE id = {p1}");
         for &aid in &ids {
-            if aid != best_id {
-                state
-                    .backend
-                    .execute(
-                        &update_sql,
-                        &[&best_id as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
-                    )
-                    .ok();
-                state
-                    .backend
-                    .execute(&delete_sql, &[&aid as &dyn ToSqlValue])
-                    .ok();
-                deleted += 1;
+            if aid == best_id {
+                continue;
             }
+            // L'arbitrage de l'utilisateur prime sur le rapprochement par
+            // titre : la fusion SUPPRIME la ligne perdante, elle ne se répare
+            // pas. Un album protégé reste simplement à part (#1276).
+            if distinctes.contains(best_id, aid) {
+                protegees += 1;
+                tracing::info!(
+                    conserve = best_id,
+                    protege = aid,
+                    "album_merge_ignoree_paire_declaree_distincte"
+                );
+                continue;
+            }
+            state
+                .backend
+                .execute(
+                    &update_sql,
+                    &[&best_id as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
+                )
+                .ok();
+            state
+                .backend
+                .execute(&delete_sql, &[&aid as &dyn ToSqlValue])
+                .ok();
+            deleted += 1;
         }
     }
     state
@@ -614,7 +836,7 @@ pub(super) async fn merge_duplicate_albums_route(
             "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
         )
         .ok();
-    Ok(Json(json!({ "merged": deleted })))
+    Ok(Json(json!({ "merged": deleted, "protected": protegees })))
 }
 
 const VARIANT_PATTERNS: &[&str] = &[
@@ -645,23 +867,59 @@ fn strip_variant_suffix(title: &str) -> String {
     title.to_string()
 }
 
+/// Écarte du groupe les variantes que l'utilisateur a déclarées distinctes de
+/// l'original (#1276), et rend `None` si le groupe n'a plus de variante — il
+/// ne signale alors plus rien.
+///
+/// La comparaison se fait contre l'ORIGINAL du groupe, celui que l'écran
+/// propose de garder. Un groupe de trois où une seule paire est arbitrée garde
+/// donc les deux autres membres rapprochés : on retire la paire nommée, on
+/// n'invente pas de nouveau rapprochement.
+fn variantes_retenues<'a, I>(
+    original: &Album,
+    variantes: I,
+    distinctes: &DistinctPairSet,
+) -> Option<Vec<&'a Album>>
+where
+    I: IntoIterator<Item = &'a Album>,
+{
+    let retenues: Vec<&Album> = match original.id {
+        Some(oid) if !distinctes.is_empty() => variantes
+            .into_iter()
+            .filter(|a| a.id.is_none_or(|vid| !distinctes.contains(oid, vid)))
+            .collect(),
+        _ => variantes.into_iter().collect(),
+    };
+    if retenues.is_empty() {
+        None
+    } else {
+        Some(retenues)
+    }
+}
+
 pub(super) async fn albums_grouped(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let repo = AlbumRepo::with_backend(state.backend.clone());
+
+    // #1276 : les paires que l'utilisateur a déclarées « pas des doublons ».
+    // Chargées en UNE requête, interrogées en mémoire — aucun coût par
+    // candidat, aucun `LOWER` ajouté au rapprochement.
+    let distinctes = paires_distinctes(&state);
 
     // Group by MusicBrainz release group ID
     let mbid_groups = repo.list_release_groups().unwrap_or_default();
 
     let mut groups: Vec<Value> = mbid_groups
         .iter()
-        .map(|(gid, albums)| {
+        .filter_map(|(gid, albums)| {
             let original = &albums[0];
-            json!({
+            let variants = variantes_retenues(original, &albums[1..], &distinctes)?;
+            Some(json!({
                 "group_id": gid,
                 "method": "musicbrainz",
                 "original": original.to_json(),
-                "variants": albums[1..].iter().map(|a| a.to_json()).collect::<Vec<_>>(),
-                "count": albums.len(),
-            })
+                "variants": variants.iter().map(|a| a.to_json()).collect::<Vec<_>>(),
+                "count": variants.len() + 1,
+            }))
         })
         .collect();
 
@@ -686,12 +944,20 @@ pub(super) async fn albums_grouped(State(state): State<AppState>) -> Result<Json
 
     for (base_title, albums) in &title_map {
         if albums.len() > 1 {
+            // Même arbitrage que pour les groupes MusicBrainz (#1276) : une
+            // variante déclarée distincte de l'original sort du groupe, et un
+            // groupe vidé de ses variantes n'est plus signalé du tout.
+            let Some(variants) =
+                variantes_retenues(albums[0], albums[1..].iter().copied(), &distinctes)
+            else {
+                continue;
+            };
             groups.push(json!({
                 "group_id": base_title,
                 "method": "title_similarity",
                 "original": albums[0].to_json(),
-                "variants": albums[1..].iter().map(|a| a.to_json()).collect::<Vec<_>>(),
-                "count": albums.len(),
+                "variants": variants.iter().map(|a| a.to_json()).collect::<Vec<_>>(),
+                "count": variants.len() + 1,
             }));
         }
     }
@@ -930,7 +1196,7 @@ pub(super) async fn batch_update_albums(
 
 #[cfg(test)]
 mod tests_grouping {
-    use super::attach_grouping;
+    use super::attach_track_tags;
     use std::collections::HashMap;
     use tune_core::db::models::Track;
 
@@ -946,7 +1212,7 @@ mod tests_grouping {
     #[test]
     fn attach_grouping_leaves_tracks_untouched_when_absent() {
         let items = vec![track(1, "I. Allegro"), track(2, "II. Adagio")];
-        let out = attach_grouping(items, &HashMap::new());
+        let out = attach_track_tags(items, &[("grouping", &HashMap::new())]);
         assert_eq!(out.len(), 2);
         for v in &out {
             assert!(
@@ -963,7 +1229,7 @@ mod tests_grouping {
         let items = vec![track(1, "I. Allegro"), track(2, "Bonus")];
         let mut map = HashMap::new();
         map.insert(2i64, "Titres bonus".to_string());
-        let out = attach_grouping(items, &map);
+        let out = attach_track_tags(items, &[("grouping", &map)]);
         assert!(out[0].get("grouping").is_none());
         assert_eq!(out[1]["grouping"], "Titres bonus");
     }
@@ -974,7 +1240,41 @@ mod tests_grouping {
         let items = vec![track(1, "I. Allegro")];
         let mut map = HashMap::new();
         map.insert(99i64, "Autre album".to_string());
-        let out = attach_grouping(items, &map);
+        let out = attach_track_tags(items, &[("grouping", &map)]);
         assert!(out[0].get("grouping").is_none());
+    }
+
+    /// DR par piste (#1388) : la valeur ressort sous `dynamic_range` sur la
+    /// bonne piste, et une piste taguée DR0 la garde — c'est une vraie mesure,
+    /// celle d'un master saturé, pas une absence.
+    #[test]
+    fn attach_dynamic_range_reports_value_and_keeps_dr0() {
+        let items = vec![track(1, "Loud"), track(2, "Untagged"), track(3, "Quiet")];
+        let mut dr = HashMap::new();
+        dr.insert(1i64, "0".to_string());
+        dr.insert(3i64, "14".to_string());
+        let out = attach_track_tags(items, &[("dynamic_range", &dr)]);
+        assert_eq!(out[0]["dynamic_range"], "0");
+        assert!(
+            out[1].get("dynamic_range").is_none(),
+            "une piste sans tag DR sort sans la clé, pas avec null"
+        );
+        assert_eq!(out[2]["dynamic_range"], "14");
+    }
+
+    /// GROUPING et DR cohabitent sans se contaminer : chaque clé n'apparaît
+    /// que sur les pistes qui la portent.
+    #[test]
+    fn attach_track_tags_keeps_keys_independent() {
+        let items = vec![track(1, "I. Allegro"), track(2, "Bonus")];
+        let mut grouping = HashMap::new();
+        grouping.insert(1i64, "Sonates".to_string());
+        let mut dr = HashMap::new();
+        dr.insert(2i64, "11".to_string());
+        let out = attach_track_tags(items, &[("grouping", &grouping), ("dynamic_range", &dr)]);
+        assert_eq!(out[0]["grouping"], "Sonates");
+        assert!(out[0].get("dynamic_range").is_none());
+        assert!(out[1].get("grouping").is_none());
+        assert_eq!(out[1]["dynamic_range"], "11");
     }
 }

@@ -165,11 +165,13 @@ mod tests {
 
     /// Un dossier temporaire à soi, sans dépendance : deux tests qui
     /// partageraient un chemin se voleraient leur `.1`.
-    fn dossier(nom: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tune-journal-{nom}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    ///
+    /// Le garde est rendu tel quel — il supprime le dossier à la sortie du
+    /// test, panique comprise. C'est cette famille qui pesait le plus lourd
+    /// dans #3030 : 1 657 des 3 204 résidus de `/tmp` étaient des
+    /// `tune-journal-*`.
+    fn dossier(nom: &str) -> tune_core::test_scratch::ScratchDir {
+        tune_core::test_scratch::scratch_dir(&format!("tune-journal-{nom}"))
     }
 
     fn taille(p: &std::path::Path) -> u64 {
