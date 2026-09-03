@@ -256,3 +256,17 @@ path = "tests/recherche_sources_i3226.rs"
 [[test]]
 name = "pairs_decouverts_i2746"
 path = "tests/pairs_decouverts_i2746.rs"
+
+# #2147 : le compteur de pistes comptait la table ENTIERE pendant que le
+# rapport de scan ne comptait que les fichiers du disque — 142 pistes d'ecart
+# chez le testeur, sans explication. `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait jamais compile, donc vert contre rien.
+#
+# PAS de `required-features`, meme motif que la cible PostgreSQL de #3182
+# ci-dessus : l'epreuve SQLite ne demande aucune base externe et doit tourner
+# dans le `cargo test --workspace` ordinaire — sinon reparer PostgreSQL en
+# cassant SQLite passerait toutes les portes. Seule l'epreuve PostgreSQL de ce
+# fichier porte `#[cfg(feature = "postgres")]`.
+[[test]]
+name = "comptes_par_source_2147"
+path = "tests/comptes_par_source_2147.rs"
