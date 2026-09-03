@@ -49,6 +49,8 @@ mod eq_refus_premium_localise;
 mod etiquettes_types_et_playlists;
 #[path = "explorateur_dossiers.rs"]
 mod explorateur_dossiers;
+#[path = "extraction_cd_ne_promet_pas_ce_qu_elle_ne_fait_pas.rs"]
+mod extraction_cd_ne_promet_pas_ce_qu_elle_ne_fait_pas;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
 #[path = "favoris_cloisonnement_par_profil.rs"]
