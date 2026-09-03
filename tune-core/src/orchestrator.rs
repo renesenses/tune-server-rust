@@ -4349,6 +4349,30 @@ impl PlaybackOrchestrator {
             }
         };
 
+        // Le format que Tune ne sait pas rendre doit se DIRE, pas se taire.
+        //
+        // Même raison que `file_not_found:` juste au-dessus, et même endroit :
+        // sans garde ici, le défaut n'apparaît qu'après `output_play_sent`, dans
+        // la tâche de transcodage détachée — trop tard pour que la route en dise
+        // quoi que ce soit, et le morceau « joue » en silence.
+        //
+        // Pour un ISO SACD c'est pire qu'un silence de plus : `from_extension`
+        // rend `None` pour `iso`, `needs_transcode` retombe sur
+        // `unwrap_or(AudioFormat::Flac)`, et une image disque part sur le fil
+        // comme si c'était du FLAC. Le geste attendu n'est pas une relance ni un
+        // nouveau parcours : il faut un outil que Tune ne fournit pas — 22 albums
+        // chez JeromeQ pour la seule trace d'un `warn!` (#3234, fil 1206).
+        //
+        // Ce refus ne fabrique PAS un quatrième canal d'état : il emprunte la
+        // sentinelle que `play_error_response` sait déjà nommer, comme
+        // `file_not_found:`, et il répète le motif que le rapport de parcours
+        // affiche depuis #2992.
+        if let Some(motif) =
+            crate::audio::iso_sacd::refus_de_lecture(std::path::Path::new(&file_path))
+        {
+            warn!(track_id, file = %file_path, motif, "local_track_format_not_playable");
+            return Err(format!("format_not_playable:{motif}"));
+        }
         let fmt = track.format.unwrap_or_else(|| "flac".into());
         let source_format = AudioFormat::from_extension(&fmt);
         // DSD is 1-bit at MHz rates. When the DB row is missing audio props
@@ -17435,6 +17459,179 @@ mod tests {
             .iter()
             .flat_map(|sample| sample.to_le_bytes())
             .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // #3234 — un format sans décodeur se DIT, il ne se joue pas en silence.
+    // ------------------------------------------------------------------
+
+    /// Écrit une image `.iso` creuse portant `SACDMTOC` à son Master TOC.
+    ///
+    /// Le décalage et la signature viennent de la PRODUCTION : une fixture qui
+    /// recopierait `0x800 * 510` deviendrait muette le jour où le contrôle
+    /// changerait de repère, et l'épreuve resterait verte contre rien.
+    ///
+    /// Fichier creux : aucun octet réel avant le décalage, la fixture ne
+    /// consomme pas 4 Mo de disque.
+    fn image_iso_sacd_3234(dossier: &std::path::Path, nom: &str) -> String {
+        use std::io::{Seek, SeekFrom, Write};
+        let chemin = dossier.join(nom);
+        let mut fichier = std::fs::File::create(&chemin).unwrap();
+        fichier
+            .seek(SeekFrom::Start(
+                crate::audio::iso_sacd::DECALAGE_MASTER_TOC_SACD,
+            ))
+            .unwrap();
+        fichier
+            .write_all(crate::audio::iso_sacd::SIGNATURE_MASTER_TOC_SACD)
+            .unwrap();
+        fichier.set_len(4_200_000).unwrap();
+        fichier.flush().unwrap();
+        chemin.to_string_lossy().into_owned()
+    }
+
+    /// `PlayRequest` minimale de lecture locale : seuls la zone et la piste
+    /// varient dans les deux épreuves qui suivent.
+    fn requete_locale_3234(zone_id: i64, track_id: i64) -> super::PlayRequest {
+        super::PlayRequest {
+            zone_id,
+            output_device_id: None,
+            track_id: Some(track_id),
+            source: Some("local".into()),
+            source_id: None,
+            title: None,
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        }
+    }
+
+    /// Insère une piste dont le `file_path` est `chemin`, au format `format`.
+    fn piste_3234(orch: &PlaybackOrchestrator, chemin: &str, format: &str) {
+        orch.db
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Supertramp')",
+                &[],
+            )
+            .unwrap();
+        orch.db
+            .execute(
+                "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Breakfast In America', 1)",
+                &[],
+            )
+            .unwrap();
+        orch.db
+            .execute(
+                &format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+                     duration_ms, sample_rate, bit_depth, channels) \
+                     VALUES (1, 'The Logical Song', 1, 1, ?, '{format}', 300000, 44100, 16, 2)"
+                ),
+                &[&chemin.to_string() as &dyn crate::db::backend::ToSqlValue],
+            )
+            .unwrap();
+    }
+
+    /// #3234 — un ISO SACD demandé en LECTURE rend un motif nommé.
+    ///
+    /// JeromeQ, fil 1206 : « Tune ne lit pas les fichiers ISO ? » Personne ne
+    /// lui répondait, et le serveur non plus. Le parcours de bibliothèque, lui,
+    /// compte et nomme ces fichiers depuis #2992 ; la demande de LECTURE, elle,
+    /// n'avait aucune garde : `AudioFormat::from_extension("iso")` rend `None`,
+    /// le transcodage retombe sur `unwrap_or(AudioFormat::Flac)`, et une image
+    /// disque part sur le fil comme du FLAC. La zone reste muette, et aucune
+    /// réponse HTTP ne dit pourquoi.
+    ///
+    /// L'épreuve mesure CE QUE REND `resolve_local_track` — la fonction que
+    /// `play()` appelle et dont la chaîne d'erreur arrive telle quelle à
+    /// `play_error_response`. Elle ne rappelle pas la condition du code : la
+    /// fixture est une vraie image dont le Master TOC porte `SACDMTOC`, et
+    /// c'est la lecture de ces huit octets sur le disque qui doit déclencher le
+    /// refus.
+    #[tokio::test]
+    async fn un_iso_sacd_demande_en_lecture_rend_un_motif_nomme() {
+        let orch = test_orchestrator();
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = image_iso_sacd_3234(dossier.path(), "Breakfast In America.iso");
+        piste_3234(&orch, &chemin, "iso");
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+
+        // `ResolvedStream` n'implémente pas `Debug` : la branche verte est
+        // dépliée à la main plutôt que par `expect_err`.
+        let erreur = match orch
+            .resolve_local_track(&requete_locale_3234(zone_id, 1))
+            .await
+        {
+            Err(erreur) => erreur,
+            Ok(_) => panic!(
+                "un ISO SACD s'est résolu en flux jouable : c'est le silence de \
+                 #3234, une image disque part sur le fil comme du FLAC"
+            ),
+        };
+
+        let motif = erreur
+            .strip_prefix("format_not_playable:")
+            .unwrap_or_else(|| {
+                panic!(
+                    "la demande de lecture doit rendre un refus NOMMÉ que la route \
+                 sait mettre en forme ; elle a rendu : {erreur}"
+                )
+            });
+        // Le motif est celui du rapport de parcours, mot pour mot (#2992) :
+        // deux phrases différentes pour un seul empêchement feraient croire à
+        // deux défauts.
+        assert_eq!(motif, crate::audio::iso_sacd::MOTIF_ISO_SACD_NON_EXTRAIT);
+        assert!(
+            motif.contains("ISO SACD"),
+            "le motif doit NOMMER le format : {motif}"
+        );
+        assert!(
+            motif.contains("sacd_extract") && motif.contains("non fourni"),
+            "le motif doit NOMMER ce qui manque, et dire que Tune ne le livre pas : {motif}"
+        );
+    }
+
+    /// Témoin de #3234 : un FLAC de la bibliothèque se résout comme avant.
+    ///
+    /// Sans ce témoin, un refus trop large rendrait toute la bibliothèque
+    /// injouable sans qu'une seule épreuve rougisse — et il doit rester vert
+    /// quand on retire le refus, sans quoi il ne mesurerait que lui-même.
+    #[tokio::test]
+    async fn le_flac_temoin_se_resout_comme_avant() {
+        let orch = test_orchestrator();
+        let dossier = tempfile::tempdir().unwrap();
+        let piste = dossier.path().join("morceau.flac");
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+            &piste,
+        )
+        .unwrap();
+        let chemin = piste.to_string_lossy().into_owned();
+        piste_3234(&orch, &chemin, "flac");
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+
+        let refus = orch
+            .resolve_local_track(&requete_locale_3234(zone_id, 1))
+            .await
+            .err();
+
+        assert!(
+            refus.is_none(),
+            "le témoin FLAC doit rester jouable : {}",
+            refus.unwrap_or_default()
+        );
     }
 
     /// #2063 — contre-épreuve négative : ajouter le crochet DSP au décodeur
