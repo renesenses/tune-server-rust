@@ -230,6 +230,7 @@ fn inject_device_identity(
     obj: &mut serde_json::Map<String, Value>,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     zone_id: i64,
+    output_device_id: Option<&str>,
     detected: Option<&tune_core::discovery::device::DiscoveredDevice>,
 ) {
     let settings = SettingsRepo::with_backend(backend.clone());
@@ -287,6 +288,26 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("mono_downmix".into(), json!(mono_downmix));
+    // #3254 — …et ce que ce réglage VAUT sur cette zone-ci. Le champ ci-dessus
+    // était accepté et relu pour n'importe quelle zone, alors que les trois
+    // seuls sites qui poussent le repli exigent une sortie `local:` et un
+    // `LocalOutput` : sur une zone réseau, accepté, persisté, relu… et sans
+    // effet. Le chemin du signal disait déjà la vérité (`zone_mono_downmix_step`
+    // rend `None` hors sortie locale) ; c'est le RÉGLAGE qui se taisait.
+    //
+    // Strictement ADDITIF : `mono_downmix` reste publié tel quel, à sa valeur
+    // persistée. Un client qui ne lit pas ce statut voit le même écran qu'avant.
+    // Même vocabulaire que `local_exclusive_mode_status` (#3192) : `reason`
+    // stable pour la machine, `detail` en clair pour un écran sans table de
+    // traduction.
+    obj.insert(
+        "mono_downmix_status".into(),
+        json!(tune_core::audio::mono_downmix::mono_downmix_status(
+            mono_downmix,
+            tune_core::audio::mono_downmix::mono_downmix_runs_on_output(output_device_id),
+            tune_core::audio::audiophile::zone_enabled(backend, zone_id),
+        )),
+    );
     obj.insert(
         "detected_manufacturer".into(),
         json!(detected.and_then(|d| d.manufacturer.clone())),
@@ -2509,7 +2530,13 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 .output_device_id
                 .as_deref()
                 .and_then(|did| devices.iter().find(|d| d.id == did));
-            inject_device_identity(obj, &state.backend, zone_id, detected_dev);
+            inject_device_identity(
+                obj,
+                &state.backend,
+                zone_id,
+                z.output_device_id.as_deref(),
+                detected_dev,
+            );
             let online = match z.output_type.as_deref() {
                 // Browser zones have no output device by design (the web
                 // client pulls stream_url itself) — always online.
@@ -2670,7 +2697,13 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     .output_device_id
                     .as_deref()
                     .and_then(|did| devices.iter().find(|d| d.id == did));
-                inject_device_identity(obj, &state.backend, id, detected_dev);
+                inject_device_identity(
+                    obj,
+                    &state.backend,
+                    id,
+                    zone.output_device_id.as_deref(),
+                    detected_dev,
+                );
                 let online = match zone.output_type.as_deref() {
                     // Same rules as list_zones: browser zones need no device;
                     // a local zone without output_device_id is an orphan that
@@ -3213,6 +3246,38 @@ async fn patch_zone(
             settings.delete(&key)
         };
         ecrire!("mono_downmix", enabled, r);
+        // #3254 — dire au JOURNAL, au moment du clic, que ce clic n'obtiendra
+        // rien. La réponse porte déjà `mono_downmix_status` (la route rend la
+        // fiche complète via `get_zone`), mais c'est ici que l'utilisateur croit
+        // avoir obtenu quelque chose.
+        //
+        // ⚠️ On ne se sert PAS de la valeur rendue par `refresh_zone_mono_downmix`
+        // comme signal de disponibilité : elle vaut `false` aussi bien parce que
+        // la zone n'est pas locale que parce qu'aucune sortie n'est ouverte — la
+        // même ambiguïté que `crossfeed_applied_live`. La règle, elle, ne dépend
+        // que de la zone.
+        let statut = tune_core::audio::mono_downmix::mono_downmix_status(
+            enabled,
+            tune_core::audio::mono_downmix::mono_downmix_runs_on_output(
+                // La zone RELUE, pas `zone_before` : le même PATCH a pu changer
+                // `output_device_id` quelques lignes plus haut, et c'est la
+                // sortie d'APRÈS qui décide si le repli agira.
+                repo.get(id)
+                    .ok()
+                    .flatten()
+                    .and_then(|z| z.output_device_id)
+                    .as_deref(),
+            ),
+            tune_core::audio::audiophile::zone_enabled(&state.backend, id),
+        );
+        if statut.unavailable {
+            warn!(
+                zone_id = id,
+                requested = enabled,
+                reason = statut.reason.map(|r| r.code()).unwrap_or_default(),
+                "zone_mono_downmix_sans_effet — le réglage est enregistré mais rien ne l'applique sur cette zone"
+            );
+        }
         // Persister ne suffit pas : sans ceci, cocher la case en écoutant ne
         // changerait rien avant la piste suivante (#1725, #1786). Or ce
         // réglage-ci se vérifie précisément à l'oreille, musique en cours.
