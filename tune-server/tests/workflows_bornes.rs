@@ -1630,3 +1630,238 @@ fn tout_membre_du_workspace_est_execute_par_une_porte_cargo_test() {
          Paquets du job `test` aujourd'hui : {sur_chaque_pr:?}"
     );
 }
+
+/// Tout membre du workspace doit etre nomme par au moins une porte
+/// `cargo clippy`. Cette liste est un INVENTAIRE, pas un echantillon — meme
+/// lecon que #1427 (les greffons ne se compilaient pas), #2865 (les features
+/// nues) et #3266 (les caisses jamais executees).
+///
+/// Croisement du 03/09/2026, sur `origin/main` (0f125653), AVANT ce garde-fou.
+/// La porte `cargo clippy` de `ci.yml` est la SEULE du depot — ni
+/// `test-postgres.yml` ni `widget-ci.yml` n'en portent une — et elle nommait
+/// huit paquets sur QUINZE membres.
+///
+/// Quinze, pas quatorze : `tune-output-api` n'apparait pas dans la liste
+/// `members` du manifeste. Il devient membre tout seul, parce que `tune-core`
+/// le prend en dependance `path` et que cargo promeut membre toute dependance
+/// `path` interne au workspace. Un test qui lirait `members = [...]` et rien
+/// d'autre le raterait — d'ou l'etape 2 ci-dessous.
+///
+/// Ce que l'elargissement change VRAIMENT, mesure et non suppose : le code de
+/// bibliotheque d'un membre tire par un `-p` est deja linte, parce que cargo
+/// passe `clippy-driver` a tous les MEMBRES du workspace, pas aux seuls `-p`
+/// (`--cap-lints allow` ne frappe que les dependances de registre). La course
+/// a huit `-p` sortait deja `plugins/tune-bandcamp/src/lib.rs:175`. Restaient
+/// dans le noir :
+///
+/// | ce qui n'etait linte par rien | pourquoi |
+/// |---|---|
+/// | `tune-ffi` en entier | aucun membre n'en depend : pas meme compile |
+/// | les cibles non-lib des six autres | `--all-targets` ne construit les tests, bancs et exemples que des paquets designes par `-p` |
+///
+/// Le test ne credite QUE les paquets nommes explicitement sur une ligne
+/// `cargo clippy` — ou, a defaut, une ligne `--workspace`, qui les prend tous.
+#[test]
+fn toute_caisse_du_workspace_est_nommee_par_une_porte_clippy() {
+    // Les workflows qui peuvent porter une porte `clippy` sur ce workspace.
+    // `widget-ci.yml` est volontairement absent : ses commandes tournent dans
+    // `tune-widget/src-tauri`, qui est un AUTRE workspace (`exclude` du
+    // manifeste racine), et ne peut donc couvrir aucun membre d'ici — y compter
+    // une ligne `cargo clippy` creerait un credit FAUX.
+    const PORTES: &[&str] = &["ci.yml", "test-postgres.yml"];
+
+    // Une caisse hors porte doit etre INSCRITE ici avec sa raison. La liste se
+    // relit ; un oubli, non. Vide a dessein : les quinze membres sont lintes.
+    const HORS_PORTE: &[(&str, &str)] = &[];
+
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+    // Le nom de paquet d'un manifeste : c'est LUI que `-p` designe, jamais le
+    // chemin. `plugins/tune-dj` se nomme `tune-dj`, et `tune-ffi` porte un
+    // `[lib]` nomme `tuneserver` — d'ou la lecture bornee a `[package]`.
+    let nom_du_paquet = |source: &str| -> Option<String> {
+        let mut dans_package = false;
+        for ligne in source.lines() {
+            let t = ligne.trim();
+            if t.starts_with('[') {
+                dans_package = t == "[package]";
+                continue;
+            }
+            if !dans_package || t.starts_with('#') {
+                continue;
+            }
+            if let Some(valeur) = t.strip_prefix("name")
+                && let Some(valeur) = valeur.trim_start().strip_prefix('=')
+            {
+                return Some(valeur.trim().trim_matches('"').to_string());
+            }
+        }
+        None
+    };
+
+    // 1. Les membres DECLARES par la liste `members` du manifeste.
+    let manifeste =
+        fs::read_to_string(racine.join("Cargo.toml")).expect("Cargo.toml du workspace illisible");
+    let debut = manifeste
+        .find("members = [")
+        .expect("`members = [` absent du Cargo.toml du workspace");
+    let reste = &manifeste[debut + "members = [".len()..];
+    let fin = reste
+        .find(']')
+        .expect("la liste `members` du workspace n'est pas fermee");
+
+    let mut a_visiter: Vec<String> = reste[..fin]
+        .split(',')
+        .map(|morceau| morceau.trim().trim_matches('"').to_string())
+        .filter(|morceau| !morceau.is_empty())
+        .collect();
+
+    assert!(
+        a_visiter.len() >= 10,
+        "seulement {} membre(s) reconnu(s) dans le Cargo.toml du workspace — la \
+         forme de la liste `members` a change et ce test ne garde plus rien : \
+         {a_visiter:?}",
+        a_visiter.len()
+    );
+
+    // 2. Les membres IMPLICITES : cargo promeut membre toute dependance `path`
+    //    interne au workspace, meme absente de `members`. C'est ainsi que
+    //    `tune-output-api` entre — via `tune-core`. Les rater, c'est laisser un
+    //    trou exactement de la forme de celui que ce test doit fermer.
+    let mut chemins: Vec<String> = Vec::new();
+    let mut membres: Vec<String> = Vec::new();
+    while let Some(chemin) = a_visiter.pop() {
+        if chemins.iter().any(|deja| *deja == chemin) {
+            continue;
+        }
+        let source = fs::read_to_string(racine.join(&chemin).join("Cargo.toml"))
+            .unwrap_or_else(|e| panic!("{chemin}/Cargo.toml illisible : {e}"));
+
+        membres.push(
+            nom_du_paquet(&source)
+                .unwrap_or_else(|| panic!("{chemin}/Cargo.toml : `[package] name` introuvable")),
+        );
+        chemins.push(chemin.clone());
+
+        for ligne in source.lines() {
+            let t = ligne.trim();
+            if t.starts_with('#') {
+                continue;
+            }
+            let Some(apres) = t.split_once("path = \"") else {
+                continue;
+            };
+            let Some((cible, _)) = apres.1.split_once('"') else {
+                continue;
+            };
+            // Resolu depuis le dossier du membre, puis ramene a la racine : un
+            // `../tune-output-api` depuis `tune-core` donne `tune-output-api`.
+            let mut pile: Vec<&str> = chemin.split('/').collect();
+            for element in cible.split('/') {
+                match element {
+                    "." | "" => {}
+                    ".." => {
+                        if pile.pop().is_none() {
+                            // Sort du depot : ce n'est pas un membre.
+                            pile.push("..");
+                        }
+                    }
+                    autre => pile.push(autre),
+                }
+            }
+            if pile.iter().any(|element| *element == "..") {
+                continue;
+            }
+            let resolu = pile.join("/");
+            if !resolu.is_empty() && racine.join(&resolu).join("Cargo.toml").is_file() {
+                a_visiter.push(resolu);
+            }
+        }
+    }
+
+    assert!(
+        membres.len() >= 15,
+        "seulement {} membre(s) resolu(s) — la liste `members` ou les \
+         dependances `path` ont change de forme, et ce test ne garde plus \
+         rien : {membres:?}",
+        membres.len()
+    );
+
+    // 3. Les paquets nommes explicitement par une ligne `cargo clippy`.
+    let mut lignes = 0usize;
+    let mut tout_le_workspace = false;
+    let mut couvertes: Vec<String> = Vec::new();
+    for fichier in PORTES {
+        let source = workflow(fichier);
+        for ligne in source.lines() {
+            let nue = ligne.trim();
+            if nue.starts_with('#') {
+                continue;
+            }
+            let Some(commande) = nue
+                .strip_prefix("- run: ")
+                .or_else(|| nue.strip_prefix("run: "))
+            else {
+                continue;
+            };
+            if commande != "cargo clippy" && !commande.starts_with("cargo clippy ") {
+                continue;
+            }
+            lignes += 1;
+            let mots: Vec<&str> = commande.split_whitespace().collect();
+            if mots.contains(&"--workspace") {
+                tout_le_workspace = true;
+            }
+            for paire in mots.windows(2) {
+                if (paire[0] == "-p" || paire[0] == "--package")
+                    && !couvertes.iter().any(|c| c == paire[1])
+                {
+                    couvertes.push(paire[1].to_string());
+                }
+            }
+        }
+    }
+
+    assert!(
+        lignes >= 1,
+        "aucune ligne `cargo clippy` reperee dans {PORTES:?} — le detecteur ne \
+         voit plus la porte qu'il doit garder. Un garde qui ne trouve rien doit \
+         ECHOUER, pas passer a vide."
+    );
+
+    // 4. Le verdict.
+    let nues: Vec<&str> = membres
+        .iter()
+        .filter(|nom| !tout_le_workspace && !couvertes.iter().any(|c| c == *nom))
+        .filter(|nom| !HORS_PORTE.iter().any(|(hors, _)| hors == *nom))
+        .map(String::as_str)
+        .collect();
+
+    assert!(
+        nues.is_empty(),
+        "ces membres du workspace ne sont nommes par AUCUNE porte `cargo clippy` \
+         de {PORTES:?} : {nues:?}\n\
+         Sans leur propre `-p`, `--all-targets` ne construit aucune de leurs \
+         cibles de test, de banc ni d'exemple : ce code-la n'est lu par aucun \
+         lint. Et une caisse dont aucun membre ne depend n'est meme pas \
+         compilee par la porte — c'etait le cas de `tune-ffi` (#3266 bis).\n\
+         Deux issues seulement :\n\
+           1. ajouter `-p <caisse>` a la ligne `cargo clippy` de ci.yml ;\n\
+           2. l'inscrire dans HORS_PORTE ci-dessus AVEC sa raison, si aucune \
+         porte ne PEUT la linter (OS, materiel).\n\
+         Paquets couverts aujourd'hui : {couvertes:?}"
+    );
+
+    // Une entree de HORS_PORTE qui ne correspond a aucun membre est une
+    // justification perimee : elle rassure sans rien couvrir.
+    let perimees: Vec<&str> = HORS_PORTE
+        .iter()
+        .map(|(nom, _)| *nom)
+        .filter(|nom| !membres.iter().any(|m| m == nom))
+        .collect();
+    assert!(
+        perimees.is_empty(),
+        "HORS_PORTE justifie des caisses qui ne sont plus membres du workspace : \
+         {perimees:?} — retirer l'entree plutot que la laisser rassurer"
+    );
+}

@@ -600,7 +600,54 @@ jobs:
       #  - `concerts` vient de `rc` (#2768, 12987dbd) ; l'en sortir rouvrirait
       #    l'angle mort que ce commit-la venait de fermer, et
       #    `toute_feature_declaree_est_activee_par_une_porte_clippy` rougirait.
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
+      #
+      # Croisement du 03/09/2026 sur `origin/main` (0f125653), AVANT cet
+      # elargissement. C'est la SEULE ligne `cargo clippy` du depot :
+      # `test-postgres.yml` et `widget-ci.yml` n'en portent aucune, et le
+      # `cargo check` du job `ffi` n'est pas un lint.
+      #
+      # QUINZE membres, pas quatorze : `cargo metadata --no-deps` en compte
+      # quinze. `tune-output-api` n'est pas dans la liste `members` — il y entre
+      # tout seul, parce que `tune-core` le prend en dependance `path`, et que
+      # cargo promeut membre toute dependance `path` interne au workspace. Lire
+      # `members = [...]` seul le rate.
+      #
+      # Huit paquets etaient nommes ; sept ne l'etaient pas. Mais MESURE plutot
+      # que suppose, le trou n'est pas la ou on le croyait : le code de
+      # bibliotheque d'un membre TIRE par un `-p` est deja linte, parce que
+      # cargo passe `clippy-driver` a tous les membres du workspace, pas aux
+      # seuls `-p`. Preuve : la course a huit `-p` sort deja
+      # `plugins/tune-bandcamp/src/lib.rs:175` et `plugins/tune-concerts/
+      # src/lib.rs:295`. Ce qui restait vraiment dans le noir :
+      #
+      #   - `tune-ffi` en ENTIER : aucun membre n'en depend, donc il n'etait pas
+      #     meme compile par cette porte ;
+      #   - les cibles NON-lib des six autres — modules `#[cfg(test)]`, bancs,
+      #     exemples : `--all-targets` ne construit ces cibles-la que pour les
+      #     paquets designes par `-p`.
+      #
+      # Mesure du 03/09/2026, apres elargissement : ZERO avertissement
+      # `clippy::correctness` sort des sept caisses neuves — la porte reste
+      # verte. Deux avertissements apparaissent, tous deux dans `tune-ffi`
+      # (`collapsible_if`, `field_reassign_with_default`), aucun n'est
+      # `correctness`, donc aucun ne rougit.
+      #
+      # Cout mesure sur Shrek, dossier cible VIDE avant CHAQUE course, huit
+      # courses a froid. Au seul moment calme de la soiree (charge 4) :
+      # 156 s a huit `-p`, 162 s a quinze — six secondes, moins de 4 %. Les six
+      # autres courses sont tombees sous la charge de deux autres agents et ne
+      # separent rien : la MEME commande a huit `-p` a mis 156, 198, 247 puis
+      # 327 s, quand celle a quinze mettait 162, 185, 193 et 234 s. Le cout de
+      # l'elargissement est sous le plancher de bruit de la machine ; il n'est
+      # pas mesurable, et surement pas de l'ordre de la minute.
+      #
+      # Meme famille que #1427 (greffons non compiles), #2865 (features nues) et
+      # #3266 (caisses jamais executees) : une porte dont la portee est plus
+      # etroite que ce qu'on croit rend un vert qui ne couvre pas ce qu'on pense.
+      #
+      # Garde : `toute_caisse_du_workspace_est_nommee_par_une_porte_clippy`
+      # (tune-server/tests/workflows_bornes.rs).
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge -p tune-ffi -p tune-output-api -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
