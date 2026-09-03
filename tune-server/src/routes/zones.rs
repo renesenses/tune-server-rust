@@ -1842,9 +1842,16 @@ fn build_signal_path(
 
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
     // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
+    //
+    // MÊME liste que `orchestrator::is_network_output_type` — c'est elle qui
+    // commande réellement `needs_transcode_for_output`, `dsd_passthrough` et
+    // les passthrough ALAC/AAC côté audio. `"slimproto"` y était depuis #2893
+    // et manquait ICI : le miroir prenait du retard sur l'original, et une
+    // source APE/WavPack servie à un Squeezelite était annoncée sans
+    // transcodage alors que l'orchestrateur en fait un (#2189).
     let is_network_output = matches!(
         output_type,
-        "dlna" | "openhome" | "chromecast" | "bluos" | "squeezebox"
+        "dlna" | "openhome" | "chromecast" | "bluos" | "squeezebox" | "slimproto"
     );
     // Passthrough DSD natif : l'orchestrateur sert le .dsf/.dff brut au
     // renderer (`orchestrator.rs` `dsd_passthrough`). Constaté sur le fil, pas
@@ -1947,8 +1954,14 @@ fn build_signal_path(
         && source_format
             .as_ref()
             .is_some_and(|f| f.needs_transcode_for_dlna());
-    // OAAT transcodes everything to WAV except WAV itself
-    let is_oaat = output_type == "oaat";
+    // OAAT transcodes everything to WAV except WAV itself.
+    //
+    // `"oaat-multiroom"` fait EXACTEMENT le même traitement que `"oaat"` : même
+    // WAV 24 bits imposé par `oaat_needs_wav` (l'orchestrateur reconnaît le
+    // groupe au préfixe `oaat-group:` de son `device_id`), mêmes tailles de
+    // paquets, et pas même l'adaptateur PCM de la sortie mono-endpoint. Son
+    // verdict doit donc être le même.
+    let is_oaat = matches!(output_type, "oaat" | "oaat-multiroom");
     let oaat_transcodes = is_oaat
         && source_format
             .as_ref()
@@ -1999,7 +2012,7 @@ fn build_signal_path(
                 (true, "DLNA/UPnP", format_name)
             }
         }
-        "oaat" => {
+        "oaat" | "oaat-multiroom" => {
             // Lossless PCM → WAV preserves every bit, but DSD → WAV is a domain
             // conversion (1-bit sigma-delta decimated to multi-bit PCM), so it is
             // NOT bit-perfect even though DSD counts as a lossless *format*.
@@ -2010,6 +2023,13 @@ fn build_signal_path(
             )
         }
         "airplay" => (false, "AirPlay", "ALAC"),
+        // AirPlay 2 ré-encode lui aussi — le démon `airplay-daemon` embarque les
+        // encodeurs ALAC et fdk-aac (cf. `Dockerfile`) — donc le verdict NÉGATIF
+        // est le bon, et il ne change pas ici. Ce que ce bras corrige, c'est le
+        // LIBELLÉ : le fourre-tout affichait la chaîne brute de la base,
+        // « airplay2 », là où l'étape Transport est lue telle quelle par le
+        // client (`NowPlaying.svelte`).
+        "airplay2" => (false, "AirPlay 2", "ALAC"),
         "chromecast" => {
             if needs_transcode_for_output {
                 let target = source_format.unwrap().dlna_transcode_target();
@@ -2034,6 +2054,35 @@ fn build_signal_path(
                 (true, "Squeezebox", format_name)
             }
         }
+        // SlimProto natif (Squeezelite, slim2diretta) : la sortie ne fait que
+        // pousser un `strm` portant l'URL de NOTRE session, et le lecteur tire
+        // le flux. C'est une sortie RÉSEAU au sens de l'orchestrateur — même
+        // liste, même `needs_transcode_for_output` — donc exactement le même
+        // raisonnement que la Squeezebox pilotée par LMS.
+        "slimproto" => {
+            if needs_transcode_for_output {
+                let target = source_format.unwrap().dlna_transcode_target();
+                (false, "SlimProto", target.display_name())
+            } else {
+                (true, "SlimProto", format_name)
+            }
+        }
+        // Sorties PULL : elles vont chercher le flux elles-mêmes sur notre
+        // session HTTP, et l'orchestrateur leur sert le FICHIER BRUT — c'est
+        // écrit noir sur blanc dans `orchestrator.rs` (« Elle recevait donc le
+        // fichier brut »), et c'est même la raison d'être de
+        // `pull_output_needs_dsp_transcode` : sans ce forçage, un EQ armé ne
+        // les atteindrait JAMAIS. Le fil est donc intact, et le dire « non
+        // bit-perfect » était le faux négatif signalé par Alex Campbell sur
+        // HQPlayer (#2189) — « Tune is reporting that it is transcoding ».
+        //
+        // Le verdict GLOBAL reste gouverné par les étapes qui, elles, touchent
+        // vraiment le signal : `dsp_applique` (EQ/convolveur), le ReplayGain,
+        // le repli mono et `resampling_active` (plafond de fréquence de la
+        // zone) le font tomber sans qu'on ait à mentir sur le transport. Même
+        // convention que le bras `"browser"`, servi lui aussi en fichier brut.
+        "hqplayer" => (true, "HQPlayer", format_name),
+        "diretta" => (true, "Diretta", format_name),
         "browser" => (true, "Browser", format_name),
         "local" => {
             // Show the actual audio backend (ASIO / WASAPI / CoreAudio / ALSA)
@@ -2052,6 +2101,19 @@ fn build_signal_path(
                 format_name,
             )
         }
+        // Type de sortie INCONNU de ce miroir. `output_type` n'est pas une
+        // énumération fermée : la passerelle recopie tel quel le `device_type`
+        // annoncé par un greffon hors dépôt (`routes/bridge.rs`,
+        // `get_or_create(&dev.name, Some(&dev.device_type), …)`), et le client
+        // peut en écrire un par `PATCH /zones/{id}` sans aucune validation.
+        //
+        // On reste NÉGATIF ici, et c'est délibéré : ce fichier écrit déjà
+        // qu'« annoncer une pureté qu'on ne tient pas est le pire des deux sens
+        // possibles de l'erreur ». Un type qu'on ne sait pas nommer est un type
+        // dont on ne sait pas ce qu'il fait du signal ; le déclarer intact
+        // serait une promesse sans mesure. Le prix de ce choix est un faux
+        // négatif — alors NOMMEZ le type ici plutôt que de le laisser tomber
+        // dans ce bras : c'est exactement ce qui a coûté #2189.
         other => (false, other, format_name),
     };
 
@@ -4741,6 +4803,224 @@ mod signal_path_tests {
             .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))
             .and_then(|s| s.get("detail").and_then(|d| d.as_str()))
             .map(String::from)
+    }
+
+    // ---------------------------------------------------------------------
+    // #2189 — « When playing local or streaming music files to HQPlayer, Tune
+    // is reporting that it is transcoding. » (Alex Campbell, forum).
+    //
+    // Le dernier bras du `match` sur `output_type` posait le transport à
+    // `false` INCONDITIONNELLEMENT pour tout type non nommé, sans rien mesurer.
+    // Or `output_type` n'est pas une énumération fermée, et plusieurs types
+    // VIVANTS y tombaient : `hqplayer` (créé par `routes/hqplayer.rs`),
+    // `slimproto` (créé par `slimproto/mod.rs`), `airplay2` (créé par
+    // `discovery_setup.rs`) et tout `device_type` recopié par la passerelle —
+    // dont `diretta`, un module payant.
+    //
+    // Ces contrats ne sont PAS derrière une fonctionnalité : ils tournent dans
+    // le job `test` de la CI, celui qui ne compile pas `local-audio`.
+    // ---------------------------------------------------------------------
+
+    /// Une zone d'un type de sortie donné, migrations appliquées.
+    fn zone_de_type(output_type: &str) -> (Arc<dyn DbBackend>, Zone) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo
+            .create(
+                output_type,
+                Some(output_type),
+                Some(&format!("{output_type}-2189")),
+            )
+            .unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        (backend, zone)
+    }
+
+    /// Source FLAC 24/96 sans perte, en lecture, avec une session vivante.
+    fn flac_hires_playing() -> ZoneState {
+        ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Locatelli".into(),
+                format: Some("flac".into()),
+                sample_rate: Some(96_000),
+                bit_depth: Some(24),
+                stream_id: Some("sid-2189".into()),
+                ..Default::default()
+            }),
+            volume: 1.0,
+            ..Default::default()
+        }
+    }
+
+    fn step_bit_perfect(v: &Value, name: &str) -> Option<bool> {
+        v.get("steps")?
+            .as_array()?
+            .iter()
+            .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|s| s.get("bit_perfect").and_then(Value::as_bool))
+    }
+
+    /// LE cas d'Alex Campbell. HQPlayer tire le flux lui-même sur notre session
+    /// HTTP, et l'orchestrateur lui sert le FICHIER BRUT : rien, côté Tune, ne
+    /// touche un seul échantillon. Annoncer « transcodé » était un faux négatif.
+    #[test]
+    fn une_sortie_pull_servie_en_fichier_brut_est_annoncee_intacte() {
+        let (backend, zone) = zone_de_type("hqplayer");
+
+        let sp = build_signal_path(
+            &flac_hires_playing(),
+            &zone,
+            &backend,
+            Some("HQPlayer"),
+            "",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            step_bit_perfect(&sp, "Transport"),
+            Some(true),
+            "le fil Tune→HQPlayer porte le fichier brut : le transport est intact"
+        );
+        assert_eq!(
+            sp.get("bit_perfect").and_then(Value::as_bool),
+            Some(true),
+            "sans EQ, sans ReplayGain et sans plafond, le verdict doit être positif"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE PERMANENTE de l'essai ci-dessus. Même zone `hqplayer`,
+    /// seul un égaliseur change. `pull_output_needs_dsp_transcode` force alors
+    /// le chemin transcodé côté audio, et le verdict DOIT retomber.
+    ///
+    /// Sans cette moitié, un correctif trop large — « une sortie PULL est
+    /// toujours bit-perfect » — resterait vert tout en promettant une pureté
+    /// que l'EQ ne tient pas : exactement l'erreur que ce fichier déclare être
+    /// « le pire des deux sens possibles ».
+    #[test]
+    fn la_meme_sortie_pull_avec_un_eq_arme_perd_son_verdict() {
+        let (backend, zone) = zone_de_type("hqplayer");
+        armer_l_eq(&backend, zone.id.unwrap());
+
+        let sp = build_signal_path(
+            &flac_hires_playing(),
+            &zone,
+            &backend,
+            Some("HQPlayer"),
+            "",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sp.get("bit_perfect").and_then(Value::as_bool),
+            Some(false),
+            "un EQ réellement appliqué doit faire tomber le verdict"
+        );
+    }
+
+    /// SlimProto est une sortie RÉSEAU pour l'orchestrateur (`slimproto` figure
+    /// dans `is_network_output_type`). Le miroir de ce fichier l'ignorait : il
+    /// faut donc à la fois annoncer le passthrough FLAC comme intact ET
+    /// continuer d'annoncer le transcodage que l'orchestrateur fait vraiment
+    /// sur une source exotique.
+    #[test]
+    fn slimproto_suit_la_liste_reseau_de_l_orchestrateur() {
+        let (backend, zone) = zone_de_type("slimproto");
+
+        let flac = build_signal_path(
+            &flac_hires_playing(),
+            &zone,
+            &backend,
+            Some("Squeezelite"),
+            "",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+        assert_eq!(
+            step_bit_perfect(&flac, "Transport"),
+            Some(true),
+            "un FLAC est servi tel quel à un lecteur SlimProto"
+        );
+
+        // Source APE : `needs_transcode_for_dlna()` la couvre, l'orchestrateur
+        // la ré-encode. Le panneau doit le dire — c'est ce que la liste réseau
+        // incomplète empêchait.
+        let mut ps = flac_hires_playing();
+        ps.now_playing.as_mut().unwrap().format = Some("ape".into());
+        let ape = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Squeezelite"),
+            "",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+        assert_eq!(
+            step_bit_perfect(&ape, "Transport"),
+            Some(false),
+            "une source APE est réellement ré-encodée avant d'être servie"
+        );
+    }
+
+    /// LA GARDE. Le défaut de #2189 n'est pas « une valeur fausse » mais « un
+    /// type non nommé ». Le bras fourre-tout se trahit par sa DESCRIPTION : il
+    /// recopie la chaîne brute de la base au lieu d'un nom d'affichage.
+    ///
+    /// On vérifie donc, pour chaque `output_type` que du code de PRODUCTION
+    /// écrit réellement dans une zone, que l'étape Transport porte un vrai nom.
+    /// Ajouter une sortie sans ajouter son bras rend cet essai ROUGE.
+    #[test]
+    fn aucun_type_de_sortie_vivant_ne_tombe_dans_le_bras_fourre_tout() {
+        // Chaque entrée est écrite en base par un chemin de production :
+        //   dlna/openhome  → discovery_setup.rs (SSDP)
+        //   chromecast/airplay/airplay2/bluos/squeezebox/oaat → discovery_setup.rs (mDNS)
+        //   hqplayer       → routes/hqplayer.rs   `get_or_create(.., Some("hqplayer"), ..)`
+        //   slimproto      → slimproto/mod.rs     `get_or_create(.., Some("slimproto"), ..)`
+        //   diretta        → routes/bridge.rs     `get_or_create(.., Some(&dev.device_type), ..)`
+        //   oaat-multiroom → `OaatMultiroomOutput::output_type()`, recopié par le client
+        //   browser/local  → zones créées par l'utilisateur
+        for output_type in [
+            "dlna",
+            "openhome",
+            "oaat",
+            "oaat-multiroom",
+            "airplay",
+            "airplay2",
+            "chromecast",
+            "bluos",
+            "squeezebox",
+            "slimproto",
+            "hqplayer",
+            "diretta",
+            "browser",
+            "local",
+        ] {
+            let (backend, zone) = zone_de_type(output_type);
+            let sp = build_signal_path(
+                &flac_hires_playing(),
+                &zone,
+                &backend,
+                Some("Renderer"),
+                "",
+                Some(&wire("flac", 96_000, 24)),
+            )
+            .unwrap();
+
+            let transport = step_desc(&sp, "Transport")
+                .unwrap_or_else(|| panic!("{output_type} : aucune étape Transport"));
+            assert_ne!(
+                transport, output_type,
+                "« {output_type} » tombe dans le bras `other =>` : l'étape Transport \
+                 affiche la chaîne brute de la base au lieu d'un nom, et son verdict \
+                 bit-perfect est posé sans rien mesurer (#2189)"
+            );
+        }
     }
 
     /// #2074 — le message que voit l'utilisateur.
