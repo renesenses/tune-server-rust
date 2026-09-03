@@ -3062,9 +3062,58 @@ mod ringbuf_tests {
     }
 }
 
+/// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
+///
+/// `decode_compressed_stream` rendait `None` pour QUATRE causes distinctes, et
+/// le fil de lecture n'en tirait qu'un `warn!` : la zone s'arrêtait, le
+/// sondeur ne recevait rien, et l'écran restait muet. Le motif nommé est ce
+/// qui permet à `record_compressed_decode_failure` de dire à l'utilisateur
+/// laquelle des quatre s'est produite.
+///
+/// Même forme que [`WindowsExclusivePcmError`] : un événement de journal
+/// stable pour la fouille, une phrase française pour l'écran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressedDecodeFailure {
+    /// Aucun démultiplexeur de symphonia n'a reconnu le conteneur.
+    ContainerUnrecognised,
+    /// Conteneur lisible, mais il ne porte aucune piste audio exploitable.
+    NoAudioTrack,
+    /// La piste audio existe ; son codec n'a pas de décodeur ici.
+    CodecUnsupported,
+    /// Le décodage a tourné et n'a produit aucun échantillon (flux tronqué).
+    NoSamplesDecoded,
+}
+
+impl CompressedDecodeFailure {
+    fn log_event(self) -> &'static str {
+        match self {
+            Self::ContainerUnrecognised => "local_audio_decode_container_unrecognised",
+            Self::NoAudioTrack => "local_audio_decode_no_audio_track",
+            Self::CodecUnsupported => "local_audio_decode_codec_unsupported",
+            Self::NoSamplesDecoded => "local_audio_decode_no_samples",
+        }
+    }
+
+    fn user_message(self, device: &str) -> String {
+        let reason = match self {
+            Self::ContainerUnrecognised => "aucun décodeur n'a reconnu le format de ce flux",
+            Self::NoAudioTrack => "le flux ne contient aucune piste audio lisible",
+            Self::CodecUnsupported => "le codec de cette piste n'est pas pris en charge",
+            Self::NoSamplesDecoded => {
+                "le décodage n'a produit aucun échantillon, le flux est tronqué ou vide"
+            }
+        };
+        format!(
+            "Sortie « {device} » : impossible de décoder la piste, {reason}. La lecture a été arrêtée avant l'ouverture du périphérique ; choisissez une autre version du fichier ou vérifiez qu'il n'est pas endommagé"
+        )
+    }
+}
+
 /// Decode a compressed audio stream (FLAC, MP3, AAC, etc.) into f32 samples using symphonia.
-/// Returns (channels, sample_rate, samples) or None if decoding fails.
-fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
+///
+/// Rend `Err(motif)` plutôt que `None` : l'appelant doit pouvoir DIRE pourquoi
+/// il s'arrête (#3270), et un `Option` ne portait rien à dire.
+fn decode_compressed_stream(data: &[u8]) -> Result<(u16, u32, Vec<f32>), CompressedDecodeFailure> {
     use std::io::Cursor;
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -3085,12 +3134,14 @@ fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
                 FormatOptions::default(),
                 MetadataOptions::default(),
             )
-            .ok()?;
+            .map_err(|_| CompressedDecodeFailure::ContainerUnrecognised)?;
 
-    let track = format.default_track(TrackType::Audio)?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or(CompressedDecodeFailure::NoAudioTrack)?;
     let audio_params = match &track.codec_params {
         Some(CodecParameters::Audio(params)) => params.clone(),
-        _ => return None,
+        _ => return Err(CompressedDecodeFailure::NoAudioTrack),
     };
     let track_id = track.id;
     let sample_rate = audio_params.sample_rate.unwrap_or(44100);
@@ -3102,7 +3153,7 @@ fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
 
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
-        .ok()?;
+        .map_err(|_| CompressedDecodeFailure::CodecUnsupported)?;
 
     let mut all_samples: Vec<f32> = Vec::new();
 
@@ -3129,7 +3180,7 @@ fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
     }
 
     if all_samples.is_empty() {
-        return None;
+        return Err(CompressedDecodeFailure::NoSamplesDecoded);
     }
 
     info!(
@@ -3139,7 +3190,7 @@ fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
         "local_audio_decoded_compressed_stream"
     );
 
-    Some((channels, sample_rate, all_samples))
+    Ok((channels, sample_rate, all_samples))
 }
 
 /// WAV format tag constants.
@@ -3653,6 +3704,34 @@ fn record_feed_stall_failure(
             "Sortie « {device} » : le périphérique a accepté l'ouverture {backend} puis a cessé de recevoir l'audio ; la lecture est restée figée à {frozen_position_ms} ms. {}",
             OpenFailure::DeviceGone.user_message()
         ));
+    }
+}
+
+/// Le DÉCODAGE a échoué : la zone ne jouera pas, et c'est le seul endroit qui
+/// sait pourquoi (#3270).
+///
+/// Quatrième membre de la famille `record_*` de ce fichier, et pour la même
+/// raison que les trois autres : `failure_slot` est le canal que
+/// `take_output_failure()` draine à chaque tick du sondeur, qui émet alors
+/// `zone.playback_error` avec `fatal: true`. Sans cet appel il ne restait
+/// qu'un `warn!` dans le journal du serveur — invisible depuis l'écran.
+///
+/// Contrairement aux trois autres, la panne n'est PAS celle du périphérique :
+/// il n'a jamais été ouvert. La sortie est nommée quand même, parce que c'est
+/// par elle que l'utilisateur désigne la zone qui s'est tue.
+fn record_compressed_decode_failure(
+    error: CompressedDecodeFailure,
+    device: &str,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        device,
+        refusal_event = error.log_event(),
+        reason = ?error,
+        "local_audio_decode_compressed_failed"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(error.user_message(device));
     }
 }
 
@@ -4785,14 +4864,20 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
-                // Decode the compressed audio
-                let Some((dec_channels, dec_sample_rate, decoded_samples)) =
-                    decode_compressed_stream(&all_data)
-                else {
-                    warn!("local_audio_decode_compressed_failed");
-                    playing.store(false, Ordering::SeqCst);
-                    return;
-                };
+                // Decode the compressed audio.
+                //
+                // #3270 : l'échec passe par `open_failure`, le canal que le
+                // sondeur draine. Un `return` nu laissait la zone s'arrêter
+                // sans que l'écran apprenne jamais pourquoi.
+                let (dec_channels, dec_sample_rate, decoded_samples) =
+                    match decode_compressed_stream(&all_data) {
+                        Ok(decoded) => decoded,
+                        Err(reason) => {
+                            record_compressed_decode_failure(reason, &device_name, &open_failure);
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    };
 
                 // Now play the decoded f32 samples using cpal shared mode
                 let dec_ch = dec_channels;
@@ -12873,6 +12958,94 @@ mod open_failure_tests {
         assert!(h.contains("audio"), "got: {h}");
         let m = OpenFailure::ServerUnreachable.user_message();
         assert!(m.contains("audio"), "got: {m}");
+    }
+}
+
+/// #3270 — « la piste ne joue pas, et rien ne le dit ».
+///
+/// Le refus d'OUVERTURE avait son canal, le blocage d'APRÈS l'ouverture aussi.
+/// Ce qui n'en avait aucun, c'est l'échec de DÉCODAGE : le flux compressé est
+/// chargé en entier, symphonia refuse, et le fil rendait la main sur un
+/// `warn!`, un drapeau à `false` et un `return` nu. Le périphérique n'ayant
+/// jamais été ouvert, aucune des heuristiques du sondeur ne rattrapait la
+/// zone — et cette branche n'est pas un vestige : Bandcamp, les podcasts,
+/// l'UPnP et les fichiers téléversés y passent sans transcodage WAV.
+#[cfg(test)]
+mod decode_failure_tests {
+    use super::{
+        CompressedDecodeFailure, decode_compressed_stream, record_compressed_decode_failure,
+    };
+
+    const TOUS: [CompressedDecodeFailure; 4] = [
+        CompressedDecodeFailure::ContainerUnrecognised,
+        CompressedDecodeFailure::NoAudioTrack,
+        CompressedDecodeFailure::CodecUnsupported,
+        CompressedDecodeFailure::NoSamplesDecoded,
+    ];
+
+    /// Le motif doit être NOMMÉ : quatre causes, quatre phrases distinctes.
+    /// Un message unique pour les quatre ne dirait rien de plus que le silence
+    /// qu'il remplace.
+    #[test]
+    fn chaque_cause_a_sa_phrase_et_son_evenement() {
+        let mut phrases = std::collections::BTreeSet::new();
+        let mut evenements = std::collections::BTreeSet::new();
+        for cause in TOUS {
+            let m = cause.user_message("DAC USB");
+            assert!(m.contains("DAC USB"), "sortie absente de {cause:?} : {m}");
+            assert!(
+                m.contains("décoder"),
+                "la cause doit être nommée dans {cause:?} : {m}"
+            );
+            phrases.insert(m);
+            evenements.insert(cause.log_event());
+        }
+        assert_eq!(phrases.len(), 4, "deux causes rendent la même phrase");
+        assert_eq!(evenements.len(), 4, "deux causes rendent le même événement");
+    }
+
+    /// Le canal est celui du sondeur : `take_output_failure()` le draine, une
+    /// seule fois. C'est la contre-épreuve du `return` nu.
+    #[test]
+    fn l_echec_de_decodage_passe_par_le_canal_que_le_sondeur_draine() {
+        use super::super::traits::OutputTarget;
+        let sortie = super::LocalOutput::new("DAC USB".into());
+        assert!(
+            sortie.take_output_failure().is_none(),
+            "TÉMOIN VERT : une sortie saine ne remonte rien"
+        );
+
+        record_compressed_decode_failure(
+            CompressedDecodeFailure::ContainerUnrecognised,
+            "DAC USB",
+            &sortie.open_failure,
+        );
+        let remonte = sortie
+            .take_output_failure()
+            .expect("l'échec de décodage doit remonter par le canal du sondeur");
+        assert!(remonte.contains("DAC USB"), "got: {remonte}");
+        assert!(
+            sortie.take_output_failure().is_none(),
+            "un échec ne doit jamais être remonté deux fois"
+        );
+    }
+
+    /// La production, pas une maquette : des octets qui ne sont ni FLAC ni MP3
+    /// ni AAC doivent rendre le motif « conteneur non reconnu », et non un
+    /// `None` muet.
+    #[test]
+    fn un_flux_illisible_rend_le_motif_conteneur_non_reconnu() {
+        let poubelle = vec![0x42u8; 8192];
+        assert_eq!(
+            decode_compressed_stream(&poubelle),
+            Err(CompressedDecodeFailure::ContainerUnrecognised)
+        );
+    }
+
+    /// TÉMOIN VERT : un flux vide ne doit pas, lui non plus, rendre `Ok`.
+    #[test]
+    fn un_flux_vide_ne_rend_jamais_un_succes() {
+        assert!(decode_compressed_stream(&[]).is_err());
     }
 }
 
