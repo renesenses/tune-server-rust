@@ -19,6 +19,8 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
+use crate::routes::filtre_sources::FiltreSources;
+
 use crate::state::AppState;
 
 /// Classement d'un resultat de recherche par rapport au morceau de reference.
@@ -500,11 +502,34 @@ where
     });
 }
 
+/// Les services interroges pour les versions d'un morceau.
+///
+/// Ecrite UNE fois : `/home/other-versions` s'en sert pour savoir s'il vaut la
+/// peine de lire son vivier d'ecoutes avant d'appeler
+/// [`versions_streaming`]. Deux listes qui derivent l'une de l'autre feraient
+/// lire l'historique pour rien, ou pire, le sauteraient alors qu'un service
+/// repond.
+pub(crate) const SERVICES_VERSIONS: [&str; 4] = ["qobuz", "tidal", "deezer", "spotify"];
+
 /// Les versions et reprises d'un morceau DISPONIBLES EN STREAMING.
 ///
 /// Un service absent, non authentifie, en erreur ou lent ne fait jamais
 /// echouer l'appel : il est simplement saute, et le resultat est partiel.
-pub(crate) async fn versions_streaming(state: &AppState, reference: &Reference) -> Vec<Value> {
+///
+/// `filtre` dit QUELS services repondent — le meme `sources` que partout
+/// ailleurs (`routes::filtre_sources`). Il est pris en ARGUMENT et non relu
+/// d'une URL : cette fonction sert DEUX routes, `/home/other-versions` et
+/// `/library/tracks/{id}/versions`, et c'est ce qui garantit qu'elles
+/// appliquent la meme regle sans la recopier. [`FiltreSources::tout`] rend le
+/// comportement d'avant, a l'octet.
+///
+/// Le service ecarte l'est AVANT le cache et avant tout appel reseau : le
+/// filtre economise l'appel, il ne jette pas un resultat deja paye.
+pub(crate) async fn versions_streaming(
+    state: &AppState,
+    reference: &Reference,
+    filtre: &FiltreSources,
+) -> Vec<Value> {
     let titre = reference.titre.as_str();
     let artiste = reference.artiste.as_str();
     let album = reference.album.as_str();
@@ -515,7 +540,10 @@ pub(crate) async fn versions_streaming(state: &AppState, reference: &Reference) 
     // memes pistes du bon artiste —, et une version affichee deux fois serait
     // pire que la version manquante qu'on repare.
     let mut deja: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    for nom_service in ["qobuz", "tidal", "deezer", "spotify"] {
+    for nom_service in SERVICES_VERSIONS {
+        if !filtre.service_demande(nom_service) {
+            continue;
+        }
         for requete in &requetes {
             let cle_cache = format!("{nom_service}:{}", requete.to_lowercase());
             let en_cache = {
@@ -592,8 +620,19 @@ pub(crate) async fn versions_streaming(state: &AppState, reference: &Reference) 
         }
     }
 
+    // ⚠️ Bandcamp est un CINQUIEME service, hors du tableau ci-dessus et hors
+    // du registre : il ne s'authentifie pas et sa recherche est un appel
+    // reseau direct. Filtrer la seule boucle du registre l'aurait laisse
+    // repondre a `sources=qobuz` — un service non demande, paye au prix d'un
+    // appel sortant. Il n'est visible ni depuis la liste des routes ni depuis
+    // `state.services` ; c'est le mecanisme qu'il faut sonder, pas le mot.
     #[cfg(feature = "bandcamp")]
-    for requete in &requetes {
+    for requete in filtre
+        .service_demande("bandcamp")
+        .then_some(&requetes)
+        .into_iter()
+        .flatten()
+    {
         let cle_cache = format!("bandcamp:{}", requete.to_lowercase());
         let en_cache = {
             let cache = CACHE_VERSIONS.lock().await;
@@ -1011,5 +1050,106 @@ mod tests {
         assert_eq!(exact, POINTS_TITRE_EXACT);
         assert_eq!(suffixe, POINTS_TITRE_SUFFIXE);
         assert!(exact > suffixe);
+    }
+}
+
+/// Garde de SITE pour la branche Bandcamp de [`versions_streaming`].
+///
+/// # Pourquoi une garde statique ici, et nulle part ailleurs
+///
+/// Les trois routes sont eprouvees sur le CORPS de leur reponse par
+/// `tests/sources_trois_routes_i3226.rs`, qui est la bonne facon de faire.
+/// Cette branche-ci echappe a ce banc, et pour une raison de fond :
+/// `tune_bandcamp::rechercher_pistes` est un APPEL RESEAU SORTANT, hors du
+/// registre et sans authentification. On ne peut donc pas lui substituer une
+/// doublure comme on le fait pour `qobuz` et `tidal`.
+///
+/// Le banc a d'abord tourne avec un titre reel : Bandcamp y a repondu neuf
+/// entrees imprevues, et l'essai devenait un pari sur ce que le site servait
+/// ce jour-la. Il tourne desormais sur un titre invente — donc Bandcamp n'y
+/// rend jamais rien, et une assertion « Bandcamp est absent » y serait verte
+/// contre rien.
+///
+/// Cette garde-la lit le fichier de production et exige que la boucle Bandcamp
+/// soit precedee de sa consultation de `sources`. Sans elle, `sources=qobuz`
+/// paierait un appel sortant vers un service que personne n'a demande, et le
+/// rendrait dans `streaming`.
+#[cfg(test)]
+mod garde_de_site_bandcamp {
+    /// La partie PRODUCTION du fichier : tout ce qui precede le premier
+    /// `#[cfg(test)]`.
+    ///
+    /// `include_str!` rend le fichier ENTIER, ces modules de test compris — ou
+    /// le motif cherche apparait en toutes lettres, dans le code de la garde
+    /// comme dans sa contre-epreuve. Sans cette coupe, la garde se prouverait
+    /// elle-meme et resterait verte quel que soit le code de production.
+    fn production(source: &str) -> &str {
+        source
+            .split_once("\n#[cfg(test)]")
+            .map(|(avant, _)| avant)
+            .unwrap_or(source)
+    }
+
+    /// Le motif exige : la boucle Bandcamp consulte `sources`.
+    const MOTIF: &str = "service_demande(\"bandcamp\")";
+
+    /// `versions.rs`, ligne ~629 : la boucle `#[cfg(feature = "bandcamp")] for
+    /// requete in …` doit etre gouvernee par `filtre.service_demande`.
+    #[test]
+    fn le_filtre_de_sources_couvre_la_branche_bandcamp() {
+        let prod = production(include_str!("versions.rs"));
+        assert!(
+            prod.contains(MOTIF),
+            "tune-server/src/routes/versions.rs — la boucle Bandcamp de \
+             `versions_streaming` (cherchez `#[cfg(feature = \"bandcamp\")]`, \
+             ligne ~629) ne consulte plus `sources` : `{MOTIF}` a disparu du \
+             code de production. `sources=qobuz` paierait alors un appel \
+             reseau sortant vers Bandcamp — un service que personne n'a \
+             demande — et rendrait ses pistes dans `streaming`. Le banc \
+             `tests/sources_trois_routes_i3226.rs` ne peut PAS attraper cela : \
+             il tourne sur un titre invente, contre lequel Bandcamp ne rend \
+             jamais rien."
+        );
+        // La garde doit designer la BOUCLE, pas n'importe quelle mention :
+        // le motif doit se trouver dans `versions_streaming`, apres la boucle
+        // du registre.
+        let (avant_bandcamp, _) = prod
+            .split_once("#[cfg(feature = \"bandcamp\")]")
+            .expect("la branche Bandcamp a disparu de versions.rs");
+        assert!(
+            !avant_bandcamp.is_empty(),
+            "la branche Bandcamp doit rester dans `versions_streaming`"
+        );
+    }
+
+    /// Contre-epreuve de la garde elle-meme, dans les DEUX sens.
+    #[test]
+    fn la_garde_ne_se_prouve_pas_sur_son_propre_module_de_test() {
+        // 1. Elle doit VOIR le motif dans un code de production qui l'a.
+        let avec = "fn f() {\n    if filtre.service_demande(\"bandcamp\") {}\n}\n";
+        assert!(
+            production(avec).contains(MOTIF),
+            "la garde doit reconnaitre le motif quand il est present"
+        );
+
+        // 2. Elle ne doit PAS le voir quand il n'existe que dans le module de
+        //    test — c'est exactement la situation de CE fichier, ou le motif
+        //    apparait trois fois ci-dessus.
+        let seulement_en_test = format!(
+            "fn f() {{}}\n\n#[cfg(test)]\nmod t {{\n    const M: &str = \"{MOTIF}\";\n}}\n"
+        );
+        assert!(
+            !production(&seulement_en_test).contains(MOTIF),
+            "un motif present dans le SEUL module de test ne doit pas compter \
+             pour du code de production — sans cette coupe, cette garde serait \
+             verte contre un `versions.rs` dont la boucle Bandcamp ne filtre \
+             plus rien"
+        );
+
+        // 3. Et un code de production nu ne doit pas passer.
+        assert!(
+            !production("fn f() {\n    for r in &requetes {}\n}\n").contains(MOTIF),
+            "une boucle Bandcamp nue ne doit pas passer pour filtree"
+        );
     }
 }

@@ -270,3 +270,16 @@ path = "tests/pairs_decouverts_i2746.rs"
 [[test]]
 name = "comptes_par_source_2147"
 path = "tests/comptes_par_source_2147.rs"
+
+# #3226 generalise : `sources` gouverne desormais AUSSI le bloc local de
+# `/home/other-versions`, `/home/artist-releases` et
+# `/library/tracks/{id}/versions`, la ou il ne filtrait que la boucle des
+# services (quand il existait). `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+#
+# Pas de `required-features` : le banc monte deux services factices et une
+# base SQLite en memoire, il ne demande aucune base externe et doit tourner
+# dans le `cargo test --workspace` ordinaire.
+[[test]]
+name = "sources_trois_routes_i3226"
+path = "tests/sources_trois_routes_i3226.rs"
