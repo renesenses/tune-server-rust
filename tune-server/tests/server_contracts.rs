@@ -7,6 +7,8 @@
 mod adresse_du_flux_reservee_au_navigateur;
 #[path = "airplay2_lit_le_flux_transcode.rs"]
 mod airplay2_lit_le_flux_transcode;
+#[path = "album_lecture_en_double.rs"]
+mod album_lecture_en_double;
 #[path = "albums_pas_des_doublons.rs"]
 mod albums_pas_des_doublons;
 #[path = "annonce_forum_bornes.rs"]

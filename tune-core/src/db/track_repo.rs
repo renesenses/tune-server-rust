@@ -601,10 +601,29 @@ pub mod sql {
 /// Display collapsing deliberately ignores `audio_hash`: a sampled candidate
 /// must not make a real track disappear from an album or artist view. The
 /// legacy presentation key remains album + disc + track + case-insensitive
-/// title. The first occurrence in input order is kept.
+/// title. The first occurrence keeps its **place** in the output.
+///
+/// Ce qui SURVIT à la position, en revanche, c'est la copie de **meilleure
+/// qualité**, pas la première venue (#1362). Cyrille Moutia décrit le cas :
+/// un CD rippé en AIFF, et le même morceau récupéré ailleurs en AAC posé dans
+/// le dossier de l'album. Les deux fichiers portent le même album, le même
+/// numéro et le même titre : ils se replient. Garder « le premier de la
+/// requête » revenait à laisser l'ordre SQL choisir entre l'AIFF et l'AAC —
+/// une pièce à pile ou face, à l'écran comme à la lecture. Le barème est celui
+/// de « Disponible en meilleure qualité »
+/// ([`crate::library::quality::score_qualite`]) : à égalité de score, le
+/// premier arrivé reste, donc rien ne bouge pour les vrais doublons à
+/// l'identique.
 pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
-    let mut seen: HashSet<(Option<i64>, String)> = HashSet::new();
-    let mut out = Vec::with_capacity(tracks.len());
+    fn score(t: &Track) -> (bool, i64) {
+        crate::library::quality::score_qualite(
+            t.format.as_deref(),
+            t.sample_rate.map(i64::from),
+            t.bit_depth.map(i64::from),
+        )
+    }
+    let mut place: HashMap<(Option<i64>, String), usize> = HashMap::new();
+    let mut out: Vec<Track> = Vec::with_capacity(tracks.len());
     for t in tracks {
         let key = (
             t.album_id,
@@ -615,8 +634,16 @@ pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
                 t.title.trim().to_lowercase()
             ),
         );
-        if seen.insert(key) {
-            out.push(t);
+        match place.get(&key) {
+            Some(&i) => {
+                if score(&t) > score(&out[i]) {
+                    out[i] = t;
+                }
+            }
+            None => {
+                place.insert(key, out.len());
+                out.push(t);
+            }
         }
     }
     out
