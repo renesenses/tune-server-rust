@@ -2106,10 +2106,44 @@ impl LocalOutput {
     /// À appeler partout où le nom vient d'un [`AudioDevice`] : sans cette
     /// étiquette, un nom ne porte rien et la résolution ne peut pas refuser un
     /// hôte étranger (#3230). Une chaîne vide est traitée comme « inconnu ».
+    ///
+    /// # Elle RECTIFIE aussi le backend (#1770)
+    ///
+    /// Connaître l'hôte d'origine, c'est savoir sous quel hôte ce nom est
+    /// ouvrable — et donc pouvoir refuser d'en ouvrir un autre. La règle est
+    /// dans [`crate::config::openable_local_backend`], avec le détail de ce
+    /// qu'elle répare.
+    ///
+    /// Elle est appliquée ICI, à la construction, et non chez les appelants :
+    /// c'est le seul endroit où l'origine est connue, et le recensement des
+    /// sites d'enregistrement est un PLANCHER, jamais un plafond. Un site
+    /// ajouté demain qui étiquette correctement son origine est corrigé sans
+    /// rien avoir à savoir de cette règle ; un site qui ne l'étiquette pas
+    /// n'est pas corrigé — et c'est ce que garde
+    /// `les_deux_sites_d_enregistrement_local_etiquettent_l_hote_d_origine`
+    /// dans `tune-server/src/background.rs`.
     #[must_use]
     pub fn with_origin_host(mut self, origin_host: &str) -> Self {
         self.origin_host = (!origin_host.is_empty()).then(|| origin_host.to_string());
+        self.audio_backend =
+            crate::config::openable_local_backend(&self.audio_backend, self.origin_host.as_deref());
         self
+    }
+
+    /// Le backend sous lequel cette sortie sera OUVERTE.
+    ///
+    /// Ce n'est pas forcément le réglage `local_audio_backend` : quand l'hôte
+    /// d'origine est connu, [`Self::with_origin_host`] l'a rectifié (#1770).
+    /// C'est cette valeur-là que consomment `select_host`, la branche ASIO
+    /// exclusive et [`crate::outputs::OutputTarget::is_available`].
+    pub fn audio_backend(&self) -> &str {
+        &self.audio_backend
+    }
+
+    /// L'hôte audio qui a énuméré le nom que porte cette sortie, s'il est
+    /// connu (#3230).
+    pub fn origin_host(&self) -> Option<&str> {
+        self.origin_host.as_deref()
     }
 
     /// Create a local output bound to the stable backend endpoint discovered
@@ -14182,5 +14216,123 @@ mod renseignement_materiel_tests {
             serde_json::from_value(ancien).expect("AudioDevice reste rétro-compatible");
         assert_eq!(relu.hardware_detail, None);
         assert_eq!(relu.name, "Haut-Parleurs");
+    }
+}
+
+/// #1770 — une zone créée à partir d'une énumération WASAPI alors qu'ASIO est
+/// configuré ne pouvait JAMAIS jouer.
+///
+/// Ces essais construisent la sortie par l'EXPRESSION EXACTE des deux sites
+/// d'enregistrement (`tune-server/src/startup.rs::register_local_outputs` et
+/// `tune-server/src/background.rs::rescan_local_audio_devices`) et mesurent ce
+/// que la sortie portera à l'ouverture. Ils ne rappellent aucune condition :
+/// `LocalOutput::audio_backend()` est la valeur que lisent `select_host`, la
+/// branche `exclusive_mode && audio_backend == "asio"` et `is_available`.
+///
+/// La branche ASIO exclusive elle-même vit sous
+/// `#[cfg(all(target_os = "windows", feature = "asio"))]` : elle ne se compile
+/// ni sur Shrek ni sur aucune porte de ce dépôt. Élargir ce `cfg` serait INERTE
+/// ici — la caisse `cpal/asio` ne se lie pas hors Windows. C'est donc la valeur
+/// D'ENTRÉE de cette branche qui est tenue, pas la branche.
+#[cfg(test)]
+mod zone_backend_asio_i1770 {
+    use super::LocalOutput;
+
+    /// Le cas mesuré chez jfpaquet le 02/09 en 0.9.130 :
+    /// `asio_device_not_found_listing_available requested=Speakers
+    /// available=["Essence STX II ASIO(64)"]`, deux fois en une minute, sans
+    /// aucun repli.
+    ///
+    /// `exclusive_mode = true` n'est pas un choix de l'essai : sous ASIO,
+    /// `AppState::effective_exclusive_mode()` le rend vrai PAR CONSTRUCTION
+    /// (`config::exclusive_mode_status`), que la case soit cochée ou non.
+    #[test]
+    fn un_endpoint_wasapi_sous_asio_ne_part_pas_dans_le_chemin_asio() {
+        let sortie = LocalOutput::with_options_and_endpoint(
+            "Speakers".to_string(),
+            Some("{0.0.0.00000000}.{a1b2c3d4}".to_string()),
+            true,
+            "asio",
+        )
+        .with_origin_host("WASAPI");
+
+        assert_ne!(
+            sortie.audio_backend(),
+            "asio",
+            "`AsioExclusiveOutput::new` ne reçoit un nom que par \
+             `audio_backend == \"asio\"` : tant que cette sortie porte `asio`, \
+             un nom WASAPI y est envoyé et ne peut qu'être refusé (#1770)"
+        );
+        assert_eq!(
+            sortie.audio_backend(),
+            "wasapi",
+            "et `select_host` doit rouvrir l'hôte qui a énuméré ce nom, sans \
+             quoi `resolve_device` refuse pour hôte étranger (#3230)"
+        );
+        assert_eq!(
+            sortie.origin_host(),
+            Some("WASAPI"),
+            "l'étiquette d'origine reste posée : c'est elle qui arme le refus \
+             de #3230 sur le chemin cpal"
+        );
+    }
+
+    /// TÉMOIN — backend ASIO, périphérique ASIO réel : comportement INCHANGÉ.
+    ///
+    /// C'est le périphérique de jfpaquet lui-même. Si cet essai tombe, le
+    /// correctif a désarmé ASIO au lieu de le protéger, et il n'y a plus de
+    /// lecture bit-perfect du tout.
+    #[test]
+    fn temoin_un_endpoint_asio_reel_reste_sur_le_chemin_asio() {
+        let sortie = LocalOutput::with_options_and_endpoint(
+            "Essence STX II ASIO(64)".to_string(),
+            None,
+            true,
+            "asio",
+        )
+        .with_origin_host("ASIO");
+
+        assert_eq!(
+            sortie.audio_backend(),
+            "asio",
+            "un périphérique réellement énuméré par ASIO doit continuer de \
+             partir dans la branche ASIO exclusive"
+        );
+        assert_eq!(sortie.origin_host(), Some("ASIO"));
+    }
+
+    /// Sans étiquette d'origine, rien n'est rectifié : on ne devine pas.
+    ///
+    /// C'est le cas de `PlaybackOrchestrator::recreate_local_and_play`, qui
+    /// reconstruit une sortie à partir du seul `device_id`.
+    #[test]
+    fn sans_hote_d_origine_le_reglage_passe_tel_quel() {
+        let sortie =
+            LocalOutput::with_options_and_endpoint("Speakers".to_string(), None, true, "asio");
+        assert_eq!(sortie.audio_backend(), "asio");
+        assert_eq!(sortie.origin_host(), None);
+
+        // Une chaîne vide vaut « inconnu », comme pour `origin_host`.
+        let vide =
+            LocalOutput::with_options_and_endpoint("Speakers".to_string(), None, true, "asio")
+                .with_origin_host("");
+        assert_eq!(vide.audio_backend(), "asio");
+        assert_eq!(vide.origin_host(), None);
+    }
+
+    /// Le mode exclusif n'est PAS touché : il reste ce que
+    /// `effective_exclusive_mode()` a décidé. Une sortie WASAPI rectifiée part
+    /// donc dans le chemin WASAPI exclusif (`exclusive_mode && audio_backend
+    /// != "asio"`), qui lui, sait l'ouvrir.
+    #[test]
+    fn le_mode_exclusif_reste_celui_qu_on_a_recu() {
+        let sortie =
+            LocalOutput::with_options_and_endpoint("Speakers".to_string(), None, true, "asio")
+                .with_origin_host("WASAPI");
+        assert!(
+            sortie.exclusive_mode,
+            "rectifier le backend ne doit pas décider à la place de \
+             l'utilisateur ce que vaut le mode exclusif"
+        );
     }
 }
