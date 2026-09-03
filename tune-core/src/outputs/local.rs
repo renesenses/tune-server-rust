@@ -262,6 +262,33 @@ struct ObservedDevice {
     reason: Option<LocalDeviceFallback>,
 }
 
+/// La CADENCE de la dernière ouverture partagée : celle de la source, celle
+/// réellement ouverte, et le motif de l'écart quand il y en a un.
+///
+/// #3233 — même famille que [`OBSERVED_DEVICE`], et pour la même raison : une
+/// décision qui change ce qui part au DAC ne doit pas rester dans le seul
+/// journal. Pierre M (fil 1043) lit « DSD64 » sur son écran pendant que Tune a
+/// choisi d'ouvrir ailleurs ; sans ce verrou, il faut ses journaux pour le
+/// savoir.
+///
+/// ⚠️ Ne concerne que le chemin cpal **partagé**. Les chemins exclusifs
+/// (WASAPI exclusif, ASIO, hog CoreAudio) n'arbitrent pas : ils ouvrent à la
+/// cadence de la source ou échouent, donc ils n'écrivent rien ici.
+///
+/// ⚠️ Comme `OBSERVED_DEVICE`, ce verrou porte la DERNIÈRE ouverture observée
+/// et n'est pas effacé à l'arrêt.
+static OBSERVED_RATE: std::sync::RwLock<Option<ObservedRate>> = std::sync::RwLock::new(None);
+
+/// Ce que la dernière ouverture partagée a demandé comme cadence, et ce qu'elle
+/// a ouvert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedRate {
+    source_sample_rate: u32,
+    opened_sample_rate: u32,
+    reason: Option<LocalRateFallback>,
+    evidence_measured: bool,
+}
+
 /// Nom du backend tel que `select_host` l'a observé, ou `"local"` faute d'avoir
 /// encore ouvert quoi que ce soit. Sert à étiqueter l'ouverture d'un
 /// périphérique par le chemin cpal, qui ne connaît que la variante cpal.
@@ -464,6 +491,13 @@ pub struct LocalBackendStatus {
     /// (ASIO → WASAPI). Les deux replis sont indépendants : une zone peut
     /// tourner sur le backend demandé et sur un autre périphérique.
     pub device: Option<LocalDeviceStatus>,
+    /// La CADENCE réellement ouverte, face à celle de la source (#3233).
+    ///
+    /// `None` = aucune ouverture partagée observée depuis le démarrage, ou
+    /// sortie exclusive (qui n'arbitre pas). Troisième repli indépendant des
+    /// deux autres : une zone peut jouer sur le bon backend, le bon
+    /// périphérique, et à une autre cadence que la source.
+    pub rate: Option<LocalRateStatus>,
 }
 
 /// Ce que la sortie locale a réellement OUVERT, face à ce que la zone
@@ -524,6 +558,109 @@ impl LocalDeviceStatus {
             reason: observed.reason,
             detail: observed.reason.map(LocalDeviceFallback::detail),
         }
+    }
+}
+
+/// Pourquoi la sortie locale partagée n'a **pas** ouvert à la cadence de la
+/// source.
+///
+/// #3233 — Pierre M (fil 1043, 14/07/2026) : « DSD : le temps défile, pas de
+/// son ». Un DSD64 décode à 176 400 Hz ; le chemin partagé ouvrait à cette
+/// cadence dès que l'énumération de cpal la « retenait », sans regarder ce que
+/// cette réponse valait. Sur WASAPI elle ne vaut rien (voir
+/// [`sample_rate_evidence`]) : la liste est fabriquée, la branche était donc
+/// toujours prise, `needs_resample` restait faux et rubato ne tournait jamais.
+///
+/// Les codes sont **stables** et destinés à la machine (le client les traduit),
+/// exactement comme [`LocalBackendFallback`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalRateFallback {
+    /// Le périphérique « retient » la cadence, mais **rien ne l'a vérifiée** :
+    /// hôte dont l'énumération est fabriquée (WASAPI), ou PCM ALSA qui passe
+    /// par un greffon rééchantillonneur. Tune refuse de fonder l'ouverture sur
+    /// une capacité supposée et convertit lui-même.
+    CapabilitiesUnverified,
+    /// Le périphérique ne retient pas la cadence : l'écart est constaté, pas
+    /// supposé. C'est le comportement de toujours, nommé.
+    RateNotSupported,
+}
+
+impl LocalRateFallback {
+    /// Code stable, celui que porte la charge utile JSON et les journaux.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::CapabilitiesUnverified => "capabilities_unverified",
+            Self::RateNotSupported => "rate_not_supported",
+        }
+    }
+
+    /// Phrase courte, dans la langue du chemin du signal — le serveur y écrit
+    /// déjà ses `detail` en français (`runtime_signal_reason_detail`).
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::CapabilitiesUnverified => {
+                "Cadence source annoncée par le périphérique mais jamais vérifiée : \
+                 ouverture à la cadence du périphérique et rééchantillonnage par Tune"
+            }
+            Self::RateNotSupported => {
+                "Cadence source non retenue par le périphérique : ouverture à la \
+                 cadence du périphérique et rééchantillonnage par Tune"
+            }
+        }
+    }
+
+    /// Toutes les variantes. Sert la contre-épreuve permanente : un motif
+    /// ajouté sans être câblé fait tomber le test qui parcourt cette liste.
+    pub const ALL: [Self; 2] = [Self::CapabilitiesUnverified, Self::RateNotSupported];
+}
+
+/// À quelle cadence la sortie locale partagée a réellement ouvert, face à celle
+/// de la source — et pourquoi, quand les deux diffèrent.
+///
+/// Additif, comme [`LocalDeviceStatus`] : un client qui ne lit pas ce champ voit
+/// le même écran qu'avant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LocalRateStatus {
+    /// Cadence du flux décodé (176 400 Hz pour un DSD64, 352 800 pour un
+    /// DSD128/256/512).
+    pub source_sample_rate: u32,
+    /// Cadence à laquelle le flux cpal a été ouvert.
+    pub opened_sample_rate: u32,
+    /// `true` dès que les deux diffèrent : Tune convertit, ce n'est plus le
+    /// train d'échantillons de la source qui part au DAC.
+    pub resampled: bool,
+    /// Pourquoi, quand la conversion est une DÉCISION de Tune. `None` = aucune
+    /// conversion, ou aucune décision à justifier.
+    pub reason: Option<LocalRateFallback>,
+    /// La même chose en clair, pour un écran sans table de traduction.
+    pub detail: Option<&'static str>,
+    /// La liste de cadences sur laquelle la décision s'est appuyée avait-elle
+    /// été **mesurée** ? Faux sur WASAPI et sur les greffons ALSA (#2862,
+    /// #1655). C'est le fait qui distingue les deux motifs.
+    pub evidence_measured: bool,
+}
+
+impl LocalRateStatus {
+    fn from_observed(observed: ObservedRate) -> Self {
+        Self {
+            source_sample_rate: observed.source_sample_rate,
+            opened_sample_rate: observed.opened_sample_rate,
+            resampled: observed.opened_sample_rate != observed.source_sample_rate,
+            reason: observed.reason,
+            detail: observed.reason.map(LocalRateFallback::detail),
+            evidence_measured: observed.evidence_measured,
+        }
+    }
+}
+
+/// Enregistre la cadence réellement ouverte par le chemin cpal **partagé**.
+///
+/// Appelé une fois par ouverture, juste après [`decide_local_rate_opening`] :
+/// la décision et sa trace ne se séparent pas.
+fn note_rate_decision(observed: ObservedRate) {
+    if let Ok(mut slot) = OBSERVED_RATE.write() {
+        *slot = Some(observed);
     }
 }
 
@@ -612,9 +749,10 @@ pub fn active_backend_name(backend: &str) -> &'static str {
 /// n'a toujours aucun moyen de savoir s'il s'est trompé de réglage ou si le
 /// serveur a basculé — ni pourquoi.
 pub fn active_backend_status(requested: &str) -> LocalBackendStatus {
-    backend_status(
+    backend_status_with_rate(
         OBSERVED_BACKEND.read().ok().and_then(|g| *g),
         OBSERVED_DEVICE.read().ok().and_then(|g| g.clone()),
+        OBSERVED_RATE.read().ok().and_then(|g| *g),
         requested,
     )
 }
@@ -641,9 +779,24 @@ fn backend_display_name(observed: Option<&'static str>, backend: &str) -> &'stat
 
 /// Même isolement pour le statut complet : aucune lecture de l'état global,
 /// aucun périphérique ouvert, donc jouable sur n'importe quelle plateforme.
+///
+/// Raccourci des tests de la famille #1395, qui n'ont rien à dire de la
+/// cadence : c'est [`backend_status_with_rate`] sans observation de cadence.
+#[cfg(test)]
 fn backend_status(
     observed: Option<ObservedBackend>,
     observed_device: Option<ObservedDevice>,
+    requested: &str,
+) -> LocalBackendStatus {
+    backend_status_with_rate(observed, observed_device, None, requested)
+}
+
+/// Même isolement pour le statut complet : aucune lecture de l'état global,
+/// aucun périphérique ouvert, donc jouable sur n'importe quelle plateforme.
+fn backend_status_with_rate(
+    observed: Option<ObservedBackend>,
+    observed_device: Option<ObservedDevice>,
+    observed_rate: Option<ObservedRate>,
     requested: &str,
 ) -> LocalBackendStatus {
     let requested_lower = requested.to_lowercase();
@@ -678,6 +831,7 @@ fn backend_status(
         fallback_reason,
         fallback_detail: fallback_reason.map(LocalBackendFallback::detail),
         device: observed_device.map(LocalDeviceStatus::from_observed),
+        rate: observed_rate.map(LocalRateStatus::from_observed),
     }
 }
 
@@ -6092,106 +6246,158 @@ impl OutputTarget for LocalOutput {
                 let default_cfg = device.default_output_config().ok().map(|c| c.config());
                 let default_sr = default_cfg.as_ref().map(|c| c.sample_rate);
 
-                if default_sr == Some(sample_rate) {
-                    // Device is already at the source rate — use it directly
-                    default_cfg.unwrap()
-                } else if let Some(cfg) = find_matching_config(&device, channels, sample_rate)
-                    .filter(|c| c.sample_rate == sample_rate)
-                {
-                    // Device SUPPORTS the source rate even though its current
-                    // default differs — open at the source rate to avoid an
-                    // extreme realtime resample.  A DSD256
-                    // file decodes to 352.8kHz; on a DAC left at 44.1kHz by the
-                    // OS the old code resampled 352.8k→44.1k in real time, the
-                    // sinc resampler underran and no sound came out (Cyrille,
-                    // FiiO K3 which natively supports 352.8kHz, iFi Neo iDSD).
+                // Ce que l'énumération de cpal RÉPOND. Le filtre est
+                // TAUTOLOGIQUE quand l'énumération est fabriquée :
+                // `find_matching_config` recopie la cadence demandée dans le
+                // `StreamConfig` qu'il rend, donc `c.sample_rate ==
+                // sample_rate` est vrai par construction dès qu'une plage
+                // quelconque a été retenue — et sur WASAPI toutes les plages
+                // sont retenues sans test (#2862). Cette réponse n'est donc
+                // plus qu'une ENTRÉE de la décision (#3233) : c'est
+                // `decide_local_rate_opening` qui tranche, en regardant ce que
+                // la réponse vaut. Elle n'est calculée que si le périphérique
+                // n'est pas déjà à la bonne cadence — sur WASAPI l'énumération
+                // déroule 147 formats, sur ASIO elle touche le pilote.
+                let enumerated = if default_sr == Some(sample_rate) {
+                    None
+                } else {
+                    find_matching_config(&device, channels, sample_rate)
+                        .filter(|c| c.sample_rate == sample_rate)
+                };
+                // Sur ALSA, `endpoint_id` est le nom de PCM (`hw:CARD=…`,
+                // `dmix:CARD=…`) : c'est LUI qui dit si le « oui » vient du
+                // pilote ou d'un rééchantillonneur (#1655). Le journaliser
+                // ici est la ligne qui manquait pour trancher un relevé de
+                // terrain sans y retourner.
+                let opened_endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
+                let rate_evidence =
+                    sample_rate_evidence_for_device(host_id_name, &opened_endpoint_id, true);
+                let decision = decide_local_rate_opening(
+                    sample_rate,
+                    default_sr,
+                    enumerated.is_some(),
+                    rate_evidence,
+                );
+
+                // Ce que la décision ouvre RÉELLEMENT — la seule chose qu'on ait
+                // le droit de remonter.
+                let (chosen, opened_sr, reason) = match (decision, default_cfg, enumerated) {
+                    // Le périphérique y est déjà : aucune conversion, et rien à
+                    // régler côté matériel.
+                    (LocalRateOpening::DeviceAlreadyAtSourceRate, Some(cfg), _) => {
+                        (cfg, sample_rate, None)
+                    }
+                    // L'énumération est une MESURE et elle retient la cadence :
+                    // on ouvre à la cadence de la source, exactement comme
+                    // avant. Témoin du cas nominal.
                     //
-                    // « SUPPORTS » n'a pas la même valeur partout, et ce chemin
-                    // ne peut pas promettre le bit-perfect sur toutes les
-                    // plateformes (#2862). Le filtre ci-dessus est
-                    // TAUTOLOGIQUE quand l'énumération est fabriquée :
-                    // `find_matching_config` recopie la cadence demandée dans le
-                    // `StreamConfig` qu'il rend, donc `c.sample_rate ==
-                    // sample_rate` est vrai par construction dès qu'une plage
-                    // quelconque a été retenue. Sur WASAPI toutes les plages
-                    // sont retenues sans test, la branche est donc TOUJOURS
-                    // prise, `needs_resample` reste faux, rubato ne tourne
-                    // jamais, et c'est le moteur Windows qui convertit derrière
-                    // (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`). Sur ALSA / ASIO /
-                    // CoreAudio la plage vient d'une interrogation du pilote et
-                    // la branche dit bien ce qu'elle prétend.
-                    // Sur ALSA, `endpoint_id` est le nom de PCM (`hw:CARD=…`,
-                    // `dmix:CARD=…`) : c'est LUI qui dit si le « oui » vient du
-                    // pilote ou d'un rééchantillonneur (#1655). Le journaliser
-                    // ici est la ligne qui manquait pour trancher un relevé de
-                    // terrain sans y retourner.
-                    let opened_endpoint_id =
-                        device.id().map(|id| id.to_string()).unwrap_or_default();
-                    let rate_evidence =
-                        sample_rate_evidence_for_device(host_id_name, &opened_endpoint_id, true);
-                    info!(
-                        source_sr = sample_rate,
-                        device_default_sr = ?default_sr,
-                        backend = %host_id_name,
-                        endpoint_id = %opened_endpoint_id,
-                        rate_support_measured = rate_evidence.is_measured(),
-                        "local_audio_open_at_source_rate_reported_supported"
-                    );
-                    // macOS: cpal's CoreAudio backend does NOT switch the device's
-                    // hardware nominal rate for output streams (see the note
-                    // above), so opening the cpal stream "at the source rate"
-                    // leaves the DAC clocked at the OS rate and CoreAudio silently
-                    // converts — which yields SILENCE for high-rate DSD→PCM
-                    // (DSD128/256/512 all decode to 352.8kHz; only DSD64's 176.4k
-                    // survived). We reach this branch precisely when the device
-                    // SUPPORTS the source rate but its default differs, so set the
-                    // hardware nominal rate explicitly (what the exclusive/hog path
-                    // already does) — the DAC then actually clocks at 352.8kHz.
-                    // Best-effort: if the device can't be resolved/set we fall
-                    // through to today's behavior (no regression). Cyrille: iFi
-                    // Neo iDSD / FiiO K3, DSD128+ silent.
-                    #[cfg(target_os = "macos")]
-                    {
-                        use coreaudio::audio_unit::macos_helpers;
-                        if let Some(dev_id) =
-                            macos_helpers::get_device_id_from_name(&device_name, false)
+                    // A DSD256 file decodes to 352.8kHz; on a DAC left at
+                    // 44.1kHz by the OS the old code resampled 352.8k→44.1k in
+                    // real time, the sinc resampler underran and no sound came
+                    // out (Cyrille, FiiO K3 which natively supports 352.8kHz,
+                    // iFi Neo iDSD).
+                    (LocalRateOpening::AtSourceRateMeasured, _, Some(cfg)) => {
+                        info!(
+                            source_sr = sample_rate,
+                            device_default_sr = ?default_sr,
+                            backend = %host_id_name,
+                            endpoint_id = %opened_endpoint_id,
+                            rate_support_measured = rate_evidence.is_measured(),
+                            "local_audio_open_at_source_rate_reported_supported"
+                        );
+                        // macOS: cpal's CoreAudio backend does NOT switch the
+                        // device's hardware nominal rate for output streams (see
+                        // the note above), so opening the cpal stream "at the
+                        // source rate" leaves the DAC clocked at the OS rate and
+                        // CoreAudio silently converts — which yields SILENCE for
+                        // high-rate DSD→PCM (DSD128/256/512 all decode to
+                        // 352.8kHz; only DSD64's 176.4k survived). We reach this
+                        // branch precisely when the device SUPPORTS the source
+                        // rate but its default differs, so set the hardware
+                        // nominal rate explicitly (what the exclusive/hog path
+                        // already does) — the DAC then actually clocks at
+                        // 352.8kHz. Best-effort: if the device can't be
+                        // resolved/set we fall through to today's behavior (no
+                        // regression). Cyrille: iFi Neo iDSD / FiiO K3, DSD128+
+                        // silent.
+                        #[cfg(target_os = "macos")]
                         {
-                            let want = cfg.sample_rate as f64;
-                            match macos_helpers::set_device_sample_rate(dev_id, want) {
-                                Ok(_) => info!(
-                                    device = %device_name,
-                                    to = cfg.sample_rate,
-                                    "local_audio_coreaudio_nominal_rate_set_shared"
-                                ),
-                                Err(e) => warn!(
-                                    error = %e,
-                                    wanted = cfg.sample_rate,
-                                    "local_audio_coreaudio_set_rate_failed"
-                                ),
+                            use coreaudio::audio_unit::macos_helpers;
+                            if let Some(dev_id) =
+                                macos_helpers::get_device_id_from_name(&device_name, false)
+                            {
+                                let want = cfg.sample_rate as f64;
+                                match macos_helpers::set_device_sample_rate(dev_id, want) {
+                                    Ok(_) => info!(
+                                        device = %device_name,
+                                        to = cfg.sample_rate,
+                                        "local_audio_coreaudio_nominal_rate_set_shared"
+                                    ),
+                                    Err(e) => warn!(
+                                        error = %e,
+                                        wanted = cfg.sample_rate,
+                                        "local_audio_coreaudio_set_rate_failed"
+                                    ),
+                                }
                             }
                         }
+                        (cfg, sample_rate, None)
                     }
-                    cfg
-                } else if let Some(cfg) = default_cfg {
-                    // Device does not support the source rate — open at device
-                    // rate, rubato will resample.
-                    info!(
-                        source_sr = sample_rate,
-                        device_sr = cfg.sample_rate,
-                        "local_audio_rate_mismatch_will_resample"
-                    );
-                    cfg
-                } else {
-                    // No default config available — try source rate as last
-                    // resort (PipeWire, etc.).
-                    find_matching_config(&device, channels, sample_rate).unwrap_or(
-                        cpal::StreamConfig {
-                            channels,
-                            sample_rate,
-                            buffer_size: cpal::BufferSize::Default,
+                    // On refuse la cadence de la source : rubato convertit. Une
+                    // décision qui change ce qui part au DAC ne passe jamais en
+                    // silence (#3209, #1655, #3233).
+                    (
+                        LocalRateOpening::ResampleToDeviceRate {
+                            device_sample_rate,
+                            reason,
                         },
-                    )
-                }
+                        Some(cfg),
+                        _,
+                    ) => {
+                        warn!(
+                            source_sr = sample_rate,
+                            device_sr = device_sample_rate,
+                            backend = %host_id_name,
+                            endpoint_id = %opened_endpoint_id,
+                            rate_support_measured = rate_evidence.is_measured(),
+                            reason = reason.code(),
+                            "local_audio_rate_mismatch_will_resample"
+                        );
+                        (cfg, device_sample_rate, Some(reason))
+                    }
+                    // Aucune cadence de périphérique connue : rien vers quoi
+                    // rééchantillonner, on ouvre à la cadence de la source en
+                    // dernier recours (PipeWire, etc.). Les bras `Some(cfg)`
+                    // ci-dessus étant exhaustifs pour `default_cfg = Some(..)`,
+                    // ce bras ne se prend qu'avec `default_cfg = None` — sauf
+                    // `AtSourceRateMeasured` sans `enumerated`, que
+                    // `decide_local_rate_opening` ne peut pas produire.
+                    _ => {
+                        let cfg = find_matching_config(&device, channels, sample_rate).unwrap_or(
+                            cpal::StreamConfig {
+                                channels,
+                                sample_rate,
+                                buffer_size: cpal::BufferSize::Default,
+                            },
+                        );
+                        let opened = cfg.sample_rate;
+                        info!(
+                            source_sr = sample_rate,
+                            opened_sr = opened,
+                            backend = %host_id_name,
+                            endpoint_id = %opened_endpoint_id,
+                            "local_audio_rate_last_resort_no_device_default"
+                        );
+                        (cfg, opened, None)
+                    }
+                };
+                note_rate_decision(ObservedRate {
+                    source_sample_rate: sample_rate,
+                    opened_sample_rate: opened_sr,
+                    reason,
+                    evidence_measured: rate_evidence.is_measured(),
+                });
+                chosen
             };
 
             // Build output stream at the chosen rate.
@@ -8549,6 +8755,103 @@ pub fn sample_rate_evidence_for_device(
     sample_rate_evidence(backend)
 }
 
+/// À quelle cadence le chemin cpal **partagé** doit ouvrir le flux.
+///
+/// #3233 — Pierre M, fil 1043 : « DSD : le temps défile, pas de son ». La
+/// décision se fondait sur `find_matching_config(..).filter(|c| c.sample_rate
+/// == sample_rate)`, un filtre **tautologique** dès que l'énumération est
+/// fabriquée : `find_matching_config` recopie la cadence demandée dans le
+/// `StreamConfig` qu'il rend, donc l'égalité est vraie par construction. Sur
+/// WASAPI, cpal retient les 21 `COMMON_SAMPLE_RATES` sans rien demander à
+/// personne ([`sample_rate_evidence`]) — la branche était TOUJOURS prise, un
+/// DSD64 décodé à 176 400 Hz était ouvert à 176 400 Hz quoi que sache faire
+/// l'endpoint, `needs_resample` restait faux et rubato ne tournait jamais.
+///
+/// **#2862 a rendu la liste honnête ; il n'a pas changé la décision qui s'en
+/// sert.** C'est ce que fait cette fonction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRateOpening {
+    /// Le périphérique **tourne déjà** à la cadence de la source : sa
+    /// configuration par défaut le dit, et celle-là est un fait mesuré sur
+    /// toutes les plateformes (`GetMixFormat` sur WASAPI). Aucune conversion,
+    /// aucune preuve à réclamer.
+    DeviceAlreadyAtSourceRate,
+    /// L'énumération retient la cadence **et** elle est une MESURE (ALSA `hw:`,
+    /// ASIO, CoreAudio) : on ouvre à la cadence de la source, comme avant. Le
+    /// témoin du cas nominal.
+    AtSourceRateMeasured,
+    /// On n'ouvre pas à la cadence de la source : le flux est ouvert à celle du
+    /// périphérique et rubato convertit. La conversion est une DÉCISION, elle
+    /// est journalisée et remontée au client.
+    ResampleToDeviceRate {
+        device_sample_rate: u32,
+        reason: LocalRateFallback,
+    },
+    /// Le périphérique n'annonce **aucune** cadence par défaut (PipeWire,
+    /// énumération muette) : il n'y a rien vers quoi rééchantillonner. On ouvre
+    /// à la cadence de la source en dernier recours — comportement de toujours,
+    /// aucune régression.
+    LastResortSourceRate,
+}
+
+/// La règle, isolée de cpal pour être éprouvée depuis n'importe quelle machine.
+///
+/// L'hôte n'est pas un `cfg!` : il entre par `evidence`, sur le modèle de
+/// [`exclusive_mode_support`] et de [`sample_rate_evidence`]. Une décision
+/// Windows enfermée dans un `cfg!` ne serait pas compilée sur Linux, et le test
+/// qui l'interroge y serait vert pour la mauvaise raison (#1837, #2056).
+///
+/// `enumeration_accepts_source_rate` est ce que répond `find_matching_config`,
+/// filtre compris. Cette réponse n'est plus SUFFISANTE : elle n'est prise au
+/// mot que lorsque `evidence` dit qu'elle a été mesurée. Le drapeau n'est
+/// consulté qu'à défaut de `device_default_rate == Some(source_sample_rate)`,
+/// cas où l'appelant n'a même pas besoin d'énumérer.
+///
+/// **Ce qu'on renonce à faire, et pourquoi.** Sonder réellement l'endpoint
+/// serait le plus juste, mais aucune sonde n'existe sur ce chemin : cpal a
+/// retiré son `IsFormatSupported` en mode partagé (« Checking formats is not
+/// needed for shared mode with auto-conversion »,
+/// `cpal-0.17.3/src/host/wasapi/device.rs:192-200`) et
+/// `build_output_stream` réussit de toute façon, puisque le flux est initialisé
+/// avec `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`. Une sonde par ouverture serait
+/// donc **elle aussi tautologique** — et coûteuse. On retient donc le seul fait
+/// que le périphérique livre vraiment : sa cadence par défaut.
+///
+/// **Ce que ça coûte au bit-perfect.** Rien qui existait. En mode partagé
+/// WASAPI le moteur de Windows reçoit `AUTOCONVERTPCM` et convertit lui-même
+/// vers la cadence du mélangeur : ouvrir « à la cadence source » ne recadençait
+/// pas le DAC, ça déplaçait seulement la conversion chez un convertisseur
+/// opaque, non mesuré, et parfois muet. La conversion revient à rubato (sinc,
+/// paramètres déjà réglés pour 176,4 → 48 kHz), et surtout elle devient
+/// VISIBLE : journal dédié et [`LocalRateStatus`] remonté au client. Le vrai
+/// bit-perfect Windows reste le mode exclusif / ASIO, chemins que cette
+/// fonction ne touche pas.
+pub fn decide_local_rate_opening(
+    source_sample_rate: u32,
+    device_default_rate: Option<u32>,
+    enumeration_accepts_source_rate: bool,
+    evidence: SampleRateEvidence,
+) -> LocalRateOpening {
+    if device_default_rate == Some(source_sample_rate) {
+        return LocalRateOpening::DeviceAlreadyAtSourceRate;
+    }
+    if enumeration_accepts_source_rate && evidence.is_measured() {
+        return LocalRateOpening::AtSourceRateMeasured;
+    }
+    let reason = if enumeration_accepts_source_rate {
+        LocalRateFallback::CapabilitiesUnverified
+    } else {
+        LocalRateFallback::RateNotSupported
+    };
+    match device_default_rate {
+        Some(device_sample_rate) => LocalRateOpening::ResampleToDeviceRate {
+            device_sample_rate,
+            reason,
+        },
+        None => LocalRateOpening::LastResortSourceRate,
+    }
+}
+
 /// Quels chemins de sortie **exclusive** sont réellement COMPILÉS pour une
 /// cible donnée.
 ///
@@ -10165,13 +10468,12 @@ mod tests {
         let appel_indice = ["sample_rate_evidence_for_device(", "host_id_name,"].concat();
         assert!(
             branche.contains(&appel_indice),
-            "cette branche ouvre à la cadence source parce que le périphérique \
-             « la supporte ». Sur WASAPI le filtre est TAUTOLOGIQUE — \
-             find_matching_config recopie la cadence demandée — donc la branche \
-             est toujours prise, needs_resample reste faux et rubato ne tourne \
-             jamais. Elle doit au moins journaliser d'où vient cette \
-             supposition (#2862), et sur ALSA QUEL PCM a dit oui : le « oui » \
-             d'un `dmix:` n'est pas celui du DAC (#1655)"
+            "le site qui décide d'ouvrir à la cadence source doit savoir ce que \
+             vaut le « oui » du périphérique. Sur WASAPI le filtre est \
+             TAUTOLOGIQUE — find_matching_config recopie la cadence demandée — \
+             et sur ALSA le « oui » d'un `dmix:` n'est pas celui du DAC. Sans \
+             cet appel, l'indice n'est ni journalisé (#2862, #1655) ni \
+             consultable par la décision (#3233)"
         );
         let pcm_journalise = ["endpoint_id = %", "opened_endpoint_id,"].concat();
         assert!(
@@ -10179,6 +10481,326 @@ mod tests {
             "sans le nom du PCM ALSA dans le journal, un relevé de terrain ne \
              peut pas dire si Tune a ouvert le matériel ou un \
              rééchantillonneur — c'est la ligne qui manquait à #1655"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3233 — la décision, pas seulement l'indice
+    //
+    // Pierre M (fil forum 1043, 14/07/2026) : « DSD : le temps défile, pas de
+    // son ». Un DSD64 décode à 176 400 Hz. Le chemin partagé ouvrait à cette
+    // cadence dès que `find_matching_config(..).filter(|c| c.sample_rate ==
+    // sample_rate)` répondait — un filtre TAUTOLOGIQUE, puisque
+    // `find_matching_config` recopie la cadence demandée dans le config qu'il
+    // rend. Sur WASAPI, cpal retient les 21 COMMON_SAMPLE_RATES sans rien
+    // demander au pilote, la branche était donc TOUJOURS prise quel que soit le
+    // matériel, `needs_resample` restait faux et rubato ne tournait jamais.
+    //
+    // #2862 avait rendu la LISTE honnête (`sample_rate_evidence`). La DÉCISION
+    // qui s'en sert n'avait pas bougé.
+    //
+    // `decide_local_rate_opening` est PURE et prend la preuve en paramètre :
+    // ces tests contredisent réellement la décision WASAPI depuis Linux, au
+    // lieu d'être verts parce que la branche n'y est pas compilée (#1837,
+    // #2056), et sans le moindre `cfg`.
+    // -----------------------------------------------------------------------
+
+    /// La preuve WASAPI, telle que la machine la calcule vraiment — jamais
+    /// écrite en dur ici, sinon le test répliquerait la règle au lieu de s'y
+    /// confronter.
+    fn preuve_wasapi() -> SampleRateEvidence {
+        sample_rate_evidence_for_device("Wasapi", "", true)
+    }
+
+    /// La preuve ALSA d'un PCM matériel — le cas nominal.
+    fn preuve_alsa_materielle() -> SampleRateEvidence {
+        sample_rate_evidence_for_device("Alsa", "ALSA:hw:CARD=DACZ8,DEV=0", true)
+    }
+
+    /// **Essai 1** — capacités fabriquées, cadence que le matériel ne tient
+    /// pas. Le cas de Pierre M : DSD64 → 176 400 Hz, DAC Windows dont le
+    /// mélangeur tourne à 48 kHz, et une énumération qui dit « oui » à tout.
+    #[test]
+    fn capacites_fabriquees_la_cadence_source_n_est_pas_ouverte_telle_quelle() {
+        let decision = decide_local_rate_opening(176_400, Some(48_000), true, preuve_wasapi());
+        assert_eq!(
+            decision,
+            LocalRateOpening::ResampleToDeviceRate {
+                device_sample_rate: 48_000,
+                reason: LocalRateFallback::CapabilitiesUnverified,
+            },
+            "l'énumération WASAPI est fabriquée : ouvrir à 176 400 Hz sur cette \
+             seule foi, c'est ce qui fait défiler le temps sans un son (#3233). \
+             La décision doit refuser la cadence source ET dire pourquoi"
+        );
+    }
+
+    /// **Essai 2 — LE TÉMOIN.** Capacités mesurées, cadence retenue :
+    /// l'ouverture ne change pas d'un iota. Un correctif qui rééchantillonnerait
+    /// aussi ici serait exactement le défaut que Tune combat.
+    #[test]
+    fn temoin_capacites_mesurees_ouvrent_toujours_a_la_cadence_source() {
+        assert_eq!(
+            decide_local_rate_opening(176_400, Some(48_000), true, preuve_alsa_materielle()),
+            LocalRateOpening::AtSourceRateMeasured,
+            "ALSA interroge le pilote cadence par cadence sur un PCM `hw:` : ce \
+             « oui » est une MESURE, la cadence source doit s'ouvrir telle \
+             quelle comme avant (Cyrille, FiiO K3 / iFi Neo iDSD)"
+        );
+        // La famille entière des hôtes qui mesurent, pas un seul représentant.
+        for hote in ["Alsa", "Asio", "CoreAudio", "Jack"] {
+            assert_eq!(
+                decide_local_rate_opening(
+                    352_800,
+                    Some(44_100),
+                    true,
+                    sample_rate_evidence_for_device(hote, "hw:CARD=X,DEV=0", true),
+                ),
+                LocalRateOpening::AtSourceRateMeasured,
+                "l'hôte « {hote} » interroge le pilote : rien ne doit changer là"
+            );
+        }
+    }
+
+    /// **Essai 3** — capacités fabriquées, mais la cadence est RÉELLEMENT
+    /// tenue : le périphérique y tourne déjà. Ne pas dégrader inutilement.
+    ///
+    /// C'est le seul fait que WASAPI livre vraiment — `GetMixFormat` décrit le
+    /// format que le moteur fait tourner, il n'est pas fabriqué.
+    #[test]
+    fn capacites_fabriquees_mais_cadence_tenue_n_est_pas_degradee() {
+        assert_eq!(
+            decide_local_rate_opening(176_400, Some(176_400), true, preuve_wasapi()),
+            LocalRateOpening::DeviceAlreadyAtSourceRate,
+            "le périphérique TOURNE à 176 400 Hz : lui imposer un aller-retour \
+             par rubato dégraderait sans rien corriger"
+        );
+        // Et même sans le « oui » de l'énumération : le fait prime sur la liste.
+        assert_eq!(
+            decide_local_rate_opening(176_400, Some(176_400), false, preuve_wasapi()),
+            LocalRateOpening::DeviceAlreadyAtSourceRate,
+        );
+    }
+
+    /// Le cas constaté — le périphérique ne retient pas la cadence — garde son
+    /// comportement de toujours, et gagne un motif distinct du précédent.
+    #[test]
+    fn cadence_non_retenue_reste_un_reechantillonnage_mais_nomme() {
+        for preuve in [preuve_wasapi(), preuve_alsa_materielle()] {
+            assert_eq!(
+                decide_local_rate_opening(176_400, Some(48_000), false, preuve),
+                LocalRateOpening::ResampleToDeviceRate {
+                    device_sample_rate: 48_000,
+                    reason: LocalRateFallback::RateNotSupported,
+                },
+                "un refus CONSTATÉ n'est pas une capacité SUPPOSÉE : les deux \
+                 motifs doivent rester distincts sur l'écran de la zone"
+            );
+        }
+    }
+
+    /// Sans cadence de périphérique, il n'y a **rien vers quoi**
+    /// rééchantillonner : refuser la cadence source ne ferait que casser la
+    /// lecture. Le dernier recours ouvre donc à la cadence source, comme avant
+    /// (PipeWire, énumération muette). Aucune régression n'est introduite là —
+    /// et c'est la limite assumée du correctif : quand le périphérique ne dit
+    /// rien du tout, Tune n'a plus aucun fait sur lequel s'appuyer.
+    #[test]
+    fn sans_cadence_de_peripherique_le_dernier_recours_est_inchange() {
+        assert_eq!(
+            decide_local_rate_opening(176_400, None, true, preuve_wasapi()),
+            LocalRateOpening::LastResortSourceRate,
+            "capacités supposées ET aucune cadence connue : dégrader vers rien \
+             n'a pas de sens, on ouvre comme avant"
+        );
+        for enumere in [true, false] {
+            assert_eq!(
+                decide_local_rate_opening(176_400, None, enumere, preuve_wasapi()),
+                LocalRateOpening::LastResortSourceRate,
+            );
+        }
+        assert_eq!(
+            decide_local_rate_opening(176_400, None, false, preuve_alsa_materielle()),
+            LocalRateOpening::LastResortSourceRate,
+        );
+        // Témoin : une énumération MESURÉE qui retient la cadence reste une
+        // ouverture à la cadence source, même sans configuration par défaut —
+        // c'est exactement ce que faisait le code d'avant.
+        assert_eq!(
+            decide_local_rate_opening(176_400, None, true, preuve_alsa_materielle()),
+            LocalRateOpening::AtSourceRateMeasured,
+            "un « oui » mesuré n'a pas besoin d'une cadence par défaut pour \
+             valoir : rien ne doit changer sur ALSA `hw:` / ASIO / CoreAudio"
+        );
+    }
+
+    /// Contre-épreuve PERMANENTE (leçon #1864) : chaque motif déclaré doit être
+    /// réellement PRODUIT par la fonction de décision. Un motif ajouté à
+    /// l'énumération sans être câblé fait tomber ce test.
+    #[test]
+    fn chaque_motif_de_cadence_est_reellement_produit() {
+        let mut produits: Vec<LocalRateFallback> = Vec::new();
+        for source in [44_100u32, 176_400, 352_800] {
+            for defaut in [None, Some(44_100u32), Some(48_000), Some(176_400)] {
+                for enumere in [true, false] {
+                    for preuve in [preuve_wasapi(), preuve_alsa_materielle()] {
+                        if let LocalRateOpening::ResampleToDeviceRate { reason, .. } =
+                            decide_local_rate_opening(source, defaut, enumere, preuve)
+                        {
+                            produits.push(reason);
+                        }
+                    }
+                }
+            }
+        }
+        for motif in LocalRateFallback::ALL {
+            assert!(
+                produits.contains(&motif),
+                "le motif {motif:?} est déclaré mais AUCUN chemin de décision ne \
+                 le construit — il ne gardera jamais rien"
+            );
+        }
+    }
+
+    /// Les motifs sont ce que le client reçoit et traduit : codes distincts,
+    /// en `snake_case`, et un texte qui dit ce qui a changé pour le son.
+    #[test]
+    fn tous_les_motifs_de_cadence_ont_un_code_et_un_texte_utilisables() {
+        let mut codes: Vec<&str> = Vec::new();
+        for motif in LocalRateFallback::ALL {
+            let code = motif.code();
+            assert!(
+                !code.is_empty()
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                "code « {code} » inutilisable comme clef de traduction"
+            );
+            assert!(!codes.contains(&code), "code « {code} » en double");
+            codes.push(code);
+            assert!(
+                motif.detail().len() > 20,
+                "le motif {motif:?} doit expliquer ce qui change pour le son"
+            );
+        }
+    }
+
+    /// Ce que la zone REÇOIT : la cadence ouverte à côté de celle de la source.
+    /// Sans ce champ, Pierre M lit « DSD64 » pendant que Tune convertit, et il
+    /// faut ses journaux pour le savoir.
+    #[test]
+    fn le_statut_de_zone_porte_la_cadence_reellement_ouverte() {
+        let degrade = backend_status_with_rate(
+            None,
+            None,
+            Some(ObservedRate {
+                source_sample_rate: 176_400,
+                opened_sample_rate: 48_000,
+                reason: Some(LocalRateFallback::CapabilitiesUnverified),
+                evidence_measured: false,
+            }),
+            "auto",
+        );
+        let rate = degrade.rate.expect("la cadence observée doit être publiée");
+        assert!(rate.resampled, "176 400 → 48 000 est une conversion");
+        assert_eq!(rate.reason, Some(LocalRateFallback::CapabilitiesUnverified));
+        assert_eq!(
+            rate.detail,
+            Some(LocalRateFallback::CapabilitiesUnverified.detail()),
+            "l'écran sans table de traduction doit avoir la phrase"
+        );
+        assert!(!rate.evidence_measured);
+        let json = serde_json::to_value(&degrade).expect("LocalBackendStatus sérialisable");
+        assert_eq!(json["rate"]["resampled"], serde_json::json!(true));
+        assert_eq!(
+            json["rate"]["reason"],
+            serde_json::json!("capabilities_unverified"),
+            "le code doit partir en snake_case, comme fallback_reason : {json}"
+        );
+
+        // Témoin : une ouverture à la cadence source ne signale aucun écart.
+        let intact = backend_status_with_rate(
+            None,
+            None,
+            Some(ObservedRate {
+                source_sample_rate: 176_400,
+                opened_sample_rate: 176_400,
+                reason: None,
+                evidence_measured: true,
+            }),
+            "auto",
+        );
+        let rate = intact.rate.expect("la cadence observée doit être publiée");
+        assert!(!rate.resampled);
+        assert_eq!(rate.reason, None);
+        assert_eq!(rate.detail, None);
+
+        // Rien n'a encore joué : le champ existe et vaut `null`, ce qui est la
+        // seule réponse honnête — comme `device` (#2207).
+        assert!(
+            backend_status_with_rate(None, None, None, "auto")
+                .rate
+                .is_none()
+        );
+    }
+
+    /// GARDE DE SITE — la fonction peut être parfaite et n'être appelée nulle
+    /// part, ou être court-circuitée par le filtre d'origine remis devant elle.
+    /// Ce test relit la PRODUCTION (idiome du dépôt : `terminologie_eq.rs`,
+    /// `position_publiee_guard`), parce qu'aucun test d'unité ne peut attraper
+    /// ça : `decide_local_rate_opening` resterait verte pendant que le chemin
+    /// réel l'ignore.
+    ///
+    /// Les aiguilles sont assemblées à l'exécution : écrites en clair, elles
+    /// figureraient dans ce fichier et le test serait vert grâce à sa propre
+    /// source.
+    #[test]
+    fn la_decision_de_cadence_est_branchee_sur_le_chemin_reel() {
+        // Source normalisée : on retire tous les blancs, pour que la garde
+        // survive à un passage de rustfmt qui recasserait les lignes — même
+        // idiome que `les_quatre_charges_utiles_de_zone_appellent_le_contrat`.
+        let source: String = include_str!("local.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        // L'APPEL de production, avec ses arguments : la signature seule ne
+        // prouverait rien, et un appel de test non plus.
+        let appel_reel = [
+            "decide_local_rate_opening(sample_rate,default_sr,",
+            "enumerated.is_some(),rate_evidence,)",
+        ]
+        .concat();
+        assert!(
+            source.contains(&appel_reel),
+            "le chemin cpal partagé doit passer par `decide_local_rate_opening` \
+             en lui donnant la cadence de la source, celle du périphérique, la \
+             réponse de l'énumération ET la preuve qui dit ce qu'elle vaut. \
+             Sans la preuve, la décision redit oui à une liste fabriquée \
+             (#3233, Pierre M, fil 1043)"
+        );
+
+        // Le retour en arrière EXACT : réutiliser le résultat du filtre comme
+        // CONDITION d'ouverture, au lieu de le passer à la décision.
+        let court_circuit = [
+            "}elseifletSome(cfg)=find_matching_config(&device,channels,sample_rate)",
+            ".filter(|c|c.sample_rate==sample_rate)",
+        ]
+        .concat();
+        assert!(
+            !source.contains(&court_circuit),
+            "le filtre tautologique est redevenu la CONDITION d'ouverture : \
+             `find_matching_config` recopie la cadence demandée dans le config \
+             qu'il rend, donc sur WASAPI la branche est prise quel que soit le \
+             matériel, `needs_resample` reste faux et rubato ne tourne jamais"
+        );
+
+        // La conversion décidée doit être remontée, pas seulement journalisée.
+        assert!(
+            source.contains("note_rate_decision(ObservedRate{"),
+            "une décision qui change ce qui part au DAC doit atteindre le \
+             client : sans `note_rate_decision`, il ne reste que le journal — \
+             c'est exactement ce qui a coûté #1395 et #2207"
         );
     }
 
