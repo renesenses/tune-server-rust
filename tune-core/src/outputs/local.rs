@@ -3618,6 +3618,68 @@ fn record_exclusive_open_failure(
     }
 }
 
+/// Pourquoi le chemin cpal PARTAGÉ n'a ouvert aucun périphérique.
+///
+/// `find_device_with_fallback` ne rend `None` que dans UN cas : le
+/// périphérique réglé sur la zone est introuvable ET l'hôte n'expose aucune
+/// sortie par défaut sur laquelle se rabattre — c'est
+/// `audio_device_not_found_no_default_available`, la seule des quatre issues
+/// de cette fonction qui n'ouvre rien. Dès qu'un repli existe on passe par
+/// `audio_device_not_found_falling_back_to_default` et la lecture continue.
+///
+/// Les deux consommateurs de ce `None` — le flux WAV, donc la bibliothèque
+/// locale, et le flux compressé décodé — s'arrêtaient sans rien dire, alors
+/// que le MÊME refus sur les chemins EXCLUSIFS est nommé depuis toujours par
+/// [`record_exclusive_open_failure`]. C'était une incohérence, pas un manque,
+/// et elle portait sur le chemin le plus emprunté de tous.
+///
+/// Passe par `failure_slot`, c'est-à-dire par `take_output_failure()` : le
+/// canal que le poller draine à chaque tick pour émettre `zone.playback_error`
+/// avec `fatal: true`. Aucun second canal n'est ouvert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedDeviceResolution {
+    /// Chemin WAV/PCM — celui de la bibliothèque locale.
+    WavStreamNotFound,
+    /// Chemin compressé, décodé par symphonia puis rendu en cpal partagé.
+    CompressedStreamNotFound,
+}
+
+impl SharedDeviceResolution {
+    /// Les deux évènements historiques sont CONSERVÉS tels quels : un journal
+    /// déjà récolté sur le terrain continue de les trouver.
+    fn log_event(self) -> &'static str {
+        match self {
+            Self::WavStreamNotFound => "audio_device_not_found_no_fallback",
+            Self::CompressedStreamNotFound => "audio_device_not_found_compressed",
+        }
+    }
+
+    fn user_message(self, device: &str) -> String {
+        let flux = match self {
+            Self::WavStreamNotFound => "le flux PCM",
+            Self::CompressedStreamNotFound => "le flux décodé",
+        };
+        format!(
+            "Sortie « {device} » : le périphérique est introuvable et le système n'expose aucune sortie par défaut sur laquelle se rabattre ; {flux} n'a été envoyé nulle part. Rebranchez le périphérique ou choisissez une autre sortie pour cette zone"
+        )
+    }
+}
+
+fn record_shared_device_not_found(
+    error: SharedDeviceResolution,
+    requested_device: &str,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        requested = %requested_device,
+        refusal_event = error.log_event(),
+        "shared_device_not_found_without_fallback"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(error.user_message(requested_device));
+    }
+}
+
 /// Le périphérique s'est OUVERT puis a cessé de tirer l'audio : dire lequel,
 /// et où la lecture s'est arrêtée.
 ///
@@ -4806,7 +4868,11 @@ impl OutputTarget for LocalOutput {
                     endpoint_id.as_deref(),
                     origin_host.as_deref(),
                 ) else {
-                    warn!(name = %device_name, "audio_device_not_found_compressed");
+                    record_shared_device_not_found(
+                        SharedDeviceResolution::CompressedStreamNotFound,
+                        &device_name,
+                        &open_failure,
+                    );
                     playing.store(false, Ordering::SeqCst);
                     return;
                 };
@@ -6321,9 +6387,10 @@ impl OutputTarget for LocalOutput {
                 endpoint_id.as_deref(),
                 origin_host.as_deref(),
             ) else {
-                warn!(
-                    requested = %device_name,
-                    "audio_device_not_found_no_fallback"
+                record_shared_device_not_found(
+                    SharedDeviceResolution::WavStreamNotFound,
+                    &device_name,
+                    &open_failure,
                 );
                 playing.store(false, Ordering::SeqCst);
                 return;

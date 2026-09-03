@@ -107,6 +107,8 @@ mod radios_validation_url;
 mod rbac;
 #[path = "recherche_totaux_i3189.rs"]
 mod recherche_totaux_i3189;
+#[path = "refus_de_peripherique_partage_dit_pourquoi.rs"]
+mod refus_de_peripherique_partage_dit_pourquoi;
 #[path = "reidentification_album.rs"]
 mod reidentification_album;
 #[path = "reprise_position_au_demarrage.rs"]
