@@ -415,8 +415,41 @@ impl OutputTarget for Airplay2Output {
             .store(media.duration_ms.unwrap_or(0), Ordering::SeqCst);
         self.position_ms.store(0, Ordering::SeqCst);
 
-        // The daemon plays from a file path or URL
-        let path = media.file_path.unwrap_or(media.url);
+        // AirPlay 2 lit le flux que le SERVEUR a decide d'envoyer, jamais le
+        // fichier d'origine.
+        //
+        // `media.file_path` porte `tracks.file_path` — le fichier brut de la
+        // bibliotheque. L'orchestrateur le renseigne pour TOUTE piste locale
+        // (`local_file_path`, orchestrator.rs) sans regarder la sortie : c'est
+        // une commodite pour les sorties qui savent lire un fichier
+        // elles-memes (OAAT), pas une instruction de lecture.
+        //
+        // Le preferer jetait tout le traitement serveur. Car ce traitement est
+        // bel et bien produit pour une zone AirPlay 2 :
+        // `pull_output_needs_dsp_transcode` (orchestrator.rs) est une liste
+        // NEGATIVE — ni locale, ni OAAT, ni pousseuse d'URI, ni navigateur —
+        // et `airplay2` y tombe. Des qu'un egaliseur, une correction de piece
+        // ou un ReplayGain sont armes sur la zone, `eq_forces_transcode` vaut
+        // donc vrai : le serveur decode, filtre, gaine, reencode vers un
+        // temporaire, ouvre une session et en publie l'adresse dans
+        // `media.url` — en sautant meme le cache de transcodage, puisque l'EQ
+        // n'entre pas dans sa clef. Cette ligne ignorait tout cela et rejouait
+        // le fichier d'origine.
+        //
+        // Ecran « egaliseur actif », zero effet audible : exactement #1216
+        // (Beoplay A9), une quatrieme fois apres les zones navigateur et les
+        // sorties PULL type Diretta.
+        //
+        // Le daemon recoit deja une adresse HTTP sur toute source NON locale —
+        // Qobuz, Tidal, radio, podcast, Bandcamp, televersement — ou
+        // `file_path` vaut None. Lui en donner une pour une piste locale ne
+        // lui demande donc rien de nouveau, et aligne AirPlay 2 sur les autres
+        // sorties POUSSEES du depot — DLNA, OpenHome, Chromecast, BluOS,
+        // Squeezebox, Slimproto, AirPlay 1, HQPlayer, pont — qui ne lisent
+        // toutes que `media.url`. Seul OAAT lit encore le fichier lui-meme,
+        // et c'est assume : il le fait derriere ses propres gardes
+        // (`prefers_local_file_gapless`, en-tete WAV ou `.dsf` natif).
+        let path = media.url;
         self.send(&serde_json::json!({
             "cmd": "play",
             "path": path,
@@ -674,6 +707,100 @@ mod transport_tests {
             title: Some("Fixture"),
             ..Default::default()
         }
+    }
+
+    /// Un faux daemon qui note la charge JSON ENTIERE, pas seulement le nom.
+    ///
+    /// `install_fake_daemon` ne retient que `cmd` : il ne peut donc rien dire
+    /// du `path`, qui est precisement ce que la garde ci-dessous mesure.
+    async fn daemon_qui_note_les_charges(
+        output: &Airplay2Output,
+    ) -> Arc<Mutex<Vec<serde_json::Value>>> {
+        let (server_stdin, daemon_stdin) = tokio::io::duplex(4096);
+        let (mut daemon_stdout, server_stdout) = tokio::io::duplex(4096);
+
+        *output.process.lock().await = Some(DaemonProcess {
+            child: None,
+            stdin: Box::new(server_stdin),
+        });
+        output.start_event_reader(BufReader::new(server_stdout));
+
+        let charges = Arc::new(Mutex::new(Vec::new()));
+        let notees = charges.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(daemon_stdin).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                notees.lock().await.push(command.clone());
+                let event = serde_json::json!({"event": "playing"});
+                let line = format!("{}\n", serde_json::to_string(&event).unwrap());
+                daemon_stdout.write_all(line.as_bytes()).await.unwrap();
+            }
+        });
+
+        charges
+    }
+
+    /// AirPlay 2 envoie l'ADRESSE DU FLUX, jamais le fichier d'origine (#1216).
+    ///
+    /// Le defaut : `let path = media.file_path.unwrap_or(media.url)`. Comme
+    /// l'orchestrateur renseigne `file_path` pour toute piste locale, le
+    /// daemon recevait le fichier brut — et le fichier transcode que le
+    /// serveur venait d'egaliser, de convoluer ou de gainer partait a la
+    /// poubelle sans avoir ete lu.
+    ///
+    /// Ce test met les deux valeurs en opposition frontale : `url` est
+    /// l'adresse de la session, `file_path` le fichier d'origine. Si la ligne
+    /// repasse au fichier, l'assertion tombe.
+    #[tokio::test]
+    async fn play_media_envoie_l_adresse_du_flux_et_pas_le_fichier_d_origine() {
+        let output = output_for_test();
+        let charges = daemon_qui_note_les_charges(&output).await;
+
+        const FLUX: &str = "http://192.0.2.10:8080/stream/sess-airplay-eq.flac";
+        const ORIGINE: &str = "/srv/musique/album/piste-egalisee.flac";
+
+        output
+            .play_media(&PlayMedia {
+                url: FLUX,
+                mime_type: "audio/flac",
+                title: Some("Fixture"),
+                // Renseigne, exactement comme le fait l'orchestrateur pour
+                // toute piste locale.
+                file_path: Some(ORIGINE),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // `play_media` n'attend AUCUNE confirmation : il ecrit sur le tube et
+        // rend la main aussitot — contrairement a `pause`/`resume`, qui
+        // passent par `send_transport_command` et bloquent sur un oneshot. La
+        // garde doit donc laisser au faux daemon le temps de noter la ligne,
+        // sans jamais dormir plus longtemps qu'il ne faut.
+        let mut play = None;
+        for _ in 0..200 {
+            play = charges
+                .lock()
+                .await
+                .iter()
+                .find(|c| c["cmd"] == "play")
+                .cloned();
+            if play.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let play = play.expect("aucune commande play envoyee au daemon");
+
+        assert_eq!(
+            play["path"], FLUX,
+            "AirPlay 2 doit jouer l'adresse du flux servi par le serveur"
+        );
+        assert_ne!(
+            play["path"], ORIGINE,
+            "AirPlay 2 a rejoue le fichier d'origine : tout le DSP est jete (#1216)"
+        );
     }
 
     #[tokio::test]
