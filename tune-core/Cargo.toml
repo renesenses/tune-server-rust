@@ -219,6 +219,17 @@ postgres = ["dep:sqlx"]
 # untouched. The onnxruntime shared lib + model are provided at runtime.
 audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
 
+# #3248 : sur PostgreSQL, un INSERT conditionnel qui n'ecrit rien annulait la
+# transaction entiere, et la branche `returning` rendait `Ok(1)` en dur.
+# `autotests = false` ci-dessus — sans cette cible le fichier ne serait JAMAIS
+# compile, et la porte rendrait un vert contre rien. La garde de site et la
+# contre-epreuve SQLite s executent SANS base ; les trois epreuves PostgreSQL
+# demandent `TUNE_TEST_PG_URL` (absente = saut annonce, posee mais injoignable
+# = echec).
+[[test]]
+name = "pg_insert_conditionnel_f7c250"
+path = "tests/pg_insert_conditionnel_f7c250.rs"
+
 # #3205 : compteur de famine de l'anneau audio. `autotests = false` ci-dessus —
 # sans cette cible le fichier ne serait JAMAIS compile, et la porte rendrait un
 # vert contre rien.

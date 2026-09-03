@@ -754,8 +754,16 @@ impl DbTxHandle for SqliteTxHandle<'_> {
 /// last_insert_rowid(), but every Tune INSERT that needs the new PK
 /// goes through `RETURNING id` (added by `dialect.returning_id_clause`).
 /// The impl detects `RETURNING id` in the SQL and routes through
-/// `fetch_one` to capture the id into an internal mutex, exposed via
+/// `fetch_all` to capture the id into an internal mutex, exposed via
 /// `last_insert_rowid()`.
+///
+/// `fetch_all` et non `fetch_one` (#3248) : la détection est SYNTAXIQUE et
+/// n'exclut qu'`ON CONFLICT`, si bien qu'un `INSERT … SELECT … WHERE NOT
+/// EXISTS` reçoit lui aussi son `RETURNING id`. Quand sa garde mord, il
+/// n'écrit rien et ne rend aucune ligne : `fetch_one` en ferait une erreur
+/// qui annulerait la transaction entière. Le compte rendu est le nombre de
+/// lignes rendues par `RETURNING`, donc le vrai nombre de lignes écrites —
+/// même contrat que `rows_affected()` sur SQLite.
 #[cfg(feature = "postgres")]
 pub struct PostgresBackend {
     pool: sqlx::PgPool,
@@ -931,12 +939,34 @@ impl DbBackend for PostgresBackend {
                     for v in &owned {
                         q = bind_sqlvalue_scalar(q, v);
                     }
-                    let id = q
-                        .fetch_one(&pool)
+                    // `fetch_all`, jamais `fetch_one` (#3248) : `RETURNING id`
+                    // est AJOUTÉ à tout INSERT nu, y compris à ceux dont
+                    // l'écriture est conditionnelle
+                    // (`INSERT … SELECT … WHERE NOT EXISTS`). Zéro ligne
+                    // écrite est un résultat LÉGITIME ; `fetch_one` en fait
+                    // une `RowNotFound`, l'erreur remonte, et dans une
+                    // transaction elle annule TOUT — c'est ce qui vidait la
+                    // file d'attente entière pour un seul identifiant de
+                    // piste manquant.
+                    //
+                    // Le nombre rendu est celui des lignes RÉELLEMENT
+                    // écrites, comme `rows_affected()` sur SQLite : 0 quand
+                    // la garde a mordu, N pour un `INSERT … SELECT`
+                    // multi-lignes. L'ancien `Ok(1)` en dur mentait sur les
+                    // deux bords.
+                    let ids = q
+                        .fetch_all(&pool)
                         .await
                         .map_err(|e| format!("pg execute (returning): {e}"))?;
-                    *last_id_handle.lock().unwrap() = id;
-                    Ok(1)
+                    // Aucune ligne écrite ⇒ `last_insert_rowid` CONSERVE sa
+                    // valeur précédente, comme sur SQLite (où un INSERT sans
+                    // effet ne touche pas `last_insert_rowid()`) et comme
+                    // déjà ici quand l'INSERT n'est pas détecté. L'écraser
+                    // par 0 fabriquerait un identifiant qui n'existe pas.
+                    if let Some(&id) = ids.last() {
+                        *last_id_handle.lock().unwrap() = id;
+                    }
+                    Ok(ids.len())
                 } else {
                     let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
                     for v in &owned {
@@ -1099,12 +1129,20 @@ impl DbTxHandle for PgTxHandle<'_> {
                     for v in &owned {
                         q = bind_sqlvalue_scalar(q, v);
                     }
-                    let id = q
-                        .fetch_one(&mut **tx_guard)
+                    // Même correctif que `PostgresBackend::execute` (#3248),
+                    // et c'est ICI qu'il compte le plus : dans une
+                    // transaction, la `RowNotFound` d'un `fetch_one` sur un
+                    // INSERT conditionnel qui n'écrit rien remonte jusqu'à
+                    // `write_tx`, qui ROLLBACK — les écritures déjà faites
+                    // dans la même transaction sont perdues.
+                    let ids = q
+                        .fetch_all(&mut **tx_guard)
                         .await
                         .map_err(|e| format!("pg tx execute (returning): {e}"))?;
-                    *last_id_handle.lock().unwrap() = id;
-                    Ok(1)
+                    if let Some(&id) = ids.last() {
+                        *last_id_handle.lock().unwrap() = id;
+                    }
+                    Ok(ids.len())
                 } else {
                     let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
                     for v in &owned {
