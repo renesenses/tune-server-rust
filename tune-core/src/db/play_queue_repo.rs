@@ -565,15 +565,22 @@ impl PlayQueueRepo {
         // rescan concurrent de transformer une ligne disparue en remplacement
         // annulé.
         //
-        // ⚠️ Elle ne peut PLUS rendre zéro ligne en régime normal, et c'est
-        // volontaire : sur PostgreSQL, `PgTxHandle::execute` ajoute
-        // « RETURNING id » à tout INSERT nu puis appelle `fetch_one`
+        // ⚠️ Elle PEUT de nouveau rendre zéro ligne, et c'est désormais sans
+        // danger. Historique, à ne pas reperdre : `PgTxHandle::execute` ajoute
+        // « RETURNING id » à tout INSERT nu, puis appelait `fetch_one`
         // (backend.rs). Une insertion gardée qui n'écrit rien n'y rend aucune
-        // ligne : `fetch_one` échoue et annule TOUTE la transaction — la garde
-        // censée sauver la file la vidait entièrement sur PG. Pré-filtrer supprime
-        // ce déclencheur. (Ce `Ok(1)` inconditionnel du chemin « returning » rend
-        // aussi le nombre de lignes affectées INUTILISABLE comme compteur sur PG :
-        // c'est pourquoi on compte nous-mêmes, et pas depuis `execute`.)
+        // ligne : `fetch_one` échouait et annulait TOUTE la transaction — la
+        // garde censée sauver la file la vidait entièrement sur PG. #3231
+        // (PR #3247) a retiré le DÉCLENCHEUR en pré-filtrant ici ; #3248 a
+        // retiré le DÉFAUT en passant `execute` à `fetch_all`, qui rend le vrai
+        // nombre de lignes. Zéro ligne est maintenant un `Ok(0)` ordinaire.
+        //
+        // C'est pourquoi le compteur ci-dessous suit le nombre de lignes RENDU
+        // PAR `execute` et non l'indice de boucle : c'est la seule valeur qui
+        // dit la vérité sur les DEUX moteurs. Un `+= 1` inconditionnel
+        // compterait une ligne fantôme quand la garde mord (course avec un
+        // rescan concurrent), creusant un trou dans `position` et pouvant
+        // laisser la file sans aucune ligne courante.
         let insert_sql = format!(
             "INSERT INTO queue_items (zone_id, track_id, position, is_current, source) \
              SELECT {}, {}, {}, {}, 'local' WHERE EXISTS (SELECT 1 FROM tracks WHERE id = {})",
@@ -608,8 +615,16 @@ impl PlayQueueRepo {
                 let pos = outcome.inserted as i64;
                 let is_current = if outcome.inserted == 0 { 1i64 } else { 0i64 };
                 let p: [&dyn ToSqlValue; 5] = [&zone_id, tid, &pos, &is_current, tid];
-                tx.execute(&insert_sql, &p)?;
-                outcome.inserted += 1;
+                // #3248 — compter les lignes RÉELLEMENT écrites. Zéro ligne
+                // signifie que la piste a disparu entre le pré-filtre et
+                // l'INSERT : c'est une perte, elle se déclare dans `skipped`
+                // pour que `has_loss()` la voie, et `position` reste dense.
+                let ecrites = tx.execute(&insert_sql, &p)?;
+                if ecrites == 0 {
+                    outcome.skipped.push(*tid);
+                    continue;
+                }
+                outcome.inserted += ecrites;
             }
             Ok(())
         })?;
