@@ -255,3 +255,16 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_3181_sections_accueil -- --nocapture --test-threads=1
+
+      # #3182 — le rapport de diagnostic mentait sur son propre moteur.
+      #
+      # C'est la seule etape qui puisse le voir : la contre-epreuve SQLite du
+      # meme fichier tourne dans `ci.yml`, mais sur SQLite le rapport disait
+      # « sqlite » AVANT comme APRES la correction. Sans une vraie base
+      # PostgreSQL, les deux suppositions — le litteral `- Engine: sqlite` et
+      # le `else { 0 }` de la version de schema — restent invisibles a toutes
+      # les portes.
+      - name: Moteur annoncé dans le rapport de diagnostic (#3182)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_3182_moteur_annonce_dans_le_rapport -- --nocapture --test-threads=1

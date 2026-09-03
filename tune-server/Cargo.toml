@@ -225,3 +225,17 @@ path = "tests/base_unique_lancement_i3185.rs"
 [[test]]
 name = "migration_windows_annexes_sqlite"
 path = "tests/migration_windows_annexes_sqlite.rs"
+
+# #3182 : le rapport de diagnostic se declarait « sqlite » sur toute
+# installation PostgreSQL, et « Migration version: 0 » sur une base de 77 291
+# pistes. `autotests = false` plus haut — sans cette cible, le fichier ne
+# serait jamais compile, donc vert contre rien.
+#
+# PAS de `required-features`, contrairement a `pg_routes_serveur` et
+# `pg_3181_sections_accueil` : la contre-epreuve SQLite de ce fichier ne
+# demande aucune base externe, et doit tourner dans le `cargo test --workspace`
+# ordinaire — sinon reparer PostgreSQL en cassant SQLite passerait toutes les
+# portes. Seule l'epreuve PostgreSQL porte `#[cfg(feature = "postgres")]`.
+[[test]]
+name = "pg_3182_moteur_annonce_dans_le_rapport"
+path = "tests/pg_3182_moteur_annonce_dans_le_rapport.rs"
