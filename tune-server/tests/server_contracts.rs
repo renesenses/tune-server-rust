@@ -43,6 +43,8 @@ mod contexte_de_session;
 mod credits_enrichissement_statut;
 #[path = "crossfeed_dit_son_indisponibilite.rs"]
 mod crossfeed_dit_son_indisponibilite;
+#[path = "echec_de_decodage_dit_pourquoi_i3270.rs"]
+mod echec_de_decodage_dit_pourquoi_i3270;
 #[path = "enrich_artiste_langue_entete.rs"]
 mod enrich_artiste_langue_entete;
 #[path = "enrichissement_repertoire.rs"]
