@@ -170,7 +170,9 @@ pub(super) async fn admin_health(State(state): State<AppState>) -> Json<Value> {
         "database": {
             "tracks": tracks,
             "albums": albums,
-            "engine": "sqlite",
+            // #3182 : troisième copie du même « sqlite » en dur. Le moteur se
+            // lit sur le backend actif, jamais sur une constante.
+            "engine": state.backend.engine().as_str(),
         },
         "playback": {
             "zones_total": zone_count,
