@@ -675,6 +675,26 @@ jobs:
     # desormais.
     steps:
       - uses: actions/checkout@v4
+      # `actions-rust-lang/audit@v1` installe l'outil par
+      # `cargo +stable install cargo-audit --vers 0.22.0 --no-default-features`,
+      # SANS `--locked` : cargo resout donc les dependances de cargo-audit a
+      # neuf, a chaque run. Le 03/09/2026 il a attrape `tinyvec 1.13.0`, publie
+      # le jour meme et casse (`cannot find macro `vec` in this scope`,
+      # tinyvec.rs:710) — et TOUTES les PR du depot sont parties rouges.
+      #
+      # Ce n'etait pas un avis de securite : c'est l'OUTIL qui ne se compilait
+      # plus. La porte reste donc bloquante pour ce qu'elle doit bloquer, et on
+      # retire seulement sa dependance a l'etat de crates.io a l'instant T.
+      #
+      # `--locked` fait lire a cargo le Cargo.lock livre avec cargo-audit
+      # 0.22.0, donc les versions figees a SA publication. L'installation qui
+      # suit dans l'action voit alors le binaire deja present a la meme version
+      # et sort en 0 sans rien reconstruire.
+      #
+      # La version et `--no-default-features` reproduisent EXACTEMENT la ligne
+      # de l'action : si elle change, celle-ci doit suivre.
+      - name: Installer cargo-audit avec son propre verrou
+        run: cargo install cargo-audit --version 0.22.0 --locked --no-default-features
       - uses: actions-rust-lang/audit@v1
         with:
           denyWarnings: true
