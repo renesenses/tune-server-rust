@@ -197,7 +197,51 @@ jobs:
       # par ce lot. Sans elles ici, le decoupage aurait retire du code de la
       # porte au lieu de l'y garder — la liste est un inventaire, pas un
       # echantillon (cf #2865).
-      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay
+      #
+      # `bandcamp` : meme motif que `local-audio` cote clippy (#2865).
+      # `tune-server/tests/bandcamp_file_de_zone_i2702.rs`
+      # vit derriere `#![cfg(feature = "bandcamp")]` parce que la caisse
+      # `tune-bandcamp` est une dependance OPTIONNELLE
+      # (`bandcamp = ["dep:tune-bandcamp"]`) : sans la fonctionnalite, ni le
+      # service ni son inscription dans `state.rs` n'existent. La retirer
+      # d'ici ne rendrait pas ces cinq essais rouges — elle les rendrait
+      # INVISIBLES, et #2702/#2778 redeviendraient verts contre rien. Ils ne
+      # tourneraient alors que dans `test-shipped-features`, differe jusqu'a
+      # `full`, donc JAMAIS sur une PR vers `batch/*`.
+      #
+      # La fonctionnalite est dans le `default` de `tune-server` et dans TOUS
+      # les binaires publies ; c'est `--no-default-features` qui la retirait
+      # ici. Elle ne tire aucune caisse audio ni systeme
+      # (`plugins/tune-bandcamp/Cargo.toml` : axum, serde, reqwest, tokio,
+      # tracing) : rien de plus a installer sur ce runner.
+      #
+      # Garde : `le_job_test_de_la_ci_active_bandcamp`
+      # (tune-server/tests/workflows_bornes.rs).
+      #
+      # #3266 — les SEPT paquets ci-dessus etaient les seuls que la CI
+      # EXECUTAIT. Un membre du workspace qu'aucun `-p` ne nomme n'est jamais
+      # lance : ses tests ne peuvent ni passer ni echouer. Recense le
+      # 03/09/2026 sur les trois workflows qui lancent `cargo test`
+      # (`ci.yml`, `test-postgres.yml`, `widget-ci.yml` — ce dernier tourne
+      # dans un AUTRE workspace) : `tune-bandcamp` (47 essais, dont les DEUX
+      # gardes de site de #2778, qui ne pouvaient donc pas crier),
+      # `tune-plugin-runtime-wasm` (8), `tune-ffi` (3), `tune-karaoke` (3)
+      # n'etaient nommes NULLE PART. Verts sous `cargo test --workspace`, que
+      # personne ne joue.
+      #
+      # `tune-cli`, `tune-dj` et `tune-concerts` sont nommes ici SANS avoir de
+      # test aujourd'hui : c'est la place qui manquait, pas les essais. Le
+      # premier `#[test]` qu'on y ecrira tournera des sa PR au lieu d'attendre
+      # qu'on repense a elargir la porte.
+      #
+      # Aucune de ces caisses ne tire de dependance audio ni systeme (axum,
+      # serde, reqwest, tokio, tracing, clap, wasmtime) : rien de plus a
+      # installer sur ce runner.
+      #
+      # Garde : `tout_membre_du_workspace_est_execute_par_une_porte_cargo_test`
+      # (tune-server/tests/workflows_bornes.rs) relit `members` du Cargo.toml
+      # racine et tombe des qu'un membre n'est nomme par aucune porte.
+      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge -p tune-cli -p tune-ffi -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,cloud-relay,bandcamp
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -234,7 +278,15 @@ jobs:
           done
           echo "::error::apt injoignable apres 3 essais"
           exit 1
-      - run: cargo test --no-fail-fast -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
+      # #3266 — les quatre greffons in-tree et le moteur WASM sont deja
+      # COMPILES ici, tires par `dj,karaoke,bandcamp,concerts,plugins-wasm` en
+      # tant que dependances optionnelles de `tune-server`. Ce qui manquait,
+      # c'est de les SELECTIONNER : sans `-p`, cargo construit leur `lib` et ne
+      # construit jamais leur binaire de test. Les nommer ici ne rajoute donc
+      # aucune dependance a compiler — seulement les harnais — et fait tourner
+      # leurs essais avec le jeu de fonctionnalites LIVRE, en plus du jeu
+      # reduit du job `test`.
+      - run: cargo test --no-fail-fast -p tune-server -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This

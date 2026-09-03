@@ -346,6 +346,25 @@ impl AppState {
         services.register(Box::new(
             tune_core::streaming::youtube::YouTubeService::new(),
         ));
+        // 🔴 #2702 / #2778 — Bandcamp n'était NULLE PART dans ce registre.
+        // Les deux seules routes qui construisent une file complète
+        // (`POST /zones/{id}/play` avec `streaming_album_id` ou
+        // `streaming_playlist_id`) commencent par `registry.get(source)` et
+        // répondaient donc `400 unknown service: bandcamp` : il ne restait que
+        // le chemin « piste distante seule », qui pose une file d'exactement
+        // UNE piste — d'où « les morceaux ne s'enchaînent pas » (Sevy Tabroc).
+        //
+        // L'inscription est INCONDITIONNELLE, comme les cinq autres, et non
+        // gardée par l'état du greffon : `ServiceRegistry::get` ne consulte
+        // jamais `enabled`, et le service rend `enabled() == false` tant que
+        // personne ne l'a activé — il apparaît donc comme disponible et non
+        // connecté, exactement comme le greffon opt-in dont il est la seconde
+        // face. La LECTURE, elle, ne change pas de chemin : `resolve_stream`
+        // route toujours `source == "bandcamp"` vers `resolve_direct_url`.
+        #[cfg(feature = "bandcamp")]
+        services.register(Box::new(tune_bandcamp::BandcampService::new(
+            backend.clone(),
+        )));
 
         let services = Arc::new(Mutex::new(services));
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
@@ -446,9 +465,14 @@ impl AppState {
     /// [`crate::discovery_setup::spawn_mdns_handler`], which browses peers tagged
     /// [`OutputType::Local`]) and drops our own advertisement. Returns an empty
     /// list before discovery starts or when multicast is blocked (Docker macvlan,
-    /// Windows firewall) — the manually-added peer list (`/system/peers`) is the
-    /// robust fallback for those networks. Shared by `/peers` and
-    /// `/system/discover-servers`.
+    /// Windows firewall) — the manually-added peer list is the robust fallback
+    /// for those networks.
+    ///
+    /// Read by `/peers`, `/system/discover-servers`, and — since #2746 —
+    /// `/system/peers`, which unites this list with the manual registry. That
+    /// last one is the panel's route, and it was the one caller this function
+    /// never had: written, wired twice, and still absent from the screen that
+    /// needed it.
     pub async fn discovered_tune_peers(&self) -> Vec<serde_json::Value> {
         use tune_core::discovery::device::OutputType;
         let scanner = { self.mdns_scanner.lock().unwrap().clone() };

@@ -5,6 +5,8 @@
 
 #[path = "adresse_du_flux_reservee_au_navigateur.rs"]
 mod adresse_du_flux_reservee_au_navigateur;
+#[path = "airplay2_lit_le_flux_transcode.rs"]
+mod airplay2_lit_le_flux_transcode;
 #[path = "albums_pas_des_doublons.rs"]
 mod albums_pas_des_doublons;
 #[path = "annonce_forum_bornes.rs"]
@@ -13,18 +15,24 @@ mod annonce_forum_bornes;
 mod auth_security;
 #[path = "autoeq_import_route.rs"]
 mod autoeq_import_route;
+#[path = "bandcamp_file_de_zone_i2702.rs"]
+mod bandcamp_file_de_zone_i2702;
 #[path = "bios_bilan_visible.rs"]
 mod bios_bilan_visible;
 #[path = "bios_langue_album.rs"]
 mod bios_langue_album;
 #[path = "bios_langue_entete.rs"]
 mod bios_langue_entete;
+#[path = "bit_perfect_sortie_pull_2189.rs"]
+mod bit_perfect_sortie_pull_2189;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
 #[path = "cles_developpeur_persistance.rs"]
 mod cles_developpeur_persistance;
 #[path = "collections_couleur_persistee.rs"]
 mod collections_couleur_persistee;
+#[path = "collections_ids_orphelins.rs"]
+mod collections_ids_orphelins;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
 #[path = "compilation_dans_les_reponses_album.rs"]
@@ -35,6 +43,10 @@ mod config_secrets_et_roles;
 mod contexte_de_session;
 #[path = "credits_enrichissement_statut.rs"]
 mod credits_enrichissement_statut;
+#[path = "crossfeed_dit_son_indisponibilite.rs"]
+mod crossfeed_dit_son_indisponibilite;
+#[path = "echec_de_decodage_dit_pourquoi_i3270.rs"]
+mod echec_de_decodage_dit_pourquoi_i3270;
 #[path = "enrich_artiste_langue_entete.rs"]
 mod enrich_artiste_langue_entete;
 #[path = "enrichissement_repertoire.rs"]
@@ -45,6 +57,8 @@ mod eq_refus_premium_localise;
 mod etiquettes_types_et_playlists;
 #[path = "explorateur_dossiers.rs"]
 mod explorateur_dossiers;
+#[path = "extraction_cd_ne_promet_pas_ce_qu_elle_ne_fait_pas.rs"]
+mod extraction_cd_ne_promet_pas_ce_qu_elle_ne_fait_pas;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
 #[path = "favoris_cloisonnement_par_profil.rs"]
@@ -61,12 +75,16 @@ mod generateur_playlists_sans_ia;
 mod http_client_seam;
 #[path = "integration.rs"]
 mod integration;
+#[path = "journal_pcm_alsa_ouvert.rs"]
+mod journal_pcm_alsa_ouvert;
 #[path = "karaoke_plugin.rs"]
 mod karaoke_plugin;
 #[path = "licence_activation_immediate.rs"]
 mod licence_activation_immediate;
 #[path = "licence_grace_visible.rs"]
 mod licence_grace_visible;
+#[path = "mono_downmix_dit_son_indisponibilite.rs"]
+mod mono_downmix_dit_son_indisponibilite;
 #[path = "notarisation_bornes.rs"]
 mod notarisation_bornes;
 #[path = "nuage_limite_dit_la_limite.rs"]
@@ -99,6 +117,8 @@ mod radios_validation_url;
 mod rbac;
 #[path = "recherche_totaux_i3189.rs"]
 mod recherche_totaux_i3189;
+#[path = "refus_de_peripherique_partage_dit_pourquoi.rs"]
+mod refus_de_peripherique_partage_dit_pourquoi;
 #[path = "reidentification_album.rs"]
 mod reidentification_album;
 #[path = "reprise_position_au_demarrage.rs"]

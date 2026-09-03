@@ -43,6 +43,52 @@
 //! Le plafond de page de Qobuz reste ce qu'il est, et le contrat de #2036 est
 //! intact — la pagination d'un service passe par `SearchPage`, pas par cette
 //! route.
+//!
+//! # #3226 — `sources` ne gouvernait QUE la moitié streaming
+//!
+//! Reivax66 (forum, fil 1647, 02/09/2026 — 0.9.130 Windows/SQLite) : dans la
+//! recherche latérale, la pilule « Qobuz » rend exactement ce que rend la
+//! pilule « Tous ».
+//!
+//! Ce n'était pas une coïncidence de son écran : `sources` était lu APRÈS les
+//! quatre recherches locales et ne servait qu'à filtrer la boucle des
+//! services. Le bloc `local` — et `radios` avec lui — partait donc dans TOUTES
+//! les réponses, quelle que soit la valeur du paramètre. « Local » semblait
+//! marcher parce qu'il EXCLUAIT le service ; « Qobuz » rendait `local + qobuz`,
+//! et comme Reivax66 n'a qu'un seul service authentifié, c'était mot pour mot
+//! le contenu de « Tous ».
+//!
+//! Le contrat, désormais :
+//!
+//! | `sources`                 | bloc `local` + `radios` | services            |
+//! |---------------------------|-------------------------|---------------------|
+//! | absent                    | rendus                  | tous ceux authentifiés |
+//! | `local`                   | rendus                  | aucun               |
+//! | `all`                     | rendus                  | tous ceux authentifiés |
+//! | `qobuz` (un service)      | **vides**               | ce service          |
+//! | `local,qobuz`             | rendus                  | ce service          |
+//! | valeur inconnue, ou vide  | **vides**               | aucun               |
+//!
+//! **Le paramètre absent ne change pas** : c'est la pilule « Tous », le seul
+//! cas qui marchait, et le seul témoin de non-régression qui vaille. Présent,
+//! `sources` est une liste blanche EXPLICITE, et le local y entre sous son
+//! propre jeton — exactement la règle que le client applique déjà de son côté
+//! pour ses playlists (`includeLocal = !activeSources ||
+//! activeSources.includes('local')`, `SearchView.svelte`). Une valeur inconnue
+//! ne sélectionne donc rien, ni service ni local : c'est déjà ce que la boucle
+//! des services faisait, et la moitié streaming ne bouge pas d'un octet.
+//!
+//! **La clé `local` reste PRÉSENTE, avec des tableaux vides** — jamais absente.
+//! Un champ absent et un champ vide ne se comportent pas pareil en JavaScript,
+//! et `federatedSearch` fait `if (result.local) result.local.tracks =
+//! mapStreamingTracks(result.local.tracks)` : `local` présent mais amputé de
+//! `tracks` planterait l'écran. La forme rendue est donc intégralement celle
+//! de #3189, avec des zéros dedans.
+//!
+//! **Ne rien calculer plutôt que jeter** : quand le local n'est pas demandé,
+//! les trois `search_page`, les trois `COUNT`, la recherche par métadonnées et
+//! la recherche de radios ne sont pas exécutés du tout. Huit requêtes SQL
+//! économisées sur chaque recherche d'un service seul.
 
 use std::collections::HashMap;
 
@@ -58,6 +104,7 @@ use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
 
+use crate::routes::filtre_sources::FiltreSources;
 use crate::state::AppState;
 
 /// Plafond des `COUNT` de la bibliothèque locale.
@@ -104,6 +151,18 @@ struct SearchParams {
     sources: Option<String>,
 }
 
+// Les jetons `local` / `all` et la règle qui les lit vivaient ICI, sous la
+// forme de deux constantes et d'un `le_local_est_demande` local à ce fichier.
+// Ils sont partis dans `routes::filtre_sources`, SANS changer de sémantique —
+// jeton pour jeton et bord pour bord.
+//
+// La raison : `/home/other-versions`, `/home/artist-releases` et
+// `/library/tracks/{id}/versions` mélangeaient local et streaming exactement
+// comme cette route, et devaient recevoir LE MÊME contrat. Le réécrire à côté
+// aurait fait deux implémentations d'une même règle — le défaut qu'on passe
+// la semaine à corriger ailleurs. Il n'en existe donc qu'une, et c'est elle
+// que les quatre routes appellent.
+
 pub fn router() -> Router<AppState> {
     Router::new().route("/", get(federated_search))
 }
@@ -115,36 +174,57 @@ async fn federated_search(
     let limit = p.limit.unwrap_or(20);
     let offset = p.offset.unwrap_or(0).max(0);
 
+    // #3226 — LU EN PREMIER. Tant que ce parsing vivait sous les recherches
+    // locales, il ne pouvait par construction gouverner qu'elles seules.
+    let filtre = FiltreSources::depuis(p.sources.as_deref());
+    let local_demande = filtre.local_demande();
+
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let track_repo = TrackRepo::with_backend(state.backend.clone());
 
-    let artists = artist_repo
-        .search_page(&p.q, limit, offset)
-        .unwrap_or_default();
-    let albums = album_repo
-        .search_page(&p.q, limit, offset)
-        .unwrap_or_default();
-    let tracks = track_repo
-        .search_page(&p.q, limit, offset)
-        .unwrap_or_default();
-    let radios = RadioRepo::with_backend(state.backend.clone())
-        .search(&p.q)
-        .unwrap_or_default();
+    let (artists, albums, tracks, radios) = if local_demande {
+        (
+            artist_repo
+                .search_page(&p.q, limit, offset)
+                .unwrap_or_default(),
+            album_repo
+                .search_page(&p.q, limit, offset)
+                .unwrap_or_default(),
+            track_repo
+                .search_page(&p.q, limit, offset)
+                .unwrap_or_default(),
+            RadioRepo::with_backend(state.backend.clone())
+                .search(&p.q)
+                .unwrap_or_default(),
+        )
+    } else {
+        // Pas « calculer puis jeter » : les requêtes ne partent pas.
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    };
 
     // Les totaux. Un `COUNT` qui échoue ne doit pas rendre 0 alors qu'une
     // liste non vide est servie : le repli est « au moins ce qu'on rend »,
     // qui reste vrai.
     let plancher = |liste: usize| offset.saturating_add(liste as i64);
-    let total_artists = artist_repo
-        .search_count(&p.q, PLAFOND_DE_COMPTAGE)
-        .unwrap_or_else(|_| plancher(artists.len()));
-    let total_albums = album_repo
-        .search_count(&p.q, PLAFOND_DE_COMPTAGE)
-        .unwrap_or_else(|_| plancher(albums.len()));
-    let total_tracks = track_repo
-        .search_count(&p.q, PLAFOND_DE_COMPTAGE)
-        .unwrap_or_else(|_| plancher(tracks.len()));
+    let (total_artists, total_albums, total_tracks) = if local_demande {
+        (
+            artist_repo
+                .search_count(&p.q, PLAFOND_DE_COMPTAGE)
+                .unwrap_or_else(|_| plancher(artists.len())),
+            album_repo
+                .search_count(&p.q, PLAFOND_DE_COMPTAGE)
+                .unwrap_or_else(|_| plancher(albums.len())),
+            track_repo
+                .search_count(&p.q, PLAFOND_DE_COMPTAGE)
+                .unwrap_or_else(|_| plancher(tracks.len())),
+        )
+    } else {
+        // Zéro, et non « le plancher » : rien n'a été cherché, donc rien n'est
+        // annoncé. Un total non nul en regard d'une liste vide ferait afficher
+        // « Pistes 137 » sous zéro ligne.
+        (0, 0, 0)
+    };
 
     // « Y a-t-il une suite ? »
     //
@@ -172,7 +252,11 @@ async fn federated_search(
     // plutôt que fondu dans `totals.tracks`, qui compte le prédicat que
     // `offset`/`limit` parcourent.
     let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
-    let meta_matches = meta_repo.search_by_value(&p.q, limit).unwrap_or_default();
+    let meta_matches = if local_demande {
+        meta_repo.search_by_value(&p.q, limit).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     let fts_track_ids: std::collections::HashSet<i64> =
         tracks.iter().filter_map(|t| t.id).collect();
@@ -217,19 +301,14 @@ async fn federated_search(
         track_results.push(v);
     }
 
-    let requested_sources: Option<Vec<String>> = p
-        .sources
-        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
-
+    // La moitié streaming ne change pas d'un octet : la liste blanche est la
+    // même, lue plus haut, et la règle qu'elle applique ici est celle d'avant.
     let mut service_results: serde_json::Map<String, Value> = serde_json::Map::new();
 
     {
         let registry = state.services.lock().await;
         for svc_name in registry.list() {
-            if let Some(ref sources) = requested_sources
-                && !sources.contains(&svc_name)
-                && !sources.contains(&"all".to_string())
-            {
+            if !filtre.service_demande(&svc_name) {
                 continue;
             }
 

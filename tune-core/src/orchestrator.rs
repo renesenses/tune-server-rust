@@ -1549,7 +1549,13 @@ fn streaming_pretranscode_format(renderer_supports_mime: bool) -> &'static str {
 /// [`PlaybackOrchestrator::seek`] — et #2893 en réclamait une quatrième. Toutes
 /// y passent désormais : un renderer ajouté ici l'est partout, alors qu'une
 /// copie oubliée serait restée MUETTE (un morceau qui repart du début).
-fn is_network_output_type(output_type: Option<&str>) -> bool {
+///
+/// `pub` depuis #2189 : il existait une QUATRIÈME copie, hors de cette caisse
+/// — `build_signal_path` (`tune-server/src/routes/zones.rs`) — et elle avait
+/// déjà dérivé : cinq types au lieu de six, `slimproto` manquant. Le panneau
+/// et le chemin audio répondaient donc à deux questions différentes sur la
+/// même zone. Le miroir d'affichage appelle maintenant CETTE fonction.
+pub fn is_network_output_type(output_type: Option<&str>) -> bool {
     matches!(
         output_type,
         Some("dlna")
@@ -1559,6 +1565,26 @@ fn is_network_output_type(output_type: Option<&str>) -> bool {
             | Some("squeezebox")
             | Some("slimproto")
     )
+}
+
+/// La sortie va CHERCHER le flux elle-même et reçoit donc nos octets **tels
+/// quels** : `hqplayer`, `airplay2`, `diretta`, tout greffon hors dépôt.
+///
+/// C'est la troisième famille de [`pull_output_needs_dsp_transcode`], extraite
+/// telle quelle — ni élargie, ni rétrécie. Elle existe séparément parce que le
+/// panneau du chemin du signal en a besoin SANS les drapeaux d'exécution
+/// (`is_local`, `is_oaat`, format source) : il n'a que le type de la zone.
+///
+/// La conséquence pour l'affichage est directe et c'est tout le sujet de
+/// #2189 : sur ces sorties, le transport ne touche AUCUN échantillon, donc il
+/// est bit-perfect. Le seul traitement qui puisse s'y appliquer est celui que
+/// [`pull_output_needs_dsp_transcode`] force — EQ, correction de pièce,
+/// ReplayGain — et le panneau le compte déjà à part. Le bras par défaut de
+/// `build_signal_path` rendait `false` inconditionnellement : une zone
+/// HQPlayer était déclarée « non bit-perfect » sur un FLAC 44,1/16 servi
+/// octet pour octet (Alex Campbell, 0.9.98 Linux, fil 1524).
+pub fn is_pull_dsp_output_type(output_type: Option<&str>) -> bool {
+    output_type.is_some() && !is_network_output_type(output_type) && output_type != Some("browser")
 }
 
 /// Après une recréation de flux à une position donnée, faut-il ENCORE envoyer
@@ -1718,17 +1744,42 @@ pub(crate) fn requete_de_retablissement(
 /// les trois choses que l'auditeur ne peut pas deviner — quelle piste, à quelle
 /// position, et pourquoi la session n'est plus là.
 ///
+/// `position_ms` est FACULTATIF (#3244). Sur une zone navigateur personne ne
+/// mesure la position — le sondeur ne passe pas — et `position_ms` y vaut 0
+/// depuis `play()`. Écrire « ne peut pas reprendre à 0:00 » ferait passer cette
+/// absence de mesure pour une mesure, et désignerait le début du morceau alors
+/// que l'auditeur en était peut-être à la moitié. `None` dit « je ne sais pas »
+/// et la phrase le dit aussi : c'est la même distinction que
+/// [`PlaybackOrchestrator::position_entretenue_par_le_sondeur`] pose pour
+/// #2595, au site voisin.
+///
 /// Fonction PURE, éprouvée sans orchestrateur.
-pub(crate) fn message_session_perdue(titre: &str, position_ms: u64, cause: Option<&str>) -> String {
-    let secondes = position_ms / 1000;
-    let mut phrase = format!(
-        "La lecture de « {titre} » ne peut pas reprendre à {}:{:02} : sa session de \
-         flux n'a pas survécu à la pause (le serveur la libère après {} minutes \
-         sans lecture). Relancez la piste.",
-        secondes / 60,
-        secondes % 60,
-        crate::http::streamer::SESSION_IDLE_TIMEOUT.as_secs() / 60,
-    );
+pub(crate) fn message_session_perdue(
+    titre: &str,
+    position_ms: Option<u64>,
+    cause: Option<&str>,
+) -> String {
+    let minutes = crate::http::streamer::SESSION_IDLE_TIMEOUT.as_secs() / 60;
+    let mut phrase = match position_ms {
+        Some(ms) => {
+            let secondes = ms / 1000;
+            format!(
+                "La lecture de « {titre} » ne peut pas reprendre à {}:{:02} : sa session de \
+                 flux n'a pas survécu à la pause (le serveur la libère après {minutes} minutes \
+                 sans lecture). Relancez la piste.",
+                secondes / 60,
+                secondes % 60,
+            )
+        }
+        // Position non mesurée : on nomme la piste et la cause, jamais un
+        // horodatage inventé.
+        None => format!(
+            "La lecture de « {titre} » ne peut pas reprendre là où elle en était : sa \
+             session de flux n'a pas survécu à la pause (le serveur la libère après \
+             {minutes} minutes sans lecture), et cette zone est lue par le navigateur — \
+             le serveur n'y mesure pas la position de lecture. Relancez la piste."
+        ),
+    };
     if let Some(cause) = cause {
         phrase.push_str(&format!(" Cause : {cause}"));
     }
@@ -1815,11 +1866,13 @@ fn pull_output_needs_dsp_transcode(
     is_oaat: bool,
     source_format: Option<AudioFormat>,
 ) -> bool {
-    output_type.is_some()
+    // La part « type de sortie » vit dans [`is_pull_dsp_output_type`], d'où le
+    // panneau du chemin du signal la lit aussi (#2189). Même ensemble, à la
+    // lettre : `is_push_uri_output_type` n'est qu'un alias de
+    // `is_network_output_type`, que la fonction extraite appelle.
+    is_pull_dsp_output_type(output_type)
         && !is_local
         && !is_oaat
-        && !is_push_uri_output_type(output_type)
-        && output_type != Some("browser")
         && source_format.is_some()
         && source_format != Some(AudioFormat::Dsd)
 }
@@ -4324,6 +4377,30 @@ impl PlaybackOrchestrator {
             }
         };
 
+        // Le format que Tune ne sait pas rendre doit se DIRE, pas se taire.
+        //
+        // Même raison que `file_not_found:` juste au-dessus, et même endroit :
+        // sans garde ici, le défaut n'apparaît qu'après `output_play_sent`, dans
+        // la tâche de transcodage détachée — trop tard pour que la route en dise
+        // quoi que ce soit, et le morceau « joue » en silence.
+        //
+        // Pour un ISO SACD c'est pire qu'un silence de plus : `from_extension`
+        // rend `None` pour `iso`, `needs_transcode` retombe sur
+        // `unwrap_or(AudioFormat::Flac)`, et une image disque part sur le fil
+        // comme si c'était du FLAC. Le geste attendu n'est pas une relance ni un
+        // nouveau parcours : il faut un outil que Tune ne fournit pas — 22 albums
+        // chez JeromeQ pour la seule trace d'un `warn!` (#3234, fil 1206).
+        //
+        // Ce refus ne fabrique PAS un quatrième canal d'état : il emprunte la
+        // sentinelle que `play_error_response` sait déjà nommer, comme
+        // `file_not_found:`, et il répète le motif que le rapport de parcours
+        // affiche depuis #2992.
+        if let Some(motif) =
+            crate::audio::iso_sacd::refus_de_lecture(std::path::Path::new(&file_path))
+        {
+            warn!(track_id, file = %file_path, motif, "local_track_format_not_playable");
+            return Err(format!("format_not_playable:{motif}"));
+        }
         let fmt = track.format.unwrap_or_else(|| "flac".into());
         let source_format = AudioFormat::from_extension(&fmt);
         // DSD is 1-bit at MHz rates. When the DB row is missing audio props
@@ -7899,6 +7976,64 @@ impl PlaybackOrchestrator {
         ))
     }
 
+    /// Les deux réglages qu'une sortie locale DOIT porter, lus là où la page
+    /// de réglages les écrit : la base.
+    ///
+    /// #1770 (point 3) — la sortie reconstruite à la volée par
+    /// [`Self::recreate_local_and_play`] les codait en dur (`false`,
+    /// `"auto"`). Conséquence, sur Windows et macOS — les seules plateformes
+    /// qui ont un chemin exclusif ([`crate::outputs::local`],
+    /// `exclusive_mode_support`) : un DAC éteint au démarrage, ou retiré par
+    /// le balayage à chaud, repartait au PREMIER appui sur Lecture en mode
+    /// partagé et jamais en ASIO — `select_host("auto")` ne sonde même pas
+    /// ASIO — alors que les réglages disaient le contraire, et sans que
+    /// l'écran le trahisse (`display_audio_backend` rend la valeur VOULUE).
+    ///
+    /// La chaîne est celle de `AppState::effective_audio_backend` /
+    /// `effective_exclusive_mode`, MOINS le fichier de configuration, qui
+    /// n'existe que dans `tune-server` et n'est pas atteignable d'ici : la
+    /// base d'abord, l'environnement en repli, puis les valeurs par défaut de
+    /// [`crate::config::TuneConfig`] — c'est-à-dire exactement ce que le
+    /// codage en dur rendait, et jamais moins.
+    pub fn reglages_sortie_locale(&self) -> (bool, String) {
+        self.reglages_sortie_locale_avec(|cle| std::env::var(cle).ok())
+    }
+
+    /// Même résolution, avec l'environnement en PARAMÈTRE.
+    ///
+    /// Même intention que [`crate::config::resolve_local_audio_backend`] : la
+    /// règle doit être éprouvable sans dépendre des variables de la machine
+    /// qui l'éprouve — sinon l'essai serait vert ou rouge selon le `.env` du
+    /// runner, et `std::env::set_var` dans un test casse la suite entière.
+    pub fn reglages_sortie_locale_avec<F>(&self, environnement: F) -> (bool, String)
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let reglages = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let backend = reglages
+            .get("local_audio_backend")
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| crate::config::resolve_local_audio_backend(&environnement))
+            .unwrap_or_else(|| "auto".to_string());
+        let demande = reglages
+            .get("local_exclusive_mode")
+            .ok()
+            .flatten()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or_else(|| {
+                environnement("TUNE_LOCAL_EXCLUSIVE_MODE")
+                    .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .unwrap_or(false)
+            });
+        // ASIO est exclusif par nature, et c'est une notion Windows (#1268,
+        // #3192). La règle vit dans `tune-core::config` et n'est pas recopiée
+        // ici : une seule écriture pour les deux chemins.
+        let effectif = crate::config::local_exclusive_mode_status(&backend, demande).effective;
+        (effectif, backend)
+    }
+
     /// Recreate a local (cpal) output on demand and play to it. Only the
     /// `local-audio` build has `outputs::local`; without that feature there is
     /// no local backend, so this is a no-op that reports the device as missing.
@@ -7910,8 +8045,25 @@ impl PlaybackOrchestrator {
         start_position_ms: Option<u64>,
     ) -> (bool, Option<String>) {
         let device_name = device_id.strip_prefix("local:").unwrap_or(device_id);
-        info!(device_id, "output_not_found_recreating_local_output");
-        let local_out = crate::outputs::local::LocalOutput::new(device_name.to_string());
+        // Les réglages, pas des littéraux : voir `reglages_sortie_locale`
+        // (#1770). `endpoint_id` et `origin_host` restent absents — les deux
+        // ne viennent QUE d'une énumération de périphériques
+        // (`AudioDevice::endpoint_id` / `.backend`), rien ne les persiste, et
+        // ce chemin n'en a pas : il existe précisément parce que le
+        // périphérique n'est PAS énumérable à cet instant. Les inventer serait
+        // pire que de les laisser vides.
+        let (exclusive_mode, audio_backend) = self.reglages_sortie_locale();
+        info!(
+            device_id,
+            exclusive_mode,
+            audio_backend = %audio_backend,
+            "output_not_found_recreating_local_output"
+        );
+        let local_out = crate::outputs::local::LocalOutput::with_options(
+            device_name.to_string(),
+            exclusive_mode,
+            &audio_backend,
+        );
         if let Some(position_ms) = start_position_ms {
             local_out.set_pending_start_position_ms(position_ms);
             // Producer always pre-seeked — see the comment in send_to_output.
@@ -8694,6 +8846,48 @@ impl PlaybackOrchestrator {
         applique_a_chaud
     }
 
+    /// La position de lecture de cette zone est-elle ENTRETENUE ?
+    ///
+    /// #2595 — Pierre M, zone 987 : basculer en mode Audiophile pendant
+    /// l'écoute fait repartir le morceau **du début**.
+    ///
+    /// [`Self::schedule_eq_replay`] relit `position_ms` pour rejouer « là où on
+    /// en était ». Or cette valeur n'est entretenue que par l'unique
+    /// `update_position` de production du sondeur — et la boucle de transport
+    /// de `poller.rs` s'ouvre sur `get_zone_device_id`, dont la branche `None`
+    /// fait `continue` **avant** cet appel. Une zone sans périphérique de
+    /// sortie — une zone navigateur, « Cet ordinateur », par conception : le
+    /// client web tire `stream_url` lui-même — n'est donc jamais observée. Son
+    /// `position_ms` reste figé sur ce que la dernière COMMANDE y a écrit,
+    /// c'est-à-dire 0 depuis `play()`, pendant que le morceau avance dans
+    /// l'onglet.
+    ///
+    /// Zéro n'est alors pas une position : c'est une absence de mesure.
+    /// Rejouer dessus n'est pas « reprendre », c'est recommencer.
+    ///
+    /// Le prédicat est **celui du sondeur, à l'identique** et à dessein, et il
+    /// est STRUCTUREL — pas un seuil, pas une heuristique sur la valeur : la
+    /// question posée est « quelqu'un observe-t-il cette zone ? ».
+    /// Périphérique présent ⇒ le sondeur passe ⇒ la position est mesurée à la
+    /// seconde. Pas de périphérique ⇒ personne ne la mesure, et le serveur ne
+    /// sait pas où en est la lecture. Rien ici ne confond « zéro » et « je ne
+    /// sais pas » : les deux cas ne se lisent pas dans la même valeur.
+    ///
+    /// Le seul autre gisement possible serait le client lui-même — c'est
+    /// l'onglet qui joue, donc lui seul connaît sa position. Aucune route ne la
+    /// remonte aujourd'hui (`SeekRequest` est une COMMANDE, pas un rapport), et
+    /// l'inventer côté serveur à partir de `streamer_bytes_sent` mesurerait le
+    /// TÉLÉCHARGEMENT, pas l'écoute — un lecteur qui tamponne en avance donnerait
+    /// une position en avance. Tant que le client ne la déclare pas, la réponse
+    /// honnête est « je ne sais pas ».
+    fn position_entretenue_par_le_sondeur(&self, zone_id: i64) -> bool {
+        ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id)
+            .is_some()
+    }
     /// Délai d'anti-rebond avant de redémarrer un flux sur changement d'EQ.
     ///
     /// Assez long pour qu'un curseur qu'on fait glisser ne produise qu'un seul
@@ -8722,7 +8916,30 @@ impl PlaybackOrchestrator {
     /// Rend immédiatement : le redémarrage est différé dans une tâche. La
     /// valeur dit si un redémarrage a été **programmé**, pas s'il a eu lieu —
     /// une demande plus récente peut encore l'annuler.
+    ///
+    /// **Ne programme rien quand la position de la zone n'est pas mesurée**
+    /// (#2595) : voir [`Self::position_entretenue_par_le_sondeur`].
     pub fn schedule_eq_replay(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        // #2595 — ne pas rejouer à une position INCONNUE.
+        //
+        // Ce redémarrage ne vaut que par sa promesse : reprendre là où on en
+        // était. Sur une zone dont personne ne mesure la position, la promesse
+        // est vide et le geste devient destructeur — il ramène l'auditeur au
+        // début du morceau, ce qu'a signalé Pierre M.
+        //
+        // Renoncer est ici le geste le MOINS destructeur. Le réglage prendra
+        // effet à la piste suivante, ce que la réponse dit déjà
+        // (`applied_live: false`) et ce que le client sait déjà afficher. Un
+        // morceau qui continue vaut mieux qu'un morceau qui recommence.
+        //
+        // On ne comble surtout PAS la source : une zone sans périphérique n'a
+        // aucune source de vérité côté serveur sur sa position. Y écrire une
+        // valeur reconstituée ferait passer une supposition pour une mesure —
+        // exactement le défaut qu'on corrige.
+        if !self.position_entretenue_par_le_sondeur(zone_id) {
+            info!(zone_id, "eq_replay_skipped_position_inconnue");
+            return false;
+        }
         let generation = {
             let mut gens = self.eq_replay_gen.lock().unwrap();
             let g = gens.entry(zone_id).or_insert(0);
@@ -9721,11 +9938,13 @@ impl PlaybackOrchestrator {
         &self,
         zone_id: i64,
         titre: &str,
-        position_ms: u64,
+        position_ms: Option<u64>,
         cause: Option<&str>,
     ) -> OutputCommandError {
         let message = message_session_perdue(titre, position_ms, cause);
-        warn!(zone_id, position_ms, %message, "resume_stream_session_lost");
+        // `?position_ms` et non `position_ms` : le journal doit distinguer
+        // `Some(137000)` de `None`, pas écrire un `0` de plus (#3244).
+        warn!(zone_id, ?position_ms, %message, "resume_stream_session_lost");
         if let Some(ref bus) = self.event_bus {
             bus.emit(
                 "zone.playback_error",
@@ -9743,6 +9962,38 @@ impl PlaybackOrchestrator {
         // know where to resume from.
         let state = self.playback.get_state(zone_id).await;
         let position_ms = state.position_ms.max(0) as u64;
+        // #3244 — cette valeur est-elle une MESURE ?
+        //
+        // Jumeau de #2595 : `position_ms` n'est entretenue que par l'unique
+        // `update_position` de production du sondeur, et la boucle de transport
+        // de `poller.rs` `continue` avant lui quand la zone n'a pas de
+        // périphérique. Sur une zone navigateur la valeur reste donc figée à 0
+        // depuis `play()` pendant que le morceau avance dans l'onglet : zéro n'y
+        // est pas une position, c'est une absence de mesure.
+        //
+        // Ce que `resume` en fait, site par site :
+        //
+        // - `requete_de_retablissement` (le seul geste qui RELANCE à la
+        //   position) et le rattrapage `checked_seek` des renderers DLNA sont
+        //   déjà gardés par la présence d'une SORTIE — `did` / `device_id`. Or
+        //   cette présence est exactement le prédicat de
+        //   `position_entretenue_par_le_sondeur` : sans périphérique, aucune des
+        //   deux branches n'est atteinte. `resume` ne peut donc PAS relancer une
+        //   zone navigateur au début, et le défaut annoncé par #3244 n'est pas
+        //   atteignable par là ;
+        // - reste `dire_session_perdue`, qui ANNONCE la position à l'auditeur —
+        //   et celle-là n'est gardée par rien. Une zone navigateur dont la
+        //   session a été ramassée s'entendait dire « ne peut pas reprendre à
+        //   0:00 », un horodatage inventé qui désigne le début du morceau. C'est
+        //   ce que ce correctif ferme.
+        //
+        // On ne comble surtout pas la source : `streamer_bytes_sent` mesure le
+        // TÉLÉCHARGEMENT, pas l'écoute. Seul le client connaît sa position, et
+        // aucune route ne la remonte aujourd'hui (`SeekRequest` est une
+        // COMMANDE, pas un rapport).
+        let position_mesuree = self
+            .position_entretenue_par_le_sondeur(zone_id)
+            .then_some(position_ms);
 
         // Une reprise « sur place » suppose que la SESSION DE FLUX qui alimentait
         // la sortie a survécu à la pause. Deux façons d'y échouer, deux remèdes.
@@ -9852,7 +10103,7 @@ impl PlaybackOrchestrator {
                                 return Err(self.dire_session_perdue(
                                     zone_id,
                                     &np.title,
-                                    position_ms,
+                                    position_mesuree,
                                     Some(&e),
                                 ));
                             }
@@ -9863,7 +10114,7 @@ impl PlaybackOrchestrator {
                         return Err(self.dire_session_perdue(
                             zone_id,
                             &np.title,
-                            position_ms,
+                            position_mesuree,
                             None,
                         ));
                     }
@@ -13286,10 +13537,10 @@ mod tests {
 
     use super::{
         PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, is_network_output_type,
-        is_push_uri_output_type, message_session_perdue, passthrough_didl_duration_ms,
-        pull_output_needs_dsp_transcode, replay_needs_output_seek, reprise_de_session,
-        requete_de_retablissement, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
-        streaming_pretranscode_format, use_file_transcode_for,
+        is_pull_dsp_output_type, is_push_uri_output_type, message_session_perdue,
+        passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, replay_needs_output_seek,
+        reprise_de_session, requete_de_retablissement, spawn_streaming_dsp_relay,
+        streaming_needs_pretranscode, streaming_pretranscode_format, use_file_transcode_for,
     };
 
     #[test]
@@ -13372,6 +13623,54 @@ mod tests {
 
         // Unregistered device (output_type_of returned None): never coalesce.
         assert!(!is_push_uri_output_type(None));
+    }
+
+    /// La part « type de sortie » de [`pull_output_needs_dsp_transcode`],
+    /// extraite pour que le panneau du chemin du signal la LISE au lieu de la
+    /// recopier (#2189).
+    ///
+    /// L'extraction doit être à la lettre : ce test compare les deux, format
+    /// source et drapeaux d'exécution neutres, sur tous les types que ce dépôt
+    /// sait produire.
+    #[test]
+    fn is_pull_dsp_output_type_est_la_part_type_de_pull_output_needs_dsp_transcode() {
+        use crate::audio::formats::AudioFormat;
+        let flac = Some(AudioFormat::Flac);
+
+        for t in [
+            "dlna",
+            "openhome",
+            "chromecast",
+            "bluos",
+            "squeezebox",
+            "slimproto",
+            "browser",
+            "local",
+            "oaat",
+            "oaat-multiroom",
+            "airplay",
+            "airplay2",
+            "hqplayer",
+            "diretta",
+            "un-greffon-hors-depot",
+        ] {
+            assert_eq!(
+                is_pull_dsp_output_type(Some(t)),
+                pull_output_needs_dsp_transcode(Some(t), false, false, flac),
+                "{t} : le prédicat extrait doit rendre exactement ce que \
+                 rendait la condition d'origine"
+            );
+        }
+        assert!(!is_pull_dsp_output_type(None));
+
+        // Et le fait qui fonde le correctif #2189 : HQPlayer, AirPlay 2 et
+        // tout greffon hors dépôt sont des sorties PULL — elles reçoivent nos
+        // octets intacts, donc le transport y est bit-perfect.
+        assert!(is_pull_dsp_output_type(Some("hqplayer")));
+        assert!(is_pull_dsp_output_type(Some("airplay2")));
+        assert!(is_pull_dsp_output_type(Some("diretta")));
+        // `slimproto` n'en est PAS une : elle reçoit une URI, comme Squeezebox.
+        assert!(!is_pull_dsp_output_type(Some("slimproto")));
     }
 
     #[test]
@@ -13960,6 +14259,56 @@ mod tests {
                 "{did} : rien ne prouve que cette sortie ne mesure pas"
             );
         }
+    }
+
+    /// #1770 (point 3) — la sortie locale reconstruite à la volée lit les
+    /// réglages au lieu de les coder en dur.
+    ///
+    /// L'essai porte sur la RÉSOLUTION, pas sur l'ouverture du périphérique :
+    /// sous Linux aucun chemin exclusif n'existe (`exclusive_mode_support`),
+    /// une épreuve qui ouvrirait un DAC serait verte contre rien ici. Ce qui
+    /// se prouve sur cette machine, c'est que les valeurs remises au
+    /// constructeur viennent de la BASE.
+    #[test]
+    fn les_reglages_de_sortie_locale_viennent_de_la_base() {
+        let orch = test_orchestrator();
+        let reglages = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+
+        // Base vierge, environnement neutre : le repli est le défaut de
+        // `TuneConfig` — c'est-à-dire ce que le codage en dur rendait.
+        assert_eq!(
+            orch.reglages_sortie_locale_avec(|_| None),
+            (false, "auto".to_string()),
+            "sur une base vierge le repli doit rester le défaut de TuneConfig"
+        );
+
+        reglages.set("local_audio_backend", "wasapi").unwrap();
+        reglages.set("local_exclusive_mode", "true").unwrap();
+        assert_eq!(
+            orch.reglages_sortie_locale_avec(|_| None),
+            (true, "wasapi".to_string()),
+            "la sortie recréée ignore les réglages : un DAC éteint au \
+             démarrage repartirait en partagé au premier appui sur Lecture, \
+             alors que la page de réglages dit le contraire (#1770)."
+        );
+
+        // L'environnement n'est qu'un REPLI : la base gagne.
+        let env_asio = |cle: &str| (cle == "TUNE_LOCAL_AUDIO_BACKEND").then(|| "asio".to_string());
+        assert_eq!(
+            orch.reglages_sortie_locale_avec(env_asio),
+            (true, "wasapi".to_string()),
+            "l'environnement ne doit pas passer devant la valeur enregistrée"
+        );
+
+        // Sans valeur en base, l'environnement est lu — c'est le seul morceau
+        // de la chaîne de `tune-server` qui soit atteignable depuis ici.
+        reglages.delete("local_audio_backend").unwrap();
+        assert_eq!(
+            orch.reglages_sortie_locale_avec(env_asio),
+            (true, "asio".to_string()),
+            "TUNE_LOCAL_AUDIO_BACKEND doit servir de repli comme dans \
+             tune-server/src/config.rs"
+        );
     }
 
     fn test_orchestrator() -> PlaybackOrchestrator {
@@ -15377,12 +15726,24 @@ mod tests {
     /// : « aucun son, volume dans le vide », et pas une ligne pour l'expliquer.
     #[test]
     fn le_message_de_session_perdue_nomme_la_piste_et_la_position() {
-        let seche = message_session_perdue("Sur la piste", 137_000, None);
+        let seche = message_session_perdue("Sur la piste", Some(137_000), None);
         assert!(seche.contains("Sur la piste"), "{seche}");
         assert!(seche.contains("2:17"), "la position doit y être : {seche}");
         assert!(seche.contains("30 minutes"), "{seche}");
-        let detaille = message_session_perdue("X", 0, Some("piste introuvable"));
+        let detaille = message_session_perdue("X", Some(0), Some("piste introuvable"));
         assert!(detaille.contains("piste introuvable"), "{detaille}");
+        // #3244 — position NON mesurée. Le message ne perd que l'horodatage :
+        // la piste, le délai et la cause restent, parce qu'ils sont connus.
+        // Les assertions ci-dessus n'ont pas bougé : seule leur signature a
+        // suivi le passage à `Option`, et un cas s'ajoute.
+        let inconnue = message_session_perdue("Sur la piste", None, Some("piste introuvable"));
+        assert!(inconnue.contains("Sur la piste"), "{inconnue}");
+        assert!(inconnue.contains("30 minutes"), "{inconnue}");
+        assert!(inconnue.contains("piste introuvable"), "{inconnue}");
+        assert!(
+            !inconnue.contains("0:00"),
+            "« 0:00 » n'est pas une position, c'est une absence de mesure : {inconnue}"
+        );
     }
 
     /// Prépare une zone qui JOUE une piste locale via une session de flux, puis
@@ -15391,14 +15752,31 @@ mod tests {
         track_id: Option<i64>,
         position_ms: i64,
     ) -> (PlaybackOrchestrator, i64, String) {
+        zone_en_pause_sur_une_piste_avec_sortie(track_id, position_ms, true).await
+    }
+    /// Même préparation, la SORTIE en moins quand `avec_sortie` est faux : une
+    /// zone NAVIGATEUR, sans `output_device_id`. C'est la forme que le sondeur
+    /// laisse sans position (#3244) — lui inventer une sortie effacerait le
+    /// défaut éprouvé.
+    async fn zone_en_pause_sur_une_piste_avec_sortie(
+        track_id: Option<i64>,
+        position_ms: i64,
+        avec_sortie: bool,
+    ) -> (PlaybackOrchestrator, i64, String) {
         let orch = test_orchestrator();
         let zone_id = ZoneRepo::with_backend(orch.db.clone())
-            .create("Salon", Some("mock"), Some("mock-salon"))
+            .create(
+                "Salon",
+                avec_sortie.then_some("mock"),
+                avec_sortie.then_some("mock-salon"),
+            )
             .unwrap();
-        orch.outputs
-            .lock()
-            .await
-            .register(Box::new(MockOutput::new("mock-salon", "Mock Salon")));
+        if avec_sortie {
+            orch.outputs
+                .lock()
+                .await
+                .register(Box::new(MockOutput::new("mock-salon", "Mock Salon")));
+        }
         // Une session de PISTE — `create_session`, pas `create_radio_session` :
         // c'est celle que le ramasse-miettes a le droit de prendre.
         let (sid, _tx, _ready) = orch
@@ -15542,6 +15920,49 @@ mod tests {
             mock.play_call_count().await,
             0,
             "session vivante ⇒ reprise sur place, aucune relecture"
+        );
+    }
+    /// #3244 — jumeau de #2595, site `resume`. Une zone NAVIGATEUR n'a pas de
+    /// position mesurée : la reprise ne doit ni relancer au début, ni ANNONCER
+    /// « 0:00 » comme si elle savait où on en était.
+    ///
+    /// La position vaut 0 parce que personne ne l'a jamais écrite — le sondeur
+    /// `continue` avant son `update_position` faute de périphérique — pendant
+    /// que le morceau avançait dans l'onglet.
+    #[tokio::test]
+    async fn la_reprise_dune_zone_navigateur_n_annonce_pas_une_position_inventee() {
+        let (orch, zone_id, sid) =
+            zone_en_pause_sur_une_piste_avec_sortie(Some(4242), 0, false).await;
+        // Sans ça l'épreuve ne mesurerait rien : c'est le prédicat de #3242 qui
+        // dit que cette zone-là n'est observée par personne.
+        assert!(
+            !orch.position_entretenue_par_le_sondeur(zone_id),
+            "une zone sans périphérique n'est pas sondée : sa position n'est pas mesurée"
+        );
+        le_ramasse_miettes_passe(&orch, &sid).await;
+        let erreur = orch
+            .resume(zone_id, None)
+            .await
+            .expect_err("session morte : la reprise doit le dire au lieu de se taire");
+        let message = erreur.to_string();
+        assert!(
+            !message.contains("0:00"),
+            "position INCONNUE annoncée comme une mesure — « 0:00 » désigne le début \
+             du morceau, pas le point de la pause : {message}"
+        );
+        assert!(
+            message.contains("Sur la piste"),
+            "la piste reste nommée, elle, on la connaît : {message}"
+        );
+        let etat = orch.playback.get_state(zone_id).await;
+        assert_eq!(
+            etat.state,
+            PlayState::Paused,
+            "une reprise qui n'a pas abouti ne doit pas s'annoncer en lecture"
+        );
+        assert!(
+            etat.last_seek_at.is_none(),
+            "aucune relance à une position inconnue ne doit avoir été TENTÉE"
         );
     }
 
@@ -16020,9 +16441,13 @@ mod tests {
     /// Rend `(orchestrateur, zone_id, répertoire)` — le répertoire doit rester
     /// vivant tant que le test tourne, sinon le fichier disparaît sous la zone
     /// et `resolve_local_track` échoue en `file_not_found`.
+    ///
+    /// `output_type` et `device_id` sont facultatifs (#2595) : une zone
+    /// navigateur — « Cet ordinateur » — n'a PAS de périphérique de sortie, et
+    /// c'est précisément cette forme-là que le sondeur laisse sans position.
     async fn zone_qui_joue_un_flac(
-        output_type: &str,
-        device_id: &str,
+        output_type: Option<&str>,
+        device_id: Option<&str>,
     ) -> (PlaybackOrchestrator, i64, tempfile::TempDir) {
         let orch = test_orchestrator();
 
@@ -16057,16 +16482,20 @@ mod tests {
 
         let zone_repo = ZoneRepo::with_backend(orch.db.clone());
         let zone_id = zone_repo
-            .create("Marantz ND8006", Some(output_type), Some(device_id))
+            .create("Marantz ND8006", output_type, device_id)
             .unwrap();
         // FLAC natif imposé : la sortie factice n'est pas un `DlnaOutput`, la
         // négociation `GetProtocolInfo` serait donc non concluante et
         // basculerait en WAV. On veut le passthrough du testeur.
         zone_repo.update_dlna_native_flac(zone_id, true).unwrap();
 
-        orch.outputs.lock().await.register(Box::new(
-            MockOutput::new(device_id, "Marantz ND8006").with_type(output_type),
-        ));
+        // Pas de périphérique, pas de sortie à enregistrer : la zone navigateur
+        // n'en a aucune, et lui en inventer une effacerait le défaut testé.
+        if let (Some(device_id), Some(output_type)) = (device_id, output_type) {
+            orch.outputs.lock().await.register(Box::new(
+                MockOutput::new(device_id, "Marantz ND8006").with_type(output_type),
+            ));
+        }
 
         orch.playback
             .play(
@@ -16334,7 +16763,7 @@ mod tests {
     #[tokio::test]
     async fn bascule_pure_sur_dlna_le_renderer_recoit_le_seek_vers_la_position() {
         let device_id = "dlna:uuid-56fcb4ae-2893";
-        let (orch, zone_id, _dir) = zone_qui_joue_un_flac("dlna", device_id).await;
+        let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
 
         orch.replay_zone_at_position(zone_id, 94_000, "eq_change")
             .await
@@ -16357,7 +16786,7 @@ mod tests {
     #[tokio::test]
     async fn une_relecture_sur_sortie_locale_n_envoie_aucun_seek() {
         let device_id = "local:Sortie 2893";
-        let (orch, zone_id, _dir) = zone_qui_joue_un_flac("local", device_id).await;
+        let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("local"), Some(device_id)).await;
 
         orch.replay_zone_at_position(zone_id, 94_000, "eq_change")
             .await
@@ -16367,6 +16796,110 @@ mod tests {
             position_vue_par_la_sortie(&orch, device_id).await,
             0,
             "sortie locale : le flux est pré-seeké à la source, un Seek de plus doublerait l'offset (#1518)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #2595 — la bascule Audiophile ne repart pas d'une position INCONNUE.
+    // ------------------------------------------------------------------
+
+    /// Laisser passer l'anti-rebond de `schedule_eq_replay`, plus la relecture
+    /// elle-même (le chemin local s'accorde 300 ms d'arrêt de sortie).
+    async fn laisser_passer_l_anti_rebond() {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PlaybackOrchestrator::EQ_REPLAY_DEBOUNCE_MS + 900,
+        ))
+        .await;
+    }
+
+    /// Le prédicat qui tranche, sur les deux formes de zone. Témoin : la zone
+    /// AVEC périphérique reste du côté « position mesurée » — le correctif ne
+    /// doit rien lui retirer.
+    #[tokio::test]
+    async fn le_predicat_de_position_suit_la_presence_d_un_peripherique() {
+        let orch = test_orchestrator();
+        let zr = ZoneRepo::with_backend(orch.db.clone());
+        let avec = zr
+            .create("Salon", Some("dlna"), Some("dlna:uuid-2595"))
+            .unwrap();
+        let sans = zr.create("Cet ordinateur", Some("browser"), None).unwrap();
+        assert!(
+            orch.position_entretenue_par_le_sondeur(avec),
+            "le sondeur interroge toute zone qui a un périphérique : sa position est mesurée à la seconde"
+        );
+        assert!(
+            !orch.position_entretenue_par_le_sondeur(sans),
+            "sans périphérique, `poller.rs` fait `continue` avant son unique `update_position` : rien ne mesure cette zone"
+        );
+    }
+
+    /// Cas NOMINAL, inchangé : sur une zone observée, la bascule reprend à la
+    /// position mesurée. C'est la contre-épreuve de la garde — si elle mordait
+    /// trop large, ce test tomberait.
+    #[tokio::test]
+    async fn la_bascule_pure_reprend_a_la_position_mesuree() {
+        let (orch, zone_id, _dir) =
+            zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-2595-temoin")).await;
+        let orch = Arc::new(orch);
+        let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
+        // Ce que le sondeur écrit chaque seconde sur une zone observée.
+        orch.playback.update_position(zone_id, 137_000).await;
+
+        assert!(
+            !orch.apply_audiophile_change(zone_id).await,
+            "chemin réseau : la bascule passe par un redémarrage programmé, donc pas d'application à chaud"
+        );
+        laisser_passer_l_anti_rebond().await;
+
+        let apres = orch.playback.get_state(zone_id).await;
+        assert_eq!(
+            apres.position_ms, 137_000,
+            "la relecture doit repartir de la position MESURÉE, pas de zéro"
+        );
+        assert_ne!(
+            apres.track_generation, generation_avant,
+            "la relecture doit bien avoir eu lieu : sans elle, ce test ne prouverait rien du cas nominal"
+        );
+    }
+
+    /// LE défaut de Pierre M (#2595), zone 987 : « Cet ordinateur », donc AUCUN
+    /// périphérique de sortie, donc aucune position mesurée. La bascule ne doit
+    /// pas prétendre reprendre : elle renonce, le dit dans le journal
+    /// (`eq_replay_skipped_position_inconnue`), et laisse le morceau courir.
+    ///
+    /// Avant le correctif, `position_ms` valait 0 — non parce que le morceau
+    /// était au début, mais parce que personne ne l'avait jamais mesuré — et la
+    /// relecture repartait de là.
+    #[tokio::test]
+    async fn la_bascule_pure_sans_peripherique_ne_repart_pas_de_zero() {
+        let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("browser"), None).await;
+        let orch = Arc::new(orch);
+        let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.position_ms,
+            0,
+            "point de départ du défaut : la zone joue et le serveur croit être à 0"
+        );
+
+        assert!(
+            !orch.apply_audiophile_change(zone_id).await,
+            "rien n'est appliqué à chaud sur une zone navigateur"
+        );
+        laisser_passer_l_anti_rebond().await;
+
+        let apres = orch.playback.get_state(zone_id).await;
+        assert!(
+            apres.last_seek_at.is_none(),
+            "aucune relecture ne doit avoir été TENTÉE : `replay_zone_at_position` pose un `seek` \
+             avant toute autre chose, y compris quand elle échoue ensuite (#2595)"
+        );
+        assert_eq!(
+            apres.track_generation, generation_avant,
+            "le morceau ne doit pas avoir été relancé — c'est exactement ce que Pierre M entend comme « ça repart du début »"
+        );
+        assert!(
+            !orch.eq_replay_gen.lock().unwrap().contains_key(&zone_id),
+            "la relecture ne doit même pas être armée quand la position est inconnue"
         );
     }
 
@@ -17127,6 +17660,179 @@ mod tests {
             .iter()
             .flat_map(|sample| sample.to_le_bytes())
             .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // #3234 — un format sans décodeur se DIT, il ne se joue pas en silence.
+    // ------------------------------------------------------------------
+
+    /// Écrit une image `.iso` creuse portant `SACDMTOC` à son Master TOC.
+    ///
+    /// Le décalage et la signature viennent de la PRODUCTION : une fixture qui
+    /// recopierait `0x800 * 510` deviendrait muette le jour où le contrôle
+    /// changerait de repère, et l'épreuve resterait verte contre rien.
+    ///
+    /// Fichier creux : aucun octet réel avant le décalage, la fixture ne
+    /// consomme pas 4 Mo de disque.
+    fn image_iso_sacd_3234(dossier: &std::path::Path, nom: &str) -> String {
+        use std::io::{Seek, SeekFrom, Write};
+        let chemin = dossier.join(nom);
+        let mut fichier = std::fs::File::create(&chemin).unwrap();
+        fichier
+            .seek(SeekFrom::Start(
+                crate::audio::iso_sacd::DECALAGE_MASTER_TOC_SACD,
+            ))
+            .unwrap();
+        fichier
+            .write_all(crate::audio::iso_sacd::SIGNATURE_MASTER_TOC_SACD)
+            .unwrap();
+        fichier.set_len(4_200_000).unwrap();
+        fichier.flush().unwrap();
+        chemin.to_string_lossy().into_owned()
+    }
+
+    /// `PlayRequest` minimale de lecture locale : seuls la zone et la piste
+    /// varient dans les deux épreuves qui suivent.
+    fn requete_locale_3234(zone_id: i64, track_id: i64) -> super::PlayRequest {
+        super::PlayRequest {
+            zone_id,
+            output_device_id: None,
+            track_id: Some(track_id),
+            source: Some("local".into()),
+            source_id: None,
+            title: None,
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        }
+    }
+
+    /// Insère une piste dont le `file_path` est `chemin`, au format `format`.
+    fn piste_3234(orch: &PlaybackOrchestrator, chemin: &str, format: &str) {
+        orch.db
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Supertramp')",
+                &[],
+            )
+            .unwrap();
+        orch.db
+            .execute(
+                "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Breakfast In America', 1)",
+                &[],
+            )
+            .unwrap();
+        orch.db
+            .execute(
+                &format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+                     duration_ms, sample_rate, bit_depth, channels) \
+                     VALUES (1, 'The Logical Song', 1, 1, ?, '{format}', 300000, 44100, 16, 2)"
+                ),
+                &[&chemin.to_string() as &dyn crate::db::backend::ToSqlValue],
+            )
+            .unwrap();
+    }
+
+    /// #3234 — un ISO SACD demandé en LECTURE rend un motif nommé.
+    ///
+    /// JeromeQ, fil 1206 : « Tune ne lit pas les fichiers ISO ? » Personne ne
+    /// lui répondait, et le serveur non plus. Le parcours de bibliothèque, lui,
+    /// compte et nomme ces fichiers depuis #2992 ; la demande de LECTURE, elle,
+    /// n'avait aucune garde : `AudioFormat::from_extension("iso")` rend `None`,
+    /// le transcodage retombe sur `unwrap_or(AudioFormat::Flac)`, et une image
+    /// disque part sur le fil comme du FLAC. La zone reste muette, et aucune
+    /// réponse HTTP ne dit pourquoi.
+    ///
+    /// L'épreuve mesure CE QUE REND `resolve_local_track` — la fonction que
+    /// `play()` appelle et dont la chaîne d'erreur arrive telle quelle à
+    /// `play_error_response`. Elle ne rappelle pas la condition du code : la
+    /// fixture est une vraie image dont le Master TOC porte `SACDMTOC`, et
+    /// c'est la lecture de ces huit octets sur le disque qui doit déclencher le
+    /// refus.
+    #[tokio::test]
+    async fn un_iso_sacd_demande_en_lecture_rend_un_motif_nomme() {
+        let orch = test_orchestrator();
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = image_iso_sacd_3234(dossier.path(), "Breakfast In America.iso");
+        piste_3234(&orch, &chemin, "iso");
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+
+        // `ResolvedStream` n'implémente pas `Debug` : la branche verte est
+        // dépliée à la main plutôt que par `expect_err`.
+        let erreur = match orch
+            .resolve_local_track(&requete_locale_3234(zone_id, 1))
+            .await
+        {
+            Err(erreur) => erreur,
+            Ok(_) => panic!(
+                "un ISO SACD s'est résolu en flux jouable : c'est le silence de \
+                 #3234, une image disque part sur le fil comme du FLAC"
+            ),
+        };
+
+        let motif = erreur
+            .strip_prefix("format_not_playable:")
+            .unwrap_or_else(|| {
+                panic!(
+                    "la demande de lecture doit rendre un refus NOMMÉ que la route \
+                 sait mettre en forme ; elle a rendu : {erreur}"
+                )
+            });
+        // Le motif est celui du rapport de parcours, mot pour mot (#2992) :
+        // deux phrases différentes pour un seul empêchement feraient croire à
+        // deux défauts.
+        assert_eq!(motif, crate::audio::iso_sacd::MOTIF_ISO_SACD_NON_EXTRAIT);
+        assert!(
+            motif.contains("ISO SACD"),
+            "le motif doit NOMMER le format : {motif}"
+        );
+        assert!(
+            motif.contains("sacd_extract") && motif.contains("non fourni"),
+            "le motif doit NOMMER ce qui manque, et dire que Tune ne le livre pas : {motif}"
+        );
+    }
+
+    /// Témoin de #3234 : un FLAC de la bibliothèque se résout comme avant.
+    ///
+    /// Sans ce témoin, un refus trop large rendrait toute la bibliothèque
+    /// injouable sans qu'une seule épreuve rougisse — et il doit rester vert
+    /// quand on retire le refus, sans quoi il ne mesurerait que lui-même.
+    #[tokio::test]
+    async fn le_flac_temoin_se_resout_comme_avant() {
+        let orch = test_orchestrator();
+        let dossier = tempfile::tempdir().unwrap();
+        let piste = dossier.path().join("morceau.flac");
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+            &piste,
+        )
+        .unwrap();
+        let chemin = piste.to_string_lossy().into_owned();
+        piste_3234(&orch, &chemin, "flac");
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+
+        let refus = orch
+            .resolve_local_track(&requete_locale_3234(zone_id, 1))
+            .await
+            .err();
+
+        assert!(
+            refus.is_none(),
+            "le témoin FLAC doit rester jouable : {}",
+            refus.unwrap_or_default()
+        );
     }
 
     /// #2063 — contre-épreuve négative : ajouter le crochet DSP au décodeur
@@ -18524,6 +19230,86 @@ mod profondeur_annoncee_egale_profondeur_ecrite {
             assert!(
                 niveau_non_nul(&dest_s, 16),
                 "source {profondeur_source} bits : le WAV 16 bits est SILENCIEUX"
+            );
+        }
+    }
+}
+
+/// #1770 (point 3) — le SITE de production, pas seulement la résolution.
+///
+/// L'essai voisin (`les_reglages_de_sortie_locale_viennent_de_la_base`) prouve
+/// que `reglages_sortie_locale` lit bien la base ; il resterait vert si
+/// quelqu'un remettait `LocalOutput::new(...)` — ou
+/// `with_options(nom, false, "auto")` — dans `recreate_local_and_play`. C'est
+/// ce site-là que ce module épingle.
+///
+/// Hors de toute `feature` : `recreate_local_and_play` vit derrière
+/// `local-audio`, qui n'est PAS dans le jeu du job `test` de la CI
+/// (`--no-default-features --features oaat,cloud-relay,bandcamp`). Une garde
+/// posée derrière cette fonctionnalité ne serait exécutée que par
+/// `test-shipped-features` et `audio-embedding`, tous deux conditionnés à
+/// `full` — donc jamais sur une PR vers `batch/*`. `include_str!` lit le
+/// texte du fichier quelles que soient les `cfg`.
+#[cfg(test)]
+mod recreation_locale_guard {
+    /// Le CORPS de `recreate_local_and_play`, de sa signature à son accolade
+    /// fermante.
+    ///
+    /// ⚠️ Le fichier est inclus en ENTIER, ce module compris, et les motifs
+    /// cherchés figurent aussi dans les messages ci-dessous : un
+    /// `contains` sur le fichier complet se trouverait lui-même et rendrait
+    /// vrai quoi qu'il arrive (#2082). La découpe l'empêche — `find` rend la
+    /// PREMIÈRE occurrence, celle de la variante `local-audio`, la seule qui
+    /// construise réellement une sortie.
+    fn corps_de_recreation() -> &'static str {
+        const TOUT: &str = include_str!("orchestrator.rs");
+        const SIGNATURE: &str = "    async fn recreate_local_and_play(\n";
+        let debut = TOUT.find(SIGNATURE).unwrap_or_else(|| {
+            panic!(
+                "`recreate_local_and_play` a été renommée ou remaniée : ce \
+                 garde-fou ne garde plus rien tant qu'il n'a pas suivi (#1770)."
+            )
+        });
+        let apres = &TOUT[debut..];
+        let fin = apres
+            .find("\n    }\n")
+            .map(|i| i + 7)
+            .unwrap_or(apres.len());
+        let corps = &apres[..fin];
+        assert!(
+            corps.contains("LocalOutput"),
+            "la découpe ne tombe plus sur la variante qui construit la sortie"
+        );
+        corps
+    }
+
+    #[test]
+    fn la_sortie_recreee_ne_code_pas_les_reglages_en_dur() {
+        let corps = corps_de_recreation();
+        assert!(
+            corps.contains("self.reglages_sortie_locale()"),
+            "`recreate_local_and_play` ne lit plus les réglages. Sous Windows \
+             et macOS, un DAC éteint au démarrage (ou retiré par le balayage à \
+             chaud) sortirait en PARTAGÉ et jamais en ASIO au premier appui \
+             sur Lecture, sans que l'écran le dise (#1770)."
+        );
+        assert!(
+            !corps.contains("LocalOutput::new("),
+            "`LocalOutput::new` code `exclusive_mode = false` et \
+             `audio_backend = \"auto\"` en dur : c'est exactement le défaut du \
+             point 3 de #1770. Passer par `with_options` avec les valeurs lues."
+        );
+        assert!(
+            corps.contains("exclusive_mode,") && corps.contains("&audio_backend,"),
+            "les valeurs lues ne sont plus celles remises au constructeur : \
+             les lire pour ne pas s'en servir ne corrige rien (#1770)."
+        );
+        for litteral in ["\"auto\"", "\"wasapi\"", "\"asio\"", "\"coreaudio\""] {
+            assert!(
+                !corps.contains(litteral),
+                "`{litteral}` est de retour en dur dans \
+                 `recreate_local_and_play` : le réglage de l'utilisateur \
+                 redevient sans effet sur ce chemin (#1770)."
             );
         }
     }

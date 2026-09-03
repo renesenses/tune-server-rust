@@ -84,6 +84,29 @@ fn play_error_response(e: String) -> axum::response::Response {
         )
             .into_response();
     }
+    // Sentinelle « format sans décodeur » de orchestrator.play() : le fichier
+    // est bien là, il est lisible, mais aucun décodeur livré ne sait le rendre —
+    // un ISO SACD demande `sacd_extract`, outil externe que Tune ne fournit pas
+    // (#3234). Le motif vient tel quel du cœur : c'est celui que le rapport de
+    // parcours affiche déjà (#2992), et l'utilisateur doit lire la même phrase
+    // aux deux endroits.
+    //
+    // 422 comme `unsupported_output_command` plus bas, et pour la raison qui y
+    // est déjà écrite : une capacité absente est une requête impossible, pas une
+    // panne. 500 enverrait chercher un défaut du serveur ; 404 mentirait sur un
+    // fichier présent ; 502 — où le fourre-tout `e.contains("extraction")`
+    // ci-dessous aurait fait tomber ce motif — accuserait un service distant qui
+    // n'a rien à voir.
+    if let Some(motif) = e.strip_prefix("format_not_playable:") {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "format_not_playable",
+                "message": motif,
+            })),
+        )
+            .into_response();
+    }
     let code = if e.contains("YouTube")
         || e.contains("youtube")
         || e.contains("yt-dlp")
@@ -814,7 +837,7 @@ async fn set_queue_retrying(
     sqlite: bool,
     zone_id: i64,
     track_ids: &[i64],
-) -> Result<(), String> {
+) -> Result<tune_core::db::play_queue_repo::SetQueueOutcome, String> {
     let _write_guard = if sqlite {
         Some(crate::sqlite_write_gate::user_queue().await)
     } else {
@@ -823,8 +846,12 @@ async fn set_queue_retrying(
     const MAX_ATTEMPTS: usize = 12;
     let mut last_err = String::new();
     for attempt in 0..MAX_ATTEMPTS {
+        // 🔴 #3231 — le compte rendu de `set_queue` remonte TEL QUEL : les
+        // identifiants absents de `tracks` sont sautes, et l'appelant doit
+        // pouvoir journaliser le nombre de lignes REELLEMENT ecrites plutot que
+        // le nombre demande.
         match queue_repo.set_queue(zone_id, track_ids) {
-            Ok(()) => return Ok(()),
+            Ok(outcome) => return Ok(outcome),
             Err(e) if e.contains("within a transaction") => {
                 last_err = e;
                 if attempt + 1 < MAX_ATTEMPTS {
@@ -911,6 +938,133 @@ mod sqlite_scan_queue_arbitration_tests {
             vec![first_id, second_id],
             "the requested queue must survive the scan arbitration intact"
         );
+    }
+}
+
+#[cfg(test)]
+mod refus_de_format_3234 {
+    use super::play_error_response;
+    use axum::http::StatusCode;
+    use serde_json::Value;
+
+    /// #3234 — ce que la ROUTE rend quand la lecture bute sur un format que
+    /// Tune ne sait pas décoder.
+    ///
+    /// L'épreuve porte sur la RÉPONSE, pas sur la condition : code HTTP, nom
+    /// de l'erreur, et contenu du message tel qu'un humain le lira. Le motif
+    /// n'est pas réécrit ici — il vient de la constante de production que le
+    /// rapport de parcours affiche déjà (#2992), de sorte que les deux
+    /// frontières ne peuvent pas diverger sans que ceci rougisse.
+    #[tokio::test]
+    async fn la_route_nomme_le_format_refuse_au_lieu_de_rendre_un_500() {
+        let reponse = play_error_response(format!(
+            "format_not_playable:{}",
+            tune_core::audio::iso_sacd::MOTIF_ISO_SACD_NON_EXTRAIT
+        ));
+
+        assert_eq!(
+            reponse.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "une capacité absente est une requête impossible (422), pas une panne du serveur"
+        );
+
+        let corps = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+            .await
+            .expect("corps de la réponse");
+        let corps: Value = serde_json::from_slice(&corps).expect("corps JSON");
+        assert_eq!(
+            corps["error"], "format_not_playable",
+            "le client doit pouvoir distinguer ce refus d'une panne : {corps}"
+        );
+
+        let message = corps["message"].as_str().expect("un message pour l'humain");
+        assert!(
+            message.contains("ISO SACD"),
+            "le message doit NOMMER le format : {message}"
+        );
+        assert!(
+            message.contains("sacd_extract") && message.contains("non fourni"),
+            "le message doit NOMMER ce qui manque et dire que Tune ne le livre pas : {message}"
+        );
+        // Aucune promesse de date : « bientôt », « prochaine version » et leurs
+        // cousins engageraient une livraison que personne n'a décidée.
+        for promesse in ["bientôt", "prochaine", "à venir", "202"] {
+            assert!(
+                !message.contains(promesse),
+                "le message ne doit promettre aucune date ({promesse}) : {message}"
+            );
+        }
+    }
+
+    /// Garde de SITE — les DEUX frontières de lecture posent le refus (#3234).
+    ///
+    /// L'épreuve de la route ci-dessus ne mesure que la mise en forme HTTP :
+    /// retirer la garde de `tune-server/src/routes/library/tracks.rs` (dans
+    /// `stream_track_audio`, juste avant le calcul du `Content-Type`) la
+    /// laisserait verte pendant que le lecteur du navigateur et le serveur
+    /// média UPnP recommenceraient à servir 4 Go d'image disque sous un 200.
+    ///
+    /// Ce fichier-ci n'est PAS lu : le test se prouverait sur son propre module
+    /// de test, où le nom apparaît dans ce commentaire même.
+    #[test]
+    fn le_flux_de_fichier_local_pose_aussi_le_refus_de_format() {
+        let source = include_str!("library/tracks.rs");
+        // Le module de test du fichier visé est retiré : une garde qui compte
+        // une occurrence citée par une assertion ne garde rien.
+        let production = source
+            .split(&format!("#[cfg({})]", "test"))
+            .next()
+            .expect("le code de production précède tout module de test");
+        assert!(
+            production.contains("iso_sacd::refus_de_lecture"),
+            "tune-server/src/routes/library/tracks.rs, dans `stream_track_audio` \
+             (juste avant le calcul du `Content-Type`) : la garde de #3234 a \
+             disparu. Sans elle, GET /api/v1/library/tracks/{{id}}/audio rend 200 \
+             et les octets bruts d'un ISO SACD — un silence, jamais une erreur."
+        );
+        assert!(
+            production.contains("\"format_not_playable\""),
+            "tune-server/src/routes/library/tracks.rs : le refus doit porter le \
+             MÊME nom d'erreur que la route de lecture, sinon le client a deux \
+             cas à connaître pour un seul empêchement (#3234)."
+        );
+    }
+
+    /// Contre-épreuve de la garde de SITE : elle doit voir le motif dans le
+    /// fichier de PRODUCTION, et refuser de se prouver sur un module de test.
+    ///
+    /// Sans ceci, `split("#[cfg(test)]")` pourrait ne rien couper (nom mal
+    /// orthographié, fichier sans module de test) et la garde deviendrait un
+    /// simple `contains` sur le fichier entier — vert grâce à ses propres
+    /// commentaires le jour où quelqu'un déplacerait la garde dans les tests.
+    #[test]
+    fn la_garde_de_site_ne_se_prouve_pas_sur_un_module_de_test() {
+        let source = include_str!("library/tracks.rs");
+        let production = source.split(&format!("#[cfg({})]", "test")).next().unwrap();
+        assert!(
+            production.len() < source.len(),
+            "tune-server/src/routes/library/tracks.rs n'a plus de module \
+             `#[cfg(test)]` : la coupe ne retire plus rien et la garde de site \
+             ci-dessus se prouverait sur du code de test"
+        );
+        assert!(
+            !production.contains("le_flux_de_fichier_local_pose_aussi_le_refus"),
+            "la partie production ne doit contenir aucun nom d'épreuve"
+        );
+    }
+
+    /// Témoin : le refus reste une branche à part. Une erreur de lecture
+    /// ordinaire garde exactement le code et le nom qu'elle avait avant #3234 —
+    /// sans quoi le nouveau 422 avalerait des pannes réelles.
+    #[tokio::test]
+    async fn une_panne_de_lecture_ordinaire_garde_son_code() {
+        let reponse = play_error_response("decode timeout".into());
+        assert_eq!(reponse.status(), StatusCode::BAD_GATEWAY);
+        let corps = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+            .await
+            .expect("corps de la réponse");
+        let corps: Value = serde_json::from_slice(&corps).expect("corps JSON");
+        assert_eq!(corps["error"], "upstream_error");
     }
 }
 
@@ -1595,7 +1749,23 @@ async fn play(
     )
     .await
     {
-        Ok(()) => info!(zone_id, n = track_ids.len(), "set_queue_ok"),
+        // `n` valait `track_ids.len()` — le nombre DEMANDE, pas le nombre ecrit.
+        // Sur une file amputee (#3231) ce journal affirmait 190 la ou 5 lignes
+        // existaient : un compteur qui ment (#2394). Il dit maintenant les deux,
+        // et une perte non nulle sort en `warn`.
+        Ok(outcome) => {
+            if outcome.has_loss() {
+                warn!(
+                    zone_id,
+                    demandees = outcome.requested,
+                    inserees = outcome.inserted,
+                    absentes = outcome.skipped_count(),
+                    "set_queue_incomplet"
+                );
+            } else {
+                info!(zone_id, n = outcome.inserted, "set_queue_ok");
+            }
+        }
         Err(e) => {
             // Never proceed on the STALE queue: track 1 would play now and the
             // natural-end advance would then resurrect whatever the DB still
@@ -4199,7 +4369,21 @@ pub async fn shuffle_all(
     )
     .await
     {
-        Ok(()) => info!(zone_id, n = all_ids.len(), "set_queue_ok"),
+        // Meme correction qu'au site « Lire » : journaliser les lignes ECRITES,
+        // et dire la perte quand il y en a une (#3231).
+        Ok(outcome) => {
+            if outcome.has_loss() {
+                warn!(
+                    zone_id,
+                    demandees = outcome.requested,
+                    inserees = outcome.inserted,
+                    absentes = outcome.skipped_count(),
+                    "shuffle_set_queue_incomplet"
+                );
+            } else {
+                info!(zone_id, n = outcome.inserted, "set_queue_ok");
+            }
+        }
         Err(e) => {
             warn!(zone_id, error = %e, "shuffle_set_queue_failed_clearing");
             let _ = queue_repo.clear(zone_id);

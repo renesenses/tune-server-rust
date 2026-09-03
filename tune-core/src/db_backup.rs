@@ -36,7 +36,7 @@ pub fn create_backup(db_path: &str) -> Option<BackupInfo> {
         return None;
     }
 
-    for suffix in ["-wal", "-shm"] {
+    for suffix in ANNEXES_SQLITE {
         let wal = db_file.with_file_name(format!("{}{suffix}", db_file.file_name()?.to_str()?));
         if wal.exists() {
             let dest = backup_dir.join(format!("{backup_name}{suffix}"));
@@ -165,7 +165,7 @@ pub fn replace_database(db_path: &str, source: &Path) -> Result<u64, String> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("invalid database path: {db_path}"))?;
 
-    for suffix in ["-wal", "-shm"] {
+    for suffix in ANNEXES_SQLITE {
         let side = db_file.with_file_name(format!("{name}{suffix}"));
         if side.exists() {
             let _ = fs::remove_file(&side);
@@ -173,6 +173,125 @@ pub fn replace_database(db_path: &str, source: &Path) -> Result<u64, String> {
     }
 
     fs::copy(source, db_file).map_err(|e| e.to_string())
+}
+
+/// Les fichiers annexes d'une base SQLite.
+///
+/// Une base n'est pas UN fichier : le `-wal` porte les transactions pas encore
+/// repliées dans le `.db`, le `-shm` l'index de ce journal. Les trois gestes de
+/// ce module traitaient déjà les deux suffixes avec la base — [`create_backup`]
+/// les copie, [`replace_database`] les efface, [`prune_backups`] les supprime —
+/// mais chacun réécrivait le littéral `["-wal", "-shm"]` pour son compte.
+///
+/// La constante existe pour que le prochain appelant la TROUVE au lieu de
+/// l'oublier. C'est exactement ce qui manquait à la migration Windows de
+/// `tune-server/src/windows_migrate.rs`, qui recopiait la base de
+/// *Program Files* vers `%LOCALAPPDATA%\TuneServer` avec un `fs::copy` nu :
+/// la base arrivait amputée des dernières écritures encore dans son journal.
+/// Le pendant macOS (#3227) l'avait écrite de son côté dans
+/// `tune-server/src/config.rs` ; les deux exemplaires étaient identiques, et
+/// c'est celui-ci qui reste — les deux migrations le réutilisent.
+pub const ANNEXES_SQLITE: [&str; 2] = ["-wal", "-shm"];
+
+/// Recopie une base SQLite **et ses annexes** vers `cible`, sans jamais
+/// toucher à la source.
+///
+/// Deux garanties, parce qu'il s'agit de la donnée d'un utilisateur :
+///
+/// * **rien n'est détruit** — on copie, on ne déplace pas. Si quoi que ce soit
+///   tourne mal ensuite, la base d'origine est encore là où elle était ;
+/// * **aucun état à mi-chemin** — les fichiers sont d'abord écrits à côté de la
+///   cible sous un nom temporaire, puis mis en place par des renommages faits
+///   dans le même dossier. Un échec avant la fin retire les temporaires ET les
+///   fichiers déjà posés, et rend l'erreur : la cible est alors exactement dans
+///   l'état où elle était.
+///
+/// La cible n'est **pas** protégée ici : c'est à l'appelant de vérifier qu'elle
+/// est absente avant d'appeler, et de journaliser la base qu'il délaisse quand
+/// les deux existent — jamais d'écrasement silencieux d'une base d'utilisateur.
+/// Les deux appelants le font : `config::appliquer_plan_base_macos` (#3185) et
+/// `windows_migrate::appliquer_plan_migration_windows`.
+///
+/// Sans `cfg` et dans `tune-core` à dessein : les deux chemins qui migrent une
+/// base — macOS (`~/Library/Application Support/Tune`) et Windows
+/// (`%LOCALAPPDATA%\TuneServer`) — vivent derrière un `#[cfg(target_os = …)]`
+/// et ne sont donc compilés sur aucune autre plateforme. Un test qui porterait
+/// le même `cfg` serait vert contre rien. Ici la règle est compilée et éprouvée
+/// partout ; seul le câblage — lire `%LOCALAPPDATA%`, lire `$HOME` — reste
+/// sous `cfg`.
+pub fn copier_base_sqlite(source: &Path, cible: &Path) -> Result<u64, String> {
+    /// Défait ce qui a été posé, retire les temporaires, et rend l'erreur.
+    fn renoncer(
+        a_poser: &[(PathBuf, PathBuf)],
+        poses: &[PathBuf],
+        erreur: String,
+    ) -> Result<u64, String> {
+        for chemin in poses {
+            let _ = fs::remove_file(chemin);
+        }
+        for (temporaire, _) in a_poser {
+            let _ = fs::remove_file(temporaire);
+        }
+        Err(erreur)
+    }
+
+    let nom_source = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("chemin de base invalide : {}", source.display()))?;
+    let nom_cible = cible
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("chemin de base invalide : {}", cible.display()))?;
+    let marque = format!("{nom_cible}.migration-{}", std::process::id());
+
+    // (temporaire, nom définitif)
+    let mut a_poser: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut poses: Vec<PathBuf> = Vec::new();
+
+    let temporaire = cible.with_file_name(&marque);
+    if let Err(e) = fs::copy(source, &temporaire) {
+        // Rien n'a encore été posé : il n'y a que ce temporaire à retirer, et
+        // il peut n'avoir jamais été créé.
+        let _ = fs::remove_file(&temporaire);
+        return Err(format!("copie de {} : {e}", source.display()));
+    }
+    a_poser.push((temporaire, cible.to_path_buf()));
+
+    for suffixe in ANNEXES_SQLITE {
+        let annexe = source.with_file_name(format!("{nom_source}{suffixe}"));
+        if !annexe.exists() {
+            continue;
+        }
+        let temporaire = cible.with_file_name(format!("{marque}{suffixe}"));
+        if let Err(e) = fs::copy(&annexe, &temporaire) {
+            let _ = fs::remove_file(&temporaire);
+            return renoncer(
+                &a_poser,
+                &poses,
+                format!("copie de {} : {e}", annexe.display()),
+            );
+        }
+        a_poser.push((
+            temporaire,
+            cible.with_file_name(format!("{nom_cible}{suffixe}")),
+        ));
+    }
+
+    for (temporaire, definitif) in &a_poser {
+        if let Err(e) = fs::rename(temporaire, definitif) {
+            return renoncer(
+                &a_poser,
+                &poses,
+                format!("mise en place de {} : {e}", definitif.display()),
+            );
+        }
+        poses.push(definitif.clone());
+    }
+
+    fs::metadata(cible)
+        .map(|m| m.len())
+        .map_err(|e| format!("base migrée illisible à {} : {e}", cible.display()))
 }
 
 fn prune_backups(backup_dir: &Path, stem: &str, ext: &str) {
@@ -198,7 +317,7 @@ fn prune_backups(backup_dir: &Path, stem: &str, ext: &str) {
     while files.len() > MAX_BACKUPS {
         if let Some(old) = files.first() {
             let _ = fs::remove_file(old);
-            for s in ["-wal", "-shm"] {
+            for s in ANNEXES_SQLITE {
                 let wal = old.with_file_name(format!(
                     "{}{s}",
                     old.file_name().unwrap_or_default().to_str().unwrap_or("")

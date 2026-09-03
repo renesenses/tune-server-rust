@@ -1954,12 +1954,14 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             }
 
             // New device found — register it
+            // L'hôte qui a énuméré ce nom voyage avec lui (#3230).
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
                 state.effective_exclusive_mode(),
                 &configured_backend,
-            );
+            )
+            .with_origin_host(&dev.backend);
             outputs.register(Box::new(local_out));
             registered_count += 1;
 
@@ -2463,5 +2465,134 @@ mod heartbeat_server_id_tests {
                 );
             }
         }
+    }
+}
+
+/// GARDE DE SITE (#1770) — les deux chemins qui enregistrent une sortie locale
+/// à partir d'une énumération doivent ÉTIQUETER l'hôte qui a énuméré le nom.
+///
+/// C'est la précondition du correctif. La rectification du backend vit dans
+/// `LocalOutput::with_origin_host` (tune-core), donc une sortie qui n'étiquette
+/// pas son origine n'est pas rectifiée : elle repart avec `asio` sur un nom
+/// WASAPI, et `AsioExclusiveOutput` la refuse — c'est exactement la panne de
+/// jfpaquet.
+///
+/// Pourquoi une garde textuelle et pas une épreuve de bout en bout : les deux
+/// fonctions visées sont derrière `#[cfg(feature = "local-audio")]` et
+/// demandent un `AppState` complet plus de vrais périphériques. La garde lit le
+/// code de PRODUCTION seul — le module de test est retranché avant l'examen,
+/// sans quoi il se prouverait lui-même. Sa propre contre-épreuve est
+/// `la_garde_refuse_un_site_sans_etiquette` : le détecteur doit rougir sur un
+/// extrait fabriqué qui n'étiquette rien.
+#[cfg(test)]
+mod etiquette_hote_origine_i1770 {
+    /// Les sites d'enregistrement de ce fichier qui n'enchaînent PAS
+    /// `.with_origin_host(...)` sur le constructeur, rendus par numéro de
+    /// ligne (1-indexé) dans le fichier d'origine.
+    fn sites_sans_etiquette(source: &str) -> Vec<usize> {
+        // Aiguille construite à l'exécution : écrite en clair, ce module se
+        // compterait lui-même dès qu'on le relit par `include_str!`.
+        let marqueur_test = format!("#[cfg({})]", "test");
+        let production = source.split(&marqueur_test).next().unwrap_or("");
+
+        const CONSTRUCTEUR: &str = "LocalOutput::with_options_and_endpoint(";
+        const ETIQUETTE: &str = ".with_origin_host(";
+
+        let mut manquants = Vec::new();
+        let mut curseur = 0usize;
+        while let Some(pos) = production[curseur..].find(CONSTRUCTEUR) {
+            let debut = curseur + pos;
+            // La chaîne d'appel tient largement dans 800 octets : le plus long
+            // des deux sites en fait moins de 300. La borne est reculée sur une
+            // frontière de caractère — ces fichiers sont pleins d'accents et de
+            // tirets cadratins, et trancher au milieu d'un « — » panique.
+            let mut fin = (debut + 800).min(production.len());
+            while fin > debut && !production.is_char_boundary(fin) {
+                fin -= 1;
+            }
+            if !production[debut..fin].contains(ETIQUETTE) {
+                manquants.push(production[..debut].lines().count());
+            }
+            curseur = debut + CONSTRUCTEUR.len();
+        }
+        manquants
+    }
+
+    /// Combien de sites ce fichier porte, étiquetés ou non.
+    fn nombre_de_sites(source: &str) -> usize {
+        let marqueur_test = format!("#[cfg({})]", "test");
+        source
+            .split(&marqueur_test)
+            .next()
+            .unwrap_or("")
+            .matches("LocalOutput::with_options_and_endpoint(")
+            .count()
+    }
+
+    #[test]
+    fn les_deux_sites_d_enregistrement_local_etiquettent_l_hote_d_origine() {
+        let fichiers = [
+            (
+                "tune-server/src/background.rs",
+                include_str!("background.rs"),
+            ),
+            ("tune-server/src/startup.rs", include_str!("startup.rs")),
+        ];
+
+        let mut total = 0usize;
+        for (chemin, source) in fichiers {
+            total += nombre_de_sites(source);
+            let manquants = sites_sans_etiquette(source);
+            assert!(
+                manquants.is_empty(),
+                "{chemin} enregistre une sortie locale sans étiqueter l'hôte \
+                 qui a énuméré son nom, ligne(s) {manquants:?}. Sans \
+                 `.with_origin_host(&dev.backend)`, \
+                 `config::openable_local_backend` n'est jamais consultée : la \
+                 sortie repart avec le backend CONFIGURÉ (`asio`) sur un nom \
+                 énuméré par WASAPI, et `AsioExclusiveOutput::new` ne peut que \
+                 la refuser (#1770, jfpaquet, 0.9.130)"
+            );
+        }
+
+        assert_eq!(
+            total, 2,
+            "les deux seuls sites d'enregistrement d'une sortie locale issue \
+             d'une énumération sont `register_local_outputs` (startup.rs) et \
+             `rescan_local_audio_devices` (background.rs). Un site de plus ou \
+             de moins : reprendre le recensement de #1770 avant de toucher à \
+             ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur lui-même. Sans elle, `sites_sans_etiquette`
+    /// pourrait ne rien détecter du tout et la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_un_site_sans_etiquette() {
+        let sain = "let o = LocalOutput::with_options_and_endpoint(\n    n, e, x, b,\n)\n.with_origin_host(&dev.backend);\n";
+        assert!(
+            sites_sans_etiquette(sain).is_empty(),
+            "le détecteur doit accepter un site correctement étiqueté"
+        );
+
+        let malade = "let o = LocalOutput::with_options_and_endpoint(\n    n, e, x, &configured_backend,\n);\noutputs.register(Box::new(o));\n";
+        assert_eq!(
+            sites_sans_etiquette(malade),
+            vec![1],
+            "le détecteur doit nommer la ligne d'un site qui n'étiquette pas \
+             son hôte d'origine"
+        );
+
+        // Et il ne doit pas se laisser sauver par une étiquette posée
+        // très loin, sur un AUTRE appel.
+        let loin = format!(
+            "let o = LocalOutput::with_options_and_endpoint(n, e, x, b);\n{}\n.with_origin_host(&dev.backend);\n",
+            "// remplissage\n".repeat(80)
+        );
+        assert_eq!(
+            sites_sans_etiquette(&loin),
+            vec![1],
+            "une étiquette hors de la chaîne d'appel ne doit pas compter"
+        );
     }
 }

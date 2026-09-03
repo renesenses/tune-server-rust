@@ -1286,12 +1286,18 @@ pub async fn register_local_outputs(state: &AppState) {
 
         for dev in &devices {
             let device_id = format!("local:{}", dev.name);
+            // `dev.backend` est l'hôte qui a énuméré ce nom. Il compte ici plus
+            // qu'ailleurs : quand ASIO n'expose rien, la boucle ci-dessus a
+            // ré-énuméré en WASAPI, si bien que ces noms-là sont des noms
+            // WASAPI alors que la lecture demandera toujours l'hôte « asio »
+            // (#3230).
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
                 exclusive_mode,
                 audio_backend,
-            );
+            )
+            .with_origin_host(&dev.backend);
             // Ensemencer la sortie avec le volume stocké.
             //
             // `LocalOutput` naît à `user_volume = 1.0` et rien ne le rectifiait :

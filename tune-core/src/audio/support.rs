@@ -211,6 +211,19 @@ mod tests {
     fn tout_format_catalogue_est_decode_ou_extrait() {
         for ext in LIBRARY_AUDIO_EXTENSIONS {
             if *ext == "iso" {
+                // `iso` reste la seule exception au contrat de décodage — mais
+                // une exception, pas un angle mort. Ce test se contentait ici
+                // d'un `continue` : il ACTAIT qu'un ISO puisse être catalogué
+                // sans décodeur ET sans que rien ne le dise, c'est-à-dire le
+                // défaut même de #3234. Il n'est pas supprimé, il est resserré :
+                // l'exemption ne vaut plus que si la demande de lecture rend un
+                // motif nommé à la place du silence.
+                assert!(
+                    crate::audio::iso_sacd::refus_de_lecture(Path::new("album.iso")).is_some(),
+                    ".iso est le seul format catalogué sans décodeur natif : la \
+                     demande de lecture doit alors rendre un motif, sans quoi la \
+                     zone reste muette sans un mot (#3234)"
+                );
                 continue;
             }
             assert!(

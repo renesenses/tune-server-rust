@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -630,7 +630,7 @@ enum ReadFileError {
 /// duration instead of leaving the track at duration 0. (Pierre M's NAS,
 /// Philippe Landes' RS130 SSD)
 fn read_file_with_retry(
-    path: &PathBuf,
+    path: &Path,
     with_hash: bool,
 ) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
     let result = match read_file_with_timeout(path, with_hash, FILE_TIMEOUT) {
@@ -704,14 +704,14 @@ fn probe_dsd_header_duration_bounded(path: &std::path::Path) -> Option<u64> {
 }
 
 fn read_file_with_timeout(
-    path: &PathBuf,
+    path: &Path,
     with_hash: bool,
     tag_timeout: Duration,
 ) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
     // Phase 1 — read the tags. This is fast even on a NAS (only the header /
     // tag blocks are read), so `tag_timeout` is plenty. A timeout here means the
     // tags are genuinely unreadable → caller falls back to filename metadata.
-    let meta_path = path.clone();
+    let meta_path = path.to_path_buf();
     let (mtx, mrx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = match crate::audio::support::library_audio_support(&meta_path) {
@@ -741,7 +741,7 @@ fn read_file_with_timeout(
     // and just skip the hash (audio_hash = None) instead of dropping the track
     // to filename-only metadata. Dedup is degraded for that one file, nothing
     // more.
-    let hash_path = path.clone();
+    let hash_path = path.to_path_buf();
     let (htx, hrx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = htx.send(compute_audio_hash(&hash_path));
@@ -1714,6 +1714,90 @@ pub fn scan_files_parallel(
 /// Balances memory usage vs. rayon thread-pool efficiency.
 pub const SCAN_BATCH_SIZE: usize = 500;
 
+/// Répartit `files` en lots d'au plus `batch_size` chemins **sans jamais
+/// séparer les fichiers d'un même dossier**.
+///
+/// Le scan décide « ce dossier est-il une compilation ? » sur le LOT qu'on lui
+/// donne (`TrackImporter::begin_batch`). Le découpage précédent — un
+/// `chunks(500)` sur l'ordre de parcours — coupait donc les albums de plus de
+/// 500 pistes, mais surtout **tous** ceux qui tombaient à cheval sur une
+/// frontière : le même dossier était jugé deux fois, sur deux populations
+/// différentes, et le tag « compilation » sortait « au hasard » d'un scan à
+/// l'autre (Pierre M, fil 1043, #3232).
+///
+/// Le regroupement est aussi nécessaire dans l'autre sens : `WalkDir` descend
+/// en profondeur, donc les fichiers d'un dossier ne sont même pas contigus dès
+/// qu'un sous-dossier (`CD2/`) s'intercale entre deux d'entre eux. La
+/// contiguïté supposée par l'ancien commentaire n'a jamais existé.
+///
+/// Garanties :
+/// - aucun lot ne dépasse `batch_size` — le plafond mémoire du scan (un lot de
+///   `ScannedFile` en vol, pochettes embarquées comprises, celles qui ont fait
+///   sauter la machine de JeromeQ) est **inchangé** ;
+/// - l'ordre est déterministe : les dossiers sortent dans l'ordre de leur
+///   PREMIER fichier, et les fichiers d'un dossier dans l'ordre du parcours ;
+/// - seul un dossier qui contient à lui seul plus de `batch_size` fichiers est
+///   encore coupé — il ne tiendrait pas dans un lot sans lever le plafond. Le
+///   cas est journalisé, et il ne concerne pas un album (500 pistes dans UN
+///   dossier).
+///
+/// Le coût est en RÉFÉRENCES, pas en métadonnées : deux `&Path` par fichier et
+/// une entrée de table par dossier, soit quelques mégaoctets pour une
+/// bibliothèque de 58 000 fichiers — sans commune mesure avec les 6,1 Gio d'un
+/// lot de pochettes.
+pub fn lots_alignes_sur_les_dossiers(files: &[PathBuf], batch_size: usize) -> Vec<Vec<&Path>> {
+    let taille = if batch_size == 0 {
+        SCAN_BATCH_SIZE
+    } else {
+        batch_size
+    };
+    // Ordre de première apparition des dossiers + leurs fichiers.
+    let mut ordre: Vec<&Path> = Vec::new();
+    let mut par_dossier: HashMap<&Path, Vec<&Path>> = HashMap::new();
+    for f in files {
+        let dossier = f.parent().unwrap_or_else(|| Path::new(""));
+        par_dossier
+            .entry(dossier)
+            .or_insert_with(|| {
+                ordre.push(dossier);
+                Vec::new()
+            })
+            .push(f.as_path());
+    }
+
+    let mut lots: Vec<Vec<&Path>> = Vec::new();
+    let mut courant: Vec<&Path> = Vec::new();
+    for dossier in ordre {
+        let mut groupe = par_dossier.remove(dossier).unwrap_or_default();
+        if groupe.len() > taille {
+            // Plus gros qu'un lot entier : le garder d'un bloc lèverait le
+            // plafond mémoire du scan. On le coupe, et on le DIT — c'est le
+            // seul cas où la décision « compilation » reste partielle.
+            warn!(
+                dossier = %dossier.display(),
+                fichiers = groupe.len(),
+                taille_de_lot = taille,
+                "scan_dossier_plus_gros_qu_un_lot — la décision « compilation » de ce dossier sera prise par morceaux"
+            );
+            if !courant.is_empty() {
+                lots.push(std::mem::take(&mut courant));
+            }
+            for morceau in groupe.chunks(taille) {
+                lots.push(morceau.to_vec());
+            }
+            continue;
+        }
+        if !courant.is_empty() && courant.len() + groupe.len() > taille {
+            lots.push(std::mem::take(&mut courant));
+        }
+        courant.append(&mut groupe);
+    }
+    if !courant.is_empty() {
+        lots.push(courant);
+    }
+    lots
+}
+
 /// Scan files in batches, calling `on_batch` after each chunk is parsed.
 ///
 /// This enables **progressive availability**: each batch can be committed to
@@ -1723,6 +1807,12 @@ pub const SCAN_BATCH_SIZE: usize = 500;
 /// The callback receives `(batch: Vec<ScannedFile>, batch_index: usize, total_files: usize)`.
 /// It runs on a rayon worker thread, so the caller must ensure any shared
 /// state (DB handle, caches) is `Send + Sync`.
+///
+/// Les lots sont **alignés sur les dossiers** — voir
+/// [`lots_alignes_sur_les_dossiers`]. `batch_size` reste un PLAFOND : un lot
+/// peut être plus petit pour ne pas couper un dossier en deux, mais jamais
+/// plus gros. C'est ce qui rend la décision « compilation » indépendante du
+/// découpage (#3232).
 ///
 /// Elle REND ce qu'elle a réellement écrit ([`EcrituresDuLot`]) : le parcours
 /// ne touche pas à la base et ne peut donc pas mesurer lui-même ce qu'elle a
@@ -1753,7 +1843,14 @@ pub fn scan_files_batched(
     // back to the default rayon pool if it couldn't be built.
     let io_pool = scan_io_pool();
 
-    for (batch_idx, chunk) in files.chunks(batch_sz).enumerate() {
+    // Un DOSSIER ne doit pas être coupé entre deux lots : la décision
+    // « compilation » se prend sur le lot, et un album à cheval était jugé
+    // deux fois sur deux populations différentes (#3232).
+    let mut deja_lus = 0usize;
+    for (batch_idx, chunk) in lots_alignes_sur_les_dossiers(files, batch_sz)
+        .into_iter()
+        .enumerate()
+    {
         // Parse metadata in parallel within this chunk
         let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let batch_timeout_counter = AtomicUsize::new(0);
@@ -1762,6 +1859,7 @@ pub fn scan_files_batched(
             chunk
                 .par_iter()
                 .map(|path| {
+                    let path: &Path = path;
                     // NFC-normalize: see comment in scan_files_parallel
                     let path_str: String = path.to_string_lossy().nfc().collect();
                     warn_unsafe_path_text(&path_str);
@@ -1908,10 +2006,15 @@ pub fn scan_files_batched(
             );
         }
 
+        // Compteur RÉEL de fichiers lus. Les lots n'ont plus tous la même
+        // taille (ils s'arrêtent aux frontières de dossier), donc
+        // `(batch_idx + 1) * batch_sz` annoncerait plus de fichiers lus qu'il
+        // n'y en a — et jusqu'à `total` bien avant la fin.
+        deja_lus += batch.len();
         info!(
             batch = batch_idx,
             batch_size = batch.len(),
-            scanned = (batch_idx + 1) * batch_sz,
+            scanned = deja_lus,
             total,
             "scan_batch_complete"
         );
@@ -3335,5 +3438,92 @@ mod tests {
             1 + distinctes.len(),
             "retenues : {retenues:?}"
         );
+    }
+
+    /// #3232 — un DOSSIER ne peut plus être coupé entre deux lots.
+    ///
+    /// L'ordre d'entrée est celui de `WalkDir`, qui descend en profondeur : les
+    /// fichiers de `/album` sont séparés par ceux de `/album/CD2`. Ils n'ont
+    /// donc jamais été contigus, contrairement à ce qu'affirmait le
+    /// commentaire de `begin_batch`.
+    #[test]
+    fn un_dossier_n_est_jamais_coupe_entre_deux_lots() {
+        let entree: Vec<PathBuf> = [
+            "/m/album/01.flac",
+            "/m/album/02.flac",
+            "/m/album/CD2/01.flac", // WalkDir s'engouffre dans le sous-dossier…
+            "/m/album/CD2/02.flac",
+            "/m/album/03.flac", // …et revient ensuite au dossier parent.
+            "/m/autre/01.flac",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+
+        for taille in 1..=8usize {
+            let lots = lots_alignes_sur_les_dossiers(&entree, taille);
+            // Rien n'est perdu, rien n'est dupliqué.
+            let mut vus: Vec<&Path> = lots.iter().flatten().copied().collect();
+            vus.sort_unstable();
+            let mut attendus: Vec<&Path> = entree.iter().map(|p| p.as_path()).collect();
+            attendus.sort_unstable();
+            assert_eq!(
+                vus, attendus,
+                "taille {taille} : la liste doit être intacte"
+            );
+            // Le plafond mémoire du scan est inchangé.
+            for lot in &lots {
+                assert!(
+                    lot.len() <= taille,
+                    "taille {taille} : un lot de {} dépasse le plafond",
+                    lot.len()
+                );
+            }
+            if taille < 3 {
+                // Un lot plus petit que le dossier ne peut pas le contenir :
+                // c'est le seul cas dégradé, et il est journalisé.
+                continue;
+            }
+            // Chaque dossier tient dans UN lot et un seul.
+            let mut lot_du_dossier: HashMap<&Path, usize> = HashMap::new();
+            for (i, lot) in lots.iter().enumerate() {
+                for f in lot {
+                    let dossier = f.parent().unwrap();
+                    let precedent = lot_du_dossier.entry(dossier).or_insert(i);
+                    assert_eq!(
+                        *precedent,
+                        i,
+                        "taille {taille} : {} est réparti sur deux lots",
+                        dossier.display()
+                    );
+                }
+            }
+            assert_eq!(lot_du_dossier.len(), 3, "trois dossiers distincts");
+        }
+    }
+
+    /// Le seul cas dégradé, nommé : un dossier plus gros qu'un lot entier ne
+    /// tient pas dans un lot. Il est coupé — lever le plafond ferait rentrer
+    /// des milliers de pochettes embarquées en mémoire d'un coup — mais aucun
+    /// lot ne dépasse la taille demandée, et les autres dossiers restent
+    /// entiers.
+    #[test]
+    fn un_dossier_plus_gros_qu_un_lot_est_coupe_sans_lever_le_plafond() {
+        let mut entree: Vec<PathBuf> = (0..7)
+            .map(|n| PathBuf::from(format!("/m/gros/{n:02}.flac")))
+            .collect();
+        entree.push(PathBuf::from("/m/petit/01.flac"));
+
+        let lots = lots_alignes_sur_les_dossiers(&entree, 3);
+        assert!(lots.iter().all(|l| l.len() <= 3));
+        assert_eq!(lots.iter().map(|l| l.len()).sum::<usize>(), 8);
+        // Le petit dossier, lui, n'est pas dispersé.
+        let lots_du_petit: Vec<usize> = lots
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.iter().any(|f| f.starts_with("/m/petit")))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(lots_du_petit.len(), 1);
     }
 }

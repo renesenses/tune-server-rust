@@ -609,6 +609,76 @@ fn la_ci_n_utilise_qu_un_cache_rust_et_la_release_peut_le_renouveler() {
     );
 }
 
+/// Le job `test` de `ci.yml` doit NOMMER `bandcamp` dans son `--features`.
+///
+/// Mesure : run **33702848850**, job `Test`, PR #3257. La ligne y etait
+/// `--no-default-features --features oaat,cloud-relay`, et
+/// `tune-server/tests/bandcamp_file_de_zone_i2702.rs` — cinq essais de #2702
+/// et #2778 — se compilait SANS le service qu'il eprouve : registre a cinq
+/// services, cinq rouges, aucun defaut. Le meme jeu de features rendait la
+/// meme suite rouge sous `Test (PostgreSQL)`.
+///
+/// Le fichier porte desormais `#![cfg(feature = "bandcamp")]`, ce qui est la
+/// verite : `bandcamp = ["dep:tune-bandcamp"]`, dependance OPTIONNELLE, donc
+/// sans la fonctionnalite `BandcampService` n'existe pas. Mais un `cfg` seul
+/// aurait remplace cinq rouges par cinq essais INVISIBLES sur toute PR vers
+/// `batch/*` — `test-shipped-features`, la seule autre porte qui active
+/// `bandcamp` en EXECUTION, est differee jusqu'a `full`.
+///
+/// Ce garde est donc la moitie qui manque au `cfg` : il refuse qu'on retire
+/// la fonctionnalite de la porte qui, elle, tourne sur chaque correctif Rust.
+/// Meme role que `toute_feature_declaree_est_activee_par_une_porte_clippy`
+/// pour les lints (#2865), applique a l'EXECUTION.
+#[test]
+fn le_job_test_de_la_ci_active_bandcamp() {
+    let ci = workflow("ci.yml");
+    let jobs = jobs(&ci);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de ci.yml"))
+    };
+    let features = |corps: &str| -> String {
+        let ligne = corps
+            .lines()
+            .find(|l| l.contains("cargo test"))
+            .expect("ce job ne lance plus `cargo test`");
+        ligne
+            .split("--features ")
+            .nth(1)
+            .expect("ce job ne nomme plus de `--features`")
+            .trim()
+            .to_owned()
+    };
+
+    let test = features(corps("test"));
+    assert!(
+        test.split(',').any(|f| f.trim() == "bandcamp"),
+        "le job `test` de ci.yml n'active plus `bandcamp` : \
+         tune-server/tests/bandcamp_file_de_zone_i2702.rs porte \
+         `#![cfg(feature = \"bandcamp\")]` et ne serait plus compile — les \
+         cinq essais de #2702/#2778 disparaitraient sans un seul rouge.\n  \
+         --features {test}"
+    );
+
+    // Contre-epreuve du detecteur, dans les deux sens : il doit voir une
+    // fonctionnalite ABSENTE de cette porte-ci, et la voir PRESENTE sur la
+    // porte du jeu livre. Sans ces deux la, un extracteur casse (qui rendrait
+    // toujours la ligne entiere, ou toujours vide) passerait a vide.
+    assert!(
+        !test.split(',').any(|f| f.trim() == "karaoke"),
+        "detecteur casse : il voit `karaoke`, que le job `test` ne porte pas \
+         — --features {test}"
+    );
+    let livre = features(corps("test-shipped-features"));
+    assert!(
+        livre.split(',').any(|f| f.trim() == "karaoke"),
+        "detecteur casse : `karaoke` est bien dans le jeu livre — \
+         --features {livre}"
+    );
+}
+
 #[test]
 fn postgres_et_widget_ne_sont_plus_doubles_dans_la_ci_generale() {
     let ci = workflow("ci.yml");
@@ -1261,5 +1331,302 @@ fn la_promotion_emporte_le_paquet_debian_dans_son_propre_run() {
     assert!(
         paquet.contains("if: ${{ !inputs.dry_run }}"),
         "un dry-run de promotion attacherait un paquet pour de vrai"
+    );
+}
+
+/// Extrait les paquets qu'une ligne `cargo test` selectionne.
+///
+/// Rend `None` si la ligne n'est pas une porte `cargo test`. Rend un vecteur
+/// VIDE si la ligne en est une mais ne nomme aucun paquet — c'est le cas de
+/// `widget-ci.yml`, qui lance `cargo test` nu dans un AUTRE workspace
+/// (`tune-widget/src-tauri`, `exclude` du notre) : elle ne peut rien couvrir
+/// ici, et surtout elle ne doit pas passer pour un `--workspace`.
+fn paquets_selectionnes(ligne: &str) -> Option<(Vec<String>, bool)> {
+    let nue = ligne.trim();
+    let commande = nue
+        .strip_prefix("- run: ")
+        .or_else(|| nue.strip_prefix("run: "))?;
+    if commande != "cargo test" && !commande.starts_with("cargo test ") {
+        return None;
+    }
+
+    let mut paquets = Vec::new();
+    let mut tout = false;
+    let mut mots = commande.split_whitespace();
+    while let Some(mot) = mots.next() {
+        match mot {
+            // `--all` est l'ancien nom de `--workspace` ; cargo l'accepte
+            // encore, et une porte qui l'emploierait couvrirait tout autant.
+            "--workspace" | "--all" => tout = true,
+            "-p" | "--package" => {
+                if let Some(nom) = mots.next() {
+                    paquets.push(nom.to_string());
+                }
+            }
+            _ => {
+                for prefixe in ["-p=", "--package="] {
+                    if let Some(nom) = mot.strip_prefix(prefixe) {
+                        paquets.push(nom.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Some((paquets, tout))
+}
+
+/// 🔴 Contre-epreuve de #3266 : tout membre du workspace est EXECUTE par une
+/// porte `cargo test` de la CI.
+///
+/// Les portes de la CI nomment leurs paquets un par un (`-p`). Personne n'y
+/// lance `cargo test --workspace`. Un paquet qui n'est nomme NULLE PART n'est
+/// donc jamais execute : ses tests ne peuvent ni passer ni echouer, ils
+/// n'existent pas pour la CI. Mesure du 03/09/2026, avant ce correctif :
+/// `plugins/tune-bandcamp`, `plugins/tune-karaoke`, `tune-plugin-runtime-wasm`
+/// et `tune-ffi` etaient dans ce cas — verts sous `cargo test --workspace`,
+/// que personne ne joue, et sous rien d'autre.
+///
+/// Ce que cela coutait precisement : `plugins/tune-bandcamp/src/lib.rs` porte
+/// les DEUX gardes de site de #2778 (`aucun_resultat_de_reglage_n_est_jete`,
+/// `le_chemin_de_liaison_se_journalise`). Une garde de site existe pour crier
+/// quand un motif interdit revient en production ; celles-la ne pouvaient pas
+/// crier, faute d'etre executees. Un `let _ = reglages.set(…)` reintroduit
+/// serait passe sans un seul rouge.
+///
+/// Meme famille que #1427 (les tests de greffons derriere une feature jamais
+/// activee) et #2865 (les features jamais nommees par une porte clippy). Les
+/// deux precedents ont ete refermes par un garde qui COMPTE au lieu de citer ;
+/// celui-ci fait de meme, sur l'axe des PAQUETS.
+///
+/// Le test rend DEUX verdicts, et le second est celui qui mord : « couvert
+/// quelque part » laisserait passer un paquet couvert par la seule porte
+/// `test-shipped-features`, differee jusqu'a `full` — donc jamais jouee sur une
+/// PR vers `batch/*`. C'est exactement le piege de #2702/#2778.
+///
+/// Sabotage : retirer un `-p` de la ligne `cargo test` du job `test` de
+/// `ci.yml` fait tomber ce test en nommant le paquet decouvert.
+#[test]
+fn tout_membre_du_workspace_est_execute_par_une_porte_cargo_test() {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+    // 1. Les membres du workspace, lus dans le manifeste racine. La liste est
+    //    un inventaire, pas un echantillon (commentaire de `Cargo.toml`) : on
+    //    la relit a chaque passage plutot que d'en recopier une copie ici, qui
+    //    vieillirait en silence.
+    let manifeste = fs::read_to_string(racine.join("Cargo.toml"))
+        .unwrap_or_else(|e| panic!("Cargo.toml racine illisible : {e}"));
+    let mut liste = String::new();
+    let mut dedans = false;
+    for ligne in manifeste.lines() {
+        let t = ligne.trim();
+        if !dedans {
+            let Some(reste) = t.strip_prefix("members") else {
+                continue;
+            };
+            let Some(reste) = reste.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let Some(reste) = reste.trim_start().strip_prefix('[') else {
+                continue;
+            };
+            dedans = true;
+            liste.push_str(reste);
+        } else {
+            liste.push_str(t);
+        }
+        if let Some(fin) = liste.find(']') {
+            liste.truncate(fin);
+            break;
+        }
+        liste.push(' ');
+    }
+    assert!(
+        dedans,
+        "`members = [` introuvable dans le Cargo.toml racine"
+    );
+
+    let chemins: Vec<String> = liste
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+
+    // Le nom PUBLIE de chaque membre — c'est lui que `-p` nomme, et il ne se
+    // deduit pas du chemin : `plugins/tune-bandcamp` s'appelle `tune-bandcamp`.
+    let mut membres: Vec<(String, String)> = Vec::new();
+    for chemin in &chemins {
+        let sous_manifeste = racine.join(chemin).join("Cargo.toml");
+        let source = fs::read_to_string(&sous_manifeste).unwrap_or_else(|e| {
+            panic!(
+                "membre `{chemin}` declare mais {} illisible : {e}",
+                sous_manifeste.display()
+            )
+        });
+        let mut section = "";
+        let mut nom = None;
+        for ligne in source.lines() {
+            let t = ligne.trim();
+            if t.starts_with('[') {
+                section = if t == "[package]" { "[package]" } else { "" };
+                continue;
+            }
+            if section != "[package]" {
+                continue;
+            }
+            // `name = "tune-cli"` — et surtout pas le `name` du `[[bin]]` qui
+            // suit dans le meme fichier et vaut `tune`.
+            if let Some(reste) = t.strip_prefix("name") {
+                if let Some(reste) = reste.trim_start().strip_prefix('=') {
+                    nom = Some(reste.trim().trim_matches('"').to_string());
+                    break;
+                }
+            }
+        }
+        let nom = nom.unwrap_or_else(|| panic!("`{chemin}/Cargo.toml` ne declare pas de `name`"));
+        membres.push((nom, chemin.clone()));
+    }
+
+    assert!(
+        membres.len() >= 12,
+        "le garde-fou n'a reconnu que {} membre(s) : la forme de `members` a \
+         change et ce test ne garde plus rien — {membres:?}",
+        membres.len()
+    );
+    // Contre-epreuve du lecteur de membres, sens NEGATIF : les deux
+    // applications Tauri sont `exclude` du workspace. Un lecteur qui listerait
+    // les dossiers au lieu de lire `members` les ferait apparaitre ici, et le
+    // test exigerait une couverture pour des caisses qui ne sont meme pas dans
+    // ce workspace.
+    for absent in ["tune-desktop", "tune-widget"] {
+        assert!(
+            !membres.iter().any(|(nom, _)| nom == absent),
+            "lecteur de membres casse : `{absent}` est `exclude`, il ne peut \
+             pas etre membre — {membres:?}"
+        );
+    }
+
+    // 2. Les paquets nommes par une ligne `cargo test`, TOUS workflows
+    //    confondus : `ci.yml` garde les fusions, `test-postgres.yml` porte la
+    //    suite PostgreSQL, et un futur workflow compterait tout autant.
+    let dossier = racine.join(".github/workflows");
+    let mut fichiers: Vec<_> = fs::read_dir(&dossier)
+        .expect("dossier des workflows illisible")
+        .filter_map(|entree| entree.ok().map(|entree| entree.path()))
+        .filter(|chemin| chemin.extension().and_then(|ext| ext.to_str()) == Some("yml"))
+        .collect();
+    fichiers.sort();
+
+    let mut portes = 0usize;
+    let mut tout_le_workspace = false;
+    let mut couverts: Vec<String> = Vec::new();
+    for chemin in &fichiers {
+        let source = fs::read_to_string(chemin)
+            .unwrap_or_else(|e| panic!("{} illisible : {e}", chemin.display()));
+        for ligne in source.lines() {
+            let Some((paquets, tout)) = paquets_selectionnes(ligne) else {
+                continue;
+            };
+            portes += 1;
+            tout_le_workspace |= tout;
+            for paquet in paquets {
+                if !couverts.contains(&paquet) {
+                    couverts.push(paquet);
+                }
+            }
+        }
+    }
+
+    assert!(
+        portes >= 10,
+        "seulement {portes} porte(s) `cargo test` reperee(s) : le detecteur ne \
+         voit plus les lignes qu'il doit lire"
+    );
+    assert!(
+        !couverts.is_empty(),
+        "aucun `-p` releve sur les portes `cargo test` : l'extracteur est casse"
+    );
+    // Contre-epreuve de l'extracteur, sens POSITIF : il doit voir un paquet
+    // qu'aucune porte ne peut perdre. Sans ce sens-la, un extracteur qui
+    // rendrait toujours la liste complete des membres passerait a vide.
+    assert!(
+        couverts.iter().any(|c| c == "tune-core"),
+        "extracteur casse : `tune-core` est nomme par plusieurs portes — {couverts:?}"
+    );
+    // Contre-epreuve de l'extracteur, sens NEGATIF : il ne doit pas rendre
+    // n'importe quel mot de la ligne. `--no-fail-fast` y est partout,
+    // `tune-widget` nulle part.
+    for intrus in ["--no-fail-fast", "--no-default-features", "tune-widget"] {
+        assert!(
+            !couverts.iter().any(|c| c == intrus),
+            "extracteur casse : il a pris `{intrus}` pour un paquet — {couverts:?}"
+        );
+    }
+
+    // 3. Premier verdict : couvert quelque part.
+    if !tout_le_workspace {
+        let nus: Vec<&(String, String)> = membres
+            .iter()
+            .filter(|(nom, _)| !couverts.iter().any(|c| c == nom))
+            .collect();
+        assert!(
+            nus.is_empty(),
+            "ces membres du workspace ne sont nommes par AUCUNE porte `cargo test` \
+             de .github/workflows : {nus:?}\n\
+             Leurs tests ne sont executes par aucun job : ils ne peuvent ni passer \
+             ni echouer, et une garde de site qui y vivrait ne pourrait jamais \
+             crier (#3266, meme famille que #1427 et #2865).\n\
+             Deux issues seulement :\n\
+               1. ajouter `-p <nom>` a une ligne `cargo test` d'un workflow ;\n\
+               2. sortir le paquet de `members` dans le Cargo.toml racine, s'il \
+             n'a rien a faire dans ce workspace.\n\
+             Paquets couverts aujourd'hui : {couverts:?}"
+        );
+    }
+
+    // 4. Second verdict : couvert par la porte qui tourne sur CHAQUE PR Rust.
+    //
+    // « Couvert quelque part » ne suffit pas, et c'est la lecon de #2702/#2778 :
+    // `test-shipped-features` est differe jusqu'a `full`, donc jamais joue sur
+    // une PR vers `batch/*`. Un paquet qui n'y serait couvert QUE la ne verrait
+    // aucun de ses essais tourner sur la PR qui le casse — il ne rougirait qu'a
+    // la promotion, quand le lot entier est deja construit dessus. Le job
+    // `test` de `ci.yml` est la seule porte `cargo test` sans condition `full`.
+    let ci = workflow("ci.yml");
+    let corps_test = jobs(&ci)
+        .into_iter()
+        .find(|(nom, _)| nom == "test")
+        .map(|(_, corps)| corps)
+        .expect("job `test` absent de ci.yml");
+    let mut sur_chaque_pr: Vec<String> = Vec::new();
+    let mut tout_sur_chaque_pr = false;
+    for ligne in corps_test.lines() {
+        if let Some((paquets, tout)) = paquets_selectionnes(ligne) {
+            tout_sur_chaque_pr |= tout;
+            sur_chaque_pr.extend(paquets);
+        }
+    }
+    assert!(
+        tout_sur_chaque_pr || !sur_chaque_pr.is_empty(),
+        "le job `test` de ci.yml ne selectionne plus aucun paquet — \
+         le detecteur ne garde plus rien"
+    );
+    if tout_sur_chaque_pr {
+        return;
+    }
+    let differes: Vec<&(String, String)> = membres
+        .iter()
+        .filter(|(nom, _)| !sur_chaque_pr.iter().any(|c| c == nom))
+        .collect();
+    assert!(
+        differes.is_empty(),
+        "ces membres ne sont pas nommes par le job `test` de ci.yml : \
+         {differes:?}\n\
+         Les autres portes `cargo test` sont conditionnees a `full` ou a un \
+         autre evenement : leurs essais ne tourneraient donc PAS sur une PR \
+         vers `batch/*`, celle qui les casse (#3266, meme piege que #2702).\n\
+         Ajouter `-p <nom>` a la ligne `cargo test` du job `test`, ou, si la \
+         porte ne PEUT pas le compiler (OS, materiel, dependance lourde), \
+         resserrer ce test ici AVEC la raison plutot que le laisser rassurer.\n\
+         Paquets du job `test` aujourd'hui : {sur_chaque_pr:?}"
     );
 }

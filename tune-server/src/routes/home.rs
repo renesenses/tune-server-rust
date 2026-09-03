@@ -13,15 +13,33 @@ use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
 use crate::error::AppError;
+use crate::routes::filtre_sources::FiltreSources;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
 struct HomeParams {
     limit: Option<i64>,
+    // ⚠️ `sources` n'est PAS ici. Cette structure sert une demi-douzaine de
+    // routes d'accueil dont la plupart n'ont pas de moitie streaming ; l'y
+    // ajouter publierait un parametre qui ne gouverne rien. `other-versions`
+    // a la sienne, `OtherVersionsParams`.
     /// Optional zone filter: when provided, continue-listening only shows
     /// albums listened on this zone.  Clients should send the CURRENT active
     /// zone so the response is relevant (DEvir QA B-09: zone mismatch).
     zone_id: Option<i64>,
+}
+
+/// Les parametres d'« Autres versions » — `GET /home/other-versions`.
+///
+/// Detachee de [`HomeParams`] pour la seule raison qui vaille : `sources` ne
+/// gouverne quelque chose que sur les routes qui melangent la bibliotheque et
+/// les services, et cette route-la est la seule de l'accueil dans ce cas avec
+/// `artist-releases`.
+#[derive(Deserialize)]
+struct OtherVersionsParams {
+    limit: Option<i64>,
+    /// Le filtre de provenance. Voir [`crate::routes::filtre_sources`].
+    sources: Option<String>,
 }
 
 /// Les parametres d'« Ajoutes recemment » (#3039).
@@ -1765,10 +1783,33 @@ const ECOUTES_STREAMING: usize = 6;
 /// Le rapprochement local est insensible a la casse et strict sur le coeur du
 /// titre : seul un suffixe d'edition delimite par ` (` ou ` [` est admis. Il
 /// ne s'agit pas d'une recherche floue.
+/// ## `sources` — d'ou viennent les versions
+///
+/// Le meme parametre que `GET /search`, `GET /home/artist-releases` et
+/// `GET /library/tracks/{id}/versions` ; le contrat complet est dans
+/// [`crate::routes::filtre_sources`]. Absent, la route rend exactement ce
+/// qu'elle rendait avant — c'est le temoin.
+///
+/// Ce que « vide » veut dire ICI, la reponse etant une LISTE de groupes :
+///
+/// - `sources=local` : la boucle streaming n'est pas parcourue. Les groupes
+///   n'ont donc pas de cle `streaming` — ce qui est deja, aujourd'hui, la
+///   forme de tout groupe dont aucun service n'a rien trouve. Aucune forme
+///   nouvelle n'est introduite.
+/// - `sources=qobuz` : la requete locale n'est pas envoyee, `groupes` part
+///   vide, et seuls subsistent les groupes CREES par le streaming — chacun
+///   avec `"versions": []`, presente et vide. C'est mot pour mot la forme du
+///   cas « Billie Jean » (aucune autre version possedee, des dizaines
+///   disponibles), qui existe deja.
+///
+/// ⚠️ `listen_history` continue d'etre lu meme sans le local : c'est le
+/// VIVIER, ce qui dit QUOI chercher chez les services, pas du contenu local
+/// rendu. Le couper ne filtrerait pas la reponse, il la viderait.
 async fn other_versions(
     State(state): State<AppState>,
-    Query(p): Query<HomeParams>,
+    Query(p): Query<OtherVersionsParams>,
 ) -> Result<Json<Value>, AppError> {
+    let filtre = FiltreSources::depuis(p.sources.as_deref());
     // Plafond borne cote serveur : ce nombre part dans le SQL, il ne doit pas
     // venir tel quel de l'URL.
     let limit = p.limit.unwrap_or(20).clamp(1, 100);
@@ -1824,7 +1865,7 @@ async fn other_versions(
     // SQLite et PostgreSQL rendent le meme ensemble DANS LE MEME ORDRE.
     let sql = format!(
         "SELECT lh.title, lh.artist_name, lh.album_title, \
-                t.id, al.id, al.title, al.cover_path, t.duration_ms \
+                t.id, al.id, al.title, al.cover_path, t.duration_ms, t.title \
         FROM (SELECT title, artist_name, album_title, MAX(listened_at) AS listened_at \
               FROM (SELECT title, artist_name, album_title, listened_at \
                     FROM listen_history \
@@ -1845,7 +1886,13 @@ async fn other_versions(
     // que l'ecran n'ait pas a le refaire (et a le refaire differemment sur
     // chacun des trois clients).
     let mut groupes: Vec<Value> = Vec::new();
-    for cols in state.backend.query_many(&sql, &[]).ou_defaut_journalise() {
+    // Pas « calculer puis jeter » : sans le local, la requete ne part pas.
+    let lignes_locales = if filtre.local_demande() {
+        state.backend.query_many(&sql, &[]).ou_defaut_journalise()
+    } else {
+        Vec::new()
+    };
+    for cols in lignes_locales {
         let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
         let artiste = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
         let joue = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
@@ -1855,6 +1902,11 @@ async fn other_versions(
             "album_title": cols.get(5).and_then(|v| v.as_string()),
             "cover_path": cols.get(6).and_then(|v| v.as_string()),
             "duration_ms": cols.get(7).and_then(|v| v.as_i64()),
+            // Le titre RETROUVE. Depuis que ` - ` ouvre un suffixe d'edition
+            // (#2372), « Smooth Operator - 2011 Remastered » est une version
+            // de « Smooth Operator » : le libelle du groupe ne vaut plus pour
+            // chacune de ses lignes.
+            "title": cols.get(8).and_then(|v| v.as_string()),
         });
         match groupes.iter_mut().find(|g| {
             g["title"].as_str() == Some(titre.as_str())
@@ -1887,23 +1939,44 @@ async fn other_versions(
     let sql_recentes = format!(
         "SELECT title, artist_name, MAX(COALESCE(album_title, '')) FROM (SELECT title, artist_name, album_title, listened_at FROM listen_history WHERE artist_name IS NOT NULL ORDER BY listened_at DESC LIMIT 200) le GROUP BY title, artist_name ORDER BY MAX(listened_at) DESC LIMIT {ECOUTES_STREAMING}"
     );
-    let recentes: Vec<(String, String, String)> = state
-        .backend
-        .query_many(&sql_recentes, &[])
-        .ou_defaut_journalise()
-        .into_iter()
-        .filter_map(|cols| {
-            Some((
-                cols.first().and_then(|v| v.as_string())?,
-                cols.get(1).and_then(|v| v.as_string())?,
-                cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
-            ))
-        })
-        .collect();
+    // Aucun service demande : ni ce `SELECT` ni la boucle qui suit n'ont de
+    // raison de tourner. La liste des services est celle de
+    // `routes::versions`, pas une copie — deux listes qui divergent feraient
+    // lire l'historique pour rien, ou sauteraient un service qui repond.
+    let un_service_repond = crate::routes::versions::SERVICES_VERSIONS
+        .iter()
+        .any(|s| filtre.service_demande(s));
+    let recentes: Vec<(String, String, String)> = if un_service_repond {
+        state
+            .backend
+            .query_many(&sql_recentes, &[])
+            .ou_defaut_journalise()
+            .into_iter()
+            .filter_map(|cols| {
+                Some((
+                    cols.first().and_then(|v| v.as_string())?,
+                    cols.get(1).and_then(|v| v.as_string())?,
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                ))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     for (titre, artiste, album) in recentes {
+        // Le vivier de cette route est `listen_history` : il ne porte ni ISRC
+        // ni duree ni annee. La reference part donc sans signaux, et le score
+        // ne repose ici que sur le titre — c'est moins que sur la route par
+        // piste, et c'est assume : inventer une duree serait pire.
+        let reference = crate::routes::versions::Reference {
+            titre: titre.clone(),
+            artiste: artiste.clone(),
+            album: album.clone(),
+            ..Default::default()
+        };
         let trouvees =
-            crate::routes::versions::versions_streaming(&state, &titre, &artiste, &album).await;
+            crate::routes::versions::versions_streaming(&state, &reference, &filtre).await;
         if trouvees.is_empty() {
             continue;
         }
@@ -1978,9 +2051,12 @@ mod tests_other_versions {
 
         let resultat = other_versions(
             State(state),
-            Query(HomeParams {
+            // `sources: None` = « Tous » : ces essais portent sur le
+            // rapprochement, pas sur la provenance. Ils disent desormais
+            // explicitement qu'ils ne filtrent rien.
+            Query(OtherVersionsParams {
                 limit: Some(20),
-                zone_id: None,
+                sources: None,
             }),
         )
         .await;
@@ -2045,9 +2121,12 @@ mod tests_other_versions {
 
         let resultat = other_versions(
             State(state),
-            Query(HomeParams {
+            // `sources: None` = « Tous » : ces essais portent sur le
+            // rapprochement, pas sur la provenance. Ils disent desormais
+            // explicitement qu'ils ne filtrent rien.
+            Query(OtherVersionsParams {
                 limit: Some(20),
-                zone_id: None,
+                sources: None,
             }),
         )
         .await;

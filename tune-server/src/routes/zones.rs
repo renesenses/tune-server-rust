@@ -230,6 +230,7 @@ fn inject_device_identity(
     obj: &mut serde_json::Map<String, Value>,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     zone_id: i64,
+    output_device_id: Option<&str>,
     detected: Option<&tune_core::discovery::device::DiscoveredDevice>,
 ) {
     let settings = SettingsRepo::with_backend(backend.clone());
@@ -287,6 +288,26 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("mono_downmix".into(), json!(mono_downmix));
+    // #3254 — …et ce que ce réglage VAUT sur cette zone-ci. Le champ ci-dessus
+    // était accepté et relu pour n'importe quelle zone, alors que les trois
+    // seuls sites qui poussent le repli exigent une sortie `local:` et un
+    // `LocalOutput` : sur une zone réseau, accepté, persisté, relu… et sans
+    // effet. Le chemin du signal disait déjà la vérité (`zone_mono_downmix_step`
+    // rend `None` hors sortie locale) ; c'est le RÉGLAGE qui se taisait.
+    //
+    // Strictement ADDITIF : `mono_downmix` reste publié tel quel, à sa valeur
+    // persistée. Un client qui ne lit pas ce statut voit le même écran qu'avant.
+    // Même vocabulaire que `local_exclusive_mode_status` (#3192) : `reason`
+    // stable pour la machine, `detail` en clair pour un écran sans table de
+    // traduction.
+    obj.insert(
+        "mono_downmix_status".into(),
+        json!(tune_core::audio::mono_downmix::mono_downmix_status(
+            mono_downmix,
+            tune_core::audio::mono_downmix::mono_downmix_runs_on_output(output_device_id),
+            tune_core::audio::audiophile::zone_enabled(backend, zone_id),
+        )),
+    );
     obj.insert(
         "detected_manufacturer".into(),
         json!(detected.and_then(|d| d.manufacturer.clone())),
@@ -361,6 +382,14 @@ async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> imp
     // Headphone crossfeed config (local output only). Defaults when unset:
     // disabled, amount 0.30, delay 0.30 ms.
     let crossfeed = read_crossfeed_config(&settings, id);
+    // …et ce que ce réglage VAUT sur CETTE zone (#2742). Additif : l'objet
+    // `crossfeed` ci-dessus est publié tel quel, un client qui ignore ce
+    // champ voit le même écran qu'avant.
+    let crossfeed_status = crossfeed_status_de_zone(
+        &state.backend,
+        id,
+        crossfeed["enabled"].as_bool().unwrap_or(false),
+    );
 
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
@@ -369,12 +398,14 @@ async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> imp
             "dsp_enabled": enabled,
             "eq_profile": eq_profile.unwrap_or_default(),
             "crossfeed": crossfeed,
+            "crossfeed_status": crossfeed_status,
         }))
         .into_response(),
         Err(_) => Json(json!({
             "zone_id": id,
             "eq_profile": eq_profile.unwrap_or_default(),
             "crossfeed": crossfeed,
+            "crossfeed_status": crossfeed_status,
         }))
         .into_response(),
     }
@@ -519,6 +550,38 @@ fn read_crossfeed_config(settings: &tune_core::db::settings_repo::SettingsRepo, 
     })
 }
 
+/// Ce que le crossfeed VAUT sur cette zone-ci, à côté de ce que le réglage
+/// demande — #2742.
+///
+/// Le crossfeed n'est installé qu'à trois endroits, tous derrière la même
+/// double garde `device_id.starts_with("local:")` +
+/// `downcast_ref::<LocalOutput>()` (`orchestrator.rs` : chemin de lecture,
+/// `refresh_zone_crossfeed`, `refresh_zone_pure_dsp`). Une zone réseau n'a donc
+/// aucun chemin de code — pendant que cette route-ci offrait le réglage, le
+/// persistait, et le relisait sans un mot. Tades : « Crossfeed n'a aucune
+/// action ».
+///
+/// La règle elle-même vit dans `tune_core::audio::crossfeed` et ne lit aucune
+/// base : ici on ne fait que lui passer les deux faits qu'elle attend — la
+/// sortie de la zone et son mode PURE. Une seule règle, donc pas de dérive
+/// possible entre cet écran et le son.
+fn crossfeed_status_de_zone(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    requested: bool,
+) -> tune_core::audio::crossfeed::CrossfeedStatus {
+    let device = ZoneRepo::with_backend(backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id);
+    tune_core::audio::crossfeed::crossfeed_status(
+        requested,
+        tune_core::audio::crossfeed::crossfeed_runs_on_output(device.as_deref()),
+        tune_core::audio::audiophile::zone_enabled(backend, zone_id),
+    )
+}
+
 async fn set_zone_dsp(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -561,6 +624,9 @@ async fn set_zone_dsp(
     // amount 0..0.5, delay_ms 0..5. Persisted to `zone_{id}_crossfeed`.
     let mut crossfeed_saved: Option<Value> = None;
     let mut cf_applique_a_chaud = false;
+    // #2742 — publié dès que le corps porte un `crossfeed`, pour que la réponse
+    // au CLIC dise déjà si le réglage aura le moindre effet.
+    let mut crossfeed_status: Option<tune_core::audio::crossfeed::CrossfeedStatus> = None;
     if let Some(cf_val) = body.get("crossfeed") {
         let enabled = cf_val
             .get("enabled")
@@ -592,6 +658,22 @@ async fn set_zone_dsp(
         // `delay_ms` en ecoutant ne changeait rien avant la piste suivante
         // (#1786).
         cf_applique_a_chaud = state.orchestrator.refresh_zone_crossfeed(id).await;
+        // #2742 — et si la zone ne peut PAS faire tourner de crossfeed, le
+        // serveur le dit au lieu d'enregistrer en silence. Journalisé au
+        // moment du CLIC, pas à la lecture : c'est ici que l'utilisateur
+        // croit avoir obtenu quelque chose.
+        let statut = crossfeed_status_de_zone(&state.backend, id, enabled);
+        if statut.unavailable {
+            warn!(
+                zone_id = id,
+                requested = enabled,
+                reason = statut
+                    .reason
+                    .map(tune_core::audio::crossfeed::CrossfeedConstraint::code),
+                "zone_crossfeed_sans_effet"
+            );
+        }
+        crossfeed_status = Some(statut);
     }
 
     let preset_id = body["dsp_preset_id"].as_i64();
@@ -605,6 +687,11 @@ async fn set_zone_dsp(
         "dsp_enabled": enabled,
         "eq_profile": body.get("eq_profile"),
         "crossfeed": crossfeed_saved,
+        // #2742 — la moitié qui manquait : ce que ce réglage VAUT sur cette
+        // zone. `null` quand le corps ne portait pas de `crossfeed` (rien n'a
+        // été demandé, il n'y a rien à répondre). `unavailable: true` doit
+        // VERROUILLER le contrôle côté client, `detail` l'expliquer.
+        "crossfeed_status": crossfeed_status,
         // Meme contrat que `POST /zones/{id}/eq` : vrai quand le reglage vient
         // d'atteindre le son d'un flux en cours. Faux ne signale PAS un echec
         // (rien ne joue, zone non locale, mode PURE) — c'est ce qui permet a un
@@ -1568,6 +1655,25 @@ fn runtime_signal_reason_detail(status: &OutputSignalPathStatus) -> Option<Strin
     (!details.is_empty()).then(|| details.join(" ; "))
 }
 
+/// Le nom PRÉSENTABLE d'un transport que le `match` de `build_signal_path` ne
+/// nomme pas par un bras.
+///
+/// Le bras par défaut rendait le second membre du tuple — la chaîne BRUTE de
+/// la colonne `zones.output_type` — comme nom de transport. Le panneau d'Alex
+/// Campbell affichait donc « hqplayer » en minuscules là où toutes les autres
+/// sorties affichent « DLNA/UPnP », « BluOS » ou « CoreAudio » (#2189).
+///
+/// Les types INCONNUS gardent leur chaîne : un greffon hors dépôt enregistre
+/// le nom qu'il veut, et aucune règle de mise en forme ne saurait deviner sa
+/// capitalisation. Inventer un libellé serait pire que de rendre le sien.
+fn libelle_de_transport(output_type: &str) -> &str {
+    match output_type {
+        "hqplayer" => "HQPlayer",
+        "diretta" => "Diretta",
+        autre => autre,
+    }
+}
+
 fn build_signal_path(
     ps: &ZoneState,
     zone: &Zone,
@@ -1755,10 +1861,16 @@ fn build_signal_path(
 
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
     // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
-    let is_network_output = matches!(
-        output_type,
-        "dlna" | "openhome" | "chromecast" | "bluos" | "squeezebox"
-    );
+    //
+    // ⚠️ Cette liste ÉTAIT recopiée ici. `orchestrator.rs` porte pourtant, en
+    // toutes lettres, « l'unique exemplaire de cette liste » — et cette
+    // quatrième copie avait déjà dérivé : cinq types au lieu de six,
+    // `slimproto` manquant. Une zone Slimproto était donc « réseau » pour le
+    // chemin audio (qui lui applique les forçages WAV/LPCM et le plafond
+    // 16 bits) et « inconnue » pour le panneau, qui la déclarait non
+    // bit-perfect sans jamais lire ces réglages. Le miroir suit désormais la
+    // décision, par la MÊME fonction (#2189, même faute que #3183).
+    let is_network_output = tune_core::orchestrator::is_network_output_type(Some(output_type));
     // Passthrough DSD natif : l'orchestrateur sert le .dsf/.dff brut au
     // renderer (`orchestrator.rs` `dsd_passthrough`). Constaté sur le fil, pas
     // deviné — cf. `wire_carries_raw_dsd`. Sans ce miroir, une piste DSD128
@@ -1922,7 +2034,14 @@ fn build_signal_path(
                 if oaat_transcodes { "WAV" } else { format_name },
             )
         }
+        // AirPlay 1 comme AirPlay 2 : le protocole impose de l'ALAC 44,1/16.
+        // La conversion a lieu POUR DE VRAI, le verdict `false` est donc juste
+        // — c'est le LIBELLÉ qui manquait : sans ce bras, une zone AirPlay 2
+        // (créée par `discovery_setup.rs`, `(Some(Box::new(ap2)), "airplay2")`)
+        // tombait dans le fourre-tout et affichait « airplay2 » en minuscules
+        // comme nom de transport (#2189).
         "airplay" => (false, "AirPlay", "ALAC"),
+        "airplay2" => (false, "AirPlay 2", "ALAC"),
         "chromecast" => {
             if needs_transcode_for_output {
                 let target = source_format.unwrap().dlna_transcode_target();
@@ -1939,12 +2058,23 @@ fn build_signal_path(
                 (true, "BluOS", format_name)
             }
         }
-        "squeezebox" => {
+        // `slimproto` EST le protocole Squeezebox, et l'orchestrateur les
+        // traite déjà à l'identique (`is_network_output_type` les liste tous
+        // les deux). Le panneau, lui, ne nommait que `squeezebox` : une zone
+        // créée par le serveur Slimproto (`tune-core/src/slimproto/mod.rs`,
+        // `get_or_create(&player_name, Some("slimproto"), …)`) tombait dans le
+        // fourre-tout et sortait « non bit-perfect » quoi qu'il arrive (#2189).
+        "squeezebox" | "slimproto" => {
+            let transport = if output_type == "slimproto" {
+                "Slimproto"
+            } else {
+                "Squeezebox"
+            };
             if needs_transcode_for_output {
                 let target = source_format.unwrap().dlna_transcode_target();
-                (false, "Squeezebox", target.display_name())
+                (false, transport, target.display_name())
             } else {
-                (true, "Squeezebox", format_name)
+                (true, transport, format_name)
             }
         }
         "browser" => (true, "Browser", format_name),
@@ -1965,7 +2095,34 @@ fn build_signal_path(
                 format_name,
             )
         }
-        other => (false, other, format_name),
+        // Tout le reste est une sortie PULL : elle va CHERCHER le flux
+        // elle-même et reçoit nos octets TELS QUELS — `hqplayer`, `diretta`,
+        // et tout greffon hors dépôt. Ce bras rendait `false`
+        // INCONDITIONNELLEMENT, et son second membre — la chaîne brute de la
+        // base — servait de nom de transport.
+        //
+        // Alex Campbell (Tune 0.9.98, Linux, sortie HQPlayer, fil 1524) :
+        // « When playing local **or streaming** music files to HQPlayer, Tune
+        // is reporting that it is transcoding. » Le « local OU streaming » est
+        // le fait qui tranche : le symptôme est inconditionnel, ce qu'aucune
+        // règle dépendant du format ne produirait. Une zone HQPlayer était
+        // déclarée non bit-perfect sur un FLAC 44,1/16 servi octet pour octet,
+        // sans EQ ni ReplayGain, sans qu'aucun transcodage n'ait lieu (#2189).
+        //
+        // Le verdict n'est plus écrit ici : il est LU du chemin audio, par la
+        // fonction que celui-ci utilise pour décider
+        // (`orchestrator::is_pull_dsp_output_type`, extraite de
+        // `pull_output_needs_dsp_transcode`). Sur ces sorties le transport ne
+        // touche aucun échantillon ; le seul traitement possible est celui que
+        // cette même fonction force — EQ, correction de pièce, ReplayGain — et
+        // il est déjà compté plus bas par `dsp_applique` et `replaygain_step`.
+        // Le verdict global retombe donc à `false` dès qu'un égaliseur est
+        // armé, exactement là où le transcodage a réellement lieu.
+        other => (
+            tune_core::orchestrator::is_pull_dsp_output_type(Some(other)),
+            libelle_de_transport(other),
+            format_name,
+        ),
     };
 
     // Detect sample rate capping (DSD excluded — the DSD→PCM transcode
@@ -2056,7 +2213,9 @@ fn build_signal_path(
     let wire_transcode = wire_wav && !matches!(format_name, "WAV");
     let transcode_active = needs_transcode_for_output
         || oaat_transcodes
-        || output_type == "airplay"
+        // AirPlay 2 encode en ALAC 44,1/16 comme AirPlay 1 : l'étape est la
+        // même, et elle manquait ici aussi (#2189).
+        || matches!(output_type, "airplay" | "airplay2")
         || dlna_lpcm
         || dlna_wav24
         || dlna_cap_16bit
@@ -2443,7 +2602,13 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 .output_device_id
                 .as_deref()
                 .and_then(|did| devices.iter().find(|d| d.id == did));
-            inject_device_identity(obj, &state.backend, zone_id, detected_dev);
+            inject_device_identity(
+                obj,
+                &state.backend,
+                zone_id,
+                z.output_device_id.as_deref(),
+                detected_dev,
+            );
             let online = match z.output_type.as_deref() {
                 // Browser zones have no output device by design (the web
                 // client pulls stream_url itself) — always online.
@@ -2604,7 +2769,13 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     .output_device_id
                     .as_deref()
                     .and_then(|did| devices.iter().find(|d| d.id == did));
-                inject_device_identity(obj, &state.backend, id, detected_dev);
+                inject_device_identity(
+                    obj,
+                    &state.backend,
+                    id,
+                    zone.output_device_id.as_deref(),
+                    detected_dev,
+                );
                 let online = match zone.output_type.as_deref() {
                     // Same rules as list_zones: browser zones need no device;
                     // a local zone without output_device_id is an orphan that
@@ -3147,6 +3318,38 @@ async fn patch_zone(
             settings.delete(&key)
         };
         ecrire!("mono_downmix", enabled, r);
+        // #3254 — dire au JOURNAL, au moment du clic, que ce clic n'obtiendra
+        // rien. La réponse porte déjà `mono_downmix_status` (la route rend la
+        // fiche complète via `get_zone`), mais c'est ici que l'utilisateur croit
+        // avoir obtenu quelque chose.
+        //
+        // ⚠️ On ne se sert PAS de la valeur rendue par `refresh_zone_mono_downmix`
+        // comme signal de disponibilité : elle vaut `false` aussi bien parce que
+        // la zone n'est pas locale que parce qu'aucune sortie n'est ouverte — la
+        // même ambiguïté que `crossfeed_applied_live`. La règle, elle, ne dépend
+        // que de la zone.
+        let statut = tune_core::audio::mono_downmix::mono_downmix_status(
+            enabled,
+            tune_core::audio::mono_downmix::mono_downmix_runs_on_output(
+                // La zone RELUE, pas `zone_before` : le même PATCH a pu changer
+                // `output_device_id` quelques lignes plus haut, et c'est la
+                // sortie d'APRÈS qui décide si le repli agira.
+                repo.get(id)
+                    .ok()
+                    .flatten()
+                    .and_then(|z| z.output_device_id)
+                    .as_deref(),
+            ),
+            tune_core::audio::audiophile::zone_enabled(&state.backend, id),
+        );
+        if statut.unavailable {
+            warn!(
+                zone_id = id,
+                requested = enabled,
+                reason = statut.reason.map(|r| r.code()).unwrap_or_default(),
+                "zone_mono_downmix_sans_effet — le réglage est enregistré mais rien ne l'applique sur cette zone"
+            );
+        }
         // Persister ne suffit pas : sans ceci, cocher la case en écoutant ne
         // changerait rien avant la piste suivante (#1725, #1786). Or ce
         // réglage-ci se vérifie précisément à l'oreille, musique en cours.
@@ -7168,6 +7371,13 @@ mod backend_local_annonce_tests {
             // ABSENCE de la charge utile qui serait la régression — le client
             // n'aurait de nouveau que le journal pour savoir où sort le son.
             "device",
+            // #3233 — la CADENCE réellement ouverte, face à celle de la
+            // source. Même raison que `device` : quand Tune refuse la cadence
+            // de la source parce que les capacités du périphérique sont
+            // SUPPOSÉES et non mesurées, il convertit — et sans ce champ le
+            // client affiche « DSD64 » pendant qu'autre chose part au DAC.
+            // `null` tant que rien n'a joué en partagé, ce qui est honnête.
+            "rate",
         ] {
             assert!(v.get(champ).is_some(), "champ « {champ} » absent de {v}");
         }
