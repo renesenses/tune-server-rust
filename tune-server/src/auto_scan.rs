@@ -31,7 +31,7 @@ pub fn build_track_from_metadata(
     artist_repo: &ArtistRepo,
     album_repo: &AlbumRepo,
 ) -> Option<(Track, Option<i64>)> {
-    build_track_from_metadata_opts(sf, artist_repo, album_repo, true, None)
+    build_track_from_metadata_opts(sf, artist_repo, album_repo, true, None, None)
 }
 
 pub fn build_track_from_metadata_opts(
@@ -45,6 +45,12 @@ pub fn build_track_from_metadata_opts(
     // various-artists compilation whose tracks each carry their own artist as
     // album_artist from splitting into one album per artist (JP Borderies).
     compilation_override: Option<bool>,
+    // L'unique artiste d'album ÉTIQUETÉ du dossier, quand le dossier n'en a
+    // qu'un. Il ne sert QU'aux fichiers dont les balises n'ont pas pu être
+    // lues (`TrackMetadata::artist_from_path`) : sans lui, un fichier en délai
+    // dépassé se rangeait sous le nom de son dossier, donc dans un album à
+    // part de ses voisines (#3232). `None` = comportement d'avant.
+    folder_tagged_artist: Option<&str>,
 ) -> Option<(Track, Option<i64>)> {
     let meta = sf.metadata.as_ref()?;
 
@@ -64,6 +70,13 @@ pub fn build_track_from_metadata_opts(
         "Various Artists"
     } else {
         meta.album_artist.as_deref().unwrap_or_else(|| {
+            // Balises illisibles : `meta.artist` n'est que le nom d'un dossier.
+            // Le vrai artiste du dossier, s'il n'y en a qu'un, vaut mieux.
+            if meta.artist_from_path
+                && let Some(a) = folder_tagged_artist
+            {
+                return a;
+            }
             meta.artist
                 .as_deref()
                 .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME)
@@ -1698,12 +1711,24 @@ pub fn spawn_file_watcher(
                                 // one file, so it reconstructs the folder view
                                 // from the DB. Any doubt → None → per-file
                                 // self-decide (previous behaviour, no regression).
-                                let comp_override: Option<bool> =
-                                    sf.metadata.as_ref().and_then(|meta| {
+                                // Rendu : `(compilation ?, artiste d'album unique
+                                // du dossier)`. Le second sert au seul fichier
+                                // dont les balises n'ont pas pu être lues (#3232).
+                                let (comp_override, folder_tagged_artist): (
+                                    Option<bool>,
+                                    Option<String>,
+                                ) = sf
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|meta| {
                                         let dir = std::path::Path::new(&sf.path).parent()?;
                                         let mut comp = meta.compilation;
                                         let mut artists: std::collections::HashSet<String> =
                                             std::collections::HashSet::new();
+                                        // La casse d'origine du premier artiste
+                                        // vu : `artists` est en minuscules, or
+                                        // ce nom peut devenir celui de l'album.
+                                        let mut premier: Option<String> = None;
                                         let mut note = |aa: Option<&str>| {
                                             if let Some(a) =
                                                 aa.map(str::trim).filter(|s| !s.is_empty())
@@ -1711,10 +1736,18 @@ pub fn spawn_file_watcher(
                                                 if crate::scan_import::is_various_artists(a) {
                                                     comp = true;
                                                 }
-                                                artists.insert(a.to_lowercase());
+                                                if artists.insert(a.to_lowercase())
+                                                    && premier.is_none()
+                                                {
+                                                    premier = Some(a.to_string());
+                                                }
                                             }
                                         };
-                                        note(meta.album_artist.as_deref());
+                                        // Un artiste déduit du CHEMIN n'est pas
+                                        // une balise : il ne compte pas.
+                                        if !meta.artist_from_path {
+                                            note(meta.album_artist.as_deref());
+                                        }
                                         let siblings = track_repo
                                             .siblings_album_artists(&dir.to_string_lossy())
                                             .ok()?;
@@ -1726,14 +1759,18 @@ pub fn spawn_file_watcher(
                                             }
                                             note(aa.as_deref());
                                         }
-                                        Some(comp || artists.len() >= 2)
-                                    });
+                                        let unique =
+                                            if artists.len() == 1 { premier } else { None };
+                                        Some((Some(comp || artists.len() >= 2), unique))
+                                    })
+                                    .unwrap_or((None, None));
                                 let Some((track, album_id)) = build_track_from_metadata_opts(
                                     sf,
                                     &artist_repo,
                                     &album_repo,
                                     watcher_quality_split,
                                     comp_override,
+                                    folder_tagged_artist.as_deref(),
                                 ) else {
                                     tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
                                     continue;
