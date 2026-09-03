@@ -105,16 +105,22 @@ fn le_rapporteur_de_decodage_ecrit_bien_dans_le_verrou() {
     );
 }
 
-/// La famille `record_*` compte quatre membres : refus PCM exclusif Windows,
-/// refus d'ouverture exclusive, blocage d'alimentation (#3108), et désormais
-/// échec de décodage (#3270). Ce compte est le garde-fou du recensement : si
-/// un cinquième silence trouve son canal, il se déclare ici.
+/// La famille `record_*` compte CINQ membres : refus PCM exclusif Windows,
+/// refus d'ouverture exclusive, blocage d'alimentation (#3108), échec de
+/// décodage (#3270), et désormais **périphérique introuvable sur le chemin
+/// PARTAGÉ** — `record_shared_device_not_found`, qui couvre les deux jumeaux
+/// `audio_device_not_found_no_fallback` (chemin WAV) et
+/// `audio_device_not_found_compressed`.
+///
+/// Ce compte est le garde-fou du recensement : si un sixième silence trouve
+/// son canal, il se déclare ici. C'est cette garde qui a fait rougir la PR
+/// du chemin partagé, et c'est exactement son travail.
 #[test]
 fn la_famille_des_rapporteurs_compte_ses_membres() {
     let membres = LOCAL.matches("\nfn record_").count();
     assert_eq!(
-        membres, 4,
-        "la famille `record_*` de local.rs compte {membres} membre(s) et non 4 ; \
+        membres, 5,
+        "la famille `record_*` de local.rs compte {membres} membre(s) et non 5 ; \
          mettre ce compte à jour EN NOMMANT le nouveau canal"
     );
 }
