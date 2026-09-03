@@ -13,3 +13,12 @@ reqwest = { workspace = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+# Test-only : `tokio::time::pause()` / `advance()`. La garde de #2952 éprouve
+# une attente de 30 s. Sans horloge virtuelle elle coûterait ce temps-là pour
+# de vrai, et son vert dépendrait de la charge de la machine — exactement ce
+# qu'un défaut de temporisation ne doit PAS avoir comme garde. `test-util`
+# n'entre que dans les cibles de test : le binaire publié ne le compile pas.
+# Même déclaration que `tune-core` et `tune-server` (#2073, #3140).
+tokio = { workspace = true, features = ["test-util"] }

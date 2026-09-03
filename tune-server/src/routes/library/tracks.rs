@@ -15,6 +15,7 @@ use tune_core::db::track_repo::TrackRepo;
 
 use super::query_multi::track_filter_from_raw;
 use crate::error::AppError;
+use crate::routes::filtre_sources::FiltreSources;
 
 /// Identifiant de la passe de relecture des métadonnées au registre
 /// `background_tasks` (#2129).
@@ -1313,7 +1314,40 @@ pub(super) struct VersionsParams {
     /// coeur de la demande de FabienM (« pour les curieux, proposer les
     /// versions trouvees dans les services streaming »). Le client peut le
     /// couper pour un premier rendu immediat.
+    ///
+    /// ⚠️ CONSERVE, et deliberement. `sources` ci-dessous le recouvre presque
+    /// entierement — `streaming=false` dit la meme chose que `sources=local` —
+    /// mais presque n'est pas assez : ce parametre est publie et
+    /// `tune-web-client` l'envoie a CHAQUE appel (`getTrackVersions`,
+    /// `src/lib/api.ts`, toujours `?streaming=true`). Un parametre qu'on
+    /// casse est une regression silencieuse pour qui l'appelle deja.
     streaming: Option<bool>,
+    /// D'ou viennent les versions rendues — le meme `sources` que
+    /// `GET /search` (#3226), `GET /home/other-versions` et
+    /// `GET /home/artist-releases`. Absent = « Tous », soit exactement le
+    /// comportement d'avant. Contrat complet dans
+    /// [`crate::routes::filtre_sources`].
+    ///
+    /// ## Comment il cohabite avec `streaming`
+    ///
+    /// `streaming=false` est un VETO sur la moitie streaming, jamais une
+    /// autorisation. Il ne peut que RETIRER des services, et il ne ressuscite
+    /// jamais le local. Les deux parametres commutent donc, et aucun des
+    /// appels d'aujourd'hui ne change de reponse :
+    ///
+    /// | appel                           | `versions` (local) | `streaming` |
+    /// |---------------------------------|--------------------|-------------|
+    /// | (rien)                          | rendues            | rendues     |
+    /// | `streaming=false`               | rendues            | **vide**    |
+    /// | `streaming=true`                | rendues            | rendues     |
+    /// | `sources=local`                 | rendues            | **vide**    |
+    /// | `sources=qobuz`                 | **vide**           | Qobuz seul  |
+    /// | `sources=qobuz&streaming=false` | **vide**           | **vide**    |
+    ///
+    /// Les trois premieres lignes sont mot pour mot ce que la route rendait
+    /// avant : `streaming` seul ne consulte jamais `sources`, et `sources`
+    /// absent vaut [`FiltreSources::tout`].
+    sources: Option<String>,
 }
 
 /// Rassemble les autres versions d'une piste. Rend `None` si la piste
@@ -1326,6 +1360,7 @@ pub(super) async fn rassembler_versions(
     id: i64,
     limite: i64,
     avec_streaming: bool,
+    filtre: &FiltreSources,
 ) -> Option<Value> {
     // Le morceau de reference : son titre, son artiste de piste (celui affiche
     // a l'auditeur) et l'album lui-meme. L'artiste d'album n'est qu'un repli :
@@ -1362,9 +1397,20 @@ pub(super) async fn rassembler_versions(
         annee: cols.get(5).and_then(|v| v.as_i64()),
     };
 
-    let locales = crate::routes::versions::versions_locales(state, &reference, Some(id), limite);
+    // ⚠️ La ligne `tracks` ci-dessus est lue QUOI QU'IL ARRIVE, meme quand le
+    // local n'est pas demande : c'est l'ENTREE de la question — le titre,
+    // l'artiste, l'ISRC, la duree —, pas une reponse. Sous `sources=qobuz`,
+    // cette route doit chercher les versions Qobuz DE CETTE PISTE, pas
+    // repondre 404 parce qu'on n'a pas demande le local. Vivier n'est pas
+    // contenu.
+    let locales = if filtre.local_demande() {
+        crate::routes::versions::versions_locales(state, &reference, Some(id), limite)
+    } else {
+        // Pas « calculer puis jeter » : la requete ne part pas.
+        Vec::new()
+    };
     let streaming = if avec_streaming {
-        crate::routes::versions::versions_streaming(state, &reference).await
+        crate::routes::versions::versions_streaming(state, &reference, filtre).await
     } else {
         Vec::new()
     };
@@ -1401,7 +1447,8 @@ pub(super) async fn track_versions(
 ) -> impl IntoResponse {
     let limite = p.limit.unwrap_or(50).clamp(1, 200);
     let avec_streaming = p.streaming.unwrap_or(true);
-    match rassembler_versions(&state, id, limite, avec_streaming).await {
+    let filtre = FiltreSources::depuis(p.sources.as_deref());
+    match rassembler_versions(&state, id, limite, avec_streaming, &filtre).await {
         Some(v) => Json(v).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -1410,6 +1457,11 @@ pub(super) async fn track_versions(
 #[cfg(test)]
 mod tests_versions_piste {
     use super::rassembler_versions;
+    // `FiltreSources::tout()` = `sources` absent = « Tous ». Ces essais
+    // portaient sur le rapprochement, pas sur la provenance : ils disent
+    // desormais explicitement qu'ils ne filtrent rien, et gardent donc le
+    // meme sens qu'avant l'ajout du parametre.
+    use crate::routes::filtre_sources::FiltreSources;
     use crate::state::AppState;
     use tune_core::db::backend::ToSqlValue;
 
@@ -1481,7 +1533,7 @@ mod tests_versions_piste {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let seed = bibliotheque_de_test(&state);
 
-        let v = rassembler_versions(&state, seed, 50, false)
+        let v = rassembler_versions(&state, seed, 50, false, &FiltreSources::tout())
             .await
             .expect("la piste existe");
 
@@ -1505,7 +1557,9 @@ mod tests_versions_piste {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let seed = bibliotheque_de_test(&state);
 
-        let v = rassembler_versions(&state, seed, 50, false).await.unwrap();
+        let v = rassembler_versions(&state, seed, 50, false, &FiltreSources::tout())
+            .await
+            .unwrap();
         let versions = v["versions"].as_array().unwrap();
         for ver in versions {
             assert_ne!(
@@ -1592,7 +1646,7 @@ mod tests_versions_piste {
         );
         piste("Running up that hill", reprise, thomas, "/reprise.flac");
 
-        let v = rassembler_versions(&state, seed, 50, false)
+        let v = rassembler_versions(&state, seed, 50, false, &FiltreSources::tout())
             .await
             .expect("la piste existe");
         assert_eq!(v["artist_name"].as_str(), Some("Kate Bush"));
@@ -1622,7 +1676,9 @@ mod tests_versions_piste {
             .and_then(|c| c.first().and_then(|v| v.as_i64()))
             .unwrap();
 
-        let v = rassembler_versions(&state, id, 50, false).await.unwrap();
+        let v = rassembler_versions(&state, id, 50, false, &FiltreSources::tout())
+            .await
+            .unwrap();
         assert_eq!(v["versions"].as_array().map(Vec::len), Some(0));
         assert_eq!(v["streaming"].as_array().map(Vec::len), Some(0));
     }
@@ -1633,7 +1689,7 @@ mod tests_versions_piste {
     async fn une_piste_inconnue_n_est_pas_un_groupe_vide() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         assert!(
-            rassembler_versions(&state, 999_999, 50, false)
+            rassembler_versions(&state, 999_999, 50, false, &FiltreSources::tout())
                 .await
                 .is_none()
         );
@@ -1721,7 +1777,7 @@ mod tests_versions_piste {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let base = bibliotheque_remasters(&state);
 
-        let v = rassembler_versions(&state, base, 50, false)
+        let v = rassembler_versions(&state, base, 50, false, &FiltreSources::tout())
             .await
             .expect("la piste existe");
         let versions = v["versions"].as_array().expect("versions locales");
@@ -1757,7 +1813,7 @@ mod tests_versions_piste {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let base = bibliotheque_remasters(&state);
 
-        let v = rassembler_versions(&state, base, 50, false)
+        let v = rassembler_versions(&state, base, 50, false, &FiltreSources::tout())
             .await
             .expect("la piste existe");
         let versions = v["versions"].as_array().expect("versions locales");
@@ -1819,7 +1875,7 @@ mod tests_versions_piste {
         piste("Smooth Operator", abbey, "USXXX9900001", "/abbey.flac");
         piste("Smooth Operator", zenith, "GBAAA8400001", "/zenith.flac");
 
-        let v = rassembler_versions(&state, base, 50, false)
+        let v = rassembler_versions(&state, base, 50, false, &FiltreSources::tout())
             .await
             .expect("la piste existe");
         let versions = v["versions"].as_array().expect("versions locales");

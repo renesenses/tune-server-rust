@@ -198,6 +198,9 @@ pub struct StreamSession {
     /// ligne par session : elle dit un FAIT ponctuel — le producteur a cessé
     /// d'être en avance — et le répéter à chaque morceau noierait le journal.
     pub dry_alert_emitted: std::sync::atomic::AtomicBool,
+    /// Vrai une fois l'alerte `stream_delivery_stall` émise. Même règle que
+    /// `dry_alert_emitted` : un FAIT ponctuel, une seule ligne par session.
+    pub stall_alert_emitted: std::sync::atomic::AtomicBool,
     /// Wakes an older radio consumer the instant a newer one claims the channel
     /// so it releases the `rx` lock promptly instead of staying parked in
     /// `recv_chunk()`. Paired with `consumer_epoch`; see `claim_channel_consumer`.
@@ -298,6 +301,7 @@ impl StreamSession {
             consumer_epoch: std::sync::atomic::AtomicU64::new(0),
             channel_was_full: std::sync::atomic::AtomicBool::new(false),
             dry_alert_emitted: std::sync::atomic::AtomicBool::new(false),
+            stall_alert_emitted: std::sync::atomic::AtomicBool::new(false),
             consumer_supersede: std::sync::Arc::new(tokio::sync::Notify::new()),
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -389,7 +393,57 @@ impl StreamSession {
         }
         !self.dry_alert_emitted.swap(true, Relaxed)
     }
+
+    /// Enregistre les deux attentes d'un tour de boucle du corps HTTP et dit
+    /// s'il faut ALERTER.
+    ///
+    /// `note_channel_fill` ne couvre qu'UNE des deux moitiés du problème : le
+    /// producteur qui se tarit. L'autre moitié ne laisse aucune trace du tout
+    /// — quand les octets sont DÉJÀ dans le canal et que c'est le corps HTTP
+    /// qui n'est plus servi (réacteur affamé, socket qui ne se vide pas), le
+    /// canal reste PLEIN, `note_channel_fill` se tait, et la sortie locale
+    /// attend dans un `reader.read()` sans limite de temps sans que rien côté
+    /// serveur ne le dise. C'est exactement le trou laissé ouvert par #2952 :
+    /// « on sait que `reader.read()` ne rend rien ; on ne sait pas si c'est le
+    /// décodage, le transcodage, l'écriture dans la session ou le socket ».
+    ///
+    /// Les deux attentes se mesurent au même endroit et se lisent ensemble :
+    ///
+    /// - `attente_producteur` — temps passé DANS `recv_chunk()`. Le canal était
+    ///   vide, on attendait le décodeur.
+    /// - `attente_transport` — temps passé DANS le `yield`, c'est-à-dire entre
+    ///   le moment où le corps a rendu un morceau et celui où on est revenu
+    ///   lui en demander un autre. Les octets étaient en main ; c'est en aval
+    ///   qu'ils n'avançaient pas.
+    ///
+    /// Une seule ligne par session, la première fois que l'une des deux
+    /// dépasse le seuil, et elle porte les DEUX valeurs plus le remplissage du
+    /// canal : c'est ce triplet qui départage, sans rien redemander au
+    /// testeur, « le producteur n'a rien produit » de « les octets étaient là
+    /// et ne sont pas partis ».
+    pub fn note_delivery_stall(
+        &self,
+        attente_producteur: std::time::Duration,
+        attente_transport: std::time::Duration,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if attente_producteur < DELIVERY_STALL_THRESHOLD
+            && attente_transport < DELIVERY_STALL_THRESHOLD
+        {
+            return false;
+        }
+        !self.stall_alert_emitted.swap(true, Relaxed)
+    }
 }
+
+/// Au-delà de cette attente, un flux interne est tenu pour BLOQUÉ.
+///
+/// Très au-dessus de toute contre-pression légitime : la sortie locale ne lit
+/// qu'au fil de son anneau (2 s) et un renderer réseau qui tamponne peut
+/// laisser le corps en attente plusieurs secondes sans que rien n'aille mal.
+/// Les attentes mesurées chez le testeur de #2952 valent 35 à 56 s ; ce seuil
+/// les attrape toutes et ne dit rien d'une lecture saine.
+pub const DELIVERY_STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Type alias for the shared sessions map, used by both core and server.
 pub type SharedSessions = Arc<Mutex<HashMap<String, Arc<StreamSession>>>>;

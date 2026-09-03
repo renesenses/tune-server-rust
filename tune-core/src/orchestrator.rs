@@ -1549,7 +1549,13 @@ fn streaming_pretranscode_format(renderer_supports_mime: bool) -> &'static str {
 /// [`PlaybackOrchestrator::seek`] — et #2893 en réclamait une quatrième. Toutes
 /// y passent désormais : un renderer ajouté ici l'est partout, alors qu'une
 /// copie oubliée serait restée MUETTE (un morceau qui repart du début).
-fn is_network_output_type(output_type: Option<&str>) -> bool {
+///
+/// `pub` depuis #2189 : il existait une QUATRIÈME copie, hors de cette caisse
+/// — `build_signal_path` (`tune-server/src/routes/zones.rs`) — et elle avait
+/// déjà dérivé : cinq types au lieu de six, `slimproto` manquant. Le panneau
+/// et le chemin audio répondaient donc à deux questions différentes sur la
+/// même zone. Le miroir d'affichage appelle maintenant CETTE fonction.
+pub fn is_network_output_type(output_type: Option<&str>) -> bool {
     matches!(
         output_type,
         Some("dlna")
@@ -1559,6 +1565,26 @@ fn is_network_output_type(output_type: Option<&str>) -> bool {
             | Some("squeezebox")
             | Some("slimproto")
     )
+}
+
+/// La sortie va CHERCHER le flux elle-même et reçoit donc nos octets **tels
+/// quels** : `hqplayer`, `airplay2`, `diretta`, tout greffon hors dépôt.
+///
+/// C'est la troisième famille de [`pull_output_needs_dsp_transcode`], extraite
+/// telle quelle — ni élargie, ni rétrécie. Elle existe séparément parce que le
+/// panneau du chemin du signal en a besoin SANS les drapeaux d'exécution
+/// (`is_local`, `is_oaat`, format source) : il n'a que le type de la zone.
+///
+/// La conséquence pour l'affichage est directe et c'est tout le sujet de
+/// #2189 : sur ces sorties, le transport ne touche AUCUN échantillon, donc il
+/// est bit-perfect. Le seul traitement qui puisse s'y appliquer est celui que
+/// [`pull_output_needs_dsp_transcode`] force — EQ, correction de pièce,
+/// ReplayGain — et le panneau le compte déjà à part. Le bras par défaut de
+/// `build_signal_path` rendait `false` inconditionnellement : une zone
+/// HQPlayer était déclarée « non bit-perfect » sur un FLAC 44,1/16 servi
+/// octet pour octet (Alex Campbell, 0.9.98 Linux, fil 1524).
+pub fn is_pull_dsp_output_type(output_type: Option<&str>) -> bool {
+    output_type.is_some() && !is_network_output_type(output_type) && output_type != Some("browser")
 }
 
 /// Après une recréation de flux à une position donnée, faut-il ENCORE envoyer
@@ -1840,11 +1866,13 @@ fn pull_output_needs_dsp_transcode(
     is_oaat: bool,
     source_format: Option<AudioFormat>,
 ) -> bool {
-    output_type.is_some()
+    // La part « type de sortie » vit dans [`is_pull_dsp_output_type`], d'où le
+    // panneau du chemin du signal la lit aussi (#2189). Même ensemble, à la
+    // lettre : `is_push_uri_output_type` n'est qu'un alias de
+    // `is_network_output_type`, que la fonction extraite appelle.
+    is_pull_dsp_output_type(output_type)
         && !is_local
         && !is_oaat
-        && !is_push_uri_output_type(output_type)
-        && output_type != Some("browser")
         && source_format.is_some()
         && source_format != Some(AudioFormat::Dsd)
 }
@@ -1969,6 +1997,36 @@ fn profondeur_sondee_si_la_base_ignore(file_path: &str, fmt: Option<AudioFormat>
 
 pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) -> bool {
     (is_local && (dsd_mode == "native" || dsd_mode == "dop")) || (is_network && dsd_mode == "dop")
+}
+
+/// Le producteur d'une session-CANAL vient de mourir sans avoir ecrit un seul
+/// octet : la session doit DISPARAITRE, pas seulement se taire.
+///
+/// `StreamSession::new` garde un `_keep_alive_tx` clone pour toute la vie de
+/// la session : laisser tomber le `tx` du producteur ne ferme PAS le canal.
+/// Sans ce retrait, la session reste inscrite sans producteur, son corps HTTP
+/// ne se termine jamais, et le pre-chargement gapless s'y enchaine — la sortie
+/// locale tire un flux qui ne debitera jamais rien et la lecture se fige
+/// jusqu'au Stop (#3287, Gros Bidon, Qobuz en USB, 03/09).
+///
+/// `AudioStreamer::remove_session` ferme le canal AVANT de retirer l'entree :
+/// un consommateur deja attache voit un EOF franc au lieu d'attendre a jamais,
+/// et `/stream/{id}` repond ensuite 404 plutot que de pendre. C'est aussi ce
+/// qui rend la mort LISIBLE : `session_alive` devient faux, et c'est le seul
+/// signal qui distingue « pas encore » de « plus jamais » — `data_ready` ne
+/// sait dire que le premier. Le poller s'en sert pour ne plus armer `SetNext`
+/// sur un flux mort.
+async fn abandonner_la_session_de_transcodage(
+    streamer: &crate::http::streamer::AudioStreamer,
+    session_id: &str,
+    tmp_path: &str,
+) {
+    let _ = std::fs::remove_file(tmp_path);
+    streamer.remove_session(session_id).await;
+    warn!(
+        stream_id = session_id,
+        "streaming_session_abandonnee_producteur_mort"
+    );
 }
 
 /// Cette piste est-elle du 1 bit (DSF/DFF) ? Le format vient de la base, tel
@@ -6359,12 +6417,27 @@ impl PlaybackOrchestrator {
                         Ok(Ok(path)) => Some((path, true)),
                         Ok(Err(e)) => {
                             warn!(error = %e, "streaming_transcode_download_failed");
-                            let _ = std::fs::remove_file(&tmp_path);
+                            // #3287 : ces deux sorties quittaient la tache
+                            // AVANT le `end_session_input` du bas, en se
+                            // contentant d'effacer le fichier temporaire. La
+                            // session restait donc inscrite, sans producteur,
+                            // canal ouvert — et le gapless s'y enchainait.
+                            abandonner_la_session_de_transcodage(
+                                &streamer_for_eof,
+                                &session_id_for_eof,
+                                &tmp_path,
+                            )
+                            .await;
                             return;
                         }
                         Err(e) => {
                             warn!(error = %e, "streaming_transcode_task_join_failed");
-                            let _ = std::fs::remove_file(&tmp_path);
+                            abandonner_la_session_de_transcodage(
+                                &streamer_for_eof,
+                                &session_id_for_eof,
+                                &tmp_path,
+                            )
+                            .await;
                             return;
                         }
                     }
@@ -7948,6 +8021,64 @@ impl PlaybackOrchestrator {
         ))
     }
 
+    /// Les deux réglages qu'une sortie locale DOIT porter, lus là où la page
+    /// de réglages les écrit : la base.
+    ///
+    /// #1770 (point 3) — la sortie reconstruite à la volée par
+    /// [`Self::recreate_local_and_play`] les codait en dur (`false`,
+    /// `"auto"`). Conséquence, sur Windows et macOS — les seules plateformes
+    /// qui ont un chemin exclusif ([`crate::outputs::local`],
+    /// `exclusive_mode_support`) : un DAC éteint au démarrage, ou retiré par
+    /// le balayage à chaud, repartait au PREMIER appui sur Lecture en mode
+    /// partagé et jamais en ASIO — `select_host("auto")` ne sonde même pas
+    /// ASIO — alors que les réglages disaient le contraire, et sans que
+    /// l'écran le trahisse (`display_audio_backend` rend la valeur VOULUE).
+    ///
+    /// La chaîne est celle de `AppState::effective_audio_backend` /
+    /// `effective_exclusive_mode`, MOINS le fichier de configuration, qui
+    /// n'existe que dans `tune-server` et n'est pas atteignable d'ici : la
+    /// base d'abord, l'environnement en repli, puis les valeurs par défaut de
+    /// [`crate::config::TuneConfig`] — c'est-à-dire exactement ce que le
+    /// codage en dur rendait, et jamais moins.
+    pub fn reglages_sortie_locale(&self) -> (bool, String) {
+        self.reglages_sortie_locale_avec(|cle| std::env::var(cle).ok())
+    }
+
+    /// Même résolution, avec l'environnement en PARAMÈTRE.
+    ///
+    /// Même intention que [`crate::config::resolve_local_audio_backend`] : la
+    /// règle doit être éprouvable sans dépendre des variables de la machine
+    /// qui l'éprouve — sinon l'essai serait vert ou rouge selon le `.env` du
+    /// runner, et `std::env::set_var` dans un test casse la suite entière.
+    pub fn reglages_sortie_locale_avec<F>(&self, environnement: F) -> (bool, String)
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let reglages = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let backend = reglages
+            .get("local_audio_backend")
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| crate::config::resolve_local_audio_backend(&environnement))
+            .unwrap_or_else(|| "auto".to_string());
+        let demande = reglages
+            .get("local_exclusive_mode")
+            .ok()
+            .flatten()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or_else(|| {
+                environnement("TUNE_LOCAL_EXCLUSIVE_MODE")
+                    .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .unwrap_or(false)
+            });
+        // ASIO est exclusif par nature, et c'est une notion Windows (#1268,
+        // #3192). La règle vit dans `tune-core::config` et n'est pas recopiée
+        // ici : une seule écriture pour les deux chemins.
+        let effectif = crate::config::local_exclusive_mode_status(&backend, demande).effective;
+        (effectif, backend)
+    }
+
     /// Recreate a local (cpal) output on demand and play to it. Only the
     /// `local-audio` build has `outputs::local`; without that feature there is
     /// no local backend, so this is a no-op that reports the device as missing.
@@ -7959,8 +8090,25 @@ impl PlaybackOrchestrator {
         start_position_ms: Option<u64>,
     ) -> (bool, Option<String>) {
         let device_name = device_id.strip_prefix("local:").unwrap_or(device_id);
-        info!(device_id, "output_not_found_recreating_local_output");
-        let local_out = crate::outputs::local::LocalOutput::new(device_name.to_string());
+        // Les réglages, pas des littéraux : voir `reglages_sortie_locale`
+        // (#1770). `endpoint_id` et `origin_host` restent absents — les deux
+        // ne viennent QUE d'une énumération de périphériques
+        // (`AudioDevice::endpoint_id` / `.backend`), rien ne les persiste, et
+        // ce chemin n'en a pas : il existe précisément parce que le
+        // périphérique n'est PAS énumérable à cet instant. Les inventer serait
+        // pire que de les laisser vides.
+        let (exclusive_mode, audio_backend) = self.reglages_sortie_locale();
+        info!(
+            device_id,
+            exclusive_mode,
+            audio_backend = %audio_backend,
+            "output_not_found_recreating_local_output"
+        );
+        let local_out = crate::outputs::local::LocalOutput::with_options(
+            device_name.to_string(),
+            exclusive_mode,
+            &audio_backend,
+        );
         if let Some(position_ms) = start_position_ms {
             local_out.set_pending_start_position_ms(position_ms);
             // Producer always pre-seeked — see the comment in send_to_output.
@@ -11215,6 +11363,18 @@ impl PlaybackOrchestrator {
         self.streamer.wait_data_ready(stream_id, timeout_ms).await
     }
 
+    /// La session de flux `stream_id` est-elle encore inscrite ?
+    ///
+    /// A lire APRES [`Self::wait_stream_data_ready`], et seulement quand il a
+    /// rendu `false` : ce dernier ne dit que « pas encore », jamais « plus
+    /// jamais ». Une session VIVANTE et muette est un telechargement lent
+    /// (DASH Hi-Res Tidal) ; une session DISPARUE est un producteur mort.
+    /// C'est l'idiome que `resume` emploie deja (#2512) pour ne pas reprendre
+    /// en silence sur une session ramassee.
+    pub async fn stream_session_alive(&self, stream_id: &str) -> bool {
+        self.streamer.session_alive(stream_id).await
+    }
+
     pub async fn streamer_bytes_sent(&self, stream_id: &str) -> Option<u64> {
         self.streamer.stream_bytes_sent(stream_id).await
     }
@@ -12709,9 +12869,9 @@ mod wav_override_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RADIO_HLS_UNSUPPORTED, RADIO_NOT_AUDIO, arm_local_stream_consumer_watch,
-        decode_radio_stream_to_pcm, emit_radio_playback_error, is_hls_manifest,
-        non_audio_content_type,
+        RADIO_HLS_UNSUPPORTED, RADIO_NOT_AUDIO, abandonner_la_session_de_transcodage,
+        arm_local_stream_consumer_watch, decode_radio_stream_to_pcm, emit_radio_playback_error,
+        is_hls_manifest, non_audio_content_type,
     };
     use crate::event_bus::EventBus;
     use crate::outputs::mock::MockOutput;
@@ -13434,10 +13594,10 @@ mod tests {
 
     use super::{
         PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, is_network_output_type,
-        is_push_uri_output_type, message_session_perdue, passthrough_didl_duration_ms,
-        pull_output_needs_dsp_transcode, replay_needs_output_seek, reprise_de_session,
-        requete_de_retablissement, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
-        streaming_pretranscode_format, use_file_transcode_for,
+        is_pull_dsp_output_type, is_push_uri_output_type, message_session_perdue,
+        passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, replay_needs_output_seek,
+        reprise_de_session, requete_de_retablissement, spawn_streaming_dsp_relay,
+        streaming_needs_pretranscode, streaming_pretranscode_format, use_file_transcode_for,
     };
 
     #[test]
@@ -13520,6 +13680,54 @@ mod tests {
 
         // Unregistered device (output_type_of returned None): never coalesce.
         assert!(!is_push_uri_output_type(None));
+    }
+
+    /// La part « type de sortie » de [`pull_output_needs_dsp_transcode`],
+    /// extraite pour que le panneau du chemin du signal la LISE au lieu de la
+    /// recopier (#2189).
+    ///
+    /// L'extraction doit être à la lettre : ce test compare les deux, format
+    /// source et drapeaux d'exécution neutres, sur tous les types que ce dépôt
+    /// sait produire.
+    #[test]
+    fn is_pull_dsp_output_type_est_la_part_type_de_pull_output_needs_dsp_transcode() {
+        use crate::audio::formats::AudioFormat;
+        let flac = Some(AudioFormat::Flac);
+
+        for t in [
+            "dlna",
+            "openhome",
+            "chromecast",
+            "bluos",
+            "squeezebox",
+            "slimproto",
+            "browser",
+            "local",
+            "oaat",
+            "oaat-multiroom",
+            "airplay",
+            "airplay2",
+            "hqplayer",
+            "diretta",
+            "un-greffon-hors-depot",
+        ] {
+            assert_eq!(
+                is_pull_dsp_output_type(Some(t)),
+                pull_output_needs_dsp_transcode(Some(t), false, false, flac),
+                "{t} : le prédicat extrait doit rendre exactement ce que \
+                 rendait la condition d'origine"
+            );
+        }
+        assert!(!is_pull_dsp_output_type(None));
+
+        // Et le fait qui fonde le correctif #2189 : HQPlayer, AirPlay 2 et
+        // tout greffon hors dépôt sont des sorties PULL — elles reçoivent nos
+        // octets intacts, donc le transport y est bit-perfect.
+        assert!(is_pull_dsp_output_type(Some("hqplayer")));
+        assert!(is_pull_dsp_output_type(Some("airplay2")));
+        assert!(is_pull_dsp_output_type(Some("diretta")));
+        // `slimproto` n'en est PAS une : elle reçoit une URI, comme Squeezebox.
+        assert!(!is_pull_dsp_output_type(Some("slimproto")));
     }
 
     #[test]
@@ -14108,6 +14316,129 @@ mod tests {
                 "{did} : rien ne prouve que cette sortie ne mesure pas"
             );
         }
+    }
+
+    /// #3287 — un producteur de transcodage qui meurt avant d'ecrire doit
+    /// laisser un SILENCE LISIBLE, pas une session fantome.
+    ///
+    /// La garde tient les deux signaux ENSEMBLE, parce que c'est leur
+    /// difference qui porte la decision du poller :
+    ///
+    /// - session VIVANTE et muette (transcodage lent, DASH Hi-Res Tidal) :
+    ///   `wait_stream_data_ready` = false, `stream_session_alive` = **true**
+    ///   → le gapless doit continuer d'armer, sinon un blanc a chaque piste ;
+    /// - session ABANDONNEE (echec CDN a 93 ms, le journal de Gros Bidon) :
+    ///   les DEUX sont false → il n'y a plus rien a armer.
+    ///
+    /// Avant le correctif, la seconde ligne rendait `alive = true` comme la
+    /// premiere : les deux cas etaient indiscernables, et la sortie locale
+    /// s'enchainait sur un flux qui ne debiterait jamais un octet.
+    ///
+    /// Le fichier temporaire est verifie au passage : c'est le seul autre
+    /// effet de la branche d'echec, et il ne doit pas se perdre dans le
+    /// deplacement.
+    #[tokio::test]
+    async fn une_session_de_transcodage_abandonnee_ne_se_confond_plus_avec_une_session_lente() {
+        use crate::http::streamer::StreamInfo;
+
+        let orch = test_orchestrator();
+        let info = StreamInfo {
+            format: "wav".to_string(),
+            mime_type: "audio/wav".to_string(),
+            ..StreamInfo::default()
+        };
+
+        // Une session de transcodage qui n'a encore rien produit : muette,
+        // mais bien vivante. C'est le cas que le poller DOIT continuer d'armer.
+        let (lente, _tx, _ready) = orch.streamer.create_session(info.clone(), false, 1).await;
+        assert!(
+            !orch.wait_stream_data_ready(&lente, 20).await,
+            "sans un octet, l'attente doit echouer — sinon l'epreuve ne mesure rien"
+        );
+        assert!(
+            orch.stream_session_alive(&lente).await,
+            "une session lente est VIVANTE : refuser d'armer ici remettrait un \
+             blanc entre chaque piste Hi-Res"
+        );
+
+        // Le cas de #3287 : le telechargement amont a echoue, le producteur
+        // abandonne. Un vrai fichier temporaire, pour verifier qu'il part.
+        let (morte, _tx2, _ready2) = orch.streamer.create_session(info, false, 1).await;
+        // `test_scratch` et pas un chemin compose a la main : le garde
+        // `aucun_chemin_temporaire_compose_a_la_main_dans_du_code_de_test`
+        // (#3030) refuse le second, et son `Drop` nettoie meme quand l'epreuve
+        // panique. Le fichier est ecrit ICI ; c'est le code de PRODUCTION qui
+        // doit le retirer, et c'est ce que la derniere assertion mesure.
+        let tmp = crate::test_scratch::scratch_file("3287-transcodage", ".flac");
+        std::fs::write(&tmp, b"pas du flac").expect("fichier temporaire de l'epreuve");
+        let tmp_str = tmp.as_str().to_string();
+
+        abandonner_la_session_de_transcodage(&orch.streamer, &morte, &tmp_str).await;
+
+        assert!(
+            !orch.stream_session_alive(&morte).await,
+            "la session d'un producteur mort doit avoir DISPARU : tant qu'elle \
+             reste inscrite, son corps HTTP ne se termine jamais et le gapless \
+             s'y enchaine (#3287)"
+        );
+        assert!(
+            !orch.wait_stream_data_ready(&morte, 20).await,
+            "une session disparue ne peut pas devenir prete"
+        );
+        assert!(
+            !tmp.exists(),
+            "le fichier temporaire du telechargement rate doit partir aussi : {tmp_str}"
+        );
+    }
+
+    /// #1770 (point 3) — la sortie locale reconstruite à la volée lit les
+    /// réglages au lieu de les coder en dur.
+    ///
+    /// L'essai porte sur la RÉSOLUTION, pas sur l'ouverture du périphérique :
+    /// sous Linux aucun chemin exclusif n'existe (`exclusive_mode_support`),
+    /// une épreuve qui ouvrirait un DAC serait verte contre rien ici. Ce qui
+    /// se prouve sur cette machine, c'est que les valeurs remises au
+    /// constructeur viennent de la BASE.
+    #[test]
+    fn les_reglages_de_sortie_locale_viennent_de_la_base() {
+        let orch = test_orchestrator();
+        let reglages = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+
+        // Base vierge, environnement neutre : le repli est le défaut de
+        // `TuneConfig` — c'est-à-dire ce que le codage en dur rendait.
+        assert_eq!(
+            orch.reglages_sortie_locale_avec(|_| None),
+            (false, "auto".to_string()),
+            "sur une base vierge le repli doit rester le défaut de TuneConfig"
+        );
+
+        reglages.set("local_audio_backend", "wasapi").unwrap();
+        reglages.set("local_exclusive_mode", "true").unwrap();
+        assert_eq!(
+            orch.reglages_sortie_locale_avec(|_| None),
+            (true, "wasapi".to_string()),
+            "la sortie recréée ignore les réglages : un DAC éteint au \
+             démarrage repartirait en partagé au premier appui sur Lecture, \
+             alors que la page de réglages dit le contraire (#1770)."
+        );
+
+        // L'environnement n'est qu'un REPLI : la base gagne.
+        let env_asio = |cle: &str| (cle == "TUNE_LOCAL_AUDIO_BACKEND").then(|| "asio".to_string());
+        assert_eq!(
+            orch.reglages_sortie_locale_avec(env_asio),
+            (true, "wasapi".to_string()),
+            "l'environnement ne doit pas passer devant la valeur enregistrée"
+        );
+
+        // Sans valeur en base, l'environnement est lu — c'est le seul morceau
+        // de la chaîne de `tune-server` qui soit atteignable depuis ici.
+        reglages.delete("local_audio_backend").unwrap();
+        assert_eq!(
+            orch.reglages_sortie_locale_avec(env_asio),
+            (true, "asio".to_string()),
+            "TUNE_LOCAL_AUDIO_BACKEND doit servir de repli comme dans \
+             tune-server/src/config.rs"
+        );
     }
 
     fn test_orchestrator() -> PlaybackOrchestrator {
@@ -19029,6 +19360,86 @@ mod profondeur_annoncee_egale_profondeur_ecrite {
             assert!(
                 niveau_non_nul(&dest_s, 16),
                 "source {profondeur_source} bits : le WAV 16 bits est SILENCIEUX"
+            );
+        }
+    }
+}
+
+/// #1770 (point 3) — le SITE de production, pas seulement la résolution.
+///
+/// L'essai voisin (`les_reglages_de_sortie_locale_viennent_de_la_base`) prouve
+/// que `reglages_sortie_locale` lit bien la base ; il resterait vert si
+/// quelqu'un remettait `LocalOutput::new(...)` — ou
+/// `with_options(nom, false, "auto")` — dans `recreate_local_and_play`. C'est
+/// ce site-là que ce module épingle.
+///
+/// Hors de toute `feature` : `recreate_local_and_play` vit derrière
+/// `local-audio`, qui n'est PAS dans le jeu du job `test` de la CI
+/// (`--no-default-features --features oaat,cloud-relay,bandcamp`). Une garde
+/// posée derrière cette fonctionnalité ne serait exécutée que par
+/// `test-shipped-features` et `audio-embedding`, tous deux conditionnés à
+/// `full` — donc jamais sur une PR vers `batch/*`. `include_str!` lit le
+/// texte du fichier quelles que soient les `cfg`.
+#[cfg(test)]
+mod recreation_locale_guard {
+    /// Le CORPS de `recreate_local_and_play`, de sa signature à son accolade
+    /// fermante.
+    ///
+    /// ⚠️ Le fichier est inclus en ENTIER, ce module compris, et les motifs
+    /// cherchés figurent aussi dans les messages ci-dessous : un
+    /// `contains` sur le fichier complet se trouverait lui-même et rendrait
+    /// vrai quoi qu'il arrive (#2082). La découpe l'empêche — `find` rend la
+    /// PREMIÈRE occurrence, celle de la variante `local-audio`, la seule qui
+    /// construise réellement une sortie.
+    fn corps_de_recreation() -> &'static str {
+        const TOUT: &str = include_str!("orchestrator.rs");
+        const SIGNATURE: &str = "    async fn recreate_local_and_play(\n";
+        let debut = TOUT.find(SIGNATURE).unwrap_or_else(|| {
+            panic!(
+                "`recreate_local_and_play` a été renommée ou remaniée : ce \
+                 garde-fou ne garde plus rien tant qu'il n'a pas suivi (#1770)."
+            )
+        });
+        let apres = &TOUT[debut..];
+        let fin = apres
+            .find("\n    }\n")
+            .map(|i| i + 7)
+            .unwrap_or(apres.len());
+        let corps = &apres[..fin];
+        assert!(
+            corps.contains("LocalOutput"),
+            "la découpe ne tombe plus sur la variante qui construit la sortie"
+        );
+        corps
+    }
+
+    #[test]
+    fn la_sortie_recreee_ne_code_pas_les_reglages_en_dur() {
+        let corps = corps_de_recreation();
+        assert!(
+            corps.contains("self.reglages_sortie_locale()"),
+            "`recreate_local_and_play` ne lit plus les réglages. Sous Windows \
+             et macOS, un DAC éteint au démarrage (ou retiré par le balayage à \
+             chaud) sortirait en PARTAGÉ et jamais en ASIO au premier appui \
+             sur Lecture, sans que l'écran le dise (#1770)."
+        );
+        assert!(
+            !corps.contains("LocalOutput::new("),
+            "`LocalOutput::new` code `exclusive_mode = false` et \
+             `audio_backend = \"auto\"` en dur : c'est exactement le défaut du \
+             point 3 de #1770. Passer par `with_options` avec les valeurs lues."
+        );
+        assert!(
+            corps.contains("exclusive_mode,") && corps.contains("&audio_backend,"),
+            "les valeurs lues ne sont plus celles remises au constructeur : \
+             les lire pour ne pas s'en servir ne corrige rien (#1770)."
+        );
+        for litteral in ["\"auto\"", "\"wasapi\"", "\"asio\"", "\"coreaudio\""] {
+            assert!(
+                !corps.contains(litteral),
+                "`{litteral}` est de retour en dur dans \
+                 `recreate_local_and_play` : le réglage de l'utilisateur \
+                 redevient sans effet sur ce chemin (#1770)."
             );
         }
     }

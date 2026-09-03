@@ -217,7 +217,31 @@ jobs:
       #
       # Garde : `le_job_test_de_la_ci_active_bandcamp`
       # (tune-server/tests/workflows_bornes.rs).
-      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay,bandcamp
+      #
+      # #3266 — les SEPT paquets ci-dessus etaient les seuls que la CI
+      # EXECUTAIT. Un membre du workspace qu'aucun `-p` ne nomme n'est jamais
+      # lance : ses tests ne peuvent ni passer ni echouer. Recense le
+      # 03/09/2026 sur les trois workflows qui lancent `cargo test`
+      # (`ci.yml`, `test-postgres.yml`, `widget-ci.yml` — ce dernier tourne
+      # dans un AUTRE workspace) : `tune-bandcamp` (47 essais, dont les DEUX
+      # gardes de site de #2778, qui ne pouvaient donc pas crier),
+      # `tune-plugin-runtime-wasm` (8), `tune-ffi` (3), `tune-karaoke` (3)
+      # n'etaient nommes NULLE PART. Verts sous `cargo test --workspace`, que
+      # personne ne joue.
+      #
+      # `tune-cli`, `tune-dj` et `tune-concerts` sont nommes ici SANS avoir de
+      # test aujourd'hui : c'est la place qui manquait, pas les essais. Le
+      # premier `#[test]` qu'on y ecrira tournera des sa PR au lieu d'attendre
+      # qu'on repense a elargir la porte.
+      #
+      # Aucune de ces caisses ne tire de dependance audio ni systeme (axum,
+      # serde, reqwest, tokio, tracing, clap, wasmtime) : rien de plus a
+      # installer sur ce runner.
+      #
+      # Garde : `tout_membre_du_workspace_est_execute_par_une_porte_cargo_test`
+      # (tune-server/tests/workflows_bornes.rs) relit `members` du Cargo.toml
+      # racine et tombe des qu'un membre n'est nomme par aucune porte.
+      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge -p tune-cli -p tune-ffi -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,cloud-relay,bandcamp
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -254,7 +278,15 @@ jobs:
           done
           echo "::error::apt injoignable apres 3 essais"
           exit 1
-      - run: cargo test --no-fail-fast -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
+      # #3266 — les quatre greffons in-tree et le moteur WASM sont deja
+      # COMPILES ici, tires par `dj,karaoke,bandcamp,concerts,plugins-wasm` en
+      # tant que dependances optionnelles de `tune-server`. Ce qui manquait,
+      # c'est de les SELECTIONNER : sans `-p`, cargo construit leur `lib` et ne
+      # construit jamais leur binaire de test. Les nommer ici ne rajoute donc
+      # aucune dependance a compiler — seulement les harnais — et fait tourner
+      # leurs essais avec le jeu de fonctionnalites LIVRE, en plus du jeu
+      # reduit du job `test`.
+      - run: cargo test --no-fail-fast -p tune-server -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This
@@ -568,7 +600,54 @@ jobs:
       #  - `concerts` vient de `rc` (#2768, 12987dbd) ; l'en sortir rouvrirait
       #    l'angle mort que ce commit-la venait de fermer, et
       #    `toute_feature_declaree_est_activee_par_une_porte_clippy` rougirait.
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
+      #
+      # Croisement du 03/09/2026 sur `origin/main` (0f125653), AVANT cet
+      # elargissement. C'est la SEULE ligne `cargo clippy` du depot :
+      # `test-postgres.yml` et `widget-ci.yml` n'en portent aucune, et le
+      # `cargo check` du job `ffi` n'est pas un lint.
+      #
+      # QUINZE membres, pas quatorze : `cargo metadata --no-deps` en compte
+      # quinze. `tune-output-api` n'est pas dans la liste `members` — il y entre
+      # tout seul, parce que `tune-core` le prend en dependance `path`, et que
+      # cargo promeut membre toute dependance `path` interne au workspace. Lire
+      # `members = [...]` seul le rate.
+      #
+      # Huit paquets etaient nommes ; sept ne l'etaient pas. Mais MESURE plutot
+      # que suppose, le trou n'est pas la ou on le croyait : le code de
+      # bibliotheque d'un membre TIRE par un `-p` est deja linte, parce que
+      # cargo passe `clippy-driver` a tous les membres du workspace, pas aux
+      # seuls `-p`. Preuve : la course a huit `-p` sort deja
+      # `plugins/tune-bandcamp/src/lib.rs:175` et `plugins/tune-concerts/
+      # src/lib.rs:295`. Ce qui restait vraiment dans le noir :
+      #
+      #   - `tune-ffi` en ENTIER : aucun membre n'en depend, donc il n'etait pas
+      #     meme compile par cette porte ;
+      #   - les cibles NON-lib des six autres — modules `#[cfg(test)]`, bancs,
+      #     exemples : `--all-targets` ne construit ces cibles-la que pour les
+      #     paquets designes par `-p`.
+      #
+      # Mesure du 03/09/2026, apres elargissement : ZERO avertissement
+      # `clippy::correctness` sort des sept caisses neuves — la porte reste
+      # verte. Deux avertissements apparaissent, tous deux dans `tune-ffi`
+      # (`collapsible_if`, `field_reassign_with_default`), aucun n'est
+      # `correctness`, donc aucun ne rougit.
+      #
+      # Cout mesure sur Shrek, dossier cible VIDE avant CHAQUE course, huit
+      # courses a froid. Au seul moment calme de la soiree (charge 4) :
+      # 156 s a huit `-p`, 162 s a quinze — six secondes, moins de 4 %. Les six
+      # autres courses sont tombees sous la charge de deux autres agents et ne
+      # separent rien : la MEME commande a huit `-p` a mis 156, 198, 247 puis
+      # 327 s, quand celle a quinze mettait 162, 185, 193 et 234 s. Le cout de
+      # l'elargissement est sous le plancher de bruit de la machine ; il n'est
+      # pas mesurable, et surement pas de l'ordre de la minute.
+      #
+      # Meme famille que #1427 (greffons non compiles), #2865 (features nues) et
+      # #3266 (caisses jamais executees) : une porte dont la portee est plus
+      # etroite que ce qu'on croit rend un vert qui ne couvre pas ce qu'on pense.
+      #
+      # Garde : `toute_caisse_du_workspace_est_nommee_par_une_porte_clippy`
+      # (tune-server/tests/workflows_bornes.rs).
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge -p tune-ffi -p tune-output-api -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
@@ -596,6 +675,26 @@ jobs:
     # desormais.
     steps:
       - uses: actions/checkout@v4
+      # `actions-rust-lang/audit@v1` installe l'outil par
+      # `cargo +stable install cargo-audit --vers 0.22.0 --no-default-features`,
+      # SANS `--locked` : cargo resout donc les dependances de cargo-audit a
+      # neuf, a chaque run. Le 03/09/2026 il a attrape `tinyvec 1.13.0`, publie
+      # le jour meme et casse (`cannot find macro `vec` in this scope`,
+      # tinyvec.rs:710) — et TOUTES les PR du depot sont parties rouges.
+      #
+      # Ce n'etait pas un avis de securite : c'est l'OUTIL qui ne se compilait
+      # plus. La porte reste donc bloquante pour ce qu'elle doit bloquer, et on
+      # retire seulement sa dependance a l'etat de crates.io a l'instant T.
+      #
+      # `--locked` fait lire a cargo le Cargo.lock livre avec cargo-audit
+      # 0.22.0, donc les versions figees a SA publication. L'installation qui
+      # suit dans l'action voit alors le binaire deja present a la meme version
+      # et sort en 0 sans rien reconstruire.
+      #
+      # La version et `--no-default-features` reproduisent EXACTEMENT la ligne
+      # de l'action : si elle change, celle-ci doit suivre.
+      - name: Installer cargo-audit avec son propre verrou
+        run: cargo install cargo-audit --version 0.22.0 --locked --no-default-features
       - uses: actions-rust-lang/audit@v1
         with:
           denyWarnings: true
