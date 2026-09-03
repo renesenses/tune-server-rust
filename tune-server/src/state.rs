@@ -346,6 +346,25 @@ impl AppState {
         services.register(Box::new(
             tune_core::streaming::youtube::YouTubeService::new(),
         ));
+        // 🔴 #2702 / #2778 — Bandcamp n'était NULLE PART dans ce registre.
+        // Les deux seules routes qui construisent une file complète
+        // (`POST /zones/{id}/play` avec `streaming_album_id` ou
+        // `streaming_playlist_id`) commencent par `registry.get(source)` et
+        // répondaient donc `400 unknown service: bandcamp` : il ne restait que
+        // le chemin « piste distante seule », qui pose une file d'exactement
+        // UNE piste — d'où « les morceaux ne s'enchaînent pas » (Sevy Tabroc).
+        //
+        // L'inscription est INCONDITIONNELLE, comme les cinq autres, et non
+        // gardée par l'état du greffon : `ServiceRegistry::get` ne consulte
+        // jamais `enabled`, et le service rend `enabled() == false` tant que
+        // personne ne l'a activé — il apparaît donc comme disponible et non
+        // connecté, exactement comme le greffon opt-in dont il est la seconde
+        // face. La LECTURE, elle, ne change pas de chemin : `resolve_stream`
+        // route toujours `source == "bandcamp"` vers `resolve_direct_url`.
+        #[cfg(feature = "bandcamp")]
+        services.register(Box::new(tune_bandcamp::BandcampService::new(
+            backend.clone(),
+        )));
 
         let services = Arc::new(Mutex::new(services));
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));

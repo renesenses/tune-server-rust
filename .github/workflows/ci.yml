@@ -197,7 +197,27 @@ jobs:
       # par ce lot. Sans elles ici, le decoupage aurait retire du code de la
       # porte au lieu de l'y garder — la liste est un inventaire, pas un
       # echantillon (cf #2865).
-      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay
+      #
+      # `bandcamp` : meme motif que `local-audio` cote clippy (#2865).
+      # `tune-server/tests/bandcamp_file_de_zone_i2702.rs`
+      # vit derriere `#![cfg(feature = "bandcamp")]` parce que la caisse
+      # `tune-bandcamp` est une dependance OPTIONNELLE
+      # (`bandcamp = ["dep:tune-bandcamp"]`) : sans la fonctionnalite, ni le
+      # service ni son inscription dans `state.rs` n'existent. La retirer
+      # d'ici ne rendrait pas ces cinq essais rouges — elle les rendrait
+      # INVISIBLES, et #2702/#2778 redeviendraient verts contre rien. Ils ne
+      # tourneraient alors que dans `test-shipped-features`, differe jusqu'a
+      # `full`, donc JAMAIS sur une PR vers `batch/*`.
+      #
+      # La fonctionnalite est dans le `default` de `tune-server` et dans TOUS
+      # les binaires publies ; c'est `--no-default-features` qui la retirait
+      # ici. Elle ne tire aucune caisse audio ni systeme
+      # (`plugins/tune-bandcamp/Cargo.toml` : axum, serde, reqwest, tokio,
+      # tracing) : rien de plus a installer sur ce runner.
+      #
+      # Garde : `le_job_test_de_la_ci_active_bandcamp`
+      # (tune-server/tests/workflows_bornes.rs).
+      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay,bandcamp
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence

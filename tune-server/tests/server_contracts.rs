@@ -13,6 +13,8 @@ mod annonce_forum_bornes;
 mod auth_security;
 #[path = "autoeq_import_route.rs"]
 mod autoeq_import_route;
+#[path = "bandcamp_file_de_zone_i2702.rs"]
+mod bandcamp_file_de_zone_i2702;
 #[path = "bios_bilan_visible.rs"]
 mod bios_bilan_visible;
 #[path = "bios_langue_album.rs"]
