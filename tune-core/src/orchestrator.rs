@@ -1971,6 +1971,36 @@ pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) ->
     (is_local && (dsd_mode == "native" || dsd_mode == "dop")) || (is_network && dsd_mode == "dop")
 }
 
+/// Le producteur d'une session-CANAL vient de mourir sans avoir ecrit un seul
+/// octet : la session doit DISPARAITRE, pas seulement se taire.
+///
+/// `StreamSession::new` garde un `_keep_alive_tx` clone pour toute la vie de
+/// la session : laisser tomber le `tx` du producteur ne ferme PAS le canal.
+/// Sans ce retrait, la session reste inscrite sans producteur, son corps HTTP
+/// ne se termine jamais, et le pre-chargement gapless s'y enchaine — la sortie
+/// locale tire un flux qui ne debitera jamais rien et la lecture se fige
+/// jusqu'au Stop (#3287, Gros Bidon, Qobuz en USB, 03/09).
+///
+/// `AudioStreamer::remove_session` ferme le canal AVANT de retirer l'entree :
+/// un consommateur deja attache voit un EOF franc au lieu d'attendre a jamais,
+/// et `/stream/{id}` repond ensuite 404 plutot que de pendre. C'est aussi ce
+/// qui rend la mort LISIBLE : `session_alive` devient faux, et c'est le seul
+/// signal qui distingue « pas encore » de « plus jamais » — `data_ready` ne
+/// sait dire que le premier. Le poller s'en sert pour ne plus armer `SetNext`
+/// sur un flux mort.
+async fn abandonner_la_session_de_transcodage(
+    streamer: &crate::http::streamer::AudioStreamer,
+    session_id: &str,
+    tmp_path: &str,
+) {
+    let _ = std::fs::remove_file(tmp_path);
+    streamer.remove_session(session_id).await;
+    warn!(
+        stream_id = session_id,
+        "streaming_session_abandonnee_producteur_mort"
+    );
+}
+
 /// Cette piste est-elle du 1 bit (DSF/DFF) ? Le format vient de la base, tel
 /// que le scan l'a écrit.
 pub fn est_source_dsd(format: Option<&str>) -> bool {
@@ -6359,12 +6389,27 @@ impl PlaybackOrchestrator {
                         Ok(Ok(path)) => Some((path, true)),
                         Ok(Err(e)) => {
                             warn!(error = %e, "streaming_transcode_download_failed");
-                            let _ = std::fs::remove_file(&tmp_path);
+                            // #3287 : ces deux sorties quittaient la tache
+                            // AVANT le `end_session_input` du bas, en se
+                            // contentant d'effacer le fichier temporaire. La
+                            // session restait donc inscrite, sans producteur,
+                            // canal ouvert — et le gapless s'y enchainait.
+                            abandonner_la_session_de_transcodage(
+                                &streamer_for_eof,
+                                &session_id_for_eof,
+                                &tmp_path,
+                            )
+                            .await;
                             return;
                         }
                         Err(e) => {
                             warn!(error = %e, "streaming_transcode_task_join_failed");
-                            let _ = std::fs::remove_file(&tmp_path);
+                            abandonner_la_session_de_transcodage(
+                                &streamer_for_eof,
+                                &session_id_for_eof,
+                                &tmp_path,
+                            )
+                            .await;
                             return;
                         }
                     }
@@ -11215,6 +11260,18 @@ impl PlaybackOrchestrator {
         self.streamer.wait_data_ready(stream_id, timeout_ms).await
     }
 
+    /// La session de flux `stream_id` est-elle encore inscrite ?
+    ///
+    /// A lire APRES [`Self::wait_stream_data_ready`], et seulement quand il a
+    /// rendu `false` : ce dernier ne dit que « pas encore », jamais « plus
+    /// jamais ». Une session VIVANTE et muette est un telechargement lent
+    /// (DASH Hi-Res Tidal) ; une session DISPARUE est un producteur mort.
+    /// C'est l'idiome que `resume` emploie deja (#2512) pour ne pas reprendre
+    /// en silence sur une session ramassee.
+    pub async fn stream_session_alive(&self, stream_id: &str) -> bool {
+        self.streamer.session_alive(stream_id).await
+    }
+
     pub async fn streamer_bytes_sent(&self, stream_id: &str) -> Option<u64> {
         self.streamer.stream_bytes_sent(stream_id).await
     }
@@ -12709,9 +12766,9 @@ mod wav_override_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RADIO_HLS_UNSUPPORTED, RADIO_NOT_AUDIO, arm_local_stream_consumer_watch,
-        decode_radio_stream_to_pcm, emit_radio_playback_error, is_hls_manifest,
-        non_audio_content_type,
+        RADIO_HLS_UNSUPPORTED, RADIO_NOT_AUDIO, abandonner_la_session_de_transcodage,
+        arm_local_stream_consumer_watch, decode_radio_stream_to_pcm, emit_radio_playback_error,
+        is_hls_manifest, non_audio_content_type,
     };
     use crate::event_bus::EventBus;
     use crate::outputs::mock::MockOutput;
@@ -14108,6 +14165,79 @@ mod tests {
                 "{did} : rien ne prouve que cette sortie ne mesure pas"
             );
         }
+    }
+
+    /// #3287 — un producteur de transcodage qui meurt avant d'ecrire doit
+    /// laisser un SILENCE LISIBLE, pas une session fantome.
+    ///
+    /// La garde tient les deux signaux ENSEMBLE, parce que c'est leur
+    /// difference qui porte la decision du poller :
+    ///
+    /// - session VIVANTE et muette (transcodage lent, DASH Hi-Res Tidal) :
+    ///   `wait_stream_data_ready` = false, `stream_session_alive` = **true**
+    ///   → le gapless doit continuer d'armer, sinon un blanc a chaque piste ;
+    /// - session ABANDONNEE (echec CDN a 93 ms, le journal de Gros Bidon) :
+    ///   les DEUX sont false → il n'y a plus rien a armer.
+    ///
+    /// Avant le correctif, la seconde ligne rendait `alive = true` comme la
+    /// premiere : les deux cas etaient indiscernables, et la sortie locale
+    /// s'enchainait sur un flux qui ne debiterait jamais un octet.
+    ///
+    /// Le fichier temporaire est verifie au passage : c'est le seul autre
+    /// effet de la branche d'echec, et il ne doit pas se perdre dans le
+    /// deplacement.
+    #[tokio::test]
+    async fn une_session_de_transcodage_abandonnee_ne_se_confond_plus_avec_une_session_lente() {
+        use crate::http::streamer::StreamInfo;
+
+        let orch = test_orchestrator();
+        let info = StreamInfo {
+            format: "wav".to_string(),
+            mime_type: "audio/wav".to_string(),
+            ..StreamInfo::default()
+        };
+
+        // Une session de transcodage qui n'a encore rien produit : muette,
+        // mais bien vivante. C'est le cas que le poller DOIT continuer d'armer.
+        let (lente, _tx, _ready) = orch.streamer.create_session(info.clone(), false, 1).await;
+        assert!(
+            !orch.wait_stream_data_ready(&lente, 20).await,
+            "sans un octet, l'attente doit echouer — sinon l'epreuve ne mesure rien"
+        );
+        assert!(
+            orch.stream_session_alive(&lente).await,
+            "une session lente est VIVANTE : refuser d'armer ici remettrait un \
+             blanc entre chaque piste Hi-Res"
+        );
+
+        // Le cas de #3287 : le telechargement amont a echoue, le producteur
+        // abandonne. Un vrai fichier temporaire, pour verifier qu'il part.
+        let (morte, _tx2, _ready2) = orch.streamer.create_session(info, false, 1).await;
+        // `test_scratch` et pas un chemin compose a la main : le garde
+        // `aucun_chemin_temporaire_compose_a_la_main_dans_du_code_de_test`
+        // (#3030) refuse le second, et son `Drop` nettoie meme quand l'epreuve
+        // panique. Le fichier est ecrit ICI ; c'est le code de PRODUCTION qui
+        // doit le retirer, et c'est ce que la derniere assertion mesure.
+        let tmp = crate::test_scratch::scratch_file("3287-transcodage", ".flac");
+        std::fs::write(&tmp, b"pas du flac").expect("fichier temporaire de l'epreuve");
+        let tmp_str = tmp.as_str().to_string();
+
+        abandonner_la_session_de_transcodage(&orch.streamer, &morte, &tmp_str).await;
+
+        assert!(
+            !orch.stream_session_alive(&morte).await,
+            "la session d'un producteur mort doit avoir DISPARU : tant qu'elle \
+             reste inscrite, son corps HTTP ne se termine jamais et le gapless \
+             s'y enchaine (#3287)"
+        );
+        assert!(
+            !orch.wait_stream_data_ready(&morte, 20).await,
+            "une session disparue ne peut pas devenir prete"
+        );
+        assert!(
+            !tmp.exists(),
+            "le fichier temporaire du telechargement rate doit partir aussi : {tmp_str}"
+        );
     }
 
     fn test_orchestrator() -> PlaybackOrchestrator {
