@@ -6091,14 +6091,38 @@ impl PositionPoller {
                     if !self.orchestrator.wait_stream_data_ready(sid, 5000).await {
                         // The next track's transcode session produced no data
                         // within the 5s budget — common for Tidal Hi-Res DASH
-                        // multi-segment downloads. We still arm SetNext, but this
-                        // is a prime instability signal.
+                        // multi-segment downloads. A session that is merely SLOW
+                        // is still armed: refusing here would put a gap between
+                        // every Hi-Res track.
+                        //
+                        // Mais « pas encore » et « plus jamais » ne se
+                        // distinguent pas dans `data_ready`. La seule question
+                        // qui les separe est celle que `resume` pose deja
+                        // (#2512) : la session existe-t-elle encore ? Le
+                        // producteur d'un transcodage streaming la RETIRE
+                        // desormais quand il meurt sans ecrire un octet — echec
+                        // de telechargement CDN, voir
+                        // `abandonner_la_session_de_transcodage`. S'enchainer
+                        // sur une session disparue fige la sortie locale
+                        // jusqu'au Stop (#3287, Gros Bidon, Qobuz en USB) : on
+                        // n'arme pas, et la fin naturelle avance la file avec un
+                        // petit blanc — jamais un gel.
+                        let session_vivante = self.orchestrator.stream_session_alive(sid).await;
                         warn!(
                             zone_id,
                             resolve_ms,
                             waited_ms = w0.elapsed().as_millis() as u64,
+                            session_vivante,
                             "gapless_data_ready_timeout"
                         );
+                        if !session_vivante {
+                            warn!(
+                                zone_id,
+                                stream_id = %sid,
+                                "gapless_non_arme_session_disparue"
+                            );
+                            return GaplessPrep::NotArmed;
+                        }
                     }
                 }
                 let output_arc = {
