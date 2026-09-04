@@ -10,12 +10,22 @@
 /// de la condition qu'elle prétendait garder. Un contrôle qui ne peut pas
 /// dire non ne contrôle rien (#2082).
 fn code_de_production() -> &'static str {
-    const TOUT: &str = include_str!("../orchestrator.rs");
-    const BORNE: &str = "mod annonce_apres_sortie_guard";
-    let fin = TOUT
-        .find(BORNE)
-        .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
-    &TOUT[..fin]
+    static PRODUCTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PRODUCTION.get_or_init(|| {
+        const TOUT: &str = include_str!("../orchestrator.rs");
+        const BORNE: &str = "mod annonce_apres_sortie_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        // Le bloc `impl PlaybackOrchestrator` est réparti par familles (REF-2,
+        // #2219) : la résolution locale, qui porte le cache hit et le
+        // passthrough, vit dans son propre module et se lit à la suite.
+        format!(
+            "{}{}",
+            &TOUT[..fin],
+            include_str!("../orchestrator/resolve_local.rs")
+        )
+    })
 }
 
 /// Position de la première occurrence, ou panique avec un message qui dit
