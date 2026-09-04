@@ -379,6 +379,13 @@ pub fn resample_i32(
 mod tests {
     use super::*;
 
+    const AES17_ORIENTED_METHOD_ID: &str = "tune-aes17-oriented-residual-v1";
+    const AES17_FUNDAMENTAL_HZ: f64 = 997.0;
+    const AES17_FUNDAMENTAL_AMPLITUDE: f64 = 0.5;
+    const AES17_INJECTED_RESIDUAL_DB: f64 = -60.0;
+    const AES17_INJECTED_TOLERANCE_DB: f64 = 0.05;
+    const AES17_SRC_RESIDUAL_LIMIT_DB: f64 = -100.0;
+
     // Rates that Tune advertises for local PCM output on every platform.
     // Keep this matrix aligned with `outputs/local.rs`: it is the product
     // contract whose SRC frame counts must remain deterministic (#2218).
@@ -424,54 +431,167 @@ mod tests {
     fn measured_tone_amplitude(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
         let trim = (samples.len() / 10).min(4_800);
         let stable = &samples[trim..samples.len() - trim];
-        let (sin_sum, cos_sum) = stable.iter().enumerate().fold(
-            (0.0_f64, 0.0_f64),
-            |(sin_sum, cos_sum), (frame, &sample)| {
-                let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
-                (
-                    sin_sum + sample as f64 * phase.sin(),
-                    cos_sum + sample as f64 * phase.cos(),
-                )
-            },
-        );
-        2.0 * sin_sum.hypot(cos_sum) / stable.len() as f64
+        let (sin_gain, cos_gain) = fit_sinusoid(stable, sr, frequency_hz);
+        sin_gain.hypot(cos_gain)
     }
 
     fn gain_db(measured: f64, reference: f64) -> f64 {
         20.0 * (measured / reference).log10()
     }
 
-    /// Fit the fundamental in quadrature and report everything left over as
-    /// distortion plus noise. This is deliberately a time-domain least-squares
-    /// measurement, independent from both the resampler and the FFT display.
-    fn thd_plus_noise_db(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
-        let trim = (samples.len() / 10).min(4_800);
-        let stable = &samples[trim..samples.len() - trim];
-        let (sin_sum, cos_sum) = stable.iter().enumerate().fold(
-            (0.0_f64, 0.0_f64),
-            |(sin_sum, cos_sum), (frame, &sample)| {
+    /// Exact two-parameter least-squares fit for `a sin(wt) + b cos(wt)`.
+    ///
+    /// The shortcut `2 * dot / N` is only valid when the analyzed window holds
+    /// an integer number of periods. That happened accidentally for the former
+    /// 1 kHz test but biases a 997 Hz measurement. Solving the 2x2 Gram system
+    /// keeps the instrument valid for arbitrary frequencies and window sizes.
+    fn fit_sinusoid(samples: &[f32], sr: u32, frequency_hz: f64) -> (f64, f64) {
+        let (sin_sq, sin_cos, cos_sq, sample_sin, sample_cos) = samples.iter().enumerate().fold(
+            (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64),
+            |(sin_sq, sin_cos, cos_sq, sample_sin, sample_cos), (frame, &sample)| {
                 let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
+                let sin = phase.sin();
+                let cos = phase.cos();
                 (
-                    sin_sum + sample as f64 * phase.sin(),
-                    cos_sum + sample as f64 * phase.cos(),
+                    sin_sq + sin * sin,
+                    sin_cos + sin * cos,
+                    cos_sq + cos * cos,
+                    sample_sin + sample as f64 * sin,
+                    sample_cos + sample as f64 * cos,
                 )
             },
         );
-        let sin_gain = 2.0 * sin_sum / stable.len() as f64;
-        let cos_gain = 2.0 * cos_sum / stable.len() as f64;
-        let fundamental_rms = sin_gain.hypot(cos_gain) / std::f64::consts::SQRT_2;
-        let residual_rms = (stable
-            .iter()
-            .enumerate()
-            .map(|(frame, &sample)| {
+        let determinant = sin_sq * cos_sq - sin_cos * sin_cos;
+        assert!(
+            determinant > f64::EPSILON,
+            "fenetre de mesure singuliere a {frequency_hz} Hz"
+        );
+        (
+            (sample_sin * cos_sq - sample_cos * sin_cos) / determinant,
+            (sample_cos * sin_sq - sample_sin * sin_cos) / determinant,
+        )
+    }
+
+    /// Fit the fundamental in quadrature and report the unweighted, full-band
+    /// residual relative to it.
+    ///
+    /// This is deliberately a time-domain least-squares instrument, independent
+    /// from both the resampler and the FFT display. It is a useful deterministic
+    /// regression metric, but it must not be presented as an AES17 THD+N result:
+    /// it applies neither the analyzer bandwidth nor the filters prescribed by
+    /// that standard. The name records that limitation so a future standards
+    /// harness cannot silently reuse this value as a conformance measurement.
+    fn unweighted_full_band_residual_db(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
+        let trim = (samples.len() / 10).min(4_800);
+        let stable = &samples[trim..samples.len() - trim];
+        let (sin_gain, cos_gain) = fit_sinusoid(stable, sr, frequency_hz);
+        let (fundamental_energy, residual_energy) = stable.iter().enumerate().fold(
+            (0.0_f64, 0.0_f64),
+            |(fundamental, residual), (frame, &sample)| {
                 let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
                 let fitted = sin_gain * phase.sin() + cos_gain * phase.cos();
-                (sample as f64 - fitted).powi(2)
-            })
-            .sum::<f64>()
-            / stable.len() as f64)
-            .sqrt();
+                (
+                    fundamental + fitted * fitted,
+                    residual + (sample as f64 - fitted).powi(2),
+                )
+            },
+        );
+        let fundamental_rms = (fundamental_energy / stable.len() as f64).sqrt();
+        let residual_rms = (residual_energy / stable.len() as f64).sqrt();
         20.0 * (residual_rms / fundamental_rms).log10()
+    }
+
+    /// Tune's reproducible, AES17-oriented residual method.
+    ///
+    /// AES17-2020 is the normative reference for digital-audio measurements,
+    /// and its 997 Hz convention motivates the stimulus. This deterministic
+    /// regression method is deliberately *not* advertised as full AES17
+    /// conformance: it removes the fundamental by an exact least-squares fit
+    /// and measures the unweighted 0..Nyquist residual instead of reproducing
+    /// every prescribed analyzer filter. The emitted JSON records that limit.
+    fn aes17_oriented_residual_v1_db(samples: &[f32], sr: u32) -> f64 {
+        unweighted_full_band_residual_db(samples, sr, AES17_FUNDAMENTAL_HZ)
+    }
+
+    fn rounded_millidecibel(value: f64) -> f64 {
+        (value * 1_000.0).round() / 1_000.0
+    }
+
+    fn injected_residual_fixture() -> Vec<f32> {
+        const SAMPLE_RATE: u32 = 48_000;
+        let residual_amplitude =
+            AES17_FUNDAMENTAL_AMPLITUDE * 10.0_f64.powf(AES17_INJECTED_RESIDUAL_DB / 20.0);
+        (0..SAMPLE_RATE)
+            .map(|frame| {
+                let time = frame as f64 / SAMPLE_RATE as f64;
+                let fundamental = AES17_FUNDAMENTAL_AMPLITUDE
+                    * (2.0 * std::f64::consts::PI * AES17_FUNDAMENTAL_HZ * time).sin();
+                let second_harmonic = residual_amplitude
+                    * (4.0 * std::f64::consts::PI * AES17_FUNDAMENTAL_HZ * time).sin();
+                (fundamental + second_harmonic) as f32
+            })
+            .collect()
+    }
+
+    fn audio_conformance_artifact() -> serde_json::Value {
+        let counterproof = injected_residual_fixture();
+        let counterproof_db = aes17_oriented_residual_v1_db(&counterproof, 48_000);
+        let src_measurements = [(44_100, 48_000), (96_000, 44_100)]
+            .into_iter()
+            .map(|(from_hz, to_hz)| {
+                let input = sine_mono(from_hz, AES17_FUNDAMENTAL_HZ, AES17_FUNDAMENTAL_AMPLITUDE);
+                let output = rubato_resample_batch_exact(&input, from_hz, to_hz, 1);
+                let residual_db = aes17_oriented_residual_v1_db(&output, to_hz);
+                serde_json::json!({
+                    "from_hz": from_hz,
+                    "to_hz": to_hz,
+                    "residual_db": rounded_millidecibel(residual_db),
+                    "passed": residual_db < AES17_SRC_RESIDUAL_LIMIT_DB,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        serde_json::json!({
+            "schema": "tune.audio-conformance.v1",
+            "method": {
+                "id": AES17_ORIENTED_METHOD_ID,
+                "normative_reference": "AES17-2020",
+                "full_aes17_conformance_claimed": false,
+                "fundamental_hz": AES17_FUNDAMENTAL_HZ,
+                "fundamental_peak_dbfs": -6.0206,
+                "duration_s": 1.0,
+                "analysis_window": "central_80_percent",
+                "fundamental_rejection": "exact_least_squares_sin_cos",
+            },
+            "band": {
+                "low_hz": 0,
+                "high_hz": "nyquist",
+                "weighting": "none",
+            },
+            "thresholds": {
+                "src_residual_max_db": AES17_SRC_RESIDUAL_LIMIT_DB,
+                "injected_residual_db": AES17_INJECTED_RESIDUAL_DB,
+                "injected_tolerance_db": AES17_INJECTED_TOLERANCE_DB,
+            },
+            "measurements": {
+                "meter_counterproof_db": rounded_millidecibel(counterproof_db),
+                "src": src_measurements,
+            },
+        })
+    }
+
+    fn artifact_path() -> std::path::PathBuf {
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("tune-core doit appartenir au workspace")
+                    .join("target")
+            });
+        target
+            .join("audio-conformance")
+            .join("aes17-oriented-residual-v1.json")
     }
 
     fn resample_in_chunks(
@@ -697,20 +817,64 @@ mod tests {
     }
 
     #[test]
-    fn resampling_keeps_sine_thd_plus_noise_below_minus_100_db() {
-        const FREQUENCY_HZ: f64 = 1_000.0;
-        const AMPLITUDE: f64 = 0.5;
+    fn residual_meter_recovers_a_known_injected_distortion() {
+        let measured = aes17_oriented_residual_v1_db(&injected_residual_fixture(), 48_000);
+        assert!(
+            (measured - AES17_INJECTED_RESIDUAL_DB).abs() < AES17_INJECTED_TOLERANCE_DB,
+            "le residumetre annonce {measured:.3} dB pour un defaut injecte a \
+             {AES17_INJECTED_RESIDUAL_DB:.1} dB"
+        );
+    }
 
+    #[test]
+    fn resampling_keeps_unweighted_full_band_residual_below_minus_100_db() {
+        // Published measurement contract for this regression test (#2218):
+        // 997 Hz stimulus, -6.02 dBFS peak, one second, the central 80% of the
+        // output analyzed, no weighting and the full 0..Nyquist bandwidth.
+        // This is intentionally not labelled AES17 THD+N; see the meter above.
         for (from_sr, to_sr) in [(44_100, 48_000), (96_000, 44_100)] {
-            let input = sine_mono(from_sr, FREQUENCY_HZ, AMPLITUDE);
+            let input = sine_mono(from_sr, AES17_FUNDAMENTAL_HZ, AES17_FUNDAMENTAL_AMPLITUDE);
             let output = rubato_resample_batch_exact(&input, from_sr, to_sr, 1);
-            let thd_n_db = thd_plus_noise_db(&output, to_sr, FREQUENCY_HZ);
+            let residual_db = aes17_oriented_residual_v1_db(&output, to_sr);
 
             assert!(
-                thd_n_db < -100.0,
-                "THD+N du SRC {from_sr} -> {to_sr} Hz mesuree a {thd_n_db:.1} dB"
+                residual_db < AES17_SRC_RESIDUAL_LIMIT_DB,
+                "residu large bande non pondere du SRC {from_sr} -> {to_sr} Hz mesure a \
+                 {residual_db:.1} dB"
             );
         }
+    }
+
+    #[test]
+    fn audio_conformance_artifact_is_stable_and_explicit() {
+        let artifact = audio_conformance_artifact();
+        assert_eq!(artifact["method"]["id"], AES17_ORIENTED_METHOD_ID);
+        assert_eq!(artifact["method"]["full_aes17_conformance_claimed"], false);
+        assert_eq!(artifact["band"]["low_hz"], 0);
+        assert_eq!(artifact["band"]["high_hz"], "nyquist");
+        assert_eq!(
+            artifact["thresholds"]["src_residual_max_db"],
+            AES17_SRC_RESIDUAL_LIMIT_DB
+        );
+        assert!(
+            artifact["measurements"]["src"]
+                .as_array()
+                .expect("mesures SRC absentes")
+                .iter()
+                .all(|measurement| measurement["passed"] == true)
+        );
+
+        let mut encoded = serde_json::to_string_pretty(&artifact)
+            .expect("l artefact de conformite doit etre serialisable");
+        encoded.push('\n');
+        let path = artifact_path();
+        std::fs::create_dir_all(path.parent().expect("repertoire d artefact absent"))
+            .expect("creation du repertoire d artefact");
+        std::fs::write(&path, &encoded).expect("ecriture de l artefact de conformite");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("relecture de l artefact de conformite"),
+            encoded
+        );
     }
 
     #[test]
