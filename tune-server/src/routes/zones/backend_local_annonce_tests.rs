@@ -97,12 +97,13 @@ fn les_quatre_charges_utiles_de_zone_appellent_le_contrat() {
     // est nommé par l'appel exact qu'il doit contenir.
     for (fichier, appel, quoi) in [
         (
-            "src/routes/zones.rs",
+            // `list_zones` vit dans le module enfant `lecture` depuis REF-4 (#2219).
+            "src/routes/zones/lecture.rs",
             "local_backend_status_value(z.output_type.as_deref(),&audio_backend_pref",
             "GET /zones",
         ),
         (
-            "src/routes/zones.rs",
+            "src/routes/zones/lecture.rs",
             "local_backend_status_value(zone.output_type.as_deref(),&audio_backend_pref",
             "GET /zones/{id}",
         ),
