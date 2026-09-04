@@ -696,7 +696,12 @@ mod tests {
     /// crossfeed est bien précédé, de peu, de la garde `local:`.
     #[test]
     fn aucun_site_d_installation_du_crossfeed_hors_de_la_garde_locale() {
-        const ORCHESTRATEUR: &str = include_str!("../orchestrator.rs");
+        // Le bloc `impl PlaybackOrchestrator` est réparti par familles (REF-2,
+        // #2219) : on lit chaque fichier qui porte un site, mis bout à bout.
+        const ORCHESTRATEUR: &str = concat!(
+            include_str!("../orchestrator.rs"),
+            include_str!("../orchestrator/dsp.rs"),
+        );
         // Témoin : si `include_str!` pointait sur un fichier vide ou faux, tout
         // le reste passerait pour vert sans rien avoir lu.
         assert!(
@@ -718,6 +723,8 @@ mod tests {
                 "pub async fn ",
                 "pub(crate) fn ",
                 "pub(crate) async fn ",
+                "pub(super) fn ",
+                "pub(super) async fn ",
             ]
             .iter()
             .any(|p| t.starts_with(p))
@@ -756,7 +763,7 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "site d'installation du crossfeed sans `LocalOutput` dans sa \
-                     propre fonction (orchestrator.rs, ligne {}) : {}",
+                     propre fonction (orchestrator.rs + orchestrator/dsp.rs, ligne {}) : {}",
                     i + 1,
                     ligne.trim()
                 )
@@ -764,7 +771,7 @@ mod tests {
             assert!(
                 remonter(&lignes, downcast, "starts_with(\"local:\")").is_some(),
                 "site d'installation du crossfeed sans garde `local:` dans sa \
-                 propre fonction (orchestrator.rs, ligne {}) : {}\n\
+                 propre fonction (orchestrator.rs + orchestrator/dsp.rs, ligne {}) : {}\n\
                  Si le crossfeed atteint désormais une sortie NON locale, \
                  `crossfeed_status` ment et doit être corrigé AVEC ce site.",
                 i + 1,
