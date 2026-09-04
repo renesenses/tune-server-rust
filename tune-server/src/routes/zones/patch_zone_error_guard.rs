@@ -6,8 +6,9 @@ use std::path::Path;
 /// qui dérivent à chaque édition.
 fn corps_du_handler() -> String {
     let source =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/zones.rs"))
-            .expect("lecture de zones.rs");
+        // `patch_zone` vit dans le module enfant `ecriture` depuis REF-4 (#2219).
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/zones/ecriture.rs"))
+            .expect("lecture de zones/ecriture.rs");
     let debut = source
         .find("async fn patch_zone(")
         .expect("`patch_zone` a été renommé — ce garde-fou ne garde plus rien");
