@@ -368,7 +368,9 @@ mod garde_de_site {
     /// la suivante, dans la même zone. Un mensonge pire que le silence.
     #[test]
     fn le_chemin_transcode_ne_porte_toujours_pas_le_repli_mono() {
-        const SOURCE: &str = include_str!("../orchestrator.rs");
+        // `transcode_source_to_file` vit dans le module `transcodage` de
+        // l'orchestrateur depuis REF-2 (#2219).
+        const SOURCE: &str = include_str!("../orchestrator/transcodage.rs");
         let debut = SOURCE
             .find("async fn transcode_source_to_file(")
             .expect("`transcode_source_to_file` a été renommée — cette garde ne garde plus rien");
