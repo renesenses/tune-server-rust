@@ -39,6 +39,7 @@ pub fn router() -> Router<AppState> {
         .route("/library-sync/status", get(library_sync_status))
         .route("/library-sync/trigger", post(library_sync_trigger))
         .route("/library-sync/full-sync", post(library_sync_full))
+        .route("/library-sync/reconcile", post(library_sync_reconcile))
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,6 +1231,86 @@ async fn library_sync_status(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// Corps de `POST /cloud/library-sync/reconcile`.
+#[derive(serde::Deserialize, Default)]
+struct ReconcileBody {
+    /// Mettre reellement les suppressions en file. Par defaut `false` : on
+    /// regarde le plan avant de l'executer.
+    #[serde(default)]
+    apply: bool,
+    /// Inclure les pistes. Par defaut `false` : 235 pages sous un plafond de
+    /// 60 requetes par minute, pour un ecart mesure de -1.
+    #[serde(default)]
+    tracks: bool,
+}
+
+/// POST /cloud/library-sync/reconcile — effacer du cloud ce que le serveur ne
+/// possede plus.
+///
+/// A BLANC par defaut. Le rapport dit alors ce qui SERAIT supprime, et le
+/// journal porte le plan (`cloud_library_reconcile_plan`). Passer
+/// `{"apply": true}` met les suppressions en file ; c'est le passage de
+/// synchro suivant qui les pousse.
+///
+/// Manuelle et non automatique, deliberement : declencher une suppression de
+/// masse au demarrage sans l'avoir vue tourner une fois serait imprudent.
+async fn library_sync_reconcile(
+    State(state): State<AppState>,
+    body: Option<Json<ReconcileBody>>,
+) -> impl IntoResponse {
+    if let Err(resp) = crate::premium_guard::require_premium(
+        &state.license,
+        tune_core::license::Feature::CloudBackup,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    let Json(body) = body.unwrap_or_default();
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
+    let token = match settings.get("mozaik_access_token").ok().flatten() {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(json!({"error": "No Mozaik access token — log in via SSO first"})),
+            )
+                .into_response();
+        }
+    };
+    if server_id.is_empty() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({"error": "No server_id configured"})),
+        )
+            .into_response();
+    }
+
+    let rapport = tune_core::cloud::library_reconcile::reconcilier(
+        &state.backend,
+        &state.http_client,
+        &server_id,
+        &token,
+        body.tracks,
+        !body.apply,
+    )
+    .await;
+
+    Json(json!({
+        "dry_run": rapport.a_blanc,
+        "artists": rapport.artistes_orphelins,
+        "albums": rapport.albums_orphelins,
+        "tracks": rapport.pistes_orphelines,
+        "total": rapport.total(),
+        "refused": rapport.refus,
+        "pending_after": tune_core::cloud::library_sync::pending_count(&state.backend),
+    }))
+    .into_response()
+}
+
 /// POST /cloud/library-sync/trigger — triggers immediate sync (premium only).
 async fn library_sync_trigger(State(state): State<AppState>) -> impl IntoResponse {
     if let Err(resp) = crate::premium_guard::require_premium(
@@ -1377,4 +1458,72 @@ async fn library_sync_full(State(state): State<AppState>) -> impl IntoResponse {
         "message": "Full library sync has been queued in the background",
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+
+    /// La propriete qui compte : un appel sans corps, ou avec un corps qui ne
+    /// dit rien, ne doit RIEN supprimer. La route passe `!body.apply` au
+    /// module, donc `apply = false` signifie « a blanc ».
+    ///
+    /// Si ce booleen s'inverse un jour, un simple `curl -X POST` sur la route
+    /// viderait le catalogue en ligne de tout ce que le serveur ne possede
+    /// plus — sans que personne l'ait demande.
+    #[test]
+    fn la_reconciliation_est_a_blanc_par_defaut() {
+        assert!(
+            !ReconcileBody::default().apply,
+            "le defaut doit etre `a blanc`"
+        );
+
+        let vide: ReconcileBody = serde_json::from_str("{}").expect("corps vide");
+        assert!(!vide.apply, "un corps vide doit rester `a blanc`");
+        assert!(
+            !vide.tracks,
+            "un corps vide ne doit pas parcourir les pistes"
+        );
+
+        let demande: ReconcileBody =
+            serde_json::from_str(r#"{"apply":true}"#).expect("corps explicite");
+        assert!(
+            demande.apply,
+            "seule une demande EXPLICITE doit mettre en file"
+        );
+    }
+
+    /// La route doit rester montee : ecrite mais pas branchee, elle ne sert a
+    /// rien. Cf le piege « ecrit mais pas branche ».
+    /// Les deux gardes ci-dessous lisent la source de CE fichier. Elles
+    /// doivent donc ignorer le module de test lui-meme : sinon la chaine
+    /// cherchee apparait dans leur propre assertion et la garde se satisfait
+    /// toute seule. Contre-epreuve du 04/09/2026 : sans cette coupe, retirer
+    /// la negation dans la route laissait les deux tests VERTS.
+    fn source_hors_tests() -> &'static str {
+        let source = include_str!("cloud.rs");
+        match source.find("#[cfg(test)]") {
+            Some(i) => &source[..i],
+            None => source,
+        }
+    }
+
+    #[test]
+    fn la_route_de_reconciliation_est_montee() {
+        let source = source_hors_tests();
+        assert!(
+            source.contains(r#".route("/library-sync/reconcile", post(library_sync_reconcile))"#),
+            "la route /library-sync/reconcile doit etre montee sur le routeur"
+        );
+
+        // Et surtout : la route doit passer la NEGATION de `apply` au module,
+        // dont le parametre est `a_blanc`. Les deux tests ci-dessus restent
+        // verts si ce `!` disparait — c'est pourtant l'inversion qui
+        // transformerait un appel a blanc en suppression de masse.
+        assert!(
+            source.contains("!body.apply"),
+            "la route doit passer `!body.apply` comme `a_blanc` : sans la \
+             negation, un appel sans corps supprimerait au lieu de simuler"
+        );
+    }
 }
