@@ -55,6 +55,9 @@ pub struct RapportReconciliation {
     pub pistes_orphelines: usize,
     /// Renseigné quand la réconciliation a refusé d'agir, avec la raison.
     pub refus: Option<String>,
+    /// Vrai quand rien n'a été mis en file : le rapport dit ce qui SERAIT
+    /// supprimé, pas ce qui l'a été.
+    pub a_blanc: bool,
 }
 
 impl RapportReconciliation {
@@ -65,6 +68,7 @@ impl RapportReconciliation {
     fn refuse(raison: impl Into<String>) -> Self {
         Self {
             refus: Some(raison.into()),
+            a_blanc: true,
             ..Default::default()
         }
     }
@@ -230,6 +234,7 @@ async fn reconcilier_genre(
     server_id: &str,
     access_token: &str,
     genre: Genre,
+    a_blanc: bool,
 ) -> Result<usize, String> {
     let en_ligne = ids_en_ligne(http_client, server_id, access_token, genre).await?;
     let locaux = ids_locaux(backend, genre)?;
@@ -244,8 +249,15 @@ async fn reconcilier_genre(
         en_ligne = en_ligne.len(),
         locaux = locaux.len(),
         orphelins = a_supprimer.len(),
+        a_blanc,
         "cloud_library_reconcile_plan"
     );
+
+    if a_blanc {
+        // Le plan est journalise, rien n'est mis en file. C'est le mode par
+        // defaut de la route manuelle : regarder avant de supprimer.
+        return Ok(a_supprimer.len());
+    }
 
     for id in &a_supprimer {
         record_change(backend, genre.entite(), *id, "delete");
@@ -256,6 +268,10 @@ async fn reconcilier_genre(
 
 /// Réconcilier le catalogue en ligne avec ce que le serveur possède encore.
 ///
+/// `a_blanc` : calculer et journaliser le plan sans rien mettre en file. Le
+/// rapport dit alors ce qui SERAIT supprime. C'est le mode par defaut de la
+/// route manuelle — on regarde le plan avant de l'executer.
+///
 /// `avec_pistes` : les pistes sont 235 pages à 200 par page et le point d'accès
 /// est limité à 60 requêtes par minute — comptez quatre minutes. L'écart mesuré
 /// sur les pistes était de −1, donc le passage courant s'en dispense.
@@ -265,6 +281,7 @@ pub async fn reconcilier(
     server_id: &str,
     access_token: &str,
     avec_pistes: bool,
+    a_blanc: bool,
 ) -> RapportReconciliation {
     if crate::scanner::activite::scan_bibliotheque_en_cours() {
         let raison = "scan de bibliotheque en cours — les ids locaux ne sont pas stables";
@@ -272,14 +289,26 @@ pub async fn reconcilier(
         return RapportReconciliation::refuse(raison);
     }
 
-    let mut rapport = RapportReconciliation::default();
+    let mut rapport = RapportReconciliation {
+        a_blanc,
+        ..Default::default()
+    };
     let mut genres = vec![Genre::Artiste, Genre::Album];
     if avec_pistes {
         genres.push(Genre::Piste);
     }
 
     for genre in genres {
-        match reconcilier_genre(backend, http_client, server_id, access_token, genre).await {
+        match reconcilier_genre(
+            backend,
+            http_client,
+            server_id,
+            access_token,
+            genre,
+            a_blanc,
+        )
+        .await
+        {
             Ok(n) => match genre {
                 Genre::Artiste => rapport.artistes_orphelins = n,
                 Genre::Album => rapport.albums_orphelins = n,
@@ -299,6 +328,7 @@ pub async fn reconcilier(
         artistes = rapport.artistes_orphelins,
         albums = rapport.albums_orphelins,
         pistes = rapport.pistes_orphelines,
+        a_blanc,
         "cloud_library_reconcile_complete"
     );
 
