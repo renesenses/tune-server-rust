@@ -317,6 +317,7 @@ mod garde_de_site {
         const SOURCE: &str = concat!(
             include_str!("../orchestrator.rs"),
             include_str!("../orchestrator/dsp.rs"),
+            include_str!("../orchestrator/transport.rs"),
         );
         const APPEL: &str = "local_output.set_mono_downmix(";
 
@@ -331,14 +332,14 @@ mod garde_de_site {
             assert!(
                 corps.contains("starts_with(\"local:\")"),
                 "site de repli mono sans garde `local:` dans sa propre fonction \
-                 (orchestrator.rs + orchestrator/dsp.rs, ligne {ligne}). Si le repli atteint désormais \
+                 (orchestrator.rs + dsp.rs + transport.rs, ligne {ligne}). Si le repli atteint désormais \
                  une sortie NON locale, `mono_downmix_status` ment et doit être \
                  corrigé AVEC ce site (#3254)."
             );
             assert!(
                 corps.contains("LocalOutput"),
                 "site de repli mono sans `downcast_ref::<LocalOutput>()` dans sa \
-                 propre fonction (orchestrator.rs + orchestrator/dsp.rs, ligne {ligne}) — la seconde \
+                 propre fonction (orchestrator.rs + dsp.rs + transport.rs, ligne {ligne}) — la seconde \
                  moitié de la garde qu'annonce `non_local_output` (#3254)."
             );
             offset = site + APPEL.len();

@@ -90,7 +90,8 @@ fn les_deux_surfaces_annoncent_la_meme_chose_pour_une_ligne_muette() {
 /// ci-dessus serait vraie en isolation et fausse en production.
 #[test]
 fn play_inner_passe_bien_par_la_regle() {
-    let src = include_str!("../orchestrator.rs");
+    // `play_inner` vit dans le module de famille `transport` (REF-2, #2219).
+    let src = include_str!("../orchestrator/transport.rs");
     let np = src
         .find("            sample_rate: resolution_annoncee(")
         .zip(src.find("            bit_depth: resolution_annoncee("));

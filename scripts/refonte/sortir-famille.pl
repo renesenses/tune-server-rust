@@ -21,14 +21,21 @@ for my $i (0..$#l) {
 }
 die "bloc impl $type introuvable\n" unless defined $fin_impl;
 
-# Localiser chaque méthode : [premier attribut/doc, dernière ligne]
-my %plage; my %vis;
-for my $nom (@voulus) {
-    my $i;
+# Localiser chaque méthode : [premier attribut/doc, dernière ligne].
+# Un même nom peut apparaître plusieurs fois (variantes #[cfg]) : on les sort toutes.
+my %plage; my %vis; my %nom_de;
+my @occurrences;
+for my $nom (do { my %v; grep { !$v{$_}++ } @voulus }) {
+    my @is;
     for my $k ($debut_impl+1 .. $fin_impl-1) {
-        if ($l[$k] =~ /^    (?:pub(?:\([a-z]+\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn \Q$nom\E\s*[<(]/) { $i = $k; last; }
+        push @is, $k if $l[$k] =~ /^    (?:pub(?:\([a-z]+\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn \Q$nom\E\s*[<(]/;
     }
-    die "méthode $nom introuvable dans impl $type\n" unless defined $i;
+    die "méthode $nom introuvable dans impl $type\n" unless @is;
+    push @occurrences, map { [$nom, $_] } @is;
+}
+for my $occ (@occurrences) {
+    my ($nom, $i) = @$occ;
+    my $cle = "$nom#$i"; $nom_de{$cle} = $nom;
     my $d = $i;
     $d-- while $d-1 > $debut_impl && $l[$d-1] =~ /^    (?:#\[|\/\/)/;
     my $f = $i;
@@ -41,17 +48,18 @@ for my $nom (@voulus) {
         $f++ while $f < $fin_impl && $l[$f] !~ /^    \}\s*$/;
         die "fin de $nom introuvable\n" if $f >= $fin_impl;
     }
-    $plage{$nom} = [$d, $f];
+    $plage{$cle} = [$d, $f];
 }
 
 # Extraire (en ordre décroissant pour ne pas décaler les indices)
 my %corps;
-for my $nom (sort { $plage{$b}[0] <=> $plage{$a}[0] } keys %plage) {
-    my ($d, $f) = @{$plage{$nom}};
+for my $cle (sort { $plage{$b}[0] <=> $plage{$a}[0] } keys %plage) {
+    my $nom = $nom_de{$cle};
+    my ($d, $f) = @{$plage{$cle}};
     my @m = @l[$d..$f];
     # visibilité : fn nue → pub(super)
     for (@m) { s/^    ((?:async\s+)?(?:unsafe\s+)?fn \Q$nom\E\s*[<(])/    pub(super) $1/ }
-    $corps{$nom} = [@m];
+    $corps{$cle} = [@m];
     my $n = $f - $d + 1;
     $n++ if $f+1 <= $#l && $l[$f+1] =~ /^\s*$/;   # avale la ligne vide qui suit
     splice @l, $d, $n;

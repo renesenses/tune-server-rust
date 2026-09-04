@@ -701,6 +701,7 @@ mod tests {
         const ORCHESTRATEUR: &str = concat!(
             include_str!("../orchestrator.rs"),
             include_str!("../orchestrator/dsp.rs"),
+            include_str!("../orchestrator/transport.rs"),
         );
         // Témoin : si `include_str!` pointait sur un fichier vide ou faux, tout
         // le reste passerait pour vert sans rien avoir lu.
@@ -763,7 +764,7 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "site d'installation du crossfeed sans `LocalOutput` dans sa \
-                     propre fonction (orchestrator.rs + orchestrator/dsp.rs, ligne {}) : {}",
+                     propre fonction (orchestrator.rs + dsp.rs + transport.rs, ligne {}) : {}",
                     i + 1,
                     ligne.trim()
                 )
@@ -771,7 +772,7 @@ mod tests {
             assert!(
                 remonter(&lignes, downcast, "starts_with(\"local:\")").is_some(),
                 "site d'installation du crossfeed sans garde `local:` dans sa \
-                 propre fonction (orchestrator.rs + orchestrator/dsp.rs, ligne {}) : {}\n\
+                 propre fonction (orchestrator.rs + dsp.rs + transport.rs, ligne {}) : {}\n\
                  Si le crossfeed atteint désormais une sortie NON locale, \
                  `crossfeed_status` ment et doit être corrigé AVEC ce site.",
                 i + 1,
