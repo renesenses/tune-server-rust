@@ -752,7 +752,7 @@ async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
         {
             state
                 .relay_client
-                .as_ref()
+                .get()
                 .map(|c| c.is_connected())
                 .unwrap_or(false)
         }

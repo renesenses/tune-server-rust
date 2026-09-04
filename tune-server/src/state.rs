@@ -135,7 +135,18 @@ pub struct AppState {
     #[cfg(feature = "plugins-wasm")]
     pub wasm_plugins: Arc<OnceLock<crate::plugins_host::WasmRegistry>>,
     #[cfg(feature = "cloud-relay")]
-    pub relay_client: Option<Arc<tune_core::cloud::relay::RelayClient>>,
+    /// Le client de relais, publie par
+    /// [`crate::background::spawn_relay_client`] au demarrage et lu par
+    /// `/cloud/relay/status`.
+    ///
+    /// `OnceLock` et non `Option` : le champ etait un `Option` qui restait
+    /// `None` a vie, parce que rien ne pouvait l'assigner apres construction
+    /// de l'`AppState`. La route de statut ne pouvait donc jamais repondre
+    /// autre chose que `connected: false`, meme relais connecte. Le relais
+    /// n'est lance qu'au demarrage — la route d'activation dit elle-meme
+    /// « restart server to activate » — donc un emplacement ecrit une fois
+    /// suffit, comme `plugin_names` plus haut.
+    pub relay_client: Arc<OnceLock<Arc<tune_core::cloud::relay::RelayClient>>>,
 }
 
 impl axum::extract::FromRef<AppState> for tune_streaming_http::StreamingHttpState {
@@ -455,7 +466,7 @@ impl AppState {
             #[cfg(feature = "plugins-wasm")]
             wasm_plugins: Arc::new(OnceLock::new()),
             #[cfg(feature = "cloud-relay")]
-            relay_client: None,
+            relay_client: Arc::new(OnceLock::new()),
         })
     }
 
@@ -562,5 +573,65 @@ impl AppState {
     pub async fn save_tokens(&self) {
         let registry = self.services.lock().await;
         registry.save_all_tokens(&self.backend).await;
+    }
+}
+
+#[cfg(all(test, feature = "cloud-relay"))]
+mod relay_slot_tests {
+    use super::*;
+
+    /// Garde du bug du 04/09/2026 : `relay_client` etait un
+    /// `Option<Arc<RelayClient>>` initialise a `None` et que RIEN ne pouvait
+    /// assigner apres construction de l'`AppState`. `/cloud/relay/status`
+    /// lisait ce champ, donc la route ne pouvait jamais repondre autre chose
+    /// que `connected: false` — relais connecte ou non.
+    ///
+    /// Ce test ne compile plus si le champ redevient un `Option` : c'est
+    /// precisement la propriete perdue qu'il retient, l'emplacement doit etre
+    /// inscriptible APRES la construction.
+    /// Deuxieme garde, et la plus importante : le test ci-dessus publie le
+    /// client LUI-MEME, donc il reste vert si le demarrage cesse de le faire.
+    /// Contre-epreuve du 04/09/2026 : `.set()` retire de `background.rs`, le
+    /// test ci-dessus passait toujours. C'etait precisement le bug — un
+    /// emplacement correct que personne ne remplit.
+    ///
+    /// Le demarrage ne peut pas etre appele ici (porte Premium, reglages,
+    /// tache reseau), donc la garde porte sur la source.
+    #[test]
+    fn le_demarrage_publie_bien_le_client_de_relais() {
+        let source = include_str!("background.rs");
+        assert!(
+            source.contains("state.relay_client.set(client)"),
+            "background.rs doit PUBLIER le client de relais dans l'AppState ; \
+             sans cela /cloud/relay/status repond `connected: false` a vie, \
+             relais connecte ou non"
+        );
+    }
+
+    #[test]
+    fn le_client_de_relais_est_publiable_apres_construction() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert!(
+            state.relay_client.get().is_none(),
+            "l'emplacement doit etre vide tant que le demarrage n'a rien publie"
+        );
+
+        let client = Arc::new(tune_core::cloud::relay::RelayClient::new(
+            "serveur-de-test".to_string(),
+            "jeton-de-test".to_string(),
+            "wss://exemple.invalid/ws/server".to_string(),
+            0,
+        ));
+        // `OnceLock::set` rend `Result<(), Arc<RelayClient>>` et
+        // `RelayClient` n'est pas `Debug` — d'ou `is_ok` plutot que `expect`.
+        assert!(
+            state.relay_client.set(client).is_ok(),
+            "l'emplacement doit accepter une publication"
+        );
+
+        assert!(
+            state.relay_client.get().is_some(),
+            "apres publication, la route de statut doit pouvoir lire le client"
+        );
     }
 }
