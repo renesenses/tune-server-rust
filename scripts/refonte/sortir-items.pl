@@ -43,6 +43,8 @@ for my $cle (sort { $plage{$b}[0] <=> $plage{$a}[0] } keys %plage) {
     my ($d, $f) = @{$plage{$cle}}; my $nom = $nom_de{$cle};
     my @m = @l[$d..$f];
     for (@m) { s/^((?:async\s+|unsafe\s+)*(?:fn|struct|enum|const|static|type|union|trait)\s+\Q$nom\E\b)/pub(super) $1/; s/^    ((?:async\s+|unsafe\s+)*fn [A-Za-z0-9_]+\s*[<(])/    pub(super) $1/ }
+    # champs de struct sans visibilité : privés au module d'origine, ils le restent pour le parent et ses tests → pub(super)
+    if (grep { /^(?:pub(?:\([a-z]+\))?\s+)?struct\s+\Q$nom\E\b/ } @m) { for (@m) { s/^    ([a-z_][A-Za-z0-9_]*)\s*:/    pub(super) $1:/ } }
     $corps{$cle} = [@m];
     my $n = $f - $d + 1; $n++ if $f+1 <= $#l && $l[$f+1] =~ /^\s*$/;
     splice @l, $d, $n; $premier = $d;
