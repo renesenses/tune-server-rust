@@ -39,8 +39,11 @@ done
 
 if [ -f "$parent/gardes.txt" ] && [ -f "$pr/gardes.txt" ]; then
   section "gardes par chemin : $(wc -l < "$parent/gardes.txt") → $(wc -l < "$pr/gardes.txt")"
-  d="$(seulement_dans "$parent/gardes.txt" "$pr/gardes.txt")"
-  a="$(seulement_dans "$pr/gardes.txt" "$parent/gardes.txt")"
+  # Le numéro de ligne bouge à chaque édition sans que la garde change :
+  # on compare « lecteur, forme, fichier lu » avec leur multiplicité.
+  sans_ligne() { awk -F'\t' 'BEGIN{OFS="\t"}{sub(/:[0-9]+$/,"",$1); print $1,$2,$3}' "$1" | sort | uniq -c | sed -E 's/^ *([0-9]+) /\1×\t/'; }
+  d="$(comm -23 <(sans_ligne "$parent/gardes.txt") <(sans_ligne "$pr/gardes.txt"))"
+  a="$(comm -13 <(sans_ligne "$parent/gardes.txt") <(sans_ligne "$pr/gardes.txt"))"
   if [ -z "$d$a" ]; then echo "✓ inchangées"; else
     echo "! gardes modifiées — à lister dans la PR (chemin adapté, jamais assertion retirée) :"
     [ -n "$d" ] && sed 's/^/    - /' <<<"$d"
