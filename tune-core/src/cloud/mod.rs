@@ -3,6 +3,7 @@ pub mod community;
 pub mod community_sync;
 pub mod consent;
 pub mod digest;
+pub mod library_reconcile;
 pub mod library_sync;
 pub mod metadata_proposals;
 pub mod playlist_hub;
