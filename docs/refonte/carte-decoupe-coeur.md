@@ -164,6 +164,11 @@ par `scripts/refonte/gardes.sh`.
 - **Nommer la famille « commun »** dans l'orchestrateur et la sortir avant
   history.
 - **Écrire un témoin pour `resolve_streaming_url`** avant de la déplacer.
+  Fait le 4 septembre : `tune-core/tests/temoin_resolution_streaming.rs`, sept
+  tests par la porte publique `resolve_queue_item_url` avec un service factice
+  (URL http verbatim, https relayée par le proxy, titre vide, durée nulle,
+  401 rafraîchi une fois, 401 persistant, service inconnu). Contre-épreuve :
+  deux sabotages de l'orchestrateur font rougir exactement les deux tests visés.
 
 ## Refaire le relevé
 

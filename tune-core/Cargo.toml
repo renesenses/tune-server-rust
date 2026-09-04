@@ -283,3 +283,10 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
     "Win32_System_Power",
 ] }
+
+# #2219 — témoin de `resolve_streaming_url` par sa porte publique, avant que
+# la famille resolve_stream quitte orchestrator.rs. `autotests = false` ci-dessus :
+# sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "temoin_resolution_streaming"
+path = "tests/temoin_resolution_streaming.rs"
