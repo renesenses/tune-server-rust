@@ -9,9 +9,15 @@ fn code_de_production() -> &'static str {
         let fin = TOUT
             .find(BORNE)
             .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
-        // `tick` vit dans son propre module (REF-1, #2219) et se lit en
-        // premier : il précédait le reste de l'impl dans le fichier d'origine.
-        format!("{}{}", include_str!("../poller/tick.rs"), &TOUT[..fin])
+        // `tick` et la radio vivent dans leurs propres modules (REF-1, #2219).
+        // `tick` se lit en premier, la radio en dernier : c'était leur ordre
+        // dans le fichier d'origine.
+        format!(
+            "{}{}{}",
+            include_str!("../poller/tick.rs"),
+            &TOUT[..fin],
+            include_str!("../poller/radio.rs")
+        )
     })
 }
 
