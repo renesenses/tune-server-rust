@@ -8,8 +8,10 @@
 /// PREMIÈRE occurrence, celle de la variante `local-audio`, la seule qui
 /// construise réellement une sortie.
 fn corps_de_recreation() -> &'static str {
-    const TOUT: &str = include_str!("../orchestrator.rs");
-    const SIGNATURE: &str = "    async fn recreate_local_and_play(\n";
+    // `recreate_local_and_play` vit dans le module de famille `transport`
+    // (REF-2, #2219), en `pub(super)` comme toute méthode privée sortie.
+    const TOUT: &str = include_str!("../orchestrator/transport.rs");
+    const SIGNATURE: &str = "    pub(super) async fn recreate_local_and_play(\n";
     let debut = TOUT.find(SIGNATURE).unwrap_or_else(|| {
         panic!(
             "`recreate_local_and_play` a été renommée ou remaniée : ce \

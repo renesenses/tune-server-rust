@@ -23,7 +23,12 @@
 use strict;
 use warnings;
 
-my $fichier = shift or die "usage : $0 <fichier.rs>\n";
+# Option : --mods a,b,c sort les modules NOMMÉS (production comprise), au lieu
+# des seuls blocs `#[cfg(test)]`. Le bloc doit rester `[pub(...)] mod nom {`
+# en colonne 0, fermé par `}` en colonne 0 ; la visibilité est conservée.
+my @voulus;
+if (@ARGV && $ARGV[0] eq "--mods") { shift; @voulus = split /,/, shift; }
+my $fichier = shift or die "usage : $0 [--mods a,b] <fichier.rs>\n";
 (my $dossier = $fichier) =~ s/\.rs$// or die "pas un .rs : $fichier\n";
 open my $in, '<', $fichier or die "$fichier : $!";
 my @lignes = <$in>;
@@ -38,11 +43,13 @@ while ($i < @lignes) {
     my $l = $lignes[$i];
     # Un bloc commence par `#[cfg(test)]` en colonne 0, éventuellement suivi
     # d'autres attributs, puis `mod nom {` en colonne 0.
-    if ($l =~ /^\#\[cfg\(test\)\]\s*$/) {
-        my $j = $i + 1;
+    my $mode_test = ($l =~ /^\#\[cfg\(test\)\]\s*$/);
+    my $mode_nom  = (@voulus && $l =~ /^(pub(?:\([a-z]+\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*\{\s*$/ && grep { $_ eq $2 } @voulus);
+    if ($mode_test || $mode_nom) {
+        my $j = $mode_test ? $i + 1 : $i;
         my @attrs;
-        while ($j < @lignes && $lignes[$j] =~ /^\#\[/) { push @attrs, $lignes[$j]; $j++ }
-        if ($j < @lignes && $lignes[$j] =~ /^(pub(?:\([a-z]+\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*\{\s*$/) {
+        while ($mode_test && $j < @lignes && $lignes[$j] =~ /^\#\[/) { push @attrs, $lignes[$j]; $j++ }
+        if ($j < @lignes && $lignes[$j] =~ /^(pub(?:\([a-z]+\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*\{\s*$/ && ($mode_test || grep { $_ eq $2 } @voulus)) {
             my ($vis, $nom) = ($1 // '', $2);
             # Fin du bloc : première `}` en colonne 0 après l'ouverture.
             my $k = $j + 1;
@@ -67,7 +74,7 @@ while ($i < @lignes) {
             open my $out, '>', $cible or die "$cible : $!";
             print $out @corps;
             close $out;
-            push @sortie, $l, @attrs, "${vis}mod $nom;\n";
+            push @sortie, ($mode_test ? ($l, @attrs) : ()), "${vis}mod $nom;\n";
             $modules++;
             $deplacees += scalar @corps;
             $i = $k + 1;

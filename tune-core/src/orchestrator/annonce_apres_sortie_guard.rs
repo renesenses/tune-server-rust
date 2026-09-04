@@ -10,12 +10,28 @@
 /// de la condition qu'elle prétendait garder. Un contrôle qui ne peut pas
 /// dire non ne contrôle rien (#2082).
 fn code_de_production() -> &'static str {
-    const TOUT: &str = include_str!("../orchestrator.rs");
-    const BORNE: &str = "mod annonce_apres_sortie_guard";
-    let fin = TOUT
-        .find(BORNE)
-        .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
-    &TOUT[..fin]
+    static PRODUCTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PRODUCTION.get_or_init(|| {
+        const TOUT: &str = include_str!("../orchestrator.rs");
+        const BORNE: &str = "mod annonce_apres_sortie_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        // Le bloc `impl PlaybackOrchestrator` est réparti par familles (REF-2,
+        // #2219) : le transport (`play_inner`, chemin de lecture), la
+        // résolution locale (cache hit, passthrough) et le commun
+        // (`confirmer_lecture_navigateur`) vivent dans leurs propres modules.
+        // Le transport se lit EN PREMIER : dans le fichier d'origine
+        // `play_inner` précédait `confirmer_lecture_navigateur`, et un test
+        // compare des positions.
+        format!(
+            "{}{}{}{}",
+            include_str!("../orchestrator/transport.rs"),
+            &TOUT[..fin],
+            include_str!("../orchestrator/resolve_local.rs"),
+            include_str!("../orchestrator/commun.rs")
+        )
+    })
 }
 
 /// Position de la première occurrence, ou panique avec un message qui dit
@@ -174,10 +190,20 @@ fn le_scrobble_definitif_reste_hors_du_demarrage() {
     let play = position("async fn play_inner(");
     let src = code_de_production();
     let apres = &src[play..];
-    let fin = apres
-        .find("\n    async fn ")
-        .or_else(|| apres.find("\n    pub async fn "))
-        .unwrap_or(apres.len());
+    // La méthode suivante, quelle que soit sa visibilité : depuis REF-2 les
+    // méthodes privées d'un module de famille sont `pub(super)`.
+    let fin = [
+        "\n    async fn ",
+        "\n    pub async fn ",
+        "\n    pub(super) async fn ",
+        "\n    fn ",
+        "\n    pub fn ",
+        "\n    pub(super) fn ",
+    ]
+    .iter()
+    .filter_map(|m| apres.find(m))
+    .min()
+    .unwrap_or(apres.len());
     assert!(
         !apres[..fin].contains("dispatch_scrobble("),
         "le scrobble définitif est reparti dans le chemin de démarrage : \
