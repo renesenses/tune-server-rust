@@ -51,8 +51,12 @@ for my $cle (sort { $plage{$b}[0] <=> $plage{$a}[0] } keys %plage) {
 }
 for (my $k = $#l; $k > 0; $k--) { splice @l, $k, 1 if $l[$k] =~ /^\s*$/ && $l[$k-1] =~ /^\s*$/; }
 # `pub use` seulement si un item déplacé est pub ou pub(crate) : un glob qui ne réexporte rien est une erreur de compilation.
-my $a_du_pub = grep { grep { /^pub(?:\(crate\))?\s/ } @$_ } values %corps;
-splice @l, $premier, 0, "mod $module;\n", ($a_du_pub ? "pub use ${module}::*;\n" : "use ${module}::*;\n"), "\n";
+# Le glob prend la plus haute visibilité présente parmi les items déplacés : `pub` s'il y en a un `pub`,
+# `pub(crate)` sinon, rien sinon — rustc refuse un glob qui ne réexporte rien à sa visibilité.
+my $a_pub = grep { grep { /^pub\s/ } @$_ } values %corps;
+my $a_crate = grep { grep { /^pub\(crate\)\s/ } @$_ } values %corps;
+my $glob = $a_pub ? "pub use ${module}::*;\n" : ($a_crate ? "pub(crate) use ${module}::*;\n" : "use ${module}::*;\n");
+splice @l, $premier, 0, "mod $module;\n", $glob, "\n";
 (my $dossier = $fichier) =~ s/\.rs$//; mkdir $dossier unless -d $dossier;
 my $cible = "$dossier/$module.rs"; die "$cible existe déjà\n" if -e $cible;
 open my $out, '>', $cible or die; print $out "use super::*;\n\n";
