@@ -50,7 +50,9 @@ for my $cle (sort { $plage{$b}[0] <=> $plage{$a}[0] } keys %plage) {
     splice @l, $d, $n; $premier = $d;
 }
 for (my $k = $#l; $k > 0; $k--) { splice @l, $k, 1 if $l[$k] =~ /^\s*$/ && $l[$k-1] =~ /^\s*$/; }
-splice @l, $premier, 0, "mod $module;\n", "pub use ${module}::*;\n", "\n";
+# `pub use` seulement si un item déplacé est pub ou pub(crate) : un glob qui ne réexporte rien est une erreur de compilation.
+my $a_du_pub = grep { grep { /^pub(?:\(crate\))?\s/ } @$_ } values %corps;
+splice @l, $premier, 0, "mod $module;\n", ($a_du_pub ? "pub use ${module}::*;\n" : "use ${module}::*;\n"), "\n";
 (my $dossier = $fichier) =~ s/\.rs$//; mkdir $dossier unless -d $dossier;
 my $cible = "$dossier/$module.rs"; die "$cible existe déjà\n" if -e $cible;
 open my $out, '>', $cible or die; print $out "use super::*;\n\n";

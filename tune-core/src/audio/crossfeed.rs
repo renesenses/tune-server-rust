@@ -702,6 +702,7 @@ mod tests {
             include_str!("../orchestrator.rs"),
             include_str!("../orchestrator/dsp.rs"),
             include_str!("../orchestrator/transport.rs"),
+            include_str!("../orchestrator/transcodage.rs"),
         );
         // Témoin : si `include_str!` pointait sur un fichier vide ou faux, tout
         // le reste passerait pour vert sans rien avoir lu.
