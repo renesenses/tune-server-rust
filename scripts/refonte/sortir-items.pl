@@ -26,7 +26,7 @@ for my $o (@occ) {
     my $f = $i;
     my $ligne = $l[$i];
     if ($ligne =~ /\{\s*$/ || ($ligne =~ /\{/ && $ligne !~ /\}\s*$/ && $ligne !~ /;\s*$/)) {
-        $f++ while $f < $#l && $l[$f] !~ /^\}\s*$/;
+        $f++ while $f < $#l && $l[$f] !~ /^\};?\s*$/;
     } elsif ($ligne =~ /;\s*$/ || $ligne =~ /\}\s*$/) {
         $f = $i;
     } else {
@@ -34,7 +34,7 @@ for my $o (@occ) {
         my $k = $i; my $bloc = 0;
         while ($k < $#l) { if ($l[$k] =~ /\{\s*$/) { $bloc = 1; last } if ($l[$k] =~ /;\s*$/) { last } $k++ }
         $f = $k;
-        if ($bloc) { $f++ while $f < $#l && $l[$f] !~ /^\}\s*$/; }
+        if ($bloc) { $f++ while $f < $#l && $l[$f] !~ /^\};?\s*$/; }
     }
     $plage{$cle} = [$d, $f];
 }
