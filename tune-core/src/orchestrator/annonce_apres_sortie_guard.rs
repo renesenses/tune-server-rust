@@ -18,16 +18,18 @@ fn code_de_production() -> &'static str {
             .find(BORNE)
             .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
         // Le bloc `impl PlaybackOrchestrator` est réparti par familles (REF-2,
-        // #2219) : le transport (`play_inner`, chemin de lecture) et la
-        // résolution locale (cache hit, passthrough) vivent dans leurs
-        // propres modules. Le transport se lit EN PREMIER : dans le fichier
-        // d'origine `play_inner` précédait `confirmer_lecture_navigateur`, et
-        // un test compare des positions.
+        // #2219) : le transport (`play_inner`, chemin de lecture), la
+        // résolution locale (cache hit, passthrough) et le commun
+        // (`confirmer_lecture_navigateur`) vivent dans leurs propres modules.
+        // Le transport se lit EN PREMIER : dans le fichier d'origine
+        // `play_inner` précédait `confirmer_lecture_navigateur`, et un test
+        // compare des positions.
         format!(
-            "{}{}{}",
+            "{}{}{}{}",
             include_str!("../orchestrator/transport.rs"),
             &TOUT[..fin],
-            include_str!("../orchestrator/resolve_local.rs")
+            include_str!("../orchestrator/resolve_local.rs"),
+            include_str!("../orchestrator/commun.rs")
         )
     })
 }
