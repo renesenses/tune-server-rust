@@ -51,10 +51,16 @@ while ($i < @lignes) {
             my @corps = @lignes[$j + 1 .. $k - 1];
             # Dédenter de 4 espaces (les lignes vides restent vides).
             for (@corps) { s/^ {4}// }
-            # Réadresser les gardes relatives au fichier source.
+            # Réadresser les gardes relatives au fichier source : TOUT chemin
+            # relatif gagne un niveau, y compris ceux qui commencent déjà par
+            # `../` (une fixture en `../../tests/fixtures/x` devient
+            # `../../../tests/fixtures/x`). Seuls les chemins absolus restent.
+            # Un marqueur \x00 empêche de rejouer la substitution sur son
+            # propre résultat ; il est retiré ensuite.
             for (@corps) {
-                $gardes++ while s/include_str!\(\s*"(?!\.\.\/)([^"]+)"\s*\)/include_str!("..\/$1")/g;
-                $gardes++ while s/\#\[path\s*=\s*"(?!\.\.\/)([^"]+)"\s*\]/#[path = "..\/$1"]/g;
+                $gardes++ while s/include_str!\(\s*"(?!\/)([^"]+)"\s*\)/include_str!(\x00"..\/$1")/g;
+                $gardes++ while s/\#\[path\s*=\s*"(?!\/)([^"]+)"\s*\]/#[path = \x00"..\/$1"]/g;
+                s/\x00//g;
             }
             my $cible = "$dossier/$nom.rs";
             die "$cible existe déjà\n" if -e $cible;
