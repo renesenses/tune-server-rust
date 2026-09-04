@@ -625,6 +625,30 @@ mod eq_refresh_guard {
         ("_mono_downmix", "refresh_zone_mono_downmix"),
     ];
 
+    /// REF-T (#2219) : un module de test sorti de son fichier en module enfant
+    /// n'est pas une route. Il se reconnaît à sa déclaration `#[cfg(test)]`
+    /// suivie de `mod <nom>;` dans le fichier parent `<dossier>.rs`. Sans cette
+    /// règle, le garde-fou verrait `zones/signal_path_tests.rs` poser les clés
+    /// DSP pour préparer ses cas et le prendrait pour une route sans
+    /// rafraîchisseur — ce que `zones.rs` n'était pas quand il les contenait.
+    fn est_module_de_test_sorti(chemin: &Path) -> bool {
+        let (Some(dossier), Some(nom)) =
+            (chemin.parent(), chemin.file_stem().and_then(|s| s.to_str()))
+        else {
+            return false;
+        };
+        let Ok(parent) = fs::read_to_string(dossier.with_extension("rs")) else {
+            return false;
+        };
+        let lignes: Vec<&str> = parent.lines().map(str::trim).collect();
+        lignes.iter().enumerate().any(|(i, l)| {
+            *l == format!("mod {nom};")
+                && lignes[i.saturating_sub(3)..i]
+                    .iter()
+                    .any(|a| *a == "#[cfg(test)]")
+        })
+    }
+
     #[test]
     fn every_route_writing_a_dsp_setting_refreshes_the_live_output() {
         let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
@@ -639,6 +663,9 @@ mod eq_refresh_guard {
                     continue;
                 }
                 if chemin.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                if est_module_de_test_sorti(&chemin) {
                     continue;
                 }
                 let nom = chemin
