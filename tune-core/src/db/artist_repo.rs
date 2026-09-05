@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
-use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect, fold_diacritics};
 use super::models::Artist;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
@@ -80,6 +80,16 @@ pub mod sql {
 
     pub fn delete<D: SqlDialect>(d: &D) -> String {
         format!("DELETE FROM artists WHERE id = {}", d.placeholder(1))
+    }
+
+    /// Les artistes dont le nom, sans accents ni casse, contient un fragment
+    /// (BIB-C2). Préfiltre SQL seulement : la décision se prend en Rust sur
+    /// [`super::cle_artiste`]. `ORDER BY id` : le plus ancien gagne.
+    pub fn candidats_par_fragment<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {COLS} FROM artists WHERE LOWER(unaccent(name)) LIKE {} ORDER BY id",
+            d.placeholder(1)
+        )
     }
 
     pub fn count() -> &'static str {
@@ -321,6 +331,47 @@ fn usable_musicbrainz_id(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+/// Clé de rapprochement d'un nom d'artiste (BIB-C2).
+///
+/// Treize paires d'artistes en double mesurées sur .18 le 30/08/2026, trois
+/// familles : accents (Ayo/Ayọ, Etienne/Étienne Daho), article « The »
+/// (Rolling Stones / The Rolling Stones), ponctuation (J.J./JJ Cale,
+/// Jean Jacques/Jean-Jacques Goldman, Simon &/and Garfunkel). La clé plie
+/// les accents, passe en minuscules, lit « & » comme « and », colle le point
+/// et l'apostrophe, ouvre un espace sur toute autre ponctuation, et retire
+/// l'article initial. Elle ne sert qu'à RETROUVER : la graphie affichée reste
+/// celle de la fiche existante.
+pub fn cle_artiste(nom: &str) -> String {
+    let plat = fold_diacritics(nom).to_lowercase().replace('&', " and ");
+    let mut cle = String::with_capacity(plat.len());
+    let mut espace_en_attente = false;
+    for c in plat.chars() {
+        if c.is_alphanumeric() {
+            if espace_en_attente && !cle.is_empty() {
+                cle.push(' ');
+            }
+            espace_en_attente = false;
+            cle.push(c);
+        } else if !matches!(c, '.' | '\'' | '\u{2019}' | '`') {
+            espace_en_attente = true;
+        }
+    }
+    let sans_article = cle.strip_prefix("the ").unwrap_or(&cle);
+    if sans_article.is_empty() {
+        plat.trim().to_string()
+    } else {
+        sans_article.to_string()
+    }
+}
+
+/// Le mot le plus long de la clé (au moins trois lettres, ni « and » ni
+/// « the ») : c'est lui qu'on demande à SQL, la clé complète tranche ensuite.
+fn fragment_de_recherche(cle: &str) -> Option<&str> {
+    cle.split(' ')
+        .filter(|m| m.len() >= 3 && !matches!(*m, "and" | "the"))
+        .max_by_key(|m| m.len())
+}
+
 impl ArtistRepo {
     pub fn new(db: SqliteDb) -> Self {
         Self { db: Arc::new(db) }
@@ -419,6 +470,9 @@ impl ArtistRepo {
                 return Ok(row_to_artist(&row));
             }
         }
+        if let Some(existant) = self.meme_artiste_sous_une_autre_graphie(name)? {
+            return Ok(existant);
+        }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
         let params: [&dyn ToSqlValue; 3] = [&name, &sort_name, &musicbrainz_id];
         let id = self.db.execute_returning_id(&create_sql, &params)?;
@@ -432,6 +486,25 @@ impl ArtistRepo {
             image_path: None,
             image_source: None,
         })
+    }
+
+    /// BIB-C2 : le même artiste existe-t-il déjà sous une autre graphie ?
+    /// Préfiltre SQL sur le mot le plus long, décision en Rust sur
+    /// [`cle_artiste`], le plus ancien d'abord. Lecture forte : le scanner
+    /// appelle ceci sous `BEGIN IMMEDIATE`, comme le nom exact juste avant.
+    fn meme_artiste_sous_une_autre_graphie(&self, name: &str) -> Result<Option<Artist>, TuneError> {
+        let cle = cle_artiste(name);
+        let Some(fragment) = fragment_de_recherche(&cle) else {
+            return Ok(None);
+        };
+        let sql = self.dialect_sql(sql::candidats_par_fragment, sql::candidats_par_fragment);
+        let motif = format!("%{fragment}%");
+        let params: [&dyn ToSqlValue; 1] = [&motif];
+        let lignes = self.db.query_many_strong(&sql, &params)?;
+        Ok(lignes
+            .iter()
+            .map(row_to_artist)
+            .find(|a| cle_artiste(&a.name) == cle))
     }
 
     pub fn update(&self, artist: &Artist) -> Result<(), TuneError> {
@@ -904,6 +977,77 @@ mod tests {
         let a2 = repo.get_or_create("Beatles", None, None).unwrap();
         assert_eq!(a1.id, a2.id);
         assert_eq!(repo.count().unwrap(), 1);
+    }
+
+    /// BIB-C2 : les treize paires mesurées sur .18 (30/08/2026) tombent
+    /// sur la même clé ; deux artistes distincts n'y tombent pas.
+    #[test]
+    fn la_cle_d_artiste_rapproche_les_treize_paires_mesurees() {
+        for (a, b) in [
+            ("Ayo", "Ayọ"),
+            ("Etienne Daho", "Étienne Daho"),
+            ("Kepa", "Képa"),
+            ("Marcio", "Márcio"),
+            ("Raphael", "Raphaël"),
+            ("Telephone", "Téléphone"),
+            ("Rolling Stones", "The Rolling Stones"),
+            ("Music", "The Music"),
+            ("Soyuz", "The Soyuz"),
+            ("Charlie Parker Quintet", "The Charlie Parker Quintet"),
+            ("J.J. Cale", "JJ Cale"),
+            ("Jean Jacques Goldman", "Jean-Jacques Goldman"),
+            ("Simon & Garfunkel", "Simon and Garfunkel"),
+        ] {
+            assert_eq!(cle_artiste(a), cle_artiste(b), "{a} / {b}");
+        }
+        assert_ne!(cle_artiste("Ayo"), cle_artiste("Ayla"));
+        assert_ne!(cle_artiste("The Music"), cle_artiste("The Musical"));
+        assert_eq!(
+            cle_artiste("The"),
+            "the",
+            "un nom réduit à l'article garde l'article"
+        );
+        assert_eq!(
+            fragment_de_recherche(&cle_artiste("Simon & Garfunkel")),
+            Some("garfunkel")
+        );
+        assert_eq!(fragment_de_recherche(&cle_artiste("The And")), None);
+    }
+
+    /// BIB-C2 : la fiche existante est réutilisée sous une autre graphie et
+    /// GARDE son nom d'affichage ; un artiste différent obtient sa fiche.
+    #[test]
+    fn get_or_create_retrouve_l_artiste_sous_une_autre_graphie() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        let daho = repo.get_or_create("Étienne Daho", None, None).unwrap();
+        let stones = repo
+            .get_or_create("The Rolling Stones", None, None)
+            .unwrap();
+        let cale = repo.get_or_create("J.J. Cale", None, None).unwrap();
+
+        let daho_bis = repo.get_or_create("Etienne Daho", None, None).unwrap();
+        assert_eq!(daho_bis.id, daho.id);
+        assert_eq!(
+            daho_bis.name, "Étienne Daho",
+            "la graphie d'affichage est celle de la fiche"
+        );
+        assert_eq!(
+            repo.get_or_create("Rolling Stones", None, None).unwrap().id,
+            stones.id
+        );
+        assert_eq!(
+            repo.get_or_create("JJ Cale", None, None).unwrap().id,
+            cale.id
+        );
+
+        let brahem = repo.get_or_create("Anouar Brahem", None, None).unwrap();
+        assert_ne!(brahem.id, daho.id);
+        let dahomey = repo.get_or_create("Dahomey", None, None).unwrap();
+        assert_ne!(
+            dahomey.id, daho.id,
+            "contenir le fragment ne suffit pas, la clé tranche"
+        );
     }
 
     /// #1311 — un artiste sans identifiant MusicBrainz est un artiste sans
