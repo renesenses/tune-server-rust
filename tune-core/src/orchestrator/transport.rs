@@ -1586,25 +1586,65 @@ impl PlaybackOrchestrator {
             return;
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(
-            REPLAY_OUTPUT_SEEK_SETTLE_MS,
-        ))
+        self.detacher_le_seek_apres_reprise(
+            zone_id,
+            did.to_string(),
+            position_ms,
+            std::time::Duration::from_millis(REPLAY_OUTPUT_SEEK_SETTLE_MS),
+            "relecture",
+        )
         .await;
-        let Some(output) = ({ self.outputs.lock().await.get(did) }) else {
-            warn!(
-                zone_id,
-                device_id = did,
-                "replay_output_seek_output_disparue"
-            );
-            return;
-        };
-        match output.lock().await.checked_seek(position_ms).await {
-            Ok(()) => info!(zone_id, position_ms, "replay_output_seek_sent"),
-            Err(e) => warn!(zone_id, position_ms, error = %e, "replay_output_seek_failed"),
-        }
-        // Repositionner APRÈS le Seek : la grâce du poller doit partir de la
-        // commande, pas de la recréation qui la précède de 500 ms.
-        self.playback.seek(zone_id, position_ms as i64).await;
+    }
+
+    /// Le seek qui suit une reprise ou une relecture sur un renderer réseau
+    /// part en tâche détachée : la réponse à l'appelant n'attend plus le temps
+    /// de pose (LAT-P2). La tâche capture la génération de lecture au départ
+    /// et abandonne si un stop, un next ou une nouvelle lecture est intervenu
+    /// pendant la pose — sinon elle seekerait la piste suivante.
+    async fn detacher_le_seek_apres_reprise(
+        &self,
+        zone_id: i64,
+        device_id: String,
+        position_ms: u64,
+        pose: std::time::Duration,
+        motif: &'static str,
+    ) {
+        let seq_au_depart = self.playback.current_play_seq(zone_id).await;
+        let outputs = self.outputs.clone();
+        let playback = self.playback.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(pose).await;
+            let seq_courante = playback.current_play_seq(zone_id).await;
+            if !reprise_toujours_la_notre(seq_au_depart, seq_courante) {
+                info!(
+                    zone_id,
+                    position_ms,
+                    motif,
+                    seq_au_depart,
+                    seq_courante,
+                    "seek_apres_reprise_abandonne_lecture_changee"
+                );
+                return;
+            }
+            let Some(output) = ({ outputs.lock().await.get(&device_id) }) else {
+                warn!(
+                    zone_id,
+                    device_id = %device_id,
+                    motif,
+                    "seek_apres_reprise_sortie_disparue"
+                );
+                return;
+            };
+            match output.lock().await.checked_seek(position_ms).await {
+                Ok(()) => {
+                    info!(zone_id, position_ms, motif, "seek_apres_reprise_envoye");
+                    playback.seek(zone_id, position_ms as i64).await;
+                }
+                Err(e) => {
+                    warn!(zone_id, position_ms, motif, error = %e, "seek_apres_reprise_echoue")
+                }
+            }
+        });
     }
 
     /// True when the zone has an uploaded room-correction IR and is not in PURE
@@ -1924,15 +1964,15 @@ impl PlaybackOrchestrator {
         // continues instead of replaying from the top. Locks are released during
         // the wait so other zones aren't blocked.
         if matches!(output_type.as_deref(), Some("dlna" | "openhome")) && position_ms > 3000 {
-            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             let did = device_id.expect("output type only exists with a device id");
-            let output = { self.outputs.lock().await.get(did) };
-            if let Some(output) = output {
-                match output.lock().await.checked_seek(position_ms).await {
-                    Ok(()) => info!(zone_id, position_ms, "dlna_resume_seek"),
-                    Err(e) => warn!(zone_id, position_ms, error = %e, "dlna_resume_seek_failed"),
-                }
-            }
+            self.detacher_le_seek_apres_reprise(
+                zone_id,
+                did.to_string(),
+                position_ms,
+                std::time::Duration::from_millis(RESUME_OUTPUT_SEEK_SETTLE_MS),
+                "reprise",
+            )
+            .await;
         }
         Ok(())
     }
