@@ -290,3 +290,7 @@ windows = { version = "0.62", features = [
 [[test]]
 name = "temoin_resolution_streaming"
 path = "tests/temoin_resolution_streaming.rs"
+
+[[test]]
+name = "temoin_resolution_locale"
+path = "tests/temoin_resolution_locale.rs"
