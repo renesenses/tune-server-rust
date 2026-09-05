@@ -7,6 +7,7 @@
 
 use reqwest::header::HeaderMap;
 use serde::Serialize;
+use tracing::warn;
 
 use crate::db::settings_repo::SettingsRepo;
 
@@ -181,7 +182,16 @@ pub async fn appeler(
     match requete.send().await {
         Ok(resp) => {
             if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                defer_from_headers(settings, scope, resp.headers());
+                // Un seul journal pour toutes les portées : chaque site en
+                // écrivait un à son nom, ou aucun.
+                if let Some(backoff) = defer_from_headers(settings, scope, resp.headers()) {
+                    warn!(
+                        scope = backoff.scope,
+                        until_epoch = backoff.until_epoch,
+                        retry_after_seconds = backoff.retry_after_seconds,
+                        "cloud_rate_limit_persisted"
+                    );
+                }
             }
             AppelCloud::Reponse(resp)
         }
@@ -246,6 +256,7 @@ mod tests {
             ("library_sync", include_str!("library_sync.rs")),
             ("telemetry", include_str!("telemetry.rs")),
             ("metadata_proposals", include_str!("metadata_proposals.rs")),
+            ("bio_sync", include_str!("bio_sync.rs")),
         ] {
             // La partie de PRODUCTION seule : un témoin peut légitimement
             // poser une échéance avec `defer_from_headers`.

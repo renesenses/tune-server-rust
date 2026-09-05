@@ -221,15 +221,6 @@ pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
 /// controle `cloud::consent::contribution_autorisee` lui-meme.
 async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
     let settings = SettingsRepo::with_backend(db.clone());
-    if let Some(backoff) = rate_limit::active(&settings, CloudScope::BiosWrite) {
-        warn!(
-            scope = backoff.scope,
-            until_epoch = backoff.until_epoch,
-            retry_after_seconds = backoff.retry_after_seconds,
-            "bio_sync_deferred_rate_limit"
-        );
-        return;
-    }
     let server_id = crate::cloud::telemetry::TelemetryReporter::get_or_create_server_id(&settings);
 
     let artist_repo = ArtistRepo::with_backend(db.clone());
@@ -326,8 +317,25 @@ async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
             albums: album_batch,
         };
 
-        match client.post(upload_url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
+        // CLD-2 : un seul chemin d'appel borné — la portée retenue ne part pas,
+        // un 429 mémorise (et journalise) son échéance avant d'être lu ici.
+        match rate_limit::appeler(
+            &settings,
+            CloudScope::BiosWrite,
+            client.post(upload_url).json(&payload),
+        )
+        .await
+        {
+            rate_limit::AppelCloud::Retenu(backoff) => {
+                warn!(
+                    scope = backoff.scope,
+                    until_epoch = backoff.until_epoch,
+                    retry_after_seconds = backoff.retry_after_seconds,
+                    "bio_sync_deferred_rate_limit"
+                );
+                return;
+            }
+            rate_limit::AppelCloud::Reponse(resp) if resp.status().is_success() => {
                 info!(
                     batch = i,
                     artists = payload.artists.len(),
@@ -335,23 +343,9 @@ async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
                     "bio_sync_uploaded"
                 );
             }
-            Ok(resp) => {
+            rate_limit::AppelCloud::Reponse(resp) => {
                 let status = resp.status();
                 warn!(batch = i, status = %status, "bio_sync_upload_rejected");
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    if let Some(backoff) = rate_limit::defer_from_headers(
-                        &settings,
-                        CloudScope::BiosWrite,
-                        resp.headers(),
-                    ) {
-                        warn!(
-                            scope = backoff.scope,
-                            until_epoch = backoff.until_epoch,
-                            retry_after_seconds = backoff.retry_after_seconds,
-                            "bio_sync_rate_limit_persisted"
-                        );
-                    }
-                }
                 // `POST /community/bios` est plafonne a 5 requetes par heure
                 // (routes/api.php:705, `throttle:5,60`). Sans ce garde-fou, le
                 // lot 0 refuse en 429 etait suivi de tous les autres, refuses
@@ -361,7 +355,7 @@ async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
                     break;
                 }
             }
-            Err(e) => {
+            rate_limit::AppelCloud::Erreur(e) => {
                 warn!(batch = i, error = %e, "bio_sync_upload_failed");
             }
         }
@@ -394,15 +388,6 @@ pub async fn download_bios(db: &Arc<dyn DbBackend>) {
 
 async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client, artist_url: &str) {
     let settings = SettingsRepo::with_backend(db.clone());
-    if let Some(backoff) = rate_limit::active(&settings, CloudScope::BiosArtistsRead) {
-        warn!(
-            scope = backoff.scope,
-            until_epoch = backoff.until_epoch,
-            retry_after_seconds = backoff.retry_after_seconds,
-            "bio_sync_deferred_rate_limit"
-        );
-        return;
-    }
     let artist_repo = ArtistRepo::with_backend(db.clone());
 
     let candidates = match artist_repo.artists_without_bio_with_mbid() {
@@ -429,24 +414,30 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client,
             urlencoding::encode(&query)
         );
 
-        let resp = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "bio_download_artists_request_failed");
-                continue;
-            }
-        };
+        // CLD-2 : le même chemin borné que l'envoi.
+        let resp =
+            match rate_limit::appeler(&settings, CloudScope::BiosArtistsRead, client.get(&url))
+                .await
+            {
+                rate_limit::AppelCloud::Retenu(backoff) => {
+                    warn!(
+                        scope = backoff.scope,
+                        until_epoch = backoff.until_epoch,
+                        retry_after_seconds = backoff.retry_after_seconds,
+                        "bio_sync_deferred_rate_limit"
+                    );
+                    return;
+                }
+                rate_limit::AppelCloud::Reponse(r) => r,
+                rate_limit::AppelCloud::Erreur(e) => {
+                    warn!(error = %e, "bio_download_artists_request_failed");
+                    continue;
+                }
+            };
 
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_artists_rejected");
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                rate_limit::defer_from_headers(
-                    &settings,
-                    CloudScope::BiosArtistsRead,
-                    resp.headers(),
-                );
-            }
             // Le marqueur reste inexplique de #2258 (`status=500`). La cause
             // est cote cloud ; ce qui est corrige ici est la REACTION du
             // client, qui reemettait le lot suivant sans pause ni limite.
@@ -497,15 +488,6 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client,
 
 async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) {
     let settings = SettingsRepo::with_backend(db.clone());
-    if let Some(backoff) = rate_limit::active(&settings, CloudScope::BiosAlbumsRead) {
-        warn!(
-            scope = backoff.scope,
-            until_epoch = backoff.until_epoch,
-            retry_after_seconds = backoff.retry_after_seconds,
-            "bio_sync_deferred_rate_limit"
-        );
-        return;
-    }
     let album_repo = AlbumRepo::with_backend(db.clone());
 
     // Phase 1: download by MBID (existing path, for albums that have one)
@@ -528,9 +510,25 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
             urlencoding::encode(&query)
         );
 
-        let resp = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
+        // CLD-2 : le même chemin borné que l'envoi.
+        let resp = match rate_limit::appeler(
+            &settings,
+            CloudScope::BiosAlbumsRead,
+            client.get(&url),
+        )
+        .await
+        {
+            rate_limit::AppelCloud::Retenu(backoff) => {
+                warn!(
+                    scope = backoff.scope,
+                    until_epoch = backoff.until_epoch,
+                    retry_after_seconds = backoff.retry_after_seconds,
+                    "bio_sync_deferred_rate_limit"
+                );
+                return;
+            }
+            rate_limit::AppelCloud::Reponse(r) => r,
+            rate_limit::AppelCloud::Erreur(e) => {
                 warn!(error = %e, "bio_download_albums_request_failed");
                 continue;
             }
@@ -539,13 +537,6 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_albums_rejected");
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                rate_limit::defer_from_headers(
-                    &settings,
-                    CloudScope::BiosAlbumsRead,
-                    resp.headers(),
-                );
-            }
             // Stop hammering the cloud when it rate-limits (429) or errors (5xx):
             // the old `continue` fired every batch back-to-back with no delay,
             // producing dozens of rejected requests/sec (Fabien). Retry happens
@@ -626,9 +617,25 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
             urlencoding::encode(&titles_param)
         );
 
-        let resp = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
+        // CLD-2 : le même chemin borné que l'envoi.
+        let resp = match rate_limit::appeler(
+            &settings,
+            CloudScope::BiosAlbumsRead,
+            client.get(&url),
+        )
+        .await
+        {
+            rate_limit::AppelCloud::Retenu(backoff) => {
+                warn!(
+                    scope = backoff.scope,
+                    until_epoch = backoff.until_epoch,
+                    retry_after_seconds = backoff.retry_after_seconds,
+                    "bio_sync_deferred_rate_limit"
+                );
+                return;
+            }
+            rate_limit::AppelCloud::Reponse(r) => r,
+            rate_limit::AppelCloud::Erreur(e) => {
                 warn!(error = %e, "bio_download_albums_by_title_request_failed");
                 continue;
             }
@@ -637,13 +644,6 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_albums_by_title_rejected");
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                rate_limit::defer_from_headers(
-                    &settings,
-                    CloudScope::BiosAlbumsRead,
-                    resp.headers(),
-                );
-            }
             // Stop hammering the cloud on 429 / 5xx instead of firing the next
             // batch immediately (Fabien: dozens of by-title 429s per second).
             if apres_refus(status) == ApresRefus::ArreterLeCycle {
