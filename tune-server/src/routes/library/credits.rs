@@ -67,15 +67,29 @@ fn ecrire_credits(
             &[&id_str as &dyn ToSqlValue],
         )
         .ok();
+    // CRD-4 : la fiche artiste existante est LIÉE (jamais créée ici — un
+    // musicien de session n'est pas un artiste de la bibliothèque tant
+    // qu'aucun album ne le porte). Sans ce lien, `/artists/{id}/credits`
+    // retombait sur une comparaison de noms, et l'onglet Instrument à venir
+    // (CRD-6) n'aurait aucune clé. Lié en CHAÎNE, comme `track_id`, pour le
+    // miroir PostgreSQL où la colonne est du `TEXT`.
+    let artistes = tune_core::db::artist_repo::ArtistRepo::with_backend(backend.clone());
     let mut ecrites = 0usize;
     for (pos, ligne) in lignes.iter().enumerate() {
         let pos = pos as i32;
+        let artist_id: Option<String> = artistes
+            .get_by_name(&ligne.artist_name)
+            .ok()
+            .flatten()
+            .and_then(|a| a.id)
+            .map(|id| id.to_string());
         let ok = backend
             .execute(
-                "INSERT INTO track_credits (track_id, artist_name, role, instrument, position) \
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO track_credits (track_id, artist_id, artist_name, role, instrument, position) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
                 &[
                     &id_str as &dyn ToSqlValue,
+                    &artist_id as &dyn ToSqlValue,
                     &ligne.artist_name as &dyn ToSqlValue,
                     &ligne.role as &dyn ToSqlValue,
                     &ligne.instrument as &dyn ToSqlValue,
@@ -536,6 +550,59 @@ pub(super) async fn enrich_credits_status(State(state): State<AppState>) -> Json
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRD-4 : à l'insertion, un crédit dont le nom correspond à une fiche
+    /// artiste existante (casse indifférente) reçoit son `artist_id` ; un nom
+    /// inconnu reste sans lien et aucune fiche n'est créée.
+    #[tokio::test]
+    async fn l_insertion_des_credits_lie_la_fiche_artiste_existante_sans_en_creer() {
+        use tune_core::db::backend::ToSqlValue;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        let artistes = tune_core::db::artist_repo::ArtistRepo::with_backend(b.clone());
+        let brahem = artistes.get_or_create("Anouar Brahem", None, None).unwrap();
+        b.execute(
+            "INSERT INTO tracks (title, file_path) VALUES (?1, ?2)",
+            &[
+                &"Le pas du chat noir" as &dyn ToSqlValue,
+                &"/m/chat.flac" as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap();
+        let piste = b.last_insert_rowid();
+        let lignes = [
+            LigneCredit {
+                artist_name: "anouar brahem".into(),
+                role: "performer".into(),
+                instrument: Some("oud".into()),
+            },
+            LigneCredit {
+                artist_name: "Musicien De Session".into(),
+                role: "performer".into(),
+                instrument: Some("piano".into()),
+            },
+        ];
+        assert_eq!(ecrire_credits(b, piste, &lignes), 2);
+        let lus = b
+            .query_many(
+                "SELECT artist_name, artist_id FROM track_credits WHERE track_id = ?1 ORDER BY position",
+                &[&piste.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap();
+        assert_eq!(lus.len(), 2);
+        assert_eq!(lus[0][1].as_i64(), brahem.id, "la fiche existante est liée");
+        assert!(
+            lus[1][1].as_i64().is_none(),
+            "le nom inconnu reste sans lien"
+        );
+        assert!(
+            artistes
+                .get_by_name("Musicien De Session")
+                .unwrap()
+                .is_none(),
+            "aucune fiche n'est créée par un crédit"
+        );
+    }
 
     /// TÉMOIN ANTI-RÉGRESSION : sans `only_missing`, la sélection est celle
     /// d'avant, au caractère près — aucune piste ne disparaît de la passe.
