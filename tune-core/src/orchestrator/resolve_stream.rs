@@ -764,7 +764,7 @@ impl PlaybackOrchestrator {
         // ⚠️ Ce bras ne chargeait que l'ÉGALISEUR (#2863) : le convolveur de
         // correction de pièce et le ReplayGain y étaient perdus, exactement
         // comme sur les bras non-DASH. `StreamingDsp` porte les trois.
-        let mut dash_dsp = self.load_streaming_dsp(
+        let dash_dsp = self.load_streaming_dsp(
             req.zone_id,
             req.track_id,
             stream_data.quality.sample_rate,
