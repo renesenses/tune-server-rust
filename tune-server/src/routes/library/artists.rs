@@ -22,6 +22,104 @@ pub(super) struct ImageReportBody {
     reason: Option<String>,
 }
 
+// ── BIB-C1, phase 0 — artistes homographes, en LECTURE SEULE ────────────────
+
+/// Ce que le rapprochement lit d'une fiche artiste.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArtisteVue {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) musicbrainz_id: Option<String>,
+    pub(crate) albums: i64,
+}
+
+/// BIB-C1, phase 0 : les groupes de fiches artistes qui portent la MÊME clé
+/// de rapprochement (`cle_artiste`, BIB-C2 : accents, casse, « The »,
+/// ponctuation, « & ») — les treize paires mesurées sur .18 le 30/08. Depuis
+/// C2 les nouvelles écritures retombent sur la fiche existante ; ce rapport
+/// nomme celles qui se sont créées AVANT, pour la table d'alias (C1) et
+/// l'écran de fusion (C3). Rien n'est fusionné : les homonymes existent, et
+/// deux fiches aux MBID différents sont peut-être deux artistes — le rapport
+/// le dit (`mbid_distincts`). Le plus ancien d'abord dans chaque groupe.
+pub(crate) fn grouper_les_artistes_homographes(artistes: &[ArtisteVue]) -> Vec<Value> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut par_cle: BTreeMap<String, Vec<&ArtisteVue>> = BTreeMap::new();
+    for a in artistes {
+        let cle = tune_core::db::artist_repo::cle_artiste(&a.name);
+        if cle.is_empty() {
+            continue;
+        }
+        par_cle.entry(cle).or_default().push(a);
+    }
+    let mut groupes: Vec<Value> = par_cle
+        .into_iter()
+        .filter(|(_, v)| v.len() >= 2)
+        .map(|(cle, mut v)| {
+            v.sort_by_key(|a| a.id);
+            let mbids: BTreeSet<&str> = v
+                .iter()
+                .filter_map(|a| a.musicbrainz_id.as_deref())
+                .filter(|m| !m.trim().is_empty())
+                .collect();
+            json!({
+                "cle": cle,
+                "mbid_distincts": mbids.len() > 1,
+                "albums": v.iter().map(|a| a.albums).sum::<i64>(),
+                "artistes": v.iter().map(|a| json!({
+                    "id": a.id,
+                    "name": a.name,
+                    "musicbrainz_id": a.musicbrainz_id,
+                    "albums": a.albums,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    // Les plus sûrs d'abord (MBID non contradictoires), puis les plus fournis.
+    groupes.sort_by(|x, y| {
+        let sx = (
+            !x["mbid_distincts"].as_bool().unwrap_or(false),
+            x["albums"].as_i64().unwrap_or(0),
+        );
+        let sy = (
+            !y["mbid_distincts"].as_bool().unwrap_or(false),
+            y["albums"].as_i64().unwrap_or(0),
+        );
+        sy.cmp(&sx)
+    });
+    groupes
+}
+
+/// `GET /library/artists/doublons` — les artistes homographes (BIB-C1, phase 0).
+pub(super) async fn artists_doublons(State(state): State<AppState>) -> Json<Value> {
+    use tune_http_types::panne_sql::OuDefautJournalise;
+    let sql = "SELECT a.id, a.name, a.musicbrainz_id, \
+               (SELECT COUNT(*) FROM albums al WHERE al.artist_id = a.id) AS albums \
+               FROM artists a ORDER BY a.id";
+    let artistes: Vec<ArtisteVue> = state
+        .backend
+        .query_many(sql, &[])
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|r| {
+            Some(ArtisteVue {
+                id: r.first().and_then(|v| v.as_i64())?,
+                name: r.get(1).and_then(|v| v.as_string())?,
+                musicbrainz_id: r
+                    .get(2)
+                    .and_then(|v| v.as_string())
+                    .filter(|m| !m.trim().is_empty()),
+                albums: r.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect();
+    let groupes = grouper_les_artistes_homographes(&artistes);
+    Json(json!({
+        "count": groupes.len(),
+        "artistes_concernes": groupes.iter().map(|g| g["artistes"].as_array().map(|a| a.len()).unwrap_or(0)).sum::<usize>(),
+        "groups": groupes,
+    }))
+}
+
 pub(super) async fn list_artists(
     State(state): State<AppState>,
     Query(p): Query<Pagination>,
@@ -913,5 +1011,57 @@ mod tests_image_artiste_televersee {
         assert_eq!(corps["size"], octets.len());
         assert_eq!(corps["hash"], corps["image_path"]);
         assert_eq!(corps["name"], "Jermaine Jackson");
+    }
+}
+
+#[cfg(test)]
+mod tests_artistes_homographes {
+    use super::{ArtisteVue, grouper_les_artistes_homographes};
+
+    fn a(id: i64, name: &str, mbid: Option<&str>, albums: i64) -> ArtisteVue {
+        ArtisteVue {
+            id,
+            name: name.into(),
+            musicbrainz_id: mbid.map(str::to_string),
+            albums,
+        }
+    }
+
+    /// BIB-C1 : les paires mesurées sur .18 tombent dans le même groupe, le
+    /// plus ancien d'abord ; deux MBID différents sont signalés ; un artiste
+    /// seul n'apparaît pas ; les groupes sûrs et fournis viennent en premier.
+    #[test]
+    fn les_homographes_sont_groupes_et_les_mbid_contradictoires_signales() {
+        let artistes = vec![
+            a(12, "Étienne Daho", Some("mb-daho"), 6),
+            a(3, "Etienne Daho", None, 1),
+            a(40, "The Rolling Stones", Some("mb-stones"), 9),
+            a(41, "Rolling Stones", Some("mb-autre"), 1),
+            a(50, "J.J. Cale", None, 2),
+            a(51, "JJ Cale", None, 1),
+            a(60, "Anouar Brahem", Some("mb-brahem"), 4),
+            a(70, "", None, 0),
+        ];
+        let g = grouper_les_artistes_homographes(&artistes);
+        assert_eq!(g.len(), 3, "{g:#?}");
+        // sûrs et fournis d'abord : Daho (7 albums, MBID non contradictoires), Cale (3), puis Stones (MBID contradictoires)
+        assert_eq!(g[0]["cle"], "etienne daho");
+        assert_eq!(g[0]["artistes"][0]["id"], 3, "le plus ancien d'abord");
+        assert_eq!(g[0]["artistes"][1]["id"], 12);
+        assert_eq!(g[0]["mbid_distincts"], false);
+        assert_eq!(g[1]["cle"], "jj cale");
+        assert_eq!(g[2]["cle"], "rolling stones");
+        assert_eq!(g[2]["mbid_distincts"], true);
+        let ids: Vec<i64> = g
+            .iter()
+            .flat_map(|x| {
+                x["artistes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|y| y["id"].as_i64().unwrap())
+            })
+            .collect();
+        assert!(!ids.contains(&60) && !ids.contains(&70));
     }
 }
