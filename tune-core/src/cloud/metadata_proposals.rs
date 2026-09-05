@@ -394,7 +394,7 @@ mod tests {
         rate_limit::defer_from_headers(&settings, CloudScope::MetadataProposalsRead, &headers)
             .expect("un Retry-After pose une echeance");
 
-        let client = reqwest::Client::builder()
+        let client = crate::http::client::builder()
             .timeout(std::time::Duration::from_millis(200))
             .build()
             .unwrap();
