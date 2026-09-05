@@ -863,10 +863,19 @@ jobs:
             echo "::warning::moins de 15 Gi libres avant hdiutil — la creation du DMG risque d'echouer"
             df -h /
           fi
+          # v0.9.136 : deux echecs identiques « No space left on device » — non pas
+          # sur le disque du runner (104 Gi libres) mais DANS l'image temporaire
+          # que `hdiutil create -srcfolder` dimensionne lui-meme, trop juste pour
+          # le .app (`could not access /Volumes/Tune Server/…/tune-server`).
+          # On lui donne la taille : le contenu mesure, plus moitie, plus 64 Mo.
+          # UDZO recomprime ensuite, la taille finale du .dmg ne change pas.
+          taille_ko=$(du -sk "$DMG_DIR" | awk '{print $1}')
+          taille_mo=$(( taille_ko / 1024 * 3 / 2 + 64 ))
+          echo "Contenu du DMG : $(( taille_ko / 1024 )) Mo — image temporaire de ${taille_mo} Mo"
           dmg_cree=""
           for i in 1 2 3; do
             sleep 10
-            if hdiutil create -volname "Tune Server" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG_NAME"; then
+            if hdiutil create -volname "Tune Server" -srcfolder "$DMG_DIR" -size "${taille_mo}m" -ov -format UDZO "$DMG_NAME"; then
               dmg_cree="oui"
               break
             fi
