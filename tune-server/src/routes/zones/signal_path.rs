@@ -426,54 +426,15 @@ pub(super) fn build_signal_path(
         .then(|| ps.output_signal_path.as_ref())
         .flatten();
 
-    // Determine if DSP is active.
-    //
-    // Deux sources, et il faut les DEUX : la colonne dsp_preset_id/dsp_enabled
-    // de la zone, et le profil d'égaliseur `zone_{id}_eq_profile`. C'est ce
-    // dernier qu'écrit le panneau EQ de « Lecture en cours » et que lit le
-    // chemin audio (`Orchestrator::zone_has_active_eq`) — l'indicateur ne le
-    // consultait pas.
-    //
-    // Conséquence : Tune pouvait afficher « Bit-Perfect » alors qu'un
-    // égaliseur modifiait réellement le signal. Pour un logiciel dont c'est
-    // l'argument central, promettre une pureté qu'on ne tient pas est le pire
-    // des deux sens possibles de l'erreur (signalement Bilou).
-    let zid = zone.id.unwrap_or(0);
-    let configured_dsp_enabled = ZoneRepo::with_backend(backend.clone())
-        .get_dsp_config(zid)
-        .map(|(preset_id, enabled)| enabled && preset_id.is_some())
-        .unwrap_or(false)
-        || zone_eq_alters_signal(&backend, zid);
-    let dsp_enabled = runtime_signal_path
-        .map(|status| status.dsp == OutputDspState::Applied)
-        .unwrap_or(configured_dsp_enabled);
-    let eq_step_description = zone_eq_step_description(&backend, zid);
-
-    // ReplayGain effectivement appliqué à la piste en cours (#1627) : même
-    // traitement que l'EQ — une étape dans le chemin, et le verdict bit-perfect
-    // en tient compte. `None` en PURE, en mode off, ou sans gain stocké.
-    let replaygain_step = zone_replaygain_step(&backend, zid, np.track_id);
-
-    // Sortie mono (#2362) : sortie locale seulement, jamais en PURE. C'est une
-    // vraie transformation — elle réécrit chaque échantillon — donc elle porte
-    // une étape et fait tomber le verdict bit-perfect, comme le ReplayGain.
-    let mono_downmix_step = zone_mono_downmix_step(&backend, zid, output_type);
-
-    // Volume at 100% means no software volume adjustment.
-    // Fixed-volume zones always output at full volume (bit-perfect).
-    //
-    // La valeur affichée est `zone.volume` (la base), PAS `ps.volume` : c'est
-    // elle que la page expose comme curseur (GET /zones/{id}). `ps.volume` est
-    // une copie mémoire qui ment dans deux cas : jamais initialisée depuis la
-    // base au démarrage (0,5 par défaut pour une zone locale/navigateur —
-    // seules les zones réseau sont resemées à la découverte), et modifiée par
-    // les régleurs internes (alarmes, minuterie de sommeil, IA) qui n'écrivaient
-    // pas la base. Résultat : le panneau bit-perfect affichait « Volume 20 % »
-    // face à un curseur ailleurs, jusqu'à ce qu'on touche le volume — le PUT
-    // réécrit alors les deux sources (#1504 Jean Valjean, même symptôme
-    // Bebelalu55 #1480). Une seule source pour les deux affichages.
-    let ui_volume = (zone.volume / 100.0).clamp(0.0, 1.0);
-    let volume_full = zone.fixed_volume || ui_volume >= 1.0 || ui_volume <= 0.0; // 0.0 means no software vol set
+    let Traitements {
+        configured_dsp_enabled,
+        dsp_enabled,
+        eq_step_description,
+        replaygain_step,
+        mono_downmix_step,
+        ui_volume,
+        volume_full,
+    } = relever_les_traitements(backend, zone, np, output_type, runtime_signal_path);
 
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
     // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
@@ -1048,6 +1009,86 @@ pub(super) fn build_signal_path(
         "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
         "dsp_metrics": dsp_metrics,
     }))
+}
+
+/// Ce que la zone fait subir au signal : égaliseur, ReplayGain, repli mono,
+/// volume logiciel. Deuxième bloc de `build_signal_path`, sorti tel quel
+/// (REF-4 phase 2, #2219) ; les champs sont les `let` que la suite relit.
+struct Traitements {
+    configured_dsp_enabled: bool,
+    dsp_enabled: bool,
+    eq_step_description: Option<String>,
+    replaygain_step: Option<ReplayGainStep>,
+    mono_downmix_step: Option<String>,
+    ui_volume: f64,
+    volume_full: bool,
+}
+
+/// Relève les traitements armés sur la zone, la sonde locale primant sur les réglages.
+fn relever_les_traitements(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone: &Zone,
+    np: &tune_core::playback::NowPlaying,
+    output_type: &str,
+    runtime_signal_path: Option<&OutputSignalPathStatus>,
+) -> Traitements {
+    // Determine if DSP is active.
+    //
+    // Deux sources, et il faut les DEUX : la colonne dsp_preset_id/dsp_enabled
+    // de la zone, et le profil d'égaliseur `zone_{id}_eq_profile`. C'est ce
+    // dernier qu'écrit le panneau EQ de « Lecture en cours » et que lit le
+    // chemin audio (`Orchestrator::zone_has_active_eq`) — l'indicateur ne le
+    // consultait pas.
+    //
+    // Conséquence : Tune pouvait afficher « Bit-Perfect » alors qu'un
+    // égaliseur modifiait réellement le signal. Pour un logiciel dont c'est
+    // l'argument central, promettre une pureté qu'on ne tient pas est le pire
+    // des deux sens possibles de l'erreur (signalement Bilou).
+    let zid = zone.id.unwrap_or(0);
+    let configured_dsp_enabled = ZoneRepo::with_backend(backend.clone())
+        .get_dsp_config(zid)
+        .map(|(preset_id, enabled)| enabled && preset_id.is_some())
+        .unwrap_or(false)
+        || zone_eq_alters_signal(&backend, zid);
+    let dsp_enabled = runtime_signal_path
+        .map(|status| status.dsp == OutputDspState::Applied)
+        .unwrap_or(configured_dsp_enabled);
+    let eq_step_description = zone_eq_step_description(&backend, zid);
+
+    // ReplayGain effectivement appliqué à la piste en cours (#1627) : même
+    // traitement que l'EQ — une étape dans le chemin, et le verdict bit-perfect
+    // en tient compte. `None` en PURE, en mode off, ou sans gain stocké.
+    let replaygain_step = zone_replaygain_step(&backend, zid, np.track_id);
+
+    // Sortie mono (#2362) : sortie locale seulement, jamais en PURE. C'est une
+    // vraie transformation — elle réécrit chaque échantillon — donc elle porte
+    // une étape et fait tomber le verdict bit-perfect, comme le ReplayGain.
+    let mono_downmix_step = zone_mono_downmix_step(&backend, zid, output_type);
+
+    // Volume at 100% means no software volume adjustment.
+    // Fixed-volume zones always output at full volume (bit-perfect).
+    //
+    // La valeur affichée est `zone.volume` (la base), PAS `ps.volume` : c'est
+    // elle que la page expose comme curseur (GET /zones/{id}). `ps.volume` est
+    // une copie mémoire qui ment dans deux cas : jamais initialisée depuis la
+    // base au démarrage (0,5 par défaut pour une zone locale/navigateur —
+    // seules les zones réseau sont resemées à la découverte), et modifiée par
+    // les régleurs internes (alarmes, minuterie de sommeil, IA) qui n'écrivaient
+    // pas la base. Résultat : le panneau bit-perfect affichait « Volume 20 % »
+    // face à un curseur ailleurs, jusqu'à ce qu'on touche le volume — le PUT
+    // réécrit alors les deux sources (#1504 Jean Valjean, même symptôme
+    // Bebelalu55 #1480). Une seule source pour les deux affichages.
+    let ui_volume = (zone.volume / 100.0).clamp(0.0, 1.0);
+    let volume_full = zone.fixed_volume || ui_volume >= 1.0 || ui_volume <= 0.0; // 0.0 means no software vol set
+    Traitements {
+        configured_dsp_enabled,
+        dsp_enabled,
+        eq_step_description,
+        replaygain_step,
+        mono_downmix_step,
+        ui_volume,
+        volume_full,
+    }
 }
 
 /// Ce que la source est, avant tout ce que la sortie lui fait : le premier
