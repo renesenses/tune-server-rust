@@ -405,17 +405,7 @@ pub(super) fn build_signal_path(
 
     let np = ps.now_playing.as_ref()?;
 
-    let Source {
-        output_container,
-        wire_sample_rate,
-        wire_bit_depth,
-        source_format,
-        is_dsd,
-        sample_rate,
-        bit_depth,
-        format_name,
-        is_lossless,
-    } = decrire_la_source(np, backend, wire);
+    let source = decrire_la_source(np, backend, wire);
 
     let output_type = zone.output_type.as_deref().unwrap_or("local");
     // Pour une sortie locale qui sait observer son dernier callback, le réel
@@ -426,16 +416,50 @@ pub(super) fn build_signal_path(
         .then(|| ps.output_signal_path.as_ref())
         .flatten();
 
+    let traitements = relever_les_traitements(backend, zone, np, output_type, runtime_signal_path);
+    let forcages = decider_les_forcages(
+        zone,
+        backend,
+        wire,
+        output_type,
+        &source,
+        traitements.dsp_enabled,
+    );
+    let (transport_bit_perfect, transport_desc, output_format_name) = decrire_le_transport(
+        output_type,
+        audio_backend,
+        runtime_signal_path,
+        &source,
+        &forcages,
+    );
+    let verdicts = rendre_les_verdicts(
+        zone,
+        np,
+        &source,
+        transport_bit_perfect,
+        &forcages,
+        &traitements,
+    );
+
+    // L'assemblage des étapes relit tout sous les noms d'origine.
+    let Source {
+        wire_sample_rate,
+        wire_bit_depth,
+        is_dsd,
+        sample_rate,
+        bit_depth,
+        format_name,
+        is_lossless,
+        ..
+    } = source;
     let Traitements {
-        configured_dsp_enabled,
-        dsp_enabled,
         eq_step_description,
         replaygain_step,
         mono_downmix_step,
         ui_volume,
         volume_full,
-    } = relever_les_traitements(backend, zone, np, output_type, runtime_signal_path);
-
+        ..
+    } = traitements;
     let Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
@@ -446,50 +470,12 @@ pub(super) fn build_signal_path(
         is_oaat,
         oaat_transcodes,
         wire_wav,
-    } = decider_les_forcages(
-        zone,
-        backend,
-        wire,
-        output_type,
-        output_container,
-        source_format,
-        is_dsd,
-        bit_depth,
-        dsp_enabled,
-    );
-
-    let (transport_bit_perfect, transport_desc, output_format_name) = decrire_le_transport(
-        output_type,
-        audio_backend,
-        runtime_signal_path,
-        source_format,
-        format_name,
-        is_lossless,
-        is_dsd,
-        bit_depth,
-        wire_wav,
-        dlna_lpcm,
-        dlna_wav24,
-        dlna_cap_16bit,
-        needs_transcode_for_output,
-        oaat_transcodes,
-    );
-
+    } = forcages;
     let Verdicts {
         resampling_active,
         bit_perfect,
         bitrate_label,
-    } = rendre_les_verdicts(
-        zone,
-        np,
-        is_dsd,
-        sample_rate,
-        is_lossless,
-        transport_bit_perfect,
-        dsp_applique,
-        replaygain_step.as_ref(),
-        mono_downmix_step.as_deref(),
-    );
+    } = verdicts;
 
     // Build steps
     let source_desc = if is_dsd {
@@ -763,18 +749,23 @@ struct Verdicts {
 }
 
 /// Rend les verdicts à partir de la source, du transport et des traitements.
-#[allow(clippy::too_many_arguments)]
 fn rendre_les_verdicts(
     zone: &Zone,
     np: &tune_core::playback::NowPlaying,
-    is_dsd: bool,
-    sample_rate: i32,
-    is_lossless: bool,
+    source: &Source,
     transport_bit_perfect: bool,
-    dsp_applique: bool,
-    replaygain_step: Option<&ReplayGainStep>,
-    mono_downmix_step: Option<&str>,
+    forcages: &Forcages,
+    traitements: &Traitements,
 ) -> Verdicts {
+    let Source {
+        is_dsd,
+        sample_rate,
+        is_lossless,
+        ..
+    } = *source;
+    let dsp_applique = forcages.dsp_applique;
+    let replaygain_step = traitements.replaygain_step.as_ref();
+    let mono_downmix_step = traitements.mono_downmix_step.as_deref();
     // Detect sample rate capping (DSD excluded — the DSD→PCM transcode
     // already handles rate conversion; showing a separate resampler step
     // would be misleading since sample_rate here is the DSD MHz rate).
@@ -831,23 +822,30 @@ fn rendre_les_verdicts(
 /// Le transport par type de sortie : bit-perfect ou non, son libellé, le
 /// format réellement émis. Quatrième bloc de `build_signal_path`, le `match`
 /// sorti tel quel (REF-4 phase 2, #2219). Rend le triplet que l'hôte liait.
-#[allow(clippy::too_many_arguments)]
 fn decrire_le_transport<'a>(
     output_type: &'a str,
     audio_backend: &'a str,
     runtime_signal_path: Option<&OutputSignalPathStatus>,
-    source_format: Option<AudioFormat>,
-    format_name: &'static str,
-    is_lossless: bool,
-    is_dsd: bool,
-    bit_depth: i32,
-    wire_wav: bool,
-    dlna_lpcm: bool,
-    dlna_wav24: bool,
-    dlna_cap_16bit: bool,
-    needs_transcode_for_output: bool,
-    oaat_transcodes: bool,
+    source: &Source,
+    forcages: &Forcages,
 ) -> (bool, &'a str, &'static str) {
+    let Source {
+        source_format,
+        format_name,
+        is_lossless,
+        is_dsd,
+        bit_depth,
+        ..
+    } = *source;
+    let Forcages {
+        wire_wav,
+        dlna_lpcm,
+        dlna_wav24,
+        dlna_cap_16bit,
+        needs_transcode_for_output,
+        oaat_transcodes,
+        ..
+    } = *forcages;
     match output_type {
         "dlna" | "openhome" => {
             if wire_wav || dlna_lpcm || dlna_wav24 {
@@ -991,6 +989,7 @@ fn decrire_le_transport<'a>(
 /// passthrough ALAC/AAC/DSD, transcodage requis, cas OAAT et fil WAV.
 /// Troisième bloc de `build_signal_path`, sorti tel quel (REF-4 phase 2,
 /// #2219) ; les champs sont les `let` que la suite relit.
+#[derive(Clone, Copy)]
 struct Forcages {
     dsp_applique: bool,
     dsp_contourne_par_le_dsd: bool,
@@ -1004,18 +1003,21 @@ struct Forcages {
 }
 
 /// Décide les forçages de sortie, en miroir des conditions de l'orchestrateur.
-#[allow(clippy::too_many_arguments)]
 fn decider_les_forcages(
     zone: &Zone,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     wire: Option<&StreamInfo>,
     output_type: &str,
-    output_container: Option<&str>,
-    source_format: Option<AudioFormat>,
-    is_dsd: bool,
-    bit_depth: i32,
+    source: &Source,
     dsp_enabled: bool,
 ) -> Forcages {
+    let Source {
+        output_container,
+        source_format,
+        is_dsd,
+        bit_depth,
+        ..
+    } = *source;
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
     // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
     //
@@ -1239,6 +1241,7 @@ fn relever_les_traitements(
 /// Ce que la source est, avant tout ce que la sortie lui fait : le premier
 /// bloc de `build_signal_path`, sorti tel quel (REF-4 phase 2, #2219). Les
 /// champs sont les `let` que la suite de la fonction relit, sous leur nom.
+#[derive(Clone, Copy)]
 struct Source<'w> {
     /// Conteneur réellement servi (None hors session : sortie locale, démarrage).
     output_container: Option<&'w str>,
