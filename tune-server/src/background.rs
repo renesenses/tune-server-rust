@@ -986,6 +986,11 @@ struct HeartbeatPlan {
     send_heartbeat: bool,
     /// Rafraichir les droits premium du compte SSO (`GET /api/v1/user`).
     refresh_account: bool,
+    /// La clé de licence se revalide par `POST /api/v1/license/validate`,
+    /// une charge à trois champs sans rien de descriptif — donc même quand
+    /// la télémétrie est refusée. Sans cela, un Premium à CLÉ en opt-out
+    /// retombait en Free au bout de la grâce de 14 jours (LIC-1).
+    revalidate_key: bool,
 }
 
 /// Decide ce que fait le tour de battement en fonction de l'opt-out telemetrie.
@@ -1005,6 +1010,7 @@ fn heartbeat_plan(telemetry_enabled: bool) -> HeartbeatPlan {
     HeartbeatPlan {
         send_heartbeat: telemetry_enabled,
         refresh_account: true,
+        revalidate_key: true,
     }
 }
 
@@ -1117,9 +1123,19 @@ fn spawn_heartbeat(state: &AppState) {
                 if plan.refresh_account {
                     refresh_account_premium(&backend, &license, &services).await;
                 }
-                suivi.rien_a_faire(Some(
-                    "telemetrie desactivee — marqueur local seulement, rien n'est parti",
-                ));
+                // La clé, elle, se revalide quand même : trois champs, rien de
+                // descriptif (LIC-1). `None` quand aucune clé n'est enregistrée.
+                let revalidation = if plan.revalidate_key {
+                    revalider_la_cle(&client, &settings, &license, &event_bus, &server_id).await
+                } else {
+                    None
+                };
+                match revalidation {
+                    Some((verdict, detail)) => suivi.terminer(verdict, None, Some(&detail)),
+                    None => suivi.rien_a_faire(Some(
+                        "telemetrie desactivee — marqueur local seulement, rien n'est parti",
+                    )),
+                }
                 tokio::time::sleep(HEARTBEAT_INTERVAL).await;
                 continue;
             }
@@ -1486,6 +1502,134 @@ fn spawn_heartbeat(state: &AppState) {
 /// (SSO). No-op if not connected (no access token). On an expired access token,
 /// tries the refresh_token grant once and retries. On any network failure the
 /// cached state is kept (the offline grace in `LicenseManager` covers it).
+/// La charge d'une revalidation de clé, et rien d'autre : la clé, l'empreinte
+/// matérielle et l'identifiant de serveur que la route attend. Aucune version,
+/// aucun nom d'hôte, aucun compte de pistes — c'est ce qui la distingue du
+/// battement, et ce qui autorise à l'envoyer quand la télémétrie est refusée.
+fn charge_de_revalidation(
+    license_key: &str,
+    hardware_fingerprint: &str,
+    server_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "license_key": license_key,
+        "hardware_fingerprint": hardware_fingerprint,
+        "server_id": server_id,
+    })
+}
+
+/// Revalide la clé de licence sans battement, par
+/// `POST /api/v1/license/validate` (la route que le bouton « Valider » du
+/// panneau appelle déjà). Même lecture de la réponse que le battement : une
+/// clé refusée hors expiration garde son palier dans la grâce, une expiration
+/// autoritaire dégrade, une confirmation restampe `license_last_validated`.
+///
+/// `None` quand aucune clé n'est enregistrée (rien à revalider) ; sinon le
+/// verdict et son motif pour le registre des tâches.
+async fn revalider_la_cle(
+    client: &reqwest::Client,
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    license: &Arc<tune_core::license::LicenseManager>,
+    event_bus: &Arc<tune_core::event_bus::EventBus>,
+    server_id: &str,
+) -> Option<(tune_core::db::task_run_repo::Verdict, String)> {
+    use tune_core::db::task_run_repo::Verdict;
+
+    let ls = license.license_state().await;
+    let key = ls.license_key.clone()?;
+
+    if let Some(backoff) = tune_core::cloud::rate_limit::active(
+        settings,
+        tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
+    ) {
+        debug!(
+            scope = backoff.scope,
+            until_epoch = backoff.until_epoch,
+            "license_revalidation_deferred_rate_limit"
+        );
+        return Some((
+            Verdict::Echec,
+            "revalidation differee (429 en cours)".into(),
+        ));
+    }
+
+    let payload = charge_de_revalidation(&key, &ls.hardware_fingerprint, server_id);
+    let resp = client
+        .post(crate::routes::cloud::license_validate_url(settings))
+        .header("Accept", "application/json")
+        .json(&payload)
+        .send()
+        .await;
+
+    match resp {
+        Ok(resp) if resp.status().is_success() => {
+            let Ok(body) = resp.json::<serde_json::Value>().await else {
+                return Some((Verdict::Echec, "reponse illisible".into()));
+            };
+            let valid = body
+                .get("license_valid")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let expired_authoritatively = body
+                .get("license_expires_at")
+                .and_then(|v| v.as_str())
+                .map(tune_core::license::is_timestamp_past)
+                .unwrap_or(false);
+            if !valid && !expired_authoritatively {
+                warn!("license_key_rejected_by_server (keeping cached tier within grace)");
+                return Some((
+                    Verdict::Echec,
+                    "cle refusee, palier conserve dans la grace".into(),
+                ));
+            }
+            if !valid {
+                info!(expired_authoritatively, "license_invalidated_by_server");
+                license
+                    .update_from_server(tune_core::license::Tier::Free, None)
+                    .await;
+                event_bus.emit(
+                    "license.updated",
+                    serde_json::json!({ "tier": "free", "expires_at": null }),
+                );
+                return Some((Verdict::Succes, "licence expiree, palier gratuit".into()));
+            }
+            let tier = match body.get("license_tier").and_then(|v| v.as_str()) {
+                Some("premium") => tune_core::license::Tier::Premium,
+                _ => tune_core::license::Tier::Free,
+            };
+            let expires_at = body
+                .get("license_expires_at")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            license.update_from_server(tier, expires_at.clone()).await;
+            info!(tier = %tier, "license_revalidated_without_heartbeat");
+            event_bus.emit(
+                "license.updated",
+                serde_json::json!({ "tier": tier, "expires_at": expires_at }),
+            );
+            Some((Verdict::Succes, format!("cle revalidee, palier {tier}")))
+        }
+        Ok(resp) => {
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                tune_core::cloud::rate_limit::defer_from_headers(
+                    settings,
+                    tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
+                    resp.headers(),
+                );
+            }
+            debug!(status = %resp.status(), "license_revalidation_rejected");
+            Some((
+                Verdict::Echec,
+                format!("refuse ({})", resp.status().as_u16()),
+            ))
+        }
+        Err(e) => {
+            debug!(error = %e, "license_revalidation_failed");
+            Some((Verdict::Echec, "hote injoignable".into()))
+        }
+    }
+}
+
 async fn refresh_account_premium(
     backend: &Arc<dyn tune_core::db::backend::DbBackend>,
     license: &Arc<tune_core::license::LicenseManager>,
@@ -2316,6 +2460,55 @@ mod heartbeat_cadence_et_optout_tests {
         assert!(
             heartbeat_plan(false).refresh_account,
             "couper la telemetrie ne doit jamais degrader un compte premium"
+        );
+    }
+
+    /// LIC-1 : l'opt-out coupe le battement DESCRIPTIF, pas la revalidation de
+    /// la clé. Sans elle, `license_last_validated` n'est plus jamais restampé
+    /// et `LicenseManager::load` dégrade un Premium à clé en Free à J+14.
+    #[test]
+    fn la_cle_se_revalide_meme_telemetrie_eteinte() {
+        assert!(
+            heartbeat_plan(false).revalidate_key,
+            "refuser la telemetrie ne doit pas faire perdre une licence a cle"
+        );
+    }
+
+    /// Ce qui autorise cet envoi en opt-out : la charge ne porte que la clé,
+    /// l'empreinte et l'identifiant de serveur — rien de descriptif.
+    #[test]
+    fn la_revalidation_ne_porte_que_trois_champs() {
+        let charge = super::charge_de_revalidation("TUNE-TEST", "empreinte", "srv");
+        let objet = charge.as_object().expect("un objet JSON");
+        let mut clefs: Vec<&str> = objet.keys().map(String::as_str).collect();
+        clefs.sort_unstable();
+        assert_eq!(
+            clefs,
+            ["hardware_fingerprint", "license_key", "server_id"],
+            "la revalidation ne doit rien porter de descriptif (version, hote, pistes…)"
+        );
+    }
+
+    /// La branche opt-out du battement appelle bien la revalidation, entre le
+    /// rafraîchissement du compte et le `continue`. Lu dans le code de
+    /// production seul : ce module cite le nom dans ses commentaires.
+    #[test]
+    fn la_branche_optout_revalide_la_cle() {
+        let source = include_str!("background.rs");
+        let production = source
+            .split(&format!("#[cfg({})]", "test"))
+            .next()
+            .expect("source vide");
+        let debut = production
+            .find("if !plan.send_heartbeat {")
+            .expect("branche opt-out introuvable");
+        let branche = &production[debut..];
+        let fin = branche
+            .find("continue;")
+            .expect("fin de la branche opt-out");
+        assert!(
+            branche[..fin].contains(&format!("revalider_la_cle{}", "(")),
+            "la branche opt-out du battement doit revalider la cle (LIC-1)"
         );
     }
 
