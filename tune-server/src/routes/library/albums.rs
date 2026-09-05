@@ -968,6 +968,165 @@ pub(super) async fn albums_grouped(State(state): State<AppState>) -> Result<Json
     })))
 }
 
+// ── BIB-A2, phase 0 — albums éclatés présumés, en LECTURE SEULE ─────────────
+
+/// Une piste vue par le rapprochement : de quel album elle est, où elle est.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PisteVue {
+    pub(crate) album_id: i64,
+    pub(crate) album_title: String,
+    pub(crate) artist_name: String,
+    pub(crate) year: Option<i64>,
+    pub(crate) file_path: String,
+    pub(crate) track_number: i64,
+}
+
+/// Le dossier d'un chemin, séparateurs `/` et `\` confondus (bibliothèques
+/// Windows et SMB), sans le nom de fichier.
+pub(crate) fn dossier_de(chemin: &str) -> &str {
+    match chemin.rfind(['/', '\\']) {
+        Some(i) => &chemin[..i],
+        None => "",
+    }
+}
+
+/// Le titre d'album réduit à ce qui se compare : accents pliés, minuscules,
+/// ponctuation en espaces, espaces réduits. Deux albums éclatés portent
+/// presque toujours le MÊME titre, à la casse ou à un point près.
+pub(crate) fn cle_titre(titre: &str) -> String {
+    let plat = tune_core::db::engine::fold_diacritics(titre).to_lowercase();
+    let mut cle = String::with_capacity(plat.len());
+    let mut espace = false;
+    for c in plat.chars() {
+        if c.is_alphanumeric() {
+            if espace && !cle.is_empty() {
+                cle.push(' ');
+            }
+            espace = false;
+            cle.push(c);
+        } else {
+            espace = true;
+        }
+    }
+    cle
+}
+
+/// BIB-A2, phase 0 : les groupes d'albums qui sont PROBABLEMENT un seul album
+/// éclaté. Le faisceau (mesure du 30/08 sur .18 : 93 % des éclatements
+/// viennent de l'enregistreur, qui écrit sous l'artiste de la PISTE) :
+/// même dossier ET même titre normalisé, sur au moins deux albums. Chaque
+/// groupe dit ensuite si les numéros de piste sont complémentaires (aucun
+/// numéro commun : la signature d'un album coupé en deux) et si les années
+/// concordent. Rien n'est fusionné : le rapport nomme, le regroupement
+/// viendra avec sa contre-épreuve.
+pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // (dossier, clé de titre) → album_id → fiche (titre, artiste, année, numéros)
+    type Fiche = (String, String, Option<i64>, BTreeSet<i64>);
+    type Faisceaux = BTreeMap<(String, String), BTreeMap<i64, Fiche>>;
+    let mut faisceaux: Faisceaux = BTreeMap::new();
+    for p in pistes {
+        let dossier = dossier_de(&p.file_path);
+        if dossier.is_empty() {
+            continue;
+        }
+        let cle = cle_titre(&p.album_title);
+        if cle.is_empty() {
+            continue;
+        }
+        let entree = faisceaux
+            .entry((dossier.to_string(), cle))
+            .or_default()
+            .entry(p.album_id)
+            .or_insert_with(|| {
+                (
+                    p.album_title.clone(),
+                    p.artist_name.clone(),
+                    p.year,
+                    BTreeSet::new(),
+                )
+            });
+        entree.3.insert(p.track_number);
+    }
+    let mut groupes = Vec::new();
+    for ((dossier, cle), albums) in &faisceaux {
+        if albums.len() < 2 {
+            continue;
+        }
+        let mut vus: BTreeSet<i64> = BTreeSet::new();
+        let mut complementaires = true;
+        for (_, _, _, numeros) in albums.values() {
+            if numeros.iter().any(|n| *n > 0 && !vus.insert(*n)) {
+                complementaires = false;
+            }
+        }
+        let annees: BTreeSet<Option<i64>> = albums.values().map(|a| a.2).collect();
+        let total: usize = albums.values().map(|a| a.3.len()).sum();
+        groupes.push(json!({
+            "dossier": dossier,
+            "titre_normalise": cle,
+            "numeros_complementaires": complementaires,
+            "meme_annee": annees.len() == 1,
+            "pistes": total,
+            "albums": albums.iter().map(|(id, (titre, artiste, annee, numeros))| json!({
+                "id": id,
+                "title": titre,
+                "artist": artiste,
+                "year": annee,
+                "track_count": numeros.len(),
+                "track_numbers": numeros,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    // Les plus sûrs d'abord : complémentaires et de même année, puis les plus gros.
+    groupes.sort_by(|a, b| {
+        let sa = (
+            a["numeros_complementaires"].as_bool().unwrap_or(false),
+            a["meme_annee"].as_bool().unwrap_or(false),
+            a["pistes"].as_u64().unwrap_or(0),
+        );
+        let sb = (
+            b["numeros_complementaires"].as_bool().unwrap_or(false),
+            b["meme_annee"].as_bool().unwrap_or(false),
+            b["pistes"].as_u64().unwrap_or(0),
+        );
+        sb.cmp(&sa)
+    });
+    groupes
+}
+
+/// `GET /library/albums/eclates` — les albums éclatés présumés (BIB-A2, phase 0).
+/// Lecture seule ; la bibliothèque entière est lue une fois (une requête).
+pub(super) async fn albums_eclates(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let sql = "SELECT t.album_id, al.title, ar.name, al.year, t.file_path, t.track_number \
+               FROM tracks t \
+               JOIN albums al ON al.id = t.album_id \
+               LEFT JOIN artists ar ON ar.id = al.artist_id \
+               WHERE t.file_path IS NOT NULL AND t.file_path <> ''";
+    let pistes: Vec<PisteVue> = state
+        .backend
+        .query_many(sql, &[])
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|r| {
+            Some(PisteVue {
+                album_id: r.first().and_then(|v| v.as_i64())?,
+                album_title: r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                artist_name: r.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                year: r.get(3).and_then(|v| v.as_i64()),
+                file_path: r.get(4).and_then(|v| v.as_string())?,
+                track_number: r.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect();
+    let groupes = grouper_les_albums_eclates(&pistes);
+    Ok(Json(json!({
+        "count": groupes.len(),
+        "albums_concernes": groupes.iter().map(|g| g["albums"].as_array().map(|a| a.len()).unwrap_or(0)).sum::<usize>(),
+        "groups": groupes,
+    })))
+}
+
 /// BIB-B1 — les ÉDITIONS d'un album.
 ///
 /// Les autres albums du MÊME artiste dont le titre est le même à un suffixe
@@ -1587,5 +1746,133 @@ mod tests_editions {
                 .await
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_albums_eclates {
+    use super::{PisteVue, cle_titre, dossier_de, grouper_les_albums_eclates};
+
+    fn piste(
+        album_id: i64,
+        titre: &str,
+        artiste: &str,
+        annee: Option<i64>,
+        chemin: &str,
+        n: i64,
+    ) -> PisteVue {
+        PisteVue {
+            album_id,
+            album_title: titre.into(),
+            artist_name: artiste.into(),
+            year: annee,
+            file_path: chemin.into(),
+            track_number: n,
+        }
+    }
+
+    /// BIB-A2 : le cas de l'enregistreur — un même dossier, un même titre, deux
+    /// albums sous deux artistes, numéros complémentaires → un groupe sûr.
+    /// Deux dossiers différents au même titre → pas un éclatement. Même
+    /// dossier, numéros qui se recouvrent → groupe, mais signalé non
+    /// complémentaire.
+    #[test]
+    fn l_enregistreur_eclate_un_album_et_le_faisceau_le_retrouve() {
+        let pistes = vec![
+            piste(
+                1,
+                "Abbey Road",
+                "The Beatles",
+                Some(1969),
+                "/m/Beatles/Abbey Road/01.flac",
+                1,
+            ),
+            piste(
+                1,
+                "Abbey Road",
+                "The Beatles",
+                Some(1969),
+                "/m/Beatles/Abbey Road/02.flac",
+                2,
+            ),
+            piste(
+                2,
+                "Abbey Road",
+                "The Beatles feat. Billy Preston",
+                Some(1969),
+                "/m/Beatles/Abbey Road/03.flac",
+                3,
+            ),
+            piste(
+                3,
+                "Abbey Road",
+                "Tribute Band",
+                Some(2001),
+                "/m/Tribute/Abbey Road/01.flac",
+                1,
+            ),
+            piste(
+                4,
+                "Kind of Blue",
+                "Miles Davis",
+                Some(1959),
+                "/m/Miles/Kind of Blue/01.flac",
+                1,
+            ),
+            piste(
+                5,
+                "Kind Of Blue.",
+                "Miles Davis Sextet",
+                Some(1997),
+                "/m/Miles/Kind of Blue/01 (bis).flac",
+                1,
+            ),
+        ];
+        let g = grouper_les_albums_eclates(&pistes);
+        assert_eq!(g.len(), 2, "{g:#?}");
+        assert_eq!(g[0]["dossier"], "/m/Beatles/Abbey Road");
+        assert_eq!(g[0]["numeros_complementaires"], true);
+        assert_eq!(g[0]["meme_annee"], true);
+        assert_eq!(g[0]["pistes"], 3);
+        assert_eq!(g[0]["albums"].as_array().unwrap().len(), 2);
+        assert_eq!(g[0]["albums"][0]["id"], 1);
+        assert_eq!(g[0]["albums"][1]["id"], 2);
+        assert_eq!(g[1]["dossier"], "/m/Miles/Kind of Blue");
+        assert_eq!(g[1]["numeros_complementaires"], false);
+        assert_eq!(g[1]["meme_annee"], false);
+        let ids: Vec<i64> = g
+            .iter()
+            .flat_map(|x| {
+                x["albums"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| a["id"].as_i64().unwrap())
+            })
+            .collect();
+        assert!(
+            !ids.contains(&3),
+            "un autre dossier n'est pas un éclatement"
+        );
+    }
+
+    /// Les deux briques : le dossier (séparateurs `/` et `\`), le titre normalisé.
+    #[test]
+    fn le_dossier_et_la_cle_de_titre() {
+        assert_eq!(
+            dossier_de("/m/Beatles/Abbey Road/01.flac"),
+            "/m/Beatles/Abbey Road"
+        );
+        assert_eq!(
+            dossier_de("C:\\Musique\\Abbey Road\\01.flac"),
+            "C:\\Musique\\Abbey Road"
+        );
+        assert_eq!(dossier_de("01.flac"), "");
+        assert_eq!(cle_titre("Kind Of Blue."), "kind of blue");
+        assert_eq!(
+            cle_titre("Été 85 (Bande originale)"),
+            "ete 85 bande originale"
+        );
+        assert_eq!(cle_titre("..."), "");
     }
 }
