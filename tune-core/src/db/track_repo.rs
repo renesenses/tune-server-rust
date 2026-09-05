@@ -1066,6 +1066,15 @@ impl TrackRepo {
             }
         }
 
+        // CRD-6 : l'instrument est un crédit, pas une colonne de `tracks` ;
+        // le prédicat jumeau des facettes vit dans `facet_filter`.
+        if let Some(c) = ph.in_list_ci("tc.instrument", f.instruments.len()) {
+            conditions.push(crate::db::facet_filter::instrument_exists(engine, &c));
+            for v in &f.instruments {
+                owned_params.push(SqlValue::Text(v.clone()));
+            }
+        }
+
         // The artist name lives on the joined `artists` table (tracks stores
         // only artist_id) — `tracks` has no artist_name column, so the old
         // `t.artist_name` predicate raised a SQL error that list_tracks

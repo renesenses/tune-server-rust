@@ -392,6 +392,10 @@ pub struct TrackFilter {
     pub sources: Vec<String>,
     pub labels: Vec<String>,
     pub composers: Vec<String>,
+    /// Instruments joués sur la piste, lus dans `track_credits.instrument`
+    /// (CRD-6). Une facette de jointure : le prédicat vit dans
+    /// [`instrument_exists`], jumeau de `dr_album_in`.
+    pub instruments: Vec<String>,
     pub artists: Vec<String>,
     pub countries: Vec<String>,
     pub moods: Vec<String>,
@@ -426,6 +430,29 @@ pub struct TrackFilter {
     pub q: Option<String>,
 }
 
+/// `track_credits.track_id` s'écrit comme `t.id` selon le moteur : entier en
+/// SQLite, mais `TEXT` sur le miroir PostgreSQL (copie SQLite→PG). Comparer
+/// sans conversion y donne `text = bigint`, que PG refuse — le même écueil que
+/// l'écriture des crédits, liée en chaîne pour cette raison.
+pub fn track_id_pour_track_credits(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Sqlite => "t.id",
+        Engine::Postgres => "CAST(t.id AS TEXT)",
+    }
+}
+
+/// Le prédicat de la facette « instrument » (CRD-6) : la piste porte au moins
+/// un crédit dont l'instrument est dans la sélection. `inner` est la liste
+/// produite par [`Placeholders::in_list_ci`] sur `tc.instrument`, pour que le
+/// compteur de marqueurs reste unique. Le JUMEAU de ce prédicat est appelé
+/// depuis `track_repo::list_filtered` et depuis les facettes du serveur.
+pub fn instrument_exists(engine: Engine, inner: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM track_credits tc WHERE tc.track_id = {} AND {inner})",
+        track_id_pour_track_credits(engine)
+    )
+}
+
 impl TrackFilter {
     /// Au moins une facette est-elle active ?
     ///
@@ -446,6 +473,7 @@ impl TrackFilter {
             || !self.sources.is_empty()
             || !self.labels.is_empty()
             || !self.composers.is_empty()
+            || !self.instruments.is_empty()
             || !self.artists.is_empty()
             || !self.countries.is_empty()
             || !self.moods.is_empty()
@@ -468,6 +496,31 @@ impl TrackFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRD-6 : le prédicat d'instrument est un EXISTS sur `track_credits`,
+    /// insensible à la casse, et compare `track_id` à `t.id` selon le moteur.
+    #[test]
+    fn le_predicat_d_instrument_suit_le_moteur() {
+        let mut sq = Placeholders::new(Engine::Sqlite);
+        let inner = sq.in_list_ci("tc.instrument", 2).unwrap();
+        assert_eq!(
+            instrument_exists(Engine::Sqlite, &inner),
+            "EXISTS (SELECT 1 FROM track_credits tc WHERE tc.track_id = t.id AND LOWER(tc.instrument) IN (LOWER(?), LOWER(?)))"
+        );
+        let mut pg = Placeholders::new(Engine::Postgres);
+        let inner = pg.in_list_ci("tc.instrument", 1).unwrap();
+        assert_eq!(
+            instrument_exists(Engine::Postgres, &inner),
+            "EXISTS (SELECT 1 FROM track_credits tc WHERE tc.track_id = CAST(t.id AS TEXT) AND LOWER(tc.instrument) = LOWER($1))"
+        );
+        assert!(
+            TrackFilter {
+                instruments: vec!["oud".into()],
+                ..Default::default()
+            }
+            .is_active()
+        );
+    }
 
     /// Le piège n°2, écrit noir sur blanc : en SQLite tous les marqueurs se
     /// ressemblent, en PostgreSQL ils sont numérotés — et le compteur doit
