@@ -26,10 +26,24 @@ fn la_boucle_du_poller_annonce_la_bascule() {
     let debut = src
         .find("pub fn spawn(self)")
         .expect("spawn doit exister — s'il a été renommé, ce test doit suivre");
-    let fin = src[debut..]
-        .find("\n    async fn tick(")
-        .map(|i| debut + i)
-        .unwrap_or(src.len());
+    // La méthode suivante, quelle que soit sa visibilité : `tick` a quitté le
+    // fichier (REF-1, #2219) et une fenêtre ouverte jusqu'à la fin du fichier
+    // ne mesurerait plus rien.
+    let fin = [
+        "\n    async fn ",
+        "\n    pub async fn ",
+        "\n    pub(super) async fn ",
+        "\n    pub(crate) async fn ",
+        "\n    fn ",
+        "\n    pub fn ",
+        "\n    pub(super) fn ",
+        "\n    pub(crate) fn ",
+    ]
+    .iter()
+    .filter_map(|m| src[debut + 1..].find(m))
+    .min()
+    .map(|i| debut + 1 + i)
+    .expect("une méthode doit suivre spawn — sinon ce test ne borne plus rien");
     let boucle = &src[debut..fin];
 
     assert!(

@@ -190,20 +190,17 @@ fn le_scrobble_definitif_reste_hors_du_demarrage() {
     let play = position("async fn play_inner(");
     let src = code_de_production();
     let apres = &src[play..];
-    // La méthode suivante, quelle que soit sa visibilité : depuis REF-2 les
-    // méthodes privées d'un module de famille sont `pub(super)`.
-    let fin = [
-        "\n    async fn ",
-        "\n    pub async fn ",
-        "\n    pub(super) async fn ",
-        "\n    fn ",
-        "\n    pub fn ",
-        "\n    pub(super) fn ",
-    ]
-    .iter()
-    .filter_map(|m| apres.find(m))
-    .min()
-    .unwrap_or(apres.len());
+    // Depuis REF-4 (#2219) `play_inner` est découpé en six temps qui le
+    // suivent immédiatement dans `transport.rs` : la fenêtre court jusqu'à la
+    // méthode d'après, pour que le chemin de démarrage ENTIER reste couvert.
+    let fin = apres
+        .find("\n    /// Recreate a local (cpal) output on demand and play to it.")
+        .unwrap_or_else(|| {
+            panic!(
+                "`recreate_local_and_play` a bougé : la fenêtre du scrobble ne \
+                 se ferme plus, ce garde-fou ne garde rien tant qu'il n'a pas suivi."
+            )
+        });
     assert!(
         !apres[..fin].contains("dispatch_scrobble("),
         "le scrobble définitif est reparti dans le chemin de démarrage : \

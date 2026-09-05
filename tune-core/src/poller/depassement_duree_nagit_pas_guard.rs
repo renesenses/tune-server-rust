@@ -2,12 +2,17 @@
 /// les motifs cherches ne puissent pas se trouver eux-memes dans les
 /// assertions ci-dessous (#2082).
 fn code_de_production() -> &'static str {
-    const TOUT: &str = include_str!("../poller.rs");
-    const BORNE: &str = "mod depassement_duree_nagit_pas_guard";
-    let fin = TOUT
-        .find(BORNE)
-        .unwrap_or_else(|| panic!("ce module a ete renomme : la decoupe ne protege plus rien"));
-    &TOUT[..fin]
+    static PRODUCTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PRODUCTION.get_or_init(|| {
+        const TOUT: &str = include_str!("../poller.rs");
+        const BORNE: &str = "mod depassement_duree_nagit_pas_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a ete renomme : la decoupe ne protege plus rien"));
+        // `tick` vit dans son propre module (REF-1, #2219) et se lit en
+        // premier : il précédait le reste de l'impl dans le fichier d'origine.
+        format!("{}{}", include_str!("../poller/tick.rs"), &TOUT[..fin])
+    })
 }
 
 fn position(motif: &str) -> usize {
