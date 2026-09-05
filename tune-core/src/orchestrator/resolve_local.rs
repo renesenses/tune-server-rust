@@ -548,134 +548,17 @@ impl PlaybackOrchestrator {
             );
         }
 
-        if source_format == Some(AudioFormat::Dsd) {
-            if dop_requested {
-                // La cadence et le nombre de canaux se lisent DANS LE FICHIER,
-                // pas dans la base.
-                //
-                // L'en-tête WAV décrivait la ligne `tracks` pendant que la
-                // charge utile sortait de `parse_dsf`/`parse_dff` : deux
-                // sources qui n'ont aucune raison de coïncider. Un écart d'un
-                // canal désaligne chaque mot de 24 bits, le marqueur DoP ne
-                // tombe plus sur l'octet de poids fort, le DAC ne verrouille
-                // pas en DSD et joue le train DSD comme du PCM — c'est-à-dire
-                // du bruit blanc (Marco Polo, Wiim Pro, #1894). Un écart de
-                // cadence annonce un débit que le renderer n'appliquera pas.
-                //
-                // Le fichier est la seule source qui décrit ce qui part
-                // réellement sur le fil, et c'est la même que celle dont
-                // l'encodeur se sert (`decode_dsd_to_dop_streaming`). La base
-                // ne sert plus que de repli si l'en-tête est illisible.
-                let dsd_probe = {
-                    let ext = std::path::Path::new(&file_path)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("dsf")
-                        .to_lowercase();
-                    if ext == "dff" {
-                        crate::audio::dff::parse_dff(&file_path)
-                            .ok()
-                            .map(|i| (i.sample_rate, i.channels))
-                    } else {
-                        crate::audio::dsf::parse_dsf(&file_path)
-                            .ok()
-                            .map(|i| (i.sample_rate, i.channels))
-                    }
-                };
-                if dsd_probe.is_none() {
-                    warn!(
-                        path = %file_path,
-                        "dsd_header_unreadable_falling_back_to_db_metadata"
-                    );
-                }
-                let (dsd_rate, dop_channels) = dop_wire_params(
-                    dsd_probe,
-                    track.sample_rate.map(|v| v as u32),
-                    track.channels as u32,
-                );
-                let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
-                // Réutilise le plafond déjà combiné avec le quirk catalogue.
-                let zone_max_sr = zone_max_sample_rate;
-                if let Some(max_sr) = zone_max_sr {
-                    if dop_rate > max_sr {
-                        info!(
-                            dsd_rate,
-                            dop_rate, max_sr, "dsd_dop_rate_exceeds_zone_max_falling_back_to_pcm"
-                        );
-                        // Fall through to normal DSD→PCM transcode path
-                    }
-                }
-                if zone_max_sr.is_none_or(|max_sr| dop_rate <= max_sr) {
-                    // `dop_channels` vient de `dop_wire_params`, calculé plus
-                    // haut avec la cadence : même source, même raison.
-
-                    let wav_info = StreamInfo {
-                        format: "wav".into(),
-                        mime_type: "audio/wav".into(),
-                        sample_rate: dop_rate,
-                        bit_depth: 24,
-                        channels: dop_channels,
-                        file_size: None,
-                        duration_ms: Some(track.duration_ms as u64),
-                        ..Default::default()
-                    };
-
-                    let (session_id, tx, data_ready) =
-                        self.streamer.create_session(wav_info, true, 128).await;
-
-                    info!(
-                        file = %file_path,
-                        dsd_rate,
-                        dop_rate,
-                        channels = dop_channels,
-                        sortie = if is_local_output { "locale" } else { "réseau" },
-                        "dsd_dop_streaming"
-                    );
-
-                    let fp = file_path.clone();
-                    let ext = std::path::Path::new(&fp)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("dsf")
-                        .to_lowercase();
-                    tokio::task::spawn_blocking(move || {
-                        // Send WAV header first
-                        let wav_hdr =
-                            crate::audio::wav::build_wav_header(dop_channels, dop_rate, 24);
-                        let rt = tokio::runtime::Handle::current();
-                        let _ = rt.block_on(tx.send(wav_hdr.to_vec()));
-                        data_ready.notify_one();
-
-                        let mut first = false;
-                        match crate::audio::decode::decode_dsd_to_dop_streaming(
-                            &fp, &ext, tx, 65536, &mut first, &None, &rt,
-                        ) {
-                            Ok(_) => tracing::debug!("dsd_dop_stream_complete"),
-                            Err(e) => tracing::warn!(error = %e, "dsd_dop_stream_failed"),
-                        }
-                    });
-
-                    let server_ip = self.server_ip();
-                    let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
-
-                    return Ok(DecisionOuResolu::Resolu(ResolvedStream {
-                        url: stream_url,
-                        stream_id: Some(session_id),
-                        title: track.title.clone(),
-                        artist: track.artist_name.clone(),
-                        album: track.album_title.clone(),
-                        duration_ms: Some(track.duration_ms),
-                        source: "local".into(),
-                        mime_type: "audio/wav".into(),
-                        sample_rate: Some(dop_rate),
-                        bit_depth: Some(24),
-                        channels: Some(dop_channels as u32),
-                        origin_url: None,
-                        bitrate_kbps: None,
-                        cover_url: self.resolve_cover_url(track.cover_path.as_deref()),
-                        file_size: None,
-                    }));
-                } // end dop_rate <= max check
+        if source_format == Some(AudioFormat::Dsd) && dop_requested {
+            if let Some(resolu) = self
+                .anticiper_le_dop(
+                    track,
+                    file_path.clone(),
+                    zone_max_sample_rate,
+                    is_local_output,
+                )
+                .await?
+            {
+                return Ok(DecisionOuResolu::Resolu(resolu));
             }
         }
 
@@ -960,6 +843,145 @@ impl PlaybackOrchestrator {
             needs_transcode,
         };
         Ok(DecisionOuResolu::Decision(decision))
+    }
+
+    /// DoP anticipé : une source DSD que la sortie prend en DoP est résolue
+    /// ici même, cadence et canaux lus DANS LE FICHIER (l'en-tête WAV
+    /// décrivait la ligne `tracks`). `None` quand la cadence DoP dépasse le
+    /// plafond de la zone : la décision continue sur le chemin ordinaire.
+    async fn anticiper_le_dop(
+        &self,
+        track: &crate::db::models::Track,
+        file_path: String,
+        zone_max_sample_rate: Option<u32>,
+        is_local_output: bool,
+    ) -> Result<Option<ResolvedStream>, String> {
+        // La cadence et le nombre de canaux se lisent DANS LE FICHIER,
+        // pas dans la base.
+        //
+        // L'en-tête WAV décrivait la ligne `tracks` pendant que la
+        // charge utile sortait de `parse_dsf`/`parse_dff` : deux
+        // sources qui n'ont aucune raison de coïncider. Un écart d'un
+        // canal désaligne chaque mot de 24 bits, le marqueur DoP ne
+        // tombe plus sur l'octet de poids fort, le DAC ne verrouille
+        // pas en DSD et joue le train DSD comme du PCM — c'est-à-dire
+        // du bruit blanc (Marco Polo, Wiim Pro, #1894). Un écart de
+        // cadence annonce un débit que le renderer n'appliquera pas.
+        //
+        // Le fichier est la seule source qui décrit ce qui part
+        // réellement sur le fil, et c'est la même que celle dont
+        // l'encodeur se sert (`decode_dsd_to_dop_streaming`). La base
+        // ne sert plus que de repli si l'en-tête est illisible.
+        let dsd_probe = {
+            let ext = std::path::Path::new(&file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("dsf")
+                .to_lowercase();
+            if ext == "dff" {
+                crate::audio::dff::parse_dff(&file_path)
+                    .ok()
+                    .map(|i| (i.sample_rate, i.channels))
+            } else {
+                crate::audio::dsf::parse_dsf(&file_path)
+                    .ok()
+                    .map(|i| (i.sample_rate, i.channels))
+            }
+        };
+        if dsd_probe.is_none() {
+            warn!(
+                path = %file_path,
+                "dsd_header_unreadable_falling_back_to_db_metadata"
+            );
+        }
+        let (dsd_rate, dop_channels) = dop_wire_params(
+            dsd_probe,
+            track.sample_rate.map(|v| v as u32),
+            track.channels as u32,
+        );
+        let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
+        // Réutilise le plafond déjà combiné avec le quirk catalogue.
+        let zone_max_sr = zone_max_sample_rate;
+        if let Some(max_sr) = zone_max_sr {
+            if dop_rate > max_sr {
+                info!(
+                    dsd_rate,
+                    dop_rate, max_sr, "dsd_dop_rate_exceeds_zone_max_falling_back_to_pcm"
+                );
+                // Fall through to normal DSD→PCM transcode path
+            }
+        }
+        if zone_max_sr.is_none_or(|max_sr| dop_rate <= max_sr) {
+            // `dop_channels` vient de `dop_wire_params`, calculé plus
+            // haut avec la cadence : même source, même raison.
+
+            let wav_info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: dop_rate,
+                bit_depth: 24,
+                channels: dop_channels,
+                file_size: None,
+                duration_ms: Some(track.duration_ms as u64),
+                ..Default::default()
+            };
+
+            let (session_id, tx, data_ready) =
+                self.streamer.create_session(wav_info, true, 128).await;
+
+            info!(
+                file = %file_path,
+                dsd_rate,
+                dop_rate,
+                channels = dop_channels,
+                sortie = if is_local_output { "locale" } else { "réseau" },
+                "dsd_dop_streaming"
+            );
+
+            let fp = file_path.clone();
+            let ext = std::path::Path::new(&fp)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("dsf")
+                .to_lowercase();
+            tokio::task::spawn_blocking(move || {
+                // Send WAV header first
+                let wav_hdr = crate::audio::wav::build_wav_header(dop_channels, dop_rate, 24);
+                let rt = tokio::runtime::Handle::current();
+                let _ = rt.block_on(tx.send(wav_hdr.to_vec()));
+                data_ready.notify_one();
+
+                let mut first = false;
+                match crate::audio::decode::decode_dsd_to_dop_streaming(
+                    &fp, &ext, tx, 65536, &mut first, &None, &rt,
+                ) {
+                    Ok(_) => tracing::debug!("dsd_dop_stream_complete"),
+                    Err(e) => tracing::warn!(error = %e, "dsd_dop_stream_failed"),
+                }
+            });
+
+            let server_ip = self.server_ip();
+            let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+
+            return Ok(Some(ResolvedStream {
+                url: stream_url,
+                stream_id: Some(session_id),
+                title: track.title.clone(),
+                artist: track.artist_name.clone(),
+                album: track.album_title.clone(),
+                duration_ms: Some(track.duration_ms),
+                source: "local".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: Some(dop_rate),
+                bit_depth: Some(24),
+                channels: Some(dop_channels as u32),
+                origin_url: None,
+                bitrate_kbps: None,
+                cover_url: self.resolve_cover_url(track.cover_path.as_deref()),
+                file_size: None,
+            }));
+        } // end dop_rate <= max check
+        Ok(None)
     }
 
     /// Arme « transcodage » du grand tuple de `resolve_local_track`, sortie telle
