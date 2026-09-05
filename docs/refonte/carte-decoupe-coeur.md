@@ -170,6 +170,59 @@ par `scripts/refonte/gardes.sh`.
   401 rafraîchi une fois, 401 persistant, service inconnu). Contre-épreuve :
   deux sabotages de l'orchestrateur font rougir exactement les deux tests visés.
 
+## Phase 2 : les grandes fonctions, décomposées sous témoins (5 septembre)
+
+La phase mécanique a déplacé sans rien changer ; la phase 2 découpe les
+fonctions géantes en temps nommés, texte copié à l'espace près, chaque temps
+prenant en entrée explicite ce qu'il lit et rendant ce qu'il décide. Les
+retours anticipés passent par un porteur (`FluxOuFini`, `DecisionOuResolu`,
+`ResoluOuFini`, `DashOuFini`) ; les valeurs relevées une fois et lues par
+plusieurs temps voyagent dans une struct (`Analyse`, `Habillage`, `Directe`,
+`FormatDeSortie`, `DashPret`, `Etiquettes`). Chaque PR est vérifiée sur Shrek
+par le comparateur (tests nominatifs, gardes et signatures identiques) et,
+quand une garde de texte relit la fonction, par une contre-épreuve compilée.
+
+| Fonction | Avant | Après | Temps | PR |
+|---|---:|---:|---|---|
+| `routes/zones/signal_path.rs` `build_signal_path` | 760 | 30 | `decrire_la_source`, `relever_les_traitements`, `decider_les_forcages`, `decrire_le_transport`, `rendre_les_verdicts`, `assembler_les_etapes` ; `Analyse` | #3367 à #3374 |
+| `routes/zones/ecriture.rs` `patch_zone` | 528 | 3 temps | `valider_le_patch`, `commander_la_sortie`, `persister_le_patch` | #3375 |
+| `orchestrator/resolve_stream.rs` `resolve_streaming_url` | 1 588 | ≈ 240 | `resoudre_flux_https`, `resoudre_flux_dash`, `resoudre_flux_local_ou_oaat` ; `FluxOuFini` | #3376, #3377, #3378 |
+| `orchestrator/resolve_local.rs` `resolve_local_track` | 1 693 | ≈ 100 | `decider_la_lecture_locale`, `transcoder_la_piste`, `servir_en_passthrough` ; `DecisionLocale`, `DecisionOuResolu` | #3381, #3382 |
+| `orchestrator/transport.rs` `play_inner` | 883 | 161 | `resoudre_la_sortie_de_la_zone`, `resoudre_la_demande`, `composer_le_now_playing`, `envoyer_a_la_sortie`, `annoncer_apres_la_sortie`, `arreter_sur_refus_de_sortie` ; `ResoluOuFini`, `Habillage` | #3384 |
+| `orchestrator/resolve_local.rs` `transcoder_la_piste` | 852 | 23 | `decider_le_format_de_sortie`, `transcoder_vers_fichier`, `transcoder_en_session` ; `FormatDeSortie`, `FluxLocal` | #3385 |
+| `orchestrator/resolve_direct.rs` `resolve_direct_url` | 572 | ≈ 170 | `decoder_la_radio_en_wav`, `decoder_bandcamp_en_wav`, `relayer_bandcamp_au_reseau`, `servir_la_radio_au_reseau` ; `Directe`, `FluxDirect` | #3386 |
+| `orchestrator/resolve_stream.rs` `resoudre_flux_https` | 536 | 38 | `pretranscoder_en_flac`, `relayer_le_flux` ; `FluxHttps` | #3387 |
+| `orchestrator/resolve_stream.rs` `resoudre_flux_dash` | 573 | 27 | `preparer_le_dash`, `choisir_l_encodage_dash`, `remuxer_le_dash`, `pretranscoder_le_dash` ; `DashPret`, `DashOuFini`, `FluxDash` | #3388 |
+| `poller/fin_de_piste.rs` `handle_track_end` | 332 | 40 | `terminer_la_file`, `avancer_avec_reprises` | #3389 |
+| `orchestrator/dsp.rs` `serve_prefetched_pcm` | 351 | 41 | `etiqueter_le_prefetch`, `encoder_le_prefetch_en_fichier`, `servir_le_prefetch_en_wav` ; `Etiquettes` | #3390 |
+| `poller/fin_de_piste.rs` `prepare_gapless` | 290 | 35 | `armer_le_fichier_local`, `armer_le_flux_suivant` | #3391 |
+| `orchestrator/transport.rs` `seek` | 276 | 55 | `deplacer_la_sortie` | #3392 |
+| `orchestrator/resolve_local.rs` `decider_la_lecture_locale` | 549 | ≈ 430 | `anticiper_le_dop` | PR à suivre |
+
+### Gardes de texte suivies pendant la phase 2
+
+- `annonce_apres_sortie_guard` : les quatre motifs (`let (output_sent, output_error) =`,
+  `if output_sent {\n            self.dispatch_now_playing(`, `if output_sent && record_history`,
+  `if !output_sent && zone_navigateur {`) sont intacts et gardent leur ordre ; la
+  fenêtre de `le_scrobble_definitif_reste_hors_du_demarrage` s'étend désormais de
+  `play_inner` à `recreate_local_and_play`, pour couvrir les six temps
+  (contre-épreuves : `dispatch_scrobble(` dans le cinquième temps → rouge ; juste
+  après la borne → vert).
+- La tranche « niveaux sur cache hit » (`"transcode_cache_hit"` →
+  `"transcode_to_temp_file_start"`) reste entière dans `transcoder_vers_fichier`.
+- `resolution_annoncee_tests` relit `sample_rate: resolution_annoncee(` au même
+  retrait dans `composer_le_now_playing`.
+
+### Ce qui reste grand, et pourquoi on ne le coupe pas au texte
+
+| Fonction | Lignes | Raison |
+|---|---:|---|
+| `poller/tick.rs` `tick` | 2 402 | REF-9 : machine à états, pas un découpage |
+| `orchestrator/radio.rs` `decode_radio_stream_to_pcm` | 394 | une boucle `'reconnect` à `continue`/`break` étiquetés |
+| `orchestrator/resolve_stream.rs` `resoudre_flux_local_ou_oaat` | 342 | 210 lignes sont une tâche `tokio::spawn` : la sortir, c'est reprendre ses captures |
+| `routes/zones/ecriture.rs` `persister_le_patch` | 354 | trente écritures plates sous la macro `ecrire!`, lues par `patch_zone_error_guard` |
+| `outputs/local.rs` `play_url` | 3 382 | REF-6/REF-7 |
+
 ## Refaire le relevé
 
 ```bash
