@@ -1,5 +1,13 @@
 use super::*;
 
+/// Ce qu'une branche de `resolve_streaming_url` rend : le flux à décrire (url
+/// servie, session, mime, taille), ou une résolution déjà complète (REF-2
+/// phase 2, #2219).
+enum FluxOuFini {
+    Flux((String, Option<String>, String, Option<u64>)),
+    Fini(ResolvedStream),
+}
+
 impl PlaybackOrchestrator {
     /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
     /// radios du MediaServer.
@@ -530,6 +538,119 @@ impl PlaybackOrchestrator {
             let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
             (url, Some(session_id), "audio/wav".to_string(), None)
         } else if is_dash_file {
+            match self
+                .resoudre_flux_dash(req, source_id, service_name, &stream_data, &mut svc)
+                .await?
+            {
+                FluxOuFini::Fini(resolu) => return Ok(resolu),
+                FluxOuFini::Flux(flux) => flux,
+            }
+        } else if is_https {
+            self.resoudre_flux_https(req, source_id, service_name, &stream_data, info, is_https)
+                .await?
+        } else {
+            (
+                stream_data.url.clone(),
+                None,
+                stream_data.mime_type.clone(),
+                None,
+            )
+        };
+
+        // Only trust the caller-supplied title when it is actually non-empty.
+        // Repeat All (and some queue paths) re-play a streaming_queue row whose
+        // stored title is "" — `req.title` is then Some("") and the old
+        // `is_some()` check served that empty title verbatim, wiping Now Playing
+        // (DEvir: `auto_next title=Shine...` followed by `orchestrator_play
+        // title=`). Falling through to get_track() refetches the real metadata
+        // from the service. The network call only fires when the title is
+        // missing, so the happy path is unchanged.
+        let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+        let (title, artist, album, mut duration_ms, cover_path) = if has_title {
+            (
+                req.title.clone().unwrap_or_default(),
+                req.artist_name.clone(),
+                req.album_title.clone(),
+                req.duration_ms,
+                req.cover_url.clone(),
+            )
+        } else {
+            match svc.get_track(source_id).await {
+                Ok(track) => (
+                    track.title,
+                    Some(track.artist),
+                    track.album,
+                    Some(track.duration_ms as i64),
+                    track.cover_path,
+                ),
+                Err(_) => (
+                    req.title
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "Unknown".into()),
+                    req.artist_name.clone(),
+                    req.album_title.clone(),
+                    req.duration_ms,
+                    req.cover_url.clone(),
+                ),
+            }
+        };
+
+        // Duration backfill, mirroring serve_prefetched_pcm (#497): a non-empty
+        // title with duration 0 skips the get_track branch above, and duration 0
+        // on an EXCLUSIVE local output disarms the poller's position-past-end
+        // advance (#483, which requires duration > 0) — on a Repeat All loop
+        // transition the ring then starved at exactly one track length and
+        // playback froze forever (DEvir, v0.9.14, ASIO, DASH file reused from
+        // disk). The network call only fires in the degraded duration-0 case,
+        // so the happy path is unchanged.
+        if duration_ms.unwrap_or(0) == 0
+            && let Ok(track) = svc.get_track(source_id).await
+            && track.duration_ms > 0
+        {
+            duration_ms = Some(track.duration_ms as i64);
+        }
+
+        // Same contract as the radio branch: every path above may have replaced
+        // the service's signed CDN URL with one of our own proxy or transcode
+        // endpoints. Keep the upstream so an output that wants the bytes as the
+        // service published them — a recorder keeping the original FLAC instead
+        // of the proxy's re-stream or a WAV transcode — can ask for them. `None`
+        // when we are handing out the upstream unchanged.
+        let origin_url = (stream_url != stream_data.url).then(|| stream_data.url.clone());
+
+        Ok(ResolvedStream {
+            url: stream_url,
+            mime_type: out_mime,
+            title,
+            artist,
+            album,
+            duration_ms,
+            source: service_name.into(),
+            cover_url: cover_path,
+            stream_id: sid,
+            file_size: stream_file_size,
+            sample_rate: Some(stream_data.quality.sample_rate),
+            bit_depth: Some(stream_data.quality.bit_depth as u32),
+            channels: Some(2),
+            origin_url,
+            bitrate_kbps: None,
+        })
+    }
+
+    /// Branche DASH de `resolve_streaming_url`, sortie telle quelle (REF-2
+    /// phase 2, #2219) : le fMP4 assemblé sur disque est pré-transcodé en FLAC
+    /// pour être servi avec un Content-Length ; un cache hit ou une session
+    /// déjà décodée rendent une résolution complète sans passer par la suite.
+    async fn resoudre_flux_dash(
+        &self,
+        req: &PlayRequest,
+        source_id: &str,
+        service_name: &str,
+        stream_data: &crate::streaming::StreamUrl,
+        svc: &mut Box<dyn crate::streaming::StreamingService>,
+    ) -> Result<FluxOuFini, String> {
+        let flux = {
             // DASH multi-segment fMP4 already assembled on disk by get_track_url().
             // DLNA renderers can't decode fMP4+FLAC directly, and chunked WAV
             // causes noise on many renderers (darTZeel, Eversolo, etc.).
@@ -706,7 +827,7 @@ impl PlaybackOrchestrator {
                                 ),
                             }
                         };
-                        return Ok(ResolvedStream {
+                        return Ok(FluxOuFini::Fini(ResolvedStream {
                             url: stream_url,
                             mime_type: hit_mime.into(),
                             title,
@@ -722,7 +843,7 @@ impl PlaybackOrchestrator {
                             channels: Some(2),
                             origin_url: None,
                             bitrate_kbps: None,
-                        });
+                        }));
                     }
                 }
             }
@@ -876,7 +997,7 @@ impl PlaybackOrchestrator {
                         ),
                     }
                 };
-                return Ok(ResolvedStream {
+                return Ok(FluxOuFini::Fini(ResolvedStream {
                     url: stream_url,
                     mime_type: "audio/flac".into(),
                     title,
@@ -892,7 +1013,7 @@ impl PlaybackOrchestrator {
                     channels: Some(2),
                     origin_url: None,
                     bitrate_kbps: None,
-                });
+                }));
             }
 
             let tmp_path_clone = tmp_path.clone();
@@ -1086,97 +1207,8 @@ impl PlaybackOrchestrator {
                     return Err(format!("DASH transcode task panic: {e}"));
                 }
             }
-        } else if is_https {
-            self.resoudre_flux_https(req, source_id, service_name, &stream_data, info, is_https)
-                .await?
-        } else {
-            (
-                stream_data.url.clone(),
-                None,
-                stream_data.mime_type.clone(),
-                None,
-            )
         };
-
-        // Only trust the caller-supplied title when it is actually non-empty.
-        // Repeat All (and some queue paths) re-play a streaming_queue row whose
-        // stored title is "" — `req.title` is then Some("") and the old
-        // `is_some()` check served that empty title verbatim, wiping Now Playing
-        // (DEvir: `auto_next title=Shine...` followed by `orchestrator_play
-        // title=`). Falling through to get_track() refetches the real metadata
-        // from the service. The network call only fires when the title is
-        // missing, so the happy path is unchanged.
-        let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
-        let (title, artist, album, mut duration_ms, cover_path) = if has_title {
-            (
-                req.title.clone().unwrap_or_default(),
-                req.artist_name.clone(),
-                req.album_title.clone(),
-                req.duration_ms,
-                req.cover_url.clone(),
-            )
-        } else {
-            match svc.get_track(source_id).await {
-                Ok(track) => (
-                    track.title,
-                    Some(track.artist),
-                    track.album,
-                    Some(track.duration_ms as i64),
-                    track.cover_path,
-                ),
-                Err(_) => (
-                    req.title
-                        .clone()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "Unknown".into()),
-                    req.artist_name.clone(),
-                    req.album_title.clone(),
-                    req.duration_ms,
-                    req.cover_url.clone(),
-                ),
-            }
-        };
-
-        // Duration backfill, mirroring serve_prefetched_pcm (#497): a non-empty
-        // title with duration 0 skips the get_track branch above, and duration 0
-        // on an EXCLUSIVE local output disarms the poller's position-past-end
-        // advance (#483, which requires duration > 0) — on a Repeat All loop
-        // transition the ring then starved at exactly one track length and
-        // playback froze forever (DEvir, v0.9.14, ASIO, DASH file reused from
-        // disk). The network call only fires in the degraded duration-0 case,
-        // so the happy path is unchanged.
-        if duration_ms.unwrap_or(0) == 0
-            && let Ok(track) = svc.get_track(source_id).await
-            && track.duration_ms > 0
-        {
-            duration_ms = Some(track.duration_ms as i64);
-        }
-
-        // Same contract as the radio branch: every path above may have replaced
-        // the service's signed CDN URL with one of our own proxy or transcode
-        // endpoints. Keep the upstream so an output that wants the bytes as the
-        // service published them — a recorder keeping the original FLAC instead
-        // of the proxy's re-stream or a WAV transcode — can ask for them. `None`
-        // when we are handing out the upstream unchanged.
-        let origin_url = (stream_url != stream_data.url).then(|| stream_data.url.clone());
-
-        Ok(ResolvedStream {
-            url: stream_url,
-            mime_type: out_mime,
-            title,
-            artist,
-            album,
-            duration_ms,
-            source: service_name.into(),
-            cover_url: cover_path,
-            stream_id: sid,
-            file_size: stream_file_size,
-            sample_rate: Some(stream_data.quality.sample_rate),
-            bit_depth: Some(stream_data.quality.bit_depth as u32),
-            channels: Some(2),
-            origin_url,
-            bitrate_kbps: None,
-        })
+        Ok(FluxOuFini::Flux(flux))
     }
 
     /// Branche HTTPS de `resolve_streaming_url`, sortie telle quelle (REF-2
