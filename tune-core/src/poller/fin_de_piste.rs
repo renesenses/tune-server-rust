@@ -407,73 +407,102 @@ impl PositionPoller {
             }
         };
         if prefers_local_file {
-            let t0 = Instant::now();
-            match self
-                .orchestrator
-                .resolve_gapless_next_local_file(zone_id, next_pos)
-                .await
-            {
-                Ok(resolved) if resolved.file_path.is_some() => {
-                    let output_arc = {
-                        let outputs = self.outputs.lock().await;
-                        outputs.get(device_id).map(|a| a.clone())
-                    };
-                    let Some(output_arc) = output_arc else {
-                        return GaplessPrep::NotArmed;
-                    };
-                    let output = output_arc.lock().await;
-                    let media = crate::outputs::PlayMedia {
-                        url: &resolved.url,
-                        mime_type: &resolved.mime_type,
-                        title: Some(&resolved.title),
-                        artist: resolved.artist.as_deref(),
-                        album: resolved.album.as_deref(),
-                        cover_url: resolved.cover_url.as_deref(),
-                        duration_ms: resolved.duration_ms,
-                        file_size: resolved.file_size,
-                        file_path: resolved.file_path.as_deref(),
-                        sample_rate: resolved.sample_rate,
-                        bit_depth: resolved.bit_depth,
-                        channels: resolved.channels,
-                        live_stream: false,
-                        byte_seekable: true,
-                        origin_url: None,
-                        source: resolved.source.as_deref(),
-                        source_id: resolved.source_id.as_deref(),
-                        track_number: resolved.track_number,
-                        disc_number: resolved.disc_number,
-                    };
-                    return match output.set_next_media(&media).await {
-                        Ok(()) => {
-                            info!(
-                                zone_id,
-                                title = %resolved.title,
-                                resolve_ms = t0.elapsed().as_millis() as u64,
-                                "gapless_next_set_local_file"
-                            );
-                            GaplessPrep::Armed(arme)
-                        }
-                        Err(e) => {
-                            warn!(zone_id, error = %e, "gapless_set_next_local_file_failed");
-                            GaplessPrep::NotArmed
-                        }
-                    };
-                }
-                Ok(_) => {
-                    info!(zone_id, "gapless_local_file_skipped_no_local_next");
-                    return GaplessPrep::NotArmed;
-                }
-                Err(e) => {
-                    warn!(zone_id, error = %e, "gapless_local_file_resolve_failed");
-                    return GaplessPrep::NotArmed;
-                }
-            }
+            return self
+                .armer_le_fichier_local(zone_id, next_pos, device_id, arme)
+                .await;
         }
 
         // v0.9 gapless characterization: time the next-track resolution and
         // surface failures at warn. These paths were debug-only, so streaming
         // gapless instability (Tidal DASH download slowness, URL/token issues)
         // was invisible in production journald. Logging only — no behaviour change.
+        self.armer_le_flux_suivant(zone_id, next_pos, device_id, arme)
+            .await
+    }
+
+    /// Sortie qui préfère un FICHIER pour l'enchaînement : la piste suivante
+    /// est résolue en chemin local et remise à la sortie par `set_next_media`.
+    /// Chaque issue rend son verdict ; rien ne retombe sur le flux.
+    async fn armer_le_fichier_local(
+        &self,
+        zone_id: i64,
+        next_pos: i64,
+        device_id: &str,
+        arme: Option<ArmedNext>,
+    ) -> GaplessPrep {
+        let t0 = Instant::now();
+        match self
+            .orchestrator
+            .resolve_gapless_next_local_file(zone_id, next_pos)
+            .await
+        {
+            Ok(resolved) if resolved.file_path.is_some() => {
+                let output_arc = {
+                    let outputs = self.outputs.lock().await;
+                    outputs.get(device_id).map(|a| a.clone())
+                };
+                let Some(output_arc) = output_arc else {
+                    return GaplessPrep::NotArmed;
+                };
+                let output = output_arc.lock().await;
+                let media = crate::outputs::PlayMedia {
+                    url: &resolved.url,
+                    mime_type: &resolved.mime_type,
+                    title: Some(&resolved.title),
+                    artist: resolved.artist.as_deref(),
+                    album: resolved.album.as_deref(),
+                    cover_url: resolved.cover_url.as_deref(),
+                    duration_ms: resolved.duration_ms,
+                    file_size: resolved.file_size,
+                    file_path: resolved.file_path.as_deref(),
+                    sample_rate: resolved.sample_rate,
+                    bit_depth: resolved.bit_depth,
+                    channels: resolved.channels,
+                    live_stream: false,
+                    byte_seekable: true,
+                    origin_url: None,
+                    source: resolved.source.as_deref(),
+                    source_id: resolved.source_id.as_deref(),
+                    track_number: resolved.track_number,
+                    disc_number: resolved.disc_number,
+                };
+                return match output.set_next_media(&media).await {
+                    Ok(()) => {
+                        info!(
+                            zone_id,
+                            title = %resolved.title,
+                            resolve_ms = t0.elapsed().as_millis() as u64,
+                            "gapless_next_set_local_file"
+                        );
+                        GaplessPrep::Armed(arme)
+                    }
+                    Err(e) => {
+                        warn!(zone_id, error = %e, "gapless_set_next_local_file_failed");
+                        GaplessPrep::NotArmed
+                    }
+                };
+            }
+            Ok(_) => {
+                info!(zone_id, "gapless_local_file_skipped_no_local_next");
+                return GaplessPrep::NotArmed;
+            }
+            Err(e) => {
+                warn!(zone_id, error = %e, "gapless_local_file_resolve_failed");
+                return GaplessPrep::NotArmed;
+            }
+        }
+    }
+
+    /// Enchaînement par FLUX : la piste suivante est résolue (transcode
+    /// compris), on attend ses premiers octets dans le budget, puis la sortie
+    /// la reçoit en `set_next_media`. Un DSD à suivre est signalé, pas armé.
+    async fn armer_le_flux_suivant(
+        &self,
+        zone_id: i64,
+        next_pos: i64,
+        device_id: &str,
+        arme: Option<ArmedNext>,
+    ) -> GaplessPrep {
         let t0 = Instant::now();
         match self.resolve_gapless_next(zone_id, next_pos).await {
             Ok(resolved) => {
