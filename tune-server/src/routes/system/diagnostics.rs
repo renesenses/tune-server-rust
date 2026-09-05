@@ -224,6 +224,163 @@ fn maintenant_epoch() -> u64 {
         .unwrap_or(0)
 }
 
+// ── DUP-1, phase 0 — doublons présumés de zones, en LECTURE SEULE ───────────
+
+/// Ce que le diagnostic a besoin de savoir d'une zone. Projection de `Zone`
+/// pour que la règle se teste sans base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ZoneVue {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) output_type: String,
+    pub(crate) output_device_id: String,
+    pub(crate) online: bool,
+}
+
+fn zone_vue(z: &tune_core::db::zone_repo::Zone) -> Option<ZoneVue> {
+    Some(ZoneVue {
+        id: z.id?,
+        name: z.name.clone(),
+        output_type: z.output_type.clone().unwrap_or_default(),
+        output_device_id: z.output_device_id.clone()?,
+        online: z.online,
+    })
+}
+
+/// L'adresse IPv4 d'un identifiant AirPlay historique `airplay-<ip>-<port>`.
+fn ip_d_identifiant_airplay(reste: &str) -> Option<&str> {
+    let (hote, _port) = reste.rsplit_once('-')?;
+    let quatre =
+        hote.split('.').count() == 4 && hote.chars().all(|c| c.is_ascii_digit() || c == '.');
+    quatre.then_some(hote)
+}
+
+/// La clé d'APPAREIL d'une zone : ce qui reste quand on retire ce qui
+/// n'identifie rien (mesure du 05/09 sur .18) :
+/// - UPnP : `uuid:` retiré, suffixe `_MR` retiré (l'UDN du sous-appareil
+///   MediaRenderer d'un Sonos a fait une deuxième zone), minuscules ;
+/// - AirPlay historique `airplay-<ip>-<port>` : l'adresse ne dit rien de
+///   stable (l'Apple TV du 13/08 est devenue un Sonos) ; si un appareil
+///   découvert porte cette adresse ET une adresse matérielle, c'est elle la clé,
+///   sinon l'adresse IP, faute de mieux ;
+/// - AirPlay `airplay-<mac>` : l'adresse matérielle.
+///
+/// `None` pour les sorties sans identité réseau (locale, navigateur, OAAT).
+pub(crate) fn cle_appareil(
+    zone: &ZoneVue,
+    appareils: &[tune_core::discovery::device::DiscoveredDevice],
+) -> Option<String> {
+    let id = zone.output_device_id.trim();
+    if let Some(reste) = id.strip_prefix("airplay-") {
+        if let Some(ip) = ip_d_identifiant_airplay(reste) {
+            let mac = appareils
+                .iter()
+                .find(|d| d.host == ip)
+                .and_then(|d| d.mac_address.as_deref())
+                .map(|m| m.to_ascii_lowercase());
+            return Some(match mac {
+                Some(m) => format!("mac:{m}"),
+                None => format!("ip:{ip}"),
+            });
+        }
+        return Some(format!("mac:{}", reste.to_ascii_lowercase()));
+    }
+    if let Some(reste) = id.strip_prefix("uuid:") {
+        return Some(format!(
+            "udn:{}",
+            reste.trim_end_matches("_MR").to_ascii_lowercase()
+        ));
+    }
+    None
+}
+
+/// L'hôte réseau d'une zone, pour rapprocher deux PROTOCOLES d'un même
+/// appareil (Eversolo en DLNA et en AirPlay) : l'adresse de l'appareil
+/// découvert qui porte l'identifiant, ou l'adresse contenue dans un
+/// identifiant AirPlay historique.
+fn hote_de_zone(
+    zone: &ZoneVue,
+    appareils: &[tune_core::discovery::device::DiscoveredDevice],
+) -> Option<String> {
+    if let Some(d) = appareils.iter().find(|d| d.id == zone.output_device_id) {
+        return Some(d.host.clone());
+    }
+    zone.output_device_id
+        .strip_prefix("airplay-")
+        .and_then(ip_d_identifiant_airplay)
+        .map(str::to_string)
+}
+
+fn groupe_json(motif: &str, cle: &str, zones: &[&ZoneVue]) -> Value {
+    json!({
+        "motif": motif,
+        "cle": cle,
+        "en_ligne": zones.iter().filter(|z| z.online).count(),
+        "zones": zones.iter().map(|z| json!({
+            "id": z.id,
+            "name": z.name,
+            "output_type": z.output_type,
+            "output_device_id": z.output_device_id,
+            "online": z.online,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// DUP-1, phase 0 : les groupes de zones qui désignent PROBABLEMENT le même
+/// appareil. Deux règles, dans cet ordre : même clé d'appareil (UDN ou adresse
+/// matérielle), puis même hôte sous deux protocoles. Rien n'est fusionné —
+/// les homonymes existent, une adresse se réattribue — le rapport NOMME, et
+/// l'utilisateur ou un chantier suivant tranche.
+pub(crate) fn doublons_de_zones(
+    zones: &[ZoneVue],
+    appareils: &[tune_core::discovery::device::DiscoveredDevice],
+) -> Vec<Value> {
+    use std::collections::BTreeMap;
+    let mut par_cle: BTreeMap<String, Vec<&ZoneVue>> = BTreeMap::new();
+    for z in zones {
+        if let Some(cle) = cle_appareil(z, appareils) {
+            par_cle.entry(cle).or_default().push(z);
+        }
+    }
+    let mut groupes = Vec::new();
+    let mut deja: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for (cle, zs) in &par_cle {
+        if zs.len() < 2 {
+            continue;
+        }
+        let motif = if cle.starts_with("udn:") {
+            "même appareil UPnP (UDN, suffixe _MR retiré)"
+        } else if cle.starts_with("mac:") {
+            "même appareil AirPlay (adresse matérielle)"
+        } else {
+            "même adresse IP AirPlay (identifiant historique)"
+        };
+        deja.extend(zs.iter().map(|z| z.id));
+        groupes.push(groupe_json(motif, cle, zs));
+    }
+    let mut par_hote: BTreeMap<String, Vec<&ZoneVue>> = BTreeMap::new();
+    for z in zones {
+        if deja.contains(&z.id) {
+            continue;
+        }
+        if let Some(h) = hote_de_zone(z, appareils) {
+            par_hote.entry(h).or_default().push(z);
+        }
+    }
+    for (hote, zs) in &par_hote {
+        let types: std::collections::BTreeSet<&str> =
+            zs.iter().map(|z| z.output_type.as_str()).collect();
+        if zs.len() >= 2 && types.len() >= 2 {
+            groupes.push(groupe_json(
+                "même hôte, deux protocoles",
+                &format!("hote:{hote}"),
+                zs,
+            ));
+        }
+    }
+    groupes
+}
+
 pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let artists = ArtistRepo::with_backend(state.backend.clone())
         .count()
@@ -242,9 +399,15 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let uptime_secs = state.started_at.elapsed().as_secs();
 
     // Zone count
-    let zone_count = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let zone_count = zone_repo.count().unwrap_or(0);
+    // DUP-1 (phase 0) : les zones telles qu'elles sont, pour nommer les doublons.
+    let zones_vues: Vec<ZoneVue> = zone_repo
+        .list()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(zone_vue)
+        .collect();
 
     // Discovered devices grouped by type
     let scanner = &state.scanner;
@@ -338,6 +501,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "memory_rss_mb": rss_mb,
         "db_backend": db_backend,
         "active_zones": zone_count,
+        // DUP-1 (phase 0) : les zones qui désignent probablement le même appareil,
+        // nommées avec leur raison. Le rapport ne fusionne rien : sur .18 le 05/09,
+        // un Sonos, un Mac et un Eversolo avaient chacun deux zones.
+        "zones_doublons": doublons_de_zones(&zones_vues, &devices),
         // #2154 — une base incomplète ne doit plus pouvoir ignorer des
         // réglages pendant des mois sans laisser de trace dans le rapport.
         "zone_settings_ignored": tune_core::db::zone_repo::zone_settings_ignored(),
@@ -2567,5 +2734,150 @@ mod tests_reports_cloud {
         let vide = rapport_des_reports_cloud(&[], maintenant);
         assert_eq!(vide["count"], 0);
         assert!(vide["scopes"].as_array().is_some_and(|v| v.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod tests_doublons_de_zones {
+    use super::{ZoneVue, cle_appareil, doublons_de_zones};
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    fn zone(id: i64, name: &str, t: &str, dev: &str, online: bool) -> ZoneVue {
+        ZoneVue {
+            id,
+            name: name.into(),
+            output_type: t.into(),
+            output_device_id: dev.into(),
+            online,
+        }
+    }
+
+    /// La mesure du 05/09 sur .18, rejouée : le Sonos (UDN et UDN `_MR`), le
+    /// Mac (identifiant IP historique et adresse matérielle), l'Eversolo en
+    /// DLNA et en AirPlay ; le Lindemann et le décodeur restent seuls.
+    #[test]
+    fn les_doublons_de_dix_huit_sont_nommes_et_les_zones_seules_laissees() {
+        let zones = vec![
+            zone(
+                6,
+                "Chambre",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400_MR",
+                false,
+            ),
+            zone(
+                8,
+                "Chambre - Sonos Play:1",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400",
+                true,
+            ),
+            zone(
+                20,
+                "Mac Studio",
+                "airplay",
+                "airplay-76:4D:00:C0:BD:51",
+                false,
+            ),
+            zone(4, "Mac13,1", "airplay", "airplay-192.168.1.41-7000", true),
+            zone(
+                10,
+                "Eversolo DMP-A8",
+                "dlna",
+                "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE",
+                true,
+            ),
+            zone(
+                2,
+                "eversolo,1",
+                "airplay",
+                "airplay-192.168.1.17-5500",
+                true,
+            ),
+            zone(
+                13,
+                "Lindemann",
+                "dlna",
+                "uuid:e92cc83b-3083-4239-9b17-1026d9344dcc",
+                false,
+            ),
+            zone(
+                17,
+                "Décodeur TV UHD",
+                "dlna",
+                "uuid:00ababad-7947-1048-8a00-5cb13ebb9dd4",
+                true,
+            ),
+            zone(15, "Cet ordinateur", "browser", "", true),
+        ];
+        let mut mac = DiscoveredDevice::new(
+            "airplay-76:4D:00:C0:BD:51".into(),
+            "Mac Studio".into(),
+            OutputType::Airplay,
+            "192.168.1.41".into(),
+            7000,
+        );
+        mac.mac_address = Some("76:4D:00:C0:BD:51".into());
+        let eversolo = DiscoveredDevice::new(
+            "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE".into(),
+            "Eversolo".into(),
+            OutputType::Dlna,
+            "192.168.1.17".into(),
+            49152,
+        );
+        let appareils = vec![mac, eversolo];
+
+        let groupes = doublons_de_zones(&zones, &appareils);
+        let ids = |g: &serde_json::Value| -> Vec<i64> {
+            g["zones"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|z| z["id"].as_i64().unwrap())
+                .collect()
+        };
+        assert_eq!(groupes.len(), 3, "{groupes:#?}");
+        assert!(
+            groupes[0]["motif"]
+                .as_str()
+                .unwrap()
+                .contains("adresse matérielle")
+        );
+        assert_eq!(ids(&groupes[0]), [20, 4]);
+        assert_eq!(groupes[0]["en_ligne"], 1);
+        assert!(groupes[1]["motif"].as_str().unwrap().contains("UDN"));
+        assert_eq!(ids(&groupes[1]), [6, 8]);
+        assert_eq!(groupes[2]["motif"], "même hôte, deux protocoles");
+        assert_eq!(ids(&groupes[2]), [10, 2]);
+        let tous: Vec<i64> = groupes.iter().flat_map(ids).collect();
+        for seul in [13, 17, 15] {
+            assert!(!tous.contains(&seul), "la zone {seul} est seule");
+        }
+    }
+
+    /// La clé d'appareil : `_MR` et `uuid:` s'effacent, l'adresse IP se résout
+    /// en adresse matérielle quand un appareil découvert la porte, sinon reste
+    /// une adresse ; une sortie locale n'a pas de clé.
+    #[test]
+    fn la_cle_d_appareil_retire_ce_qui_n_identifie_rien() {
+        let z = |dev: &str| zone(1, "z", "dlna", dev, true);
+        assert_eq!(
+            cle_appareil(&z("uuid:RINCON_ABC_MR"), &[]).as_deref(),
+            Some("udn:rincon_abc")
+        );
+        assert_eq!(
+            cle_appareil(&z("uuid:RINCON_ABC"), &[]).as_deref(),
+            Some("udn:rincon_abc")
+        );
+        assert_eq!(
+            cle_appareil(&z("airplay-AA:BB:CC:DD:EE:FF"), &[]).as_deref(),
+            Some("mac:aa:bb:cc:dd:ee:ff")
+        );
+        assert_eq!(
+            cle_appareil(&z("airplay-192.168.1.37-7000"), &[]).as_deref(),
+            Some("ip:192.168.1.37")
+        );
+        assert_eq!(cle_appareil(&z("local:hw:0,0"), &[]), None);
+        assert_eq!(cle_appareil(&z("oaat:1081bb7a"), &[]), None);
     }
 }
