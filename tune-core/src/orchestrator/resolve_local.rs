@@ -950,7 +950,18 @@ impl PlaybackOrchestrator {
         &self,
         req: &PlayRequest,
         decision: &DecisionLocale,
-    ) -> Result<(String, String, String, Option<u64>, Option<u32>, Option<u32>, Option<u32>), String> {
+    ) -> Result<
+        (
+            String,
+            String,
+            String,
+            Option<u64>,
+            Option<u32>,
+            Option<u32>,
+            Option<u32>,
+        ),
+        String,
+    > {
         let DecisionLocale {
             bit_depth,
             bit_depth_wire,
@@ -1791,7 +1802,18 @@ impl PlaybackOrchestrator {
         &self,
         req: &PlayRequest,
         decision: &DecisionLocale,
-    ) -> Result<(String, String, String, Option<u64>, Option<u32>, Option<u32>, Option<u32>), String> {
+    ) -> Result<
+        (
+            String,
+            String,
+            String,
+            Option<u64>,
+            Option<u32>,
+            Option<u32>,
+            Option<u32>,
+        ),
+        String,
+    > {
         let DecisionLocale {
             bit_depth,
             bit_depth_wire,
