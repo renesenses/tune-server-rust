@@ -86,13 +86,55 @@ pub(super) async fn patch_zone(
         Err(e) => return echec_ecriture(id, "zone", &id.to_string(), e),
     };
 
+    let volume_demande = match valider_le_patch(id, &zone_before, &body) {
+        Ok(volume) => volume,
+        Err(reponse) => return reponse,
+    };
+    // Volume et mute sont des commandes, pas de simples préférences. Le
+    // renderer doit les accepter avant qu'un PATCH puisse annoncer leur
+    // réussite ou laisser une valeur mensongère en base. Si le PATCH change
+    // aussi de sortie, la commande vise explicitement la nouvelle sortie.
+    let command_device_id = body
+        .output_device_id
+        .as_deref()
+        .or(zone_before.output_device_id.as_deref());
+    if let Err(reponse) =
+        commander_la_sortie(&state, id, command_device_id, &body, volume_demande).await
+    {
+        return reponse;
+    }
+    if let Err(reponse) =
+        persister_le_patch(&state, &repo, id, &zone_before, command_device_id, &body).await
+    {
+        return reponse;
+    }
+
+    if body.brand.is_some() || body.model.is_some() {
+        push_device_correction(&state, id).await;
+        // Dans la foulée : les réglages qui marchent chez cet utilisateur pour
+        // cet appareil identifié (#1743) — c'est au moment où il nomme son
+        // appareil qu'on sait à quoi rattacher le préréglage.
+        push_device_preset(&state, id).await;
+    }
+
+    get_zone(State(state), Path(id)).await.into_response()
+}
+
+/// Premier temps de `patch_zone` : les refus que la route prononce seule,
+/// avant toute écriture. Rend le volume linéaire demandé, s'il y en a un.
+/// Bloc sorti tel quel (REF-4 phase 2, #2219), ses `return` enrobés d'`Err`.
+fn valider_le_patch(
+    id: i64,
+    zone_before: &Zone,
+    body: &PatchZone,
+) -> Result<Option<f64>, axum::response::Response> {
     // Les valeurs que cette route peut juger seule, avant toute écriture : un
     // PATCH est atomique du point de vue de l'utilisateur, il ne doit pas
     // laisser la moitié de ses champs écrits derrière lui.
     if let Some(ref ot) = body.output_type
         && !TYPES_DE_SORTIE.contains(&ot.as_str())
     {
-        return refus_de_valeur(
+        return Err(refus_de_valeur(
             id,
             "output_type",
             ot,
@@ -100,17 +142,17 @@ pub(super) async fn patch_zone(
                 "type de sortie inconnu (attendu : {})",
                 TYPES_DE_SORTIE.join(", ")
             ),
-        );
+        ));
     }
     if let Some(ref mode) = body.dsd_mode
         && !MODES_DSD.contains(&mode.as_str())
     {
-        return refus_de_valeur(
+        return Err(refus_de_valeur(
             id,
             "dsd_mode",
             mode,
             &format!("mode DSD inconnu (attendu : {})", MODES_DSD.join(", ")),
-        );
+        ));
     }
     // #2271 — un mode inconnu est REFUSE, jamais range en base. Sans ce
     // garde-fou une faute de frappe s'ecrirait telle quelle et la lecture
@@ -119,7 +161,7 @@ pub(super) async fn patch_zone(
     if let Some(ref mode) = body.autoplay_mode
         && AutoplayMode::from_str_stocke(mode).is_none()
     {
-        return refus_de_valeur(
+        return Err(refus_de_valeur(
             id,
             "autoplay_mode",
             mode,
@@ -127,12 +169,17 @@ pub(super) async fn patch_zone(
                 "mode de continuation inconnu (attendu : {})",
                 AutoplayMode::NOMS.join(", ")
             ),
-        );
+        ));
     }
     if let Some(vol) = body.volume
         && !(0..=100).contains(&vol)
     {
-        return refus_de_valeur(id, "volume", &vol.to_string(), "hors de 0..100");
+        return Err(refus_de_valeur(
+            id,
+            "volume",
+            &vol.to_string(),
+            "hors de 0..100",
+        ));
     }
     // #1274 — `volume` et `volume_db` sont exclusifs, et la validation du dB
     // vit dans `volume_scale`. Ce PATCH ne peut pas déléguer complètement :
@@ -154,7 +201,7 @@ pub(super) async fn patch_zone(
                 (Some(v), _) => v.to_string(),
                 _ => String::new(),
             };
-            return refus_de_valeur(id, "volume_db", &recu, motif);
+            return Err(refus_de_valeur(id, "volume_db", &recu, motif));
         }
     };
     if let Some(ref device_id) = body.output_device_id
@@ -162,41 +209,49 @@ pub(super) async fn patch_zone(
     {
         // Une chaîne vide n'efface pas la sortie, elle la rend introuvable :
         // la zone reste « configurée » et ne joue nulle part.
-        return refus_de_valeur(
+        return Err(refus_de_valeur(
             id,
             "output_device_id",
             device_id,
             "vide — pour retirer la sortie, envoyer output_type",
-        );
+        ));
     }
     if let Some(ref name) = body.name
         && name.trim().is_empty()
     {
-        return refus_de_valeur(id, "name", name, "vide");
+        return Err(refus_de_valeur(id, "name", name, "vide"));
     }
 
     // Ce refus précède strictement la première écriture : un PATCH qui porte
     // d'autres champs ne doit rien modifier si l'accord manque.
     if fixed_volume_confirmation_required(&zone_before, &body) {
         warn!(zone_id = id, "fixed_volume_confirmation_required");
-        return (
+        return Err((
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "full_volume_confirmation_required",
                 "message": "Enabling fixed volume raises this zone to full scale (100%). Confirm with `confirm_full_volume` to proceed.",
             })),
         )
-            .into_response();
+            .into_response());
     }
 
     // Volume et mute sont des commandes, pas de simples préférences. Le
     // renderer doit les accepter avant qu'un PATCH puisse annoncer leur
     // réussite ou laisser une valeur mensongère en base. Si le PATCH change
     // aussi de sortie, la commande vise explicitement la nouvelle sortie.
-    let command_device_id = body
-        .output_device_id
-        .as_deref()
-        .or(zone_before.output_device_id.as_deref());
+    Ok(volume_demande)
+}
+
+/// Deuxième temps : volume et sourdine sont des commandes à la sortie, pas
+/// des préférences. Bloc sorti tel quel, ses `return` enrobés d'`Err`.
+async fn commander_la_sortie(
+    state: &AppState,
+    id: i64,
+    command_device_id: Option<&str>,
+    body: &PatchZone,
+    volume_demande: Option<f64>,
+) -> Result<(), axum::response::Response> {
     // #1274 — même garde-fou que sur PUT/POST …/volume : ce PATCH est la
     // troisième porte d'écriture du volume, et la consigne y arrive aussi en
     // dB. `command_device_id` porte déjà la sortie VISÉE, celle que ce même
@@ -204,7 +259,7 @@ pub(super) async fn patch_zone(
     if let Some(db) = body.volume_db
         && let Some(motif) = refus_de_resolution_volume(&state, command_device_id, db).await
     {
-        return refus_de_valeur(id, "volume_db", &db.to_string(), &motif);
+        return Err(refus_de_valeur(id, "volume_db", &db.to_string(), &motif));
     }
 
     // #1274 — `volume_demande` porte déjà la valeur linéaire, qu'elle vienne
@@ -217,7 +272,9 @@ pub(super) async fn patch_zone(
             .set_volume(id, volume, command_device_id)
             .await
     {
-        return crate::routes::playback::output_command_error_response(error);
+        return Err(crate::routes::playback::output_command_error_response(
+            error,
+        ));
     }
     if let Some(muted) = body.muted
         && let Err(error) = state
@@ -225,9 +282,31 @@ pub(super) async fn patch_zone(
             .set_mute(id, muted, command_device_id)
             .await
     {
-        return crate::routes::playback::output_command_error_response(error);
+        return Err(crate::routes::playback::output_command_error_response(
+            error,
+        ));
     }
 
+    /// Écrit un champ, ou s'arrête en journalisant la cause.
+    ///
+    /// Une macro et non une closure : chaque échec doit **sortir** du handler,
+    /// et une closure ne peut pas rendre la main à sa place. C'est aussi ce qui
+    /// garantit qu'aucun des trente blocs ne puisse redevenir muet — il n'y a
+    /// plus qu'un seul endroit où le `return` est écrit.
+    Ok(())
+}
+
+/// Troisième temps : chaque préférence persistée par la macro `ecrire!`, qui
+/// journalise l'échec, et les rafraîchissements de la sortie vivante qui
+/// l'accompagnent. Bloc sorti tel quel, ses `return` enrobés d'`Err`.
+async fn persister_le_patch(
+    state: &AppState,
+    repo: &ZoneRepo,
+    id: i64,
+    zone_before: &Zone,
+    command_device_id: Option<&str>,
+    body: &PatchZone,
+) -> Result<(), axum::response::Response> {
     /// Écrit un champ, ou s'arrête en journalisant la cause.
     ///
     /// Une macro et non une closure : chaque échec doit **sortir** du handler,
@@ -237,7 +316,7 @@ pub(super) async fn patch_zone(
     macro_rules! ecrire {
         ($champ:literal, $valeur:expr, $ecriture:expr) => {
             if let Err(e) = $ecriture {
-                return echec_ecriture(id, $champ, &$valeur.to_string(), e);
+                return Err(echec_ecriture(id, $champ, &$valeur.to_string(), e));
             }
         };
     }
@@ -301,7 +380,9 @@ pub(super) async fn patch_zone(
                 .arm_fixed_volume(id, command_device_id)
                 .await
             {
-                return crate::routes::playback::output_command_error_response(error);
+                return Err(crate::routes::playback::output_command_error_response(
+                    error,
+                ));
             }
         } else if !fixed && etait_fixe {
             // Sortie du mode : rendre le volume d'avant. `update_fixed_volume`
@@ -319,7 +400,9 @@ pub(super) async fn patch_zone(
                         .set_volume(id, pourcent / 100.0, command_device_id)
                         .await
                     {
-                        return crate::routes::playback::output_command_error_response(error);
+                        return Err(crate::routes::playback::output_command_error_response(
+                            error,
+                        ));
                     }
                     info!(zone_id = id, volume = pourcent, "fixed_volume_restaure");
                 }
@@ -567,15 +650,7 @@ pub(super) async fn patch_zone(
     // la seule matiere qui permette de le faire evoluer a partir du parc reel.
     // Envoi anonyme et sans attente : la reponse HTTP a l'utilisateur ne doit
     // dependre en rien de la disponibilite du site.
-    if body.brand.is_some() || body.model.is_some() {
-        push_device_correction(&state, id).await;
-        // Dans la foulée : les réglages qui marchent chez cet utilisateur pour
-        // cet appareil identifié (#1743) — c'est au moment où il nomme son
-        // appareil qu'on sait à quoi rattacher le préréglage.
-        push_device_preset(&state, id).await;
-    }
-
-    get_zone(State(state), Path(id)).await.into_response()
+    Ok(())
 }
 
 pub(super) async fn create_zone(
