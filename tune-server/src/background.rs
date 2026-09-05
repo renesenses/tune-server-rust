@@ -979,6 +979,23 @@ fn spawn_telemetry_reporter(state: &AppState) {
 /// memoire. Elles sont locales et n'appellent personne.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Reprise rapprochée après un battement — ou une revalidation de clé — en
+/// échec : 1 min, puis 5, puis 15, puis la cadence horaire. Sans elle, un
+/// hôte injoignable au démarrage (réseau pas encore monté, coupure) laissait
+/// la licence non confirmée pendant une heure pleine (LIC-3). Un 429 n'est
+/// pas un échec de ce type : son `Retry-After` est respecté tel quel.
+const REPRISES_BATTEMENT_SECS: [u64; 3] = [60, 300, 900];
+
+fn prochain_intervalle_battement(echecs_consecutifs: u32) -> std::time::Duration {
+    if echecs_consecutifs == 0 {
+        return HEARTBEAT_INTERVAL;
+    }
+    REPRISES_BATTEMENT_SECS
+        .get(echecs_consecutifs as usize - 1)
+        .map(|s| std::time::Duration::from_secs(*s))
+        .unwrap_or(HEARTBEAT_INTERVAL)
+}
+
 /// Ce qu'un tour de battement a le droit de faire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeartbeatPlan {
@@ -1084,6 +1101,7 @@ fn spawn_heartbeat(state: &AppState) {
 
         let registre = tune_core::db::task_run_repo::TaskRunRepo::with_backend(backend.clone());
 
+        let mut echecs_consecutifs: u32 = 0;
         loop {
             let plan = heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled());
 
@@ -1131,12 +1149,20 @@ fn spawn_heartbeat(state: &AppState) {
                     None
                 };
                 match revalidation {
-                    Some((verdict, detail)) => suivi.terminer(verdict, None, Some(&detail)),
+                    Some((verdict, detail)) => {
+                        echecs_consecutifs =
+                            if verdict == tune_core::db::task_run_repo::Verdict::Echec {
+                                echecs_consecutifs + 1
+                            } else {
+                                0
+                            };
+                        suivi.terminer(verdict, None, Some(&detail));
+                    }
                     None => suivi.rien_a_faire(Some(
                         "telemetrie desactivee — marqueur local seulement, rien n'est parti",
                     )),
                 }
-                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                tokio::time::sleep(prochain_intervalle_battement(echecs_consecutifs)).await;
                 continue;
             }
 
@@ -1484,6 +1510,11 @@ fn spawn_heartbeat(state: &AppState) {
                 }
             }
 
+            echecs_consecutifs = if verdict == tune_core::db::task_run_repo::Verdict::Echec {
+                echecs_consecutifs + 1
+            } else {
+                0
+            };
             suivi.terminer(verdict, None, Some(&motif));
 
             // Refresh the account premium (SSO) from /api/v1/user so a lapsed
@@ -1493,7 +1524,7 @@ fn spawn_heartbeat(state: &AppState) {
                 refresh_account_premium(&backend, &license, &services).await;
             }
 
-            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+            tokio::time::sleep(prochain_intervalle_battement(echecs_consecutifs)).await;
         }
     });
 }
@@ -2509,6 +2540,47 @@ mod heartbeat_cadence_et_optout_tests {
         assert!(
             branche[..fin].contains(&format!("revalider_la_cle{}", "(")),
             "la branche opt-out du battement doit revalider la cle (LIC-1)"
+        );
+    }
+
+    /// LIC-3 : après un échec, le battement revient vite (1, 5, 15 min), puis
+    /// retrouve sa cadence horaire ; sans échec, il ne bat pas plus souvent.
+    #[test]
+    fn la_reprise_apres_echec_est_rapprochee_puis_horaire() {
+        use super::prochain_intervalle_battement as prochain;
+        assert_eq!(prochain(0), HEARTBEAT_INTERVAL);
+        assert_eq!(prochain(1).as_secs(), 60);
+        assert_eq!(prochain(2).as_secs(), 300);
+        assert_eq!(prochain(3).as_secs(), 900);
+        assert_eq!(prochain(4), HEARTBEAT_INTERVAL);
+        assert_eq!(prochain(u32::MAX), HEARTBEAT_INTERVAL);
+    }
+
+    /// Les deux sommeils qui suivent un verdict (opt-out, fin de cycle) passent
+    /// par la reprise ; seul le sommeil du 429 garde l'heure pleine, parce que
+    /// le serveur a lui-même dit quand revenir.
+    #[test]
+    fn les_sommeils_apres_verdict_passent_par_la_reprise() {
+        let source = include_str!("background.rs");
+        let production = source
+            .split(&format!("#[cfg({})]", "test"))
+            .next()
+            .expect("source vide");
+        let corps = production
+            .split("fn spawn_heartbeat")
+            .nth(1)
+            .expect("spawn_heartbeat introuvable");
+        assert_eq!(
+            corps
+                .matches("sleep(prochain_intervalle_battement(")
+                .count(),
+            2,
+            "les sommeils apres verdict doivent passer par prochain_intervalle_battement"
+        );
+        assert_eq!(
+            corps.matches("sleep(HEARTBEAT_INTERVAL)").count(),
+            1,
+            "seul le sommeil du 429 garde HEARTBEAT_INTERVAL"
         );
     }
 
