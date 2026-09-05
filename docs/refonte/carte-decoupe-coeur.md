@@ -11,7 +11,7 @@ sur le source ; rien n'est estimé. Le suivi du chantier vit dans l'epic #2219.
 - **Un tiers à 40 % de chaque fichier est du test**, pas de la production. Le
   monolithe à découper est plus petit que sa taille ne le dit, et le module de
   tests inline est lui-même un fichier géant.
-- **Une famille manque au plan** : 22 méthodes « communes » de l'orchestrateur,
+- **Une famille manquait au plan v1** (livrée depuis, #3336) : 22 méthodes « communes » de l'orchestrateur,
   appelées par toutes les autres familles. Elles font une PR à part, en premier.
 - **La boucle producteur est presque isolée** : `play_url` contient
   `build_int_stream` comme fonction imbriquée, et le branchement par backend vit
@@ -54,7 +54,7 @@ occurrences du nom de la méthode dans la zone de tests du fichier.
 
 | Famille | Méthodes | Lignes | Réf. tests | Géants et remarques |
 |---|---:|---:|---:|---|
-| **commun** (absente du plan) | 22 | 615 | 196 | `new` (147 réf.), `server_ip`, `reglages_sortie_locale`, `resolve_cover_url`, `message_echec_sortie`, `record_listen`. Appelée par toutes les autres familles. |
+| **commun** (absente du plan v1, nommée par cette carte, **livrée le 04/09 par #3336** : `orchestrator/commun.rs`, 21 méthodes, `new` reste avec le type) | 22 | 615 | 196 | `new` (147 réf.), `server_ip`, `reglages_sortie_locale`, `resolve_cover_url`, `message_echec_sortie`, `record_listen`. Appelée par toutes les autres familles. |
 | history | 10 | 242 | 4 | Feuille : un seul appel sortant. ListenBrainz, Last.fm, annonces, témoins. |
 | transport | 21 | 2 201 | 94 | `play_inner` **888**, `seek` 268, `resume` 215, `send_to_output` 186, `stop` 92. La colonne vertébrale, la plus testée. |
 | dsp | 23 | 1 274 | 27 | `refresh_zone_pure_dsp` 98, `set_volume` 95, crossfeed, EQ, niveaux, DoP. Appelée par les trois résolveurs. |
