@@ -475,52 +475,21 @@ pub(super) fn build_signal_path(
         oaat_transcodes,
     );
 
-    // Detect sample rate capping (DSD excluded — the DSD→PCM transcode
-    // already handles rate conversion; showing a separate resampler step
-    // would be misleading since sample_rate here is the DSD MHz rate).
-    let resampling_active = !is_dsd
-        && zone
-            .max_sample_rate
-            .is_some_and(|max| (sample_rate as u32) > max);
-
-    // Overall bit-perfect: lossless source + no transcoding + no DSP + no
-    // resampling + no ReplayGain. Volume is excluded — it's a user preference,
-    // not a signal degradation. ReplayGain, lui, multiplie chaque échantillon :
-    // l'orchestrateur le traite déjà comme l'EQ (`zone_replaygain_changes_audio`
-    // force le chemin transcodé), le verdict doit dire la même chose (#1627).
-    // + le repli mono (#2362) : sommer les deux voies et les réémettre
-    // identiques réécrit chaque échantillon. Une zone qui l'active n'est PAS
-    // bit-perfect, et le panneau doit le dire — c'est exactement la promesse
-    // que #1548/#1559 (EQ) et #1627 (ReplayGain) avaient laissé mentir.
-    // `dsp_applique`, et non `dsp_enabled` : un EQ armé qu'un flux DSD brut
-    // met hors de portée ne touche AUCUN échantillon. Le faire tomber le
-    // verdict serait mentir dans l'autre sens (#1393).
-    let bit_perfect = is_lossless
-        && transport_bit_perfect
-        && !dsp_applique
-        && !resampling_active
-        && replaygain_step.is_none()
-        && mono_downmix_step.is_none();
-
-    // Débit de la SOURCE, annoncé seulement quand elle le nomme elle-même.
-    //
-    // C'est le message que voit l'utilisateur pour le mp3-128 de Bandcamp
-    // (#2074). La règle écrite dans le plugin — « un flux à 128 kbit/s doit
-    // être annoncé comme tel PARTOUT où il apparaît »
-    // (`plugins/tune-bandcamp/src/lib.rs`) — n'était tenue que sur l'écran
-    // Bandcamp. Passée en zone, la même piste s'affichait « MP3 44kHz/16bit »,
-    // exactement comme un 320 : le seul public de ce logiciel est celui qui
-    // règle sa chaîne au bit près, et c'est précisément à lui que la
-    // différence était cachée.
-    //
-    // Filtré sur le verdict avec perte : un débit sur un FLAC n'aurait aucun
-    // sens, et un album Bandcamp ACHETÉ en lossless ne doit surtout pas
-    // hériter du chiffre de l'extrait.
-    let bitrate_label = np
-        .bitrate_kbps
-        .filter(|kbps| *kbps > 0 && !is_lossless)
-        .map(|kbps| format!(" {kbps} kbit/s"))
-        .unwrap_or_default();
+    let Verdicts {
+        resampling_active,
+        bit_perfect,
+        bitrate_label,
+    } = rendre_les_verdicts(
+        zone,
+        np,
+        is_dsd,
+        sample_rate,
+        is_lossless,
+        transport_bit_perfect,
+        dsp_applique,
+        replaygain_step.as_ref(),
+        mono_downmix_step.as_deref(),
+    );
 
     // Build steps
     let source_desc = if is_dsd {
@@ -782,6 +751,81 @@ pub(super) fn build_signal_path(
         "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
         "dsp_metrics": dsp_metrics,
     }))
+}
+
+/// Les verdicts : rééchantillonnage actif, bit-perfect global, débit annoncé.
+/// Cinquième bloc de `build_signal_path`, sorti tel quel (REF-4 phase 2,
+/// #2219) ; les champs sont les `let` que la suite relit.
+struct Verdicts {
+    resampling_active: bool,
+    bit_perfect: bool,
+    bitrate_label: String,
+}
+
+/// Rend les verdicts à partir de la source, du transport et des traitements.
+#[allow(clippy::too_many_arguments)]
+fn rendre_les_verdicts(
+    zone: &Zone,
+    np: &tune_core::playback::NowPlaying,
+    is_dsd: bool,
+    sample_rate: i32,
+    is_lossless: bool,
+    transport_bit_perfect: bool,
+    dsp_applique: bool,
+    replaygain_step: Option<&ReplayGainStep>,
+    mono_downmix_step: Option<&str>,
+) -> Verdicts {
+    // Detect sample rate capping (DSD excluded — the DSD→PCM transcode
+    // already handles rate conversion; showing a separate resampler step
+    // would be misleading since sample_rate here is the DSD MHz rate).
+    let resampling_active = !is_dsd
+        && zone
+            .max_sample_rate
+            .is_some_and(|max| (sample_rate as u32) > max);
+
+    // Overall bit-perfect: lossless source + no transcoding + no DSP + no
+    // resampling + no ReplayGain. Volume is excluded — it's a user preference,
+    // not a signal degradation. ReplayGain, lui, multiplie chaque échantillon :
+    // l'orchestrateur le traite déjà comme l'EQ (`zone_replaygain_changes_audio`
+    // force le chemin transcodé), le verdict doit dire la même chose (#1627).
+    // + le repli mono (#2362) : sommer les deux voies et les réémettre
+    // identiques réécrit chaque échantillon. Une zone qui l'active n'est PAS
+    // bit-perfect, et le panneau doit le dire — c'est exactement la promesse
+    // que #1548/#1559 (EQ) et #1627 (ReplayGain) avaient laissé mentir.
+    // `dsp_applique`, et non `dsp_enabled` : un EQ armé qu'un flux DSD brut
+    // met hors de portée ne touche AUCUN échantillon. Le faire tomber le
+    // verdict serait mentir dans l'autre sens (#1393).
+    let bit_perfect = is_lossless
+        && transport_bit_perfect
+        && !dsp_applique
+        && !resampling_active
+        && replaygain_step.is_none()
+        && mono_downmix_step.is_none();
+
+    // Débit de la SOURCE, annoncé seulement quand elle le nomme elle-même.
+    //
+    // C'est le message que voit l'utilisateur pour le mp3-128 de Bandcamp
+    // (#2074). La règle écrite dans le plugin — « un flux à 128 kbit/s doit
+    // être annoncé comme tel PARTOUT où il apparaît »
+    // (`plugins/tune-bandcamp/src/lib.rs`) — n'était tenue que sur l'écran
+    // Bandcamp. Passée en zone, la même piste s'affichait « MP3 44kHz/16bit »,
+    // exactement comme un 320 : le seul public de ce logiciel est celui qui
+    // règle sa chaîne au bit près, et c'est précisément à lui que la
+    // différence était cachée.
+    //
+    // Filtré sur le verdict avec perte : un débit sur un FLAC n'aurait aucun
+    // sens, et un album Bandcamp ACHETÉ en lossless ne doit surtout pas
+    // hériter du chiffre de l'extrait.
+    let bitrate_label = np
+        .bitrate_kbps
+        .filter(|kbps| *kbps > 0 && !is_lossless)
+        .map(|kbps| format!(" {kbps} kbit/s"))
+        .unwrap_or_default();
+    Verdicts {
+        resampling_active,
+        bit_perfect,
+        bitrate_label,
+    }
 }
 
 /// Le transport par type de sortie : bit-perfect ou non, son libellé, le
