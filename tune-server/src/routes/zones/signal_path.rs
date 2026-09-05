@@ -436,133 +436,27 @@ pub(super) fn build_signal_path(
         volume_full,
     } = relever_les_traitements(backend, zone, np, output_type, runtime_signal_path);
 
-    // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
-    // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
-    //
-    // ⚠️ Cette liste ÉTAIT recopiée ici. `orchestrator.rs` porte pourtant, en
-    // toutes lettres, « l'unique exemplaire de cette liste » — et cette
-    // quatrième copie avait déjà dérivé : cinq types au lieu de six,
-    // `slimproto` manquant. Une zone Slimproto était donc « réseau » pour le
-    // chemin audio (qui lui applique les forçages WAV/LPCM et le plafond
-    // 16 bits) et « inconnue » pour le panneau, qui la déclarait non
-    // bit-perfect sans jamais lire ces réglages. Le miroir suit désormais la
-    // décision, par la MÊME fonction (#2189, même faute que #3183).
-    let is_network_output = tune_core::orchestrator::is_network_output_type(Some(output_type));
-    // Passthrough DSD natif : l'orchestrateur sert le .dsf/.dff brut au
-    // renderer (`orchestrator.rs` `dsd_passthrough`). Constaté sur le fil, pas
-    // deviné — cf. `wire_carries_raw_dsd`. Sans ce miroir, une piste DSD128
-    // envoyée telle quelle à un Eversolo DMP-A6 s'affichait « DSD128 5.6 MHz →
-    // FLAC 5644kHz/1bit » : un transcodage qui n'a pas lieu, vers un conteneur
-    // qui ne peut pas exister (#1315).
-    let dsd_passthrough = is_dsd && is_network_output && wire_carries_raw_dsd(wire);
-    // Un égaliseur ARMÉ n'atteint pas un flux DSD servi BRUT hors sortie
-    // locale, et l'orchestrateur s'en abstient DÉLIBÉRÉMENT : convertir du DSD
-    // natif en PCM pour y passer un EQ serait une dégradation décidée à la
-    // place de l'auditeur. Les deux gardes sont explicites côté audio —
-    // `pull_output_needs_dsp_transcode` rend `false` sur `AudioFormat::Dsd`,
-    // et `eq_forces_transcode` est gardé par `!dsd_passthrough`.
-    //
-    // Le panneau, lui, annonçait l'étape DSP sur la seule foi du RÉGLAGE en
-    // base (`configured_dsp_enabled`) : un traitement qui n'a pas lieu, plus
-    // un verdict bit-perfect qu'il faisait tomber alors que le fil est intact.
-    // C'est la faute de #1315 et #2053 — ne pas annoncer ce qui n'a pas lieu —
-    // et c'est le versant visible du signalement d'Eric (#1393, renderer
-    // Diretta et PC vu comme zone DLNA) : des réglages sans effet, et rien qui
-    // le dise.
-    //
-    // `is_network_output` n'est PAS la bonne borne : une sortie PULL hors
-    // dépôt (`diretta`) va chercher le .dsf elle-même sans être « réseau » au
-    // sens de ce fichier, et c'est justement la zone du signalement. Le fil
-    // est CONSTATÉ (`wire_carries_raw_dsd`), pas déduit.
-    //
-    // La sortie LOCALE est exclue : elle a sa sonde d'exécution, qui dit déjà
-    // « DSP contourné pour DoP » quand c'est le cas, et qui est plus juste que
-    // toute déduction faite ici.
-    let dsd_brut_hors_sortie_locale =
-        is_dsd && output_type != "local" && wire_carries_raw_dsd(wire);
-    // « Armé » et « appliqué » ne sont pas la même chose.
-    let dsp_applique = dsp_enabled && !dsd_brut_hors_sortie_locale;
-    let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
-    // ALAC native passthrough (opt-in per zone): the orchestrator serves the ALAC
-    // file straight to a renderer that decodes it (bit-perfect, no FLAC transcode).
-    // Mirror the orchestrator's condition (see orchestrator.rs `alac_passthrough`)
-    // so the signal path does not show a phantom ALAC→FLAC transcode step when the
-    // wire is really ALAC (forum #1131: DartZeel DAC displays ALAC at the right
-    // resolution, yet the signal path claimed an ALAC→FLAC transcode).
-    // A zone forced to serve WAV/LPCM (`dlna_lpcm`) always transcodes, so it takes
-    // precedence over ALAC passthrough — matching the orchestrator.
-    let zone_id = zone.id.unwrap_or(0);
-    // `!dsd_passthrough` : même précédence que l'orchestrateur, où le forçage
-    // WAV ne peut pas s'appliquer à un flux DSD servi brut (`dlna_needs_wav`
-    // exige `will_be_flac`, faux dès que `needs_transcode_for_output` tombe).
-    // Sans cette garde, une zone cochée « LPCM » annoncerait du WAV sur un fil
-    // qui porte du DSD.
-    let dlna_lpcm = is_network_output
-        && !dsd_passthrough
-        && ZoneRepo::with_backend(backend.clone()).get_dlna_lpcm(zone_id);
-    // Zone opt-in 16-bit cap (Ruark R3, #1137): mirrors the orchestrator so the
-    // signal path shows a real 16-bit downconvert instead of a phantom
-    // bit-perfect passthrough when the source is hi-res.
-    let dlna_cap_16bit = is_network_output
-        && bit_depth > 16
-        && ZoneRepo::with_backend(backend.clone()).get_dlna_cap_16bit(zone_id);
-    // Zone opt-in: serve genuine 24-bit WAV (audio/L24) instead of the 16-bit
-    // LPCM fallback. Mirrors orchestrator.rs `dlna_wav24` so the signal path
-    // shows a lossless 24-bit WAV wire (not a phantom 16-bit truncation).
-    let dlna_wav24 = is_network_output
-        && bit_depth > 16
-        && ZoneRepo::with_backend(backend.clone()).get_dlna_wav24(zone_id);
-    // Même règle que l'orchestrateur, par la MÊME fonction : sur une source
-    // FLAC dont la zone demande le FLAC natif, le forçage WAV ne s'applique pas
-    // — il vise le décodeur ALAC du renderer. Sans ce miroir, le chemin du
-    // signal annoncerait un transcodage vers WAV là où le fil porte du FLAC,
-    // c'est-à-dire exactement le genre d'affichage inventé que ce dépôt traque.
-    let source_is_flac = source_format == Some(AudioFormat::Flac);
-    let native_flac_opt_in =
-        is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_native_flac(zone_id);
-    let dlna_lpcm = tune_core::orchestrator::wav_override_applies(
+    let Forcages {
+        dsp_applique,
+        dsp_contourne_par_le_dsd,
         dlna_lpcm,
-        source_is_flac,
-        native_flac_opt_in,
-    );
-    let dlna_wav24 = tune_core::orchestrator::wav_override_applies(
+        dlna_cap_16bit,
         dlna_wav24,
-        source_is_flac,
-        native_flac_opt_in,
+        needs_transcode_for_output,
+        is_oaat,
+        oaat_transcodes,
+        wire_wav,
+    } = decider_les_forcages(
+        zone,
+        backend,
+        wire,
+        output_type,
+        output_container,
+        source_format,
+        is_dsd,
+        bit_depth,
+        dsp_enabled,
     );
-    let alac_passthrough = source_format == Some(AudioFormat::Alac)
-        && is_network_output
-        && !dlna_lpcm
-        && !dlna_wav24
-        && !dlna_cap_16bit
-        && ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id);
-    // Miroir de la condition AAC de l'orchestrateur (voir orchestrator.rs).
-    let aac_passthrough = source_format == Some(AudioFormat::Aac)
-        && is_network_output
-        && !dlna_lpcm
-        && !dlna_wav24
-        && ZoneRepo::with_backend(backend.clone()).get_aac_passthrough(zone_id);
-    let needs_transcode_for_output = is_network_output
-        && !dsd_passthrough
-        && !alac_passthrough
-        && !aac_passthrough
-        && source_format
-            .as_ref()
-            .is_some_and(|f| f.needs_transcode_for_dlna());
-    // OAAT transcodes everything to WAV except WAV itself
-    let is_oaat = output_type == "oaat";
-    let oaat_transcodes = is_oaat
-        && source_format
-            .as_ref()
-            .is_some_and(|f| *f != AudioFormat::Wav);
-
-    // The renderer may be served WAV/LPCM even for a FLAC/ALAC source when it
-    // does not advertise `audio/flac` (`orchestrator::dlna_needs_wav`, decided
-    // by async SOAP negotiation this synchronous builder cannot replay). Trust
-    // the live session's real container over the static transcode-target guess
-    // so the path shows "ALAC → WAV" instead of a phantom "ALAC → FLAC" (Sevy,
-    // LHC-52). Only "wav" changes the verdict; anything else keeps prior logic.
-    let wire_wav = output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
 
     let (transport_bit_perfect, transport_desc, output_format_name) = match output_type {
         "dlna" | "openhome" => {
@@ -1009,6 +903,175 @@ pub(super) fn build_signal_path(
         "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
         "dsp_metrics": dsp_metrics,
     }))
+}
+
+/// Ce que la sortie impose à la source : forçages WAV/LPCM, plafond 16 bits,
+/// passthrough ALAC/AAC/DSD, transcodage requis, cas OAAT et fil WAV.
+/// Troisième bloc de `build_signal_path`, sorti tel quel (REF-4 phase 2,
+/// #2219) ; les champs sont les `let` que la suite relit.
+struct Forcages {
+    dsp_applique: bool,
+    dsp_contourne_par_le_dsd: bool,
+    dlna_lpcm: bool,
+    dlna_cap_16bit: bool,
+    dlna_wav24: bool,
+    needs_transcode_for_output: bool,
+    is_oaat: bool,
+    oaat_transcodes: bool,
+    wire_wav: bool,
+}
+
+/// Décide les forçages de sortie, en miroir des conditions de l'orchestrateur.
+#[allow(clippy::too_many_arguments)]
+fn decider_les_forcages(
+    zone: &Zone,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    wire: Option<&StreamInfo>,
+    output_type: &str,
+    output_container: Option<&str>,
+    source_format: Option<AudioFormat>,
+    is_dsd: bool,
+    bit_depth: i32,
+    dsp_enabled: bool,
+) -> Forcages {
+    // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
+    // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
+    //
+    // ⚠️ Cette liste ÉTAIT recopiée ici. `orchestrator.rs` porte pourtant, en
+    // toutes lettres, « l'unique exemplaire de cette liste » — et cette
+    // quatrième copie avait déjà dérivé : cinq types au lieu de six,
+    // `slimproto` manquant. Une zone Slimproto était donc « réseau » pour le
+    // chemin audio (qui lui applique les forçages WAV/LPCM et le plafond
+    // 16 bits) et « inconnue » pour le panneau, qui la déclarait non
+    // bit-perfect sans jamais lire ces réglages. Le miroir suit désormais la
+    // décision, par la MÊME fonction (#2189, même faute que #3183).
+    let is_network_output = tune_core::orchestrator::is_network_output_type(Some(output_type));
+    // Passthrough DSD natif : l'orchestrateur sert le .dsf/.dff brut au
+    // renderer (`orchestrator.rs` `dsd_passthrough`). Constaté sur le fil, pas
+    // deviné — cf. `wire_carries_raw_dsd`. Sans ce miroir, une piste DSD128
+    // envoyée telle quelle à un Eversolo DMP-A6 s'affichait « DSD128 5.6 MHz →
+    // FLAC 5644kHz/1bit » : un transcodage qui n'a pas lieu, vers un conteneur
+    // qui ne peut pas exister (#1315).
+    let dsd_passthrough = is_dsd && is_network_output && wire_carries_raw_dsd(wire);
+    // Un égaliseur ARMÉ n'atteint pas un flux DSD servi BRUT hors sortie
+    // locale, et l'orchestrateur s'en abstient DÉLIBÉRÉMENT : convertir du DSD
+    // natif en PCM pour y passer un EQ serait une dégradation décidée à la
+    // place de l'auditeur. Les deux gardes sont explicites côté audio —
+    // `pull_output_needs_dsp_transcode` rend `false` sur `AudioFormat::Dsd`,
+    // et `eq_forces_transcode` est gardé par `!dsd_passthrough`.
+    //
+    // Le panneau, lui, annonçait l'étape DSP sur la seule foi du RÉGLAGE en
+    // base (`configured_dsp_enabled`) : un traitement qui n'a pas lieu, plus
+    // un verdict bit-perfect qu'il faisait tomber alors que le fil est intact.
+    // C'est la faute de #1315 et #2053 — ne pas annoncer ce qui n'a pas lieu —
+    // et c'est le versant visible du signalement d'Eric (#1393, renderer
+    // Diretta et PC vu comme zone DLNA) : des réglages sans effet, et rien qui
+    // le dise.
+    //
+    // `is_network_output` n'est PAS la bonne borne : une sortie PULL hors
+    // dépôt (`diretta`) va chercher le .dsf elle-même sans être « réseau » au
+    // sens de ce fichier, et c'est justement la zone du signalement. Le fil
+    // est CONSTATÉ (`wire_carries_raw_dsd`), pas déduit.
+    //
+    // La sortie LOCALE est exclue : elle a sa sonde d'exécution, qui dit déjà
+    // « DSP contourné pour DoP » quand c'est le cas, et qui est plus juste que
+    // toute déduction faite ici.
+    let dsd_brut_hors_sortie_locale =
+        is_dsd && output_type != "local" && wire_carries_raw_dsd(wire);
+    // « Armé » et « appliqué » ne sont pas la même chose.
+    let dsp_applique = dsp_enabled && !dsd_brut_hors_sortie_locale;
+    let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
+    // ALAC native passthrough (opt-in per zone): the orchestrator serves the ALAC
+    // file straight to a renderer that decodes it (bit-perfect, no FLAC transcode).
+    // Mirror the orchestrator's condition (see orchestrator.rs `alac_passthrough`)
+    // so the signal path does not show a phantom ALAC→FLAC transcode step when the
+    // wire is really ALAC (forum #1131: DartZeel DAC displays ALAC at the right
+    // resolution, yet the signal path claimed an ALAC→FLAC transcode).
+    // A zone forced to serve WAV/LPCM (`dlna_lpcm`) always transcodes, so it takes
+    // precedence over ALAC passthrough — matching the orchestrator.
+    let zone_id = zone.id.unwrap_or(0);
+    // `!dsd_passthrough` : même précédence que l'orchestrateur, où le forçage
+    // WAV ne peut pas s'appliquer à un flux DSD servi brut (`dlna_needs_wav`
+    // exige `will_be_flac`, faux dès que `needs_transcode_for_output` tombe).
+    // Sans cette garde, une zone cochée « LPCM » annoncerait du WAV sur un fil
+    // qui porte du DSD.
+    let dlna_lpcm = is_network_output
+        && !dsd_passthrough
+        && ZoneRepo::with_backend(backend.clone()).get_dlna_lpcm(zone_id);
+    // Zone opt-in 16-bit cap (Ruark R3, #1137): mirrors the orchestrator so the
+    // signal path shows a real 16-bit downconvert instead of a phantom
+    // bit-perfect passthrough when the source is hi-res.
+    let dlna_cap_16bit = is_network_output
+        && bit_depth > 16
+        && ZoneRepo::with_backend(backend.clone()).get_dlna_cap_16bit(zone_id);
+    // Zone opt-in: serve genuine 24-bit WAV (audio/L24) instead of the 16-bit
+    // LPCM fallback. Mirrors orchestrator.rs `dlna_wav24` so the signal path
+    // shows a lossless 24-bit WAV wire (not a phantom 16-bit truncation).
+    let dlna_wav24 = is_network_output
+        && bit_depth > 16
+        && ZoneRepo::with_backend(backend.clone()).get_dlna_wav24(zone_id);
+    // Même règle que l'orchestrateur, par la MÊME fonction : sur une source
+    // FLAC dont la zone demande le FLAC natif, le forçage WAV ne s'applique pas
+    // — il vise le décodeur ALAC du renderer. Sans ce miroir, le chemin du
+    // signal annoncerait un transcodage vers WAV là où le fil porte du FLAC,
+    // c'est-à-dire exactement le genre d'affichage inventé que ce dépôt traque.
+    let source_is_flac = source_format == Some(AudioFormat::Flac);
+    let native_flac_opt_in =
+        is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_native_flac(zone_id);
+    let dlna_lpcm = tune_core::orchestrator::wav_override_applies(
+        dlna_lpcm,
+        source_is_flac,
+        native_flac_opt_in,
+    );
+    let dlna_wav24 = tune_core::orchestrator::wav_override_applies(
+        dlna_wav24,
+        source_is_flac,
+        native_flac_opt_in,
+    );
+    let alac_passthrough = source_format == Some(AudioFormat::Alac)
+        && is_network_output
+        && !dlna_lpcm
+        && !dlna_wav24
+        && !dlna_cap_16bit
+        && ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id);
+    // Miroir de la condition AAC de l'orchestrateur (voir orchestrator.rs).
+    let aac_passthrough = source_format == Some(AudioFormat::Aac)
+        && is_network_output
+        && !dlna_lpcm
+        && !dlna_wav24
+        && ZoneRepo::with_backend(backend.clone()).get_aac_passthrough(zone_id);
+    let needs_transcode_for_output = is_network_output
+        && !dsd_passthrough
+        && !alac_passthrough
+        && !aac_passthrough
+        && source_format
+            .as_ref()
+            .is_some_and(|f| f.needs_transcode_for_dlna());
+    // OAAT transcodes everything to WAV except WAV itself
+    let is_oaat = output_type == "oaat";
+    let oaat_transcodes = is_oaat
+        && source_format
+            .as_ref()
+            .is_some_and(|f| *f != AudioFormat::Wav);
+
+    // The renderer may be served WAV/LPCM even for a FLAC/ALAC source when it
+    // does not advertise `audio/flac` (`orchestrator::dlna_needs_wav`, decided
+    // by async SOAP negotiation this synchronous builder cannot replay). Trust
+    // the live session's real container over the static transcode-target guess
+    // so the path shows "ALAC → WAV" instead of a phantom "ALAC → FLAC" (Sevy,
+    // LHC-52). Only "wav" changes the verdict; anything else keeps prior logic.
+    let wire_wav = output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
+    Forcages {
+        dsp_applique,
+        dsp_contourne_par_le_dsd,
+        dlna_lpcm,
+        dlna_cap_16bit,
+        dlna_wav24,
+        needs_transcode_for_output,
+        is_oaat,
+        oaat_transcodes,
+        wire_wav,
+    }
 }
 
 /// Ce que la zone fait subir au signal : égaliseur, ReplayGain, repli mono,
