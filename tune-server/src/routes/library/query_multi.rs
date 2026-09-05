@@ -90,6 +90,7 @@ pub(super) fn track_filter_from_raw(raw: Option<&str>) -> Result<TrackFilter, Ap
         sources: texts("source"),
         labels: texts("label"),
         composers: texts("composer"),
+        instruments: texts("instrument"),
         artists: texts("artist"),
         countries: texts("country"),
         moods: texts("mood"),

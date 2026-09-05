@@ -231,6 +231,16 @@ fn build_facet_conditions(
             }
         }
     }
+    // CRD-6 : « instrument » est une facette à part entière — elle ne se filtre
+    // pas elle-même — et vient des crédits, pas d'une colonne de `tracks`.
+    if exclude != "instrument" {
+        if let Some(c) = ph.in_list_ci("tc.instrument", sel.instruments.len()) {
+            conds.push(tune_core::db::facet_filter::instrument_exists(engine, &c));
+            for v in &sel.instruments {
+                params.push(SqlValue::Text(v.clone()));
+            }
+        }
+    }
     if exclude != "artist" {
         // `tracks` has no artist_name column (artist is a FK to `artists`), and
         // these conditions run against `FROM tracks t` with no join, so resolve
@@ -508,6 +518,11 @@ pub(super) async fn library_facets(
             // le rail coûte une requête pour ne rien montrer. Un client la
             // demande explicitement (`fields=…,dr`).
             "dr" => dr_facet(&state, engine, limit, &conds, &params),
+            // Instrument (CRD-6) : vient de `track_credits`, remplie par la passe
+            // automatique (CRD-5). Comme `dr`, absente du jeu par défaut : vide
+            // tant que les crédits ne sont pas là, un client la demande
+            // explicitement (`fields=…,instrument`).
+            "instrument" => instrument_facet(&state, engine, limit, &conds, &params),
             "favorite" => favorite_facet(&state, &conds, &params),
             "playlist" => playlist_facet(&state, limit, &conds, &params),
             "untagged" => untagged_facet(&state, &conds, &params),
@@ -1169,6 +1184,50 @@ fn artist_facet(
 
 /// Count distinct values of an extended tag in the `track_metadata` k/v store,
 /// optionally narrowed to the tracks matching the active-facet conditions.
+/// La facette « instrument » (CRD-6) : chaque instrument des crédits, avec le
+/// nombre de pistes qui le portent, resserré par les autres facettes actives.
+/// Sur PostgreSQL `track_credits.track_id` est du texte : le sous-ensemble de
+/// pistes est projeté dans le même type (`track_id_pour_track_credits`).
+fn instrument_facet(
+    state: &AppState,
+    engine: Engine,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let narrow = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND tc.track_id IN (SELECT {} FROM tracks t WHERE {})",
+            tune_core::db::facet_filter::track_id_pour_track_credits(engine),
+            conds.join(" AND ")
+        )
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let sql = format!(
+        "SELECT tc.instrument AS value, COUNT(DISTINCT tc.track_id) AS n FROM track_credits tc \
+         WHERE tc.instrument IS NOT NULL AND tc.instrument <> ''{narrow} \
+         GROUP BY tc.instrument ORDER BY n DESC, value ASC{limit_clause}"
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(&sql, &bound)
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let value = it.next()?.as_string()?;
+            let count = it.next()?.as_i64().unwrap_or(0);
+            Some((value, count))
+        })
+        .collect()
+}
+
 fn kv_facet(
     state: &AppState,
     key: &str,
@@ -1212,6 +1271,87 @@ fn kv_facet(
 mod tests {
     use super::*;
     use crate::routes::smart_refs::{EmptyResolver, RefCtx};
+
+    /// CRD-6 : la facette « instrument » compte les pistes par instrument des
+    /// crédits ; elle ne se filtre pas elle-même ; sa sélection resserre les
+    /// autres facettes et la liste des pistes.
+    #[tokio::test]
+    async fn la_facette_instrument_compte_les_pistes_et_filtre_les_autres() {
+        use tune_core::db::backend::ToSqlValue;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        let piste = |titre: &str, annee: i64| {
+            b.execute(
+                "INSERT INTO tracks (title, file_path, year) VALUES (?1, ?2, ?3)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &format!("/m/{titre}.flac") as &dyn ToSqlValue,
+                    &annee as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let credit = |track: i64, instrument: &str| {
+            b.execute(
+                "INSERT INTO track_credits (track_id, artist_name, role, instrument, position) VALUES (?1, ?2, 'performer', ?3, 0)",
+                &[&track.to_string() as &dyn ToSqlValue, &"Musicien" as &dyn ToSqlValue, &instrument as &dyn ToSqlValue],
+            )
+            .unwrap();
+        };
+        let a = piste("A", 1998);
+        let bb = piste("B", 2004);
+        let _c = piste("C", 2004);
+        credit(a, "oud");
+        credit(bb, "oud");
+        credit(bb, "piano");
+
+        async fn facettes(state: &AppState, raw: &str) -> Value {
+            // `fields` arrive par l'extracteur `Query`, les facettes à plusieurs
+            // valeurs par la chaîne brute : on nourrit les deux, comme axum.
+            let fields = raw
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("fields="))
+                .map(str::to_string);
+            let Json(v) = library_facets(
+                Query(FacetQuery {
+                    fields,
+                    ..Default::default()
+                }),
+                RawQuery(Some(raw.to_string())),
+                State(state.clone()),
+            )
+            .await
+            .ok()
+            .expect("la route répond");
+            v
+        }
+        let v = facettes(&state, "fields=instrument").await;
+        assert_eq!(v["instrument"][0]["value"], "oud");
+        assert_eq!(v["instrument"][0]["count"], 2);
+        assert_eq!(v["instrument"][1]["value"], "piano");
+        assert_eq!(v["instrument"][1]["count"], 1);
+
+        // Sélectionner « piano » ne vide pas la facette instrument elle-même,
+        // mais resserre les années à celle de la piste B.
+        let v = facettes(&state, "fields=instrument,year&instrument=piano").await;
+        assert_eq!(v["instrument"].as_array().unwrap().len(), 2, "{v}");
+        assert_eq!(v["year"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["year"][0]["value"], "2004");
+
+        // La liste des pistes suit le même filtre.
+        let filtre = tune_core::db::facet_filter::TrackFilter {
+            instruments: vec!["OUD".into()],
+            ..Default::default()
+        };
+        let (pistes, total) =
+            tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
+                .list_filtered(&filtre, 50, 0)
+                .unwrap();
+        assert_eq!(total, 2, "casse indifférente");
+        let titres: Vec<&str> = pistes.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titres, ["A", "B"]);
+    }
 
     /// La liste des étiquettes surveillées est FERMÉE : c'est elle qui garantit
     /// que le SQL formaté ne dépend jamais de l'entrée de la requête.
