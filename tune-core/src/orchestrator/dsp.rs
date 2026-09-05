@@ -1,5 +1,15 @@
 use super::*;
 
+/// Ce que `serve_prefetched_pcm` annonce de la piste : relevé une fois, lu
+/// par la sortie réseau comme par la sortie locale.
+struct Etiquettes {
+    title: String,
+    artist: Option<String>,
+    album: Option<String>,
+    cover_url: Option<String>,
+    duration_ms: u64,
+}
+
 impl PlaybackOrchestrator {
     /// Marque la zone en résolution gapless jusqu'au drop du garde.
     pub(super) fn begin_levels_prewarm(&self, zone_id: i64) -> LevelsPrewarmScope<'_> {
@@ -90,10 +100,51 @@ impl PlaybackOrchestrator {
         prefetched: crate::prefetch::PrefetchedTrack,
         req: &PlayRequest,
     ) -> Result<ResolvedStream, String> {
-        let sr = prefetched.sample_rate;
         let bd = prefetched.bit_depth;
-        let ch = prefetched.channels;
+        let etiquettes = self.etiqueter_le_prefetch(&prefetched, req).await;
 
+        let is_local_stream = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("local:"));
+        let is_network_output = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| !id.starts_with("local:") && !id.starts_with("oaat:"));
+        // Même règle que le bras transcodage : ce qu'on ANNONCE doit être une
+        // largeur que la chaîne sait ÉCRIRE.
+        //
+        // `bd.max(16).min(24)` est la troisième écriture à la main de
+        // `cap_output_bit_depth` — la fonction créée précisément pour qu'on
+        // cesse de la réécrire (#1610) — et elle en a le même angle mort :
+        // 17..23 passent intacts, et ni `encode_wav` ni `pcm_to_i32` ne savent
+        // les écrire. Un prefetch d'une source de 20 bits partait donc vers un
+        // encodeur qui la refuse (#1437).
+        let out_bd = if is_local_stream {
+            32
+        } else {
+            crate::audio::decode::container_bit_depth(cap_output_bit_depth(bd))
+        };
+
+        // For DLNA/network outputs, encode prefetched PCM to a file.
+        // Use FLAC if the renderer supports it, otherwise WAV.
+        if is_network_output {
+            return self
+                .encoder_le_prefetch_en_fichier(prefetched, req, etiquettes, out_bd)
+                .await;
+        }
+        self.servir_le_prefetch_en_wav(prefetched, req, etiquettes, out_bd)
+            .await
+    }
+
+    /// Premier temps : le titre, l'artiste, l'album, la pochette et la durée
+    /// annoncés. La demande (l'écoute en cours) l'emporte sur le tampon, qui
+    /// décrit la piste SUIVANTE ; le service comble ce qui manque encore.
+    async fn etiqueter_le_prefetch(
+        &self,
+        prefetched: &crate::prefetch::PrefetchedTrack,
+        req: &PlayRequest,
+    ) -> Etiquettes {
         // Prefer the request's metadata (from now_playing) over the prefetch
         // buffer's. The buffer is built for the *next* track and can carry an
         // empty title (prefetched before its metadata was resolved); serving it
@@ -158,179 +209,201 @@ impl PlaybackOrchestrator {
         }
 
         // Determine output bit depth based on output type
-        let is_local_stream = req
-            .output_device_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("local:"));
-        let is_network_output = req
-            .output_device_id
-            .as_deref()
-            .is_some_and(|id| !id.starts_with("local:") && !id.starts_with("oaat:"));
-        // Même règle que le bras transcodage : ce qu'on ANNONCE doit être une
-        // largeur que la chaîne sait ÉCRIRE.
-        //
-        // `bd.max(16).min(24)` est la troisième écriture à la main de
-        // `cap_output_bit_depth` — la fonction créée précisément pour qu'on
-        // cesse de la réécrire (#1610) — et elle en a le même angle mort :
-        // 17..23 passent intacts, et ni `encode_wav` ni `pcm_to_i32` ne savent
-        // les écrire. Un prefetch d'une source de 20 bits partait donc vers un
-        // encodeur qui la refuse (#1437).
-        let out_bd = if is_local_stream {
-            32
+        Etiquettes {
+            title,
+            artist,
+            album,
+            cover_url,
+            duration_ms,
+        }
+    }
+
+    /// Sortie réseau (DLNA, OpenHome) : le PCM préchargé est encodé en FLAC,
+    /// ou en WAV si le renderer ne lit pas le FLAC, dans un fichier servi
+    /// avec Content-Length ; les niveaux partent en parallèle.
+    async fn encoder_le_prefetch_en_fichier(
+        &self,
+        prefetched: crate::prefetch::PrefetchedTrack,
+        req: &PlayRequest,
+        etiquettes: Etiquettes,
+        out_bd: u16,
+    ) -> Result<ResolvedStream, String> {
+        let Etiquettes {
+            title,
+            artist,
+            cover_url,
+            duration_ms,
+            ..
+        } = etiquettes;
+        let sr = prefetched.sample_rate;
+        let bd = prefetched.bit_depth;
+        let ch = prefetched.channels;
+        let use_wav = if let Some(device_id) = req.output_device_id.as_deref() {
+            !self.dlna_supports_mime(device_id, "audio/flac").await
         } else {
-            crate::audio::decode::container_bit_depth(cap_output_bit_depth(bd))
+            false
+        };
+        let ext = if use_wav { "wav" } else { "flac" };
+        let tmp_path =
+            std::env::temp_dir().join(format!("tune-prefetch-{}.{ext}", uuid::Uuid::new_v4()));
+        let tmp_str = tmp_path.to_string_lossy().to_string();
+        // Match the encoded header's bit depth (out_bd) to the actual PCM.
+        let pcm_data = if bd != out_bd {
+            crate::audio::decode::convert_pcm_bytes(&prefetched.pcm_data, bd, out_bd)
+        } else {
+            prefetched.pcm_data
+        };
+        let encode_sr = sr;
+        let encode_bd = out_bd;
+        let encode_ch = ch;
+        let encode_path = tmp_str.clone();
+        let encode_wav = use_wav;
+        // VU-mètres : le tampon prefetch EST le PCM décodé — sans ce
+        // renvoi, une piste streaming servie depuis le prefetch (gapless
+        // N+1) laissait les aiguilles figées alors que la piste jouée via
+        // le pipeline download+decode les animait.
+        let prefetch_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            if let Some(ref ltx) = prefetch_levels_tx {
+                crate::audio::tap::send_windowed_pcm(
+                    ltx,
+                    &pcm_data,
+                    encode_bd,
+                    encode_ch as u16,
+                    encode_sr,
+                );
+            }
+            let data_size = pcm_data.len() as u32;
+            let byte_rate = encode_sr * encode_ch as u32 * (encode_bd as u32 / 8);
+            let block_align = encode_ch as u16 * (encode_bd as u16 / 8);
+            if encode_wav {
+                let mut f = std::fs::File::create(&encode_path)
+                    .map_err(|e| format!("create tmp wav: {e}"))?;
+                let mut hdr = Vec::with_capacity(44);
+                hdr.extend_from_slice(b"RIFF");
+                hdr.extend_from_slice(&(36 + data_size).to_le_bytes());
+                hdr.extend_from_slice(b"WAVEfmt ");
+                hdr.extend_from_slice(&16u32.to_le_bytes());
+                hdr.extend_from_slice(&1u16.to_le_bytes());
+                hdr.extend_from_slice(&(encode_ch as u16).to_le_bytes());
+                hdr.extend_from_slice(&encode_sr.to_le_bytes());
+                hdr.extend_from_slice(&byte_rate.to_le_bytes());
+                hdr.extend_from_slice(&block_align.to_le_bytes());
+                hdr.extend_from_slice(&(encode_bd as u16).to_le_bytes());
+                hdr.extend_from_slice(b"data");
+                hdr.extend_from_slice(&data_size.to_le_bytes());
+                f.write_all(&hdr)
+                    .map_err(|e| format!("write wav header: {e}"))?;
+                f.write_all(&pcm_data)
+                    .map_err(|e| format!("write wav pcm: {e}"))?;
+                Ok::<(), String>(())
+            } else {
+                // Encodage FLAC NATIF. Le chemin precedent ecrivait un WAV
+                // temporaire puis lancait `ffmpeg -c:a flac` — un binaire
+                // externe retire du projet en v0.8.46, donc un echec
+                // systematique partout ou il n'est pas installe par
+                // ailleurs, et un fichier de cache jamais produit.
+                //
+                // `AudioEncoder` est deja dans l'arbre et fait le meme
+                // travail sans processus externe ni fichier intermediaire.
+                // On est dans un `spawn_blocking`, donc les variantes
+                // `_sync` sont exactement ce qu'il faut (cf. leur
+                // documentation : pas d'await, encodage pur CPU).
+                let mut enc = crate::audio::encoder::AudioEncoder::new(
+                    "flac",
+                    encode_sr,
+                    encode_bd as u32,
+                    encode_ch as u32,
+                );
+                enc.start_sync()?;
+                enc.write_sync(&pcm_data)?;
+                let flac = enc.finish_sync()?;
+                std::fs::write(&encode_path, &flac).map_err(|e| format!("write flac: {e}"))?;
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e| format!("spawn: {e}"))??;
+
+        let file_size = std::fs::metadata(&tmp_str).map(|m| m.len()).unwrap_or(0);
+        let (out_format, out_mime) = if use_wav {
+            ("wav", "audio/wav")
+        } else {
+            ("flac", "audio/flac")
+        };
+        info!(
+            title = %prefetched.title,
+            file_size,
+            format = out_format,
+            "prefetch_pcm_encoded_for_dlna"
+        );
+
+        let flac_info = StreamInfo {
+            format: out_format.into(),
+            mime_type: out_mime.into(),
+            sample_rate: sr,
+            bit_depth: out_bd,
+            channels: ch,
+            file_size: Some(file_size),
+            duration_ms: Some(duration_ms),
+            ..Default::default()
         };
 
-        // For DLNA/network outputs, encode prefetched PCM to a file.
-        // Use FLAC if the renderer supports it, otherwise WAV.
-        if is_network_output {
-            let use_wav = if let Some(device_id) = req.output_device_id.as_deref() {
-                !self.dlna_supports_mime(device_id, "audio/flac").await
-            } else {
-                false
-            };
-            let ext = if use_wav { "wav" } else { "flac" };
-            let tmp_path =
-                std::env::temp_dir().join(format!("tune-prefetch-{}.{ext}", uuid::Uuid::new_v4()));
-            let tmp_str = tmp_path.to_string_lossy().to_string();
-            // Match the encoded header's bit depth (out_bd) to the actual PCM.
-            let pcm_data = if bd != out_bd {
-                crate::audio::decode::convert_pcm_bytes(&prefetched.pcm_data, bd, out_bd)
-            } else {
-                prefetched.pcm_data
-            };
-            let encode_sr = sr;
-            let encode_bd = out_bd;
-            let encode_ch = ch;
-            let encode_path = tmp_str.clone();
-            let encode_wav = use_wav;
-            // VU-mètres : le tampon prefetch EST le PCM décodé — sans ce
-            // renvoi, une piste streaming servie depuis le prefetch (gapless
-            // N+1) laissait les aiguilles figées alors que la piste jouée via
-            // le pipeline download+decode les animait.
-            let prefetch_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
-            tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                if let Some(ref ltx) = prefetch_levels_tx {
-                    crate::audio::tap::send_windowed_pcm(
-                        ltx,
-                        &pcm_data,
-                        encode_bd,
-                        encode_ch as u16,
-                        encode_sr,
-                    );
-                }
-                let data_size = pcm_data.len() as u32;
-                let byte_rate = encode_sr * encode_ch as u32 * (encode_bd as u32 / 8);
-                let block_align = encode_ch as u16 * (encode_bd as u16 / 8);
-                if encode_wav {
-                    let mut f = std::fs::File::create(&encode_path)
-                        .map_err(|e| format!("create tmp wav: {e}"))?;
-                    let mut hdr = Vec::with_capacity(44);
-                    hdr.extend_from_slice(b"RIFF");
-                    hdr.extend_from_slice(&(36 + data_size).to_le_bytes());
-                    hdr.extend_from_slice(b"WAVEfmt ");
-                    hdr.extend_from_slice(&16u32.to_le_bytes());
-                    hdr.extend_from_slice(&1u16.to_le_bytes());
-                    hdr.extend_from_slice(&(encode_ch as u16).to_le_bytes());
-                    hdr.extend_from_slice(&encode_sr.to_le_bytes());
-                    hdr.extend_from_slice(&byte_rate.to_le_bytes());
-                    hdr.extend_from_slice(&block_align.to_le_bytes());
-                    hdr.extend_from_slice(&(encode_bd as u16).to_le_bytes());
-                    hdr.extend_from_slice(b"data");
-                    hdr.extend_from_slice(&data_size.to_le_bytes());
-                    f.write_all(&hdr)
-                        .map_err(|e| format!("write wav header: {e}"))?;
-                    f.write_all(&pcm_data)
-                        .map_err(|e| format!("write wav pcm: {e}"))?;
-                    Ok::<(), String>(())
-                } else {
-                    // Encodage FLAC NATIF. Le chemin precedent ecrivait un WAV
-                    // temporaire puis lancait `ffmpeg -c:a flac` — un binaire
-                    // externe retire du projet en v0.8.46, donc un echec
-                    // systematique partout ou il n'est pas installe par
-                    // ailleurs, et un fichier de cache jamais produit.
-                    //
-                    // `AudioEncoder` est deja dans l'arbre et fait le meme
-                    // travail sans processus externe ni fichier intermediaire.
-                    // On est dans un `spawn_blocking`, donc les variantes
-                    // `_sync` sont exactement ce qu'il faut (cf. leur
-                    // documentation : pas d'await, encodage pur CPU).
-                    let mut enc = crate::audio::encoder::AudioEncoder::new(
-                        "flac",
-                        encode_sr,
-                        encode_bd as u32,
-                        encode_ch as u32,
-                    );
-                    enc.start_sync()?;
-                    enc.write_sync(&pcm_data)?;
-                    let flac = enc.finish_sync()?;
-                    std::fs::write(&encode_path, &flac).map_err(|e| format!("write flac: {e}"))?;
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(|e| format!("spawn: {e}"))??;
+        let session_id = self
+            .streamer
+            .create_file_session(flac_info, tmp_str.clone(), false)
+            .await;
 
-            let file_size = std::fs::metadata(&tmp_str).map(|m| m.len()).unwrap_or(0);
-            let (out_format, out_mime) = if use_wav {
-                ("wav", "audio/wav")
-            } else {
-                ("flac", "audio/flac")
-            };
-            info!(
-                title = %prefetched.title,
-                file_size,
-                format = out_format,
-                "prefetch_pcm_encoded_for_dlna"
-            );
+        let server_ip = self.server_ip();
+        let stream_url = self
+            .streamer
+            .get_stream_url(&session_id, &server_ip, "flac");
 
-            let flac_info = StreamInfo {
-                format: out_format.into(),
-                mime_type: out_mime.into(),
-                sample_rate: sr,
-                bit_depth: out_bd,
-                channels: ch,
-                file_size: Some(file_size),
-                duration_ms: Some(duration_ms),
-                ..Default::default()
-            };
+        Ok(ResolvedStream {
+            url: stream_url,
+            stream_id: Some(session_id),
+            title: title.clone(),
+            artist: artist.clone(),
+            album: None,
+            duration_ms: Some(duration_ms as i64),
+            source: prefetched.source,
+            mime_type: "audio/flac".into(),
+            sample_rate: Some(sr),
+            bit_depth: Some(out_bd as u32),
+            channels: Some(ch as u32),
+            // What we serve here is a local session over the decoded buffer;
+            // the service's own URL travels on `PrefetchedTrack` so a
+            // recorder still gets the published bytes rather than our
+            // re-encode. A track shorter than the prefetch window is served
+            // from this path, so without it short tracks were the only ones
+            // captured through the proxy — and filed under `Stream/`.
+            origin_url: prefetched.upstream_url,
+            bitrate_kbps: None,
+            cover_url: cover_url.clone(),
+            file_size: Some(file_size),
+        })
+    }
 
-            let session_id = self
-                .streamer
-                .create_file_session(flac_info, tmp_str.clone(), false)
-                .await;
-
-            let server_ip = self.server_ip();
-            let stream_url = self
-                .streamer
-                .get_stream_url(&session_id, &server_ip, "flac");
-
-            return Ok(ResolvedStream {
-                url: stream_url,
-                stream_id: Some(session_id),
-                title: title.clone(),
-                artist: artist.clone(),
-                album: None,
-                duration_ms: Some(duration_ms as i64),
-                source: prefetched.source,
-                mime_type: "audio/flac".into(),
-                sample_rate: Some(sr),
-                bit_depth: Some(out_bd as u32),
-                channels: Some(ch as u32),
-                // What we serve here is a local session over the decoded buffer;
-                // the service's own URL travels on `PrefetchedTrack` so a
-                // recorder still gets the published bytes rather than our
-                // re-encode. A track shorter than the prefetch window is served
-                // from this path, so without it short tracks were the only ones
-                // captured through the proxy — and filed under `Stream/`.
-                origin_url: prefetched.upstream_url,
-                bitrate_kbps: None,
-                cover_url: cover_url.clone(),
-                file_size: Some(file_size),
-            });
-        }
-
+    /// Sortie locale ou PULL : le PCM préchargé est poussé tel quel (converti
+    /// à la profondeur de sortie) dans une session-canal WAV.
+    async fn servir_le_prefetch_en_wav(
+        &self,
+        prefetched: crate::prefetch::PrefetchedTrack,
+        req: &PlayRequest,
+        etiquettes: Etiquettes,
+        out_bd: u16,
+    ) -> Result<ResolvedStream, String> {
+        let Etiquettes {
+            title,
+            artist,
+            album,
+            cover_url,
+            duration_ms,
+        } = etiquettes;
+        let sr = prefetched.sample_rate;
+        let bd = prefetched.bit_depth;
+        let ch = prefetched.channels;
         let wav_info = StreamInfo {
             format: "wav".into(),
             mime_type: "audio/wav".into(),
