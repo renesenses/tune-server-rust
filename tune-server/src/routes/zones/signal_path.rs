@@ -405,118 +405,17 @@ pub(super) fn build_signal_path(
 
     let np = ps.now_playing.as_ref()?;
 
-    // Conteneur réellement servi (None hors session : sortie locale, démarrage).
-    let output_container = wire.map(|w| w.format.as_str());
-    // Fréquence et profondeur réellement émises. Une session fraîchement créée
-    // peut encore porter des zéros (`StreamInfo::default`) : on ne retient que
-    // des valeurs renseignées, sans quoi l'affichage annoncerait « 0kHz/0bit ».
-    let wire_sample_rate = wire.map(|w| w.sample_rate).filter(|v| *v > 0);
-    let wire_bit_depth = wire.map(|w| w.bit_depth).filter(|v| *v > 0);
-    // A decoded live radio has no library row and its NowPlaying resolution is
-    // only the bootstrap value chosen before the decoder opens the upstream.
-    // Once the session publishes its detected PCM format, that observation is
-    // authoritative for the source line too (France Musique: 48 kHz, not the
-    // 44.1 kHz bootstrap value from session creation — #2427).
-    let radio_wire_sample_rate = (np.source == "radio")
-        .then_some(wire_sample_rate)
-        .flatten()
-        .map(|v| v as i32);
-    let radio_wire_bit_depth = (np.source == "radio")
-        .then_some(wire_bit_depth)
-        .flatten()
-        .map(|v| v as i32);
-
-    // Look up track details for format/sample_rate/bit_depth
-    let track = np.track_id.and_then(|tid| {
-        TrackRepo::with_backend(backend.clone())
-            .get(tid)
-            .ok()
-            .flatten()
-    });
-
-    let fmt_str = np
-        .format
-        .clone()
-        .or_else(|| track.as_ref().and_then(|t| t.format.clone()))
-        .unwrap_or_else(|| "flac".into());
-    let source_format = AudioFormat::from_extension(&fmt_str);
-    let is_dsd = matches!(fmt_str.as_str(), "dsd" | "dsf" | "dff");
-    // For DSD files, prefer the track's original sample rate and bit depth
-    // from the database (which represent the SOURCE format: e.g. 2822400 Hz
-    // / 1-bit for DSD64) over the NowPlaying values, which may contain the
-    // TRANSCODED PCM values (e.g. 176400 Hz / 24-bit) when the file was
-    // converted for network output (DLNA, OpenHome, etc.).
-    let sample_rate = if is_dsd {
-        track
-            .as_ref()
-            .and_then(|t| t.sample_rate)
-            .or_else(|| np.sample_rate.map(|v| v as i32))
-            .unwrap_or(2_822_400)
-    } else {
-        radio_wire_sample_rate
-            .or_else(|| np.sample_rate.map(|v| v as i32))
-            .or_else(|| track.as_ref().and_then(|t| t.sample_rate))
-            // Dernier recours quand ni la lecture en cours ni la base ne
-            // savent : le fil, qui décrit ce qui part vraiment. Sans lui on
-            // affichait 44100 en dur — une valeur inventée, affirmée avec le
-            // même aplomb qu'une vraie mesure, et fausse dès que le fichier
-            // était en Hi-Res (métadonnées non lues au scan).
-            .or_else(|| wire_sample_rate.map(|v| v as i32))
-            .unwrap_or(44100)
-    };
-    let bit_depth = if is_dsd {
-        track
-            .as_ref()
-            .and_then(|t| t.bit_depth)
-            .or_else(|| np.bit_depth.map(|v| v as i32))
-            .unwrap_or(1)
-    } else {
-        radio_wire_bit_depth
-            .or_else(|| np.bit_depth.map(|v| v as i32))
-            .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
-            .or_else(|| wire_bit_depth.map(|v| v as i32))
-            .unwrap_or(16)
-    };
-
-    let format_name = if is_dsd {
-        dsd_family_name(sample_rate)
-    } else if let Some(f) = source_format.as_ref() {
-        f.display_name()
-    } else {
-        // A UPnP/NAS media-server source reports its codec as a MIME type or DLNA
-        // profile (e.g. "audio/mp4", "AAC_ISO_320"), not a file extension, so
-        // from_extension() returned None and the signal path showed "Unknown"
-        // (Yves: NAS as source). Recognize the codec from the raw string instead.
-        let l = fmt_str.to_lowercase();
-        let is_m4a = l.contains("mp4") || l.contains("m4a") || l.contains("aac");
-        if l.contains("alac") || (is_m4a && bit_depth >= 24) {
-            // audio/mp4 (M4A) is ambiguous ALAC vs AAC — same container/MIME. A
-            // DIDL res@bitsPerSample >= 24 means lossless ALAC, not lossy AAC
-            // (Yves: NAS ALAC read 24-bit by the DartZeel but shown as AAC here).
-            "ALAC"
-        } else if is_m4a {
-            "AAC"
-        } else if l.contains("mp3") || l.contains("mpeg") {
-            "MP3"
-        } else if l.contains("flac") {
-            "FLAC"
-        } else if l.contains("wav") {
-            "WAV"
-        } else if l.contains("ogg") || l.contains("vorbis") {
-            "OGG"
-        } else if l.contains("opus") {
-            "OPUS"
-        } else {
-            "Unknown"
-        }
-    };
-    // For a media-server source (no from_extension AudioFormat) the lossless
-    // verdict follows the recognized codec name, so a 24-bit ALAC is no longer
-    // shown "Avec perte" (Yves).
-    let is_lossless = source_format
-        .as_ref()
-        .map(|f| f.is_lossless())
-        .unwrap_or_else(|| matches!(format_name, "ALAC" | "FLAC" | "WAV"));
+    let Source {
+        output_container,
+        wire_sample_rate,
+        wire_bit_depth,
+        source_format,
+        is_dsd,
+        sample_rate,
+        bit_depth,
+        format_name,
+        is_lossless,
+    } = decrire_la_source(np, backend, wire);
 
     let output_type = zone.output_type.as_deref().unwrap_or("local");
     // Pour une sortie locale qui sait observer son dernier callback, le réel
@@ -1149,4 +1048,152 @@ pub(super) fn build_signal_path(
         "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
         "dsp_metrics": dsp_metrics,
     }))
+}
+
+/// Ce que la source est, avant tout ce que la sortie lui fait : le premier
+/// bloc de `build_signal_path`, sorti tel quel (REF-4 phase 2, #2219). Les
+/// champs sont les `let` que la suite de la fonction relit, sous leur nom.
+struct Source<'w> {
+    /// Conteneur réellement servi (None hors session : sortie locale, démarrage).
+    output_container: Option<&'w str>,
+    /// Fréquence et profondeur réellement émises, seulement si renseignées.
+    wire_sample_rate: Option<u32>,
+    wire_bit_depth: Option<u16>,
+    source_format: Option<AudioFormat>,
+    is_dsd: bool,
+    sample_rate: i32,
+    bit_depth: i32,
+    format_name: &'static str,
+    is_lossless: bool,
+}
+
+/// Lit la piste, le fil et la lecture en cours pour décrire la source.
+fn decrire_la_source<'w>(
+    np: &tune_core::playback::NowPlaying,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    wire: Option<&'w StreamInfo>,
+) -> Source<'w> {
+    // Conteneur réellement servi (None hors session : sortie locale, démarrage).
+    let output_container = wire.map(|w| w.format.as_str());
+    // Fréquence et profondeur réellement émises. Une session fraîchement créée
+    // peut encore porter des zéros (`StreamInfo::default`) : on ne retient que
+    // des valeurs renseignées, sans quoi l'affichage annoncerait « 0kHz/0bit ».
+    let wire_sample_rate = wire.map(|w| w.sample_rate).filter(|v| *v > 0);
+    let wire_bit_depth = wire.map(|w| w.bit_depth).filter(|v| *v > 0);
+    // A decoded live radio has no library row and its NowPlaying resolution is
+    // only the bootstrap value chosen before the decoder opens the upstream.
+    // Once the session publishes its detected PCM format, that observation is
+    // authoritative for the source line too (France Musique: 48 kHz, not the
+    // 44.1 kHz bootstrap value from session creation — #2427).
+    let radio_wire_sample_rate = (np.source == "radio")
+        .then_some(wire_sample_rate)
+        .flatten()
+        .map(|v| v as i32);
+    let radio_wire_bit_depth = (np.source == "radio")
+        .then_some(wire_bit_depth)
+        .flatten()
+        .map(|v| v as i32);
+
+    // Look up track details for format/sample_rate/bit_depth
+    let track = np.track_id.and_then(|tid| {
+        TrackRepo::with_backend(backend.clone())
+            .get(tid)
+            .ok()
+            .flatten()
+    });
+
+    let fmt_str = np
+        .format
+        .clone()
+        .or_else(|| track.as_ref().and_then(|t| t.format.clone()))
+        .unwrap_or_else(|| "flac".into());
+    let source_format = AudioFormat::from_extension(&fmt_str);
+    let is_dsd = matches!(fmt_str.as_str(), "dsd" | "dsf" | "dff");
+    // For DSD files, prefer the track's original sample rate and bit depth
+    // from the database (which represent the SOURCE format: e.g. 2822400 Hz
+    // / 1-bit for DSD64) over the NowPlaying values, which may contain the
+    // TRANSCODED PCM values (e.g. 176400 Hz / 24-bit) when the file was
+    // converted for network output (DLNA, OpenHome, etc.).
+    let sample_rate = if is_dsd {
+        track
+            .as_ref()
+            .and_then(|t| t.sample_rate)
+            .or_else(|| np.sample_rate.map(|v| v as i32))
+            .unwrap_or(2_822_400)
+    } else {
+        radio_wire_sample_rate
+            .or_else(|| np.sample_rate.map(|v| v as i32))
+            .or_else(|| track.as_ref().and_then(|t| t.sample_rate))
+            // Dernier recours quand ni la lecture en cours ni la base ne
+            // savent : le fil, qui décrit ce qui part vraiment. Sans lui on
+            // affichait 44100 en dur — une valeur inventée, affirmée avec le
+            // même aplomb qu'une vraie mesure, et fausse dès que le fichier
+            // était en Hi-Res (métadonnées non lues au scan).
+            .or_else(|| wire_sample_rate.map(|v| v as i32))
+            .unwrap_or(44100)
+    };
+    let bit_depth = if is_dsd {
+        track
+            .as_ref()
+            .and_then(|t| t.bit_depth)
+            .or_else(|| np.bit_depth.map(|v| v as i32))
+            .unwrap_or(1)
+    } else {
+        radio_wire_bit_depth
+            .or_else(|| np.bit_depth.map(|v| v as i32))
+            .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
+            .or_else(|| wire_bit_depth.map(|v| v as i32))
+            .unwrap_or(16)
+    };
+
+    let format_name = if is_dsd {
+        dsd_family_name(sample_rate)
+    } else if let Some(f) = source_format.as_ref() {
+        f.display_name()
+    } else {
+        // A UPnP/NAS media-server source reports its codec as a MIME type or DLNA
+        // profile (e.g. "audio/mp4", "AAC_ISO_320"), not a file extension, so
+        // from_extension() returned None and the signal path showed "Unknown"
+        // (Yves: NAS as source). Recognize the codec from the raw string instead.
+        let l = fmt_str.to_lowercase();
+        let is_m4a = l.contains("mp4") || l.contains("m4a") || l.contains("aac");
+        if l.contains("alac") || (is_m4a && bit_depth >= 24) {
+            // audio/mp4 (M4A) is ambiguous ALAC vs AAC — same container/MIME. A
+            // DIDL res@bitsPerSample >= 24 means lossless ALAC, not lossy AAC
+            // (Yves: NAS ALAC read 24-bit by the DartZeel but shown as AAC here).
+            "ALAC"
+        } else if is_m4a {
+            "AAC"
+        } else if l.contains("mp3") || l.contains("mpeg") {
+            "MP3"
+        } else if l.contains("flac") {
+            "FLAC"
+        } else if l.contains("wav") {
+            "WAV"
+        } else if l.contains("ogg") || l.contains("vorbis") {
+            "OGG"
+        } else if l.contains("opus") {
+            "OPUS"
+        } else {
+            "Unknown"
+        }
+    };
+    // For a media-server source (no from_extension AudioFormat) the lossless
+    // verdict follows the recognized codec name, so a 24-bit ALAC is no longer
+    // shown "Avec perte" (Yves).
+    let is_lossless = source_format
+        .as_ref()
+        .map(|f| f.is_lossless())
+        .unwrap_or_else(|| matches!(format_name, "ALAC" | "FLAC" | "WAV"));
+    Source {
+        output_container,
+        wire_sample_rate,
+        wire_bit_depth,
+        source_format,
+        is_dsd,
+        sample_rate,
+        bit_depth,
+        format_name,
+        is_lossless,
+    }
 }
