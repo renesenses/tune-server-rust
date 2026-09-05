@@ -958,7 +958,7 @@ async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
 /// dans ce fichier. L'URL était la seule de cloud.rs à rester en dur, ce qui
 /// rendait l'activation de licence intestable autrement qu'en appelant le
 /// serveur de licences de production.
-fn license_validate_url(settings: &SettingsRepo) -> String {
+pub(crate) fn license_validate_url(settings: &SettingsRepo) -> String {
     let base = settings
         .get("mozaik_base_url")
         .ok()
