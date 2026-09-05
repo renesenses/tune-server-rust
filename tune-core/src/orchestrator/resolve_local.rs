@@ -23,7 +23,6 @@ struct DecisionLocale {
     oaat_needs_wav: bool,
     sample_rate: u32,
     source_format: Option<AudioFormat>,
-    track_id: i64,
     zone_max_sample_rate: Option<u32>,
     track_duration_ms: i64,
     track_file_size: Option<i64>,
@@ -299,7 +298,6 @@ impl PlaybackOrchestrator {
             .decider_la_lecture_locale(
                 req,
                 &track,
-                track_id,
                 file_path.clone(),
                 fmt.clone(),
                 source_format,
@@ -421,7 +419,6 @@ impl PlaybackOrchestrator {
         &self,
         req: &PlayRequest,
         track: &crate::db::models::Track,
-        track_id: i64,
         file_path: String,
         fmt: String,
         source_format: Option<AudioFormat>,
@@ -833,7 +830,6 @@ impl PlaybackOrchestrator {
             oaat_needs_wav,
             sample_rate,
             source_format,
-            track_id,
             zone_max_sample_rate,
             track_duration_ms,
             track_file_size,
@@ -1332,8 +1328,8 @@ impl PlaybackOrchestrator {
             // ReplayGain scales the samples, so like the EQ and the FIR it
             // changes the encoded bytes without being part of the cache key.
             // A cached transcode made at a different gain would be served
-            // silently at the wrong level — so a gained transcode is never
-            // cached, and never reads the cache.
+            // silently at the wrong level — so the gain is part of the cache
+            // key (LAT-F2): a rendition is only ever served at its own gain.
             // NOT for a local zone: the local output applies the gain on
             // its own render path, and a local zone with a known source
             // format always comes through here (`local_needs_wav`) — so
@@ -1353,14 +1349,31 @@ impl PlaybackOrchestrator {
                 }
                 _ => None,
             };
-            let cache_path_opt = if eq_profile.is_some()
-                || convolver.is_some()
-                || replaygain_factor.is_some()
-            {
-                None
-            } else {
-                crate::transcode_cache::cache_path(&file_path, &out_ext, out_sr, out_bd, channels)
-            };
+            // LAT-F2 : le traitement entre dans la clé du cache. Une rendition
+            // par réglage — égaliseur (profil canonique), ReplayGain (facteur
+            // exact), convolution (contenu de l'IR) — au lieu de retranscoder
+            // à chaque écoute dès qu'un traitement est actif. Sans traitement,
+            // l'empreinte est `None` et la clé reste celle d'avant.
+            let empreinte_dsp = crate::transcode_cache::empreinte_dsp(
+                eq_profile
+                    .as_ref()
+                    .and_then(|_| self.load_eq_profile(req.zone_id))
+                    .and_then(|p| serde_json::to_string(&p).ok())
+                    .as_deref(),
+                replaygain_factor,
+                convolver
+                    .as_ref()
+                    .and_then(|_| self.octets_ir(req.zone_id))
+                    .as_deref(),
+            );
+            let cache_path_opt = crate::transcode_cache::cache_path_dsp(
+                &file_path,
+                &out_ext,
+                out_sr,
+                out_bd,
+                channels,
+                empreinte_dsp.as_ref(),
+            );
             // The transcode always writes to a fresh `tune-transcode-*` file
             // (subject to the normal cleanup); on success it is atomically
             // renamed into the cache. A crash mid-transcode therefore can
@@ -1460,9 +1473,9 @@ impl PlaybackOrchestrator {
                 // On décode la RENDITION mise en cache, pas la source : c'est
                 // elle qui part au renderer, donc c'est elle que les aiguilles
                 // doivent décrire. Aucune divergence à craindre au passage —
-                // `cache_path_opt` est `None` dès qu'un EQ, une convolution ou
-                // un ReplayGain est en jeu, donc une rendition en cache est
-                // toujours du signal non traité.
+                // la clé du cache porte l'empreinte du traitement (LAT-F2),
+                // donc une rendition en cache est exactement celle que ce
+                // réglage de zone produit.
                 //
                 // Décodage EN FLUX, le PCM part dans un puits, seules les
                 // fenêtres ressortent : matérialiser la piste coûterait
