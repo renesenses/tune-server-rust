@@ -2176,12 +2176,97 @@ fn refus_nommes(instantane: &serde_json::Value) -> Vec<(String, String, String)>
         .unwrap_or_default()
 }
 
+/// Écart minimal entre deux recherches SSDP déclenchées par la connexion d'un
+/// client (LAT-Z3). Même valeur que la cadence courte du scanner : un client
+/// qui se reconnecte en boucle ne doit pas transformer le réseau en rafale de
+/// M-SEARCH.
+const RECHERCHE_A_LA_CONNEXION_ECART_MIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Dernière recherche déclenchée par une connexion ; partagée par tous les
+/// clients — c'est le réseau qu'on protège, pas chaque client.
+static DERNIERE_RECHERCHE_A_LA_CONNEXION: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Une recherche est due si aucune n'est partie, ou si la dernière remonte à
+/// au moins `ecart_min`.
+fn recherche_due(
+    derniere: Option<std::time::Instant>,
+    maintenant: std::time::Instant,
+    ecart_min: std::time::Duration,
+) -> bool {
+    derniere.is_none_or(|d| maintenant.duration_since(d) >= ecart_min)
+}
+
+/// Réserve la fenêtre : rend `true` et note l'instant si une recherche est due,
+/// `false` sinon. Deux clients qui se connectent ensemble n'en déclenchent
+/// qu'une.
+fn reserver_la_recherche(
+    verrou: &std::sync::Mutex<Option<std::time::Instant>>,
+    ecart_min: std::time::Duration,
+) -> bool {
+    let maintenant = std::time::Instant::now();
+    let mut derniere = verrou.lock().unwrap_or_else(|e| e.into_inner());
+    if recherche_due(*derniere, maintenant, ecart_min) {
+        *derniere = Some(maintenant);
+        true
+    } else {
+        false
+    }
+}
+
+/// LAT-Z3 : un client qui se connecte veut voir ses appareils tout de suite,
+/// pas au prochain tour du scanner (30 à 120 s). On lance une recherche SSDP
+/// en tâche détachée — la connexion ne l'attend pas — au plus une par
+/// [`RECHERCHE_A_LA_CONNEXION_ECART_MIN`]. Les réponses passent par le même
+/// chemin qu'une découverte vivante (`handle_ssdp_discovered`).
+pub fn declencher_la_recherche_a_la_connexion(state: &AppState) -> bool {
+    if !reserver_la_recherche(
+        &DERNIERE_RECHERCHE_A_LA_CONNEXION,
+        RECHERCHE_A_LA_CONNEXION_ECART_MIN,
+    ) {
+        return false;
+    }
+    let scanner = state.scanner.clone();
+    tokio::spawn(async move {
+        let appareils = scanner.rescan().await.len();
+        info!(appareils, "ssdp_recherche_a_la_connexion_d_un_client");
+    });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AnnonceAppareil, find_cross_protocol_zone_conflict, may_reanchor, refus_nommes,
         register_discovered_output, resolve_control_url, statut_du_fournisseur,
     };
+
+    /// LAT-Z3 : la règle de la fenêtre — jamais lancée → due ; lancée il y a
+    /// moins de l'écart → pas due ; l'écart atteint → due.
+    #[test]
+    fn la_recherche_a_la_connexion_est_due_une_fois_par_fenetre() {
+        let ecart = std::time::Duration::from_secs(30);
+        let t0 = std::time::Instant::now();
+        assert!(super::recherche_due(None, t0, ecart));
+        assert!(!super::recherche_due(
+            Some(t0),
+            t0 + std::time::Duration::from_secs(5),
+            ecart
+        ));
+        assert!(super::recherche_due(Some(t0), t0 + ecart, ecart));
+    }
+
+    /// Deux clients qui se connectent ensemble ne réservent qu'une recherche ;
+    /// une fois l'écart passé, la suivante repart.
+    #[test]
+    fn deux_connexions_dans_la_fenetre_ne_reservent_qu_une_recherche() {
+        let verrou = std::sync::Mutex::new(None);
+        let ecart = std::time::Duration::from_millis(50);
+        assert!(super::reserver_la_recherche(&verrou, ecart));
+        assert!(!super::reserver_la_recherche(&verrou, ecart));
+        std::thread::sleep(ecart);
+        assert!(super::reserver_la_recherche(&verrou, ecart));
+    }
 
     /// LAT-Z2 : trois renderers connus dont l'adresse ne répond pas sont sondés
     /// ensemble — le tout tient dans une borne (et non trois), et l'ordre du
