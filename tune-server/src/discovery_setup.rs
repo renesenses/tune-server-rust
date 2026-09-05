@@ -949,6 +949,35 @@ async fn handle_ssdp_discovered(
     }
 }
 
+/// Borne d'une sonde de renderer connu au démarrage. Un appareil éteint ne
+/// doit pas retenir les autres : avant LAT-Z2 chaque timeout s'insérait devant
+/// les suivants, le démarrage sondait un par un.
+const SONDE_RENDERER_BORNE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sonde tous les renderers connus EN MÊME TEMPS, chacun borné, et rend les
+/// résultats dans l'ordre reçu — l'appelant applique ensuite séquentiellement.
+/// La durée totale est celle de la sonde la plus lente, plus la borne au pire,
+/// et non la somme.
+async fn sonder_les_renderers_en_parallele(
+    renderers: Vec<KnownRenderer>,
+    borne: std::time::Duration,
+) -> Vec<(
+    KnownRenderer,
+    Option<tune_core::discovery::device::DiscoveredDevice>,
+)> {
+    futures_util::future::join_all(renderers.into_iter().map(|kr| async move {
+        let sonde = tokio::time::timeout(
+            borne,
+            tune_core::discovery::ssdp::probe_renderer(&kr.device_id, &kr.location),
+        )
+        .await
+        .ok()
+        .flatten();
+        (kr, sonde)
+    }))
+    .await
+}
+
 /// Re-probe every persisted renderer at startup and re-register the reachable
 /// ones (#1126).
 ///
@@ -1020,8 +1049,14 @@ pub async fn reregister_known_renderers(state: &AppState) {
 
     let mut seen_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut recovered = 0usize;
-    for kr in renderers {
-        match tune_core::discovery::ssdp::probe_renderer(&kr.device_id, &kr.location).await {
+    // LAT-Z2 : les sondes partent toutes ensemble, chacune bornée, et le
+    // résultat revient dans l'ordre du magasin. L'application (identité,
+    // enregistrement, déduplicat par hôte) reste séquentielle et
+    // déterministe : deux registres de renderers persistés coexistent, avec
+    // des verdicts d'identité qui ne doivent pas courir l'un contre l'autre.
+    let sondes = sonder_les_renderers_en_parallele(renderers, SONDE_RENDERER_BORNE).await;
+    for (kr, sonde) in sondes {
+        match sonde {
             Some(dev) => {
                 // `dev.id` est l'identifiant qu'on VIENT de passer en argument :
                 // `build_renderer_device` le recopie tel quel. Le comparer à
@@ -2147,6 +2182,37 @@ mod tests {
         AnnonceAppareil, find_cross_protocol_zone_conflict, may_reanchor, refus_nommes,
         register_discovered_output, resolve_control_url, statut_du_fournisseur,
     };
+
+    /// LAT-Z2 : trois renderers connus dont l'adresse ne répond pas sont sondés
+    /// ensemble — le tout tient dans une borne (et non trois), et l'ordre du
+    /// magasin est conservé, ce qui garde l'application déterministe.
+    #[tokio::test]
+    async fn les_sondes_des_renderers_connus_partent_ensemble_et_reviennent_dans_l_ordre() {
+        let borne = std::time::Duration::from_millis(800);
+        let renderers: Vec<super::KnownRenderer> = (1..=3)
+            .map(|i| super::KnownRenderer {
+                device_id: format!("uuid:absent-{i}"),
+                location: format!("http://10.255.255.{i}:8080/desc.xml"),
+                name: format!("Absent {i}"),
+                mac: String::new(),
+                manufacturer: String::new(),
+                model: String::new(),
+            })
+            .collect();
+        let depart = std::time::Instant::now();
+        let sondes = super::sonder_les_renderers_en_parallele(renderers, borne).await;
+        let duree = depart.elapsed();
+        assert!(
+            duree < borne * 2,
+            "trois sondes bornées à {borne:?} doivent tenir en parallèle, pas en série : {duree:?}"
+        );
+        let ordre: Vec<&str> = sondes.iter().map(|(kr, _)| kr.device_id.as_str()).collect();
+        assert_eq!(ordre, ["uuid:absent-1", "uuid:absent-2", "uuid:absent-3"]);
+        assert!(
+            sondes.iter().all(|(_, s)| s.is_none()),
+            "aucune adresse ne répond"
+        );
+    }
     use tune_core::db::zone_repo::Zone;
     use tune_core::discovery::device::{DiscoveredDevice, OutputType};
     use tune_core::event_bus::EventBus;
