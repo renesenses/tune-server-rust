@@ -16,6 +16,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::cloud::rate_limit::{self, CloudScope};
 use crate::db::album_repo::AlbumRepo;
 use crate::db::backend::DbBackend;
 use crate::db::metadata_proposal_repo::{
@@ -137,6 +138,18 @@ pub async fn run_cycle(
     now: &str,
 ) -> Result<ProposalCycle, String> {
     let mut cycle = ProposalCycle::default();
+    // Un 429 du cloud est persisté en base (CLD-1) : on respecte son
+    // `Retry-After`, redémarrage compris, sans rappeler le serveur.
+    let settings = SettingsRepo::with_backend(backend.clone());
+    if let Some(backoff) = rate_limit::active(&settings, CloudScope::MetadataProposalsRead) {
+        debug!(
+            scope = backoff.scope,
+            until_epoch = backoff.until_epoch,
+            retry_after_seconds = backoff.retry_after_seconds,
+            "metadata_proposals_deferred_rate_limit"
+        );
+        return Ok(cycle);
+    }
     let repo = MetadataProposalRepo::with_backend(backend.clone());
 
     // 1. Ce que la communaute propose.
@@ -153,6 +166,13 @@ pub async fn run_cycle(
     if !status.is_success() {
         // 429 et 5xx sont des conditions transitoires du cloud communautaire,
         // pas des pannes : on retentera au cycle suivant sans alarmer.
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            rate_limit::defer_from_headers(
+                &settings,
+                CloudScope::MetadataProposalsRead,
+                resp.headers(),
+            );
+        }
         if status.as_u16() == 429 || status.is_server_error() {
             debug!(status = %status, "metadata_proposals_throttled");
             return Ok(cycle);
@@ -229,6 +249,16 @@ pub async fn push_decisions(
     if pending.is_empty() {
         return Ok(0);
     }
+    let settings = SettingsRepo::with_backend(backend.clone());
+    if let Some(backoff) = rate_limit::active(&settings, CloudScope::MetadataDecisionsWrite) {
+        debug!(
+            scope = backoff.scope,
+            until_epoch = backoff.until_epoch,
+            retry_after_seconds = backoff.retry_after_seconds,
+            "metadata_decisions_deferred_rate_limit"
+        );
+        return Ok(0);
+    }
 
     let decisions: Vec<serde_json::Value> = pending
         .iter()
@@ -256,6 +286,13 @@ pub async fn push_decisions(
 
     let status = resp.status();
     if !status.is_success() {
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            rate_limit::defer_from_headers(
+                &settings,
+                CloudScope::MetadataDecisionsWrite,
+                resp.headers(),
+            );
+        }
         if status.as_u16() == 429 || status.is_server_error() {
             debug!(status = %status, "metadata_decisions_throttled");
             return Ok(0);
@@ -339,6 +376,38 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         Arc::new(db)
+    }
+
+    /// CLD-1 : un `Retry-After` encore en cours, lu en base, suffit à ne PAS
+    /// rappeler le cloud. Le client HTTP pointe une adresse injoignable :
+    /// s'il était sollicité, `run_cycle` rendrait une erreur et non le cycle
+    /// vide.
+    #[tokio::test]
+    async fn un_429_en_cours_retient_le_cycle_sans_appeler_le_cloud() {
+        let backend = setup();
+        let settings = SettingsRepo::with_backend(backend.clone());
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("600"),
+        );
+        rate_limit::defer_from_headers(&settings, CloudScope::MetadataProposalsRead, &headers)
+            .expect("un Retry-After pose une echeance");
+
+        let client = crate::http::client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let cycle = run_cycle(
+            &backend,
+            &client,
+            "srv-test",
+            "jeton",
+            "2026-09-05T00:00:00Z",
+        )
+        .await
+        .expect("le cycle retenu n'est pas une erreur");
+        assert_eq!(cycle.fetched, 0, "rien ne doit avoir ete demande au cloud");
     }
 
     /// Cree un album et renvoie son id local.

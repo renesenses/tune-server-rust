@@ -4,7 +4,9 @@ use std::time::Instant;
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
+use crate::cloud::rate_limit::{self, CloudScope};
 use crate::db::backend::{DbBackend, ToSqlValue};
+use crate::db::settings_repo::SettingsRepo;
 
 const CLOUD_LIBRARY_API: &str = "https://mozaiklabs.fr/api/v1/cloud-library";
 const SYNC_BATCH_SIZE: i64 = 200;
@@ -382,6 +384,19 @@ pub async fn push_changes(
 
         // 6. POST batch to cloud API
         if !changes.is_empty() {
+            // Un 429 du cloud est persisté EN BASE (CLD-1) : la synchro respecte
+            // le `Retry-After` reçu, redémarrage compris, au lieu de le
+            // redécouvrir à chaque cycle.
+            let settings = SettingsRepo::with_backend(backend.clone());
+            if let Some(backoff) = rate_limit::active(&settings, CloudScope::LibrarySync) {
+                debug!(
+                    scope = backoff.scope,
+                    until_epoch = backoff.until_epoch,
+                    retry_after_seconds = backoff.retry_after_seconds,
+                    "cloud_library_sync_deferred_rate_limit"
+                );
+                break;
+            }
             let payload = serde_json::json!({
                 "server_id": server_id,
                 "changes": changes,
@@ -408,6 +423,13 @@ pub async fn push_changes(
                     // and retry next cycle quietly instead of spamming a scary
                     // "batch_failed" warning (Jean Valjean saw 429s in his log).
                     // Mirrors the bio_sync throttle handling.
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        rate_limit::defer_from_headers(
+                            &settings,
+                            CloudScope::LibrarySync,
+                            resp.headers(),
+                        );
+                    }
                     if status.as_u16() == 429 || status.is_server_error() {
                         debug!(status = %status, "cloud_library_sync_throttled — retry next cycle");
                         break;
