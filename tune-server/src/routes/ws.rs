@@ -81,6 +81,9 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    // LAT-Z3 : le client veut voir ses appareils maintenant, pas au prochain
+    // tour du scanner. Détaché et borné à une recherche par fenêtre.
+    crate::discovery_setup::declencher_la_recherche_a_la_connexion(&state);
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
