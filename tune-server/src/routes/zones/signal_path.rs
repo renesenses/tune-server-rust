@@ -458,143 +458,22 @@ pub(super) fn build_signal_path(
         dsp_enabled,
     );
 
-    let (transport_bit_perfect, transport_desc, output_format_name) = match output_type {
-        "dlna" | "openhome" => {
-            if wire_wav || dlna_lpcm || dlna_wav24 {
-                // Renderer served WAV/LPCM, not FLAC — the signal path must say
-                // so (a renderer showing "WAV/PCM" otherwise contradicted Tune's
-                // "→ FLAC" label, LHC). Three causes, same wire: the zone forces
-                // 16-bit LPCM (`dlna_lpcm`) or genuine 24-bit WAV (`dlna_wav24`),
-                // or the renderer doesn't advertise `audio/flac` and the
-                // orchestrator fell back to WAV (`dlna_needs_wav`) — detected here
-                // from the live session's real container (`wire_wav`), which the
-                // synchronous builder cannot renegotiate. The plain LPCM fallback
-                // is 16-bit (audio/L16), bit-perfect only when the lossless source
-                // already fits 16 bits (Sevy, #1137). The opt-in `dlna_wav24` path
-                // preserves the full 24-bit source, so it stays bit-perfect.
-                // A *native* WAV source is served byte-for-byte (WAV never
-                // transcodes for DLNA), so it is bit-perfect at any depth
-                // regardless of `dlna_wav24` — which only governs the FLAC/ALAC→WAV
-                // fallback (Sandro/Progman: WAV 24-bit direct showed red without it).
-                let wav_bit_perfect = wav_wire_bit_perfect(
-                    is_lossless,
-                    matches!(source_format, Some(AudioFormat::Wav)),
-                    dlna_wav24,
-                    bit_depth,
-                );
-                (wav_bit_perfect, "DLNA/UPnP", "WAV")
-            } else if needs_transcode_for_output || dlna_cap_16bit {
-                // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
-                // an otherwise-direct FLAC source (Ruark R3, #1137).
-                let target = source_format
-                    .map(|f| f.dlna_transcode_target())
-                    .unwrap_or(AudioFormat::Flac);
-                (false, "DLNA/UPnP", target.display_name())
-            } else {
-                // FLAC, WAV, MP3, AAC → passthrough (bit-perfect for lossless)
-                (true, "DLNA/UPnP", format_name)
-            }
-        }
-        "oaat" => {
-            // Lossless PCM → WAV preserves every bit, but DSD → WAV is a domain
-            // conversion (1-bit sigma-delta decimated to multi-bit PCM), so it is
-            // NOT bit-perfect even though DSD counts as a lossless *format*.
-            (
-                (is_lossless && !is_dsd) || !oaat_transcodes,
-                "OAAT",
-                if oaat_transcodes { "WAV" } else { format_name },
-            )
-        }
-        // AirPlay 1 comme AirPlay 2 : le protocole impose de l'ALAC 44,1/16.
-        // La conversion a lieu POUR DE VRAI, le verdict `false` est donc juste
-        // — c'est le LIBELLÉ qui manquait : sans ce bras, une zone AirPlay 2
-        // (créée par `discovery_setup.rs`, `(Some(Box::new(ap2)), "airplay2")`)
-        // tombait dans le fourre-tout et affichait « airplay2 » en minuscules
-        // comme nom de transport (#2189).
-        "airplay" => (false, "AirPlay", "ALAC"),
-        "airplay2" => (false, "AirPlay 2", "ALAC"),
-        "chromecast" => {
-            if needs_transcode_for_output {
-                let target = source_format.unwrap().dlna_transcode_target();
-                (false, "Chromecast", target.display_name())
-            } else {
-                (false, "Chromecast", format_name)
-            }
-        }
-        "bluos" => {
-            if needs_transcode_for_output {
-                let target = source_format.unwrap().dlna_transcode_target();
-                (false, "BluOS", target.display_name())
-            } else {
-                (true, "BluOS", format_name)
-            }
-        }
-        // `slimproto` EST le protocole Squeezebox, et l'orchestrateur les
-        // traite déjà à l'identique (`is_network_output_type` les liste tous
-        // les deux). Le panneau, lui, ne nommait que `squeezebox` : une zone
-        // créée par le serveur Slimproto (`tune-core/src/slimproto/mod.rs`,
-        // `get_or_create(&player_name, Some("slimproto"), …)`) tombait dans le
-        // fourre-tout et sortait « non bit-perfect » quoi qu'il arrive (#2189).
-        "squeezebox" | "slimproto" => {
-            let transport = if output_type == "slimproto" {
-                "Slimproto"
-            } else {
-                "Squeezebox"
-            };
-            if needs_transcode_for_output {
-                let target = source_format.unwrap().dlna_transcode_target();
-                (false, transport, target.display_name())
-            } else {
-                (true, transport, format_name)
-            }
-        }
-        "browser" => (true, "Browser", format_name),
-        "local" => {
-            // Show the actual audio backend (ASIO / WASAPI / CoreAudio / ALSA)
-            let transport = match audio_backend {
-                "ASIO" => "ASIO (exclusive)",
-                "WASAPI" => "WASAPI",
-                "CoreAudio" => "CoreAudio",
-                "ALSA" => "ALSA",
-                other => other,
-            };
-            (
-                runtime_signal_path
-                    .map(runtime_transport_is_intact)
-                    .unwrap_or(true),
-                transport,
-                format_name,
-            )
-        }
-        // Tout le reste est une sortie PULL : elle va CHERCHER le flux
-        // elle-même et reçoit nos octets TELS QUELS — `hqplayer`, `diretta`,
-        // et tout greffon hors dépôt. Ce bras rendait `false`
-        // INCONDITIONNELLEMENT, et son second membre — la chaîne brute de la
-        // base — servait de nom de transport.
-        //
-        // Alex Campbell (Tune 0.9.98, Linux, sortie HQPlayer, fil 1524) :
-        // « When playing local **or streaming** music files to HQPlayer, Tune
-        // is reporting that it is transcoding. » Le « local OU streaming » est
-        // le fait qui tranche : le symptôme est inconditionnel, ce qu'aucune
-        // règle dépendant du format ne produirait. Une zone HQPlayer était
-        // déclarée non bit-perfect sur un FLAC 44,1/16 servi octet pour octet,
-        // sans EQ ni ReplayGain, sans qu'aucun transcodage n'ait lieu (#2189).
-        //
-        // Le verdict n'est plus écrit ici : il est LU du chemin audio, par la
-        // fonction que celui-ci utilise pour décider
-        // (`orchestrator::is_pull_dsp_output_type`, extraite de
-        // `pull_output_needs_dsp_transcode`). Sur ces sorties le transport ne
-        // touche aucun échantillon ; le seul traitement possible est celui que
-        // cette même fonction force — EQ, correction de pièce, ReplayGain — et
-        // il est déjà compté plus bas par `dsp_applique` et `replaygain_step`.
-        // Le verdict global retombe donc à `false` dès qu'un égaliseur est
-        // armé, exactement là où le transcodage a réellement lieu.
-        other => (
-            tune_core::orchestrator::is_pull_dsp_output_type(Some(other)),
-            libelle_de_transport(other),
-            format_name,
-        ),
-    };
+    let (transport_bit_perfect, transport_desc, output_format_name) = decrire_le_transport(
+        output_type,
+        audio_backend,
+        runtime_signal_path,
+        source_format,
+        format_name,
+        is_lossless,
+        is_dsd,
+        bit_depth,
+        wire_wav,
+        dlna_lpcm,
+        dlna_wav24,
+        dlna_cap_16bit,
+        needs_transcode_for_output,
+        oaat_transcodes,
+    );
 
     // Detect sample rate capping (DSD excluded — the DSD→PCM transcode
     // already handles rate conversion; showing a separate resampler step
@@ -903,6 +782,165 @@ pub(super) fn build_signal_path(
         "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
         "dsp_metrics": dsp_metrics,
     }))
+}
+
+/// Le transport par type de sortie : bit-perfect ou non, son libellé, le
+/// format réellement émis. Quatrième bloc de `build_signal_path`, le `match`
+/// sorti tel quel (REF-4 phase 2, #2219). Rend le triplet que l'hôte liait.
+#[allow(clippy::too_many_arguments)]
+fn decrire_le_transport<'a>(
+    output_type: &'a str,
+    audio_backend: &'a str,
+    runtime_signal_path: Option<&OutputSignalPathStatus>,
+    source_format: Option<AudioFormat>,
+    format_name: &'static str,
+    is_lossless: bool,
+    is_dsd: bool,
+    bit_depth: i32,
+    wire_wav: bool,
+    dlna_lpcm: bool,
+    dlna_wav24: bool,
+    dlna_cap_16bit: bool,
+    needs_transcode_for_output: bool,
+    oaat_transcodes: bool,
+) -> (bool, &'a str, &'static str) {
+    match output_type {
+        "dlna" | "openhome" => {
+            if wire_wav || dlna_lpcm || dlna_wav24 {
+                // Renderer served WAV/LPCM, not FLAC — the signal path must say
+                // so (a renderer showing "WAV/PCM" otherwise contradicted Tune's
+                // "→ FLAC" label, LHC). Three causes, same wire: the zone forces
+                // 16-bit LPCM (`dlna_lpcm`) or genuine 24-bit WAV (`dlna_wav24`),
+                // or the renderer doesn't advertise `audio/flac` and the
+                // orchestrator fell back to WAV (`dlna_needs_wav`) — detected here
+                // from the live session's real container (`wire_wav`), which the
+                // synchronous builder cannot renegotiate. The plain LPCM fallback
+                // is 16-bit (audio/L16), bit-perfect only when the lossless source
+                // already fits 16 bits (Sevy, #1137). The opt-in `dlna_wav24` path
+                // preserves the full 24-bit source, so it stays bit-perfect.
+                // A *native* WAV source is served byte-for-byte (WAV never
+                // transcodes for DLNA), so it is bit-perfect at any depth
+                // regardless of `dlna_wav24` — which only governs the FLAC/ALAC→WAV
+                // fallback (Sandro/Progman: WAV 24-bit direct showed red without it).
+                let wav_bit_perfect = wav_wire_bit_perfect(
+                    is_lossless,
+                    matches!(source_format, Some(AudioFormat::Wav)),
+                    dlna_wav24,
+                    bit_depth,
+                );
+                (wav_bit_perfect, "DLNA/UPnP", "WAV")
+            } else if needs_transcode_for_output || dlna_cap_16bit {
+                // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
+                // an otherwise-direct FLAC source (Ruark R3, #1137).
+                let target = source_format
+                    .map(|f| f.dlna_transcode_target())
+                    .unwrap_or(AudioFormat::Flac);
+                (false, "DLNA/UPnP", target.display_name())
+            } else {
+                // FLAC, WAV, MP3, AAC → passthrough (bit-perfect for lossless)
+                (true, "DLNA/UPnP", format_name)
+            }
+        }
+        "oaat" => {
+            // Lossless PCM → WAV preserves every bit, but DSD → WAV is a domain
+            // conversion (1-bit sigma-delta decimated to multi-bit PCM), so it is
+            // NOT bit-perfect even though DSD counts as a lossless *format*.
+            (
+                (is_lossless && !is_dsd) || !oaat_transcodes,
+                "OAAT",
+                if oaat_transcodes { "WAV" } else { format_name },
+            )
+        }
+        // AirPlay 1 comme AirPlay 2 : le protocole impose de l'ALAC 44,1/16.
+        // La conversion a lieu POUR DE VRAI, le verdict `false` est donc juste
+        // — c'est le LIBELLÉ qui manquait : sans ce bras, une zone AirPlay 2
+        // (créée par `discovery_setup.rs`, `(Some(Box::new(ap2)), "airplay2")`)
+        // tombait dans le fourre-tout et affichait « airplay2 » en minuscules
+        // comme nom de transport (#2189).
+        "airplay" => (false, "AirPlay", "ALAC"),
+        "airplay2" => (false, "AirPlay 2", "ALAC"),
+        "chromecast" => {
+            if needs_transcode_for_output {
+                let target = source_format.unwrap().dlna_transcode_target();
+                (false, "Chromecast", target.display_name())
+            } else {
+                (false, "Chromecast", format_name)
+            }
+        }
+        "bluos" => {
+            if needs_transcode_for_output {
+                let target = source_format.unwrap().dlna_transcode_target();
+                (false, "BluOS", target.display_name())
+            } else {
+                (true, "BluOS", format_name)
+            }
+        }
+        // `slimproto` EST le protocole Squeezebox, et l'orchestrateur les
+        // traite déjà à l'identique (`is_network_output_type` les liste tous
+        // les deux). Le panneau, lui, ne nommait que `squeezebox` : une zone
+        // créée par le serveur Slimproto (`tune-core/src/slimproto/mod.rs`,
+        // `get_or_create(&player_name, Some("slimproto"), …)`) tombait dans le
+        // fourre-tout et sortait « non bit-perfect » quoi qu'il arrive (#2189).
+        "squeezebox" | "slimproto" => {
+            let transport = if output_type == "slimproto" {
+                "Slimproto"
+            } else {
+                "Squeezebox"
+            };
+            if needs_transcode_for_output {
+                let target = source_format.unwrap().dlna_transcode_target();
+                (false, transport, target.display_name())
+            } else {
+                (true, transport, format_name)
+            }
+        }
+        "browser" => (true, "Browser", format_name),
+        "local" => {
+            // Show the actual audio backend (ASIO / WASAPI / CoreAudio / ALSA)
+            let transport = match audio_backend {
+                "ASIO" => "ASIO (exclusive)",
+                "WASAPI" => "WASAPI",
+                "CoreAudio" => "CoreAudio",
+                "ALSA" => "ALSA",
+                other => other,
+            };
+            (
+                runtime_signal_path
+                    .map(runtime_transport_is_intact)
+                    .unwrap_or(true),
+                transport,
+                format_name,
+            )
+        }
+        // Tout le reste est une sortie PULL : elle va CHERCHER le flux
+        // elle-même et reçoit nos octets TELS QUELS — `hqplayer`, `diretta`,
+        // et tout greffon hors dépôt. Ce bras rendait `false`
+        // INCONDITIONNELLEMENT, et son second membre — la chaîne brute de la
+        // base — servait de nom de transport.
+        //
+        // Alex Campbell (Tune 0.9.98, Linux, sortie HQPlayer, fil 1524) :
+        // « When playing local **or streaming** music files to HQPlayer, Tune
+        // is reporting that it is transcoding. » Le « local OU streaming » est
+        // le fait qui tranche : le symptôme est inconditionnel, ce qu'aucune
+        // règle dépendant du format ne produirait. Une zone HQPlayer était
+        // déclarée non bit-perfect sur un FLAC 44,1/16 servi octet pour octet,
+        // sans EQ ni ReplayGain, sans qu'aucun transcodage n'ait lieu (#2189).
+        //
+        // Le verdict n'est plus écrit ici : il est LU du chemin audio, par la
+        // fonction que celui-ci utilise pour décider
+        // (`orchestrator::is_pull_dsp_output_type`, extraite de
+        // `pull_output_needs_dsp_transcode`). Sur ces sorties le transport ne
+        // touche aucun échantillon ; le seul traitement possible est celui que
+        // cette même fonction force — EQ, correction de pièce, ReplayGain — et
+        // il est déjà compté plus bas par `dsp_applique` et `replaygain_step`.
+        // Le verdict global retombe donc à `false` dès qu'un égaliseur est
+        // armé, exactement là où le transcodage a réellement lieu.
+        other => (
+            tune_core::orchestrator::is_pull_dsp_output_type(Some(other)),
+            libelle_de_transport(other),
+            format_name,
+        ),
+    }
 }
 
 /// Ce que la sortie impose à la source : forçages WAV/LPCM, plafond 16 bits,
