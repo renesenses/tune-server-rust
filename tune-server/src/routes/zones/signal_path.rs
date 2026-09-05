@@ -441,7 +441,70 @@ pub(super) fn build_signal_path(
         &traitements,
     );
 
-    // L'assemblage des étapes relit tout sous les noms d'origine.
+    let analyse = Analyse {
+        source,
+        traitements,
+        forcages,
+        transport: (transport_bit_perfect, transport_desc, output_format_name),
+        verdicts,
+    };
+    let bit_perfect = analyse.verdicts.bit_perfect;
+    let is_lossless = analyse.source.is_lossless;
+    let etapes = assembler_les_etapes(
+        ps,
+        zone,
+        renderer_label,
+        output_type,
+        runtime_signal_path,
+        analyse,
+    );
+    Some(json!({
+        "bit_perfect": bit_perfect,
+        // Whether the *source* is a lossless format (FLAC, ALAC, WAV, DSD, …).
+        // Distinct from bit_perfect: a lossless source transcoded to another
+        // lossless container (DSD→FLAC, ALAC→FLAC for a DLNA renderer) is not
+        // bit-perfect but is still lossless — the UI must not call it "lossy".
+        "lossless": is_lossless,
+        "summary": etapes.summary,
+        "steps": etapes.steps,
+        "runtime_observed": runtime_signal_path.is_some(),
+        "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
+        "dsp_metrics": etapes.dsp_metrics,
+    }))
+}
+
+/// Tout ce que `build_signal_path` a établi, prêt à être décrit en étapes
+/// (REF-4 phase 2, #2219). C'est la matière que REF-6 calculera depuis le
+/// modèle typé ; ici, ce sont encore les blocs d'origine, un par champ.
+struct Analyse<'a> {
+    source: Source<'a>,
+    traitements: Traitements,
+    forcages: Forcages,
+    /// (bit-perfect, libellé du transport, format émis).
+    transport: (bool, &'a str, &'static str),
+    verdicts: Verdicts,
+}
+
+/// Les étapes affichées, le résumé et les métriques DSP.
+struct Etapes {
+    steps: Vec<Value>,
+    summary: String,
+    dsp_metrics: Option<Value>,
+}
+
+/// Assemble les étapes du chemin de signal ; sixième bloc de
+/// `build_signal_path`, sorti tel quel, qui relit l'analyse sous les noms
+/// d'origine. Elle prend l'analyse par valeur : ses champs non copiables
+/// (descriptions, étapes optionnelles) y sont consommés.
+fn assembler_les_etapes(
+    ps: &ZoneState,
+    zone: &Zone,
+    renderer_label: Option<&str>,
+    output_type: &str,
+    runtime_signal_path: Option<&OutputSignalPathStatus>,
+    analyse: Analyse<'_>,
+) -> Etapes {
+    let (transport_bit_perfect, transport_desc, output_format_name) = analyse.transport;
     let Source {
         wire_sample_rate,
         wire_bit_depth,
@@ -451,7 +514,7 @@ pub(super) fn build_signal_path(
         format_name,
         is_lossless,
         ..
-    } = source;
+    } = analyse.source;
     let Traitements {
         eq_step_description,
         replaygain_step,
@@ -459,7 +522,7 @@ pub(super) fn build_signal_path(
         ui_volume,
         volume_full,
         ..
-    } = traitements;
+    } = analyse.traitements;
     let Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
@@ -470,14 +533,12 @@ pub(super) fn build_signal_path(
         is_oaat,
         oaat_transcodes,
         wire_wav,
-    } = forcages;
+    } = analyse.forcages;
     let Verdicts {
         resampling_active,
         bit_perfect,
         bitrate_label,
-    } = verdicts;
-
-    // Build steps
+    } = analyse.verdicts;
     let source_desc = if is_dsd {
         // DSD rates are in MHz range — display as e.g. "DSD64 2.8 MHz" or "DSD128 5.6 MHz"
         dsd_resolution_label(sample_rate)
@@ -723,20 +784,11 @@ pub(super) fn build_signal_path(
     } else {
         format!("{format_name} \u{2192} {transport_desc}{bp_label}")
     };
-
-    Some(json!({
-        "bit_perfect": bit_perfect,
-        // Whether the *source* is a lossless format (FLAC, ALAC, WAV, DSD, …).
-        // Distinct from bit_perfect: a lossless source transcoded to another
-        // lossless container (DSD→FLAC, ALAC→FLAC for a DLNA renderer) is not
-        // bit-perfect but is still lossless — the UI must not call it "lossy".
-        "lossless": is_lossless,
-        "summary": summary,
-        "steps": steps,
-        "runtime_observed": runtime_signal_path.is_some(),
-        "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
-        "dsp_metrics": dsp_metrics,
-    }))
+    Etapes {
+        steps,
+        summary,
+        dsp_metrics,
+    }
 }
 
 /// Les verdicts : rééchantillonnage actif, bit-perfect global, débit annoncé.
