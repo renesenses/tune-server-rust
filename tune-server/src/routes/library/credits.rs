@@ -158,6 +158,22 @@ pub(super) async fn artist_credits(
     Ok(Json(json!(items)))
 }
 
+/// Écrit sur la piste l'enregistrement retenu par le score (CRD-3), pour que
+/// la passe globale et les crédits d'album le retrouvent sans rechercher.
+fn retenir_le_mbid(state: &AppState, track_id: i64, mbid: &str) {
+    let e = state.backend.engine();
+    let m = |i: usize| crate::routes::versions::marqueur(e, i);
+    let sql = format!(
+        "UPDATE tracks SET musicbrainz_recording_id = {} WHERE id = {}",
+        m(1),
+        m(2)
+    );
+    let params: [&dyn tune_core::db::backend::ToSqlValue; 2] = [&mbid, &track_id];
+    if let Err(err) = state.backend.execute(&sql, &params) {
+        tracing::warn!(track_id, error = %err, "credits_mbid_retenu_non_ecrit");
+    }
+}
+
 pub(super) async fn enrich_track_credits(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -168,9 +184,34 @@ pub(super) async fn enrich_track_credits(
         _ => return Json(json!({"enriched": false, "reason": "track not found"})).into_response(),
     };
 
-    let Some(ref mbid) = track.musicbrainz_recording_id else {
-        return Json(json!({"enriched": false, "reason": "no MusicBrainz recording ID"}))
-            .into_response();
+    let mbid = match track
+        .musicbrainz_recording_id
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+    {
+        Some(m) => m,
+        None => {
+            // CRD-3 : sans MBID (99 % des pistes mesurées sur .18), on cherche
+            // l'enregistrement et on ne retient qu'un appariement au-dessus du
+            // seuil — jamais « le premier résultat ». Le MBID retenu est écrit
+            // sur la piste : la passe globale le reverra.
+            let Some(choix) = tune_core::metadata::credits_mb::rechercher_l_enregistrement(
+                &state.http_client,
+                &track.title,
+                track.artist_name.as_deref().unwrap_or(""),
+                Some(track.duration_ms),
+            )
+            .await
+            else {
+                return Json(json!({
+                    "enriched": false,
+                    "reason": "no MusicBrainz recording matched above threshold",
+                }))
+                .into_response();
+            };
+            retenir_le_mbid(&state, id, &choix.mbid);
+            choix.mbid
+        }
     };
 
     let url = format!(

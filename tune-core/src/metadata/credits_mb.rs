@@ -195,10 +195,250 @@ pub fn lignes_credits(data: &Value) -> Vec<LigneCredit> {
     out
 }
 
+/// Un enregistrement MusicBrainz retenu pour une piste sans MBID (CRD-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidatEnregistrement {
+    pub mbid: String,
+    pub score: i32,
+}
+
+/// En dessous de ce score, on ne retient RIEN : mieux vaut aucun crédit qu'un
+/// crédit d'un autre morceau. Titre exact + artiste exact = 75 ; titre
+/// approchant + artiste exact + durée à moins de 3 s = 65 ; titre approchant
+/// + artiste exact sans durée = 45, refusé.
+pub const SCORE_MINIMAL_ENREGISTREMENT: i32 = 60;
+
+/// Score d'un enregistrement candidat contre la piste. Chaque composante est
+/// nommée pour que le seuil se lise : titre (45 exact, 15 si l'un contient
+/// l'autre), artiste-crédit (30 exact, 10 contenu), durée (20 à ±3 s, 8 à
+/// ±10 s, −20 au-delà de 30 s, 0 sans durée), et le dixième du score que
+/// MusicBrainz attribue lui-même à sa réponse.
+pub fn score_enregistrement(
+    titre: &str,
+    artiste: &str,
+    duree_ms: Option<i64>,
+    enregistrement: &Value,
+) -> i32 {
+    let t = normaliser(titre);
+    let a = normaliser(artiste);
+    let rec_titre = normaliser(enregistrement["title"].as_str().unwrap_or(""));
+    let mut score = 0;
+    if !t.is_empty() && rec_titre == t {
+        score += 45;
+    } else if !t.is_empty()
+        && !rec_titre.is_empty()
+        && (rec_titre.contains(&t) || t.contains(&rec_titre))
+    {
+        score += 15;
+    }
+    if !a.is_empty() {
+        let noms: Vec<String> = enregistrement["artist-credit"]
+            .as_array()
+            .map(|v| {
+                v.iter()
+                    .filter_map(|ac| {
+                        ac["name"]
+                            .as_str()
+                            .or_else(|| ac["artist"]["name"].as_str())
+                    })
+                    .map(normaliser)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if noms.contains(&a) {
+            score += 30;
+        } else if noms
+            .iter()
+            .any(|n| n.contains(&a) || a.contains(n.as_str()))
+        {
+            score += 10;
+        }
+    }
+    if let (Some(d), Some(l)) = (
+        duree_ms.filter(|d| *d > 0),
+        enregistrement["length"].as_i64(),
+    ) {
+        let ecart = (d - l).abs();
+        score += if ecart <= 3_000 {
+            20
+        } else if ecart <= 10_000 {
+            8
+        } else if ecart > 30_000 {
+            -20
+        } else {
+            0
+        };
+    }
+    score += enregistrement["score"].as_i64().unwrap_or(0).clamp(0, 100) as i32 / 10;
+    score
+}
+
+/// Choisit, parmi les `recordings` d'une réponse de recherche MusicBrainz,
+/// celui qui dépasse le seuil avec le meilleur score — le premier à égalité,
+/// et `None` si aucun ne l'atteint. Le « premier résultat » d'avant prenait
+/// un morceau homonyme d'un autre artiste sans sourciller.
+pub fn choisir_l_enregistrement(
+    titre: &str,
+    artiste: &str,
+    duree_ms: Option<i64>,
+    reponse: &Value,
+) -> Option<CandidatEnregistrement> {
+    let recordings = reponse["recordings"].as_array()?;
+    let mut meilleur: Option<CandidatEnregistrement> = None;
+    for rec in recordings {
+        let Some(mbid) = rec["id"].as_str() else {
+            continue;
+        };
+        let score = score_enregistrement(titre, artiste, duree_ms, rec);
+        if score >= SCORE_MINIMAL_ENREGISTREMENT
+            && meilleur.as_ref().is_none_or(|m| score > m.score)
+        {
+            meilleur = Some(CandidatEnregistrement {
+                mbid: mbid.to_string(),
+                score,
+            });
+        }
+    }
+    meilleur
+}
+
+/// Cherche l'enregistrement d'une piste sans MBID et le retient seulement
+/// au-dessus du seuil. Le client est fourni par l'appelant (couture HTTP
+/// unique du serveur). Cinq résultats suffisent : le score tranche, pas la
+/// position.
+pub async fn rechercher_l_enregistrement(
+    client: &reqwest::Client,
+    titre: &str,
+    artiste: &str,
+    duree_ms: Option<i64>,
+) -> Option<CandidatEnregistrement> {
+    let titre = titre.trim();
+    if titre.is_empty() {
+        return None;
+    }
+    let echappe = |s: &str| s.replace('"', " ");
+    let query = if artiste.trim().is_empty() {
+        format!("recording:\"{}\"", echappe(titre))
+    } else {
+        format!(
+            "recording:\"{}\" AND artist:\"{}\"",
+            echappe(titre),
+            echappe(artiste.trim())
+        )
+    };
+    let resp = client
+        .get("https://musicbrainz.org/ws/2/recording")
+        .query(&[("query", query.as_str()), ("limit", "5"), ("fmt", "json")])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: Value = resp.json().await.ok()?;
+    choisir_l_enregistrement(titre, artiste, duree_ms, &data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn reponse(recs: Vec<Value>) -> Value {
+        json!({ "recordings": recs })
+    }
+    fn rec(id: &str, titre: &str, artiste: &str, length: Option<i64>, score_mb: i64) -> Value {
+        let mut r = json!({ "id": id, "title": titre, "score": score_mb,
+            "artist-credit": [{ "name": artiste, "artist": { "name": artiste } }] });
+        if let Some(l) = length {
+            r["length"] = json!(l);
+        }
+        r
+    }
+
+    /// CRD-3 : le premier résultat n'est plus roi. Un homonyme d'un autre
+    /// artiste, mieux classé par MusicBrainz, est écarté au profit de
+    /// l'enregistrement dont titre, artiste et durée concordent.
+    #[test]
+    fn le_score_prefere_la_concordance_au_premier_resultat() {
+        let r = reponse(vec![
+            rec(
+                "mb-homonyme",
+                "Hallelujah",
+                "Jeff Buckley",
+                Some(413_000),
+                100,
+            ),
+            rec(
+                "mb-le-bon",
+                "Hallelujah",
+                "Leonard Cohen",
+                Some(274_000),
+                90,
+            ),
+        ]);
+        let choix =
+            choisir_l_enregistrement("Hallelujah", "Leonard Cohen", Some(275_000), &r).unwrap();
+        assert_eq!(choix.mbid, "mb-le-bon");
+        assert!(choix.score >= 45 + 30 + 20 + 9, "{}", choix.score);
+    }
+
+    /// Sous le seuil, rien : un titre approchant chez le bon artiste mais sans
+    /// durée ne suffit pas ; un titre exact du bon artiste suffit même sans
+    /// durée.
+    #[test]
+    fn sous_le_seuil_aucun_enregistrement_n_est_retenu() {
+        let approchant = reponse(vec![rec(
+            "mb-approx",
+            "Hallelujah (Live)",
+            "Leonard Cohen",
+            None,
+            80,
+        )]);
+        assert_eq!(
+            choisir_l_enregistrement("Hallelujah", "Leonard Cohen", None, &approchant),
+            None
+        );
+        let exact = reponse(vec![rec(
+            "mb-exact",
+            "Hallelujah",
+            "Leonard Cohen",
+            None,
+            80,
+        )]);
+        assert_eq!(
+            choisir_l_enregistrement("Hallelujah", "Leonard Cohen", None, &exact).map(|c| c.mbid),
+            Some("mb-exact".to_string())
+        );
+        assert_eq!(
+            choisir_l_enregistrement("Hallelujah", "Leonard Cohen", None, &json!({})),
+            None
+        );
+    }
+
+    /// Les composantes du score, une à une : une durée à plus de 30 s pénalise,
+    /// la casse et la ponctuation ne comptent pas.
+    #[test]
+    fn les_composantes_du_score_se_lisent_une_a_une() {
+        let r = rec("x", "Don't Stop Me Now", "Queen", Some(209_000), 0);
+        assert_eq!(
+            score_enregistrement("don't stop me now", "queen", Some(210_000), &r),
+            45 + 30 + 20
+        );
+        assert_eq!(
+            score_enregistrement("Don't Stop Me Now", "Queen", Some(260_000), &r),
+            45 + 30 - 20
+        );
+        assert_eq!(
+            score_enregistrement("Don't Stop Me Now", "Queen", None, &r),
+            45 + 30
+        );
+        assert_eq!(score_enregistrement("Stop Me", "Queen", None, &r), 15 + 30);
+        assert_eq!(
+            score_enregistrement("Autre chose", "Quelqu'un", None, &r),
+            0
+        );
+    }
 
     // Les trois tests du canon d'instrument suivent la table : ils vivent
     // dans `tune_core::metadata::instruments`.
