@@ -6,12 +6,18 @@
 /// arrive. Vécu le jour même sur un autre garde-fou (#2082) : il avait
 /// survécu au sabotage de la condition qu'il prétendait garder.
 fn code_de_production() -> &'static str {
-    const TOUT: &str = include_str!("../zones.rs");
-    const BORNE: &str = "mod charge_utile_zone_guard";
-    let fin = TOUT
-        .find(BORNE)
-        .unwrap_or_else(|| panic!("module renommé : la découpe ne protège plus rien"));
-    &TOUT[..fin]
+    static PRODUCTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PRODUCTION.get_or_init(|| {
+        const TOUT: &str = include_str!("../zones.rs");
+        const BORNE: &str = "mod charge_utile_zone_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("module renommé : la découpe ne protège plus rien"));
+        // Les deux `obj.insert(…)` de la charge utile vivent dans le module
+        // enfant `lecture` (`list_zones`, `get_zone`) depuis REF-4 (#2219) :
+        // il se lit à la suite de zones.rs, avant sa borne.
+        format!("{}{}", &TOUT[..fin], include_str!("lecture.rs"))
+    })
 }
 
 /// 🔴 Le point aveugle qui a laissé passer la troisième copie (#2055).

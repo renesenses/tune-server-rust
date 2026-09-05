@@ -649,10 +649,35 @@ mod eq_refresh_guard {
         })
     }
 
+    /// REF-4 (#2219) : un module de PRODUCTION sorti d'un fichier de routes en
+    /// module enfant (`mod <nom>;` sans `#[cfg(test)]` dans `<dossier>.rs`) est
+    /// un morceau de ce fichier, pas une route à part. Il se lit AVEC son
+    /// parent, sous le nom du parent : la granularité « au fichier de route »
+    /// est conservée telle quelle (`zones.rs` + `zones/signal_path.rs` = ce
+    /// que `zones.rs` était). Rend le nom du fichier parent.
+    fn parent_de_production(chemin: &Path) -> Option<String> {
+        let dossier = chemin.parent()?;
+        let nom = chemin.file_stem()?.to_str()?;
+        let fichier_parent = dossier.with_extension("rs");
+        let parent = fs::read_to_string(&fichier_parent).ok()?;
+        let lignes: Vec<&str> = parent.lines().map(str::trim).collect();
+        let declare = lignes.iter().enumerate().any(|(i, l)| {
+            *l == format!("mod {nom};")
+                && !lignes[i.saturating_sub(3)..i]
+                    .iter()
+                    .any(|a| *a == "#[cfg(test)]")
+        });
+        if !declare {
+            return None;
+        }
+        fichier_parent.file_name()?.to_str().map(str::to_string)
+    }
+
     #[test]
     fn every_route_writing_a_dsp_setting_refreshes_the_live_output() {
         let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
         let mut sources: Vec<(String, String)> = Vec::new();
+        let mut enfants: Vec<(Option<String>, usize)> = Vec::new();
 
         let mut piles = vec![racine.clone()];
         while let Some(dir) = piles.pop() {
@@ -677,7 +702,19 @@ mod eq_refresh_guard {
                     nom,
                     fs::read_to_string(&chemin).expect("lecture du fichier"),
                 ));
+                enfants.push((parent_de_production(&chemin), sources.len() - 1));
             }
+        }
+        // Les modules enfants de production rejoignent le texte de leur parent.
+        for (parent, index) in enfants.into_iter().rev() {
+            let Some(parent) = parent else { continue };
+            let (_, texte) = sources.remove(index);
+            let (_, source_parent) = sources
+                .iter_mut()
+                .find(|(nom, _)| *nom == parent)
+                .unwrap_or_else(|| panic!("le fichier parent {parent} doit être dans src/routes"));
+            source_parent.push('\n');
+            source_parent.push_str(&texte);
         }
 
         for (cle, rafraichisseur) in REGLAGES_A_RAFRAICHIR {

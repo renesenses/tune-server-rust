@@ -64,8 +64,13 @@ use tune_core::poller::fsm::{
     ConsommationFlux, StoppedInput, StoppedOutcome, classify_stopped, consommation_flux,
 };
 
-/// Le source du sondeur, lu à la compilation — voir l'épreuve 4.
-const SOURCE_POLLER: &str = include_str!("../src/poller.rs");
+/// Le source du sondeur, lu à la compilation — voir l'épreuve 4. `tick`, qui
+/// porte le bras du seuil d'échec, vit dans son propre module depuis REF-1
+/// (#2219) et se lit en premier, comme dans le fichier d'origine.
+const SOURCE_POLLER: &str = concat!(
+    include_str!("../src/poller/tick.rs"),
+    include_str!("../src/poller.rs")
+);
 
 /// `STOPPED_FAILURE_THRESHOLD` vaut 30 et le bras applique son propre `+1` :
 /// 29 ticks en entrée placent la décision exactement AU seuil.
@@ -189,10 +194,12 @@ fn un_flux_qui_delivre_ne_change_pas() {
 fn branche_du_seuil_d_echec() -> &'static str {
     let debut = SOURCE_POLLER
         .find("} else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {")
-        .expect("le bras du seuil d'échec a disparu de poller.rs");
+        .expect("le bras du seuil d'échec a disparu de poller.rs et poller/tick.rs");
     let fin = SOURCE_POLLER[debut..]
         .find("\"stopped_early_waiting\"")
-        .expect("la branche suivante (stopped_early_waiting) a disparu de poller.rs");
+        .expect(
+            "la branche suivante (stopped_early_waiting) a disparu de poller.rs et poller/tick.rs",
+        );
     &SOURCE_POLLER[debut..debut + fin]
 }
 

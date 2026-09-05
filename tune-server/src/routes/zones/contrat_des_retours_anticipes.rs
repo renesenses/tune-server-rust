@@ -9,15 +9,30 @@ use tune_core::db::zone_repo::ZoneRepo;
 /// la fonction marche, pas qu'on l'appelle.
 #[test]
 fn les_retours_anticipes_passent_par_le_contrat() {
-    let src = std::fs::read_to_string(std::path::Path::new("src/routes/zones.rs"))
-        .expect("zones.rs doit être lisible depuis la racine du crate");
+    // `create_zone` vit dans le module enfant `ecriture` depuis REF-4 (#2219).
+    let src = std::fs::read_to_string(std::path::Path::new("src/routes/zones/ecriture.rs"))
+        .expect("zones/ecriture.rs doit être lisible depuis la racine du crate");
     let debut = src
         .find("async fn create_zone(")
         .expect("create_zone doit exister");
-    let fin = src[debut..]
-        .find("\nasync fn ")
-        .map(|i| debut + i)
-        .unwrap_or(src.len());
+    // La fonction suivante, quelle que soit sa visibilité : les items sortis
+    // sont `pub(super)`, et une fenêtre ouverte jusqu'à la fin du fichier ne
+    // mesurerait plus rien.
+    let fin = [
+        "\nasync fn ",
+        "\npub async fn ",
+        "\npub(super) async fn ",
+        "\npub(crate) async fn ",
+        "\nfn ",
+        "\npub fn ",
+        "\npub(super) fn ",
+        "\npub(crate) fn ",
+    ]
+    .iter()
+    .filter_map(|m| src[debut + 1..].find(m))
+    .min()
+    .map(|i| debut + 1 + i)
+    .expect("une fonction doit suivre create_zone — sinon ce test ne borne plus rien");
     let corps = &src[debut..fin];
 
     assert_eq!(

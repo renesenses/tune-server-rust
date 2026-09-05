@@ -1327,11 +1327,15 @@ mod tests {
     fn aucune_route_ne_rebaptise_un_demi_rtt_en_latence_audio() {
         let manager = include_str!("zone_manager.rs");
         let zones = include_str!("zones.rs");
+        // Les routes de groupe (calibrage, santé) vivent dans leur module
+        // enfant depuis REF-4 (#2219) : la garde les relit avec zones.rs.
+        let groupes = include_str!("zones/groupes.rs");
 
         let demi_rtt = concat!("rtt_ms", " / 2");
         let fausse_estimation = concat!("estimated_", "latency_ms");
         assert!(!manager.contains(demi_rtt));
         assert!(!zones.contains(demi_rtt));
+        assert!(!groupes.contains(demi_rtt));
         assert!(!manager.contains(fausse_estimation));
     }
 }
