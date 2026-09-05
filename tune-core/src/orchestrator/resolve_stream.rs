@@ -8,6 +8,10 @@ enum FluxOuFini {
     Fini(ResolvedStream),
 }
 
+/// Ce qu'un flux HTTPS rend à `resoudre_flux_https` : URL à jouer, session
+/// éventuelle, type MIME servi, taille connue.
+type FluxHttps = (String, Option<String>, String, Option<u64>);
+
 impl PlaybackOrchestrator {
     /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
     /// radios du MediaServer.
@@ -1241,53 +1245,305 @@ impl PlaybackOrchestrator {
         stream_data: &crate::streaming::StreamUrl,
         info: StreamInfo,
         is_https: bool,
-    ) -> Result<(String, Option<String>, String, Option<u64>), String> {
-        let flux = {
-            let codec_lower = stream_data.quality.codec.to_lowercase();
-            // Codecs that legacy DLNA renderers can't decode must be
-            // pre-transcoded to FLAC. AAC/MP4 (most renderers reject AAC over
-            // DLNA) plus Opus/Ogg-Vorbis: YouTube delivers Opus-in-WebM, which
-            // old renderers like the Cyrus Stream X reject outright (no
-            // audio/webm or audio/opus sink), leaving the transport in
-            // ERROR_OCCURRED.
-            let needs_flac_transcode = codec_lower == "aac"
-                || codec_lower == "mp4"
-                || stream_data.mime_type.contains("mp4")
-                || AudioFormat::from_extension(&codec_lower)
-                    .is_some_and(|f| f.needs_transcode_for_dlna());
+    ) -> Result<FluxHttps, String> {
+        let codec_lower = stream_data.quality.codec.to_lowercase();
+        // Codecs that legacy DLNA renderers can't decode must be
+        // pre-transcoded to FLAC. AAC/MP4 (most renderers reject AAC over
+        // DLNA) plus Opus/Ogg-Vorbis: YouTube delivers Opus-in-WebM, which
+        // old renderers like the Cyrus Stream X reject outright (no
+        // audio/webm or audio/opus sink), leaving the transport in
+        // ERROR_OCCURRED.
+        let needs_flac_transcode = codec_lower == "aac"
+            || codec_lower == "mp4"
+            || stream_data.mime_type.contains("mp4")
+            || AudioFormat::from_extension(&codec_lower)
+                .is_some_and(|f| f.needs_transcode_for_dlna());
 
-            if needs_flac_transcode {
-                // AAC/MP4 streams need transcoding for DLNA — most renderers
-                // (DMP-A8, etc.) don't support AAC via DLNA.  Pre-transcode to
-                // FLAC temp file so we serve with Content-Length (chunked WAV
-                // causes noise on many renderers).
-                let sr = stream_data.quality.sample_rate;
-                let bd = stream_data.quality.bit_depth.max(16).min(24) as u16;
+        if needs_flac_transcode {
+            self.pretranscoder_en_flac(req, service_name, stream_data, codec_lower)
+                .await
+        } else {
+            self.relayer_le_flux(
+                req,
+                source_id,
+                service_name,
+                stream_data,
+                info,
+                is_https,
+                codec_lower,
+            )
+            .await
+        }
+    }
+
+    /// Premier temps, codecs que les renderers DLNA anciens refusent (AAC,
+    /// MP4, Opus) : téléchargement puis pré-transcodage en FLAC, servi par
+    /// une session de fichier avec Content-Length.
+    async fn pretranscoder_en_flac(
+        &self,
+        req: &PlayRequest,
+        service_name: &str,
+        stream_data: &crate::streaming::StreamUrl,
+        codec_lower: String,
+    ) -> Result<FluxHttps, String> {
+        let flux = {
+            // AAC/MP4 streams need transcoding for DLNA — most renderers
+            // (DMP-A8, etc.) don't support AAC via DLNA.  Pre-transcode to
+            // FLAC temp file so we serve with Content-Length (chunked WAV
+            // causes noise on many renderers).
+            let sr = stream_data.quality.sample_rate;
+            let bd = stream_data.quality.bit_depth.max(16).min(24) as u16;
+
+            info!(
+                service = service_name,
+                codec = %codec_lower,
+                sample_rate = sr,
+                "streaming_aac_transcode_to_wav_channel"
+            );
+
+            // ── Téléchargement court, puis CANAL streaming ──
+            //
+            // L'ancien chemin transcodait la PISTE ENTIÈRE en fichier avant
+            // de jouer : télécharger + tout décoder + tout encoder = 34 s
+            // mesurées entre la décision et le play (Tidal AAC → DMP-A8,
+            // .18, 25/08). Le canal WAV — le chemin des DSD et des radios,
+            // au contrat rendu honnête en 0.9.106 — démarre dès les
+            // premiers blocs décodés. Seul le téléchargement du fichier
+            // AAC reste devant le play : quelques secondes.
+            let upstream_url = stream_data.url.clone();
+            let codec = codec_lower.clone();
+            let tmp_dl = std::env::temp_dir()
+                .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
+                .to_string_lossy()
+                .to_string();
+            let tmp_dl_clone = tmp_dl.clone();
+            let dl = tokio::task::spawn_blocking(move || {
+                let resp = crate::http::client::blocking_builder()
+                    .timeout(std::time::Duration::from_secs(120))
+                    .build()
+                    .and_then(|c| c.get(&upstream_url).send())
+                    .map_err(|e| format!("upstream fetch: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!("upstream HTTP {}", resp.status()));
+                }
+                let bytes = resp.bytes().map_err(|e| format!("download: {e}"))?;
+                std::fs::write(&tmp_dl_clone, &bytes).map_err(|e| format!("write dl: {e}"))?;
+                Ok::<(), String>(())
+            })
+            .await;
+            match dl {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %e, "streaming_aac_download_failed");
+                    let _ = std::fs::remove_file(&tmp_dl);
+                    return Err(format!("AAC download failed: {e}"));
+                }
+                Err(e) => {
+                    warn!(error = %e, "streaming_aac_download_task_panic");
+                    let _ = std::fs::remove_file(&tmp_dl);
+                    return Err(format!("AAC download task panic: {e}"));
+                }
+            }
+
+            let info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: sr,
+                bit_depth: bd,
+                channels: 2,
+                ..Default::default()
+            };
+            let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+            // Chaîne DSP de la zone (#2863). Ce bras servait le PCM décodé
+            // TEL QUEL : égaliseur, convolveur et ReplayGain y étaient
+            // calculés côté interface puis jetés. Le relais les applique au
+            // fil de l'eau, sans rien bufferiser de plus — le démarrage
+            // immédiat conquis en 0.9.106 est préservé. Sans traitement
+            // actif, le canal reste celui d'avant, à l'octet près.
+            let aac_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+            let tx = if aac_dsp.is_active() {
+                info!(
+                    zone_id = req.zone_id,
+                    "streaming_aac_channel_dsp_relay_inserted"
+                );
+                spawn_streaming_dsp_relay(aac_dsp, bd, true, tx)
+            } else {
+                tx
+            };
+            {
+                let sessions = self.streamer.sessions_state();
+                let sessions = sessions.lock().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    session
+                        .wav_header_included
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+
+            let ev_bus = self.event_bus.clone();
+            let playback = self.playback.clone();
+            let zone_id = req.zone_id;
+            let attach_levels = self.levels_attach_allowed(zone_id);
+            let fp = tmp_dl.clone();
+            tokio::spawn(async move {
+                let err_bus = ev_bus.clone();
+                let levels_tx = match ev_bus.filter(|_| attach_levels) {
+                    Some(bus) => {
+                        let play_seq = playback.current_play_seq(zone_id).await;
+                        spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0)
+                    }
+                    None => {
+                        tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0
+                    }
+                };
+                let fp_clone = fp.clone();
+                let tx_clone = tx.clone();
+                drop(tx);
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::audio::decode::decode_to_pcm_streaming_seeked(
+                        &fp_clone,
+                        Some(sr),
+                        Some(2),
+                        Some(bd),
+                        tx_clone,
+                        32768,
+                        data_ready,
+                        levels_tx,
+                        0.0,
+                    )
+                })
+                .await;
+                let _ = std::fs::remove_file(&fp);
+                match result {
+                    Ok(Ok(_)) => {
+                        debug!("streaming_aac_channel_complete");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "streaming_aac_channel_decode_failed");
+                        if let Some(ref bus) = err_bus {
+                            bus.emit(
+                                "zone.playback_error",
+                                serde_json::json!({
+                                    "zone_id": zone_id,
+                                    "error": format!("Impossible de décoder la piste : {e}"),
+                                }),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "streaming_aac_channel_task_panic");
+                    }
+                }
+            });
+
+            let server_ip = self.server_ip();
+            let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+            (url, Some(session_id), "audio/wav".to_string(), None)
+        };
+        Ok(flux)
+    }
+
+    /// Second temps, codecs sans perte : le renderer accepte-t-il ce type
+    /// MIME ? Sinon transcodage WAV (LPCM) ; sinon relais du flux CDN par
+    /// session mandataire, bit-perfect, avec la sonde de niveaux en parallèle.
+    #[allow(clippy::too_many_arguments)] // les arguments de `resoudre_flux_https`, plus le codec
+    async fn relayer_le_flux(
+        &self,
+        req: &PlayRequest,
+        source_id: &str,
+        service_name: &str,
+        stream_data: &crate::streaming::StreamUrl,
+        info: StreamInfo,
+        is_https: bool,
+        codec_lower: String,
+    ) -> Result<FluxHttps, String> {
+        let flux = {
+            // Non-AAC codecs (FLAC, etc.) — check if the DLNA renderer
+            // actually supports this MIME type before proxying directly.
+            // Strict renderers (Denon, Marantz, Revox) reject FLAC because
+            // their GetProtocolInfo Sink doesn't list audio/flac.  In that
+            // case, transcode to WAV (LPCM) which has a proper DLNA.ORG_PN
+            // profile and is universally supported.
+            let zone = ZoneRepo::with_backend(self.db.clone())
+                .get(req.zone_id)
+                .ok()
+                .flatten();
+            let zone_output_type = zone.as_ref().and_then(|z| z.output_type.clone());
+            let is_dlna = zone_output_type.as_deref() == Some("dlna");
+            let device_id = req
+                .output_device_id
+                .as_deref()
+                .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+                .unwrap_or("");
+            let renderer_supports_mime = if is_dlna
+                && (stream_data.mime_type == "audio/flac"
+                    || stream_data.mime_type == "audio/x-flac")
+                && !device_id.is_empty()
+            {
+                self.dlna_supports_mime(device_id, &stream_data.mime_type)
+                    .await
+            } else {
+                true
+            };
+
+            // Chaîne DSP de la zone (#2863). Le bras « proxy verbatim »
+            // ci-dessous ne décode RIEN : il relaie les octets du CDN. Un
+            // égaliseur, une correction de pièce ou un ReplayGain armés y
+            // étaient donc calculés puis jetés, sans une ligne de journal —
+            // « je règle mon égaliseur, j'écoute du Qobuz sur ma zone
+            // réseau, et je n'entends aucune différence ».
+            let sr = stream_data.quality.sample_rate;
+            let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+            let https_dsp_active = https_dsp.is_active();
+
+            if streaming_needs_pretranscode(renderer_supports_mime, https_dsp_active) {
+                // Deux raisons d'arriver ici : le renderer ne sait pas lire
+                // le FLAC (→ WAV/LPCM), ou un traitement doit entrer dans le
+                // signal (→ FLAC pleine profondeur, le renderer sait le
+                // lire). Même schéma que le pré-transcodage AAC :
+                // téléchargement → décodage → traitement → encodage →
+                // session fichier (Content-Length, pas de chunked).
+                let bd = stream_data.quality.bit_depth.max(16).min(24);
+                let enc_format = streaming_pretranscode_format(renderer_supports_mime);
+                let enc_is_wav = enc_format == "wav";
 
                 info!(
                     service = service_name,
                     codec = %codec_lower,
+                    device = %device_id,
                     sample_rate = sr,
-                    "streaming_aac_transcode_to_wav_channel"
+                    bit_depth = bd,
+                    enc_format,
+                    dsp_active = https_dsp_active,
+                    renderer_supports_mime,
+                    "streaming_pretranscode_for_renderer_or_dsp"
                 );
 
-                // ── Téléchargement court, puis CANAL streaming ──
-                //
-                // L'ancien chemin transcodait la PISTE ENTIÈRE en fichier avant
-                // de jouer : télécharger + tout décoder + tout encoder = 34 s
-                // mesurées entre la décision et le play (Tidal AAC → DMP-A8,
-                // .18, 25/08). Le canal WAV — le chemin des DSD et des radios,
-                // au contrat rendu honnête en 0.9.106 — démarre dès les
-                // premiers blocs décodés. Seul le téléchargement du fichier
-                // AAC reste devant le play : quelques secondes.
                 let upstream_url = stream_data.url.clone();
-                let codec = codec_lower.clone();
                 let tmp_dl = std::env::temp_dir()
-                    .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
+                    .join(format!(
+                        "tune-stream-{}.{}",
+                        uuid::Uuid::new_v4(),
+                        codec_lower
+                    ))
                     .to_string_lossy()
                     .to_string();
+                let tmp_wav = std::env::temp_dir()
+                    .join(format!(
+                        "tune-stream-pretranscode-{}.{}",
+                        uuid::Uuid::new_v4(),
+                        enc_format
+                    ))
+                    .to_string_lossy()
+                    .to_string();
+
                 let tmp_dl_clone = tmp_dl.clone();
-                let dl = tokio::task::spawn_blocking(move || {
+                let tmp_wav_clone = tmp_wav.clone();
+                // VU-mètres : même ajout que les autres pré-transcodes —
+                // le PCM décodé alimente le forwarder de niveaux.
+                let wav_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
+                let transcode_result = tokio::task::spawn_blocking(move || {
+                    // 1. Download
                     let resp = crate::http::client::blocking_builder()
                         .timeout(std::time::Duration::from_secs(120))
                         .build()
@@ -1298,430 +1554,218 @@ impl PlaybackOrchestrator {
                     }
                     let bytes = resp.bytes().map_err(|e| format!("download: {e}"))?;
                     std::fs::write(&tmp_dl_clone, &bytes).map_err(|e| format!("write dl: {e}"))?;
-                    Ok::<(), String>(())
+
+                    // 2. Decode to PCM
+                    let decoded = crate::audio::decode::decode_to_pcm(
+                        &tmp_dl_clone,
+                        Some(sr),
+                        Some(2),
+                        0.0,
+                        0.0,
+                    )?;
+                    let mut pcm_bytes = decoded.pcm_bytes();
+                    let mut actual_bd = decoded.bit_depth;
+                    let actual_sr = decoded.sample_rate;
+                    let actual_ch = decoded.channels;
+
+                    // Plafond 16 bits : UNIQUEMENT quand on retombe sur
+                    // WAV/LPCM. Le renderer a rejeté le FLAC, on sert donc
+                    // sous `DLNA.ORG_PN=LPCM`, un profil 16 bits seulement —
+                    // un Hi-Res 24 bits servi dessous joue du SILENCE sur un
+                    // Ruark R3 / LHC-62 (Yves, #1137).
+                    //
+                    // Quand c'est le TRAITEMENT qui impose le
+                    // pré-transcodage (#2863), le renderer sait lire le
+                    // FLAC : on ré-encode en FLAC pleine profondeur, et le
+                    // plafond n'a pas lieu d'être. Sans cette distinction,
+                    // armer un égaliseur ferait tomber tout le Hi-Res Qobuz
+                    // à 16 bits — une dégradation jamais demandée.
+                    if enc_is_wav && actual_bd > 16 {
+                        pcm_bytes =
+                            crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
+                        actual_bd = 16;
+                    }
+
+                    // ReplayGain, égaliseur, puis convolveur FIR — l'ordre
+                    // de `transcode_source_to_file`. Sans traitement actif,
+                    // `pcm_bytes` n'est pas touché d'un octet.
+                    https_dsp.process(&mut pcm_bytes, actual_bd);
+
+                    // Niveaux post-traitement : les VU décrivent ce qui sera
+                    // entendu, comme sur le bras DASH.
+                    if let Some(ref ltx) = wav_levels_tx {
+                        crate::audio::tap::send_windowed_pcm(
+                            ltx,
+                            &pcm_bytes,
+                            actual_bd,
+                            actual_ch as u16,
+                            actual_sr,
+                        );
+                    }
+
+                    // 3. Encode
+                    let rt = tokio::runtime::Handle::try_current()
+                        .map_err(|e| format!("no tokio runtime: {e}"))?;
+                    let encoded_data = rt.block_on(async {
+                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                            enc_format,
+                            actual_sr,
+                            actual_bd as u32,
+                            actual_ch,
+                        );
+                        encoder.start().await?;
+                        encoder.write(&pcm_bytes).await?;
+                        encoder.finish().await
+                    })?;
+
+                    std::fs::write(&tmp_wav_clone, &encoded_data)
+                        .map_err(|e| format!("write pre-transcode: {e}"))?;
+
+                    let _ = std::fs::remove_file(&tmp_dl_clone);
+                    let file_size = encoded_data.len() as u64;
+                    Ok::<(u64, u16, u32, u16), String>((
+                        file_size,
+                        actual_bd,
+                        actual_sr,
+                        actual_ch as u16,
+                    ))
                 })
                 .await;
-                match dl {
-                    Ok(Ok(())) => {}
+
+                match transcode_result {
+                    Ok(Ok((file_size, actual_bd, actual_sr, actual_ch))) => {
+                        info!(
+                            tmp = %tmp_wav,
+                            file_size,
+                            bit_depth = actual_bd,
+                            sample_rate = actual_sr,
+                            enc_format,
+                            "streaming_pretranscode_complete"
+                        );
+
+                        let enc_mime = if enc_is_wav {
+                            "audio/wav"
+                        } else {
+                            "audio/flac"
+                        };
+                        let file_info = StreamInfo {
+                            format: enc_format.into(),
+                            mime_type: enc_mime.into(),
+                            sample_rate: actual_sr,
+                            bit_depth: actual_bd,
+                            channels: actual_ch,
+                            file_size: Some(file_size),
+                            duration_ms: None,
+                            ..Default::default()
+                        };
+                        let session_id = self
+                            .streamer
+                            .create_file_session(file_info, tmp_wav, false)
+                            .await;
+
+                        let server_ip = self.server_ip();
+                        let url = self
+                            .streamer
+                            .get_stream_url(&session_id, &server_ip, enc_format);
+                        (url, Some(session_id), enc_mime.to_string(), Some(file_size))
+                    }
                     Ok(Err(e)) => {
-                        warn!(error = %e, "streaming_aac_download_failed");
+                        warn!(error = %e, "streaming_pretranscode_failed");
                         let _ = std::fs::remove_file(&tmp_dl);
-                        return Err(format!("AAC download failed: {e}"));
+                        let _ = std::fs::remove_file(&tmp_wav);
+                        return Err(format!("streaming pre-transcode failed: {e}"));
                     }
                     Err(e) => {
-                        warn!(error = %e, "streaming_aac_download_task_panic");
+                        warn!(error = %e, "streaming_pretranscode_task_panic");
                         let _ = std::fs::remove_file(&tmp_dl);
-                        return Err(format!("AAC download task panic: {e}"));
+                        let _ = std::fs::remove_file(&tmp_wav);
+                        return Err(format!("streaming pre-transcode task panic: {e}"));
                     }
                 }
-
-                let info = StreamInfo {
-                    format: "wav".into(),
-                    mime_type: "audio/wav".into(),
-                    sample_rate: sr,
-                    bit_depth: bd,
-                    channels: 2,
-                    ..Default::default()
-                };
-                let (session_id, tx, data_ready) =
-                    self.streamer.create_session(info, false, 256).await;
-                // Chaîne DSP de la zone (#2863). Ce bras servait le PCM décodé
-                // TEL QUEL : égaliseur, convolveur et ReplayGain y étaient
-                // calculés côté interface puis jetés. Le relais les applique au
-                // fil de l'eau, sans rien bufferiser de plus — le démarrage
-                // immédiat conquis en 0.9.106 est préservé. Sans traitement
-                // actif, le canal reste celui d'avant, à l'octet près.
-                let aac_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
-                let tx = if aac_dsp.is_active() {
-                    info!(
-                        zone_id = req.zone_id,
-                        "streaming_aac_channel_dsp_relay_inserted"
-                    );
-                    spawn_streaming_dsp_relay(aac_dsp, bd, true, tx)
-                } else {
-                    tx
-                };
-                {
-                    let sessions = self.streamer.sessions_state();
-                    let sessions = sessions.lock().await;
-                    if let Some(session) = sessions.get(&session_id) {
-                        session
-                            .wav_header_included
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-
-                let ev_bus = self.event_bus.clone();
-                let playback = self.playback.clone();
-                let zone_id = req.zone_id;
-                let attach_levels = self.levels_attach_allowed(zone_id);
-                let fp = tmp_dl.clone();
-                tokio::spawn(async move {
-                    let err_bus = ev_bus.clone();
-                    let levels_tx = match ev_bus.filter(|_| attach_levels) {
-                        Some(bus) => {
-                            let play_seq = playback.current_play_seq(zone_id).await;
-                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0)
-                        }
-                        None => {
-                            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0
-                        }
-                    };
-                    let fp_clone = fp.clone();
-                    let tx_clone = tx.clone();
-                    drop(tx);
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::audio::decode::decode_to_pcm_streaming_seeked(
-                            &fp_clone,
-                            Some(sr),
-                            Some(2),
-                            Some(bd),
-                            tx_clone,
-                            32768,
-                            data_ready,
-                            levels_tx,
-                            0.0,
-                        )
-                    })
-                    .await;
-                    let _ = std::fs::remove_file(&fp);
-                    match result {
-                        Ok(Ok(_)) => {
-                            debug!("streaming_aac_channel_complete");
-                        }
-                        Ok(Err(e)) => {
-                            warn!(error = %e, "streaming_aac_channel_decode_failed");
-                            if let Some(ref bus) = err_bus {
-                                bus.emit(
-                                    "zone.playback_error",
-                                    serde_json::json!({
-                                        "zone_id": zone_id,
-                                        "error": format!("Impossible de décoder la piste : {e}"),
-                                    }),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "streaming_aac_channel_task_panic");
-                        }
-                    }
-                });
-
-                let server_ip = self.server_ip();
-                let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
-                (url, Some(session_id), "audio/wav".to_string(), None)
             } else {
-                // Non-AAC codecs (FLAC, etc.) — check if the DLNA renderer
-                // actually supports this MIME type before proxying directly.
-                // Strict renderers (Denon, Marantz, Revox) reject FLAC because
-                // their GetProtocolInfo Sink doesn't list audio/flac.  In that
-                // case, transcode to WAV (LPCM) which has a proper DLNA.ORG_PN
-                // profile and is universally supported.
-                let zone = ZoneRepo::with_backend(self.db.clone())
-                    .get(req.zone_id)
-                    .ok()
-                    .flatten();
-                let zone_output_type = zone.as_ref().and_then(|z| z.output_type.clone());
-                let is_dlna = zone_output_type.as_deref() == Some("dlna");
-                let device_id = req
-                    .output_device_id
-                    .as_deref()
-                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
-                    .unwrap_or("");
-                let renderer_supports_mime = if is_dlna
-                    && (stream_data.mime_type == "audio/flac"
-                        || stream_data.mime_type == "audio/x-flac")
-                    && !device_id.is_empty()
-                {
-                    self.dlna_supports_mime(device_id, &stream_data.mime_type)
-                        .await
+                // Renderer supports FLAC et AUCUN traitement actif — proxy
+                // direct, octets du CDN verbatim, bit-perfect. C'est le
+                // chemin de l'immense majorité des écoutes, et il ne bouge
+                // pas d'un octet.
+                //
+                // Qobuz/Tidal signed CDN URLs carry a short TTL (Qobuz
+                // `etsp=<unix-expiry>`, ~60 min). On a long Hi-Res track the
+                // URL expires mid-playback and a client Range-resume against
+                // the stored URL fails at the connection/auth level. Attach a
+                // re-resolver so the proxy layer can fetch a FRESH signed URL
+                // for the same track+quality and resume byte-exact (#1136).
+                // Only for real https CDN URLs (not file:// DASH assemblies).
+                let reresolve: Option<crate::http::streamer::ReresolveFn> = if is_https {
+                    let services = self.services.clone();
+                    let service_name = service_name.to_string();
+                    let source_id = source_id.to_string();
+                    Some(std::sync::Arc::new(move || {
+                        let services = services.clone();
+                        let service_name = service_name.clone();
+                        let source_id = source_id.clone();
+                        Box::pin(async move {
+                            let registry = services.lock().await;
+                            let svc = registry
+                                .get(&service_name)
+                                .ok_or_else(|| format!("unknown service: {service_name}"))?;
+                            let mut svc = svc.write().await;
+                            // Best-effort token refresh, then re-resolve with
+                            // the same default quality the initial play used.
+                            let _ = svc.refresh_if_needed().await;
+                            match svc.get_track_url(&source_id, None).await {
+                                Ok(data) => Ok(data.url),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        })
+                            as std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<Output = Result<String, String>> + Send,
+                                >,
+                            >
+                    }))
                 } else {
-                    true
+                    None
                 };
+                let session_id = self
+                    .streamer
+                    .create_proxy_session_with_reresolve(
+                        info,
+                        stream_data.url.clone(),
+                        false,
+                        reresolve,
+                    )
+                    .await;
+                let server_ip = self.server_ip();
+                let url = self
+                    .streamer
+                    .get_stream_url(&session_id, &server_ip, &codec_lower);
 
-                // Chaîne DSP de la zone (#2863). Le bras « proxy verbatim »
-                // ci-dessous ne décode RIEN : il relaie les octets du CDN. Un
-                // égaliseur, une correction de pièce ou un ReplayGain armés y
-                // étaient donc calculés puis jetés, sans une ligne de journal —
-                // « je règle mon égaliseur, j'écoute du Qobuz sur ma zone
-                // réseau, et je n'entends aucune différence ».
-                let sr = stream_data.quality.sample_rate;
-                let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
-                let https_dsp_active = https_dsp.is_active();
-
-                if streaming_needs_pretranscode(renderer_supports_mime, https_dsp_active) {
-                    // Deux raisons d'arriver ici : le renderer ne sait pas lire
-                    // le FLAC (→ WAV/LPCM), ou un traitement doit entrer dans le
-                    // signal (→ FLAC pleine profondeur, le renderer sait le
-                    // lire). Même schéma que le pré-transcodage AAC :
-                    // téléchargement → décodage → traitement → encodage →
-                    // session fichier (Content-Length, pas de chunked).
-                    let bd = stream_data.quality.bit_depth.max(16).min(24);
-                    let enc_format = streaming_pretranscode_format(renderer_supports_mime);
-                    let enc_is_wav = enc_format == "wav";
-
-                    info!(
-                        service = service_name,
-                        codec = %codec_lower,
-                        device = %device_id,
-                        sample_rate = sr,
-                        bit_depth = bd,
-                        enc_format,
-                        dsp_active = https_dsp_active,
-                        renderer_supports_mime,
-                        "streaming_pretranscode_for_renderer_or_dsp"
-                    );
-
-                    let upstream_url = stream_data.url.clone();
-                    let tmp_dl = std::env::temp_dir()
-                        .join(format!(
-                            "tune-stream-{}.{}",
-                            uuid::Uuid::new_v4(),
-                            codec_lower
-                        ))
-                        .to_string_lossy()
-                        .to_string();
-                    let tmp_wav = std::env::temp_dir()
-                        .join(format!(
-                            "tune-stream-pretranscode-{}.{}",
-                            uuid::Uuid::new_v4(),
-                            enc_format
-                        ))
-                        .to_string_lossy()
-                        .to_string();
-
-                    let tmp_dl_clone = tmp_dl.clone();
-                    let tmp_wav_clone = tmp_wav.clone();
-                    // VU-mètres : même ajout que les autres pré-transcodes —
-                    // le PCM décodé alimente le forwarder de niveaux.
-                    let wav_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
-                    let transcode_result = tokio::task::spawn_blocking(move || {
-                        // 1. Download
-                        let resp = crate::http::client::blocking_builder()
-                            .timeout(std::time::Duration::from_secs(120))
-                            .build()
-                            .and_then(|c| c.get(&upstream_url).send())
-                            .map_err(|e| format!("upstream fetch: {e}"))?;
-                        if !resp.status().is_success() {
-                            return Err(format!("upstream HTTP {}", resp.status()));
-                        }
-                        let bytes = resp.bytes().map_err(|e| format!("download: {e}"))?;
-                        std::fs::write(&tmp_dl_clone, &bytes)
-                            .map_err(|e| format!("write dl: {e}"))?;
-
-                        // 2. Decode to PCM
-                        let decoded = crate::audio::decode::decode_to_pcm(
-                            &tmp_dl_clone,
-                            Some(sr),
-                            Some(2),
-                            0.0,
-                            0.0,
-                        )?;
-                        let mut pcm_bytes = decoded.pcm_bytes();
-                        let mut actual_bd = decoded.bit_depth;
-                        let actual_sr = decoded.sample_rate;
-                        let actual_ch = decoded.channels;
-
-                        // Plafond 16 bits : UNIQUEMENT quand on retombe sur
-                        // WAV/LPCM. Le renderer a rejeté le FLAC, on sert donc
-                        // sous `DLNA.ORG_PN=LPCM`, un profil 16 bits seulement —
-                        // un Hi-Res 24 bits servi dessous joue du SILENCE sur un
-                        // Ruark R3 / LHC-62 (Yves, #1137).
-                        //
-                        // Quand c'est le TRAITEMENT qui impose le
-                        // pré-transcodage (#2863), le renderer sait lire le
-                        // FLAC : on ré-encode en FLAC pleine profondeur, et le
-                        // plafond n'a pas lieu d'être. Sans cette distinction,
-                        // armer un égaliseur ferait tomber tout le Hi-Res Qobuz
-                        // à 16 bits — une dégradation jamais demandée.
-                        if enc_is_wav && actual_bd > 16 {
-                            pcm_bytes =
-                                crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
-                            actual_bd = 16;
-                        }
-
-                        // ReplayGain, égaliseur, puis convolveur FIR — l'ordre
-                        // de `transcode_source_to_file`. Sans traitement actif,
-                        // `pcm_bytes` n'est pas touché d'un octet.
-                        https_dsp.process(&mut pcm_bytes, actual_bd);
-
-                        // Niveaux post-traitement : les VU décrivent ce qui sera
-                        // entendu, comme sur le bras DASH.
-                        if let Some(ref ltx) = wav_levels_tx {
-                            crate::audio::tap::send_windowed_pcm(
-                                ltx,
-                                &pcm_bytes,
-                                actual_bd,
-                                actual_ch as u16,
-                                actual_sr,
-                            );
-                        }
-
-                        // 3. Encode
-                        let rt = tokio::runtime::Handle::try_current()
-                            .map_err(|e| format!("no tokio runtime: {e}"))?;
-                        let encoded_data = rt.block_on(async {
-                            let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                                enc_format,
-                                actual_sr,
-                                actual_bd as u32,
-                                actual_ch,
-                            );
-                            encoder.start().await?;
-                            encoder.write(&pcm_bytes).await?;
-                            encoder.finish().await
-                        })?;
-
-                        std::fs::write(&tmp_wav_clone, &encoded_data)
-                            .map_err(|e| format!("write pre-transcode: {e}"))?;
-
-                        let _ = std::fs::remove_file(&tmp_dl_clone);
-                        let file_size = encoded_data.len() as u64;
-                        Ok::<(u64, u16, u32, u16), String>((
-                            file_size,
-                            actual_bd,
-                            actual_sr,
-                            actual_ch as u16,
-                        ))
-                    })
+                // VU-mètres (#1106) : le proxy sert les octets CDN
+                // verbatim, rien n'est décodé côté serveur → aucun
+                // `playback.audio_levels`, aiguilles figées sur Qobuz/
+                // Tidal direct alors qu'une piste locale les anime. On
+                // décode le même flux en parallèle, uniquement pour les
+                // niveaux — le flux servi reste bit-perfect.
+                //
+                // On tape NOTRE session proxy (`url`, localhost) et non
+                // l'URL CDN signée `stream_data.url` : le navigateur, en
+                // consommant le proxy, fait re-résoudre une URL signée
+                // fraîche, et l'ancienne signature tapée directement était
+                // rejetée par le CDN (aucune fenêtre décodée → aiguilles
+                // figées, la 1re version du fix #1247). Passer par le proxy
+                // réutilise sa re-résolution / reprise et sert exactement
+                // les octets joués. Le bridage ≤30 s en avance impose une
+                // contre-pression TCP : le proxy ne pré-télécharge pas
+                // toute la piste.
+                self.spawn_proxy_levels_probe(req.zone_id, url.clone(), codec_lower.clone())
                     .await;
 
-                    match transcode_result {
-                        Ok(Ok((file_size, actual_bd, actual_sr, actual_ch))) => {
-                            info!(
-                                tmp = %tmp_wav,
-                                file_size,
-                                bit_depth = actual_bd,
-                                sample_rate = actual_sr,
-                                enc_format,
-                                "streaming_pretranscode_complete"
-                            );
-
-                            let enc_mime = if enc_is_wav {
-                                "audio/wav"
-                            } else {
-                                "audio/flac"
-                            };
-                            let file_info = StreamInfo {
-                                format: enc_format.into(),
-                                mime_type: enc_mime.into(),
-                                sample_rate: actual_sr,
-                                bit_depth: actual_bd,
-                                channels: actual_ch,
-                                file_size: Some(file_size),
-                                duration_ms: None,
-                                ..Default::default()
-                            };
-                            let session_id = self
-                                .streamer
-                                .create_file_session(file_info, tmp_wav, false)
-                                .await;
-
-                            let server_ip = self.server_ip();
-                            let url =
-                                self.streamer
-                                    .get_stream_url(&session_id, &server_ip, enc_format);
-                            (url, Some(session_id), enc_mime.to_string(), Some(file_size))
-                        }
-                        Ok(Err(e)) => {
-                            warn!(error = %e, "streaming_pretranscode_failed");
-                            let _ = std::fs::remove_file(&tmp_dl);
-                            let _ = std::fs::remove_file(&tmp_wav);
-                            return Err(format!("streaming pre-transcode failed: {e}"));
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "streaming_pretranscode_task_panic");
-                            let _ = std::fs::remove_file(&tmp_dl);
-                            let _ = std::fs::remove_file(&tmp_wav);
-                            return Err(format!("streaming pre-transcode task panic: {e}"));
-                        }
-                    }
-                } else {
-                    // Renderer supports FLAC et AUCUN traitement actif — proxy
-                    // direct, octets du CDN verbatim, bit-perfect. C'est le
-                    // chemin de l'immense majorité des écoutes, et il ne bouge
-                    // pas d'un octet.
-                    //
-                    // Qobuz/Tidal signed CDN URLs carry a short TTL (Qobuz
-                    // `etsp=<unix-expiry>`, ~60 min). On a long Hi-Res track the
-                    // URL expires mid-playback and a client Range-resume against
-                    // the stored URL fails at the connection/auth level. Attach a
-                    // re-resolver so the proxy layer can fetch a FRESH signed URL
-                    // for the same track+quality and resume byte-exact (#1136).
-                    // Only for real https CDN URLs (not file:// DASH assemblies).
-                    let reresolve: Option<crate::http::streamer::ReresolveFn> = if is_https {
-                        let services = self.services.clone();
-                        let service_name = service_name.to_string();
-                        let source_id = source_id.to_string();
-                        Some(std::sync::Arc::new(move || {
-                            let services = services.clone();
-                            let service_name = service_name.clone();
-                            let source_id = source_id.clone();
-                            Box::pin(async move {
-                                let registry = services.lock().await;
-                                let svc = registry
-                                    .get(&service_name)
-                                    .ok_or_else(|| format!("unknown service: {service_name}"))?;
-                                let mut svc = svc.write().await;
-                                // Best-effort token refresh, then re-resolve with
-                                // the same default quality the initial play used.
-                                let _ = svc.refresh_if_needed().await;
-                                match svc.get_track_url(&source_id, None).await {
-                                    Ok(data) => Ok(data.url),
-                                    Err(e) => Err(e.to_string()),
-                                }
-                            })
-                                as std::pin::Pin<
-                                    Box<
-                                        dyn std::future::Future<Output = Result<String, String>>
-                                            + Send,
-                                    >,
-                                >
-                        }))
-                    } else {
-                        None
-                    };
-                    let session_id = self
-                        .streamer
-                        .create_proxy_session_with_reresolve(
-                            info,
-                            stream_data.url.clone(),
-                            false,
-                            reresolve,
-                        )
-                        .await;
-                    let server_ip = self.server_ip();
-                    let url = self
-                        .streamer
-                        .get_stream_url(&session_id, &server_ip, &codec_lower);
-
-                    // VU-mètres (#1106) : le proxy sert les octets CDN
-                    // verbatim, rien n'est décodé côté serveur → aucun
-                    // `playback.audio_levels`, aiguilles figées sur Qobuz/
-                    // Tidal direct alors qu'une piste locale les anime. On
-                    // décode le même flux en parallèle, uniquement pour les
-                    // niveaux — le flux servi reste bit-perfect.
-                    //
-                    // On tape NOTRE session proxy (`url`, localhost) et non
-                    // l'URL CDN signée `stream_data.url` : le navigateur, en
-                    // consommant le proxy, fait re-résoudre une URL signée
-                    // fraîche, et l'ancienne signature tapée directement était
-                    // rejetée par le CDN (aucune fenêtre décodée → aiguilles
-                    // figées, la 1re version du fix #1247). Passer par le proxy
-                    // réutilise sa re-résolution / reprise et sert exactement
-                    // les octets joués. Le bridage ≤30 s en avance impose une
-                    // contre-pression TCP : le proxy ne pré-télécharge pas
-                    // toute la piste.
-                    self.spawn_proxy_levels_probe(req.zone_id, url.clone(), codec_lower.clone())
-                        .await;
-
-                    // Report the mime of the codec we actually serve, not the
-                    // upstream API's mime_type. Qobuz can return a mime that does
-                    // not normalise to a lossless format, so Now Playing showed
-                    // FLAC tracks as "compressé"/lossy (Progman). codec_lower is
-                    // authoritative for what the proxy streams.
-                    (url, Some(session_id), format!("audio/{codec_lower}"), None)
-                }
+                // Report the mime of the codec we actually serve, not the
+                // upstream API's mime_type. Qobuz can return a mime that does
+                // not normalise to a lossless format, so Now Playing showed
+                // FLAC tracks as "compressé"/lossy (Progman). codec_lower is
+                // authoritative for what the proxy streams.
+                (url, Some(session_id), format!("audio/{codec_lower}"), None)
             }
         };
         Ok(flux)
