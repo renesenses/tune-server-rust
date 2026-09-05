@@ -40,6 +40,30 @@ enum DecisionOuResolu {
     Resolu(ResolvedStream),
 }
 
+/// Le grand tuple rendu par les bras de `resolve_local_track` : identifiant
+/// de session, type MIME, extension, taille, fréquence, profondeur, canaux.
+type FluxLocal = (
+    String,
+    String,
+    String,
+    Option<u64>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+);
+
+/// Ce que le premier temps du transcodage a décidé du format de sortie,
+/// avant de choisir entre le fichier pré-transcodé et la session à la volée.
+struct FormatDeSortie {
+    out_sr: u32,
+    out_bd: u16,
+    out_mime: String,
+    out_ext: String,
+    target_format_str: String,
+    use_file_transcode: bool,
+    info: StreamInfo,
+}
+
 impl PlaybackOrchestrator {
     /// Faut-il envoyer le DSD tel quel au renderer ?
     ///
@@ -300,12 +324,8 @@ impl PlaybackOrchestrator {
             self.servir_en_passthrough(req, &decision).await?
         };
         let DecisionLocale {
-            sample_rate,
-            bit_depth,
-            channels,
             is_network_output,
             needs_transcode,
-            zone,
             ..
         } = decision;
 
@@ -962,6 +982,23 @@ impl PlaybackOrchestrator {
         ),
         String,
     > {
+        let format = self.decider_le_format_de_sortie(req, decision);
+        if format.use_file_transcode {
+            self.transcoder_vers_fichier(req, decision, format).await
+        } else {
+            self.transcoder_en_session(req, decision, format).await
+        }
+    }
+
+    /// Premier temps du transcodage : le format de sortie. Fréquence plafonnée
+    /// par la zone, profondeur selon la sortie, conteneur et type MIME, et le
+    /// choix entre fichier pré-transcodé et session à la volée
+    /// (`use_file_transcode_for`).
+    fn decider_le_format_de_sortie(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+    ) -> FormatDeSortie {
         let DecisionLocale {
             bit_depth,
             bit_depth_wire,
@@ -973,7 +1010,6 @@ impl PlaybackOrchestrator {
             eq_forces_transcode,
             is_browser_output,
             is_chromecast,
-            is_local_output,
             is_network_output,
             local_needs_wav,
             needs_downsample,
@@ -981,816 +1017,870 @@ impl PlaybackOrchestrator {
             oaat_needs_wav,
             sample_rate,
             source_format,
-            track_id,
             zone_max_sample_rate,
             track_duration_ms,
-            track_file_size,
             ref file_path,
-            ref fmt,
-            ref zone,
             ..
         } = *decision;
-        let flux = {
-            let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
-            let target_fmt = if oaat_needs_wav || local_needs_wav || browser_needs_wav {
-                AudioFormat::Wav
-            } else if dlna_needs_wav {
-                // Renderer doesn't support FLAC — transcode to WAV (LPCM)
-                // which has a proper DLNA.ORG_PN=LPCM profile.
-                AudioFormat::Wav
-            } else if needs_downsample && !needs_transcode_for_output {
-                // Only downsampling — keep the same lossless format
-                AudioFormat::Flac
-            } else if is_chromecast && src_fmt == AudioFormat::Aiff {
-                // AIFF → FLAC for Chromecast (Cast decodes FLAC up to
-                // 24-bit/96k, but not AIFF). dlna_transcode_target(Aiff) is a
-                // no-op (Aiff→Aiff) meant for DLNA, so it must be overridden
-                // here or the Cast device would be fed AIFF again (#1210).
-                AudioFormat::Flac
-            } else if src_fmt == AudioFormat::Dsd && is_network_output {
-                // DSD → network renderer: stream as progressive WAV/LPCM instead
-                // of a blocking pre-transcode to a FLAC file.
-                //
-                // DSD→FLAC is the slowest transcode (74–86s for a track). The
-                // FLAC path takes `use_file_transcode` below, which decodes AND
-                // encodes the WHOLE file to /tmp BEFORE serving a single byte —
-                // so a renderer that can't wait ~80s for its transport URI to
-                // become playable times out and plays SILENCE. Linn Klimax /
-                // OpenHome (Pierre Mack) never decodes DSD itself, so it always
-                // hit this ~80s stall.
-                //
-                // A WAV target routes through the streaming session instead: the
-                // decoder feeds PCM as it runs (first bytes in ~1s), and the HTTP
-                // layer still advertises an exact Content-Length
-                // (StreamInfo::wav_content_length, from the known duration) +
-                // Accept-Ranges + 206-on-`bytes=0-` — exactly what DLNA/OpenHome
-                // renderers require. This is the same streaming-WAV path the
-                // Eversolo DMP-A6/A8 already use. Renderers that need a 16-bit
-                // LPCM cap keep it via `dlna_needs_wav` above; this branch only
-                // catches FLAC-capable renderers (Linn) that were paying the full
-                // ~80s stall for nothing.
-                AudioFormat::Wav
-            } else {
-                src_fmt.dlna_transcode_target()
-            };
-            let mut out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
-            // Apply zone max_sample_rate cap
-            if let Some(max_sr) = zone_max_sample_rate {
-                if out_sr > max_sr {
-                    info!(
-                        zone_id = req.zone_id,
-                        source_rate = out_sr,
-                        max_rate = max_sr,
-                        "zone_max_sample_rate_cap_applied"
-                    );
-                    out_sr = max_sr;
-                }
+        let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
+        let target_fmt = if oaat_needs_wav || local_needs_wav || browser_needs_wav {
+            AudioFormat::Wav
+        } else if dlna_needs_wav {
+            // Renderer doesn't support FLAC — transcode to WAV (LPCM)
+            // which has a proper DLNA.ORG_PN=LPCM profile.
+            AudioFormat::Wav
+        } else if needs_downsample && !needs_transcode_for_output {
+            // Only downsampling — keep the same lossless format
+            AudioFormat::Flac
+        } else if is_chromecast && src_fmt == AudioFormat::Aiff {
+            // AIFF → FLAC for Chromecast (Cast decodes FLAC up to
+            // 24-bit/96k, but not AIFF). dlna_transcode_target(Aiff) is a
+            // no-op (Aiff→Aiff) meant for DLNA, so it must be overridden
+            // here or the Cast device would be fed AIFF again (#1210).
+            AudioFormat::Flac
+        } else if src_fmt == AudioFormat::Dsd && is_network_output {
+            // DSD → network renderer: stream as progressive WAV/LPCM instead
+            // of a blocking pre-transcode to a FLAC file.
+            //
+            // DSD→FLAC is the slowest transcode (74–86s for a track). The
+            // FLAC path takes `use_file_transcode` below, which decodes AND
+            // encodes the WHOLE file to /tmp BEFORE serving a single byte —
+            // so a renderer that can't wait ~80s for its transport URI to
+            // become playable times out and plays SILENCE. Linn Klimax /
+            // OpenHome (Pierre Mack) never decodes DSD itself, so it always
+            // hit this ~80s stall.
+            //
+            // A WAV target routes through the streaming session instead: the
+            // decoder feeds PCM as it runs (first bytes in ~1s), and the HTTP
+            // layer still advertises an exact Content-Length
+            // (StreamInfo::wav_content_length, from the known duration) +
+            // Accept-Ranges + 206-on-`bytes=0-` — exactly what DLNA/OpenHome
+            // renderers require. This is the same streaming-WAV path the
+            // Eversolo DMP-A6/A8 already use. Renderers that need a 16-bit
+            // LPCM cap keep it via `dlna_needs_wav` above; this branch only
+            // catches FLAC-capable renderers (Linn) that were paying the full
+            // ~80s stall for nothing.
+            AudioFormat::Wav
+        } else {
+            src_fmt.dlna_transcode_target()
+        };
+        let mut out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
+        // Apply zone max_sample_rate cap
+        if let Some(max_sr) = zone_max_sample_rate {
+            if out_sr > max_sr {
+                info!(
+                    zone_id = req.zone_id,
+                    source_rate = out_sr,
+                    max_rate = max_sr,
+                    "zone_max_sample_rate_cap_applied"
+                );
+                out_sr = max_sr;
             }
-            let out_bd: u16 = if local_needs_wav {
-                // Local output (cpal/WASAPI): always use 32-bit WAV.
-                //
-                // Symphonia decodes all audio into AudioBuffer<i32> (left-justified
-                // 32-bit integers) regardless of source bit depth.  When packing
-                // these into 24-bit (3 bytes/sample), any mismatch between the
-                // reported source_bd and the actual sample range causes byte
-                // misalignment in the PCM stream — the local parser then reads
-                // from wrong offsets, producing white noise.
-                //
-                // Using 32-bit eliminates this class of bugs entirely: each i32
-                // sample is written as 4 bytes, matching the WAV header's declared
-                // byte width.  The local output converts to f32 for cpal anyway,
-                // so there is zero quality loss.
-                32
-            } else if browser_needs_wav {
-                // Browser <audio> plays 16-bit PCM WAV everywhere; 24/32-bit are
-                // spotty across engines. Match the streaming arm (browser = 16-bit
-                // WAV) so playback is guaranteed audible.
-                16
-            } else if src_fmt == AudioFormat::Dsd {
-                24
-            } else if oaat_needs_wav {
-                // OAAT endpoints (Tune's own RPi renderers) parse the WAV fmt
-                // chunk and handle true 24-bit PCM: cap at 24-bit.
-                cap_output_bit_depth(bit_depth)
-            } else if dlna_wav24 {
-                // Zone opt-in: serve genuine 24-bit WAV to a renderer that
-                // advertises `audio/L24`. The DIDL drops the 16-bit-only
-                // `DLNA.ORG_PN=LPCM` profile (didl::dlna_flags_for_mime_bd keyed
-                // on this bit_depth), so the renderer parses the real 24-bit WAV
-                // header instead of mapping a false profile back to 16-bit and
-                // reading misaligned samples (#1137). `dlna_wav24` is already
-                // gated on `bit_depth_wire > 16` above; cap at 24 (FLAC/WAV
-                // ceiling).
-                //
-                // `bit_depth_wire`, pas `bit_depth` : sur un ALAC dont la base
-                // ignore la profondeur, c'est la sonde du fichier qui fait foi.
-                // Prendre la valeur de la base ici servirait un en-tête 16 bits
-                // pour un flux 24 — exactement le défaut que ce chemin corrige
-                // (#1654).
-                bit_depth_wire.min(24)
-            } else if dlna_needs_wav {
-                // Generic DLNA renderers that need a WAV/LPCM fallback: cap at
-                // 16-bit.
-                //
-                // The WAV we serve is advertised in DIDL with
-                // `DLNA.ORG_PN=LPCM` and Content-Type `audio/wav`.  The DLNA
-                // LPCM profile is standardised for 16-bit only (`audio/L16`);
-                // there is no standard PN for 24-bit LPCM.  Many hi-fi
-                // renderers (Ruark R3, LHC-62 — Yves, forum #1137) map that
-                // advertised profile to 16-bit and, fed genuine 24-bit PCM
-                // (3 bytes/sample), read misaligned samples and play SILENCE.
-                // 16-bit tracks worked because 16-bit WAV *is* valid LPCM.
-                //
-                // Renderers that can preserve hi-res advertise `audio/flac`
-                // and take the FLAC branch above (dlna_needs_wav = false), so
-                // this cap only ever applies to the LPCM fallback where
-                // guaranteed-audible 16-bit is the correct trade-off.
-                16
-            } else if dlna_cap_16bit {
-                // Zone opt-in cap: renderer advertises `audio/flac` but only
-                // decodes 16-bit (Ruark R3, #1137). Downconvert to 16-bit FLAC
-                // instead of sending silent hi-res direct.
-                16
-            } else if src_fmt == AudioFormat::Alac {
-                // ALAC: transcode to FLAC for DLNA (universally supported).
-                // FLAC max is 24-bit; cap at min(source_bd, 24) but at least 16.
-                cap_output_bit_depth(bit_depth)
-            } else {
-                cap_output_bit_depth(bit_depth)
-            };
-            // La profondeur ANNONCÉE doit être une profondeur QU'ON SAIT ÉCRIRE.
+        }
+        let out_bd: u16 = if local_needs_wav {
+            // Local output (cpal/WASAPI): always use 32-bit WAV.
             //
-            // `out_bd` part dans `StreamInfo`, donc dans le `<res bitsPerSample>`
-            // du DIDL et dans le choix du profil `DLNA.ORG_PN` : c'est le contrat
-            // passé au renderer. Or deux branches le laissent sortir de
-            // {16, 24, 32} — `cap_output_bit_depth` ne borne qu'à 16..24, et
-            // `dlna_wav24` prend `bit_depth_wire.min(24)`. Une source de 20 bits,
-            // légale en ALAC comme en FLAC, annonçait donc 20 bits, que rien en
-            // aval ne sait ni convertir ni encoder. Arrondi vers le HAUT, comme
-            // au décodage : aucun bit perdu (#1437).
-            let out_bd = crate::audio::decode::container_bit_depth(out_bd);
-            let out_mime = if oaat_needs_wav || local_needs_wav {
-                "audio/wav".to_string()
-            } else {
-                target_fmt.mime_type().to_string()
-            };
-            let out_ext = if oaat_needs_wav || local_needs_wav {
-                "wav".to_string()
-            } else {
-                target_fmt.container_format().to_string()
-            };
-
-            info!(
-                file = %file_path,
-                source = ?src_fmt,
-                target = ?target_fmt,
-                sample_rate = out_sr,
-                bit_depth = out_bd,
-                "transcode_required"
-            );
-
-            // For network outputs (DLNA, OpenHome, etc.) with non-WAV targets
-            // (e.g. FLAC), pre-transcode to a temp file on disk so the HTTP
-            // handler can serve it with Content-Length and Accept-Ranges.
-            // Renderers like the darTZeel LHC-208 reject chunked transfer
-            // (no Content-Length) and require a known file size.
+            // Symphonia decodes all audio into AudioBuffer<i32> (left-justified
+            // 32-bit integers) regardless of source bit depth.  When packing
+            // these into 24-bit (3 bytes/sample), any mismatch between the
+            // reported source_bd and the actual sample range causes byte
+            // misalignment in the PCM stream — the local parser then reads
+            // from wrong offsets, producing white noise.
             //
-            // For local/OAAT outputs (WAV target), keep using streaming
-            // sessions — those outputs don't need Content-Length.
-            let target_format_str = if target_fmt == AudioFormat::Wav {
-                "wav".to_string()
-            } else {
-                target_fmt.container_format().to_string()
-            };
-            // Network outputs need file transcode for Content-Length + Range.
-            // Local outputs use streaming sessions — the _keep_alive_tx in
-            // StreamSession prevents the channel from closing when the decoder
-            // finishes, so ASIO/WASAPI can consume all buffered data at their
-            // own pace. This avoids the 28s download delay of file transcode.
-            // A DSD source served as WAV/LPCM can stream (exact Content-Length
-            // from wav_content_length) instead of blocking on a temp file that
-            // times out at 120s for DSD256/512 → silence (Villerio). Gated by
-            // the `dsd_lpcm_stream` setting (toggle in Settings → Lecture),
-            // off by default pending field validation; read live so the toggle
-            // takes effect without a restart.
-            let dsd_lpcm_streams = src_fmt == AudioFormat::Dsd
-                && target_fmt == AudioFormat::Wav
-                && SettingsRepo::with_backend(self.db.clone())
-                    .get("dsd_lpcm_stream")
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    == Some("true");
-            let use_file_transcode = use_file_transcode_for(
-                is_network_output,
-                target_format_str == "wav",
-                dlna_needs_wav,
-                dsd_lpcm_streams,
-                // Une zone dont un TRAITEMENT est actif doit l'entendre : le
-                // bras progressif appelle `decode_to_pcm_streaming_seeked`, qui
-                // ne reçoit ni EqProcessor, ni convolveur, ni facteur
-                // ReplayGain — seul `transcode_source_to_file` les applique
-                // (voir les points 1a/1b de cette fonction). Le « transcodage
-                // forcé » servait donc un flux sans aucun des trois.
-                //
-                // Mesuré sur .18 pour le NAVIGATEUR : capture WAV avec EQ
-                // strictement identique à la source décodée (#1168). La même
-                // fuite existe sur une sortie RÉSEAU depuis que le DSD y part en
-                // WAV progressif (0cf27ade, 27/07) : une zone DLNA/OpenHome avec
-                // égaliseur, correction FIR ou ReplayGain actif lisant du DSD
-                // prend ce bras et perd les trois, en silence. C'est la famille
-                // #1216 — déjà corrigée pour le passthrough réseau, le
-                // navigateur et les sorties PULL, jamais ici.
-                //
-                // `eq_forces_transcode` est déjà borné aux sorties réseau /
-                // navigateur / PULL et aux zones où un traitement est
-                // RÉELLEMENT actif (PURE rend `None`) : une zone sans
-                // traitement — l'immense majorité, et le cas qu'arbitre #1363 —
-                // garde le bras progressif. Les sorties PULL (`oaat`,
-                // `diretta`) restent hors du champ : elles ne passent jamais par
-                // le transcodage fichier et le changement n'est pas mesuré.
-                (is_browser_output || is_network_output) && eq_forces_transcode,
-            );
+            // Using 32-bit eliminates this class of bugs entirely: each i32
+            // sample is written as 4 bytes, matching the WAV header's declared
+            // byte width.  The local output converts to f32 for cpal anyway,
+            // so there is zero quality loss.
+            32
+        } else if browser_needs_wav {
+            // Browser <audio> plays 16-bit PCM WAV everywhere; 24/32-bit are
+            // spotty across engines. Match the streaming arm (browser = 16-bit
+            // WAV) so playback is guaranteed audible.
+            16
+        } else if src_fmt == AudioFormat::Dsd {
+            24
+        } else if oaat_needs_wav {
+            // OAAT endpoints (Tune's own RPi renderers) parse the WAV fmt
+            // chunk and handle true 24-bit PCM: cap at 24-bit.
+            cap_output_bit_depth(bit_depth)
+        } else if dlna_wav24 {
+            // Zone opt-in: serve genuine 24-bit WAV to a renderer that
+            // advertises `audio/L24`. The DIDL drops the 16-bit-only
+            // `DLNA.ORG_PN=LPCM` profile (didl::dlna_flags_for_mime_bd keyed
+            // on this bit_depth), so the renderer parses the real 24-bit WAV
+            // header instead of mapping a false profile back to 16-bit and
+            // reading misaligned samples (#1137). `dlna_wav24` is already
+            // gated on `bit_depth_wire > 16` above; cap at 24 (FLAC/WAV
+            // ceiling).
+            //
+            // `bit_depth_wire`, pas `bit_depth` : sur un ALAC dont la base
+            // ignore la profondeur, c'est la sonde du fichier qui fait foi.
+            // Prendre la valeur de la base ici servirait un en-tête 16 bits
+            // pour un flux 24 — exactement le défaut que ce chemin corrige
+            // (#1654).
+            bit_depth_wire.min(24)
+        } else if dlna_needs_wav {
+            // Generic DLNA renderers that need a WAV/LPCM fallback: cap at
+            // 16-bit.
+            //
+            // The WAV we serve is advertised in DIDL with
+            // `DLNA.ORG_PN=LPCM` and Content-Type `audio/wav`.  The DLNA
+            // LPCM profile is standardised for 16-bit only (`audio/L16`);
+            // there is no standard PN for 24-bit LPCM.  Many hi-fi
+            // renderers (Ruark R3, LHC-62 — Yves, forum #1137) map that
+            // advertised profile to 16-bit and, fed genuine 24-bit PCM
+            // (3 bytes/sample), read misaligned samples and play SILENCE.
+            // 16-bit tracks worked because 16-bit WAV *is* valid LPCM.
+            //
+            // Renderers that can preserve hi-res advertise `audio/flac`
+            // and take the FLAC branch above (dlna_needs_wav = false), so
+            // this cap only ever applies to the LPCM fallback where
+            // guaranteed-audible 16-bit is the correct trade-off.
+            16
+        } else if dlna_cap_16bit {
+            // Zone opt-in cap: renderer advertises `audio/flac` but only
+            // decodes 16-bit (Ruark R3, #1137). Downconvert to 16-bit FLAC
+            // instead of sending silent hi-res direct.
+            16
+        } else if src_fmt == AudioFormat::Alac {
+            // ALAC: transcode to FLAC for DLNA (universally supported).
+            // FLAC max is 24-bit; cap at min(source_bd, 24) but at least 16.
+            cap_output_bit_depth(bit_depth)
+        } else {
+            cap_output_bit_depth(bit_depth)
+        };
+        // La profondeur ANNONCÉE doit être une profondeur QU'ON SAIT ÉCRIRE.
+        //
+        // `out_bd` part dans `StreamInfo`, donc dans le `<res bitsPerSample>`
+        // du DIDL et dans le choix du profil `DLNA.ORG_PN` : c'est le contrat
+        // passé au renderer. Or deux branches le laissent sortir de
+        // {16, 24, 32} — `cap_output_bit_depth` ne borne qu'à 16..24, et
+        // `dlna_wav24` prend `bit_depth_wire.min(24)`. Une source de 20 bits,
+        // légale en ALAC comme en FLAC, annonçait donc 20 bits, que rien en
+        // aval ne sait ni convertir ni encoder. Arrondi vers le HAUT, comme
+        // au décodage : aucun bit perdu (#1437).
+        let out_bd = crate::audio::decode::container_bit_depth(out_bd);
+        let out_mime = if oaat_needs_wav || local_needs_wav {
+            "audio/wav".to_string()
+        } else {
+            target_fmt.mime_type().to_string()
+        };
+        let out_ext = if oaat_needs_wav || local_needs_wav {
+            "wav".to_string()
+        } else {
+            target_fmt.container_format().to_string()
+        };
 
-            let info = StreamInfo {
-                format: out_ext.clone(),
-                mime_type: out_mime.clone(),
-                sample_rate: out_sr,
-                bit_depth: out_bd,
-                channels,
-                file_size: None,
-                duration_ms: Some(track_duration_ms as u64),
-                ..Default::default()
-            };
+        info!(
+            file = %file_path,
+            source = ?src_fmt,
+            target = ?target_fmt,
+            sample_rate = out_sr,
+            bit_depth = out_bd,
+            "transcode_required"
+        );
 
-            if use_file_transcode {
-                // ── Pre-transcode to temp file (FLAC) ──────────────────
-                // Decode → encode → write to /tmp, then create a file session.
-                // The HTTP handler serves file sessions with Content-Length
-                // and Range support, which DLNA renderers require.
-                let fp = file_path.clone();
-                let ev_bus = self.event_bus.clone();
-                let playback = self.playback.clone();
-                let zone_id = req.zone_id;
-                // EQ alters the encoded bytes and is not part of the cache key,
-                // so a zone with an active EQ never uses the cache (always fresh).
-                let eq_profile = self.load_eq_processor(req.zone_id, out_sr, channels);
-                // The FIR convolver, like the EQ, alters the encoded bytes and
-                // is not part of the cache key → a zone with an active IR never
-                // uses the cache (always fresh).
-                let convolver = self.load_convolver(req.zone_id, out_sr, channels);
-                // ReplayGain scales the samples, so like the EQ and the FIR it
-                // changes the encoded bytes without being part of the cache key.
-                // A cached transcode made at a different gain would be served
-                // silently at the wrong level — so a gained transcode is never
-                // cached, and never reads the cache.
-                // NOT for a local zone: the local output applies the gain on
-                // its own render path, and a local zone with a known source
-                // format always comes through here (`local_needs_wav`) — so
-                // baking it in as well multiplied the gain twice. A -6 dB track
-                // played at -12 dB, quietly.
-                let replaygain_factor = match (
-                    is_local_output || self.zone_audiophile(req.zone_id),
-                    req.track_id,
-                ) {
-                    (false, Some(tid)) => {
-                        let f = crate::audio::replaygain::playback_factor(&self.db, tid);
-                        if (f - 1.0).abs() > 1e-6 {
-                            Some(f)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-                let cache_path_opt =
-                    if eq_profile.is_some() || convolver.is_some() || replaygain_factor.is_some() {
-                        None
+        // For network outputs (DLNA, OpenHome, etc.) with non-WAV targets
+        // (e.g. FLAC), pre-transcode to a temp file on disk so the HTTP
+        // handler can serve it with Content-Length and Accept-Ranges.
+        // Renderers like the darTZeel LHC-208 reject chunked transfer
+        // (no Content-Length) and require a known file size.
+        //
+        // For local/OAAT outputs (WAV target), keep using streaming
+        // sessions — those outputs don't need Content-Length.
+        let target_format_str = if target_fmt == AudioFormat::Wav {
+            "wav".to_string()
+        } else {
+            target_fmt.container_format().to_string()
+        };
+        // Network outputs need file transcode for Content-Length + Range.
+        // Local outputs use streaming sessions — the _keep_alive_tx in
+        // StreamSession prevents the channel from closing when the decoder
+        // finishes, so ASIO/WASAPI can consume all buffered data at their
+        // own pace. This avoids the 28s download delay of file transcode.
+        // A DSD source served as WAV/LPCM can stream (exact Content-Length
+        // from wav_content_length) instead of blocking on a temp file that
+        // times out at 120s for DSD256/512 → silence (Villerio). Gated by
+        // the `dsd_lpcm_stream` setting (toggle in Settings → Lecture),
+        // off by default pending field validation; read live so the toggle
+        // takes effect without a restart.
+        let dsd_lpcm_streams = src_fmt == AudioFormat::Dsd
+            && target_fmt == AudioFormat::Wav
+            && SettingsRepo::with_backend(self.db.clone())
+                .get("dsd_lpcm_stream")
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("true");
+        let use_file_transcode = use_file_transcode_for(
+            is_network_output,
+            target_format_str == "wav",
+            dlna_needs_wav,
+            dsd_lpcm_streams,
+            // Une zone dont un TRAITEMENT est actif doit l'entendre : le
+            // bras progressif appelle `decode_to_pcm_streaming_seeked`, qui
+            // ne reçoit ni EqProcessor, ni convolveur, ni facteur
+            // ReplayGain — seul `transcode_source_to_file` les applique
+            // (voir les points 1a/1b de cette fonction). Le « transcodage
+            // forcé » servait donc un flux sans aucun des trois.
+            //
+            // Mesuré sur .18 pour le NAVIGATEUR : capture WAV avec EQ
+            // strictement identique à la source décodée (#1168). La même
+            // fuite existe sur une sortie RÉSEAU depuis que le DSD y part en
+            // WAV progressif (0cf27ade, 27/07) : une zone DLNA/OpenHome avec
+            // égaliseur, correction FIR ou ReplayGain actif lisant du DSD
+            // prend ce bras et perd les trois, en silence. C'est la famille
+            // #1216 — déjà corrigée pour le passthrough réseau, le
+            // navigateur et les sorties PULL, jamais ici.
+            //
+            // `eq_forces_transcode` est déjà borné aux sorties réseau /
+            // navigateur / PULL et aux zones où un traitement est
+            // RÉELLEMENT actif (PURE rend `None`) : une zone sans
+            // traitement — l'immense majorité, et le cas qu'arbitre #1363 —
+            // garde le bras progressif. Les sorties PULL (`oaat`,
+            // `diretta`) restent hors du champ : elles ne passent jamais par
+            // le transcodage fichier et le changement n'est pas mesuré.
+            (is_browser_output || is_network_output) && eq_forces_transcode,
+        );
+
+        let info = StreamInfo {
+            format: out_ext.clone(),
+            mime_type: out_mime.clone(),
+            sample_rate: out_sr,
+            bit_depth: out_bd,
+            channels,
+            file_size: None,
+            duration_ms: Some(track_duration_ms as u64),
+            ..Default::default()
+        };
+        FormatDeSortie {
+            out_sr,
+            out_bd,
+            out_mime,
+            out_ext,
+            target_format_str,
+            use_file_transcode,
+            info,
+        }
+    }
+
+    /// Deuxième temps, sorties réseau : décodage → encodage → fichier
+    /// temporaire, puis session de fichier servie avec Content-Length et
+    /// Range. Cache par empreinte quand aucun traitement n'altère les octets.
+    /// `annonce_apres_sortie_guard` relit ce texte (niveaux sur cache hit).
+    async fn transcoder_vers_fichier(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+        format: FormatDeSortie,
+    ) -> Result<FluxLocal, String> {
+        let DecisionLocale {
+            bit_depth,
+            channels,
+            is_local_output,
+            sample_rate,
+            track_duration_ms,
+            ref file_path,
+            ..
+        } = *decision;
+        let FormatDeSortie {
+            out_sr,
+            out_bd,
+            out_mime,
+            out_ext,
+            target_format_str,
+            ..
+        } = format;
+        let flux = {
+            // ── Pre-transcode to temp file (FLAC) ──────────────────
+            // Decode → encode → write to /tmp, then create a file session.
+            // The HTTP handler serves file sessions with Content-Length
+            // and Range support, which DLNA renderers require.
+            let fp = file_path.clone();
+            let ev_bus = self.event_bus.clone();
+            let playback = self.playback.clone();
+            let zone_id = req.zone_id;
+            // EQ alters the encoded bytes and is not part of the cache key,
+            // so a zone with an active EQ never uses the cache (always fresh).
+            let eq_profile = self.load_eq_processor(req.zone_id, out_sr, channels);
+            // The FIR convolver, like the EQ, alters the encoded bytes and
+            // is not part of the cache key → a zone with an active IR never
+            // uses the cache (always fresh).
+            let convolver = self.load_convolver(req.zone_id, out_sr, channels);
+            // ReplayGain scales the samples, so like the EQ and the FIR it
+            // changes the encoded bytes without being part of the cache key.
+            // A cached transcode made at a different gain would be served
+            // silently at the wrong level — so a gained transcode is never
+            // cached, and never reads the cache.
+            // NOT for a local zone: the local output applies the gain on
+            // its own render path, and a local zone with a known source
+            // format always comes through here (`local_needs_wav`) — so
+            // baking it in as well multiplied the gain twice. A -6 dB track
+            // played at -12 dB, quietly.
+            let replaygain_factor = match (
+                is_local_output || self.zone_audiophile(req.zone_id),
+                req.track_id,
+            ) {
+                (false, Some(tid)) => {
+                    let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+                    if (f - 1.0).abs() > 1e-6 {
+                        Some(f)
                     } else {
-                        crate::transcode_cache::cache_path(
-                            &file_path, &out_ext, out_sr, out_bd, channels,
-                        )
-                    };
-                // The transcode always writes to a fresh `tune-transcode-*` file
-                // (subject to the normal cleanup); on success it is atomically
-                // renamed into the cache. A crash mid-transcode therefore can
-                // never leave a partial file under a cache name that a later hit
-                // would serve.
-                let tmp_path = std::env::temp_dir()
-                    .join(format!(
-                        "tune-transcode-{}.{}",
-                        uuid::Uuid::new_v4(),
-                        &out_ext
-                    ))
-                    .to_string_lossy()
-                    .to_string();
-
-                // Serialize transcodes of this same source file and drop any
-                // play a newer tap has already superseded, so a burst of taps
-                // can't spawn overlapping ALAC→FLAC transcodes of one file
-                // (Yves, DMP-A10 over DLNA). Capture our own play seq, then
-                // wait our turn on the per-file gate; if a newer play bumped the
-                // generation while we waited, skip the transcode entirely.
-                let my_seq = self.playback.current_play_seq(req.zone_id).await;
-                let file_gate = {
-                    let mut gates = TRANSCODE_GATE.lock().await;
-                    gates
-                        .entry(file_path.clone())
-                        .or_insert_with(|| Arc::new(Mutex::new(())))
-                        .clone()
-                };
-                let _file_hold = file_gate.lock().await;
-                if self.playback.current_play_seq(req.zone_id).await != my_seq {
-                    info!(
-                        zone_id = req.zone_id,
-                        file = %file_path,
-                        "transcode_skipped_superseded_burst"
-                    );
-                    return Err(SUPERSEDED_BEFORE_TRANSCODE.into());
-                }
-
-                // Cache hit: an identical rendition already exists on disk —
-                // serve it and skip the entire decode/encode (Yves: ~30s → instant
-                // on replay / superseded burst).
-                if let Some(cp) = cache_path_opt
-                    .as_ref()
-                    .filter(|cp| crate::transcode_cache::is_hit(cp))
-                {
-                    crate::transcode_cache::touch(cp);
-                    let file_size = std::fs::metadata(cp).map(|m| m.len()).unwrap_or(0);
-                    info!(file = %file_path, cache = %cp, file_size, "transcode_cache_hit");
-                    let file_info = StreamInfo {
-                        format: out_ext.clone(),
-                        mime_type: out_mime.clone(),
-                        sample_rate: out_sr,
-                        bit_depth: out_bd,
-                        channels,
-                        file_size: Some(file_size),
-                        duration_ms: Some(track_duration_ms as u64),
-                        ..Default::default()
-                    };
-                    let session_id = self
-                        .streamer
-                        .create_file_session(file_info, cp.clone(), false)
-                        .await;
-                    // The current track was a cache hit → warm the next one too,
-                    // so an album keeps hitting the cache track after track.
-                    self.spawn_warm_next_local(
-                        req.zone_id,
-                        sample_rate,
-                        bit_depth,
-                        channels,
-                        out_ext.clone(),
-                        out_sr,
-                        out_bd,
-                        target_format_str.clone(),
-                    );
-
-                    // …et les VU-mètres avec, sinon ils s'éteignent DÈS la
-                    // deuxième écoute.
-                    //
-                    // Le chemin du transcodage frais, juste en dessous, émet ses
-                    // niveaux depuis le `pcm_bytes` que lui rend
-                    // `transcode_source_to_file`. Un cache hit saute tout le
-                    // décodage — c'est son intérêt — donc plus une seule fenêtre
-                    // de PCM ne passe par ici, et rien n'attachait de forwarder :
-                    // aiguilles à zéro, spectrogramme plat, pour une lecture
-                    // pourtant parfaitement normale.
-                    //
-                    // Le symptôme suit exactement la mise en cache, ce qui le
-                    // rendait incompréhensible côté testeur : la PREMIÈRE écoute
-                    // d'une piste anime tout, chaque REPRISE est morte. Et il
-                    // frappe l'ALAC en premier parce que l'ALAC transcode
-                    // toujours pour un renderer réseau — il peuple donc ce cache
-                    // à chaque album, là où un FLAC part souvent en natif sans
-                    // jamais traverser ce bloc. Journaux d'Yves Corbat du
-                    // 01/09/2026 : 7 des 8 lectures de « Topography of Mind »
-                    // sont des cache hits, toutes sans niveaux.
-                    //
-                    // On décode la RENDITION mise en cache, pas la source : c'est
-                    // elle qui part au renderer, donc c'est elle que les aiguilles
-                    // doivent décrire. Aucune divergence à craindre au passage —
-                    // `cache_path_opt` est `None` dès qu'un EQ, une convolution ou
-                    // un ReplayGain est en jeu, donc une rendition en cache est
-                    // toujours du signal non traité.
-                    //
-                    // Décodage EN FLUX, le PCM part dans un puits, seules les
-                    // fenêtres ressortent : matérialiser la piste coûterait
-                    // ~1,9 Go sur un 24/192 de dix minutes, uniquement pour
-                    // animer des aiguilles.
-                    //
-                    // Par `spawn_local_file_levels_decode`, et pas en recopiant
-                    // la forme à la main. La première version de ce bloc s'était
-                    // modelée sur le décodage-pour-niveaux du PASSTHROUGH, qui
-                    // n'a jamais eu de frein (#1423) : elle en a hérité la forme
-                    // (flux, PCM au puits) mais pas le bridage que porte la
-                    // fonction ci-dessus — son puits drainait sans condition. Le
-                    // décodage courait alors à la vitesse du DISQUE pendant que
-                    // le forwarder ne publie qu'au temps réel, et la file du
-                    // forwarder — non bornée, chaque fenêtre portant son PCM —
-                    // retenait la piste ENTIÈRE. Le comble : le commentaire
-                    // ci-dessus invoquait les ~1,9 Go qu'il laissait revenir par
-                    // la file. Et le cache hit est le cas COURANT, pas le rare.
-                    //
-                    // On décode la rendition à son débit NATIF : la clef du
-                    // cache (`transcode_cache::cache_path`) couvre `out_sr`,
-                    // `out_bd` et `channels`, donc le fichier en cache est déjà
-                    // dans ce format — rééchantillonner vers lui ne changeait
-                    // rien.
-                    if let Some(bus) = ev_bus
-                        .clone()
-                        .filter(|_| self.levels_attach_allowed(zone_id))
-                    {
-                        // Génération épinglée au moment de la décision (#1110) :
-                        // ce décodage dure toute la piste, il ne doit pas pouvoir
-                        // se raccrocher à la suivante.
-                        let play_seq = playback.current_play_seq(zone_id).await;
-                        // Cache hit : la rendition est servie depuis son début
-                        // (un seek passe par Range HTTP).
-                        spawn_local_file_levels_decode(
-                            bus,
-                            playback.clone(),
-                            zone_id,
-                            play_seq,
-                            cp.clone(),
-                        );
-                    }
-                    (
-                        session_id,
-                        out_mime,
-                        out_ext,
-                        Some(file_size),
-                        Some(out_sr),
-                        Some(out_bd as u32),
-                        Some(channels as u32),
-                    )
-                } else {
-                    info!(
-                        file = %fp,
-                        tmp = %tmp_path,
-                        target = %target_format_str,
-                        sample_rate = out_sr,
-                        bit_depth = out_bd,
-                        "transcode_to_temp_file_start"
-                    );
-
-                    // Target bit depth chosen above (out_bd). For the generic DLNA
-                    // WAV/LPCM fallback this is 16 (LPCM is a 16-bit-only profile);
-                    // the decoded PCM must actually be reduced to 16-bit here, not
-                    // merely relabelled — otherwise 24-bit samples are served under
-                    // a 16-bit WAV header and the renderer plays silence (#1137).
-                    let target_bd = out_bd;
-                    // Le budget doit suivre la TAILLE, pas une constante.
-                    //
-                    // 120 s fixes suffisaient tant qu'on transcodait du FLAC ;
-                    // ils ne suffisent plus pour du DSD. Journaux de Cyrille
-                    // (#1330, ampli Yamaha en zone PCM, source sur NAS) : un
-                    // FLAC DXD est prêt en ~6 s, un DSD128 en ~20 s, et un
-                    // mouvement de symphonie en DSD256 courait encore au-delà.
-                    // Passé le délai, la lecture ne démarre JAMAIS — d'où « le
-                    // DSD128 passe, le DSD256 non », qui n'a rien à voir avec
-                    // la fréquence (les deux visent 352,8 kHz) et tout à voir
-                    // avec le volume de données à décoder.
-                    let transcode_budget = transcode_budget_for(&fp);
-                    info!(
-                        file = %file_path,
-                        budget_s = transcode_budget.as_secs(),
-                        "transcode_budget_selected"
-                    );
-                    // …mais la taille seule ne suffit pas : elle ignore la
-                    // VITESSE de la machine (#3140). `120 + 0,3154·D` en DSD256
-                    // n'est tenable qu'à partir de `× 3,17` temps réel ; Shrek
-                    // décode à `× 2,2`, et Tune livre de l'ARM64. La balise
-                    // publie l'audio déjà décodé, le chien de garde en tire le
-                    // facteur réel de CET hôte et n'ÉTEND le budget que si
-                    // celui de la taille ne suffit pas.
-                    let progres = crate::audio::decode_progress::DecodeProgress::new();
-                    let politique =
-                        BudgetAdaptatif::new(track_duration_ms as f64 / 1000.0, transcode_budget);
-                    // Même raison que le pré-transcode DASH plus bas : la ligne
-                    // de fin doit porter sa propre durée, pour rester lisible
-                    // seule dans un export de journal tronqué par la rotation.
-                    let file_transcode_start = std::time::Instant::now();
-                    let transcode_result = transcoder_sous_budget(
-                        transcode_source_to_file(
-                            fp.clone(),
-                            out_sr,
-                            channels,
-                            target_bd,
-                            target_format_str.clone(),
-                            eq_profile,
-                            convolver,
-                            replaygain_factor,
-                            tmp_path.clone(),
-                            Some(progres.clone()),
-                        ),
-                        progres,
-                        politique,
-                        PAS_SONDAGE_BUDGET,
-                        Some(file_path.as_str()),
-                    )
-                    .await;
-
-                    match transcode_result {
-                        Ok(Ok((file_size, pcm_bytes, actual_bd))) => {
-                            if file_size < 1024 {
-                                warn!(
-                                    file = %file_path,
-                                    file_size,
-                                    "transcode_produced_empty_file — source may be corrupted or encrypted"
-                                );
-                                let _ = std::fs::remove_file(&tmp_path);
-                                return Err(
-                                    "transcode produced empty file (corrupted source?)".into()
-                                );
-                            }
-                            // Promote the completed file into the cache (atomic rename
-                            // within the temp dir) so the next identical request is a
-                            // hit. If we're not caching, or the rename fails, serve the
-                            // freshly-written file as before.
-                            let serve_path = match cache_path_opt.as_ref() {
-                                Some(cp) if std::fs::rename(&tmp_path, cp).is_ok() => {
-                                    tokio::task::spawn_blocking(crate::transcode_cache::evict);
-                                    cp.clone()
-                                }
-                                _ => tmp_path.clone(),
-                            };
-                            info!(
-                                file = %file_path,
-                                tmp = %serve_path,
-                                file_size,
-                                elapsed_ms = file_transcode_start.elapsed().as_millis() as u64,
-                                "transcode_to_temp_file_complete"
-                            );
-
-                            // Emit audio levels in the background, paced to
-                            // the playback clock by the forwarder. Pas pendant
-                            // un pré-chargement gapless : la session décrit la
-                            // piste SUIVANTE, ses niveaux partiraient datés de
-                            // l'horloge de la piste courante.
-                            if let Some(bus) = ev_bus
-                                .clone()
-                                .filter(|_| self.levels_attach_allowed(zone_id))
-                            {
-                                let playback = playback.clone();
-                                let actual_ch = channels;
-                                let sr = out_sr;
-                                // Génération épinglée au moment de la décision,
-                                // pas au démarrage de la tâche (#1110).
-                                let play_seq = playback.current_play_seq(zone_id).await;
-                                tokio::spawn(async move {
-                                    // Temp-file : le PCM décodé part du début
-                                    // du fichier (un seek passe par Range HTTP).
-                                    let levels_tx = spawn_paced_levels_forwarder(
-                                        bus, playback, zone_id, play_seq, 0,
-                                    );
-                                    tokio::task::spawn_blocking(move || {
-                                        crate::audio::tap::send_windowed_pcm(
-                                            &levels_tx, &pcm_bytes, actual_bd, actual_ch, sr,
-                                        );
-                                    })
-                                    .await
-                                    .ok();
-                                });
-                            }
-
-                            // Create a file session — HTTP handler serves with
-                            // Content-Length and Range support.
-                            let file_info = StreamInfo {
-                                format: out_ext.clone(),
-                                mime_type: out_mime.clone(),
-                                sample_rate: out_sr,
-                                bit_depth: out_bd,
-                                channels,
-                                file_size: Some(file_size),
-                                duration_ms: Some(track_duration_ms as u64),
-                                ..Default::default()
-                            };
-                            let session_id = self
-                                .streamer
-                                .create_file_session(file_info, serve_path, false)
-                                .await;
-
-                            // Current track just transcoded into the cache → warm
-                            // the next one in the background while this one plays,
-                            // so the album transition is a cache hit (no 30s gap).
-                            // Only when the current was actually cached (Some means
-                            // no EQ) — warming an EQ zone would populate an entry
-                            // the real (EQ) play never hits.
-                            if cache_path_opt.is_some() {
-                                self.spawn_warm_next_local(
-                                    req.zone_id,
-                                    sample_rate,
-                                    bit_depth,
-                                    channels,
-                                    out_ext.clone(),
-                                    out_sr,
-                                    out_bd,
-                                    target_format_str.clone(),
-                                );
-                            }
-                            (
-                                session_id,
-                                out_mime,
-                                out_ext,
-                                Some(file_size),
-                                Some(out_sr),
-                                Some(out_bd as u32),
-                                Some(channels as u32),
-                            )
-                        }
-                        Ok(Err(e)) => {
-                            warn!(error = %e, file = %file_path, "transcode_to_temp_file_failed");
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return Err(format!("transcode failed: {e}"));
-                        }
-                        Err(depassement) => {
-                            let budget_s = depassement.budget.as_secs();
-                            let size_mb = std::fs::metadata(&fp)
-                                .map(|m| m.len() / (1024 * 1024))
-                                .unwrap_or(0);
-                            let _ = std::fs::remove_file(&tmp_path);
-                            // La moitié utile de #3140 : DIRE que c'est l'hôte.
-                            //
-                            // L'ancienne ligne n'annonçait qu'un délai dépassé
-                            // et une taille, et envoyait chercher du côté du
-                            // disque ou du réseau — alors que la cause est la
-                            // vitesse du processeur, et qu'elle est désormais
-                            // MESURÉE. On la nomme, avec son facteur et celui
-                            // qu'il aurait fallu.
-                            match (depassement.facteur, depassement.facteur_requis()) {
-                                (Some(mesure), Some(requis)) => {
-                                    warn!(
-                                        file = %file_path,
-                                        budget_s,
-                                        size_mb,
-                                        track_s = depassement.piste_s,
-                                        decoded_s = depassement.decode.as_secs_f64(),
-                                        elapsed_s = depassement.ecoule.as_secs_f64(),
-                                        host_realtime_factor = mesure,
-                                        required_realtime_factor = requis,
-                                        "transcode_timeout_host_too_slow"
-                                    );
-                                    return Err(format!(
-                                        "transcode timeout after {budget_s}s: this HOST decodes \
-                                         this file at \u{d7}{mesure:.2} real time and would need \
-                                         \u{d7}{requis:.2} to finish a {track_min:.1} min track \
-                                         \u{2014} the machine is too slow for this format, not the \
-                                         disk and not the file ({size_mb} MB, \
-                                         {decoded:.0}s of audio decoded)",
-                                        track_min = depassement.piste_s / 60.0,
-                                        decoded = depassement.decode.as_secs_f64(),
-                                    ));
-                                }
-                                // Rien n'a été mesuré (décodeur qui ne publie
-                                // pas, durée de piste inconnue, blocage avant
-                                // la première fenêtre) : le message d'avant,
-                                // mot pour mot.
-                                _ => {
-                                    warn!(
-                                        file = %file_path,
-                                        budget_s,
-                                        size_mb,
-                                        "transcode_timeout"
-                                    );
-                                    return Err(format!(
-                                        "transcode timeout after {budget_s}s for a {size_mb} MB source \u{2014} \
-                                         disk or network too slow, or the file is unusually large"
-                                    ));
-                                }
-                            }
-                        }
+                        None
                     }
                 }
+                _ => None,
+            };
+            let cache_path_opt = if eq_profile.is_some()
+                || convolver.is_some()
+                || replaygain_factor.is_some()
+            {
+                None
             } else {
-                // ── Streaming transcode (WAV for local/OAAT) ──────────
-                // Use the computed WAV content length for the DIDL size
-                // attribute so DLNA renderers know the correct stream size.
-                let transcode_file_size = info.wav_content_length();
+                crate::transcode_cache::cache_path(&file_path, &out_ext, out_sr, out_bd, channels)
+            };
+            // The transcode always writes to a fresh `tune-transcode-*` file
+            // (subject to the normal cleanup); on success it is atomically
+            // renamed into the cache. A crash mid-transcode therefore can
+            // never leave a partial file under a cache name that a later hit
+            // would serve.
+            let tmp_path = std::env::temp_dir()
+                .join(format!(
+                    "tune-transcode-{}.{}",
+                    uuid::Uuid::new_v4(),
+                    &out_ext
+                ))
+                .to_string_lossy()
+                .to_string();
 
-                let (session_id, tx, data_ready) =
-                    self.streamer.create_session(info, false, 256).await;
+            // Serialize transcodes of this same source file and drop any
+            // play a newer tap has already superseded, so a burst of taps
+            // can't spawn overlapping ALAC→FLAC transcodes of one file
+            // (Yves, DMP-A10 over DLNA). Capture our own play seq, then
+            // wait our turn on the per-file gate; if a newer play bumped the
+            // generation while we waited, skip the transcode entirely.
+            let my_seq = self.playback.current_play_seq(req.zone_id).await;
+            let file_gate = {
+                let mut gates = TRANSCODE_GATE.lock().await;
+                gates
+                    .entry(file_path.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            };
+            let _file_hold = file_gate.lock().await;
+            if self.playback.current_play_seq(req.zone_id).await != my_seq {
+                info!(
+                    zone_id = req.zone_id,
+                    file = %file_path,
+                    "transcode_skipped_superseded_burst"
+                );
+                return Err(SUPERSEDED_BEFORE_TRANSCODE.into());
+            }
 
-                // Mark session: the streaming decoder sends the WAV header
-                // with the real source sample rate, so the stream handler
-                // must NOT prepend its own.
-                {
-                    let sessions = self.streamer.sessions_state();
-                    let sessions = sessions.lock().await;
-                    if let Some(session) = sessions.get(&session_id) {
-                        session
-                            .wav_header_included
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-
-                let fp = file_path.clone();
-                let ev_bus = self.event_bus.clone();
-                let playback = self.playback.clone();
-                let zone_id = req.zone_id;
-                let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
-                let streamer_sessions = self.streamer.sessions_state();
-                let close_session_id = session_id.clone();
-                // Pré-chargement gapless : session de la piste suivante, pas
-                // de forwarder (voir `levels_prewarm`).
-                let attach_levels = self.levels_attach_allowed(zone_id);
-                tokio::spawn(async move {
-                    debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
-
-                    // Bus conservé pour signaler un échec de décodage au client :
-                    // un décodage transcodé qui échoue (codec non supporté, fichier
-                    // corrompu…) ne doit PLUS produire un flux silencieux qui boucle
-                    // toutes les ~2 s — on remonte une erreur visible.
-                    let err_bus = ev_bus.clone();
-
-                    // Forwarder cadencé si le bus existe ; sinon un canal dont
-                    // le récepteur est aussitôt abandonné (le décodeur ignore
-                    // les erreurs d'envoi).
-                    let levels_tx = match ev_bus.filter(|_| attach_levels) {
-                        Some(bus) => {
-                            let play_seq = playback.current_play_seq(zone_id).await;
-                            spawn_paced_levels_forwarder(
-                                bus,
-                                playback,
-                                zone_id,
-                                play_seq,
-                                (seek_s * 1000.0) as i64,
-                            )
-                        }
-                        None => {
-                            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0
-                        }
-                    };
-
-                    let fp_clone = fp.clone();
-                    let tx_clone = tx.clone();
-                    drop(tx);
-
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::audio::decode::decode_to_pcm_streaming_seeked(
-                            &fp_clone,
-                            Some(out_sr),
-                            Some(channels as u32),
-                            Some(out_bd),
-                            tx_clone,
-                            32768,
-                            data_ready,
-                            levels_tx,
-                            seek_s,
-                        )
-                    })
+            // Cache hit: an identical rendition already exists on disk —
+            // serve it and skip the entire decode/encode (Yves: ~30s → instant
+            // on replay / superseded burst).
+            if let Some(cp) = cache_path_opt
+                .as_ref()
+                .filter(|cp| crate::transcode_cache::is_hit(cp))
+            {
+                crate::transcode_cache::touch(cp);
+                let file_size = std::fs::metadata(cp).map(|m| m.len()).unwrap_or(0);
+                info!(file = %file_path, cache = %cp, file_size, "transcode_cache_hit");
+                let file_info = StreamInfo {
+                    format: out_ext.clone(),
+                    mime_type: out_mime.clone(),
+                    sample_rate: out_sr,
+                    bit_depth: out_bd,
+                    channels,
+                    file_size: Some(file_size),
+                    duration_ms: Some(track_duration_ms as u64),
+                    ..Default::default()
+                };
+                let session_id = self
+                    .streamer
+                    .create_file_session(file_info, cp.clone(), false)
                     .await;
+                // The current track was a cache hit → warm the next one too,
+                // so an album keeps hitting the cache track after track.
+                self.spawn_warm_next_local(
+                    req.zone_id,
+                    sample_rate,
+                    bit_depth,
+                    channels,
+                    out_ext.clone(),
+                    out_sr,
+                    out_bd,
+                    target_format_str.clone(),
+                );
 
-                    match result {
-                        Ok(Ok(_bit_depth)) => {
-                            debug!(file = %fp, "transcode_complete_streaming");
-                        }
-                        Ok(Err(e)) => {
-                            warn!(error = %e, file = %fp, "transcode_streaming_decode_failed");
-                            if let Some(ref bus) = err_bus {
-                                bus.emit(
-                                    "zone.playback_error",
-                                    serde_json::json!({
-                                        "zone_id": zone_id,
-                                        "error": format!("Impossible de décoder la piste : {e}"),
-                                    }),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, file = %fp, "transcode_streaming_task_panic");
-                            if let Some(ref bus) = err_bus {
-                                bus.emit(
-                                    "zone.playback_error",
-                                    serde_json::json!({
-                                        "zone_id": zone_id,
-                                        "error": "Le décodage de la piste a échoué (erreur interne).",
-                                    }),
-                                );
-                            }
-                        }
-                    }
-
-                    // Signal EOF by dropping the keep-alive sender. The
-                    // decoder's tx is already dropped at this point, but the
-                    // _keep_alive_tx in the session keeps the channel open
-                    // until we explicitly close it here.
-                    let sessions = streamer_sessions.lock().await;
-                    if let Some(session) = sessions.get(&close_session_id) {
-                        session.close_sender().await;
-                    }
-                });
-
+                // …et les VU-mètres avec, sinon ils s'éteignent DÈS la
+                // deuxième écoute.
+                //
+                // Le chemin du transcodage frais, juste en dessous, émet ses
+                // niveaux depuis le `pcm_bytes` que lui rend
+                // `transcode_source_to_file`. Un cache hit saute tout le
+                // décodage — c'est son intérêt — donc plus une seule fenêtre
+                // de PCM ne passe par ici, et rien n'attachait de forwarder :
+                // aiguilles à zéro, spectrogramme plat, pour une lecture
+                // pourtant parfaitement normale.
+                //
+                // Le symptôme suit exactement la mise en cache, ce qui le
+                // rendait incompréhensible côté testeur : la PREMIÈRE écoute
+                // d'une piste anime tout, chaque REPRISE est morte. Et il
+                // frappe l'ALAC en premier parce que l'ALAC transcode
+                // toujours pour un renderer réseau — il peuple donc ce cache
+                // à chaque album, là où un FLAC part souvent en natif sans
+                // jamais traverser ce bloc. Journaux d'Yves Corbat du
+                // 01/09/2026 : 7 des 8 lectures de « Topography of Mind »
+                // sont des cache hits, toutes sans niveaux.
+                //
+                // On décode la RENDITION mise en cache, pas la source : c'est
+                // elle qui part au renderer, donc c'est elle que les aiguilles
+                // doivent décrire. Aucune divergence à craindre au passage —
+                // `cache_path_opt` est `None` dès qu'un EQ, une convolution ou
+                // un ReplayGain est en jeu, donc une rendition en cache est
+                // toujours du signal non traité.
+                //
+                // Décodage EN FLUX, le PCM part dans un puits, seules les
+                // fenêtres ressortent : matérialiser la piste coûterait
+                // ~1,9 Go sur un 24/192 de dix minutes, uniquement pour
+                // animer des aiguilles.
+                //
+                // Par `spawn_local_file_levels_decode`, et pas en recopiant
+                // la forme à la main. La première version de ce bloc s'était
+                // modelée sur le décodage-pour-niveaux du PASSTHROUGH, qui
+                // n'a jamais eu de frein (#1423) : elle en a hérité la forme
+                // (flux, PCM au puits) mais pas le bridage que porte la
+                // fonction ci-dessus — son puits drainait sans condition. Le
+                // décodage courait alors à la vitesse du DISQUE pendant que
+                // le forwarder ne publie qu'au temps réel, et la file du
+                // forwarder — non bornée, chaque fenêtre portant son PCM —
+                // retenait la piste ENTIÈRE. Le comble : le commentaire
+                // ci-dessus invoquait les ~1,9 Go qu'il laissait revenir par
+                // la file. Et le cache hit est le cas COURANT, pas le rare.
+                //
+                // On décode la rendition à son débit NATIF : la clef du
+                // cache (`transcode_cache::cache_path`) couvre `out_sr`,
+                // `out_bd` et `channels`, donc le fichier en cache est déjà
+                // dans ce format — rééchantillonner vers lui ne changeait
+                // rien.
+                if let Some(bus) = ev_bus
+                    .clone()
+                    .filter(|_| self.levels_attach_allowed(zone_id))
+                {
+                    // Génération épinglée au moment de la décision (#1110) :
+                    // ce décodage dure toute la piste, il ne doit pas pouvoir
+                    // se raccrocher à la suivante.
+                    let play_seq = playback.current_play_seq(zone_id).await;
+                    // Cache hit : la rendition est servie depuis son début
+                    // (un seek passe par Range HTTP).
+                    spawn_local_file_levels_decode(
+                        bus,
+                        playback.clone(),
+                        zone_id,
+                        play_seq,
+                        cp.clone(),
+                    );
+                }
                 (
                     session_id,
                     out_mime,
                     out_ext,
-                    transcode_file_size,
+                    Some(file_size),
                     Some(out_sr),
                     Some(out_bd as u32),
                     Some(channels as u32),
                 )
+            } else {
+                info!(
+                    file = %fp,
+                    tmp = %tmp_path,
+                    target = %target_format_str,
+                    sample_rate = out_sr,
+                    bit_depth = out_bd,
+                    "transcode_to_temp_file_start"
+                );
+
+                // Target bit depth chosen above (out_bd). For the generic DLNA
+                // WAV/LPCM fallback this is 16 (LPCM is a 16-bit-only profile);
+                // the decoded PCM must actually be reduced to 16-bit here, not
+                // merely relabelled — otherwise 24-bit samples are served under
+                // a 16-bit WAV header and the renderer plays silence (#1137).
+                let target_bd = out_bd;
+                // Le budget doit suivre la TAILLE, pas une constante.
+                //
+                // 120 s fixes suffisaient tant qu'on transcodait du FLAC ;
+                // ils ne suffisent plus pour du DSD. Journaux de Cyrille
+                // (#1330, ampli Yamaha en zone PCM, source sur NAS) : un
+                // FLAC DXD est prêt en ~6 s, un DSD128 en ~20 s, et un
+                // mouvement de symphonie en DSD256 courait encore au-delà.
+                // Passé le délai, la lecture ne démarre JAMAIS — d'où « le
+                // DSD128 passe, le DSD256 non », qui n'a rien à voir avec
+                // la fréquence (les deux visent 352,8 kHz) et tout à voir
+                // avec le volume de données à décoder.
+                let transcode_budget = transcode_budget_for(&fp);
+                info!(
+                    file = %file_path,
+                    budget_s = transcode_budget.as_secs(),
+                    "transcode_budget_selected"
+                );
+                // …mais la taille seule ne suffit pas : elle ignore la
+                // VITESSE de la machine (#3140). `120 + 0,3154·D` en DSD256
+                // n'est tenable qu'à partir de `× 3,17` temps réel ; Shrek
+                // décode à `× 2,2`, et Tune livre de l'ARM64. La balise
+                // publie l'audio déjà décodé, le chien de garde en tire le
+                // facteur réel de CET hôte et n'ÉTEND le budget que si
+                // celui de la taille ne suffit pas.
+                let progres = crate::audio::decode_progress::DecodeProgress::new();
+                let politique =
+                    BudgetAdaptatif::new(track_duration_ms as f64 / 1000.0, transcode_budget);
+                // Même raison que le pré-transcode DASH plus bas : la ligne
+                // de fin doit porter sa propre durée, pour rester lisible
+                // seule dans un export de journal tronqué par la rotation.
+                let file_transcode_start = std::time::Instant::now();
+                let transcode_result = transcoder_sous_budget(
+                    transcode_source_to_file(
+                        fp.clone(),
+                        out_sr,
+                        channels,
+                        target_bd,
+                        target_format_str.clone(),
+                        eq_profile,
+                        convolver,
+                        replaygain_factor,
+                        tmp_path.clone(),
+                        Some(progres.clone()),
+                    ),
+                    progres,
+                    politique,
+                    PAS_SONDAGE_BUDGET,
+                    Some(file_path.as_str()),
+                )
+                .await;
+
+                match transcode_result {
+                    Ok(Ok((file_size, pcm_bytes, actual_bd))) => {
+                        if file_size < 1024 {
+                            warn!(
+                                file = %file_path,
+                                file_size,
+                                "transcode_produced_empty_file — source may be corrupted or encrypted"
+                            );
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err("transcode produced empty file (corrupted source?)".into());
+                        }
+                        // Promote the completed file into the cache (atomic rename
+                        // within the temp dir) so the next identical request is a
+                        // hit. If we're not caching, or the rename fails, serve the
+                        // freshly-written file as before.
+                        let serve_path = match cache_path_opt.as_ref() {
+                            Some(cp) if std::fs::rename(&tmp_path, cp).is_ok() => {
+                                tokio::task::spawn_blocking(crate::transcode_cache::evict);
+                                cp.clone()
+                            }
+                            _ => tmp_path.clone(),
+                        };
+                        info!(
+                            file = %file_path,
+                            tmp = %serve_path,
+                            file_size,
+                            elapsed_ms = file_transcode_start.elapsed().as_millis() as u64,
+                            "transcode_to_temp_file_complete"
+                        );
+
+                        // Emit audio levels in the background, paced to
+                        // the playback clock by the forwarder. Pas pendant
+                        // un pré-chargement gapless : la session décrit la
+                        // piste SUIVANTE, ses niveaux partiraient datés de
+                        // l'horloge de la piste courante.
+                        if let Some(bus) = ev_bus
+                            .clone()
+                            .filter(|_| self.levels_attach_allowed(zone_id))
+                        {
+                            let playback = playback.clone();
+                            let actual_ch = channels;
+                            let sr = out_sr;
+                            // Génération épinglée au moment de la décision,
+                            // pas au démarrage de la tâche (#1110).
+                            let play_seq = playback.current_play_seq(zone_id).await;
+                            tokio::spawn(async move {
+                                // Temp-file : le PCM décodé part du début
+                                // du fichier (un seek passe par Range HTTP).
+                                let levels_tx = spawn_paced_levels_forwarder(
+                                    bus, playback, zone_id, play_seq, 0,
+                                );
+                                tokio::task::spawn_blocking(move || {
+                                    crate::audio::tap::send_windowed_pcm(
+                                        &levels_tx, &pcm_bytes, actual_bd, actual_ch, sr,
+                                    );
+                                })
+                                .await
+                                .ok();
+                            });
+                        }
+
+                        // Create a file session — HTTP handler serves with
+                        // Content-Length and Range support.
+                        let file_info = StreamInfo {
+                            format: out_ext.clone(),
+                            mime_type: out_mime.clone(),
+                            sample_rate: out_sr,
+                            bit_depth: out_bd,
+                            channels,
+                            file_size: Some(file_size),
+                            duration_ms: Some(track_duration_ms as u64),
+                            ..Default::default()
+                        };
+                        let session_id = self
+                            .streamer
+                            .create_file_session(file_info, serve_path, false)
+                            .await;
+
+                        // Current track just transcoded into the cache → warm
+                        // the next one in the background while this one plays,
+                        // so the album transition is a cache hit (no 30s gap).
+                        // Only when the current was actually cached (Some means
+                        // no EQ) — warming an EQ zone would populate an entry
+                        // the real (EQ) play never hits.
+                        if cache_path_opt.is_some() {
+                            self.spawn_warm_next_local(
+                                req.zone_id,
+                                sample_rate,
+                                bit_depth,
+                                channels,
+                                out_ext.clone(),
+                                out_sr,
+                                out_bd,
+                                target_format_str.clone(),
+                            );
+                        }
+                        (
+                            session_id,
+                            out_mime,
+                            out_ext,
+                            Some(file_size),
+                            Some(out_sr),
+                            Some(out_bd as u32),
+                            Some(channels as u32),
+                        )
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, file = %file_path, "transcode_to_temp_file_failed");
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(format!("transcode failed: {e}"));
+                    }
+                    Err(depassement) => {
+                        let budget_s = depassement.budget.as_secs();
+                        let size_mb = std::fs::metadata(&fp)
+                            .map(|m| m.len() / (1024 * 1024))
+                            .unwrap_or(0);
+                        let _ = std::fs::remove_file(&tmp_path);
+                        // La moitié utile de #3140 : DIRE que c'est l'hôte.
+                        //
+                        // L'ancienne ligne n'annonçait qu'un délai dépassé
+                        // et une taille, et envoyait chercher du côté du
+                        // disque ou du réseau — alors que la cause est la
+                        // vitesse du processeur, et qu'elle est désormais
+                        // MESURÉE. On la nomme, avec son facteur et celui
+                        // qu'il aurait fallu.
+                        match (depassement.facteur, depassement.facteur_requis()) {
+                            (Some(mesure), Some(requis)) => {
+                                warn!(
+                                    file = %file_path,
+                                    budget_s,
+                                    size_mb,
+                                    track_s = depassement.piste_s,
+                                    decoded_s = depassement.decode.as_secs_f64(),
+                                    elapsed_s = depassement.ecoule.as_secs_f64(),
+                                    host_realtime_factor = mesure,
+                                    required_realtime_factor = requis,
+                                    "transcode_timeout_host_too_slow"
+                                );
+                                return Err(format!(
+                                    "transcode timeout after {budget_s}s: this HOST decodes \
+                                     this file at \u{d7}{mesure:.2} real time and would need \
+                                     \u{d7}{requis:.2} to finish a {track_min:.1} min track \
+                                     \u{2014} the machine is too slow for this format, not the \
+                                     disk and not the file ({size_mb} MB, \
+                                     {decoded:.0}s of audio decoded)",
+                                    track_min = depassement.piste_s / 60.0,
+                                    decoded = depassement.decode.as_secs_f64(),
+                                ));
+                            }
+                            // Rien n'a été mesuré (décodeur qui ne publie
+                            // pas, durée de piste inconnue, blocage avant
+                            // la première fenêtre) : le message d'avant,
+                            // mot pour mot.
+                            _ => {
+                                warn!(
+                                    file = %file_path,
+                                    budget_s,
+                                    size_mb,
+                                    "transcode_timeout"
+                                );
+                                return Err(format!(
+                                    "transcode timeout after {budget_s}s for a {size_mb} MB source \u{2014} \
+                                     disk or network too slow, or the file is unusually large"
+                                ));
+                            }
+                        }
+                    }
+                }
             }
+        };
+        Ok(flux)
+    }
+
+    /// Deuxième temps, sorties locales et PULL : session de flux alimentée par
+    /// le décodeur, longueur WAV calculée pour la DIDL, canal gardé ouvert
+    /// jusqu'à la fin du décodage.
+    async fn transcoder_en_session(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+        format: FormatDeSortie,
+    ) -> Result<FluxLocal, String> {
+        let DecisionLocale {
+            channels,
+            ref file_path,
+            ..
+        } = *decision;
+        let FormatDeSortie {
+            out_sr,
+            out_bd,
+            out_mime,
+            out_ext,
+            info,
+            ..
+        } = format;
+        let flux = {
+            // ── Streaming transcode (WAV for local/OAAT) ──────────
+            // Use the computed WAV content length for the DIDL size
+            // attribute so DLNA renderers know the correct stream size.
+            let transcode_file_size = info.wav_content_length();
+
+            let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+
+            // Mark session: the streaming decoder sends the WAV header
+            // with the real source sample rate, so the stream handler
+            // must NOT prepend its own.
+            {
+                let sessions = self.streamer.sessions_state();
+                let sessions = sessions.lock().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    session
+                        .wav_header_included
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+
+            let fp = file_path.clone();
+            let ev_bus = self.event_bus.clone();
+            let playback = self.playback.clone();
+            let zone_id = req.zone_id;
+            let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
+            let streamer_sessions = self.streamer.sessions_state();
+            let close_session_id = session_id.clone();
+            // Pré-chargement gapless : session de la piste suivante, pas
+            // de forwarder (voir `levels_prewarm`).
+            let attach_levels = self.levels_attach_allowed(zone_id);
+            tokio::spawn(async move {
+                debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
+
+                // Bus conservé pour signaler un échec de décodage au client :
+                // un décodage transcodé qui échoue (codec non supporté, fichier
+                // corrompu…) ne doit PLUS produire un flux silencieux qui boucle
+                // toutes les ~2 s — on remonte une erreur visible.
+                let err_bus = ev_bus.clone();
+
+                // Forwarder cadencé si le bus existe ; sinon un canal dont
+                // le récepteur est aussitôt abandonné (le décodeur ignore
+                // les erreurs d'envoi).
+                let levels_tx = match ev_bus.filter(|_| attach_levels) {
+                    Some(bus) => {
+                        let play_seq = playback.current_play_seq(zone_id).await;
+                        spawn_paced_levels_forwarder(
+                            bus,
+                            playback,
+                            zone_id,
+                            play_seq,
+                            (seek_s * 1000.0) as i64,
+                        )
+                    }
+                    None => {
+                        tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0
+                    }
+                };
+
+                let fp_clone = fp.clone();
+                let tx_clone = tx.clone();
+                drop(tx);
+
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::audio::decode::decode_to_pcm_streaming_seeked(
+                        &fp_clone,
+                        Some(out_sr),
+                        Some(channels as u32),
+                        Some(out_bd),
+                        tx_clone,
+                        32768,
+                        data_ready,
+                        levels_tx,
+                        seek_s,
+                    )
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(_bit_depth)) => {
+                        debug!(file = %fp, "transcode_complete_streaming");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, file = %fp, "transcode_streaming_decode_failed");
+                        if let Some(ref bus) = err_bus {
+                            bus.emit(
+                                "zone.playback_error",
+                                serde_json::json!({
+                                    "zone_id": zone_id,
+                                    "error": format!("Impossible de décoder la piste : {e}"),
+                                }),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, file = %fp, "transcode_streaming_task_panic");
+                        if let Some(ref bus) = err_bus {
+                            bus.emit(
+                                "zone.playback_error",
+                                serde_json::json!({
+                                    "zone_id": zone_id,
+                                    "error": "Le décodage de la piste a échoué (erreur interne).",
+                                }),
+                            );
+                        }
+                    }
+                }
+
+                // Signal EOF by dropping the keep-alive sender. The
+                // decoder's tx is already dropped at this point, but the
+                // _keep_alive_tx in the session keeps the channel open
+                // until we explicitly close it here.
+                let sessions = streamer_sessions.lock().await;
+                if let Some(session) = sessions.get(&close_session_id) {
+                    session.close_sender().await;
+                }
+            });
+
+            (
+                session_id,
+                out_mime,
+                out_ext,
+                transcode_file_size,
+                Some(out_sr),
+                Some(out_bd as u32),
+                Some(channels as u32),
+            )
         };
         Ok(flux)
     }
@@ -1816,25 +1906,11 @@ impl PlaybackOrchestrator {
     > {
         let DecisionLocale {
             bit_depth,
-            bit_depth_wire,
-            browser_needs_wav,
             channels,
-            dlna_cap_16bit,
-            dlna_needs_wav,
-            dlna_wav24,
-            eq_forces_transcode,
             is_browser_output,
-            is_chromecast,
-            is_local_output,
             is_network_output,
-            local_needs_wav,
-            needs_downsample,
-            needs_transcode_for_output,
-            oaat_needs_wav,
             sample_rate,
             source_format,
-            track_id,
-            zone_max_sample_rate,
             track_duration_ms,
             track_file_size,
             ref file_path,
