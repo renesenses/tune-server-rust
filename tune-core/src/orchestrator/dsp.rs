@@ -990,20 +990,34 @@ impl PlaybackOrchestrator {
     /// `None`; otherwise load the uploaded IR (`ir_path_{zone}`) for the
     /// stream's sample rate + channel count. Applied in `transcode_source_to_file`
     /// after the EQ, so it colours the bytes served to a network renderer.
+    /// Le fichier de réponse impulsionnelle de la zone (`ir_path_{zone}`),
+    /// `None` en mode PURE ou sans réglage. Une seule lecture du réglage pour
+    /// le convolveur et pour l'empreinte du cache (LAT-F2).
+    pub(super) fn chemin_ir(&self, zone_id: i64) -> Option<String> {
+        if self.zone_audiophile(zone_id) {
+            return None;
+        }
+        crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .get(&format!("ir_path_{zone_id}"))
+            .ok()
+            .flatten()
+            .filter(|p| !p.is_empty())
+    }
+
+    /// Les octets de la réponse impulsionnelle, pour l'empreinte du cache de
+    /// transcodage : c'est le CONTENU qui décide de la rendition, pas le nom
+    /// du fichier. `None` si la zone n'en a pas ou s'il est illisible.
+    pub(super) fn octets_ir(&self, zone_id: i64) -> Option<Vec<u8>> {
+        std::fs::read(self.chemin_ir(zone_id)?).ok()
+    }
+
     pub(super) fn load_convolver(
         &self,
         zone_id: i64,
         sample_rate: u32,
         channels: u16,
     ) -> Option<crate::audio::convolver::Convolver> {
-        if self.zone_audiophile(zone_id) {
-            return None;
-        }
-        let path = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
-            .get(&format!("ir_path_{zone_id}"))
-            .ok()
-            .flatten()
-            .filter(|p| !p.is_empty())?;
+        let path = self.chemin_ir(zone_id)?;
         match crate::audio::convolver::Convolver::from_wav_for(
             &path,
             1024,

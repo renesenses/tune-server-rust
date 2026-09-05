@@ -21,10 +21,7 @@ struct Directe<'a> {
     mime_type: &'a str,
     duration_ms: Option<i64>,
     bc_quality: &'a Option<super::bandcamp::BandcampQuality>,
-    is_radio: bool,
-    is_bandcamp: bool,
     is_local_output: bool,
-    is_oaat_output: bool,
     is_browser_output: bool,
     radio_eq_profile: &'a Option<crate::audio::eq::EqProfile>,
 }
@@ -286,10 +283,7 @@ impl PlaybackOrchestrator {
             mime_type,
             duration_ms,
             bc_quality: &bc_quality,
-            is_radio,
-            is_bandcamp,
             is_local_output,
-            is_oaat_output,
             is_browser_output,
             radio_eq_profile: &radio_eq_profile,
         };
@@ -302,7 +296,7 @@ impl PlaybackOrchestrator {
                 && !is_local_output
                 && (req.output_device_id.is_some() || is_browser_output)
             {
-                self.relayer_bandcamp_au_reseau(req, d).await
+                self.relayer_bandcamp_au_reseau(d).await
             } else if is_radio {
                 self.servir_la_radio_au_reseau(req, d).await
             } else if is_bandcamp {
@@ -556,7 +550,7 @@ impl PlaybackOrchestrator {
 
     /// Bandcamp vers un renderer réseau ou le navigateur : relais HTTP du flux
     /// HTTPS par une session mandataire, le codec annoncé venant de l'URL.
-    async fn relayer_bandcamp_au_reseau(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
+    async fn relayer_bandcamp_au_reseau(&self, d: Directe<'_>) -> FluxDirect {
         let Directe {
             audio_url,
             mime_type,

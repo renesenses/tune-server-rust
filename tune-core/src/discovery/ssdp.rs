@@ -326,9 +326,9 @@ impl SsdpScanner {
     }
 
     pub async fn rescan(&self) -> Vec<DiscoveredDevice> {
-        let responses = search_all(&self.search_targets).await;
+        let reponses = rechercher_en_flux(&self.search_targets);
         let event_tx = self.event_tx.lock().await.clone();
-        process_responses(&self.state, &event_tx, responses).await;
+        traiter_le_flux(&self.state, &event_tx, reponses).await;
         let state = self.state.lock().await;
         state.devices.values().cloned().collect()
     }
@@ -355,8 +355,8 @@ async fn scan_loop(
     let mut fast_retry = 0usize;
     let mut ever_found = false;
     loop {
-        let responses = search_all(&targets).await;
-        process_responses(&state, &event_tx, responses).await;
+        let reponses = rechercher_en_flux(&targets);
+        traiter_le_flux(&state, &event_tx, reponses).await;
 
         let has_devices = {
             let mut st = state.lock().await;
@@ -625,31 +625,41 @@ fn usn_from_raw(data: &[u8]) -> Option<String> {
     None
 }
 
-async fn search_all(targets: &[String]) -> Vec<SsdpResponse> {
-    let mut all_responses = Vec::new();
+/// La recherche active, au fil de l'eau (LAT-Z1) : les réponses partent dans
+/// un canal dès leur réception, la tâche se termine à la fin de la fenêtre
+/// d'écoute. Même parcours qu'avant (cibles, puis interfaces, puis le repli
+/// Windows sur 0.0.0.0 quand rien n'est venu).
+fn rechercher_en_flux(targets: &[String]) -> mpsc::Receiver<SsdpResponse> {
+    let (tx, rx) = mpsc::channel(64);
+    let targets = targets.to_vec();
+    tokio::spawn(async move {
+        diffuser_les_reponses(&targets, &tx).await;
+    });
+    rx
+}
 
+async fn diffuser_les_reponses(targets: &[String], tx: &mpsc::Sender<SsdpResponse>) {
+    let mut total = 0usize;
     for target in targets {
-        match send_msearch(target).await {
-            Ok(responses) => all_responses.extend(responses),
+        match send_msearch(target, tx).await {
+            Ok(n) => total += n,
             Err(e) => debug!(target, error = %e, "msearch_failed"),
         }
     }
-
     // Windows multi-NIC fallback: retry with 0.0.0.0
-    if all_responses.is_empty() && cfg!(target_os = "windows") {
+    if total == 0 && cfg!(target_os = "windows") {
         debug!("ssdp_windows_fallback_0000");
         for target in targets {
-            if let Ok(responses) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED).await {
-                all_responses.extend(responses);
+            if let Ok(n) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED, tx).await {
+                total += n;
             }
         }
     }
-
-    all_responses
+    debug!(total, "ssdp_search_window_closed");
 }
 
-async fn send_msearch(target: &str) -> Result<Vec<SsdpResponse>, String> {
-    let mut all_responses = Vec::new();
+async fn send_msearch(target: &str, tx: &mpsc::Sender<SsdpResponse>) -> Result<usize, String> {
+    let mut total = 0usize;
     let mut tried = std::collections::HashSet::new();
 
     // Enumerate all real network interfaces (works in Docker macvlan, VPN, multi-NIC)
@@ -663,24 +673,28 @@ async fn send_msearch(target: &str) -> Result<Vec<SsdpResponse>, String> {
             {
                 tried.insert(ip);
                 debug!(interface = %iface.name, ip = %ip, "ssdp_probing_interface");
-                if let Ok(resps) = send_msearch_from(target, ip).await {
-                    all_responses.extend(resps);
+                if let Ok(n) = send_msearch_from(target, ip, tx).await {
+                    total += n;
                 }
             }
         }
     }
 
     // Fallback: also try 0.0.0.0 if no interface found or no responses
-    if all_responses.is_empty()
-        && let Ok(resps) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED).await
+    if total == 0
+        && let Ok(n) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED, tx).await
     {
-        all_responses.extend(resps);
+        total += n;
     }
 
-    Ok(all_responses)
+    Ok(total)
 }
 
-async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpResponse>, String> {
+async fn send_msearch_from(
+    target: &str,
+    bind_ip: Ipv4Addr,
+    tx: &mpsc::Sender<SsdpResponse>,
+) -> Result<usize, String> {
     // Use socket2 with explicit multicast interface binding for VPN compat
     let sock2 = socket2::Socket::new(
         socket2::Domain::IPV4,
@@ -719,7 +733,7 @@ async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpRe
         .await
         .map_err(|e| format!("send: {e}"))?;
 
-    let mut responses = Vec::new();
+    let mut parsed = 0usize;
     let mut buf = [0u8; 4096];
     let mut recv_count: u32 = 0;
 
@@ -733,7 +747,12 @@ async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpRe
             Ok(Ok((len, addr))) => {
                 recv_count += 1;
                 if let Some(resp) = parse_ssdp_response(&buf[..len]) {
-                    responses.push(resp);
+                    parsed += 1;
+                    // Au fil de l'eau : la réponse part tout de suite, le
+                    // consommateur l'enregistre pendant que l'écoute continue.
+                    if tx.send(resp).await.is_err() {
+                        break;
+                    }
                 } else {
                     debug!(from = %addr, bytes = len, "ssdp_unparseable_response");
                 }
@@ -745,9 +764,9 @@ async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpRe
             Err(_) => break,
         }
     }
-    debug!(bind = %bind_ip, target, recv_count, parsed = responses.len(), "ssdp_search_done");
+    debug!(bind = %bind_ip, target, recv_count, parsed, "ssdp_search_done");
 
-    Ok(responses)
+    Ok(parsed)
 }
 
 fn parse_ssdp_response(data: &[u8]) -> Option<SsdpResponse> {
@@ -989,259 +1008,319 @@ pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDe
     ))
 }
 
+/// Un lot de réponses (recherche active ou annonce NOTIFY) : classer, enregistrer
+/// les nouveaux, oublier les absents. Même ordre qu'avant LAT-Z1 ; la boucle de
+/// recherche passe désormais par [`traiter_le_flux`], qui enregistre chaque
+/// appareil dès sa réponse au lieu d'attendre la fin de la fenêtre.
 async fn process_responses(
     state: &Arc<Mutex<ScannerState>>,
     event_tx: &mpsc::Sender<SsdpEvent>,
     responses: Vec<SsdpResponse>,
 ) {
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut new_devices: Vec<(String, SsdpResponse)> = Vec::new();
-
-    // Dedup by location
     let mut seen_locations: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut new_devices: Vec<(String, SsdpResponse)> = Vec::new();
     for resp in responses {
-        if seen_locations.contains(&resp.location) {
-            continue;
+        if let Some(nouveau) =
+            classer_la_reponse(state, &mut seen_ids, &mut seen_locations, resp).await
+        {
+            new_devices.push(nouveau);
         }
-        seen_locations.insert(resp.location.clone());
+    }
+    for (dev_id, resp) in new_devices {
+        enregistrer_l_appareil(state, event_tx, dev_id, resp).await;
+    }
+    oublier_les_absents(state, event_tx, &seen_ids).await;
+}
 
-        if let Some(host_str) = host_from_location(&resp.location) {
-            if let Ok(ip) = host_str.parse::<std::net::Ipv4Addr>() {
-                if is_virtual_ip(ip) {
-                    debug!(
-                        location = %resp.location,
-                        ip = %ip,
-                        "ssdp_response_rejected_virtual_ip_in_location"
-                    );
-                    continue;
-                }
-            }
+/// SSDP au fil de l'eau (LAT-Z1) : les réponses arrivent par un canal pendant
+/// toute la fenêtre d'écoute, et chaque appareil est classé puis enregistré dès
+/// la sienne — un renderer qui répond en 200 ms apparaît en 200 ms, la fenêtre
+/// de [`SEARCH_TIMEOUT`] ne borne plus que l'écoute. Le déduplicat intra-fenêtre
+/// et le bilan des absents sont inchangés : ils courent sur le lot entier, à la
+/// fermeture du canal.
+async fn traiter_le_flux(
+    state: &Arc<Mutex<ScannerState>>,
+    event_tx: &mpsc::Sender<SsdpEvent>,
+    mut reponses: mpsc::Receiver<SsdpResponse>,
+) {
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_locations: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(resp) = reponses.recv().await {
+        if let Some((dev_id, resp)) =
+            classer_la_reponse(state, &mut seen_ids, &mut seen_locations, resp).await
+        {
+            enregistrer_l_appareil(state, event_tx, dev_id, resp).await;
         }
+    }
+    oublier_les_absents(state, event_tx, &seen_ids).await;
+}
 
-        // Un appareil est identifié par sa LOCATION, pas par l'UDN de
-        // l'annonce : les frères embarqués d'un HEOS partagent la première
-        // et diffèrent par le second (#1703, cf. `known_id_for_location`).
-        // Le déduplicat par `seen_locations` ci-dessus ne couvre qu'un seul
-        // lot ; le NOTIFY passif appelle cette fonction avec **une** réponse
-        // à la fois, donc chaque annonce d'un frère y échappait.
-        let st = state.lock().await;
-        let dev_id = st
-            .known_id_for_location(&resp.location)
-            .cloned()
-            .unwrap_or_else(|| device_id_from_usn(&resp.usn));
-        let known = st.known_locations.contains_key(&dev_id);
-        drop(st);
+/// Première passe, réponse par réponse : déduplicat par LOCATION, rejet des IP
+/// virtuelles, identification ; un appareil connu voit sa fraîcheur rafraîchie
+/// ici même, un nouveau est rendu pour être enregistré.
+async fn classer_la_reponse(
+    state: &Arc<Mutex<ScannerState>>,
+    seen_ids: &mut std::collections::HashSet<String>,
+    seen_locations: &mut std::collections::HashSet<String>,
+    resp: SsdpResponse,
+) -> Option<(String, SsdpResponse)> {
+    if seen_locations.contains(&resp.location) {
+        return None;
+    }
+    seen_locations.insert(resp.location.clone());
 
-        seen_ids.insert(dev_id.clone());
-
-        if !known {
-            new_devices.push((dev_id, resp));
-        } else {
-            let mut st = state.lock().await;
-            st.miss_count.remove(&dev_id);
-            // Réannonce d'un serveur déjà connu : on remet son horloge à zéro.
-            // C'est CE point qui garantit qu'un serveur bien vivant qui a raté
-            // un cycle — Wi-Fi qui hoquette, annonce perdue — ne disparaît
-            // pas : la seule réapparition suffit à annuler tout le compte à
-            // rebours (#2139).
-            if let Some(ms) = st.media_servers.get_mut(&dev_id) {
-                ms.last_seen = Instant::now();
-                ms.max_age = max_age_from_response(&resp);
+    if let Some(host_str) = host_from_location(&resp.location) {
+        if let Ok(ip) = host_str.parse::<std::net::Ipv4Addr>() {
+            if is_virtual_ip(ip) {
+                debug!(
+                    location = %resp.location,
+                    ip = %ip,
+                    "ssdp_response_rejected_virtual_ip_in_location"
+                );
+                return None;
             }
         }
     }
 
-    // Fetch device descriptions for new devices
-    for (dev_id, resp) in new_devices {
-        match fetch_device_description(&resp.location).await {
-            Ok(desc) => {
+    // Un appareil est identifié par sa LOCATION, pas par l'UDN de
+    // l'annonce : les frères embarqués d'un HEOS partagent la première
+    // et diffèrent par le second (#1703, cf. `known_id_for_location`).
+    // Le déduplicat par `seen_locations` ci-dessus ne couvre qu'un seul
+    // lot ; le NOTIFY passif appelle cette fonction avec **une** réponse
+    // à la fois, donc chaque annonce d'un frère y échappait.
+    let st = state.lock().await;
+    let dev_id = st
+        .known_id_for_location(&resp.location)
+        .cloned()
+        .unwrap_or_else(|| device_id_from_usn(&resp.usn));
+    let known = st.known_locations.contains_key(&dev_id);
+    drop(st);
+
+    seen_ids.insert(dev_id.clone());
+
+    if !known {
+        return Some((dev_id, resp));
+    } else {
+        let mut st = state.lock().await;
+        st.miss_count.remove(&dev_id);
+        // Réannonce d'un serveur déjà connu : on remet son horloge à zéro.
+        // C'est CE point qui garantit qu'un serveur bien vivant qui a raté
+        // un cycle — Wi-Fi qui hoquette, annonce perdue — ne disparaît
+        // pas : la seule réapparition suffit à annuler tout le compte à
+        // rebours (#2139).
+        if let Some(ms) = st.media_servers.get_mut(&dev_id) {
+            ms.last_seen = Instant::now();
+            ms.max_age = max_age_from_response(&resp);
+        }
+    }
+    None
+}
+
+/// Deuxième passe, appareil par appareil : description, classement renderer ou
+/// serveur multimédia, repli MinimalDMR, enregistrement et évènement.
+async fn enregistrer_l_appareil(
+    state: &Arc<Mutex<ScannerState>>,
+    event_tx: &mpsc::Sender<SsdpEvent>,
+    dev_id: String,
+    resp: SsdpResponse,
+) {
+    match fetch_device_description(&resp.location).await {
+        Ok(desc) => {
+            let host = host_from_location(&resp.location).unwrap_or_default();
+            let port = port_from_location(&resp.location);
+
+            let device_type = if desc.is_openhome() {
+                OutputType::Openhome
+            } else if desc.is_media_renderer() {
+                OutputType::Dlna
+            } else if desc.has_av_transport() {
+                // Non-standard deviceType but supports AVTransport (WiiM, foobar2000 foo_upnp, etc.)
+                debug!(
+                    id = %dev_id,
+                    name = %desc.friendly_name,
+                    device_type = %desc.device_type,
+                    "ssdp_non_standard_renderer_accepted"
+                );
+                OutputType::Dlna
+            } else if desc.is_media_server() {
+                let cd_url = desc
+                    .services
+                    .iter()
+                    .find(|s| s.service_type.contains("ContentDirectory"))
+                    .map(|s| s.control_url.clone())
+                    .unwrap_or_default();
+                if !cd_url.is_empty() {
+                    let host = host_from_location(&resp.location).unwrap_or_default();
+                    let base = base_url_from_location(&resp.location);
+                    let full_cd_url = if cd_url.starts_with("http") {
+                        cd_url
+                    } else {
+                        format!("{base}{cd_url}")
+                    };
+                    let ms = MediaServerInfo {
+                        id: dev_id.clone(),
+                        name: desc.friendly_name.clone(),
+                        manufacturer: desc.manufacturer.clone(),
+                        model: desc.model_name.clone(),
+                        location: resp.location.clone(),
+                        content_directory_url: full_cd_url,
+                        host,
+                        port,
+                        last_seen: Instant::now(),
+                        max_age: max_age_from_response(&resp),
+                    };
+                    // Record the media server as known so later SSDP cycles
+                    // skip it (see the `!known` gate above). Renderers are
+                    // recorded the same way further down; media servers were
+                    // omitted, so every ~2 min cycle re-fetched their
+                    // description and re-logged this INFO line — dozens of
+                    // duplicate `ssdp_media_server_discovered` entries that
+                    // drowned the playback traces in tester logs and made
+                    // DLNA issues undiagnosable (#954).
+                    {
+                        let mut st = state.lock().await;
+                        st.known_locations
+                            .insert(dev_id.clone(), resp.location.clone());
+                        // Le registre de fraîcheur, sans lequel rien
+                        // n'expire (#2139).
+                        st.media_servers.insert(dev_id.clone(), ms.clone());
+                    }
+                    info!(
+                        id = %dev_id,
+                        name = %ms.name,
+                        location = %ms.location,
+                        cd_url = %ms.content_directory_url,
+                        "ssdp_media_server_discovered"
+                    );
+                    let _ = event_tx.send(SsdpEvent::MediaServerDiscovered(ms)).await;
+                }
+                return;
+            } else {
+                debug!(
+                    id = %dev_id,
+                    name = %desc.friendly_name,
+                    device_type = %desc.device_type,
+                    "ssdp_device_skipped"
+                );
+                return;
+            };
+
+            let device =
+                build_renderer_device(&dev_id, &resp.location, host, port, device_type, &desc);
+
+            let mut st = state.lock().await;
+            st.create_failures.remove(&resp.location);
+            st.known_locations.insert(dev_id.clone(), resp.location);
+            st.miss_count.remove(&dev_id);
+            st.devices.insert(dev_id.clone(), device.clone());
+            drop(st);
+
+            info!(id = %dev_id, name = %device.name, "ssdp_device_discovered");
+            let _ = event_tx
+                .send(SsdpEvent::DeviceDiscovered(Box::new(device)))
+                .await;
+        }
+        Err(e) => {
+            let failure_count = {
+                let mut st = state.lock().await;
+                let count = st.create_failures.entry(resp.location.clone()).or_insert(0);
+                *count += 1;
+                *count
+            };
+
+            // Try MinimalDMR probe on first failure
+            if failure_count == 1 {
                 let host = host_from_location(&resp.location).unwrap_or_default();
                 let port = port_from_location(&resp.location);
-
-                let device_type = if desc.is_openhome() {
-                    OutputType::Openhome
-                } else if desc.is_media_renderer() {
-                    OutputType::Dlna
-                } else if desc.has_av_transport() {
-                    // Non-standard deviceType but supports AVTransport (WiiM, foobar2000 foo_upnp, etc.)
-                    debug!(
-                        id = %dev_id,
-                        name = %desc.friendly_name,
-                        device_type = %desc.device_type,
-                        "ssdp_non_standard_renderer_accepted"
+                let base_url = format!("http://{host}:{port}");
+                let fallback_name = format!("Renderer ({host})");
+                if let Some(probe) = super::minimal_dmr::probe_minimal_dmr(
+                    &base_url,
+                    Some(&resp.location),
+                    &fallback_name,
+                )
+                .await
+                {
+                    let mut device = DiscoveredDevice::new(
+                        dev_id.clone(),
+                        probe.name.clone(),
+                        OutputType::Dlna,
+                        host,
+                        port,
                     );
-                    OutputType::Dlna
-                } else if desc.is_media_server() {
-                    let cd_url = desc
-                        .services
-                        .iter()
-                        .find(|s| s.service_type.contains("ContentDirectory"))
-                        .map(|s| s.control_url.clone())
-                        .unwrap_or_default();
-                    if !cd_url.is_empty() {
-                        let host = host_from_location(&resp.location).unwrap_or_default();
-                        let base = base_url_from_location(&resp.location);
-                        let full_cd_url = if cd_url.starts_with("http") {
-                            cd_url
-                        } else {
-                            format!("{base}{cd_url}")
-                        };
-                        let ms = MediaServerInfo {
-                            id: dev_id.clone(),
-                            name: desc.friendly_name.clone(),
-                            manufacturer: desc.manufacturer.clone(),
-                            model: desc.model_name.clone(),
-                            location: resp.location.clone(),
-                            content_directory_url: full_cd_url,
-                            host,
-                            port,
-                            last_seen: Instant::now(),
-                            max_age: max_age_from_response(&resp),
-                        };
-                        // Record the media server as known so later SSDP cycles
-                        // skip it (see the `!known` gate above). Renderers are
-                        // recorded the same way further down; media servers were
-                        // omitted, so every ~2 min cycle re-fetched their
-                        // description and re-logged this INFO line — dozens of
-                        // duplicate `ssdp_media_server_discovered` entries that
-                        // drowned the playback traces in tester logs and made
-                        // DLNA issues undiagnosable (#954).
-                        {
-                            let mut st = state.lock().await;
-                            st.known_locations
-                                .insert(dev_id.clone(), resp.location.clone());
-                            // Le registre de fraîcheur, sans lequel rien
-                            // n'expire (#2139).
-                            st.media_servers.insert(dev_id.clone(), ms.clone());
-                        }
-                        info!(
-                            id = %dev_id,
-                            name = %ms.name,
-                            location = %ms.location,
-                            cd_url = %ms.content_directory_url,
-                            "ssdp_media_server_discovered"
-                        );
-                        let _ = event_tx.send(SsdpEvent::MediaServerDiscovered(ms)).await;
+                    device.location = Some(resp.location.clone());
+                    let mut svc_urls = std::collections::HashMap::new();
+                    svc_urls.insert("AVTransport".to_string(), probe.av_transport_url.clone());
+                    if let Some(ref rc) = probe.rendering_control_url {
+                        svc_urls.insert("RenderingControl".to_string(), rc.clone());
                     }
-                    continue;
-                } else {
-                    debug!(
-                        id = %dev_id,
-                        name = %desc.friendly_name,
-                        device_type = %desc.device_type,
-                        "ssdp_device_skipped"
+                    device.capabilities.insert(
+                        "service_urls".into(),
+                        serde_json::to_value(&svc_urls).unwrap_or_default(),
                     );
-                    continue;
-                };
+                    device
+                        .capabilities
+                        .insert("minimal_dmr".into(), serde_json::Value::Bool(true));
+                    super::mac::enrich_identity(&mut device);
 
-                let device =
-                    build_renderer_device(&dev_id, &resp.location, host, port, device_type, &desc);
-
-                let mut st = state.lock().await;
-                st.create_failures.remove(&resp.location);
-                st.known_locations.insert(dev_id.clone(), resp.location);
-                st.miss_count.remove(&dev_id);
-                st.devices.insert(dev_id.clone(), device.clone());
-                drop(st);
-
-                info!(id = %dev_id, name = %device.name, "ssdp_device_discovered");
-                let _ = event_tx
-                    .send(SsdpEvent::DeviceDiscovered(Box::new(device)))
-                    .await;
-            }
-            Err(e) => {
-                let failure_count = {
                     let mut st = state.lock().await;
-                    let count = st.create_failures.entry(resp.location.clone()).or_insert(0);
-                    *count += 1;
-                    *count
-                };
+                    st.create_failures.remove(&resp.location);
+                    st.known_locations.insert(dev_id.clone(), resp.location);
+                    st.miss_count.remove(&dev_id);
+                    st.devices.insert(dev_id.clone(), device.clone());
+                    drop(st);
 
-                // Try MinimalDMR probe on first failure
-                if failure_count == 1 {
-                    let host = host_from_location(&resp.location).unwrap_or_default();
-                    let port = port_from_location(&resp.location);
-                    let base_url = format!("http://{host}:{port}");
-                    let fallback_name = format!("Renderer ({host})");
-                    if let Some(probe) = super::minimal_dmr::probe_minimal_dmr(
-                        &base_url,
-                        Some(&resp.location),
-                        &fallback_name,
-                    )
-                    .await
-                    {
-                        let mut device = DiscoveredDevice::new(
-                            dev_id.clone(),
-                            probe.name.clone(),
-                            OutputType::Dlna,
-                            host,
-                            port,
-                        );
-                        device.location = Some(resp.location.clone());
-                        let mut svc_urls = std::collections::HashMap::new();
-                        svc_urls.insert("AVTransport".to_string(), probe.av_transport_url.clone());
-                        if let Some(ref rc) = probe.rendering_control_url {
-                            svc_urls.insert("RenderingControl".to_string(), rc.clone());
-                        }
-                        device.capabilities.insert(
-                            "service_urls".into(),
-                            serde_json::to_value(&svc_urls).unwrap_or_default(),
-                        );
-                        device
-                            .capabilities
-                            .insert("minimal_dmr".into(), serde_json::Value::Bool(true));
-                        super::mac::enrich_identity(&mut device);
-
-                        let mut st = state.lock().await;
-                        st.create_failures.remove(&resp.location);
-                        st.known_locations.insert(dev_id.clone(), resp.location);
-                        st.miss_count.remove(&dev_id);
-                        st.devices.insert(dev_id.clone(), device.clone());
-                        drop(st);
-
-                        info!(id = %dev_id, name = %probe.name, "ssdp_minimal_dmr_discovered");
-                        let _ = event_tx
-                            .send(SsdpEvent::DeviceDiscovered(Box::new(device)))
-                            .await;
-                        continue;
-                    }
+                    info!(id = %dev_id, name = %probe.name, "ssdp_minimal_dmr_discovered");
+                    let _ = event_tx
+                        .send(SsdpEvent::DeviceDiscovered(Box::new(device)))
+                        .await;
+                    return;
                 }
+            }
 
-                if failure_count <= 3 {
-                    // La LOCATION, et pas seulement l'UUID (#2417).
-                    //
-                    // Pour un échec RÉSEAU l'adresse survivait par accident,
-                    // parce que le message d'erreur l'embarque :
-                    // « HTTP fetch http://192.168.1.1:1900/rootDesc.xml: …
-                    // operation timed out ». Pour un échec de PARSING, non :
-                    // « XML parse error: ill-formed document: expected
-                    // `</meta>`, but `</head>` was found » ne porte aucune
-                    // URL. C'est exactement le cas qui en a besoin, et c'était
-                    // le seul qui ne l'avait pas.
-                    //
-                    // Cette erreur-là est la signature d'une page HTML — un
-                    // `<meta>` non refermé dans un `<head>`. Une adresse
-                    // annoncée en SSDP rend donc du HTML là où le scanner
-                    // attend une description UPnP, et sans l'URL on ne peut ni
-                    // l'ouvrir dans un navigateur, ni chercher qui l'annonce.
-                    // Le journal de FabienM (fil forum 1535) est resté
-                    // indiagnosticable pour cette seule raison.
-                    warn!(
-                        id = %dev_id,
-                        location = %resp.location,
-                        error = %e,
-                        "ssdp_device_create_failed"
-                    );
-                }
-                let mut st = state.lock().await;
-                if st.create_failures.len() > 200 {
-                    st.create_failures.retain(|_, c| *c < 50);
-                }
+            if failure_count <= 3 {
+                // La LOCATION, et pas seulement l'UUID (#2417).
+                //
+                // Pour un échec RÉSEAU l'adresse survivait par accident,
+                // parce que le message d'erreur l'embarque :
+                // « HTTP fetch http://192.168.1.1:1900/rootDesc.xml: …
+                // operation timed out ». Pour un échec de PARSING, non :
+                // « XML parse error: ill-formed document: expected
+                // `</meta>`, but `</head>` was found » ne porte aucune
+                // URL. C'est exactement le cas qui en a besoin, et c'était
+                // le seul qui ne l'avait pas.
+                //
+                // Cette erreur-là est la signature d'une page HTML — un
+                // `<meta>` non refermé dans un `<head>`. Une adresse
+                // annoncée en SSDP rend donc du HTML là où le scanner
+                // attend une description UPnP, et sans l'URL on ne peut ni
+                // l'ouvrir dans un navigateur, ni chercher qui l'annonce.
+                // Le journal de FabienM (fil forum 1535) est resté
+                // indiagnosticable pour cette seule raison.
+                warn!(
+                    id = %dev_id,
+                    location = %resp.location,
+                    error = %e,
+                    "ssdp_device_create_failed"
+                );
+            }
+            let mut st = state.lock().await;
+            if st.create_failures.len() > 200 {
+                st.create_failures.retain(|_, c| *c < 50);
             }
         }
     }
+}
 
-    // Grace period: check for lost devices
+/// Troisième passe, sur le lot entier : les appareils qui n'ont pas répondu
+/// perdent une vie (sonde unicast avant l'oubli), les serveurs multimédia
+/// périmés sont re-sondés.
+async fn oublier_les_absents(
+    state: &Arc<Mutex<ScannerState>>,
+    event_tx: &mpsc::Sender<SsdpEvent>,
+    seen_ids: &std::collections::HashSet<String>,
+) {
     let mut lost_ids = Vec::new();
     {
         let mut st = state.lock().await;
@@ -1706,6 +1785,49 @@ mod tests {
             _st: None,
             max_age: None,
         }
+    }
+
+    /// LAT-Z1 : une réponse reçue tôt est enregistrée tout de suite, pendant que
+    /// la fenêtre d'écoute est encore ouverte (le canal est vivant) — pas à sa
+    /// fermeture. Avant, `search_all` entassait les réponses jusqu'à
+    /// `SEARCH_TIMEOUT` et un appareil répondant en 200 ms attendait 6 s.
+    #[tokio::test]
+    async fn une_reponse_precoce_est_enregistree_pendant_la_fenetre() {
+        let addr = spawn_description_server().await;
+        let location = format!("http://{addr}/zone1/desc.xml");
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (ev_tx, mut ev_rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(8);
+        let etat = state.clone();
+        let traitement = tokio::spawn(async move { traiter_le_flux(&etat, &ev_tx, rx).await });
+
+        tx.send(announcement(&location, "uuid:zone-1::urn:x"))
+            .await
+            .expect("le canal est ouvert");
+
+        // La fenêtre est toujours ouverte (`tx` vivant) : l'appareil doit déjà
+        // être là, sans attendre la fermeture.
+        let mut vu = false;
+        for _ in 0..60 {
+            if !state.lock().await.devices.is_empty() {
+                vu = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            vu,
+            "l'appareil doit être enregistré pendant la fenêtre, pas après sa fermeture"
+        );
+        assert!(
+            matches!(ev_rx.try_recv(), Ok(SsdpEvent::DeviceDiscovered(_))),
+            "l'évènement de découverte doit être parti pendant la fenêtre"
+        );
+
+        drop(tx);
+        traitement
+            .await
+            .expect("le traitement se termine à la fermeture du canal");
     }
 
     #[tokio::test]
