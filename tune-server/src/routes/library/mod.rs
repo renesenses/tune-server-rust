@@ -182,6 +182,7 @@ pub fn router() -> Router<AppState> {
         .route("/artists/{id}/bio", get(artists::artist_bio))
         .route("/artists/{id}/similar", get(artists::artist_similar))
         .route("/artists/{id}/metadata", get(artists::artist_metadata))
+        .route("/artists/doublons", get(artists::artists_doublons))
         .route(
             "/albums",
             get(albums::list_albums).post(albums::create_album),
@@ -211,7 +212,6 @@ pub fn router() -> Router<AppState> {
         .route("/albums/grouped", get(albums::albums_grouped))
         .route("/albums/{id}/completeness", get(albums::album_completeness))
         .route("/albums/{id}/editions", get(albums::album_editions))
-        .route("/albums/eclates", get(albums::albums_eclates))
         .route(
             "/albums/{id}",
             get(albums::get_album).put(albums::update_album),
