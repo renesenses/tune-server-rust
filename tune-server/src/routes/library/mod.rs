@@ -7,7 +7,7 @@ mod artwork;
 mod better_quality;
 mod browse;
 mod collections;
-mod credits;
+pub(crate) mod credits;
 pub(crate) mod credits_mb;
 mod duplicates;
 mod enrich;
