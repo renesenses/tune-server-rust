@@ -24,10 +24,16 @@ pub enum CloudScope {
     CommunityEnriched,
     CommunityExtraWrite,
     CommunityExtraRead,
+    /// `POST /cloud-library/{server}/sync` : la synchro de bibliothèque (CLD-1).
+    LibrarySync,
+    /// `GET /cloud-library/{server}/proposals` : les propositions reçues (CLD-1).
+    MetadataProposalsRead,
+    /// `POST /cloud-library/{server}/proposals/decisions` : les décisions renvoyées (CLD-1).
+    MetadataDecisionsWrite,
 }
 
 impl CloudScope {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
         Self::Telemetry,
         Self::InstanceHeartbeat,
         Self::BiosWrite,
@@ -38,6 +44,9 @@ impl CloudScope {
         Self::CommunityEnriched,
         Self::CommunityExtraWrite,
         Self::CommunityExtraRead,
+        Self::LibrarySync,
+        Self::MetadataProposalsRead,
+        Self::MetadataDecisionsWrite,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -52,6 +61,9 @@ impl CloudScope {
             Self::CommunityEnriched => "community_enriched",
             Self::CommunityExtraWrite => "community_extra_write",
             Self::CommunityExtraRead => "community_extra_read",
+            Self::LibrarySync => "library_sync",
+            Self::MetadataProposalsRead => "metadata_proposals_read",
+            Self::MetadataDecisionsWrite => "metadata_decisions_write",
         }
     }
 
@@ -199,5 +211,35 @@ mod tests {
             None
         );
         assert!(active_all(&settings).is_empty());
+    }
+
+    /// Une portée oubliée dans `ALL` serait posée par `defer_from_headers`
+    /// mais invisible du diagnostic (`active_all`) : chaque variante doit y
+    /// figurer, avec une clef qui ne collisionne avec aucune autre.
+    #[test]
+    fn chaque_portee_figure_dans_all_avec_sa_propre_clef() {
+        let settings = settings();
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("30"));
+        for scope in CloudScope::ALL {
+            defer_from_headers(&settings, scope, &headers).unwrap();
+        }
+        let actives = active_all(&settings);
+        assert_eq!(actives.len(), CloudScope::ALL.len());
+        let mut noms: Vec<&str> = actives.iter().map(|a| a.scope).collect();
+        noms.sort_unstable();
+        noms.dedup();
+        assert_eq!(
+            noms.len(),
+            CloudScope::ALL.len(),
+            "deux portees partagent une clef"
+        );
+        for attendu in [
+            "library_sync",
+            "metadata_proposals_read",
+            "metadata_decisions_write",
+        ] {
+            assert!(noms.contains(&attendu), "portee CLD-1 absente : {attendu}");
+        }
     }
 }
