@@ -30,6 +30,14 @@ struct DecisionLocale {
     file_path: String,
     fmt: String,
     zone: Option<crate::db::zone_repo::Zone>,
+    needs_transcode: bool,
+}
+
+/// Ce que les décisions rendent : la décision à exécuter, ou une résolution
+/// déjà complète (DoP servi directement) (REF-2 phase 2, #2219).
+enum DecisionOuResolu {
+    Decision(DecisionLocale),
+    Resolu(ResolvedStream),
 }
 
 impl PlaybackOrchestrator {
@@ -180,7 +188,7 @@ impl PlaybackOrchestrator {
             .map_err(|e| e.to_string())?
             .ok_or("track not found")?;
 
-        let file_path = track.file_path.ok_or("track has no file_path")?;
+        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
 
         // The DB row can outlive the file (moved/deleted external drive, stale
         // scan, duplicate compilation entry pointing at an old path). Without
@@ -230,7 +238,7 @@ impl PlaybackOrchestrator {
             warn!(track_id, file = %file_path, motif, "local_track_format_not_playable");
             return Err(format!("format_not_playable:{motif}"));
         }
-        let fmt = track.format.unwrap_or_else(|| "flac".into());
+        let fmt = track.format.clone().unwrap_or_else(|| "flac".into());
         let source_format = AudioFormat::from_extension(&fmt);
         // DSD is 1-bit at MHz rates. When the DB row is missing audio props
         // (lofty returns None for many .dsf/.dff files), fall back to DSD64
@@ -263,6 +271,142 @@ impl PlaybackOrchestrator {
             }
         }
 
+        let decision = match self
+            .decider_la_lecture_locale(
+                req,
+                &track,
+                track_id,
+                file_path.clone(),
+                fmt.clone(),
+                source_format,
+                is_dsd_source,
+            )
+            .await?
+        {
+            DecisionOuResolu::Resolu(resolu) => return Ok(resolu),
+            DecisionOuResolu::Decision(decision) => decision,
+        };
+        let (
+            session_id,
+            out_mime,
+            out_ext,
+            resolved_file_size,
+            resolved_sr,
+            resolved_bd,
+            resolved_ch,
+        ) = if decision.needs_transcode {
+            self.transcoder_la_piste(req, &decision).await?
+        } else {
+            self.servir_en_passthrough(req, &decision).await?
+        };
+        let DecisionLocale {
+            sample_rate,
+            bit_depth,
+            channels,
+            is_network_output,
+            needs_transcode,
+            zone,
+            ..
+        } = decision;
+
+        let server_ip = self.server_ip();
+        let stream_url = self
+            .streamer
+            .get_stream_url(&session_id, &server_ip, &out_ext);
+
+        // For a transcoded WAV/LPCM stream served with an exact byte length
+        // (the file-transcode path pre-encodes the whole WAV, so file_size is
+        // the real body size), advertise a DIDL `res@duration` derived from
+        // that byte length instead of the scanned `track.duration_ms`. The two
+        // can disagree by a few seconds (the FLAC STREAMINFO/scan duration vs.
+        // the actual decoded sample count), and when the DIDL duration is
+        // LONGER than the bytes the renderer receives, some renderers (Marantz
+        // ND 8006) reach EOF, see position < advertised duration, and
+        // restart/loop the track near the end instead of advancing (#1132).
+        // Computing duration from size/byte_rate keeps duration and size
+        // mathematically consistent, so the progress bar tracks correctly and
+        // the track advances cleanly. Only applies when we know the exact size
+        // AND the audio params; otherwise fall back to the scanned duration.
+        let didl_duration_ms = if out_mime == "audio/wav" || out_mime == "audio/x-wav" {
+            match (resolved_file_size, resolved_sr, resolved_bd, resolved_ch) {
+                (Some(size), Some(sr), Some(bd), Some(ch))
+                    if size > 44 && sr > 0 && bd > 0 && ch > 0 =>
+                {
+                    let byte_rate = sr as u64 * ch as u64 * (bd as u64 / 8);
+                    if byte_rate > 0 {
+                        Some(((size - 44) * 1000 / byte_rate) as i64)
+                    } else {
+                        Some(track.duration_ms)
+                    }
+                }
+                _ => Some(track.duration_ms),
+            }
+        } else if !needs_transcode && is_network_output {
+            // Native passthrough (FLAC/ALAC/… served raw) to a network renderer.
+            //
+            // The gapless-queued (SetNextAVTransportURI) track is the one that
+            // regresses on the Marantz ND 8006 (Jean Valjean, #1132): odd tracks
+            // start via a fresh SetAVTransportURI + Play — the renderer fetches
+            // the URL itself, learns the true byte length, and ends the track at
+            // the real EOF, so an over-long DIDL duration is harmless. But on the
+            // gapless auto-transition to the *next* track the renderer does NOT
+            // re-probe the stream — it models playback purely from the DIDL
+            // `res@duration` we supplied via SetNext. When the scanned
+            // `track.duration_ms` (possibly recovered by a slow/fallback scan on
+            // a NAS, or drifted vs. the real sample count) is a few seconds LONGER
+            // than the file's true duration, the renderer holds at the real EOF
+            // with its estimate still reading position < duration, loses the
+            // format/duration/progress display and cuts near the end of the
+            // queued track. 1626ec21 only made `res@size` consistent; the
+            // duration was still the scanned value on this passthrough path.
+            //
+            // Prefer the file container's authoritative duration (FLAC STREAMINFO
+            // total_samples / sample_rate via lofty — metadata only, no decode)
+            // so the SetNext DIDL `res@duration` matches the bytes actually
+            // served. This corrects the current-track DIDL identically (it can
+            // only get MORE accurate, never worse — the initial Play already
+            // ends at real EOF). Fall back to the scanned duration if the probe
+            // fails, so a NAS timeout never blanks the duration entirely.
+            let probed_secs = crate::audio::analyzer::get_duration(&file_path).await.ok();
+            Some(passthrough_didl_duration_ms(probed_secs, track.duration_ms))
+        } else {
+            Some(track.duration_ms)
+        };
+
+        Ok(ResolvedStream {
+            url: stream_url,
+            mime_type: out_mime,
+            title: track.title,
+            artist: track.artist_name,
+            album: track.album_title,
+            duration_ms: didl_duration_ms,
+            source: "local".into(),
+            cover_url: track.cover_path,
+            stream_id: Some(session_id),
+            file_size: resolved_file_size,
+            sample_rate: resolved_sr,
+            bit_depth: resolved_bd,
+            channels: resolved_ch,
+            origin_url: None,
+            bitrate_kbps: None,
+        })
+    }
+
+    /// Les décisions de `resolve_local_track` (formats, sortie, forçages DLNA,
+    /// plafonds, égaliseur, transcodage requis), sorties telles quelles (REF-2
+    /// phase 2, #2219). Le DoP servi directement rend une résolution complète
+    /// sans passer par les armes : c'est le retour anticipé d'origine.
+    #[allow(clippy::too_many_arguments)]
+    async fn decider_la_lecture_locale(
+        &self,
+        req: &PlayRequest,
+        track: &crate::db::models::Track,
+        track_id: i64,
+        file_path: String,
+        fmt: String,
+        source_format: Option<AudioFormat>,
+        is_dsd_source: bool,
+    ) -> Result<DecisionOuResolu, String> {
         let sample_rate = track
             .sample_rate
             .unwrap_or(if is_dsd_source { 2_822_400 } else { 44100 })
@@ -494,7 +638,7 @@ impl PlaybackOrchestrator {
                     let server_ip = self.server_ip();
                     let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
 
-                    return Ok(ResolvedStream {
+                    return Ok(DecisionOuResolu::Resolu(ResolvedStream {
                         url: stream_url,
                         stream_id: Some(session_id),
                         title: track.title.clone(),
@@ -510,7 +654,7 @@ impl PlaybackOrchestrator {
                         bitrate_kbps: None,
                         cover_url: self.resolve_cover_url(track.cover_path.as_deref()),
                         file_size: None,
-                    });
+                    }));
                 } // end dop_rate <= max check
             }
         }
@@ -790,105 +934,12 @@ impl PlaybackOrchestrator {
             zone_max_sample_rate,
             track_duration_ms,
             track_file_size,
-            file_path: file_path.clone(),
-            fmt: fmt.clone(),
-            zone: zone.clone(),
+            file_path,
+            fmt,
+            zone,
+            needs_transcode,
         };
-        let (
-            session_id,
-            out_mime,
-            out_ext,
-            resolved_file_size,
-            resolved_sr,
-            resolved_bd,
-            resolved_ch,
-        ) = if needs_transcode {
-            self.transcoder_la_piste(req, &decision).await?
-        } else {
-            self.servir_en_passthrough(req, &decision).await?
-        };
-
-        let server_ip = self.server_ip();
-        let stream_url = self
-            .streamer
-            .get_stream_url(&session_id, &server_ip, &out_ext);
-
-        // For a transcoded WAV/LPCM stream served with an exact byte length
-        // (the file-transcode path pre-encodes the whole WAV, so file_size is
-        // the real body size), advertise a DIDL `res@duration` derived from
-        // that byte length instead of the scanned `track.duration_ms`. The two
-        // can disagree by a few seconds (the FLAC STREAMINFO/scan duration vs.
-        // the actual decoded sample count), and when the DIDL duration is
-        // LONGER than the bytes the renderer receives, some renderers (Marantz
-        // ND 8006) reach EOF, see position < advertised duration, and
-        // restart/loop the track near the end instead of advancing (#1132).
-        // Computing duration from size/byte_rate keeps duration and size
-        // mathematically consistent, so the progress bar tracks correctly and
-        // the track advances cleanly. Only applies when we know the exact size
-        // AND the audio params; otherwise fall back to the scanned duration.
-        let didl_duration_ms = if out_mime == "audio/wav" || out_mime == "audio/x-wav" {
-            match (resolved_file_size, resolved_sr, resolved_bd, resolved_ch) {
-                (Some(size), Some(sr), Some(bd), Some(ch))
-                    if size > 44 && sr > 0 && bd > 0 && ch > 0 =>
-                {
-                    let byte_rate = sr as u64 * ch as u64 * (bd as u64 / 8);
-                    if byte_rate > 0 {
-                        Some(((size - 44) * 1000 / byte_rate) as i64)
-                    } else {
-                        Some(track.duration_ms)
-                    }
-                }
-                _ => Some(track.duration_ms),
-            }
-        } else if !needs_transcode && is_network_output {
-            // Native passthrough (FLAC/ALAC/… served raw) to a network renderer.
-            //
-            // The gapless-queued (SetNextAVTransportURI) track is the one that
-            // regresses on the Marantz ND 8006 (Jean Valjean, #1132): odd tracks
-            // start via a fresh SetAVTransportURI + Play — the renderer fetches
-            // the URL itself, learns the true byte length, and ends the track at
-            // the real EOF, so an over-long DIDL duration is harmless. But on the
-            // gapless auto-transition to the *next* track the renderer does NOT
-            // re-probe the stream — it models playback purely from the DIDL
-            // `res@duration` we supplied via SetNext. When the scanned
-            // `track.duration_ms` (possibly recovered by a slow/fallback scan on
-            // a NAS, or drifted vs. the real sample count) is a few seconds LONGER
-            // than the file's true duration, the renderer holds at the real EOF
-            // with its estimate still reading position < duration, loses the
-            // format/duration/progress display and cuts near the end of the
-            // queued track. 1626ec21 only made `res@size` consistent; the
-            // duration was still the scanned value on this passthrough path.
-            //
-            // Prefer the file container's authoritative duration (FLAC STREAMINFO
-            // total_samples / sample_rate via lofty — metadata only, no decode)
-            // so the SetNext DIDL `res@duration` matches the bytes actually
-            // served. This corrects the current-track DIDL identically (it can
-            // only get MORE accurate, never worse — the initial Play already
-            // ends at real EOF). Fall back to the scanned duration if the probe
-            // fails, so a NAS timeout never blanks the duration entirely.
-            let probed_secs = crate::audio::analyzer::get_duration(&file_path).await.ok();
-            Some(passthrough_didl_duration_ms(probed_secs, track.duration_ms))
-        } else {
-            Some(track.duration_ms)
-        };
-
-        Ok(ResolvedStream {
-            url: stream_url,
-            mime_type: out_mime,
-            title: track.title,
-            artist: track.artist_name,
-            album: track.album_title,
-            duration_ms: didl_duration_ms,
-            source: "local".into(),
-            cover_url: track.cover_path,
-            stream_id: Some(session_id),
-            file_size: resolved_file_size,
-            sample_rate: resolved_sr,
-            bit_depth: resolved_bd,
-            channels: resolved_ch,
-            origin_url: None,
-            bitrate_kbps: None,
-        })
+        Ok(DecisionOuResolu::Decision(decision))
     }
 
     /// Arme « transcodage » du grand tuple de `resolve_local_track`, sortie telle
@@ -937,6 +988,7 @@ impl PlaybackOrchestrator {
             ref file_path,
             ref fmt,
             ref zone,
+            ..
         } = *decision;
         let flux = {
             let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
@@ -1788,6 +1840,7 @@ impl PlaybackOrchestrator {
             ref file_path,
             ref fmt,
             ref zone,
+            ..
         } = *decision;
         let flux = {
             // Standard passthrough: serve the raw file.
