@@ -245,7 +245,11 @@ mod tests {
         for (nom, source) in [
             ("library_sync", include_str!("library_sync.rs")),
             ("telemetry", include_str!("telemetry.rs")),
+            ("metadata_proposals", include_str!("metadata_proposals.rs")),
         ] {
+            // La partie de PRODUCTION seule : un témoin peut légitimement
+            // poser une échéance avec `defer_from_headers`.
+            let source = source.split("#[cfg(test)]").next().unwrap_or(source);
             assert!(
                 source.contains("rate_limit::appeler("),
                 "{nom} doit emprunter le chemin unique"

@@ -141,38 +141,39 @@ pub async fn run_cycle(
     // Un 429 du cloud est persisté en base (CLD-1) : on respecte son
     // `Retry-After`, redémarrage compris, sans rappeler le serveur.
     let settings = SettingsRepo::with_backend(backend.clone());
-    if let Some(backoff) = rate_limit::active(&settings, CloudScope::MetadataProposalsRead) {
-        debug!(
-            scope = backoff.scope,
-            until_epoch = backoff.until_epoch,
-            retry_after_seconds = backoff.retry_after_seconds,
-            "metadata_proposals_deferred_rate_limit"
-        );
-        return Ok(cycle);
-    }
     let repo = MetadataProposalRepo::with_backend(backend.clone());
 
     // 1. Ce que la communaute propose.
     let url = format!("{CLOUD_LIBRARY_API}/{server_id}/proposals?limit={FETCH_LIMIT}");
-    let resp = http_client
-        .get(&url)
-        .bearer_auth(access_token)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("appel propositions: {e}"))?;
+    // CLD-2 : un seul chemin d'appel borné — la portée retenue ne part pas,
+    // un 429 mémorise son échéance avant d'être lu ici.
+    let resp = match rate_limit::appeler(
+        &settings,
+        CloudScope::MetadataProposalsRead,
+        http_client
+            .get(&url)
+            .bearer_auth(access_token)
+            .timeout(std::time::Duration::from_secs(30)),
+    )
+    .await
+    {
+        rate_limit::AppelCloud::Retenu(backoff) => {
+            debug!(
+                scope = backoff.scope,
+                until_epoch = backoff.until_epoch,
+                retry_after_seconds = backoff.retry_after_seconds,
+                "metadata_proposals_deferred_rate_limit"
+            );
+            return Ok(cycle);
+        }
+        rate_limit::AppelCloud::Reponse(resp) => resp,
+        rate_limit::AppelCloud::Erreur(e) => return Err(format!("appel propositions: {e}")),
+    };
 
     let status = resp.status();
     if !status.is_success() {
         // 429 et 5xx sont des conditions transitoires du cloud communautaire,
         // pas des pannes : on retentera au cycle suivant sans alarmer.
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            rate_limit::defer_from_headers(
-                &settings,
-                CloudScope::MetadataProposalsRead,
-                resp.headers(),
-            );
-        }
         if status.as_u16() == 429 || status.is_server_error() {
             debug!(status = %status, "metadata_proposals_throttled");
             return Ok(cycle);
@@ -250,15 +251,6 @@ pub async fn push_decisions(
         return Ok(0);
     }
     let settings = SettingsRepo::with_backend(backend.clone());
-    if let Some(backoff) = rate_limit::active(&settings, CloudScope::MetadataDecisionsWrite) {
-        debug!(
-            scope = backoff.scope,
-            until_epoch = backoff.until_epoch,
-            retry_after_seconds = backoff.retry_after_seconds,
-            "metadata_decisions_deferred_rate_limit"
-        );
-        return Ok(0);
-    }
 
     let decisions: Vec<serde_json::Value> = pending
         .iter()
@@ -273,26 +265,35 @@ pub async fn push_decisions(
         })
         .collect();
 
-    let resp = http_client
-        .post(format!(
-            "{CLOUD_LIBRARY_API}/{server_id}/proposals/decisions"
-        ))
-        .bearer_auth(access_token)
-        .json(&serde_json::json!({ "decisions": decisions }))
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("envoi decisions: {e}"))?;
+    // CLD-2 : le même chemin borné que la lecture des propositions.
+    let resp = match rate_limit::appeler(
+        &settings,
+        CloudScope::MetadataDecisionsWrite,
+        http_client
+            .post(format!(
+                "{CLOUD_LIBRARY_API}/{server_id}/proposals/decisions"
+            ))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "decisions": decisions }))
+            .timeout(std::time::Duration::from_secs(30)),
+    )
+    .await
+    {
+        rate_limit::AppelCloud::Retenu(backoff) => {
+            debug!(
+                scope = backoff.scope,
+                until_epoch = backoff.until_epoch,
+                retry_after_seconds = backoff.retry_after_seconds,
+                "metadata_decisions_deferred_rate_limit"
+            );
+            return Ok(0);
+        }
+        rate_limit::AppelCloud::Reponse(resp) => resp,
+        rate_limit::AppelCloud::Erreur(e) => return Err(format!("envoi decisions: {e}")),
+    };
 
     let status = resp.status();
     if !status.is_success() {
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            rate_limit::defer_from_headers(
-                &settings,
-                CloudScope::MetadataDecisionsWrite,
-                resp.headers(),
-            );
-        }
         if status.as_u16() == 429 || status.is_server_error() {
             debug!(status = %status, "metadata_decisions_throttled");
             return Ok(0);
