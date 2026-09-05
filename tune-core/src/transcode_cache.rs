@@ -50,6 +50,74 @@ pub fn cache_path(
     bit_depth: u16,
     channels: u16,
 ) -> Option<String> {
+    cache_path_dsp(source, out_ext, sample_rate, bit_depth, channels, None)
+}
+
+/// Version de l'algorithme DSP entrant dans la clé. À incrémenter dès qu'une
+/// mise à jour de l'égaliseur, de la convolution ou du ReplayGain change les
+/// octets rendus pour une même empreinte : sinon une rendition d'hier
+/// resservirait l'ancien traitement (LAT-F2).
+pub const DSP_CACHE_VERSION: u32 = 1;
+
+/// Empreinte du traitement appliqué à la rendition : la représentation
+/// canonique de l'égaliseur (JSON du profil), le facteur ReplayGain (ses
+/// octets IEEE, pas une décimale arrondie) et le CONTENU de la réponse
+/// impulsionnelle, chacun derrière son séparateur de domaine, plus
+/// [`DSP_CACHE_VERSION`]. `None` quand aucun traitement n'est en jeu : la clé
+/// reste alors exactement celle d'avant LAT-F2, et le cache existant est
+/// conservé.
+pub fn empreinte_dsp(
+    eq_profile_json: Option<&str>,
+    replaygain_factor: Option<f64>,
+    impulse_response: Option<&[u8]>,
+) -> Option<[u8; 32]> {
+    empreinte_dsp_v(
+        DSP_CACHE_VERSION,
+        eq_profile_json,
+        replaygain_factor,
+        impulse_response,
+    )
+}
+
+fn empreinte_dsp_v(
+    version: u32,
+    eq_profile_json: Option<&str>,
+    replaygain_factor: Option<f64>,
+    impulse_response: Option<&[u8]>,
+) -> Option<[u8; 32]> {
+    if eq_profile_json.is_none() && replaygain_factor.is_none() && impulse_response.is_none() {
+        return None;
+    }
+    let mut h = Sha256::new();
+    h.update(b"dsp-version\0");
+    h.update(version.to_le_bytes());
+    if let Some(eq) = eq_profile_json {
+        h.update(b"eq\0");
+        h.update(eq.as_bytes());
+        h.update([0u8]);
+    }
+    if let Some(rg) = replaygain_factor {
+        h.update(b"rg\0");
+        h.update(rg.to_bits().to_le_bytes());
+    }
+    if let Some(ir) = impulse_response {
+        h.update(b"ir\0");
+        h.update(Sha256::digest(ir));
+    }
+    Some(h.finalize().into())
+}
+
+/// Clé de cache d'une rendition locale, avec l'empreinte du traitement quand
+/// il y en a un : une rendition par réglage, rejouée instantanément, au lieu
+/// de retranscoder à chaque écoute dès qu'un EQ est actif (LAT-F2).
+pub fn cache_path_dsp(
+    source: &str,
+    out_ext: &str,
+    sample_rate: u32,
+    bit_depth: u16,
+    channels: u16,
+    empreinte_dsp: Option<&[u8; 32]>,
+) -> Option<String> {
     let meta = std::fs::metadata(source).ok()?;
     let mtime = meta
         .modified()
@@ -65,6 +133,10 @@ pub fn cache_path(
     h.update(sample_rate.to_le_bytes());
     h.update(bit_depth.to_le_bytes());
     h.update(channels.to_le_bytes());
+    if let Some(empreinte) = empreinte_dsp {
+        h.update(b"dsp\0");
+        h.update(empreinte);
+    }
     let hex = format!("{:x}", h.finalize());
     let name = format!("{CACHE_PREFIX}{}.{out_ext}", &hex[..32]);
     Some(
@@ -236,6 +308,74 @@ mod tests {
         assert_ne!(a, cache_path(&src, "flac", 48000, 16, 2).unwrap());
         assert_ne!(a, cache_path(&src, "flac", 44100, 24, 2).unwrap());
         assert_ne!(a, cache_path(&src, "flac", 44100, 16, 1).unwrap());
+    }
+
+    /// LAT-F2 : sans traitement, la clé est celle d'avant (le cache existant
+    /// survit) ; avec, chaque composante de l'empreinte — égaliseur,
+    /// ReplayGain, contenu de l'IR, version de l'algorithme — change la clé.
+    #[test]
+    fn la_cle_porte_le_dsp_et_chaque_composante_l_invalide() {
+        let source = crate::test_scratch::scratch_file("tune-tcache-dsp", ".flac");
+        std::fs::write(&source, b"pas un vrai flac").unwrap();
+        let src = source.to_string_lossy().to_string();
+
+        let nu = cache_path(&src, "flac", 44_100, 16, 2).unwrap();
+        assert_eq!(
+            cache_path_dsp(&src, "flac", 44_100, 16, 2, None).unwrap(),
+            nu
+        );
+        assert!(
+            empreinte_dsp(None, None, None).is_none(),
+            "sans traitement, pas d'empreinte"
+        );
+
+        let eq_a = empreinte_dsp(Some(r#"{"bass_gain_db":3.0}"#), None, None).unwrap();
+        let eq_b = empreinte_dsp(Some(r#"{"bass_gain_db":4.0}"#), None, None).unwrap();
+        let rg = empreinte_dsp(None, Some(0.5), None).unwrap();
+        let rg2 = empreinte_dsp(None, Some(0.5000001), None).unwrap();
+        let ir_a = empreinte_dsp(None, None, Some(b"RIFF....ir-a")).unwrap();
+        let ir_b = empreinte_dsp(None, None, Some(b"RIFF....ir-b")).unwrap();
+        let tout = empreinte_dsp(
+            Some(r#"{"bass_gain_db":3.0}"#),
+            Some(0.5),
+            Some(b"RIFF....ir-a"),
+        )
+        .unwrap();
+
+        let cle = |e: &[u8; 32]| cache_path_dsp(&src, "flac", 44_100, 16, 2, Some(e)).unwrap();
+        let cles = [
+            cle(&eq_a),
+            cle(&eq_b),
+            cle(&rg),
+            cle(&rg2),
+            cle(&ir_a),
+            cle(&ir_b),
+            cle(&tout),
+        ];
+        for c in &cles {
+            assert_ne!(
+                *c, nu,
+                "une rendition traitee ne doit jamais prendre la cle du signal brut"
+            );
+        }
+        let mut distinctes = cles.to_vec();
+        distinctes.sort();
+        distinctes.dedup();
+        assert_eq!(
+            distinctes.len(),
+            cles.len(),
+            "deux traitements differents partagent une cle"
+        );
+        assert_eq!(
+            cle(&eq_a),
+            cle(&empreinte_dsp(Some(r#"{"bass_gain_db":3.0}"#), None, None).unwrap()),
+            "meme traitement, meme cle"
+        );
+        assert_ne!(
+            empreinte_dsp_v(1, Some("{}"), None, None),
+            empreinte_dsp_v(2, Some("{}"), None, None),
+            "une nouvelle version de l'algorithme doit invalider les renditions"
+        );
     }
 
     #[test]
