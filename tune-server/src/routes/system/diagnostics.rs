@@ -187,6 +187,43 @@ async fn releve_famine_anneau(state: &AppState) -> Vec<Value> {
         .collect()
 }
 
+/// CLD-3 — les reports 429 du cloud, lisibles dans le rapport.
+///
+/// Quand mozaiklabs.fr répond 429, chaque portée (`CloudScope`) retient ses
+/// appels jusqu'à l'échéance ; jusqu'ici seul `/cloud/telemetry/status` le
+/// disait, et personne ne le lisait. Le rapport de diagnostic est ce que le
+/// testeur colle sur le forum : une bio qui n'arrive pas, une proposition de
+/// métadonnées qui n'est pas envoyée, doivent pouvoir se lire comme « portée
+/// retenue encore N secondes », pas comme une panne muette. `remaining_seconds`
+/// est borné à zéro : une échéance passée n'est pas une dette négative.
+fn rapport_des_reports_cloud(
+    actifs: &[tune_core::cloud::rate_limit::ActiveCloudBackoff],
+    maintenant_epoch: u64,
+) -> Value {
+    let portees: Vec<Value> = actifs
+        .iter()
+        .map(|a| {
+            json!({
+                "scope": a.scope,
+                "until_epoch": a.until_epoch,
+                "remaining_seconds": a.until_epoch.saturating_sub(maintenant_epoch),
+                "retry_after_seconds": a.retry_after_seconds,
+            })
+        })
+        .collect();
+    json!({
+        "count": portees.len(),
+        "scopes": portees,
+    })
+}
+
+fn maintenant_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let artists = ArtistRepo::with_backend(state.backend.clone())
         .count()
@@ -335,6 +372,12 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
             "albums": albums,
             "last_result": scan_result,
         },
+        // CLD-3 — les portées cloud retenues par un 429, avec leur échéance :
+        // sans cela un enrichissement qui n'arrive pas ressemble à une panne.
+        "cloud_rate_limits": rapport_des_reports_cloud(
+            &tune_core::cloud::rate_limit::active_all(&settings),
+            maintenant_epoch(),
+        ),
         "features": tune_core::enabled_features(),
         // Legacy fields kept for backward compatibility
         "engine": "rust",
@@ -2484,5 +2527,45 @@ mod version_de_schema_rendue {
     fn une_version_connue_se_rend_telle_quelle() {
         assert_eq!(version_de_schema_affichee(Some(0)), "0");
         assert_eq!(version_de_schema_affichee(Some(49)), "49");
+    }
+}
+
+#[cfg(test)]
+mod tests_reports_cloud {
+    use super::rapport_des_reports_cloud;
+    use tune_core::cloud::rate_limit::ActiveCloudBackoff;
+
+    /// CLD-3 : chaque portée retenue est nommée avec son échéance et le temps
+    /// restant ; une échéance passée rend zéro, jamais un négatif ; sans
+    /// report, `count` vaut zéro et la liste existe (le client n'a pas à
+    /// deviner l'absence).
+    #[test]
+    fn le_rapport_nomme_les_portees_retenues_et_borne_le_restant() {
+        let maintenant = 1_700_000_000u64;
+        let actifs = [
+            ActiveCloudBackoff {
+                scope: "bios_artists_read",
+                until_epoch: maintenant + 90,
+                retry_after_seconds: 120,
+            },
+            ActiveCloudBackoff {
+                scope: "telemetry",
+                until_epoch: maintenant - 5,
+                retry_after_seconds: 60,
+            },
+        ];
+        let r = rapport_des_reports_cloud(&actifs, maintenant);
+        assert_eq!(r["count"], 2);
+        assert_eq!(r["scopes"][0]["scope"], "bios_artists_read");
+        assert_eq!(r["scopes"][0]["remaining_seconds"], 90);
+        assert_eq!(r["scopes"][0]["retry_after_seconds"], 120);
+        assert_eq!(
+            r["scopes"][1]["remaining_seconds"], 0,
+            "une échéance passée n'est pas une dette"
+        );
+
+        let vide = rapport_des_reports_cloud(&[], maintenant);
+        assert_eq!(vide["count"], 0);
+        assert!(vide["scopes"].as_array().is_some_and(|v| v.is_empty()));
     }
 }
