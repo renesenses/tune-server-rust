@@ -211,3 +211,18 @@ pub(crate) fn message_session_perdue(
 /// sauter. Le ND8006 fait déjà des `soap_retry` sur `GetTransportInfo` dans ces
 /// instants-là.
 pub(super) const REPLAY_OUTPUT_SEEK_SETTLE_MS: u64 = 500;
+
+/// Temps de pose avant le seek qui suit une REPRISE sur un renderer réseau
+/// (DLNA, OpenHome) : le renderer redémarre son transport, il faut le laisser
+/// repartir avant de lui demander de sauter (LAT-P2 : ce temps ne retient plus
+/// la réponse, il court dans une tâche détachée).
+pub(super) const RESUME_OUTPUT_SEEK_SETTLE_MS: u64 = 700;
+
+/// Le seek détaché n'a de sens que pour la lecture qui l'a demandé : entre le
+/// départ de la tâche et la fin de son temps de pose, un stop, un next ou une
+/// nouvelle lecture peuvent être passés — il seekerait alors la piste
+/// SUIVANTE. La génération de lecture (`play_seq`) capturée au départ doit
+/// être celle du moment du seek.
+pub(super) fn reprise_toujours_la_notre(seq_au_depart: u64, seq_courante: u64) -> bool {
+    seq_au_depart == seq_courante
+}

@@ -709,8 +709,9 @@ use super::{
     PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, is_network_output_type,
     is_pull_dsp_output_type, is_push_uri_output_type, message_session_perdue,
     passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, replay_needs_output_seek,
-    reprise_de_session, requete_de_retablissement, spawn_streaming_dsp_relay,
-    streaming_needs_pretranscode, streaming_pretranscode_format, use_file_transcode_for,
+    reprise_de_session, reprise_toujours_la_notre, requete_de_retablissement,
+    spawn_streaming_dsp_relay, streaming_needs_pretranscode, streaming_pretranscode_format,
+    use_file_transcode_for,
 };
 
 #[test]
@@ -950,6 +951,69 @@ fn une_relecture_reseau_sur_session_seekable_reclame_le_seek() {
     // C'est le cas de figure de #2595 (zone sans périphérique, position
     // restée à 0) : il ne doit pas produire un Seek inutile de plus.
     assert!(!replay_needs_output_seek(true, true, 0));
+}
+
+/// LAT-P2 : le seek détaché appartient à la lecture qui l'a demandé. Même
+/// génération → il part ; une génération de plus (stop, next, nouvelle
+/// lecture pendant la pose) → il s'abstient, sinon il seekerait la piste
+/// suivante.
+#[test]
+fn le_seek_detache_ne_part_que_pour_sa_lecture() {
+    assert!(reprise_toujours_la_notre(7, 7));
+    assert!(!reprise_toujours_la_notre(7, 8));
+    assert!(!reprise_toujours_la_notre(8, 7));
+}
+
+/// La réponse de `resume` et celle de la relecture ne doivent plus porter le
+/// temps de pose : aucun `sleep` dans leur corps, le seek passe par la tâche
+/// détachée, et la tâche relit la génération avant de seeker. Lu dans le code
+/// de production de `transport.rs` seul.
+#[test]
+fn les_seeks_apres_reprise_sont_detaches_et_gardes() {
+    let source = include_str!("transport.rs");
+    let corps = |signature: &str| -> &str {
+        let debut = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} introuvable"));
+        let apres = &source[debut..];
+        let fin = apres
+            .find("\n    }\n")
+            .map(|i| i + 7)
+            .unwrap_or(apres.len());
+        &apres[..fin]
+    };
+    for (nom, sig) in [
+        (
+            "resume",
+            "pub async fn resume(&self, zone_id: i64, device_id: Option<&str>)",
+        ),
+        (
+            "seek_output_after_replay",
+            "pub(super) async fn seek_output_after_replay(",
+        ),
+    ] {
+        let c = corps(sig);
+        assert!(
+            !c.contains("tokio::time::sleep("),
+            "{nom} ne doit plus dormir avant de repondre (LAT-P2)"
+        );
+        assert!(
+            c.contains("detacher_le_seek_apres_reprise("),
+            "{nom} doit passer par la tache detachee"
+        );
+    }
+    let tache = corps("async fn detacher_le_seek_apres_reprise(");
+    let pose = tache
+        .find("tokio::time::sleep(pose)")
+        .expect("la tache dort d'abord");
+    let garde = tache
+        .find("reprise_toujours_la_notre(")
+        .expect("la tache relit la generation");
+    let seek = tache.find(".checked_seek(").expect("la tache seeke");
+    assert!(
+        pose < garde && garde < seek,
+        "ordre attendu : pose, garde de generation, seek"
+    );
 }
 
 /// La liste des sorties « réseau » ne vit plus qu'à un endroit.
@@ -3982,6 +4046,26 @@ async fn position_vue_par_la_sortie(orch: &PlaybackOrchestrator, device_id: &str
     guard.get_status().await.unwrap().position_ms
 }
 
+/// Depuis LAT-P2 le seek qui suit une relecture part en tâche détachée, après
+/// `REPLAY_OUTPUT_SEEK_SETTLE_MS` : la réponse à l'appelant ne l'attend plus.
+/// On attend donc ici, sans dépasser quelques secondes, que la sortie l'ait
+/// reçu — la valeur rendue est la dernière position vue.
+async fn attendre_la_position_vue_par_la_sortie(
+    orch: &PlaybackOrchestrator,
+    device_id: &str,
+    attendue: u64,
+) -> u64 {
+    let mut vue = 0;
+    for _ in 0..60 {
+        vue = position_vue_par_la_sortie(orch, device_id).await;
+        if vue == attendue {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    vue
+}
+
 /// #2893 — LE défaut, de bout en bout : bascule Pure sur une sortie DLNA.
 ///
 /// Jean Valjean (0.9.126, Marantz ND8006, fil 1618) : le serveur relance à
@@ -4003,7 +4087,7 @@ async fn bascule_pure_sur_dlna_le_renderer_recoit_le_seek_vers_la_position() {
         .expect("la relecture doit réussir");
 
     assert_eq!(
-        position_vue_par_la_sortie(&orch, device_id).await,
+        attendre_la_position_vue_par_la_sortie(&orch, device_id, 94_000).await,
         94_000,
         "le renderer doit recevoir un Seek vers la position : sans lui il rejoue le morceau depuis le début (#2893)"
     );
