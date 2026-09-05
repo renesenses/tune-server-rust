@@ -9,14 +9,29 @@ fn corps_du_handler() -> String {
         // `patch_zone` vit dans le module enfant `ecriture` depuis REF-4 (#2219).
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/zones/ecriture.rs"))
             .expect("lecture de zones/ecriture.rs");
-    let debut = source
-        .find("async fn patch_zone(")
-        .expect("`patch_zone` a été renommé — ce garde-fou ne garde plus rien");
-    let reste = &source[debut..];
-    let fin = reste
-        .find("\n}\n")
-        .expect("fin de `patch_zone` introuvable");
-    reste[..fin].to_string()
+    // REF-4 phase 2 (#2219) : `patch_zone` se lit en quatre corps, dans
+    // l'ordre d'appel — l'hôte, puis valider, commander, persister. Les
+    // positions comparées ci-dessous gardent leur sens sur la concaténation.
+    let corps_de = |signature: &str| -> String {
+        let debut = source.find(signature).unwrap_or_else(|| {
+            panic!("`{signature}` a été renommé — ce garde-fou ne garde plus rien")
+        });
+        let reste = &source[debut..];
+        let fin = reste
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("fin de `{signature}` introuvable"));
+        reste[..fin].to_string()
+    };
+    [
+        "async fn patch_zone(",
+        "fn valider_le_patch(",
+        "async fn commander_la_sortie(",
+        "async fn persister_le_patch(",
+    ]
+    .into_iter()
+    .map(corps_de)
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 #[test]
