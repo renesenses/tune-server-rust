@@ -210,6 +210,7 @@ pub fn router() -> Router<AppState> {
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
         .route("/albums/{id}/completeness", get(albums::album_completeness))
+        .route("/albums/{id}/editions", get(albums::album_editions))
         .route(
             "/albums/{id}",
             get(albums::get_album).put(albums::update_album),

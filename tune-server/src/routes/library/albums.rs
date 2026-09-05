@@ -968,6 +968,176 @@ pub(super) async fn albums_grouped(State(state): State<AppState>) -> Result<Json
     })))
 }
 
+/// BIB-B1 — les ÉDITIONS d'un album.
+///
+/// Les autres albums du MÊME artiste dont le titre est le même à un suffixe
+/// d'édition près — « (Remastered 2009) », « [Super Deluxe] »,
+/// « - 2009 Remaster » — rapprochés par la règle EXACTE des versions de
+/// piste (#2372, [`crate::routes::versions::predicat_titres_equivalents`]) :
+/// aucun rapprochement flou, mieux vaut ne rien proposer qu'un faux.
+///
+/// Pour un audiophile, deux qualités du même album ne sont PAS un doublon à
+/// supprimer (140 groupes mesurés sur .18, 29 seulement à nombre de pistes
+/// égal). La route les NOMME — édition, année, format, résolution, nombre de
+/// pistes — et ne fusionne rien. Les paires que l'utilisateur a déclarées
+/// distinctes (`/albums/{id}/distinct/{other_id}`) sont écartées.
+pub(super) async fn album_editions(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let album = repo
+        .get(id)
+        .ok()
+        .flatten()
+        .ok_or(AppError::not_found("album not found"))?;
+    let Some(artist_id) = album.artist_id else {
+        return Ok(Json(json!({
+            "album_id": id,
+            "album_title": album.title,
+            "base_title": album.title.trim(),
+            "edition": Value::Null,
+            "editions": [],
+            "count": 0,
+            "reason": "album sans artiste",
+        })));
+    };
+    let lignes = albums_au_titre_equivalent(&state, artist_id, id, &album.title);
+    // La règle exacte de #2372 ne voit, depuis une édition, que sa base : deux
+    // éditions sœurs ne se voient pas l'une l'autre. On établit donc la base
+    // (le titre le plus court du groupe) et, si l'album interrogé n'est pas
+    // la base, on relit le groupe depuis elle.
+    let titres_directs: Vec<String> = std::iter::once(album.title.clone())
+        .chain(
+            lignes
+                .iter()
+                .filter_map(|r| r.get(1).and_then(|v| v.as_string())),
+        )
+        .collect();
+    let base = titre_de_base(&titres_directs);
+    let lignes = if base.to_lowercase() == album.title.trim().to_lowercase() {
+        lignes
+    } else {
+        albums_au_titre_equivalent(&state, artist_id, id, &base)
+    };
+    let distincts = AlbumDistinctRepo::with_backend(state.backend.clone())
+        .charger_ensemble()
+        .ok();
+    let retenues: Vec<&Vec<tune_core::db::backend::SqlValue>> = lignes
+        .iter()
+        .filter(|r| {
+            let autre = r.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            !distincts.as_ref().is_some_and(|d| d.contains(id, autre))
+        })
+        .collect();
+    let pistes_album = album.track_count.map(i64::from);
+    let editions: Vec<Value> = retenues
+        .iter()
+        .map(|r| {
+            let titre = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+            let pistes = r.get(4).and_then(|v| v.as_i64());
+            json!({
+                "id": r.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                "title": titre,
+                "edition": etiquette_d_edition(&base, &titre),
+                "year": r.get(2).and_then(|v| v.as_i64()),
+                "original_year": r.get(3).and_then(|v| v.as_i64()),
+                "track_count": pistes,
+                "disc_count": r.get(5).and_then(|v| v.as_i64()),
+                "format": r.get(6).and_then(|v| v.as_string()),
+                "sample_rate": r.get(7).and_then(|v| v.as_i64()),
+                "bit_depth": r.get(8).and_then(|v| v.as_i64()),
+                "source": r.get(9).and_then(|v| v.as_string()),
+                "cover_path": r.get(10).and_then(|v| v.as_string()),
+                "musicbrainz_release_id": r.get(11).and_then(|v| v.as_string()),
+                "same_track_count": pistes.is_some() && pistes == pistes_album,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "album_id": id,
+        "album_title": album.title,
+        "base_title": base,
+        "edition": etiquette_d_edition(&base, &album.title),
+        "count": editions.len(),
+        "editions": editions,
+    })))
+}
+
+/// Les albums d'un artiste au titre équivalent à `titre` (règle exacte de
+/// #2372), l'album `id` exclu, les plus anciens d'abord.
+fn albums_au_titre_equivalent(
+    state: &AppState,
+    artist_id: i64,
+    id: i64,
+    titre: &str,
+) -> Vec<Vec<tune_core::db::backend::SqlValue>> {
+    let engine = state.backend.engine();
+    let m = |i: usize| crate::routes::versions::marqueur(engine, i);
+    let sql = format!(
+        "SELECT a.id, a.title, a.year, a.original_year, a.track_count, a.disc_count, \
+                a.format, a.sample_rate, a.bit_depth, a.source, a.cover_path, a.musicbrainz_release_id \
+         FROM albums a \
+         WHERE a.artist_id = {} AND a.id != {} AND {} \
+         ORDER BY a.year, a.id",
+        m(1),
+        m(2),
+        crate::routes::versions::predicat_titres_equivalents("a.title", &m(3))
+    );
+    // SQLite numérote ses marqueurs par position (`?`), PostgreSQL par nom
+    // (`$3`) : le titre est lié autant de fois que le prédicat le répète.
+    let repetitions = match engine {
+        Engine::Sqlite => sql.matches('?').count().saturating_sub(2).max(1),
+        Engine::Postgres => 1,
+    };
+    let titre = titre.to_string();
+    let mut params: Vec<&dyn ToSqlValue> = vec![&artist_id, &id];
+    params.extend(std::iter::repeat_n(&titre as &dyn ToSqlValue, repetitions));
+    state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise()
+}
+
+/// Le titre de base d'un groupe d'éditions : le plus court (en caractères),
+/// le premier à égalité. Avec la règle exacte de #2372 c'est nécessairement
+/// le préfixe commun des autres.
+fn titre_de_base(titres: &[String]) -> String {
+    titres
+        .iter()
+        .map(|t| t.trim())
+        .min_by_key(|t| t.chars().count())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Ce qui distingue une édition de son titre de base : le suffixe après le
+/// délimiteur, sans sa parenthèse ou son crochet fermant. `None` pour le
+/// titre de base lui-même ou un titre qui n'en descend pas.
+fn etiquette_d_edition(base: &str, titre: &str) -> Option<String> {
+    let base = base.trim();
+    let titre = titre.trim();
+    if base.is_empty() || titre.len() <= base.len() {
+        return None;
+    }
+    let debut = titre.get(..base.len())?;
+    if debut.to_lowercase() != base.to_lowercase() {
+        return None;
+    }
+    let reste = &titre[base.len()..];
+    let delimiteur = crate::routes::versions::DELIMITEURS_D_EDITION
+        .iter()
+        .find(|d| reste.starts_with(**d))?;
+    let corps = reste[delimiteur.len()..].trim();
+    let corps = match *delimiteur {
+        " (" => corps.strip_suffix(')').unwrap_or(corps),
+        " [" => corps.strip_suffix(']').unwrap_or(corps),
+        _ => corps,
+    }
+    .trim();
+    (!corps.is_empty()).then(|| corps.to_string())
+}
+
 pub(super) async fn album_completeness(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -1276,5 +1446,146 @@ mod tests_grouping {
         assert!(out[0].get("dynamic_range").is_none());
         assert!(out[1].get("grouping").is_none());
         assert_eq!(out[1]["dynamic_range"], "11");
+    }
+}
+
+#[cfg(test)]
+mod tests_editions {
+    use super::*;
+    use tune_core::db::album_distinct_repo::AlbumDistinctRepo;
+
+    /// BIB-B1 : l'étiquette d'édition est le suffixe après le délimiteur,
+    /// sans parenthèse ni crochet fermant ; le titre de base n'en a pas ; un
+    /// titre qui ne descend pas de la base non plus.
+    #[test]
+    fn l_etiquette_d_edition_est_le_suffixe_nu() {
+        assert_eq!(
+            etiquette_d_edition("Abbey Road", "Abbey Road (Remastered 2009)").as_deref(),
+            Some("Remastered 2009")
+        );
+        assert_eq!(
+            etiquette_d_edition("Abbey Road", "abbey road [Super Deluxe]").as_deref(),
+            Some("Super Deluxe")
+        );
+        assert_eq!(
+            etiquette_d_edition("Abbey Road", "Abbey Road - 2019 Mix").as_deref(),
+            Some("2019 Mix")
+        );
+        assert_eq!(etiquette_d_edition("Abbey Road", "Abbey Road"), None);
+        assert_eq!(etiquette_d_edition("Abbey Road", "Abbey Roads"), None);
+        assert_eq!(etiquette_d_edition("Abbey Road", "Let It Be"), None);
+        assert_eq!(
+            titre_de_base(&["Abbey Road (Remastered 2009)".into(), "Abbey Road".into()]),
+            "Abbey Road"
+        );
+    }
+
+    /// BIB-B1 : les éditions d'un album sont les albums du MÊME artiste au
+    /// titre équivalent, nommées par leur suffixe, avec format et résolution ;
+    /// un autre artiste, un autre titre n'y entrent pas ; une paire déclarée
+    /// distincte en sort ; depuis une édition on retrouve la base.
+    #[tokio::test]
+    async fn les_editions_d_un_album_sont_nommees_jamais_fusionnees() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        let artiste = |nom: &str| {
+            b.execute(
+                "INSERT INTO artists (name) VALUES (?1)",
+                &[&nom as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let album = |titre: &str,
+                     artiste_id: i64,
+                     annee: i64,
+                     format: &str,
+                     sr: i64,
+                     bd: i64,
+                     pistes: i64| {
+            b.execute(
+                "INSERT INTO albums (title, artist_id, year, format, sample_rate, bit_depth, track_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &artiste_id as &dyn ToSqlValue,
+                    &annee as &dyn ToSqlValue,
+                    &format as &dyn ToSqlValue,
+                    &sr as &dyn ToSqlValue,
+                    &bd as &dyn ToSqlValue,
+                    &pistes as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let beatles = artiste("The Beatles");
+        let autre = artiste("Tribute Band");
+        let base = album("Abbey Road", beatles, 1969, "FLAC", 44_100, 16, 17);
+        let remaster = album(
+            "Abbey Road (Remastered 2009)",
+            beatles,
+            2009,
+            "FLAC",
+            96_000,
+            24,
+            17,
+        );
+        let deluxe = album(
+            "Abbey Road [Super Deluxe]",
+            beatles,
+            2019,
+            "FLAC",
+            96_000,
+            24,
+            40,
+        );
+        let _let_it_be = album("Let It Be", beatles, 1970, "FLAC", 44_100, 16, 12);
+        let _hommage = album("Abbey Road", autre, 2001, "MP3", 44_100, 16, 17);
+
+        let Json(v) = album_editions(State(state.clone()), Path(base))
+            .await
+            .ok()
+            .expect("la route repond");
+        assert_eq!(v["base_title"], "Abbey Road");
+        assert_eq!(v["edition"], Value::Null);
+        assert_eq!(v["count"], 2, "{v}");
+        let eds = v["editions"].as_array().unwrap();
+        assert_eq!(eds[0]["id"], remaster);
+        assert_eq!(eds[0]["edition"], "Remastered 2009");
+        assert_eq!(eds[0]["sample_rate"], 96_000);
+        assert_eq!(eds[0]["bit_depth"], 24);
+        assert_eq!(eds[0]["same_track_count"], true);
+        assert_eq!(eds[1]["id"], deluxe);
+        assert_eq!(eds[1]["edition"], "Super Deluxe");
+        assert_eq!(eds[1]["same_track_count"], false);
+
+        // Depuis une édition, la base et l'autre édition ressortent, et
+        // l'album interrogé connaît sa propre étiquette.
+        let Json(v) = album_editions(State(state.clone()), Path(deluxe))
+            .await
+            .ok()
+            .expect("la route repond");
+        assert_eq!(v["base_title"], "Abbey Road");
+        assert_eq!(v["edition"], "Super Deluxe");
+        assert_eq!(v["count"], 2, "{v}");
+
+        // Une paire déclarée distincte par l'utilisateur sort de la liste.
+        AlbumDistinctRepo::with_backend(state.backend.clone())
+            .declarer_distincts(base, deluxe)
+            .unwrap();
+        let Json(v) = album_editions(State(state.clone()), Path(base))
+            .await
+            .ok()
+            .expect("la route repond");
+        assert_eq!(v["count"], 1, "{v}");
+        assert_eq!(v["editions"][0]["id"], remaster);
+
+        // Un album inconnu : 404, pas une liste vide.
+        assert!(
+            album_editions(State(state.clone()), Path(999_999))
+                .await
+                .is_err()
+        );
     }
 }

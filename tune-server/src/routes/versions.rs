@@ -92,7 +92,7 @@ pub(crate) fn classer_version(
 /// precedente ; la fermer demanderait le dictionnaire de qualificatifs propose
 /// par FabienM (fil 1627), qui est un chantier a lui seul et devrait alors
 /// valoir pour les TROIS delimiteurs.
-const DELIMITEURS_D_EDITION: [&str; 3] = [" (", " [", " - "];
+pub(crate) const DELIMITEURS_D_EDITION: [&str; 3] = [" (", " [", " - "];
 
 /// Deux titres designent le meme morceau quand ils sont identiques, ou quand
 /// l'un ajoute au titre nu un suffixe d'edition ouvert par l'un des
