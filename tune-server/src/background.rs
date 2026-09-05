@@ -29,6 +29,11 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
+    // CRD-5 : passe automatique des crédits, bornée par tour et reprenable par
+    // curseur, derrière le même droit premium que les biographies. Une garde
+    // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du
+    // code mort pendant des mois pour une ligne comme celle-ci.
+    crate::routes::library::credits::spawn_passe_automatique_credits(state);
     spawn_community_sync(state);
     spawn_replaygain_analysis(state);
     #[cfg(feature = "audio-embedding")]
