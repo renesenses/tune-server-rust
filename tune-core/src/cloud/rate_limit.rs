@@ -149,6 +149,46 @@ pub fn active_all(settings: &SettingsRepo) -> Vec<ActiveCloudBackoff> {
         .collect()
 }
 
+/// Le verdict d'un appel cloud borné (CLD-2).
+#[derive(Debug)]
+pub enum AppelCloud {
+    /// La portée est retenue par un 429 encore actif : l'appel n'est PAS parti.
+    Retenu(ActiveCloudBackoff),
+    /// L'appel est parti et le cloud a répondu (429 compris : l'échéance est
+    /// déjà mémorisée quand on lit cette réponse).
+    Reponse(reqwest::Response),
+    /// L'appel est parti et a échoué avant toute réponse.
+    Erreur(reqwest::Error),
+}
+
+/// UN seul chemin pour appeler mozaiklabs.fr sous une portée (CLD-2).
+///
+/// Avant lui, vingt-trois sites dans six fichiers répétaient la même paire
+/// « `active` avant, `defer_from_headers` après » avec, à chaque fois, un
+/// flux de contrôle réécrit à la main ; en oublier une moitié suffisait à
+/// rappeler le cloud comme si de rien n'était. Ici : une portée retenue ne
+/// part pas ; une réponse 429 mémorise son `Retry-After` avant d'être rendue
+/// telle quelle, pour que l'appelant garde SA lecture du statut et SON
+/// journal. Le client HTTP reste celui de l'appelant (couture unique).
+pub async fn appeler(
+    settings: &SettingsRepo,
+    scope: CloudScope,
+    requete: reqwest::RequestBuilder,
+) -> AppelCloud {
+    if let Some(backoff) = active(settings, scope) {
+        return AppelCloud::Retenu(backoff);
+    }
+    match requete.send().await {
+        Ok(resp) => {
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                defer_from_headers(settings, scope, resp.headers());
+            }
+            AppelCloud::Reponse(resp)
+        }
+        Err(e) => AppelCloud::Erreur(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +202,63 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         SettingsRepo::with_backend(Arc::new(db))
+    }
+
+    /// CLD-2 : une portée retenue ne part PAS (aucun réseau : l'adresse est
+    /// injoignable et pourtant le verdict est `Retenu`) ; une portée libre
+    /// part, et sans serveur le verdict est `Erreur` ; la synchro de
+    /// bibliothèque et la télémétrie n'appellent plus `active` ni
+    /// `defer_from_headers` elles-mêmes.
+    #[tokio::test]
+    async fn appeler_retient_avant_de_partir_et_les_deux_premiers_sites_l_empruntent() {
+        let settings = settings();
+        let client = crate::http::client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("120"),
+        );
+        defer_from_headers(&settings, CloudScope::Telemetry, &headers).unwrap();
+        match appeler(
+            &settings,
+            CloudScope::Telemetry,
+            client.get("http://10.255.255.1:9/"),
+        )
+        .await
+        {
+            AppelCloud::Retenu(b) => assert_eq!(b.scope, CloudScope::Telemetry.as_str()),
+            autre => panic!("une portée retenue ne doit pas partir : {autre:?}"),
+        }
+        match appeler(
+            &settings,
+            CloudScope::LibrarySync,
+            client.get("http://10.255.255.1:9/"),
+        )
+        .await
+        {
+            AppelCloud::Erreur(_) => {}
+            autre => panic!("sans serveur, le verdict est Erreur : {autre:?}"),
+        }
+        for (nom, source) in [
+            ("library_sync", include_str!("library_sync.rs")),
+            ("telemetry", include_str!("telemetry.rs")),
+        ] {
+            assert!(
+                source.contains("rate_limit::appeler("),
+                "{nom} doit emprunter le chemin unique"
+            );
+            assert!(
+                !source.contains("rate_limit::active("),
+                "{nom} ne vérifie plus la portée lui-même"
+            );
+            assert!(
+                !source.contains("defer_from_headers("),
+                "{nom} ne mémorise plus le 429 lui-même"
+            );
+        }
     }
 
     #[test]
