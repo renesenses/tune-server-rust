@@ -1,3 +1,5 @@
+ M tune-core/src/audio/mod.rs
+?? tune-core/src/audio/empreinte.rs
 pub mod aac_encoder;
 pub mod aiff;
 pub mod alac_encoder;
@@ -21,6 +23,7 @@ pub mod dsf;
 pub mod embedding;
 /// READ side of audio embeddings (storage + cosine) — always compiled, no ort.
 pub mod embedding_store;
+pub mod empreinte;
 pub mod encoder;
 pub mod eq;
 pub mod eq_presets;
