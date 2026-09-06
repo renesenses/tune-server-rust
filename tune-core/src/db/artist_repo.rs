@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::absorption;
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect, fold_diacritics};
 use super::models::Artist;
@@ -295,6 +296,25 @@ pub mod sql {
     }
 }
 
+/// Bilan d'une absorption d'artiste (BIB-C1, phase 1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RapportDAbsorptionArtiste {
+    pub cible: i64,
+    pub doublon: i64,
+    pub albums: usize,
+    pub pistes: usize,
+    pub credits: usize,
+    /// Favoris, masquages, étiquettes, signalements, propositions, journal de
+    /// synchronisation repointés.
+    pub marqueurs: usize,
+    /// Textes recalés sur la graphie survivante (`tracks.album_artist`,
+    /// `track_credits.artist_name`).
+    pub textes_recales: usize,
+    /// Champs de la cible restés vides et repris du doublon (MBID, tri,
+    /// Discogs, image, biographie).
+    pub champs_repris: usize,
+}
+
 pub struct ArtistRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -523,6 +543,178 @@ impl ArtistRepo {
         ];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// `cible` absorbe `doublon` (BIB-C1, phase 1) : deux fiches d'un même
+    /// artiste sous deux graphies (« Rolling Stones » / « The Rolling
+    /// Stones », « Ayo » / « Ayọ ») n'en font plus qu'une.
+    ///
+    /// Aucune fusion d'artiste n'existait : `delete` laissait `albums` et
+    /// `tracks` pendants, `PUT /library/artists/{id}` renomme la fiche et rien
+    /// d'autre. Ici, dans l'ordre : champs vides de la cible repris du doublon
+    /// (MBID, nom de tri, Discogs, image, biographie), `albums`, `tracks`,
+    /// `track_credits`, les textes qui portaient la graphie perdante
+    /// (`tracks.album_artist`, lu en priorité par `albums-detailed`, et
+    /// `track_credits.artist_name`), favoris, masquages, étiquettes,
+    /// signalements, propositions, journal de synchronisation, cache de
+    /// biographie ; puis `DELETE FROM artists`. L'historique d'écoute ne
+    /// connaît que le nom : il reste tel quel.
+    ///
+    /// Pas de table d'alias : la route impose la même [`cle_artiste`], et
+    /// [`Self::get_or_create`] retombe sur la fiche survivante pour toute
+    /// graphie de la même clé — un fichier taggé « Ayọ » ne fait pas renaître
+    /// « Ayọ ». L'appelant a vérifié la clé, les MBID et l'artiste inconnu ;
+    /// rien n'est automatique.
+    pub fn absorber(
+        &self,
+        cible: i64,
+        doublon: i64,
+    ) -> Result<RapportDAbsorptionArtiste, TuneError> {
+        if cible == doublon {
+            return Err(TuneError::from(
+                "un artiste ne s'absorbe pas lui-même".to_string(),
+            ));
+        }
+        let Some(artiste_cible) = self.get(cible)? else {
+            return Err(TuneError::from(format!("artiste {cible} inconnu")));
+        };
+        let Some(artiste_doublon) = self.get(doublon)? else {
+            return Err(TuneError::from(format!("artiste {doublon} inconnu")));
+        };
+        let db: &dyn DbBackend = &*self.db;
+        const CHAMPS: [&str; 11] = [
+            "musicbrainz_id",
+            "sort_name",
+            "discogs_id",
+            "image_path",
+            "image_source",
+            "bio",
+            "bio_source",
+            "bio_source_url",
+            "bio_license",
+            "bio_lang",
+            "bio_fetched_at",
+        ];
+        let champs_repris =
+            absorption::reprendre_les_champs_vides(db, "artists", &CHAMPS, cible, doublon)?;
+        let albums = absorption::repointer(db, "albums", "artist_id", None, cible, doublon)?;
+        let pistes = absorption::repointer(db, "tracks", "artist_id", None, cible, doublon)?;
+        let credits =
+            absorption::repointer(db, "track_credits", "artist_id", None, cible, doublon)?;
+        let mut textes_recales = 0usize;
+        textes_recales += absorption::recaler_le_texte(
+            db,
+            "track_credits",
+            "artist_name",
+            "artist_id",
+            cible,
+            &artiste_cible.name,
+            &artiste_doublon.name,
+        )?;
+        textes_recales += absorption::recaler_le_texte(
+            db,
+            "tracks",
+            "album_artist",
+            "artist_id",
+            cible,
+            &artiste_cible.name,
+            &artiste_doublon.name,
+        )?;
+        let mut marqueurs = 0usize;
+        let artiste = Some("item_type = 'artist'");
+        marqueurs += absorption::repointer_a_cle_unique(
+            db,
+            "favorites",
+            "item_id",
+            "profile_id",
+            artiste,
+            cible,
+            doublon,
+        )?;
+        marqueurs += absorption::repointer_a_cle_unique(
+            db,
+            "hidden_items",
+            "item_id",
+            "profile_id",
+            artiste,
+            cible,
+            doublon,
+        )?;
+        marqueurs += absorption::repointer_a_cle_unique(
+            db,
+            "item_tags",
+            "item_id",
+            "tag_id",
+            artiste,
+            cible,
+            doublon,
+        )?;
+        marqueurs += absorption::repointer(
+            db,
+            "metadata_reports",
+            "entity_id",
+            Some("entity IN ('artist', 'artist_image', 'bio')"),
+            cible,
+            doublon,
+        )?;
+        marqueurs += absorption::repointer(
+            db,
+            "metadata_proposals",
+            "local_id",
+            Some("entity = 'artist'"),
+            cible,
+            doublon,
+        )?;
+        marqueurs += absorption::repointer(
+            db,
+            "sync_changelog",
+            "entity_id",
+            Some("entity_type = 'artist'"),
+            cible,
+            doublon,
+        )?;
+
+        // Le cache de biographie est rangé par NOM : celui de la graphie
+        // perdante n'est plus atteignable, on le retire.
+        let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let prefixe = format!("cache:artistbio:{}:", artiste_doublon.name);
+        if let Ok(toutes) = settings.all() {
+            for (cle, _) in toutes.iter().filter(|(k, _)| k.starts_with(&prefixe)) {
+                settings.delete(cle)?;
+            }
+        }
+
+        let sql = format!("DELETE FROM artists WHERE id = {}", self.marque(1));
+        let params: [&dyn ToSqlValue; 1] = [&doublon];
+        self.db.execute(&sql, &params)?;
+        tracing::info!(
+            cible,
+            doublon,
+            albums,
+            pistes,
+            credits,
+            marqueurs,
+            textes_recales,
+            champs_repris,
+            "artiste_absorbe"
+        );
+        Ok(RapportDAbsorptionArtiste {
+            cible,
+            doublon,
+            albums,
+            pistes,
+            credits,
+            marqueurs,
+            textes_recales,
+            champs_repris,
+        })
+    }
+
+    fn marque(&self, n: usize) -> String {
+        match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(n),
+            Engine::Postgres => PostgresDialect.placeholder(n),
+        }
     }
 
     pub fn delete(&self, id: i64) -> Result<(), TuneError> {
@@ -1535,5 +1727,111 @@ mod tests {
         let repo = ArtistRepo::with_backend(backend);
         let id = repo.create(&Artist::new("X".into())).unwrap();
         assert!(repo.get(id).unwrap().is_some());
+    }
+
+    /// BIB-C1 (phase 1) : l'absorption reprend ce que la cible n'a pas,
+    /// recale les textes sur la graphie survivante, et la clé C2 empêche la
+    /// graphie perdante de renaître — sans table d'alias.
+    #[test]
+    fn absorber_un_homographe_et_la_graphie_perdante_ne_renait_pas() {
+        let db = test_db();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ArtistRepo::new(db.clone());
+        let cible = repo
+            .create(&Artist {
+                id: None,
+                name: "Etienne Daho".to_string(),
+                sort_name: None,
+                musicbrainz_id: None,
+                discogs_id: None,
+                bio: None,
+                image_path: None,
+                image_source: None,
+            })
+            .unwrap();
+        let doublon = repo
+            .create(&Artist {
+                id: None,
+                name: "Étienne Daho".to_string(),
+                sort_name: None,
+                musicbrainz_id: Some("mbid-daho".to_string()),
+                discogs_id: None,
+                bio: Some("Né à Oran.".to_string()),
+                image_path: None,
+                image_source: None,
+            })
+            .unwrap();
+        {
+            let conn = db.connection().lock().unwrap();
+            conn.execute_batch(&format!(
+                "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Pop Satori', {cible}), (2, 'Eden', {doublon});\
+                 INSERT INTO tracks (id, title, album_id, artist_id, album_artist, file_path) VALUES \
+                   (1, 'Duel au soleil', 1, {cible}, 'Etienne Daho', '/m/pop/01.flac'),\
+                   (2, 'Des attractions désastre', 2, {doublon}, 'Étienne Daho', '/m/eden/01.flac');\
+                 INSERT INTO track_credits (track_id, artist_id, artist_name, role) VALUES (2, {doublon}, 'Étienne Daho', 'performer');\
+                 INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'artist', {doublon});"
+            ))
+            .unwrap();
+        }
+        settings
+            .set("cache:artistbio:Étienne Daho:fr", "{}")
+            .unwrap();
+
+        let rapport = repo.absorber(cible, doublon).unwrap();
+        assert_eq!((rapport.albums, rapport.pistes, rapport.credits), (1, 1, 1));
+        assert_eq!(
+            rapport.textes_recales, 2,
+            "album_artist et artist_name recalés"
+        );
+        assert!(
+            rapport.champs_repris >= 2,
+            "MBID et biographie repris : {rapport:?}"
+        );
+
+        let survivant = repo.get(cible).unwrap().unwrap();
+        assert_eq!(
+            survivant.name, "Etienne Daho",
+            "la graphie de la cible ne change pas"
+        );
+        assert_eq!(survivant.musicbrainz_id.as_deref(), Some("mbid-daho"));
+        assert_eq!(survivant.bio.as_deref(), Some("Né à Oran."));
+        assert!(
+            repo.get(doublon).unwrap().is_none(),
+            "la fiche perdante disparaît"
+        );
+        assert_eq!(
+            settings.get("cache:artistbio:Étienne Daho:fr").unwrap(),
+            None
+        );
+        {
+            let conn = db.connection().lock().unwrap();
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM tracks WHERE artist_id = {cible} AND album_artist = 'Etienne Daho'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                n, 2,
+                "les deux pistes portent l'artiste et la graphie survivants"
+            );
+            let fav: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM favorites WHERE item_type = 'artist' AND item_id = {cible}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(fav, 1, "le favori suit");
+        }
+
+        // Pas de renaissance : la graphie perdante retombe sur le survivant.
+        let avant = repo.count().unwrap();
+        let retrouve = repo.get_or_create("Étienne Daho", None, None).unwrap();
+        assert_eq!(retrouve.id, Some(cible));
+        assert_eq!(repo.count().unwrap(), avant);
+        assert!(repo.absorber(cible, cible).is_err());
     }
 }
