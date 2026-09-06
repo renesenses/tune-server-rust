@@ -400,6 +400,9 @@ CREATE TABLE IF NOT EXISTS tracks (
     file_mtime REAL,
     file_size INTEGER,
     audio_hash TEXT,
+    -- BIB-B2 : empreinte du contenu audio décodé (`audio/empreinte.rs`),
+    -- versionnée (`env100ms-v1:<hex>`). NULL = pas encore calculée.
+    audio_fingerprint TEXT,
     source TEXT DEFAULT 'local',
     source_id TEXT,
     isrc TEXT,

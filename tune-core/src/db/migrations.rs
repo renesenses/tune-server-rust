@@ -1674,6 +1674,22 @@ WHERE name LIKE '%World%'
         // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84 et 94.
         up: "",
     },
+    Migration {
+        version: 96,
+        name: "tracks_audio_fingerprint",
+        // BIB-B2 : `tracks.audio_fingerprint`, l'empreinte du CONTENU audio
+        // decode (`audio/empreinte.rs`). `audio_hash` hache 64 Ko d'octets
+        // du conteneur et ne reconnait que la copie exacte ; deux encodages
+        // d'un meme master n'ont aucun octet en commun. L'empreinte, elle,
+        // se compare avec tolerance. Posee par la passe ReplayGain (le
+        // fichier vient d'etre decode) et par un rattrapage borne pour les
+        // pistes deja analysees. Versionnee dans la valeur ; NULL pour
+        // l'existant. TEXT des deux cotes : rien a rattraper en parite.
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2754,6 +2770,8 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "mac", "TEXT");
     // DUP-1 (phase 2) : derniere reponse de l'appareil, ISO 8601 UTC, NULL = jamais vue.
     add_column_if_missing(db, "zones", "last_seen_at", "TEXT");
+    // BIB-B2 : empreinte du contenu audio decode, versionnee (env100ms-v1:<hex>).
+    add_column_if_missing(db, "tracks", "audio_fingerprint", "TEXT");
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
@@ -3253,6 +3271,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         50,
         "zones_last_seen_at",
         include_str!("../../migrations/postgres/050_zones_last_seen_at.sql"),
+    ),
+    (
+        51,
+        "tracks_audio_fingerprint",
+        include_str!("../../migrations/postgres/051_tracks_audio_fingerprint.sql"),
     ),
 ];
 
@@ -4867,7 +4890,10 @@ mod tests {
         // `online` n'a qu'un etat ; la derniere reponse datee distingue une
         // zone eteinte d'une zone abandonnee. TEXT des deux cotes, NULL pour
         // l'existant.
-        assert_eq!(pg_latest_version(), 50, "latest PG migration must be 50");
+        // 51 : `tracks_audio_fingerprint` (BIB-B2). Jumelle SQLite : la 96.
+        // L'empreinte du contenu audio decode, versionnee, NULL pour
+        // l'existant ; TEXT des deux cotes.
+        assert_eq!(pg_latest_version(), 51, "latest PG migration must be 51");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
