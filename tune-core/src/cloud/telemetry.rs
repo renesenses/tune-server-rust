@@ -84,15 +84,6 @@ impl TelemetryReporter {
         }
 
         let settings = SettingsRepo::with_backend(db.clone());
-        if let Some(backoff) = rate_limit::active(&settings, CloudScope::Telemetry) {
-            warn!(
-                scope = backoff.scope,
-                until_epoch = backoff.until_epoch,
-                retry_after_seconds = backoff.retry_after_seconds,
-                "telemetry_deferred_rate_limit"
-            );
-            return;
-        }
         let server_id = Self::get_or_create_server_id(&settings);
 
         // Collect connected service names (authenticated == true)
@@ -145,26 +136,36 @@ impl TelemetryReporter {
             }
         };
 
-        match client.post(HEARTBEAT_URL).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
+        // CLD-2 : un seul chemin d'appel borné — la portée retenue ne part pas
+        // (le battement est quotidien : relire quelques compteurs avant de
+        // s'abstenir ne coûte rien), un 429 mémorise son échéance.
+        match rate_limit::appeler(
+            &settings,
+            CloudScope::Telemetry,
+            client.post(HEARTBEAT_URL).json(&payload),
+        )
+        .await
+        {
+            rate_limit::AppelCloud::Retenu(backoff) => {
+                warn!(
+                    scope = backoff.scope,
+                    until_epoch = backoff.until_epoch,
+                    retry_after_seconds = backoff.retry_after_seconds,
+                    "telemetry_deferred_rate_limit"
+                );
+            }
+            rate_limit::AppelCloud::Reponse(resp) if resp.status().is_success() => {
                 info!(
                     tracks = payload.tracks_count,
                     services = ?payload.services,
                     "telemetry_heartbeat_sent"
                 );
             }
-            Ok(resp) => {
+            rate_limit::AppelCloud::Reponse(resp) => {
                 let status = resp.status();
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    rate_limit::defer_from_headers(
-                        &settings,
-                        CloudScope::Telemetry,
-                        resp.headers(),
-                    );
-                }
                 warn!(status = %status, "telemetry_heartbeat_rejected");
             }
-            Err(e) => {
+            rate_limit::AppelCloud::Erreur(e) => {
                 warn!(error = %e, "telemetry_heartbeat_failed");
             }
         }
