@@ -325,6 +325,8 @@ pub fn router() -> Router<AppState> {
             get(list_zones).post(create_zone).delete(delete_all_zones),
         )
         .route("/{id}", get(get_zone).patch(patch_zone).delete(delete_zone))
+        // DUP-1 (phase 1) : fusion explicite de deux zones du même appareil.
+        .route("/{id}/fusionner-dans/{cible}", post(fusionner_zones))
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
@@ -377,6 +379,8 @@ pub use lecture::*;
 
 #[cfg(test)]
 mod debit_de_zone_tests;
+#[cfg(test)]
+mod fusion_tests;
 
 pub async fn create_zone_handler(
     state: State<AppState>,

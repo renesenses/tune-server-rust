@@ -906,6 +906,83 @@ pub(super) async fn delete_zone(
     }
 }
 
+/// `POST /zones/{doublon}/fusionner-dans/{cible}` — DUP-1, phase 1.
+///
+/// La phase 0 (`zones_doublons` dans `/system/diagnostics`) nomme les zones
+/// qui désignent probablement le même appareil ; ici l'utilisateur tranche,
+/// et le serveur vérifie avant d'agir : les deux zones doivent avoir la même
+/// clé d'appareil (`cle_appareil`, la règle de la phase 0), et aucune ne doit
+/// être en lecture. Rien n'est automatique : le ré-ancrage silencieux a déjà
+/// coûté une zone Apple TV devenue Sonos (13/08).
+///
+/// Réponses : `200` avec le bilan de [`ZoneRepo::fusionner`] ; `404` zone
+/// inconnue ; `400` même zone des deux côtés ; `409 zones_distinctes` ou
+/// `409 zone_en_lecture`.
+pub(super) async fn fusionner_zones(
+    State(state): State<AppState>,
+    Path((doublon, cible)): Path<(i64, i64)>,
+) -> impl IntoResponse {
+    use crate::routes::system::diagnostics::{cle_appareil, zone_vue};
+    if doublon == cible {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "meme_zone", "message": "une zone ne se fusionne pas dans elle-même"})),
+        )
+            .into_response();
+    }
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let (Ok(Some(zone_doublon)), Ok(Some(zone_cible))) = (repo.get(doublon), repo.get(cible))
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "zone_inconnue"})),
+        )
+            .into_response();
+    };
+    let appareils = state.scanner.devices().await;
+    let cle = |z: &Zone| zone_vue(z).and_then(|vue| cle_appareil(&vue, &appareils));
+    let (cle_doublon, cle_cible) = (cle(&zone_doublon), cle(&zone_cible));
+    if cle_doublon.is_none() || cle_doublon != cle_cible {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "zones_distinctes",
+                "message": "les deux zones ne désignent pas le même appareil : la fusion est refusée",
+                "cles": [cle_doublon, cle_cible],
+            })),
+        )
+            .into_response();
+    }
+    for id in [doublon, cible] {
+        if matches!(state.playback.get_state(id).await.state, PlayState::Playing) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "zone_en_lecture", "zone_id": id})),
+            )
+                .into_response();
+        }
+    }
+    match repo.fusionner(doublon, cible) {
+        Ok(rapport) => {
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::ZoneDeleted,
+                json!({"id": doublon}),
+            );
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::ZoneUpdated,
+                json!({"id": cible}),
+            );
+            info!(doublon, cible, "zones_fusionnees");
+            (StatusCode::OK, Json(json!(rapport))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "fusion_echouee", "message": e})),
+        )
+            .into_response(),
+    }
+}
+
 pub(super) async fn update_volume(
     State(state): State<AppState>,
     Path(id): Path<i64>,
