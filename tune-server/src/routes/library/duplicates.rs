@@ -623,6 +623,99 @@ pub(super) async fn smart_duplicates(
     })))
 }
 
+/// BIB-B2 (phase D) : où en est l'empreinte, et la rattraper À LA DEMANDE.
+///
+/// L'empreinte est posée par la passe ReplayGain, puis rattrapée en arrière-plan
+/// par petits lots, seulement quand rien ne joue. Pour la calibrer sur une vraie
+/// bibliothèque, il faut lire sa couverture et pouvoir forcer le rattrapage sans
+/// attendre le créneau : c'est ce que rendent ces deux portes. Le rattrapage
+/// forcé reste borné (`max` lots, 40 au plus) et respecte les mêmes gardes que
+/// le fond (analyse désactivée, zone en lecture ⇒ le lot s'arrête).
+pub(super) async fn couverture_empreintes(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let version = tune_core::audio::empreinte::VERSION;
+    let motif = format!("{version}:%");
+    let marque = format!("{version}:-");
+    let sql = "SELECT COUNT(*), \
+               SUM(CASE WHEN audio_fingerprint LIKE ? AND audio_fingerprint != ? THEN 1 ELSE 0 END), \
+               SUM(CASE WHEN audio_fingerprint = ? THEN 1 ELSE 0 END), \
+               SUM(CASE WHEN LOWER(COALESCE(format, '')) IN ('dsd', 'dsf', 'dff', 'dsdiff') THEN 1 ELSE 0 END) \
+               FROM tracks WHERE file_path IS NOT NULL AND file_path != ''";
+    let ligne = match state.backend.query_one(
+        sql,
+        &[
+            &motif as &dyn ToSqlValue,
+            &marque as &dyn ToSqlValue,
+            &marque as &dyn ToSqlValue,
+        ],
+    ) {
+        Ok(ligne) => ligne,
+        Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+            return Ok(Json(json!({ "disponible": false, "version": version })));
+        }
+        Err(e) => {
+            return Err(AppError::internal(format!(
+                "couverture des empreintes : {e}"
+            )));
+        }
+    };
+    let n = |i: usize| {
+        ligne
+            .as_ref()
+            .and_then(|l| l.get(i))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    };
+    let candidates =
+        tune_core::audio::replaygain::compter_les_candidats_a_empreinter(&state.backend)
+            .unwrap_or(0);
+    let groupes = doublons_par_contenu(&state, i64::MAX, 0).len();
+    Ok(Json(json!({
+        "disponible": true,
+        "version": version,
+        "pistes": n(0),
+        "avec_empreinte": n(1),
+        "marquees_silence_ou_indecodable": n(2),
+        "dsd_exclues": n(3),
+        "candidates": candidates,
+        "groupes_par_contenu": groupes,
+        "analyse_active": tune_core::audio::replaygain::analysis_enabled(&state.backend),
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ParamsEmpreinte {
+    /// Nombre de lots à traiter maintenant (25 pistes par lot) ; 4 par défaut, 40 au plus.
+    max: Option<usize>,
+}
+
+pub(super) async fn empreinter_maintenant(
+    State(state): State<AppState>,
+    Query(p): Query<ParamsEmpreinte>,
+) -> Result<Json<Value>, AppError> {
+    let max = p.max.unwrap_or(4).min(40);
+    let mut lots = 0usize;
+    let mut traitees = 0usize;
+    while lots < max {
+        let n = tune_core::audio::replaygain::empreinter_un_lot(&state.backend).await;
+        lots += 1;
+        traitees += n;
+        if n == 0 {
+            break;
+        }
+    }
+    let restantes =
+        tune_core::audio::replaygain::compter_les_candidats_a_empreinter(&state.backend)
+            .unwrap_or(0);
+    Ok(Json(json!({
+        "lots": lots,
+        "traitees": traitees,
+        "restantes": restantes,
+        "analyse_active": tune_core::audio::replaygain::analysis_enabled(&state.backend),
+    })))
+}
+
 #[derive(Deserialize)]
 pub(super) struct ScanParams {
     /// Plafond de pistes examinées. 0 (défaut) = toute la bibliothèque.
@@ -674,5 +767,7 @@ pub(super) async fn scan_duplicates(
 
 #[cfg(test)]
 pub(super) mod tests_contenu;
+#[cfg(test)]
+mod tests_empreintes;
 #[cfg(test)]
 mod tests_paires;
