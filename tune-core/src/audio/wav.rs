@@ -31,7 +31,7 @@ pub fn build_wav_header_bounded_live(channels: u16, sample_rate: u32, bit_depth:
 
 /// Build a 44-byte WAV header. When `duration_ms` is provided, the header
 /// contains the correct data size so DLNA renderers don't need to probe
-/// the stream end. Falls back to [`UNKNOWN_DATA_SIZE`] for unknown-length
+/// the stream end. Falls back to `UNKNOWN_DATA_SIZE` for unknown-length
 /// streams.
 pub fn build_wav_header(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
     build_wav_header_with_duration(channels, sample_rate, bit_depth, None)

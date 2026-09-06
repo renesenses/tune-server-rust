@@ -55,7 +55,7 @@ impl AudioEncoder {
         self.start_sync()
     }
 
-    /// Synchronous body of [`start`]. Encoding is pure CPU work (native FLAC /
+    /// Synchronous body of [`start`](Self::start). Encoding is pure CPU work (native FLAC /
     /// WAV, no I/O or await points), so it can run directly on a blocking
     /// thread without a Tokio runtime. Call this from inside `spawn_blocking`
     /// instead of driving the async method with a nested `Handle::block_on`,
@@ -135,7 +135,7 @@ impl AudioEncoder {
         self.finish_sync()
     }
 
-    /// Synchronous body of [`finish`] — see [`start_sync`](Self::start_sync).
+    /// Synchronous body of [`finish`](Self::finish) — see [`start_sync`](Self::start_sync).
     pub fn finish_sync(&mut self) -> Result<Vec<u8>, String> {
         // FLAC streaming path
         if let Some(state) = self.flac_state.take() {

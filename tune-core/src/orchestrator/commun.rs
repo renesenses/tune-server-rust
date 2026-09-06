@@ -277,7 +277,7 @@ impl PlaybackOrchestrator {
     /// de réglages les écrit : la base.
     ///
     /// #1770 (point 3) — la sortie reconstruite à la volée par
-    /// [`Self::recreate_local_and_play`] les codait en dur (`false`,
+    /// `Self::recreate_local_and_play` les codait en dur (`false`,
     /// `"auto"`). Conséquence, sur Windows et macOS — les seules plateformes
     /// qui ont un chemin exclusif ([`crate::outputs::local`],
     /// `exclusive_mode_support`) : un DAC éteint au démarrage, ou retiré par

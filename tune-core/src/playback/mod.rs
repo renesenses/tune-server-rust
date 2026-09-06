@@ -157,7 +157,7 @@ pub struct ZoneState {
     /// fin de la piste.
     ///
     /// Ce compteur borne le mensonge : après
-    /// [`OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER`] observations consécutives sous
+    /// `OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER` observations consécutives sous
     /// le plancher, c'est le renderer qui a raison et le plancher cède. Remis à
     /// zéro par toute observation qui progresse, et par toute commande.
     ///
@@ -1076,7 +1076,7 @@ impl PlaybackManager {
     /// garde `stale_start_position`, si bien qu'un renderer qui rejoue la
     /// position de la session précédente (DMP-A6/A8) peut relever le plancher
     /// d'un coup. [`ZoneState::reculs_de_position`] borne ce mensonge : après
-    /// [`OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER`] observations consécutives sous
+    /// `OBSERVATIONS_EN_RECUL_AVANT_DE_CEDER` observations consécutives sous
     /// le plancher, le renderer a raison et le plancher cède. La garde
     /// n'immobilise donc jamais le curseur durablement.
     ///

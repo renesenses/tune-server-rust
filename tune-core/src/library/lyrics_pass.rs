@@ -379,7 +379,7 @@ pub fn run_local_index(
 
 /// Pourquoi une requête LRCLIB a échoué. Le distinguo est ce qui décide de la
 /// suite : un « ralentis » arrête la passe net, une panne de transport ne
-/// l'arrête qu'après [`MAX_CONSECUTIVE_FAILURES`] d'affilée.
+/// l'arrête qu'après `MAX_CONSECUTIVE_FAILURES` d'affilée.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchFailure {
     /// HTTP 429 / 503 — le service demande explicitement qu'on s'arrête.
@@ -797,8 +797,8 @@ pub struct ExportCandidate {
 ///
 /// Le prédicat d'exclusion suit la cible, et c'est ce qui rend la passe
 /// reprenable : en `.lrc` on écarte celles qui ont déjà un `.lrc`
-/// ([`HAS_LRC`]), en étiquette celles qui ont déjà une étiquette
-/// ([`HAS_TAG`]). Écrire l'un n'empêche donc jamais d'écrire l'autre plus
+/// (`HAS_LRC`), en étiquette celles qui ont déjà une étiquette
+/// (`HAS_TAG`). Écrire l'un n'empêche donc jamais d'écrire l'autre plus
 /// tard.
 pub fn export_candidates(
     db: &Arc<dyn DbBackend>,

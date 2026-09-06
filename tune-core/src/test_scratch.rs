@@ -30,7 +30,7 @@
 //! précisément le test **qui échoue** qui laisse le plus de résidus, et la
 //! panique saute la dernière ligne.
 //!
-//! D'où [`ScratchDir`] : le dossier est supprimé par `Drop`, donc aussi
+//! D'où `ScratchDir` : le dossier est supprimé par `Drop`, donc aussi
 //! pendant le déroulage de pile d'une panique. L'appelant n'a plus rien à
 //! écrire — et n'a plus rien à oublier.
 //!

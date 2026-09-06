@@ -17,7 +17,7 @@
 //!
 //! Le prix de cette règle est le faux positif : un nom peut contenir un
 //! fragment sensible sans porter de secret. Ces cas sont nommés un par un dans
-//! [`EXCEPTIONS`], avec leur lecteur, parce que masquer une valeur que
+//! `EXCEPTIONS`, avec leur lecteur, parce que masquer une valeur que
 //! l'interface lit casse un écran sans aucun message d'erreur.
 
 use serde_json::Value;
