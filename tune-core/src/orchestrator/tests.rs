@@ -706,12 +706,12 @@ use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::streaming::registry::ServiceRegistry;
 
 use super::{
-    PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, is_network_output_type,
-    is_pull_dsp_output_type, is_push_uri_output_type, message_session_perdue,
-    passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, replay_needs_output_seek,
-    reprise_de_session, reprise_toujours_la_notre, requete_de_retablissement,
-    spawn_streaming_dsp_relay, streaming_needs_pretranscode, streaming_pretranscode_format,
-    use_file_transcode_for,
+    PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, cible_wav_pour_traitement,
+    is_network_output_type, is_pull_dsp_output_type, is_push_uri_output_type,
+    message_session_perdue, passthrough_didl_duration_ms, pull_output_needs_dsp_transcode,
+    replay_needs_output_seek, reprise_de_session, reprise_toujours_la_notre,
+    requete_de_retablissement, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
+    streaming_pretranscode_format, use_file_transcode_for,
 };
 
 #[test]
@@ -891,6 +891,87 @@ fn un_traitement_actif_ne_ramene_plus_au_fichier_quand_la_cible_est_wav() {
     assert!(use_file_transcode_for(true, false, false, false, true));
     // Renderer LPCM sans bascule streaming : le fichier WAV, comme avant.
     assert!(use_file_transcode_for(true, true, true, false, false));
+}
+
+/// LAT-F1 (phase 1) — la cible WAV « pour traitement » exige les CINQ
+/// conditions : traitement actif, zone réseau, source non DSD, opt-in armé,
+/// renderer qui a annoncé le LPCM. En retirer une seule rend au fichier.
+#[test]
+fn la_cible_wav_pour_traitement_exige_les_cinq_conditions() {
+    assert!(cible_wav_pour_traitement(true, true, false, true, true));
+    // Sans traitement : rien à faire au fil de l'eau.
+    assert!(!cible_wav_pour_traitement(false, true, false, true, true));
+    // Zone locale / navigateur : déjà WAV par leurs propres branches.
+    assert!(!cible_wav_pour_traitement(true, false, false, true, true));
+    // DSD : sa branche WAV progressive existe déjà, on n'y touche pas.
+    assert!(!cible_wav_pour_traitement(true, true, true, true, true));
+    // Sans opt-in : à froid, rien ne change de format.
+    assert!(!cible_wav_pour_traitement(true, true, false, false, true));
+    // Renderer sans LPCM annoncé (ou sonde inconcluante) : le fichier.
+    assert!(!cible_wav_pour_traitement(true, true, false, true, false));
+}
+
+/// LAT-F1 (phase 1), de bout en bout sur la DÉCISION : une zone DLNA avec
+/// égaliseur, un FLAC 16 bits, l'opt-in armé — la cible est le WAV servi en
+/// session progressive, non le FLAC ré-encodé par le fichier. Sans opt-in,
+/// tout reste comme avant (#3357). Une sortie ABSENTE du registre est
+/// présumée capable (comme pour `dlna_supports_mime`) ; une sortie sans Sink
+/// rend au fichier.
+#[tokio::test]
+async fn une_zone_dlna_avec_egaliseur_part_en_wav_progressif_sur_opt_in() {
+    // Montage à la main, et non par `zone_qui_joue_un_flac` : cette aide
+    // ENREGISTRE une `MockOutput` sous le périphérique de la zone, et une
+    // sortie qui n'est pas un `DlnaOutput` n'a pas de Sink à lire — la
+    // sonde répondrait non avant même l'opt-in. Ici la sortie est absente
+    // du registre : présumée capable, comme pour `dlna_supports_mime`.
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Salon", Some("dlna"), Some("uuid:salon-3357"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(
+            &format!("zone_{zone_id}_eq_profile"),
+            &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+        )
+        .unwrap();
+    let req = requete_locale_3234(zone_id, 1);
+
+    // Sans opt-in : FLAC ré-encodé, servi par le fichier — comme avant.
+    let avant = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(avant.out_mime, "audio/flac");
+    assert!(
+        avant.use_file_transcode,
+        "sans opt-in, le fichier reste la voie"
+    );
+
+    // Opt-in armé : WAV en session progressive, avec le traitement au fil de l'eau.
+    settings.set("dsp_progressif_reseau", "true").unwrap();
+    let apres = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(apres.out_mime, "audio/wav");
+    assert_eq!(apres.out_ext, "wav");
+    assert_eq!(
+        apres.out_bd, 16,
+        "un FLAC 16 bits part en 16 bits, pas gonflé"
+    );
+    assert!(
+        !apres.use_file_transcode,
+        "la cible WAV part en session, pas par le fichier"
+    );
+
+    // Une sortie enregistrée qui n'est PAS un renderer DLNA n'a pas de Sink :
+    // pas de LPCM annoncé, donc retour au fichier malgré l'opt-in.
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("uuid:salon-3357", "Salon").with_type("dlna"),
+    ));
+    let sans_sink = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(sans_sink.out_mime, "audio/flac");
+    assert!(sans_sink.use_file_transcode);
 }
 
 /// #2863 — le bras streaming HTTPS servait les octets du CDN VERBATIM dès

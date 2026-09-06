@@ -27,6 +27,57 @@ struct Directe<'a> {
 }
 
 impl PlaybackOrchestrator {
+    /// LAT-F1 (phase 1) : le renderer a-t-il ANNONCÉ le LPCM à la profondeur
+    /// qu'on lui servirait ? `hi_res` = plus de 16 bits, auquel cas
+    /// `audio/L16` seul ne suffit pas — un WAV 24 bits servi à un renderer
+    /// qui n'a annoncé que du 16 bits lit des échantillons désalignés et
+    /// joue du SILENCE (#1137, Ruark R3).
+    ///
+    /// Mêmes conventions que `dlna_supports_mime` : une sortie absente du
+    /// registre est présumée capable (elle n'est pas là pour dire le
+    /// contraire), une sortie qui n'est pas un `DlnaOutput` n'a pas de Sink à
+    /// lire donc répond NON, et une sonde inconcluante répond NON sans être
+    /// mise en cache — la lecture suivante re-sonde. Les réponses concluantes
+    /// sont mémorisées par renderer : une sonde SOAP par session, pas par
+    /// morceau.
+    pub(super) async fn dlna_accepte_lpcm(&self, device_id: &str, hi_res: bool) -> bool {
+        let cle = format!("{device_id}|{}", if hi_res { "24" } else { "16" });
+        if let Some(connu) = self.dlna_lpcm_accepte.lock().await.get(&cle) {
+            return *connu;
+        }
+        let arc = { self.outputs.lock().await.get(device_id) };
+        let Some(output) = arc else {
+            return true;
+        };
+        let caps = {
+            let locked = output.lock().await;
+            let Some(dlna) = locked
+                .as_any()
+                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+            else {
+                return false;
+            };
+            dlna.probe_capabilities().await
+        };
+        if !caps.probed {
+            return false;
+        }
+        let accepte = caps.wav || caps.lpcm24 || (!hi_res && caps.lpcm16);
+        tracing::info!(
+            device_id,
+            hi_res,
+            accepte,
+            wav = caps.wav,
+            lpcm16 = caps.lpcm16,
+            lpcm24 = caps.lpcm24,
+            "dlna_lpcm_capability_probed"
+        );
+        self.dlna_lpcm_accepte.lock().await.insert(cle, accepte);
+        accepte
+    }
+}
+
+impl PlaybackOrchestrator {
     /// Check whether a DLNA renderer supports a given MIME type by querying
     /// its ConnectionManager GetProtocolInfo Sink.  Results are cached per
     /// device_id so the SOAP call only happens once per renderer per session.

@@ -43,6 +43,7 @@ const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
     ("resample_policy", || json!("none")),
     ("prefetch_mode", || json!("30s")),
     ("dsd_lpcm_stream", || json!(false)),
+    ("dsp_progressif_reseau", || json!(false)),
     ("auth_enabled", || json!(false)),
 ];
 
