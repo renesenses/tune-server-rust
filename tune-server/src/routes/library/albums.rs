@@ -20,7 +20,7 @@ use tune_core::db::rating_repo::RatingRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
 
-use super::Pagination;
+use super::{Pagination, refus};
 
 #[derive(Deserialize)]
 pub(super) struct AlbumFilters {
@@ -1147,10 +1147,6 @@ fn dossiers_de_l_album(state: &AppState, album_id: i64) -> std::collections::BTr
         .map(|chemin| dossier_de(&chemin).to_string())
         .filter(|d| !d.is_empty())
         .collect()
-}
-
-fn refus(code: StatusCode, erreur: &str, message: String) -> axum::response::Response {
-    (code, Json(json!({ "error": erreur, "message": message }))).into_response()
 }
 
 /// `POST /library/albums/{cible}/absorber/{doublon}` — BIB-A2, phase 1.

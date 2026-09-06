@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::absorption::{self, table_absente};
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Album;
@@ -513,11 +514,6 @@ pub struct RapportDAbsorption {
     pub champs_repris: usize,
 }
 
-/// Une base ancienne ou partielle : la table ou la colonne n'existe pas.
-fn table_absente(e: &str) -> bool {
-    e.contains("no such table") || e.contains("no such column") || e.contains("does not exist")
-}
-
 pub struct AlbumRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -682,25 +678,8 @@ impl AlbumRepo {
             "musicbrainz_release_group_id",
             "folder_path",
         ];
-        let (p1, p2, p3) = (self.marque(1), self.marque(2), self.marque(3));
-        let params: [&dyn ToSqlValue; 3] = [&doublon, &cible, &doublon];
-        let mut repris = 0usize;
-        for champ in CHAMPS {
-            let sql = format!(
-                "UPDATE albums SET {champ} = (SELECT d.{champ} FROM albums d WHERE d.id = {p1}) \
-                 WHERE id = {p2} AND ({champ} IS NULL OR CAST({champ} AS TEXT) = '') \
-                   AND EXISTS (SELECT 1 FROM albums d WHERE d.id = {p3} \
-                               AND d.{champ} IS NOT NULL AND CAST(d.{champ} AS TEXT) <> '')"
-            );
-            match self.db.execute(&sql, &params) {
-                Ok(n) => repris += n,
-                Err(e) if table_absente(&e) => {
-                    tracing::debug!(champ, error = %e, "album_absorption_champ_absent");
-                }
-                Err(e) => return Err(TuneError::from(e)),
-            }
-        }
-        Ok(repris)
+        absorption::reprendre_les_champs_vides(&*self.db, "albums", &CHAMPS, cible, doublon)
+            .map_err(TuneError::from)
     }
 
     /// `UPDATE {table} SET {colonne} = cible WHERE {colonne} = doublon [AND filtre]`,
@@ -713,21 +692,8 @@ impl AlbumRepo {
         cible: i64,
         doublon: i64,
     ) -> Result<usize, TuneError> {
-        let filtre = filtre.map(|f| format!(" AND {f}")).unwrap_or_default();
-        let sql = format!(
-            "UPDATE {table} SET {colonne} = {} WHERE {colonne} = {}{filtre}",
-            self.marque(1),
-            self.marque(2)
-        );
-        let params: [&dyn ToSqlValue; 2] = [&cible, &doublon];
-        match self.db.execute(&sql, &params) {
-            Ok(n) => Ok(n),
-            Err(e) if table_absente(&e) => {
-                tracing::debug!(table, error = %e, "album_absorption_table_absente");
-                Ok(0)
-            }
-            Err(e) => Err(TuneError::from(e)),
-        }
+        absorption::repointer(&*self.db, table, colonne, filtre, cible, doublon)
+            .map_err(TuneError::from)
     }
 
     /// Même chose pour une table à clé unique `(colonne, discriminant)` : la
@@ -743,19 +709,16 @@ impl AlbumRepo {
         cible: i64,
         doublon: i64,
     ) -> Result<usize, TuneError> {
-        let f = filtre.map(|f| format!(" AND {f}")).unwrap_or_default();
-        let (p1, p2) = (self.marque(1), self.marque(2));
-        let purge = format!(
-            "DELETE FROM {table} WHERE {colonne} = {p1}{f} AND {discriminant} IN \
-             (SELECT {discriminant} FROM {table} WHERE {colonne} = {p2}{f})"
-        );
-        let params: [&dyn ToSqlValue; 2] = [&doublon, &cible];
-        match self.db.execute(&purge, &params) {
-            Ok(_) => {}
-            Err(e) if table_absente(&e) => return Ok(0),
-            Err(e) => return Err(TuneError::from(e)),
-        }
-        self.repointer(table, colonne, filtre, cible, doublon)
+        absorption::repointer_a_cle_unique(
+            &*self.db,
+            table,
+            colonne,
+            discriminant,
+            filtre,
+            cible,
+            doublon,
+        )
+        .map_err(TuneError::from)
     }
 
     /// Les dossiers de l'utilisateur (`settings['collections']`, liste JSON de

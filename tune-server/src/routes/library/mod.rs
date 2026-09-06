@@ -170,6 +170,19 @@ pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("artwork_cache")
 }
 
+/// Une réponse de refus uniforme pour les opérations explicites de la
+/// bibliothèque (absorptions d'albums et d'artistes).
+pub(super) fn refus(
+    code: axum::http::StatusCode,
+    erreur: &str,
+    message: String,
+) -> axum::response::Response {
+    axum::response::IntoResponse::into_response((
+        code,
+        axum::Json(serde_json::json!({ "error": erreur, "message": message })),
+    ))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/artists", get(artists::list_artists))
@@ -183,6 +196,11 @@ pub fn router() -> Router<AppState> {
         .route("/artists/{id}/similar", get(artists::artist_similar))
         .route("/artists/{id}/metadata", get(artists::artist_metadata))
         .route("/artists/doublons", get(artists::artists_doublons))
+        // BIB-C1 (phase 1) : un artiste absorbe son homographe, à la demande.
+        .route(
+            "/artists/{cible}/absorber/{doublon}",
+            post(artists::absorber_artiste),
+        )
         .route(
             "/albums",
             get(albums::list_albums).post(albums::create_album),
