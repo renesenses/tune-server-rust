@@ -237,7 +237,7 @@ pub(crate) struct ZoneVue {
     pub(crate) online: bool,
 }
 
-fn zone_vue(z: &tune_core::db::zone_repo::Zone) -> Option<ZoneVue> {
+pub(crate) fn zone_vue(z: &tune_core::db::zone_repo::Zone) -> Option<ZoneVue> {
     Some(ZoneVue {
         id: z.id?,
         name: z.name.clone(),
