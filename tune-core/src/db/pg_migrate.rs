@@ -377,7 +377,8 @@ CREATE TABLE IF NOT EXISTS zones (
     aac_passthrough TEXT DEFAULT 0,
     dlna_lpcm TEXT DEFAULT 0,
     dlna_cap_16bit TEXT DEFAULT 0,
-    lyrics_offset_ms TEXT DEFAULT 0
+    lyrics_offset_ms TEXT DEFAULT 0,
+    last_seen_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
@@ -873,6 +874,7 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS alac_passthrough TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS aac_passthrough TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_lpcm TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_seen_at TEXT;
 
 -- listen_history: streaming source id + album id + profile scoping (v32/v37/v45)
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;
