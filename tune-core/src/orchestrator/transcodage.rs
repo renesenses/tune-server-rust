@@ -318,6 +318,14 @@ pub(super) async fn transcode_source_to_file(
     dest: String,
     progres: Option<std::sync::Arc<crate::audio::decode_progress::DecodeProgress>>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
+    // LAT-F1 (phase 2a) : le chemin fichier reste le seul où le renderer
+    // attend le morceau ENTIER (cible FLAC, Content-Length exigé). Avant de
+    // le pipeliner, savoir OÙ passent les 46 à 62 s mesurés sur une zone DLNA
+    // avec égaliseur (#3357) : décodage, traitement, encodage ou écriture.
+    // Une seule ligne de journal à la fin, `transcode_to_temp_file_stages`,
+    // que le terrain lira sur le .18 avant qu'on décide quoi pipeliner.
+    let chrono = std::time::Instant::now();
+    let dest_journal = dest.clone();
     // 1. Decode source to PCM (blocking I/O).
     let decoded = tokio::task::spawn_blocking(move || {
         // La balise se pose SUR CE THREAD : c'est lui qui décode (#3140).
@@ -328,6 +336,7 @@ pub(super) async fn transcode_source_to_file(
     })
     .await
     .map_err(|e| format!("decode task panic: {e}"))??;
+    let decode_ms = chrono.elapsed().as_millis() as u64;
 
     let mut pcm_bytes = decoded.pcm_bytes();
     let mut actual_bd = decoded.bit_depth;
@@ -377,6 +386,7 @@ pub(super) async fn transcode_source_to_file(
         conv.process_pcm(&mut pcm_bytes, actual_bd);
     }
 
+    let traitement_ms = chrono.elapsed().as_millis() as u64 - decode_ms;
     // 2. Encode to the target format.
     let mut encoder = crate::audio::encoder::AudioEncoder::new(
         &target_fmt,
@@ -387,6 +397,7 @@ pub(super) async fn transcode_source_to_file(
     encoder.start().await?;
     encoder.write(&pcm_bytes).await?;
     let encoded_data = encoder.finish().await?;
+    let encode_ms = chrono.elapsed().as_millis() as u64 - decode_ms - traitement_ms;
 
     // 3. Write to `dest` (blocking I/O).
     let file_size = encoded_data.len() as u64;
@@ -396,6 +407,17 @@ pub(super) async fn transcode_source_to_file(
     })
     .await
     .map_err(|e| format!("write task panic: {e}"))??;
+    let total_ms = chrono.elapsed().as_millis() as u64;
+    info!(
+        dest = %dest_journal,
+        decode_ms,
+        traitement_ms,
+        encode_ms,
+        ecriture_ms = total_ms - decode_ms - traitement_ms - encode_ms,
+        total_ms,
+        octets = file_size,
+        "transcode_to_temp_file_stages"
+    );
 
     Ok((file_size, pcm_bytes, actual_bd))
 }
