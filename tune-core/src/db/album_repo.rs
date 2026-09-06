@@ -495,6 +495,29 @@ impl DrRange {
     }
 }
 
+/// Bilan d'une absorption (BIB-A2, phase 1) : ce qui a suivi le doublon
+/// jusqu'à l'album conservé.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RapportDAbsorption {
+    pub cible: i64,
+    pub doublon: i64,
+    /// Pistes rattachées à la cible.
+    pub pistes: usize,
+    /// Marqueurs repointés : favoris, masquages, étiquettes, notes,
+    /// métadonnées enrichies, signalements, historique d'écoute.
+    pub marqueurs: usize,
+    /// Dossiers (collections) dont la liste d'albums a été réécrite.
+    pub collections_reecrites: usize,
+    /// Champs de la cible restés vides et repris du doublon (pochette,
+    /// année, genre, label, identifiants MusicBrainz, dossier).
+    pub champs_repris: usize,
+}
+
+/// Une base ancienne ou partielle : la table ou la colonne n'existe pas.
+fn table_absente(e: &str) -> bool {
+    e.contains("no such table") || e.contains("no such column") || e.contains("does not exist")
+}
+
 pub struct AlbumRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -506,6 +529,295 @@ impl AlbumRepo {
 
     pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
+    }
+
+    fn marque(&self, n: usize) -> String {
+        match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(n),
+            Engine::Postgres => PostgresDialect.placeholder(n),
+        }
+    }
+
+    /// `cible` absorbe `doublon` (BIB-A2, phase 1) : tout ce qui désignait le
+    /// doublon désigne désormais la cible, puis la ligne du doublon disparaît.
+    ///
+    /// Les quatre « fusions » du dépôt (`merge-duplicates`, `/metadata/albums/
+    /// merge`, post-scan, maintenance) ne migrent que `tracks` : un favori, une
+    /// note, une étiquette ou un dossier posés sur le perdant meurent avec lui.
+    /// Ici, dans l'ordre : champs vides de la cible repris du doublon (une
+    /// pochette n'a pas de raison de disparaître), pistes, historique,
+    /// suggestions, notes et métadonnées (à clé unique : le doublon cède quand
+    /// la cible a déjà la sienne), favoris, masquages, étiquettes,
+    /// signalements, propositions, dossiers (`collections`, liste JSON dans
+    /// `settings`), paires distinctes qui le nommaient ; puis `DELETE`, puis
+    /// `track_count` et `folder_path` de la cible recalculés.
+    ///
+    /// L'appelant a établi que les deux albums sont le même disque (même
+    /// dossier, même titre normalisé, pas de paire déclarée distincte) : ce
+    /// n'est pas décidé ici, et jamais automatiquement.
+    pub fn absorber(&self, cible: i64, doublon: i64) -> Result<RapportDAbsorption, TuneError> {
+        if cible == doublon {
+            return Err(TuneError::from(
+                "un album ne s'absorbe pas lui-même".to_string(),
+            ));
+        }
+        if self.get(cible)?.is_none() {
+            return Err(TuneError::from(format!("album {cible} inconnu")));
+        }
+        if self.get(doublon)?.is_none() {
+            return Err(TuneError::from(format!("album {doublon} inconnu")));
+        }
+        let champs_repris = self.reprendre_les_champs_vides(cible, doublon)?;
+        let pistes = self.repointer("tracks", "album_id", None, cible, doublon)?;
+        let mut marqueurs = 0usize;
+        marqueurs += self.repointer("listen_history", "album_id", None, cible, doublon)?;
+        marqueurs += self.repointer("metadata_suggestions", "album_id", None, cible, doublon)?;
+        marqueurs += self.repointer_a_cle_unique(
+            "album_ratings",
+            "album_id",
+            "profile_id",
+            None,
+            cible,
+            doublon,
+        )?;
+        marqueurs +=
+            self.repointer_a_cle_unique("album_metadata", "album_id", "key", None, cible, doublon)?;
+        let album = Some("item_type = 'album'");
+        marqueurs += self.repointer_a_cle_unique(
+            "favorites",
+            "item_id",
+            "profile_id",
+            album,
+            cible,
+            doublon,
+        )?;
+        marqueurs += self.repointer_a_cle_unique(
+            "hidden_items",
+            "item_id",
+            "profile_id",
+            album,
+            cible,
+            doublon,
+        )?;
+        marqueurs +=
+            self.repointer_a_cle_unique("item_tags", "item_id", "tag_id", album, cible, doublon)?;
+        marqueurs += self.repointer(
+            "metadata_reports",
+            "entity_id",
+            Some("entity = 'album'"),
+            cible,
+            doublon,
+        )?;
+        marqueurs += self.repointer(
+            "metadata_proposals",
+            "local_id",
+            Some("entity = 'album'"),
+            cible,
+            doublon,
+        )?;
+        let collections_reecrites = self.reecrire_les_collections(cible, doublon)?;
+        self.oublier_les_paires_distinctes(doublon)?;
+
+        let (p1, p2) = (self.marque(1), self.marque(2));
+        let params_doublon: [&dyn ToSqlValue; 1] = [&doublon];
+        self.db.execute(
+            &format!("DELETE FROM albums WHERE id = {p1}"),
+            &params_doublon,
+        )?;
+        let params_cible: [&dyn ToSqlValue; 1] = [&cible];
+        self.db.execute(
+            &format!(
+                "UPDATE albums SET track_count = \
+                 (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id) WHERE id = {p1}"
+            ),
+            &params_cible,
+        )?;
+        if self.folder_path_of(cible)?.is_none() {
+            let premiere = self.db.query_one_strong(
+                &format!("SELECT file_path FROM tracks WHERE album_id = {p1} ORDER BY id LIMIT 1"),
+                &params_cible,
+            )?;
+            if let Some(dossier) = premiere
+                .and_then(|r| r.first().and_then(|v| v.as_string()))
+                .as_deref()
+                .and_then(crate::scanner::album_folder::album_folder)
+                .filter(|d| !d.is_empty())
+            {
+                let params: [&dyn ToSqlValue; 2] = [&dossier, &cible];
+                self.db.execute(
+                    &format!("UPDATE albums SET folder_path = {p1} WHERE id = {p2}"),
+                    &params,
+                )?;
+            }
+        }
+        tracing::info!(
+            cible,
+            doublon,
+            pistes,
+            marqueurs,
+            collections_reecrites,
+            champs_repris,
+            "album_absorbe"
+        );
+        Ok(RapportDAbsorption {
+            cible,
+            doublon,
+            pistes,
+            marqueurs,
+            collections_reecrites,
+            champs_repris,
+        })
+    }
+
+    /// Les champs de la cible restés vides prennent la valeur du doublon —
+    /// jamais l'inverse : un champ renseigné sur la cible ne cède pas.
+    fn reprendre_les_champs_vides(&self, cible: i64, doublon: i64) -> Result<usize, TuneError> {
+        const CHAMPS: [&str; 8] = [
+            "cover_path",
+            "year",
+            "original_year",
+            "genre",
+            "label",
+            "musicbrainz_release_id",
+            "musicbrainz_release_group_id",
+            "folder_path",
+        ];
+        let (p1, p2, p3) = (self.marque(1), self.marque(2), self.marque(3));
+        let params: [&dyn ToSqlValue; 3] = [&doublon, &cible, &doublon];
+        let mut repris = 0usize;
+        for champ in CHAMPS {
+            let sql = format!(
+                "UPDATE albums SET {champ} = (SELECT d.{champ} FROM albums d WHERE d.id = {p1}) \
+                 WHERE id = {p2} AND ({champ} IS NULL OR CAST({champ} AS TEXT) = '') \
+                   AND EXISTS (SELECT 1 FROM albums d WHERE d.id = {p3} \
+                               AND d.{champ} IS NOT NULL AND CAST(d.{champ} AS TEXT) <> '')"
+            );
+            match self.db.execute(&sql, &params) {
+                Ok(n) => repris += n,
+                Err(e) if table_absente(&e) => {
+                    tracing::debug!(champ, error = %e, "album_absorption_champ_absent");
+                }
+                Err(e) => return Err(TuneError::from(e)),
+            }
+        }
+        Ok(repris)
+    }
+
+    /// `UPDATE {table} SET {colonne} = cible WHERE {colonne} = doublon [AND filtre]`,
+    /// tolérant aux tables héritées absentes.
+    fn repointer(
+        &self,
+        table: &str,
+        colonne: &str,
+        filtre: Option<&str>,
+        cible: i64,
+        doublon: i64,
+    ) -> Result<usize, TuneError> {
+        let filtre = filtre.map(|f| format!(" AND {f}")).unwrap_or_default();
+        let sql = format!(
+            "UPDATE {table} SET {colonne} = {} WHERE {colonne} = {}{filtre}",
+            self.marque(1),
+            self.marque(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&cible, &doublon];
+        match self.db.execute(&sql, &params) {
+            Ok(n) => Ok(n),
+            Err(e) if table_absente(&e) => {
+                tracing::debug!(table, error = %e, "album_absorption_table_absente");
+                Ok(0)
+            }
+            Err(e) => Err(TuneError::from(e)),
+        }
+    }
+
+    /// Même chose pour une table à clé unique `(colonne, discriminant)` : la
+    /// ligne du doublon dont la cible possède déjà l'équivalent est retirée
+    /// d'abord — la cible garde la sienne — puis le reste est repointé.
+    /// Portable : `UPDATE OR IGNORE` n'existe pas sous PostgreSQL.
+    fn repointer_a_cle_unique(
+        &self,
+        table: &str,
+        colonne: &str,
+        discriminant: &str,
+        filtre: Option<&str>,
+        cible: i64,
+        doublon: i64,
+    ) -> Result<usize, TuneError> {
+        let f = filtre.map(|f| format!(" AND {f}")).unwrap_or_default();
+        let (p1, p2) = (self.marque(1), self.marque(2));
+        let purge = format!(
+            "DELETE FROM {table} WHERE {colonne} = {p1}{f} AND {discriminant} IN \
+             (SELECT {discriminant} FROM {table} WHERE {colonne} = {p2}{f})"
+        );
+        let params: [&dyn ToSqlValue; 2] = [&doublon, &cible];
+        match self.db.execute(&purge, &params) {
+            Ok(_) => {}
+            Err(e) if table_absente(&e) => return Ok(0),
+            Err(e) => return Err(TuneError::from(e)),
+        }
+        self.repointer(table, colonne, filtre, cible, doublon)
+    }
+
+    /// Les dossiers de l'utilisateur (`settings['collections']`, liste JSON de
+    /// `{…, "album_ids": […]}`) : le doublon y cède sa place à la cible.
+    fn reecrire_les_collections(&self, cible: i64, doublon: i64) -> Result<usize, TuneError> {
+        let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let Some(brut) = settings.get("collections").ok().flatten() else {
+            return Ok(0);
+        };
+        let Ok(mut collections) = serde_json::from_str::<Vec<serde_json::Value>>(&brut) else {
+            return Ok(0);
+        };
+        let mut reecrites = 0usize;
+        for collection in collections.iter_mut() {
+            let Some(ids) = collection
+                .get("album_ids")
+                .and_then(|v| v.as_array())
+                .cloned()
+            else {
+                continue;
+            };
+            let mut sortie: Vec<i64> = Vec::with_capacity(ids.len());
+            let mut change = false;
+            for id in ids.iter().filter_map(|v| v.as_i64()) {
+                let id = if id == doublon {
+                    change = true;
+                    cible
+                } else {
+                    id
+                };
+                if !sortie.contains(&id) {
+                    sortie.push(id);
+                }
+            }
+            if change {
+                collection["album_ids"] = serde_json::json!(sortie);
+                reecrites += 1;
+            }
+        }
+        if reecrites > 0 {
+            let texte =
+                serde_json::to_string(&collections).map_err(|e| TuneError::from(e.to_string()))?;
+            settings
+                .set("collections", &texte)
+                .map_err(TuneError::from)?;
+        }
+        Ok(reecrites)
+    }
+
+    /// Les arbitrages « distincts » qui nommaient le doublon n'ont plus d'objet.
+    fn oublier_les_paires_distinctes(&self, doublon: i64) -> Result<(), TuneError> {
+        let sql = format!(
+            "DELETE FROM album_distinct_pairs WHERE album_a_id = {} OR album_b_id = {}",
+            self.marque(1),
+            self.marque(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&doublon, &doublon];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => Ok(()),
+            Err(e) if table_absente(&e) => Ok(()),
+            Err(e) => Err(TuneError::from(e)),
+        }
     }
 
     fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String

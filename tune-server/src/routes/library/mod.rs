@@ -214,6 +214,11 @@ pub fn router() -> Router<AppState> {
         .route("/albums/{id}/editions", get(albums::album_editions))
         // BIB-A2 (phase 0) : `/albums/eclates` AVANT `/albums/{id}`, comme `hidden`.
         .route("/albums/eclates", get(albums::albums_eclates))
+        // BIB-A2 (phase 1) : un album éclaté absorbe son doublon, à la demande.
+        .route(
+            "/albums/{cible}/absorber/{doublon}",
+            post(albums::absorber_album),
+        )
         .route(
             "/albums/{id}",
             get(albums::get_album).put(albums::update_album),
