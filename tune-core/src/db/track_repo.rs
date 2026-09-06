@@ -457,6 +457,15 @@ pub mod sql {
         )
     }
 
+    /// BIB-B2 : l'empreinte du contenu audio decode, forme serialisee versionnee.
+    pub fn set_audio_fingerprint<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET audio_fingerprint = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn set_acoustid<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE tracks SET acoustid_fingerprint = {}, acoustid_confidence = {} WHERE id = {}",
@@ -2001,6 +2010,15 @@ impl TrackRepo {
     pub fn set_trailing_silence(&self, track_id: i64, ms: i64) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::set_trailing_silence, sql::set_trailing_silence);
         let params: [&dyn ToSqlValue; 2] = [&ms, &track_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// BIB-B2 : pose l'empreinte du contenu audio decode (`audio::empreinte`),
+    /// sous sa forme serialisee et versionnee.
+    pub fn set_audio_fingerprint(&self, track_id: i64, empreinte: &str) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::set_audio_fingerprint, sql::set_audio_fingerprint);
+        let params: [&dyn ToSqlValue; 2] = [&empreinte, &track_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
