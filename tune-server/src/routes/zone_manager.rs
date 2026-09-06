@@ -949,16 +949,27 @@ const ENDPOINT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 /// Les sondes partent en parallèle : le coût du contrôle est celui du membre
 /// le plus lent, pas leur somme.
 pub(crate) async fn unreachable_endpoints(endpoints: &[(String, u16)]) -> Vec<String> {
+    unreachable_endpoints_avec_delai(endpoints, ENDPOINT_PROBE_TIMEOUT).await
+}
+
+/// Le même contrôle avec le délai en paramètre. La production passe toujours
+/// par [`unreachable_endpoints`] et sa seconde et demie ; les témoins qui
+/// ouvrent un écouteur dans une tâche prennent un délai large, parce que sous
+/// saturation l'`accept` peut mettre plus d'une seconde et demie à être
+/// ordonnancé — et nommer fautif un membre qui répond (2 rouges sur 147 tours
+/// la nuit du 05/09).
+pub(crate) async fn unreachable_endpoints_avec_delai(
+    endpoints: &[(String, u16)],
+    delai: std::time::Duration,
+) -> Vec<String> {
     let probes = endpoints.iter().map(|(host, port)| {
         let host = host.clone();
         let port = *port;
         async move {
-            let ok = tokio::time::timeout(
-                ENDPOINT_PROBE_TIMEOUT,
-                tokio::net::TcpStream::connect((host.as_str(), port)),
-            )
-            .await
-            .is_ok_and(|r| r.is_ok());
+            let ok =
+                tokio::time::timeout(delai, tokio::net::TcpStream::connect((host.as_str(), port)))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
             if ok {
                 None
             } else {
@@ -1246,16 +1257,19 @@ fn downcast_oaat_multiroom(
 mod tests {
     use super::*;
 
-    /// Un port fermé sur la boucle locale : on ouvre un écouteur pour obtenir
-    /// un numéro de port réellement libre, puis on le referme. Tirer un numéro
-    /// au hasard donnerait un test qui échoue le jour où quelque chose écoute
-    /// dessus.
+    /// Un port fermé sur la boucle locale. Le port 1 est privilégié : rien n'y
+    /// écoute et aucun test ne peut s'y attacher sans être root. L'ancienne
+    /// méthode — ouvrir un écouteur sur `:0`, lire le port, le refermer —
+    /// laissait une fenêtre où l'un des dizaines de tests parallèles qui
+    /// s'attachent à `127.0.0.1:0` recevait CE port, et la connexion
+    /// « refusée » aboutissait (2 rouges sur 147 tours la nuit du 05/09).
     async fn port_ferme() -> u16 {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
-        port
+        1
     }
+
+    /// Délai de sonde des témoins qui ouvrent un écouteur : large, parce que
+    /// la tâche d'`accept` n'est pas prioritaire sous saturation.
+    const DELAI_TEMOIN: std::time::Duration = std::time::Duration::from_secs(20);
 
     #[tokio::test]
     async fn un_appareil_qui_refuse_la_connexion_est_signale() {
@@ -1282,7 +1296,9 @@ mod tests {
         tokio::spawn(async move {
             let _ = l.accept().await;
         });
-        let refuses = unreachable_endpoints(&[("127.0.0.1".to_string(), port)]).await;
+        let refuses =
+            unreachable_endpoints_avec_delai(&[("127.0.0.1".to_string(), port)], DELAI_TEMOIN)
+                .await;
         assert!(
             refuses.is_empty(),
             "un point de diffusion qui accepte la connexion ne doit pas être \
@@ -1305,10 +1321,13 @@ mod tests {
             }
         });
         let port_mauvais = port_ferme().await;
-        let refuses = unreachable_endpoints(&[
-            ("127.0.0.1".to_string(), port_bon),
-            ("127.0.0.1".to_string(), port_mauvais),
-        ])
+        let refuses = unreachable_endpoints_avec_delai(
+            &[
+                ("127.0.0.1".to_string(), port_bon),
+                ("127.0.0.1".to_string(), port_mauvais),
+            ],
+            DELAI_TEMOIN,
+        )
         .await;
         assert_eq!(refuses, vec![format!("127.0.0.1:{port_mauvais}")]);
     }
