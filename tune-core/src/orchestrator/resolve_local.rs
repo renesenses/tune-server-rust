@@ -1168,7 +1168,9 @@ impl PlaybackOrchestrator {
             // ~80s stall for nothing.
             AudioFormat::Wav
         } else {
-            src_fmt.dlna_transcode_target()
+            // #3357 : l'encodeur n'écrit que WAV et FLAC ; une cible AIFF (ou
+            // MP3, OGG) devenait du FLAC en silence, servi sous `audio/aiff`.
+            cible_encodable(src_fmt.dlna_transcode_target())
         };
         let mut out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
         // Apply zone max_sample_rate cap
