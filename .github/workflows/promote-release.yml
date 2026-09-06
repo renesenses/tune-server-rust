@@ -281,6 +281,31 @@ jobs:
             -H 'X-GitHub-Event: release' -H "X-Hub-Signature-256: $SIGNATURE" \
             -d "$BODY" https://mozaiklabs.fr/webhooks/github/release
 
+          # Les images Tune OS. La release OS est publiee PLUS HAUT, avant la
+          # release app : son webhook GitHub arrive au site quelques secondes
+          # avant que la ForumRelease de l'app existe (mesure sur la .137 :
+          # OS 20:46:46, app 20:46:49), et l'ingesteur la SAUTE — garde
+          # « pas d'images OS sans release app ». Depuis la .131, premiere
+          # promotion en deux temps, aucune image systeme n'etait rattachee
+          # sur mozaiklabs.fr/download. On rejoue donc ici la livraison OS,
+          # APRES l'app et de facon synchrone, avec la meme signature HMAC.
+          OS_RELEASE="$(GH_TOKEN="$OS_TOKEN" gh api --paginate \
+            "repos/renesenses/tune-os/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"$OS_TAG\")]" \
+            | jq -s 'add // [] | .[0] // empty')"
+          if [ -n "$OS_RELEASE" ]; then
+            OS_BODY="$(jq -n --arg action published --argjson release "$OS_RELEASE" \
+              --arg name tune-os --arg full renesenses/tune-os \
+              '{action:$action,release:$release,repository:{name:$name,full_name:$full}}')"
+            OS_SIGNATURE="sha256=$(printf '%s' "$OS_BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $2}')"
+            curl -fsS -X POST -H 'Content-Type: application/json' \
+              -H 'X-GitHub-Event: release' -H "X-Hub-Signature-256: $OS_SIGNATURE" \
+              -d "$OS_BODY" https://mozaiklabs.fr/webhooks/github/release
+            echo "livraison OS $OS_TAG rejouee apres l'app"
+          else
+            echo "::warning::release OS $OS_TAG introuvable au moment du rejeu : images systeme non rattachees"
+          fi
+
           {
             echo "## v$VERSION promue"
             echo
@@ -288,7 +313,7 @@ jobs:
             echo "- release Tune OS publique"
             echo "- Docker $TAG et latest sur le digest staged"
             echo "- Homebrew mis a jour"
-            echo "- site notifie"
+            echo "- site notifie (release app, puis release Tune OS dans cet ordre)"
             echo "- Android inchange : absent du manifeste a quatre composants"
             echo "- paquet .deb : job \`deb\` de ce meme run"
           } >> "$GITHUB_STEP_SUMMARY"
