@@ -352,10 +352,10 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
 
     let windows = corps("windows-pr");
     assert!(windows.contains("if: github.event_name == 'pull_request'"));
-    assert!(windows.contains("--features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm"));
+    assert!(windows.contains("--features oaat,cloud-relay,postgres,dj,karaoke,bandcamp,plugins-wasm"));
     assert!(
         windows
-            .contains("--features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm")
+            .contains("--features oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm")
     );
 
     let macos = corps("macos-pr");
@@ -809,10 +809,10 @@ fn les_deux_plateformes_compilent_sur_toute_pr_rust() {
     // Rien n'est RETIRE : les deux jobs gardent leurs configurations, et
     // `release-gate` continue de les exiger verts pour promouvoir vers main.
     let windows = corps("windows-pr");
-    assert!(windows.contains("--features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm"));
+    assert!(windows.contains("--features oaat,cloud-relay,postgres,dj,karaoke,bandcamp,plugins-wasm"));
     assert!(
         windows
-            .contains("--features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm")
+            .contains("--features oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm")
     );
     assert!(corps("macos-pr").contains("cargo check --package tune-server"));
     let porte = corps("release-gate");
