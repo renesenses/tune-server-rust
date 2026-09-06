@@ -380,7 +380,14 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                         // Une passe à la fois (#1576) : si le sweep acoustique
                         // décode, on attend notre tour plutôt que d'empiler.
                         let _slot = ANALYSIS_SLOT.lock().await;
-                        analyze_track_batch(&backend).await
+                        // BIB-B2 : quand le ReplayGain n'a plus de piste, le
+                        // meme creneau sert au rattrapage des empreintes des
+                        // pistes deja analysees (avant la colonne, ou apres un
+                        // changement de version de l'algorithme).
+                        match analyze_track_batch(&backend).await {
+                            0 => empreinter_un_lot(&backend).await,
+                            n => n,
+                        }
                     }
                 };
                 // La lecture peut avoir démarré PENDANT le lot, qui a alors
@@ -672,6 +679,10 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
                 );
             }
         }
+        // BIB-B2 : l'empreinte du contenu, dans la meme passe. Le fichier
+        // vient d'etre decode en entier ; 60 s de plus en mono 11 kHz ne
+        // pesent rien, et la piste ne repassera pas par ici.
+        empreinter_la_piste(backend, track_id, &sur_disque).await;
         // Sentinel = unix seconds, so an album pass can tell a track has been
         // handled even when it produced no gain.
         let _ = repo.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
@@ -699,6 +710,123 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
 /// gain across an album to preserve inter-track dynamics; album peak is the max
 /// track peak. Written to EVERY track of the album (ReplayGain album tags are
 /// per-track).
+/// BIB-B2 : la marque « pas d'empreinte possible » (silence, fichier
+/// indecodable), versionnee comme une empreinte : elle sort la piste du
+/// rattrapage sans jamais se comparer a rien (`deserialiser` la refuse).
+fn marque_sans_empreinte() -> String {
+    format!("{}:-", crate::audio::empreinte::VERSION)
+}
+
+/// Calcule et pose l'empreinte du contenu d'une piste (BIB-B2). Le decodage
+/// (90 s au plus, mono 11 kHz) part en tache bloquante. Rend `true` si une
+/// valeur a ete ecrite (empreinte ou marque).
+async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin: &str) -> bool {
+    let chemin_owned = chemin.to_string();
+    let calcul = tokio::task::spawn_blocking(move || {
+        crate::audio::empreinte::empreinte_du_fichier(&chemin_owned)
+    })
+    .await;
+    let valeur = match calcul {
+        Ok(Ok(Some(e))) => e.serialiser(),
+        Ok(Ok(None)) => {
+            debug!(track_id, path = %chemin, "empreinte_silence — marque posee");
+            marque_sans_empreinte()
+        }
+        Ok(Err(e)) => {
+            warn!(track_id, path = %chemin, error = %e, "empreinte_decodage_echoue — marque posee");
+            marque_sans_empreinte()
+        }
+        Err(e) => {
+            warn!(track_id, path = %chemin, error = %e, "empreinte_tache_interrompue");
+            return false;
+        }
+    };
+    match crate::db::track_repo::TrackRepo::with_backend(backend.clone())
+        .set_audio_fingerprint(track_id, &valeur)
+    {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(track_id, error = %e, "empreinte_ecriture_echouee");
+            false
+        }
+    }
+}
+
+/// BIB-B2 : rattrapage borne des empreintes — les pistes deja analysees par
+/// le ReplayGain (donc jamais reprises par [`analyze_track_batch`]) qui n'ont
+/// pas d'empreinte de la version courante. Memes gardes que le ReplayGain :
+/// reglage, lecture en cours, chemin introuvable reporte (#1865), DSD ecarte
+/// (le reechantillonneur DSD→PCM peut boucler sur certains rips SACD).
+pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let motif = format!("{}:%", crate::audio::empreinte::VERSION);
+    let rows = match backend.query_many(
+        "SELECT t.id, t.file_path FROM tracks t \
+         WHERE t.file_path IS NOT NULL AND t.file_path != '' \
+           AND (t.audio_fingerprint IS NULL OR t.audio_fingerprint NOT LIKE ?) \
+           AND EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_analyzed') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
+                   AND m.value > ?) \
+           AND LOWER(COALESCE(t.format, '')) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff') \
+         LIMIT ?",
+        &[
+            &motif as &dyn ToSqlValue,
+            &seuil_report as &dyn ToSqlValue,
+            &(TRACK_BATCH as i64) as &dyn ToSqlValue,
+        ],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // Base anterieure a la colonne : rien a rattraper, sans bruit.
+            if !(e.contains("no such column") || e.contains("does not exist")) {
+                warn!(error = %e, "empreinte_candidate_query_failed");
+            }
+            return 0;
+        }
+    };
+    if rows.is_empty() {
+        return 0;
+    }
+    let repo = TrackMetadataRepo::with_backend(backend.clone());
+    let mut done = 0usize;
+    for r in &rows {
+        if !analysis_enabled(backend) || any_zone_playing(backend) {
+            break;
+        }
+        let Some(track_id) = r.first().and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let Some(path) = r
+            .get(1)
+            .and_then(|v| v.as_string())
+            .filter(|p| !p.is_empty())
+        else {
+            continue;
+        };
+        let sur_disque = match resolve_local_path(&path) {
+            LocalPath::Found(reel) => reel,
+            LocalPath::Missing => {
+                warn!(track_id, path = %path, "empreinte_path_unresolved — piste REPORTEE (#1865)");
+                let _ = repo.set(
+                    track_id,
+                    PATH_UNRESOLVED_KEY,
+                    &deferral_stamp(now_epoch_secs() as i64),
+                );
+                done += 1;
+                continue;
+            }
+        };
+        if empreinter_la_piste(backend, track_id, &sur_disque).await {
+            done += 1;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(PER_FILE_PAUSE_MS)).await;
+    }
+    info!(empreintes = done, "empreinte_lot");
+    done
+}
+
 pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // An album that has track gains but no album gain yet. One at a time keeps
     // it cheap (pure arithmetic, no decode) and interleaved with the track pass.
@@ -1437,6 +1565,90 @@ mod tests {
 
     fn temoins(db: &crate::db::sqlite::SqliteDb) -> std::collections::HashMap<String, String> {
         TrackMetadataRepo::new(db.clone()).get_all(42).unwrap()
+    }
+
+    fn empreinte_de(db: &crate::db::sqlite::SqliteDb, id: i64) -> Option<String> {
+        db.query_one(
+            &format!("SELECT audio_fingerprint FROM tracks WHERE id = {id}"),
+            &[],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_string()))
+    }
+
+    /// BIB-B2 : la passe ReplayGain pose aussi l'empreinte du contenu, dans
+    /// la foulée du décodage.
+    #[tokio::test]
+    async fn la_passe_replaygain_pose_aussi_l_empreinte() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ape/sine_16s_c3000.wav"
+        );
+        let (db, backend) = base_avec_piste(fixture);
+        assert_eq!(analyze_track_batch(&backend).await, 1);
+        let e = empreinte_de(&db, 42).expect("l'empreinte est posée");
+        assert!(e.starts_with("env100ms-v1:") && e.len() > 20, "{e}");
+        assert!(temoins(&db).contains_key("rg_analyzed"));
+        // Rien à rattraper ensuite : la piste porte déjà la version courante.
+        assert_eq!(empreinter_un_lot(&backend).await, 0);
+    }
+
+    /// BIB-B2 : le rattrapage traite les pistes déjà analysées par le
+    /// ReplayGain (jamais reprises par la passe), reporte les chemins
+    /// introuvables sans marque, et ne repasse pas sur ce qu'il a fait.
+    #[tokio::test]
+    async fn le_rattrapage_empreinte_les_pistes_analysees_et_reporte_les_absentes() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ape/sine_16s_c3000.wav"
+        );
+        let (db, backend) = base_avec_piste(fixture);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent = tmp
+            .path()
+            .join("absente.flac")
+            .to_string_lossy()
+            .to_string();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, \
+             sample_rate, channels) VALUES (43, 'Absente', 1, 1, ?, 300000, 44100, 2)",
+            &[&absent],
+        )
+        .unwrap();
+        let meta = TrackMetadataRepo::new(db.clone());
+        meta.set(42, "rg_analyzed", "1").unwrap();
+        meta.set(43, "rg_analyzed", "1").unwrap();
+        assert_eq!(empreinte_de(&db, 42), None, "avant : rien");
+
+        assert_eq!(
+            empreinter_un_lot(&backend).await,
+            2,
+            "une empreinte, un report"
+        );
+        let e = empreinte_de(&db, 42).expect("la piste analysée reçoit son empreinte");
+        assert!(e.starts_with("env100ms-v1:"), "{e}");
+        assert_eq!(
+            empreinte_de(&db, 43),
+            None,
+            "un chemin introuvable ne reçoit ni empreinte ni marque"
+        );
+        let m43 = TrackMetadataRepo::new(db.clone()).get_all(43).unwrap();
+        assert!(
+            m43.contains_key(PATH_UNRESOLVED_KEY),
+            "le report est daté : {m43:?}"
+        );
+
+        assert_eq!(
+            empreinter_un_lot(&backend).await,
+            0,
+            "rien à refaire : faite, ou reportée"
+        );
+        // Une version périmée est reprise.
+        crate::db::track_repo::TrackRepo::with_backend(backend.clone())
+            .set_audio_fingerprint(42, "vieille-v0:abcd")
+            .unwrap();
+        assert_eq!(empreinter_un_lot(&backend).await, 1);
+        assert!(empreinte_de(&db, 42).unwrap().starts_with("env100ms-v1:"));
     }
 
     /// LE défaut. Un fichier introuvable N'EST PAS un fichier indécodable :
