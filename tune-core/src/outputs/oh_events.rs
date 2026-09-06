@@ -13,7 +13,7 @@
 //!   texte est un second document XML échappé
 //!   (`<Event><InstanceID val="0"><TransportState val="PLAYING"/>…`).
 //!
-//! [`EventState::apply_properties`] aplatit le second cas avant d'appliquer,
+//! `EventState::apply_properties` aplatit le second cas avant d'appliquer,
 //! si bien que les deux dialectes finissent dans le même état. Un renderer
 //! OpenHome n'émet JAMAIS `LastChange` : le chemin ajouté pour DLNA est
 //! strictement additif et ne change aucun verdict OpenHome (#2263).
@@ -80,7 +80,7 @@ pub struct EventState {
 }
 
 impl EventState {
-    /// Un évènement est arrivé il y a moins de [`EVENT_STALE_SECS`].
+    /// Un évènement est arrivé il y a moins de `EVENT_STALE_SECS`.
     ///
     /// Critère des services qui poussent EN CONTINU (OpenHome `Time`). Ne
     /// convient pas à DLNA : voir [`EventState::is_live`].
@@ -457,7 +457,7 @@ impl UpnpEventListener {
     /// prochain réveil de la boucle.
     ///
     /// C'est la boucle elle-même mise à disposition : elle appelle exactement
-    /// cette fonction toutes les [`RENEW_INTERVAL_SECS`] secondes. Sans ce
+    /// cette fonction toutes les `RENEW_INTERVAL_SECS` secondes. Sans ce
     /// point d'entrée, vérifier qu'un renouvellement refusé coupe bien
     /// l'abonnement demanderait d'attendre quatre minutes — donc ne serait
     /// jamais vérifié.

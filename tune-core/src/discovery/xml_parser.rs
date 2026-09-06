@@ -169,7 +169,7 @@ pub struct UnreadableBody {
     pub excerpt_bytes: usize,
     /// Début du corps, assaini (tout caractère de contrôle devient une espace,
     /// pour qu'une ligne de journal reste une ligne) et borné à
-    /// [`BODY_EXCERPT_LIMIT`] octets.
+    /// `BODY_EXCERPT_LIMIT` octets.
     pub excerpt: String,
 }
 

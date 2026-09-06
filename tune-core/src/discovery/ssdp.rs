@@ -94,7 +94,7 @@ pub enum MediaServerVerdict {
 ///    (`IDLE_SCAN_INTERVAL`, 120 s), c'est **au minimum quinze cycles
 ///    consécutifs manqués** avant même d'être candidat ;
 /// 3. le verdict `ExpiredNeedsProbe` n'est pas un retrait : l'appelant doit
-///    encore obtenir un échec de [`unicast_probe`] sur la `LOCATION`.
+///    encore obtenir un échec de `unicast_probe` sur la `LOCATION`.
 ///
 /// Le critère est un TEMPS ÉCOULÉ, pas un nombre de cycles manqués, et c'est
 /// délibéré : `process_responses` est appelée aussi bien par la boucle de

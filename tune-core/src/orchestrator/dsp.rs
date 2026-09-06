@@ -656,7 +656,7 @@ impl PlaybackOrchestrator {
     /// une demande plus récente peut encore l'annuler.
     ///
     /// **Ne programme rien quand la position de la zone n'est pas mesurée**
-    /// (#2595) : voir [`Self::position_entretenue_par_le_sondeur`].
+    /// (#2595) : voir `Self::position_entretenue_par_le_sondeur`.
     pub fn schedule_eq_replay(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
         // #2595 — ne pas rejouer à une position INCONNUE.
         //
@@ -1080,7 +1080,7 @@ impl PlaybackOrchestrator {
 
     /// La zone demande-t-elle le repli mono sur sa sortie LOCALE ? (#2362)
     ///
-    /// Symétrique de [`Self::load_crossfeed_processor`] :
+    /// Symétrique de `Self::load_crossfeed_processor` :
     ///
     ///   - mode PURE (audiophile) → `false` (chemin bit-perfect, intouché) ;
     ///   - réglage absent, vide, ou différent de `"true"` → `false` (défaut).

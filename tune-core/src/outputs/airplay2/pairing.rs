@@ -20,12 +20,12 @@
 //!   * les constantes **kTLVType_* / State / Method / Error** ;
 //!   * les primitives : client SRP-6a (`srp`), HKDF-SHA512, signature et
 //!     vérification Ed25519, ECDH X25519, AEAD ChaCha20-Poly1305 ;
-//!   * les deux poignées de main de bout en bout — [`run_pair_setup`] et
-//!     [`run_pair_verify`] — pilotées par le trait [`PairTransport`].
+//!   * les deux poignées de main de bout en bout — [`run_pair_setup`](crate::outputs::airplay2::pairing::run_pair_setup) et
+//!     [`run_pair_verify`](crate::outputs::airplay2::pairing::run_pair_verify) — pilotées par le trait [`PairTransport`](crate::outputs::airplay2::pairing::PairTransport).
 //!
 //! Ce qui est écrit mais **jamais confronté à un appareil** :
 //!
-//!   * [`RtspPairTransport`], le transport RTSP réel. Sa correction face à un
+//!   * [`RtspPairTransport`](crate::outputs::airplay2::pairing::RtspPairTransport), le transport RTSP réel. Sa correction face à un
 //!     vrai récepteur est **non validée** : les quirks des Samsung/LG/Apple ne
 //!     se devinent pas, ils se capturent.
 //!
@@ -165,7 +165,7 @@ pub mod tlv_type {
     pub const ENCRYPTED_DATA: u8 = 0x05;
     /// Pairing state: M1..M6 (1-indexed).
     pub const STATE: u8 = 0x06;
-    /// Error code (see [`error_code`]).
+    /// Error code (see [`error_code`](super::error_code)).
     pub const ERROR: u8 = 0x07;
     pub const RETRY_DELAY: u8 = 0x08;
     pub const CERTIFICATE: u8 = 0x09;
