@@ -136,6 +136,7 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS autoplay_enabled TEXT DEFAULT '0'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT",
+    "ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_seen_at TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT",
     // BIGINT, pas TEXT : `albums.id` est BIGINT, et la jointure de « Continuer
     // l'ecoute » compare les deux. En TEXT, PostgreSQL rend `operator does not

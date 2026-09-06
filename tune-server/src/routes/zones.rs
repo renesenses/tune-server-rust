@@ -376,6 +376,7 @@ pub use dsp::*;
 
 mod lecture;
 pub use lecture::*;
+mod presence;
 
 #[cfg(test)]
 mod debit_de_zone_tests;
