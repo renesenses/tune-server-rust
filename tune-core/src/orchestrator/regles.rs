@@ -159,12 +159,15 @@ pub fn est_dsd_brut(mime_type: &str) -> bool {
 /// pointless and, on DSD256/512, fatal (the ~decode exceeds the 120s temp-file
 /// timeout → the renderer plays silence).
 ///
-/// `dsp_active` PRIME sur tout le reste. Le bras progressif appelle
-/// `decode_to_pcm_streaming_seeked`, qui ne reçoit ni égaliseur, ni convolveur,
-/// ni facteur ReplayGain : seul `transcode_source_to_file` les applique. Une
-/// zone dont un traitement est actif doit donc repasser par le fichier, sans
-/// quoi le traitement est perdu EN SILENCE — famille #1216, déjà corrigée pour
-/// le passthrough réseau, le navigateur et les sorties PULL.
+/// `dsp_active` ne compte que si la cible n'est PAS du WAV. Depuis LAT-F1
+/// (phase 0) le bras progressif applique lui-même égaliseur, convolveur et
+/// ReplayGain au fil de l'eau (`spawn_streaming_dsp_relay`, le relais de
+/// #2863) : une cible WAV garde le démarrage immédiat AVEC son traitement.
+/// Avant, toute zone à traitement actif repassait par le fichier entier —
+/// 46 à 62 s de silence sur une zone DLNA avec égaliseur (#3357). Une cible
+/// non WAV (FLAC ré-encodé) passe encore par le fichier : l'encodeur n'est
+/// branché que là. La famille #1216 (traitement perdu en silence) reste
+/// couverte : le traitement est appliqué, d'un côté ou de l'autre.
 ///
 /// Kept a pure function so the decision matrix is unit-testable without an
 /// orchestrator.
@@ -175,7 +178,37 @@ pub(super) fn use_file_transcode_for(
     dsd_lpcm_streams: bool,
     dsp_active: bool,
 ) -> bool {
-    is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams)) || dsp_active
+    is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams))
+        || (dsp_active && !target_is_wav)
+}
+
+/// LAT-F1 (phase 1) — une zone réseau à traitement actif dont la cible serait
+/// un FICHIER (FLAC ré-encodé) doit-elle partir en WAV progressif ?
+///
+/// La phase 0 a branché le traitement sur le bras progressif, mais n'y envoie
+/// que les cibles DÉJÀ WAV. Un renderer qui lit le FLAC (Beoplay A9, Linn,
+/// LHC-208…) recevait donc toujours le FLAC ré-encodé par le fichier entier :
+/// 46 à 62 s de silence au premier morceau d'une zone avec égaliseur (#3357).
+///
+/// Choisir le WAV pour ces zones change le FORMAT servi au renderer — donc :
+/// - opt-in explicite (`dsp_progressif_reseau`, Réglages → Lecture), à froid
+///   rien ne bouge ;
+/// - le renderer doit avoir ANNONCÉ le LPCM à la profondeur servie (sonde
+///   `GetProtocolInfo` ; inconcluante ⇒ non, on garde le fichier) ;
+/// - jamais sur un DSD : il a sa propre branche WAV, déjà progressive.
+///
+/// Fonction pure, comme `use_file_transcode_for` : la matrice se teste sans
+/// orchestrateur. L'ordre des branches de `decider_le_format_de_sortie` fait
+/// le reste — une cible déjà WAV (OAAT, locale, navigateur, `dlna_needs_wav`)
+/// n'arrive jamais jusqu'ici.
+pub(super) fn cible_wav_pour_traitement(
+    dsp_active: bool,
+    is_network: bool,
+    src_est_dsd: bool,
+    opt_in: bool,
+    renderer_accepte_lpcm: bool,
+) -> bool {
+    dsp_active && is_network && !src_est_dsd && opt_in && renderer_accepte_lpcm
 }
 
 /// Le bras streaming HTTPS doit-il PRÉ-TRANSCODER au lieu de servir les octets
@@ -241,7 +274,7 @@ pub fn is_network_output_type(output_type: Option<&str>) -> bool {
 /// La sortie va CHERCHER le flux elle-même et reçoit donc nos octets **tels
 /// quels** : `hqplayer`, `airplay2`, `diretta`, tout greffon hors dépôt.
 ///
-/// C'est la troisième famille de [`pull_output_needs_dsp_transcode`], extraite
+/// C'est la troisième famille de `pull_output_needs_dsp_transcode`, extraite
 /// telle quelle — ni élargie, ni rétrécie. Elle existe séparément parce que le
 /// panneau du chemin du signal en a besoin SANS les drapeaux d'exécution
 /// (`is_local`, `is_oaat`, format source) : il n'a que le type de la zone.
@@ -249,7 +282,7 @@ pub fn is_network_output_type(output_type: Option<&str>) -> bool {
 /// La conséquence pour l'affichage est directe et c'est tout le sujet de
 /// #2189 : sur ces sorties, le transport ne touche AUCUN échantillon, donc il
 /// est bit-perfect. Le seul traitement qui puisse s'y appliquer est celui que
-/// [`pull_output_needs_dsp_transcode`] force — EQ, correction de pièce,
+/// `pull_output_needs_dsp_transcode` force — EQ, correction de pièce,
 /// ReplayGain — et le panneau le compte déjà à part. Le bras par défaut de
 /// `build_signal_path` rendait `false` inconditionnellement : une zone
 /// HQPlayer était déclarée « non bit-perfect » sur un FLAC 44,1/16 servi

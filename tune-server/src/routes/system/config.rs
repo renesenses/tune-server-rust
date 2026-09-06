@@ -474,6 +474,17 @@ pub(super) async fn get_config(
         .and_then(|v| v.as_str().map(|s| s == "true").or_else(|| v.as_bool()))
         .unwrap_or(false);
     config.insert("dsd_lpcm_stream".to_string(), json!(dsd_lpcm_stream));
+    // LAT-F1 (phase 1) : traitement au fil de l'eau sur les zones réseau
+    // (Réglages → Lecture). Même mécanique que `dsd_lpcm_stream` : PATCH
+    // range « true »/« false » en texte, la lecture rend un vrai booléen.
+    let dsp_progressif_reseau = config
+        .get("dsp_progressif_reseau")
+        .and_then(|v| v.as_str().map(|s| s == "true").or_else(|| v.as_bool()))
+        .unwrap_or(false);
+    config.insert(
+        "dsp_progressif_reseau".to_string(),
+        json!(dsp_progressif_reseau),
+    );
     // Les TROIS modes ReplayGain de #1627 — « néant / tags du fichier /
     // calcul » — publiés comme UN seul fait, en LECTURE.
     //

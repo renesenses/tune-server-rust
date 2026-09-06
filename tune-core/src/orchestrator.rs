@@ -684,6 +684,9 @@ pub struct PlaybackOrchestrator {
     /// Only negative results are cached — if a MIME is not in the set, it's
     /// either supported or hasn't been checked yet.
     dlna_unsupported_mimes: Mutex<HashMap<String, Vec<String>>>,
+    /// LAT-F1 (phase 1) : réponses CONCLUANTES de `dlna_accepte_lpcm`, par
+    /// `device_id|profondeur`. Les sondes inconcluantes n'y entrent pas.
+    dlna_lpcm_accepte: Mutex<HashMap<String, bool>>,
     /// Zones dont une résolution gapless est en cours : les sessions créées
     /// pendant cette fenêtre pré-chargent la piste SUIVANTE — leur attacher
     /// un forwarder de niveaux daterait les fenêtres avec l'horloge de la
@@ -976,6 +979,7 @@ impl PlaybackOrchestrator {
             prefetch: Arc::new(PrefetchEngine::new()),
             dsd_capabilities: Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
+            dlna_lpcm_accepte: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
