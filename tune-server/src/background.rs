@@ -1171,25 +1171,6 @@ fn spawn_heartbeat(state: &AppState) {
                 continue;
             }
 
-            if let Some(backoff) = tune_core::cloud::rate_limit::active(
-                &settings,
-                tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
-            ) {
-                debug!(
-                    scope = backoff.scope,
-                    until_epoch = backoff.until_epoch,
-                    retry_after_seconds = backoff.retry_after_seconds,
-                    "heartbeat_deferred_rate_limit"
-                );
-                // Le heartbeat cloud est differe, pas le rafraichissement SSO :
-                // les deux routes ont des compteurs distincts.
-                if plan.refresh_account {
-                    refresh_account_premium(&backend, &license, &services).await;
-                }
-                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-                continue;
-            }
-
             let tracks = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone())
                 .count()
                 .unwrap_or(0);
@@ -1372,14 +1353,39 @@ fn spawn_heartbeat(state: &AppState) {
             let mut verdict = tune_core::db::task_run_repo::Verdict::Echec;
             let mut motif = String::from("hote injoignable");
 
-            match client
-                .post("https://mozaiklabs.fr/api/v1/heartbeat")
-                .header("Accept", "application/json")
-                .json(&payload)
-                .send()
-                .await
+            // CLD-2 : un seul chemin d'appel borné. La portée retenue ne part
+            // pas ; la branche « retenu » est celle du pré-contrôle d'avant, au
+            // même endroit dans le tour : rafraîchir le compte SSO si prévu
+            // (les deux routes ont des compteurs distincts), dormir l'intervalle
+            // plein, passer au tour suivant sans clore le suivi ni compter un
+            // échec. La charge utile a été relevée pour rien : une fois par
+            // heure, quelques lectures de base.
+            match tune_core::cloud::rate_limit::appeler(
+                &settings,
+                tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
+                client
+                    .post("https://mozaiklabs.fr/api/v1/heartbeat")
+                    .header("Accept", "application/json")
+                    .json(&payload),
+            )
+            .await
             {
-                Ok(resp) if resp.status().is_success() => {
+                tune_core::cloud::rate_limit::AppelCloud::Retenu(backoff) => {
+                    debug!(
+                        scope = backoff.scope,
+                        until_epoch = backoff.until_epoch,
+                        retry_after_seconds = backoff.retry_after_seconds,
+                        "heartbeat_deferred_rate_limit"
+                    );
+                    if plan.refresh_account {
+                        refresh_account_premium(&backend, &license, &services).await;
+                    }
+                    tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                    continue;
+                }
+                tune_core::cloud::rate_limit::AppelCloud::Reponse(resp)
+                    if resp.status().is_success() =>
+                {
                     verdict = tune_core::db::task_run_repo::Verdict::Succes;
                     motif = format!("accepte ({})", resp.status().as_u16());
                     debug!(instance_id = %instance_id, tracks, uptime_s, "heartbeat_sent");
@@ -1499,18 +1505,11 @@ fn spawn_heartbeat(state: &AppState) {
                         // else: no license fields in response — keep cached state.
                     }
                 }
-                Ok(resp) => {
-                    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        tune_core::cloud::rate_limit::defer_from_headers(
-                            &settings,
-                            tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
-                            resp.headers(),
-                        );
-                    }
+                tune_core::cloud::rate_limit::AppelCloud::Reponse(resp) => {
                     debug!(status = %resp.status(), "heartbeat_rejected");
                     motif = format!("refuse ({})", resp.status().as_u16());
                 }
-                Err(e) => {
+                tune_core::cloud::rate_limit::AppelCloud::Erreur(e) => {
                     debug!(error = %e, "heartbeat_failed");
                 }
             }
@@ -1574,31 +1573,31 @@ async fn revalider_la_cle(
     let ls = license.license_state().await;
     let key = ls.license_key.clone()?;
 
-    if let Some(backoff) = tune_core::cloud::rate_limit::active(
+    let payload = charge_de_revalidation(&key, &ls.hardware_fingerprint, server_id);
+    // CLD-2 : le même chemin borné que le battement, même portée.
+    let resp = tune_core::cloud::rate_limit::appeler(
         settings,
         tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
-    ) {
-        debug!(
-            scope = backoff.scope,
-            until_epoch = backoff.until_epoch,
-            "license_revalidation_deferred_rate_limit"
-        );
-        return Some((
-            Verdict::Echec,
-            "revalidation differee (429 en cours)".into(),
-        ));
-    }
-
-    let payload = charge_de_revalidation(&key, &ls.hardware_fingerprint, server_id);
-    let resp = client
-        .post(crate::routes::cloud::license_validate_url(settings))
-        .header("Accept", "application/json")
-        .json(&payload)
-        .send()
-        .await;
+        client
+            .post(crate::routes::cloud::license_validate_url(settings))
+            .header("Accept", "application/json")
+            .json(&payload),
+    )
+    .await;
 
     match resp {
-        Ok(resp) if resp.status().is_success() => {
+        tune_core::cloud::rate_limit::AppelCloud::Retenu(backoff) => {
+            debug!(
+                scope = backoff.scope,
+                until_epoch = backoff.until_epoch,
+                "license_revalidation_deferred_rate_limit"
+            );
+            Some((
+                Verdict::Echec,
+                "revalidation differee (429 en cours)".into(),
+            ))
+        }
+        tune_core::cloud::rate_limit::AppelCloud::Reponse(resp) if resp.status().is_success() => {
             let Ok(body) = resp.json::<serde_json::Value>().await else {
                 return Some((Verdict::Echec, "reponse illisible".into()));
             };
@@ -1645,21 +1644,14 @@ async fn revalider_la_cle(
             );
             Some((Verdict::Succes, format!("cle revalidee, palier {tier}")))
         }
-        Ok(resp) => {
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                tune_core::cloud::rate_limit::defer_from_headers(
-                    settings,
-                    tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
-                    resp.headers(),
-                );
-            }
+        tune_core::cloud::rate_limit::AppelCloud::Reponse(resp) => {
             debug!(status = %resp.status(), "license_revalidation_rejected");
             Some((
                 Verdict::Echec,
                 format!("refuse ({})", resp.status().as_u16()),
             ))
         }
-        Err(e) => {
+        tune_core::cloud::rate_limit::AppelCloud::Erreur(e) => {
             debug!(error = %e, "license_revalidation_failed");
             Some((Verdict::Echec, "hote injoignable".into()))
         }
@@ -2530,6 +2522,7 @@ mod heartbeat_cadence_et_optout_tests {
     /// production seul : ce module cite le nom dans ses commentaires.
     #[test]
     fn la_branche_optout_revalide_la_cle() {
+        // (voir aussi `le_battement_emprunte_le_chemin_d_appel_unique` plus bas)
         let source = include_str!("background.rs");
         let production = source
             .split(&format!("#[cfg({})]", "test"))
@@ -2546,6 +2539,43 @@ mod heartbeat_cadence_et_optout_tests {
             branche[..fin].contains(&format!("revalider_la_cle{}", "(")),
             "la branche opt-out du battement doit revalider la cle (LIC-1)"
         );
+    }
+
+    /// CLD-2 : le battement et la revalidation de clé passent par
+    /// `rate_limit::appeler`, et la partie de production de ce fichier ne
+    /// vérifie plus la portée ni ne mémorise le 429 elle-même. La branche
+    /// « retenu » du battement garde ses trois gestes : rafraîchir le compte
+    /// SSO si prévu, dormir l'intervalle plein, passer au tour suivant.
+    #[test]
+    fn le_battement_emprunte_le_chemin_d_appel_unique() {
+        let source = include_str!("background.rs");
+        let production = source
+            .split(&format!("#[cfg({})]", "test"))
+            .next()
+            .expect("source vide");
+        assert!(!production.contains(&format!("rate_limit::active{}", "(")));
+        assert!(!production.contains(&format!("defer_from_headers{}", "(")));
+        assert_eq!(
+            production
+                .matches(&format!("rate_limit::appeler{}", "("))
+                .count(),
+            2,
+            "le battement et la revalidation, et rien d'autre dans ce fichier"
+        );
+        let retenu = production
+            .find("AppelCloud::Retenu(backoff) => {\n                    debug!(")
+            .expect("branche retenu du battement");
+        let branche = &production[retenu..retenu + 900];
+        for geste in [
+            "refresh_account_premium(",
+            "sleep(HEARTBEAT_INTERVAL)",
+            "continue;",
+        ] {
+            assert!(
+                branche.contains(geste),
+                "{geste} doit rester dans la branche retenue"
+            );
+        }
     }
 
     /// LIC-3 : après un échec, le battement revient vite (1, 5, 15 min), puis
