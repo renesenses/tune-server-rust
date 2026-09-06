@@ -788,7 +788,7 @@ pub struct SlimProtoServer {
 impl SlimProtoServer {
     /// Create a new server. The port defaults to 3483 but can be overridden
     /// via the `TUNE_SLIMPROTO_PORT` environment variable. No zone bridging
-    /// (used by unit tests) — prefer [`new_with_state`] in production.
+    /// (used by unit tests) — prefer [`new_with_state`](Self::new_with_state) in production.
     pub fn new() -> Self {
         Self {
             port: Self::resolve_port(),

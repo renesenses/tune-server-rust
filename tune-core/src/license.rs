@@ -869,7 +869,7 @@ const GRACE_NOTICE_AFTER_DAYS: i64 = 2;
 pub enum GracePhase {
     /// Confirmé en ligne récemment — rien à signaler.
     Ok,
-    /// Pas de confirmation depuis au moins [`GRACE_NOTICE_AFTER_DAYS`] jours,
+    /// Pas de confirmation depuis au moins `GRACE_NOTICE_AFTER_DAYS` jours,
     /// mais la fenêtre court toujours : **le premium est intact**.
     Grace,
     /// La fenêtre est écoulée : les droits premium sont retombés en Free en
@@ -897,7 +897,7 @@ pub struct OfflineGrace {
     pub source: GraceSource,
     /// Dernière confirmation en ligne réussie (ISO-8601 Zulu). `None` = jamais.
     pub since: Option<String>,
-    /// Instant où la fenêtre se referme (`since` + [`GRACE_PERIOD_DAYS`]).
+    /// Instant où la fenêtre se referme (`since` + `GRACE_PERIOD_DAYS`).
     pub until: Option<String>,
     /// Jours entiers restants, arrondis au supérieur ; 0 une fois écoulée.
     pub days_remaining: i64,
@@ -1011,7 +1011,7 @@ fn format_utc(dt: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 /// Whether an ISO-8601 (`%Y-%m-%dT%H:%M:%SZ`) timestamp lies in the past.
-/// Unlike [`is_expired`] (which fails *closed*: malformed → expired), this fails
+/// Unlike `is_expired` (which fails *closed*: malformed → expired), this fails
 /// *open*: unparseable input returns `false` so malformed server data never
 /// triggers a license revocation. Used by the heartbeat to tell a genuine past
 /// expiry from a transient `license_valid:false` verdict.

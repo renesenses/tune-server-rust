@@ -180,7 +180,7 @@ pub fn replace_database(db_path: &str, source: &Path) -> Result<u64, String> {
 /// Une base n'est pas UN fichier : le `-wal` porte les transactions pas encore
 /// repliées dans le `.db`, le `-shm` l'index de ce journal. Les trois gestes de
 /// ce module traitaient déjà les deux suffixes avec la base — [`create_backup`]
-/// les copie, [`replace_database`] les efface, [`prune_backups`] les supprime —
+/// les copie, [`replace_database`] les efface, `prune_backups` les supprime —
 /// mais chacun réécrivait le littéral `["-wal", "-shm"]` pour son compte.
 ///
 /// La constante existe pour que le prochain appelant la TROUVE au lieu de

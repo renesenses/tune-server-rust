@@ -5,7 +5,7 @@
 //! NFD (macOS, SMB/CIFS) ou en graphie mixte : `lofty::read_from_path` rend
 //! alors `ENOENT` sur un fichier bel et bien présent (#1865). Aucune fonction
 //! de ce module ne doit donner à `lofty` — ni à `exists()` — la chaîne lue en
-//! base : elle passe d'abord par [`graphie_sur_disque`].
+//! base : elle passe d'abord par `graphie_sur_disque`.
 //!
 //! Mesure sur `.18` le 30/08/2026 : **147 pistes sur 46 877** ont un chemin
 //! stocké qui ne désigne aucun fichier tel quel (135 retrouvées en NFD global,

@@ -33,7 +33,7 @@
 //!    l'écriture du marqueur ;
 //! 2. **réconciliation** aux mêmes cinq ancrages que `hidden_items`
 //!    (démarrage, `scan.rs`, `auto_scan.rs`, purge d'orphelines, et la route
-//!    de purge de `config.rs`), via le **même** [`find_album_by_identity`] —
+//!    de purge de `config.rs`), via le **même** `find_album_by_identity` —
 //!    pas une seconde règle de rattachement. La PR #2848 a montré ce que coûte
 //!    un repli divergent : une chaîne vide traitée autrement qu'un NULL, et un
 //!    rattachement à tous les homonymes.

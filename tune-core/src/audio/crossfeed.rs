@@ -59,7 +59,7 @@ pub struct CrossfeedProcessor {
 
 impl CrossfeedProcessor {
     /// Build a processor for the given `sample_rate` (Hz), `amount` (strength)
-    /// and `delay_ms` (crossfeed delay, capped at [`MAX_DELAY_MS`]).
+    /// and `delay_ms` (crossfeed delay, capped at `MAX_DELAY_MS`).
     ///
     /// `delay_samples = round(delay_ms / 1000 * sample_rate)`, clamped so a
     /// pathological config can never allocate an unbounded buffer.
