@@ -757,20 +757,41 @@ async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin
 /// pas d'empreinte de la version courante. Memes gardes que le ReplayGain :
 /// reglage, lecture en cours, chemin introuvable reporte (#1865), DSD ecarte
 /// (le reechantillonneur DSD→PCM peut boucler sur certains rips SACD).
-pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
-    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
-    let motif = format!("{}:%", crate::audio::empreinte::VERSION);
-    let rows = match backend.query_many(
-        "SELECT t.id, t.file_path FROM tracks t \
-         WHERE t.file_path IS NOT NULL AND t.file_path != '' \
+/// Le prédicat des pistes À EMPREINTER, partagé entre le rattrapage et son
+/// compteur (BIB-B2 phase D) : deux textes finiraient par diverger, et la
+/// couverture annoncée ne serait plus celle que le rattrapage traite.
+/// Paramètres, dans l'ordre : motif `VERSION:%`, seuil de report.
+const CANDIDATS_EMPREINTE_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' \
            AND (t.audio_fingerprint IS NULL OR t.audio_fingerprint NOT LIKE ?) \
            AND EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'rg_analyzed') \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
                    AND m.value > ?) \
-           AND LOWER(COALESCE(t.format, '')) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff') \
-         LIMIT ?",
+           AND LOWER(COALESCE(t.format, '')) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff')";
+
+/// Combien de pistes le rattrapage traiterait encore. `None` : base
+/// antérieure à la colonne `audio_fingerprint` (rien à compter).
+pub fn compter_les_candidats_a_empreinter(backend: &Arc<dyn DbBackend>) -> Option<i64> {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let motif = format!("{}:%", crate::audio::empreinte::VERSION);
+    backend
+        .query_one(
+            &format!("SELECT COUNT(*) FROM tracks t WHERE {CANDIDATS_EMPREINTE_WHERE}"),
+            &[&motif as &dyn ToSqlValue, &seuil_report as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+}
+
+pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let motif = format!("{}:%", crate::audio::empreinte::VERSION);
+    let rows = match backend.query_many(
+        &format!(
+            "SELECT t.id, t.file_path FROM tracks t WHERE {CANDIDATS_EMPREINTE_WHERE} LIMIT ?"
+        ),
         &[
             &motif as &dyn ToSqlValue,
             &seuil_report as &dyn ToSqlValue,

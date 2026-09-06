@@ -55,10 +55,18 @@ const PLANCHER_DB: f64 = -80.0;
 /// Décalage maximal essayé à la comparaison, en trames.
 pub const DECALAGE_MAX: usize = 3;
 /// Distance en deçà de laquelle deux empreintes désignent le même contenu.
-/// Calibrée sur les témoins : 0 pour deux encodages sans perte, quelques
-/// centièmes pour une simulation d'encodage avec perte, au-dessus de 0,15
-/// pour deux signaux différents.
-pub const SEUIL_MEME_CONTENU: f64 = 0.06;
+///
+/// Calibrée sur 556 fichiers réels du .18 (06/09/2026 : 153 689 paires,
+/// originaux et enregistrements des mêmes morceaux, plusieurs éditions) :
+/// les paires au même titre sont à 88 % sous 0,05 (351 sur 400) ; les paires
+/// de morceaux DIFFÉRENTS commencent à 0,050 (8 entre 0,050 et 0,0525, 27,
+/// 63, 134, 223… par pas de 0,0025 ensuite) et une seule descend sous 0,05
+/// (« All Blues » / « A.T.F.W. », 0,0445). À 0,06, l'ancien seuil, 232 paires
+/// étrangères passaient, et la transitivité en faisait un amas de cent
+/// pistes. Entre 0,05 et 0,06 vivent surtout des rééditions d'un même
+/// enregistrement mêlées à des étrangers : la zone grise n'est pas tranchée
+/// ici, elle reste hors du « même contenu ».
+pub const SEUIL_MEME_CONTENU: f64 = 0.05;
 /// Part minimale de la plus courte empreinte qui doit se recouvrir.
 const RECOUVREMENT_MIN: f64 = 0.8;
 
@@ -270,42 +278,57 @@ pub fn distance_grossiere(a: &Empreinte, b: &Empreinte) -> Option<f64> {
 /// [`meme_contenu`], sont réunies (union-find). Rend les groupes d'au moins
 /// deux identifiants, les plus grands d'abord, identifiants croissants.
 pub fn grouper_par_contenu(empreintes: &[(i64, Empreinte)]) -> Vec<Vec<i64>> {
-    fn racine(parent: &mut [usize], mut i: usize) -> usize {
-        while parent[i] != i {
-            parent[i] = parent[parent[i]];
-            i = parent[i];
-        }
-        i
-    }
+    // LIAISON COMPLÈTE, pas transitive : une piste n'entre dans un groupe que
+    // si elle est « même contenu » avec CHACUN de ses membres, et deux groupes
+    // ne fusionnent jamais. L'union-find d'avant chaînait les arêtes : sur le
+    // banc réel, une seule paire douteuse suffisait à souder Coltrane,
+    // Gainsbourg et Nougaro dans un groupe de cent pistes.
+    let meme = |i: usize, j: usize| {
+        let (a, b) = (&empreintes[i].1, &empreintes[j].1);
+        distance_grossiere(a, b).is_some_and(|d| d <= SEUIL_GROSSIER) && meme_contenu(a, b)
+    };
     let mut ordre: Vec<usize> = (0..empreintes.len()).collect();
     ordre.sort_by_key(|&i| empreintes[i].1.trames.len());
-    let mut parent: Vec<usize> = (0..empreintes.len()).collect();
+    let mut groupe_de: Vec<Option<usize>> = vec![None; empreintes.len()];
+    let mut groupes: Vec<Vec<usize>> = Vec::new();
     for (k, &i) in ordre.iter().enumerate() {
         let li = empreintes[i].1.trames.len();
         for &j in &ordre[k + 1..] {
             if empreintes[j].1.trames.len() > li + TOLERANCE_DUREE_TRAMES {
                 break;
             }
-            let (a, b) = (&empreintes[i].1, &empreintes[j].1);
-            if distance_grossiere(a, b).is_some_and(|d| d <= SEUIL_GROSSIER) && meme_contenu(a, b) {
-                let (ra, rb) = (racine(&mut parent, i), racine(&mut parent, j));
-                if ra != rb {
-                    parent[rb] = ra;
+            if !meme(i, j) {
+                continue;
+            }
+            match (groupe_de[i], groupe_de[j]) {
+                (None, None) => {
+                    groupes.push(vec![i, j]);
+                    groupe_de[i] = Some(groupes.len() - 1);
+                    groupe_de[j] = Some(groupes.len() - 1);
                 }
+                (Some(g), None) => {
+                    if groupes[g].iter().all(|&m| m == i || meme(m, j)) {
+                        groupes[g].push(j);
+                        groupe_de[j] = Some(g);
+                    }
+                }
+                (None, Some(g)) => {
+                    if groupes[g].iter().all(|&m| m == j || meme(m, i)) {
+                        groupes[g].push(i);
+                        groupe_de[i] = Some(g);
+                    }
+                }
+                (Some(_), Some(_)) => {}
             }
         }
     }
-    let mut groupes: std::collections::HashMap<usize, Vec<i64>> = std::collections::HashMap::new();
-    for (i, (id, _)) in empreintes.iter().enumerate() {
-        let r = racine(&mut parent, i);
-        groupes.entry(r).or_default().push(*id);
-    }
     let mut sortie: Vec<Vec<i64>> = groupes
-        .into_values()
+        .into_iter()
         .filter(|g| g.len() >= 2)
-        .map(|mut g| {
-            g.sort_unstable();
-            g
+        .map(|g| {
+            let mut ids: Vec<i64> = g.into_iter().map(|i| empreintes[i].0).collect();
+            ids.sort_unstable();
+            ids
         })
         .collect();
     sortie.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
@@ -481,5 +504,24 @@ mod tests {
             "les trois copies ensemble, les deux autres seuls"
         );
         assert!(grouper_par_contenu(&[]).is_empty());
+    }
+
+    /// Banc réel du 06/09/2026 : A ≈ B et B ≈ C ne font pas A ≈ C. Avec des
+    /// arêtes transitives, trois pistes dont les extrêmes sont étrangères
+    /// finissaient dans le même groupe — et de proche en proche, cent.
+    #[test]
+    fn le_regroupement_ne_chaine_pas_deux_voisins_dont_les_extremes_different() {
+        let plate = |niveau: u8| Empreinte {
+            version: VERSION.to_string(),
+            trames: vec![[niveau, niveau]; 600],
+        };
+        // Pas de 12 sur les deux octets : 24 / 510 = 0,047, sous le seuil ;
+        // deux pas : 0,094, au-dessus.
+        let a = plate(100);
+        let b = plate(112);
+        let c = plate(124);
+        assert!(meme_contenu(&a, &b) && meme_contenu(&b, &c) && !meme_contenu(&a, &c));
+        let groupes = grouper_par_contenu(&[(1, a), (2, b), (3, c)]);
+        assert_eq!(groupes, vec![vec![1, 2]], "{groupes:?}");
     }
 }

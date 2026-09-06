@@ -388,6 +388,10 @@ pub fn router() -> Router<AppState> {
             get(better_quality::album_better_quality),
         )
         .route("/duplicates/scan", post(duplicates::scan_duplicates))
+        .route(
+            "/duplicates/empreintes",
+            get(duplicates::couverture_empreintes).post(duplicates::empreinter_maintenant),
+        )
         .route("/duplicates/resolve", post(duplicates::resolve_duplicate))
         .route("/activity", get(stats::library_activity))
         .route("/albums/{id}/bio", get(albums::album_bio))
