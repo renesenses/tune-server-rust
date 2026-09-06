@@ -20,7 +20,7 @@ use tune_core::db::rating_repo::RatingRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
 
-use super::Pagination;
+use super::{Pagination, refus};
 
 #[derive(Deserialize)]
 pub(super) struct AlbumFilters {
@@ -1127,6 +1127,137 @@ pub(super) async fn albums_eclates(State(state): State<AppState>) -> Result<Json
     })))
 }
 
+/// Les dossiers (au sens `dossier_de`) où vivent les pistes d'un album.
+fn dossiers_de_l_album(state: &AppState, album_id: i64) -> std::collections::BTreeSet<String> {
+    let p1 = match state.backend.engine() {
+        Engine::Postgres => PostgresDialect.placeholder(1),
+        Engine::Sqlite => SqliteDialect.placeholder(1),
+    };
+    state
+        .backend
+        .query_many(
+            &format!(
+                "SELECT file_path FROM tracks WHERE album_id = {p1} AND file_path IS NOT NULL"
+            ),
+            &[&album_id as &dyn ToSqlValue],
+        )
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_string()))
+        .map(|chemin| dossier_de(&chemin).to_string())
+        .filter(|d| !d.is_empty())
+        .collect()
+}
+
+/// `POST /library/albums/{cible}/absorber/{doublon}` — BIB-A2, phase 1.
+///
+/// La phase 0 (`GET /library/albums/eclates`) nomme les faisceaux : même
+/// dossier, même titre normalisé, deux lignes `albums`. Ici l'utilisateur
+/// tranche, un couple à la fois, et le serveur vérifie avant d'agir la règle
+/// exacte de la phase 0 : les deux albums ont des pistes dans un **même
+/// dossier** (`dossier_de`), leurs titres ont la **même clé** (`cle_titre`),
+/// tous deux sont `local`, et la paire n'a pas été déclarée distincte
+/// (`album_distinct_pairs`). Rien n'est automatique : ni scan, ni migration,
+/// ni tâche de fond ne passent par ici.
+///
+/// Réponses : `200` avec le bilan de [`AlbumRepo::absorber`] (pistes,
+/// marqueurs, collections, champs repris) ; `404` album inconnu ; `400` même
+/// album des deux côtés ; `409 dossiers_differents`, `409 titres_differents`,
+/// `409 source_non_locale`, `409 paire_declaree_distincte`.
+pub(super) async fn absorber_album(
+    State(state): State<AppState>,
+    Path((cible, doublon)): Path<(i64, i64)>,
+) -> axum::response::Response {
+    if cible == doublon {
+        return refus(
+            StatusCode::BAD_REQUEST,
+            "meme_album",
+            "un album ne s'absorbe pas lui-même".to_string(),
+        );
+    }
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let (Ok(Some(album_cible)), Ok(Some(album_doublon))) = (repo.get(cible), repo.get(doublon))
+    else {
+        return refus(
+            StatusCode::NOT_FOUND,
+            "album_inconnu",
+            format!("albums {cible} / {doublon}"),
+        );
+    };
+    let non_locales = {
+        let (p1, p2) = match state.backend.engine() {
+            Engine::Postgres => (
+                PostgresDialect.placeholder(1),
+                PostgresDialect.placeholder(2),
+            ),
+            Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
+        };
+        state
+            .backend
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM albums WHERE id IN ({p1}, {p2}) AND COALESCE(source, 'local') <> 'local'"
+                ),
+                &[&cible as &dyn ToSqlValue, &doublon],
+            )
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+    };
+    if non_locales > 0 {
+        return refus(
+            StatusCode::CONFLICT,
+            "source_non_locale",
+            "seuls deux albums de la bibliothèque locale se regroupent".to_string(),
+        );
+    }
+    if cle_titre(&album_cible.title) != cle_titre(&album_doublon.title) {
+        return refus(
+            StatusCode::CONFLICT,
+            "titres_differents",
+            format!(
+                "« {} » et « {} » n'ont pas le même titre",
+                album_cible.title, album_doublon.title
+            ),
+        );
+    }
+    let dossiers_cible = dossiers_de_l_album(&state, cible);
+    let dossiers_doublon = dossiers_de_l_album(&state, doublon);
+    if dossiers_cible
+        .intersection(&dossiers_doublon)
+        .next()
+        .is_none()
+    {
+        return refus(
+            StatusCode::CONFLICT,
+            "dossiers_differents",
+            "les deux albums n'ont aucun dossier en commun : ce ne sont pas les éclats d'un même disque".to_string(),
+        );
+    }
+    if paires_distinctes(&state).contains(cible, doublon) {
+        return refus(
+            StatusCode::CONFLICT,
+            "paire_declaree_distincte",
+            "ces deux albums ont été déclarés distincts : l'arbitrage prime".to_string(),
+        );
+    }
+    match repo.absorber(cible, doublon) {
+        Ok(rapport) => {
+            state.event_bus.emit(
+                tune_core::event_types::EventType::LibraryUpdated.as_str(),
+                json!({ "source": "albums_absorber", "cible": cible, "doublon": doublon }),
+            );
+            (StatusCode::OK, Json(json!(rapport))).into_response()
+        }
+        Err(e) => refus(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "absorption_echouee",
+            e.to_string(),
+        ),
+    }
+}
+
 /// BIB-B1 — les ÉDITIONS d'un album.
 ///
 /// Les autres albums du MÊME artiste dont le titre est le même à un suffixe
@@ -1876,3 +2007,6 @@ mod tests_albums_eclates {
         assert_eq!(cle_titre("..."), "");
     }
 }
+
+#[cfg(test)]
+mod tests_regroupement;
