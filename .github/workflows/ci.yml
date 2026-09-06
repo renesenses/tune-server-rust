@@ -286,7 +286,7 @@ jobs:
       # aucune dependance a compiler — seulement les harnais — et fait tourner
       # leurs essais avec le jeu de fonctionnalites LIVRE, en plus du jeu
       # reduit du job `test`.
-      - run: cargo test --no-fail-fast -p tune-server -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
+      - run: cargo test --no-fail-fast -p tune-server -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,cloud-relay,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This
@@ -383,7 +383,7 @@ jobs:
           key: x86_64-pc-windows-msvc
           save-if: false
       - name: Windows livré sans ASIO
-        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
+        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,cloud-relay,postgres,dj,karaoke,bandcamp,plugins-wasm
       - name: Download ASIO SDK
         shell: pwsh
         run: |
@@ -392,7 +392,7 @@ jobs:
           $sdkDir = Get-ChildItem -Path asiosdk -Directory | Select-Object -First 1
           echo "CPAL_ASIO_DIR=$($sdkDir.FullName)" >> $env:GITHUB_ENV
       - name: ASIO
-        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
+        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
 
   # Un seul ABI/configuration macOS suffit : les deux architectures partagent le
   # meme cfg Rust. Les deux vrais binaires restent construits au push, puis par
@@ -470,7 +470,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,concerts,plugins-wasm
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux' && !matrix.cross
@@ -495,11 +495,11 @@ jobs:
 
       - name: Build (native, Linux with local-audio)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
       - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       # The `asio` feature (Windows-only, cfg(all(windows, feature="asio"))) is
       # NOT covered by the build above, so ASIO code compiled only at release
@@ -517,7 +517,7 @@ jobs:
 
       - name: ASIO feature compile-check (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo check --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
+        run: cargo check --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
