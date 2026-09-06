@@ -130,14 +130,82 @@ pub(super) async fn list_duplicates(
         })
         .collect();
 
+    let content_dups = doublons_par_contenu(&state, limit, offset);
+
     Ok(Json(json!({
         "duplicates": {
             "by_hash": hash_dups,
             "by_metadata": meta_dups,
             "by_fingerprint": fp_dups,
+            "by_content": content_dups,
         },
-        "total": hash_dups.len() + meta_dups.len() + fp_dups.len(),
+        "total": hash_dups.len() + meta_dups.len() + fp_dups.len() + content_dups.len(),
     })))
+}
+
+/// BIB-B2 (phase C) — les groupes de pistes dont le CONTENU décodé est le
+/// même (`audio/empreinte.rs`) : le rip FLAC et sa copie AAC, l'AIFF et son
+/// ALAC, deux résolutions du même master — ce que ni `audio_hash` (octets du
+/// conteneur) ni les métadonnées ne voient. Empreintes lues telles quelles,
+/// regroupées par `grouper_par_contenu` (durées à une seconde près, préfiltre
+/// grossier, puis comparaison alignée avec tolérance). Base antérieure à la
+/// colonne : liste vide, sans bruit. `limit`/`offset` portent sur les groupes.
+fn doublons_par_contenu(state: &AppState, limit: i64, offset: i64) -> Vec<Value> {
+    use tune_core::audio::empreinte::{Empreinte, grouper_par_contenu};
+    let rows = match state.backend.query_many(
+        "SELECT t.id, t.title, ar.name, t.file_path, t.duration_ms, t.format, t.sample_rate, \
+                t.bit_depth, t.audio_fingerprint \
+         FROM tracks t LEFT JOIN artists ar ON t.artist_id = ar.id \
+         WHERE t.audio_fingerprint IS NOT NULL",
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            if !(e.contains("no such column") || e.contains("does not exist")) {
+                tracing::warn!(error = %e, "duplicates_contenu_query_failed");
+            }
+            return Vec::new();
+        }
+    };
+    let mut fiches: std::collections::HashMap<i64, Value> = std::collections::HashMap::new();
+    let mut empreintes: Vec<(i64, Empreinte)> = Vec::new();
+    for row in &rows {
+        let Some(id) = row.first().and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let Some(empreinte) = row
+            .get(8)
+            .and_then(|v| v.as_string())
+            .and_then(|t| Empreinte::deserialiser(&t))
+        else {
+            continue;
+        };
+        fiches.insert(
+            id,
+            json!({
+                "id": id,
+                "title": row.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist_name": row.get(2).and_then(|v| v.as_string()),
+                "file_path": row.get(3).and_then(|v| v.as_string()),
+                "duration_ms": row.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                "format": row.get(5).and_then(|v| v.as_string()),
+                "sample_rate": row.get(6).and_then(|v| v.as_i64()),
+                "bit_depth": row.get(7).and_then(|v| v.as_i64()),
+            }),
+        );
+        empreintes.push((id, empreinte));
+    }
+    grouper_par_contenu(&empreintes)
+        .into_iter()
+        .skip(offset.max(0) as usize)
+        .take(limit.max(0) as usize)
+        .map(|ids| {
+            json!({
+                "match_type": "audio_content",
+                "tracks": ids.iter().filter_map(|id| fiches.get(id).cloned()).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 pub(super) async fn resolve_duplicate(
@@ -374,3 +442,6 @@ pub(super) async fn scan_duplicates(
         "errors": resultat.errors,
     })))
 }
+
+#[cfg(test)]
+pub(super) mod tests_contenu;
