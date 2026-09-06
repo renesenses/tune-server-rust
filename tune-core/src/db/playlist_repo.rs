@@ -178,7 +178,7 @@ impl PlaylistRepo {
 
     /// Read a playlist **only if it belongs to `profile_id`**.
     ///
-    /// [`get`] is kept for the internal paths that legitimately have no caller
+    /// [`get`](Self::get) is kept for the internal paths that legitimately have no caller
     /// identity (scan-sync of folder playlists, the public share-token route).
     /// Every HTTP handler that acts on behalf of somebody must use this one:
     /// `WHERE id = ?` alone is not an access control, since the ids are

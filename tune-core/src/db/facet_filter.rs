@@ -33,7 +33,7 @@
 //!    PostgreSQL.** La chaîne plate `a OR b OR c …` a une profondeur d'arbre
 //!    égale à son nombre de termes, et SQLite plafonne à 1 000. Le même filtre
 //!    rendait donc la bonne liste sur PostgreSQL et une liste VIDE sur SQLite.
-//!    [`ou_equilibre`] ramène la profondeur à `log2(n)`.
+//!    `ou_equilibre` ramène la profondeur à `log2(n)`.
 
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
@@ -119,7 +119,7 @@ impl Placeholders {
     /// Parenthésé : sans quoi le `OU` interne se ferait manger par le `ET`
     /// entre facettes. `None` si la liste est vide.
     ///
-    /// Les termes sont assemblés par [`ou_equilibre`] — voir le piège n°3.
+    /// Les termes sont assemblés par `ou_equilibre` — voir le piège n°3.
     pub fn or_like_ci(&mut self, expr: &str, n: usize) -> Option<String> {
         if n == 0 {
             return None;

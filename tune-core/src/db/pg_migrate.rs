@@ -273,6 +273,7 @@ CREATE TABLE IF NOT EXISTS tracks (
     file_mtime TEXT,
     file_size TEXT,
     audio_hash TEXT,
+    audio_fingerprint TEXT,
     source TEXT DEFAULT 'local',
     source_id TEXT,
     isrc TEXT,
@@ -907,6 +908,7 @@ ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS disc_number TEXT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_media_path TEXT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_start_ms BIGINT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_end_ms BIGINT;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_fingerprint TEXT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE

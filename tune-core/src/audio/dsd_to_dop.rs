@@ -5,8 +5,8 @@
 /// audio interfaces (WASAPI, ASIO, CoreAudio).
 ///
 /// DoP frame layout (24-bit LE per channel):
-///   byte 0: DSD bits [7:0]  (low byte of 16 DSD bits)
-///   byte 1: DSD bits [15:8] (high byte of 16 DSD bits)
+///   byte 0: DSD bits `[7:0]`  (low byte of 16 DSD bits)
+///   byte 1: DSD bits `[15:8]` (high byte of 16 DSD bits)
 ///   byte 2: marker (0x05 or 0xFA, alternating per frame)
 ///
 /// Sample rates:

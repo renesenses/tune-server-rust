@@ -21,6 +21,7 @@ pub mod dsf;
 pub mod embedding;
 /// READ side of audio embeddings (storage + cosine) — always compiled, no ort.
 pub mod embedding_store;
+pub mod empreinte;
 pub mod encoder;
 pub mod eq;
 pub mod eq_presets;

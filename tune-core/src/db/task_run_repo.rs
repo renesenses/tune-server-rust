@@ -13,11 +13,11 @@
 //! redemarrage, ne se filtre pas par passe, et ne se borne pas. Ici :
 //!
 //! * **ca survit** — c'est une table, relue apres redemarrage ;
-//! * **c'est borne** — [`RETENTION_EXECUTIONS_PAR_PASSE`] par passe et
-//!   [`RETENTION_JOURS`] d'age. Une table d'observabilite qui grossit sans fin
+//! * **c'est borne** — [`RETENTION_EXECUTIONS_PAR_PASSE`](crate::db::task_run_repo::RETENTION_EXECUTIONS_PAR_PASSE) par passe et
+//!   [`RETENTION_JOURS`](crate::db::task_run_repo::RETENTION_JOURS) d'age. Une table d'observabilite qui grossit sans fin
 //!   finit par couter plus cher que ce qu'elle observe ;
-//! * **c'est interrogeable** — [`TaskRunRepo::lister`] et
-//!   [`TaskRunRepo::resume`], exposees par la route `/system/task-runs`.
+//! * **c'est interrogeable** — [`TaskRunRepo::lister`](crate::db::task_run_repo::TaskRunRepo::lister) et
+//!   [`TaskRunRepo::resume`](crate::db::task_run_repo::TaskRunRepo::resume), exposees par la route `/system/task-runs`.
 //!
 //! # Les deux defauts que ce registre ne reproduit pas
 //!
@@ -26,8 +26,8 @@
 //! fin etait pose APRES la boucle : un redemarrage le sautait, et le reglage
 //! affirmait pour toujours qu'une passe tournait pendant que le fil qui
 //! l'ecrivait n'existait plus — bouton de relance grise sur une passe morte.
-//! Ici, chaque ligne porte le [`boot_id`] de l'incarnation du processus qui l'a
-//! ecrite, et [`TaskRunRepo::clore_orphelines`] ferme au demarrage tout ce qui
+//! Ici, chaque ligne porte le [`boot_id`](crate::db::task_run_repo::boot_id) de l'incarnation du processus qui l'a
+//! ecrite, et [`TaskRunRepo::clore_orphelines`](crate::db::task_run_repo::TaskRunRepo::clore_orphelines) ferme au demarrage tout ce qui
 //! reste `en_cours` sous un AUTRE boot. Aucune passe ne survit au processus qui
 //! la portait : le demarrage est la seule preuve necessaire.
 //!
@@ -44,7 +44,7 @@
 //!
 //! Ce registre contient des **compteurs et des verdicts**, pas des donnees. Ni
 //! chemin de fichier, ni cle, ni jeton. Le champ libre `detail` passe par
-//! [`detail_sans_donnees`] avant toute ecriture — c'est une garde, pas une
+//! [`detail_sans_donnees`](crate::db::task_run_repo::detail_sans_donnees) avant toute ecriture — c'est une garde, pas une
 //! excuse pour y verser n'importe quoi.
 
 use std::sync::Arc;
@@ -190,7 +190,7 @@ fn ressemble_a_un_secret(jeton: &str) -> bool {
 ///
 /// * tout jeton contenant `/` ou `\` devient `[chemin]` — cela couvre les
 ///   chemins POSIX, les chemins Windows et les URL ;
-/// * tout jeton qui [`ressemble_a_un_secret`] devient `[masque]` ;
+/// * tout jeton qui `ressemble_a_un_secret` devient `[masque]` ;
 /// * le resultat est tronque a [`DETAIL_MAX`] caracteres.
 ///
 /// Consequence assumee : un `12/34` ecrit dans `detail` sera masque. C'est

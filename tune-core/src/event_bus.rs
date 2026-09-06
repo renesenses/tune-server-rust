@@ -55,10 +55,10 @@ impl EventBus {
         });
     }
 
-    /// Emit using the typed [`EventType`] taxonomy. Preferred over [`emit`]
+    /// Emit using the typed [`EventType`](crate::event_types::EventType) taxonomy. Preferred over [`emit`](Self::emit)
     /// for new events: the event name is compile-checked against the enum
     /// rather than a free-form string, while staying wire-compatible (it
-    /// resolves to the same canonical dotted name via [`EventType::as_str`]).
+    /// resolves to the same canonical dotted name via [`EventType::as_str`](crate::event_types::EventType::as_str)).
     pub fn emit_typed(&self, event_type: crate::event_types::EventType, data: Value) {
         self.emit(event_type.as_str(), data);
     }

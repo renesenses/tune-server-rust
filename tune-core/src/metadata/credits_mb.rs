@@ -144,7 +144,7 @@ pub fn lignes_artist_credit(data: &Value) -> Vec<LigneCredit> {
 /// Deux changements par rapport aux trois copies qu'elle remplace :
 /// 1. **tous** les attributs d'instrument sont écrits — une ligne par couple
 ///    artiste × instrument — au lieu du seul `attributes[0]` ;
-/// 2. les types de relation sont FILTRÉS par [`role_canonique`].
+/// 2. les types de relation sont FILTRÉS par `role_canonique`.
 pub fn lignes_relations(data: &Value) -> Vec<LigneCredit> {
     let Some(relations) = data.get("relations").and_then(|v| v.as_array()) else {
         return Vec::new();

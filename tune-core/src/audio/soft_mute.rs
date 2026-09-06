@@ -36,13 +36,13 @@
 //! duquel une commande de transport commence à paraître molle. La demande
 //! initiale parlait de 1 à 2 secondes : à cette durée la pause ne serait plus une
 //! pause, et le remède serait pire que le défaut. Le réglage reste ouvert par
-//! zone, borné par [`SOFT_MUTE_MAX_MS`].
+//! zone, borné par [`SOFT_MUTE_MAX_MS`](crate::audio::soft_mute::SOFT_MUTE_MAX_MS).
 //!
 //! # Ce que la rampe ne doit JAMAIS toucher
 //!
 //! Une rampe de gain est une multiplication du signal. Elle est donc désarmée
 //! d'office, sans exception, dans les trois cas où le PCM doit sortir intact —
-//! voir [`armed_ms`] :
+//! voir [`armed_ms`](crate::audio::soft_mute::armed_ms) :
 //!
 //! * **DoP / DSD.** Un flux DoP est un train DSD emballé dans du PCM 24 bits dont
 //!   l'octet de tête porte le marqueur alterné `0x05`/`0xFA`. Tout facteur autre
@@ -56,7 +56,7 @@
 //!
 //! Dans ces trois cas le comportement redevient **exactement** celui d'avant :
 //! coupure franche. Et même armée, la rampe ne touche rien tant qu'elle est au
-//! repos à l'unité : [`SoftMuteRamp::apply`] ressort le tampon inchangé,
+//! repos à l'unité : [`SoftMuteRamp::apply`](crate::audio::soft_mute::SoftMuteRamp::apply) ressort le tampon inchangé,
 //! bit à bit, quand `gain == target == 1.0` et que le gain de base vaut 1.0.
 
 use std::sync::Arc;

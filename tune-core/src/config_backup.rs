@@ -27,7 +27,7 @@
 //!   rebuilds the install and only asks for a passphrase to re-attach the
 //!   streaming services.
 //! - Snapshots written before this change are still readable on import
-//!   ([`deobfuscate`]), because users have them. Nothing produces that format
+//!   (`deobfuscate`), because users have them. Nothing produces that format
 //!   any more.
 
 use std::sync::Arc;

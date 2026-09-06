@@ -101,7 +101,7 @@ pub struct TrackMetadata {
     /// balises mais du CHEMIN : les tags n'ont pas pu être lus du tout — délai
     /// dépassé sur le stockage, ou lofty incapable d'ouvrir le fichier. Seuls
     /// les replis « tout depuis le chemin » le posent :
-    /// [`tagless_fallback_no_props`], [`tagless_fallback`] et `m4a_fallback`.
+    /// [`tagless_fallback_no_props`], `tagless_fallback` et `m4a_fallback`.
     ///
     /// Il existe parce qu'un nom de dossier n'est pas un artiste : compté
     /// comme tel, il fabrique un DEUXIÈME artiste dans un dossier qui n'en a
