@@ -1,27 +1,33 @@
-//! Les sections « Autres versions » et « Radios récentes » sur une VRAIE base
-//! PostgreSQL, et le même résultat que sur SQLite (#3181).
+//! Les sections « Autres versions », « Radios récentes », « À découvrir » et
+//! « Top mixes » sur une VRAIE base PostgreSQL, et le même résultat que sur
+//! SQLite (#3181).
 //!
 //! ## Ce qui a échappé aux portes
 //!
 //! Le journal de #3181 montre trois requêtes de l'accueil en échec chez un
-//! testeur PostgreSQL, à la même seconde, dont deux traitées ici :
+//! testeur PostgreSQL, à la même seconde :
 //!
 //! - `for SELECT DISTINCT, ORDER BY expressions must appear in select list`
 //!   — « Autres versions », qui triait sur `lh.listened_at` sans le
 //!   sélectionner ;
 //! - `operator does not exist: text = integer` — « Radios récemment
 //!   écoutées », qui comparait `is_favorite` à l'entier `0` alors que la
-//!   colonne est `TEXT` sur une base venue de SQLite.
+//!   colonne est `TEXT` sur une base venue de SQLite ;
+//! - `column reference "genre" is ambiguous` — la requête des genres les
+//!   plus écoutés, partagée par « À découvrir » et « Top mixes », dont le
+//!   `WHERE genre` se heurtait à `t.genre` et `a.genre`.
 //!
-//! SQLite accepte les deux formes. Les deux sections partaient donc vides sur
-//! PostgreSQL, et `ou_defaut_journalise` rendait `200 []` : rien à l'écran,
-//! rien dans le corps de la réponse, une seule ligne dans le journal serveur.
+//! SQLite accepte les deux premières formes ; la troisième échoue aussi chez
+//! lui. Les sections partaient donc vides sur PostgreSQL — ou, pour
+//! « À découvrir », rendaient des albums AU HASARD présentés comme des
+//! recommandations — et `ou_defaut_journalise` rendait `200` : rien à
+//! l'écran qui le dise, une seule ligne dans le journal serveur.
 //!
 //! `pg_routes_serveur.rs` frappe déjà `/api/v1/home/recently-added` sur
-//! PostgreSQL, mais il ne vérifie que le STATUT. Or ces deux routes rendent
-//! `200` avec un corps vide quand leur requête échoue : un test de statut est
-//! par construction aveugle à ce défaut. C'est pourquoi ce fichier sème des
-//! données et exige des LIGNES.
+//! PostgreSQL, mais il ne vérifie que le STATUT. Or ces routes rendent `200`
+//! avec un corps vide (ou plausible) quand leur requête échoue : un test de
+//! statut est par construction aveugle à ce défaut. C'est pourquoi ce fichier
+//! sème des données et exige des LIGNES, puis les nomme.
 //!
 //! ## Les deux moteurs, dans le même test
 //!
@@ -57,10 +63,16 @@ const ROUTES_SONDEES: &[&str] = &[
     "/api/v1/home/other-versions",
     // #3181 — `is_favorite = 0` sur une colonne `TEXT`.
     "/api/v1/home/radio-picks",
+    // #3181 — `genre` ambigu dans la requête des genres les plus écoutés.
+    // Les deux routes tirent au hasard (`ORDER BY RANDOM()`) : la semence ne
+    // leur laisse qu'UNE ligne possible, pour que la comparaison entre
+    // moteurs porte sur le contenu et non sur le tirage.
+    "/api/v1/home/recommendations",
+    "/api/v1/home/top-mixes",
 ];
 
 /// Plancher du détecteur.
-const MINIMUM_DE_ROUTES: usize = 2;
+const MINIMUM_DE_ROUTES: usize = 4;
 
 /// Les tables vidées avant la semence, dans l'ordre des dépendances.
 ///
@@ -140,6 +152,24 @@ fn semer(state: &AppState) {
          VALUES ('Running Up That Hill', 'Kate Bush', 'Hit Collection', '2026-08-29T18:04:00Z')",
         "INSERT INTO listen_history (title, artist_name, album_title, listened_at) \
          VALUES ('Running Up That Hill', 'Kate Bush', 'Hit Collection', '2026-08-30T07:11:00Z')",
+        // ── « À découvrir » et « Top mixes » ──
+        // Un seul genre dans l'historique, porté par l'album écouté ; un seul
+        // autre album de ce genre, jamais écouté : la recommandation attendue.
+        // Les albums de Kate Bush n'ont pas de genre et n'entrent pas en jeu.
+        // L'écoute part de l'album lui-même (`album_id` posé, même titre
+        // d'album) : « Autres versions » l'écarte, sa règle exigeant un album
+        // DIFFÉRENT, et le groupe de Kate Bush reste seul.
+        "INSERT INTO artists (name) VALUES ('Nina Simone')",
+        "INSERT INTO albums (title, artist_id, genre) \
+         SELECT 'Pastel Blues', id, 'Jazz' FROM artists WHERE name = 'Nina Simone'",
+        "INSERT INTO albums (title, artist_id, genre) \
+         SELECT 'Wild Is the Wind', id, 'Jazz' FROM artists WHERE name = 'Nina Simone'",
+        "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+         SELECT 'Sinnerman', al.id, al.artist_id, '618000', '/i3181/sinnerman.flac' \
+         FROM albums al WHERE al.title = 'Pastel Blues'",
+        "INSERT INTO listen_history (title, artist_name, album_title, album_id, listened_at) \
+         SELECT 'Sinnerman', 'Nina Simone', 'Pastel Blues', id, '2026-08-27T21:00:00Z' \
+         FROM albums WHERE title = 'Pastel Blues'",
         // ── « Radios » ──
         // Une favorite, une non-favorite datée, une jamais jouée.
         "INSERT INTO radio_stations (name, url, is_favorite, last_played) \
@@ -262,6 +292,21 @@ async fn pg_3181_sections_accueil_rendent_les_memes_lignes_que_sqlite() {
     );
 
     verifier_radios_recentes(&pg).await;
+
+    // « À découvrir » : l'album de Jazz pas encore écouté, proposé POUR SON
+    // GENRE — pas un tirage au hasard maquillé en recommandation.
+    let decouvrir = corps_de(&pg, "/api/v1/home/recommendations").await;
+    let albums = decouvrir.as_array().expect("albums recommandés");
+    assert_eq!(albums.len(), 1, "albums recommandés : {albums:?}");
+    assert_eq!(albums[0]["title"].as_str(), Some("Wild Is the Wind"));
+    assert_eq!(albums[0]["reason"].as_str(), Some("genre_match"));
+
+    // « Top mixes » : un mix pour le seul genre écouté, garni de sa piste.
+    let mixes = corps_de(&pg, "/api/v1/home/top-mixes").await;
+    let mixes = mixes.as_array().expect("mixes");
+    assert_eq!(mixes.len(), 1, "mixes rendus : {mixes:?}");
+    assert_eq!(mixes[0]["genre"].as_str(), Some("Jazz"));
+    assert_eq!(mixes[0]["tracks"][0]["title"].as_str(), Some("Sinnerman"));
 
     // ── 4. Le schéma DU SIGNALEMENT : `is_favorite` en TEXT ──
     //
