@@ -137,6 +137,8 @@ pub(super) async fn network_health(
 pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = repo.list().unwrap_or_default();
+    // DUP-1 (phase 2) : l'age de la derniere reponse, une requete pour toutes.
+    let ages = repo.ages_depuis_derniere_vue().unwrap_or_default();
     let devices = state.scanner.devices().await;
     // Manually-added devices (e.g. legacy DLNA renderers that never appear in
     // SSDP discovery) are registered as outputs but absent from `devices`.
@@ -328,6 +330,11 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                     .unwrap_or(false),
             };
             obj.insert("online".into(), json!(online));
+            for (cle, valeur) in
+                super::presence::Presence::qualifier(online, ages.get(&zone_id).copied()).champs()
+            {
+                obj.insert(cle.into(), valeur);
+            }
             obj.insert(
                 "output_reach".into(),
                 json!(output_reach(&state, z, &ps).await),
@@ -495,6 +502,14 @@ pub(super) async fn get_zone(
                         .unwrap_or(false),
                 };
                 obj.insert("online".into(), json!(online));
+                let age = ZoneRepo::with_backend(state.backend.clone())
+                    .ages_depuis_derniere_vue()
+                    .unwrap_or_default()
+                    .get(&id)
+                    .copied();
+                for (cle, valeur) in super::presence::Presence::qualifier(online, age).champs() {
+                    obj.insert(cle.into(), valeur);
+                }
                 obj.insert(
                     "output_reach".into(),
                     json!(output_reach(&state, &zone, &ps).await),

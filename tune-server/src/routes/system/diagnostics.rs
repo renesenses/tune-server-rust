@@ -311,17 +311,25 @@ fn hote_de_zone(
         .map(str::to_string)
 }
 
+/// DUP-1 (phase 2) : dans un groupe, une zone hors ligne dont une jumelle est
+/// en ligne est PROBABLEMENT remplacee — l'appareil a change d'identifiant et
+/// l'ancienne ligne ne reviendra pas. C'est une proposition de fusion
+/// (`POST /zones/{doublon}/fusionner-dans/{cible}`), jamais une action, et
+/// jamais deduite de l'age seul : une zone seule, si vieille soit-elle, est
+/// eteinte, pas remplacee.
 fn groupe_json(motif: &str, cle: &str, zones: &[&ZoneVue]) -> Value {
+    let en_ligne = zones.iter().filter(|z| z.online).count();
     json!({
         "motif": motif,
         "cle": cle,
-        "en_ligne": zones.iter().filter(|z| z.online).count(),
+        "en_ligne": en_ligne,
         "zones": zones.iter().map(|z| json!({
             "id": z.id,
             "name": z.name,
             "output_type": z.output_type,
             "output_device_id": z.output_device_id,
             "online": z.online,
+            "remplacee_probable": !z.online && en_ligne > 0,
         })).collect::<Vec<_>>(),
     })
 }
@@ -2750,6 +2758,54 @@ mod tests_doublons_de_zones {
             output_device_id: dev.into(),
             online,
         }
+    }
+
+    /// DUP-1 (phase 2) : « remplacée » ne vient que d'une jumelle en ligne.
+    /// Le Sonos hors ligne dont l'UDN racine est en ligne est probablement
+    /// remplacé ; deux zones d'un même appareil toutes deux hors ligne ne le
+    /// sont pas ; une zone seule n'apparaît même pas.
+    #[test]
+    fn remplacee_probable_ne_vient_que_d_une_jumelle_en_ligne() {
+        let zones = vec![
+            zone(
+                6,
+                "Chambre",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400_MR",
+                false,
+            ),
+            zone(
+                8,
+                "Chambre - Sonos",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400",
+                true,
+            ),
+            zone(30, "Bureau", "dlna", "uuid:BUREAU_MR", false),
+            zone(31, "Bureau - Node", "dlna", "uuid:BUREAU", false),
+            zone(12, "Lindemann", "dlna", "uuid:LINDEMANN", false),
+        ];
+        let groupes = doublons_de_zones(&zones, &[]);
+        let drapeau = |id: i64| {
+            groupes
+                .iter()
+                .flat_map(|g| g["zones"].as_array().cloned().unwrap_or_default())
+                .find(|z| z["id"].as_i64() == Some(id))
+                .map(|z| z["remplacee_probable"].as_bool().unwrap_or(false))
+        };
+        assert_eq!(
+            drapeau(6),
+            Some(true),
+            "hors ligne, jumelle en ligne : remplacée probable"
+        );
+        assert_eq!(drapeau(8), Some(false), "la jumelle en ligne ne l'est pas");
+        assert_eq!(
+            drapeau(30),
+            Some(false),
+            "deux zones hors ligne : éteintes, pas remplacées"
+        );
+        assert_eq!(drapeau(31), Some(false));
+        assert_eq!(drapeau(12), None, "une zone seule n'est pas un doublon");
     }
 
     /// La mesure du 05/09 sur .18, rejouée : le Sonos (UDN et UDN `_MR`), le

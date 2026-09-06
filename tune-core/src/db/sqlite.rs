@@ -502,7 +502,10 @@ CREATE TABLE IF NOT EXISTS zones (
     mac TEXT,
     -- Décalage des paroles synchronisées, en ms (positif = retardées).
     -- Compense la latence serveur → oreille, propre à chaque appareil (#1328).
-    lyrics_offset_ms INTEGER NOT NULL DEFAULT 0
+    lyrics_offset_ms INTEGER NOT NULL DEFAULT 0,
+    -- DUP-1 (phase 2) : dernière fois que l'appareil a répondu (ISO 8601 UTC).
+    -- NULL = jamais vue depuis la pose de la colonne. TEXT des deux côtés.
+    last_seen_at TEXT
 );
 
 -- Unified queue (v0.9 rc.2): a single ordered queue per zone holding both

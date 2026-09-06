@@ -259,6 +259,52 @@ pub mod sql {
         )
     }
 
+    /// L'instant courant en ISO 8601 UTC, calcule par la base elle-meme :
+    /// aucun format a produire cote Rust, et le meme texte des deux cotes.
+    pub fn maintenant_iso(engine: Engine) -> &'static str {
+        match engine {
+            Engine::Sqlite => "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            Engine::Postgres => {
+                "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
+            }
+        }
+    }
+
+    /// Passage EN LIGNE : `online` ET `last_seen_at` (DUP-1, phase 2). Le
+    /// passage hors ligne, lui, ne touche pas a la date — c'est ce qui en
+    /// fait une « derniere fois vue ».
+    pub fn marquer_en_ligne_par_appareil<D: SqlDialect>(d: &D, engine: Engine) -> String {
+        format!(
+            "UPDATE zones SET online = {}, last_seen_at = {} WHERE output_device_id = {}",
+            d.placeholder(1),
+            maintenant_iso(engine),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn marquer_en_ligne_par_id<D: SqlDialect>(d: &D, engine: Engine) -> String {
+        format!(
+            "UPDATE zones SET online = {}, last_seen_at = {} WHERE id = {}",
+            d.placeholder(1),
+            maintenant_iso(engine),
+            d.placeholder(2)
+        )
+    }
+
+    /// Age, en secondes, de la derniere reponse de chaque zone qui en a une.
+    pub fn ages_depuis_derniere_vue(engine: Engine) -> &'static str {
+        match engine {
+            Engine::Sqlite => {
+                "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', last_seen_at) AS INTEGER) \
+                 FROM zones WHERE last_seen_at IS NOT NULL"
+            }
+            Engine::Postgres => {
+                "SELECT id, CAST(EXTRACT(EPOCH FROM (now() - last_seen_at::timestamptz)) AS BIGINT) \
+                 FROM zones WHERE last_seen_at IS NOT NULL"
+            }
+        }
+    }
+
     pub fn set_online_by_device<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET online = {} WHERE output_device_id = {}",
@@ -1268,10 +1314,43 @@ impl ZoneRepo {
 
     pub fn update_online(&self, id: i64, online: bool) -> Result<(), String> {
         let val: String = if online { "1".into() } else { "0".into() };
-        let sql = self.update_field_sql("online");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        if online {
+            let engine = self.db.engine();
+            let sql = self.dialect_sql(
+                |d| sql::marquer_en_ligne_par_id(d, engine),
+                |d| sql::marquer_en_ligne_par_id(d, engine),
+            );
+            match self.db.execute(&sql, &params) {
+                Ok(_) => return Ok(()),
+                // Base anterieure a la colonne : on ecrit au moins `online`.
+                Err(e) if e.contains("no such column") || e.contains("does not exist") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let sql = self.update_field_sql("online");
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// L'age, en secondes, de la derniere reponse de chaque zone qui en a une
+    /// (DUP-1, phase 2). Une zone absente de la carte n'a jamais ete vue
+    /// depuis la pose de la colonne. Base anterieure a la colonne : carte vide.
+    pub fn ages_depuis_derniere_vue(&self) -> Result<std::collections::HashMap<i64, i64>, String> {
+        let lignes = match self
+            .db
+            .query_many_strong(sql::ages_depuis_derniere_vue(self.db.engine()), &[])
+        {
+            Ok(l) => l,
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                return Ok(Default::default());
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(lignes
+            .iter()
+            .filter_map(|l| Some((l.first()?.as_i64()?, l.get(1)?.as_i64()?)))
+            .collect())
     }
 
     pub fn update_gapless_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
@@ -1835,8 +1914,22 @@ impl ZoneRepo {
 
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
         let val: String = if online { "1".into() } else { "0".into() };
-        let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
         let params: [&dyn ToSqlValue; 2] = [&val, &device_id];
+        if online {
+            // DUP-1 (phase 2) : le passage en ligne date la derniere reponse.
+            let engine = self.db.engine();
+            let sql = self.dialect_sql(
+                |d| sql::marquer_en_ligne_par_appareil(d, engine),
+                |d| sql::marquer_en_ligne_par_appareil(d, engine),
+            );
+            match self.db.execute(&sql, &params) {
+                Ok(n) => return Ok(n),
+                // Base anterieure a la colonne : on ecrit au moins `online`.
+                Err(e) if e.contains("no such column") || e.contains("does not exist") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
         self.db.execute(&sql, &params)
     }
 
@@ -3272,6 +3365,52 @@ mod autoplay_mode_tests {
         );
         assert_eq!(remplacer_dans_la_liste("[1, 2]", 20, 4), None);
         assert_eq!(remplacer_dans_la_liste("pas une liste", 20, 4), None);
+    }
+
+    /// DUP-1 (phase 2) : le passage EN LIGNE date la zone, le passage hors
+    /// ligne ne touche pas a la date, et l'age se lit en secondes ; une zone
+    /// jamais vue n'a pas d'age.
+    #[test]
+    fn le_passage_en_ligne_date_la_zone_et_le_passage_hors_ligne_garde_la_date() {
+        let repo = repo();
+        let vue = repo
+            .create("Salon", Some("dlna"), Some("uuid:salon"))
+            .unwrap();
+        let jamais = repo
+            .create("Cave", Some("dlna"), Some("uuid:cave"))
+            .unwrap();
+        let lue = |id: i64| {
+            valeur_texte(
+                &repo,
+                &format!("SELECT last_seen_at FROM zones WHERE id = {id}"),
+            )
+        };
+        assert_eq!(lue(vue), None, "avant tout passage en ligne : NULL");
+
+        repo.set_online_by_device("uuid:salon", true).unwrap();
+        let date = lue(vue).expect("le passage en ligne pose la date");
+        assert!(
+            date.ends_with('Z') && date.len() == 20,
+            "ISO 8601 UTC : {date}"
+        );
+
+        repo.set_online_by_device("uuid:salon", false).unwrap();
+        assert_eq!(
+            lue(vue).as_deref(),
+            Some(date.as_str()),
+            "hors ligne ne touche pas la date"
+        );
+        assert_eq!(lue(jamais), None);
+
+        let ages = repo.ages_depuis_derniere_vue().unwrap();
+        assert!(
+            ages.get(&vue).is_some_and(|a| (0..=5).contains(a)),
+            "age en secondes : {ages:?}"
+        );
+        assert!(!ages.contains_key(&jamais), "jamais vue : pas d'age");
+
+        repo.update_online(jamais, true).unwrap();
+        assert!(lue(jamais).is_some(), "par identifiant aussi");
     }
 
     /// Defaut inchange : une zone neuve n'enchaine rien.
