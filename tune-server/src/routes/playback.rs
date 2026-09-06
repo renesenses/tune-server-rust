@@ -2505,18 +2505,29 @@ async fn resolve_streaming_queue_meta(
 /// Deux résolutions parallèles, c'est le montage qui a déjà fait perdre le
 /// canal des bandes d'égaliseur (#2313) et les identifiants de la lecture en
 /// cours. Une seule, partagée.
+///
+/// ## Pourquoi le repli passe par ici et pas seulement par l'écran (#1362)
+///
+/// La liste d'un album à l'écran passe par `dedup_display_tracks`
+/// (`routes/library/albums.rs`) : deux fichiers du même morceau dans le même
+/// album n'y font qu'une ligne. La file, elle, prenait `list_by_album` **brut**.
+/// La zone recevait donc des pistes que l'écran cache — et un album dont le
+/// dossier contient à la fois le rip AIFF et une copie AAC du même titre se
+/// jouait **deux fois** sur ce morceau, dans deux résolutions, sans que rien
+/// ne l'annonce (Cyrille Moutia, forum 1260, 01/08). Un écran et une file qui
+/// se répondent : le même repli, appelé au même endroit que la résolution.
 fn resoudre_pistes_d_album(
     state: &AppState,
     track_repo: &tune_core::db::track_repo::TrackRepo,
     album_id: i64,
     zone_id: i64,
 ) -> Vec<i64> {
-    let mut ids: Vec<i64> = track_repo
-        .list_by_album(album_id)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|t| t.id)
-        .collect();
+    use tune_core::db::track_repo::dedup_display_tracks;
+    let mut ids: Vec<i64> =
+        dedup_display_tracks(track_repo.list_by_album(album_id).unwrap_or_default())
+            .iter()
+            .filter_map(|t| t.id)
+            .collect();
     if ids.is_empty() {
         // La ligne cliquée n'a pas de pistes : les grilles Albums/Genres/Années
         // exposent parfois une ligne périmée dont les pistes vivent sous une
@@ -2529,9 +2540,7 @@ fn resoudre_pistes_d_album(
                 .ok()
                 .flatten()
         {
-            ids = track_repo
-                .list_by_album(sibling)
-                .unwrap_or_default()
+            ids = dedup_display_tracks(track_repo.list_by_album(sibling).unwrap_or_default())
                 .iter()
                 .filter_map(|t| t.id)
                 .collect();
