@@ -10,6 +10,12 @@
 //! déplace un peu le signal (délai d'encodage, bruit de quantification), il ne
 //! le change pas.
 //!
+//! Granularite : deux contenus de meme enveloppe et de hauteur dominante
+//! voisine (un sinus pur de 440 Hz, un melange 220/330/440) se ressemblent
+//! pour elle. Elle reconnait un MEME enregistrement sous deux encodages ; elle
+//! ne classe pas des morceaux differents, et BIB-B3 la croise avec la duree,
+//! le titre et l'artiste avant de nommer un doublon.
+//!
 //! Ce module est pur : aucune base, aucun réseau, aucune dépendance nouvelle,
 //! présent dans le binaire par défaut (Tune OS sur Raspberry Pi n'a ni la
 //! feature `audio-embedding`, ni `fpcalc`). Le stockage (`tracks.audio_fingerprint`),
@@ -229,6 +235,83 @@ pub fn meme_contenu(a: &Empreinte, b: &Empreinte) -> bool {
     distance(a, b).is_some_and(|d| d <= SEUIL_MEME_CONTENU)
 }
 
+/// Une trame sur [`PAS_GROSSIER`] pour la comparaison grossière.
+pub const PAS_GROSSIER: usize = 8;
+/// Au-delà, la comparaison grossière écarte la paire sans aller plus loin.
+pub const SEUIL_GROSSIER: f64 = 0.18;
+/// Deux enregistrements identiques n'ont pas des durées utiles qui diffèrent
+/// de plus d'une seconde (rembourrage d'encodeur, fondu coupé).
+pub const TOLERANCE_DUREE_TRAMES: usize = 10;
+
+/// Distance grossière : sans décalage, une trame sur [`PAS_GROSSIER`]. Un
+/// préfiltre bon marché pour écarter ce qui n'a rien à voir avant la
+/// comparaison alignée. `None` si les versions diffèrent.
+pub fn distance_grossiere(a: &Empreinte, b: &Empreinte) -> Option<f64> {
+    if a.version != b.version {
+        return None;
+    }
+    let n = a.trames.len().min(b.trames.len());
+    if n == 0 {
+        return None;
+    }
+    let mut somme = 0.0;
+    let mut compte = 0usize;
+    for i in (0..n).step_by(PAS_GROSSIER) {
+        let (ta, tb) = (a.trames[i], b.trames[i]);
+        somme +=
+            ((ta[0] as f64 - tb[0] as f64).abs() + (ta[1] as f64 - tb[1] as f64).abs()) / 510.0;
+        compte += 1;
+    }
+    Some(somme / compte as f64)
+}
+
+/// Regroupe des pistes par contenu : les paires dont les durées utiles sont à
+/// [`TOLERANCE_DUREE_TRAMES`] près, qui passent le préfiltre grossier puis
+/// [`meme_contenu`], sont réunies (union-find). Rend les groupes d'au moins
+/// deux identifiants, les plus grands d'abord, identifiants croissants.
+pub fn grouper_par_contenu(empreintes: &[(i64, Empreinte)]) -> Vec<Vec<i64>> {
+    fn racine(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut ordre: Vec<usize> = (0..empreintes.len()).collect();
+    ordre.sort_by_key(|&i| empreintes[i].1.trames.len());
+    let mut parent: Vec<usize> = (0..empreintes.len()).collect();
+    for (k, &i) in ordre.iter().enumerate() {
+        let li = empreintes[i].1.trames.len();
+        for &j in &ordre[k + 1..] {
+            if empreintes[j].1.trames.len() > li + TOLERANCE_DUREE_TRAMES {
+                break;
+            }
+            let (a, b) = (&empreintes[i].1, &empreintes[j].1);
+            if distance_grossiere(a, b).is_some_and(|d| d <= SEUIL_GROSSIER) && meme_contenu(a, b) {
+                let (ra, rb) = (racine(&mut parent, i), racine(&mut parent, j));
+                if ra != rb {
+                    parent[rb] = ra;
+                }
+            }
+        }
+    }
+    let mut groupes: std::collections::HashMap<usize, Vec<i64>> = std::collections::HashMap::new();
+    for (i, (id, _)) in empreintes.iter().enumerate() {
+        let r = racine(&mut parent, i);
+        groupes.entry(r).or_default().push(*id);
+    }
+    let mut sortie: Vec<Vec<i64>> = groupes
+        .into_values()
+        .filter(|g| g.len() >= 2)
+        .map(|mut g| {
+            g.sort_unstable();
+            g
+        })
+        .collect();
+    sortie.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
+    sortie
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +445,41 @@ mod tests {
             meme_contenu(&e, &c),
             "un extrait tronqué du même morceau se reconnaît si le recouvrement suffit… "
         );
+    }
+
+    #[test]
+    fn grouper_par_contenu_reunit_les_copies_et_separe_les_morceaux() {
+        let a = empreinte_des_echantillons(&signal(&[220.0, 330.0, 440.0], 30.0, 1.0, 0.8), 16)
+            .unwrap();
+        let a_perte = empreinte_des_echantillons(
+            &avec_perte(&signal(&[220.0, 330.0, 440.0], 30.0, 1.0, 0.8), 551, 48),
+            16,
+        )
+        .unwrap();
+        let a_attenue = empreinte_des_echantillons(
+            &signal(&[220.0, 330.0, 440.0], 30.0, 1.0, 0.8)
+                .iter()
+                .map(|s| s / 2)
+                .collect::<Vec<_>>(),
+            16,
+        )
+        .unwrap();
+        let b =
+            empreinte_des_echantillons(&signal(&[1_000.0, 1_500.0], 30.0, 1.0, 0.8), 16).unwrap();
+        // Un contenu franchement different : l'empreinte (enveloppe + passages par zero)
+        // ne separe PAS un sinus pur de 440 Hz d'un melange domine par 440 Hz —
+        // c'est sa granularite, dite dans le doc du module.
+        let c =
+            empreinte_des_echantillons(&signal(&[3_000.0, 4_200.0], 30.0, 0.0, 0.8), 16).unwrap();
+        let d_grossiere = distance_grossiere(&a, &a_perte).unwrap();
+        assert!(d_grossiere <= SEUIL_GROSSIER, "préfiltre : {d_grossiere}");
+        assert!(distance_grossiere(&a, &b).unwrap() > SEUIL_GROSSIER);
+        let groupes = grouper_par_contenu(&[(7, b), (3, a_perte), (9, c), (1, a), (5, a_attenue)]);
+        assert_eq!(
+            groupes,
+            vec![vec![1, 3, 5]],
+            "les trois copies ensemble, les deux autres seuls"
+        );
+        assert!(grouper_par_contenu(&[]).is_empty());
     }
 }

@@ -1326,6 +1326,7 @@ pub(super) async fn album_editions(
         .map(|r| {
             let titre = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
             let pistes = r.get(4).and_then(|v| v.as_i64());
+            let autre = r.first().and_then(|v| v.as_i64()).unwrap_or(0);
             json!({
                 "id": r.first().and_then(|v| v.as_i64()).unwrap_or(0),
                 "title": titre,
@@ -1341,6 +1342,14 @@ pub(super) async fn album_editions(
                 "cover_path": r.get(10).and_then(|v| v.as_string()),
                 "musicbrainz_release_id": r.get(11).and_then(|v| v.as_string()),
                 "same_track_count": pistes.is_some() && pistes == pistes_album,
+                // BIB-B2 (phase C) : le CONTENU des pistes, quand les empreintes
+                // existent des deux côtés — `null` tant qu'on ne sait pas.
+                "same_content": match contenu_commun(&state, id, autre) {
+                    (0, _) => Value::Null,
+                    (comparees, memes) => json!(memes * 5 >= comparees * 4),
+                },
+                "content_compared": contenu_commun(&state, id, autre).0,
+                "content_same": contenu_commun(&state, id, autre).1,
             })
         })
         .collect();
@@ -1356,6 +1365,59 @@ pub(super) async fn album_editions(
 
 /// Les albums d'un artiste au titre équivalent à `titre` (règle exacte de
 /// #2372), l'album `id` exclu, les plus anciens d'abord.
+/// BIB-B2 (phase C) : les empreintes de contenu des pistes d'un album, par
+/// (disque, numéro). Base antérieure à la colonne : rien.
+fn empreintes_de_l_album(
+    state: &AppState,
+    album_id: i64,
+) -> std::collections::BTreeMap<(i64, i64), tune_core::audio::empreinte::Empreinte> {
+    let p1 = match state.backend.engine() {
+        Engine::Postgres => PostgresDialect.placeholder(1),
+        Engine::Sqlite => SqliteDialect.placeholder(1),
+    };
+    let sql = format!(
+        "SELECT COALESCE(disc_number, 1), COALESCE(track_number, 0), audio_fingerprint \
+         FROM tracks WHERE album_id = {p1} AND audio_fingerprint IS NOT NULL"
+    );
+    match state
+        .backend
+        .query_many(&sql, &[&album_id as &dyn ToSqlValue])
+    {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|r| {
+                let disque = r.first()?.as_i64()?;
+                let numero = r.get(1)?.as_i64()?;
+                let empreinte =
+                    tune_core::audio::empreinte::Empreinte::deserialiser(&r.get(2)?.as_string()?)?;
+                Some(((disque, numero), empreinte))
+            })
+            .collect(),
+        Err(_) => Default::default(),
+    }
+}
+
+/// Pistes comparables entre deux albums (même disque, même numéro, une
+/// empreinte de chaque côté) et, parmi elles, celles de même contenu.
+fn contenu_commun(state: &AppState, a: i64, b: i64) -> (usize, usize) {
+    let ea = empreintes_de_l_album(state, a);
+    if ea.is_empty() {
+        return (0, 0);
+    }
+    let eb = empreintes_de_l_album(state, b);
+    let mut comparees = 0usize;
+    let mut memes = 0usize;
+    for (cle, x) in &ea {
+        if let Some(y) = eb.get(cle) {
+            comparees += 1;
+            if tune_core::audio::empreinte::meme_contenu(x, y) {
+                memes += 1;
+            }
+        }
+    }
+    (comparees, memes)
+}
+
 fn albums_au_titre_equivalent(
     state: &AppState,
     artist_id: i64,
@@ -2010,3 +2072,6 @@ mod tests_albums_eclates {
 
 #[cfg(test)]
 mod tests_regroupement;
+
+#[cfg(test)]
+mod tests_contenu;
