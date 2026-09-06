@@ -866,25 +866,31 @@ fn dsd_lpcm_streams_only_when_toggled_and_dsd_wav() {
 
 /// Un traitement actif RAMÈNE au fichier temporaire, quel que soit le reste.
 ///
-/// Le bras progressif ne branche ni égaliseur, ni convolveur, ni
-/// ReplayGain : les y envoyer, c'est les perdre sans le dire. Les deux
-/// premières lignes sont exactement les cas que le bras progressif gagne
-/// aujourd'hui (renderer FLAC depuis 0cf27ade ; renderer LPCM le jour où
-/// `dsd_lpcm_stream` deviendrait le défaut, #1363).
+/// LAT-F1 (phase 0) — le bras progressif applique désormais lui-même le
+/// traitement de la zone (`spawn_streaming_dsp_relay`) : une cible WAV
+/// n'est plus renvoyée au fichier par un égaliseur, un convolveur ou le
+/// ReplayGain. C'était la cause des 46 à 62 s de silence d'une zone DLNA
+/// avec égaliseur (#3357). Une cible non WAV (FLAC ré-encodé) passe
+/// toujours par le fichier : l'encodeur n'est branché que là.
 #[test]
-fn un_traitement_actif_ramene_au_fichier() {
+fn un_traitement_actif_ne_ramene_plus_au_fichier_quand_la_cible_est_wav() {
     // Renderer FLAC-capable, DSD → WAV progressif : streame sans DSP…
     assert!(!use_file_transcode_for(true, true, false, false, false));
-    // …et repasse par le fichier dès qu'un traitement est actif.
-    assert!(use_file_transcode_for(true, true, false, false, true));
+    // …et STREAME AUSSI avec un traitement actif : le relais l'applique.
+    assert!(!use_file_transcode_for(true, true, false, false, true));
     // Renderer LPCM, bascule « Streaming continu » armée : même règle.
     assert!(!use_file_transcode_for(true, true, true, true, false));
-    assert!(use_file_transcode_for(true, true, true, true, true));
-    // Zone navigateur (non « réseau ») avec EQ : le cas déjà couvert par
-    // #1168, qui passait par un `||` hors de cette fonction.
-    assert!(use_file_transcode_for(false, true, false, false, true));
+    assert!(!use_file_transcode_for(true, true, true, true, true));
+    // Zone navigateur avec EQ (#1168) : progressive avec son traitement.
+    assert!(!use_file_transcode_for(false, true, false, false, true));
     // Sans traitement, une sortie non réseau ne file-transcode toujours pas.
     assert!(!use_file_transcode_for(false, true, false, false, false));
+    // Cible NON WAV (FLAC ré-encodé pour un renderer qui le lit) : le fichier,
+    // avec ou sans traitement — l'encodeur FLAC n'est branché que là.
+    assert!(use_file_transcode_for(true, false, false, false, false));
+    assert!(use_file_transcode_for(true, false, false, false, true));
+    // Renderer LPCM sans bascule streaming : le fichier WAV, comme avant.
+    assert!(use_file_transcode_for(true, true, true, false, false));
 }
 
 /// #2863 — le bras streaming HTTPS servait les octets du CDN VERBATIM dès

@@ -1235,29 +1235,20 @@ impl PlaybackOrchestrator {
             target_format_str == "wav",
             dlna_needs_wav,
             dsd_lpcm_streams,
-            // Une zone dont un TRAITEMENT est actif doit l'entendre : le
-            // bras progressif appelle `decode_to_pcm_streaming_seeked`, qui
-            // ne reçoit ni EqProcessor, ni convolveur, ni facteur
-            // ReplayGain — seul `transcode_source_to_file` les applique
-            // (voir les points 1a/1b de cette fonction). Le « transcodage
-            // forcé » servait donc un flux sans aucun des trois.
-            //
-            // Mesuré sur .18 pour le NAVIGATEUR : capture WAV avec EQ
-            // strictement identique à la source décodée (#1168). La même
-            // fuite existe sur une sortie RÉSEAU depuis que le DSD y part en
-            // WAV progressif (0cf27ade, 27/07) : une zone DLNA/OpenHome avec
-            // égaliseur, correction FIR ou ReplayGain actif lisant du DSD
-            // prend ce bras et perd les trois, en silence. C'est la famille
-            // #1216 — déjà corrigée pour le passthrough réseau, le
-            // navigateur et les sorties PULL, jamais ici.
+            // Une zone dont un TRAITEMENT est actif doit l'entendre. Depuis
+            // LAT-F1 (phase 0), le bras progressif applique lui-même
+            // égaliseur, convolveur et ReplayGain au fil de l'eau (relais
+            // `spawn_streaming_dsp_relay` dans `transcoder_en_session`) : une
+            // cible WAV reste donc progressive avec son traitement, sans
+            // attendre le fichier entier (#3357). Seule une cible NON WAV
+            // (FLAC ré-encodé pour un renderer qui le lit) passe encore par
+            // le fichier, parce que l'encodeur n'est branché que là.
             //
             // `eq_forces_transcode` est déjà borné aux sorties réseau /
             // navigateur / PULL et aux zones où un traitement est
-            // RÉELLEMENT actif (PURE rend `None`) : une zone sans
-            // traitement — l'immense majorité, et le cas qu'arbitre #1363 —
-            // garde le bras progressif. Les sorties PULL (`oaat`,
+            // RÉELLEMENT actif (PURE rend `None`). Les sorties PULL (`oaat`,
             // `diretta`) restent hors du champ : elles ne passent jamais par
-            // le transcodage fichier et le changement n'est pas mesuré.
+            // le transcodage fichier.
             (is_browser_output || is_network_output) && eq_forces_transcode,
         );
 
@@ -1796,6 +1787,26 @@ impl PlaybackOrchestrator {
             let transcode_file_size = info.wav_content_length();
 
             let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+
+            // LAT-F1 (phase 0) : la chaîne DSP de la zone AU FIL DE L'EAU.
+            // Ce bras servait le PCM décodé tel quel : égaliseur, convolveur
+            // et ReplayGain n'y étaient pas appliqués, et la règle de
+            // décision renvoyait donc toute zone à traitement actif vers le
+            // transcodage fichier — le fichier ENTIER décodé, traité, encodé
+            // et écrit avant le premier octet servi : 46 à 62 s de silence
+            // mesurés sur une zone DLNA avec égaliseur (#3357). Le relais
+            // qui applique ces trois traitements chunk par chunk existe
+            // depuis #2863 (bras Tidal, DASH) ; il est branché ici de la même
+            // façon. Sans traitement actif, le canal reste celui d'avant, à
+            // l'octet près. Le premier chunk du décodeur est l'en-tête WAV :
+            // il est épargné (`skip_header`), comme sur les autres bras.
+            let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
+            let tx = if dsp.is_active() {
+                tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
+                spawn_streaming_dsp_relay(dsp, out_bd, true, tx)
+            } else {
+                tx
+            };
 
             // Mark session: the streaming decoder sends the WAV header
             // with the real source sample rate, so the stream handler

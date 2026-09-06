@@ -159,12 +159,15 @@ pub fn est_dsd_brut(mime_type: &str) -> bool {
 /// pointless and, on DSD256/512, fatal (the ~decode exceeds the 120s temp-file
 /// timeout → the renderer plays silence).
 ///
-/// `dsp_active` PRIME sur tout le reste. Le bras progressif appelle
-/// `decode_to_pcm_streaming_seeked`, qui ne reçoit ni égaliseur, ni convolveur,
-/// ni facteur ReplayGain : seul `transcode_source_to_file` les applique. Une
-/// zone dont un traitement est actif doit donc repasser par le fichier, sans
-/// quoi le traitement est perdu EN SILENCE — famille #1216, déjà corrigée pour
-/// le passthrough réseau, le navigateur et les sorties PULL.
+/// `dsp_active` ne compte que si la cible n'est PAS du WAV. Depuis LAT-F1
+/// (phase 0) le bras progressif applique lui-même égaliseur, convolveur et
+/// ReplayGain au fil de l'eau (`spawn_streaming_dsp_relay`, le relais de
+/// #2863) : une cible WAV garde le démarrage immédiat AVEC son traitement.
+/// Avant, toute zone à traitement actif repassait par le fichier entier —
+/// 46 à 62 s de silence sur une zone DLNA avec égaliseur (#3357). Une cible
+/// non WAV (FLAC ré-encodé) passe encore par le fichier : l'encodeur n'est
+/// branché que là. La famille #1216 (traitement perdu en silence) reste
+/// couverte : le traitement est appliqué, d'un côté ou de l'autre.
 ///
 /// Kept a pure function so the decision matrix is unit-testable without an
 /// orchestrator.
@@ -175,7 +178,8 @@ pub(super) fn use_file_transcode_for(
     dsd_lpcm_streams: bool,
     dsp_active: bool,
 ) -> bool {
-    is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams)) || dsp_active
+    is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams))
+        || (dsp_active && !target_is_wav)
 }
 
 /// Le bras streaming HTTPS doit-il PRÉ-TRANSCODER au lieu de servir les octets
