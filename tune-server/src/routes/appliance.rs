@@ -541,13 +541,29 @@ mod tests {
         let dir = tune_core::test_scratch::scratch_dir("tune-poweroff-test");
         let bin = dir.join("systemctl-bouchon.sh");
         let trace = dir.join("argv.txt");
+        // `--sonde` : le bouchon répond sans rien écrire, pour la sonde de
+        // disponibilité ci-dessous.
         let script = format!(
-            "#!/bin/sh\nprintf '%s' \"$*\" > {}\necho 'refuse' 1>&2\nexit {}\n",
+            "#!/bin/sh\n[ \"$1\" = --sonde ] && exit 0\nprintf '%s' \"$*\" > {}\necho 'refuse' 1>&2\nexit {}\n",
             trace.display(),
             code_sortie
         );
         std::fs::write(&bin, script).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Sous charge, un `fork` d'un autre test peut hériter du descripteur
+        // d'écriture entre `write` et l'exécution : `exec` rend alors ETXTBSY
+        // (« Text file busy ») et le test rougit pour rien — 3 rouges sur 200
+        // tours la nuit du 05/09. On sonde le bouchon jusqu'à ce qu'il s'exécute.
+        let pret = std::time::Instant::now();
+        loop {
+            match std::process::Command::new(&bin).arg("--sonde").output() {
+                Ok(out) if out.status.success() => break,
+                _ if pret.elapsed() > std::time::Duration::from_secs(5) => {
+                    panic!("le bouchon n'est jamais devenu exécutable")
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
         (dir, bin, trace)
     }
 

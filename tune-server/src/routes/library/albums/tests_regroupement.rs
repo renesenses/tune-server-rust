@@ -1,0 +1,418 @@
+//! BIB-A2 (phase 1) : l'absorption d'un éclat d'album par la route publique.
+//!
+//! Le cas est celui de l'enregistreur : un dossier, un disque, deux lignes
+//! `albums` parce qu'un fichier a été indexé sous l'artiste de la piste.
+//! Chaque témoin porte sa contre-épreuve : ce que la phase 0 voit avant, ce
+//! qu'elle ne voit plus après, et les marqueurs qui doivent survivre.
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+use tune_core::db::backend::ToSqlValue;
+
+type Etat = crate::state::AppState;
+
+fn serveur() -> (axum::Router, Etat) {
+    let state = Etat::new(":memory:", 0, Default::default()).unwrap();
+    let routeur = crate::routes::router(state.clone());
+    (routeur, state)
+}
+
+async fn appel(app: &axum::Router, methode: &str, chemin: &str) -> (StatusCode, Value) {
+    let requete = Request::builder()
+        .method(methode)
+        .uri(chemin)
+        .header("Content-Type", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let reponse = app.clone().oneshot(requete).await.unwrap();
+    let statut = reponse.status();
+    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        statut,
+        serde_json::from_slice(&octets).unwrap_or(Value::Null),
+    )
+}
+
+fn inserer(state: &Etat, sql: &str, params: &[&dyn ToSqlValue]) -> i64 {
+    state.backend.execute(sql, params).unwrap();
+    state.backend.last_insert_rowid()
+}
+
+fn artiste(state: &Etat, nom: &str) -> i64 {
+    inserer(
+        state,
+        "INSERT INTO artists (name) VALUES (?)",
+        &[&nom as &dyn ToSqlValue],
+    )
+}
+
+fn album(state: &Etat, titre: &str, artist_id: i64) -> i64 {
+    inserer(
+        state,
+        "INSERT INTO albums (title, artist_id, source, track_count) VALUES (?, ?, 'local', 0)",
+        &[&titre as &dyn ToSqlValue, &artist_id],
+    )
+}
+
+fn piste(state: &Etat, album_id: i64, artist_id: i64, numero: i64, chemin: &str) {
+    inserer(
+        state,
+        "INSERT INTO tracks (title, album_id, artist_id, track_number, file_path) VALUES (?, ?, ?, ?, ?)",
+        &[
+            &format!("Piste {numero}") as &dyn ToSqlValue,
+            &album_id,
+            &artist_id,
+            &numero,
+            &chemin,
+        ],
+    );
+}
+
+fn compte(state: &Etat, sql: &str, id: i64) -> i64 {
+    state
+        .backend
+        .query_one(sql, &[&id as &dyn ToSqlValue])
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
+fn album_existe(state: &Etat, id: i64) -> bool {
+    compte(state, "SELECT COUNT(*) FROM albums WHERE id = ?", id) > 0
+}
+
+/// Le disque de l'enregistreur : « The Wall » sous Pink Floyd (deux pistes),
+/// et un éclat « The Wall » sous David Gilmour (une piste), même dossier.
+fn le_disque_eclate(state: &Etat) -> (i64, i64, i64, i64) {
+    let floyd = artiste(state, "Pink Floyd");
+    let gilmour = artiste(state, "David Gilmour");
+    let cible = album(state, "The Wall", floyd);
+    let eclat = album(state, "The Wall", gilmour);
+    piste(
+        state,
+        cible,
+        floyd,
+        1,
+        "/musique/the wall/01 In the Flesh.flac",
+    );
+    piste(
+        state,
+        cible,
+        floyd,
+        2,
+        "/musique/the wall/02 The Thin Ice.flac",
+    );
+    piste(
+        state,
+        eclat,
+        gilmour,
+        3,
+        "/musique/the wall/03 Another Brick.flac",
+    );
+    (cible, eclat, floyd, gilmour)
+}
+
+#[tokio::test]
+async fn l_eclat_de_l_enregistreur_est_absorbe_avec_ses_marqueurs() {
+    let (app, state) = serveur();
+    let (cible, eclat, _, _) = le_disque_eclate(&state);
+    // Marqueurs posés sur l'ÉCLAT : ils doivent survivre sur la cible.
+    inserer(
+        &state,
+        "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'album', ?)",
+        &[&eclat as &dyn ToSqlValue],
+    );
+    inserer(
+        &state,
+        "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES (?, 1, 5)",
+        &[&eclat as &dyn ToSqlValue],
+    );
+    let tag = inserer(&state, "INSERT INTO tags (name) VALUES ('progressif')", &[]);
+    inserer(
+        &state,
+        "INSERT INTO item_tags (tag_id, item_type, item_id) VALUES (?, 'album', ?)",
+        &[&tag as &dyn ToSqlValue, &eclat],
+    );
+    state
+        .backend
+        .execute(
+            "UPDATE albums SET cover_path = 'abcdef0123456789' WHERE id = ?",
+            &[&eclat as &dyn ToSqlValue],
+        )
+        .unwrap();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    settings
+        .set(
+            "collections",
+            &json!([{ "id": 1, "name": "Rock", "album_ids": [eclat, 999] }]).to_string(),
+        )
+        .unwrap();
+
+    // Contre-épreuve : la phase 0 voit le faisceau.
+    let (_, avant) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    assert_eq!(avant["count"].as_u64(), Some(1), "avant : {avant}");
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/absorber/{eclat}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps : {corps}");
+    assert_eq!(corps["pistes"].as_u64(), Some(1));
+    assert_eq!(corps["collections_reecrites"].as_u64(), Some(1));
+    assert!(
+        corps["champs_repris"].as_u64().unwrap_or(0) >= 1,
+        "la pochette : {corps}"
+    );
+
+    let (_, apres) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    assert_eq!(apres["count"].as_u64(), Some(0), "après : {apres}");
+    assert!(
+        !album_existe(&state, eclat),
+        "la ligne de l'éclat disparaît"
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ?",
+            cible
+        ),
+        3
+    );
+    assert_eq!(
+        compte(&state, "SELECT track_count FROM albums WHERE id = ?", cible),
+        3
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM favorites WHERE item_type = 'album' AND item_id = ?",
+            cible
+        ),
+        1,
+        "le favori suit"
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT rating FROM album_ratings WHERE album_id = ?",
+            cible
+        ),
+        5,
+        "la note suit"
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM item_tags WHERE item_type = 'album' AND item_id = ?",
+            cible
+        ),
+        1,
+        "l'étiquette suit"
+    );
+    let collections: Vec<Value> =
+        serde_json::from_str(&settings.get("collections").unwrap().unwrap()).unwrap();
+    assert_eq!(
+        collections[0]["album_ids"],
+        json!([cible, 999]),
+        "le dossier pointe la cible"
+    );
+    let pochette = state
+        .backend
+        .query_one(
+            "SELECT cover_path FROM albums WHERE id = ?",
+            &[&cible as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_string()));
+    assert_eq!(
+        pochette.as_deref(),
+        Some("abcdef0123456789"),
+        "la pochette de l'éclat est reprise"
+    );
+
+    // Idempotence : l'éclat n'existe plus, rien ne se supprime deux fois.
+    let (statut, _) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/absorber/{eclat}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn la_cible_garde_ses_propres_marqueurs_quand_les_deux_en_ont() {
+    let (app, state) = serveur();
+    let (cible, eclat, _, _) = le_disque_eclate(&state);
+    inserer(
+        &state,
+        "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES (?, 1, 2)",
+        &[&cible as &dyn ToSqlValue],
+    );
+    inserer(
+        &state,
+        "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES (?, 1, 5)",
+        &[&eclat as &dyn ToSqlValue],
+    );
+    inserer(
+        &state,
+        "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'album', ?)",
+        &[&cible as &dyn ToSqlValue],
+    );
+    inserer(
+        &state,
+        "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'album', ?)",
+        &[&eclat as &dyn ToSqlValue],
+    );
+    state
+        .backend
+        .execute(
+            "UPDATE albums SET cover_path = 'cible00' WHERE id = ?",
+            &[&cible as &dyn ToSqlValue],
+        )
+        .unwrap();
+    state
+        .backend
+        .execute(
+            "UPDATE albums SET cover_path = 'eclat00' WHERE id = ?",
+            &[&eclat as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/absorber/{eclat}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps : {corps}");
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT rating FROM album_ratings WHERE album_id = ?",
+            cible
+        ),
+        2,
+        "la note de la cible ne cède pas"
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM album_ratings WHERE album_id = ?",
+            cible
+        ),
+        1
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM favorites WHERE item_type = 'album' AND item_id = ?",
+            cible
+        ),
+        1,
+        "un seul favori, pas de doublon de clé"
+    );
+    let pochette = state
+        .backend
+        .query_one(
+            "SELECT cover_path FROM albums WHERE id = ?",
+            &[&cible as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_string()));
+    assert_eq!(
+        pochette.as_deref(),
+        Some("cible00"),
+        "la pochette de la cible ne cède pas"
+    );
+}
+
+#[tokio::test]
+async fn un_autre_dossier_un_autre_titre_ou_une_paire_distincte_sont_refuses() {
+    let (app, state) = serveur();
+    let (cible, eclat, _, gilmour) = le_disque_eclate(&state);
+
+    let ailleurs = album(&state, "The Wall", gilmour);
+    piste(
+        &state,
+        ailleurs,
+        gilmour,
+        1,
+        "/musique/autre dossier/01.flac",
+    );
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/absorber/{ailleurs}"),
+    )
+    .await;
+    assert_eq!(
+        (statut, corps["error"].as_str()),
+        (StatusCode::CONFLICT, Some("dossiers_differents")),
+        "{corps}"
+    );
+
+    let autre_titre = album(&state, "Animals", gilmour);
+    piste(
+        &state,
+        autre_titre,
+        gilmour,
+        1,
+        "/musique/the wall/09 Pigs.flac",
+    );
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/absorber/{autre_titre}"),
+    )
+    .await;
+    assert_eq!(
+        (statut, corps["error"].as_str()),
+        (StatusCode::CONFLICT, Some("titres_differents")),
+        "{corps}"
+    );
+
+    let (statut, _) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/distinct/{eclat}"),
+    )
+    .await;
+    assert!(statut.is_success(), "déclaration distincte : {statut}");
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/absorber/{eclat}"),
+    )
+    .await;
+    assert_eq!(
+        (statut, corps["error"].as_str()),
+        (StatusCode::CONFLICT, Some("paire_declaree_distincte")),
+        "{corps}"
+    );
+    assert!(
+        album_existe(&state, cible) && album_existe(&state, eclat),
+        "rien n'a bougé"
+    );
+
+    let (statut, _) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/absorber/{cible}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::BAD_REQUEST);
+    let (statut, _) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/absorber/424242"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::NOT_FOUND);
+}

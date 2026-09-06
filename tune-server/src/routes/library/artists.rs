@@ -90,6 +90,91 @@ pub(crate) fn grouper_les_artistes_homographes(artistes: &[ArtisteVue]) -> Vec<V
 }
 
 /// `GET /library/artists/doublons` — les artistes homographes (BIB-C1, phase 0).
+/// `POST /library/artists/{cible}/absorber/{doublon}` — BIB-C1, phase 1.
+///
+/// La phase 0 (`GET /library/artists/doublons`) nomme les groupes de même
+/// clé (`cle_artiste`). Ici l'utilisateur tranche, un couple à la fois, et le
+/// serveur vérifie : même clé, pas deux MBID différents (le drapeau
+/// `mbid_distincts` de la phase 0), aucun des deux n'est l'artiste inconnu.
+/// Le survivant est celui que l'URL nomme `cible` — l'écran propose le plus
+/// ancien, comme la liste de la phase 0. Rien n'est automatique.
+///
+/// Réponses : `200` avec le bilan de [`ArtistRepo::absorber`] ; `404`
+/// artiste inconnu ; `400` même artiste des deux côtés ; `409
+/// cles_differentes`, `409 mbid_distincts`, `409 artiste_inconnu_non_absorbable`.
+pub(super) async fn absorber_artiste(
+    State(state): State<AppState>,
+    Path((cible, doublon)): Path<(i64, i64)>,
+) -> Response {
+    use tune_core::db::artist_repo::{UNKNOWN_ARTIST_NAME, cle_artiste};
+    if cible == doublon {
+        return super::refus(
+            StatusCode::BAD_REQUEST,
+            "meme_artiste",
+            "un artiste ne s'absorbe pas lui-même".to_string(),
+        );
+    }
+    let repo = ArtistRepo::with_backend(state.backend.clone());
+    let (Ok(Some(artiste_cible)), Ok(Some(artiste_doublon))) = (repo.get(cible), repo.get(doublon))
+    else {
+        return super::refus(
+            StatusCode::NOT_FOUND,
+            "artiste_inconnu",
+            format!("artistes {cible} / {doublon}"),
+        );
+    };
+    if artiste_cible.name == UNKNOWN_ARTIST_NAME || artiste_doublon.name == UNKNOWN_ARTIST_NAME {
+        return super::refus(
+            StatusCode::CONFLICT,
+            "artiste_inconnu_non_absorbable",
+            "« Unknown Artist » n'est pas une fiche : rien ne s'y fond, il ne se fond dans rien"
+                .to_string(),
+        );
+    }
+    if cle_artiste(&artiste_cible.name) != cle_artiste(&artiste_doublon.name) {
+        return super::refus(
+            StatusCode::CONFLICT,
+            "cles_differentes",
+            format!(
+                "« {} » et « {} » ne sont pas deux graphies du même nom",
+                artiste_cible.name, artiste_doublon.name
+            ),
+        );
+    }
+    let mbid = |m: &Option<String>| {
+        m.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some((a, b)) = mbid(&artiste_cible.musicbrainz_id)
+        .zip(mbid(&artiste_doublon.musicbrainz_id))
+        .filter(|(a, b)| a != b)
+    {
+        return super::refus(
+            StatusCode::CONFLICT,
+            "mbid_distincts",
+            format!(
+                "deux identifiants MusicBrainz différents ({a} / {b}) : deux artistes, pas deux graphies"
+            ),
+        );
+    }
+    match repo.absorber(cible, doublon) {
+        Ok(rapport) => {
+            state.event_bus.emit(
+                tune_core::event_types::EventType::LibraryUpdated.as_str(),
+                json!({ "source": "artists_absorber", "cible": cible, "doublon": doublon }),
+            );
+            (StatusCode::OK, Json(json!(rapport))).into_response()
+        }
+        Err(e) => super::refus(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "absorption_echouee",
+            e.to_string(),
+        ),
+    }
+}
+
 pub(super) async fn artists_doublons(State(state): State<AppState>) -> Json<Value> {
     use tune_http_types::panne_sql::OuDefautJournalise;
     let sql = "SELECT a.id, a.name, a.musicbrainz_id, \
@@ -1065,3 +1150,6 @@ mod tests_artistes_homographes {
         assert!(!ids.contains(&60) && !ids.contains(&70));
     }
 }
+
+#[cfg(test)]
+mod tests_absorption;

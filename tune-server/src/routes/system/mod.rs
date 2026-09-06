@@ -10,7 +10,7 @@ mod config;
 mod config_backup;
 mod convert;
 mod database;
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod enrich;
 /// Périmètre de l'explorateur de dossiers (#1275).
 pub(crate) mod explorateur;

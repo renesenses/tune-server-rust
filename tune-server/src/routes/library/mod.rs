@@ -170,6 +170,19 @@ pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("artwork_cache")
 }
 
+/// Une réponse de refus uniforme pour les opérations explicites de la
+/// bibliothèque (absorptions d'albums et d'artistes).
+pub(super) fn refus(
+    code: axum::http::StatusCode,
+    erreur: &str,
+    message: String,
+) -> axum::response::Response {
+    axum::response::IntoResponse::into_response((
+        code,
+        axum::Json(serde_json::json!({ "error": erreur, "message": message })),
+    ))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/artists", get(artists::list_artists))
@@ -183,6 +196,11 @@ pub fn router() -> Router<AppState> {
         .route("/artists/{id}/similar", get(artists::artist_similar))
         .route("/artists/{id}/metadata", get(artists::artist_metadata))
         .route("/artists/doublons", get(artists::artists_doublons))
+        // BIB-C1 (phase 1) : un artiste absorbe son homographe, à la demande.
+        .route(
+            "/artists/{cible}/absorber/{doublon}",
+            post(artists::absorber_artiste),
+        )
         .route(
             "/albums",
             get(albums::list_albums).post(albums::create_album),
@@ -212,6 +230,13 @@ pub fn router() -> Router<AppState> {
         .route("/albums/grouped", get(albums::albums_grouped))
         .route("/albums/{id}/completeness", get(albums::album_completeness))
         .route("/albums/{id}/editions", get(albums::album_editions))
+        // BIB-A2 (phase 0) : `/albums/eclates` AVANT `/albums/{id}`, comme `hidden`.
+        .route("/albums/eclates", get(albums::albums_eclates))
+        // BIB-A2 (phase 1) : un album éclaté absorbe son doublon, à la demande.
+        .route(
+            "/albums/{cible}/absorber/{doublon}",
+            post(albums::absorber_album),
+        )
         .route(
             "/albums/{id}",
             get(albums::get_album).put(albums::update_album),
@@ -424,4 +449,85 @@ pub fn router() -> Router<AppState> {
             post(collections::add_album_to_collection)
                 .delete(collections::remove_album_from_collection),
         )
+}
+
+#[cfg(test)]
+mod routage_tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// Les gestionnaires `pub(super) async fn … State<AppState> …` d'un
+    /// sous-module de `library/`, tels que le routeur les nomme.
+    fn gestionnaires(module: &str, source: &str) -> BTreeSet<String> {
+        let mut noms = BTreeSet::new();
+        let motif = "pub(super) async fn ";
+        let mut depuis = 0;
+        while let Some(i) = source[depuis..].find(motif) {
+            let debut = depuis + i + motif.len();
+            let fin_nom = source[debut..]
+                .find('(')
+                .map(|j| debut + j)
+                .unwrap_or(source.len());
+            let nom = &source[debut..fin_nom];
+            let fin_signature = source[fin_nom..]
+                .find('{')
+                .map(|j| fin_nom + j)
+                .unwrap_or(source.len());
+            if source[fin_nom..fin_signature].contains("State<AppState>") {
+                noms.insert(format!("{module}::{nom}"));
+            }
+            depuis = fin_nom;
+        }
+        noms
+    }
+
+    /// Une poussée par l'API Git Data recopie un fichier entier : #3432 a ainsi
+    /// effacé la ligne `.route("/albums/eclates", …)` posée par #3431, et le
+    /// gestionnaire est resté écrit mais pas branché jusqu'à v0.9.137. Chaque
+    /// gestionnaire d'un sous-module de `library/` doit être nommé par le
+    /// routeur de ce fichier.
+    #[test]
+    fn chaque_gestionnaire_de_la_bibliotheque_est_branche() {
+        let dossier = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/library");
+        let routeur = std::fs::read_to_string(dossier.join("mod.rs")).unwrap();
+        let routeur = routeur.split("#[cfg(test)]").next().unwrap();
+        let mut orphelins = Vec::new();
+        let mut branches = 0usize;
+        for entree in std::fs::read_dir(&dossier).unwrap() {
+            let chemin = entree.unwrap().path();
+            let Some(module) = chemin.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if module == "mod" || chemin.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&chemin).unwrap();
+            for nom in gestionnaires(module, &source) {
+                if routeur.contains(&format!("({nom})"))
+                    || routeur.contains(&format!("({nom}\n"))
+                    || routeur.contains(&format!(".{}(", nom.rsplit("::").next().unwrap()))
+                        && routeur.contains(&nom)
+                {
+                    branches += 1;
+                } else {
+                    orphelins.push(nom);
+                }
+            }
+        }
+        assert!(
+            branches > 50,
+            "le garde doit voir les gestionnaires : {branches}"
+        );
+        assert!(
+            orphelins.is_empty(),
+            "gestionnaires écrits mais jamais branchés dans le routeur de library/ : {orphelins:?}"
+        );
+    }
+
+    #[test]
+    fn le_garde_lit_bien_une_signature() {
+        let src = "pub(super) async fn a(State(s): State<AppState>) -> Json<Value> {\n}\npub(super) async fn b(x: u8) {\n}\n";
+        let noms = gestionnaires("m", src);
+        assert_eq!(noms.into_iter().collect::<Vec<_>>(), ["m::a"]);
+    }
 }

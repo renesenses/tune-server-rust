@@ -147,7 +147,7 @@ pub mod sql {
     /// si la survivante est vierge, et a savoir si le doublon apporte vraiment
     /// quelque chose. Voir `ZoneRepo::merge_duplicate_settings` pour la regle
     /// et pour l'absence deliberee de `gapless_enabled`.
-    const REGLAGES_A_FUSIONNER: &[(&str, &str)] = &[
+    pub(super) const REGLAGES_A_FUSIONNER: &[(&str, &str)] = &[
         // Drapeaux : defaut 0, donc seul un 1 se reporte.
         ("fixed_volume", "0"),
         ("alac_passthrough", "0"),
@@ -173,7 +173,7 @@ pub mod sql {
     /// journaux de DEvir). Le report de ces deux reglages se fait desormais la
     /// ou ils sont reellement ranges, voir
     /// [`ZoneRepo::reporter_reglages_de_doublons`].
-    const REGLAGES_NULLABLES: &[&str] = &["max_sample_rate"];
+    pub(super) const REGLAGES_NULLABLES: &[&str] = &["max_sample_rate"];
 
     /// Les zones en doublon, survivante d'abord dans chaque groupe.
     ///
@@ -257,6 +257,52 @@ pub mod sql {
             d.placeholder(1),
             d.placeholder(2)
         )
+    }
+
+    /// L'instant courant en ISO 8601 UTC, calcule par la base elle-meme :
+    /// aucun format a produire cote Rust, et le meme texte des deux cotes.
+    pub fn maintenant_iso(engine: Engine) -> &'static str {
+        match engine {
+            Engine::Sqlite => "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            Engine::Postgres => {
+                "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
+            }
+        }
+    }
+
+    /// Passage EN LIGNE : `online` ET `last_seen_at` (DUP-1, phase 2). Le
+    /// passage hors ligne, lui, ne touche pas a la date — c'est ce qui en
+    /// fait une « derniere fois vue ».
+    pub fn marquer_en_ligne_par_appareil<D: SqlDialect>(d: &D, engine: Engine) -> String {
+        format!(
+            "UPDATE zones SET online = {}, last_seen_at = {} WHERE output_device_id = {}",
+            d.placeholder(1),
+            maintenant_iso(engine),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn marquer_en_ligne_par_id<D: SqlDialect>(d: &D, engine: Engine) -> String {
+        format!(
+            "UPDATE zones SET online = {}, last_seen_at = {} WHERE id = {}",
+            d.placeholder(1),
+            maintenant_iso(engine),
+            d.placeholder(2)
+        )
+    }
+
+    /// Age, en secondes, de la derniere reponse de chaque zone qui en a une.
+    pub fn ages_depuis_derniere_vue(engine: Engine) -> &'static str {
+        match engine {
+            Engine::Sqlite => {
+                "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', last_seen_at) AS INTEGER) \
+                 FROM zones WHERE last_seen_at IS NOT NULL"
+            }
+            Engine::Postgres => {
+                "SELECT id, CAST(EXTRACT(EPOCH FROM (now() - last_seen_at::timestamptz)) AS BIGINT) \
+                 FROM zones WHERE last_seen_at IS NOT NULL"
+            }
+        }
     }
 
     pub fn set_online_by_device<D: SqlDialect>(d: &D) -> String {
@@ -520,6 +566,130 @@ pub struct ZoneRepo {
     db: Arc<dyn DbBackend>,
 }
 
+/// Bilan d'une fusion explicite de deux zones (DUP-1, phase 1) : ce qui a
+/// suivi le doublon jusqu'à la cible, et ce qui a été laissé exprès.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RapportDeFusion {
+    pub doublon: i64,
+    pub cible: i64,
+    /// Lignes de file d'attente passées du doublon à la cible.
+    pub file_reportee: usize,
+    /// La cible avait déjà une file : celle du doublon n'y a pas été mêlée.
+    pub file_conservee_sur_la_cible: bool,
+    pub alarmes_reportees: usize,
+    pub historique_reporte: usize,
+    /// Réglages de `settings` posés sur la cible parce qu'elle n'en avait pas.
+    pub reglages_reportes: usize,
+    pub groupes_reecrits: bool,
+    pub zone_par_defaut_reportee: bool,
+}
+
+/// Une base ancienne ou partielle : la table ou la colonne n'existe pas.
+fn schema_incomplet(e: &str) -> bool {
+    e.contains("no such table") || e.contains("no such column") || e.contains("does not exist")
+}
+
+/// Les réglages d'une zone qui vivent dans `settings` : le préfixe de
+/// convention `zone_{id}_…` et les quatre clés qui l'ignorent (calibration
+/// DAC, pièce, réponse impulsionnelle, renderer UPnP).
+fn cles_de_zone(id: i64) -> (String, [String; 4]) {
+    (
+        format!("zone_{id}_"),
+        [
+            format!("dac_profile_{id}"),
+            format!("room_profile_{id}"),
+            format!("ir_path_{id}"),
+            format!("upnp_renderer_udn_{id}"),
+        ],
+    )
+}
+
+/// Reporte sur `cible` les réglages `settings` de `doublon` qu'elle n'a pas
+/// encore : un réglage explicite de la cible ne cède jamais, et les clés du
+/// doublon ne sont pas effacées (un report est réversible). `connues` sert de
+/// mémoire : ce qui vient d'être posé compte comme posé pour la suite.
+fn reporter_les_cles_de_zone(
+    settings: &super::settings_repo::SettingsRepo,
+    connues: &mut std::collections::HashMap<String, String>,
+    apportees: &[(String, String)],
+    doublon: i64,
+    cible: i64,
+) -> Result<usize, String> {
+    let (prefixe_doublon, exactes_doublon) = cles_de_zone(doublon);
+    let (prefixe_cible, exactes_cible) = cles_de_zone(cible);
+    let mut reportees = 0usize;
+    for (cle, valeur) in apportees {
+        let vers = if let Some(quoi) = cle.strip_prefix(&prefixe_doublon) {
+            format!("{prefixe_cible}{quoi}")
+        } else if let Some(rang) = exactes_doublon.iter().position(|c| c == cle) {
+            exactes_cible[rang].clone()
+        } else {
+            continue;
+        };
+        if valeur.trim().is_empty() {
+            continue;
+        }
+        if connues.get(&vers).is_some_and(|v| !v.trim().is_empty()) {
+            continue;
+        }
+        settings.set(&vers, valeur)?;
+        connues.insert(vers.clone(), valeur.clone());
+        reportees += 1;
+        tracing::info!(depuis = %cle, vers = %vers, "zone_reglage_reporte_depuis_doublon");
+    }
+    Ok(reportees)
+}
+
+/// Remplace `doublon` par `cible` dans une liste JSON d'identifiants de zones
+/// (`[4, 20]`), sans créer de répétition. `None` si rien ne change ou si la
+/// liste n'est pas lisible : on ne réécrit pas ce qu'on ne comprend pas.
+fn remplacer_dans_la_liste(brut: &str, doublon: i64, cible: i64) -> Option<String> {
+    let ids: Vec<i64> = serde_json::from_str(brut).ok()?;
+    if !ids.contains(&doublon) {
+        return None;
+    }
+    let mut sortie: Vec<i64> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = if id == doublon { cible } else { id };
+        if !sortie.contains(&id) {
+            sortie.push(id);
+        }
+    }
+    serde_json::to_string(&sortie).ok()
+}
+
+/// Réécrit le réglage `zone_groups` (liste JSON de groupes portant `zone_ids`
+/// et `leader_id`) pour que le doublon y cède sa place à la cible.
+fn reecrire_les_groupes(brut: &str, doublon: i64, cible: i64) -> Option<String> {
+    let mut groupes: Vec<serde_json::Value> = serde_json::from_str(brut).ok()?;
+    let mut change = false;
+    for groupe in groupes.iter_mut() {
+        if let Some(ids) = groupe.get("zone_ids").and_then(|v| v.as_array()).cloned() {
+            let mut sortie: Vec<i64> = Vec::with_capacity(ids.len());
+            for id in ids.iter().filter_map(|v| v.as_i64()) {
+                let id = if id == doublon {
+                    change = true;
+                    cible
+                } else {
+                    id
+                };
+                if !sortie.contains(&id) {
+                    sortie.push(id);
+                }
+            }
+            groupe["zone_ids"] = serde_json::json!(sortie);
+        }
+        if groupe.get("leader_id").and_then(|v| v.as_i64()) == Some(doublon) {
+            groupe["leader_id"] = serde_json::json!(cible);
+            change = true;
+        }
+    }
+    if !change {
+        return None;
+    }
+    serde_json::to_string(&groupes).ok()
+}
+
 impl ZoneRepo {
     pub fn new(db: SqliteDb) -> Self {
         Self { db: Arc::new(db) }
@@ -772,36 +942,20 @@ impl ZoneRepo {
             let Some((survivante, doublons)) = ids.split_first() else {
                 continue;
             };
-            let prefixe_survivante = format!("zone_{survivante}_");
             for doublon in doublons {
-                let prefixe_doublon = format!("zone_{doublon}_");
-                for (cle, valeur) in &apportees {
-                    let Some(quoi) = cle.strip_prefix(&prefixe_doublon) else {
-                        continue;
-                    };
-                    if valeur.trim().is_empty() {
-                        continue;
+                match reporter_les_cles_de_zone(
+                    &settings,
+                    &mut connues,
+                    &apportees,
+                    *doublon,
+                    *survivante,
+                ) {
+                    Ok(n) => reportees += n,
+                    Err(e) if manque(&e) => {
+                        tracing::warn!(error = %e, "zone_reglages_table_absente_report_saute");
+                        return Ok(());
                     }
-                    let cible = format!("{prefixe_survivante}{quoi}");
-                    let deja_pose = connues.get(&cible).is_some_and(|v| !v.trim().is_empty());
-                    if deja_pose {
-                        continue;
-                    }
-                    match settings.set(&cible, valeur) {
-                        Ok(()) => {}
-                        Err(e) if manque(&e) => {
-                            tracing::warn!(error = %e, "zone_reglages_table_absente_report_saute");
-                            return Ok(());
-                        }
-                        Err(e) => return Err(e),
-                    }
-                    connues.insert(cible.clone(), valeur.clone());
-                    reportees += 1;
-                    tracing::info!(
-                        depuis = %cle,
-                        vers = %cible,
-                        "zone_reglage_reporte_depuis_doublon"
-                    );
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -810,6 +964,251 @@ impl ZoneRepo {
             tracing::info!(reglages = reportees, "zone_reglages_reportes");
         }
         Ok(())
+    }
+
+    /// Fusionne explicitement la zone `doublon` dans la zone `cible` (DUP-1,
+    /// phase 1).
+    ///
+    /// Le dédoublonnage du démarrage ([`Self::deduplicate`]) ne voit que des
+    /// zones au même `output_device_id`. Or les doublons mesurés sur le
+    /// serveur de test le 05/09 portent des identifiants **différents** pour
+    /// le même appareil : l'UDN racine et l'UDN du sous-appareil `_MR` d'un
+    /// Sonos, l'identifiant IP d'hier et le MAC d'aujourd'hui d'un Mac en
+    /// AirPlay. Ici, l'appelant a déjà établi que c'est le même appareil (la
+    /// phase 0 nomme les groupes, `cle_appareil` côté serveur) ; la fusion ne
+    /// décide rien d'elle-même et n'est jamais automatique.
+    ///
+    /// Ce qui suit le doublon, dans l'ordre : les colonnes de réglage (même
+    /// règle que [`Self::merge_duplicate_settings`] : la cible restée au défaut
+    /// prend la valeur du doublon, un réglage explicite ne cède jamais), les
+    /// clés `settings` de la zone, la file d'attente (seulement si la cible
+    /// n'en a pas : on ne mêle pas deux files), les alarmes (colonne et liste
+    /// `multi_zone_ids`), l'historique d'écoute, la file de flux héritée, les
+    /// groupes de zones et la zone par défaut. Puis le doublon est **masqué**,
+    /// pas supprimé : son identifiant reste occupé, et la découverte
+    /// (`is_device_hidden`) ne le fait pas renaître.
+    ///
+    /// Les étapes ne sont pas une seule transaction : chacune ne fait que
+    /// reporter ou réaffecter, aucune n'efface, et le masquage vient en
+    /// dernier. Une panne au milieu laisse deux zones et des réglages en
+    /// double, jamais une perte.
+    pub fn fusionner(&self, doublon: i64, cible: i64) -> Result<RapportDeFusion, String> {
+        if doublon == cible {
+            return Err("une zone ne se fusionne pas dans elle-même".to_string());
+        }
+        if self.get(doublon)?.is_none() {
+            return Err(format!("zone {doublon} inconnue"));
+        }
+        if self.get(cible)?.is_none() {
+            return Err(format!("zone {cible} inconnue"));
+        }
+        self.reporter_les_colonnes_vers(doublon, cible)?;
+        let reglages_reportes = self.reporter_les_reglages_vers(doublon, cible)?;
+        let (file_reportee, file_conservee_sur_la_cible) =
+            self.reporter_la_file_vers(doublon, cible)?;
+        let alarmes_reportees = self.reporter_les_alarmes_vers(doublon, cible)?;
+        let historique_reporte = self.reporter_une_table_vers("listen_history", doublon, cible)?;
+        self.reporter_une_table_vers("streaming_queue", doublon, cible)?;
+        let (groupes_reecrits, zone_par_defaut_reportee) =
+            self.reporter_les_references_vers(doublon, cible)?;
+        self.delete(doublon)?;
+        tracing::info!(
+            doublon,
+            cible,
+            file_reportee,
+            reglages_reportes,
+            alarmes_reportees,
+            "zone_fusionnee"
+        );
+        Ok(RapportDeFusion {
+            doublon,
+            cible,
+            file_reportee,
+            file_conservee_sur_la_cible,
+            alarmes_reportees,
+            historique_reporte,
+            reglages_reportes,
+            groupes_reecrits,
+            zone_par_defaut_reportee,
+        })
+    }
+
+    fn marque(&self, n: usize) -> String {
+        match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(n),
+            Engine::Postgres => PostgresDialect.placeholder(n),
+        }
+    }
+
+    /// Les colonnes de réglage de `cible` restées au défaut prennent la valeur
+    /// de `doublon` — [`sql::merge_duplicate_settings`] pour deux zones
+    /// nommées au lieu d'un regroupement par identifiant.
+    fn reporter_les_colonnes_vers(&self, doublon: i64, cible: i64) -> Result<(), String> {
+        let (p1, p2, p3) = (self.marque(1), self.marque(2), self.marque(3));
+        let mut instructions: Vec<String> = Vec::new();
+        for (colonne, defaut) in sql::REGLAGES_A_FUSIONNER {
+            instructions.push(format!(
+                "UPDATE zones SET {colonne} = (SELECT d.{colonne} FROM zones d WHERE d.id = {p1}) \
+                 WHERE id = {p2} AND COALESCE({colonne}, {defaut}) = {defaut} \
+                   AND EXISTS (SELECT 1 FROM zones d WHERE d.id = {p3} \
+                               AND COALESCE(d.{colonne}, {defaut}) <> {defaut})"
+            ));
+        }
+        for colonne in sql::REGLAGES_NULLABLES {
+            instructions.push(format!(
+                "UPDATE zones SET {colonne} = (SELECT d.{colonne} FROM zones d WHERE d.id = {p1}) \
+                 WHERE id = {p2} AND {colonne} IS NULL \
+                   AND EXISTS (SELECT 1 FROM zones d WHERE d.id = {p3} AND d.{colonne} IS NOT NULL)"
+            ));
+        }
+        instructions.push(format!(
+            "UPDATE zones SET dsd_mode = (SELECT d.dsd_mode FROM zones d WHERE d.id = {p1}) \
+             WHERE id = {p2} AND COALESCE(dsd_mode, 'auto') = 'auto' \
+               AND EXISTS (SELECT 1 FROM zones d WHERE d.id = {p3} \
+                           AND COALESCE(d.dsd_mode, 'auto') <> 'auto')"
+        ));
+        let params: [&dyn ToSqlValue; 3] = [&doublon, &cible, &doublon];
+        for instruction in &instructions {
+            match self.db.execute(instruction, &params) {
+                Ok(_) => {}
+                Err(e) if schema_incomplet(&e) => {
+                    tracing::warn!(error = %e, "zone_fusion_colonne_absente_sautee");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn reporter_les_reglages_vers(&self, doublon: i64, cible: i64) -> Result<usize, String> {
+        let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let mut connues: std::collections::HashMap<String, String> = match settings.all() {
+            Ok(v) => v.into_iter().collect(),
+            Err(e) if schema_incomplet(&e) => {
+                tracing::warn!(error = %e, "zone_fusion_reglages_table_absente");
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
+        };
+        let apportees: Vec<(String, String)> = connues
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        reporter_les_cles_de_zone(&settings, &mut connues, &apportees, doublon, cible)
+    }
+
+    /// La file du doublon passe à la cible **seulement si la cible n'en a
+    /// pas** : deux files ne se mêlent pas, et celle de la zone en ligne est
+    /// celle que l'utilisateur voit.
+    fn reporter_la_file_vers(&self, doublon: i64, cible: i64) -> Result<(usize, bool), String> {
+        let compte = format!(
+            "SELECT COUNT(*) FROM queue_items WHERE zone_id = {}",
+            self.marque(1)
+        );
+        let params: [&dyn ToSqlValue; 1] = [&cible];
+        let deja = match self.db.query_many_strong(&compte, &params) {
+            Ok(lignes) => lignes
+                .first()
+                .and_then(|l| l.first())
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            Err(e) if schema_incomplet(&e) => return Ok((0, false)),
+            Err(e) => return Err(e),
+        };
+        if deja > 0 {
+            return Ok((0, true));
+        }
+        Ok((
+            self.reporter_une_table_vers("queue_items", doublon, cible)?,
+            false,
+        ))
+    }
+
+    /// `UPDATE {table} SET zone_id = cible WHERE zone_id = doublon`, tolérant
+    /// aux tables héritées absentes.
+    fn reporter_une_table_vers(
+        &self,
+        table: &str,
+        doublon: i64,
+        cible: i64,
+    ) -> Result<usize, String> {
+        let sql = format!(
+            "UPDATE {table} SET zone_id = {} WHERE zone_id = {}",
+            self.marque(1),
+            self.marque(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&cible, &doublon];
+        match self.db.execute(&sql, &params) {
+            Ok(n) => Ok(n),
+            Err(e) if schema_incomplet(&e) => {
+                tracing::warn!(table, error = %e, "zone_fusion_table_absente_sautee");
+                Ok(0)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Les alarmes : la colonne `zone_id`, puis la liste `multi_zone_ids`.
+    fn reporter_les_alarmes_vers(&self, doublon: i64, cible: i64) -> Result<usize, String> {
+        let n = self.reporter_une_table_vers("alarms", doublon, cible)?;
+        let lignes = match self.db.query_many_strong(
+            "SELECT id, multi_zone_ids FROM alarms WHERE multi_zone_ids IS NOT NULL",
+            &[],
+        ) {
+            Ok(l) => l,
+            Err(e) if schema_incomplet(&e) => return Ok(n),
+            Err(e) => return Err(e),
+        };
+        let maj = format!(
+            "UPDATE alarms SET multi_zone_ids = {} WHERE id = {}",
+            self.marque(1),
+            self.marque(2)
+        );
+        for ligne in &lignes {
+            let Some(id) = ligne.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(brut) = ligne.get(1).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let Some(reecrit) = remplacer_dans_la_liste(&brut, doublon, cible) else {
+                continue;
+            };
+            let params: [&dyn ToSqlValue; 2] = [&reecrit, &id];
+            self.db.execute(&maj, &params)?;
+        }
+        Ok(n)
+    }
+
+    /// Les références par valeur dans `settings` : `zone_groups` et
+    /// `default_zone_id`.
+    fn reporter_les_references_vers(
+        &self,
+        doublon: i64,
+        cible: i64,
+    ) -> Result<(bool, bool), String> {
+        let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let mut groupes_reecrits = false;
+        if let Some(reecrit) = settings
+            .get("zone_groups")
+            .ok()
+            .flatten()
+            .and_then(|brut| reecrire_les_groupes(&brut, doublon, cible))
+        {
+            settings.set("zone_groups", &reecrit)?;
+            groupes_reecrits = true;
+        }
+        let mut zone_par_defaut_reportee = false;
+        if settings
+            .get("default_zone_id")
+            .ok()
+            .flatten()
+            .is_some_and(|valeur| valeur.trim() == doublon.to_string())
+        {
+            settings.set("default_zone_id", &cible.to_string())?;
+            zone_par_defaut_reportee = true;
+        }
+        Ok((groupes_reecrits, zone_par_defaut_reportee))
     }
 
     /// Rendre leur prefixe `local:` aux zones locales qui l'ont perdu.
@@ -915,10 +1314,43 @@ impl ZoneRepo {
 
     pub fn update_online(&self, id: i64, online: bool) -> Result<(), String> {
         let val: String = if online { "1".into() } else { "0".into() };
-        let sql = self.update_field_sql("online");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        if online {
+            let engine = self.db.engine();
+            let sql = self.dialect_sql(
+                |d| sql::marquer_en_ligne_par_id(d, engine),
+                |d| sql::marquer_en_ligne_par_id(d, engine),
+            );
+            match self.db.execute(&sql, &params) {
+                Ok(_) => return Ok(()),
+                // Base anterieure a la colonne : on ecrit au moins `online`.
+                Err(e) if e.contains("no such column") || e.contains("does not exist") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let sql = self.update_field_sql("online");
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// L'age, en secondes, de la derniere reponse de chaque zone qui en a une
+    /// (DUP-1, phase 2). Une zone absente de la carte n'a jamais ete vue
+    /// depuis la pose de la colonne. Base anterieure a la colonne : carte vide.
+    pub fn ages_depuis_derniere_vue(&self) -> Result<std::collections::HashMap<i64, i64>, String> {
+        let lignes = match self
+            .db
+            .query_many_strong(sql::ages_depuis_derniere_vue(self.db.engine()), &[])
+        {
+            Ok(l) => l,
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                return Ok(Default::default());
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(lignes
+            .iter()
+            .filter_map(|l| Some((l.first()?.as_i64()?, l.get(1)?.as_i64()?)))
+            .collect())
     }
 
     pub fn update_gapless_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
@@ -1482,8 +1914,22 @@ impl ZoneRepo {
 
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
         let val: String = if online { "1".into() } else { "0".into() };
-        let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
         let params: [&dyn ToSqlValue; 2] = [&val, &device_id];
+        if online {
+            // DUP-1 (phase 2) : le passage en ligne date la derniere reponse.
+            let engine = self.db.engine();
+            let sql = self.dialect_sql(
+                |d| sql::marquer_en_ligne_par_appareil(d, engine),
+                |d| sql::marquer_en_ligne_par_appareil(d, engine),
+            );
+            match self.db.execute(&sql, &params) {
+                Ok(n) => return Ok(n),
+                // Base anterieure a la colonne : on ecrit au moins `online`.
+                Err(e) if e.contains("no such column") || e.contains("does not exist") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
         self.db.execute(&sql, &params)
     }
 
@@ -1712,7 +2158,7 @@ mod tests {
     /// Base complete : `settings` n'est pas dans `init_schema`, elle vient des
     /// migrations. Les tests qui touchent aux reglages hors colonnes en ont
     /// besoin ; les autres restent sur la base minimale.
-    fn test_db_migree() -> SqliteDb {
+    pub(super) fn test_db_migree() -> SqliteDb {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
@@ -2734,6 +3180,237 @@ mod autoplay_mode_tests {
     fn zone(repo: &ZoneRepo) -> i64 {
         repo.create("Salon", Some("dlna"), Some("uuid:salon"))
             .unwrap()
+    }
+
+    fn valeur_texte(repo: &ZoneRepo, sql: &str) -> Option<String> {
+        repo.db
+            .query_many_strong(sql, &[])
+            .unwrap()
+            .first()
+            .and_then(|l| l.first())
+            .and_then(|v| v.as_string().or_else(|| v.as_i64().map(|n| n.to_string())))
+    }
+
+    /// DUP-1 (phase 1) : la fusion reporte ce que la cible n'a pas réglé,
+    /// jamais ce qu'elle a choisi ; le doublon sort de la liste sans libérer
+    /// son identifiant ; groupes et zone par défaut suivent.
+    #[test]
+    fn fusionner_reporte_sans_ecraser_et_masque_le_doublon() {
+        let repo = ZoneRepo::new(super::tests::test_db_migree());
+        let doublon = repo
+            .create(
+                "Chambre",
+                Some("dlna"),
+                Some("uuid:RINCON_B8E937B44D0801400_MR"),
+            )
+            .unwrap();
+        let cible = repo
+            .create(
+                "Chambre - Sonos Play:1",
+                Some("dlna"),
+                Some("uuid:RINCON_B8E937B44D0801400"),
+            )
+            .unwrap();
+        repo.update_fixed_volume(doublon, true).unwrap();
+        repo.update_dsd_mode(doublon, "dop").unwrap();
+        repo.update_dsd_mode(cible, "native").unwrap();
+        let settings = super::super::settings_repo::SettingsRepo::with_backend(repo.db.clone());
+        settings
+            .set(&format!("zone_{doublon}_eq_profile"), "salon")
+            .unwrap();
+        settings
+            .set(&format!("zone_{doublon}_crossfeed"), "on")
+            .unwrap();
+        settings
+            .set(&format!("zone_{cible}_crossfeed"), "off")
+            .unwrap();
+        settings
+            .set(&format!("ir_path_{doublon}"), "/ir/salon.wav")
+            .unwrap();
+        settings
+            .set("default_zone_id", &doublon.to_string())
+            .unwrap();
+        settings
+            .set(
+                "zone_groups",
+                &format!(
+                    r#"[{{"id":1,"group_id":"1","name":"Bas","leader_id":{doublon},"zone_ids":[{doublon},{cible},7]}}]"#
+                ),
+            )
+            .unwrap();
+
+        let rapport = repo.fusionner(doublon, cible).unwrap();
+
+        let apres = repo.get(cible).unwrap().unwrap();
+        assert!(
+            apres.fixed_volume,
+            "la cible était au défaut : le volume fixe du doublon s'applique"
+        );
+        assert_eq!(
+            valeur_texte(
+                &repo,
+                &format!("SELECT dsd_mode FROM zones WHERE id = {cible}")
+            )
+            .as_deref(),
+            Some("native"),
+            "un réglage explicite de la cible ne cède jamais"
+        );
+        assert_eq!(
+            settings
+                .get(&format!("zone_{cible}_eq_profile"))
+                .unwrap()
+                .as_deref(),
+            Some("salon")
+        );
+        assert_eq!(
+            settings
+                .get(&format!("zone_{cible}_crossfeed"))
+                .unwrap()
+                .as_deref(),
+            Some("off")
+        );
+        assert_eq!(
+            settings
+                .get(&format!("ir_path_{cible}"))
+                .unwrap()
+                .as_deref(),
+            Some("/ir/salon.wav")
+        );
+        assert_eq!(
+            rapport.reglages_reportes, 2,
+            "eq_profile et ir_path ; crossfeed refusé"
+        );
+        assert_eq!(
+            settings.get("default_zone_id").unwrap(),
+            Some(cible.to_string())
+        );
+        let groupes = settings.get("zone_groups").unwrap().unwrap();
+        assert!(
+            groupes.contains(&format!(r#""zone_ids":[{cible},7]"#))
+                && groupes.contains(&format!(r#""leader_id":{cible}"#)),
+            "le doublon cède sa place dans le groupe : {groupes}"
+        );
+        assert!(rapport.zone_par_defaut_reportee && rapport.groupes_reecrits);
+        assert!(
+            repo.list().unwrap().iter().all(|z| z.id != Some(doublon)),
+            "le doublon sort de la liste"
+        );
+        assert!(
+            repo.is_device_hidden("uuid:RINCON_B8E937B44D0801400_MR"),
+            "l'identifiant reste occupé : la découverte ne recrée pas la zone"
+        );
+        assert!(
+            repo.fusionner(cible, cible).is_err(),
+            "pas de fusion dans soi-même"
+        );
+        assert!(
+            repo.fusionner(doublon, 999).is_err(),
+            "cible inconnue refusée"
+        );
+    }
+
+    /// DUP-1 (phase 1) : la file suit le doublon seulement si la cible n'en a
+    /// pas ; on ne mêle jamais deux files.
+    #[test]
+    fn fusionner_reporte_la_file_seulement_si_la_cible_n_en_a_pas() {
+        let repo = ZoneRepo::new(super::tests::test_db_migree());
+        let a = repo.create("A", Some("dlna"), Some("uuid:x_MR")).unwrap();
+        let b = repo.create("B", Some("dlna"), Some("uuid:x")).unwrap();
+        let c = repo.create("C", Some("dlna"), Some("uuid:y_MR")).unwrap();
+        let d = repo.create("D", Some("dlna"), Some("uuid:y")).unwrap();
+        repo.db
+            .execute_batch(&format!(
+                "INSERT INTO queue_items (zone_id, position, title) VALUES \
+                 ({a}, 0, 'un'), ({a}, 1, 'deux'), ({c}, 0, 'trois'), ({d}, 0, 'quatre');"
+            ))
+            .unwrap();
+        let r1 = repo.fusionner(a, b).unwrap();
+        assert_eq!(
+            (r1.file_reportee, r1.file_conservee_sur_la_cible),
+            (2, false)
+        );
+        let r2 = repo.fusionner(c, d).unwrap();
+        assert_eq!(
+            (r2.file_reportee, r2.file_conservee_sur_la_cible),
+            (0, true)
+        );
+        let compte = |zone: i64| {
+            valeur_texte(
+                &repo,
+                &format!("SELECT COUNT(*) FROM queue_items WHERE zone_id = {zone}"),
+            )
+        };
+        assert_eq!(
+            compte(b).as_deref(),
+            Some("2"),
+            "la file de A est arrivée sur B"
+        );
+        assert_eq!(compte(d).as_deref(), Some("1"), "la file de D est intacte");
+        assert_eq!(
+            compte(c).as_deref(),
+            Some("1"),
+            "celle de C n'a pas été mêlée"
+        );
+    }
+
+    #[test]
+    fn remplacer_dans_la_liste_ne_repete_pas_et_ne_touche_pas_l_illisible() {
+        assert_eq!(
+            remplacer_dans_la_liste("[4, 20, 6]", 20, 4).as_deref(),
+            Some("[4,6]")
+        );
+        assert_eq!(
+            remplacer_dans_la_liste("[20, 6]", 20, 4).as_deref(),
+            Some("[4,6]")
+        );
+        assert_eq!(remplacer_dans_la_liste("[1, 2]", 20, 4), None);
+        assert_eq!(remplacer_dans_la_liste("pas une liste", 20, 4), None);
+    }
+
+    /// DUP-1 (phase 2) : le passage EN LIGNE date la zone, le passage hors
+    /// ligne ne touche pas a la date, et l'age se lit en secondes ; une zone
+    /// jamais vue n'a pas d'age.
+    #[test]
+    fn le_passage_en_ligne_date_la_zone_et_le_passage_hors_ligne_garde_la_date() {
+        let repo = repo();
+        let vue = repo
+            .create("Salon", Some("dlna"), Some("uuid:salon"))
+            .unwrap();
+        let jamais = repo
+            .create("Cave", Some("dlna"), Some("uuid:cave"))
+            .unwrap();
+        let lue = |id: i64| {
+            valeur_texte(
+                &repo,
+                &format!("SELECT last_seen_at FROM zones WHERE id = {id}"),
+            )
+        };
+        assert_eq!(lue(vue), None, "avant tout passage en ligne : NULL");
+
+        repo.set_online_by_device("uuid:salon", true).unwrap();
+        let date = lue(vue).expect("le passage en ligne pose la date");
+        assert!(
+            date.ends_with('Z') && date.len() == 20,
+            "ISO 8601 UTC : {date}"
+        );
+
+        repo.set_online_by_device("uuid:salon", false).unwrap();
+        assert_eq!(
+            lue(vue).as_deref(),
+            Some(date.as_str()),
+            "hors ligne ne touche pas la date"
+        );
+        assert_eq!(lue(jamais), None);
+
+        let ages = repo.ages_depuis_derniere_vue().unwrap();
+        assert!(
+            ages.get(&vue).is_some_and(|a| (0..=5).contains(a)),
+            "age en secondes : {ages:?}"
+        );
+        assert!(!ages.contains_key(&jamais), "jamais vue : pas d'age");
+
+        repo.update_online(jamais, true).unwrap();
+        assert!(lue(jamais).is_some(), "par identifiant aussi");
     }
 
     /// Defaut inchange : une zone neuve n'enchaine rien.
