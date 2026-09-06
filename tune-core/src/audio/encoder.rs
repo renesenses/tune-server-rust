@@ -284,9 +284,6 @@ fn flac_write(
 ) -> Result<(), String> {
     let bytes_per_sample = ((bit_depth + 7) / 8) as usize;
     let bytes_per_frame = bytes_per_sample * channels as usize; // one inter-channel sample
-
-    // Combine any leftover bytes from the previous write with new data.
-    // We take ownership of leftover to avoid borrow conflicts with state.
     let combined: Vec<u8>;
     let working_data: &[u8] = if state.pcm_leftover.is_empty() {
         pcm_data
@@ -298,52 +295,61 @@ fn flac_write(
         };
         &combined
     };
-
-    // How many complete inter-channel samples can we decode?
     let usable_bytes = (working_data.len() / bytes_per_frame) * bytes_per_frame;
     let remainder_bytes = working_data.len() - usable_bytes;
-
-    // Decode usable PCM to interleaved i32 samples
     let interleaved = pcm_to_i32(&working_data[..usable_bytes], bit_depth)?;
-
-    // De-interleave into per-channel buffers
     let ch = channels as usize;
+    for buf in &mut state.channel_buffers {
+        buf.reserve(interleaved.len() / ch + 1);
+    }
     for (i, &s) in interleaved.iter().enumerate() {
         state.channel_buffers[i % ch].push(s);
     }
-
-    // Encode complete blocks as they become available
-    while state.channel_buffers[0].len() >= FLAC_BLOCK_SIZE {
-        encode_block_from_buffers(state, FLAC_BLOCK_SIZE, sample_rate, bit_depth, channels)?;
+    // LAT-F1 (phase 2b) : tous les blocs complets sont encodés à partir d'un
+    // décalage, et les tampons ne sont décalés QU'UNE fois. Avant, chaque bloc
+    // drainait le début des tampons — un déplacement de toute la fin du
+    // morceau tous les 4 096 échantillons, quadratique : c'était l'essentiel
+    // des 20 s que coûtait un FLAC de cinq minutes (#3357).
+    let blocs = state.channel_buffers[0].len() / FLAC_BLOCK_SIZE;
+    for k in 0..blocs {
+        encode_block_at(
+            state,
+            k * FLAC_BLOCK_SIZE,
+            FLAC_BLOCK_SIZE,
+            sample_rate,
+            bit_depth,
+            channels,
+        )?;
     }
-
-    // Save remainder bytes for the next write
+    if blocs > 0 {
+        let consomme = blocs * FLAC_BLOCK_SIZE;
+        for buf in &mut state.channel_buffers {
+            buf.drain(..consomme);
+        }
+    }
     if remainder_bytes > 0 {
         state.pcm_leftover = working_data[usable_bytes..].to_vec();
     }
-    // else: pcm_leftover is already empty (either was empty, or was taken via mem::take)
-
     Ok(())
 }
 
 /// Encode `block_len` samples from the front of each channel buffer as a single
 /// FLAC frame, then drain those samples from the buffers.
-fn encode_block_from_buffers(
+/// Encode UN bloc lu à `offset` dans les tampons par canal, sans les toucher.
+fn encode_block_at(
     state: &mut FlacStreamState,
+    offset: usize,
     block_len: usize,
     sample_rate: u32,
     bit_depth: u32,
     channels: u32,
 ) -> Result<(), String> {
     let frame_start = state.output.len();
-
-    // Build temporary per-channel slices for the encoder
     let channel_slices: Vec<&[i32]> = state
         .channel_buffers
         .iter()
-        .map(|buf| &buf[..block_len])
+        .map(|buf| &buf[offset..offset + block_len])
         .collect();
-
     encode_flac_frame_slices(
         &mut state.output,
         &channel_slices,
@@ -353,18 +359,26 @@ fn encode_block_from_buffers(
         channels,
         state.frame_count,
     )?;
-
     let frame_bytes = (state.output.len() - frame_start) as u32;
     state.min_frame_size = state.min_frame_size.min(frame_bytes);
     state.max_frame_size = state.max_frame_size.max(frame_bytes);
     state.frame_count += 1;
     state.total_samples += block_len as u64;
+    Ok(())
+}
 
-    // Drain the consumed samples from channel buffers
+/// Encode le bloc en tête des tampons puis le consomme (dernier bloc, à la fin).
+fn encode_block_from_buffers(
+    state: &mut FlacStreamState,
+    block_len: usize,
+    sample_rate: u32,
+    bit_depth: u32,
+    channels: u32,
+) -> Result<(), String> {
+    encode_block_at(state, 0, block_len, sample_rate, bit_depth, channels)?;
     for buf in &mut state.channel_buffers {
         buf.drain(..block_len);
     }
-
     Ok(())
 }
 
@@ -622,38 +636,42 @@ fn pcm_to_i32(pcm: &[u8], bit_depth: u32) -> Result<Vec<i32>, String> {
 /// A bitstream writer that accumulates bits into a byte buffer.
 struct BitWriter {
     buf: Vec<u8>,
-    current_byte: u8,
-    bits_in_byte: u8, // how many bits written into current_byte (0-7)
+    /// Bits en attente (moins de huit), alignés à droite.
+    acc: u64,
+    nbits: u32,
 }
 
 impl BitWriter {
     fn new() -> Self {
         Self {
             buf: Vec::new(),
-            current_byte: 0,
-            bits_in_byte: 0,
+            acc: 0,
+            nbits: 0,
         }
     }
 
-    /// Write `n` bits from `value` (MSB first). n must be <= 32.
+    /// Écrit `n` bits (poids fort d'abord) : les octets complets partent d'un
+    /// coup. L'ancienne boucle poussait bit à bit — un `push` tous les huit
+    /// bits et une itération par bit pour chaque échantillon codé en Rice.
+    #[inline]
     fn write_bits(&mut self, value: u32, n: u8) {
         debug_assert!(n <= 32);
         if n == 0 {
             return;
         }
-        for i in (0..n).rev() {
-            let bit = (value >> i) & 1;
-            self.current_byte = (self.current_byte << 1) | bit as u8;
-            self.bits_in_byte += 1;
-            if self.bits_in_byte == 8 {
-                self.buf.push(self.current_byte);
-                self.current_byte = 0;
-                self.bits_in_byte = 0;
-            }
+        let n = n as u32;
+        let masque = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+        let mut acc = (self.acc << n) | (value & masque) as u64;
+        let mut total = self.nbits + n;
+        while total >= 8 {
+            total -= 8;
+            self.buf.push((acc >> total) as u8);
         }
+        acc &= (1u64 << total) - 1;
+        self.acc = acc;
+        self.nbits = total;
     }
 
-    /// Write `n` bits from a u64 value (MSB first). n must be <= 64.
     fn write_bits_u64(&mut self, value: u64, n: u8) {
         debug_assert!(n <= 64);
         if n <= 32 {
@@ -664,19 +682,37 @@ impl BitWriter {
         }
     }
 
-    /// Pad remaining bits to byte boundary with zeros.
+    /// `n` bits à zéro : la partie unaire du code de Rice, qui peut être longue.
+    fn write_zeros(&mut self, mut n: u32) {
+        if self.nbits > 0 {
+            let reste = 8 - self.nbits;
+            if n < reste {
+                self.acc <<= n;
+                self.nbits += n;
+                return;
+            }
+            self.buf.push((self.acc << reste) as u8);
+            self.acc = 0;
+            self.nbits = 0;
+            n -= reste;
+        }
+        let octets = (n / 8) as usize;
+        if octets > 0 {
+            self.buf.resize(self.buf.len() + octets, 0);
+        }
+        self.nbits = n % 8;
+    }
+
     fn flush(&mut self) {
-        if self.bits_in_byte > 0 {
-            self.current_byte <<= 8 - self.bits_in_byte;
-            self.buf.push(self.current_byte);
-            self.current_byte = 0;
-            self.bits_in_byte = 0;
+        if self.nbits > 0 {
+            self.buf.push((self.acc << (8 - self.nbits)) as u8);
+            self.acc = 0;
+            self.nbits = 0;
         }
     }
 
-    /// Returns the accumulated bytes. Must call flush() first.
     fn into_bytes(self) -> Vec<u8> {
-        debug_assert_eq!(self.bits_in_byte, 0);
+        debug_assert_eq!(self.nbits, 0);
         self.buf
     }
 }
@@ -917,15 +953,19 @@ fn encode_subframe_fixed(
 
 /// Pick the best fixed prediction order (0-4) by minimizing sum of absolute residuals.
 fn pick_best_fixed_order(samples: &[i32]) -> u8 {
+    let n = samples.len();
     let mut best_order = 0u8;
     let mut best_sum = u64::MAX;
-
     for order in 0..=4u8 {
-        if (order as usize) >= samples.len() {
+        let depart = order as usize;
+        if depart >= n {
             break;
         }
-        let residuals = compute_fixed_residuals(samples, order);
-        let sum: u64 = residuals.iter().map(|r| r.unsigned_abs() as u64).sum();
+        // Somme des résidus SANS matérialiser le vecteur : cinq ordres par
+        // sous-trame, autant d'allocations évitées par bloc et par canal.
+        let sum = (depart..n).fold(0u64, |acc, i| {
+            acc.saturating_add(residu_fixe(samples, i, order).unsigned_abs())
+        });
         if sum < best_sum {
             best_sum = sum;
             best_order = order;
@@ -934,27 +974,25 @@ fn pick_best_fixed_order(samples: &[i32]) -> u8 {
     best_order
 }
 
+/// Le résidu du prédicteur fixe d'ordre `order` à la position `i`.
+#[inline]
+fn residu_fixe(s: &[i32], i: usize, order: u8) -> i64 {
+    let x = |j: usize| s[j] as i64;
+    match order {
+        0 => x(i),
+        1 => x(i) - x(i - 1),
+        2 => x(i) - 2 * x(i - 1) + x(i - 2),
+        3 => x(i) - 3 * x(i - 1) + 3 * x(i - 2) - x(i - 3),
+        4 => x(i) - 4 * x(i - 1) + 6 * x(i - 2) - 4 * x(i - 3) + x(i - 4),
+        _ => unreachable!(),
+    }
+}
+
 /// Compute residuals for FIXED prediction of given order.
 fn compute_fixed_residuals(samples: &[i32], order: u8) -> Vec<i64> {
-    let n = samples.len();
-    let start = order as usize;
-    let mut residuals = Vec::with_capacity(n - start);
-
-    // Work with i64 to avoid overflow in higher-order predictions
-    let s: Vec<i64> = samples.iter().map(|&x| x as i64).collect();
-
-    for i in start..n {
-        let r = match order {
-            0 => s[i],
-            1 => s[i] - s[i - 1],
-            2 => s[i] - 2 * s[i - 1] + s[i - 2],
-            3 => s[i] - 3 * s[i - 1] + 3 * s[i - 2] - s[i - 3],
-            4 => s[i] - 4 * s[i - 1] + 6 * s[i - 2] - 4 * s[i - 3] + s[i - 4],
-            _ => unreachable!(),
-        };
-        residuals.push(r);
-    }
-    residuals
+    (order as usize..samples.len())
+        .map(|i| residu_fixe(samples, i, order))
+        .collect()
 }
 
 /// Encode residuals using Rice coding (RESIDUAL_CODING_METHOD_PARTITIONED_RICE).
@@ -1050,21 +1088,10 @@ fn write_rice_signed(bw: &mut BitWriter, value: i64, k: u8) {
     } else {
         (((-value) as u64) << 1) - 1
     };
-
     let quotient = (mapped >> k) as u32;
     let remainder = mapped & ((1u64 << k) - 1);
-
-    // Unary code for quotient: `quotient` zeros followed by a terminating one.
-    // FLAC decoders read the quotient with read_unary_zeros() (count leading
-    // zeros up to the first 1), so writing ones-then-zero desynchronised every
-    // Rice-coded residual — corrupting all FIXED subframes (audible as noise on
-    // transcoded ALAC; CONSTANT subframes, which use no Rice coding, were fine).
-    for _ in 0..quotient {
-        bw.write_bits(0, 1);
-    }
+    bw.write_zeros(quotient);
     bw.write_bits(1, 1);
-
-    // Binary code for remainder: k bits
     if k > 0 {
         if k <= 32 {
             bw.write_bits(remainder as u32, k);
@@ -1098,35 +1125,58 @@ fn write_signed(bw: &mut BitWriter, value: i64, bits: u8) {
 // ---------------------------------------------------------------------------
 
 /// CRC-8 with polynomial x^8 + x^2 + x^1 + 1 (0x07), init 0.
-fn flac_crc8(data: &[u8]) -> u8 {
-    let mut crc: u8 = 0;
-    for &byte in data {
-        crc ^= byte;
-        for _ in 0..8 {
-            if crc & 0x80 != 0 {
-                crc = (crc << 1) ^ 0x07;
+const fn table_crc8() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u8;
+        let mut b = 0;
+        while b < 8 {
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x07
             } else {
-                crc <<= 1;
-            }
+                crc << 1
+            };
+            b += 1;
         }
+        t[i] = crc;
+        i += 1;
     }
-    crc
+    t
+}
+
+const fn table_crc16() -> [u16; 256] {
+    let mut t = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut b = 0;
+        while b < 8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
+            b += 1;
+        }
+        t[i] = crc;
+        i += 1;
+    }
+    t
+}
+
+static CRC8: [u8; 256] = table_crc8();
+static CRC16: [u16; 256] = table_crc16();
+
+fn flac_crc8(data: &[u8]) -> u8 {
+    data.iter().fold(0u8, |crc, &b| CRC8[(crc ^ b) as usize])
 }
 
 /// CRC-16 with polynomial x^16 + x^15 + x^2 + 1 (0x8005), init 0.
 fn flac_crc16(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0;
-    for &byte in data {
-        crc ^= (byte as u16) << 8;
-        for _ in 0..8 {
-            if crc & 0x8000 != 0 {
-                crc = (crc << 1) ^ 0x8005;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    crc
+    data.iter().fold(0u16, |crc, &b| {
+        (crc << 8) ^ CRC16[(((crc >> 8) as u8) ^ b) as usize]
+    })
 }
 
 // ---------------------------------------------------------------------------
