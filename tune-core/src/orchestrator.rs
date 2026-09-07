@@ -1131,6 +1131,9 @@ mod resolution_annoncee_tests;
 mod wav_override_tests;
 
 #[cfg(test)]
+mod plafond_16_bits_tests;
+
+#[cfg(test)]
 mod tests;
 
 /// Plafond de profondeur en sortie (#1610).

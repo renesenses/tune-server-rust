@@ -667,10 +667,13 @@ impl PlaybackOrchestrator {
         // Only meaningful when the source is deeper than 16-bit.
         // Flag zone `dlna_cap_16bit` OR quirk catalogue `force_16bit` (additif :
         // le quirk ne peut que l'activer, jamais le désactiver — Ruark R3 #1137).
-        let dlna_cap_16bit = is_network_output
-            && bit_depth > 16
-            && (ZoneRepo::with_backend(self.db.clone()).get_dlna_cap_16bit(req.zone_id)
-                || device_quirks.force_16bit);
+        // Par la MÊME fonction que le miroir du chemin du signal (#3183).
+        let dlna_cap_16bit = dlna_cap_16bit_applies(
+            is_network_output,
+            bit_depth,
+            ZoneRepo::with_backend(self.db.clone()).get_dlna_cap_16bit(req.zone_id),
+            device_quirks.force_16bit,
+        );
         let alac_passthrough = source_format == Some(AudioFormat::Alac)
             && is_network_output
             && !dlna_force_wav
