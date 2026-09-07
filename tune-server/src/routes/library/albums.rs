@@ -339,8 +339,20 @@ pub(super) async fn get_album(
             // from the payload rather than null when untagged, so a client can
             // simply test for the key instead of distinguishing "no tag" from
             // "measured zero" — DR0 is a real value.
-            if let (Some(obj), Ok(Some(dr))) = (j.as_object_mut(), repo.dynamic_range(id)) {
-                obj.insert("dynamic_range".into(), Value::String(dr));
+            //
+            // `dynamic_range_source` dit d'OÙ sort la valeur (#1388) :
+            // `album_tag` quand une piste porte `ALBUM DYNAMIC RANGE`,
+            // `track_average` quand Tune l'a déduite de la moyenne arrondie des
+            // `DYNAMIC RANGE` des pistes. Les deux clés apparaissent et
+            // disparaissent ENSEMBLE : un client qui ne connaît que la première
+            // ne voit aucun changement, celui qui lit la seconde peut annoncer
+            // une mesure ou une déduction plutôt que de les confondre.
+            if let (Some(obj), Ok(Some(dr))) = (j.as_object_mut(), repo.dynamic_range_detail(id)) {
+                obj.insert("dynamic_range".into(), Value::String(dr.valeur.to_string()));
+                obj.insert(
+                    "dynamic_range_source".into(),
+                    Value::String(dr.source().into()),
+                );
             }
             Json(j).into_response()
         }

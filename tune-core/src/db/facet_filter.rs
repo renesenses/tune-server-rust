@@ -259,14 +259,19 @@ pub fn favorite_condition(kind: &str) -> Option<&'static str> {
 /// liste filtrée (`TrackRepo::list_filtered`). Une facette qui compterait
 /// autrement que la liste qu'elle filtre serait pire qu'une facette absente.
 ///
-/// Le DR vit dans le magasin ouvert `track_metadata`, sous la clé `dr_album`,
-/// en **TEXTE** déjà normalisé au scan (« DR12 », « DR 12 » → « 12 », commit
-/// 7cdc93ff). Trois gardes avant le `CAST`, parce qu'un magasin ouvert accepte
-/// n'importe quelle chaîne : non vide, trois caractères au plus, et **rien que
-/// des chiffres**. Sans le troisième, `CAST('abc' AS INTEGER)` vaut `0` en
-/// SQLite (donc « DR0 », une valeur de facette inventée) et **lève** en
-/// PostgreSQL (donc la requête entière échoue) — la 17ᵉ divergence PG/SQLite
-/// qu'on refuse d'ajouter.
+/// Le DR vit dans le magasin ouvert `track_metadata`, sous **deux** clés — le
+/// tag d'album `dr_album` et le tag de piste `dr_track` — en **TEXTE** déjà
+/// normalisé au scan (« DR12 », « DR 12 » → « 12 », commit 7cdc93ff). Trois
+/// gardes avant le `CAST`, parce qu'un magasin ouvert accepte n'importe quelle
+/// chaîne : non vide, trois caractères au plus, et **rien que des chiffres**.
+/// Sans le troisième, `CAST('abc' AS INTEGER)` vaut `0` en SQLite (donc
+/// « DR0 », une valeur de facette inventée) et **lève** en PostgreSQL (donc la
+/// requête entière échoue) — la 17ᵉ divergence PG/SQLite qu'on refuse
+/// d'ajouter.
+///
+/// Les deux clés passent ensemble parce que [`DR_ALBUM_VALUE`] les départage
+/// lui-même : le tag d'album prime, les tags de piste ne servent qu'à défaut.
+/// Les filtrer ici obligerait chaque appelant à refaire ce choix.
 ///
 /// L'alias de `track_metadata` est `tm`, celui de `tracks` est `tdr` : jamais
 /// `t`, qui est déjà pris par la requête ENGLOBANTE côté pistes.
@@ -277,23 +282,55 @@ pub fn dr_tag_where(engine: Engine) -> String {
         Engine::Sqlite => "tm.value NOT GLOB '*[^0-9]*'",
         Engine::Postgres => "tm.value ~ '^[0-9]+$'",
     };
-    format!("tm.key = 'dr_album' AND tm.value <> '' AND LENGTH(tm.value) <= 3 AND {only_digits}")
+    format!(
+        "tm.key IN ('dr_album', 'dr_track') AND tm.value <> '' \
+         AND LENGTH(tm.value) <= 3 AND {only_digits}"
+    )
 }
 
-/// Le DR d'un album à partir de ses pistes : le **maximum**.
+/// Le DR d'un album à partir de ses pistes — sur un groupe `GROUP BY album_id`
+/// filtré par [`dr_tag_where`].
 ///
-/// Le tag est un tag d'ALBUM recopié sur chaque piste ; en théorie toutes les
-/// pistes portent la même valeur. Quand elles divergent (album ré-tagué à
-/// moitié), le maximum donne une valeur stable et reproductible plutôt qu'une
-/// valeur au hasard du plan d'exécution.
-pub const DR_ALBUM_VALUE: &str = "MAX(CAST(tm.value AS INTEGER))";
+/// Deux étages, dans cet ordre (#1388) :
+///
+/// 1. **Le tag d'album**, `ALBUM DYNAMIC RANGE`, quand une piste au moins le
+///    porte. C'est un tag d'ALBUM recopié sur chaque piste ; en théorie toutes
+///    portent la même valeur, et quand elles divergent (album ré-tagué à
+///    moitié) le `MAX` donne une valeur stable et reproductible plutôt qu'une
+///    valeur au hasard du plan d'exécution.
+/// 2. **La moyenne des DR de piste**, arrondie, quand aucune piste ne porte le
+///    tag d'album mais que des pistes portent `DYNAMIC RANGE`. C'est la façon
+///    dont les mesureurs eux-mêmes composent la valeur d'album à partir des
+///    pistes, et c'est le cas de Patatorz à l'envers : lui ne tague que
+///    l'album ; foobar2000, lui, écrit le tag par piste et rien pour l'album,
+///    et la fiche restait alors muette (« DR » nulle part) alors que chaque
+///    piste affichait le sien.
+///
+/// `COALESCE` et non `MAX` des deux : un tag d'album explicite doit gagner,
+/// même quand il est plus bas que la moyenne des pistes. C'est la valeur que
+/// le mesureur a écrite.
+///
+/// Une seule expression pour la grille, le tri, la tranche, le rail de
+/// facettes et la fiche : deux règles auraient fini par afficher un DR que la
+/// facette ne connaît pas.
+pub const DR_ALBUM_VALUE: &str = "COALESCE(\
+     MAX(CASE WHEN tm.key = 'dr_album' THEN CAST(tm.value AS INTEGER) END), \
+     CAST(ROUND(AVG(CASE WHEN tm.key = 'dr_track' THEN CAST(tm.value AS INTEGER) END)) AS INTEGER))";
+
+/// « D'où vient la valeur ? », en SQL : `1` quand c'est le tag d'album, `0`
+/// quand c'est la moyenne des pistes.
+///
+/// Colonne séparée plutôt que devinée après coup : depuis la valeur seule, on
+/// ne peut pas distinguer un album tagué DR12 d'un album dont les pistes
+/// moyennent 12. Et l'écran ne dit pas la même chose des deux.
+pub const DR_ALBUM_FROM_TAG: &str = "MAX(CASE WHEN tm.key = 'dr_album' THEN 1 ELSE 0 END)";
 
 /// La table dérivée « un album, son DR » — à joindre sur `album_id`.
 ///
-/// Elle ne balaie que les lignes `dr_album` de `track_metadata`, c'est-à-dire
-/// une poignée sur une bibliothèque réelle : c'est ce qui la rend jointe-able
-/// sans coût, là où une sous-requête CORRÉLÉE par piste referait le travail
-/// des centaines de milliers de fois.
+/// Elle ne balaie que les lignes `dr_album` et `dr_track` de `track_metadata`,
+/// que `idx_track_metadata_key` sert directement : c'est ce qui la rend
+/// jointe-able sans coût, là où une sous-requête CORRÉLÉE par piste referait le
+/// travail des centaines de milliers de fois.
 pub fn dr_album_source(engine: Engine) -> String {
     format!(
         "SELECT tdr.album_id AS album_id, {DR_ALBUM_VALUE} AS dr \
@@ -749,7 +786,7 @@ mod tests {
         let having = ph.in_list(DR_ALBUM_VALUE, 3).expect("liste non vide");
         let sql = dr_album_in(Engine::Postgres, &having);
         assert!(
-            sql.contains("HAVING MAX(CAST(tm.value AS INTEGER)) IN ($4, $5, $6)"),
+            sql.contains(&format!("HAVING {DR_ALBUM_VALUE} IN ($4, $5, $6)")),
             "les trois marqueurs se suivent : {sql}"
         );
         assert_eq!(
@@ -777,7 +814,7 @@ mod tests {
             assert!(dr_album_source(engine).contains(&regle));
             assert!(dr_album_in(engine, "1 = 1").contains(&regle));
             // Les trois gardes AVANT le CAST, sur les deux moteurs.
-            assert!(regle.contains("tm.key = 'dr_album'"));
+            assert!(regle.contains("tm.key IN ('dr_album', 'dr_track')"));
             assert!(regle.contains("tm.value <> ''"));
             assert!(regle.contains("LENGTH(tm.value) <= 3"));
         }
