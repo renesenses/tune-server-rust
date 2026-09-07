@@ -129,6 +129,19 @@ impl AudioEncoder {
         Ok(())
     }
 
+    /// Le format RÉELLEMENT écrit, après `start` : « flac » ou « wav ». Un
+    /// appelant qui étiquette la sortie doit lire ceci, pas le format demandé —
+    /// une demande AIFF, MP3 ou OGG est servie en FLAC (#3357).
+    pub fn format_effectif(&self) -> &'static str {
+        if self.flac_state.is_some() {
+            "flac"
+        } else if self.pcm_buffer.is_some() {
+            "wav"
+        } else {
+            ""
+        }
+    }
+
     pub async fn write(&mut self, pcm_data: &[u8]) -> Result<(), String> {
         self.write_sync(pcm_data)
     }
@@ -1207,6 +1220,25 @@ fn flac_crc16(data: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3357 : ce que l'encodeur écrit vraiment. AIFF, MP3 et OGG n'ont pas
+    /// d'encodeur natif : la charge utile est du FLAC, et l'appelant doit
+    /// pouvoir le savoir autrement qu'en lisant le journal.
+    #[test]
+    fn le_format_effectif_dit_ce_qui_est_ecrit() {
+        for (demande, attendu) in [
+            ("wav", "wav"),
+            ("flac", "flac"),
+            ("aiff", "flac"),
+            ("mp3", "flac"),
+            ("ogg", "flac"),
+        ] {
+            let mut enc = AudioEncoder::new(demande, 44_100, 16, 2);
+            assert_eq!(enc.format_effectif(), "", "avant start, rien n'est écrit");
+            enc.start_sync().unwrap();
+            assert_eq!(enc.format_effectif(), attendu, "demande {demande}");
+        }
+    }
 
     /// Encode a known 24-bit signal to FLAC and decode it back: the stream must
     /// be valid and bit-exact. Guards two encoder bugs that made transcoded
