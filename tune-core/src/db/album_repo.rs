@@ -289,10 +289,13 @@ pub mod sql {
         )
     }
 
+    /// Le compte des PRÉSENTATIONS de l'album, pas de ses lignes de table
+    /// (#1362) — voir
+    /// [`sql_compte_pistes_visibles`](crate::db::track_repo::sql_compte_pistes_visibles).
     pub fn update_track_count<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE albums SET track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = {}) WHERE id = {}",
-            d.placeholder(1),
+            "UPDATE albums SET track_count = {} WHERE id = {}",
+            crate::db::track_repo::sql_compte_pistes_visibles(&d.placeholder(1)),
             d.placeholder(2)
         )
     }
@@ -623,8 +626,8 @@ impl AlbumRepo {
         let params_cible: [&dyn ToSqlValue; 1] = [&cible];
         self.db.execute(
             &format!(
-                "UPDATE albums SET track_count = \
-                 (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id) WHERE id = {p1}"
+                "UPDATE albums SET track_count = {} WHERE id = {p1}",
+                crate::db::track_repo::sql_compte_pistes_visibles("albums.id")
             ),
             &params_cible,
         )?;
@@ -3547,6 +3550,73 @@ mod tests {
         album_repo.update_track_count(alid).unwrap();
         let album = album_repo.get(alid).unwrap().unwrap();
         assert_eq!(album.track_count, Some(2));
+    }
+
+    /// Pose un album et ses pistes, et rend `(compte enregistré, lignes vues à
+    /// l'écran)`. Les deux viennent des fonctions RÉELLES —
+    /// `AlbumRepo::update_track_count` et
+    /// `track_repo::dedup_display_tracks` — pas d'une transcription de leur
+    /// SQL : c'est le seul montage qui garde le comportement.
+    fn compte_et_lignes_vues(pistes: &[(i32, i32, &str, &str)]) -> (Option<i32>, usize) {
+        let db = test_db();
+        let album_repo = AlbumRepo::new(db.clone());
+        let track_repo = crate::db::track_repo::TrackRepo::new(db);
+        let alid = album_repo
+            .create(&Album::new("Melody Nelson".into()))
+            .unwrap();
+        for (i, (disque, numero, titre, format)) in pistes.iter().enumerate() {
+            let mut t = crate::db::models::Track::new((*titre).to_string());
+            t.album_id = Some(alid);
+            t.disc_number = *disque;
+            t.track_number = *numero;
+            t.format = Some((*format).to_string());
+            t.sample_rate = Some(44100);
+            t.bit_depth = Some(16);
+            t.file_path = Some(format!("/musique/melody/{i}.{format}"));
+            track_repo.create(&t).unwrap();
+        }
+        album_repo.update_track_count(alid).unwrap();
+        let compte = album_repo.get(alid).unwrap().unwrap().track_count;
+        let vues =
+            crate::db::track_repo::dedup_display_tracks(track_repo.list_by_album(alid).unwrap())
+                .len();
+        (compte, vues)
+    }
+
+    /// #1362 — le cas de **Cyrille Moutia** : un CD rippé en AIFF, plus le même
+    /// morceau récupéré ailleurs en AAC et posé dans le dossier de l'album.
+    ///
+    /// L'écran replie les deux copies, la file n'en enfile qu'une : le compte
+    /// de l'album doit dire la même chose qu'eux. Comptées comme des lignes,
+    /// les quatre pistes en annonçaient quatre pour trois montrées — et
+    /// l'album, ne pouvant plus jamais égaler son propre total, restait
+    /// « commencé » à vie dans `GET /home`.
+    #[test]
+    fn le_compte_de_pistes_est_celui_que_l_ecran_montre() {
+        let (compte, vues) = compte_et_lignes_vues(&[
+            (1, 1, "Ballade De Melody Nelson", "aiff"),
+            (1, 6, "Melody", "aiff"),
+            (1, 6, "Melody", "aac"),
+            (1, 7, "Glory Box", "aiff"),
+        ]);
+        assert_eq!(vues, 3, "l'écran replie les deux copies de « Melody »");
+        assert_eq!(compte, Some(3), "le compte enregistré dit la même chose");
+    }
+
+    /// Contre-épreuve : sans copie en trop, rien ne bouge. Le même titre sur
+    /// deux DISQUES d'un coffret reste deux pistes, et deux morceaux distincts
+    /// portant le même numéro sur deux disques aussi.
+    #[test]
+    fn un_album_sans_copie_en_trop_garde_son_compte() {
+        let (compte, vues) = compte_et_lignes_vues(&[
+            (1, 1, "Ballade De Melody Nelson", "aiff"),
+            (1, 6, "Melody", "aiff"),
+            (1, 7, "Glory Box", "aiff"),
+            (2, 6, "Melody", "aiff"),
+            (2, 7, "Roads", "aiff"),
+        ]);
+        assert_eq!(vues, 5);
+        assert_eq!(compte, Some(5));
     }
 
     #[test]

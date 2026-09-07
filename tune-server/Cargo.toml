@@ -120,6 +120,15 @@ tokio = { workspace = true, features = ["test-util"] }
 name = "server_contracts"
 path = "tests/server_contracts.rs"
 
+# #1362 — « un morceau présent deux fois dans un album ne doit pas se jouer
+# deux fois ». Le fichier existe depuis que le défaut a été corrigé, mais
+# `autotests = false` (plus haut) le laissait HORS COMPILATION : la garde
+# n'était donc exécutée par personne, ni en local ni en CI. Elle l'est
+# désormais.
+[[test]]
+name = "album_lecture_en_double"
+path = "tests/album_lecture_en_double.rs"
+
 [[test]]
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
