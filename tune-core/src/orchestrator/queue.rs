@@ -103,6 +103,9 @@ impl PlaybackOrchestrator {
                 // Pré-chauffage en fond, sans budget ni auditeur qui attend :
                 // rien à mesurer, rien à étendre (#3140).
                 None,
+                // …et rien à préempter : ce travail n'appartient à aucune
+                // demande de lecture, il ne tient pas la zone (#3444).
+                None,
             )
             .await
             {
@@ -426,6 +429,63 @@ impl PlaybackOrchestrator {
             .get_at(zone_id, position)?
             .ok_or("no queue item at position")?;
 
+        // #3442 — la zone ADOPTE le flux pre-arme.
+        //
+        // L'enchainement sans blanc ouvre le flux de la piste suivante une
+        // trentaine de secondes a l'avance (`resolve_queue_item_url`, qui
+        // journalise `proxy_session_created`) et le range sous
+        // `gapless_sessions[zone]`. A la transition, cette fonction posait
+        // un `None` en dur a la place : l'identifiant EXISTE — le serveur l'a
+        // cree lui-meme et l'a mis dans l'URL passee a `dlna_set_next` — il
+        // n'etait simplement jamais transmis a la zone. Trois consequences,
+        // toutes portees par la chronologie du 05/09 (zone 10, DMP-A8 en
+        // DLNA) :
+        //
+        // 1. le sondeur ne peut plus mesurer les octets servis ; sa garde
+        //    refuse alors de couper une zone dont elle ne peut pas prouver la
+        //    panne (`octets_servis_inconnus_zone_non_coupee`, has_stream_id=
+        //    false, #2394) et le silence dure sans fin — 285 s observees, la
+        //    position figee a 6 s sur un morceau de 226 s ;
+        // 2. `poller::decisions::qui_tient_le_renderer` relit l'URI que
+        //    l'appareil annonce, y trouve `/stream/…` sans notre identifiant,
+        //    et conclut « tenu par un AUTRE serveur Tune » ;
+        // 3. l'armement SUIVANT commence par `cleanup_gapless_session`, qui
+        //    retire du gestionnaire de flux la session encore rangee sous la
+        //    zone — c'est-a-dire, depuis la transition, celle que le renderer
+        //    est EN TRAIN de lire, son fichier de pre-transcodage compris.
+        //
+        // On prend donc le flux pre-arme (il cesse d'etre « a jeter ») et on
+        // laisse a sa place celui de la piste qui vient de finir : c'est lui,
+        // desormais, dont c'est le tour d'etre libere au prochain armement.
+        // L'echange garde la duree de vie des sessions exactement telle
+        // qu'elle etait ; seule leur IDENTITE est corrigee.
+        //
+        // Rien n'est echange quand il n'y a rien a adopter (enchainement par
+        // FICHIER local, cf. `resolve_gapless_next_local_file`, qui n'ouvre
+        // aucune session) : le comportement y reste au mot pres celui d'avant.
+        let flux_precedent = self
+            .playback
+            .get_state(zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.stream_id);
+        let flux_adopte = {
+            let mut prepares = self.gapless_sessions.lock().await;
+            let adopte = prepares.remove(&zone_id);
+            if adopte.is_some()
+                && let Some(ancien) = flux_precedent.filter(|a| Some(a) != adopte.as_ref())
+            {
+                prepares.insert(zone_id, ancien);
+            }
+            adopte
+        };
+        info!(
+            zone_id,
+            position,
+            stream_id = flux_adopte.as_deref().unwrap_or("absent"),
+            "avance_gapless_flux_adopte"
+        );
+
         let np = if let Some(track_id) = entry.track_id {
             let track_repo = crate::db::track_repo::TrackRepo::with_backend(self.db.clone());
             let track = track_repo.get(track_id).ok().flatten();
@@ -443,6 +503,8 @@ impl PlaybackOrchestrator {
                 duration_ms: entry.duration_ms.unwrap_or(0),
                 source: "local".into(),
                 source_id: None,
+                // #3442 — le flux pre-arme suit la piste qu'il porte.
+                stream_id: flux_adopte.clone(),
                 ..track
                     .as_ref()
                     .map(crate::playback::NowPlaying::from_track)
@@ -472,7 +534,8 @@ impl PlaybackOrchestrator {
                 duration_ms: entry.duration_ms.unwrap_or(0),
                 source,
                 source_id: entry.source_id.clone(),
-                stream_id: None,
+                // #3442 — le `None` en dur qui perdait le flux pre-arme.
+                stream_id: flux_adopte.clone(),
                 ..Default::default()
             }
         };

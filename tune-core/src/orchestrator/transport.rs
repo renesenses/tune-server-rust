@@ -301,6 +301,24 @@ impl PlaybackOrchestrator {
             "orchestrator_play"
         );
 
+        // #2269 — la zone joue, mais pas forcément là où elle le dit.
+        //
+        // Le repli de la sortie locale sur le périphérique système (appareil
+        // débranché, ou renommé par son pilote au changement de cadence) est
+        // VOULU et reste inchangé : mieux vaut jouer ailleurs que ne pas jouer.
+        // Ce qui manquait, c'est de le DIRE — l'auditeur croyait écouter sa
+        // zone bit-perfect et entendait la sortie système.
+        //
+        // Ici, et pas dans le sondeur : c'est le seul endroit où l'on sait
+        // qu'un démarrage de lecture LOCALE vient d'aboutir. `output_sent`
+        // prouve que la sortie a accepté le flux — on n'annonce donc jamais un
+        // repli sur une lecture qui n'a pas eu lieu.
+        #[cfg(feature = "local-audio")]
+        {
+            if output_sent && is_local {
+                self.dire_si_la_zone_joue_ailleurs(req.zone_id);
+            }
+        }
         // Fail fast when the initial output send itself errored.
         //
         // play() already flipped the zone to Playing and bumped

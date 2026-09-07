@@ -730,6 +730,18 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+    /// Dernier repli de PÉRIPHÉRIQUE local annoncé par zone, texte compris
+    /// (#2269).
+    ///
+    /// Une zone dont le périphérique est introuvable joue sur la sortie
+    /// système à CHAQUE piste : sans cette mémoire, l'avance gapless
+    /// répéterait la même phrase indéfiniment et l'information deviendrait du
+    /// bruit. L'entrée est effacée dès que le périphérique demandé est de
+    /// nouveau celui qui joue, pour qu'un repli ultérieur soit dit à son tour.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    #[cfg(feature = "local-audio")]
+    replis_de_peripherique_dits: std::sync::Mutex<HashMap<i64, String>>,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -985,6 +997,8 @@ impl PlaybackOrchestrator {
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(feature = "local-audio")]
+            replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1014,6 +1028,9 @@ impl PlaybackOrchestrator {
 mod commun;
 
 mod transport;
+// #2269 — le repli silencieux de la sortie locale, rendu audible.
+#[cfg(feature = "local-audio")]
+mod repli_de_peripherique;
 
 mod resolve_stream;
 
@@ -1116,6 +1133,33 @@ mod transcode_budget_tests;
 #[cfg(test)]
 mod budget_adaptatif_tests;
 
+/// #3444 — un pré-transcodage en vol doit être PRÉEMPTIBLE.
+///
+/// ## Le fait de base mesuré ici
+///
+/// Une demande de lecture émise PENDANT un pré-transcodage de la même zone est
+/// servie, au pas de sondage près, au lieu d'attendre la fin d'un travail dont
+/// la sortie sera de toute façon jetée. Deux conséquences, toutes deux
+/// épinglées : le chien de garde rend `Preempte` en nommant la demande
+/// abandonnée, celle qui prend la main et le temps perdu ; et le verrou par
+/// fichier — celui qui, sur le .18 en 0.9.136, a retenu la zone 10 pendant
+/// 102 s — est rendu du même coup.
+///
+/// ## La contre-épreuve
+///
+/// `rouge_avant_le_transcodage_ignore_la_demande_et_va_au_bout` exécute
+/// l'ANCIEN comportement (surveillance sans point de contrôle) sur le même
+/// couple : la demande tombe à 3 s, la zone reste prise 102,2 s. C'est la
+/// moitié sans laquelle le témoin vert ne prouverait rien.
+///
+/// ## Aucun `sleep` réel
+///
+/// Tout tourne sous `#[tokio::test(start_paused = true)]`, comme les essais de
+/// budget voisins : l'horloge de tokio est virtuelle, les 102 s du ticket
+/// s'écoulent en quelques millisecondes, et le verdict est TOUJOURS le même.
+#[cfg(test)]
+mod preemption_du_transcodage_tests;
+
 /// La regle de decision du passthrough DSD (#2122).
 ///
 /// Les douze combinaisons : quatre modes croises avec les trois reponses
@@ -1200,3 +1244,6 @@ mod profondeur_annoncee_egale_profondeur_ecrite;
 /// texte du fichier quelles que soient les `cfg`.
 #[cfg(test)]
 mod recreation_locale_guard;
+
+#[cfg(test)]
+mod adoption_du_flux_pre_arme_3442;
