@@ -93,6 +93,34 @@ fn next_id(items: &[Value]) -> i64 {
         + 1
 }
 
+/// Contrat public d'un groupe de commandes hétérogène.
+///
+/// Ces groupes permettent de piloter plusieurs zones ensemble. Ils ne placent
+/// pas les renderers indépendants dans un domaine d'horloge commun et ne leur
+/// transmettent aucun timestamp de présentation (#2215).
+pub(crate) fn generic_group_synchronization_contract() -> Value {
+    json!({
+        "supported": false,
+        "transport": "independent_renderers",
+        "presentation_timestamps": false,
+        "render_latency_calibrated": false,
+        "accuracy_claim_ms": null,
+        "alternative": "oaat",
+    })
+}
+
+/// Ajoute le contrat de synchronisation à la vue d'un groupe hétérogène.
+pub(crate) fn generic_group_view(mut group: Value) -> Value {
+    group["synchronization"] = generic_group_synchronization_contract();
+    group
+}
+
+/// Ajoute le contrat de synchronisation à la vue d'un groupe OAAT.
+pub(crate) fn oaat_group_view(mut group: Value) -> Value {
+    group["synchronization"] = tune_core::outputs::oaat::oaat_synchronization_contract();
+    group
+}
+
 pub(crate) fn now_iso() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -312,7 +340,10 @@ struct CreateGroupRequest {
 
 async fn list_groups(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let groups = load_json_setting(&settings, "zone_groups");
+    let groups = load_json_setting(&settings, "zone_groups")
+        .into_iter()
+        .map(generic_group_view)
+        .collect::<Vec<_>>();
     Json(json!(groups))
 }
 
@@ -331,7 +362,7 @@ async fn create_group(
     });
     groups.push(group.clone());
     save_json_setting(&settings, "zone_groups", &groups);
-    (StatusCode::CREATED, Json(group)).into_response()
+    (StatusCode::CREATED, Json(generic_group_view(group))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -361,7 +392,7 @@ async fn update_group(
             }
             let result = groups[i].clone();
             save_json_setting(&settings, "zone_groups", &groups);
-            Json(result).into_response()
+            Json(generic_group_view(result)).into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -452,7 +483,8 @@ fn audio_calibration_unavailable_payload(group_id: i64) -> Value {
     json!({
         "error": "audio_calibration_unavailable",
         "group_id": group_id,
-        "message": "Le RTT de commande ne mesure pas la latence de restitution audio. Utilisez les corrections manuelles jusqu'à la disponibilité de timestamps de présentation ou d'une mesure acoustique.",
+        "synchronization": generic_group_synchronization_contract(),
+        "message": "Tune ne synchronise pas les renderers indépendants de ce groupe. Le RTT de commande ne mesure pas leur latence audio. Pour une lecture planifiée par timestamps de présentation, utilisez des points de diffusion Tune/OAAT.",
     })
 }
 
@@ -833,6 +865,9 @@ async fn sync_stats(State(state): State<AppState>) -> Json<Value> {
         "zones": zone_stats,
         "playing_count": playing.len(),
         "max_drift_ms": max_drift_ms,
+        "measurement": "reported_playback_position",
+        "synchronization_guarantee": false,
+        "warning": "Les positions rapportées par des renderers indépendants ne prouvent pas une restitution audio synchronisée.",
     }))
 }
 
@@ -911,7 +946,8 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
         "latencies": results,
         "measurement": "control_rtt",
         "audio_latency_available": false,
-        "warning": "Le RTT de commande ne mesure pas la latence de restitution audio.",
+        "synchronization_scope": "oaat_only",
+        "warning": "Le RTT de commande ne mesure pas la latence de restitution audio. Tune ne promet une planification synchronisée que pour ses points de diffusion OAAT.",
         "measured_at": now_iso(),
     }))
 }
@@ -922,7 +958,10 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn list_oaat_groups(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let groups = load_json_setting(&settings, "oaat_groups");
+    let groups = load_json_setting(&settings, "oaat_groups")
+        .into_iter()
+        .map(oaat_group_view)
+        .collect::<Vec<_>>();
     Json(json!({ "oaat_groups": groups }))
 }
 
@@ -1057,12 +1096,12 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
 
     info!(group_id = %group_id, name, endpoints = endpoints.len(), "oaat_multiroom_group_created");
 
-    Json(json!({
+    Json(oaat_group_view(json!({
         "id": group_id,
         "name": name,
         "endpoints": endpoints.len(),
         "device_id": format!("oaat-group:{group_id}"),
-    }))
+    })))
 }
 
 async fn delete_oaat_group(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
@@ -1340,6 +1379,58 @@ mod tests {
         assert_eq!(payload["group_id"], 42);
         assert!(payload["message"].as_str().unwrap().contains("RTT"));
         assert!(payload["message"].as_str().unwrap().contains("audio"));
+        assert_eq!(payload["synchronization"]["supported"], false);
+        assert_eq!(payload["synchronization"]["presentation_timestamps"], false);
+        assert_eq!(payload["synchronization"]["alternative"], "oaat");
+        assert!(payload["synchronization"]["accuracy_claim_ms"].is_null());
+    }
+
+    /// #2215 : un groupe de renderers indépendants ne doit JAMAIS être
+    /// présenté comme synchronisé. Sans la vue, la route rendait l'objet
+    /// persisté nu et le client restait libre de conclure au multiroom.
+    #[test]
+    fn un_groupe_generique_n_est_jamais_annonce_comme_synchronise() {
+        let view = generic_group_view(json!({
+            "id": 7,
+            "name": "Salon + cuisine",
+            "zone_ids": [1, 2],
+        }));
+
+        assert_eq!(view["synchronization"]["supported"], false);
+        assert_eq!(
+            view["synchronization"]["transport"],
+            "independent_renderers"
+        );
+        assert_eq!(view["synchronization"]["alternative"], "oaat");
+        assert!(view["synchronization"]["accuracy_claim_ms"].is_null());
+    }
+
+    /// #2215 : OAAT a un mécanisme, mais aucune précision mesurée.
+    #[test]
+    fn un_groupe_oaat_annonce_le_mecanisme_sans_inventer_sa_precision() {
+        let view = oaat_group_view(json!({"id": "salon"}));
+
+        assert_eq!(view["synchronization"]["supported"], true);
+        assert_eq!(view["synchronization"]["transport"], "oaat");
+        assert_eq!(
+            view["synchronization"]["mechanism"],
+            "clock_sync_and_presentation_timestamps"
+        );
+        assert_eq!(view["synchronization"]["render_latency_calibrated"], false);
+        assert!(view["synchronization"]["accuracy_claim_ms"].is_null());
+    }
+
+    /// #2215 : la seconde famille de routes de groupes (REF-4, #2219) sert le
+    /// même objet au client web. Elle doit passer par la même vue, sinon le
+    /// contrat dépend de l'URL appelée.
+    #[test]
+    fn la_famille_de_routes_zones_applique_le_meme_contrat() {
+        let groupes = include_str!("zones/groupes.rs");
+
+        assert!(
+            groupes.contains("generic_group_view"),
+            "les routes /zones/groups rendent encore un groupe sans contrat de synchronisation"
+        );
     }
 
     #[test]
@@ -1356,5 +1447,21 @@ mod tests {
         assert!(!zones.contains(demi_rtt));
         assert!(!groupes.contains(demi_rtt));
         assert!(!manager.contains(fausse_estimation));
+    }
+
+    /// #2215 : la documentation promettait une synchronisation NTP et une
+    /// précision sub-milliseconde que rien ne mesure. Cette garde relit les
+    /// fichiers livrés, pas une copie.
+    #[test]
+    fn la_documentation_ne_promet_plus_ntp_ni_sub_milliseconde() {
+        let guide_fr = include_str!("../../../docs/getting-started/fr.md");
+        let guide_en = include_str!("../../../docs/getting-started/en.md");
+        let architecture = include_str!("../../../docs/architecture-tune-server-rust.md");
+
+        assert!(!guide_fr.contains("synchronise les sorties via NTP"));
+        assert!(!guide_en.contains("synchronizes outputs via NTP"));
+        assert!(!architecture.contains("Synchronisation sub-milliseconde"));
+        assert!(guide_fr.contains("Seuls les points de diffusion Tune"));
+        assert!(architecture.contains("Hors OAAT"));
     }
 }

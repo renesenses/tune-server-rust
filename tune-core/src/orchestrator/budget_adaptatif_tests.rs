@@ -1,6 +1,6 @@
 use super::{
-    BudgetAdaptatif, MARGE_BUDGET_TRANSCODAGE, PAS_SONDAGE_BUDGET, PLAFOND_BUDGET_TRANSCODAGE,
-    SONDAGES_AVANT_MESURE, VerdictBudget, transcoder_sous_budget,
+    BudgetAdaptatif, FinDeTranscodage, MARGE_BUDGET_TRANSCODAGE, PAS_SONDAGE_BUDGET,
+    PLAFOND_BUDGET_TRANSCODAGE, SONDAGES_AVANT_MESURE, VerdictBudget, transcoder_sous_budget,
 };
 use crate::audio::decode_progress::DecodeProgress;
 use std::sync::Arc;
@@ -51,7 +51,7 @@ async fn jouer(
     facteur: f64,
     budget_taille: Duration,
 ) -> (
-    Result<Result<&'static str, String>, super::DepassementBudget>,
+    Result<Result<&'static str, String>, FinDeTranscodage>,
     Duration,
 ) {
     let debut = tokio::time::Instant::now();
@@ -62,6 +62,7 @@ async fn jouer(
         progres,
         politique,
         PAS_SONDAGE_BUDGET,
+        None,
         None,
     )
     .await;
@@ -131,7 +132,7 @@ async fn couple_2_un_hote_deux_fois_plus_lent_que_le_temps_reel_echoue_toujours(
     let facteur = 0.5;
     let budget = budget_historique_pour(octets_dsd256(piste_s));
     let (r, ecoule) = jouer(piste_s, facteur, budget).await;
-    let Err(d) = r else {
+    let Err(FinDeTranscodage::Budget(d)) = r else {
         panic!("un hôte à × 0,5 ne peut PAS transcoder 40 min : {r:?}");
     };
     assert_eq!(
@@ -196,6 +197,7 @@ async fn temoin_un_fichier_illisible_echoue_toujours_et_vite() {
         politique,
         PAS_SONDAGE_BUDGET,
         None,
+        None,
     )
     .await;
     assert!(
@@ -231,9 +233,10 @@ async fn temoin_un_decodeur_muet_garde_le_budget_historique() {
         politique,
         PAS_SONDAGE_BUDGET,
         None,
+        None,
     )
     .await;
-    let Err(d) = r else {
+    let Err(FinDeTranscodage::Budget(d)) = r else {
         panic!("il devait expirer : {r:?}")
     };
     assert_eq!(d.budget, budget, "le budget ne doit pas avoir bougé");

@@ -2365,6 +2365,19 @@ fn browse_radios(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     // `TotalMatches` dit la taille RÉELLE du dossier, pas celle de la page :
     // c'est de là que le point de contrôle sait qu'il reste des pages.
     didl.total = total;
+    // Le journal que la vérification terrain de #2103 réclame explicitement :
+    // « le journal dira si le Browse sur radios arrive jusqu'au serveur et ce
+    // qu'il répond. Si le Browse n'arrive pas, le défaut n'est pas dans le
+    // contenu du dossier mais dans le chemin qui y mène. » Sans cette ligne,
+    // un dossier Radio vide sur le ND8006 ne permet pas de séparer les deux,
+    // et elles n'ont pas la même correction.
+    tracing::info!(
+        start,
+        count,
+        rendues = didl.returned,
+        total,
+        "upnp_browse_radios"
+    );
     didl
 }
 
@@ -5469,5 +5482,103 @@ mod ssdp_msearch_tests {
         assert!(result.xml.contains("So What"), "{}", result.xml);
         assert!(!result.xml.contains("Live"), "{}", result.xml);
         assert!(!result.xml.contains("Blue in Green"), "{}", result.xml);
+    }
+
+    /// #2103 et #1800 tenus ensemble, sur la population qui les a ouverts :
+    /// les stations LIVREES par les migrations, dont le `codec` est NULL.
+    ///
+    /// PREMISSE, verifiee dans le test lui-meme : la migration 33
+    /// `seed_default_radios` n'ecrit que `name`, `url`, `genre` et `country`.
+    /// Les stations d'un serveur neuf ont donc toutes `codec = NULL`. C'est
+    /// exactement ce que dit #2103 : le correctif de #1788 deduisait le type
+    /// MIME du codec, et sur cette population il ne deduisait rien.
+    ///
+    /// FAIT DE BASE : chaque station livree — codec NULL compris — sort du
+    /// `Browse` avec une URL de TUNE et un type MIME utilisable, et le dossier
+    /// n'est pas vide. Les deux defauts se tiennent dans la meme assertion
+    /// parce que le correctif de #1800 les a supprimes ensemble : en publiant
+    /// `radio_audio_url` avec un `audio/wav` CONSTANT, il a retire le codec du
+    /// chemin. Plus une ligne du serveur media ne le lit — `radio_mime_type`
+    /// n'existe plus dans le depot.
+    ///
+    /// TEMOIN LATERAL, vert des deux cotes et sur la meme base : le conteneur
+    /// `albums`, le chemin que Jean Valjean voit PLEIN sur son ND8006. S'il
+    /// passait au rouge, le defaut ne serait pas le dossier Radio mais la base
+    /// d'essai.
+    #[test]
+    fn chaque_station_livree_sans_codec_sort_avec_une_url_tune_et_un_mime() {
+        let mut state = state_du_releve_nd8006();
+        // IP forcee : l'URL publiee doit etre comparable caractere par
+        // caractere, sans dependre de l'interface de la machine de build.
+        state.advertised_ip = Some("192.168.1.18".into());
+        let base = state.base_url();
+        let stations = RadioRepo::with_backend(state.backend.clone())
+            .list()
+            .unwrap();
+        let total = stations.len();
+
+        // --- PREMISSE : le jeu d'essai EST celui de #2103.
+        assert!(
+            total >= 20,
+            "le jeu d'essai doit porter les stations livrees par les \
+             migrations — {total} seulement"
+        );
+        let sans_codec = stations.iter().filter(|s| s.codec.is_none()).count();
+        assert_eq!(
+            sans_codec, total,
+            "la premisse de #2103 a change : {sans_codec} stations sur {total} \
+             ont un codec NULL"
+        );
+
+        // --- LE FAIT DE BASE, station par station.
+        let didl = browse_radios(&state, 0, 500);
+        for station in &stations {
+            let attendue = radio_audio_url(&base, station.id.unwrap_or(0));
+            assert!(
+                didl.xml
+                    .contains(&format!("http-get:*:audio/wav:*\">{attendue}</res>")),
+                "« {} » (codec {:?}) n'est pas publiee sur une URL de Tune avec \
+                 un type MIME : {}",
+                station.name,
+                station.codec,
+                didl.xml
+            );
+            assert!(
+                !didl.xml.contains(&station.url),
+                "le DIDL publie encore l'URL du diffuseur pour « {} » : {}",
+                station.name,
+                station.url
+            );
+        }
+
+        // --- Et le dossier n'est pas vide : la reponse SOAP compte.
+        let reponse = browse_action_response(&state, &soap_browse("radios", 0, 500));
+        assert!(
+            !is_soap_fault(&reponse),
+            "le dossier Radio rend un fault : {reponse}"
+        );
+        let rendus = compteur(&reponse, "NumberReturned");
+        assert_ne!(
+            rendus, 0,
+            "dossier Radio VIDE sur {total} stations sans codec : {reponse}"
+        );
+        assert_eq!(
+            rendus, total as u64,
+            "le dossier Radio annonce {rendus} elements pour {total} stations : \
+             {reponse}"
+        );
+        assert_eq!(
+            rendus,
+            objets_transportes(&reponse),
+            "annonce et transport divergent : {reponse}"
+        );
+
+        // --- TEMOIN LATERAL : le chemin que le testeur voit plein.
+        let albums = browse_action_response(&state, &soap_browse("albums", 0, 10));
+        assert_eq!(
+            compteur(&albums, "NumberReturned"),
+            2,
+            "temoin albums : {albums}"
+        );
     }
 }

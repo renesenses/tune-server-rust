@@ -242,14 +242,17 @@ fn un_dsf_sans_tag_reste_lisible_et_retombe_sur_son_nom() {
     let dir = dossier();
     // `metadata_offset = 0` : l'en-tête DSD annonce qu'il n'y a pas de tag.
     // C'est un cas NORMAL, pas un rejet — le fichier doit rester dans la
-    // bibliothèque, avec ses propriétés audio et son nom pour titre.
+    // bibliothèque, avec ses propriétés audio et son nom pour titre — SANS le
+    // numéro de piste, qui va dans `track_number` (second volet de #3180 :
+    // ce témoin figeait « 09 - Keep It Dark », le symptôme même de Benjithom).
     let chemin = dir.path().join("09 - Keep It Dark.dsf");
     let mut buf = dsf(&[]);
     buf[20..28].copy_from_slice(&0u64.to_le_bytes());
     std::fs::write(&chemin, &buf).unwrap();
 
     let meta = tune_core::metadata::try_read_metadata(&chemin).expect("un .dsf nu reste lu");
-    assert_eq!(meta.title.as_deref(), Some("09 - Keep It Dark"));
+    assert_eq!(meta.title.as_deref(), Some("Keep It Dark"));
+    assert_eq!(meta.track_number, Some(9));
     assert_eq!(meta.sample_rate, Some(2_822_400));
     assert_eq!(meta.channels, Some(2));
 }
