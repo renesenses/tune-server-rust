@@ -70,6 +70,25 @@ pub mod sql {
         )
     }
 
+    /// Le meme INSERT, GARDE par l'existence de la piste — la forme que
+    /// `set_queue` emploie depuis #3231/#3248, ici pour l'AJOUT.
+    ///
+    /// `queue_items.track_id` porte `REFERENCES tracks(id)` (`sqlite.rs`,
+    /// CORE_SCHEMA) : un identifiant perime leve « FOREIGN KEY constraint
+    /// failed » et ANNULE toute la transaction. Un ajout de 190 pistes dont une
+    /// seule a disparu n'ajoutait alors RIEN. La garde rend `Ok(0)` a la place,
+    /// l'appelant compte la perte et les positions restent denses.
+    pub fn insert_local_at_if_exists<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO queue_items (zone_id, track_id, position, is_current, source) \
+             SELECT {}, {}, {}, 0, 'local' WHERE EXISTS (SELECT 1 FROM tracks WHERE id = {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
     pub fn unset_current<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE queue_items SET is_current = 0 WHERE zone_id = {} AND track_id IS NOT NULL",
@@ -642,26 +661,74 @@ impl PlayQueueRepo {
         Ok(outcome)
     }
 
+    /// Ajoute des pistes locales a la file — a la fin, ou a une position donnee
+    /// (« Lire ensuite »).
+    ///
+    /// 🔴 #3231 — ce site etait le DERNIER a numeroter dans l'espace de
+    /// positions PAR SOURCE que la migration 53 (`unify_queue_positions`) a
+    /// aboli. `sql::max_position` ne regarde que les lignes locales
+    /// (`track_id IS NOT NULL`) : sur une file ou l'autoplay du sondeur a deja
+    /// ajoute des lignes de service derriere l'album, le maximum LOCAL vaut 4
+    /// alors que la file va jusqu'a 7. Les pistes ajoutees repartaient donc a 5
+    /// — PAR-DESSUS les lignes de service — et la file finissait a
+    /// `count_all = 9` pour des positions qui s'arretent a 7 : les positions 8
+    /// que `next_position` parcourt (`poller.rs`, arithmetique pure sur
+    /// `queue_length`) n'ont AUCUNE ligne, `play_from_queue` echoue sur « no
+    /// queue item at position », et la lecture s'arrete bien avant la fin.
+    /// C'est le defaut que #2055 avait corrige pour `append_streaming_queue`,
+    /// et qui restait entier ici. Le decalage, lui, etait DEJA unifie
+    /// (`shift_positions_up` n'a jamais filtre `track_id`) : les deux moities
+    /// du meme calcul ne parlaient pas du meme espace.
+    ///
+    /// Second volet, meme defaut que `set_queue` : l'INSERT etait NU, et
+    /// `queue_items.track_id` porte `REFERENCES tracks(id)`. Un seul
+    /// identifiant perime — une piste retiree de la bibliotheque entre
+    /// l'affichage de la liste et le geste — levait « FOREIGN KEY constraint
+    /// failed » et annulait TOUT l'ajout. Les identifiants sont desormais
+    /// tranches d'abord, dans la meme transaction, l'INSERT reste garde, et la
+    /// perte est comptee ET journalisee (#2394 : un compteur qui ment est pire
+    /// qu'un compteur absent).
+    ///
+    /// Les positions restent DENSES dans les deux cas : la numerotation suit
+    /// les lignes reellement ecrites, et le trou eventuellement laisse par une
+    /// ligne refusee au milieu d'une insertion est referme.
     pub fn add_tracks(
         &self,
         zone_id: i64,
         track_ids: &[i64],
         position: Option<i64>,
     ) -> Result<(), String> {
-        let max_pos_sql = self.dialect_sql(sql::max_position, sql::max_position);
+        let max_pos_sql = self.dialect_sql(sql::max_position_any, sql::max_position_any);
         let insert_sql = self.dialect_sql(
-            sql::insert_queue_row_no_current,
-            sql::insert_queue_row_no_current,
+            sql::insert_local_at_if_exists,
+            sql::insert_local_at_if_exists,
         );
         let shift_sql = self.dialect_sql(sql::shift_positions_up, sql::shift_positions_up);
+        let mut inserees = 0usize;
+        let mut absentes: Vec<i64> = Vec::new();
         self.db.write_tx(&mut |tx| {
+            // `write_tx` prend un FnMut : repartir d'une ardoise propre pour
+            // qu'une fermeture rejouee ne compte pas deux fois la meme perte.
+            inserees = 0;
+            absentes.clear();
+            let existantes = self.existing_track_ids(tx, track_ids)?;
+            let mut gardees: Vec<i64> = Vec::with_capacity(track_ids.len());
+            for tid in track_ids {
+                if existantes.contains(tid) {
+                    gardees.push(*tid);
+                } else {
+                    absentes.push(*tid);
+                }
+            }
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
             let max_pos: i64 = tx
                 .query_one(&max_pos_sql, &p)?
                 .as_ref()
                 .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
                 .unwrap_or(-1);
-            let start = position.unwrap_or(max_pos + 1);
+            // `clamp` comme `insert_at` : une position demandee au-dela de la
+            // fin de file ouvrirait un trou que rien ne saurait parcourir.
+            let start = position.unwrap_or(max_pos + 1).clamp(0, max_pos + 1);
             // Mid-queue insert (explicit position, e.g. "Play next"): shift the
             // existing rows up first so the new rows don't collide on `position`.
             // Without this, inserting at an occupied position left two rows with
@@ -669,18 +736,50 @@ impl PlayQueueRepo {
             // gapless advance resolved to the wrong track (Bertrand: a "Play next"
             // on an album produced a duplicate entry + duplicate position). Append
             // (position = None → start = max+1) matches nothing, so this is a no-op.
-            let count = track_ids.len() as i64;
+            let count = gardees.len() as i64;
             if position.is_some() && count > 0 {
                 let sp: [&dyn ToSqlValue; 3] = [&count, &zone_id, &start];
                 tx.execute(&shift_sql, &sp)?;
             }
-            for (i, tid) in track_ids.iter().enumerate() {
-                let pos = start + i as i64;
-                let p: [&dyn ToSqlValue; 3] = [&zone_id, tid, &pos];
-                tx.execute(&insert_sql, &p)?;
+            for tid in &gardees {
+                let pos = start + inserees as i64;
+                let p: [&dyn ToSqlValue; 4] = [&zone_id, tid, &pos, tid];
+                // Compter les lignes REELLEMENT ecrites, comme `set_queue` :
+                // zero ligne signifie que la piste a disparu entre le
+                // pre-filtre et l'INSERT. C'est une perte, elle se declare, et
+                // la position ne saute pas.
+                let ecrites = tx.execute(&insert_sql, &p)?;
+                if ecrites == 0 {
+                    absentes.push(*tid);
+                    continue;
+                }
+                inserees += ecrites;
+            }
+            // Le decalage a ouvert `count` places ; si moins de lignes ont pu
+            // s'y ecrire, refermer le reliquat pour que les positions restent
+            // 0..N-1. Sans cela, une piste disparue au milieu d'un « Lire
+            // ensuite » laisserait exactement le trou que ce correctif ferme.
+            let manquantes = count - inserees as i64;
+            if position.is_some() && manquantes > 0 {
+                let recul = -manquantes;
+                let depuis = start + count;
+                let sp: [&dyn ToSqlValue; 3] = [&recul, &zone_id, &depuis];
+                tx.execute(&shift_sql, &sp)?;
             }
             Ok(())
-        })
+        })?;
+        if !absentes.is_empty() {
+            let apercu: Vec<i64> = absentes.iter().take(10).copied().collect();
+            warn!(
+                zone_id,
+                demandees = track_ids.len(),
+                inserees,
+                absentes = absentes.len(),
+                apercu_ids_absents = ?apercu,
+                "add_tracks_pistes_absentes"
+            );
+        }
+        Ok(())
     }
 
     /// Append tracks at the end of the local queue for a zone.
@@ -2391,5 +2490,232 @@ mod tests {
         assert_eq!(bilan.skipped_count(), 4);
         assert_eq!(repo.count_all(1).unwrap(), 0);
         assert!(repo.get_current(1).unwrap().is_none());
+    }
+
+    // ── #3231, second foyer : l'AJOUT ────────────────────────────────────
+    //
+    // `set_queue` est dense depuis #3247/#3248. `add_tracks` — « verser une
+    // playlist dans la file » (`routes/playlists.rs::transfer_playlist`),
+    // l'assistant (`ai/executor.rs`) et l'autoplay local du sondeur
+    // (`poller/fin_de_piste.rs`, par `append_tracks`) — numerotait encore dans
+    // l'espace de positions PAR SOURCE, et inserait sans garde.
+
+    /// Cree la piste locale supplementaire que l'utilisateur ajoute.
+    fn une_piste_de_plus(db: &SqliteDb, nom: &str) -> i64 {
+        let track_repo = TrackRepo::new(db.clone());
+        let mut t = Track::new(nom.to_string());
+        t.file_path = Some(format!("/ajout/{nom}.flac"));
+        t.duration_ms = 180_000;
+        track_repo.create(&t).unwrap()
+    }
+
+    /// L'etat de Tades, reconstruit ici pour garder la main sur la base :
+    /// un album local (positions 0..4) puis trois lignes de service posees
+    /// derriere par l'autoplay du sondeur (positions 5..7).
+    fn album_puis_service() -> (SqliteDb, PlayQueueRepo) {
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db.clone());
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let mut t = Track::new(format!("Album {i}"));
+            t.file_path = Some(format!("/album/{i}.flac"));
+            ids.push(track_repo.create(&t).unwrap());
+        }
+        repo.set_queue(1, &ids).unwrap();
+        let ajouts: Vec<StreamingQueueItem> = (0..3)
+            .map(|i| {
+                (
+                    format!("auto{i}"),
+                    format!("Suggestion {i}"),
+                    "Voisin".to_string(),
+                    None,
+                    None,
+                    200_000i64,
+                    Some("qobuz".to_string()),
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        repo.append_streaming_queue(1, &ajouts).unwrap();
+        (db, repo)
+    }
+
+    /// 🔴 CONTRE-EPREUVE #3231 — l'ajout numerote dans l'espace UNIFIE.
+    ///
+    /// File de Tades : 5 pistes d'album (0..4) + 3 lignes de service (5..7).
+    /// L'utilisateur verse une playlist dans la file.
+    ///
+    /// Avant le correctif, `add_tracks` partait de `MAX(position)` des seules
+    /// lignes LOCALES — 4 — et ecrivait a 5, 6 : PAR-DESSUS deux lignes de
+    /// service. La file annoncait `count_all = 10` pour des positions qui
+    /// s'arretent a 7 ; les positions 8 et 9 que `next_position` parcourt
+    /// n'ont AUCUNE ligne, et `play_from_queue` echoue sur « no queue item at
+    /// position » apres que la route a repondu « playing ».
+    #[test]
+    fn l_ajout_local_ne_retombe_pas_sur_les_lignes_de_service() {
+        let (db, repo) = album_puis_service();
+        let a = une_piste_de_plus(&db, "un");
+        let b = une_piste_de_plus(&db, "deux");
+
+        repo.append_tracks(1, &[a, b]).unwrap();
+
+        let total = repo.count_all(1).unwrap();
+        assert_eq!(total, 10, "5 d'album + 3 de service + 2 ajoutees");
+
+        let ordre = repo.get_ordered(1).unwrap();
+        let positions: Vec<i64> = ordre.iter().map(|e| e.position).collect();
+        assert_eq!(
+            positions,
+            (0..total).collect::<Vec<_>>(),
+            "les positions doivent former 0..N-1 sans trou ni doublon — \
+             avant le correctif l'ajout retombait sur 5 et 6, deja pris : {positions:?}"
+        );
+
+        // Chaque position que `count_all` annonce porte une ligne.
+        for p in 0..total {
+            assert!(
+                repo.get_at(1, p).unwrap().is_some(),
+                "la file annonce {total} pistes, mais la position {p} est vide"
+            );
+        }
+
+        // Et les deux pistes versees sont bien EN FIN de file, dans l'ordre.
+        assert_eq!(repo.get_at(1, 8).unwrap().unwrap().track_id, Some(a));
+        assert_eq!(repo.get_at(1, 9).unwrap().unwrap().track_id, Some(b));
+
+        // L'epreuve qui tranche : la marche du sondeur va jusqu'au bout.
+        let mut position = 0i64;
+        let mut jouees = 1;
+        while let Some(suivante) =
+            crate::poller::PositionPoller::next_position(&crate::playback::ZoneState {
+                state: crate::playback::PlayState::Playing,
+                queue_position: position,
+                queue_length: total,
+                repeat: crate::playback::RepeatMode::Off,
+                shuffle: false,
+                ..Default::default()
+            })
+        {
+            assert!(
+                repo.get_at(1, suivante).unwrap().is_some(),
+                "la position {suivante} que « suivant » designe est vide"
+            );
+            position = suivante;
+            jouees += 1;
+        }
+        assert_eq!(jouees, total, "la file entiere doit etre parcourue");
+    }
+
+    /// 🔴 CONTRE-EPREUVE #3231 — une piste disparue n'annule plus tout l'ajout.
+    ///
+    /// `queue_items.track_id` porte `REFERENCES tracks(id)` : l'INSERT nu
+    /// levait « FOREIGN KEY constraint failed » sur le premier identifiant
+    /// perime et `write_tx` annulait la transaction — la playlist entiere
+    /// restait a la porte, pour UNE piste retiree de la bibliotheque. C'est le
+    /// meme mal que #3231 sur `set_queue`, au site de l'ajout.
+    #[test]
+    fn l_ajout_saute_la_piste_absente_au_lieu_d_annuler_toute_la_liste() {
+        let db = test_db();
+        let repo = PlayQueueRepo::new(db.clone());
+        let a = une_piste_de_plus(&db, "a");
+        let b = une_piste_de_plus(&db, "b");
+        let c = une_piste_de_plus(&db, "c");
+        // Un identifiant tres au-dessus de tout ce que la base a distribue.
+        let fantome = 900_001i64;
+
+        repo.append_tracks(1, &[a, fantome, b, c])
+            .expect("un identifiant perime ne doit pas annuler l'ajout entier");
+
+        assert_eq!(
+            repo.count_all(1).unwrap(),
+            3,
+            "les trois pistes reelles entrent dans la file"
+        );
+        let ordre = repo.get_ordered(1).unwrap();
+        assert_eq!(
+            ordre.iter().map(|e| e.position).collect::<Vec<i64>>(),
+            vec![0, 1, 2],
+            "et les positions restent denses malgre le saut"
+        );
+        assert_eq!(
+            ordre
+                .iter()
+                .filter_map(|e| e.track_id)
+                .collect::<Vec<i64>>(),
+            vec![a, b, c],
+            "dans l'ordre demande"
+        );
+    }
+
+    /// 🔴 CONTRE-EPREUVE #3231 — « Lire ensuite » referme le trou.
+    ///
+    /// Insertion a une position occupee : le decalage ouvre autant de places
+    /// que d'identifiants demandes. Si l'un d'eux n'existe plus, la place
+    /// ouverte pour lui doit etre refermee, sinon la file garde un trou au
+    /// milieu — exactement le defaut que ce lot corrige, deplace d'un cran.
+    #[test]
+    fn lire_ensuite_avec_une_piste_absente_ne_laisse_pas_de_trou() {
+        let db = test_db();
+        let repo = PlayQueueRepo::new(db.clone());
+        let a = une_piste_de_plus(&db, "a");
+        let b = une_piste_de_plus(&db, "b");
+        let x = une_piste_de_plus(&db, "x");
+        repo.set_queue(1, &[a, b]).unwrap();
+
+        // « Lire ensuite » deux pistes dont une a disparu.
+        repo.add_tracks(1, &[x, 900_002], Some(1)).unwrap();
+
+        let ordre = repo.get_ordered(1).unwrap();
+        assert_eq!(
+            ordre.iter().map(|e| e.position).collect::<Vec<i64>>(),
+            vec![0, 1, 2],
+            "positions denses : la place ouverte pour la piste absente est refermee"
+        );
+        assert_eq!(
+            ordre
+                .iter()
+                .filter_map(|e| e.track_id)
+                .collect::<Vec<i64>>(),
+            vec![a, x, b],
+            "et l'ordre reste celui du geste"
+        );
+    }
+
+    /// 🟢 TEMOIN, vert des deux cotes — « Lire ensuite » decale TOUTE la file.
+    ///
+    /// Une insertion a une position occupee, sur une file qui melange lignes
+    /// locales et lignes de service : rien ne se met a deux a la meme place, et
+    /// la piste inseree tombe exactement ou le geste l'a demandee. Ce temoin
+    /// interdit la correction paresseuse — « numeroter apres tout le monde » —
+    /// qui rendrait les positions denses en jetant « Lire ensuite ».
+    #[test]
+    fn temoin_lire_ensuite_reste_a_sa_place_sur_une_file_mixte() {
+        let (db, repo) = album_puis_service();
+        let x = une_piste_de_plus(&db, "ensuite");
+
+        // L'album est en position 0 : « Lire ensuite » vise la position 1.
+        repo.add_tracks(1, &[x], Some(1)).unwrap();
+
+        let ordre = repo.get_ordered(1).unwrap();
+        let positions: Vec<i64> = ordre.iter().map(|e| e.position).collect();
+        assert_eq!(
+            positions,
+            (0..9).collect::<Vec<_>>(),
+            "aucune position en double apres un « Lire ensuite » : {positions:?}"
+        );
+        assert_eq!(
+            repo.get_at(1, 1).unwrap().unwrap().track_id,
+            Some(x),
+            "la piste demandee « ensuite » doit etre a la position 1"
+        );
+        // Les trois lignes de service ont recule d'un cran et restent en fin.
+        for p in 6..9 {
+            assert!(
+                !repo.get_at(1, p).unwrap().unwrap().is_local(),
+                "la position {p} doit rester une ligne de service"
+            );
+        }
     }
 }
