@@ -200,6 +200,25 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2441 -- --nocapture
 
+      # #3248 -- l'INSERT conditionnel sterile, sur une VRAIE base.
+      #
+      # Les temoins de #3248 existent depuis le 03/09 et sont declares dans
+      # `tune-core/Cargo.toml`, mais AUCUNE etape ne leur posait
+      # `TUNE_TEST_PG_URL`. La seule qui les executait -- « Tests tune-core et
+      # tune-server avec PostgreSQL », plus haut -- ne pose pas la variable :
+      # les trois epreuves y prenaient leur chemin « saut annonce » a chaque
+      # execution, et seules la garde de site et la contre-epreuve SQLite
+      # tournaient vraiment. Un vert contre rien, precisement ce que le ticket
+      # demandait d'eviter. Cette etape les EXECUTE, apres les migrations.
+      #
+      # Elle est la seule porte capable de voir le defaut : sur SQLite, un
+      # INSERT conditionnel qui n'ecrit rien rend deja 0 sans erreur. C'est
+      # PostgreSQL, et lui seul, qui annulait la transaction entiere.
+      - name: INSERT conditionnel stérile sur PostgreSQL (#3248)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_insert_conditionnel_f7c250 -- --nocapture
+
       # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
       # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
       # l'autre — et refuse toute colonne que le schema neuf a et qu'aucune
