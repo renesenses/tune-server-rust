@@ -313,7 +313,12 @@ fn cmp_nums(r: &[u64], c: &[u64]) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-fn is_newer(remote: &str, current: &str) -> bool {
+/// `pub(crate)` et non privé : c'est la SEULE comparaison de versions du
+/// dépôt, et [`crate::plugins::PluginManifest::compatible_with`] doit poser
+/// exactement la même question sur `min_server_version` (#3408). En écrire une
+/// seconde ferait diverger le traitement des pré-versions (`0.9.140-rc1`), qui
+/// est précisément la partie délicate.
+pub(crate) fn is_newer(remote: &str, current: &str) -> bool {
     use std::cmp::Ordering;
     let (r_rel, r_pre) = parse_version(remote);
     let (c_rel, c_pre) = parse_version(current);

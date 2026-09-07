@@ -209,6 +209,31 @@ pub(crate) async fn fiches_locales_honorables(state: &AppState) -> Vec<Value> {
         );
     }
     gardees
+        .into_iter()
+        .map(|fiche| completer_compatible(fiche, true))
+        .collect()
+}
+
+/// Ajoute `compatible` à une fiche qui ne le porte pas — et **seulement** dans
+/// ce cas (#3408).
+///
+/// `??` et non `=` : une fiche qui dit explicitement `false` continue d'être
+/// respectée. C'est la même règle que le correctif client, posée du côté qui
+/// protège aussi les clients déjà publiés — ceux des testeurs, ceux des
+/// versions passées — qui n'auront jamais la normalisation.
+///
+/// Une fiche héritée gardée par [`fiches_locales_honorables`] est, par
+/// construction, un greffon que ce binaire sait charger : sa compatibilité est
+/// établie par le tri lui-même, pas devinée. Le reste de la fiche ressort
+/// intact, identifiant et libellé compris — c'est la garantie de #2132, et un
+/// champ ajouté ne déplace ni l'un ni l'autre.
+fn completer_compatible(mut fiche: Value, compatible: bool) -> Value {
+    if let Some(objet) = fiche.as_object_mut() {
+        objet
+            .entry("compatible")
+            .or_insert_with(|| Value::Bool(compatible));
+    }
+    fiche
 }
 
 async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
@@ -229,10 +254,18 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         "enabled": xtune_installed,
         "url": "/xtune/",
         "icon": "vinyl",
+        // Livré AVEC ce serveur : il n'y a pas de version à confronter.
+        "compatible": true,
     }));
 
     // Plugins actually loaded through the SDK. These are the only entries
     // backed by running code — everything above is settings bookkeeping.
+    //
+    // `compatible: true` sans réserve : un greffon SDK est COMPILÉ dans ce
+    // binaire, et `setup_all` vient en plus de lui faire passer la porte d'ABI
+    // (`plugin_protocol_incompatible`). Un greffon qui figure ici tourne
+    // réellement dans ce processus — c'est la compatibilité constatée, pas
+    // supposée.
     //
     // Read from the snapshot `plugins::init` published, never from the loader:
     // event dispatch holds the loader's lock across every plugin's `on_event`,
@@ -248,6 +281,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "enabled": info.enabled,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
+            "compatible": true,
         }));
     }
 
@@ -278,6 +312,10 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "loaded": false,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
+            // Dormant, mais compilé dans CE binaire : c'est exactement la
+            // fiche sur laquelle l'écran doit proposer « Installer ». La dire
+            // incompatible grisait le seul bouton qui la rende utile.
+            "compatible": true,
         }));
     }
 
@@ -304,6 +342,21 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
                     .is_some_and(|reg| reg.get(&id).is_some());
                 #[cfg(not(feature = "plugins-wasm"))]
                 let loaded = false;
+                // Le SEUL endroit où ce serveur détient un énoncé de
+                // compatibilité écrit par le greffon lui-même :
+                // `min_server_version`, jusqu'ici lu par le manifeste et par
+                // personne. On le confronte enfin à la version courante — une
+                // absence, ou une exigence illisible, restant « compatible »
+                // (voir `PluginManifest::compatible_with`).
+                let compatible = info.manifest.compatible_with(tune_core::version());
+                if !compatible {
+                    tracing::info!(
+                        plugin_name = %id,
+                        min_server_version = ?info.manifest.min_server_version,
+                        server_version = %tune_core::version(),
+                        "plugin_wasm_min_server_version_non_atteinte"
+                    );
+                }
                 plugins.push(serde_json::json!({
                     "name": id,
                     "display_name": info.manifest.name,
@@ -316,6 +369,8 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
                     "loaded": loaded,
                     "restart_required": enabled && !loaded,
                     "url": format!("/api/v1/plugins/{id}/"),
+                    "compatible": compatible,
+                    "min_server_version": info.manifest.min_server_version,
                 }));
             }
         }
@@ -343,6 +398,29 @@ fn plugin_available_snapshot(state: &AppState) -> &[tune_core::plugin_sdk::Avail
         .unwrap_or_default()
 }
 
+/// La compatibilité d'un greffon désigné par son seul nom.
+///
+/// Un greffon **wasm** posé sur le disque porte un manifeste, donc une
+/// exigence de version : c'est la seule que ce serveur puisse confronter, et
+/// elle doit répondre pareil sur `/plugins` et sur `/plugins/{nom}` — deux
+/// verdicts différents pour la même extension, c'est le défaut d'origine sous
+/// une autre forme. Pour tout autre nom (compilé, intégré, hérité), il n'y a
+/// rien à confronter : `true`.
+async fn compatible_selon_le_disque(name: &str) -> bool {
+    let Some(dir) = crate::plugins::wasm_plugins_dir() else {
+        return true;
+    };
+    let manager = tune_core::plugins::PluginManager::new(dir);
+    let Ok(infos) = manager.scan().await else {
+        return true;
+    };
+    infos
+        .iter()
+        .find(|i| i.manifest.id == name)
+        .map(|i| i.manifest.compatible_with(tune_core::version()))
+        .unwrap_or(true)
+}
+
 async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     // An SDK plugin is authoritative about itself: it is loaded or it is not,
     // regardless of what the settings table happens to say.
@@ -356,8 +434,12 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
             "enabled": info.enabled,
             "status": "loaded",
             "config_schema": info.config_schema,
+            // Il TOURNE dans ce processus : il a franchi la porte d'ABI.
+            "compatible": true,
         }));
     }
+
+    let compatible = compatible_selon_le_disque(&name).await;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
@@ -397,6 +479,10 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
             "enabled": false,
             "status": "unavailable",
             "detail": "no plugin by that name is compiled into this server or installed on disk — nothing was ever loaded",
+            // Indisponible n'est PAS incompatible : `status` porte déjà la
+            // raison exacte. Émettre `false` ici collerait un second libellé,
+            // faux, sur une fiche déjà expliquée.
+            "compatible": true,
         }));
     }
 
@@ -405,6 +491,7 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
         "installed": installed,
         "enabled": enabled,
         "status": if installed { "installed" } else { "not_installed" },
+        "compatible": compatible,
     }))
 }
 
