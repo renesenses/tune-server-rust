@@ -658,6 +658,56 @@ pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
     out
 }
 
+/// L'expression SQL qui compte ce que [`dedup_display_tracks`] laisse voir —
+/// les PRÉSENTATIONS d'un album, pas ses lignes de table (#1362).
+///
+/// `alias_album` est l'expression qui désigne l'album : `albums.id` dans un
+/// `UPDATE albums`, un paramètre lié (`?1`, `$1`) dans une requête ciblée.
+///
+/// ## Pourquoi ce compte-là et pas `COUNT(*)`
+///
+/// **Cyrille Moutia**, forum 1260 (01/08/2026) : un CD rippé en AIFF, et un
+/// morceau du même album récupéré ailleurs en AAC, posé dans le dossier. Le
+/// dossier étant ce qui identifie une parution
+/// ([`crate::scanner::album_folder`]), les deux fichiers entrent dans le même
+/// album — c'est voulu. L'écran, lui, n'en montre qu'une ligne
+/// ([`dedup_display_tracks`]) et la file n'en enfile qu'une
+/// (`resoudre_pistes_d_album`, `routes/playback.rs`) : la copie de moindre
+/// qualité est masquée, et c'est aussi voulu.
+///
+/// `albums.track_count`, lui, comptait les LIGNES. Le même album annonçait
+/// donc treize titres, en montrait douze, et en jouait douze. La treizième ne
+/// se voyait nulle part — elle ne se COMPTAIT que. Deux conséquences mesurables
+/// dans le produit :
+///
+/// - `GET /home` (`db::home_queries`, « albums commencés ») retient les albums
+///   dont `COUNT(DISTINCT lh.title) < a.track_count`. Le compte des titres
+///   écoutés est DISTINCT, celui des pistes ne l'était pas : un album ainsi
+///   doublé ne pouvait plus jamais atteindre son propre total, et restait
+///   « à finir » pour toujours ;
+/// - `GET /albums/{id}/editions` (`same_track_count`) et
+///   `GET /albums/{id}/completeness` comparent ce total d'une édition à
+///   l'autre : une copie en trop faisait passer deux pressages identiques pour
+///   deux pressages différents.
+///
+/// La clé est exactement celle de [`dedup_display_tracks`] : disque, numéro,
+/// titre en minuscules sans blancs de bord. Deux vrais morceaux distincts n'y
+/// collisionnent pas, donc un album normal garde son compte au titre près.
+///
+/// ⚠️ `LOWER` de SQLite ne replie que l'ASCII, là où `to_lowercase` de Rust
+/// replie tout l'Unicode. Deux lignes qui ne diffèrent QUE par la casse d'une
+/// lettre accentuée (« Été » et « été ») seraient donc comptées deux fois ici
+/// et repliées à l'écran. Le compte reste alors celui d'avant ce correctif :
+/// le décalage n'est pas aggravé.
+pub fn sql_compte_pistes_visibles(alias_album: &str) -> String {
+    format!(
+        "(SELECT COUNT(DISTINCT COALESCE(t.disc_number, 1) || '/' \
+         || COALESCE(t.track_number, 0) || '/' \
+         || LOWER(TRIM(COALESCE(t.title, '')))) \
+         FROM tracks t WHERE t.album_id = {alias_album})"
+    )
+}
+
 /// Nombre d'ids inlinés par requête `WHERE t.id IN (…)`.
 ///
 /// Les ids sont des `i64` issus de nos propres requêtes : les inliner ne

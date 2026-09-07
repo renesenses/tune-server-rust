@@ -832,9 +832,10 @@ pub(super) async fn merge_duplicate_albums_route(
     }
     state
         .backend
-        .execute_batch(
-            "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
-        )
+        .execute_batch(&format!(
+            "UPDATE albums SET track_count = {}",
+            tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
+        ))
         .ok();
     Ok(Json(json!({ "merged": deleted, "protected": protegees })))
 }
@@ -1506,10 +1507,17 @@ pub(super) async fn album_completeness(
         Engine::Sqlite => SqliteDialect.placeholder(1),
     };
 
+    // Le MÊME compte que `albums.track_count` (#1362) : les deux membres de la
+    // comparaison ci-dessous doivent parler de la même chose, sinon un album
+    // portant deux copies d'un morceau se déclarerait complet parce que ses
+    // lignes dépassent ses présentations.
     let actual_tracks: i64 = state
         .backend
         .query_one(
-            &format!("SELECT COUNT(*) FROM tracks WHERE album_id = {p1}"),
+            &format!(
+                "SELECT {}",
+                tune_core::db::track_repo::sql_compte_pistes_visibles(&p1)
+            ),
             &[&id as &dyn ToSqlValue],
         )
         .ok()
