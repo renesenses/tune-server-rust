@@ -26,7 +26,8 @@ use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
 use crate::outputs::traits::{
-    OutputDspMetrics, OutputSignalPathStatus, OutputStatus, OutputTarget, TransportState,
+    OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus, OutputStatus, OutputTarget,
+    TransportState,
 };
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 
@@ -54,6 +55,13 @@ static STATUS_POLL_TIMEOUT: LazyLock<Option<Duration>> = LazyLock::new(|| {
 /// signal observation captured before releasing the output. Taking both under
 /// one lock prevents the UI from combining a status from one track with the
 /// signal contract of the next one.
+///
+/// Le relevé de famine de l'anneau (#3318) se prend sous CE lock-ci et pas
+/// ailleurs : c'est trois atomiques, cela ne coûte rien de plus qu'un champ
+/// du statut, et un second verrouillage par tick et par zone rentrerait en
+/// concurrence avec l'orchestrateur pour ne rien gagner. Une sortie qui ne
+/// tient pas d'anneau — tout renderer réseau — rend `None` par défaut de
+/// trait.
 async fn get_status_with_signal_path_bounded(
     output_arc: &Arc<Mutex<Box<dyn OutputTarget>>>,
     timeout: Option<Duration>,
@@ -62,13 +70,19 @@ async fn get_status_with_signal_path_bounded(
         OutputStatus,
         Option<OutputSignalPathStatus>,
         Option<OutputDspMetrics>,
+        Option<OutputRingStarvation>,
     ),
     String,
 > {
     let poll = async {
         let output = output_arc.lock().await;
         let status = output.get_status().await?;
-        Ok((status, output.signal_path_status(), output.dsp_metrics()))
+        Ok((
+            status,
+            output.signal_path_status(),
+            output.dsp_metrics(),
+            output.ring_starvation(),
+        ))
     };
     match timeout {
         Some(t) => tokio::time::timeout(t, poll)
@@ -749,6 +763,11 @@ mod tests;
 
 #[cfg(test)]
 mod status_timeout_tests;
+
+/// #3318 — l'instant où l'anneau audio se vide, et le silence que le DAC
+/// reçoit alors. La comptabilité pure, et son branchement dans `tick()`.
+#[cfg(test)]
+mod famine_anneau_i3318;
 
 #[cfg(test)]
 mod cadence_de_repos_tests;

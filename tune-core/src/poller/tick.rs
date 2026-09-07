@@ -55,7 +55,10 @@ impl PositionPoller {
                     }
                 };
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok((s, signal_path, dsp_metrics)) => {
+                    // Chemin « zone au repos » : rien ne joue, donc rien ne
+                    // peut manquer à l'anneau. Le relevé de famine n'a de sens
+                    // que sur le chemin de lecture, plus bas.
+                    Ok((s, signal_path, dsp_metrics, _famine)) => {
                         let b = idle_backoff.entry(zone_id).or_default();
                         b.record_success(s.state);
                         // Clôture de panne (#2566) : muette si le sondage
@@ -580,7 +583,7 @@ impl PositionPoller {
                 }
             }
 
-            let status = {
+            let (status, famine_anneau) = {
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
                     match outputs.get(&device_id) {
@@ -589,7 +592,7 @@ impl PositionPoller {
                     }
                 };
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok((s, signal_path, dsp_metrics)) => {
+                    Ok((s, signal_path, dsp_metrics, famine)) => {
                         ps.consecutive_errors = 0;
                         // Clôture de panne (#2566) : muette si le sondage
                         // n'avait jamais cessé de répondre.
@@ -609,7 +612,7 @@ impl PositionPoller {
                         self.playback
                             .set_output_dsp_metrics(zone_id, dsp_metrics)
                             .await;
-                        s
+                        (s, famine)
                     }
                     Err(e) => {
                         ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);
@@ -680,6 +683,50 @@ impl PositionPoller {
                     }
                 }
             };
+
+            // ── L'anneau de la sortie s'est-il vidé ? (#3318) ──
+            //
+            // Le seul instant que l'auditeur ENTEND, et le seul qui n'était
+            // écrit nulle part. `local_audio_slow_read` dit que le fil de
+            // lecture a attendu son flux ; `stream_delivery_stall` dit qui le
+            // faisait attendre ; ni l'une ni l'autre ne dit si l'anneau de 2 s
+            // a tenu. Chez Yacine — un seul cœur, 80 °C, un balayage
+            // d'empreintes en fond — il ne tenait pas, et son journal n'en
+            // portait aucune trace.
+            //
+            // Avant le branchement RADIO : un flux sans fin affame l'anneau
+            // exactement comme un fichier.
+            //
+            // Deux lignes par incident, jamais plus, quelle qu'en soit la
+            // durée — voir `decisions::SuiviFamine`.
+            let famine_courante = famine_anneau.unwrap_or_default();
+            if let Some(constat) = famine_anneau.and_then(|f| ps.famine.observer(f)) {
+                match constat {
+                    decisions::FamineAnneau::Debut(ep) => warn!(
+                        zone_id,
+                        device = %device_id,
+                        position_ms = status.position_ms,
+                        flux_ms = ep.flux_ms,
+                        rappels_a_court = ep.rappels_a_court,
+                        silence_ms = ep.silence_ms,
+                        "famine_anneau_debut — l'anneau audio de la sortie s'est vidé : le \
+                         pilote a réclamé de l'audio et a reçu des zéros"
+                    ),
+                    decisions::FamineAnneau::Fin(ep) => warn!(
+                        zone_id,
+                        device = %device_id,
+                        position_ms = status.position_ms,
+                        flux_ms = ep.flux_ms,
+                        rappels_a_court = ep.rappels_a_court,
+                        echantillons_manquants = ep.echantillons_manquants,
+                        silence_ms = ep.silence_ms,
+                        duree_ms = ep.duree_ms,
+                        "famine_anneau_fin — l'anneau audio est réalimenté ; bilan de \
+                         l'épisode : `silence_ms` de zéros envoyés au DAC sur `duree_ms` \
+                         d'audio joué"
+                    ),
+                }
+            }
 
             // Update last_radio_poll so the throttle gate works on next tick.
             if is_radio {
@@ -769,6 +816,11 @@ impl PositionPoller {
                         // duree, et ce bras n'evalue meme pas le predicat
                         // (#2493). Constat toujours faux, par construction.
                         lecture_au_dela_de_la_duree: false,
+                        famine_anneau_evenements: famine_courante.events,
+                        famine_anneau_silence_ms: decisions::silence_ms(
+                            famine_courante.missing_samples,
+                            famine_courante,
+                        ),
                     },
                 );
 
@@ -2261,6 +2313,13 @@ impl PositionPoller {
                     last_latency_ms: ps.last_latency_ms,
                     max_latency_ms: ps.max_latency_ms,
                     lecture_au_dela_de_la_duree: ps.depassement_duree_signale,
+                    // #3318 — cumul du flux EN COURS, recopié du relevé de la
+                    // sortie : il repart de zéro à chaque piste, comme lui.
+                    famine_anneau_evenements: famine_courante.events,
+                    famine_anneau_silence_ms: decisions::silence_ms(
+                        famine_courante.missing_samples,
+                        famine_courante,
+                    ),
                 },
             );
 
