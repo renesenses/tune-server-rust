@@ -114,7 +114,7 @@ Um **denselben Titel gleichzeitig auf mehreren Zonen** abzuspielen:
 
 **Einstellungen → Zonengruppen → Gruppe erstellen**
 
-Der Server synchronisiert die Ausgaben über NTP. Die Latenz ist pro Zone einstellbar (**Einstellungen → Zonen → Sync-Verzögerung**).
+Nur über **OAAT** gruppierte Tune-Endpunkte teilen eine Uhr und erhalten Präsentationszeitstempel. Gruppen unabhängiger DLNA-, AirPlay-, Chromecast- oder anderer Ausgaben bieten eine gemeinsame Steuerung, werden von Tune aber nicht als synchronisiertes Multiroom-System dargestellt. Die Verzögerung pro Zone ist eine manuelle Korrektur, keine automatische Messung der akustischen Latenz.
 
 ---
 
