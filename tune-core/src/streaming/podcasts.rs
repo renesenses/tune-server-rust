@@ -281,7 +281,33 @@ impl PodcastService {
         parse_rss(&xml_text, limit)
     }
 
+    /// Le pays — et le SEUL — que couvre [`Self::curated_french_podcasts`]
+    /// (#3395).
+    ///
+    /// La sélection éditoriale est une liste écrite en dur, pas un
+    /// fournisseur : elle ne sait pas filtrer par pays, et il n'existe rien à
+    /// filtrer hors de France. Les routes annoncent donc ce pays au client
+    /// plutôt que de servir du français sous un autre drapeau.
+    pub const CURATED_COUNTRY: &'static str = "fr";
+
+    /// La sélection éditoriale POUR un pays (#3395).
+    ///
+    /// Vide partout ailleurs qu'en France : mieux vaut une section vide, que
+    /// le client sait masquer, qu'une liste française rendue quel que soit le
+    /// pays demandé — c'est ce qui faisait croire que le sélecteur de pays
+    /// était mort.
+    pub fn curated_for_country(country: &str) -> Vec<Podcast> {
+        if country.eq_ignore_ascii_case(Self::CURATED_COUNTRY) {
+            Self::curated_french_podcasts()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Curated French podcasts from Radio France and other networks.
+    ///
+    /// Liste FRANÇAISE en dur — voir [`Self::curated_for_country`] pour
+    /// l'usage sensible au pays.
     pub fn curated_french_podcasts() -> Vec<Podcast> {
         vec![
             // ── Radio France — France Inter ──
@@ -609,6 +635,20 @@ impl PodcastService {
 
     // ── Apple Top Podcasts ──────────────────────────────────────────
 
+    /// L'adresse du palmarès Apple pour un pays et un genre.
+    ///
+    /// Le pays est un segment du CHEMIN chez Apple
+    /// (`…/fr/podcasts/top/50/…`), pas un paramètre de requête : c'est le
+    /// fournisseur lui-même qui filtre, le serveur ne trie rien. Extraite
+    /// pour que le passage du pays soit vérifiable sans réseau (#3395).
+    pub fn top_chart_url(genre: Option<u32>, country: &str) -> String {
+        let cc = country.to_lowercase();
+        match genre {
+            Some(gid) => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcasts.json?genre={gid}"),
+            None => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcasts.json"),
+        }
+    }
+
     /// Fetch the top 50 podcasts from the Apple RSS feed generator.
     /// `country` is an ISO 3166-1 alpha-2 code (e.g. "fr", "us", "de", "kr").
     /// Results are cached for 1 hour per (country, genre) key.
@@ -618,10 +658,7 @@ impl PodcastService {
         country: &str,
     ) -> Result<Vec<Podcast>, String> {
         let cc = country.to_lowercase();
-        let url = match genre {
-            Some(gid) => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcasts.json?genre={gid}"),
-            None => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcasts.json"),
-        };
+        let url = Self::top_chart_url(genre, &cc);
         let cache_key = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&cc, &mut h);
@@ -924,6 +961,51 @@ mod tests {
         assert!(podcasts.iter().any(|p| p.name == "Boomerang"));
         assert!(podcasts.iter().any(|p| p.name == "Club Jazzafip"));
     }
+    /// #3395 — le pays atteint VRAIMENT le fournisseur.
+    ///
+    /// Chez Apple, le pays est un segment du chemin : deux pays donnent deux
+    /// adresses. Le témoin épingle cela sans réseau — c'est ce que
+    /// `/discover` ne faisait pas, en demandant « us » en dur.
+    #[test]
+    fn top_chart_url_porte_le_pays_3395() {
+        let fr = PodcastService::top_chart_url(None, "fr");
+        let us = PodcastService::top_chart_url(None, "us");
+        assert_ne!(fr, us, "deux pays, deux adresses");
+        assert!(fr.contains("/fr/podcasts/top/50/"), "{fr}");
+        assert!(us.contains("/us/podcasts/top/50/"), "{us}");
+        // Le pays est normalisé, le genre reste un paramètre de requête.
+        assert_eq!(PodcastService::top_chart_url(None, "FR"), fr);
+        assert!(
+            PodcastService::top_chart_url(Some(1310), "fr").ends_with("podcasts.json?genre=1310"),
+            "le genre reste un paramètre de requête"
+        );
+    }
+
+    /// #3395 — la sélection éditoriale est française, et le dit.
+    ///
+    /// Elle ne se « filtre » pas : hors de France il n'y a rien à rendre, et
+    /// rendre la liste française sous un autre drapeau est le défaut signalé.
+    #[test]
+    fn la_selection_editoriale_ne_couvre_que_la_france_3395() {
+        assert_eq!(PodcastService::CURATED_COUNTRY, "fr");
+        assert_eq!(
+            PodcastService::curated_for_country("fr").len(),
+            PodcastService::curated_french_podcasts().len(),
+            "en France, la sélection complète"
+        );
+        assert_eq!(
+            PodcastService::curated_for_country("FR").len(),
+            PodcastService::curated_french_podcasts().len(),
+            "la casse du code pays ne change rien"
+        );
+        for ailleurs in ["us", "de", "kr", ""] {
+            assert!(
+                PodcastService::curated_for_country(ailleurs).is_empty(),
+                "aucune sélection pour {ailleurs:?} — il n'en existe pas"
+            );
+        }
+    }
+
     #[test]
     fn radio_france_alias() {
         let a = PodcastService::radio_france_podcasts();
