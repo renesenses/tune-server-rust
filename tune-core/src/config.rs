@@ -127,6 +127,17 @@ pub struct TuneConfig {
     pub log_level: String,
 
     // Update
+    /// ⚠️ Ce champ-ci ne pilote RIEN, et ne le peut pas.
+    ///
+    /// `TuneConfig::from_env` — juste en dessous — n'a **aucun appelant** dans
+    /// le dépôt : le serveur charge `tune_server::config::TuneConfig::load`,
+    /// une AUTRE structure du même nom. C'est là, et là seulement, que
+    /// `TUNE_AUTO_UPDATE` est lu et atteint `spawn_background_tasks` (#3217).
+    ///
+    /// Laissé en place plutôt que retiré : sortir un champ d'une configuration
+    /// publique est un arbitrage de Bertrand, pas une retouche. Mais un
+    /// lecteur qui tomberait ici d'abord doit savoir qu'il regarde la copie
+    /// morte.
     pub auto_update: bool,
 }
 

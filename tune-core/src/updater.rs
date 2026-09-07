@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::warn;
 
 // List endpoints (NOT `/releases/latest`): `/latest` excludes prereleases, so a
 // beta-channel build (e.g. "0.9.0-rc2") would never be offered newer RCs — and,
@@ -10,7 +10,21 @@ use tracing::{info, warn};
 const PROXY_RELEASES_URL: &str = "https://mozaiklabs.fr/api/tune/releases?per_page=20";
 const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/renesenses/tune-server-rust/releases?per_page=20";
-const CHECK_INTERVAL_SECS: u64 = 6 * 3600;
+/// Cadence du vérificateur périodique de mises à jour (#3217).
+///
+/// **Publique et employée**, contrairement à l'état d'avant : elle servait de
+/// cadence à `UpdateChecker::spawn_periodic`, dont `git grep` ne rendait qu'UNE
+/// seule occurrence — sa propre définition. Cette boucle n'a jamais eu
+/// d'appelant : le réglage `TUNE_AUTO_UPDATE` était accepté, réglable, et sans
+/// effet. Le seul lanceur est désormais
+/// `tune_server::routes::system::update::spawn_verificateur_de_mise_a_jour`,
+/// gardé par un test de câblage.
+///
+/// Six heures : la vérification est un simple GET sur la liste des releases
+/// (proxy mozaiklabs, repli GitHub), et rien n'est installé — un rythme plus
+/// serré ne rendrait pas l'information plus utile et rapprocherait le plafond
+/// de 60 requêtes/heure de l'API GitHub anonyme.
+pub const CHECK_INTERVAL_SECS: u64 = 6 * 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseInfo {
@@ -251,28 +265,6 @@ impl UpdateChecker {
             return Err(format!("api: {} {}", url, resp.status()));
         }
         resp.json().await.map_err(|e| format!("parse: {e}"))
-    }
-
-    pub fn spawn_periodic(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(CHECK_INTERVAL_SECS));
-            loop {
-                ticker.tick().await;
-                match self.check().await {
-                    Ok(Some(release)) => {
-                        info!(
-                            version = %release.version,
-                            current = %self.current_version,
-                            "update_available"
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!(error = %e, "update_check_failed");
-                    }
-                }
-            }
-        })
     }
 }
 

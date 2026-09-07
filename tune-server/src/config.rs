@@ -50,6 +50,22 @@ pub struct TuneConfig {
     /// Overridable via `TUNE_FREE_MAX_ZONES`. Default 3.
     #[serde(default = "default_free_max_zones")]
     pub free_max_zones: i64,
+    /// `TUNE_AUTO_UPDATE` — « préviens-moi quand une version paraît » (#3217).
+    ///
+    /// À `true`, le serveur lance un vérificateur périodique (toutes les six
+    /// heures) qui interroge la liste des releases sur le canal enregistré et
+    /// dépose ce qu'il trouve, que `GET /system/update/status` rend sous
+    /// `available_update`. Il **n'installe rien** : la garde anti-coupure de
+    /// #2954 tient parce que toute installation est un geste délibéré, et un
+    /// vérificateur n'a personne à prévenir avant de couper la musique.
+    ///
+    /// 🔴 Le champ existait déjà — dans l'AUTRE `TuneConfig`, celle de
+    /// `tune-core/src/config.rs`, dont `from_env()` n'a AUCUN appelant dans le
+    /// dépôt. Le serveur charge cette structure-ci (`TuneConfig::load`), pas
+    /// celle-là : `TUNE_AUTO_UPDATE` n'était donc pas seulement lu nulle part,
+    /// il était déclaré dans une configuration que rien ne construit.
+    #[serde(default)]
+    pub auto_update: bool,
 }
 
 fn default_free_max_zones() -> i64 {
@@ -158,6 +174,10 @@ impl Default for TuneConfig {
             local_exclusive_mode: false,
             tidal_quality: "HI_RES_LOSSLESS".into(),
             free_max_zones: default_free_max_zones(),
+            // Le défaut historique : personne n'est prévenu de rien tant qu'il
+            // ne l'a pas demandé. Poser le drapeau ne déclenche qu'un contrôle
+            // périodique, jamais une installation.
+            auto_update: false,
         }
     }
 }
@@ -267,6 +287,13 @@ impl TuneConfig {
         }
         if let Ok(v) = std::env::var("TUNE_AUTO_SCAN") {
             config.auto_scan = v == "true";
+        }
+        // #3217 — `TUNE_AUTO_UPDATE` était lu par `tune-core/src/config.rs`,
+        // c'est-à-dire par une `TuneConfig` que le serveur ne construit jamais.
+        // Il est lu ICI, dans la configuration qui atteint réellement
+        // `spawn_background_tasks`.
+        if let Ok(v) = std::env::var("TUNE_AUTO_UPDATE") {
+            config.auto_update = v == "true";
         }
         if let Ok(v) = std::env::var("QOBUZ_APP_ID")
             && !v.is_empty()

@@ -46,6 +46,17 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // un réglage que plus personne ne relisait. Un test de câblage garde la
     // ligne.
     crate::routes::system::scan::spawn_scan_scheduler(state.clone(), config.auto_scan);
+    // Vérificateur périodique de mises à jour (#3217). Même défaut que la ligne
+    // ci-dessus, et même remède : `UpdateChecker::spawn_periodic` n'avait qu'UNE
+    // occurrence dans tout le dépôt — sa définition — et `TUNE_AUTO_UPDATE`
+    // était accepté, réglable, et sans effet. Il NOTIFIE et n'installe rien :
+    // la garde anti-coupure de #2954 se justifie par « toute installation est
+    // un geste délibéré », et une installation automatique la ferait tomber.
+    // Un test de câblage garde la ligne.
+    crate::routes::system::update::spawn_verificateur_de_mise_a_jour(
+        state.clone(),
+        config.auto_update,
+    );
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config.port);
