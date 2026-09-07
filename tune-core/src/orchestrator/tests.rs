@@ -6039,3 +6039,105 @@ async fn output_send_error_fails_fast_to_stopped() {
         "output send error must leave the zone Stopped, not Playing"
     );
 }
+
+/// #3479 — les six sorties anticipées de `refresh_zone_eq` rendaient le MÊME
+/// `false`, sans un mot.
+///
+/// Reivax66 signale « l'activation de l'égaliseur coupe le son » depuis Windows,
+/// en 0.9.138. Deux familles connues produisent exactement cette phrase :
+/// la zone RÉSEAU (#3357 — étiquette qui ment, ou pré-transcodage du fichier
+/// entier) et la sortie LOCALE (#1735 — le marqueur DoP réécrit). Pour savoir
+/// LAQUELLE, il faut savoir où le réglage est allé — et rien ne le disait.
+///
+/// La contre-épreuve est celle-ci : trois zones qui échouent toutes les trois,
+/// et dont les motifs doivent être TROIS valeurs distinctes. Avec un `bool`,
+/// les trois valaient `false` et ce test ne pouvait pas s'écrire.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn un_changement_d_eq_nomme_son_premier_echec() {
+    use super::dsp::EchecEqLocal;
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+
+    // 1. Une zone RÉSEAU : il n'y a rien de local à rafraîchir, le réglage
+    //    devra passer par un redémarrage de flux.
+    let reseau = zones
+        .create("Denon", Some("dlna"), Some("dlna:uuid-1234"))
+        .unwrap();
+    // 2. Une zone LOCALE dont le périphérique n'est pas (ou plus) au registre.
+    let orpheline = zones
+        .create("Casque", Some("local"), Some("local:DAC-absent"))
+        .unwrap();
+    // 3. Une zone sans aucun périphérique.
+    let nue = zones.create("Zone nue", Some("local"), None).unwrap();
+
+    let motifs: Vec<EchecEqLocal> = {
+        let mut v = Vec::new();
+        for id in [reseau, orpheline, nue] {
+            let r = orch.refresh_zone_eq_detaille(id).await;
+            assert!(!r.applique(), "zone {id} : aucun chemin local vivant");
+            v.push(r.echec.expect("un échec doit porter son motif"));
+        }
+        v
+    };
+    assert_eq!(
+        motifs,
+        vec![
+            EchecEqLocal::SortieNonLocale,
+            EchecEqLocal::SortieAbsenteDuRegistre,
+            EchecEqLocal::ZoneSansPeripherique,
+        ],
+        "trois échecs différents doivent porter trois motifs différents, \
+         sans quoi un rapport de diagnostic ne permet pas de choisir le code \
+         à regarder"
+    );
+
+    // 4. Le quatrième motif, celui qui compte le plus sur une sortie locale :
+    //    la sortie EST là, elle EST locale, et pourtant rien ne joue encore.
+    let salon = zone_locale_avec_eq(&orch).await;
+    let r = orch.refresh_zone_eq_detaille(salon).await;
+    assert_eq!(r.echec, Some(EchecEqLocal::FormatInconnu));
+    assert_eq!(r.format, None, "aucun format ne peut être annoncé");
+}
+
+/// L'autre bord : quand le contrat ATTEINT la sortie locale, le rapport chiffre
+/// ce qui change — et ce qui ne change pas.
+///
+/// Le format est identique avant et après : un égaliseur ne touche ni la
+/// cadence ni le nombre de canaux. Ce qu'il touche est le NIVEAU, et le
+/// pré-gain automatique le dit : ici −8,0 dB pour un unique low-shelf à +8 dB.
+/// C'est ce chiffre-là, absent de tout journal jusqu'à #3479, qui distingue
+/// « l'égaliseur a coupé le son » de « l'égaliseur a beaucoup baissé le son ».
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn le_rapport_a_chaud_chiffre_le_format_et_le_pregain() {
+    let orch = test_orchestrator();
+    let zone_id = zone_locale_avec_eq(&orch).await;
+    avec_sortie_locale(&orch, |local| {
+        local.declare_current_format_for_test(44_100, 2);
+    })
+    .await;
+
+    let r = orch.refresh_zone_eq_detaille(zone_id).await;
+    assert!(r.applique(), "une sortie locale vivante reçoit le contrat");
+    assert_eq!(r.device_id, "local:DAC");
+    assert_eq!(r.format, Some((44_100, 2)));
+    assert_eq!(r.format_ecrit(), "44100 Hz / 2 canaux / f32");
+    assert!(r.eq_actif, "le profil de la zone est audible");
+    assert_eq!(r.preamp_db, Some(-8.0));
+    assert_eq!(r.preamp_db_droite, Some(-8.0));
+}
+
+/// La famille de sortie est un MOT, pas une déduction refaite après coup.
+#[test]
+fn famille_de_sortie_nomme_chaque_famille() {
+    use super::dsp::famille_de_sortie;
+    assert_eq!(famille_de_sortie("local:DAC", Some("local")), "locale");
+    assert_eq!(famille_de_sortie("", Some("local")), "locale");
+    assert_eq!(famille_de_sortie("dlna:uuid", Some("dlna")), "reseau");
+    assert_eq!(famille_de_sortie("cc:uuid", Some("chromecast")), "reseau");
+    assert_eq!(famille_de_sortie("b:1", Some("browser")), "navigateur");
+    assert_eq!(famille_de_sortie("oaat:1", Some("oaat")), "oaat");
+    assert_eq!(famille_de_sortie("d:1", Some("diretta")), "pull");
+    assert_eq!(famille_de_sortie("", None), "absente");
+}
