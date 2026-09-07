@@ -283,3 +283,10 @@ path = "tests/comptes_par_source_2147.rs"
 [[test]]
 name = "sources_trois_routes_i3226"
 path = "tests/sources_trois_routes_i3226.rs"
+
+# #1361 — « Retour à l'album en cours » : la route qui dit quel album jouer
+# rouvrir, et chez qui. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
+[[test]]
+name = "album_en_cours_1361"
+path = "tests/album_en_cours_1361.rs"
