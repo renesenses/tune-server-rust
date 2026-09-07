@@ -111,6 +111,8 @@ mod playlists_ecritures_partielles;
 mod podcasts_radiofrance_cle;
 #[path = "portee_repertoire_jokers.rs"]
 mod portee_repertoire_jokers;
+#[path = "radio_ne_fait_pas_avancer_la_file.rs"]
+mod radio_ne_fait_pas_avancer_la_file;
 #[path = "radios_recherche_distinction.rs"]
 mod radios_recherche_distinction;
 #[path = "radios_validation_url.rs"]

@@ -2090,12 +2090,88 @@ fn reject_if_zone_has_no_output_device(
     None
 }
 
+/// Une radio en cours de lecture doit-elle INTERDIRE l'avance vers l'élément
+/// suivant de la file ?
+///
+/// #3342 — Philippe, v0.9.134 : « lorsque j'écoute une station radio, au bout
+/// d'une dizaine de secondes la lecture passe sur le dernier album Qobuz
+/// écouté sans action de ma part ». Ses journaux du 04/09 disent la mécanique
+/// exacte, et elle ne tient pas au hasard :
+///
+/// ```text
+/// 17:33:32.096  orchestrator_play zone_id=10 title=FIP Jazz source=radio
+/// 17:33:42.175  radio_stream_superseded ... connected_secs=9
+/// 17:33:42.443  radio_stream_client_disconnect ... remaining_consumers=0
+/// 17:33:46.154  api_next_requested zone_id=10
+/// 17:33:46.158  prefetch_consumed source=qobuz source_id=410609160
+/// 17:33:46.331  orchestrator_play zone_id=10 title=Simplifier source=qobuz
+/// ```
+///
+/// Six fois de suite dans le même quart d'heure, sur cinq stations
+/// différentes. Le flux du navigateur meurt vers la dixième seconde, l'élément
+/// `<audio>` rend son évènement de fin, et le client demande « suivant ».
+///
+/// Or `play_radio` ne TOUCHE PAS la file : il appelle l'orchestrateur avec
+/// `source = "radio"` et laisse en place `queue_position` et `queue_length`
+/// de la dernière file écoutée. La file de Philippe portait encore les huit
+/// pistes de son album Qobuz, position 0 — et « suivant » la ressuscitait à la
+/// position 1. La radio n'était pas la piste courante de cette file ; elle
+/// n'en faisait pas partie du tout.
+///
+/// Le sondeur avait déjà reçu cette garde-là (#2493, « un flux de radio n'a
+/// pas de fin : sa position ne peut rien dépasser », `poller/tick.rs`) — c'est
+/// pourquoi aucun `gapless_arm_trace` n'apparaît sur la zone 10 des journaux.
+/// La route HTTP `POST /zones/{id}/next`, elle, ne l'avait jamais eue.
+///
+/// La règle ne regarde donc pas QUI appelle — le serveur ne peut pas
+/// distinguer l'appui de l'utilisateur du réveil du client, les deux arrivent
+/// par la même route sans le moindre marqueur. Elle regarde ce sur quoi la
+/// file est POSÉE : si la ligne à `queue_position` est elle-même une radio, la
+/// file est une file de stations et « suivant » y a un sens ; sinon la file
+/// est résiduelle, elle appartient à une autre écoute, et rien ne doit l'en
+/// faire sortir.
+///
+/// Contre-épreuve : `source_en_cours = None` ou n'importe quelle autre source
+/// rend `false` — une piste normale garde son bouton « suivant » intact.
+pub(crate) fn radio_hors_file_interdit_le_suivant(
+    source_en_cours: Option<&str>,
+    source_de_la_ligne_courante: Option<&str>,
+) -> bool {
+    source_en_cours == Some("radio") && source_de_la_ligne_courante != Some("radio")
+}
+
 async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_next_requested");
     if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
         return resp;
     }
     let current = state.playback.get_state(zone_id).await;
+
+    // #3342 — une radio ne fait pas avancer une file qui n'est pas la sienne.
+    // Voir `radio_hors_file_interdit_le_suivant` pour le pourquoi.
+    if let Some(np) = current.now_playing.as_ref() {
+        let ligne_courante = PlayQueueRepo::with_backend(state.backend.clone())
+            .get_at(zone_id, current.queue_position)
+            .ou_defaut_journalise();
+        if radio_hors_file_interdit_le_suivant(
+            Some(np.source.as_str()),
+            ligne_courante.as_ref().and_then(|e| e.source.as_deref()),
+        ) {
+            info!(
+                zone_id,
+                station = %np.title,
+                queue_position = current.queue_position,
+                queue_length = current.queue_length,
+                "next_ignore_radio_hors_file"
+            );
+            return Json(json!({
+                "status": "playing",
+                "reason": "radio_no_next",
+                "queue_position": current.queue_position,
+            }))
+            .into_response();
+        }
+    }
 
     // Manual skip: ignore repeat-one so the button always changes track (#1110).
     let Some(next_pos) = tune_core::poller::PositionPoller::next_position_manual(&current) else {
