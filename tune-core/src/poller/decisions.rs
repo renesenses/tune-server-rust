@@ -937,3 +937,162 @@ pub fn poll_failed_past_end(
         && queue_duration_ms > END_MARGIN_MS
         && wall_elapsed_secs.saturating_mul(1000) >= queue_duration_ms.saturating_add(END_MARGIN_MS)
 }
+
+// ───────────────────────── famine de l'anneau audio ─────────────────────────
+//
+// #3318 — Yacine, « coupures et arrêt pendant la lecture », Linux, un seul
+// cœur, DAC USB DENAFRIPS en ALSA, 49 618 pistes, un balayage d'empreintes en
+// fond et un LMS sur la même machine.
+//
+// Ce que le journal savait déjà dire, et ce qu'il ne disait pas.
+//
+// - `local_audio_slow_read` (`outputs/local.rs`) dit que le fil de lecture a
+//   attendu son flux HTTP interne — 38,6 s puis 44,9 s dans son relevé, sur
+//   une piste de 210,5 s qui a mis 290 s à finir.
+// - `stream_delivery_stall` (`tune-stream-http`) dit qui le faisait attendre :
+//   le producteur, ou le transport.
+//
+// Aucune des deux ne dit ce que l'AUDITEUR entend. Entre le lecteur HTTP et le
+// DAC il y a un anneau de 2 s (`ring_cap = taux × canaux × 2`, `outputs/local.rs`) :
+// tant qu'il tient, une attente de lecture ne s'entend pas. C'est son
+// épuisement — et lui seul — qui envoie des zéros au DAC. Or cet instant n'est
+// écrit NULLE PART : `RingStarvation` compte bien les rappels servis à court,
+// mais ses compteurs ne se lisent que sur demande, dans
+// `/api/v1/system/diagnostics`, sans date, et ils repartent de zéro à la piste
+// suivante. Un testeur qui entend une coupure et joint son journal ne joint
+// donc rien de la coupure.
+//
+// `SuiviFamine` comble ce trou depuis le SONDEUR, qui relit ces compteurs à
+// chaque tick : deux lignes par incident — celle qui l'ouvre, celle qui le
+// ferme avec son bilan — et jamais une de plus tant qu'il dure.
+
+use crate::outputs::traits::OutputRingStarvation;
+
+/// Le bilan d'un épisode de famine, tiré de DEUX relevés du même flux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpisodeFamine {
+    /// Rappels du pilote servis À COURT sur l'intervalle.
+    pub rappels_a_court: u64,
+    /// Échantillons entrelacés qui ont manqué à ces rappels, cumulés. Ce sont
+    /// des zéros : le pilote les a réclamés, l'anneau ne les avait pas.
+    pub echantillons_manquants: u64,
+    /// Ce que ces échantillons valent en SILENCE envoyé au DAC.
+    pub silence_ms: u64,
+    /// Durée d'audio écoulée sur l'intervalle, mesurée à l'horloge du pilote.
+    /// C'est la LARGEUR de l'épisode : `silence_ms` sur `duree_ms` dit à quel
+    /// point la lecture a été hachée.
+    pub duree_ms: u64,
+    /// Position, dans le flux, où l'épisode se referme — l'horloge du pilote
+    /// depuis le début de la piste, la seule qui compte le temps réellement
+    /// joué.
+    pub flux_ms: u64,
+}
+
+/// Ce qu'un tick a constaté sur l'anneau d'une zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FamineAnneau {
+    /// L'anneau vient de se vider : premier tick où le pilote est servi à
+    /// court. Porte ce que ce tick-là a coûté.
+    Debut(EpisodeFamine),
+    /// L'anneau est réalimenté : le pilote a été servi en entier sur tout
+    /// l'intervalle. Porte le bilan CUMULÉ depuis le début de l'épisode.
+    Fin(EpisodeFamine),
+}
+
+/// Le suivi de la famine d'UNE zone, d'un tick au suivant.
+///
+/// Purement comptable : il ne lit pas l'heure (l'horloge du pilote, portée par
+/// les relevés, est la seule honnête — un tick de sondeur retardé par la même
+/// saturation de processeur mentirait sur la durée) et il ne journalise rien.
+/// L'appelant décide quoi écrire.
+///
+/// Trois refus délibérés :
+///
+/// 1. **Le premier relevé ne dit jamais rien.** Il sert de repère. Des
+///    compteurs déjà hauts au moment où on commence à regarder n'appartiennent
+///    pas au tick qui les découvre.
+/// 2. **Un flux qui repart remet les compteurs à zéro** (`begin_stream`).
+///    Un recul de `served_samples` est donc une piste NEUVE, pas une famine :
+///    on se recale sans rien dire — mais on ferme d'abord l'épisode ouvert, au
+///    dernier relevé de la piste qui s'achève, faute de quoi une piste jouée à
+///    court de bout en bout n'aurait jamais son bilan.
+/// 3. **Une famine qui dure ne s'écrit qu'une fois.** Chez Yacine, l'anneau
+///    reste vide 38 s d'affilée : au tick du sondeur, cela ferait 38 lignes
+///    identiques. Deux suffisent, et la seconde porte le total.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SuiviFamine {
+    /// Le relevé du tick précédent, quel qu'il soit.
+    dernier: Option<OutputRingStarvation>,
+    /// Le relevé qui PRÉCÈDE l'épisode en cours — le dernier instant où
+    /// l'anneau tenait encore. `None` quand rien n'est ouvert.
+    avant_episode: Option<OutputRingStarvation>,
+}
+
+impl SuiviFamine {
+    /// Verser un relevé et dire ce qu'il faut en écrire.
+    pub fn observer(&mut self, courant: OutputRingStarvation) -> Option<FamineAnneau> {
+        let Some(dernier) = self.dernier else {
+            self.dernier = Some(courant);
+            return None;
+        };
+
+        // Flux neuf : `begin_stream` a remis les compteurs à zéro.
+        if courant.served_samples < dernier.served_samples || courant.events < dernier.events {
+            let bilan = self
+                .avant_episode
+                .take()
+                .map(|avant| FamineAnneau::Fin(episode(avant, dernier)));
+            self.dernier = Some(courant);
+            return bilan;
+        }
+
+        let a_court = courant.events > dernier.events;
+        let issue = if a_court {
+            if self.avant_episode.is_none() {
+                self.avant_episode = Some(dernier);
+                Some(FamineAnneau::Debut(episode(dernier, courant)))
+            } else {
+                None
+            }
+        } else {
+            self.avant_episode
+                .take()
+                .map(|avant| FamineAnneau::Fin(episode(avant, courant)))
+        };
+        self.dernier = Some(courant);
+        issue
+    }
+}
+
+/// Le bilan entre deux relevés du MÊME flux, `avant` étant le plus ancien.
+fn episode(avant: OutputRingStarvation, apres: OutputRingStarvation) -> EpisodeFamine {
+    let manquants = apres.missing_samples.saturating_sub(avant.missing_samples);
+    EpisodeFamine {
+        rappels_a_court: apres.events.saturating_sub(avant.events),
+        echantillons_manquants: manquants,
+        silence_ms: silence_ms(manquants, apres),
+        duree_ms: apres.stream_ms.saturating_sub(avant.stream_ms),
+        flux_ms: apres.stream_ms,
+    }
+}
+
+/// Convertir des échantillons manquants en millisecondes de silence.
+///
+/// La cadence (taux × canaux) n'est pas publiée par le relevé, mais elle s'y
+/// lit sans perte : `stream_ms / served_samples` vaut exactement
+/// `1000 / cadence` — c'est ainsi que `RingStarvation::snapshot` construit
+/// `stream_ms`. Chez Yacine, `served = 33 816 156` pour `stream_ms = 352 251`
+/// rend 96 000 échantillons/s, soit 48 kHz en stéréo. Sur des dizaines de
+/// millions d'échantillons, l'arrondi de cette division vaut moins d'une
+/// milliseconde par heure de lecture.
+///
+/// Rend 0 tant que le flux n'a servi aucun échantillon : sans dénominateur, il
+/// n'y a pas de cadence, et inventer une valeur serait pire que se taire.
+pub fn silence_ms(echantillons_manquants: u64, releve: OutputRingStarvation) -> u64 {
+    if releve.served_samples == 0 {
+        return 0;
+    }
+    let ms = u128::from(echantillons_manquants) * u128::from(releve.stream_ms)
+        / u128::from(releve.served_samples);
+    u64::try_from(ms).unwrap_or(u64::MAX)
+}
