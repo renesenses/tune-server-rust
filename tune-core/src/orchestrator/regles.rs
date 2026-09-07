@@ -280,6 +280,26 @@ pub(super) fn cible_wav_pour_traitement(
     dsp_active && is_network && !src_est_dsd && opt_in && renderer_accepte_lpcm
 }
 
+/// La cible d'un TRANSCODAGE doit être un format que l'encodeur sait produire.
+///
+/// `AudioFormat::dlna_transcode_target` rend « AIFF » pour une source AIFF,
+/// parce que les renderers le lisent nativement — vrai en passthrough, faux
+/// dès qu'un traitement force le transcodage : l'encodeur n'a pas de bras
+/// AIFF (ni MP3, ni OGG) et substituait du FLAC en silence, que le serveur
+/// servait sous `.aiff` / `audio/aiff`. Le renderer DLNA de Cyrille restait
+/// muet (#3357, 60 207 920 octets de FLAC étiquetés AIFF). Ici, tout ce que
+/// l'encodeur ne sait pas écrire devient FLAC AVANT que l'extension et le
+/// type MIME n'en soient dérivés : un FLAC s'annonce FLAC.
+pub(super) fn cible_encodable(
+    cible: crate::audio::formats::AudioFormat,
+) -> crate::audio::formats::AudioFormat {
+    use crate::audio::formats::AudioFormat;
+    match cible {
+        AudioFormat::Wav | AudioFormat::Flac => cible,
+        _ => AudioFormat::Flac,
+    }
+}
+
 /// Le bras streaming HTTPS doit-il PRÉ-TRANSCODER au lieu de servir les octets
 /// du CDN verbatim ?
 ///

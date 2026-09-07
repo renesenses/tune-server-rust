@@ -706,12 +706,13 @@ use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::streaming::registry::ServiceRegistry;
 
 use super::{
-    PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, cible_wav_pour_ape_reseau,
-    cible_wav_pour_traitement, is_network_output_type, is_pull_dsp_output_type,
-    is_push_uri_output_type, message_session_perdue, passthrough_didl_duration_ms,
-    pull_output_needs_dsp_transcode, replay_needs_output_seek, reprise_de_session,
-    reprise_toujours_la_notre, requete_de_retablissement, spawn_streaming_dsp_relay,
-    streaming_needs_pretranscode, streaming_pretranscode_format, use_file_transcode_for,
+    PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, cible_encodable,
+    cible_wav_pour_ape_reseau, cible_wav_pour_traitement, is_network_output_type,
+    is_pull_dsp_output_type, is_push_uri_output_type, message_session_perdue,
+    passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, replay_needs_output_seek,
+    reprise_de_session, reprise_toujours_la_notre, requete_de_retablissement,
+    spawn_streaming_dsp_relay, streaming_needs_pretranscode, streaming_pretranscode_format,
+    use_file_transcode_for,
 };
 
 #[test]
@@ -909,6 +910,53 @@ fn la_cible_wav_pour_traitement_exige_les_cinq_conditions() {
     assert!(!cible_wav_pour_traitement(true, true, false, false, true));
     // Renderer sans LPCM annoncé (ou sonde inconcluante) : le fichier.
     assert!(!cible_wav_pour_traitement(true, true, false, true, false));
+}
+
+/// #3357 — la cible d'un transcodage est toujours un format que l'encodeur
+/// sait écrire : WAV et FLAC passent, tout le reste (AIFF, MP3, OGG, ALAC…)
+/// devient FLAC avant que l'étiquette n'en soit dérivée.
+#[test]
+fn la_cible_de_transcodage_est_toujours_encodable() {
+    use crate::audio::formats::AudioFormat;
+    assert_eq!(cible_encodable(AudioFormat::Wav), AudioFormat::Wav);
+    assert_eq!(cible_encodable(AudioFormat::Flac), AudioFormat::Flac);
+    for f in [
+        AudioFormat::Aiff,
+        AudioFormat::Mp3,
+        AudioFormat::Ogg,
+        AudioFormat::Alac,
+    ] {
+        assert_eq!(cible_encodable(f), AudioFormat::Flac, "{f:?}");
+    }
+}
+
+/// #3357, de bout en bout sur la DÉCISION (Cyrille, fil « Pas de son avec la
+/// v.0.9135 ») : une zone DLNA avec égaliseur et une piste AIFF locale. Avant,
+/// la cible restait « AIFF », l'encodeur écrivait du FLAC, et le renderer
+/// recevait `…/xxx.aiff` en `audio/aiff` : muet. La cible est désormais FLAC,
+/// donc l'extension et le type MIME aussi.
+#[tokio::test]
+async fn une_piste_aiff_transcodee_pour_un_renderer_est_servie_en_flac_annonce_flac() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Pièce par défaut", Some("dlna"), Some("uuid:cyrille-3357"))
+        .unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &format!("zone_{zone_id}_eq_profile"),
+            &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+        )
+        .unwrap();
+    piste_3234(&orch, "/m/cyrille/01 - Morceau.aiff", "aiff");
+    let req = requete_locale_3234(zone_id, 1);
+    let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(format.out_mime, "audio/flac", "{}", format.out_ext);
+    assert_eq!(format.out_ext, "flac");
+    assert_eq!(format.target_format_str, "flac");
+    assert!(
+        format.use_file_transcode,
+        "cible FLAC réseau : le fichier, comme avant"
+    );
 }
 
 /// LAT-F1 (phase 1), de bout en bout sur la DÉCISION : une zone DLNA avec
