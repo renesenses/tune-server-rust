@@ -47,6 +47,33 @@ pub fn wav_override_applies(
     force_wav_requested && !(source_is_flac && native_flac_opt_in)
 }
 
+/// Le plafond 16 bits s'applique-t-il à CETTE lecture ?
+///
+/// Certains renderers annoncent `audio/flac` mais ne décodent que 16 bits : un
+/// FLAC ou un ALAC 24 bits servi direct joue le SILENCE (Ruark R3, Yves #1137).
+/// Deux sources l'activent, en OU : le drapeau de zone `dlna_cap_16bit` et le
+/// quirk `force_16bit` du catalogue d'appareils (marque + modèle choisis pour
+/// la zone, `device_catalog::resolve_zone_quirks`). Le quirk ne peut
+/// qu'activer le plafond, jamais le désactiver. Sans objet jusqu'à 16 bits, et
+/// hors sortie réseau.
+///
+/// `pub` pour la même raison que [`is_network_output_type`] et
+/// [`wav_override_applies`] : le miroir du chemin du signal
+/// (`tune-server/src/routes/zones/signal_path.rs`) recopiait cette condition
+/// SANS le quirk catalogue. Sur un Ruark R3 et une source 24 bits,
+/// l'orchestrateur transcodait en 16 bits pendant que le panneau annonçait un
+/// passthrough bit-perfect (#3183, troisième ligne de l'écart n° 3). Le
+/// paramètre `catalogue_force_16bit` est OBLIGATOIRE : un appelant ne peut
+/// plus oublier cette source-là.
+pub fn dlna_cap_16bit_applies(
+    is_network_output: bool,
+    bit_depth: u16,
+    zone_cap_16bit: bool,
+    catalogue_force_16bit: bool,
+) -> bool {
+    is_network_output && bit_depth > 16 && (zone_cap_16bit || catalogue_force_16bit)
+}
+
 /// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
 /// file served on the HI-RES streaming path (cache-hit → a previously-finished
 /// transcode instead of a fresh one), so it stays OFF until validated on a real

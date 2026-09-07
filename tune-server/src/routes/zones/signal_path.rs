@@ -432,14 +432,7 @@ pub(super) fn build_signal_path(
         &source,
         &forcages,
     );
-    let verdicts = rendre_les_verdicts(
-        zone,
-        np,
-        &source,
-        transport_bit_perfect,
-        &forcages,
-        &traitements,
-    );
+    let verdicts = rendre_les_verdicts(np, &source, transport_bit_perfect, &forcages, &traitements);
 
     let analyse = Analyse {
         source,
@@ -533,6 +526,7 @@ fn assembler_les_etapes(
         is_oaat,
         oaat_transcodes,
         wire_wav,
+        max_sample_rate,
     } = analyse.forcages;
     let Verdicts {
         resampling_active,
@@ -612,7 +606,7 @@ fn assembler_les_etapes(
             bit_depth
         });
         let out_sample_rate = wire_sample_rate.map(|v| v as i32).unwrap_or_else(|| {
-            zone.max_sample_rate
+            max_sample_rate
                 .map(|m| (sample_rate as u32).min(m) as i32)
                 .unwrap_or(sample_rate)
         });
@@ -627,9 +621,8 @@ fn assembler_les_etapes(
         }));
     }
 
-    // Resampler step (when zone max_sample_rate caps the output)
-    if resampling_active {
-        let max_sr = zone.max_sample_rate.unwrap();
+    // Resampler step (when the effective max_sample_rate caps the output)
+    if let Some(max_sr) = max_sample_rate.filter(|_| resampling_active) {
         let src_khz = sample_rate / 1000;
         let dst_khz = max_sr / 1000;
         steps.push(json!({
@@ -802,7 +795,6 @@ struct Verdicts {
 
 /// Rend les verdicts à partir de la source, du transport et des traitements.
 fn rendre_les_verdicts(
-    zone: &Zone,
     np: &tune_core::playback::NowPlaying,
     source: &Source,
     transport_bit_perfect: bool,
@@ -821,8 +813,12 @@ fn rendre_les_verdicts(
     // Detect sample rate capping (DSD excluded — the DSD→PCM transcode
     // already handles rate conversion; showing a separate resampler step
     // would be misleading since sample_rate here is the DSD MHz rate).
+    //
+    // Sur le plafond EFFECTIF (`Forcages::max_sample_rate`, zone et catalogue
+    // combinés), pas sur le seul réglage de zone : c'est celui que
+    // `resolve_local_track` applique (#3183).
     let resampling_active = !is_dsd
-        && zone
+        && forcages
             .max_sample_rate
             .is_some_and(|max| (sample_rate as u32) > max);
 
@@ -1052,6 +1048,9 @@ struct Forcages {
     is_oaat: bool,
     oaat_transcodes: bool,
     wire_wav: bool,
+    /// Plafond de fréquence EFFECTIF : réglage de zone et catalogue d'appareils
+    /// combinés en `min`, comme `resolve_local_track` (#3183).
+    max_sample_rate: Option<u32>,
 }
 
 /// Décide les forçages de sortie, en miroir des conditions de l'orchestrateur.
@@ -1134,12 +1133,30 @@ fn decider_les_forcages(
     let dlna_lpcm = is_network_output
         && !dsd_passthrough
         && ZoneRepo::with_backend(backend.clone()).get_dlna_lpcm(zone_id);
-    // Zone opt-in 16-bit cap (Ruark R3, #1137): mirrors the orchestrator so the
-    // signal path shows a real 16-bit downconvert instead of a phantom
-    // bit-perfect passthrough when the source is hi-res.
-    let dlna_cap_16bit = is_network_output
-        && bit_depth > 16
-        && ZoneRepo::with_backend(backend.clone()).get_dlna_cap_16bit(zone_id);
+    // Quirks du catalogue d'appareils : la MÊME source que l'orchestrateur
+    // (`resolve_zone_quirks`, marque + modèle choisis par l'utilisateur pour
+    // la zone ; profil neutre sinon). Ils portent deux contraintes câblées,
+    // `force_16bit` et `max_sample_rate`, et ce miroir n'en lisait AUCUNE : il
+    // ne consultait que les réglages de zone. Sur un Ruark R3 (`force_16bit`)
+    // et une source 24 bits, l'orchestrateur transcodait en 16 bits pendant
+    // que ce panneau annonçait un passthrough bit-perfect (#3183).
+    let device_quirks = tune_core::device_catalog::resolve_zone_quirks(backend, zone_id);
+    // Plafond 16 bits (Ruark R3, #1137) : drapeau de zone OU quirk catalogue,
+    // par la MÊME fonction que l'orchestrateur (#3183).
+    let dlna_cap_16bit = tune_core::orchestrator::dlna_cap_16bit_applies(
+        is_network_output,
+        u16::try_from(bit_depth).unwrap_or(0),
+        ZoneRepo::with_backend(backend.clone()).get_dlna_cap_16bit(zone_id),
+        device_quirks.force_16bit,
+    );
+    // Plafond de fréquence effectif : le réglage de zone combiné en `min` avec
+    // le catalogue, comme `resolve_local_track` (`combine_max_sample_rate`).
+    // Un WiiM Mini catalogué à 48 kHz rééchantillonne un FLAC 96 kHz sans
+    // qu'aucun réglage de zone ne le dise — le panneau doit le voir aussi.
+    let max_sample_rate = tune_core::device_catalog::combine_max_sample_rate(
+        zone.max_sample_rate,
+        device_quirks.max_sample_rate,
+    );
     // Zone opt-in: serve genuine 24-bit WAV (audio/L24) instead of the 16-bit
     // LPCM fallback. Mirrors orchestrator.rs `dlna_wav24` so the signal path
     // shows a lossless 24-bit WAV wire (not a phantom 16-bit truncation).
@@ -1207,6 +1224,7 @@ fn decider_les_forcages(
         is_oaat,
         oaat_transcodes,
         wire_wav,
+        max_sample_rate,
     }
 }
 

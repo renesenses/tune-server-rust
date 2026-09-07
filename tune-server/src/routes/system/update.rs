@@ -2179,46 +2179,214 @@ pub(super) async fn update_apply() -> impl IntoResponse {
     }))
 }
 
-/// GET /system/changelog — fetch from GitHub releases, cache 1 hour.
-pub(super) async fn changelog() -> Json<Value> {
+/// Paramètres de `GET /system/changelog`. Le client envoie aussi `limit`, que
+/// la route n'a jamais lu ; serde l'ignore, comme avant.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(super) struct ChangelogQuery {
+    /// Langue demandée explicitement (`?lang=en`). Sinon `Accept-Language`.
+    pub lang: Option<String>,
+}
+
+/// GET /system/changelog — notes de version depuis les releases GitHub, dans
+/// la langue demandée, cache 1 heure.
+///
+/// La langue vient de [`crate::i18n::lang_from_request`] : `?lang=` explicite,
+/// sinon `Accept-Language`, sinon `fr` (#3089). Les notes sont traduites À LA
+/// PUBLICATION — un bloc par langue dans le corps de la release, cf.
+/// [`blocs_par_langue`] — et la route sert le bloc de la langue demandée, ou
+/// le français en repli, en le DISANT : `lang` est la langue effectivement
+/// servie, `fallback` vaut `true` dès qu'au moins une entrée n'a pas pu être
+/// servie dans la langue demandée. Chaque entrée porte aussi ses propres
+/// `lang`/`fallback`, car une release ancienne (français seul) peut côtoyer
+/// une release traduite dans la même liste.
+///
+/// Le cache mémorise les releases BRUTES, pas une réponse rendue : la
+/// dérivation par langue est un découpage de texte, sans réseau, refait à
+/// chaque appel. Un cache de réponses aurait dû être indexé par langue, sans
+/// quoi le premier appelant fixait la langue de tous les autres pendant une
+/// heure (piège nommé dans l'arbitrage de #3089).
+pub(super) async fn changelog(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ChangelogQuery>,
+) -> Json<Value> {
     use std::sync::OnceLock;
     use tokio::sync::Mutex;
 
-    static CACHE: OnceLock<Mutex<(std::time::Instant, Value)>> = OnceLock::new();
+    let lang = crate::i18n::base_tag(&crate::i18n::lang_from_request(q.lang.as_deref(), &headers));
+
+    static CACHE: OnceLock<Mutex<(std::time::Instant, Vec<Value>)>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| {
         Mutex::new((
             std::time::Instant::now() - std::time::Duration::from_secs(7200),
-            json!([]),
+            Vec::new(),
         ))
     });
     let mut guard = cache.lock().await;
 
-    if guard.0.elapsed() < std::time::Duration::from_secs(3600)
-        && guard.1.as_array().is_some_and(|a| !a.is_empty())
-    {
-        return Json(json!({ "version": tune_core::version(), "entries": guard.1 }));
-    }
-
-    let entries = match fetch_github_changelog().await {
-        Ok(e) => {
-            *guard = (std::time::Instant::now(), e.clone());
-            e
-        }
-        Err(_) => guard.1.clone(),
-    };
+    let releases =
+        if guard.0.elapsed() < std::time::Duration::from_secs(3600) && !guard.1.is_empty() {
+            guard.1.clone()
+        } else {
+            match fetch_github_releases().await {
+                Ok(r) => {
+                    *guard = (std::time::Instant::now(), r.clone());
+                    r
+                }
+                Err(_) => guard.1.clone(),
+            }
+        };
     drop(guard);
 
-    // Le cache démarre à `json!([])`. Sur un serveur fraîchement lancé et sans
-    // réseau, les deux branches ci-dessus rendent donc un tableau VIDE, et le
-    // panneau « Quoi de neuf » s'affiche désert — ce qui se lit non pas comme
-    // « je n'ai pas pu joindre la source » mais comme « cette version
-    // n'apporte rien ». Le repli en dur existait depuis toujours pour ce cas ;
-    // il n'était simplement jamais appelé.
-    if entries.as_array().is_none_or(|a| a.is_empty()) {
-        return changelog_hardcoded();
+    // Le cache démarre vide. Sur un serveur fraîchement lancé et sans réseau,
+    // les deux branches ci-dessus rendent donc une liste VIDE, et le panneau
+    // « Quoi de neuf » s'affiche désert — ce qui se lit non pas comme « je
+    // n'ai pas pu joindre la source » mais comme « cette version n'apporte
+    // rien ». Le repli en dur existait depuis toujours pour ce cas ; il
+    // n'était simplement jamais appelé.
+    if releases.is_empty() {
+        return changelog_hardcoded(&lang);
     }
 
-    Json(json!({ "version": tune_core::version(), "entries": entries }))
+    let NotesServies {
+        entries,
+        lang: servie,
+        fallback,
+    } = entrees_pour_langue(&releases, &lang);
+    Json(json!({
+        "version": tune_core::version(),
+        "lang": servie,
+        "fallback": fallback,
+        "entries": entries,
+    }))
+}
+
+/// Marqueur ouvrant un bloc de langue dans un corps de release :
+/// `<!-- lang:en -->`, seul sur sa ligne. Rend la base de l'étiquette, ou
+/// `None` si la ligne n'est pas un marqueur.
+fn marqueur_de_langue(line: &str) -> Option<String> {
+    let inner = line
+        .trim()
+        .strip_prefix("<!--")?
+        .strip_suffix("-->")?
+        .trim()
+        .strip_prefix("lang:")?;
+    let tag = crate::i18n::base_tag(inner);
+    (!tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphabetic())).then_some(tag)
+}
+
+/// Découpe un corps de release en blocs `(langue, texte)`, dans l'ordre.
+///
+/// Format de publication multilingue (docs/RELEASE-WORKFLOW.md, « Notes de
+/// version multilingues ») : le français d'abord, tel qu'il a toujours été
+/// écrit, puis un bloc par traduction, chacun ouvert par un commentaire HTML
+/// `<!-- lang:xx -->` seul sur sa ligne. Le commentaire est invisible sur la
+/// page GitHub et traverse le proxy `mozaiklabs.fr` comme n'importe quel
+/// texte : rien à télécharger de plus, rien à parser de plus qu'un corps.
+///
+/// Compatibilité : une release ANCIENNE n'a aucun marqueur — tout son corps
+/// est le bloc `fr`. Un préambule sans marqueur est de même le bloc `fr`, et
+/// un `<!-- lang:fr -->` explicite est accepté. Un bloc vide (marqueur laissé
+/// sans texte) est ignoré : il ne « couvre » pas la langue, elle repliera.
+fn blocs_par_langue(body: &str) -> Vec<(String, String)> {
+    let mut blocs: Vec<(String, String)> = Vec::new();
+    let mut courant = String::from("fr");
+    let mut texte = String::new();
+    let clore = |lang: &str, texte: &mut String, blocs: &mut Vec<(String, String)>| {
+        if texte.trim().is_empty() {
+            texte.clear();
+        } else {
+            blocs.push((lang.to_string(), std::mem::take(texte)));
+        }
+    };
+    for line in body.lines() {
+        if let Some(lang) = marqueur_de_langue(line) {
+            clore(&courant, &mut texte, &mut blocs);
+            courant = lang;
+            continue;
+        }
+        texte.push_str(line);
+        texte.push('\n');
+    }
+    clore(&courant, &mut texte, &mut blocs);
+    blocs
+}
+
+/// Le texte des notes à servir pour `lang`, avec la langue effectivement
+/// servie et le drapeau de repli. Cherche d'abord le bloc de la langue
+/// demandée, puis le bloc `fr` ; sans aucun des deux (corps vide, ou notes
+/// publiées sans français — cas non prévu par le format), rend le corps
+/// entier, étiqueté `fr` et en repli.
+fn notes_dans_la_langue(body: &str, lang: &str) -> (String, String, bool) {
+    let blocs = blocs_par_langue(body);
+    if let Some((_, texte)) = blocs.iter().find(|(l, _)| l == lang) {
+        return (texte.clone(), lang.to_string(), false);
+    }
+    if let Some((_, texte)) = blocs.iter().find(|(l, _)| l == "fr") {
+        return (texte.clone(), "fr".to_string(), lang != "fr");
+    }
+    (body.to_string(), "fr".to_string(), lang != "fr")
+}
+
+/// Ce que la route rend pour une langue : les entrées, la langue servie et le
+/// drapeau de repli agrégé.
+struct NotesServies {
+    entries: Vec<Value>,
+    /// La langue demandée si au moins une entrée est servie dedans, sinon
+    /// `fr` : c'est ce que le panneau affiche majoritairement.
+    lang: String,
+    /// `true` dès qu'une entrée n'a pas pu être servie dans la langue
+    /// demandée — le client peut alors dire « notes en français ».
+    fallback: bool,
+}
+
+/// Dérive les entrées du panneau depuis les releases brutes, pour `lang`.
+/// Sans réseau : c'est la partie testable de la route.
+fn entrees_pour_langue(releases: &[Value], lang: &str) -> NotesServies {
+    let mut fallback = false;
+    let mut une_dans_la_langue = false;
+    let entries: Vec<Value> = releases
+        .iter()
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?;
+            let version = tag.strip_prefix('v').unwrap_or(tag);
+            let date = r["published_at"]
+                .as_str()
+                .unwrap_or("")
+                .split('T')
+                .next()
+                .unwrap_or("");
+            let body = r["body"].as_str().unwrap_or("");
+            let (texte, servie, repli) = notes_dans_la_langue(body, lang);
+            fallback |= repli;
+            une_dans_la_langue |= !repli;
+            let ParsedBody {
+                mut features,
+                fixes,
+                improvements,
+            } = parse_release_body(&texte);
+            if features.is_empty() && fixes.is_empty() && improvements.is_empty() {
+                features.push(format!("Release {version}"));
+            }
+            Some(json!({
+                "version": version,
+                "date": date,
+                "lang": servie,
+                "fallback": repli,
+                "features": features,
+                "fixes": fixes,
+                "improvements": improvements,
+            }))
+        })
+        .collect();
+    NotesServies {
+        entries,
+        lang: if une_dans_la_langue {
+            lang.to_string()
+        } else {
+            "fr".to_string()
+        },
+        fallback,
+    }
 }
 
 /// Les trois listes du panneau « Quoi de neuf », telles qu'il les attend.
@@ -2241,14 +2409,79 @@ enum Section {
     Other,
 }
 
-/// Classe un intitulé (titre de section) par mots-clés, FR et EN.
+/// Mots-clés de titre, par rubrique, dans les dix langues de l'interface
+/// (`crate::i18n::SUPPORTED`). Le format de publication multilingue
+/// (docs/RELEASE-WORKFLOW.md, « Notes de version multilingues ») impose aux
+/// blocs traduits les titres que cette table reconnaît : rédacteur et lecteur
+/// partagent la même liste, sinon les puces d'un bloc allemand tomberaient en
+/// `Other` et le panneau afficherait « Release x.y.z » à la place des notes.
+/// Comparaison en minuscules, par sous-chaîne, dans l'ordre : corrections,
+/// puis améliorations, puis nouveautés.
+const TITRES_CORRECTIONS: &[&str] = &[
+    "correct",
+    "fix",
+    "bug", // fr, en (et « Buggfixar » sv)
+    "korrektur",
+    "fehler",
+    "behoben", // de
+    "correc",
+    "correz",
+    "corect",
+    "remed", // es, it, ro
+    "rätt",
+    "ratt", // sv
+    "修复",
+    "修正",
+    "수정", // zh, ja, ko
+];
+const TITRES_AMELIORATIONS: &[&str] = &[
+    "amélio",
+    "ameli",
+    "improv", // fr, en
+    "verbesser",
+    "mejor",
+    "miglior", // de, es, it
+    "îmbunăt",
+    "imbunat",
+    "förbättr",
+    "forbattr", // ro, sv
+    "改进",
+    "优化",
+    "改善",
+    "개선", // zh, ja, ko
+];
+const TITRES_NOUVEAUTES: &[&str] = &[
+    "nouveaut",
+    "feature",
+    "ajout", // fr, en
+    "neuheit",
+    "neuerung",
+    "neue funktion", // de
+    "noved",
+    "nuevas func",
+    "novit",
+    "nuove", // es, it
+    "noutăț",
+    "noutat",
+    "nyhet",
+    "nya funktion", // ro, sv
+    "新功能",
+    "新增",
+    "新機能",
+    "새로운 기능",
+    "신규", // zh, ja, ko
+];
+
+/// Classe un intitulé (titre de section) par mots-clés, dans les dix langues
+/// de l'interface.
 fn section_from_title(title: &str) -> Section {
     let l = title.to_lowercase();
-    if l.contains("correct") || l.contains("fix") || l.contains("bug") {
+    let contient = |mots: &[&str]| mots.iter().any(|m| l.contains(m));
+    if contient(TITRES_CORRECTIONS) {
         Section::Fixes
-    } else if l.contains("amélio") || l.contains("ameli") || l.contains("improv") {
+    } else if contient(TITRES_AMELIORATIONS) {
         Section::Improvements
-    } else if l.contains("nouveaut") || l.contains("feature") || l.contains("ajout") {
+    } else if contient(TITRES_NOUVEAUTES) {
         Section::Features
     } else {
         Section::Other
@@ -2354,7 +2587,10 @@ fn parse_release_body(body: &str) -> ParsedBody {
     out
 }
 
-async fn fetch_github_changelog() -> Result<Value, String> {
+/// Les releases GitHub BRUTES (JSON de l'API, 20 dernières), via le proxy
+/// `mozaiklabs.fr` puis GitHub. La dérivation en entrées du panneau, par
+/// langue, est faite par [`entrees_pour_langue`] — hors réseau, donc testable.
+async fn fetch_github_releases() -> Result<Vec<Value>, String> {
     let client = tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .user_agent("Tune/2.0")
@@ -2390,36 +2626,7 @@ async fn fetch_github_changelog() -> Result<Value, String> {
             resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())?
         }
     };
-    let entries: Vec<Value> = releases
-        .iter()
-        .filter_map(|r| {
-            let tag = r["tag_name"].as_str()?;
-            let version = tag.strip_prefix('v').unwrap_or(tag);
-            let date = r["published_at"]
-                .as_str()
-                .unwrap_or("")
-                .split('T')
-                .next()
-                .unwrap_or("");
-            let body = r["body"].as_str().unwrap_or("");
-            let ParsedBody {
-                mut features,
-                fixes,
-                improvements,
-            } = parse_release_body(body);
-            if features.is_empty() && fixes.is_empty() && improvements.is_empty() {
-                features.push(format!("Release {version}"));
-            }
-            Some(json!({
-                "version": version,
-                "date": date,
-                "features": features,
-                "fixes": fixes,
-                "improvements": improvements,
-            }))
-        })
-        .collect();
-    Ok(json!(entries))
+    Ok(releases)
 }
 
 /// Dernier recours quand la source distante est injoignable ET que le cache
@@ -2431,9 +2638,14 @@ async fn fetch_github_changelog() -> Result<Value, String> {
 /// Ces notes sont figées et ne suivent pas les releases : elles valent mieux
 /// qu'un panneau vide, pas mieux que les vraies notes. Chaque entrée porte sa
 /// version et sa date, donc rien n'est présenté comme récent à tort.
-fn changelog_hardcoded() -> Json<Value> {
+///
+/// Ces notes n'existent qu'en français : `lang` le dit, et `fallback` vaut
+/// `true` dès que la langue demandée n'est pas `fr` (#3089).
+fn changelog_hardcoded(lang: &str) -> Json<Value> {
     Json(json!({
         "version": tune_core::version(),
+        "lang": "fr",
+        "fallback": lang != "fr",
         // Dit au client que ces notes sont un secours, pas l'actualité du
         // produit. Sans ce drapeau, le panneau badge sa première entrée
         // « Récent » — soit « v0.8.15 » annoncée comme la version en cours sur
@@ -3433,7 +3645,7 @@ mod changelog_fallback_tests {
     /// précisément le moment où le repli sert.
     #[test]
     fn le_repli_satisfait_le_contrat_du_panneau() {
-        let body = changelog_hardcoded().0;
+        let body = changelog_hardcoded("fr").0;
         let entries = body["entries"]
             .as_array()
             .expect("le repli doit exposer un tableau `entries`");
@@ -3453,7 +3665,7 @@ mod changelog_fallback_tests {
     /// S'il disparaît, le panneau rebadge « Récent » sur une entrée de juin.
     #[test]
     fn le_repli_sannonce_comme_tel() {
-        let body = changelog_hardcoded().0;
+        let body = changelog_hardcoded("fr").0;
         assert_eq!(
             body["offline"],
             serde_json::json!(true),
@@ -3466,7 +3678,7 @@ mod changelog_fallback_tests {
     /// ligne muette dans le panneau — le défaut même qu'on corrige.
     #[test]
     fn chaque_entree_du_repli_est_affichable() {
-        let body = changelog_hardcoded().0;
+        let body = changelog_hardcoded("fr").0;
         for e in body["entries"].as_array().unwrap() {
             let v = e["version"].as_str().unwrap_or("");
             assert!(!v.is_empty(), "entrée sans version : {e}");
@@ -3482,5 +3694,208 @@ mod changelog_fallback_tests {
                 "version {v} : rubriques vides, la ligne serait muette"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod changelog_lang_tests {
+    //! #3089 — les notes de version sont traduites À LA PUBLICATION, un bloc
+    //! par langue dans le corps de la release ; la route sert la langue
+    //! demandée, ou le français en le disant. Aucun réseau : on part des
+    //! releases brutes telles que l'API les rend.
+    use super::{
+        Section, blocs_par_langue, changelog_hardcoded, entrees_pour_langue, section_from_title,
+    };
+    use serde_json::{Value, json};
+
+    /// Corps publié selon le format multilingue : français d'abord, sans
+    /// marqueur, puis un bloc anglais.
+    const CORPS_TRADUIT: &str = "\
+## Nouveautés
+- Recherche dans un serveur UPnP
+## Corrections
+- Pochette erronée dans les compilations
+
+<!-- lang:en -->
+## Features
+- Search inside a UPnP server
+## Bug fixes
+- Wrong cover art in compilations
+";
+
+    /// Corps d'une release ANCIENNE : français seul, aucun marqueur.
+    const CORPS_ANCIEN: &str = "\
+## Corrections
+- Lecture qui s'arrêtait au premier morceau
+";
+
+    fn release(tag: &str, body: &str) -> Value {
+        json!({ "tag_name": tag, "published_at": "2026-09-06T19:06:57Z", "body": body })
+    }
+
+    #[test]
+    fn langue_demandee_presente_elle_est_servie() {
+        let r = [release("v0.9.141", CORPS_TRADUIT)];
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "en");
+        assert!(
+            !n.fallback,
+            "la langue demandée existe : aucun repli à déclarer"
+        );
+        let e = &n.entries[0];
+        assert_eq!(e["lang"], json!("en"));
+        assert_eq!(e["fallback"], json!(false));
+        assert_eq!(e["features"], json!(["Search inside a UPnP server"]));
+        assert_eq!(e["fixes"], json!(["Wrong cover art in compilations"]));
+        // Le bloc français ne fuit pas dans la réponse anglaise.
+        assert!(
+            !e.to_string().contains("Pochette"),
+            "le bloc français a fui dans la réponse anglaise : {e}"
+        );
+    }
+
+    #[test]
+    fn langue_absente_repli_francais_declare() {
+        let r = [release("v0.9.141", CORPS_TRADUIT)];
+        let n = entrees_pour_langue(&r, "de");
+        assert_eq!(
+            n.lang, "fr",
+            "sans bloc allemand, c'est le français qui est servi"
+        );
+        assert!(n.fallback, "le repli doit être DIT, pas silencieux");
+        let e = &n.entries[0];
+        assert_eq!(e["lang"], json!("fr"));
+        assert_eq!(e["fallback"], json!(true));
+        assert_eq!(e["features"], json!(["Recherche dans un serveur UPnP"]));
+        assert!(
+            !e.to_string().contains("Search inside"),
+            "le bloc anglais a été servi à un appel allemand : {e}"
+        );
+    }
+
+    #[test]
+    fn release_ancienne_sans_marqueur_reste_francaise() {
+        let r = [release("v0.9.129", CORPS_ANCIEN)];
+        // Demandée en français : servie telle quelle, sans repli.
+        let n = entrees_pour_langue(&r, "fr");
+        assert_eq!(n.lang, "fr");
+        assert!(!n.fallback);
+        assert_eq!(
+            n.entries[0]["fixes"],
+            json!(["Lecture qui s'arrêtait au premier morceau"])
+        );
+        // Demandée en anglais : même contenu, repli déclaré.
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "fr");
+        assert!(n.fallback);
+        assert_eq!(n.entries[0]["fallback"], json!(true));
+        assert_eq!(
+            n.entries[0]["fixes"],
+            json!(["Lecture qui s'arrêtait au premier morceau"])
+        );
+    }
+
+    #[test]
+    fn releases_traduites_et_anciennes_cohabitent() {
+        // Une liste réelle mêle des releases publiées avant et après le
+        // format : chaque entrée dit sa langue, l'agrégat dit le repli.
+        let r = [
+            release("v0.9.141", CORPS_TRADUIT),
+            release("v0.9.129", CORPS_ANCIEN),
+        ];
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "en", "au moins une entrée est en anglais");
+        assert!(
+            n.fallback,
+            "une entrée n'a pas pu l'être : le repli est déclaré"
+        );
+        assert_eq!(n.entries[0]["lang"], json!("en"));
+        assert_eq!(n.entries[0]["fallback"], json!(false));
+        assert_eq!(n.entries[1]["lang"], json!("fr"));
+        assert_eq!(n.entries[1]["fallback"], json!(true));
+    }
+
+    #[test]
+    fn le_marqueur_tolere_espaces_casse_et_region() {
+        let blocs =
+            blocs_par_langue("Préambule\n<!--lang:EN-GB-->\nBody\n<!--  lang: de  -->\nText\n");
+        let langues: Vec<&str> = blocs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(langues, ["fr", "en", "de"]);
+        assert_eq!(blocs[1].1.trim(), "Body");
+    }
+
+    #[test]
+    fn un_bloc_vide_ne_couvre_pas_sa_langue() {
+        // Un marqueur laissé sans texte (traduction oubliée) ne doit pas
+        // produire un panneau vide : la langue replie sur le français.
+        let r = [release(
+            "v0.9.141",
+            "## Corrections\n- Un correctif\n<!-- lang:en -->\n\n",
+        )];
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "fr");
+        assert!(n.fallback);
+        assert_eq!(n.entries[0]["fixes"], json!(["Un correctif"]));
+    }
+
+    #[test]
+    fn un_commentaire_html_quelconque_nest_pas_un_marqueur() {
+        // `<!-- generated by git-cliff -->` (pied de cliff.toml) et autres
+        // commentaires ne découpent rien.
+        let blocs = blocs_par_langue("## Corrections\n- x\n<!-- generated by git-cliff -->\n");
+        assert_eq!(blocs.len(), 1);
+        assert_eq!(blocs[0].0, "fr");
+    }
+
+    #[test]
+    fn les_titres_traduits_se_classent() {
+        for (titre, attendu) in [
+            ("Fehlerbehebungen", Section::Fixes),
+            ("Correcciones", Section::Fixes),
+            ("Correzioni", Section::Fixes),
+            ("Rättningar", Section::Fixes),
+            ("修复", Section::Fixes),
+            ("バグ修正", Section::Fixes),
+            ("버그 수정", Section::Fixes),
+            ("Verbesserungen", Section::Improvements),
+            ("Mejoras", Section::Improvements),
+            ("Miglioramenti", Section::Improvements),
+            ("Îmbunătățiri", Section::Improvements),
+            ("Förbättringar", Section::Improvements),
+            ("改进", Section::Improvements),
+            ("改善", Section::Improvements),
+            ("개선", Section::Improvements),
+            ("Neuheiten", Section::Features),
+            ("Novedades", Section::Features),
+            ("Novità", Section::Features),
+            ("Noutăți", Section::Features),
+            ("Nyheter", Section::Features),
+            ("新功能", Section::Features),
+            ("新機能", Section::Features),
+            ("새로운 기능", Section::Features),
+            // Inchangé : ce qui n'est pas une rubrique du panneau reste dehors.
+            ("Mise à jour", Section::Other),
+            ("Downloads", Section::Other),
+            ("Lecture", Section::Other),
+        ] {
+            assert!(
+                section_from_title(titre) == attendu,
+                "« {titre} » mal classé"
+            );
+        }
+    }
+
+    #[test]
+    fn le_repli_en_dur_dit_sa_langue() {
+        let fr = changelog_hardcoded("fr").0;
+        assert_eq!(fr["lang"], json!("fr"));
+        assert_eq!(fr["fallback"], json!(false));
+        let en = changelog_hardcoded("en").0;
+        assert_eq!(
+            en["lang"],
+            json!("fr"),
+            "le secours n'existe qu'en français"
+        );
+        assert_eq!(en["fallback"], json!(true));
     }
 }
