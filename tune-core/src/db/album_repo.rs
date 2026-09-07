@@ -1751,10 +1751,66 @@ impl AlbumRepo {
     /// so every list was empty. Cast the column to TEXT first so the
     /// expression is valid whichever type the column has; NULLIF guards
     /// against empty strings. Valid on SQLite too (soft affinities).
-    pub(crate) const ADDED_AT_JOIN: &'static str = "LEFT JOIN (SELECT t.album_id, \
+    /// ⚠️ L'expression elle-même vit dans [`Self::ADDED_AT_SOURCE`] : le tri
+    /// (cette jointure) et la LECTURE de la valeur ([`Self::added_at_by_ids`])
+    /// doivent mesurer la même chose, sans quoi la grille trierait par une
+    /// date qu'elle n'affiche pas — c'est exactement le défaut #3397.
+    pub(crate) fn added_at_join() -> String {
+        format!(
+            "LEFT JOIN ({} GROUP BY t.album_id) aa ON aa.album_id = a.id",
+            Self::ADDED_AT_SOURCE
+        )
+    }
+
+    /// Le tronc commun de la date d'ajout : tout sauf le `GROUP BY` et
+    /// l'enveloppe, pour que la jointure de tri et la lecture par page en
+    /// partagent l'expression AU CARACTÈRE PRÈS (#3397). Recopiée, elle
+    /// dériverait, et le tri « Ajout récent » cesserait de correspondre à la
+    /// date rendue.
+    pub(crate) const ADDED_AT_SOURCE: &'static str = "SELECT t.album_id, \
                 MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))) AS added_at \
-           FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
-           GROUP BY t.album_id) aa ON aa.album_id = a.id";
+           FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path";
+
+    /// La date d'ajout des albums de la PAGE, en une requête groupée (#3397).
+    ///
+    /// Même expression que [`Self::added_at_join`] ; la seule différence est
+    /// la borne : ici on ne mesure QUE les identifiants déjà retenus par le
+    /// 1er temps de #1269, jamais toute la bibliothèque. `idx_tracks_album_id`
+    /// existe sur les deux moteurs, donc le `IN` se lit par l'index.
+    ///
+    /// C'est ce qui permet de renseigner `added_at` sur TOUS les tris sans
+    /// reposer la jointure — et sans toucher au plan du 1er temps.
+    ///
+    /// Les identifiants viennent de la base et sont des entiers : ils
+    /// s'inlinent sans marqueur, comme la matérialisation de la page juste
+    /// en dessous, et par tranches pour la même raison (limite de longueur
+    /// SQL de SQLite).
+    pub(crate) fn added_at_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, f64>, TuneError> {
+        let mut par_id = std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "{} WHERE t.album_id IN ({id_list}) GROUP BY t.album_id",
+                Self::ADDED_AT_SOURCE
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                if let (Some(id), Some(at)) = (
+                    row.first().and_then(|v| v.as_i64()),
+                    row.get(1).and_then(|v| v.as_f64()),
+                ) {
+                    par_id.insert(id, at);
+                }
+            }
+        }
+        Ok(par_id)
+    }
 
     /// Jointure GROUPÉE qui donne le Dynamic Range de CHAQUE album en une
     /// passe, exposé sous l'alias `dr.dr` (#2144).
@@ -2056,7 +2112,15 @@ impl AlbumRepo {
             // are sorted" report (Bilou, #1102).
             // The timestamp itself comes from `ADDED_AT_JOIN`, computed ONCE
             // for the whole page — see the comment on that constant (#1269).
-            "added_at" | "added_date" => format!("aa.added_at {dir} NULLS LAST, a.id {dir}"),
+            // `added` est le troisième nom de la même option : c'est celui que
+            // l'issue #3397 mesure (`?sort=added&order=desc`), et celui que
+            // `CollectionSort::parse` accepte déjà pour les dossiers. Sans
+            // l'alias il retombait sur `a.id` — un tri qui *paraît* juste sur
+            // les derniers albums ajoutés (leurs ids sont les plus hauts) et
+            // faux partout ailleurs, exactement le défaut #1102.
+            "added_at" | "added_date" | "added" => {
+                format!("aa.added_at {dir} NULLS LAST, a.id {dir}")
+            }
             // Dynamic Range (#2144). `NULLS LAST` dans LES DEUX sens : un
             // album sans tag n'a pas un DR bas, il n'en a pas — le ranger avec
             // les masters saturés serait un mensonge, et le testeur qui trie
@@ -2155,7 +2219,10 @@ impl AlbumRepo {
         //
         // 1er temps : trier des lignes ÉTROITES — a.id et la clé de tri
         // seulement — et borner en SQL (LIMIT/OFFSET).
-        let added_at_sort = matches!(sort, "added_at" | "added_date");
+        // Les MÊMES clés que la branche `added_at` d'`order_clause` : la
+        // jointure qui fournit `aa.added_at` doit être posée pour chacune,
+        // sinon `ORDER BY aa.added_at` référence une table absente.
+        let added_at_sort = matches!(sort, "added_at" | "added_date" | "added");
         // #3074 — la colonne de melange n'est calculee QUE pour
         // `sort=random` : le SQL de tous les autres tris ne bouge pas d'un
         // caractere, et le plan de #1269 est preserve tel quel.
@@ -2163,11 +2230,12 @@ impl AlbumRepo {
             (sort == "random").then(|| Self::melange_aleatoire_sql("a.id", seed.unwrap_or(0)));
         let mut joins = "LEFT JOIN artists ar ON a.artist_id = ar.id".to_string();
         if added_at_sort {
-            // `aa.added_at` vient de la jointure groupée `ADDED_AT_JOIN` —
-            // une seule passe sur tracks/file_first_seen, exposée en 2e
-            // colonne pour que le client puisse rendre sa frise chronologique.
+            // `aa.added_at` vient de la jointure groupée `added_at_join()` —
+            // une seule passe sur tracks/file_first_seen. Elle n'est posée que
+            // pour le TRI : la valeur rendue au client, elle, se lit plus bas
+            // sur la page bornée, quel que soit le tri (#3397).
             joins.push(' ');
-            joins.push_str(Self::ADDED_AT_JOIN);
+            joins.push_str(&Self::added_at_join());
         }
         // La jointure DR n'est posée QUE si on trie ou filtre dessus : le
         // listage par défaut garde le SQL — et le plan — de #1269 au caractère
@@ -2176,9 +2244,11 @@ impl AlbumRepo {
             joins.push(' ');
             joins.push_str(&Self::dr_album_join(self.db.engine()));
         }
-        let id_select = if added_at_sort {
-            format!("SELECT a.id, aa.added_at FROM albums a {joins}")
-        } else if let Some(rnd) = rnd_expr.as_deref() {
+        // #3397 — le 1er temps ne rend plus QUE des identifiants, y compris
+        // en tri par date d'ajout : `aa.added_at` reste lisible par `ORDER BY`
+        // depuis la jointure sans figurer dans la liste de colonnes. La date
+        // n'a plus qu'UNE source de lecture, la même pour tous les tris.
+        let id_select = if let Some(rnd) = rnd_expr.as_deref() {
             // La colonne calculee reste dans le 1er temps de #1269 : on trie
             // des lignes ETROITES (id + valeur de melange), jamais les vingt-
             // cinq colonnes de l'album.
@@ -2199,21 +2269,29 @@ impl AlbumRepo {
             .iter()
             .filter_map(|r| r.first().and_then(|v| v.as_i64()))
             .collect();
-        let added_at_by_id: std::collections::HashMap<i64, f64> = if added_at_sort {
-            rows.iter()
-                .filter_map(|r| {
-                    Some((
-                        r.first().and_then(|v| v.as_i64())?,
-                        r.get(1).and_then(|v| v.as_f64())?,
-                    ))
-                })
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
         if ordered_ids.is_empty() {
             return Ok(Vec::new());
         }
+
+        // #3397 — la date d'ajout se lit ICI, sur la page déjà bornée, pour
+        // TOUS les tris. Avant, elle n'était extraite que du 1er temps du tri
+        // par date : `GET /library/albums?sort=title` rendait `added_at: null`
+        // sur les 50 lignes, et l'écran ne pouvait pas proposer « Ajout
+        // récent » (#3351) — la route triait par une date qu'elle taisait.
+        //
+        // Un échec ici ne doit pas vider la grille : la page reste servie,
+        // sans la date, exactement comme avant le correctif. Une base ancienne
+        // sans `file_first_seen` a déjà valu un écran noir (#1269).
+        let added_at_by_id = match self.added_at_by_ids(&ordered_ids) {
+            Ok(par_id) => par_id,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "added_at_by_ids a échoué — page servie sans date d'ajout"
+                );
+                std::collections::HashMap::new()
+            }
+        };
 
         // 2e temps : ne matérialiser QUE la page. Ids issus de la base (i64),
         // inlinés sans placeholder — par tranches, pour rester sous la
@@ -2710,9 +2788,11 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
         // Index 24: a.is_compilation (#1957). Voir [`drapeau_compilation`] :
         // même décodeur que les routes qui bâtissent leur JSON à la main.
         is_compilation: drapeau_compilation(cols.get(24)),
-        // Index 25: added_at — absent de la plupart des requêtes (None) ;
-        // le listing trié par date d'ajout le renseigne après coup, depuis
-        // sa première passe (#1269).
+        // Index 25: added_at — `select_album()` s'arrête à `is_compilation`,
+        // donc la colonne est absente ici (None). Le listage de la
+        // Bibliothèque la renseigne après coup, pour TOUS les tris, depuis
+        // `added_at_by_ids` (#3397 ; auparavant depuis la seule première
+        // passe du tri par date, #1269).
         added_at: cols.get(25).and_then(|v| v.as_f64()),
         disc_count: cols.get(7).and_then(|v| v.as_i64()).map(|n| n as i32),
         track_count: cols.get(8).and_then(|v| v.as_i64()).map(|n| n as i32),
@@ -4517,6 +4597,11 @@ mod tests {
         let canon = titles(arepo.list_sorted(100, 0, "added_at", "desc").unwrap());
         let alias = titles(arepo.list_sorted(100, 0, "added_date", "desc").unwrap());
         assert_eq!(alias, canon, "added_date must alias added_at");
+        // #3397 — `added` est le mot-clé mesuré dans l'issue. Sans alias il
+        // retombait sur `a.id` : ici les ids sont A<B<C alors que la date
+        // d'ajout fait A>B>C, donc le repli sur l'id rendrait C,B,A.
+        let alias_court = titles(arepo.list_sorted(100, 0, "added", "desc").unwrap());
+        assert_eq!(alias_court, canon, "added doit aliaser added_at (#3397)");
         assert_eq!(
             alias,
             vec!["A", "B", "C"],
@@ -4591,6 +4676,77 @@ mod tests {
         let asc = arepo.list_sorted(100, 0, "added_at", "asc").unwrap();
         assert_eq!(asc[0].title, "C");
         assert_eq!(asc[2].title, "A");
+    }
+
+    /// #3397 — la date d'ajout ne dépend PAS du tri demandé.
+    ///
+    /// Avant, `added_at` n'était extrait que du 1er temps du tri par date :
+    /// tout autre tri rendait `null`, y compris sur les albums que le tri par
+    /// date venait d'ordonner. Le témoin compare les DEUX formes album par
+    /// album : la valeur doit être la même sous chaque clé de tri.
+    #[test]
+    fn added_at_est_rendu_sous_tous_les_tris_3397() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        for (titre, chemin, mtime) in [
+            ("Amnesiac", "/a.flac", 1000.0),
+            ("Kid A", "/b.flac", 2000.0),
+            ("OK Computer", "/c.flac", 3000.0),
+        ] {
+            let id = arepo.create(&Album::new(titre.into())).unwrap();
+            let mut t = Track::new("piste".into());
+            t.album_id = Some(id);
+            t.file_path = Some(chemin.into());
+            t.file_mtime = Some(mtime);
+            trepo.create(&t).unwrap();
+        }
+
+        // La référence : ce que rend le chemin qui TRIE par date d'ajout.
+        let reference: std::collections::HashMap<i64, Option<f64>> = arepo
+            .list_sorted(100, 0, "added_at", "desc")
+            .unwrap()
+            .iter()
+            .map(|a| (a.id.unwrap(), a.added_at))
+            .collect();
+        assert_eq!(reference.len(), 3, "trois albums attendus : {reference:?}");
+        assert!(
+            reference.values().all(Option::is_some),
+            "le chemin de référence doit dater les trois albums : {reference:?}"
+        );
+
+        for tri in ["title", "artist", "year", "release_date", "id", "random"] {
+            let page = arepo.list_sorted(100, 0, tri, "asc").unwrap();
+            assert_eq!(page.len(), 3, "tri {tri} : la page doit rester servie");
+            for album in &page {
+                let id = album.id.unwrap();
+                assert_eq!(
+                    album.added_at, reference[&id],
+                    "tri {tri}, album {id} : added_at doit valoir ce que rend le tri par date"
+                );
+            }
+        }
+    }
+
+    /// #3397 — le tri et la lecture mesurent la MÊME date.
+    ///
+    /// La preuve est structurelle : les deux formes sont bâties sur
+    /// `ADDED_AT_SOURCE`. Recopier l'expression ferait diverger le tri de la
+    /// valeur affichée sans qu'aucun test de contenu ne s'en aperçoive.
+    #[test]
+    fn la_jointure_de_tri_et_la_lecture_partagent_l_expression_3397() {
+        assert!(
+            AlbumRepo::added_at_join().contains(AlbumRepo::ADDED_AT_SOURCE),
+            "la jointure de tri doit être bâtie sur ADDED_AT_SOURCE"
+        );
+        assert!(
+            AlbumRepo::ADDED_AT_SOURCE.contains("file_first_seen")
+                && AlbumRepo::ADDED_AT_SOURCE.contains("CAST(t.file_mtime AS TEXT)"),
+            "l'expression partagée garde la source persistante ET le repli mtime"
+        );
     }
 
     #[test]

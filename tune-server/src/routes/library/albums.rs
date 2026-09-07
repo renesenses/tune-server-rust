@@ -2075,3 +2075,147 @@ mod tests_regroupement;
 
 #[cfg(test)]
 mod tests_contenu;
+
+/// #3397 — le témoin qui empêche les deux chemins de `GET /library/albums` de
+/// diverger.
+///
+/// La route bâtit sa page en deux temps depuis #1269 : un tri sur des lignes
+/// étroites, puis la matérialisation de la page. `added_at` n'était lu que
+/// dans le PREMIER temps, et seulement quand le tri portait sur lui : dès
+/// qu'un autre tri était demandé, les cinquante lignes sortaient avec
+/// `added_at: null` — y compris sous `sort=added`, qui triait donc par une
+/// date qu'il taisait, ce qui bloquait « trier par date d'ajout » (#3351).
+///
+/// Le témoin ne vérifie pas `added_at` seul : il compare les OBJETS ENTIERS
+/// rendus par le chemin trié et par le chemin non trié pour le même album.
+/// Tout futur champ qui n'existerait que d'un côté le fera tomber.
+#[cfg(test)]
+mod tests_tri_added_at {
+    use axum::body::Body;
+    use axum::http::Request;
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+
+    type Etat = crate::state::AppState;
+
+    fn serveur() -> (axum::Router, Etat) {
+        let state = Etat::new(":memory:", 0, Default::default()).unwrap();
+        // `albums.artist_id` et `tracks.artist_id` référencent `artists(id)` :
+        // sans cet artiste, l'insertion tombe sur « FOREIGN KEY constraint
+        // failed » et le témoin serait vert contre une base vide.
+        state
+            .backend
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Radiohead')",
+                &[],
+            )
+            .unwrap();
+        let routeur = crate::routes::router(state.clone());
+        (routeur, state)
+    }
+
+    fn album_avec_piste(state: &Etat, titre: &str, chemin: &str, mtime: f64) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO albums (title, artist_id, source, track_count, year) \
+                 VALUES (?, 1, 'local', 1, 2001)",
+                &[&titre as &dyn ToSqlValue],
+            )
+            .unwrap();
+        let album_id = state.backend.last_insert_rowid();
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (title, album_id, artist_id, track_number, file_path, \
+                 file_mtime, duration_ms) VALUES (?, ?, 1, 1, ?, ?, 30000)",
+                &[&titre as &dyn ToSqlValue, &album_id, &chemin, &mtime],
+            )
+            .unwrap();
+    }
+
+    /// Les lignes de la réponse, indexées par identifiant d'album.
+    async fn lignes_par_id(app: &axum::Router, requete: &str) -> HashMap<i64, Value> {
+        let reponse = app
+            .clone()
+            .oneshot(Request::get(requete).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            reponse.status().is_success(),
+            "{requete} : {}",
+            reponse.status()
+        );
+        let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&corps).unwrap();
+        json["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|a| (a["id"].as_i64().expect("id"), a.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn le_chemin_trie_rend_le_meme_objet_que_le_chemin_non_trie_3397() {
+        let (app, state) = serveur();
+        album_avec_piste(&state, "Amnesiac", "/a.flac", 1_000.0);
+        album_avec_piste(&state, "Kid A", "/b.flac", 2_000.0);
+        album_avec_piste(&state, "OK Computer", "/c.flac", 3_000.0);
+
+        let sans_tri = lignes_par_id(&app, "/api/v1/library/albums?limit=50&offset=0").await;
+        assert_eq!(sans_tri.len(), 3, "trois albums attendus : {sans_tri:?}");
+        for (id, ligne) in &sans_tri {
+            assert!(
+                ligne["added_at"].as_f64().is_some(),
+                "album {id} : le chemin non trié date déjà l'album — {ligne}"
+            );
+        }
+
+        for tri in ["title", "artist", "year", "added", "added_date", "random"] {
+            let trie = lignes_par_id(
+                &app,
+                &format!("/api/v1/library/albums?limit=50&offset=0&sort={tri}&order=asc"),
+            )
+            .await;
+            assert_eq!(
+                trie.len(),
+                sans_tri.len(),
+                "tri {tri} : la page doit rester servie"
+            );
+            for (id, ligne) in &trie {
+                assert_eq!(
+                    ligne,
+                    sans_tri.get(id).expect("même album des deux côtés"),
+                    "tri {tri}, album {id} : les deux chemins doivent rendre le MÊME objet"
+                );
+            }
+        }
+    }
+
+    /// `sort=added` est le cas qui a fait ouvrir l'issue : la route triait par
+    /// la date d'ajout sans la rendre. Contre-épreuve directe.
+    #[tokio::test]
+    async fn sort_added_rend_la_date_sur_laquelle_il_vient_de_trier_3397() {
+        let (app, state) = serveur();
+        album_avec_piste(&state, "Amnesiac", "/a.flac", 1_000.0);
+        album_avec_piste(&state, "Kid A", "/b.flac", 2_000.0);
+
+        let lignes = lignes_par_id(
+            &app,
+            "/api/v1/library/albums?limit=50&offset=0&sort=added&order=desc",
+        )
+        .await;
+        assert_eq!(lignes.len(), 2);
+        for (id, ligne) in &lignes {
+            assert!(
+                ligne["added_at"].as_f64().is_some(),
+                "album {id} : sort=added doit rendre added_at — {ligne}"
+            );
+        }
+    }
+}
