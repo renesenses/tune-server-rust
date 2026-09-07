@@ -730,6 +730,18 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+    /// Dernier repli de PÉRIPHÉRIQUE local annoncé par zone, texte compris
+    /// (#2269).
+    ///
+    /// Une zone dont le périphérique est introuvable joue sur la sortie
+    /// système à CHAQUE piste : sans cette mémoire, l'avance gapless
+    /// répéterait la même phrase indéfiniment et l'information deviendrait du
+    /// bruit. L'entrée est effacée dès que le périphérique demandé est de
+    /// nouveau celui qui joue, pour qu'un repli ultérieur soit dit à son tour.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    #[cfg(feature = "local-audio")]
+    replis_de_peripherique_dits: std::sync::Mutex<HashMap<i64, String>>,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -985,6 +997,8 @@ impl PlaybackOrchestrator {
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(feature = "local-audio")]
+            replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1014,6 +1028,9 @@ impl PlaybackOrchestrator {
 mod commun;
 
 mod transport;
+// #2269 — le repli silencieux de la sortie locale, rendu audible.
+#[cfg(feature = "local-audio")]
+mod repli_de_peripherique;
 
 mod resolve_stream;
 
