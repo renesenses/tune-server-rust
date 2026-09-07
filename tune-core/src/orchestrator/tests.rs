@@ -706,12 +706,12 @@ use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::streaming::registry::ServiceRegistry;
 
 use super::{
-    PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, cible_wav_pour_traitement,
-    is_network_output_type, is_pull_dsp_output_type, is_push_uri_output_type,
-    message_session_perdue, passthrough_didl_duration_ms, pull_output_needs_dsp_transcode,
-    replay_needs_output_seek, reprise_de_session, reprise_toujours_la_notre,
-    requete_de_retablissement, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
-    streaming_pretranscode_format, use_file_transcode_for,
+    PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, cible_wav_pour_ape_reseau,
+    cible_wav_pour_traitement, is_network_output_type, is_pull_dsp_output_type,
+    is_push_uri_output_type, message_session_perdue, passthrough_didl_duration_ms,
+    pull_output_needs_dsp_transcode, replay_needs_output_seek, reprise_de_session,
+    reprise_toujours_la_notre, requete_de_retablissement, spawn_streaming_dsp_relay,
+    streaming_needs_pretranscode, streaming_pretranscode_format, use_file_transcode_for,
 };
 
 #[test]
@@ -972,6 +972,103 @@ async fn une_zone_dlna_avec_egaliseur_part_en_wav_progressif_sur_opt_in() {
     let sans_sink = orch.format_de_sortie_pour_test(&req).await.unwrap();
     assert_eq!(sans_sink.out_mime, "audio/flac");
     assert!(sans_sink.use_file_transcode);
+}
+
+/// #3311 — la cible WAV d'un `.ape` sur une zone RÉSEAU exige les TROIS
+/// conditions. En retirer une seule rend au FLAC, donc au fichier.
+#[test]
+fn la_cible_wav_pour_ape_reseau_exige_les_trois_conditions() {
+    assert!(cible_wav_pour_ape_reseau(true, true, true));
+    // Source non `.ape` : rien ne bouge, le FLAC reste la cible de tout le
+    // reste du catalogue.
+    assert!(!cible_wav_pour_ape_reseau(false, true, true));
+    // Sortie locale / OAAT / navigateur : elles sont DÉJÀ en WAV par leurs
+    // propres branches, et prennent déjà le décodeur incrémental.
+    assert!(!cible_wav_pour_ape_reseau(true, false, true));
+    // Sonde LPCM négative ou inconcluante : le format servi ne change pas.
+    assert!(!cible_wav_pour_ape_reseau(true, true, false));
+}
+
+/// #3311, de bout en bout sur la DÉCISION — le cœur du ticket.
+///
+/// Le décodeur `.ape` incrémental annoncé livré en v0.9.131 (#2505, PR #3177)
+/// EST bien sur la ligne : `0cb2aed0` est un ancêtre de `v0.9.131` comme de
+/// `main`, et `tune-core/src/audio/decode.rs` n'a pas rebougé depuis. Mais il
+/// n'est branché que sur `decode_ape_streaming`, et une zone RÉSEAU n'y
+/// arrivait jamais : `Ape.needs_transcode_for_dlna()` est vrai,
+/// `Ape.dlna_transcode_target()` rend `Flac`, donc `use_file_transcode_for`
+/// renvoyait au fichier — `decode_to_pcm` → `decode_ape_to_pcm`, la piste
+/// entière en mémoire, 2,37 Gio de pic mesurés sur une image de CD d'une
+/// heure, et un REFUS net au-delà de 2 Gio de PCM déclaré.
+///
+/// Sans le correctif, la première assertion tombe : `out_mime = "audio/flac"`
+/// et `use_file_transcode = true`.
+///
+/// Montage à la main comme pour #3357 : la sortie est ABSENTE du registre, donc
+/// présumée capable du LPCM (même règle que `dlna_supports_mime`). La seconde
+/// moitié du test enregistre une sortie qui n'est PAS un `DlnaOutput` : elle
+/// n'a aucun Sink à lire, la sonde répond non, et tout retombe sur le FLAC
+/// servi par le fichier — la garde anti-régression de ce correctif.
+#[tokio::test]
+async fn un_ape_sur_une_zone_reseau_part_en_wav_progressif() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Salon", Some("dlna"), Some("uuid:salon-3311"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ape/sine_16s_c3000.ape"
+        ),
+        "ape",
+    );
+    let req = requete_locale_3234(zone_id, 1);
+
+    let f = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(
+        f.out_mime, "audio/wav",
+        "un .ape vers un renderer LPCM part en WAV, pas en FLAC ré-encodé"
+    );
+    assert_eq!(f.out_ext, "wav");
+    assert_eq!(f.out_bd, 16, "un .ape 16 bits part en 16 bits, pas gonflé");
+    assert!(
+        !f.use_file_transcode,
+        "la cible WAV part en session progressive — le SEUL bras qui décode \
+         le Monkey's Audio au fil de l'eau (#2505)"
+    );
+
+    // L'AUTRE issue du même défaut : un renderer sans `audio/flac` (ici le
+    // forçage de zone `dlna_lpcm`) recevait DÉJÀ du WAV — et `use_file_transcode_for`
+    // le renvoyait quand même au fichier, parce que son exception ne connaissait
+    // que le DSD. C'est ce que `wav_diffusable` corrige : cette moitié-là tombe
+    // sans le correctif alors que la précédente passe.
+    ZoneRepo::with_backend(orch.db.clone())
+        .update_dlna_lpcm(zone_id, true)
+        .unwrap();
+    let force_lpcm = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(force_lpcm.out_mime, "audio/wav");
+    assert!(
+        !force_lpcm.use_file_transcode,
+        "un WAV imposé par `dlna_needs_wav` diffuse aussi : le bras fichier \
+         n'a aucun décodeur `.ape` incrémental"
+    );
+    ZoneRepo::with_backend(orch.db.clone())
+        .update_dlna_lpcm(zone_id, false)
+        .unwrap();
+
+    // Sortie enregistrée qui n'est PAS un renderer DLNA : pas de Sink, donc
+    // pas de LPCM annoncé. Le format servi ne change pas, et le comportement
+    // d'avant #3311 est conservé à l'octet près.
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("uuid:salon-3311", "Salon").with_type("dlna"),
+    ));
+    let sans_sonde = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(sans_sonde.out_mime, "audio/flac");
+    assert!(
+        sans_sonde.use_file_transcode,
+        "sans LPCM annoncé, le FLAC par le fichier reste la voie — inchangé"
+    );
 }
 
 /// #2863 — le bras streaming HTTPS servait les octets du CDN VERBATIM dès
