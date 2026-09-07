@@ -211,6 +211,25 @@ pub(super) fn cible_wav_pour_traitement(
     dsp_active && is_network && !src_est_dsd && opt_in && renderer_accepte_lpcm
 }
 
+/// Le relais DSP au fil de l'eau doit-il être inséré sur le bras progressif ?
+///
+/// LAT-F1 (phase 0) a branché égaliseur, convolveur et ReplayGain sur ce bras
+/// sans regarder QUI le consomme. Or une sortie LOCALE y passe toujours —
+/// `local_needs_wav` transcode en WAV tout format source connu, parce que le
+/// parseur de `LocalOutput` ne lit que du PCM simple — et `LocalOutput`
+/// applique DÉJÀ ces trois étages dans sa boucle de lecture (`set_eq`,
+/// `set_replaygain_factor`, son propre convolveur, réinstallés à chaque
+/// lecture par le chemin de `transport.rs`).
+///
+/// Les deux chemins se cumulaient donc : courbe d'égaliseur **doublée en dB**,
+/// facteur ReplayGain **au carré**, réponse impulsionnelle convoluée deux fois.
+///
+/// Le relais n'a de sens que pour les sorties qui ne traitent RIEN
+/// elles-mêmes : réseau, OAAT, navigateur. Une sortie `local:` s'en passe.
+pub(super) fn relais_dsp_progressif(dsp_actif: bool, sortie_est_locale: bool) -> bool {
+    dsp_actif && !sortie_est_locale
+}
+
 /// Le bras streaming HTTPS doit-il PRÉ-TRANSCODER au lieu de servir les octets
 /// du CDN verbatim ?
 ///

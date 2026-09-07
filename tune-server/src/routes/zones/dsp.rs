@@ -19,11 +19,8 @@ pub(super) async fn get_zone_dsp(
     // …et ce que ce réglage VAUT sur CETTE zone (#2742). Additif : l'objet
     // `crossfeed` ci-dessus est publié tel quel, un client qui ignore ce
     // champ voit le même écran qu'avant.
-    let crossfeed_status = crossfeed_status_de_zone(
-        &state.backend,
-        id,
-        crossfeed["enabled"].as_bool().unwrap_or(false),
-    );
+    let crossfeed_status =
+        crossfeed_status_de_zone(&state, id, crossfeed["enabled"].as_bool().unwrap_or(false)).await;
 
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
@@ -198,24 +195,57 @@ pub(super) fn read_crossfeed_config(
 /// persistait, et le relisait sans un mot. Tades : « Crossfeed n'a aucune
 /// action ».
 ///
+/// ⚠️ **Ce commentaire décrit l'état d'AVANT LAT-F1** et n'est gardé que pour
+/// la trace du défaut d'origine. Depuis que le bras progressif porte le
+/// crossfeed (`StreamingDsp`), une zone RÉSEAU peut l'entendre — sous deux
+/// conditions que cette fonction va chercher : l'opt-in `dsp_progressif_reseau`
+/// et le LPCM annoncé par le renderer.
+///
 /// La règle elle-même vit dans `tune_core::audio::crossfeed` et ne lit aucune
-/// base : ici on ne fait que lui passer les deux faits qu'elle attend — la
-/// sortie de la zone et son mode PURE. Une seule règle, donc pas de dérive
-/// possible entre cet écran et le son.
-pub(super) fn crossfeed_status_de_zone(
-    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+/// base : ici on ne fait que lui passer les faits qu'elle attend. Une seule
+/// règle, donc pas de dérive possible entre cet écran et le son.
+///
+/// La sonde LPCM est interrogée à **16 bits**. C'est le plancher du bras
+/// progressif : un renderer qui refuse déjà le LPCM 16 n'a aucun chemin, quelle
+/// que soit la piste. Un renderer qui l'accepte en 16 et le refuse en 24 verra
+/// son crossfeed s'appliquer sur les pistes 16 bits seulement — une vérité qui
+/// dépend de la PISTE, que cette route ne connaît pas et ne prétend donc pas
+/// dire. Le champ `detail` reste vrai dans les deux cas.
+pub(super) async fn crossfeed_status_de_zone(
+    state: &AppState,
     zone_id: i64,
     requested: bool,
 ) -> tune_core::audio::crossfeed::CrossfeedStatus {
-    let device = ZoneRepo::with_backend(backend.clone())
+    let backend = &state.backend;
+    let zone = ZoneRepo::with_backend(backend.clone())
         .get(zone_id)
         .ok()
+        .flatten();
+    let device = zone.as_ref().and_then(|z| z.output_device_id.clone());
+    let est_reseau = tune_core::orchestrator::is_network_output_type(
+        zone.as_ref().and_then(|z| z.output_type.as_deref()),
+    );
+    let progressif_arme = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+        .get("dsp_progressif_reseau")
+        .ok()
         .flatten()
-        .and_then(|z| z.output_device_id);
+        .as_deref()
+        == Some("true");
+    // La sonde ne sert que si les deux conditions d'avant sont réunies : ne
+    // pas réveiller le réseau pour une zone locale, ni pour un opt-in fermé.
+    let renderer_accepte_lpcm = match (&device, est_reseau && progressif_arme) {
+        (Some(did), true) if !did.is_empty() => {
+            state.orchestrator.dlna_accepte_lpcm(did, false).await
+        }
+        _ => false,
+    };
     tune_core::audio::crossfeed::crossfeed_status(
         requested,
         tune_core::audio::crossfeed::crossfeed_runs_on_output(device.as_deref()),
+        est_reseau,
         tune_core::audio::audiophile::zone_enabled(backend, zone_id),
+        progressif_arme,
+        renderer_accepte_lpcm,
     )
 }
 
@@ -299,7 +329,7 @@ pub(super) async fn set_zone_dsp(
         // serveur le dit au lieu d'enregistrer en silence. Journalisé au
         // moment du CLIC, pas à la lecture : c'est ici que l'utilisateur
         // croit avoir obtenu quelque chose.
-        let statut = crossfeed_status_de_zone(&state.backend, id, enabled);
+        let statut = crossfeed_status_de_zone(&state, id, enabled).await;
         if statut.unavailable {
             warn!(
                 zone_id = id,

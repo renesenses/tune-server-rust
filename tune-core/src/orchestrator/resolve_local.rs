@@ -812,13 +812,21 @@ impl PlaybackOrchestrator {
                 .as_deref()
                 == Some("true");
             let src_est_dsd = source_format == Some(AudioFormat::Dsd);
-            let candidat = cible_wav_pour_traitement(
-                eq_forces_transcode,
-                is_network_output,
-                src_est_dsd,
-                opt_in,
-                true,
-            );
+            // #2742 — le crossfeed compte comme un traitement ICI, et ICI
+            // SEULEMENT. Il reste hors de `eq_forces_transcode` à dessein :
+            // ce drapeau-là renvoie au FICHIER quand l'opt-in est désarmé, et
+            // une zone réseau qui a coché le crossfeed (aujourd'hui sans le
+            // moindre effet) se retrouverait à payer 46 à 62 s de silence
+            // avant la première note pour un réglage qu'elle croyait inerte.
+            // Ne le compter que dans la cible progressive garantit qu'à froid
+            // rien ne change, et qu'armé, le crossfeed a enfin un chemin.
+            // `is_network_output &&` d'abord : sans lui, une zone LOCALE
+            // paierait une lecture de réglages par piste pour un drapeau que
+            // `cible_wav_pour_traitement` va de toute façon annuler.
+            let traitement = eq_forces_transcode
+                || (is_network_output && self.zone_has_active_crossfeed(req.zone_id));
+            let candidat =
+                cible_wav_pour_traitement(traitement, is_network_output, src_est_dsd, opt_in, true);
             let renderer_accepte_lpcm = if candidat {
                 let did = req
                     .output_device_id
@@ -830,7 +838,7 @@ impl PlaybackOrchestrator {
                 false
             };
             cible_wav_pour_traitement(
-                eq_forces_transcode,
+                traitement,
                 is_network_output,
                 src_est_dsd,
                 opt_in,
@@ -845,6 +853,11 @@ impl PlaybackOrchestrator {
             || needs_downsample
             || dlna_needs_wav
             || eq_forces_transcode
+            // Une zone qui n'a QUE du crossfeed n'allume pas
+            // `eq_forces_transcode` (voir plus haut) : sans cette ligne, sa
+            // cible progressive serait décidée puis jamais empruntée, et le
+            // crossfeed resterait muet malgré l'opt-in.
+            || dsp_progressif_wav
             // 16-bit cap on a FLAC-direct renderer: force a transcode so the
             // hi-res FLAC is re-encoded at 16-bit instead of served direct
             // (silent on the Ruark R3, #1137). ALAC already transcodes because
@@ -1082,6 +1095,45 @@ impl PlaybackOrchestrator {
             }
             DecisionOuResolu::Resolu(_) => Err("résolu sans transcodage".into()),
         }
+    }
+
+    /// Ce que `transcoder_en_session` déciderait du relais DSP, sans rien
+    /// décoder : `(traitement actif, relais armé)`.
+    ///
+    /// Les deux valeurs comptent séparément. Une sortie locale avec égaliseur
+    /// a bien un traitement ACTIF — c'est ce qui rendait le cumul possible —
+    /// et ne doit pourtant pas armer le relais, puisqu'elle applique ce même
+    /// traitement elle-même. Un test qui ne regarderait que la seconde ne
+    /// distinguerait pas « la garde tient » de « la zone n'a pas d'EQ ».
+    #[cfg(test)]
+    pub(super) async fn relais_dsp_pour_test(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<(bool, bool), String> {
+        let track_id = req.track_id.ok_or("no track_id for local playback")?;
+        let track = TrackRepo::with_backend(self.db.clone())
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
+        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
+        let fmt = track.format.clone().unwrap_or_else(|| "flac".into());
+        let source_format = AudioFormat::from_extension(&fmt);
+        let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+        let decision = match self
+            .decider_la_lecture_locale(req, &track, file_path, fmt, source_format, is_dsd_source)
+            .await?
+        {
+            DecisionOuResolu::Decision(d) => d,
+            DecisionOuResolu::Resolu(_) => return Err("résolu sans transcodage".into()),
+        };
+        let format = self.decider_le_format_de_sortie(req, &decision);
+        let dsp =
+            self.load_streaming_dsp(req.zone_id, req.track_id, format.out_sr, decision.channels);
+        let actif = dsp.is_active();
+        Ok((
+            actif,
+            relais_dsp_progressif(actif, decision.is_local_output),
+        ))
     }
 
     /// Premier temps du transcodage : le format de sortie. Fréquence plafonnée
@@ -1857,6 +1909,7 @@ impl PlaybackOrchestrator {
     ) -> Result<FluxLocal, String> {
         let DecisionLocale {
             channels,
+            is_local_output,
             ref file_path,
             ..
         } = *decision;
@@ -1888,8 +1941,14 @@ impl PlaybackOrchestrator {
             // façon. Sans traitement actif, le canal reste celui d'avant, à
             // l'octet près. Le premier chunk du décodeur est l'en-tête WAV :
             // il est épargné (`skip_header`), comme sur les autres bras.
+            //
+            // ⚠️ Sauf sur une sortie LOCALE : elle passe TOUJOURS par ici
+            // (`local_needs_wav`) et applique déjà ces mêmes étages dans sa
+            // propre boucle de lecture. Les cumuler doublait la courbe de
+            // l'égaliseur en dB et élevait le facteur ReplayGain au carré —
+            // voir `relais_dsp_progressif`.
             let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
-            let tx = if dsp.is_active() {
+            let tx = if relais_dsp_progressif(dsp.is_active(), is_local_output) {
                 tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
                 spawn_streaming_dsp_relay(dsp, out_bd, true, tx)
             } else {
