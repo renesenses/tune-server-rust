@@ -552,3 +552,68 @@ fn garde_de_site_3256() {
          ne serait couvert par aucune épreuve."
     );
 }
+
+/// La garde d'EXÉCUTION : un témoin ne vaut que s'il tourne contre une vraie
+/// base.
+///
+/// [`garde_de_site_3256`] relit le SOURCE ; celle-ci relit le WORKFLOW.
+///
+/// Les quatre épreuves du module `postgres` ci-dessus prennent leur chemin
+/// « saut annoncé » dès que `TUNE_TEST_PG_URL` est absente. Or elle l'était à
+/// CHAQUE exécution de la CI : la seule étape de `test-postgres.yml` qui
+/// compilait et lançait ce fichier — « Tests tune-core et tune-server avec
+/// PostgreSQL » — ne pose pas la variable, et aucune autre ne nommait cette
+/// cible.
+///
+/// Ici la contre-épreuve SQLite ne rattrape RIEN : sur SQLite la clause
+/// ` RETURNING id` n'est jamais ajoutée, donc [`sqlite_3256_contre_epreuve`]
+/// est verte avant comme après le correctif. Sans une vraie base PostgreSQL,
+/// il ne restait que [`garde_de_site_3256`], qui relit du texte et ne prouve
+/// aucun comportement.
+///
+/// Le découpage par `- name:` isole l'étape : une variable posée sur l'étape
+/// voisine ne compte pas. `include_str!` plutôt qu'une lecture au chemin
+/// courant : le fichier manquant devient une erreur de COMPILATION, pas un
+/// test qui se saute.
+#[test]
+fn garde_d_execution_3256() {
+    const WORKFLOW: &str = include_str!("../../.github/workflows/test-postgres.yml");
+    const CIBLE: &str = "--test pg_returning_id_hors_table_a_id_3256";
+    let etape = WORKFLOW
+        .split("- name:")
+        .find(|bloc| bloc.contains(CIBLE))
+        .unwrap_or_else(|| {
+            panic!(
+                "#3256 — aucune étape de `test-postgres.yml` ne lance \
+                 `{CIBLE}`. Sans elle, les épreuves PostgreSQL de ce fichier \
+                 se sautent en silence et la CI rend un vert contre rien."
+            )
+        });
+    assert!(
+        etape.contains("TUNE_TEST_PG_URL: postgresql://"),
+        "#3256 — l'étape qui lance `{CIBLE}` ne pose pas `TUNE_TEST_PG_URL` : \
+         les quatre épreuves y prendraient leur chemin « saut annoncé »."
+    );
+    // L'étape doit venir APRÈS l'application des migrations : `task_runs`
+    // naît de `040_task_runs.sql`, et sans elle l'épreuve échouerait sur une
+    // table absente au lieu de prouver quoi que ce soit.
+    let migrations = WORKFLOW
+        .find("- name: Apply PG migrations")
+        .expect("#3256 — l'étape « Apply PG migrations » a disparu");
+    let notre_etape = WORKFLOW
+        .find(CIBLE)
+        .expect("#3256 — cible introuvable dans le workflow");
+    assert!(
+        migrations < notre_etape,
+        "#3256 — l'épreuve doit être lancée APRÈS « Apply PG migrations » : \
+         `task_runs` vient de `040_task_runs.sql`."
+    );
+    // La cible doit AUSSI être déclarée : `tune-core` porte `autotests =
+    // false`, donc un fichier non inscrit ne se compile jamais.
+    const MANIFESTE: &str = include_str!("../Cargo.toml");
+    assert!(
+        MANIFESTE.contains("name = \"pg_returning_id_hors_table_a_id_3256\""),
+        "#3256 — cible de test non déclarée dans `tune-core/Cargo.toml` : avec \
+         `autotests = false`, ce fichier ne serait JAMAIS compilé."
+    );
+}
