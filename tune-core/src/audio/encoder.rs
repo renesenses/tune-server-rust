@@ -39,6 +39,27 @@ struct FlacStreamState {
     pcm_leftover: Vec<u8>,
 }
 
+/// Le format que l'encodeur écrit RÉELLEMENT pour une cible demandée.
+///
+/// [`AudioEncoder::start_sync`] n'a que deux bras qui produisent ce qu'on lui
+/// demande — `wav` et `flac`. Tout le reste (`mp3`, `ogg`, `aiff`, et le bras
+/// `other`) est **remplacé par du FLAC**, avec un `warn!` pour seule trace, et
+/// `self.format` garde la valeur demandée : l'appelant qui dérive son extension
+/// et son type MIME de la cible sert donc des octets FLAC sous une autre
+/// étiquette, et le renderer reste muet (#3357).
+///
+/// Cette fonction ne CHANGE rien à ce comportement : elle le rend LISIBLE, pour
+/// que `eq_format_apres_traitement` puisse dire si l'étiquette servie
+/// correspond à la charge utile. Sa contre-épreuve
+/// (`format_effectif_suit_les_bras_de_start_sync`) la confronte aux bras réels
+/// de `start_sync` plutôt qu'à une table recopiée.
+pub fn format_effectif(demande: &str) -> &'static str {
+    match demande {
+        "wav" => "wav",
+        _ => "flac",
+    }
+}
+
 impl AudioEncoder {
     pub fn new(format: &str, sample_rate: u32, bit_depth: u32, channels: u32) -> Self {
         Self {
@@ -1644,6 +1665,52 @@ mod tests {
         assert_eq!(
             flac, flac2,
             "unaligned writes should produce same output as single write"
+        );
+    }
+
+    /// #3479 / #3357 — `format_effectif` doit suivre les BRAS RÉELS de
+    /// `start_sync`, pas une table recopiée à côté.
+    ///
+    /// La contre-épreuve démarre un encodeur pour chaque cible et regarde
+    /// laquelle des deux machines a été armée : le tampon PCM (WAV) ou l'état
+    /// FLAC. Si un bras natif était ajouté demain — un vrai encodeur AIFF, par
+    /// exemple — sans que `format_effectif` suive, ce test tomberait, et avec
+    /// lui le champ `etiquette_conforme` cesserait de mentir en silence.
+    #[test]
+    fn format_effectif_suit_les_bras_de_start_sync() {
+        for cible in ["wav", "flac", "mp3", "ogg", "aiff", "n_importe_quoi"] {
+            let mut enc = AudioEncoder::new(cible, 44_100, 16, 2);
+            enc.start_sync().unwrap();
+            let arme = if enc.flac_state.is_some() {
+                "flac"
+            } else if enc.pcm_buffer.is_some() {
+                "wav"
+            } else {
+                panic!("{cible} : start_sync n'a armé aucun encodeur");
+            };
+            assert_eq!(
+                format_effectif(cible),
+                arme,
+                "cible « {cible} » : start_sync arme {arme}, format_effectif annonce {}",
+                format_effectif(cible)
+            );
+        }
+    }
+
+    /// Et la substitution, prise sur le fait : une cible AIFF rend des octets
+    /// qui commencent par `fLaC`. C'est ce que le renderer de Cyrille recevait
+    /// sous l'étiquette `audio/aiff`.
+    #[tokio::test]
+    async fn une_cible_aiff_produit_bel_et_bien_du_flac() {
+        let mut enc = AudioEncoder::new("aiff", 44_100, 16, 2);
+        enc.start().await.unwrap();
+        enc.write(&vec![0_u8; 4096 * 2 * 2]).await.unwrap();
+        let octets = enc.finish().await.unwrap();
+        assert_eq!(
+            &octets[0..4],
+            b"fLaC",
+            "l'encodeur écrit du FLAC pour une cible AIFF — l'étiquette servie \
+             doit donc venir de format_effectif, pas de la cible demandée"
         );
     }
 }

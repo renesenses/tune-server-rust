@@ -1400,6 +1400,53 @@ impl PlaybackOrchestrator {
             duration_ms: Some(track_duration_ms as u64),
             ..Default::default()
         };
+        // ── #3479 : le pendant RÉSEAU de `eq_change_journal` ────────────────
+        //
+        // Sur une sortie locale, l'égaliseur ne change pas le format : c'est
+        // `eq_change_journal` (`dsp.rs`) qui le dit, et qui chiffre le niveau
+        // retiré. Ici, le format change POUR DE BON — c'est même le seul motif
+        // du transcodage — et deux choses peuvent alors produire un silence
+        // complet plutôt qu'un son altéré :
+        //
+        // 1. **l'étiquette ment sur la charge utile.** `AudioEncoder::start_sync`
+        //    substitue silencieusement du FLAC à toute cible qu'il ne sait pas
+        //    écrire (`aiff`, `mp3`, `ogg`…), tandis que `out_mime` et `out_ext`
+        //    viennent de la cible DEMANDÉE. Le renderer reçoit des octets FLAC
+        //    étiquetés `audio/aiff` et reste muet (#3357, mesuré chez Cyrille :
+        //    60 207 920 octets servis pour 72 765 000 attendus en AIFF) ;
+        // 2. **le fichier entier passe avant le premier octet**
+        //    (`fichier_entier`) — 46 à 62 s de silence apparent (#3357, annexe).
+        //
+        // Aucune trace ne reliait la cible demandée à ce que l'encodeur écrit
+        // vraiment : `transcode_required` nomme source et cible, jamais le MIME
+        // servi ni l'encodeur effectif. `etiquette_conforme` est ce lien.
+        if eq_forces_transcode {
+            let encodeur_effectif = crate::audio::encoder::format_effectif(&target_format_str);
+            info!(
+                zone_id = req.zone_id,
+                famille = if is_browser_output {
+                    "navigateur"
+                } else if is_network_output {
+                    "reseau"
+                } else {
+                    "pull"
+                },
+                format_avant = ?src_fmt,
+                taux_avant = sample_rate,
+                profondeur_avant = bit_depth,
+                canaux = channels,
+                format_apres = %target_format_str,
+                taux_apres = out_sr,
+                profondeur_apres = out_bd,
+                mime_servi = %out_mime,
+                extension_servie = %out_ext,
+                encodeur_effectif,
+                etiquette_conforme = encodeur_effectif == target_format_str,
+                fichier_entier = use_file_transcode,
+                "eq_format_apres_traitement"
+            );
+        }
+
         FormatDeSortie {
             out_sr,
             out_bd,
