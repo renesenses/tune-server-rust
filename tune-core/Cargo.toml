@@ -304,3 +304,11 @@ path = "tests/temoin_resolution_streaming.rs"
 [[test]]
 name = "temoin_resolution_locale"
 path = "tests/temoin_resolution_locale.rs"
+
+# #3419 — la reprise dans Tune des favoris posés chez le service. Même raison
+# que les cibles ci-dessus : `autotests = false` en tête de ce fichier, sans
+# cette déclaration le témoin ne serait jamais compilé et la porte rendrait un
+# vert contre rien.
+[[test]]
+name = "reprise_favoris_streaming"
+path = "tests/reprise_favoris_streaming.rs"

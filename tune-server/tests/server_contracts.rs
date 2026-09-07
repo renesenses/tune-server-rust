@@ -109,6 +109,13 @@ mod playlists_cloisonnement_par_profil;
 mod playlists_ecritures_partielles;
 #[path = "podcasts_radiofrance_cle.rs"]
 mod podcasts_radiofrance_cle;
+// #3266 — la portee des lignes `cargo test` de la CI, gardee par le workflow
+// lui-meme (`include_str!`). Enregistre ici parce que `tune-server` porte
+// `autotests = false` : un fichier pose dans tests/ et jamais declare ne se
+// compile pas, et un garde jamais compile ne garde rien — c'est le defaut meme
+// que ce fichier existe pour empecher.
+#[path = "portee_ligne_de_test_3266.rs"]
+mod portee_ligne_de_test_3266;
 #[path = "portee_repertoire_jokers.rs"]
 mod portee_repertoire_jokers;
 #[path = "radio_ne_fait_pas_avancer_la_file.rs"]
