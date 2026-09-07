@@ -322,6 +322,7 @@ pub async fn handle_stream(
             wants_icy,
             false,
             tune_core::http::streamer::VOIE_FICHIER,
+            false,
         );
         return serve_file(path, &session.info, &req_headers, session.clone()).await;
     }
@@ -336,6 +337,7 @@ pub async fn handle_stream(
             wants_icy,
             false,
             tune_core::http::streamer::VOIE_MANDATAIRE,
+            false,
         );
         return proxy_stream(
             url,
@@ -489,24 +491,40 @@ pub async fn handle_stream(
     // Ce que le poller n'avait aucun moyen de savoir : il publie un titre dans
     // `radio_now` sans jamais apprendre si quelqu'un est en mesure de le
     // relire. Le voici noté sous la clé qu'ils partagent (#2991).
+    // `bounded_live` complète la note : les blocs s'entrelacent de la même
+    // façon, mais la réponse se présente au renderer comme un FICHIER
+    // (`Content-Length` fini + `Accept-Ranges`) et non comme un direct. C'est
+    // le cas ORDINAIRE — `accepts_chunked_live_stream` ne rend `true` que pour
+    // un agent `Lavf` ou absent — et c'est la moitié de la négociation qu'aucun
+    // journal ne portait quand un appareil ne suivait pas (#2991).
     tune_core::http::streamer::note_icy_channel(
         stream_id,
         wants_icy,
         has_icy,
         tune_core::http::streamer::VOIE_FLUX,
+        bounded_live,
     );
 
     // Sans cette ligne, ce défaut n'est pas diagnosticable à distance : le
     // journal du testeur ne disait ni si son renderer avait demandé l'ICY, ni
     // si on le lui avait accordé — deux allers-retours pour la même personne.
+    let contrat_journal = if bounded_live {
+        "fichier borné"
+    } else {
+        "chunké"
+    };
     info!(
         stream_id,
         agent = user_agent.as_deref().unwrap_or("-"),
         wants_icy,
         has_icy,
         is_radio,
+        contrat = contrat_journal,
         "icy_metadata_negotiated"
     );
+    // Le nom de l'appareil doit suivre le corps du flux : c'est lui qu'on veut
+    // lire sur CHAQUE poussée de métadonnées, et non seulement à la connexion.
+    let agent_journal = user_agent.clone().unwrap_or_else(|| "-".to_string());
 
     let sr = session.info.sample_rate;
     let bd = session.info.bit_depth;
@@ -553,13 +571,65 @@ pub async fn handle_stream(
         // gardait la première image (Serge Asselin, RS250A, fil 1529). Le repli
         // sur `icy_cover` reste pour les sessions non-radio, le jour où ce champ
         // sera renseigné.
+        //
+        // ── Le journal de la POUSSÉE (#2991) ──
+        //
+        // Jusqu'ici, aucune ligne n'était écrite quand un bloc partait
+        // RÉELLEMENT vers l'appareil : `radio_refresh_channel`, côté poller,
+        // annonce par où le changement DEVRAIT passer, et `canal_radio` le
+        // déduit de deux registres. Un testeur qui répond « la pochette ne
+        // change pas » laissait donc le choix entre « aucun bloc n'est parti »
+        // et « le bloc est parti sans pochette » — deux corrections opposées,
+        // et pas une trace pour les départager. Le bloc étant reconstruit plus
+        // de dix fois par seconde, `SuiviBlocIcy` ne laisse passer que le
+        // premier puis les CHANGEMENTS : une ligne par morceau.
+        // `Mutex` et non `RefCell` : le corps du flux doit être `Send`, et une
+        // référence partagée sur une cellule ne l'est pas. Aucune contention —
+        // un seul consommateur tient le canal PCM (`claim_channel_consumer`).
+        let suivi_icy =
+            std::sync::Mutex::new(tune_core::http::streamer::SuiviBlocIcy::nouveau());
         let bloc_icy_courant = || match tune_core::http::streamer::radio_now(&icy_stream_id) {
-            Some(np) => build_icy_metadata(
-                np.artist.as_deref(),
-                Some(&np.title),
-                np.cover.as_deref().or(icy_cover.as_deref()),
-            ),
-            None => icy_block.clone(),
+            Some(np) => {
+                let pochette = np.cover.as_deref().or(icy_cover.as_deref());
+                let bloc = build_icy_metadata(np.artist.as_deref(), Some(&np.title), pochette);
+                if suivi_icy
+                    .lock()
+                    .is_ok_and(|mut s| s.a_journaliser(&np.title, pochette))
+                {
+                    info!(
+                        stream_id = %icy_stream_id,
+                        appareil = %agent_journal,
+                        methode = "icy in-band",
+                        contrat = contrat_journal,
+                        artiste = np.artist.as_deref().unwrap_or("-"),
+                        titre = %np.title,
+                        pochette = pochette.unwrap_or("-"),
+                        octets = bloc.len(),
+                        "radio_icy_block_sent"
+                    );
+                }
+                bloc
+            }
+            None => {
+                // Le renderer lit bien des blocs, mais le poller n'a jamais
+                // rien publié sous ce `stream_id` : l'appareil affiche
+                // éternellement ce qu'il a reçu à sa connexion. C'est l'autre
+                // moitié du diagnostic, et elle se taisait aussi.
+                if suivi_icy
+                    .lock()
+                    .is_ok_and(|mut s| s.a_journaliser("(aucun titre publié)", None))
+                {
+                    warn!(
+                        stream_id = %icy_stream_id,
+                        appareil = %agent_journal,
+                        methode = "icy in-band",
+                        contrat = contrat_journal,
+                        "radio_icy_block_sent — bloc de repli : le poller n'a publié aucun \
+                         titre sous ce stream_id, l'écran restera sur celui de la connexion"
+                    );
+                }
+                icy_block.clone()
+            }
         };
 
         if is_wav && !wav_header_included {
@@ -2541,11 +2611,38 @@ mod tests {
             Some("16384"),
             "témoin : la fenêtre ICY doit rester accordée exactement comme avant"
         );
+        // CONTRE-ÉPREUVE #2991. Cet agent ne porte pas `Lavf` :
+        // `accepts_chunked_live_stream` rend `false` et la radio lui est servie
+        // au contrat FICHIER. Avant le correctif, la note ne le disait pas et
+        // le verdict était le même que pour un corps chunké.
         assert_eq!(
             canal_radio(Some(sid)),
-            CanalRadio::Icy,
-            "handle_stream doit avoir noté le canal accordé — sans cette note, \
-             le poller ne peut pas distinguer « ça marche » de « personne n'écoute »"
+            CanalRadio::Icy { borne: true },
+            "handle_stream doit avoir noté le canal accordé ET le contrat — sans cette note, \
+             le poller ne peut pas distinguer « ça marche » de « personne n'écoute », \
+             ni un direct chunké d'une réponse servie comme un fichier"
+        );
+        forget_icy_channel(sid);
+    }
+    /// TÉMOIN de l'autre contrat : un agent `Lavf` accepte le corps chunké et
+    /// la note doit le dire. Sans ce second cas, `borne` pourrait valoir `true`
+    /// partout sans qu'aucune épreuve ne s'en aperçoive.
+    #[tokio::test]
+    async fn un_renderer_lavf_est_note_sur_le_contrat_chunke() {
+        use tune_core::http::streamer::{CanalRadio, canal_radio, forget_icy_channel};
+        let sid = "i2991-b2092-icy-chunke";
+        forget_icy_channel(sid);
+        let (entetes, _) = corps_radio(sid, "Lavf/60.16.100", true, 4096).await;
+        assert_eq!(
+            entetes.get("icy-metaint").and_then(|v| v.to_str().ok()),
+            Some("16384"),
+            "témoin : la fenêtre ICY reste accordée sur le corps chunké"
+        );
+        assert_eq!(
+            canal_radio(Some(sid)),
+            CanalRadio::Icy { borne: false },
+            "un agent Lavf accepte le direct chunké : la note doit le distinguer \
+             d'une radio servie au contrat fichier"
         );
         forget_icy_channel(sid);
     }
