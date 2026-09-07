@@ -287,3 +287,21 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_3182_moteur_annonce_dans_le_rapport -- --nocapture --test-threads=1
+
+      # #3256 -- ` RETURNING id` seulement la ou la colonne EXISTE, sur une
+      # VRAIE base.
+      #
+      # Meme angle mort que l'etape de #3248 : les temoins existent depuis le
+      # 03/09 et sont declares dans `tune-core/Cargo.toml`, mais aucune etape
+      # ne leur posait `TUNE_TEST_PG_URL`, donc leurs quatre epreuves
+      # prenaient leur chemin « saut annonce » a chaque execution.
+      #
+      # Aucune autre porte ne peut les remplacer. Le defaut est un
+      # `ERROR: column "id" does not exist` rendu par PostgreSQL sur les
+      # tables a clef composite (`task_runs`, `streaming_auth`) ; sur SQLite
+      # la clause n'est jamais ajoutee, donc la contre-epreuve SQLite du meme
+      # fichier reste verte AVANT comme APRES le correctif. Il faut le moteur.
+      - name: RETURNING id hors des tables à colonne id sur PostgreSQL (#3256)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_returning_id_hors_table_a_id_3256 -- --nocapture
