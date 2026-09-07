@@ -1703,6 +1703,22 @@ impl PlaybackOrchestrator {
                 // de fin doit porter sa propre durée, pour rester lisible
                 // seule dans un export de journal tronqué par la rotation.
                 let file_transcode_start = std::time::Instant::now();
+                // #3444 — le pré-transcodage devient PRÉEMPTIBLE.
+                //
+                // Le verrou par fichier (`_file_hold`, pris juste au-dessus)
+                // est tenu pendant tout ce qui suit : tant que ce transcodage
+                // court, toute autre demande visant le même fichier attend.
+                // Sur le .18 en 0.9.136, un `Aac -> Flac` de 102 s a ainsi
+                // retenu la zone 10 pendant que huit demandes successives
+                // étaient reconnues dépassées sans jamais rien interrompre.
+                // Le drapeau d'abandon suit le travail jusqu'à son écriture,
+                // pour qu'un abandon tardif ne laisse pas de temporaire.
+                let abandon = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let supersession = Supersession {
+                    playback: playback.clone(),
+                    zone_id,
+                    seq: my_seq,
+                };
                 let transcode_result = transcoder_sous_budget(
                     transcode_source_to_file(
                         fp.clone(),
@@ -1715,11 +1731,13 @@ impl PlaybackOrchestrator {
                         replaygain_factor,
                         tmp_path.clone(),
                         Some(progres.clone()),
+                        Some(abandon.clone()),
                     ),
                     progres,
                     politique,
                     PAS_SONDAGE_BUDGET,
                     Some(file_path.as_str()),
+                    Some(&supersession),
                 )
                 .await;
 
@@ -1834,7 +1852,27 @@ impl PlaybackOrchestrator {
                         let _ = std::fs::remove_file(&tmp_path);
                         return Err(format!("transcode failed: {e}"));
                     }
-                    Err(depassement) => {
+                    // #3444 — une demande de lecture plus récente a pris la
+                    // zone : on rend la main SUR PLACE. Le verrou par fichier
+                    // tombe avec le retour, le temporaire part, et le geste le
+                    // plus récent est servi au lieu d'attendre la fin d'un
+                    // travail dont la sortie serait de toute façon jetée
+                    // (`orchestrator_play_superseded_skipping_output`).
+                    Err(FinDeTranscodage::Preempte { gagnant, perdu }) => {
+                        abandon.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = std::fs::remove_file(&tmp_path);
+                        warn!(
+                            zone_id,
+                            file = %file_path,
+                            tmp = %tmp_path,
+                            play_seq_abandonne = my_seq,
+                            play_seq_gagnant = gagnant,
+                            perdu_ms = perdu.as_millis() as u64,
+                            "transcode_abandonne_pour_lecture_plus_recente"
+                        );
+                        return Err(SUPERSEDED_BEFORE_TRANSCODE.into());
+                    }
+                    Err(FinDeTranscodage::Budget(depassement)) => {
                         let budget_s = depassement.budget.as_secs();
                         let size_mb = std::fs::metadata(&fp)
                             .map(|m| m.len() / (1024 * 1024))

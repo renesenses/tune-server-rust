@@ -103,6 +103,9 @@ impl PlaybackOrchestrator {
                 // Pré-chauffage en fond, sans budget ni auditeur qui attend :
                 // rien à mesurer, rien à étendre (#3140).
                 None,
+                // …et rien à préempter : ce travail n'appartient à aucune
+                // demande de lecture, il ne tient pas la zone (#3444).
+                None,
             )
             .await
             {

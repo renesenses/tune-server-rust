@@ -1133,6 +1133,33 @@ mod transcode_budget_tests;
 #[cfg(test)]
 mod budget_adaptatif_tests;
 
+/// #3444 — un pré-transcodage en vol doit être PRÉEMPTIBLE.
+///
+/// ## Le fait de base mesuré ici
+///
+/// Une demande de lecture émise PENDANT un pré-transcodage de la même zone est
+/// servie, au pas de sondage près, au lieu d'attendre la fin d'un travail dont
+/// la sortie sera de toute façon jetée. Deux conséquences, toutes deux
+/// épinglées : le chien de garde rend `Preempte` en nommant la demande
+/// abandonnée, celle qui prend la main et le temps perdu ; et le verrou par
+/// fichier — celui qui, sur le .18 en 0.9.136, a retenu la zone 10 pendant
+/// 102 s — est rendu du même coup.
+///
+/// ## La contre-épreuve
+///
+/// `rouge_avant_le_transcodage_ignore_la_demande_et_va_au_bout` exécute
+/// l'ANCIEN comportement (surveillance sans point de contrôle) sur le même
+/// couple : la demande tombe à 3 s, la zone reste prise 102,2 s. C'est la
+/// moitié sans laquelle le témoin vert ne prouverait rien.
+///
+/// ## Aucun `sleep` réel
+///
+/// Tout tourne sous `#[tokio::test(start_paused = true)]`, comme les essais de
+/// budget voisins : l'horloge de tokio est virtuelle, les 102 s du ticket
+/// s'écoulent en quelques millisecondes, et le verdict est TOUJOURS le même.
+#[cfg(test)]
+mod preemption_du_transcodage_tests;
+
 /// La regle de decision du passthrough DSD (#2122).
 ///
 /// Les douze combinaisons : quatre modes croises avec les trois reponses
