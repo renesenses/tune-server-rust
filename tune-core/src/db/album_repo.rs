@@ -174,6 +174,16 @@ pub mod sql {
             d.placeholder(2)
         )
     }
+    /// Artiste d'album ET titre d'un seul geste — voir
+    /// [`AlbumRepo::reclasser_en_compilation`] (#3232).
+    pub fn set_artist_and_title<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET artist_id = {}, title = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
 
     /// Albums qui portent la signature étroite du collage #2458.
     ///
@@ -1368,6 +1378,33 @@ impl AlbumRepo {
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// Reprend une ligne album créée sous une décision « compilation »
+    /// PARTIELLE : artiste d'album, titre, drapeau.
+    ///
+    /// 🔴 #3232 — un dossier plus gros qu'un lot de scan ne tient pas dans un
+    /// lot (le lot porte les pochettes embarquées) : il est coupé, et le
+    /// premier morceau crée la ligne album avant que le scan ait vu le reste
+    /// du dossier. Sur l'anthologie de Pierre M, le premier morceau ne montre
+    /// qu'un artiste — l'album naît sous son nom, sans drapeau — et c'est le
+    /// second qui révèle la compilation. La décision porte sur le DOSSIER : la
+    /// ligne est donc reprise, au lieu de rester ce que le hasard du découpage
+    /// en avait fait.
+    ///
+    /// Écriture ciblée, et non un `update` complet : la ligne a pu recevoir
+    /// entre-temps sa pochette et ses dates, qu'un `UPDATE` de toutes les
+    /// colonnes depuis une copie en cache effacerait.
+    pub fn reclasser_en_compilation(
+        &self,
+        album_id: i64,
+        artist_id: i64,
+        titre: &str,
+    ) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::set_artist_and_title, sql::set_artist_and_title);
+        let params: [&dyn ToSqlValue; 3] = [&artist_id, &titre, &album_id];
+        self.db.execute(&sql, &params)?;
+        self.mark_compilation(album_id)
     }
 
     /// Like `get_by_title_and_artist` but uses `query_one_strong` to
