@@ -1217,3 +1217,6 @@ mod profondeur_annoncee_egale_profondeur_ecrite;
 /// texte du fichier quelles que soient les `cfg`.
 #[cfg(test)]
 mod recreation_locale_guard;
+
+#[cfg(test)]
+mod adoption_du_flux_pre_arme_3442;
