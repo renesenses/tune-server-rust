@@ -29,6 +29,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
+    spawn_reprise_favoris_streaming(state);
     // CRD-5 : passe automatique des crédits, bornée par tour et reprenable par
     // curseur, derrière le même droit premium que les biographies. Une garde
     // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du
@@ -1804,6 +1805,62 @@ fn spawn_slimproto_server(state: &AppState, port_http: u16) {
         port_http,
         port_cli: 9090,
         version: tune_core::version().to_string(),
+    });
+}
+
+/// Le délai avant la reprise des favoris de service : le démarrage a mieux à
+/// faire, et les jetons des services sont restaurés puis rafraîchis dans les
+/// premières secondes. 90 s, comme la veille Bandcamp, pour la même raison.
+const REPRISE_FAVORIS_DELAI_SECS: u64 = 90;
+
+/// Reprend UNE fois, au démarrage, les favoris posés chez Qobuz/Tidal/… dans
+/// la table de Tune (#3419).
+///
+/// # Pourquoi un appelant, et pas seulement une route
+///
+/// Sans passage automatique, la reprise ne serait qu'une route que personne
+/// n'appelle : les clients déjà publiés ne la connaissent pas, et le défaut —
+/// une règle « Favori · est · Piste » qui rend 0 — resterait entier jusqu'à ce
+/// qu'un client soit mis à jour. L'issue le propose explicitement :
+/// « une route de synchronisation explicite, appelable au démarrage ou depuis
+/// les Réglages ».
+///
+/// # Sur quel profil
+///
+/// Sur `active_profile_id` — le modèle mono-actif que `/profiles/switch` et
+/// l'orchestrateur (marquage de l'historique) utilisent déjà —, à défaut le
+/// profil 1. Au démarrage il n'y a aucune requête, donc aucun `X-Profile-Id` :
+/// c'est la seule identité que la machine possède à cet instant. Les autres
+/// profils d'un foyer se reprennent par la route, qui agit sur l'appelant.
+///
+/// # Une passe, pas une veille
+///
+/// Aucune répétition : la reprise n'ajoute jamais qu'au premier passage, et la
+/// question « faut-il resynchroniser périodiquement, et que faire d'un favori
+/// retiré chez le service » demande un arbitrage que ce correctif ne tranche
+/// pas (voir `tune_core::streaming::favorites_import`).
+fn spawn_reprise_favoris_streaming(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(REPRISE_FAVORIS_DELAI_SECS)).await;
+        let profil =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("active_profile_id")
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .filter(|&id| id > 0)
+                .unwrap_or(1);
+        let comptes = crate::routes::profiles::reprendre_les_favoris(&state, profil, None).await;
+        let services = comptes.as_object().map(|o| o.len()).unwrap_or(0);
+        if services > 0 {
+            info!(
+                profile_id = profil,
+                services,
+                comptes = %comptes,
+                "reprise_favoris_streaming_au_demarrage"
+            );
+        }
     });
 }
 
