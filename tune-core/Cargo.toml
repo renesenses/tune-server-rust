@@ -294,3 +294,10 @@ path = "tests/temoin_resolution_streaming.rs"
 [[test]]
 name = "temoin_resolution_locale"
 path = "tests/temoin_resolution_locale.rs"
+
+# #2060 / #3522 — une balise « Track N » ne doit pas voler la place du nom de
+# fichier. `autotests = false` plus haut : sans cette cible, le fichier ne
+# serait jamais compilé.
+[[test]]
+name = "titre_de_remplissage_2060"
+path = "tests/titre_de_remplissage_2060.rs"
