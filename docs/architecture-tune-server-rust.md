@@ -314,8 +314,8 @@ Tune peut envoyer le son vers 15 types d'appareils différents :
 
 | Protocole | Description |
 |-----------|-------------|
-| **OAAT** | Open Advanced Audio Transport — protocole de synchronisation multiroom développé pour Tune. Synchronisation sub-milliseconde entre les zones via UDP multicast. |
-| **Groupes de zones** | Regroupement logique de plusieurs appareils pour lecture synchronisée |
+| **OAAT** | Open Advanced Audio Transport — les points de diffusion Tune partagent l'horloge du contrôleur et planifient les paquets depuis leurs timestamps de présentation. Aucune précision chiffrée n'est revendiquée sans validation matérielle de bout en bout. |
+| **Groupes de zones** | Pilotage logique de plusieurs appareils. Hors OAAT, leurs renderers restent indépendants et Tune ne garantit pas une restitution synchronisée. |
 
 ---
 
