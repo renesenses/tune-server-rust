@@ -2218,6 +2218,213 @@ fn extract_title_from_filename(path: &Path) -> (Option<u32>, Option<String>) {
     }
 }
 
+/// Un titre de balise qui ne dit rien d'autre que « la piste numéro N ».
+///
+/// Ce n'est pas une invention de Tune : c'est ce qu'écrivent les logiciels de
+/// gravure quand le disque n'est pas reconnu — `Track 01`, `Piste 1`,
+/// `Audio Track 6`, `Untitled`. La balise EXISTE, elle est parfaitement lisible,
+/// et elle ne porte aucune information. Le nom du fichier, lui, en porte une
+/// quand l'auditeur a rangé sa bibliothèque à la main.
+///
+/// Mesuré chez **Belkadi Yacine** (#2060, #3522, tickets support 85→92 du
+/// 07/09/2026) : dix-neuf FLAC nommés `01 Ballade De Melody Nelson.flac` …
+/// `19 Glory Box (Mudflap Mix).flac`, affichés « Track 1 » … « Track 19 » dans
+/// Tune. Son journal le confirme au moment de la lecture —
+/// `orchestrator_play … title=Track 6` pour le fichier `06 Melody.flac` — et
+/// son scan ne signale AUCUN échec de lecture de balise
+/// (`batched_scan_complete total=25 metadata_ok=19 metadata_failed=0`).
+/// Le titre affiché vient donc bien de la balise, pas d'un repli.
+///
+/// La liste est volontairement étroite : le mot doit être un marqueur de
+/// position, seul ou suivi d'un nombre, et RIEN d'autre. « Trackspotting »,
+/// « Piste noire », « Track Of My Tears » n'en sont pas.
+pub(crate) fn titre_de_remplissage(titre: &str) -> bool {
+    let t = titre.trim().to_lowercase();
+    if t.is_empty() {
+        return true;
+    }
+    if matches!(
+        t.as_str(),
+        "untitled" | "unknown" | "no title" | "sans titre" | "titre inconnu" | "aucun titre"
+    ) {
+        return true;
+    }
+    // « untitled track » avant « track » : le préfixe le plus long d'abord,
+    // sinon `strip_prefix("track")` ne verrait jamais les composés.
+    for prefixe in [
+        "audio track",
+        "untitled track",
+        "unknown track",
+        "track",
+        "piste",
+        "plage",
+    ] {
+        let Some(reste) = t.strip_prefix(prefixe) else {
+            continue;
+        };
+        let reste = reste.trim_start_matches([' ', '-', '_', '.', '#', ':']);
+        let reste = reste
+            .strip_prefix("no.")
+            .or_else(|| reste.strip_prefix("n°"))
+            .unwrap_or(reste)
+            .trim_start_matches([' ', '-', '_', '.', '#']);
+        if reste.is_empty() || reste.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Le titre que la piste portera, entre celui de la BALISE et celui tiré du nom
+/// de fichier.
+///
+/// **La balise gagne.** Deux exceptions, et deux seulement :
+///
+/// 1. la balise n'a pas de titre — le repli historique (JP Robbe), inchangé ;
+/// 2. la balise porte un titre de REMPLISSAGE ([`titre_de_remplissage`]) *et*
+///    le nom de fichier en porte un autre, qui n'en est pas un.
+///
+/// Trois verrous encadrent la seconde, pour qu'aucune balise réelle ne puisse
+/// être écrasée :
+///
+/// - le nom de fichier doit contenir au moins une LETTRE. `06.flac` donne
+///   « 06 » : un numéro n'apprend rien de plus que « Track 6 », et le
+///   remplacement serait une régression pure ;
+/// - le nom de fichier ne doit pas être lui-même un remplissage. Un morceau
+///   réellement intitulé « Track 9 » est rangé dans `09 Track 9.flac` : les
+///   deux côtés disent la même chose, donc rien ne bouge ;
+/// - les deux titres doivent différer, sinon il n'y a rien à faire.
+///
+/// Le sens du remplacement est donc toujours « une balise vide de sens cède à
+/// une information réelle », jamais l'inverse.
+pub(crate) fn titre_retenu(du_tag: Option<String>, du_nom: Option<String>) -> Option<String> {
+    let Some(tag) = du_tag.filter(|t| !t.trim().is_empty()) else {
+        return du_nom;
+    };
+    let Some(nom) = du_nom.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
+        return Some(tag);
+    };
+    if !titre_de_remplissage(&tag)
+        || titre_de_remplissage(nom)
+        || !nom.chars().any(char::is_alphabetic)
+        || nom.to_lowercase() == tag.trim().to_lowercase()
+    {
+        return Some(tag);
+    }
+    Some(nom.to_string())
+}
+
+#[cfg(test)]
+mod tests_titre_de_remplissage {
+    use super::{titre_de_remplissage, titre_retenu};
+
+    #[test]
+    fn les_formes_ecrites_par_les_logiciels_de_gravure() {
+        for t in [
+            "Track 1",
+            "Track 19",
+            "track06",
+            "Track-06",
+            "Track_6",
+            "Track.6",
+            "Track #6",
+            "Track No. 6",
+            "Audio Track 06",
+            "Untitled Track 3",
+            "Unknown Track",
+            "Piste 6",
+            "Plage 12",
+            "Track",
+            "Untitled",
+            "Sans titre",
+            "  Track 6  ",
+        ] {
+            assert!(titre_de_remplissage(t), "{t} est un remplissage");
+        }
+    }
+
+    /// Contre-épreuve : la liste est étroite, et elle doit le rester. Un seul
+    /// faux positif ici ferait DISPARAÎTRE un vrai titre au profit d'un nom de
+    /// fichier.
+    #[test]
+    fn aucun_vrai_titre_ne_passe_pour_un_remplissage() {
+        for t in [
+            "Trackspotting",
+            "Track Of My Tears",
+            "Piste noire",
+            "Plage privée",
+            "Fast Track to Nowhere",
+            "Untitled #23",
+            "Unknown Pleasures",
+            "Glory Box",
+            "06 Melody",
+            "9",
+        ] {
+            assert!(!titre_de_remplissage(t), "{t} est un vrai titre");
+        }
+    }
+
+    #[test]
+    fn le_cas_de_yacine() {
+        assert_eq!(
+            titre_retenu(Some("Track 6".into()), Some("Melody".into())).as_deref(),
+            Some("Melody")
+        );
+    }
+
+    #[test]
+    fn la_balise_gagne_des_qu_elle_dit_quelque_chose() {
+        assert_eq!(
+            titre_retenu(Some("Glory Box".into()), Some("piste six".into())).as_deref(),
+            Some("Glory Box")
+        );
+    }
+
+    #[test]
+    fn un_nom_sans_lettre_ne_remplace_rien() {
+        assert_eq!(
+            titre_retenu(Some("Track 6".into()), Some("06".into())).as_deref(),
+            Some("Track 6")
+        );
+        assert_eq!(
+            titre_retenu(Some("Track 6".into()), Some("6 - 6".into())).as_deref(),
+            Some("Track 6")
+        );
+    }
+
+    #[test]
+    fn deux_remplissages_ne_se_remplacent_pas() {
+        assert_eq!(
+            titre_retenu(Some("Track 9".into()), Some("Track 9".into())).as_deref(),
+            Some("Track 9")
+        );
+        assert_eq!(
+            titre_retenu(Some("Track 9".into()), Some("Piste 9".into())).as_deref(),
+            Some("Track 9")
+        );
+    }
+
+    #[test]
+    fn le_repli_historique_du_titre_absent_est_intact() {
+        assert_eq!(
+            titre_retenu(None, Some("Toy Box".into())).as_deref(),
+            Some("Toy Box")
+        );
+        assert_eq!(
+            titre_retenu(Some("   ".into()), Some("Toy Box".into())).as_deref(),
+            Some("Toy Box")
+        );
+        // Rien des deux côtés : rien à rendre.
+        assert_eq!(titre_retenu(None, None), None);
+        // Une balise de remplissage SANS nom de fichier exploitable reste :
+        // « Track 6 » vaut mieux que rien.
+        assert_eq!(
+            titre_retenu(Some("Track 6".into()), None).as_deref(),
+            Some("Track 6")
+        );
+    }
+}
+
 /// Écarter une durée MP3 franchement incohérente avec la taille du fichier.
 ///
 /// Le besoin est réel (`1e06a2c0`) : sans en-tête XING/VBRI, ou avec un
@@ -2679,8 +2886,17 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     // Montreux Alexander FLACs have TITLE+ALBUM but no TRACKNUMBER). Fill each
     // MISSING field individually — never override a value the tag already has.
     let (fname_track, fname_title) = extract_title_from_filename(path);
-    if title.as_deref().map_or(true, |t| t.trim().is_empty()) {
-        title = fname_title;
+    let titre_du_tag = title.clone();
+    title = titre_retenu(title, fname_title);
+    if title != titre_du_tag && titre_du_tag.is_some() {
+        // Ne se produit QUE sur le cas ci-dessous (un titre vide n'était pas
+        // `Some`), donc une ligne par fichier de remplissage et rien d'autre.
+        tracing::info!(
+            path = %path.display(),
+            titre_du_tag = ?titre_du_tag,
+            titre_retenu = ?title,
+            "titre_de_remplissage_ecarte_au_profit_du_nom_de_fichier"
+        );
     }
     // Le dossier parent n'est pas toujours l'album : sous `.../Titre/CD2/`,
     // c'est un disque, et l'album est au-dessus (#1656).
