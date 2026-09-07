@@ -216,6 +216,7 @@ Configuration via `tune.toml` or environment variables (env vars take precedence
 | `TUNE_ARTWORK_DIR` | artwork_cache | Artwork cache directory |
 | `TUNE_MUSIC_DIRS` | [] | JSON array or comma-separated paths |
 | `TUNE_AUTO_SCAN` | false | Scan music dirs on startup |
+| `TUNE_AUTO_UPDATE` | false | Check for new releases every 6 h and record the notice (never installs) |
 | `TUNE_LOG_LEVEL` | info | Log level (trace/debug/info/warn/error) |
 | `QOBUZ_APP_ID` | | Qobuz API app ID |
 | `QOBUZ_APP_SECRET` | | Qobuz API app secret |

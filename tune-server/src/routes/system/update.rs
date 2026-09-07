@@ -892,6 +892,299 @@ fn checker_for(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) 
     UpdateChecker::with_channel(update_channel(backend))
 }
 
+/// La clé où le vérificateur périodique dépose ce qu'il a TROUVÉ — jamais ce
+/// qu'il a fait, puisqu'il n'installe rien.
+///
+/// Distincte de `last_update_result`, qui porte le résultat de la DERNIÈRE
+/// installation appliquée : confondre les deux ferait passer une simple
+/// disponibilité pour une mise à jour effectuée.
+pub(crate) const CLE_MISE_A_JOUR_DISPONIBLE: &str = "update_available_release";
+
+/// Délai avant le premier contrôle après le démarrage.
+///
+/// La boucle ne part pas au tour zéro : le démarrage a déjà de quoi faire, et
+/// surtout une machine qui redémarre en boucle (unité systemd `Restart=always`
+/// devant un défaut de configuration) taperait l'API des releases à chaque
+/// relance. Deux minutes suffisent à sortir de cette fenêtre-là.
+const DELAI_PREMIER_CONTROLE: Duration = Duration::from_secs(120);
+
+/// L'annonce déposée en base quand une version plus récente existe.
+///
+/// Fonction pure, pour que ce que l'écran lira soit éprouvable sans réseau.
+fn annonce_de_release(current: &str, release: &ReleaseInfo, channel: UpdateChannel) -> Value {
+    let (setting, effective) = channel_fields(channel, current);
+    json!({
+        "current": current,
+        "latest": release.version,
+        "tag_name": release.tag_name,
+        "name": release.name,
+        "published_at": release.published_at,
+        "html_url": release.html_url,
+        "channel": setting,
+        "effective_channel": effective,
+        "checked_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    })
+}
+
+/// Un tour du vérificateur périodique : interroger, consigner, et RIEN d'autre.
+///
+/// Le canal est relu À CHAQUE TOUR, par `checker_for` — le même point unique
+/// que les deux routes. Le lire une fois au lancement rendrait le réglage
+/// `update_channel` inopérant jusqu'au prochain redémarrage : quelqu'un qui
+/// passe de `beta` à `stable` doit être entendu au tour suivant, pas au
+/// prochain démarrage.
+///
+/// Une erreur réseau NE TOUCHE PAS l'annonce déjà déposée : une coupure de
+/// liaison n'est pas la preuve qu'une version a disparu.
+async fn tour_de_verification(state: &AppState) {
+    let current = tune_core::version();
+    let channel = update_channel(&state.backend);
+    let checker = checker_for(&state.backend);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    match checker.check().await {
+        Ok(Some(release)) => {
+            let annonce = annonce_de_release(current, &release, channel);
+            if let Err(e) = settings.set(CLE_MISE_A_JOUR_DISPONIBLE, &annonce.to_string()) {
+                warn!(error = %e, "update_available_write_failed");
+            }
+            info!(
+                version = %release.version,
+                current,
+                channel = channel.as_str(),
+                "update_available"
+            );
+        }
+        // Plus rien à annoncer : la version installée est à jour, ou l'annonce
+        // précédente portait une version que le canal ne propose plus. Effacer
+        // évite qu'un écran garde éternellement un point rouge périmé.
+        Ok(None) => {
+            let _ = settings.delete(CLE_MISE_A_JOUR_DISPONIBLE);
+        }
+        Err(e) => {
+            warn!(error = %e, "update_check_failed");
+        }
+    }
+}
+
+/// #3217 — le vérificateur périodique de mises à jour, enfin LANCÉ.
+///
+/// ## Ce qui était en place, et ce qui ne l'était pas
+///
+/// `TUNE_AUTO_UPDATE` était déclaré (`config.rs:130`), par défaut à `false`
+/// (`config.rs:220`) et réglable par l'environnement (`config.rs:299`) — et lu
+/// NULLE PART. En face, `UpdateChecker::spawn_periodic` avait une seule
+/// occurrence dans tout le dépôt : sa propre définition. Poser
+/// `TUNE_AUTO_UPDATE=true` dans une unité systemd ou un `docker-compose`
+/// n'obtenait rien, sans un mot au journal.
+///
+/// ## Pourquoi il NOTIFIE et n'installe pas
+///
+/// La garde anti-coupure de la route d'installation (#2954) repose sur une
+/// prémisse écrite noir sur blanc en tête de ce fichier : « toute installation est
+/// aujourd'hui un geste délibéré ». Celui qui ne passe pas `?force=true` n'a
+/// pas été prévenu de ce qu'il s'apprête à interrompre — l'écran, lui, prévient
+/// puis force. Un vérificateur qui installerait tout seul n'est prévenu par
+/// personne : il n'a pas d'interface pour avertir, et il ne peut pas dire
+/// `force` de bonne foi. Le souvenir du 10/08/2026 sur le .18 est dans le même
+/// commentaire : six mises à jour en une journée, deux qui ont ré-exécuté
+/// pendant que la zone 12 diffusait.
+///
+/// Ce lanceur ne touche donc à aucun chemin d'installation. Il interroge,
+/// journalise `update_available` et dépose l'annonce sous
+/// [`CLE_MISE_A_JOUR_DISPONIBLE`], que `GET /system/update/status` rend. Le
+/// geste d'installation reste entier, délibéré, et la garde de #2954 garde
+/// exactement ce qu'elle gardait. Une garde de site le tient
+/// (`le_verificateur_periodique_n_installe_rien`).
+///
+/// ## Ce que le réglage veut dire désormais
+///
+/// `TUNE_AUTO_UPDATE=true` = « préviens-moi quand une version paraît ». C'est
+/// moins que ce que le nom promet, et c'est délibéré : passer à l'installation
+/// automatique demanderait de rouvrir la garde anti-coupure, ce qui est un
+/// arbitrage de Bertrand et non une décision d'implémentation.
+pub(crate) fn spawn_verificateur_de_mise_a_jour(state: AppState, auto_update: bool) {
+    if !auto_update {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(DELAI_PREMIER_CONTROLE).await;
+        let cadence = Duration::from_secs(tune_core::updater::CHECK_INTERVAL_SECS);
+        loop {
+            tour_de_verification(&state).await;
+            tokio::time::sleep(cadence).await;
+        }
+    });
+}
+
+/// Câblage et portée du vérificateur périodique (#3217).
+///
+/// Ce qui a été perdu pendant des mois, c'est un APPEL — pas une logique :
+/// `spawn_periodic` était écrit, complet, et personne ne le lançait. Aucun test
+/// de comportement ne pouvait le voir : ils passaient tous sans que la boucle
+/// tourne jamais. Même procédé que `scan_scheduler_cablage_tests`, pour la
+/// même raison.
+#[cfg(test)]
+mod verificateur_periodique_cablage {
+    use super::*;
+
+    /// Le seul endroit qui lance les passes de fond doit porter l'appel, et lui
+    /// passer `config.auto_update` — sans quoi `TUNE_AUTO_UPDATE` redevient un
+    /// réglage accepté et sans effet.
+    #[test]
+    fn le_verificateur_periodique_est_lance_au_demarrage() {
+        let background = include_str!("../../background.rs");
+        // Témoin : si `include_str!` pointait sur un fichier vide ou faux,
+        // l'assertion suivante échouerait pour la mauvaise raison.
+        assert!(
+            background.contains("pub async fn spawn_background_tasks"),
+            "témoin : le fichier lu doit être celui qui câble les passes de fond"
+        );
+        // Espaces normalisés : l'appel dépasse la largeur de `rustfmt`, qui le
+        // replie sur trois lignes. Un garde qui exigerait la ligne d'un seul
+        // tenant tomberait au premier `cargo fmt`, pour rien.
+        let serre: String = background.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            serre.contains(
+                "update::spawn_verificateur_de_mise_a_jour( state.clone(), config.auto_update, );"
+            ) || serre.contains(
+                "update::spawn_verificateur_de_mise_a_jour(state.clone(), config.auto_update);"
+            ),
+            "spawn_verificateur_de_mise_a_jour doit être appelé depuis \
+             background.rs, en lui passant `config.auto_update` — sans cet \
+             appel, `TUNE_AUTO_UPDATE` est de nouveau sans effet (#3217)"
+        );
+    }
+
+    /// 🔴 Le réglage doit être lu par la configuration que le serveur CHARGE.
+    ///
+    /// Il y a deux `TuneConfig` dans ce dépôt. `TUNE_AUTO_UPDATE` n'était lu
+    /// que par celle de `tune-core`, dont `from_env()` n'a aucun appelant : le
+    /// drapeau n'était donc pas seulement ignoré, il était déclaré dans une
+    /// configuration que rien ne construit. Celle qui atteint
+    /// `spawn_background_tasks` est `tune_server::config::TuneConfig`, et c'est
+    /// elle que ce test lit.
+    #[test]
+    fn le_reglage_est_lu_par_la_configuration_du_serveur() {
+        let config = include_str!("../../config.rs");
+        assert!(
+            config.contains("pub fn load() -> Self"),
+            "témoin : le fichier lu doit être celui que le serveur charge"
+        );
+        assert!(
+            config.contains("pub auto_update: bool"),
+            "`auto_update` doit être un champ de la TuneConfig du serveur (#3217)"
+        );
+        let serre: String = config.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            serre.contains(
+                "std::env::var(\"TUNE_AUTO_UPDATE\") { config.auto_update = v == \"true\";"
+            ),
+            "TUNE_AUTO_UPDATE doit être lu par `TuneConfig::load` — sans cela le \
+             réglage reste accepté et sans effet (#3217)"
+        );
+    }
+
+    /// 🔴 Garde de site : le vérificateur périodique n'installe RIEN.
+    ///
+    /// La garde anti-coupure de #2954 se justifie par « toute installation est
+    /// un geste délibéré ». Un tour de vérification qui appellerait un chemin
+    /// d'installation ferait tomber cette prémisse, et rouvrirait les
+    /// micro-coupures du 10/08/2026 — cette fois sans personne devant l'écran.
+    /// Brancher l'installation automatique est un arbitrage, pas une retouche :
+    /// il doit rougir ici avant d'être livré.
+    #[test]
+    fn le_verificateur_periodique_n_installe_rien() {
+        let source = include_str!("update.rs");
+        let debut = source
+            .find("async fn tour_de_verification")
+            .expect("témoin : `tour_de_verification` doit exister dans ce fichier");
+        let fin = source[debut..]
+            .find("\n/// Câblage et portée du vérificateur périodique")
+            .map(|f| debut + f)
+            .expect("témoin : la borne de fin du bloc doit exister");
+        let bloc = &source[debut..fin];
+        assert!(
+            bloc.contains("spawn_verificateur_de_mise_a_jour"),
+            "témoin : le bloc lu doit contenir le lanceur — {} octets",
+            bloc.len()
+        );
+        for interdit in [
+            "update_install",
+            "install_unix",
+            "install_windows",
+            "update_apply",
+            "defer_restart_until_quiet",
+        ] {
+            assert!(
+                !bloc.contains(interdit),
+                "le vérificateur périodique appelle `{interdit}` : il installerait \
+                 sans que personne ait été prévenu, et la garde anti-coupure de \
+                 #2954 repose sur le contraire (#3217)"
+            );
+        }
+    }
+
+    /// 🔴 L'annonce doit être LUE quelque part.
+    ///
+    /// Une notification déposée en base qu'aucune route ne rend serait le
+    /// défaut « écrit mais pas branché » à l'autre bout : le vérificateur
+    /// tournerait, l'écran ne verrait rien, et `TUNE_AUTO_UPDATE` resterait
+    /// aussi muet qu'avant. `GET /system/update/status` est le point de lecture.
+    #[test]
+    fn l_annonce_est_rendue_par_la_route_de_statut() {
+        let source = include_str!("update.rs");
+        let debut = source
+            .find("pub(super) async fn update_status")
+            .expect("témoin : `update_status` doit exister dans ce fichier");
+        let fin = source[debut..]
+            .find("\n/// Compare the version an in-progress update")
+            .map(|f| debut + f)
+            .expect("témoin : la borne de fin de la route doit exister");
+        let bloc = &source[debut..fin];
+        assert!(
+            bloc.contains("CLE_MISE_A_JOUR_DISPONIBLE"),
+            "`update_status` doit relire la clé du vérificateur périodique (#3217)"
+        );
+        assert!(
+            bloc.contains("\"available_update\": available_update"),
+            "`update_status` doit RENDRE l'annonce, pas seulement la lire (#3217)"
+        );
+    }
+
+    /// L'annonce déposée porte de quoi décider : la version, le canal qui l'a
+    /// choisie, et la date du contrôle.
+    #[test]
+    fn l_annonce_dit_la_version_le_canal_et_la_date() {
+        let release = ReleaseInfo {
+            tag_name: "v0.9.141".into(),
+            version: "0.9.141".into(),
+            name: "Tune 0.9.141".into(),
+            body: String::new(),
+            published_at: "2026-09-06T10:00:00Z".into(),
+            html_url: "https://example.invalid/releases/v0.9.141".into(),
+            assets: Vec::new(),
+        };
+        let annonce = annonce_de_release("0.9.140", &release, UpdateChannel::Stable);
+        assert_eq!(annonce["current"], "0.9.140");
+        assert_eq!(annonce["latest"], "0.9.141");
+        assert_eq!(annonce["tag_name"], "v0.9.141");
+        assert_eq!(annonce["channel"], "stable");
+        assert_eq!(annonce["effective_channel"], "stable");
+        assert!(
+            annonce["checked_at"].as_u64().unwrap_or(0) > 1_700_000_000,
+            "la date du contrôle doit être un horodatage réel : {annonce}"
+        );
+        // Le canal `auto` doit sortir RÉSOLU, sans quoi un écran affichant
+        // « auto » ne dit pas à l'utilisateur ce qu'il va recevoir.
+        let auto = annonce_de_release("0.9.140-rc2", &release, UpdateChannel::Auto);
+        assert_eq!(auto["channel"], "auto");
+        assert_eq!(auto["effective_channel"], "beta");
+    }
+}
+
 /// Les deux champs que toute réponse de `/update/check` porte désormais :
 /// le réglage tel qu'il est enregistré, et le canal EFFECTIF une fois `auto`
 /// résolu contre le binaire en cours. Sans le second, un écran affichant
@@ -2041,8 +2334,20 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
     // record_post_update_result). Lets the UI surface a silent swap failure —
     // e.g. Windows came back on the old binary — instead of the update just
     // looking like it did nothing.
-    let last_update_result = SettingsRepo::with_backend(state.backend.clone())
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let last_update_result = settings
         .get("last_update_result")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    // #3217 — ce que le vérificateur périodique a TROUVÉ, s'il tourne. C'est
+    // l'autre moitié de `TUNE_AUTO_UPDATE` : sans un endroit où la lire,
+    // l'annonce déposée en base serait « écrite mais pas branchée ». `null`
+    // quand le réglage est à `false`, quand aucun tour n'a encore eu lieu, ou
+    // quand la version installée est déjà la dernière du canal.
+    let available_update = settings
+        .get(CLE_MISE_A_JOUR_DISPONIBLE)
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
@@ -2052,6 +2357,7 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
         "phase": phase,
         "update_in_progress": phase.is_some() && !is_failed,
         "last_update_result": last_update_result,
+        "available_update": available_update,
     }))
 }
 
