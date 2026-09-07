@@ -1334,6 +1334,124 @@ fn la_promotion_emporte_le_paquet_debian_dans_son_propre_run() {
     );
 }
 
+/// Le nom PUBLIE d'un manifeste — c'est LUI que `-p` designe, jamais le chemin.
+///
+/// `plugins/tune-bandcamp` se nomme `tune-bandcamp`, `tune-cli` porte un
+/// `[[bin]] name = "tune"` et `tune-ffi` un `[lib] name = "tuneserver"` : la
+/// lecture est bornee a la section `[package]`, sans quoi elle prendrait le
+/// premier `name` venu.
+fn nom_du_paquet(source: &str) -> Option<String> {
+    let mut dans_package = false;
+    for ligne in source.lines() {
+        let t = ligne.trim();
+        if t.starts_with('[') {
+            dans_package = t == "[package]";
+            continue;
+        }
+        if !dans_package || t.starts_with('#') {
+            continue;
+        }
+        if let Some(valeur) = t.strip_prefix("name")
+            && let Some(valeur) = valeur.trim_start().strip_prefix('=')
+        {
+            return Some(valeur.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// Tous les membres du workspace, par `(nom de paquet, chemin)`.
+///
+/// Deux sources, et la seconde est celle qui manquait a la garde `cargo test`
+/// jusqu'a #3266 bis :
+///
+/// 1. la liste `members` du manifeste racine — les membres DECLARES ;
+/// 2. les membres IMPLICITES : cargo promeut membre toute dependance `path`
+///    interne au workspace, meme absente de `members`. C'est ainsi que
+///    `tune-output-api` entre, via `tune-core`. Les rater, c'est laisser un
+///    trou exactement de la forme de celui que ces gardes doivent fermer.
+///
+/// Une fonction partagee plutot que deux lecteurs jumeaux : le trou de
+/// #3266 bis vient precisement de ce que la garde `clippy` savait resoudre les
+/// membres implicites et que la garde `cargo test` ne le savait pas.
+fn membres_du_workspace(racine: &Path) -> Vec<(String, String)> {
+    let manifeste = fs::read_to_string(racine.join("Cargo.toml"))
+        .unwrap_or_else(|e| panic!("Cargo.toml racine illisible : {e}"));
+    let debut = manifeste
+        .find("members = [")
+        .expect("`members = [` absent du Cargo.toml du workspace");
+    let reste = &manifeste[debut + "members = [".len()..];
+    let fin = reste
+        .find(']')
+        .expect("la liste `members` du workspace n'est pas fermee");
+
+    let mut a_visiter: Vec<String> = reste[..fin]
+        .split(',')
+        .map(|morceau| morceau.trim().trim_matches('"').to_string())
+        .filter(|morceau| !morceau.is_empty())
+        .collect();
+
+    assert!(
+        a_visiter.len() >= 10,
+        "seulement {} membre(s) reconnu(s) dans le Cargo.toml du workspace — la \
+         forme de la liste `members` a change et ces tests ne gardent plus \
+         rien : {a_visiter:?}",
+        a_visiter.len()
+    );
+
+    let mut vus: Vec<String> = Vec::new();
+    let mut membres: Vec<(String, String)> = Vec::new();
+    while let Some(chemin) = a_visiter.pop() {
+        if vus.iter().any(|deja| *deja == chemin) {
+            continue;
+        }
+        let source = fs::read_to_string(racine.join(&chemin).join("Cargo.toml"))
+            .unwrap_or_else(|e| panic!("{chemin}/Cargo.toml illisible : {e}"));
+        let nom = nom_du_paquet(&source)
+            .unwrap_or_else(|| panic!("{chemin}/Cargo.toml : `[package] name` introuvable"));
+        vus.push(chemin.clone());
+        membres.push((nom, chemin.clone()));
+
+        for ligne in source.lines() {
+            let t = ligne.trim();
+            if t.starts_with('#') {
+                continue;
+            }
+            let Some(apres) = t.split_once("path = \"") else {
+                continue;
+            };
+            let Some((cible, _)) = apres.1.split_once('"') else {
+                continue;
+            };
+            // Resolu depuis le dossier du membre, puis ramene a la racine : un
+            // `../tune-output-api` depuis `tune-core` donne `tune-output-api`.
+            let mut pile: Vec<&str> = chemin.split('/').collect();
+            for element in cible.split('/') {
+                match element {
+                    "." | "" => {}
+                    ".." => {
+                        if pile.pop().is_none() {
+                            // Sort du depot : ce n'est pas un membre.
+                            pile.push("..");
+                        }
+                    }
+                    autre => pile.push(autre),
+                }
+            }
+            if pile.iter().any(|element| *element == "..") {
+                continue;
+            }
+            let resolu = pile.join("/");
+            if !resolu.is_empty() && racine.join(&resolu).join("Cargo.toml").is_file() {
+                a_visiter.push(resolu);
+            }
+        }
+    }
+
+    membres.sort();
+    membres
+}
+
 /// Extrait les paquets qu'une ligne `cargo test` selectionne.
 ///
 /// Rend `None` si la ligne n'est pas une porte `cargo test`. Rend un vecteur
@@ -1405,92 +1523,43 @@ fn paquets_selectionnes(ligne: &str) -> Option<(Vec<String>, bool)> {
 ///
 /// Sabotage : retirer un `-p` de la ligne `cargo test` du job `test` de
 /// `ci.yml` fait tomber ce test en nommant le paquet decouvert.
+///
+/// 🔴 #3266 bis, 06/09/2026 : ce test lisait la seule liste `members` du
+/// manifeste racine, et RATAIT donc `tune-output-api` — 1 031 lignes, sept
+/// `#[test]`. Cargo promeut membre toute dependance `path` interne au
+/// workspace ; `tune-core/Cargo.toml:9` le prend ainsi, et il etait membre
+/// sans etre inscrit. Le garde restait donc VERT au-dessus d'un paquet qu'aucune
+/// porte `cargo test` ne nommait : un garde qui ne voit pas ce qu'il garde ne
+/// garde rien. La resolution transitive vient de
+/// `toute_caisse_du_workspace_est_nommee_par_une_porte_clippy`, qui la portait
+/// deja depuis #3304 ; elle est desormais partagee par
+/// [`membres_du_workspace`], pour que les deux gardes ne puissent plus diverger.
 #[test]
 fn tout_membre_du_workspace_est_execute_par_une_porte_cargo_test() {
     let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
 
-    // 1. Les membres du workspace, lus dans le manifeste racine. La liste est
-    //    un inventaire, pas un echantillon (commentaire de `Cargo.toml`) : on
-    //    la relit a chaque passage plutot que d'en recopier une copie ici, qui
-    //    vieillirait en silence.
-    let manifeste = fs::read_to_string(racine.join("Cargo.toml"))
-        .unwrap_or_else(|e| panic!("Cargo.toml racine illisible : {e}"));
-    let mut liste = String::new();
-    let mut dedans = false;
-    for ligne in manifeste.lines() {
-        let t = ligne.trim();
-        if !dedans {
-            let Some(reste) = t.strip_prefix("members") else {
-                continue;
-            };
-            let Some(reste) = reste.trim_start().strip_prefix('=') else {
-                continue;
-            };
-            let Some(reste) = reste.trim_start().strip_prefix('[') else {
-                continue;
-            };
-            dedans = true;
-            liste.push_str(reste);
-        } else {
-            liste.push_str(t);
-        }
-        if let Some(fin) = liste.find(']') {
-            liste.truncate(fin);
-            break;
-        }
-        liste.push(' ');
-    }
-    assert!(
-        dedans,
-        "`members = [` introuvable dans le Cargo.toml racine"
-    );
-
-    let chemins: Vec<String> = liste
-        .split(',')
-        .map(|c| c.trim().trim_matches('"').to_string())
-        .filter(|c| !c.is_empty())
-        .collect();
-
-    // Le nom PUBLIE de chaque membre — c'est lui que `-p` nomme, et il ne se
-    // deduit pas du chemin : `plugins/tune-bandcamp` s'appelle `tune-bandcamp`.
-    let mut membres: Vec<(String, String)> = Vec::new();
-    for chemin in &chemins {
-        let sous_manifeste = racine.join(chemin).join("Cargo.toml");
-        let source = fs::read_to_string(&sous_manifeste).unwrap_or_else(|e| {
-            panic!(
-                "membre `{chemin}` declare mais {} illisible : {e}",
-                sous_manifeste.display()
-            )
-        });
-        let mut section = "";
-        let mut nom = None;
-        for ligne in source.lines() {
-            let t = ligne.trim();
-            if t.starts_with('[') {
-                section = if t == "[package]" { "[package]" } else { "" };
-                continue;
-            }
-            if section != "[package]" {
-                continue;
-            }
-            // `name = "tune-cli"` — et surtout pas le `name` du `[[bin]]` qui
-            // suit dans le meme fichier et vaut `tune`.
-            if let Some(reste) = t.strip_prefix("name") {
-                if let Some(reste) = reste.trim_start().strip_prefix('=') {
-                    nom = Some(reste.trim().trim_matches('"').to_string());
-                    break;
-                }
-            }
-        }
-        let nom = nom.unwrap_or_else(|| panic!("`{chemin}/Cargo.toml` ne declare pas de `name`"));
-        membres.push((nom, chemin.clone()));
-    }
+    // 1. Les membres du workspace : ceux que `members` declare, ET ceux que
+    //    cargo promeut par dependance `path`. La liste est un inventaire, pas
+    //    un echantillon (commentaire de `Cargo.toml`) : on la relit a chaque
+    //    passage plutot que d'en recopier une copie ici, qui vieillirait en
+    //    silence.
+    let membres = membres_du_workspace(&racine);
 
     assert!(
-        membres.len() >= 12,
-        "le garde-fou n'a reconnu que {} membre(s) : la forme de `members` a \
-         change et ce test ne garde plus rien — {membres:?}",
+        membres.len() >= 15,
+        "le garde-fou n'a reconnu que {} membre(s) : la forme de `members` ou \
+         des dependances `path` a change et ce test ne garde plus rien — \
+         {membres:?}",
         membres.len()
+    );
+    // Contre-epreuve de la resolution transitive : `tune-output-api` n'est
+    // atteint que par la dependance `path` de `tune-core`. Un lecteur qui
+    // retomberait sur la seule liste `members` le perdrait — c'est exactement
+    // le trou de #3266 bis, et c'est ce qui doit rougir plutot que passer.
+    assert!(
+        membres.iter().any(|(nom, _)| nom == "tune-output-api"),
+        "resolution des membres cassee : `tune-output-api` est membre par la \
+         dependance `path` de `tune-core` — {membres:?}"
     );
     // Contre-epreuve du lecteur de membres, sens NEGATIF : les deux
     // applications Tauri sont `exclude` du workspace. Un lecteur qui listerait
@@ -1676,108 +1745,16 @@ fn toute_caisse_du_workspace_est_nommee_par_une_porte_clippy() {
 
     let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
 
-    // Le nom de paquet d'un manifeste : c'est LUI que `-p` designe, jamais le
-    // chemin. `plugins/tune-dj` se nomme `tune-dj`, et `tune-ffi` porte un
-    // `[lib]` nomme `tuneserver` — d'ou la lecture bornee a `[package]`.
-    let nom_du_paquet = |source: &str| -> Option<String> {
-        let mut dans_package = false;
-        for ligne in source.lines() {
-            let t = ligne.trim();
-            if t.starts_with('[') {
-                dans_package = t == "[package]";
-                continue;
-            }
-            if !dans_package || t.starts_with('#') {
-                continue;
-            }
-            if let Some(valeur) = t.strip_prefix("name")
-                && let Some(valeur) = valeur.trim_start().strip_prefix('=')
-            {
-                return Some(valeur.trim().trim_matches('"').to_string());
-            }
-        }
-        None
-    };
-
-    // 1. Les membres DECLARES par la liste `members` du manifeste.
-    let manifeste =
-        fs::read_to_string(racine.join("Cargo.toml")).expect("Cargo.toml du workspace illisible");
-    let debut = manifeste
-        .find("members = [")
-        .expect("`members = [` absent du Cargo.toml du workspace");
-    let reste = &manifeste[debut + "members = [".len()..];
-    let fin = reste
-        .find(']')
-        .expect("la liste `members` du workspace n'est pas fermee");
-
-    let mut a_visiter: Vec<String> = reste[..fin]
-        .split(',')
-        .map(|morceau| morceau.trim().trim_matches('"').to_string())
-        .filter(|morceau| !morceau.is_empty())
+    // 1. Les membres du workspace — DECLARES par `members` et IMPLICITES par
+    //    dependance `path`. Lecteur partage avec
+    //    `tout_membre_du_workspace_est_execute_par_une_porte_cargo_test`
+    //    depuis #3266 bis : deux lecteurs jumeaux avaient deja diverge, et
+    //    c'est la divergence qui avait laisse `tune-output-api` hors de la
+    //    ligne `cargo test`.
+    let membres: Vec<String> = membres_du_workspace(&racine)
+        .into_iter()
+        .map(|(nom, _)| nom)
         .collect();
-
-    assert!(
-        a_visiter.len() >= 10,
-        "seulement {} membre(s) reconnu(s) dans le Cargo.toml du workspace — la \
-         forme de la liste `members` a change et ce test ne garde plus rien : \
-         {a_visiter:?}",
-        a_visiter.len()
-    );
-
-    // 2. Les membres IMPLICITES : cargo promeut membre toute dependance `path`
-    //    interne au workspace, meme absente de `members`. C'est ainsi que
-    //    `tune-output-api` entre — via `tune-core`. Les rater, c'est laisser un
-    //    trou exactement de la forme de celui que ce test doit fermer.
-    let mut chemins: Vec<String> = Vec::new();
-    let mut membres: Vec<String> = Vec::new();
-    while let Some(chemin) = a_visiter.pop() {
-        if chemins.iter().any(|deja| *deja == chemin) {
-            continue;
-        }
-        let source = fs::read_to_string(racine.join(&chemin).join("Cargo.toml"))
-            .unwrap_or_else(|e| panic!("{chemin}/Cargo.toml illisible : {e}"));
-
-        membres.push(
-            nom_du_paquet(&source)
-                .unwrap_or_else(|| panic!("{chemin}/Cargo.toml : `[package] name` introuvable")),
-        );
-        chemins.push(chemin.clone());
-
-        for ligne in source.lines() {
-            let t = ligne.trim();
-            if t.starts_with('#') {
-                continue;
-            }
-            let Some(apres) = t.split_once("path = \"") else {
-                continue;
-            };
-            let Some((cible, _)) = apres.1.split_once('"') else {
-                continue;
-            };
-            // Resolu depuis le dossier du membre, puis ramene a la racine : un
-            // `../tune-output-api` depuis `tune-core` donne `tune-output-api`.
-            let mut pile: Vec<&str> = chemin.split('/').collect();
-            for element in cible.split('/') {
-                match element {
-                    "." | "" => {}
-                    ".." => {
-                        if pile.pop().is_none() {
-                            // Sort du depot : ce n'est pas un membre.
-                            pile.push("..");
-                        }
-                    }
-                    autre => pile.push(autre),
-                }
-            }
-            if pile.iter().any(|element| *element == "..") {
-                continue;
-            }
-            let resolu = pile.join("/");
-            if !resolu.is_empty() && racine.join(&resolu).join("Cargo.toml").is_file() {
-                a_visiter.push(resolu);
-            }
-        }
-    }
 
     assert!(
         membres.len() >= 15,

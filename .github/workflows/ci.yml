@@ -241,7 +241,25 @@ jobs:
       # Garde : `tout_membre_du_workspace_est_execute_par_une_porte_cargo_test`
       # (tune-server/tests/workflows_bornes.rs) relit `members` du Cargo.toml
       # racine et tombe des qu'un membre n'est nomme par aucune porte.
-      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge -p tune-cli -p tune-ffi -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,cloud-relay,bandcamp
+      #
+      # #3266 bis — `tune-output-api` (1 031 lignes, SEPT essais) manquait
+      # encore le 06/09/2026. Il est membre du workspace sans figurer dans
+      # `members` : cargo promeut membre toute dependance `path` interne, et
+      # `tune-core` le prend ainsi. La garde ci-dessus ne lisait que `members`,
+      # donc elle ne le voyait pas et restait verte au-dessus du trou ; seule la
+      # porte clippy le nommait, et clippy compile sans executer. Ses essais
+      # gardent le contrat des greffons de sortie : le repli ferme des
+      # capacites inconnues, la resolution de volume (le plancher a -40 dB du
+      # pour-cent) et la relecture d'une charge utile anterieure au champ.
+      # La caisse ne tire que serde, serde_json et async-trait : rien de plus a
+      # compiler ici.
+      #
+      # Place APRES `-p tune-ffi`, comme sur la ligne clippy : la garde
+      # `les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout` exige
+      # que les cinq caisses HTTP extraites restent CONTIGUES jusqu'a
+      # `-p tune-server`. L'inserer au milieu de ce bloc fait rougir cette
+      # garde-la — mesure sur Shrek avant de la deplacer ici.
+      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge -p tune-cli -p tune-ffi -p tune-output-api -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts --no-default-features --features oaat,cloud-relay,bandcamp
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
