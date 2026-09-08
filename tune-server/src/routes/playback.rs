@@ -2995,7 +2995,29 @@ async fn queue_jump(
     }
 }
 
+/// 🔴 #3669 — « Vider la file » est un ORDRE D'ARRÊT, pas un repeint d'écran.
+///
+/// Laurent (fil 182, Atoll ST300 en DLNA) : « Le vidage de la liste de lecture
+/// est visible à l'affichage. Mais l'album continue à être joué. » La route
+/// vidait la table, le préchargement, l'état en mémoire et le fichier
+/// persistant — QUATRE gestes dont aucun ne parlait au périphérique.
+///
+/// `stop_and_clear` porte pourtant « Stop playback » dans son nom et dans son
+/// commentaire : il écrit `PlayState::Stopped` dans un `HashMap` sous mutex et
+/// émet un évènement d'interface. C'est tout. Le renderer, lui, n'a jamais reçu
+/// de `Stop` et continue le flux qu'il tient déjà — « une mise en cache de
+/// l'album en cours qui ne peut être annulé ».
+///
+/// Le vrai arrêt est celui de la route `stop` : `get_zone_device_id` puis
+/// `orchestrator.stop(zone_id, device_id)`, qui persiste la position, écrit
+/// `last_play_state = "stopped"` EN BASE, ferme la session gapless, oublie la
+/// dernière émission réseau et coupe le flux sur la sortie. C'est ce même appel
+/// qui est posé ici, et il vient EN PREMIER : `orchestrator.stop` a besoin du
+/// `now_playing` encore présent pour retrouver le `stream_id` de la session à
+/// fermer, que `stop_and_clear` met à `None` juste après.
 async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+    let device_id = get_zone_device_id(&state, zone_id);
+    state.orchestrator.stop(zone_id, device_id.as_deref()).await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     queue_repo.clear(zone_id).ok();
     state.orchestrator.clear_prefetch().await;
@@ -5957,5 +5979,133 @@ mod demarrage_detache_annonce_3270 {
             "// remplissage\n".repeat(60)
         );
         assert_eq!(demarrages_detaches_muets(&loin), vec![1]);
+    }
+}
+
+/// 🔴 #3669 — vider la file d'attente doit ARRÊTER le périphérique.
+///
+/// Garde de SITE D'APPEL : elle appelle `super::queue_clear`, la route montée
+/// sur `POST /zones/{id}/queue/clear`, et regarde ce qui est SORTI du serveur —
+/// la commande reçue par la sortie, et l'état de lecture écrit en base. Elle ne
+/// lit aucune source : `stop_and_clear` passait déjà cette zone en « stopped »
+/// dans son `HashMap`, et c'est précisément la mesure qui mentait.
+///
+/// Sans l'appel à `orchestrator.stop` posé dans `queue_clear`, les deux
+/// assertions tombent : `stop_call_count()` reste à 0 (le renderer n'a jamais
+/// reçu de `Stop` et continue son flux) et `get_last_play_state` reste
+/// `"playing"`.
+#[cfg(test)]
+mod vider_la_file_arrete_le_peripherique_3669 {
+    use crate::state::AppState;
+    use axum::extract::{Path, State};
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::outputs::mock::MockOutput;
+    use tune_core::playback::NowPlaying;
+
+    const APPAREIL: &str = "uuid:atoll-st300";
+
+    /// Une zone DLNA qui JOUE : une sortie enregistrée, une file, un
+    /// `now_playing`, et `last_play_state = "playing"` en base.
+    async fn zone_en_lecture() -> (AppState, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("AppState");
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = repo
+            .create("Salon", Some("dlna"), Some(APPAREIL))
+            .expect("création de zone");
+        state.outputs.lock().await.register(Box::new(
+            MockOutput::new(APPAREIL, "Atoll ST300").with_type("dlna"),
+        ));
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(
+                zone_id,
+                &[QueueInput::Streaming {
+                    source: "qobuz".into(),
+                    source_id: "a1".into(),
+                    title: "Piste".into(),
+                    artist: "Artiste".into(),
+                    album: None,
+                    cover_url: None,
+                    duration_ms: 200_000,
+                    track_number: None,
+                    disc_number: None,
+                }],
+            )
+            .expect("mise en file");
+        state
+            .playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "Piste".into(),
+                    source: "qobuz".into(),
+                    source_id: Some("a1".into()),
+                    duration_ms: 200_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        repo.save_play_state(zone_id, "playing")
+            .expect("état de lecture initial");
+        (state, zone_id)
+    }
+
+    /// Combien de `Stop` la sortie a REÇUS. Zéro est la mesure du défaut : le
+    /// renderer garde la main sur son flux.
+    async fn arrets_recus(state: &AppState) -> u64 {
+        let registre = state.outputs.lock().await;
+        let arc = registre.get(APPAREIL).expect("sortie enregistrée");
+        let sortie = arc.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("MockOutput")
+            .stop_call_count()
+    }
+
+    #[tokio::test]
+    async fn queue_clear_envoie_un_stop_a_la_sortie_et_ecrit_stopped_en_base() {
+        let (state, zone_id) = zone_en_lecture().await;
+        assert_eq!(
+            arrets_recus(&state).await,
+            0,
+            "rien ne doit être arrêté avant le geste"
+        );
+
+        let _ = super::queue_clear(State(state.clone()), Path(zone_id)).await;
+
+        assert_eq!(
+            arrets_recus(&state).await,
+            1,
+            "« vider la file » doit envoyer UN Stop au périphérique — sans lui, \
+             l'écran affiche « arrêté » et l'album continue (Laurent, fil 182)"
+        );
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("stopped".into()),
+            "la base doit dire « stopped » : c'est elle que relisent le poller \
+             et la reprise, pas le HashMap de PlaybackManager"
+        );
+        assert_eq!(
+            PlayQueueRepo::with_backend(state.backend.clone())
+                .count_all(zone_id)
+                .unwrap_or(-1),
+            0,
+            "et la file reste vidée — l'arrêt s'AJOUTE au geste, il ne le remplace pas"
+        );
+    }
+
+    /// L'autre moitié de la contre-épreuve, en positif : la route `stop`
+    /// produit exactement la même sortie observable. C'est elle qui nomme
+    /// l'appel manquant.
+    #[tokio::test]
+    async fn la_route_stop_produit_la_meme_sortie_observable() {
+        let (state, zone_id) = zone_en_lecture().await;
+        let _ = super::stop(State(state.clone()), Path(zone_id)).await;
+        assert_eq!(arrets_recus(&state).await, 1);
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("stopped".into())
+        );
     }
 }
