@@ -1331,11 +1331,20 @@ pub async fn register_local_outputs(state: &AppState) {
                 "local_audio_output_registered"
             );
 
-            let zone_name = if dev.is_default {
-                "This Computer".to_string()
-            } else {
-                dev.name.clone()
-            };
+            // #1770 : l'étiquette générique ne se minte qu'une fois. Changer
+            // de moteur audio change le NOM du périphérique système, donc son
+            // `device_id`, donc la ligne en base — et la sortie système WASAPI
+            // se voyait offrir un second « This Computer » à côté de celui
+            // d'ASIO (jfpaquet, 0.9.130). La mesure exclut l'appareil courant :
+            // sa propre zone ne doit pas compter contre lui.
+            let generique_deja_pris = zone_repo
+                .etiquette_generique_locale_prise(&device_id)
+                .unwrap_or(false);
+            let zone_name = tune_core::config::nom_de_zone_locale(
+                &dev.name,
+                dev.is_default,
+                generique_deja_pris,
+            );
 
             let zone_exists = zone_repo
                 .get_by_device_id(&device_id)
