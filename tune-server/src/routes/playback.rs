@@ -2759,14 +2759,32 @@ async fn queue_add(
             .into_response();
     }
 
-    let count = inputs.len();
-    let start = match queue_repo.insert_at(zone_id, &inputs, body.position) {
-        Ok(start) => start,
+    // 🔴 #3231 — `added` comptait les pistes DEMANDÉES. Depuis que l'insertion
+    // unifiée saute la piste disparue au lieu d'annuler tout l'ajout, demandé
+    // et écrit ne sont plus le même nombre : annoncer le premier ferait dire à
+    // la réponse « 190 ajoutées » là où la file en porte 3. Un compteur qui
+    // ment est pire qu'un compteur absent (#2394) — on annonce donc ce qui est
+    // ENTRÉ, et on nomme ce qui est tombé.
+    let bilan = match queue_repo.insert_at_bilan(zone_id, &inputs, body.position) {
+        Ok(bilan) => bilan,
         Err(e) => {
             warn!(zone_id, error = %e, "queue_insert_failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     };
+    let count = bilan.inserted();
+    let start = bilan.start;
+    if bilan.has_loss() {
+        let apercu: Vec<i64> = bilan.skipped.iter().take(10).copied().collect();
+        warn!(
+            zone_id,
+            demandees = bilan.requested,
+            ajoutees = count,
+            absentes = bilan.skipped.len(),
+            apercu_ids_absents = ?apercu,
+            "queue_add_pistes_absentes — des pistes demandées n'existent plus en bibliothèque"
+        );
+    }
     let total = queue_repo.count_all(zone_id).unwrap_or(0);
     let current_pos = state.playback.get_state(zone_id).await.queue_position;
     state
@@ -2782,12 +2800,13 @@ async fn queue_add(
     info!(
         zone_id,
         added = count,
+        demandees = bilan.requested,
         position = ?body.position,
         inserted_at = ?start,
         queue_length = total,
         "queue_add_ok"
     );
-    let enfiles = decrire_enfilage(&inputs, start);
+    let enfiles = decrire_enfilage(&inputs, start, &bilan.retenus);
     state.event_bus.emit(
         "playback.queue.track_added",
         json!({
@@ -2835,12 +2854,24 @@ async fn queue_add(
 /// N'interroge RIEN : tout est déjà résolu dans `inputs` (le titre d'une piste
 /// de service y est passé par `resolve_streaming_queue_meta`). Un album de
 /// trente pistes ne coûte donc pas trente requêtes de plus.
-fn decrire_enfilage(inputs: &[QueueInput], start: Option<i64>) -> Vec<serde_json::Value> {
-    inputs
+///
+/// 🔴 #3231 — `retenus` porte les INDICES de `inputs` réellement écrits, dans
+/// l'ordre des positions. Numéroter par l'indice de boucle, comme avant,
+/// annonçait une position pour une piste qui n'était jamais entrée, et décalait
+/// toutes les suivantes : la réponse censée dire où la piste a ATTERRI (#2079)
+/// devenait fausse dès qu'une piste manquait. Le rang dans `retenus` EST le
+/// décalage depuis `start`.
+fn decrire_enfilage(
+    inputs: &[QueueInput],
+    start: Option<i64>,
+    retenus: &[usize],
+) -> Vec<serde_json::Value> {
+    retenus
         .iter()
         .enumerate()
-        .map(|(i, item)| {
-            let position = start.map(|s| s + i as i64);
+        .filter_map(|(rang, &idx)| inputs.get(idx).map(|item| (rang, item)))
+        .map(|(rang, item)| {
+            let position = start.map(|s| s + rang as i64);
             match item {
                 QueueInput::Local { track_id } => json!({
                     "position": position,
