@@ -161,6 +161,40 @@ fn json_body(phase: &str, progress: &Option<MigrationProgress>) -> String {
             None => format!("Tune démarre : {phase}"),
         },
         "migration": migration,
+        // 🔴 #3343 — les DEUX champs que le seul client d'API de ce répondeur
+        // attend, et qu'il ne trouvait pas.
+        //
+        // Le chemin est celui-ci : après une mise à jour, le client web sonde
+        // `GET /api/v1/system/update/status` toutes les 3 s pendant 180 s et
+        // ne recharge la page que si `current_version` a bougé, ou s'il a vu
+        // le serveur tomber ET que `update_in_progress` est faux
+        // (`tune-web-client/src/components/SettingsView.svelte`, boucle de
+        // `installUpdate()` ; `SettingsV2.svelte`, boucle de `installerMaj()`).
+        // Or `getUpdateStatus()` appelle `fetch` SANS regarder `res.ok` : notre
+        // 503 ne lève donc pas, il est lu comme une réponse normale — et cette
+        // réponse ne portait ni l'un ni l'autre. Pendant toute la durée des
+        // migrations du nouveau binaire (25,8 s mesurées le 07/09 sur un
+        // journal de testeur, davantage sur une grande bibliothèque), le
+        // client recevait un JSON parfaitement valide qui ne lui apprenait
+        // RIEN, et il ne pouvait même plus conclure « le serveur est tombé ».
+        // Passé le plafond, la boucle s'arrête sans recharger : l'onglet reste
+        // sur la page d'attente jusqu'à ce qu'on le ferme (fil 1662, JLuc).
+        //
+        // `current_version` est la version du binaire qui démarre — connue
+        // sans base, donc disponible ici — et c'est exactement ce que la route
+        // servira une fois debout (`routes/system/update.rs`, `update_status`).
+        // Le nouveau serveur l'annonce donc dès sa première connexion acceptée,
+        // et le client conclut « la version a bougé » sans attendre la fin des
+        // migrations : il recharge, retombe sur la page HTML d'attente qui se
+        // rafraîchit toute seule, et sort de l'impasse.
+        //
+        // `update_in_progress: false` est un CONSTAT, pas une commodité : ce
+        // répondeur ne tourne que pendant le démarrage, et un démarrage
+        // n'applique aucune mise à jour — celle-ci a eu lieu dans le processus
+        // précédent. Sans lui, `!status?.update_in_progress` valait `!undefined`
+        // par accident ; il vaut désormais la même chose parce que c'est vrai.
+        "current_version": tune_core::version(),
+        "update_in_progress": false,
     })
     .to_string()
 }
@@ -222,6 +256,50 @@ mod tests {
         assert_eq!(v["migration"]["total"], 12);
         assert_eq!(v["migration"]["name"], "upgrade_fts5_tables");
         assert_eq!(v["migration"]["elapsed_s"], 61);
+    }
+
+    /// #3343 — le client qui ATTEND une mise à jour doit pouvoir conclure.
+    ///
+    /// Il ne lit que deux champs (`current_version`, `update_in_progress`) et
+    /// ne regarde pas le code HTTP : tant que la réponse de démarrage ne les
+    /// portait pas, il tournait 180 s dans le vide puis abandonnait sans
+    /// recharger, laissant l'onglet sur la page d'attente.
+    ///
+    /// L'épreuve porte sur les deux formes que sert le répondeur — avec et
+    /// sans migration en cours : c'est justement pendant la migration que le
+    /// client était aveugle, et la sortie sans progression est celle des
+    /// premières secondes du démarrage.
+    #[test]
+    fn le_client_qui_attend_une_mise_a_jour_lit_la_version_qui_demarre() {
+        let sans_migration = response("/api/v1/system/update/status", "démarrage", None);
+        let avec_migration = response(
+            "/api/v1/system/update/status",
+            "base de données",
+            Some(MigrationProgress {
+                engine: "sqlite",
+                done: 0,
+                total: 12,
+                step: "upgrade_fts5_tables".to_string(),
+                elapsed: Duration::from_secs(3),
+            }),
+        );
+
+        for raw in [sans_migration, avec_migration] {
+            let body = raw.split("\r\n\r\n").nth(1).expect("corps absent");
+            let v: serde_json::Value = serde_json::from_str(body).expect("JSON invalide");
+            assert_eq!(
+                v["current_version"],
+                serde_json::Value::String(tune_core::version().to_string()),
+                "la réponse de démarrage doit annoncer la version du binaire \
+                 qui démarre, sinon le client ne voit jamais la version bouger : {body}"
+            );
+            assert_eq!(
+                v["update_in_progress"],
+                serde_json::Value::Bool(false),
+                "un démarrage n'applique aucune mise à jour ; sans ce champ le \
+                 client ne peut pas conclure que le redémarrage est fait : {body}"
+            );
+        }
     }
 
     /// Le navigateur, lui, doit voir une page qui explique et se rafraîchit —
