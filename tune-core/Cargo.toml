@@ -270,6 +270,16 @@ path = "tests/journal_dsf_tag_ecarte_i3180_e7d445.rs"
 name = "octets_servis_inconnus_2394"
 path = "tests/octets_servis_inconnus_2394.rs"
 
+# Meme famille que #2665 / #2890 / #3180, quatrieme fois : abonne `tracing`
+# GLOBAL, donc un binaire a lui seul et UN SEUL test dedans. Il tient la trace
+# qui tranche entre les deux familles de « l'egaliseur coupe le son » (#3479) —
+# zone RESEAU (#3357) ou sortie LOCALE (#1735) — et son autre bord, une seule
+# ligne par changement. `autotests = false` ci-dessus : sans cette cible le
+# fichier ne serait JAMAIS compile.
+[[test]]
+name = "journal_egaliseur_i3479"
+path = "tests/journal_egaliseur_i3479.rs"
+
 [build-dependencies]
 cc = "1"
 
@@ -301,3 +311,10 @@ path = "tests/temoin_resolution_locale.rs"
 [[test]]
 name = "titre_de_remplissage_2060"
 path = "tests/titre_de_remplissage_2060.rs"
+# #3419 — la reprise dans Tune des favoris posés chez le service. Même raison
+# que les cibles ci-dessus : `autotests = false` en tête de ce fichier, sans
+# cette déclaration le témoin ne serait jamais compilé et la porte rendrait un
+# vert contre rien.
+[[test]]
+name = "reprise_favoris_streaming"
+path = "tests/reprise_favoris_streaming.rs"

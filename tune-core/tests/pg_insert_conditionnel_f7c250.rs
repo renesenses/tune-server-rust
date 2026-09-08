@@ -378,3 +378,51 @@ fn garde_de_site_3248() {
          un mensonge sur PostgreSQL."
     );
 }
+
+/// La garde d'EXÉCUTION : un témoin ne vaut que s'il tourne contre une vraie
+/// base.
+///
+/// [`garde_de_site_3248`] relit le SOURCE ; celle-ci relit le WORKFLOW.
+///
+/// Les trois épreuves du module `postgres` ci-dessus prennent leur chemin
+/// « saut annoncé » dès que `TUNE_TEST_PG_URL` est absente. Or elle l'était à
+/// CHAQUE exécution de la CI : la seule étape de `test-postgres.yml` qui
+/// compilait et lançait ce fichier — « Tests tune-core et tune-server avec
+/// PostgreSQL » — ne pose pas la variable, et aucune autre ne nommait cette
+/// cible. Le fichier passait donc au vert sans qu'une seule de ses épreuves
+/// PostgreSQL ait touché une base : la garde de site et la contre-épreuve
+/// SQLite, rien de plus. C'est le « vert contre rien » que le ticket
+/// demandait explicitement d'éviter.
+///
+/// Le découpage par `- name:` isole l'étape : une variable posée sur l'étape
+/// voisine ne compte pas. `include_str!` plutôt qu'une lecture au chemin
+/// courant : le fichier manquant devient une erreur de COMPILATION, pas un
+/// test qui se saute.
+#[test]
+fn garde_d_execution_3248() {
+    const WORKFLOW: &str = include_str!("../../.github/workflows/test-postgres.yml");
+    const CIBLE: &str = "--test pg_insert_conditionnel_f7c250";
+    let etape = WORKFLOW
+        .split("- name:")
+        .find(|bloc| bloc.contains(CIBLE))
+        .unwrap_or_else(|| {
+            panic!(
+                "#3248 — aucune étape de `test-postgres.yml` ne lance \
+                 `{CIBLE}`. Sans elle, les épreuves PostgreSQL de ce fichier \
+                 se sautent en silence et la CI rend un vert contre rien."
+            )
+        });
+    assert!(
+        etape.contains("TUNE_TEST_PG_URL: postgresql://"),
+        "#3248 — l'étape qui lance `{CIBLE}` ne pose pas `TUNE_TEST_PG_URL` : \
+         les trois épreuves y prendraient leur chemin « saut annoncé »."
+    );
+    // La cible doit AUSSI être déclarée : `tune-core` porte `autotests =
+    // false`, donc un fichier non inscrit ne se compile jamais.
+    const MANIFESTE: &str = include_str!("../Cargo.toml");
+    assert!(
+        MANIFESTE.contains("name = \"pg_insert_conditionnel_f7c250\""),
+        "#3248 — cible de test non déclarée dans `tune-core/Cargo.toml` : avec \
+         `autotests = false`, ce fichier ne serait JAMAIS compilé."
+    );
+}

@@ -200,6 +200,25 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2441 -- --nocapture
 
+      # #3248 -- l'INSERT conditionnel sterile, sur une VRAIE base.
+      #
+      # Les temoins de #3248 existent depuis le 03/09 et sont declares dans
+      # `tune-core/Cargo.toml`, mais AUCUNE etape ne leur posait
+      # `TUNE_TEST_PG_URL`. La seule qui les executait -- « Tests tune-core et
+      # tune-server avec PostgreSQL », plus haut -- ne pose pas la variable :
+      # les trois epreuves y prenaient leur chemin « saut annonce » a chaque
+      # execution, et seules la garde de site et la contre-epreuve SQLite
+      # tournaient vraiment. Un vert contre rien, precisement ce que le ticket
+      # demandait d'eviter. Cette etape les EXECUTE, apres les migrations.
+      #
+      # Elle est la seule porte capable de voir le defaut : sur SQLite, un
+      # INSERT conditionnel qui n'ecrit rien rend deja 0 sans erreur. C'est
+      # PostgreSQL, et lui seul, qui annulait la transaction entiere.
+      - name: INSERT conditionnel stérile sur PostgreSQL (#3248)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_insert_conditionnel_f7c250 -- --nocapture
+
       # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
       # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
       # l'autre — et refuse toute colonne que le schema neuf a et qu'aucune
@@ -268,3 +287,21 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_3182_moteur_annonce_dans_le_rapport -- --nocapture --test-threads=1
+
+      # #3256 -- ` RETURNING id` seulement la ou la colonne EXISTE, sur une
+      # VRAIE base.
+      #
+      # Meme angle mort que l'etape de #3248 : les temoins existent depuis le
+      # 03/09 et sont declares dans `tune-core/Cargo.toml`, mais aucune etape
+      # ne leur posait `TUNE_TEST_PG_URL`, donc leurs quatre epreuves
+      # prenaient leur chemin « saut annonce » a chaque execution.
+      #
+      # Aucune autre porte ne peut les remplacer. Le defaut est un
+      # `ERROR: column "id" does not exist` rendu par PostgreSQL sur les
+      # tables a clef composite (`task_runs`, `streaming_auth`) ; sur SQLite
+      # la clause n'est jamais ajoutee, donc la contre-epreuve SQLite du meme
+      # fichier reste verte AVANT comme APRES le correctif. Il faut le moteur.
+      - name: RETURNING id hors des tables à colonne id sur PostgreSQL (#3256)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_returning_id_hors_table_a_id_3256 -- --nocapture

@@ -1660,7 +1660,36 @@ pub(crate) fn extract_dsf_cover(path: &Path) -> Option<(Vec<u8>, String)> {
 ///
 /// For DFF files (or if DSF header / ID3v2 parsing fails), we fall back to
 /// deriving title/album/artist from the file path.
+///
+/// Forme sans balise lofty : lofty n'a rien ouvert, ou n'a rendu aucune
+/// balise. Voir [`dsf_dff_fallback_complete`] pour l'ordre des sources.
 fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
+    dsf_dff_fallback_complete(path, None)
+}
+
+/// Le repli DSF/DFF, avec la balise que lofty a déjà rendue quand il en a une.
+///
+/// # #3180 — trois sources, dans cet ordre, et rien n'est écrasé
+///
+/// 1. les VRAIES balises ID3v2 du fichier, lues par notre propre lecteur ;
+/// 2. ce que lofty avait lu dans sa balise (`tag_lofty`), pour les seuls
+///    champs que le lecteur maison n'a pas rendus ;
+/// 3. le nom de fichier et l'arborescence, pour ce qui manque encore.
+///
+/// Avant, ce repli remplaçait EN BLOC la balise lofty : un `.dsf` dont lofty
+/// lisait bien l'artiste, l'album et l'année mais pas le titre repartait
+/// avec l'artiste = nom du dossier grand-parent et l'année perdue (Pierre M,
+/// fil 920). Et le titre de secours était `file_stem()` BRUT, numéro de piste
+/// compris — « 01 - The Beat Goes On » chez Benjithom (fil 1100) — alors que
+/// les deux autres replis passaient déjà par [`extract_title_from_filename`].
+///
+/// Le passage par le chemin est journalisé en `info!` avec les champs
+/// fabriqués : c'était le seul repli muet, et une piste ainsi remplie était
+/// indistinguable d'une piste correctement taguée.
+fn dsf_dff_fallback_complete(
+    path: &Path,
+    tag_lofty: Option<&lofty::tag::Tag>,
+) -> Option<TrackMetadata> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     if ext != "dsf" && ext != "dff" {
         return None;
@@ -1812,17 +1841,70 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         )
     };
 
-    // Fall back to filename/directory for fields the ID3v2 tag didn't provide.
     // Treat a present-but-empty/whitespace tag as absent: a file whose ALBUM tag
     // is "" (not missing) otherwise produced a blank, untitled album that no
     // amount of re-scanning could name (Bilou #1093). `filter` drops the empty
     // value so the folder-name fallback kicks in.
-    let title = title
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
+    let non_vide = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+    let title = non_vide(title);
+    let mut artist = non_vide(artist);
+    let mut album = non_vide(album);
+    let mut album_artist = non_vide(album_artist);
+    let mut year = year;
+    let mut track_number = track_number;
+    let mut disc_number = disc_number;
+    let mut genre = non_vide(genre);
+
+    // Source 2 (#3180) : ce que lofty avait DÉJÀ lu n'est pas écrasé. Ce
+    // repli est appelé avec sa balise quand lofty a rendu un titre vide sur un
+    // DSD ; l'artiste, l'album et l'année qu'il y avait lus restent bons et
+    // ne doivent pas céder devant un nom de dossier.
+    if let Some(tag) = tag_lofty {
+        use lofty::tag::{Accessor, ItemKey};
+        let texte = |s: Option<std::borrow::Cow<'_, str>>| non_vide(s.map(|s| s.to_string()));
+        artist = artist.or_else(|| texte(tag.artist()));
+        album = album.or_else(|| texte(tag.album()));
+        album_artist = album_artist
+            .or_else(|| non_vide(tag.get_string(ItemKey::AlbumArtist).map(|s| s.to_string())));
+        year = year.or_else(|| tag.date().map(|d| d.year as u32));
+        track_number = track_number.or_else(|| tag.track());
+        disc_number = disc_number.or_else(|| tag.disk());
+        genre = genre.or_else(|| texte(tag.genre()));
+    }
+
+    // Source 3 : le nom de fichier et l'arborescence, pour ce qui manque
+    // encore. Le titre de secours est le nom de fichier SANS son numéro de
+    // piste — « 01 - The Beat Goes On » devient « The Beat Goes On » et le
+    // numéro va dans `track_number` s'il n'y était pas (#3180). Le même
+    // découpage que `tagless_fallback` et le repli à balises partielles.
+    let (numero_du_nom, titre_du_nom) = extract_title_from_filename(path);
     let (album_du_chemin, artiste_du_chemin, disque_du_chemin) = album_artiste_du_chemin(path);
-    let album = album.filter(|s| !s.trim().is_empty()).or(album_du_chemin);
+    let titre_du_chemin = title.is_none();
+    let artiste_du_chemin_pris = artist.is_none() && artiste_du_chemin.is_some();
+    let album_du_chemin_pris = album.is_none() && album_du_chemin.is_some();
+    let title = title
+        .or(titre_du_nom)
+        .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
+    let track_number = track_number.or(numero_du_nom);
+    let album = album.or(album_du_chemin);
     let artist = artist.or(artiste_du_chemin);
+    if titre_du_chemin || artiste_du_chemin_pris || album_du_chemin_pris {
+        // `info!` et non `debug!` : c'est la trace qui manquait deux mois
+        // durant. Elle ne parle QUE quand un champ a été fabriqué depuis le
+        // chemin — un DSD entièrement tagué passe ici sans bruit.
+        tracing::info!(
+            path = %path.display(),
+            titre_du_nom_de_fichier = titre_du_chemin,
+            artiste_du_dossier = artiste_du_chemin_pris,
+            album_du_dossier = album_du_chemin_pris,
+            title = ?title,
+            artist = ?artist,
+            album = ?album,
+            "dsf_dff_fallback_depuis_le_chemin"
+        );
+    } else {
+        tracing::debug!(path = %path.display(), "dsf_dff_fallback_metadata");
+    }
     // `album_artist` n'est PLUS déduit du chemin. C'est le seul repli à tags
     // partiels : le fichier peut porter un ARTIST par piste sans ALBUMARTIST,
     // et y coller un nom de dossier faisait arriver le champ REMPLI au scan.
@@ -2193,20 +2275,25 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
 ///   "01 - Title.wav" -> (Some(1), Some("Title"))
 ///   "01. Title.wav"  -> (Some(1), Some("Title"))
 ///   "01_Title.wav"   -> (Some(1), Some("Title"))
+///   "D1 03 - Title.dsf" -> (Some(3), Some("Title"))   (marque de disque sautée)
 ///   "Title.wav"      -> (None, Some("Title"))
 fn extract_title_from_filename(path: &Path) -> (Option<u32>, Option<String>) {
     let file_name = match path.file_stem().and_then(|s| s.to_str()) {
         Some(n) => n,
         None => return (None, None),
     };
-    if let Some(first_char) = file_name.chars().next()
+    // Rips multi-disques : « D1 03 - Titre » ou « d2-11. Titre ». La marque de
+    // disque n'est sautée QUE si un numéro de piste la suit — « D12 - Purple
+    // Pills » garde son titre entier (#3180).
+    let sans_disque = sauter_marque_de_disque(file_name).unwrap_or(file_name);
+    if let Some(first_char) = sans_disque.chars().next()
         && first_char.is_ascii_digit()
     {
-        let num_str: String = file_name
+        let num_str: String = sans_disque
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect();
-        let after = file_name[num_str.len()..].trim_start_matches([' ', '-', '.', '_']);
+        let after = sans_disque[num_str.len()..].trim_start_matches([' ', '-', '.', '_']);
         let title = if after.is_empty() {
             Some(file_name.to_string())
         } else {
@@ -2423,6 +2510,24 @@ mod tests_titre_de_remplissage {
             Some("Track 6")
         );
     }
+}
+/// Saute une marque de disque « D1 » / « d02 » en tête de nom de fichier,
+/// mais seulement si un numéro de piste vient juste derrière (séparé par
+/// espace, tiret, point ou soulignement). Rend `None` sinon.
+fn sauter_marque_de_disque(nom: &str) -> Option<&str> {
+    let reste = nom.strip_prefix(['D', 'd'])?;
+    let chiffres = reste.chars().take_while(|c| c.is_ascii_digit()).count();
+    if !(1..=2).contains(&chiffres) {
+        return None;
+    }
+    let apres = &reste[chiffres..];
+    let sans_separateur = apres.trim_start_matches([' ', '-', '.', '_']);
+    if sans_separateur.len() == apres.len() {
+        return None;
+    }
+    sans_separateur
+        .starts_with(|c: char| c.is_ascii_digit())
+        .then_some(sans_separateur)
 }
 
 /// Écarter une durée MP3 franchement incohérente avec la taille du fichier.
@@ -2754,6 +2859,9 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     // Benjithom). Because a (mostly-empty) tag *is* present, the `None` branch
     // above never fires. So when lofty's title is empty for a DSD file, prefer
     // our own ID3v2.2/.3/.4 parser, which reads those frames correctly.
+    //
+    // La balise lofty est passée au repli : ce qu'elle contient de bon —
+    // artiste, album, année — n'est plus remplacé par l'arborescence (#3180).
     {
         let ext = path
             .extension()
@@ -2763,7 +2871,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         if matches!(ext.as_str(), "dsf" | "dff")
             && tag.title().map_or(true, |t| t.trim().is_empty())
         {
-            if let Some(meta) = dsf_dff_fallback(path) {
+            if let Some(meta) = dsf_dff_fallback_complete(path, Some(tag)) {
                 if meta
                     .title
                     .as_deref()
@@ -4534,6 +4642,30 @@ mod tests {
     }
 
     #[test]
+    fn nom_de_fichier_prefixes_de_numero_et_marque_de_disque() {
+        // #3180 : les préfixes que le repli DSD laissait dans le titre.
+        let cas = [
+            ("01 - The Beat Goes On.dsf", Some(1), "The Beat Goes On"),
+            ("01. Titre.dsf", Some(1), "Titre"),
+            ("1-Titre.dff", Some(1), "Titre"),
+            ("D1 03 - Titre.dsf", Some(3), "Titre"),
+            ("d2_11.Titre.dsf", Some(11), "Titre"),
+            ("D01-04 Titre.dsf", Some(4), "Titre"),
+            // Marque de disque sans numéro derrière : rien n'est retiré.
+            ("D12 - Purple Pills.dsf", None, "D12 - Purple Pills"),
+            ("Dance 01.dsf", None, "Dance 01"),
+            ("D1.dsf", None, "D1"),
+            // Uniquement un numéro : le nom entier reste le titre.
+            ("07.dsf", Some(7), "07"),
+        ];
+        for (nom, numero_attendu, titre_attendu) in cas {
+            let (numero, titre) = extract_title_from_filename(Path::new(nom));
+            assert_eq!(numero, numero_attendu, "numéro pour {nom}");
+            assert_eq!(titre.as_deref(), Some(titre_attendu), "titre pour {nom}");
+        }
+    }
+
+    #[test]
     fn normalize_format_mp4_aac_no_bit_depth() {
         // AAC (lossy) in M4A container: lofty reports no bit depth
         assert_eq!(normalize_format("mp4", None), "aac");
@@ -4679,9 +4811,135 @@ mod tests {
         let meta = dsf_dff_fallback(Path::new("/music/Miles Davis/Kind of Blue/01-So What.dsf"));
         assert!(meta.is_some());
         let meta = meta.unwrap();
-        assert_eq!(meta.title.as_deref(), Some("01-So What"));
+        // #3180 : le titre de secours n'emporte plus le numéro de piste, qui
+        // va dans `track_number`. Ce témoin figeait « 01-So What ».
+        assert_eq!(meta.title.as_deref(), Some("So What"));
+        assert_eq!(meta.track_number, Some(1));
         assert_eq!(meta.album.as_deref(), Some("Kind of Blue"));
         assert_eq!(meta.artist.as_deref(), Some("Miles Davis"));
+    }
+
+    #[test]
+    fn dsf_fallback_titre_de_secours_sans_numero_de_piste() {
+        // Benjithom, fil 1100 : « 01 - The Beat Goes On.dsf » s'affichait tel
+        // quel. Le numéro part dans `track_number`, le titre est nettoyé.
+        let meta = dsf_dff_fallback(Path::new(
+            "/music/Sonny & Cher/Look at Us/01 - The Beat Goes On.dsf",
+        ))
+        .unwrap();
+        assert_eq!(meta.title.as_deref(), Some("The Beat Goes On"));
+        assert_eq!(meta.track_number, Some(1));
+        assert_eq!(meta.album.as_deref(), Some("Look at Us"));
+        assert_eq!(meta.artist.as_deref(), Some("Sonny & Cher"));
+
+        // Rip multi-disque : marque de disque puis numéro de piste.
+        let meta = dsf_dff_fallback(Path::new("/music/A/B/D1 03 - Titre.dff")).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Titre"));
+        assert_eq!(meta.track_number, Some(3));
+
+        // Sans numéro : le nom entier reste le titre, rien n'est inventé.
+        let meta = dsf_dff_fallback(Path::new("/music/A/B/Blue in Green.dsf")).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Blue in Green"));
+        assert_eq!(meta.track_number, None);
+    }
+
+    #[test]
+    fn dsf_fallback_ne_remplace_pas_la_balise_lofty() {
+        // Pierre M, fil 920 : lofty avait lu artiste, album et année, seul le
+        // titre manquait. Le repli renvoyait TOUT depuis l'arborescence :
+        // artiste = dossier grand-parent, année perdue. Il ne comble plus que
+        // ce qui manque.
+        use lofty::tag::{Accessor, ItemKey, Tag, TagType};
+        use std::io::Write;
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("Dossier Rip").join("Sous-dossier");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("07 - Man On The Corner.dsf");
+        // Un `.dsf` SANS tag ID3v2 : le lecteur maison ne rend rien.
+        std::fs::File::create(&file_path)
+            .unwrap()
+            .write_all(&build_dsf_bytes(None))
+            .unwrap();
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_artist("Genesis".into());
+        tag.set_album("Abacab".into());
+        tag.insert_text(ItemKey::RecordingDate, "1981".into());
+        tag.set_genre("Rock".into());
+
+        let meta = dsf_dff_fallback_complete(&file_path, Some(&tag)).unwrap();
+        assert_eq!(
+            meta.artist.as_deref(),
+            Some("Genesis"),
+            "artiste de la balise, pas du dossier"
+        );
+        assert_eq!(
+            meta.album.as_deref(),
+            Some("Abacab"),
+            "album de la balise, pas du dossier"
+        );
+        assert_eq!(meta.year, Some(1981), "année de la balise conservée");
+        assert_eq!(meta.genre.as_deref(), Some("Rock"));
+        // Le titre manquait partout : nom de fichier, numéro retiré.
+        assert_eq!(meta.title.as_deref(), Some("Man On The Corner"));
+        assert_eq!(meta.track_number, Some(7));
+        assert_eq!(meta.disc_number, None);
+        assert_eq!(meta.album_artist, None);
+
+        // Sans balise lofty, le même fichier retombe bien sur le chemin —
+        // c'est le comportement des deux autres sites d'appel, inchangé.
+        let meta = dsf_dff_fallback_complete(&file_path, None).unwrap();
+        assert_eq!(meta.artist.as_deref(), Some("Dossier Rip"));
+        assert_eq!(meta.album.as_deref(), Some("Sous-dossier"));
+        assert_eq!(meta.year, None);
+    }
+
+    #[test]
+    fn dsf_fallback_les_vraies_balises_priment_sur_lofty() {
+        // Le lecteur maison a lu le tag ID3v2 : c'est LUI la source, la
+        // balise lofty (suspecte, puisque son titre est vide) ne comble que
+        // les trous — ici l'année, absente du tag ID3v2.
+        use lofty::tag::{Accessor, ItemKey, Tag, TagType};
+        use std::io::Write;
+        let tmp = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let id3_tag = build_id3v2_tag(&[("TIT2", "So What"), ("TPE1", "Miles Davis")]);
+        std::fs::File::create(tmp.path())
+            .unwrap()
+            .write_all(&build_dsf_bytes(Some(&id3_tag)))
+            .unwrap();
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_artist("Mauvais artiste".into());
+        tag.set_album("Kind of Blue".into());
+        tag.insert_text(ItemKey::RecordingDate, "1959".into());
+
+        let meta = dsf_dff_fallback_complete(tmp.path(), Some(&tag)).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("So What"));
+        assert_eq!(meta.artist.as_deref(), Some("Miles Davis"));
+        assert_eq!(meta.album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(meta.year, Some(1959));
+    }
+
+    #[test]
+    fn try_read_metadata_dsf_titre_vide_garde_les_balises_et_nettoie_le_titre() {
+        // De bout en bout : un `.dsf` dont le tag ID3v2 porte artiste et album
+        // mais pas de titre. lofty rend une balise au titre vide ; le repli
+        // doit garder l'artiste du tag (pas le dossier) et tirer le titre du
+        // nom de fichier, numéro retiré.
+        use std::io::Write;
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("V_DSF").join("Genesis - Abacab");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("07 - Man On The Corner.dsf");
+        let id3_tag = build_id3v2_tag(&[("TPE1", "Genesis"), ("TALB", "Abacab"), ("TDRC", "1981")]);
+        std::fs::File::create(&file_path)
+            .unwrap()
+            .write_all(&build_dsf_bytes(Some(&id3_tag)))
+            .unwrap();
+        let meta = try_read_metadata(&file_path).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Man On The Corner"));
+        assert_eq!(meta.track_number, Some(7));
+        assert_eq!(meta.artist.as_deref(), Some("Genesis"));
+        assert_eq!(meta.album.as_deref(), Some("Abacab"));
+        assert_eq!(meta.year, Some(1981));
     }
 
     #[test]

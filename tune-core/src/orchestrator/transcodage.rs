@@ -14,6 +14,95 @@ pub(super) const SUPERSEDED_BEFORE_TRANSCODE: &str = "__superseded_before_transc
 pub(super) static TRANSCODE_GATE: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// De quoi savoir, PENDANT un pré-transcodage, qu'une demande de lecture plus
+/// récente a pris la zone (#3444).
+///
+/// La supersession était déjà DÉTECTÉE — huit
+/// `orchestrator_play_superseded_before_transcode` en 102 s sur le .18 en
+/// 0.9.136 — mais jamais AGIE : le seul test avait lieu APRÈS
+/// `transcode_to_temp_file_complete`, et se contentait de JETER le résultat
+/// (`orchestrator_play_superseded_skipping_output`, `resolve_ms=102170`). Les
+/// 102 s de calcul étaient donc intégralement perdues, ET la zone restait prise
+/// pendant toute leur durée : le verrou par fichier (`TRANSCODE_GATE`, tenu
+/// dans `transcoder_vers_fichier`) n'est rendu qu'au retour de la fonction, si
+/// bien que toute demande visant le même fichier attendait la fin d'un travail
+/// déjà condamné.
+///
+/// Les deux grandeurs du ticket sont indépendantes : raccourcir le
+/// transcodage (0.9.140, traitement au fil de l'eau) réduit la FENÊTRE, il ne
+/// la supprime pas. La borne du blocage ne vient pas du format mais du budget :
+/// `transcode_budget_for` accorde 120 s au plancher et
+/// `PLAFOND_BUDGET_TRANSCODAGE` en autorise 1 800. L'abandon en vol rend la
+/// zone au geste le plus récent au pas de sondage près (250 ms), quelle que
+/// soit la longueur du transcodage.
+#[derive(Clone)]
+pub(super) struct Supersession {
+    pub(super) playback: Arc<PlaybackManager>,
+    pub(super) zone_id: i64,
+    /// Le `play_seq` de la lecture QUI transcode, capturé avant de prendre le
+    /// verrou par fichier. Toute autre valeur signifie qu'une lecture plus
+    /// récente a bumpé la génération de la zone.
+    pub(super) seq: u64,
+}
+
+impl Supersession {
+    /// `Some(seq)` quand une lecture plus récente a pris la zone ; `seq` est
+    /// alors celui de la demande qui prend la main — c'est lui que le journal
+    /// doit nommer.
+    async fn gagnant(&self) -> Option<u64> {
+        let courant = self.playback.current_play_seq(self.zone_id).await;
+        (courant != self.seq).then_some(courant)
+    }
+}
+
+/// Pourquoi un pré-transcodage surveillé a rendu la main sans avoir fini.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum FinDeTranscodage {
+    /// Budget épuisé : l'hôte est trop lent pour ce fichier (#3140).
+    Budget(DepassementBudget),
+    /// Une demande de lecture plus récente a pris la zone (#3444) : on
+    /// abandonne SUR PLACE au lieu de finir un travail dont la sortie sera de
+    /// toute façon jetée.
+    Preempte {
+        /// `play_seq` de la demande qui prend la main.
+        gagnant: u64,
+        /// Temps de transcodage jeté par l'abandon — ce que l'ancien code
+        /// laissait courir jusqu'au bout.
+        perdu: std::time::Duration,
+    },
+}
+
+/// Écrit le pré-transcodage dans son fichier temporaire, sauf si l'abandon est
+/// tombé entre-temps — et efface ce qui vient d'être écrit s'il est tombé
+/// PENDANT l'écriture.
+///
+/// L'abandon de #3444 lâche la tâche asynchrone du transcodage ; il ne peut
+/// pas interrompre ce qui est déjà parti sur le pool bloquant, et la dernière
+/// étape de `transcode_source_to_file` est justement une écriture bloquante.
+/// Sans ce drapeau, un abandon tombant dans cette fenêtre déposait un
+/// `tune-transcode-*` que plus personne ne connaissait :
+/// `cleanup_leftover_transcode_files` ne le ramasse qu'au prochain démarrage du
+/// serveur. Le contrat tenu ici est simple — **abandon posé ⇒ aucun fichier
+/// temporaire ne subsiste**, que l'écriture ait commencé ou non.
+pub(super) fn ecrire_sauf_si_abandonne(
+    dest: &str,
+    octets: &[u8],
+    abandon: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    let abandonne = || abandon.is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed));
+    // Chemin rapide : rien à écrire pour personne, et pas 60 Mio à poser sur
+    // le disque pour les effacer dans la foulée.
+    if abandonne() {
+        return Ok(());
+    }
+    std::fs::write(dest, octets).map_err(|e| format!("write temp file: {e}"))?;
+    // Course : l'abandon a pu tomber pendant l'écriture ci-dessus.
+    if abandonne() {
+        let _ = std::fs::remove_file(dest);
+    }
+    Ok(())
+}
+
 /// Decode `source` to PCM, reduce its bit depth to `target_bd` when the source
 /// is deeper, apply the zone `eq` if any, encode to `target_fmt`, and write the
 /// result to `dest`. Returns `(encoded_size, pcm_bytes, actual_bit_depth)`.
@@ -236,19 +325,25 @@ impl DepassementBudget {
     }
 }
 
-/// Surveille `travail` sous un budget qui s'étend selon le débit mesuré.
+/// Surveille `travail` sous un budget qui s'étend selon le débit mesuré, et
+/// l'abandonne dès qu'une demande de lecture plus récente prend la zone.
 ///
 /// Remplace le `tokio::time::timeout` fixe. L'horloge est celle de tokio
 /// (`tokio::time::Instant`), pas `std::time::Instant` : c'est ce qui rend la
 /// contre-épreuve possible sans AUCUN `sleep` réel — un test sous
 /// `#[tokio::test(start_paused = true)]` avance cette horloge virtuellement.
+///
+/// `supersession` à `None` : le travail n'appartient à aucune zone (le
+/// pré-chauffage en fond, les essais) et n'est jamais préempté — comportement
+/// strictement inchangé.
 pub(super) async fn transcoder_sous_budget<F, T>(
     travail: F,
     progres: std::sync::Arc<crate::audio::decode_progress::DecodeProgress>,
     politique: BudgetAdaptatif,
     pas: std::time::Duration,
     journal: Option<&str>,
-) -> Result<T, DepassementBudget>
+    supersession: Option<&Supersession>,
+) -> Result<T, FinDeTranscodage>
 where
     F: std::future::Future<Output = T>,
 {
@@ -264,6 +359,18 @@ where
             _ = tokio::time::sleep(pas) => {}
         }
         let ecoule = debut.elapsed();
+        // L'abandon PASSE AVANT le budget : un travail que plus personne
+        // n'attend n'a pas à être mesuré, et surtout pas à être attendu. C'est
+        // le point de contrôle que #3444 réclamait — celui qui existait déjà
+        // dans `resolve_local`, mais seulement APRÈS la fin du transcodage.
+        if let Some(sup) = supersession {
+            if let Some(gagnant) = sup.gagnant().await {
+                return Err(FinDeTranscodage::Preempte {
+                    gagnant,
+                    perdu: ecoule,
+                });
+            }
+        }
         let decode = std::time::Duration::from_millis(progres.decoded_ms());
         if decode > std::time::Duration::ZERO {
             sondages += 1;
@@ -294,13 +401,13 @@ where
             }
         }
         if ecoule >= budget {
-            return Err(DepassementBudget {
+            return Err(FinDeTranscodage::Budget(DepassementBudget {
                 budget,
                 ecoule,
                 decode,
                 facteur,
                 piste_s: politique.piste_s,
-            });
+            }));
         }
     }
 }
@@ -317,6 +424,12 @@ pub(super) async fn transcode_source_to_file(
     replaygain: Option<f64>,
     dest: String,
     progres: Option<std::sync::Arc<crate::audio::decode_progress::DecodeProgress>>,
+    // `abandon` est levé quand une lecture plus récente a pris la zone
+    // (#3444) : la dernière étape, une écriture bloquante que l'abandon ne
+    // peut pas interrompre, ne doit alors laisser aucun fichier derrière elle.
+    // `None` pour tout ce qui n'appartient à aucune zone (le pré-chauffage en
+    // fond, les essais).
+    abandon: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // LAT-F1 (phase 2a) : le chemin fichier reste le seul où le renderer
     // attend le morceau ENTIER (cible FLAC, Content-Length exigé). Avant de
@@ -403,7 +516,7 @@ pub(super) async fn transcode_source_to_file(
     let file_size = encoded_data.len() as u64;
     let encoded_clone = encoded_data.clone();
     tokio::task::spawn_blocking(move || {
-        std::fs::write(&dest, &encoded_clone).map_err(|e| format!("write temp file: {e}"))
+        ecrire_sauf_si_abandonne(&dest, &encoded_clone, abandon.as_deref())
     })
     .await
     .map_err(|e| format!("write task panic: {e}"))??;

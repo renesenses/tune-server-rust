@@ -860,6 +860,13 @@ async fn le_gestionnaire_ne_propose_plus_les_fiches_de_l_ere_python() {
     // Témoin vert : la fiche gardée sort INCHANGÉE. Un identifiant qui bouge
     // casse les installations existantes ; un libellé qui bouge casse la
     // reconnaissance à l'écran.
+    //
+    // « Inchangée » se vérifie champ à champ depuis #3408, et non par égalité
+    // de l'objet entier : le tri AJOUTE désormais `compatible` aux fiches
+    // qu'il garde (une fiche gardée est, par construction, un greffon que ce
+    // binaire sait charger). L'égalité stricte confondait « aucun champ
+    // modifié » — ce que la garantie promet — avec « aucun champ ajouté », ce
+    // qu'elle n'a jamais promis.
     let gardee = rendues[0];
     let semee: Value = serde_json::from_str(FICHES_HERITEES).unwrap();
     let attendue = semee
@@ -868,10 +875,115 @@ async fn le_gestionnaire_ne_propose_plus_les_fiches_de_l_ere_python() {
         .iter()
         .find(|f| f["name"] == "horscatalogue")
         .unwrap();
+    for (clef, valeur) in attendue.as_object().unwrap() {
+        assert_eq!(
+            gardee.get(clef),
+            Some(valeur),
+            "la fiche vivante doit traverser le tri sans qu'un champ bouge \
+             (champ « {clef} », fiche rendue : {gardee})"
+        );
+    }
     assert_eq!(
-        gardee, attendue,
-        "la fiche vivante doit traverser le tri telle quelle"
+        gardee["compatible"], true,
+        "une fiche héritée gardée nomme un greffon chargeable : elle doit \
+         être dite compatible, sans quoi l'écran la grise ({gardee})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `compatible` : le champ que la route n'émettait pas (#3408)
+// ---------------------------------------------------------------------------
+
+/// Le défaut du ticket, pris là où il se produit : dans le CORPS de la liste.
+///
+/// Querite, 05/09/2026 : toutes ses extensions portaient le badge rouge
+/// « INCOMPATIBLE » et le bouton « Installer » du catalogue était grisé. La
+/// cause n'est pas un calcul faux, c'est une ABSENCE : `GET /api/v1/plugins`
+/// n'émettait `compatible` sur aucune de ses trois entrées, et un champ absent
+/// est faux en JavaScript. L'écran précédent le masquait en normalisant la
+/// liste avant affichage ; le nouveau lisait la réponse telle quelle.
+///
+/// Le correctif client ne suffit pas et c'est tout l'objet de ce test : les
+/// clients DÉJÀ PUBLIÉS — ceux des testeurs, ceux des versions passées — n'ont
+/// pas cette normalisation. Seul le champ côté serveur les protège.
+///
+/// On n'énumère pas les entrées attendues : le jeu de fonctionnalités livré en
+/// compile d'autres (dj, karaoke, bandcamp, plugins-wasm). L'assertion porte
+/// sur TOUTES les entrées rendues, quelles qu'elles soient — c'est exactement
+/// la promesse de Querite : plus une seule fiche muette.
+#[tokio::test]
+async fn aucune_fiche_de_la_liste_ne_sort_sans_compatible() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(
+        &state,
+        "http://127.0.0.1:0",
+        vec![Box::new(Loads), Box::new(OptIn), Box::new(Uncatalogued)],
+    )
+    .await;
+    // Une fiche héritée VIVANTE dans le lot : la quatrième famille d'entrées,
+    // celle qui ressort de la clef de réglages `plugins` (#2132).
+    semer_les_fiches_heritees(&state);
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/plugins").await;
+    assert_eq!(status, StatusCode::OK);
+    let liste: Value = serde_json::from_str(&body).unwrap();
+    let entrees = liste.as_array().expect("un tableau");
+    assert!(!entrees.is_empty(), "la liste ne doit pas être vide");
+
+    for fiche in entrees {
+        let nom = fiche["name"].as_str().unwrap_or("<sans nom>");
+        assert!(
+            fiche.get("compatible").and_then(Value::as_bool).is_some(),
+            "« {nom} » sort sans `compatible` : le client la grisera ({fiche})"
+        );
+        assert_eq!(
+            fiche["compatible"], true,
+            "rien n'est incompatible sur ce serveur nu — « {nom} » ({fiche})"
+        );
+    }
+
+    // Et nommément les deux familles du relevé de Querite : l'intégrée
+    // (xtune) et une SDK (bandcamp chez lui, `loads` ici).
+    for attendu in ["xtune", "loads", "optin", "horscatalogue"] {
+        let fiche = entrees
+            .iter()
+            .find(|f| f["name"] == attendu)
+            .unwrap_or_else(|| panic!("« {attendu} » doit figurer dans la liste"));
+        assert_eq!(fiche["compatible"], true, "{fiche}");
+    }
+}
+
+/// La fiche unitaire répond comme la liste.
+///
+/// `/plugins/{nom}` sert le même type au client (`MergedPlugin`, contrat web),
+/// et `compatible` y est tout aussi obligatoire. Deux verdicts différents pour
+/// la même extension selon la route serait le défaut d'origine sous une autre
+/// forme : l'écran de détail grisant ce que la liste propose.
+#[tokio::test]
+async fn la_fiche_unitaire_porte_aussi_compatible() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Loads)]).await;
+
+    let app = tune_server::routes::router(state.clone());
+
+    // Chargé.
+    let (status, body) = body_of(&app, "/api/v1/plugins/loads").await;
+    assert_eq!(status, StatusCode::OK);
+    let fiche: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(fiche["status"], "loaded", "{fiche}");
+    assert_eq!(fiche["compatible"], true, "{fiche}");
+
+    // Inconnu de ce binaire : « pas installé » n'est pas « incompatible ».
+    // Le client doit pouvoir afficher la raison réelle, pas un badge rouge
+    // qui parle de version.
+    let (status, body) = body_of(&app, "/api/v1/plugins/inconnu").await;
+    assert_eq!(status, StatusCode::OK);
+    let fiche: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(fiche["status"], "not_installed", "{fiche}");
+    assert_eq!(fiche["compatible"], true, "{fiche}");
 }
 
 /// `GET /api/v1/system/plugins` est l'alias historique, et il lisait la clef

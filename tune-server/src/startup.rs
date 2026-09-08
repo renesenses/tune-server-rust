@@ -1268,13 +1268,11 @@ pub async fn register_local_outputs(state: &AppState) {
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-        let auto_create =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                .get("zone_auto_create")
-                .ok()
-                .flatten()
-                .map(|v| v != "false")
-                .unwrap_or(true);
+        // #3529 : lecture unique, portée par `ZoneRepo`. Ce chemin-ci garde sa
+        // règle propre — `local_zone_action` autorise la sortie système par
+        // défaut, c'est le sens de #1770 — mais il ne relit plus le réglage
+        // lui-même.
+        let auto_create = zone_repo.zone_auto_create_autorise();
         // Un backend est censé marquer une seule sortie par défaut. `find`
         // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
         let system_default_device_id = first_system_default_name(
