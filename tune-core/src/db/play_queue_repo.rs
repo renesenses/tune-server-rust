@@ -458,6 +458,45 @@ impl SetQueueOutcome {
     }
 }
 
+/// Ce que `insert_at` a réellement écrit.
+///
+/// 🔴 #3231 — le MÊME défaut que `set_queue`, à l'autre bout de la file.
+/// `set_queue` (remplacement) et `add_tracks` (ajout local) sautent depuis
+/// #3247 la piste sans ligne dans `tracks` et comptent les insertions
+/// RÉUSSIES. `insert_at` — l'insertion UNIFIÉE, celle du « Lire ensuite » et de
+/// l'ajout en fin de file — était restée sur l'INSERT nu : elle ne sautait
+/// rien, elle TOMBAIT, et la demande entière était perdue.
+///
+/// L'appelant reçoit donc, comme pour `set_queue`, ce qui est entré et ce qui
+/// est tombé : un compteur qui ment est pire qu'un compteur absent (#2394).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InsertOutcome {
+    /// Position réelle de la PREMIÈRE ligne écrite, `None` quand rien ne l'a
+    /// été (liste vide, ou toutes les pistes absentes de `tracks`).
+    pub start: Option<i64>,
+    /// Nombre d'entrées passées à `insert_at`.
+    pub requested: usize,
+    /// Indices de `items` réellement écrits, dans l'ordre des positions : la
+    /// ligne `retenus[k]` occupe `start + k`. C'est ce rang — et non l'indice
+    /// de boucle — que la réponse HTTP doit annoncer (#2079 : dire où la piste
+    /// a ATTERRI, pas où on l'a demandée).
+    pub retenus: Vec<usize>,
+    /// Identifiants locaux sans ligne dans `tracks`, dans l'ordre demandé.
+    pub skipped: Vec<i64>,
+}
+
+impl InsertOutcome {
+    /// Nombre de lignes réellement écrites.
+    pub fn inserted(&self) -> usize {
+        self.retenus.len()
+    }
+
+    /// Vrai dès qu'au moins une entrée est tombée.
+    pub fn has_loss(&self) -> bool {
+        !self.skipped.is_empty()
+    }
+}
+
 pub struct PlayQueueRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -911,7 +950,7 @@ impl PlayQueueRepo {
     /// track instead of at the end of the album (Sandro S1).
     ///
     /// Renvoie la position **réelle** de la première ligne insérée, `None`
-    /// quand `items` est vide — aucune ligne, donc aucune position.
+    /// quand rien n'a été écrit — liste vide, ou toutes les pistes disparues.
     ///
     /// Cette valeur n'est pas décorative : `position` est **ramenée** dans
     /// `0..=max_pos + 1`. Un client qui demande « juste après la piste en
@@ -919,25 +958,80 @@ impl PlayQueueRepo {
     /// de file, et l'écriture réussit dans les deux cas. Sans la position
     /// effective, un appelant ne peut pas distinguer les deux (#2079) : il ne
     /// lui reste qu'à relire toute la file pour savoir ce qu'il vient de faire.
+    ///
+    /// Enveloppe de [`Self::insert_at_bilan`], qui dit EN PLUS ce qui est
+    /// tombé. Cette signature-ci reste pour les appelants qui n'ont besoin que
+    /// de la position.
     pub fn insert_at(
         &self,
         zone_id: i64,
         items: &[QueueInput],
         position: Option<i64>,
     ) -> Result<Option<i64>, String> {
+        self.insert_at_bilan(zone_id, items, position)
+            .map(|bilan| bilan.start)
+    }
+
+    /// Comme [`Self::insert_at`], et REND COMPTE de ce qui est tombé.
+    ///
+    /// 🔴 #3231 — le TROISIÈME site de la même famille, et le dernier resté nu.
+    ///
+    /// `set_queue` et `add_tracks` insèrent depuis #3247 par
+    /// `insert_local_at_if_exists`, un INSERT gardé qui rend `Ok(0)` sur une
+    /// piste disparue. `insert_at` — l'insertion UNIFIÉE : « Lire ensuite » et
+    /// « Ajouter à la file » (`POST /playback/queue`, `routes/playback.rs`),
+    /// l'enfilage d'un greffon (`plugins_host.rs`), la restauration d'une file
+    /// au démarrage (`queue_persistence.rs`) — écrivait encore par
+    /// `insert_local_at`, un `INSERT … VALUES` **nu**.
+    ///
+    /// Or `queue_items.track_id` porte `REFERENCES tracks(id)` et le schéma
+    /// pose `PRAGMA foreign_keys=ON` (`db/sqlite.rs`) : un seul identifiant
+    /// périmé — piste supprimée, rescan qui a réécrit ses lignes — levait
+    /// « FOREIGN KEY constraint failed » et annulait TOUTE la transaction, y
+    /// compris le décalage déjà ouvert. Un « ajouter ces 190 titres » dont UNE
+    /// piste avait disparu n'ajoutait donc RIEN, et la route rendait 500 sans
+    /// nommer la piste fautive. C'est le symptôme jumeau de celui de Pierre M :
+    /// la file perd des lignes sans le dire.
+    ///
+    /// Trois choses ici, et les trois ensemble :
+    ///
+    /// 1. la garde `WHERE EXISTS` remplace l'INSERT nu — la ligne absente est
+    ///    sautée, la transaction survit et les autres pistes entrent ;
+    /// 2. la position compte les insertions **réussies**, pas les tours de
+    ///    boucle — sans quoi on refermerait le défaut d'origine de #3231 par un
+    ///    autre trou, celui-là même que `next_position_inner` ne sait pas
+    ///    franchir ;
+    /// 3. le reliquat du décalage est refermé, pour que les positions restent
+    ///    `0..N-1` — la seule forme que `next_position_inner` et `get_at`
+    ///    savent parcourir.
+    pub fn insert_at_bilan(
+        &self,
+        zone_id: i64,
+        items: &[QueueInput],
+        position: Option<i64>,
+    ) -> Result<InsertOutcome, String> {
         if items.is_empty() {
-            return Ok(None);
+            return Ok(InsertOutcome::default());
         }
         let max_pos_sql = self.dialect_sql(sql::max_position_any, sql::max_position_any);
         let shift_sql = self.dialect_sql(sql::shift_positions, sql::shift_positions);
-        let insert_local_sql = self.dialect_sql(sql::insert_local_at, sql::insert_local_at);
+        let insert_local_sql = self.dialect_sql(
+            sql::insert_local_at_if_exists,
+            sql::insert_local_at_if_exists,
+        );
         let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
         let n = items.len() as i64;
         // Renseignée DANS la transaction, lue après elle : `write_tx` peut
         // rejouer la fermeture (base occupée), et c'est le dernier passage —
         // celui qui a réellement commité — qui doit gagner.
         let mut start_effectif: i64 = 0;
+        let mut retenus: Vec<usize> = Vec::with_capacity(items.len());
+        let mut absentes: Vec<i64> = Vec::new();
         self.db.write_tx(&mut |tx| {
+            // `write_tx` prend un FnMut : repartir d'une ardoise propre pour
+            // qu'une fermeture rejouée ne compte pas deux fois la même perte.
+            retenus.clear();
+            absentes.clear();
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
             let max_pos: i64 = tx
                 .query_one(&max_pos_sql, &p)?
@@ -950,11 +1044,21 @@ impl PlayQueueRepo {
             let sp: [&dyn ToSqlValue; 3] = [&n, &zone_id, &start];
             tx.execute(&shift_sql, &sp)?;
             for (i, item) in items.iter().enumerate() {
-                let pos = start + i as i64;
+                // La position suit les lignes DÉJÀ écrites, pas l'indice de
+                // boucle : c'est toute la leçon de #3231.
+                let pos = start + retenus.len() as i64;
                 match item {
                     QueueInput::Local { track_id } => {
-                        let p: [&dyn ToSqlValue; 3] = [&zone_id, track_id, &pos];
-                        tx.execute(&insert_local_sql, &p)?;
+                        let p: [&dyn ToSqlValue; 4] = [&zone_id, track_id, &pos, track_id];
+                        // Compter les lignes RÉELLEMENT écrites, comme
+                        // `set_queue` et `add_tracks` : zéro ligne signifie que
+                        // la piste n'existe plus. C'est une perte, elle se
+                        // déclare, et la position ne saute pas.
+                        if tx.execute(&insert_local_sql, &p)? == 0 {
+                            absentes.push(*track_id);
+                            continue;
+                        }
+                        retenus.push(i);
                     }
                     QueueInput::Streaming {
                         source,
@@ -981,12 +1085,44 @@ impl PlayQueueRepo {
                             disc_number,
                         ];
                         tx.execute(&insert_streaming_sql, &p)?;
+                        retenus.push(i);
                     }
                 }
             }
+            // Le décalage a ouvert `n` places ; si moins de lignes ont pu s'y
+            // écrire, refermer le reliquat pour que les positions restent
+            // `0..N-1`. Sans cela, une piste disparue au milieu d'un « Lire
+            // ensuite » laisserait exactement le trou que #3231 ferme ailleurs.
+            // En ajout de fin (`start = max + 1`) il n'y a rien derrière : le
+            // décalage ne rencontre aucune ligne et ne coûte rien.
+            let manquantes = n - retenus.len() as i64;
+            if manquantes > 0 {
+                let recul = -manquantes;
+                let depuis = start_effectif + n;
+                let sp: [&dyn ToSqlValue; 3] = [&recul, &zone_id, &depuis];
+                tx.execute(&shift_sql, &sp)?;
+            }
             Ok(())
         })?;
-        Ok(Some(start_effectif))
+        if !absentes.is_empty() {
+            let apercu: Vec<i64> = absentes.iter().take(10).copied().collect();
+            warn!(
+                zone_id,
+                demandees = items.len(),
+                inserees = retenus.len(),
+                absentes = absentes.len(),
+                apercu_ids_absents = ?apercu,
+                "insert_at_pistes_absentes"
+            );
+        }
+        Ok(InsertOutcome {
+            // Aucune ligne écrite : AUCUNE position à annoncer. Rendre `start`
+            // ici ferait croire à un ajout qui n'a pas eu lieu.
+            start: (!retenus.is_empty()).then_some(start_effectif),
+            requested: items.len(),
+            retenus: std::mem::take(&mut retenus),
+            skipped: std::mem::take(&mut absentes),
+        })
     }
 
     /// Append items at the end of the unified queue.
@@ -2717,5 +2853,202 @@ mod tests {
                 "la position {p} doit rester une ligne de service"
             );
         }
+    }
+
+    // ── #3231, TROISIEME foyer : l'insertion UNIFIEE ─────────────────────
+    //
+    // `set_queue` (remplacement) et `add_tracks` (ajout local) sont denses et
+    // gardes depuis #3247/#3248. `insert_at` — « Lire ensuite » et « Ajouter a
+    // la file » (`routes/playback.rs::queue_add`), l'enfilage d'un greffon
+    // (`plugins_host.rs`), la restauration au demarrage
+    // (`queue_persistence.rs`) — inserait encore par `insert_local_at`, un
+    // `INSERT … VALUES` NU. Le site d'appel a garder est donc `insert_at` /
+    // `insert_at_bilan`, pas le SQL.
+
+    /// La file mixte de reference : deux pistes locales puis une ligne de
+    /// service, aux positions 0, 1, 2.
+    fn file_mixte_de_trois() -> (SqliteDb, PlayQueueRepo, i64, i64) {
+        let db = test_db();
+        let repo = PlayQueueRepo::new(db.clone());
+        let a = une_piste_de_plus(&db, "mixte-a");
+        let b = une_piste_de_plus(&db, "mixte-b");
+        repo.insert_at(1, &[local(a), local(b), streaming("s0", "Service")], None)
+            .unwrap();
+        (db, repo, a, b)
+    }
+
+    /// 🔴 CONTRE-EPREUVE #3231 — une piste disparue n'annule plus l'ajout
+    /// UNIFIE.
+    ///
+    /// Avec l'INSERT nu, `queue_items.track_id REFERENCES tracks(id)` +
+    /// `PRAGMA foreign_keys=ON` faisaient lever « FOREIGN KEY constraint
+    /// failed » des le fantome : `write_tx` annulait TOUTE la transaction, donc
+    /// aucune des pistes valides n'entrait et la route rendait 500. Retirer la
+    /// garde de `insert_at_bilan` rend ce test ROUGE sur la premiere assertion
+    /// (`insert_at_bilan` renvoie `Err`).
+    #[test]
+    fn l_ajout_unifie_saute_la_piste_absente_au_lieu_de_tout_annuler() {
+        let db = test_db();
+        let repo = PlayQueueRepo::new(db.clone());
+        let a = une_piste_de_plus(&db, "u-a");
+        let b = une_piste_de_plus(&db, "u-b");
+        let c = une_piste_de_plus(&db, "u-c");
+        // Un identifiant tres au-dessus de tout ce que la base a distribue.
+        let fantome = 900_101i64;
+
+        let bilan = repo
+            .insert_at_bilan(1, &[local(a), local(fantome), local(b), local(c)], None)
+            .expect("un identifiant perime ne doit pas annuler l'ajout entier");
+
+        assert_eq!(bilan.requested, 4);
+        assert_eq!(bilan.inserted(), 3, "les trois pistes reelles sont entrees");
+        assert_eq!(
+            bilan.skipped,
+            vec![fantome],
+            "et la perte est NOMMEE, pas seulement comptee"
+        );
+        assert!(bilan.has_loss());
+        assert_eq!(bilan.start, Some(0));
+        assert_eq!(
+            bilan.retenus,
+            vec![0, 2, 3],
+            "les rangs rendus designent les entrees REELLEMENT ecrites"
+        );
+
+        let ordre = repo.get_ordered(1).unwrap();
+        assert_eq!(
+            ordre.iter().map(|e| e.position).collect::<Vec<i64>>(),
+            vec![0, 1, 2],
+            "les positions restent denses malgre le saut"
+        );
+        assert_eq!(
+            ordre
+                .iter()
+                .filter_map(|e| e.track_id)
+                .collect::<Vec<i64>>(),
+            vec![a, b, c],
+            "dans l'ordre demande"
+        );
+        assert_eq!(repo.count_all(1).unwrap(), 3);
+    }
+
+    /// 🔴 CONTRE-EPREUVE #3231 — « Lire ensuite » unifie ne laisse pas de trou.
+    ///
+    /// Le decalage ouvre `n` places AVANT d'inserer. Si une seule piste tombe,
+    /// la place ouverte reste vide : la file porte alors les positions
+    /// 0, 1, 3, 4 — exactement le trou que `next_position_inner` (arithmetique
+    /// pure : `+1`, `% longueur`, arret sur `>= longueur`) ne sait pas
+    /// franchir, et que `get_at` (`WHERE q.position = ?`) resout en « aucune
+    /// ligne ». C'est le mecanisme decrit par Pierre M, transpose a l'insertion
+    /// au milieu.
+    #[test]
+    fn lire_ensuite_unifie_avec_une_piste_absente_ne_laisse_pas_de_trou() {
+        let (db, repo, a, b) = file_mixte_de_trois();
+        let x = une_piste_de_plus(&db, "u-ensuite");
+        let fantome = 900_102i64;
+
+        // « Lire ensuite » sur la position 1, avec une piste disparue au milieu
+        // du lot demande.
+        let bilan = repo
+            .insert_at_bilan(1, &[local(x), local(fantome)], Some(1))
+            .expect("l'insertion ne doit pas tomber");
+
+        assert_eq!(bilan.inserted(), 1);
+        assert_eq!(bilan.skipped, vec![fantome]);
+        assert_eq!(bilan.start, Some(1));
+
+        let ordre = repo.get_ordered(1).unwrap();
+        let positions: Vec<i64> = ordre.iter().map(|e| e.position).collect();
+        assert_eq!(
+            positions,
+            vec![0, 1, 2, 3],
+            "aucun trou apres un « Lire ensuite » ampute : {positions:?}"
+        );
+        assert_eq!(
+            ordre
+                .iter()
+                .map(|e| e.track_id)
+                .collect::<Vec<Option<i64>>>(),
+            vec![Some(a), Some(x), Some(b), None],
+            "la piste demandee est a la position 1, la suite a recule d'un cran"
+        );
+        // La marche « suivant » doit atteindre CHAQUE position, sans exception.
+        for p in 0..4 {
+            assert!(
+                repo.get_at(1, p).unwrap().is_some(),
+                "aucune ligne a la position {p} : la file est creuse"
+            );
+        }
+    }
+
+    /// 🔴 CONTRE-EPREUVE #3231 — toutes les pistes disparues : la position
+    /// annoncee ne ment pas.
+    ///
+    /// Rendre `Some(start)` sans avoir rien ecrit ferait croire a un ajout : la
+    /// reponse HTTP annonce « votre piste est en position 1 » et il n'y a
+    /// aucune ligne. Rien n'est ecrit, rien n'est decale, et `start` vaut
+    /// `None`.
+    #[test]
+    fn l_ajout_unifie_entierement_absent_ne_ment_ni_sur_la_position_ni_sur_la_file() {
+        let (_db, repo, a, b) = file_mixte_de_trois();
+
+        let bilan = repo
+            .insert_at_bilan(1, &[local(900_201), local(900_202)], Some(1))
+            .expect("une demande entierement perimee ne doit pas tomber");
+
+        assert_eq!(bilan.inserted(), 0);
+        assert_eq!(bilan.start, None, "aucune ligne, donc aucune position");
+        assert_eq!(bilan.skipped, vec![900_201, 900_202]);
+        assert!(bilan.retenus.is_empty());
+        // Et `insert_at`, l'enveloppe que le sondeur appelle, dit la meme chose.
+        assert_eq!(repo.insert_at(1, &[local(900_203)], Some(1)).unwrap(), None);
+
+        let ordre = repo.get_ordered(1).unwrap();
+        assert_eq!(
+            ordre.iter().map(|e| e.position).collect::<Vec<i64>>(),
+            vec![0, 1, 2],
+            "la file d'origine est intacte : le decalage ouvert a ete referme"
+        );
+        assert_eq!(
+            ordre
+                .iter()
+                .map(|e| e.track_id)
+                .collect::<Vec<Option<i64>>>(),
+            vec![Some(a), Some(b), None]
+        );
+    }
+
+    /// 🟢 TEMOIN #3231 — une demande entierement valide est INCHANGEE.
+    ///
+    /// L'autre moitie de la contre-epreuve : la garde ne doit rien couter au
+    /// cas courant. Positions denses, ordre demande, position effective rendue
+    /// (#2079), lignes de service comprises.
+    #[test]
+    fn temoin_l_ajout_unifie_entierement_valide_est_inchange() {
+        let (db, repo, a, b) = file_mixte_de_trois();
+        let x = une_piste_de_plus(&db, "u-temoin");
+
+        let bilan = repo
+            .insert_at_bilan(1, &[local(x), streaming("s1", "Ensuite")], Some(1))
+            .expect("insertion valide");
+
+        assert_eq!(bilan.inserted(), 2);
+        assert!(!bilan.has_loss(), "aucune perte a declarer");
+        assert_eq!(bilan.start, Some(1));
+        assert_eq!(bilan.retenus, vec![0, 1]);
+
+        let ordre = repo.get_ordered(1).unwrap();
+        assert_eq!(
+            ordre.iter().map(|e| e.position).collect::<Vec<i64>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            ordre
+                .iter()
+                .map(|e| e.track_id)
+                .collect::<Vec<Option<i64>>>(),
+            vec![Some(a), Some(x), None, Some(b), None],
+            "x en 1, la ligne de service ajoutee en 2, la file d'origine derriere"
+        );
     }
 }
