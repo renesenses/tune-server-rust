@@ -80,6 +80,7 @@ async fn la_cible_est_toujours_une_largeur_que_la_chaine_sait_ecrire() {
             dest_s.clone(),
             None,
             None,
+            None,
         )
         .await
         {
@@ -139,6 +140,7 @@ async fn le_forcage_wav16_reste_identique() {
             None,
             None,
             dest_s.clone(),
+            None,
             None,
             None,
         )

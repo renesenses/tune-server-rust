@@ -459,6 +459,20 @@ pub struct InventaireCue {
 /// `.cue` — on ne re-parcourt donc pas l'arborescence, on ne relit que les
 /// dossiers concernés.
 pub fn inventorier(dossiers: &[PathBuf]) -> InventaireCue {
+    inventorier_avec(dossiers, |_, _| {})
+}
+
+/// Le même inventaire, en donnant chaque plan à un visiteur.
+///
+/// C'est par là que le scan ÉCRIT (voir [`super::cue_bibliotheque`]). La
+/// lecture d'un `.cue` est une entrée-sortie par feuille, parfois sur un
+/// partage réseau : inventorier d'abord puis re-planifier pour écrire
+/// doublerait ce coût sur toute la bibliothèque. Le visiteur voit exactement
+/// ce que l'inventaire compte — impossible que le rapport et la base divergent.
+pub fn inventorier_avec(
+    dossiers: &[PathBuf],
+    mut visiteur: impl FnMut(&Path, &PlanCue),
+) -> InventaireCue {
     let mut inv = InventaireCue::default();
 
     let retenus = dossiers.len().min(PLAFOND_DOSSIERS_INVENTORIES);
@@ -474,6 +488,7 @@ pub fn inventorier(dossiers: &[PathBuf]) -> InventaireCue {
             continue;
         }
         inv.dossiers += 1;
+        visiteur(dossier, &plan);
 
         for album in &plan.albums {
             inv.albums += 1;

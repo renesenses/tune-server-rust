@@ -107,6 +107,34 @@ fn empreinte_dsp_v(
     Some(h.finalize().into())
 }
 
+/// L'empreinte de cache d'une TRANCHE de fichier (#3631).
+///
+/// 🔴 **Sans elle, le cache confondrait les pistes d'un même album CUE.** La
+/// clé de [`cache_path_dsp`] est bâtie sur le fichier SOURCE — or les quinze
+/// pistes d'une image partagent ce fichier, à la mtime et à la taille près.
+/// La première rendition mise en cache serait donc servie pour les quatorze
+/// autres : quinze pistes différentes, un seul et même morceau.
+///
+/// Rend l'empreinte de traitement inchangée quand il n'y a pas de tranche : une
+/// piste ordinaire garde exactement la clé qu'elle avait.
+pub fn empreinte_avec_tranche(
+    dsp: Option<[u8; 32]>,
+    tranche: Option<(u64, Option<u64>)>,
+) -> Option<[u8; 32]> {
+    let Some((debut_ms, fin_ms)) = tranche else {
+        return dsp;
+    };
+    let mut h = Sha256::new();
+    h.update(b"tranche\0");
+    h.update(debut_ms.to_le_bytes());
+    h.update(fin_ms.unwrap_or(u64::MAX).to_le_bytes());
+    if let Some(d) = dsp {
+        h.update(b"dsp\0");
+        h.update(d);
+    }
+    Some(h.finalize().into())
+}
+
 /// Clé de cache d'une rendition locale, avec l'empreinte du traitement quand
 /// il y en a un : une rendition par réglage, rejouée instantanément, au lieu
 /// de retranscoder à chaque écoute dès qu'un EQ est actif (LAT-F2).

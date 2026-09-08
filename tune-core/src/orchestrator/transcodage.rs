@@ -413,6 +413,17 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+/// La TRANCHE de la source à transcoder : début et durée, en secondes (#3631).
+///
+/// `duree_s = 0.0` veut dire « jusqu'au bout du fichier » — la convention que
+/// [`crate::audio::decode::decode_to_pcm`] emploie déjà pour `max_duration_s`,
+/// reprise telle quelle pour qu'il n'y ait qu'un sens à retenir.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct TrancheSource {
+    pub(super) debut_s: f64,
+    pub(super) duree_s: f64,
+}
+
 pub(super) async fn transcode_source_to_file(
     source: String,
     out_sr: u32,
@@ -430,6 +441,10 @@ pub(super) async fn transcode_source_to_file(
     // `None` pour tout ce qui n'appartient à aucune zone (le pré-chauffage en
     // fond, les essais).
     abandon: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    // #3631 — la TRANCHE de la source à transcoder, quand la piste est une
+    // piste virtuelle de feuille CUE. `None` pour un fichier ordinaire : le
+    // décodage est alors STRICTEMENT celui d'avant (`0.0, 0.0`).
+    tranche: Option<TrancheSource>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // LAT-F1 (phase 2a) : le chemin fichier reste le seul où le renderer
     // attend le morceau ENTIER (cible FLAC, Content-Length exigé). Avant de
@@ -445,7 +460,16 @@ pub(super) async fn transcode_source_to_file(
         // Sans balise (`None`, tous les appelants hors chemin de lecture), le
         // décodage est strictement celui d'avant.
         let _balise = progres.map(crate::audio::decode_progress::installer);
-        crate::audio::decode::decode_to_pcm(&source, Some(out_sr), Some(channels as u32), 0.0, 0.0)
+        let (debut_s, duree_s) = tranche
+            .map(|t| (t.debut_s, t.duree_s))
+            .unwrap_or((0.0, 0.0));
+        crate::audio::decode::decode_to_pcm(
+            &source,
+            Some(out_sr),
+            Some(channels as u32),
+            debut_s,
+            duree_s,
+        )
     })
     .await
     .map_err(|e| format!("decode task panic: {e}"))??;

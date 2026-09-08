@@ -1225,11 +1225,17 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // a comptées comme des fichiers non lus et n'en a retenu que les
         // dossiers — les ouvrir pendant le parcours ajouterait une lecture
         // bloquante par fichier sur un NAS, ce que le parcours s'interdit.
-        // Aucune écriture en base : c'est le rapport qui gagne la vérité, pas
-        // la bibliothèque. Presque toujours instantané, parce que la liste est
-        // vide dans l'immense majorité des bibliothèques.
-        let inventaire_cue =
-            tune_core::scanner::cue_album::inventorier(&list_result.dossiers_avec_feuille_cue);
+        // Presque toujours instantané, parce que la liste est vide dans
+        // l'immense majorité des bibliothèques.
+        //
+        // #3631 (lot 2b) : cette relecture ÉCRIT désormais les pistes
+        // virtuelles, au même endroit et sans relire une feuille de plus. Le
+        // rapport garde exactement les mêmes clés — c'est le même inventaire.
+        let (inventaire_cue, bilan_cue, images_cue) =
+            tune_core::scanner::cue_bibliotheque::inventorier_et_ecrire(
+                db.clone(),
+                &list_result.dossiers_avec_feuille_cue,
+            );
         if inventaire_cue.dossiers > 0 {
             tracing::info!(
                 dossiers = inventaire_cue.dossiers,
@@ -1237,10 +1243,26 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 albums_multi_feuilles = inventaire_cue.albums_multi_feuilles,
                 pistes = inventaire_cue.pistes,
                 feuilles_ecartees = inventaire_cue.feuilles_ecartees,
+                pistes_creees = bilan_cue.pistes_creees,
+                pistes_mises_a_jour = bilan_cue.pistes_mises_a_jour,
+                pistes_elaguees = bilan_cue.pistes_elaguees,
                 "scan_cue_sheets_inventoried — feuilles CUE : ce qu'elles décrivent"
             );
         }
-        let files = list_result.files;
+        // Un fichier image découpé par une feuille n'est plus une piste à lui
+        // seul : ses tranches le représentent. Sans ce retrait, l'album
+        // existerait deux fois — la piste « image entière » à côté de ses
+        // tranches. Le retrait vaut aussi pour `discovered_paths`, de sorte
+        // qu'une bibliothèque déjà indexée voie sa piste image élaguée.
+        let files: Vec<std::path::PathBuf> = if images_cue.is_empty() {
+            list_result.files
+        } else {
+            list_result
+                .files
+                .into_iter()
+                .filter(|p| !images_cue.contains(p))
+                .collect()
+        };
         let total_discovered = files.len();
 
         let discovered_paths: std::collections::HashSet<String> = files
