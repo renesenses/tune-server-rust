@@ -74,6 +74,49 @@ pub fn dlna_cap_16bit_applies(
     is_network_output && bit_depth > 16 && (zone_cap_16bit || catalogue_force_16bit)
 }
 
+/// La source doit-elle etre transcodee POUR LA SORTIE ?
+///
+/// Quatrieme condition partagee entre la decision
+/// (`orchestrator/resolve_local.rs`) et le miroir du chemin du signal
+/// (`tune-server/src/routes/zones/signal_path.rs`) — et la seule des quatre
+/// qui divergeait ENCORE quand les trois lignes du tableau de #3183 ont ete
+/// declarees reconciliees. Personne ne l'avait comptee : elle n'etait pas dans
+/// le tableau.
+///
+/// L'ecart porte sur un `output_type` et un format, un seul de chaque. Le
+/// Default Media Receiver d'un Chromecast ne decode pas l'AIFF, qu'un renderer
+/// DLNA joue direct : la decision choisit donc entre
+/// [`AudioFormat::needs_transcode_for_chromecast`] et
+/// [`AudioFormat::needs_transcode_for_dlna`] selon le type de la zone (#1210,
+/// Mika, BeoPlay A9 via CAST), tandis que le miroir n'appelait QUE la seconde.
+/// Sur une zone `chromecast` et une source AIFF, l'orchestrateur transcode
+/// donc pendant que le panneau annonce un passthrough bit-perfect — la faute
+/// exacte du Ruark R3, sur un autre couple.
+///
+/// Le `output_type` est un parametre OBLIGATOIRE, et `is_network_output` n'en
+/// est PAS un : il est deduit ici par [`is_network_output_type`]. C'est ce qui
+/// portait l'ecart, un appelant ne peut plus l'oublier ni le recalculer de
+/// travers.
+pub fn needs_transcode_for_output_applies(
+    output_type: Option<&str>,
+    source_format: Option<AudioFormat>,
+    dsd_passthrough: bool,
+    alac_passthrough: bool,
+    aac_passthrough: bool,
+) -> bool {
+    is_network_output_type(output_type)
+        && !dsd_passthrough
+        && !alac_passthrough
+        && !aac_passthrough
+        && source_format.is_some_and(|f| {
+            if output_type == Some("chromecast") {
+                f.needs_transcode_for_chromecast()
+            } else {
+                f.needs_transcode_for_dlna()
+            }
+        })
+}
+
 /// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
 /// file served on the HI-RES streaming path (cache-hit → a previously-finished
 /// transcode instead of a fresh one), so it stays OFF until validated on a real

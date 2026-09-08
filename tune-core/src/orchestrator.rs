@@ -1180,6 +1180,8 @@ mod wav_override_tests;
 
 #[cfg(test)]
 mod plafond_16_bits_tests;
+#[cfg(test)]
+mod transcodage_de_sortie_tests;
 
 #[cfg(test)]
 mod tests;
