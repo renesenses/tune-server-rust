@@ -283,3 +283,13 @@ path = "tests/comptes_par_source_2147.rs"
 [[test]]
 name = "sources_trois_routes_i3226"
 path = "tests/sources_trois_routes_i3226.rs"
+
+# #3383 : la bascule « désactiver la télémétrie » n'éteignait rien — la route
+# n'écrivait pas, et les sept gardes d'envoi ne lisaient que `TUNE_TELEMETRY`.
+# Le témoin passe par les ROUTES MONTÉES puis appelle les décisions de
+# production (`background::plan_du_tour`, `consent::contribution_autorisee`) :
+# débrancher la conduite le fait rougir. `autotests = false` plus haut : sans
+# cette cible, le fichier ne serait JAMAIS compilé, donc vert contre rien.
+[[test]]
+name = "refus_telemetrie_honore_3383"
+path = "tests/refus_telemetrie_honore_3383.rs"
