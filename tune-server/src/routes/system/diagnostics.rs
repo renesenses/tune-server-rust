@@ -1858,9 +1858,14 @@ pub(super) async fn rearm_asio_warm_scan(
 
 /// Anonymous telemetry snapshot — returns what would be sent if telemetry
 /// is enabled. No data leaves the server unless the user explicitly opts in.
+///
+/// #3383 : `enabled` disait autrefois « le reglage vaut exactement `"true"` »,
+/// ce qui annonçait un opt-out sur une installation neuve qui n'avait rien
+/// decoche — et ignorait `TUNE_TELEMETRY`. Il dit maintenant l'etat EFFECTIF,
+/// le meme que les gardes d'envoi consultent, par le meme appel.
 pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let enabled = settings.get("telemetry_enabled").ok().flatten().as_deref() == Some("true");
+    let enabled = tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(&settings);
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
@@ -1891,14 +1896,27 @@ pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Va
     }))
 }
 
+/// #3383 — cette route ecrivait deja la bonne cle, mais personne ne la lisait :
+/// un aller-retour ferme sur lui-meme. Elle est desormais BRANCHEE, parce que
+/// `TelemetryReporter::is_enabled_for` consulte cette meme cle. Ce n'est donc
+/// plus un troisieme interrupteur mort a cote de deux autres, c'est le meme.
+///
+/// La reponse renvoie l'etat EFFECTIF et non ce qui vient d'etre demande :
+/// `TUNE_TELEMETRY=false` reste souverain, et un appelant qui rallume alors
+/// que l'exploitant a coupe doit le voir.
 pub(super) async fn telemetry_toggle(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let enabled = body["enabled"].as_bool().unwrap_or(false);
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let _ = settings.set("telemetry_enabled", if enabled { "true" } else { "false" });
-    Json(json!({ "enabled": enabled }))
+    let _ = settings.set(
+        tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY,
+        if enabled { "true" } else { "false" },
+    );
+    Json(json!({
+        "enabled": tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(&settings),
+    }))
 }
 
 pub(super) async fn api_stats(State(state): State<AppState>) -> Json<Value> {

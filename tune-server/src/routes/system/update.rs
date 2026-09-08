@@ -115,6 +115,37 @@ async fn playing_zone_ids(playback: &tune_core::playback::PlaybackManager) -> Ve
         .collect()
 }
 
+/// Les zones qui retiennent la relance, NOMMÉES, et sous la forme que
+/// l'interface peut afficher telle quelle.
+///
+/// Le journal les nomme depuis #2954 (`update_deferred_playback_in_progress
+/// zones=[…]`). La réponse rendue à l'appelant, elle, ne portait qu'un motif
+/// `playback_in_progress` et une phrase générique — l'utilisateur voyait un
+/// refus sans sujet.
+///
+/// Tades (#3581) ne pouvait donc ni voir QUELLE zone prétendait jouer — sa
+/// Serenade était à l'arrêt — ni savoir qu'une sortie existait : `?force=true`
+/// est dans la route depuis #2976, et rien, dans la réponse, ne l'annonçait.
+/// #3155 a établi qu'aucun détecteur ne rattrape une zone locale figée ; tant
+/// que c'est vrai, le seul recours possible est de nommer la zone et de dire
+/// qu'on peut passer outre. La borne haute du report reste, elle, à deux
+/// heures.
+///
+/// Un nom introuvable en base ne fait pas échouer le refus : l'identifiant est
+/// rendu seul, ce qui vaut toujours mieux que rien.
+fn zones_qui_retiennent(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    ids: &[i64],
+) -> Vec<Value> {
+    let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    ids.iter()
+        .map(|id| {
+            let nom = repo.get(*id).ok().flatten().map(|z| z.name);
+            json!({ "id": id, "name": nom })
+        })
+        .collect()
+}
+
 /// Plafond du report de la relance. Passé ce délai on relance MALGRÉ une zone
 /// annoncée en lecture.
 ///
@@ -1480,12 +1511,18 @@ pub(super) async fn update_install(
     // qu'une zone joue — la contention est exactement le terrain des coupures
     // signalées dans le même fil (#2952).
     if !force && !playing.is_empty() {
+        let zones = zones_qui_retiennent(&state.backend, &playing);
         warn!(zones = ?playing, "update_deferred_playback_in_progress");
         return (
             StatusCode::CONFLICT,
             Json(json!({
                 "status": "blocked",
                 "reason": "playback_in_progress",
+                // Ce que le journal savait déjà et que l'appelant n'avait pas :
+                // QUI retient, et qu'il existe une sortie (#3581).
+                "zones": zones,
+                "force_available": true,
+                "force_hint": "POST /system/update/install?force=true",
                 "message": "Update deferred: music is playing and installing it would stop playback. It will be applied automatically once playback stops."
             })),
         )
@@ -4203,5 +4240,62 @@ mod changelog_lang_tests {
             "le secours n'existe qu'en français"
         );
         assert_eq!(en["fallback"], json!(true));
+    }
+}
+
+/// #3581 — ce que le refus de mise à jour rend à l'appelant.
+#[cfg(test)]
+mod tests_zones_qui_retiennent {
+    use super::zones_qui_retiennent;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::zone_repo::ZoneRepo;
+
+    fn backend() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().expect("base en mémoire");
+        db.init_schema().expect("schéma");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        Arc::new(db)
+    }
+
+    /// Le refus doit NOMMER la zone. Tades voyait « playback_in_progress » et
+    /// rien d'autre : il ne pouvait pas savoir que c'était sa Serenade que le
+    /// serveur croyait en lecture.
+    #[test]
+    fn le_refus_nomme_la_zone_qui_retient() {
+        let b = backend();
+        let repo = ZoneRepo::with_backend(b.clone());
+        let id = repo
+            .create("Serenade", Some("dlna"), None)
+            .expect("création de zone");
+
+        let rendu = zones_qui_retiennent(&b, &[id]);
+
+        assert_eq!(rendu.len(), 1);
+        assert_eq!(rendu[0]["id"].as_i64(), Some(id));
+        assert_eq!(rendu[0]["name"].as_str(), Some("Serenade"));
+    }
+
+    /// Contre-épreuve : un identifiant sans zone en base ne fait pas échouer le
+    /// refus et ne fabrique pas de nom. L'identifiant seul vaut mieux que rien
+    /// — c'est exactement le cas d'une zone figée en mémoire dont la ligne a
+    /// disparu (#3155).
+    #[test]
+    fn un_identifiant_sans_zone_rend_un_nom_vide_sans_echouer() {
+        let b = backend();
+        let rendu = zones_qui_retiennent(&b, &[4242]);
+
+        assert_eq!(rendu.len(), 1);
+        assert_eq!(rendu[0]["id"].as_i64(), Some(4242));
+        assert!(rendu[0]["name"].is_null());
+    }
+
+    /// Aucune zone en lecture : rien à nommer. Une garde qui rendrait toujours
+    /// une entrée se lirait comme un refus permanent.
+    #[test]
+    fn sans_zone_en_lecture_il_n_y_a_rien_a_nommer() {
+        let b = backend();
+        assert!(zones_qui_retiennent(&b, &[]).is_empty());
     }
 }

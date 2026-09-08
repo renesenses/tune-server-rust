@@ -537,6 +537,28 @@ pub mod sql {
            AND album_id IS NOT NULL AND file_path IS NOT NULL"
     }
 
+    /// Ce que la base sait déjà de chaque piste locale, réduit aux SEULES
+    /// valeurs dont dépend le verdict « compilation » d'un dossier (#3528).
+    ///
+    /// `tracks` ne porte pas la balise `album` : elle est résolue en une ligne
+    /// `albums`. C'est donc `al.title` qui tient lieu de titre d'album, et
+    /// `al.is_compilation` de drapeau. `t.album_artist`, lui, est la balise
+    /// BRUTE, écrite telle quelle par `build_track_row`.
+    ///
+    /// `ar.name` est l'artiste que le scan a RÉSOLU pour la piste, et c'est
+    /// justement ce qui le rend sûr à relire : un fichier dont les balises
+    /// n'ont pas pu être lues (`TrackMetadata::artist_from_path`) n'a jamais
+    /// posé son nom de dossier ici — l'import l'avait déjà remplacé par
+    /// l'artiste épinglé du dossier. Le faux second artiste de #3232 ne peut
+    /// donc pas revenir par cette porte.
+    pub fn preuves_de_compilation() -> &'static str {
+        "SELECT t.file_path, t.album_artist, ar.name, al.title, al.is_compilation \
+         FROM tracks t \
+         LEFT JOIN artists ar ON ar.id = t.artist_id \
+         LEFT JOIN albums al ON al.id = t.album_id \
+         WHERE t.source = 'local' AND t.file_path IS NOT NULL"
+    }
+
     /// Le PRÉDICAT de la recherche de pistes, sans projection ni bornes.
     ///
     /// Extrait pour que la LISTE rendue et le COMPTE annoncé portent
@@ -658,6 +680,56 @@ pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
     out
 }
 
+/// L'expression SQL qui compte ce que [`dedup_display_tracks`] laisse voir —
+/// les PRÉSENTATIONS d'un album, pas ses lignes de table (#1362).
+///
+/// `alias_album` est l'expression qui désigne l'album : `albums.id` dans un
+/// `UPDATE albums`, un paramètre lié (`?1`, `$1`) dans une requête ciblée.
+///
+/// ## Pourquoi ce compte-là et pas `COUNT(*)`
+///
+/// **Cyrille Moutia**, forum 1260 (01/08/2026) : un CD rippé en AIFF, et un
+/// morceau du même album récupéré ailleurs en AAC, posé dans le dossier. Le
+/// dossier étant ce qui identifie une parution
+/// ([`crate::scanner::album_folder`]), les deux fichiers entrent dans le même
+/// album — c'est voulu. L'écran, lui, n'en montre qu'une ligne
+/// ([`dedup_display_tracks`]) et la file n'en enfile qu'une
+/// (`resoudre_pistes_d_album`, `routes/playback.rs`) : la copie de moindre
+/// qualité est masquée, et c'est aussi voulu.
+///
+/// `albums.track_count`, lui, comptait les LIGNES. Le même album annonçait
+/// donc treize titres, en montrait douze, et en jouait douze. La treizième ne
+/// se voyait nulle part — elle ne se COMPTAIT que. Deux conséquences mesurables
+/// dans le produit :
+///
+/// - `GET /home` (`db::home_queries`, « albums commencés ») retient les albums
+///   dont `COUNT(DISTINCT lh.title) < a.track_count`. Le compte des titres
+///   écoutés est DISTINCT, celui des pistes ne l'était pas : un album ainsi
+///   doublé ne pouvait plus jamais atteindre son propre total, et restait
+///   « à finir » pour toujours ;
+/// - `GET /albums/{id}/editions` (`same_track_count`) et
+///   `GET /albums/{id}/completeness` comparent ce total d'une édition à
+///   l'autre : une copie en trop faisait passer deux pressages identiques pour
+///   deux pressages différents.
+///
+/// La clé est exactement celle de [`dedup_display_tracks`] : disque, numéro,
+/// titre en minuscules sans blancs de bord. Deux vrais morceaux distincts n'y
+/// collisionnent pas, donc un album normal garde son compte au titre près.
+///
+/// ⚠️ `LOWER` de SQLite ne replie que l'ASCII, là où `to_lowercase` de Rust
+/// replie tout l'Unicode. Deux lignes qui ne diffèrent QUE par la casse d'une
+/// lettre accentuée (« Été » et « été ») seraient donc comptées deux fois ici
+/// et repliées à l'écran. Le compte reste alors celui d'avant ce correctif :
+/// le décalage n'est pas aggravé.
+pub fn sql_compte_pistes_visibles(alias_album: &str) -> String {
+    format!(
+        "(SELECT COUNT(DISTINCT COALESCE(t.disc_number, 1) || '/' \
+         || COALESCE(t.track_number, 0) || '/' \
+         || LOWER(TRIM(COALESCE(t.title, '')))) \
+         FROM tracks t WHERE t.album_id = {alias_album})"
+    )
+}
+
 /// Nombre d'ids inlinés par requête `WHERE t.id IN (…)`.
 ///
 /// Les ids sont des `i64` issus de nos propres requêtes : les inliner ne
@@ -719,6 +791,28 @@ impl InfoFichier {
     pub fn est_locale(&self) -> bool {
         self.source == "local"
     }
+}
+
+/// Ce que la base sait d'une piste déjà indexée, réduit aux valeurs dont
+/// dépend le verdict « compilation » de son dossier.
+///
+/// 🔴 #3528 — un scan incrémental ne PRÉSENTE que les fichiers modifiés : la
+/// décision se prenait donc sur une fraction du dossier, et un seul fichier
+/// relu suffisait à faire basculer l'album entier. Ces preuves-là amorcent le
+/// dossier depuis la base, pour les fichiers que le pré-filtre a écartés.
+///
+/// Rendue par [`TrackRepo::preuves_de_compilation`], une entrée par
+/// `file_path`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PreuveDeCompilation {
+    /// `tracks.album_artist` : la balise BRUTE, telle que le scan l'a lue.
+    pub album_artist: Option<String>,
+    /// L'artiste RÉSOLU de la piste (`artists.name` via `tracks.artist_id`).
+    pub artiste: Option<String>,
+    /// Le titre de la ligne `albums` où la piste a été rangée.
+    pub album: Option<String>,
+    /// `albums.is_compilation` : le verdict déjà rendu sur cette ligne.
+    pub compilation: bool,
 }
 
 pub struct TrackRepo {
@@ -2117,6 +2211,35 @@ impl TrackRepo {
                         mtime,
                         taille,
                         source,
+                    },
+                ))
+            })
+            .collect())
+    }
+
+    /// La carte `file_path` → [`PreuveDeCompilation`], pour toutes les pistes
+    /// locales déjà indexées.
+    ///
+    /// Voir [`sql::preuves_de_compilation`]. L'appelant n'en garde que les
+    /// chemins que le pré-filtre du scan a ÉCARTÉS : un fichier relu apporte
+    /// ses propres balises, fraîches, et n'a que faire de ce que la base
+    /// disait de lui (#3528). C'est aussi ce qui rend un « Scan complet »
+    /// souverain : il ne saute aucun fichier, donc il n'amorce rien.
+    pub fn preuves_de_compilation(
+        &self,
+    ) -> Result<HashMap<String, PreuveDeCompilation>, TuneError> {
+        let rows = self.db.query_many(sql::preuves_de_compilation(), &[])?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| {
+                let path = cols.first().and_then(|v| v.as_string())?;
+                Some((
+                    path,
+                    PreuveDeCompilation {
+                        album_artist: cols.get(1).and_then(|v| v.as_string()),
+                        artiste: cols.get(2).and_then(|v| v.as_string()),
+                        album: cols.get(3).and_then(|v| v.as_string()),
+                        compilation: crate::db::album_repo::drapeau_compilation(cols.get(4)),
                     },
                 ))
             })

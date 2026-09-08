@@ -312,6 +312,15 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "loaded": false,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
+            // 🔴 #3484 — le champ que la fiche wasm porte depuis toujours, et
+            // que la fiche COMPILÉE n'a jamais porté (voir la boucle wasm plus
+            // bas : `"restart_required": enabled && !loaded`). Un greffon
+            // installé qui figure ici n'a pas été chargé — la porte de
+            // `setup_all` ne s'ouvre qu'au démarrage — donc l'attente d'un
+            // redémarrage est un FAIT de cette ligne, pas une supposition de
+            // l'écran. Sans lui, deux fiches dans le même état répondaient
+            // différemment selon leur nature, et seule la wasm le disait.
+            "restart_required": installed,
             // Dormant, mais compilé dans CE binaire : c'est exactement la
             // fiche sur laquelle l'écran doit proposer « Installer ». La dire
             // incompatible grisait le seul bouton qui la rende utile.
@@ -495,18 +504,54 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
     }))
 }
 
+/// Le greffon `name` tourne-t-il DANS ce processus, en ce moment ?
+///
+/// La seule autorité est l'instantané que `plugins::init` a publié après
+/// `setup_all` : il ne contient que ce qui a réellement chargé. Un réglage en
+/// base ne dit rien de l'instant présent — c'est tout le sujet de #3484.
+fn greffon_charge(state: &AppState, name: &str) -> bool {
+    plugin_snapshot(state).iter().any(|p| p.name == name)
+}
+
+/// 🔴 #3484 — activer un greffon n'en démarre AUCUN.
+///
+/// La porte qui décide de charger un greffon est
+/// `tune_core::plugin_sdk::PluginLoader::setup_all`, et elle ne s'ouvre qu'au
+/// démarrage : basculer `plugin_{name}_enabled` écrit une ligne en base et ne
+/// monte rien dans le serveur qui tourne. `install_plugin` et `delete_plugin`
+/// le disaient déjà par `restart_required` ; `enable`/`disable` ne le disaient
+/// pas — alors que ce sont les deux seules routes que l'écran appelle quand on
+/// bascule l'interrupteur d'un greffon déjà installé.
+///
+/// L'appelant existe, et il en dépend : `tune-web-client`,
+/// `src/components/v2/PluginsV2.svelte` fait passer l'installation ET la
+/// bascule par le même `act()`, dont la seule décision est
+/// `if (res?.restart_required) restartNeeded = true;`. Sans le champ, la
+/// bascule annonçait « activé » et n'affichait jamais la bannière : le testeur
+/// voyait un greffon coché qui ne fait rien (« j'ai installé le plugin
+/// Bandcamp mais impossible de le démarrer », fil 1682, Patatorz).
+///
+/// La valeur n'est pas une constante : elle compare l'état DEMANDÉ à ce qui
+/// tourne réellement. Réactiver un greffon déjà chargé, ou désactiver un
+/// greffon déjà absent, ne demande aucun redémarrage — et le prétendre
+/// enverrait couper la musique pour rien.
 async fn enable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "true").ok();
-    Json(json!({ "name": name, "enabled": true }))
+    let restart_required = !greffon_charge(&state, &name);
+    Json(json!({ "name": name, "enabled": true, "restart_required": restart_required }))
 }
 
+/// Le pendant de [`enable_plugin`] : un greffon qui tourne continue de tourner
+/// jusqu'au prochain démarrage, ses routes montées et son abonnement au bus
+/// actif. Le dire est la même dette que ci-dessus.
 async fn disable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "false").ok();
-    Json(json!({ "name": name, "enabled": false }))
+    let restart_required = greffon_charge(&state, &name);
+    Json(json!({ "name": name, "enabled": false, "restart_required": restart_required }))
 }
 
 #[derive(Deserialize)]

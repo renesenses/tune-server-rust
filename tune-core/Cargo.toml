@@ -305,6 +305,12 @@ path = "tests/temoin_resolution_streaming.rs"
 name = "temoin_resolution_locale"
 path = "tests/temoin_resolution_locale.rs"
 
+# #2060 / #3522 — une balise « Track N » ne doit pas voler la place du nom de
+# fichier. `autotests = false` plus haut : sans cette cible, le fichier ne
+# serait jamais compilé.
+[[test]]
+name = "titre_de_remplissage_2060"
+path = "tests/titre_de_remplissage_2060.rs"
 # #3419 — la reprise dans Tune des favoris posés chez le service. Même raison
 # que les cibles ci-dessus : `autotests = false` en tête de ce fichier, sans
 # cette déclaration le témoin ne serait jamais compilé et la porte rendrait un
@@ -312,3 +318,14 @@ path = "tests/temoin_resolution_locale.rs"
 [[test]]
 name = "reprise_favoris_streaming"
 path = "tests/reprise_favoris_streaming.rs"
+
+# Meme famille que #2665 / #2890 / #3180 / #3479, cinquieme fois : abonne
+# `tracing` GLOBAL, donc un binaire a lui seul et UN SEUL test dedans. Il tient
+# les trois durees du demarrage d'une piste de service sur SORTIE LOCALE
+# (#3568) — assemblage de l'adresse, telechargement complet, transcodage WAV —
+# que rien ne mesurait au niveau livre. `autotests = false` en tete de ce
+# fichier : sans cette cible, le temoin ne serait jamais compile et la porte
+# rendrait un vert contre rien.
+[[test]]
+name = "journal_latence_demarrage_local_i3568"
+path = "tests/journal_latence_demarrage_local_i3568.rs"

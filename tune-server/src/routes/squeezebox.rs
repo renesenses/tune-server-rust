@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::db::zone_repo::CreationDeZone;
 use tune_core::outputs::squeezebox::LMS_CLI_PORT;
 
 use crate::state::AppState;
@@ -540,11 +541,24 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
         // Auto-create zone if not already present. Only log a reconnect on an
         // actual offline→online transition — the previous code logged
         // squeezebox_zone_reconnected on every 60s pass for every live zone.
-        match zone_repo.get_or_create(&player_name, Some("squeezebox"), &device_id) {
-            Ok((zid, true)) => {
+        //
+        // #3529 — ce sondeur tourne toutes les 60 s tant que `squeezebox_enabled`
+        // est vrai, et il ne consultait pas « Créer automatiquement les zones ».
+        // Un nouveau lecteur branché sur le LMS faisait donc apparaître une
+        // zone en moins d'une minute, réglage décoché.
+        match zone_repo.get_or_create_si_autorise(
+            &player_name,
+            Some("squeezebox"),
+            &device_id,
+            "squeezebox_poller",
+        ) {
+            Ok(CreationDeZone::Creee(zid)) => {
                 tracing::info!(name = %player_name, zone_id = zid, "squeezebox_zone_auto_created");
             }
-            Ok((_, false)) => {
+            Ok(CreationDeZone::Refusee) => {
+                tracing::info!(name = %player_name, id = %device_id, "squeezebox_zone_auto_create_disabled_skipping");
+            }
+            Ok(CreationDeZone::Existante(_)) => {
                 let was_online = zone_repo
                     .get_by_device_id(&device_id)
                     .ok()

@@ -97,7 +97,15 @@ fn joindre_dr_par_piste(state: &AppState, items: Vec<tune_core::db::models::Trac
     let dr = TrackMetadataRepo::with_backend(state.backend.clone())
         .get_key_for_tracks("dr_track", &track_ids)
         .unwrap_or_default();
-    super::albums::attach_track_tags(items, &[("dynamic_range", &dr)])
+    let mut items = super::albums::attach_track_tags(items, &[("dynamic_range", &dr)]);
+    // #3518 — « Idéalement sur la même route que les autres listes de pistes,
+    // pour que le tableau ait les mêmes colonnes partout » : ce chemin est le
+    // seam unique des trois autres surfaces (`/library/tracks` filtré, non
+    // filtré, et la fiche d'une piste). Le brancher ici les sert toutes les
+    // trois, sans un second recopieur qui aurait fini par diverger — c'est
+    // exactement l'argument de #1388 sur `attach_track_tags`.
+    super::albums::attacher_ecoutes(state, &mut items);
+    items
 }
 
 #[derive(Deserialize)]
@@ -275,10 +283,76 @@ pub(super) async fn get_track(
     }
 }
 
+/// Le morceau de `Range: bytes=…` qu'on sait honorer, ramené à des bornes
+/// closes valides pour `taille` octets.
+///
+/// Rend `None` si l'en-tête est absent ou d'une forme qu'on ne prétend pas
+/// couvrir (unité autre que `bytes`, plusieurs intervalles) : l'appelant sert
+/// alors le fichier entier en 200, ce qui reste la réponse juste. Rend
+/// `Some(Err(()))` quand l'intervalle est syntaxiquement bon mais hors du
+/// fichier — le contrat HTTP demande là un 416, pas un 200.
+#[allow(clippy::type_complexity)]
+fn intervalle_demande(entetes: &HeaderMap, taille: u64) -> Option<Result<(u64, u64), ()>> {
+    let brut = entetes.get(axum::http::header::RANGE)?.to_str().ok()?;
+    let liste = brut.trim().strip_prefix("bytes=")?.trim();
+    if liste.contains(',') {
+        return None;
+    }
+    let (debut, fin) = liste.split_once('-')?;
+    let (debut, fin) = (debut.trim(), fin.trim());
+    if taille == 0 {
+        return Some(Err(()));
+    }
+    let dernier = taille - 1;
+    let bornes = if debut.is_empty() {
+        // `bytes=-N` : les N derniers octets.
+        let n: u64 = fin.parse().ok()?;
+        if n == 0 {
+            return Some(Err(()));
+        }
+        (taille.saturating_sub(n), dernier)
+    } else {
+        let d: u64 = debut.parse().ok()?;
+        let f = if fin.is_empty() {
+            dernier
+        } else {
+            fin.parse::<u64>().ok()?.min(dernier)
+        };
+        (d, f)
+    };
+    if bornes.0 > dernier || bornes.0 > bornes.1 {
+        return Some(Err(()));
+    }
+    Some(Ok(bornes))
+}
+
+/// Sert les octets d'une piste locale — et c'est par ici, pas par
+/// l'orchestrateur, que passent le lecteur du navigateur ET le serveur média
+/// UPnP quand un point de contrôle tiers commande la lecture.
+///
+/// Deux défauts se tenaient ici, et le second cachait le premier (#3579).
+///
+/// 1. **Le contrat de `Range` était annoncé et pas tenu.** La route posait
+///    `Accept-Ranges: bytes`, recevait un `Range: bytes=0-` et répondait
+///    invariablement `200 OK` avec le fichier entier — l'en-tête de requête
+///    était lié à `_req_headers`, jamais consulté. Un renderer qui demande un
+///    intervalle et reçoit un 200 n'a aucun moyen de savoir où il en est ; un
+///    renderer strict refuse tout simplement la réponse.
+/// 2. **La route n'écrivait pas une ligne de journal.** C'est pourquoi le
+///    diagnostic de Tades ne montre RIEN du côté des pistes locales, alors que
+///    la radio, servie par `tune_stream_http`, y laisse `stream_request` puis
+///    `radio_bounded_live_response`. Deux testeurs (Tades et Patatorz,
+///    fils 1705/1706) décrivent la même asymétrie depuis JPlay iOS : la radio
+///    part, une piste locale ne démarre jamais — et il n'existait aucune trace
+///    permettant de dire ce que le renderer avait demandé, ni ce qu'il avait
+///    reçu.
+///
+/// La trace est posée d'abord : elle vaut indépendamment de la cause, et sans
+/// elle le prochain relevé serait aussi muet que celui-ci.
 pub(super) async fn stream_track_audio(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    _req_headers: HeaderMap,
+    req_headers: HeaderMap,
 ) -> impl IntoResponse {
     let repo = TrackRepo::with_backend(state.backend.clone());
     let track = match repo.get(id) {
@@ -332,31 +406,97 @@ pub(super) async fn stream_track_audio(
         .map(|f| f.mime_type().to_string())
         .unwrap_or_else(|| "application/octet-stream".into());
 
+    let agent = req_headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("inconnu");
+    let range_brut = req_headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let intervalle = match intervalle_demande(&req_headers, file_size) {
+        Some(Ok(bornes)) => Some(bornes),
+        Some(Err(())) => {
+            // Intervalle bien formé mais hors du fichier. Répondre 200 ici
+            // ferait passer une demande impossible pour un succès.
+            tracing::warn!(
+                track_id = id,
+                agent,
+                range = range_brut,
+                taille = file_size,
+                "track_audio_range_hors_fichier"
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Content-Range",
+                HeaderValue::from_str(&format!("bytes */{file_size}"))
+                    .unwrap_or(HeaderValue::from_static("bytes */0")),
+            );
+            headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+            return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
+        }
+        None => None,
+    };
+
+    let (debut, fin) = intervalle.unwrap_or((0, file_size.saturating_sub(1)));
+    let longueur = if file_size == 0 { 0 } else { fin - debut + 1 };
+
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type",
         HeaderValue::from_str(&mime)
             .unwrap_or(HeaderValue::from_static("application/octet-stream")),
     );
-    headers.insert("Content-Length", HeaderValue::from(file_size));
+    headers.insert("Content-Length", HeaderValue::from(longueur));
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+    let statut = if intervalle.is_some() {
+        headers.insert(
+            "Content-Range",
+            HeaderValue::from_str(&format!("bytes {debut}-{fin}/{file_size}"))
+                .unwrap_or(HeaderValue::from_static("bytes 0-0/0")),
+        );
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+
+    tracing::info!(
+        track_id = id,
+        agent,
+        range = range_brut,
+        format = track.format.as_deref().unwrap_or("inconnu"),
+        mime = %mime,
+        taille = file_size,
+        octets = longueur,
+        statut = statut.as_u16(),
+        "track_audio_request"
+    );
 
     let path_owned = file_path.clone();
     let body = Body::from_stream(async_stream::stream! {
         if let Ok(mut file) = tokio::fs::File::open(&path_owned).await {
-            use tokio::io::AsyncReadExt;
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            if debut > 0 && file.seek(std::io::SeekFrom::Start(debut)).await.is_err() {
+                return;
+            }
+            let mut restant = longueur;
             let mut buf = vec![0u8; 65536];
-            loop {
-                match file.read(&mut buf).await {
+            while restant > 0 {
+                let vise = buf.len().min(restant as usize);
+                match file.read(&mut buf[..vise]).await {
                     Ok(0) => break,
-                    Ok(n) => yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n])),
+                    Ok(n) => {
+                        restant -= n as u64;
+                        yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
+                    }
                     Err(_e) => { break; }
                 }
             }
         }
     });
 
-    (StatusCode::OK, headers, body).into_response()
+    (statut, headers, body).into_response()
 }
 
 pub(super) async fn rescan_track(
@@ -1940,5 +2080,79 @@ mod tests_tache_de_fond_rescan_metadata {
             .unwrap();
         let corps: Value = serde_json::from_slice(&octets).unwrap();
         assert_eq!(corps["status"], "rescan_metadata_started");
+    }
+}
+
+#[cfg(test)]
+mod tests_intervalle_piste_locale {
+    use super::intervalle_demande;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn entetes(range: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if !range.is_empty() {
+            h.insert(
+                axum::http::header::RANGE,
+                HeaderValue::from_str(range).expect("en-tête de test valide"),
+            );
+        }
+        h
+    }
+
+    /// La forme exacte que JPlay/Diretta envoie, et celle que la route
+    /// ignorait : `bytes=0-` couvre tout le fichier, et doit donner un 206
+    /// avec un `Content-Range` — pas un 200 muet (#3579).
+    #[test]
+    fn bytes_zero_ouvert_couvre_tout_le_fichier() {
+        assert_eq!(
+            intervalle_demande(&entetes("bytes=0-"), 1000),
+            Some(Ok((0, 999)))
+        );
+    }
+
+    #[test]
+    fn intervalle_ferme_et_suffixe() {
+        assert_eq!(
+            intervalle_demande(&entetes("bytes=100-199"), 1000),
+            Some(Ok((100, 199)))
+        );
+        assert_eq!(
+            intervalle_demande(&entetes("bytes=-100"), 1000),
+            Some(Ok((900, 999)))
+        );
+    }
+
+    /// Une fin au-delà du fichier se rogne : c'est une demande valide.
+    #[test]
+    fn la_fin_est_rognee_sur_la_taille() {
+        assert_eq!(
+            intervalle_demande(&entetes("bytes=900-99999"), 1000),
+            Some(Ok((900, 999)))
+        );
+    }
+
+    /// Contre-épreuve du 416 : un début hors fichier n'est PAS servi comme un
+    /// fichier entier.
+    #[test]
+    fn un_debut_hors_fichier_est_insatisfiable() {
+        assert_eq!(
+            intervalle_demande(&entetes("bytes=5000-"), 1000),
+            Some(Err(()))
+        );
+        assert_eq!(intervalle_demande(&entetes("bytes=0-"), 0), Some(Err(())));
+    }
+
+    /// Contre-épreuve du 200 : sans en-tête, ou sur une forme qu'on ne
+    /// prétend pas couvrir, la route doit continuer à servir le fichier
+    /// entier. Une garde qui rendrait 206 partout casserait le navigateur.
+    #[test]
+    fn sans_range_ou_forme_non_couverte_le_fichier_entier_reste_la_reponse() {
+        assert_eq!(intervalle_demande(&entetes(""), 1000), None);
+        assert_eq!(intervalle_demande(&entetes("secondes=0-1"), 1000), None);
+        assert_eq!(
+            intervalle_demande(&entetes("bytes=0-99,200-299"), 1000),
+            None
+        );
+        assert_eq!(intervalle_demande(&entetes("bytes=abc-"), 1000), None);
     }
 }

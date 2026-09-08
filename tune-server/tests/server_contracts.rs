@@ -67,6 +67,8 @@ mod facettes_multivaleurs;
 mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
 mod favoris_facettes_routes;
+#[path = "features_livrees_3355.rs"]
+mod features_livrees_3355;
 #[path = "file_promet_l_enchainement.rs"]
 mod file_promet_l_enchainement;
 #[path = "fonds_communautaire_par_mbid.rs"]
@@ -156,6 +158,8 @@ mod tests_orphelins;
 mod tranches_dynamic_range;
 #[path = "tri_aleatoire_albums.rs"]
 mod tri_aleatoire_albums;
+#[path = "tune_tested_telechargement.rs"]
+mod tune_tested_telechargement;
 #[path = "uptime_process_scope.rs"]
 mod uptime_process_scope;
 #[path = "volume_db_contrat.rs"]

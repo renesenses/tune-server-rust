@@ -15,3 +15,4 @@ pub mod relay;
 pub mod sso;
 pub mod support;
 pub mod telemetry;
+pub mod tune_tested;

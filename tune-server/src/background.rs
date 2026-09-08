@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
 
+use tune_core::db::zone_repo::CreationDeZone;
 use tune_core::outputs::OutputRegistry;
 use tune_core::poller::{JournalSondage, TraceEchecSondage};
 
@@ -18,6 +19,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_dash_temp_gc();
     spawn_position_poller(state);
     spawn_token_refresher(state);
+    spawn_tune_tested_refresher(state);
     spawn_upnp_advertiser(state, config).await;
     // Renderers UPnP par zone (#1750) : annonceur propre, relu à chaque
     // cycle — l'opt-in d'une zone prend effet sans redémarrage.
@@ -37,6 +39,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     crate::routes::library::credits::spawn_passe_automatique_credits(state);
     spawn_community_sync(state);
     spawn_replaygain_analysis(state);
+    spawn_lyrics_catchup(state);
     #[cfg(feature = "audio-embedding")]
     spawn_audio_embedding(state);
     spawn_radio_logo_refresh(state);
@@ -553,17 +556,30 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     }
                 }
 
-                // Auto-created zones start dormant and don't count against the
-                // free tier; the cap is enforced at first play in
-                // orchestrator.play(). So discovery may always register a device.
-                match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
-                    Ok((zid, true)) => {
+                // #3529 — ce lot tourne à CHAQUE démarrage et ne consultait pas
+                // « Créer automatiquement les zones ». Le commentaire qui
+                // tenait ici lieu de justification (« auto-created zones start
+                // dormant … discovery may always register a device ») parle du
+                // plafond du palier gratuit, PAS du réglage : une zone naît en
+                // ligne (`online` vaut `DEFAULT 1` au schéma). D'où « elles
+                // apparaissent ET s'activent toutes seules », chez Fabien, sur
+                // une installation où la case est décochée.
+                match zone_repo.get_or_create_si_autorise(
+                    &d.name,
+                    Some("dlna"),
+                    &d.id,
+                    "ssdp_startup",
+                ) {
+                    Ok(CreationDeZone::Creee(zid)) => {
                         let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
                     }
-                    Ok((zid, false)) => {
+                    Ok(CreationDeZone::Existante(zid)) => {
                         let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         let _ = zone_repo.set_online_by_device(&d.id, true);
+                    }
+                    Ok(CreationDeZone::Refusee) => {
+                        info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_auto_create_disabled_skipping");
                     }
                     Err(e) => {
                         tracing::warn!(name = %d.name, device_id = %d.id, error = %e, "ssdp_startup_zone_create_failed");
@@ -856,6 +872,40 @@ fn spawn_position_poller(state: &AppState) {
     poller.spawn();
 }
 
+/// #3589, volet A — le catalogue « Tune tested », au démarrage puis toutes les
+/// six heures.
+///
+/// Six heures, et non l'heure du `Cache-Control: public, max-age=3600` mesuré
+/// sur la réponse du site : une validation d'appareil n'est pas une urgence, et
+/// `version` étant un entier qui ne recule jamais, un tour qui ne trouve rien
+/// de neuf ne coûte qu'une comparaison.
+///
+/// 🔴 Ne rend jamais d'erreur : hors ligne, `rafraichir` rend `Repli` et
+/// l'instance garde ce qu'elle a — le dernier catalogue rangé, ou le catalogue
+/// embarqué si elle n'en a jamais obtenu.
+fn spawn_tune_tested_refresher(state: &AppState) {
+    let db = state.backend.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        loop {
+            // `interval` déclenche IMMÉDIATEMENT son premier tour : c'est le
+            // « au démarrage » de l'issue, sans second appel à écrire.
+            ticker.tick().await;
+            match tune_core::cloud::tune_tested::rafraichir(&db).await {
+                tune_core::cloud::tune_tested::Issue::Range { avant, apres } => {
+                    tracing::info!(avant, apres, "tune_tested_catalogue_mis_a_jour");
+                }
+                tune_core::cloud::tune_tested::Issue::Inchange(v) => {
+                    tracing::debug!(version = v, "tune_tested_catalogue_inchange");
+                }
+                tune_core::cloud::tune_tested::Issue::Repli(raison) => {
+                    tracing::debug!(%raison, "tune_tested_catalogue_repli");
+                }
+            }
+        }
+    });
+}
+
 fn spawn_token_refresher(state: &AppState) {
     let services = state.services.clone();
     let db = state.backend.clone();
@@ -968,7 +1018,9 @@ fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {
 }
 
 fn spawn_telemetry_reporter(state: &AppState) {
-    tune_core::cloud::telemetry::spawn_startup_ping(state.services.clone());
+    // #3383 : le ping de demarrage recoit la base, parce qu'il doit lire le
+    // consentement avant d'envoyer version, OS, arch et liste des services.
+    tune_core::cloud::telemetry::spawn_startup_ping(state.backend.clone(), state.services.clone());
     tune_core::cloud::telemetry::TelemetryReporter::spawn(
         state.backend.clone(),
         state.services.clone(),
@@ -1015,16 +1067,16 @@ fn prochain_intervalle_battement(echecs_consecutifs: u32) -> std::time::Duration
 
 /// Ce qu'un tour de battement a le droit de faire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HeartbeatPlan {
+pub struct HeartbeatPlan {
     /// Envoyer la charge utile a `POST /api/v1/heartbeat`.
-    send_heartbeat: bool,
+    pub send_heartbeat: bool,
     /// Rafraichir les droits premium du compte SSO (`GET /api/v1/user`).
-    refresh_account: bool,
+    pub refresh_account: bool,
     /// La clé de licence se revalide par `POST /api/v1/license/validate`,
     /// une charge à trois champs sans rien de descriptif — donc même quand
     /// la télémétrie est refusée. Sans cela, un Premium à CLÉ en opt-out
     /// retombait en Free au bout de la grâce de 14 jours (LIC-1).
-    revalidate_key: bool,
+    pub revalidate_key: bool,
 }
 
 /// Decide ce que fait le tour de battement en fonction de l'opt-out telemetrie.
@@ -1046,6 +1098,19 @@ fn heartbeat_plan(telemetry_enabled: bool) -> HeartbeatPlan {
         refresh_account: true,
         revalidate_key: true,
     }
+}
+
+/// Le plan d'UN tour, decide a partir des reglages de CETTE instance.
+///
+/// #3383 — c'est le seul site d'appel de `heartbeat_plan` en production, et
+/// c'est ici que se lit le consentement. `is_enabled_for` et non `is_enabled` :
+/// le refus pose dans l'interface (`POST /cloud/telemetry/disable`) compte
+/// autant que celui pose dans l'environnement (`TUNE_TELEMETRY=false`).
+///
+/// Fonction et non expression en ligne, pour qu'un temoin puisse APPELER la
+/// decision reelle plutot que d'en recopier les termes.
+pub fn plan_du_tour(settings: &tune_core::db::settings_repo::SettingsRepo) -> HeartbeatPlan {
+    heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(settings))
 }
 
 /// Lightweight heartbeat — honours `TUNE_TELEMETRY` (#2416).
@@ -1120,7 +1185,7 @@ fn spawn_heartbeat(state: &AppState) {
 
         let mut echecs_consecutifs: u32 = 0;
         loop {
-            let plan = heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled());
+            let plan = plan_du_tour(&settings);
 
             // Registre des executions automatisees (#2080) : un cycle = une
             // ligne. Le battement est la seule passe dont l'echec est INVISIBLE
@@ -1957,6 +2022,21 @@ fn spawn_replaygain_analysis(state: &AppState) {
     tune_core::audio::replaygain::spawn(state.backend.clone());
 }
 
+/// #2172 — le rattrapage des paroles.
+///
+/// Le titre de l'issue disait « aucun passage de fond ne récupère les
+/// paroles » : les deux passes de `library::lyrics_pass` existaient depuis la
+/// 0.9.118, mais leur SEUL appelant était `POST /library/lyrics/fetch`, un
+/// bouton. Cette ligne est ce qui manquait — sans elle, le cœur reste du code
+/// que rien n'atteint, exactement comme `spawn_scan_scheduler` avant #2469.
+///
+/// Ne fait rien tant que `lyrics_lrclib_enabled` n'est pas activé, s'efface
+/// devant toute zone qui joue, et ne demande jamais plus de `LOT_DE_FOND`
+/// paroles d'affilée.
+fn spawn_lyrics_catchup(state: &AppState) {
+    tune_core::library::lyrics_pass::spawn(state.backend.clone(), state.http_client.clone());
+}
+
 /// Background CLAP audio-embedding sweep for the acoustic Smart Radio. Opt-in
 /// build (feature-gated) AND opt-in at runtime (`audio_embedding_enabled`); the
 /// loop no-ops cheaply until enabled and a model is present.
@@ -2293,13 +2373,9 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // Phase 2: Create zones and emit events (no lock held)
     if !new_devices_to_zone.is_empty() {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-        let auto_create =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                .get("zone_auto_create")
-                .ok()
-                .flatten()
-                .map(|v| v != "false")
-                .unwrap_or(true);
+        // #3529 — même lecture du réglage que partout ailleurs, mais elle
+        // n'est plus recopiée : `ZoneRepo` la porte une fois pour toutes.
+        let auto_create = zone_repo.zone_auto_create_autorise();
         let system_default_device_id = crate::startup::first_system_default_name(
             new_devices_to_zone
                 .iter()
@@ -2705,9 +2781,12 @@ mod heartbeat_cadence_et_optout_tests {
         );
     }
 
-    /// Le battement doit lire l'opt-out par le MEME mecanisme que la telemetrie
-    /// (`TelemetryReporter::is_enabled`), pas par une seconde lecture maison de
-    /// la variable d'environnement.
+    /// Le battement doit lire l'opt-out par le MEME mecanisme que le reste des
+    /// envois (`TelemetryReporter::is_enabled_for`), pas par une seconde
+    /// lecture maison de la variable d'environnement.
+    ///
+    /// #3383 : `is_enabled_for` et non `is_enabled` — le second ne connait que
+    /// l'environnement, et laissait la bascule de l'interface sans effet.
     #[test]
     fn l_optout_reutilise_le_mecanisme_de_la_telemetrie() {
         // On ne regarde QUE le code de production : les modules de test citent
@@ -2719,10 +2798,65 @@ mod heartbeat_cadence_et_optout_tests {
             .next()
             .expect("source vide");
         assert!(
-            production.contains(&format!("TelemetryReporter::{}()", "is_enabled")),
-            "l'opt-out du battement doit reutiliser TelemetryReporter::is_enabled, \
+            production.contains(&format!("TelemetryReporter::{}(", "is_enabled_for")),
+            "l'opt-out du battement doit reutiliser TelemetryReporter::is_enabled_for, \
              pas relire TUNE_TELEMETRY pour son compte"
         );
+    }
+
+    /// #3383 — le battement lit le reglage ECRIT par la bascule de
+    /// l'interface, et pas seulement la variable d'environnement.
+    ///
+    /// Ce temoin APPELLE `plan_du_tour`, c'est-a-dire l'unique expression que
+    /// la boucle de production evalue a chaque tour : debrancher la conduite
+    /// le fait rougir, ce qu'une recherche de chaine dans le fichier ne ferait
+    /// pas.
+    #[test]
+    fn le_refus_pose_dans_l_interface_coupe_le_battement() {
+        let db = base_de_test();
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(db);
+
+        // Rien de pose : comportement d'avant, le battement part.
+        assert!(
+            super::plan_du_tour(&reglages).send_heartbeat,
+            "une installation qui n'a rien decoche doit continuer d'emettre"
+        );
+
+        // `POST /cloud/telemetry/disable` ecrit ceci, et rien d'autre.
+        reglages
+            .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "false")
+            .expect("ecriture du reglage");
+        let plan = super::plan_du_tour(&reglages);
+        assert!(
+            !plan.send_heartbeat,
+            "le refus pose dans l'interface doit couper la charge utile descriptive"
+        );
+        // Et la licence, elle, continue de vivre — LIC-1 : un opt-out ne se
+        // paie jamais en fonctionnalites perdues, y compris a J+15.
+        assert!(
+            plan.revalidate_key,
+            "refuser la telemetrie ne doit pas faire perdre une licence a cle"
+        );
+        assert!(
+            plan.refresh_account,
+            "refuser la telemetrie ne doit pas degrader un compte premium"
+        );
+
+        // Et il se rallume.
+        reglages
+            .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "true")
+            .expect("ecriture du reglage");
+        assert!(
+            super::plan_du_tour(&reglages).send_heartbeat,
+            "re-cocher doit reellement rallumer"
+        );
+    }
+
+    fn base_de_test() -> std::sync::Arc<dyn tune_core::db::backend::DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().expect("base en memoire");
+        db.init_schema().expect("schema");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        std::sync::Arc::new(db)
     }
 }
 

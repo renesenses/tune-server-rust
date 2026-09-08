@@ -120,6 +120,15 @@ tokio = { workspace = true, features = ["test-util"] }
 name = "server_contracts"
 path = "tests/server_contracts.rs"
 
+# #1362 — « un morceau présent deux fois dans un album ne doit pas se jouer
+# deux fois ». Le fichier existe depuis que le défaut a été corrigé, mais
+# `autotests = false` (plus haut) le laissait HORS COMPILATION : la garde
+# n'était donc exécutée par personne, ni en local ni en CI. Elle l'est
+# désormais.
+[[test]]
+name = "album_lecture_en_double"
+path = "tests/album_lecture_en_double.rs"
+
 [[test]]
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
@@ -271,6 +280,17 @@ path = "tests/pairs_decouverts_i2746.rs"
 name = "comptes_par_source_2147"
 path = "tests/comptes_par_source_2147.rs"
 
+# #3542 : `POST /podcasts/subscriptions` rendait 201 dans les deux cas —
+# creation reelle et abonnement deja present — sans porter l'identifiant de la
+# ligne. `autotests = false` plus haut : sans cette cible, le fichier ne serait
+# JAMAIS compile, donc vert contre rien.
+#
+# Pas de `required-features` : le banc monte une base SQLite en memoire et
+# appelle la route par son URL, il ne demande aucune base externe ni reseau.
+[[test]]
+name = "podcasts_abonnement_identifiant_3542"
+path = "tests/podcasts_abonnement_identifiant_3542.rs"
+
 # #3226 generalise : `sources` gouverne desormais AUSSI le bloc local de
 # `/home/other-versions`, `/home/artist-releases` et
 # `/library/tracks/{id}/versions`, la ou il ne filtrait que la boucle des
@@ -296,3 +316,69 @@ path = "tests/sources_trois_routes_i3226.rs"
 [[test]]
 name = "radio_adresse_pas_un_flux_3578"
 path = "tests/radio_adresse_pas_un_flux_3578.rs"
+# #3383 : la bascule « désactiver la télémétrie » n'éteignait rien — la route
+# n'écrivait pas, et les sept gardes d'envoi ne lisaient que `TUNE_TELEMETRY`.
+# Le témoin passe par les ROUTES MONTÉES puis appelle les décisions de
+# production (`background::plan_du_tour`, `consent::contribution_autorisee`) :
+# débrancher la conduite le fait rougir. `autotests = false` plus haut : sans
+# cette cible, le fichier ne serait JAMAIS compilé, donc vert contre rien.
+[[test]]
+name = "refus_telemetrie_honore_3383"
+path = "tests/refus_telemetrie_honore_3383.rs"
+
+# #3322 : `output_capabilities.channel_layouts` était déclaré, publié, et vide
+# sur les 14 zones — `v1()` le posait à `Vec::new()` et aucun builder ne
+# permettait de l'écrire. Le témoin passe par les DEUX routes de zone puis par
+# `output_capabilities_avec`, l'appel de production commun. `autotests = false`
+# plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, donc vert
+# contre rien.
+[[test]]
+name = "dispositions_de_canaux_3322"
+path = "tests/dispositions_de_canaux_3322.rs"
+
+# #3462 — la garde qui verifie qu'un SlimProto mort au demarrage apparait dans
+# la grille de composants de `/system/health`, celle que trois ecrans affichent
+# deja. Fichier a part : `etat_ecoute()` est un etat GLOBAL au processus, le
+# poser depuis un test contaminerait tous les autres tests du meme binaire.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+[[test]]
+name = "sante_slimproto_i3462"
+path = "tests/sante_slimproto_i3462.rs"
+
+# #3518 : « # Plays » et « Last Played », deux colonnes de la maquette V1 que
+# AUCUNE route de liste de pistes ne portait. La garde passe par le ROUTEUR
+# MONTE : un essai qui appellerait `plays_for_tracks` en direct resterait vert
+# alors meme que la route ne l'appelle pas — le defaut « ecrit mais pas
+# branche » que ce depot connait par coeur. `autotests = false` plus haut :
+# sans cette cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+[[test]]
+name = "ecoutes_par_piste_3518"
+path = "tests/ecoutes_par_piste_3518.rs"
+# #1361 — « Retour à l'album en cours » : la route qui dit quel album jouer
+# rouvrir, et chez qui. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
+[[test]]
+name = "album_en_cours_1361"
+path = "tests/album_en_cours_1361.rs"
+# #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
+# que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
+# une variable d'environnement que plus aucune etape ne pose. `autotests =
+# false` plus haut : sans cette cible, la garde des gardes ne serait elle-meme
+# jamais compilee — la panne exacte qu'elle refuse.
+#
+# Pas de `required-features` : elle ne lit que des fichiers du depot (manifestes,
+# sources, workflows) et doit tourner sur CHAQUE porte `cargo test -p
+# tune-server`, y compris la plus etroite.
+[[test]]
+name = "derive_des_garde_fous_2816"
+path = "tests/derive_des_garde_fous_2816.rs"
+# #3529 : le recensement des chemins qui creent une zone. Il lit la SOURCE de
+# `tune-server/src` et echoue sur tout site nouveau qui ne consulte pas
+# « Creer automatiquement les zones ». Cible a elle seule parce qu'elle ne
+# monte aucun `AppState` et n'a besoin d'aucune feature — et `autotests = false`
+# plus haut : sans cette entree, le fichier ne serait JAMAIS compile, donc vert
+# contre rien.
+[[test]]
+name = "zones_auto_create_recension"
+path = "tests/zones_auto_create_recension.rs"
