@@ -1307,6 +1307,18 @@ fn version_de_schema_affichee(version: Option<i32>) -> String {
     version.map_or_else(|| VERSION_DE_SCHEMA_INCONNUE.to_string(), |v| v.to_string())
 }
 
+/// Une valeur de réglage telle qu'elle doit se LIRE dans le markdown (#2856).
+///
+/// Une chaîne perd ses guillemets JSON — `resample_policy: none`, pas
+/// `resample_policy: "none"` —, tout le reste s'écrit tel quel. Fonction NUE,
+/// éprouvable sans base ni `AppState`.
+fn valeur_lisible(valeur: &Value) -> String {
+    match valeur.as_str() {
+        Some(texte) => texte.to_string(),
+        None => valeur.to_string(),
+    }
+}
+
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
@@ -1569,6 +1581,38 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         version_de_schema_affichee(db_version)
     ));
 
+    // #2856 — le rapport ne portait AUCUNE section de réglages. Ni l'état de
+    // l'enrichissement au scan, ni le moteur audio : deux faits qu'il fallait
+    // redemander au testeur à chaque ticket de métadonnées ou de son, alors
+    // que le serveur les a sous la main. La fiche système (`/system/profile`)
+    // en portait déjà une partie ; le rapport, lui, est ce que le testeur
+    // COLLE sur le forum, et c'est là qu'on lit un ticket.
+    //
+    // La liste des réglages publiables est celle de la fiche, PARTAGÉE et non
+    // recopiée : deux listes auraient divergé, et la seconde n'aurait pas
+    // hérité de la garde qui interdit d'y faire entrer une clé secrète.
+    let reglages = super::profile::support_settings(|k| settings.get(k).ok().flatten());
+    let moteur_audio = super::profile::moteur_audio(&state);
+    md.push_str("\n## Settings\n");
+    md.push_str(&format!(
+        "- Audio backend: requested={}, active={}\n",
+        valeur_lisible(&moteur_audio["backend_requested"]),
+        valeur_lisible(&moteur_audio["backend_active"]),
+    ));
+    md.push_str(&format!(
+        "- Exclusive mode: requested={}, effective={}, forced={}{}\n",
+        valeur_lisible(&moteur_audio["exclusive_mode"]["requested"]),
+        valeur_lisible(&moteur_audio["exclusive_mode"]["effective"]),
+        valeur_lisible(&moteur_audio["exclusive_mode"]["forced"]),
+        match moteur_audio["exclusive_mode"]["detail"].as_str() {
+            Some(raison) => format!(" — {raison}"),
+            None => String::new(),
+        },
+    ));
+    for (cle, valeur) in &reglages {
+        md.push_str(&format!("- {cle}: {}\n", valeur_lisible(valeur)));
+    }
+
     // Recent logs (tail) — the single most useful part of a bug report. Reuses
     // the same collector as the /logs endpoint so the report matches what the
     // "Export logs" button shows.
@@ -1630,6 +1674,10 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             "engine": state.backend.engine().as_str(),
             "migration_version": db_version,
         },
+        // #2856 — les mêmes réglages que la section markdown, pour le client
+        // qui lit le JSON. Même source, donc jamais deux vérités.
+        "settings": reglages,
+        "audio": moteur_audio,
         "markdown": md,
     }))
 }

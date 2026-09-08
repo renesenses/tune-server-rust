@@ -31,7 +31,12 @@ use crate::state::AppState;
 /// authentifié (pas seulement admin).
 /// Interdit : toute clé contenant un secret (api_key, jwt_secret,
 /// license_key, discogs_token, auth_tokens_*, mots de passe…).
-const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
+///
+/// `pub(super)` depuis #2856 : le RAPPORT DE BOGUE ne portait aucune section
+/// de réglages, et c'est cette même liste qu'il doit rendre. Deux listes
+/// auraient divergé, et la seconde n'aurait pas hérité de la garde de
+/// `est_secret` posée ci-dessous.
+pub(super) const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
     ("community_sync_enabled", || json!(false)),
     // Consentement de contribution (bios + images d'artistes). Non sensible,
     // et utile en support : « est-ce que cette instance envoie quelque chose ? »
@@ -50,7 +55,7 @@ const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
 /// Projette les settings bruts sur l'allowlist support. Les valeurs stockées
 /// en texte ("true", "1.5", "none") sont re-typées quand c'est du JSON valide,
 /// sinon renvoyées telles quelles en chaîne.
-fn support_settings(get: impl Fn(&str) -> Option<String>) -> Map<String, Value> {
+pub(super) fn support_settings(get: impl Fn(&str) -> Option<String>) -> Map<String, Value> {
     let mut out = Map::new();
     for (key, default) in SUPPORT_SETTING_KEYS {
         let value = match get(key) {
@@ -62,21 +67,54 @@ fn support_settings(get: impl Fn(&str) -> Option<String>) -> Map<String, Value> 
     out
 }
 
+/// Le nom du backend audio réellement ACTIF.
+pub(super) fn backend_audio_actif(state: &AppState) -> &'static str {
+    #[cfg(feature = "local-audio")]
+    {
+        tune_core::outputs::local::active_backend_name(&state.display_audio_backend())
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        let _ = &state.config.local_audio_backend;
+        "none"
+    }
+}
+
+/// Le MOTEUR AUDIO tel qu'un ticket doit pouvoir le lire (#2856).
+///
+/// Trois faits, jamais un seul : ce qui a été DEMANDÉ, ce qui TOURNE, et ce
+/// que le mode exclusif vaut réellement — avec la raison quand les deux
+/// diffèrent. C'est exactement l'écart que #3192 a mesuré chez jfpaquet :
+/// sous ASIO, décocher « mode exclusif » reste sans effet (un pilote ASIO
+/// ouvert en partagé n'existe pas), le son de toutes les autres applications
+/// disparaît, et rien ne le dit. Un ticket qui ne porte que le backend actif
+/// oblige à réécrire au testeur pour apprendre ces trois valeurs.
+///
+/// Aucun secret ici : trois booléens, deux noms de backend et une phrase
+/// figée du binaire.
+pub(super) fn moteur_audio(state: &AppState) -> Value {
+    let exclusif = state.exclusive_mode_status();
+    json!({
+        "backend_requested": state.effective_audio_backend(),
+        "backend_active": backend_audio_actif(state),
+        "exclusive_mode": {
+            "requested": exclusif.requested,
+            "effective": exclusif.effective,
+            "forced": exclusif.forced,
+            "detail": exclusif.detail,
+        },
+    })
+}
+
 pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // --- server -----------------------------------------------------------
-    let audio_backend = {
-        #[cfg(feature = "local-audio")]
-        {
-            tune_core::outputs::local::active_backend_name(&state.display_audio_backend())
-        }
-        #[cfg(not(feature = "local-audio"))]
-        {
-            let _ = &state.config.local_audio_backend;
-            "none"
-        }
-    };
+    let audio_backend = backend_audio_actif(&state);
+    // #2856 : la fiche ne portait que le backend ACTIF. Elle porte désormais
+    // aussi le DEMANDÉ et l'état du mode exclusif, les deux faits qu'il
+    // fallait redemander au testeur à chaque ticket audio.
+    let audio = moteur_audio(&state);
     let server = json!({
         "version": tune_core::version(),
         "os": std::env::consts::OS,
@@ -88,6 +126,7 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
         "process_started_at": state.process_started_at_rfc3339(),
         "database_engine": state.backend.engine().as_str(),
         "audio_backend": audio_backend,
+        "audio": audio,
     });
 
     // --- library ----------------------------------------------------------
@@ -188,6 +227,22 @@ mod tests {
                     "setting {key:?} ressemble à un secret et ne doit pas être exposé"
                 );
             }
+        }
+    }
+
+    /// La même exigence, mais énoncée par la classification du dépôt plutôt
+    /// que par une liste de fragments écrite à la main ici (#2856). C'est
+    /// `tune_core::secrets::est_secret` qui décide ailleurs ce qu'on caviarde ;
+    /// une clé qu'elle juge secrète n'a rien à faire dans une fiche jointe à un
+    /// ticket, ni dans le rapport de bogue qui lit la même liste.
+    #[test]
+    fn l_allowlist_ne_porte_aucune_cle_jugee_secrete_par_le_depot() {
+        for (key, _) in SUPPORT_SETTING_KEYS {
+            assert!(
+                !tune_core::secrets::est_secret(key),
+                "le réglage {key:?} est classé secret par tune_core::secrets \
+                 et ne doit pas partir dans un ticket support (#2856)"
+            );
         }
     }
 
