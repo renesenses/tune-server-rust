@@ -742,7 +742,13 @@ mod ecriture;
 pub use ecriture::*;
 
 mod peripheriques;
+mod preconfiguration;
+
+// La découverte (`discovery_setup.rs`) crée des zones sans passer par le
+// routeur : elle a besoin des deux mêmes gestes que `POST /zones`.
 pub use peripheriques::*;
+pub(crate) use preconfiguration::ouvrir_provenance as ouvrir_provenance_de_zone;
+pub(crate) use preconfiguration::preconfigurer_zone as preconfigurer_zone_decouverte;
 
 mod groupes;
 pub use groupes::*;
