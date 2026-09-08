@@ -313,3 +313,13 @@ path = "tests/dispositions_de_canaux_3322.rs"
 [[test]]
 name = "sante_slimproto_i3462"
 path = "tests/sante_slimproto_i3462.rs"
+
+# #3518 : « # Plays » et « Last Played », deux colonnes de la maquette V1 que
+# AUCUNE route de liste de pistes ne portait. La garde passe par le ROUTEUR
+# MONTE : un essai qui appellerait `plays_for_tracks` en direct resterait vert
+# alors meme que la route ne l'appelle pas — le defaut « ecrit mais pas
+# branche » que ce depot connait par coeur. `autotests = false` plus haut :
+# sans cette cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+[[test]]
+name = "ecoutes_par_piste_3518"
+path = "tests/ecoutes_par_piste_3518.rs"
