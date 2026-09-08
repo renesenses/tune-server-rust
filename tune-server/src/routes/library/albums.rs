@@ -1090,6 +1090,115 @@ pub(crate) fn cle_titre(titre: &str) -> String {
     cle
 }
 
+/// Le numéro de TRANCHE que porte un mot de titre : `cd2`, `disc 3`,
+/// `disque 1`, `part 2`, `partie 1`.
+///
+/// Le vocabulaire des **disques** n'est pas redéfini ici : il vient de
+/// [`tune_core::metadata::numero_de_disque`], la fonction que le scan emploie
+/// déjà pour reconnaître un dossier de disque (#1656). Une seconde liste
+/// aurait dérivé de la première au premier ajout.
+///
+/// Seuls `part` / `partie` sont ajoutés, et **uniquement ici** : un dossier
+/// nommé « Part 1 » n'est pas un CD, et l'élargissement du vocabulaire des
+/// dossiers changerait la déduction d'album au scan. Dans un TITRE, en
+/// revanche, « (Part 1) » est bien une tranche — c'est l'un des quatre cas
+/// que #3396 nomme.
+///
+/// `Vol. 2` en est volontairement absent, et cela CONTREDIT le corps de
+/// l'issue, qui le cite parmi les suffixes à retirer. Le commentaire de
+/// `numero_de_disque` tranche l'inverse, avec sa raison : « c'est presque
+/// toujours un vrai titre d'album (« Greatest Hits Vol. 2 »), et le confondre
+/// avec un disque effacerait un album entier ». Fusionner « Greatest Hits
+/// Vol. 1 » et « Greatest Hits Vol. 2 » détruirait une distinction voulue —
+/// exactement le dégât contre lequel l'issue met elle-même en garde deux
+/// paragraphes plus bas.
+fn numero_de_tranche(mot: &str) -> Option<u32> {
+    if let Some(n) = tune_core::metadata::numero_de_disque(mot) {
+        return Some(n);
+    }
+    let mot = mot.trim().to_lowercase();
+    // « partie » avant « part », sinon « partie 2 » se lirait « part » + « ie 2 ».
+    for prefixe in ["partie", "part"] {
+        if let Some(reste) = mot.strip_prefix(prefixe) {
+            return reste
+                .trim_start_matches([' ', '-', '_', '.', '#'])
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n > 0);
+        }
+    }
+    None
+}
+/// [`cle_titre`], puis retrait d'un marqueur de TRANCHE en fin de titre.
+///
+/// ## Ce qui manquait (#3396)
+///
+/// `cle_titre` ne retire rien : `cle_titre("Sgt. Pepper — Disc 1")` rend
+/// `"sgt pepper disc 1"` et `cle_titre("Sgt. Pepper — Disc 2")` rend
+/// `"sgt pepper disc 2"`. Les deux clés diffèrent, donc
+/// [`grouper_les_albums_eclates`] ne les met JAMAIS dans le même faisceau —
+/// alors que c'est le cas d'école du ticket : « un « Disc 1 » / « Disc 2 »
+/// séparés ». Le mécanisme BIB-A2 existait, la clé le rendait aveugle à la
+/// moitié des éclatements qu'il devait voir.
+///
+/// ## Ce que le retrait NE fait pas
+///
+/// - il n'agit qu'en **fin** de titre : « CD1 Sessions » garde sa clé ;
+/// - il exige qu'il RESTE quelque chose : un album qui ne s'appelle que
+///   « CD 2 » garde sa clé entière, sinon tous les albums ainsi nommés
+///   convergeraient sur la clé vide ;
+/// - il ne fusionne rien par lui-même. Le faisceau reste soumis à la même
+///   règle qu'avant — même dossier d'album, deux lignes `albums` — et
+///   l'absorption reste un geste manuel, refusable et annulable par
+///   `album_distinct_pairs`.
+pub(crate) fn cle_titre_sans_tranche(titre: &str) -> String {
+    let cle = cle_titre(titre);
+    let mots: Vec<&str> = cle.split(' ').filter(|m| !m.is_empty()).collect();
+    // « … disc 2 » : le marqueur et son nombre sont deux mots. Il doit rester
+    // au moins un mot de titre devant.
+    if mots.len() >= 3
+        && numero_de_tranche(&format!(
+            "{} {}",
+            mots[mots.len() - 2],
+            mots[mots.len() - 1]
+        ))
+        .is_some()
+    {
+        return mots[..mots.len() - 2].join(" ");
+    }
+    // « … cd2 » : marqueur et nombre collés, un seul mot.
+    if mots.len() >= 2 && numero_de_tranche(mots[mots.len() - 1]).is_some() {
+        return mots[..mots.len() - 1].join(" ");
+    }
+    cle
+}
+/// Le dossier qui porte l'ALBUM : [`dossier_de`], puis un cran de plus quand
+/// le dernier segment n'est QU'un numéro de disque.
+///
+/// ## Ce qui manquait (#3396)
+///
+/// `.../Sgt. Pepper/CD1/01.flac` et `.../Sgt. Pepper/CD2/01.flac` donnaient
+/// deux dossiers différents, donc deux faisceaux distincts, donc aucun
+/// rapprochement — et l'absorption les refusait avec `409
+/// dossiers_differents`. C'est le premier cas que #3396 cite : « un dossier
+/// par CD ».
+///
+/// La reconnaissance du segment est celle du scan
+/// ([`tune_core::metadata::numero_de_disque`], #1656) : `CD1`, `CD 2`,
+/// `Disc-3`, `Disque 1`, `disk04` et rien d'autre. Un dossier `Bonus` ou
+/// `Disco` ne remonte pas.
+pub(crate) fn dossier_de_l_album(chemin: &str) -> &str {
+    let dossier = dossier_de(chemin);
+    let dernier = match dossier.rfind(['/', '\\']) {
+        Some(i) => &dossier[i + 1..],
+        None => dossier,
+    };
+    if tune_core::metadata::numero_de_disque(dernier).is_some() {
+        dossier_de(dossier)
+    } else {
+        dossier
+    }
+}
 /// BIB-A2, phase 0 : les groupes d'albums qui sont PROBABLEMENT un seul album
 /// éclaté. Le faisceau (mesure du 30/08 sur .18 : 93 % des éclatements
 /// viennent de l'enregistreur, qui écrit sous l'artiste de la PISTE) :
@@ -1105,11 +1214,16 @@ pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
     type Faisceaux = BTreeMap<(String, String), BTreeMap<i64, Fiche>>;
     let mut faisceaux: Faisceaux = BTreeMap::new();
     for p in pistes {
-        let dossier = dossier_de(&p.file_path);
+        // Le dossier de l'ALBUM, pas celui du fichier : un coffret rangé en
+        // `.../Album/CD1` et `.../Album/CD2` doit tomber dans un seul
+        // faisceau (#3396).
+        let dossier = dossier_de_l_album(&p.file_path);
         if dossier.is_empty() {
             continue;
         }
-        let cle = cle_titre(&p.album_title);
+        // La clé sans marqueur de tranche : « Album Disc 1 » et
+        // « Album Disc 2 » sont le même album coupé en deux (#3396).
+        let cle = cle_titre_sans_tranche(&p.album_title);
         if cle.is_empty() {
             continue;
         }
@@ -1223,7 +1337,9 @@ fn dossiers_de_l_album(state: &AppState, album_id: i64) -> std::collections::BTr
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| r.first().and_then(|v| v.as_string()))
-        .map(|chemin| dossier_de(&chemin).to_string())
+        // Même dossier d'album qu'en phase 0 : `.../Album/CD1` et
+        // `.../Album/CD2` ont bien `.../Album` en commun (#3396).
+        .map(|chemin| dossier_de_l_album(&chemin).to_string())
         .filter(|d| !d.is_empty())
         .collect()
 }
@@ -1291,7 +1407,11 @@ pub(super) async fn absorber_album(
             "seuls deux albums de la bibliothèque locale se regroupent".to_string(),
         );
     }
-    if cle_titre(&album_cible.title) != cle_titre(&album_doublon.title) {
+    // La MÊME clé que la phase 0, marqueur de tranche retiré. Sans cela, la
+    // phase 0 proposerait « Album Disc 1 » + « Album Disc 2 » et la phase 1
+    // les refuserait par `titres_differents` : une surface ouverte sur un
+    // geste que le serveur décline (#3396).
+    if cle_titre_sans_tranche(&album_cible.title) != cle_titre_sans_tranche(&album_doublon.title) {
         return refus(
             StatusCode::CONFLICT,
             "titres_differents",
