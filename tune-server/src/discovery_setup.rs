@@ -1167,6 +1167,10 @@ pub fn spawn_mdns_handler(
             .with_bluos()
             .with_oaat()
             .with_squeezebox()
+            // Lecteurs Sendspin (#3326, phase 1). On les PARCOURT sans jamais
+            // enregistrer de sortie : voir le bras `OutputType::Sendspin` du
+            // `match` ci-dessous.
+            .with_sendspin()
             // Browse peer Tune servers too, so this server can list the other
             // Tune servers on the network (#1273). Each server already announces
             // itself via `register_self`; without this it never browsed back.
@@ -1349,6 +1353,32 @@ pub fn spawn_mdns_handler(
                                 info!(host = %lms_addr, "mdns_lms_discovered_auto_configured");
                             }
                             (None, "squeezebox")
+                        }
+                        // Sendspin (#3326) — phase 1 : DÉCOUVERTE SEULE.
+                        //
+                        // On rend `None` volontairement. Tout ce qui suit dans
+                        // cette boucle — enregistrement de la sortie,
+                        // reconnexion, création automatique de zone, montée en
+                        // priorité — est gardé par `if let Some(output)` :
+                        // aucune zone Sendspin ne peut donc naître, et aucune
+                        // zone existante ne peut être capturée par une annonce
+                        // Sendspin. C'est exactement ce qu'on veut tant que la
+                        // lecture n'existe pas : un appareil visible, jamais un
+                        // appareil qui promet.
+                        //
+                        // La liste, elle, est servie par `GET /devices/sendspin`.
+                        OutputType::Sendspin => {
+                            info!(
+                                name = %dev.name,
+                                host = %dev.host,
+                                port = dev.port,
+                                path = ?dev
+                                    .capabilities
+                                    .get(tune_core::discovery::sendspin::CLE_CHEMIN)
+                                    .and_then(|v| v.as_str()),
+                                "sendspin_lecteur_decouvert_sans_sortie"
+                            );
+                            (None, "sendspin")
                         }
                         _ => (None, ""),
                     };

@@ -32,6 +32,14 @@ struct TopQuery {
     #[serde(default = "default_country")]
     country: String,
 }
+/// `GET /discover` (#3395). Même paramètre et même valeur par défaut que
+/// [`TopQuery`] : les deux routes servent le même palmarès, elles ne peuvent
+/// pas diverger sur le pays.
+#[derive(Deserialize)]
+struct DiscoverQuery {
+    #[serde(default = "default_country")]
+    country: String,
+}
 #[derive(Deserialize)]
 struct EpisodesQuery {
     feed_url: Option<String>,
@@ -178,18 +186,48 @@ async fn unsubscribe(State(state): State<AppState>, Path(id): Path<i64>) -> impl
 async fn radiofrance_podcasts() -> Json<Value> {
     Json(json!(PodcastService::curated_french_podcasts()))
 }
-/// GET /discover — curated French podcasts + optional Apple top chart enrichment.
-async fn discover_podcasts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let curated = PodcastService::curated_french_podcasts();
+/// `GET /discover?country={cc}` — la sélection éditoriale et le palmarès
+/// Apple du pays demandé.
+///
+/// #3395 — le handler ne prenait AUCUN `Query` : `?country=` n'était pas mal
+/// utilisé, il n'était jamais lu. Le palmarès partait sur « us » écrit en dur
+/// et la sélection était la liste française quel que soit le pays, ce qui
+/// rendait la réponse octet pour octet identique entre `fr` et `us` — le
+/// sélecteur de pays de l'écran Podcasts paraissait mort.
+///
+/// Les deux sections ne se comportent pas pareil, et c'est assumé :
+///
+/// - `top` vient d'un vrai fournisseur (Apple), qui filtre par pays lui-même
+///   — le pays est un segment de SON chemin, le serveur ne fait que le lui
+///   transmettre ;
+/// - `curated` est une liste écrite en dur, et il n'en existe QUE pour la
+///   France. Elle n'est donc rendue que pour `fr`, et la réponse annonce
+///   `curated_country` pour que le client sache à quoi s'en tenir. Aucun
+///   filtre n'est simulé côté serveur : hors de France, il n'y a rien à
+///   filtrer.
+async fn discover_podcasts(
+    State(state): State<AppState>,
+    Query(q): Query<DiscoverQuery>,
+) -> Result<Json<Value>, AppError> {
+    let curated = PodcastService::curated_for_country(&q.country);
     let svc = PodcastService::with_client(state.http_client.clone());
-    let top = svc.top_podcasts(None, "us").await.unwrap_or_default();
+    let top = svc.top_podcasts(None, &q.country).await.unwrap_or_default();
     Ok(Json(json!({
+        "country": q.country,
         "curated": curated,
+        // Le pays — le seul — pour lequel une sélection éditoriale existe. Un
+        // client hors de ce pays sait ainsi que `curated` est vide par
+        // construction, et non parce que la requête a échoué.
+        "curated_country": PodcastService::CURATED_COUNTRY,
         "top": top,
         "genres": PodcastService::available_genres(),
     })))
 }
-/// GET /top?genre={genreId} — Apple Top 50 podcasts in France, optionally filtered by genre.
+/// `GET /top?genre={genreId}&country={cc}` — le Top 50 Apple du pays demandé,
+/// éventuellement filtré par genre.
+///
+/// Le pays est paramétré depuis #3207 ; le commentaire, lui, annonçait encore
+/// « in France » (#3395).
 async fn top_podcasts(
     State(state): State<AppState>,
     Query(q): Query<TopQuery>,
@@ -510,5 +548,46 @@ mod tests {
         assert_eq!(guess_audio_mime("https://x.com/ep.mp3"), "audio/mpeg");
         assert_eq!(guess_audio_mime("https://x.com/ep.m4a?t=1"), "audio/mp4");
         assert_eq!(guess_audio_mime("https://x.com/stream"), "audio/mpeg");
+    }
+
+    /// #3395 — `/discover` LIT le pays, et le lit comme `/top`.
+    ///
+    /// Le défaut n'était pas une mauvaise lecture du paramètre : le handler
+    /// n'en prenait aucun. Le témoin épingle la lecture elle-même (le
+    /// `Query`), pays absent comme pays fourni, et exige la même valeur par
+    /// défaut que `/top` — c'est leur divergence qui rendrait à nouveau une
+    /// section sourde au sélecteur.
+    #[test]
+    fn discover_lit_le_pays_comme_top_3395() {
+        // L'extracteur réellement employé par la route, sur une vraie chaîne
+        // de requête.
+        let lu = |q: &str| -> DiscoverQuery {
+            let uri: axum::http::Uri = format!("/podcasts/discover?{q}").parse().unwrap();
+            Query::<DiscoverQuery>::try_from_uri(&uri)
+                .expect("la chaîne de requête doit se désérialiser")
+                .0
+        };
+        assert_eq!(lu("").country, default_country(), "défaut de /discover");
+        assert_eq!(lu("country=fr").country, "fr");
+        assert_eq!(lu("country=us").country, "us");
+        let uri: axum::http::Uri = "/podcasts/top".parse().unwrap();
+        let top = Query::<TopQuery>::try_from_uri(&uri).unwrap().0;
+        assert_eq!(
+            lu("").country,
+            top.country,
+            "/discover et /top doivent partager la valeur par défaut"
+        );
+    }
+
+    /// #3395 — la sélection éditoriale n'est servie que sous son drapeau.
+    ///
+    /// La route n'invente aucun filtre : elle rend ce que le fournisseur —
+    /// ici une liste écrite en dur, française — sait couvrir, et rien
+    /// ailleurs.
+    #[test]
+    fn discover_ne_sert_la_selection_que_pour_son_pays_3395() {
+        assert!(!PodcastService::curated_for_country("fr").is_empty());
+        assert!(PodcastService::curated_for_country("us").is_empty());
+        assert_eq!(PodcastService::CURATED_COUNTRY, "fr");
     }
 }

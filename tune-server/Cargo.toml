@@ -284,6 +284,18 @@ path = "tests/comptes_par_source_2147.rs"
 name = "sources_trois_routes_i3226"
 path = "tests/sources_trois_routes_i3226.rs"
 
+# #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
+# que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
+# une variable d'environnement que plus aucune etape ne pose. `autotests =
+# false` plus haut : sans cette cible, la garde des gardes ne serait elle-meme
+# jamais compilee — la panne exacte qu'elle refuse.
+#
+# Pas de `required-features` : elle ne lit que des fichiers du depot (manifestes,
+# sources, workflows) et doit tourner sur CHAQUE porte `cargo test -p
+# tune-server`, y compris la plus etroite.
+[[test]]
+name = "derive_des_garde_fous_2816"
+path = "tests/derive_des_garde_fous_2816.rs"
 # #3529 : le recensement des chemins qui creent une zone. Il lit la SOURCE de
 # `tune-server/src` et echoue sur tout site nouveau qui ne consulte pas
 # « Creer automatiquement les zones ». Cible a elle seule parce qu'elle ne

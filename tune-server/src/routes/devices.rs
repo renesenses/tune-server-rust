@@ -45,6 +45,14 @@ pub fn router() -> Router<AppState> {
         // donne déjà la priorité au segment littéral, la ligne est ici pour
         // que la lecture le montre.
         .route("/ignored", get(list_ignored_devices))
+        // #3326 — lecteurs Sendspin vus sur le réseau. Route séparée, et non
+        // une entrée de plus dans `GET /devices` : ce que `GET /devices` liste
+        // est offert à la création de zone, et `POST /zones` accepte
+        // n'importe quel `output_device_id` sans vérifier le registre des
+        // sorties (`routes/zones/ecriture.rs`). Y verser un appareil qui ne
+        // joue pas encore fabriquerait une zone muette — le contraire de ce
+        // que la phase 1 doit livrer.
+        .route("/sendspin", get(list_sendspin_players))
         .route(
             "/{device_id}/ignore",
             post(ignore_device).delete(unignore_device),
@@ -63,6 +71,23 @@ pub fn router() -> Router<AppState> {
 /// déroulants Marque/Modèle de la config d'une zone.
 async fn device_catalog() -> Json<Value> {
     Json(json!(tune_core::device_catalog::catalog()))
+}
+
+/// `GET /devices/sendspin` — les lecteurs Sendspin vus sur le réseau (#3326).
+///
+/// Phase 1 du chantier : Tune sait les VOIR, pas encore leur envoyer de son.
+/// Chaque entrée le dit explicitement (`playable: false` et un motif), et
+/// `supported` en tête de la charge utile le dit pour la liste entière — un
+/// client n'a donc pas à déduire d'un tableau vide qu'il ne se passe rien.
+async fn list_sendspin_players(State(state): State<AppState>) -> Json<Value> {
+    let players = state.discovered_sendspin_players().await;
+    Json(json!({
+        "service": tune_core::discovery::sendspin::SERVICE_LECTEUR,
+        "playback_supported": false,
+        "reason": tune_core::discovery::sendspin::MOTIF_PHASE_DECOUVERTE,
+        "count": players.len(),
+        "players": players,
+    }))
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
