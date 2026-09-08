@@ -94,6 +94,16 @@ pub struct DlnaOutput {
     /// per-zone override (Settings → renderer panel) can be applied live to the
     /// already-registered output without rebuilding it. 0 = no delay.
     play_delay_ms: AtomicU64,
+    /// Budget de la fenetre de reveil d'apres-`Play`, en ms
+    /// ([`BUDGET_REVEIL_STANDBY`] par defaut).
+    ///
+    /// Champ et non constante parce que la fenetre dure une DEMI-MINUTE :
+    /// eprouver le cycle complet — acquittement, `CurrentURI` vide, relances,
+    /// abandon — depuis `play_media` coutait ce temps-la pour de vrai, et
+    /// aucune epreuve ne le payait. Le seul ecrivain hors de la construction
+    /// est [`DlnaOutput::with_budget_reveil_ms`] ; la production ne l'appelle
+    /// nulle part et garde donc la constante, au millieme pres.
+    budget_reveil_ms: AtomicU64,
     /// Alternates between false ("1") and true ("2") so that consecutive
     /// DIDL items sent via SetAVTransportURI / SetNextAVTransportURI use
     /// different item IDs.  Renderers like Marantz ND8006 cache DIDL
@@ -271,6 +281,7 @@ impl DlnaOutput {
                 .build()
                 .unwrap_or_default(),
             play_delay_ms: AtomicU64::new(0),
+            budget_reveil_ms: AtomicU64::new(BUDGET_REVEIL_STANDBY.as_millis() as u64),
             next_item_id_flip: AtomicBool::new(false),
             didl_niveau_appris: AtomicU8::new(0),
             muted: AtomicBool::new(false),
@@ -292,6 +303,17 @@ impl DlnaOutput {
 
     pub fn with_play_delay(self, delay_ms: u64) -> Self {
         self.play_delay_ms.store(delay_ms, Ordering::Relaxed);
+        self
+    }
+    /// Raccourcit la fenetre de reveil d'apres-`Play` (defaut :
+    /// [`BUDGET_REVEIL_STANDBY`], 30 s).
+    ///
+    /// Existe pour qu'un banc puisse traverser le cycle ENTIER d'un ampli qui
+    /// ne se reveille jamais — c'est le seul moyen de mesurer ce que Tune
+    /// ANNONCE au bout, sans attendre une demi-minute par epreuve. Aucun
+    /// appelant de production : la valeur par defaut est la constante.
+    pub fn with_budget_reveil_ms(self, budget_ms: u64) -> Self {
+        self.budget_reveil_ms.store(budget_ms, Ordering::Relaxed);
         self
     }
 
@@ -1202,7 +1224,7 @@ impl OutputTarget for DlnaOutput {
         let mime_relance = attempt_mime.as_str();
         let verif = verifier_uri_appliquee(
             media.url,
-            BUDGET_REVEIL_STANDBY,
+            std::time::Duration::from_millis(self.budget_reveil_ms.load(Ordering::Relaxed)),
             || async move {
                 moi.av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
                     .await
@@ -2126,6 +2148,18 @@ const CADENCE_REVEIL: std::time::Duration = std::time::Duration::from_secs(1);
 /// reveil. Un HEOS qui finit de demarrer a pu perdre l'URI posee avant son
 /// reveil : la reposer periodiquement est ce qui la fait prendre.
 const INTERVALLE_RELANCE_REVEIL: std::time::Duration = std::time::Duration::from_secs(8);
+/// Ce qu'il doit rester de budget pour qu'une relance vaille d'etre engagee
+/// (#3580).
+///
+/// Une relance n'est pas une lecture : elle repose l'URI, attend le
+/// `play_delay` de la zone, puis joue. C'est le travail le plus long du cycle,
+/// et il partait sans qu'on regarde le budget — le journal de Reivax66 montre
+/// une quatrieme relance a 10:35:39,442 suivie de la SORTIE de la boucle a
+/// 10:35:42,647 : trois actions SOAP envoyees a un appareil, dont personne ne
+/// lira jamais l'effet, et trois secondes d'attente de plus pour l'auditeur.
+///
+/// On n'engage donc une relance que s'il reste de quoi en LIRE le resultat.
+const RESERVE_DE_RELECTURE_APRES_RELANCE: std::time::Duration = std::time::Duration::from_secs(4);
 /// Battement du bareme historique (#2390), quand le renderer tient une AUTRE
 /// source. Inchange.
 const CADENCE_URI_ETRANGERE: std::time::Duration = std::time::Duration::from_millis(400);
@@ -2277,10 +2311,26 @@ where
 
     // ── Temps 2 : la fenetre de reveil. ───────────────────────────────────
     if v.verdict == UriVerdict::PasEncore && v.refus_relance.is_none() && !v.soap_muet {
-        let debut_reveil = tokio::time::Instant::now();
-        let mut derniere_relance = debut_reveil;
-        while debut_reveil.elapsed() < budget_reveil {
+        // #3580 — LA BORNE COMPTE LE TEMPS DEJA PASSE.
+        //
+        // Elle ne comptait que ses propres sommeils : le temps 1 (six actions
+        // SOAP et une relance complete) s'ajoutait ENTIEREMENT a la fenetre,
+        // et chaque tour engageait une lecture — puis parfois une relance —
+        // apres le dernier controle. Sous `start_paused`, ou une action SOAP
+        // ne coute rien, la borne tenait ses ~32 s et l'epreuve restait verte ;
+        // sur le reseau de Reivax66 elle a rendu `attente_ms=41290` pour un
+        // budget de 30 s (ticket support 78, #3580). La marge sous la grace de
+        // chargement du sondeur (`TRACK_LOAD_GRACE_SECS` = 45 s), qui existe
+        // pour qu'UNE SEULE instance decide, tombait de 13 s a 3,7 s — et une
+        // zone reglee avec un `play_delay` la franchit.
+        let mut derniere_relance = tokio::time::Instant::now();
+        while debut.elapsed() < budget_reveil {
             tokio::time::sleep(CADENCE_REVEIL).await;
+            // Le sommeil a pu consommer ce qui restait : on n'engage pas une
+            // action SOAP de plus hors du budget.
+            if debut.elapsed() >= budget_reveil {
+                break;
+            }
             match lire_uri().await {
                 Ok(uri) => {
                     v.uri_tenue = uri.clone();
@@ -2297,7 +2347,9 @@ where
             if v.verdict != UriVerdict::PasEncore {
                 break;
             }
-            if derniere_relance.elapsed() >= INTERVALLE_RELANCE_REVEIL {
+            if derniere_relance.elapsed() >= INTERVALLE_RELANCE_REVEIL
+                && debut.elapsed() + RESERVE_DE_RELECTURE_APRES_RELANCE <= budget_reveil
+            {
                 derniere_relance = tokio::time::Instant::now();
                 v.relances += 1;
                 v.refus_relance = relancer().await;
@@ -2738,18 +2790,60 @@ mod tests {
         reponses: Vec<Result<Option<&'static str>, &'static str>>,
         refus_relance: Option<&'static str>,
     ) -> (VerifUri, u32, u32) {
+        // Sans cout : le banc historique, au battement pres.
+        let (v, journal) = eprouver_avec_couts(
+            reponses,
+            refus_relance,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let lectures = journal
+            .iter()
+            .filter(|a| **a == ActionSoap::Lecture)
+            .count() as u32;
+        let relances = journal
+            .iter()
+            .filter(|a| **a == ActionSoap::Relance)
+            .count() as u32;
+        (v, lectures, relances)
+    }
+    /// Ce que le renderer a reellement recu, dans l'ORDRE.
+    ///
+    /// Le compte seul ne dit pas si la derniere action envoyee a l'appareil
+    /// est une relance dont personne ne lira l'effet — c'est precisement ce
+    /// que le journal de Reivax66 montre, et un compteur ne peut pas le voir.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ActionSoap {
+        Lecture,
+        Relance,
+    }
+    /// Le meme banc, mais ou chaque action SOAP COUTE du temps.
+    ///
+    /// C'est l'angle mort de tout ce qui precede : sous `start_paused`, une
+    /// lecture et une relance sont gratuites, si bien que la borne semblait
+    /// tenir ses ~32 s. Sur un vrai reseau elles ne le sont pas, et c'est de
+    /// la que viennent les 41 290 ms du releve.
+    async fn eprouver_avec_couts(
+        reponses: Vec<Result<Option<&'static str>, &'static str>>,
+        refus_relance: Option<&'static str>,
+        cout_lecture: std::time::Duration,
+        cout_relance: std::time::Duration,
+    ) -> (VerifUri, Vec<ActionSoap>) {
         let file: std::cell::RefCell<std::collections::VecDeque<_>> =
             std::cell::RefCell::new(reponses.into_iter().collect());
         let derniere: std::cell::RefCell<Result<Option<&'static str>, &'static str>> =
             std::cell::RefCell::new(Ok(None));
-        let lectures = std::cell::Cell::new(0u32);
-        let relances = std::cell::Cell::new(0u32);
-        let (file_r, derniere_r, lectures_r, relances_r) = (&file, &derniere, &lectures, &relances);
+        let journal: std::cell::RefCell<Vec<ActionSoap>> = std::cell::RefCell::new(Vec::new());
+        let (file_r, derniere_r, journal_r) = (&file, &derniere, &journal);
         let v = verifier_uri_appliquee(
             URL_2749,
             BUDGET_REVEIL_STANDBY,
             || async move {
-                lectures_r.set(lectures_r.get() + 1);
+                journal_r.borrow_mut().push(ActionSoap::Lecture);
+                if !cout_lecture.is_zero() {
+                    tokio::time::sleep(cout_lecture).await;
+                }
                 if let Some(r) = file_r.borrow_mut().pop_front() {
                     *derniere_r.borrow_mut() = r;
                 }
@@ -2757,12 +2851,103 @@ mod tests {
                 r.map(|u| u.map(str::to_string)).map_err(str::to_string)
             },
             || async move {
-                relances_r.set(relances_r.get() + 1);
+                journal_r.borrow_mut().push(ActionSoap::Relance);
+                if !cout_relance.is_zero() {
+                    tokio::time::sleep(cout_relance).await;
+                }
                 refus_relance.map(str::to_string)
             },
         )
         .await;
-        (v, lectures.get(), relances.get())
+        let journal = journal.into_inner();
+        (v, journal)
+    }
+    /// Le cout d'un aller-retour SOAP sur le reseau de Reivax66.
+    const COUT_LECTURE_3580: std::time::Duration = std::time::Duration::from_millis(400);
+    /// Le cout d'une relance : `SetAVTransportURI`, le `play_delay` de la zone,
+    /// puis `Play`. Trois secondes est ce que rend une zone reglee avec un
+    /// delai de pose, cas courant sur les amplis lents.
+    const COUT_RELANCE_3580: std::time::Duration = std::time::Duration::from_millis(3_000);
+    /// #3580 — L'ATTENTE MUETTE DOIT RESTER SOUS SA PROPRE BORNE.
+    ///
+    /// Reivax66, ticket support 78 : `dlna_play_uri_restee_vide attente_ms=41290
+    /// relances=4 soap_muet=false`, pour un `BUDGET_REVEIL_STANDBY` de 30 s.
+    /// Le commentaire de la borne affirme pourtant « ~32 s au pire, sous les
+    /// 45 s de la grace comme sous le budget HTTP de l'appelant », et
+    /// `i2749_une_veille_qui_n_aboutit_pas_echoue_a_la_borne` le certifiait —
+    /// en ne facturant AUCUN temps aux actions SOAP.
+    ///
+    /// Ce banc-ci leur en facture. Il fait tourner la MEME boucle de
+    /// production, avec les memes constantes, et mesure ce que l'auditeur
+    /// attend vraiment.
+    #[tokio::test(start_paused = true)]
+    async fn i3580_l_attente_reste_sous_sa_borne_quand_le_soap_coute_du_temps() {
+        let (v, _journal) = eprouver_avec_couts(
+            vec![Ok(Some(""))],
+            None,
+            COUT_LECTURE_3580,
+            COUT_RELANCE_3580,
+        )
+        .await;
+        assert_eq!(
+            v.verdict,
+            UriVerdict::PasEncore,
+            "le cas mesure est bien celui du Denon : il repond, et ne tient rien"
+        );
+        assert!(
+            v.attente_ms >= 25_000,
+            "raccourcir l'attente ne corrigerait pas le defaut, il en creerait              un autre : un ampli qui met 25 s a sortir de veille doit encore              etre rattrape — {} ms",
+            v.attente_ms
+        );
+        assert!(
+            v.attente_ms <= 33_000,
+            "la borne ne compte que ses propres sommeils : le bareme du temps 1              et chaque action SOAP engagee apres le dernier controle s'y              ajoutent. Reivax66 a mesure 41 290 ms pour un budget de 30 s, la              ou le code annonce « ~32 s au pire, sous les 45 s de la grace du              sondeur » (#3580) — mesure : {} ms",
+            v.attente_ms
+        );
+    }
+    /// #3580 — LA DERNIERE ACTION ENVOYEE N'EST JAMAIS UNE RELANCE.
+    ///
+    /// Le releve montre une quatrieme relance a 10:35:39,442 et la sortie de
+    /// la boucle a 10:35:42,647 : `SetAVTransportURI`, `play_delay`, `Play` —
+    /// trois actions poussees dans un appareil dont on ne relira jamais la
+    /// `CurrentURI`. Elles ne peuvent rien corriger par construction, et elles
+    /// coutent leur duree a l'auditeur.
+    #[tokio::test(start_paused = true)]
+    async fn i3580_aucune_relance_n_est_la_derniere_action_envoyee() {
+        let (_v, journal) = eprouver_avec_couts(
+            vec![Ok(Some(""))],
+            None,
+            COUT_LECTURE_3580,
+            COUT_RELANCE_3580,
+        )
+        .await;
+        assert!(
+            journal.len() > 6,
+            "la fenetre de reveil doit s'etre ouverte : {journal:?}"
+        );
+        assert_eq!(
+            journal.last(),
+            Some(&ActionSoap::Lecture),
+            "une relance dont on ne lit jamais l'effet est une action SOAP pour              rien, et de l'attente en plus (#3580) — enchainement : {journal:?}"
+        );
+        // Et chaque relance doit etre SUIVIE d'au moins une lecture.
+        for (i, action) in journal.iter().enumerate() {
+            if *action == ActionSoap::Relance {
+                assert!(
+                    journal[i + 1..].contains(&ActionSoap::Lecture),
+                    "la relance en position {i} n'est jamais relue : {journal:?}"
+                );
+            }
+        }
+    }
+    /// Temoin — sans cout, le banc historique rend exactement ce qu'il rendait.
+    /// Si celui-ci rougit, c'est le banc qui a bouge, pas la borne.
+    #[tokio::test(start_paused = true)]
+    async fn i3580_le_banc_sans_cout_ne_change_pas_de_sens() {
+        let (v, lectures, relances) = eprouver_2749(vec![Ok(Some(""))], None).await;
+        assert_eq!(v.verdict, UriVerdict::PasEncore);
+        assert!(lectures >= 6, "le bareme du temps 1 fait six lectures");
+        assert!(relances >= 3, "l'URI est reposee pendant l'attente");
     }
 
     /// TEMOIN 1 — `CurrentURI` vide, puis la BONNE URI : la zone joue.

@@ -1898,6 +1898,18 @@ mod tests {
             Receiver<TuneEvent>,
             tempfile::TempDir,
         ) {
+            banc_avec(make_dlna(base)).await
+        }
+
+        /// Le meme banc, sur une sortie DLNA fournie par l'appelant.
+        async fn banc_avec(
+            sortie: DlnaOutput,
+        ) -> (
+            PlaybackOrchestrator,
+            i64,
+            Receiver<TuneEvent>,
+            tempfile::TempDir,
+        ) {
             let db = SqliteDb::open_in_memory().unwrap();
             db.init_schema().unwrap();
             run_migrations(&db).unwrap();
@@ -1952,10 +1964,7 @@ mod tests {
                 .create("Eversolo DMP-A8", Some("dlna"), Some(DEVICE_ID))
                 .unwrap();
             zones.update_dlna_native_flac(zone_id, true).unwrap();
-            orch.outputs
-                .lock()
-                .await
-                .register(Box::new(make_dlna(base)));
+            orch.outputs.lock().await.register(Box::new(sortie));
             (orch, zone_id, recu, dir)
         }
 
@@ -2142,6 +2151,102 @@ mod tests {
                 "une lecture qui démarre ne doit annoncer AUCUNE erreur : {erreurs:?}"
             );
 
+            handle.abort();
+        }
+
+        /// #3580 — LE DENON DE REIVAX66 : il ACQUITTE tout et ne tient RIEN.
+        ///
+        /// Son journal (ticket support 78, 04/09/2026, zone « Home Theater ») :
+        /// `soap_muet=false` — l'appareil repond, et il repond OK, c'est pour
+        /// cela qu'il s'allume et bascule sur la bonne entree — puis
+        /// `dlna_play_uri_restee_vide attente_ms=41290 relances=4`, et
+        /// `canal="aucun — aucun renderer connecte a ce flux"`. Vu de lui :
+        /// un bouton Lire sans effet.
+        ///
+        /// Ce banc pose EXACTEMENT cet appareil — `GetMediaInfo` rend une
+        /// `CurrentURI` vide a chaque lecture, pour toujours — et traverse la
+        /// chaine de production entiere : `orch.play()` → `play_inner` →
+        /// `send_to_output` → le vrai `DlnaOutput`. Le point mesure n'est pas
+        /// le journal du serveur, qui portait deja tout : c'est ce que
+        /// l'AUDITEUR recoit.
+        ///
+        /// Le budget de reveil est raccourci a 300 ms — sans quoi cette epreuve
+        /// couterait les 30 s de `BUDGET_REVEIL_STANDBY`. Le cycle traverse est
+        /// le meme, au battement pres.
+        #[tokio::test]
+        async fn un_ampli_qui_ne_tient_aucun_media_fait_remonter_la_cause() {
+            let state = MockState::default();
+            // L'appareil de Reivax66 : sa pile SOAP repond, mais sa
+            // `CurrentURI` reste VIDE quoi qu'on lui envoie.
+            *state.media_info_fige.lock().await = true;
+            *state.current_uri.lock().await = String::new();
+            let (base, handle) = start_mock(state.clone()).await;
+            let (orch, zone_id, recu, _dir) =
+                banc_avec(make_dlna(&base).with_budget_reveil_ms(300)).await;
+            let erreurs = collecter(recu);
+            let resultat = orch
+                .play(PlayRequest {
+                    zone_id,
+                    track_id: Some(1),
+                    source: Some("local".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("play() rend Ok — c'est le piege de ce ticket");
+
+            // 1. LE FAIT DE BASE : l'ordre est bien parti, et il a ete acquitte.
+            let url = resultat
+                .stream_url
+                .clone()
+                .expect("une lecture refusee doit quand meme nommer son URL de flux");
+            let uris = uris_recues(&state).await;
+            assert!(
+                uris.iter().any(|u| *u == url),
+                "aucun SetAVTransportURI ne porte l'URL du flux ({url}) : {uris:?}"
+            );
+            assert!(
+                state.play_count.load(Ordering::Relaxed) >= 1,
+                "le renderer n'a ACQUITTE aucun Play : ce n'est pas le cas mesure ici"
+            );
+            assert!(
+                state.set_uri_corps.lock().await.len() >= 2,
+                "l'URI doit etre REPOSEE pendant l'attente — les « relances » du journal"
+            );
+            assert!(
+                !resultat.output_sent,
+                "le renderer ne tient rien : output_sent doit valoir faux"
+            );
+
+            // 2. CE QUE L'AUDITEUR RECOIT. Le journal du serveur portait deja
+            //    tout le cycle ; la question du ticket est celle-ci.
+            let erreurs = erreurs_apres(&erreurs, std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                erreurs.len(),
+                1,
+                "une et une seule erreur de lecture doit etre annoncee : {erreurs:?}"
+            );
+            let erreur = &erreurs[0];
+            assert_eq!(erreur["zone_id"], zone_id, "l'erreur doit nommer la zone");
+            assert_eq!(
+                erreur["fatal"], true,
+                "sans `fatal`, la fenetre de grace d'apres-lecture du client avale \
+                 le message et l'auditeur n'a, une fois de plus, que le silence"
+            );
+            let texte = erreur["error"].as_str().unwrap_or_default();
+            assert!(
+                texte.contains("acquitte Play") || texte.contains("acquitté Play"),
+                "le message doit NOMMER ce que l'appareil a fait : {texte:?}"
+            );
+            assert!(
+                texte.contains("AUCUN"),
+                "il ne joue pas autre chose — il ne tient RIEN, et c'est ce que \
+                 le message doit dire (#2749) : {texte:?}"
+            );
+            assert!(
+                texte.contains("veille"),
+                "le message doit nommer la conduite qui debloque : un ampli en \
+                 veille reseau, a rallumer : {texte:?}"
+            );
             handle.abort();
         }
     }
