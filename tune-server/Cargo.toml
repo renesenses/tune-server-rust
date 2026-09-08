@@ -293,3 +293,13 @@ path = "tests/sources_trois_routes_i3226.rs"
 [[test]]
 name = "refus_telemetrie_honore_3383"
 path = "tests/refus_telemetrie_honore_3383.rs"
+
+# #3322 : `output_capabilities.channel_layouts` était déclaré, publié, et vide
+# sur les 14 zones — `v1()` le posait à `Vec::new()` et aucun builder ne
+# permettait de l'écrire. Le témoin passe par les DEUX routes de zone puis par
+# `output_capabilities_avec`, l'appel de production commun. `autotests = false`
+# plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, donc vert
+# contre rien.
+[[test]]
+name = "dispositions_de_canaux_3322"
+path = "tests/dispositions_de_canaux_3322.rs"
