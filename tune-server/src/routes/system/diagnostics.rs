@@ -1303,8 +1303,26 @@ const VERSION_DE_SCHEMA_INCONNUE: &str = "unknown";
 ///
 /// Fonction NUE — elle ne prend pas d'`AppState` — pour qu'une épreuve puisse
 /// la sonder sans base ; c'est le rendu qui est éprouvé, pas la condition.
+/// Ce que la ligne « Interface (web) » dit quand `web/version.json` n'existe
+/// pas. Surtout pas la version du serveur : deux numeros identiques feraient
+/// disparaitre l'ecart que #3380 existe pour rendre visible.
+const SANS_VERSION_INTERFACE: &str =
+    "inconnue (web/version.json absent : build web anterieur a #3380)";
+
 fn version_de_schema_affichee(version: Option<i32>) -> String {
     version.map_or_else(|| VERSION_DE_SCHEMA_INCONNUE.to_string(), |v| v.to_string())
+}
+
+/// Une valeur de réglage telle qu'elle doit se LIRE dans le markdown (#2856).
+///
+/// Une chaîne perd ses guillemets JSON — `resample_policy: none`, pas
+/// `resample_policy: "none"` —, tout le reste s'écrit tel quel. Fonction NUE,
+/// éprouvable sans base ni `AppState`.
+fn valeur_lisible(valeur: &Value) -> String {
+    match valeur.as_str() {
+        Some(texte) => texte.to_string(),
+        None => valeur.to_string(),
+    }
 }
 
 /// Generate a bug report with comprehensive diagnostic data.
@@ -1325,6 +1343,12 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // une base jamais migrée.
     let db_version = super::version_de_schema(&state);
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    // #3380 — la version de l'INTERFACE. `web/` est deploye separement du
+    // binaire : sans elle, un bogue d'ecran s'instruit sans savoir quel ecran
+    // tournait. `None` quand `web/version.json` n'existe pas — JAMAIS un repli
+    // sur la version du serveur, qui rendrait l'ecart invisible.
+    let version_interface =
+        tune_core::interface_web::version_interface(&crate::config::resolve_web_dir());
     let music_dirs = super::get_music_dirs_list(&state.backend);
     let scan_status = settings
         .get("scan_status")
@@ -1416,6 +1440,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str(&format!(
         "**Version**: {} (engine: rust)\n",
         tune_core::version()
+    ));
+    // #3380 : juste sous la version du serveur, parce que c'est la paire qui
+    // se lit — deux numeros qui divergent expliquent a eux seuls un ticket.
+    md.push_str(&format!(
+        "**Interface (web)**: {}\n",
+        version_interface
+            .as_deref()
+            .unwrap_or(SANS_VERSION_INTERFACE)
     ));
     md.push_str(&format!(
         "**Platform**: {} ({})\n",
@@ -1569,6 +1601,38 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         version_de_schema_affichee(db_version)
     ));
 
+    // #2856 — le rapport ne portait AUCUNE section de réglages. Ni l'état de
+    // l'enrichissement au scan, ni le moteur audio : deux faits qu'il fallait
+    // redemander au testeur à chaque ticket de métadonnées ou de son, alors
+    // que le serveur les a sous la main. La fiche système (`/system/profile`)
+    // en portait déjà une partie ; le rapport, lui, est ce que le testeur
+    // COLLE sur le forum, et c'est là qu'on lit un ticket.
+    //
+    // La liste des réglages publiables est celle de la fiche, PARTAGÉE et non
+    // recopiée : deux listes auraient divergé, et la seconde n'aurait pas
+    // hérité de la garde qui interdit d'y faire entrer une clé secrète.
+    let reglages = super::profile::support_settings(|k| settings.get(k).ok().flatten());
+    let moteur_audio = super::profile::moteur_audio(&state);
+    md.push_str("\n## Settings\n");
+    md.push_str(&format!(
+        "- Audio backend: requested={}, active={}\n",
+        valeur_lisible(&moteur_audio["backend_requested"]),
+        valeur_lisible(&moteur_audio["backend_active"]),
+    ));
+    md.push_str(&format!(
+        "- Exclusive mode: requested={}, effective={}, forced={}{}\n",
+        valeur_lisible(&moteur_audio["exclusive_mode"]["requested"]),
+        valeur_lisible(&moteur_audio["exclusive_mode"]["effective"]),
+        valeur_lisible(&moteur_audio["exclusive_mode"]["forced"]),
+        match moteur_audio["exclusive_mode"]["detail"].as_str() {
+            Some(raison) => format!(" — {raison}"),
+            None => String::new(),
+        },
+    ));
+    for (cle, valeur) in &reglages {
+        md.push_str(&format!("- {cle}: {}\n", valeur_lisible(valeur)));
+    }
+
     // Recent logs (tail) — the single most useful part of a bug report. Reuses
     // the same collector as the /logs endpoint so the report matches what the
     // "Export logs" button shows.
@@ -1595,6 +1659,9 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
 
     Json(json!({
         "version": tune_core::version(),
+        // #3380 — le champ que la telemetrie reprend et que l'admin mozaiklabs
+        // affichera a cote de `version`. `null` = interface non identifiable.
+        "ui_version": version_interface,
         "engine": "rust",
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -1630,6 +1697,10 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             "engine": state.backend.engine().as_str(),
             "migration_version": db_version,
         },
+        // #2856 — les mêmes réglages que la section markdown, pour le client
+        // qui lit le JSON. Même source, donc jamais deux vérités.
+        "settings": reglages,
+        "audio": moteur_audio,
         "markdown": md,
     }))
 }
@@ -1858,9 +1929,14 @@ pub(super) async fn rearm_asio_warm_scan(
 
 /// Anonymous telemetry snapshot — returns what would be sent if telemetry
 /// is enabled. No data leaves the server unless the user explicitly opts in.
+///
+/// #3383 : `enabled` disait autrefois « le reglage vaut exactement `"true"` »,
+/// ce qui annonçait un opt-out sur une installation neuve qui n'avait rien
+/// decoche — et ignorait `TUNE_TELEMETRY`. Il dit maintenant l'etat EFFECTIF,
+/// le meme que les gardes d'envoi consultent, par le meme appel.
 pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let enabled = settings.get("telemetry_enabled").ok().flatten().as_deref() == Some("true");
+    let enabled = tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(&settings);
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
@@ -1891,14 +1967,27 @@ pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Va
     }))
 }
 
+/// #3383 — cette route ecrivait deja la bonne cle, mais personne ne la lisait :
+/// un aller-retour ferme sur lui-meme. Elle est desormais BRANCHEE, parce que
+/// `TelemetryReporter::is_enabled_for` consulte cette meme cle. Ce n'est donc
+/// plus un troisieme interrupteur mort a cote de deux autres, c'est le meme.
+///
+/// La reponse renvoie l'etat EFFECTIF et non ce qui vient d'etre demande :
+/// `TUNE_TELEMETRY=false` reste souverain, et un appelant qui rallume alors
+/// que l'exploitant a coupe doit le voir.
 pub(super) async fn telemetry_toggle(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let enabled = body["enabled"].as_bool().unwrap_or(false);
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let _ = settings.set("telemetry_enabled", if enabled { "true" } else { "false" });
-    Json(json!({ "enabled": enabled }))
+    let _ = settings.set(
+        tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY,
+        if enabled { "true" } else { "false" },
+    );
+    Json(json!({
+        "enabled": tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(&settings),
+    }))
 }
 
 pub(super) async fn api_stats(State(state): State<AppState>) -> Json<Value> {

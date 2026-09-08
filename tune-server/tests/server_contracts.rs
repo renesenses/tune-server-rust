@@ -29,6 +29,8 @@ mod bios_langue_entete;
 mod bit_perfect_sortie_pull_2189;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
+#[path = "can_skip_next_dit_le_refus_radio_3514.rs"]
+mod can_skip_next_dit_le_refus_radio_3514;
 #[path = "cles_developpeur_persistance.rs"]
 mod cles_developpeur_persistance;
 #[path = "collections_couleur_persistee.rs"]
@@ -67,6 +69,8 @@ mod facettes_multivaleurs;
 mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
 mod favoris_facettes_routes;
+#[path = "features_livrees_3355.rs"]
+mod features_livrees_3355;
 #[path = "file_promet_l_enchainement.rs"]
 mod file_promet_l_enchainement;
 #[path = "fonds_communautaire_par_mbid.rs"]
@@ -109,12 +113,23 @@ mod playlists_cloisonnement_par_profil;
 mod playlists_ecritures_partielles;
 #[path = "podcasts_radiofrance_cle.rs"]
 mod podcasts_radiofrance_cle;
+// #3266 — la portee des lignes `cargo test` de la CI, gardee par le workflow
+// lui-meme (`include_str!`). Enregistre ici parce que `tune-server` porte
+// `autotests = false` : un fichier pose dans tests/ et jamais declare ne se
+// compile pas, et un garde jamais compile ne garde rien — c'est le defaut meme
+// que ce fichier existe pour empecher.
+#[path = "portee_ligne_de_test_3266.rs"]
+mod portee_ligne_de_test_3266;
 #[path = "portee_repertoire_jokers.rs"]
 mod portee_repertoire_jokers;
+#[path = "radio_ne_fait_pas_avancer_la_file.rs"]
+mod radio_ne_fait_pas_avancer_la_file;
 #[path = "radios_recherche_distinction.rs"]
 mod radios_recherche_distinction;
 #[path = "radios_validation_url.rs"]
 mod radios_validation_url;
+#[path = "rapport_dit_quelle_interface_tourne_3380.rs"]
+mod rapport_dit_quelle_interface_tourne_3380;
 #[path = "rbac.rs"]
 mod rbac;
 #[path = "recherche_totaux_i3189.rs"]
@@ -147,6 +162,8 @@ mod tests_orphelins;
 mod tranches_dynamic_range;
 #[path = "tri_aleatoire_albums.rs"]
 mod tri_aleatoire_albums;
+#[path = "tune_tested_telechargement.rs"]
+mod tune_tested_telechargement;
 #[path = "uptime_process_scope.rs"]
 mod uptime_process_scope;
 #[path = "volume_db_contrat.rs"]

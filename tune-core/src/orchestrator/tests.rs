@@ -706,10 +706,11 @@ use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::streaming::registry::ServiceRegistry;
 
 use super::{
-    PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, cible_wav_pour_traitement,
-    is_network_output_type, is_pull_dsp_output_type, is_push_uri_output_type,
-    message_session_perdue, passthrough_didl_duration_ms, pull_output_needs_dsp_transcode,
-    relais_dsp_progressif, replay_needs_output_seek, reprise_de_session, reprise_toujours_la_notre,
+    PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, cible_encodable,
+    cible_wav_pour_ape_reseau, cible_wav_pour_traitement, is_network_output_type,
+    is_pull_dsp_output_type, is_push_uri_output_type, message_session_perdue,
+    passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, relais_dsp_progressif,
+    replay_needs_output_seek, reprise_de_session, reprise_toujours_la_notre,
     requete_de_retablissement, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
     streaming_pretranscode_format, use_file_transcode_for,
 };
@@ -911,6 +912,53 @@ fn la_cible_wav_pour_traitement_exige_les_cinq_conditions() {
     assert!(!cible_wav_pour_traitement(true, true, false, true, false));
 }
 
+/// #3357 — la cible d'un transcodage est toujours un format que l'encodeur
+/// sait écrire : WAV et FLAC passent, tout le reste (AIFF, MP3, OGG, ALAC…)
+/// devient FLAC avant que l'étiquette n'en soit dérivée.
+#[test]
+fn la_cible_de_transcodage_est_toujours_encodable() {
+    use crate::audio::formats::AudioFormat;
+    assert_eq!(cible_encodable(AudioFormat::Wav), AudioFormat::Wav);
+    assert_eq!(cible_encodable(AudioFormat::Flac), AudioFormat::Flac);
+    for f in [
+        AudioFormat::Aiff,
+        AudioFormat::Mp3,
+        AudioFormat::Ogg,
+        AudioFormat::Alac,
+    ] {
+        assert_eq!(cible_encodable(f), AudioFormat::Flac, "{f:?}");
+    }
+}
+
+/// #3357, de bout en bout sur la DÉCISION (Cyrille, fil « Pas de son avec la
+/// v.0.9135 ») : une zone DLNA avec égaliseur et une piste AIFF locale. Avant,
+/// la cible restait « AIFF », l'encodeur écrivait du FLAC, et le renderer
+/// recevait `…/xxx.aiff` en `audio/aiff` : muet. La cible est désormais FLAC,
+/// donc l'extension et le type MIME aussi.
+#[tokio::test]
+async fn une_piste_aiff_transcodee_pour_un_renderer_est_servie_en_flac_annonce_flac() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Pièce par défaut", Some("dlna"), Some("uuid:cyrille-3357"))
+        .unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &format!("zone_{zone_id}_eq_profile"),
+            &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+        )
+        .unwrap();
+    piste_3234(&orch, "/m/cyrille/01 - Morceau.aiff", "aiff");
+    let req = requete_locale_3234(zone_id, 1);
+    let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(format.out_mime, "audio/flac", "{}", format.out_ext);
+    assert_eq!(format.out_ext, "flac");
+    assert_eq!(format.target_format_str, "flac");
+    assert!(
+        format.use_file_transcode,
+        "cible FLAC réseau : le fichier, comme avant"
+    );
+}
+
 /// #2742 — le crossfeed est le QUATRIÈME étage du porteur, et il compte pour
 /// `is_active()`.
 ///
@@ -1046,7 +1094,7 @@ async fn une_zone_locale_avec_egaliseur_ne_traite_pas_deux_fois() {
         "une sortie locale part en session : c'est le bras où vit le relais"
     );
 
-    let (actif, relais) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    let (actif, relais, _) = orch.relais_dsp_pour_test(&req).await.unwrap();
     assert!(
         actif,
         "l'égaliseur de la zone est bien chargé — sans ça le test ne prouve rien"
@@ -1120,6 +1168,103 @@ async fn une_zone_dlna_avec_egaliseur_part_en_wav_progressif_sur_opt_in() {
     assert!(sans_sink.use_file_transcode);
 }
 
+/// #3311 — la cible WAV d'un `.ape` sur une zone RÉSEAU exige les TROIS
+/// conditions. En retirer une seule rend au FLAC, donc au fichier.
+#[test]
+fn la_cible_wav_pour_ape_reseau_exige_les_trois_conditions() {
+    assert!(cible_wav_pour_ape_reseau(true, true, true));
+    // Source non `.ape` : rien ne bouge, le FLAC reste la cible de tout le
+    // reste du catalogue.
+    assert!(!cible_wav_pour_ape_reseau(false, true, true));
+    // Sortie locale / OAAT / navigateur : elles sont DÉJÀ en WAV par leurs
+    // propres branches, et prennent déjà le décodeur incrémental.
+    assert!(!cible_wav_pour_ape_reseau(true, false, true));
+    // Sonde LPCM négative ou inconcluante : le format servi ne change pas.
+    assert!(!cible_wav_pour_ape_reseau(true, true, false));
+}
+
+/// #3311, de bout en bout sur la DÉCISION — le cœur du ticket.
+///
+/// Le décodeur `.ape` incrémental annoncé livré en v0.9.131 (#2505, PR #3177)
+/// EST bien sur la ligne : `0cb2aed0` est un ancêtre de `v0.9.131` comme de
+/// `main`, et `tune-core/src/audio/decode.rs` n'a pas rebougé depuis. Mais il
+/// n'est branché que sur `decode_ape_streaming`, et une zone RÉSEAU n'y
+/// arrivait jamais : `Ape.needs_transcode_for_dlna()` est vrai,
+/// `Ape.dlna_transcode_target()` rend `Flac`, donc `use_file_transcode_for`
+/// renvoyait au fichier — `decode_to_pcm` → `decode_ape_to_pcm`, la piste
+/// entière en mémoire, 2,37 Gio de pic mesurés sur une image de CD d'une
+/// heure, et un REFUS net au-delà de 2 Gio de PCM déclaré.
+///
+/// Sans le correctif, la première assertion tombe : `out_mime = "audio/flac"`
+/// et `use_file_transcode = true`.
+///
+/// Montage à la main comme pour #3357 : la sortie est ABSENTE du registre, donc
+/// présumée capable du LPCM (même règle que `dlna_supports_mime`). La seconde
+/// moitié du test enregistre une sortie qui n'est PAS un `DlnaOutput` : elle
+/// n'a aucun Sink à lire, la sonde répond non, et tout retombe sur le FLAC
+/// servi par le fichier — la garde anti-régression de ce correctif.
+#[tokio::test]
+async fn un_ape_sur_une_zone_reseau_part_en_wav_progressif() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Salon", Some("dlna"), Some("uuid:salon-3311"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ape/sine_16s_c3000.ape"
+        ),
+        "ape",
+    );
+    let req = requete_locale_3234(zone_id, 1);
+
+    let f = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(
+        f.out_mime, "audio/wav",
+        "un .ape vers un renderer LPCM part en WAV, pas en FLAC ré-encodé"
+    );
+    assert_eq!(f.out_ext, "wav");
+    assert_eq!(f.out_bd, 16, "un .ape 16 bits part en 16 bits, pas gonflé");
+    assert!(
+        !f.use_file_transcode,
+        "la cible WAV part en session progressive — le SEUL bras qui décode \
+         le Monkey's Audio au fil de l'eau (#2505)"
+    );
+
+    // L'AUTRE issue du même défaut : un renderer sans `audio/flac` (ici le
+    // forçage de zone `dlna_lpcm`) recevait DÉJÀ du WAV — et `use_file_transcode_for`
+    // le renvoyait quand même au fichier, parce que son exception ne connaissait
+    // que le DSD. C'est ce que `wav_diffusable` corrige : cette moitié-là tombe
+    // sans le correctif alors que la précédente passe.
+    ZoneRepo::with_backend(orch.db.clone())
+        .update_dlna_lpcm(zone_id, true)
+        .unwrap();
+    let force_lpcm = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(force_lpcm.out_mime, "audio/wav");
+    assert!(
+        !force_lpcm.use_file_transcode,
+        "un WAV imposé par `dlna_needs_wav` diffuse aussi : le bras fichier \
+         n'a aucun décodeur `.ape` incrémental"
+    );
+    ZoneRepo::with_backend(orch.db.clone())
+        .update_dlna_lpcm(zone_id, false)
+        .unwrap();
+
+    // Sortie enregistrée qui n'est PAS un renderer DLNA : pas de Sink, donc
+    // pas de LPCM annoncé. Le format servi ne change pas, et le comportement
+    // d'avant #3311 est conservé à l'octet près.
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("uuid:salon-3311", "Salon").with_type("dlna"),
+    ));
+    let sans_sonde = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(sans_sonde.out_mime, "audio/flac");
+    assert!(
+        sans_sonde.use_file_transcode,
+        "sans LPCM annoncé, le FLAC par le fichier reste la voie — inchangé"
+    );
+}
+
 /// #2742 + LAT-F1, de bout en bout sur la DÉCISION : une zone DLNA dont le
 /// SEUL traitement est un crossfeed part en WAV progressif quand l'opt-in est
 /// armé — et reste EXACTEMENT comme avant quand il ne l'est pas.
@@ -1178,7 +1323,7 @@ async fn une_zone_reseau_dont_le_seul_traitement_est_le_crossfeed() {
         !apres.use_file_transcode,
         "la cible WAV part en session, pas par le fichier"
     );
-    let (actif, relais) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    let (actif, relais, crossfeed_executable) = orch.relais_dsp_pour_test(&req).await.unwrap();
     assert!(
         actif,
         "le porteur doit voir le crossfeed comme un traitement"
@@ -1186,6 +1331,16 @@ async fn une_zone_reseau_dont_le_seul_traitement_est_le_crossfeed() {
     assert!(
         relais,
         "et le relais doit être armé : la zone n'est pas locale"
+    );
+    // La ligne qui manquait. Les trois assertions d'au-dessus — et la garde de
+    // site, qui relit le source — restent VERTES si l'on pose `channels: 0`
+    // dans `load_streaming_dsp` : le crossfeed est alors chargé, transporté,
+    // appelé… et `process_pcm` sort avant d'écrire un octet. Contre-épreuve
+    // faite : c'est la seule des quatre qui rougit.
+    assert!(
+        crossfeed_executable,
+        "le porteur transporte un crossfeed mais ne l'exécutera pas : \
+         `process_pcm` rend immédiatement hors stéréo"
     );
 }
 
@@ -5360,6 +5515,99 @@ fn piste_3234(orch: &PlaybackOrchestrator, chemin: &str, format: &str) {
         .unwrap();
 }
 
+/// #3270 (point 2) — une piste qui NE DÉMARRE PAS le dit à l'auditeur.
+///
+/// `next` et `previous` détachent `play_from_queue` et répondent
+/// `{"status":"playing"}` avant que l'échec soit connu. L'échec ne peut donc
+/// se dire que par le second canal, celui que `routes/ws.rs` pousse à TOUTES
+/// les télécommandes.
+///
+/// `fatal: true` est le fait à tenir : la zone ne joue pas. Sans lui, la
+/// fenêtre de grâce d'après-lecture du client web avale le message (#1960,
+/// #2630) et l'auditeur n'a, une fois de plus, que le silence.
+#[tokio::test]
+async fn une_piste_qui_ne_demarre_pas_est_annoncee_a_l_auditeur() {
+    let bus = Arc::new(EventBus::new());
+    let mut rx = bus.subscribe();
+    let mut orch = test_orchestrator();
+    orch.event_bus = Some(bus.clone());
+
+    orch.dire_piste_non_demarree(21, "suivante", "track not found");
+
+    let ev = rx.recv().await.expect("un événement doit être émis");
+    assert_eq!(ev.event_type, "zone.playback_error");
+    assert_eq!(ev.data["zone_id"], 21);
+    assert_eq!(
+        ev.data["fatal"], true,
+        "la zone ne joue pas : sans fatal:true le client étouffe le message"
+    );
+    let msg = ev.data["error"].as_str().unwrap();
+    assert!(
+        msg.contains("suivante"),
+        "le message doit nommer le GESTE, sinon l'auditeur ne sait pas ce qui \
+         a échoué : {msg}"
+    );
+    assert!(
+        msg.contains("track not found"),
+        "le message doit porter la cause remontée par l'orchestrateur : {msg}"
+    );
+}
+
+/// CONTRE-ÉPREUVE : sans bus (démarrage partiel, essais), l'annonce se tait au
+/// lieu de paniquer. Même règle que `dire_le_repli_de_peripherique`.
+#[tokio::test]
+async fn sans_bus_l_annonce_se_tait_au_lieu_de_paniquer() {
+    let orch = test_orchestrator();
+    orch.dire_piste_non_demarree(21, "précédente", "peu importe");
+}
+
+/// #3270 (point 4) — un fichier TÉLÉVERSÉ que rien ne sait lire est refusé
+/// par un motif NOMMÉ, à la porte que les deux entrées traversent.
+///
+/// Avant, `AudioFormat::from_extension("wma")` rendait `None`, ce `None` était
+/// absorbé par `unwrap_or("audio/wav")`, et le fichier obtenait une session de
+/// flux annoncée `audio/wav` : la zone se taisait sans un mot.
+#[tokio::test]
+async fn un_televersement_illisible_est_refuse_avant_toute_session() {
+    let orch = test_orchestrator();
+    // #3030 — `test_scratch` et rien d'autre : le nettoyage passe par `Drop`,
+    // donc il a lieu même si l'assertion ci-dessous panique.
+    let dossier = crate::test_scratch::scratch_dir("3270-televersement");
+    let wma = dossier.join("concert.wma");
+    std::fs::write(&wma, b"pas de l'audio lisible").unwrap();
+
+    let req = requete_locale_3234(21, 1);
+    // `expect_err` demanderait `ResolvedStream: Debug`, qu'il n'implémente
+    // pas : on déstructure.
+    let Err(erreur) = orch
+        .resolve_uploaded_file(wma.to_str().unwrap(), &req)
+        .await
+    else {
+        panic!("un .wma ne doit pas obtenir de session de flux");
+    };
+    assert!(
+        erreur.starts_with("format_not_playable:"),
+        "le refus doit porter la sentinelle de #3234, que `play_error_response` \
+         transforme déjà en 422 nommé — pas une seconde forme d'erreur : {erreur}"
+    );
+    assert!(
+        erreur.contains("wma"),
+        "le motif doit NOMMER le format refusé : {erreur}"
+    );
+
+    // CONTRE-ÉPREUVE : un vrai FLAC, lui, est résolu. Sans elle, un refus qui
+    // rejetterait TOUT resterait vert et le téléversement serait mort.
+    let flac = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac");
+    let Ok(resolu) = orch.resolve_uploaded_file(flac, &req).await else {
+        panic!("un FLAC téléversé doit toujours se lire");
+    };
+    assert_eq!(resolu.source, "upload");
+    assert_eq!(
+        resolu.mime_type, "audio/flac",
+        "et il doit s'annoncer pour ce qu'il est"
+    );
+}
+
 /// #3234 — un ISO SACD demandé en LECTURE rend un motif nommé.
 ///
 /// JeromeQ, fil 1206 : « Tune ne lit pas les fichiers ISO ? » Personne ne
@@ -6156,4 +6404,106 @@ async fn output_send_error_fails_fast_to_stopped() {
         PlayState::Stopped,
         "output send error must leave the zone Stopped, not Playing"
     );
+}
+
+/// #3479 — les six sorties anticipées de `refresh_zone_eq` rendaient le MÊME
+/// `false`, sans un mot.
+///
+/// Reivax66 signale « l'activation de l'égaliseur coupe le son » depuis Windows,
+/// en 0.9.138. Deux familles connues produisent exactement cette phrase :
+/// la zone RÉSEAU (#3357 — étiquette qui ment, ou pré-transcodage du fichier
+/// entier) et la sortie LOCALE (#1735 — le marqueur DoP réécrit). Pour savoir
+/// LAQUELLE, il faut savoir où le réglage est allé — et rien ne le disait.
+///
+/// La contre-épreuve est celle-ci : trois zones qui échouent toutes les trois,
+/// et dont les motifs doivent être TROIS valeurs distinctes. Avec un `bool`,
+/// les trois valaient `false` et ce test ne pouvait pas s'écrire.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn un_changement_d_eq_nomme_son_premier_echec() {
+    use super::dsp::EchecEqLocal;
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+
+    // 1. Une zone RÉSEAU : il n'y a rien de local à rafraîchir, le réglage
+    //    devra passer par un redémarrage de flux.
+    let reseau = zones
+        .create("Denon", Some("dlna"), Some("dlna:uuid-1234"))
+        .unwrap();
+    // 2. Une zone LOCALE dont le périphérique n'est pas (ou plus) au registre.
+    let orpheline = zones
+        .create("Casque", Some("local"), Some("local:DAC-absent"))
+        .unwrap();
+    // 3. Une zone sans aucun périphérique.
+    let nue = zones.create("Zone nue", Some("local"), None).unwrap();
+
+    let motifs: Vec<EchecEqLocal> = {
+        let mut v = Vec::new();
+        for id in [reseau, orpheline, nue] {
+            let r = orch.refresh_zone_eq_detaille(id).await;
+            assert!(!r.applique(), "zone {id} : aucun chemin local vivant");
+            v.push(r.echec.expect("un échec doit porter son motif"));
+        }
+        v
+    };
+    assert_eq!(
+        motifs,
+        vec![
+            EchecEqLocal::SortieNonLocale,
+            EchecEqLocal::SortieAbsenteDuRegistre,
+            EchecEqLocal::ZoneSansPeripherique,
+        ],
+        "trois échecs différents doivent porter trois motifs différents, \
+         sans quoi un rapport de diagnostic ne permet pas de choisir le code \
+         à regarder"
+    );
+
+    // 4. Le quatrième motif, celui qui compte le plus sur une sortie locale :
+    //    la sortie EST là, elle EST locale, et pourtant rien ne joue encore.
+    let salon = zone_locale_avec_eq(&orch).await;
+    let r = orch.refresh_zone_eq_detaille(salon).await;
+    assert_eq!(r.echec, Some(EchecEqLocal::FormatInconnu));
+    assert_eq!(r.format, None, "aucun format ne peut être annoncé");
+}
+
+/// L'autre bord : quand le contrat ATTEINT la sortie locale, le rapport chiffre
+/// ce qui change — et ce qui ne change pas.
+///
+/// Le format est identique avant et après : un égaliseur ne touche ni la
+/// cadence ni le nombre de canaux. Ce qu'il touche est le NIVEAU, et le
+/// pré-gain automatique le dit : ici −8,0 dB pour un unique low-shelf à +8 dB.
+/// C'est ce chiffre-là, absent de tout journal jusqu'à #3479, qui distingue
+/// « l'égaliseur a coupé le son » de « l'égaliseur a beaucoup baissé le son ».
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn le_rapport_a_chaud_chiffre_le_format_et_le_pregain() {
+    let orch = test_orchestrator();
+    let zone_id = zone_locale_avec_eq(&orch).await;
+    avec_sortie_locale(&orch, |local| {
+        local.declare_current_format_for_test(44_100, 2);
+    })
+    .await;
+
+    let r = orch.refresh_zone_eq_detaille(zone_id).await;
+    assert!(r.applique(), "une sortie locale vivante reçoit le contrat");
+    assert_eq!(r.device_id, "local:DAC");
+    assert_eq!(r.format, Some((44_100, 2)));
+    assert_eq!(r.format_ecrit(), "44100 Hz / 2 canaux / f32");
+    assert!(r.eq_actif, "le profil de la zone est audible");
+    assert_eq!(r.preamp_db, Some(-8.0));
+    assert_eq!(r.preamp_db_droite, Some(-8.0));
+}
+
+/// La famille de sortie est un MOT, pas une déduction refaite après coup.
+#[test]
+fn famille_de_sortie_nomme_chaque_famille() {
+    use super::dsp::famille_de_sortie;
+    assert_eq!(famille_de_sortie("local:DAC", Some("local")), "locale");
+    assert_eq!(famille_de_sortie("", Some("local")), "locale");
+    assert_eq!(famille_de_sortie("dlna:uuid", Some("dlna")), "reseau");
+    assert_eq!(famille_de_sortie("cc:uuid", Some("chromecast")), "reseau");
+    assert_eq!(famille_de_sortie("b:1", Some("browser")), "navigateur");
+    assert_eq!(famille_de_sortie("oaat:1", Some("oaat")), "oaat");
+    assert_eq!(famille_de_sortie("d:1", Some("diretta")), "pull");
+    assert_eq!(famille_de_sortie("", None), "absente");
 }

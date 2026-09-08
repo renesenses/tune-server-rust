@@ -10,6 +10,136 @@ struct Etiquettes {
     duration_ms: u64,
 }
 
+/// Pourquoi l'égaliseur n'a pas pu être remplacé À CHAUD sur une sortie locale.
+///
+/// #3479 — « l'activation de l'égaliseur coupe le son » (Reivax66, 0.9.138,
+/// Windows). Les six sorties anticipées de
+/// [`PlaybackOrchestrator::refresh_zone_eq`] rendaient toutes le MÊME `false`,
+/// sans une ligne de journal. Le serveur ne disait donc nulle part si le
+/// réglage avait atteint la sortie locale, s'il était parti en redémarrage de
+/// flux réseau, ou s'il n'avait rien atteint du tout — et un rapport de
+/// diagnostic joint à un fil du forum ne permettait pas de trancher entre la
+/// famille « zone RÉSEAU » (#3357) et la famille « sortie LOCALE » (#1735),
+/// c'est-à-dire de savoir quel code regarder.
+///
+/// Chaque motif porte son nom, et ce nom part dans `eq_change_journal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `CaisseSansAudioLocal` n'est construite que SANS `local-audio`, les cinq
+// autres seulement AVEC : aucune configuration ne les construit toutes.
+#[allow(dead_code)]
+pub(crate) enum EchecEqLocal {
+    /// Caisse compilée sans `local-audio` : il n'existe aucune sortie locale.
+    CaisseSansAudioLocal,
+    /// La zone n'a pas de périphérique de sortie, ou sa ligne est absente.
+    ZoneSansPeripherique,
+    /// La zone joue ailleurs que sur la machine — DLNA, navigateur, OAAT…
+    SortieNonLocale,
+    /// `local:…`, mais ce périphérique n'est pas au registre des sorties.
+    SortieAbsenteDuRegistre,
+    /// Le registre a bien cette clé, mais ce n'est pas une `LocalOutput`.
+    SortiePasUneSortieLocale,
+    /// Rien ne joue : aucun couple (taux, canaux) n'a encore été vu, et bâtir
+    /// des biquads pour un format inconnu donnerait des coefficients faux.
+    FormatInconnu,
+}
+
+impl EchecEqLocal {
+    /// Le mot qui part dans le journal. Stable : c'est lui qu'on cherchera
+    /// dans un export de diagnostic.
+    pub(crate) fn nom(self) -> &'static str {
+        match self {
+            Self::CaisseSansAudioLocal => "caisse_sans_audio_local",
+            Self::ZoneSansPeripherique => "zone_sans_peripherique",
+            Self::SortieNonLocale => "sortie_non_locale",
+            Self::SortieAbsenteDuRegistre => "sortie_absente_du_registre",
+            Self::SortiePasUneSortieLocale => "sortie_pas_une_sortie_locale",
+            Self::FormatInconnu => "format_inconnu",
+        }
+    }
+}
+
+/// Ce qu'un changement d'égaliseur a RÉELLEMENT fait sur la sortie locale.
+#[derive(Debug, Clone)]
+pub(crate) struct RapportEqAChaud {
+    /// Le périphérique de la zone, vide si elle n'en a pas.
+    pub(crate) device_id: String,
+    /// `None` quand le contrat a bien été posé sur une sortie locale vivante.
+    pub(crate) echec: Option<EchecEqLocal>,
+    /// Le couple (taux, canaux) du flux en cours — le format AVANT traitement,
+    /// et aussi celui d'APRÈS : un égaliseur ne change ni la cadence ni le
+    /// nombre de canaux. Ce qu'il change est le NIVEAU, d'où `preamp_db`.
+    pub(crate) format: Option<(u32, u16)>,
+    /// Un `EqProcessor` audible a-t-il été monté ? `false` couvre aussi bien le
+    /// retrait volontaire (PURE, profil désactivé) qu'un profil dont toutes les
+    /// bandes sont neutres.
+    pub(crate) eq_actif: bool,
+    /// Le pré-gain automatique, en dB, canal gauche puis droit.
+    ///
+    /// C'est la marge que l'égaliseur RETIRE au signal pour ne pas écrêter
+    /// (`EqProfile::automatic_headroom_db`, qui réserve la SOMME des gains
+    /// positifs de la cascade). Sur un profil qui pousse beaucoup, c'est de lui
+    /// que vient une chute de niveau — mesurée jusqu'à -22,2 dB sur un profil
+    /// AutoEq réel (`tune-core/tests/autoeq_profils_reels.rs`) — et il ne se
+    /// lisait jusqu'ici dans aucun journal.
+    pub(crate) preamp_db: Option<f64>,
+    pub(crate) preamp_db_droite: Option<f64>,
+}
+
+impl RapportEqAChaud {
+    fn echoue(device_id: String, echec: EchecEqLocal) -> Self {
+        Self {
+            device_id,
+            echec: Some(echec),
+            format: None,
+            eq_actif: false,
+            preamp_db: None,
+            preamp_db_droite: None,
+        }
+    }
+
+    /// Le contrat a-t-il atteint une sortie locale vivante ? C'est exactement
+    /// ce que [`PlaybackOrchestrator::refresh_zone_eq`] rendait déjà.
+    pub(crate) fn applique(&self) -> bool {
+        self.echec.is_none()
+    }
+
+    /// Le format, écrit pour un humain. `-` quand rien ne joue.
+    pub(crate) fn format_ecrit(&self) -> String {
+        match self.format {
+            Some((taux, canaux)) => format!("{taux} Hz / {canaux} canaux / f32"),
+            None => "-".to_string(),
+        }
+    }
+}
+
+/// La famille de sortie d'une zone, telle que le journal doit la NOMMER.
+///
+/// Fonction PURE : elle ne lit que ce que la ligne de zone porte déjà. Elle
+/// existe pour que « locale » et « réseau » soient un MOT dans le journal, et
+/// non une déduction à refaire après coup sur un identifiant de périphérique —
+/// c'est précisément cette déduction qui manquait pour instruire #3479.
+pub(crate) fn famille_de_sortie(device_id: &str, output_type: Option<&str>) -> &'static str {
+    if device_id.is_empty() && output_type.is_none() {
+        return "absente";
+    }
+    if device_id.starts_with("local:") || output_type == Some("local") {
+        return "locale";
+    }
+    if device_id.starts_with("oaat:") || device_id.starts_with("oaat-group:") {
+        return "oaat";
+    }
+    if output_type == Some("browser") {
+        return "navigateur";
+    }
+    if is_network_output_type(output_type) {
+        return "reseau";
+    }
+    if is_pull_dsp_output_type(output_type) {
+        return "pull";
+    }
+    "inconnue"
+}
+
 impl PlaybackOrchestrator {
     /// Marque la zone en résolution gapless jusqu'au drop du garde.
     pub(super) fn begin_levels_prewarm(&self, zone_id: i64) -> LevelsPrewarmScope<'_> {
@@ -544,42 +674,74 @@ impl PlaybackOrchestrator {
     /// avec un profil désactivé. `false` est réservé à l'absence de chemin
     /// local vivant : zone distante, sortie absente ou format encore inconnu.
     pub async fn refresh_zone_eq(&self, zone_id: i64) -> bool {
+        self.refresh_zone_eq_detaille(zone_id).await.applique()
+    }
+
+    /// Le corps de [`Self::refresh_zone_eq`], mais qui DIT ce qu'il a fait.
+    ///
+    /// Même travail, mêmes conditions d'arrêt, à l'octet près — seule la valeur
+    /// rendue change : un [`RapportEqAChaud`] au lieu d'un `bool` muet. Chaque
+    /// sortie anticipée porte désormais son motif ([`EchecEqLocal`]), et le
+    /// chemin nominal rapporte le format vu, le nombre de bandes et le pré-gain
+    /// réservé. C'est cette matière que `eq_change_journal` met dans le journal
+    /// (#3479).
+    /// Le périphérique de sortie de la zone, ou la chaîne vide s'il n'y en a
+    /// pas.
+    ///
+    /// Lu **sans condition de compilation** : c'est une colonne de `zones`, pas
+    /// une propriété de la sortie locale. La CI l'a montré sur le jeu
+    /// `--no-default-features --features oaat,cloud-relay,bandcamp` — le bras
+    /// « caisse sans audio local » rendait un `device_id` VIDE, et
+    /// `eq_change_journal` perdait l'identifiant de l'appareil selon le binaire
+    /// livré. Une trace qui change de contenu avec les fonctionnalités
+    /// compilées ne vaut rien pour diagnostiquer chez un testeur : c'est
+    /// justement le binaire allégé qu'on ne peut pas interroger autrement.
+    fn peripherique_de_la_zone(&self, zone_id: i64) -> String {
+        ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id)
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn refresh_zone_eq_detaille(&self, zone_id: i64) -> RapportEqAChaud {
+        // Le périphérique est relevé AVANT tout aiguillage, et par le même
+        // chemin dans les deux jeux de fonctionnalités : c'est ce qui garantit
+        // que le journal le porte toujours.
+        let device_id = self.peripherique_de_la_zone(zone_id);
         #[cfg(not(feature = "local-audio"))]
         {
-            let _ = zone_id;
-            false
+            RapportEqAChaud::echoue(device_id, EchecEqLocal::CaisseSansAudioLocal)
         }
         #[cfg(feature = "local-audio")]
         {
-            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
-                .get(zone_id)
-                .ok()
-                .flatten()
-                .and_then(|z| z.output_device_id)
-            else {
-                return false;
-            };
+            if device_id.is_empty() {
+                return RapportEqAChaud::echoue(device_id, EchecEqLocal::ZoneSansPeripherique);
+            }
             if !device_id.starts_with("local:") {
-                return false;
+                return RapportEqAChaud::echoue(device_id, EchecEqLocal::SortieNonLocale);
             }
             let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
-                return false;
+                return RapportEqAChaud::echoue(device_id, EchecEqLocal::SortieAbsenteDuRegistre);
             };
             let output = output_arc.lock().await;
             let Some(local_output) = output
                 .as_any()
                 .downcast_ref::<crate::outputs::local::LocalOutput>()
             else {
-                return false;
+                return RapportEqAChaud::echoue(device_id, EchecEqLocal::SortiePasUneSortieLocale);
             };
             // Pas de flux en cours : la prochaine lecture rebâtira l'EQ de
             // toute façon, et bâtir pour un format inconnu donnerait des
             // coefficients faux.
             let Some((taux, canaux)) = local_output.current_format() else {
-                return false;
+                return RapportEqAChaud::echoue(device_id, EchecEqLocal::FormatInconnu);
             };
             let eq = self.load_eq_processor(zone_id, taux, canaux);
             let actif = eq.is_some();
+            let preamp_db = eq.as_ref().and_then(|e| e.preamp_db(0));
+            let preamp_db_droite = eq.as_ref().and_then(|e| e.preamp_db(1));
             // `replace_eq_live` et non `set_eq` : la piste est en cours, donc
             // l'historique des biquads doit survivre au remplacement, sinon le
             // geste même qu'on vient de rendre possible — bouger un curseur en
@@ -593,7 +755,14 @@ impl PlaybackOrchestrator {
                 actif,
                 "zone_eq_refreshed_live"
             );
-            true
+            RapportEqAChaud {
+                device_id,
+                echec: None,
+                format: Some((taux, canaux)),
+                eq_actif: actif,
+                preamp_db,
+                preamp_db_droite,
+            }
         }
     }
 
@@ -622,21 +791,96 @@ impl PlaybackOrchestrator {
     /// et reconstruisent ainsi `signal_path` depuis le profil EQ qui vient
     /// d'être persisté, au lieu de conserver l'instantané de la lecture (#1985).
     pub async fn apply_eq_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
-        let applique_a_chaud = self.refresh_zone_eq(zone_id).await;
+        let rapport = self.refresh_zone_eq_detaille(zone_id).await;
+        let applique_a_chaud = rapport.applique();
+        let mut chemin = if applique_a_chaud {
+            "local_a_chaud"
+        } else {
+            "sans_chemin"
+        };
         if !applique_a_chaud {
             // Pas de chemin local vivant. Reste le redémarrage — mais uniquement si
             // quelque chose joue : sinon la prochaine lecture rebâtira l'EQ toute
             // seule, et redémarrer un flux inexistant n'a aucun sens.
             let joue = self.playback.get_state(zone_id).await.now_playing.is_some();
-            if joue {
-                self.schedule_eq_replay(zone_id);
-            }
+            chemin = if !joue {
+                "rien_ne_joue"
+            } else if self.schedule_eq_replay(zone_id) {
+                "replay_programme"
+            } else {
+                // `schedule_eq_replay` a déjà dit POURQUOI (#2595) ; ici on
+                // retient seulement que rien ne partira.
+                "replay_refuse_position_inconnue"
+            };
         }
+
+        self.journaliser_le_changement_d_eq(zone_id, &rapport, chemin);
 
         if let Some(ref bus) = self.event_bus {
             bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
         }
         applique_a_chaud
+    }
+
+    /// LA trace qui tranche, à l'activation de l'égaliseur (#3479).
+    ///
+    /// Une ligne, au niveau INFO — donc présente dans l'export de diagnostic
+    /// qu'un testeur joint à son fil — et qui répond aux quatre questions
+    /// qu'aucun journal ne savait répondre le 06/09/2026, quand Reivax66 a
+    /// signalé « l'activation de l'égaliseur coupe le son » depuis Windows :
+    ///
+    /// | question | champs |
+    /// |---|---|
+    /// | quelle zone ? | `zone_id`, `zone` |
+    /// | quel type de sortie ? | `famille`, `output_type`, `device_id` |
+    /// | quel format avant, quel format après ? | `format_avant`, `format_apres`, `preamp_db_g`, `preamp_db_d` |
+    /// | quel est le premier échec ? | `premier_echec`, `chemin` |
+    ///
+    /// « Avant » et « après » sont DEUX champs même quand la cadence et les
+    /// canaux ne bougent pas, et c'est délibéré : le fait qu'ils ne bougent PAS
+    /// est ce qui écarte l'hypothèse « format refusé par le périphérique après
+    /// traitement ». Sur ce chemin, ce que l'égaliseur change est le NIVEAU, et
+    /// c'est `preamp_db_g` / `preamp_db_d` qui le chiffrent.
+    ///
+    /// Le pendant réseau de cette ligne est `eq_format_apres_traitement`
+    /// (`resolve_local.rs`) : là, le format change pour de bon, et l'étiquette
+    /// servie au renderer peut diverger de la charge utile (#3357).
+    fn journaliser_le_changement_d_eq(
+        &self,
+        zone_id: i64,
+        rapport: &RapportEqAChaud,
+        chemin: &str,
+    ) {
+        let zone = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten();
+        let nom = zone.as_ref().map(|z| z.name.clone()).unwrap_or_default();
+        let output_type = zone.as_ref().and_then(|z| z.output_type.clone());
+        let famille = famille_de_sortie(&rapport.device_id, output_type.as_deref());
+        let format = rapport.format_ecrit();
+        // Le profil est une propriété de la ZONE, pas de la sortie : il se lit
+        // même quand aucun chemin local n'a pu être servi, et c'est justement
+        // là que sa lecture compte.
+        let profil = self.load_eq_profile(zone_id);
+        info!(
+            zone_id,
+            zone = %nom,
+            famille,
+            output_type = output_type.as_deref().unwrap_or("-"),
+            device_id = %rapport.device_id,
+            pure = self.zone_audiophile(zone_id),
+            profil_actif = profil.is_some(),
+            bandes = profil.map(|p| p.bands.len()).unwrap_or(0),
+            eq_actif = rapport.eq_actif,
+            format_avant = %format,
+            format_apres = %format,
+            preamp_db_g = rapport.preamp_db.unwrap_or(0.0),
+            preamp_db_d = rapport.preamp_db_droite.unwrap_or(0.0),
+            chemin,
+            premier_echec = rapport.echec.map(EchecEqLocal::nom).unwrap_or("-"),
+            "eq_change_journal"
+        );
     }
 
     /// Faire prendre effet un changement d'égaliseur sur un chemin **non

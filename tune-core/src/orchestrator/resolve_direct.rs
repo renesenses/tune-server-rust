@@ -158,6 +158,30 @@ impl PlaybackOrchestrator {
         if !path.exists() {
             return Err(format!("uploaded file not found: {file_path}"));
         }
+        // #3270 (point 4) — un REFUS NOMMÉ avant toute promesse de lecture.
+        //
+        // C'est le point unique que traversent les DEUX entrées d'un fichier
+        // téléversé : `resolve_stream` (`commun.rs`, branche `source ==
+        // "upload"`) et `resoudre_la_demande` (`transport.rs`, branche
+        // `req.temp_file_path`). Sans lui, `AudioFormat::from_extension` rendait
+        // `None` pour un `.wma` ou un `.iso` et ce `None` était absorbé douze
+        // lignes plus bas par `unwrap_or("audio/wav")` : le fichier obtenait une
+        // session de flux annoncée `audio/wav`, la sortie ne décodait rien, et
+        // la zone se taisait sans un mot.
+        //
+        // La sentinelle `format_not_playable:` est celle de #3234 :
+        // `play_error_response` (`tune-server/src/routes/playback.rs`) la
+        // transforme déjà en `422 {"error":"format_not_playable","message":…}`.
+        // On n'ouvre pas un second canal pour dire la même chose.
+        if let Some(motif) = crate::audio::support::refus_de_televersement(path) {
+            warn!(
+                zone_id = req.zone_id,
+                file = %file_path,
+                %motif,
+                "uploaded_file_format_not_playable"
+            );
+            return Err(format!("format_not_playable:{motif}"));
+        }
         let ext = path
             .extension()
             .and_then(|e| e.to_str())

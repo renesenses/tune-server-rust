@@ -278,8 +278,54 @@ pub(crate) fn can_skip_next(zone_state: &tune_core::playback::ZoneState) -> bool
     tune_core::poller::PositionPoller::next_position_manual(zone_state).is_some()
 }
 
+/// La MÊME décision, complétée par la règle que `POST /zones/{id}/next`
+/// applique réellement depuis #3342.
+///
+/// #3514 — depuis #3342, `next` refuse d'avancer quand une radio joue hors de
+/// sa file : il rend `{"reason":"radio_no_next"}` et ne touche à rien. Mais la
+/// projection ci-dessus est restée celle de `next_position_manual`, qui ne
+/// connaît que la POSITION : sur la file résiduelle de Philippe — trois pistes
+/// Qobuz, position 0 — elle rend `Some(1)`, donc `true`. Le bouton « suivant »
+/// restait franchement actif pendant toute la radio, et chaque appui partait
+/// dans le vide sans que rien ne l'explique.
+///
+/// C'est le motif que ce dépôt traite en ce moment sous toutes ses formes : le
+/// serveur ANNONCE ce qu'il ne fera pas. Une capacité annoncée et non honorée
+/// est pire qu'une capacité refusée — l'auditeur croit avoir agi. La réparation
+/// est de dire non au bon endroit, ici dans le champ que l'écran lit, et non
+/// d'inventer un « suivant » de radio qui n'existe pas.
+///
+/// ⚠️ La lecture de file ne coûte QUE sur une radio. La règle exige
+/// `source_en_cours == "radio"` ; hors radio on rend la projection pure sans
+/// toucher la base, ce qui laisse `GET /zones` — qui boucle sur toutes les
+/// zones — au même nombre de requêtes qu'avant.
+pub(crate) async fn can_skip_next_publie(
+    state: &AppState,
+    zone_id: i64,
+    zone_state: &tune_core::playback::ZoneState,
+) -> bool {
+    if !can_skip_next(zone_state) {
+        return false;
+    }
+    let Some(np) = zone_state.now_playing.as_ref() else {
+        return true;
+    };
+    if np.source != "radio" {
+        return true;
+    }
+    let ligne_courante = PlayQueueRepo::with_backend(state.backend.clone())
+        .get_at(zone_id, zone_state.queue_position)
+        .ou_defaut_journalise();
+    !radio_hors_file_interdit_le_suivant(
+        Some(np.source.as_str()),
+        ligne_courante.as_ref().and_then(|e| e.source.as_deref()),
+    )
+}
 pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     let zone_state = state.playback.get_state(zone_id).await;
+    // #3514 — la décision PUBLIÉE est celle que la route applique, refus
+    // « radio hors file » compris. Voir `can_skip_next_publie`.
+    let peut_avancer = can_skip_next_publie(state, zone_id, &zone_state).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_db = zone_repo.get(zone_id).ok().flatten();
     let mut v = json!({
@@ -316,7 +362,7 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "position_ms": zone_state.position_ms,
         "queue_length": zone_state.queue_length,
         "queue_position": zone_state.queue_position,
-        "can_skip_next": can_skip_next(&zone_state),
+        "can_skip_next": peut_avancer,
         // #2092 / #2055 — TROISIÈME construction de la charge utile d'une zone,
         // et la dernière qui ne portait pas le transport.
         //
@@ -2090,12 +2136,88 @@ fn reject_if_zone_has_no_output_device(
     None
 }
 
+/// Une radio en cours de lecture doit-elle INTERDIRE l'avance vers l'élément
+/// suivant de la file ?
+///
+/// #3342 — Philippe, v0.9.134 : « lorsque j'écoute une station radio, au bout
+/// d'une dizaine de secondes la lecture passe sur le dernier album Qobuz
+/// écouté sans action de ma part ». Ses journaux du 04/09 disent la mécanique
+/// exacte, et elle ne tient pas au hasard :
+///
+/// ```text
+/// 17:33:32.096  orchestrator_play zone_id=10 title=FIP Jazz source=radio
+/// 17:33:42.175  radio_stream_superseded ... connected_secs=9
+/// 17:33:42.443  radio_stream_client_disconnect ... remaining_consumers=0
+/// 17:33:46.154  api_next_requested zone_id=10
+/// 17:33:46.158  prefetch_consumed source=qobuz source_id=410609160
+/// 17:33:46.331  orchestrator_play zone_id=10 title=Simplifier source=qobuz
+/// ```
+///
+/// Six fois de suite dans le même quart d'heure, sur cinq stations
+/// différentes. Le flux du navigateur meurt vers la dixième seconde, l'élément
+/// `<audio>` rend son évènement de fin, et le client demande « suivant ».
+///
+/// Or `play_radio` ne TOUCHE PAS la file : il appelle l'orchestrateur avec
+/// `source = "radio"` et laisse en place `queue_position` et `queue_length`
+/// de la dernière file écoutée. La file de Philippe portait encore les huit
+/// pistes de son album Qobuz, position 0 — et « suivant » la ressuscitait à la
+/// position 1. La radio n'était pas la piste courante de cette file ; elle
+/// n'en faisait pas partie du tout.
+///
+/// Le sondeur avait déjà reçu cette garde-là (#2493, « un flux de radio n'a
+/// pas de fin : sa position ne peut rien dépasser », `poller/tick.rs`) — c'est
+/// pourquoi aucun `gapless_arm_trace` n'apparaît sur la zone 10 des journaux.
+/// La route HTTP `POST /zones/{id}/next`, elle, ne l'avait jamais eue.
+///
+/// La règle ne regarde donc pas QUI appelle — le serveur ne peut pas
+/// distinguer l'appui de l'utilisateur du réveil du client, les deux arrivent
+/// par la même route sans le moindre marqueur. Elle regarde ce sur quoi la
+/// file est POSÉE : si la ligne à `queue_position` est elle-même une radio, la
+/// file est une file de stations et « suivant » y a un sens ; sinon la file
+/// est résiduelle, elle appartient à une autre écoute, et rien ne doit l'en
+/// faire sortir.
+///
+/// Contre-épreuve : `source_en_cours = None` ou n'importe quelle autre source
+/// rend `false` — une piste normale garde son bouton « suivant » intact.
+pub(crate) fn radio_hors_file_interdit_le_suivant(
+    source_en_cours: Option<&str>,
+    source_de_la_ligne_courante: Option<&str>,
+) -> bool {
+    source_en_cours == Some("radio") && source_de_la_ligne_courante != Some("radio")
+}
+
 async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_next_requested");
     if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
         return resp;
     }
     let current = state.playback.get_state(zone_id).await;
+
+    // #3342 — une radio ne fait pas avancer une file qui n'est pas la sienne.
+    // Voir `radio_hors_file_interdit_le_suivant` pour le pourquoi.
+    if let Some(np) = current.now_playing.as_ref() {
+        let ligne_courante = PlayQueueRepo::with_backend(state.backend.clone())
+            .get_at(zone_id, current.queue_position)
+            .ou_defaut_journalise();
+        if radio_hors_file_interdit_le_suivant(
+            Some(np.source.as_str()),
+            ligne_courante.as_ref().and_then(|e| e.source.as_deref()),
+        ) {
+            info!(
+                zone_id,
+                station = %np.title,
+                queue_position = current.queue_position,
+                queue_length = current.queue_length,
+                "next_ignore_radio_hors_file"
+            );
+            return Json(json!({
+                "status": "playing",
+                "reason": "radio_no_next",
+                "queue_position": current.queue_position,
+            }))
+            .into_response();
+        }
+    }
 
     // Manual skip: ignore repeat-one so the button always changes track (#1110).
     let Some(next_pos) = tune_core::poller::PositionPoller::next_position_manual(&current) else {
@@ -2108,6 +2230,12 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
     tokio::spawn(async move {
         if let Err(e) = s.orchestrator.play_from_queue(zone_id, next_pos).await {
             tracing::warn!(zone_id, error = %e, "next_play_failed");
+            // #3270 (point 2) — la réponse HTTP est déjà partie en disant
+            // « playing » ; c'est ici, et seulement ici, que l'échec devient
+            // connaissable. Sans cette ligne il mourait dans le `warn!`
+            // ci-dessus : la zone ne jouait pas, et rien ne le disait.
+            s.orchestrator
+                .dire_piste_non_demarree(zone_id, "suivante", &e);
         }
     });
 
@@ -2199,6 +2327,9 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
     tokio::spawn(async move {
         if let Err(e) = s.orchestrator.play_from_queue(zone_id, prev_pos).await {
             tracing::warn!(zone_id, error = %e, "prev_play_failed");
+            // #3270 (point 2) — jumeau du site de `next`, ligne pour ligne.
+            s.orchestrator
+                .dire_piste_non_demarree(zone_id, "précédente", &e);
         }
     });
 
@@ -2683,14 +2814,32 @@ async fn queue_add(
             .into_response();
     }
 
-    let count = inputs.len();
-    let start = match queue_repo.insert_at(zone_id, &inputs, body.position) {
-        Ok(start) => start,
+    // 🔴 #3231 — `added` comptait les pistes DEMANDÉES. Depuis que l'insertion
+    // unifiée saute la piste disparue au lieu d'annuler tout l'ajout, demandé
+    // et écrit ne sont plus le même nombre : annoncer le premier ferait dire à
+    // la réponse « 190 ajoutées » là où la file en porte 3. Un compteur qui
+    // ment est pire qu'un compteur absent (#2394) — on annonce donc ce qui est
+    // ENTRÉ, et on nomme ce qui est tombé.
+    let bilan = match queue_repo.insert_at_bilan(zone_id, &inputs, body.position) {
+        Ok(bilan) => bilan,
         Err(e) => {
             warn!(zone_id, error = %e, "queue_insert_failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     };
+    let count = bilan.inserted();
+    let start = bilan.start;
+    if bilan.has_loss() {
+        let apercu: Vec<i64> = bilan.skipped.iter().take(10).copied().collect();
+        warn!(
+            zone_id,
+            demandees = bilan.requested,
+            ajoutees = count,
+            absentes = bilan.skipped.len(),
+            apercu_ids_absents = ?apercu,
+            "queue_add_pistes_absentes — des pistes demandées n'existent plus en bibliothèque"
+        );
+    }
     let total = queue_repo.count_all(zone_id).unwrap_or(0);
     let current_pos = state.playback.get_state(zone_id).await.queue_position;
     state
@@ -2706,12 +2855,13 @@ async fn queue_add(
     info!(
         zone_id,
         added = count,
+        demandees = bilan.requested,
         position = ?body.position,
         inserted_at = ?start,
         queue_length = total,
         "queue_add_ok"
     );
-    let enfiles = decrire_enfilage(&inputs, start);
+    let enfiles = decrire_enfilage(&inputs, start, &bilan.retenus);
     state.event_bus.emit(
         "playback.queue.track_added",
         json!({
@@ -2759,12 +2909,24 @@ async fn queue_add(
 /// N'interroge RIEN : tout est déjà résolu dans `inputs` (le titre d'une piste
 /// de service y est passé par `resolve_streaming_queue_meta`). Un album de
 /// trente pistes ne coûte donc pas trente requêtes de plus.
-fn decrire_enfilage(inputs: &[QueueInput], start: Option<i64>) -> Vec<serde_json::Value> {
-    inputs
+///
+/// 🔴 #3231 — `retenus` porte les INDICES de `inputs` réellement écrits, dans
+/// l'ordre des positions. Numéroter par l'indice de boucle, comme avant,
+/// annonçait une position pour une piste qui n'était jamais entrée, et décalait
+/// toutes les suivantes : la réponse censée dire où la piste a ATTERRI (#2079)
+/// devenait fausse dès qu'une piste manquait. Le rang dans `retenus` EST le
+/// décalage depuis `start`.
+fn decrire_enfilage(
+    inputs: &[QueueInput],
+    start: Option<i64>,
+    retenus: &[usize],
+) -> Vec<serde_json::Value> {
+    retenus
         .iter()
         .enumerate()
-        .map(|(i, item)| {
-            let position = start.map(|s| s + i as i64);
+        .filter_map(|(rang, &idx)| inputs.get(idx).map(|item| (rang, item)))
+        .map(|(rang, item)| {
+            let position = start.map(|s| s + rang as i64);
             match item {
                 QueueInput::Local { track_id } => json!({
                     "position": position,
@@ -4473,6 +4635,28 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
             .into_response();
     };
 
+    // #3270 (point 4) — refuser AVANT d'écrire dans `/tmp/tune-upload`.
+    //
+    // Le refus de fond est dans `resolve_uploaded_file` : c'est lui qui garde
+    // le chemin de LECTURE, y compris un `temp_file_path` fourni directement
+    // sans passer par cette route. Celui-ci est le refus POLI, au plus tôt : il
+    // évite d'écrire un fichier qu'on sait ne pas savoir lire, et il répond à
+    // l'utilisateur pendant qu'il regarde son écran, avec le même code stable
+    // (`format_not_playable`, 422) que le chemin de lecture.
+    //
+    // Décidé sur le nom que le CLIENT a envoyé, avant le repli `.wav` : une
+    // extension absente n'est pas un refus (voir
+    // `refus_de_televersement_par_extension`).
+    if let Some(motif) =
+        tune_core::audio::support::refus_de_televersement_par_extension(&original_name)
+    {
+        warn!(fichier = %original_name, %motif, "upload_format_not_playable");
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "format_not_playable", "message": motif})),
+        )
+            .into_response();
+    }
     let ext = std::path::Path::new(&original_name)
         .extension()
         .and_then(|e| e.to_str())
@@ -4568,6 +4752,112 @@ mod contrat_suivant_tests {
         };
 
         assert!(can_skip_next(&state));
+    }
+}
+
+/// #3514 — et la même décision, PUBLIÉE. Le test ci-dessus éprouve la règle ;
+/// celui-ci éprouve que la TROISIÈME charge utile de zone — celle que rendent
+/// une vingtaine de routes de lecture — s'en sert. C'est l'écart que ce dépôt
+/// connaît par cœur : tester que la fonction marche, pas qu'on l'appelle.
+#[cfg(test)]
+mod contrat_suivant_radio_tests {
+    use crate::state::AppState;
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::playback::NowPlaying;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// Une zone posée EN BASE, avec une sortie.
+    fn zone(state: &AppState, nom: &str) -> i64 {
+        ZoneRepo::with_backend(state.backend.clone())
+            .create(nom, Some("mock"), Some("sortie-essai"))
+            .expect("creation de zone")
+    }
+
+    /// La file résiduelle de Philippe : trois pistes Qobuz, l'écoute d'avant.
+    fn file(state: &AppState, zone_id: i64, source: &str) {
+        let items: Vec<QueueInput> = ["a", "b", "c"]
+            .iter()
+            .map(|id| QueueInput::Streaming {
+                source: source.into(),
+                source_id: (*id).into(),
+                title: (*id).to_string(),
+                artist: "Aldo Romano".into(),
+                album: None,
+                duration_ms: 197_000,
+                cover_url: None,
+                track_number: None,
+                disc_number: None,
+            })
+            .collect();
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zone_id, &items)
+            .expect("mise en file");
+    }
+
+    fn en_cours(source: &str, titre: &str) -> NowPlaying {
+        NowPlaying {
+            title: titre.into(),
+            source: source.into(),
+            source_id: Some("x".into()),
+            duration_ms: 0,
+            ..Default::default()
+        }
+    }
+
+    async fn charge_utile(source_de_la_file: &str, source_en_cours: &str) -> serde_json::Value {
+        let state = etat();
+        let zid = zone(&state, "Salon");
+        file(&state, zid, source_de_la_file);
+        state
+            .playback
+            .play(zid, en_cours(source_en_cours, "FIP Jazz"))
+            .await;
+        // `play` réinitialise l'information de file : on la repose APRÈS, sinon
+        // `can_skip_next` serait faux pour une tout autre raison.
+        state.playback.update_queue_info(zid, 0, 3).await;
+        super::build_zone_json(&state, zid).await
+    }
+
+    #[tokio::test]
+    async fn la_charge_utile_de_lecture_refuse_le_suivant_pendant_une_radio_hors_file() {
+        let v = charge_utile("qobuz", "radio").await;
+        assert_eq!(
+            v.get("can_skip_next"),
+            Some(&serde_json::json!(false)),
+            "la file résiduelle a encore deux pistes après la position 0, donc \
+             `next_position_manual` rend `Some(1)` — mais `POST /next` refuse \
+             d'y aller (`radio_no_next`, #3342). La charge utile doit dire ce \
+             refus, sinon le bouton reste actif et sans effet (#3514) : {v}"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE 1 : même file, même route, une piste normale en cours.
+    #[tokio::test]
+    async fn une_piste_normale_garde_son_suivant_annonce() {
+        let v = charge_utile("qobuz", "qobuz").await;
+        assert_eq!(
+            v.get("can_skip_next"),
+            Some(&serde_json::json!(true)),
+            "sans elle, un `can_skip_next` cassé pour tout le monde passerait \
+             le test ci-dessus : {v}"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE 2 : une file FAITE de stations. La règle regarde la
+    /// ligne de file courante, pas seulement ce qui joue — l'auditeur qui
+    /// enfile ses stations favorites garde son bouton.
+    #[tokio::test]
+    async fn une_file_de_stations_garde_son_suivant_annonce() {
+        let v = charge_utile("radio", "radio").await;
+        assert_eq!(
+            v.get("can_skip_next"),
+            Some(&serde_json::json!(true)),
+            "la ligne courante EST une radio : « suivant » y a un sens : {v}"
+        );
     }
 }
 
@@ -5506,5 +5796,148 @@ mod tests_reprise_position_2876 {
             ..Default::default()
         };
         assert_eq!(reprise_applicable(&zone, Some(42), None), None);
+    }
+}
+
+/// #3270 (point 2) — garde de SITE : tout démarrage de piste DÉTACHÉ doit
+/// annoncer son échec.
+///
+/// `next` et `previous` répondent `{"status":"playing"}` sans attendre
+/// `play_from_queue`, et c'est délibéré : la résolution d'une piste peut
+/// prendre une minute (`resolve_ms=62017`, #3357). Le prix de ce choix est que
+/// l'échec ne peut plus se dire par la réponse HTTP — il doit partir sur
+/// `zone.playback_error`, sans quoi la zone ne joue pas et rien ne le dit.
+///
+/// Garde TEXTUELLE parce que ces deux handlers demandent un `AppState` complet,
+/// une base et un orchestrateur vivant. Elle nomme les SITES D'APPEL : chaque
+/// bloc `tokio::spawn` qui démarre une piste doit consulter
+/// `dire_piste_non_demarree`. Sa contre-épreuve est
+/// `la_garde_refuse_un_demarrage_detache_muet`.
+///
+/// Les aiguilles sont construites à l'exécution : écrites en clair, ce module
+/// se compterait lui-même dès qu'on relit le fichier par `include_str!`.
+#[cfg(test)]
+mod demarrage_detache_annonce_3270 {
+    /// Le nom de l'appel qui démarre une piste, jamais écrit en clair ici.
+    fn aiguille_demarrage() -> String {
+        format!("play_from{}queue(", "_")
+    }
+
+    /// Le nom de l'annonce, idem.
+    fn aiguille_annonce() -> String {
+        format!("dire_piste{}demarree(", "_non_")
+    }
+
+    /// Les blocs `tokio::spawn` de `source` qui démarrent une piste sans
+    /// annoncer l'échec, rendus par numéro de ligne (1-indexé).
+    fn demarrages_detaches_muets(source: &str) -> Vec<usize> {
+        let demarrage = aiguille_demarrage();
+        let annonce = aiguille_annonce();
+        let spawn = format!("tokio::{}(async move {{", "spawn");
+
+        let mut muets = Vec::new();
+        let mut curseur = 0usize;
+        while let Some(pos) = source[curseur..].find(&spawn) {
+            let debut = curseur + pos;
+            // Le bloc détaché le plus long de ce fichier fait moins de 400
+            // octets. La borne est reculée sur une frontière de caractère : ce
+            // fichier est plein d'accents, et trancher au milieu d'un « é »
+            // panique.
+            let mut fin = (debut + 700).min(source.len());
+            while fin > debut && !source.is_char_boundary(fin) {
+                fin -= 1;
+            }
+            let bloc = &source[debut..fin];
+            if bloc.contains(&demarrage) && !bloc.contains(&annonce) {
+                muets.push(source[..debut].lines().count());
+            }
+            curseur = debut + spawn.len();
+        }
+        muets
+    }
+
+    /// Combien de démarrages détachés ce fichier porte, muets ou non.
+    fn nombre_de_demarrages_detaches(source: &str) -> usize {
+        let demarrage = aiguille_demarrage();
+        let spawn = format!("tokio::{}(async move {{", "spawn");
+        let mut total = 0usize;
+        let mut curseur = 0usize;
+        while let Some(pos) = source[curseur..].find(&spawn) {
+            let debut = curseur + pos;
+            let mut fin = (debut + 700).min(source.len());
+            while fin > debut && !source.is_char_boundary(fin) {
+                fin -= 1;
+            }
+            if source[debut..fin].contains(&demarrage) {
+                total += 1;
+            }
+            curseur = debut + spawn.len();
+        }
+        total
+    }
+
+    #[test]
+    fn next_et_previous_annoncent_l_echec_qu_ils_ne_peuvent_pas_attendre() {
+        let source = include_str!("playback.rs");
+        let muets = demarrages_detaches_muets(source);
+        assert!(
+            muets.is_empty(),
+            "tune-server/src/routes/playback.rs démarre une piste dans un \
+             `tokio::spawn` sans annoncer son échec, ligne(s) {muets:?}. La \
+             réponse HTTP est déjà partie en disant « playing » : sans \
+             `orchestrator.dire_piste_non_demarree(...)`, l'échec meurt dans un \
+             `warn!` et la zone ne joue pas sans que rien ne le dise (#3270)"
+        );
+        assert_eq!(
+            nombre_de_demarrages_detaches(source),
+            2,
+            "les deux seuls démarrages de piste détachés de ce fichier sont \
+             ceux de `next` et de `previous`. Un de plus ou de moins : \
+             reprendre le recensement avant de toucher à ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur. Sans elle, `demarrages_detaches_muets`
+    /// pourrait ne rien détecter du tout et la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_un_demarrage_detache_muet() {
+        let spawn = format!("tokio::{}(async move {{", "spawn");
+        let demarrage = aiguille_demarrage();
+        let annonce = aiguille_annonce();
+
+        let prefixe = "let s = state.clone();\n";
+        let sain = format!(
+            "{prefixe}{spawn}\n    if let Err(e) = s.orchestrator.{demarrage}z, p).await {{\n \
+             s.orchestrator.{annonce}z, \"suivante\", &e);\n    }}\n}});\n"
+        );
+        assert!(
+            demarrages_detaches_muets(&sain).is_empty(),
+            "le détecteur doit accepter un démarrage détaché qui annonce"
+        );
+        assert_eq!(nombre_de_demarrages_detaches(&sain), 1);
+
+        let malade = format!(
+            "{prefixe}{spawn}\n    if let Err(e) = s.orchestrator.{demarrage}z, p).await {{\n \
+             tracing::warn!(error = %e);\n    }}\n}});\n"
+        );
+        assert_eq!(
+            demarrages_detaches_muets(&malade),
+            vec![1],
+            "le détecteur doit nommer la ligne d'un démarrage détaché muet — \
+             c'est le défaut de #3270"
+        );
+
+        // Un `tokio::spawn` qui ne démarre AUCUNE piste n'est pas un site :
+        // sans ceci, la garde exigerait une annonce de tâches sans rapport.
+        let hors_sujet = format!("{spawn}\n    faire_autre_chose().await;\n}});\n");
+        assert!(demarrages_detaches_muets(&hors_sujet).is_empty());
+        assert_eq!(nombre_de_demarrages_detaches(&hors_sujet), 0);
+
+        // Et une annonce posée très loin, hors du bloc, ne doit pas sauver.
+        let loin = format!(
+            "{prefixe}{spawn}\n    if let Err(e) = s.orchestrator.{demarrage}z, p).await {{}}\n}});\n{}\n{annonce}z);\n",
+            "// remplissage\n".repeat(60)
+        );
+        assert_eq!(demarrages_detaches_muets(&loin), vec![1]);
     }
 }

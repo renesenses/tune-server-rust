@@ -473,6 +473,25 @@ impl AppState {
     /// last one is the panel's route, and it was the one caller this function
     /// never had: written, wired twice, and still absent from the screen that
     /// needed it.
+    /// Lecteurs Sendspin découverts sur le réseau (`_sendspin._tcp`, #3326).
+    ///
+    /// Lit le même scanner mDNS que [`Self::discovered_tune_peers`]. La liste
+    /// est **descriptive** : chaque entrée porte `playable: false` et le motif,
+    /// parce que la phase 1 du chantier ne livre pas la lecture. Aucune sortie
+    /// n'est enregistrée pour ces appareils, donc aucun d'eux n'apparaît dans
+    /// `GET /devices` ni ne peut devenir une zone — ce qui est le comportement
+    /// voulu : une zone qui ne joue rien est pire que pas de zone.
+    ///
+    /// Rend une liste vide avant le démarrage de la découverte, ou quand le
+    /// multicast est bloqué (Docker macvlan, pare-feu Windows).
+    pub async fn discovered_sendspin_players(&self) -> Vec<serde_json::Value> {
+        let scanner = { self.mdns_scanner.lock().unwrap().clone() };
+        let Some(scanner) = scanner else {
+            return Vec::new();
+        };
+        tune_core::discovery::sendspin::decrire(&scanner.devices().await)
+    }
+
     pub async fn discovered_tune_peers(&self) -> Vec<serde_json::Value> {
         use tune_core::discovery::device::OutputType;
         let scanner = { self.mdns_scanner.lock().unwrap().clone() };

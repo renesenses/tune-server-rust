@@ -1206,7 +1206,15 @@ pub async fn register_local_outputs(state: &AppState) {
     // Prefer DB-persisted backend (set via UI) over config/env default
     let audio_backend_owned = state.effective_audio_backend();
     let audio_backend = &audio_backend_owned;
-    let exclusive_mode = state.effective_exclusive_mode();
+    // #3245 — le mode exclusif se décide PAR PÉRIPHÉRIQUE, dans la boucle.
+    //
+    // Ce qui est lu ici, c'est la DEMANDE : la contrainte de plateforme, elle,
+    // dépend du backend sous lequel CHAQUE sortie sera ouverte, et ce backend
+    // n'est pas le réglage global (`openable_local_backend`, #1770). Calculer
+    // `effective_exclusive_mode()` une fois puis le passer identique à chaque
+    // `LocalOutput` faisait déborder « ASIO est exclusif par nature » sur des
+    // sorties qui ne sont pas ASIO.
+    let exclusive_demande = state.requested_exclusive_mode();
     // Publish it: this is the value the outputs below are built with, and the
     // only honest answer for the signal path until the next restart.
     if let Ok(mut slot) = state.active_audio_backend.write() {
@@ -1268,13 +1276,11 @@ pub async fn register_local_outputs(state: &AppState) {
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-        let auto_create =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                .get("zone_auto_create")
-                .ok()
-                .flatten()
-                .map(|v| v != "false")
-                .unwrap_or(true);
+        // #3529 : lecture unique, portée par `ZoneRepo`. Ce chemin-ci garde sa
+        // règle propre — `local_zone_action` autorise la sortie système par
+        // défaut, c'est le sens de #1770 — mais il ne relit plus le réglage
+        // lui-même.
+        let auto_create = zone_repo.zone_auto_create_autorise();
         // Un backend est censé marquer une seule sortie par défaut. `find`
         // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
         let system_default_device_id = first_system_default_name(
@@ -1291,13 +1297,32 @@ pub async fn register_local_outputs(state: &AppState) {
             // ré-énuméré en WASAPI, si bien que ces noms-là sont des noms
             // WASAPI alors que la lecture demandera toujours l'hôte « asio »
             // (#3230).
+            // #3245 — la contrainte de plateforme se pose sur le backend
+            // OUVRABLE de CE périphérique, pas sur le réglage global. Même
+            // rectification que `with_origin_host` juste en dessous, et pour
+            // la même raison : sans elle, un nom WASAPI héritait de l'exclusif
+            // imposé par ASIO et Tune ouvrait WASAPI en mode exclusif, coupant
+            // le son de toutes les autres applications de la machine.
+            let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
+                audio_backend,
+                Some(dev.backend.as_str()),
+                exclusive_demande,
+            );
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
-                exclusive_mode,
+                statut_exclusif.effective,
                 audio_backend,
             )
             .with_origin_host(&dev.backend);
+            info!(
+                device_id = %device_id,
+                hote_origine = %dev.backend,
+                demande = exclusive_demande,
+                effectif = statut_exclusif.effective,
+                impose = statut_exclusif.forced,
+                "local_output_exclusive_mode_par_peripherique"
+            );
             // Ensemencer la sortie avec le volume stocké.
             //
             // `LocalOutput` naît à `user_volume = 1.0` et rien ne le rectifiait :
@@ -1333,11 +1358,20 @@ pub async fn register_local_outputs(state: &AppState) {
                 "local_audio_output_registered"
             );
 
-            let zone_name = if dev.is_default {
-                "This Computer".to_string()
-            } else {
-                dev.name.clone()
-            };
+            // #1770 : l'étiquette générique ne se minte qu'une fois. Changer
+            // de moteur audio change le NOM du périphérique système, donc son
+            // `device_id`, donc la ligne en base — et la sortie système WASAPI
+            // se voyait offrir un second « This Computer » à côté de celui
+            // d'ASIO (jfpaquet, 0.9.130). La mesure exclut l'appareil courant :
+            // sa propre zone ne doit pas compter contre lui.
+            let generique_deja_pris = zone_repo
+                .etiquette_generique_locale_prise(&device_id)
+                .unwrap_or(false);
+            let zone_name = tune_core::config::nom_de_zone_locale(
+                &dev.name,
+                dev.is_default,
+                generique_deja_pris,
+            );
 
             let zone_exists = zone_repo
                 .get_by_device_id(&device_id)

@@ -334,6 +334,12 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
         .route("/{id}/device-presets", get(get_device_presets))
         .route("/{id}/name", put(rename_zone))
+        // #1361 — l'album de ce qui joue, et chez qui l'ouvrir, en UNE
+        // réponse. Deux orthographes pour la même route : le dépôt en est à
+        // mi-chemin de sa francisation, et un client ne doit pas avoir à
+        // deviner de quel côté il est tombé.
+        .route("/{id}/album-en-cours", get(album_en_cours))
+        .route("/{id}/current-album", get(album_en_cours))
         .route("/sync-status", get(sync_status))
         .route("/{id}/network-health", get(network_health))
         .route("/group-delays", get(list_group_delays).put(set_group_delay))
@@ -471,6 +477,154 @@ pub(crate) fn inject_session_context(obj: &mut serde_json::Map<String, Value>, p
         "session_context_source".into(),
         json!(ps.session_context_source),
     );
+}
+
+/// L'album de ce qui joue, en UNE réponse — la fiche à ouvrir, et chez qui.
+///
+/// `GET /api/v1/zones/{id}/album-en-cours` (alias `…/current-album`).
+///
+/// # Ce qui manquait
+///
+/// **Cyrille Moutia** demande depuis le 30/06/2026, et redemande le 09/08
+/// (#1361), que le titre d'album de « Lecture en cours » ramène à l'album.
+/// Le serveur en avait déjà les morceaux, mais éparpillés, et leur assemblage
+/// était laissé au client :
+///
+/// - `session_context_type` / `_id` / `_source` disent ce que l'auditeur a
+///   DEMANDÉ — un album Qobuz, une playlist locale — mais seulement quand le
+///   geste était un conteneur. Un morceau lancé depuis une recherche donne
+///   `("track", "<id>", "qobuz")`, et l'album n'y est pas ;
+/// - `current_track.album_id` est un `i64` de la table `albums` : toujours
+///   `null` sur une piste de service ;
+/// - il restait `source` + `source_id`, l'identifiant de la PISTE, d'où un
+///   `GET /streaming/{service}/tracks/{track_id}` à faire par le client **à
+///   chaque changement de piste** pour seulement en retrouver l'album.
+///
+/// Trois provenances, trois espaces de noms, et à chaque fois la question
+/// « chez qui ouvrir ça ? ». Deviner le service depuis l'écran affiché est
+/// faux dès qu'on regarde Tidal en écoutant Qobuz — la devinette même que
+/// #1284 a condamnée pour l'album (« Entreat (2010) » ouvrait la page de The
+/// Cure).
+///
+/// # L'ordre de résolution, et pourquoi celui-là
+///
+/// 1. **le geste** (`session_context_type == "album"`). Il survit aux avances
+///    automatiques : la deuxième piste d'un album reste une écoute d'album, là
+///    où `current_track` change à chaque piste. C'est ce qui fait un « retour à
+///    l'album » STABLE ;
+/// 2. **la ligne de bibliothèque** de la piste en cours, quand il y en a une ;
+/// 3. **le service**, interrogé une fois ici plutôt qu'une fois par piste chez
+///    chaque client (`get_track` → `album_id`, le même appel que
+///    `GET /streaming/{service}/tracks/{track_id}`).
+///
+/// `origin` nomme la branche prise : un client qui trouve `service_lookup`
+/// sait qu'il a coûté un aller-retour au service, et peut décider de ne
+/// rafraîchir que sur changement de piste.
+///
+/// # Ce qui reste au client
+///
+/// Ouvrir `path`. Rien d'autre : ni recherche par titre, ni supposition de
+/// service, ni deuxième requête.
+pub(super) async fn album_en_cours(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    /// La charge utile, construite au même endroit pour les trois branches —
+    /// deux fabricants finiraient par diverger sur le chemin publié.
+    fn reponse(
+        zone_id: i64,
+        service: &str,
+        album_id: &str,
+        artist_id: Option<&str>,
+        origine: &str,
+    ) -> Value {
+        let (nature, path) = if service == "local" {
+            ("library", format!("/api/v1/library/albums/{album_id}"))
+        } else {
+            (
+                "streaming",
+                format!("/api/v1/streaming/{service}/albums/{album_id}"),
+            )
+        };
+        json!({
+            "zone_id": zone_id,
+            "kind": nature,
+            "service": service,
+            "album_id": album_id,
+            "artist_id": artist_id,
+            "path": path,
+            "origin": origine,
+        })
+    }
+    fn rien(zone_id: i64, raison: &str) -> axum::response::Response {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "zone_id": zone_id, "album_id": Value::Null, "reason": raison })),
+        )
+            .into_response()
+    }
+
+    let ps = state.playback.get_state(id).await;
+
+    // 1. Le geste.
+    if ps.session_context_type.as_deref() == Some("album")
+        && let Some(album) = ps
+            .session_context_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+    {
+        // `session_context_source` est absent des sessions ouvertes avant
+        // #1361 ; la bibliothèque est le seul autre espace de noms possible,
+        // et c'est le mot que `contexte_de_lecture` y écrit.
+        let service = ps.session_context_source.as_deref().unwrap_or("local");
+        return Json(reponse(id, service, album, None, "session_context")).into_response();
+    }
+
+    let Some(np) = ps.now_playing.as_ref() else {
+        return rien(id, "aucune_lecture");
+    };
+
+    // 2. La ligne de bibliothèque.
+    if let Some(aid) = np.album_id {
+        return Json(reponse(
+            id,
+            "local",
+            &aid.to_string(),
+            np.artist_id.map(|a| a.to_string()).as_deref(),
+            "current_track",
+        ))
+        .into_response();
+    }
+
+    // 3. Le service.
+    let (source, Some(source_id)) = (np.source.as_str(), np.source_id.as_deref()) else {
+        return rien(id, "piste_sans_identifiant_de_source");
+    };
+    if source.is_empty() || source == "local" || source == "radio" || source == "upnp" {
+        return rien(id, "source_sans_fiche_album");
+    }
+    let registre = state.services.lock().await;
+    let Some(svc) = registre.get(source) else {
+        return rien(id, "service_inconnu");
+    };
+    let svc = svc.read().await;
+    match svc.get_track(source_id).await {
+        Ok(t) => match t.album_id.as_deref().filter(|a| !a.trim().is_empty()) {
+            Some(album) => Json(reponse(
+                id,
+                source,
+                album,
+                t.artist_id.as_deref(),
+                "service_lookup",
+            ))
+            .into_response(),
+            None => rien(id, "le_service_ne_nomme_pas_d_album"),
+        },
+        Err(e) => {
+            warn!(zone_id = id, service = source, error = %e, "album_en_cours_service_injoignable");
+            rien(id, "service_injoignable")
+        }
+    }
 }
 
 /// Qui a le droit de recevoir l'adresse du flux interne — la règle, UNE fois.
@@ -612,9 +766,93 @@ pub(crate) async fn output_capabilities(
     state: &AppState,
     output_device_id: Option<&str>,
 ) -> Option<tune_core::outputs::OutputCapabilities> {
+    output_capabilities_avec(state, output_device_id, &canaux_des_peripheriques_locaux()).await
+}
+
+/// Les périphériques audio locaux tels que le serveur les a déjà énumérés.
+///
+/// `cached_audio_devices` et non `list_audio_devices` : re-énumérer WASAPI
+/// sonde chaque appareil et peut tuer un flux en cours (DEvir). Une route de
+/// lecture n'a pas le droit de faire ça.
+///
+/// Vide quand la fonctionnalité `local-audio` n'est pas compilée — la sortie
+/// locale n'existe alors pas, et il n'y a rien à déclarer.
+///
+/// Rendu en couples `(nom, max_channels)` et non en `AudioDevice` : ce type
+/// n'existe pas sans `local-audio`, et le reste de la chaîne n'a besoin que de
+/// ces deux valeurs.
+pub(crate) fn canaux_des_peripheriques_locaux() -> Vec<(String, u16)> {
+    #[cfg(feature = "local-audio")]
+    {
+        tune_core::outputs::local::cached_audio_devices()
+            .into_iter()
+            .map(|appareil| (appareil.name, appareil.max_channels))
+            .collect()
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        Vec::new()
+    }
+}
+
+/// #3322 — le contrat déclarait `channel_layouts`, le publiait, et personne ne
+/// l'écrivait jamais : vide ou nul sur les quatorze zones mesurées le
+/// 04/09/2026. Le moteur multicanal de `tune_core::audio::channels` existait
+/// depuis le portage de `feat/multichannel` et n'avait AUCUN appelant.
+///
+/// L'appelant manquant est ici : c'est cette fonction qui assemble ce que
+/// `GET /zones` et `GET /zones/{id}` remettent au client — les deux passent
+/// par elle, donc les deux publient la même chose (critère d'acceptation 4).
+///
+/// Ce qu'elle remplit, et ce qu'elle laisse vide :
+///
+/// * une sortie qui déclare déjà ses dispositions garde les siennes, sans
+///   discussion — l'enrichissement ne recouvre jamais une donnée de première
+///   main ;
+/// * une sortie LOCALE reçoit celles que son appareil sait rendre, déduites de
+///   `AudioDevice::max_channels`, la valeur que l'énumération connaît déjà et
+///   que `GET /devices/audio` publie depuis toujours ;
+/// * tout le reste — DLNA, AirPlay, Chromecast, OAAT, navigateur — reste `[]`.
+///   Les canaux d'un renderer réseau se négocient DANS le flux ; ce n'est pas
+///   une propriété locale, et aucune source du dépôt ne la porte
+///   (`sink_protocols`, le paramètre du détecteur DLNA, n'a aucun producteur).
+///   `[]` dit « on ne sait pas » ; une valeur inventée mentirait.
+///
+/// Séparée de [`output_capabilities`] et prenant la liste en paramètre pour
+/// qu'un témoin puisse l'appeler avec un parc connu, sans dépendre de la carte
+/// son de la machine qui exécute les tests.
+pub async fn output_capabilities_avec(
+    state: &AppState,
+    output_device_id: Option<&str>,
+    peripheriques: &[(String, u16)],
+) -> Option<tune_core::outputs::OutputCapabilities> {
     let device_id = output_device_id?;
     let output = { state.outputs.lock().await.get(device_id) }?;
-    Some(output.lock().await.capabilities())
+    let mut capacites = output.lock().await.capabilities();
+    if capacites.channel_layouts.is_empty() {
+        capacites.channel_layouts =
+            dispositions_du_peripherique_local(device_id, peripheriques).unwrap_or_default();
+    }
+    Some(capacites)
+}
+
+/// Les dispositions qu'un identifiant de sortie LOCALE peut déclarer.
+///
+/// `None` dès que le lien n'est pas établi : identifiant qui n'est pas
+/// `local:…`, appareil absent du parc énuméré, ou `max_channels` à zéro. Aucun
+/// de ces trois cas ne se rattrape par une supposition.
+///
+/// L'identifiant est construit par `format!("local:{}", dev.name)` au moment
+/// de l'enregistrement (`startup.rs`, `background.rs`) : c'est ce même nom qui
+/// sert de clé ici.
+fn dispositions_du_peripherique_local(
+    device_id: &str,
+    peripheriques: &[(String, u16)],
+) -> Option<Vec<String>> {
+    let nom = device_id.strip_prefix("local:")?;
+    let (_, max_channels) = peripheriques.iter().find(|(n, _)| n == nom)?;
+    let dispositions = tune_core::audio::channels::ChannelLayout::noms_jusqu_a(*max_channels);
+    (!dispositions.is_empty()).then_some(dispositions)
 }
 
 /// La sortie enregistrée pour une zone ne sait-elle mettre en attente qu'un
@@ -742,7 +980,13 @@ mod ecriture;
 pub use ecriture::*;
 
 mod peripheriques;
+mod preconfiguration;
+
+// La découverte (`discovery_setup.rs`) crée des zones sans passer par le
+// routeur : elle a besoin des deux mêmes gestes que `POST /zones`.
 pub use peripheriques::*;
+pub(crate) use preconfiguration::ouvrir_provenance as ouvrir_provenance_de_zone;
+pub(crate) use preconfiguration::preconfigurer_zone as preconfigurer_zone_decouverte;
 
 mod groupes;
 pub use groupes::*;

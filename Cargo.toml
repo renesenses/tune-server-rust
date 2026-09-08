@@ -3,7 +3,14 @@
 # (caisses extraites), `rc` ajoute `plugins/tune-concerts` (#2768). Une liste
 # de membres est un inventaire, pas un echantillon — en retirer un le sort de
 # `--workspace`, donc de la porte, sans que rien ne rougisse.
-members = ["tune-core", "tune-http-types", "tune-server", "tune-smart-http", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp", "plugins/tune-concerts"]
+#
+# `tune-output-api` est INSCRIT depuis #3266, alors qu'il etait deja membre :
+# cargo promeut membre toute dependance `path` interne, et `tune-core` le prend
+# ainsi (`tune-core/Cargo.toml:9`). Membre implicite, il echappait a tout ce qui
+# lit cette liste — dont la garde `cargo test`, qui restait verte pendant que
+# ses SEPT essais n'etaient executes par aucune porte. Le rendre explicite ne
+# change rien pour cargo ; ca rend l'inventaire vrai.
+members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tune-smart-http", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp", "plugins/tune-concerts"]
 # tune-desktop and tune-widget are Tauri apps, each with its own workspace and
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
@@ -12,7 +19,7 @@ exclude = ["tune-desktop", "tune-widget"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.140"
+version = "0.9.142"
 edition = "2024"
 # Business Source License 1.1 (see LICENSE). SPDX id BUSL-1.1 — NOT MIT: the
 # old value misdeclared far broader rights to audit/SBOM tools (issue #1147).

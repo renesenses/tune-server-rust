@@ -174,6 +174,16 @@ pub mod sql {
             d.placeholder(2)
         )
     }
+    /// Artiste d'album ET titre d'un seul geste — voir
+    /// [`AlbumRepo::reclasser_en_compilation`] (#3232).
+    pub fn set_artist_and_title<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET artist_id = {}, title = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
 
     /// Albums qui portent la signature étroite du collage #2458.
     ///
@@ -289,10 +299,13 @@ pub mod sql {
         )
     }
 
+    /// Le compte des PRÉSENTATIONS de l'album, pas de ses lignes de table
+    /// (#1362) — voir
+    /// [`sql_compte_pistes_visibles`](crate::db::track_repo::sql_compte_pistes_visibles).
     pub fn update_track_count<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE albums SET track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = {}) WHERE id = {}",
-            d.placeholder(1),
+            "UPDATE albums SET track_count = {} WHERE id = {}",
+            crate::db::track_repo::sql_compte_pistes_visibles(&d.placeholder(1)),
             d.placeholder(2)
         )
     }
@@ -496,6 +509,35 @@ impl DrRange {
     }
 }
 
+/// Le Dynamic Range d'un album, et **d'où il sort** (#1388).
+///
+/// La valeur seule ne suffit pas à l'écran : un album tagué `ALBUM DYNAMIC
+/// RANGE=12` et un album dont les dix pistes moyennent 12 donnent le même
+/// nombre, et ne se disent pas de la même façon. Le premier est une mesure
+/// écrite par un mesureur, le second une déduction de Tune.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicRangeAlbum {
+    /// Le DR, en entier. `0` est une VALEUR — celle d'un master saturé — et
+    /// non une absence : l'absence, c'est le `None` qui enveloppe cette
+    /// structure.
+    pub valeur: i64,
+    /// `true` quand au moins une piste porte le tag d'album `ALBUM DYNAMIC
+    /// RANGE` ; `false` quand la valeur est la moyenne arrondie des tags
+    /// `DYNAMIC RANGE` des pistes.
+    pub depuis_le_tag_album: bool,
+}
+
+impl DynamicRangeAlbum {
+    /// L'étiquette stable que porte la réponse HTTP, à traduire côté client.
+    pub fn source(&self) -> &'static str {
+        if self.depuis_le_tag_album {
+            "album_tag"
+        } else {
+            "track_average"
+        }
+    }
+}
+
 /// Bilan d'une absorption (BIB-A2, phase 1) : ce qui a suivi le doublon
 /// jusqu'à l'album conservé.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -623,8 +665,8 @@ impl AlbumRepo {
         let params_cible: [&dyn ToSqlValue; 1] = [&cible];
         self.db.execute(
             &format!(
-                "UPDATE albums SET track_count = \
-                 (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id) WHERE id = {p1}"
+                "UPDATE albums SET track_count = {} WHERE id = {p1}",
+                crate::db::track_repo::sql_compte_pistes_visibles("albums.id")
             ),
             &params_cible,
         )?;
@@ -1370,6 +1412,33 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// Reprend une ligne album créée sous une décision « compilation »
+    /// PARTIELLE : artiste d'album, titre, drapeau.
+    ///
+    /// 🔴 #3232 — un dossier plus gros qu'un lot de scan ne tient pas dans un
+    /// lot (le lot porte les pochettes embarquées) : il est coupé, et le
+    /// premier morceau crée la ligne album avant que le scan ait vu le reste
+    /// du dossier. Sur l'anthologie de Pierre M, le premier morceau ne montre
+    /// qu'un artiste — l'album naît sous son nom, sans drapeau — et c'est le
+    /// second qui révèle la compilation. La décision porte sur le DOSSIER : la
+    /// ligne est donc reprise, au lieu de rester ce que le hasard du découpage
+    /// en avait fait.
+    ///
+    /// Écriture ciblée, et non un `update` complet : la ligne a pu recevoir
+    /// entre-temps sa pochette et ses dates, qu'un `UPDATE` de toutes les
+    /// colonnes depuis une copie en cache effacerait.
+    pub fn reclasser_en_compilation(
+        &self,
+        album_id: i64,
+        artist_id: i64,
+        titre: &str,
+    ) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::set_artist_and_title, sql::set_artist_and_title);
+        let params: [&dyn ToSqlValue; 3] = [&artist_id, &titre, &album_id];
+        self.db.execute(&sql, &params)?;
+        self.mark_compilation(album_id)
+    }
+
     /// Like `get_by_title_and_artist` but uses `query_one_strong` to
     /// read through the write connection. Called by `get_or_create` /
     /// `get_or_create_with_mbid` which run inside a scanner
@@ -1751,10 +1820,66 @@ impl AlbumRepo {
     /// so every list was empty. Cast the column to TEXT first so the
     /// expression is valid whichever type the column has; NULLIF guards
     /// against empty strings. Valid on SQLite too (soft affinities).
-    pub(crate) const ADDED_AT_JOIN: &'static str = "LEFT JOIN (SELECT t.album_id, \
+    /// ⚠️ L'expression elle-même vit dans [`Self::ADDED_AT_SOURCE`] : le tri
+    /// (cette jointure) et la LECTURE de la valeur ([`Self::added_at_by_ids`])
+    /// doivent mesurer la même chose, sans quoi la grille trierait par une
+    /// date qu'elle n'affiche pas — c'est exactement le défaut #3397.
+    pub(crate) fn added_at_join() -> String {
+        format!(
+            "LEFT JOIN ({} GROUP BY t.album_id) aa ON aa.album_id = a.id",
+            Self::ADDED_AT_SOURCE
+        )
+    }
+
+    /// Le tronc commun de la date d'ajout : tout sauf le `GROUP BY` et
+    /// l'enveloppe, pour que la jointure de tri et la lecture par page en
+    /// partagent l'expression AU CARACTÈRE PRÈS (#3397). Recopiée, elle
+    /// dériverait, et le tri « Ajout récent » cesserait de correspondre à la
+    /// date rendue.
+    pub(crate) const ADDED_AT_SOURCE: &'static str = "SELECT t.album_id, \
                 MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))) AS added_at \
-           FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
-           GROUP BY t.album_id) aa ON aa.album_id = a.id";
+           FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path";
+
+    /// La date d'ajout des albums de la PAGE, en une requête groupée (#3397).
+    ///
+    /// Même expression que [`Self::added_at_join`] ; la seule différence est
+    /// la borne : ici on ne mesure QUE les identifiants déjà retenus par le
+    /// 1er temps de #1269, jamais toute la bibliothèque. `idx_tracks_album_id`
+    /// existe sur les deux moteurs, donc le `IN` se lit par l'index.
+    ///
+    /// C'est ce qui permet de renseigner `added_at` sur TOUS les tris sans
+    /// reposer la jointure — et sans toucher au plan du 1er temps.
+    ///
+    /// Les identifiants viennent de la base et sont des entiers : ils
+    /// s'inlinent sans marqueur, comme la matérialisation de la page juste
+    /// en dessous, et par tranches pour la même raison (limite de longueur
+    /// SQL de SQLite).
+    pub(crate) fn added_at_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, f64>, TuneError> {
+        let mut par_id = std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "{} WHERE t.album_id IN ({id_list}) GROUP BY t.album_id",
+                Self::ADDED_AT_SOURCE
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                if let (Some(id), Some(at)) = (
+                    row.first().and_then(|v| v.as_i64()),
+                    row.get(1).and_then(|v| v.as_f64()),
+                ) {
+                    par_id.insert(id, at);
+                }
+            }
+        }
+        Ok(par_id)
+    }
 
     /// Jointure GROUPÉE qui donne le Dynamic Range de CHAQUE album en une
     /// passe, exposé sous l'alias `dr.dr` (#2144).
@@ -2056,7 +2181,15 @@ impl AlbumRepo {
             // are sorted" report (Bilou, #1102).
             // The timestamp itself comes from `ADDED_AT_JOIN`, computed ONCE
             // for the whole page — see the comment on that constant (#1269).
-            "added_at" | "added_date" => format!("aa.added_at {dir} NULLS LAST, a.id {dir}"),
+            // `added` est le troisième nom de la même option : c'est celui que
+            // l'issue #3397 mesure (`?sort=added&order=desc`), et celui que
+            // `CollectionSort::parse` accepte déjà pour les dossiers. Sans
+            // l'alias il retombait sur `a.id` — un tri qui *paraît* juste sur
+            // les derniers albums ajoutés (leurs ids sont les plus hauts) et
+            // faux partout ailleurs, exactement le défaut #1102.
+            "added_at" | "added_date" | "added" => {
+                format!("aa.added_at {dir} NULLS LAST, a.id {dir}")
+            }
             // Dynamic Range (#2144). `NULLS LAST` dans LES DEUX sens : un
             // album sans tag n'a pas un DR bas, il n'en a pas — le ranger avec
             // les masters saturés serait un mensonge, et le testeur qui trie
@@ -2155,7 +2288,10 @@ impl AlbumRepo {
         //
         // 1er temps : trier des lignes ÉTROITES — a.id et la clé de tri
         // seulement — et borner en SQL (LIMIT/OFFSET).
-        let added_at_sort = matches!(sort, "added_at" | "added_date");
+        // Les MÊMES clés que la branche `added_at` d'`order_clause` : la
+        // jointure qui fournit `aa.added_at` doit être posée pour chacune,
+        // sinon `ORDER BY aa.added_at` référence une table absente.
+        let added_at_sort = matches!(sort, "added_at" | "added_date" | "added");
         // #3074 — la colonne de melange n'est calculee QUE pour
         // `sort=random` : le SQL de tous les autres tris ne bouge pas d'un
         // caractere, et le plan de #1269 est preserve tel quel.
@@ -2163,11 +2299,12 @@ impl AlbumRepo {
             (sort == "random").then(|| Self::melange_aleatoire_sql("a.id", seed.unwrap_or(0)));
         let mut joins = "LEFT JOIN artists ar ON a.artist_id = ar.id".to_string();
         if added_at_sort {
-            // `aa.added_at` vient de la jointure groupée `ADDED_AT_JOIN` —
-            // une seule passe sur tracks/file_first_seen, exposée en 2e
-            // colonne pour que le client puisse rendre sa frise chronologique.
+            // `aa.added_at` vient de la jointure groupée `added_at_join()` —
+            // une seule passe sur tracks/file_first_seen. Elle n'est posée que
+            // pour le TRI : la valeur rendue au client, elle, se lit plus bas
+            // sur la page bornée, quel que soit le tri (#3397).
             joins.push(' ');
-            joins.push_str(Self::ADDED_AT_JOIN);
+            joins.push_str(&Self::added_at_join());
         }
         // La jointure DR n'est posée QUE si on trie ou filtre dessus : le
         // listage par défaut garde le SQL — et le plan — de #1269 au caractère
@@ -2176,9 +2313,11 @@ impl AlbumRepo {
             joins.push(' ');
             joins.push_str(&Self::dr_album_join(self.db.engine()));
         }
-        let id_select = if added_at_sort {
-            format!("SELECT a.id, aa.added_at FROM albums a {joins}")
-        } else if let Some(rnd) = rnd_expr.as_deref() {
+        // #3397 — le 1er temps ne rend plus QUE des identifiants, y compris
+        // en tri par date d'ajout : `aa.added_at` reste lisible par `ORDER BY`
+        // depuis la jointure sans figurer dans la liste de colonnes. La date
+        // n'a plus qu'UNE source de lecture, la même pour tous les tris.
+        let id_select = if let Some(rnd) = rnd_expr.as_deref() {
             // La colonne calculee reste dans le 1er temps de #1269 : on trie
             // des lignes ETROITES (id + valeur de melange), jamais les vingt-
             // cinq colonnes de l'album.
@@ -2199,21 +2338,29 @@ impl AlbumRepo {
             .iter()
             .filter_map(|r| r.first().and_then(|v| v.as_i64()))
             .collect();
-        let added_at_by_id: std::collections::HashMap<i64, f64> = if added_at_sort {
-            rows.iter()
-                .filter_map(|r| {
-                    Some((
-                        r.first().and_then(|v| v.as_i64())?,
-                        r.get(1).and_then(|v| v.as_f64())?,
-                    ))
-                })
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
         if ordered_ids.is_empty() {
             return Ok(Vec::new());
         }
+
+        // #3397 — la date d'ajout se lit ICI, sur la page déjà bornée, pour
+        // TOUS les tris. Avant, elle n'était extraite que du 1er temps du tri
+        // par date : `GET /library/albums?sort=title` rendait `added_at: null`
+        // sur les 50 lignes, et l'écran ne pouvait pas proposer « Ajout
+        // récent » (#3351) — la route triait par une date qu'elle taisait.
+        //
+        // Un échec ici ne doit pas vider la grille : la page reste servie,
+        // sans la date, exactement comme avant le correctif. Une base ancienne
+        // sans `file_first_seen` a déjà valu un écran noir (#1269).
+        let added_at_by_id = match self.added_at_by_ids(&ordered_ids) {
+            Ok(par_id) => par_id,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "added_at_by_ids a échoué — page servie sans date d'ajout"
+                );
+                std::collections::HashMap::new()
+            }
+        };
 
         // 2e temps : ne matérialiser QUE la page. Ids issus de la base (i64),
         // inlinés sans placeholder — par tranches, pour rester sous la
@@ -2530,37 +2677,66 @@ impl AlbumRepo {
 
     /// Bio provenance (source, url, license, lang, fetched_at) for the
     /// album-detail endpoint. Returns None when no sourced bio is recorded.
-    /// The album's Dynamic Range, as tagged by an external analyser.
+    /// The album's Dynamic Range, and WHERE it comes from (#1388).
     ///
-    /// The value is written per track by the scanner (`track_metadata['dr_album']`,
-    /// read from the Vorbis `ALBUM DYNAMIC RANGE` field) because that is where
-    /// the tag physically lives — in each file — while it describes the album as
-    /// a whole. Any one track therefore answers for the album, hence `LIMIT 1`.
+    /// `None` when the album has no DR at all — the common case, tagging DR
+    /// being a deliberate step most libraries never take. The caller must
+    /// render nothing at all rather than an empty field, and above all not a
+    /// zero: DR0 is the real measurement of a crushed master.
     ///
-    /// Returns `None` when no track carries the tag, which is the common case:
-    /// tagging DR is a deliberate step most libraries never take. The caller
-    /// must render nothing at all rather than an empty field.
-    pub fn dynamic_range(&self, id: i64) -> Result<Option<String>, TuneError> {
-        let sql = match self.db.engine() {
-            Engine::Sqlite => {
-                "SELECT tm.value FROM track_metadata tm \
-                 JOIN tracks t ON t.id = tm.track_id \
-                 WHERE t.album_id = ? AND tm.key = 'dr_album' AND tm.value <> '' \
-                 LIMIT 1"
-            }
-            Engine::Postgres => {
-                "SELECT tm.value FROM track_metadata tm \
-                 JOIN tracks t ON t.id = tm.track_id \
-                 WHERE t.album_id = $1 AND tm.key = 'dr_album' AND tm.value <> '' \
-                 LIMIT 1"
-            }
+    /// ## Une seule règle, celle qui a des consommateurs
+    ///
+    /// Cette lecture passe désormais par [`facet_filter::DR_ALBUM_VALUE`],
+    /// exactement l'expression du tri, de la tranche et du rail de facettes
+    /// (#2144). Elle prenait auparavant `tm.value` d'une piste au hasard
+    /// (`LIMIT 1`, sans `ORDER BY`) et sans la garde « rien que des chiffres ».
+    /// Deux écarts s'en suivaient, mesurables tous les deux :
+    ///
+    /// - un album ré-tagué à moitié affichait le DR d'une piste tirée au sort
+    ///   par le plan d'exécution, quand le tri, lui, en retenait le maximum ;
+    /// - un album tagué `ALBUM DYNAMIC RANGE=14 dB` (valeur non numérique, que
+    ///   `normalise_dr` laisse telle quelle) affichait « DR 14 dB » sur sa
+    ///   fiche alors qu'il restait invisible au tri comme à la facette.
+    ///
+    /// Le second cas perd donc son badge. C'est voulu : trois consommateurs
+    /// contre un, et un badge que la facette ignore est un badge qui ment.
+    pub fn dynamic_range_detail(&self, id: i64) -> Result<Option<DynamicRangeAlbum>, TuneError> {
+        let engine = self.db.engine();
+        let marqueur = match engine {
+            Engine::Sqlite => "?",
+            Engine::Postgres => "$1",
         };
+        let sql = format!(
+            "SELECT {}, {} FROM track_metadata tm \
+             JOIN tracks tdr ON tdr.id = tm.track_id \
+             WHERE tdr.album_id = {marqueur} AND {} \
+             GROUP BY tdr.album_id",
+            crate::db::facet_filter::DR_ALBUM_VALUE,
+            crate::db::facet_filter::DR_ALBUM_FROM_TAG,
+            crate::db::facet_filter::dr_tag_where(engine),
+        );
         let params: [&dyn ToSqlValue; 1] = [&id];
+        let Some(cols) = self.db.query_one(&sql, &params)? else {
+            return Ok(None);
+        };
+        // `COALESCE` rend NULL quand le groupe n'a QUE des lignes écartées —
+        // impossible avec le `WHERE` ci-dessus, mais un `unwrap` ici tuerait la
+        // fiche entière pour un DR manquant.
+        let Some(valeur) = cols.first().and_then(|v| v.as_i64()) else {
+            return Ok(None);
+        };
+        Ok(Some(DynamicRangeAlbum {
+            valeur,
+            depuis_le_tag_album: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0) == 1,
+        }))
+    }
+
+    /// Le DR de l'album, en texte, pour la fiche. Voir
+    /// [`Self::dynamic_range_detail`] pour la règle et sa provenance.
+    pub fn dynamic_range(&self, id: i64) -> Result<Option<String>, TuneError> {
         Ok(self
-            .db
-            .query_one(sql, &params)?
-            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
-            .filter(|s| !s.trim().is_empty()))
+            .dynamic_range_detail(id)?
+            .map(|dr| dr.valeur.to_string()))
     }
 
     pub fn bio_provenance(&self, id: i64) -> Result<Option<serde_json::Value>, TuneError> {
@@ -2710,9 +2886,11 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
         // Index 24: a.is_compilation (#1957). Voir [`drapeau_compilation`] :
         // même décodeur que les routes qui bâtissent leur JSON à la main.
         is_compilation: drapeau_compilation(cols.get(24)),
-        // Index 25: added_at — absent de la plupart des requêtes (None) ;
-        // le listing trié par date d'ajout le renseigne après coup, depuis
-        // sa première passe (#1269).
+        // Index 25: added_at — `select_album()` s'arrête à `is_compilation`,
+        // donc la colonne est absente ici (None). Le listage de la
+        // Bibliothèque la renseigne après coup, pour TOUS les tris, depuis
+        // `added_at_by_ids` (#3397 ; auparavant depuis la seule première
+        // passe du tri par date, #1269).
         added_at: cols.get(25).and_then(|v| v.as_f64()),
         disc_count: cols.get(7).and_then(|v| v.as_i64()).map(|n| n as i32),
         track_count: cols.get(8).and_then(|v| v.as_i64()).map(|n| n as i32),
@@ -3549,6 +3727,73 @@ mod tests {
         assert_eq!(album.track_count, Some(2));
     }
 
+    /// Pose un album et ses pistes, et rend `(compte enregistré, lignes vues à
+    /// l'écran)`. Les deux viennent des fonctions RÉELLES —
+    /// `AlbumRepo::update_track_count` et
+    /// `track_repo::dedup_display_tracks` — pas d'une transcription de leur
+    /// SQL : c'est le seul montage qui garde le comportement.
+    fn compte_et_lignes_vues(pistes: &[(i32, i32, &str, &str)]) -> (Option<i32>, usize) {
+        let db = test_db();
+        let album_repo = AlbumRepo::new(db.clone());
+        let track_repo = crate::db::track_repo::TrackRepo::new(db);
+        let alid = album_repo
+            .create(&Album::new("Melody Nelson".into()))
+            .unwrap();
+        for (i, (disque, numero, titre, format)) in pistes.iter().enumerate() {
+            let mut t = crate::db::models::Track::new((*titre).to_string());
+            t.album_id = Some(alid);
+            t.disc_number = *disque;
+            t.track_number = *numero;
+            t.format = Some((*format).to_string());
+            t.sample_rate = Some(44100);
+            t.bit_depth = Some(16);
+            t.file_path = Some(format!("/musique/melody/{i}.{format}"));
+            track_repo.create(&t).unwrap();
+        }
+        album_repo.update_track_count(alid).unwrap();
+        let compte = album_repo.get(alid).unwrap().unwrap().track_count;
+        let vues =
+            crate::db::track_repo::dedup_display_tracks(track_repo.list_by_album(alid).unwrap())
+                .len();
+        (compte, vues)
+    }
+
+    /// #1362 — le cas de **Cyrille Moutia** : un CD rippé en AIFF, plus le même
+    /// morceau récupéré ailleurs en AAC et posé dans le dossier de l'album.
+    ///
+    /// L'écran replie les deux copies, la file n'en enfile qu'une : le compte
+    /// de l'album doit dire la même chose qu'eux. Comptées comme des lignes,
+    /// les quatre pistes en annonçaient quatre pour trois montrées — et
+    /// l'album, ne pouvant plus jamais égaler son propre total, restait
+    /// « commencé » à vie dans `GET /home`.
+    #[test]
+    fn le_compte_de_pistes_est_celui_que_l_ecran_montre() {
+        let (compte, vues) = compte_et_lignes_vues(&[
+            (1, 1, "Ballade De Melody Nelson", "aiff"),
+            (1, 6, "Melody", "aiff"),
+            (1, 6, "Melody", "aac"),
+            (1, 7, "Glory Box", "aiff"),
+        ]);
+        assert_eq!(vues, 3, "l'écran replie les deux copies de « Melody »");
+        assert_eq!(compte, Some(3), "le compte enregistré dit la même chose");
+    }
+
+    /// Contre-épreuve : sans copie en trop, rien ne bouge. Le même titre sur
+    /// deux DISQUES d'un coffret reste deux pistes, et deux morceaux distincts
+    /// portant le même numéro sur deux disques aussi.
+    #[test]
+    fn un_album_sans_copie_en_trop_garde_son_compte() {
+        let (compte, vues) = compte_et_lignes_vues(&[
+            (1, 1, "Ballade De Melody Nelson", "aiff"),
+            (1, 6, "Melody", "aiff"),
+            (1, 7, "Glory Box", "aiff"),
+            (2, 6, "Melody", "aiff"),
+            (2, 7, "Roads", "aiff"),
+        ]);
+        assert_eq!(vues, 5);
+        assert_eq!(compte, Some(5));
+    }
+
     #[test]
     fn unicode_album_title() {
         let db = test_db();
@@ -4149,6 +4394,205 @@ mod tests {
         // DR0 is a real measurement on a crushed master, not an absence.
         mrepo.set(id1, "dr_album", "0").unwrap();
         assert_eq!(arepo.dynamic_range(album_id).unwrap().as_deref(), Some("0"));
+        assert!(
+            arepo
+                .dynamic_range_detail(album_id)
+                .unwrap()
+                .unwrap()
+                .depuis_le_tag_album,
+            "un DR0 tagué reste une MESURE, pas une déduction"
+        );
+    }
+
+    /// La valeur d'ALBUM quand seules les pistes sont taguées (#1388).
+    ///
+    /// foobar2000 écrit `DYNAMIC RANGE` par piste et rien pour l'album. La
+    /// fiche restait alors muette alors que chaque piste affichait son DR : le
+    /// titre de l'issue demande les deux. La valeur d'album est la moyenne
+    /// arrondie des pistes, et elle se DIT comme une déduction.
+    #[test]
+    fn le_dr_dalbum_se_deduit_de_la_moyenne_des_pistes_quand_le_tag_dalbum_manque() {
+        use crate::db::models::Track;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use crate::db::track_repo::TrackRepo;
+
+        let db = db_avec_track_metadata();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+        let mrepo = TrackMetadataRepo::new(db.clone());
+
+        let album_id = arepo.create(&Album::new("Spirit of Eden".into())).unwrap();
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let mut t = Track::new(format!("piste {n}"));
+            t.album_id = Some(album_id);
+            t.file_path = Some(format!("/m/soe-{n}.flac"));
+            ids.push(trepo.create(&t).unwrap());
+        }
+
+        // Aucun tag : rien. C'est le cas courant, et il ne bouge pas.
+        assert_eq!(arepo.dynamic_range_detail(album_id).unwrap(), None);
+
+        // 12, 13, 13 → moyenne 12,67 → DR13, annoncée comme une déduction.
+        mrepo.set(ids[0], "dr_track", "12").unwrap();
+        mrepo.set(ids[1], "dr_track", "13").unwrap();
+        mrepo.set(ids[2], "dr_track", "13").unwrap();
+        let dr = arepo.dynamic_range_detail(album_id).unwrap().unwrap();
+        assert_eq!(dr.valeur, 13);
+        assert!(!dr.depuis_le_tag_album);
+        assert_eq!(dr.source(), "track_average");
+        assert_eq!(
+            arepo.dynamic_range(album_id).unwrap().as_deref(),
+            Some("13")
+        );
+
+        // Contre-épreuve : dès qu'UNE piste porte le tag d'ALBUM, c'est lui qui
+        // gagne — même plus bas que la moyenne. C'est la valeur écrite par le
+        // mesureur, pas une valeur que Tune recalcule.
+        mrepo.set(ids[2], "dr_album", "9").unwrap();
+        let dr = arepo.dynamic_range_detail(album_id).unwrap().unwrap();
+        assert_eq!(dr.valeur, 9);
+        assert!(dr.depuis_le_tag_album);
+        assert_eq!(dr.source(), "album_tag");
+    }
+
+    /// Un DR déduit des pistes est aussi TRIABLE et FILTRABLE (#1388/#2144).
+    ///
+    /// La fiche et la grille doivent tomber d'accord : afficher « DR13 » sur un
+    /// album que la facette DR ne connaît pas serait un badge qui ment. Le
+    /// témoin appelle les DEUX chemins sur le même album.
+    #[test]
+    fn un_dr_deduit_des_pistes_est_aussi_visible_du_tri_et_de_la_tranche() {
+        use crate::db::models::Track;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use crate::db::track_repo::TrackRepo;
+
+        let db = db_avec_track_metadata();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+        let mrepo = TrackMetadataRepo::new(db.clone());
+
+        let album_id = arepo.create(&Album::new("Laughing Stock".into())).unwrap();
+        let mut t = Track::new("Ascension Day".into());
+        t.album_id = Some(album_id);
+        t.file_path = Some("/m/ls-1.flac".into());
+        let tid = trepo.create(&t).unwrap();
+        // Un album témoin SANS aucun tag : il ne doit jamais entrer dans une
+        // tranche, avant comme après.
+        album_avec_dr(&db, "Sans DR", None);
+
+        let tranche = |min, max| {
+            arepo
+                .list_filtered(
+                    100,
+                    0,
+                    "dynamic_range",
+                    "desc",
+                    None,
+                    None,
+                    None,
+                    true,
+                    DrRange::new(min, max),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|a| a.title)
+                .collect::<Vec<_>>()
+        };
+
+        // Sans aucun tag, l'album n'est ni dans la tranche ni dans les valeurs.
+        assert!(tranche(Some(13), Some(13)).is_empty());
+        assert!(arepo.dynamic_range_values().unwrap().is_empty());
+
+        mrepo.set(tid, "dr_track", "13").unwrap();
+        assert_eq!(
+            arepo
+                .dynamic_range_detail(album_id)
+                .unwrap()
+                .unwrap()
+                .valeur,
+            13
+        );
+        assert_eq!(tranche(Some(13), Some(13)), vec!["Laughing Stock"]);
+        assert_eq!(arepo.dynamic_range_values().unwrap(), vec![13]);
+        // Et l'album jamais tagué reste dehors, même d'une tranche assez large
+        // pour contenir tous les DR possibles : une tranche est RESTRICTIVE.
+        // (`DrRange::new(None, None)` ne serait PAS une tranche large mais
+        // l'ABSENCE de filtre — piège n°1 de `facet_filter`.)
+        assert_eq!(tranche(Some(0), Some(30)), vec!["Laughing Stock"]);
+    }
+
+    /// Un album ré-tagué à moitié : la fiche et le tri retiennent le MÊME
+    /// nombre.
+    ///
+    /// La fiche lisait `tm.value` d'une piste au hasard (`LIMIT 1`, sans
+    /// `ORDER BY`) là où le tri retenait le maximum. Sur un album dont deux
+    /// pistes portent 10 et 14, la fiche pouvait afficher 10 pendant que la
+    /// tranche `[14, 14]` le rendait. Le témoin appelle les deux.
+    #[test]
+    fn la_fiche_et_la_tranche_saccordent_sur_un_album_retague_a_moitie() {
+        use crate::db::models::Track;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use crate::db::track_repo::TrackRepo;
+
+        let db = db_avec_track_metadata();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+        let mrepo = TrackMetadataRepo::new(db.clone());
+
+        let album_id = arepo.create(&Album::new("Kid A".into())).unwrap();
+        for (n, valeur) in ["10", "14"].iter().enumerate() {
+            let mut t = Track::new(format!("piste {n}"));
+            t.album_id = Some(album_id);
+            t.file_path = Some(format!("/m/ka-{n}.flac"));
+            let tid = trepo.create(&t).unwrap();
+            mrepo.set(tid, "dr_album", valeur).unwrap();
+        }
+
+        let fiche = arepo.dynamic_range_detail(album_id).unwrap().unwrap();
+        assert_eq!(fiche.valeur, 14);
+        let dans_la_tranche = |min, max| {
+            !arepo
+                .list_filtered(
+                    100,
+                    0,
+                    "dynamic_range",
+                    "desc",
+                    None,
+                    None,
+                    None,
+                    true,
+                    DrRange::new(min, max),
+                )
+                .unwrap()
+                .is_empty()
+        };
+        assert!(dans_la_tranche(Some(fiche.valeur), Some(fiche.valeur)));
+        // Contre-épreuve : la valeur que la fiche NE retient PAS ne classe pas
+        // non plus l'album.
+        assert!(!dans_la_tranche(Some(10), Some(10)));
+    }
+
+    /// Un tag non numérique n'est affiché nulle part — parce qu'il n'est déjà
+    /// classé nulle part (#1388).
+    ///
+    /// `normalise_dr` laisse « 14 dB » tel quel. La fiche l'affichait
+    /// (« DR 14 dB ») alors que le tri, la tranche et la facette l'ignoraient
+    /// tous les trois. Une seule règle : celle qui a trois consommateurs.
+    #[test]
+    fn un_tag_dr_non_numerique_nest_ni_affiche_ni_classe() {
+        let db = db_avec_track_metadata();
+        let arepo = AlbumRepo::new(db.clone());
+        let bancal = album_avec_dr(&db, "Bancal", Some("14 dB"));
+        let propre = album_avec_dr(&db, "Propre", Some("14"));
+
+        assert_eq!(arepo.dynamic_range_detail(bancal).unwrap(), None);
+        assert_eq!(
+            arepo.dynamic_range_detail(propre).unwrap().unwrap().valeur,
+            14
+        );
+        // Et la facette ne connaissait déjà que le second.
+        assert_eq!(arepo.dynamic_range_values().unwrap(), vec![14]);
     }
 
     // ------------------------------------------------------------------
@@ -4517,6 +4961,11 @@ mod tests {
         let canon = titles(arepo.list_sorted(100, 0, "added_at", "desc").unwrap());
         let alias = titles(arepo.list_sorted(100, 0, "added_date", "desc").unwrap());
         assert_eq!(alias, canon, "added_date must alias added_at");
+        // #3397 — `added` est le mot-clé mesuré dans l'issue. Sans alias il
+        // retombait sur `a.id` : ici les ids sont A<B<C alors que la date
+        // d'ajout fait A>B>C, donc le repli sur l'id rendrait C,B,A.
+        let alias_court = titles(arepo.list_sorted(100, 0, "added", "desc").unwrap());
+        assert_eq!(alias_court, canon, "added doit aliaser added_at (#3397)");
         assert_eq!(
             alias,
             vec!["A", "B", "C"],
@@ -4591,6 +5040,77 @@ mod tests {
         let asc = arepo.list_sorted(100, 0, "added_at", "asc").unwrap();
         assert_eq!(asc[0].title, "C");
         assert_eq!(asc[2].title, "A");
+    }
+
+    /// #3397 — la date d'ajout ne dépend PAS du tri demandé.
+    ///
+    /// Avant, `added_at` n'était extrait que du 1er temps du tri par date :
+    /// tout autre tri rendait `null`, y compris sur les albums que le tri par
+    /// date venait d'ordonner. Le témoin compare les DEUX formes album par
+    /// album : la valeur doit être la même sous chaque clé de tri.
+    #[test]
+    fn added_at_est_rendu_sous_tous_les_tris_3397() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        for (titre, chemin, mtime) in [
+            ("Amnesiac", "/a.flac", 1000.0),
+            ("Kid A", "/b.flac", 2000.0),
+            ("OK Computer", "/c.flac", 3000.0),
+        ] {
+            let id = arepo.create(&Album::new(titre.into())).unwrap();
+            let mut t = Track::new("piste".into());
+            t.album_id = Some(id);
+            t.file_path = Some(chemin.into());
+            t.file_mtime = Some(mtime);
+            trepo.create(&t).unwrap();
+        }
+
+        // La référence : ce que rend le chemin qui TRIE par date d'ajout.
+        let reference: std::collections::HashMap<i64, Option<f64>> = arepo
+            .list_sorted(100, 0, "added_at", "desc")
+            .unwrap()
+            .iter()
+            .map(|a| (a.id.unwrap(), a.added_at))
+            .collect();
+        assert_eq!(reference.len(), 3, "trois albums attendus : {reference:?}");
+        assert!(
+            reference.values().all(Option::is_some),
+            "le chemin de référence doit dater les trois albums : {reference:?}"
+        );
+
+        for tri in ["title", "artist", "year", "release_date", "id", "random"] {
+            let page = arepo.list_sorted(100, 0, tri, "asc").unwrap();
+            assert_eq!(page.len(), 3, "tri {tri} : la page doit rester servie");
+            for album in &page {
+                let id = album.id.unwrap();
+                assert_eq!(
+                    album.added_at, reference[&id],
+                    "tri {tri}, album {id} : added_at doit valoir ce que rend le tri par date"
+                );
+            }
+        }
+    }
+
+    /// #3397 — le tri et la lecture mesurent la MÊME date.
+    ///
+    /// La preuve est structurelle : les deux formes sont bâties sur
+    /// `ADDED_AT_SOURCE`. Recopier l'expression ferait diverger le tri de la
+    /// valeur affichée sans qu'aucun test de contenu ne s'en aperçoive.
+    #[test]
+    fn la_jointure_de_tri_et_la_lecture_partagent_l_expression_3397() {
+        assert!(
+            AlbumRepo::added_at_join().contains(AlbumRepo::ADDED_AT_SOURCE),
+            "la jointure de tri doit être bâtie sur ADDED_AT_SOURCE"
+        );
+        assert!(
+            AlbumRepo::ADDED_AT_SOURCE.contains("file_first_seen")
+                && AlbumRepo::ADDED_AT_SOURCE.contains("CAST(t.file_mtime AS TEXT)"),
+            "l'expression partagée garde la source persistante ET le repli mtime"
+        );
     }
 
     #[test]

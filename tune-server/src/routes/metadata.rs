@@ -2454,9 +2454,10 @@ async fn merge_albums(
 
     state
         .backend
-        .execute_batch(
-            "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)",
-        )
+        .execute_batch(&format!(
+            "UPDATE albums SET track_count = {}",
+            tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
+        ))
         .ok();
 
     let total_tracks = track_repo

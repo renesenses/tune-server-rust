@@ -193,6 +193,13 @@ impl PlaybackOrchestrator {
             .ok_or_else(|| format!("unknown service: {service_name}"))?;
         let mut svc = svc.write().await;
 
+        // Chronomètre de la PREMIÈRE étape (#3568). Pour Tidal en DASH
+        // multi-segments, `get_track_url()` ne rend pas une adresse : il
+        // assemble le fMP4 ENTIER sur disque avant de rendre un `file://`.
+        // Cette étape-là ne laissait aucune trace, et c'est celle qu'on
+        // soupçonne de dominer l'attente sur une piste 24/96 — sans pouvoir
+        // le dire, faute de l'avoir jamais mesurée.
+        let debut_url = std::time::Instant::now();
         // Try to get the track URL; if it fails with an auth error, attempt
         // a token refresh and retry once. This handles Qobuz tokens expiring
         // mid-session (search still works without auth, but playback doesn't).
@@ -219,6 +226,24 @@ impl PlaybackOrchestrator {
             }
             Err(e) => return Err(e.to_string()),
         };
+
+        // `origine` dit LAQUELLE des deux formes le service a rendue, ce qui
+        // change la lecture du chiffre : `fichier` = le fMP4 DASH a été
+        // assemblé pendant ces millisecondes ; `https` = une simple adresse
+        // signée, et le téléchargement est encore devant nous.
+        info!(
+            service = service_name,
+            source_id = %source_id,
+            elapsed_ms = debut_url.elapsed().as_millis() as u64,
+            origine = if stream_data.url.starts_with("file://") {
+                "fichier"
+            } else if stream_data.url.starts_with("https://") {
+                "https"
+            } else {
+                "http"
+            },
+            "streaming_track_url_resolved"
+        );
 
         let info = StreamInfo {
             format: stream_data.quality.codec.to_lowercase(),
@@ -552,6 +577,13 @@ impl PlaybackOrchestrator {
                         .to_string();
                     let tmp_path_clone = tmp_path.clone();
                     let upstream = upstream_url.clone();
+                    // Deuxieme etape chronometree (#3568) : le telechargement
+                    // COMPLET du flux compresse vers un fichier temporaire.
+                    // `LocalOutput` ne decode pas de flux compresse, donc rien
+                    // ne part vers la carte son avant que cette boucle soit
+                    // finie. C'est la moitie de l'attente qu'Audirvana ne paie
+                    // pas : lui lit l'adresse Tidal en progressif.
+                    let debut_telechargement = std::time::Instant::now();
                     let download_result = tokio::task::spawn_blocking(move || {
                         let resp = crate::http::client::blocking_builder()
                             .timeout(std::time::Duration::from_secs(120))
@@ -565,8 +597,8 @@ impl PlaybackOrchestrator {
                                 };
                                 match std::io::copy(&mut r, &mut file) {
                                     Ok(bytes) => {
-                                        debug!(bytes, path = %tmp_path_clone, "streaming_download_complete");
-                                        Ok(tmp_path_clone)
+                                        debug!(path = %tmp_path_clone, "streaming_download_target");
+                                        Ok((tmp_path_clone, bytes))
                                     }
                                     Err(e) => Err(format!("download copy: {e}")),
                                 }
@@ -578,7 +610,23 @@ impl PlaybackOrchestrator {
                     .await;
 
                     match download_result {
-                        Ok(Ok(path)) => Some((path, true)),
+                        Ok(Ok((path, octets))) => {
+                            // `info!`, et non plus `debug!` : au niveau livre,
+                            // le journal de FranckLeRouge ne portait AUCUNE
+                            // ligne entre l'ordre de lecture et la fin du
+                            // transcodage. Impossible d'attribuer l'attente
+                            // (#3568). Une ligne par piste, avec de quoi
+                            // separer « le reseau est lent » de « le fichier
+                            // est gros ».
+                            let ms = debut_telechargement.elapsed().as_millis() as u64;
+                            info!(
+                                octets,
+                                elapsed_ms = ms,
+                                debit_kio_s = if ms > 0 { octets * 1000 / 1024 / ms } else { 0 },
+                                "streaming_download_complete"
+                            );
+                            Some((path, true))
+                        }
                         Ok(Err(e)) => {
                             warn!(error = %e, "streaming_transcode_download_failed");
                             // #3287 : ces deux sorties quittaient la tache
@@ -607,6 +655,11 @@ impl PlaybackOrchestrator {
                     }
                 };
 
+                // Troisieme etape chronometree (#3568) : le decodage vers du
+                // PCM en WAV. Il est progressif — la session recoit ses
+                // premiers octets bien avant la fin — mais rien ne disait
+                // jusqu'ici combien il coute ni ou il commence.
+                let debut_transcodage = std::time::Instant::now();
                 let tx_for_decode = tx.clone();
                 // Drop the original sender so the channel closes when decode finishes.
                 drop(tx);
@@ -668,7 +721,12 @@ impl PlaybackOrchestrator {
                                 "streaming_sample_rate_mismatch_wav_header_has_correct_rate"
                             );
                         }
-                        debug!("streaming_transcode_complete_progressive");
+                        info!(
+                            elapsed_ms = debut_transcodage.elapsed().as_millis() as u64,
+                            sample_rate = actual_rate,
+                            bit_depth = bd,
+                            "streaming_transcode_complete_progressive"
+                        );
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "streaming_transcode_decode_failed");

@@ -68,6 +68,15 @@ pub(crate) enum ProblemeUrlFlux {
     SansHote { schema: String },
     /// Un blanc au milieu — collage coupé.
     Espace,
+    /// L'adresse se lit, le serveur répond, mais ce qu'il rend n'est PAS de
+    /// l'audio : une page web, le plus souvent.
+    ///
+    /// Belkadi Yacine a collé `https://radioparadise.com/listen/channels/
+    /// main-mix` — la page d'ÉCOUTE, pas le flux. Elle passe toutes les
+    /// vérifications ci-dessus : `https`, un hôte, aucun blanc. Tune l'a donc
+    /// enregistrée sans un mot, et ne le lui a appris qu'à la première lecture
+    /// (`radio_not_audio` dans le journal, fil forum 1698, #3578).
+    PasUnFlux { type_mime: String },
 }
 
 impl ProblemeUrlFlux {
@@ -81,6 +90,7 @@ impl ProblemeUrlFlux {
             Self::SchemaNonLisible { .. } => "radio_url_schema_non_lisible",
             Self::SansHote { .. } => "radio_url_sans_hote",
             Self::Espace => "radio_url_espace",
+            Self::PasUnFlux { .. } => "radio_url_pas_un_flux",
         }
     }
 
@@ -102,6 +112,9 @@ impl ProblemeUrlFlux {
             }
             Self::SansHote { schema } => {
                 crate::i18n::t(lang, "radio.url.sansHote").replace("{schema}", schema)
+            }
+            Self::PasUnFlux { type_mime } => {
+                crate::i18n::t(lang, "radio.url.pasUnFlux").replace("{type}", type_mime)
             }
         }
     }
@@ -218,6 +231,59 @@ pub(crate) fn valider_url_flux(saisie: &str) -> Result<String, ProblemeUrlFlux> 
         return Err(ProblemeUrlFlux::SansHote { schema });
     }
     Ok(url.to_string())
+}
+
+/// Combien de temps on accepte d'attendre le serveur de la station AVANT de
+/// renoncer à la sonder.
+///
+/// Court, délibérément : c'est un formulaire, l'utilisateur attend devant son
+/// écran. Passé ce délai on ENREGISTRE — voir [`sonder_le_flux`] : une station
+/// lente n'est pas une station fausse.
+const DELAI_SONDE_FLUX: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Le serveur de la station rend-il, MAINTENANT, autre chose que de l'audio ?
+///
+/// C'est le second appelant de `tune_core::orchestrator::non_audio_content_type`
+/// — le premier étant la lecture, qui rendait déjà ce verdict, mais trop tard
+/// (#3578). La liste noire est donc la même des deux côtés, par construction.
+///
+/// **Ne refuse que ce qui est ÉTABLI.** Tout le reste — serveur injoignable,
+/// délai dépassé, code HTTP d'erreur, `Content-Type` absent ou inconnu — rend
+/// `None`, c'est-à-dire « on enregistre ». La raison est la même que celle qui
+/// a fait choisir une liste noire plutôt qu'une liste blanche côté lecture :
+/// un Icecast de salon éteint au moment de la saisie, un serveur qui refuse
+/// `HEAD`, un `application/octet-stream` — tous ces cas MARCHENT à la lecture,
+/// et les refuser ici serait pire que le défaut corrigé.
+///
+/// `HEAD` d'abord parce qu'il ne coûte pas un octet de flux ; beaucoup
+/// d'Icecast ne le servent pas, d'où le repli sur un `GET` d'un seul octet
+/// (`Range: bytes=0-0`), qu'on abandonne dès les en-têtes lus.
+async fn sonder_le_flux(client: &reqwest::Client, url: &str) -> Option<ProblemeUrlFlux> {
+    async fn type_annonce(requete: reqwest::RequestBuilder) -> Option<String> {
+        let reponse = requete.timeout(DELAI_SONDE_FLUX).send().await.ok()?;
+        if !reponse.status().is_success() {
+            return None;
+        }
+        Some(
+            reponse
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)?
+                .to_str()
+                .ok()?
+                .to_string(),
+        )
+    }
+
+    let content_type = match type_annonce(client.head(url)).await {
+        Some(ct) => Some(ct),
+        // Beaucoup de serveurs Icecast/Shoutcast répondent 405 ou 400 à un
+        // HEAD tout en servant parfaitement le GET : sans ce repli, la sonde
+        // serait aveugle sur une bonne partie du parc.
+        None => type_annonce(client.get(url).header(reqwest::header::RANGE, "bytes=0-0")).await,
+    }?;
+
+    let type_mime = tune_core::orchestrator::non_audio_content_type(&content_type)?;
+    Some(ProblemeUrlFlux::PasUnFlux { type_mime })
 }
 
 /// Le refus, mis en forme pour le client web.
@@ -611,9 +677,27 @@ async fn media_server_radio_audio_head(
 ) -> Response {
     let repo = RadioRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(_)) => tune_stream_http::live_radio_head_response("audio/wav", &req_headers),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        Ok(Some(station)) => {
+            tracing::debug!(
+                radio_id = id,
+                radio = %station.name,
+                amont = %station.url,
+                "media_server_radio_head"
+            );
+            tune_stream_http::live_radio_head_response("audio/wav", &req_headers)
+        }
+        // #1800 reproche au dossier Radio de ne laisser « aucune trace côté
+        // serveur ». Un renderer qui repartait sur un 404 ou un 500 n'en
+        // laissait justement aucune : le journal restait muet, et le testeur
+        // ne pouvait rapporter qu'un dossier vide, sans rien pour trancher.
+        Ok(None) => {
+            tracing::warn!(radio_id = id, "media_server_radio_station_inconnue");
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(error) => {
+            tracing::warn!(radio_id = id, error = %error, "media_server_radio_base_illisible");
+            (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+        }
     }
 }
 
@@ -625,8 +709,14 @@ async fn media_server_radio_audio(
     let repo = RadioRepo::with_backend(state.backend.clone());
     let radio = match repo.get(id) {
         Ok(Some(radio)) => radio,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        Ok(None) => {
+            tracing::warn!(radio_id = id, "media_server_radio_station_inconnue");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(error) => {
+            tracing::warn!(radio_id = id, error = %error, "media_server_radio_base_illisible");
+            return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        }
     };
 
     // Le Browse et le HEAD sont sans effet. Seul un renderer qui demande
@@ -638,9 +728,15 @@ async fn media_server_radio_audio(
         .orchestrator
         .create_media_server_radio_session(radio.url.clone())
         .await;
+    // `amont` : l'URL du diffuseur que Tune va chercher pour le compte du
+    // renderer. C'est la trace que #1800 réclame — station, URL amont, statut —
+    // et celle qui rend notre journal comparable à celui d'Emby cité dans le
+    // ticket, où la requête du lecteur et celle du serveur se lisent l'une
+    // sous l'autre.
     tracing::info!(
         radio_id = id,
         radio = %radio.name,
+        amont = %radio.url,
         stream_id = %stream_id,
         "media_server_radio_stream_started"
     );
@@ -651,6 +747,13 @@ async fn media_server_radio_audio(
         req_headers,
     )
     .await;
+    tracing::info!(
+        radio_id = id,
+        radio = %radio.name,
+        amont = %radio.url,
+        statut = response.status().as_u16(),
+        "media_server_radio_stream_reponse"
+    );
     with_media_server_radio_cleanup(response, state.streamer, stream_id)
 }
 
@@ -681,6 +784,13 @@ async fn create_radio(
         Ok(url) => url,
         Err(probleme) => return refus_url(&probleme, &crate::i18n::lang_from_header(&headers)),
     };
+    // Puis ce que la FORME ne peut pas dire : le serveur rend-il un flux, ou
+    // une page web ? Belkadi Yacine avait collé la page d'écoute de Radio
+    // Paradise ; elle passe toutes les règles ci-dessus, et seule la LECTURE
+    // le lui a appris, sur une station muette (#3578, fil forum 1698).
+    if let Some(probleme) = sonder_le_flux(&state.http_client, &url).await {
+        return refus_url(&probleme, &crate::i18n::lang_from_header(&headers));
+    }
     let repo = RadioRepo::with_backend(state.backend.clone());
     let auto_logo = if body.logo_url.is_none() {
         favicon_from_url(body.homepage.as_deref().unwrap_or(&url))
@@ -754,6 +864,15 @@ async fn update_radio(
         Some(Ok(url)) => Some(url),
         None => None,
     };
+    // Même sonde qu'à la création, et sur la même règle : elle ne porte que
+    // sur l'adresse SAISIE. Une station enregistrée avant #3578, dont
+    // l'adresse rendrait une page web, reste renommable et reclassable sans
+    // être obligée de réparer son adresse d'abord.
+    if let Some(url) = url_saisie.as_deref()
+        && let Some(probleme) = sonder_le_flux(&state.http_client, url).await
+    {
+        return refus_url(&probleme, &crate::i18n::lang_from_header(&headers));
+    }
     let repo = RadioRepo::with_backend(state.backend.clone());
     let Some(mut station) = repo.get(id).ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();

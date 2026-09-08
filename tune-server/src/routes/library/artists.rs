@@ -344,12 +344,11 @@ pub(super) async fn artist_bio(
 /// Un `?lang=` vide (`?lang=`) est traité comme absent : il ne nomme aucune
 /// langue, et le laisser passer donnerait `lang = ""`, qui ne convient à
 /// aucune bio estampillée et déclencherait un appel réseau pour rien.
+///
+/// La résolution elle-même vit dans [`crate::i18n::lang_from_request`] depuis
+/// #3089 : les notes de version la partagent, une seule implémentation.
 pub(super) fn langue_demandee(param: Option<&str>, headers: &HeaderMap) -> String {
-    param
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| crate::i18n::lang_from_header(headers))
+    crate::i18n::lang_from_request(param, headers)
 }
 
 /// La langue d'une bio stockée convient-elle à celle qu'on demande ?

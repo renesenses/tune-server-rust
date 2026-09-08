@@ -313,12 +313,25 @@ pub mod sql {
         )
     }
 
+    /// `('This Computer', 'Cet ordinateur')` — construit depuis
+    /// [`crate::config::ETIQUETTES_LOCALES_GENERIQUES`], source unique de la
+    /// liste. Aucune de ces étiquettes ne porte d'apostrophe ; ajouter une
+    /// langue qui en porterait demanderait un échappement ici.
+    pub fn etiquettes_locales_generiques() -> String {
+        crate::config::ETIQUETTES_LOCALES_GENERIQUES
+            .iter()
+            .map(|e| format!("'{e}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub fn rename_generic_local_label<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET name = {} \
-             WHERE id = {} AND name IN ('This Computer', 'Cet ordinateur')",
+             WHERE id = {} AND name IN ({})",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            etiquettes_locales_generiques()
         )
     }
 
@@ -326,8 +339,23 @@ pub mod sql {
         format!(
             "UPDATE zones SET is_hidden = 1 \
              WHERE id <> {} AND output_type = 'local' \
-             AND name IN ('This Computer', 'Cet ordinateur') \
+             AND name IN ({}) \
              AND COALESCE(is_hidden, 0) = 0",
+            d.placeholder(1),
+            etiquettes_locales_generiques()
+        )
+    }
+
+    /// Compte les zones locales VISIBLES qui portent déjà une étiquette
+    /// générique, en excluant l'appareil qu'on s'apprête à traiter (#1770).
+    pub fn etiquette_generique_locale_prise<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM zones \
+             WHERE output_type = 'local' \
+             AND name IN ({}) \
+             AND COALESCE(is_hidden, 0) = 0 \
+             AND (output_device_id IS NULL OR output_device_id <> {})",
+            etiquettes_locales_generiques(),
             d.placeholder(1)
         )
     }
@@ -690,6 +718,45 @@ fn reecrire_les_groupes(brut: &str, doublon: i64, cible: i64) -> Option<String> 
     serde_json::to_string(&groupes).ok()
 }
 
+/// Ce qu'a fait une demande de création de zone soumise au réglage
+/// « Créer automatiquement les zones » (`zone_auto_create`).
+///
+/// Trois issues, et pas deux : refuser une naissance n'est pas la même chose
+/// que retrouver une zone connue. Les cinq chemins de découverte qui
+/// ignoraient le réglage (#3529) ne regardaient que le booléen `created` de
+/// [`ZoneRepo::get_or_create`], lequel ne dit rien du réglage — il ne pouvait
+/// donc pas les avertir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationDeZone {
+    /// Une zone vient de naître.
+    Creee(i64),
+    /// Une zone existait déjà pour cet appareil, visible ou masquée. La
+    /// reconnexion d'une zone connue n'est JAMAIS soumise au réglage.
+    Existante(i64),
+    /// `zone_auto_create` est décoché et cet appareil n'a jamais eu de zone.
+    Refusee,
+}
+
+impl CreationDeZone {
+    /// L'identifiant de la zone, sauf quand la création a été refusée.
+    pub fn id(&self) -> Option<i64> {
+        match self {
+            Self::Creee(id) | Self::Existante(id) => Some(*id),
+            Self::Refusee => None,
+        }
+    }
+
+    /// Vrai seulement quand une zone vient de naître.
+    pub fn vient_de_naitre(&self) -> bool {
+        matches!(self, Self::Creee(_))
+    }
+
+    /// Vrai quand le réglage a bloqué la naissance.
+    pub fn refusee(&self) -> bool {
+        matches!(self, Self::Refusee)
+    }
+}
+
 impl ZoneRepo {
     pub fn new(db: SqliteDb) -> Self {
         Self { db: Arc::new(db) }
@@ -840,6 +907,81 @@ impl ZoneRepo {
                 Err(e)
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Le réglage « Créer automatiquement les zones ».
+    ///
+    /// Absent ou illisible vaut **coché** : c'est le défaut posé par
+    /// `routes/system/config.rs`, et une base neuve ne doit pas se comporter
+    /// comme si l'utilisateur avait décoché.
+    ///
+    /// Cette lecture était recopiée à l'identique en cinq endroits de
+    /// `tune-server` (#1770 en avait ajouté une sixième). Elle vit désormais
+    /// ici, une seule fois : `git grep '"zone_auto_create"'` sur le dépôt doit
+    /// ne rendre que cette ligne, le défaut de `system/config.rs` et la liste
+    /// de `secrets.rs`.
+    pub fn zone_auto_create_autorise(&self) -> bool {
+        super::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .get("zone_auto_create")
+            .ok()
+            .flatten()
+            .map(|v| v != "false")
+            .unwrap_or(true)
+    }
+
+    /// [`Self::get_or_create`], mais soumis au réglage « Créer automatiquement
+    /// les zones ».
+    ///
+    /// #3529 — la garde était recopiée dans cinq chemins de création et
+    /// **absente** de cinq autres, dont trois qui tournent seuls, sans aucun
+    /// geste de l'utilisateur : le lot SSDP de démarrage, le re-sondage des
+    /// DLNA mémorisés, et les sondeurs Squeezebox et HQPlayer. C'est la
+    /// duplication qui les a laissés passer, la garde descend donc d'un étage.
+    ///
+    /// Règle : **seule la naissance d'une zone est soumise au réglage**. Un
+    /// appareil qui a déjà une zone est rendu [`CreationDeZone::Existante`]
+    /// sans consulter quoi que ce soit, pour que la reconnexion
+    /// (`set_online_by_device`) et le rattachement d'identité
+    /// (`set_identity`) continuent de fonctionner réglage décoché — c'est la
+    /// condition posée par l'issue, et c'est aussi ce que faisaient déjà les
+    /// cinq chemins gardés.
+    ///
+    /// `origine` nomme le chemin appelant. Il n'apparaît que dans le journal,
+    /// pour qu'un refus soit attribuable sans lire le code.
+    pub fn get_or_create_si_autorise(
+        &self,
+        name: &str,
+        output_type: Option<&str>,
+        output_device_id: &str,
+        origine: &str,
+    ) -> Result<CreationDeZone, String> {
+        // Même question, et dans le même ordre, que la voie rapide de
+        // `get_or_create` : une zone masquée compte comme existante ici aussi,
+        // sinon un appareil supprimé repasserait par la case création.
+        if let Some(id) = self
+            .get_by_device_id(output_device_id)?
+            .and_then(|zone| zone.id)
+        {
+            return Ok(CreationDeZone::Existante(id));
+        }
+
+        if !self.zone_auto_create_autorise() {
+            tracing::info!(
+                name = %name,
+                device_id = %output_device_id,
+                origine = %origine,
+                "zone_auto_create_refusee"
+            );
+            return Ok(CreationDeZone::Refusee);
+        }
+
+        // La course reste possible entre le contrôle ci-dessus et l'INSERT :
+        // `get_or_create` la rattrape, et un `created = false` inattendu se
+        // lit alors comme une zone existante.
+        match self.get_or_create(name, output_type, output_device_id)? {
+            (id, true) => Ok(CreationDeZone::Creee(id)),
+            (id, false) => Ok(CreationDeZone::Existante(id)),
         }
     }
 
@@ -1961,13 +2103,63 @@ impl ZoneRepo {
     /// twins, leaving both "This Computer" and "Cet ordinateur" in the picker
     /// (Philippe Vella). Only the exact generic labels are touched — a
     /// user-renamed zone is never hidden. Returns the number hidden.
+    ///
+    /// ⚠️ **La zone gardée doit elle-même porter l'étiquette générique**
+    /// (#1770). Sans cette condition, appeler cette fonction avec une zone
+    /// nommée « Speakers » masquait la zone « This Computer » de l'autre
+    /// moteur audio : il n'y avait alors aucune jumelle, seulement une zone
+    /// étrangère effacée en silence — et une zone masquée ne revient jamais
+    /// par la découverte (`get_or_create` la rend telle quelle). Le scénario
+    /// est celui de la bascule ASIO → WASAPI : l'utilisateur retrouvait sa
+    /// zone ASIO absente du sélecteur au démarrage suivant.
+    ///
+    /// Une zone gardée introuvable ou renommée par l'utilisateur ne masque
+    /// donc rien, et rend `Ok(0)`.
     pub fn hide_duplicate_generic_local(&self, keep_id: i64) -> Result<usize, String> {
+        let gardee_est_generique = self
+            .get(keep_id)?
+            .is_some_and(|z| crate::config::est_etiquette_locale_generique(&z.name));
+        if !gardee_est_generique {
+            tracing::debug!(
+                zone_id = keep_id,
+                "zone_gardee_non_generique_aucun_masquage"
+            );
+            return Ok(0);
+        }
         let sql = self.dialect_sql(
             sql::hide_duplicate_generic_local,
             sql::hide_duplicate_generic_local,
         );
         let params: [&dyn ToSqlValue; 1] = [&keep_id];
         self.db.execute(&sql, &params)
+    }
+
+    /// Une zone locale VISIBLE porte-t-elle déjà l'étiquette générique, sur un
+    /// AUTRE appareil que `device_id` ? (#1770)
+    ///
+    /// C'est la mesure que consulte [`crate::config::nom_de_zone_locale`]
+    /// avant de nommer une zone qu'on s'apprête à créer. L'exclusion par
+    /// `device_id` compte : la zone de l'appareil courant, si elle existe, est
+    /// justement celle qu'on ne veut pas compter contre lui-même.
+    ///
+    /// Base antérieure à `is_hidden` / `output_device_id` : rend `false`,
+    /// c'est-à-dire le comportement d'avant le correctif.
+    pub fn etiquette_generique_locale_prise(&self, device_id: &str) -> Result<bool, String> {
+        let sql = self.dialect_sql(
+            sql::etiquette_generique_locale_prise,
+            sql::etiquette_generique_locale_prise,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&device_id];
+        match self.db.query_many_strong(&sql, &params) {
+            Ok(lignes) => Ok(lignes
+                .first()
+                .and_then(|l| l.first())
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0),
+            Err(e) if schema_incomplet(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Soft-delete EVERY zone and clear the free-tier activation markers.
@@ -2165,6 +2357,149 @@ mod tests {
         db
     }
 
+    /// #1770 — la mesure que consulte la règle de nommage. Une zone locale
+    /// VISIBLE portant l'étiquette générique, sur un AUTRE appareil, la rend
+    /// vraie.
+    #[test]
+    fn l_etiquette_generique_prise_par_un_autre_appareil_est_vue() {
+        let repo = ZoneRepo::new(test_db());
+        repo.create(
+            "This Computer",
+            Some("local"),
+            Some("local:Essence STX II ASIO(64)"),
+        )
+        .unwrap();
+
+        assert!(
+            repo.etiquette_generique_locale_prise("local:Speakers")
+                .unwrap(),
+            "la zone ASIO porte déjà l'étiquette : la sortie système WASAPI \
+             ne doit pas en minter une seconde (#1770)"
+        );
+    }
+
+    /// TÉMOIN — la zone de l'appareil courant ne compte pas contre lui-même,
+    /// sinon un simple redémarrage renommerait la zone système à chaque tour.
+    #[test]
+    fn temoin_sa_propre_zone_ne_compte_pas_contre_l_appareil() {
+        let repo = ZoneRepo::new(test_db());
+        repo.create("This Computer", Some("local"), Some("local:Speakers"))
+            .unwrap();
+
+        assert!(
+            !repo
+                .etiquette_generique_locale_prise("local:Speakers")
+                .unwrap(),
+            "l'appareil qui porte déjà l'étiquette ne se la prend pas à \
+             lui-même"
+        );
+    }
+
+    /// Une zone masquée ne prend rien : elle n'est pas dans le sélecteur, donc
+    /// aucun doublon visible n'est possible.
+    #[test]
+    fn une_zone_masquee_ne_prend_pas_l_etiquette() {
+        let repo = ZoneRepo::new(test_db());
+        let id = repo
+            .create("This Computer", Some("local"), Some("local:Vieux DAC"))
+            .unwrap();
+        repo.delete(id).unwrap();
+
+        assert!(
+            !repo
+                .etiquette_generique_locale_prise("local:Speakers")
+                .unwrap()
+        );
+    }
+
+    /// Une zone d'un autre type (DLNA) qui s'appellerait ainsi ne compte pas :
+    /// la règle ne porte que sur les sorties locales.
+    #[test]
+    fn une_zone_non_locale_ne_prend_pas_l_etiquette() {
+        let repo = ZoneRepo::new(test_db());
+        repo.create("This Computer", Some("dlna"), Some("uuid:42"))
+            .unwrap();
+
+        assert!(
+            !repo
+                .etiquette_generique_locale_prise("local:Speakers")
+                .unwrap()
+        );
+    }
+
+    /// #1770 — `hide_duplicate_generic_local` ne masque plus rien quand la
+    /// zone GARDÉE ne porte pas l'étiquette générique. Sans cette condition,
+    /// la zone système WASAPI (« Speakers ») effaçait en silence la zone ASIO
+    /// « This Computer », qu'aucune découverte ne ressuscite ensuite.
+    #[test]
+    fn une_zone_gardee_non_generique_ne_masque_personne() {
+        let repo = ZoneRepo::new(test_db());
+        let asio = repo
+            .create(
+                "This Computer",
+                Some("local"),
+                Some("local:Essence STX II ASIO(64)"),
+            )
+            .unwrap();
+        let wasapi = repo
+            .create("Speakers", Some("local"), Some("local:Speakers"))
+            .unwrap();
+
+        assert_eq!(
+            repo.hide_duplicate_generic_local(wasapi).unwrap(),
+            0,
+            "garder « Speakers » ne désigne aucune jumelle : rien ne doit \
+             être masqué (#1770)"
+        );
+        assert!(
+            repo.list().unwrap().iter().any(|z| z.id == Some(asio)),
+            "la zone ASIO doit rester dans le sélecteur"
+        );
+    }
+
+    /// TÉMOIN — le cas de Philippe Vella (#1233) marche toujours : deux
+    /// étiquettes génériques, la gardée en est une, la jumelle est masquée.
+    /// Si cet essai tombe, le correctif a désarmé la déduplication au lieu de
+    /// la borner.
+    #[test]
+    fn temoin_deux_etiquettes_generiques_la_jumelle_est_toujours_masquee() {
+        let repo = ZoneRepo::new(test_db());
+        let ancienne = repo
+            .create(
+                "Cet ordinateur",
+                Some("local"),
+                Some("local:MacBook de Jean"),
+            )
+            .unwrap();
+        let vivante = repo
+            .create("This Computer", Some("local"), Some("local:MacBook"))
+            .unwrap();
+
+        assert_eq!(repo.hide_duplicate_generic_local(vivante).unwrap(), 1);
+        let visibles = repo.list().unwrap();
+        assert!(visibles.iter().any(|z| z.id == Some(vivante)));
+        assert!(
+            !visibles.iter().any(|z| z.id == Some(ancienne)),
+            "la jumelle générique doit toujours être masquée (#1233)"
+        );
+    }
+
+    /// Une zone renommée par l'utilisateur n'est jamais masquée, même quand la
+    /// gardée est bien générique. C'est le contrat d'origine, reconduit.
+    #[test]
+    fn temoin_une_zone_renommee_n_est_jamais_masquee() {
+        let repo = ZoneRepo::new(test_db());
+        let salon = repo
+            .create("Salon", Some("local"), Some("local:Ampli"))
+            .unwrap();
+        let vivante = repo
+            .create("This Computer", Some("local"), Some("local:Speakers"))
+            .unwrap();
+
+        assert_eq!(repo.hide_duplicate_generic_local(vivante).unwrap(), 0);
+        assert!(repo.list().unwrap().iter().any(|z| z.id == Some(salon)));
+    }
+
     #[test]
     fn crud_zone() {
         let db = test_db();
@@ -2189,6 +2524,148 @@ mod tests {
         repo.delete(id).unwrap();
         assert!(repo.list().unwrap().is_empty());
         assert!(repo.is_device_hidden("uuid:123"));
+    }
+
+    // ── #3529 : la garde « Créer automatiquement les zones », une fois ────
+    //
+    // Ces essais éprouvent la garde elle-même. Le fait que les cinq chemins de
+    // découverte y passent bien est éprouvé à part, par le recensement
+    // `tune-server/tests/zones_auto_create_recension.rs` : un essai de
+    // comportement ne peut pas voir un SIXIÈME site qui ne l'appellerait pas,
+    // et c'est exactement ainsi que ces cinq-là sont passés.
+
+    /// Le cas de Fabien : réglage décoché, appareil jamais vu. Aucune zone.
+    #[test]
+    fn auto_create_decoche_refuse_un_appareil_inconnu() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        settings.set("zone_auto_create", "false").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("FIP Salon", Some("squeezebox"), "sb:aa:bb", "essai")
+            .unwrap();
+
+        assert_eq!(issue, CreationDeZone::Refusee);
+        assert!(issue.id().is_none());
+        assert!(!issue.vient_de_naitre());
+        assert!(
+            repo.list().unwrap().is_empty(),
+            "aucune zone ne doit exister apres un refus"
+        );
+        assert!(
+            repo.get_by_device_id("sb:aa:bb").unwrap().is_none(),
+            "le refus ne doit pas non plus laisser de zone masquee derriere lui"
+        );
+    }
+
+    /// La condition posée par l'issue : la garde bloque la NAISSANCE, jamais
+    /// la reconnexion. Une zone connue reste retrouvable réglage décoché,
+    /// sans quoi un appareil qui se rebranche deviendrait injoignable.
+    #[test]
+    fn auto_create_decoche_laisse_reconnecter_une_zone_connue() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        let connue = repo
+            .create("Salon", Some("dlna"), Some("uuid:connu"))
+            .unwrap();
+        settings.set("zone_auto_create", "false").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("Salon", Some("dlna"), "uuid:connu", "essai")
+            .unwrap();
+
+        assert_eq!(issue, CreationDeZone::Existante(connue));
+        assert!(!issue.refusee());
+        repo.set_online_by_device("uuid:connu", true).unwrap();
+        assert!(repo.get(connue).unwrap().unwrap().online);
+    }
+
+    /// Une zone SUPPRIMÉE (masquée) est une zone existante, pas un appareil
+    /// inconnu : le refus ne doit pas la faire renaître par la porte de
+    /// derrière, ni la ressusciter.
+    #[test]
+    fn auto_create_decoche_ne_ressuscite_pas_une_zone_supprimee() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        let supprimee = repo
+            .create("Salon", Some("dlna"), Some("uuid:efface"))
+            .unwrap();
+        repo.delete(supprimee).unwrap();
+        settings.set("zone_auto_create", "false").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("Salon", Some("dlna"), "uuid:efface", "essai")
+            .unwrap();
+
+        assert_eq!(issue, CreationDeZone::Existante(supprimee));
+        assert!(
+            repo.is_device_hidden("uuid:efface"),
+            "elle doit rester masquee"
+        );
+        assert!(repo.list().unwrap().is_empty());
+    }
+
+    /// Réglage coché : rien ne change, la zone naît.
+    #[test]
+    fn auto_create_coche_cree_la_zone() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        settings.set("zone_auto_create", "true").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("HQPlayer", Some("hqplayer"), "hqplayer-1.2.3.4", "essai")
+            .unwrap();
+
+        let id = issue.id().expect("une zone doit naitre");
+        assert!(issue.vient_de_naitre());
+        assert_eq!(issue, CreationDeZone::Creee(id));
+        assert_eq!(repo.list().unwrap().len(), 1);
+    }
+
+    /// Base neuve : le réglage n'est pas encore écrit. Le défaut est « coché »
+    /// (`system/config.rs`), pas « décoché » — une installation neuve doit
+    /// continuer de proposer ses zones toute seule.
+    #[test]
+    fn reglage_absent_vaut_coche() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        assert!(settings.get("zone_auto_create").unwrap().is_none());
+
+        assert!(repo.zone_auto_create_autorise());
+        assert!(
+            repo.get_or_create_si_autorise("Salon", Some("dlna"), "uuid:neuf", "essai")
+                .unwrap()
+                .vient_de_naitre()
+        );
+    }
+
+    /// La seconde moitié du constat de Fabien : « et s'activent toutes
+    /// seules ». Une zone naît **en ligne**, parce que `INSERT INTO zones`
+    /// n'écrit pas `online` et que le schéma vaut `DEFAULT 1`.
+    ///
+    /// Cet essai ne corrige rien, il FIXE le fait : la naissance en ligne est
+    /// désormais un comportement éprouvé, et non un effet de bord du schéma
+    /// que personne ne verrait changer. C'est le refus de la naissance, plus
+    /// haut, qui traite le symptôme ; retourner ce défaut à 0 laisserait
+    /// hors ligne les zones que les chemins de découverte créent
+    /// légitimement — plusieurs ne rappellent `set_online_by_device` que dans
+    /// leur branche « zone déjà connue ».
+    #[test]
+    fn une_zone_creee_nait_en_ligne() {
+        let db = test_db_migree();
+        let repo = ZoneRepo::new(db);
+        let id = repo
+            .create("Salon", Some("dlna"), Some("uuid:naissance"))
+            .unwrap();
+        assert!(
+            repo.get(id).unwrap().unwrap().online,
+            "une zone naissante est en ligne : c'est le DEFAULT 1 du schema"
+        );
     }
 
     /// #1832 — les reglages ranges dans `settings` (profil d'egaliseur en

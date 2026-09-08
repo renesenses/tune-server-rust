@@ -209,6 +209,31 @@ pub(crate) async fn fiches_locales_honorables(state: &AppState) -> Vec<Value> {
         );
     }
     gardees
+        .into_iter()
+        .map(|fiche| completer_compatible(fiche, true))
+        .collect()
+}
+
+/// Ajoute `compatible` à une fiche qui ne le porte pas — et **seulement** dans
+/// ce cas (#3408).
+///
+/// `??` et non `=` : une fiche qui dit explicitement `false` continue d'être
+/// respectée. C'est la même règle que le correctif client, posée du côté qui
+/// protège aussi les clients déjà publiés — ceux des testeurs, ceux des
+/// versions passées — qui n'auront jamais la normalisation.
+///
+/// Une fiche héritée gardée par [`fiches_locales_honorables`] est, par
+/// construction, un greffon que ce binaire sait charger : sa compatibilité est
+/// établie par le tri lui-même, pas devinée. Le reste de la fiche ressort
+/// intact, identifiant et libellé compris — c'est la garantie de #2132, et un
+/// champ ajouté ne déplace ni l'un ni l'autre.
+fn completer_compatible(mut fiche: Value, compatible: bool) -> Value {
+    if let Some(objet) = fiche.as_object_mut() {
+        objet
+            .entry("compatible")
+            .or_insert_with(|| Value::Bool(compatible));
+    }
+    fiche
 }
 
 async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
@@ -229,10 +254,18 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         "enabled": xtune_installed,
         "url": "/xtune/",
         "icon": "vinyl",
+        // Livré AVEC ce serveur : il n'y a pas de version à confronter.
+        "compatible": true,
     }));
 
     // Plugins actually loaded through the SDK. These are the only entries
     // backed by running code — everything above is settings bookkeeping.
+    //
+    // `compatible: true` sans réserve : un greffon SDK est COMPILÉ dans ce
+    // binaire, et `setup_all` vient en plus de lui faire passer la porte d'ABI
+    // (`plugin_protocol_incompatible`). Un greffon qui figure ici tourne
+    // réellement dans ce processus — c'est la compatibilité constatée, pas
+    // supposée.
     //
     // Read from the snapshot `plugins::init` published, never from the loader:
     // event dispatch holds the loader's lock across every plugin's `on_event`,
@@ -248,6 +281,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "enabled": info.enabled,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
+            "compatible": true,
         }));
     }
 
@@ -278,6 +312,19 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "loaded": false,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
+            // 🔴 #3484 — le champ que la fiche wasm porte depuis toujours, et
+            // que la fiche COMPILÉE n'a jamais porté (voir la boucle wasm plus
+            // bas : `"restart_required": enabled && !loaded`). Un greffon
+            // installé qui figure ici n'a pas été chargé — la porte de
+            // `setup_all` ne s'ouvre qu'au démarrage — donc l'attente d'un
+            // redémarrage est un FAIT de cette ligne, pas une supposition de
+            // l'écran. Sans lui, deux fiches dans le même état répondaient
+            // différemment selon leur nature, et seule la wasm le disait.
+            "restart_required": installed,
+            // Dormant, mais compilé dans CE binaire : c'est exactement la
+            // fiche sur laquelle l'écran doit proposer « Installer ». La dire
+            // incompatible grisait le seul bouton qui la rende utile.
+            "compatible": true,
         }));
     }
 
@@ -304,6 +351,21 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
                     .is_some_and(|reg| reg.get(&id).is_some());
                 #[cfg(not(feature = "plugins-wasm"))]
                 let loaded = false;
+                // Le SEUL endroit où ce serveur détient un énoncé de
+                // compatibilité écrit par le greffon lui-même :
+                // `min_server_version`, jusqu'ici lu par le manifeste et par
+                // personne. On le confronte enfin à la version courante — une
+                // absence, ou une exigence illisible, restant « compatible »
+                // (voir `PluginManifest::compatible_with`).
+                let compatible = info.manifest.compatible_with(tune_core::version());
+                if !compatible {
+                    tracing::info!(
+                        plugin_name = %id,
+                        min_server_version = ?info.manifest.min_server_version,
+                        server_version = %tune_core::version(),
+                        "plugin_wasm_min_server_version_non_atteinte"
+                    );
+                }
                 plugins.push(serde_json::json!({
                     "name": id,
                     "display_name": info.manifest.name,
@@ -316,6 +378,8 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
                     "loaded": loaded,
                     "restart_required": enabled && !loaded,
                     "url": format!("/api/v1/plugins/{id}/"),
+                    "compatible": compatible,
+                    "min_server_version": info.manifest.min_server_version,
                 }));
             }
         }
@@ -343,6 +407,29 @@ fn plugin_available_snapshot(state: &AppState) -> &[tune_core::plugin_sdk::Avail
         .unwrap_or_default()
 }
 
+/// La compatibilité d'un greffon désigné par son seul nom.
+///
+/// Un greffon **wasm** posé sur le disque porte un manifeste, donc une
+/// exigence de version : c'est la seule que ce serveur puisse confronter, et
+/// elle doit répondre pareil sur `/plugins` et sur `/plugins/{nom}` — deux
+/// verdicts différents pour la même extension, c'est le défaut d'origine sous
+/// une autre forme. Pour tout autre nom (compilé, intégré, hérité), il n'y a
+/// rien à confronter : `true`.
+async fn compatible_selon_le_disque(name: &str) -> bool {
+    let Some(dir) = crate::plugins::wasm_plugins_dir() else {
+        return true;
+    };
+    let manager = tune_core::plugins::PluginManager::new(dir);
+    let Ok(infos) = manager.scan().await else {
+        return true;
+    };
+    infos
+        .iter()
+        .find(|i| i.manifest.id == name)
+        .map(|i| i.manifest.compatible_with(tune_core::version()))
+        .unwrap_or(true)
+}
+
 async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     // An SDK plugin is authoritative about itself: it is loaded or it is not,
     // regardless of what the settings table happens to say.
@@ -356,8 +443,12 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
             "enabled": info.enabled,
             "status": "loaded",
             "config_schema": info.config_schema,
+            // Il TOURNE dans ce processus : il a franchi la porte d'ABI.
+            "compatible": true,
         }));
     }
+
+    let compatible = compatible_selon_le_disque(&name).await;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
@@ -397,6 +488,10 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
             "enabled": false,
             "status": "unavailable",
             "detail": "no plugin by that name is compiled into this server or installed on disk — nothing was ever loaded",
+            // Indisponible n'est PAS incompatible : `status` porte déjà la
+            // raison exacte. Émettre `false` ici collerait un second libellé,
+            // faux, sur une fiche déjà expliquée.
+            "compatible": true,
         }));
     }
 
@@ -405,21 +500,58 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
         "installed": installed,
         "enabled": enabled,
         "status": if installed { "installed" } else { "not_installed" },
+        "compatible": compatible,
     }))
 }
 
+/// Le greffon `name` tourne-t-il DANS ce processus, en ce moment ?
+///
+/// La seule autorité est l'instantané que `plugins::init` a publié après
+/// `setup_all` : il ne contient que ce qui a réellement chargé. Un réglage en
+/// base ne dit rien de l'instant présent — c'est tout le sujet de #3484.
+fn greffon_charge(state: &AppState, name: &str) -> bool {
+    plugin_snapshot(state).iter().any(|p| p.name == name)
+}
+
+/// 🔴 #3484 — activer un greffon n'en démarre AUCUN.
+///
+/// La porte qui décide de charger un greffon est
+/// `tune_core::plugin_sdk::PluginLoader::setup_all`, et elle ne s'ouvre qu'au
+/// démarrage : basculer `plugin_{name}_enabled` écrit une ligne en base et ne
+/// monte rien dans le serveur qui tourne. `install_plugin` et `delete_plugin`
+/// le disaient déjà par `restart_required` ; `enable`/`disable` ne le disaient
+/// pas — alors que ce sont les deux seules routes que l'écran appelle quand on
+/// bascule l'interrupteur d'un greffon déjà installé.
+///
+/// L'appelant existe, et il en dépend : `tune-web-client`,
+/// `src/components/v2/PluginsV2.svelte` fait passer l'installation ET la
+/// bascule par le même `act()`, dont la seule décision est
+/// `if (res?.restart_required) restartNeeded = true;`. Sans le champ, la
+/// bascule annonçait « activé » et n'affichait jamais la bannière : le testeur
+/// voyait un greffon coché qui ne fait rien (« j'ai installé le plugin
+/// Bandcamp mais impossible de le démarrer », fil 1682, Patatorz).
+///
+/// La valeur n'est pas une constante : elle compare l'état DEMANDÉ à ce qui
+/// tourne réellement. Réactiver un greffon déjà chargé, ou désactiver un
+/// greffon déjà absent, ne demande aucun redémarrage — et le prétendre
+/// enverrait couper la musique pour rien.
 async fn enable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "true").ok();
-    Json(json!({ "name": name, "enabled": true }))
+    let restart_required = !greffon_charge(&state, &name);
+    Json(json!({ "name": name, "enabled": true, "restart_required": restart_required }))
 }
 
+/// Le pendant de [`enable_plugin`] : un greffon qui tourne continue de tourner
+/// jusqu'au prochain démarrage, ses routes montées et son abonnement au bus
+/// actif. Le dire est la même dette que ci-dessus.
 async fn disable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "false").ok();
-    Json(json!({ "name": name, "enabled": false }))
+    let restart_required = greffon_charge(&state, &name);
+    Json(json!({ "name": name, "enabled": false, "restart_required": restart_required }))
 }
 
 #[derive(Deserialize)]

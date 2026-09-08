@@ -126,22 +126,26 @@ fn ph(engine: Engine, idx: usize) -> String {
 /// celui de l'album. Partage entre les recommandations et les « top mixes »,
 /// qui prenaient tous deux le genre d'un album homonyme (#2731).
 ///
-/// ATTENTION : telle quelle, cette requete ECHOUE sur les deux moteurs —
-/// `WHERE genre IS NOT NULL` est ambigu entre `t.genre` et `a.genre`, et
-/// l'erreur est avalee par le `unwrap_or_default` des appelants. La jointure
-/// est corrigee ici pour le jour ou la requete sera reveillee ; la reveiller
-/// releve d'un arbitrage produit (cf. le test
-/// `les_genres_les_plus_ecoutes_ne_rendent_rien_ambiguite_sur_genre`), pas du
-/// defaut d'homonymie.
+/// Le filtre sur le genre se pose sur la sous-requete `g`, ou `genre`
+/// n'existe qu'une fois. Pose DANS la sous-requete, a cote de `t.genre` et
+/// `a.genre`, `WHERE genre IS NOT NULL` etait ambigu pour les deux moteurs —
+/// « column reference "genre" is ambiguous » dans le journal de jfpaquet
+/// (#3181, PostgreSQL), « ambiguous column name: genre » sur SQLite — et
+/// l'echec, avale par `ou_defaut_journalise`, faisait tirer « A decouvrir »
+/// au hasard et laissait les « top mixes » vides, sans rien dire a l'ecran.
+///
+/// L'alias `g` n'est pas decoratif : jusqu'a PostgreSQL 15, une sous-requete
+/// de `FROM` doit en porter un. Le second critere de tri rend l'ordre des
+/// ex aequo defini, donc le meme sur les deux moteurs.
 fn sql_top_genres() -> String {
     format!(
-        "SELECT genre, COUNT(*) as cnt \
-         FROM (SELECT COALESCE(t.genre, a.genre) as genre \
+        "SELECT g.genre, COUNT(*) AS cnt \
+         FROM (SELECT COALESCE(t.genre, a.genre) AS genre \
                FROM listen_history lh \
                LEFT JOIN tracks t ON lh.track_id = t.id \
-               LEFT JOIN albums a ON {HISTORIQUE_VERS_ALBUM} \
-               WHERE genre IS NOT NULL AND genre != '') \
-         GROUP BY genre ORDER BY cnt DESC LIMIT 5"
+               LEFT JOIN albums a ON {HISTORIQUE_VERS_ALBUM}) g \
+         WHERE g.genre IS NOT NULL AND g.genre <> '' \
+         GROUP BY g.genre ORDER BY cnt DESC, g.genre LIMIT 5"
     )
 }
 
@@ -515,9 +519,39 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                     // `context_id` et sa `source`, a charge du client de la
                     // nommer. Mieux qu'un titre de piste presente pour un nom
                     // de playlist.
-                    o.insert("title".into(), json!(playlists.get(&id)));
+                    let nom = playlists.get(&id);
+                    o.insert("title".into(), json!(nom));
                     o.insert("album_id".into(), Value::Null);
-                    o.insert("album_title".into(), Value::Null);
+                    // 🔴 #3425 — la vignette muette.
+                    //
+                    // Le raisonnement ci-dessus tient : un titre de piste
+                    // presente comme nom de playlist serait un mensonge, et
+                    // `title` reste donc nul pour une playlist de streaming.
+                    // Mais sa CONCLUSION — « a charge du client de la nommer »
+                    // — laissait le client sans rien : `album_title` etait
+                    // efface LUI AUSSI, alors que la ligne d'historique le
+                    // porte, et l'entree repartait sans AUCUN libelle.
+                    //
+                    // Mesure du 05/09 sur le .42 : trois vignettes sur huit
+                    // dans ce cas. Ce que les clients en font, faute de mieux :
+                    // `HomeView.svelte` affiche `title ?? album_title ?? ''`,
+                    // donc une tuile VIDE au clic mort ; `accueilWidgets.ts`
+                    // replie sur `'—'` puis JETTE l'entree quand elle n'a pas
+                    // de pochette. Une vignette anonyme est pire que les deux
+                    // options que le commentaire d'origine ecartait.
+                    //
+                    // Aucun client ne peut inventer le nom d'une playlist
+                    // Qobuz a partir de son seul identifiant sans un
+                    // aller-retour vers le service, vignette par vignette.
+                    //
+                    // On ne garde donc `album_title` QUE la ou il remplace
+                    // un vide : la playlist LOCALE a son nom et n'en a pas
+                    // besoin — l'album de la derniere piste n'y ajouterait
+                    // qu'un second libelle concurrent. C'est le disque
+                    // reellement ecoute, pas un nom de playlist invente.
+                    if nom.is_some() {
+                        o.insert("album_title".into(), Value::Null);
+                    }
                 }
                 "artist" => {
                     // L'artiste demande, pas celui de la derniere piste jouee :
@@ -857,30 +891,127 @@ mod tests_homonymes {
         );
     }
 
-    /// Constat de bordure, releve en voulant eprouver le meme defaut du cote
-    /// des recommandations : `sql_top_genres` ne rend RIEN, sur les deux
-    /// moteurs. `WHERE genre IS NOT NULL` se heurte a `t.genre` et `a.genre`
-    /// — « ambiguous column name: genre » — et l'erreur est avalee par le
-    /// `unwrap_or_default` de l'appelant. « A decouvrir » tire donc toujours
-    /// au hasard, et « top mixes » est toujours vide.
-    ///
-    /// Consequence pour #2731 : la jointure corrigee dans `sql_top_genres` et
-    /// le `NOT EXISTS` des recommandations sont ecrits juste, mais aucun test
-    /// ne peut les atteindre tant que cette requete ne s'execute pas. Reveiller
-    /// la requete change ce que l'accueil AFFICHE (le hasard cede la place aux
-    /// albums d'un genre, qui peuvent etre zero) : c'est un arbitrage produit,
-    /// pas le defaut de Tades. Il est laisse hors de ce correctif, et ce test
-    /// le fige pour qu'on ne le decouvre pas deux fois.
+    /// Les genres les plus ecoutes, tels que la requete les rend.
+    fn genres_ecoutes(state: &AppState) -> Vec<(String, i64)> {
+        let Ok(lignes) = state.backend.query_many(&sql_top_genres(), &[]) else {
+            panic!("la requete des genres doit repondre")
+        };
+        lignes
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                )
+            })
+            .collect()
+    }
+
+    /// #3181 — la requete des genres REPOND. Avant, `WHERE genre IS NOT NULL`
+    /// pose dans la sous-requete etait ambigu entre `t.genre` et `a.genre`
+    /// (« ambiguous column name: genre » sur SQLite, « column reference
+    /// "genre" is ambiguous » sur PostgreSQL) : elle echouait sur les deux
+    /// moteurs, l'echec etait avale, « A decouvrir » tirait au hasard et les
+    /// « top mixes » restaient vides. Ce test tombe sur l'ancienne forme.
     #[test]
-    fn les_genres_les_plus_ecoutes_ne_rendent_rien_ambiguite_sur_genre() {
+    fn les_genres_les_plus_ecoutes_comptent_le_genre_de_l_album() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let (_police, pulp) = deux_live(&state, Some("Rock"));
         ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+        ecoute(&state, "Disco 2000", Some("Pulp"), Some(pulp));
 
+        assert_eq!(genres_ecoutes(&state), vec![("Rock".to_string(), 2)]);
+    }
+
+    /// Le genre de la PISTE prime sur celui de l'album quand la piste est
+    /// connue — c'est le `COALESCE(t.genre, a.genre)`, jusqu'ici jamais
+    /// atteint par un test puisque la requete ne s'executait pas.
+    #[test]
+    fn le_genre_de_la_piste_prime_sur_celui_de_l_album() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, pulp) = deux_live(&state, Some("Rock"));
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path, genre) \
+             SELECT 'Common People', id, artist_id, 351000, '/pulp/common.flac', 'Britpop' \
+             FROM albums WHERE id = ?1",
+            &[&pulp as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let piste = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO listen_history \
+             (title, artist_name, album_title, album_id, track_id, listened_at) \
+             VALUES ('Common People', 'Pulp', 'Live', ?1, ?2, '2026-08-28T22:45:00Z')",
+            &[&pulp as &dyn ToSqlValue, &piste as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+        assert_eq!(genres_ecoutes(&state), vec![("Britpop".to_string(), 1)]);
+    }
+
+    /// « A decouvrir » recommande un album du genre ecoute que l'auditeur n'a
+    /// pas encore entendu — et non plus n'importe quoi.
+    #[test]
+    fn a_decouvrir_propose_un_album_du_genre_ecoute_pas_encore_entendu() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (police, pulp) = deux_live(&state, Some("Rock"));
+        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+
+        let Ok(items) = fetch_recommendations(&state, 20) else {
+            panic!("la requete doit repondre")
+        };
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["id"].as_i64(), Some(police));
+        assert_eq!(items[0]["reason"].as_str(), Some("genre_match"));
+    }
+
+    /// Reveiller la requete ne doit pas VIDER la section : quand tout ce qui
+    /// est du genre a deja ete ecoute, le hasard reprend, comme avant.
+    #[test]
+    fn a_decouvrir_retombe_sur_le_hasard_quand_le_genre_est_epuise() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (police, pulp) = deux_live(&state, Some("Rock"));
+        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+        ecoute(&state, "Roxanne", Some("The Police"), Some(police));
+
+        let Ok(items) = fetch_recommendations(&state, 20) else {
+            panic!("la requete doit repondre")
+        };
+        assert_eq!(items.len(), 2, "albums rendus : {items:?}");
         assert!(
-            state.backend.query_many(&sql_top_genres(), &[]).is_err(),
-            "si cette requete se met a repondre, les deux jointures corrigees \
-             deviennent testables — et « A decouvrir » cesse d'etre aleatoire"
+            items.iter().all(|i| i["reason"].as_str() == Some("random")),
+            "albums rendus : {items:?}"
+        );
+    }
+
+    /// Les « top mixes » ne sont plus vides : un mix par genre ecoute, garni
+    /// des pistes de ce genre.
+    #[tokio::test]
+    async fn les_top_mixes_rendent_un_mix_du_genre_ecoute() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, pulp) = deux_live(&state, Some("Rock"));
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+                 SELECT 'Common People', id, artist_id, 351000, '/pulp/common.flac' \
+                 FROM albums WHERE id = ?1",
+                &[&pulp as &dyn ToSqlValue],
+            )
+            .unwrap();
+        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+
+        let Ok(Json(mixes)) = top_mixes(State(state)).await else {
+            panic!("la route doit repondre")
+        };
+        let mixes = mixes.as_array().expect("mixes");
+        assert_eq!(mixes.len(), 1, "mixes rendus : {mixes:?}");
+        assert_eq!(mixes[0]["genre"].as_str(), Some("Rock"));
+        assert_eq!(mixes[0]["play_count"].as_i64(), Some(1));
+        assert_eq!(
+            mixes[0]["tracks"][0]["title"].as_str(),
+            Some("Common People")
         );
     }
 }
@@ -1077,6 +1208,96 @@ mod tests_contextes {
             items[0]["title"].is_null(),
             "pas de nom en base : mieux vaut un titre nul que le titre de la \
              piste presente pour un nom de playlist — {items:?}"
+        );
+    }
+
+    /// 🔴 #3425 — mais elle ne doit pas repartir SANS AUCUN libelle.
+    ///
+    /// `title` nul est une decision, et elle tient. Effacer `album_title` EN
+    /// PLUS n'en etait pas une : la ligne d'historique le porte, et sans lui
+    /// la vignette n'a plus rien a afficher. Mesure du 05/09 sur le .42 :
+    /// trois vignettes sur huit muettes.
+    ///
+    /// L'epreuve porte sur l'invariant que l'ecran attend, pas sur une valeur
+    /// de commodite : une entree de « Continuer l'ecoute » doit toujours
+    /// porter AU MOINS UN libelle quand la base en connait un.
+    #[test]
+    fn une_playlist_de_streaming_garde_le_titre_d_album_de_l_historique() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        ecoute_avec_contexte(
+            &state,
+            "Family Affair",
+            Some("Sly & The Family Stone"),
+            Some("There's a Riot Goin' On"),
+            None,
+            "playlist",
+            "58698608",
+            Some(3),
+            "2026-09-05T21:10:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "l'entree a ete perdue : {items:?}");
+        assert_eq!(items[0]["context_type"], "playlist");
+        // La decision d'origine ne bouge pas : pas de nom en base, pas de
+        // titre invente.
+        assert!(
+            items[0]["title"].is_null(),
+            "le titre de la piste ne doit toujours pas passer pour un nom de \
+             playlist — {items:?}"
+        );
+        assert_eq!(
+            items[0]["album_title"], "There's a Riot Goin' On",
+            "l'historique porte le disque ecoute : l'effacer laissait la \
+             vignette sans aucun libelle — {items:?}"
+        );
+        // L'invariant, enonce tel que l'ecran le lit : `title ?? album_title`
+        // (HomeView.svelte) et `champ(o,'title','name','album_title',…)`
+        // (accueilWidgets.ts) doivent trouver quelque chose.
+        assert!(
+            !items[0]["title"].is_null() || !items[0]["album_title"].is_null(),
+            "entree sans AUCUN libelle : c'est exactement la vignette muette \
+             de #3425 — {items:?}"
+        );
+    }
+
+    /// Temoin vert — une playlist LOCALE ne gagne pas un second libelle.
+    ///
+    /// Elle a son nom : y ajouter l'album de la derniere piste poserait deux
+    /// libelles concurrents sur la meme vignette. Le correctif ne remplit un
+    /// vide que la ou il y en a un.
+    #[test]
+    fn une_playlist_locale_n_expose_toujours_pas_de_titre_d_album() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute("INSERT INTO playlists (name) VALUES ('Route de nuit')", &[])
+            .unwrap();
+        let playlist_id = state.backend.last_insert_rowid();
+        ecoute_avec_contexte(
+            &state,
+            "So What",
+            Some("Miles Davis"),
+            Some("Kind of Blue"),
+            None,
+            "playlist",
+            &playlist_id.to_string(),
+            Some(6),
+            "2026-09-05T21:10:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items[0]["title"], "Route de nuit");
+        assert!(
+            items[0]["album_title"].is_null(),
+            "la playlist locale a deja son nom : l'album de la derniere piste \
+             n'a rien a faire sur la vignette — {items:?}"
         );
     }
 
@@ -1532,44 +1753,50 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
         .collect();
 
-    if top_genres.is_empty() {
-        // Fallback: return random albums
-        let p1 = ph(engine, 1);
-        let sql = format!(
-            "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
-                   FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id \
-                   ORDER BY RANDOM() LIMIT {p1}"
-        );
-        let params: [&dyn ToSqlValue; 1] = [&limit];
-        let rows = state
-            .backend
-            .query_many(&sql, &params)
-            .ou_defaut_journalise();
-        return Ok(rows
-            .iter()
-            .map(|cols| {
-                json!({
-                    "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
-                    "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
-                    "artist_name": cols.get(2).and_then(|v| v.as_string()),
-                    "year": cols.get(3).and_then(|v| v.as_i64()),
-                    "cover_path": cols.get(4).and_then(|v| v.as_string()),
-                    "genre": cols.get(5).and_then(|v| v.as_string()),
-                    "reason": "random",
-                })
-            })
-            .collect());
+    // Les albums des genres ecoutes que l'auditeur n'a pas encore entendus.
+    // S'il n'y en a aucun — pas d'historique, historique sans genre, ou tout
+    // le genre deja ecoute — on retombe sur le hasard, comme avant. Depuis
+    // #3181 la requete des genres repond enfin : la section ne doit pas se
+    // VIDER le jour ou elle se met a recommander pour de vrai.
+    let par_genre = if top_genres.is_empty() {
+        Vec::new()
+    } else {
+        albums_du_genre_non_ecoutes(state, &top_genres, limit)
+    };
+    if !par_genre.is_empty() {
+        return Ok(par_genre);
     }
 
-    // Find albums matching top genres that the user hasn't listened to.
+    // Fallback: return random albums
+    let p1 = ph(engine, 1);
+    let sql = format!(
+        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
+               FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id \
+               ORDER BY RANDOM() LIMIT {p1}"
+    );
+    let params: [&dyn ToSqlValue; 1] = [&limit];
+    let rows = state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise();
+    Ok(rows
+        .iter()
+        .map(|cols| album_recommande(cols, "random"))
+        .collect())
+}
+
+/// Les albums des `genres` donnes que l'historique ne connait pas, au hasard,
+/// `limit` au plus.
+fn albums_du_genre_non_ecoutes(state: &AppState, genres: &[String], limit: i64) -> Vec<Value> {
+    let engine = state.backend.engine();
     // Build engine-specific placeholders for the IN clause.
-    let genre_placeholders: String = top_genres
+    let genre_placeholders: String = genres
         .iter()
         .enumerate()
         .map(|(i, _)| ph(engine, i + 1))
         .collect::<Vec<_>>()
         .join(",");
-    let limit_ph = ph(engine, top_genres.len() + 1);
+    let limit_ph = ph(engine, genres.len() + 1);
     let sql = format!(
         "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
          FROM albums a \
@@ -1582,31 +1809,34 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
     );
 
     // Build a Vec of owned SqlValue-able params: genres + limit.
-    let mut param_vals: Vec<Box<dyn ToSqlValue>> = top_genres
+    let mut param_vals: Vec<Box<dyn ToSqlValue>> = genres
         .iter()
         .map(|g| Box::new(g.clone()) as Box<dyn ToSqlValue>)
         .collect();
     param_vals.push(Box::new(limit));
     let param_refs: Vec<&dyn ToSqlValue> = param_vals.iter().map(|p| p.as_ref()).collect();
 
-    let rows = state
+    state
         .backend
         .query_many(&sql, &param_refs)
-        .ou_defaut_journalise();
-    Ok(rows
+        .ou_defaut_journalise()
         .iter()
-        .map(|cols| {
-            json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
-                "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
-                "artist_name": cols.get(2).and_then(|v| v.as_string()),
-                "year": cols.get(3).and_then(|v| v.as_i64()),
-                "cover_path": cols.get(4).and_then(|v| v.as_string()),
-                "genre": cols.get(5).and_then(|v| v.as_string()),
-                "reason": "genre_match",
-            })
-        })
-        .collect())
+        .map(|cols| album_recommande(cols, "genre_match"))
+        .collect()
+}
+
+/// Une ligne `a.id, a.title, ar.name, a.year, a.cover_path, a.genre` dans la
+/// forme que l'ecran lit, avec la raison pour laquelle on la propose.
+fn album_recommande(cols: &[tune_core::db::backend::SqlValue], raison: &str) -> Value {
+    json!({
+        "id": cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+        "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        "artist_name": cols.get(2).and_then(|v| v.as_string()),
+        "year": cols.get(3).and_then(|v| v.as_i64()),
+        "cover_path": cols.get(4).and_then(|v| v.as_string()),
+        "genre": cols.get(5).and_then(|v| v.as_string()),
+        "reason": raison,
+    })
 }
 
 /// Auto-generated "mixes" by genre from top genres in history.

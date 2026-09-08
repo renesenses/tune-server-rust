@@ -816,13 +816,10 @@ async fn handle_ssdp_discovered(
             }),
         );
     } else if !is_tv {
-        // Check zone_auto_create setting
-        let auto_create = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
-            .get("zone_auto_create")
-            .ok()
-            .flatten()
-            .map(|v| v != "false")
-            .unwrap_or(true);
+        // Check zone_auto_create setting — #3529 : lecture unique, portée par
+        // `ZoneRepo`. Elle était recopiée mot pour mot en cinq endroits, ce
+        // qui a permis à cinq autres chemins de ne jamais la recopier.
+        let auto_create = zone_repo.zone_auto_create_autorise();
         if !auto_create {
             info!(name = %dev.name, id = %dev.id, "ssdp_zone_auto_create_disabled_skipping");
             return;
@@ -922,6 +919,19 @@ async fn handle_ssdp_discovered(
                 // Persist host + MAC so a later UUID change, protocol change
                 // or DHCP renumbering reconnects here (#942, #1239).
                 let _ = zone_repo.set_identity(zid, &dev.host, dev.mac_address.as_deref());
+                // #3589 — « à la découverte d'un appareil reconnu ». C'est
+                // ICI, et à la création manuelle, que « personne n'a rien
+                // réglé » est vrai par construction : la zone n'existait pas
+                // il y a une ligne. La provenance s'ouvre AVANT, sinon la
+                // préconfiguration refuse d'agir — c'est voulu.
+                crate::routes::zones::ouvrir_provenance_de_zone(db, zid);
+                crate::routes::zones::preconfigurer_zone_decouverte(
+                    db,
+                    zid,
+                    dev.manufacturer.as_deref(),
+                    dev.model.as_deref(),
+                    Some(type_str),
+                );
                 event_bus.emit_typed(
                     EventType::ZoneCreated,
                     charge_utile_zone_creee(
@@ -1170,6 +1180,10 @@ pub fn spawn_mdns_handler(
             .with_bluos()
             .with_oaat()
             .with_squeezebox()
+            // Lecteurs Sendspin (#3326, phase 1). On les PARCOURT sans jamais
+            // enregistrer de sortie : voir le bras `OutputType::Sendspin` du
+            // `match` ci-dessous.
+            .with_sendspin()
             // Browse peer Tune servers too, so this server can list the other
             // Tune servers on the network (#1273). Each server already announces
             // itself via `register_self`; without this it never browsed back.
@@ -1352,6 +1366,32 @@ pub fn spawn_mdns_handler(
                                 info!(host = %lms_addr, "mdns_lms_discovered_auto_configured");
                             }
                             (None, "squeezebox")
+                        }
+                        // Sendspin (#3326) — phase 1 : DÉCOUVERTE SEULE.
+                        //
+                        // On rend `None` volontairement. Tout ce qui suit dans
+                        // cette boucle — enregistrement de la sortie,
+                        // reconnexion, création automatique de zone, montée en
+                        // priorité — est gardé par `if let Some(output)` :
+                        // aucune zone Sendspin ne peut donc naître, et aucune
+                        // zone existante ne peut être capturée par une annonce
+                        // Sendspin. C'est exactement ce qu'on veut tant que la
+                        // lecture n'existe pas : un appareil visible, jamais un
+                        // appareil qui promet.
+                        //
+                        // La liste, elle, est servie par `GET /devices/sendspin`.
+                        OutputType::Sendspin => {
+                            info!(
+                                name = %dev.name,
+                                host = %dev.host,
+                                port = dev.port,
+                                path = ?dev
+                                    .capabilities
+                                    .get(tune_core::discovery::sendspin::CLE_CHEMIN)
+                                    .and_then(|v| v.as_str()),
+                                "sendspin_lecteur_decouvert_sans_sortie"
+                            );
+                            (None, "sendspin")
                         }
                         _ => (None, ""),
                     };
@@ -1550,16 +1590,9 @@ pub fn spawn_mdns_handler(
                                             "mdns_zone_skipped_conflicting_protocol"
                                         );
                                     } else {
-                                        // Check zone_auto_create setting
-                                        let auto_create =
-                                        tune_core::db::settings_repo::SettingsRepo::with_backend(
-                                            db.clone(),
-                                        )
-                                        .get("zone_auto_create")
-                                        .ok()
-                                        .flatten()
-                                        .map(|v| v != "false")
-                                        .unwrap_or(true);
+                                        // Check zone_auto_create setting (#3529 :
+                                        // lecture unique, portée par `ZoneRepo`).
+                                        let auto_create = zone_repo.zone_auto_create_autorise();
                                         if !auto_create {
                                             info!(name = %dev.name, id = %dev.id, "mdns_zone_auto_create_disabled_skipping");
                                         } else {
@@ -2033,15 +2066,8 @@ pub fn spawn_output_providers(
                             set_zone_online(&event_bus, &db, &dev_id, true);
                             info!(name = %name, id = %dev_id, old_id = ?z.output_device_id, "provider_zone_device_updated");
                         } else {
-                            let auto_create =
-                                tune_core::db::settings_repo::SettingsRepo::with_backend(
-                                    db.clone(),
-                                )
-                                .get("zone_auto_create")
-                                .ok()
-                                .flatten()
-                                .map(|v| v != "false")
-                                .unwrap_or(true);
+                            // #3529 : lecture unique, portée par `ZoneRepo`.
+                            let auto_create = zone_repo.zone_auto_create_autorise();
                             if !auto_create {
                                 info!(name = %name, id = %dev_id, "provider_zone_auto_create_disabled_skipping");
                             } else {

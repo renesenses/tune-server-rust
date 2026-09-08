@@ -17,6 +17,10 @@ struct DecisionLocale {
     /// LAT-F1 (phase 1) : traitement actif, zone réseau, opt-in armé et
     /// renderer LPCM — la cible part en WAV progressif au lieu du fichier.
     dsp_progressif_wav: bool,
+    /// #3311 : source `.ape`, zone réseau, renderer LPCM annoncé — la cible
+    /// part en WAV progressif, seul bras qui décode le Monkey's Audio au fil
+    /// de l'eau depuis #2505.
+    ape_flux_wav: bool,
     is_chromecast: bool,
     is_local_output: bool,
     is_network_output: bool,
@@ -667,10 +671,13 @@ impl PlaybackOrchestrator {
         // Only meaningful when the source is deeper than 16-bit.
         // Flag zone `dlna_cap_16bit` OR quirk catalogue `force_16bit` (additif :
         // le quirk ne peut que l'activer, jamais le désactiver — Ruark R3 #1137).
-        let dlna_cap_16bit = is_network_output
-            && bit_depth > 16
-            && (ZoneRepo::with_backend(self.db.clone()).get_dlna_cap_16bit(req.zone_id)
-                || device_quirks.force_16bit);
+        // Par la MÊME fonction que le miroir du chemin du signal (#3183).
+        let dlna_cap_16bit = dlna_cap_16bit_applies(
+            is_network_output,
+            bit_depth,
+            ZoneRepo::with_backend(self.db.clone()).get_dlna_cap_16bit(req.zone_id),
+            device_quirks.force_16bit,
+        );
         let alac_passthrough = source_format == Some(AudioFormat::Alac)
             && is_network_output
             && !dlna_force_wav
@@ -696,18 +703,17 @@ impl PlaybackOrchestrator {
         // track never leaves position 0; auto-advance then skips to the next
         // track every few seconds and the shuffle-all queue "resets" endlessly,
         // never becoming audible (forum #1210, Mika, BeoPlay A9 via CAST).
+        //
+        // La condition vit dans `regles.rs` depuis #3183 : le miroir du chemin
+        // du signal la recopiait SANS le bras Chromecast.
         let is_chromecast = zone_output_type.as_deref() == Some("chromecast");
-        let needs_transcode_for_output = is_network_output
-            && !dsd_passthrough
-            && !alac_passthrough
-            && !aac_passthrough
-            && source_format.as_ref().is_some_and(|f| {
-                if is_chromecast {
-                    f.needs_transcode_for_chromecast()
-                } else {
-                    f.needs_transcode_for_dlna()
-                }
-            });
+        let needs_transcode_for_output = needs_transcode_for_output_applies(
+            zone_output_type.as_deref(),
+            source_format,
+            dsd_passthrough,
+            alac_passthrough,
+            aac_passthrough,
+        );
 
         // DLNA format negotiation: if the output will be FLAC (either source
         // is FLAC, or source needs transcode and target is FLAC), check that
@@ -845,6 +851,32 @@ impl PlaybackOrchestrator {
                 renderer_accepte_lpcm,
             )
         };
+        // #3311 — le décodeur `.ape` incrémental livré en v0.9.131 (#2505) est
+        // branché sur le SEUL bras progressif. Sur une zone réseau la cible est
+        // le FLAC ré-encodé (ou le WAV `dlna_needs_wav`), et les deux repassent
+        // par le fichier : la piste entière décodée en mémoire avant le premier
+        // octet — 2,37 Gio de pic mesurés pour une image de CD d'une heure —
+        // et un REFUS net au-delà de 2 Gio de PCM déclaré. Aucun `.ape` joué
+        // sur une zone réseau n'atteignait donc le correctif annoncé.
+        //
+        // Le format servi sur le fil change : la sonde LPCM du renderer est
+        // consultée d'abord, exactement comme pour `dsp_progressif_wav`, et
+        // une sonde inconcluante garde le FLAC.
+        let ape_flux_wav = {
+            let src_est_ape = source_format == Some(AudioFormat::Ape);
+            let candidat = cible_wav_pour_ape_reseau(src_est_ape, is_network_output, true);
+            let renderer_accepte_lpcm = if candidat {
+                let did = req
+                    .output_device_id
+                    .as_deref()
+                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+                    .unwrap_or("");
+                !did.is_empty() && self.dlna_accepte_lpcm(did, bit_depth > 16).await
+            } else {
+                false
+            };
+            cible_wav_pour_ape_reseau(src_est_ape, is_network_output, renderer_accepte_lpcm)
+        };
 
         let needs_transcode = needs_transcode_for_output
             || oaat_needs_wav
@@ -882,6 +914,7 @@ impl PlaybackOrchestrator {
             is_chromecast,
             is_local_output,
             dsp_progressif_wav,
+            ape_flux_wav,
             is_network_output,
             local_needs_wav,
             needs_downsample,
@@ -1098,18 +1131,25 @@ impl PlaybackOrchestrator {
     }
 
     /// Ce que `transcoder_en_session` déciderait du relais DSP, sans rien
-    /// décoder : `(traitement actif, relais armé)`.
+    /// décoder : `(traitement actif, relais armé, crossfeed exécutable)`.
     ///
     /// Les deux valeurs comptent séparément. Une sortie locale avec égaliseur
     /// a bien un traitement ACTIF — c'est ce qui rendait le cumul possible —
     /// et ne doit pourtant pas armer le relais, puisqu'elle applique ce même
     /// traitement elle-même. Un test qui ne regarderait que la seconde ne
     /// distinguerait pas « la garde tient » de « la zone n'a pas d'EQ ».
+    ///
+    /// Le troisième fait est venu d'une contre-épreuve : poser `channels: 0`
+    /// dans `load_streaming_dsp` rend le crossfeed INERTE sur toute zone
+    /// réseau — `process_pcm` sort avant d'écrire un octet — et les trois
+    /// gardes du correctif restaient VERTES, la garde de site comprise, parce
+    /// qu'aucune ne regardait le porteur réellement construit. Celle-ci le
+    /// regarde.
     #[cfg(test)]
     pub(super) async fn relais_dsp_pour_test(
         &self,
         req: &PlayRequest,
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<(bool, bool, bool), String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
         let track = TrackRepo::with_backend(self.db.clone())
             .get(track_id)
@@ -1133,6 +1173,7 @@ impl PlaybackOrchestrator {
         Ok((
             actif,
             relais_dsp_progressif(actif, decision.is_local_output),
+            dsp.crossfeed_executable(),
         ))
     }
 
@@ -1154,6 +1195,7 @@ impl PlaybackOrchestrator {
             dlna_needs_wav,
             dlna_wav24,
             dsp_progressif_wav,
+            ape_flux_wav,
             eq_forces_transcode,
             is_browser_output,
             is_chromecast,
@@ -1219,8 +1261,21 @@ impl PlaybackOrchestrator {
             // catches FLAC-capable renderers (Linn) that were paying the full
             // ~80s stall for nothing.
             AudioFormat::Wav
+        } else if ape_flux_wav {
+            // #3311 — Monkey's Audio vers un renderer réseau : WAV progressif,
+            // pas FLAC ré-encodé par le fichier entier. Même mécanisme que la
+            // branche DSD juste au-dessus, un cran plus grave : le seul
+            // décodeur `.ape` incrémental (#2505, livré en v0.9.131) est celui
+            // du bras progressif, et le bras fichier REFUSE net au-delà de
+            // 2 Gio de PCM déclaré (24/96 au-delà de ~52 min). Le renderer a
+            // ANNONCÉ le LPCM — sans quoi `ape_flux_wav` serait faux et le
+            // FLAC resterait la cible, comme avant.
+            info!(zone_id = req.zone_id, "ape_flux_wav_target");
+            AudioFormat::Wav
         } else {
-            src_fmt.dlna_transcode_target()
+            // #3357 : l'encodeur n'écrit que WAV et FLAC ; une cible AIFF (ou
+            // MP3, OGG) devenait du FLAC en silence, servi sous `audio/aiff`.
+            cible_encodable(src_fmt.dlna_transcode_target())
         };
         let mut out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
         // Apply zone max_sample_rate cap
@@ -1370,11 +1425,18 @@ impl PlaybackOrchestrator {
                 .flatten()
                 .as_deref()
                 == Some("true");
+        // Un `.ape` vers un renderer LPCM diffuse lui aussi, et pour une raison
+        // plus dure encore que le DSD : le bras fichier n'a AUCUN décodeur
+        // Monkey's Audio incrémental (#3311). La condition sur `target_fmt`
+        // vaut pour les deux issues — la branche `ape_flux_wav` ci-dessus, et
+        // le WAV que `dlna_needs_wav` impose déjà à un renderer sans
+        // `audio/flac`, que ce prédicat renvoyait au fichier.
+        let wav_diffusable = dsd_lpcm_streams || (ape_flux_wav && target_fmt == AudioFormat::Wav);
         let use_file_transcode = use_file_transcode_for(
             is_network_output,
             target_format_str == "wav",
             dlna_needs_wav,
-            dsd_lpcm_streams,
+            wav_diffusable,
             // Une zone dont un TRAITEMENT est actif doit l'entendre. Depuis
             // LAT-F1 (phase 0), le bras progressif applique lui-même
             // égaliseur, convolveur et ReplayGain au fil de l'eau (relais
@@ -1402,6 +1464,53 @@ impl PlaybackOrchestrator {
             duration_ms: Some(track_duration_ms as u64),
             ..Default::default()
         };
+        // ── #3479 : le pendant RÉSEAU de `eq_change_journal` ────────────────
+        //
+        // Sur une sortie locale, l'égaliseur ne change pas le format : c'est
+        // `eq_change_journal` (`dsp.rs`) qui le dit, et qui chiffre le niveau
+        // retiré. Ici, le format change POUR DE BON — c'est même le seul motif
+        // du transcodage — et deux choses peuvent alors produire un silence
+        // complet plutôt qu'un son altéré :
+        //
+        // 1. **l'étiquette ment sur la charge utile.** `AudioEncoder::start_sync`
+        //    substitue silencieusement du FLAC à toute cible qu'il ne sait pas
+        //    écrire (`aiff`, `mp3`, `ogg`…), tandis que `out_mime` et `out_ext`
+        //    viennent de la cible DEMANDÉE. Le renderer reçoit des octets FLAC
+        //    étiquetés `audio/aiff` et reste muet (#3357, mesuré chez Cyrille :
+        //    60 207 920 octets servis pour 72 765 000 attendus en AIFF) ;
+        // 2. **le fichier entier passe avant le premier octet**
+        //    (`fichier_entier`) — 46 à 62 s de silence apparent (#3357, annexe).
+        //
+        // Aucune trace ne reliait la cible demandée à ce que l'encodeur écrit
+        // vraiment : `transcode_required` nomme source et cible, jamais le MIME
+        // servi ni l'encodeur effectif. `etiquette_conforme` est ce lien.
+        if eq_forces_transcode {
+            let encodeur_effectif = crate::audio::encoder::format_effectif(&target_format_str);
+            info!(
+                zone_id = req.zone_id,
+                famille = if is_browser_output {
+                    "navigateur"
+                } else if is_network_output {
+                    "reseau"
+                } else {
+                    "pull"
+                },
+                format_avant = ?src_fmt,
+                taux_avant = sample_rate,
+                profondeur_avant = bit_depth,
+                canaux = channels,
+                format_apres = %target_format_str,
+                taux_apres = out_sr,
+                profondeur_apres = out_bd,
+                mime_servi = %out_mime,
+                extension_servie = %out_ext,
+                encodeur_effectif,
+                etiquette_conforme = encodeur_effectif == target_format_str,
+                fichier_entier = use_file_transcode,
+                "eq_format_apres_traitement"
+            );
+        }
+
         FormatDeSortie {
             out_sr,
             out_bd,
@@ -1705,6 +1814,22 @@ impl PlaybackOrchestrator {
                 // de fin doit porter sa propre durée, pour rester lisible
                 // seule dans un export de journal tronqué par la rotation.
                 let file_transcode_start = std::time::Instant::now();
+                // #3444 — le pré-transcodage devient PRÉEMPTIBLE.
+                //
+                // Le verrou par fichier (`_file_hold`, pris juste au-dessus)
+                // est tenu pendant tout ce qui suit : tant que ce transcodage
+                // court, toute autre demande visant le même fichier attend.
+                // Sur le .18 en 0.9.136, un `Aac -> Flac` de 102 s a ainsi
+                // retenu la zone 10 pendant que huit demandes successives
+                // étaient reconnues dépassées sans jamais rien interrompre.
+                // Le drapeau d'abandon suit le travail jusqu'à son écriture,
+                // pour qu'un abandon tardif ne laisse pas de temporaire.
+                let abandon = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let supersession = Supersession {
+                    playback: playback.clone(),
+                    zone_id,
+                    seq: my_seq,
+                };
                 let transcode_result = transcoder_sous_budget(
                     transcode_source_to_file(
                         fp.clone(),
@@ -1717,11 +1842,13 @@ impl PlaybackOrchestrator {
                         replaygain_factor,
                         tmp_path.clone(),
                         Some(progres.clone()),
+                        Some(abandon.clone()),
                     ),
                     progres,
                     politique,
                     PAS_SONDAGE_BUDGET,
                     Some(file_path.as_str()),
+                    Some(&supersession),
                 )
                 .await;
 
@@ -1836,7 +1963,27 @@ impl PlaybackOrchestrator {
                         let _ = std::fs::remove_file(&tmp_path);
                         return Err(format!("transcode failed: {e}"));
                     }
-                    Err(depassement) => {
+                    // #3444 — une demande de lecture plus récente a pris la
+                    // zone : on rend la main SUR PLACE. Le verrou par fichier
+                    // tombe avec le retour, le temporaire part, et le geste le
+                    // plus récent est servi au lieu d'attendre la fin d'un
+                    // travail dont la sortie serait de toute façon jetée
+                    // (`orchestrator_play_superseded_skipping_output`).
+                    Err(FinDeTranscodage::Preempte { gagnant, perdu }) => {
+                        abandon.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = std::fs::remove_file(&tmp_path);
+                        warn!(
+                            zone_id,
+                            file = %file_path,
+                            tmp = %tmp_path,
+                            play_seq_abandonne = my_seq,
+                            play_seq_gagnant = gagnant,
+                            perdu_ms = perdu.as_millis() as u64,
+                            "transcode_abandonne_pour_lecture_plus_recente"
+                        );
+                        return Err(SUPERSEDED_BEFORE_TRANSCODE.into());
+                    }
+                    Err(FinDeTranscodage::Budget(depassement)) => {
                         let budget_s = depassement.budget.as_secs();
                         let size_mb = std::fs::metadata(&fp)
                             .map(|m| m.len() / (1024 * 1024))

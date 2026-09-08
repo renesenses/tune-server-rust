@@ -455,6 +455,30 @@ async fn activate_preset(
 /// fichier arbitraire dans un réglage persisté.
 const TAILLE_MAX_PROFIL: usize = 64 * 1024;
 
+/// Le compte rendu des lignes écartées, tel qu'il part dans la réponse.
+///
+/// Fonction nommée et non expression en ligne : c'est ce que le témoin
+/// `les_filtres_ecartes_partent_avec_leur_ligne_et_leur_raison` APPELLE. Un
+/// test qui recopierait le `json!` du corps de la route ne garderait que
+/// lui-même.
+fn filtres_ignores_json(ignores: &[tune_core::audio::autoeq::FiltreIgnore]) -> Vec<Value> {
+    ignores
+        .iter()
+        .map(|i| {
+            json!({
+                "line": i.ligne,
+                // `null` quand la ligne s'arrête après le « OFF » : le client
+                // affiche alors le numéro seul, ce qui suffit à la retrouver.
+                "filter_type": i.type_filtre,
+                // Clé stable, à traduire côté client…
+                "reason": i.raison.cle(),
+                // …et la phrase de repli pour celui qui ne la connaît pas.
+                "reason_detail": i.raison.to_string(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct ImportAutoEqBody {
     /// Le texte du fichier `… ParametricEQ.txt`, collé ou déposé tel quel.
@@ -494,6 +518,14 @@ struct ImportAutoEqBody {
 /// mais l'utilisateur doit pouvoir rattraper au volume en sachant pourquoi.
 /// D'où `preamp_db`, `reserved_headroom_db` et `preamp_applied` dans la
 /// réponse.
+///
+/// ## Ce qu'elle a compris, ligne par ligne
+///
+/// La réponse ne se contente pas d'un nombre de bandes : `ignored_filters`
+/// nomme chaque ligne écartée — son numéro dans le texte collé, le type écrit,
+/// et une raison en clé stable (`disabled`). Un fichier d'Equalizer APO de dix
+/// lignes dont trois `OFF` donnait « 7 bandes » et un « 3 » sans adresse ;
+/// l'utilisateur devait relire son fichier pour retrouver lesquelles.
 ///
 /// La couverture n'est pas supposée, elle est **vérifiée à chaque import** :
 /// `preamp_covered_by_headroom` compare la marge réellement réservée au
@@ -575,9 +607,14 @@ async fn import_autoeq(
     let mut corps = json!({
         "preset": preset,
         "band_count": profil.bandes.len(),
-        // Écartés, mais comptés : l'écart entre le fichier et le préréglage
-        // s'explique dans la réponse, pas à l'oreille.
-        "ignored_filter_count": profil.filtres_ignores,
+        // Écartés, mais NOMMÉS : l'écart entre le fichier et le préréglage
+        // s'explique dans la réponse, pas à l'oreille. Le compte reste — un
+        // client qui n'affiche qu'un chiffre continue de marcher — et la liste
+        // dit désormais QUELLES lignes, et pourquoi. `reason` est une clé
+        // stable (`disabled`), à traduire côté client ; `reason_detail` est la
+        // phrase de repli pour un client qui ne connaît pas encore la clé.
+        "ignored_filter_count": profil.ignores.len(),
+        "ignored_filters": filtres_ignores_json(&profil.ignores),
         // Ce que le fichier demande…
         "preamp_db": profil.preamp_db,
         // …ce que Tune réserve réellement, et le fait qu'il ne cumule pas.
@@ -638,7 +675,7 @@ fn epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{EqBand, resolve_activation_zone};
+    use super::{EqBand, filtres_ignores_json, resolve_activation_zone};
     use serde_json::json;
 
     #[test]
@@ -704,6 +741,52 @@ mod tests {
         assert_eq!(relue.band_type, "low_shelf");
         // Une correction de casque vaut pour les deux oreilles.
         assert_eq!(relue.channel, None);
+    }
+
+    /// Le compte rendu que la réponse porte : chaque ligne écartée, avec son
+    /// numéro DANS LE TEXTE COLLÉ et sa raison en clé stable.
+    ///
+    /// Le témoin appelle `filtres_ignores_json`, la fonction que la route
+    /// appelle — pas une recopie de son `json!`. Sans ce compte rendu, un
+    /// fichier de quatre filtres dont deux `OFF` répondait « 2 bandes » et
+    /// laissait l'utilisateur chercher les deux autres à la main.
+    #[test]
+    fn les_filtres_ecartes_partent_avec_leur_ligne_et_leur_raison() {
+        let profil = tune_core::audio::autoeq::analyser(
+            "Preamp: -6.1 dB\n\
+             Filter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1\n\
+             Filter 2: OFF LSC Fc 105 Hz Gain 6.4 dB Q 0.70\n\
+             Filter 3: OFF\n",
+        )
+        .expect("profil AutoEq valide");
+
+        let rendu = filtres_ignores_json(&profil.ignores);
+        assert_eq!(profil.bandes.len(), 1);
+        assert_eq!(rendu.len(), 2);
+        // Ligne 3 du texte, et non « filtre 2 » : le Preamp occupe la ligne 1.
+        assert_eq!(rendu[0]["line"], 3);
+        assert_eq!(rendu[0]["filter_type"], "LSC");
+        assert_eq!(rendu[0]["reason"], "disabled");
+        assert!(
+            rendu[0]["reason_detail"].as_str().unwrap().contains("OFF"),
+            "{}",
+            rendu[0]
+        );
+        // « Filter 3: OFF » tout court : pas de type, mais la ligne est là.
+        assert_eq!(rendu[1]["line"], 4);
+        assert!(rendu[1]["filter_type"].is_null(), "{}", rendu[1]);
+    }
+
+    /// Contre-épreuve : un export AutoEq ordinaire n'écarte rien, et le compte
+    /// rendu est VIDE. Une liste qui se remplirait toute seule ne prouverait
+    /// rien de l'autre témoin.
+    #[test]
+    fn un_profil_sans_ligne_off_ne_rend_aucun_filtre_ecarte() {
+        let profil = tune_core::audio::autoeq::analyser(
+            "Preamp: -6.1 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1\n",
+        )
+        .expect("profil AutoEq valide");
+        assert!(filtres_ignores_json(&profil.ignores).is_empty());
     }
 
     /// Un texte qui n'est pas un profil AutoEq doit produire un message

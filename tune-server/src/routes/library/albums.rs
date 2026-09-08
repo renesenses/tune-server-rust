@@ -14,6 +14,7 @@ use tune_core::db::album_repo::{AlbumRepo, DrRange};
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::models::Album;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
@@ -339,8 +340,20 @@ pub(super) async fn get_album(
             // from the payload rather than null when untagged, so a client can
             // simply test for the key instead of distinguishing "no tag" from
             // "measured zero" — DR0 is a real value.
-            if let (Some(obj), Ok(Some(dr))) = (j.as_object_mut(), repo.dynamic_range(id)) {
-                obj.insert("dynamic_range".into(), Value::String(dr));
+            //
+            // `dynamic_range_source` dit d'OÙ sort la valeur (#1388) :
+            // `album_tag` quand une piste porte `ALBUM DYNAMIC RANGE`,
+            // `track_average` quand Tune l'a déduite de la moyenne arrondie des
+            // `DYNAMIC RANGE` des pistes. Les deux clés apparaissent et
+            // disparaissent ENSEMBLE : un client qui ne connaît que la première
+            // ne voit aucun changement, celui qui lit la seconde peut annoncer
+            // une mesure ou une déduction plutôt que de les confondre.
+            if let (Some(obj), Ok(Some(dr))) = (j.as_object_mut(), repo.dynamic_range_detail(id)) {
+                obj.insert("dynamic_range".into(), Value::String(dr.valeur.to_string()));
+                obj.insert(
+                    "dynamic_range_source".into(),
+                    Value::String(dr.source().into()),
+                );
             }
             Json(j).into_response()
         }
@@ -359,9 +372,17 @@ pub(super) async fn album_tracks(
     // forwards it here so the album detail shows only the matching tracks
     // (Sergio: a Hi-Res/FLAC filter must not reveal the album's MP3/44.1
     // tracks). With no filter this is identical to list_by_album.
+    //
+    // `ou_defaut_journalise` et non `unwrap_or_default` (#2861) : une panne de
+    // base rendait ici une liste VIDE, indiscernable d'un album sans piste, et
+    // sans une ligne de journal. Le cas n'est pas theorique sur cette route —
+    // le rapport de jfpaquet du 02/09 (0.9.130, PostgreSQL, fil 1642) porte
+    // trois `panne_sql_avalee` de l'accueil dans la MEME fenetre de journal
+    // (#3181) : sur cette installation, une requete qui echoue en silence est
+    // l'ordinaire, pas l'exception. La reponse HTTP ne bouge pas.
     let items = dedup_display_tracks(
         repo.list_by_album_filtered(id, f.format.as_deref(), f.quality.as_deref())
-            .unwrap_or_default(),
+            .ou_defaut_journalise(),
     );
 
     // GROUPING (#2130) : lu au scan et rangé dans `track_metadata`, il n'était
@@ -374,7 +395,7 @@ pub(super) async fn album_tracks(
     let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
     let grouping = meta_repo
         .get_key_for_tracks("grouping", &track_ids)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
 
     // Dynamic Range par piste (#1388) : le tag `DYNAMIC RANGE` est lu au scan
     // (#1806, `track_metadata['dr_track']`) mais n'était ressorti par aucune
@@ -384,12 +405,19 @@ pub(super) async fn album_tracks(
     // vraie mesure (celle d'un master saturé).
     let dynamic_range = meta_repo
         .get_key_for_tracks("dr_track", &track_ids)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
 
-    Json(json!(attach_track_tags(
+    let mut items = attach_track_tags(
         items,
-        &[("grouping", &grouping), ("dynamic_range", &dynamic_range)]
-    )))
+        &[("grouping", &grouping), ("dynamic_range", &dynamic_range)],
+    );
+    // #3518 — « # Plays » et « Last Played », deux colonnes de la maquette V1
+    // (Levente, 07/09/2026) que la route ne portait pas. C'est LE SITE D'APPEL :
+    // `plays_for_tracks` peut être parfaite dans `history_repo`, sans cette
+    // ligne la route rend les mêmes 31 champs qu'avant et les colonnes restent
+    // `indisponible` côté client.
+    attacher_ecoutes(&state, &mut items);
+    Json(json!(items))
 }
 
 /// Recopie des tags étendus (`track_metadata`) sur les pistes sérialisées
@@ -404,6 +432,56 @@ pub(super) async fn album_tracks(
 /// second recopieur écrit à côté aurait fini par diverger — l'écran aurait vu
 /// `dynamic_range` sur les pistes d'un album et rien, ou autre chose, dans la
 /// table des titres.
+/// Recopie l'écoute par piste sur des pistes sérialisées : `play_count` et
+/// `last_played_at` (#3518).
+///
+/// # Un contrat différent de celui de `attach_track_tags`
+///
+/// Les tags étendus sont ABSENTS quand la piste n'en porte pas. Ici les deux
+/// clés sont TOUJOURS présentes quand la lecture a réussi : `play_count` vaut
+/// `0` et `last_played_at` vaut `null` pour une piste jamais jouée. L'issue le
+/// demande en toutes lettres — « ici un zéro est une information, pas une
+/// absence » —, et un client ne peut pas afficher « jamais joué » sur une clé
+/// qui manque : il ne saurait pas si la route ignore la colonne ou si la piste
+/// n'a jamais tourné.
+///
+/// # Ce qui se passe quand la base échoue
+///
+/// Aucune des deux clés n'est posée. Pas `0` : un zéro dû à une panne se lit
+/// « jamais jouée » et ment. « Une colonne qui se trompe est pire qu'une
+/// colonne absente » est l'argument même du ticket ; il vaut aussi contre nous.
+/// L'échec laisse une trace dans le journal, comme #2861 l'exige pour les
+/// favoris.
+///
+/// Une seule requête pour toute la page, et aucune du tout sur une page vide.
+pub(super) fn attacher_ecoutes(state: &AppState, items: &mut [Value]) {
+    let ids: Vec<i64> = items
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_i64))
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let stats = match HistoryRepo::with_backend(state.backend.clone()).plays_for_tracks(&ids) {
+        Ok(stats) => stats,
+        Err(e) => {
+            tracing::error!(error = %e, "ecoutes_par_piste_illisibles");
+            return;
+        }
+    };
+    for item in items.iter_mut() {
+        let Some(id) = item.get("id").and_then(Value::as_i64) else {
+            continue;
+        };
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let (compte, derniere) = stats.get(&id).cloned().unwrap_or((0, None));
+        obj.insert("play_count".into(), json!(compte));
+        obj.insert("last_played_at".into(), json!(derniere));
+    }
+}
+
 pub(super) fn attach_track_tags(
     items: Vec<tune_core::db::models::Track>,
     tags: &[(&str, &std::collections::HashMap<i64, String>)],
@@ -832,9 +910,10 @@ pub(super) async fn merge_duplicate_albums_route(
     }
     state
         .backend
-        .execute_batch(
-            "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
-        )
+        .execute_batch(&format!(
+            "UPDATE albums SET track_count = {}",
+            tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
+        ))
         .ok();
     Ok(Json(json!({ "merged": deleted, "protected": protegees })))
 }
@@ -1011,6 +1090,115 @@ pub(crate) fn cle_titre(titre: &str) -> String {
     cle
 }
 
+/// Le numéro de TRANCHE que porte un mot de titre : `cd2`, `disc 3`,
+/// `disque 1`, `part 2`, `partie 1`.
+///
+/// Le vocabulaire des **disques** n'est pas redéfini ici : il vient de
+/// [`tune_core::metadata::numero_de_disque`], la fonction que le scan emploie
+/// déjà pour reconnaître un dossier de disque (#1656). Une seconde liste
+/// aurait dérivé de la première au premier ajout.
+///
+/// Seuls `part` / `partie` sont ajoutés, et **uniquement ici** : un dossier
+/// nommé « Part 1 » n'est pas un CD, et l'élargissement du vocabulaire des
+/// dossiers changerait la déduction d'album au scan. Dans un TITRE, en
+/// revanche, « (Part 1) » est bien une tranche — c'est l'un des quatre cas
+/// que #3396 nomme.
+///
+/// `Vol. 2` en est volontairement absent, et cela CONTREDIT le corps de
+/// l'issue, qui le cite parmi les suffixes à retirer. Le commentaire de
+/// `numero_de_disque` tranche l'inverse, avec sa raison : « c'est presque
+/// toujours un vrai titre d'album (« Greatest Hits Vol. 2 »), et le confondre
+/// avec un disque effacerait un album entier ». Fusionner « Greatest Hits
+/// Vol. 1 » et « Greatest Hits Vol. 2 » détruirait une distinction voulue —
+/// exactement le dégât contre lequel l'issue met elle-même en garde deux
+/// paragraphes plus bas.
+fn numero_de_tranche(mot: &str) -> Option<u32> {
+    if let Some(n) = tune_core::metadata::numero_de_disque(mot) {
+        return Some(n);
+    }
+    let mot = mot.trim().to_lowercase();
+    // « partie » avant « part », sinon « partie 2 » se lirait « part » + « ie 2 ».
+    for prefixe in ["partie", "part"] {
+        if let Some(reste) = mot.strip_prefix(prefixe) {
+            return reste
+                .trim_start_matches([' ', '-', '_', '.', '#'])
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n > 0);
+        }
+    }
+    None
+}
+/// [`cle_titre`], puis retrait d'un marqueur de TRANCHE en fin de titre.
+///
+/// ## Ce qui manquait (#3396)
+///
+/// `cle_titre` ne retire rien : `cle_titre("Sgt. Pepper — Disc 1")` rend
+/// `"sgt pepper disc 1"` et `cle_titre("Sgt. Pepper — Disc 2")` rend
+/// `"sgt pepper disc 2"`. Les deux clés diffèrent, donc
+/// [`grouper_les_albums_eclates`] ne les met JAMAIS dans le même faisceau —
+/// alors que c'est le cas d'école du ticket : « un « Disc 1 » / « Disc 2 »
+/// séparés ». Le mécanisme BIB-A2 existait, la clé le rendait aveugle à la
+/// moitié des éclatements qu'il devait voir.
+///
+/// ## Ce que le retrait NE fait pas
+///
+/// - il n'agit qu'en **fin** de titre : « CD1 Sessions » garde sa clé ;
+/// - il exige qu'il RESTE quelque chose : un album qui ne s'appelle que
+///   « CD 2 » garde sa clé entière, sinon tous les albums ainsi nommés
+///   convergeraient sur la clé vide ;
+/// - il ne fusionne rien par lui-même. Le faisceau reste soumis à la même
+///   règle qu'avant — même dossier d'album, deux lignes `albums` — et
+///   l'absorption reste un geste manuel, refusable et annulable par
+///   `album_distinct_pairs`.
+pub(crate) fn cle_titre_sans_tranche(titre: &str) -> String {
+    let cle = cle_titre(titre);
+    let mots: Vec<&str> = cle.split(' ').filter(|m| !m.is_empty()).collect();
+    // « … disc 2 » : le marqueur et son nombre sont deux mots. Il doit rester
+    // au moins un mot de titre devant.
+    if mots.len() >= 3
+        && numero_de_tranche(&format!(
+            "{} {}",
+            mots[mots.len() - 2],
+            mots[mots.len() - 1]
+        ))
+        .is_some()
+    {
+        return mots[..mots.len() - 2].join(" ");
+    }
+    // « … cd2 » : marqueur et nombre collés, un seul mot.
+    if mots.len() >= 2 && numero_de_tranche(mots[mots.len() - 1]).is_some() {
+        return mots[..mots.len() - 1].join(" ");
+    }
+    cle
+}
+/// Le dossier qui porte l'ALBUM : [`dossier_de`], puis un cran de plus quand
+/// le dernier segment n'est QU'un numéro de disque.
+///
+/// ## Ce qui manquait (#3396)
+///
+/// `.../Sgt. Pepper/CD1/01.flac` et `.../Sgt. Pepper/CD2/01.flac` donnaient
+/// deux dossiers différents, donc deux faisceaux distincts, donc aucun
+/// rapprochement — et l'absorption les refusait avec `409
+/// dossiers_differents`. C'est le premier cas que #3396 cite : « un dossier
+/// par CD ».
+///
+/// La reconnaissance du segment est celle du scan
+/// ([`tune_core::metadata::numero_de_disque`], #1656) : `CD1`, `CD 2`,
+/// `Disc-3`, `Disque 1`, `disk04` et rien d'autre. Un dossier `Bonus` ou
+/// `Disco` ne remonte pas.
+pub(crate) fn dossier_de_l_album(chemin: &str) -> &str {
+    let dossier = dossier_de(chemin);
+    let dernier = match dossier.rfind(['/', '\\']) {
+        Some(i) => &dossier[i + 1..],
+        None => dossier,
+    };
+    if tune_core::metadata::numero_de_disque(dernier).is_some() {
+        dossier_de(dossier)
+    } else {
+        dossier
+    }
+}
 /// BIB-A2, phase 0 : les groupes d'albums qui sont PROBABLEMENT un seul album
 /// éclaté. Le faisceau (mesure du 30/08 sur .18 : 93 % des éclatements
 /// viennent de l'enregistreur, qui écrit sous l'artiste de la PISTE) :
@@ -1026,11 +1214,16 @@ pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
     type Faisceaux = BTreeMap<(String, String), BTreeMap<i64, Fiche>>;
     let mut faisceaux: Faisceaux = BTreeMap::new();
     for p in pistes {
-        let dossier = dossier_de(&p.file_path);
+        // Le dossier de l'ALBUM, pas celui du fichier : un coffret rangé en
+        // `.../Album/CD1` et `.../Album/CD2` doit tomber dans un seul
+        // faisceau (#3396).
+        let dossier = dossier_de_l_album(&p.file_path);
         if dossier.is_empty() {
             continue;
         }
-        let cle = cle_titre(&p.album_title);
+        // La clé sans marqueur de tranche : « Album Disc 1 » et
+        // « Album Disc 2 » sont le même album coupé en deux (#3396).
+        let cle = cle_titre_sans_tranche(&p.album_title);
         if cle.is_empty() {
             continue;
         }
@@ -1144,7 +1337,9 @@ fn dossiers_de_l_album(state: &AppState, album_id: i64) -> std::collections::BTr
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| r.first().and_then(|v| v.as_string()))
-        .map(|chemin| dossier_de(&chemin).to_string())
+        // Même dossier d'album qu'en phase 0 : `.../Album/CD1` et
+        // `.../Album/CD2` ont bien `.../Album` en commun (#3396).
+        .map(|chemin| dossier_de_l_album(&chemin).to_string())
         .filter(|d| !d.is_empty())
         .collect()
 }
@@ -1212,7 +1407,11 @@ pub(super) async fn absorber_album(
             "seuls deux albums de la bibliothèque locale se regroupent".to_string(),
         );
     }
-    if cle_titre(&album_cible.title) != cle_titre(&album_doublon.title) {
+    // La MÊME clé que la phase 0, marqueur de tranche retiré. Sans cela, la
+    // phase 0 proposerait « Album Disc 1 » + « Album Disc 2 » et la phase 1
+    // les refuserait par `titres_differents` : une surface ouverte sur un
+    // geste que le serveur décline (#3396).
+    if cle_titre_sans_tranche(&album_cible.title) != cle_titre_sans_tranche(&album_doublon.title) {
         return refus(
             StatusCode::CONFLICT,
             "titres_differents",
@@ -1506,10 +1705,17 @@ pub(super) async fn album_completeness(
         Engine::Sqlite => SqliteDialect.placeholder(1),
     };
 
+    // Le MÊME compte que `albums.track_count` (#1362) : les deux membres de la
+    // comparaison ci-dessous doivent parler de la même chose, sinon un album
+    // portant deux copies d'un morceau se déclarerait complet parce que ses
+    // lignes dépassent ses présentations.
     let actual_tracks: i64 = state
         .backend
         .query_one(
-            &format!("SELECT COUNT(*) FROM tracks WHERE album_id = {p1}"),
+            &format!(
+                "SELECT {}",
+                tune_core::db::track_repo::sql_compte_pistes_visibles(&p1)
+            ),
             &[&id as &dyn ToSqlValue],
         )
         .ok()
@@ -2075,3 +2281,147 @@ mod tests_regroupement;
 
 #[cfg(test)]
 mod tests_contenu;
+
+/// #3397 — le témoin qui empêche les deux chemins de `GET /library/albums` de
+/// diverger.
+///
+/// La route bâtit sa page en deux temps depuis #1269 : un tri sur des lignes
+/// étroites, puis la matérialisation de la page. `added_at` n'était lu que
+/// dans le PREMIER temps, et seulement quand le tri portait sur lui : dès
+/// qu'un autre tri était demandé, les cinquante lignes sortaient avec
+/// `added_at: null` — y compris sous `sort=added`, qui triait donc par une
+/// date qu'il taisait, ce qui bloquait « trier par date d'ajout » (#3351).
+///
+/// Le témoin ne vérifie pas `added_at` seul : il compare les OBJETS ENTIERS
+/// rendus par le chemin trié et par le chemin non trié pour le même album.
+/// Tout futur champ qui n'existerait que d'un côté le fera tomber.
+#[cfg(test)]
+mod tests_tri_added_at {
+    use axum::body::Body;
+    use axum::http::Request;
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+
+    type Etat = crate::state::AppState;
+
+    fn serveur() -> (axum::Router, Etat) {
+        let state = Etat::new(":memory:", 0, Default::default()).unwrap();
+        // `albums.artist_id` et `tracks.artist_id` référencent `artists(id)` :
+        // sans cet artiste, l'insertion tombe sur « FOREIGN KEY constraint
+        // failed » et le témoin serait vert contre une base vide.
+        state
+            .backend
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Radiohead')",
+                &[],
+            )
+            .unwrap();
+        let routeur = crate::routes::router(state.clone());
+        (routeur, state)
+    }
+
+    fn album_avec_piste(state: &Etat, titre: &str, chemin: &str, mtime: f64) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO albums (title, artist_id, source, track_count, year) \
+                 VALUES (?, 1, 'local', 1, 2001)",
+                &[&titre as &dyn ToSqlValue],
+            )
+            .unwrap();
+        let album_id = state.backend.last_insert_rowid();
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (title, album_id, artist_id, track_number, file_path, \
+                 file_mtime, duration_ms) VALUES (?, ?, 1, 1, ?, ?, 30000)",
+                &[&titre as &dyn ToSqlValue, &album_id, &chemin, &mtime],
+            )
+            .unwrap();
+    }
+
+    /// Les lignes de la réponse, indexées par identifiant d'album.
+    async fn lignes_par_id(app: &axum::Router, requete: &str) -> HashMap<i64, Value> {
+        let reponse = app
+            .clone()
+            .oneshot(Request::get(requete).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            reponse.status().is_success(),
+            "{requete} : {}",
+            reponse.status()
+        );
+        let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&corps).unwrap();
+        json["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|a| (a["id"].as_i64().expect("id"), a.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn le_chemin_trie_rend_le_meme_objet_que_le_chemin_non_trie_3397() {
+        let (app, state) = serveur();
+        album_avec_piste(&state, "Amnesiac", "/a.flac", 1_000.0);
+        album_avec_piste(&state, "Kid A", "/b.flac", 2_000.0);
+        album_avec_piste(&state, "OK Computer", "/c.flac", 3_000.0);
+
+        let sans_tri = lignes_par_id(&app, "/api/v1/library/albums?limit=50&offset=0").await;
+        assert_eq!(sans_tri.len(), 3, "trois albums attendus : {sans_tri:?}");
+        for (id, ligne) in &sans_tri {
+            assert!(
+                ligne["added_at"].as_f64().is_some(),
+                "album {id} : le chemin non trié date déjà l'album — {ligne}"
+            );
+        }
+
+        for tri in ["title", "artist", "year", "added", "added_date", "random"] {
+            let trie = lignes_par_id(
+                &app,
+                &format!("/api/v1/library/albums?limit=50&offset=0&sort={tri}&order=asc"),
+            )
+            .await;
+            assert_eq!(
+                trie.len(),
+                sans_tri.len(),
+                "tri {tri} : la page doit rester servie"
+            );
+            for (id, ligne) in &trie {
+                assert_eq!(
+                    ligne,
+                    sans_tri.get(id).expect("même album des deux côtés"),
+                    "tri {tri}, album {id} : les deux chemins doivent rendre le MÊME objet"
+                );
+            }
+        }
+    }
+
+    /// `sort=added` est le cas qui a fait ouvrir l'issue : la route triait par
+    /// la date d'ajout sans la rendre. Contre-épreuve directe.
+    #[tokio::test]
+    async fn sort_added_rend_la_date_sur_laquelle_il_vient_de_trier_3397() {
+        let (app, state) = serveur();
+        album_avec_piste(&state, "Amnesiac", "/a.flac", 1_000.0);
+        album_avec_piste(&state, "Kid A", "/b.flac", 2_000.0);
+
+        let lignes = lignes_par_id(
+            &app,
+            "/api/v1/library/albums?limit=50&offset=0&sort=added&order=desc",
+        )
+        .await;
+        assert_eq!(lignes.len(), 2);
+        for (id, ligne) in &lignes {
+            assert!(
+                ligne["added_at"].as_f64().is_some(),
+                "album {id} : sort=added doit rendre added_at — {ligne}"
+            );
+        }
+    }
+}

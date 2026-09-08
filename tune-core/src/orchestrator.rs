@@ -20,6 +20,10 @@ use transcodage::*;
 const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
 
 mod radio;
+/// Réexport PUBLIC, et un seul : `tune-server` refuse désormais à
+/// l'ENREGISTREMENT une adresse de station qui rend une page web, avec le même
+/// verdict que la lecture (#3578). Le reste de ce module reste interne.
+pub use radio::non_audio_content_type;
 pub(crate) use radio::*;
 
 /// re-resolve or re-send. The `superseded` play_seq guard in `play_inner` only
@@ -730,6 +734,18 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+    /// Dernier repli de PÉRIPHÉRIQUE local annoncé par zone, texte compris
+    /// (#2269).
+    ///
+    /// Une zone dont le périphérique est introuvable joue sur la sortie
+    /// système à CHAQUE piste : sans cette mémoire, l'avance gapless
+    /// répéterait la même phrase indéfiniment et l'information deviendrait du
+    /// bruit. L'entrée est effacée dès que le périphérique demandé est de
+    /// nouveau celui qui joue, pour qu'un repli ultérieur soit dit à son tour.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    #[cfg(feature = "local-audio")]
+    replis_de_peripherique_dits: std::sync::Mutex<HashMap<i64, String>>,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -919,6 +935,20 @@ impl StreamingDsp {
             || self.crossfeed.is_some()
     }
 
+    /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
+    ///
+    /// `is_active()` ne prouve que la PRÉSENCE d'un processeur, et un porteur
+    /// peut le transporter sans jamais l'appeler : `process_pcm` rend
+    /// immédiatement dès que `channels != 2`. Un porteur bâti avec un nombre
+    /// de canaux faux — ou laissé à zéro par le `Default` — reste donc
+    /// « actif » tout en étant MUET sur le crossfeed. C'est le mode de panne
+    /// qu'une garde de site, purement textuelle, ne peut pas voir : le champ
+    /// existe, le chargement existe, l'appel existe, et rien ne sort.
+    #[cfg(test)]
+    fn crossfeed_executable(&self) -> bool {
+        self.crossfeed.is_some() && self.channels == 2
+    }
+
     /// Applique les trois étages EN PLACE.
     ///
     /// Sans étage actif, `pcm` n'est pas touché d'un octet : c'est le témoin
@@ -1011,6 +1041,8 @@ impl PlaybackOrchestrator {
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(feature = "local-audio")]
+            replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1040,6 +1072,9 @@ impl PlaybackOrchestrator {
 mod commun;
 
 mod transport;
+// #2269 — le repli silencieux de la sortie locale, rendu audible.
+#[cfg(feature = "local-audio")]
+mod repli_de_peripherique;
 
 mod resolve_stream;
 
@@ -1142,6 +1177,33 @@ mod transcode_budget_tests;
 #[cfg(test)]
 mod budget_adaptatif_tests;
 
+/// #3444 — un pré-transcodage en vol doit être PRÉEMPTIBLE.
+///
+/// ## Le fait de base mesuré ici
+///
+/// Une demande de lecture émise PENDANT un pré-transcodage de la même zone est
+/// servie, au pas de sondage près, au lieu d'attendre la fin d'un travail dont
+/// la sortie sera de toute façon jetée. Deux conséquences, toutes deux
+/// épinglées : le chien de garde rend `Preempte` en nommant la demande
+/// abandonnée, celle qui prend la main et le temps perdu ; et le verrou par
+/// fichier — celui qui, sur le .18 en 0.9.136, a retenu la zone 10 pendant
+/// 102 s — est rendu du même coup.
+///
+/// ## La contre-épreuve
+///
+/// `rouge_avant_le_transcodage_ignore_la_demande_et_va_au_bout` exécute
+/// l'ANCIEN comportement (surveillance sans point de contrôle) sur le même
+/// couple : la demande tombe à 3 s, la zone reste prise 102,2 s. C'est la
+/// moitié sans laquelle le témoin vert ne prouverait rien.
+///
+/// ## Aucun `sleep` réel
+///
+/// Tout tourne sous `#[tokio::test(start_paused = true)]`, comme les essais de
+/// budget voisins : l'horloge de tokio est virtuelle, les 102 s du ticket
+/// s'écoulent en quelques millisecondes, et le verdict est TOUJOURS le même.
+#[cfg(test)]
+mod preemption_du_transcodage_tests;
+
 /// La regle de decision du passthrough DSD (#2122).
 ///
 /// Les douze combinaisons : quatre modes croises avec les trois reponses
@@ -1155,6 +1217,11 @@ mod resolution_annoncee_tests;
 
 #[cfg(test)]
 mod wav_override_tests;
+
+#[cfg(test)]
+mod plafond_16_bits_tests;
+#[cfg(test)]
+mod transcodage_de_sortie_tests;
 
 #[cfg(test)]
 mod tests;
@@ -1226,3 +1293,6 @@ mod profondeur_annoncee_egale_profondeur_ecrite;
 /// texte du fichier quelles que soient les `cfg`.
 #[cfg(test)]
 mod recreation_locale_guard;
+
+#[cfg(test)]
+mod adoption_du_flux_pre_arme_3442;
