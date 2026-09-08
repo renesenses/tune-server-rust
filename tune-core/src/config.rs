@@ -587,6 +587,69 @@ pub fn openable_local_backend(configured: &str, origin_host: Option<&str>) -> St
     configured.to_string()
 }
 
+/// Les étiquettes génériques que porte une zone locale attachée à la SORTIE
+/// SYSTÈME. Deux, parce que les versions passées écrivaient la française sur
+/// un macOS en français : un renommage de la machine ou un changement de
+/// langue mintait alors une seconde zone par défaut sous l'autre étiquette
+/// (Philippe Vella, #1233).
+///
+/// Source unique : la clause SQL de `ZoneRepo` en est construite, et la règle
+/// de nommage ci-dessous la consulte. Ajouter une langue ici les corrige
+/// toutes les deux.
+pub const ETIQUETTES_LOCALES_GENERIQUES: [&str; 2] = ["This Computer", "Cet ordinateur"];
+
+/// L'étiquette générique effectivement POSÉE sur une zone locale nouvellement
+/// créée. Les autres entrées de [`ETIQUETTES_LOCALES_GENERIQUES`] ne servent
+/// qu'à RECONNAÎTRE l'héritage.
+pub const ETIQUETTE_LOCALE_GENERIQUE: &str = ETIQUETTES_LOCALES_GENERIQUES[0];
+
+/// Vrai si ce nom de zone est l'une des étiquettes génériques, quelle que soit
+/// la casse.
+pub fn est_etiquette_locale_generique(nom: &str) -> bool {
+    ETIQUETTES_LOCALES_GENERIQUES
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(nom))
+}
+
+/// Le nom à donner à une zone locale qu'on s'apprête à CRÉER (#1770).
+///
+/// # Pourquoi cette règle existe
+///
+/// Le `device_id` d'une sortie locale est dérivé du NOM du périphérique
+/// (`local:<nom>`). Changer de moteur audio change donc l'identifiant de la
+/// sortie système : sous ASIO c'est `local:Essence STX II ASIO(64)`, sous
+/// WASAPI c'est `local:Speakers`. Ce sont deux lignes différentes en base, et
+/// `ZoneRepo::get_or_create` ne rapproche que par `output_device_id` : au
+/// premier démarrage qui suit la bascule ASIO → WASAPI, la sortie système
+/// WASAPI n'a pas de zone, elle en obtient une — et l'ancienne, celle d'ASIO,
+/// reste visible. Toutes deux s'appellent « This Computer ». C'est le doublon
+/// mesuré chez jfpaquet le 02/09/2026 en 0.9.130 : deux zones du même nom,
+/// l'une qui joue, l'autre non.
+///
+/// `ZoneRepo::hide_duplicate_generic_local` ne rattrapait pas ce cas : elle
+/// n'est appelée que sur la branche « la zone existait déjà », jamais sur la
+/// branche de création.
+///
+/// La règle posée ici est la plus conservatrice des deux possibles : on ne
+/// masque RIEN — masquer la zone ASIO la ferait disparaître pour de bon, la
+/// découverte ne ressuscitant jamais une zone masquée — on refuse simplement
+/// de minter une seconde fois l'étiquette générique. La nouvelle zone prend le
+/// nom de son périphérique, exactement comme une sortie non-défaut, et les
+/// deux zones deviennent distinguables dans le sélecteur.
+///
+/// Sur une base neuve, `generique_deja_pris` est faux et le comportement est
+/// mot pour mot celui d'avant.
+pub fn nom_de_zone_locale(
+    nom_appareil: &str,
+    est_defaut: bool,
+    generique_deja_pris: bool,
+) -> String {
+    if est_defaut && !generique_deja_pris {
+        return ETIQUETTE_LOCALE_GENERIQUE.to_string();
+    }
+    nom_appareil.to_string()
+}
+
 fn env_str(key: &str, target: &mut String) {
     if let Ok(val) = std::env::var(key) {
         *target = val;
@@ -1032,5 +1095,63 @@ mod backend_ouvrable_i1770 {
     fn la_casse_du_reglage_et_de_l_hote_est_ignoree() {
         assert_eq!(openable_local_backend("ASIO", Some("Wasapi")), "wasapi");
         assert_eq!(openable_local_backend("Asio", Some("asio")), "Asio");
+    }
+}
+
+/// #1770 — la règle « on ne minte pas deux fois l'étiquette générique ».
+///
+/// Comme la règle voisine, elle ne dépend d'aucune plateforme : c'est
+/// exactement pour ça qu'elle vit ici et non dans le chemin Windows qu'aucune
+/// porte de ce dépôt ne compile.
+#[cfg(test)]
+mod nom_de_zone_locale_i1770 {
+    use super::{ETIQUETTE_LOCALE_GENERIQUE, est_etiquette_locale_generique, nom_de_zone_locale};
+
+    /// Le cas de la bascule ASIO → WASAPI. Une zone « This Computer » existe
+    /// déjà (celle d'ASIO) ; la sortie système WASAPI, qui porte un AUTRE
+    /// `device_id`, ne doit pas en minter une seconde du même nom.
+    #[test]
+    fn la_sortie_systeme_ne_reprend_pas_une_etiquette_deja_prise() {
+        assert_eq!(
+            nom_de_zone_locale("Speakers", true, true),
+            "Speakers",
+            "après une bascule de moteur audio, la nouvelle sortie système \
+             doit prendre le nom de son périphérique : deux zones nommées \
+             « This Computer » sont indiscernables dans le sélecteur (#1770, \
+             jfpaquet, 0.9.130)"
+        );
+    }
+
+    /// TÉMOIN — base neuve, aucune étiquette générique posée : le
+    /// comportement d'origine est intact. Si cet essai tombe, le correctif a
+    /// privé la première zone locale de son nom au lieu de protéger la
+    /// seconde.
+    #[test]
+    fn temoin_base_neuve_la_sortie_systeme_garde_l_etiquette_generique() {
+        assert_eq!(
+            nom_de_zone_locale("Speakers", true, false),
+            ETIQUETTE_LOCALE_GENERIQUE,
+            "sur une base neuve la sortie système s'appelle toujours \
+             « This Computer »"
+        );
+    }
+
+    /// Une sortie qui n'est pas la sortie système n'a jamais porté
+    /// l'étiquette générique, prise ou non.
+    #[test]
+    fn une_sortie_non_defaut_porte_toujours_son_nom() {
+        assert_eq!(nom_de_zone_locale("BL650", false, false), "BL650");
+        assert_eq!(nom_de_zone_locale("BL650", false, true), "BL650");
+    }
+
+    /// Les deux étiquettes héritées sont reconnues, la casse est ignorée, et
+    /// un nom choisi par l'utilisateur ne l'est pas.
+    #[test]
+    fn la_reconnaissance_couvre_les_deux_langues_et_pas_le_reste() {
+        assert!(est_etiquette_locale_generique("This Computer"));
+        assert!(est_etiquette_locale_generique("Cet ordinateur"));
+        assert!(est_etiquette_locale_generique("this computer"));
+        assert!(!est_etiquette_locale_generique("Salon"));
+        assert!(!est_etiquette_locale_generique("Speakers"));
     }
 }

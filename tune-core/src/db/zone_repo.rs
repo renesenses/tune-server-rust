@@ -313,12 +313,25 @@ pub mod sql {
         )
     }
 
+    /// `('This Computer', 'Cet ordinateur')` — construit depuis
+    /// [`crate::config::ETIQUETTES_LOCALES_GENERIQUES`], source unique de la
+    /// liste. Aucune de ces étiquettes ne porte d'apostrophe ; ajouter une
+    /// langue qui en porterait demanderait un échappement ici.
+    pub fn etiquettes_locales_generiques() -> String {
+        crate::config::ETIQUETTES_LOCALES_GENERIQUES
+            .iter()
+            .map(|e| format!("'{e}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub fn rename_generic_local_label<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET name = {} \
-             WHERE id = {} AND name IN ('This Computer', 'Cet ordinateur')",
+             WHERE id = {} AND name IN ({})",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            etiquettes_locales_generiques()
         )
     }
 
@@ -326,8 +339,23 @@ pub mod sql {
         format!(
             "UPDATE zones SET is_hidden = 1 \
              WHERE id <> {} AND output_type = 'local' \
-             AND name IN ('This Computer', 'Cet ordinateur') \
+             AND name IN ({}) \
              AND COALESCE(is_hidden, 0) = 0",
+            d.placeholder(1),
+            etiquettes_locales_generiques()
+        )
+    }
+
+    /// Compte les zones locales VISIBLES qui portent déjà une étiquette
+    /// générique, en excluant l'appareil qu'on s'apprête à traiter (#1770).
+    pub fn etiquette_generique_locale_prise<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM zones \
+             WHERE output_type = 'local' \
+             AND name IN ({}) \
+             AND COALESCE(is_hidden, 0) = 0 \
+             AND (output_device_id IS NULL OR output_device_id <> {})",
+            etiquettes_locales_generiques(),
             d.placeholder(1)
         )
     }
@@ -2075,13 +2103,63 @@ impl ZoneRepo {
     /// twins, leaving both "This Computer" and "Cet ordinateur" in the picker
     /// (Philippe Vella). Only the exact generic labels are touched — a
     /// user-renamed zone is never hidden. Returns the number hidden.
+    ///
+    /// ⚠️ **La zone gardée doit elle-même porter l'étiquette générique**
+    /// (#1770). Sans cette condition, appeler cette fonction avec une zone
+    /// nommée « Speakers » masquait la zone « This Computer » de l'autre
+    /// moteur audio : il n'y avait alors aucune jumelle, seulement une zone
+    /// étrangère effacée en silence — et une zone masquée ne revient jamais
+    /// par la découverte (`get_or_create` la rend telle quelle). Le scénario
+    /// est celui de la bascule ASIO → WASAPI : l'utilisateur retrouvait sa
+    /// zone ASIO absente du sélecteur au démarrage suivant.
+    ///
+    /// Une zone gardée introuvable ou renommée par l'utilisateur ne masque
+    /// donc rien, et rend `Ok(0)`.
     pub fn hide_duplicate_generic_local(&self, keep_id: i64) -> Result<usize, String> {
+        let gardee_est_generique = self
+            .get(keep_id)?
+            .is_some_and(|z| crate::config::est_etiquette_locale_generique(&z.name));
+        if !gardee_est_generique {
+            tracing::debug!(
+                zone_id = keep_id,
+                "zone_gardee_non_generique_aucun_masquage"
+            );
+            return Ok(0);
+        }
         let sql = self.dialect_sql(
             sql::hide_duplicate_generic_local,
             sql::hide_duplicate_generic_local,
         );
         let params: [&dyn ToSqlValue; 1] = [&keep_id];
         self.db.execute(&sql, &params)
+    }
+
+    /// Une zone locale VISIBLE porte-t-elle déjà l'étiquette générique, sur un
+    /// AUTRE appareil que `device_id` ? (#1770)
+    ///
+    /// C'est la mesure que consulte [`crate::config::nom_de_zone_locale`]
+    /// avant de nommer une zone qu'on s'apprête à créer. L'exclusion par
+    /// `device_id` compte : la zone de l'appareil courant, si elle existe, est
+    /// justement celle qu'on ne veut pas compter contre lui-même.
+    ///
+    /// Base antérieure à `is_hidden` / `output_device_id` : rend `false`,
+    /// c'est-à-dire le comportement d'avant le correctif.
+    pub fn etiquette_generique_locale_prise(&self, device_id: &str) -> Result<bool, String> {
+        let sql = self.dialect_sql(
+            sql::etiquette_generique_locale_prise,
+            sql::etiquette_generique_locale_prise,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&device_id];
+        match self.db.query_many_strong(&sql, &params) {
+            Ok(lignes) => Ok(lignes
+                .first()
+                .and_then(|l| l.first())
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0),
+            Err(e) if schema_incomplet(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Soft-delete EVERY zone and clear the free-tier activation markers.
@@ -2277,6 +2355,149 @@ mod tests {
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         db
+    }
+
+    /// #1770 — la mesure que consulte la règle de nommage. Une zone locale
+    /// VISIBLE portant l'étiquette générique, sur un AUTRE appareil, la rend
+    /// vraie.
+    #[test]
+    fn l_etiquette_generique_prise_par_un_autre_appareil_est_vue() {
+        let repo = ZoneRepo::new(test_db());
+        repo.create(
+            "This Computer",
+            Some("local"),
+            Some("local:Essence STX II ASIO(64)"),
+        )
+        .unwrap();
+
+        assert!(
+            repo.etiquette_generique_locale_prise("local:Speakers")
+                .unwrap(),
+            "la zone ASIO porte déjà l'étiquette : la sortie système WASAPI \
+             ne doit pas en minter une seconde (#1770)"
+        );
+    }
+
+    /// TÉMOIN — la zone de l'appareil courant ne compte pas contre lui-même,
+    /// sinon un simple redémarrage renommerait la zone système à chaque tour.
+    #[test]
+    fn temoin_sa_propre_zone_ne_compte_pas_contre_l_appareil() {
+        let repo = ZoneRepo::new(test_db());
+        repo.create("This Computer", Some("local"), Some("local:Speakers"))
+            .unwrap();
+
+        assert!(
+            !repo
+                .etiquette_generique_locale_prise("local:Speakers")
+                .unwrap(),
+            "l'appareil qui porte déjà l'étiquette ne se la prend pas à \
+             lui-même"
+        );
+    }
+
+    /// Une zone masquée ne prend rien : elle n'est pas dans le sélecteur, donc
+    /// aucun doublon visible n'est possible.
+    #[test]
+    fn une_zone_masquee_ne_prend_pas_l_etiquette() {
+        let repo = ZoneRepo::new(test_db());
+        let id = repo
+            .create("This Computer", Some("local"), Some("local:Vieux DAC"))
+            .unwrap();
+        repo.delete(id).unwrap();
+
+        assert!(
+            !repo
+                .etiquette_generique_locale_prise("local:Speakers")
+                .unwrap()
+        );
+    }
+
+    /// Une zone d'un autre type (DLNA) qui s'appellerait ainsi ne compte pas :
+    /// la règle ne porte que sur les sorties locales.
+    #[test]
+    fn une_zone_non_locale_ne_prend_pas_l_etiquette() {
+        let repo = ZoneRepo::new(test_db());
+        repo.create("This Computer", Some("dlna"), Some("uuid:42"))
+            .unwrap();
+
+        assert!(
+            !repo
+                .etiquette_generique_locale_prise("local:Speakers")
+                .unwrap()
+        );
+    }
+
+    /// #1770 — `hide_duplicate_generic_local` ne masque plus rien quand la
+    /// zone GARDÉE ne porte pas l'étiquette générique. Sans cette condition,
+    /// la zone système WASAPI (« Speakers ») effaçait en silence la zone ASIO
+    /// « This Computer », qu'aucune découverte ne ressuscite ensuite.
+    #[test]
+    fn une_zone_gardee_non_generique_ne_masque_personne() {
+        let repo = ZoneRepo::new(test_db());
+        let asio = repo
+            .create(
+                "This Computer",
+                Some("local"),
+                Some("local:Essence STX II ASIO(64)"),
+            )
+            .unwrap();
+        let wasapi = repo
+            .create("Speakers", Some("local"), Some("local:Speakers"))
+            .unwrap();
+
+        assert_eq!(
+            repo.hide_duplicate_generic_local(wasapi).unwrap(),
+            0,
+            "garder « Speakers » ne désigne aucune jumelle : rien ne doit \
+             être masqué (#1770)"
+        );
+        assert!(
+            repo.list().unwrap().iter().any(|z| z.id == Some(asio)),
+            "la zone ASIO doit rester dans le sélecteur"
+        );
+    }
+
+    /// TÉMOIN — le cas de Philippe Vella (#1233) marche toujours : deux
+    /// étiquettes génériques, la gardée en est une, la jumelle est masquée.
+    /// Si cet essai tombe, le correctif a désarmé la déduplication au lieu de
+    /// la borner.
+    #[test]
+    fn temoin_deux_etiquettes_generiques_la_jumelle_est_toujours_masquee() {
+        let repo = ZoneRepo::new(test_db());
+        let ancienne = repo
+            .create(
+                "Cet ordinateur",
+                Some("local"),
+                Some("local:MacBook de Jean"),
+            )
+            .unwrap();
+        let vivante = repo
+            .create("This Computer", Some("local"), Some("local:MacBook"))
+            .unwrap();
+
+        assert_eq!(repo.hide_duplicate_generic_local(vivante).unwrap(), 1);
+        let visibles = repo.list().unwrap();
+        assert!(visibles.iter().any(|z| z.id == Some(vivante)));
+        assert!(
+            !visibles.iter().any(|z| z.id == Some(ancienne)),
+            "la jumelle générique doit toujours être masquée (#1233)"
+        );
+    }
+
+    /// Une zone renommée par l'utilisateur n'est jamais masquée, même quand la
+    /// gardée est bien générique. C'est le contrat d'origine, reconduit.
+    #[test]
+    fn temoin_une_zone_renommee_n_est_jamais_masquee() {
+        let repo = ZoneRepo::new(test_db());
+        let salon = repo
+            .create("Salon", Some("local"), Some("local:Ampli"))
+            .unwrap();
+        let vivante = repo
+            .create("This Computer", Some("local"), Some("local:Speakers"))
+            .unwrap();
+
+        assert_eq!(repo.hide_duplicate_generic_local(vivante).unwrap(), 0);
+        assert!(repo.list().unwrap().iter().any(|z| z.id == Some(salon)));
     }
 
     #[test]

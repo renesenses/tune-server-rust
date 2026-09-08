@@ -2392,11 +2392,15 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             if is_asio_configured {
                 continue;
             }
-            let zone_name = if *is_default {
-                "This Computer".to_string()
-            } else {
-                dev_name.clone()
-            };
+            // #1770 : même règle qu'au démarrage — l'étiquette générique ne se
+            // minte qu'une fois. Un DAC branché à chaud qui devient la sortie
+            // système ne doit pas produire un second « This Computer » à côté
+            // de celui que porte déjà une autre sortie locale.
+            let generique_deja_pris = zone_repo
+                .etiquette_generique_locale_prise(device_id)
+                .unwrap_or(false);
+            let zone_name =
+                tune_core::config::nom_de_zone_locale(dev_name, *is_default, generique_deja_pris);
 
             // #1770 : le rescan peut créer au plus UNE zone, celle de la sortie
             // système. Les autres sorties restent enregistrées pour que
@@ -2967,6 +2971,116 @@ mod heartbeat_server_id_tests {
                 );
             }
         }
+    }
+}
+
+/// GARDE DE SITE (#1770) — les deux chemins qui NOMMENT une zone locale
+/// doivent passer par `config::nom_de_zone_locale`, jamais écrire l'étiquette
+/// générique en dur.
+///
+/// C'est la précondition du correctif. La règle « on ne minte pas deux fois
+/// l'étiquette générique » vit dans `tune-core::config` ; un site qui écrit
+/// `"This Computer"` lui-même ne la consulte pas et refabrique le doublon —
+/// deux zones du même nom après une bascule ASIO → WASAPI, mesuré chez
+/// jfpaquet en 0.9.130.
+///
+/// Pourquoi une garde textuelle : les deux fonctions visées sont derrière
+/// `#[cfg(feature = "local-audio")]` et demandent un `AppState` complet plus de
+/// vrais périphériques. La garde lit le code de PRODUCTION seul — le module de
+/// test est retranché avant l'examen, sans quoi sa propre contre-épreuve le
+/// ferait rougir. Sa contre-épreuve est
+/// `la_garde_refuse_une_etiquette_ecrite_en_dur`.
+#[cfg(test)]
+mod etiquette_generique_i1770 {
+    /// Le code de production d'un fichier : tout ce qui précède le premier
+    /// module de test. L'aiguille est construite à l'exécution, sinon ce
+    /// module se retrancherait au mauvais endroit dès qu'on le relit par
+    /// `include_str!`.
+    fn production(source: &str) -> &str {
+        let marqueur_test = format!("#[cfg({})]", "test");
+        source.split(&marqueur_test).next().unwrap_or("")
+    }
+
+    /// Les étiquettes génériques écrites en dur, en littéral Rust, dans le
+    /// code de production. Rendues par numéro de ligne (1-indexé).
+    fn etiquettes_en_dur(source: &str) -> Vec<usize> {
+        let production = production(source);
+        let mut lignes = Vec::new();
+        for etiquette in tune_core::config::ETIQUETTES_LOCALES_GENERIQUES {
+            let aiguille = format!("\"{etiquette}\"");
+            let mut curseur = 0usize;
+            while let Some(pos) = production[curseur..].find(&aiguille) {
+                let debut = curseur + pos;
+                lignes.push(production[..debut].lines().count());
+                curseur = debut + aiguille.len();
+            }
+        }
+        lignes.sort_unstable();
+        lignes
+    }
+
+    fn appels_a_la_regle(source: &str) -> usize {
+        production(source)
+            .matches("config::nom_de_zone_locale(")
+            .count()
+    }
+
+    #[test]
+    fn les_deux_sites_de_nommage_local_passent_par_la_regle() {
+        let fichiers = [
+            (
+                "tune-server/src/background.rs",
+                include_str!("background.rs"),
+            ),
+            ("tune-server/src/startup.rs", include_str!("startup.rs")),
+        ];
+        let mut total = 0usize;
+        for (chemin, source) in fichiers {
+            total += appels_a_la_regle(source);
+            let en_dur = etiquettes_en_dur(source);
+            assert!(
+                en_dur.is_empty(),
+                "{chemin} écrit une étiquette de zone locale générique en dur, \
+                 ligne(s) {en_dur:?}. Ce site ne consulte donc pas \
+                 `config::nom_de_zone_locale` et peut minter un second \
+                 « This Computer » à côté de celui d'un autre moteur audio \
+                 (#1770, jfpaquet, 0.9.130)"
+            );
+        }
+        assert_eq!(
+            total, 2,
+            "les deux seuls sites qui nomment une zone locale issue d'une \
+             énumération sont `register_local_outputs` (startup.rs) et \
+             `rescan_local_audio_devices` (background.rs). Un site de plus ou \
+             de moins : reprendre le recensement de #1770 avant de toucher à \
+             ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur lui-même. Sans elle, `etiquettes_en_dur`
+    /// pourrait ne rien détecter du tout et la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_une_etiquette_ecrite_en_dur() {
+        let fabrique = "fn f() {\n    let zone_name = \"This Computer\".to_string();\n}\n";
+        assert_eq!(
+            etiquettes_en_dur(fabrique),
+            vec![2],
+            "le détecteur doit rougir sur un site qui écrit l'étiquette en dur"
+        );
+        assert_eq!(
+            appels_a_la_regle(fabrique),
+            0,
+            "et ne doit compter aucun appel à la règle là où il n'y en a pas"
+        );
+    }
+
+    /// TÉMOIN — le détecteur ne rougit pas sur un site conforme.
+    #[test]
+    fn temoin_un_site_conforme_passe() {
+        let fabrique = "fn f() {\n    let zone_name = \
+                        tune_core::config::nom_de_zone_locale(&n, d, p);\n}\n";
+        assert!(etiquettes_en_dur(fabrique).is_empty());
+        assert_eq!(appels_a_la_regle(fabrique), 1);
     }
 }
 
