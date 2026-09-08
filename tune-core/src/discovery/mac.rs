@@ -59,6 +59,23 @@ pub fn vendor_for_mac(mac: &str) -> Option<&'static str> {
         .map(|i| OUI_AUDIO[i].1)
 }
 
+/// L'OUI d'une MAC : ses **trois premiers octets**, `AA:BB:CC`.
+///
+/// C'est la partie qui nomme le fabricant, et la seule que mozaiklabs conserve
+/// des corrections de marque/modèle (#3589) — les trois derniers octets
+/// identifient un appareil chez quelqu'un et sont écartés à la réception. Le
+/// serveur tronque donc lui-même : ce qui ne part pas ne peut pas fuiter, et le
+/// site accepte le champ `oui` aussi bien que la MAC complète.
+///
+/// Toutes les graphies de [`normalize_mac`] sont acceptées ; `None` si la
+/// chaîne n'est pas une MAC.
+pub fn oui_prefix(mac: &str) -> Option<String> {
+    let mac = normalize_mac(mac)?;
+    // `normalize_mac` garantit `AA:BB:CC:DD:EE:FF` — 8 octets ASCII pour
+    // `AA:BB:CC`, jamais une frontière de caractère multi-octet.
+    Some(mac[..8].to_string())
+}
+
 /// Look the `ip` up in the OS ARP cache.
 ///
 /// Returns a normalised MAC, or `None` when the entry is absent/incomplete.
@@ -187,5 +204,29 @@ mod tests {
         dev.manufacturer = None;
         enrich_identity(&mut dev);
         assert_eq!(dev.manufacturer.as_deref(), Some("Sonos"));
+    }
+
+    /// #3589 — le site ne garde que l'OUI ; le serveur tronque lui-même.
+    #[test]
+    fn l_oui_ne_garde_que_les_trois_premiers_octets() {
+        for graphie in [
+            "AA:BB:CC:DD:EE:FF",
+            "aa-bb-cc-dd-ee-ff",
+            "aabbccddeeff",
+            "a:b:c:d:e:f",
+        ] {
+            let attendu = if graphie == "a:b:c:d:e:f" {
+                "0A:0B:0C"
+            } else {
+                "AA:BB:CC"
+            };
+            assert_eq!(
+                oui_prefix(graphie).as_deref(),
+                Some(attendu),
+                "graphie refusee : {graphie}"
+            );
+        }
+        assert_eq!(oui_prefix("pas une mac"), None);
+        assert_eq!(oui_prefix(""), None);
     }
 }

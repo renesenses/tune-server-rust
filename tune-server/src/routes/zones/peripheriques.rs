@@ -196,6 +196,43 @@ pub(super) async fn push_device_preset(state: &AppState, zone_id: i64) {
     });
 }
 
+/// La charge utile d'une correction de marque/modèle, **sans réseau** — pour
+/// que sa forme soit vérifiable (l'adresse, elle, est en dur dans ce fichier).
+///
+/// Le champ non corrigé part en chaîne vide et non en null : côté site, ces
+/// colonnes entrent dans la clé d'unicité, où un null est « jamais égal » —
+/// chaque renvoi créerait une ligne de plus au lieu d'incrémenter le compteur.
+///
+/// 🔴 **Seul l'OUI part, jamais la MAC complète** (#3589). Le site n'en garde
+/// de toute façon que les trois premiers octets et écarte les trois derniers à
+/// la réception ; mais ceux-là identifient un appareil chez quelqu'un, et cet
+/// envoi est « volontairement anonyme » (entête de ce fichier). Ce qui ne part
+/// pas ne peut pas fuiter. La clé est **absente** plutôt que nulle quand la MAC
+/// est inconnue.
+pub(super) fn charge_utile_correction(
+    detected_manufacturer: Option<String>,
+    detected_model: Option<String>,
+    brand: Option<String>,
+    model: Option<String>,
+    output_type: Option<String>,
+    mac: Option<&str>,
+) -> Value {
+    let mut payload = json!({
+        "detected_manufacturer": detected_manufacturer,
+        "detected_model": detected_model,
+        "brand": brand.unwrap_or_default(),
+        "model": model.unwrap_or_default(),
+        "output_type": output_type,
+    });
+    if let (Some(oui), Some(obj)) = (
+        mac.and_then(tune_core::discovery::mac::oui_prefix),
+        payload.as_object_mut(),
+    ) {
+        obj.insert("oui".into(), json!(oui));
+    }
+    payload
+}
+
 pub(super) async fn push_device_correction(state: &AppState, zone_id: i64) {
     if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
         return;
@@ -232,16 +269,30 @@ pub(super) async fn push_device_correction(state: &AppState, zone_id: i64) {
         .as_deref()
         .and_then(|did| devices.iter().find(|d| d.id == did));
 
-    // Le champ non corrigé part en chaîne vide et non en null : côté site, ces
-    // colonnes entrent dans la clé d'unicité, où un null est « jamais égal » —
-    // chaque renvoi créerait une ligne de plus au lieu d'incrémenter le compteur.
-    let payload = json!({
-        "detected_manufacturer": detected.and_then(|d| d.manufacturer.clone()),
-        "detected_model": detected.and_then(|d| d.model.clone()),
-        "brand": brand.unwrap_or_default(),
-        "model": model.unwrap_or_default(),
-        "output_type": zone.output_type,
-    });
+    // #3589 — l'OUI qui a produit la mauvaise déduction.
+    //
+    // Le commentaire du contrôleur qui reçoit ces corrections le dit depuis
+    // toujours : « c'est elle que la déduction par OUI se trompe le plus
+    // souvent » (voir le bloc juste au-dessus). Le serveur déduisait la marque
+    // des trois premiers octets de la MAC — `vendor_for_mac`,
+    // `tune-core/src/discovery/mac.rs` — et se trompait, mais rien ne remontait
+    // QUELLE entrée de la table l'avait causé : chaque correction était perdue
+    // pour la ligne qui l'avait provoquée.
+    //
+    // 🔴 Seul l'OUI part, jamais la MAC complète. Le site n'en garde de toute
+    // façon que les trois premiers octets et écarte les trois derniers à la
+    // réception — mais ceux-là identifient un appareil chez quelqu'un, et cet
+    // envoi est « volontairement anonyme » (entête de ce fichier). Ce qui ne
+    // part pas ne peut pas fuiter. Le champ `oui` est accepté par le site au
+    // même titre que `mac`.
+    let payload = charge_utile_correction(
+        detected.and_then(|d| d.manufacturer.clone()),
+        detected.and_then(|d| d.model.clone()),
+        brand,
+        model,
+        zone.output_type,
+        detected.and_then(|d| d.mac_address.as_deref()),
+    );
 
     tokio::spawn(async move {
         let Ok(client) = tune_core::http::client::builder()
@@ -528,4 +579,63 @@ pub(super) async fn register_dlna_output_from_device(
     }
 
     false
+}
+
+#[cfg(test)]
+mod correction_tests {
+    use super::charge_utile_correction;
+
+    /// #3589 — la correction porte l'OUI qui a produit la mauvaise déduction,
+    /// et RIEN de plus : les trois derniers octets ne quittent pas la maison.
+    #[test]
+    fn la_correction_porte_l_oui_et_pas_la_mac_complete() {
+        let p = charge_utile_correction(
+            Some("Yamaha Corporation".into()),
+            Some("RX-V6A".into()),
+            Some("Bluesound".into()),
+            None,
+            Some("dlna".into()),
+            Some("00:A0:DE:12:34:56"),
+        );
+        assert_eq!(p["oui"], "00:A0:DE");
+        let brut = serde_json::to_string(&p).unwrap();
+        for octet in ["12:34:56", "123456"] {
+            assert!(
+                !brut.contains(octet),
+                "les trois derniers octets ont fui : {brut}"
+            );
+        }
+        // Le champ non corrigé part en chaîne vide, pas en null (clé d'unicité).
+        assert_eq!(p["model"], "");
+        assert_eq!(p["brand"], "Bluesound");
+    }
+
+    /// Les trois graphies que le site accepte arrivent toutes au même OUI.
+    #[test]
+    fn toutes_les_graphies_de_mac_donnent_le_meme_oui() {
+        for graphie in ["AA:BB:CC:DD:EE:FF", "aa-bb-cc-dd-ee-ff", "aabbccddeeff"] {
+            let p =
+                charge_utile_correction(None, None, Some("X".into()), None, None, Some(graphie));
+            assert_eq!(p["oui"], "AA:BB:CC", "graphie refusee : {graphie}");
+        }
+    }
+
+    /// Sans MAC, la clé est ABSENTE — pas nulle, pas vide.
+    #[test]
+    fn sans_mac_la_cle_oui_n_est_pas_envoyee() {
+        let p = charge_utile_correction(None, None, Some("X".into()), None, None, None);
+        assert!(p.get("oui").is_none(), "clé oui envoyée sans MAC : {p}");
+        let p = charge_utile_correction(
+            None,
+            None,
+            Some("X".into()),
+            None,
+            None,
+            Some("pas-une-mac"),
+        );
+        assert!(
+            p.get("oui").is_none(),
+            "OUI fabriqué depuis une non-MAC : {p}"
+        );
+    }
 }
