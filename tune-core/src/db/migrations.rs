@@ -2422,6 +2422,18 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // rien à annoncer — ni dans le journal, ni à l'écran d'attente (#1701). Le
     // « +1 » est la passe finale (colonnes de sûreté, file unifiée, ANALYZE),
     // qui tourne à chaque démarrage et pèse, elle aussi, sur une grosse base.
+    // Une base en AVANCE sur le binaire : dit ici, une fois, au demarrage.
+    // Sans cette ligne le cas est parfaitement muet — `pending` vaut 0 et tout
+    // se passe comme si la base etait a jour (#2266).
+    if schema_en_avance(current_version, latest_version()) {
+        tracing::warn!(
+            version_base = current_version,
+            version_binaire = latest_version(),
+            "schema_en_avance_sur_le_binaire — cette base a ete migree par une \
+             version plus recente de Tune. Aucune migration inverse n'existe : \
+             une requete sur une colonne inconnue de cette version echouera."
+        );
+    }
     let floor = current_version.max(if tables_exist { 1 } else { 0 });
     let pending = MIGRATIONS.iter().filter(|m| m.version > floor).count();
     let started = std::time::Instant::now();
@@ -2924,6 +2936,30 @@ pub fn latest_version() -> i32 {
     MIGRATIONS.last().map(|m| m.version).unwrap_or(0)
 }
 
+/// La base a-t-elle ete migree par une version PLUS RECENTE que ce binaire ?
+///
+/// C'est la signature d'un RETOUR A UNE VERSION ANTERIEURE : on redescend d'un
+/// binaire, la base, elle, ne redescend pas. Aucune migration inverse n'existe
+/// dans ce depot — `Migration` n'a qu'un champ `up`, `PG_MIGRATIONS` qu'un SQL
+/// montant — et il n'y a donc rien pour ramener le schema en arriere.
+///
+/// Ce cas n'etait DISTINGUE nulle part : `run_migrations` calcule
+/// `floor = current_version.max(...)`, ne trouve aucune migration `> floor`,
+/// et rend `Ok(())` en silence ; la route de diagnostic, elle, comparait
+/// `v >= l` et annoncait donc `up_to_date: true` sur une base en avance. Le
+/// serveur demarre — puis casse a la premiere requete qui touche une colonne
+/// que sa version ne connait pas. C'est le risque nomme au ticket #2266
+/// (« La migration de base a rebours ») et il n'etait ni mesure ni dit.
+///
+/// Deux sites d'appel :
+/// - `run_migrations` / `run_pg_migrations`, pour le DIRE au journal de
+///   demarrage ;
+/// - `tune-server/src/routes/system/database.rs`, `etat_du_schema`, pour le
+///   rendre au champ `schema_ahead` de `GET /system/database/status`.
+pub fn schema_en_avance(version_base: i32, version_binaire: i32) -> bool {
+    version_base > version_binaire
+}
+
 // ─── PostgreSQL migration runner ─────────────────────────────────────
 
 /// Embedded PG migration scripts. Each tuple is (version, name, sql).
@@ -3365,6 +3401,16 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
 
     // Même décompte que côté SQLite : de quoi annoncer l'avancement au lieu de
     // laisser croire à un serveur planté (#1701). Le « +1 » est l'ANALYZE final.
+    // Meme mesure que cote SQLite (#2266) : une base en avance sur le binaire
+    // est dite, une fois, au demarrage.
+    if schema_en_avance(current, pg_latest_version()) {
+        tracing::warn!(
+            version_base = current,
+            version_binaire = pg_latest_version(),
+            "schema_en_avance_sur_le_binaire — cette base a ete migree par une \
+             version plus recente de Tune. Aucune migration inverse n'existe."
+        );
+    }
     let pending = PG_MIGRATIONS
         .iter()
         .filter(|&&(v, _, _)| v > current)
