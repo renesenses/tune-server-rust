@@ -334,6 +334,12 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
         .route("/{id}/device-presets", get(get_device_presets))
         .route("/{id}/name", put(rename_zone))
+        // #1361 — l'album de ce qui joue, et chez qui l'ouvrir, en UNE
+        // réponse. Deux orthographes pour la même route : le dépôt en est à
+        // mi-chemin de sa francisation, et un client ne doit pas avoir à
+        // deviner de quel côté il est tombé.
+        .route("/{id}/album-en-cours", get(album_en_cours))
+        .route("/{id}/current-album", get(album_en_cours))
         .route("/sync-status", get(sync_status))
         .route("/{id}/network-health", get(network_health))
         .route("/group-delays", get(list_group_delays).put(set_group_delay))
@@ -471,6 +477,154 @@ pub(crate) fn inject_session_context(obj: &mut serde_json::Map<String, Value>, p
         "session_context_source".into(),
         json!(ps.session_context_source),
     );
+}
+
+/// L'album de ce qui joue, en UNE réponse — la fiche à ouvrir, et chez qui.
+///
+/// `GET /api/v1/zones/{id}/album-en-cours` (alias `…/current-album`).
+///
+/// # Ce qui manquait
+///
+/// **Cyrille Moutia** demande depuis le 30/06/2026, et redemande le 09/08
+/// (#1361), que le titre d'album de « Lecture en cours » ramène à l'album.
+/// Le serveur en avait déjà les morceaux, mais éparpillés, et leur assemblage
+/// était laissé au client :
+///
+/// - `session_context_type` / `_id` / `_source` disent ce que l'auditeur a
+///   DEMANDÉ — un album Qobuz, une playlist locale — mais seulement quand le
+///   geste était un conteneur. Un morceau lancé depuis une recherche donne
+///   `("track", "<id>", "qobuz")`, et l'album n'y est pas ;
+/// - `current_track.album_id` est un `i64` de la table `albums` : toujours
+///   `null` sur une piste de service ;
+/// - il restait `source` + `source_id`, l'identifiant de la PISTE, d'où un
+///   `GET /streaming/{service}/tracks/{track_id}` à faire par le client **à
+///   chaque changement de piste** pour seulement en retrouver l'album.
+///
+/// Trois provenances, trois espaces de noms, et à chaque fois la question
+/// « chez qui ouvrir ça ? ». Deviner le service depuis l'écran affiché est
+/// faux dès qu'on regarde Tidal en écoutant Qobuz — la devinette même que
+/// #1284 a condamnée pour l'album (« Entreat (2010) » ouvrait la page de The
+/// Cure).
+///
+/// # L'ordre de résolution, et pourquoi celui-là
+///
+/// 1. **le geste** (`session_context_type == "album"`). Il survit aux avances
+///    automatiques : la deuxième piste d'un album reste une écoute d'album, là
+///    où `current_track` change à chaque piste. C'est ce qui fait un « retour à
+///    l'album » STABLE ;
+/// 2. **la ligne de bibliothèque** de la piste en cours, quand il y en a une ;
+/// 3. **le service**, interrogé une fois ici plutôt qu'une fois par piste chez
+///    chaque client (`get_track` → `album_id`, le même appel que
+///    `GET /streaming/{service}/tracks/{track_id}`).
+///
+/// `origin` nomme la branche prise : un client qui trouve `service_lookup`
+/// sait qu'il a coûté un aller-retour au service, et peut décider de ne
+/// rafraîchir que sur changement de piste.
+///
+/// # Ce qui reste au client
+///
+/// Ouvrir `path`. Rien d'autre : ni recherche par titre, ni supposition de
+/// service, ni deuxième requête.
+pub(super) async fn album_en_cours(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    /// La charge utile, construite au même endroit pour les trois branches —
+    /// deux fabricants finiraient par diverger sur le chemin publié.
+    fn reponse(
+        zone_id: i64,
+        service: &str,
+        album_id: &str,
+        artist_id: Option<&str>,
+        origine: &str,
+    ) -> Value {
+        let (nature, path) = if service == "local" {
+            ("library", format!("/api/v1/library/albums/{album_id}"))
+        } else {
+            (
+                "streaming",
+                format!("/api/v1/streaming/{service}/albums/{album_id}"),
+            )
+        };
+        json!({
+            "zone_id": zone_id,
+            "kind": nature,
+            "service": service,
+            "album_id": album_id,
+            "artist_id": artist_id,
+            "path": path,
+            "origin": origine,
+        })
+    }
+    fn rien(zone_id: i64, raison: &str) -> axum::response::Response {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "zone_id": zone_id, "album_id": Value::Null, "reason": raison })),
+        )
+            .into_response()
+    }
+
+    let ps = state.playback.get_state(id).await;
+
+    // 1. Le geste.
+    if ps.session_context_type.as_deref() == Some("album")
+        && let Some(album) = ps
+            .session_context_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+    {
+        // `session_context_source` est absent des sessions ouvertes avant
+        // #1361 ; la bibliothèque est le seul autre espace de noms possible,
+        // et c'est le mot que `contexte_de_lecture` y écrit.
+        let service = ps.session_context_source.as_deref().unwrap_or("local");
+        return Json(reponse(id, service, album, None, "session_context")).into_response();
+    }
+
+    let Some(np) = ps.now_playing.as_ref() else {
+        return rien(id, "aucune_lecture");
+    };
+
+    // 2. La ligne de bibliothèque.
+    if let Some(aid) = np.album_id {
+        return Json(reponse(
+            id,
+            "local",
+            &aid.to_string(),
+            np.artist_id.map(|a| a.to_string()).as_deref(),
+            "current_track",
+        ))
+        .into_response();
+    }
+
+    // 3. Le service.
+    let (source, Some(source_id)) = (np.source.as_str(), np.source_id.as_deref()) else {
+        return rien(id, "piste_sans_identifiant_de_source");
+    };
+    if source.is_empty() || source == "local" || source == "radio" || source == "upnp" {
+        return rien(id, "source_sans_fiche_album");
+    }
+    let registre = state.services.lock().await;
+    let Some(svc) = registre.get(source) else {
+        return rien(id, "service_inconnu");
+    };
+    let svc = svc.read().await;
+    match svc.get_track(source_id).await {
+        Ok(t) => match t.album_id.as_deref().filter(|a| !a.trim().is_empty()) {
+            Some(album) => Json(reponse(
+                id,
+                source,
+                album,
+                t.artist_id.as_deref(),
+                "service_lookup",
+            ))
+            .into_response(),
+            None => rien(id, "le_service_ne_nomme_pas_d_album"),
+        },
+        Err(e) => {
+            warn!(zone_id = id, service = source, error = %e, "album_en_cours_service_injoignable");
+            rien(id, "service_injoignable")
+        }
+    }
 }
 
 /// Qui a le droit de recevoir l'adresse du flux interne — la règle, UNE fois.

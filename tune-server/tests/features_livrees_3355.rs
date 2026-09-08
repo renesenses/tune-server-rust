@@ -72,22 +72,22 @@ const MANIFESTE: &str = include_str!("../Cargo.toml");
 /// Le couple est (fonctionnalite, identifiant de la ligne de build) :
 /// l'identifiant est `<workflow> / <plateforme ou nom d'etape>`.
 const HORS_PORTE: &[(&str, &str, &str)] = &[
-    (
-        "local-audio",
-        "release.yml / linux-aarch64",
-        "Compilation croisee : `cpal` a besoin des en-tetes ALSA de la CIBLE, \
-         que le conteneur `cross` ne porte pas. MESURE sur l'artefact publie \
-         v0.9.141 : `strings tune-server | grep -c cpal` rend 0 sur \
-         linux-aarch64 contre 175 sur linux-x86_64. Les binaires ARM livres \
-         n'ont donc PAS de sortie audio locale — constat, pas arbitrage : voir \
-         #3355.",
-    ),
+    // L'exemption `release.yml / linux-aarch64` a ete LEVEE par #3613 : les
+    // en-tetes ALSA de la cible sont desormais installees dans le conteneur
+    // `cross` (`Cross.toml`, `pre-build`), et un garde-fou de release lit
+    // l'ELF publie pour verifier que `libasound.so` y est bien declaree en
+    // NEEDED. C'etait la cible que l'image Tune OS du Raspberry Pi installe.
     (
         "local-audio",
         "release.yml / linux-aarch64-musl",
-        "Meme compilation croisee, meme absence d'en-tetes ALSA pour la cible, \
-         et en plus une edition de liens statique. Meme constat que la ligne \
-         gnu ci-dessus (#3355).",
+        "IMPOSSIBLE sans forker `alsa-sys`, pas seulement couteux (#3613). Son \
+         `build.rs` est `pkg_config::Config::new().statik(false).probe(\"alsa\")` \
+         : le `statik(false)` est un LITTERAL, pas une variable d'environnement \
+         comme le `LIBOPUS_STATIC` de #1288. La caisse emet donc toujours un \
+         lien DYNAMIQUE vers `libasound`, ce que l'etape « Verify musl binary \
+         is statically linked » de `release.yml` refuse par construction — et \
+         cette garantie statique est la raison d'etre de la cible (NAS a vieille \
+         userland, Synology DSM). Un NAS n'a par ailleurs pas de DAC.",
     ),
     (
         "local-audio",

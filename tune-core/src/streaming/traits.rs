@@ -155,6 +155,44 @@ pub struct SearchPage {
     pub truncated: bool,
 }
 
+/// Ce qu'un service SANS pagination peut réellement recevoir en `limit`
+/// (#2160).
+///
+/// Le contrat de la route est celui de Qobuz : `limit` est un nombre
+/// d'éléments **par catégorie**, et `0` veut dire « Tous ». Qobuz sait tenir
+/// les deux, parce que lui pagine. Les autres services n'ont, eux, qu'une
+/// requête à offrir, et la valeur leur est recopiée telle quelle dans l'URL —
+/// `…&limit=0` chez Spotify, chez Tidal, chez Deezer.
+///
+/// Deux conséquences, et ce sont deux défauts :
+///
+/// - **`0` n'est pas « Tous » pour eux, c'est « zéro »** — au mieux une page
+///   vide, au pire un refus de l'API, que la route de recherche traduit en 502.
+///   Un « Tous » qui vide l'écran est pire que le plafond de 50 dont se plaint
+///   le ticket.
+/// - **Un `limit` extravagant n'est pas mieux** : le même chemin transmet
+///   `limit=100000`, que ces API refusent ou tronquent sans le dire.
+///
+/// Ce plafond est celui que les écrans envoient déjà (`SEARCH_PAGE_LIMIT = 50`
+/// côté client) et celui de la page Qobuz ; le retenir ne change donc RIEN au
+/// trafic actuel — il ne borne que les deux valeurs qui, aujourd'hui, ne
+/// rendent rien.
+pub const LIMITE_PAGE_SANS_PAGINATION: usize = 50;
+
+/// Traduit la convention de la route vers ce qu'un service sans pagination
+/// accepte : `0` (« Tous ») devient une page pleine, et tout ce qui dépasse la
+/// page est ramené à la page.
+///
+/// Rend aussi la borne appliquée, pour que la page sache si c'est NOUS qui
+/// avons coupé — sans quoi elle annoncerait un catalogue épuisé.
+pub fn limite_sans_pagination(limit: usize) -> usize {
+    if limit == 0 {
+        LIMITE_PAGE_SANS_PAGINATION
+    } else {
+        limit.min(LIMITE_PAGE_SANS_PAGINATION)
+    }
+}
+
 impl SearchPage {
     /// Page unique d'un service qui ne sait pas paginer sa recherche.
     ///
@@ -175,6 +213,35 @@ impl SearchPage {
             has_more: false,
             truncated: false,
         }
+    }
+
+    /// Page unique d'un service dont la demande a été RAMENÉE à ce qu'il sait
+    /// servir ([`limite_sans_pagination`]).
+    ///
+    /// Une catégorie qui rend exactement la borne a probablement été coupée par
+    /// nous : le service n'annonçant aucun total, on ne peut pas savoir s'il en
+    /// restait — mais annoncer `has_more: false` et un total égal au nombre
+    /// rendu affirmerait qu'il n'en restait pas. C'est ce que faisait
+    /// [`Self::page_unique`] pour un « Tous » ramené à 50, et c'est le
+    /// « totaux annoncés » de #2160 : l'écran croyait tenir tout le catalogue.
+    ///
+    /// On ne fabrique pas de total : `totals` reste ce qui est rendu. Ce sont
+    /// `has_more` et `truncated` qui portent le doute, et c'est exactement ce
+    /// que leur documentation dit d'eux.
+    pub fn page_unique_bornee(results: SearchResults, borne: usize) -> Self {
+        let coupee = borne > 0
+            && [
+                results.tracks.len(),
+                results.albums.len(),
+                results.artists.len(),
+                results.playlists.len(),
+            ]
+            .iter()
+            .any(|rendu| *rendu >= borne);
+        let mut page = Self::page_unique(results);
+        page.has_more = coupee;
+        page.truncated = coupee;
+        page
     }
 
     /// Page vide au-delà de ce qu'un service sait servir.
@@ -284,6 +351,14 @@ pub trait StreamingService: Send + Sync {
     /// rend sa page unique ; au-delà il rend du vide, car recycler la première
     /// page en prétendant que c'est la seconde ferait afficher deux fois les
     /// mêmes titres.
+    ///
+    /// La limite est d'abord ramenée à ce qu'un service sans pagination sait
+    /// recevoir ([`limite_sans_pagination`]) : la route parle la convention de
+    /// Qobuz — `0` = « Tous » —, et la recopier telle quelle dans l'URL d'un
+    /// service qui ne pagine pas produit `limit=0`, c'est-à-dire une page vide
+    /// ou un refus de l'API (#2160). C'est le seul endroit où cette traduction
+    /// peut vivre une fois pour toutes : chaque service la referait sinon, et
+    /// aucun ne la faisait.
     async fn search_page(
         &self,
         query: &str,
@@ -293,7 +368,11 @@ pub trait StreamingService: Send + Sync {
         if offset > 0 {
             return Ok(SearchPage::au_dela(offset));
         }
-        Ok(SearchPage::page_unique(self.search(query, limit).await?))
+        let borne = limite_sans_pagination(limit);
+        Ok(SearchPage::page_unique_bornee(
+            self.search(query, borne).await?,
+            borne,
+        ))
     }
 
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError>;
@@ -799,5 +878,223 @@ mod tests {
         let json = serde_json::to_value(&section).unwrap();
         assert_eq!(json["id"], "new-releases");
         assert_eq!(json["name"], "New Releases");
+    }
+}
+
+/// Ce qu'un service SANS pagination reçoit réellement (#2160).
+///
+/// Ces gardes appellent `search_page` — le défaut du trait — sur un connecteur
+/// qui note ce que son `search` a reçu. Lire le texte de `traits.rs` ne
+/// prouverait rien : le défaut est un chemin de code, et c'est ce chemin qui
+/// recopiait `limit=0` dans l'URL de Spotify, de Tidal et de Deezer.
+#[cfg(test)]
+mod tests_limite_sans_pagination {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Un connecteur qui n'implémente QUE `search` : `search_page` lui vient du
+    /// trait, ce qui est exactement l'objet de l'essai. Il note la limite reçue
+    /// et rend `rendus` pistes, pour qu'un plafond qui mord se voie.
+    struct ServiceSansPagination {
+        limites_vues: Arc<Mutex<Vec<usize>>>,
+        rendus: usize,
+    }
+
+    fn piste(i: usize) -> StreamTrack {
+        StreamTrack {
+            id: i.to_string(),
+            title: format!("Titre {i}"),
+            artist: "Artiste".into(),
+            album: None,
+            album_id: None,
+            duration_ms: 1000,
+            cover_path: None,
+            track_number: None,
+            disc_number: None,
+            explicit: false,
+            quality: None,
+            isrc: None,
+            composer: None,
+            artist_id: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServiceSansPagination {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            "sans-pagination"
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _enabled: bool) {}
+        async fn authenticate(
+            &mut self,
+            _credentials: &serde_json::Value,
+        ) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        /// Le témoin : ce que la couche au-dessus a réellement demandé.
+        async fn search(&self, _query: &str, limit: usize) -> Result<SearchResults, TuneError> {
+            self.limites_vues
+                .lock()
+                .expect("verrou d'essai")
+                .push(limit);
+            Ok(SearchResults {
+                tracks: (0..self.rendus).map(piste).collect(),
+                albums: Vec::new(),
+                artists: Vec::new(),
+                playlists: Vec::new(),
+            })
+        }
+        async fn get_track(&self, _id: &str) -> Result<StreamTrack, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_track_url(
+            &self,
+            _id: &str,
+            _quality: Option<&str>,
+        ) -> Result<StreamUrl, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album(&self, _id: &str) -> Result<StreamAlbum, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_artist(&self, _id: &str) -> Result<StreamArtist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist(&self, _id: &str) -> Result<StreamPlaylist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Ok(Vec::new())
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Ok(Vec::new())
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn service(rendus: usize) -> (ServiceSansPagination, Arc<Mutex<Vec<usize>>>) {
+        let limites_vues = Arc::new(Mutex::new(Vec::new()));
+        (
+            ServiceSansPagination {
+                limites_vues: limites_vues.clone(),
+                rendus,
+            },
+            limites_vues,
+        )
+    }
+
+    #[tokio::test]
+    async fn tous_ne_devient_jamais_limit_zero_chez_un_service_qui_ne_pagine_pas() {
+        // Le défaut : `?limit=0` est le « Tous » de la route, et il arrivait
+        // tel quel dans `…&limit=0`, que ces API refusent ou servent vide.
+        let (svc, vues) = service(50);
+        let page = svc.search_page("depeche mode", 0, 0).await.expect("page");
+        assert_eq!(
+            *vues.lock().expect("verrou d'essai"),
+            vec![LIMITE_PAGE_SANS_PAGINATION],
+            "« Tous » devient la page la plus large que le service sache servir"
+        );
+        assert_eq!(page.results.tracks.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn une_limite_extravagante_est_ramenee_a_la_page() {
+        let (svc, vues) = service(50);
+        svc.search_page("depeche mode", 100_000, 0)
+            .await
+            .expect("page");
+        assert_eq!(
+            *vues.lock().expect("verrou d'essai"),
+            vec![LIMITE_PAGE_SANS_PAGINATION]
+        );
+    }
+
+    #[tokio::test]
+    async fn une_limite_deja_tenable_passe_intacte() {
+        // Contre-épreuve : la borne ne doit RIEN changer au trafic actuel.
+        // 50 est ce que les écrans envoient aujourd'hui, 20 le défaut de la
+        // route ; les deux doivent traverser sans être touchés.
+        for demandee in [1usize, 20, 50] {
+            let (svc, vues) = service(0);
+            svc.search_page("q", demandee, 0).await.expect("page");
+            assert_eq!(
+                *vues.lock().expect("verrou d'essai"),
+                vec![demandee],
+                "une limite que le service sait tenir n'est pas retouchée"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn une_page_pleine_ne_se_declare_pas_exhaustive() {
+        // « totaux annoncés » : rendre exactement la borne ne prouve pas que
+        // le catalogue est épuisé. `page_unique` affirmait pourtant
+        // `has_more: false` et un total égal au nombre rendu.
+        let (svc, _vues) = service(LIMITE_PAGE_SANS_PAGINATION);
+        let page = svc.search_page("somebody", 0, 0).await.expect("page");
+        assert!(
+            page.has_more,
+            "50 rendus sur un plafond de 50 : on ne sait pas si c'est tout"
+        );
+        assert!(page.truncated, "et c'est NOTRE plafond qui a coupé");
+    }
+
+    #[tokio::test]
+    async fn une_page_courte_reste_exhaustive() {
+        // Contre-épreuve de la précédente : sous la borne, le service s'est
+        // arrêté de lui-même — pas de « Charger plus » à afficher.
+        let (svc, _vues) = service(7);
+        let page = svc.search_page("obscur", 0, 0).await.expect("page");
+        assert_eq!(page.results.tracks.len(), 7);
+        assert!(!page.has_more);
+        assert!(!page.truncated);
+        assert_eq!(page.totals.tracks, 7);
+    }
+
+    #[tokio::test]
+    async fn un_curseur_ne_rappelle_pas_la_premiere_page() {
+        // Non-régression : le défaut du trait rend du vide au-delà de zéro,
+        // et n'appelle même pas le service.
+        let (svc, vues) = service(50);
+        let page = svc.search_page("q", 0, 50).await.expect("page");
+        assert!(vues.lock().expect("verrou d'essai").is_empty());
+        assert_eq!(page.offset, 50);
+        assert!(page.results.tracks.is_empty());
+    }
+
+    #[test]
+    fn la_traduction_de_la_limite_est_totale() {
+        assert_eq!(limite_sans_pagination(0), LIMITE_PAGE_SANS_PAGINATION);
+        assert_eq!(limite_sans_pagination(1), 1);
+        assert_eq!(limite_sans_pagination(20), 20);
+        assert_eq!(limite_sans_pagination(50), 50);
+        assert_eq!(limite_sans_pagination(51), LIMITE_PAGE_SANS_PAGINATION);
+        assert_eq!(
+            limite_sans_pagination(usize::MAX),
+            LIMITE_PAGE_SANS_PAGINATION
+        );
     }
 }

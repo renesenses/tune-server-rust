@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::db::zone_repo::CreationDeZone;
 use tune_core::outputs::hqplayer::{HQPLAYER_DEFAULT_PORT, HqplayerOutput};
 use tune_core::outputs::traits::OutputTarget;
 
@@ -194,11 +195,23 @@ async fn discover_and_register_inner(
     } else {
         output_name.clone()
     };
-    match zone_repo.get_or_create(&zone_name, Some("hqplayer"), &device_id) {
-        Ok((zid, true)) => {
+    // #3529 — ce sondage ne consultait pas « Créer automatiquement les
+    // zones ». Il tourne à chaque tour du sondeur tant que `hqplayer_enabled`
+    // est vrai : une instance HQPlayer jamais vue faisait apparaître sa zone
+    // toute seule, réglage décoché.
+    match zone_repo.get_or_create_si_autorise(
+        &zone_name,
+        Some("hqplayer"),
+        &device_id,
+        "hqplayer_discover",
+    ) {
+        Ok(CreationDeZone::Creee(zid)) => {
             tracing::info!(name = %zone_name, zone_id = zid, "hqplayer_zone_auto_created");
         }
-        Ok((_, false)) => {
+        Ok(CreationDeZone::Refusee) => {
+            tracing::info!(name = %zone_name, id = %device_id, "hqplayer_zone_auto_create_disabled_skipping");
+        }
+        Ok(CreationDeZone::Existante(_)) => {
             let _ = zone_repo.set_online_by_device(&device_id, true);
             tracing::info!(name = %output_name, id = %device_id, "hqplayer_zone_reconnected");
         }
