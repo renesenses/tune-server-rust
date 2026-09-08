@@ -124,6 +124,26 @@ jobs:
             os: ubuntu-22.04
             platform: linux-x86_64
             ext: tar.gz
+          # Les deux cibles ARM sont construites par `cross`, dans un
+          # conteneur qui ne porte pas les en-tetes ALSA de la CIBLE : leur
+          # `features:` n'a donc PAS `local-audio`, contrairement aux lignes
+          # natives Linux/Windows/macOS plus bas.
+          #
+          # Ce n'est pas un oubli, c'est une contrainte — mais c'est une
+          # ABSENCE MESUREE, pas un arbitrage : sur l'artefact publie
+          # v0.9.141, `strings tune-server | grep -c cpal` rend 0 sur
+          # linux-aarch64 contre 175 sur linux-x86_64. Les binaires ARM
+          # livres n'ont pas de sortie audio locale. Voir #3355.
+          #
+          # Toute AUTRE fonctionnalite du `default` de tune-server doit
+          # figurer dans chaque `features:` ci-dessous et dans chaque ligne
+          # `cargo build` qui passe `--no-default-features` : c'est
+          # `cloud-relay` qui manquait partout jusqu'a la v0.9.141, et rien
+          # n'a rougi. La garde
+          # `toute_feature_par_defaut_est_livree_par_toute_ligne_de_build_de_release`
+          # (tune-server/tests/features_livrees_3355.rs) lit ce fichier et
+          # refuse desormais un nouvel oubli ; les deux exceptions ARM
+          # ci-dessus y sont inscrites avec leur raison.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
             platform: linux-aarch64
