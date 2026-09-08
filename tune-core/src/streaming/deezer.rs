@@ -41,7 +41,27 @@ pub struct DeezerService {
     quality: String,
     proxy_base_url: Option<String>,
     arl_rejected: bool,
+    /// Cet ARL-ci a-t-il DÉJÀ authentifié dans ce processus ?
+    ///
+    /// C'est ce qui sépare « valeur douteuse » de « identifiant éprouvé » :
+    /// une valeur qui n'a jamais rien ouvert est refusée au premier coup,
+    /// un identifiant qui a servi obtient un second essai (voir
+    /// [`ARL_ZERO_USER_TOLERANCE`]).
+    arl_authenticated_once: bool,
+    /// Nombre de réponses `USER_ID: 0` CONSÉCUTIVES depuis la dernière
+    /// authentification réussie. Remis à zéro par tout succès.
+    arl_zero_user_streak: u8,
 }
+
+/// Combien de sessions anonymes consécutives on tolère avant de jeter un ARL
+/// qui a déjà authentifié.
+///
+/// La passerelle Deezer rend `USER_ID: 0` — une session ANONYME — aussi bien
+/// pour un ARL réellement expiré que pour un incident passager de session côté
+/// fournisseur. Sur un seul relevé les deux sont indiscernables ; sur deux
+/// relevés espacés de cinq minutes, l'expiration est la lecture de loin la
+/// plus probable.
+const ARL_ZERO_USER_TOLERANCE: u8 = 1;
 
 impl Default for DeezerService {
     fn default() -> Self {
@@ -67,6 +87,8 @@ impl DeezerService {
             quality: "FLAC".into(),
             proxy_base_url: None,
             arl_rejected: false,
+            arl_authenticated_once: false,
+            arl_zero_user_streak: 0,
         }
     }
 
@@ -140,11 +162,47 @@ impl DeezerService {
             .or_else(|| user["USER_ID"].as_str().and_then(|s| s.parse().ok()))
             .unwrap_or(0);
         if user_id_num == 0 {
+            // #1909 a tranché ce partage — passager contre définitif — pour la
+            // sonde de DÉMARRAGE, dans `handle_restored_arl_failure`. Le même
+            // partage manquait ICI, et c'est ce chemin-ci qui tombe en pleine
+            // session : tant que `license_token` est vide, `refresh_if_needed`
+            // rappelle cette fonction toutes les 300 s, et un seul `USER_ID: 0`
+            // suffisait à effacer l'ARL en mémoire. `session_expired()` passait
+            // vrai dans la foulée (`arl_rejected` et pas de jeton OAuth), et le
+            // rafraîchisseur de `background.rs` SUPPRIMAIT la ligne
+            // `auth_tokens_deezer` — la perte devenait définitive.
+            //
+            // Chez Belkadi Yacine (#3576) l'écran est passé de « Deezer :
+            // Connecté » (capture de 11:26:46) à « Non connecté », champ ARL
+            // vide (11:36:10) : dix minutes, soit deux tics du rafraîchisseur,
+            // et `process_started_at` identique de part et d'autre — aucun
+            // redémarrage n'a eu lieu. Au démarrage suivant, à 12:11, le
+            // journal porte `tokens_restored` pour youtube, tidal et qobuz, et
+            // rien pour deezer : il n'y avait plus de ligne à restaurer.
+            //
+            // Un ARL qui n'a JAMAIS authentifié reste refusé au premier coup :
+            // c'est le cas d'une mauvaise valeur collée dans le champ, et celui
+            // de la sonde de démarrage sur une ligne périmée, dont dépend la
+            // suppression voulue par #1909.
+            self.arl_zero_user_streak = self.arl_zero_user_streak.saturating_add(1);
+            if self.arl_authenticated_once && self.arl_zero_user_streak <= ARL_ZERO_USER_TOLERANCE {
+                warn!(
+                    refus_consecutifs = self.arl_zero_user_streak,
+                    tolerance = ARL_ZERO_USER_TOLERANCE,
+                    "deezer_session_anonyme_toleree"
+                );
+                return Err(ArlAuthenticationError::Unavailable(
+                    "session Deezer anonyme (USER_ID=0) — identifiant conservé pour un nouvel essai"
+                        .into(),
+                ));
+            }
             self.reject_arl();
             return Err(ArlAuthenticationError::Rejected(
                 "ARL invalide ou expiré".into(),
             ));
         }
+        self.arl_authenticated_once = true;
+        self.arl_zero_user_streak = 0;
         self.user_id = Some(user_id_num);
         self.username = user["BLOG_NAME"].as_str().map(Into::into);
         self.license_token = user
@@ -170,6 +228,15 @@ impl DeezerService {
     }
 
     fn reject_arl(&mut self) {
+        // Le greffon Deezer n'émettait aucune trace sur ce chemin : rien, dans
+        // le journal de Yacine, ne datait la perte de l'ARL — seules ses trois
+        // captures d'écran la datent (#3576). Cette ligne-ci est le témoin qui
+        // manquait, et elle dit lequel des deux cas s'est produit.
+        warn!(
+            avait_authentifie = self.arl_authenticated_once,
+            refus_consecutifs = self.arl_zero_user_streak,
+            "deezer_arl_efface"
+        );
         self.arl = None;
         self.license_token = None;
         self.api_token = None;
@@ -909,6 +976,11 @@ impl StreamingService for DeezerService {
         if let Some(arl) = tokens["arl"].as_str() {
             self.arl = Some(arl.into());
             self.arl_rejected = false;
+            // Une ligne relue n'a rien authentifié dans CE processus : la sonde
+            // de démarrage est son premier contact, et elle garde le droit de
+            // refuser du premier coup (#1909).
+            self.arl_authenticated_once = false;
+            self.arl_zero_user_streak = 0;
             restored = true;
         }
         if let Some(q) = tokens["quality"].as_str() {
@@ -1235,6 +1307,55 @@ mod tests {
         assert!(svc.arl_rejected);
         assert!(svc.session_expired());
         assert!(svc.save_tokens().is_none());
+    }
+
+    /// Le cas de Yacine : un ARL qui a déjà ouvert la session survit à UNE
+    /// session anonyme, et la ligne persistée n'est pas supprimée derrière.
+    #[test]
+    fn une_session_anonyme_ne_jette_pas_un_arl_deja_eprouve() {
+        let mut svc = DeezerService::new();
+        svc.arl = Some("a".repeat(192));
+        svc.arl_authenticated_once = true;
+        svc.arl_zero_user_streak = 1;
+        // Ce qu'`authenticate_arl_checked` rend sous la tolérance.
+        svc.handle_restored_arl_failure(&ArlAuthenticationError::Unavailable(
+            "session Deezer anonyme (USER_ID=0)".into(),
+        ));
+        assert_eq!(svc.arl.as_deref(), Some("a".repeat(192).as_str()));
+        assert!(!svc.arl_rejected);
+        // C'est CE point qui décidait de la suppression de `auth_tokens_deezer`
+        // dans `background.rs`.
+        assert!(!svc.session_expired());
+        assert!(svc.save_tokens().is_some());
+    }
+
+    /// Contre-épreuve de la garde : passé la tolérance, l'ARL part bien. Sans
+    /// elle, la garde ci-dessus se lirait comme « on ne jette plus jamais ».
+    #[test]
+    fn passe_la_tolerance_l_arl_eprouve_est_bien_jete() {
+        let mut svc = DeezerService::new();
+        svc.arl = Some("a".repeat(192));
+        svc.arl_authenticated_once = true;
+        svc.arl_zero_user_streak = ARL_ZERO_USER_TOLERANCE + 1;
+        svc.handle_restored_arl_failure(&ArlAuthenticationError::Rejected(
+            "ARL invalide ou expiré".into(),
+        ));
+        assert!(svc.arl.is_none());
+        assert!(svc.session_expired());
+        assert!(svc.save_tokens().is_none());
+    }
+
+    /// Seconde contre-épreuve : une ligne relue du disque n'est PAS éprouvée,
+    /// donc la sonde de démarrage garde le droit de refuser du premier coup —
+    /// c'est de quoi dépend `expired_session_row_deleted` (#1909).
+    #[test]
+    fn un_arl_relu_du_disque_n_est_pas_declare_eprouve() {
+        let mut svc = DeezerService::new();
+        svc.arl_authenticated_once = true;
+        svc.arl_zero_user_streak = 3;
+        assert!(svc.restore_tokens(&json!({"arl": "a".repeat(192)})));
+        assert!(!svc.arl_authenticated_once);
+        assert_eq!(svc.arl_zero_user_streak, 0);
     }
 
     #[test]

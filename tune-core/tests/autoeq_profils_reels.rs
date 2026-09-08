@@ -11,7 +11,7 @@
 //! Un test sur du texte écrit à la main prouverait seulement que l'analyseur
 //! lit ce que l'analyseur écrit. Ces trois-là prouvent qu'il lit AutoEq.
 
-use tune_core::audio::autoeq::{ErreurAutoEq, analyser};
+use tune_core::audio::autoeq::{ErreurAutoEq, RaisonIgnore, analyser};
 use tune_core::audio::eq::{EqProcessor, EqProfile};
 
 const HD_650: &str = include_str!("fixtures/autoeq/sennheiser_hd_650.txt");
@@ -38,27 +38,44 @@ fn les_trois_profils_publies_sont_lus_en_dix_bandes() {
         assert!(profil.preamp_db < 0.0, "{nom} : le Preamp est negatif");
         // Les exports d'AutoEq n'ont aucun filtre desactive : le compte rendu
         // le dit, et l'utilisateur ne cherche pas de bande manquante.
-        assert_eq!(
-            profil.filtres_ignores, 0,
+        assert!(
+            profil.ignores.is_empty(),
             "{nom} : aucun filtre OFF dans un export AutoEq"
         );
     }
 }
 
-/// Les filtres `OFF` sont ecartes du son, mais COMPTES dans le compte rendu.
+/// Les filtres `OFF` sont ecartes du son, mais NOMMES dans le compte rendu.
 ///
 /// Equalizer APO exporte volontiers des lignes desactivees. Les taire ferait
 /// croire a une troncature : dix lignes dans le fichier, sept bandes dans le
-/// prereglage, et rien pour expliquer l'ecart.
+/// prereglage, et rien pour expliquer l'ecart. Un simple compte laissait
+/// l'utilisateur relire son fichier pour retrouver LESQUELLES ; ici le numero
+/// de ligne les designe, et il pointe la ligne du fichier, pas le rang du
+/// filtre (le HD 650 a un Preamp en tete, donc filtre 8 = ligne 9).
 #[test]
-fn les_filtres_desactives_dun_profil_reel_sont_comptes() {
+fn les_filtres_desactives_dun_profil_reel_sont_nommes() {
     let avec_off = HD_650
         .replace("Filter 8: ON", "Filter 8: OFF")
         .replace("Filter 9: ON", "Filter 9: OFF")
         .replace("Filter 10: ON", "Filter 10: OFF");
     let profil = analyser(&avec_off).unwrap();
     assert_eq!(profil.bandes.len(), 7);
-    assert_eq!(profil.filtres_ignores, 3);
+    assert_eq!(profil.ignores.len(), 3);
+    // Les numeros de ligne du FICHIER, pas les rangs des filtres.
+    let lignes: Vec<usize> = profil.ignores.iter().map(|i| i.ligne).collect();
+    let attendues: Vec<usize> = avec_off
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains(": OFF"))
+        .map(|(i, _)| i + 1)
+        .collect();
+    assert_eq!(lignes, attendues);
+    for ignore in &profil.ignores {
+        assert_eq!(ignore.raison, RaisonIgnore::Desactive);
+        assert_eq!(ignore.raison.cle(), "disabled");
+        assert_eq!(ignore.type_filtre.as_deref(), Some("PK"));
+    }
     // Et les sept bandes restantes sont bien les sept premieres du fichier.
     assert_eq!(profil.bandes[6].freq, 1227.0);
 }

@@ -835,9 +835,11 @@ fn merge_duplicate_albums(
             }
         }
     }
-    db.execute_batch(
-        "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
-    ).ok();
+    db.execute_batch(&format!(
+        "UPDATE albums SET track_count = {}",
+        tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
+    ))
+    .ok();
     Ok(deleted)
 }
 
