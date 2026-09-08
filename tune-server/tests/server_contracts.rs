@@ -43,6 +43,8 @@ mod collections_ordre_albums;
 mod compilation_dans_les_reponses_album;
 #[path = "config_secrets_et_roles.rs"]
 mod config_secrets_et_roles;
+#[path = "consommateur_hors_arbre.rs"]
+mod consommateur_hors_arbre;
 #[path = "contexte_de_session.rs"]
 mod contexte_de_session;
 #[path = "credits_enrichissement_statut.rs"]
