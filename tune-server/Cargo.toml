@@ -396,3 +396,17 @@ path = "tests/derive_des_garde_fous_2816.rs"
 [[test]]
 name = "zones_auto_create_recension"
 path = "tests/zones_auto_create_recension.rs"
+
+# #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
+# rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
+# jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
+# rien ne gardait la VALEUR (`max_limit` partait tel quel dans `LIMIT {n}` : `0`
+# vidait la collection, un negatif faisait diverger SQLite et PostgreSQL). Le
+# temoin passe par les ROUTES MONTEES. `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+#
+# Posée ICI, au milieu du fichier, et non à la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent à chaque fois.
+[[test]]
+name = "borne_smart_collections_2732"
+path = "tests/borne_smart_collections_2732.rs"
