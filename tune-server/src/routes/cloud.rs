@@ -875,11 +875,12 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
         );
     }
 
-    let zone_limit = if ls.tier == tune_core::license::Tier::Premium {
-        None
-    } else {
-        Some(state.license.free_zone_limit())
-    };
+    // Meme lecture que `/system/config` et que le refus de lecture : une seule
+    // implementation du plafond (#3673). Cette route-ci en tenait sa propre
+    // copie ternaire, identique a celle de `/system/config` a un `serde_json::
+    // Value::Null` pres — deux ecritures d'une meme regle, donc deux occasions
+    // de deriver.
+    let zone_limit = state.license.limite_zones().await;
 
     // Floating-license single-session model: when set, `tier` above is already
     // Free (premium is gated off here) and this object tells the UI WHY — the

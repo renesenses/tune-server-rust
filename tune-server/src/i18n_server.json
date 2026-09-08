@@ -1655,6 +1655,18 @@
     "ro": "Zona nr. {id} nu mai există. Reîmprospătați lista de zone.",
     "sv": "Zon nr {id} finns inte längre. Uppdatera zonlistan."
   },
+  "zone.freeCapReached": {
+    "fr": "Vous utilisez déjà vos {n} zones gratuites. Jouer sur une zone de plus demande Tune Premium — les protocoles (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) sont tous inclus dans la version gratuite.",
+    "en": "You are already using your {n} free zones. Playing on one more zone requires Tune Premium — the protocols (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) are all included in the free version.",
+    "de": "Sie nutzen bereits Ihre {n} kostenlosen Zonen. Die Wiedergabe auf einer weiteren Zone erfordert Tune Premium — die Protokolle (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) sind alle in der kostenlosen Version enthalten.",
+    "es": "Ya está usando sus {n} zonas gratuitas. Reproducir en una zona más requiere Tune Premium: los protocolos (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) están todos incluidos en la versión gratuita.",
+    "it": "Stai già usando le tue {n} zone gratuite. Riprodurre su un'altra zona richiede Tune Premium — i protocolli (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) sono tutti inclusi nella versione gratuita.",
+    "zh": "您已用满 {n} 个免费区域。在更多区域播放需要 Tune Premium — 各类协议（DLNA、AirPlay 2、BluOS、Chromecast、OpenHome）均已包含在免费版中。",
+    "ja": "無料の {n} ゾーンをすべて使用中です。さらにゾーンで再生するには Tune Premium が必要です。プロトコル（DLNA、AirPlay 2、BluOS、Chromecast、OpenHome）はすべて無料版に含まれています。",
+    "ko": "무료 영역 {n}개를 이미 모두 사용 중입니다. 영역을 하나 더 재생하려면 Tune Premium이 필요합니다. 프로토콜(DLNA, AirPlay 2, BluOS, Chromecast, OpenHome)은 모두 무료 버전에 포함되어 있습니다.",
+    "ro": "Folosiți deja cele {n} zone gratuite. Redarea într-o zonă în plus necesită Tune Premium — protocoalele (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) sunt toate incluse în versiunea gratuită.",
+    "sv": "Du använder redan dina {n} gratiszoner. Att spela i ytterligare en zon kräver Tune Premium — protokollen (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) ingår alla i gratisversionen."
+  },
   "zonegroup.sameOutput": {
     "fr": "Les zones « {a} » et « {b} » utilisent la même sortie audio : elles ne peuvent pas être groupées. Supprimez-en une, ou donnez-lui une autre sortie.",
     "en": "Zones “{a}” and “{b}” use the same audio output: they cannot be grouped. Delete one of them, or give it another output.",
