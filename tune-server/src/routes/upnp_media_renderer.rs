@@ -150,12 +150,35 @@ async fn description(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
         .map(|u| u.base_url())
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", state.port));
     let xml = upnp_renderer::renderer_description_xml(
-        &format!("{} (Tune)", zone.name),
+        &nom_de_facade(&zone.name),
         &renderer_udn(&settings, zone_id),
         &base_url,
         zone_id,
     );
     xml_response(xml)
+}
+
+/// Le `friendlyName` de la façade MediaRenderer d'une zone — **idempotent**.
+///
+/// C'est l'unique producteur du suffixe « (Tune) », et il était
+/// `format!("{} (Tune)", zone.name)` : non idempotent. Or ce nom ne reste pas
+/// dans le XML. Le scanner SSDP en fait `device.name`, et l'auto-découverte
+/// crée une zone qui le porte (`discovery_setup.rs`, `get_or_create`) : chaque
+/// tour où les deux rideaux d'auto-exclusion (`est_notre_propre_renderer`,
+/// `est_un_de_nos_udn_de_facade`) cèdent AJOUTAIT un « (Tune) » de plus, écrit
+/// dans `zones.name`, où il survit aux redémarrages. Le journal du testeur de
+/// #3616 en porte TROIS : « DENAFRIPS USB HiRes Audio, USB Audio (Tune) (Tune)
+/// (Tune) ».
+///
+/// Ce troisième rideau ne remplace pas les deux autres — il n'empêche pas la
+/// zone fantôme, il en borne le nom. Une zone déjà suffixée par un tour
+/// précédent ne se re-suffixe plus, et la dérive s'arrête net.
+fn nom_de_facade(nom_de_zone: &str) -> String {
+    const SUFFIXE: &str = " (Tune)";
+    if nom_de_zone.ends_with(SUFFIXE) {
+        return nom_de_zone.to_string();
+    }
+    format!("{nom_de_zone}{SUFFIXE}")
 }
 
 async fn avtransport_scpd() -> Response {
@@ -554,4 +577,57 @@ pub fn spawn_renderer_advertiser(state: AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 🔴 #3616, défaut 2 — le suffixe « (Tune) » ne doit plus s'accumuler.
+    ///
+    /// Site d'appel gardé : la route `description` (`GET
+    /// /upnp/renderer/{zone}/description.xml`), qui compose son `friendlyName`
+    /// par `nom_de_facade(&zone.name)` et le passe à
+    /// `upnp_renderer::renderer_description_xml`. La garde refait EXACTEMENT
+    /// cette composition, et compte les suffixes dans le XML réellement servi
+    /// — pas dans la seule chaîne intermédiaire.
+    #[test]
+    fn le_suffixe_tune_ne_s_accumule_pas_dans_la_description_servie() {
+        // Le nom déjà pollué du journal du testeur, tel qu'une zone fantôme
+        // l'a persisté en base : il ne doit pas en gagner un quatrième.
+        let deja_pollue = "DENAFRIPS USB HiRes Audio, USB Audio (Tune) (Tune) (Tune)";
+        let xml = upnp_renderer::renderer_description_xml(
+            &nom_de_facade(deja_pollue),
+            "uuid:0f1ac0de-0000-4000-8000-000000000001",
+            "http://192.168.0.39:8888",
+            17,
+        );
+        assert_eq!(
+            xml.matches("(Tune)").count(),
+            3,
+            "un nom déjà suffixé ne doit pas en gagner un de plus : c'est ce \
+             tour de plus, répété, qui a produit « (Tune) (Tune) (Tune) » \
+             dans zones.name.\nXML servi :\n{xml}"
+        );
+
+        // Contre-épreuve, l'autre sens : une zone SAINE doit toujours recevoir
+        // son suffixe. Sans lui, `est_notre_propre_renderer` et la
+        // documentation UPnP-RENDERER perdraient leur repère de lecture.
+        let xml = upnp_renderer::renderer_description_xml(
+            &nom_de_facade("Salon"),
+            "uuid:0f1ac0de-0000-4000-8000-000000000002",
+            "http://192.168.0.39:8888",
+            18,
+        );
+        assert!(
+            xml.contains("Salon (Tune)"),
+            "une zone jamais suffixée doit l'être : l'idempotence ne doit pas \
+             supprimer le suffixe.\nXML servi :\n{xml}"
+        );
+        assert_eq!(
+            xml.matches("(Tune)").count(),
+            1,
+            "et une seule fois.\nXML servi :\n{xml}"
+        );
+    }
 }

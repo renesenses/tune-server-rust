@@ -986,6 +986,16 @@ pub const PREVENT_CLIPPING_KEY: &str = "replaygain_prevent_clipping";
 /// stocké, cela laisse la marge inter-échantillons aux DAC qui la demandent.
 pub const TRUE_PEAK_CEILING_KEY: &str = "replaygain_true_peak_ceiling_db";
 
+/// Au-delà de ce pic, la valeur tagée n'est plus une amplitude normalisée.
+///
+/// Un pic ReplayGain vaut `1.0` à la pleine échelle. Un master écrêté monte
+/// légitimement au-dessus (`1.02`, `1.1`) : le plafond est posé à `4.0`
+/// (+12 dBFS) pour que ces pics-là continuent de protéger. Une valeur plus
+/// haute — `32768`, `8388607` — est une échelle d'ÉCHANTILLON écrite par un
+/// vieux tagueur ; l'utiliser comme pic ferait tomber le facteur sur son
+/// plancher, soit 60 dB de trop peu.
+pub const PEAK_MAX_PLAUSIBLE: f64 = 4.0;
+
 /// Témoin de provenance du gain de PISTE (#1627) : posé par la passe d'analyse
 /// à côté de `rg_track_gain`. Absent ⇒ la valeur vient des tags du fichier.
 pub const TRACK_SOURCE_KEY: &str = "rg_track_source";
@@ -1237,10 +1247,25 @@ pub fn stored_gain_detail(
         .ok()?;
     let pick = |gain_key: &str, peak_key: &str, true_peak_key: &str| -> Option<TrackGain> {
         let gain_db = meta.get(gain_key).cloned().and_then(parse_gain_db)?;
+        // Un pic ReplayGain est une AMPLITUDE NORMALISÉE, pas une valeur
+        // d'échantillon. Le tag est importé VERBATIM du fichier
+        // (`metadata/mod.rs`, `ItemKey::ReplayGainTrackPeak` → `rg_track_peak`)
+        // et certains vieux tagueurs y écrivent l'échelle de l'échantillon :
+        // `32768` en 16 bits, `8388607` en 24 bits. `gain_factor` calcule alors
+        // `plafond / pic`, tombe sur le plancher `0.001` de son `clamp` final,
+        // et la piste sort 60 dB trop bas — inaudible, sans qu'aucun message ne
+        // le dise.
+        //
+        // Le plafond est `PEAK_MAX_PLAUSIBLE` = 4 (+12 dBFS) et non 1 : un
+        // master écrêté dépasse légitimement la pleine échelle (1,02 ; 1,1) et
+        // son pic doit continuer de protéger. Au-delà, la valeur n'est plus un
+        // pic normalisé mais une autre échelle ; l'IGNORER fait retomber
+        // `prevent_clipping` sur le cas « aucun pic tagué », ce qui vaut mieux
+        // que d'éteindre le son.
         let read_peak = |key: &str| {
             meta.get(key)
                 .and_then(|p| p.trim().parse::<f64>().ok())
-                .filter(|p| *p > 0.0)
+                .filter(|p| *p > 0.0 && *p <= PEAK_MAX_PLAUSIBLE)
         };
         // Le true peak (inter-échantillons, #1694) PRIME quand il existe :
         // c'est lui qui voit les overs que le sample peak rate, et c'est
@@ -2961,5 +2986,113 @@ mod tests {
         w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
         w.extend_from_slice(&donnees);
         std::fs::write(path, w).unwrap();
+    }
+}
+
+/// Le pic tagué dans la mauvaise échelle éteignait le son (Refs #2157).
+///
+/// Les témoins passent par `playback_factor`, le SITE D'APPEL de production :
+/// c'est lui qu'appellent `orchestrator/resolve_local.rs:1523` (sortie locale),
+/// `orchestrator/transport.rs:1373` et `orchestrator/dsp.rs:1123`. Ils ne
+/// supposent aucun périphérique audio — seulement une base et la décision de
+/// gain.
+#[cfg(test)]
+mod garde_pic_hors_echelle {
+    use super::*;
+    use crate::db::sqlite::SqliteDb;
+
+    /// Une piste, ReplayGain en mode piste, anti-écrêtage à son défaut d'usine.
+    fn base_replaygain(gain_db: &str, pic: Option<&str>) -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Ella Fitzgerald')",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Clap Hands', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, \
+             sample_rate, channels) VALUES (42, 'Autumn Leaves', 1, 1, '/x/42.flac', 300000, \
+             44100, 2)",
+            &[],
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        SettingsRepo::with_backend(backend.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        meta.set(42, "rg_track_gain", gain_db).unwrap();
+        if let Some(p) = pic {
+            meta.set(42, "rg_track_peak", p).unwrap();
+        }
+        backend
+    }
+
+    /// LE défaut : `32768` (16 bits) et `8388607` (24 bits) sont des échelles
+    /// d'échantillon, pas des amplitudes. `gain_factor` en tirait
+    /// `plafond / pic`, tombait sur le plancher `0.001` du `clamp` final, et la
+    /// piste sortait 60 dB trop bas — inaudible, sans message.
+    #[test]
+    fn un_pic_tague_en_echelle_d_echantillon_n_eteint_plus_la_piste() {
+        for pic in ["32768", "32767.0", "8388607", "2147483647"] {
+            let backend = base_replaygain("-6.0 dB", Some(pic));
+            let f = playback_factor(&backend, 42);
+            assert!(
+                f > 0.001,
+                "pic {pic} : facteur {f} — le plancher du clamp, soit -60 dB"
+            );
+            // Le pic est ignoré : il ne reste que le gain tagué, -6 dB.
+            let attendu = 10f64.powf(-6.0 / 20.0);
+            assert!(
+                (f - attendu).abs() < 1e-9,
+                "pic {pic} : facteur {f}, attendu {attendu} (le gain seul)"
+            );
+        }
+    }
+
+    /// Contre-épreuve, l'autre moitié : un pic PLAUSIBLE doit continuer de
+    /// protéger. Un master écrêté à `1.1` avec un gain de +6 dB dépasserait la
+    /// pleine échelle ; `prevent_clipping` doit tirer le facteur à `1/1.1`.
+    #[test]
+    fn un_pic_plausible_protege_toujours_de_l_ecretage() {
+        let backend = base_replaygain("+6.0 dB", Some("1.1"));
+        let f = playback_factor(&backend, 42);
+        let attendu = 1.0 / 1.1;
+        assert!(
+            (f - attendu).abs() < 1e-9,
+            "facteur {f}, attendu {attendu} : l'anti-écrêtage ne tire plus"
+        );
+        assert!(
+            f < 10f64.powf(6.0 / 20.0),
+            "le gain brut est passé tel quel"
+        );
+
+        // Et la borne elle-même : `PEAK_MAX_PLAUSIBLE` est retenu, pas rejeté.
+        let backend = base_replaygain("+12.0 dB", Some("4.0"));
+        let f = playback_factor(&backend, 42);
+        assert!(
+            (f - 0.25).abs() < 1e-9,
+            "facteur {f}, attendu 0.25 : le pic 4.0 doit encore protéger"
+        );
+    }
+
+    /// Un pic hors échelle ne doit pas se distinguer d'un pic ABSENT : c'est
+    /// tout le sens du repli. Sans ce témoin, le premier test passerait au vert
+    /// sur un `factor` mis à 1.0 en dur.
+    #[test]
+    fn un_pic_hors_echelle_vaut_exactement_un_pic_absent() {
+        let sans = playback_factor(&base_replaygain("-6.0 dB", None), 42);
+        let ferraille = playback_factor(&base_replaygain("-6.0 dB", Some("32768")), 42);
+        assert!(
+            (sans - ferraille).abs() < 1e-12,
+            "sans pic {sans} != pic hors échelle {ferraille}"
+        );
     }
 }

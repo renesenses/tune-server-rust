@@ -70,7 +70,26 @@ async fn fetch_radio_metadata_depuis(
     if stream_url.contains("radioparadise")
         || station_name.to_lowercase().contains("radio paradise")
     {
-        let chan = radioparadise_channel(stream_url);
+        // Le nom compte autant que l'URL : la porte ci-dessus admet une station
+        // reconnue par son SEUL nom, et le resolveur de canal ne lisait que
+        // l'URL. Une entree nommee « Radio Paradise - Serenity » posee sur une
+        // adresse que Tune ne sait pas decouper tombait donc sur le melange
+        // principal (#3523, #3543).
+        let chan = match radioparadise_channel(station_name, stream_url) {
+            Some(c) => c,
+            None => {
+                // Aucun canal nomme : c'est le melange principal, dont l'URL ne
+                // porte que le format (`flacm`, `aac-128`). On le journalise
+                // pour qu'un canal NOUVEAU se lise a la ligne, au lieu
+                // d'afficher en silence le morceau d'un autre canal.
+                debug!(
+                    station = %station_name,
+                    url = %stream_url,
+                    "radioparadise_canal_par_defaut"
+                );
+                CANAL_RADIO_PARADISE_PRINCIPAL
+            }
+        };
         return fetch_radio_paradise_metadata(station_name, chan).await;
     }
 
@@ -555,16 +574,96 @@ async fn fetch_radiofrance_live_metadata(
 // Radio Paradise
 // ---------------------------------------------------------------------------
 
-fn radioparadise_channel(stream_url: &str) -> u32 {
-    if stream_url.contains("chan=1") || stream_url.contains("mellow") {
-        1
-    } else if stream_url.contains("chan=2") || stream_url.contains("rock") {
-        2
-    } else if stream_url.contains("chan=3") || stream_url.contains("world") {
-        3
-    } else {
-        0 // main mix
+/// Le melange principal de Radio Paradise : son URL de flux ne porte QUE le
+/// format (`flacm`, `aac-128`, `aac-320`, `mp3-192`), aucun nom de canal.
+/// C'est donc la valeur de repli, et elle est juste.
+const CANAL_RADIO_PARADISE_PRINCIPAL: u32 = 0;
+
+/// Les canaux de Radio Paradise, `stream_name` → numero `chan` de l'API.
+///
+/// **Mesure du 08/09/2026**, `https://api.radioparadise.com/api/list_chan` :
+/// SEPT canaux, et leurs numeros NE SE SUIVENT PAS.
+///
+/// | `chan` | titre | `stream_name` |
+/// |---|---|---|
+/// | 0 | The Main Mix | `main-mix` |
+/// | 1 | Mellow Mix | `mellow` |
+/// | 2 | RockIt! | `rock` |
+/// | 3 | The Globe | `global` |
+/// | 5 | Beyond… | `beyond` |
+/// | 42 | Serenity | `serenity` |
+/// | 945 | KFAT | `kfat` |
+///
+/// Les sept repondent : `now_playing?chan={n}` rend un artiste, un titre et une
+/// pochette pour chacun (mesure du 08/09/2026). Les numeros absents de cette
+/// table — 4, 6, 7, 9 — rendent, eux, un titre VIDE : on ne les devine pas, et
+/// c'est pourquoi cette table vient de `list_chan` et non d'un comptage.
+///
+/// Une URL de flux se lit `stream.radioparadise.com/{stream_name}-{format}`.
+///
+/// `world` et `rockit` sont des ALIAS : `world` est le nom que la table
+/// d'origine de ce fichier donnait au canal 3, que Radio Paradise publie
+/// aujourd'hui sous `global` ; `rockit` est le titre du canal 2. Les garder
+/// n'ajoute aucun canal, cela evite seulement qu'une URL ou un nom deja saisi
+/// cesse d'etre reconnu.
+const CANAUX_RADIO_PARADISE: &[(&str, u32)] = &[
+    ("mellow", 1),
+    ("rock", 2),
+    ("rockit", 2),
+    ("global", 3),
+    ("world", 3),
+    ("beyond", 5),
+    ("serenity", 42),
+    ("kfat", 945),
+];
+
+/// Le canal de Radio Paradise designe par cette station, s'il est nomme.
+///
+/// **L'URL decide d'abord**, parce qu'elle dit ce qui est reellement diffuse —
+/// c'est deja la doctrine de `bbc_service_id` : l'annuaire porte une entree
+/// nommee « Radio Paradise » tout court sur `.../mellow-flacm`, et c'est le
+/// Mellow Mix qui joue. **Le nom ne sert qu'en second**, pour les entrees dont
+/// l'adresse ne porte pas le canal.
+///
+/// Le rapprochement se fait sur des JETONS ENTIERS, pas sur une inclusion :
+/// `contains("rock")` mordait sur n'importe quel mot qui contient « rock ».
+/// On decoupe donc sur tout ce qui n'est ni lettre ni chiffre, et l'on compare
+/// le jeton en entier.
+///
+/// Rend `None` quand rien n'est nomme : le site d'appel en fait le melange
+/// principal, et le journalise.
+fn radioparadise_channel(station_name: &str, stream_url: &str) -> Option<u32> {
+    // `chan=N` reste lu en premier : c'est le canal ecrit noir sur blanc.
+    if let Some(chan) = canal_ecrit_dans_l_url(stream_url) {
+        return Some(chan);
     }
+    canal_par_jetons(stream_url).or_else(|| canal_par_jetons(station_name))
+}
+
+/// Le `chan=N` d'une URL, quand N est un canal que Radio Paradise publie.
+///
+/// Le nombre est lu ENTIER : `chan=1` ne doit pas mordre sur `chan=12`, qui
+/// n'est pas le Mellow Mix mais un canal inexistant.
+fn canal_ecrit_dans_l_url(stream_url: &str) -> Option<u32> {
+    let apres = stream_url.split("chan=").nth(1)?;
+    let nombre: String = apres.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let chan: u32 = nombre.parse().ok()?;
+    (chan == CANAL_RADIO_PARADISE_PRINCIPAL
+        || CANAUX_RADIO_PARADISE.iter().any(|(_, c)| *c == chan))
+    .then_some(chan)
+}
+
+/// Chercher un `stream_name` de canal parmi les jetons d'une chaine.
+fn canal_par_jetons(source: &str) -> Option<u32> {
+    source
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .find_map(|jeton| {
+            CANAUX_RADIO_PARADISE
+                .iter()
+                .find(|(nom, _)| *nom == jeton)
+                .map(|(_, chan)| *chan)
+        })
 }
 
 async fn fetch_radio_paradise_metadata(station_name: &str, chan: u32) -> Option<IcyMetadata> {
@@ -1206,23 +1305,156 @@ mod tests {
         );
     }
 
+    /// Le contrat d'origine, mot pour mot : rien de ce qui etait reconnu ne
+    /// cesse de l'etre. `world-320` compris — Radio Paradise ne publie plus ce
+    /// nom, l'alias le garde lisible.
     #[test]
     fn radioparadise_channel_detection() {
         assert_eq!(
-            radioparadise_channel("http://stream.radioparadise.com/aac-320"),
-            0
+            radioparadise_channel("Radio Paradise", "http://stream.radioparadise.com/aac-320"),
+            None
         );
         assert_eq!(
-            radioparadise_channel("http://stream.radioparadise.com/mellow-320"),
-            1
+            radioparadise_channel(
+                "Radio Paradise",
+                "http://stream.radioparadise.com/mellow-320"
+            ),
+            Some(1)
         );
         assert_eq!(
-            radioparadise_channel("http://stream.radioparadise.com/rock-320"),
-            2
+            radioparadise_channel("Radio Paradise", "http://stream.radioparadise.com/rock-320"),
+            Some(2)
         );
         assert_eq!(
-            radioparadise_channel("http://stream.radioparadise.com/world-320"),
-            3
+            radioparadise_channel(
+                "Radio Paradise",
+                "http://stream.radioparadise.com/world-320"
+            ),
+            Some(3)
+        );
+    }
+
+    /// Les SEPT canaux publies par Radio Paradise — table mesuree le
+    /// 08/09/2026 sur `list_chan` — se resolvent par l'URL que l'annuaire
+    /// mozaiklabs sert aujourd'hui.
+    ///
+    /// **C'est ici que le defaut se voit** : avant, `global-flacm` et
+    /// `serenity-flac` ne portaient aucun des trois mots-clefs connus
+    /// (`mellow`, `rock`, `world`) et tombaient sur le melange principal. Deux
+    /// stations de l'annuaire (id 70 « Radio Paradise - Global Mix » et id 71
+    /// « Radio Paradise - Serenity ») affichaient donc, en silence, le morceau
+    /// d'un AUTRE canal (#3523, #3543).
+    #[test]
+    fn les_sept_canaux_de_radio_paradise_se_resolvent_par_leur_url() {
+        for (url, attendu) in [
+            // Melange principal : l'URL ne porte que le format.
+            ("http://stream.radioparadise.com/flacm", None),
+            ("http://stream.radioparadise.com/aac-128", None),
+            ("http://stream.radioparadise.com/mellow-flacm", Some(1)),
+            ("http://stream.radioparadise.com/rock-flacm", Some(2)),
+            ("http://stream.radioparadise.com/rock-flac", Some(2)),
+            ("http://stream.radioparadise.com/global-flacm", Some(3)),
+            ("http://stream.radioparadise.com/beyond-flacm", Some(5)),
+            ("http://stream.radioparadise.com/serenity-flac", Some(42)),
+            ("http://stream.radioparadise.com/kfat-flacm", Some(945)),
+        ] {
+            assert_eq!(
+                radioparadise_channel("Radio Paradise", url),
+                attendu,
+                "canal attendu pour {url}"
+            );
+        }
+    }
+
+    /// La porte d'entree (`fetch_radio_metadata_depuis`) admet une station
+    /// reconnue par son SEUL nom. Le resolveur doit donc lire le nom lui aussi,
+    /// sans quoi toute entree dont l'adresse ne porte pas le canal retombe sur
+    /// le melange principal. Les noms sont ceux de l'annuaire mozaiklabs,
+    /// releves le 08/09/2026.
+    #[test]
+    fn le_canal_se_resout_aussi_par_le_nom_quand_l_url_ne_le_porte_pas() {
+        for (nom, attendu) in [
+            ("Radio Paradise", None),
+            ("Radio Paradise - Main Mix", None),
+            ("Radio Paradise - Mellow Mix", Some(1)),
+            ("Radio Paradise Rock Mix", Some(2)),
+            ("Radio Paradise - Global Mix", Some(3)),
+            ("Radio Paradise - Serenity", Some(42)),
+        ] {
+            assert_eq!(
+                radioparadise_channel(nom, "http://exemple.invalid/paradise"),
+                attendu,
+                "canal attendu pour le nom {nom}"
+            );
+        }
+    }
+
+    /// L'URL passe AVANT le nom : l'annuaire porte une entree nommee « Radio
+    /// Paradise » tout court (id 66) posee sur `.../mellow-flacm`, et c'est le
+    /// Mellow Mix qui joue. Le nom ne doit pas ecraser ce que l'adresse dit.
+    #[test]
+    fn l_url_decide_avant_le_nom() {
+        assert_eq!(
+            radioparadise_channel(
+                "Radio Paradise - Main Mix",
+                "http://stream.radioparadise.com/rock-flacm"
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            radioparadise_channel(
+                "Radio Paradise",
+                "http://stream.radioparadise.com/global-flacm"
+            ),
+            Some(3)
+        );
+    }
+
+    /// **Temoin.** Le rapprochement se fait sur un JETON ENTIER. Un mot qui
+    /// contient seulement le nom d'un canal ne designe aucun canal — sinon
+    /// « worldwide » vaudrait « world », et le `contains` d'origine le faisait.
+    #[test]
+    fn un_mot_qui_contient_le_nom_d_un_canal_ne_designe_aucun_canal() {
+        assert_eq!(
+            radioparadise_channel(
+                "Radio Paradise Worldwide",
+                "http://exemple.invalid/flux.mp3"
+            ),
+            None
+        );
+        assert_eq!(
+            radioparadise_channel("Radio Paradise", "http://exemple.invalid/rockabilly-320"),
+            None
+        );
+        assert_eq!(
+            radioparadise_channel("Radio Paradise Beyonce", "http://exemple.invalid/flux.mp3"),
+            None
+        );
+    }
+
+    /// `chan=N` est lu comme un NOMBRE, pas comme un prefixe : `chan=12`
+    /// n'existe pas chez Radio Paradise et ne vaut pas le Mellow Mix.
+    #[test]
+    fn le_parametre_chan_se_lit_en_entier() {
+        assert_eq!(
+            radioparadise_channel("Radio Paradise", "http://exemple.invalid/?chan=1"),
+            Some(1)
+        );
+        assert_eq!(
+            radioparadise_channel("Radio Paradise", "http://exemple.invalid/?chan=42"),
+            Some(42)
+        );
+        assert_eq!(
+            radioparadise_channel("Radio Paradise", "http://exemple.invalid/?chan=945"),
+            Some(945)
+        );
+        assert_eq!(
+            radioparadise_channel("Radio Paradise", "http://exemple.invalid/?chan=0"),
+            Some(0)
+        );
+        assert_eq!(
+            radioparadise_channel("Radio Paradise", "http://exemple.invalid/?chan=12"),
+            None
         );
     }
 

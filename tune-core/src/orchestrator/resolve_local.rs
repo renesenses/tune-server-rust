@@ -1182,6 +1182,45 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Ce que `transcoder_en_session` déciderait du relais DSP, sans rien
+    /// décoder : `(traitement actif, relais armé)`.
+    ///
+    /// Les deux valeurs comptent séparément. Une sortie locale avec égaliseur
+    /// a bien un traitement ACTIF — c'est ce qui rendait le cumul possible —
+    /// et ne doit pourtant pas armer le relais, puisqu'elle applique ce même
+    /// traitement elle-même. Un test qui ne regarderait que la seconde ne
+    /// distinguerait pas « la garde tient » de « la zone n'a pas d'EQ ».
+    #[cfg(test)]
+    pub(super) async fn relais_dsp_pour_test(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<(bool, bool), String> {
+        let track_id = req.track_id.ok_or("no track_id for local playback")?;
+        let track = TrackRepo::with_backend(self.db.clone())
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
+        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
+        let fmt = track.format.clone().unwrap_or_else(|| "flac".into());
+        let source_format = AudioFormat::from_extension(&fmt);
+        let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+        let decision = match self
+            .decider_la_lecture_locale(req, &track, file_path, fmt, source_format, is_dsd_source)
+            .await?
+        {
+            DecisionOuResolu::Decision(d) => d,
+            DecisionOuResolu::Resolu(_) => return Err("résolu sans transcodage".into()),
+        };
+        let format = self.decider_le_format_de_sortie(req, &decision);
+        let dsp =
+            self.load_streaming_dsp(req.zone_id, req.track_id, format.out_sr, decision.channels);
+        let actif = dsp.is_active();
+        Ok((
+            actif,
+            relais_dsp_progressif(actif, decision.is_local_output),
+        ))
+    }
+
     /// Premier temps du transcodage : le format de sortie. Fréquence plafonnée
     /// par la zone, profondeur selon la sortie, conteneur et type MIME, et le
     /// choix entre fichier pré-transcodé et session à la volée
@@ -1566,11 +1605,23 @@ impl PlaybackOrchestrator {
             let zone_id = req.zone_id;
             // EQ alters the encoded bytes and is not part of the cache key,
             // so a zone with an active EQ never uses the cache (always fresh).
-            let eq_profile = self.load_eq_processor(req.zone_id, out_sr, channels);
+            //
+            // PAS pour une sortie LOCALE, exactement comme le ReplayGain
+            // quinze lignes plus bas : `LocalOutput` applique déjà l'égaliseur
+            // et le convolveur dans sa propre boucle de lecture. Les cuire ici
+            // AUSSI doublerait la courbe en dB et convoluerait deux fois — le
+            // défaut que `relais_dsp_progressif` chasse sur l'autre bras. La
+            // garde du ReplayGain était SEULE ; elle ne l'est plus.
+            let cuire = traitement_cuit_dans_le_fichier(is_local_output);
+            let eq_profile = cuire
+                .then(|| self.load_eq_processor(req.zone_id, out_sr, channels))
+                .flatten();
             // The FIR convolver, like the EQ, alters the encoded bytes and
             // is not part of the cache key → a zone with an active IR never
             // uses the cache (always fresh).
-            let convolver = self.load_convolver(req.zone_id, out_sr, channels);
+            let convolver = cuire
+                .then(|| self.load_convolver(req.zone_id, out_sr, channels))
+                .flatten();
             // ReplayGain scales the samples, so like the EQ and the FIR it
             // changes the encoded bytes without being part of the cache key.
             // A cached transcode made at a different gain would be served
@@ -2077,6 +2128,7 @@ impl PlaybackOrchestrator {
         let DecisionLocale {
             channels,
             tranche_cue,
+            is_local_output,
             ref file_path,
             ..
         } = *decision;
@@ -2108,8 +2160,14 @@ impl PlaybackOrchestrator {
             // façon. Sans traitement actif, le canal reste celui d'avant, à
             // l'octet près. Le premier chunk du décodeur est l'en-tête WAV :
             // il est épargné (`skip_header`), comme sur les autres bras.
+            //
+            // ⚠️ Sauf sur une sortie LOCALE : elle passe TOUJOURS par ici
+            // (`local_needs_wav`) et applique déjà ces mêmes étages dans sa
+            // propre boucle de lecture. Les cumuler doublait la courbe de
+            // l'égaliseur en dB et élevait le facteur ReplayGain au carré —
+            // voir `relais_dsp_progressif`.
             let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
-            let tx = if dsp.is_active() {
+            let tx = if relais_dsp_progressif(dsp.is_active(), is_local_output) {
                 tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
                 spawn_streaming_dsp_relay(dsp, out_bd, true, tx)
             } else {
