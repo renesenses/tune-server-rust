@@ -7005,6 +7005,30 @@ impl OutputTarget for LocalOutput {
                 feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
                 total_frames_fed += processed.source_frames;
             }
+            // ── #3318 — LA CLÉ QUI MANQUAIT ────────────────────────────
+            //
+            // `local_audio_slow_read` et `local_audio_read_error` ne portaient
+            // que des octets et des millisecondes : ni appareil, ni flux. Or
+            // la ligne symétrique côté producteur — `stream_delivery_stall`
+            // (`tune-stream-http/src/lib.rs`) — porte, elle, `stream_id`.
+            //
+            // Sans identifiant commun, la seule jointure possible entre « la
+            // sortie a attendu » et « le flux interne n'a rien servi » était
+            // l'HORODATAGE, et elle n'est valide que si une SEULE zone joue
+            // pendant la fenêtre. Sur la machine de #3318 — un seul cœur,
+            // 49 618 pistes, plusieurs sorties énumérées — ce n'est pas une
+            // hypothèse qu'on puisse tenir, et c'est exactement pour ça que
+            // le dossier était bloqué : les deux moitiés de la mesure
+            // existaient et ne se joignaient pas.
+            //
+            // L'identifiant n'est pas à inventer : il est déjà dans l'URL que
+            // ce fil est en train de tirer (`…/stream/<id>.<ext>`).
+            // `stream_id_de_l_uri` est la découpe du serveur de flux
+            // elle-même, appelée et non recopiée — le jour où la convention
+            // change, les deux bougent ensemble.
+            let cle_de_flux = crate::poller::decisions::stream_id_de_l_uri(Some(&url));
+            let cle_de_flux = cle_de_flux.as_deref();
+
             let mut total_bytes_read: u64 = 0;
             let mut first_data_logged = false;
             let stream_start = std::time::Instant::now();
@@ -7087,7 +7111,12 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
                     Err(e) => {
-                        warn!(error = %e, total_bytes_read, "local_audio_read_error");
+                        journaliser_erreur_de_lecture(
+                            &device_name,
+                            cle_de_flux,
+                            &e.to_string(),
+                            total_bytes_read,
+                        );
                         http_eof = true;
                         break;
                     }
@@ -7103,11 +7132,12 @@ impl OutputTarget for LocalOutput {
                     );
                     first_data_logged = true;
                 } else if read_elapsed.as_millis() > 5000 {
-                    warn!(
-                        bytes = n,
-                        wait_ms = read_elapsed.as_millis() as u64,
+                    journaliser_lecture_lente(
+                        &device_name,
+                        cle_de_flux,
+                        n,
+                        read_elapsed.as_millis() as u64,
                         total_bytes_read,
-                        "local_audio_slow_read"
                     );
                 }
 
@@ -9286,3 +9316,83 @@ mod renseignement_materiel_tests;
 /// D'ENTRÉE de cette branche qui est tenue, pas la branche.
 #[cfg(test)]
 mod zone_backend_asio_i1770;
+
+// ───────────────────────────────────────────────────────────────────────────
+// #3318 — les deux lignes de journal du fil de lecture de la sortie locale,
+// écrites ici plutôt qu'en ligne, pour DEUX raisons :
+//
+// 1. elles vivent au fond d'un `std::thread::spawn` qu'aucun test unitaire ne
+//    peut atteindre — ni périphérique ALSA, ni flux HTTP dans une épreuve ;
+//    sorties, elles s'éprouvent ;
+// 2. elles doivent porter la MÊME clé que `stream_delivery_stall`, sans quoi
+//    les deux moitiés de la mesure restent inutilisables ensemble.
+//
+// `cle_de_correlation_i3318.rs` garde le contenu émis ET le fait que le fil
+// de lecture les appelle bien avec la clé — « écrit mais pas branché » est
+// précisément le défaut qui a laissé ce dossier en plan.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Ce qu'on écrit à la place d'un identifiant de flux quand l'URL n'en porte
+/// pas.
+///
+/// Ce cas EXISTE et n'est pas un bug : la sortie locale sait aussi lire une
+/// radio ou un fichier servi par un tiers, dont l'URL n'a pas la forme
+/// `…/stream/<id>`. Un tiret est lisible dans un `grep` et ne se confond avec
+/// aucun identifiant ; un champ absent, lui, se serait lu comme une ligne
+/// d'une autre version.
+pub(crate) const FLUX_INCONNU: &str = "-";
+
+/// `local_audio_slow_read` — le fil de lecture a attendu ses octets.
+///
+/// `wait_ms` est la durée d'UN `reader.read()`, pas un cumul. Le seuil
+/// d'émission (5 s) est chez l'appelant : cette fonction écrit ce qu'on lui
+/// donne.
+///
+/// `stream_id` part en Display (`%`) et NON en Debug : `stream_delivery_stall`
+/// rend `stream_id=e32c865e-…` sans guillemets, et une clé de jointure qui ne
+/// s'écrit pas pareil des deux côtés ne se cherche pas d'un seul `grep`.
+pub(crate) fn journaliser_lecture_lente(
+    device: &str,
+    stream_id: Option<&str>,
+    bytes: usize,
+    wait_ms: u64,
+    total_bytes_read: u64,
+) {
+    warn!(
+        device = %device,
+        stream_id = %stream_id.unwrap_or(FLUX_INCONNU),
+        bytes,
+        wait_ms,
+        total_bytes_read,
+        "local_audio_slow_read — la sortie locale a attendu ses octets ; \
+         `stream_id` joint cette ligne au `stream_delivery_stall` du flux \
+         interne (#3318)"
+    );
+}
+
+/// `local_audio_read_error` — le flux interne a rendu une erreur au lieu
+/// d'octets, et le fil de lecture s'arrête là.
+///
+/// C'est la coupure FRANCHE du fil 1660 (« le flux s'interrompt complètement
+/// et la lecture s'arrête net »), par opposition à l'attente de
+/// [`journaliser_lecture_lente`]. Les deux sortent du même `reader.read()` :
+/// c'est pourquoi elles portent la même clé.
+pub(crate) fn journaliser_erreur_de_lecture(
+    device: &str,
+    stream_id: Option<&str>,
+    erreur: &str,
+    total_bytes_read: u64,
+) {
+    warn!(
+        device = %device,
+        stream_id = %stream_id.unwrap_or(FLUX_INCONNU),
+        error = %erreur,
+        total_bytes_read,
+        "local_audio_read_error — le flux interne a rendu une erreur ; \
+         `stream_id` joint cette ligne au `stream_delivery_stall` du flux \
+         interne (#3318)"
+    );
+}
+
+#[cfg(test)]
+mod cle_de_correlation_i3318;

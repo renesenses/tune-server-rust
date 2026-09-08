@@ -150,15 +150,57 @@ pub(super) async fn network_health(
     let stream_bytes = mesure.map_or(0, |(octets, _)| octets);
     let bitrate_kbps = mesure.and_then(|(octets, fenetre)| debit_observe_kbps(octets, fenetre));
 
-    Json(json!({
-        "zone_id": id,
+    Json(corps_network_health(
+        id,
+        &poller,
+        stream_bytes,
+        bitrate_kbps,
+    ))
+}
+
+/// Le corps JSON de `GET /api/v1/zones/{id}/network-health`, sorti du
+/// gestionnaire pour qu'il soit ÉPROUVABLE — comme [`debit_observe_kbps`]
+/// juste au-dessus.
+///
+/// ## #3318 — pourquoi cette route mentait sur la famine d'anneau
+///
+/// `ZonePollerMetrics` porte depuis `22436699` deux mesures de ce que le DAC
+/// n'a PAS reçu : `famine_anneau_evenements` et `famine_anneau_silence_ms`.
+/// Le sondeur les y recopie à chaque tick (`tune-core/src/poller/tick.rs`,
+/// aux DEUX sites qui insèrent dans `shared_metrics` — le bras radio et le
+/// bras « zone en lecture »).
+///
+/// `GET /zones/sync-status` les rend sans rien faire : il sérialise la
+/// structure entière (`"poller": poller`). **Cette route-ci ne le pouvait
+/// pas** : elle bâtit son objet champ par champ, et les deux mesures n'y
+/// avaient jamais été ajoutées. Une zone dont l'anneau se vidait se lisait
+/// donc « saine » ici, avec les sept mêmes champs qu'une zone normale — ce
+/// qui est pire que de ne rien annoncer, puisqu'une route qui répond sans
+/// le champ se lit comme une absence de défaut.
+///
+/// Le piège est structurel : un champ ajouté à `ZonePollerMetrics` apparaît
+/// tout seul dans `sync-status` et JAMAIS ici. C'est ce que garde
+/// `sante_reseau_de_zone_tests.rs`.
+pub(super) fn corps_network_health(
+    zone_id: i64,
+    poller: &tune_core::poller::ZonePollerMetrics,
+    stream_bytes: u64,
+    bitrate_kbps: Option<f64>,
+) -> Value {
+    json!({
+        "zone_id": zone_id,
         "bytes_sent": stream_bytes,
         "bitrate_kbps": bitrate_kbps,
         "poll_latency_ms": poller.last_latency_ms,
         "max_latency_ms": poller.max_latency_ms,
         "poll_errors": poller.total_errors,
         "total_polls": poller.total_polls,
-    }))
+        // #3318 — ce que le DAC n'a pas reçu, par zone. Le cumul repart de
+        // zéro à chaque piste, comme les compteurs de la sortie qu'il
+        // recopie : c'est un état du flux EN COURS, pas un historique.
+        "famine_anneau_evenements": poller.famine_anneau_evenements,
+        "famine_anneau_silence_ms": poller.famine_anneau_silence_ms,
+    })
 }
 
 pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
