@@ -818,13 +818,22 @@ impl PlaybackOrchestrator {
                 .as_deref()
                 == Some("true");
             let src_est_dsd = source_format == Some(AudioFormat::Dsd);
-            let candidat = cible_wav_pour_traitement(
-                eq_forces_transcode,
-                is_network_output,
-                src_est_dsd,
-                opt_in,
-                true,
-            );
+            // #2742 — le crossfeed compte comme un traitement ICI, et ICI
+            // SEULEMENT. Il reste hors de `eq_forces_transcode` à dessein : ce
+            // drapeau-là renvoie au FICHIER quand l'opt-in est désarmé, et une
+            // zone réseau qui a coché le crossfeed — aujourd'hui sans le
+            // moindre effet — se retrouverait à payer 46 à 62 s de silence
+            // avant la première note pour un réglage qu'elle croyait inerte.
+            // Ne le compter que dans la cible progressive garantit qu'à froid
+            // rien ne change, et qu'armé, le crossfeed a enfin un chemin.
+            //
+            // `is_network_output &&` d'abord : sans lui, une zone LOCALE
+            // paierait une lecture de réglages par piste pour un drapeau que
+            // `cible_wav_pour_traitement` va de toute façon annuler.
+            let traitement = eq_forces_transcode
+                || (is_network_output && self.zone_has_active_crossfeed(req.zone_id));
+            let candidat =
+                cible_wav_pour_traitement(traitement, is_network_output, src_est_dsd, opt_in, true);
             let renderer_accepte_lpcm = if candidat {
                 let did = req
                     .output_device_id
@@ -836,7 +845,7 @@ impl PlaybackOrchestrator {
                 false
             };
             cible_wav_pour_traitement(
-                eq_forces_transcode,
+                traitement,
                 is_network_output,
                 src_est_dsd,
                 opt_in,
@@ -877,6 +886,11 @@ impl PlaybackOrchestrator {
             || needs_downsample
             || dlna_needs_wav
             || eq_forces_transcode
+            // Une zone qui n'a QUE du crossfeed n'allume pas
+            // `eq_forces_transcode` (voir plus haut) : sans cette ligne, sa
+            // cible progressive serait décidée puis jamais empruntée, et le
+            // crossfeed resterait muet malgré l'opt-in.
+            || dsp_progressif_wav
             // 16-bit cap on a FLAC-direct renderer: force a transcode so the
             // hi-res FLAC is re-encoded at 16-bit instead of served direct
             // (silent on the Ruark R3, #1137). ALAC already transcodes because

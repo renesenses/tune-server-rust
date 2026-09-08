@@ -1308,6 +1308,155 @@ async fn une_zone_locale_avec_egaliseur_ne_traite_pas_deux_fois() {
 ///
 /// La ligne qui MORD est la deuxième : renderer FLAC-capable + traitement
 /// actif ⇒ pré-transcodage. Les deux dernières sont le comportement
+
+/// #2742 — le crossfeed est le QUATRIÈME étage du porteur, et il compte pour
+/// `is_active()`.
+///
+/// Sans la première assertion, une zone réseau qui n'a QUE du crossfeed
+/// laisserait `is_active()` à faux : le relais ne serait pas inséré et le
+/// réglage resterait aussi muet qu'avant — le défaut d'origine, déplacé d'un
+/// cran.
+///
+/// Le crossfeed est mid-preservant par construction (`L_out + R_out == L + R`),
+/// donc un signal parfaitement mono le traverse INTACT. C'est pourquoi le
+/// témoin injecte du L ≠ R : un test sur `pcm_sinus_16`, qui écrit le même
+/// échantillon dans les deux canaux, passerait au vert sans rien prouver.
+#[test]
+fn le_crossfeed_est_le_quatrieme_etage_de_la_chaine_streaming() {
+    let mut cf = StreamingDsp {
+        crossfeed: Some(crate::audio::crossfeed::CrossfeedProcessor::new(
+            44100, 0.3, 0.3,
+        )),
+        channels: 2,
+        ..Default::default()
+    };
+    assert!(
+        cf.is_active(),
+        "un crossfeed seul doit armer le relais, sinon il reste muet"
+    );
+    let source = pcm_stereo_decorrele_16(512);
+    let mut pcm = source.clone();
+    cf.process(&mut pcm, 16);
+    assert_ne!(
+        pcm, source,
+        "un crossfeed à 0,3 doit modifier un signal L≠R"
+    );
+
+    // Mono parfait : mid-preservant, donc INTACT. C'est la promesse de
+    // l'algorithme, pas un effet de bord — la casser serait une régression
+    // audible sur tout enregistrement mono.
+    let mut cf = StreamingDsp {
+        crossfeed: Some(crate::audio::crossfeed::CrossfeedProcessor::new(
+            44100, 0.3, 0.3,
+        )),
+        channels: 2,
+        ..Default::default()
+    };
+    let mono = pcm_sinus_16(512);
+    let mut pcm = mono.clone();
+    cf.process(&mut pcm, 16);
+    assert_eq!(pcm, mono, "L == R : le crossfeed ne doit rien changer");
+
+    // Et hors stéréo, non-op franc : deux canaux, pas cinq.
+    let mut cf = StreamingDsp {
+        crossfeed: Some(crate::audio::crossfeed::CrossfeedProcessor::new(
+            44100, 0.3, 0.3,
+        )),
+        channels: 6,
+        ..Default::default()
+    };
+    let source = pcm_stereo_decorrele_16(512);
+    let mut pcm = source.clone();
+    cf.process(&mut pcm, 16);
+    assert_eq!(pcm, source, "6 canaux : aucun octet ne doit bouger");
+}
+
+/// Un PCM stéréo dont les deux canaux DIFFÈRENT — deux sinus déphasés.
+///
+/// `pcm_sinus_16` écrit le même échantillon à gauche et à droite ; le
+/// crossfeed, mid-preservant, le laisserait intact et un test bâti dessus
+/// serait vert sans rien mesurer.
+fn pcm_stereo_decorrele_16(n: usize) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let t = i as f64 / 44100.0;
+        let l = (2.0 * std::f64::consts::PI * 80.0 * t).sin() * 0.5;
+        let r = (2.0 * std::f64::consts::PI * 320.0 * t).sin() * 0.5;
+        pcm.extend_from_slice(&((l * 32767.0) as i16).to_le_bytes());
+        pcm.extend_from_slice(&((r * 32767.0) as i16).to_le_bytes());
+    }
+    pcm
+}
+
+/// #2742 + LAT-F1, de bout en bout sur la DÉCISION : une zone DLNA dont le
+/// SEUL traitement est un crossfeed part en WAV progressif quand l'opt-in est
+/// armé — et reste EXACTEMENT comme avant quand il ne l'est pas.
+///
+/// Les deux moitiés comptent autant l'une que l'autre.
+///
+/// La première est le correctif : sans elle le crossfeed n'a aucun chemin sur
+/// une zone réseau, ce que Tades décrivait par « Crossfeed n'a aucune action ».
+///
+/// La seconde est la garde qui protège tous les autres. Le crossfeed est
+/// délibérément tenu HORS de `eq_forces_transcode` : ce drapeau-là renvoie au
+/// transcodage FICHIER, donc au morceau entier décodé avant le premier octet —
+/// 46 à 62 s de silence (#3357). Quelqu'un qui a coché le crossfeed sur une
+/// zone réseau l'a fait en croyant le réglage inerte ; le lui rendre actif au
+/// prix d'une minute d'attente serait un plus mauvais marché que le défaut.
+#[tokio::test]
+async fn une_zone_reseau_dont_le_seul_traitement_est_le_crossfeed() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Salon", Some("dlna"), Some("uuid:salon-2742"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    // Un crossfeed, et RIEN d'autre : ni égaliseur, ni convolveur, ni ReplayGain.
+    settings
+        .set(
+            &format!("zone_{zone_id}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    assert!(
+        orch.zone_has_active_crossfeed(zone_id),
+        "le montage doit vraiment armer un crossfeed, sinon le test ne prouve rien"
+    );
+    let req = requete_locale_3234(zone_id, 1);
+
+    // Opt-in DÉSARMÉ : rien ne bouge. FLAC ré-encodé par le fichier, comme
+    // avant le correctif — pas une seconde d'attente ajoutée.
+    let avant = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(avant.out_mime, "audio/flac", "à froid, rien ne change");
+    assert!(avant.use_file_transcode);
+
+    // Opt-in ARMÉ : WAV progressif, et le relais portera le crossfeed.
+    settings.set("dsp_progressif_reseau", "true").unwrap();
+    let apres = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(
+        apres.out_mime, "audio/wav",
+        "un crossfeed seul doit suffire à ouvrir le bras progressif : {}",
+        apres.out_ext
+    );
+    assert!(
+        !apres.use_file_transcode,
+        "la cible WAV part en session, pas par le fichier"
+    );
+    let (actif, relais) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif,
+        "le porteur doit voir le crossfeed comme un traitement"
+    );
+    assert!(
+        relais,
+        "et le relais doit être armé : la zone n'est pas locale"
+    );
+}
+
 /// historique (#1137, renderer sans `audio/flac`), qui ne doit pas bouger.
 #[test]
 fn un_traitement_actif_impose_le_pretranscodage_streaming() {
@@ -1545,7 +1694,7 @@ fn la_chaine_streaming_applique_replaygain_puis_egaliseur() {
     let mut deux = StreamingDsp {
         replaygain: Some(0.5),
         eq: Some(eq_grave_boostee()),
-        convolver: None,
+        ..Default::default()
     };
     let mut pcm_deux = source.clone();
     deux.process(&mut pcm_deux, 16);
