@@ -1,5 +1,32 @@
 use super::*;
 
+/// #2369 — ce que la zone OBTIENDRA d'une source DSD, à côté de ce qu'elle a
+/// DEMANDÉ (`dsd_mode`).
+///
+/// Le sélecteur propose « natif » et « dop ». Sur une sortie locale, les deux
+/// emballent le DSD en DoP : aucun chemin natif n'existe dans
+/// `tune-core/src/outputs/local.rs`. L'écran affichait donc « natif » pendant
+/// que du DoP partait, et le testeur qui bascule d'un mode à l'autre refait
+/// deux fois le même essai. `dsd_mode` reste ce qui est réglé ; ce champ dit
+/// ce qui part.
+///
+/// Une SEULE fonction pour les deux sites jumeaux (`list_zones` et
+/// `get_zone`) : c'est une copie qui dérive qui avait fait répondre deux
+/// choses différentes à la même question sur la même zone (#2189).
+///
+/// Les deux entrées sont celles-là mêmes dont se sert `resolve_local_track` —
+/// le préfixe `local:` de `output_device_id`, et `is_network_output_type` sur
+/// `output_type` — pour que le panneau ne puisse pas contredire le chemin
+/// audio.
+fn dsd_transport_value(zone: &Zone, dsd_mode: &str) -> Value {
+    let is_local = zone
+        .output_device_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("local:"));
+    let is_network = tune_core::orchestrator::is_network_output_type(zone.output_type.as_deref());
+    json!(tune_core::orchestrator::transport_dsd(is_local, is_network, dsd_mode).as_str())
+}
+
 pub(super) async fn sync_status(State(state): State<AppState>) -> Json<Value> {
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
@@ -253,7 +280,10 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             // demandé, pas ce qui part sur le fil.
             obj.insert("dop_active".into(), json!(ps.dop_active));
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
-            obj.insert("dsd_mode".into(), json!(zone_repo.get_dsd_mode(zone_id)));
+            let dsd_mode = zone_repo.get_dsd_mode(zone_id);
+            // #2369 — le mode DEMANDÉ n'est pas le transport OBTENU.
+            obj.insert("dsd_transport".into(), dsd_transport_value(z, &dsd_mode));
+            obj.insert("dsd_mode".into(), json!(dsd_mode));
             obj.insert(
                 "lyrics_offset_ms".into(),
                 json!(zone_repo.get_lyrics_offset_ms(zone_id)),
@@ -443,7 +473,14 @@ pub(super) async fn get_zone(
                 obj.insert("resolving".into(), json!(ps.resolving));
                 // Voir la note au site jumeau : DoP en cours ⇒ volume inerte.
                 obj.insert("dop_active".into(), json!(ps.dop_active));
-                obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
+                let dsd_mode = repo.get_dsd_mode(id);
+                // Voir la note au site jumeau : le mode demandé n'est pas le
+                // transport obtenu (#2369).
+                obj.insert(
+                    "dsd_transport".into(),
+                    dsd_transport_value(&zone, &dsd_mode),
+                );
+                obj.insert("dsd_mode".into(), json!(dsd_mode));
                 obj.insert(
                     "lyrics_offset_ms".into(),
                     json!(repo.get_lyrics_offset_ms(id)),

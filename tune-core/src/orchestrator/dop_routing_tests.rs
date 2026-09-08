@@ -1,7 +1,116 @@
 use super::{
-    AudioFormat, conteneur_a_profondeur_cachee, dop_requested, dop_wire_params,
-    profondeur_sondee_si_la_base_ignore,
+    AudioFormat, TransportDsd, conteneur_a_profondeur_cachee, dop_requested, dop_wire_params,
+    profondeur_sondee_si_la_base_ignore, transport_dsd,
 };
+
+/// Toutes les combinaisons que peut rencontrer `transport_dsd` : les trois
+/// familles de sortie croisées avec les quatre modes du sélecteur, plus la
+/// chaîne vide qu'écrit `resolve_local_track` quand la source n'est pas du DSD.
+const COMBINAISONS: &[(bool, bool, &str)] = &[
+    (true, false, "native"),
+    (true, false, "dop"),
+    (true, false, "pcm"),
+    (true, false, "auto"),
+    (true, false, ""),
+    (false, true, "native"),
+    (false, true, "dop"),
+    (false, true, "pcm"),
+    (false, true, "auto"),
+    (false, true, ""),
+    (false, false, "native"),
+    (false, false, "dop"),
+    (false, false, "pcm"),
+    (false, false, "auto"),
+    (false, false, ""),
+    // Le cas qui ne se produit pas en exploitation mais que la fonction
+    // accepte : les deux drapeaux à vrai. Il est là pour que la réécriture
+    // ne puisse pas s'en écarter sans qu'on le voie.
+    (true, true, "native"),
+    (true, true, "dop"),
+    (true, true, "pcm"),
+    (true, true, "auto"),
+    (true, true, ""),
+];
+
+/// LE témoin de non-régression du découpage (#2369).
+///
+/// `dop_requested` ne se calcule plus : il se DÉDUIT de `transport_dsd`. Ce
+/// test rejoue l'expression d'origine, telle qu'elle était écrite avant le
+/// découpage, et exige le même booléen sur les vingt combinaisons. Si la
+/// réécriture avait changé ne serait-ce qu'un cas, une zone qui joue
+/// aujourd'hui aurait cessé de jouer — c'est le risque que ce chantier ne
+/// prend pas.
+#[test]
+fn la_table_de_verite_de_dop_requested_est_inchangee() {
+    for &(is_local, is_network, mode) in COMBINAISONS {
+        // L'expression d'AVANT le découpage, recopiée telle quelle.
+        let avant =
+            (is_local && (mode == "native" || mode == "dop")) || (is_network && mode == "dop");
+        assert_eq!(
+            dop_requested(is_local, is_network, mode),
+            avant,
+            "le découpage a changé le comportement pour              (is_local={is_local}, is_network={is_network}, mode={mode:?})"
+        );
+    }
+}
+
+/// #2369 — le fait que le sélecteur cache : sur une sortie LOCALE, « natif »
+/// et « dop » ne sont pas deux chemins, c'est le même.
+///
+/// Le test ne demande pas qu'ils divergent — ils ne le peuvent pas tant que
+/// `outputs/local.rs` n'ouvre pas un flux DSD. Il exige que la DÉCISION les
+/// distingue, pour que le journal et l'API puissent le dire au lieu de laisser
+/// un testeur refaire deux fois le même essai (Marco Polo, SMSL SU-1 ; Didier,
+/// SMSL SU-8).
+#[test]
+fn en_local_natif_est_du_dop_mais_se_nomme_autrement() {
+    assert_eq!(
+        transport_dsd(true, false, "native"),
+        TransportDsd::NatifServiEnDop,
+        "« natif » en local doit être nommé pour ce qu'il est"
+    );
+    assert_eq!(transport_dsd(true, false, "dop"), TransportDsd::Dop);
+    // Et le fait qui motive le chantier : les deux emballent, à l'identique.
+    assert!(dop_requested(true, false, "native"));
+    assert!(dop_requested(true, false, "dop"));
+    // Seul le premier ment à l'écran.
+    assert!(!transport_dsd(true, false, "native").tient_sa_promesse());
+    assert!(transport_dsd(true, false, "dop").tient_sa_promesse());
+}
+
+/// En RÉSEAU, « natif » n'est pas un mensonge : il n'arme pas le DoP, et
+/// `should_dsd_passthrough` arbitre ensuite. Rien à nommer ici.
+#[test]
+fn en_reseau_natif_ne_promet_pas_de_dop() {
+    assert_eq!(transport_dsd(false, true, "native"), TransportDsd::Pcm);
+    assert_eq!(transport_dsd(false, true, "dop"), TransportDsd::Dop);
+    assert!(transport_dsd(false, true, "native").tient_sa_promesse());
+}
+
+/// Les libellés partent au journal et à l'API : l'interface les lit, donc ils
+/// ne bougent pas. Ce test les fige.
+#[test]
+fn les_libelles_du_transport_sont_stables() {
+    assert_eq!(TransportDsd::Pcm.as_str(), "pcm");
+    assert_eq!(TransportDsd::Dop.as_str(), "dop");
+    assert_eq!(TransportDsd::NatifServiEnDop.as_str(), "natif_servi_en_dop");
+}
+
+/// Une zone dont la source n'est PAS du DSD reçoit `dsd_mode = ""` de
+/// `resolve_local_track`. Elle ne doit rien déclencher, et surtout pas la
+/// ligne de journal « natif indisponible ».
+#[test]
+fn une_source_non_dsd_ne_declenche_rien() {
+    for &(is_local, is_network, mode) in COMBINAISONS {
+        if mode.is_empty() {
+            assert_eq!(
+                transport_dsd(is_local, is_network, mode),
+                TransportDsd::Pcm,
+                "chaîne vide (source non DSD) : aucun transport DSD"
+            );
+        }
+    }
+}
 
 /// #1772 — le cas RÉEL de Marco Polo : Wiim Pro (renderer DLNA) relié en
 /// optique à un DAC Denafrips, zone réglée sur « dop ». Avant le correctif,

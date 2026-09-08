@@ -517,7 +517,28 @@ impl PlaybackOrchestrator {
         } else {
             String::new()
         };
-        let dop_requested = dop_requested(is_local_output, is_network_output, &dsd_mode);
+        let transport = transport_dsd(is_local_output, is_network_output, &dsd_mode);
+        let dop_requested = transport != TransportDsd::Pcm;
+
+        // #2369 — « natif » sur une sortie locale N'EST PAS natif.
+        //
+        // Le sélecteur propose deux modes ; sur une carte son, les deux
+        // emballent le DSD en DoP par ce même chemin. Le testeur qui coche
+        // « natif », voit du bruit blanc, recoche « dop » et revoit le même
+        // bruit blanc a fait UN essai sous deux étiquettes — et nous avons
+        // cherché une différence entre deux chemins identiques.
+        //
+        // Cette ligne ne change pas ce qui sort : elle l'écrit. Elle est le
+        // seul endroit qui connaisse à la fois le format de la source, le type
+        // de la sortie et le mode réglé, exactement comme
+        // `dsd_dop_not_requested` juste en dessous.
+        if transport == TransportDsd::NatifServiEnDop {
+            warn!(
+                zone_id = req.zone_id,
+                transport = transport.as_str(),
+                "dsd_local_natif_indisponible_servi_en_dop"
+            );
+        }
 
         // Un mode « auto » qui ne fait rien d'automatique, et qui se taisait.
         //
