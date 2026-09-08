@@ -120,6 +120,15 @@ tokio = { workspace = true, features = ["test-util"] }
 name = "server_contracts"
 path = "tests/server_contracts.rs"
 
+# #1362 — « un morceau présent deux fois dans un album ne doit pas se jouer
+# deux fois ». Le fichier existe depuis que le défaut a été corrigé, mais
+# `autotests = false` (plus haut) le laissait HORS COMPILATION : la garde
+# n'était donc exécutée par personne, ni en local ni en CI. Elle l'est
+# désormais.
+[[test]]
+name = "album_lecture_en_double"
+path = "tests/album_lecture_en_double.rs"
+
 [[test]]
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
@@ -195,6 +204,20 @@ required-features = ["postgres"]
 [[test]]
 name = "ajouts_recents_fenetre"
 path = "tests/ajouts_recents_fenetre.rs"
+
+# #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
+# rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
+# jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
+# rien ne gardait la VALEUR (`max_limit` partait tel quel dans `LIMIT {n}` : `0`
+# vidait la collection, un negatif faisait diverger SQLite et PostgreSQL). Le
+# temoin passe par les ROUTES MONTEES. `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+#
+# Posée ICI, au milieu du fichier, et non à la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent à chaque fois.
+[[test]]
+name = "borne_smart_collections_2732"
+path = "tests/borne_smart_collections_2732.rs"
 
 # Canal stable / beta : quelles versions `/update/check` a le droit de proposer
 # (#2266). Le defaut `auto` reproduit le comportement d'avant.
@@ -334,14 +357,30 @@ path = "tests/sante_slimproto_i3462.rs"
 [[test]]
 name = "ecoutes_par_piste_3518"
 path = "tests/ecoutes_par_piste_3518.rs"
-
-# #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
-# rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
-# jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
-# rien ne gardait la VALEUR (`max_limit` partait tel quel dans `LIMIT {n}` : `0`
-# vidait la collection, un negatif faisait diverger SQLite et PostgreSQL). Le
-# temoin passe par les ROUTES MONTEES. `autotests = false` plus haut : sans cette
-# cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+# #1361 — « Retour à l'album en cours » : la route qui dit quel album jouer
+# rouvrir, et chez qui. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
 [[test]]
-name = "borne_smart_collections_2732"
-path = "tests/borne_smart_collections_2732.rs"
+name = "album_en_cours_1361"
+path = "tests/album_en_cours_1361.rs"
+# #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
+# que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
+# une variable d'environnement que plus aucune etape ne pose. `autotests =
+# false` plus haut : sans cette cible, la garde des gardes ne serait elle-meme
+# jamais compilee — la panne exacte qu'elle refuse.
+#
+# Pas de `required-features` : elle ne lit que des fichiers du depot (manifestes,
+# sources, workflows) et doit tourner sur CHAQUE porte `cargo test -p
+# tune-server`, y compris la plus etroite.
+[[test]]
+name = "derive_des_garde_fous_2816"
+path = "tests/derive_des_garde_fous_2816.rs"
+# #3529 : le recensement des chemins qui creent une zone. Il lit la SOURCE de
+# `tune-server/src` et echoue sur tout site nouveau qui ne consulte pas
+# « Creer automatiquement les zones ». Cible a elle seule parce qu'elle ne
+# monte aucun `AppState` et n'a besoin d'aucune feature — et `autotests = false`
+# plus haut : sans cette entree, le fichier ne serait JAMAIS compile, donc vert
+# contre rien.
+[[test]]
+name = "zones_auto_create_recension"
+path = "tests/zones_auto_create_recension.rs"
