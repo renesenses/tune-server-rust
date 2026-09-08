@@ -690,6 +690,45 @@ fn reecrire_les_groupes(brut: &str, doublon: i64, cible: i64) -> Option<String> 
     serde_json::to_string(&groupes).ok()
 }
 
+/// Ce qu'a fait une demande de création de zone soumise au réglage
+/// « Créer automatiquement les zones » (`zone_auto_create`).
+///
+/// Trois issues, et pas deux : refuser une naissance n'est pas la même chose
+/// que retrouver une zone connue. Les cinq chemins de découverte qui
+/// ignoraient le réglage (#3529) ne regardaient que le booléen `created` de
+/// [`ZoneRepo::get_or_create`], lequel ne dit rien du réglage — il ne pouvait
+/// donc pas les avertir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationDeZone {
+    /// Une zone vient de naître.
+    Creee(i64),
+    /// Une zone existait déjà pour cet appareil, visible ou masquée. La
+    /// reconnexion d'une zone connue n'est JAMAIS soumise au réglage.
+    Existante(i64),
+    /// `zone_auto_create` est décoché et cet appareil n'a jamais eu de zone.
+    Refusee,
+}
+
+impl CreationDeZone {
+    /// L'identifiant de la zone, sauf quand la création a été refusée.
+    pub fn id(&self) -> Option<i64> {
+        match self {
+            Self::Creee(id) | Self::Existante(id) => Some(*id),
+            Self::Refusee => None,
+        }
+    }
+
+    /// Vrai seulement quand une zone vient de naître.
+    pub fn vient_de_naitre(&self) -> bool {
+        matches!(self, Self::Creee(_))
+    }
+
+    /// Vrai quand le réglage a bloqué la naissance.
+    pub fn refusee(&self) -> bool {
+        matches!(self, Self::Refusee)
+    }
+}
+
 impl ZoneRepo {
     pub fn new(db: SqliteDb) -> Self {
         Self { db: Arc::new(db) }
@@ -840,6 +879,81 @@ impl ZoneRepo {
                 Err(e)
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Le réglage « Créer automatiquement les zones ».
+    ///
+    /// Absent ou illisible vaut **coché** : c'est le défaut posé par
+    /// `routes/system/config.rs`, et une base neuve ne doit pas se comporter
+    /// comme si l'utilisateur avait décoché.
+    ///
+    /// Cette lecture était recopiée à l'identique en cinq endroits de
+    /// `tune-server` (#1770 en avait ajouté une sixième). Elle vit désormais
+    /// ici, une seule fois : `git grep '"zone_auto_create"'` sur le dépôt doit
+    /// ne rendre que cette ligne, le défaut de `system/config.rs` et la liste
+    /// de `secrets.rs`.
+    pub fn zone_auto_create_autorise(&self) -> bool {
+        super::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .get("zone_auto_create")
+            .ok()
+            .flatten()
+            .map(|v| v != "false")
+            .unwrap_or(true)
+    }
+
+    /// [`Self::get_or_create`], mais soumis au réglage « Créer automatiquement
+    /// les zones ».
+    ///
+    /// #3529 — la garde était recopiée dans cinq chemins de création et
+    /// **absente** de cinq autres, dont trois qui tournent seuls, sans aucun
+    /// geste de l'utilisateur : le lot SSDP de démarrage, le re-sondage des
+    /// DLNA mémorisés, et les sondeurs Squeezebox et HQPlayer. C'est la
+    /// duplication qui les a laissés passer, la garde descend donc d'un étage.
+    ///
+    /// Règle : **seule la naissance d'une zone est soumise au réglage**. Un
+    /// appareil qui a déjà une zone est rendu [`CreationDeZone::Existante`]
+    /// sans consulter quoi que ce soit, pour que la reconnexion
+    /// (`set_online_by_device`) et le rattachement d'identité
+    /// (`set_identity`) continuent de fonctionner réglage décoché — c'est la
+    /// condition posée par l'issue, et c'est aussi ce que faisaient déjà les
+    /// cinq chemins gardés.
+    ///
+    /// `origine` nomme le chemin appelant. Il n'apparaît que dans le journal,
+    /// pour qu'un refus soit attribuable sans lire le code.
+    pub fn get_or_create_si_autorise(
+        &self,
+        name: &str,
+        output_type: Option<&str>,
+        output_device_id: &str,
+        origine: &str,
+    ) -> Result<CreationDeZone, String> {
+        // Même question, et dans le même ordre, que la voie rapide de
+        // `get_or_create` : une zone masquée compte comme existante ici aussi,
+        // sinon un appareil supprimé repasserait par la case création.
+        if let Some(id) = self
+            .get_by_device_id(output_device_id)?
+            .and_then(|zone| zone.id)
+        {
+            return Ok(CreationDeZone::Existante(id));
+        }
+
+        if !self.zone_auto_create_autorise() {
+            tracing::info!(
+                name = %name,
+                device_id = %output_device_id,
+                origine = %origine,
+                "zone_auto_create_refusee"
+            );
+            return Ok(CreationDeZone::Refusee);
+        }
+
+        // La course reste possible entre le contrôle ci-dessus et l'INSERT :
+        // `get_or_create` la rattrape, et un `created = false` inattendu se
+        // lit alors comme une zone existante.
+        match self.get_or_create(name, output_type, output_device_id)? {
+            (id, true) => Ok(CreationDeZone::Creee(id)),
+            (id, false) => Ok(CreationDeZone::Existante(id)),
         }
     }
 
@@ -2189,6 +2303,148 @@ mod tests {
         repo.delete(id).unwrap();
         assert!(repo.list().unwrap().is_empty());
         assert!(repo.is_device_hidden("uuid:123"));
+    }
+
+    // ── #3529 : la garde « Créer automatiquement les zones », une fois ────
+    //
+    // Ces essais éprouvent la garde elle-même. Le fait que les cinq chemins de
+    // découverte y passent bien est éprouvé à part, par le recensement
+    // `tune-server/tests/zones_auto_create_recension.rs` : un essai de
+    // comportement ne peut pas voir un SIXIÈME site qui ne l'appellerait pas,
+    // et c'est exactement ainsi que ces cinq-là sont passés.
+
+    /// Le cas de Fabien : réglage décoché, appareil jamais vu. Aucune zone.
+    #[test]
+    fn auto_create_decoche_refuse_un_appareil_inconnu() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        settings.set("zone_auto_create", "false").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("FIP Salon", Some("squeezebox"), "sb:aa:bb", "essai")
+            .unwrap();
+
+        assert_eq!(issue, CreationDeZone::Refusee);
+        assert!(issue.id().is_none());
+        assert!(!issue.vient_de_naitre());
+        assert!(
+            repo.list().unwrap().is_empty(),
+            "aucune zone ne doit exister apres un refus"
+        );
+        assert!(
+            repo.get_by_device_id("sb:aa:bb").unwrap().is_none(),
+            "le refus ne doit pas non plus laisser de zone masquee derriere lui"
+        );
+    }
+
+    /// La condition posée par l'issue : la garde bloque la NAISSANCE, jamais
+    /// la reconnexion. Une zone connue reste retrouvable réglage décoché,
+    /// sans quoi un appareil qui se rebranche deviendrait injoignable.
+    #[test]
+    fn auto_create_decoche_laisse_reconnecter_une_zone_connue() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        let connue = repo
+            .create("Salon", Some("dlna"), Some("uuid:connu"))
+            .unwrap();
+        settings.set("zone_auto_create", "false").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("Salon", Some("dlna"), "uuid:connu", "essai")
+            .unwrap();
+
+        assert_eq!(issue, CreationDeZone::Existante(connue));
+        assert!(!issue.refusee());
+        repo.set_online_by_device("uuid:connu", true).unwrap();
+        assert!(repo.get(connue).unwrap().unwrap().online);
+    }
+
+    /// Une zone SUPPRIMÉE (masquée) est une zone existante, pas un appareil
+    /// inconnu : le refus ne doit pas la faire renaître par la porte de
+    /// derrière, ni la ressusciter.
+    #[test]
+    fn auto_create_decoche_ne_ressuscite_pas_une_zone_supprimee() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        let supprimee = repo
+            .create("Salon", Some("dlna"), Some("uuid:efface"))
+            .unwrap();
+        repo.delete(supprimee).unwrap();
+        settings.set("zone_auto_create", "false").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("Salon", Some("dlna"), "uuid:efface", "essai")
+            .unwrap();
+
+        assert_eq!(issue, CreationDeZone::Existante(supprimee));
+        assert!(
+            repo.is_device_hidden("uuid:efface"),
+            "elle doit rester masquee"
+        );
+        assert!(repo.list().unwrap().is_empty());
+    }
+
+    /// Réglage coché : rien ne change, la zone naît.
+    #[test]
+    fn auto_create_coche_cree_la_zone() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        settings.set("zone_auto_create", "true").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("HQPlayer", Some("hqplayer"), "hqplayer-1.2.3.4", "essai")
+            .unwrap();
+
+        let id = issue.id().expect("une zone doit naitre");
+        assert!(issue.vient_de_naitre());
+        assert_eq!(issue, CreationDeZone::Creee(id));
+        assert_eq!(repo.list().unwrap().len(), 1);
+    }
+
+    /// Base neuve : le réglage n'est pas encore écrit. Le défaut est « coché »
+    /// (`system/config.rs`), pas « décoché » — une installation neuve doit
+    /// continuer de proposer ses zones toute seule.
+    #[test]
+    fn reglage_absent_vaut_coche() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        assert!(settings.get("zone_auto_create").unwrap().is_none());
+
+        assert!(repo.zone_auto_create_autorise());
+        assert!(
+            repo.get_or_create_si_autorise("Salon", Some("dlna"), "uuid:neuf", "essai")
+                .unwrap()
+                .vient_de_naitre()
+        );
+    }
+
+    /// La seconde moitié du constat de Fabien : « et s'activent toutes
+    /// seules ». Une zone naît **en ligne**, parce que `INSERT INTO zones`
+    /// n'écrit pas `online` et que le schéma vaut `DEFAULT 1`.
+    ///
+    /// Cet essai ne corrige rien, il FIXE le fait : la naissance en ligne est
+    /// désormais un comportement éprouvé, et non un effet de bord du schéma
+    /// que personne ne verrait changer. C'est le refus de la naissance, plus
+    /// haut, qui traite le symptôme ; retourner ce défaut à 0 laisserait
+    /// hors ligne les zones que les chemins de découverte créent
+    /// légitimement — plusieurs ne rappellent `set_online_by_device` que dans
+    /// leur branche « zone déjà connue ».
+    #[test]
+    fn une_zone_creee_nait_en_ligne() {
+        let db = test_db_migree();
+        let repo = ZoneRepo::new(db);
+        let id = repo
+            .create("Salon", Some("dlna"), Some("uuid:naissance"))
+            .unwrap();
+        assert!(
+            repo.get(id).unwrap().unwrap().online,
+            "une zone naissante est en ligne : c'est le DEFAULT 1 du schema"
+        );
     }
 
     /// #1832 — les reglages ranges dans `settings` (profil d'egaliseur en

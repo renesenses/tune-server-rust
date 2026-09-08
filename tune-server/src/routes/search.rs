@@ -140,6 +140,26 @@ use crate::state::AppState;
 /// de savoir que 50 n'est pas le compte.
 const PLAFOND_DE_COMPTAGE: i64 = 5_000;
 
+/// Lignes rendues quand l'appelant ne dit rien. Nommé parce qu'il sert deux
+/// fois : ici, et en repli quand `?limit=` porte une valeur qu'un nombre
+/// d'éléments ne peut pas prendre (#2160).
+const LIMITE_PAR_DEFAUT: i64 = 20;
+
+/// La limite telle qu'un service de streaming peut la recevoir (#2160).
+///
+/// `limit` est un `i64` que rien ne borne en bas : la moitié LOCALE lit un
+/// nombre négatif comme « sans limite », mais un `as usize` en faisait ici
+/// 18 446 744 073 709 551 615 — que `plafond_recherche` traduit chez Qobuz en
+/// « Tous », soit dix allers-retours par service et par frappe, pour une
+/// valeur que personne n'a demandée.
+///
+/// Retomber sur `0` serait pire encore : `0` EST le « Tous » de Qobuz. Le
+/// repli est donc le défaut de la route — la seule valeur dont on sait qu'elle
+/// a été voulue par quelqu'un.
+fn limite_pour_les_services(limit: i64) -> usize {
+    usize::try_from(limit).unwrap_or(LIMITE_PAR_DEFAUT as usize)
+}
+
 #[derive(Deserialize)]
 struct SearchParams {
     q: String,
@@ -171,7 +191,7 @@ async fn federated_search(
     State(state): State<AppState>,
     Query(p): Query<SearchParams>,
 ) -> Json<Value> {
-    let limit = p.limit.unwrap_or(20);
+    let limit = p.limit.unwrap_or(LIMITE_PAR_DEFAUT);
     let offset = p.offset.unwrap_or(0).max(0);
 
     // #3226 — LU EN PREMIER. Tant que ce parsing vivait sous les recherches
@@ -320,7 +340,10 @@ async fn federated_search(
                 // `limit` tel quel, sans `offset` : le plafond de page d'un
                 // service (Qobuz : 50) est SA contrainte, et #2036 dit qu'on la
                 // pagine par `SearchPage`, pas en gonflant ce nombre.
-                if let Ok(results) = svc.search(&p.q, limit as usize).await {
+                //
+                // « Tel quel » s'arrête au SIGNE : voir
+                // [`limite_pour_les_services`] (#2160).
+                if let Ok(results) = svc.search(&p.q, limite_pour_les_services(limit)).await {
                     service_results.insert(svc_name, json!(results));
                 }
             }
@@ -360,4 +383,35 @@ async fn federated_search(
         "radios": radios,
         "services": service_results,
     }))
+}
+
+#[cfg(test)]
+mod tests_limite_services {
+    use super::*;
+
+    /// #2160 — la limite envoyée aux services de streaming.
+    #[test]
+    fn une_limite_negative_ne_devient_pas_tous() {
+        // Le défaut : `-1 as usize` = `usize::MAX`, que Qobuz borne à 500 —
+        // c'est-à-dire dix allers-retours pour une recherche fédérée.
+        assert_eq!(limite_pour_les_services(-1), LIMITE_PAR_DEFAUT as usize);
+        assert_eq!(
+            limite_pour_les_services(i64::MIN),
+            LIMITE_PAR_DEFAUT as usize
+        );
+        assert_ne!(
+            limite_pour_les_services(-1),
+            0,
+            "0 est le « Tous » de Qobuz : y retomber aggraverait le défaut"
+        );
+    }
+
+    /// Contre-épreuve : tout ce qui est un nombre d'éléments traverse intact,
+    /// y compris le `0` explicite, qui reste le « Tous » documenté.
+    #[test]
+    fn une_limite_valide_traverse_intacte() {
+        for demandee in [0i64, 1, 20, 50, 200, 5_000] {
+            assert_eq!(limite_pour_les_services(demandee), demandee as usize);
+        }
+    }
 }

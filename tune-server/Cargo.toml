@@ -205,19 +205,19 @@ required-features = ["postgres"]
 name = "ajouts_recents_fenetre"
 path = "tests/ajouts_recents_fenetre.rs"
 
-# #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
-# rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
-# jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
-# rien ne gardait la VALEUR (`max_limit` partait tel quel dans `LIMIT {n}` : `0`
-# vidait la collection, un negatif faisait diverger SQLite et PostgreSQL). Le
-# temoin passe par les ROUTES MONTEES. `autotests = false` plus haut : sans cette
-# cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+# #3101 : la portée de répertoire de l'audit de bibliothèque. Le motif LIKE de
+# `GET /export/library-audit.csv?dir=…` était écrit à la main, sans séparateur :
+# auditer `…/Rock` ramenait `…/Rockabilly` et le déclarait fantôme. Le témoin
+# passe par la ROUTE MONTÉE, avec de vrais fichiers sur le disque, et non par
+# `folder_like_pattern` — c'est le site d'appel qui avait dérivé, pas le
+# constructeur de motif. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait JAMAIS compilé, donc vert contre rien.
 #
 # Posée ICI, au milieu du fichier, et non à la fin : deux lots qui ajoutent
 # chacun leur cible en queue de `Cargo.toml` se conflictent à chaque fois.
 [[test]]
-name = "borne_smart_collections_2732"
-path = "tests/borne_smart_collections_2732.rs"
+name = "portee_audit_repertoire_3101"
+path = "tests/portee_audit_repertoire_3101.rs"
 
 # Canal stable / beta : quelles versions `/update/check` a le droit de proposer
 # (#2266). Le defaut `auto` reproduit le comportement d'avant.
@@ -318,6 +318,18 @@ path = "tests/podcasts_abonnement_identifiant_3542.rs"
 name = "sources_trois_routes_i3226"
 path = "tests/sources_trois_routes_i3226.rs"
 
+# #3578 : une adresse de station qui rend une PAGE WEB etait acceptee a
+# l'enregistrement et ne se decouvrait qu'a la lecture. Le juge
+# (`non_audio_content_type`) existait deja et n'avait qu'UN appelant.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Pas de `required-features` : le banc monte un faux serveur de station sur
+# 127.0.0.1 et une base SQLite en memoire, il ne demande ni base externe ni
+# reseau sortant.
+[[test]]
+name = "radio_adresse_pas_un_flux_3578"
+path = "tests/radio_adresse_pas_un_flux_3578.rs"
 # #3383 : la bascule « désactiver la télémétrie » n'éteignait rien — la route
 # n'écrivait pas, et les sept gardes d'envoi ne lisaient que `TUNE_TELEMETRY`.
 # Le témoin passe par les ROUTES MONTÉES puis appelle les décisions de
@@ -384,3 +396,17 @@ path = "tests/derive_des_garde_fous_2816.rs"
 [[test]]
 name = "zones_auto_create_recension"
 path = "tests/zones_auto_create_recension.rs"
+
+# #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
+# rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
+# jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
+# rien ne gardait la VALEUR (`max_limit` partait tel quel dans `LIMIT {n}` : `0`
+# vidait la collection, un negatif faisait diverger SQLite et PostgreSQL). Le
+# temoin passe par les ROUTES MONTEES. `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+#
+# Posée ICI, au milieu du fichier, et non à la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent à chaque fois.
+[[test]]
+name = "borne_smart_collections_2732"
+path = "tests/borne_smart_collections_2732.rs"

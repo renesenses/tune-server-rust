@@ -51,9 +51,35 @@ struct RadioConsumerGuard {
 /// renderer. An absent or unreadable User-Agent keeps the current behaviour:
 /// only a renderer that positively identifies itself as something other than
 /// Lavf gets the file contract.
+///
+/// ## #3513 — un navigateur n'est pas un renderer
+///
+/// Le filet posé par #1689 (« tout ce qui n'est pas Lavf ») a attrapé le
+/// **navigateur**, qui n'a jamais refusé le chunké : c'est le mode de transfert
+/// par défaut de HTTP/1.1, et l'élément `<audio>` de Firefox le lit sans rien
+/// demander. Servi comme un fichier de 2 Gio, Firefox faisait au contraire ce
+/// qu'un fichier autorise — il rouvrait la connexion avec un `Range` — et
+/// comme le canal PCM d'une station n'admet **qu'un seul consommateur**, cette
+/// reconnexion supplantait la précédente. Chez Fabien, six fois en un quart
+/// d'heure : neuf secondes de son, `radio_stream_superseded`, puis
+/// `radio_stream_client_disconnect … remaining_consumers=0` — plus personne.
+///
+/// Le contrat fichier reste ce qu'il est pour les appareils qui l'exigent
+/// (darTZeel LHC-208, Marantz, Sonos…) : ils ne s'annoncent pas `Mozilla`.
+/// Un navigateur, lui, retrouve le chunké — donc **aucun `Content-Length`,
+/// aucun `Accept-Ranges`, plus rien qui l'invite à se reconnecter**. C'est la
+/// cause qui disparaît, pas le symptôme qu'on rattrape.
+///
+/// `Mozilla/5.0` est le préfixe que déclarent Firefox, Chrome, Safari et Edge
+/// sans exception. Aucun des renderers de #1689 ne le porte, et si un appareil
+/// inconnu s'annonçait ainsi, il retomberait simplement sur le comportement
+/// d'avant #1689 — chunké — et non sur une panne nouvelle.
 fn accepts_chunked_live_stream(user_agent: Option<&str>) -> bool {
     match user_agent {
-        Some(ua) if !ua.is_empty() => ua.to_ascii_lowercase().contains("lavf"),
+        Some(ua) if !ua.is_empty() => {
+            let ua = ua.to_ascii_lowercase();
+            ua.contains("lavf") || ua.contains("mozilla")
+        }
         _ => true,
     }
 }
@@ -2326,6 +2352,35 @@ mod tests {
         assert_eq!(parse_range_start("bytes=0-").unwrap().min(44), 0);
     }
 
+    /// #3513 — le navigateur était pris dans le filet de #1689.
+    ///
+    /// « Tout ce qui n'est pas Lavf » visait les renderers DLNA. Firefox,
+    /// Chrome et Safari n'ont jamais refusé le chunké : c'est le transfert par
+    /// défaut de HTTP/1.1. Servis comme un fichier de 2 Gio, ils faisaient ce
+    /// qu'un fichier autorise — un `Range` — et le canal PCM à consommateur
+    /// unique ne s'en relevait pas.
+    #[test]
+    fn un_navigateur_nest_pas_un_renderer() {
+        assert!(accepts_chunked_live_stream(Some(
+            "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0"
+        )));
+        assert!(accepts_chunked_live_stream(Some(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+        )));
+        assert!(accepts_chunked_live_stream(Some(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+             (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+        )));
+
+        // Contre-épreuve : les appareils de #1689 ne s'annoncent pas
+        // « Mozilla », ils gardent le contrat fichier.
+        assert!(!accepts_chunked_live_stream(Some("player/100")));
+        assert!(!accepts_chunked_live_stream(Some("Sonos/84.1-56110")));
+        assert!(!accepts_chunked_live_stream(Some("Marantz ND8006")));
+        assert!(!accepts_chunked_live_stream(Some("LHC-208/1.0")));
+    }
+
     #[test]
     fn parse_range_start_cases() {
         // Resume from a byte offset (DMP-A8 reconnect after a CDN drop).
@@ -2729,6 +2784,208 @@ mod tests {
 
         forget_icy_channel(sid);
         drop(bac);
+    }
+
+    // ───────────────── #3513 — la radio qui se tait à la 10e seconde ────────
+    //
+    // Fabien, v0.9.140 : une radio écoutée dans le navigateur se tait vers la
+    // dixième seconde. Le serveur annonçait à Firefox un WAV de 2 Gio, Firefox
+    // traitait la réponse comme un fichier borné et rouvrait la connexion avec
+    // un `Range` ; le canal PCM à consommateur unique faisait que chaque
+    // reconnexion supplantait la précédente. Six fois en un quart d'heure,
+    // `radio_stream_superseded connected_secs=9` puis
+    // `radio_stream_client_disconnect … remaining_consumers=0`.
+
+    const NAVIGATEUR: &str =
+        "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0";
+
+    /// Rien, dans la réponse servie au navigateur, ne l'invite à se
+    /// reconnecter : pas de longueur, pas d'`Accept-Ranges`, un corps chunké.
+    /// C'est la CAUSE de #3513 qui disparaît, et non le symptôme rattrapé.
+    #[tokio::test]
+    async fn le_navigateur_ne_recoit_plus_de_longueur_a_reprendre() {
+        let (entetes, octets) = corps_radio("i3513-contrat", NAVIGATEUR, false, 8192).await;
+
+        assert!(
+            entetes.get("Content-Length").is_none(),
+            "un Content-Length de 2 Gio est ce qui faisait rouvrir Firefox par Range"
+        );
+        assert!(
+            entetes.get("Accept-Ranges").is_none(),
+            "annoncer les Range sur un direct, c'est les inviter"
+        );
+        assert!(
+            entetes.get("Content-Range").is_none(),
+            "un direct n'a pas de position, il ne peut pas en annoncer une"
+        );
+        assert_eq!(
+            entetes
+                .get("Transfer-Encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("chunked"),
+            "le navigateur retrouve le contrat sans fin"
+        );
+        assert_eq!(
+            entetes.get("Content-Type").and_then(|v| v.to_str().ok()),
+            Some("audio/wav")
+        );
+        // Le son est bien là : en-tête WAV puis le PCM semé.
+        assert_eq!(octets.len(), 44 + 8192);
+        assert_eq!(&octets[..4], b"RIFF");
+        assert!(octets[44..].iter().all(|o| *o == 0xAA));
+    }
+
+    /// Le témoin de #3513 : on rejoue la reconnexion par `Range` sur une
+    /// session radio VIVANTE, et le son continue.
+    ///
+    /// Deux connexions successives sur la même station, la seconde portant
+    /// `Range: bytes=44-` — exactement ce que faisait Firefox. La seconde
+    /// prend la main sur le canal PCM (`claim_channel_consumer`), la première
+    /// rend le canal sans consommer un morceau de plus, et **le direct semé
+    /// après la reconnexion sort par la nouvelle connexion**. C'est la
+    /// question posée par le ticket : « faut-il que la plus récente prenne la
+    /// main sans couper le flux » — elle le fait déjà, ce qui manquait était
+    /// un témoin qui le prouve.
+    ///
+    /// L'ancienne connexion est DRAINÉE en parallèle, et ce n'est pas un
+    /// détail de mise en scène : un corps `axum` n'avance que lorsqu'on le
+    /// tire, et c'est le serveur HTTP qui le tire en vrai. Sans ce drainage,
+    /// la première connexion resterait garée dans `recv_chunk()` en tenant le
+    /// verrou du canal, et l'essai attendrait pour de mauvaises raisons.
+    #[tokio::test]
+    async fn une_reconnexion_par_range_ne_coupe_pas_le_son() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use tune_core::http::streamer::SharedSessions;
+
+        let sid = "i3513-reconnexion";
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let mut session = StreamSession::new(sid.to_string(), info, false, 64);
+        session.is_radio = true;
+        let session = std::sync::Arc::new(session);
+        // Sans format détecté, l'en-tête attend le décodeur dix secondes.
+        session.publish_detected_output_format(44100, 2);
+        let tx = session.tx.lock().await.clone().expect("tx");
+
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), session.clone())].into_iter().collect(),
+        ));
+
+        let requete = |range: Option<&str>| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("User-Agent", NAVIGATEUR.parse().unwrap());
+            if let Some(r) = range {
+                h.insert("Range", r.parse().unwrap());
+            }
+            h
+        };
+
+        // ── Première connexion : l'onglet qui écoute ─────────────────────────
+        let premiere = super::handle_stream(
+            Path(format!("{sid}.wav")),
+            State(sessions.clone()),
+            requete(None),
+        )
+        .await;
+        assert_eq!(premiere.status(), axum::http::StatusCode::OK);
+        assert!(premiere.headers().get("Content-Length").is_none());
+        let mut corps_premiere = premiere.into_body().into_data_stream();
+
+        tx.send(vec![0x11; 4096]).await.expect("pcm avant reprise");
+        let mut avant = Vec::new();
+        while avant.len() < 44 + 4096 {
+            let bloc =
+                tokio::time::timeout(std::time::Duration::from_secs(10), corps_premiere.next())
+                    .await
+                    .expect("la premiere connexion doit recevoir du son")
+                    .expect("le flux est ouvert")
+                    .expect("bloc lisible");
+            avant.extend_from_slice(&bloc);
+        }
+        assert_eq!(&avant[..4], b"RIFF");
+        assert!(avant[44..].iter().any(|o| *o == 0x11));
+
+        // ── La reconnexion décrite par #3513 ─────────────────────────────────
+        let seconde = super::handle_stream(
+            Path(format!("{sid}.wav")),
+            State(sessions.clone()),
+            requete(Some("bytes=44-")),
+        )
+        .await;
+        assert_eq!(
+            seconde.status(),
+            axum::http::StatusCode::OK,
+            "un direct n'est pas un fichier : pas de 206, pas de Content-Range"
+        );
+        assert!(seconde.headers().get("Content-Range").is_none());
+        let mut corps_seconde = seconde.into_body().into_data_stream();
+
+        // Premier morceau de la seconde connexion : l'en-tête WAV entier. Il
+        // part avant que le canal PCM soit réclamé, il ne consomme donc rien.
+        let entete = corps_seconde
+            .next()
+            .await
+            .expect("le flux est ouvert")
+            .expect("bloc lisible");
+        assert_eq!(&entete[..4], b"RIFF", "la reprise renvoie l'en-tete entier");
+        assert_eq!(entete.len(), 44);
+
+        // Second sondage : c'est LUI qui fait réclamer le canal
+        // (`claim_channel_consumer`) et gare la seconde connexion en attente de
+        // direct. Rien n'a encore été semé, il doit donc expirer — et l'ordre
+        // est ainsi fixé sans dépendre de celui dans lequel `join!` sonde.
+        let rien =
+            tokio::time::timeout(std::time::Duration::from_millis(300), corps_seconde.next()).await;
+        assert!(
+            rien.is_err(),
+            "aucun direct n'a encore ete seme apres la reprise du canal"
+        );
+
+        // Le direct reprend. La première connexion est déjà supplantée : elle
+        // rendra le canal sans consommer un morceau de plus.
+        for _ in 0..16 {
+            tx.send(vec![0x22; 4096]).await.expect("pcm apres reprise");
+        }
+
+        let drainage_premiere = async { while let Some(Ok(_)) = corps_premiere.next().await {} };
+        let lecture_seconde = async {
+            let mut recu = Vec::new();
+            while recu.len() < 8192 {
+                let bloc =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), corps_seconde.next())
+                        .await
+                        .expect("le son doit CONTINUER apres la reconnexion — c'est #3513")
+                        .expect("le flux est ouvert")
+                        .expect("bloc lisible");
+                recu.extend_from_slice(&bloc);
+            }
+            recu
+        };
+        let (_, pcm) = tokio::join!(drainage_premiere, lecture_seconde);
+
+        assert!(
+            pcm.iter().any(|o| *o == 0x22),
+            "la nouvelle connexion doit porter le direct semé APRES la reprise"
+        );
+        assert!(
+            pcm.len() >= 8192,
+            "au moins deux morceaux de direct, pas un souffle : {} octets",
+            pcm.len()
+        );
+        assert_eq!(
+            session
+                .active_consumers
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "la premiere connexion a rendu le canal, la seconde le tient"
+        );
     }
 
     /// La frontière tombe exactement sur la fin d'un morceau : le bloc part

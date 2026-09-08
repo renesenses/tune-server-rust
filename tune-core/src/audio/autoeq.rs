@@ -22,9 +22,35 @@
 //! | `Fc … Hz` | `freq` |
 //! | `Gain … dB` | `gain` |
 //! | `Q …` | `q` |
-//! | `PK` | `peak` |
+//! | `PK`, `PEQ` | `peak` |
 //! | `LS`, `LSC`, `LSQ` | `low_shelf` |
 //! | `HS`, `HSC`, `HSQ` | `high_shelf` |
+//! | `LP`, `LPQ` | `low_pass` |
+//! | `HP`, `HPQ` | `high_pass` |
+//! | `NO` | `notch` |
+//!
+//! Les trois dernières lignes ne viennent pas d'AutoEq — son export
+//! ParametricEQ n'écrit que `PK`, `LSC` et `HSC` — mais d'Equalizer APO, dont
+//! les fichiers `config.txt` se collent dans le même champ et portent la même
+//! grammaire. `low_pass`, `high_pass` et `notch` sont des types que
+//! [`EqBandSpec::coeffs`] construit déjà : les refuser aurait rejeté le fichier
+//! ENTIER pour une ligne que le DSP sait pourtant jouer. Ces trois types-là
+//! n'ont pas de `Gain` dans un fichier APO, et n'en ont pas besoin — les
+//! coefficients d'un passe ou d'un rejet n'en lisent aucun.
+//!
+//! ## Ce que l'analyseur ÉCARTE, et ce qu'il REFUSE
+//!
+//! Deux issues distinctes, à ne pas confondre :
+//!
+//! - **Écarté** ([`FiltreIgnore`]) : la ligne est comprise, mais elle ne
+//!   produit pas de bande — aujourd'hui uniquement `Filter n: OFF`. Le reste du
+//!   fichier est importé, et chaque ligne écartée est rendue avec son numéro et
+//!   sa raison. Compter sans dire lesquelles obligeait l'utilisateur à relire
+//!   son fichier pour retrouver les trois bandes « manquantes ».
+//! - **Refusé** ([`ErreurAutoEq`]) : la ligne n'est pas comprise, ou demande
+//!   une valeur que l'égaliseur ne reproduirait pas. Rien n'est importé du
+//!   tout. Une correction tronquée est une AUTRE correction, et elle
+//!   s'entendrait sans que rien ne l'ait dit.
 //!
 //! ## Le `Preamp` : pourquoi ce module ne l'applique PAS
 //!
@@ -70,14 +96,58 @@ pub struct ProfilAutoEq {
     pub preamp_db: f64,
     /// Les bandes, dans l'ordre du fichier. Les filtres `OFF` sont écartés.
     pub bandes: Vec<EqBandSpec>,
-    /// Combien de lignes `Filter … OFF` ont été écartées.
+    /// Les lignes `Filter …` comprises mais écartées, dans l'ordre du fichier.
     ///
     /// Écarter n'est pas taire. Equalizer APO exporte volontiers dix lignes
     /// dont trois désactivées ; l'utilisateur qui voit « 7 bandes importées »
     /// alors que son fichier en montre dix a le droit de savoir où sont
-    /// passées les trois autres, sans avoir à relire le fichier. C'est le
-    /// compte rendu que la route rend dans `ignored_filter_count`.
-    pub filtres_ignores: usize,
+    /// passées les trois autres — et lesquelles. Un simple compte le laissait
+    /// relire son fichier ; chaque entrée porte donc son numéro de ligne, le
+    /// type écrit et la raison. C'est le compte rendu que la route rend dans
+    /// `ignored_filters`.
+    pub ignores: Vec<FiltreIgnore>,
+}
+
+/// Une ligne `Filter …` comprise mais qui ne produit pas de bande.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FiltreIgnore {
+    /// Le numéro de la ligne dans le texte, à partir de 1 comme dans un
+    /// éditeur — de quoi la retrouver sans la chercher.
+    pub ligne: usize,
+    /// Le type de filtre tel qu'écrit dans le fichier (`PK`, `LSC`…), ou
+    /// `None` quand la ligne s'arrête avant de le nommer : `Filter 4: OFF`
+    /// tout court est une ligne valide d'Equalizer APO.
+    pub type_filtre: Option<String>,
+    /// Pourquoi cette ligne n'a pas donné de bande.
+    pub raison: RaisonIgnore,
+}
+
+/// Pourquoi une ligne comprise ne devient pas une bande.
+///
+/// Énumération et non message libre : le client doit pouvoir traduire la
+/// raison, pas afficher du français figé par le serveur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaisonIgnore {
+    /// `Filter n: OFF` — le filtre est désactivé dans le fichier.
+    Desactive,
+}
+
+impl RaisonIgnore {
+    /// L'étiquette stable que porte la réponse HTTP. Elle ne change pas avec
+    /// la langue : c'est une clé, pas une phrase.
+    pub fn cle(self) -> &'static str {
+        match self {
+            Self::Desactive => "disabled",
+        }
+    }
+}
+
+impl std::fmt::Display for RaisonIgnore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Desactive => write!(f, "filtre désactivé dans le fichier (« OFF »)"),
+        }
+    }
 }
 
 impl ProfilAutoEq {
@@ -208,7 +278,7 @@ const FREQ_MAX_HZ: f64 = 192_000.0;
 pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
     let mut preamp_db = 0.0;
     let mut bandes = Vec::new();
-    let mut filtres_ignores = 0usize;
+    let mut ignores: Vec<FiltreIgnore> = Vec::new();
 
     for (index, brute) in texte.lines().enumerate() {
         let ligne = index + 1;
@@ -222,9 +292,9 @@ pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
             preamp_db = analyser_preamp(contenu, ligne)?;
         } else if minuscules.starts_with("filter") {
             match analyser_filtre(contenu, ligne)? {
-                Some(bande) => bandes.push(bande),
-                // Écarté, mais compté : voir `ProfilAutoEq::filtres_ignores`.
-                None => filtres_ignores += 1,
+                Ok(bande) => bandes.push(bande),
+                // Écarté, mais NOMMÉ : voir `ProfilAutoEq::ignores`.
+                Err(ignore) => ignores.push(ignore),
             }
         } else {
             return Err(ErreurAutoEq::LigneIncomprise { ligne });
@@ -238,7 +308,7 @@ pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
     Ok(ProfilAutoEq {
         preamp_db,
         bandes,
-        filtres_ignores,
+        ignores,
     })
 }
 
@@ -265,9 +335,16 @@ fn analyser_preamp(contenu: &str, ligne: usize) -> Result<f64, ErreurAutoEq> {
     domaine(db, "Preamp", ligne, -GAIN_MAX_DB, 0.0)
 }
 
-/// `Filter 1: ON LSC Fc 105 Hz Gain 6.4 dB Q 0.70` → une bande, ou `None` si
-/// le filtre est `OFF`.
-fn analyser_filtre(contenu: &str, ligne: usize) -> Result<Option<EqBandSpec>, ErreurAutoEq> {
+/// `Filter 1: ON LSC Fc 105 Hz Gain 6.4 dB Q 0.70` → une bande.
+///
+/// Le `Err` INTERNE de ce résultat n'est pas une erreur du fichier : c'est une
+/// ligne comprise mais écartée ([`FiltreIgnore`]). Les vraies erreurs
+/// remontent par le `?`, en [`ErreurAutoEq`].
+#[allow(clippy::result_large_err)]
+fn analyser_filtre(
+    contenu: &str,
+    ligne: usize,
+) -> Result<Result<EqBandSpec, FiltreIgnore>, ErreurAutoEq> {
     // Le numéro du filtre ne sert à rien : c'est l'ordre du fichier qui compte,
     // et il est déjà celui de la boucle appelante.
     let apres = contenu
@@ -279,8 +356,16 @@ fn analyser_filtre(contenu: &str, ligne: usize) -> Result<Option<EqBandSpec>, Er
     let etat = mots.first().ok_or(ErreurAutoEq::EtatManquant { ligne })?;
     match etat.to_ascii_uppercase().as_str() {
         // Un filtre désactivé n'est pas une erreur : Equalizer APO complète ses
-        // exports avec des lignes « OFF » que rien n'oblige à interpréter.
-        "OFF" => return Ok(None),
+        // exports avec des lignes « OFF » que rien n'oblige à interpréter. La
+        // ligne est écartée, mais elle repart NOMMÉE dans le compte rendu — y
+        // compris quand elle s'arrête après le « OFF », ce qui est licite.
+        "OFF" => {
+            return Ok(Err(FiltreIgnore {
+                ligne,
+                type_filtre: mots.get(1).map(|t| (*t).to_string()),
+                raison: RaisonIgnore::Desactive,
+            }));
+        }
         "ON" => {}
         _ => return Err(ErreurAutoEq::EtatManquant { ligne }),
     }
@@ -293,6 +378,12 @@ fn analyser_filtre(contenu: &str, ligne: usize) -> Result<Option<EqBandSpec>, Er
         "PK" | "PEQ" => "peak",
         "LS" | "LSC" | "LSQ" => "low_shelf",
         "HS" | "HSC" | "HSQ" => "high_shelf",
+        // Absents de l'export AutoEq, présents dans les `config.txt`
+        // d'Equalizer APO — et déjà construits par `EqBandSpec::coeffs`. Les
+        // refuser rejetait le fichier ENTIER pour une ligne que le DSP joue.
+        "LP" | "LPQ" => "low_pass",
+        "HP" | "HPQ" => "high_pass",
+        "NO" => "notch",
         _ => {
             return Err(ErreurAutoEq::TypeInconnu {
                 ligne,
@@ -304,8 +395,22 @@ fn analyser_filtre(contenu: &str, ligne: usize) -> Result<Option<EqBandSpec>, Er
     let freq = champ_obligatoire(&mots, "Fc", ligne)?;
     let freq = domaine(freq, "Fc", ligne, 1.0, FREQ_MAX_HZ)?;
 
-    let gain = champ_obligatoire(&mots, "Gain", ligne)?;
-    let gain = domaine(gain, "Gain", ligne, -GAIN_MAX_DB, GAIN_MAX_DB)?;
+    // Un passe-bas, un passe-haut et un rejet n'ont pas de gain — ni dans le
+    // fichier d'Equalizer APO, ni dans leurs coefficients : `EqBandSpec::coeffs`
+    // ne lit `gain` que pour `peak` et les deux plateaux. L'exiger aurait refusé
+    // une ligne parfaitement formée. Pour un `PK`/`LS`/`HS`, en revanche, un
+    // `Gain` absent est bien une ligne mutilée — la bande serait plate.
+    let gain_facultatif = matches!(band_type, "low_pass" | "high_pass" | "notch");
+    let gain = match champ_optionnel(&mots, "Gain", ligne)? {
+        Some(valeur) => domaine(valeur, "Gain", ligne, -GAIN_MAX_DB, GAIN_MAX_DB)?,
+        None if gain_facultatif => 0.0,
+        None => {
+            return Err(ErreurAutoEq::ChampManquant {
+                ligne,
+                champ: "Gain",
+            });
+        }
+    };
 
     // Le Q est absent des lignes `LS`/`HS` d'Equalizer APO, qui sont à pente
     // fixe. Le défaut vaut alors la pente S = 1 des plateaux de `audio::eq`.
@@ -314,7 +419,7 @@ fn analyser_filtre(contenu: &str, ligne: usize) -> Result<Option<EqBandSpec>, Er
         None => std::f64::consts::FRAC_1_SQRT_2,
     };
 
-    Ok(Some(EqBandSpec {
+    Ok(Ok(EqBandSpec {
         freq,
         gain,
         q,
@@ -442,26 +547,94 @@ mod tests {
         assert_eq!(profil.bandes[0].freq, 1000.0);
     }
 
-    /// Écarter n'est pas taire : les `OFF` sont comptés pour le compte rendu.
+    /// Écarter n'est pas taire : les `OFF` repartent NOMMÉS, pas comptés.
     ///
-    /// Sans ce compte, un fichier de dix lignes dont trois désactivées rendrait
-    /// « 7 bandes » sans que rien n'explique l'écart, et l'utilisateur croirait
-    /// à une troncature.
+    /// Sans ce compte rendu, un fichier de dix lignes dont trois désactivées
+    /// rendrait « 7 bandes » sans que rien n'explique l'écart, et l'utilisateur
+    /// croirait à une troncature. Un simple nombre le laissait relire son
+    /// fichier pour retrouver LESQUELLES : le numéro de ligne les désigne.
     #[test]
-    fn les_filtres_desactives_sont_comptes_dans_le_compte_rendu() {
+    fn les_filtres_desactives_repartent_avec_leur_ligne_et_leur_raison() {
         let texte = "Filter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1\n\
                      Filter 2: OFF PK Fc 200 Hz Gain 2 dB Q 1\n\
-                     Filter 3: off PK Fc 300 Hz Gain 2 dB Q 1\n\
+                     Filter 3: off LSC Fc 300 Hz Gain 2 dB Q 1\n\
                      Filter 4: ON PK Fc 4000 Hz Gain -2 dB Q 1\n";
         let profil = analyser(texte).unwrap();
         assert_eq!(profil.bandes.len(), 2);
-        assert_eq!(profil.filtres_ignores, 2);
+        assert_eq!(
+            profil.ignores,
+            vec![
+                FiltreIgnore {
+                    ligne: 2,
+                    type_filtre: Some("PK".into()),
+                    raison: RaisonIgnore::Desactive,
+                },
+                FiltreIgnore {
+                    ligne: 3,
+                    type_filtre: Some("LSC".into()),
+                    raison: RaisonIgnore::Desactive,
+                },
+            ]
+        );
+        assert_eq!(RaisonIgnore::Desactive.cle(), "disabled");
     }
 
+    /// Contre-épreuve du témoin précédent : sans ligne `OFF`, la liste est
+    /// vide. Un compte rendu qui se remplirait tout seul ne prouverait rien.
     #[test]
-    fn un_profil_sans_filtre_desactive_nen_compte_aucun() {
+    fn un_profil_sans_filtre_desactive_nen_nomme_aucun() {
         let profil = analyser(DEUX_LIGNES).unwrap();
-        assert_eq!(profil.filtres_ignores, 0);
+        assert!(profil.ignores.is_empty());
+    }
+
+    /// `Filter 4: OFF` tout court est une ligne licite d'Equalizer APO : elle
+    /// s'écarte sans type, et surtout sans faire échouer le fichier.
+    #[test]
+    fn un_off_sans_type_secarte_sans_refuser_le_fichier() {
+        let profil = analyser("Filter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1\nFilter 2: OFF\n").unwrap();
+        assert_eq!(profil.bandes.len(), 1);
+        assert_eq!(
+            profil.ignores,
+            vec![FiltreIgnore {
+                ligne: 2,
+                type_filtre: None,
+                raison: RaisonIgnore::Desactive,
+            }]
+        );
+    }
+
+    /// Les types d'Equalizer APO que le DSP de Tune construit déjà.
+    ///
+    /// Avant, une seule de ces lignes refusait le fichier ENTIER — alors que
+    /// `EqBandSpec::coeffs` sait bâtir les trois. Et un passe/rejet n'a pas de
+    /// `Gain` : l'exiger refusait une ligne parfaitement formée.
+    #[test]
+    fn les_passes_et_le_rejet_dequalizer_apo_deviennent_les_types_de_tune() {
+        let profil = analyser(
+            "Filter 1: ON HP Fc 20 Hz Q 0.7\n\
+             Filter 2: ON LPQ Fc 18000 Hz Q 0.5\n\
+             Filter 3: ON NO Fc 50 Hz Q 8\n\
+             Filter 4: ON PK Fc 1000 Hz Gain 3 dB Q 1\n",
+        )
+        .expect("des types que le DSP construit déjà");
+        let types: Vec<&str> = profil.bandes.iter().map(|b| b.band_type.as_str()).collect();
+        assert_eq!(types, ["high_pass", "low_pass", "notch", "peak"]);
+        // Sans `Gain`, un passe reste à zéro — et ne réserve donc aucune marge.
+        assert_eq!(profil.bandes[0].gain, 0.0);
+        assert_eq!(profil.marge_reservee_db(), -3.0);
+    }
+
+    /// Contre-épreuve : un `PK` sans `Gain` reste REFUSÉ. La tolérance porte
+    /// sur les types dont les coefficients ignorent le gain, pas sur tous.
+    #[test]
+    fn un_peak_sans_gain_reste_refuse() {
+        assert_eq!(
+            analyser("Filter 1: ON PK Fc 1000 Hz Q 1\n").unwrap_err(),
+            ErreurAutoEq::ChampManquant {
+                ligne: 1,
+                champ: "Gain"
+            }
+        );
     }
 
     #[test]

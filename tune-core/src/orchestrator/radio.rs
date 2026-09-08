@@ -97,7 +97,21 @@ pub(crate) const RADIO_NOT_AUDIO: &str = "radio_not_audio";
 /// Renvoie `Some(étiquette)` — le type normalisé, à afficher — quand le flux
 /// n'est pas de l'audio ; `None` dans tous les autres cas, y compris un
 /// en-tête absent ou illisible.
-pub(crate) fn non_audio_content_type(content_type: &str) -> Option<String> {
+///
+/// DEUX appelants, depuis #3578, et c'est le second qui manquait :
+///
+///   * la LECTURE, ici même (`decode_radio_stream_to_pcm`) — le verdict arrive
+///     quand l'auditeur a déjà cliqué ;
+///   * l'ENREGISTREMENT, dans `tune-server` (`routes::radios::sonder_le_flux`,
+///     appelée par `create_radio` et `update_radio`) — Belkadi Yacine avait
+///     collé `https://radioparadise.com/listen/channels/main-mix`, la page
+///     d'écoute et non le flux ; Tune l'a acceptée sans un mot et ne le lui a
+///     appris qu'à la première lecture (fil forum 1698).
+///
+/// `pub` pour ce second appelant : cette fonction est le juge, et les deux
+/// chemins doivent rendre le MÊME verdict — deux listes noires qui divergent
+/// feraient refuser à l'enregistrement une station qui joue, ou l'inverse.
+pub fn non_audio_content_type(content_type: &str) -> Option<String> {
     // `text/html; charset=UTF-8` → `text/html`
     let ct = content_type
         .split(';')

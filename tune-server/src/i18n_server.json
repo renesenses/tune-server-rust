@@ -1819,6 +1819,18 @@
     "ro": "Adresa nu indică niciun server după „{schema}://”. Lipsește numele gazdei, de exemplu {schema}://example.net/stream.mp3",
     "sv": "Adressen anger ingen server efter ”{schema}://”. Värdnamnet saknas, till exempel {schema}://example.net/stream.mp3"
   },
+  "radio.url.pasUnFlux": {
+    "fr": "Cette adresse répond bien, mais elle rend « {type} » et non un flux audio : c'est une page web, pas la station. Sur le site de la radio, cherchez le lien « écouter » ou « flux » et copiez CETTE adresse-là.",
+    "en": "That address answers, but it returns “{type}” instead of an audio stream: it is a web page, not the station. On the station's site, look for the “listen” or “stream” link and copy THAT address.",
+    "de": "Diese Adresse antwortet zwar, liefert aber „{type}“ statt eines Audiostreams: Es ist eine Webseite, nicht der Sender. Suchen Sie auf der Website des Senders den Link „Hören“ oder „Stream“ und kopieren Sie DIESE Adresse.",
+    "es": "Esa dirección responde, pero devuelve «{type}» en lugar de un flujo de audio: es una página web, no la emisora. En el sitio de la emisora, busque el enlace «escuchar» o «flujo» y copie ESA dirección.",
+    "it": "Questo indirizzo risponde, ma restituisce «{type}» invece di un flusso audio: è una pagina web, non la stazione. Sul sito della radio, cercare il collegamento «ascolta» o «flusso» e copiare QUELL'indirizzo.",
+    "zh": "该地址有响应，但返回的是「{type}」而不是音频流：这是一个网页，不是电台。请在电台网站上找到「收听」或「流」链接，复制那个地址。",
+    "ja": "このアドレスは応答しますが、音声ストリームではなく「{type}」を返します。放送局ではなくウェブページです。放送局のサイトで「聴く」または「ストリーム」のリンクを探し、そのアドレスをコピーしてください。",
+    "ko": "이 주소는 응답하지만 오디오 스트림이 아니라 “{type}”을(를) 반환합니다. 방송국이 아니라 웹 페이지입니다. 방송국 사이트에서 “듣기” 또는 “스트림” 링크를 찾아 그 주소를 복사하세요.",
+    "ro": "Această adresă răspunde, dar returnează „{type}” în loc de un flux audio: este o pagină web, nu postul. Pe site-ul postului, căutați linkul „ascultă” sau „flux” și copiați ACEA adresă.",
+    "sv": "Adressen svarar, men den returnerar ”{type}” i stället för en ljudström: det är en webbsida, inte stationen. Leta efter länken ”lyssna” eller ”ström” på stationens webbplats och kopiera DEN adressen."
+  },
   "radio.url.espace": {
     "fr": "L'adresse du flux contient un espace, ce qu'une adresse de flux ne comporte jamais. Vérifiez qu'elle n'a pas été coupée au collage.",
     "en": "The stream address contains a space, which a stream address never has. Check that it was not broken when pasted.",

@@ -173,26 +173,38 @@ async fn les_adresses_exotiques_mais_lisibles_sont_acceptees() {
         .unwrap()
         .len();
 
+    // Des noms en `.invalid` — la famille que la RFC 2606 garantit ne JAMAIS
+    // résoudre — et non `example.net`, qui, lui, répond.
+    //
+    // Depuis #3578 la route ne se contente plus de lire la FORME de l'adresse :
+    // elle sonde le serveur et refuse ce qui rend une page web. Cet essai-ci
+    // porte sur la forme, et sur elle seule ; une adresse qui répond ferait
+    // dépendre son verdict de l'accès Internet du runner — verte hors ligne,
+    // rouge en ligne. Un nom qui ne résout pas rend la sonde muette (elle
+    // n'établit rien, donc elle accepte) et l'essai déterministe.
+    //
+    // Les dix FORMES sont inchangées : c'est le seul contrat que ce lot témoin
+    // a jamais porté.
     let legitimes = [
         (
             "port explicite",
-            "http://icecast.example.net:8000/stream.mp3",
+            "http://icecast.exemple.invalid:8000/stream.mp3",
         ),
-        ("chemin vide", "https://example.net"),
+        ("chemin vide", "https://exemple.invalid"),
         ("IPv4 nue", "http://192.168.1.42:8000/"),
         ("IPv6 littérale", "http://[2001:db8::1]:8000/stream"),
-        ("hôte sans point", "http://nas:8000/flux"),
+        ("hôte sans point", "http://nas-inexistant:8000/flux"),
         (
             "sous-domaines et paramètres",
-            "https://stream.relay.eu-west.cdn.radio.example.net/live/aac?bitrate=320&session=abc",
+            "https://stream.relay.eu-west.cdn.radio.exemple.invalid/live/aac?bitrate=320&session=abc",
         ),
         (
             "identifiants",
-            "http://user:motdepasse@example.net:8000/stream",
+            "http://user:motdepasse@exemple.invalid:8000/stream",
         ),
-        ("schéma en majuscules", "HTTP://EXAMPLE.NET/Stream.MP3"),
-        ("playlist m3u", "http://example.net/live.m3u"),
-        ("manifeste HLS", "https://example.net/hls/master.m3u8"),
+        ("schéma en majuscules", "HTTP://EXEMPLE.INVALID/Stream.MP3"),
+        ("playlist m3u", "http://exemple.invalid/live.m3u"),
+        ("manifeste HLS", "https://exemple.invalid/hls/master.m3u8"),
     ];
     assert_eq!(legitimes.len(), 10, "le lot témoin a changé de taille");
 

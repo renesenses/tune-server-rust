@@ -20,6 +20,16 @@
 //! gestionnaire (`history::top_artists`, via `backend.query_many`) et l'appel
 //! de dépôt (`profiles::list_facet_favorites`, le site que la #2861 nomme).
 //!
+//! S'y ajoute la **liste de pistes d'un album** (`albums::album_tracks`), qui
+//! était restée sur `unwrap_or_default()` alors que le reste de son fichier
+//! avait déjà été converti — la conversion de la #2861 y était partielle. Ce
+//! n'est pas une route comme une autre pour ce défaut : elle est la SEULE à
+//! rendre le contenu d'une fiche album, et une panne y produisait un album
+//! « sans piste », que rien ne distinguait d'un album réellement vide. Le
+//! rapport de jfpaquet du 02/09 (0.9.130, PostgreSQL, fil 1642) porte trois
+//! `panne_sql_avalee` de l'accueil dans la même fenêtre de journal (#3181) :
+//! sur cette installation, la requête qui échoue en silence est l'ordinaire.
+//!
 //! ## Pourquoi un binaire de test à lui seul, et un seul test dedans
 //!
 //! Leçon déjà payée par `tune-core/tests/journal_descriptif_illisible.rs` :
@@ -71,9 +81,11 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
     }
 }
 
-/// Les deux routes sous observation, une par famille de site corrigé.
+/// Les routes sous observation, une par famille de site corrigé.
 const ROUTE_SQL_BRUT: &str = "/api/v1/history/top-artists";
 const ROUTE_DEPOT: &str = "/api/v1/profiles/1/favorites/facets";
+/// La fiche album : le seul endroit d'où sort la liste de pistes d'un album.
+const ROUTE_ALBUM: &str = "/api/v1/library/albums/1/tracks";
 
 async fn get(app: &axum::Router, chemin: &str) -> (StatusCode, String) {
     let reponse = app
@@ -110,6 +122,7 @@ async fn une_panne_sql_laisse_une_trace_sans_changer_la_reponse() {
 
     let (statut_sain_sql, corps_sain_sql) = get(&app, ROUTE_SQL_BRUT).await;
     let (statut_sain_depot, corps_sain_depot) = get(&app, ROUTE_DEPOT).await;
+    let (statut_sain_album, corps_sain_album) = get(&app, ROUTE_ALBUM).await;
 
     assert_eq!(
         statut_sain_sql,
@@ -121,6 +134,11 @@ async fn une_panne_sql_laisse_une_trace_sans_changer_la_reponse() {
         statut_sain_depot,
         StatusCode::OK,
         "{ROUTE_DEPOT} doit répondre 200 sur une base saine (corps : {corps_sain_depot})"
+    );
+    assert_eq!(
+        statut_sain_album,
+        StatusCode::OK,
+        "{ROUTE_ALBUM} doit répondre 200 sur une base saine (corps : {corps_sain_album})"
     );
 
     // Une base saine mais vide ne doit produire AUCUNE trace de panne :
@@ -141,11 +159,12 @@ async fn une_panne_sql_laisse_une_trace_sans_changer_la_reponse() {
     // disparue — dans les deux cas `query_many` rend `Err`, et c'est ce
     // `Err` qui se perdait.
     etat.backend
-        .execute_batch("DROP TABLE listen_history; DROP TABLE favorite_facets;")
-        .expect("les deux tables existent sur une base neuve");
+        .execute_batch("DROP TABLE listen_history; DROP TABLE favorite_facets; DROP TABLE tracks;")
+        .expect("les trois tables existent sur une base neuve");
 
     let (statut_casse_sql, corps_casse_sql) = get(&app, ROUTE_SQL_BRUT).await;
     let (statut_casse_depot, corps_casse_depot) = get(&app, ROUTE_DEPOT).await;
+    let (statut_casse_album, corps_casse_album) = get(&app, ROUTE_ALBUM).await;
 
     // --- 3. La réponse n'a PAS bougé — le silence cesse, l'écran ne casse pas ---
 
@@ -161,6 +180,13 @@ async fn une_panne_sql_laisse_une_trace_sans_changer_la_reponse() {
         "la réponse de {ROUTE_DEPOT} a changé — retirer ses favoris à quelqu'un \
          parce qu'une requête a échoué serait pire que le défaut d'origine"
     );
+    assert_eq!(
+        (statut_casse_album, corps_casse_album.as_str()),
+        (statut_sain_album, corps_sain_album.as_str()),
+        "la réponse de {ROUTE_ALBUM} a changé : la fiche album doit rester \
+         dégradée exactement comme avant — un 500 y effacerait l'écran entier \
+         au lieu de sa seule liste de pistes"
+    );
 
     // --- 4. …mais le journal, lui, porte désormais l'échec ---
 
@@ -171,9 +197,9 @@ async fn une_panne_sql_laisse_une_trace_sans_changer_la_reponse() {
         .collect();
 
     assert!(
-        traces.len() >= 2,
-        "deux requêtes ont échoué, le journal doit porter deux traces — c'est \
-         tout le défaut de la #2861 : la section ne s'explique pas, elle \
+        traces.len() >= 3,
+        "trois requêtes ont échoué, le journal doit porter trois traces — \
+         c'est tout le défaut de la #2861 : la section ne s'explique pas, elle \
          disparaît.\ntraces trouvées : {}\njournal complet :\n{journal}",
         traces.len()
     );
@@ -189,6 +215,12 @@ async fn une_panne_sql_laisse_une_trace_sans_changer_la_reponse() {
     assert!(
         traces.iter().any(|l| l.contains("profiles.rs")),
         "aucune trace ne désigne profiles.rs :\n{journal}"
+    );
+    assert!(
+        traces.iter().any(|l| l.contains("albums.rs")),
+        "aucune trace ne désigne albums.rs — la liste de pistes d'un album \
+         est-elle retombée sur `unwrap_or_default()` ? C'est le site que la \
+         conversion de la #2861 avait laissé de côté dans ce fichier.\n{journal}"
     );
     assert!(
         !traces.iter().any(|l| l.contains("panne_sql.rs")),

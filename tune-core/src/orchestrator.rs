@@ -20,6 +20,10 @@ use transcodage::*;
 const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
 
 mod radio;
+/// Réexport PUBLIC, et un seul : `tune-server` refuse désormais à
+/// l'ENREGISTREMENT une adresse de station qui rend une page web, avec le même
+/// verdict que la lecture (#3578). Le reste de ce module reste interne.
+pub use radio::non_audio_content_type;
 pub(crate) use radio::*;
 
 /// re-resolve or re-send. The `superseded` play_seq guard in `play_inner` only

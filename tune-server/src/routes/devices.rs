@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use std::sync::Arc;
 use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
-use tune_core::db::zone_repo::ZoneRepo;
+use tune_core::db::zone_repo::{CreationDeZone, ZoneRepo};
 use tune_core::discovery::device::dedup_devices;
 use tune_core::discovery::renderer_identity::{
     Evidence, IdentityVerdict, RendererIdentity, compare_at_same_location,
@@ -45,6 +45,14 @@ pub fn router() -> Router<AppState> {
         // donne déjà la priorité au segment littéral, la ligne est ici pour
         // que la lecture le montre.
         .route("/ignored", get(list_ignored_devices))
+        // #3326 — lecteurs Sendspin vus sur le réseau. Route séparée, et non
+        // une entrée de plus dans `GET /devices` : ce que `GET /devices` liste
+        // est offert à la création de zone, et `POST /zones` accepte
+        // n'importe quel `output_device_id` sans vérifier le registre des
+        // sorties (`routes/zones/ecriture.rs`). Y verser un appareil qui ne
+        // joue pas encore fabriquerait une zone muette — le contraire de ce
+        // que la phase 1 doit livrer.
+        .route("/sendspin", get(list_sendspin_players))
         .route(
             "/{device_id}/ignore",
             post(ignore_device).delete(unignore_device),
@@ -63,6 +71,23 @@ pub fn router() -> Router<AppState> {
 /// déroulants Marque/Modèle de la config d'une zone.
 async fn device_catalog() -> Json<Value> {
     Json(json!(tune_core::device_catalog::catalog()))
+}
+
+/// `GET /devices/sendspin` — les lecteurs Sendspin vus sur le réseau (#3326).
+///
+/// Phase 1 du chantier : Tune sait les VOIR, pas encore leur envoyer de son.
+/// Chaque entrée le dit explicitement (`playable: false` et un motif), et
+/// `supported` en tête de la charge utile le dit pour la liste entière — un
+/// client n'a donc pas à déduire d'un tableau vide qu'il ne se passe rien.
+async fn list_sendspin_players(State(state): State<AppState>) -> Json<Value> {
+    let players = state.discovered_sendspin_players().await;
+    Json(json!({
+        "service": tune_core::discovery::sendspin::SERVICE_LECTEUR,
+        "playback_supported": false,
+        "reason": tune_core::discovery::sendspin::MOTIF_PHASE_DECOUVERTE,
+        "count": players.len(),
+        "players": players,
+    }))
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
@@ -346,6 +371,13 @@ fn forget_manual_device(state: &AppState, device_id: &str) {
     }
 }
 
+/// Zone d'un appareil que l'utilisateur a ajouté **à la main**
+/// (`POST /devices/add`, puis sa ré-inscription au démarrage).
+///
+/// #3529 : ce chemin n'est volontairement PAS soumis à « Créer automatiquement
+/// les zones ». Le geste de l'utilisateur vaut consentement, et le réglage ne
+/// porte que sur ce qui se crée tout seul. Le re-sondage des DLNA mémorisés,
+/// lui, se crée tout seul : il passe par [`ensure_zone_automatique`].
 fn ensure_zone(state: &AppState, name: &str, type_str: &str, device_id: &str) -> Option<i64> {
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     match zone_repo.get_or_create(name, Some(type_str), device_id) {
@@ -354,6 +386,34 @@ fn ensure_zone(state: &AppState, name: &str, type_str: &str, device_id: &str) ->
                 let _ = zone_repo.set_online_by_device(device_id, true);
             }
             Some(zid)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Zone d'un appareil retrouvé **tout seul** par le re-sondage des DLNA
+/// mémorisés (`reprobe_dlna_with_backoff` → `register_discovered_dlna`).
+///
+/// #3529 — ce chemin tourne à chaque démarrage, avec réessais, sans aucun
+/// geste de l'utilisateur : il est soumis au réglage. Une zone déjà connue est
+/// remise en ligne comme avant ; seule la naissance est refusée.
+fn ensure_zone_automatique(
+    state: &AppState,
+    name: &str,
+    type_str: &str,
+    device_id: &str,
+    origine: &str,
+) -> Option<i64> {
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+    match zone_repo.get_or_create_si_autorise(name, Some(type_str), device_id, origine) {
+        Ok(CreationDeZone::Creee(zid)) => Some(zid),
+        Ok(CreationDeZone::Existante(zid)) => {
+            let _ = zone_repo.set_online_by_device(device_id, true);
+            Some(zid)
+        }
+        Ok(CreationDeZone::Refusee) => {
+            info!(name = %name, device_id = %device_id, "discovered_dlna_zone_auto_create_disabled_skipping");
+            None
         }
         Err(_) => None,
     }
@@ -1042,7 +1102,7 @@ async fn register_discovered_dlna(
     // Registry is keyed by device_id (the uuid): a later multicast discovery
     // replaces this entry rather than duplicating it.
     state.outputs.lock().await.register(Box::new(dlna));
-    let _ = ensure_zone(state, &device_name, "dlna", &dev.uuid);
+    let _ = ensure_zone_automatique(state, &device_name, "dlna", &dev.uuid, "discovered_dlna");
     // Drive auto_resume: it waits on `device.reconnected` to resume a zone that
     // was playing before the restart — the multicast path may never fire for a
     // lazy SSDP responder, which is the whole point of #1126.
