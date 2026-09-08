@@ -283,3 +283,16 @@ path = "tests/comptes_par_source_2147.rs"
 [[test]]
 name = "sources_trois_routes_i3226"
 path = "tests/sources_trois_routes_i3226.rs"
+
+# #3578 : une adresse de station qui rend une PAGE WEB etait acceptee a
+# l'enregistrement et ne se decouvrait qu'a la lecture. Le juge
+# (`non_audio_content_type`) existait deja et n'avait qu'UN appelant.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Pas de `required-features` : le banc monte un faux serveur de station sur
+# 127.0.0.1 et une base SQLite en memoire, il ne demande ni base externe ni
+# reseau sortant.
+[[test]]
+name = "radio_adresse_pas_un_flux_3578"
+path = "tests/radio_adresse_pas_un_flux_3578.rs"
