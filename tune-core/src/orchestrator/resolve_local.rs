@@ -37,6 +37,36 @@ struct DecisionLocale {
     fmt: String,
     zone: Option<crate::db::zone_repo::Zone>,
     needs_transcode: bool,
+    /// #3631 — la TRANCHE à jouer dans `file_path`, quand la piste vient d'une
+    /// feuille CUE : début et durée, en millisecondes.
+    ///
+    /// `None` pour toute piste ordinaire, c'est-à-dire pour la quasi-totalité
+    /// d'une bibliothèque : chaque site qui la lit garde alors son
+    /// comportement d'avant, à l'octet près.
+    tranche_cue: Option<TrancheCue>,
+}
+
+/// Un intervalle nommé à l'intérieur d'un fichier image (#3631).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TrancheCue {
+    pub(super) debut_ms: u64,
+    /// `None` quand la piste court jusqu'au bout du fichier — la dernière
+    /// d'une feuille. Il n'y a alors rien à borner : le fichier s'arrête tout
+    /// seul au bon endroit.
+    pub(super) duree_ms: Option<u64>,
+}
+
+impl TrancheCue {
+    /// La durée restante après un seek utilisateur DANS la tranche.
+    ///
+    /// Le seek de l'utilisateur est relatif au début de la PISTE, pas du
+    /// fichier image : il s'ajoute au début de la tranche et se retranche de sa
+    /// durée. Sans cette soustraction, sauter à 2 min d'une piste de 5 en
+    /// jouerait encore 5 — donc 2 minutes de la piste SUIVANTE.
+    fn duree_restante_s(&self, seek_ms: u64) -> Option<f64> {
+        let duree = self.duree_ms?;
+        Some(duree.saturating_sub(seek_ms) as f64 / 1000.0)
+    }
 }
 
 /// Ce que les décisions rendent : la décision à exécuter, ou une résolution
@@ -218,7 +248,22 @@ impl PlaybackOrchestrator {
             .map_err(|e| e.to_string())?
             .ok_or("track not found")?;
 
-        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
+        // #3631 — une piste de feuille CUE n'a PAS de `file_path` : `tracks.
+        // file_path` est `UNIQUE` et une feuille découpe N pistes dans le même
+        // fichier. Son fichier est `cue_media_path`, et ce qu'elle joue en est
+        // une TRANCHE. Sans ce repli, toute piste CUE échouait ici sur
+        // « track has no file_path » — c'est-à-dire toutes, puisque rien ne
+        // les écrivait avant le lot 2b.
+        let bornes = track.bornes_cue();
+        let tranche_cue = bornes.as_ref().map(|(_, debut, fin)| TrancheCue {
+            debut_ms: *debut,
+            duree_ms: fin.map(|f| f.saturating_sub(*debut)),
+        });
+        let file_path = match (track.file_path.clone(), &bornes) {
+            (Some(p), _) => p,
+            (None, Some((media, _, _))) => media.clone(),
+            (None, None) => return Err("track has no file_path".into()),
+        };
 
         // The DB row can outlive the file (moved/deleted external drive, stale
         // scan, duplicate compilation entry pointing at an old path). Without
@@ -288,7 +333,12 @@ impl PlaybackOrchestrator {
         // that track. Recover the real duration now and persist it so the track
         // self-heals for every later read. DSD is read from the header because
         // lofty (which get_duration uses) is exactly what returned 0 for it.
-        if track.duration_ms <= 0 {
+        //
+        // ⛔ JAMAIS pour une tranche de feuille CUE : la sonde rendrait la
+        // durée de l'IMAGE ENTIÈRE — 74 minutes pour une piste de 3 — et la
+        // persisterait. La durée d'une tranche est celle que la feuille dit,
+        // pas celle du fichier qui la porte.
+        if track.duration_ms <= 0 && tranche_cue.is_none() {
             if let Some(ms) = probe_local_duration_ms(&file_path, source_format).await {
                 track.duration_ms = ms;
                 let repo2 = TrackRepo::with_backend(self.db.clone());
@@ -309,6 +359,7 @@ impl PlaybackOrchestrator {
                 fmt.clone(),
                 source_format,
                 is_dsd_source,
+                tranche_cue,
             )
             .await?
         {
@@ -430,6 +481,7 @@ impl PlaybackOrchestrator {
         fmt: String,
         source_format: Option<AudioFormat>,
         is_dsd_source: bool,
+        tranche_cue: Option<TrancheCue>,
     ) -> Result<DecisionOuResolu, String> {
         let sample_rate = track
             .sample_rate
@@ -881,7 +933,11 @@ impl PlaybackOrchestrator {
             // hi-res FLAC is re-encoded at 16-bit instead of served direct
             // (silent on the Ruark R3, #1137). ALAC already transcodes because
             // the cap disables alac_passthrough above.
-            || (dlna_cap_16bit && will_be_flac);
+            || (dlna_cap_16bit && will_be_flac)
+            // #3631 — une TRANCHE ne se sert jamais telle quelle. Le
+            // passthrough enverrait le fichier image ENTIER : l'album complet
+            // sous le nom d'une de ses pistes. Seul le décodage sait couper.
+            || tranche_cue.is_some();
         if eq_forces_transcode && !needs_transcode_for_output && !dlna_needs_wav {
             info!(zone_id = req.zone_id, "eq_active_forcing_network_transcode");
         }
@@ -916,6 +972,7 @@ impl PlaybackOrchestrator {
             fmt,
             zone,
             needs_transcode,
+            tranche_cue,
         };
         Ok(DecisionOuResolu::Decision(decision))
     }
@@ -1107,7 +1164,15 @@ impl PlaybackOrchestrator {
         let source_format = AudioFormat::from_extension(&fmt);
         let is_dsd_source = source_format == Some(AudioFormat::Dsd);
         match self
-            .decider_la_lecture_locale(req, &track, file_path, fmt, source_format, is_dsd_source)
+            .decider_la_lecture_locale(
+                req,
+                &track,
+                file_path,
+                fmt,
+                source_format,
+                is_dsd_source,
+                None,
+            )
             .await?
         {
             DecisionOuResolu::Decision(decision) => {
@@ -1478,6 +1543,7 @@ impl PlaybackOrchestrator {
             is_local_output,
             sample_rate,
             track_duration_ms,
+            tranche_cue,
             ref file_path,
             ..
         } = *decision;
@@ -1545,6 +1611,14 @@ impl PlaybackOrchestrator {
                     .as_ref()
                     .and_then(|_| self.octets_ir(req.zone_id))
                     .as_deref(),
+            );
+            // 🔴 #3631 — la TRANCHE entre dans la clé. La clé est bâtie sur le
+            // fichier SOURCE, et les quinze pistes d'une image CUE le
+            // partagent : sans ce brassage, la première rendition mise en
+            // cache serait servie pour les quatorze autres.
+            let empreinte_dsp = crate::transcode_cache::empreinte_avec_tranche(
+                empreinte_dsp,
+                tranche_cue.map(|t| (t.debut_ms, t.duree_ms.map(|d| t.debut_ms + d))),
             );
             let cache_path_opt = crate::transcode_cache::cache_path_dsp(
                 &file_path,
@@ -1783,6 +1857,12 @@ impl PlaybackOrchestrator {
                         tmp_path.clone(),
                         Some(progres.clone()),
                         Some(abandon.clone()),
+                        // #3631 — la tranche à découper dans le fichier image.
+                        // `None` pour un fichier ordinaire.
+                        tranche_cue.map(|t| TrancheSource {
+                            debut_s: t.debut_ms as f64 / 1000.0,
+                            duree_s: t.duree_ms.map(|d| d as f64 / 1000.0).unwrap_or(0.0),
+                        }),
                     ),
                     progres,
                     politique,
@@ -1996,6 +2076,7 @@ impl PlaybackOrchestrator {
     ) -> Result<FluxLocal, String> {
         let DecisionLocale {
             channels,
+            tranche_cue,
             ref file_path,
             ..
         } = *decision;
@@ -2052,7 +2133,18 @@ impl PlaybackOrchestrator {
             let ev_bus = self.event_bus.clone();
             let playback = self.playback.clone();
             let zone_id = req.zone_id;
-            let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
+            // #3631 — le seek de l'utilisateur est relatif au début de la
+            // PISTE. Pour une tranche de feuille CUE, la position dans le
+            // FICHIER est le début de la tranche PLUS ce seek ; la durée
+            // restante à servir, elle, en est diminuée d'autant.
+            let seek_utilisateur_ms = req.seek_ms.unwrap_or(0);
+            let seek_s = (tranche_cue.map(|t| t.debut_ms).unwrap_or(0) + seek_utilisateur_ms)
+                as f64
+                / 1000.0;
+            let duree_tranche_s = tranche_cue.and_then(|t| t.duree_restante_s(seek_utilisateur_ms));
+            // Les niveaux sont datés sur l'horloge de la PISTE : le décalage
+            // du fichier image n'a rien à y faire.
+            let seek_niveaux_ms = seek_utilisateur_ms as i64;
             let streamer_sessions = self.streamer.sessions_state();
             let close_session_id = session_id.clone();
             // Pré-chargement gapless : session de la piste suivante, pas
@@ -2078,7 +2170,7 @@ impl PlaybackOrchestrator {
                             playback,
                             zone_id,
                             play_seq,
-                            (seek_s * 1000.0) as i64,
+                            seek_niveaux_ms,
                         )
                     }
                     None => {
@@ -2091,7 +2183,7 @@ impl PlaybackOrchestrator {
                 drop(tx);
 
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm_streaming_seeked(
+                    crate::audio::decode::decode_to_pcm_streaming_tranche(
                         &fp_clone,
                         Some(out_sr),
                         Some(channels as u32),
@@ -2101,6 +2193,7 @@ impl PlaybackOrchestrator {
                         data_ready,
                         levels_tx,
                         seek_s,
+                        duree_tranche_s,
                     )
                 })
                 .await;
