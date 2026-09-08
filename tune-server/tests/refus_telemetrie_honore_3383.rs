@@ -244,8 +244,12 @@ async fn le_ping_de_demarrage_respecte_le_refus() {
     let (app, state) = banc();
     poster(&app, "/api/v1/cloud/telemetry/disable").await;
 
-    let verdict =
-        tune_core::cloud::telemetry::ping_de_demarrage(&state.backend, &state.services).await;
+    let verdict = tune_core::cloud::telemetry::ping_de_demarrage(
+        &state.backend,
+        &state.services,
+        &tune_server::config::resolve_web_dir(),
+    )
+    .await;
     assert_eq!(
         verdict,
         tune_core::cloud::telemetry::PingDemarrage::Refuse,

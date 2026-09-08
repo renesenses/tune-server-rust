@@ -30,6 +30,7 @@ pub mod favorites_sort;
 pub mod health;
 pub mod health_monitor;
 pub mod http;
+pub mod interface_web;
 pub mod library;
 pub mod license;
 pub mod lyrics;

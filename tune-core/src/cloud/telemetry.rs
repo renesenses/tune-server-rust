@@ -51,6 +51,7 @@ pub enum PingDemarrage {
 pub async fn ping_de_demarrage(
     db: &Arc<dyn DbBackend>,
     services: &Arc<Mutex<ServiceRegistry>>,
+    web_dir: &std::path::Path,
 ) -> PingDemarrage {
     let settings = SettingsRepo::with_backend(db.clone());
     if !TelemetryReporter::is_enabled_for(&settings) {
@@ -69,6 +70,11 @@ pub async fn ping_de_demarrage(
     };
     let payload = serde_json::json!({
         "v": crate::version(),
+        // #3380 — la version de l'INTERFACE, relue a CHAQUE envoi et non figee
+        // au demarrage : une mise a jour automatique reecrit `web/` sous le
+        // processus en cours. `null` quand le fichier n'existe pas ; jamais un
+        // repli sur `v`, qui ferait disparaitre l'ecart qu'on cherche.
+        "ui": crate::interface_web::version_interface(web_dir),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "services": svc_list,
@@ -82,12 +88,13 @@ pub async fn ping_de_demarrage(
 pub fn spawn_startup_ping(
     db: Arc<dyn DbBackend>,
     services: std::sync::Arc<tokio::sync::Mutex<crate::streaming::registry::ServiceRegistry>>,
+    web_dir: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         // Le verrou est lu APRES l'attente, pas avant : l'utilisateur qui
         // decoche dans les dix premieres secondes doit etre entendu.
-        ping_de_demarrage(&db, &services).await;
+        ping_de_demarrage(&db, &services, &web_dir).await;
     });
 }
 
@@ -95,6 +102,11 @@ pub fn spawn_startup_ping(
 struct HeartbeatPayload {
     server_id: String,
     version: String,
+    /// #3380 — la version de l'INTERFACE servie par cette instance, quand elle
+    /// est lisible. `web/` est deploye separement du binaire : sans ce champ,
+    /// un rapport d'ecran arrive avec une version serveur recente et une
+    /// interface possiblement en retard de plusieurs versions.
+    ui_version: Option<String>,
     services: Vec<String>,
     tracks_count: i64,
     artists_with_bio: i64,
@@ -167,7 +179,11 @@ impl TelemetryReporter {
 
     /// Collect and send a heartbeat to mozaiklabs.fr.
     /// Fails silently — logs a warning but never panics.
-    pub async fn send(db: &Arc<dyn DbBackend>, services: &Arc<Mutex<ServiceRegistry>>) {
+    pub async fn send(
+        db: &Arc<dyn DbBackend>,
+        services: &Arc<Mutex<ServiceRegistry>>,
+        web_dir: &std::path::Path,
+    ) {
         let settings = SettingsRepo::with_backend(db.clone());
         // #3383 : `is_enabled_for` et non `is_enabled` — le refus pose dans
         // l'interface compte autant que celui pose dans l'environnement.
@@ -207,6 +223,7 @@ impl TelemetryReporter {
         let payload = HeartbeatPayload {
             server_id,
             version: crate::version().to_string(),
+            ui_version: crate::interface_web::version_interface(web_dir),
             services: connected_services,
             tracks_count,
             artists_with_bio,
@@ -264,12 +281,16 @@ impl TelemetryReporter {
 
     /// Spawn a background task that sends a heartbeat after 30 seconds,
     /// then every 24 hours.
-    pub fn spawn(db: Arc<dyn DbBackend>, services: Arc<Mutex<ServiceRegistry>>) {
+    pub fn spawn(
+        db: Arc<dyn DbBackend>,
+        services: Arc<Mutex<ServiceRegistry>>,
+        web_dir: std::path::PathBuf,
+    ) {
         tokio::spawn(async move {
             // Initial delay: give the server time to restore tokens and scan
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             loop {
-                Self::send(&db, &services).await;
+                Self::send(&db, &services, &web_dir).await;
                 tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
             }
         });

@@ -128,6 +128,8 @@ mod radio_ne_fait_pas_avancer_la_file;
 mod radios_recherche_distinction;
 #[path = "radios_validation_url.rs"]
 mod radios_validation_url;
+#[path = "rapport_dit_quelle_interface_tourne_3380.rs"]
+mod rapport_dit_quelle_interface_tourne_3380;
 #[path = "rbac.rs"]
 mod rbac;
 #[path = "recherche_totaux_i3189.rs"]
