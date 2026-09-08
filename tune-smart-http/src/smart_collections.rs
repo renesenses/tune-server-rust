@@ -457,7 +457,33 @@ pub fn build_album_query(
                 _ => v.to_string(),
             })
             .unwrap_or_default();
+        // DEUX échappements, et les confondre casse quelque chose dans les
+        // deux sens.
+        //
+        // `esc` — les apostrophes seulement. C'est ce qu'une comparaison
+        // d'ÉGALITÉ demande : `=` compare des chaînes entières, `%` et `_` n'y
+        // sont pas des jokers. Y neutraliser les jokers ferait comparer
+        // `100\% Live` à `100% Live`, qui ne se ressemblent plus.
+        //
+        // `esc_like` — pour les motifs `LIKE`, où les mêmes caractères
+        // deviennent des jokers :
+        //
+        //  - `%` et `_` non neutralisés font qu'un filtre rend PLUS que demandé
+        //    — `100% Live` ramenait aussi `1000 Autres` (#3101) ;
+        //  - l'antislash, lui, fait rendre MOINS : Postgres le traite comme son
+        //    caractère d'échappement, SQLite non. Un chemin Windows
+        //    `G:\Jazz\%` dégénère côté PG en `G:Jazz%` et ne correspond à
+        //    RIEN — les quatre racines de JF affichées « 0 piste » sur une
+        //    bibliothèque parfaitement scannée (#1752).
+        //
+        // Le second point n'était théorique que tant qu'aucun champ ne portait
+        // de chemin. Le champ « répertoire » en porte un, donc il l'arme.
         let esc = value.replace('\'', "''");
+        let esc_like = tune_core::db::track_repo::echapper_jokers_like(&value).replace('\'', "''");
+        // « l'antislash échappe » — la clause dit à Postgres ce qu'il fait déjà
+        // et à SQLite ce qu'il ne faisait pas. Les deux moteurs lisent enfin la
+        // même chose.
+        let esc_clause = tune_core::db::track_repo::like_escape_clause();
 
         // --- règles « référence » (collection / playlist / favori) ---
         if smart_refs::is_ref_field(field) {
@@ -618,6 +644,11 @@ pub fn build_album_query(
             "label" => "al.label",
             "format" => "t.format",
             "source" => "t.source",
+            // #REPERTOIRE — la LOCALISATION de la piste sur le disque. Le seul
+            // champ dont la valeur est un CHEMIN, donc le seul qui porte des
+            // antislashs sur Windows : c'est lui qui rend l'échappement `LIKE`
+            // ci-dessous obligatoire et non cosmétique (#1752).
+            "folder" | "file_path" => "t.file_path",
             "cover_path" => "al.cover_path",
             // Fall back to the track year: many albums have a NULL al.year even
             // though the tracks carry the year in their tags (Elie — genre, a
@@ -646,14 +677,16 @@ pub fn build_album_query(
                 | "label"
                 | "format"
                 | "source"
+                | "folder"
+                | "file_path"
         );
         let int_val = || value.parse::<i64>().unwrap_or(0);
 
         let cond = match op {
             "=" if is_text => format!("LOWER({col}) = LOWER('{esc}')"),
             "!=" if is_text => format!("LOWER({col}) != LOWER('{esc}')"),
-            "contains" => format!("LOWER({col}) LIKE LOWER('%{esc}%')"),
-            "starts_with" => format!("LOWER({col}) LIKE LOWER('{esc}%')"),
+            "contains" => format!("LOWER({col}) LIKE LOWER('%{esc_like}%'){esc_clause}"),
+            "starts_with" => format!("LOWER({col}) LIKE LOWER('{esc_like}%'){esc_clause}"),
             "is_null" => format!("({col} IS NULL OR {col} = '')"),
             "is_not_null" => format!("({col} IS NOT NULL AND {col} != '')"),
             "=" => format!("{col} = {}", int_val()),
@@ -891,6 +924,92 @@ async fn preview_albums(
 mod tests {
     use super::{build_album_query, normalize_sort_order, resolve_timestamp_sql};
     use crate::smart_refs::{EmptyResolver, RefCtx};
+
+    /// Le champ « répertoire » compile sur `t.file_path`, et sur lui seul.
+    ///
+    /// C'est la colonne qui porte la LOCALISATION de la piste. La désigner
+    /// autrement — `al.cover_path` est le seul autre chemin du schéma — rendrait
+    /// une collection qui trie sur la pochette au lieu du fichier.
+    #[test]
+    fn le_repertoire_compile_sur_le_chemin_de_la_piste() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let rules = r#"[{"field":"folder","operator":"starts_with","value":"/data/music/Jazz"}]"#;
+        let (ou, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
+        assert!(ou.contains("t.file_path"), "{ou}");
+        assert!(ou.contains("/data/music/Jazz%"), "préfixe attendu : {ou}");
+    }
+
+    /// ⭐ #1752 — un chemin WINDOWS doit survivre au compilateur.
+    ///
+    /// Postgres traite l'antislash comme son caractère d'échappement dans
+    /// `LIKE` ; SQLite n'en a aucun. Un motif brut `G:\Jazz - Vocal\%` se
+    /// dégrade donc, côté Postgres SEULEMENT, en la chaîne littérale
+    /// `G:Jazz - Vocal%` — qui ne correspond à rien. C'est ce qui avait fait
+    /// afficher « Dossier vide — 0 pistes » aux quatre racines de JF Paquet sur
+    /// une bibliothèque parfaitement scannée.
+    ///
+    /// Le défaut n'était visible que pour un utilisateur Windows **ET**
+    /// Postgres : les Windows sont en SQLite, les serveurs PG sont sous Linux
+    /// avec des chemins POSIX. D'où des mois d'invisibilité — et la raison pour
+    /// laquelle cette garde est textuelle plutôt que fonctionnelle : reproduire
+    /// la panne demanderait un Postgres ET des chemins Windows.
+    ///
+    /// Les deux moitiés du contrat sont indissociables et doivent être
+    /// vérifiées ENSEMBLE : la clause dit « l'antislash échappe », la valeur
+    /// doit donc doubler les siens. L'une sans l'autre est pire que rien.
+    #[test]
+    fn un_chemin_windows_survit_au_compilateur() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let rules = r#"[{"field":"folder","operator":"starts_with","value":"G:\\Jazz - Vocal"}]"#;
+        let (ou, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
+        assert!(
+            ou.contains(r"G:\\Jazz - Vocal"),
+            "l'antislash doit sortir DOUBLÉ, sinon Postgres l'avale : {ou}"
+        );
+        assert!(
+            ou.contains(r"ESCAPE '\'"),
+            "sans la clause, doubler l'antislash le rend visible au lieu de \
+             littéral sur SQLite : {ou}"
+        );
+    }
+
+    /// #3101 — les jokers de `LIKE` sont neutralisés dans la VALEUR.
+    ///
+    /// Sans ça, un filtre rend PLUS que demandé : `%` avale n'importe quelle
+    /// suite, donc « contient 100% Live » ramenait aussi `1000 Autres`. Sur des
+    /// bibliothèques de dizaines de milliers de fichiers, `%` et `_` sont
+    /// partout dans les noms de dossiers.
+    #[test]
+    fn les_jokers_ne_sont_plus_des_jokers() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let rules = r#"[{"field":"title","operator":"contains","value":"100% Live"}]"#;
+        let (ou, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
+        assert!(
+            ou.contains(r"100\% Live"),
+            "le % doit être neutralisé : {ou}"
+        );
+    }
+
+    /// TÉMOIN — l'ÉGALITÉ, elle, ne neutralise rien.
+    ///
+    /// C'est la moitié qu'on casse en corrigeant l'autre trop largement : `=`
+    /// compare des chaînes entières, `%` n'y est pas un joker. Y appliquer
+    /// l'échappement ferait comparer `100\% Live` à `100% Live`, deux chaînes
+    /// qui ne se ressemblent plus — un titre qui matchait cesserait de matcher.
+    #[test]
+    fn l_egalite_ne_neutralise_pas_les_jokers() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let rules = r#"[{"field":"title","operator":"=","value":"100% Live"}]"#;
+        let (ou, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
+        assert!(
+            ou.contains("100% Live") && !ou.contains(r"100\% Live"),
+            "l'égalité doit comparer la valeur TELLE QUELLE : {ou}"
+        );
+        assert!(
+            !ou.contains("ESCAPE"),
+            "une égalité n'est pas un LIKE, elle n'a pas de clause ESCAPE : {ou}"
+        );
+    }
 
     #[test]
     fn resolve_timestamp_relative_forms() {
