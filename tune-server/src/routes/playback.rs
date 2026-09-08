@@ -278,8 +278,54 @@ pub(crate) fn can_skip_next(zone_state: &tune_core::playback::ZoneState) -> bool
     tune_core::poller::PositionPoller::next_position_manual(zone_state).is_some()
 }
 
+/// La MÊME décision, complétée par la règle que `POST /zones/{id}/next`
+/// applique réellement depuis #3342.
+///
+/// #3514 — depuis #3342, `next` refuse d'avancer quand une radio joue hors de
+/// sa file : il rend `{"reason":"radio_no_next"}` et ne touche à rien. Mais la
+/// projection ci-dessus est restée celle de `next_position_manual`, qui ne
+/// connaît que la POSITION : sur la file résiduelle de Philippe — trois pistes
+/// Qobuz, position 0 — elle rend `Some(1)`, donc `true`. Le bouton « suivant »
+/// restait franchement actif pendant toute la radio, et chaque appui partait
+/// dans le vide sans que rien ne l'explique.
+///
+/// C'est le motif que ce dépôt traite en ce moment sous toutes ses formes : le
+/// serveur ANNONCE ce qu'il ne fera pas. Une capacité annoncée et non honorée
+/// est pire qu'une capacité refusée — l'auditeur croit avoir agi. La réparation
+/// est de dire non au bon endroit, ici dans le champ que l'écran lit, et non
+/// d'inventer un « suivant » de radio qui n'existe pas.
+///
+/// ⚠️ La lecture de file ne coûte QUE sur une radio. La règle exige
+/// `source_en_cours == "radio"` ; hors radio on rend la projection pure sans
+/// toucher la base, ce qui laisse `GET /zones` — qui boucle sur toutes les
+/// zones — au même nombre de requêtes qu'avant.
+pub(crate) async fn can_skip_next_publie(
+    state: &AppState,
+    zone_id: i64,
+    zone_state: &tune_core::playback::ZoneState,
+) -> bool {
+    if !can_skip_next(zone_state) {
+        return false;
+    }
+    let Some(np) = zone_state.now_playing.as_ref() else {
+        return true;
+    };
+    if np.source != "radio" {
+        return true;
+    }
+    let ligne_courante = PlayQueueRepo::with_backend(state.backend.clone())
+        .get_at(zone_id, zone_state.queue_position)
+        .ou_defaut_journalise();
+    !radio_hors_file_interdit_le_suivant(
+        Some(np.source.as_str()),
+        ligne_courante.as_ref().and_then(|e| e.source.as_deref()),
+    )
+}
 pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     let zone_state = state.playback.get_state(zone_id).await;
+    // #3514 — la décision PUBLIÉE est celle que la route applique, refus
+    // « radio hors file » compris. Voir `can_skip_next_publie`.
+    let peut_avancer = can_skip_next_publie(state, zone_id, &zone_state).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_db = zone_repo.get(zone_id).ok().flatten();
     let mut v = json!({
@@ -316,7 +362,7 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "position_ms": zone_state.position_ms,
         "queue_length": zone_state.queue_length,
         "queue_position": zone_state.queue_position,
-        "can_skip_next": can_skip_next(&zone_state),
+        "can_skip_next": peut_avancer,
         // #2092 / #2055 — TROISIÈME construction de la charge utile d'une zone,
         // et la dernière qui ne portait pas le transport.
         //
@@ -4675,6 +4721,112 @@ mod contrat_suivant_tests {
         };
 
         assert!(can_skip_next(&state));
+    }
+}
+
+/// #3514 — et la même décision, PUBLIÉE. Le test ci-dessus éprouve la règle ;
+/// celui-ci éprouve que la TROISIÈME charge utile de zone — celle que rendent
+/// une vingtaine de routes de lecture — s'en sert. C'est l'écart que ce dépôt
+/// connaît par cœur : tester que la fonction marche, pas qu'on l'appelle.
+#[cfg(test)]
+mod contrat_suivant_radio_tests {
+    use crate::state::AppState;
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::playback::NowPlaying;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// Une zone posée EN BASE, avec une sortie.
+    fn zone(state: &AppState, nom: &str) -> i64 {
+        ZoneRepo::with_backend(state.backend.clone())
+            .create(nom, Some("mock"), Some("sortie-essai"))
+            .expect("creation de zone")
+    }
+
+    /// La file résiduelle de Philippe : trois pistes Qobuz, l'écoute d'avant.
+    fn file(state: &AppState, zone_id: i64, source: &str) {
+        let items: Vec<QueueInput> = ["a", "b", "c"]
+            .iter()
+            .map(|id| QueueInput::Streaming {
+                source: source.into(),
+                source_id: (*id).into(),
+                title: (*id).to_string(),
+                artist: "Aldo Romano".into(),
+                album: None,
+                duration_ms: 197_000,
+                cover_url: None,
+                track_number: None,
+                disc_number: None,
+            })
+            .collect();
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zone_id, &items)
+            .expect("mise en file");
+    }
+
+    fn en_cours(source: &str, titre: &str) -> NowPlaying {
+        NowPlaying {
+            title: titre.into(),
+            source: source.into(),
+            source_id: Some("x".into()),
+            duration_ms: 0,
+            ..Default::default()
+        }
+    }
+
+    async fn charge_utile(source_de_la_file: &str, source_en_cours: &str) -> serde_json::Value {
+        let state = etat();
+        let zid = zone(&state, "Salon");
+        file(&state, zid, source_de_la_file);
+        state
+            .playback
+            .play(zid, en_cours(source_en_cours, "FIP Jazz"))
+            .await;
+        // `play` réinitialise l'information de file : on la repose APRÈS, sinon
+        // `can_skip_next` serait faux pour une tout autre raison.
+        state.playback.update_queue_info(zid, 0, 3).await;
+        super::build_zone_json(&state, zid).await
+    }
+
+    #[tokio::test]
+    async fn la_charge_utile_de_lecture_refuse_le_suivant_pendant_une_radio_hors_file() {
+        let v = charge_utile("qobuz", "radio").await;
+        assert_eq!(
+            v.get("can_skip_next"),
+            Some(&serde_json::json!(false)),
+            "la file résiduelle a encore deux pistes après la position 0, donc \
+             `next_position_manual` rend `Some(1)` — mais `POST /next` refuse \
+             d'y aller (`radio_no_next`, #3342). La charge utile doit dire ce \
+             refus, sinon le bouton reste actif et sans effet (#3514) : {v}"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE 1 : même file, même route, une piste normale en cours.
+    #[tokio::test]
+    async fn une_piste_normale_garde_son_suivant_annonce() {
+        let v = charge_utile("qobuz", "qobuz").await;
+        assert_eq!(
+            v.get("can_skip_next"),
+            Some(&serde_json::json!(true)),
+            "sans elle, un `can_skip_next` cassé pour tout le monde passerait \
+             le test ci-dessus : {v}"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE 2 : une file FAITE de stations. La règle regarde la
+    /// ligne de file courante, pas seulement ce qui joue — l'auditeur qui
+    /// enfile ses stations favorites garde son bouton.
+    #[tokio::test]
+    async fn une_file_de_stations_garde_son_suivant_annonce() {
+        let v = charge_utile("radio", "radio").await;
+        assert_eq!(
+            v.get("can_skip_next"),
+            Some(&serde_json::json!(true)),
+            "la ligne courante EST une radio : « suivant » y a un sens : {v}"
+        );
     }
 }
 

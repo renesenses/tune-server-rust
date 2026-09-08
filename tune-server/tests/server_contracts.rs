@@ -29,6 +29,8 @@ mod bios_langue_entete;
 mod bit_perfect_sortie_pull_2189;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
+#[path = "can_skip_next_dit_le_refus_radio_3514.rs"]
+mod can_skip_next_dit_le_refus_radio_3514;
 #[path = "cles_developpeur_persistance.rs"]
 mod cles_developpeur_persistance;
 #[path = "collections_couleur_persistee.rs"]
