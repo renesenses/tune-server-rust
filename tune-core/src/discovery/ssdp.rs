@@ -97,10 +97,18 @@ pub enum MediaServerVerdict {
 ///    encore obtenir un échec de `unicast_probe` sur la `LOCATION`.
 ///
 /// Le critère est un TEMPS ÉCOULÉ, pas un nombre de cycles manqués, et c'est
-/// délibéré : `process_responses` est appelée aussi bien par la boucle de
-/// balayage que par le récepteur de NOTIFY, une réponse à la fois. Un décompte
-/// de cycles y dériverait — chaque datagramme d'un appareil VOISIN compterait
-/// comme un cycle manqué pour tous les autres. Une horloge, non.
+/// délibéré : un décompte de cycles dériverait dès qu'un appelant apporte
+/// autre chose qu'une fenêtre d'observation complète — chaque datagramme d'un
+/// appareil VOISIN compterait comme un cycle manqué pour tous les autres. Une
+/// horloge, non.
+///
+/// ⚠️ Ce raisonnement décrivait un danger BIEN RÉEL, et il portait juste : les
+/// serveurs multimédia y ont échappé, les renderers non. `miss_count` /
+/// `MISS_GRACE_CYCLES`, eux, comptent bien des cycles — et le récepteur de
+/// NOTIFY appelait `process_responses` une réponse à la fois. C'est #3616.
+/// La correction n'a pas été de transformer ce compteur-là en horloge, mais de
+/// rendre au NOTIFY isolé sa sémantique propre :
+/// [`enregistrer_une_annonce`] n'appelle plus [`oublier_les_absents`].
 pub fn media_server_verdict(
     seen_this_cycle: bool,
     age: Duration,
@@ -537,12 +545,10 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                     }
                     continue;
                 }
-                // ssdp:alive (or update): reuse the M-SEARCH processing path.
-                // process_responses dedups by location/USN, so repeated
-                // announcements for an already-known device are cheap.
-                if let Some(resp) = parse_ssdp_response(data) {
-                    process_responses(&state, &event_tx, vec![resp]).await;
-                } else {
+                // `ssdp:alive` (ou `ssdp:update`) : UN datagramme, donc
+                // `enregistrer_une_annonce` et surtout PAS le bilan de fenêtre
+                // de `process_responses` — voir le contrat des deux fonctions.
+                if !enregistrer_une_annonce(&state, &event_tx, data).await {
                     debug!(from = %addr, bytes = len, "ssdp_notify_unparseable");
                 }
             }
@@ -1008,10 +1014,28 @@ pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDe
     ))
 }
 
-/// Un lot de réponses (recherche active ou annonce NOTIFY) : classer, enregistrer
-/// les nouveaux, oublier les absents. Même ordre qu'avant LAT-Z1 ; la boucle de
-/// recherche passe désormais par [`traiter_le_flux`], qui enregistre chaque
-/// appareil dès sa réponse au lieu d'attendre la fin de la fenêtre.
+/// ⚠️ CONTRAT — cette fonction prend une **fenêtre d'observation COMPLÈTE**.
+///
+/// `responses` doit être la totalité de ce qui a été entendu pendant une
+/// fenêtre où *tous* les appareils vivants avaient l'occasion de parler : le
+/// lot de réponses d'un M-SEARCH. Elle se termine par [`oublier_les_absents`],
+/// qui traite « absent du lot » comme « n'a pas répondu à l'appel » et fait
+/// perdre une vie (`miss_count`) à chaque appareil connu qui n'y figure pas.
+///
+/// ⛔ **Ne JAMAIS l'appeler avec un seul datagramme.** C'était le défaut de
+/// #3616 : l'écouteur NOTIFY passif lui passait `vec![resp]`, un unique
+/// `ssdp:alive`. `seen_ids` ne contenait alors qu'un appareil — celui qui
+/// venait de parler — et **tous les autres** prenaient un cycle manqué. Avec
+/// `MISS_GRACE_CYCLES` = 3, trois annonces spontanées de n'importe quels
+/// voisins bavards (box, téléviseur, imprimante) suffisaient à mettre toute la
+/// liste en sonde de dernière chance, sans qu'aucune horloge n'intervienne :
+/// 124 s entre `ssdp_device_discovered` et `ssdp_device_lost` chez le testeur,
+/// puis `Discovered devices: 0`.
+///
+/// La même fonction servait deux appelants aux sémantiques opposées. Elles
+/// sont désormais séparées, et c'est le NOM qui porte la différence :
+/// - fenêtre complète → `process_responses` / [`traiter_le_flux`] ;
+/// - annonce isolée → [`enregistrer_une_annonce`], qui n'oublie jamais.
 async fn process_responses(
     state: &Arc<Mutex<ScannerState>>,
     event_tx: &mpsc::Sender<SsdpEvent>,
@@ -1031,6 +1055,36 @@ async fn process_responses(
         enregistrer_l_appareil(state, event_tx, dev_id, resp).await;
     }
     oublier_les_absents(state, event_tx, &seen_ids).await;
+}
+
+/// L'autre moitié du contrat : **UN** datagramme `NOTIFY ssdp:alive`, tel que
+/// l'écouteur passif le reçoit (`notify_listen_loop`, site d'appel unique).
+///
+/// Une annonce spontanée dit « je suis là ». Elle ne dit **rien** des autres
+/// appareils : celui qui se tait à cet instant précis n'est pas absent, il n'a
+/// simplement pas parlé dans cette microseconde. D'où la règle, qui est tout
+/// le correctif de #3616 : **un NOTIFY isolé enregistre, jamais il n'oublie.**
+/// Aucun appel à [`oublier_les_absents`] ici — le vieillissement reste
+/// l'affaire du balayage périodique, qui, lui, voit tout le monde.
+///
+/// Rend `false` quand le datagramme n'a pas pu être analysé, pour que
+/// l'appelant journalise `ssdp_notify_unparseable` avec son émetteur.
+async fn enregistrer_une_annonce(
+    state: &Arc<Mutex<ScannerState>>,
+    event_tx: &mpsc::Sender<SsdpEvent>,
+    data: &[u8],
+) -> bool {
+    let Some(resp) = parse_ssdp_response(data) else {
+        return false;
+    };
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_locations: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some((dev_id, resp)) =
+        classer_la_reponse(state, &mut seen_ids, &mut seen_locations, resp).await
+    {
+        enregistrer_l_appareil(state, event_tx, dev_id, resp).await;
+    }
+    true
 }
 
 /// SSDP au fil de l'eau (LAT-Z1) : les réponses arrivent par un canal pendant
@@ -1785,6 +1839,156 @@ mod tests {
             _st: None,
             max_age: None,
         }
+    }
+
+    // ── #3616 : un datagramme n'est pas une fenêtre d'observation ─────────
+
+    /// Un `NOTIFY ssdp:alive` BRUT, tel qu'il sort de la socket multicast.
+    /// C'est exactement ce que `notify_listen_loop` tient dans `data` au
+    /// moment où il appelle `enregistrer_une_annonce(&state, &event_tx, data)`.
+    ///
+    /// Le témoin est bâti sur des datagrammes fabriqués et non sur un vrai
+    /// SSDP : la machine de compilation n'a pas de multicast utile, et un
+    /// témoin qui en supposerait un se contenterait de SAUTER — un test sauté
+    /// n'est pas un test vert.
+    fn datagramme_notify_alive(location: &str, usn: &str) -> Vec<u8> {
+        format!(
+            "NOTIFY * HTTP/1.1\r\n\
+             HOST: 239.255.255.250:1900\r\n\
+             CACHE-CONTROL: max-age=1800\r\n\
+             LOCATION: {location}\r\n\
+             NT: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\
+             NTS: ssdp:alive\r\n\
+             USN: {usn}\r\n\
+             \r\n"
+        )
+        .into_bytes()
+    }
+
+    /// Pose un appareil connu dans l'état du scanner, LOCATION sur un port
+    /// FERMÉ : la sonde unicast de dernière chance y échouera à coup sûr et
+    /// vite. Si cet appareil disparaît, c'est bien qu'on l'a fait vieillir.
+    async fn poser_un_appareil_connu(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> String {
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ecoute.local_addr().unwrap();
+        drop(ecoute);
+        let location = format!("http://{addr}/upnp/description.xml");
+        let mut st = state.lock().await;
+        st.devices.insert(
+            dev_id.to_string(),
+            DiscoveredDevice::new(
+                dev_id.to_string(),
+                "Ampli du salon".to_string(),
+                OutputType::Dlna,
+                "127.0.0.1".to_string(),
+                addr.port(),
+            ),
+        );
+        st.known_locations
+            .insert(dev_id.to_string(), location.clone());
+        location
+    }
+
+    /// 🔴 #3616 — LA GARDE. Site d'appel gardé : `notify_listen_loop`, branche
+    /// `ssdp:alive`, qui appelle `enregistrer_une_annonce`.
+    ///
+    /// Avant, cette branche appelait `process_responses(&state, &event_tx,
+    /// vec![resp])` : UN datagramme traité comme une fenêtre d'observation
+    /// complète. `seen_ids` ne contenait que l'émetteur, et `oublier_les_absents`
+    /// faisait perdre une vie à tous les autres. Avec `MISS_GRACE_CYCLES` = 3,
+    /// trois annonces spontanées de n'importe quels voisins — box, téléviseur,
+    /// imprimante — mettaient toute la liste en sonde de dernière chance.
+    #[tokio::test]
+    async fn un_notify_de_voisin_ne_fait_pas_vieillir_les_autres_appareils() {
+        const AMPLI: &str = "uuid:129b92ad-826c-4b86-a905-7ea60f4a9e8c";
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, mut rx) = mpsc::channel(32);
+        poser_un_appareil_connu(&state, AMPLI).await;
+
+        // Le voisin bavard : un vrai renderer, qui s'annonce spontanément,
+        // encore et encore — et qui ne dit RIEN de l'ampli.
+        let addr = spawn_description_server().await;
+        let voisin = datagramme_notify_alive(
+            &format!("http://{addr}/aios.xml"),
+            "uuid:9ab0c000-f668-11de-9976-0080-0006787c2e26::urn:schemas-upnp-org:device:MediaRenderer:1",
+        );
+
+        let annonces = MISS_GRACE_CYCLES + 2;
+        for _ in 0..annonces {
+            assert!(
+                enregistrer_une_annonce(&state, &tx, &voisin).await,
+                "le datagramme NOTIFY fabriqué doit s'analyser"
+            );
+        }
+
+        let st = state.lock().await;
+        assert!(
+            st.devices.contains_key(AMPLI),
+            "l'ampli n'a rien fait de mal : {annonces} annonces d'un VOISIN ne \
+             doivent pas le faire disparaître (#3616). Appareils restants : {:?}",
+            st.devices.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            st.miss_count.get(AMPLI).copied().unwrap_or(0),
+            0,
+            "un NOTIFY isolé ne dit rien des autres appareils : aucun cycle \
+             manqué ne doit être compté à l'ampli"
+        );
+        drop(st);
+
+        // Le voisin, lui, a bien été enregistré : la branche ENREGISTRE encore.
+        let mut decouvertes = 0;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                SsdpEvent::DeviceDiscovered(_) => decouvertes += 1,
+                SsdpEvent::DeviceLost(id) => {
+                    panic!("aucune perte ne doit être émise, or {id} est déclaré perdu")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            decouvertes, 1,
+            "le voisin doit être découvert une fois : « enregistrer, jamais oublier »"
+        );
+    }
+
+    /// L'AUTRE MOITIÉ de la contre-épreuve : le même scénario passé par
+    /// `process_responses`, c'est-à-dire par l'ancien site d'appel. Le bilan de
+    /// fenêtre s'applique, l'ampli perd une vie par datagramme et disparaît.
+    ///
+    /// Ce test n'entérine pas un défaut : il épingle le CONTRAT de
+    /// `process_responses` — « ce lot est tout ce qui a été entendu, l'absent
+    /// n'a pas répondu ». C'est ce contrat qui rendait `vec![resp]` fautif, et
+    /// c'est lui qui prouve que la garde ci-dessus mordrait sur une régression.
+    #[tokio::test]
+    async fn contre_epreuve_un_seul_datagramme_pris_pour_une_fenetre_perd_les_autres() {
+        const AMPLI: &str = "uuid:129b92ad-826c-4b86-a905-7ea60f4a9e8c";
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, _rx) = mpsc::channel(32);
+        poser_un_appareil_connu(&state, AMPLI).await;
+
+        let addr = spawn_description_server().await;
+        let location = format!("http://{addr}/aios.xml");
+        let voisin = || {
+            announcement(
+                &location,
+                "uuid:9ab0c000-f668-11de-9976-0080-0006787c2e26::urn:schemas-upnp-org:device:MediaRenderer:1",
+            )
+        };
+
+        for _ in 0..MISS_GRACE_CYCLES {
+            process_responses(&state, &tx, vec![voisin()]).await;
+        }
+
+        assert!(
+            !state.lock().await.devices.contains_key(AMPLI),
+            "contre-épreuve muette : si l'ampli SURVIT ici, c'est que le \
+             mécanisme de #3616 n'existe plus et que la garde ci-dessus ne \
+             garde plus rien"
+        );
     }
 
     /// LAT-Z1 : une réponse reçue tôt est enregistrée tout de suite, pendant que
