@@ -1130,26 +1130,24 @@ impl PlaybackOrchestrator {
         }
     }
 
-    /// Ce que `transcoder_en_session` déciderait du relais DSP, sans rien
-    /// décoder : `(traitement actif, relais armé, crossfeed exécutable)`.
+    /// Ce que `transcoder_en_session` verrait du porteur DSP, sans rien
+    /// décoder : `(traitement actif, crossfeed exécutable)`.
     ///
-    /// Les deux valeurs comptent séparément. Une sortie locale avec égaliseur
-    /// a bien un traitement ACTIF — c'est ce qui rendait le cumul possible —
-    /// et ne doit pourtant pas armer le relais, puisqu'elle applique ce même
-    /// traitement elle-même. Un test qui ne regarderait que la seconde ne
-    /// distinguerait pas « la garde tient » de « la zone n'a pas d'EQ ».
+    /// Les deux faits comptent séparément. Le premier dit que le relais sera
+    /// inséré — c'est lui qui donne enfin un chemin au crossfeed sur une zone
+    /// réseau. Le second dit que le crossfeed sera réellement EXÉCUTÉ.
     ///
-    /// Le troisième fait est venu d'une contre-épreuve : poser `channels: 0`
+    /// Ce second fait vient d'une contre-épreuve : poser `channels: 0`
     /// dans `load_streaming_dsp` rend le crossfeed INERTE sur toute zone
-    /// réseau — `process_pcm` sort avant d'écrire un octet — et les trois
-    /// gardes du correctif restaient VERTES, la garde de site comprise, parce
+    /// réseau — `process_pcm` sort avant d'écrire un octet — et les gardes du
+    /// correctif restaient VERTES, la garde de site comprise, parce
     /// qu'aucune ne regardait le porteur réellement construit. Celle-ci le
     /// regarde.
     #[cfg(test)]
     pub(super) async fn relais_dsp_pour_test(
         &self,
         req: &PlayRequest,
-    ) -> Result<(bool, bool, bool), String> {
+    ) -> Result<(bool, bool), String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
         let track = TrackRepo::with_backend(self.db.clone())
             .get(track_id)
@@ -1169,12 +1167,7 @@ impl PlaybackOrchestrator {
         let format = self.decider_le_format_de_sortie(req, &decision);
         let dsp =
             self.load_streaming_dsp(req.zone_id, req.track_id, format.out_sr, decision.channels);
-        let actif = dsp.is_active();
-        Ok((
-            actif,
-            relais_dsp_progressif(actif, decision.is_local_output),
-            dsp.crossfeed_executable(),
-        ))
+        Ok((dsp.is_active(), dsp.crossfeed_executable()))
     }
 
     /// Premier temps du transcodage : le format de sortie. Fréquence plafonnée
@@ -2056,7 +2049,6 @@ impl PlaybackOrchestrator {
     ) -> Result<FluxLocal, String> {
         let DecisionLocale {
             channels,
-            is_local_output,
             ref file_path,
             ..
         } = *decision;
@@ -2088,14 +2080,8 @@ impl PlaybackOrchestrator {
             // façon. Sans traitement actif, le canal reste celui d'avant, à
             // l'octet près. Le premier chunk du décodeur est l'en-tête WAV :
             // il est épargné (`skip_header`), comme sur les autres bras.
-            //
-            // ⚠️ Sauf sur une sortie LOCALE : elle passe TOUJOURS par ici
-            // (`local_needs_wav`) et applique déjà ces mêmes étages dans sa
-            // propre boucle de lecture. Les cumuler doublait la courbe de
-            // l'égaliseur en dB et élevait le facteur ReplayGain au carré —
-            // voir `relais_dsp_progressif`.
             let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
-            let tx = if relais_dsp_progressif(dsp.is_active(), is_local_output) {
+            let tx = if dsp.is_active() {
                 tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
                 spawn_streaming_dsp_relay(dsp, out_bd, true, tx)
             } else {

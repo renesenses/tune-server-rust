@@ -709,10 +709,10 @@ use super::{
     PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, cible_encodable,
     cible_wav_pour_ape_reseau, cible_wav_pour_traitement, is_network_output_type,
     is_pull_dsp_output_type, is_push_uri_output_type, message_session_perdue,
-    passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, relais_dsp_progressif,
-    replay_needs_output_seek, reprise_de_session, reprise_toujours_la_notre,
-    requete_de_retablissement, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
-    streaming_pretranscode_format, use_file_transcode_for,
+    passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, replay_needs_output_seek,
+    reprise_de_session, reprise_toujours_la_notre, requete_de_retablissement,
+    spawn_streaming_dsp_relay, streaming_needs_pretranscode, streaming_pretranscode_format,
+    use_file_transcode_for,
 };
 
 #[test]
@@ -1039,72 +1039,6 @@ fn pcm_stereo_decorrele_16(n: usize) -> Vec<u8> {
     pcm
 }
 
-/// Le relais DSP au fil de l'eau n'est PAS pour une sortie locale — elle
-/// applique déjà les mêmes étages elle-même.
-///
-/// Régression introduite par LAT-F1 (phase 0) : le relais était armé sur le
-/// seul `dsp.is_active()`, sans regarder qui consomme le bras. Retirer
-/// `&& !sortie_est_locale` de `relais_dsp_progressif` fait ROUGIR la
-/// deuxième ligne — c'est la seule raison de faire confiance à ce test.
-#[test]
-fn le_relais_dsp_epargne_la_sortie_locale() {
-    // Réseau, OAAT, navigateur : personne d'autre ne traite, le relais agit.
-    assert!(relais_dsp_progressif(true, false));
-    // LA ligne du défaut : sortie locale à traitement actif, relais MUET.
-    assert!(!relais_dsp_progressif(true, true));
-    // Sans traitement, rien à insérer nulle part : le canal reste nu.
-    assert!(!relais_dsp_progressif(false, false));
-    assert!(!relais_dsp_progressif(false, true));
-}
-
-/// De bout en bout sur la DÉCISION : un casque branché sur la carte son, avec
-/// égaliseur, ne voit pas son traitement appliqué deux fois.
-///
-/// Les deux assertions ne disent pas la même chose et c'est le sujet :
-/// le traitement est bien ACTIF (l'égaliseur de la zone est chargé, donc le
-/// cumul était possible), et le relais n'est pourtant PAS armé.
-///
-/// Rappel de la mécanique : `local_needs_wav` transcode tout format source
-/// connu pour le parseur de `LocalOutput`, donc une sortie locale prend
-/// TOUJOURS le bras en session — celui-là même où la phase 0 a branché le
-/// relais.
-#[tokio::test]
-async fn une_zone_locale_avec_egaliseur_ne_traite_pas_deux_fois() {
-    let orch = test_orchestrator();
-    let zone_id = ZoneRepo::with_backend(orch.db.clone())
-        .create("Casque", Some("local"), Some("local:Realtek HD"))
-        .unwrap();
-    piste_3234(
-        &orch,
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
-        "flac",
-    );
-    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
-        .set(
-            &format!("zone_{zone_id}_eq_profile"),
-            &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
-        )
-        .unwrap();
-    let mut req = requete_locale_3234(zone_id, 1);
-    req.output_device_id = Some("local:Realtek HD".into());
-
-    let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
-    assert!(
-        !format.use_file_transcode,
-        "une sortie locale part en session : c'est le bras où vit le relais"
-    );
-
-    let (actif, relais, _) = orch.relais_dsp_pour_test(&req).await.unwrap();
-    assert!(
-        actif,
-        "l'égaliseur de la zone est bien chargé — sans ça le test ne prouve rien"
-    );
-    assert!(
-        !relais,
-        "le relais doublerait la courbe de l'égaliseur déjà appliquée par LocalOutput"
-    );
-}
-
 /// LAT-F1 (phase 1), de bout en bout sur la DÉCISION : une zone DLNA avec
 /// égaliseur, un FLAC 16 bits, l'opt-in armé — la cible est le WAV servi en
 /// session progressive, non le FLAC ré-encodé par le fichier. Sans opt-in,
@@ -1323,20 +1257,17 @@ async fn une_zone_reseau_dont_le_seul_traitement_est_le_crossfeed() {
         !apres.use_file_transcode,
         "la cible WAV part en session, pas par le fichier"
     );
-    let (actif, relais, crossfeed_executable) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    let (actif, crossfeed_executable) = orch.relais_dsp_pour_test(&req).await.unwrap();
     assert!(
         actif,
-        "le porteur doit voir le crossfeed comme un traitement"
+        "le porteur doit voir le crossfeed comme un traitement — c'est ce qui \
+         arme le relais et donne enfin un chemin au crossfeed"
     );
-    assert!(
-        relais,
-        "et le relais doit être armé : la zone n'est pas locale"
-    );
-    // La ligne qui manquait. Les trois assertions d'au-dessus — et la garde de
+    // La ligne qui manquait. Les assertions d'au-dessus — et la garde de
     // site, qui relit le source — restent VERTES si l'on pose `channels: 0`
     // dans `load_streaming_dsp` : le crossfeed est alors chargé, transporté,
     // appelé… et `process_pcm` sort avant d'écrire un octet. Contre-épreuve
-    // faite : c'est la seule des quatre qui rougit.
+    // faite : c'est la seule qui rougit.
     assert!(
         crossfeed_executable,
         "le porteur transporte un crossfeed mais ne l'exécutera pas : \
