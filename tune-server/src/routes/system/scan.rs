@@ -1323,9 +1323,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // stats across the pool, and SCAN_CANCEL is honoured here too so Stop
         // aborts during this phase, not only during batch processing.
         use rayon::prelude::*;
-        let files_to_scan: Vec<std::path::PathBuf> = files
-            .into_par_iter()
-            .filter(|path| {
+        // `partition` et non `filter` : les fichiers ÉCARTÉS sont gardés, parce
+        // qu'ils PÈSENT. Le verdict « compilation » porte sur le dossier
+        // entier, et la base est le seul témoin de ceux que ce scan ne relira
+        // pas (#3528, `TrackImporter::amorcer_depuis_la_base`).
+        let (files_to_scan, files_ecartes): (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) =
+            files.into_par_iter().partition(|path| {
                 if scan_cancel_requested() {
                     return false;
                 }
@@ -1336,8 +1339,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // Shared with auto_scan so the manual and watcher scans can't
                 // diverge on the NFC key handling (the "scan interminable" bug).
                 file_needs_scan(path, &existing_tracks)
-            })
-            .collect();
+            });
         let pre_skipped = (total_discovered - files_to_scan.len()) as i64;
 
         tracing::info!(
@@ -1419,9 +1421,16 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // `cover.jpg` n'avait alors aucun chemin vers l'écran (#3028). Même
         // arbitrage que le genre d'album plus bas : un scan forcé est une
         // demande explicite de reconstruire depuis les fichiers.
-        let mut importer =
-            crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone())
-                .with_force_artwork(force);
+        let mut importer = crate::scan_import::TrackImporter::new(
+            db.clone(),
+            quality_split,
+            cache_dir.clone(),
+            crate::scan_import::PorteeDuScan {
+                a_scanner: &files_to_scan,
+                ecartes: &files_ecartes,
+            },
+        )
+        .with_force_artwork(force);
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
 

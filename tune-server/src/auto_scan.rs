@@ -396,12 +396,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             .num_threads(tune_core::scanner::walker::scan_io_concurrency())
             .build()
             .ok();
-        let files_to_scan: Vec<std::path::PathBuf> = match &stat_pool {
-            Some(pool) => {
-                pool.install(|| files.into_par_iter().filter(|p| is_changed(p)).collect())
-            }
-            None => files.into_iter().filter(|p| is_changed(p)).collect(),
-        };
+        // `partition` et non `filter` : les fichiers ÉCARTÉS sont gardés, parce
+        // qu'ils PÈSENT sur le verdict « compilation » de leur dossier, dont la
+        // base est le seul témoin quand ce scan ne les relit pas (#3528). Même
+        // geste que le scan manuel, pour les mêmes raisons.
+        let (files_to_scan, files_ecartes): (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) =
+            match &stat_pool {
+                Some(pool) => pool.install(|| files.into_par_iter().partition(|p| is_changed(p))),
+                None => files.into_iter().partition(|p| is_changed(p)),
+            };
         let pre_skipped = total_discovered - files_to_scan.len();
 
         info!(
@@ -434,8 +437,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // scan. Using it here fixes the drift where the auto/startup scan used a
         // simpler resolver and could split a compilation (or an album with
         // per-track soloists) into one album+cover per artist.
-        let mut importer =
-            crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
+        let mut importer = crate::scan_import::TrackImporter::new(
+            db.clone(),
+            quality_split,
+            cache_dir.clone(),
+            crate::scan_import::PorteeDuScan {
+                a_scanner: &files_to_scan,
+                ecartes: &files_ecartes,
+            },
+        );
         let mut inserted = 0u64;
         let mut updated = 0u64;
         // `db_insert_failed` / `db_update_failed` sont désormais agrégés par le
