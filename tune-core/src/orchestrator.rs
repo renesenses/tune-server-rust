@@ -1215,6 +1215,13 @@ mod dsd_passthrough_tests;
 #[cfg(test)]
 mod resolution_annoncee_tests;
 
+/// #2250 — « Lire » et « Lecture aléatoire » annoncent la MÊME résolution pour
+/// la même ligne. La garde voisine (`resolution_annoncee_tests`) éprouve la
+/// règle ; celle-ci éprouve les DEUX FORMES DE DEMANDE que les deux boutons
+/// construisent, en appelant `composer_le_now_playing`.
+#[cfg(test)]
+mod annonce_lire_contre_aleatoire;
+
 #[cfg(test)]
 mod wav_override_tests;
 

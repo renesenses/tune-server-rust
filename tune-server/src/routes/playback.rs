@@ -4578,8 +4578,26 @@ pub async fn shuffle_all(
         duration_ms: track.as_ref().map(|t| t.duration_ms),
         seek_ms: None,
         temp_file_path: None,
+        // `None` DELIBERE, et non un oubli — #2250 demandait de les renseigner
+        // depuis `track` « comme les autres champs ». Ce serait un no-op :
+        //
+        // 1. leur unique consommateur est la branche « serveur media / podcast »
+        //    de `resolve_direct.rs` (les attributs `res@` du DIDL que le client
+        //    recopie), atteinte seulement quand `req.source` vaut autre chose
+        //    que `local` — ce que cette demande ne fait jamais (`source: None`) ;
+        // 2. la resolution ANNONCEE d'une piste locale est relue de la ligne
+        //    `tracks` par `composer_le_now_playing`, a partir du seul
+        //    `track_id` ci-dessus ;
+        // 3. le bouton « Lire » ne les transmet pas davantage : il passe
+        //    `body.sample_rate` / `body.bit_depth`, et un client qui demarre une
+        //    piste de la bibliotheque n'envoie ni l'un ni l'autre.
+        //
+        // Garde qui l'etablit en APPELANT les deux chemins sur la meme ligne :
+        // `tune-core/src/orchestrator/annonce_lire_contre_aleatoire.rs`.
         sample_rate: None,
         bit_depth: None,
+        // Meme raison : `composer_le_now_playing` les reprend de la ligne
+        // (`media_track_number` / `media_disc_number`) quand la demande se tait.
         media_format: None,
         track_number: None,
         disc_number: None,

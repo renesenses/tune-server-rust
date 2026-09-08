@@ -544,8 +544,39 @@ impl PositionPoller {
                         None => continue,
                     }
                 };
+                // On ne prend le verrou de la sortie QUE s'il est libre, et on
+                // passe le tour de la zone entière s'il ne l'est pas.
+                //
+                // `orchestrator/transport.rs:1414` tient ce verrou pendant TOUT
+                // `play_media` — jusqu'à ~32 s pour un ampli DLNA qui sort de
+                // veille réseau (`BUDGET_REVEIL_STANDBY`, `outputs/dlna.rs:2142`)
+                // — et la boucle `for zone_state in &states` (:321) est
+                // SÉQUENTIELLE : toutes les zones placées derrière celle-là
+                // cessaient d'être sondées. Mesuré : une tenue de 30 s gèle le
+                // tick 30 001 ms, et l'ordre de `all_states()` est celui d'un
+                // HashMap — il n'y a pas de zone protégée.
+                //
+                // `continue` et non « boîte vide » : quinze lignes plus bas,
+                // `get_status_with_signal_path_bounded` reprend LE MÊME verrou.
+                // Ne borner que ce bloc-ci laissait 5 s de gel
+                // (`STATUS_POLL_TIMEOUT`, `poller.rs:34-46` — MESURÉ 5 002 ms),
+                // et transformait l'attente en ÉCHEC de sondage : cinq
+                // expirations d'affilée, `backoff_remaining` à 16 tours, donc
+                // une zone plus sondée pendant ~16 s APRÈS le réveil.
+                //
+                // Passer le tour est sans risque : le seul teneur durable de ce
+                // verrou est une commande de l'orchestrateur en cours sur CETTE
+                // zone (play, pause, seek, stop). Le tick suivant, une seconde
+                // plus tard, la reprendra — et sa boîte aux lettres avec.
                 let failure = {
-                    let output = output_arc.lock().await;
+                    let Ok(output) = output_arc.try_lock() else {
+                        debug!(
+                            zone_id,
+                            device = %device_id,
+                            "zone_ignoree_sortie_occupee_par_l_orchestrateur"
+                        );
+                        continue;
+                    };
                     output.take_output_failure()
                 };
                 if let Some(msg) = failure {

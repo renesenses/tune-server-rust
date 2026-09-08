@@ -65,6 +65,8 @@ mod explorateur_dossiers;
 mod extraction_cd_ne_promet_pas_ce_qu_elle_ne_fait_pas;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
+#[path = "famine_mesuree_3205.rs"]
+mod famine_mesuree_3205;
 #[path = "favoris_cloisonnement_par_profil.rs"]
 mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]

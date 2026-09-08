@@ -709,10 +709,10 @@ use super::{
     PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, cible_encodable,
     cible_wav_pour_ape_reseau, cible_wav_pour_traitement, is_network_output_type,
     is_pull_dsp_output_type, is_push_uri_output_type, message_session_perdue,
-    passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, replay_needs_output_seek,
-    reprise_de_session, reprise_toujours_la_notre, requete_de_retablissement,
-    spawn_streaming_dsp_relay, streaming_needs_pretranscode, streaming_pretranscode_format,
-    use_file_transcode_for,
+    passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, relais_dsp_progressif,
+    replay_needs_output_seek, reprise_de_session, reprise_toujours_la_notre,
+    requete_de_retablissement, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
+    streaming_pretranscode_format, traitement_cuit_dans_le_fichier, use_file_transcode_for,
 };
 
 #[test]
@@ -1039,6 +1039,139 @@ fn pcm_stereo_decorrele_16(n: usize) -> Vec<u8> {
     pcm
 }
 
+/// Le relais DSP au fil de l'eau n'est PAS pour une sortie locale — elle
+/// applique déjà les mêmes étages elle-même.
+///
+/// Régression introduite par LAT-F1 (phase 0) : le relais était armé sur le
+/// seul `dsp.is_active()`, sans regarder qui consomme le bras. Retirer
+/// `&& !sortie_est_locale` de `relais_dsp_progressif` fait ROUGIR la
+/// deuxième ligne — c'est la seule raison de faire confiance à ce test.
+#[test]
+fn le_relais_dsp_epargne_la_sortie_locale() {
+    // Réseau, OAAT, navigateur : personne d'autre ne traite, le relais agit.
+    assert!(relais_dsp_progressif(true, false));
+    // LA ligne du défaut : sortie locale à traitement actif, relais MUET.
+    assert!(!relais_dsp_progressif(true, true));
+    // Sans traitement, rien à insérer nulle part : le canal reste nu.
+    assert!(!relais_dsp_progressif(false, false));
+    assert!(!relais_dsp_progressif(false, true));
+}
+
+/// La MÊME règle sur le bras FICHIER : une sortie locale ne fait pas cuire son
+/// traitement dans le fichier pré-transcodé.
+///
+/// Le ReplayGain portait déjà cette garde depuis LAT-F2, l'égaliseur et le
+/// convolveur non. L'asymétrie est fermée ; ce témoin la nomme.
+#[test]
+fn le_transcodage_fichier_epargne_la_sortie_locale() {
+    assert!(traitement_cuit_dans_le_fichier(false));
+    assert!(!traitement_cuit_dans_le_fichier(true));
+}
+
+/// Niveau efficace d'un PCM stéréo 16 bits, en dBFS.
+fn rms_dbfs_16(pcm: &[u8], depuis: usize) -> f64 {
+    let ech: Vec<f64> = pcm
+        .chunks_exact(2)
+        .skip(depuis * 2)
+        .map(|o| i16::from_le_bytes([o[0], o[1]]) as f64 / 32768.0)
+        .collect();
+    let carre: f64 = ech.iter().map(|v| v * v).sum::<f64>() / ech.len() as f64;
+    20.0 * carre.sqrt().log10()
+}
+
+/// LA MESURE de la régression .139/.140 : ce que coûtait exactement le cumul.
+///
+/// Le défaut n'était pas une hypothèse. Sur une sortie locale, le relais du
+/// bras progressif traitait le flux, puis `LocalOutput` réappliquait les MÊMES
+/// étages dans sa boucle de lecture. Ce témoin rejoue les deux chemins — deux
+/// porteurs distincts, comme les deux chemins de production — et mesure
+/// l'écart en dB.
+///
+/// Ce que ça donne, sinus 80 Hz stéréo 16 bits, les 512 premiers échantillons
+/// écartés pour laisser les biquads s'établir :
+///
+/// | étage | une passe | deux passes | écart |
+/// |---|---|---|---|
+/// | égaliseur (grave +6 dB, pré-gain automatique) | −3,00 dB | −5,99 dB | **doublé en dB** |
+/// | ReplayGain (facteur 0,5) | −6,02 dB | −12,04 dB | **gain au carré** |
+///
+/// Le témoin n'assène pas ces valeurs : il vérifie la RELATION — deux passes
+/// valent exactement deux fois une passe, en dB. C'est la signature d'un
+/// traitement appliqué deux fois, et elle ne dépend ni du réglage choisi ni
+/// des coefficients.
+///
+/// Ce témoin ne garde pas le correctif — c'est `le_relais_dsp_epargne_la_sortie_locale`
+/// qui le garde. Il garde la MESURE : si un jour le cumul cessait de doubler
+/// les dB, la description du défaut dans `relais_dsp_progressif` serait
+/// devenue fausse et personne ne le saurait.
+#[test]
+fn le_cumul_double_les_decibels_et_eleve_le_gain_au_carre() {
+    // 4096 échantillons : assez pour que la moyenne quadratique soit stable
+    // après les 512 écartés.
+    let source = pcm_sinus_16(4096);
+    let reference = rms_dbfs_16(&source, 512);
+
+    // ── Égaliseur ────────────────────────────────────────────────────
+    let mut une = StreamingDsp {
+        eq: Some(eq_grave_boostee()),
+        ..Default::default()
+    };
+    let mut pcm_une = source.clone();
+    une.process(&mut pcm_une, 16);
+    let eq_une = rms_dbfs_16(&pcm_une, 512) - reference;
+
+    // Deuxième passe sur un porteur NEUF : c'est bien deux chaînes
+    // indépendantes qui se cumulaient, pas un seul filtre appliqué deux fois
+    // avec son état.
+    let mut deux = StreamingDsp {
+        eq: Some(eq_grave_boostee()),
+        ..Default::default()
+    };
+    let mut pcm_deux = pcm_une.clone();
+    deux.process(&mut pcm_deux, 16);
+    let eq_deux = rms_dbfs_16(&pcm_deux, 512) - reference;
+
+    assert!(
+        eq_une.abs() > 1.0,
+        "l'égaliseur doit changer le niveau, sinon la mesure ne prouve rien : {eq_une:.2} dB"
+    );
+    assert!(
+        (eq_deux - 2.0 * eq_une).abs() < 0.15,
+        "deux passes d'égaliseur doivent DOUBLER l'écart en dB : \
+         une passe {eq_une:.2} dB, deux passes {eq_deux:.2} dB, \
+         attendu ≈ {:.2} dB",
+        2.0 * eq_une
+    );
+
+    // ── ReplayGain ───────────────────────────────────────────────────
+    let mut une = StreamingDsp {
+        replaygain: Some(0.5),
+        ..Default::default()
+    };
+    let mut pcm_une = source.clone();
+    une.process(&mut pcm_une, 16);
+    let rg_une = rms_dbfs_16(&pcm_une, 512) - reference;
+
+    let mut deux = StreamingDsp {
+        replaygain: Some(0.5),
+        ..Default::default()
+    };
+    let mut pcm_deux = pcm_une.clone();
+    deux.process(&mut pcm_deux, 16);
+    let rg_deux = rms_dbfs_16(&pcm_deux, 512) - reference;
+
+    // −6,02 dB : c'est 20·log10(0,5), la valeur exacte du facteur.
+    assert!(
+        (rg_une + 6.02).abs() < 0.1,
+        "un facteur 0,5 vaut −6,02 dB, mesuré {rg_une:.2} dB"
+    );
+    assert!(
+        (rg_deux + 12.04).abs() < 0.1,
+        "deux passes élèvent le facteur AU CARRÉ (0,5 → 0,25), soit −12,04 dB, \
+         mesuré {rg_deux:.2} dB"
+    );
+}
+
 /// LAT-F1 (phase 1), de bout en bout sur la DÉCISION : une zone DLNA avec
 /// égaliseur, un FLAC 16 bits, l'opt-in armé — la cible est le WAV servi en
 /// session progressive, non le FLAC ré-encodé par le fichier. Sans opt-in,
@@ -1199,6 +1332,55 @@ async fn un_ape_sur_une_zone_reseau_part_en_wav_progressif() {
     );
 }
 
+/// De bout en bout sur la DÉCISION : un casque branché sur la carte son, avec
+/// égaliseur, ne voit pas son traitement appliqué deux fois.
+///
+/// Les deux assertions ne disent pas la même chose et c'est le sujet :
+/// le traitement est bien ACTIF (l'égaliseur de la zone est chargé, donc le
+/// cumul était possible), et le relais n'est pourtant PAS armé.
+///
+/// Rappel de la mécanique : `local_needs_wav` transcode tout format source
+/// connu pour le parseur de `LocalOutput`, donc une sortie locale prend
+/// TOUJOURS le bras en session — celui-là même où la phase 0 a branché le
+/// relais. La première assertion le prouve, et elle prouve du même coup que
+/// le bras FICHIER reste hors d'atteinte pour cette zone.
+#[tokio::test]
+async fn une_zone_locale_avec_egaliseur_ne_traite_pas_deux_fois() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Casque", Some("local"), Some("local:Realtek HD"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &format!("zone_{zone_id}_eq_profile"),
+            &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+        )
+        .unwrap();
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.output_device_id = Some("local:Realtek HD".into());
+
+    let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert!(
+        !format.use_file_transcode,
+        "une sortie locale part en session : c'est le bras où vit le relais"
+    );
+
+    let (actif, relais, _) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif,
+        "l'égaliseur de la zone est bien chargé — sans ça le test ne prouve rien"
+    );
+    assert!(
+        !relais,
+        "le relais doublerait la courbe de l'égaliseur déjà appliquée par LocalOutput"
+    );
+}
+
 /// #2742 + LAT-F1, de bout en bout sur la DÉCISION : une zone DLNA dont le
 /// SEUL traitement est un crossfeed part en WAV progressif quand l'opt-in est
 /// armé — et reste EXACTEMENT comme avant quand il ne l'est pas.
@@ -1257,17 +1439,20 @@ async fn une_zone_reseau_dont_le_seul_traitement_est_le_crossfeed() {
         !apres.use_file_transcode,
         "la cible WAV part en session, pas par le fichier"
     );
-    let (actif, crossfeed_executable) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    let (actif, relais, crossfeed_executable) = orch.relais_dsp_pour_test(&req).await.unwrap();
     assert!(
         actif,
-        "le porteur doit voir le crossfeed comme un traitement — c'est ce qui \
-         arme le relais et donne enfin un chemin au crossfeed"
+        "le porteur doit voir le crossfeed comme un traitement"
     );
-    // La ligne qui manquait. Les assertions d'au-dessus — et la garde de
+    assert!(
+        relais,
+        "et le relais doit être armé : la zone n'est pas locale"
+    );
+    // La ligne qui manquait. Les trois assertions d'au-dessus — et la garde de
     // site, qui relit le source — restent VERTES si l'on pose `channels: 0`
     // dans `load_streaming_dsp` : le crossfeed est alors chargé, transporté,
     // appelé… et `process_pcm` sort avant d'écrire un octet. Contre-épreuve
-    // faite : c'est la seule qui rougit.
+    // faite : c'est la seule des quatre qui rougit.
     assert!(
         crossfeed_executable,
         "le porteur transporte un crossfeed mais ne l'exécutera pas : \

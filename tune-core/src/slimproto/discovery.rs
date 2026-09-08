@@ -125,10 +125,12 @@ async fn adresse_face_a(correspondant: std::net::SocketAddr) -> Option<String> {
 /// Arme le répondeur de découverte. Tourne pour toujours.
 pub fn spawn(identite: IdentiteServeur) {
     tokio::spawn(async move {
-        let port: u16 = std::env::var("TUNE_SLIMPROTO_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(super::DEFAULT_PORT);
+        // La MEME resolution que le serveur TCP (`SlimProtoServer::resolve_port`).
+        // Une seconde lecture de la variable, ecrite a la main ici, laisserait le
+        // repondeur UDP et le serveur TCP diverger a la premiere retouche : la
+        // platine trouverait Tune par diffusion sur un port et ne pourrait pas
+        // s'y connecter sur l'autre.
+        let port: u16 = super::port_slimproto();
         let socket = match UdpSocket::bind(("0.0.0.0", port)).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
