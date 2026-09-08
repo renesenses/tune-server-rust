@@ -13,9 +13,9 @@ enum ResoluOuFini {
 
 /// Ce que la demande impose par-dessus le flux résolu : pochette et album
 /// demandés, sinon ceux du flux. Relevés une fois, lus par trois temps.
-struct Habillage {
-    album: Option<String>,
-    cover_path: Option<String>,
+pub(super) struct Habillage {
+    pub(super) album: Option<String>,
+    pub(super) cover_path: Option<String>,
 }
 
 impl PlaybackOrchestrator {
@@ -598,7 +598,7 @@ impl PlaybackOrchestrator {
     /// Troisième temps : le `NowPlaying` annoncé aux clients, la ligne de
     /// bibliothèque prenant le pas sur le flux pour le format et la
     /// résolution (`resolution_annoncee`).
-    fn composer_le_now_playing(
+    pub(super) fn composer_le_now_playing(
         &self,
         req: &PlayRequest,
         resolved: &ResolvedStream,
