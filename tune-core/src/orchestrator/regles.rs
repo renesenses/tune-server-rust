@@ -323,6 +323,51 @@ pub(super) fn cible_wav_pour_traitement(
     dsp_active && is_network && !src_est_dsd && opt_in && renderer_accepte_lpcm
 }
 
+/// Le relais DSP au fil de l'eau doit-il être inséré sur le bras progressif ?
+///
+/// LAT-F1 (phase 0) a branché égaliseur, convolveur et ReplayGain sur ce bras
+/// sans regarder QUI le consomme. Or une sortie LOCALE y passe toujours —
+/// `local_needs_wav` transcode en WAV tout format source connu, parce que le
+/// parseur de `LocalOutput` ne lit que du PCM simple — et `LocalOutput`
+/// applique DÉJÀ ces trois étages dans sa boucle de lecture (`set_eq`,
+/// `set_replaygain_factor`, son propre convolveur, réinstallés à chaque
+/// lecture par le chemin de `transport.rs`).
+///
+/// Les deux chemins se cumulaient donc, et le cumul est MESURÉ
+/// (`le_cumul_double_les_decibels_et_eleve_le_gain_au_carre`) : courbe
+/// d'égaliseur **doublée en dB**, facteur ReplayGain **au carré**, réponse
+/// impulsionnelle convoluée deux fois. Régression livrée en v0.9.139 et
+/// v0.9.140, audible sur toute la population de #1416.
+///
+/// Le relais n'a de sens que pour les sorties qui ne traitent RIEN
+/// elles-mêmes : réseau, OAAT, navigateur. Une sortie `local:` s'en passe.
+pub(super) fn relais_dsp_progressif(dsp_actif: bool, sortie_est_locale: bool) -> bool {
+    dsp_actif && !sortie_est_locale
+}
+
+/// Le bras FICHIER doit-il cuire le traitement de zone dans le fichier ?
+///
+/// Même défaut que [`relais_dsp_progressif`], sur l'autre bras, et la même
+/// réponse : une sortie LOCALE applique déjà égaliseur, convolveur et
+/// ReplayGain elle-même. Les cuire aussi dans le fichier pré-transcodé les
+/// appliquerait deux fois.
+///
+/// Le ReplayGain portait cette garde depuis LAT-F2 — « A -6 dB track played
+/// at -12 dB, quietly » — mais il la portait SEUL : `load_eq_processor` et
+/// `load_convolver` étaient appelés sans condition juste au-dessus de lui.
+/// L'asymétrie n'avait pas de raison d'être.
+///
+/// Ce bras est aujourd'hui INATTEIGNABLE pour une sortie locale, et c'est
+/// gardé : `use_file_transcode_for` y reçoit `dsp_active = (navigateur ||
+/// réseau) && eq_forces_transcode`, faux pour elle, et
+/// `une_zone_locale_avec_egaliseur_ne_traite_pas_deux_fois` le vérifie de
+/// bout en bout. La garde est donc une ceinture, pas la correction d'un
+/// symptôme observé : elle ferme la porte par laquelle le doublement
+/// reviendrait le jour où quelqu'un relâche ce prédicat.
+pub(super) fn traitement_cuit_dans_le_fichier(sortie_est_locale: bool) -> bool {
+    !sortie_est_locale
+}
+
 /// La cible d'un TRANSCODAGE doit être un format que l'encodeur sait produire.
 ///
 /// `AudioFormat::dlna_transcode_target` rend « AIFF » pour une source AIFF,
