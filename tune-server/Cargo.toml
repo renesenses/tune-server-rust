@@ -304,6 +304,16 @@ path = "tests/refus_telemetrie_honore_3383.rs"
 name = "dispositions_de_canaux_3322"
 path = "tests/dispositions_de_canaux_3322.rs"
 
+# #3462 — la garde qui verifie qu'un SlimProto mort au demarrage apparait dans
+# la grille de composants de `/system/health`, celle que trois ecrans affichent
+# deja. Fichier a part : `etat_ecoute()` est un etat GLOBAL au processus, le
+# poser depuis un test contaminerait tous les autres tests du meme binaire.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+[[test]]
+name = "sante_slimproto_i3462"
+path = "tests/sante_slimproto_i3462.rs"
+
 # #3518 : « # Plays » et « Last Played », deux colonnes de la maquette V1 que
 # AUCUNE route de liste de pistes ne portait. La garde passe par le ROUTEUR
 # MONTE : un essai qui appellerait `plays_for_tracks` en direct resterait vert
