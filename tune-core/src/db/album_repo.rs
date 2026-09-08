@@ -174,6 +174,16 @@ pub mod sql {
             d.placeholder(2)
         )
     }
+    /// Artiste d'album ET titre d'un seul geste — voir
+    /// [`AlbumRepo::reclasser_en_compilation`] (#3232).
+    pub fn set_artist_and_title<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET artist_id = {}, title = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
 
     /// Albums qui portent la signature étroite du collage #2458.
     ///
@@ -493,6 +503,35 @@ impl DrRange {
             return None;
         }
         Some(Self { min, max })
+    }
+}
+
+/// Le Dynamic Range d'un album, et **d'où il sort** (#1388).
+///
+/// La valeur seule ne suffit pas à l'écran : un album tagué `ALBUM DYNAMIC
+/// RANGE=12` et un album dont les dix pistes moyennent 12 donnent le même
+/// nombre, et ne se disent pas de la même façon. Le premier est une mesure
+/// écrite par un mesureur, le second une déduction de Tune.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicRangeAlbum {
+    /// Le DR, en entier. `0` est une VALEUR — celle d'un master saturé — et
+    /// non une absence : l'absence, c'est le `None` qui enveloppe cette
+    /// structure.
+    pub valeur: i64,
+    /// `true` quand au moins une piste porte le tag d'album `ALBUM DYNAMIC
+    /// RANGE` ; `false` quand la valeur est la moyenne arrondie des tags
+    /// `DYNAMIC RANGE` des pistes.
+    pub depuis_le_tag_album: bool,
+}
+
+impl DynamicRangeAlbum {
+    /// L'étiquette stable que porte la réponse HTTP, à traduire côté client.
+    pub fn source(&self) -> &'static str {
+        if self.depuis_le_tag_album {
+            "album_tag"
+        } else {
+            "track_average"
+        }
     }
 }
 
@@ -1368,6 +1407,33 @@ impl AlbumRepo {
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// Reprend une ligne album créée sous une décision « compilation »
+    /// PARTIELLE : artiste d'album, titre, drapeau.
+    ///
+    /// 🔴 #3232 — un dossier plus gros qu'un lot de scan ne tient pas dans un
+    /// lot (le lot porte les pochettes embarquées) : il est coupé, et le
+    /// premier morceau crée la ligne album avant que le scan ait vu le reste
+    /// du dossier. Sur l'anthologie de Pierre M, le premier morceau ne montre
+    /// qu'un artiste — l'album naît sous son nom, sans drapeau — et c'est le
+    /// second qui révèle la compilation. La décision porte sur le DOSSIER : la
+    /// ligne est donc reprise, au lieu de rester ce que le hasard du découpage
+    /// en avait fait.
+    ///
+    /// Écriture ciblée, et non un `update` complet : la ligne a pu recevoir
+    /// entre-temps sa pochette et ses dates, qu'un `UPDATE` de toutes les
+    /// colonnes depuis une copie en cache effacerait.
+    pub fn reclasser_en_compilation(
+        &self,
+        album_id: i64,
+        artist_id: i64,
+        titre: &str,
+    ) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::set_artist_and_title, sql::set_artist_and_title);
+        let params: [&dyn ToSqlValue; 3] = [&artist_id, &titre, &album_id];
+        self.db.execute(&sql, &params)?;
+        self.mark_compilation(album_id)
     }
 
     /// Like `get_by_title_and_artist` but uses `query_one_strong` to
@@ -2608,37 +2674,66 @@ impl AlbumRepo {
 
     /// Bio provenance (source, url, license, lang, fetched_at) for the
     /// album-detail endpoint. Returns None when no sourced bio is recorded.
-    /// The album's Dynamic Range, as tagged by an external analyser.
+    /// The album's Dynamic Range, and WHERE it comes from (#1388).
     ///
-    /// The value is written per track by the scanner (`track_metadata['dr_album']`,
-    /// read from the Vorbis `ALBUM DYNAMIC RANGE` field) because that is where
-    /// the tag physically lives — in each file — while it describes the album as
-    /// a whole. Any one track therefore answers for the album, hence `LIMIT 1`.
+    /// `None` when the album has no DR at all — the common case, tagging DR
+    /// being a deliberate step most libraries never take. The caller must
+    /// render nothing at all rather than an empty field, and above all not a
+    /// zero: DR0 is the real measurement of a crushed master.
     ///
-    /// Returns `None` when no track carries the tag, which is the common case:
-    /// tagging DR is a deliberate step most libraries never take. The caller
-    /// must render nothing at all rather than an empty field.
-    pub fn dynamic_range(&self, id: i64) -> Result<Option<String>, TuneError> {
-        let sql = match self.db.engine() {
-            Engine::Sqlite => {
-                "SELECT tm.value FROM track_metadata tm \
-                 JOIN tracks t ON t.id = tm.track_id \
-                 WHERE t.album_id = ? AND tm.key = 'dr_album' AND tm.value <> '' \
-                 LIMIT 1"
-            }
-            Engine::Postgres => {
-                "SELECT tm.value FROM track_metadata tm \
-                 JOIN tracks t ON t.id = tm.track_id \
-                 WHERE t.album_id = $1 AND tm.key = 'dr_album' AND tm.value <> '' \
-                 LIMIT 1"
-            }
+    /// ## Une seule règle, celle qui a des consommateurs
+    ///
+    /// Cette lecture passe désormais par [`facet_filter::DR_ALBUM_VALUE`],
+    /// exactement l'expression du tri, de la tranche et du rail de facettes
+    /// (#2144). Elle prenait auparavant `tm.value` d'une piste au hasard
+    /// (`LIMIT 1`, sans `ORDER BY`) et sans la garde « rien que des chiffres ».
+    /// Deux écarts s'en suivaient, mesurables tous les deux :
+    ///
+    /// - un album ré-tagué à moitié affichait le DR d'une piste tirée au sort
+    ///   par le plan d'exécution, quand le tri, lui, en retenait le maximum ;
+    /// - un album tagué `ALBUM DYNAMIC RANGE=14 dB` (valeur non numérique, que
+    ///   `normalise_dr` laisse telle quelle) affichait « DR 14 dB » sur sa
+    ///   fiche alors qu'il restait invisible au tri comme à la facette.
+    ///
+    /// Le second cas perd donc son badge. C'est voulu : trois consommateurs
+    /// contre un, et un badge que la facette ignore est un badge qui ment.
+    pub fn dynamic_range_detail(&self, id: i64) -> Result<Option<DynamicRangeAlbum>, TuneError> {
+        let engine = self.db.engine();
+        let marqueur = match engine {
+            Engine::Sqlite => "?",
+            Engine::Postgres => "$1",
         };
+        let sql = format!(
+            "SELECT {}, {} FROM track_metadata tm \
+             JOIN tracks tdr ON tdr.id = tm.track_id \
+             WHERE tdr.album_id = {marqueur} AND {} \
+             GROUP BY tdr.album_id",
+            crate::db::facet_filter::DR_ALBUM_VALUE,
+            crate::db::facet_filter::DR_ALBUM_FROM_TAG,
+            crate::db::facet_filter::dr_tag_where(engine),
+        );
         let params: [&dyn ToSqlValue; 1] = [&id];
+        let Some(cols) = self.db.query_one(&sql, &params)? else {
+            return Ok(None);
+        };
+        // `COALESCE` rend NULL quand le groupe n'a QUE des lignes écartées —
+        // impossible avec le `WHERE` ci-dessus, mais un `unwrap` ici tuerait la
+        // fiche entière pour un DR manquant.
+        let Some(valeur) = cols.first().and_then(|v| v.as_i64()) else {
+            return Ok(None);
+        };
+        Ok(Some(DynamicRangeAlbum {
+            valeur,
+            depuis_le_tag_album: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0) == 1,
+        }))
+    }
+
+    /// Le DR de l'album, en texte, pour la fiche. Voir
+    /// [`Self::dynamic_range_detail`] pour la règle et sa provenance.
+    pub fn dynamic_range(&self, id: i64) -> Result<Option<String>, TuneError> {
         Ok(self
-            .db
-            .query_one(sql, &params)?
-            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
-            .filter(|s| !s.trim().is_empty()))
+            .dynamic_range_detail(id)?
+            .map(|dr| dr.valeur.to_string()))
     }
 
     pub fn bio_provenance(&self, id: i64) -> Result<Option<serde_json::Value>, TuneError> {
@@ -4229,6 +4324,205 @@ mod tests {
         // DR0 is a real measurement on a crushed master, not an absence.
         mrepo.set(id1, "dr_album", "0").unwrap();
         assert_eq!(arepo.dynamic_range(album_id).unwrap().as_deref(), Some("0"));
+        assert!(
+            arepo
+                .dynamic_range_detail(album_id)
+                .unwrap()
+                .unwrap()
+                .depuis_le_tag_album,
+            "un DR0 tagué reste une MESURE, pas une déduction"
+        );
+    }
+
+    /// La valeur d'ALBUM quand seules les pistes sont taguées (#1388).
+    ///
+    /// foobar2000 écrit `DYNAMIC RANGE` par piste et rien pour l'album. La
+    /// fiche restait alors muette alors que chaque piste affichait son DR : le
+    /// titre de l'issue demande les deux. La valeur d'album est la moyenne
+    /// arrondie des pistes, et elle se DIT comme une déduction.
+    #[test]
+    fn le_dr_dalbum_se_deduit_de_la_moyenne_des_pistes_quand_le_tag_dalbum_manque() {
+        use crate::db::models::Track;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use crate::db::track_repo::TrackRepo;
+
+        let db = db_avec_track_metadata();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+        let mrepo = TrackMetadataRepo::new(db.clone());
+
+        let album_id = arepo.create(&Album::new("Spirit of Eden".into())).unwrap();
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let mut t = Track::new(format!("piste {n}"));
+            t.album_id = Some(album_id);
+            t.file_path = Some(format!("/m/soe-{n}.flac"));
+            ids.push(trepo.create(&t).unwrap());
+        }
+
+        // Aucun tag : rien. C'est le cas courant, et il ne bouge pas.
+        assert_eq!(arepo.dynamic_range_detail(album_id).unwrap(), None);
+
+        // 12, 13, 13 → moyenne 12,67 → DR13, annoncée comme une déduction.
+        mrepo.set(ids[0], "dr_track", "12").unwrap();
+        mrepo.set(ids[1], "dr_track", "13").unwrap();
+        mrepo.set(ids[2], "dr_track", "13").unwrap();
+        let dr = arepo.dynamic_range_detail(album_id).unwrap().unwrap();
+        assert_eq!(dr.valeur, 13);
+        assert!(!dr.depuis_le_tag_album);
+        assert_eq!(dr.source(), "track_average");
+        assert_eq!(
+            arepo.dynamic_range(album_id).unwrap().as_deref(),
+            Some("13")
+        );
+
+        // Contre-épreuve : dès qu'UNE piste porte le tag d'ALBUM, c'est lui qui
+        // gagne — même plus bas que la moyenne. C'est la valeur écrite par le
+        // mesureur, pas une valeur que Tune recalcule.
+        mrepo.set(ids[2], "dr_album", "9").unwrap();
+        let dr = arepo.dynamic_range_detail(album_id).unwrap().unwrap();
+        assert_eq!(dr.valeur, 9);
+        assert!(dr.depuis_le_tag_album);
+        assert_eq!(dr.source(), "album_tag");
+    }
+
+    /// Un DR déduit des pistes est aussi TRIABLE et FILTRABLE (#1388/#2144).
+    ///
+    /// La fiche et la grille doivent tomber d'accord : afficher « DR13 » sur un
+    /// album que la facette DR ne connaît pas serait un badge qui ment. Le
+    /// témoin appelle les DEUX chemins sur le même album.
+    #[test]
+    fn un_dr_deduit_des_pistes_est_aussi_visible_du_tri_et_de_la_tranche() {
+        use crate::db::models::Track;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use crate::db::track_repo::TrackRepo;
+
+        let db = db_avec_track_metadata();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+        let mrepo = TrackMetadataRepo::new(db.clone());
+
+        let album_id = arepo.create(&Album::new("Laughing Stock".into())).unwrap();
+        let mut t = Track::new("Ascension Day".into());
+        t.album_id = Some(album_id);
+        t.file_path = Some("/m/ls-1.flac".into());
+        let tid = trepo.create(&t).unwrap();
+        // Un album témoin SANS aucun tag : il ne doit jamais entrer dans une
+        // tranche, avant comme après.
+        album_avec_dr(&db, "Sans DR", None);
+
+        let tranche = |min, max| {
+            arepo
+                .list_filtered(
+                    100,
+                    0,
+                    "dynamic_range",
+                    "desc",
+                    None,
+                    None,
+                    None,
+                    true,
+                    DrRange::new(min, max),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|a| a.title)
+                .collect::<Vec<_>>()
+        };
+
+        // Sans aucun tag, l'album n'est ni dans la tranche ni dans les valeurs.
+        assert!(tranche(Some(13), Some(13)).is_empty());
+        assert!(arepo.dynamic_range_values().unwrap().is_empty());
+
+        mrepo.set(tid, "dr_track", "13").unwrap();
+        assert_eq!(
+            arepo
+                .dynamic_range_detail(album_id)
+                .unwrap()
+                .unwrap()
+                .valeur,
+            13
+        );
+        assert_eq!(tranche(Some(13), Some(13)), vec!["Laughing Stock"]);
+        assert_eq!(arepo.dynamic_range_values().unwrap(), vec![13]);
+        // Et l'album jamais tagué reste dehors, même d'une tranche assez large
+        // pour contenir tous les DR possibles : une tranche est RESTRICTIVE.
+        // (`DrRange::new(None, None)` ne serait PAS une tranche large mais
+        // l'ABSENCE de filtre — piège n°1 de `facet_filter`.)
+        assert_eq!(tranche(Some(0), Some(30)), vec!["Laughing Stock"]);
+    }
+
+    /// Un album ré-tagué à moitié : la fiche et le tri retiennent le MÊME
+    /// nombre.
+    ///
+    /// La fiche lisait `tm.value` d'une piste au hasard (`LIMIT 1`, sans
+    /// `ORDER BY`) là où le tri retenait le maximum. Sur un album dont deux
+    /// pistes portent 10 et 14, la fiche pouvait afficher 10 pendant que la
+    /// tranche `[14, 14]` le rendait. Le témoin appelle les deux.
+    #[test]
+    fn la_fiche_et_la_tranche_saccordent_sur_un_album_retague_a_moitie() {
+        use crate::db::models::Track;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use crate::db::track_repo::TrackRepo;
+
+        let db = db_avec_track_metadata();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+        let mrepo = TrackMetadataRepo::new(db.clone());
+
+        let album_id = arepo.create(&Album::new("Kid A".into())).unwrap();
+        for (n, valeur) in ["10", "14"].iter().enumerate() {
+            let mut t = Track::new(format!("piste {n}"));
+            t.album_id = Some(album_id);
+            t.file_path = Some(format!("/m/ka-{n}.flac"));
+            let tid = trepo.create(&t).unwrap();
+            mrepo.set(tid, "dr_album", valeur).unwrap();
+        }
+
+        let fiche = arepo.dynamic_range_detail(album_id).unwrap().unwrap();
+        assert_eq!(fiche.valeur, 14);
+        let dans_la_tranche = |min, max| {
+            !arepo
+                .list_filtered(
+                    100,
+                    0,
+                    "dynamic_range",
+                    "desc",
+                    None,
+                    None,
+                    None,
+                    true,
+                    DrRange::new(min, max),
+                )
+                .unwrap()
+                .is_empty()
+        };
+        assert!(dans_la_tranche(Some(fiche.valeur), Some(fiche.valeur)));
+        // Contre-épreuve : la valeur que la fiche NE retient PAS ne classe pas
+        // non plus l'album.
+        assert!(!dans_la_tranche(Some(10), Some(10)));
+    }
+
+    /// Un tag non numérique n'est affiché nulle part — parce qu'il n'est déjà
+    /// classé nulle part (#1388).
+    ///
+    /// `normalise_dr` laisse « 14 dB » tel quel. La fiche l'affichait
+    /// (« DR 14 dB ») alors que le tri, la tranche et la facette l'ignoraient
+    /// tous les trois. Une seule règle : celle qui a trois consommateurs.
+    #[test]
+    fn un_tag_dr_non_numerique_nest_ni_affiche_ni_classe() {
+        let db = db_avec_track_metadata();
+        let arepo = AlbumRepo::new(db.clone());
+        let bancal = album_avec_dr(&db, "Bancal", Some("14 dB"));
+        let propre = album_avec_dr(&db, "Propre", Some("14"));
+
+        assert_eq!(arepo.dynamic_range_detail(bancal).unwrap(), None);
+        assert_eq!(
+            arepo.dynamic_range_detail(propre).unwrap().unwrap().valeur,
+            14
+        );
+        // Et la facette ne connaissait déjà que le second.
+        assert_eq!(arepo.dynamic_range_values().unwrap(), vec![14]);
     }
 
     // ------------------------------------------------------------------

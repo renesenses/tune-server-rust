@@ -816,13 +816,10 @@ async fn handle_ssdp_discovered(
             }),
         );
     } else if !is_tv {
-        // Check zone_auto_create setting
-        let auto_create = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
-            .get("zone_auto_create")
-            .ok()
-            .flatten()
-            .map(|v| v != "false")
-            .unwrap_or(true);
+        // Check zone_auto_create setting — #3529 : lecture unique, portée par
+        // `ZoneRepo`. Elle était recopiée mot pour mot en cinq endroits, ce
+        // qui a permis à cinq autres chemins de ne jamais la recopier.
+        let auto_create = zone_repo.zone_auto_create_autorise();
         if !auto_create {
             info!(name = %dev.name, id = %dev.id, "ssdp_zone_auto_create_disabled_skipping");
             return;
@@ -1580,16 +1577,9 @@ pub fn spawn_mdns_handler(
                                             "mdns_zone_skipped_conflicting_protocol"
                                         );
                                     } else {
-                                        // Check zone_auto_create setting
-                                        let auto_create =
-                                        tune_core::db::settings_repo::SettingsRepo::with_backend(
-                                            db.clone(),
-                                        )
-                                        .get("zone_auto_create")
-                                        .ok()
-                                        .flatten()
-                                        .map(|v| v != "false")
-                                        .unwrap_or(true);
+                                        // Check zone_auto_create setting (#3529 :
+                                        // lecture unique, portée par `ZoneRepo`).
+                                        let auto_create = zone_repo.zone_auto_create_autorise();
                                         if !auto_create {
                                             info!(name = %dev.name, id = %dev.id, "mdns_zone_auto_create_disabled_skipping");
                                         } else {
@@ -2063,15 +2053,8 @@ pub fn spawn_output_providers(
                             set_zone_online(&event_bus, &db, &dev_id, true);
                             info!(name = %name, id = %dev_id, old_id = ?z.output_device_id, "provider_zone_device_updated");
                         } else {
-                            let auto_create =
-                                tune_core::db::settings_repo::SettingsRepo::with_backend(
-                                    db.clone(),
-                                )
-                                .get("zone_auto_create")
-                                .ok()
-                                .flatten()
-                                .map(|v| v != "false")
-                                .unwrap_or(true);
+                            // #3529 : lecture unique, portée par `ZoneRepo`.
+                            let auto_create = zone_repo.zone_auto_create_autorise();
                             if !auto_create {
                                 info!(name = %name, id = %dev_id, "provider_zone_auto_create_disabled_skipping");
                             } else {

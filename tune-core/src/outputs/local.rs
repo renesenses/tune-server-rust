@@ -6844,6 +6844,32 @@ impl OutputTarget for LocalOutput {
             let mut skipped_bytes: u64 = 0;
             let mut needs_resample = output_sr != sample_rate;
             let mut needs_channel_adapt = output_ch != channels;
+            // #3233 — Pierre M, fil 1043 : « DSD : le temps défile, pas de
+            // son ». Un porteur DoP ne survit ni au sinc ni à l'adaptation de
+            // canaux : le marqueur 0x05/0xFA alterne à CHAQUE trame, c'est un
+            // carré à fs/2 (88,2 kHz pour un DoP DSD64) que le filtre annihile
+            // (`audio::dsd_to_dop::DopRuptureChemin`). Les bras EXCLUSIFS
+            // refusent déjà ce cas avant qu'un échantillon parte au DAC
+            // (`WindowsExclusivePcmError::DopUnsupported`) ; le chemin partagé,
+            // lui, le détruisait en silence. Depuis #3252 la branche
+            // `ResampleToDeviceRate` est réellement prise sur WASAPI — le cas
+            // est donc devenu ATTEIGNABLE, et il faut le nommer plutôt que de
+            // servir au DAC un signal dont il ne reste rien.
+            let refuser_le_porteur_dop = |dop: bool, src_sr: u32, src_ch: u16| -> bool {
+                let Some(rupture) = crate::audio::dsd_to_dop::rupture_du_porteur_dop(
+                    dop, src_sr, output_sr, src_ch, output_ch,
+                ) else {
+                    return false;
+                };
+                rupture.journaliser(&device_name);
+                if let Ok(mut slot) = open_failure.lock() {
+                    *slot = Some(rupture.message_utilisateur(&device_name));
+                }
+                force_silent.store(true, Ordering::SeqCst);
+                dop_active.store(false, Ordering::SeqCst);
+                sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
+                true
+            };
 
             // Create rubato sinc resampler once for the entire track.
             // Using FixedAsync::Input so we feed fixed-size input chunks.
@@ -6956,6 +6982,14 @@ impl OutputTarget for LocalOutput {
                     );
                 }
 
+                // #3233 : le porteur DoP ne survit pas a ce chemin — refuser
+                // AVANT que le premier echantillon parte au DAC.
+                if refuser_le_porteur_dop(processed.dop, sample_rate, channels) {
+                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    return;
+                }
                 if needs_channel_adapt {
                     samples = adapt_channels(&samples, channels, output_ch);
                 }
@@ -7121,6 +7155,14 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
+                // #3233 : le porteur DoP ne survit pas a ce chemin — refuser
+                // AVANT que le premier echantillon parte au DAC.
+                if refuser_le_porteur_dop(processed.dop, sample_rate, channels) {
+                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    return;
+                }
                 if needs_channel_adapt {
                     samples = adapt_channels(&samples, channels, output_ch);
                 }
@@ -7529,6 +7571,14 @@ impl OutputTarget for LocalOutput {
                     // Même frontière que la piste initiale : la piste chaînée
                     // conserve l'état du DSP mais prend une nouvelle décision
                     // PCM/DoP avant son premier échantillon (#2296/#2232).
+                    // #3233 : le porteur DoP ne survit pas a ce chemin — refuser
+                    // AVANT que le premier echantillon parte au DAC.
+                    if refuser_le_porteur_dop(processed.dop, sample_rate, channels) {
+                        if play_generation.load(Ordering::SeqCst) == my_generation {
+                            playing.store(false, Ordering::SeqCst);
+                        }
+                        return;
+                    }
                     if needs_channel_adapt {
                         smp = adapt_channels(&smp, channels, output_ch);
                     }
@@ -7587,6 +7637,14 @@ impl OutputTarget for LocalOutput {
                                 continue;
                             };
                             let mut smp = processed.samples;
+                            // #3233 : le porteur DoP ne survit pas a ce chemin — refuser
+                            // AVANT que le premier echantillon parte au DAC.
+                            if refuser_le_porteur_dop(processed.dop, sample_rate, channels) {
+                                if play_generation.load(Ordering::SeqCst) == my_generation {
+                                    playing.store(false, Ordering::SeqCst);
+                                }
+                                return;
+                            }
                             if needs_channel_adapt {
                                 smp = adapt_channels(&smp, channels, output_ch);
                             }

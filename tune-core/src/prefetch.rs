@@ -154,6 +154,32 @@ impl PrefetchEngine {
         // Find the next track in the queue, respecting repeat/shuffle mode.
         let zone_state = playback.get_state(zone_id).await;
 
+        // #3342 — une radio n'a pas de piste suivante à préparer.
+        //
+        // `play_radio` ne touche pas la file : la zone garde `queue_position`
+        // et `queue_length` de la dernière écoute. `play_inner` déclenchait
+        // donc le préchargement à CHAQUE lancement de station, et le serveur
+        // décodait 17 Mo de PCM Qobuz pendant qu'une radio jouait — six fois
+        // en un quart d'heure dans les journaux de Philippe :
+        //
+        // ```text
+        // orchestrator_play zone_id=10 title=FIP Monde source=radio
+        // prefetch_starting zone_id=10 source=qobuz title=Some("L'absence") next_pos=1
+        // ```
+        //
+        // Ce tampon-là n'est pas la cause du basculement — c'est la route
+        // `next` qui décide (voir `radio_hors_file_interdit_le_suivant`) —
+        // mais c'est lui qui le rendait instantané, et il ne sert à rien : la
+        // piste préparée n'appartient pas à ce que la zone joue.
+        if zone_state
+            .now_playing
+            .as_ref()
+            .is_some_and(|np| np.source == "radio")
+        {
+            debug!(zone_id, "prefetch_skip_radio");
+            return;
+        }
+
         if zone_state.queue_length == 0 {
             debug!(zone_id, "prefetch_no_queue");
             return;

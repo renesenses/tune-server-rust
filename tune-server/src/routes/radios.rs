@@ -611,9 +611,27 @@ async fn media_server_radio_audio_head(
 ) -> Response {
     let repo = RadioRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(_)) => tune_stream_http::live_radio_head_response("audio/wav", &req_headers),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        Ok(Some(station)) => {
+            tracing::debug!(
+                radio_id = id,
+                radio = %station.name,
+                amont = %station.url,
+                "media_server_radio_head"
+            );
+            tune_stream_http::live_radio_head_response("audio/wav", &req_headers)
+        }
+        // #1800 reproche au dossier Radio de ne laisser « aucune trace côté
+        // serveur ». Un renderer qui repartait sur un 404 ou un 500 n'en
+        // laissait justement aucune : le journal restait muet, et le testeur
+        // ne pouvait rapporter qu'un dossier vide, sans rien pour trancher.
+        Ok(None) => {
+            tracing::warn!(radio_id = id, "media_server_radio_station_inconnue");
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(error) => {
+            tracing::warn!(radio_id = id, error = %error, "media_server_radio_base_illisible");
+            (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+        }
     }
 }
 
@@ -625,8 +643,14 @@ async fn media_server_radio_audio(
     let repo = RadioRepo::with_backend(state.backend.clone());
     let radio = match repo.get(id) {
         Ok(Some(radio)) => radio,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        Ok(None) => {
+            tracing::warn!(radio_id = id, "media_server_radio_station_inconnue");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(error) => {
+            tracing::warn!(radio_id = id, error = %error, "media_server_radio_base_illisible");
+            return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        }
     };
 
     // Le Browse et le HEAD sont sans effet. Seul un renderer qui demande
@@ -638,9 +662,15 @@ async fn media_server_radio_audio(
         .orchestrator
         .create_media_server_radio_session(radio.url.clone())
         .await;
+    // `amont` : l'URL du diffuseur que Tune va chercher pour le compte du
+    // renderer. C'est la trace que #1800 réclame — station, URL amont, statut —
+    // et celle qui rend notre journal comparable à celui d'Emby cité dans le
+    // ticket, où la requête du lecteur et celle du serveur se lisent l'une
+    // sous l'autre.
     tracing::info!(
         radio_id = id,
         radio = %radio.name,
+        amont = %radio.url,
         stream_id = %stream_id,
         "media_server_radio_stream_started"
     );
@@ -651,6 +681,13 @@ async fn media_server_radio_audio(
         req_headers,
     )
     .await;
+    tracing::info!(
+        radio_id = id,
+        radio = %radio.name,
+        amont = %radio.url,
+        statut = response.status().as_u16(),
+        "media_server_radio_stream_reponse"
+    );
     with_media_server_radio_cleanup(response, state.streamer, stream_id)
 }
 

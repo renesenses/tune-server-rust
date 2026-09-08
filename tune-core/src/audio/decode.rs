@@ -2163,8 +2163,15 @@ impl ApeHeaderInfo {
 /// d'allocation, lui, n'appartient qu'au chemin par lots (voir
 /// `decode_ape_to_pcm`), le chemin incrémental ne matérialisant jamais la
 /// piste entière.
+///
+/// `bras` nomme le chemin qui ouvre — `"progressif"` ou `"fichier"`. Il part
+/// dans le journal parce que c'est LA question qu'un rapport de terrain sur un
+/// `.ape` muet ne permettait pas de trancher : le décodeur incrémental livré en
+/// v0.9.131 (#2505) n'est branché que sur le premier, et rien dans le journal
+/// ne disait lequel avait servi (#3311).
 fn ape_open_checked(
     file_path: &str,
+    bras: &str,
 ) -> Result<
     (
         ape_decoder::ApeDecoder<std::io::BufReader<File>>,
@@ -2179,6 +2186,30 @@ fn ape_open_checked(
     let sample_rate = info.sample_rate;
     let channels = info.channels as u32;
     let bit_depth = info.bits_per_sample;
+    // Ce que le fichier DIT de lui-même, avant tout décodage et avant tout
+    // garde-fou : version APE, niveau de compression, format, découpage en
+    // trames et durée. Au niveau `info` DÉLIBÉRÉMENT — le journal exporté par
+    // « Diagnostics » est filtré à `info`, et une ligne `debug` n'y figurerait
+    // pas. Une seule ligne par ouverture de `.ape` (#3311).
+    tracing::info!(
+        file = file_path,
+        bras,
+        version = info.version,
+        compression = info.compression_level,
+        sample_rate,
+        bit_depth,
+        channels,
+        floating_point = info.is_floating_point,
+        total_blocks = info.total_samples,
+        total_frames = info.total_frames,
+        blocks_per_frame = info.blocks_per_frame,
+        duree_s = info.duration_ms as f64 / 1000.0,
+        pcm_declare_octets = info
+            .total_samples
+            .saturating_mul(u64::from(info.channels))
+            .saturating_mul(u64::from(info.bits_per_sample / 8).max(1)),
+        "ape_ouvert"
+    );
     if info.is_floating_point {
         return Err("Monkey's Audio (.ape) floating-point source not supported".into());
     }
@@ -2307,7 +2338,7 @@ fn decode_ape_to_pcm(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
-    let (mut decoder, header) = ape_open_checked(file_path)?;
+    let (mut decoder, header) = ape_open_checked(file_path, "fichier")?;
     // Plafond d'allocation calculé depuis l'en-tête, AVANT tout décodage.
     // Il garde CE chemin, dont le contrat (`DecodedAudio`) est de rendre la
     // piste entière : ici, et ici seulement, une piste longue devient
@@ -2319,6 +2350,18 @@ fn decode_ape_to_pcm(
         .saturating_mul(u64::from(header.channels))
         .saturating_mul(bytes_per);
     if expected_bytes > MAX_APE_PCM_BYTES {
+        // Nommé dans le journal, et pas seulement rendu à l'appelant : c'est
+        // le mur DUR de ce bras, franchi par un 24/96 au-delà de ~52 minutes,
+        // et un rapport de terrain doit pouvoir le lire (#3311).
+        tracing::warn!(
+            file = file_path,
+            plafond_octets = MAX_APE_PCM_BYTES,
+            pcm_declare_octets = expected_bytes,
+            total_blocks = header.total_samples,
+            channels = header.channels,
+            bit_depth = header.bit_depth,
+            "ape_lots_plafond_depasse"
+        );
         return Err(format!(
             "ape: decoded size would exceed {} GiB (header claims {} samples)",
             MAX_APE_PCM_BYTES / (1024 * 1024 * 1024),
@@ -2419,7 +2462,7 @@ fn decode_ape_streaming(
         .and_then(|s| s.path.to_str())
         .unwrap_or(file_path);
 
-    let (mut decoder, header) = ape_open_checked(file_path)?;
+    let (mut decoder, header) = ape_open_checked(file_path, "progressif")?;
     let source_bd = header.out_bit_depth;
     let output_bd = target_bit_depth.unwrap_or(source_bd);
     let output_rate = target_sample_rate.unwrap_or(header.sample_rate);
@@ -2458,16 +2501,43 @@ fn decode_ape_streaming(
     let mut frame_samples: Vec<i32> = Vec::with_capacity(header.frame_interleaved_samples());
     let mut total_output_samples = 0usize;
     let mut source_samples_seen = 0usize;
+    // Journal #3311 : un `.ape` muet ne laissait AUCUNE trace entre l'ouverture
+    // et la fin du décodage — pour une image de CD d'une heure, c'est toute la
+    // fenêtre de la panne. Trois repères bornent désormais cette fenêtre :
+    // l'ouverture (`ape_ouvert`), le PREMIER bloc PCM réellement émis, et la
+    // fin ou l'erreur, qui portent l'une comme l'autre la position atteinte.
+    let chrono = std::time::Instant::now();
+    let mut trames_decodees: u32 = 0;
+    let mut derniere_trace = std::time::Instant::now();
+    let position_s = |echantillons: usize| -> f64 {
+        seek_s + echantillons as f64 / output_ch as f64 / output_rate as f64
+    };
 
     for frame_idx in start_frame..header.total_frames {
-        let frame_pcm = decoder
-            .decode_frame(frame_idx)
-            .map_err(|e| format!("ape decode_frame {frame_idx}: {e}"))?;
+        let frame_pcm = decoder.decode_frame(frame_idx).map_err(|e| {
+            // La position ATTEINTE, pas seulement l'indice de trame : c'est
+            // elle qui dit au testeur où le fichier lâche (#3311).
+            tracing::warn!(
+                file = file_path,
+                frame = frame_idx,
+                total_frames = header.total_frames,
+                position_s = position_s(total_output_samples),
+                ecoule_s = chrono.elapsed().as_secs_f64(),
+                erreur = %e,
+                "ape_streaming_trame_refusee"
+            );
+            format!(
+                "ape decode_frame {frame_idx}/{} à {:.1} s: {e}",
+                header.total_frames,
+                position_s(total_output_samples)
+            )
+        })?;
         frame_samples.clear();
         ape_pcm_to_i32(&frame_pcm, &header, &mut frame_samples)?;
         // Le PCM natif de la trame ne sert plus : le rendre avant l'adaptation
         // garde le pic au niveau d'UNE trame.
         drop(frame_pcm);
+        trames_decodees += 1;
         let from = skip_interleaved.min(frame_samples.len());
         skip_interleaved = 0;
         if from == frame_samples.len() {
@@ -2481,6 +2551,7 @@ fn decode_ape_streaming(
             let chunk: Vec<u8> = pcm_buf.drain(..flush_len).collect();
             // PCM d'abord, niveaux ensuite : même raison que le chemin
             // symphonia — ne pas retarder le flux audio.
+            let premier = !*first_chunk_sent;
             match rt.block_on(tokio::time::timeout(
                 std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                 tx.send(chunk.clone()),
@@ -2492,11 +2563,26 @@ fn decode_ape_streaming(
                 }
                 Err(_) => {
                     tracing::warn!(
+                        file = file_path,
                         timeout_secs = SEND_TIMEOUT_SECS,
+                        frame = frame_idx,
+                        position_s = position_s(total_output_samples),
                         "ape_streaming_send_timeout"
                     );
                     return Ok((output_bd, output_rate));
                 }
+            }
+            if premier {
+                // Le repère qui manquait : à `info`, donc présent dans le
+                // journal exporté. « Ouvert mais jamais un octet » et « des
+                // octets puis un arrêt » ne se ressemblent plus.
+                tracing::info!(
+                    file = file_path,
+                    delai_ms = chrono.elapsed().as_millis() as u64,
+                    frame = frame_idx,
+                    octets = chunk.len(),
+                    "ape_streaming_premier_bloc"
+                );
             }
             if !*first_chunk_sent {
                 *first_chunk_sent = true;
@@ -2507,6 +2593,17 @@ fn decode_ape_streaming(
             if let Some(ltx) = levels_tx {
                 super::tap::send_windowed_pcm(ltx, &chunk, output_bd, output_ch, output_rate);
             }
+        }
+        if derniere_trace.elapsed() >= std::time::Duration::from_secs(10) {
+            derniere_trace = std::time::Instant::now();
+            debug!(
+                file = file_path,
+                frame = frame_idx,
+                total_frames = header.total_frames,
+                position_s = position_s(total_output_samples),
+                ecoule_s = chrono.elapsed().as_secs_f64(),
+                "ape_streaming_progression"
+            );
         }
     }
 
@@ -2544,7 +2641,10 @@ fn decode_ape_streaming(
 
     let out_frames = total_output_samples as f64 / output_ch as f64;
     let duration_s = out_frames / output_rate as f64;
-    debug!(
+    // Le troisième repère de #3311, à `info` comme les deux autres : un
+    // journal qui porte `ape_ouvert` sans `ape_streaming_termine` dit que le
+    // décodage s'est arrêté en vol, et `position_s` dit où.
+    tracing::info!(
         file = file_path,
         samples = total_output_samples,
         source_rate = header.sample_rate,
@@ -2554,7 +2654,10 @@ fn decode_ape_streaming(
         source_bd,
         output_bd,
         duration_s,
-        "decoded_ape_streaming"
+        trames_decodees,
+        total_frames = header.total_frames,
+        ecoule_s = chrono.elapsed().as_secs_f64(),
+        "ape_streaming_termine"
     );
     Ok((output_bd, output_rate))
 }

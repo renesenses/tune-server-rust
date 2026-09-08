@@ -119,6 +119,10 @@ pub(super) async fn list_groups(State(state): State<AppState>) -> Json<Value> {
             group["group_id"] = json!(id.to_string());
         }
     }
+    let groups = groups
+        .into_iter()
+        .map(crate::routes::zone_manager::generic_group_view)
+        .collect::<Vec<_>>();
     Json(json!(groups))
 }
 
@@ -190,7 +194,11 @@ pub(super) async fn create_group(
         tune_core::event_types::EventType::GroupCreated,
         json!({ "id": id, "name": name, "zone_ids": zone_ids }),
     );
-    Ok((StatusCode::CREATED, Json(group)).into_response())
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::routes::zone_manager::generic_group_view(group)),
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -237,7 +245,7 @@ pub(super) async fn patch_group(
                 tune_core::event_types::EventType::GroupUpdated,
                 json!({ "id": group_id, "group": result }),
             );
-            Ok(Json(result).into_response())
+            Ok(Json(crate::routes::zone_manager::generic_group_view(result)).into_response())
         }
         None => Ok(StatusCode::NOT_FOUND.into_response()),
     }

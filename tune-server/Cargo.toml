@@ -296,3 +296,12 @@ path = "tests/sources_trois_routes_i3226.rs"
 [[test]]
 name = "derive_des_garde_fous_2816"
 path = "tests/derive_des_garde_fous_2816.rs"
+# #3529 : le recensement des chemins qui creent une zone. Il lit la SOURCE de
+# `tune-server/src` et echoue sur tout site nouveau qui ne consulte pas
+# « Creer automatiquement les zones ». Cible a elle seule parce qu'elle ne
+# monte aucun `AppState` et n'a besoin d'aucune feature — et `autotests = false`
+# plus haut : sans cette entree, le fichier ne serait JAMAIS compile, donc vert
+# contre rien.
+[[test]]
+name = "zones_auto_create_recension"
+path = "tests/zones_auto_create_recension.rs"
