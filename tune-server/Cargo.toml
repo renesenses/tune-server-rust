@@ -205,6 +205,20 @@ required-features = ["postgres"]
 name = "ajouts_recents_fenetre"
 path = "tests/ajouts_recents_fenetre.rs"
 
+# #3101 : la portée de répertoire de l'audit de bibliothèque. Le motif LIKE de
+# `GET /export/library-audit.csv?dir=…` était écrit à la main, sans séparateur :
+# auditer `…/Rock` ramenait `…/Rockabilly` et le déclarait fantôme. Le témoin
+# passe par la ROUTE MONTÉE, avec de vrais fichiers sur le disque, et non par
+# `folder_like_pattern` — c'est le site d'appel qui avait dérivé, pas le
+# constructeur de motif. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait JAMAIS compilé, donc vert contre rien.
+#
+# Posée ICI, au milieu du fichier, et non à la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent à chaque fois.
+[[test]]
+name = "portee_audit_repertoire_3101"
+path = "tests/portee_audit_repertoire_3101.rs"
+
 # Canal stable / beta : quelles versions `/update/check` a le droit de proposer
 # (#2266). Le defaut `auto` reproduit le comportement d'avant.
 [[test]]
@@ -343,17 +357,6 @@ path = "tests/sante_slimproto_i3462.rs"
 [[test]]
 name = "ecoutes_par_piste_3518"
 path = "tests/ecoutes_par_piste_3518.rs"
-
-# #3101 : la portée de répertoire de l'audit de bibliothèque. Le motif LIKE de
-# `GET /export/library-audit.csv?dir=…` était écrit à la main, sans séparateur :
-# auditer `…/Rock` ramenait `…/Rockabilly` et le déclarait fantôme. Le témoin
-# passe par la ROUTE MONTÉE, avec de vrais fichiers sur le disque, et non par
-# `folder_like_pattern` — c'est le site d'appel qui avait dérivé, pas le
-# constructeur de motif. `autotests = false` plus haut : sans cette cible, le
-# fichier ne serait JAMAIS compilé, donc vert contre rien.
-[[test]]
-name = "portee_audit_repertoire_3101"
-path = "tests/portee_audit_repertoire_3101.rs"
 # #1361 — « Retour à l'album en cours » : la route qui dit quel album jouer
 # rouvrir, et chez qui. `autotests = false` plus haut : sans cette cible, le
 # fichier ne serait jamais compilé.
