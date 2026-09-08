@@ -263,6 +263,24 @@ path = "tests/migration_windows_annexes_sqlite.rs"
 name = "pg_3182_moteur_annonce_dans_le_rapport"
 path = "tests/pg_3182_moteur_annonce_dans_le_rapport.rs"
 
+# #2856 : le rapport de bogue ne portait AUCUNE section de reglages — ni
+# l'etat de l'enrichissement au scan, ni le moteur audio. Deux faits qu'il
+# fallait redemander au testeur a chaque ticket, alors que le serveur les a
+# sous la main. La garde passe par les ROUTES MONTEES
+# (`/system/bug-report/markdown`, `/system/bug-report`, `/system/profile`) :
+# un essai qui appellerait `support_settings` en direct resterait vert alors
+# meme que le rapport ne l'appelle pas. Sa seconde moitie ecrit de VRAIS
+# secrets en base et exige qu'aucun ne ressorte, ni son nom ni sa valeur.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait
+# JAMAIS compile, donc vert contre rien.
+#
+# Posee ICI, a cote de la cible de #3182 qui garde le meme rapport, et non a
+# la fin : deux lots qui ajoutent chacun leur cible en queue de `Cargo.toml`
+# se conflictent a chaque fois.
+[[test]]
+name = "rapport_reglages_2856"
+path = "tests/rapport_reglages_2856.rs"
+
 # #3226 : `sources` ne gouvernait que la boucle des services, jamais le bloc
 # `local` ni les radios — la pilule « Qobuz » rendait donc `local + qobuz`.
 # `autotests = false` plus haut : sans cette cible, le fichier ne serait jamais
