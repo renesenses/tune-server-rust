@@ -312,3 +312,14 @@ path = "tests/temoin_resolution_locale.rs"
 [[test]]
 name = "reprise_favoris_streaming"
 path = "tests/reprise_favoris_streaming.rs"
+
+# Meme famille que #2665 / #2890 / #3180 / #3479, cinquieme fois : abonne
+# `tracing` GLOBAL, donc un binaire a lui seul et UN SEUL test dedans. Il tient
+# les trois durees du demarrage d'une piste de service sur SORTIE LOCALE
+# (#3568) — assemblage de l'adresse, telechargement complet, transcodage WAV —
+# que rien ne mesurait au niveau livre. `autotests = false` en tete de ce
+# fichier : sans cette cible, le temoin ne serait jamais compile et la porte
+# rendrait un vert contre rien.
+[[test]]
+name = "journal_latence_demarrage_local_i3568"
+path = "tests/journal_latence_demarrage_local_i3568.rs"
