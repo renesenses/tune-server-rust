@@ -229,6 +229,21 @@ impl OutputCapabilities {
         }
     }
 
+    /// Déclare les dispositions de canaux que cette sortie sait rendre (#3322).
+    ///
+    /// `v1` pose `channel_layouts: Vec::new()` en dur, et il n'existait AUCUN
+    /// chemin d'écriture : le champ était déclaré, publié, et vide sur les
+    /// quatorze zones mesurées le 04/09/2026. C'est le builder qui manquait.
+    ///
+    /// La liste vide garde son sens : « on ne sait pas », jamais « aucune ».
+    /// Une sortie qui ignore le nombre de canaux de son appareil ne doit rien
+    /// déclarer plutôt qu'inventer une valeur.
+    #[must_use]
+    pub fn with_channel_layouts(mut self, layouts: Vec<String>) -> Self {
+        self.channel_layouts = layouts;
+        self
+    }
+
     /// Déclare une grille linéaire de `steps` pas (voir [`VolumeResolution`]).
     #[must_use]
     pub fn with_linear_volume(mut self, steps: u32) -> Self {
