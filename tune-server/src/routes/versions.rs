@@ -289,13 +289,13 @@ pub(crate) fn score_version(reference: &Reference, candidat: Signaux<'_>) -> i32
     points
 }
 
-/// Un ISRC comparable : majuscules, sans separateur ni espace.
-fn normaliser_isrc(brut: &str) -> String {
-    brut.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_uppercase())
-        .collect()
-}
+// Un ISRC comparable : majuscules, sans separateur ni espace.
+//
+// La definition vit desormais dans `tune-core` : une clef d'identite ne peut
+// pas se comparer de deux facons selon le chemin emprunte (#2264). Ce module
+// en portait une copie pliee tandis que `track_matcher::match_by_isrc`
+// comparait la chaine BRUTE — voir le commentaire de mesure la-bas.
+use tune_core::library::track_matcher::normaliser_isrc;
 
 /// Les requetes envoyees a un service pour trouver les versions d'un morceau.
 ///
