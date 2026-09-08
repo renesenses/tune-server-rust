@@ -1205,7 +1205,15 @@ impl PlaybackOrchestrator {
         let source_format = AudioFormat::from_extension(&fmt);
         let is_dsd_source = source_format == Some(AudioFormat::Dsd);
         let decision = match self
-            .decider_la_lecture_locale(req, &track, file_path, fmt, source_format, is_dsd_source)
+            .decider_la_lecture_locale(
+                req,
+                &track,
+                file_path,
+                fmt,
+                source_format,
+                is_dsd_source,
+                None,
+            )
             .await?
         {
             DecisionOuResolu::Decision(d) => d,
