@@ -1687,9 +1687,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
                             .map(|id| id.to_string())
                             .collect::<Vec<_>>()
                             .join(",");
+                        let compte_visible =
+                            tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id");
                         db.execute_batch(&format!(
-                            "UPDATE albums SET track_count = \
-                             (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id) \
+                            "UPDATE albums SET track_count = {compte_visible} \
                              WHERE id IN ({ids_csv});\
                              UPDATE albums SET \
                              format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
@@ -1977,8 +1978,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 tracing::warn!(error = %e, "post_scan_album_genres_backfill_failed");
             }
             if let Err(e) = db.execute(
-                "UPDATE albums SET track_count = \
-                 (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id)",
+                &format!(
+                    "UPDATE albums SET track_count = {}",
+                    tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
+                ),
                 &[],
             ) {
                 tracing::warn!(error = %e, "post_scan_track_count_update_failed");
@@ -2084,10 +2087,11 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 }
                 if merged_albums > 0 {
                     // Refresh track_count for albums that received tracks from merged duplicates
-                    db.execute_batch(
-                        "UPDATE albums SET track_count = \
-                         (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id)",
-                    ).ok();
+                    db.execute_batch(&format!(
+                        "UPDATE albums SET track_count = {}",
+                        tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
+                    ))
+                    .ok();
                     tracing::info!(merged_albums, "post_scan_duplicate_albums_merged");
                 }
             }

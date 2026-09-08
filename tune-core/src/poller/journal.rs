@@ -17,6 +17,19 @@ pub struct ZonePollerMetrics {
     /// deja qu'elle ne l'est pas — soit la lecture est bloquee, soit la duree
     /// connue est fausse, et le sondeur ne peut pas trancher entre les deux.
     pub lecture_au_dela_de_la_duree: bool,
+    /// Rappels du pilote audio servis À COURT depuis le début du flux en
+    /// cours sur cette zone (#3318). Zéro pour une zone dont la sortie ne
+    /// tient pas d'anneau — un renderer réseau, par exemple : c'est LUI qui
+    /// tamponne, et Tune ne peut rien en dire.
+    ///
+    /// Champ de CONSTAT, comme [`Self::lecture_au_dela_de_la_duree`] : aucune
+    /// décision de lecture ne s'en sert. Il repart de zéro à chaque piste,
+    /// comme les compteurs qu'il recopie.
+    pub famine_anneau_evenements: u64,
+    /// Le silence que ces rappels ont réellement envoyé au DAC, en
+    /// millisecondes, depuis le début du flux en cours. C'est la seule mesure
+    /// de ce que l'auditeur a entendu — ou plutôt n'a pas entendu.
+    pub famine_anneau_silence_ms: u64,
 }
 
 /// Plafond du recul sur une zone arrêtée : 2^5 = 32 ticks, soit ~32 s entre

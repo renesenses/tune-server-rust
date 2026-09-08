@@ -153,6 +153,16 @@ pub(super) struct ZonePollState {
     /// de l'audio reellement en cours (`dlna_frozen_end=true`, journal Sandro
     /// du 01/09 a 14:23:10).
     pub(super) gapless_armed: Option<ArmedNext>,
+    /// Suivi de la FAMINE de l'anneau audio de cette zone (#3318).
+    ///
+    /// Le sondeur est le seul endroit qui relise ces compteurs à intervalle
+    /// régulier ; sans lui, l'instant où l'anneau s'est vidé — le seul que
+    /// l'auditeur entende — ne figure dans aucun journal. Voir
+    /// [`decisions::SuiviFamine`].
+    ///
+    /// N'entre dans AUCUNE décision : rien ici n'arrête, ne relance ni
+    /// n'avance quoi que ce soit. C'est un champ de constat.
+    pub(super) famine: decisions::SuiviFamine,
 }
 
 impl ZonePollState {
@@ -201,6 +211,7 @@ impl ZonePollState {
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
             gapless_armed: None,
+            famine: decisions::SuiviFamine::default(),
         }
     }
 }

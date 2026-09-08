@@ -125,22 +125,26 @@ async fn hung_lock_holder_times_out_too() {
 #[tokio::test]
 async fn healthy_transport_passes_through() {
     let out = arc(Box::new(FastOutput));
-    let (status, signal_path, dsp_metrics) =
+    let (status, signal_path, dsp_metrics, famine) =
         get_status_with_signal_path_bounded(&out, Some(Duration::from_secs(5)))
             .await
             .unwrap();
     assert_eq!(status.state, TransportState::Playing);
     assert_eq!(signal_path.unwrap().bit_perfect, true);
     assert_eq!(dsp_metrics.unwrap().eq_overs, 3);
+    // Une sortie sans anneau ne rend rien : c'est le defaut du trait, et il
+    // doit rester distinct de « un anneau qui n'a rien manque » (#3318).
+    assert!(famine.is_none());
 }
 
 #[tokio::test]
 async fn timeout_disabled_preserves_unbounded_behavior() {
     // TUNE_POLLER_STATUS_TIMEOUT_SECS=0 → rollback to the pre-fix path.
     let out = arc(Box::new(FastOutput));
-    let (status, signal_path, dsp_metrics) = get_status_with_signal_path_bounded(&out, None)
-        .await
-        .unwrap();
+    let (status, signal_path, dsp_metrics, _famine) =
+        get_status_with_signal_path_bounded(&out, None)
+            .await
+            .unwrap();
     assert_eq!(status.state, TransportState::Playing);
     assert!(signal_path.is_some());
     assert_eq!(dsp_metrics.unwrap().eq_non_finite_samples, 1);
