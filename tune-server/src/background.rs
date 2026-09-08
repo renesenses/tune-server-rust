@@ -18,6 +18,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_dash_temp_gc();
     spawn_position_poller(state);
     spawn_token_refresher(state);
+    spawn_tune_tested_refresher(state);
     spawn_upnp_advertiser(state, config).await;
     // Renderers UPnP par zone (#1750) : annonceur propre, relu à chaque
     // cycle — l'opt-in d'une zone prend effet sans redémarrage.
@@ -854,6 +855,40 @@ fn spawn_position_poller(state: &AppState) {
         state.poller_metrics.clone(),
     );
     poller.spawn();
+}
+
+/// #3589, volet A — le catalogue « Tune tested », au démarrage puis toutes les
+/// six heures.
+///
+/// Six heures, et non l'heure du `Cache-Control: public, max-age=3600` mesuré
+/// sur la réponse du site : une validation d'appareil n'est pas une urgence, et
+/// `version` étant un entier qui ne recule jamais, un tour qui ne trouve rien
+/// de neuf ne coûte qu'une comparaison.
+///
+/// 🔴 Ne rend jamais d'erreur : hors ligne, `rafraichir` rend `Repli` et
+/// l'instance garde ce qu'elle a — le dernier catalogue rangé, ou le catalogue
+/// embarqué si elle n'en a jamais obtenu.
+fn spawn_tune_tested_refresher(state: &AppState) {
+    let db = state.backend.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        loop {
+            // `interval` déclenche IMMÉDIATEMENT son premier tour : c'est le
+            // « au démarrage » de l'issue, sans second appel à écrire.
+            ticker.tick().await;
+            match tune_core::cloud::tune_tested::rafraichir(&db).await {
+                tune_core::cloud::tune_tested::Issue::Range { avant, apres } => {
+                    tracing::info!(avant, apres, "tune_tested_catalogue_mis_a_jour");
+                }
+                tune_core::cloud::tune_tested::Issue::Inchange(v) => {
+                    tracing::debug!(version = v, "tune_tested_catalogue_inchange");
+                }
+                tune_core::cloud::tune_tested::Issue::Repli(raison) => {
+                    tracing::debug!(%raison, "tune_tested_catalogue_repli");
+                }
+            }
+        }
+    });
 }
 
 fn spawn_token_refresher(state: &AppState) {

@@ -158,6 +158,8 @@ mod tests_orphelins;
 mod tranches_dynamic_range;
 #[path = "tri_aleatoire_albums.rs"]
 mod tri_aleatoire_albums;
+#[path = "tune_tested_telechargement.rs"]
+mod tune_tested_telechargement;
 #[path = "uptime_process_scope.rs"]
 mod uptime_process_scope;
 #[path = "volume_db_contrat.rs"]
