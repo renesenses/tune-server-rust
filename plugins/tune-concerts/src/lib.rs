@@ -388,7 +388,31 @@ pub async fn synchroniser_abonnements(
     instance_id: &str,
 ) -> Result<usize, String> {
     let artistes = artistes_de_la_bibliotheque(backend)?;
+    envoyer_abonnements(CONCERTS_API, http_client, instance_id, &artistes).await
+}
 
+/// L'envoi proprement dit : le découpage en lots, la tolérance au lot perdu et
+/// le décompte. Séparé de [`synchroniser_abonnements`] pour être **appelable**
+/// sans base et sans nuage.
+///
+/// # Pourquoi la racine de l'API est un argument
+///
+/// Sans elle, la seule façon d'exercer ce code serait de parler à
+/// `mozaiklabs.fr` depuis un essai — c'est-à-dire jamais. Le découpage était de
+/// fait le seul apport de ce greffon qu'aucun essai n'atteignait :
+/// `tune-server/tests/concerts_plugin.rs` découpe lui-même un vecteur avec
+/// `chunks(LOT)` et vérifie sa propre arithmétique. C'est un essai qui **relit**
+/// le code au lieu de l'**appeler** : le jour où cette boucle-ci se remettrait à
+/// couper à 200, il resterait vert.
+///
+/// L'unique appelant en production est [`synchroniser_abonnements`] juste
+/// au-dessus, et il passe [`CONCERTS_API`].
+pub async fn envoyer_abonnements(
+    racine: &str,
+    http_client: &reqwest::Client,
+    instance_id: &str,
+    artistes: &[Value],
+) -> Result<usize, String> {
     if artistes.is_empty() {
         debug!("concert_alerts_no_artists");
         return Ok(0);
@@ -416,7 +440,7 @@ pub async fn synchroniser_abonnements(
         });
 
         let resp = http_client
-            .post(format!("{CONCERTS_API}/subscribe"))
+            .post(format!("{racine}/subscribe"))
             .json(&body)
             .timeout(std::time::Duration::from_secs(30))
             .send()
@@ -491,8 +515,21 @@ pub async fn recuperer_concerts(
     http_client: &reqwest::Client,
     instance_id: &str,
 ) -> Result<Vec<Value>, CloudError> {
+    recuperer_concerts_depuis(CONCERTS_API, http_client, instance_id).await
+}
+
+/// La lecture, avec la racine de l'API en argument — même raison que
+/// [`envoyer_abonnements`] : c'est le seul moyen d'exercer la traduction d'un
+/// refus du nuage en [`CloudError`] sans appeler `mozaiklabs.fr`.
+///
+/// L'unique appelant en production est [`recuperer_concerts`] juste au-dessus.
+pub async fn recuperer_concerts_depuis(
+    racine: &str,
+    http_client: &reqwest::Client,
+    instance_id: &str,
+) -> Result<Vec<Value>, CloudError> {
     let resp = http_client
-        .get(format!("{CONCERTS_API}/upcoming"))
+        .get(format!("{racine}/upcoming"))
         .query(&[("instance_id", instance_id)])
         .timeout(std::time::Duration::from_secs(15))
         .send()
@@ -561,4 +598,400 @@ fn lancer_synchronisation(backend: Arc<dyn DbBackend>) -> tokio::task::JoinHandl
             tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Essais (#3640)
+// ---------------------------------------------------------------------------
+//
+// Cette caisse rendait `tune_concerts: 0 passed` dans les deux jobs qui la
+// nomment. `tune-server/tests/concerts_plugin.rs` en garde déjà la moitié
+// haute — le montage du routeur, le hors-catalogue, l'arrêt de la tâche, la
+// requête d'artistes, et le RENDU d'un refus par `reponse_de_refus`.
+//
+// Ce qui restait sans aucun témoin, c'est tout ce qui parle au nuage :
+//
+//   * le découpage en lots de `LOT` et sa tolérance au lot perdu. L'essai de
+//     `tune-server` découpe LUI-MÊME un vecteur avec `chunks(LOT)` et vérifie
+//     sa propre arithmétique — il relit le code au lieu de l'appeler, et
+//     resterait vert si la boucle d'envoi se remettait à couper à 200 ;
+//   * la LECTURE d'un refus : `reponse_de_refus` est gardée, mais rien ne
+//     vérifiait que `recuperer_concerts` construit bien le `CloudError` qu'elle
+//     rend. Les deux moitiés du 429 sont désormais tenues.
+
+#[cfg(test)]
+mod essais {
+    use std::sync::Mutex;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// Une réponse du banc : statut, corps, et le `Retry-After` à annoncer.
+    type Reponse = (u16, &'static str, Option<u64>);
+
+    /// Un banc HTTP minimal : il répond dans l'ordre du script et garde ce
+    /// qu'il a reçu.
+    ///
+    /// ⚠️ Il lit la requête **entière** — ligne, en-têtes et corps — avant
+    /// d'écrire, puis ferme par un `shutdown` explicite. Un banc qui répond
+    /// sans avoir lu fait émettre un RST par le noyau, et le RST détruit la
+    /// réponse encore en vol : c'est la vraie cause de l'instabilité cherchée
+    /// pendant des jours sur #1358.
+    struct Banc {
+        racine: String,
+        recues: Arc<Mutex<Vec<Value>>>,
+        tache: tokio::task::JoinHandle<()>,
+    }
+
+    impl Banc {
+        /// Ce que le banc a reçu : `{"cible": "…", "corps": …}` par requête.
+        fn recues(&self) -> Vec<Value> {
+            self.recues.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Banc {
+        fn drop(&mut self) {
+            self.tache.abort();
+        }
+    }
+
+    fn position(foin: &[u8], aiguille: &[u8]) -> Option<usize> {
+        foin.windows(aiguille.len()).position(|f| f == aiguille)
+    }
+
+    /// Le dernier élément du script est réutilisé si les appels le dépassent :
+    /// un essai qui veut « tout refuser » n'écrit qu'une réponse.
+    async fn banc(script: Vec<Reponse>) -> Banc {
+        assert!(
+            !script.is_empty(),
+            "le script du banc ne peut pas etre vide"
+        );
+        let ecoute = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let racine = format!("http://{}", ecoute.local_addr().unwrap());
+        let recues: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let journal = recues.clone();
+
+        let tache = tokio::spawn(async move {
+            let mut appel = 0usize;
+            loop {
+                let Ok((mut flux, _)) = ecoute.accept().await else {
+                    return;
+                };
+
+                // 1. Lire la requête entière AVANT d'écrire quoi que ce soit.
+                let mut brut: Vec<u8> = Vec::new();
+                let mut tampon = [0u8; 4096];
+                let complete = loop {
+                    let lu = match flux.read(&mut tampon).await {
+                        Ok(0) | Err(_) => break false,
+                        Ok(n) => n,
+                    };
+                    brut.extend_from_slice(&tampon[..lu]);
+                    let Some(fin) = position(&brut, b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let entetes = String::from_utf8_lossy(&brut[..fin]).to_lowercase();
+                    let taille = entetes
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|s| s.split("\r\n").next())
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if brut.len() >= fin + 4 + taille {
+                        let cible = String::from_utf8_lossy(&brut[..fin])
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
+                        let corps = serde_json::from_slice::<Value>(&brut[fin + 4..])
+                            .unwrap_or(Value::Null);
+                        journal.lock().unwrap().push(json!({
+                            "cible": cible,
+                            "corps": corps,
+                        }));
+                        break true;
+                    }
+                };
+                if !complete {
+                    continue;
+                }
+
+                // 2. Répondre, puis fermer proprement.
+                let (statut, charge, retry) = script
+                    .get(appel)
+                    .copied()
+                    .unwrap_or(script[script.len() - 1]);
+                appel += 1;
+                let mut tete = format!(
+                    "HTTP/1.1 {statut} R\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    charge.len()
+                );
+                if let Some(secondes) = retry {
+                    tete.push_str(&format!("Retry-After: {secondes}\r\n"));
+                }
+                tete.push_str("\r\n");
+                tete.push_str(charge);
+                let _ = flux.write_all(tete.as_bytes()).await;
+                let _ = flux.flush().await;
+                let _ = flux.shutdown().await;
+            }
+        });
+
+        Banc {
+            racine,
+            recues,
+            tache,
+        }
+    }
+
+    fn artistes(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| json!({"artist_name": format!("Artiste {i:04}"), "musicbrainz_artist_id": null}))
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // `envoyer_abonnements` — appelée par `synchroniser_abonnements`
+    // -----------------------------------------------------------------------
+
+    /// ⭐ Le découpage, exercé pour de vrai. L'ancienne requête coupait à 200
+    /// SANS LE DIRE : sur les 1 747 artistes du serveur de référence, 1 547
+    /// n'étaient jamais abonnés et personne ne pouvait le savoir. Ce témoin
+    /// compte les appels **reçus par le nuage**, pas les tranches d'un vecteur.
+    #[tokio::test]
+    async fn quatre_cent_cinquante_artistes_partent_en_trois_appels_et_aucun_ne_se_perd() {
+        let banc = banc(vec![
+            (200, r#"{"subscribed":200,"ignored":0}"#, None),
+            (200, r#"{"subscribed":200,"ignored":0}"#, None),
+            (200, r#"{"subscribed":50,"ignored":0}"#, None),
+        ])
+        .await;
+
+        let total = envoyer_abonnements(
+            &banc.racine,
+            &reqwest::Client::new(),
+            "inst-1",
+            &artistes(450),
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 450, "le total doit additionner les trois reponses");
+
+        let recues = banc.recues();
+        assert_eq!(recues.len(), 3, "450 artistes = 3 appels au nuage");
+        let mut noms: Vec<String> = Vec::new();
+        for appel in &recues {
+            assert_eq!(appel["corps"]["instance_id"], "inst-1");
+            let lot = appel["corps"]["artists"].as_array().unwrap();
+            assert!(
+                lot.len() <= LOT,
+                "un lot de {} depasse la borne du nuage ({LOT})",
+                lot.len()
+            );
+            noms.extend(
+                lot.iter()
+                    .map(|a| a["artist_name"].as_str().unwrap().to_string()),
+            );
+        }
+        assert_eq!(noms.len(), 450, "aucun artiste ne doit rester a quai");
+        noms.sort();
+        noms.dedup();
+        assert_eq!(noms.len(), 450, "aucun artiste ne doit partir deux fois");
+    }
+
+    /// « Un lot en échec ne condamne pas les autres » : mieux vaut abonner
+    /// 250 artistes que zéro parce que le deuxième appel est tombé.
+    #[tokio::test]
+    async fn un_lot_refuse_ne_condamne_pas_les_suivants() {
+        let banc = banc(vec![
+            (200, r#"{"subscribed":200}"#, None),
+            (500, r#"{"message":"boum"}"#, None),
+            (200, r#"{"subscribed":50}"#, None),
+        ])
+        .await;
+
+        let total = envoyer_abonnements(
+            &banc.racine,
+            &reqwest::Client::new(),
+            "inst-1",
+            &artistes(450),
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 250, "les deux lots passes doivent compter");
+        assert_eq!(
+            banc.recues().len(),
+            3,
+            "le troisieme lot doit partir malgre l'echec du deuxieme"
+        );
+    }
+
+    /// Contre-épreuve de la tolérance : quand TOUT échoue, il faut une erreur.
+    /// Un `Ok(0)` paisible se lirait dans le journal comme « bibliothèque
+    /// vide », c'est-à-dire comme un fait, alors que le nuage est en panne.
+    #[tokio::test]
+    async fn tous_les_lots_en_echec_rendent_une_erreur_et_non_un_zero_paisible() {
+        let banc = banc(vec![(500, r#"{}"#, None)]).await;
+
+        let resultat = envoyer_abonnements(
+            &banc.racine,
+            &reqwest::Client::new(),
+            "inst-1",
+            &artistes(450),
+        )
+        .await;
+
+        let Err(motif) = resultat else {
+            panic!("trois lots refuses doivent rendre une erreur, pas un Ok");
+        };
+        assert!(
+            motif.contains('3'),
+            "l'erreur doit dire combien de lots sont tombes : {motif}"
+        );
+    }
+
+    /// Un 429 est un refus comme un autre pour cette tâche : il est journalisé
+    /// avec son délai, et les lots suivants partent quand même. La tâche est
+    /// périodique, personne ne l'attend — l'arrêter perdrait les 250 autres.
+    #[tokio::test]
+    async fn un_429_sur_un_lot_ne_fait_pas_tomber_la_tache() {
+        let banc = banc(vec![
+            (429, r#"{"message":"Too Many Attempts."}"#, Some(90)),
+            (200, r#"{"subscribed":200}"#, None),
+            (200, r#"{"subscribed":50}"#, None),
+        ])
+        .await;
+
+        let total = envoyer_abonnements(
+            &banc.racine,
+            &reqwest::Client::new(),
+            "inst-1",
+            &artistes(450),
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 250);
+        assert_eq!(banc.recues().len(), 3);
+    }
+
+    /// Une bibliothèque vide ne doit produire AUCUN appel : abonner « rien »
+    /// ferait tourner une requête toutes les 24 h chez chaque installation
+    /// fraîche, et le nuage la compterait dans son quota.
+    #[tokio::test]
+    async fn une_bibliotheque_vide_ne_touche_pas_le_reseau() {
+        let banc = banc(vec![(200, r#"{"subscribed":0}"#, None)]).await;
+
+        let total = envoyer_abonnements(&banc.racine, &reqwest::Client::new(), "inst-1", &[])
+            .await
+            .unwrap();
+
+        assert_eq!(total, 0);
+        assert!(
+            banc.recues().is_empty(),
+            "aucun appel ne doit partir sur une bibliotheque vide"
+        );
+    }
+
+    /// Le contrat de fil avec le nuage (site-mozaiklabs#185) : le nom part
+    /// toujours, le MBID part quand on l'a et vaut `null` sinon. Un artiste
+    /// sans MBID doit partir COMME LES AUTRES — c'est l'apport de #2892, et
+    /// c'est ce que ce témoin voit maintenant dans la charge réellement émise.
+    #[tokio::test]
+    async fn le_nom_et_le_mbid_partent_tels_quels_dans_la_charge() {
+        let banc = banc(vec![(200, r#"{"subscribed":2}"#, None)]).await;
+        let tous = vec![
+            json!({"artist_name": "Superbus", "musicbrainz_artist_id": "abc-123"}),
+            json!({"artist_name": "Groupe sans identite", "musicbrainz_artist_id": null}),
+        ];
+
+        envoyer_abonnements(&banc.racine, &reqwest::Client::new(), "inst-42", &tous)
+            .await
+            .unwrap();
+
+        let recues = banc.recues();
+        assert_eq!(recues.len(), 1);
+        assert!(
+            recues[0]["cible"]
+                .as_str()
+                .unwrap()
+                .starts_with("POST /subscribe "),
+            "l'abonnement doit taper /subscribe : {:?}",
+            recues[0]["cible"]
+        );
+        assert_eq!(recues[0]["corps"]["instance_id"], "inst-42");
+        assert_eq!(recues[0]["corps"]["artists"], json!(tous));
+    }
+
+    // -----------------------------------------------------------------------
+    // `recuperer_concerts` — appelée par `concerts_a_venir`
+    // -----------------------------------------------------------------------
+
+    /// ⭐ La moitié LECTURE du 429. `tune-server/tests/concerts_plugin.rs` garde
+    /// le RENDU (`reponse_de_refus`) en lui fabriquant un `CloudError` à la
+    /// main ; rien ne vérifiait que la lecture en construit un. Un
+    /// `CloudError::Message` rendu ici ferait un 200 parfaitement vert de
+    /// l'autre côté.
+    #[tokio::test]
+    async fn un_429_du_nuage_arrive_en_refus_limite_avec_son_delai() {
+        let banc = banc(vec![(429, r#"{"message":"Too Many Attempts."}"#, Some(42))]).await;
+
+        let err = recuperer_concerts_depuis(&banc.racine, &reqwest::Client::new(), "inst-1")
+            .await
+            .unwrap_err();
+
+        assert!(err.is_rate_limited(), "un 429 doit rester un 429 : {err:?}");
+        assert_eq!(
+            err.retry_after(),
+            Some(42),
+            "le delai annonce doit remonter"
+        );
+        assert_eq!(err.upstream(), Some("Too Many Attempts."));
+    }
+
+    /// Contre-épreuve : hors 429, rien ne bouge et surtout aucun délai n'est
+    /// fabriqué — le banc en annonce un que le code doit ignorer.
+    #[tokio::test]
+    async fn contre_epreuve_un_refus_ordinaire_ne_fabrique_aucun_delai() {
+        let banc = banc(vec![(500, r#"{"message":"boum"}"#, Some(42))]).await;
+
+        let err = recuperer_concerts_depuis(&banc.racine, &reqwest::Client::new(), "inst-1")
+            .await
+            .unwrap_err();
+
+        assert!(
+            !err.is_rate_limited(),
+            "un 500 n'est pas une limite : {err:?}"
+        );
+        assert_eq!(
+            err.retry_after(),
+            None,
+            "hors 429, aucun delai ne doit etre fabrique"
+        );
+    }
+
+    /// Le chemin nominal : l'identité de l'instance part en requête, et la
+    /// liste rendue est celle du nuage.
+    #[tokio::test]
+    async fn la_lecture_porte_l_identite_de_l_instance_et_rend_la_liste() {
+        let banc = banc(vec![(
+            200,
+            r#"{"concerts":[{"id":1},{"id":2},{"id":3}]}"#,
+            None,
+        )])
+        .await;
+
+        let concerts = recuperer_concerts_depuis(&banc.racine, &reqwest::Client::new(), "inst-7")
+            .await
+            .unwrap();
+
+        assert_eq!(concerts.len(), 3);
+        let cible = banc.recues()[0]["cible"].as_str().unwrap().to_string();
+        assert!(
+            cible.starts_with("GET /upcoming?") && cible.contains("instance_id=inst-7"),
+            "l'identite doit partir en requete : {cible}"
+        );
+    }
 }
