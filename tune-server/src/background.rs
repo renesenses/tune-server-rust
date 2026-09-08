@@ -2275,10 +2275,25 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
 
             // New device found — register it
             // L'hôte qui a énuméré ce nom voyage avec lui (#3230).
+            //
+            // #3245 — et le mode exclusif se décide AVEC lui. Ce chemin-ci est
+            // celui qui rendait le débordement certain : quand ASIO est
+            // configuré, ce rescan FORCE l'énumération WASAPI (voir
+            // `scan_backend` plus haut), donc tous les noms qu'il enregistre
+            // sont des noms WASAPI. `state.effective_exclusive_mode()` valait
+            // pourtant `true`, imposé par ASIO, et `LocalOutput` ouvrait ces
+            // sorties en WASAPI EXCLUSIF — le son des autres applications de la
+            // machine disparaissait sur un périphérique que personne n'avait
+            // demandé en exclusif (jfpaquet, Asus Essence STX II).
+            let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
+                &configured_backend,
+                Some(dev.backend.as_str()),
+                state.requested_exclusive_mode(),
+            );
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
-                state.effective_exclusive_mode(),
+                statut_exclusif.effective,
                 &configured_backend,
             )
             .with_origin_host(&dev.backend);
@@ -3209,6 +3224,171 @@ mod etiquette_hote_origine_i1770 {
             sites_sans_etiquette(&loin),
             vec![1],
             "une étiquette hors de la chaîne d'appel ne doit pas compter"
+        );
+    }
+}
+
+/// #3245 — le mode exclusif d'une sortie locale doit se décider PAR
+/// PÉRIPHÉRIQUE, sur les DEUX sites qui en enregistrent une.
+///
+/// La règle est `tune_core::config::local_exclusive_mode_du_peripherique` :
+/// elle compose `openable_local_backend` (le backend sous lequel CE nom
+/// s'ouvrira, #1770) avec `exclusive_mode_status` (la contrainte ASIO, #3192).
+/// Un site qui passe à la place la valeur MACHINE —
+/// `effective_exclusive_mode()` — impose l'exclusif d'ASIO à une sortie qui
+/// sera ouverte en WASAPI ; Tune ouvre alors WASAPI en exclusif et la machine
+/// perd le son de toutes ses autres applications (jfpaquet, Asus Essence
+/// STX II).
+///
+/// Garde TEXTUELLE, et pour la même raison que sa jumelle
+/// `etiquette_hote_origine_i1770` : les deux fonctions visées sont derrière
+/// `#[cfg(feature = "local-audio")]` et demandent un `AppState` complet plus
+/// de vrais périphériques. Elle nomme les SITES D'APPEL et lit le code de
+/// PRODUCTION seul — le module de test est retranché avant l'examen, sans quoi
+/// il se prouverait lui-même. Sa contre-épreuve est
+/// `la_garde_refuse_un_site_qui_impose_la_valeur_machine`.
+#[cfg(test)]
+mod exclusif_par_peripherique_i3245 {
+    const CONSTRUCTEUR: &str = "LocalOutput::with_options_and_endpoint(";
+    /// Le nom de la variable que les deux sites remplissent avec la règle.
+    /// C'est bien le SITE D'APPEL qui est nommé : la garde n'accepte pas un
+    /// booléen calculé ailleurs et recopié.
+    const REGLE: &str = "statut_exclusif.effective";
+
+    /// Les ARGUMENTS d'un appel au constructeur, parenthèses comprises.
+    ///
+    /// Une simple fenêtre d'octets — celle de la garde de #1770 — ne
+    /// conviendrait pas ici : le site de `startup.rs` journalise
+    /// `statut_exclusif.effective` juste après l'appel, et une fenêtre large se
+    /// laisserait sauver par cette TRACE pendant que l'ARGUMENT, lui, serait
+    /// redevenu la valeur machine. On lit donc exactement la liste
+    /// d'arguments, en comptant les parenthèses.
+    fn arguments_du_constructeur(source: &str, debut: usize) -> Option<&str> {
+        let ouvre = debut + CONSTRUCTEUR.len() - 1;
+        let mut profondeur = 0i32;
+        for (i, octet) in source[ouvre..].bytes().enumerate() {
+            match octet {
+                b'(' => profondeur += 1,
+                b')' => {
+                    profondeur -= 1;
+                    if profondeur == 0 {
+                        return Some(&source[ouvre..ouvre + i + 1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Le code de production seul : l'aiguille est construite à l'exécution,
+    /// sans quoi ce module se compterait lui-même à travers `include_str!`.
+    fn production(source: &str) -> &str {
+        let marqueur_test = format!("#[cfg({})]", "test");
+        let coupe = source.find(&marqueur_test).unwrap_or(source.len());
+        &source[..coupe]
+    }
+
+    /// Les sites d'enregistrement dont l'ARGUMENT de mode exclusif ne vient PAS
+    /// de la règle par périphérique, par numéro de ligne (1-indexé).
+    fn sites_sans_regle_par_peripherique(source: &str) -> Vec<usize> {
+        let production = production(source);
+        let mut manquants = Vec::new();
+        let mut curseur = 0usize;
+        while let Some(pos) = production[curseur..].find(CONSTRUCTEUR) {
+            let debut = curseur + pos;
+            let conforme = arguments_du_constructeur(production, debut)
+                .is_some_and(|args| args.contains(REGLE));
+            if !conforme {
+                manquants.push(production[..debut].lines().count());
+            }
+            curseur = debut + CONSTRUCTEUR.len();
+        }
+        manquants
+    }
+
+    /// Combien de sites ce fichier porte, conformes ou non.
+    fn nombre_de_sites_i3245(source: &str) -> usize {
+        production(source).matches(CONSTRUCTEUR).count()
+    }
+
+    #[test]
+    fn les_deux_sites_d_enregistrement_local_decident_l_exclusif_par_peripherique() {
+        let fichiers = [
+            (
+                "tune-server/src/background.rs",
+                include_str!("background.rs"),
+            ),
+            ("tune-server/src/startup.rs", include_str!("startup.rs")),
+        ];
+
+        let mut total = 0usize;
+        for (chemin, source) in fichiers {
+            total += nombre_de_sites_i3245(source);
+            let manquants = sites_sans_regle_par_peripherique(source);
+            assert!(
+                manquants.is_empty(),
+                "{chemin} construit une sortie locale sans décider son mode \
+                 exclusif PAR PÉRIPHÉRIQUE, ligne(s) {manquants:?}. Sans \
+                 `local_exclusive_mode_du_peripherique(...)` en ARGUMENT, la \
+                 contrainte « ASIO est exclusif par nature » déborde sur un nom \
+                 énuméré par WASAPI : Tune ouvre WASAPI en EXCLUSIF et la \
+                 machine perd le son de toutes ses autres applications (#3245, \
+                 jfpaquet, Asus Essence STX II)"
+            );
+        }
+
+        assert_eq!(
+            total, 2,
+            "les deux seuls sites d'enregistrement d'une sortie locale issue \
+             d'une énumération sont `register_local_outputs` (startup.rs) et \
+             `rescan_local_audio_devices` (background.rs). Un site de plus ou \
+             de moins : reprendre le recensement avant de toucher à ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur lui-même. Sans elle,
+    /// `sites_sans_regle_par_peripherique` pourrait ne rien détecter du tout et
+    /// la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_un_site_qui_impose_la_valeur_machine() {
+        let sain = "let x = regle(b, Some(&dev.backend), d);\nlet o = LocalOutput::with_options_and_endpoint(n, e, statut_exclusif.effective, b);\n";
+        assert!(
+            sites_sans_regle_par_peripherique(sain).is_empty(),
+            "le détecteur doit accepter un site dont l'ARGUMENT vient de la règle"
+        );
+        assert_eq!(nombre_de_sites_i3245(sain), 1);
+
+        let malade = "let s = state.clone();\nlet o = LocalOutput::with_options_and_endpoint(n, e, state.effective_exclusive_mode(), b);\n";
+        assert_eq!(
+            sites_sans_regle_par_peripherique(malade),
+            vec![2],
+            "le détecteur doit nommer la ligne d'un site qui impose la valeur \
+             MACHINE à chaque périphérique — c'est le défaut de #3245"
+        );
+
+        // LE CAS QUI COMPTE, et celui qu'une simple fenêtre d'octets raterait :
+        // l'argument est redevenu la valeur machine, mais la TRACE voisine
+        // nomme encore la règle. C'est exactement la forme du site de
+        // `startup.rs`. Un détecteur qui lirait 800 octets autour de l'appel
+        // resterait vert ici, contre un défaut bien vivant.
+        let sauve_par_sa_trace = "let s = state.clone();\nlet o = LocalOutput::with_options_and_endpoint(n, e, state.effective_exclusive_mode(), b);\ninfo!(effectif = statut_exclusif.effective);\n";
+        assert_eq!(
+            sites_sans_regle_par_peripherique(sauve_par_sa_trace),
+            vec![2],
+            "une trace qui NOMME la règle ne doit pas tenir lieu de l'avoir \
+             APPELÉE : c'est l'argument qui atteint le pilote, pas le journal"
+        );
+
+        // Et le retranchement du module de test doit vraiment couper.
+        let avec_tests = format!(
+            "let o = LocalOutput::with_options_and_endpoint(n, e, x, b);\n#[cfg({})]\nmod t {{ LocalOutput::with_options_and_endpoint(n, e, statut_exclusif.effective, b) }}\n",
+            "test"
+        );
+        assert_eq!(
+            nombre_de_sites_i3245(&avec_tests),
+            1,
+            "un site cité dans un module de test ne doit pas être compté"
         );
     }
 }
