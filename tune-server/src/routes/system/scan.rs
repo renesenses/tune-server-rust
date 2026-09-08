@@ -902,6 +902,12 @@ impl ChiffresDeFinDeScan<'_> {
             "artwork_extracted": self.artwork_extracted,
             "auto_enrichment": self.auto_enrichment,
             "failed_paths": self.scan_stats.failed_paths,
+            // Les fichiers de 0 octet — copies interrompues (#2060). Un
+            // COMPTEUR, donc il part chez les trois consommateurs. Il ne
+            // doublonne pas `metadata_failed`, il le désambiguïse : sans lui,
+            // « 5 » sur 49 629 fichiers peut aussi bien désigner cinq fichiers
+            // aux balises abîmées, et le testeur n'a aucun moyen de trancher.
+            "skipped_empty_files": self.scan_stats.empty_files,
             // Des COMPTEURS, donc ils partent chez les trois consommateurs —
             // comme tous les autres. Seule la liste nominative des feuilles
             // écartées reste au fichier (`cue_sheets_skipped_paths`), pour la
@@ -950,6 +956,10 @@ impl ChiffresDeFinDeScan<'_> {
         rapport["skipped_unsupported_paths"] = json!(self.skipped_unsupported_paths);
         rapport["skipped_no_metadata_paths"] = json!(self.skipped_no_metadata_paths);
         rapport["skipped_duplicate_paths"] = json!(self.skipped_duplicate_paths);
+        // LESQUELS sont vides (#2060). Même règle : la liste est nominative,
+        // elle sort par le seul fichier. C'est celle-là que le testeur recopie
+        // pour aller effacer ses copies interrompues.
+        rapport["skipped_empty_file_paths"] = json!(self.scan_stats.empty_file_paths);
         // LESQUELLES, pas seulement combien (#1763). Même règle que ci-dessus :
         // ce sont des chemins de l'utilisateur, ils sortent par le fichier.
         rapport["cue_sheets_skipped_paths"] = json!(self.cue.chemins_ecartes);
@@ -976,6 +986,8 @@ impl ChiffresDeFinDeScan<'_> {
             // tronquée en silence : c'est exactement le défaut « un chemin
             // corrigé, les autres nus » que cette clé existe pour éviter.
             || self.cue.chemins_ecartes.len() >= PLAFOND
+            // La cinquième liste (#2060) obéit au même plafond.
+            || self.scan_stats.empty_file_paths.len() >= PLAFOND
     }
 }
 
@@ -3759,6 +3771,11 @@ mod rapport_de_fin_de_scan {
             metadata_failed: 60,
             metadata_timeout: 40,
             failed_paths: vec!["/Volumes/musique/piste.flac".to_string()],
+            // Les copies interrompues (#2060). Un chiffre distinct de tous les
+            // autres : un rapport qui rangerait deux compteurs sous la mauvaise
+            // clé passerait sinon inaperçu.
+            empty_files: 111,
+            empty_file_paths: vec!["/Volumes/musique/copie-interrompue.flac".to_string()],
             ..Default::default()
         }
     }
@@ -3809,6 +3826,9 @@ mod rapport_de_fin_de_scan {
             vec![
                 "cue_sheets_skipped_paths",
                 "skipped_duplicate_paths",
+                // Les fichiers de 0 octet (#2060) : le COMPTEUR part chez les
+                // trois, la liste nominative par le seul fichier.
+                "skipped_empty_file_paths",
                 "skipped_no_metadata_paths",
                 "skipped_paths_truncated",
                 "skipped_unsupported_by_ext",
@@ -3866,6 +3886,13 @@ mod rapport_de_fin_de_scan {
         assert_eq!(
             r["failed_paths"],
             serde_json::json!(["/Volumes/musique/piste.flac"])
+        );
+        // Les copies interrompues (#2060) : un compteur exhaustif chez les
+        // trois consommateurs, la liste nominative dans le seul fichier.
+        assert_eq!(r["skipped_empty_files"], serde_json::json!(111));
+        assert_eq!(
+            r["skipped_empty_file_paths"],
+            serde_json::json!(["/Volumes/musique/copie-interrompue.flac"])
         );
         assert_eq!(
             r["skipped_unsupported_by_ext"],
@@ -3972,11 +3999,18 @@ mod rapport_de_fin_de_scan {
         /// Sous leur forme littérale de clé JSON. Chercher le mot nu
         /// attraperait le nom de la variable Rust et passerait sans qu'aucune
         /// clé ne soit publiée.
-        const CLES: [&str; 6] = [
+        const CLES: [&str; 8] = [
             "\"skipped_unsupported_paths\"",
             "\"skipped_no_metadata_paths\"",
             "\"skipped_duplicate_paths\"",
             "\"skipped_paths_truncated\"",
+            // Les fichiers de 0 octet (#2060), mêmes deux clés des deux côtés :
+            // le compteur pour les trois consommateurs, la liste nominative
+            // pour le seul fichier. C'est l'unique information qui dise à
+            // l'utilisateur qu'une copie interrompue traîne dans sa
+            // bibliothèque.
+            "\"skipped_empty_files\"",
+            "\"skipped_empty_file_paths\"",
             // Les feuilles CUE (#1763) : mêmes deux clés des deux côtés, pour
             // la même raison. Le compteur part chez les trois consommateurs,
             // la liste nominative par le seul fichier.
@@ -4005,20 +4039,23 @@ mod rapport_de_fin_de_scan {
         }
     }
 
-    /// Les trois motifs sont pourvus, pas un seul (#2050).
+    /// Chaque motif d'écart est pourvu, pas un seul (#2050, #2060).
     ///
     /// « Un chemin corrigé, les autres nus » est le défaut qui revient : le
-    /// scan écarte pour trois motifs distincts, et n'en instrumenter qu'un
+    /// scan écarte pour plusieurs motifs distincts, et n'en instrumenter qu'un
     /// laisse l'utilisateur devant une liste qui ne contient pas son fichier,
-    /// sans lui dire que deux autres listes existaient.
+    /// sans lui dire que les autres listes existaient. Le quatrième motif est
+    /// le fichier de 0 octet (#2060) : c'est celui qui manquait chez Belkadi
+    /// Yacine.
     #[test]
-    fn les_trois_motifs_d_ecart_ont_chacun_leur_liste() {
+    fn chaque_motif_d_ecart_a_sa_liste() {
         let stats = stats_de_scan();
         let r = chiffres(&stats).rapport_du_fichier();
         for cle in [
             "skipped_unsupported_paths",
             "skipped_no_metadata_paths",
             "skipped_duplicate_paths",
+            "skipped_empty_file_paths",
         ] {
             let liste = r[cle].as_array().unwrap_or_else(|| panic!("{cle} absente"));
             assert!(!liste.is_empty(), "{cle} est publiée mais toujours vide");

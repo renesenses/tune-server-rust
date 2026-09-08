@@ -1034,6 +1034,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
+            // Les fichiers de 0 octet (#2060) — même clé que le scan manuel.
+            // Un compteur : il part chez les trois consommateurs.
+            "skipped_empty_files": stats.empty_files,
             "skipped_unsupported_by_ext": skipped_by_ext,
             "skipped_unsupported_reasons": skipped_reasons,
             // Ce que les feuilles CUE décrivent (#1763) — mêmes clés que
@@ -1061,12 +1064,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         report_fichier["skipped_duplicate_paths"] = serde_json::json!(skipped_duplicate_paths);
         report_fichier["cue_sheets_skipped_paths"] =
             serde_json::json!(inventaire_cue.chemins_ecartes);
+        // LESQUELS sont vides (#2060) — même clé que le scan manuel.
+        report_fichier["skipped_empty_file_paths"] = serde_json::json!(stats.empty_file_paths);
         report_fichier["skipped_paths_truncated"] = serde_json::json!(
             [
                 skipped_unsupported_paths.len(),
                 skipped_no_metadata_paths.len(),
                 skipped_duplicate_paths.len(),
                 inventaire_cue.chemins_ecartes.len(),
+                stats.empty_file_paths.len(),
             ]
             .iter()
             .any(|n| *n >= tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES)

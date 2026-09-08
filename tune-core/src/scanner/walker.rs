@@ -552,6 +552,69 @@ pub struct ScanStats {
     /// Les lignes que la base a refusées à la MISE À JOUR — même mécanique et
     /// même raison que [`Self::db_insert_failed`].
     pub db_update_failed: usize,
+    /// Combien de fichiers audio de **0 octet** le scan a écartés (#2060).
+    ///
+    /// Décompte EXHAUSTIF, jamais plafonné : c'est lui qui doit répondre à
+    /// « combien ? ». Le parcours écartait déjà ces fichiers — un `warn!` par
+    /// fichier, et rien d'autre. Ils étaient versés dans le fourre-tout
+    /// `metadata_failed`, qui compte des BALISES ILLISIBLES : chez Belkadi
+    /// Yacine (#2060, 07/09/2026) le rapport annonçait `metadata_failed=5` sur
+    /// 49 629 fichiers, sans que rien ne distingue cinq copies interrompues de
+    /// cinq fichiers aux balises abîmées. Le seul endroit qui le savait était
+    /// une ligne de journal que l'utilisateur n'a aucun moyen de lire.
+    ///
+    /// Ils RESTENT comptés dans `metadata_failed` : ce compteur-ci s'ajoute,
+    /// il ne déplace rien. Changer `metadata_failed` changerait du même coup
+    /// [`Self::a_perdu_des_pistes`], et ce ticket demande un signalement, pas
+    /// une redéfinition de ce qu'est une perte.
+    pub empty_files: usize,
+    /// LESQUELS, plafonnés par [`PLAFOND_CHEMINS_ECARTES`] comme les autres
+    /// listes nominatives — un compteur ne dit jamais quel fichier recopier.
+    pub empty_file_paths: Vec<String>,
+}
+
+/// Le motif inscrit dans [`ScanStats::failed_paths`] pour un fichier vide.
+///
+/// Nommé une fois pour les deux parcours : c'est du texte lu par un humain
+/// dans le rapport, et deux orthographes rendraient le rapport dépendant de
+/// quel chemin de scan l'a produit.
+pub const MOTIF_FICHIER_VIDE: &str = "empty file (0 bytes)";
+
+/// Ce que les deux parcours font d'un fichier de 0 octet, écrit UNE fois.
+///
+/// Les deux boucles de lecture ([`scan_files_parallel`] et
+/// [`scan_files_batched`]) sont des sœurs recopiées ; le geste « écarter un
+/// fichier vide » y était déjà dupliqué mot pour mot. L'instrumenter à un seul
+/// des deux endroits aurait rendu le compteur dépendant du chemin de scan
+/// employé — exactement le mode d'échec silencieux de #2012 et #2050.
+#[derive(Default)]
+pub struct EcartsFichiersVides {
+    compte: AtomicUsize,
+    chemins: Mutex<Vec<String>>,
+}
+
+impl EcartsFichiersVides {
+    /// Écarte un fichier vide : le journal, le décompte, l'échantillon
+    /// nominatif, et la liste des échecs déjà publiée.
+    fn ecarter(&self, chemin: &str, echecs: &Mutex<Vec<(String, String)>>) {
+        warn!(path = %chemin, "scan_file_empty_skipped — zero-byte file (aborted copy?)");
+        self.compte.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut chemins) = self.chemins.lock() {
+            pousser_chemin_ecarte(&mut chemins, chemin);
+        }
+        echecs
+            .lock()
+            .unwrap()
+            .push((chemin.to_string(), MOTIF_FICHIER_VIDE.to_string()));
+    }
+
+    fn compte(&self) -> usize {
+        self.compte.load(Ordering::Relaxed)
+    }
+
+    fn chemins(self) -> Vec<String> {
+        self.chemins.into_inner().unwrap_or_default()
+    }
 }
 
 impl ScanStats {
@@ -1520,6 +1583,7 @@ pub fn scan_files_parallel(
     let timeout_counter = AtomicUsize::new(0);
     let total = files.len();
     let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let vides = EcartsFichiersVides::default();
 
     let results: Vec<ScannedFile> = files
         .par_iter()
@@ -1551,11 +1615,7 @@ pub fn scan_files_parallel(
             // tracks: don't index a tagless duration-0 ghost, surface them in
             // failed_paths so the report shows what to clean.
             if stat_ok && file_size == 0 {
-                warn!(path = %path_str, "scan_file_empty_skipped — zero-byte file (aborted copy?)");
-                failed_files
-                    .lock()
-                    .unwrap()
-                    .push((path_str.clone(), "empty file (0 bytes)".into()));
+                vides.ecarter(&path_str, &failed_files);
                 return ScannedFile {
                     path: path_str,
                     metadata: None,
@@ -1677,6 +1737,8 @@ pub fn scan_files_parallel(
         // fermeture d'import (#2939).
         db_insert_failed: 0,
         db_update_failed: 0,
+        empty_files: vides.compte(),
+        empty_file_paths: vides.chemins(),
     };
     if !failed.is_empty() {
         let listing: Vec<String> = failed
@@ -1854,6 +1916,7 @@ pub fn scan_files_batched(
         // Parse metadata in parallel within this chunk
         let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let batch_timeout_counter = AtomicUsize::new(0);
+        let vides = EcartsFichiersVides::default();
 
         let read_batch = || {
             chunk
@@ -1877,11 +1940,7 @@ pub fn scan_files_batched(
                     // tracks: don't index a tagless duration-0 ghost, surface
                     // them in failed_paths so the report shows what to clean.
                     if stat_ok && file_size == 0 {
-                        warn!(path = %path_str, "scan_file_empty_skipped — zero-byte file (aborted copy?)");
-                        failed_files
-                            .lock()
-                            .unwrap()
-                            .push((path_str.clone(), "empty file (0 bytes)".into()));
+                        vides.ecarter(&path_str, &failed_files);
                         return ScannedFile {
                             path: path_str,
                             metadata: None,
@@ -1958,6 +2017,13 @@ pub fn scan_files_batched(
             .count();
         aggregate.metadata_timeout += batch_timeouts;
         aggregate.hash_ok += batch.iter().filter(|f| f.audio_hash.is_some()).count();
+        // Les fichiers de 0 octet du lot (#2060). Sœur de la variante directe :
+        // le décompte s'additionne sans plafond, l'échantillon nominatif garde
+        // le sien.
+        aggregate.empty_files += vides.compte();
+        for chemin in vides.chemins() {
+            pousser_chemin_ecarte(&mut aggregate.empty_file_paths, chemin);
+        }
         for file in batch.iter() {
             let Some(unsupported) = file.unsupported.as_ref() else {
                 continue;
@@ -2804,6 +2870,143 @@ mod tests {
         assert_eq!(batch_stats.db_update_failed, 0);
         assert!(!batch_stats.a_perdu_des_pistes());
         assert_eq!(batch_stats.unsupported_by_ext.get("dff-dst"), Some(&1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Un fichier de 0 octet est COMPTÉ et NOMMÉ, pas seulement journalisé
+    /// (#2060).
+    ///
+    /// Chez Belkadi Yacine, cinq copies interrompues étaient écartées en
+    /// silence : le rapport de scan annonçait `metadata_failed=5` sur 49 629
+    /// fichiers, un chiffre qui ne distingue pas une copie interrompue d'un
+    /// fichier aux balises abîmées. Il cherchait des fichiers « présents dans
+    /// l'explorateur, absents de Tune » sans avoir le moindre moyen de savoir
+    /// que Tune les avait vus et écartés.
+    ///
+    /// **Contre-épreuve dans le même test** : un fichier NON vide mais
+    /// illisible (un octet de remplissage) doit rester hors du compteur et
+    /// hors de la liste. Sans elle, `empty_files` pourrait valoir « tout ce
+    /// qui a échoué » et le rapport serait faux dans l'autre sens.
+    ///
+    /// Les deux parcours sont jugés : le direct ET celui par lots, que le
+    /// serveur emploie. Une instrumentation posée d'un seul côté rendrait le
+    /// compteur dépendant du chemin de scan.
+    ///
+    /// La fixture vit sous `CARGO_MANIFEST_DIR/target`, jamais dans `/tmp` :
+    /// sur la machine de compilation, `/tmp` rend des parcours vides.
+    #[test]
+    fn un_fichier_de_zero_octet_est_compte_et_nomme() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_fichier_vide_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vide = dir.join("copie-interrompue.flac");
+        let pas_vide = dir.join("illisible-mais-non-vide.flac");
+        std::fs::write(&vide, b"").unwrap();
+        std::fs::write(&pas_vide, b"\0").unwrap();
+
+        let listed = list_audio_files(&[dir.to_string_lossy().to_string()]);
+        assert_eq!(
+            listed.files.len(),
+            2,
+            "les deux fichiers doivent être inventoriés : c'est la lecture qui les sépare"
+        );
+
+        let vide_txt = vide.to_string_lossy().to_string();
+        let pas_vide_txt = pas_vide.to_string_lossy().to_string();
+
+        for (parcours, stats) in [
+            ("direct", scan_files_parallel(&listed.files, false, None).1),
+            (
+                "par lots",
+                scan_files_batched(&listed.files, false, 1, |_, _, _| {
+                    EcrituresDuLot::SANS_PERTE
+                }),
+            ),
+        ] {
+            assert_eq!(
+                stats.empty_files, 1,
+                "parcours {parcours} : le fichier de 0 octet doit être compté (#2060)"
+            );
+            assert_eq!(
+                stats.empty_file_paths.len(),
+                1,
+                "parcours {parcours} : la liste nomme le fichier vide, et lui seul"
+            );
+            assert!(
+                stats.empty_file_paths[0].contains("copie-interrompue.flac"),
+                "parcours {parcours} : c'est le chemin du fichier vide qui est publié, \
+                 pas un autre — obtenu {:?}",
+                stats.empty_file_paths
+            );
+            // Contre-épreuve, moitié négative : l'autre fichier n'est pas vide.
+            // Il est d'ailleurs entré en bibliothèque avec un titre tiré de son
+            // nom de fichier, alors que ses octets ne disent rien — c'est bien
+            // la TAILLE NULLE qui écarte, pas l'illisibilité des balises.
+            assert!(
+                !stats
+                    .empty_file_paths
+                    .iter()
+                    .any(|c| c.contains("illisible-mais-non-vide")),
+                "parcours {parcours} : un fichier non vide n'est pas un fichier vide"
+            );
+            let echecs = stats.failed_paths.join("\n");
+            assert!(
+                echecs.contains(&vide_txt) && echecs.contains(MOTIF_FICHIER_VIDE),
+                "parcours {parcours} : le fichier vide reste dans `failed_paths` avec son \
+                 motif — le compteur s'ajoute, il ne déplace rien. Obtenu : {echecs}"
+            );
+            assert!(
+                !echecs.contains(&pas_vide_txt),
+                "parcours {parcours} : le fichier non vide n'a rien à faire dans les échecs"
+            );
+            assert_eq!(
+                stats.metadata_failed, 1,
+                "parcours {parcours} : le fichier vide reste compté dans `metadata_failed` — \
+                 ce ticket ajoute un compteur, il n'en redéfinit aucun"
+            );
+            assert_eq!(
+                stats.metadata_ok, 1,
+                "parcours {parcours} : le fichier non vide, lui, entre en bibliothèque"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L'autre moitié de la contre-épreuve : une bibliothèque SANS fichier
+    /// vide publie zéro, et une liste vide.
+    ///
+    /// Sans elle, un compteur câblé sur « nombre de fichiers lus » passerait le
+    /// test précédent.
+    #[test]
+    fn une_bibliotheque_sans_fichier_vide_ne_compte_rien() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_sans_fichier_vide_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("illisible.flac"), b"\0\0\0\0").unwrap();
+
+        let listed = list_audio_files(&[dir.to_string_lossy().to_string()]);
+        assert_eq!(listed.files.len(), 1);
+
+        let (_, stats) = scan_files_parallel(&listed.files, false, None);
+        assert_eq!(stats.empty_files, 0);
+        assert!(stats.empty_file_paths.is_empty());
+        // Le zéro n'est pas celui d'un parcours qui n'aurait rien vu : le
+        // fichier a bien été lu, et il est entré en bibliothèque.
+        assert_eq!(stats.total_files, 1);
+        assert_eq!(stats.metadata_ok, 1);
+        assert!(stats.failed_paths.is_empty());
+
+        let batch = scan_files_batched(&listed.files, false, 1, |_, _, _| {
+            EcrituresDuLot::SANS_PERTE
+        });
+        assert_eq!(batch.empty_files, 0);
+        assert!(batch.empty_file_paths.is_empty());
+        assert_eq!(batch.metadata_ok, 1);
+        assert!(batch.failed_paths.is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
