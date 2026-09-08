@@ -153,11 +153,52 @@ async fn subscribe(
             &body.source_id as &dyn ToSqlValue,
         ],
     ) {
-        Ok(_) => {
-            info!(title = %body.title, feed_url = %feed_url, "podcast_subscribed");
+        // `execute` rend le nombre de lignes RÉELLEMENT écrites, sur les deux
+        // moteurs : `INSERT OR IGNORE` sur SQLite et `ON CONFLICT (feed_url)
+        // DO NOTHING` sur PostgreSQL rendent tous deux 0 quand la ligne était
+        // déjà là (`rows_affected()` côté PG, cf. #3248). C'est le seul signal
+        // qui sépare les deux cas, et il était jeté ici (#3542).
+        Ok(lignes_ecrites) => {
+            let creation = lignes_ecrites > 0;
+            // L'identifiant est relu par le flux, jamais par `last_insert_rowid`
+            // : sur un abonnement DÉJÀ existant aucune ligne n'a été écrite, et
+            // sur PostgreSQL un `ON CONFLICT` ne renseigne rien. Une seule
+            // requête couvre donc honnêtement les deux cas. Le `?` est traduit
+            // en `$1` par le dos PostgreSQL, comme partout ailleurs sur ce
+            // chemin (cf. `unsubscribe`).
+            let id = state
+                .backend
+                .query_one(
+                    "SELECT id FROM podcast_subscriptions WHERE feed_url = ?",
+                    &[&feed_url as &dyn ToSqlValue],
+                )
+                .ok()
+                .flatten()
+                .and_then(|r| r.first().and_then(|v| v.as_i64()));
+            info!(
+                title = %body.title,
+                feed_url = %feed_url,
+                creation,
+                id,
+                "podcast_subscribed"
+            );
+            // 201 pour une création, 200 pour un abonnement déjà présent : un
+            // client qui reçoit 201 sait qu'il vient d'ajouter quelque chose et
+            // peut le dire, là où le 201 systématique d'avant lui faisait
+            // annoncer un ajout à chaque nouveau clic sur le même podcast.
+            let code = if creation {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
             (
-                StatusCode::CREATED,
-                Json(json!({"title": body.title, "feed_url": feed_url})),
+                code,
+                Json(json!({
+                    "id": id,
+                    "created": creation,
+                    "title": body.title,
+                    "feed_url": feed_url,
+                })),
             )
                 .into_response()
         }

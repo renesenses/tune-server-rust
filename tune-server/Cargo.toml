@@ -271,6 +271,17 @@ path = "tests/pairs_decouverts_i2746.rs"
 name = "comptes_par_source_2147"
 path = "tests/comptes_par_source_2147.rs"
 
+# #3542 : `POST /podcasts/subscriptions` rendait 201 dans les deux cas —
+# creation reelle et abonnement deja present — sans porter l'identifiant de la
+# ligne. `autotests = false` plus haut : sans cette cible, le fichier ne serait
+# JAMAIS compile, donc vert contre rien.
+#
+# Pas de `required-features` : le banc monte une base SQLite en memoire et
+# appelle la route par son URL, il ne demande aucune base externe ni reseau.
+[[test]]
+name = "podcasts_abonnement_identifiant_3542"
+path = "tests/podcasts_abonnement_identifiant_3542.rs"
+
 # #3226 generalise : `sources` gouverne desormais AUSSI le bloc local de
 # `/home/other-versions`, `/home/artist-releases` et
 # `/library/tracks/{id}/versions`, la ou il ne filtrait que la boucle des
