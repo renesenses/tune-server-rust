@@ -104,13 +104,26 @@ pub struct DlnaOutput {
     /// est [`DlnaOutput::with_budget_reveil_ms`] ; la production ne l'appelle
     /// nulle part et garde donc la constante, au millieme pres.
     budget_reveil_ms: AtomicU64,
-    /// Alternates between false ("1") and true ("2") so that consecutive
-    /// DIDL items sent via SetAVTransportURI / SetNextAVTransportURI use
-    /// different item IDs.  Renderers like Marantz ND8006 cache DIDL
-    /// metadata keyed by item id — using the same id for both current and
-    /// next track causes the renderer to display stale metadata (wrong
-    /// duration, format) on every other track.
-    next_item_id_flip: AtomicBool,
+    /// Compteur MONOTONE des `item id` DIDL émis vers CET appareil.
+    ///
+    /// Les renderers du genre Marantz ND8006 indexent les métadonnées DIDL
+    /// qu'ils gardent en cache sur l'`item id` : réutiliser un id déjà vu leur
+    /// fait réafficher les anciennes (durée, format, progression de la piste
+    /// précédente).
+    ///
+    /// 🔴 Ce champ était un `AtomicBool` qui alternait « 1 » / « 2 »
+    /// (`d53191bb`, 14/06/2026). Deux valeurs pour DEUX appelants —
+    /// `play_media` (`SetAVTransportURI`) et `set_next_media`
+    /// (`SetNextAVTransportURI`) — ne peuvent pas rester distinctes dans la
+    /// durée : la piste 3 récupérait l'id de la piste 1, la piste 4 celui de
+    /// la piste 2. La collision revenait donc avec une PÉRIODE DE DEUX, c'est
+    /// à dire exactement le « une piste sur deux » que le correctif visait, et
+    /// exactement ce que Jean Valjean décrit le lendemain de sa livraison
+    /// (fil forum 631, 15/06/2026, #3675).
+    ///
+    /// Un compteur qui ne revient jamais en arrière n'a pas de période : deux
+    /// émissions ne partagent plus jamais d'id sur la vie du processus.
+    item_id_seq: AtomicU64,
     /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
     /// 2 = vide). La pile Platinum de l'Eversolo ne lit qu'un segment TCP de
     /// requête : le DIDL complet déborde et finit en « 500 sans corps », le
@@ -282,7 +295,7 @@ impl DlnaOutput {
                 .unwrap_or_default(),
             play_delay_ms: AtomicU64::new(0),
             budget_reveil_ms: AtomicU64::new(BUDGET_REVEIL_STANDBY.as_millis() as u64),
-            next_item_id_flip: AtomicBool::new(false),
+            item_id_seq: AtomicU64::new(1),
             didl_niveau_appris: AtomicU8::new(0),
             muted: AtomicBool::new(false),
             micromega_ip,
@@ -736,7 +749,7 @@ impl DlnaOutput {
     async fn reposer_uri(
         &self,
         media: &PlayMedia<'_>,
-        item_id: &'static str,
+        item_id: &str,
         mime: &str,
         niveau_didl: u8,
     ) -> Result<String, String> {
@@ -857,13 +870,16 @@ impl DlnaOutput {
         Self::didl_metadata_minimale(media, item_id, mime)
     }
 
-    /// Return the next item id ("1" or "2") and flip the toggle.
-    /// Alternating ids prevents renderers (Marantz ND8006 etc.) from
-    /// displaying stale cached metadata when the same id is reused for
-    /// consecutive tracks.
-    fn next_item_id(&self) -> &'static str {
-        let prev = self.next_item_id_flip.fetch_xor(true, Ordering::Relaxed);
-        if prev { "2" } else { "1" }
+    /// Rend un `item id` DIDL JAMAIS DÉJÀ ÉMIS vers cet appareil, et avance le
+    /// compteur.
+    ///
+    /// Deux appelants seulement, et ils se suivent piste après piste :
+    /// [`DlnaOutput::play_media`] (`SetAVTransportURI`) et
+    /// [`DlnaOutput::set_next_media`] (`SetNextAVTransportURI`). Voir
+    /// [`DlnaOutput::item_id_seq`] pour la raison du compteur monotone : une
+    /// alternance à deux valeurs collisionnait une fois sur deux (#3675).
+    fn next_item_id(&self) -> String {
+        self.item_id_seq.fetch_add(1, Ordering::Relaxed).to_string()
     }
 
     fn parse_time(time_str: &str) -> u64 {
@@ -973,7 +989,10 @@ impl OutputTarget for DlnaOutput {
             }
         }
 
-        let item_id = self.next_item_id();
+        // Un id neuf pour CETTE piste : l'ancienne alternance à deux valeurs
+        // rendait la piste 3 identique à la piste 1 (#3675).
+        let item_id_courant = self.next_item_id();
+        let item_id = item_id_courant.as_str();
 
         // First attempt: announce `media.mime_type` UNCHANGED — exactly the
         // previous behaviour. The Sink is NOT probed here: a healthy renderer
@@ -1711,7 +1730,10 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        let item_id = self.next_item_id();
+        // Id neuf, distinct de celui du `SetAVTransportURI` qui précède comme de
+        // tous ceux déjà émis vers cet appareil (#3675).
+        let item_id_suivant = self.next_item_id();
+        let item_id = item_id_suivant.as_str();
         // Même échelle que le SetAVTransportURI du play : le DIDL complet du
         // gapless a la même taille, donc le même échec de lecture chez
         // Platinum — et un gapless silencieusement perdu, c'est une file qui
@@ -3338,9 +3360,15 @@ mod tests {
     }
 
     #[test]
-    fn didl_item_id_alternates() {
-        // Verify that consecutive tracks get different item IDs to prevent
-        // Marantz ND8006 (and similar) from displaying cached metadata.
+    fn didl_metadata_ecrit_l_item_id_qu_on_lui_donne() {
+        // Ce test s'appelait `didl_item_id_alternates` et venait avec le
+        // correctif d'alternance de `d53191bb`. Il ne PROUVAIT PAS
+        // l'alternance : il passe « 1 » puis « 2 » à la main et n'appelle
+        // jamais `next_item_id`. Il est donc resté vert pendant les trois mois
+        // où la suite réellement émise valait `1, 2, 1, 2` (#3675). Ce qu'il
+        // vérifie, et c'est utile, c'est que l'id fourni ARRIVE dans le
+        // document. L'unicité, elle, se garde en appelant le générateur —
+        // `quatre_item_id_consecutifs_sont_tous_distincts` et ses voisins.
         let didl_1 = DlnaOutput::didl_metadata(
             &PlayMedia {
                 url: "http://x/track1",
@@ -3406,5 +3434,141 @@ mod tests {
         );
         assert!(didl.contains("sampleFrequency=\"96000\""));
         assert!(didl.contains("bitsPerSample=\"24\""));
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // #3675 — Marantz ND8006 : « une piste sur deux perd le format, le temps
+    // et sa progression » (Jean Valjean, fil forum 631, 15/06/2026).
+    //
+    // Ces gardes APPELLENT `next_item_id`, la fonction que les deux seuls
+    // appelants du fichier consomment : `DlnaOutput::play_media`
+    // (`SetAVTransportURI`, la piste courante) et `DlnaOutput::set_next_media`
+    // (`SetNextAVTransportURI`, la piste armée en gapless). Elles ne relisent
+    // pas la source.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Un renderer de test. `DlnaOutput::new` ne touche pas au réseau : rien
+    /// ne part tant qu'aucune action SOAP n'est émise, et aucune ne l'est ici.
+    fn renderer_de_test() -> DlnaOutput {
+        DlnaOutput::new(
+            "Marantz ND8006".to_string(),
+            "uuid:nd8006-de-test".to_string(),
+            "http://192.0.2.10:60006".to_string(),
+            "http://192.0.2.10:60006/AVTransport/ctrl".to_string(),
+            "http://192.0.2.10:60006/RenderingControl/ctrl".to_string(),
+            None,
+        )
+    }
+
+    /// La FORME FAUTIVE, reproduite : l'alternance à deux valeurs livrée le
+    /// 14/06/2026 (`d53191bb`). Sans cette moitié, la garde suivante pourrait
+    /// être verte sans rien avoir distingué.
+    ///
+    /// Quatre tirages — deux pistes armées en gapless — ne rendent que DEUX
+    /// valeurs : la piste 3 reprend l'id de la piste 1, la piste 4 celui de la
+    /// piste 2. La collision de cache que le correctif prétendait supprimer
+    /// revient donc avec une PÉRIODE DE DEUX, qui est la période même du
+    /// symptôme signalé.
+    #[test]
+    fn la_forme_fautive_reproduite_collisionne_avec_une_periode_de_deux() {
+        let bascule = AtomicBool::new(false);
+        let alterner = || {
+            if bascule.fetch_xor(true, Ordering::Relaxed) {
+                "2"
+            } else {
+                "1"
+            }
+        };
+
+        let ids: Vec<&str> = (0..4).map(|_| alterner()).collect();
+
+        assert_eq!(ids[0], ids[2], "piste 3 réutilise l'id de la piste 1");
+        assert_eq!(ids[1], ids[3], "piste 4 réutilise l'id de la piste 2");
+        let uniques: std::collections::BTreeSet<&&str> = ids.iter().collect();
+        assert_eq!(uniques.len(), 2, "le domaine ne compte que deux valeurs");
+    }
+
+    /// La forme livrée : quatre émissions consécutives, quatre ids distincts.
+    #[test]
+    fn quatre_item_id_consecutifs_sont_tous_distincts() {
+        let sortie = renderer_de_test();
+
+        let ids: Vec<String> = (0..4).map(|_| sortie.next_item_id()).collect();
+
+        let uniques: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(uniques.len(), ids.len(), "ids émis : {ids:?}");
+    }
+
+    /// Et sur une file entière : aucun id ne revient, quelle que soit la
+    /// répartition entre les deux appelants. Un compteur qui rebouclerait sur
+    /// un petit domaine — le défaut corrigé — serait rouge ici.
+    #[test]
+    fn deux_cents_emissions_ne_repetent_jamais_un_id() {
+        let sortie = renderer_de_test();
+
+        let ids: Vec<String> = (0..200).map(|_| sortie.next_item_id()).collect();
+
+        let uniques: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(uniques.len(), 200, "un id a été réémis");
+    }
+
+    /// Chaque appareil compte pour lui : deux renderers ne se volent pas leur
+    /// suite d'ids, et rien n'est partagé entre eux.
+    #[test]
+    fn le_compteur_est_propre_a_chaque_appareil() {
+        let un = renderer_de_test();
+        let autre = renderer_de_test();
+
+        // Deux appareils neufs partent du même id : le compteur n'est pas
+        // global.
+        assert_eq!(un.next_item_id(), autre.next_item_id());
+        // Et faire avancer l'un n'avance pas l'autre.
+        let _ = un.next_item_id();
+        assert_ne!(un.next_item_id(), autre.next_item_id());
+    }
+
+    /// L'id neuf arrive bien DANS le document DIDL envoyé au renderer —
+    /// l'attribut `id` de `<item>`, celui sur lequel le ND8006 indexe son
+    /// cache. Un compteur juste dont la valeur n'atteindrait pas le document
+    /// ne corrigerait rien.
+    #[test]
+    fn les_documents_didl_successifs_portent_des_id_distincts() {
+        let sortie = renderer_de_test();
+        let media = PlayMedia {
+            url: "http://192.0.2.1:8888/stream/1",
+            mime_type: "audio/flac",
+            title: Some("So What"),
+            artist: Some("Miles Davis"),
+            album: Some("Kind of Blue"),
+            duration_ms: Some(562_000),
+            file_size: Some(50_000_000),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            channels: Some(2),
+            ..Default::default()
+        };
+
+        let ids: Vec<String> = (0..4)
+            .map(|_| {
+                let didl = DlnaOutput::didl_metadata_pour_test(
+                    &media,
+                    &sortie.next_item_id(),
+                    media.mime_type,
+                );
+                // `build_escaped` rend `&lt;item id="1" …&gt;` : le chevron
+                // est échappé, les guillemets restent bruts (les analyseurs
+                // Denon/Marantz butent sur `&quot;`). Le marqueur cherché est
+                // donc valide sur les deux formes.
+                const MARQUEUR: &str = "item id=\"";
+                let debut = didl
+                    .find(MARQUEUR)
+                    .unwrap_or_else(|| panic!("aucun `{MARQUEUR}` dans le DIDL : {didl}"));
+                let reste = &didl[debut + MARQUEUR.len()..];
+                reste[..reste.find('"').expect("attribut id non terminé")].to_string()
+            })
+            .collect();
+
+        let uniques: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(uniques.len(), 4, "ids portés par les DIDL : {ids:?}");
     }
 }
