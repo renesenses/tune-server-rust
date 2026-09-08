@@ -359,9 +359,17 @@ pub(super) async fn album_tracks(
     // forwards it here so the album detail shows only the matching tracks
     // (Sergio: a Hi-Res/FLAC filter must not reveal the album's MP3/44.1
     // tracks). With no filter this is identical to list_by_album.
+    //
+    // `ou_defaut_journalise` et non `unwrap_or_default` (#2861) : une panne de
+    // base rendait ici une liste VIDE, indiscernable d'un album sans piste, et
+    // sans une ligne de journal. Le cas n'est pas theorique sur cette route —
+    // le rapport de jfpaquet du 02/09 (0.9.130, PostgreSQL, fil 1642) porte
+    // trois `panne_sql_avalee` de l'accueil dans la MEME fenetre de journal
+    // (#3181) : sur cette installation, une requete qui echoue en silence est
+    // l'ordinaire, pas l'exception. La reponse HTTP ne bouge pas.
     let items = dedup_display_tracks(
         repo.list_by_album_filtered(id, f.format.as_deref(), f.quality.as_deref())
-            .unwrap_or_default(),
+            .ou_defaut_journalise(),
     );
 
     // GROUPING (#2130) : lu au scan et rangé dans `track_metadata`, il n'était
@@ -374,7 +382,7 @@ pub(super) async fn album_tracks(
     let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
     let grouping = meta_repo
         .get_key_for_tracks("grouping", &track_ids)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
 
     // Dynamic Range par piste (#1388) : le tag `DYNAMIC RANGE` est lu au scan
     // (#1806, `track_metadata['dr_track']`) mais n'était ressorti par aucune
@@ -384,7 +392,7 @@ pub(super) async fn album_tracks(
     // vraie mesure (celle d'un master saturé).
     let dynamic_range = meta_repo
         .get_key_for_tracks("dr_track", &track_ids)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
 
     Json(json!(attach_track_tags(
         items,
