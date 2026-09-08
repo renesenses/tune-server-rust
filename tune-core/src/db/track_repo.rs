@@ -537,6 +537,28 @@ pub mod sql {
            AND album_id IS NOT NULL AND file_path IS NOT NULL"
     }
 
+    /// Ce que la base sait déjà de chaque piste locale, réduit aux SEULES
+    /// valeurs dont dépend le verdict « compilation » d'un dossier (#3528).
+    ///
+    /// `tracks` ne porte pas la balise `album` : elle est résolue en une ligne
+    /// `albums`. C'est donc `al.title` qui tient lieu de titre d'album, et
+    /// `al.is_compilation` de drapeau. `t.album_artist`, lui, est la balise
+    /// BRUTE, écrite telle quelle par `build_track_row`.
+    ///
+    /// `ar.name` est l'artiste que le scan a RÉSOLU pour la piste, et c'est
+    /// justement ce qui le rend sûr à relire : un fichier dont les balises
+    /// n'ont pas pu être lues (`TrackMetadata::artist_from_path`) n'a jamais
+    /// posé son nom de dossier ici — l'import l'avait déjà remplacé par
+    /// l'artiste épinglé du dossier. Le faux second artiste de #3232 ne peut
+    /// donc pas revenir par cette porte.
+    pub fn preuves_de_compilation() -> &'static str {
+        "SELECT t.file_path, t.album_artist, ar.name, al.title, al.is_compilation \
+         FROM tracks t \
+         LEFT JOIN artists ar ON ar.id = t.artist_id \
+         LEFT JOIN albums al ON al.id = t.album_id \
+         WHERE t.source = 'local' AND t.file_path IS NOT NULL"
+    }
+
     /// Le PRÉDICAT de la recherche de pistes, sans projection ni bornes.
     ///
     /// Extrait pour que la LISTE rendue et le COMPTE annoncé portent
@@ -719,6 +741,28 @@ impl InfoFichier {
     pub fn est_locale(&self) -> bool {
         self.source == "local"
     }
+}
+
+/// Ce que la base sait d'une piste déjà indexée, réduit aux valeurs dont
+/// dépend le verdict « compilation » de son dossier.
+///
+/// 🔴 #3528 — un scan incrémental ne PRÉSENTE que les fichiers modifiés : la
+/// décision se prenait donc sur une fraction du dossier, et un seul fichier
+/// relu suffisait à faire basculer l'album entier. Ces preuves-là amorcent le
+/// dossier depuis la base, pour les fichiers que le pré-filtre a écartés.
+///
+/// Rendue par [`TrackRepo::preuves_de_compilation`], une entrée par
+/// `file_path`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PreuveDeCompilation {
+    /// `tracks.album_artist` : la balise BRUTE, telle que le scan l'a lue.
+    pub album_artist: Option<String>,
+    /// L'artiste RÉSOLU de la piste (`artists.name` via `tracks.artist_id`).
+    pub artiste: Option<String>,
+    /// Le titre de la ligne `albums` où la piste a été rangée.
+    pub album: Option<String>,
+    /// `albums.is_compilation` : le verdict déjà rendu sur cette ligne.
+    pub compilation: bool,
 }
 
 pub struct TrackRepo {
@@ -2117,6 +2161,35 @@ impl TrackRepo {
                         mtime,
                         taille,
                         source,
+                    },
+                ))
+            })
+            .collect())
+    }
+
+    /// La carte `file_path` → [`PreuveDeCompilation`], pour toutes les pistes
+    /// locales déjà indexées.
+    ///
+    /// Voir [`sql::preuves_de_compilation`]. L'appelant n'en garde que les
+    /// chemins que le pré-filtre du scan a ÉCARTÉS : un fichier relu apporte
+    /// ses propres balises, fraîches, et n'a que faire de ce que la base
+    /// disait de lui (#3528). C'est aussi ce qui rend un « Scan complet »
+    /// souverain : il ne saute aucun fichier, donc il n'amorce rien.
+    pub fn preuves_de_compilation(
+        &self,
+    ) -> Result<HashMap<String, PreuveDeCompilation>, TuneError> {
+        let rows = self.db.query_many(sql::preuves_de_compilation(), &[])?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| {
+                let path = cols.first().and_then(|v| v.as_string())?;
+                Some((
+                    path,
+                    PreuveDeCompilation {
+                        album_artist: cols.get(1).and_then(|v| v.as_string()),
+                        artiste: cols.get(2).and_then(|v| v.as_string()),
+                        album: cols.get(3).and_then(|v| v.as_string()),
+                        compilation: crate::db::album_repo::drapeau_compilation(cols.get(4)),
                     },
                 ))
             })
