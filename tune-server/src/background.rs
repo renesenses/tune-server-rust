@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
 
+use tune_core::db::zone_repo::CreationDeZone;
 use tune_core::outputs::OutputRegistry;
 use tune_core::poller::{JournalSondage, TraceEchecSondage};
 
@@ -553,17 +554,30 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     }
                 }
 
-                // Auto-created zones start dormant and don't count against the
-                // free tier; the cap is enforced at first play in
-                // orchestrator.play(). So discovery may always register a device.
-                match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
-                    Ok((zid, true)) => {
+                // #3529 — ce lot tourne à CHAQUE démarrage et ne consultait pas
+                // « Créer automatiquement les zones ». Le commentaire qui
+                // tenait ici lieu de justification (« auto-created zones start
+                // dormant … discovery may always register a device ») parle du
+                // plafond du palier gratuit, PAS du réglage : une zone naît en
+                // ligne (`online` vaut `DEFAULT 1` au schéma). D'où « elles
+                // apparaissent ET s'activent toutes seules », chez Fabien, sur
+                // une installation où la case est décochée.
+                match zone_repo.get_or_create_si_autorise(
+                    &d.name,
+                    Some("dlna"),
+                    &d.id,
+                    "ssdp_startup",
+                ) {
+                    Ok(CreationDeZone::Creee(zid)) => {
                         let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
                     }
-                    Ok((zid, false)) => {
+                    Ok(CreationDeZone::Existante(zid)) => {
                         let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         let _ = zone_repo.set_online_by_device(&d.id, true);
+                    }
+                    Ok(CreationDeZone::Refusee) => {
+                        info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_auto_create_disabled_skipping");
                     }
                     Err(e) => {
                         tracing::warn!(name = %d.name, device_id = %d.id, error = %e, "ssdp_startup_zone_create_failed");
@@ -2293,13 +2307,9 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // Phase 2: Create zones and emit events (no lock held)
     if !new_devices_to_zone.is_empty() {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-        let auto_create =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                .get("zone_auto_create")
-                .ok()
-                .flatten()
-                .map(|v| v != "false")
-                .unwrap_or(true);
+        // #3529 — même lecture du réglage que partout ailleurs, mais elle
+        // n'est plus recopiée : `ZoneRepo` la porte une fois pour toutes.
+        let auto_create = zone_repo.zone_auto_create_autorise();
         let system_default_device_id = crate::startup::first_system_default_name(
             new_devices_to_zone
                 .iter()
