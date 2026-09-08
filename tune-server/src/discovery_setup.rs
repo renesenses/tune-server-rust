@@ -919,6 +919,19 @@ async fn handle_ssdp_discovered(
                 // Persist host + MAC so a later UUID change, protocol change
                 // or DHCP renumbering reconnects here (#942, #1239).
                 let _ = zone_repo.set_identity(zid, &dev.host, dev.mac_address.as_deref());
+                // #3589 — « à la découverte d'un appareil reconnu ». C'est
+                // ICI, et à la création manuelle, que « personne n'a rien
+                // réglé » est vrai par construction : la zone n'existait pas
+                // il y a une ligne. La provenance s'ouvre AVANT, sinon la
+                // préconfiguration refuse d'agir — c'est voulu.
+                crate::routes::zones::ouvrir_provenance_de_zone(db, zid);
+                crate::routes::zones::preconfigurer_zone_decouverte(
+                    db,
+                    zid,
+                    dev.manufacturer.as_deref(),
+                    dev.model.as_deref(),
+                    Some(type_str),
+                );
                 event_bus.emit_typed(
                     EventType::ZoneCreated,
                     charge_utile_zone_creee(

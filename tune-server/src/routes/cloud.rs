@@ -385,33 +385,66 @@ async fn sso_disconnect(State(state): State<AppState>) -> Json<Value> {
 // Telemetry
 // ---------------------------------------------------------------------------
 
+/// #3383 — `enabled` dit desormais l'etat EFFECTIF, celui que les gardes
+/// d'envoi consultent, et non plus la seule variable d'environnement.
+///
+/// `env_override` est ajoute pour repondre a la question que l'issue laissait
+/// ouverte : que montrer quand l'exploitant impose un etat que l'utilisateur
+/// ne peut pas changer. Vrai = `TUNE_TELEMETRY` coupe a l'echelle de la
+/// machine, la bascule de l'interface ne peut rien rallumer. Champ AJOUTE :
+/// un client qui l'ignore lit `enabled` comme avant.
 async fn telemetry_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let enabled = TelemetryReporter::is_enabled();
+    let enabled = TelemetryReporter::is_enabled_for(&settings);
     let server_id = settings.get("server_id").ok().flatten();
     let rate_limits = tune_core::cloud::rate_limit::active_all(&settings);
     Json(json!({
         "enabled": enabled,
+        "env_override": !TelemetryReporter::is_enabled(),
         "server_id": server_id,
         "rate_limits": rate_limits,
     }))
 }
 
+/// Ecrit le consentement, au lieu de se contenter de le relire (#3383).
+///
+/// `TUNE_TELEMETRY=false` reste souverain : la reponse renvoie l'etat
+/// EFFECTIF, donc `false`, et l'interface voit tout de suite que son clic n'a
+/// pas pris — au lieu de basculer une case que le rafraichissement suivant
+/// remettra en place toute seule.
 async fn telemetry_enable(State(state): State<AppState>) -> Json<Value> {
-    // Telemetry is now env-var-driven (TUNE_TELEMETRY=false to disable).
-    // This endpoint creates/returns the server_id for informational purposes.
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings
+        .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "true")
+        .ok();
     TelemetryReporter::get_or_create_server_id(&settings);
     info!("telemetry_enabled");
-    Json(json!({ "enabled": TelemetryReporter::is_enabled() }))
+    Json(json!({
+        "enabled": TelemetryReporter::is_enabled_for(&settings),
+        "env_override": !TelemetryReporter::is_enabled(),
+    }))
 }
 
-async fn telemetry_disable(State(_state): State<AppState>) -> Json<Value> {
-    // Telemetry is now disabled via TUNE_TELEMETRY=false env var.
-    info!("telemetry_disable_requested_use_env_var");
-    Json(
-        json!({ "enabled": TelemetryReporter::is_enabled(), "note": "Set TUNE_TELEMETRY=false to disable telemetry" }),
-    )
+/// Le refus est ECRIT, et les sept gardes d'envoi le lisent (#3383).
+///
+/// Avant ce correctif, cette route ne liait meme pas son `State` : elle
+/// journalisait « posez TUNE_TELEMETRY=false » et repondait `enabled: true`
+/// juste apres que l'utilisateur eut demande l'inverse.
+///
+/// Ce qui continue de partir, et c'est deliberé : la revalidation horaire de
+/// la cle de licence (trois champs, rien de descriptif) et le rafraichissement
+/// des droits premium SSO. Un opt-out ne doit jamais se payer en
+/// fonctionnalites perdues — voir `background::heartbeat_plan` (LIC-1).
+async fn telemetry_disable(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings
+        .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "false")
+        .ok();
+    info!("telemetry_disabled");
+    Json(json!({
+        "enabled": TelemetryReporter::is_enabled_for(&settings),
+        "env_override": !TelemetryReporter::is_enabled(),
+    }))
 }
 
 // ---------------------------------------------------------------------------

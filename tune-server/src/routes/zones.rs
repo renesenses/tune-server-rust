@@ -766,9 +766,93 @@ pub(crate) async fn output_capabilities(
     state: &AppState,
     output_device_id: Option<&str>,
 ) -> Option<tune_core::outputs::OutputCapabilities> {
+    output_capabilities_avec(state, output_device_id, &canaux_des_peripheriques_locaux()).await
+}
+
+/// Les périphériques audio locaux tels que le serveur les a déjà énumérés.
+///
+/// `cached_audio_devices` et non `list_audio_devices` : re-énumérer WASAPI
+/// sonde chaque appareil et peut tuer un flux en cours (DEvir). Une route de
+/// lecture n'a pas le droit de faire ça.
+///
+/// Vide quand la fonctionnalité `local-audio` n'est pas compilée — la sortie
+/// locale n'existe alors pas, et il n'y a rien à déclarer.
+///
+/// Rendu en couples `(nom, max_channels)` et non en `AudioDevice` : ce type
+/// n'existe pas sans `local-audio`, et le reste de la chaîne n'a besoin que de
+/// ces deux valeurs.
+pub(crate) fn canaux_des_peripheriques_locaux() -> Vec<(String, u16)> {
+    #[cfg(feature = "local-audio")]
+    {
+        tune_core::outputs::local::cached_audio_devices()
+            .into_iter()
+            .map(|appareil| (appareil.name, appareil.max_channels))
+            .collect()
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        Vec::new()
+    }
+}
+
+/// #3322 — le contrat déclarait `channel_layouts`, le publiait, et personne ne
+/// l'écrivait jamais : vide ou nul sur les quatorze zones mesurées le
+/// 04/09/2026. Le moteur multicanal de `tune_core::audio::channels` existait
+/// depuis le portage de `feat/multichannel` et n'avait AUCUN appelant.
+///
+/// L'appelant manquant est ici : c'est cette fonction qui assemble ce que
+/// `GET /zones` et `GET /zones/{id}` remettent au client — les deux passent
+/// par elle, donc les deux publient la même chose (critère d'acceptation 4).
+///
+/// Ce qu'elle remplit, et ce qu'elle laisse vide :
+///
+/// * une sortie qui déclare déjà ses dispositions garde les siennes, sans
+///   discussion — l'enrichissement ne recouvre jamais une donnée de première
+///   main ;
+/// * une sortie LOCALE reçoit celles que son appareil sait rendre, déduites de
+///   `AudioDevice::max_channels`, la valeur que l'énumération connaît déjà et
+///   que `GET /devices/audio` publie depuis toujours ;
+/// * tout le reste — DLNA, AirPlay, Chromecast, OAAT, navigateur — reste `[]`.
+///   Les canaux d'un renderer réseau se négocient DANS le flux ; ce n'est pas
+///   une propriété locale, et aucune source du dépôt ne la porte
+///   (`sink_protocols`, le paramètre du détecteur DLNA, n'a aucun producteur).
+///   `[]` dit « on ne sait pas » ; une valeur inventée mentirait.
+///
+/// Séparée de [`output_capabilities`] et prenant la liste en paramètre pour
+/// qu'un témoin puisse l'appeler avec un parc connu, sans dépendre de la carte
+/// son de la machine qui exécute les tests.
+pub async fn output_capabilities_avec(
+    state: &AppState,
+    output_device_id: Option<&str>,
+    peripheriques: &[(String, u16)],
+) -> Option<tune_core::outputs::OutputCapabilities> {
     let device_id = output_device_id?;
     let output = { state.outputs.lock().await.get(device_id) }?;
-    Some(output.lock().await.capabilities())
+    let mut capacites = output.lock().await.capabilities();
+    if capacites.channel_layouts.is_empty() {
+        capacites.channel_layouts =
+            dispositions_du_peripherique_local(device_id, peripheriques).unwrap_or_default();
+    }
+    Some(capacites)
+}
+
+/// Les dispositions qu'un identifiant de sortie LOCALE peut déclarer.
+///
+/// `None` dès que le lien n'est pas établi : identifiant qui n'est pas
+/// `local:…`, appareil absent du parc énuméré, ou `max_channels` à zéro. Aucun
+/// de ces trois cas ne se rattrape par une supposition.
+///
+/// L'identifiant est construit par `format!("local:{}", dev.name)` au moment
+/// de l'enregistrement (`startup.rs`, `background.rs`) : c'est ce même nom qui
+/// sert de clé ici.
+fn dispositions_du_peripherique_local(
+    device_id: &str,
+    peripheriques: &[(String, u16)],
+) -> Option<Vec<String>> {
+    let nom = device_id.strip_prefix("local:")?;
+    let (_, max_channels) = peripheriques.iter().find(|(n, _)| n == nom)?;
+    let dispositions = tune_core::audio::channels::ChannelLayout::noms_jusqu_a(*max_channels);
+    (!dispositions.is_empty()).then_some(dispositions)
 }
 
 /// La sortie enregistrée pour une zone ne sait-elle mettre en attente qu'un
@@ -896,7 +980,13 @@ mod ecriture;
 pub use ecriture::*;
 
 mod peripheriques;
+mod preconfiguration;
+
+// La découverte (`discovery_setup.rs`) crée des zones sans passer par le
+// routeur : elle a besoin des deux mêmes gestes que `POST /zones`.
 pub use peripheriques::*;
+pub(crate) use preconfiguration::ouvrir_provenance as ouvrir_provenance_de_zone;
+pub(crate) use preconfiguration::preconfigurer_zone as preconfigurer_zone_decouverte;
 
 mod groupes;
 pub use groupes::*;

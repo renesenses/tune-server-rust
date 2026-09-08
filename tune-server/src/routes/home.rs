@@ -519,9 +519,39 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                     // `context_id` et sa `source`, a charge du client de la
                     // nommer. Mieux qu'un titre de piste presente pour un nom
                     // de playlist.
-                    o.insert("title".into(), json!(playlists.get(&id)));
+                    let nom = playlists.get(&id);
+                    o.insert("title".into(), json!(nom));
                     o.insert("album_id".into(), Value::Null);
-                    o.insert("album_title".into(), Value::Null);
+                    // 🔴 #3425 — la vignette muette.
+                    //
+                    // Le raisonnement ci-dessus tient : un titre de piste
+                    // presente comme nom de playlist serait un mensonge, et
+                    // `title` reste donc nul pour une playlist de streaming.
+                    // Mais sa CONCLUSION — « a charge du client de la nommer »
+                    // — laissait le client sans rien : `album_title` etait
+                    // efface LUI AUSSI, alors que la ligne d'historique le
+                    // porte, et l'entree repartait sans AUCUN libelle.
+                    //
+                    // Mesure du 05/09 sur le .42 : trois vignettes sur huit
+                    // dans ce cas. Ce que les clients en font, faute de mieux :
+                    // `HomeView.svelte` affiche `title ?? album_title ?? ''`,
+                    // donc une tuile VIDE au clic mort ; `accueilWidgets.ts`
+                    // replie sur `'—'` puis JETTE l'entree quand elle n'a pas
+                    // de pochette. Une vignette anonyme est pire que les deux
+                    // options que le commentaire d'origine ecartait.
+                    //
+                    // Aucun client ne peut inventer le nom d'une playlist
+                    // Qobuz a partir de son seul identifiant sans un
+                    // aller-retour vers le service, vignette par vignette.
+                    //
+                    // On ne garde donc `album_title` QUE la ou il remplace
+                    // un vide : la playlist LOCALE a son nom et n'en a pas
+                    // besoin — l'album de la derniere piste n'y ajouterait
+                    // qu'un second libelle concurrent. C'est le disque
+                    // reellement ecoute, pas un nom de playlist invente.
+                    if nom.is_some() {
+                        o.insert("album_title".into(), Value::Null);
+                    }
                 }
                 "artist" => {
                     // L'artiste demande, pas celui de la derniere piste jouee :
@@ -1178,6 +1208,96 @@ mod tests_contextes {
             items[0]["title"].is_null(),
             "pas de nom en base : mieux vaut un titre nul que le titre de la \
              piste presente pour un nom de playlist — {items:?}"
+        );
+    }
+
+    /// 🔴 #3425 — mais elle ne doit pas repartir SANS AUCUN libelle.
+    ///
+    /// `title` nul est une decision, et elle tient. Effacer `album_title` EN
+    /// PLUS n'en etait pas une : la ligne d'historique le porte, et sans lui
+    /// la vignette n'a plus rien a afficher. Mesure du 05/09 sur le .42 :
+    /// trois vignettes sur huit muettes.
+    ///
+    /// L'epreuve porte sur l'invariant que l'ecran attend, pas sur une valeur
+    /// de commodite : une entree de « Continuer l'ecoute » doit toujours
+    /// porter AU MOINS UN libelle quand la base en connait un.
+    #[test]
+    fn une_playlist_de_streaming_garde_le_titre_d_album_de_l_historique() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        ecoute_avec_contexte(
+            &state,
+            "Family Affair",
+            Some("Sly & The Family Stone"),
+            Some("There's a Riot Goin' On"),
+            None,
+            "playlist",
+            "58698608",
+            Some(3),
+            "2026-09-05T21:10:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "l'entree a ete perdue : {items:?}");
+        assert_eq!(items[0]["context_type"], "playlist");
+        // La decision d'origine ne bouge pas : pas de nom en base, pas de
+        // titre invente.
+        assert!(
+            items[0]["title"].is_null(),
+            "le titre de la piste ne doit toujours pas passer pour un nom de \
+             playlist — {items:?}"
+        );
+        assert_eq!(
+            items[0]["album_title"], "There's a Riot Goin' On",
+            "l'historique porte le disque ecoute : l'effacer laissait la \
+             vignette sans aucun libelle — {items:?}"
+        );
+        // L'invariant, enonce tel que l'ecran le lit : `title ?? album_title`
+        // (HomeView.svelte) et `champ(o,'title','name','album_title',…)`
+        // (accueilWidgets.ts) doivent trouver quelque chose.
+        assert!(
+            !items[0]["title"].is_null() || !items[0]["album_title"].is_null(),
+            "entree sans AUCUN libelle : c'est exactement la vignette muette \
+             de #3425 — {items:?}"
+        );
+    }
+
+    /// Temoin vert — une playlist LOCALE ne gagne pas un second libelle.
+    ///
+    /// Elle a son nom : y ajouter l'album de la derniere piste poserait deux
+    /// libelles concurrents sur la meme vignette. Le correctif ne remplit un
+    /// vide que la ou il y en a un.
+    #[test]
+    fn une_playlist_locale_n_expose_toujours_pas_de_titre_d_album() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute("INSERT INTO playlists (name) VALUES ('Route de nuit')", &[])
+            .unwrap();
+        let playlist_id = state.backend.last_insert_rowid();
+        ecoute_avec_contexte(
+            &state,
+            "So What",
+            Some("Miles Davis"),
+            Some("Kind of Blue"),
+            None,
+            "playlist",
+            &playlist_id.to_string(),
+            Some(6),
+            "2026-09-05T21:10:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items[0]["title"], "Route de nuit");
+        assert!(
+            items[0]["album_title"].is_null(),
+            "la playlist locale a deja son nom : l'album de la derniere piste \
+             n'a rien a faire sur la vignette — {items:?}"
         );
     }
 

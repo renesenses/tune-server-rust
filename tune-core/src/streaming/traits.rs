@@ -532,6 +532,44 @@ pub trait StreamingService: Send + Sync {
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         Ok(vec![])
     }
+
+    /// Les favoris d'un type, **déjà sérialisés**, portant la date de mise en
+    /// favori sous la clé `created_at` quand le service la transporte (#3489).
+    ///
+    /// # Pourquoi une méthode à part, et pas un champ de plus
+    ///
+    /// `StreamTrack`, `StreamAlbum` et `StreamArtist` sont construits à
+    /// quatre-vingt-onze endroits — recherche, détail d'album, radio, DJ
+    /// automatique, greffons. « Mis en favori le » n'a de sens sur AUCUN
+    /// d'entre eux sauf ici : la date n'appartient pas à l'album, elle
+    /// appartient au lien entre un compte et un album.
+    ///
+    /// # Le contrat du repli
+    ///
+    /// `Ok(None)` — le défaut — signifie « je n'ai pas de date à ajouter » et
+    /// non « je n'ai pas de favoris » : l'appelant reprend alors la lecture
+    /// typée, **inchangée**. Un connecteur qui ne surcharge pas cette méthode
+    /// se comporte donc exactement comme avant, octet pour octet.
+    ///
+    /// Un connecteur qui la surcharge ne doit émettre `created_at` que sur les
+    /// éléments réellement datés par le service. Inventer une date serait pire
+    /// que n'en donner aucune : le client sait traiter l'absence — il masque le
+    /// sens du tri et signale la clé inerte —, il ne sait pas se méfier d'une
+    /// valeur fausse.
+    ///
+    /// # Un seul aller-retour
+    ///
+    /// La surcharge lit le MÊME point d'entrée que `get_user_tracks` /
+    /// `get_user_albums` / `get_user_artists`, une seule fois, et en tire deux
+    /// projections. Réclamer les dates par un second appel doublerait le coût
+    /// de l'écran Favoris, que #1621 avait précisément réduit.
+    async fn get_user_favorites_dated(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        let _ = fav_type;
+        Ok(None)
+    }
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let _ = (fav_type, item_id);
         Err("not supported".into())

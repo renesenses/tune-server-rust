@@ -788,10 +788,17 @@ pub async fn batch_enrich_artwork_scoped(
 ///
 /// Order: mozaiklabs community → Fanart.tv → TheAudioDB → MusicBrainz
 /// direct image → MusicBrainz→Wikidata→Wikimedia → Discogs → Last.fm.
+///
+/// `discogs_token` et `lastfm_key` sont TOUS DEUX résolus par l'appelant, dans
+/// les réglages d'abord : les deux dernières marches de la cascade sont les
+/// seules qui servent un artiste sans MBID, et une clé lue dans
+/// l'environnement seul les éteignait pour qui l'avait saisie dans Tune
+/// (#2257).
 pub async fn fetch_artist_image(
     mbid: &str,
     artist_name: &str,
     discogs_token: Option<&str>,
+    lastfm_key: &str,
 ) -> Option<Vec<u8>> {
     let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
@@ -845,9 +852,9 @@ pub async fn fetch_artist_image(
     }
 
     // 7. Last.fm (artist.getinfo → image array, "extralarge" or "mega")
-    if !artist_name.is_empty() {
+    if !artist_name.is_empty() && !lastfm_key.is_empty() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Some(bytes) = fetch_artist_image_lastfm(&client, artist_name).await {
+        if let Some(bytes) = fetch_artist_image_lastfm(&client, artist_name, lastfm_key).await {
             return Some(bytes);
         }
     }
@@ -1176,11 +1183,15 @@ async fn fetch_artist_image_discogs(
 ///
 /// The response contains an `image` array with sizes: small, medium, large,
 /// extralarge, mega. We prefer "mega" first, then "extralarge".
-async fn fetch_artist_image_lastfm(client: &reqwest::Client, artist_name: &str) -> Option<Vec<u8>> {
-    let api_key = std::env::var("TUNE_LASTFM_API_KEY")
-        .or_else(|_| std::env::var("LASTFM_API_KEY"))
-        .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
-        .ok()?;
+///
+/// La clé arrive par l'appelant, **jamais** par l'environnement lu ici : c'est
+/// le seul moyen d'empêcher que le réglage saisi dans Tune redevienne
+/// invisible pour cette source (#2257). Voir [`cle_lastfm_des_images`].
+async fn fetch_artist_image_lastfm(
+    client: &reqwest::Client,
+    artist_name: &str,
+    api_key: &str,
+) -> Option<Vec<u8>> {
     if api_key.is_empty() {
         return None;
     }
@@ -1189,7 +1200,7 @@ async fn fetch_artist_image_lastfm(client: &reqwest::Client, artist_name: &str) 
         .query(&[
             ("method", "artist.getinfo"),
             ("artist", artist_name),
-            ("api_key", &api_key),
+            ("api_key", api_key),
             ("format", "json"),
         ])
         .timeout(std::time::Duration::from_secs(10))
@@ -1306,6 +1317,50 @@ pub(crate) fn avancement_par_nom(
         "discogs_enriched": discogs_enriched,
         "lastfm_enriched": lastfm_enriched,
     })
+}
+
+/// La clé Last.fm que la passe d'images doit employer : **le réglage saisi
+/// dans Tune d'abord**, l'environnement seulement à défaut.
+///
+/// ## Ce qui manquait (#2257)
+///
+/// Ce fichier était le DERNIER endroit du dépôt à ne lire que
+/// l'environnement (`std::env::var("TUNE_LASTFM_API_KEY")` et ses deux
+/// anciens noms). Partout ailleurs le réglage `lastfm_api_key` — celui que
+/// l'interface écrit — l'emporte déjà :
+///
+/// | site | ce qu'il lit |
+/// |---|---|
+/// | `metadata/bio_batch.rs::cle_lastfm` | réglage, puis environnement |
+/// | `tune-server/src/routes/metadata.rs::enrich_artist` | réglage, puis environnement |
+/// | `tune-server/src/routes/lastfm_social.rs::lastfm_api_key` | réglage seul |
+/// | `library/artwork.rs` (ici) | **environnement seul** |
+///
+/// Conséquence exacte : un utilisateur qui saisit sa clé dans Tune obtenait
+/// ses biographies Last.fm et ses amis Last.fm, mais **aucune vignette
+/// d'artiste** issue de Last.fm — `lastfm_available` restait faux, la passe 3
+/// n'appelait que Discogs, et la marche 7 de la cascade sortait sur le `?` du
+/// `env::var`. Or Discogs et Last.fm sont les DEUX seules sources qui
+/// travaillent pour un artiste sans MBID, la population entière de ce ticket.
+///
+/// C'est le pendant EXACT du correctif Discogs déjà posé dans ce fichier
+/// (« Previously this read env only, so a Discogs token configured in the app
+/// never applied », Progman) : il n'avait jamais été porté à Last.fm.
+///
+/// La résolution elle-même n'est pas recopiée : elle vit dans
+/// [`crate::metadata::bio_batch::cle_lastfm_avec_reglage`], qui porte déjà les
+/// trois noms d'environnement historiques et la priorité du réglage.
+///
+/// ## Site d'appel
+///
+/// [`batch_enrich_artist_artwork_inner`], une fois par passe, juste après la
+/// résolution du jeton Discogs — et son résultat est le SEUL chemin par
+/// lequel une clé atteint [`fetch_artist_image_lastfm`], qui n'en lit plus
+/// aucune elle-même.
+pub(crate) fn cle_lastfm_des_images(settings: &crate::db::settings_repo::SettingsRepo) -> String {
+    crate::metadata::bio_batch::cle_lastfm_avec_reglage(
+        settings.get("lastfm_api_key").ok().flatten(),
+    )
 }
 
 /// Source ayant effectivement posé l'image d'un artiste cherché par nom.
@@ -1631,6 +1686,12 @@ async fn batch_enrich_artist_artwork_inner(
                 .filter(|s| !s.is_empty())
         });
 
+    // La clé Last.fm, résolue comme le jeton Discogs juste au-dessus : le
+    // réglage saisi dans Tune d'abord, l'environnement à défaut (#2257).
+    // Lue ICI, une fois, et transmise ensuite — plus aucune fonction de ce
+    // fichier ne va la chercher elle-même.
+    let lastfm_key = cle_lastfm_des_images(&settings);
+
     let mut enriched = 0u32;
     let mut failed = 0u32;
     let total_images = artists.len();
@@ -1656,7 +1717,7 @@ async fn batch_enrich_artist_artwork_inner(
             }
         }
 
-        match fetch_artist_image(&mbid, name, discogs_token.as_deref()).await {
+        match fetch_artist_image(&mbid, name, discogs_token.as_deref(), &lastfm_key).await {
             Some(data) => {
                 // Adressage par le CONTENU (#1444), plus par l'identité de
                 // l'artiste. L'ancienne clé était `artist-mbid-{mbid}`, sinon
@@ -1748,11 +1809,11 @@ async fn batch_enrich_artist_artwork_inner(
     let mut discogs_enriched = 0u32;
     let mut lastfm_enriched = 0u32;
     let discogs_available = discogs_token.is_some();
-    let lastfm_available = std::env::var("TUNE_LASTFM_API_KEY")
-        .or_else(|_| std::env::var("LASTFM_API_KEY"))
-        .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
-        .map(|t| !t.is_empty())
-        .unwrap_or(false);
+    // Même clé que la marche 7 de la cascade, résolue une seule fois plus
+    // haut. Elle lisait ici l'environnement SEUL : une clé saisie dans Tune
+    // laissait cette passe croire que Last.fm n'était pas configuré, et sur
+    // une bibliothèque sans MBID il ne restait plus que Discogs (#2257).
+    let lastfm_available = !lastfm_key.is_empty();
 
     if discogs_available || lastfm_available {
         let no_mbid_artists = match artist_repo.list_without_image_no_mbid() {
@@ -1783,6 +1844,7 @@ async fn batch_enrich_artist_artwork_inner(
                 let cache_dir = &cache_dir;
                 let artist_repo = &artist_repo;
                 let discogs_token = discogs_token.as_deref();
+                let lastfm_key = lastfm_key.as_str();
                 async move {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -1805,7 +1867,9 @@ async fn batch_enrich_artist_artwork_inner(
                     // Fallback to Last.fm
                     if lastfm_available {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        if let Some(data) = fetch_artist_image_lastfm(client, &name).await {
+                        if let Some(data) =
+                            fetch_artist_image_lastfm(client, &name, lastfm_key).await
+                        {
                             // Adressage par le CONTENU (#1444), même raison
                             // qu'au passage Discogs juste au-dessus.
                             std::fs::create_dir_all(cache_dir).ok();
@@ -2403,6 +2467,78 @@ mod tests {
         assert_eq!(fin["total"], 12);
         assert_eq!(fin["enriched"], 3);
         assert_eq!((discogs, lastfm), (3, 0));
+    }
+
+    // ---------------------------------------------------------------------
+    // #2257 — la clé Last.fm saisie dans Tune doit atteindre les IMAGES.
+    //
+    // Ce fichier était le dernier à ne lire que l'environnement. La garde
+    // appelle `cle_lastfm_des_images`, c'est-à-dire la fonction que
+    // `batch_enrich_artist_artwork_inner` appelle, sur un vrai `SettingsRepo`
+    // adossé à une base en mémoire. Aucun appel réseau.
+    // ---------------------------------------------------------------------
+
+    /// Le réglage `lastfm_api_key` — celui que l'interface écrit et que le
+    /// scrobbling, les amis Last.fm et les biographies lisent déjà — active
+    /// enfin la source d'images.
+    ///
+    /// C'est la moitié « ça marche » de la contre-épreuve : sans le correctif,
+    /// `cle_lastfm_des_images` n'existe pas et la passe lit `std::env`, où
+    /// aucune de ces trois variables n'est posée par ce test.
+    #[test]
+    fn le_reglage_lastfm_saisi_dans_tune_atteint_la_passe_dimages() {
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(base_neuve());
+        settings
+            .set("lastfm_api_key", "cle-saisie-dans-tune")
+            .unwrap();
+
+        assert_eq!(
+            cle_lastfm_des_images(&settings),
+            "cle-saisie-dans-tune",
+            "la clé des Réglages doit servir aux images comme elle sert déjà \
+             aux biographies (#2257)"
+        );
+        assert!(
+            !cle_lastfm_des_images(&settings).is_empty(),
+            "c'est cette chaîne non vide qui rend `lastfm_available` vrai et \
+             fait appeler Last.fm par la passe 3"
+        );
+    }
+
+    /// L'autre moitié : sans réglage — et sans variable d'environnement posée
+    /// par ce test — la clé reste VIDE, donc `lastfm_available` reste faux et
+    /// la passe 3 n'appelle pas Last.fm. Une garde qui ne saurait pas
+    /// distinguer les deux cas serait verte contre n'importe quoi.
+    ///
+    /// Le réglage posé à la chaîne vide est traité comme absent : c'est ce que
+    /// laisse un champ de saisie effacé dans l'interface.
+    #[test]
+    fn sans_reglage_ni_environnement_la_source_lastfm_reste_eteinte() {
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(base_neuve());
+
+        // Le test ne pose aucune variable d'environnement : modifier
+        // l'environnement d'un processus d'essai contamine toute la suite.
+        // Sur une machine où l'une des trois serait posée, la mesure n'aurait
+        // aucun sens — on la saute plutôt que de rendre un vert faux.
+        let environnement_pose = ["TUNE_LASTFM_API_KEY", "LASTFM_API_KEY", "TUNE_LASTFM_KEY"]
+            .iter()
+            .any(|nom| std::env::var(nom).is_ok_and(|v| !v.trim().is_empty()));
+        if environnement_pose {
+            return;
+        }
+
+        assert_eq!(
+            cle_lastfm_des_images(&settings),
+            "",
+            "aucune clé nulle part : la source doit rester éteinte"
+        );
+
+        settings.set("lastfm_api_key", "   ").unwrap();
+        assert_eq!(
+            cle_lastfm_des_images(&settings),
+            "",
+            "un champ effacé dans l'interface n'est pas une clé"
+        );
     }
 
     // ---------------------------------------------------------------------

@@ -124,12 +124,32 @@ jobs:
             os: ubuntu-22.04
             platform: linux-x86_64
             ext: tar.gz
+          # Les deux cibles ARM sont construites par `cross`, dans un
+          # conteneur qui ne porte pas les en-tetes ALSA de la CIBLE : leur
+          # `features:` n'a donc PAS `local-audio`, contrairement aux lignes
+          # natives Linux/Windows/macOS plus bas.
+          #
+          # Ce n'est pas un oubli, c'est une contrainte — mais c'est une
+          # ABSENCE MESUREE, pas un arbitrage : sur l'artefact publie
+          # v0.9.141, `strings tune-server | grep -c cpal` rend 0 sur
+          # linux-aarch64 contre 175 sur linux-x86_64. Les binaires ARM
+          # livres n'ont pas de sortie audio locale. Voir #3355.
+          #
+          # Toute AUTRE fonctionnalite du `default` de tune-server doit
+          # figurer dans chaque `features:` ci-dessous et dans chaque ligne
+          # `cargo build` qui passe `--no-default-features` : c'est
+          # `cloud-relay` qui manquait partout jusqu'a la v0.9.141, et rien
+          # n'a rougi. La garde
+          # `toute_feature_par_defaut_est_livree_par_toute_ligne_de_build_de_release`
+          # (tune-server/tests/features_livrees_3355.rs) lit ce fichier et
+          # refuse desormais un nouvel oubli ; les deux exceptions ARM
+          # ci-dessus y sont inscrites avec leur raison.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
             platform: linux-aarch64
             ext: tar.gz
             cross: true
-            features: oaat,cloud-relay,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
+            features: oaat,cloud-relay,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -222,6 +242,33 @@ jobs:
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
+
+      # Garde-fou #3613 : la sortie audio LOCALE doit être DANS le binaire ARM
+      # livré, pas seulement dans la ligne de build.
+      #
+      # C'est la leçon de #3355 : la garde qui existait lisait ce qu'on LINTE,
+      # pas ce qu'on EXPÉDIE. Les archives ARM sont parties sans `cpal` depuis
+      # le 20/05/2026 — `strings tune-server | grep -c cpal` rend 175 sur
+      # linux-x86_64 et 0 sur linux-aarch64 en v0.9.141 — alors que l'image
+      # Tune OS du Raspberry Pi installe EXACTEMENT cette archive.
+      #
+      # On lit l'ELF, pas la configuration. `alsa-sys` lie ALSA en DYNAMIQUE
+      # (`pkg_config…statik(false)`, codé en dur dans son `build.rs`) : un
+      # binaire qui porte réellement cpal déclare donc `libasound.so.2` en
+      # NEEDED. `readelf` est indépendant de l'architecture — il lit l'ELF
+      # arm64 depuis un runner x86_64, contrairement à `ldd`.
+      - name: Verify local-audio is compiled into the ARM binary
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/tune-server"
+          NEEDED="$(readelf -d "$BIN" 2>/dev/null | grep -c 'libasound\.so' || true)"
+          if [ "${NEEDED:-0}" -eq 0 ]; then
+            echo "::error::Le binaire linux-aarch64 ne lie pas ALSA : la sortie audio locale est ABSENTE de l'artefact publié (#3613)."
+            readelf -d "$BIN" || true
+            exit 1
+          fi
+          echo "libasound.so déclaré en NEEDED : la sortie locale est bien dans l'artefact."
 
       # Garde-fou #1288 : la cible musl n'a d'intérêt que si le binaire est
       # RÉELLEMENT statique (NAS à vieille userland, Alpine ARM). Une dépendance

@@ -45,12 +45,12 @@ pub fn est_vrai(brut: &str) -> bool {
 /// au cloud communautaire ?
 ///
 /// Faux quand le reglage est absent (installation neuve), illisible, ou pose a
-/// autre chose que vrai. Faux aussi quand `TUNE_TELEMETRY` est explicitement
-/// coupe : un refus pose a l'echelle de la machine reste souverain sur un
-/// reglage d'application — on ne peut pas re-autoriser par l'UI ce que
-/// l'exploitant a interdit par l'environnement.
+/// autre chose que vrai. Faux aussi quand la telemetrie est refusee — par
+/// l'environnement OU par l'interface (#3383) : un refus, d'ou qu'il vienne,
+/// reste souverain, et on ne peut pas re-autoriser d'un cote ce qui a ete
+/// interdit de l'autre.
 pub fn contribution_autorisee(settings: &SettingsRepo) -> bool {
-    if !crate::cloud::telemetry::TelemetryReporter::is_enabled() {
+    if !crate::cloud::telemetry::TelemetryReporter::is_enabled_for(settings) {
         return false;
     }
     settings

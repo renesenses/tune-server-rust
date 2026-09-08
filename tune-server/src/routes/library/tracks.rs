@@ -97,7 +97,15 @@ fn joindre_dr_par_piste(state: &AppState, items: Vec<tune_core::db::models::Trac
     let dr = TrackMetadataRepo::with_backend(state.backend.clone())
         .get_key_for_tracks("dr_track", &track_ids)
         .unwrap_or_default();
-    super::albums::attach_track_tags(items, &[("dynamic_range", &dr)])
+    let mut items = super::albums::attach_track_tags(items, &[("dynamic_range", &dr)]);
+    // #3518 — « Idéalement sur la même route que les autres listes de pistes,
+    // pour que le tableau ait les mêmes colonnes partout » : ce chemin est le
+    // seam unique des trois autres surfaces (`/library/tracks` filtré, non
+    // filtré, et la fiche d'une piste). Le brancher ici les sert toutes les
+    // trois, sans un second recopieur qui aurait fini par diverger — c'est
+    // exactement l'argument de #1388 sur `attach_track_tags`.
+    super::albums::attacher_ecoutes(state, &mut items);
+    items
 }
 
 #[derive(Deserialize)]
@@ -318,6 +326,35 @@ fn intervalle_demande(entetes: &HeaderMap, taille: u64) -> Option<Result<(u64, u
     Some(Ok(bornes))
 }
 
+/// Les trois en-têtes que le contrat HTTP de DLNA attend d'une ressource
+/// publiée par un serveur média, posés sur CHAQUE réponse de la route.
+///
+/// `contentFeatures.dlna.org` porte les drapeaux du profil — un point de
+/// contrôle qui envoie `getcontentFeatures.dlna.org: 1` avant de pousser
+/// l'URI attend cette ligne en retour ; `transferMode.dlna.org` dit le mode
+/// de transfert servi et se rend tel qu'il a été demandé quand la demande est
+/// exploitable.
+///
+/// Les valeurs ne sont pas fabriquées ici : les drapeaux viennent de la
+/// fonction qui construit déjà le `protocolInfo` du DIDL, de sorte que ce que
+/// le serveur média ANNONCE et ce que cette route REND ne peuvent pas
+/// diverger.
+fn poser_le_contrat_dlna(
+    headers: &mut HeaderMap,
+    features: &'static str,
+    transfer_mode: &'static str,
+) {
+    headers.insert(
+        "transferMode.dlna.org",
+        HeaderValue::from_static(transfer_mode),
+    );
+    headers.insert(
+        "contentFeatures.dlna.org",
+        HeaderValue::from_static(features),
+    );
+    headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+}
+
 /// Sert les octets d'une piste locale — et c'est par ici, pas par
 /// l'orchestrateur, que passent le lecteur du navigateur ET le serveur média
 /// UPnP quand un point de contrôle tiers commande la lecture.
@@ -398,6 +435,47 @@ pub(super) async fn stream_track_audio(
         .map(|f| f.mime_type().to_string())
         .unwrap_or_else(|| "application/octet-stream".into());
 
+    // #3579 — LE CONTRAT DLNA, celui que la radio honore et que la piste
+    // locale ignorait.
+    //
+    // Le serveur média de Tune publie deux familles d'URL
+    // (`tune-core/src/upnp_server.rs`). `radio_audio_url` est servie par
+    // `tune_stream_http`, qui pose `transferMode.dlna.org`,
+    // `contentFeatures.dlna.org` et `Connection: keep-alive` sur CHAQUE
+    // réponse — HEAD comme GET, 200 comme 206 ; le dépôt en fait déjà son
+    // « contrat de fichier », et des épreuves y veillent (« le GET doit dire
+    // OP=00 comme la DIDL »). `track_audio_url` arrive ICI, et n'en posait
+    // AUCUN. C'est l'asymétrie exacte que décrivent Tades et Patatorz depuis
+    // JPlay iOS (fils 1705/1706) : la radio part, une piste locale ne démarre
+    // jamais, alors que le parcours — pochette, titres, durées — vient de bout
+    // en bout du même serveur média.
+    //
+    // Les drapeaux ne sont pas réécrits ici : ils viennent de la fonction qui
+    // sert déjà à construire le `protocolInfo` du DIDL
+    // (`outputs::didl::dlna_flags_for_mime_bd_sr`), avec la même cadence et la
+    // même profondeur que `didl_track_item` leur donne. Les deux ne peuvent
+    // donc pas se contredire.
+    //
+    // Ce que cela NE prétend pas être : la preuve que c'était la cause. Aucun
+    // relevé ne dit ce que le point de contrôle de Tades a fait de la réponse
+    // — la route n'écrivait rien avant #3595. Ce qui est établi, c'est que la
+    // réponse était incomplète au regard du contrat, et qu'elle ne l'est plus.
+    let features = tune_core::outputs::didl::dlna_flags_for_mime_bd_sr(
+        &mime,
+        track.bit_depth.map(|bd| bd as u32),
+        track.sample_rate.map(|sr| sr as u32),
+    );
+    // Un fichier fini et seekable vaut `Interactive` ; on rend `Streaming` ou
+    // `Background` quand c'est ce qui a été demandé.
+    let transfer_mode = match req_headers
+        .get("transferMode.dlna.org")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    {
+        Some("Streaming") => "Streaming",
+        Some("Background") => "Background",
+        _ => "Interactive",
+    };
     let agent = req_headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -426,6 +504,7 @@ pub(super) async fn stream_track_audio(
                     .unwrap_or(HeaderValue::from_static("bytes */0")),
             );
             headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+            poser_le_contrat_dlna(&mut headers, features, transfer_mode);
             return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
         }
         None => None,
@@ -442,6 +521,7 @@ pub(super) async fn stream_track_audio(
     );
     headers.insert("Content-Length", HeaderValue::from(longueur));
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+    poser_le_contrat_dlna(&mut headers, features, transfer_mode);
     let statut = if intervalle.is_some() {
         headers.insert(
             "Content-Range",
@@ -462,6 +542,8 @@ pub(super) async fn stream_track_audio(
         taille = file_size,
         octets = longueur,
         statut = statut.as_u16(),
+        dlna_features = features,
+        transfer_mode,
         "track_audio_request"
     );
 
@@ -2146,5 +2228,300 @@ mod tests_intervalle_piste_locale {
             None
         );
         assert_eq!(intervalle_demande(&entetes("bytes=abc-"), 1000), None);
+    }
+}
+
+/// #3579 — CE QUE LA ROUTE REND VRAIMENT, en-tête par en-tête.
+///
+/// Aucune de ces épreuves ne lit le code source : toutes passent par le
+/// ROUTEUR de la famille `library` (`super::router()`), donc par la ligne
+/// `.route("/tracks/{id}/audio", get(tracks::stream_track_audio))`. Déplacer
+/// ou démonter la route les fait rougir ; retirer le contrat DLNA de la
+/// réponse aussi.
+#[cfg(test)]
+mod contrat_dlna_de_la_route_audio_3579 {
+    use crate::state::AppState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+
+    /// Pose un fichier réel et la piste qui le désigne. `cadence` et
+    /// `profondeur` comptent : le profil DLNA d'un LPCM en dépend.
+    fn piste(
+        etiquette: &str,
+        extension: &str,
+        cadence: i64,
+        profondeur: i64,
+    ) -> (AppState, i64, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("dossier temporaire");
+        let chemin = dir.path().join(format!("piste.{extension}"));
+        std::fs::write(&chemin, b"0123456789").expect("écriture du fichier");
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let chemin_txt = chemin.to_string_lossy().to_string();
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (title, format, file_path, sample_rate, bit_depth) \
+                 VALUES ('Requiem', ?1, ?2, ?3, ?4)",
+                &[
+                    &etiquette.to_string() as &dyn ToSqlValue,
+                    &chemin_txt as &dyn ToSqlValue,
+                    &cadence as &dyn ToSqlValue,
+                    &profondeur as &dyn ToSqlValue,
+                ],
+            )
+            .expect("insertion de la piste");
+        let id = state.backend.last_insert_rowid();
+        (state, id, dir)
+    }
+
+    /// La requête traverse le routeur monté, pas le handler nu.
+    async fn par_la_route(
+        state: &AppState,
+        id: i64,
+        methode: &str,
+        entetes: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut requete = Request::builder()
+            .method(methode)
+            .uri(format!("/tracks/{id}/audio"));
+        for (nom, valeur) in entetes {
+            requete = requete.header(*nom, *valeur);
+        }
+        super::super::router()
+            .with_state(state.clone())
+            .oneshot(requete.body(Body::empty()).expect("requête"))
+            .await
+            .expect("réponse")
+    }
+
+    fn entete(reponse: &axum::response::Response, nom: &str) -> String {
+        reponse
+            .headers()
+            .get(nom)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// LA TABLE RÉELLE des types servis, mesurée sur la route.
+    ///
+    /// Le ticket soupçonnait le repli `application/octet-stream` d'expliquer
+    /// la piste qui ne démarre pas. Cette épreuve tranche : le fichier de
+    /// Tades est un FLAC 16 bits / 44,1 kHz — la capture d'écran de JPlay le
+    /// dit — et la route en sert `audio/flac`. Le repli existe, mais il ne
+    /// mord que sur une extension hors table (ou une piste sans `format`),
+    /// alors que TOUTES les extensions que le scanner catalogue
+    /// (`LIBRARY_AUDIO_EXTENSIONS`) ont un type réel, `iso` excepté — refusé
+    /// plus haut par un 422 nommé.
+    #[tokio::test]
+    async fn le_type_servi_pour_chaque_format() {
+        for (etiquette, extension, attendu) in [
+            // Le cas exact de la capture : Mozart, Requiem K626, FLAC 16/44,1.
+            ("flac", "flac", "audio/flac"),
+            ("wav", "wav", "audio/wav"),
+            ("aiff", "aiff", "audio/aiff"),
+            ("aif", "aif", "audio/aiff"),
+            ("mp3", "mp3", "audio/mpeg"),
+            // `.alac` est catalogué et rend bien un conteneur MP4…
+            ("alac", "alac", "audio/mp4"),
+            // …et un `.m4a` aussi, désormais : c'est le MÊME conteneur MP4.
+            // Il sortait en `audio/aac`, c'est-à-dire un flux ADTS **nu**,
+            // alors qu'un `.m4a` n'est jamais de l'ADTS — et qu'il peut porter
+            // de l'ALAC aussi bien que de l'AAC (#3605, corrigé ici).
+            ("m4a", "m4a", "audio/mp4"),
+            // Contre-épreuve, et elle est indispensable : le correctif ne doit
+            // PAS avoir renommé l'AAC en bloc. Un `.aac` est un flux ADTS nu,
+            // et lui garde `audio/aac`.
+            ("aac", "aac", "audio/aac"),
+            ("dsf", "dsf", "application/x-dsd"),
+            // Le repli, et le seul chemin qui y mène.
+            ("mkv", "mkv", "application/octet-stream"),
+        ] {
+            let (state, id, _dir) = piste(etiquette, extension, 44_100, 16);
+            let reponse = par_la_route(&state, id, "GET", &[]).await;
+            assert_eq!(reponse.status(), StatusCode::OK);
+            assert_eq!(
+                entete(&reponse, "Content-Type"),
+                attendu,
+                "format « {etiquette} » : type servi inattendu"
+            );
+        }
+    }
+
+    /// Le fichier de Tades, isolé : la réponse ne doit PAS être le repli.
+    #[tokio::test]
+    async fn un_flac_16_44_n_est_jamais_servi_en_octet_stream() {
+        let (state, id, _dir) = piste("flac", "flac", 44_100, 16);
+        let reponse = par_la_route(&state, id, "GET", &[]).await;
+        assert_eq!(
+            entete(&reponse, "Content-Type"),
+            "audio/flac",
+            "le repli `application/octet-stream` ne mord PAS sur un FLAC : \
+             cette hypothèse de #3579 est écartée par la mesure"
+        );
+    }
+
+    /// LE CORRECTIF : le contrat DLNA que la radio honore déjà.
+    ///
+    /// `tune_stream_http` pose ces trois lignes sur chaque réponse du
+    /// `radio_audio_url` du serveur média ; le `track_audio_url` du même
+    /// serveur média n'en posait aucune.
+    #[tokio::test]
+    async fn la_route_repond_le_contrat_dlna() {
+        let (state, id, _dir) = piste("flac", "flac", 44_100, 16);
+        let reponse =
+            par_la_route(&state, id, "GET", &[("getcontentFeatures.dlna.org", "1")]).await;
+        assert_eq!(reponse.status(), StatusCode::OK);
+        let features = entete(&reponse, "contentFeatures.dlna.org");
+        assert!(
+            !features.is_empty(),
+            "un point de contrôle qui demande `getcontentFeatures.dlna.org: 1` \
+             doit recevoir `contentFeatures.dlna.org` — la radio le rend déjà, \
+             la piste locale ne le rendait pas (#3579)"
+        );
+        assert!(
+            features.contains("DLNA.ORG_OP=01"),
+            "la route honore le `Range` depuis #3595 : elle doit l'ANNONCER — {features}"
+        );
+        assert_eq!(
+            entete(&reponse, "transferMode.dlna.org"),
+            "Interactive",
+            "un fichier fini et seekable se transfère en `Interactive`"
+        );
+    }
+
+    /// Les drapeaux annoncés sont ceux du DIDL, pas une seconde table.
+    ///
+    /// Deux tables divergeraient — c'est précisément la faute que le DIDL des
+    /// pistes a déjà corrigée une fois (#1681). On compare donc à la fonction
+    /// de production, pas à une chaîne recopiée.
+    #[tokio::test]
+    async fn les_drapeaux_annonces_sont_ceux_du_didl() {
+        for (etiquette, extension, cadence, profondeur) in [
+            ("flac", "flac", 44_100i64, 16i64),
+            ("wav", "wav", 44_100, 16),
+            // LPCM ne couvre ni le 24 bits ni le 96 kHz : la route doit suivre
+            // le DIDL jusque-là, sinon elle promet un profil que le fichier ne
+            // respecte pas (#1137, #1458).
+            ("wav", "wav", 96_000, 24),
+            ("mp3", "mp3", 44_100, 16),
+            ("m4a", "m4a", 44_100, 16),
+            ("mkv", "mkv", 44_100, 16),
+        ] {
+            let (state, id, _dir) = piste(etiquette, extension, cadence, profondeur);
+            let reponse = par_la_route(&state, id, "GET", &[]).await;
+            let mime = entete(&reponse, "Content-Type");
+            let attendu = tune_core::outputs::didl::dlna_flags_for_mime_bd_sr(
+                &mime,
+                Some(profondeur as u32),
+                Some(cadence as u32),
+            );
+            assert_eq!(
+                entete(&reponse, "contentFeatures.dlna.org"),
+                attendu,
+                "« {etiquette} » {cadence}/{profondeur} : la route et le DIDL \
+                 doivent annoncer le MÊME profil"
+            );
+        }
+        // Et le profil dépend VRAIMENT de la cadence et de la profondeur : un
+        // LPCM 16/44,1 le porte, un 24/96 ne le porte plus.
+        let (state, id, _dir) = piste("wav", "wav", 44_100, 16);
+        assert!(
+            entete(
+                &par_la_route(&state, id, "GET", &[]).await,
+                "contentFeatures.dlna.org"
+            )
+            .contains("DLNA.ORG_PN=LPCM")
+        );
+        let (state, id, _dir) = piste("wav", "wav", 96_000, 24);
+        assert!(
+            !entete(
+                &par_la_route(&state, id, "GET", &[]).await,
+                "contentFeatures.dlna.org"
+            )
+            .contains("DLNA.ORG_PN"),
+            "annoncer LPCM sur un 24/96 fait jouer du silence (#1137)"
+        );
+    }
+
+    /// Le mode de transfert demandé est RENDU, comme le protocole l'attend.
+    #[tokio::test]
+    async fn le_mode_de_transfert_demande_est_rendu() {
+        let (state, id, _dir) = piste("flac", "flac", 44_100, 16);
+        for demande in ["Streaming", "Background", "Interactive"] {
+            let reponse =
+                par_la_route(&state, id, "GET", &[("transferMode.dlna.org", demande)]).await;
+            assert_eq!(entete(&reponse, "transferMode.dlna.org"), demande);
+        }
+        // Une valeur inconnue ne fait pas échouer la lecture : on retombe sur
+        // le mode juste pour un fichier.
+        let reponse = par_la_route(&state, id, "GET", &[("transferMode.dlna.org", "Zzz")]).await;
+        assert_eq!(reponse.status(), StatusCode::OK);
+        assert_eq!(entete(&reponse, "transferMode.dlna.org"), "Interactive");
+    }
+
+    /// Un renderer sonde d'abord en HEAD. Le HEAD doit annoncer le MÊME
+    /// contrat que le GET, sinon le sondage conclut avant d'essayer (#1689,
+    /// déjà tranché pour la radio).
+    #[tokio::test]
+    async fn le_head_annonce_le_meme_contrat_que_le_get() {
+        let (state, id, _dir) = piste("flac", "flac", 44_100, 16);
+        let get = par_la_route(&state, id, "GET", &[]).await;
+        let head = par_la_route(&state, id, "HEAD", &[]).await;
+        assert_eq!(head.status(), StatusCode::OK, "le HEAD doit être servi");
+        for nom in [
+            "Content-Type",
+            "Content-Length",
+            "Accept-Ranges",
+            "contentFeatures.dlna.org",
+            "transferMode.dlna.org",
+        ] {
+            assert_eq!(
+                entete(&head, nom),
+                entete(&get, nom),
+                "le HEAD et le GET doivent dire la même chose sur `{nom}`"
+            );
+        }
+    }
+
+    /// Une réponse partielle porte le contrat elle aussi — c'est celle que le
+    /// renderer reçoit réellement quand il ouvre le flux.
+    #[tokio::test]
+    async fn une_reponse_partielle_porte_aussi_le_contrat() {
+        let (state, id, _dir) = piste("flac", "flac", 44_100, 16);
+        let reponse = par_la_route(&state, id, "GET", &[("Range", "bytes=0-")]).await;
+        assert_eq!(reponse.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(entete(&reponse, "Content-Range"), "bytes 0-9/10");
+        assert!(
+            entete(&reponse, "contentFeatures.dlna.org").contains("DLNA.ORG_OP=01"),
+            "le 206 doit porter le contrat DLNA comme le 200"
+        );
+        assert_eq!(entete(&reponse, "transferMode.dlna.org"), "Interactive");
+    }
+
+    /// Le refus d'un intervalle impossible reste lisible : il porte le contrat
+    /// et le `Content-Range` de l'échec.
+    #[tokio::test]
+    async fn le_refus_d_intervalle_reste_lisible() {
+        let (state, id, _dir) = piste("flac", "flac", 44_100, 16);
+        let reponse = par_la_route(&state, id, "GET", &[("Range", "bytes=99-")]).await;
+        assert_eq!(reponse.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(entete(&reponse, "Content-Range"), "bytes */10");
+        assert!(!entete(&reponse, "contentFeatures.dlna.org").is_empty());
+    }
+
+    /// Témoin : le corps servi n'a pas bougé. Un contrat ajouté ne doit pas
+    /// coûter un octet au flux.
+    #[tokio::test]
+    async fn le_corps_servi_est_inchange() {
+        let (state, id, _dir) = piste("flac", "flac", 44_100, 16);
+        let reponse = par_la_route(&state, id, "GET", &[]).await;
+        assert_eq!(entete(&reponse, "Content-Length"), "10");
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        assert_eq!(&octets[..], b"0123456789");
     }
 }

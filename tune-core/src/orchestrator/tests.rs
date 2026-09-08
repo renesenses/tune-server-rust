@@ -5290,6 +5290,99 @@ fn piste_3234(orch: &PlaybackOrchestrator, chemin: &str, format: &str) {
         .unwrap();
 }
 
+/// #3270 (point 2) — une piste qui NE DÉMARRE PAS le dit à l'auditeur.
+///
+/// `next` et `previous` détachent `play_from_queue` et répondent
+/// `{"status":"playing"}` avant que l'échec soit connu. L'échec ne peut donc
+/// se dire que par le second canal, celui que `routes/ws.rs` pousse à TOUTES
+/// les télécommandes.
+///
+/// `fatal: true` est le fait à tenir : la zone ne joue pas. Sans lui, la
+/// fenêtre de grâce d'après-lecture du client web avale le message (#1960,
+/// #2630) et l'auditeur n'a, une fois de plus, que le silence.
+#[tokio::test]
+async fn une_piste_qui_ne_demarre_pas_est_annoncee_a_l_auditeur() {
+    let bus = Arc::new(EventBus::new());
+    let mut rx = bus.subscribe();
+    let mut orch = test_orchestrator();
+    orch.event_bus = Some(bus.clone());
+
+    orch.dire_piste_non_demarree(21, "suivante", "track not found");
+
+    let ev = rx.recv().await.expect("un événement doit être émis");
+    assert_eq!(ev.event_type, "zone.playback_error");
+    assert_eq!(ev.data["zone_id"], 21);
+    assert_eq!(
+        ev.data["fatal"], true,
+        "la zone ne joue pas : sans fatal:true le client étouffe le message"
+    );
+    let msg = ev.data["error"].as_str().unwrap();
+    assert!(
+        msg.contains("suivante"),
+        "le message doit nommer le GESTE, sinon l'auditeur ne sait pas ce qui \
+         a échoué : {msg}"
+    );
+    assert!(
+        msg.contains("track not found"),
+        "le message doit porter la cause remontée par l'orchestrateur : {msg}"
+    );
+}
+
+/// CONTRE-ÉPREUVE : sans bus (démarrage partiel, essais), l'annonce se tait au
+/// lieu de paniquer. Même règle que `dire_le_repli_de_peripherique`.
+#[tokio::test]
+async fn sans_bus_l_annonce_se_tait_au_lieu_de_paniquer() {
+    let orch = test_orchestrator();
+    orch.dire_piste_non_demarree(21, "précédente", "peu importe");
+}
+
+/// #3270 (point 4) — un fichier TÉLÉVERSÉ que rien ne sait lire est refusé
+/// par un motif NOMMÉ, à la porte que les deux entrées traversent.
+///
+/// Avant, `AudioFormat::from_extension("wma")` rendait `None`, ce `None` était
+/// absorbé par `unwrap_or("audio/wav")`, et le fichier obtenait une session de
+/// flux annoncée `audio/wav` : la zone se taisait sans un mot.
+#[tokio::test]
+async fn un_televersement_illisible_est_refuse_avant_toute_session() {
+    let orch = test_orchestrator();
+    // #3030 — `test_scratch` et rien d'autre : le nettoyage passe par `Drop`,
+    // donc il a lieu même si l'assertion ci-dessous panique.
+    let dossier = crate::test_scratch::scratch_dir("3270-televersement");
+    let wma = dossier.join("concert.wma");
+    std::fs::write(&wma, b"pas de l'audio lisible").unwrap();
+
+    let req = requete_locale_3234(21, 1);
+    // `expect_err` demanderait `ResolvedStream: Debug`, qu'il n'implémente
+    // pas : on déstructure.
+    let Err(erreur) = orch
+        .resolve_uploaded_file(wma.to_str().unwrap(), &req)
+        .await
+    else {
+        panic!("un .wma ne doit pas obtenir de session de flux");
+    };
+    assert!(
+        erreur.starts_with("format_not_playable:"),
+        "le refus doit porter la sentinelle de #3234, que `play_error_response` \
+         transforme déjà en 422 nommé — pas une seconde forme d'erreur : {erreur}"
+    );
+    assert!(
+        erreur.contains("wma"),
+        "le motif doit NOMMER le format refusé : {erreur}"
+    );
+
+    // CONTRE-ÉPREUVE : un vrai FLAC, lui, est résolu. Sans elle, un refus qui
+    // rejetterait TOUT resterait vert et le téléversement serait mort.
+    let flac = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac");
+    let Ok(resolu) = orch.resolve_uploaded_file(flac, &req).await else {
+        panic!("un FLAC téléversé doit toujours se lire");
+    };
+    assert_eq!(resolu.source, "upload");
+    assert_eq!(
+        resolu.mime_type, "audio/flac",
+        "et il doit s'annoncer pour ce qu'il est"
+    );
+}
+
 /// #3234 — un ISO SACD demandé en LECTURE rend un motif nommé.
 ///
 /// JeromeQ, fil 1206 : « Tune ne lit pas les fichiers ISO ? » Personne ne

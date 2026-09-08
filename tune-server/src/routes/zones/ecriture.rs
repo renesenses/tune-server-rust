@@ -318,6 +318,13 @@ async fn persister_le_patch(
             if let Err(e) = $ecriture {
                 return Err(echec_ecriture(id, $champ, &$valeur.to_string(), e));
             }
+            // #3589 — la MARQUE d'auteur. Ce `PATCH` est la seule porte par
+            // laquelle un humain règle une zone : ce qui passe ici est, par
+            // définition, posé à la main. La marque survit au retour au
+            // défaut — c'est précisément ce que la convention « clé supprimée
+            // à la désactivation » ne sait pas dire, et sans quoi la
+            // préconfiguration écraserait la case que l'utilisateur DÉCOCHE.
+            super::preconfiguration::marquer_pose(&state.backend, id, $champ);
         };
     }
 
@@ -812,6 +819,21 @@ pub(super) async fn create_zone(
         Ok(id) => {
             info!(zone_id = id, name = %body.name, output_type = ?output_type, "zone_created");
 
+            // #3589 — la zone vient de naître : c'est le SEUL instant où
+            // « aucune marque d'auteur » signifie vraiment « personne n'a rien
+            // réglé ». La provenance s'ouvre ici, la préconfiguration s'appuie
+            // dessus, et l'ordre compte : sans la marque, `preconfigurer_zone`
+            // refuse d'agir.
+            super::preconfiguration::ouvrir_provenance(&state.backend, id);
+            let (brand, model) = identite_detectee(&state, output_device_id).await;
+            super::preconfiguration::preconfigurer_zone(
+                &state.backend,
+                id,
+                brand.as_deref(),
+                model.as_deref(),
+                output_type,
+            );
+
             // Build the full zone object for both HTTP response and WS event
             let zone = repo.get(id).ok().flatten();
             let v =
@@ -861,6 +883,27 @@ pub(super) async fn create_zone(
             Json(json!({"detail": e})),
         )
             .into_response(),
+    }
+}
+
+/// Marque et modèle **annoncés par l'appareil** qui vient d'être assigné.
+///
+/// Volontairement la détection brute, et non l'override utilisateur
+/// (`zone_{id}_brand`) : à la création d'une zone, cet override n'existe pas
+/// encore — il ne naît que d'une correction ultérieure. Une zone dont
+/// l'appareil n'annonce rien n'est pas préconfigurable, et c'est très bien :
+/// la reconnaissance exige un nom de modèle exact.
+async fn identite_detectee(
+    state: &AppState,
+    output_device_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(device_id) = output_device_id else {
+        return (None, None);
+    };
+    let devices = state.scanner.devices().await;
+    match devices.iter().find(|d| d.id == device_id) {
+        Some(d) => (d.manufacturer.clone(), d.model.clone()),
+        None => (None, None),
     }
 }
 

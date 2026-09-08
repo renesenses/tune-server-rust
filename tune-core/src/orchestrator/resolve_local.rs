@@ -703,18 +703,17 @@ impl PlaybackOrchestrator {
         // track never leaves position 0; auto-advance then skips to the next
         // track every few seconds and the shuffle-all queue "resets" endlessly,
         // never becoming audible (forum #1210, Mika, BeoPlay A9 via CAST).
+        //
+        // La condition vit dans `regles.rs` depuis #3183 : le miroir du chemin
+        // du signal la recopiait SANS le bras Chromecast.
         let is_chromecast = zone_output_type.as_deref() == Some("chromecast");
-        let needs_transcode_for_output = is_network_output
-            && !dsd_passthrough
-            && !alac_passthrough
-            && !aac_passthrough
-            && source_format.as_ref().is_some_and(|f| {
-                if is_chromecast {
-                    f.needs_transcode_for_chromecast()
-                } else {
-                    f.needs_transcode_for_dlna()
-                }
-            });
+        let needs_transcode_for_output = needs_transcode_for_output_applies(
+            zone_output_type.as_deref(),
+            source_format,
+            dsd_passthrough,
+            alac_passthrough,
+            aac_passthrough,
+        );
 
         // DLNA format negotiation: if the output will be FLAC (either source
         // is FLAC, or source needs transcode and target is FLAC), check that
