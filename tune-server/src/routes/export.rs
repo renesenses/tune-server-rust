@@ -216,25 +216,52 @@ async fn export_library_audit_csv(
     // Côté base : les pistes LOCALES sous ces racines. Les pistes streaming
     // (source non locale) n'ont pas de fichier : hors sujet.
     let mut bdd: Vec<tune_core::library::audit::PisteBdd> = Vec::new();
+    // 🔴 #3101 — la portée de répertoire passe par `folder_like_pattern`, jamais
+    // par un motif écrit à la main.
+    //
+    // Ce site en avait reconstruit la moitié « échappement » et laissé tomber
+    // les trois autres garanties du contrat. Chacune se voyait à l'écran :
+    //
+    // 1. **pas de séparateur.** Le motif valait `<dir>%`, pas `<dir>/%` : auditer
+    //    `…/Rock` ramenait aussi les pistes de `…/Rockabilly` et de `…/Rock2`.
+    //    Le disque, lui, n'était parcouru que sous `…/Rock` — tout le voisinage
+    //    ressortait donc classé « Fantôme », c'est-à-dire proposé à la
+    //    suppression. Un filtre qui ne filtre pas rend PLUS que demandé, et
+    //    l'écran affiche le reste de la bibliothèque là où l'utilisateur avait
+    //    choisi UN répertoire (#3101) ;
+    // 2. **pas de repli NFC.** `tracks.file_path` est écrit en forme composée
+    //    par le scanner ; un répertoire accentué venu d'un volume macOS ou d'un
+    //    partage SMB arrive décomposé. Les deux chaînes s'affichent à
+    //    l'identique et ne partagent pas un octet : le `LIKE` ne ramenait alors
+    //    AUCUNE ligne, et l'audit déclarait « hors bibliothèque » chaque fichier
+    //    d'un dossier pourtant scanné ;
+    // 3. **marqueur `?` gravé en dur.** PostgreSQL numérote les siens : sur le
+    //    moteur PG la requête échouait, `ou_defaut_journalise` rendait une liste
+    //    vide, et l'audit entier annonçait la même chose — toute la
+    //    bibliothèque hors bibliothèque.
+    //
+    // Les deux moitiés du contrat (`folder_like_pattern` pour la valeur,
+    // `like_escape_clause` pour la clause) voyagent ensemble ou pas du tout.
+    let like_ph = match state.backend.engine() {
+        tune_core::db::engine::Engine::Postgres => "$1",
+        tune_core::db::engine::Engine::Sqlite => "?1",
+    };
+    let sql_bdd = format!(
+        "SELECT t.id, t.file_path, t.title, COALESCE(ar.name, ''), COALESCE(al.title, ''), \
+         COALESCE(t.format, ''), COALESCE(t.file_size, 0), COALESCE(t.file_mtime, 0), \
+         COALESCE(t.audio_hash, '') \
+         FROM tracks t \
+         LEFT JOIN artists ar ON t.artist_id = ar.id \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         WHERE t.file_path LIKE {like_ph}{esc} \
+           AND (t.source IS NULL OR t.source = '' OR t.source = 'local')",
+        esc = tune_core::db::track_repo::like_escape_clause()
+    );
     for d in &dirs {
-        let prefix = format!(
-            "{}%",
-            d.replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
+        let prefix = tune_core::db::track_repo::folder_like_pattern(d);
         let rows = state
             .backend
-            .query_many(
-                "SELECT t.id, t.file_path, t.title, COALESCE(ar.name, ''), COALESCE(al.title, ''), \
-                 COALESCE(t.format, ''), COALESCE(t.file_size, 0), COALESCE(t.file_mtime, 0), \
-                 COALESCE(t.audio_hash, '') \
-                 FROM tracks t \
-                 LEFT JOIN artists ar ON t.artist_id = ar.id \
-                 LEFT JOIN albums al ON t.album_id = al.id \
-                 WHERE t.file_path LIKE ? ESCAPE '\\' AND (t.source IS NULL OR t.source = '' OR t.source = 'local')",
-                &[&prefix],
-            )
+            .query_many(&sql_bdd, &[&prefix])
             .ou_defaut_journalise();
         for r in rows {
             bdd.push(tune_core::library::audit::PisteBdd {
