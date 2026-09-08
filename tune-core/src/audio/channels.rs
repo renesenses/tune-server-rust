@@ -34,6 +34,72 @@ pub enum ChannelLayout {
 }
 
 impl ChannelLayout {
+    /// Les neuf dispositions nommées, de la plus petite à la plus grande.
+    ///
+    /// C'est le VOCABULAIRE du serveur (#3322) : 1, 2, 6, 8, 10, 12, 16, 24,
+    /// 32 canaux. Rien entre les deux n'a de nom — un « 7 canaux » ne
+    /// correspond à aucune variante, et ne doit donc jamais être proposé.
+    pub const TOUTES: [Self; 9] = [
+        Self::Mono,
+        Self::Stereo,
+        Self::Surround51,
+        Self::Surround71,
+        Self::Surround514,
+        Self::Surround714,
+        Self::Surround916,
+        Self::Immersive24,
+        Self::Immersive32,
+    ];
+
+    /// Le nom stable de la disposition sur le fil.
+    ///
+    /// Identique à ce que `serde` produit (`rename_all = "snake_case"`), et
+    /// `nom_stable_identique_a_serde` le verrouille : les deux ne peuvent pas
+    /// diverger sans faire rougir la suite.
+    ///
+    /// Ce n'est PAS [`Self::badge`], qui est un libellé d'écran et qui rend
+    /// `None` pour mono et stéréo — donc inutilisable comme identifiant.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mono => "mono",
+            Self::Stereo => "stereo",
+            Self::Surround51 => "surround51",
+            Self::Surround71 => "surround71",
+            Self::Surround514 => "surround514",
+            Self::Surround714 => "surround714",
+            Self::Surround916 => "surround916",
+            Self::Immersive24 => "immersive24",
+            Self::Immersive32 => "immersive32",
+        }
+    }
+
+    /// Les dispositions qu'un appareil de `max_channels` canaux sait rendre.
+    ///
+    /// Toutes celles dont le nombre de canaux TIENT dans l'appareil — un
+    /// convertisseur 8 canaux rend mono, stéréo, 5.1 et 7.1, et rien au-delà.
+    ///
+    /// Vide quand `max_channels` vaut 0 : « on ne sait pas » ne s'arrondit pas
+    /// à « mono ». C'est le critère d'acceptation de #3322 — une zone dont la
+    /// capacité est inconnue publie `[]`, jamais une valeur inventée.
+    pub fn jusqu_a(max_channels: u16) -> Vec<Self> {
+        if max_channels == 0 {
+            return Vec::new();
+        }
+        Self::TOUTES
+            .into_iter()
+            .filter(|disposition| disposition.channel_count() <= max_channels)
+            .collect()
+    }
+
+    /// [`Self::jusqu_a`], rendu sous la forme que publie le contrat
+    /// `output_capabilities.channel_layouts` (`Vec<String>`).
+    pub fn noms_jusqu_a(max_channels: u16) -> Vec<String> {
+        Self::jusqu_a(max_channels)
+            .into_iter()
+            .map(|disposition| disposition.as_str().to_string())
+            .collect()
+    }
+
     /// Number of discrete channels in this layout.
     pub fn channel_count(self) -> u16 {
         match self {
@@ -818,5 +884,57 @@ mod stereo_i32_tests {
     #[test]
     fn adaptation_refuse_une_trame_incomplete() {
         assert!(adapt_channels_i32(&[1, 2, 3], 2, 1, 16).is_err());
+    }
+}
+
+/// #3322 — le vocabulaire des dispositions, et son bord.
+#[cfg(test)]
+mod dispositions_publiables_tests {
+    use super::ChannelLayout;
+
+    /// Le nom publié doit être CELUI de serde. Deux écritures du même nom, un
+    /// jour, divergent ; ce témoin le refuse.
+    #[test]
+    fn nom_stable_identique_a_serde() {
+        for disposition in ChannelLayout::TOUTES {
+            let par_serde = serde_json::to_string(&disposition).expect("sérialisation");
+            assert_eq!(
+                par_serde,
+                format!("\"{}\"", disposition.as_str()),
+                "as_str() doit rendre exactement le nom serde de {disposition:?}"
+            );
+        }
+    }
+
+    /// Un appareil de N canaux rend toutes les dispositions qui TIENNENT
+    /// dedans, et aucune au-delà.
+    #[test]
+    fn les_dispositions_tiennent_dans_l_appareil() {
+        assert_eq!(ChannelLayout::noms_jusqu_a(2), vec!["mono", "stereo"]);
+        assert_eq!(
+            ChannelLayout::noms_jusqu_a(8),
+            vec!["mono", "stereo", "surround51", "surround71"]
+        );
+        assert_eq!(
+            ChannelLayout::noms_jusqu_a(32).len(),
+            9,
+            "un Trinnov Altitude atteint les neuf dispositions"
+        );
+        // Un nombre de canaux sans nom (7) ne fabrique pas de disposition : il
+        // s'arrête à celle du dessous. C'est le garde-fou de l'issue — ne
+        // jamais proposer un état que `ChannelLayout` ne sait pas nommer.
+        assert_eq!(
+            ChannelLayout::noms_jusqu_a(7),
+            vec!["mono", "stereo", "surround51"]
+        );
+    }
+
+    /// « On ne sait pas » ne s'arrondit pas à « mono ».
+    #[test]
+    fn zero_canal_ne_publie_rien() {
+        assert!(
+            ChannelLayout::noms_jusqu_a(0).is_empty(),
+            "une capacité inconnue publie [], jamais une valeur inventée"
+        );
     }
 }
