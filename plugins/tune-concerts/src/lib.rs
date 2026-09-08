@@ -772,7 +772,7 @@ mod essais {
 
         let total = envoyer_abonnements(
             &banc.racine,
-            &reqwest::Client::new(),
+            tune_core::http::client::shared(),
             "inst-1",
             &artistes(450),
         )
@@ -815,7 +815,7 @@ mod essais {
 
         let total = envoyer_abonnements(
             &banc.racine,
-            &reqwest::Client::new(),
+            tune_core::http::client::shared(),
             "inst-1",
             &artistes(450),
         )
@@ -838,7 +838,7 @@ mod essais {
 
         let resultat = envoyer_abonnements(
             &banc.racine,
-            &reqwest::Client::new(),
+            tune_core::http::client::shared(),
             "inst-1",
             &artistes(450),
         )
@@ -867,7 +867,7 @@ mod essais {
 
         let total = envoyer_abonnements(
             &banc.racine,
-            &reqwest::Client::new(),
+            tune_core::http::client::shared(),
             "inst-1",
             &artistes(450),
         )
@@ -884,9 +884,14 @@ mod essais {
     async fn une_bibliotheque_vide_ne_touche_pas_le_reseau() {
         let banc = banc(vec![(200, r#"{"subscribed":0}"#, None)]).await;
 
-        let total = envoyer_abonnements(&banc.racine, &reqwest::Client::new(), "inst-1", &[])
-            .await
-            .unwrap();
+        let total = envoyer_abonnements(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-1",
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(total, 0);
         assert!(
@@ -907,9 +912,14 @@ mod essais {
             json!({"artist_name": "Groupe sans identite", "musicbrainz_artist_id": null}),
         ];
 
-        envoyer_abonnements(&banc.racine, &reqwest::Client::new(), "inst-42", &tous)
-            .await
-            .unwrap();
+        envoyer_abonnements(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-42",
+            &tous,
+        )
+        .await
+        .unwrap();
 
         let recues = banc.recues();
         assert_eq!(recues.len(), 1);
@@ -938,9 +948,10 @@ mod essais {
     async fn un_429_du_nuage_arrive_en_refus_limite_avec_son_delai() {
         let banc = banc(vec![(429, r#"{"message":"Too Many Attempts."}"#, Some(42))]).await;
 
-        let err = recuperer_concerts_depuis(&banc.racine, &reqwest::Client::new(), "inst-1")
-            .await
-            .unwrap_err();
+        let err =
+            recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-1")
+                .await
+                .unwrap_err();
 
         assert!(err.is_rate_limited(), "un 429 doit rester un 429 : {err:?}");
         assert_eq!(
@@ -957,9 +968,10 @@ mod essais {
     async fn contre_epreuve_un_refus_ordinaire_ne_fabrique_aucun_delai() {
         let banc = banc(vec![(500, r#"{"message":"boum"}"#, Some(42))]).await;
 
-        let err = recuperer_concerts_depuis(&banc.racine, &reqwest::Client::new(), "inst-1")
-            .await
-            .unwrap_err();
+        let err =
+            recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-1")
+                .await
+                .unwrap_err();
 
         assert!(
             !err.is_rate_limited(),
@@ -983,9 +995,10 @@ mod essais {
         )])
         .await;
 
-        let concerts = recuperer_concerts_depuis(&banc.racine, &reqwest::Client::new(), "inst-7")
-            .await
-            .unwrap();
+        let concerts =
+            recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-7")
+                .await
+                .unwrap();
 
         assert_eq!(concerts.len(), 3);
         let cible = banc.recues()[0]["cible"].as_str().unwrap().to_string();
