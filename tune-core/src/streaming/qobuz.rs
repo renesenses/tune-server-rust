@@ -1127,6 +1127,52 @@ impl QobuzService {
             .map(str::to_string)
     }
 
+    /// Les favoris d'un type, **bruts**, tels que Qobuz les rend (#3489).
+    ///
+    /// Un seul point de lecture pour deux projections : la liste typée que
+    /// consomment la lecture et la reprise (#3419), et la liste sérialisée
+    /// datée que sert la route des favoris. Deux points de lecture auraient
+    /// divergé — c'est exactement ce qui s'était produit sur cette route avec
+    /// les playlists (#2370), où l'aller et la reprise après rafraîchissement
+    /// du jeton ne dispatchaient déjà plus pareil.
+    async fn favoris_bruts(&self, type_qobuz: &str) -> Result<Vec<serde_json::Value>, TuneError> {
+        Ok(self
+            .api_get_all_pages(
+                "/favorite/getUserFavorites",
+                &[("type", type_qobuz)],
+                type_qobuz,
+            )
+            .await?)
+    }
+
+    /// La clé sous laquelle Qobuz date la mise en favori d'un élément de
+    /// `/favorite/getUserFavorites` : un entier d'époque, en secondes.
+    const CLES_DATE_FAVORI: &[&str] = &["favorited_at"];
+
+    /// UN favori brut, sérialisé, avec sa date de mise en favori (#3489).
+    ///
+    /// Fonction pure, et c'est le but : c'est ici que se joue le correctif —
+    /// quel champ du brut porte la date —, et une fonction pure se met sous
+    /// garde sans serveur simulé. Changez `favorited_at` pour n'importe quoi
+    /// d'autre et les essais de ce fichier passent au rouge.
+    ///
+    /// Un `fav_type` qui n'est ni `tracks` ni `albums` est traité en artiste :
+    /// le seul appelant a déjà écarté les autres.
+    fn favori_date(brut: &serde_json::Value, fav_type: &str) -> serde_json::Value {
+        let mut element = match fav_type {
+            "tracks" => serde_json::to_value(Self::map_track(brut)),
+            "albums" => serde_json::to_value(Self::map_album(brut)),
+            _ => serde_json::to_value(Self::map_artist(brut)),
+        }
+        .unwrap_or(serde_json::Value::Null);
+        crate::streaming::favorites_date::greffer_created_at(
+            &mut element,
+            brut,
+            Self::CLES_DATE_FAVORI,
+        );
+        element
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let album = &item["album"];
         StreamTrack {
@@ -2391,14 +2437,38 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
-        let items = self
-            .api_get_all_pages(
-                "/favorite/getUserFavorites",
-                &[("type", "tracks")],
-                "tracks",
-            )
-            .await?;
+        let items = self.favoris_bruts("tracks").await?;
         Ok(items.iter().map(Self::map_track).collect())
+    }
+
+    /// #3489 — la date de mise en favori, que Qobuz porte sur chaque élément
+    /// de `/favorite/getUserFavorites` sous `favorited_at` (un entier d'époque).
+    ///
+    /// Elle est lue ICI et non dans `map_track` / `map_album` / `map_artist`,
+    /// et c'est délibéré : `detail_album` met en cache la réponse entière de
+    /// `/album/get` en s'appuyant sur le fait qu'AUCUN mappeur ne consulte de
+    /// champ propre au compte — « ni `favorited_at`, ni `purchasable`, ni
+    /// `streamable` ». Le commentaire de ce cache pose la condition en toutes
+    /// lettres : « si un jour un mappeur se met à lire un champ dépendant du
+    /// compte, ce cache devra sauter ». Lire la date au site des favoris tient
+    /// la condition, et laisse le cache d'album intact.
+    ///
+    /// Les playlists retombent sur `None` : Qobuz les sert par un tout autre
+    /// point d'entrée, et aucune date n'y a été établie.
+    async fn get_user_favorites_dated(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        if !matches!(fav_type, "tracks" | "albums" | "artists") {
+            return Ok(None);
+        }
+        let items = self.favoris_bruts(fav_type).await?;
+        Ok(Some(
+            items
+                .iter()
+                .map(|brut| Self::favori_date(brut, fav_type))
+                .collect(),
+        ))
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
@@ -2657,24 +2727,12 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
-        let items = self
-            .api_get_all_pages(
-                "/favorite/getUserFavorites",
-                &[("type", "albums")],
-                "albums",
-            )
-            .await?;
+        let items = self.favoris_bruts("albums").await?;
         Ok(items.iter().map(Self::map_album).collect())
     }
 
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
-        let items = self
-            .api_get_all_pages(
-                "/favorite/getUserFavorites",
-                &[("type", "artists")],
-                "artists",
-            )
-            .await?;
+        let items = self.favoris_bruts("artists").await?;
         Ok(items.iter().map(Self::map_artist).collect())
     }
 
@@ -4128,6 +4186,60 @@ mod tests {
         assert_eq!(pistes.len(), 2, "2 participations en cache, 2 servies");
         assert_eq!(pistes[0].title, "So What");
         assert_eq!(pistes[1].title, "Blue in Green");
+    }
+
+    /// #3489 — la date que Qobuz pose sur chaque favori sort bien de la
+    /// projection datée, sous le nom que le client attend.
+    ///
+    /// Contre-épreuve : remplacez `favorited_at` par n'importe quel autre nom
+    /// dans `CLES_DATE_FAVORI` et cet essai passe au rouge.
+    #[test]
+    fn favori_date_porte_la_date_de_qobuz() {
+        let brut = json!({
+            "id": 999,
+            "title": "Time Out",
+            "artist": {"name": "Dave Brubeck", "id": 42},
+            "tracks_count": 7,
+            "favorited_at": 1_700_000_000,
+        });
+        let element = QobuzService::favori_date(&brut, "albums");
+        assert_eq!(element["source_id"], json!("999"));
+        assert_eq!(element["title"], json!("Time Out"));
+        assert_eq!(
+            element["created_at"],
+            json!("2023-11-14T22:13:20Z"),
+            "la route des favoris doit transporter la date, c'est tout l'objet de #3489"
+        );
+    }
+
+    /// Un favori que Qobuz n'a pas daté sort sans la clé — jamais avec une
+    /// date inventée.
+    #[test]
+    fn favori_date_sans_date_ne_ment_pas() {
+        let brut = json!({"id": 1, "title": "Sans date", "artist": {"name": "X"}});
+        let element = QobuzService::favori_date(&brut, "albums");
+        assert!(element.get("created_at").is_none());
+        assert_eq!(element["title"], json!("Sans date"));
+    }
+
+    /// Les trois types passent par la même projection, et aucun ne perd les
+    /// champs qu'il servait avant le correctif.
+    #[test]
+    fn les_trois_types_gardent_leur_contrat() {
+        let piste = QobuzService::favori_date(
+            &json!({"id": 7, "title": "Take Five", "performer": {"name": "Brubeck"},
+                    "favorited_at": 1_700_000_000}),
+            "tracks",
+        );
+        assert_eq!(piste["source_id"], json!("7"));
+        assert_eq!(piste["created_at"], json!("2023-11-14T22:13:20Z"));
+
+        let artiste = QobuzService::favori_date(
+            &json!({"id": 42, "name": "Dave Brubeck", "favorited_at": 1_700_000_000}),
+            "artists",
+        );
+        assert_eq!(artiste["name"], json!("Dave Brubeck"));
+        assert_eq!(artiste["created_at"], json!("2023-11-14T22:13:20Z"));
     }
 }
 

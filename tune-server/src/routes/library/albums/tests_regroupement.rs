@@ -416,3 +416,225 @@ async fn un_autre_dossier_un_autre_titre_ou_une_paire_distincte_sont_refuses() {
     .await;
     assert_eq!(statut, StatusCode::NOT_FOUND);
 }
+// ---------------------------------------------------------------------------
+// #3396 — les albums DÉCOUPÉS : « Disc 1 » / « Disc 2 », et un dossier par CD.
+//
+// BIB-A2 existait déjà et ne voyait ni l'un ni l'autre : sa clé de titre ne
+// retirait aucun marqueur de tranche, et son dossier était celui du FICHIER.
+// Les témoins passent par les DEUX routes publiques — la phase 0 qui propose,
+// la phase 1 qui exécute — parce qu'une clé corrigée d'un seul côté ouvrirait
+// une surface sur un geste que le serveur refuse.
+// ---------------------------------------------------------------------------
+
+/// Un coffret dont chaque disque est un dossier : `.../CD1`, `.../CD2`.
+fn le_coffret_par_dossier(state: &Etat) -> (i64, i64) {
+    let artiste_id = artiste(state, "The Beatles");
+    let un = album(state, "The White Album", artiste_id);
+    let deux = album(state, "The White Album", artiste_id);
+    piste(
+        state,
+        un,
+        artiste_id,
+        1,
+        "/musique/white album/CD1/01 Back.flac",
+    );
+    piste(
+        state,
+        un,
+        artiste_id,
+        2,
+        "/musique/white album/CD1/02 Dear.flac",
+    );
+    piste(
+        state,
+        deux,
+        artiste_id,
+        1,
+        "/musique/white album/CD2/01 Birthday.flac",
+    );
+    (un, deux)
+}
+
+/// Les numéros du groupe, dans l'ordre où la phase 0 les rend.
+fn groupe_contenant(corps: &Value, ids: (i64, i64)) -> Option<Value> {
+    corps["groups"]
+        .as_array()?
+        .iter()
+        .find(|g| {
+            let membres: Vec<i64> = g["albums"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|m| m["id"].as_i64()).collect())
+                .unwrap_or_default();
+            membres.contains(&ids.0) && membres.contains(&ids.1)
+        })
+        .cloned()
+}
+
+/// Premier cas nommé par le ticket : « un dossier par CD ». La phase 0 doit
+/// les réunir, et la phase 1 doit accepter de les fusionner.
+///
+/// Contre-épreuve dans le même témoin : deux albums de même titre rangés dans
+/// deux dossiers qui ne sont PAS des dossiers de disque restent séparés, et
+/// leur absorption reste refusée par `dossiers_differents`. Sans elle, une
+/// remontée d'un cran inconditionnelle passerait pour un correctif.
+#[tokio::test]
+async fn un_dossier_par_cd_est_un_seul_album() {
+    let (app, state) = serveur();
+    let (un, deux) = le_coffret_par_dossier(&state);
+
+    let (statut, corps) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    let groupe = groupe_contenant(&corps, (un, deux))
+        .unwrap_or_else(|| panic!("CD1 et CD2 doivent former un faisceau : {corps}"));
+    assert_eq!(
+        groupe["dossier"].as_str(),
+        Some("/musique/white album"),
+        "le faisceau porte le dossier de l'ALBUM, pas celui du disque"
+    );
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{un}/absorber/{deux}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert!(!album_existe(&state, deux), "le second CD est absorbé");
+    assert_eq!(
+        compte(&state, "SELECT COUNT(*) FROM tracks WHERE album_id = ?", un),
+        3,
+        "les trois pistes du coffret sont sous un seul album"
+    );
+
+    // Contre-épreuve : « Bonus » n'est pas un numéro de disque.
+    let (app, state) = serveur();
+    let artiste_id = artiste(&state, "The Beatles");
+    let a = album(&state, "The White Album", artiste_id);
+    let b = album(&state, "The White Album", artiste_id);
+    piste(
+        &state,
+        a,
+        artiste_id,
+        1,
+        "/musique/white album/Bonus/01.flac",
+    );
+    piste(
+        &state,
+        b,
+        artiste_id,
+        1,
+        "/musique/white album/Inedits/01.flac",
+    );
+    let (_, corps) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    assert!(
+        groupe_contenant(&corps, (a, b)).is_none(),
+        "deux dossiers qui ne sont pas des disques ne se rejoignent pas : {corps}"
+    );
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{a}/absorber/{b}"),
+    )
+    .await;
+    assert_eq!(
+        (statut, corps["error"].as_str()),
+        (StatusCode::CONFLICT, Some("dossiers_differents")),
+        "{corps}"
+    );
+}
+
+/// Deuxième cas nommé par le ticket : la tranche est dans le TITRE.
+///
+/// Contre-épreuve dans le même témoin : `Vol. 1` / `Vol. 2` restent DEUX
+/// albums. Le corps de l'issue demande de retirer aussi ce suffixe ; le
+/// commentaire de `numero_de_disque` dit l'inverse et donne sa raison, et
+/// c'est lui qui est suivi — fusionner deux volumes détruirait une
+/// distinction voulue.
+#[tokio::test]
+async fn un_titre_qui_porte_sa_tranche_est_un_seul_album() {
+    let (app, state) = serveur();
+    let artiste_id = artiste(&state, "The Beatles");
+    let un = album(&state, "The White Album (Disc 1)", artiste_id);
+    let deux = album(&state, "The White Album — Disc 2", artiste_id);
+    piste(
+        &state,
+        un,
+        artiste_id,
+        1,
+        "/musique/white album/01 Back.flac",
+    );
+    piste(
+        &state,
+        deux,
+        artiste_id,
+        2,
+        "/musique/white album/02 Birthday.flac",
+    );
+
+    let (_, corps) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    let groupe = groupe_contenant(&corps, (un, deux))
+        .unwrap_or_else(|| panic!("« Disc 1 » et « Disc 2 » sont un seul album : {corps}"));
+    assert_eq!(
+        groupe["titre_normalise"].as_str(),
+        Some("the white album"),
+        "la clé du faisceau ne porte plus la tranche"
+    );
+    assert_eq!(
+        groupe["numeros_complementaires"].as_bool(),
+        Some(true),
+        "les numéros se complètent : c'est le garde-fou contre la réédition"
+    );
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{un}/absorber/{deux}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert!(!album_existe(&state, deux));
+
+    // Contre-épreuve : les VOLUMES ne sont pas des tranches.
+    let (app, state) = serveur();
+    let artiste_id = artiste(&state, "Queen");
+    let v1 = album(&state, "Greatest Hits Vol. 1", artiste_id);
+    let v2 = album(&state, "Greatest Hits Vol. 2", artiste_id);
+    piste(&state, v1, artiste_id, 1, "/musique/queen/01 Bohemian.flac");
+    piste(
+        &state,
+        v2,
+        artiste_id,
+        2,
+        "/musique/queen/02 One Vision.flac",
+    );
+    let (_, corps) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    assert!(
+        groupe_contenant(&corps, (v1, v2)).is_none(),
+        "« Vol. 1 » et « Vol. 2 » sont deux albums : {corps}"
+    );
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{v1}/absorber/{v2}"),
+    )
+    .await;
+    assert_eq!(
+        (statut, corps["error"].as_str()),
+        (StatusCode::CONFLICT, Some("titres_differents")),
+        "{corps}"
+    );
+
+    // Et un titre qui n'est QUE sa tranche garde sa clé : sinon tous les
+    // albums nommés « CD 2 » convergeraient sur la clé vide.
+    let (app, state) = serveur();
+    let artiste_id = artiste(&state, "Inconnu");
+    let seul = album(&state, "CD 2", artiste_id);
+    let autre = album(&state, "CD 3", artiste_id);
+    piste(&state, seul, artiste_id, 1, "/musique/vrac/01.flac");
+    piste(&state, autre, artiste_id, 2, "/musique/vrac/02.flac");
+    let (_, corps) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    assert!(
+        groupe_contenant(&corps, (seul, autre)).is_none(),
+        "« CD 2 » et « CD 3 » ne sont pas le même album : {corps}"
+    );
+}

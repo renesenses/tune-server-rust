@@ -407,7 +407,7 @@ fn cle_lastfm_dans(lecture: impl Fn(&str) -> Option<String>) -> String {
 /// `routes/lastfm_social.rs` écrit la clé de l'interface dans le réglage
 /// `lastfm_api_key`. Personne ne la relisait ici : un utilisateur qui saisit
 /// sa clé dans Tune n'en tirait aucune biographie (#1311).
-fn cle_lastfm_avec_reglage(reglage: Option<String>) -> String {
+pub(crate) fn cle_lastfm_avec_reglage(reglage: Option<String>) -> String {
     if let Some(depuis_reglages) = reglage
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())

@@ -171,10 +171,41 @@ async fn list_collections(
     Ok(Json(json!(items)))
 }
 
+/// La borne `max_limit` d'une collection intelligente, ou 400.
+///
+/// 🔴 #2732 — `max_limit` était recopié TEL QUEL dans le SQL
+/// (`build_album_query` : `format!("LIMIT {n}")`), sans qu'aucune écriture ne
+/// le regarde. Le formulaire annonce `min="1"`, mais rien ne l'appliquait côté
+/// serveur et l'API acceptait n'importe quel entier. Une borne que le serveur
+/// ne peut pas honorer s'enregistrait donc en silence, et se relisait au
+/// formulaire comme une valeur normale — la collection, elle, ne rendait pas ce
+/// que l'écran annonçait :
+///
+/// - `0` ⇒ `LIMIT 0` : la collection résout ZÉRO album, sans message. Une
+///   borne « aucun album » n'a aucun sens, et rien ne la distingue à l'écran
+///   d'une règle qui ne ramène rien ;
+/// - négatif ⇒ les deux moteurs DIVERGENT. SQLite lit un `LIMIT` négatif comme
+///   « pas de limite » — la borne enregistrée ne borne alors rien —, tandis que
+///   PostgreSQL refuse la requête et la route rend 500. C'est exactement la
+///   classe d'écart que #1752 a coûté : la même donnée, deux comportements.
+///
+/// La doctrine du dépôt est de REFUSER, jamais d'ignorer : une valeur ignorée
+/// devient un réglage annoncé qui ne s'applique pas (`ints` dans
+/// `routes/library/query_multi.rs`). `None` reste « pas de borne ».
+fn borne_valide(max_limit: Option<i64>) -> Result<Option<i64>, AppError> {
+    match max_limit {
+        Some(n) if n <= 0 => Err(AppError::bad_request(format!(
+            "max_limit doit etre strictement positif (recu {n}) ; omettre le champ signifie « pas de borne »"
+        ))),
+        autre => Ok(autre),
+    }
+}
+
 async fn create_collection(
     State(state): State<SmartHttpState>,
     Json(body): Json<CreateCollection>,
 ) -> Result<impl IntoResponse, AppError> {
+    borne_valide(body.max_limit)?;
     let rules_json = body.rules.to_string();
     let match_mode = body.match_mode.clone().unwrap_or_else(|| "all".into());
     let sort_by = body.sort_by.clone();
@@ -253,6 +284,10 @@ async fn update_collection(
     Path(id): Path<i64>,
     Json(body): Json<UpdateCollection>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Une borne inapplicable est refusée AVANT toute écriture : la mise à jour
+    // écrit champ par champ, un refus tardif laisserait la collection à
+    // moitié modifiée (#2732).
+    borne_valide(body.max_limit)?;
     // Refuse les références circulaires avant d'écrire quoi que ce soit.
     if let Some(ref rules) = body.rules {
         let self_name = body
@@ -696,7 +731,16 @@ pub fn build_album_query(
         )
     };
 
-    let limit_clause = max_limit.map(|n| format!("LIMIT {n}")).unwrap_or_default();
+    // 🔴 #2732 — `filter(|n| *n > 0)` est la moitié LECTURE de la garde posée à
+    // l'écriture par `borne_valide`. Les lignes déjà enregistrées avec `0` ou
+    // une valeur négative — écrites avant cette garde — rendaient une
+    // collection VIDE sur SQLite et un 500 sur PostgreSQL. Elles se lisent
+    // désormais comme « pas de borne », ce qui est le seul repli qui ne perde
+    // aucun album ; les nouvelles écritures, elles, sont refusées à la porte.
+    let limit_clause = max_limit
+        .filter(|n| *n > 0)
+        .map(|n| format!("LIMIT {n}"))
+        .unwrap_or_default();
 
     (where_clause, order, limit_clause)
 }
@@ -819,6 +863,10 @@ async fn preview_albums(
     profile: ActiveProfile,
     Json(body): Json<PreviewRequest>,
 ) -> Result<Json<Value>, AppError> {
+    // La prévisualisation doit refuser la même borne que l'enregistrement :
+    // sinon l'écran montrerait un aperçu que la collection enregistrée ne sait
+    // pas reproduire (#2732).
+    borne_valide(body.max_limit)?;
     let rules_json = body.rules.to_string();
     let match_mode = body.match_mode.as_deref().unwrap_or("all");
     let sort_by = body.sort_by.as_deref().unwrap_or("title");

@@ -157,6 +157,63 @@ pub fn library_audio_support(path: &Path) -> LibraryAudioSupport {
     by_extension
 }
 
+/// Le motif NOMMÉ qui interdit de lire un fichier téléversé, ou `None`.
+///
+/// #3270 (point 4) — `upload_audio_file` et `resolve_uploaded_file` acceptaient
+/// n'importe quoi : l'extension n'était lue que pour NOMMER le fichier écrit,
+/// et le `None` de `AudioFormat::from_extension` était immédiatement absorbé par
+/// un `unwrap_or("audio/wav")`. Un `.wma`, un `.iso`, un `.pdf` traversaient
+/// toute la résolution, obtenaient une session de flux annoncée `audio/wav`, et
+/// la zone se taisait sans qu'un mot soit dit. Même famille que #3234, dont le
+/// « refus nommé » ne connaît que `.iso`.
+///
+/// La frontière est celle du décodeur livré ([`NATIVE_DECODE_EXTENSIONS`]), pas
+/// celle du catalogue : un téléversement n'entre pas dans la bibliothèque, il
+/// est joué. `.aac` brut est donc accepté ici alors que le catalogue le refuse.
+///
+/// **Une extension ABSENTE n'est pas un refus.** Le chemin d'aujourd'hui nomme
+/// ces fichiers `.wav` par défaut (`unwrap_or("wav")`) et les joue quand ils en
+/// sont vraiment ; refuser ici retirerait un cas qui marche pour couvrir une
+/// supposition. Ce qu'on refuse, c'est une extension PRÉSENTE dont on sait
+/// qu'aucun décodeur livré ne la lit — un fait, pas une présomption.
+pub fn refus_de_televersement_par_extension(nom: &str) -> Option<String> {
+    let ext = extension(Path::new(nom))?;
+    if NATIVE_DECODE_EXTENSIONS.contains(&ext.as_str()) {
+        // Le contenu peut encore démentir l'extension (DSDIFF compressé en
+        // DST). C'est `refus_de_televersement` qui tranche, fichier en main.
+        return None;
+    }
+    Some(motif_de_refus(&ext, None))
+}
+
+/// Même refus, FICHIER EN MAIN : ajoute l'inspection de contenu que
+/// l'extension seule ne peut pas faire (un `.dff` compressé en DST).
+///
+/// C'est cette variante que le chemin de lecture appelle : à ce moment le
+/// fichier existe, et promettre un décodage sans l'avoir vérifié est
+/// exactement ce que [`native_decoder_supports_file`] existe pour éviter.
+pub fn refus_de_televersement(path: &Path) -> Option<String> {
+    let ext = extension(path)?;
+    if !NATIVE_DECODE_EXTENSIONS.contains(&ext.as_str()) {
+        return Some(motif_de_refus(&ext, None));
+    }
+    decoder_rejection(path).map(|refus| motif_de_refus(&ext, Some(refus.reason)))
+}
+
+/// La phrase rendue à l'auditeur. Elle nomme ce qui est refusé ET ce qui est
+/// accepté : un refus qui n'indique pas la sortie est un cul-de-sac.
+fn motif_de_refus(ext: &str, precision: Option<&'static str>) -> String {
+    let cause = match precision {
+        Some(p) => p.to_string(),
+        None => format!("aucun décodeur livré ne lit « .{ext} »"),
+    };
+    format!(
+        "Ce fichier ne peut pas être lu : {cause}. Formats acceptés : \
+         FLAC, WAV, AIFF, MP3, M4A/ALAC, AAC, OGG/Opus, DSF, DFF (DSD non \
+         compressé), WavPack, APE."
+    )
+}
+
 /// DSDIFF minimal, mais structurellement valide, dont le payload est annoncé
 /// DST. Gardé octet pour octet comme témoin commun du contrat scanner/décodeur.
 #[cfg(test)]
@@ -205,6 +262,107 @@ pub(crate) fn dff_dst_minimal_fixture() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    // -----------------------------------------------------------------
+    // #3270 (point 4) — le refus NOMMÉ d'un fichier téléversé.
+    // -----------------------------------------------------------------
+
+    /// TÉMOIN — une extension qu'aucun décodeur livré ne lit est refusée, et
+    /// le motif NOMME l'extension refusée ET les formats acceptés.
+    #[test]
+    fn un_televersement_illisible_est_refuse_en_nommant_le_format() {
+        for nom in [
+            "concert.wma",
+            "album.iso",
+            "notice.pdf",
+            "installeur.exe",
+            "decoupe.cue",
+        ] {
+            let motif = super::refus_de_televersement_par_extension(nom)
+                .unwrap_or_else(|| panic!("« {nom} » doit être refusé"));
+            let ext = nom.rsplit('.').next().unwrap();
+            assert!(
+                motif.contains(ext),
+                "le motif doit NOMMER ce qui est refusé : {motif}"
+            );
+            assert!(
+                motif.contains("FLAC") && motif.contains("WAV"),
+                "un refus qui n'indique pas la sortie est un cul-de-sac : {motif}"
+            );
+        }
+    }
+
+    /// CONTRE-ÉPREUVE — tout ce que le décodeur livré sait lire passe. Sans
+    /// elle, un refus trop large serait vert : il suffirait de tout refuser.
+    #[test]
+    fn tout_ce_que_le_decodeur_sait_lire_passe() {
+        for ext in super::NATIVE_DECODE_EXTENSIONS {
+            let nom = format!("piste.{ext}");
+            assert_eq!(
+                super::refus_de_televersement_par_extension(&nom),
+                None,
+                "« {nom} » est dans NATIVE_DECODE_EXTENSIONS : le refuser                  retirerait un cas qui marche"
+            );
+        }
+        // Et la casse ne décide de rien.
+        assert_eq!(
+            super::refus_de_televersement_par_extension("Piste.FLAC"),
+            None
+        );
+    }
+
+    /// Une extension ABSENTE n'est pas un refus : le chemin d'aujourd'hui
+    /// nomme ces fichiers `.wav` et les joue quand ils en sont. Refuser ici
+    /// couvrirait une supposition, pas un fait.
+    #[test]
+    fn sans_extension_rien_n_est_refuse() {
+        assert_eq!(
+            super::refus_de_televersement_par_extension("enregistrement"),
+            None
+        );
+        assert_eq!(super::refus_de_televersement_par_extension(""), None);
+    }
+
+    /// Le CONTENU peut démentir l'extension : un `.dff` compressé en DST porte
+    /// une extension que le décodeur connaît, et pourtant aucun décodeur DST
+    /// n'est livré. C'est ce que la variante « fichier en main » attrape et que
+    /// la variante « extension seule » ne peut pas voir — les deux moitiés du
+    /// même contrat.
+    #[test]
+    fn un_dff_compresse_en_dst_est_refuse_par_le_contenu() {
+        // #3030 — `test_scratch` et rien d'autre : un chemin composé à la main
+        // survit au test qui ÉCHOUE, et c'est le geste qui a laissé 3 204
+        // entrées dans /tmp.
+        let dossier = crate::test_scratch::scratch_dir("3270-dst");
+        let chemin = dossier.join("image.dff");
+        std::fs::write(&chemin, super::dff_dst_minimal_fixture()).unwrap();
+
+        assert_eq!(
+            super::refus_de_televersement_par_extension("image.dff"),
+            None,
+            "l'extension seule ne peut pas voir la compression DST"
+        );
+        let motif = super::refus_de_televersement(&chemin)
+            .expect("fichier en main, le DST doit être refusé");
+        assert!(
+            motif.contains("DST"),
+            "le motif doit nommer la compression en cause : {motif}"
+        );
+
+        // CONTRE-ÉPREUVE de la même variante : elle ne refuse pas tout. Un
+        // vrai FLAC, fichier en main, passe — sinon ce test resterait vert
+        // contre une fonction qui rendrait `Some` pour n'importe quoi.
+        let flac = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test.flac"
+        ));
+        assert!(flac.exists(), "la fixture FLAC doit exister : {flac:?}");
+        assert_eq!(
+            super::refus_de_televersement(flac),
+            None,
+            "un FLAC se lit : le refuser serait une régression"
+        );
+    }
+
     use super::*;
 
     #[test]

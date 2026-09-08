@@ -19,6 +19,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_dash_temp_gc();
     spawn_position_poller(state);
     spawn_token_refresher(state);
+    spawn_tune_tested_refresher(state);
     spawn_upnp_advertiser(state, config).await;
     // Renderers UPnP par zone (#1750) : annonceur propre, relu à chaque
     // cycle — l'opt-in d'une zone prend effet sans redémarrage.
@@ -871,6 +872,40 @@ fn spawn_position_poller(state: &AppState) {
     poller.spawn();
 }
 
+/// #3589, volet A — le catalogue « Tune tested », au démarrage puis toutes les
+/// six heures.
+///
+/// Six heures, et non l'heure du `Cache-Control: public, max-age=3600` mesuré
+/// sur la réponse du site : une validation d'appareil n'est pas une urgence, et
+/// `version` étant un entier qui ne recule jamais, un tour qui ne trouve rien
+/// de neuf ne coûte qu'une comparaison.
+///
+/// 🔴 Ne rend jamais d'erreur : hors ligne, `rafraichir` rend `Repli` et
+/// l'instance garde ce qu'elle a — le dernier catalogue rangé, ou le catalogue
+/// embarqué si elle n'en a jamais obtenu.
+fn spawn_tune_tested_refresher(state: &AppState) {
+    let db = state.backend.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        loop {
+            // `interval` déclenche IMMÉDIATEMENT son premier tour : c'est le
+            // « au démarrage » de l'issue, sans second appel à écrire.
+            ticker.tick().await;
+            match tune_core::cloud::tune_tested::rafraichir(&db).await {
+                tune_core::cloud::tune_tested::Issue::Range { avant, apres } => {
+                    tracing::info!(avant, apres, "tune_tested_catalogue_mis_a_jour");
+                }
+                tune_core::cloud::tune_tested::Issue::Inchange(v) => {
+                    tracing::debug!(version = v, "tune_tested_catalogue_inchange");
+                }
+                tune_core::cloud::tune_tested::Issue::Repli(raison) => {
+                    tracing::debug!(%raison, "tune_tested_catalogue_repli");
+                }
+            }
+        }
+    });
+}
+
 fn spawn_token_refresher(state: &AppState) {
     let services = state.services.clone();
     let db = state.backend.clone();
@@ -983,10 +1018,22 @@ fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {
 }
 
 fn spawn_telemetry_reporter(state: &AppState) {
-    tune_core::cloud::telemetry::spawn_startup_ping(state.services.clone());
+    // #3383 : le ping de demarrage recoit la base, parce qu'il doit lire le
+    // consentement avant d'envoyer version, OS, arch et liste des services.
+    // #3380 : les deux envois recoivent le repertoire web REELLEMENT servi
+    // (`resolve_web_dir`, le meme que le routeur), pour y relire la version de
+    // l'interface a chaque battement. Sans ce chemin, mozaiklabs ne connait que
+    // la version du binaire — et `web/` est deploye separement.
+    let web_dir = crate::config::resolve_web_dir();
+    tune_core::cloud::telemetry::spawn_startup_ping(
+        state.backend.clone(),
+        state.services.clone(),
+        web_dir.clone(),
+    );
     tune_core::cloud::telemetry::TelemetryReporter::spawn(
         state.backend.clone(),
         state.services.clone(),
+        web_dir,
     );
 }
 
@@ -1030,16 +1077,16 @@ fn prochain_intervalle_battement(echecs_consecutifs: u32) -> std::time::Duration
 
 /// Ce qu'un tour de battement a le droit de faire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HeartbeatPlan {
+pub struct HeartbeatPlan {
     /// Envoyer la charge utile a `POST /api/v1/heartbeat`.
-    send_heartbeat: bool,
+    pub send_heartbeat: bool,
     /// Rafraichir les droits premium du compte SSO (`GET /api/v1/user`).
-    refresh_account: bool,
+    pub refresh_account: bool,
     /// La clé de licence se revalide par `POST /api/v1/license/validate`,
     /// une charge à trois champs sans rien de descriptif — donc même quand
     /// la télémétrie est refusée. Sans cela, un Premium à CLÉ en opt-out
     /// retombait en Free au bout de la grâce de 14 jours (LIC-1).
-    revalidate_key: bool,
+    pub revalidate_key: bool,
 }
 
 /// Decide ce que fait le tour de battement en fonction de l'opt-out telemetrie.
@@ -1061,6 +1108,19 @@ fn heartbeat_plan(telemetry_enabled: bool) -> HeartbeatPlan {
         refresh_account: true,
         revalidate_key: true,
     }
+}
+
+/// Le plan d'UN tour, decide a partir des reglages de CETTE instance.
+///
+/// #3383 — c'est le seul site d'appel de `heartbeat_plan` en production, et
+/// c'est ici que se lit le consentement. `is_enabled_for` et non `is_enabled` :
+/// le refus pose dans l'interface (`POST /cloud/telemetry/disable`) compte
+/// autant que celui pose dans l'environnement (`TUNE_TELEMETRY=false`).
+///
+/// Fonction et non expression en ligne, pour qu'un temoin puisse APPELER la
+/// decision reelle plutot que d'en recopier les termes.
+pub fn plan_du_tour(settings: &tune_core::db::settings_repo::SettingsRepo) -> HeartbeatPlan {
+    heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(settings))
 }
 
 /// Lightweight heartbeat — honours `TUNE_TELEMETRY` (#2416).
@@ -1135,7 +1195,7 @@ fn spawn_heartbeat(state: &AppState) {
 
         let mut echecs_consecutifs: u32 = 0;
         loop {
-            let plan = heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled());
+            let plan = plan_du_tour(&settings);
 
             // Registre des executions automatisees (#2080) : un cycle = une
             // ligne. Le battement est la seule passe dont l'echec est INVISIBLE
@@ -2225,10 +2285,25 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
 
             // New device found — register it
             // L'hôte qui a énuméré ce nom voyage avec lui (#3230).
+            //
+            // #3245 — et le mode exclusif se décide AVEC lui. Ce chemin-ci est
+            // celui qui rendait le débordement certain : quand ASIO est
+            // configuré, ce rescan FORCE l'énumération WASAPI (voir
+            // `scan_backend` plus haut), donc tous les noms qu'il enregistre
+            // sont des noms WASAPI. `state.effective_exclusive_mode()` valait
+            // pourtant `true`, imposé par ASIO, et `LocalOutput` ouvrait ces
+            // sorties en WASAPI EXCLUSIF — le son des autres applications de la
+            // machine disparaissait sur un périphérique que personne n'avait
+            // demandé en exclusif (jfpaquet, Asus Essence STX II).
+            let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
+                &configured_backend,
+                Some(dev.backend.as_str()),
+                state.requested_exclusive_mode(),
+            );
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
-                state.effective_exclusive_mode(),
+                statut_exclusif.effective,
                 &configured_backend,
             )
             .with_origin_host(&dev.backend);
@@ -2342,11 +2417,15 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             if is_asio_configured {
                 continue;
             }
-            let zone_name = if *is_default {
-                "This Computer".to_string()
-            } else {
-                dev_name.clone()
-            };
+            // #1770 : même règle qu'au démarrage — l'étiquette générique ne se
+            // minte qu'une fois. Un DAC branché à chaud qui devient la sortie
+            // système ne doit pas produire un second « This Computer » à côté
+            // de celui que porte déjà une autre sortie locale.
+            let generique_deja_pris = zone_repo
+                .etiquette_generique_locale_prise(device_id)
+                .unwrap_or(false);
+            let zone_name =
+                tune_core::config::nom_de_zone_locale(dev_name, *is_default, generique_deja_pris);
 
             // #1770 : le rescan peut créer au plus UNE zone, celle de la sortie
             // système. Les autres sorties restent enregistrées pour que
@@ -2731,9 +2810,12 @@ mod heartbeat_cadence_et_optout_tests {
         );
     }
 
-    /// Le battement doit lire l'opt-out par le MEME mecanisme que la telemetrie
-    /// (`TelemetryReporter::is_enabled`), pas par une seconde lecture maison de
-    /// la variable d'environnement.
+    /// Le battement doit lire l'opt-out par le MEME mecanisme que le reste des
+    /// envois (`TelemetryReporter::is_enabled_for`), pas par une seconde
+    /// lecture maison de la variable d'environnement.
+    ///
+    /// #3383 : `is_enabled_for` et non `is_enabled` — le second ne connait que
+    /// l'environnement, et laissait la bascule de l'interface sans effet.
     #[test]
     fn l_optout_reutilise_le_mecanisme_de_la_telemetrie() {
         // On ne regarde QUE le code de production : les modules de test citent
@@ -2745,10 +2827,65 @@ mod heartbeat_cadence_et_optout_tests {
             .next()
             .expect("source vide");
         assert!(
-            production.contains(&format!("TelemetryReporter::{}()", "is_enabled")),
-            "l'opt-out du battement doit reutiliser TelemetryReporter::is_enabled, \
+            production.contains(&format!("TelemetryReporter::{}(", "is_enabled_for")),
+            "l'opt-out du battement doit reutiliser TelemetryReporter::is_enabled_for, \
              pas relire TUNE_TELEMETRY pour son compte"
         );
+    }
+
+    /// #3383 — le battement lit le reglage ECRIT par la bascule de
+    /// l'interface, et pas seulement la variable d'environnement.
+    ///
+    /// Ce temoin APPELLE `plan_du_tour`, c'est-a-dire l'unique expression que
+    /// la boucle de production evalue a chaque tour : debrancher la conduite
+    /// le fait rougir, ce qu'une recherche de chaine dans le fichier ne ferait
+    /// pas.
+    #[test]
+    fn le_refus_pose_dans_l_interface_coupe_le_battement() {
+        let db = base_de_test();
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(db);
+
+        // Rien de pose : comportement d'avant, le battement part.
+        assert!(
+            super::plan_du_tour(&reglages).send_heartbeat,
+            "une installation qui n'a rien decoche doit continuer d'emettre"
+        );
+
+        // `POST /cloud/telemetry/disable` ecrit ceci, et rien d'autre.
+        reglages
+            .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "false")
+            .expect("ecriture du reglage");
+        let plan = super::plan_du_tour(&reglages);
+        assert!(
+            !plan.send_heartbeat,
+            "le refus pose dans l'interface doit couper la charge utile descriptive"
+        );
+        // Et la licence, elle, continue de vivre — LIC-1 : un opt-out ne se
+        // paie jamais en fonctionnalites perdues, y compris a J+15.
+        assert!(
+            plan.revalidate_key,
+            "refuser la telemetrie ne doit pas faire perdre une licence a cle"
+        );
+        assert!(
+            plan.refresh_account,
+            "refuser la telemetrie ne doit pas degrader un compte premium"
+        );
+
+        // Et il se rallume.
+        reglages
+            .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "true")
+            .expect("ecriture du reglage");
+        assert!(
+            super::plan_du_tour(&reglages).send_heartbeat,
+            "re-cocher doit reellement rallumer"
+        );
+    }
+
+    fn base_de_test() -> std::sync::Arc<dyn tune_core::db::backend::DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().expect("base en memoire");
+        db.init_schema().expect("schema");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        std::sync::Arc::new(db)
     }
 }
 
@@ -2859,6 +2996,116 @@ mod heartbeat_server_id_tests {
                 );
             }
         }
+    }
+}
+
+/// GARDE DE SITE (#1770) — les deux chemins qui NOMMENT une zone locale
+/// doivent passer par `config::nom_de_zone_locale`, jamais écrire l'étiquette
+/// générique en dur.
+///
+/// C'est la précondition du correctif. La règle « on ne minte pas deux fois
+/// l'étiquette générique » vit dans `tune-core::config` ; un site qui écrit
+/// `"This Computer"` lui-même ne la consulte pas et refabrique le doublon —
+/// deux zones du même nom après une bascule ASIO → WASAPI, mesuré chez
+/// jfpaquet en 0.9.130.
+///
+/// Pourquoi une garde textuelle : les deux fonctions visées sont derrière
+/// `#[cfg(feature = "local-audio")]` et demandent un `AppState` complet plus de
+/// vrais périphériques. La garde lit le code de PRODUCTION seul — le module de
+/// test est retranché avant l'examen, sans quoi sa propre contre-épreuve le
+/// ferait rougir. Sa contre-épreuve est
+/// `la_garde_refuse_une_etiquette_ecrite_en_dur`.
+#[cfg(test)]
+mod etiquette_generique_i1770 {
+    /// Le code de production d'un fichier : tout ce qui précède le premier
+    /// module de test. L'aiguille est construite à l'exécution, sinon ce
+    /// module se retrancherait au mauvais endroit dès qu'on le relit par
+    /// `include_str!`.
+    fn production(source: &str) -> &str {
+        let marqueur_test = format!("#[cfg({})]", "test");
+        source.split(&marqueur_test).next().unwrap_or("")
+    }
+
+    /// Les étiquettes génériques écrites en dur, en littéral Rust, dans le
+    /// code de production. Rendues par numéro de ligne (1-indexé).
+    fn etiquettes_en_dur(source: &str) -> Vec<usize> {
+        let production = production(source);
+        let mut lignes = Vec::new();
+        for etiquette in tune_core::config::ETIQUETTES_LOCALES_GENERIQUES {
+            let aiguille = format!("\"{etiquette}\"");
+            let mut curseur = 0usize;
+            while let Some(pos) = production[curseur..].find(&aiguille) {
+                let debut = curseur + pos;
+                lignes.push(production[..debut].lines().count());
+                curseur = debut + aiguille.len();
+            }
+        }
+        lignes.sort_unstable();
+        lignes
+    }
+
+    fn appels_a_la_regle(source: &str) -> usize {
+        production(source)
+            .matches("config::nom_de_zone_locale(")
+            .count()
+    }
+
+    #[test]
+    fn les_deux_sites_de_nommage_local_passent_par_la_regle() {
+        let fichiers = [
+            (
+                "tune-server/src/background.rs",
+                include_str!("background.rs"),
+            ),
+            ("tune-server/src/startup.rs", include_str!("startup.rs")),
+        ];
+        let mut total = 0usize;
+        for (chemin, source) in fichiers {
+            total += appels_a_la_regle(source);
+            let en_dur = etiquettes_en_dur(source);
+            assert!(
+                en_dur.is_empty(),
+                "{chemin} écrit une étiquette de zone locale générique en dur, \
+                 ligne(s) {en_dur:?}. Ce site ne consulte donc pas \
+                 `config::nom_de_zone_locale` et peut minter un second \
+                 « This Computer » à côté de celui d'un autre moteur audio \
+                 (#1770, jfpaquet, 0.9.130)"
+            );
+        }
+        assert_eq!(
+            total, 2,
+            "les deux seuls sites qui nomment une zone locale issue d'une \
+             énumération sont `register_local_outputs` (startup.rs) et \
+             `rescan_local_audio_devices` (background.rs). Un site de plus ou \
+             de moins : reprendre le recensement de #1770 avant de toucher à \
+             ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur lui-même. Sans elle, `etiquettes_en_dur`
+    /// pourrait ne rien détecter du tout et la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_une_etiquette_ecrite_en_dur() {
+        let fabrique = "fn f() {\n    let zone_name = \"This Computer\".to_string();\n}\n";
+        assert_eq!(
+            etiquettes_en_dur(fabrique),
+            vec![2],
+            "le détecteur doit rougir sur un site qui écrit l'étiquette en dur"
+        );
+        assert_eq!(
+            appels_a_la_regle(fabrique),
+            0,
+            "et ne doit compter aucun appel à la règle là où il n'y en a pas"
+        );
+    }
+
+    /// TÉMOIN — le détecteur ne rougit pas sur un site conforme.
+    #[test]
+    fn temoin_un_site_conforme_passe() {
+        let fabrique = "fn f() {\n    let zone_name = \
+                        tune_core::config::nom_de_zone_locale(&n, d, p);\n}\n";
+        assert!(etiquettes_en_dur(fabrique).is_empty());
+        assert_eq!(appels_a_la_regle(fabrique), 1);
     }
 }
 
@@ -2987,6 +3234,171 @@ mod etiquette_hote_origine_i1770 {
             sites_sans_etiquette(&loin),
             vec![1],
             "une étiquette hors de la chaîne d'appel ne doit pas compter"
+        );
+    }
+}
+
+/// #3245 — le mode exclusif d'une sortie locale doit se décider PAR
+/// PÉRIPHÉRIQUE, sur les DEUX sites qui en enregistrent une.
+///
+/// La règle est `tune_core::config::local_exclusive_mode_du_peripherique` :
+/// elle compose `openable_local_backend` (le backend sous lequel CE nom
+/// s'ouvrira, #1770) avec `exclusive_mode_status` (la contrainte ASIO, #3192).
+/// Un site qui passe à la place la valeur MACHINE —
+/// `effective_exclusive_mode()` — impose l'exclusif d'ASIO à une sortie qui
+/// sera ouverte en WASAPI ; Tune ouvre alors WASAPI en exclusif et la machine
+/// perd le son de toutes ses autres applications (jfpaquet, Asus Essence
+/// STX II).
+///
+/// Garde TEXTUELLE, et pour la même raison que sa jumelle
+/// `etiquette_hote_origine_i1770` : les deux fonctions visées sont derrière
+/// `#[cfg(feature = "local-audio")]` et demandent un `AppState` complet plus
+/// de vrais périphériques. Elle nomme les SITES D'APPEL et lit le code de
+/// PRODUCTION seul — le module de test est retranché avant l'examen, sans quoi
+/// il se prouverait lui-même. Sa contre-épreuve est
+/// `la_garde_refuse_un_site_qui_impose_la_valeur_machine`.
+#[cfg(test)]
+mod exclusif_par_peripherique_i3245 {
+    const CONSTRUCTEUR: &str = "LocalOutput::with_options_and_endpoint(";
+    /// Le nom de la variable que les deux sites remplissent avec la règle.
+    /// C'est bien le SITE D'APPEL qui est nommé : la garde n'accepte pas un
+    /// booléen calculé ailleurs et recopié.
+    const REGLE: &str = "statut_exclusif.effective";
+
+    /// Les ARGUMENTS d'un appel au constructeur, parenthèses comprises.
+    ///
+    /// Une simple fenêtre d'octets — celle de la garde de #1770 — ne
+    /// conviendrait pas ici : le site de `startup.rs` journalise
+    /// `statut_exclusif.effective` juste après l'appel, et une fenêtre large se
+    /// laisserait sauver par cette TRACE pendant que l'ARGUMENT, lui, serait
+    /// redevenu la valeur machine. On lit donc exactement la liste
+    /// d'arguments, en comptant les parenthèses.
+    fn arguments_du_constructeur(source: &str, debut: usize) -> Option<&str> {
+        let ouvre = debut + CONSTRUCTEUR.len() - 1;
+        let mut profondeur = 0i32;
+        for (i, octet) in source[ouvre..].bytes().enumerate() {
+            match octet {
+                b'(' => profondeur += 1,
+                b')' => {
+                    profondeur -= 1;
+                    if profondeur == 0 {
+                        return Some(&source[ouvre..ouvre + i + 1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Le code de production seul : l'aiguille est construite à l'exécution,
+    /// sans quoi ce module se compterait lui-même à travers `include_str!`.
+    fn production(source: &str) -> &str {
+        let marqueur_test = format!("#[cfg({})]", "test");
+        let coupe = source.find(&marqueur_test).unwrap_or(source.len());
+        &source[..coupe]
+    }
+
+    /// Les sites d'enregistrement dont l'ARGUMENT de mode exclusif ne vient PAS
+    /// de la règle par périphérique, par numéro de ligne (1-indexé).
+    fn sites_sans_regle_par_peripherique(source: &str) -> Vec<usize> {
+        let production = production(source);
+        let mut manquants = Vec::new();
+        let mut curseur = 0usize;
+        while let Some(pos) = production[curseur..].find(CONSTRUCTEUR) {
+            let debut = curseur + pos;
+            let conforme = arguments_du_constructeur(production, debut)
+                .is_some_and(|args| args.contains(REGLE));
+            if !conforme {
+                manquants.push(production[..debut].lines().count());
+            }
+            curseur = debut + CONSTRUCTEUR.len();
+        }
+        manquants
+    }
+
+    /// Combien de sites ce fichier porte, conformes ou non.
+    fn nombre_de_sites_i3245(source: &str) -> usize {
+        production(source).matches(CONSTRUCTEUR).count()
+    }
+
+    #[test]
+    fn les_deux_sites_d_enregistrement_local_decident_l_exclusif_par_peripherique() {
+        let fichiers = [
+            (
+                "tune-server/src/background.rs",
+                include_str!("background.rs"),
+            ),
+            ("tune-server/src/startup.rs", include_str!("startup.rs")),
+        ];
+
+        let mut total = 0usize;
+        for (chemin, source) in fichiers {
+            total += nombre_de_sites_i3245(source);
+            let manquants = sites_sans_regle_par_peripherique(source);
+            assert!(
+                manquants.is_empty(),
+                "{chemin} construit une sortie locale sans décider son mode \
+                 exclusif PAR PÉRIPHÉRIQUE, ligne(s) {manquants:?}. Sans \
+                 `local_exclusive_mode_du_peripherique(...)` en ARGUMENT, la \
+                 contrainte « ASIO est exclusif par nature » déborde sur un nom \
+                 énuméré par WASAPI : Tune ouvre WASAPI en EXCLUSIF et la \
+                 machine perd le son de toutes ses autres applications (#3245, \
+                 jfpaquet, Asus Essence STX II)"
+            );
+        }
+
+        assert_eq!(
+            total, 2,
+            "les deux seuls sites d'enregistrement d'une sortie locale issue \
+             d'une énumération sont `register_local_outputs` (startup.rs) et \
+             `rescan_local_audio_devices` (background.rs). Un site de plus ou \
+             de moins : reprendre le recensement avant de toucher à ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur lui-même. Sans elle,
+    /// `sites_sans_regle_par_peripherique` pourrait ne rien détecter du tout et
+    /// la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_un_site_qui_impose_la_valeur_machine() {
+        let sain = "let x = regle(b, Some(&dev.backend), d);\nlet o = LocalOutput::with_options_and_endpoint(n, e, statut_exclusif.effective, b);\n";
+        assert!(
+            sites_sans_regle_par_peripherique(sain).is_empty(),
+            "le détecteur doit accepter un site dont l'ARGUMENT vient de la règle"
+        );
+        assert_eq!(nombre_de_sites_i3245(sain), 1);
+
+        let malade = "let s = state.clone();\nlet o = LocalOutput::with_options_and_endpoint(n, e, state.effective_exclusive_mode(), b);\n";
+        assert_eq!(
+            sites_sans_regle_par_peripherique(malade),
+            vec![2],
+            "le détecteur doit nommer la ligne d'un site qui impose la valeur \
+             MACHINE à chaque périphérique — c'est le défaut de #3245"
+        );
+
+        // LE CAS QUI COMPTE, et celui qu'une simple fenêtre d'octets raterait :
+        // l'argument est redevenu la valeur machine, mais la TRACE voisine
+        // nomme encore la règle. C'est exactement la forme du site de
+        // `startup.rs`. Un détecteur qui lirait 800 octets autour de l'appel
+        // resterait vert ici, contre un défaut bien vivant.
+        let sauve_par_sa_trace = "let s = state.clone();\nlet o = LocalOutput::with_options_and_endpoint(n, e, state.effective_exclusive_mode(), b);\ninfo!(effectif = statut_exclusif.effective);\n";
+        assert_eq!(
+            sites_sans_regle_par_peripherique(sauve_par_sa_trace),
+            vec![2],
+            "une trace qui NOMME la règle ne doit pas tenir lieu de l'avoir \
+             APPELÉE : c'est l'argument qui atteint le pilote, pas le journal"
+        );
+
+        // Et le retranchement du module de test doit vraiment couper.
+        let avec_tests = format!(
+            "let o = LocalOutput::with_options_and_endpoint(n, e, x, b);\n#[cfg({})]\nmod t {{ LocalOutput::with_options_and_endpoint(n, e, statut_exclusif.effective, b) }}\n",
+            "test"
+        );
+        assert_eq!(
+            nombre_de_sites_i3245(&avec_tests),
+            1,
+            "un site cité dans un module de test ne doit pas être compté"
         );
     }
 }

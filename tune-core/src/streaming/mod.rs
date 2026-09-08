@@ -1,6 +1,7 @@
 pub mod amazon;
 pub mod deezer;
 pub mod deezer_decrypt;
+pub mod favorites_date;
 pub mod favorites_import;
 pub mod matching;
 pub mod podcasts;

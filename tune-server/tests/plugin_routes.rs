@@ -533,6 +533,132 @@ async fn opt_in_plugin_loads_after_install() {
     assert_eq!(entry["enabled"], true);
 }
 
+// ---------------------------------------------------------------------------
+// #3484 — « installé mais impossible de le démarrer »
+// ---------------------------------------------------------------------------
+//
+// La porte qui charge un greffon (`PluginLoader::setup_all`) ne s'ouvre qu'au
+// démarrage. `install` et `uninstall` le disaient par `restart_required` ;
+// `enable` et `disable` ne le disaient pas, alors que ce sont les deux routes
+// que l'écran appelle pour l'interrupteur d'un greffon déjà installé. Le
+// gestionnaire de la nouvelle interface ne montre sa bannière que sur ce champ
+// (`tune-web-client`, `src/components/v2/PluginsV2.svelte` : install et bascule
+// passent par le même `act()`, dont la seule décision est
+// `if (res?.restart_required) restartNeeded = true;`). Sans lui, basculer
+// annonçait « activé » et rien ne chargeait.
+//
+// Les trois épreuves ci-dessous portent sur les trois cas qui se distinguent,
+// et le témoin vert du milieu est celui qui compte : `restart_required` doit
+// être un CONSTAT (l'état demandé diffère-t-il de ce qui tourne ?), pas un
+// `true` constant qui enverrait couper la musique pour rien.
+
+/// Activer un greffon qui ne tourne pas : le redémarrage est annoncé.
+#[tokio::test]
+async fn activer_un_greffon_dormant_annonce_le_redemarrage() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    // Pas installé : `setup_all` le laisse dormant, il ne tourne pas.
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/optin/enable", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], true);
+    assert_eq!(
+        body["restart_required"], true,
+        "le réglage est écrit mais aucun routeur n'est monté : sans ce champ \
+         l'écran annonce « activé » et rien ne charge — {body}"
+    );
+
+    // Et le réglage a bien été posé : le champ ne remplace pas l'écriture.
+    let (_installed, enabled) = reglages_d_installation(&state, "optin");
+    assert_eq!(enabled.as_deref(), Some("true"));
+}
+
+/// Témoin vert — réactiver un greffon DÉJÀ chargé ne demande rien.
+///
+/// C'est ce cas qui interdit un `true` constant : la bannière enverrait
+/// redémarrer un serveur qui n'a rien à recharger, et la lecture s'arrêterait
+/// pour rien.
+#[tokio::test]
+async fn reactiver_un_greffon_deja_charge_ne_demande_aucun_redemarrage() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_optin_installed", "true")
+        .unwrap();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/optin/enable", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["restart_required"], false,
+        "le greffon tourne déjà : rien à recharger — {body}"
+    );
+}
+
+/// Désactiver un greffon qui TOURNE : ses routes restent montées jusqu'au
+/// prochain démarrage, et le champ doit le dire.
+#[tokio::test]
+async fn desactiver_un_greffon_charge_annonce_le_redemarrage() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_optin_installed", "true")
+        .unwrap();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/optin/disable", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], false);
+    assert_eq!(
+        body["restart_required"], true,
+        "le greffon tourne encore : ses routes ne tomberont qu'au prochain \
+         démarrage — {body}"
+    );
+}
+
+/// La fiche d'un greffon COMPILÉ installé mais pas encore chargé porte le même
+/// champ que la fiche wasm dans le même état.
+///
+/// Les deux boucles de `list_plugins` décrivaient le même fait — installé, pas
+/// chargé, redémarrage attendu — et une seule le disait. Un écran ne peut pas
+/// deviner que le champ manque : il lit `undefined` et conclut « rien à
+/// faire ».
+#[tokio::test]
+async fn la_fiche_d_un_greffon_installe_non_charge_annonce_le_redemarrage() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    // Installé APRÈS le démarrage : c'est exactement la fenêtre entre le clic
+    // « Installer » et le redémarrage.
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_optin_installed", "true")
+        .unwrap();
+
+    let app = tune_server::routes::router(state.clone());
+    let (_status, body) = body_of(&app, "/api/v1/plugins").await;
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "optin")
+        .expect("le greffon dormant reste listé");
+    assert_eq!(entry["installed"], true);
+    assert_eq!(entry["enabled"], false);
+    assert_eq!(
+        entry["restart_required"], true,
+        "installé et pas chargé : la fiche doit l'annoncer comme la fiche wasm — {entry}"
+    );
+}
+
 /// `dj` et `karaoke` sont compilés dans TOUS les binaires publiés — les six
 /// lignes de build de `release.yml` les listent avec `bandcamp`. Ils ne
 /// doivent pourtant plus figurer dans le gestionnaire : aucun écran du client

@@ -104,10 +104,39 @@ pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
         _ => (StatusCode::OK, "degraded", "degraded"),
     };
 
-    let components: serde_json::Map<String, Value> = sondes
+    let mut components: serde_json::Map<String, Value> = sondes
         .iter()
         .map(|(nom, ok)| ((*nom).to_string(), Value::Bool(*ok)))
         .collect();
+
+    // 🔴 #3462 — un sous-système mort au démarrage, enfin visible là où on
+    // regarde.
+    //
+    // Quand un Lyrion/LMS tourne sur la même machine, le bind SlimProto sur
+    // 3483 échoue et AUCUNE platine Squeezebox ne verra jamais Tune. La cause
+    // est déjà sondée, nommée et retenue pour la session par
+    // `tune_core::slimproto::etat_ecoute()` — mais elle ne sortait que par
+    // `/system/diagnostics/network` et par le rapport de bogue, c'est-à-dire
+    // par deux chemins que personne n'emprunte avant d'avoir déjà soupçonné
+    // quelque chose. Le testeur, lui, regarde l'écran Diagnostics et l'onglet
+    // Système des Réglages : les trois écrans qui affichent DÉJÀ cette grille
+    // de composants (`DiagnosticsView.svelte`, `SettingsView.svelte`,
+    // `v2/SettingsV2.svelte`, via `SystemHealth.components`). On remplit le
+    // contrat existant, on n'en invente pas un second — c'est la règle posée
+    // plus haut, et elle vaut aussi pour ce qui n'est pas la base.
+    //
+    // ⚠️ Volontairement HORS de `sondes` : `status` et le 503 énoncent l'état
+    // de la BASE, et un LMS voisin n'a jamais empêché Tune de servir sa
+    // bibliothèque. Compter SlimProto ici ferait passer tout le serveur en
+    // `degraded` — pastille orange dans la barre latérale comprise — pour une
+    // panne qui ne touche qu'un protocole. Le composant dit non ; le verdict
+    // global ne bouge pas.
+    //
+    // Absent tant qu'aucune tentative d'écoute n'a eu lieu : une absence reste
+    // une absence, elle ne devient pas un « en panne ».
+    if let Some(etat) = tune_core::slimproto::etat_ecoute() {
+        components.insert("slimproto".to_string(), Value::Bool(etat.ecoute));
+    }
 
     (
         code,

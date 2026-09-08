@@ -176,10 +176,11 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             inject_session_context(obj, &ps);
             obj.insert("position_ms".into(), json!(ps.position_ms));
             obj.insert("queue_length".into(), json!(ps.queue_length));
-            obj.insert(
-                "can_skip_next".into(),
-                json!(crate::routes::playback::can_skip_next(&ps)),
-            );
+            // #3514 — le refus « radio hors file » (#3342) fait partie de la
+            // décision : sans lui, le bouton reste actif et sans effet.
+            let peut_avancer =
+                crate::routes::playback::can_skip_next_publie(&state, zone_id, &ps).await;
+            obj.insert("can_skip_next".into(), json!(peut_avancer));
             // L'aleatoire et la repetition appartiennent a la ZONE, et ils
             // survivent aux redemarrages : `queue_persistence` les enregistre
             // avec la file, `startup.rs` les restaure.
@@ -396,10 +397,10 @@ pub(super) async fn get_zone(
                 // "now playing" highlight on track change without refetching the
                 // whole queue (expensive under a large shuffle queue, #1096).
                 obj.insert("queue_position".into(), json!(ps.queue_position));
-                obj.insert(
-                    "can_skip_next".into(),
-                    json!(crate::routes::playback::can_skip_next(&ps)),
-                );
+                // #3514 — même décision qu'au-dessus, même refus.
+                let peut_avancer =
+                    crate::routes::playback::can_skip_next_publie(&state, id, &ps).await;
+                obj.insert("can_skip_next".into(), json!(peut_avancer));
                 // Meme raison qu'au-dessus (#2092) : c'est cette charge utile
                 // que le client relit apres chaque evenement de lecture, et
                 // c'est elle qui doit lui apprendre un aleatoire deja actif.

@@ -1193,13 +1193,18 @@ fn decider_les_forcages(
         && !dlna_lpcm
         && !dlna_wav24
         && ZoneRepo::with_backend(backend.clone()).get_aac_passthrough(zone_id);
-    let needs_transcode_for_output = is_network_output
-        && !dsd_passthrough
-        && !alac_passthrough
-        && !aac_passthrough
-        && source_format
-            .as_ref()
-            .is_some_and(|f| f.needs_transcode_for_dlna());
+    // #3183 — la QUATRIEME copie a la main, et celle qui avait deja derive :
+    // ce miroir n'appelait que `needs_transcode_for_dlna()`, la decision
+    // choisit le bras Chromecast pour une zone `chromecast`. Sur une source
+    // AIFF, l'orchestrateur transcodait pendant que ce panneau annoncait un
+    // passthrough. Les deux cotes appellent desormais la MEME fonction.
+    let needs_transcode_for_output = tune_core::orchestrator::needs_transcode_for_output_applies(
+        Some(output_type),
+        source_format,
+        dsd_passthrough,
+        alac_passthrough,
+        aac_passthrough,
+    );
     // OAAT transcodes everything to WAV except WAV itself
     let is_oaat = output_type == "oaat";
     let oaat_transcodes = is_oaat

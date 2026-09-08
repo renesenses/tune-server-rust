@@ -2067,7 +2067,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
 /// toujours un vrai titre d'album (« Greatest Hits Vol. 2 »), et le confondre
 /// avec un disque effacerait un album entier. Un préfixe suivi d'autre chose
 /// qu'un nombre — `Disco`, `CD Rip` — ne correspond pas non plus.
-pub(crate) fn numero_de_disque(nom: &str) -> Option<u32> {
+pub fn numero_de_disque(nom: &str) -> Option<u32> {
     let nom = nom.trim().to_lowercase();
     // « disque » avant « disc », sinon « disque 2 » se lirait « disc » + « ue 2 ».
     for prefixe in ["disque", "disc", "disk", "cd"] {

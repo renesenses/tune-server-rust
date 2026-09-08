@@ -753,12 +753,21 @@ async fn diagnostics_returns_ok() {
     assert!(body["cpu_count"].as_u64().unwrap() > 0);
 }
 
+/// #3383 — ce temoin s'appelait `telemetry_snapshot_default_disabled` et
+/// affirmait `enabled: false` sur une installation neuve. C'etait FAUX : la
+/// telemetrie a toujours ete active par defaut (`is_enabled()` rend `true`
+/// quand `TUNE_TELEMETRY` n'est pas pose). Le champ ne disait pas la meme
+/// chose que les gardes d'envoi : il relisait une cle que personne d'autre ne
+/// consultait. Il dit maintenant l'etat EFFECTIF, donc `true` par defaut.
 #[tokio::test]
-async fn telemetry_snapshot_default_disabled() {
+async fn telemetry_snapshot_dit_l_etat_effectif() {
     let app = make_app();
     let (status, body) = get(&app, "/api/v1/system/telemetry").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["enabled"], false);
+    assert_eq!(
+        body["enabled"], true,
+        "la telemetrie est active par defaut — le snapshot doit le dire"
+    );
     assert!(body["payload"]["version"].is_string());
     assert!(body["payload"]["os"].is_string());
     assert!(body["payload"]["tracks"].is_number());
@@ -769,9 +778,18 @@ async fn telemetry_snapshot_default_disabled() {
 async fn telemetry_toggle() {
     let app = make_app();
 
+    // #3383 : la bascule se lit dans les DEUX sens. Ce temoin n'en verifiait
+    // qu'un, et c'etait celui qui ne prouve rien — re-cocher ce qui etait deja
+    // actif par defaut. Le sens qui compte est l'extinction.
     let (status, body) =
-        post_json(&app, "/api/v1/system/telemetry", json!({"enabled": true})).await;
+        post_json(&app, "/api/v1/system/telemetry", json!({"enabled": false})).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], false);
+
+    let (_, body) = get(&app, "/api/v1/system/telemetry").await;
+    assert_eq!(body["enabled"], false);
+
+    let (_, body) = post_json(&app, "/api/v1/system/telemetry", json!({"enabled": true})).await;
     assert_eq!(body["enabled"], true);
 
     let (_, body) = get(&app, "/api/v1/system/telemetry").await;
