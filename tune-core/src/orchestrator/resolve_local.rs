@@ -818,13 +818,22 @@ impl PlaybackOrchestrator {
                 .as_deref()
                 == Some("true");
             let src_est_dsd = source_format == Some(AudioFormat::Dsd);
-            let candidat = cible_wav_pour_traitement(
-                eq_forces_transcode,
-                is_network_output,
-                src_est_dsd,
-                opt_in,
-                true,
-            );
+            // #2742 — le crossfeed compte comme un traitement ICI, et ICI
+            // SEULEMENT. Il reste hors de `eq_forces_transcode` à dessein :
+            // ce drapeau-là renvoie au FICHIER quand l'opt-in est désarmé, et
+            // une zone réseau qui a coché le crossfeed (aujourd'hui sans le
+            // moindre effet) se retrouverait à payer 46 à 62 s de silence
+            // avant la première note pour un réglage qu'elle croyait inerte.
+            // Ne le compter que dans la cible progressive garantit qu'à froid
+            // rien ne change, et qu'armé, le crossfeed a enfin un chemin.
+            // `is_network_output &&` d'abord : sans lui, une zone LOCALE
+            // paierait une lecture de réglages par piste pour un drapeau que
+            // `cible_wav_pour_traitement` va de toute façon annuler.
+            let traitement = eq_forces_transcode
+                || (is_network_output && self.zone_has_active_crossfeed(req.zone_id));
+            let candidat =
+                cible_wav_pour_traitement(traitement, is_network_output, src_est_dsd, opt_in, true);
+
             let renderer_accepte_lpcm = if candidat {
                 let did = req
                     .output_device_id
@@ -836,7 +845,7 @@ impl PlaybackOrchestrator {
                 false
             };
             cible_wav_pour_traitement(
-                eq_forces_transcode,
+                traitement,
                 is_network_output,
                 src_est_dsd,
                 opt_in,
@@ -877,6 +886,11 @@ impl PlaybackOrchestrator {
             || needs_downsample
             || dlna_needs_wav
             || eq_forces_transcode
+            // Une zone qui n'a QUE du crossfeed n'allume pas
+            // `eq_forces_transcode` (voir plus haut) : sans cette ligne, sa
+            // cible progressive serait décidée puis jamais empruntée, et le
+            // crossfeed resterait muet malgré l'opt-in.
+            || dsp_progressif_wav
             // 16-bit cap on a FLAC-direct renderer: force a transcode so the
             // hi-res FLAC is re-encoded at 16-bit instead of served direct
             // (silent on the Ruark R3, #1137). ALAC already transcodes because
@@ -1118,18 +1132,26 @@ impl PlaybackOrchestrator {
     }
 
     /// Ce que `transcoder_en_session` déciderait du relais DSP, sans rien
-    /// décoder : `(traitement actif, relais armé)`.
+    /// décoder : `(traitement actif, relais armé, crossfeed exécutable)`.
     ///
-    /// Les deux valeurs comptent séparément. Une sortie locale avec égaliseur
-    /// a bien un traitement ACTIF — c'est ce qui rendait le cumul possible —
-    /// et ne doit pourtant pas armer le relais, puisqu'elle applique ce même
-    /// traitement elle-même. Un test qui ne regarderait que la seconde ne
-    /// distinguerait pas « la garde tient » de « la zone n'a pas d'EQ ».
+    /// Les deux premières valeurs comptent séparément. Une sortie locale avec
+    /// égaliseur a bien un traitement ACTIF — c'est ce qui rendait le cumul
+    /// possible — et ne doit pourtant pas armer le relais, puisqu'elle
+    /// applique ce même traitement elle-même. Un test qui ne regarderait que
+    /// la seconde ne distinguerait pas « la garde tient » de « la zone n'a
+    /// pas d'EQ ».
+    ///
+    /// Le troisième fait est venu d'une contre-épreuve : poser `channels: 0`
+    /// dans `load_streaming_dsp` rend le crossfeed INERTE sur toute zone
+    /// réseau — `process_pcm` sort avant d'écrire un octet — et les gardes du
+    /// correctif restaient VERTES, la garde de site comprise, parce
+    /// qu'aucune ne regardait le porteur réellement construit. Celle-ci le
+    /// regarde.
     #[cfg(test)]
     pub(super) async fn relais_dsp_pour_test(
         &self,
         req: &PlayRequest,
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<(bool, bool, bool), String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
         let track = TrackRepo::with_backend(self.db.clone())
             .get(track_id)
@@ -1153,6 +1175,7 @@ impl PlaybackOrchestrator {
         Ok((
             actif,
             relais_dsp_progressif(actif, decision.is_local_output),
+            dsp.crossfeed_executable(),
         ))
     }
 
