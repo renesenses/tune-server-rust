@@ -97,7 +97,15 @@ fn joindre_dr_par_piste(state: &AppState, items: Vec<tune_core::db::models::Trac
     let dr = TrackMetadataRepo::with_backend(state.backend.clone())
         .get_key_for_tracks("dr_track", &track_ids)
         .unwrap_or_default();
-    super::albums::attach_track_tags(items, &[("dynamic_range", &dr)])
+    let mut items = super::albums::attach_track_tags(items, &[("dynamic_range", &dr)]);
+    // #3518 — « Idéalement sur la même route que les autres listes de pistes,
+    // pour que le tableau ait les mêmes colonnes partout » : ce chemin est le
+    // seam unique des trois autres surfaces (`/library/tracks` filtré, non
+    // filtré, et la fiche d'une piste). Le brancher ici les sert toutes les
+    // trois, sans un second recopieur qui aurait fini par diverger — c'est
+    // exactement l'argument de #1388 sur `attach_track_tags`.
+    super::albums::attacher_ecoutes(state, &mut items);
+    items
 }
 
 #[derive(Deserialize)]

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,56 @@ pub mod sql {
              GROUP BY h.title, h.artist_name \
              ORDER BY plays DESC LIMIT {}",
             d.placeholder(1)
+        )
+    }
+
+    /// L'écoute de plusieurs pistes d'un coup : compte et dernière fois (#3518).
+    ///
+    /// # Pourquoi le rapprochement se fait par titre + interprète
+    ///
+    /// Parce que `listen_history.track_id` est **toujours NULL**. Le seul site
+    /// qui écrit l'historique — `orchestrator::commun::record_listen` — passe
+    /// `track_id: None`, avec le commentaire qui l'explique. Une jointure sur
+    /// `h.track_id = t.id` rendrait donc `play_count = 0` pour la bibliothèque
+    /// entière : la colonne exacte que #3518 refuse, celle qui affiche « jamais
+    /// joué » pour une piste jouée cent fois.
+    ///
+    /// Le rapprochement est le MÊME que celui de `top_tracks` et de
+    /// `track_plays` — égalité stricte sur `title` et `artist_name` —, et c'est
+    /// délibéré : la colonne d'un album doit donner le même nombre que l'écran
+    /// « Titres les plus écoutés », sans quoi deux vues de la même donnée se
+    /// contrediraient à l'écran.
+    ///
+    /// # La radio est exclue
+    ///
+    /// Comme partout ailleurs dans ce fichier : le titre d'une ligne de radio
+    /// est un instantané figé qui ne correspond pas à ce qui passait vraiment.
+    ///
+    /// # Le compte est GLOBAL, pas par profil
+    ///
+    /// L'arbitrage que l'issue laissait ouvert. `listen_history.profile_id`
+    /// n'est rempli que si la requête de lecture portait un `X-Profile-Id` ; il
+    /// est NULL sur la grande majorité des lignes, et `full_dashboard` filtre
+    /// par égalité stricte, donc une vue par profil les écarterait toutes. Un
+    /// compte par profil rendrait aujourd'hui zéro presque partout. Global, il
+    /// donne le même nombre que `/library/history/top-tracks`, que le client
+    /// affiche déjà. Une variante par profil pourra s'ajouter en paramètre
+    /// sans changer la forme de la réponse.
+    ///
+    /// `id_list` n'est composé que d'entiers, produits par l'appelant à partir
+    /// des identifiants qu'il a lus en base — jamais d'une chaîne du client.
+    pub fn plays_for_tracks(id_list: &str) -> String {
+        format!(
+            "SELECT t.id, COUNT(h.id), MAX(h.listened_at) \
+             FROM tracks t \
+             LEFT JOIN artists a ON a.id = t.artist_id \
+             LEFT JOIN listen_history h \
+                    ON h.source != 'radio' \
+                   AND h.title = t.title \
+                   AND (h.artist_name = a.name \
+                        OR (h.artist_name IS NULL AND a.name IS NULL)) \
+             WHERE t.id IN ({id_list}) \
+             GROUP BY t.id"
         )
     }
 
@@ -273,6 +324,39 @@ impl HistoryRepo {
 
     /// How many times a track (matched by `title` + `artist_name`) was played,
     /// excluding radio. Mirrors the dashboard "top tracks" grouping.
+    /// Compte d'écoutes et dernière écoute, pour un lot de pistes (#3518).
+    ///
+    /// Rend une entrée par piste **trouvée**, avec `(compte, derniere)`. Une
+    /// piste jamais jouée rend `(0, None)` : ici le zéro est une information,
+    /// pas une absence, et l'appelant doit pouvoir le distinguer d'un échec.
+    ///
+    /// Une seule requête pour toute la page, quel que soit le nombre de
+    /// pistes ; aucune du tout sur une liste vide.
+    pub fn plays_for_tracks(
+        &self,
+        track_ids: &[i64],
+    ) -> Result<HashMap<i64, (i64, Option<String>)>, String> {
+        if track_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let id_list = track_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let rows = self.db.query_many(&sql::plays_for_tracks(&id_list), &[])?;
+        let mut map = HashMap::new();
+        for cols in rows {
+            let Some(id) = cols.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let compte = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+            let derniere = cols.get(2).and_then(|v| v.as_string());
+            map.insert(id, (compte, derniere));
+        }
+        Ok(map)
+    }
+
     pub fn track_plays(&self, title: &str, artist_name: Option<&str>) -> Result<i64, String> {
         let count = |sql: &str, params: &[&dyn ToSqlValue]| -> Result<i64, String> {
             Ok(self
@@ -1643,5 +1727,179 @@ mod tests {
         let dash = repo.full_dashboard("7d", None, None, 10).unwrap();
         assert_eq!(dash.totals.plays, 1);
         assert_eq!(dash.totals.unique_artists, 1);
+    }
+
+    /// Deux pistes du même album, du même interprète : `So What` (id 1) et
+    /// `Blue in Green` (id 2).
+    fn pose_un_album(repo: &HistoryRepo) {
+        repo.db
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Miles Davis')",
+                &[],
+            )
+            .expect("artiste");
+        repo.db
+            .execute(
+                "INSERT INTO albums (id, title, artist_id, track_count) \
+                 VALUES (1, 'Kind of Blue', 1, 2)",
+                &[],
+            )
+            .expect("album");
+        for (id, titre) in [(1, "So What"), (2, "Blue in Green")] {
+            repo.db
+                .execute(
+                    &format!(
+                        "INSERT INTO tracks (id, title, artist_id, album_id, file_path) \
+                         VALUES ({id}, '{titre}', 1, 1, '/musique/{id}.flac')"
+                    ),
+                    &[],
+                )
+                .expect("piste");
+        }
+    }
+
+    /// Une écoute écrite par le VRAI chemin — `record`, celui de
+    /// l'orchestrateur —, donc avec `track_id` à NULL comme en production.
+    fn ecoute(repo: &HistoryRepo, titre: &str, artiste: Option<&str>, source: &str, quand: &str) {
+        let id = repo
+            .record(&ListenRecord {
+                id: None,
+                track_id: None,
+                title: titre.into(),
+                artist_name: artiste.map(Into::into),
+                album_title: Some("Kind of Blue".into()),
+                source: source.into(),
+                source_id: None,
+                album_id: Some(1),
+                duration_ms: 562_000,
+                listened_at: None,
+                zone_id: None,
+                cover_url: None,
+                profile_id: None,
+                context_type: None,
+                context_id: None,
+                context_position: None,
+            })
+            .expect("ecoute enregistree");
+        // `record` laisse la base dater la ligne ; on la repositionne pour que
+        // « la derniere ecoute » soit verifiable et non dependante de l'heure
+        // de la machine d'essai.
+        repo.db
+            .execute(
+                &format!("UPDATE listen_history SET listened_at = '{quand}' WHERE id = {id}"),
+                &[],
+            )
+            .expect("date d'ecoute");
+    }
+
+    /// #3518 — le socle des colonnes « # Plays » et « Last Played » de la
+    /// maquette V1 : deux pistes du même album, l'une jouée, l'autre non.
+    ///
+    /// Le zéro compte : il dit « jamais jouée », et l'écran doit pouvoir
+    /// l'afficher au lieu de laisser la case vide.
+    #[test]
+    fn l_ecoute_par_piste_se_compte_et_se_date() {
+        let repo = fresh_repo();
+        pose_un_album(&repo);
+        for jour in ["2026-09-01T10:00:00Z", "2026-09-05T21:30:00Z"] {
+            ecoute(&repo, "So What", Some("Miles Davis"), "local", jour);
+        }
+        let stats = repo.plays_for_tracks(&[1, 2]).expect("lecture");
+        assert_eq!(
+            stats.get(&1),
+            Some(&(2i64, Some("2026-09-05T21:30:00Z".to_string()))),
+            "deux ecoutes, et la DERNIERE des deux"
+        );
+        assert_eq!(
+            stats.get(&2),
+            Some(&(0i64, None)),
+            "une piste jamais jouee rend zero, pas une absence"
+        );
+    }
+
+    /// La cause du ticket, mise sous garde. `listen_history.track_id` est
+    /// TOUJOURS NULL — `record_listen` passe `track_id: None` — donc une
+    /// jointure sur cette colonne rendrait zéro partout. Ce test écrit
+    /// l'historique par le vrai chemin (`record`) et exige que le compte
+    /// remonte quand même.
+    #[test]
+    fn le_compte_remonte_malgre_un_track_id_toujours_nul() {
+        let repo = fresh_repo();
+        pose_un_album(&repo);
+        ecoute(
+            &repo,
+            "So What",
+            Some("Miles Davis"),
+            "local",
+            "2026-09-05T21:30:00Z",
+        );
+        let nuls = repo
+            .db
+            .query_one(
+                "SELECT COUNT(*) FROM listen_history WHERE track_id IS NULL",
+                &[],
+            )
+            .expect("compte")
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        assert_eq!(nuls, 1, "l'orchestrateur n'ecrit jamais de track_id");
+        assert_eq!(
+            repo.plays_for_tracks(&[1])
+                .expect("lecture")
+                .get(&1)
+                .map(|s| s.0),
+            Some(1)
+        );
+    }
+
+    /// La radio ne compte pas : le titre d'une ligne de radio est un
+    /// instantané figé qui ne correspond pas à ce qui passait vraiment. Même
+    /// exclusion que `top_tracks`, `track_plays` et la liste d'historique.
+    #[test]
+    fn la_radio_ne_compte_pas_dans_l_ecoute_d_une_piste() {
+        let repo = fresh_repo();
+        pose_un_album(&repo);
+        ecoute(
+            &repo,
+            "So What",
+            Some("Miles Davis"),
+            "radio",
+            "2026-09-05T21:30:00Z",
+        );
+        assert_eq!(
+            repo.plays_for_tracks(&[1]).expect("lecture").get(&1),
+            Some(&(0i64, None))
+        );
+    }
+
+    /// Un homonyme d'un AUTRE interprète ne gonfle pas le compte : le
+    /// rapprochement porte sur le couple titre + interprète, celui de
+    /// `top_tracks`.
+    #[test]
+    fn un_homonyme_d_un_autre_interprete_ne_compte_pas() {
+        let repo = fresh_repo();
+        pose_un_album(&repo);
+        ecoute(
+            &repo,
+            "So What",
+            Some("Bill Evans"),
+            "local",
+            "2026-09-05T21:30:00Z",
+        );
+        assert_eq!(
+            repo.plays_for_tracks(&[1]).expect("lecture").get(&1),
+            Some(&(0i64, None)),
+            "meme titre, autre interprete : ce n'est pas la meme piste"
+        );
+    }
+
+    /// Une liste vide ne part pas en base, et un identifiant inconnu ne rend
+    /// rien plutôt qu'une ligne fantôme.
+    #[test]
+    fn une_liste_vide_ou_inconnue_ne_rend_rien() {
+        let repo = fresh_repo();
+        pose_un_album(&repo);
+        assert!(repo.plays_for_tracks(&[]).expect("lecture").is_empty());
+        assert!(repo.plays_for_tracks(&[9999]).expect("lecture").is_empty());
     }
 }

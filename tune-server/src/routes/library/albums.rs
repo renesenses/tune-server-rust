@@ -14,6 +14,7 @@ use tune_core::db::album_repo::{AlbumRepo, DrRange};
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::models::Album;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
@@ -386,10 +387,17 @@ pub(super) async fn album_tracks(
         .get_key_for_tracks("dr_track", &track_ids)
         .unwrap_or_default();
 
-    Json(json!(attach_track_tags(
+    let mut items = attach_track_tags(
         items,
-        &[("grouping", &grouping), ("dynamic_range", &dynamic_range)]
-    )))
+        &[("grouping", &grouping), ("dynamic_range", &dynamic_range)],
+    );
+    // #3518 — « # Plays » et « Last Played », deux colonnes de la maquette V1
+    // (Levente, 07/09/2026) que la route ne portait pas. C'est LE SITE D'APPEL :
+    // `plays_for_tracks` peut être parfaite dans `history_repo`, sans cette
+    // ligne la route rend les mêmes 31 champs qu'avant et les colonnes restent
+    // `indisponible` côté client.
+    attacher_ecoutes(&state, &mut items);
+    Json(json!(items))
 }
 
 /// Recopie des tags étendus (`track_metadata`) sur les pistes sérialisées
@@ -404,6 +412,56 @@ pub(super) async fn album_tracks(
 /// second recopieur écrit à côté aurait fini par diverger — l'écran aurait vu
 /// `dynamic_range` sur les pistes d'un album et rien, ou autre chose, dans la
 /// table des titres.
+/// Recopie l'écoute par piste sur des pistes sérialisées : `play_count` et
+/// `last_played_at` (#3518).
+///
+/// # Un contrat différent de celui de `attach_track_tags`
+///
+/// Les tags étendus sont ABSENTS quand la piste n'en porte pas. Ici les deux
+/// clés sont TOUJOURS présentes quand la lecture a réussi : `play_count` vaut
+/// `0` et `last_played_at` vaut `null` pour une piste jamais jouée. L'issue le
+/// demande en toutes lettres — « ici un zéro est une information, pas une
+/// absence » —, et un client ne peut pas afficher « jamais joué » sur une clé
+/// qui manque : il ne saurait pas si la route ignore la colonne ou si la piste
+/// n'a jamais tourné.
+///
+/// # Ce qui se passe quand la base échoue
+///
+/// Aucune des deux clés n'est posée. Pas `0` : un zéro dû à une panne se lit
+/// « jamais jouée » et ment. « Une colonne qui se trompe est pire qu'une
+/// colonne absente » est l'argument même du ticket ; il vaut aussi contre nous.
+/// L'échec laisse une trace dans le journal, comme #2861 l'exige pour les
+/// favoris.
+///
+/// Une seule requête pour toute la page, et aucune du tout sur une page vide.
+pub(super) fn attacher_ecoutes(state: &AppState, items: &mut [Value]) {
+    let ids: Vec<i64> = items
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_i64))
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let stats = match HistoryRepo::with_backend(state.backend.clone()).plays_for_tracks(&ids) {
+        Ok(stats) => stats,
+        Err(e) => {
+            tracing::error!(error = %e, "ecoutes_par_piste_illisibles");
+            return;
+        }
+    };
+    for item in items.iter_mut() {
+        let Some(id) = item.get("id").and_then(Value::as_i64) else {
+            continue;
+        };
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let (compte, derniere) = stats.get(&id).cloned().unwrap_or((0, None));
+        obj.insert("play_count".into(), json!(compte));
+        obj.insert("last_played_at".into(), json!(derniere));
+    }
+}
+
 pub(super) fn attach_track_tags(
     items: Vec<tune_core::db::models::Track>,
     tags: &[(&str, &std::collections::HashMap<i64, String>)],
