@@ -157,7 +157,12 @@ pub(super) async fn get_device_presets(
 /// marque ET modèle sont connus et qu'au moins un réglage diffère des
 /// défauts.
 pub(super) async fn push_device_preset(state: &AppState, zone_id: i64) {
-    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
+    // #3383 : `is_enabled_for` et non `is_enabled` — un refus pose dans
+    // l'interface arrete cette remontee de catalogue comme le ferait
+    // `TUNE_TELEMETRY=false`.
+    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    )) {
         return;
     }
     let Some((brand, model)) = zone_identity_for_catalog(state, zone_id).await else {
@@ -197,7 +202,12 @@ pub(super) async fn push_device_preset(state: &AppState, zone_id: i64) {
 }
 
 pub(super) async fn push_device_correction(state: &AppState, zone_id: i64) {
-    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
+    // #3383 : `is_enabled_for` et non `is_enabled` — un refus pose dans
+    // l'interface arrete cette remontee de catalogue comme le ferait
+    // `TUNE_TELEMETRY=false`.
+    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    )) {
         return;
     }
 
@@ -369,7 +379,12 @@ pub(super) async fn push_device_caps(
     zone_id: i64,
     caps: &tune_core::outputs::dlna::RendererCapabilities,
 ) {
-    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
+    // #3383 : `is_enabled_for` et non `is_enabled` — un refus pose dans
+    // l'interface arrete cette remontee de catalogue comme le ferait
+    // `TUNE_TELEMETRY=false`.
+    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    )) {
         return;
     }
     let Some((brand, model)) = zone_identity_for_catalog(state, zone_id).await else {

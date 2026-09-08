@@ -968,7 +968,9 @@ fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {
 }
 
 fn spawn_telemetry_reporter(state: &AppState) {
-    tune_core::cloud::telemetry::spawn_startup_ping(state.services.clone());
+    // #3383 : le ping de demarrage recoit la base, parce qu'il doit lire le
+    // consentement avant d'envoyer version, OS, arch et liste des services.
+    tune_core::cloud::telemetry::spawn_startup_ping(state.backend.clone(), state.services.clone());
     tune_core::cloud::telemetry::TelemetryReporter::spawn(
         state.backend.clone(),
         state.services.clone(),
@@ -1015,16 +1017,16 @@ fn prochain_intervalle_battement(echecs_consecutifs: u32) -> std::time::Duration
 
 /// Ce qu'un tour de battement a le droit de faire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HeartbeatPlan {
+pub struct HeartbeatPlan {
     /// Envoyer la charge utile a `POST /api/v1/heartbeat`.
-    send_heartbeat: bool,
+    pub send_heartbeat: bool,
     /// Rafraichir les droits premium du compte SSO (`GET /api/v1/user`).
-    refresh_account: bool,
+    pub refresh_account: bool,
     /// La clé de licence se revalide par `POST /api/v1/license/validate`,
     /// une charge à trois champs sans rien de descriptif — donc même quand
     /// la télémétrie est refusée. Sans cela, un Premium à CLÉ en opt-out
     /// retombait en Free au bout de la grâce de 14 jours (LIC-1).
-    revalidate_key: bool,
+    pub revalidate_key: bool,
 }
 
 /// Decide ce que fait le tour de battement en fonction de l'opt-out telemetrie.
@@ -1046,6 +1048,19 @@ fn heartbeat_plan(telemetry_enabled: bool) -> HeartbeatPlan {
         refresh_account: true,
         revalidate_key: true,
     }
+}
+
+/// Le plan d'UN tour, decide a partir des reglages de CETTE instance.
+///
+/// #3383 — c'est le seul site d'appel de `heartbeat_plan` en production, et
+/// c'est ici que se lit le consentement. `is_enabled_for` et non `is_enabled` :
+/// le refus pose dans l'interface (`POST /cloud/telemetry/disable`) compte
+/// autant que celui pose dans l'environnement (`TUNE_TELEMETRY=false`).
+///
+/// Fonction et non expression en ligne, pour qu'un temoin puisse APPELER la
+/// decision reelle plutot que d'en recopier les termes.
+pub fn plan_du_tour(settings: &tune_core::db::settings_repo::SettingsRepo) -> HeartbeatPlan {
+    heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(settings))
 }
 
 /// Lightweight heartbeat — honours `TUNE_TELEMETRY` (#2416).
@@ -1120,7 +1135,7 @@ fn spawn_heartbeat(state: &AppState) {
 
         let mut echecs_consecutifs: u32 = 0;
         loop {
-            let plan = heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled());
+            let plan = plan_du_tour(&settings);
 
             // Registre des executions automatisees (#2080) : un cycle = une
             // ligne. Le battement est la seule passe dont l'echec est INVISIBLE
@@ -2705,9 +2720,12 @@ mod heartbeat_cadence_et_optout_tests {
         );
     }
 
-    /// Le battement doit lire l'opt-out par le MEME mecanisme que la telemetrie
-    /// (`TelemetryReporter::is_enabled`), pas par une seconde lecture maison de
-    /// la variable d'environnement.
+    /// Le battement doit lire l'opt-out par le MEME mecanisme que le reste des
+    /// envois (`TelemetryReporter::is_enabled_for`), pas par une seconde
+    /// lecture maison de la variable d'environnement.
+    ///
+    /// #3383 : `is_enabled_for` et non `is_enabled` — le second ne connait que
+    /// l'environnement, et laissait la bascule de l'interface sans effet.
     #[test]
     fn l_optout_reutilise_le_mecanisme_de_la_telemetrie() {
         // On ne regarde QUE le code de production : les modules de test citent
@@ -2719,10 +2737,65 @@ mod heartbeat_cadence_et_optout_tests {
             .next()
             .expect("source vide");
         assert!(
-            production.contains(&format!("TelemetryReporter::{}()", "is_enabled")),
-            "l'opt-out du battement doit reutiliser TelemetryReporter::is_enabled, \
+            production.contains(&format!("TelemetryReporter::{}(", "is_enabled_for")),
+            "l'opt-out du battement doit reutiliser TelemetryReporter::is_enabled_for, \
              pas relire TUNE_TELEMETRY pour son compte"
         );
+    }
+
+    /// #3383 — le battement lit le reglage ECRIT par la bascule de
+    /// l'interface, et pas seulement la variable d'environnement.
+    ///
+    /// Ce temoin APPELLE `plan_du_tour`, c'est-a-dire l'unique expression que
+    /// la boucle de production evalue a chaque tour : debrancher la conduite
+    /// le fait rougir, ce qu'une recherche de chaine dans le fichier ne ferait
+    /// pas.
+    #[test]
+    fn le_refus_pose_dans_l_interface_coupe_le_battement() {
+        let db = base_de_test();
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(db);
+
+        // Rien de pose : comportement d'avant, le battement part.
+        assert!(
+            super::plan_du_tour(&reglages).send_heartbeat,
+            "une installation qui n'a rien decoche doit continuer d'emettre"
+        );
+
+        // `POST /cloud/telemetry/disable` ecrit ceci, et rien d'autre.
+        reglages
+            .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "false")
+            .expect("ecriture du reglage");
+        let plan = super::plan_du_tour(&reglages);
+        assert!(
+            !plan.send_heartbeat,
+            "le refus pose dans l'interface doit couper la charge utile descriptive"
+        );
+        // Et la licence, elle, continue de vivre — LIC-1 : un opt-out ne se
+        // paie jamais en fonctionnalites perdues, y compris a J+15.
+        assert!(
+            plan.revalidate_key,
+            "refuser la telemetrie ne doit pas faire perdre une licence a cle"
+        );
+        assert!(
+            plan.refresh_account,
+            "refuser la telemetrie ne doit pas degrader un compte premium"
+        );
+
+        // Et il se rallume.
+        reglages
+            .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "true")
+            .expect("ecriture du reglage");
+        assert!(
+            super::plan_du_tour(&reglages).send_heartbeat,
+            "re-cocher doit reellement rallumer"
+        );
+    }
+
+    fn base_de_test() -> std::sync::Arc<dyn tune_core::db::backend::DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().expect("base en memoire");
+        db.init_schema().expect("schema");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        std::sync::Arc::new(db)
     }
 }
 

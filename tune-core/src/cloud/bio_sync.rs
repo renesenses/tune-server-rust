@@ -364,9 +364,11 @@ async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
 
 /// Download community bios for artists that have no local bio.
 /// Only downloads for artists/albums that already have a MusicBrainz ID.
-/// Fails silently. Respects `TUNE_TELEMETRY` flag.
+/// Fails silently. Respecte le refus de telemetrie — environnement ET
+/// interface depuis #3383.
 pub async fn download_bios(db: &Arc<dyn DbBackend>) {
-    if !crate::cloud::telemetry::TelemetryReporter::is_enabled() {
+    let reglages = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
+    if !crate::cloud::telemetry::TelemetryReporter::is_enabled_for(&reglages) {
         return;
     }
 
