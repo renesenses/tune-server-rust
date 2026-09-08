@@ -2326,13 +2326,15 @@ mod contrat_dlna_de_la_route_audio_3579 {
             ("mp3", "mp3", "audio/mpeg"),
             // `.alac` est catalogué et rend bien un conteneur MP4…
             ("alac", "alac", "audio/mp4"),
-            // …tandis qu'un ALAC réel, qui vit dans un `.m4a`, sort en
-            // `audio/aac`. C'est une confusion conteneur/codec RÉELLE, notée
-            // ici parce qu'elle est mesurée, et NON corrigée dans ce lot :
-            // `AudioFormat::mime_type` est lue par le DIDL, les décisions de
-            // transcodage et les capacités de sortie, et la changer déborde
-            // très largement ce ticket. Elle n'explique pas le FLAC de Tades.
-            ("m4a", "m4a", "audio/aac"),
+            // …et un `.m4a` aussi, désormais : c'est le MÊME conteneur MP4.
+            // Il sortait en `audio/aac`, c'est-à-dire un flux ADTS **nu**,
+            // alors qu'un `.m4a` n'est jamais de l'ADTS — et qu'il peut porter
+            // de l'ALAC aussi bien que de l'AAC (#3605, corrigé ici).
+            ("m4a", "m4a", "audio/mp4"),
+            // Contre-épreuve, et elle est indispensable : le correctif ne doit
+            // PAS avoir renommé l'AAC en bloc. Un `.aac` est un flux ADTS nu,
+            // et lui garde `audio/aac`.
+            ("aac", "aac", "audio/aac"),
             ("dsf", "dsf", "application/x-dsd"),
             // Le repli, et le seul chemin qui y mène.
             ("mkv", "mkv", "application/octet-stream"),
