@@ -2184,6 +2184,12 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
     tokio::spawn(async move {
         if let Err(e) = s.orchestrator.play_from_queue(zone_id, next_pos).await {
             tracing::warn!(zone_id, error = %e, "next_play_failed");
+            // #3270 (point 2) — la réponse HTTP est déjà partie en disant
+            // « playing » ; c'est ici, et seulement ici, que l'échec devient
+            // connaissable. Sans cette ligne il mourait dans le `warn!`
+            // ci-dessus : la zone ne jouait pas, et rien ne le disait.
+            s.orchestrator
+                .dire_piste_non_demarree(zone_id, "suivante", &e);
         }
     });
 
@@ -2275,6 +2281,9 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
     tokio::spawn(async move {
         if let Err(e) = s.orchestrator.play_from_queue(zone_id, prev_pos).await {
             tracing::warn!(zone_id, error = %e, "prev_play_failed");
+            // #3270 (point 2) — jumeau du site de `next`, ligne pour ligne.
+            s.orchestrator
+                .dire_piste_non_demarree(zone_id, "précédente", &e);
         }
     });
 
@@ -4580,6 +4589,28 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
             .into_response();
     };
 
+    // #3270 (point 4) — refuser AVANT d'écrire dans `/tmp/tune-upload`.
+    //
+    // Le refus de fond est dans `resolve_uploaded_file` : c'est lui qui garde
+    // le chemin de LECTURE, y compris un `temp_file_path` fourni directement
+    // sans passer par cette route. Celui-ci est le refus POLI, au plus tôt : il
+    // évite d'écrire un fichier qu'on sait ne pas savoir lire, et il répond à
+    // l'utilisateur pendant qu'il regarde son écran, avec le même code stable
+    // (`format_not_playable`, 422) que le chemin de lecture.
+    //
+    // Décidé sur le nom que le CLIENT a envoyé, avant le repli `.wav` : une
+    // extension absente n'est pas un refus (voir
+    // `refus_de_televersement_par_extension`).
+    if let Some(motif) =
+        tune_core::audio::support::refus_de_televersement_par_extension(&original_name)
+    {
+        warn!(fichier = %original_name, %motif, "upload_format_not_playable");
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "format_not_playable", "message": motif})),
+        )
+            .into_response();
+    }
     let ext = std::path::Path::new(&original_name)
         .extension()
         .and_then(|e| e.to_str())
@@ -5613,5 +5644,148 @@ mod tests_reprise_position_2876 {
             ..Default::default()
         };
         assert_eq!(reprise_applicable(&zone, Some(42), None), None);
+    }
+}
+
+/// #3270 (point 2) — garde de SITE : tout démarrage de piste DÉTACHÉ doit
+/// annoncer son échec.
+///
+/// `next` et `previous` répondent `{"status":"playing"}` sans attendre
+/// `play_from_queue`, et c'est délibéré : la résolution d'une piste peut
+/// prendre une minute (`resolve_ms=62017`, #3357). Le prix de ce choix est que
+/// l'échec ne peut plus se dire par la réponse HTTP — il doit partir sur
+/// `zone.playback_error`, sans quoi la zone ne joue pas et rien ne le dit.
+///
+/// Garde TEXTUELLE parce que ces deux handlers demandent un `AppState` complet,
+/// une base et un orchestrateur vivant. Elle nomme les SITES D'APPEL : chaque
+/// bloc `tokio::spawn` qui démarre une piste doit consulter
+/// `dire_piste_non_demarree`. Sa contre-épreuve est
+/// `la_garde_refuse_un_demarrage_detache_muet`.
+///
+/// Les aiguilles sont construites à l'exécution : écrites en clair, ce module
+/// se compterait lui-même dès qu'on relit le fichier par `include_str!`.
+#[cfg(test)]
+mod demarrage_detache_annonce_3270 {
+    /// Le nom de l'appel qui démarre une piste, jamais écrit en clair ici.
+    fn aiguille_demarrage() -> String {
+        format!("play_from{}queue(", "_")
+    }
+
+    /// Le nom de l'annonce, idem.
+    fn aiguille_annonce() -> String {
+        format!("dire_piste{}demarree(", "_non_")
+    }
+
+    /// Les blocs `tokio::spawn` de `source` qui démarrent une piste sans
+    /// annoncer l'échec, rendus par numéro de ligne (1-indexé).
+    fn demarrages_detaches_muets(source: &str) -> Vec<usize> {
+        let demarrage = aiguille_demarrage();
+        let annonce = aiguille_annonce();
+        let spawn = format!("tokio::{}(async move {{", "spawn");
+
+        let mut muets = Vec::new();
+        let mut curseur = 0usize;
+        while let Some(pos) = source[curseur..].find(&spawn) {
+            let debut = curseur + pos;
+            // Le bloc détaché le plus long de ce fichier fait moins de 400
+            // octets. La borne est reculée sur une frontière de caractère : ce
+            // fichier est plein d'accents, et trancher au milieu d'un « é »
+            // panique.
+            let mut fin = (debut + 700).min(source.len());
+            while fin > debut && !source.is_char_boundary(fin) {
+                fin -= 1;
+            }
+            let bloc = &source[debut..fin];
+            if bloc.contains(&demarrage) && !bloc.contains(&annonce) {
+                muets.push(source[..debut].lines().count());
+            }
+            curseur = debut + spawn.len();
+        }
+        muets
+    }
+
+    /// Combien de démarrages détachés ce fichier porte, muets ou non.
+    fn nombre_de_demarrages_detaches(source: &str) -> usize {
+        let demarrage = aiguille_demarrage();
+        let spawn = format!("tokio::{}(async move {{", "spawn");
+        let mut total = 0usize;
+        let mut curseur = 0usize;
+        while let Some(pos) = source[curseur..].find(&spawn) {
+            let debut = curseur + pos;
+            let mut fin = (debut + 700).min(source.len());
+            while fin > debut && !source.is_char_boundary(fin) {
+                fin -= 1;
+            }
+            if source[debut..fin].contains(&demarrage) {
+                total += 1;
+            }
+            curseur = debut + spawn.len();
+        }
+        total
+    }
+
+    #[test]
+    fn next_et_previous_annoncent_l_echec_qu_ils_ne_peuvent_pas_attendre() {
+        let source = include_str!("playback.rs");
+        let muets = demarrages_detaches_muets(source);
+        assert!(
+            muets.is_empty(),
+            "tune-server/src/routes/playback.rs démarre une piste dans un \
+             `tokio::spawn` sans annoncer son échec, ligne(s) {muets:?}. La \
+             réponse HTTP est déjà partie en disant « playing » : sans \
+             `orchestrator.dire_piste_non_demarree(...)`, l'échec meurt dans un \
+             `warn!` et la zone ne joue pas sans que rien ne le dise (#3270)"
+        );
+        assert_eq!(
+            nombre_de_demarrages_detaches(source),
+            2,
+            "les deux seuls démarrages de piste détachés de ce fichier sont \
+             ceux de `next` et de `previous`. Un de plus ou de moins : \
+             reprendre le recensement avant de toucher à ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur. Sans elle, `demarrages_detaches_muets`
+    /// pourrait ne rien détecter du tout et la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_un_demarrage_detache_muet() {
+        let spawn = format!("tokio::{}(async move {{", "spawn");
+        let demarrage = aiguille_demarrage();
+        let annonce = aiguille_annonce();
+
+        let prefixe = "let s = state.clone();\n";
+        let sain = format!(
+            "{prefixe}{spawn}\n    if let Err(e) = s.orchestrator.{demarrage}z, p).await {{\n \
+             s.orchestrator.{annonce}z, \"suivante\", &e);\n    }}\n}});\n"
+        );
+        assert!(
+            demarrages_detaches_muets(&sain).is_empty(),
+            "le détecteur doit accepter un démarrage détaché qui annonce"
+        );
+        assert_eq!(nombre_de_demarrages_detaches(&sain), 1);
+
+        let malade = format!(
+            "{prefixe}{spawn}\n    if let Err(e) = s.orchestrator.{demarrage}z, p).await {{\n \
+             tracing::warn!(error = %e);\n    }}\n}});\n"
+        );
+        assert_eq!(
+            demarrages_detaches_muets(&malade),
+            vec![1],
+            "le détecteur doit nommer la ligne d'un démarrage détaché muet — \
+             c'est le défaut de #3270"
+        );
+
+        // Un `tokio::spawn` qui ne démarre AUCUNE piste n'est pas un site :
+        // sans ceci, la garde exigerait une annonce de tâches sans rapport.
+        let hors_sujet = format!("{spawn}\n    faire_autre_chose().await;\n}});\n");
+        assert!(demarrages_detaches_muets(&hors_sujet).is_empty());
+        assert_eq!(nombre_de_demarrages_detaches(&hors_sujet), 0);
+
+        // Et une annonce posée très loin, hors du bloc, ne doit pas sauver.
+        let loin = format!(
+            "{prefixe}{spawn}\n    if let Err(e) = s.orchestrator.{demarrage}z, p).await {{}}\n}});\n{}\n{annonce}z);\n",
+            "// remplissage\n".repeat(60)
+        );
+        assert_eq!(demarrages_detaches_muets(&loin), vec![1]);
     }
 }

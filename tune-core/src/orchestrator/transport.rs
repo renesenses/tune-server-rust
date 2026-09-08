@@ -1788,6 +1788,58 @@ impl PlaybackOrchestrator {
         OutputCommandError::failed(OutputCommand::Resume, message)
     }
 
+    /// La phrase dite à l'auditeur quand la piste demandée n'a pas démarré.
+    ///
+    /// Associée mais sans `self`, comme `message_session_perdue` est libre : le
+    /// texte se vérifie sans monter d'orchestrateur ni de bus.
+    pub fn message_piste_non_demarree(geste: &str, cause: &str) -> String {
+        format!("Impossible de lire la piste {geste} : {cause}")
+    }
+
+    /// Dire qu'une piste demandée N'A PAS démarré, quand plus personne n'attend
+    /// la réponse HTTP.
+    ///
+    /// #3270 (point 2) — `next` et `previous`
+    /// (`tune-server/src/routes/playback.rs`) détachent `play_from_queue` dans
+    /// un `tokio::spawn` et répondent `{"status":"playing"}` AVANT que l'échec
+    /// éventuel soit connu. Un client qui lit cette réponse croit que la piste
+    /// suivante joue.
+    ///
+    /// **Pourquoi ne pas simplement attendre l'appel.** Parce que la résolution
+    /// d'une piste n'est pas brève : sur une zone réseau dont un traitement est
+    /// actif, le pré-transcodage prend le fichier entier — `resolve_ms=62017`
+    /// mesuré chez Cyrille (#3357). Attendre transformerait chaque appui sur
+    /// « suivant » en une requête HTTP d'une minute, et un client impatient
+    /// relancerait, ce qui jette le calcul en cours
+    /// (`orchestrator_play_superseded_skipping_output`). Le geste doit rester
+    /// immédiat ; ce qui manquait, c'est le SECOND canal.
+    ///
+    /// `zone.playback_error` est ce canal : celui que six autres échecs de
+    /// lecture utilisent déjà et que `routes/ws.rs` pousse verbatim à TOUTES
+    /// les télécommandes, pas seulement à celle qui a appuyé.
+    ///
+    /// `fatal: true` pour la raison écrite en #1960 et #2630 : la zone ne joue
+    /// pas, et sans ce drapeau la fenêtre de grâce d'après-lecture du client
+    /// web avale le message — l'auditeur n'aurait, une fois de plus, que le
+    /// silence.
+    ///
+    /// Sans bus (démarrage partiel, essais) on ne panique pas : on se tait,
+    /// comme `dire_le_repli_de_peripherique`.
+    pub fn dire_piste_non_demarree(&self, zone_id: i64, geste: &str, cause: &str) {
+        let message = Self::message_piste_non_demarree(geste, cause);
+        warn!(zone_id, geste, cause, %message, "piste_non_demarree");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": message,
+                    "fatal": true,
+                }),
+            );
+        }
+    }
+
     pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
         // Position is preserved across pause (playback state isn't reset), so we
         // know where to resume from.
