@@ -12,11 +12,25 @@ pub enum OutputType {
     Openhome,
     Squeezebox,
     Oaat,
+    /// Sendspin (Open Home Foundation), chantier #3326.
+    ///
+    /// Phase 1 : DÉCOUVERTE SEULE. Aucune sortie n'est enregistrée pour ce
+    /// type, donc aucune zone n'est créée et rien ne peut y être joué.
+    Sendspin,
 }
 
 impl OutputType {
+    /// Qui l'emporte quand un même appareil s'annonce sous plusieurs
+    /// protocoles (cf. [`dedup_devices`]).
+    ///
+    /// Sendspin vaut **0**, sous la sortie locale, et ce n'est pas une opinion
+    /// sur le protocole : tant que la lecture n'est pas implémentée (#3326,
+    /// phase 1), une annonce Sendspin qui l'emporterait sur l'annonce AirPlay
+    /// ou DLNA de la MÊME enceinte remplacerait une sortie qui joue par une
+    /// entrée qui ne joue pas. La valeur remontera avec la lecture, pas avant.
     pub fn priority(self) -> u8 {
         match self {
+            Self::Sendspin => 0,
             Self::Oaat => 8,
             Self::Openhome => 7,
             Self::Bluos => 6,
@@ -40,6 +54,7 @@ impl std::fmt::Display for OutputType {
             Self::Openhome => write!(f, "openhome"),
             Self::Squeezebox => write!(f, "squeezebox"),
             Self::Oaat => write!(f, "oaat"),
+            Self::Sendspin => write!(f, "sendspin"),
         }
     }
 }
@@ -379,5 +394,53 @@ mod tests {
         dev.manufacturer = Some("Mozaik Labs".into());
         let result = dedup_devices(vec![dev]);
         assert!(result.is_empty());
+    }
+
+    /// Une enceinte qui parle Sendspin parle presque toujours AUSSI autre
+    /// chose (AirPlay, DLNA, Chromecast) : les enceintes ESPHome et Music
+    /// Assistant s'annoncent sur plusieurs protocoles à la fois. Le
+    /// dédoublonnage retient l'annonce de plus forte priorité — donc, tant que
+    /// Sendspin ne joue pas (#3326, phase 1), il ne doit JAMAIS être celle-là :
+    /// l'appareil deviendrait une entrée muette là où il jouait.
+    #[test]
+    fn sendspin_ne_prend_jamais_la_place_d_un_protocole_qui_joue() {
+        for concurrent in [
+            OutputType::Oaat,
+            OutputType::Openhome,
+            OutputType::Bluos,
+            OutputType::Squeezebox,
+            OutputType::Dlna,
+            OutputType::Chromecast,
+            OutputType::Airplay,
+            OutputType::Local,
+        ] {
+            assert!(
+                OutputType::Sendspin.priority() < concurrent.priority(),
+                "Sendspin ne joue pas encore : il doit passer APRÈS {concurrent}"
+            );
+
+            // Et la conséquence, mesurée sur le dédoublonnage lui-même : même
+            // annoncé en premier, Sendspin reste l'alternative.
+            let sendspin = DiscoveredDevice::new(
+                "sendspin-192.168.1.42-8928".into(),
+                "Cuisine".into(),
+                OutputType::Sendspin,
+                "192.168.1.42".into(),
+                8928,
+            );
+            let autre = DiscoveredDevice::new(
+                format!("{concurrent}-192.168.1.42-80"),
+                "Cuisine".into(),
+                concurrent,
+                "192.168.1.42".into(),
+                80,
+            );
+            let result = dedup_devices(vec![sendspin, autre]);
+            assert_eq!(result.len(), 1);
+            assert_eq!(
+                result[0].device_type, concurrent,
+                "l'entrée retenue doit être celle qui joue"
+            );
+        }
     }
 }
