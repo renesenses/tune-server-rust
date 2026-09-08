@@ -1020,10 +1020,20 @@ fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {
 fn spawn_telemetry_reporter(state: &AppState) {
     // #3383 : le ping de demarrage recoit la base, parce qu'il doit lire le
     // consentement avant d'envoyer version, OS, arch et liste des services.
-    tune_core::cloud::telemetry::spawn_startup_ping(state.backend.clone(), state.services.clone());
+    // #3380 : les deux envois recoivent le repertoire web REELLEMENT servi
+    // (`resolve_web_dir`, le meme que le routeur), pour y relire la version de
+    // l'interface a chaque battement. Sans ce chemin, mozaiklabs ne connait que
+    // la version du binaire — et `web/` est deploye separement.
+    let web_dir = crate::config::resolve_web_dir();
+    tune_core::cloud::telemetry::spawn_startup_ping(
+        state.backend.clone(),
+        state.services.clone(),
+        web_dir.clone(),
+    );
     tune_core::cloud::telemetry::TelemetryReporter::spawn(
         state.backend.clone(),
         state.services.clone(),
+        web_dir,
     );
 }
 

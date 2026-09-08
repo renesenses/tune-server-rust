@@ -1303,6 +1303,12 @@ const VERSION_DE_SCHEMA_INCONNUE: &str = "unknown";
 ///
 /// Fonction NUE — elle ne prend pas d'`AppState` — pour qu'une épreuve puisse
 /// la sonder sans base ; c'est le rendu qui est éprouvé, pas la condition.
+/// Ce que la ligne « Interface (web) » dit quand `web/version.json` n'existe
+/// pas. Surtout pas la version du serveur : deux numeros identiques feraient
+/// disparaitre l'ecart que #3380 existe pour rendre visible.
+const SANS_VERSION_INTERFACE: &str =
+    "inconnue (web/version.json absent : build web anterieur a #3380)";
+
 fn version_de_schema_affichee(version: Option<i32>) -> String {
     version.map_or_else(|| VERSION_DE_SCHEMA_INCONNUE.to_string(), |v| v.to_string())
 }
@@ -1337,6 +1343,12 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // une base jamais migrée.
     let db_version = super::version_de_schema(&state);
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    // #3380 — la version de l'INTERFACE. `web/` est deploye separement du
+    // binaire : sans elle, un bogue d'ecran s'instruit sans savoir quel ecran
+    // tournait. `None` quand `web/version.json` n'existe pas — JAMAIS un repli
+    // sur la version du serveur, qui rendrait l'ecart invisible.
+    let version_interface =
+        tune_core::interface_web::version_interface(&crate::config::resolve_web_dir());
     let music_dirs = super::get_music_dirs_list(&state.backend);
     let scan_status = settings
         .get("scan_status")
@@ -1428,6 +1440,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str(&format!(
         "**Version**: {} (engine: rust)\n",
         tune_core::version()
+    ));
+    // #3380 : juste sous la version du serveur, parce que c'est la paire qui
+    // se lit — deux numeros qui divergent expliquent a eux seuls un ticket.
+    md.push_str(&format!(
+        "**Interface (web)**: {}\n",
+        version_interface
+            .as_deref()
+            .unwrap_or(SANS_VERSION_INTERFACE)
     ));
     md.push_str(&format!(
         "**Platform**: {} ({})\n",
@@ -1639,6 +1659,9 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
 
     Json(json!({
         "version": tune_core::version(),
+        // #3380 — le champ que la telemetrie reprend et que l'admin mozaiklabs
+        // affichera a cote de `version`. `null` = interface non identifiable.
+        "ui_version": version_interface,
         "engine": "rust",
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
