@@ -1804,3 +1804,117 @@ async fn le_plafond_de_frequence_du_catalogue_fait_tomber_le_verdict_comme_l_orc
         Some("96kHz \u{2192} 48kHz")
     );
 }
+
+// ------------------------------------------------------------------
+// #3183 — la QUATRIÈME copie à la main, celle que le tableau du ticket ne
+// comptait pas.
+//
+// Les trois lignes de l'écart n° 3 (liste « sortie réseau », forçage WAV,
+// plafond 16 bits) ont chacune été réconciliées en extrayant la condition
+// dans `tune_core::orchestrator`. `needs_transcode_for_output` était la
+// quatrième, et elle avait DÉJÀ dérivé : la décision choisit entre
+// `needs_transcode_for_chromecast()` et `needs_transcode_for_dlna()` selon le
+// type de la zone, ce miroir n'appelait que la seconde.
+//
+// L'écart porte sur un seul couple, et il est réel : le Default Media
+// Receiver ne décode pas l'AIFF (#1210, Mika, BeoPlay A9 via CAST).
+
+/// Une zone `chromecast`, sur une base migrée — comme `dlna_zone()`, l'autre
+/// type.
+fn chromecast_zone() -> (Arc<dyn DbBackend>, Zone) {
+    let db = SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    tune_core::db::migrations::run_migrations(&db).unwrap();
+    let backend: Arc<dyn DbBackend> = Arc::new(db);
+    let repo = ZoneRepo::with_backend(backend.clone());
+    let id = repo
+        .create("Cast", Some("chromecast"), Some("dev-cast"))
+        .unwrap();
+    let zone = repo.get(id).unwrap().unwrap();
+    (backend, zone)
+}
+
+/// Un VRAI AIFF de la caisse, annoncé 44,1/16 en base.
+fn piste_aiff(backend: &Arc<dyn DbBackend>) -> i64 {
+    let chemin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tune-core/tests/fixtures/test.aiff"
+    );
+    let mut t = tune_core::db::models::Track::new("Piste 3183 AIFF".into());
+    t.duration_ms = 1_000;
+    t.file_path = Some(chemin.into());
+    t.format = Some("aiff".into());
+    t.sample_rate = Some(44_100);
+    t.bit_depth = Some(16);
+    t.channels = 2;
+    t.file_size = std::fs::metadata(chemin).ok().map(|m| m.len() as i64);
+    t.source = "local".into();
+    tune_core::db::track_repo::TrackRepo::with_backend(backend.clone())
+        .create(&t)
+        .unwrap()
+}
+
+/// Le cas divergent, confronté à la VRAIE décision sur la MÊME base : un AIFF
+/// sur une zone Chromecast. L'orchestrateur transcode en FLAC ; le panneau
+/// annonçait un passthrough bit-perfect.
+#[tokio::test]
+async fn un_aiff_sur_une_zone_chromecast_tombe_comme_l_orchestrateur() {
+    let (backend, zone) = chromecast_zone();
+    let zone_id = zone.id.unwrap();
+    let track_id = piste_aiff(&backend);
+    let r = decision(&backend, zone_id, track_id).await;
+    assert_eq!(
+        r.mime_type, "audio/flac",
+        "l'orchestrateur transcode l'AIFF en FLAC pour un Chromecast (#1210)"
+    );
+    let sp = build_signal_path(
+        &en_lecture(track_id, "aiff", 44_100, 16),
+        &zone,
+        &backend,
+        Some("BeoPlay A9"),
+        "",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        verdict(&sp),
+        Some(false),
+        "l'orchestrateur transcode, le panneau annonçait un passthrough \
+         bit-perfect (#3183, quatrième copie) : {sp}"
+    );
+    assert!(
+        transcoder_desc(&sp).is_some(),
+        "l'étape de transcodage doit apparaître : {sp}"
+    );
+}
+
+/// Contre-épreuve : le MÊME AIFF, la même piste, sur une zone `dlna`. Là, le
+/// renderer le joue direct — la décision ne transcode pas, et le panneau doit
+/// dire passthrough. Sans cette moitié, l'épreuve ci-dessus resterait verte
+/// avec un miroir qui annoncerait « transcodage » pour toutes les zones.
+#[tokio::test]
+async fn le_meme_aiff_sur_une_zone_dlna_reste_un_passthrough() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    let track_id = piste_aiff(&backend);
+    let r = decision(&backend, zone_id, track_id).await;
+    assert_eq!(
+        r.mime_type, "audio/aiff",
+        "un renderer DLNA joue l'AIFF direct : aucun transcodage"
+    );
+    let sp = build_signal_path(
+        &en_lecture(track_id, "aiff", 44_100, 16),
+        &zone,
+        &backend,
+        Some("Marantz SR7009"),
+        "",
+        None,
+    )
+    .unwrap();
+    assert_eq!(verdict(&sp), Some(true), "{sp}");
+    assert_eq!(
+        transcoder_desc(&sp),
+        None,
+        "aucun transcodage : l'AIFF part tel quel"
+    );
+}
