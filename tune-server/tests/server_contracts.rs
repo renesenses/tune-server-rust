@@ -67,6 +67,8 @@ mod facettes_multivaleurs;
 mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
 mod favoris_facettes_routes;
+#[path = "features_livrees_3355.rs"]
+mod features_livrees_3355;
 #[path = "file_promet_l_enchainement.rs"]
 mod file_promet_l_enchainement;
 #[path = "fonds_communautaire_par_mbid.rs"]
