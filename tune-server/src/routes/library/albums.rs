@@ -339,8 +339,20 @@ pub(super) async fn get_album(
             // from the payload rather than null when untagged, so a client can
             // simply test for the key instead of distinguishing "no tag" from
             // "measured zero" — DR0 is a real value.
-            if let (Some(obj), Ok(Some(dr))) = (j.as_object_mut(), repo.dynamic_range(id)) {
-                obj.insert("dynamic_range".into(), Value::String(dr));
+            //
+            // `dynamic_range_source` dit d'OÙ sort la valeur (#1388) :
+            // `album_tag` quand une piste porte `ALBUM DYNAMIC RANGE`,
+            // `track_average` quand Tune l'a déduite de la moyenne arrondie des
+            // `DYNAMIC RANGE` des pistes. Les deux clés apparaissent et
+            // disparaissent ENSEMBLE : un client qui ne connaît que la première
+            // ne voit aucun changement, celui qui lit la seconde peut annoncer
+            // une mesure ou une déduction plutôt que de les confondre.
+            if let (Some(obj), Ok(Some(dr))) = (j.as_object_mut(), repo.dynamic_range_detail(id)) {
+                obj.insert("dynamic_range".into(), Value::String(dr.valeur.to_string()));
+                obj.insert(
+                    "dynamic_range_source".into(),
+                    Value::String(dr.source().into()),
+                );
             }
             Json(j).into_response()
         }
@@ -359,9 +371,17 @@ pub(super) async fn album_tracks(
     // forwards it here so the album detail shows only the matching tracks
     // (Sergio: a Hi-Res/FLAC filter must not reveal the album's MP3/44.1
     // tracks). With no filter this is identical to list_by_album.
+    //
+    // `ou_defaut_journalise` et non `unwrap_or_default` (#2861) : une panne de
+    // base rendait ici une liste VIDE, indiscernable d'un album sans piste, et
+    // sans une ligne de journal. Le cas n'est pas theorique sur cette route —
+    // le rapport de jfpaquet du 02/09 (0.9.130, PostgreSQL, fil 1642) porte
+    // trois `panne_sql_avalee` de l'accueil dans la MEME fenetre de journal
+    // (#3181) : sur cette installation, une requete qui echoue en silence est
+    // l'ordinaire, pas l'exception. La reponse HTTP ne bouge pas.
     let items = dedup_display_tracks(
         repo.list_by_album_filtered(id, f.format.as_deref(), f.quality.as_deref())
-            .unwrap_or_default(),
+            .ou_defaut_journalise(),
     );
 
     // GROUPING (#2130) : lu au scan et rangé dans `track_metadata`, il n'était
@@ -374,7 +394,7 @@ pub(super) async fn album_tracks(
     let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
     let grouping = meta_repo
         .get_key_for_tracks("grouping", &track_ids)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
 
     // Dynamic Range par piste (#1388) : le tag `DYNAMIC RANGE` est lu au scan
     // (#1806, `track_metadata['dr_track']`) mais n'était ressorti par aucune
@@ -384,7 +404,7 @@ pub(super) async fn album_tracks(
     // vraie mesure (celle d'un master saturé).
     let dynamic_range = meta_repo
         .get_key_for_tracks("dr_track", &track_ids)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
 
     Json(json!(attach_track_tags(
         items,
@@ -832,9 +852,10 @@ pub(super) async fn merge_duplicate_albums_route(
     }
     state
         .backend
-        .execute_batch(
-            "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
-        )
+        .execute_batch(&format!(
+            "UPDATE albums SET track_count = {}",
+            tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
+        ))
         .ok();
     Ok(Json(json!({ "merged": deleted, "protected": protegees })))
 }
@@ -1506,10 +1527,17 @@ pub(super) async fn album_completeness(
         Engine::Sqlite => SqliteDialect.placeholder(1),
     };
 
+    // Le MÊME compte que `albums.track_count` (#1362) : les deux membres de la
+    // comparaison ci-dessous doivent parler de la même chose, sinon un album
+    // portant deux copies d'un morceau se déclarerait complet parce que ses
+    // lignes dépassent ses présentations.
     let actual_tracks: i64 = state
         .backend
         .query_one(
-            &format!("SELECT COUNT(*) FROM tracks WHERE album_id = {p1}"),
+            &format!(
+                "SELECT {}",
+                tune_core::db::track_repo::sql_compte_pistes_visibles(&p1)
+            ),
             &[&id as &dyn ToSqlValue],
         )
         .ok()
@@ -2075,3 +2103,147 @@ mod tests_regroupement;
 
 #[cfg(test)]
 mod tests_contenu;
+
+/// #3397 — le témoin qui empêche les deux chemins de `GET /library/albums` de
+/// diverger.
+///
+/// La route bâtit sa page en deux temps depuis #1269 : un tri sur des lignes
+/// étroites, puis la matérialisation de la page. `added_at` n'était lu que
+/// dans le PREMIER temps, et seulement quand le tri portait sur lui : dès
+/// qu'un autre tri était demandé, les cinquante lignes sortaient avec
+/// `added_at: null` — y compris sous `sort=added`, qui triait donc par une
+/// date qu'il taisait, ce qui bloquait « trier par date d'ajout » (#3351).
+///
+/// Le témoin ne vérifie pas `added_at` seul : il compare les OBJETS ENTIERS
+/// rendus par le chemin trié et par le chemin non trié pour le même album.
+/// Tout futur champ qui n'existerait que d'un côté le fera tomber.
+#[cfg(test)]
+mod tests_tri_added_at {
+    use axum::body::Body;
+    use axum::http::Request;
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+
+    type Etat = crate::state::AppState;
+
+    fn serveur() -> (axum::Router, Etat) {
+        let state = Etat::new(":memory:", 0, Default::default()).unwrap();
+        // `albums.artist_id` et `tracks.artist_id` référencent `artists(id)` :
+        // sans cet artiste, l'insertion tombe sur « FOREIGN KEY constraint
+        // failed » et le témoin serait vert contre une base vide.
+        state
+            .backend
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Radiohead')",
+                &[],
+            )
+            .unwrap();
+        let routeur = crate::routes::router(state.clone());
+        (routeur, state)
+    }
+
+    fn album_avec_piste(state: &Etat, titre: &str, chemin: &str, mtime: f64) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO albums (title, artist_id, source, track_count, year) \
+                 VALUES (?, 1, 'local', 1, 2001)",
+                &[&titre as &dyn ToSqlValue],
+            )
+            .unwrap();
+        let album_id = state.backend.last_insert_rowid();
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (title, album_id, artist_id, track_number, file_path, \
+                 file_mtime, duration_ms) VALUES (?, ?, 1, 1, ?, ?, 30000)",
+                &[&titre as &dyn ToSqlValue, &album_id, &chemin, &mtime],
+            )
+            .unwrap();
+    }
+
+    /// Les lignes de la réponse, indexées par identifiant d'album.
+    async fn lignes_par_id(app: &axum::Router, requete: &str) -> HashMap<i64, Value> {
+        let reponse = app
+            .clone()
+            .oneshot(Request::get(requete).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            reponse.status().is_success(),
+            "{requete} : {}",
+            reponse.status()
+        );
+        let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&corps).unwrap();
+        json["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|a| (a["id"].as_i64().expect("id"), a.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn le_chemin_trie_rend_le_meme_objet_que_le_chemin_non_trie_3397() {
+        let (app, state) = serveur();
+        album_avec_piste(&state, "Amnesiac", "/a.flac", 1_000.0);
+        album_avec_piste(&state, "Kid A", "/b.flac", 2_000.0);
+        album_avec_piste(&state, "OK Computer", "/c.flac", 3_000.0);
+
+        let sans_tri = lignes_par_id(&app, "/api/v1/library/albums?limit=50&offset=0").await;
+        assert_eq!(sans_tri.len(), 3, "trois albums attendus : {sans_tri:?}");
+        for (id, ligne) in &sans_tri {
+            assert!(
+                ligne["added_at"].as_f64().is_some(),
+                "album {id} : le chemin non trié date déjà l'album — {ligne}"
+            );
+        }
+
+        for tri in ["title", "artist", "year", "added", "added_date", "random"] {
+            let trie = lignes_par_id(
+                &app,
+                &format!("/api/v1/library/albums?limit=50&offset=0&sort={tri}&order=asc"),
+            )
+            .await;
+            assert_eq!(
+                trie.len(),
+                sans_tri.len(),
+                "tri {tri} : la page doit rester servie"
+            );
+            for (id, ligne) in &trie {
+                assert_eq!(
+                    ligne,
+                    sans_tri.get(id).expect("même album des deux côtés"),
+                    "tri {tri}, album {id} : les deux chemins doivent rendre le MÊME objet"
+                );
+            }
+        }
+    }
+
+    /// `sort=added` est le cas qui a fait ouvrir l'issue : la route triait par
+    /// la date d'ajout sans la rendre. Contre-épreuve directe.
+    #[tokio::test]
+    async fn sort_added_rend_la_date_sur_laquelle_il_vient_de_trier_3397() {
+        let (app, state) = serveur();
+        album_avec_piste(&state, "Amnesiac", "/a.flac", 1_000.0);
+        album_avec_piste(&state, "Kid A", "/b.flac", 2_000.0);
+
+        let lignes = lignes_par_id(
+            &app,
+            "/api/v1/library/albums?limit=50&offset=0&sort=added&order=desc",
+        )
+        .await;
+        assert_eq!(lignes.len(), 2);
+        for (id, ligne) in &lignes {
+            assert!(
+                ligne["added_at"].as_f64().is_some(),
+                "album {id} : sort=added doit rendre added_at — {ligne}"
+            );
+        }
+    }
+}

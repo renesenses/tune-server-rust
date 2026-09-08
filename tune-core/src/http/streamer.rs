@@ -578,6 +578,18 @@ pub struct CanalIcy {
     pub accorde: bool,
     /// La branche qui l'a servi (une des trois constantes ci-dessus).
     pub voie: &'static str,
+    /// La reponse a-t-elle ete servie au contrat FICHIER — `Content-Length`
+    /// fini + `Accept-Ranges` — plutot qu'en corps chunke ?
+    ///
+    /// Une radio bornee est le cas ORDINAIRE d'un renderer reseau :
+    /// `accepts_chunked_live_stream` ne rend `true` que pour un agent `Lavf`
+    /// (ou absent), tout le reste recoit le contrat fichier (#1689). Les blocs
+    /// ICY y sont entrelaces exactement de la meme facon — mais la reponse, elle,
+    /// se presente au renderer comme un FICHIER, et c'est la moitie de la
+    /// negociation qu'aucun journal ne portait. On la NOTE ; on n'en conclut
+    /// rien : rien dans ce depot ne prouve qu'un appareil cesse de lire l'ICY
+    /// parce que la reponse est bornee.
+    pub borne: bool,
 }
 
 static ICY_NEGOCIE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, CanalIcy>>> =
@@ -587,7 +599,13 @@ static ICY_NEGOCIE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, CanalIc
 /// flux sur les TROIS branches — y compris celles qui ne portent pas d'ICY :
 /// « aucune trace » et « servi par une voie sans ICY » sont deux diagnostics
 /// différents, et c'est justement celui-là qu'on n'avait pas.
-pub fn note_icy_channel(stream_id: &str, demande: bool, accorde: bool, voie: &'static str) {
+pub fn note_icy_channel(
+    stream_id: &str,
+    demande: bool,
+    accorde: bool,
+    voie: &'static str,
+    borne: bool,
+) {
     if let Ok(mut map) = ICY_NEGOCIE.lock() {
         map.insert(
             stream_id.to_string(),
@@ -595,6 +613,7 @@ pub fn note_icy_channel(stream_id: &str, demande: bool, accorde: bool, voie: &'s
                 demande,
                 accorde,
                 voie,
+                borne,
             },
         );
     }
@@ -616,8 +635,13 @@ pub fn forget_icy_channel(stream_id: &str) {
 /// renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanalRadio {
-    /// Fenêtre ICY accordée : les blocs partent, l'écran peut suivre.
-    Icy,
+    /// Fenêtre ICY accordée : les blocs partent, l'écran peut suivre. `borne`
+    /// dit sous quel contrat la réponse a été servie — corps chunké, ou fichier
+    /// borné (`Content-Length` + `Accept-Ranges`, le cas de tout renderer dont
+    /// l'agent n'est pas `Lavf`). Le verdict reste le même : les blocs partent.
+    /// Seul le libellé du journal change, parce que c'est l'information qui
+    /// manquait pour instruire le cas d'un appareil qui ne suit pas (#2991).
+    Icy { borne: bool },
     /// Servi par une branche qui n'insère aucun bloc ICY (fichier, mandataire).
     VoieSansIcy,
     /// Le renderer n'a pas demandé les métadonnées en cours de flux.
@@ -633,7 +657,7 @@ pub enum CanalRadio {
 impl CanalRadio {
     /// Le changement de morceau atteint-il réellement le renderer ?
     pub fn atteint_le_renderer(self) -> bool {
-        matches!(self, CanalRadio::Icy)
+        matches!(self, CanalRadio::Icy { .. })
     }
 
     /// Le libellé qui part au journal. Écrit pour être lu SEUL : une seule
@@ -646,7 +670,14 @@ impl CanalRadio {
     /// le nomme, lui, dans `icy_metadata_negotiated`.
     pub fn libelle(self) -> &'static str {
         match self {
-            CanalRadio::Icy => "icy — fenêtre accordée, les blocs partent",
+            CanalRadio::Icy { borne: false } => {
+                "icy — fenêtre accordée sur un corps chunké, les blocs partent"
+            }
+            CanalRadio::Icy { borne: true } => {
+                "icy — fenêtre accordée, mais la réponse est servie au contrat FICHIER \
+                 (Content-Length + Accept-Ranges) : les blocs partent quand même, reste à \
+                 savoir si l'appareil les lit"
+            }
             CanalRadio::VoieSansIcy => {
                 "aucun — servi par une voie qui n'insère aucun bloc ICY (fichier ou mandataire)"
             }
@@ -672,13 +703,50 @@ pub fn canal_radio(stream_id: Option<&str>) -> CanalRadio {
     };
     match icy_channel(sid) {
         None => CanalRadio::AucuneConnexion,
-        Some(c) if c.accorde => CanalRadio::Icy,
+        Some(c) if c.accorde => CanalRadio::Icy { borne: c.borne },
         Some(c) if c.voie != VOIE_FLUX => CanalRadio::VoieSansIcy,
         Some(c) if c.demande => CanalRadio::IcyRefuse,
         Some(_) => CanalRadio::IcyNonDemande,
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Le journal de la POUSSÉE, et non celui de l'intention (#2991)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `canal_radio` ci-dessus dit par où le changement DEVRAIT passer ; il le
+// déduit de deux registres. Il ne prouve pas qu'un bloc soit réellement parti,
+// et il ne dit NI le titre NI l'URL de pochette qui sont partis. C'est
+// exactement ce qui manquait au dernier aller-retour avec le testeur : « la
+// pochette ne change pas » ne se distinguait pas de « la pochette part vide ».
+//
+// Le bloc, lui, est reconstruit toutes les 16 384 octets — plus de dix fois par
+// seconde sur un WAV 44,1 kHz. Le journaliser à chaque insertion noierait tout.
+// Ce suivi ne laisse passer que le PREMIER bloc, puis les CHANGEMENTS : une
+// ligne par morceau, ce qui est précisément le rythme du symptôme.
+#[derive(Debug, Default)]
+pub struct SuiviBlocIcy {
+    dernier: Option<String>,
+}
+impl SuiviBlocIcy {
+    pub fn nouveau() -> Self {
+        Self::default()
+    }
+    /// Rend `true` au premier bloc, puis seulement quand le titre OU la
+    /// pochette changent.
+    ///
+    /// Les deux champs sont séparés par un octet qui ne peut pas figurer dans
+    /// une URL ni dans un titre : sans lui, `("ab", "c")` et `("a", "bc")`
+    /// auraient la même empreinte et un changement passerait pour un doublon.
+    pub fn a_journaliser(&mut self, titre: &str, pochette: Option<&str>) -> bool {
+        let empreinte = format!("{titre}\u{1f}{}", pochette.unwrap_or(""));
+        if self.dernier.as_deref() == Some(empreinte.as_str()) {
+            return false;
+        }
+        self.dernier = Some(empreinte);
+        true
+    }
+}
 pub struct AudioStreamer {
     sessions: Arc<Mutex<HashMap<String, Arc<StreamSession>>>>,
     port: u16,
@@ -1232,33 +1300,69 @@ fn is_temp_transcode_file(path: &str) -> bool {
         || file_name.starts_with("tune-faststart-")
 }
 
+/// Charge utile maximale d'un bloc ICY : l'octet de longueur qui le precede
+/// compte des groupes de 16 octets et ne monte pas au-dela de 255. Il n'existe
+/// donc AUCUNE facon d'annoncer plus de 4080 octets de metadonnees.
+pub const ICY_CHARGE_MAX: usize = 255 * 16;
+/// Refermer une declaration ICY coupee, sur une frontiere de caractere.
+///
+/// Appelee seulement quand le titre SEUL depasse la charge maximale : on garde
+/// ce qui tient et l'on repose le `';` de fin, sans quoi le bloc est illisible.
+fn tronque_declaration_icy(charge: &str) -> String {
+    const FIN: &str = "';";
+    let budget = ICY_CHARGE_MAX - FIN.len();
+    let mut coupe = budget.min(charge.len());
+    while coupe > 0 && !charge.is_char_boundary(coupe) {
+        coupe -= 1;
+    }
+    format!("{}{FIN}", &charge[..coupe])
+}
+// ── Pourquoi ce bloc JETTE au lieu de COUPER (#2991) ──
+//
+// L'ancien code posait `len_byte = (payload.len() / 16).min(255)` puis
+// recopiait `payload[..len_byte * 16]` : une charge trop longue partait COUPEE.
+// Coupee au milieu de l'URL de pochette, donc sans son `';` de fermeture ; et
+// coupee en OCTETS, donc au milieu d'un caractere accentue des que le titre en
+// portait un. Un lecteur qui parse la declaration entiere rejette alors le bloc
+// COMPLET — ni le titre ni la pochette ne changent, ce qui est mot pour mot le
+// symptome instruit ici. Un bloc VALIDE sans pochette vaut mieux qu'un bloc
+// tronque que personne ne peut lire : le titre passe d'abord, la pochette n'est
+// ajoutee que si elle tient.
 pub fn build_icy_metadata(
     artist: Option<&str>,
     title: Option<&str>,
     cover_url: Option<&str>,
 ) -> Vec<u8> {
-    let mut parts = Vec::new();
     let stream_title = match (artist, title) {
         (Some(a), Some(t)) => Some(format!("{a} - {t}")),
         (Some(a), None) => Some(a.to_string()),
         (None, Some(t)) => Some(t.to_string()),
         (None, None) => None,
     };
-    if let Some(st) = stream_title {
-        parts.push(format!("StreamTitle='{st}';"));
-    }
+    let mut charge = match stream_title {
+        Some(st) => format!("StreamTitle='{st}';"),
+        None => String::new(),
+    };
     if let Some(url) = cover_url {
-        parts.push(format!("StreamUrl='{url}';"));
+        let declaration = format!("StreamUrl='{url}';");
+        if charge.len() + declaration.len() <= ICY_CHARGE_MAX {
+            charge.push_str(&declaration);
+        }
     }
-    if parts.is_empty() {
+    if charge.len() > ICY_CHARGE_MAX {
+        charge = tronque_declaration_icy(&charge);
+    }
+    if charge.is_empty() {
         return vec![0u8];
     }
-    let mut payload = parts.join("").into_bytes();
+    let mut payload = charge.into_bytes();
     let pad = (16 - payload.len() % 16) % 16;
     payload.resize(payload.len() + pad, 0);
-    let len_byte = (payload.len() / 16).min(255) as u8;
-    let mut block = vec![len_byte];
-    block.extend_from_slice(&payload[..len_byte as usize * 16]);
+    // 255 au plus par construction : la charge ne depasse plus ICY_CHARGE_MAX.
+    let len_byte = (payload.len() / 16) as u8;
+    let mut block = Vec::with_capacity(1 + payload.len());
+    block.push(len_byte);
+    block.extend_from_slice(&payload);
     block
 }
 
@@ -2119,17 +2223,17 @@ mod tests {
     #[test]
     fn le_canal_distingue_l_icy_accorde_du_non_demande() {
         let accorde = "i2991-a4f218-accorde";
-        note_icy_channel(accorde, true, true, VOIE_FLUX);
-        assert_eq!(canal_radio(Some(accorde)), CanalRadio::Icy);
+        note_icy_channel(accorde, true, true, VOIE_FLUX, false);
+        assert_eq!(canal_radio(Some(accorde)), CanalRadio::Icy { borne: false });
         assert!(canal_radio(Some(accorde)).atteint_le_renderer());
 
         let muet = "i2991-a4f218-non-demande";
-        note_icy_channel(muet, false, false, VOIE_FLUX);
+        note_icy_channel(muet, false, false, VOIE_FLUX, false);
         assert_eq!(canal_radio(Some(muet)), CanalRadio::IcyNonDemande);
         assert!(!canal_radio(Some(muet)).atteint_le_renderer());
 
         let refuse = "i2991-a4f218-refuse";
-        note_icy_channel(refuse, true, false, VOIE_FLUX);
+        note_icy_channel(refuse, true, false, VOIE_FLUX, false);
         assert_eq!(canal_radio(Some(refuse)), CanalRadio::IcyRefuse);
 
         forget_icy_channel(accorde);
@@ -2144,7 +2248,7 @@ mod tests {
     fn une_voie_sans_decoupe_ne_porte_aucun_bloc_meme_si_l_icy_est_demande() {
         for voie in [VOIE_FICHIER, VOIE_MANDATAIRE] {
             let sid = format!("i2991-a4f218-voie-{voie}");
-            note_icy_channel(&sid, true, false, voie);
+            note_icy_channel(&sid, true, false, voie, false);
             assert_eq!(
                 canal_radio(Some(&sid)),
                 CanalRadio::VoieSansIcy,
@@ -2154,6 +2258,142 @@ mod tests {
         }
     }
 
+    // ───── #2991 — ce que le bloc ICY emporte, et ce qu'il n'emporte plus ─────
+    /// CONTRE-ÉPREUVE. Une charge trop longue partait COUPÉE : plus de `';` de
+    /// fermeture, donc une déclaration que rien ne peut refermer. Un lecteur
+    /// qui parse la déclaration entière rejette le bloc COMPLET — le titre AVEC
+    /// la pochette, ce qui est le symptôme instruit ici.
+    ///
+    /// Rouge avant le correctif : le bloc se terminait par des `a` d'URL.
+    #[test]
+    fn un_bloc_icy_trop_long_part_valide_au_lieu_de_partir_coupe() {
+        let pochette = format!("https://img.example.org/{}.jpg", "a".repeat(4200));
+        let bloc = build_icy_metadata(Some("Pink Floyd"), Some("Time"), Some(&pochette));
+        assert_eq!(
+            bloc.len(),
+            1 + bloc[0] as usize * 16,
+            "l'octet de longueur doit décrire EXACTEMENT la charge servie"
+        );
+        assert!(
+            bloc.len() <= 1 + ICY_CHARGE_MAX,
+            "aucun bloc ne peut dépasser ce que son octet de longueur sait annoncer"
+        );
+        let charge = std::str::from_utf8(&bloc[1..])
+            .expect("la charge doit rester de l'UTF-8 valide")
+            .trim_end_matches('\0')
+            .to_string();
+        assert!(
+            charge.starts_with("StreamTitle='Pink Floyd - Time';"),
+            "le titre passe d'abord : c'est lui qu'on garde si les deux ne tiennent pas ; \
+             charge = {charge:?}"
+        );
+        assert!(
+            charge.ends_with("';"),
+            "toute déclaration doit être refermée, sinon le bloc entier est illisible ; \
+             fin = {:?}",
+            &charge[charge.len().saturating_sub(40)..]
+        );
+        assert!(
+            !charge.contains("StreamUrl="),
+            "une pochette qui ne tient pas est JETÉE, pas coupée ; charge = {charge:?}"
+        );
+    }
+    /// CONTRE-ÉPREUVE. La coupe se faisait en OCTETS : un titre accentué —
+    /// c'est-à-dire un titre français sur deux — partait coupé au milieu d'un
+    /// caractère, et le bloc n'était plus de l'UTF-8.
+    ///
+    /// Rouge avant le correctif : `from_utf8` échouait.
+    #[test]
+    fn un_titre_accentue_trop_long_ne_part_pas_coupe_au_milieu_d_un_caractere() {
+        let titre = "é".repeat(2100);
+        let bloc = build_icy_metadata(None, Some(&titre), Some("https://img.example.org/x.jpg"));
+        let charge = std::str::from_utf8(&bloc[1..])
+            .expect("le bloc doit rester de l'UTF-8 valide même quand le titre déborde");
+        assert!(charge.trim_end_matches('\0').ends_with("';"));
+        assert_eq!(bloc.len(), 1 + bloc[0] as usize * 16);
+    }
+    /// TÉMOIN. Le cas ordinaire — un titre et une pochette qui tiennent — ne
+    /// bouge pas d'un octet.
+    #[test]
+    fn un_bloc_icy_ordinaire_porte_toujours_le_titre_et_la_pochette() {
+        let bloc = build_icy_metadata(
+            Some("Pink Floyd"),
+            Some("Time"),
+            Some("https://img.radioparadise.com/covers/l/x.jpg"),
+        );
+        let charge = std::str::from_utf8(&bloc[1..]).expect("UTF-8");
+        assert!(charge.contains("StreamTitle='Pink Floyd - Time';"));
+        assert!(charge.contains("StreamUrl='https://img.radioparadise.com/covers/l/x.jpg';"));
+        assert_eq!(bloc.len(), 1 + bloc[0] as usize * 16);
+    }
+    /// CONTRE-ÉPREUVE. Le contrat sous lequel la réponse est servie — chunké ou
+    /// fichier borné — est la moitié de la négociation qu'aucun journal ne
+    /// portait. Un renderer dont l'agent n'est pas `Lavf` reçoit TOUJOURS le
+    /// contrat fichier : c'est le cas ordinaire, et il se lisait « fenêtre
+    /// accordée, les blocs partent », exactement comme un corps chunké.
+    ///
+    /// Rouge avant le correctif : les deux rendaient `CanalRadio::Icy` et le
+    /// MÊME libellé.
+    #[test]
+    fn le_canal_nomme_le_contrat_sous_lequel_la_reponse_est_servie() {
+        let chunke = "i2991-b2092-chunke";
+        let borne = "i2991-b2092-borne";
+        note_icy_channel(chunke, true, true, VOIE_FLUX, false);
+        note_icy_channel(borne, true, true, VOIE_FLUX, true);
+        assert_eq!(
+            canal_radio(Some(chunke)),
+            CanalRadio::Icy { borne: false },
+            "un corps chunké reste ce qu'il était"
+        );
+        assert_eq!(canal_radio(Some(borne)), CanalRadio::Icy { borne: true });
+        // On NOTE le contrat, on n'en conclut pas l'échec : rien dans ce dépôt
+        // ne prouve qu'un appareil cesse de lire l'ICY parce que la réponse est
+        // bornée. Déclarer l'échec ici serait un faux rouge pour tous les
+        // renderers que ce chemin sert correctement.
+        assert!(
+            canal_radio(Some(borne)).atteint_le_renderer(),
+            "les blocs partent dans les deux cas — seul le libellé change"
+        );
+        assert!(
+            canal_radio(Some(borne)).libelle().contains("FICHIER"),
+            "le libellé est lu SEUL au journal : il doit nommer le contrat"
+        );
+        assert_ne!(
+            canal_radio(Some(borne)).libelle(),
+            canal_radio(Some(chunke)).libelle(),
+            "les deux contrats doivent se distinguer d'une ligne de journal"
+        );
+        forget_icy_channel(chunke);
+        forget_icy_channel(borne);
+    }
+    /// CONTRE-ÉPREUVE. Le bloc est reconstruit plus de dix fois par seconde :
+    /// journaliser chaque insertion noierait le journal, ne rien journaliser
+    /// est l'état d'aujourd'hui. Une ligne par morceau, et une pochette qui
+    /// change SEULE doit se voir — c'est la moitié du ticket.
+    #[test]
+    fn le_suivi_du_bloc_icy_ne_journalise_que_les_changements() {
+        let mut suivi = SuiviBlocIcy::nouveau();
+        assert!(suivi.a_journaliser("Time", Some("https://c/1.jpg")));
+        assert!(
+            !suivi.a_journaliser("Time", Some("https://c/1.jpg")),
+            "le même bloc ne repart pas au journal dix fois par seconde"
+        );
+        assert!(
+            suivi.a_journaliser("Time", Some("https://c/2.jpg")),
+            "une POCHETTE qui change seule doit se voir : c'est la moitié du ticket"
+        );
+        assert!(suivi.a_journaliser("Money", Some("https://c/2.jpg")));
+        assert!(
+            suivi.a_journaliser("Money", None),
+            "perdre la pochette est un changement, pas un silence"
+        );
+        let mut ambigu = SuiviBlocIcy::nouveau();
+        assert!(ambigu.a_journaliser("ab", Some("c")));
+        assert!(
+            ambigu.a_journaliser("a", Some("bc")),
+            "deux champs ne doivent pas se confondre par simple concaténation"
+        );
+    }
     /// Le registre suit la vie de la session, comme `RADIO_NOW` : sinon il
     /// grossirait d'une entrée par flux écouté, et un `stream_id` réémployé
     /// hériterait du verdict d'un autre appareil.
@@ -2161,8 +2401,8 @@ mod tests {
     async fn retirer_une_session_oublie_son_canal() {
         let streamer = AudioStreamer::new(8080);
         let (id, _tx, _ready, _session) = streamer.create_radio_session(info_de_test(), 8).await;
-        note_icy_channel(&id, true, true, VOIE_FLUX);
-        assert_eq!(canal_radio(Some(&id)), CanalRadio::Icy);
+        note_icy_channel(&id, true, true, VOIE_FLUX, false);
+        assert_eq!(canal_radio(Some(&id)), CanalRadio::Icy { borne: false });
 
         streamer.remove_session(&id).await;
         assert_eq!(

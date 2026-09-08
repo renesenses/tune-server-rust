@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
 
+use tune_core::db::zone_repo::CreationDeZone;
 use tune_core::outputs::OutputRegistry;
 use tune_core::poller::{JournalSondage, TraceEchecSondage};
 
@@ -29,6 +30,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
+    spawn_reprise_favoris_streaming(state);
     // CRD-5 : passe automatique des crédits, bornée par tour et reprenable par
     // curseur, derrière le même droit premium que les biographies. Une garde
     // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du
@@ -36,6 +38,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     crate::routes::library::credits::spawn_passe_automatique_credits(state);
     spawn_community_sync(state);
     spawn_replaygain_analysis(state);
+    spawn_lyrics_catchup(state);
     #[cfg(feature = "audio-embedding")]
     spawn_audio_embedding(state);
     spawn_radio_logo_refresh(state);
@@ -46,6 +49,17 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // un réglage que plus personne ne relisait. Un test de câblage garde la
     // ligne.
     crate::routes::system::scan::spawn_scan_scheduler(state.clone(), config.auto_scan);
+    // Vérificateur périodique de mises à jour (#3217). Même défaut que la ligne
+    // ci-dessus, et même remède : `UpdateChecker::spawn_periodic` n'avait qu'UNE
+    // occurrence dans tout le dépôt — sa définition — et `TUNE_AUTO_UPDATE`
+    // était accepté, réglable, et sans effet. Il NOTIFIE et n'installe rien :
+    // la garde anti-coupure de #2954 se justifie par « toute installation est
+    // un geste délibéré », et une installation automatique la ferait tomber.
+    // Un test de câblage garde la ligne.
+    crate::routes::system::update::spawn_verificateur_de_mise_a_jour(
+        state.clone(),
+        config.auto_update,
+    );
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config.port);
@@ -541,17 +555,30 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     }
                 }
 
-                // Auto-created zones start dormant and don't count against the
-                // free tier; the cap is enforced at first play in
-                // orchestrator.play(). So discovery may always register a device.
-                match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
-                    Ok((zid, true)) => {
+                // #3529 — ce lot tourne à CHAQUE démarrage et ne consultait pas
+                // « Créer automatiquement les zones ». Le commentaire qui
+                // tenait ici lieu de justification (« auto-created zones start
+                // dormant … discovery may always register a device ») parle du
+                // plafond du palier gratuit, PAS du réglage : une zone naît en
+                // ligne (`online` vaut `DEFAULT 1` au schéma). D'où « elles
+                // apparaissent ET s'activent toutes seules », chez Fabien, sur
+                // une installation où la case est décochée.
+                match zone_repo.get_or_create_si_autorise(
+                    &d.name,
+                    Some("dlna"),
+                    &d.id,
+                    "ssdp_startup",
+                ) {
+                    Ok(CreationDeZone::Creee(zid)) => {
                         let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
                     }
-                    Ok((zid, false)) => {
+                    Ok(CreationDeZone::Existante(zid)) => {
                         let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         let _ = zone_repo.set_online_by_device(&d.id, true);
+                    }
+                    Ok(CreationDeZone::Refusee) => {
+                        info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_auto_create_disabled_skipping");
                     }
                     Err(e) => {
                         tracing::warn!(name = %d.name, device_id = %d.id, error = %e, "ssdp_startup_zone_create_failed");
@@ -1807,6 +1834,62 @@ fn spawn_slimproto_server(state: &AppState, port_http: u16) {
     });
 }
 
+/// Le délai avant la reprise des favoris de service : le démarrage a mieux à
+/// faire, et les jetons des services sont restaurés puis rafraîchis dans les
+/// premières secondes. 90 s, comme la veille Bandcamp, pour la même raison.
+const REPRISE_FAVORIS_DELAI_SECS: u64 = 90;
+
+/// Reprend UNE fois, au démarrage, les favoris posés chez Qobuz/Tidal/… dans
+/// la table de Tune (#3419).
+///
+/// # Pourquoi un appelant, et pas seulement une route
+///
+/// Sans passage automatique, la reprise ne serait qu'une route que personne
+/// n'appelle : les clients déjà publiés ne la connaissent pas, et le défaut —
+/// une règle « Favori · est · Piste » qui rend 0 — resterait entier jusqu'à ce
+/// qu'un client soit mis à jour. L'issue le propose explicitement :
+/// « une route de synchronisation explicite, appelable au démarrage ou depuis
+/// les Réglages ».
+///
+/// # Sur quel profil
+///
+/// Sur `active_profile_id` — le modèle mono-actif que `/profiles/switch` et
+/// l'orchestrateur (marquage de l'historique) utilisent déjà —, à défaut le
+/// profil 1. Au démarrage il n'y a aucune requête, donc aucun `X-Profile-Id` :
+/// c'est la seule identité que la machine possède à cet instant. Les autres
+/// profils d'un foyer se reprennent par la route, qui agit sur l'appelant.
+///
+/// # Une passe, pas une veille
+///
+/// Aucune répétition : la reprise n'ajoute jamais qu'au premier passage, et la
+/// question « faut-il resynchroniser périodiquement, et que faire d'un favori
+/// retiré chez le service » demande un arbitrage que ce correctif ne tranche
+/// pas (voir `tune_core::streaming::favorites_import`).
+fn spawn_reprise_favoris_streaming(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(REPRISE_FAVORIS_DELAI_SECS)).await;
+        let profil =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("active_profile_id")
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .filter(|&id| id > 0)
+                .unwrap_or(1);
+        let comptes = crate::routes::profiles::reprendre_les_favoris(&state, profil, None).await;
+        let services = comptes.as_object().map(|o| o.len()).unwrap_or(0);
+        if services > 0 {
+            info!(
+                profile_id = profil,
+                services,
+                comptes = %comptes,
+                "reprise_favoris_streaming_au_demarrage"
+            );
+        }
+    });
+}
+
 fn spawn_bio_sync(state: &AppState) {
     let license = state.license.clone();
     let db = state.backend.clone();
@@ -1887,6 +1970,21 @@ fn spawn_community_sync(state: &AppState) {
 /// it never slows indexing. Gated by the `replaygain_analysis_enabled` setting.
 fn spawn_replaygain_analysis(state: &AppState) {
     tune_core::audio::replaygain::spawn(state.backend.clone());
+}
+
+/// #2172 — le rattrapage des paroles.
+///
+/// Le titre de l'issue disait « aucun passage de fond ne récupère les
+/// paroles » : les deux passes de `library::lyrics_pass` existaient depuis la
+/// 0.9.118, mais leur SEUL appelant était `POST /library/lyrics/fetch`, un
+/// bouton. Cette ligne est ce qui manquait — sans elle, le cœur reste du code
+/// que rien n'atteint, exactement comme `spawn_scan_scheduler` avant #2469.
+///
+/// Ne fait rien tant que `lyrics_lrclib_enabled` n'est pas activé, s'efface
+/// devant toute zone qui joue, et ne demande jamais plus de `LOT_DE_FOND`
+/// paroles d'affilée.
+fn spawn_lyrics_catchup(state: &AppState) {
+    tune_core::library::lyrics_pass::spawn(state.backend.clone(), state.http_client.clone());
 }
 
 /// Background CLAP audio-embedding sweep for the acoustic Smart Radio. Opt-in
@@ -2225,13 +2323,9 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // Phase 2: Create zones and emit events (no lock held)
     if !new_devices_to_zone.is_empty() {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-        let auto_create =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                .get("zone_auto_create")
-                .ok()
-                .flatten()
-                .map(|v| v != "false")
-                .unwrap_or(true);
+        // #3529 — même lecture du réglage que partout ailleurs, mais elle
+        // n'est plus recopiée : `ZoneRepo` la porte une fois pour toutes.
+        let auto_create = zone_repo.zone_auto_create_autorise();
         let system_default_device_id = crate::startup::first_system_default_name(
             new_devices_to_zone
                 .iter()

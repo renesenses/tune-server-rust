@@ -115,6 +115,37 @@ async fn playing_zone_ids(playback: &tune_core::playback::PlaybackManager) -> Ve
         .collect()
 }
 
+/// Les zones qui retiennent la relance, NOMMÉES, et sous la forme que
+/// l'interface peut afficher telle quelle.
+///
+/// Le journal les nomme depuis #2954 (`update_deferred_playback_in_progress
+/// zones=[…]`). La réponse rendue à l'appelant, elle, ne portait qu'un motif
+/// `playback_in_progress` et une phrase générique — l'utilisateur voyait un
+/// refus sans sujet.
+///
+/// Tades (#3581) ne pouvait donc ni voir QUELLE zone prétendait jouer — sa
+/// Serenade était à l'arrêt — ni savoir qu'une sortie existait : `?force=true`
+/// est dans la route depuis #2976, et rien, dans la réponse, ne l'annonçait.
+/// #3155 a établi qu'aucun détecteur ne rattrape une zone locale figée ; tant
+/// que c'est vrai, le seul recours possible est de nommer la zone et de dire
+/// qu'on peut passer outre. La borne haute du report reste, elle, à deux
+/// heures.
+///
+/// Un nom introuvable en base ne fait pas échouer le refus : l'identifiant est
+/// rendu seul, ce qui vaut toujours mieux que rien.
+fn zones_qui_retiennent(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    ids: &[i64],
+) -> Vec<Value> {
+    let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    ids.iter()
+        .map(|id| {
+            let nom = repo.get(*id).ok().flatten().map(|z| z.name);
+            json!({ "id": id, "name": nom })
+        })
+        .collect()
+}
+
 /// Plafond du report de la relance. Passé ce délai on relance MALGRÉ une zone
 /// annoncée en lecture.
 ///
@@ -892,6 +923,299 @@ fn checker_for(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) 
     UpdateChecker::with_channel(update_channel(backend))
 }
 
+/// La clé où le vérificateur périodique dépose ce qu'il a TROUVÉ — jamais ce
+/// qu'il a fait, puisqu'il n'installe rien.
+///
+/// Distincte de `last_update_result`, qui porte le résultat de la DERNIÈRE
+/// installation appliquée : confondre les deux ferait passer une simple
+/// disponibilité pour une mise à jour effectuée.
+pub(crate) const CLE_MISE_A_JOUR_DISPONIBLE: &str = "update_available_release";
+
+/// Délai avant le premier contrôle après le démarrage.
+///
+/// La boucle ne part pas au tour zéro : le démarrage a déjà de quoi faire, et
+/// surtout une machine qui redémarre en boucle (unité systemd `Restart=always`
+/// devant un défaut de configuration) taperait l'API des releases à chaque
+/// relance. Deux minutes suffisent à sortir de cette fenêtre-là.
+const DELAI_PREMIER_CONTROLE: Duration = Duration::from_secs(120);
+
+/// L'annonce déposée en base quand une version plus récente existe.
+///
+/// Fonction pure, pour que ce que l'écran lira soit éprouvable sans réseau.
+fn annonce_de_release(current: &str, release: &ReleaseInfo, channel: UpdateChannel) -> Value {
+    let (setting, effective) = channel_fields(channel, current);
+    json!({
+        "current": current,
+        "latest": release.version,
+        "tag_name": release.tag_name,
+        "name": release.name,
+        "published_at": release.published_at,
+        "html_url": release.html_url,
+        "channel": setting,
+        "effective_channel": effective,
+        "checked_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    })
+}
+
+/// Un tour du vérificateur périodique : interroger, consigner, et RIEN d'autre.
+///
+/// Le canal est relu À CHAQUE TOUR, par `checker_for` — le même point unique
+/// que les deux routes. Le lire une fois au lancement rendrait le réglage
+/// `update_channel` inopérant jusqu'au prochain redémarrage : quelqu'un qui
+/// passe de `beta` à `stable` doit être entendu au tour suivant, pas au
+/// prochain démarrage.
+///
+/// Une erreur réseau NE TOUCHE PAS l'annonce déjà déposée : une coupure de
+/// liaison n'est pas la preuve qu'une version a disparu.
+async fn tour_de_verification(state: &AppState) {
+    let current = tune_core::version();
+    let channel = update_channel(&state.backend);
+    let checker = checker_for(&state.backend);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    match checker.check().await {
+        Ok(Some(release)) => {
+            let annonce = annonce_de_release(current, &release, channel);
+            if let Err(e) = settings.set(CLE_MISE_A_JOUR_DISPONIBLE, &annonce.to_string()) {
+                warn!(error = %e, "update_available_write_failed");
+            }
+            info!(
+                version = %release.version,
+                current,
+                channel = channel.as_str(),
+                "update_available"
+            );
+        }
+        // Plus rien à annoncer : la version installée est à jour, ou l'annonce
+        // précédente portait une version que le canal ne propose plus. Effacer
+        // évite qu'un écran garde éternellement un point rouge périmé.
+        Ok(None) => {
+            let _ = settings.delete(CLE_MISE_A_JOUR_DISPONIBLE);
+        }
+        Err(e) => {
+            warn!(error = %e, "update_check_failed");
+        }
+    }
+}
+
+/// #3217 — le vérificateur périodique de mises à jour, enfin LANCÉ.
+///
+/// ## Ce qui était en place, et ce qui ne l'était pas
+///
+/// `TUNE_AUTO_UPDATE` était déclaré (`config.rs:130`), par défaut à `false`
+/// (`config.rs:220`) et réglable par l'environnement (`config.rs:299`) — et lu
+/// NULLE PART. En face, `UpdateChecker::spawn_periodic` avait une seule
+/// occurrence dans tout le dépôt : sa propre définition. Poser
+/// `TUNE_AUTO_UPDATE=true` dans une unité systemd ou un `docker-compose`
+/// n'obtenait rien, sans un mot au journal.
+///
+/// ## Pourquoi il NOTIFIE et n'installe pas
+///
+/// La garde anti-coupure de la route d'installation (#2954) repose sur une
+/// prémisse écrite noir sur blanc en tête de ce fichier : « toute installation est
+/// aujourd'hui un geste délibéré ». Celui qui ne passe pas `?force=true` n'a
+/// pas été prévenu de ce qu'il s'apprête à interrompre — l'écran, lui, prévient
+/// puis force. Un vérificateur qui installerait tout seul n'est prévenu par
+/// personne : il n'a pas d'interface pour avertir, et il ne peut pas dire
+/// `force` de bonne foi. Le souvenir du 10/08/2026 sur le .18 est dans le même
+/// commentaire : six mises à jour en une journée, deux qui ont ré-exécuté
+/// pendant que la zone 12 diffusait.
+///
+/// Ce lanceur ne touche donc à aucun chemin d'installation. Il interroge,
+/// journalise `update_available` et dépose l'annonce sous
+/// [`CLE_MISE_A_JOUR_DISPONIBLE`], que `GET /system/update/status` rend. Le
+/// geste d'installation reste entier, délibéré, et la garde de #2954 garde
+/// exactement ce qu'elle gardait. Une garde de site le tient
+/// (`le_verificateur_periodique_n_installe_rien`).
+///
+/// ## Ce que le réglage veut dire désormais
+///
+/// `TUNE_AUTO_UPDATE=true` = « préviens-moi quand une version paraît ». C'est
+/// moins que ce que le nom promet, et c'est délibéré : passer à l'installation
+/// automatique demanderait de rouvrir la garde anti-coupure, ce qui est un
+/// arbitrage de Bertrand et non une décision d'implémentation.
+pub(crate) fn spawn_verificateur_de_mise_a_jour(state: AppState, auto_update: bool) {
+    if !auto_update {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(DELAI_PREMIER_CONTROLE).await;
+        let cadence = Duration::from_secs(tune_core::updater::CHECK_INTERVAL_SECS);
+        loop {
+            tour_de_verification(&state).await;
+            tokio::time::sleep(cadence).await;
+        }
+    });
+}
+
+/// Câblage et portée du vérificateur périodique (#3217).
+///
+/// Ce qui a été perdu pendant des mois, c'est un APPEL — pas une logique :
+/// `spawn_periodic` était écrit, complet, et personne ne le lançait. Aucun test
+/// de comportement ne pouvait le voir : ils passaient tous sans que la boucle
+/// tourne jamais. Même procédé que `scan_scheduler_cablage_tests`, pour la
+/// même raison.
+#[cfg(test)]
+mod verificateur_periodique_cablage {
+    use super::*;
+
+    /// Le seul endroit qui lance les passes de fond doit porter l'appel, et lui
+    /// passer `config.auto_update` — sans quoi `TUNE_AUTO_UPDATE` redevient un
+    /// réglage accepté et sans effet.
+    #[test]
+    fn le_verificateur_periodique_est_lance_au_demarrage() {
+        let background = include_str!("../../background.rs");
+        // Témoin : si `include_str!` pointait sur un fichier vide ou faux,
+        // l'assertion suivante échouerait pour la mauvaise raison.
+        assert!(
+            background.contains("pub async fn spawn_background_tasks"),
+            "témoin : le fichier lu doit être celui qui câble les passes de fond"
+        );
+        // Espaces normalisés : l'appel dépasse la largeur de `rustfmt`, qui le
+        // replie sur trois lignes. Un garde qui exigerait la ligne d'un seul
+        // tenant tomberait au premier `cargo fmt`, pour rien.
+        let serre: String = background.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            serre.contains(
+                "update::spawn_verificateur_de_mise_a_jour( state.clone(), config.auto_update, );"
+            ) || serre.contains(
+                "update::spawn_verificateur_de_mise_a_jour(state.clone(), config.auto_update);"
+            ),
+            "spawn_verificateur_de_mise_a_jour doit être appelé depuis \
+             background.rs, en lui passant `config.auto_update` — sans cet \
+             appel, `TUNE_AUTO_UPDATE` est de nouveau sans effet (#3217)"
+        );
+    }
+
+    /// 🔴 Le réglage doit être lu par la configuration que le serveur CHARGE.
+    ///
+    /// Il y a deux `TuneConfig` dans ce dépôt. `TUNE_AUTO_UPDATE` n'était lu
+    /// que par celle de `tune-core`, dont `from_env()` n'a aucun appelant : le
+    /// drapeau n'était donc pas seulement ignoré, il était déclaré dans une
+    /// configuration que rien ne construit. Celle qui atteint
+    /// `spawn_background_tasks` est `tune_server::config::TuneConfig`, et c'est
+    /// elle que ce test lit.
+    #[test]
+    fn le_reglage_est_lu_par_la_configuration_du_serveur() {
+        let config = include_str!("../../config.rs");
+        assert!(
+            config.contains("pub fn load() -> Self"),
+            "témoin : le fichier lu doit être celui que le serveur charge"
+        );
+        assert!(
+            config.contains("pub auto_update: bool"),
+            "`auto_update` doit être un champ de la TuneConfig du serveur (#3217)"
+        );
+        let serre: String = config.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            serre.contains(
+                "std::env::var(\"TUNE_AUTO_UPDATE\") { config.auto_update = v == \"true\";"
+            ),
+            "TUNE_AUTO_UPDATE doit être lu par `TuneConfig::load` — sans cela le \
+             réglage reste accepté et sans effet (#3217)"
+        );
+    }
+
+    /// 🔴 Garde de site : le vérificateur périodique n'installe RIEN.
+    ///
+    /// La garde anti-coupure de #2954 se justifie par « toute installation est
+    /// un geste délibéré ». Un tour de vérification qui appellerait un chemin
+    /// d'installation ferait tomber cette prémisse, et rouvrirait les
+    /// micro-coupures du 10/08/2026 — cette fois sans personne devant l'écran.
+    /// Brancher l'installation automatique est un arbitrage, pas une retouche :
+    /// il doit rougir ici avant d'être livré.
+    #[test]
+    fn le_verificateur_periodique_n_installe_rien() {
+        let source = include_str!("update.rs");
+        let debut = source
+            .find("async fn tour_de_verification")
+            .expect("témoin : `tour_de_verification` doit exister dans ce fichier");
+        let fin = source[debut..]
+            .find("\n/// Câblage et portée du vérificateur périodique")
+            .map(|f| debut + f)
+            .expect("témoin : la borne de fin du bloc doit exister");
+        let bloc = &source[debut..fin];
+        assert!(
+            bloc.contains("spawn_verificateur_de_mise_a_jour"),
+            "témoin : le bloc lu doit contenir le lanceur — {} octets",
+            bloc.len()
+        );
+        for interdit in [
+            "update_install",
+            "install_unix",
+            "install_windows",
+            "update_apply",
+            "defer_restart_until_quiet",
+        ] {
+            assert!(
+                !bloc.contains(interdit),
+                "le vérificateur périodique appelle `{interdit}` : il installerait \
+                 sans que personne ait été prévenu, et la garde anti-coupure de \
+                 #2954 repose sur le contraire (#3217)"
+            );
+        }
+    }
+
+    /// 🔴 L'annonce doit être LUE quelque part.
+    ///
+    /// Une notification déposée en base qu'aucune route ne rend serait le
+    /// défaut « écrit mais pas branché » à l'autre bout : le vérificateur
+    /// tournerait, l'écran ne verrait rien, et `TUNE_AUTO_UPDATE` resterait
+    /// aussi muet qu'avant. `GET /system/update/status` est le point de lecture.
+    #[test]
+    fn l_annonce_est_rendue_par_la_route_de_statut() {
+        let source = include_str!("update.rs");
+        let debut = source
+            .find("pub(super) async fn update_status")
+            .expect("témoin : `update_status` doit exister dans ce fichier");
+        let fin = source[debut..]
+            .find("\n/// Compare the version an in-progress update")
+            .map(|f| debut + f)
+            .expect("témoin : la borne de fin de la route doit exister");
+        let bloc = &source[debut..fin];
+        assert!(
+            bloc.contains("CLE_MISE_A_JOUR_DISPONIBLE"),
+            "`update_status` doit relire la clé du vérificateur périodique (#3217)"
+        );
+        assert!(
+            bloc.contains("\"available_update\": available_update"),
+            "`update_status` doit RENDRE l'annonce, pas seulement la lire (#3217)"
+        );
+    }
+
+    /// L'annonce déposée porte de quoi décider : la version, le canal qui l'a
+    /// choisie, et la date du contrôle.
+    #[test]
+    fn l_annonce_dit_la_version_le_canal_et_la_date() {
+        let release = ReleaseInfo {
+            tag_name: "v0.9.141".into(),
+            version: "0.9.141".into(),
+            name: "Tune 0.9.141".into(),
+            body: String::new(),
+            published_at: "2026-09-06T10:00:00Z".into(),
+            html_url: "https://example.invalid/releases/v0.9.141".into(),
+            assets: Vec::new(),
+        };
+        let annonce = annonce_de_release("0.9.140", &release, UpdateChannel::Stable);
+        assert_eq!(annonce["current"], "0.9.140");
+        assert_eq!(annonce["latest"], "0.9.141");
+        assert_eq!(annonce["tag_name"], "v0.9.141");
+        assert_eq!(annonce["channel"], "stable");
+        assert_eq!(annonce["effective_channel"], "stable");
+        assert!(
+            annonce["checked_at"].as_u64().unwrap_or(0) > 1_700_000_000,
+            "la date du contrôle doit être un horodatage réel : {annonce}"
+        );
+        // Le canal `auto` doit sortir RÉSOLU, sans quoi un écran affichant
+        // « auto » ne dit pas à l'utilisateur ce qu'il va recevoir.
+        let auto = annonce_de_release("0.9.140-rc2", &release, UpdateChannel::Auto);
+        assert_eq!(auto["channel"], "auto");
+        assert_eq!(auto["effective_channel"], "beta");
+    }
+}
+
 /// Les deux champs que toute réponse de `/update/check` porte désormais :
 /// le réglage tel qu'il est enregistré, et le canal EFFECTIF une fois `auto`
 /// résolu contre le binaire en cours. Sans le second, un écran affichant
@@ -1187,12 +1511,18 @@ pub(super) async fn update_install(
     // qu'une zone joue — la contention est exactement le terrain des coupures
     // signalées dans le même fil (#2952).
     if !force && !playing.is_empty() {
+        let zones = zones_qui_retiennent(&state.backend, &playing);
         warn!(zones = ?playing, "update_deferred_playback_in_progress");
         return (
             StatusCode::CONFLICT,
             Json(json!({
                 "status": "blocked",
                 "reason": "playback_in_progress",
+                // Ce que le journal savait déjà et que l'appelant n'avait pas :
+                // QUI retient, et qu'il existe une sortie (#3581).
+                "zones": zones,
+                "force_available": true,
+                "force_hint": "POST /system/update/install?force=true",
                 "message": "Update deferred: music is playing and installing it would stop playback. It will be applied automatically once playback stops."
             })),
         )
@@ -2041,8 +2371,20 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
     // record_post_update_result). Lets the UI surface a silent swap failure —
     // e.g. Windows came back on the old binary — instead of the update just
     // looking like it did nothing.
-    let last_update_result = SettingsRepo::with_backend(state.backend.clone())
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let last_update_result = settings
         .get("last_update_result")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    // #3217 — ce que le vérificateur périodique a TROUVÉ, s'il tourne. C'est
+    // l'autre moitié de `TUNE_AUTO_UPDATE` : sans un endroit où la lire,
+    // l'annonce déposée en base serait « écrite mais pas branchée ». `null`
+    // quand le réglage est à `false`, quand aucun tour n'a encore eu lieu, ou
+    // quand la version installée est déjà la dernière du canal.
+    let available_update = settings
+        .get(CLE_MISE_A_JOUR_DISPONIBLE)
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
@@ -2052,6 +2394,7 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
         "phase": phase,
         "update_in_progress": phase.is_some() && !is_failed,
         "last_update_result": last_update_result,
+        "available_update": available_update,
     }))
 }
 
@@ -2179,46 +2522,214 @@ pub(super) async fn update_apply() -> impl IntoResponse {
     }))
 }
 
-/// GET /system/changelog — fetch from GitHub releases, cache 1 hour.
-pub(super) async fn changelog() -> Json<Value> {
+/// Paramètres de `GET /system/changelog`. Le client envoie aussi `limit`, que
+/// la route n'a jamais lu ; serde l'ignore, comme avant.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(super) struct ChangelogQuery {
+    /// Langue demandée explicitement (`?lang=en`). Sinon `Accept-Language`.
+    pub lang: Option<String>,
+}
+
+/// GET /system/changelog — notes de version depuis les releases GitHub, dans
+/// la langue demandée, cache 1 heure.
+///
+/// La langue vient de [`crate::i18n::lang_from_request`] : `?lang=` explicite,
+/// sinon `Accept-Language`, sinon `fr` (#3089). Les notes sont traduites À LA
+/// PUBLICATION — un bloc par langue dans le corps de la release, cf.
+/// [`blocs_par_langue`] — et la route sert le bloc de la langue demandée, ou
+/// le français en repli, en le DISANT : `lang` est la langue effectivement
+/// servie, `fallback` vaut `true` dès qu'au moins une entrée n'a pas pu être
+/// servie dans la langue demandée. Chaque entrée porte aussi ses propres
+/// `lang`/`fallback`, car une release ancienne (français seul) peut côtoyer
+/// une release traduite dans la même liste.
+///
+/// Le cache mémorise les releases BRUTES, pas une réponse rendue : la
+/// dérivation par langue est un découpage de texte, sans réseau, refait à
+/// chaque appel. Un cache de réponses aurait dû être indexé par langue, sans
+/// quoi le premier appelant fixait la langue de tous les autres pendant une
+/// heure (piège nommé dans l'arbitrage de #3089).
+pub(super) async fn changelog(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ChangelogQuery>,
+) -> Json<Value> {
     use std::sync::OnceLock;
     use tokio::sync::Mutex;
 
-    static CACHE: OnceLock<Mutex<(std::time::Instant, Value)>> = OnceLock::new();
+    let lang = crate::i18n::base_tag(&crate::i18n::lang_from_request(q.lang.as_deref(), &headers));
+
+    static CACHE: OnceLock<Mutex<(std::time::Instant, Vec<Value>)>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| {
         Mutex::new((
             std::time::Instant::now() - std::time::Duration::from_secs(7200),
-            json!([]),
+            Vec::new(),
         ))
     });
     let mut guard = cache.lock().await;
 
-    if guard.0.elapsed() < std::time::Duration::from_secs(3600)
-        && guard.1.as_array().is_some_and(|a| !a.is_empty())
-    {
-        return Json(json!({ "version": tune_core::version(), "entries": guard.1 }));
-    }
-
-    let entries = match fetch_github_changelog().await {
-        Ok(e) => {
-            *guard = (std::time::Instant::now(), e.clone());
-            e
-        }
-        Err(_) => guard.1.clone(),
-    };
+    let releases =
+        if guard.0.elapsed() < std::time::Duration::from_secs(3600) && !guard.1.is_empty() {
+            guard.1.clone()
+        } else {
+            match fetch_github_releases().await {
+                Ok(r) => {
+                    *guard = (std::time::Instant::now(), r.clone());
+                    r
+                }
+                Err(_) => guard.1.clone(),
+            }
+        };
     drop(guard);
 
-    // Le cache démarre à `json!([])`. Sur un serveur fraîchement lancé et sans
-    // réseau, les deux branches ci-dessus rendent donc un tableau VIDE, et le
-    // panneau « Quoi de neuf » s'affiche désert — ce qui se lit non pas comme
-    // « je n'ai pas pu joindre la source » mais comme « cette version
-    // n'apporte rien ». Le repli en dur existait depuis toujours pour ce cas ;
-    // il n'était simplement jamais appelé.
-    if entries.as_array().is_none_or(|a| a.is_empty()) {
-        return changelog_hardcoded();
+    // Le cache démarre vide. Sur un serveur fraîchement lancé et sans réseau,
+    // les deux branches ci-dessus rendent donc une liste VIDE, et le panneau
+    // « Quoi de neuf » s'affiche désert — ce qui se lit non pas comme « je
+    // n'ai pas pu joindre la source » mais comme « cette version n'apporte
+    // rien ». Le repli en dur existait depuis toujours pour ce cas ; il
+    // n'était simplement jamais appelé.
+    if releases.is_empty() {
+        return changelog_hardcoded(&lang);
     }
 
-    Json(json!({ "version": tune_core::version(), "entries": entries }))
+    let NotesServies {
+        entries,
+        lang: servie,
+        fallback,
+    } = entrees_pour_langue(&releases, &lang);
+    Json(json!({
+        "version": tune_core::version(),
+        "lang": servie,
+        "fallback": fallback,
+        "entries": entries,
+    }))
+}
+
+/// Marqueur ouvrant un bloc de langue dans un corps de release :
+/// `<!-- lang:en -->`, seul sur sa ligne. Rend la base de l'étiquette, ou
+/// `None` si la ligne n'est pas un marqueur.
+fn marqueur_de_langue(line: &str) -> Option<String> {
+    let inner = line
+        .trim()
+        .strip_prefix("<!--")?
+        .strip_suffix("-->")?
+        .trim()
+        .strip_prefix("lang:")?;
+    let tag = crate::i18n::base_tag(inner);
+    (!tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphabetic())).then_some(tag)
+}
+
+/// Découpe un corps de release en blocs `(langue, texte)`, dans l'ordre.
+///
+/// Format de publication multilingue (docs/RELEASE-WORKFLOW.md, « Notes de
+/// version multilingues ») : le français d'abord, tel qu'il a toujours été
+/// écrit, puis un bloc par traduction, chacun ouvert par un commentaire HTML
+/// `<!-- lang:xx -->` seul sur sa ligne. Le commentaire est invisible sur la
+/// page GitHub et traverse le proxy `mozaiklabs.fr` comme n'importe quel
+/// texte : rien à télécharger de plus, rien à parser de plus qu'un corps.
+///
+/// Compatibilité : une release ANCIENNE n'a aucun marqueur — tout son corps
+/// est le bloc `fr`. Un préambule sans marqueur est de même le bloc `fr`, et
+/// un `<!-- lang:fr -->` explicite est accepté. Un bloc vide (marqueur laissé
+/// sans texte) est ignoré : il ne « couvre » pas la langue, elle repliera.
+fn blocs_par_langue(body: &str) -> Vec<(String, String)> {
+    let mut blocs: Vec<(String, String)> = Vec::new();
+    let mut courant = String::from("fr");
+    let mut texte = String::new();
+    let clore = |lang: &str, texte: &mut String, blocs: &mut Vec<(String, String)>| {
+        if texte.trim().is_empty() {
+            texte.clear();
+        } else {
+            blocs.push((lang.to_string(), std::mem::take(texte)));
+        }
+    };
+    for line in body.lines() {
+        if let Some(lang) = marqueur_de_langue(line) {
+            clore(&courant, &mut texte, &mut blocs);
+            courant = lang;
+            continue;
+        }
+        texte.push_str(line);
+        texte.push('\n');
+    }
+    clore(&courant, &mut texte, &mut blocs);
+    blocs
+}
+
+/// Le texte des notes à servir pour `lang`, avec la langue effectivement
+/// servie et le drapeau de repli. Cherche d'abord le bloc de la langue
+/// demandée, puis le bloc `fr` ; sans aucun des deux (corps vide, ou notes
+/// publiées sans français — cas non prévu par le format), rend le corps
+/// entier, étiqueté `fr` et en repli.
+fn notes_dans_la_langue(body: &str, lang: &str) -> (String, String, bool) {
+    let blocs = blocs_par_langue(body);
+    if let Some((_, texte)) = blocs.iter().find(|(l, _)| l == lang) {
+        return (texte.clone(), lang.to_string(), false);
+    }
+    if let Some((_, texte)) = blocs.iter().find(|(l, _)| l == "fr") {
+        return (texte.clone(), "fr".to_string(), lang != "fr");
+    }
+    (body.to_string(), "fr".to_string(), lang != "fr")
+}
+
+/// Ce que la route rend pour une langue : les entrées, la langue servie et le
+/// drapeau de repli agrégé.
+struct NotesServies {
+    entries: Vec<Value>,
+    /// La langue demandée si au moins une entrée est servie dedans, sinon
+    /// `fr` : c'est ce que le panneau affiche majoritairement.
+    lang: String,
+    /// `true` dès qu'une entrée n'a pas pu être servie dans la langue
+    /// demandée — le client peut alors dire « notes en français ».
+    fallback: bool,
+}
+
+/// Dérive les entrées du panneau depuis les releases brutes, pour `lang`.
+/// Sans réseau : c'est la partie testable de la route.
+fn entrees_pour_langue(releases: &[Value], lang: &str) -> NotesServies {
+    let mut fallback = false;
+    let mut une_dans_la_langue = false;
+    let entries: Vec<Value> = releases
+        .iter()
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?;
+            let version = tag.strip_prefix('v').unwrap_or(tag);
+            let date = r["published_at"]
+                .as_str()
+                .unwrap_or("")
+                .split('T')
+                .next()
+                .unwrap_or("");
+            let body = r["body"].as_str().unwrap_or("");
+            let (texte, servie, repli) = notes_dans_la_langue(body, lang);
+            fallback |= repli;
+            une_dans_la_langue |= !repli;
+            let ParsedBody {
+                mut features,
+                fixes,
+                improvements,
+            } = parse_release_body(&texte);
+            if features.is_empty() && fixes.is_empty() && improvements.is_empty() {
+                features.push(format!("Release {version}"));
+            }
+            Some(json!({
+                "version": version,
+                "date": date,
+                "lang": servie,
+                "fallback": repli,
+                "features": features,
+                "fixes": fixes,
+                "improvements": improvements,
+            }))
+        })
+        .collect();
+    NotesServies {
+        entries,
+        lang: if une_dans_la_langue {
+            lang.to_string()
+        } else {
+            "fr".to_string()
+        },
+        fallback,
+    }
 }
 
 /// Les trois listes du panneau « Quoi de neuf », telles qu'il les attend.
@@ -2241,14 +2752,79 @@ enum Section {
     Other,
 }
 
-/// Classe un intitulé (titre de section) par mots-clés, FR et EN.
+/// Mots-clés de titre, par rubrique, dans les dix langues de l'interface
+/// (`crate::i18n::SUPPORTED`). Le format de publication multilingue
+/// (docs/RELEASE-WORKFLOW.md, « Notes de version multilingues ») impose aux
+/// blocs traduits les titres que cette table reconnaît : rédacteur et lecteur
+/// partagent la même liste, sinon les puces d'un bloc allemand tomberaient en
+/// `Other` et le panneau afficherait « Release x.y.z » à la place des notes.
+/// Comparaison en minuscules, par sous-chaîne, dans l'ordre : corrections,
+/// puis améliorations, puis nouveautés.
+const TITRES_CORRECTIONS: &[&str] = &[
+    "correct",
+    "fix",
+    "bug", // fr, en (et « Buggfixar » sv)
+    "korrektur",
+    "fehler",
+    "behoben", // de
+    "correc",
+    "correz",
+    "corect",
+    "remed", // es, it, ro
+    "rätt",
+    "ratt", // sv
+    "修复",
+    "修正",
+    "수정", // zh, ja, ko
+];
+const TITRES_AMELIORATIONS: &[&str] = &[
+    "amélio",
+    "ameli",
+    "improv", // fr, en
+    "verbesser",
+    "mejor",
+    "miglior", // de, es, it
+    "îmbunăt",
+    "imbunat",
+    "förbättr",
+    "forbattr", // ro, sv
+    "改进",
+    "优化",
+    "改善",
+    "개선", // zh, ja, ko
+];
+const TITRES_NOUVEAUTES: &[&str] = &[
+    "nouveaut",
+    "feature",
+    "ajout", // fr, en
+    "neuheit",
+    "neuerung",
+    "neue funktion", // de
+    "noved",
+    "nuevas func",
+    "novit",
+    "nuove", // es, it
+    "noutăț",
+    "noutat",
+    "nyhet",
+    "nya funktion", // ro, sv
+    "新功能",
+    "新增",
+    "新機能",
+    "새로운 기능",
+    "신규", // zh, ja, ko
+];
+
+/// Classe un intitulé (titre de section) par mots-clés, dans les dix langues
+/// de l'interface.
 fn section_from_title(title: &str) -> Section {
     let l = title.to_lowercase();
-    if l.contains("correct") || l.contains("fix") || l.contains("bug") {
+    let contient = |mots: &[&str]| mots.iter().any(|m| l.contains(m));
+    if contient(TITRES_CORRECTIONS) {
         Section::Fixes
-    } else if l.contains("amélio") || l.contains("ameli") || l.contains("improv") {
+    } else if contient(TITRES_AMELIORATIONS) {
         Section::Improvements
-    } else if l.contains("nouveaut") || l.contains("feature") || l.contains("ajout") {
+    } else if contient(TITRES_NOUVEAUTES) {
         Section::Features
     } else {
         Section::Other
@@ -2354,7 +2930,10 @@ fn parse_release_body(body: &str) -> ParsedBody {
     out
 }
 
-async fn fetch_github_changelog() -> Result<Value, String> {
+/// Les releases GitHub BRUTES (JSON de l'API, 20 dernières), via le proxy
+/// `mozaiklabs.fr` puis GitHub. La dérivation en entrées du panneau, par
+/// langue, est faite par [`entrees_pour_langue`] — hors réseau, donc testable.
+async fn fetch_github_releases() -> Result<Vec<Value>, String> {
     let client = tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .user_agent("Tune/2.0")
@@ -2390,36 +2969,7 @@ async fn fetch_github_changelog() -> Result<Value, String> {
             resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())?
         }
     };
-    let entries: Vec<Value> = releases
-        .iter()
-        .filter_map(|r| {
-            let tag = r["tag_name"].as_str()?;
-            let version = tag.strip_prefix('v').unwrap_or(tag);
-            let date = r["published_at"]
-                .as_str()
-                .unwrap_or("")
-                .split('T')
-                .next()
-                .unwrap_or("");
-            let body = r["body"].as_str().unwrap_or("");
-            let ParsedBody {
-                mut features,
-                fixes,
-                improvements,
-            } = parse_release_body(body);
-            if features.is_empty() && fixes.is_empty() && improvements.is_empty() {
-                features.push(format!("Release {version}"));
-            }
-            Some(json!({
-                "version": version,
-                "date": date,
-                "features": features,
-                "fixes": fixes,
-                "improvements": improvements,
-            }))
-        })
-        .collect();
-    Ok(json!(entries))
+    Ok(releases)
 }
 
 /// Dernier recours quand la source distante est injoignable ET que le cache
@@ -2431,9 +2981,14 @@ async fn fetch_github_changelog() -> Result<Value, String> {
 /// Ces notes sont figées et ne suivent pas les releases : elles valent mieux
 /// qu'un panneau vide, pas mieux que les vraies notes. Chaque entrée porte sa
 /// version et sa date, donc rien n'est présenté comme récent à tort.
-fn changelog_hardcoded() -> Json<Value> {
+///
+/// Ces notes n'existent qu'en français : `lang` le dit, et `fallback` vaut
+/// `true` dès que la langue demandée n'est pas `fr` (#3089).
+fn changelog_hardcoded(lang: &str) -> Json<Value> {
     Json(json!({
         "version": tune_core::version(),
+        "lang": "fr",
+        "fallback": lang != "fr",
         // Dit au client que ces notes sont un secours, pas l'actualité du
         // produit. Sans ce drapeau, le panneau badge sa première entrée
         // « Récent » — soit « v0.8.15 » annoncée comme la version en cours sur
@@ -3433,7 +3988,7 @@ mod changelog_fallback_tests {
     /// précisément le moment où le repli sert.
     #[test]
     fn le_repli_satisfait_le_contrat_du_panneau() {
-        let body = changelog_hardcoded().0;
+        let body = changelog_hardcoded("fr").0;
         let entries = body["entries"]
             .as_array()
             .expect("le repli doit exposer un tableau `entries`");
@@ -3453,7 +4008,7 @@ mod changelog_fallback_tests {
     /// S'il disparaît, le panneau rebadge « Récent » sur une entrée de juin.
     #[test]
     fn le_repli_sannonce_comme_tel() {
-        let body = changelog_hardcoded().0;
+        let body = changelog_hardcoded("fr").0;
         assert_eq!(
             body["offline"],
             serde_json::json!(true),
@@ -3466,7 +4021,7 @@ mod changelog_fallback_tests {
     /// ligne muette dans le panneau — le défaut même qu'on corrige.
     #[test]
     fn chaque_entree_du_repli_est_affichable() {
-        let body = changelog_hardcoded().0;
+        let body = changelog_hardcoded("fr").0;
         for e in body["entries"].as_array().unwrap() {
             let v = e["version"].as_str().unwrap_or("");
             assert!(!v.is_empty(), "entrée sans version : {e}");
@@ -3482,5 +4037,265 @@ mod changelog_fallback_tests {
                 "version {v} : rubriques vides, la ligne serait muette"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod changelog_lang_tests {
+    //! #3089 — les notes de version sont traduites À LA PUBLICATION, un bloc
+    //! par langue dans le corps de la release ; la route sert la langue
+    //! demandée, ou le français en le disant. Aucun réseau : on part des
+    //! releases brutes telles que l'API les rend.
+    use super::{
+        Section, blocs_par_langue, changelog_hardcoded, entrees_pour_langue, section_from_title,
+    };
+    use serde_json::{Value, json};
+
+    /// Corps publié selon le format multilingue : français d'abord, sans
+    /// marqueur, puis un bloc anglais.
+    const CORPS_TRADUIT: &str = "\
+## Nouveautés
+- Recherche dans un serveur UPnP
+## Corrections
+- Pochette erronée dans les compilations
+
+<!-- lang:en -->
+## Features
+- Search inside a UPnP server
+## Bug fixes
+- Wrong cover art in compilations
+";
+
+    /// Corps d'une release ANCIENNE : français seul, aucun marqueur.
+    const CORPS_ANCIEN: &str = "\
+## Corrections
+- Lecture qui s'arrêtait au premier morceau
+";
+
+    fn release(tag: &str, body: &str) -> Value {
+        json!({ "tag_name": tag, "published_at": "2026-09-06T19:06:57Z", "body": body })
+    }
+
+    #[test]
+    fn langue_demandee_presente_elle_est_servie() {
+        let r = [release("v0.9.141", CORPS_TRADUIT)];
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "en");
+        assert!(
+            !n.fallback,
+            "la langue demandée existe : aucun repli à déclarer"
+        );
+        let e = &n.entries[0];
+        assert_eq!(e["lang"], json!("en"));
+        assert_eq!(e["fallback"], json!(false));
+        assert_eq!(e["features"], json!(["Search inside a UPnP server"]));
+        assert_eq!(e["fixes"], json!(["Wrong cover art in compilations"]));
+        // Le bloc français ne fuit pas dans la réponse anglaise.
+        assert!(
+            !e.to_string().contains("Pochette"),
+            "le bloc français a fui dans la réponse anglaise : {e}"
+        );
+    }
+
+    #[test]
+    fn langue_absente_repli_francais_declare() {
+        let r = [release("v0.9.141", CORPS_TRADUIT)];
+        let n = entrees_pour_langue(&r, "de");
+        assert_eq!(
+            n.lang, "fr",
+            "sans bloc allemand, c'est le français qui est servi"
+        );
+        assert!(n.fallback, "le repli doit être DIT, pas silencieux");
+        let e = &n.entries[0];
+        assert_eq!(e["lang"], json!("fr"));
+        assert_eq!(e["fallback"], json!(true));
+        assert_eq!(e["features"], json!(["Recherche dans un serveur UPnP"]));
+        assert!(
+            !e.to_string().contains("Search inside"),
+            "le bloc anglais a été servi à un appel allemand : {e}"
+        );
+    }
+
+    #[test]
+    fn release_ancienne_sans_marqueur_reste_francaise() {
+        let r = [release("v0.9.129", CORPS_ANCIEN)];
+        // Demandée en français : servie telle quelle, sans repli.
+        let n = entrees_pour_langue(&r, "fr");
+        assert_eq!(n.lang, "fr");
+        assert!(!n.fallback);
+        assert_eq!(
+            n.entries[0]["fixes"],
+            json!(["Lecture qui s'arrêtait au premier morceau"])
+        );
+        // Demandée en anglais : même contenu, repli déclaré.
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "fr");
+        assert!(n.fallback);
+        assert_eq!(n.entries[0]["fallback"], json!(true));
+        assert_eq!(
+            n.entries[0]["fixes"],
+            json!(["Lecture qui s'arrêtait au premier morceau"])
+        );
+    }
+
+    #[test]
+    fn releases_traduites_et_anciennes_cohabitent() {
+        // Une liste réelle mêle des releases publiées avant et après le
+        // format : chaque entrée dit sa langue, l'agrégat dit le repli.
+        let r = [
+            release("v0.9.141", CORPS_TRADUIT),
+            release("v0.9.129", CORPS_ANCIEN),
+        ];
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "en", "au moins une entrée est en anglais");
+        assert!(
+            n.fallback,
+            "une entrée n'a pas pu l'être : le repli est déclaré"
+        );
+        assert_eq!(n.entries[0]["lang"], json!("en"));
+        assert_eq!(n.entries[0]["fallback"], json!(false));
+        assert_eq!(n.entries[1]["lang"], json!("fr"));
+        assert_eq!(n.entries[1]["fallback"], json!(true));
+    }
+
+    #[test]
+    fn le_marqueur_tolere_espaces_casse_et_region() {
+        let blocs =
+            blocs_par_langue("Préambule\n<!--lang:EN-GB-->\nBody\n<!--  lang: de  -->\nText\n");
+        let langues: Vec<&str> = blocs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(langues, ["fr", "en", "de"]);
+        assert_eq!(blocs[1].1.trim(), "Body");
+    }
+
+    #[test]
+    fn un_bloc_vide_ne_couvre_pas_sa_langue() {
+        // Un marqueur laissé sans texte (traduction oubliée) ne doit pas
+        // produire un panneau vide : la langue replie sur le français.
+        let r = [release(
+            "v0.9.141",
+            "## Corrections\n- Un correctif\n<!-- lang:en -->\n\n",
+        )];
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "fr");
+        assert!(n.fallback);
+        assert_eq!(n.entries[0]["fixes"], json!(["Un correctif"]));
+    }
+
+    #[test]
+    fn un_commentaire_html_quelconque_nest_pas_un_marqueur() {
+        // `<!-- generated by git-cliff -->` (pied de cliff.toml) et autres
+        // commentaires ne découpent rien.
+        let blocs = blocs_par_langue("## Corrections\n- x\n<!-- generated by git-cliff -->\n");
+        assert_eq!(blocs.len(), 1);
+        assert_eq!(blocs[0].0, "fr");
+    }
+
+    #[test]
+    fn les_titres_traduits_se_classent() {
+        for (titre, attendu) in [
+            ("Fehlerbehebungen", Section::Fixes),
+            ("Correcciones", Section::Fixes),
+            ("Correzioni", Section::Fixes),
+            ("Rättningar", Section::Fixes),
+            ("修复", Section::Fixes),
+            ("バグ修正", Section::Fixes),
+            ("버그 수정", Section::Fixes),
+            ("Verbesserungen", Section::Improvements),
+            ("Mejoras", Section::Improvements),
+            ("Miglioramenti", Section::Improvements),
+            ("Îmbunătățiri", Section::Improvements),
+            ("Förbättringar", Section::Improvements),
+            ("改进", Section::Improvements),
+            ("改善", Section::Improvements),
+            ("개선", Section::Improvements),
+            ("Neuheiten", Section::Features),
+            ("Novedades", Section::Features),
+            ("Novità", Section::Features),
+            ("Noutăți", Section::Features),
+            ("Nyheter", Section::Features),
+            ("新功能", Section::Features),
+            ("新機能", Section::Features),
+            ("새로운 기능", Section::Features),
+            // Inchangé : ce qui n'est pas une rubrique du panneau reste dehors.
+            ("Mise à jour", Section::Other),
+            ("Downloads", Section::Other),
+            ("Lecture", Section::Other),
+        ] {
+            assert!(
+                section_from_title(titre) == attendu,
+                "« {titre} » mal classé"
+            );
+        }
+    }
+
+    #[test]
+    fn le_repli_en_dur_dit_sa_langue() {
+        let fr = changelog_hardcoded("fr").0;
+        assert_eq!(fr["lang"], json!("fr"));
+        assert_eq!(fr["fallback"], json!(false));
+        let en = changelog_hardcoded("en").0;
+        assert_eq!(
+            en["lang"],
+            json!("fr"),
+            "le secours n'existe qu'en français"
+        );
+        assert_eq!(en["fallback"], json!(true));
+    }
+}
+
+/// #3581 — ce que le refus de mise à jour rend à l'appelant.
+#[cfg(test)]
+mod tests_zones_qui_retiennent {
+    use super::zones_qui_retiennent;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::zone_repo::ZoneRepo;
+
+    fn backend() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().expect("base en mémoire");
+        db.init_schema().expect("schéma");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        Arc::new(db)
+    }
+
+    /// Le refus doit NOMMER la zone. Tades voyait « playback_in_progress » et
+    /// rien d'autre : il ne pouvait pas savoir que c'était sa Serenade que le
+    /// serveur croyait en lecture.
+    #[test]
+    fn le_refus_nomme_la_zone_qui_retient() {
+        let b = backend();
+        let repo = ZoneRepo::with_backend(b.clone());
+        let id = repo
+            .create("Serenade", Some("dlna"), None)
+            .expect("création de zone");
+
+        let rendu = zones_qui_retiennent(&b, &[id]);
+
+        assert_eq!(rendu.len(), 1);
+        assert_eq!(rendu[0]["id"].as_i64(), Some(id));
+        assert_eq!(rendu[0]["name"].as_str(), Some("Serenade"));
+    }
+
+    /// Contre-épreuve : un identifiant sans zone en base ne fait pas échouer le
+    /// refus et ne fabrique pas de nom. L'identifiant seul vaut mieux que rien
+    /// — c'est exactement le cas d'une zone figée en mémoire dont la ligne a
+    /// disparu (#3155).
+    #[test]
+    fn un_identifiant_sans_zone_rend_un_nom_vide_sans_echouer() {
+        let b = backend();
+        let rendu = zones_qui_retiennent(&b, &[4242]);
+
+        assert_eq!(rendu.len(), 1);
+        assert_eq!(rendu[0]["id"].as_i64(), Some(4242));
+        assert!(rendu[0]["name"].is_null());
+    }
+
+    /// Aucune zone en lecture : rien à nommer. Une garde qui rendrait toujours
+    /// une entrée se lirait comme un refus permanent.
+    #[test]
+    fn sans_zone_en_lecture_il_n_y_a_rien_a_nommer() {
+        let b = backend();
+        assert!(zones_qui_retiennent(&b, &[]).is_empty());
     }
 }

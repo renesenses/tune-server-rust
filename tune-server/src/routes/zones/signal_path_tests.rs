@@ -1567,3 +1567,240 @@ fn replaygain_base_ancienne_retombe_sur_rg_analyzed() {
         Some("analysis")
     );
 }
+// ------------------------------------------------------------------
+// #3183 — le miroir lit les quirks du CATALOGUE, comme l'orchestrateur.
+//
+// Troisième ligne de l'écart n° 3 du ticket : la décision
+// (`resolve_local_track`) plafonne à 16 bits sur `dlna_cap_16bit` OU
+// `device_quirks.force_16bit` ; le miroir ne consultait que le drapeau de
+// zone. Sur un Ruark R3 (catalogue, `force_16bit`) et une source 24 bits,
+// l'orchestrateur transcodait pendant que ce panneau annonçait un
+// passthrough bit-perfect — le témoin qu'on demande aux testeurs de
+// photographier mentait. Même faute sur le plafond de fréquence, que
+// l'orchestrateur combine avec le catalogue (`combine_max_sample_rate`) et
+// que le miroir lisait sur la seule zone (écart n° 1 du ticket, côté panneau).
+//
+// Les épreuves « comme l'orchestrateur » confrontent le miroir à la VRAIE
+// décision, sur la même base, la même zone et la même piste : elles ne
+// rejouent pas la condition, elles la comparent au verdict de
+// `resolve_queue_item_url`.
+
+/// L'appareil que l'utilisateur a choisi pour la zone, écrit là où le chemin
+/// audio le lit (`device_catalog::resolve_zone_quirks`).
+fn choisir_l_appareil(backend: &Arc<dyn DbBackend>, zone_id: i64, marque: &str, modele: &str) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    settings
+        .set(&format!("zone_{zone_id}_brand"), marque)
+        .unwrap();
+    settings
+        .set(&format!("zone_{zone_id}_model"), modele)
+        .unwrap();
+}
+/// Un VRAI FLAC de la caisse, annoncé `sample_rate`/`bit_depth` en base (la
+/// base peut différer du fichier : c'est la décision prise sur l'annonce
+/// qu'on mesure, pas le décodage).
+fn piste_flac(backend: &Arc<dyn DbBackend>, sample_rate: i32, bit_depth: i32) -> i64 {
+    let chemin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tune-core/tests/fixtures/test.flac"
+    );
+    let mut t = tune_core::db::models::Track::new("Piste 3183".into());
+    t.duration_ms = 1_000;
+    t.file_path = Some(chemin.into());
+    t.format = Some("flac".into());
+    t.sample_rate = Some(sample_rate);
+    t.bit_depth = Some(bit_depth);
+    t.channels = 2;
+    t.file_size = std::fs::metadata(chemin).ok().map(|m| m.len() as i64);
+    t.source = "local".into();
+    tune_core::db::track_repo::TrackRepo::with_backend(backend.clone())
+        .create(&t)
+        .unwrap()
+}
+/// La décision de l'orchestrateur pour la piste, par sa porte publique, sur la
+/// MÊME base que le miroir. Aucune sortie ni service : la zone DLNA adresse un
+/// appareil inconnu du registre, réputé accepter tout MIME (comportement de
+/// production sans sonde).
+async fn decision(
+    backend: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    track_id: i64,
+) -> tune_core::orchestrator::ResolvedQueueItem {
+    tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(backend.clone())
+        .append(
+            zone_id,
+            &[tune_core::db::play_queue_repo::QueueInput::Local { track_id }],
+        )
+        .unwrap();
+    let orch = tune_core::orchestrator::PlaybackOrchestrator::new(
+        backend.clone(),
+        Arc::new(tune_core::playback::PlaybackManager::new()),
+        Arc::new(tune_core::http::streamer::AudioStreamer::new(0)),
+        Arc::new(tokio::sync::Mutex::new(
+            tune_core::streaming::registry::ServiceRegistry::new(),
+        )),
+        Arc::new(tokio::sync::Mutex::new(
+            tune_core::outputs::registry::OutputRegistry::new(),
+        )),
+        None,
+    );
+    orch.resolve_queue_item_url(zone_id, 0).await.unwrap()
+}
+/// La même piste vue par le panneau : en lecture, sans session de flux — le
+/// cas où le miroir n'a que les règles pour répondre.
+fn en_lecture(track_id: i64, format: &str, sample_rate: u32, bit_depth: u32) -> ZoneState {
+    ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            track_id: Some(track_id),
+            title: "Piste 3183".into(),
+            source: "local".into(),
+            format: Some(format.into()),
+            sample_rate: Some(sample_rate),
+            bit_depth: Some(bit_depth),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    }
+}
+fn verdict(sp: &Value) -> Option<bool> {
+    sp.get("bit_perfect").and_then(Value::as_bool)
+}
+/// Le plafond 16 bits du catalogue : la décision transcode en 16 bits, le
+/// panneau doit rendre le même verdict.
+#[tokio::test]
+async fn le_plafond_16_bits_du_catalogue_fait_tomber_le_verdict_comme_l_orchestrateur() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    choisir_l_appareil(&backend, zone_id, "Ruark Audio", "R3");
+    assert!(
+        !ZoneRepo::with_backend(backend.clone()).get_dlna_cap_16bit(zone_id),
+        "témoin : aucun drapeau de zone, seul le catalogue plafonne"
+    );
+    let track_id = piste_flac(&backend, 96_000, 24);
+    let r = decision(&backend, zone_id, track_id).await;
+    assert_eq!(r.mime_type, "audio/flac");
+    assert_eq!(
+        r.bit_depth,
+        Some(16),
+        "l'orchestrateur applique `force_16bit` du catalogue : 16 bits servis"
+    );
+    let sp = build_signal_path(
+        &en_lecture(track_id, "flac", 96_000, 24),
+        &zone,
+        &backend,
+        Some("Ruark R3"),
+        "",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        verdict(&sp),
+        Some(false),
+        "l'orchestrateur transcode en 16 bits, le panneau annonçait un passthrough \
+         bit-perfect (#3183) : {sp}"
+    );
+    assert_eq!(
+        transcoder_desc(&sp).as_deref(),
+        Some("FLAC 96kHz/24bit \u{2192} FLAC 96kHz/16bit"),
+        "l'étape de transcodage doit montrer la profondeur réellement servie"
+    );
+}
+/// Le cas du ticket, mot pour mot : ALAC 24 bits, « ALAC direct » coché, Ruark
+/// R3 au catalogue. L'orchestrateur refuse le passthrough (`!dlna_cap_16bit`
+/// dans sa condition `alac_passthrough`) et transcode en FLAC 16 bits.
+#[test]
+fn alac_direct_sur_un_ruark_r3_du_catalogue_n_est_pas_bit_perfect() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    ZoneRepo::with_backend(backend.clone())
+        .update_alac_passthrough(zone_id, true)
+        .unwrap();
+    choisir_l_appareil(&backend, zone_id, "Ruark Audio", "R3");
+    let sp = build_signal_path(
+        &alac_hires_playing(),
+        &zone,
+        &backend,
+        Some("Ruark R3"),
+        "",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        verdict(&sp),
+        Some(false),
+        "un Ruark R3 ne décode que 16 bits : le passthrough ALAC 24 bits est refusé \
+         par l'orchestrateur, le panneau doit le dire (#3183) : {sp}"
+    );
+    assert_eq!(
+        transcoder_desc(&sp).as_deref(),
+        Some("ALAC 96kHz/24bit \u{2192} FLAC 96kHz/16bit")
+    );
+}
+/// Témoin : le même réglage sur un appareil du catalogue SANS quirk (WiiM Pro,
+/// `quirks: {}`) garde le passthrough ALAC bit-perfect. Le plafond vient du
+/// quirk, pas du seul fait d'avoir choisi un modèle.
+#[test]
+fn alac_direct_sur_un_appareil_sans_quirk_reste_bit_perfect() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    ZoneRepo::with_backend(backend.clone())
+        .update_alac_passthrough(zone_id, true)
+        .unwrap();
+    choisir_l_appareil(&backend, zone_id, "WiiM", "WiiM Pro");
+    let sp = build_signal_path(
+        &alac_hires_playing(),
+        &zone,
+        &backend,
+        Some("WiiM Pro"),
+        "",
+        None,
+    )
+    .unwrap();
+    assert_eq!(verdict(&sp), Some(true), "{sp}");
+    assert_eq!(
+        transcoder_desc(&sp),
+        None,
+        "aucun transcodage : l'ALAC part tel quel"
+    );
+}
+/// Le plafond de fréquence du catalogue (WiiM Mini, 48 kHz) : l'orchestrateur
+/// le combine en `min` avec le réglage de zone et rééchantillonne ; le miroir
+/// ne lisait que la zone et annonçait un passthrough 96 kHz bit-perfect.
+#[tokio::test]
+async fn le_plafond_de_frequence_du_catalogue_fait_tomber_le_verdict_comme_l_orchestrateur() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    choisir_l_appareil(&backend, zone_id, "WiiM", "WiiM Mini");
+    assert!(
+        zone.max_sample_rate.is_none(),
+        "témoin : aucun plafond de zone, seul le catalogue plafonne"
+    );
+    let track_id = piste_flac(&backend, 96_000, 24);
+    let r = decision(&backend, zone_id, track_id).await;
+    assert_eq!(
+        r.sample_rate,
+        Some(48_000),
+        "l'orchestrateur applique le plafond de 48 kHz du catalogue"
+    );
+    let sp = build_signal_path(
+        &en_lecture(track_id, "flac", 96_000, 24),
+        &zone,
+        &backend,
+        Some("WiiM Mini"),
+        "",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        verdict(&sp),
+        Some(false),
+        "l'orchestrateur rééchantillonne à 48 kHz, le panneau annonçait 96 kHz \
+         bit-perfect (#3183) : {sp}"
+    );
+    assert_eq!(
+        step_desc(&sp, "Resampler").as_deref(),
+        Some("96kHz \u{2192} 48kHz")
+    );
+}

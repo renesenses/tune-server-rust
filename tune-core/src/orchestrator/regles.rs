@@ -47,6 +47,33 @@ pub fn wav_override_applies(
     force_wav_requested && !(source_is_flac && native_flac_opt_in)
 }
 
+/// Le plafond 16 bits s'applique-t-il à CETTE lecture ?
+///
+/// Certains renderers annoncent `audio/flac` mais ne décodent que 16 bits : un
+/// FLAC ou un ALAC 24 bits servi direct joue le SILENCE (Ruark R3, Yves #1137).
+/// Deux sources l'activent, en OU : le drapeau de zone `dlna_cap_16bit` et le
+/// quirk `force_16bit` du catalogue d'appareils (marque + modèle choisis pour
+/// la zone, `device_catalog::resolve_zone_quirks`). Le quirk ne peut
+/// qu'activer le plafond, jamais le désactiver. Sans objet jusqu'à 16 bits, et
+/// hors sortie réseau.
+///
+/// `pub` pour la même raison que [`is_network_output_type`] et
+/// [`wav_override_applies`] : le miroir du chemin du signal
+/// (`tune-server/src/routes/zones/signal_path.rs`) recopiait cette condition
+/// SANS le quirk catalogue. Sur un Ruark R3 et une source 24 bits,
+/// l'orchestrateur transcodait en 16 bits pendant que le panneau annonçait un
+/// passthrough bit-perfect (#3183, troisième ligne de l'écart n° 3). Le
+/// paramètre `catalogue_force_16bit` est OBLIGATOIRE : un appelant ne peut
+/// plus oublier cette source-là.
+pub fn dlna_cap_16bit_applies(
+    is_network_output: bool,
+    bit_depth: u16,
+    zone_cap_16bit: bool,
+    catalogue_force_16bit: bool,
+) -> bool {
+    is_network_output && bit_depth > 16 && (zone_cap_16bit || catalogue_force_16bit)
+}
+
 /// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
 /// file served on the HI-RES streaming path (cache-hit → a previously-finished
 /// transcode instead of a fresh one), so it stays OFF until validated on a real
@@ -152,12 +179,16 @@ pub fn est_dsd_brut(mime_type: &str) -> bool {
 ///
 /// A temp file is required for renderers that reject chunked transfer
 /// (darTZeel LHC-208 etc.): every non-WAV target (FLAC), and every WAV target a
-/// renderer demands as raw LPCM (`dlna_needs_wav`). The exception is
-/// `dsd_lpcm_streams` — a DSD source going out as WAV/LPCM with the
-/// `dsd_lpcm_stream` toggle on: the streaming path already advertises an exact
-/// Content-Length (`StreamInfo::wav_content_length`), so blocking to /tmp is
-/// pointless and, on DSD256/512, fatal (the ~decode exceeds the 120s temp-file
-/// timeout → the renderer plays silence).
+/// renderer demands as raw LPCM (`dlna_needs_wav`). L'exception est
+/// `wav_diffusable` : une cible WAV dont la session progressive annonce déjà un
+/// Content-Length exact (`StreamInfo::wav_content_length`) ET dont le décodeur
+/// travaille au fil de l'eau. Deux sources y entrent, pour la même raison —
+/// passer par le fichier leur est FATAL, pas seulement lent :
+///
+/// - le DSD sous la bascule `dsd_lpcm_stream` : en DSD256/512 le décodage
+///   dépasse le budget du fichier temporaire et le renderer joue du silence ;
+/// - le Monkey's Audio (`.ape`) vers un renderer qui a ANNONCÉ le LPCM
+///   (#3311) — voir [`cible_wav_pour_ape_reseau`].
 ///
 /// `dsp_active` ne compte que si la cible n'est PAS du WAV. Depuis LAT-F1
 /// (phase 0) le bras progressif applique lui-même égaliseur, convolveur et
@@ -175,11 +206,49 @@ pub(super) fn use_file_transcode_for(
     is_network: bool,
     target_is_wav: bool,
     dlna_needs_wav: bool,
-    dsd_lpcm_streams: bool,
+    wav_diffusable: bool,
     dsp_active: bool,
 ) -> bool {
-    is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams))
+    is_network && (!target_is_wav || (dlna_needs_wav && !wav_diffusable))
         || (dsp_active && !target_is_wav)
+}
+
+/// #3311 — un Monkey's Audio (`.ape`) servi à un renderer RÉSEAU doit-il
+/// partir en WAV progressif plutôt qu'en FLAC ré-encodé par le fichier ?
+///
+/// Le décodeur `.ape` incrémental livré en v0.9.131 (#2505, PR #3177) n'est
+/// branché que sur le bras progressif (`decode_ape_streaming`). Or `.ape` a
+/// `needs_transcode_for_dlna() == true` et `dlna_transcode_target() == Flac` :
+/// sur une zone réseau la cible est donc le FLAC, et `use_file_transcode_for`
+/// rend `true` ; et si le renderer n'annonce pas `audio/flac`, `dlna_needs_wav`
+/// donne un WAV que le MÊME prédicat renvoie AUSSI au fichier. Les deux issues
+/// aboutissent à `decode_to_pcm` → `decode_ape_to_pcm`, la piste entière en
+/// mémoire — exactement ce que #2505 a chassé de l'autre bras. AUCUN `.ape`
+/// joué sur une zone réseau n'atteignait donc le correctif annoncé.
+///
+/// Mesuré sur Shrek (profil release), image de CD d'une heure 16/44 stéréo
+/// fabriquée par répétition de trames :
+///
+/// | bras | premier octet PCM | pic RSS |
+/// |---|---|---|
+/// | progressif (`decode_ape_streaming`) | 0,70 ms | plat |
+/// | par lots (`decode_ape_to_pcm`) | jamais avant la fin, 59,2 s | 2,37 Gio |
+///
+/// Et le plafond d'en-tête du bras par lots REFUSE net au-delà de 2 Gio de PCM
+/// déclaré — un 24/96 dépasse ce seuil vers 52 minutes.
+///
+/// Le renderer doit avoir ANNONCÉ le LPCM (sonde `GetProtocolInfo`,
+/// `dlna_accepte_lpcm`) : le format servi sur le fil change, et une sonde
+/// inconcluante garde le FLAC. Même garde que [`cible_wav_pour_traitement`].
+///
+/// Fonction pure, comme ses deux voisines : la matrice se teste sans
+/// orchestrateur.
+pub(super) fn cible_wav_pour_ape_reseau(
+    src_est_ape: bool,
+    is_network: bool,
+    renderer_accepte_lpcm: bool,
+) -> bool {
+    src_est_ape && is_network && renderer_accepte_lpcm
 }
 
 /// LAT-F1 (phase 1) — une zone réseau à traitement actif dont la cible serait
@@ -209,6 +278,26 @@ pub(super) fn cible_wav_pour_traitement(
     renderer_accepte_lpcm: bool,
 ) -> bool {
     dsp_active && is_network && !src_est_dsd && opt_in && renderer_accepte_lpcm
+}
+
+/// La cible d'un TRANSCODAGE doit être un format que l'encodeur sait produire.
+///
+/// `AudioFormat::dlna_transcode_target` rend « AIFF » pour une source AIFF,
+/// parce que les renderers le lisent nativement — vrai en passthrough, faux
+/// dès qu'un traitement force le transcodage : l'encodeur n'a pas de bras
+/// AIFF (ni MP3, ni OGG) et substituait du FLAC en silence, que le serveur
+/// servait sous `.aiff` / `audio/aiff`. Le renderer DLNA de Cyrille restait
+/// muet (#3357, 60 207 920 octets de FLAC étiquetés AIFF). Ici, tout ce que
+/// l'encodeur ne sait pas écrire devient FLAC AVANT que l'extension et le
+/// type MIME n'en soient dérivés : un FLAC s'annonce FLAC.
+pub(super) fn cible_encodable(
+    cible: crate::audio::formats::AudioFormat,
+) -> crate::audio::formats::AudioFormat {
+    use crate::audio::formats::AudioFormat;
+    match cible {
+        AudioFormat::Wav | AudioFormat::Flac => cible,
+        _ => AudioFormat::Flac,
+    }
 }
 
 /// Le bras streaming HTTPS doit-il PRÉ-TRANSCODER au lieu de servir les octets

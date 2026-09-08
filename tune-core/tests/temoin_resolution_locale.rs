@@ -19,6 +19,7 @@ use tune_core::db::backend::DbBackend;
 use tune_core::db::migrations::run_migrations;
 use tune_core::db::models::Track;
 use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::zone_repo::ZoneRepo;
@@ -239,4 +240,32 @@ async fn un_fichier_disparu_est_nomme_dans_l_erreur_et_n_ouvre_aucune_session() 
         err.contains("n_existe_pas.flac"),
         "et le chemin fautif : {err}"
     );
+}
+/// #3183 — le plafond peut venir du CATALOGUE seul : aucun drapeau de zone,
+/// mais l'appareil choisi pour la zone est un Ruark R3 (`force_16bit`). C'est
+/// la décision que le miroir du chemin du signal doit rendre à l'identique
+/// (`tune-server/src/routes/zones/signal_path_tests.rs`).
+#[tokio::test]
+async fn le_plafond_16_bits_du_catalogue_reencode_aussi_sans_drapeau_de_zone() {
+    let b = banc("dlna", "uuid:renderer-inconnu").await;
+    let settings = SettingsRepo::with_backend(b.db.clone());
+    settings
+        .set(&format!("zone_{}_brand", b.zone_id), "Ruark Audio")
+        .expect("marque");
+    settings
+        .set(&format!("zone_{}_model", b.zone_id), "R3")
+        .expect("modèle");
+    assert!(
+        !b.zones().get_dlna_cap_16bit(b.zone_id),
+        "témoin : aucun drapeau de zone, seul le catalogue plafonne"
+    );
+    let id = b.piste(FLAC, 96_000, 24);
+    let r = b.resoudre(id).await.expect("résolution");
+    assert_eq!(r.mime_type, "audio/flac");
+    assert_eq!(
+        r.bit_depth,
+        Some(16),
+        "le quirk `force_16bit` du catalogue refuse le passthrough 24 bits (#3183)"
+    );
+    assert!(r.stream_id.is_some());
 }

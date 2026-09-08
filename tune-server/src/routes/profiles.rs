@@ -147,6 +147,11 @@ pub fn router() -> Router<AppState> {
             "/{id}/favorites/streaming/remove",
             post(remove_streaming_favorite),
         )
+        // Reprise des favoris posés CHEZ le service (#3419).
+        .route(
+            "/{id}/favorites/streaming/sync",
+            post(sync_streaming_favorites),
+        )
         // Favoris de facette (label, et demain genre/format/année) — #2442.
         .route("/{id}/favorites/facets", get(list_facet_favorites))
         .route("/{id}/favorites/facets/add", post(add_facet_favorite))
@@ -458,6 +463,83 @@ async fn remove_streaming_favorite(
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
+}
+
+/// `?service=` : ne reprendre qu'un service. Absent, tous ceux qui sont
+/// authentifiés.
+#[derive(Deserialize)]
+struct SyncQuery {
+    service: Option<String>,
+}
+
+/// Reprend dans `streaming_favorites` les favoris posés CHEZ Qobuz/Tidal/…
+/// (#3419).
+///
+/// Bertrand, 05/09/2026 : « j'ai 3 pistes Qobuz en favori !! » — et sa règle
+/// « Favori · est · Piste » rendait 0 album. Elle avait raison : ces favoris
+/// n'existaient pas dans la base de Tune. Seul le cœur cliqué DANS Tune
+/// écrivait la table ; celui cliqué dans l'application du service — le geste
+/// de loin le plus fréquent — n'y arrivait jamais.
+///
+/// **Le profil est celui de l'APPELANT**, comme les neuf autres routes de la
+/// famille (`profil_du_chemin_ou_404`, #2560). Un import est une écriture de
+/// favoris : le laisser viser un profil nommé dans le chemin rouvrirait très
+/// exactement la faille que ce garde a fermée.
+///
+/// La reprise n'ajoute jamais qu'au profil interrogé, et ne retire rien : voir
+/// [`tune_core::streaming::favorites_import`] pour ce qui est délibérément
+/// laissé de côté (réconciliation, colonne d'origine, périodicité).
+async fn sync_streaming_favorites(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    profil: ActiveProfile,
+    Query(q): Query<SyncQuery>,
+) -> Response {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
+    let comptes = reprendre_les_favoris(&state, id, q.service.as_deref()).await;
+    Json(json!({ "profile_id": id, "services": comptes })).into_response()
+}
+
+/// Le corps de la reprise, partagé entre la route et le passage de démarrage.
+///
+/// Deux appelants, une seule règle : n'interroger que les services **activés
+/// et authentifiés**. Un service déconnecté rendrait une erreur par type et
+/// gonflerait `echecs` sans rien apprendre à personne.
+///
+/// Les `Arc` du registre sont clonés d'abord, verrou relâché : le registre est
+/// un `Mutex` et les lectures qui suivent sont longues (réseau).
+pub(crate) async fn reprendre_les_favoris(
+    state: &AppState,
+    profile_id: i64,
+    service_demande: Option<&str>,
+) -> Value {
+    let arcs: Vec<(String, _)> = {
+        let registre = state.services.lock().await;
+        registre
+            .list()
+            .into_iter()
+            .filter(|nom| service_demande.is_none_or(|d| d == nom))
+            .filter_map(|nom| registre.get(&nom).map(|arc| (nom, arc)))
+            .collect()
+    };
+
+    let mut comptes = serde_json::Map::new();
+    for (nom, arc) in arcs {
+        let svc = arc.read().await;
+        if !svc.enabled() || !svc.auth_status().await.authenticated {
+            continue;
+        }
+        let stats = tune_core::streaming::favorites_import::reprendre_les_favoris_du_service(
+            &**svc,
+            profile_id,
+            &state.backend,
+        )
+        .await;
+        comptes.insert(nom, json!(stats));
+    }
+    Value::Object(comptes)
 }
 
 // --- Favoris de facette (label…) : une VALEUR, pas un identifiant (#2442) ---

@@ -16,6 +16,10 @@ pub const CHROMECAST_SERVICE: &str = "_googlecast._tcp.local.";
 pub const SQUEEZEBOX_SERVICE: &str = "_slimcli._tcp.local.";
 pub const TUNE_SERVICE: &str = "_tune-server._tcp.local.";
 pub const OAAT_SERVICE: &str = "_oaat._tcp.local.";
+/// Service annoncé par un LECTEUR Sendspin (#3326). Dans Sendspin, c'est
+/// l'enceinte qui s'annonce et la source de musique qui compose vers elle ;
+/// la constante vit dans [`super::sendspin`], avec sa source.
+pub const SENDSPIN_SERVICE: &str = super::sendspin::SERVICE_LECTEUR;
 
 #[derive(Debug, Clone)]
 pub enum MdnsEvent {
@@ -117,6 +121,20 @@ impl MdnsScanner {
             service_type: OAAT_SERVICE.to_string(),
             output_type: OutputType::Oaat,
             default_port: 9740,
+        });
+        self
+    }
+
+    /// Parcourt les LECTEURS Sendspin (#3326, phase 1 : découverte seule).
+    ///
+    /// Le port par défaut est celui que la spécification recommande (8928) ;
+    /// il ne sert que si l'annonce n'en porte aucun, ce qui ne devrait pas
+    /// arriver.
+    pub fn with_sendspin(mut self) -> Self {
+        self.configs.push(MdnsServiceConfig {
+            service_type: SENDSPIN_SERVICE.to_string(),
+            output_type: OutputType::Sendspin,
+            default_port: super::sendspin::PORT_LECTEUR_RECOMMANDE,
         });
         self
     }
@@ -548,6 +566,28 @@ fn service_to_device(
     // BluOS capabilities
     if output_type == OutputType::Bluos {
         caps.insert("bluos".to_string(), serde_json::Value::Bool(true));
+    }
+
+    // Sendspin (#3326) : la spécification ne définit que DEUX enregistrements
+    // TXT, `path` (REQUIS) et `name` (facultatif). Rien d'autre — pas de
+    // version, pas de rôle, et surtout pas d'identifiant : l'identité durable
+    // d'un lecteur Sendspin est son `client_id`, une clé publique Curve25519
+    // qui n'est connue qu'après la poignée de main Noise. `stable_id` reste
+    // donc `None` ici, et l'identifiant d'appareil retombe volontairement sur
+    // la forme dérivée de l'adresse.
+    if output_type == OutputType::Sendspin {
+        let annonce = super::sendspin::Annonce::depuis_txt(
+            info.get_property_val_str("path"),
+            info.get_property_val_str("name"),
+        );
+        // Le TXT `name` est le nom convivial du lecteur ; le nom d'instance
+        // mDNS, lui, n'est qu'une étiquette de service. La spécification le
+        // qualifie de simple « discovery-time hint » : il est remplacé par le
+        // `client/hello` en phase 2, jamais avant.
+        if let Some(nom) = &annonce.nom {
+            device.name = nom.clone();
+        }
+        caps.extend(annonce.capacites());
     }
 
     // Chromecast model
