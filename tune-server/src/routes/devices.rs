@@ -1447,6 +1447,56 @@ async fn device_status(
 
 // --- Device buffer stats ---
 
+/// Les compteurs de sous-alimentation d'une sortie, tels qu'ELLE les a mesurés
+/// (#3205).
+///
+/// # Pourquoi ce n'est pas un `0` par défaut
+///
+/// Les deux routes `buffer-stats` publiaient `"total_underruns": 0` **écrit en
+/// dur**, sur toutes les sorties et en toutes circonstances. C'est le chiffre
+/// même dont #3205 fait dépendre le sort du noyau `PREEMPT_RT` de Tune OS :
+/// « si les xruns sont à zéro sur noyau standard, le noyau RT est un coût sans
+/// gain ». Un zéro fabriqué ne se distingue pas d'un zéro mesuré, et il rend
+/// donc la conclusion *automatique* — dans le sens du retrait, sans qu'aucune
+/// mesure ait eu lieu.
+///
+/// La règle est celle que `poller/famine_anneau_i3318.rs` s'était déjà donnée :
+/// une sortie sans anneau ne doit rien faire remonter du tout, **et surtout pas
+/// un zéro qui se lirait comme « mesuré, et sain »**. D'où :
+///
+/// * `null` — cette sortie n'observe pas sa famine. C'est le cas de tout
+///   renderer réseau : il reçoit un flux déjà encodé et n'a aucun anneau à
+///   affamer. `ring_starvation()` rend `None`, et c'est la valeur par défaut du
+///   trait, donc aussi celle de toute sortie hors-arbre ;
+/// * un nombre — il a été compté par le rappel temps réel de cette sortie.
+///   `0` y redevient une information : « mesuré, et rien n'a manqué ».
+///
+/// `total_disconnections` reste à `null` : aucun compteur de déconnexion
+/// n'existe dans l'arbre. Le mettre à `0` serait la même invention.
+fn compteurs_de_famine(famine: Option<tune_core::outputs::traits::OutputRingStarvation>) -> Value {
+    let Some(f) = famine else {
+        return json!({
+            "total_underruns": Value::Null,
+            "ring_starvation_missing_samples": Value::Null,
+            "served_samples": Value::Null,
+            "stream_ms": Value::Null,
+        });
+    };
+    json!({
+        "total_underruns": f.events,
+        "ring_starvation_missing_samples": f.missing_samples,
+        "served_samples": f.served_samples,
+        "stream_ms": f.stream_ms,
+    })
+}
+
+/// Recopie les champs de [`compteurs_de_famine`] dans l'objet d'une sortie.
+fn poser_compteurs(cible: &mut serde_json::Map<String, Value>, famine: Value) {
+    if let Value::Object(champs) = famine {
+        cible.extend(champs);
+    }
+}
+
 fn buffer_settings_for(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     device_id: &str,
@@ -1471,15 +1521,16 @@ async fn all_buffer_stats(State(state): State<AppState>) -> Json<Value> {
         if let Some(output) = outputs.get(device_id) {
             let output = output.lock().await;
             let (buffer_s, auto) = buffer_settings_for(&state.backend, device_id);
-            stats.push(json!({
-                "device_id": device_id,
-                "device_name": output.name(),
-                "buffer_s": buffer_s,
-                "auto": auto,
-                "manual_override": !auto,
-                "total_disconnections": 0,
-                "total_underruns": 0,
-            }));
+            let mut ligne = serde_json::Map::new();
+            ligne.insert("device_id".into(), json!(device_id));
+            ligne.insert("device_name".into(), json!(output.name()));
+            ligne.insert("buffer_s".into(), json!(buffer_s));
+            ligne.insert("auto".into(), json!(auto));
+            ligne.insert("manual_override".into(), json!(!auto));
+            // #3205 — aucun compteur de déconnexion n'existe : `null`, pas `0`.
+            ligne.insert("total_disconnections".into(), Value::Null);
+            poser_compteurs(&mut ligne, compteurs_de_famine(output.ring_starvation()));
+            stats.push(Value::Object(ligne));
         }
     }
     Json(json!(stats))
@@ -1499,16 +1550,16 @@ async fn device_buffer_stats(
     };
     let output = output.lock().await;
     let (buffer_s, auto) = buffer_settings_for(&state.backend, &device_id);
-    Json(json!({
-        "device_id": device_id,
-        "device_name": output.name(),
-        "buffer_s": buffer_s,
-        "auto": auto,
-        "manual_override": !auto,
-        "total_disconnections": 0,
-        "total_underruns": 0,
-    }))
-    .into_response()
+    let mut corps = serde_json::Map::new();
+    corps.insert("device_id".into(), json!(device_id));
+    corps.insert("device_name".into(), json!(output.name()));
+    corps.insert("buffer_s".into(), json!(buffer_s));
+    corps.insert("auto".into(), json!(auto));
+    corps.insert("manual_override".into(), json!(!auto));
+    // #3205 — aucun compteur de déconnexion n'existe : `null`, pas `0`.
+    corps.insert("total_disconnections".into(), Value::Null);
+    poser_compteurs(&mut corps, compteurs_de_famine(output.ring_starvation()));
+    Json(Value::Object(corps)).into_response()
 }
 
 #[derive(Deserialize)]
