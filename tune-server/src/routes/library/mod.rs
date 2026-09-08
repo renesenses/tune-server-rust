@@ -336,6 +336,12 @@ pub fn router() -> Router<AppState> {
         .route("/lyrics/status", get(lyrics_pass::lyrics_status))
         .route("/lyrics/fetch", post(lyrics_pass::lyrics_fetch))
         .route("/lyrics/write", post(lyrics_pass::lyrics_write))
+        // #2172 — le rattrapage de fond : sa couverture, et son forçage. Même
+        // forme que `/duplicates/empreintes` (0.9.140), volontairement.
+        .route(
+            "/lyrics/rattrapage",
+            get(lyrics_pass::couverture_rattrapage).post(lyrics_pass::rattraper_maintenant),
+        )
         .route("/search", get(search::search))
         .route("/search/acoustic", post(search::acoustic_search))
         .route("/search/acoustic/status", get(search::acoustic_status))

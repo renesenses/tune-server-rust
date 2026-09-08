@@ -305,6 +305,12 @@ path = "tests/temoin_resolution_streaming.rs"
 name = "temoin_resolution_locale"
 path = "tests/temoin_resolution_locale.rs"
 
+# #2060 / #3522 — une balise « Track N » ne doit pas voler la place du nom de
+# fichier. `autotests = false` plus haut : sans cette cible, le fichier ne
+# serait jamais compilé.
+[[test]]
+name = "titre_de_remplissage_2060"
+path = "tests/titre_de_remplissage_2060.rs"
 # #3419 — la reprise dans Tune des favoris posés chez le service. Même raison
 # que les cibles ci-dessus : `autotests = false` en tête de ce fichier, sans
 # cette déclaration le témoin ne serait jamais compilé et la porte rendrait un

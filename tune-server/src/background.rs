@@ -38,6 +38,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     crate::routes::library::credits::spawn_passe_automatique_credits(state);
     spawn_community_sync(state);
     spawn_replaygain_analysis(state);
+    spawn_lyrics_catchup(state);
     #[cfg(feature = "audio-embedding")]
     spawn_audio_embedding(state);
     spawn_radio_logo_refresh(state);
@@ -1969,6 +1970,21 @@ fn spawn_community_sync(state: &AppState) {
 /// it never slows indexing. Gated by the `replaygain_analysis_enabled` setting.
 fn spawn_replaygain_analysis(state: &AppState) {
     tune_core::audio::replaygain::spawn(state.backend.clone());
+}
+
+/// #2172 — le rattrapage des paroles.
+///
+/// Le titre de l'issue disait « aucun passage de fond ne récupère les
+/// paroles » : les deux passes de `library::lyrics_pass` existaient depuis la
+/// 0.9.118, mais leur SEUL appelant était `POST /library/lyrics/fetch`, un
+/// bouton. Cette ligne est ce qui manquait — sans elle, le cœur reste du code
+/// que rien n'atteint, exactement comme `spawn_scan_scheduler` avant #2469.
+///
+/// Ne fait rien tant que `lyrics_lrclib_enabled` n'est pas activé, s'efface
+/// devant toute zone qui joue, et ne demande jamais plus de `LOT_DE_FOND`
+/// paroles d'affilée.
+fn spawn_lyrics_catchup(state: &AppState) {
+    tune_core::library::lyrics_pass::spawn(state.backend.clone(), state.http_client.clone());
 }
 
 /// Background CLAP audio-embedding sweep for the acoustic Smart Radio. Opt-in
