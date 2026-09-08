@@ -271,17 +271,6 @@ path = "tests/pairs_decouverts_i2746.rs"
 name = "comptes_par_source_2147"
 path = "tests/comptes_par_source_2147.rs"
 
-# #3542 : `POST /podcasts/subscriptions` rendait 201 dans les deux cas —
-# creation reelle et abonnement deja present — sans porter l'identifiant de la
-# ligne. `autotests = false` plus haut : sans cette cible, le fichier ne serait
-# JAMAIS compile, donc vert contre rien.
-#
-# Pas de `required-features` : le banc monte une base SQLite en memoire et
-# appelle la route par son URL, il ne demande aucune base externe ni reseau.
-[[test]]
-name = "podcasts_abonnement_identifiant_3542"
-path = "tests/podcasts_abonnement_identifiant_3542.rs"
-
 # #3226 generalise : `sources` gouverne desormais AUSSI le bloc local de
 # `/home/other-versions`, `/home/artist-releases` et
 # `/library/tracks/{id}/versions`, la ou il ne filtrait que la boucle des
@@ -315,22 +304,13 @@ path = "tests/refus_telemetrie_honore_3383.rs"
 name = "dispositions_de_canaux_3322"
 path = "tests/dispositions_de_canaux_3322.rs"
 
-# #3462 — la garde qui verifie qu'un SlimProto mort au demarrage apparait dans
-# la grille de composants de `/system/health`, celle que trois ecrans affichent
-# deja. Fichier a part : `etat_ecoute()` est un etat GLOBAL au processus, le
-# poser depuis un test contaminerait tous les autres tests du meme binaire.
-# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
-# compile, donc vert contre rien.
+# #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
+# rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
+# jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
+# rien ne gardait la VALEUR (`max_limit` partait tel quel dans `LIMIT {n}` : `0`
+# vidait la collection, un negatif faisait diverger SQLite et PostgreSQL). Le
+# temoin passe par les ROUTES MONTEES. `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
 [[test]]
-name = "sante_slimproto_i3462"
-path = "tests/sante_slimproto_i3462.rs"
-
-# #3518 : « # Plays » et « Last Played », deux colonnes de la maquette V1 que
-# AUCUNE route de liste de pistes ne portait. La garde passe par le ROUTEUR
-# MONTE : un essai qui appellerait `plays_for_tracks` en direct resterait vert
-# alors meme que la route ne l'appelle pas — le defaut « ecrit mais pas
-# branche » que ce depot connait par coeur. `autotests = false` plus haut :
-# sans cette cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
-[[test]]
-name = "ecoutes_par_piste_3518"
-path = "tests/ecoutes_par_piste_3518.rs"
+name = "borne_smart_collections_2732"
+path = "tests/borne_smart_collections_2732.rs"
