@@ -173,30 +173,6 @@ const SAUTS_CONNUS: &[(&str, &str, &[&str], &str)] = &[
         "Demande une base de production copiée à la main. Saut assumé.",
     ),
     (
-        "tune-core/tests/pg_insert_conditionnel_f7c250.rs",
-        "TUNE_TEST_PG_URL",
-        &[
-            "pg_3248_insert_conditionnel_sterile_n_annule_pas_la_transaction",
-            "pg_3248_le_nombre_de_lignes_rendu_est_le_vrai",
-            "pg_3248_temoin_last_insert_rowid_intact",
-        ],
-        "#3248 — rattaché par #3519 sur `batch/bugs-4`, absent de cette ligne. \
-         Entrée à RETIRER à la fusion des deux lots : la garde rougira alors \
-         d'elle-même en le disant.",
-    ),
-    (
-        "tune-core/tests/pg_returning_id_hors_table_a_id_3256.rs",
-        "TUNE_TEST_PG_URL",
-        &[
-            "pg_3256_insert_dans_une_table_sans_colonne_id_reussit",
-            "pg_3256_insert_sans_colonne_id_dans_une_transaction",
-            "pg_3256_les_tables_visees_n_ont_pas_de_colonne_id",
-            "pg_3256_temoin_les_tables_a_id_rendent_toujours_leur_identifiant",
-        ],
-        "#3256 — rattaché par #3520 sur `batch/bugs-4`, absent de cette ligne. \
-         Entrée à RETIRER à la fusion des deux lots.",
-    ),
-    (
         "tune-server/tests/compilation_dans_les_reponses_album.rs",
         "TUNE_TEST_PG_URL",
         &["pg_i1957_la_colonne_est_un_entier_et_les_routes_servent_le_drapeau"],
