@@ -803,20 +803,11 @@ impl PlaybackOrchestrator {
             // Une session-canal (conversion à la volée) ne sait pas rejouer un
             // octet passé : la DIDL doit annoncer DLNA.ORG_OP=00, sans quoi le
             // renderer seeke par tranches et gèle à 0:00 (DMP-A8, DSD, 24/08).
-            let byte_seekable = match resolved.stream_id.as_deref() {
-                Some(sid) => {
-                    let session = {
-                        let sessions = self.streamer.sessions_state();
-                        let guard = sessions.lock().await;
-                        guard.get(sid).cloned()
-                    };
-                    match session {
-                        Some(s) => !s.is_channel().await,
-                        None => true,
-                    }
-                }
-                None => true,
-            };
+            // Mesurée ici comme aux trois sites de PRÉ-ARMEMENT : une seule
+            // question, une seule réponse (`media_byte_seekable`).
+            let byte_seekable = self
+                .media_byte_seekable(resolved.stream_id.as_deref())
+                .await;
             let media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
                 mime_type: &resolved.mime_type,

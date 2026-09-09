@@ -437,6 +437,11 @@ impl PositionPoller {
             .await
         {
             Ok(resolved) if resolved.file_path.is_some() => {
+                // #1894 — mesurée, jamais supposée (`media_byte_seekable`).
+                let byte_seekable = self
+                    .orchestrator
+                    .media_byte_seekable(resolved.stream_id.as_deref())
+                    .await;
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
                     outputs.get(device_id).map(|a| a.clone())
@@ -459,7 +464,7 @@ impl PositionPoller {
                     bit_depth: resolved.bit_depth,
                     channels: resolved.channels,
                     live_stream: false,
-                    byte_seekable: true,
+                    byte_seekable,
                     origin_url: None,
                     source: resolved.source.as_deref(),
                     source_id: resolved.source_id.as_deref(),
@@ -547,6 +552,11 @@ impl PositionPoller {
                         }
                     }
                 }
+                // #1894 — mesurée, jamais supposée (`media_byte_seekable`).
+                let byte_seekable = self
+                    .orchestrator
+                    .media_byte_seekable(resolved.stream_id.as_deref())
+                    .await;
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
                     outputs.get(device_id)
@@ -603,7 +613,7 @@ impl PositionPoller {
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
                         live_stream: false,
-                        byte_seekable: true,
+                        byte_seekable,
                         origin_url: None,
                         source: resolved.source.as_deref(),
                         source_id: resolved.source_id.as_deref(),

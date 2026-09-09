@@ -18,6 +18,19 @@ pub struct DsdToDoP {
     channels: usize,
     lsb_first: bool,
     frame_count: u64,
+    /// Les octets d'une trame INCOMPLÈTE laissés par le bloc précédent.
+    ///
+    /// Une trame DoP consomme `2 * channels` octets DSD. `feed` recevait des
+    /// blocs dont la taille n'est garantie multiple que de `channels` —
+    /// `DffStreamReader::open` le documente ainsi — et rendait donc jusqu'à
+    /// `2 * channels - 1` octets à chaque appel, définitivement perdus. Sur un
+    /// DFF six canaux, 32 766 = 2 730 x 12 + 6 : un octet DSD par canal jeté
+    /// toutes les 2,7 ms de DSD64, sur toute la piste.
+    ///
+    /// Le report rend l'encodeur indifférent au découpage : la garde
+    /// `un_decoupage_hostile_produit_exactement_le_meme_porteur` le mesure en
+    /// comparant un appel unique à des appels d'un octet.
+    reste: Vec<u8>,
 }
 
 impl DsdToDoP {
@@ -26,6 +39,7 @@ impl DsdToDoP {
             channels,
             lsb_first,
             frame_count: 0,
+            reste: Vec::new(),
         }
     }
 
@@ -38,7 +52,22 @@ impl DsdToDoP {
     /// Input: byte-interleaved DSD (ch0_b0, ch1_b0, ch0_b1, ch1_b1, ...)
     /// Each byte = 8 DSD bits. We need 16 bits (2 bytes) per channel per DoP frame.
     /// So we consume `2 * channels` bytes per DoP frame.
+    /// Le découpage des blocs n'a AUCUN effet sur ce qui sort : les octets
+    /// d'une trame incomplète sont reportés sur l'appel suivant (voir
+    /// [`Self::reste`]).
     pub fn feed(&mut self, dsd_data: &[u8]) -> Vec<u8> {
+        if self.channels == 0 {
+            return Vec::new();
+        }
+        if self.reste.is_empty() {
+            return self.encoder_les_trames_entieres(dsd_data);
+        }
+        let mut tampon = std::mem::take(&mut self.reste);
+        tampon.extend_from_slice(dsd_data);
+        self.encoder_les_trames_entieres(&tampon)
+    }
+
+    fn encoder_les_trames_entieres(&mut self, dsd_data: &[u8]) -> Vec<u8> {
         let bytes_per_frame = 2 * self.channels;
         let num_frames = dsd_data.len() / bytes_per_frame;
         // 3 bytes per channel per frame (24-bit)
@@ -72,6 +101,9 @@ impl DsdToDoP {
             self.frame_count += 1;
         }
 
+        self.reste.clear();
+        self.reste
+            .extend_from_slice(&dsd_data[num_frames * bytes_per_frame..]);
         out
     }
 }
@@ -277,6 +309,33 @@ mod tests {
         let out = dop.feed(&data);
         // 2 frames × 2 channels × 3 bytes = 12 bytes
         assert_eq!(out.len(), 12);
+    }
+
+    /// GARDE — le découpage des blocs ne change RIEN aux octets produits.
+    ///
+    /// C'est la propriété qui manquait : `feed` jetait la trame incomplète de
+    /// chaque bloc, donc le résultat dépendait de la taille de lecture du
+    /// fichier. Un octet par canal disparaissait à chaque bloc dès que celui-ci
+    /// n'était pas un multiple de `2 * canaux` — le cas de tout DFF dont le
+    /// nombre de canaux est impair une fois divisé dans 32 768.
+    #[test]
+    fn un_decoupage_hostile_produit_exactement_le_meme_porteur() {
+        for canaux in [1usize, 2, 6] {
+            let dsd: Vec<u8> = (0..3_000u32).map(|i| (i % 251 + 1) as u8).collect();
+            let entier = DsdToDoP::new(canaux, false).feed(&dsd);
+            for tranche in [1usize, 3, 7, 2 * canaux + 1, 997] {
+                let mut dop = DsdToDoP::new(canaux, false);
+                let mut morceaux = Vec::new();
+                for bloc in dsd.chunks(tranche) {
+                    morceaux.extend_from_slice(&dop.feed(bloc));
+                }
+                assert_eq!(
+                    morceaux, entier,
+                    "{canaux} canaux, blocs de {tranche} octets : le porteur DoP \
+                     dépend du découpage — des octets DSD sont perdus en route"
+                );
+            }
+        }
     }
 
     #[test]
