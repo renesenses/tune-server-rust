@@ -91,9 +91,10 @@ pub fn radio_audio_url(base_url: &str, radio_id: i64) -> String {
 /// de Tune », et note que « toutes les autres branches du serveur media
 /// servent une URL Tune ». `5d123568` a corrige le `<res>` ; il n'a pas touche
 /// a `<upnp:albumArtURI>`, qui restait la DERNIERE adresse externe publiee par
-/// le serveur media. Mesure sur une base fraiche : 49 stations sur 50 portent
-/// un `logo_url` `https://mozaiklabs.fr/storage/radio-logos/*.png`, remis tel
-/// quel au renderer.
+/// le serveur media. Mesure sur le DIDL emis par une base fraichement migree :
+/// 50 stations livrees, dont **25 portent un `logo_url`** — et les 25 le
+/// publiaient `https://mozaiklabs.fr/storage/radio-logos/*.png` tel quel au
+/// renderer. Les 25 autres n'ont pas de logo et n'emettent pas la balise.
 ///
 /// Le relais existe pourtant deja, et un seul consommateur s'en sert. Le
 /// commentaire de `refresh_radio_logos`
@@ -5444,10 +5445,10 @@ mod ssdp_msearch_tests {
     /// pas celle de Tune », et son corps note que « toutes les autres branches
     /// du serveur media servent une URL Tune ». Le correctif de la v0.9.118 a
     /// refait le `<res>` ; il n'a jamais touche a `<upnp:albumArtURI>`, qui
-    /// restait la derniere adresse externe publiee. Mesure sur une base
-    /// fraiche : 49 stations sur 50 portent un `logo_url`
-    /// `https://mozaiklabs.fr/storage/radio-logos/*.png`, remis tel quel au
-    /// renderer.
+    /// restait la derniere adresse externe publiee. Mesure sur le DIDL emis
+    /// par une base fraichement migree : 50 stations livrees, dont **25
+    /// portent un `logo_url`** — et les 25 le publiaient
+    /// `https://mozaiklabs.fr/storage/radio-logos/*.png` tel quel au renderer.
     ///
     /// Le relais existe pourtant, et le client WEB s'en sert deja — le
     /// commentaire de `refresh_radio_logos` le dit mot pour mot. Seul le
