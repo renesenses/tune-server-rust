@@ -88,6 +88,11 @@ impl GaplessHandler {
 
         match orchestrator.resolve_queue_item_url(zone_id, next_pos).await {
             Ok(resolved) => {
+                // #1894 — le pré-armement annonçait `DLNA.ORG_OP=01` en dur sur
+                // une session-canal que `play` annonce, elle, non-seekable.
+                let byte_seekable = orchestrator
+                    .media_byte_seekable(resolved.stream_id.as_deref())
+                    .await;
                 let outputs = orchestrator.outputs.lock().await;
                 if let Some(output) = outputs.get(device_id) {
                     let out = output.lock().await;
@@ -105,7 +110,7 @@ impl GaplessHandler {
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
                         live_stream: false,
-                        byte_seekable: true,
+                        byte_seekable,
                         // A staged queue item is a finite track: only the live
                         // and proxy paths have an upstream URL to carry.
                         origin_url: None,

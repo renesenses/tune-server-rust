@@ -226,3 +226,145 @@ pub(super) const RESUME_OUTPUT_SEEK_SETTLE_MS: u64 = 700;
 pub(super) fn reprise_toujours_la_notre(seq_au_depart: u64, seq_courante: u64) -> bool {
     seq_au_depart == seq_courante
 }
+
+impl PlaybackOrchestrator {
+    /// Le flux qu'on s'apprête à annoncer sait-il rejouer un octet déjà servi ?
+    ///
+    /// C'est la seule question qui décide du `DLNA.ORG_OP` du `protocolInfo`
+    /// (`didl::DidlItem::byte_seekable`). Une session-CANAL — une conversion à
+    /// la volée, dont un flux DoP est le cas type — ne sait pas revenir en
+    /// arrière : son producteur pousse dans un `mpsc` et rien n'est conservé.
+    /// L'annoncer « seekable » invite le renderer à redemander une tranche par
+    /// `Range`, qu'on ne peut honorer qu'en lui servant le DIRECT à la place
+    /// des octets demandés — et un renderer qui repart ainsi au mauvais endroit
+    /// d'un train DoP ne retrouve plus le marqueur `0x05`/`0xFA` dans l'octet
+    /// de poids fort : le DAC ne verrouille pas, et joue le train DSD comme du
+    /// PCM. C'est-à-dire du bruit blanc (#1894).
+    ///
+    /// # Pourquoi cette méthode existe
+    ///
+    /// La mesure était faite au seul site de `play` (`transport.rs`). Les TROIS
+    /// sites de PRÉ-ARMEMENT — `gapless.rs`, et les deux bras de
+    /// `poller::fin_de_piste` — écrivaient `byte_seekable: true` en dur. Le
+    /// même flux était donc annoncé non-seekable quand on appuyait sur lecture,
+    /// et seekable quand il arrivait comme piste SUIVANTE d'un album : deux
+    /// contrats contradictoires pour les mêmes octets, selon le chemin.
+    ///
+    /// La garde `gapless_skipped_dsd_next_dlna` ne rattrapait pas le cas : elle
+    /// regarde le MIME et l'extension de l'URL, et un flux DoP se présente en
+    /// `audio/wav` sur une URL `.wav` — c'est tout son objet. Un album DSD
+    /// enchaîné sur un renderer réseau passait donc par le pré-armement.
+    ///
+    /// `None` (pas de session : une URL de fichier ou de CDN servie telle
+    /// quelle) et une session inconnue rendent `true`, comme le site d'origine.
+    pub(crate) async fn media_byte_seekable(&self, stream_id: Option<&str>) -> bool {
+        let Some(sid) = stream_id else {
+            return true;
+        };
+        let session = {
+            let sessions = self.streamer.sessions_state();
+            let guard = sessions.lock().await;
+            guard.get(sid).cloned()
+        };
+        match session {
+            Some(s) => !s.is_channel().await,
+            None => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod seekabilite_annoncee_tests {
+    use super::PlaybackOrchestrator;
+    use crate::db::migrations::run_migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::http::streamer::{AudioStreamer, StreamInfo};
+    use crate::outputs::registry::OutputRegistry;
+    use crate::playback::PlaybackManager;
+    use crate::streaming::registry::ServiceRegistry;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn orchestrateur_de_test() -> PlaybackOrchestrator {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+        PlaybackOrchestrator::new(
+            db,
+            Arc::new(PlaybackManager::new()),
+            Arc::new(AudioStreamer::new(0)),
+            Arc::new(Mutex::new(ServiceRegistry::new())),
+            Arc::new(Mutex::new(OutputRegistry::new())),
+            None,
+        )
+    }
+
+    /// TEMOIN — la mesure elle-meme, sur les trois formes de session.
+    ///
+    /// La garde de source ci-dessous prouve que les quatre sites POSENT la
+    /// question ; celle-ci prouve que la reponse est juste. Sans les deux, un
+    /// `media_byte_seekable` qui rendrait toujours `true` passerait.
+    #[tokio::test]
+    async fn seule_une_session_canal_perd_la_seekabilite() {
+        let orch = orchestrateur_de_test();
+        let info = StreamInfo {
+            format: "wav".to_string(),
+            mime_type: "audio/wav".to_string(),
+            ..StreamInfo::default()
+        };
+        // Le flux DoP EST une session-canal : `anticiper_le_dop` cree une
+        // session `create_session` et pousse les mots de 24 bits dans un mpsc.
+        let (canal, _tx, _pret) = orch.streamer.create_session(info.clone(), true, 128).await;
+        assert!(
+            !orch.media_byte_seekable(Some(&canal)).await,
+            "une conversion au fil de l'eau ne sait pas rejouer un octet servi"
+        );
+        // Un transcodage POSE sur disque, lui, se relit par Range.
+        let fichier = tempfile::NamedTempFile::new().unwrap();
+        let sur_disque = orch
+            .streamer
+            .create_file_session(info, fichier.path().to_string_lossy().into_owned(), false)
+            .await;
+        assert!(
+            orch.media_byte_seekable(Some(&sur_disque)).await,
+            "une session FICHIER est bel et bien seekable : ne pas l'annoncer \
+             couterait le seek sur tout le catalogue transcode"
+        );
+        // Ni session, ni session connue : une URL servie telle quelle.
+        assert!(orch.media_byte_seekable(None).await);
+        assert!(orch.media_byte_seekable(Some("session-disparue")).await);
+    }
+
+    /// GARDE DE SOURCE — aucun site ne réinvente la réponse.
+    ///
+    /// Le défaut corrigé n'était pas une mauvaise valeur : c'était QUATRE
+    /// endroits pour une seule question, dont trois répondaient sans regarder.
+    /// Rien ne détecte cela à l'exécution — les trois sites de pré-armement
+    /// demandent un renderer réseau et une file de plusieurs pistes. La seule
+    /// garde qui tienne est donc portée sur la source.
+    #[test]
+    fn aucun_site_n_annonce_une_seekabilite_qu_il_n_a_pas_mesuree() {
+        for (nom, src) in [
+            ("orchestrator/transport.rs", include_str!("transport.rs")),
+            (
+                "playback/gapless.rs",
+                include_str!("../playback/gapless.rs"),
+            ),
+            (
+                "poller/fin_de_piste.rs",
+                include_str!("../poller/fin_de_piste.rs"),
+            ),
+        ] {
+            assert!(
+                !src.contains("byte_seekable: true"),
+                "{nom} annonce une seekabilité en dur : elle se MESURE, par \
+                 `media_byte_seekable` (#1894)"
+            );
+            assert!(
+                src.contains("media_byte_seekable"),
+                "{nom} construit un PlayMedia sans passer par la mesure unique"
+            );
+        }
+    }
+}
