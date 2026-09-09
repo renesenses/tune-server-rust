@@ -1366,6 +1366,45 @@ static SCAN_GUARD: std::sync::Mutex<Option<(std::time::Instant, Vec<AudioDevice>
     std::sync::Mutex::new(None);
 const SCAN_COOLDOWN_SECS: u64 = 5;
 
+/// Le dernier inventaire PUBLIÉ, lisible sans jamais attendre l'énumération en
+/// cours.
+///
+/// 🔴 #3730 — [`SCAN_GUARD`] est tenu pendant TOUTE la durée de
+/// [`list_audio_devices_uncached`], c'est-à-dire pendant l'énumération WASAPI
+/// complète : elle sonde les formats de chaque point de sortie, et c'est
+/// exactement l'opération que ce fichier documente comme capable de tuer un
+/// flux en cours. Tant qu'elle dure, quiconque prend ce même verrou attend.
+///
+/// [`cached_audio_devices`] le prenait — pour LIRE. Ce n'était pas gênant
+/// tant qu'elle n'était appelée que depuis des tâches de fond. Depuis #3322,
+/// elle est sur le chemin CHAUD de l'API : `output_capabilities`
+/// (`tune-server/src/routes/zones.rs`) l'appelle pour chaque charge utile de
+/// zone, donc `GET /zones` **une fois par zone**, `GET /zones/{id}`, la
+/// charge utile WebSocket, et la réponse de `POST /zones/{id}/play`. Ce sont
+/// des gestionnaires `async` : le verrou est bloquant, il n'y a pas de
+/// `spawn_blocking`, et le client web interroge `GET /zones` en boucle. Une
+/// énumération lente — le cas ordinaire sur Windows, où le rescan la relance
+/// toutes les 120 s dès que rien ne joue — gare donc autant de fils de
+/// l'ordonnanceur qu'il y a de requêtes en vol.
+///
+/// Ce second dépôt rompt le couplage : l'énumérateur y RANGE son résultat
+/// (verrou pris le temps d'une affectation), les lecteurs l'y PRENNENT. Aucun
+/// lecteur ne peut plus attendre un balayage matériel.
+///
+/// `Mutex` et non `RwLock` : mêmes bornes que le verrou voisin, et la section
+/// critique se réduit à un clone.
+static DERNIER_PARC: std::sync::Mutex<Vec<AudioDevice>> = std::sync::Mutex::new(Vec::new());
+
+/// Ranger l'inventaire fraîchement énuméré, à la vue des lecteurs.
+///
+/// Appelée par le seul site qui produit un inventaire neuf, juste après
+/// l'énumération et AVANT que [`SCAN_GUARD`] ne soit relâché : un lecteur qui
+/// arrive entre les deux voit l'ancien parc — jamais un parc vide, jamais un
+/// parc à moitié écrit.
+fn publier_le_parc(parc: &[AudioDevice]) {
+    *DERNIER_PARC.lock().unwrap_or_else(|e| e.into_inner()) = parc.to_vec();
+}
+
 /// List audio devices using the default host.
 pub fn list_audio_devices() -> Vec<AudioDevice> {
     list_audio_devices_with_backend("auto")
@@ -1443,6 +1482,10 @@ pub fn list_audio_devices_with_backend(backend: &str) -> Vec<AudioDevice> {
         }
     }
     let result = list_audio_devices_uncached(backend);
+    // Publier AVANT de relâcher `SCAN_GUARD` : le parc devient lisible sans
+    // attendre, et les lecteurs n'ont jamais à prendre le verrou d'énumération
+    // (#3730).
+    publier_le_parc(&result);
     *guard = Some((std::time::Instant::now(), result.clone()));
     result
 }
@@ -1453,13 +1496,17 @@ pub fn list_audio_devices_with_backend(backend: &str) -> Vec<AudioDevice> {
 /// invalidate an active render stream and kill playback on Windows (DEvir). So
 /// while a local stream is playing we serve this cache instead of re-scanning.
 /// Returns an empty list if nothing has been enumerated yet this session.
+///
+/// 🔴 #3730 — lit [`DERNIER_PARC`] et NON [`SCAN_GUARD`]. Le second est tenu
+/// pendant toute l'énumération : le prendre pour lire faisait attendre
+/// l'appelant aussi longtemps que le balayage matériel. Depuis #3322 cette
+/// fonction est sur le chemin chaud de l'API — voir [`DERNIER_PARC`] pour la
+/// liste des routes concernées et le mécanisme complet.
 pub fn cached_audio_devices() -> Vec<AudioDevice> {
-    SCAN_GUARD
+    DERNIER_PARC
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(|(_, devices)| devices.clone())
-        .unwrap_or_default()
+        .clone()
 }
 
 fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
@@ -9601,3 +9648,6 @@ mod cle_de_correlation_i3318;
 
 #[cfg(test)]
 mod repli_format_compresse_i3618;
+
+#[cfg(test)]
+mod parc_lisible_sans_attendre_i3730;
