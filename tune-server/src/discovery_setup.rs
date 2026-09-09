@@ -390,7 +390,19 @@ pub fn spawn_ssdp_handler(
                         &nos_adresses(),
                         notre_udn.as_deref(),
                     ) {
-                        debug!(
+                        // INFO, pas DEBUG : ce rideau RETIRE une entree de la
+                        // liste « Serveurs multimedia » que le testeur voit.
+                        // Le journal du ticket support 61 montre Tune lui-meme
+                        // enregistre comme serveur multimedia et presente dans
+                        // sa liste (`media_server_registered`
+                        // id=uuid:c4467384-…, 0.9.119) ; le ticket 97 dit qu'il
+                        // lisait « depuis le nas freebox ET DEPUIS TUNE ».
+                        // Depuis #3688 cette entree disparait — a raison ou
+                        // non, ce n'est pas la question ici. Sous DEBUG, un
+                        // testeur qui redit « plus de serveurs multimedia »
+                        // joindrait un journal qui n'en porte pas la trace, et
+                        // l'instruction repartirait a zero comme pour #2718.
+                        info!(
                             id = %ms.id,
                             name = %ms.name,
                             location = %ms.location,

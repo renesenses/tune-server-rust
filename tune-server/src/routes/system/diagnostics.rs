@@ -1385,6 +1385,25 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
     drop(outputs);
+    // Le registre des serveurs multimedia, lu ici et rendu dans la section
+    // « Network » plus bas. Trie par nom : deux rapports du meme testeur
+    // doivent se comparer ligne a ligne.
+    let mut serveurs_multimedia: Vec<(String, String, u16, bool, u64)> = {
+        let registre = state.media_servers.lock().await;
+        registre
+            .values()
+            .map(|ms| {
+                (
+                    ms.name.clone(),
+                    ms.host.clone(),
+                    ms.port,
+                    ms.is_reachable(),
+                    ms.age().as_secs(),
+                )
+            })
+            .collect()
+    };
+    serveurs_multimedia.sort();
 
     let uptime_str = format!(
         "{}d {}h {}m {}s",
@@ -1521,6 +1540,26 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
 
     md.push_str("## Network\n");
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
+    // #2718 et tickets support 61, 87, 97, 98 — « plus de serveurs
+    // multimedia ». « Discovered devices » ne compte QUE les renderers ; le
+    // registre des serveurs multimedia est un autre registre, et ce rapport
+    // — celui que le testeur JOINT a son ticket — n'en disait pas un mot.
+    // Quatre rapports de suite ont donc ete lus sans que la liste dont le
+    // testeur signalait la disparition y figure une seule fois.
+    md.push_str(&format!(
+        "- Serveurs multimedia: {}\n",
+        serveurs_multimedia.len()
+    ));
+    for (nom, hote, port, joignable, age) in &serveurs_multimedia {
+        md.push_str(&format!(
+            "  - {nom} — {hote}:{port} — {} — vu il y a {age} s\n",
+            if *joignable {
+                "joignable"
+            } else {
+                "INJOIGNABLE"
+            }
+        ));
+    }
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
     // #2938 : cinq testeurs ont joint un journal ou le bind TCP 3483 echoue.
     // La ligne existait, noyee dans le journal et en anglais ; personne ne l'a

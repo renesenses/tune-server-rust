@@ -357,6 +357,35 @@ impl SsdpScanner {
     }
 }
 
+/// Le recensement periodique du balayage — extrait pour etre mesurable, et
+/// elargi au registre qu'il ne nommait pas.
+///
+/// `devices` ne compte QUE les renderers : les serveurs multimedia vivent dans
+/// `media_servers`, deliberement hors de `devices` (voir le champ). Cette
+/// ligne etait donc muette sur la seule question que quatre tickets de suite
+/// ont posee — « combien de serveurs multimedia Tune voit-il ? » (tickets
+/// support 61, 87, 97 et 98, Belkadi Yacine, du 28/08 au 08/09/2026).
+///
+/// Le journal du ticket 87 la porte HUIT fois, toutes `devices=0`, et il a
+/// fallu argumenter PAR L'ABSENCE de lignes `ssdp_media_server_discovered`
+/// pour en deduire le compte des serveurs. Une absence n'est pas une preuve :
+/// le compte est desormais ecrit, sur une ligne qui existait deja et qui
+/// n'ajoute donc aucun bruit.
+///
+/// Rend `true` quand la ligne a ete emise.
+fn recenser_si_l_heure_est_venue(st: &mut ScannerState) -> bool {
+    if st.last_periodic_rescan.elapsed() < PERIODIC_RESCAN_INTERVAL {
+        return false;
+    }
+    info!(
+        devices = st.devices.len(),
+        serveurs = st.media_servers.len(),
+        "ssdp_periodic_rescan"
+    );
+    st.last_periodic_rescan = Instant::now();
+    true
+}
+
 async fn scan_loop(
     state: Arc<Mutex<ScannerState>>,
     targets: Vec<String>,
@@ -374,10 +403,7 @@ async fn scan_loop(
         let has_devices = {
             let mut st = state.lock().await;
             st.initial_scan_done = true;
-            if st.last_periodic_rescan.elapsed() >= PERIODIC_RESCAN_INTERVAL {
-                info!(devices = st.devices.len(), "ssdp_periodic_rescan");
-                st.last_periodic_rescan = Instant::now();
-            }
+            recenser_si_l_heure_est_venue(&mut st);
             !st.devices.is_empty()
         };
         if has_devices {
@@ -2671,6 +2697,78 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    /// #2718 — le recensement périodique doit nommer les DEUX registres.
+    ///
+    /// `ssdp_periodic_rescan` est la seule ligne que TOUTE installation écrit
+    /// périodiquement au sujet de la découverte. Elle ne portait que
+    /// `devices`, c'est-à-dire les renderers. Le journal du ticket support 87
+    /// la porte huit fois — `devices=0` à chaque fois — et sur cette base il a
+    /// fallu argumenter par l'ABSENCE de `ssdp_media_server_discovered` pour
+    /// dire combien de serveurs multimédia Tune voyait. Une absence n'est pas
+    /// une preuve.
+    ///
+    /// La garde exige le compte des serveurs sur cette ligne, avec un registre
+    /// dont les deux moitiés diffèrent : `devices=0` et `serveurs=1`. Un
+    /// recensement qui recompterait `devices` sous les deux noms serait rouge.
+    #[test]
+    fn le_recensement_periodique_nomme_les_serveurs_multimedia() {
+        let mut st = ScannerState::new();
+        st.media_servers.insert(
+            "uuid:freebox".into(),
+            MediaServerInfo {
+                id: "uuid:freebox".into(),
+                name: "Freebox Server".into(),
+                manufacturer: "Freebox SA".into(),
+                model: "Freebox Server".into(),
+                location: "http://192.168.0.254:52424/device.xml".into(),
+                content_directory_url: "http://192.168.0.254:52424/cd".into(),
+                host: "192.168.0.254".into(),
+                port: 52424,
+                last_seen: Instant::now(),
+                max_age: MEDIA_SERVER_MIN_MAX_AGE,
+            },
+        );
+        // L'heure est venue : on recule la dernière trace au-delà de
+        // l'intervalle, sans attendre les 300 s réelles.
+        st.last_periodic_rescan = Instant::now()
+            .checked_sub(PERIODIC_RESCAN_INTERVAL + Duration::from_secs(1))
+            .expect("horloge du processus trop jeune pour reculer de 301 s");
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let emise =
+            tracing::subscriber::with_default(abonne, || recenser_si_l_heure_est_venue(&mut st));
+        assert!(
+            emise,
+            "l'intervalle est dépassé : le recensement devait être émis"
+        );
+
+        let texte = journal.texte();
+        let ligne = texte
+            .lines()
+            .find(|l| l.contains("ssdp_periodic_rescan"))
+            .unwrap_or_else(|| {
+                panic!("aucune trace ssdp_periodic_rescan dans le journal :\n{texte}")
+            });
+        assert!(
+            ligne.contains("serveurs=1"),
+            "le recensement ne dit pas combien de SERVEURS MULTIMÉDIA sont \
+             connus — c'est la question posée par les tickets support 61, 87, \
+             97 et 98, et la seule ligne périodique du journal ne la répond \
+             toujours pas.\nattendu quelque part : serveurs=1\nligne : {ligne}"
+        );
+        assert!(
+            ligne.contains("devices=0"),
+            "le compte des renderers doit rester lisible, et rester DISTINCT \
+             de celui des serveurs : ici 0 renderer pour 1 serveur.\n\
+             ligne : {ligne}"
+        );
     }
 
     /// L'UDN annonce par le descripteur doit ressortir de `build_renderer_device`.
