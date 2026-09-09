@@ -1282,6 +1282,13 @@ pub fn spawn_mdns_handler(
         if let Err(e) = mdns.register_self(port, tune_core::version()) {
             tracing::warn!(error = %e, "mdns_register_self_failed");
         }
+        // #3326 S2-a — l'autre moitié de la découverte Sendspin. La
+        // spécification exige du serveur qu'il supporte les DEUX modes ; la
+        // phase 1 ne parcourait que le premier. Une annonce qui échoue ne doit
+        // pas empêcher le reste de la découverte de démarrer.
+        if let Err(e) = mdns.register_sendspin_server(port) {
+            tracing::warn!(error = %e, "mdns_register_sendspin_server_failed");
+        }
         // Publish the scanner so routes (`/peers`, `/system/discover-servers`)
         // can list the discovered peers. AppState keeps it alive for the whole
         // process, so the returned handle is a convenience clone only.

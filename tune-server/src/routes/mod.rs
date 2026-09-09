@@ -63,6 +63,7 @@ pub mod roon_bridge;
 pub mod sacd_rip;
 pub mod scrobbler;
 pub mod search;
+pub mod sendspin;
 pub mod service_tokens;
 pub mod setlistfm;
 pub mod shazam;
@@ -476,6 +477,11 @@ pub fn router_with_plugins(
     let mut app = Router::new()
         .nest("/api/v1", api)
         .nest("/ws", ws::router())
+        // #3326 S2-a — point d'accès Sendspin. À la RACINE et non sous
+        // `/api/v1` : le TXT mDNS annonce `/sendspin`, et une enceinte ne
+        // connaît pas nos préfixes. Pas d'extracteur `WsAuthorized` non
+        // plus — c'est la couche Noise qui authentifie, pas axum.
+        .nest("/sendspin", sendspin::router())
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
         .with_state(state.clone())
