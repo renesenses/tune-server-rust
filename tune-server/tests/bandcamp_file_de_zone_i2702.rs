@@ -231,3 +231,196 @@ async fn l_etat_de_liaison_bandcamp_se_lit_par_une_route() {
          FabienM qui devient visible : {corps}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// « Ma collection » sert-elle ce que Bandcamp lui donne ? (Yves, 09/09/2026)
+// ---------------------------------------------------------------------------
+
+/// Une page de collection telle que Bandcamp la rend RÉELLEMENT.
+///
+/// Mesurée le 09/09/2026 sur `POST
+/// https://bandcamp.com/api/fancollection/1/collection_items`, sans aucun
+/// cookie de session : 200, huit clefs de premier niveau, dont un bloc
+/// `tracklists` que Tune jetait, et un `redownload_urls` VIDE. Les noms et la
+/// forme sont recopiés de cette réponse, pas devinés d'après le code.
+///
+/// Deux articles ACHETÉS — c'est le sujet : ce que Tune rend à quelqu'un qui a
+/// payé. Le second n'a volontairement pas de tracklist, pour que l'absence
+/// d'extrait reste un `null` franc et non une panne.
+fn page_de_collection_reelle() -> Value {
+    json!({
+        "items": [
+            {
+                "band_name": "Andrew Huang",
+                "item_title": "CXM 1978",
+                "item_type": "album",
+                "item_url": "https://andrewhuang.bandcamp.com/album/cxm-1978",
+                "item_art_id": 3903246145i64,
+                "tralbum_type": "a",
+                "tralbum_id": 787856765i64,
+                "purchased": "10 Jun 2026 13:15:40 GMT",
+                "download_available": true,
+                "num_streamable_tracks": 2
+            },
+            {
+                "band_name": "Sans Tracklist",
+                "item_title": "Précommande",
+                "item_type": "album",
+                "item_url": "https://exemple.bandcamp.com/album/precommande",
+                "item_art_id": 1i64,
+                "tralbum_type": "a",
+                "tralbum_id": 999i64,
+                "purchased": "01 Jan 2026 00:00:00 GMT",
+                "download_available": false
+            }
+        ],
+        "tracklists": {
+            "a787856765": [
+                {
+                    "id": 3603313194i64,
+                    "title": "CXM 1978",
+                    "artist": "Andrew Huang",
+                    "track_number": 1,
+                    "duration": 138.772,
+                    "file": {
+                        "mp3-128": "https://bandcamp.com/stream_redirect?enc=mp3-128&track_id=3603313194"
+                    }
+                }
+            ]
+        },
+        // Mesuré VIDE sans session d'achat : c'est ce champ qui porterait les
+        // fichiers sans perte de l'acheteur, et Tune n'a aucune session à
+        // présenter — `lier_compte` ne lit qu'une page de profil PUBLIQUE.
+        "redownload_urls": {},
+        "purchase_infos": {},
+        "more_available": false,
+        "last_token": "1781097340:787856765:a::"
+    })
+}
+
+/// 🔴 « Ma collection » ANNONCE le mp3-128, comme toutes les autres surfaces.
+///
+/// C'est le signalement d'Yves, qui a ACHETÉ ses albums : Tune lui joue le
+/// flux de découverte à 128 kbit/s. Mesuré le 09/09/2026, Bandcamp ne sert
+/// rien d'autre sans session d'achat — `file` ne porte QUE la clef `mp3-128`
+/// (3 pistes sur 3 dans la collection, 2 sur 2 sur la page d'album), tout
+/// autre `enc=` répond 404, et le flux mesure bien 128 kbit/s / 44 100 Hz.
+/// Il n'y a donc rien de mieux à jouer, et la seule réparation honnête est de
+/// le DIRE là où l'acheteur regarde.
+///
+/// Or c'était la seule surface Bandcamp muette : `/discover` porte `qualite`
+/// et `lossless` par article ET sur l'enveloppe, `/search` sur l'enveloppe,
+/// `/album` sur l'album et sur chaque piste — et `/collection` sur rien. La
+/// règle de #2074 (« un flux à 128 kbit/s doit être annoncé PARTOUT où il
+/// apparaît ») s'arrêtait juste avant l'écran de l'acheteur.
+///
+/// Sabotage : retirer `"qualite": BC_STREAM_QUALITY` de l'article dans
+/// `collection_mise_en_forme` fait tomber ce test.
+#[test]
+fn ma_collection_annonce_le_mp3_128_comme_les_autres_surfaces_bandcamp() {
+    let vue = tune_bandcamp::collection_mise_en_forme(&page_de_collection_reelle(), 897100);
+
+    assert_eq!(
+        vue["qualite"],
+        json!("mp3-128"),
+        "l'enveloppe de « Ma collection » doit annoncer sa qualité comme \
+         /search et /discover : {vue}"
+    );
+    assert_eq!(
+        vue["lossless"],
+        json!(false),
+        "« Ma collection » ne sert PAS de sans perte, et doit le dire : {vue}"
+    );
+    let note = vue["quality_note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("128") && note.contains("télécharger"),
+        "la note doit nommer le débit ET le seul chemin qui rend à l'acheteur \
+         ce qu'il a payé — le téléchargement : {note:?}"
+    );
+
+    for (rang, article) in vue["items"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(
+            article["qualite"],
+            json!("mp3-128"),
+            "article {rang} : la qualité doit être annoncée sur l'ARTICLE \
+             aussi, comme /discover le fait — un écran qui n'affiche que la \
+             grille doit pouvoir le dire : {article}"
+        );
+        assert_eq!(
+            article["lossless"],
+            json!(false),
+            "article {rang} : {article}"
+        );
+    }
+}
+
+/// 🔴 Un article de « Ma collection » porte de quoi s'afficher et de quoi jouer.
+///
+/// Second symptôme du même écran, rapporté le même jour : « le clic sur la
+/// pochette ne lance pas la lecture ». Une seule cause côté serveur — la
+/// réponse de Bandcamp porte DÉJÀ la pochette et une URL de flux par article,
+/// et `collection_mise_en_forme` les jetait toutes les deux. L'article arrivait
+/// au client avec cinq champs de texte : rien à afficher, rien à jouer.
+///
+/// Le préfixe `a` de la pochette n'est pas décoratif — `.../img/3903246145_2.jpg`
+/// répond 404, `.../img/a3903246145_2.jpg` répond 200, mesuré. C'est pour cela
+/// que le client ne recompose AUCUNE URL bcbits lui-même et attend une adresse
+/// résolue, comme sur les trois autres surfaces.
+///
+/// Sabotage : retirer `"extrait": extrait_de_collection(brut, it)` de
+/// `collection_mise_en_forme` fait tomber ce test.
+#[test]
+fn un_article_de_ma_collection_porte_une_pochette_et_un_extrait_jouables() {
+    let vue = tune_bandcamp::collection_mise_en_forme(&page_de_collection_reelle(), 897100);
+    let articles = vue["items"].as_array().unwrap();
+    assert_eq!(
+        articles.len(),
+        2,
+        "les deux achats doivent survivre : {vue}"
+    );
+
+    let achat = &articles[0];
+    assert_eq!(
+        achat["pochette"],
+        json!("https://f4.bcbits.com/img/a3903246145_2.jpg"),
+        "la pochette doit être RÉSOLUE, préfixe `a` compris : sans elle la \
+         vignette de l'acheteur reste vide sur l'écran de ses propres \
+         achats : {achat}"
+    );
+    assert_eq!(
+        achat["extrait"],
+        json!("https://bandcamp.com/stream_redirect?enc=mp3-128&track_id=3603313194"),
+        "l'URL de flux vient du bloc `tracklists` que Bandcamp rend déjà dans \
+         la MÊME réponse — sans elle, le geste de lecture n'a rien à jouer : \
+         {achat}"
+    );
+    assert_eq!(
+        achat["source"],
+        json!("bandcamp"),
+        "la source nomme le service, comme partout ailleurs : {achat}"
+    );
+
+    // Un article sans tracklist rend un `null` franc, pas une panne ni une
+    // URL inventée : le client saura qu'il n'y a rien à jouer.
+    assert_eq!(
+        articles[1]["extrait"],
+        Value::Null,
+        "sans tracklist, l'extrait doit être null : {}",
+        articles[1]
+    );
+
+    // TÉMOIN — les cinq champs d'origine sont intacts. Le client les lit tous
+    // (`BandcampItem`), et le rapprochement avec la bibliothèque locale en
+    // dépend : les ajouter ne doit rien remplacer.
+    assert_eq!(achat["artist"], json!("Andrew Huang"));
+    assert_eq!(achat["title"], json!("CXM 1978"));
+    assert_eq!(achat["type"], json!("album"));
+    assert_eq!(
+        achat["url"],
+        json!("https://andrewhuang.bandcamp.com/album/cxm-1978")
+    );
+    assert_eq!(achat["art_id"], json!(3903246145i64));
+    assert_eq!(vue["fan_id"], json!(897100));
+    assert_eq!(vue["count"], json!(2));
+    assert_eq!(vue["more_available"], json!(false));
+}
