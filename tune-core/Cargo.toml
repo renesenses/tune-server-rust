@@ -280,6 +280,15 @@ path = "tests/octets_servis_inconnus_2394.rs"
 name = "journal_egaliseur_i3479"
 path = "tests/journal_egaliseur_i3479.rs"
 
+# #3479, seconde moitie du message du 08/09 : la bascule d'egaliseur CHIFFRE sa
+# duree (`duree_ms`) et NOMME ce qui la retient (`amortissement`). Abonne
+# `tracing` GLOBAL, donc un test par binaire — meme raison que la cible
+# ci-dessus. `autotests = false` en tete de ce fichier : sans cette cible, le
+# fichier ne serait JAMAIS compile.
+[[test]]
+name = "reactivite_egaliseur_i3479"
+path = "tests/reactivite_egaliseur_i3479.rs"
+
 [build-dependencies]
 cc = "1"
 
