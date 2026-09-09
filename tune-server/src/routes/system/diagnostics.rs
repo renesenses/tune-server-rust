@@ -677,6 +677,12 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
         // Squeezebox ne pourraient jamais se connecter (#2938). `null` tant
         // qu'aucune tentative d'ecoute n'a eu lieu.
         "slimproto": tune_core::slimproto::etat_ecoute(),
+        // L'etat de l'ecouteur SSDP (port 1900) et le nombre de reponses
+        // M-SEARCH emises. Sans ce champ, « Tune repond-il aux M-SEARCH ? » ne
+        // se mesurait qu'au tcpdump, chez le testeur — c'est exactement ce
+        // qu'a du faire celui de #3687. `null` tant qu'aucune liaison n'a ete
+        // tentee.
+        "ssdp": tune_core::discovery::ssdp::etat_ecoute_ssdp(),
         "devices": devices.iter().map(|d| json!({
             "id": d.id,
             "name": d.name,
@@ -1541,6 +1547,37 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             md.push_str("- SlimProto (Squeezebox): aucune tentative d'ecoute\n");
         }
     }
+
+    // #3687 : un testeur a passe une soiree au tcpdump et au M-SEARCH Python
+    // pour savoir si Tune repond aux recherches SSDP. La reponse tient en une
+    // ligne, et elle est desormais ici — avec, en cas de panne, la cause.
+    match tune_core::discovery::ssdp::etat_ecoute_ssdp() {
+        Some(etat) if !etat.ecoute => {
+            md.push_str(&format!(
+                "- **⚠ Decouverte SSDP HORS SERVICE** — port {} : {}\n",
+                etat.port,
+                etat.message.as_deref().unwrap_or("cause inconnue"),
+            ));
+            if let Some(err) = etat.erreur_systeme.as_deref() {
+                md.push_str(&format!("  - erreur systeme : {err}\n"));
+            }
+        }
+        Some(etat) => {
+            md.push_str(&format!(
+                "- Decouverte SSDP: en ecoute sur {}, {} reponse(s) M-SEARCH emise(s)\n",
+                etat.port, etat.reponses_msearch
+            ));
+            if etat.echecs > 0 {
+                md.push_str(&format!(
+                    "  - {} liaison(s) refusee(s) avant reprise\n",
+                    etat.echecs
+                ));
+            }
+        }
+        None => {
+            md.push_str("- Decouverte SSDP: aucune tentative d'ecoute\n");
+        }
+    }
     md.push('\n');
 
     // #2392 : c'est CE bloc qui aurait épargné au bêta-testeur du module
@@ -1688,6 +1725,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             "discovered_devices": devices.len(),
             "registered_outputs": output_count,
             "slimproto": tune_core::slimproto::etat_ecoute(),
+            // Le pendant de la ligne markdown ci-dessus (#3687).
+            "ssdp": tune_core::discovery::ssdp::etat_ecoute_ssdp(),
         },
         "oaat_endpoints": oaat_endpoints,
         "ring_starvation": ring_starvation,

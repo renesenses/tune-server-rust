@@ -436,6 +436,13 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     if let Some(obj) = v.as_object_mut() {
         crate::routes::zones::inject_metadata_anchor(obj, &zone_state);
         crate::routes::zones::inject_session_context(obj, &zone_state);
+        // #2672 — LE défaut. Cette charge utile, rendue par une vingtaine de
+        // routes de lecture, ne portait aucun des neuf réglages du panneau
+        // « Avancé · renderer », alors que `GET /zones` et `GET /zones/{id}`
+        // les portent. Un client qui remplace son objet zone par la réponse
+        // d'un `play` les voyait donc disparaître à chaque changement de
+        // fichier — sans qu'une seule ligne de la base ait bougé.
+        crate::routes::zones::injecter_reglages_renderer(obj, &zone_repo, zone_id);
     }
     // Où va le son — même champ que GET /zones et GET /zones/{id} (#1499).
     if let Some(ref zone) = zone_db {

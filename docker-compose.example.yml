@@ -10,6 +10,9 @@ services:
       - /chemin/vers/musique:/music:ro
       - tune-data:/data
     environment:
+      # Mettre `[]` pour demarrer SANS aucun dossier de bibliotheque et
+      # les choisir depuis Reglages. Un `/music` non monte est un volume
+      # anonyme VIDE : il n'est plus seme au premier demarrage (#3686).
       - TUNE_MUSIC_DIRS=["/music"]
       - TUNE_PORT=8888
       - TUNE_AUTO_SCAN=true

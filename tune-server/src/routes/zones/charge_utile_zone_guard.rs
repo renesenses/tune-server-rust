@@ -100,3 +100,92 @@ fn toute_charge_utile_de_zone_porte_le_transport_et_la_decision_suivant() {
          permutation depuis l'ordre brut de la file (#2337)."
     );
 }
+
+/// 🔴 #2672 — LA GARDE. Les neuf réglages « Avancé · renderer » sortent des
+/// TROIS charges utiles de zone.
+///
+/// SITES D'APPEL GARDÉS, nommément : `list_zones` et `get_zone`
+/// (`routes/zones/lecture.rs`) et `build_zone_json` (`routes/playback.rs`) —
+/// les trois appellent `crate::routes::zones::injecter_reglages_renderer`.
+///
+/// Le contrôle ne compte plus les clés une à une : elles ne sont plus écrites
+/// qu'une fois, dans l'injecteur. Il compte les SITES D'APPEL, et les compare
+/// au nombre de charges utiles que `queue_length` denombre déjà. Trois charges
+/// utiles, trois appels — ou le contrôle tombe.
+///
+/// C'est la quatrième divergence de cette famille (#2055, #2092, #2337, puis
+/// celle-ci) : à chaque fois, une copie à la main d'une charge utile de zone a
+/// oublié un champ que les autres portaient.
+#[test]
+fn les_trois_charges_utiles_injectent_les_reglages_renderer() {
+    let src = format!("{}{}", code_de_production(), corps_de_build_zone_json());
+
+    let charges =
+        src.matches(r#""queue_length".into()"#).count() + src.matches(r#""queue_length":"#).count();
+    assert!(
+        charges >= 3,
+        "le marqueur `queue_length` n'apparaît que {charges} fois — la forme \
+         des charges utiles a changé et ce contrôle ne garde plus rien."
+    );
+
+    let appels = src.matches("injecter_reglages_renderer(obj").count();
+    assert_eq!(
+        appels, charges,
+        "{charges} charge(s) utile(s) de zone, mais {appels} appellent \
+         `injecter_reglages_renderer` : une copie a divergé. Le client verrait \
+         de nouveau les cases « Avancé · renderer » se décocher au lancement \
+         d'un album (#2672)."
+    );
+}
+
+/// 🔴 #2672 — l'autre moitié : l'injecteur écrit bien les NEUF clés.
+///
+/// Sans elle, la garde ci-dessus resterait verte devant un
+/// `injecter_reglages_renderer` vidé de son corps : trois appels, zéro clé.
+/// Elle APPELLE la fonction de production, sur une carte réelle, et lit ce
+/// qu'elle y a mis — elle ne relit pas le source.
+#[test]
+fn l_injecteur_ecrit_les_neuf_reglages_du_panneau_avance() {
+    let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    tune_core::db::migrations::run_migrations(&db).unwrap();
+    let backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend> = std::sync::Arc::new(db);
+    let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(backend);
+    let zone_id = repo.create("Salon", Some("dlna"), None).unwrap();
+
+    // L'état que le testeur avait posé : trois cases cochées.
+    repo.update_dlna_lpcm(zone_id, true).unwrap();
+    repo.update_dlna_native_flac(zone_id, true).unwrap();
+    repo.update_dlna_cap_16bit(zone_id, true).unwrap();
+
+    let mut obj = serde_json::Map::new();
+    crate::routes::zones::injecter_reglages_renderer(&mut obj, &repo, zone_id);
+
+    for cle in [
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "alac_passthrough",
+        "aac_passthrough",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+    ] {
+        assert!(
+            obj.contains_key(cle),
+            "la clé `{cle}` manque à la charge utile — c'est une case qui \
+             se décoche à l'écran (#2672)"
+        );
+    }
+
+    // Et ce sont les VALEURS de la base, pas des défauts : une garde qui
+    // n'aurait vérifié que la présence resterait verte devant un injecteur
+    // qui écrirait `false` partout — exactement le symptôme à empêcher.
+    assert_eq!(obj["dlna_lpcm"], serde_json::json!(true));
+    assert_eq!(obj["dlna_native_flac"], serde_json::json!(true));
+    assert_eq!(obj["dlna_cap_16bit"], serde_json::json!(true));
+    // Contre-épreuve : ce qui n'a pas été coché ne l'est pas.
+    assert_eq!(obj["dlna_wav24"], serde_json::json!(false));
+    assert_eq!(obj["alac_passthrough"], serde_json::json!(false));
+}
