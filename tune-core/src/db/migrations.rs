@@ -5015,7 +5015,13 @@ mod tests {
         // 51 : `tracks_audio_fingerprint` (BIB-B2). Jumelle SQLite : la 96.
         // L'empreinte du contenu audio decode, versionnee, NULL pour
         // l'existant ; TEXT des deux cotes.
-        assert_eq!(pg_latest_version(), 51, "latest PG migration must be 51");
+        // 52 : `streaming_item_tags` (#3699). Jumelle SQLite : la 97.
+        // `item_tags.item_id` est un entier — la clef primaire d'un objet
+        // LOCAL. Un album Qobuz, Tidal ou Bandcamp n'en a pas : il porte la
+        // paire `source` + `source_id`. Meme forme que `streaming_favorites`,
+        // instantane d'affichage compris, pour qu'un album retire du catalogue
+        // degrade sa pochette sans vider la liste.
+        assert_eq!(pg_latest_version(), 52, "latest PG migration must be 52");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
