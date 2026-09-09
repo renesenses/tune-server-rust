@@ -288,6 +288,58 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_3182_moteur_annonce_dans_le_rapport -- --nocapture --test-threads=1
 
+      # #3569 -- les E2E historiques de `postgres_e2e.rs`, ENFIN executees.
+      #
+      # Quinze epreuves sur dix-neuf n'avaient jamais tourne sur AUCUNE porte.
+      # Le fichier date de la mise en place du moteur PostgreSQL ; sa doctrine
+      # ecrite en tete disait « run via scripts/pg-e2e.sh », un script qui exige
+      # Docker et que personne n'a jamais branche a la CI. Les quatre epreuves
+      # visibles (#1706, #2860, #2441, `pg_config_backup`) le sont parce qu'une
+      # etape les nomme par un filtre ; les quinze autres prenaient leur chemin
+      # « saut annonce » a chaque execution, et `cargo` les comptait `ok`.
+      #
+      # Le filtre est le NOM DU MODULE : il prend les dix-neuf d'un coup, y
+      # compris celles que les etapes ci-dessus nomment deja. Les rejouer coute
+      # quelques secondes et supprime la question « laquelle manque ».
+      #
+      # `--test-threads=1` : chaque epreuve TRUNCATE les memes tables (voir
+      # `reset_schema`), et les `TRUNCATE ... CASCADE` s'interbloquent en
+      # parallele. Meme raison que l'etape des routes plus bas.
+      - name: E2E historiques de PostgreSQL (#3569)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib postgres_e2e -- --nocapture --test-threads=1
+
+      # #3569 -- les trois temoins PostgreSQL de `tune-server` que rien
+      # n'executait : le drapeau « compilation » (#1957), la ventilation par
+      # source (#2147) et les versions par piste (#2372). Chacun porte deja une
+      # contre-epreuve SQLite qui tourne dans `ci.yml` ; c'est le versant
+      # PostgreSQL qui n'avait jamais tourne.
+      #
+      # ⚠️ TROIS etapes et non une, parce que les trois fichiers ne vivent pas
+      # dans la meme cible : #1957 est tire par l'agregateur `server_contracts`
+      # (`autotests = false`), #2147 et #2372 ont chacun leur `[[test]]`. Une
+      # cible qui ne contient pas le filtre ne rend pas d'erreur : `cargo`
+      # affiche `test result: ok. 0 passed; 620 filtered out` et l'etape est
+      # VERTE sans avoir rien execute. Premiere redaction de ce lot :
+      # `--test server_contracts i2147_pg` -- zero test, vert. C'est la garde de
+      # recensement (`derive_des_garde_fous_2816.rs`) qui l'a dit, en comptant
+      # le temoin comme toujours saute.
+      - name: Drapeau « compilation » sur PostgreSQL (#1957)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test server_contracts pg_i1957 -- --nocapture --test-threads=1
+
+      - name: Ventilation par source sur PostgreSQL (#2147)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test comptes_par_source_2147 i2147_pg -- --nocapture --test-threads=1
+
+      - name: Versions par piste sur PostgreSQL (#2372)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_2372_versions_par_piste -- --nocapture --test-threads=1
+
       # #3256 -- ` RETURNING id` seulement la ou la colonne EXISTE, sur une
       # VRAIE base.
       #
