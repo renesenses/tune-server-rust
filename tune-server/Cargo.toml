@@ -348,6 +348,20 @@ path = "tests/sources_trois_routes_i3226.rs"
 [[test]]
 name = "radio_adresse_pas_un_flux_3578"
 path = "tests/radio_adresse_pas_un_flux_3578.rs"
+
+# #3543 : l'annuaire du site sert dix entrees Radio Paradise pour sept canaux,
+# dont trois adresses de flux servies DEUX fois sous deux noms. Chaque entree
+# porte son bouton « + Ajouter a Tune », qui tombe sur `GET /radios/add` et
+# creait sans broncher un doublon dans la liste du testeur — `radio_stations`
+# n'a aucune contrainte d'unicite. Le temoin passe par la ROUTE MONTEE.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Pas de `required-features` : `add_from_web` ne sonde pas le flux, le banc
+# n'ouvre aucune connexion sortante et monte une base SQLite en memoire.
+[[test]]
+name = "radio_ajout_web_sans_doublon_3543"
+path = "tests/radio_ajout_web_sans_doublon_3543.rs"
 # #3383 : la bascule « désactiver la télémétrie » n'éteignait rien — la route
 # n'écrivait pas, et les sept gardes d'envoi ne lisaient que `TUNE_TELEMETRY`.
 # Le témoin passe par les ROUTES MONTÉES puis appelle les décisions de
