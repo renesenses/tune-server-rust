@@ -197,6 +197,14 @@ pub struct DidlBuilder {
     /// True for infinite live streams (internet radio): emit live/senderPaced
     /// protocolInfo flags and never emit `size=`/`duration=` in `<res>`.
     live_stream: bool,
+    /// La valeur de `<upnp:class>`. `musicTrack` par defaut — c'est ce que
+    /// TOUS les emetteurs historiques publiaient, et ce defaut garde leur
+    /// sortie octet pour octet. Le dossier Radio est le seul a en demander une
+    /// autre (`audioBroadcast`), et il ne pouvait pas le faire sans se batir
+    /// son `<item>` a la main, hors de ce constructeur — donc hors de
+    /// `escape_sain`, hors de `live_stream` et hors de tout ce que ce
+    /// constructeur garantit.
+    upnp_class: String,
     byte_seekable: bool,
     /// Émettre `sampleFrequency` / `bitsPerSample` / `nrAudioChannels` dans
     /// `<res>`. Faux pour le DIDL réduit, qui doit tenir sous un segment TCP
@@ -227,6 +235,7 @@ impl DidlBuilder {
             item_id: "0".to_string(),
             parent_id: "0".to_string(),
             live_stream: false,
+            upnp_class: "object.item.audioItem.musicTrack".to_string(),
             byte_seekable: true,
             emettre_attributs_audio: true,
         }
@@ -255,6 +264,18 @@ impl DidlBuilder {
     /// `size=`/`duration=` attributes regardless of any values set.
     pub fn live_stream(mut self, yes: bool) -> Self {
         self.live_stream = yes;
+        self
+    }
+    /// Choisir la `<upnp:class>` publiee, au lieu du `musicTrack` par defaut.
+    ///
+    /// Une station de radio est un `object.item.audioItem.audioBroadcast`, et
+    /// [`crate::upnp_server`] declare cette classe dans sa table
+    /// `CLASSES_PUBLIEES` : c'est par elle qu'un `Search` vise le dossier
+    /// Radio. Elle doit donc rester ce qu'elle est — mais elle etait jusqu'ici
+    /// la SEULE raison pour laquelle le dossier Radio se batissait son XML a
+    /// la main.
+    pub fn upnp_class(mut self, class: &str) -> Self {
+        self.upnp_class = class.to_string();
         self
     }
 
@@ -504,11 +525,12 @@ impl DidlBuilder {
             .map(|ch| format!(" nrAudioChannels=\"{ch}\""))
             .unwrap_or_default();
 
+        let classe = escape_sain(&self.upnp_class);
         format!(
             "<item id=\"{escaped_id}\" parentID=\"{escaped_pid}\" restricted=\"1\">\
              <dc:title>{title}</dc:title>\
              {artist_tags}\
-             <upnp:class>object.item.audioItem.musicTrack</upnp:class>\
+             <upnp:class>{classe}</upnp:class>\
              {album_tag}\
              {art_tag}\
              {track_num_tag}\
