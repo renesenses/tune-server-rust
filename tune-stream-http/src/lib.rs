@@ -293,6 +293,38 @@ pub async fn handle_head(
     (StatusCode::OK, headers).into_response()
 }
 
+/// Sentinelle du corps d'une conversion : elle NOMME un blocage qui ne finit
+/// jamais.
+///
+/// `StreamSession::note_delivery_stall` ne se prononce qu'au RETOUR du
+/// `yield` : elle mesure une attente FINIE. Un corps lâché EN VOL — la
+/// connexion meurt, la zone est arrêtée, le processus n'en sort plus — ne
+/// passe jamais par ce point de mesure et ne laisse donc pas une ligne. C'est
+/// la forme même de #3575 (« sortie locale imprenable pour toute la vie du
+/// processus ») : le pire cas est précisément celui qui se tait.
+///
+/// La sentinelle vit dans le corps du flux. Quand le corps est lâché, son
+/// `Drop` demande à la session si une attente était en vol, et l'écrit.
+struct SentinelleDuCorps(std::sync::Arc<StreamSession>);
+
+impl Drop for SentinelleDuCorps {
+    fn drop(&mut self) {
+        if let Some(attente) = self.0.note_delivery_abandoned() {
+            warn!(
+                stream_id = %self.0.id,
+                attente_transport_ms = attente.as_millis() as u64,
+                bytes_sent = self
+                    .0
+                    .bytes_sent
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "stream_delivery_abandoned — le corps du flux interne a été lâché ALORS \
+                 qu'un morceau attendait encore de partir : cette attente ne finira \
+                 jamais, et personne ne serait revenu la mesurer"
+            );
+        }
+    }
+}
+
 pub async fn handle_stream(
     Path(raw_id): Path<String>,
     State(sessions): State<SharedSessions>,
@@ -835,6 +867,10 @@ pub async fn handle_stream(
             // `StreamSession::note_delivery_stall`.
             let mut attente_transport = std::time::Duration::ZERO;
 
+            // Nomme le blocage qui ne finit jamais : voir `SentinelleDuCorps`.
+            // Elle vit ICI, dans le corps, pour que son `Drop` parte avec lui.
+            let _sentinelle = SentinelleDuCorps(session.clone());
+
             // ── L'en-tête WAV doit survivre aux connexions de sonde ──
             //
             // Sur une conversion, l'en-tête est le premier chunk DU CANAL : la
@@ -905,9 +941,9 @@ pub async fn handle_stream(
                     }
                     if buffered == 0 && !coalesce_buf.is_empty() {
                         let restant = std::mem::take(&mut coalesce_buf);
-                        let avant_yield = tokio::time::Instant::now();
+                        session.debut_attente_transport();
                         yield Ok(bytes::Bytes::from(restant));
-                        attente_transport += avant_yield.elapsed();
+                        attente_transport += session.fin_attente_transport();
                     }
                 }
 
@@ -928,6 +964,12 @@ pub async fn handle_stream(
                                 attente_transport_ms = attente_transport.as_millis() as u64,
                                 buffered,
                                 channel_max,
+                                // Rang du blocage DANS la session : #2952 en
+                                // porte deux par piste, et lire « blocage=2 »
+                                // évite de croire qu'on tient le premier.
+                                blocage = session
+                                    .stall_alerts
+                                    .load(std::sync::atomic::Ordering::Relaxed),
                                 bytes_sent = session
                                     .bytes_sent
                                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -963,9 +1005,9 @@ pub async fn handle_stream(
                                 }
                                 while coalesce_buf.len() >= MIN_HTTP_CHUNK {
                                     let flushed: Vec<u8> = coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
-                                    let avant_yield = tokio::time::Instant::now();
+                                    session.debut_attente_transport();
                                     yield Ok(bytes::Bytes::from(flushed));
-                                    attente_transport += avant_yield.elapsed();
+                                    attente_transport += session.fin_attente_transport();
                                 }
                                 continue;
                             }
@@ -973,9 +1015,9 @@ pub async fn handle_stream(
                         coalesce_buf.extend_from_slice(&chunk);
                         while coalesce_buf.len() >= MIN_HTTP_CHUNK {
                             let flushed: Vec<u8> = coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
-                            let avant_yield = tokio::time::Instant::now();
+                            session.debut_attente_transport();
                             yield Ok(bytes::Bytes::from(flushed));
-                            attente_transport += avant_yield.elapsed();
+                            attente_transport += session.fin_attente_transport();
                         }
                     }
                 }
@@ -1948,8 +1990,9 @@ mod tests {
         // Première trame : régime sain, rien à signaler.
         let premiere = corps.next().await.expect("corps terminé").expect("flux");
         assert_eq!(premiere.len(), 65_536);
-        assert!(
-            !session.stall_alert_emitted.load(Relaxed),
+        assert_eq!(
+            session.stall_alerts.load(Relaxed),
+            0,
             "une trame livrée normalement ne doit RIEN signaler"
         );
 
@@ -1961,8 +2004,13 @@ mod tests {
 
         let seconde = corps.next().await.expect("corps terminé").expect("flux");
         assert_eq!(seconde.len(), 65_536);
-        assert!(
-            session.stall_alert_emitted.load(Relaxed),
+        // `stall_alerts` et non `stall_alert_emitted` : depuis que le témoin se
+        // RÉARME au premier tour sain (une ligne par blocage, pas une par
+        // session), le drapeau est retombé quand la trame suivante est servie.
+        // Le COMPTEUR, lui, est le fait durable.
+        assert_eq!(
+            session.stall_alerts.load(Relaxed),
+            1,
             "30 s sans que les octets DÉJÀ décodés ne partent, et le serveur \
              n'en dit rien : c'est le trou d'instrumentation de #2952"
         );
@@ -1998,13 +2046,173 @@ mod tests {
             !session.stall_alert_emitted.load(Relaxed),
             "aucune attente n'a dépassé le seuil : rien ne doit être signalé"
         );
+        assert_eq!(
+            session.stall_alerts.load(Relaxed),
+            0,
+            "aucun blocage, aucune ligne"
+        );
     }
 
-    /// Le seuil et la règle « une seule ligne par session » sont le contrat de
+    /// GARDE #2952 — DEUX blocages dans la même piste doivent donner DEUX
+    /// lignes.
+    ///
+    /// Le journal de Belkadi Yacine porte, sur la MÊME piste et donc la même
+    /// session de flux, `local_audio_slow_read wait_ms=38594` à 15:47:42 puis
+    /// `wait_ms=44853` à 15:48:36 — la piste a commencé à 15:46:47
+    /// (`track_end_gap wall_secs=290` à 15:51:37) et s'est terminée à 15:51:37.
+    /// La piste suivante porte la même paire (35 191 ms, 35 367 ms). Avec une
+    /// seule ligne par session, le second blocage de chaque piste n'aurait
+    /// jamais de contrepartie côté serveur, et l'absence de ligne se lirait
+    /// comme « le flux allait bien la seconde fois ».
+    ///
+    /// Le vrai `handle_stream` est appelé ; l'horloge est arrêtée et avancée à
+    /// la main, donc le vert ne dépend pas de la charge de la machine.
+    #[tokio::test]
+    async fn deux_blocages_dans_la_meme_session_donnent_deux_lignes() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (session, sessions) = session_pleine("deux", 8).await;
+
+        let rep = super::handle_stream(
+            Path("deux.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+
+        // Trame 1 : régime sain.
+        assert_eq!(
+            corps.next().await.expect("corps").expect("flux").len(),
+            65_536
+        );
+
+        // Premier blocage : 30 s sans que le corps soit relu.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::time::resume();
+        assert_eq!(
+            corps.next().await.expect("corps").expect("flux").len(),
+            65_536
+        );
+        assert_eq!(
+            session.stall_alerts.load(Relaxed),
+            1,
+            "le premier blocage doit être signalé"
+        );
+
+        // Trame saine entre les deux : c'est elle qui réarme.
+        assert_eq!(
+            corps.next().await.expect("corps").expect("flux").len(),
+            65_536
+        );
+
+        // Second blocage, même session.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::time::resume();
+        assert_eq!(
+            corps.next().await.expect("corps").expect("flux").len(),
+            65_536
+        );
+        assert_eq!(
+            session.stall_alerts.load(Relaxed),
+            2,
+            "le SECOND blocage de la même piste doit avoir sa ligne : avec un \
+             seul tir par session, la moitié de la matière de #2952 reste \
+             invisible et l'absence se lit comme un flux sain"
+        );
+    }
+
+    /// GARDE #3575 — un blocage qui ne FINIT jamais doit être nommé.
+    ///
+    /// `note_delivery_stall` mesure au RETOUR du `yield` : un corps lâché en
+    /// vol ne repasse jamais par ce point et ne laissait donc pas une seule
+    /// ligne. C'est le pire cas — « sortie locale imprenable pour toute la vie
+    /// du processus » — et c'était précisément celui qui se taisait.
+    #[tokio::test]
+    async fn un_corps_lache_pendant_le_blocage_le_dit() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (session, sessions) = session_pleine("lache", 6).await;
+
+        let rep = super::handle_stream(
+            Path("lache.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+
+        assert_eq!(
+            corps.next().await.expect("corps").expect("flux").len(),
+            65_536
+        );
+
+        // Le corps reste suspendu DANS son `yield` pendant 30 s, puis la
+        // connexion meurt : personne ne reviendra jamais mesurer cette attente.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::time::resume();
+        drop(corps);
+
+        assert!(
+            session.abandon_alert_emitted.load(Relaxed),
+            "un corps lâché après 30 s d'attente en vol ne laissait AUCUNE \
+             trace : c'est le trou de #3575"
+        );
+        assert_eq!(
+            session.stall_alerts.load(Relaxed),
+            0,
+            "aucune attente FINIE n'a été mesurée : ne pas la compter deux fois"
+        );
+    }
+
+    /// TÉMOIN VERT du précédent : lâcher un corps est le cas ORDINAIRE.
+    ///
+    /// Sans lui, une sentinelle qui crierait à chaque fermeture passerait
+    /// aussi — et noierait le journal à chaque changement de piste.
+    #[tokio::test]
+    async fn un_corps_lache_sans_attente_ne_signale_aucun_abandon() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (session, sessions) = session_pleine("ordinaire", 6).await;
+
+        let rep = super::handle_stream(
+            Path("ordinaire.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+
+        for _ in 0..2 {
+            assert_eq!(
+                corps.next().await.expect("corps").expect("flux").len(),
+                65_536
+            );
+        }
+        drop(corps);
+
+        assert!(
+            !session.abandon_alert_emitted.load(Relaxed),
+            "un corps lâché entre deux morceaux n'est pas un blocage"
+        );
+    }
+
+    /// Le seuil et la règle « une ligne par BLOCAGE » sont le contrat de
     /// `note_delivery_stall`. Une attente sous le seuil ne dit rien ; la
-    /// première au-dessus alerte ; les suivantes se taisent.
+    /// première au-dessus alerte ; les suivantes du MÊME blocage se taisent ;
+    /// un tour sain réarme, et le blocage suivant a droit à sa ligne.
     #[test]
-    fn le_seuil_de_blocage_alerte_une_seule_fois() {
+    fn le_seuil_de_blocage_alerte_une_fois_par_blocage() {
+        use std::sync::atomic::Ordering::Relaxed;
         use std::time::Duration;
         use tune_core::http::streamer::DELIVERY_STALL_THRESHOLD;
 
@@ -2019,7 +2227,21 @@ mod tests {
         );
         assert!(
             !session.note_delivery_stall(DELIVERY_STALL_THRESHOLD * 10, Duration::ZERO),
-            "une seule ligne par session"
+            "le MÊME blocage ne se répète pas"
+        );
+
+        // Un tour sain : le blocage est fini.
+        assert!(!session.note_delivery_stall(sous, sous));
+        assert!(
+            session.note_delivery_stall(Duration::ZERO, DELIVERY_STALL_THRESHOLD),
+            "le SECOND blocage de la session doit avoir sa ligne : #2952 en \
+             porte deux par piste (38 594 ms puis 44 853 ms), et n'en garder \
+             qu'un fait lire « la seconde attente n'a pas de contrepartie »"
+        );
+        assert_eq!(
+            session.stall_alerts.load(Relaxed),
+            2,
+            "deux blocages, deux lignes"
         );
     }
 
