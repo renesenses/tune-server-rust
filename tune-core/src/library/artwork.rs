@@ -2192,6 +2192,30 @@ pub fn refresh_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String>
 /// Running this at the end of a scan self-heals those albums: any local album
 /// with a missing cover gets its embedded art re-extracted from the first track
 /// that yields one. Returns the number of albums filled.
+/// Le fichier RÉEL d'une piste — celui qu'on peut ouvrir.
+///
+/// 🔴 `file_path` ne suffit pas. Une piste découpée par une feuille CUE est une
+/// tranche à l'intérieur d'un autre fichier : elle n'a pas de fichier à elle et
+/// porte `file_path = NULL` par construction, son support étant `cue_media_path`.
+///
+/// Les deux boucles ci-dessous filtraient sur `file_path` : les pistes CUE
+/// étaient donc écartées AVANT même qu'on cherche une pochette. Gros Bidon
+/// (Didier), fil forum 1738 le 09/09/2026 : « il manque les pochettes des albums
+/// car Tune ne semble pas prendre le fichier cover.jpg associé au FLAC quand il
+/// est associé à un fichier CUE. » Le `cover.jpg` était bien là, à côté du FLAC ;
+/// personne n'allait le voir.
+///
+/// C'est le même motif que l'élagage, qui a dû recevoir son propre chemin
+/// (`elaguer_les_pistes_cue`) parce que la purge ordinaire filtre elle aussi sur
+/// `file_path IS NOT NULL` : toute passe indexée sur `file_path` perd les pistes
+/// CUE en silence.
+fn chemin_sur_disque(track: &crate::db::models::Track) -> Option<&str> {
+    track
+        .file_path
+        .as_deref()
+        .or(track.cue_media_path.as_deref())
+}
+
 pub fn backfill_embedded_covers(
     db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
     cache_dir: &Path,
@@ -2214,7 +2238,7 @@ pub fn backfill_embedded_covers(
         // dont le fichier portait une image.
         if let Some(hash) = tracks
             .iter()
-            .filter_map(|t| t.file_path.as_ref())
+            .filter_map(chemin_sur_disque)
             .find_map(|p| folder_cover_hash(Path::new(p), cache_dir))
         {
             if album_repo.force_update_cover_path(*album_id, &hash).is_ok() {
@@ -2224,7 +2248,7 @@ pub fn backfill_embedded_covers(
         }
 
         for track in &tracks {
-            let Some(ref file_path) = track.file_path else {
+            let Some(file_path) = chemin_sur_disque(track) else {
                 continue;
             };
             if let Some(hash) = get_or_extract(Path::new(file_path), cache_dir) {
