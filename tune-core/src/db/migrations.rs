@@ -1690,6 +1690,54 @@ WHERE name LIKE '%World%'
         // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95.
         up: "",
     },
+    // #3699 — etiqueter un album de streaming. `item_tags.item_id` est un
+    // `INTEGER` : la clef primaire d'un objet de la base LOCALE. Un album
+    // Qobuz, Tidal ou Bandcamp n'en a pas — il porte la paire
+    // `source` + `source_id`. La table locale ne peut donc pas le designer, et
+    // le client avait raison de cacher le bouton Etiquettes sur un album de
+    // streaming : le serveur n'aurait rien su en faire.
+    //
+    // Meme forme que les FAVORIS, qui ont deja resolu exactement ce probleme
+    // (`streaming_favorites`, migration 58) : une table a part, indexee sur la
+    // paire, et un INSTANTANE d'affichage (`title`, `artist`, `album`,
+    // `cover_url`) pose a l'etiquetage. C'est cet instantane qui repond au
+    // troisieme point du ticket : un album de streaming peut DISPARAITRE du
+    // catalogue, et la liste par etiquette doit continuer de s'afficher. Comme
+    // elle se rend depuis l'instantane, elle n'interroge jamais le service :
+    // un `source_id` mort degrade sa pochette, il ne bloque pas l'ecran.
+    //
+    // PAS DE COLONNE `id` : la clef naturelle (tag_id, item_type, source,
+    // source_id) EST la clef primaire — meme choix que `favorite_facets`
+    // (migration PG 038) et `task_runs` (87), et pour la meme raison : une
+    // colonne `id` impose la divergence AUTOINCREMENT / BIGSERIAL que la
+    // bascule SQLite -> PostgreSQL a deja payee cher (#1706). C'est aussi ce
+    // qui rend le deuxieme point du ticket structurel : l'unicite porte sur la
+    // PAIRE, pas sur un entier, donc le meme album Qobuz etiquete deux fois ne
+    // peut pas creer deux lignes.
+    //
+    // `tag_id` reste INTEGER ici et BIGINT cote PostgreSQL (jamais TEXT) : la
+    // jointure avec `tags.id` doit rester possible sur les deux moteurs, et la
+    // copie SQLite -> PG lie nativement les entiers (voir le commentaire de
+    // `insert_batch` dans `pg_migrate.rs`).
+    Migration {
+        version: 97,
+        name: "streaming_item_tags",
+        up: "
+CREATE TABLE IF NOT EXISTS streaming_item_tags (
+    tag_id INTEGER NOT NULL,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (tag_id, item_type, source, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2889,6 +2937,25 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
+    // Etiquettes posees sur un objet de STREAMING (migration v97, #3699) ;
+    // re-creee inconditionnellement pour la meme raison que la table
+    // ci-dessus : une base venue de n'importe quelle version anterieure doit
+    // l'avoir, quel que soit le chemin de migration qu'elle a emprunte.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS streaming_item_tags (\
+            tag_id INTEGER NOT NULL,\
+            item_type TEXT NOT NULL,\
+            source TEXT NOT NULL,\
+            source_id TEXT NOT NULL,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            cover_url TEXT,\
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),\
+            PRIMARY KEY (tag_id, item_type, source, source_id)\
+        );",
+    )
+    .ok();
     // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
     // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
     // on DBs that skipped the numbered unified-queue migration.
@@ -3312,6 +3379,15 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         51,
         "tracks_audio_fingerprint",
         include_str!("../../migrations/postgres/051_tracks_audio_fingerprint.sql"),
+    ),
+    // Jumelle PostgreSQL de la migration SQLite 97 (#3699). Les deux listes
+    // sont SEPAREES — `run_migrations` ne prend qu'un `SqliteDb` — donc sans
+    // cette entree tout le parc PostgreSQL (.15, .18, Docker) n'aurait pas la
+    // table, et etiqueter un album de streaming y echouerait en erreur SQL.
+    (
+        52,
+        "streaming_item_tags",
+        include_str!("../../migrations/postgres/052_streaming_item_tags.sql"),
     ),
 ];
 
@@ -4939,7 +5015,13 @@ mod tests {
         // 51 : `tracks_audio_fingerprint` (BIB-B2). Jumelle SQLite : la 96.
         // L'empreinte du contenu audio decode, versionnee, NULL pour
         // l'existant ; TEXT des deux cotes.
-        assert_eq!(pg_latest_version(), 51, "latest PG migration must be 51");
+        // 52 : `streaming_item_tags` (#3699). Jumelle SQLite : la 97.
+        // `item_tags.item_id` est un entier — la clef primaire d'un objet
+        // LOCAL. Un album Qobuz, Tidal ou Bandcamp n'en a pas : il porte la
+        // paire `source` + `source_id`. Meme forme que `streaming_favorites`,
+        // instantane d'affichage compris, pour qu'un album retire du catalogue
+        // degrade sa pochette sans vider la liste.
+        assert_eq!(pg_latest_version(), 52, "latest PG migration must be 52");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
@@ -5453,6 +5535,118 @@ mod tests {
             "`task_runs` manque à ENSURE_TABLES : les bases PostgreSQL déjà \
              converties (schema_version 99) resteraient sans registre pour \
              toujours"
+        );
+    }
+
+    /// La migration PostgreSQL la plus haute doit ENREGISTRER son numero.
+    ///
+    /// `run_pg_migrations` n'ecrit rien dans `schema_version` : il applique le
+    /// SQL de chaque script et passe au suivant. C'est le script lui-meme qui
+    /// pose sa ligne, et seul le PLUS HAUT fait avancer `MAX(version)`. Un
+    /// dernier script qui l'oublie laisse la base se croire une version en
+    /// arriere : le rapport de diagnostic annonce `up_to_date: false` pour
+    /// toujours, et le script est rejoue a chaque demarrage.
+    ///
+    /// C'est arrive a la 052 (#3699), et rien de local ne l'a vu :
+    /// `pg_migrations_are_contiguous_and_include_numeric_heals` vit derriere
+    /// `#[cfg(feature = "postgres")]`, que la porte locale ne compile pas.
+    /// Cette garde-ci lit les FICHIERS : elle vaut quel que soit le jeu de
+    /// features.
+    ///
+    /// Elle ne juge QUE le plus haut : dix-neuf scripts anterieurs n'ont pas
+    /// cette ligne et n'en ont pas besoin — un script plus haut les couvre.
+    #[test]
+    fn la_derniere_migration_postgres_enregistre_son_numero() {
+        let dossier = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        let mut scripts: Vec<(u32, String)> = fs::read_dir(&dossier)
+            .expect("migrations/postgres lisible")
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".sql"))
+            .filter_map(|n| n.get(..3)?.parse::<u32>().ok().map(|v| (v, n)))
+            .collect();
+        scripts.sort();
+        let (numero, nom) = scripts.last().cloned().expect("au moins un script PG");
+        let sql = fs::read_to_string(dossier.join(&nom)).unwrap();
+        let attendu = format!("INSERT INTO schema_version (version, name) VALUES ({numero},");
+        assert!(
+            sql.contains(&attendu),
+            "« {nom} » est la migration PostgreSQL la plus haute et n'enregistre \
+             pas son numero : la base restera bloquee a la version precedente, \
+             le rapport de diagnostic dira `up_to_date: false` a jamais et le \
+             script sera rejoue a chaque demarrage. Ajoute, dans son BEGIN/COMMIT :\n\
+             {attendu} '<nom>')\n    ON CONFLICT (version) DO NOTHING;"
+        );
+    }
+
+    /// `streaming_item_tags` (#3699) doit exister sur les QUATRE chemins par
+    /// lesquels une base arrive a la vie — exactement comme `task_runs`.
+    ///
+    /// Le chemin qu'on oublie est le troisieme : une base creee par
+    /// l'assistant SQLite -> PostgreSQL enregistre `schema_version = 99` et ne
+    /// rejoue **jamais** les scripts PG numerotes. Sur ces bases-la, la
+    /// migration 052 ne s'appliquera pas — ni maintenant, ni jamais — et
+    /// etiqueter un album Qobuz y rendrait une erreur SQL pour toujours.
+    ///
+    /// Ce test lit les SOURCES : il vaut donc quel que soit le jeu de features
+    /// compile, `PG_MIGRATIONS` vivant derriere `#[cfg(feature = "postgres")]`.
+    #[test]
+    fn les_etiquettes_de_streaming_existent_sur_les_quatre_chemins() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // 1. Migration SQLite — les bases SQLite existantes ET neuves.
+        assert!(
+            MIGRATIONS.iter().any(|m| m.name == "streaming_item_tags"),
+            "la migration SQLite `streaming_item_tags` a disparu"
+        );
+        // 2. Migration PG numerotee — les bases PostgreSQL sur la piste
+        //    numerotee (.15, .18, Docker).
+        let ce_fichier = include_str!("migrations.rs");
+        assert!(
+            ce_fichier.contains("052_streaming_item_tags.sql"),
+            "`streaming_item_tags` existe cote SQLite mais n'est pas \
+             enregistree dans PG_MIGRATIONS : tout le parc PostgreSQL \
+             resterait sans la table"
+        );
+        assert!(
+            racine
+                .join("migrations/postgres/052_streaming_item_tags.sql")
+                .exists(),
+            "l'entree PG_MIGRATIONS pointe sur un fichier absent"
+        );
+        // 3. `PG_FULL_SCHEMA` — une base montee d'un bloc par la bascule
+        //    SQLite -> PostgreSQL, qui ne rejouera aucun script numerote.
+        let pg_neuf = fs::read_to_string(racine.join("src/db/pg_migrate.rs")).unwrap();
+        assert!(
+            pg_neuf.contains("CREATE TABLE IF NOT EXISTS streaming_item_tags"),
+            "`streaming_item_tags` manque a PG_FULL_SCHEMA : une base creee \
+             par la bascule porte schema_version 99 et ne recevrait JAMAIS la \
+             migration 052"
+        );
+        // 3 bis. Et la table doit etre COPIEE a la bascule, sans quoi tout
+        //        l'etiquetage du catalogue de streaming serait perdu ce
+        //        jour-la — le defaut mesure sur `favorite_facets` (#2442).
+        assert!(
+            pg_neuf.contains("\"streaming_item_tags\","),
+            "`streaming_item_tags` n'est pas dans MIGRATION_TABLES : les \
+             etiquettes posees sur des albums de streaming seraient perdues a \
+             la bascule SQLite -> PostgreSQL"
+        );
+        // 3 ter. Cette table n'a pas de colonne `id` : la clause par defaut
+        //        `ON CONFLICT (id)` de la copie echouerait sur elle.
+        assert!(
+            pg_neuf.contains("ON CONFLICT (tag_id, item_type, source, source_id) DO NOTHING"),
+            "la copie SQLite -> PG n'a pas de clause ON CONFLICT propre a \
+             `streaming_item_tags`, qui n'a PAS de colonne `id` : la clause \
+             par defaut `ON CONFLICT (id)` echouerait"
+        );
+        // 4. `ENSURE_TABLES` — le rattrapage rejoue a CHAQUE demarrage, seul
+        //    filet pour une base deja convertie AVANT cette version.
+        let ensure = fs::read_to_string(racine.join("src/db/postgres.rs")).unwrap();
+        assert!(
+            ensure.contains("CREATE TABLE IF NOT EXISTS streaming_item_tags"),
+            "`streaming_item_tags` manque a ENSURE_TABLES : les bases \
+             PostgreSQL deja converties (schema_version 99) resteraient sans \
+             la table pour toujours"
         );
     }
 }
