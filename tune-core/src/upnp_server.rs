@@ -702,6 +702,12 @@ const CLASSES_PUBLIEES: [(CibleRecherche, &str, &[&str]); 6] = [
         "object.item.audioitem.musictrack",
         &["object.item.audioitem"],
     ),
+    // ⚠️ CRITERE, pas emission. Depuis la troisieme voie, un `Browse` du
+    // rayon Radio publie `musicTrack` ([`RADIO_CLASSE_BROWSE`]) ; cette
+    // entree-ci reste `audiobroadcast` parce que c'est par elle qu'un
+    // `SearchCriteria` atteint le rayon (#1777, #2907), et un `Search` repond
+    // alors dans cette meme classe ([`RADIO_CLASSE_SEARCH`]). Unifier les deux
+    // fait rougir `un_search_sur_le_dossier_radio_le_trouve_encore`.
     (
         CibleRecherche::Radios,
         "object.item.audioitem.audiobroadcast",
@@ -1199,7 +1205,10 @@ fn search_containers_in_container(
                 .unwrap_or_default();
             let retenues = retenir_par_titre(stations, titres, |s| s.name.as_str());
             let (page, total) = paginer(retenues, start, count);
-            let mut didl = didl_radios(&page, &base_url);
+            // Le verbe CHERCHE : on repond dans la classe qui a servi de
+            // critere, pas dans celle du parcours. Voir
+            // [`RADIO_CLASSE_SEARCH`].
+            let mut didl = didl_radios(&page, &base_url, RADIO_CLASSE_SEARCH);
             didl.total = total;
             Some(didl)
         }
@@ -1749,7 +1758,7 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                     .ok()
                     .flatten()
             })
-            .map(|station| didl_radio_item(&station, &state.base_url())),
+            .map(|station| didl_radio_item(&station, &state.base_url(), RADIO_CLASSE_BROWSE)),
         id if id.starts_with("track/") => id
             .strip_prefix("track/")
             .and_then(|n| n.parse::<i64>().ok())
@@ -2448,7 +2457,7 @@ fn browse_radios(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let repo = RadioRepo::with_backend(state.backend.clone());
     let stations = repo.list().unwrap_or_default();
     let (page, total) = paginer(stations, start, count);
-    let mut didl = didl_radios(&page, &state.base_url());
+    let mut didl = didl_radios(&page, &state.base_url(), RADIO_CLASSE_BROWSE);
     // `TotalMatches` dit la taille RÉELLE du dossier, pas celle de la page :
     // c'est de là que le point de contrôle sait qu'il reste des pages.
     didl.total = total;
@@ -2474,10 +2483,14 @@ fn browse_radios(state: &UpnpState, start: u64, count: u64) -> DidlResult {
 /// PARTAGE avec les pistes — ce que ce commentaire affirmait deja alors que le
 /// XML etait encore ecrit a la main juste en dessous. Voir la note de
 /// [`didl_radio_item`] pour ce que cette main manquait.
-fn didl_radios(stations: &[crate::db::radio_repo::RadioStation], base: &str) -> DidlResult {
+fn didl_radios(
+    stations: &[crate::db::radio_repo::RadioStation],
+    base: &str,
+    classe: &str,
+) -> DidlResult {
     let mut inner = String::new();
     for station in stations {
-        inner.push_str(&didl_radio_item(station, base));
+        inner.push_str(&didl_radio_item(station, base, classe));
     }
     let total = stations.len() as u64;
     DidlResult {
@@ -2487,11 +2500,53 @@ fn didl_radios(stations: &[crate::db::radio_repo::RadioStation], base: &str) -> 
     }
 }
 
-/// La classe DIDL d'une station. Elle reste `audioBroadcast` : c'est la valeur
-/// que [`CLASSES_PUBLIEES`] declare, et c'est par elle qu'un `Search` vise le
-/// dossier Radio (#1777, #2907). La changer rendrait la table menteuse et
-/// ferait disparaitre les radios de la recherche.
-const RADIO_UPNP_CLASS: &str = "object.item.audioItem.audioBroadcast";
+/// La classe DIDL qu'une station publie quand on la **PARCOURT**.
+///
+/// # Pourquoi deux classes, et pourquoi c'est licite
+///
+/// Le dossier Radio etait le SEUL rayon du serveur media a publier
+/// `object.item.audioItem.audioBroadcast` ; les six autres publient
+/// `musicTrack` ou une classe de conteneur. C'est aussi le seul que le
+/// Marantz ND8006 de Jean Valjean lit « liste vide », six versions de suite,
+/// pendant que les six autres s'affichent — et la MEME station poussee par
+/// Tune en `SetAVTransportURI`, donc annoncee `musicTrack`, se joue sur cet
+/// appareil. La classe est le dernier ecart connu entre ce qu'il accepte et
+/// ce qu'il ecarte.
+///
+/// Ce qui bloquait le changement n'etait pas la specification : c'etait la
+/// crainte de casser `Search`, parce que [`CLASSES_PUBLIEES`] nomme
+/// `audiobroadcast` pour atteindre le rayon Radio (#1777, #2907). **Les deux
+/// usages sont separes**, et ce n'est pas un raisonnement mais une lecture :
+///
+/// * [`CLASSES_PUBLIEES`] est une table de **CRITERE**. Ses chaines sont en
+///   minuscules et ne sont lues que par [`predicat_de_classe`] /
+///   [`cibles_du_predicat`] pour traduire un `SearchCriteria` en
+///   [`CibleRecherche`]. Aucune d'elles n'atteint jamais le XML.
+/// * La constante ci-dessous est une valeur **EMISE**, en casse DIDL, et
+///   c'est la seule qui entre dans un `<upnp:class>`.
+///
+/// On sert donc `musicTrack` au verbe qui PEUPLE le rayon, sans toucher au
+/// filtre qui le TROUVE. Garde : [`un_search_sur_le_dossier_radio_le_trouve_encore`].
+///
+/// Les deux flags de `Browse` partagent cette valeur — `BrowseDirectChildren`
+/// et `BrowseMetadata` doivent decrire le MEME objet de la MEME facon, sans
+/// quoi un indexeur qui parcourt puis valide chaque objet lit deux classes
+/// pour un seul `radio/N` : c'est exactement le mode d'echec de #2183.
+///
+/// ⚠️ Le prix, dit franchement : un `Search` sur `musicTrack` ne rend
+/// toujours que les pistes, pas les stations, alors que le `Browse` les
+/// annonce desormais ainsi. C'est une incoherence assumee, et elle est plus
+/// petite que l'alternative — faire disparaitre les radios de la recherche.
+const RADIO_CLASSE_BROWSE: &str = "object.item.audioItem.musicTrack";
+
+/// La classe DIDL qu'une station publie quand on la **CHERCHE**.
+///
+/// `Search` a selectionne le rayon Radio *par* cette classe : lui rendre des
+/// items qui ne la portent pas ferait ecarter la reponse par tout point de
+/// controle qui refiltre ce qu'il recoit. L'item repond donc dans la classe
+/// qu'on lui a demandee. Garde :
+/// [`un_search_sur_le_dossier_radio_le_trouve_encore`].
+const RADIO_CLASSE_SEARCH: &str = "object.item.audioItem.audioBroadcast";
 
 /// Le type MIME que la route `/{id}/audio.wav` sert reellement
 /// (`tune-server/src/routes/radios.rs`, `live_radio_head_response("audio/wav", ..)`).
@@ -2524,11 +2579,16 @@ const RADIO_MIME: &str = "audio/wav";
 ///    de piste sautait le dossier Radio, parce qu'il ne partageait pas leur
 ///    code. C'est ce qui a fait durer #2103 six versions.
 ///
-/// La sortie ne change QUE par ce qui etait faux : la classe reste
-/// `audioBroadcast`, le `protocolInfo` reste `http-get:*:audio/wav:*`
+/// La sortie ne change QUE par ce qui etait faux ; la classe est desormais
+/// choisie par l'APPELANT ([`RADIO_CLASSE_BROWSE`] ou
+/// [`RADIO_CLASSE_SEARCH`]), le `protocolInfo` reste `http-get:*:audio/wav:*`
 /// ([`crate::outputs::didl::ProtocolStyle::Simple`], le style de tout le
 /// serveur media), et la pochette reste AVANT le `<res>`.
-fn didl_radio_item(station: &crate::db::radio_repo::RadioStation, base: &str) -> String {
+fn didl_radio_item(
+    station: &crate::db::radio_repo::RadioStation,
+    base: &str,
+    classe: &str,
+) -> String {
     let id = format!("radio/{}", station.id.unwrap_or(0));
     let logo = station
         .logo_url
@@ -2543,7 +2603,7 @@ fn didl_radio_item(station: &crate::db::radio_repo::RadioStation, base: &str) ->
     )
     .item_id(&id)
     .parent_id("radios")
-    .upnp_class(RADIO_UPNP_CLASS)
+    .upnp_class(classe)
     .live_stream(true)
     .album_art_opt(logo.as_deref())
     .build_item()
@@ -4755,6 +4815,63 @@ mod tests {
             "le nom par defaut a bouge"
         );
     }
+
+    /// Le changement de classe du rayon Radio ne traverse AUCUN autre rayon.
+    ///
+    /// La troisieme voie ne deplace qu'une valeur, dans un seul rayon. Ce
+    /// temoin epingle la classe publiee par chacun des sept rayons sur le DIDL
+    /// reellement rendu : si un jour quelqu'un touche au constructeur partage
+    /// ou au defaut de [`crate::outputs::didl::DidlBuilder`], c'est ici que ca
+    /// rougit, et pas trois mois plus tard chez un testeur.
+    #[test]
+    fn le_changement_de_classe_ne_traverse_aucun_autre_rayon() {
+        let (state, _, _, _, _) = state_complet();
+        // Aiguilles assemblees a l'execution : ecrites en clair, elles se
+        // trouveraient elles-memes si un jour ce test lisait la source.
+        let audio = format!("object.item.{}", "audioItem");
+        let piste = format!("{audio}.{}", "musicTrack");
+        let diffusion = format!("{audio}.{}", "audioBroadcast");
+        let attendu: [(&str, String); 7] = [
+            (
+                "artists",
+                format!("object.container.person.{}", "musicArtist"),
+            ),
+            ("albums", format!("object.container.album.{}", "musicAlbum")),
+            ("genres", format!("object.container.genre.{}", "musicGenre")),
+            ("years", "object.container".to_string()),
+            ("tracks", piste.clone()),
+            ("radios", piste.clone()),
+            (
+                "playlists",
+                format!("object.container.{}", "playlistContainer"),
+            ),
+        ];
+        for (rayon, classe) in &attendu {
+            let didl = didl_du_soap(&build_browse_response(
+                &state,
+                &corps_browse(rayon, "BrowseDirectChildren"),
+            ));
+            let balise = format!("<upnp:class>{classe}</upnp:class>");
+            assert!(
+                didl.contains(&balise),
+                "le rayon {rayon} ne publie plus {classe} : {didl}"
+            );
+        }
+        // Et la classe de diffusion ne doit plus sortir d'AUCUN parcours :
+        // c'est tout l'objet de l'arbitrage.
+        for (rayon, _) in &attendu {
+            for drapeau in ["BrowseDirectChildren", "BrowseMetadata"] {
+                let didl = didl_du_soap(&build_browse_response(
+                    &state,
+                    &corps_browse(rayon, drapeau),
+                ));
+                assert!(
+                    !didl.contains(&diffusion),
+                    "{drapeau}({rayon}) publie encore {diffusion} : {didl}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6158,5 +6275,157 @@ mod ssdp_msearch_tests {
             2,
             "temoin albums : {albums}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2103 — la troisieme voie : `musicTrack` au verbe qui PEUPLE le rayon,
+    // `audioBroadcast` au verbe qui le TROUVE.
+    // -----------------------------------------------------------------------
+
+    /// Le contenu de `<Result>`, des-echappe : le DIDL tel qu'un point de
+    /// controle le lit apres avoir depile l'enveloppe SOAP.
+    fn didl_du_soap_recherche(reponse: &str) -> String {
+        let debut = reponse.find("<Result>").expect("pas de <Result>") + "<Result>".len();
+        let fin = reponse.find("</Result>").expect("pas de </Result>");
+        quick_xml::escape::unescape(&reponse[debut..fin])
+            .expect("<Result> mal echappe")
+            .into_owned()
+    }
+
+    /// LA regression que l'arbitrage cherche a eviter : un `Search` doit
+    /// continuer a trouver le dossier Radio.
+    ///
+    /// C'est la raison pour laquelle la classe emise n'avait jamais ete
+    /// changee. Elle tient parce que les deux usages sont SEPARES :
+    /// `CLASSES_PUBLIEES` est un critere (chaines en minuscules, lues par
+    /// `cibles_du_predicat`, jamais emises), `RADIO_CLASSE_*` sont des valeurs
+    /// emises. Ce temoin mesure la separation sur le SOAP reellement rendu :
+    /// si quelqu'un unifie les deux classes plus tard, il rougit.
+    #[test]
+    fn un_search_sur_le_dossier_radio_le_trouve_encore() {
+        let state = state_du_releve_nd8006();
+        // Aiguille assemblee a l'execution.
+        let diffusion = format!("object.item.{}.{}", "audioItem", "audioBroadcast");
+        let reponse = search_action_response(
+            &state,
+            &soap_search(
+                "0",
+                &format!("upnp:class derivedfrom &quot;{diffusion}&quot;"),
+                0,
+                100,
+            ),
+        );
+        assert!(
+            reponse.contains("<u:SearchResponse"),
+            "le Search a echoue : {reponse}"
+        );
+        assert!(
+            !reponse.contains("<NumberReturned>0</NumberReturned>"),
+            "le Search ne trouve plus le dossier Radio : {reponse}"
+        );
+        assert!(
+            reponse.contains("FIP HiFi"),
+            "le Search ne rend pas la station : {reponse}"
+        );
+        // Et il repond DANS la classe demandee : un point de controle qui
+        // refiltre ce qu'il recoit doit garder les items.
+        let didl = didl_du_soap_recherche(&reponse);
+        assert!(
+            didl.contains(&format!("<upnp:class>{diffusion}</upnp:class>")),
+            "le Search rend des items qui ne portent pas la classe demandee : {didl}"
+        );
+    }
+
+    /// Le meme rayon, par l'autre verbe, publie `musicTrack` — et garde tout
+    /// ce que #3771 lui a donne.
+    ///
+    /// Les six autres rayons du serveur media publient `musicTrack` ou une
+    /// classe de conteneur, et le ND8006 de Jean Valjean les affiche tous ;
+    /// le seul rayon en `audioBroadcast` est celui qu'il lit vide, six
+    /// versions de suite. Ce temoin tient la nouvelle valeur ET les acquis :
+    /// `restricted`, la pochette relayee par Tune, l'adresse Tune du flux.
+    ///
+    /// `BrowseMetadata` doit dire la MEME chose que `BrowseDirectChildren` :
+    /// un indexeur qui parcourt puis valide chaque objet lirait sinon deux
+    /// classes pour un seul `radio/N` (#2183).
+    #[test]
+    fn le_dossier_radio_publie_musictrack_quand_on_le_parcourt() {
+        use crate::db::radio_repo::RadioStation;
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let id = RadioRepo::with_backend(backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "FIP HiFi".into(),
+                url: "https://icecast.example/fip-hifi.aac".into(),
+                homepage: None,
+                logo_url: Some("https://mozaiklabs.fr/storage/radio-logos/abc.png".into()),
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: true,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+        let state = UpnpState::new(backend, 8888, Some("192.168.1.18".into()));
+
+        let piste = format!("object.item.{}.{}", "audioItem", "musicTrack");
+        let diffusion = format!("object.item.{}.{}", "audioItem", "audioBroadcast");
+
+        for corps in [
+            soap_browse("radios", 0, 500),
+            corps_browse_metadata(&format!("radio/{id}")),
+        ] {
+            let reponse = build_browse_response(&state, &corps);
+            let didl = didl_du_soap_recherche(&reponse);
+            assert!(
+                didl.contains(&format!("<upnp:class>{piste}</upnp:class>")),
+                "le parcours du rayon Radio ne publie pas {piste} : {didl}"
+            );
+            assert!(
+                !didl.contains(&diffusion),
+                "le parcours du rayon Radio publie encore {diffusion} : {didl}"
+            );
+            // Les acquis de #3771 ne doivent pas partir avec la classe.
+            assert!(
+                didl.contains("restricted=\"1\""),
+                "l'item de station a perdu restricted : {didl}"
+            );
+            assert!(
+                didl.contains("http://192.168.1.18:8888/api/v1/library/artwork/"),
+                "la pochette n'est plus relayee par Tune : {didl}"
+            );
+            assert!(
+                !didl.contains("<upnp:albumArtURI>https://mozaiklabs.fr"),
+                "une adresse externe est ressortie du dossier Radio : {didl}"
+            );
+            assert!(
+                didl.contains(&format!(
+                    "http://192.168.1.18:8888/api/v1/radios/{id}/audio.wav"
+                )),
+                "le flux n'est plus servi par Tune : {didl}"
+            );
+        }
+    }
+
+    /// Un `Browse` avec `BrowseMetadata`, pour un objet donne.
+    fn corps_browse_metadata(object_id: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><s:Envelope><s:Body>
+<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+<ObjectID>{object_id}</ObjectID>
+<BrowseFlag>BrowseMetadata</BrowseFlag>
+<Filter>*</Filter>
+<StartingIndex>0</StartingIndex>
+<RequestedCount>0</RequestedCount>
+<SortCriteria></SortCriteria>
+</u:Browse></s:Body></s:Envelope>"#
+        )
     }
 }

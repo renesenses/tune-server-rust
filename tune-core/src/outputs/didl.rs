@@ -206,11 +206,13 @@ pub struct DidlBuilder {
     live_stream: bool,
     /// La valeur de `<upnp:class>`. `musicTrack` par defaut — c'est ce que
     /// TOUS les emetteurs historiques publiaient, et ce defaut garde leur
-    /// sortie octet pour octet. Le dossier Radio est le seul a en demander une
-    /// autre (`audioBroadcast`), et il ne pouvait pas le faire sans se batir
-    /// son `<item>` a la main, hors de ce constructeur — donc hors de
-    /// `escape_sain`, hors de `live_stream` et hors de tout ce que ce
-    /// constructeur garantit.
+    /// sortie octet pour octet. Le dossier Radio est le seul a la choisir
+    /// explicitement, et il le fait desormais SELON LE VERBE : `musicTrack`
+    /// quand on le parcourt, `audioBroadcast` quand on le cherche (voir
+    /// `RADIO_CLASSE_BROWSE` / `RADIO_CLASSE_SEARCH` dans
+    /// [`crate::upnp_server`]). Il ne pouvait pas le faire sans se batir son
+    /// `<item>` a la main — donc hors de `escape_sain`, hors de `live_stream`
+    /// et hors de tout ce que ce constructeur garantit.
     upnp_class: String,
     byte_seekable: bool,
     /// Émettre `sampleFrequency` / `bitsPerSample` / `nrAudioChannels` dans
@@ -275,12 +277,14 @@ impl DidlBuilder {
     }
     /// Choisir la `<upnp:class>` publiee, au lieu du `musicTrack` par defaut.
     ///
-    /// Une station de radio est un `object.item.audioItem.audioBroadcast`, et
-    /// [`crate::upnp_server`] declare cette classe dans sa table
-    /// `CLASSES_PUBLIEES` : c'est par elle qu'un `Search` vise le dossier
-    /// Radio. Elle doit donc rester ce qu'elle est — mais elle etait jusqu'ici
-    /// la SEULE raison pour laquelle le dossier Radio se batissait son XML a
-    /// la main.
+    /// Le seul appelant est le dossier Radio, et il passe deux valeurs
+    /// DIFFERENTES selon le verbe : `musicTrack` pour un `Browse` — la classe
+    /// que publient les six autres rayons, et les seuls que le Marantz ND8006
+    /// affiche —, `audioBroadcast` pour un `Search`, parce que c'est par cette
+    /// classe que `CLASSES_PUBLIEES` (table de CRITERE, jamais emise) laisse
+    /// un `SearchCriteria` atteindre le rayon (#1777, #2907). Voir
+    /// `RADIO_CLASSE_BROWSE` / `RADIO_CLASSE_SEARCH` dans
+    /// [`crate::upnp_server`].
     pub fn upnp_class(mut self, class: &str) -> Self {
         self.upnp_class = class.to_string();
         self
