@@ -49,7 +49,20 @@
 -- qui n'en porte aucune : `TagRepo::delete` retire explicitement les lignes de
 -- cette table avant l'etiquette, sur les deux moteurs.
 --
--- Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS.
+-- ## Le script enregistre son propre numero
+--
+-- `run_pg_migrations` n'ecrit RIEN dans `schema_version` : il applique le SQL
+-- et passe au suivant. C'est chaque script qui pose sa ligne. Le script le
+-- plus haut qui oublie cette ligne laisse `MAX(version)` en arriere : la base
+-- se croit en 51 pour toujours, le rapport de diagnostic annonce
+-- `up_to_date: false`, et le script est rejoue a chaque demarrage. Mesure du
+-- 09/09 sur le job « Test (PostgreSQL) » : `latest_version: 52,
+-- migration_version: 51`.
+--
+-- Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS, et la ligne de
+-- registre est posee en ON CONFLICT DO NOTHING.
+
+BEGIN;
 
 CREATE TABLE IF NOT EXISTS streaming_item_tags (
     tag_id BIGINT NOT NULL,
@@ -66,3 +79,8 @@ CREATE TABLE IF NOT EXISTS streaming_item_tags (
 
 CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item
     ON streaming_item_tags(item_type, source, source_id);
+
+INSERT INTO schema_version (version, name) VALUES (52, 'streaming_item_tags')
+    ON CONFLICT (version) DO NOTHING;
+
+COMMIT;

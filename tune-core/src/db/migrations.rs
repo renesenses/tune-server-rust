@@ -5538,6 +5538,47 @@ mod tests {
         );
     }
 
+    /// La migration PostgreSQL la plus haute doit ENREGISTRER son numero.
+    ///
+    /// `run_pg_migrations` n'ecrit rien dans `schema_version` : il applique le
+    /// SQL de chaque script et passe au suivant. C'est le script lui-meme qui
+    /// pose sa ligne, et seul le PLUS HAUT fait avancer `MAX(version)`. Un
+    /// dernier script qui l'oublie laisse la base se croire une version en
+    /// arriere : le rapport de diagnostic annonce `up_to_date: false` pour
+    /// toujours, et le script est rejoue a chaque demarrage.
+    ///
+    /// C'est arrive a la 052 (#3699), et rien de local ne l'a vu :
+    /// `pg_migrations_are_contiguous_and_include_numeric_heals` vit derriere
+    /// `#[cfg(feature = "postgres")]`, que la porte locale ne compile pas.
+    /// Cette garde-ci lit les FICHIERS : elle vaut quel que soit le jeu de
+    /// features.
+    ///
+    /// Elle ne juge QUE le plus haut : dix-neuf scripts anterieurs n'ont pas
+    /// cette ligne et n'en ont pas besoin — un script plus haut les couvre.
+    #[test]
+    fn la_derniere_migration_postgres_enregistre_son_numero() {
+        let dossier = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        let mut scripts: Vec<(u32, String)> = fs::read_dir(&dossier)
+            .expect("migrations/postgres lisible")
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".sql"))
+            .filter_map(|n| n.get(..3)?.parse::<u32>().ok().map(|v| (v, n)))
+            .collect();
+        scripts.sort();
+        let (numero, nom) = scripts.last().cloned().expect("au moins un script PG");
+        let sql = fs::read_to_string(dossier.join(&nom)).unwrap();
+        let attendu = format!("INSERT INTO schema_version (version, name) VALUES ({numero},");
+        assert!(
+            sql.contains(&attendu),
+            "« {nom} » est la migration PostgreSQL la plus haute et n'enregistre \
+             pas son numero : la base restera bloquee a la version precedente, \
+             le rapport de diagnostic dira `up_to_date: false` a jamais et le \
+             script sera rejoue a chaque demarrage. Ajoute, dans son BEGIN/COMMIT :\n\
+             {attendu} '<nom>')\n    ON CONFLICT (version) DO NOTHING;"
+        );
+    }
+
     /// `streaming_item_tags` (#3699) doit exister sur les QUATRE chemins par
     /// lesquels une base arrive a la vie — exactement comme `task_runs`.
     ///
