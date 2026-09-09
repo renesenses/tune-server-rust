@@ -9,13 +9,13 @@ Multi-room music server written in Rust. Manages a local audio library with full
 ```bash
 cargo build --release --package tune-server
 
-TUNE_PORT=8085 \
+TUNE_PORT=8888 \
 TUNE_MUSIC_DIRS='["/path/to/music"]' \
 TUNE_AUTO_SCAN=true \
   ./target/release/tune-server
 ```
 
-Open `http://localhost:8085` in a browser.
+Open `http://localhost:8888` in a browser.
 
 ### Debian / Ubuntu
 
@@ -57,7 +57,7 @@ Copy `tune.toml.example` to `tune.toml` and edit, or use environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TUNE_PORT` | 8085 | HTTP port |
+| `TUNE_PORT` | 8888 | HTTP port |
 | `TUNE_DB_PATH` | tune.db | SQLite database path |
 | `TUNE_MUSIC_DIRS` | [] | Music directories (JSON array or comma-separated) |
 | `TUNE_AUTO_SCAN` | false | Scan library on startup |
@@ -68,6 +68,8 @@ Copy `tune.toml.example` to `tune.toml` and edit, or use environment variables:
 | `TUNE_ARTWORK_DIR` | artwork_cache | Cover art cache |
 | `TUNE_INGEST_STAGING` | *(next to artwork cache)* | Where drag-and-dropped files are staged before import |
 | `TUNE_LOG_LEVEL` | info | Log level |
+| `TUNE_SPOTIFY_CLIENT_ID` | *(none)* | Client ID of **your own** Spotify application — Spotify grants no shared one |
+| `TUNE_SPOTIFY_REDIRECT_URI` | `http://127.0.0.1:<TUNE_PORT>/api/v1/streaming/spotify/callback` | Overrides the derived default; required for a remote install |
 
 ## Architecture
 
@@ -145,8 +147,35 @@ cargo test --workspace
 TUNE_LOG_LEVEL=debug cargo run --package tune-server
 
 # Benchmarks against a running server
-./bench.sh localhost:8085
+./bench.sh localhost:8888
 ```
+
+## Spotify — the redirect URI you must declare yourself
+
+Tune ships **no** Spotify client ID: `DEFAULT_CLIENT_ID` is the literal
+`"placeholder"`, and the service reports itself disabled until you set
+`TUNE_SPOTIFY_CLIENT_ID`. You therefore create your own application at
+<https://developer.spotify.com/dashboard>, and you must declare there —
+character for character — the redirect URI Tune sends. Tune cannot do that
+for you.
+
+By default Tune sends:
+
+```
+http://127.0.0.1:<the port Tune listens on>/api/v1/streaming/spotify/callback
+```
+
+The port is **derived from `TUNE_PORT`**, not hard-coded: on the default
+install that is `http://127.0.0.1:8888/api/v1/streaming/spotify/callback`.
+`localhost` is **not** a substitute — Spotify has refused the alias since
+April 2025 and accepts plain HTTP only for an explicit loopback literal.
+
+`GET /api/v1/system/env` reports the exact string under
+`spotify_redirect_uri`; copy it from there rather than retyping it.
+
+A Tune reached from another machine (NAS, mini-PC) cannot use a loopback
+address: register an HTTPS URI in the dashboard and give Tune the same one
+through `spotify_redirect_uri` in `tune.toml` or `TUNE_SPOTIFY_REDIRECT_URI`.
 
 ## License
 
