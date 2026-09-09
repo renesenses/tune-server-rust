@@ -340,6 +340,10 @@ impl AppState {
             tune_core::streaming::spotify::SpotifyService::with_config(
                 tune_config.spotify_client_id.as_deref(),
                 tune_config.spotify_redirect_uri.as_deref(),
+                // Le port REELLEMENT ecoute (`bootstrap.rs` lie `config.port`),
+                // pas le defaut de la caisse : l'URI de redirection envoyee a
+                // Spotify doit nommer un port ou Tune repond (#2680).
+                port,
             ),
         ));
         services.register(Box::new(tune_core::streaming::deezer::DeezerService::new()));
