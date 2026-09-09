@@ -17,6 +17,41 @@ pub mod sql {
 
     const RECORD_COLS: &str = "id, track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, listened_at, zone_id, context_type, context_id, context_position";
 
+    /// Les mêmes colonnes, mais avec `track_id` RÉSOLU.
+    ///
+    /// 🔴 `listen_history.track_id` est **toujours NULL** : le seul site
+    /// d'insertion passe `track_id: None`. La liste rendait donc ce NULL tel
+    /// quel, et le client ne pouvait désigner aucune écoute locale.
+    ///
+    /// FabienM, fil forum 1739, 09/09/2026 : « Manque des contrôles dans les
+    /// titres du menu historique. Exemple ici : le titre Racing in the street
+    /// n'a aucun contrôle comme les 2 autres titres. » Sa capture montre
+    /// l'inverse de l'attendu — la piste LOCALE est nue, les deux Qobuz ont
+    /// leurs boutons : une piste de service est désignée par `source` +
+    /// `source_id`, qui eux sont bien enregistrés.
+    ///
+    /// Mesure sur le .18, `GET /library/history?limit=60` : **38 écoutes
+    /// locales sur 38 sans `track_id`**, contre 22 écoutes de service avec
+    /// leur `source_id`.
+    ///
+    /// `top_tracks` avait déjà ce défaut et le résout depuis longtemps, avec
+    /// le commentaire qui en dit la conséquence (« tapping a track on the home
+    /// screen did nothing »). La correction n'avait jamais été portée ici.
+    ///
+    /// ⚠️ On rapproche par titre **ET album**, pas par titre seul comme
+    /// `top_tracks` : sur une bibliothèque réelle « Intro » ou « Untitled »
+    /// existent des dizaines de fois, et un rapprochement par titre seul
+    /// rendrait l'identifiant d'une AUTRE piste — pire qu'un bouton absent.
+    /// Sans `album_id` sur la ligne, on préfère ne rien résoudre.
+    const RECORD_COLS_RESOLUS: &str = "h.id, COALESCE(h.track_id, t.id) as track_id, h.title, \
+         h.artist_name, h.album_title, h.source, h.source_id, h.album_id, h.duration_ms, \
+         h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position";
+
+    /// La jointure qui résout `track_id`, commune aux deux listes.
+    const JOINTURE_PISTE: &str = " FROM listen_history h \
+         LEFT JOIN tracks t ON t.title = h.title AND t.album_id = h.album_id \
+         WHERE h.source != 'radio' ORDER BY h.listened_at DESC";
+
     pub fn record<D: SqlDialect>(d: &D) -> String {
         format!(
             "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id, context_type, context_id, context_position) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
@@ -44,14 +79,14 @@ pub mod sql {
     // Stats already filter `source != 'radio'`; align the list with them.
     pub fn recent<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {RECORD_COLS} FROM listen_history WHERE source != 'radio' ORDER BY listened_at DESC LIMIT {}",
+            "SELECT {RECORD_COLS_RESOLUS}{JOINTURE_PISTE} LIMIT {}",
             d.placeholder(1)
         )
     }
 
     pub fn recent_paginated<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {RECORD_COLS} FROM listen_history WHERE source != 'radio' ORDER BY listened_at DESC LIMIT {} OFFSET {}",
+            "SELECT {RECORD_COLS_RESOLUS}{JOINTURE_PISTE} LIMIT {} OFFSET {}",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -1323,6 +1358,123 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         HistoryRepo::new(db)
+    }
+
+    /// Un dépôt ET sa base : résoudre `track_id` demande de vraies pistes.
+    fn repo_et_base() -> (HistoryRepo, Arc<dyn DbBackend>) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let partagee: Arc<dyn DbBackend> = Arc::new(db);
+        (
+            HistoryRepo {
+                db: partagee.clone(),
+            },
+            partagee,
+        )
+    }
+
+    /// Une écoute nue : seuls les champs qui comptent pour ces témoins-ci.
+    fn ecoute_locale_nue(titre: &str, album_id: Option<i64>) -> ListenRecord {
+        ListenRecord {
+            id: None,
+            track_id: None,
+            title: titre.into(),
+            artist_name: None,
+            album_title: None,
+            source: "local".into(),
+            source_id: None,
+            album_id,
+            duration_ms: 0,
+            listened_at: None,
+            zone_id: None,
+            cover_url: None,
+            profile_id: None,
+            context_type: None,
+            context_id: None,
+            context_position: None,
+        }
+    }
+
+    /// 🔴 L'HISTORIQUE REND UN `track_id` UTILISABLE — fil 1739.
+    ///
+    /// FabienM, 09/09/2026 : « Manque des contrôles dans les titres du menu
+    /// historique. Exemple ici : le titre Racing in the street n'a aucun
+    /// contrôle comme les 2 autres titres. »
+    ///
+    /// `listen_history.track_id` est TOUJOURS NULL — le seul site d'insertion
+    /// passe `None`. Le client désigne une piste locale par son identifiant :
+    /// sans lui, `corpsDeLecture` rend `null` et TOUTE la barre d'actions
+    /// disparaît. Une piste de service, elle, s'identifie par `source` +
+    /// `source_id`, bien enregistrés — d'où l'inversion que Fabien a vue.
+    ///
+    /// Mesure sur le .18 : 38 écoutes locales sur 38 sans `track_id`.
+    #[test]
+    fn l_historique_resout_le_track_id_dune_ecoute_locale() {
+        let (repo, db) = repo_et_base();
+        db.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Springsteen')",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (7, 'Live 1975-85', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, artist_id, album_id) VALUES (42, 'Racing In The Street', 1, 7)",
+            &[],
+        )
+        .unwrap();
+
+        repo.record(&ecoute_locale_nue("Racing In The Street", Some(7)))
+            .unwrap();
+
+        assert_eq!(
+            repo.recent(10).unwrap()[0].track_id,
+            Some(42),
+            "l'écoute locale sort sans identifiant : le client ne peut ni la \
+             lire, ni l'enfiler, ni la mettre en favori — aucun contrôle"
+        );
+    }
+
+    /// LA CONTRE-ÉPREUVE — on ne résout JAMAIS vers une autre piste.
+    ///
+    /// `top_tracks` rapproche par titre SEUL. Sur une bibliothèque réelle,
+    /// « Intro » ou « Untitled » existent des dizaines de fois : rendre
+    /// l'identifiant d'un homonyme ferait lire le mauvais morceau, ce qui est
+    /// pire qu'un bouton absent. On exige donc le même album.
+    #[test]
+    fn un_homonyme_dun_autre_album_ne_resout_rien() {
+        let (repo, db) = repo_et_base();
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'Divers')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (7, 'A', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (8, 'B', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, artist_id, album_id) VALUES (42, 'Intro', 1, 7)",
+            &[],
+        )
+        .unwrap();
+
+        // L'écoute vient de l'album 8 ; la seule piste « Intro » est sur le 7.
+        repo.record(&ecoute_locale_nue("Intro", Some(8))).unwrap();
+
+        assert_eq!(
+            repo.recent(10).unwrap()[0].track_id,
+            None,
+            "un homonyme d'un AUTRE album a été résolu : le client lirait le \
+             mauvais morceau, ce qui est pire qu'un bouton absent"
+        );
     }
 
     /// #2441 — l'ecoute doit garder la trace de CE QUE l'auditeur a demande.

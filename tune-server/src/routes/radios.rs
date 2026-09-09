@@ -888,9 +888,40 @@ async fn media_server_radio_audio(
     with_media_server_radio_cleanup(response, state.streamer, stream_id)
 }
 
-async fn list_radios(State(state): State<AppState>) -> Json<Value> {
+/// Filtres de `GET /radios`.
+///
+/// 🔴 `list_radios` ne prenait AUCUN paramètre : `?favorite=true` était accepté
+/// par le routeur, ignoré par le code, et la liste complète repartait avec un
+/// 200. Le client ne pouvait pas le savoir.
+///
+/// Mesuré sur le .18 le 09/09/2026 : `GET /radios?favorite=true&limit=500` et
+/// `GET /radios?limit=500` rendent les MÊMES 46 lignes, dont 5 seulement
+/// portent `is_favorite`. Un appelant qui fait confiance au filtre affiche donc
+/// 41 stations qui ne sont pas en favori.
+///
+/// FabienM, fil forum 1739, 09/09/2026 : « Radio mis en favori n'apparaît pas
+/// dans le menu favoris. » Ce filtre est l'une des deux moitiés du défaut ;
+/// l'autre est côté client, qui ne demandait pas les stations du tout.
+///
+/// Un filtre silencieusement ignoré est pire qu'un filtre absent : absent, il
+/// rend une erreur et l'appelant le voit.
+#[derive(serde::Deserialize, Default)]
+struct ListRadiosQuery {
+    favorite: Option<bool>,
+}
+
+async fn list_radios(
+    State(state): State<AppState>,
+    Query(q): Query<ListRadiosQuery>,
+) -> Json<Value> {
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let items = repo.list().unwrap_or_default();
+    // `favorites()` trie déjà par nom et filtre en SQL — même chemin que
+    // `GET /radios/favorites`, plutôt qu'un second filtre à faire diverger.
+    let items = if q.favorite == Some(true) {
+        repo.favorites().unwrap_or_default()
+    } else {
+        repo.list().unwrap_or_default()
+    };
     Json(json!(items))
 }
 
