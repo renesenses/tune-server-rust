@@ -81,6 +81,192 @@ pub(crate) const SOAP_HTTP_SANS_CORPS_PREFIX: &str = "soap http sans corps:";
 /// implicitly stops the current track on compliant renderers.
 const STOP_BEFORE_PLAY_TIMEOUT_MS: u64 = 2000;
 
+/// Base du délai avant de remettre à l'épreuve un niveau de DIDL dégradé.
+///
+/// Une minute : plus court que la plus courte des pistes d'une file ordinaire,
+/// donc un hoquet ISOLÉ se rattrape dès la piste suivante et l'utilisateur ne
+/// voit qu'une piste sans son format.
+const DIDL_RESONDE_BASE_MS: u64 = 60_000;
+
+/// Plafond de ce délai. Il double à chaque remise à l'épreuve qui échoue :
+/// l'appareil qui ne sait VRAIMENT pas lire un DIDL complet — la pile
+/// Platinum de l'Eversolo, #2394 — converge vers UN aller-retour perdu par
+/// heure, pas un par piste.
+const DIDL_RESONDE_MAX_MS: u64 = 3_600_000;
+
+/// Horloge monotone du processus, en millisecondes.
+///
+/// `Instant` ne se range pas dans un atomique et l'heure murale peut reculer
+/// (NTP, réveil de veille) — or un délai qui recule rouvrirait la sonde en
+/// boucle. Une origine posée une fois, et des millisecondes écoulées depuis.
+fn horloge_process_ms() -> u64 {
+    static ORIGINE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGINE
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Ce qu'un apprentissage vient de faire au niveau de DIDL. Rendu par
+/// [`NiveauDidlAppris::apprendre`], qui en journalise chaque forme : la
+/// dégradation était MUETTE jusqu'ici (#3675), et c'est ce silence qui a rendu
+/// le dossier si long à instruire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransitionNiveauDidl {
+    /// Le niveau n'a pas bougé et aucune remise à l'épreuve n'était due.
+    Inchange,
+    /// Les métadonnées s'appauvrissent (le numéro de niveau MONTE).
+    Degrade { ancien: u8, neuf: u8 },
+    /// Les métadonnées reviennent (le numéro de niveau DESCEND) : la remise à
+    /// l'épreuve a réussi, l'appareil avait seulement hoqueté.
+    Restaure { ancien: u8, neuf: u8 },
+    /// La remise à l'épreuve a de nouveau échoué : on espace la suivante.
+    ResondeEchouee { attente_ms: u64 },
+}
+
+/// Niveau de DIDL appris pour UN appareil — **avec sa porte de sortie**.
+///
+/// Le niveau (0 = complet, 1 = minimal, 2 = vide) est appris à l'usage : on
+/// démarre l'échelle là où l'appareil a fini par répondre, pour ne pas re-payer
+/// l'aller-retour raté à chaque piste (DMP-A8, #2394).
+///
+/// 🔴 Mais cet apprentissage ne savait que DESCENDRE : les deux seuls `store`
+/// du fichier ne montaient jamais en qualité. Une SEULE réponse « 500 sans
+/// corps » — que `soap_action` rend sans même la réessayer — privait donc
+/// TOUTES les pistes suivantes, pour la vie du processus, de `sampleFrequency`
+/// et `bitsPerSample` (et aussi de l'artiste, de l'album et de la pochette,
+/// que le DIDL minimal n'écrit pas davantage). Un appareil qui hoquette une
+/// fois au réveil ou pendant une bascule d'entrée restait dégradé à jamais, et
+/// RIEN ne le disait : « le Marantz perd le format (44/16) » (#3675).
+///
+/// Le remède est un délai qui DOUBLE : la dégradation reste apprise, mais elle
+/// expire. Un hoquet isolé se rattrape à la piste suivante ; un appareil qui ne
+/// sait vraiment pas faire n'est plus sondé qu'une fois l'heure.
+pub(crate) struct NiveauDidlAppris {
+    niveau: AtomicU8,
+    /// Horodatage ([`horloge_process_ms`]) du dernier apprentissage d'un
+    /// niveau dégradé, ou de la dernière remise à l'épreuve ratée.
+    appris_a_ms: AtomicU64,
+    /// Délai courant avant la prochaine remise à l'épreuve.
+    attente_ms: AtomicU64,
+}
+
+impl NiveauDidlAppris {
+    fn neuf() -> Self {
+        Self {
+            niveau: AtomicU8::new(0),
+            appris_a_ms: AtomicU64::new(0),
+            attente_ms: AtomicU64::new(DIDL_RESONDE_BASE_MS),
+        }
+    }
+
+    /// Vrai quand un niveau dégradé a passé son délai de remise à l'épreuve.
+    fn resonde_due(&self, maintenant_ms: u64) -> bool {
+        self.niveau.load(Ordering::Relaxed) > 0
+            && maintenant_ms.saturating_sub(self.appris_a_ms.load(Ordering::Relaxed))
+                >= self.attente_ms.load(Ordering::Relaxed)
+    }
+
+    /// Le niveau auquel démarrer l'échelle pour la prochaine émission.
+    ///
+    /// **Seule** façon de lire le niveau appris depuis la production : il n'y a
+    /// pas d'accesseur brut, pour qu'aucun chemin ne puisse repartir du niveau
+    /// dégradé en contournant la porte.
+    fn niveau_de_depart(&self, maintenant_ms: u64, appareil: &str) -> u8 {
+        if self.resonde_due(maintenant_ms) {
+            info!(
+                device = %appareil,
+                niveau_appris = self.niveau.load(Ordering::Relaxed),
+                attente_ms = self.attente_ms.load(Ordering::Relaxed),
+                "dlna_didl_niveau_resonde"
+            );
+            return 0;
+        }
+        self.niveau.load(Ordering::Relaxed)
+    }
+
+    /// Enregistre le niveau qui a FINI par passer, et journalise le passage
+    /// dans les DEUX sens.
+    ///
+    /// `maintenant_ms` doit être celui passé à [`Self::niveau_de_depart`] pour
+    /// la même émission : c'est ce qui rend les deux décisions cohérentes — une
+    /// remise à l'épreuve due au départ est encore due à l'arrivée.
+    fn apprendre(&self, niveau: u8, maintenant_ms: u64, appareil: &str) -> TransitionNiveauDidl {
+        let resondait = self.resonde_due(maintenant_ms);
+        let ancien = self.niveau.swap(niveau, Ordering::Relaxed);
+        let transition = if niveau < ancien {
+            self.attente_ms
+                .store(DIDL_RESONDE_BASE_MS, Ordering::Relaxed);
+            self.appris_a_ms.store(maintenant_ms, Ordering::Relaxed);
+            TransitionNiveauDidl::Restaure {
+                ancien,
+                neuf: niveau,
+            }
+        } else if niveau > ancien {
+            self.attente_ms
+                .store(DIDL_RESONDE_BASE_MS, Ordering::Relaxed);
+            self.appris_a_ms.store(maintenant_ms, Ordering::Relaxed);
+            TransitionNiveauDidl::Degrade {
+                ancien,
+                neuf: niveau,
+            }
+        } else if niveau > 0 && resondait {
+            let attente = self
+                .attente_ms
+                .load(Ordering::Relaxed)
+                .saturating_mul(2)
+                .min(DIDL_RESONDE_MAX_MS);
+            self.attente_ms.store(attente, Ordering::Relaxed);
+            self.appris_a_ms.store(maintenant_ms, Ordering::Relaxed);
+            TransitionNiveauDidl::ResondeEchouee {
+                attente_ms: attente,
+            }
+        } else {
+            TransitionNiveauDidl::Inchange
+        };
+
+        // Les deux sens laissent une trace NOMMÉE. Sans elles, la dégradation
+        // était invisible : le seul indice était un `warn` par tentative, qui
+        // ne disait pas que l'appareil venait de changer d'état DURABLEMENT.
+        match transition {
+            TransitionNiveauDidl::Degrade { ancien, neuf } => warn!(
+                device = %appareil,
+                ancien_niveau = ancien,
+                niveau = neuf,
+                attente_ms = DIDL_RESONDE_BASE_MS,
+                "dlna_didl_niveau_degrade"
+            ),
+            TransitionNiveauDidl::Restaure { ancien, neuf } => info!(
+                device = %appareil,
+                ancien_niveau = ancien,
+                niveau = neuf,
+                "dlna_didl_niveau_restaure"
+            ),
+            TransitionNiveauDidl::ResondeEchouee { attente_ms } => debug!(
+                device = %appareil,
+                niveau,
+                attente_ms,
+                "dlna_didl_niveau_resonde_echouee"
+            ),
+            TransitionNiveauDidl::Inchange => {}
+        }
+        transition
+    }
+
+    /// Lecture brute réservée aux épreuves : la production n'a que
+    /// [`Self::niveau_de_depart`].
+    #[cfg(test)]
+    pub(crate) fn niveau_courant(&self) -> u8 {
+        self.niveau.load(Ordering::Relaxed)
+    }
+
+    /// Le délai courant, pour les épreuves du barème.
+    #[cfg(test)]
+    pub(crate) fn attente_courante_ms(&self) -> u64 {
+        self.attente_ms.load(Ordering::Relaxed)
+    }
+}
+
 pub struct DlnaOutput {
     name: String,
     device_id: String,
@@ -104,22 +290,38 @@ pub struct DlnaOutput {
     /// est [`DlnaOutput::with_budget_reveil_ms`] ; la production ne l'appelle
     /// nulle part et garde donc la constante, au millieme pres.
     budget_reveil_ms: AtomicU64,
-    /// Alternates between false ("1") and true ("2") so that consecutive
-    /// DIDL items sent via SetAVTransportURI / SetNextAVTransportURI use
-    /// different item IDs.  Renderers like Marantz ND8006 cache DIDL
-    /// metadata keyed by item id — using the same id for both current and
-    /// next track causes the renderer to display stale metadata (wrong
-    /// duration, format) on every other track.
-    next_item_id_flip: AtomicBool,
+    /// Compteur MONOTONE des `item id` DIDL émis vers CET appareil.
+    ///
+    /// Les renderers du genre Marantz ND8006 indexent les métadonnées DIDL
+    /// qu'ils gardent en cache sur l'`item id` : réutiliser un id déjà vu leur
+    /// fait réafficher les anciennes (durée, format, progression de la piste
+    /// précédente).
+    ///
+    /// 🔴 Ce champ était un `AtomicBool` qui alternait « 1 » / « 2 »
+    /// (`d53191bb`, 14/06/2026). Deux valeurs pour DEUX appelants —
+    /// `play_media` (`SetAVTransportURI`) et `set_next_media`
+    /// (`SetNextAVTransportURI`) — ne peuvent pas rester distinctes dans la
+    /// durée : la piste 3 récupérait l'id de la piste 1, la piste 4 celui de
+    /// la piste 2. La collision revenait donc avec une PÉRIODE DE DEUX, c'est
+    /// à dire exactement le « une piste sur deux » que le correctif visait, et
+    /// exactement ce que Jean Valjean décrit le lendemain de sa livraison
+    /// (fil forum 631, 15/06/2026, #3675).
+    ///
+    /// Un compteur qui ne revient jamais en arrière n'a pas de période : deux
+    /// émissions ne partagent plus jamais d'id sur la vie du processus.
+    item_id_seq: AtomicU64,
     /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
     /// 2 = vide). La pile Platinum de l'Eversolo ne lit qu'un segment TCP de
     /// requête : le DIDL complet déborde et finit en « 500 sans corps », le
     /// minimal passe — mais l'échelle re-payait l'aller-retour raté À CHAQUE
     /// piste (un warn + ~200 ms par SetURI/SetNext, constaté sur DMP-A8,
-    /// #2394). Une fois le niveau qui passe constaté, on démarre là. Jamais
-    /// remonté en cours de vie du process : la pile du renderer ne change pas ;
-    /// un redémarrage de Tune repart du complet.
-    didl_niveau_appris: AtomicU8,
+    /// #2394). Une fois le niveau qui passe constaté, on démarre là.
+    ///
+    /// 🔴 Ce champ était un `AtomicU8` nu, que rien ne rabaissait jamais : un
+    /// seul « 500 sans corps » dégradait l'appareil pour la vie du processus.
+    /// Il porte maintenant sa propre porte de sortie — voir
+    /// [`NiveauDidlAppris`] (#3675).
+    didl_niveau_appris: NiveauDidlAppris,
     /// Dernier état « coupé » que **Tune** a posé sur cet appareil, via
     /// `set_mute`.
     ///
@@ -282,8 +484,8 @@ impl DlnaOutput {
                 .unwrap_or_default(),
             play_delay_ms: AtomicU64::new(0),
             budget_reveil_ms: AtomicU64::new(BUDGET_REVEIL_STANDBY.as_millis() as u64),
-            next_item_id_flip: AtomicBool::new(false),
-            didl_niveau_appris: AtomicU8::new(0),
+            item_id_seq: AtomicU64::new(1),
+            didl_niveau_appris: NiveauDidlAppris::neuf(),
             muted: AtomicBool::new(false),
             micromega_ip,
             connection_manager_url,
@@ -736,7 +938,7 @@ impl DlnaOutput {
     async fn reposer_uri(
         &self,
         media: &PlayMedia<'_>,
-        item_id: &'static str,
+        item_id: &str,
         mime: &str,
         niveau_didl: u8,
     ) -> Result<String, String> {
@@ -857,13 +1059,16 @@ impl DlnaOutput {
         Self::didl_metadata_minimale(media, item_id, mime)
     }
 
-    /// Return the next item id ("1" or "2") and flip the toggle.
-    /// Alternating ids prevents renderers (Marantz ND8006 etc.) from
-    /// displaying stale cached metadata when the same id is reused for
-    /// consecutive tracks.
-    fn next_item_id(&self) -> &'static str {
-        let prev = self.next_item_id_flip.fetch_xor(true, Ordering::Relaxed);
-        if prev { "2" } else { "1" }
+    /// Rend un `item id` DIDL JAMAIS DÉJÀ ÉMIS vers cet appareil, et avance le
+    /// compteur.
+    ///
+    /// Deux appelants seulement, et ils se suivent piste après piste :
+    /// [`DlnaOutput::play_media`] (`SetAVTransportURI`) et
+    /// [`DlnaOutput::set_next_media`] (`SetNextAVTransportURI`). Voir
+    /// [`DlnaOutput::item_id_seq`] pour la raison du compteur monotone : une
+    /// alternance à deux valeurs collisionnait une fois sur deux (#3675).
+    fn next_item_id(&self) -> String {
+        self.item_id_seq.fetch_add(1, Ordering::Relaxed).to_string()
     }
 
     fn parse_time(time_str: &str) -> u64 {
@@ -973,7 +1178,10 @@ impl OutputTarget for DlnaOutput {
             }
         }
 
-        let item_id = self.next_item_id();
+        // Un id neuf pour CETTE piste : l'ancienne alternance à deux valeurs
+        // rendait la piste 3 identique à la piste 1 (#3675).
+        let item_id_courant = self.next_item_id();
+        let item_id = item_id_courant.as_str();
 
         // First attempt: announce `media.mime_type` UNCHANGED — exactly the
         // previous behaviour. The Sink is NOT probed here: a healthy renderer
@@ -991,7 +1199,13 @@ impl OutputTarget for DlnaOutput {
         // On démarre au niveau APPRIS pour cet appareil : re-payer l'échec du
         // complet à chaque piste coûtait un aller-retour et un warn par SetURI
         // (DMP-A8, #2394) pour finir au même DIDL minimal de toute façon.
-        let mut niveau_didl: u8 = self.didl_niveau_appris.load(Ordering::Relaxed);
+        // Mais l'apprentissage EXPIRE : un appareil qui a hoqueté une fois est
+        // remis à l'épreuve après un délai qui double (#3675). Le même
+        // horodatage sert au départ et à l'apprentissage de cette émission.
+        let maintenant_ms = horloge_process_ms();
+        let mut niveau_didl: u8 = self
+            .didl_niveau_appris
+            .niveau_de_depart(maintenant_ms, &self.name);
         let debut_set_uri = std::time::Instant::now();
         loop {
             let metadata = match niveau_didl {
@@ -1020,7 +1234,7 @@ impl OutputTarget for DlnaOutput {
 
             if !(set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>")) {
                 self.didl_niveau_appris
-                    .store(niveau_didl, Ordering::Relaxed);
+                    .apprendre(niveau_didl, maintenant_ms, &self.name);
                 // Le SUCCÈS se journalise, pas seulement l'échec. Sans cette
                 // ligne, un SetAVTransportURI lent laisse un trou muet et
                 // l'incident n'est plus instruisable : dans le journal de
@@ -1711,15 +1925,24 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        let item_id = self.next_item_id();
+        // Id neuf, distinct de celui du `SetAVTransportURI` qui précède comme de
+        // tous ceux déjà émis vers cet appareil (#3675).
+        let item_id_suivant = self.next_item_id();
+        let item_id = item_id_suivant.as_str();
         // Même échelle que le SetAVTransportURI du play : le DIDL complet du
         // gapless a la même taille, donc le même échec de lecture chez
         // Platinum — et un gapless silencieusement perdu, c'est une file qui
         // s'arrête entre deux pistes.
         let mut resp = None;
         // Même départ au niveau appris que le play : l'échec du DIDL complet
-        // est une propriété de l'appareil, pas de la piste (#2394).
-        for niveau in self.didl_niveau_appris.load(Ordering::Relaxed)..=2 {
+        // est une propriété de l'appareil, pas de la piste (#2394) — mais une
+        // propriété qui EXPIRE, pour qu'un hoquet ne dégrade pas la file
+        // entière (#3675). Même porte, même horodatage que `play_media`.
+        let maintenant_ms = horloge_process_ms();
+        let depart = self
+            .didl_niveau_appris
+            .niveau_de_depart(maintenant_ms, &self.name);
+        for niveau in depart..=2 {
             let metadata = match niveau {
                 0 => Self::didl_metadata(media, item_id),
                 1 => Self::didl_metadata_minimale(media, item_id, media.mime_type),
@@ -1730,7 +1953,8 @@ impl OutputTarget for DlnaOutput {
                 media.url
             )).await {
                 Ok(r) => {
-                    self.didl_niveau_appris.store(niveau, Ordering::Relaxed);
+                    self.didl_niveau_appris
+                        .apprendre(niveau, maintenant_ms, &self.name);
                     resp = Some(r);
                     break;
                 }
@@ -3338,9 +3562,15 @@ mod tests {
     }
 
     #[test]
-    fn didl_item_id_alternates() {
-        // Verify that consecutive tracks get different item IDs to prevent
-        // Marantz ND8006 (and similar) from displaying cached metadata.
+    fn didl_metadata_ecrit_l_item_id_qu_on_lui_donne() {
+        // Ce test s'appelait `didl_item_id_alternates` et venait avec le
+        // correctif d'alternance de `d53191bb`. Il ne PROUVAIT PAS
+        // l'alternance : il passe « 1 » puis « 2 » à la main et n'appelle
+        // jamais `next_item_id`. Il est donc resté vert pendant les trois mois
+        // où la suite réellement émise valait `1, 2, 1, 2` (#3675). Ce qu'il
+        // vérifie, et c'est utile, c'est que l'id fourni ARRIVE dans le
+        // document. L'unicité, elle, se garde en appelant le générateur —
+        // `quatre_item_id_consecutifs_sont_tous_distincts` et ses voisins.
         let didl_1 = DlnaOutput::didl_metadata(
             &PlayMedia {
                 url: "http://x/track1",
@@ -3406,5 +3636,416 @@ mod tests {
         );
         assert!(didl.contains("sampleFrequency=\"96000\""));
         assert!(didl.contains("bitsPerSample=\"24\""));
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // #3675 — Marantz ND8006 : « une piste sur deux perd le format, le temps
+    // et sa progression » (Jean Valjean, fil forum 631, 15/06/2026).
+    //
+    // Ces gardes APPELLENT `next_item_id`, la fonction que les deux seuls
+    // appelants du fichier consomment : `DlnaOutput::play_media`
+    // (`SetAVTransportURI`, la piste courante) et `DlnaOutput::set_next_media`
+    // (`SetNextAVTransportURI`, la piste armée en gapless). Elles ne relisent
+    // pas la source.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Un renderer de test. `DlnaOutput::new` ne touche pas au réseau : rien
+    /// ne part tant qu'aucune action SOAP n'est émise, et aucune ne l'est ici.
+    fn renderer_de_test() -> DlnaOutput {
+        DlnaOutput::new(
+            "Marantz ND8006".to_string(),
+            "uuid:nd8006-de-test".to_string(),
+            "http://192.0.2.10:60006".to_string(),
+            "http://192.0.2.10:60006/AVTransport/ctrl".to_string(),
+            "http://192.0.2.10:60006/RenderingControl/ctrl".to_string(),
+            None,
+        )
+    }
+
+    /// La FORME FAUTIVE, reproduite : l'alternance à deux valeurs livrée le
+    /// 14/06/2026 (`d53191bb`). Sans cette moitié, la garde suivante pourrait
+    /// être verte sans rien avoir distingué.
+    ///
+    /// Quatre tirages — deux pistes armées en gapless — ne rendent que DEUX
+    /// valeurs : la piste 3 reprend l'id de la piste 1, la piste 4 celui de la
+    /// piste 2. La collision de cache que le correctif prétendait supprimer
+    /// revient donc avec une PÉRIODE DE DEUX, qui est la période même du
+    /// symptôme signalé.
+    #[test]
+    fn la_forme_fautive_reproduite_collisionne_avec_une_periode_de_deux() {
+        let bascule = AtomicBool::new(false);
+        let alterner = || {
+            if bascule.fetch_xor(true, Ordering::Relaxed) {
+                "2"
+            } else {
+                "1"
+            }
+        };
+
+        let ids: Vec<&str> = (0..4).map(|_| alterner()).collect();
+
+        assert_eq!(ids[0], ids[2], "piste 3 réutilise l'id de la piste 1");
+        assert_eq!(ids[1], ids[3], "piste 4 réutilise l'id de la piste 2");
+        let uniques: std::collections::BTreeSet<&&str> = ids.iter().collect();
+        assert_eq!(uniques.len(), 2, "le domaine ne compte que deux valeurs");
+    }
+
+    /// La forme livrée : quatre émissions consécutives, quatre ids distincts.
+    #[test]
+    fn quatre_item_id_consecutifs_sont_tous_distincts() {
+        let sortie = renderer_de_test();
+
+        let ids: Vec<String> = (0..4).map(|_| sortie.next_item_id()).collect();
+
+        let uniques: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(uniques.len(), ids.len(), "ids émis : {ids:?}");
+    }
+
+    /// Et sur une file entière : aucun id ne revient, quelle que soit la
+    /// répartition entre les deux appelants. Un compteur qui rebouclerait sur
+    /// un petit domaine — le défaut corrigé — serait rouge ici.
+    #[test]
+    fn deux_cents_emissions_ne_repetent_jamais_un_id() {
+        let sortie = renderer_de_test();
+
+        let ids: Vec<String> = (0..200).map(|_| sortie.next_item_id()).collect();
+
+        let uniques: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(uniques.len(), 200, "un id a été réémis");
+    }
+
+    /// Chaque appareil compte pour lui : deux renderers ne se volent pas leur
+    /// suite d'ids, et rien n'est partagé entre eux.
+    #[test]
+    fn le_compteur_est_propre_a_chaque_appareil() {
+        let un = renderer_de_test();
+        let autre = renderer_de_test();
+
+        // Deux appareils neufs partent du même id : le compteur n'est pas
+        // global.
+        assert_eq!(un.next_item_id(), autre.next_item_id());
+        // Et faire avancer l'un n'avance pas l'autre.
+        let _ = un.next_item_id();
+        assert_ne!(un.next_item_id(), autre.next_item_id());
+    }
+
+    /// L'id neuf arrive bien DANS le document DIDL envoyé au renderer —
+    /// l'attribut `id` de `<item>`, celui sur lequel le ND8006 indexe son
+    /// cache. Un compteur juste dont la valeur n'atteindrait pas le document
+    /// ne corrigerait rien.
+    #[test]
+    fn les_documents_didl_successifs_portent_des_id_distincts() {
+        let sortie = renderer_de_test();
+        let media = PlayMedia {
+            url: "http://192.0.2.1:8888/stream/1",
+            mime_type: "audio/flac",
+            title: Some("So What"),
+            artist: Some("Miles Davis"),
+            album: Some("Kind of Blue"),
+            duration_ms: Some(562_000),
+            file_size: Some(50_000_000),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            channels: Some(2),
+            ..Default::default()
+        };
+
+        let ids: Vec<String> = (0..4)
+            .map(|_| {
+                let didl = DlnaOutput::didl_metadata_pour_test(
+                    &media,
+                    &sortie.next_item_id(),
+                    media.mime_type,
+                );
+                // `build_escaped` rend `&lt;item id="1" …&gt;` : le chevron
+                // est échappé, les guillemets restent bruts (les analyseurs
+                // Denon/Marantz butent sur `&quot;`). Le marqueur cherché est
+                // donc valide sur les deux formes.
+                const MARQUEUR: &str = "item id=\"";
+                let debut = didl
+                    .find(MARQUEUR)
+                    .unwrap_or_else(|| panic!("aucun `{MARQUEUR}` dans le DIDL : {didl}"));
+                let reste = &didl[debut + MARQUEUR.len()..];
+                reste[..reste.find('"').expect("attribut id non terminé")].to_string()
+            })
+            .collect();
+
+        let uniques: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(uniques.len(), 4, "ids portés par les DIDL : {ids:?}");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // #3675, SECOND mécanisme — le niveau de DIDL appris ne savait que
+    // DESCENDRE en qualité. Une seule réponse « 500 sans corps » privait
+    // TOUTES les pistes suivantes du format annoncé, pour la vie du processus,
+    // et rien ne le disait.
+    //
+    // La durée d'une piste de référence dans tout ce bloc : quatre minutes.
+    // ───────────────────────────────────────────────────────────────────────
+
+    const PISTE_MS: u64 = 240_000;
+
+    /// LA garde. Un hoquet isolé — un appareil qui répond mal une fois, au
+    /// réveil ou pendant une bascule d'entrée — ne doit pas dégrader la file
+    /// entière.
+    ///
+    /// Avant le correctif, la piste 2 repartait du niveau 1 et toutes les
+    /// suivantes aussi : `niveau_de_depart` n'existait pas, les deux `store`
+    /// du fichier ne faisaient que monter.
+    #[test]
+    fn un_hoquet_isole_ne_prive_pas_les_pistes_suivantes_du_format() {
+        let porte = NiveauDidlAppris::neuf();
+
+        // Piste 1 : l'appareil rend un « 500 sans corps » sur le DIDL complet.
+        // L'échelle descend au DIDL minimal — celui qui n'écrit NI
+        // `sampleFrequency` NI `bitsPerSample`.
+        let t1 = 0;
+        assert_eq!(porte.niveau_de_depart(t1, "Marantz ND8006"), 0);
+        assert_eq!(
+            porte.apprendre(1, t1, "Marantz ND8006"),
+            TransitionNiveauDidl::Degrade { ancien: 0, neuf: 1 },
+            "la dégradation doit se NOMMER, pas se faire en silence"
+        );
+
+        // Piste 2, quatre minutes plus tard : la porte redonne le complet.
+        let t2 = t1 + PISTE_MS;
+        assert_eq!(
+            porte.niveau_de_depart(t2, "Marantz ND8006"),
+            0,
+            "le hoquet de la piste 1 a été appris DÉFINITIVEMENT"
+        );
+
+        // L'appareil n'avait fait que hoqueter : le complet passe, et la
+        // remontée se nomme elle aussi.
+        assert_eq!(
+            porte.apprendre(0, t2, "Marantz ND8006"),
+            TransitionNiveauDidl::Restaure { ancien: 1, neuf: 0 }
+        );
+
+        // Piste 3 : plus rien à rattraper, et plus une seule sonde à payer.
+        let t3 = t2 + PISTE_MS;
+        assert_eq!(porte.niveau_de_depart(t3, "Marantz ND8006"), 0);
+        assert_eq!(
+            porte.apprendre(0, t3, "Marantz ND8006"),
+            TransitionNiveauDidl::Inchange
+        );
+    }
+
+    /// La FORME FAUTIVE, reproduite. Sans cette moitié, la garde ci-dessus
+    /// pourrait être verte sans avoir rien distingué.
+    ///
+    /// Le champ était un `AtomicU8` nu : le départ valait le niveau appris, et
+    /// rien au monde ne le rabaissait.
+    #[test]
+    fn la_forme_fautive_reproduite_ne_remonte_jamais() {
+        // Un « 500 sans corps » a eu lieu sur la piste 1.
+        let appris_sans_retour = AtomicU8::new(1);
+        let depart_fautif = || appris_sans_retour.load(Ordering::Relaxed);
+
+        // Cent pistes — près de sept heures de musique — plus tard : toujours
+        // le DIDL minimal, donc toujours pas de format sur l'afficheur.
+        for piste in 1..=100u64 {
+            assert_eq!(
+                depart_fautif(),
+                1,
+                "piste {piste}, à {} ms : la forme fautive ne remonte jamais",
+                piste * PISTE_MS
+            );
+        }
+
+        // La porte neuve, elle, rend la main — mais pas avant son délai.
+        let porte = NiveauDidlAppris::neuf();
+        porte.apprendre(1, 0, "Marantz ND8006");
+        assert_eq!(
+            porte.niveau_de_depart(DIDL_RESONDE_BASE_MS - 1, "Marantz ND8006"),
+            1,
+            "avant le délai, l'apprentissage tient"
+        );
+        assert_eq!(
+            porte.niveau_de_depart(DIDL_RESONDE_BASE_MS, "Marantz ND8006"),
+            0,
+            "au délai, l'appareil est remis à l'épreuve"
+        );
+    }
+
+    /// L'autre moitié du contrat : un appareil qui ne sait VRAIMENT pas lire un
+    /// DIDL complet — la pile Platinum de l'Eversolo, #2394 — ne doit pas être
+    /// resondé à chaque piste. C'est exactement ce que l'apprentissage était
+    /// venu supprimer, et qu'une simple remise à zéro par piste rétablirait.
+    #[test]
+    fn un_appareil_qui_ne_sait_pas_faire_n_est_pas_resonde_a_chaque_piste() {
+        let porte = NiveauDidlAppris::neuf();
+        // Soixante pistes : quatre heures de musique d'affilée.
+        const PISTES: u32 = 60;
+        let mut resondes = 0u32;
+
+        for piste in 0..PISTES {
+            let t = u64::from(piste) * PISTE_MS;
+            let etait_degrade = porte.niveau_courant() > 0;
+            let depart = porte.niveau_de_depart(t, "Eversolo DMP-A8");
+            if etait_degrade && depart == 0 {
+                resondes += 1;
+            }
+            // La pile Platinum refuse le DIDL complet À CHAQUE FOIS.
+            porte.apprendre(1, t, "Eversolo DMP-A8");
+        }
+
+        assert!(
+            resondes >= 1,
+            "une porte qui ne se rouvre jamais est le défaut qu'on corrige"
+        );
+        assert!(
+            resondes * 5 <= PISTES,
+            "{resondes} aller-retours perdus sur {PISTES} pistes : la sonde \
+             doit s'espacer, pas revenir à chaque piste"
+        );
+        assert_eq!(
+            porte.attente_courante_ms(),
+            DIDL_RESONDE_MAX_MS,
+            "au bout de quatre heures, le délai doit avoir atteint son plafond"
+        );
+    }
+
+    /// Le barème lui-même : le délai double à chaque remise à l'épreuve ratée,
+    /// et il plafonne.
+    #[test]
+    fn le_delai_de_resonde_double_et_plafonne() {
+        let porte = NiveauDidlAppris::neuf();
+        porte.apprendre(1, 0, "Eversolo DMP-A8");
+        assert_eq!(porte.attente_courante_ms(), DIDL_RESONDE_BASE_MS);
+
+        let mut t = 0u64;
+        let mut attente = DIDL_RESONDE_BASE_MS;
+        for tour in 0..20 {
+            t += attente;
+            assert_eq!(
+                porte.niveau_de_depart(t, "Eversolo DMP-A8"),
+                0,
+                "tour {tour} : la sonde était due à {t} ms"
+            );
+            attente = attente.saturating_mul(2).min(DIDL_RESONDE_MAX_MS);
+            assert_eq!(
+                porte.apprendre(1, t, "Eversolo DMP-A8"),
+                TransitionNiveauDidl::ResondeEchouee {
+                    attente_ms: attente
+                },
+                "tour {tour}"
+            );
+        }
+        assert_eq!(porte.attente_courante_ms(), DIDL_RESONDE_MAX_MS);
+    }
+
+    /// Une dégradation NEUVE repart du délai de base : le barème accumulé par
+    /// un incident ancien ne doit pas retarder le rattrapage du suivant.
+    #[test]
+    fn une_degradation_neuve_repart_du_delai_de_base() {
+        let porte = NiveauDidlAppris::neuf();
+        porte.apprendre(1, 0, "Marantz ND8006");
+
+        let mut t = 0u64;
+        let mut attente = DIDL_RESONDE_BASE_MS;
+        for _ in 0..3 {
+            t += attente;
+            porte.apprendre(1, t, "Marantz ND8006");
+            attente = attente.saturating_mul(2).min(DIDL_RESONDE_MAX_MS);
+        }
+        assert!(porte.attente_courante_ms() > DIDL_RESONDE_BASE_MS);
+
+        // L'appareil se remet.
+        t += attente;
+        assert_eq!(porte.niveau_de_depart(t, "Marantz ND8006"), 0);
+        assert_eq!(
+            porte.apprendre(0, t, "Marantz ND8006"),
+            TransitionNiveauDidl::Restaure { ancien: 1, neuf: 0 }
+        );
+        assert_eq!(
+            porte.attente_courante_ms(),
+            DIDL_RESONDE_BASE_MS,
+            "le barème doit être remis à plat par la restauration"
+        );
+
+        // Un nouvel incident, plus tard : rattrapé au bout d'une minute, pas
+        // au bout du délai qu'avait atteint l'incident précédent.
+        let t_incident = t + 10 * PISTE_MS;
+        porte.apprendre(1, t_incident, "Marantz ND8006");
+        assert_eq!(
+            porte.niveau_de_depart(t_incident + DIDL_RESONDE_BASE_MS, "Marantz ND8006"),
+            0
+        );
+    }
+
+    /// CE QUE L'UTILISATEUR PERD, mesuré sur les deux documents que les deux
+    /// niveaux produisent réellement — pas décrit dans un commentaire.
+    ///
+    /// C'est le lien entre le niveau et le symptôme rapporté : « le Marantz
+    /// perd le format (44/16) ».
+    #[test]
+    fn le_didl_minimal_prive_le_renderer_du_format_que_le_complet_annonce() {
+        let media = PlayMedia {
+            url: "http://192.0.2.1:8888/stream/1",
+            mime_type: "audio/flac",
+            title: Some("So What"),
+            artist: Some("Miles Davis"),
+            album: Some("Kind of Blue"),
+            cover_url: Some("http://192.0.2.1:8888/cover/1"),
+            duration_ms: Some(562_000),
+            file_size: Some(50_000_000),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            channels: Some(2),
+            ..Default::default()
+        };
+
+        let complet = DlnaOutput::didl_metadata_pour_test(&media, "1", media.mime_type);
+        let minimal = DlnaOutput::didl_metadata_minimale_pour_test(&media, "1", media.mime_type);
+
+        for attendu in [
+            "sampleFrequency=\"44100\"",
+            "bitsPerSample=\"16\"",
+            "Miles Davis",
+            "Kind of Blue",
+        ] {
+            assert!(
+                complet.contains(attendu),
+                "le DIDL complet doit porter `{attendu}` : {complet}"
+            );
+            assert!(
+                !minimal.contains(attendu),
+                "le DIDL minimal ne porte PAS `{attendu}` — c'est ce que \
+                 l'utilisateur perd quand le niveau est rabaissé : {minimal}"
+            );
+        }
+
+        // Le titre et la durée, eux, survivent : la perte est bornée, et c'est
+        // exactement la liste ci-dessus.
+        assert!(minimal.contains("So What"));
+        assert!(minimal.contains("duration="));
+    }
+
+    /// « Écrit mais pas branché » : la porte éprouvée ci-dessus est bien LE
+    /// champ du `DlnaOutput` réel, celui que `play_media` (`SetAVTransportURI`)
+    /// et `set_next_media` (`SetNextAVTransportURI`) interrogent.
+    ///
+    /// [`NiveauDidlAppris`] n'expose AUCUNE lecture brute du niveau hors des
+    /// épreuves : `niveau_de_depart` est le seul chemin de production, aucun
+    /// appelant ne peut donc repartir du niveau dégradé en contournant le
+    /// délai.
+    #[test]
+    fn la_porte_est_bien_le_champ_du_renderer_reel() {
+        let sortie = renderer_de_test();
+
+        assert_eq!(
+            sortie.didl_niveau_appris.niveau_de_depart(0, &sortie.name),
+            0,
+            "un appareil neuf part du DIDL complet"
+        );
+        sortie.didl_niveau_appris.apprendre(1, 0, &sortie.name);
+        assert_eq!(
+            sortie
+                .didl_niveau_appris
+                .niveau_de_depart(PISTE_MS, &sortie.name),
+            0,
+            "quatre minutes plus tard, le renderer réel est remis à l'épreuve"
+        );
     }
 }

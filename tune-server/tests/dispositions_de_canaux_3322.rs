@@ -289,3 +289,117 @@ async fn une_declaration_de_la_sortie_prime_sur_la_deduction() {
         "ce que la sortie déclare elle-même ne doit jamais être écrasé"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #3322 — la grille « Appareils », l'autre route qui publie `output_capabilities`
+// ---------------------------------------------------------------------------
+
+/// Le même appareil répondait DEUX choses selon la route empruntée.
+///
+/// `GET /zones` et `GET /zones/{id}` complètent `channel_layouts` depuis le
+/// parc énuméré ; `GET /devices` publiait les capacités BRUTES du registre.
+/// C'est pourtant `GET /devices` que la grille « Appareils » du client
+/// interroge (`ZoneManagerView.svelte`, `api.getDevices()`) — et elle liste
+/// précisément les appareils qu'AUCUNE zone n'utilise encore, pour lesquels
+/// `GET /zones` ne peut par construction RIEN publier.
+///
+/// Ce témoin appelle l'assemblage de production `liste_des_appareils` avec un
+/// parc connu, exactement comme le témoin des zones appelle
+/// `output_capabilities_avec`. Retirer l'enrichissement de `GET /devices` le
+/// fait rougir.
+#[tokio::test]
+async fn la_grille_des_appareils_publie_aussi_les_dispositions_locales() {
+    let banc = Banc::neuf();
+    banc.zone_liee(SortieDEssai::neuve(
+        "local:Convertisseur 8 voies",
+        OutputCapabilities::v1(true, true, true, true, true, false),
+    ))
+    .await;
+    banc.zone_liee(SortieDEssai::neuve(
+        "dlna:renderer-inconnu",
+        OutputCapabilities::v1(true, true, true, true, true, true),
+    ))
+    .await;
+    banc.zone_liee(SortieDEssai::neuve(
+        "local:Carte qui sait",
+        OutputCapabilities::v1(true, true, true, true, true, false)
+            .with_channel_layouts(vec!["stereo".to_string()]),
+    ))
+    .await;
+
+    let parc = vec![
+        ("Convertisseur 8 voies".to_string(), 8u16),
+        ("Carte qui sait".to_string(), 32u16),
+    ];
+    let entrees = tune_server::routes::devices::liste_des_appareils(&banc.state, &parc).await;
+
+    assert_eq!(
+        dispositions_de(&entrees, "local:Convertisseur 8 voies"),
+        vec!["mono", "stereo", "surround51", "surround71"],
+        "GET /devices doit compléter une sortie LOCALE connue du parc, comme \
+         GET /zones le fait déjà"
+    );
+    assert!(
+        dispositions_de(&entrees, "dlna:renderer-inconnu").is_empty(),
+        "un renderer réseau négocie ses canaux dans le flux : [] et non une \
+         valeur inventée"
+    );
+    assert_eq!(
+        dispositions_de(&entrees, "local:Carte qui sait"),
+        vec!["stereo"],
+        "ce que la sortie déclare elle-même ne doit jamais être écrasé"
+    );
+}
+
+/// La route MONTÉE `GET /devices` publie bien le contrat de capacités.
+///
+/// Ce qu'il prouve : le champ voyage jusqu'au client par la route réelle, et
+/// la règle « inconnu ⇒ `[]`, jamais une valeur inventée » y tient aussi.
+///
+/// Ce qu'il NE prouve PAS, et il faut le dire : l'ENRICHISSEMENT ne peut pas
+/// être observé depuis une route montée dans un test. Le parc vient de
+/// `tune_core::outputs::local::cached_audio_devices()`, qui rend le CACHE de
+/// la dernière énumération et non une énumération fraîche ; dans un processus
+/// de test rien ne l'a jamais peuplé, il est donc vide sur toute machine —
+/// mesuré `[]` sur Shrek. Le témoin de l'enrichissement est celui d'au-dessus,
+/// sur l'assemblage de production `liste_des_appareils`, que le handler
+/// `list_devices` se contente d'appeler avec le parc réel : il n'y a rien
+/// entre les deux où une divergence pourrait se loger.
+#[tokio::test]
+async fn la_route_montee_devices_publie_le_contrat_de_capacites() {
+    let banc = Banc::neuf();
+    banc.zone_liee(SortieDEssai::neuve(
+        "local:Carte qui declare",
+        OutputCapabilities::v1(true, true, true, true, true, false)
+            .with_channel_layouts(vec!["surround51".to_string(), "surround71".to_string()]),
+    ))
+    .await;
+    banc.zone_liee(SortieDEssai::neuve(
+        "dlna:renderer-inconnu",
+        OutputCapabilities::v1(true, true, true, true, true, true),
+    ))
+    .await;
+
+    let (status, liste) = banc.lire("/api/v1/devices").await;
+    assert_eq!(status, StatusCode::OK);
+    let entrees = liste.as_array().expect("un tableau d'appareils");
+
+    assert_eq!(
+        dispositions_de(entrees, "local:Carte qui declare"),
+        vec!["surround51", "surround71"],
+        "GET /devices doit remettre au client les dispositions de la sortie"
+    );
+    assert!(
+        dispositions_de(entrees, "dlna:renderer-inconnu").is_empty(),
+        "une capacité inconnue publie [] sur GET /devices aussi"
+    );
+}
+
+/// Les dispositions publiées pour un identifiant d'appareil donné.
+fn dispositions_de(entrees: &[Value], device_id: &str) -> Vec<String> {
+    let entree = entrees
+        .iter()
+        .find(|e| e["id"].as_str() == Some(device_id))
+        .unwrap_or_else(|| panic!("l'entrée {device_id} doit être listée par GET /devices"));
+    dispositions(entree)
+}

@@ -37,6 +37,36 @@ struct DecisionLocale {
     fmt: String,
     zone: Option<crate::db::zone_repo::Zone>,
     needs_transcode: bool,
+    /// #3631 — la TRANCHE à jouer dans `file_path`, quand la piste vient d'une
+    /// feuille CUE : début et durée, en millisecondes.
+    ///
+    /// `None` pour toute piste ordinaire, c'est-à-dire pour la quasi-totalité
+    /// d'une bibliothèque : chaque site qui la lit garde alors son
+    /// comportement d'avant, à l'octet près.
+    tranche_cue: Option<TrancheCue>,
+}
+
+/// Un intervalle nommé à l'intérieur d'un fichier image (#3631).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TrancheCue {
+    pub(super) debut_ms: u64,
+    /// `None` quand la piste court jusqu'au bout du fichier — la dernière
+    /// d'une feuille. Il n'y a alors rien à borner : le fichier s'arrête tout
+    /// seul au bon endroit.
+    pub(super) duree_ms: Option<u64>,
+}
+
+impl TrancheCue {
+    /// La durée restante après un seek utilisateur DANS la tranche.
+    ///
+    /// Le seek de l'utilisateur est relatif au début de la PISTE, pas du
+    /// fichier image : il s'ajoute au début de la tranche et se retranche de sa
+    /// durée. Sans cette soustraction, sauter à 2 min d'une piste de 5 en
+    /// jouerait encore 5 — donc 2 minutes de la piste SUIVANTE.
+    fn duree_restante_s(&self, seek_ms: u64) -> Option<f64> {
+        let duree = self.duree_ms?;
+        Some(duree.saturating_sub(seek_ms) as f64 / 1000.0)
+    }
 }
 
 /// Ce que les décisions rendent : la décision à exécuter, ou une résolution
@@ -218,7 +248,22 @@ impl PlaybackOrchestrator {
             .map_err(|e| e.to_string())?
             .ok_or("track not found")?;
 
-        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
+        // #3631 — une piste de feuille CUE n'a PAS de `file_path` : `tracks.
+        // file_path` est `UNIQUE` et une feuille découpe N pistes dans le même
+        // fichier. Son fichier est `cue_media_path`, et ce qu'elle joue en est
+        // une TRANCHE. Sans ce repli, toute piste CUE échouait ici sur
+        // « track has no file_path » — c'est-à-dire toutes, puisque rien ne
+        // les écrivait avant le lot 2b.
+        let bornes = track.bornes_cue();
+        let tranche_cue = bornes.as_ref().map(|(_, debut, fin)| TrancheCue {
+            debut_ms: *debut,
+            duree_ms: fin.map(|f| f.saturating_sub(*debut)),
+        });
+        let file_path = match (track.file_path.clone(), &bornes) {
+            (Some(p), _) => p,
+            (None, Some((media, _, _))) => media.clone(),
+            (None, None) => return Err("track has no file_path".into()),
+        };
 
         // The DB row can outlive the file (moved/deleted external drive, stale
         // scan, duplicate compilation entry pointing at an old path). Without
@@ -288,7 +333,12 @@ impl PlaybackOrchestrator {
         // that track. Recover the real duration now and persist it so the track
         // self-heals for every later read. DSD is read from the header because
         // lofty (which get_duration uses) is exactly what returned 0 for it.
-        if track.duration_ms <= 0 {
+        //
+        // ⛔ JAMAIS pour une tranche de feuille CUE : la sonde rendrait la
+        // durée de l'IMAGE ENTIÈRE — 74 minutes pour une piste de 3 — et la
+        // persisterait. La durée d'une tranche est celle que la feuille dit,
+        // pas celle du fichier qui la porte.
+        if track.duration_ms <= 0 && tranche_cue.is_none() {
             if let Some(ms) = probe_local_duration_ms(&file_path, source_format).await {
                 track.duration_ms = ms;
                 let repo2 = TrackRepo::with_backend(self.db.clone());
@@ -309,6 +359,7 @@ impl PlaybackOrchestrator {
                 fmt.clone(),
                 source_format,
                 is_dsd_source,
+                tranche_cue,
             )
             .await?
         {
@@ -430,6 +481,7 @@ impl PlaybackOrchestrator {
         fmt: String,
         source_format: Option<AudioFormat>,
         is_dsd_source: bool,
+        tranche_cue: Option<TrancheCue>,
     ) -> Result<DecisionOuResolu, String> {
         let sample_rate = track
             .sample_rate
@@ -517,7 +569,28 @@ impl PlaybackOrchestrator {
         } else {
             String::new()
         };
-        let dop_requested = dop_requested(is_local_output, is_network_output, &dsd_mode);
+        let transport = transport_dsd(is_local_output, is_network_output, &dsd_mode);
+        let dop_requested = transport != TransportDsd::Pcm;
+
+        // #2369 — « natif » sur une sortie locale N'EST PAS natif.
+        //
+        // Le sélecteur propose deux modes ; sur une carte son, les deux
+        // emballent le DSD en DoP par ce même chemin. Le testeur qui coche
+        // « natif », voit du bruit blanc, recoche « dop » et revoit le même
+        // bruit blanc a fait UN essai sous deux étiquettes — et nous avons
+        // cherché une différence entre deux chemins identiques.
+        //
+        // Cette ligne ne change pas ce qui sort : elle l'écrit. Elle est le
+        // seul endroit qui connaisse à la fois le format de la source, le type
+        // de la sortie et le mode réglé, exactement comme
+        // `dsd_dop_not_requested` juste en dessous.
+        if transport == TransportDsd::NatifServiEnDop {
+            warn!(
+                zone_id = req.zone_id,
+                transport = transport.as_str(),
+                "dsd_local_natif_indisponible_servi_en_dop"
+            );
+        }
 
         // Un mode « auto » qui ne fait rien d'automatique, et qui se taisait.
         //
@@ -818,13 +891,22 @@ impl PlaybackOrchestrator {
                 .as_deref()
                 == Some("true");
             let src_est_dsd = source_format == Some(AudioFormat::Dsd);
-            let candidat = cible_wav_pour_traitement(
-                eq_forces_transcode,
-                is_network_output,
-                src_est_dsd,
-                opt_in,
-                true,
-            );
+            // #2742 — le crossfeed compte comme un traitement ICI, et ICI
+            // SEULEMENT. Il reste hors de `eq_forces_transcode` à dessein :
+            // ce drapeau-là renvoie au FICHIER quand l'opt-in est désarmé, et
+            // une zone réseau qui a coché le crossfeed (aujourd'hui sans le
+            // moindre effet) se retrouverait à payer 46 à 62 s de silence
+            // avant la première note pour un réglage qu'elle croyait inerte.
+            // Ne le compter que dans la cible progressive garantit qu'à froid
+            // rien ne change, et qu'armé, le crossfeed a enfin un chemin.
+            // `is_network_output &&` d'abord : sans lui, une zone LOCALE
+            // paierait une lecture de réglages par piste pour un drapeau que
+            // `cible_wav_pour_traitement` va de toute façon annuler.
+            let traitement = eq_forces_transcode
+                || (is_network_output && self.zone_has_active_crossfeed(req.zone_id));
+            let candidat =
+                cible_wav_pour_traitement(traitement, is_network_output, src_est_dsd, opt_in, true);
+
             let renderer_accepte_lpcm = if candidat {
                 let did = req
                     .output_device_id
@@ -836,7 +918,7 @@ impl PlaybackOrchestrator {
                 false
             };
             cible_wav_pour_traitement(
-                eq_forces_transcode,
+                traitement,
                 is_network_output,
                 src_est_dsd,
                 opt_in,
@@ -877,11 +959,20 @@ impl PlaybackOrchestrator {
             || needs_downsample
             || dlna_needs_wav
             || eq_forces_transcode
+            // Une zone qui n'a QUE du crossfeed n'allume pas
+            // `eq_forces_transcode` (voir plus haut) : sans cette ligne, sa
+            // cible progressive serait décidée puis jamais empruntée, et le
+            // crossfeed resterait muet malgré l'opt-in.
+            || dsp_progressif_wav
             // 16-bit cap on a FLAC-direct renderer: force a transcode so the
             // hi-res FLAC is re-encoded at 16-bit instead of served direct
             // (silent on the Ruark R3, #1137). ALAC already transcodes because
             // the cap disables alac_passthrough above.
-            || (dlna_cap_16bit && will_be_flac);
+            || (dlna_cap_16bit && will_be_flac)
+            // #3631 — une TRANCHE ne se sert jamais telle quelle. Le
+            // passthrough enverrait le fichier image ENTIER : l'album complet
+            // sous le nom d'une de ses pistes. Seul le décodage sait couper.
+            || tranche_cue.is_some();
         if eq_forces_transcode && !needs_transcode_for_output && !dlna_needs_wav {
             info!(zone_id = req.zone_id, "eq_active_forcing_network_transcode");
         }
@@ -916,6 +1007,7 @@ impl PlaybackOrchestrator {
             fmt,
             zone,
             needs_transcode,
+            tranche_cue,
         };
         Ok(DecisionOuResolu::Decision(decision))
     }
@@ -1107,7 +1199,15 @@ impl PlaybackOrchestrator {
         let source_format = AudioFormat::from_extension(&fmt);
         let is_dsd_source = source_format == Some(AudioFormat::Dsd);
         match self
-            .decider_la_lecture_locale(req, &track, file_path, fmt, source_format, is_dsd_source)
+            .decider_la_lecture_locale(
+                req,
+                &track,
+                file_path,
+                fmt,
+                source_format,
+                is_dsd_source,
+                None,
+            )
             .await?
         {
             DecisionOuResolu::Decision(decision) => {
@@ -1115,6 +1215,62 @@ impl PlaybackOrchestrator {
             }
             DecisionOuResolu::Resolu(_) => Err("résolu sans transcodage".into()),
         }
+    }
+
+    /// Ce que `transcoder_en_session` déciderait du relais DSP, sans rien
+    /// décoder : `(traitement actif, relais armé, crossfeed exécutable)`.
+    ///
+    /// Les deux premières valeurs comptent séparément. Une sortie locale avec
+    /// égaliseur a bien un traitement ACTIF — c'est ce qui rendait le cumul
+    /// possible — et ne doit pourtant pas armer le relais, puisqu'elle
+    /// applique ce même traitement elle-même. Un test qui ne regarderait que
+    /// la seconde ne distinguerait pas « la garde tient » de « la zone n'a
+    /// pas d'EQ ».
+    ///
+    /// Le troisième fait est venu d'une contre-épreuve : poser `channels: 0`
+    /// dans `load_streaming_dsp` rend le crossfeed INERTE sur toute zone
+    /// réseau — `process_pcm` sort avant d'écrire un octet — et les gardes du
+    /// correctif restaient VERTES, la garde de site comprise, parce
+    /// qu'aucune ne regardait le porteur réellement construit. Celle-ci le
+    /// regarde.
+    #[cfg(test)]
+    pub(super) async fn relais_dsp_pour_test(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<(bool, bool, bool), String> {
+        let track_id = req.track_id.ok_or("no track_id for local playback")?;
+        let track = TrackRepo::with_backend(self.db.clone())
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
+        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
+        let fmt = track.format.clone().unwrap_or_else(|| "flac".into());
+        let source_format = AudioFormat::from_extension(&fmt);
+        let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+        let decision = match self
+            .decider_la_lecture_locale(
+                req,
+                &track,
+                file_path,
+                fmt,
+                source_format,
+                is_dsd_source,
+                None,
+            )
+            .await?
+        {
+            DecisionOuResolu::Decision(d) => d,
+            DecisionOuResolu::Resolu(_) => return Err("résolu sans transcodage".into()),
+        };
+        let format = self.decider_le_format_de_sortie(req, &decision);
+        let dsp =
+            self.load_streaming_dsp(req.zone_id, req.track_id, format.out_sr, decision.channels);
+        let actif = dsp.is_active();
+        Ok((
+            actif,
+            relais_dsp_progressif(actif, decision.is_local_output),
+            dsp.crossfeed_executable(),
+        ))
     }
 
     /// Premier temps du transcodage : le format de sortie. Fréquence plafonnée
@@ -1478,6 +1634,7 @@ impl PlaybackOrchestrator {
             is_local_output,
             sample_rate,
             track_duration_ms,
+            tranche_cue,
             ref file_path,
             ..
         } = *decision;
@@ -1500,11 +1657,23 @@ impl PlaybackOrchestrator {
             let zone_id = req.zone_id;
             // EQ alters the encoded bytes and is not part of the cache key,
             // so a zone with an active EQ never uses the cache (always fresh).
-            let eq_profile = self.load_eq_processor(req.zone_id, out_sr, channels);
+            //
+            // PAS pour une sortie LOCALE, exactement comme le ReplayGain
+            // quinze lignes plus bas : `LocalOutput` applique déjà l'égaliseur
+            // et le convolveur dans sa propre boucle de lecture. Les cuire ici
+            // AUSSI doublerait la courbe en dB et convoluerait deux fois — le
+            // défaut que `relais_dsp_progressif` chasse sur l'autre bras. La
+            // garde du ReplayGain était SEULE ; elle ne l'est plus.
+            let cuire = traitement_cuit_dans_le_fichier(is_local_output);
+            let eq_profile = cuire
+                .then(|| self.load_eq_processor(req.zone_id, out_sr, channels))
+                .flatten();
             // The FIR convolver, like the EQ, alters the encoded bytes and
             // is not part of the cache key → a zone with an active IR never
             // uses the cache (always fresh).
-            let convolver = self.load_convolver(req.zone_id, out_sr, channels);
+            let convolver = cuire
+                .then(|| self.load_convolver(req.zone_id, out_sr, channels))
+                .flatten();
             // ReplayGain scales the samples, so like the EQ and the FIR it
             // changes the encoded bytes without being part of the cache key.
             // A cached transcode made at a different gain would be served
@@ -1545,6 +1714,14 @@ impl PlaybackOrchestrator {
                     .as_ref()
                     .and_then(|_| self.octets_ir(req.zone_id))
                     .as_deref(),
+            );
+            // 🔴 #3631 — la TRANCHE entre dans la clé. La clé est bâtie sur le
+            // fichier SOURCE, et les quinze pistes d'une image CUE le
+            // partagent : sans ce brassage, la première rendition mise en
+            // cache serait servie pour les quatorze autres.
+            let empreinte_dsp = crate::transcode_cache::empreinte_avec_tranche(
+                empreinte_dsp,
+                tranche_cue.map(|t| (t.debut_ms, t.duree_ms.map(|d| t.debut_ms + d))),
             );
             let cache_path_opt = crate::transcode_cache::cache_path_dsp(
                 &file_path,
@@ -1783,6 +1960,12 @@ impl PlaybackOrchestrator {
                         tmp_path.clone(),
                         Some(progres.clone()),
                         Some(abandon.clone()),
+                        // #3631 — la tranche à découper dans le fichier image.
+                        // `None` pour un fichier ordinaire.
+                        tranche_cue.map(|t| TrancheSource {
+                            debut_s: t.debut_ms as f64 / 1000.0,
+                            duree_s: t.duree_ms.map(|d| d as f64 / 1000.0).unwrap_or(0.0),
+                        }),
                     ),
                     progres,
                     politique,
@@ -1996,6 +2179,8 @@ impl PlaybackOrchestrator {
     ) -> Result<FluxLocal, String> {
         let DecisionLocale {
             channels,
+            tranche_cue,
+            is_local_output,
             ref file_path,
             ..
         } = *decision;
@@ -2027,8 +2212,14 @@ impl PlaybackOrchestrator {
             // façon. Sans traitement actif, le canal reste celui d'avant, à
             // l'octet près. Le premier chunk du décodeur est l'en-tête WAV :
             // il est épargné (`skip_header`), comme sur les autres bras.
+            //
+            // ⚠️ Sauf sur une sortie LOCALE : elle passe TOUJOURS par ici
+            // (`local_needs_wav`) et applique déjà ces mêmes étages dans sa
+            // propre boucle de lecture. Les cumuler doublait la courbe de
+            // l'égaliseur en dB et élevait le facteur ReplayGain au carré —
+            // voir `relais_dsp_progressif`.
             let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
-            let tx = if dsp.is_active() {
+            let tx = if relais_dsp_progressif(dsp.is_active(), is_local_output) {
                 tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
                 spawn_streaming_dsp_relay(dsp, out_bd, true, tx)
             } else {
@@ -2052,7 +2243,18 @@ impl PlaybackOrchestrator {
             let ev_bus = self.event_bus.clone();
             let playback = self.playback.clone();
             let zone_id = req.zone_id;
-            let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
+            // #3631 — le seek de l'utilisateur est relatif au début de la
+            // PISTE. Pour une tranche de feuille CUE, la position dans le
+            // FICHIER est le début de la tranche PLUS ce seek ; la durée
+            // restante à servir, elle, en est diminuée d'autant.
+            let seek_utilisateur_ms = req.seek_ms.unwrap_or(0);
+            let seek_s = (tranche_cue.map(|t| t.debut_ms).unwrap_or(0) + seek_utilisateur_ms)
+                as f64
+                / 1000.0;
+            let duree_tranche_s = tranche_cue.and_then(|t| t.duree_restante_s(seek_utilisateur_ms));
+            // Les niveaux sont datés sur l'horloge de la PISTE : le décalage
+            // du fichier image n'a rien à y faire.
+            let seek_niveaux_ms = seek_utilisateur_ms as i64;
             let streamer_sessions = self.streamer.sessions_state();
             let close_session_id = session_id.clone();
             // Pré-chargement gapless : session de la piste suivante, pas
@@ -2078,7 +2280,7 @@ impl PlaybackOrchestrator {
                             playback,
                             zone_id,
                             play_seq,
-                            (seek_s * 1000.0) as i64,
+                            seek_niveaux_ms,
                         )
                     }
                     None => {
@@ -2091,7 +2293,7 @@ impl PlaybackOrchestrator {
                 drop(tx);
 
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm_streaming_seeked(
+                    crate::audio::decode::decode_to_pcm_streaming_tranche(
                         &fp_clone,
                         Some(out_sr),
                         Some(channels as u32),
@@ -2101,6 +2303,7 @@ impl PlaybackOrchestrator {
                         data_ready,
                         levels_tx,
                         seek_s,
+                        duree_tranche_s,
                     )
                 })
                 .await;

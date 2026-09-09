@@ -259,6 +259,33 @@ pub struct LicenseState {
 /// Free-tier zone cap when not overridden. Configurable at runtime via
 /// `TUNE_FREE_MAX_ZONES` (see `TuneConfig`); premium is always unlimited.
 const DEFAULT_FREE_MAX_ZONES: i64 = 3;
+
+// ---------------------------------------------------------------------------
+// Plafond de zones du palier gratuit
+// ---------------------------------------------------------------------------
+
+/// Ce que le plafond de zones dit à un instant donné : combien de zones
+/// consomment le quota, et quel est le quota (`None` = illimité).
+///
+/// Un seul type, produit par un seul calcul
+/// ([`LicenseManager::plafond_zones`]) : le refus de lecture, l'affichage de
+/// `/system/config` et celui de `/cloud/license/status` lisent tous les trois
+/// le même objet. Avant #3673 chacun refaisait sa propre version du chiffre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlafondZones {
+    /// Zones qui consomment le quota — en ligne, non masquées, déjà jouées.
+    /// Vaut 0 quand la question ne se pose pas (Premium).
+    pub actives: i64,
+    /// Le plafond, ou `None` pour illimité (Premium).
+    pub limite: Option<i64>,
+}
+
+impl PlafondZones {
+    /// Le quota est-il consommé ? `false` dès que la limite est `None`.
+    pub fn atteint(&self) -> bool {
+        self.limite.is_some_and(|l| self.actives >= l)
+    }
+}
 // Offline grace once a key HAS been validated online at least once. Shortened
 // from 30 to 14 days: enough tolerance for an intermittently-connected server,
 // but a revoked or lapsed key falls back to Free sooner. The initial online
@@ -396,13 +423,45 @@ impl LicenseManager {
         effective_tier(&*self.state.read().await) == Tier::Premium
     }
 
-    /// Check whether adding a new zone is allowed.
-    /// Free tier: max `free_max_zones`.  Premium: unlimited.
-    pub async fn check_zone_limit(&self, current_count: i64) -> bool {
+    /// Le plafond de zones **en vigueur** : `None` = illimité (Premium),
+    /// `Some(n)` = le palier gratuit et son nombre.
+    ///
+    /// C'est LA lecture du chiffre. `/system/config` et `/cloud/license/status`
+    /// affichaient la même condition ternaire recopiée à la main, chacune de
+    /// son côté (#3673) : elles appellent désormais celle-ci.
+    pub async fn limite_zones(&self) -> Option<i64> {
         match effective_tier(&*self.state.read().await) {
-            Tier::Premium => true,
-            Tier::Free => current_count < self.free_max_zones,
+            Tier::Premium => None,
+            Tier::Free => Some(self.free_max_zones),
         }
+    }
+
+    /// L'état du plafond de zones : combien consomment le quota, et quel est
+    /// le quota. **Seule** implémentation de la règle (#3673).
+    ///
+    /// L'assiette est celle que #667 a tranchée — `ZoneRepo::count_active` :
+    /// en ligne, non masquée, et **déjà jouée** (`last_track_id IS NOT NULL`).
+    /// Une zone auto-découverte jamais utilisée ne consomme rien : c'est ce
+    /// qui a débloqué JeromeQ (forum #783), à qui la découverte réseau avait
+    /// rempli le quota avant qu'il ne joue quoi que ce soit.
+    ///
+    /// Ce qui existait ici avant s'appelait `check_zone_limit(current_count)`
+    /// et laissait l'**appelant** choisir ce qu'il comptait — donc la règle.
+    /// Il n'avait plus aucun appelant hors de ses propres tests : c'était une
+    /// seconde règle écrite mais pas branchée, prête à revenir à l'assiette
+    /// d'avant #667 dès que quelqu'un lui aurait passé `count_online()`.
+    pub async fn plafond_zones(&self) -> PlafondZones {
+        let limite = self.limite_zones().await;
+        // Ne compter que si la question se pose : un serveur Premium n'a pas
+        // à interroger la base pour s'entendre dire « illimité ».
+        let actives = if limite.is_some() {
+            crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                .count_active()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        PlafondZones { actives, limite }
     }
 
     /// Clone snapshot of the current license state (for API responses). The
@@ -1452,14 +1511,48 @@ mod tests {
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
-        let mgr = LicenseManager::new_with_limit(backend, 3);
+        let mgr = LicenseManager::new_with_limit(backend.clone(), 3);
         assert_eq!(mgr.tier().await, Tier::Free);
         assert!(!mgr.is_premium().await);
         assert!(!mgr.check_feature(Feature::DspEq).await);
         // Free tier is capped at the configured limit (3 here).
         assert_eq!(mgr.free_zone_limit(), 3);
-        assert!(mgr.check_zone_limit(2).await);
-        assert!(!mgr.check_zone_limit(3).await);
+        assert_eq!(mgr.limite_zones().await, Some(3));
+        // Le plafond mesure lui-même son assiette (#3673) : ce n'est plus
+        // l'appelant qui annonce un nombre, c'est la base qui le dit.
+        let zones = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let id = zones
+                .create(
+                    &format!("Zone {n}"),
+                    Some("dlna"),
+                    Some(&format!("uuid:{n}")),
+                )
+                .unwrap();
+            zones.update_online(id, true).unwrap();
+            ids.push(id);
+        }
+        // Trois zones en ligne mais DORMANTES : le quota est intact.
+        let p = mgr.plafond_zones().await;
+        assert_eq!(p.actives, 0, "une zone jamais jouee ne consomme rien");
+        assert!(!p.atteint());
+        // Deux zones jouées : encore une place.
+        for id in &ids[..2] {
+            zones
+                .save_playback_position(*id, 0, Some(1), Some("local"), None)
+                .unwrap();
+        }
+        assert_eq!(mgr.plafond_zones().await.actives, 2);
+        assert!(!mgr.plafond_zones().await.atteint());
+        // La troisième consomme la dernière : le plafond est atteint.
+        zones
+            .save_playback_position(ids[2], 0, Some(1), Some("local"), None)
+            .unwrap();
+        let p = mgr.plafond_zones().await;
+        assert_eq!(p.actives, 3);
+        assert_eq!(p.limite, Some(3));
+        assert!(p.atteint(), "3 zones jouees sur un plafond de 3 = atteint");
     }
 
     #[tokio::test]
@@ -1493,7 +1586,9 @@ mod tests {
         assert_eq!(mgr.tier().await, Tier::Premium);
         assert!(mgr.is_premium().await);
         assert!(mgr.check_feature(Feature::CloudRelay).await);
-        assert!(mgr.check_zone_limit(100).await);
+        // Premium : plus de plafond du tout, quel que soit le nombre de zones.
+        assert_eq!(mgr.limite_zones().await, None);
+        assert!(!mgr.plafond_zones().await.atteint());
 
         mgr.clear_license().await;
         assert_eq!(mgr.tier().await, Tier::Free);

@@ -1203,7 +1203,26 @@ impl PlaybackOrchestrator {
             replaygain,
             eq: self.load_eq_processor(zone_id, sample_rate, channels),
             convolver: self.load_convolver(zone_id, sample_rate, channels),
+            // #2742 — le crossfeed rejoint les trois autres. `load_crossfeed_processor`
+            // n'a jamais porté de garde `local:` : la contrainte vivait chez ses
+            // APPELANTS, tous dans la sortie locale. Un bras progressif est donc
+            // libre de le charger, et c'est ce qui lui ouvre les zones réseau.
+            // La ligne à retard est bâtie au taux réellement servi, comme les
+            // biquads de l'égaliseur juste au-dessus.
+            crossfeed: self.load_crossfeed_processor(zone_id, sample_rate),
+            channels,
         }
+    }
+
+    /// La zone a-t-elle un crossfeed réellement actif ?
+    ///
+    /// Jumeau de [`Self::zone_has_active_eq`], et pour le même usage : décider
+    /// du chemin AVANT de connaître le taux réel du flux. 44 100 n'est qu'une
+    /// sonde — `load_crossfeed_processor` ne rend `None` que sur le mode PURE,
+    /// la case décochée ou un `amount` nul, et aucun des trois ne dépend du
+    /// taux ; seule la longueur de la ligne à retard en dépend.
+    pub(super) fn zone_has_active_crossfeed(&self, zone_id: i64) -> bool {
+        self.load_crossfeed_processor(zone_id, 44100).is_some()
     }
 
     /// Profil EQ réellement actif pour une zone, sans encore le lier à un

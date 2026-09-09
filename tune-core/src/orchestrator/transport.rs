@@ -13,9 +13,9 @@ enum ResoluOuFini {
 
 /// Ce que la demande impose par-dessus le flux résolu : pochette et album
 /// demandés, sinon ceux du flux. Relevés une fois, lus par trois temps.
-struct Habillage {
-    album: Option<String>,
-    cover_path: Option<String>,
+pub(super) struct Habillage {
+    pub(super) album: Option<String>,
+    pub(super) cover_path: Option<String>,
 }
 
 impl PlaybackOrchestrator {
@@ -95,14 +95,25 @@ impl PlaybackOrchestrator {
             .flatten()
             .and_then(|z| z.last_track_id)
             .is_some();
-        if already_active || lic.is_premium().await {
+        if already_active {
             return Ok(());
         }
-        let active = zrepo.count_active().unwrap_or(0);
-        if active >= lic.free_zone_limit() {
+        // Le chiffre ET l'assiette viennent d'un SEUL endroit (#3673) : ni le
+        // plafond ni le comptage ne sont refaits ici. `plafond_zones` rend
+        // `limite: None` sur Premium, donc `atteint()` y est toujours faux.
+        let plafond = lic.plafond_zones().await;
+        if plafond.atteint() {
+            // Sentinelle STRUCTURÉE, pas une phrase : le nombre voyage, la
+            // formulation est celle de la couche HTTP, dans la langue de la
+            // requête (#3672). Ce qui partait d'ici était une phrase anglaise
+            // en dur, servie telle quelle à un utilisateur francophone — et
+            // elle parlait de « Premium » sans dire qu'il s'agissait d'un
+            // NOMBRE DE ZONES, ce dont Claudio Osorio a conclu que ses
+            // protocoles réseau étaient payants.
             return Err(format!(
-                "premium_required:Free tier is limited to {} active zones. Upgrade to Tune Premium for unlimited zones.",
-                lic.free_zone_limit()
+                "free_zone_cap:{}:{}",
+                plafond.actives,
+                plafond.limite.unwrap_or(0)
             ));
         }
         Ok(())
@@ -598,7 +609,7 @@ impl PlaybackOrchestrator {
     /// Troisième temps : le `NowPlaying` annoncé aux clients, la ligne de
     /// bibliothèque prenant le pas sur le flux pour le format et la
     /// résolution (`resolution_annoncee`).
-    fn composer_le_now_playing(
+    pub(super) fn composer_le_now_playing(
         &self,
         req: &PlayRequest,
         resolved: &ResolvedStream,

@@ -21,6 +21,8 @@ pub mod metadata_report_repo;
 pub mod migration_status;
 pub mod migrations;
 pub mod models;
+#[cfg(all(test, feature = "postgres"))]
+mod pg_ensure_schema_parity;
 #[cfg(feature = "postgres")]
 pub mod pg_migrate;
 #[cfg(all(test, feature = "postgres"))]

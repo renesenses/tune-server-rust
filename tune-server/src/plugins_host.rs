@@ -163,9 +163,35 @@ impl HostContext for AppStateHost {
             return Err("queue_add: no valid tracks (need track_id or source+source_id)".into());
         }
 
-        let added = inputs.len();
-        PlayQueueRepo::with_backend(self.backend.clone()).append(zone, &inputs)?;
-        Ok(json!({ "ok": true, "added": added }))
+        // 🔴 #3663 — `added` comptait les pistes DEMANDÉES, comme la route le
+        // faisait avant #3231. L'enveloppe `append` jette le bilan de
+        // `insert_at_bilan` : depuis que l'insertion unifiée SAUTE la piste
+        // disparue au lieu d'annuler toute la transaction, demandé et écrit ne
+        // sont plus le même nombre, et un greffon qui enfile 190 titres dont
+        // trois ont disparu s'entendait répondre « added: 190 » pour une file
+        // qui en porte 187. Un compteur qui ment est pire qu'un compteur
+        // absent (#2394) : on annonce ce qui est ENTRÉ, et on nomme ce qui est
+        // tombé. Même vocabulaire que `queue_add_pistes_absentes` sur la route.
+        let bilan = PlayQueueRepo::with_backend(self.backend.clone())
+            .insert_at_bilan(zone, &inputs, None)?;
+        if bilan.has_loss() {
+            let apercu: Vec<i64> = bilan.skipped.iter().take(10).copied().collect();
+            warn!(
+                target: "plugin",
+                zone,
+                demandees = bilan.requested,
+                ajoutees = bilan.inserted(),
+                absentes = bilan.skipped.len(),
+                apercu_ids_absents = ?apercu,
+                "plugin_queue_add_pistes_absentes — des pistes demandées par un greffon n'existent plus en bibliothèque"
+            );
+        }
+        Ok(json!({
+            "ok": true,
+            "added": bilan.inserted(),
+            "demandees": bilan.requested,
+            "absentes": bilan.skipped.len(),
+        }))
     }
 
     fn now_playing(&self, zone: i64) -> Result<Value, String> {
@@ -818,5 +844,97 @@ mod tests {
         assert!(any_subscription_matches(&subs, "zone.created"));
         assert!(!any_subscription_matches(&subs, "library.scanned"));
         assert!(!any_subscription_matches(&[], "playback.paused"));
+    }
+}
+
+/// 🔴 #3663 — ce que le greffon s'entend répondre doit être ce qui est ENTRÉ.
+///
+/// Garde de SITE D'APPEL : elle appelle `AppStateHost::queue_add`, la
+/// capacité `host_queue_add` que tout greffon wasm atteint, et lit le `added`
+/// de sa réponse. Elle ne vérifie pas que `insert_at_bilan` sait compter — ce
+/// compte est déjà gardé chez lui — mais que CET appelant-ci le consomme, au
+/// lieu de rendre `inputs.len()` comme le faisait l'enveloppe `append`.
+///
+/// Les deux moitiés y sont : une piste disparue doit faire répondre `added: 1`
+/// pour deux demandées, et la même demande entièrement valide doit répondre
+/// `added: 2` sans perte annoncée.
+#[cfg(test)]
+mod le_greffon_ne_compte_que_ce_qui_est_entre_3663 {
+    use super::AppStateHost;
+    use crate::state::AppState;
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::db::play_queue_repo::PlayQueueRepo;
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_plugin_runtime_wasm::HostContext;
+
+    /// Une zone, deux pistes en bibliothèque. `supprimer` retire la seconde
+    /// juste avant l'enfilage : l'identifiant que le greffon demande devient
+    /// périmé, exactement comme après un rescan.
+    fn enfiler_deux_pistes(supprimer: bool) -> (serde_json::Value, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("AppState");
+        let zone_id = ZoneRepo::with_backend(state.backend.clone())
+            .create("Salon", Some("local"), Some("local:essai"))
+            .expect("création de zone");
+        state
+            .backend
+            .execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+            .unwrap();
+        state
+            .backend
+            .execute(
+                "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+                &[],
+            )
+            .unwrap();
+        for i in 1..=2i64 {
+            let titre = format!("Piste {i}");
+            state
+                .backend
+                .execute(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms) \
+                     VALUES (?, ?, 1, 1, 180000)",
+                    &[&i as &dyn ToSqlValue, &titre.as_str()],
+                )
+                .unwrap();
+        }
+        if supprimer {
+            state
+                .backend
+                .execute("DELETE FROM tracks WHERE id = 2", &[])
+                .unwrap();
+        }
+        let host = AppStateHost::from_state(&state);
+        let reponse = host
+            .queue_add(
+                zone_id,
+                serde_json::json!([{ "track_id": 1 }, { "track_id": 2 }]),
+            )
+            .expect("host_queue_add");
+        let en_file = PlayQueueRepo::with_backend(state.backend.clone())
+            .count_all(zone_id)
+            .unwrap_or(-1);
+        (reponse, en_file)
+    }
+
+    #[test]
+    fn une_piste_disparue_ne_doit_pas_etre_comptee_comme_ajoutee() {
+        let (reponse, en_file) = enfiler_deux_pistes(true);
+        assert_eq!(en_file, 1, "une seule ligne a pu s'écrire");
+        assert_eq!(
+            reponse["added"], 1,
+            "le greffon doit lire ce qui est ENTRÉ, pas ce qu'il a demandé — \
+             un compteur qui ment est pire qu'un compteur absent (#2394)"
+        );
+        assert_eq!(reponse["demandees"], 2);
+        assert_eq!(reponse["absentes"], 1);
+    }
+
+    #[test]
+    fn contre_epreuve_rien_ne_manque_rien_n_est_annonce_perdu() {
+        let (reponse, en_file) = enfiler_deux_pistes(false);
+        assert_eq!(en_file, 2);
+        assert_eq!(reponse["added"], 2);
+        assert_eq!(reponse["demandees"], 2);
+        assert_eq!(reponse["absentes"], 0);
     }
 }

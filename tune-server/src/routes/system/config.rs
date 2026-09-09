@@ -631,11 +631,11 @@ pub(super) async fn get_config(
     // Premium licensing info
     let license_state = state.license.license_state().await;
     let premium_tier = license_state.tier;
-    let zone_limit = if premium_tier == tune_core::license::Tier::Premium {
-        serde_json::Value::Null
-    } else {
-        json!(state.license.free_zone_limit())
-    };
+    // Le plafond vient de la licence, qui est la SEULE a savoir s'il y en a un
+    // (#3673) : cette route en tenait sa propre copie ternaire, `/cloud/license
+    // /status` la sienne, et le refus de lecture une troisieme. `null` = pas de
+    // plafond du tout, ce que le client web lit deja comme « illimite ».
+    let zone_limit = json!(state.license.limite_zones().await);
     let mut premium_features = serde_json::Map::new();
     for f in tune_core::license::Feature::all_premium() {
         let key = serde_json::to_value(f)

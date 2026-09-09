@@ -1,4 +1,12 @@
-//! Headphone crossfeed DSP effect (built-in, local output only).
+//! Headphone crossfeed DSP effect (built-in).
+//!
+//! ⚠️ Ce module s'est longtemps intitulé « local output only », et c'était vrai :
+//! les trois seuls sites d'installation étaient derrière
+//! `device_id.starts_with("local:")`. Depuis LAT-F1, le relais du bras
+//! progressif (`StreamingDsp`) en porte un quatrième, ce qui ouvre les zones
+//! RÉSEAU — sous conditions, énumérées par `crossfeed_status`. Le chemin
+//! FICHIER, lui, n'en porte toujours aucun, et un garde-fou de ce module le
+//! vérifie.
 //!
 //! Crossfeed blends a small, delayed amount of each channel into the other to
 //! relax the hard left/right separation of a stereo recording heard on
@@ -121,6 +129,82 @@ impl CrossfeedProcessor {
         }
     }
 
+    /// Appliquer le crossfeed à du PCM entier entrelacé, en place — la même
+    /// disposition que celle passée à `EqProcessor::process_pcm` et à
+    /// `Convolver::process_pcm` (petit-boutien, 16 / 24 / 32 bits).
+    ///
+    /// C'est la porte du bras PROGRESSIF. La sortie locale, elle, tient déjà
+    /// des `f32` et appelle directement `process_interleaved` : les deux
+    /// chemins partagent donc l'algorithme, et lui seul.
+    ///
+    /// `channels` est un paramètre parce que ce processeur ne le porte pas :
+    /// le crossfeed n'a de sens qu'en stéréo — c'est un effet de séparation
+    /// gauche/droite — et tout autre nombre de canaux est un **non-op**
+    /// silencieux, comme la garde `channels == 2` que `local.rs` applique de
+    /// son côté. Une conversion qui interpréterait du 5.1 en paires L/R
+    /// mélangerait des canaux sans rapport.
+    ///
+    /// La ligne à retard vit entre les appels : le découpage en chunks du bras
+    /// progressif est donc transparent, exactement comme pour les biquads de
+    /// l'égaliseur et le recouvrement du convolveur.
+    pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16, channels: u16) {
+        if channels != 2 || pcm.is_empty() || self.amount == 0.0 {
+            return;
+        }
+        let bps = (bit_depth / 8) as usize;
+        if bps == 0 {
+            return;
+        }
+        let total = pcm.len() / bps;
+        // Une trame stéréo incomplète en fin de chunk n'est pas interprétable
+        // en paire L/R : on s'arrête à la dernière trame ENTIÈRE et on laisse
+        // les octets restants intacts plutôt que de les décaler d'un canal.
+        let total = total - (total % 2);
+        if total == 0 {
+            return;
+        }
+        let mut buf: Vec<f32> = Vec::with_capacity(total);
+        for i in 0..total {
+            let o = i * bps;
+            let s = match bit_depth {
+                16 => i16::from_le_bytes([pcm[o], pcm[o + 1]]) as f32 / 32768.0,
+                24 => {
+                    let v = i32::from_le_bytes([0, pcm[o], pcm[o + 1], pcm[o + 2]]);
+                    v as f32 / 2147483648.0
+                }
+                32 => {
+                    let v = i32::from_le_bytes([pcm[o], pcm[o + 1], pcm[o + 2], pcm[o + 3]]);
+                    v as f32 / 2147483648.0
+                }
+                _ => return,
+            };
+            buf.push(s);
+        }
+        self.process_interleaved(&mut buf);
+        for i in 0..total {
+            let o = i * bps;
+            let s = buf[i].clamp(-1.0, 1.0);
+            match bit_depth {
+                16 => {
+                    let v = (s * 32767.0).round() as i16;
+                    pcm[o..o + 2].copy_from_slice(&v.to_le_bytes());
+                }
+                24 => {
+                    let v = (s * 8_388_607.0).round() as i32;
+                    let b = v.to_le_bytes();
+                    pcm[o] = b[0];
+                    pcm[o + 1] = b[1];
+                    pcm[o + 2] = b[2];
+                }
+                32 => {
+                    let v = (s * 2_147_483_647.0).round() as i32;
+                    pcm[o..o + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Reprendre la ligne à retard d'un processeur précédent, pour qu'un
     /// remplacement **en cours de lecture** ne claque pas.
     ///
@@ -196,18 +280,33 @@ impl CrossfeedProcessor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CrossfeedConstraint {
-    /// La zone ne joue pas par une sortie LOCALE. Le crossfeed n'est appliqué
-    /// que par `LocalOutput` (`apply_local_dsp` / `flush_local_dsp`) ; le
-    /// chemin réseau passe par `transcode_source_to_file`, dont la signature
-    /// ne porte que l'égaliseur, le convolveur et le ReplayGain — jamais de
-    /// crossfeed. Couvre aussi la zone dont aucun périphérique n'est résolu :
-    /// elle ne joue nulle part, donc pas davantage par une sortie locale.
+    /// La zone ne joue ni par une sortie LOCALE, ni par une sortie RÉSEAU :
+    /// OAAT, navigateur, sorties PULL, ou zone dont aucun périphérique n'est
+    /// résolu (elle ne joue nulle part).
+    ///
+    /// Depuis LAT-F1 ce motif ne couvre plus les zones réseau — elles ont leurs
+    /// deux motifs propres. Il reste la réponse PRUDENTE pour les familles dont
+    /// le chemin n'a pas été mesuré : certaines traversent probablement le
+    /// relais progressif, mais annoncer « disponible » sans preuve serait le
+    /// défaut de #2742 pris à l'envers.
     NonLocalOutput,
     /// Le mode PURE (audiophile) désarme volontairement le crossfeed pour
     /// garder le chemin bit-perfect (`load_crossfeed_processor` rend `None`).
     /// C'est un choix assumé, pas une panne — mais tant qu'il dure, le réglage
     /// est sans effet et l'écran doit le dire.
     PureMode,
+    /// Zone RÉSEAU dont le flux progressif n'est pas armé. Depuis LAT-F1, le
+    /// crossfeed d'une zone réseau est appliqué par le relais du bras
+    /// progressif ; ce bras n'est emprunté que si l'opt-in global
+    /// `dsp_progressif_reseau` (Réglages → Lecture) est coché. À froid, la
+    /// zone part encore par le fichier pré-transcodé, qui ne porte aucun
+    /// crossfeed — et c'est un garde-fou du dépôt, pas un oubli.
+    NetworkProgressiveOff,
+    /// Zone RÉSEAU dont le renderer n'a pas annoncé le LPCM à la profondeur
+    /// servie (sonde `GetProtocolInfo`, réponse inconcluante comprise). Le
+    /// bras progressif sert du WAV : un renderer qui ne le déclare pas est
+    /// renvoyé au fichier, donc sans crossfeed.
+    NetworkRendererNoLpcm,
 }
 
 impl CrossfeedConstraint {
@@ -216,6 +315,8 @@ impl CrossfeedConstraint {
         match self {
             Self::NonLocalOutput => "non_local_output",
             Self::PureMode => "pure_mode",
+            Self::NetworkProgressiveOff => "network_progressive_off",
+            Self::NetworkRendererNoLpcm => "network_renderer_no_lpcm",
         }
     }
 
@@ -235,12 +336,29 @@ impl CrossfeedConstraint {
                  touche le signal, crossfeed compris. Le réglage est conservé et \
                  reprendra effet dès que le mode PURE sera désactivé."
             }
+            Self::NetworkProgressiveOff => {
+                "Sur une zone réseau, le crossfeed passe par le flux progressif. \
+                 Activez « DSP progressif réseau » dans Réglages → Lecture pour \
+                 l'entendre ; sans cette option la zone reçoit un fichier \
+                 pré-transcodé, qui ne porte pas le crossfeed."
+            }
+            Self::NetworkRendererNoLpcm => {
+                "Ce lecteur réseau n'annonce pas savoir lire le PCM non compressé \
+                 à cette profondeur. Le flux progressif — le seul chemin du \
+                 crossfeed sur une zone réseau — ne peut donc pas lui être servi. \
+                 Le réglage est conservé et vaudra pour une autre sortie."
+            }
         }
     }
 
     /// Toutes les variantes. Sert la contre-épreuve permanente : une contrainte
     /// ajoutée sans code ni libellé fait tomber le test qui parcourt cette liste.
-    pub const ALL: [Self; 2] = [Self::NonLocalOutput, Self::PureMode];
+    pub const ALL: [Self; 4] = [
+        Self::NonLocalOutput,
+        Self::PureMode,
+        Self::NetworkProgressiveOff,
+        Self::NetworkRendererNoLpcm,
+    ];
 }
 
 /// Ce que le crossfeed VAUT réellement pour une zone, à côté de ce que le
@@ -295,14 +413,41 @@ pub fn crossfeed_runs_on_output(output_device_id: Option<&str>) -> bool {
 pub fn crossfeed_status(
     requested: bool,
     output_is_local: bool,
+    output_is_network: bool,
     audiophile: bool,
+    progressif_arme: bool,
+    renderer_accepte_lpcm: bool,
 ) -> CrossfeedStatus {
-    let reason = if !output_is_local {
-        Some(CrossfeedConstraint::NonLocalOutput)
-    } else if audiophile {
+    // L'ORDRE a changé avec LAT-F1, et le changement est le sujet.
+    //
+    // Avant, `NonLocalOutput` primait : une zone réseau ne verrait JAMAIS de
+    // crossfeed, PURE ou non, donc autant nommer la contrainte définitive.
+    // Depuis que le bras progressif porte le crossfeed, ce n'est plus vrai —
+    // une zone réseau PEUT l'entendre. La contrainte qu'aucun chemin
+    // n'esquive est désormais le mode PURE : `load_crossfeed_processor` rend
+    // `None`, quelle que soit la sortie. C'est donc lui qui passe devant.
+    let reason = if audiophile {
         Some(CrossfeedConstraint::PureMode)
-    } else {
+    } else if output_is_local {
         None
+    } else if output_is_network {
+        // Les deux conditions du bras progressif, dans l'ordre où
+        // l'utilisateur peut agir dessus : l'opt-in est une case qu'il coche,
+        // le LPCM du renderer ne se négocie pas.
+        if !progressif_arme {
+            Some(CrossfeedConstraint::NetworkProgressiveOff)
+        } else if !renderer_accepte_lpcm {
+            Some(CrossfeedConstraint::NetworkRendererNoLpcm)
+        } else {
+            None
+        }
+    } else {
+        // Ni locale, ni réseau : OAAT, navigateur, sorties PULL, zone sans
+        // périphérique résolu. Elles ne sont PAS couvertes par ce correctif —
+        // certaines traversent probablement le relais (OAAT transcode en WAV
+        // par session), mais ce n'est pas mesuré, et annoncer « disponible »
+        // sans preuve est exactement le défaut de #2742 pris à l'envers.
+        Some(CrossfeedConstraint::NonLocalOutput)
     };
     let unavailable = reason.is_some();
     CrossfeedStatus {
@@ -535,7 +680,7 @@ mod tests {
     /// c'est qu'on a désarmé le cas nominal en corrigeant le cas réseau.
     #[test]
     fn une_sortie_locale_honore_le_crossfeed_sans_rien_annoncer() {
-        let s = crossfeed_status(true, true, false);
+        let s = crossfeed_status(true, true, false, false, false, false);
         assert!(
             s.effective,
             "sortie locale hors PURE : le crossfeed s'applique"
@@ -549,34 +694,40 @@ mod tests {
         assert!(s.requested);
 
         // Décoché sur une sortie locale : rien à annoncer non plus.
-        let eteint = crossfeed_status(false, true, false);
+        let eteint = crossfeed_status(false, true, false, false, false, false);
         assert!(!eteint.effective);
         assert!(!eteint.unavailable);
         assert_eq!(eteint.reason, None);
     }
 
-    /// 1. Zone réseau + case COCHÉE : le réglage est sans effet, **et la raison
-    ///    est donnée**. C'est tout le ticket : avant, le premier point était
-    ///    vrai et le second manquait.
+    /// 1. Zone réseau + case COCHÉE + flux progressif DÉSARMÉ : le réglage est
+    ///    sans effet, **et la raison est donnée**. C'est tout le ticket : avant,
+    ///    le premier point était vrai et le second manquait.
+    ///
+    ///    Le motif a changé avec LAT-F1 : ce n'est plus « pas de sortie locale »
+    ///    (une zone réseau PEUT désormais entendre le crossfeed) mais « le flux
+    ///    progressif n'est pas armé ». La nuance compte pour l'utilisateur :
+    ///    l'ancien message le renvoyait à changer de zone, le nouveau à cocher
+    ///    une case.
     #[test]
-    fn une_sortie_reseau_dit_que_le_crossfeed_n_agit_pas() {
-        let s = crossfeed_status(true, false, false);
+    fn une_sortie_reseau_sans_flux_progressif_dit_que_le_crossfeed_n_agit_pas() {
+        let s = crossfeed_status(true, false, true, false, false, false);
         assert!(
             !s.effective,
-            "aucun des trois sites d'installation n'est atteignable hors sortie locale"
+            "sans le bras progressif, une zone réseau n'a aucun chemin"
         );
         assert!(
             s.unavailable,
             "et le contrôle doit être annoncé comme INDISPONIBLE, pas honoré"
         );
-        assert_eq!(s.reason, Some(CrossfeedConstraint::NonLocalOutput));
+        assert_eq!(s.reason, Some(CrossfeedConstraint::NetworkProgressiveOff));
         let detail = s
             .detail
             .expect("une contrainte sans explication, c'est le défaut de #2742");
         assert!(
-            detail.contains("locale"),
+            detail.contains("progressif"),
             "l'explication doit dire à l'utilisateur ce qu'il PEUT faire \
-             (écouter sur une zone locale), pas seulement ce qu'il subit : {detail}"
+             (armer le flux progressif), pas seulement ce qu'il subit : {detail}"
         );
         assert!(
             s.requested,
@@ -591,10 +742,10 @@ mod tests {
     ///    le contrôle qu'APRÈS que l'utilisateur a cliqué pour rien.
     #[test]
     fn une_sortie_reseau_verrouille_meme_case_decochee() {
-        let s = crossfeed_status(false, false, false);
+        let s = crossfeed_status(false, false, true, false, false, false);
         assert!(!s.effective);
         assert!(s.unavailable);
-        assert_eq!(s.reason, Some(CrossfeedConstraint::NonLocalOutput));
+        assert_eq!(s.reason, Some(CrossfeedConstraint::NetworkProgressiveOff));
     }
 
     /// 3. Le mode PURE désarme le crossfeed sur une sortie locale, et le dit.
@@ -602,7 +753,7 @@ mod tests {
     ///    était de l'annoncer.
     #[test]
     fn le_mode_pure_desarme_le_crossfeed_et_le_dit() {
-        let s = crossfeed_status(true, true, true);
+        let s = crossfeed_status(true, true, false, true, false, false);
         assert!(!s.effective);
         assert!(s.unavailable);
         assert_eq!(s.reason, Some(CrossfeedConstraint::PureMode));
@@ -612,13 +763,64 @@ mod tests {
         );
     }
 
-    /// 4. Zone réseau ET en PURE : c'est `NonLocalOutput` qui prime. PURE se
-    ///    lève en décochant une case ; la sortie réseau, non — annoncer PURE
-    ///    laisserait croire qu'il suffit de le désactiver pour entendre le
-    ///    crossfeed.
+    /// 4. Zone réseau ET en PURE : c'est désormais **PURE** qui prime, et
+    ///    l'inversion est le sujet.
+    ///
+    ///    Avant LAT-F1, `NonLocalOutput` passait devant parce qu'une zone
+    ///    réseau ne verrait JAMAIS de crossfeed : nommer PURE aurait laissé
+    ///    croire qu'il suffisait de le désactiver. Ce n'est plus vrai — le bras
+    ///    progressif porte le crossfeed. La contrainte qu'aucun chemin
+    ///    n'esquive est maintenant PURE : `load_crossfeed_processor` rend
+    ///    `None` quelle que soit la sortie. C'est donc elle qu'il faut nommer.
     #[test]
-    fn la_sortie_reseau_prime_sur_le_mode_pure() {
-        let s = crossfeed_status(true, false, true);
+    fn le_mode_pure_prime_sur_les_contraintes_de_chemin() {
+        let s = crossfeed_status(true, false, true, true, true, true);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::PureMode));
+    }
+
+    /// LAT-F1 — une zone RÉSEAU dont tout est réuni entend enfin son crossfeed.
+    ///
+    /// C'est la ligne qui n'existait pas : jusqu'ici aucune combinaison de
+    /// paramètres ne pouvait rendre `unavailable == false` sur une sortie non
+    /// locale. Si ce test rougit, le crossfeed réseau est reparti au placard.
+    #[test]
+    fn une_zone_reseau_armee_entend_enfin_son_crossfeed() {
+        let s = crossfeed_status(true, false, true, false, true, true);
+        assert!(
+            s.effective,
+            "opt-in armé + renderer LPCM : le chemin existe"
+        );
+        assert!(!s.unavailable);
+        assert!(s.reason.is_none(), "rien à annoncer : {s:?}");
+        assert!(s.detail.is_none());
+    }
+
+    /// …et le renderer qui n'annonce pas le LPCM est nommé pour lui-même.
+    ///
+    /// Deux motifs distincts et non deux façons de dire « non » : l'opt-in est
+    /// une case que l'utilisateur coche, le LPCM du renderer ne se négocie pas.
+    /// Les confondre renverrait quelqu'un cocher une case déjà cochée.
+    #[test]
+    fn un_renderer_sans_lpcm_est_nomme_pour_lui_meme() {
+        let s = crossfeed_status(true, false, true, false, true, false);
+        assert!(s.unavailable);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::NetworkRendererNoLpcm));
+        assert!(
+            s.detail.is_some_and(|d| d.contains("PCM")),
+            "l'explication doit nommer ce que le lecteur refuse"
+        );
+    }
+
+    /// Ni locale, ni réseau : la prudence de #2742 tient.
+    ///
+    /// OAAT, navigateur, sorties PULL, zone sans périphérique résolu. Certaines
+    /// traversent probablement le relais — mais ce n'est pas mesuré, et
+    /// annoncer « disponible » sans preuve est le défaut de #2742 pris à
+    /// l'envers. Ce test grave le choix, il ne le célèbre pas.
+    #[test]
+    fn une_sortie_ni_locale_ni_reseau_reste_annoncee_indisponible() {
+        let s = crossfeed_status(true, false, false, false, true, true);
+        assert!(s.unavailable);
         assert_eq!(s.reason, Some(CrossfeedConstraint::NonLocalOutput));
     }
 
@@ -663,7 +865,9 @@ mod tests {
     /// recopiée à côté. C'est ce que le client lira pour choisir sa traduction.
     #[test]
     fn le_code_serialise_est_le_code_stable() {
-        let s = crossfeed_status(true, false, false);
+        // Ni locale, ni réseau : le seul montage qui rend encore
+        // `NonLocalOutput` depuis LAT-F1.
+        let s = crossfeed_status(true, false, false, false, false, false);
         let v = serde_json::to_value(&s).expect("le statut doit être sérialisable");
         assert_eq!(
             v["reason"].as_str(),
@@ -676,24 +880,49 @@ mod tests {
         assert!(v["detail"].as_str().is_some_and(|d| !d.is_empty()));
 
         // Le cas nominal ne publie AUCUN motif : `null`, pas une chaîne vide.
-        let nominal = serde_json::to_value(crossfeed_status(true, true, false)).unwrap();
+        let nominal =
+            serde_json::to_value(crossfeed_status(true, true, false, false, false, false)).unwrap();
         assert!(nominal["reason"].is_null());
         assert!(nominal["detail"].is_null());
+
+        // Et le lien code() ↔ JSON vaut pour TOUTES les variantes, pas pour la
+        // seule qu'un test aurait choisie. Un `#[serde(rename)]` oublié sur une
+        // variante ajoutée fait tomber cette boucle.
+        for c in CrossfeedConstraint::ALL {
+            let json = serde_json::to_value(c).expect("une contrainte doit être sérialisable");
+            assert_eq!(
+                json.as_str(),
+                Some(c.code()),
+                "le JSON d'une contrainte doit être son code stable"
+            );
+        }
     }
 
     /// ⭐ GARDE DE SITE — la prémisse de toute la règle, relue dans le code de
     /// PRODUCTION.
     ///
-    /// `crossfeed_status` affirme « hors sortie locale, le crossfeed n'a aucun
-    /// chemin de code ». Cette affirmation n'est vraie que tant que le chemin
-    /// réseau n'installe pas de crossfeed. Si quelqu'un porte un jour le
-    /// crossfeed sur `transcode_source_to_file` sans revenir ici, le serveur se
-    /// mettrait à mentir dans l'AUTRE sens : un écran qui annonce « sans effet »
-    /// pendant que le DAC reçoit un signal traité.
+    /// ⚠️ **La prémisse a changé avec LAT-F1, et ce test a failli devenir un
+    /// garde-fou aveugle.** Il ne cherche que `.set_crossfeed(` et
+    /// `.replace_crossfeed_live(` : le quatrième site d'installation, celui du
+    /// relais progressif, n'utilise NI l'un NI l'autre — il pose un
+    /// `CrossfeedProcessor` dans `StreamingDsp`. Le test serait donc resté vert
+    /// en gardant une affirmation devenue fausse. C'est le mode de panne qu'il
+    /// existe pour empêcher, retourné contre lui-même.
     ///
-    /// On relit donc `orchestrator.rs` — le fichier réel, par `include_str!`,
-    /// l'idiome du dépôt — et on vérifie que tout appel qui INSTALLE un
-    /// crossfeed est bien précédé, de peu, de la garde `local:`.
+    /// La règle exacte aujourd'hui : hors sortie locale, le crossfeed passe par
+    /// le relais progressif **et par lui seul**. Trois choses à tenir, donc :
+    ///
+    /// 1. les trois sites `set_crossfeed` / `replace_crossfeed_live` restent
+    ///    derrière la garde `local:` — sinon la sortie locale traiterait deux
+    ///    fois, comme l'égaliseur l'a fait en 0.9.139 ;
+    /// 2. le chemin FICHIER (`transcode_source_to_file`) n'en porte toujours
+    ///    aucun — le renderer y reçoit un morceau entier pré-transcodé, et
+    ///    `crossfeed_status` s'appuie dessus pour dire `network_progressive_off` ;
+    /// 3. le relais progressif, LUI, en porte un — sinon `crossfeed_status`
+    ///    annoncerait « disponible » sur une zone réseau où plus rien ne
+    ///    l'applique : le mensonge de #2742, à l'envers.
+    ///
+    /// On relit le code de production par `include_str!`, l'idiome du dépôt.
     #[test]
     fn aucun_site_d_installation_du_crossfeed_hors_de_la_garde_locale() {
         // Le bloc `impl PlaybackOrchestrator` est réparti par familles (REF-2,
@@ -809,6 +1038,33 @@ mod tests {
             "le chemin transcodé accepte désormais un crossfeed : \
              `CrossfeedConstraint::NonLocalOutput` n'est plus vrai et doit \
              être revu ici AVANT d'être publié à l'écran.\nsignature : {signature}"
+        );
+
+        // 3. Et le RELAIS progressif, lui, doit en porter un.
+        //
+        // C'est la moitié que les deux blocs précédents ne voient pas : ils
+        // gardent les chemins qui NE DOIVENT PAS appliquer de crossfeed. Sans
+        // celle-ci, quelqu'un qui retire le quatrième étage laisse
+        // `crossfeed_status` annoncer « disponible » sur une zone réseau où
+        // plus rien ne l'applique — exactement le mensonge de #2742, à
+        // l'envers, et les trois assertions d'au-dessus resteraient vertes.
+        assert!(
+            ORCHESTRATEUR
+                .contains("crossfeed: Option<crate::audio::crossfeed::CrossfeedProcessor>"),
+            "`StreamingDsp` ne porte plus d'étage crossfeed : une zone réseau \
+             n'a plus aucun chemin, et `crossfeed_status` doit redevenir \
+             `NonLocalOutput` AVANT que cet étage disparaisse"
+        );
+        assert!(
+            ORCHESTRATEUR.contains("crossfeed: self.load_crossfeed_processor("),
+            "`load_streaming_dsp` ne charge plus le crossfeed : l'étage existe \
+             mais reste vide, donc muet — un `None` permanent est plus \
+             sournois qu'un champ supprimé, car il compile et se teste vert"
+        );
+        assert!(
+            ORCHESTRATEUR.contains("cf.process_pcm(pcm, bit_depth, self.channels)"),
+            "`StreamingDsp::process` n'applique plus le crossfeed : il est \
+             chargé, transporté, et jeté sans être exécuté"
         );
     }
 }

@@ -40,7 +40,12 @@ impl PlaybackOrchestrator {
     /// mise en cache — la lecture suivante re-sonde. Les réponses concluantes
     /// sont mémorisées par renderer : une sonde SOAP par session, pas par
     /// morceau.
-    pub(super) async fn dlna_accepte_lpcm(&self, device_id: &str, hi_res: bool) -> bool {
+    /// `pub` et non `pub(super)` depuis #2742 : la route `/zones/{id}/dsp`
+    /// doit pouvoir dire si le crossfeed a un chemin sur une zone réseau, et
+    /// la réponse tient à cette sonde. Le résultat est mis en cache par
+    /// renderer et profondeur, l'appel depuis la route est donc gratuit après
+    /// le premier.
+    pub async fn dlna_accepte_lpcm(&self, device_id: &str, hi_res: bool) -> bool {
         let cle = format!("{device_id}|{}", if hi_res { "24" } else { "16" });
         if let Some(connu) = self.dlna_lpcm_accepte.lock().await.get(&cle) {
             return *connu;

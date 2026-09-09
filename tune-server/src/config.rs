@@ -806,8 +806,34 @@ pub fn appliquer_plan_base_macos(config: &mut TuneConfig, plan: PlanBaseMacos) {
 mod listen_socket_tests {
     use super::*;
 
+    /// L'hôte sait-il vraiment JOINDRE `::1` ?
+    ///
+    /// Une pile IPv6 peut exister, une socket peut s'y lier, et la boucle
+    /// locale rester INJOIGNABLE : sur Shrek, `connect("::1")` rend
+    /// `NetworkUnreachable` (code 101). Les deux sauts d'origine de l'épreuve
+    /// ci-dessous ne voyaient pas ce cas-là — elle tombait donc sur un défaut
+    /// de l'HÔTE en nommant « connexion ::1 refusée », jamais sur un défaut du
+    /// serveur. La question se pose ici, une fois, sur une socket à part.
+    fn boucle_locale_ipv6_joignable() -> bool {
+        let Ok(temoin) = std::net::TcpListener::bind("[::1]:0") else {
+            return false;
+        };
+        let Ok(port) = temoin.local_addr().map(|a| a.port()) else {
+            return false;
+        };
+        std::net::TcpStream::connect(("::1", port)).is_ok()
+    }
+
     /// Le point du correctif #1321 : une seule socket doit servir les clients
     /// IPv4 (Chrome, 127.0.0.1) ET IPv6 (Firefox, ::1).
+    ///
+    /// ⚠️ Cette épreuve ne devient JAMAIS un no-op complet (#3569). Ses deux
+    /// sauts d'origine — pas de socket double pile, `bind` refusé — rendaient
+    /// la main sans avoir rien exigé : sur un hôte sans IPv6, elle s'affichait
+    /// verte en n'ayant mesuré aucune des deux familles. La moitié IPv4 du
+    /// contrat ne dépend d'aucune capacité de l'hôte : elle est exigée
+    /// d'abord, et sans condition. Seule la moitié IPv6 s'annonce sautée, et
+    /// elle le dit.
     #[test]
     fn dual_stack_socket_accepts_both_families() {
         let Some((socket, addr)) = dual_stack_listen_socket(0) else {
@@ -822,11 +848,27 @@ mod listen_socket_tests {
         let listener: std::net::TcpListener = socket.into();
         let port = listener.local_addr().expect("local_addr").port();
 
-        for target in ["127.0.0.1", "::1"] {
-            let client = std::net::TcpStream::connect((target, port));
-            assert!(client.is_ok(), "connexion {target} refusée : {client:?}");
-            drop(listener.accept().expect("accept"));
+        let v4 = std::net::TcpStream::connect(("127.0.0.1", port));
+        assert!(
+            v4.is_ok(),
+            "connexion 127.0.0.1 refusée sur la socket double pile : {v4:?}"
+        );
+        drop(listener.accept().expect("accept IPv4"));
+
+        if !boucle_locale_ipv6_joignable() {
+            eprintln!(
+                "SAUT PARTIEL : `::1` est injoignable sur cet hôte. La moitié \
+                 IPv4 du contrat de #1321 vient d'être EXIGÉE ; la moitié IPv6 \
+                 ne peut l'être nulle part sans boucle locale IPv6 routée."
+            );
+            return;
         }
+        let v6 = std::net::TcpStream::connect(("::1", port));
+        assert!(
+            v6.is_ok(),
+            "connexion ::1 refusée sur la socket double pile : {v6:?}"
+        );
+        drop(listener.accept().expect("accept IPv6"));
     }
 
     #[test]

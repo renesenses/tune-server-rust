@@ -326,8 +326,16 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // `<db>-scan-report.json` : une clé posée d'un seul côté ferait
         // dépendre la réponse de `/scan/report` de QUEL scan a tourné en
         // dernier, ce qui est précisément le défaut de #2012 / #2050.
-        let inventaire_cue =
-            tune_core::scanner::cue_album::inventorier(&list_result.dossiers_avec_feuille_cue);
+        //
+        // #3631 (lot 2b) : le MÊME parcours ÉCRIT maintenant les pistes
+        // virtuelles. `inventorier` construisait les `PisteCue` puis les
+        // jetait ; `inventorier_et_ecrire` les range, sans relire une seule
+        // feuille de plus, et rend l'inventaire à l'identique.
+        let (inventaire_cue, bilan_cue, images_cue) =
+            tune_core::scanner::cue_bibliotheque::inventorier_et_ecrire(
+                db.clone(),
+                &list_result.dossiers_avec_feuille_cue,
+            );
         if inventaire_cue.dossiers > 0 {
             info!(
                 dossiers = inventaire_cue.dossiers,
@@ -335,10 +343,27 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 albums_multi_feuilles = inventaire_cue.albums_multi_feuilles,
                 pistes = inventaire_cue.pistes,
                 feuilles_ecartees = inventaire_cue.feuilles_ecartees,
+                pistes_creees = bilan_cue.pistes_creees,
+                pistes_mises_a_jour = bilan_cue.pistes_mises_a_jour,
+                pistes_elaguees = bilan_cue.pistes_elaguees,
                 "scan_cue_sheets_inventoried — feuilles CUE : ce qu'elles décrivent"
             );
         }
-        let files = list_result.files;
+        // Un fichier image découpé par une feuille n'est PLUS une piste à lui
+        // seul : ses tranches le représentent. Sans ce retrait, l'album
+        // existerait deux fois — une piste de 74 minutes à côté de ses quinze.
+        // Le retrait vaut aussi pour `discovered_paths` juste en dessous : une
+        // bibliothèque déjà scannée voit ainsi sa piste « image entière »
+        // élaguée au scan suivant, au lieu de rester en doublon à vie.
+        let files: Vec<std::path::PathBuf> = if images_cue.is_empty() {
+            list_result.files
+        } else {
+            list_result
+                .files
+                .into_iter()
+                .filter(|p| !images_cue.contains(p))
+                .collect()
+        };
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
 
@@ -1034,6 +1059,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
+            // Les fichiers de 0 octet (#2060) — même clé que le scan manuel.
+            // Un compteur : il part chez les trois consommateurs.
+            "skipped_empty_files": stats.empty_files,
             "skipped_unsupported_by_ext": skipped_by_ext,
             "skipped_unsupported_reasons": skipped_reasons,
             // Ce que les feuilles CUE décrivent (#1763) — mêmes clés que
@@ -1061,12 +1089,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         report_fichier["skipped_duplicate_paths"] = serde_json::json!(skipped_duplicate_paths);
         report_fichier["cue_sheets_skipped_paths"] =
             serde_json::json!(inventaire_cue.chemins_ecartes);
+        // LESQUELS sont vides (#2060) — même clé que le scan manuel.
+        report_fichier["skipped_empty_file_paths"] = serde_json::json!(stats.empty_file_paths);
         report_fichier["skipped_paths_truncated"] = serde_json::json!(
             [
                 skipped_unsupported_paths.len(),
                 skipped_no_metadata_paths.len(),
                 skipped_duplicate_paths.len(),
                 inventaire_cue.chemins_ecartes.len(),
+                stats.empty_file_paths.len(),
             ]
             .iter()
             .any(|n| *n >= tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES)

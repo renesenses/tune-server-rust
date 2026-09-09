@@ -323,6 +323,51 @@ pub(super) fn cible_wav_pour_traitement(
     dsp_active && is_network && !src_est_dsd && opt_in && renderer_accepte_lpcm
 }
 
+/// Le relais DSP au fil de l'eau doit-il être inséré sur le bras progressif ?
+///
+/// LAT-F1 (phase 0) a branché égaliseur, convolveur et ReplayGain sur ce bras
+/// sans regarder QUI le consomme. Or une sortie LOCALE y passe toujours —
+/// `local_needs_wav` transcode en WAV tout format source connu, parce que le
+/// parseur de `LocalOutput` ne lit que du PCM simple — et `LocalOutput`
+/// applique DÉJÀ ces trois étages dans sa boucle de lecture (`set_eq`,
+/// `set_replaygain_factor`, son propre convolveur, réinstallés à chaque
+/// lecture par le chemin de `transport.rs`).
+///
+/// Les deux chemins se cumulaient donc, et le cumul est MESURÉ
+/// (`le_cumul_double_les_decibels_et_eleve_le_gain_au_carre`) : courbe
+/// d'égaliseur **doublée en dB**, facteur ReplayGain **au carré**, réponse
+/// impulsionnelle convoluée deux fois. Régression livrée en v0.9.139 et
+/// v0.9.140, audible sur toute la population de #1416.
+///
+/// Le relais n'a de sens que pour les sorties qui ne traitent RIEN
+/// elles-mêmes : réseau, OAAT, navigateur. Une sortie `local:` s'en passe.
+pub(super) fn relais_dsp_progressif(dsp_actif: bool, sortie_est_locale: bool) -> bool {
+    dsp_actif && !sortie_est_locale
+}
+
+/// Le bras FICHIER doit-il cuire le traitement de zone dans le fichier ?
+///
+/// Même défaut que [`relais_dsp_progressif`], sur l'autre bras, et la même
+/// réponse : une sortie LOCALE applique déjà égaliseur, convolveur et
+/// ReplayGain elle-même. Les cuire aussi dans le fichier pré-transcodé les
+/// appliquerait deux fois.
+///
+/// Le ReplayGain portait cette garde depuis LAT-F2 — « A -6 dB track played
+/// at -12 dB, quietly » — mais il la portait SEUL : `load_eq_processor` et
+/// `load_convolver` étaient appelés sans condition juste au-dessus de lui.
+/// L'asymétrie n'avait pas de raison d'être.
+///
+/// Ce bras est aujourd'hui INATTEIGNABLE pour une sortie locale, et c'est
+/// gardé : `use_file_transcode_for` y reçoit `dsp_active = (navigateur ||
+/// réseau) && eq_forces_transcode`, faux pour elle, et
+/// `une_zone_locale_avec_egaliseur_ne_traite_pas_deux_fois` le vérifie de
+/// bout en bout. La garde est donc une ceinture, pas la correction d'un
+/// symptôme observé : elle ferme la porte par laquelle le doublement
+/// reviendrait le jour où quelqu'un relâche ce prédicat.
+pub(super) fn traitement_cuit_dans_le_fichier(sortie_est_locale: bool) -> bool {
+    !sortie_est_locale
+}
+
 /// La cible d'un TRANSCODAGE doit être un format que l'encodeur sait produire.
 ///
 /// `AudioFormat::dlna_transcode_target` rend « AIFF » pour une source AIFF,
@@ -589,8 +634,94 @@ pub(super) fn profondeur_sondee_si_la_base_ignore(
     Some(bd)
 }
 
+/// Ce qu'une source DSD DEVIENT réellement en sortie — et non ce que le
+/// sélecteur de la zone affiche.
+///
+/// #2369 — le sélecteur propose « natif » et « dop ». Sur une sortie LOCALE,
+/// [`dop_requested`] rendait `true` pour les deux, à l'identique : les deux
+/// emballent le DSD en DoP. Le testeur qui coche « natif » choisit un chemin
+/// qui n'existe pas. La mesure qui le fixe, sur `v0.9.143` comme sur
+/// `batch/bugs-9` : `SND_PCM_FORMAT_DSD`, `DSD_U32` et `dsd_native` ont ZÉRO
+/// occurrence dans `tune-core/src/outputs/local.rs`, et le flux y est ouvert
+/// par `build_output_stream` typé — `f32`, puis un repli entier `i16`/`i32`.
+/// Aucun de ces types ne peut porter du 1 bit.
+///
+/// Cette énumération ne change RIEN au son : [`dop_requested`] s'en déduit et
+/// garde exactement la même table de vérité — le témoin obligatoire est
+/// `la_table_de_verite_de_dop_requested_est_inchangee`. Elle sépare la
+/// DÉCISION, pour que le journal et l'API puissent nommer ce qui part sur le
+/// fil au lieu de répéter ce qui a été demandé. Ouvrir le vrai chemin natif
+/// est le chantier de #2369 ; il vit dans `outputs/local.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportDsd {
+    /// Rien n'emballe le DSD ici. La piste sera transcodée en PCM, ou servie
+    /// telle quelle par un chemin qui a son propre arbitrage
+    /// (`should_dsd_passthrough`, en réseau).
+    Pcm,
+    /// DoP demandé explicitement, et obtenu — le comportement de référence,
+    /// qui ne doit pas bouger.
+    Dop,
+    /// La zone demande « natif » sur une sortie LOCALE. Aucun chemin natif
+    /// n'existe : c'est du DoP qui part, exactement comme en mode « dop ».
+    /// C'est le mensonge de #2369, nommé plutôt que corrigé — le corriger
+    /// suppose d'ouvrir le périphérique dans un format DSD, ce qui n'est pas
+    /// une décision d'orchestrateur.
+    NatifServiEnDop,
+}
+
+impl TransportDsd {
+    /// Libellé stable, pour le journal et pour l'API. Ce sont des identifiants
+    /// que l'interface lit : ils ne se traduisent pas et ne changent pas.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pcm => "pcm",
+            Self::Dop => "dop",
+            Self::NatifServiEnDop => "natif_servi_en_dop",
+        }
+    }
+
+    /// Le réglage de la zone est-il tenu tel qu'il est écrit à l'écran ?
+    ///
+    /// Faux uniquement pour [`Self::NatifServiEnDop`] : c'est le seul cas où
+    /// ce qui part diffère de ce qui a été demandé.
+    #[must_use]
+    pub fn tient_sa_promesse(self) -> bool {
+        !matches!(self, Self::NatifServiEnDop)
+    }
+}
+
+/// Le transport qu'une source DSD obtiendra, sachant la sortie et le réglage
+/// de la zone.
+///
+/// `is_local` se lit sur le PRÉFIXE de `output_device_id` (`local:`), pas sur
+/// `output_type` — c'est la source dont se sert `resolve_local_track`, et le
+/// miroir d'affichage doit se servir de la même, faute de quoi le panneau et
+/// le chemin audio répondraient à deux questions différentes (le défaut
+/// qu'avait déjà corrigé #2189 sur [`is_network_output_type`]).
+#[must_use]
+pub fn transport_dsd(is_local: bool, is_network: bool, dsd_mode: &str) -> TransportDsd {
+    if is_local {
+        return match dsd_mode {
+            "native" => TransportDsd::NatifServiEnDop,
+            "dop" => TransportDsd::Dop,
+            _ => TransportDsd::Pcm,
+        };
+    }
+    if is_network && dsd_mode == "dop" {
+        return TransportDsd::Dop;
+    }
+    TransportDsd::Pcm
+}
+
+/// Un emballage DoP part-il ? Déduit de [`transport_dsd`] : c'est la MÊME
+/// décision, lue en booléen par les appelants qui n'ont pas besoin du détail.
+///
+/// Écrite ainsi plutôt qu'en double pour qu'il ne puisse pas exister deux
+/// réponses à la même question — la dérive qu'a coûtée chaque copie de
+/// `is_network_output_type` (#2189).
 pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) -> bool {
-    (is_local && (dsd_mode == "native" || dsd_mode == "dop")) || (is_network && dsd_mode == "dop")
+    transport_dsd(is_local, is_network, dsd_mode) != TransportDsd::Pcm
 }
 
 /// Cette piste est-elle du 1 bit (DSF/DFF) ? Le format vient de la base, tel

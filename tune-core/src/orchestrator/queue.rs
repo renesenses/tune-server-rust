@@ -106,6 +106,8 @@ impl PlaybackOrchestrator {
                 // …et rien à préempter : ce travail n'appartient à aucune
                 // demande de lecture, il ne tient pas la zone (#3444).
                 None,
+                // Fichier ordinaire : aucune tranche à découper (#3631).
+                None,
             )
             .await
             {

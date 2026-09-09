@@ -61,6 +61,8 @@ Copy `tune.toml.example` to `tune.toml` and edit, or use environment variables:
 | `TUNE_DB_PATH` | tune.db | SQLite database path |
 | `TUNE_MUSIC_DIRS` | [] | Music directories (JSON array or comma-separated) |
 | `TUNE_AUTO_SCAN` | false | Scan library on startup |
+
+> **Docker — starting with no library folder.** The image ships `TUNE_MUSIC_DIRS='["/music"]'` and `TUNE_AUTO_SCAN=true`, and its `VOLUME ["/music"]` makes Docker create an *empty anonymous volume* when you mount nothing there. Set `TUNE_MUSIC_DIRS=[]` to start with no library folder at all and pick your folders from Settings. Since v0.9.143 a folder that does not exist, is not a directory, or is completely empty is no longer seeded on first run (it is logged as `music_dirs_semis_dossier_ecarte`), so an unmounted `/music` no longer sends the startup scan off on the wrong folder. Mount `/data` on a persistent path so the first run only ever happens once.
 | `TUNE_SCAN_IO_CONCURRENCY` | *auto* | Parallel tag reads during a scan. Auto-detected from the storage: **4** on a spinning disk, **32** otherwise. Set it only to override that guess — a slow NAS may want less, a high-latency share more. Clamped to 1..=256. |
 | `TUNE_WEB_DIR` | web | Web client directory |
 | `TUNE_ARTWORK_DIR` | artwork_cache | Cover art cache |
