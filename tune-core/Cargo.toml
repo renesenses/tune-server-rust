@@ -41,6 +41,32 @@ sha2 = { workspace = true }
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 getrandom = "0.2"
+
+# --- Sendspin (#3326) : cryptographie et encodage, sur TOUTES les plateformes.
+#
+# Ces quatre caisses ne doivent PAS retourner sous
+# `[target.'cfg(unix)'.dependencies]`. Ce bloc-là existe pour l'appairage
+# AirPlay 2, qui est effectivement unix ; Sendspin, lui, tourne partout où Tune
+# tourne — Windows compris. La CI « Windows + ASIO » est la garde : elle a
+# rougi sur `unresolved import snow / base64 / x25519_dalek / rand_core`
+# quand ces lignes étaient du mauvais côté du manifeste.
+#
+# `snow` : Noise KKpsk2, en pur Rust. Le résolveur par défaut s'appuie sur
+# `curve25519-dalek`, `chacha20poly1305`, `aes-gcm` et `sha2` — les mêmes
+# familles que le reste du manifeste ; le résolveur accéléré `ring` n'est pas
+# activé. Mesuré : les DEUX suites imposées au serveur
+# (`25519_ChaChaPoly_SHA256` et `25519_AESGCM_SHA256`) aboutissent. On
+# n'écrit pas Noise à la main : c'est de la cryptographie.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "default-resolver-crypto",
+    "std",
+] }
+# L'identifiant d'un pair Sendspin EST sa clé publique X25519, en base64url
+# sans remplissage.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
+rand_core = { version = "0.6", features = ["getrandom"] }
 blowfish = { workspace = true }
 chrono = { workspace = true }
 cbc = { workspace = true }
@@ -99,24 +125,7 @@ libc = "0.2"
 srp = "0.6"
 hkdf = "0.12"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-# Noise KKpsk2 pour Sendspin (#3326, S2-a). Pur Rust : le resolveur par
-# défaut (`default-resolver` + `default-resolver-crypto`) s'appuie sur
-# `curve25519-dalek`, `chacha20poly1305`, `aes-gcm` et `sha2` — les mêmes
-# familles que le reste du manifeste. Le résolveur accéléré `ring` n'est PAS
-# activé. Mesuré : les deux suites imposées au serveur
-# (`25519_ChaChaPoly_SHA256` et `25519_AESGCM_SHA256`) fonctionnent en
-# KKpsk2. On n'écrit pas Noise à la main : c'est de la cryptographie.
-snow = { version = "0.10", default-features = false, features = [
-    "default-resolver",
-    "default-resolver-crypto",
-    "std",
-] }
-# Les identifiants Sendspin sont des clés publiques en base64url SANS
-# remplissage ; la caisse était déjà dans le verrou, elle devient directe.
-base64 = "0.22"
 chacha20poly1305 = "0.10"
-rand_core = { version = "0.6", features = ["getrandom"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
