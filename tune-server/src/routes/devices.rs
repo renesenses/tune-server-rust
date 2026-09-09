@@ -81,12 +81,25 @@ async fn device_catalog() -> Json<Value> {
 /// client n'a donc pas à déduire d'un tableau vide qu'il ne se passe rien.
 async fn list_sendspin_players(State(state): State<AppState>) -> Json<Value> {
     let players = state.discovered_sendspin_players().await;
+    // #3326 S2-a — les pairs qui ont mené une poignée de main Noise jusqu'au
+    // bout, avec ce qu'ils ont dit d'eux dans leur `client/hello`. C'est une
+    // liste DIFFÉRENTE de `players` : celle-ci vient du réseau (mDNS), celle-là
+    // du protocole. Un pair peut figurer dans l'une sans l'autre — une enceinte
+    // qui compose vers nous n'a aucune raison de s'annoncer en mDNS.
+    let pairs = tune_core::sendspin::registre::decrire();
     Json(json!({
         "service": tune_core::discovery::sendspin::SERVICE_LECTEUR,
+        "server_service": tune_core::discovery::sendspin::SERVICE_SERVEUR,
+        "server_path": tune_core::sendspin::CHEMIN_POINT_D_ACCES,
+        "server_id": tune_core::sendspin::identite_du_serveur().id(),
+        // S2-a monte le tuyau chiffré ; elle ne joue rien. Tant que c'est faux,
+        // aucune zone Sendspin ne doit naître de cette liste.
         "playback_supported": false,
         "reason": tune_core::discovery::sendspin::MOTIF_PHASE_DECOUVERTE,
         "count": players.len(),
         "players": players,
+        "handshaked_count": pairs.len(),
+        "handshaked": pairs,
     }))
 }
 
