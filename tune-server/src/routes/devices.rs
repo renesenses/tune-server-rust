@@ -91,6 +91,18 @@ async fn list_sendspin_players(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
+    let peripheriques = crate::routes::zones::canaux_des_peripheriques_locaux();
+    Json(json!(liste_des_appareils(&state, &peripheriques).await))
+}
+
+/// Le corps de `GET /devices` (et `/devices/list`), le parc audio local pris en
+/// paramètre.
+///
+/// Même découpe que `zones::output_capabilities` / `output_capabilities_avec`
+/// (#3322) : le handler va chercher le parc réel, cette fonction ne fait que
+/// s'en servir. Un témoin peut donc l'appeler avec un parc connu, sans dépendre
+/// de la carte son de la machine qui exécute les tests.
+pub async fn liste_des_appareils(state: &AppState, peripheriques: &[(String, u16)]) -> Vec<Value> {
     let scanner = &state.scanner;
     let discovered = scanner.devices().await;
 
@@ -110,7 +122,59 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
     // cessent d'être PROPOSÉS.
     retirer_appareils_ignores(&mut items, &state.backend);
 
-    Json(json!(items))
+    // #3322 — DERNIÈRE étape, après les retraits : ce qui sort d'ici est
+    // exactement ce que le client reçoit.
+    enrichir_les_dispositions_de_canaux(&mut items, peripheriques);
+    items
+}
+
+/// #3322 — `GET /devices` publiait les capacités BRUTES du registre.
+///
+/// `GET /zones` et `GET /zones/{id}` complètent `channel_layouts` depuis le
+/// parc audio énuméré (`zones::output_capabilities_avec`) ; `GET /devices`
+/// non. Le MÊME appareil répondait donc deux choses selon la route empruntée,
+/// et c'est `GET /devices` que la grille « Appareils » du client interroge
+/// (`ZoneManagerView.svelte`, `api.getDevices()`).
+///
+/// Surtout : cette grille liste les appareils qu'AUCUNE zone n'utilise encore.
+/// Pour ceux-là `GET /zones` ne peut rien publier — il n'y a pas de zone. La
+/// route des zones ne pouvait donc pas couvrir le cas ; il fallait celle-ci.
+///
+/// La règle est celle des zones, à la lettre :
+///
+/// * une sortie qui déclare déjà ses dispositions garde les siennes ;
+/// * une sortie `local:` connue du parc reçoit celles que son appareil sait
+///   rendre, déduites de `AudioDevice::max_channels` ;
+/// * tout le reste garde `[]`, qui dit « on ne sait pas » et jamais
+///   « aucune » — un renderer réseau négocie ses canaux DANS le flux.
+///
+/// Une entrée sans contrat de capacités du tout (`output_capabilities` absent
+/// ou `null`) n'en reçoit pas un : déclarer des canaux sans dire ce que la
+/// sortie sait faire par ailleurs fabriquerait un contrat à moitié inventé.
+pub fn enrichir_les_dispositions_de_canaux(items: &mut [Value], peripheriques: &[(String, u16)]) {
+    for item in items.iter_mut() {
+        let deja_declarees = item
+            .pointer("/output_capabilities/channel_layouts")
+            .and_then(Value::as_array)
+            .is_some_and(|liste| !liste.is_empty());
+        if deja_declarees {
+            continue;
+        }
+        let Some(device_id) = item.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let Some(dispositions) =
+            crate::routes::zones::dispositions_du_peripherique_local(&device_id, peripheriques)
+        else {
+            continue;
+        };
+        if let Some(capacites) = item
+            .get_mut("output_capabilities")
+            .and_then(Value::as_object_mut)
+        {
+            capacites.insert("channel_layouts".into(), json!(dispositions));
+        }
+    }
 }
 
 /// L'identité d'une entrée de `GET /devices`, telle qu'elle est sérialisée.
