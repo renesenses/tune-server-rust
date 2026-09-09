@@ -242,6 +242,38 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_schema_parity -- --nocapture
 
+      # #3715 — le garde que #2995 demandait a son point 3, ENFIN execute.
+      #
+      # Il etait ecrit depuis le 31/08/2026 et n'avait JAMAIS tourne : aucune
+      # etape ne lui posait `TUNE_TEST_PG_URL`, donc ses deux temoins prenaient
+      # leur chemin « saut annonce » a chaque execution et cargo les comptait
+      # `ok`. Un garde compile mais jamais execute est aussi trompeur qu'un
+      # garde jamais compile.
+      #
+      # Premiere execution reelle le 09/09/2026 : 13 colonnes divergentes et 2
+      # tolerances perimees. La migration 053 en convertit 3 (4 lignes sur 13),
+      # les 9 restantes sont inscrites nominativement dans `ECARTS_TOLERES` avec
+      # leur motif MESURE. Cette etape est ce qui empeche la quatorzieme.
+      #
+      # ⚠️ `--test-threads=1` : les deux temoins montent des bases jetables et
+      # les `DROP DATABASE` s'interbloquent en parallele.
+      - name: Parité des types PG/SQLite (#2995, #3715)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib pg_sqlite_type_parity -- --nocapture --test-threads=1
+
+      # #3716 — le TROISIEME axe. `queue_items` a trois redacteurs de schema en
+      # PostgreSQL ; il n'existait de porte que sur deux des trois paires.
+      # `pg_schema_parity` confronte PG_FULL_SCHEMA aux scripts numerotes,
+      # `pg_sqlite_type_parity` PostgreSQL a SQLite — aucun des deux ne regarde
+      # `ensure_schema`, qui s'execute pourtant a CHAQUE demarrage et AVANT le
+      # lanceur de migrations. Sur une base vide ce sont SES types que
+      # l'installation neuve recoit.
+      - name: Parité ensure_schema / scripts numérotés (#3716)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib pg_ensure_schema_parity -- --nocapture --test-threads=1
+
       # #3123 — les requetes de tune-server, ENFIN executees sur PostgreSQL.
       #
       # Toutes les etapes ci-dessus visent `tune-core`. Les 419 litteraux SQL

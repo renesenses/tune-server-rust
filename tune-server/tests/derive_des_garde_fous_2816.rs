@@ -136,32 +136,24 @@ const SELECTEURS_HORS_LIB: &[&str] = &["--test", "--bench", "--example", "--bin"
 /// qui vaut décision.
 ///
 /// Il ne peut que DESCENDRE au fil des rattachements. Le 06/09/2026 il valait
-/// trente ; #3519 et #3520 en ont retiré sept ; ce lot en retire dix-huit.
-const TEMOINS_SAUTES_TOLERES: usize = 5;
+/// trente ; #3519 et #3520 en ont retiré sept ; #3569 en a retiré dix-huit ;
+/// #3715 en retire les DEUX derniers qui fussent réductibles. Les trois qui
+/// restent sont irréductibles.
+const TEMOINS_SAUTES_TOLERES: usize = 3;
 
 /// `(fichier, variable, témoins, raison)`.
 ///
-/// ⚠️ Trois de ces sauts sont **irréductibles** : ils exigent ce qu'aucun
-/// runner ne peut fournir — une session vivante, un fichier audio hors dépôt,
-/// une base de production. Le quatrième (`pg_sqlite_type_parity`) ne l'est pas :
-/// il est BLOQUÉ par #3715, et sa raison porte le ROUGE mesuré au lieu de le
-/// taire. Tout le reste — dix-huit témoins — a été RATTACHÉ à
-/// `test-postgres.yml` par #3569 ; ce n'était pas de la prudence, c'était de la
-/// dette.
+/// ⚠️ Les trois sauts qui restent sont **irréductibles** : ils exigent ce
+/// qu'aucun runner ne peut fournir — une session vivante, un fichier audio hors
+/// dépôt, une base de production.
+///
+/// Le quatrième, `pg_sqlite_type_parity`, ne l'était pas : il était BLOQUÉ par
+/// le rouge de #3715. Ce rouge est levé — la migration 053 convertit trois
+/// colonnes, les neuf qui restent sont inscrites nominativement dans
+/// `ECARTS_TOLERES` avec leur motif mesuré, et les deux tolérances périmées
+/// sont retirées. Son étape est posée dans `test-postgres.yml`, avec celle du
+/// témoin neuf de #3716. Cette liste ne porte donc plus AUCUN saut réductible.
 const SAUTS_CONNUS: &[(&str, &str, &[&str], &str)] = &[
-    (
-        "tune-core/src/db/pg_sqlite_type_parity.rs",
-        "TUNE_TEST_PG_URL",
-        &["aucune_exception_perimee", "parite_des_types_pg_sqlite"],
-        "SEUL saut qui ne soit pas irréductible, et il est BLOQUÉ, pas remis à \
-         plus tard : exécutés pour la première fois le 09/09/2026 sur une base \
-         neuve, ces deux témoins rendent ROUGE — treize colonnes divergent \
-         encore entre PostgreSQL et SQLite, et deux tolérances d'`ECARTS_TOLERES` \
-         sont périmées. Le détail nominatif est dans #3715, avec la commande qui \
-         le rejoue. Poser l'étape maintenant ferait rougir la CI ; la rendre \
-         verte par indulgence effacerait treize défauts mesurés. L'étape se \
-         rattache AVEC la dernière correction de #3715, pas avant.",
-    ),
     (
         "tune-core/src/orchestrator/tests.rs",
         "TUNE_DIAG_PROBE_URL",

@@ -207,18 +207,6 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
     (
         "migree",
         "zones",
-        "dlna_wav24",
-        "TEXT vs INTEGER — 032 ajoute au lieu de convertir (#2995)",
-    ),
-    (
-        "migree",
-        "zones",
-        "dlna_play_delay_ms",
-        "TEXT vs INTEGER — 032 ajoute au lieu de convertir (#2995)",
-    ),
-    (
-        "migree",
-        "zones",
         "fixed_volume",
         "TEXT vs INTEGER — 032 ajoute au lieu de convertir (#2995)",
     ),
@@ -257,6 +245,112 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
         "queue_items",
         "is_current",
         "TEXT vs INTEGER — jamais convertie sur le chemin migré (#2995)",
+    ),
+    // ── #3715 — les NEUF qui restent, mesurees le 09/09/2026 ──────────────
+    //
+    // Quatre des treize lignes de #3715 ont ete CONVERTIES par la migration 053
+    // (`album_metadata.album_id`, `network_mounts.active`, et
+    // `listen_history.context_position` sur les deux chemins). Les neuf
+    // ci-dessous ne le sont pas, et chacune dit POURQUOI — la mesure, pas
+    // l'intention.
+    //
+    // La regle qui les separe, mesuree sur PostgreSQL 16.15 : une colonne TEXT
+    // ne se convertit que si TOUS ses redacteurs lient deja un entier.
+    // PostgreSQL refuse `text -> smallint` et `boolean -> smallint` en
+    // affectation, mais accepte `bigint -> text`. Convertir une colonne dont un
+    // redacteur lie du texte echangerait une lecture fausse contre une ecriture
+    // refusee.
+    (
+        "native",
+        "streaming_favorites",
+        "id",
+        "TEXT vs INTEGER — la table n'est montee QUE par `ENSURE_TABLES`, en TEXT \
+         avec `nextval(...)::text`. MESURE 09/09/2026 : native=text, migree=bigint \
+         (la 012 convertit apres la copie). Convertir le natif exige de changer \
+         AUSSI la liaison du depot — c'est la table exacte de #1706, elle demande \
+         sa propre passe (#3715)",
+    ),
+    (
+        "native",
+        "streaming_favorites",
+        "profile_id",
+        "TEXT vs INTEGER — meme origine qu'`id`. MESURE : `StreamingFavoritesRepo` \
+         lie `pid` en TEXT, et sur une base MIGREE la colonne est bigint, donc \
+         `WHERE profile_id = $1` y rend `operator does not exist: bigint = text` — \
+         list/add/remove/is_favorite, tout le volet Favoris de streaming est mort \
+         sur le parc migre. Le sens de la reparation est INVERSE de ce que cette \
+         ligne suggere : aligner le natif sur bigint ET corriger la liaison (#3715)",
+    ),
+    (
+        "migree",
+        "alarms",
+        "enabled",
+        "TEXT vs INTEGER — aucun degat MESURE : la seule comparaison est \
+         `WHERE enabled = '1'` et la seule ecriture `SET enabled = '0'`, litteraux \
+         qui valent sur TEXT comme sur SMALLINT ; la lecture passe par `as_i64()`, \
+         qui reparse le texte. Convertible sans urgence, apres verification de \
+         chaque redacteur (#3715)",
+    ),
+    (
+        "migree",
+        "alarms",
+        "one_shot",
+        "TEXT vs INTEGER — aucun degat MESURE : jamais compare en SQL, lu par \
+         `as_i64()` qui reparse le texte, ecrit par un entier lie. Convertible \
+         sans urgence (#3715)",
+    ),
+    (
+        "migree",
+        "alarms",
+        "skip_holidays",
+        "TEXT vs INTEGER — aucun degat MESURE : jamais compare en SQL, lu par \
+         `as_i64()` qui reparse le texte, ecrit par un entier lie. Convertible \
+         sans urgence (#3715)",
+    ),
+    (
+        "migree",
+        "alarms",
+        "source_id",
+        "TEXT vs INTEGER — c'est la declaration SQLITE qui a tort. Cette colonne \
+         porte un identifiant de SERVICE, donc une chaine : `radios.rs` la lie en \
+         `Option<String>` et la relit en `as_string()`. MESURE sur une base NATIVE, \
+         ou 008 la declare bigint : creer une alarme avec un source_id rend \
+         `column \"source_id\" is of type bigint but expression is of type text`, et \
+         la relecture rend `null` (`as_str()` sur un `SqlValue::Int`). Le degat est \
+         sur le chemin NATIF, en sens INVERSE : la reparation est TEXT des deux \
+         cotes, pas INTEGER (#3715)",
+    ),
+    (
+        "migree",
+        "profiles",
+        "is_admin",
+        "TEXT vs INTEGER — NE PAS convertir seule. MESURE : `boolean -> smallint` \
+         est REFUSE en affectation et `routes/cloud.rs` lie `user.is_admin` en \
+         booleen — la conversion tuerait la creation de profil SSO sur le parc \
+         migre. Degat actuel MESURE : `as_bool()` rend `None` sur un \
+         `SqlValue::Text`, donc `GET /auth/me` rend `is_admin: null` au lieu de \
+         true/false sur toute base migree. Reparer la liaison d'abord (#3715)",
+    ),
+    (
+        "migree",
+        "radio_stations",
+        "is_favorite",
+        "TEXT vs INTEGER — aucun degat MESURE : #3181 a reecrit toutes les \
+         comparaisons en litteral texte (`= '1'`, `= '0'`), qui valent des deux \
+         cotes, la lecture passe par `as_i64()`, et `ORDER BY is_favorite DESC` \
+         donne le meme ordre sur '0'/'1' que sur 0/1. Convertible sans urgence \
+         mesuree, apres verification de chaque redacteur (#3715)",
+    ),
+    (
+        "migree",
+        "zones",
+        "dsp_enabled",
+        "TEXT vs INTEGER — NE PAS convertir seule. MESURE : `text -> smallint` est \
+         REFUSE en affectation et `ZoneRepo::update_dsp` lie `en: String` — la \
+         conversion echangerait la lecture fausse (`COALESCE types text and integer \
+         cannot be matched` sur `get_dsp_config`) contre une ecriture refusee. Au \
+         passage, MESURE : `update_dsp` est DEJA mort sur TOUT PostgreSQL, natif \
+         compris — `dsp_preset_id` est bigint et recoit un `String` (#3715)",
     ),
 ];
 
@@ -607,8 +701,11 @@ fn l_inventaire_des_ecarts_toleres_est_propre() {
     // exactement l'affaissement silencieux que ce garde-fou combat.
     assert_eq!(
         ECARTS_TOLERES.len(),
-        16,
-        // 1 côté natif (`zones.is_hidden`), 15 côté migré. Compte MESURÉ par
+        23,
+        // 3 côté natif, 20 côté migré. Le 31/08/2026 il valait 16 ; #3715 en a
+        // retiré 2 (tolérances périmées, `zones.dlna_wav24` et
+        // `zones.dlna_play_delay_ms`, réparées depuis) et inscrit les 9
+        // divergences que la migration 053 ne convertit pas. Compte MESURÉ par
         // `parite_des_types_pg_sqlite` et `aucune_exception_perimee` sur le
         // PostgreSQL 16 de la CI, pas estimé à la lecture des sources.
         "le nombre d'écarts tolérés a changé — mettre à jour ce compte ET #2995"
