@@ -92,7 +92,15 @@ fn apply_metadata_to_track(
 ///
 /// Une seule requête indexée par page, et aucune du tout sur une page vide
 /// (`get_key_for_tracks` court-circuite sur une liste d'identifiants vide).
-fn joindre_dr_par_piste(state: &AppState, items: Vec<tune_core::db::models::Track>) -> Vec<Value> {
+///
+/// ⚠️ `pub(super)` depuis #3789, et non privée : `super::search` sert ses
+/// titres dans la MÊME table à colonnes côté client. Le rendre visible coûte
+/// une ligne ; le recopier aurait fait un QUATRIÈME chemin qui aurait fini par
+/// diverger — c'est l'argument que porte déjà le commentaire ci-dessous.
+pub(super) fn joindre_dr_par_piste(
+    state: &AppState,
+    items: Vec<tune_core::db::models::Track>,
+) -> Vec<Value> {
     let track_ids: Vec<i64> = items.iter().filter_map(|t| t.id).collect();
     let dr = TrackMetadataRepo::with_backend(state.backend.clone())
         .get_key_for_tracks("dr_track", &track_ids)
@@ -100,10 +108,11 @@ fn joindre_dr_par_piste(state: &AppState, items: Vec<tune_core::db::models::Trac
     let mut items = super::albums::attach_track_tags(items, &[("dynamic_range", &dr)]);
     // #3518 — « Idéalement sur la même route que les autres listes de pistes,
     // pour que le tableau ait les mêmes colonnes partout » : ce chemin est le
-    // seam unique des trois autres surfaces (`/library/tracks` filtré, non
-    // filtré, et la fiche d'une piste). Le brancher ici les sert toutes les
-    // trois, sans un second recopieur qui aurait fini par diverger — c'est
-    // exactement l'argument de #1388 sur `attach_track_tags`.
+    // seam unique des autres surfaces (`/library/tracks` filtré, non filtré,
+    // la fiche d'une piste, et depuis #3789 `/library/search` et
+    // `/library/search/acoustic`). Le brancher ici les sert TOUTES, sans un
+    // second recopieur qui aurait fini par diverger — c'est exactement
+    // l'argument de #1388 sur `attach_track_tags`.
     super::albums::attacher_ecoutes(state, &mut items);
     items
 }
