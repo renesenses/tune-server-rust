@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -642,6 +643,40 @@ RELEASE_GATE_WORKFLOWS: tuple[str, ...] = (
 # legitimement manquer.
 MANDATORY_GATE_WORKFLOW = ".github/workflows/ci.yml"
 
+# Attente de la porte OBLIGATOIRE avant de trancher (#2808, phase 0).
+#
+# 40 minutes : sur les trains recents, `ci.yml` sur le commit de promotion tient
+# entre 30 et 40 minutes (v0.9.142 : 09:41:56Z -> 10:17:26Z, soit 35 min 30 s),
+# et le controleur pose le tag quelques minutes apres la fusion — l'attente
+# restante mesuree ce jour-la est de 28 minutes. Le budget tient sous le
+# `timeout-minutes: 60` du job `preflight` : une attente qui deborderait le job
+# rendrait un ROUGE qui ne dit rien du code. Reglable par
+# `PREFLIGHT_ATTENTE_PORTES_S` pour une reprise pressee — jamais pour desarmer :
+# une valeur nulle fait REFUSER des le premier check incomplet, elle ne rend pas
+# la tolerance d'avant.
+ATTENTE_PORTES_S = 40 * 60
+ATTENTE_PORTES_SONDAGE_S = 30
+
+
+def _budget_attente_portes() -> float:
+    """Budget d'attente, en secondes. Une valeur illisible garde le defaut."""
+    brut = os.environ.get("PREFLIGHT_ATTENTE_PORTES_S")
+    if brut is None:
+        return float(ATTENTE_PORTES_S)
+    try:
+        return max(0.0, float(brut))
+    except ValueError:
+        return float(ATTENTE_PORTES_S)
+
+
+# Indirections, pour que les contre-epreuves n'attendent pas reellement.
+def _pause(secondes: float) -> None:
+    time.sleep(secondes)
+
+
+def _horloge() -> float:
+    return time.monotonic()
+
 
 def release_gate_suites(repo: str, sha: str, token: Optional[str]) -> dict[int, str]:
     """Renvoie {check_suite_id: fichier de workflow} pour les seules portes."""
@@ -670,63 +705,111 @@ def check_ci_status(repo: str, sha: str, token: Optional[str]) -> CheckResult:
     disparaitre les portes elles-memes. Interroger les suites des portes borne
     la lecture a ce qui compte.
     """
-    try:
-        gates = release_gate_suites(repo, sha, token)
-        runs: list[dict] = []
-        for suite_id in gates:
-            data = github_api(
-                f"/repos/{repo}/check-suites/{suite_id}/check-runs?per_page=100",
-                token,
+    debut = _horloge()
+    while True:
+        try:
+            gates = release_gate_suites(repo, sha, token)
+            runs: list[dict] = []
+            obligatoires: list[dict] = []
+            for suite_id, workflow in gates.items():
+                data = github_api(
+                    f"/repos/{repo}/check-suites/{suite_id}/check-runs?per_page=100",
+                    token,
+                )
+                lot = data.get("check_runs", [])
+                runs.extend(lot)
+                if workflow == MANDATORY_GATE_WORKFLOW:
+                    obligatoires.extend(lot)
+        except HTTPError as e:
+            return CheckResult("ci_status", False, f"GitHub API error: {e.code}")
+        except Exception as e:
+            return CheckResult("ci_status", False, f"GitHub API error: {e}")
+
+        if MANDATORY_GATE_WORKFLOW not in gates.values():
+            return CheckResult(
+                "ci_status",
+                False,
+                f"aucune execution de {MANDATORY_GATE_WORKFLOW} sur ce commit : "
+                "porte de release introuvable",
             )
-            runs.extend(data.get("check_runs", []))
-    except HTTPError as e:
-        return CheckResult("ci_status", False, f"GitHub API error: {e.code}")
-    except Exception as e:
-        return CheckResult("ci_status", False, f"GitHub API error: {e}")
+        if not runs:
+            return CheckResult(
+                "ci_status",
+                False,
+                "aucun check-run de porte de release sur ce commit",
+            )
 
-    if MANDATORY_GATE_WORKFLOW not in gates.values():
-        return CheckResult(
-            "ci_status",
-            False,
-            f"aucune execution de {MANDATORY_GATE_WORKFLOW} sur ce commit : "
-            "porte de release introuvable",
-        )
-    if not runs:
-        return CheckResult(
-            "ci_status",
-            False,
-            "aucun check-run de porte de release sur ce commit",
-        )
+        failures = [
+            r["name"]
+            for r in runs
+            if r.get("status") == "completed" and r.get("conclusion") not in ("success", "neutral", "skipped")
+        ]
+        if failures:
+            return CheckResult(
+                "ci_status",
+                False,
+                f"{len(failures)} failed: {', '.join(failures[:5])}",
+            )
 
-    failures = [
-        r["name"]
-        for r in runs
-        if r.get("status") == "completed" and r.get("conclusion") not in ("success", "neutral", "skipped")
-    ]
-    if failures:
-        return CheckResult(
-            "ci_status",
-            False,
-            f"{len(failures)} failed: {', '.join(failures[:5])}",
-        )
-    # Jobs that haven't finished yet are NOT a failure: the current preflight
-    # check and other workflows triggered by the tag can still be running.
-    # Only actually-failed runs (handled above) block. Release itself cannot
-    # start building before this reusable workflow has succeeded.
-    pending = [r["name"] for r in runs if r.get("status") != "completed"]
-    gate_names = ", ".join(sorted({w.rsplit("/", 1)[-1] for w in gates.values()}))
-    if pending:
+        # 🔴 #2808 — un check ENCORE EN COURS n'est pas une preuve verte.
+        #
+        # Mesure du train v0.9.142 (08/09/2026), sur le commit de promotion
+        # `6874e679` : le preflight a conclu « portes de release vertes » a
+        # 09:49:48Z, alors que l'execution de `ci.yml` sur ce meme commit
+        # (run 34211429600, evenement `push`) n'a fini qu'a 10:17:26Z — vingt-
+        # huit minutes plus tard, matrice `Build …` comprise. Le tag etait
+        # deja pose (09:49:47Z) et la construction lancee. Le train est passe,
+        # mais par chance de calendrier : c'est une course, pas une preuve.
+        #
+        # Le remede tient a l'ATTENTE plutot qu'au refus. Un refus sec
+        # rougirait sur CHAQUE train — le controleur est lance a la main
+        # quelques minutes apres la fusion, quand `ci.yml` tourne encore — et
+        # une porte qui rougit sur tout finit desarmee. On attend donc que la
+        # porte OBLIGATOIRE finisse, puis on relit ; ce sont les memes regles
+        # qui tranchent ensuite, sur des conclusions completes.
+        #
+        # Perimetre volontairement ETROIT : seule `ci.yml` fait attendre. Les
+        # deux autres portes ont un filtre `paths`, peuvent legitimement ne pas
+        # tourner, et gardent la tolerance d'avant. L'elargir se decidera sur
+        # une mesure, pas par symetrie.
+        #
+        # Aucune boucle infinie : `ci.yml` n'est PAS declenchee par un push de
+        # tag (`on: push: branches: [main]`), elle ne peut donc pas attendre le
+        # preflight qui l'attend. Le budget borne quand meme l'attente, et son
+        # epuisement REFUSE — il ne retombe pas sur l'ancien vert.
+        en_cours_obligatoires = [
+            r["name"] for r in obligatoires if r.get("status") != "completed"
+        ]
+        budget = _budget_attente_portes()
+        if en_cours_obligatoires and _horloge() - debut < budget:
+            _pause(min(ATTENTE_PORTES_SONDAGE_S, budget))
+            continue
+
+        gate_names = ", ".join(sorted({w.rsplit("/", 1)[-1] for w in gates.values()}))
+        if en_cours_obligatoires:
+            return CheckResult(
+                "ci_status",
+                False,
+                f"{MANDATORY_GATE_WORKFLOW} toujours en cours apres "
+                f"{int(budget)} s d'attente — un check incomplet n'est pas une "
+                f"preuve verte (#2808) : "
+                f"{', '.join(en_cours_obligatoires[:5])}",
+            )
+        # Une porte FACULTATIVE encore en cours ne bloque toujours pas : elle a
+        # un filtre `paths` et peut legitimement ne rien avoir a dire.
+        pending = [r["name"] for r in runs if r.get("status") != "completed"]
+        if pending:
+            return CheckResult(
+                "ci_status",
+                True,
+                f"portes de release vertes ({gate_names}) — "
+                f"{len(pending)} encore en cours : {', '.join(pending[:5])}",
+            )
         return CheckResult(
             "ci_status",
             True,
-            f"portes de release vertes ({gate_names}) — "
-            f"{len(pending)} encore en cours : {', '.join(pending[:5])}",
+            f"{len(runs)} check-runs verts sur les portes de release ({gate_names})",
         )
-    return CheckResult(
-        "ci_status",
-        True,
-        f"{len(runs)} check-runs verts sur les portes de release ({gate_names})",
-    )
 
 
 def self_test_ci_status_gates() -> None:
@@ -807,6 +890,8 @@ def self_test_ci_status_gates() -> None:
         return fake
 
     original_github_api = globals()["github_api"]
+    original_pause = globals()["_pause"]
+    original_horloge = globals()["_horloge"]
     try:
         # Contrat 1 — LE BLOCAGE DU 02/09. Les vraies portes sont vertes ;
         # l'audit de gouvernance, la tentative du controleur et la conclusion
@@ -868,18 +953,81 @@ def self_test_ci_status_gates() -> None:
         hollow = check_ci_status("owner/repo", "b362f854", None)
         assert not hollow.passed, hollow
 
-        # Contrat 4 — un job de porte encore en cours ne bloque pas.
+        # Contrat 4 — UN CHECK EN COURS SUR LA PORTE OBLIGATOIRE FAIT
+        # ATTENDRE, ET NE VAUT PLUS VERT (#2808).
+        #
+        # C'est le contrat qui a change. Avant, ce cas rendait `passed=True` :
+        # c'est exactement ce qui s'est produit sur le train v0.9.142, ou le
+        # preflight a conclu vert 28 minutes avant la fin de `ci.yml`.
         pending_bodies = dict(commit_bodies)
         pending_bodies[CI_SUITE] = suite_runs(
             ("Test", "completed", "success"),
             ("Build aarch64-apple-darwin", "in_progress", None),
         )
+
+        # 4a — SENS NEGATIF : la porte obligatoire ne finit jamais. Le budget
+        # s'epuise et le controle REFUSE. Sans ce sens-la, l'attente serait un
+        # simple delai avant le meme faux vert.
         globals()["github_api"] = make_api(commit_suites, pending_bodies)
-        running = check_ci_status("owner/repo", "b362f854", None)
-        assert running.passed, running
-        assert "Build aarch64-apple-darwin" in running.detail, running
+        attentes: list[float] = []
+        globals()["_pause"] = attentes.append
+        faux_temps = iter([0.0] + [float(i) for i in range(1, 2000)])
+        globals()["_horloge"] = lambda: next(faux_temps)
+        os.environ["PREFLIGHT_ATTENTE_PORTES_S"] = "60"
+        bloque = check_ci_status("owner/repo", "b362f854", None)
+        assert not bloque.passed, bloque
+        assert "Build aarch64-apple-darwin" in bloque.detail, bloque
+        assert MANDATORY_GATE_WORKFLOW in bloque.detail, bloque
+        assert attentes, "le controle doit avoir ATTENDU avant de refuser"
+
+        # 4b — SENS POSITIF : la porte obligatoire finit pendant l'attente. Le
+        # controle repasse au vert, sur des conclusions COMPLETES. Sans ce
+        # sens-la, on aurait remplace un faux vert par un faux rouge.
+        fini_bodies = dict(commit_bodies)
+        fini_bodies[CI_SUITE] = suite_runs(
+            ("Test", "completed", "success"),
+            ("Build aarch64-apple-darwin", "completed", "success"),
+        )
+        etat = {"corps": pending_bodies}
+
+        def pause_qui_termine(secondes: float) -> None:
+            attentes.append(secondes)
+            etat["corps"] = fini_bodies
+
+        def api_variable(path: str, _token: Optional[str] = None):
+            return make_api(commit_suites, etat["corps"])(path, _token)
+
+        attentes.clear()
+        globals()["_pause"] = pause_qui_termine
+        globals()["github_api"] = api_variable
+        faux_temps = iter([0.0] + [float(i) for i in range(1, 2000)])
+        globals()["_horloge"] = lambda: next(faux_temps)
+        repris = check_ci_status("owner/repo", "b362f854", None)
+        assert repris.passed, repris
+        assert "Build aarch64-apple-darwin" not in repris.detail, repris
+        assert len(attentes) == 1, attentes
+
+        # 4c — une porte FACULTATIVE encore en cours ne fait toujours pas
+        # attendre : elle a un filtre `paths` et peut n'avoir rien a dire.
+        # Le perimetre de l'attente reste etroit.
+        widget_en_cours = dict(commit_bodies)
+        widget_en_cours[WIDGET_SUITE] = suite_runs(
+            ("Widget (compilation)", "in_progress", None),
+        )
+        globals()["github_api"] = make_api(commit_suites, widget_en_cours)
+        attentes.clear()
+        globals()["_pause"] = attentes.append
+        faux_temps = iter([0.0] + [float(i) for i in range(1, 2000)])
+        globals()["_horloge"] = lambda: next(faux_temps)
+        facultative = check_ci_status("owner/repo", "b362f854", None)
+        assert facultative.passed, facultative
+        assert "Widget (compilation)" in facultative.detail, facultative
+        assert not attentes, "une porte facultative ne doit pas faire attendre"
     finally:
         globals()["github_api"] = original_github_api
+        globals()["_pause"] = original_pause
+        globals()["_horloge"] = original_horloge
+        os.environ.pop("PREFLIGHT_ATTENTE_PORTES_S", None)
 
 
 # ─── Resume du job ────────────────────────────────────────────────────
