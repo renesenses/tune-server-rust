@@ -378,6 +378,16 @@ path = "tests/dispositions_de_canaux_3322.rs"
 name = "sante_slimproto_i3462"
 path = "tests/sante_slimproto_i3462.rs"
 
+# #2718 — « plus de serveurs multimedia ». La fiche support et le rapport de
+# bogue decrivaient les zones jusqu'au modele du DAC et ne comptaient PAS les
+# serveurs multimedia : quatre tickets (61, 87, 97, 98) instruits sans jamais
+# pouvoir dire combien Tune en voyait. Le temoin passe par les ROUTES MONTEES.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+[[test]]
+name = "serveurs_multimedia_dans_la_fiche_2718"
+path = "tests/serveurs_multimedia_dans_la_fiche_2718.rs"
+
 # #3518 : « # Plays » et « Last Played », deux colonnes de la maquette V1 que
 # AUCUNE route de liste de pistes ne portait. La garde passe par le ROUTEUR
 # MONTE : un essai qui appellerait `plays_for_tracks` en direct resterait vert
