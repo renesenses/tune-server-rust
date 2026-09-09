@@ -198,9 +198,49 @@ pub struct StreamSession {
     /// ligne par session : elle dit un FAIT ponctuel — le producteur a cessé
     /// d'être en avance — et le répéter à chaque morceau noierait le journal.
     pub dry_alert_emitted: std::sync::atomic::AtomicBool,
-    /// Vrai une fois l'alerte `stream_delivery_stall` émise. Même règle que
-    /// `dry_alert_emitted` : un FAIT ponctuel, une seule ligne par session.
+    /// Vrai tant que le blocage EN COURS a déjà été signalé.
+    ///
+    /// Contrairement à `dry_alert_emitted`, ce témoin se RÉARME au premier
+    /// tour de boucle sain : une ligne par BLOCAGE, et non une par session.
+    ///
+    /// La règle « une seule ligne par session » perdait la moitié de la
+    /// matière de #2952. Le journal de Belkadi Yacine porte DEUX blocages dans
+    /// la MÊME piste — donc la même session : `local_audio_slow_read`
+    /// `wait_ms=38594` à 15:47:42 puis `wait_ms=44853` à 15:48:36, tous deux
+    /// entre le début de la piste (15:46:47, déduit de `wall_secs=290` sur le
+    /// `track_end_gap` de 15:51:37) et sa fin. La même paire se répète sur la
+    /// piste suivante (35 191 ms puis 35 367 ms). Avec un seul tir par
+    /// session, le second blocage de chaque piste n'aurait JAMAIS de ligne
+    /// côté serveur — et le lecteur du journal, voyant deux attentes de la
+    /// sortie locale en face d'une seule ligne du flux, conclurait que la
+    /// seconde n'a pas de contrepartie. C'est l'absence prise pour une preuve.
+    ///
+    /// Le débit reste borné : un blocage dure au moins
+    /// `DELIVERY_STALL_THRESHOLD`, donc au plus une ligne toutes les 20 s par
+    /// session, quoi qu'il arrive.
     pub stall_alert_emitted: std::sync::atomic::AtomicBool,
+    /// Nombre de blocages signalés depuis le début de la session. Porté par la
+    /// ligne (`blocage = n`) pour qu'un journal dise tout de suite si l'on lit
+    /// le premier trou de la piste ou le troisième.
+    pub stall_alerts: std::sync::atomic::AtomicU32,
+    /// Instant du `yield` EN COURS du corps HTTP, s'il y en a un.
+    ///
+    /// `note_delivery_stall` ne se prononce qu'APRÈS coup : la durée d'un
+    /// `yield` n'est connue qu'au RETOUR de ce `yield`. Un blocage qui ne
+    /// finit jamais — la connexion meurt, la zone est arrêtée, le corps est
+    /// lâché en vol — ne laisse donc AUCUNE ligne : le seul endroit qui
+    /// mesure n'est jamais atteint. C'est la forme même de #3575 (« sortie
+    /// locale imprenable pour toute la vie du processus »), et c'est le pire
+    /// cas qui se taise. Ce champ tient l'attente en vol pour que la
+    /// sentinelle du corps puisse la NOMMER au moment où le corps est lâché.
+    ///
+    /// `tokio::time::Instant` et non `std::time::Instant` : l'horloge du test
+    /// se met en pause et s'avance à la main, sans quoi le vert dépendrait de
+    /// la charge de la machine.
+    pub attente_transport_en_vol: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Vrai une fois l'alerte `stream_delivery_abandoned` émise. Un corps ne
+    /// se lâche qu'une fois : pas de réarmement ici.
+    pub abandon_alert_emitted: std::sync::atomic::AtomicBool,
     /// Wakes an older radio consumer the instant a newer one claims the channel
     /// so it releases the `rx` lock promptly instead of staying parked in
     /// `recv_chunk()`. Paired with `consumer_epoch`; see `claim_channel_consumer`.
@@ -302,6 +342,9 @@ impl StreamSession {
             channel_was_full: std::sync::atomic::AtomicBool::new(false),
             dry_alert_emitted: std::sync::atomic::AtomicBool::new(false),
             stall_alert_emitted: std::sync::atomic::AtomicBool::new(false),
+            stall_alerts: std::sync::atomic::AtomicU32::new(0),
+            attente_transport_en_vol: std::sync::Mutex::new(None),
+            abandon_alert_emitted: std::sync::atomic::AtomicBool::new(false),
             consumer_supersede: std::sync::Arc::new(tokio::sync::Notify::new()),
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -421,6 +464,12 @@ impl StreamSession {
     /// canal : c'est ce triplet qui départage, sans rien redemander au
     /// testeur, « le producteur n'a rien produit » de « les octets étaient là
     /// et ne sont pas partis ».
+    ///
+    /// # Une ligne par BLOCAGE, pas une par session
+    ///
+    /// Le témoin se réarme au premier tour sain. Voir `stall_alert_emitted` :
+    /// #2952 porte deux blocages par piste, donc deux par session, et la règle
+    /// d'origine en effaçait un sur deux.
     pub fn note_delivery_stall(
         &self,
         attente_producteur: std::time::Duration,
@@ -430,9 +479,58 @@ impl StreamSession {
         if attente_producteur < DELIVERY_STALL_THRESHOLD
             && attente_transport < DELIVERY_STALL_THRESHOLD
         {
+            // Tour sain : le blocage précédent, s'il y en avait un, est fini.
+            // Le prochain aura droit à sa ligne.
+            self.stall_alert_emitted.store(false, Relaxed);
             return false;
         }
-        !self.stall_alert_emitted.swap(true, Relaxed)
+        let premier = !self.stall_alert_emitted.swap(true, Relaxed);
+        if premier {
+            self.stall_alerts.fetch_add(1, Relaxed);
+        }
+        premier
+    }
+
+    /// Note qu'un `yield` du corps HTTP COMMENCE : les octets sont en main, et
+    /// c'est en aval qu'on attend maintenant.
+    pub fn debut_attente_transport(&self) {
+        if let Ok(mut slot) = self.attente_transport_en_vol.lock() {
+            *slot = Some(tokio::time::Instant::now());
+        }
+    }
+
+    /// Note que le `yield` en cours est REVENU, et rend sa durée.
+    ///
+    /// Rend zéro si aucun `yield` n'était en vol : un appel sans début apparié
+    /// ne doit pas inventer une attente.
+    pub fn fin_attente_transport(&self) -> std::time::Duration {
+        self.attente_transport_en_vol
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .map(|debut| debut.elapsed())
+            .unwrap_or_default()
+    }
+
+    /// Le corps a été LÂCHÉ alors qu'un `yield` était encore en vol : rend la
+    /// durée de l'attente abandonnée s'il faut ALERTER, `None` sinon.
+    ///
+    /// C'est la seule mesure possible d'un blocage qui ne finit jamais :
+    /// `note_delivery_stall` attend le retour du `yield`, qui n'aura pas lieu.
+    /// Sous le seuil, rien — un corps lâché entre deux morceaux est le cas
+    /// ORDINAIRE (le renderer a fini, la zone a changé de piste).
+    pub fn note_delivery_abandoned(&self) -> Option<std::time::Duration> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let debut = self
+            .attente_transport_en_vol
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())?;
+        let attente = debut.elapsed();
+        if attente < DELIVERY_STALL_THRESHOLD {
+            return None;
+        }
+        (!self.abandon_alert_emitted.swap(true, Relaxed)).then_some(attente)
     }
 }
 
