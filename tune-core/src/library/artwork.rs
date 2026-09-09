@@ -3359,6 +3359,81 @@ mod tests {
         );
     }
 
+    /// 🔴 UN ALBUM CUE TROUVE SA `cover.jpg` — fil forum 1738.
+    ///
+    /// Gros Bidon (Didier), 09/09/2026 : « il manque les pochettes des albums
+    /// car Tune ne semble pas prendre le fichier cover.jpg associé au FLAC
+    /// quand il est associé à un fichier CUE. »
+    ///
+    /// Une piste découpée par une feuille CUE n'a PAS de fichier à elle :
+    /// `file_path` est NULL par construction, son support étant
+    /// `cue_media_path`. Les deux boucles du backfill filtraient sur
+    /// `file_path` — la piste était écartée avant même qu'on cherche, et la
+    /// `cover.jpg` posée juste à côté du FLAC n'était jamais regardée.
+    ///
+    /// La piste de ce témoin porte `file_path = None`, comme en production.
+    /// Sans cela il serait vert contre n'importe quel code.
+    #[test]
+    fn une_piste_cue_sans_file_path_trouve_la_pochette_du_dossier() {
+        use crate::db::album_repo::AlbumRepo;
+        use crate::db::artist_repo::ArtistRepo;
+        use crate::db::backend::DbBackend;
+        use crate::db::models::{Artist, Track};
+        use crate::db::sqlite::SqliteDb;
+        use crate::db::track_repo::TrackRepo;
+        use std::sync::Arc;
+
+        let base = crate::test_scratch::scratch_dir("tune_backfill_cue");
+        let music = base.join("Gould - Goldberg");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("cover.jpg"), b"\xff\xd8\xff\xe0dummyjpegdata").unwrap();
+        // L'IMAGE : le gros fichier que la feuille découpe.
+        let media = music.join("image.flac");
+        std::fs::write(&media, b"not really flac").unwrap();
+        let cache_dir = base.join("cache");
+
+        let sqlite = SqliteDb::open_in_memory().unwrap();
+        sqlite.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(sqlite);
+        let artist_repo = ArtistRepo::with_backend(backend.clone());
+        let album_repo = AlbumRepo::with_backend(backend.clone());
+        let track_repo = TrackRepo::with_backend(backend.clone());
+
+        let aid = artist_repo
+            .create(&Artist::new("Glenn Gould".into()))
+            .unwrap();
+        let alid = album_repo
+            .get_or_create("Goldberg Variations", aid, Some(1981))
+            .unwrap()
+            .id
+            .unwrap();
+
+        let mut track = Track::new("Aria".into());
+        track.artist_id = Some(aid);
+        track.album_id = Some(alid);
+        // 🔴 LE POINT DU TÉMOIN : pas de `file_path`, seulement le support CUE.
+        track.file_path = None;
+        track.cue_media_path = Some(media.to_string_lossy().into_owned());
+        track.cue_start_ms = Some(0);
+        track_repo.create(&track).unwrap();
+
+        assert_eq!(
+            backfill_embedded_covers(&backend, &cache_dir),
+            1,
+            "la pochette du dossier n'a pas été trouvée pour un album CUE"
+        );
+        assert!(
+            album_repo
+                .get(alid)
+                .unwrap()
+                .unwrap()
+                .cover_path
+                .as_deref()
+                .is_some_and(|c| !c.is_empty()),
+            "l'album CUE est resté sans pochette"
+        );
+    }
+
     #[test]
     fn artwork_hash_different_for_different_paths() {
         let h1 = artwork_hash("/music/a.flac");
