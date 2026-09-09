@@ -257,8 +257,13 @@ fn ip_d_identifiant_airplay(reste: &str) -> Option<&str> {
 
 /// La clé d'APPAREIL d'une zone : ce qui reste quand on retire ce qui
 /// n'identifie rien (mesure du 05/09 sur .18) :
-/// - UPnP : `uuid:` retiré, suffixe `_MR` retiré (l'UDN du sous-appareil
-///   MediaRenderer d'un Sonos a fait une deuxième zone), minuscules ;
+/// - UPnP : `uuid:` retiré, suffixe `_MR` ou `_MS` retiré, minuscules. Un
+///   Sonos annonce TROIS UDN pour un seul appareil : la racine ZonePlayer,
+///   `…_MR` (sous-appareil MediaRenderer) et `…_MS` (MediaServer). Les trois
+///   ont fait trois zones sur le serveur de test — relevé du 09/09 sur .18 :
+///   « Chambre » en 8 (racine), 6 (`_MR`) et 9 (`_MS`), « Cuisine » en 7, 11
+///   et 12. Ne retirer que `_MR` laissait la troisième hors du rapport ET
+///   inéligible à la fusion, alors que c'est le même haut-parleur ;
 /// - AirPlay historique `airplay-<ip>-<port>` : l'adresse ne dit rien de
 ///   stable (l'Apple TV du 13/08 est devenue un Sonos) ; si un appareil
 ///   découvert porte cette adresse ET une adresse matérielle, c'est elle la clé,
@@ -286,10 +291,15 @@ pub(crate) fn cle_appareil(
         return Some(format!("mac:{}", reste.to_ascii_lowercase()));
     }
     if let Some(reste) = id.strip_prefix("uuid:") {
-        return Some(format!(
-            "udn:{}",
-            reste.trim_end_matches("_MR").to_ascii_lowercase()
-        ));
+        // `strip_suffix` et non `trim_end_matches` : on retire UN suffixe de
+        // sous-appareil, pas une répétition. Les deux suffixes sont ceux que
+        // Sonos annonce et rien d'autre n'est deviné — une identité qu'on ne
+        // sait pas prouver ne doit pas devenir une fusion (13/08).
+        let socle = reste
+            .strip_suffix("_MR")
+            .or_else(|| reste.strip_suffix("_MS"))
+            .unwrap_or(reste);
+        return Some(format!("udn:{}", socle.to_ascii_lowercase()));
     }
     None
 }
@@ -357,7 +367,7 @@ pub(crate) fn doublons_de_zones(
             continue;
         }
         let motif = if cle.starts_with("udn:") {
-            "même appareil UPnP (UDN, suffixe _MR retiré)"
+            "même appareil UPnP (UDN, suffixe _MR ou _MS retiré)"
         } else if cle.starts_with("mac:") {
             "même appareil AirPlay (adresse matérielle)"
         } else {
@@ -3406,5 +3416,58 @@ mod tests_doublons_de_zones {
         );
         assert_eq!(cle_appareil(&z("local:hw:0,0"), &[]), None);
         assert_eq!(cle_appareil(&z("oaat:1081bb7a"), &[]), None);
+    }
+    /// Les TROIS UDN d'un Sonos ne font qu'un appareil, donc un seul groupe.
+    ///
+    /// Relevé du 09/09 sur .18 (`tune_v2.db`) : « Chambre » existe en racine
+    /// (id 8), en `_MR` (id 6) et en `_MS` (id 9) ; « Cuisine » en 7, 11 et
+    /// 12. Tant que seul `_MR` était retiré, la ligne `_MS` n'était ni nommée
+    /// par le rapport ni fusionnable par la route : elle restait à l'écran
+    /// sans aucun moyen de la faire disparaître sans perdre ses réglages.
+    #[test]
+    fn les_trois_udn_d_un_sonos_ne_font_qu_un_seul_groupe() {
+        let z = |dev: &str| zone(1, "z", "dlna", dev, true);
+        for suffixe in ["", "_MR", "_MS"] {
+            assert_eq!(
+                cle_appareil(&z(&format!("uuid:RINCON_B8E937B44D0801400{suffixe}")), &[])
+                    .as_deref(),
+                Some("udn:rincon_b8e937b44d0801400"),
+                "suffixe {suffixe:?}"
+            );
+        }
+        // Un suffixe qui n'est pas un sous-appareil Sonos ne s'efface pas :
+        // deux appareils différents ne doivent pas se retrouver dans le même
+        // groupe parce que leur UDN finit pareil.
+        assert_eq!(
+            cle_appareil(&z("uuid:ABC_MZ"), &[]).as_deref(),
+            Some("udn:abc_mz")
+        );
+        let zones = vec![
+            zone(8, "Chambre", "dlna", "uuid:RINCON_B8E937B44D0801400", true),
+            zone(
+                6,
+                "Chambre",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400_MR",
+                false,
+            ),
+            zone(
+                9,
+                "Chambre - Sonos Play:1 Media Renderer",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400_MS",
+                false,
+            ),
+        ];
+        let groupes = doublons_de_zones(&zones, &[]);
+        assert_eq!(groupes.len(), 1, "{groupes:#?}");
+        let mut ids: Vec<i64> = groupes[0]["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|z| z["id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [6, 8, 9], "les trois lignes sont un seul appareil");
     }
 }
