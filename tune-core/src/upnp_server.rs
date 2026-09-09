@@ -243,7 +243,13 @@ pub fn build_device_description(state: &UpnpState) -> String {
     </serviceList>
   </device>
 </root>"#,
-        friendly = state.friendly_name,
+        // Le nom est réglable (`upnp_friendly_name`, POST
+        // /api/v1/upnp/config) et partait ICI sans échappement : une
+        // esperluette ou un chevron dans « Salon & Cuisine » rendait
+        // `description.xml` illégal, et un point de contrôle strict — JPLAY
+        // décrit et appaire le serveur AVANT d'indexer (#2183) — ne peut alors
+        // plus décrire le MediaServer du tout.
+        friendly = crate::outputs::didl::escape_sain(&state.friendly_name),
         version = crate::version(),
         uuid = state.uuid,
         base = base,
@@ -2392,13 +2398,13 @@ fn didl_albums_under(
         if let Some(ref artist_name) = album.artist_name {
             extra.push_str(&format!(
                 "<dc:creator>{}</dc:creator>",
-                quick_xml::escape::escape(artist_name)
+                crate::outputs::didl::escape_sain(artist_name)
             ));
         }
         if let Some(ref cover) = album.cover_path {
             extra.push_str(&format!(
                 "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                quick_xml::escape::escape(&artwork_url(base_url, cover))
+                crate::outputs::didl::escape_sain(&artwork_url(base_url, cover))
             ));
         }
         inner.push_str(&didl_container_ext(
@@ -2556,7 +2562,7 @@ fn browse_artist_albums(state: &UpnpState, artist_id: i64, base_url: &str) -> Di
         if let Some(ref cover) = album.cover_path {
             extra.push_str(&format!(
                 "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                quick_xml::escape::escape(&artwork_url(base_url, cover))
+                crate::outputs::didl::escape_sain(&artwork_url(base_url, cover))
             ));
         }
         inner.push_str(&didl_container_ext(
@@ -2617,6 +2623,30 @@ fn didl_container(
     didl_container_ext(id, parent_id, title, class, child_count, "")
 }
 
+/// L'`<container>` du serveur média — l'UNIQUE émetteur de conteneurs du
+/// fichier, appelé par la racine, les artistes, les albums, les genres, les
+/// années et les listes de lecture.
+///
+/// Deux manques, tous deux mesurés sur le DIDL réellement émis :
+///
+/// 1. **`restricted` est OBLIGATOIRE.** L'annexe B de ContentDirectory:1 le
+///    déclare `use="required"` sur `container` comme sur `item`. Le dépôt
+///    connaissait la règle et ne l'appliquait qu'aux items :
+///    [`crate::outputs::didl::DidlBuilder::build_item`] écrit
+///    `restricted="1"`, et le test
+///    `un_item_de_station_est_bati_comme_un_item_de_piste` l'exige d'une
+///    station. Aucun conteneur ne l'a jamais porté — la mesure
+///    d'origine, `Browse(artists)` : `<container id="artist/1"
+///    parentID="artists" childCount="1">`. Un point de contrôle qui valide
+///    contre le schéma rejette l'objet, donc le dossier.
+/// 2. **le texte libre passait par `quick_xml::escape::escape` nu.** Un nom
+///    d'artiste, un titre d'album, un genre ou un nom de liste vient des tags
+///    du fichier ; XML 1.0 y interdit les caractères de contrôle, et un
+///    séparateur NUL d'ID3v2.4 rendait l'enveloppe SOAP ENTIÈRE illégale —
+///    npupnp répond alors 401 « Invalid Action », son parseur ayant échoué sur
+///    le CORPS. C'est la note en tête de `outputs/didl.rs`. Elle avait été
+///    appliquée à tous les émetteurs d'ITEMS ; la porte conteneur est restée
+///    ouverte, et c'est celle par où passent les noms de tags.
 fn didl_container_ext(
     id: &str,
     parent_id: &str,
@@ -2625,18 +2655,19 @@ fn didl_container_ext(
     child_count: Option<u64>,
     extra_xml: &str,
 ) -> String {
+    use crate::outputs::didl::escape_sain;
     let cc = child_count
         .map(|c| format!(" childCount=\"{c}\""))
         .unwrap_or_default();
     format!(
-        "<container id=\"{id}\" parentID=\"{pid}\"{cc}>\
+        "<container id=\"{id}\" parentID=\"{pid}\" restricted=\"1\"{cc}>\
          <dc:title>{title}</dc:title>\
          <upnp:class>{class}</upnp:class>\
          {extra}\
          </container>",
-        id = quick_xml::escape::escape(id),
-        pid = quick_xml::escape::escape(parent_id),
-        title = quick_xml::escape::escape(title),
+        id = escape_sain(id),
+        pid = escape_sain(parent_id),
+        title = escape_sain(title),
         class = class,
         extra = extra_xml,
     )
@@ -3125,7 +3156,8 @@ mod tests {
                 "le dossier {genre:?} annonce {annonce} et ouvre {ouvert}"
             );
             // Le nombre doit être DANS le DIDL, porté par ce conteneur-là.
-            let attendu = format!("id=\"{id}\" parentID=\"genres\" childCount=\"{ouvert}\"");
+            let attendu =
+                format!("id=\"{id}\" parentID=\"genres\" restricted=\"1\" childCount=\"{ouvert}\"");
             assert!(
                 liste.xml.contains(&attendu),
                 "la liste n'annonce pas la taille de {genre:?} : {}",
@@ -3417,7 +3449,8 @@ mod tests {
             );
 
             // Le nombre doit être DANS le DIDL, porté par ce conteneur-là.
-            let attendu = format!("id=\"{id}\" parentID=\"0\" childCount=\"{ouvert}\"");
+            let attendu =
+                format!("id=\"{id}\" parentID=\"0\" restricted=\"1\" childCount=\"{ouvert}\"");
             assert!(
                 racine.xml.contains(&attendu),
                 "la racine n'annonce pas la taille du rayon {id} ({titre}) : {}",
@@ -3467,7 +3500,8 @@ mod tests {
         let ouvert = browse_direct_children(&state, &conteneur, 0, 100).total;
         assert_eq!(ouvert, 2, "l'album masqué ne doit pas s'ouvrir");
 
-        let attendu = format!("id=\"{conteneur}\" parentID=\"artists\" childCount=\"2\"");
+        let attendu =
+            format!("id=\"{conteneur}\" parentID=\"artists\" restricted=\"1\" childCount=\"2\"");
         let liste = browse_direct_children(&state, "artists", 0, 100);
         assert!(
             liste.xml.contains(&attendu),
@@ -4531,6 +4565,195 @@ mod tests {
         assert!(xml.contains("application/x-dsd"), "{xml}");
         assert!(!xml.contains("audio/flac"), "{xml}");
         assert!(xml.contains("sampleFrequency=\"2822400\""), "{xml}");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2183, #1800, #2103 — ce que le serveur media publie doit d'abord
+    // PARSER, et se conformer au schema, chez un point de controle strict.
+    // -----------------------------------------------------------------------
+
+    /// Le document est-il du XML 1.0 bien forme ? Rendu par un VRAI parseur —
+    /// c'est ce que fait le point de controle, et une comparaison de chaine ne
+    /// mesure pas la meme chose.
+    fn xml_bien_forme(xml: &str) -> Result<(), String> {
+        let mut lecteur = quick_xml::Reader::from_str(xml);
+        lecteur.config_mut().check_end_names = true;
+        loop {
+            match lecteur.read_event() {
+                Ok(quick_xml::events::Event::Eof) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+
+    /// Le DIDL tel que le point de controle le lit : le contenu de `<Result>`,
+    /// des-echappe une fois. On mesure la SORTIE observable du trajet SOAP
+    /// complet, jamais la fonction qui l'a produite.
+    fn didl_du_soap(reponse: &str) -> String {
+        let debut = reponse
+            .find("<Result>")
+            .expect("pas de <Result> dans la reponse SOAP")
+            + "<Result>".len();
+        let fin = reponse.find("</Result>").expect("pas de </Result>");
+        quick_xml::escape::unescape(&reponse[debut..fin])
+            .expect("le contenu de <Result> n'est pas echappe correctement")
+            .into_owned()
+    }
+
+    /// La valeur du premier attribut `id` d'un en-tete `<container …`.
+    fn id_du_conteneur(entete: &str) -> Option<String> {
+        let reste = entete.strip_prefix("id=\"")?;
+        let fin = reste.find('"')?;
+        Some(
+            quick_xml::escape::unescape(&reste[..fin])
+                .ok()?
+                .into_owned(),
+        )
+    }
+
+    /// `restricted` est OBLIGATOIRE sur un objet DIDL-Lite, conteneur compris.
+    ///
+    /// Mesure d'origine, avant correctif, sur `Browse(artists)` :
+    /// `<container id="artist/1" parentID="artists" childCount="1">`. Les
+    /// ITEMS le portaient depuis toujours ; aucun CONTENEUR ne l'a jamais
+    /// porte. Le test descend l'arbre reel du serveur media par SOAP et
+    /// n'accepte aucune exception.
+    #[test]
+    fn aucun_conteneur_publie_ne_sort_sans_l_attribut_restricted() {
+        let (state, _, _, _, _) = state_complet();
+        let mut a_visiter = vec!["0".to_string()];
+        let mut conteneurs_vus = 0usize;
+        for _profondeur in 0..3 {
+            let mut suivants = Vec::new();
+            for oid in &a_visiter {
+                for drapeau in ["BrowseDirectChildren", "BrowseMetadata"] {
+                    let didl =
+                        didl_du_soap(&build_browse_response(&state, &corps_browse(oid, drapeau)));
+                    if let Err(e) = xml_bien_forme(&didl) {
+                        panic!("{drapeau}({oid}) rend un DIDL illisible : {e}\n{didl}");
+                    }
+                    for bout in didl.split("<container ").skip(1) {
+                        let entete = &bout[..bout.find('>').expect("en-tete non ferme")];
+                        conteneurs_vus += 1;
+                        assert!(
+                            entete.contains(" restricted=\""),
+                            "{drapeau}({oid}) publie un conteneur SANS l'attribut \
+                             obligatoire restricted : <container {entete}>"
+                        );
+                        if drapeau == "BrowseDirectChildren" {
+                            if let Some(id) = id_du_conteneur(entete) {
+                                suivants.push(id);
+                            }
+                        }
+                    }
+                }
+            }
+            a_visiter = suivants;
+        }
+        // Temoin : sans lui, un arbre vide rendrait ce test vert contre rien.
+        assert!(
+            conteneurs_vus >= 8,
+            "l'arbre parcouru ne porte que {conteneurs_vus} conteneurs : \
+             le test ne mesure plus rien"
+        );
+    }
+
+    /// Un caractere de controle dans un nom de TAG ne doit pas vider un
+    /// dossier.
+    ///
+    /// XML 1.0 les interdit et `quick_xml::escape::escape` ne les ote pas :
+    /// un separateur NUL d'ID3v2.4 dans un nom d'artiste ou un titre d'album
+    /// rendait l'enveloppe SOAP entiere illegale. npupnp (upmpdcli) repond
+    /// alors 401 « Invalid Action » — son parseur echoue sur le CORPS — et le
+    /// dossier se lit vide, sans une ligne de journal. Le correctif de #3771
+    /// avait ferme cette porte pour les ITEMS ; les CONTENEURS, ou entrent
+    /// justement les noms d'artistes, d'albums et de genres, restaient
+    /// ouverts.
+    #[test]
+    fn un_caractere_de_controle_dans_un_nom_de_tag_ne_vide_pas_le_dossier() {
+        use crate::db::models::{Album, Artist};
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let artiste_id = ArtistRepo::with_backend(backend.clone())
+            .create(&Artist::new("Miles\u{0}Davis".into()))
+            .unwrap();
+        let mut album = Album::new("Kind of\u{1}Blue".into());
+        album.artist_id = Some(artiste_id);
+        album.genre = Some("Ja\u{0}zz".into());
+        AlbumRepo::with_backend(backend.clone())
+            .create(&album)
+            .unwrap();
+        let state = UpnpState::new(backend, 8888, Some("192.168.1.18".into()));
+
+        let interdit = |c: char| !matches!(c, '\t' | '\n' | '\r') && c < '\u{20}';
+        for rayon in ["artists", "albums", "genres"] {
+            let reponse =
+                build_browse_response(&state, &corps_browse(rayon, "BrowseDirectChildren"));
+            let fautifs: Vec<u32> = reponse
+                .chars()
+                .filter(|c| interdit(*c))
+                .map(|c| c as u32)
+                .collect();
+            assert!(
+                fautifs.is_empty(),
+                "la reponse SOAP du rayon {rayon} porte des caracteres interdits \
+                 par XML 1.0 ({fautifs:?}) : un parseur strict rejette le CORPS \
+                 entier et le dossier se lit vide"
+            );
+            let didl = didl_du_soap(&reponse);
+            if let Err(e) = xml_bien_forme(&didl) {
+                panic!("le DIDL du rayon {rayon} ne parse pas : {e}\n{didl}");
+            }
+            // Temoin : le dossier n'est pas vide non plus — le correctif ne
+            // doit pas « assainir » en supprimant l'entree.
+            assert!(
+                reponse.contains("<NumberReturned>1</NumberReturned>"),
+                "le rayon {rayon} s'ouvre vide : {reponse}"
+            );
+        }
+    }
+
+    /// Le nom du serveur est reglable — il n'etait pas echappe dans
+    /// `description.xml`.
+    ///
+    /// `upnp_friendly_name` (POST /api/v1/upnp/config) part tel quel dans
+    /// `<friendlyName>`. « Salon & Cuisine » suffit a rendre le descriptif
+    /// illegal. Or #2183 tient sur cette etape : « le MediaServer est vu,
+    /// DECRIT et appaire » — un point de controle qui ne parse pas le
+    /// descriptif ne voit pas le serveur du tout.
+    #[test]
+    fn le_nom_du_serveur_ne_casse_plus_son_descriptif() {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        crate::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set("upnp_friendly_name", "Salon & Cuisine <Tune>")
+            .unwrap();
+        let state = UpnpState::new(backend, 8888, Some("192.168.1.18".into()));
+
+        let descriptif = build_device_description(&state);
+        if let Err(e) = xml_bien_forme(&descriptif) {
+            panic!("description.xml ne parse plus : {e}\n{descriptif}");
+        }
+        assert!(
+            descriptif.contains("<friendlyName>Salon &amp; Cuisine &lt;Tune&gt;</friendlyName>"),
+            "le nom du serveur n'est pas echappe : {descriptif}"
+        );
+        // Temoin : un nom ordinaire traverse inchange.
+        let db2 = SqliteDb::open_in_memory().unwrap();
+        db2.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db2).unwrap();
+        let state2 = UpnpState::new(Arc::new(db2), 8888, Some("192.168.1.18".into()));
+        assert!(
+            build_device_description(&state2).contains("<friendlyName>Tune Server</friendlyName>"),
+            "le nom par defaut a bouge"
+        );
     }
 }
 

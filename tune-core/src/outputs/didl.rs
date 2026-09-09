@@ -28,7 +28,14 @@ fn texte_xml_sain(s: &str) -> std::borrow::Cow<'_, str> {
 
 /// Échappement XML précédé de l'assainissement ci-dessus — l'unique porte
 /// par laquelle du texte libre (tags) entre dans un document DIDL.
-fn escape_sain(s: &str) -> String {
+///
+/// `pub(crate)` depuis #2183 : le serveur média bâtit ses **conteneurs**
+/// (artistes, albums, genres, années, listes) hors de [`DidlBuilder`], et il
+/// les échappait avec `quick_xml::escape::escape` nu. Un titre d'album ou un
+/// nom d'artiste venu des tags rendait donc l'enveloppe SOAP entière illégale
+/// — exactement ce que la note en tête de ce fichier décrit, mais du côté
+/// conteneur, où le correctif posé sur les items ne passait pas.
+pub(crate) fn escape_sain(s: &str) -> String {
     let sain = texte_xml_sain(s);
     escape(sain.as_ref()).into_owned()
 }
