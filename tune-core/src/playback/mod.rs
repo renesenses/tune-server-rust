@@ -377,6 +377,42 @@ pub struct ZoneState {
     /// restauration d'état on ne conclut rien.
     #[serde(skip)]
     pub browser_unattended_at: Option<Instant>,
+    /// Instant de la dernière AVANCE de la position OBSERVÉE — pas de la
+    /// dernière commande, pas du dernier tick.
+    ///
+    /// `state == Playing` est une DÉCLARATION : quelqu'un a écrit « ça joue »
+    /// et personne ne l'a jamais contredit. Sur une zone dont la sortie a
+    /// disparu du registre du sondeur (`poller/tick.rs`, `outputs.get(&device_id)
+    /// → None => continue`), plus rien ne l'observe : la déclaration survit à
+    /// la réalité pour toujours, et le seul détecteur de zone figée est
+    /// DLNA-only (`dlna_playing_stall_eligible`, #3155). C'est le fantôme de
+    /// #3581 — une Serenade éteinte qui interdisait la mise à jour.
+    ///
+    /// Ce champ porte le seul fait OBSERVABLE qui distingue « ça joue » de
+    /// « ça l'a dit un jour » : la position publiée avance-t-elle encore ? Il
+    /// est stampé UNIQUEMENT par [`PlaybackManager::update_position`], et
+    /// uniquement quand la position retenue augmente réellement — c'est-à-dire
+    /// par l'unique observation de production (`poller/tick.rs:1003`).
+    ///
+    /// Les trois valeurs ne disent pas la même chose, et l'ambiguïté est
+    /// résolue du côté SÛR :
+    /// - `None` — personne n'a jamais observé d'avance sur cette piste. Une
+    ///   zone navigateur (aucun périphérique, cf.
+    ///   `position_entretenue_par_le_sondeur`), une radio dont le renderer
+    ///   n'annonce aucune position, une piste qui vient de démarrer. **On ne
+    ///   conclut rien** : la zone est traitée comme jouant.
+    /// - `Some(t)` récent — la zone est vivante, mesurée.
+    /// - `Some(t)` ancien — elle a été observée, puis l'observation s'est
+    ///   figée. C'est le fantôme.
+    ///
+    /// Remis à `None` par tout changement d'état qui rouvre la question
+    /// (`play`, `resume`, `stop`, `seek`) : après une commande, la mesure
+    /// d'avant ne décrit plus rien.
+    ///
+    /// `#[serde(skip)]` comme ses voisins `Instant` : après une restauration
+    /// d'état on ne conclut rien.
+    #[serde(skip)]
+    pub derniere_avance_de_position: Option<Instant>,
 }
 
 /// Vrai quand la nouvelle métadonnée now-playing change d'identité
@@ -447,8 +483,43 @@ impl Default for ZoneState {
             session_context_source: None,
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
+            derniere_avance_de_position: None,
         }
     }
+}
+
+/// Une zone annoncée `Playing` dont la position observée n'a plus bougé depuis
+/// `silence_max` est-elle FIGÉE ?
+///
+/// Le prédicat de #3581, et la seule question qu'on sache poser honnêtement à
+/// un état mémoire : *quelqu'un observe-t-il encore cette zone avancer ?*
+///
+/// Trois refus délibérés, tous du côté sûr — un faux « figée » couperait une
+/// écoute réelle, un faux « vivante » ne coûte qu'une attente :
+/// - une zone qui n'est pas `Playing` n'est jamais figée (une PAUSE ne retient
+///   rien, cf. `playback_in_progress`) ;
+/// - `derniere_avance_de_position == None` n'est PAS un silence : c'est une
+///   absence de mesure. Zone navigateur, radio sans position annoncée, piste
+///   qui démarre — on ne conclut rien ;
+/// - une RADIO est exclue par principe. Un flux live n'a pas de durée, et
+///   plusieurs renderers en annoncent la position par à-coups ou pas du tout ;
+///   figer la conclusion sur cette forme-là reviendrait à couper la seule
+///   lecture qui, par nature, dure des heures sans changer de piste.
+pub fn zone_figee(state: &ZoneState, silence_max: std::time::Duration) -> bool {
+    if state.state != PlayState::Playing {
+        return false;
+    }
+    let est_radio = state
+        .now_playing
+        .as_ref()
+        .map(|np| np.source == "radio")
+        .unwrap_or(false);
+    if est_radio {
+        return false;
+    }
+    state
+        .derniere_avance_de_position
+        .is_some_and(|t| t.elapsed() >= silence_max)
 }
 
 /// Build a materialised shuffle order: a Fisher-Yates permutation of
@@ -715,6 +786,9 @@ impl PlaybackManager {
         // annoncée « recherche en cours » pendant toute la lecture.
         state.resolving = false;
         state.state = PlayState::Playing;
+        // Nouveau flux : la mesure d'avance d'avant ne décrit plus rien, et
+        // rien n'a encore été observé de celui-ci. « Je ne sais pas » (#3581).
+        state.derniere_avance_de_position = None;
         // Le verdict appartient au flux qui l'a produit. Tant que le backend
         // n'a pas observé le premier buffer du nouveau flux, mieux vaut
         // annoncer « non observé » que réutiliser la promesse de la piste
@@ -779,6 +853,9 @@ impl PlaybackManager {
         if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Playing;
             state.paused_at = None;
+            // La mesure d'avance date d'avant la pause : elle ne dit rien de
+            // la lecture qui repart (#3581).
+            state.derniere_avance_de_position = None;
         }
         self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
@@ -799,6 +876,7 @@ impl PlaybackManager {
             state.output_signal_path = None;
             state.paused_at = None;
             state.last_seek_at = None;
+            state.derniere_avance_de_position = None;
             // Keep position_ms and now_playing so the UI shows where
             // playback left off and can resume from the same position.
             now_playing_event_data(state)
@@ -827,6 +905,7 @@ impl PlaybackManager {
             // La file est vide : il n'y a plus rien à reprendre (#2876).
             state.pending_resume_ms = None;
             state.metadata_changed_at_ms = None;
+            state.derniere_avance_de_position = None;
         }
         self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
@@ -885,6 +964,10 @@ impl PlaybackManager {
             // retenir et le curseur suit immédiatement (#3229).
             state.reculs_de_position = 0;
             state.last_seek_at = Some(Instant::now());
+            // Le curseur vient d'être déplacé par une COMMANDE : la prochaine
+            // observation repart d'ailleurs, la mesure d'avance d'avant ne
+            // vaut plus (#3581).
+            state.derniere_avance_de_position = None;
         }
         self.emit(PlaybackEvent {
             event: "seek".into(),
@@ -1089,6 +1172,13 @@ impl PlaybackManager {
             return position_ms;
         };
         if position_ms >= state.position_ms {
+            // Une AVANCE, et elle seule, prouve que quelqu'un observe encore
+            // cette zone (#3581). `>` et non `>=` : un renderer qui répète
+            // indéfiniment la même position n'avance pas — c'est exactement la
+            // forme du fantôme.
+            if position_ms > state.position_ms {
+                state.derniere_avance_de_position = Some(Instant::now());
+            }
             state.reculs_de_position = 0;
             state.position_ms = position_ms;
             return position_ms;
@@ -1293,6 +1383,7 @@ mod tests {
             session_context_source: None,
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
+            derniere_avance_de_position: None,
         };
         let v = now_playing_event_data(&state);
         // Full NowPlaying is serialised…
@@ -1833,5 +1924,165 @@ mod tests {
             8_000,
             "une secousse isolée redevient inoffensive après que le plancher a cédé"
         );
+    }
+}
+
+/// #3581 — le prédicat de la zone FIGÉE, tenu sur une horloge RÉELLE.
+///
+/// Les épreuves de `tune-server` passent un seuil nul faute de pouvoir
+/// remonter le temps à travers `PlaybackManager`. Celles-ci fabriquent l'état
+/// directement et **antidatent** l'instant d'avance : c'est le seul endroit où
+/// « dix minutes » est réellement mesuré, avec la constante de production.
+#[cfg(test)]
+mod zone_figee_tests {
+    use super::{NowPlaying, PlayState, ZoneState, zone_figee};
+    use std::time::{Duration, Instant};
+
+    /// La valeur de production de `SILENCE_DE_POSITION_AVANT_ZONE_FIGEE`
+    /// (`tune-server/src/routes/system/update.rs`). Recopiée ici parce que
+    /// `tune-core` ne dépend pas de `tune-server` ; c'est la borne du serveur
+    /// qui fait foi, ce test tient le PRÉDICAT à cette échelle-là.
+    const DIX_MINUTES: Duration = Duration::from_secs(600);
+
+    fn zone(state: PlayState, source: &str, avance_il_y_a: Option<Duration>) -> ZoneState {
+        ZoneState {
+            zone_id: 12,
+            state,
+            now_playing: Some(NowPlaying {
+                source: source.into(),
+                ..Default::default()
+            }),
+            derniere_avance_de_position: avance_il_y_a
+                .map(|d| Instant::now().checked_sub(d).expect("horloge trop jeune")),
+            ..Default::default()
+        }
+    }
+
+    /// Le fantôme de Tades : la Serenade dit `Playing`, sa position n'a plus
+    /// bougé depuis onze minutes.
+    #[test]
+    fn onze_minutes_sans_avance_font_une_zone_figee() {
+        assert!(zone_figee(
+            &zone(PlayState::Playing, "local", Some(Duration::from_secs(660))),
+            DIX_MINUTES
+        ));
+    }
+
+    /// Neuf minutes ne suffisent pas. La borne est du côté sûr : tant qu'on
+    /// n'est pas certain, la lecture est réputée réelle.
+    #[test]
+    fn neuf_minutes_sans_avance_ne_suffisent_pas() {
+        assert!(!zone_figee(
+            &zone(PlayState::Playing, "local", Some(Duration::from_secs(540))),
+            DIX_MINUTES
+        ));
+    }
+
+    /// Une lecture qui avance à la seconde n'est jamais figée — la propriété
+    /// qui garantit qu'aucun son réel n'est coupé.
+    #[test]
+    fn une_zone_observee_a_l_instant_n_est_jamais_figee() {
+        assert!(!zone_figee(
+            &zone(
+                PlayState::Playing,
+                "local",
+                Some(Duration::from_millis(200))
+            ),
+            DIX_MINUTES
+        ));
+    }
+
+    /// `None` = jamais observée = on ne conclut rien.
+    #[test]
+    fn une_absence_de_mesure_n_est_pas_un_silence() {
+        assert!(!zone_figee(
+            &zone(PlayState::Playing, "local", None),
+            DIX_MINUTES
+        ));
+    }
+
+    /// Une radio immobile depuis des heures reste une radio qui joue.
+    #[test]
+    fn une_radio_n_est_jamais_declaree_figee() {
+        assert!(!zone_figee(
+            &zone(PlayState::Playing, "radio", Some(Duration::from_secs(7200))),
+            DIX_MINUTES
+        ));
+    }
+
+    /// Ni une zone à l'arrêt, ni une zone en pause : le verdict ne porte que
+    /// sur ce qui prétend jouer.
+    #[test]
+    fn seul_playing_peut_etre_figee() {
+        for etat in [PlayState::Stopped, PlayState::Paused] {
+            assert!(
+                !zone_figee(
+                    &zone(etat, "local", Some(Duration::from_secs(7200))),
+                    DIX_MINUTES
+                ),
+                "{etat:?} ne doit jamais être déclaré figé"
+            );
+        }
+    }
+
+    /// La chaîne complète, par la porte de production : le sondeur observe une
+    /// avance, elle est HORODATÉE, et c'est cet horodatage que le prédicat
+    /// lit. Sans le stampage dans `update_position`, ce test ne voit rien
+    /// avancer.
+    #[tokio::test]
+    async fn une_avance_observee_horodate_la_zone() {
+        let pm = super::PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        assert!(
+            pm.get_state(12).await.derniere_avance_de_position.is_none(),
+            "une piste qui démarre n'a encore rien été vue avancer"
+        );
+        pm.update_position(12, 1_000).await;
+        assert!(
+            pm.get_state(12).await.derniere_avance_de_position.is_some(),
+            "l'unique observation de production doit horodater l'avance, \
+             sans quoi toute zone reste éternellement « jamais mesurée » et le \
+             fantôme de #3581 revient"
+        );
+    }
+
+    /// Une position RÉPÉTÉE n'est pas une avance. C'est exactement la forme du
+    /// fantôme : le sondeur peut continuer à lire, tant que rien ne bouge la
+    /// zone n'est pas vivante.
+    #[tokio::test]
+    async fn repeter_la_meme_position_n_est_pas_une_avance() {
+        let pm = super::PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        pm.update_position(12, 1_000).await;
+        let premier = pm.get_state(12).await.derniere_avance_de_position;
+        pm.update_position(12, 1_000).await;
+        assert_eq!(
+            pm.get_state(12).await.derniere_avance_de_position,
+            premier,
+            "réécrire la MÊME position ne doit pas rafraîchir l'horodatage"
+        );
+    }
+
+    /// Toute COMMANDE rouvre la question : après elle, plus rien n'a été
+    /// observé du flux qui repart.
+    #[tokio::test]
+    async fn une_commande_efface_la_mesure_d_avance() {
+        for geste in ["stop", "seek", "resume"] {
+            let pm = super::PlaybackManager::new();
+            pm.play(12, NowPlaying::default()).await;
+            pm.update_position(12, 1_000).await;
+            match geste {
+                "stop" => pm.stop(12).await,
+                "seek" => pm.seek(12, 90_000).await,
+                _ => {
+                    pm.pause(12).await;
+                    pm.resume(12).await;
+                }
+            }
+            assert!(
+                pm.get_state(12).await.derniere_avance_de_position.is_none(),
+                "après « {geste} », la mesure d'avance d'avant ne décrit plus rien"
+            );
+        }
     }
 }
