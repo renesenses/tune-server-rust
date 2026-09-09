@@ -14,6 +14,8 @@ pub mod decode;
 /// sur le décodage en cours, sans le coûter.
 pub mod decode_progress;
 pub mod dff;
+#[cfg(test)]
+mod dop_porteur_bout_en_bout;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;

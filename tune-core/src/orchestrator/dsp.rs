@@ -791,6 +791,7 @@ impl PlaybackOrchestrator {
     /// et reconstruisent ainsi `signal_path` depuis le profil EQ qui vient
     /// d'être persisté, au lieu de conserver l'instantané de la lecture (#1985).
     pub async fn apply_eq_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        let debut = std::time::Instant::now();
         let rapport = self.refresh_zone_eq_detaille(zone_id).await;
         let applique_a_chaud = rapport.applique();
         let mut chemin = if applique_a_chaud {
@@ -814,7 +815,13 @@ impl PlaybackOrchestrator {
             };
         }
 
-        self.journaliser_le_changement_d_eq(zone_id, &rapport, chemin);
+        // Arrete AVANT la journalisation, et c'est le point : ce qu'on chiffre
+        // est le cout de la BASCULE — relire la zone, batir la cascade, la
+        // poser derriere le mutex que la boucle audio relit a chaque paquet —,
+        // pas le cout de la trace qui la raconte. Passe ce point, plus rien ne
+        // touche le son.
+        let duree = debut.elapsed();
+        self.journaliser_le_changement_d_eq(zone_id, &rapport, chemin, duree);
 
         if let Some(ref bus) = self.event_bus {
             bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
@@ -850,6 +857,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         rapport: &RapportEqAChaud,
         chemin: &str,
+        duree: std::time::Duration,
     ) {
         let zone = ZoneRepo::with_backend(self.db.clone())
             .get(zone_id)
@@ -879,8 +887,52 @@ impl PlaybackOrchestrator {
             preamp_db_d = rapport.preamp_db_droite.unwrap_or(0.0),
             chemin,
             premier_echec = rapport.echec.map(EchecEqLocal::nom).unwrap_or("-"),
+            duree_ms = duree.as_micros() as f64 / 1000.0,
+            amortissement = %Self::amortissement_du_chemin(chemin),
             "eq_change_journal"
         );
+    }
+
+    /// Quel amortissement gouverne CETTE bascule — et le mot compte (#3479).
+    ///
+    /// Le 08/09/2026, Reivax66 écrit « maintenant ça fonctionne, il reste à
+    /// améliorer la réactivité ». Le tri du soir même a montré que trois
+    /// dossiers sans une ligne de code commune produisent cette phrase, et que
+    /// rien dans le journal ne permettait de choisir : `eq_change_journal`
+    /// nommait le chemin, jamais son coût ni ce qui le retenait.
+    ///
+    /// Or les deux chemins de [`Self::apply_eq_change`] ne sont pas amortis de
+    /// la même façon, et c'est une asymétrie DÉLIBÉRÉE que personne ne pouvait
+    /// lire depuis un export :
+    ///
+    /// | chemin | amortissement | pourquoi |
+    /// |---|---|---|
+    /// | `local_a_chaud` | **aucun** | l'`EqProcessor` vit derrière un mutex relu à chaque paquet : le remplacer est inaudible, donc chaque cran de curseur le refait, et c'est ce qui rend le geste « bouger un curseur en écoutant » possible (#1725) |
+    /// | `replay_programme` | anti-rebond + plancher | là, le flux est redémarré, la manœuvre est AUDIBLE : sans amortissement un curseur de 31 bandes produirait 31 coupures (#1710) |
+    /// | le reste | sans objet | rien n'a été programmé |
+    ///
+    /// Ce que ce champ permet de faire sur un simple export, et qu'il fallait
+    /// jusqu'ici le code sous les yeux pour établir : **un `local_a_chaud`
+    /// exclut le redémarrage de flux**, donc la famille #2102
+    /// (« chaque changement d'égaliseur coupe et relance le flux ») ; et il
+    /// exclut aussi #1725/#1710 (« l'égaliseur n'agit qu'à la piste
+    /// suivante »), puisque le mutex remplacé est celui que le paquet SUIVANT
+    /// relit. Les deux se lisaient déjà dans `chemin` — mais seulement pour qui
+    /// savait ce que `chemin` implique. Ici, c'est écrit.
+    ///
+    /// Les deux durées viennent des constantes réelles, jamais d'un littéral
+    /// recopié : une valeur qu'on change se lit aussitôt dans le journal, et un
+    /// amortissement qu'on retire disparaît de la ligne.
+    pub fn amortissement_du_chemin(chemin: &str) -> String {
+        match chemin {
+            "local_a_chaud" => "aucun".to_string(),
+            "replay_programme" => format!(
+                "anti_rebond_{}ms_plancher_{}ms",
+                Self::EQ_REPLAY_DEBOUNCE_MS,
+                Self::EQ_REPLAY_FLOOR_MS
+            ),
+            _ => "sans_objet".to_string(),
+        }
     }
 
     /// Faire prendre effet un changement d'égaliseur sur un chemin **non

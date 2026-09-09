@@ -98,6 +98,19 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"
+# Test-only (#3326, S2-a) : jouer le ROLE CLIENT du protocole Sendspin contre
+# notre propre point d'acces, sur une vraie connexion WebSocket. `axum` sait
+# accepter une connexion, pas en ouvrir une.
+tokio-tungstenite = "0.26"
+# Test-only : le repondeur Noise du temoin est ecrit DANS le fichier de test,
+# et non emprunte au code de production. Une secondeQ implementation du cote
+# client verifie la sequence au lieu de la recopier.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "default-resolver-crypto",
+    "std",
+] }
+base64 = "0.22"
 # Test-only : fabriquer des horodatages passés pour rejouer une machine restée
 # hors ligne (tests/licence_grace_visible.rs, #1999).
 chrono = { workspace = true }
@@ -115,6 +128,12 @@ image = { workspace = true }
 # temps-là pour de vrai (routes/library/artwork.rs, #2073). `test-util` n'entre
 # que dans les cibles de test : le binaire publié ne le compile pas.
 tokio = { workspace = true, features = ["test-util"] }
+
+# `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
+# point d'accès Sendspin doit être une cible déclarée pour être compilé.
+[[test]]
+name = "sendspin_point_d_acces_s2a"
+path = "tests/sendspin_point_d_acces_s2a.rs"
 
 [[test]]
 name = "server_contracts"
@@ -348,6 +367,20 @@ path = "tests/sources_trois_routes_i3226.rs"
 [[test]]
 name = "radio_adresse_pas_un_flux_3578"
 path = "tests/radio_adresse_pas_un_flux_3578.rs"
+
+# #3543 : l'annuaire du site sert dix entrees Radio Paradise pour sept canaux,
+# dont trois adresses de flux servies DEUX fois sous deux noms. Chaque entree
+# porte son bouton « + Ajouter a Tune », qui tombe sur `GET /radios/add` et
+# creait sans broncher un doublon dans la liste du testeur — `radio_stations`
+# n'a aucune contrainte d'unicite. Le temoin passe par la ROUTE MONTEE.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Pas de `required-features` : `add_from_web` ne sonde pas le flux, le banc
+# n'ouvre aucune connexion sortante et monte une base SQLite en memoire.
+[[test]]
+name = "radio_ajout_web_sans_doublon_3543"
+path = "tests/radio_ajout_web_sans_doublon_3543.rs"
 # #3383 : la bascule « désactiver la télémétrie » n'éteignait rien — la route
 # n'écrivait pas, et les sept gardes d'envoi ne lisaient que `TUNE_TELEMETRY`.
 # Le témoin passe par les ROUTES MONTÉES puis appelle les décisions de
@@ -378,6 +411,16 @@ path = "tests/dispositions_de_canaux_3322.rs"
 name = "sante_slimproto_i3462"
 path = "tests/sante_slimproto_i3462.rs"
 
+# #2718 — « plus de serveurs multimedia ». La fiche support et le rapport de
+# bogue decrivaient les zones jusqu'au modele du DAC et ne comptaient PAS les
+# serveurs multimedia : quatre tickets (61, 87, 97, 98) instruits sans jamais
+# pouvoir dire combien Tune en voyait. Le temoin passe par les ROUTES MONTEES.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+[[test]]
+name = "serveurs_multimedia_dans_la_fiche_2718"
+path = "tests/serveurs_multimedia_dans_la_fiche_2718.rs"
+
 # #3518 : « # Plays » et « Last Played », deux colonnes de la maquette V1 que
 # AUCUNE route de liste de pistes ne portait. La garde passe par le ROUTEUR
 # MONTE : un essai qui appellerait `plays_for_tracks` en direct resterait vert
@@ -387,6 +430,16 @@ path = "tests/sante_slimproto_i3462.rs"
 [[test]]
 name = "ecoutes_par_piste_3518"
 path = "tests/ecoutes_par_piste_3518.rs"
+
+# #3789 : les MEMES trois colonnes, mais sur `/library/search`, qui ne passait
+# par aucun des deux enrichissements. Meme discipline que #3518 — la garde
+# interroge la ROUTE MONTEE et lit la charge JSON reellement rendue, pas la
+# fonction qui la fabrique. `autotests = false` plus haut : sans cette cible,
+# le fichier ne serait JAMAIS compile, donc vert contre rien.
+[[test]]
+name = "recherche_pistes_enrichies_3789"
+path = "tests/recherche_pistes_enrichies_3789.rs"
+
 # #1361 — « Retour à l'album en cours » : la route qui dit quel album jouer
 # rouvrir, et chez qui. `autotests = false` plus haut : sans cette cible, le
 # fichier ne serait jamais compilé.

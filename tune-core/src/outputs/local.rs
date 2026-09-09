@@ -33,6 +33,29 @@ enum OpenFailure {
     DeviceGone,
     /// Another application holds the device exclusively.
     Busy,
+    /// Le backend a dit « indisponible » sans dire pourquoi.
+    ///
+    /// cpal 0.17.3 replie SIX errno distincts — `ENOENT`, `EPERM`, `ENODEV`,
+    /// `ENOTSUPP`, `EBUSY`, `EAGAIN` — sur un seul
+    /// `BuildStreamError::DeviceNotAvailable`
+    /// (`cpal-0.17.3/src/host/alsa/mod.rs:358-363`, et le même bloc à 458-463
+    /// pour l'énumération), dont le `Display` est toujours la même phrase :
+    /// « The requested device is no longer available. For example, it has been
+    /// unplugged. »
+    ///
+    /// Le motif est donc DÉTRUIT avant d'arriver ici : ni [`Self::DeviceGone`]
+    /// (`no such device`) ni [`Self::Busy`] (`busy` / `in use`) ne peuvent plus
+    /// être atteints sur ALSA, et le cas tombait dans [`Self::Unknown`], dont
+    /// la phrase — « le périphérique a refusé tous les formats proposés » —
+    /// accuse le FORMAT alors que le périphérique n'a jamais été ouvert et que
+    /// changer de format n'y changera rien.
+    ///
+    /// Mesuré sur le relevé de Belkadi Yacine (#3575) : DIX échecs, tous avec
+    /// cette phrase et pas un autre motif, sur un DAC que l'énumération
+    /// retrouvait à chaque tour (`local_audio_devices_enumerated count=6`, dix
+    /// fois en 43 min). Nommer l'ambiguïté vaut mieux que la trancher au
+    /// hasard.
+    IndisponibleMotifPerdu,
     /// Nothing matched — say so plainly rather than guess.
     Unknown,
 }
@@ -59,6 +82,12 @@ fn classify_open_failure(err: &str) -> OpenFailure {
         || e.contains("access denied")
     {
         OpenFailure::ServerUnreachable
+    } else if e.contains("no longer available") {
+        // La phrase de repli de cpal. Elle doit être testée AVANT les motifs
+        // fins : ceux-ci cherchent des mots que ce message ne porte pas, si
+        // bien que sans cette branche le cas le plus fréquent sur ALSA tombait
+        // dans `Unknown`.
+        OpenFailure::IndisponibleMotifPerdu
     } else if e.contains("no such device") || e.contains("no such file") {
         OpenFailure::DeviceGone
     } else if e.contains("busy") || e.contains("in use") {
@@ -81,6 +110,12 @@ impl OpenFailure {
                 "the device is gone — a USB DAC unplugged or powered off since it was selected"
             }
             Self::Busy => "the device is held exclusively by another application",
+            Self::IndisponibleMotifPerdu => {
+                "the backend collapsed the errno: cpal maps ENOENT/EPERM/ENODEV/EBUSY/EAGAIN \
+                 onto one `DeviceNotAvailable`, so the device is either GONE or already HELD \
+                 by an exclusive opener — including a previous stream of ours that has not \
+                 released the PCM yet — and cpal no longer says which"
+            }
             Self::Unknown => {
                 "the device refused every format offered — it may be unavailable or misconfigured"
             }
@@ -103,11 +138,107 @@ impl OpenFailure {
                 "un autre programme utilise déjà ce périphérique en exclusivité. \
                  Fermez-le, puis relancez la lecture"
             }
+            Self::IndisponibleMotifPerdu => {
+                "ce périphérique n'a pas pu être ouvert : il est soit débranché ou éteint, \
+                 soit déjà utilisé en exclusivité. Vérifiez qu'il est allumé et connecté, \
+                 fermez l'application qui l'utilise, puis relancez la lecture"
+            }
             Self::Unknown => {
                 "le périphérique a refusé tous les formats proposés. Choisissez une autre \
                  sortie dans les réglages de la zone"
             }
         }
+    }
+}
+
+/// Budget d'attente accordé au fil de lecture PRÉCÉDENT pour rendre le PCM.
+///
+/// `stop()` accepte déjà d'attendre 2 000 ms sa sortie, puis le DÉTACHE
+/// (`local_audio_stop_thread_detached`). Ce budget-ci s'ajoute à celui-là, et
+/// il est délibérément court : quelqu'un vient d'appuyer sur Lecture.
+pub(crate) const BUDGET_RELACHE_PERIPHERIQUE_MS: u64 = 1_500;
+
+/// Pas entre deux vérifications de la sentinelle du fil précédent.
+pub(crate) const PALIER_RELACHE_PERIPHERIQUE_MS: u64 = 50;
+
+/// Que faire quand notre PROPRE fil de lecture précédent n'a peut-être pas
+/// fini de rendre le périphérique.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelacheDuPeripherique {
+    /// Le fil précédent a rendu le PCM : ouvrir maintenant.
+    Libre,
+    /// Il le tient encore, et le budget n'est pas épuisé : repasser plus tard.
+    Attendre { apres_ms: u64 },
+    /// Il le tient encore, mais le budget est épuisé : ouvrir quand même, et
+    /// le DIRE. On n'ajoute pas une panne d'attente à une panne d'ouverture —
+    /// et l'ouverture peut très bien réussir, le fil détaché ayant pu rendre
+    /// le PCM entre deux réveils.
+    ForcerEtLeDire,
+}
+
+/// #3575 — le périphérique que Tune se prend à lui-même.
+///
+/// Depuis `ee4ec884` (« préférer le PCM matériel `hw:` au greffon qui accepte
+/// tout », 02/09/2026, première version publiée qui le porte : **v0.9.132**,
+/// mesuré par `git tag --contains`), une sortie locale Linux n'ouvre plus un
+/// greffon
+/// PARTAGEABLE (`sysdefault:`, `front:`, PipeWire) mais le PCM matériel
+/// `hw:CARD=…,DEV=…`, qui n'accepte **qu'un seul ouvreur**.
+///
+/// Le ticket dit « après la mise à jour 0.9.140 » : c'est la version que
+/// Belkadi Yacine exécutait, pas nécessairement celle qui a introduit le
+/// défaut. De quelle version il venait n'est pas mesuré, et rien ici ne le
+/// suppose.
+///
+/// Or `play_url` enchaîne `stop()` puis une ouverture 50 ms plus tard, et
+/// `stop()` ne garantit RIEN : il attend la sortie du fil précédent 2 000 ms,
+/// puis le détache s'il est encore là — « the thread will exit on its own once
+/// the blocking read returns », dit son propre commentaire. Ce fil détaché
+/// tient toujours le flux cpal, donc le PCM. Tant que le greffon était
+/// partageable le recouvrement passait inaperçu ; sur `hw:` il rend `EBUSY`,
+/// que cpal replie sur « The requested device is no longer available »
+/// ([`OpenFailure::IndisponibleMotifPerdu`]), et la zone s'arrête.
+///
+/// Relevé de Belkadi Yacine (#3575), **13 ouvertures instrumentées sur 13, zéro
+/// contre-exemple** : les DIX échecs portent `device_default_sr=None` — la
+/// sonde `default_output_config()` avait déjà pris le refus sur le MÊME PCM
+/// quelques millisecondes plus tôt — et les TROIS réussites portent une cadence
+/// par défaut réellement lue. Le processus sain
+/// rejoue d'ailleurs l'échec à 12:14:38, 2,7 s après avoir ouvert le même
+/// `alsa:hw:CARD=2,DEV=0`, puis réussit à 12:15:00 : ce n'est ni un
+/// périphérique mort ni un renommage, c'est un RECOUVREMENT.
+///
+/// L'attente n'est accordée que si l'on peut NOMMER le teneur — notre propre
+/// fil. Contre un périphérique réellement débranché, ou tenu par un autre
+/// programme, attendre ne ferait que retarder le message.
+pub(crate) fn decider_la_relache_du_peripherique(
+    fil_precedent_encore_vivant: bool,
+    attendu_ms: u64,
+    budget_ms: u64,
+) -> RelacheDuPeripherique {
+    if !fil_precedent_encore_vivant {
+        return RelacheDuPeripherique::Libre;
+    }
+    if attendu_ms >= budget_ms {
+        return RelacheDuPeripherique::ForcerEtLeDire;
+    }
+    RelacheDuPeripherique::Attendre {
+        apres_ms: PALIER_RELACHE_PERIPHERIQUE_MS.min(budget_ms - attendu_ms),
+    }
+}
+
+/// Dit « ce fil vit encore » aussi longtemps qu'il existe.
+///
+/// Déclarée en PREMIER dans le fil de lecture, elle est donc détruite en
+/// DERNIER : la sentinelle ne retombe qu'après le `Drop` du flux cpal, c'est-
+/// à-dire après la fermeture effective du PCM. L'ordre est ce qui fait la
+/// preuve — une sentinelle qui retomberait avant le flux annoncerait un
+/// périphérique libre qui ne l'est pas.
+pub(crate) struct SentinelleDuFilDeLecture(pub(crate) Arc<AtomicBool>);
+
+impl Drop for SentinelleDuFilDeLecture {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1884,6 +2015,13 @@ pub struct LocalOutput {
     stop_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// Handle to the playback thread so `stop()` can wait for it to exit.
     play_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Vrai tant que le DERNIER fil de lecture lancé n'a pas rendu son flux
+    /// cpal — donc tant qu'il peut tenir le PCM exclusif (#3575).
+    ///
+    /// `play_thread` ne répond pas à cette question : `stop()` le `take()` puis
+    /// DÉTACHE le fil quand il déborde des 2 000 ms, et le handle disparaît
+    /// alors qu'un flux cpal bien vivant tient encore `hw:CARD=…`.
+    sentinelle_du_fil: std::sync::Mutex<Option<Arc<AtomicBool>>>,
     /// When true (and on macOS), use CoreAudio exclusive/hog mode for
     /// bit-perfect output, bypassing the system mixer.
     exclusive_mode: bool,
@@ -2224,6 +2362,7 @@ impl LocalOutput {
             track_artist: Arc::new(std::sync::Mutex::new(None)),
             stop_tx: std::sync::Mutex::new(None),
             play_thread: std::sync::Mutex::new(None),
+            sentinelle_du_fil: std::sync::Mutex::new(None),
             exclusive_mode,
             audio_backend: audio_backend.to_string(),
             play_generation: Arc::new(AtomicU64::new(0)),
@@ -4791,8 +4930,61 @@ impl OutputTarget for LocalOutput {
             };
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
+        // #3575 — sur Linux le PCM ouvert est `hw:CARD=…` depuis `ee4ec884` :
+        // EXCLUSIF. Dormir 50 ms en espérant que le fil précédent ait fini
+        // n'était pas une mesure, c'était un pari — et `stop()` vient
+        // peut-être de le DÉTACHER sans qu'il ait rendu quoi que ce soit.
+        // On demande donc à sa sentinelle, au lieu de le supposer.
         #[cfg(not(target_os = "windows"))]
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        {
+            let sentinelle = self.sentinelle_du_fil.lock().unwrap().clone();
+            let mut attendu_ms: u64 = 0;
+            loop {
+                let vivant = sentinelle
+                    .as_ref()
+                    .is_some_and(|s| s.load(Ordering::SeqCst));
+                match decider_la_relache_du_peripherique(
+                    vivant,
+                    attendu_ms,
+                    BUDGET_RELACHE_PERIPHERIQUE_MS,
+                ) {
+                    RelacheDuPeripherique::Libre => {
+                        if attendu_ms > 0 {
+                            info!(
+                                device = %self.device_name,
+                                attendu_ms,
+                                "local_audio_peripherique_relache_par_le_fil_precedent"
+                            );
+                        }
+                        break;
+                    }
+                    RelacheDuPeripherique::Attendre { apres_ms } => {
+                        if attendu_ms == 0 {
+                            warn!(
+                                device = %self.device_name,
+                                budget_ms = BUDGET_RELACHE_PERIPHERIQUE_MS,
+                                "local_audio_peripherique_encore_tenu_par_le_fil_precedent"
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(apres_ms)).await;
+                        attendu_ms += apres_ms;
+                    }
+                    RelacheDuPeripherique::ForcerEtLeDire => {
+                        warn!(
+                            device = %self.device_name,
+                            attendu_ms,
+                            "local_audio_ouverture_forcee_le_fil_precedent_tient_encore"
+                        );
+                        break;
+                    }
+                }
+            }
+            // Le repos que l'ancien sommeil accordait au sous-système audio
+            // reste dû : ALSA/CoreAudio veulent quelques dizaines de ms entre
+            // la fermeture et la réouverture, sans quoi les premières trames
+            // portent le résidu de la session précédente.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         // Create a FRESH force_silent flag for the new stream.
         // The old stream's callback keeps its clone of the previous Arc
@@ -4895,7 +5087,16 @@ impl OutputTarget for LocalOutput {
         // calling play_url(), and resetting would wipe the known duration.
         // It is cleared in stop() instead.
 
+        // Armée avant le `spawn` pour qu'aucune fenêtre ne s'ouvre entre la
+        // publication de la sentinelle et le démarrage effectif du fil : un
+        // `play_url` concurrent doit voir « vivant » dès maintenant.
+        let sentinelle_vivante = Arc::new(AtomicBool::new(true));
+        *self.sentinelle_du_fil.lock().unwrap() = Some(sentinelle_vivante.clone());
         let handle = std::thread::spawn(move || {
+            // PREMIÈRE déclaration du fil, donc DERNIÈRE détruite : la
+            // sentinelle ne retombe qu'après le `Drop` du flux cpal, c'est-à-
+            // dire après la fermeture effective du PCM (#3575).
+            let _sentinelle_du_fil = SentinelleDuFilDeLecture(sentinelle_vivante);
             // ------- HTTP fetch the audio stream -------
             // No total timeout — long tracks can stream for 30+ minutes.
             // The force_silent flag is checked at every loop iteration and
@@ -5066,7 +5267,29 @@ impl OutputTarget for LocalOutput {
                 // Same rationale as the WAV path: opening at the source
                 // rate in shared mode is unreliable on macOS/Windows.
                 let output_config = {
-                    let default_cfg = device.default_output_config().ok().map(|c| c.config());
+                    let default_cfg = match device.default_output_config() {
+                        Ok(c) => Some(c.config()),
+                        Err(e) => {
+                            // #3575 — `device_default_sr=None` était une ABSENCE, et
+                            // une absence ne prouve rien : elle se lisait « ce
+                            // périphérique n'annonce pas de cadence par défaut »
+                            // alors qu'elle veut dire « on vient d'échouer à
+                            // l'ouvrir ». Sur ALSA cette sonde ouvre le MÊME PCM que
+                            // la lecture (`cpal-0.17.3/src/host/alsa/mod.rs:457`) :
+                            // son échec EST le premier `EBUSY`, quelques
+                            // millisecondes avant celui qui arrêtera la zone.
+                            //
+                            // Relevé de Belkadi Yacine, 13 ouvertures sur 13 :
+                            // `None` sur les DIX échecs, une cadence réellement lue
+                            // sur les TROIS réussites. La ligne, elle, manquait.
+                            warn!(
+                                device = %device_name,
+                                error = %e,
+                                "local_audio_default_config_probe_failed"
+                            );
+                            None
+                        }
+                    };
                     let default_sr = default_cfg.as_ref().map(|c| c.sample_rate);
                     if default_sr == Some(dec_sr) {
                         default_cfg.unwrap()
@@ -6663,7 +6886,29 @@ impl OutputTarget for LocalOutput {
             let output_config = {
                 // First, get the device's default config (reflects actual
                 // operating rate on most platforms).
-                let default_cfg = device.default_output_config().ok().map(|c| c.config());
+                let default_cfg = match device.default_output_config() {
+                    Ok(c) => Some(c.config()),
+                    Err(e) => {
+                        // #3575 — `device_default_sr=None` était une ABSENCE, et
+                        // une absence ne prouve rien : elle se lisait « ce
+                        // périphérique n'annonce pas de cadence par défaut »
+                        // alors qu'elle veut dire « on vient d'échouer à
+                        // l'ouvrir ». Sur ALSA cette sonde ouvre le MÊME PCM que
+                        // la lecture (`cpal-0.17.3/src/host/alsa/mod.rs:457`) :
+                        // son échec EST le premier `EBUSY`, quelques
+                        // millisecondes avant celui qui arrêtera la zone.
+                        //
+                        // Relevé de Belkadi Yacine, 13 ouvertures sur 13 :
+                        // `None` sur les DIX échecs, une cadence réellement lue
+                        // sur les TROIS réussites. La ligne, elle, manquait.
+                        warn!(
+                            device = %device_name,
+                            error = %e,
+                            "local_audio_default_config_probe_failed"
+                        );
+                        None
+                    }
+                };
                 let default_sr = default_cfg.as_ref().map(|c| c.sample_rate);
 
                 // Ce que l'énumération de cpal RÉPOND. Le filtre est
@@ -8259,7 +8504,25 @@ impl OutputTarget for LocalOutput {
                         // Detach — force_silent keeps the old callback silent
                         // so there is no audible overlap; the thread will exit
                         // on its own once the blocking read returns.
-                        debug!("local_audio_stop_thread_detached — old stream exits in background");
+                        //
+                        // #3575 — cette ligne était en `debug!`, donc INVISIBLE
+                        // de tout relevé de terrain : les exports de journaux
+                        // de Belkadi Yacine ne portent que de l'INFO et
+                        // au-dessus (854 INFO, 59 WARN, 2 ERROR, ZÉRO debug).
+                        // Son absence ne prouvait donc RIEN, et c'est pourtant
+                        // elle qui départage les deux histoires : un fil
+                        // détaché tient toujours le flux cpal, donc le PCM
+                        // `hw:` EXCLUSIF, et la lecture suivante prend `EBUSY`
+                        // — que cpal replie sur « no longer available ».
+                        //
+                        // Elle passe en `warn!` : détacher un fil de lecture
+                        // n'est pas un événement de routine, c'est le renoncement
+                        // à une garantie.
+                        warn!(
+                            attente_ms = 2000,
+                            "local_audio_stop_thread_detached — le fil de lecture précédent \
+                             n'a pas rendu la main : il tient peut-être encore le périphérique"
+                        );
                         return;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -9470,6 +9733,14 @@ mod tests;
 
 #[cfg(test)]
 mod open_failure_tests;
+/// #3575 — le PCM exclusif que Tune se prend a lui-meme.
+///
+/// Les fonctions eprouvees ici sont PURES et compilees sur toutes les cibles :
+/// la decision d ouverture est sortie du fil `std::thread::spawn` justement
+/// pour cela. La sentinelle, elle, est eprouvee sur son ORDRE de destruction,
+/// qui est tout son contrat.
+#[cfg(test)]
+mod relache_peripherique_i3575;
 
 /// #3270 — « la piste ne joue pas, et rien ne le dit ».
 ///

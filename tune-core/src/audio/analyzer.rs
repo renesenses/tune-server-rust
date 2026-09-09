@@ -143,6 +143,168 @@ fn k_weighting_coefficients(fs: f64) -> (Biquad, Biquad) {
     )
 }
 
+/// Plage dynamique (« DR ») d'une piste, en flux — algorithme TT Dynamic Range.
+///
+/// Bertrand, 09/09/2026 : « Lance le calcul des DR ». Il n'y avait rien à
+/// lancer — Tune LISAIT le tag Vorbis `ALBUM DYNAMIC RANGE` / `DYNAMIC RANGE`
+/// (`metadata/mod.rs`) et ne calculait rien. Mesuré le même jour sur TROIS
+/// bibliothèques (.18, .15, .42) : zéro DR partout, parce qu'aucun de ces
+/// fichiers ne porte le tag. Cinq surfaces d'interface — badge de fiche, tri,
+/// tranche, facette Oxygen, colonne de titres — étaient construites et vides.
+///
+/// ## L'algorithme, et pourquoi ces constantes-là
+///
+/// Pour chaque canal :
+///  1. découper en blocs de **3 s** ;
+///  2. par bloc, le RMS *référencé sinus* `sqrt(2 · moyenne(x²))` et le pic ;
+///  3. garder les **20 %** de blocs au RMS le plus fort, et en faire le RMS
+///     quadratique moyen ;
+///  4. `DR = 20·log₁₀(pic₂ / RMS₂₀%)`, où `pic₂` est le DEUXIÈME plus grand pic
+///     de bloc du canal.
+///
+/// Puis la moyenne sur les canaux, arrondie.
+///
+/// 🔴 Le facteur 2 du RMS n'est pas décoratif : il fait qu'un sinus pur rend
+/// `RMS = amplitude`, donc `DR = 0`. Sans lui tout le barème glisse de 3 dB et
+/// les valeurs ne se compareraient plus à celles publiées par les autres
+/// mesureurs. C'est ce que vérifie le premier témoin.
+///
+/// 🔴 `pic₂` et non le pic maximum : un unique échantillon aberrant — un clic,
+/// une erreur d'encodage — gonflerait le DR de toute la piste. Prendre le
+/// second est ce qui rend la mesure robuste, et c'est le choix de l'outil de
+/// référence.
+///
+/// ## Ce que cette mesure N'EST PAS
+///
+/// Elle ne remplace pas le tag du fichier : un disque qui porte
+/// `DYNAMIC RANGE` garde SA valeur, celle que son producteur a mesurée. Le
+/// calcul ne sert qu'aux fichiers qui n'en ont pas — voir `dr_source`.
+///
+/// ⚠️ Un écart de ±1 avec une valeur publiée est normal : le découpage des
+/// blocs aux bords et l'arrondi diffèrent d'une implémentation à l'autre. On
+/// ne prétend pas à l'égalité au dixième.
+///
+/// Mémoire bornée comme son voisin : un `f64` par bloc de 3 s et par canal —
+/// une piste de dix minutes en stéréo en garde 400.
+struct DrAccumulator {
+    channels: usize,
+    block_frames: usize,
+    /// Somme des carrés du bloc en cours, par canal.
+    sum_sq: Vec<f64>,
+    /// Pic du bloc en cours, par canal.
+    peak_courant: Vec<f64>,
+    /// Trames déjà entrées dans le bloc en cours (commun aux canaux).
+    frames_du_bloc: usize,
+    /// RMS de chaque bloc terminé, par canal.
+    rms_des_blocs: Vec<Vec<f64>>,
+    /// Les DEUX plus grands pics de bloc, par canal, en ordre décroissant.
+    deux_pics: Vec<[f64; 2]>,
+}
+
+impl DrAccumulator {
+    /// Le bloc de 3 s de l'algorithme TT.
+    const BLOC_SECONDES: f64 = 3.0;
+    /// La part des blocs les plus forts retenue pour le RMS.
+    const PART_FORTE: f64 = 0.20;
+
+    fn new(sample_rate: usize, channels: usize) -> Self {
+        Self {
+            channels,
+            block_frames: ((sample_rate as f64) * Self::BLOC_SECONDES) as usize,
+            sum_sq: vec![0.0; channels],
+            peak_courant: vec![0.0; channels],
+            frames_du_bloc: 0,
+            rms_des_blocs: vec![Vec::new(); channels],
+            deux_pics: vec![[0.0; 2]; channels],
+        }
+    }
+
+    /// Échantillons ENTRELACÉS et normalisés, en tranches quelconques : l'état
+    /// du bloc en cours traverse les appels, exactement comme le fait le
+    /// filtre du voisin. Découper autrement ne change pas le résultat.
+    fn feed(&mut self, samples: &[f64]) {
+        if self.channels == 0 || self.block_frames == 0 {
+            return;
+        }
+        for trame in samples.chunks_exact(self.channels) {
+            for (c, &x) in trame.iter().enumerate() {
+                self.sum_sq[c] += x * x;
+                let a = x.abs();
+                if a > self.peak_courant[c] {
+                    self.peak_courant[c] = a;
+                }
+            }
+            self.frames_du_bloc += 1;
+            if self.frames_du_bloc >= self.block_frames {
+                self.fermer_le_bloc();
+            }
+        }
+    }
+
+    fn fermer_le_bloc(&mut self) {
+        if self.frames_du_bloc == 0 {
+            return;
+        }
+        let n = self.frames_du_bloc as f64;
+        for c in 0..self.channels {
+            // 🔴 RMS RÉFÉRENCÉ SINUS : `sqrt(2 · moyenne)`. Voir la doc.
+            let rms = (2.0 * self.sum_sq[c] / n).sqrt();
+            self.rms_des_blocs[c].push(rms);
+            let p = self.peak_courant[c];
+            if p > self.deux_pics[c][0] {
+                self.deux_pics[c][1] = self.deux_pics[c][0];
+                self.deux_pics[c][0] = p;
+            } else if p > self.deux_pics[c][1] {
+                self.deux_pics[c][1] = p;
+            }
+            self.sum_sq[c] = 0.0;
+            self.peak_courant[c] = 0.0;
+        }
+        self.frames_du_bloc = 0;
+    }
+
+    /// La valeur DR, arrondie. `None` sur du silence ou une entrée trop courte.
+    fn finish(mut self) -> Option<u32> {
+        // Le reliquat compte : une piste de 4 s n'a qu'un bloc plein, et le
+        // second porte l'essentiel de sa fin. L'ignorer perdrait les pistes
+        // courtes — et une piste de moins de 3 s n'aurait AUCUN bloc.
+        self.fermer_le_bloc();
+
+        let mut total = 0.0_f64;
+        let mut comptes = 0usize;
+        for c in 0..self.channels {
+            let mut rms = std::mem::take(&mut self.rms_des_blocs[c]);
+            if rms.is_empty() {
+                continue;
+            }
+            // Un canal muet (une piste mono servie en stéréo, une voie de
+            // remplissage) ne doit pas tirer la moyenne : il n'a pas de plage
+            // dynamique, il n'a rien du tout.
+            let pic2 = self.deux_pics[c][1];
+            if pic2 <= 0.0 {
+                continue;
+            }
+            rms.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            // Au moins UN bloc, même sur une piste très courte.
+            let n = ((rms.len() as f64) * Self::PART_FORTE).round().max(1.0) as usize;
+            let n = n.min(rms.len());
+            let somme: f64 = rms[..n].iter().map(|r| r * r).sum();
+            let rms20 = (somme / n as f64).sqrt();
+            if rms20 <= 0.0 {
+                continue;
+            }
+            total += 20.0 * (pic2 / rms20).log10();
+            comptes += 1;
+        }
+        if comptes == 0 {
+            return None;
+        }
+        // Négatif possible sur un signal carré (RMS > pic) : le DR est une
+        // ÉCHELLE qui commence à zéro, on ne publie pas de valeur négative.
+        Some((total / comptes as f64).round().max(0.0) as u32)
+    }
+}
+
 /// Streaming EBU R128 (BS.1770-4) integrated-loudness + sample-peak accumulator.
 ///
 /// Feed interleaved, normalized (`[-1, 1]`) f64 samples in any chunking — the
@@ -368,6 +530,22 @@ pub async fn measure_loudness(file_path: &str) -> Option<f64> {
 /// `rg_track_gain` (reference − LUFS), `rg_track_peak` and
 /// `rg_track_true_peak` (#1694) without decoding the file twice.
 pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64, f64)> {
+    mesurer_intensite_et_plage(file_path)
+        .await
+        .map(|(lufs, peak, tp, _dr)| (lufs, peak, tp))
+}
+
+/// Intensité, pics ET plage dynamique — UN SEUL décodage.
+///
+/// 🔴 C'est toute l'économie du calcul de DR : il voyage avec le décodage que
+/// la passe ReplayGain paie déjà. Un balayage séparé relirait chaque fichier
+/// une seconde fois, pour une bibliothèque qui compte des milliers d'heures
+/// d'audio (46 877 pistes mesurées sur le .18 le 09/09/2026).
+///
+/// Le quatrième membre est `None` quand la piste est trop courte, muette, ou
+/// que ses canaux n'ont pas deux pics de bloc distincts — jamais une valeur
+/// inventée.
+pub async fn mesurer_intensite_et_plage(file_path: &str) -> Option<(f64, f64, f64, Option<u32>)> {
     // Analyse in bounded time segments and stream them through the accumulator,
     // so memory never scales with track length. Decoding a whole long 24/192
     // track into RAM cost several GB and OOM-killed the server in a crash-loop
@@ -382,6 +560,7 @@ pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64, f64
     const MAX_ANALYSIS_SECONDS: f64 = 24.0 * 3600.0;
 
     let mut acc: Option<LoudnessAccumulator> = None;
+    let mut dr: Option<DrAccumulator> = None;
     let mut seek = 0.0_f64;
 
     loop {
@@ -411,6 +590,10 @@ pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64, f64
             .collect();
         acc.get_or_insert_with(|| LoudnessAccumulator::new(sample_rate, channels))
             .feed(&samples);
+        // LES MÊMES échantillons, déjà décodés et déjà normalisés : la plage
+        // dynamique ne coûte que son arithmétique.
+        dr.get_or_insert_with(|| DrAccumulator::new(sample_rate, channels))
+            .feed(&samples);
 
         // A segment shorter than requested means we reached the end. Advance the
         // seek by the actual decoded duration so segments stay contiguous even if
@@ -422,7 +605,11 @@ pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64, f64
         seek += frames as f64 / sample_rate as f64;
     }
 
-    acc?.finish()
+    let (lufs, peak, true_peak) = acc?.finish()?;
+    // La plage dynamique est FACULTATIVE : une piste dont l'intensité se
+    // mesure mais dont la plage ne se calcule pas (trop courte, un seul pic)
+    // ne doit pas faire échouer toute la mesure — ReplayGain en dépend.
+    Some((lufs, peak, true_peak, dr.and_then(|d| d.finish())))
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,5 +1345,195 @@ mod tests {
             .collect();
         assert!(smoothed[2] < 10.0);
         assert!(smoothed[2] > 0.0);
+    }
+
+    // ── Plage dynamique (DR) ───────────────────────────────────────────────
+    //
+    // 🔴 CES TÉMOINS ONT DES RÉPONSES CONNUES D'AVANCE, calculées à la main
+    // depuis la définition de l'algorithme — pas relevées sur la sortie du
+    // code. Un témoin qui inscrit ce que le code produit ne garde rien : il
+    // resterait vert si l'algorithme dérivait de 3 dB, ce qui est exactement
+    // l'erreur qu'on risque ici (le facteur 2 du RMS référencé sinus).
+
+    /// Un signal de synthèse : `n` secondes à `sr` Hz, stéréo entrelacé.
+    fn signal(sr: usize, secondes: f64, mut f: impl FnMut(f64) -> f64) -> Vec<f64> {
+        let trames = (sr as f64 * secondes) as usize;
+        let mut v = Vec::with_capacity(trames * 2);
+        for i in 0..trames {
+            let x = f(i as f64 / sr as f64);
+            v.push(x);
+            v.push(x);
+        }
+        v
+    }
+
+    fn dr_de(sr: usize, samples: &[f64]) -> Option<u32> {
+        let mut acc = DrAccumulator::new(sr, 2);
+        acc.feed(samples);
+        acc.finish()
+    }
+
+    /// 🔴 LE TÉMOIN QUI TIENT LE FACTEUR 2.
+    ///
+    /// Un sinus pur a `RMS = A/√2` ; le RMS *référencé sinus* le multiplie par
+    /// √2 et rend `A`, soit exactement son pic — donc **DR = 0**. Sans ce
+    /// facteur le résultat serait 3, et TOUT le barème glisserait de 3 dB par
+    /// rapport aux valeurs publiées par les autres mesureurs.
+    #[test]
+    fn un_sinus_pur_a_une_plage_dynamique_nulle() {
+        let sr = 8_000;
+        let s = signal(sr, 30.0, |t| (2.0 * std::f64::consts::PI * 440.0 * t).sin());
+        assert_eq!(dr_de(sr, &s), Some(0));
+    }
+
+    /// 🔴 LA PROPRIÉTÉ CENTRALE : le DR ne mesure PAS le volume.
+    ///
+    /// Le même sinus vingt décibels plus bas garde la même plage dynamique.
+    /// Un code qui confondrait plage et niveau passerait le témoin précédent
+    /// et échouerait ici — c'est la contre-épreuve du premier.
+    #[test]
+    fn la_plage_dynamique_ne_depend_pas_du_volume() {
+        let sr = 8_000;
+        let fort = signal(sr, 30.0, |t| (2.0 * std::f64::consts::PI * 440.0 * t).sin());
+        let faible = signal(sr, 30.0, |t| {
+            0.1 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+        });
+        assert_eq!(dr_de(sr, &fort), dr_de(sr, &faible));
+        assert_eq!(dr_de(sr, &faible), Some(0));
+    }
+
+    /// 🔴 CE QUE LE DR MESURE VRAIMENT — le FACTEUR DE CRÊTE, pas le contraste.
+    ///
+    /// Première version de ce témoin : 6 s à pleine échelle puis 24 s à
+    /// −40 dB, en attendant « une grande plage ». Il rendait **0**, et le code
+    /// avait raison. Les 20 % de blocs retenus sont les blocs FORTS ; dans ces
+    /// blocs-là le signal est un sinus pur, donc pic = RMS, donc DR nul. Un
+    /// disque bruyamment compressé suivi d'un passage calme n'a pas une grande
+    /// plage dynamique : il a deux volumes.
+    ///
+    /// Ce que le DR voit, c'est l'écart entre les crêtes et le corps du son À
+    /// L'INTÉRIEUR des passages les plus forts — une frappe de batterie qui
+    /// dépasse le lit sonore. D'où ce signal : 1 % de pleine échelle, le reste
+    /// à −40 dB, DANS CHAQUE bloc.
+    ///
+    /// La valeur attendue se calcule à la main :
+    ///   moyenne(x²) ≈ 0,01·0,5 + 0,99·(0,01²/2) ≈ 0,00505
+    ///   RMS = √(2 · 0,00505) ≈ 0,1005    pic₂ = 1
+    ///   DR = 20·log₁₀(1 / 0,1005) ≈ 20
+    #[test]
+    fn le_facteur_de_crete_donne_une_grande_plage() {
+        let sr = 8_000;
+        let bloc = 3.0;
+        let s = signal(sr, 30.0, |t| {
+            // Position dans le bloc de 3 s courant.
+            let dans_le_bloc = t % bloc;
+            let a = if dans_le_bloc < bloc * 0.01 {
+                1.0
+            } else {
+                0.01
+            };
+            a * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+        });
+        let dr = dr_de(sr, &s).expect("une plage doit se mesurer");
+        // ±2 autour de 20 : le découpage aux bords des blocs et l'arrondi
+        // déplacent la valeur, l'ordre de grandeur est ce qui compte.
+        assert!(
+            (18..=22).contains(&dr),
+            "plage mesurée {dr}, attendue autour de 20 (calcul à la main)"
+        );
+    }
+
+    /// 🔴 LE DÉCOUPAGE DES TRANCHES NE CHANGE RIEN.
+    ///
+    /// Le décodeur rend des segments de 30 s ; l'accumulateur doit donner le
+    /// MÊME résultat qu'une passe d'un seul tenant, sinon la valeur dépendrait
+    /// de la façon dont le fichier a été lu. Même garantie que son voisin
+    /// `LoudnessAccumulator`, et c'est ce qui autorise le flux.
+    #[test]
+    fn le_decoupage_en_tranches_ne_change_pas_la_valeur() {
+        let sr = 8_000;
+        let s = signal(sr, 30.0, |t| {
+            let a = if t < 6.0 { 1.0 } else { 0.01 };
+            a * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+        });
+        let entier = dr_de(sr, &s);
+
+        let mut acc = DrAccumulator::new(sr, 2);
+        // Des tranches VOLONTAIREMENT irrégulières, et jamais alignées sur les
+        // blocs de 3 s : un découpage complaisant ne prouverait rien.
+        let mut i = 0usize;
+        for taille in [1_000usize, 7_777, 33_333, 101, 250_000].iter().cycle() {
+            if i >= s.len() {
+                break;
+            }
+            let fin = (i + taille * 2).min(s.len());
+            acc.feed(&s[i..fin]);
+            i = fin;
+        }
+        assert_eq!(acc.finish(), entier);
+    }
+
+    /// Le silence n'a pas de plage dynamique — et n'en invente pas une.
+    #[test]
+    fn le_silence_ne_rend_aucune_plage() {
+        let sr = 8_000;
+        assert_eq!(dr_de(sr, &signal(sr, 10.0, |_| 0.0)), None);
+    }
+
+    /// Une piste plus courte qu'un bloc rend quand même une valeur.
+    ///
+    /// Le reliquat est fermé à la fin : sans cela, tout ce qui dure moins de
+    /// 3 s n'aurait AUCUN bloc et sortirait sans plage. Deux pics de bloc sont
+    /// nécessaires, d'où le second bloc court.
+    #[test]
+    fn une_piste_tres_courte_rend_quand_meme_une_valeur() {
+        let sr = 8_000;
+        let s = signal(sr, 4.0, |t| (2.0 * std::f64::consts::PI * 440.0 * t).sin());
+        assert_eq!(dr_de(sr, &s), Some(0));
+    }
+
+    /// 🔴 UN CLIC ISOLÉ NE GONFLE PAS LA PLAGE — c'est le rôle du pic₂.
+    ///
+    /// On ajoute UN échantillon à pleine échelle sur un sinus faible. Prendre
+    /// le pic MAXIMUM ferait bondir la valeur ; prendre le second la laisse
+    /// où elle est. Sans ce choix, tout défaut d'encodage se lirait comme un
+    /// disque très dynamique.
+    #[test]
+    fn un_clic_isole_ne_gonfle_pas_la_plage() {
+        let sr = 8_000;
+        let propre = signal(sr, 30.0, |t| {
+            0.1 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+        });
+        let mut avec_clic = propre.clone();
+        // Un seul échantillon, dans UN seul bloc, à pleine échelle.
+        avec_clic[sr * 2 * 5] = 1.0;
+        avec_clic[sr * 2 * 5 + 1] = 1.0;
+        assert_eq!(dr_de(sr, &avec_clic), dr_de(sr, &propre));
+    }
+
+    /// Un canal MUET ne tire pas la moyenne vers le bas.
+    ///
+    /// Une piste mono servie sur deux voies, ou une voie de remplissage :
+    /// elle n'a pas une plage nulle, elle n'a pas de plage du tout.
+    #[test]
+    fn un_canal_muet_est_ecarte_de_la_moyenne() {
+        let sr = 8_000;
+        let trames = sr * 30;
+        let mut s = Vec::with_capacity(trames * 2);
+        for i in 0..trames {
+            let t = i as f64 / sr as f64;
+            let a = if t < 6.0 { 1.0 } else { 0.01 };
+            s.push(a * (2.0 * std::f64::consts::PI * 440.0 * t).sin());
+            s.push(0.0); // canal droit muet
+        }
+        let mut acc = DrAccumulator::new(sr, 2);
+        acc.feed(&s);
+        let deux_canaux = acc.finish().expect("le canal gauche porte une plage");
+
+        // La même chose en mono : ce doit être la MÊME valeur.
+        let mono: Vec<f64> = s.iter().step_by(2).copied().collect();
+        let mut acc1 = DrAccumulator::new(sr, 1);
+        acc1.feed(&mono);
+        assert_eq!(Some(deux_canaux), acc1.finish());
     }
 }

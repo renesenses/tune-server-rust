@@ -31,6 +31,30 @@ pub const REFERENCE_LUFS: f64 = -18.0;
 /// never monopolises the CPU on a big library — it chips away over time.
 const TRACK_BATCH: usize = 25;
 
+/// Provenance d'un `dr_track` CALCULÉ par cette passe, par opposition à celui
+/// lu dans les tags du fichier au scan. Voir l'écriture dans
+/// `analyze_track_batch`.
+const DR_SOURCE_ANALYSIS: &str = "analysis";
+
+/// La plage calculée a-t-elle le droit de s'écrire ?
+///
+/// 🔴 LE TAG DU FICHIER FAIT FOI. `dr_track` a DEUX producteurs : le scan, qui
+/// lit `DYNAMIC RANGE` dans le fichier (`metadata/mod.rs`), et cette passe, qui
+/// le calcule. Le premier porte la valeur que le producteur du disque a
+/// mesurée ; la remplacer par une estimation perdrait une donnée d'origine.
+///
+/// ⚠️ Une valeur VIDE n'est pas une valeur. Un tag présent mais vide
+/// (`DYNAMIC RANGE=`) existe sur des fichiers mal étiquetés ; le traiter comme
+/// « déjà tagué » condamnerait ces pistes à n'avoir jamais de DR, ni lu ni
+/// calculé.
+///
+/// Fonction à part, et non un `if` dans la boucle : une garde écrite contre la
+/// boucle devrait monter une base, des fichiers et un décodeur pour juger deux
+/// lignes de condition. Ici elle APPELLE la décision.
+fn peut_ecrire_le_dr(existant: Option<&str>) -> bool {
+    !existant.is_some_and(|v| !v.trim().is_empty())
+}
+
 /// Pause between per-file analyses (each one fully decodes a track). Keeps the
 /// pass "nice": it must never compete with playback or make the machine hot.
 const PER_FILE_PAUSE_MS: u64 = 400;
@@ -601,7 +625,7 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
         // fichier monopolise le disque pendant des minutes.
         let measured = match mesurer_en_cedant_a_la_lecture(
             backend,
-            crate::audio::analyzer::measure_loudness_and_peak(&sur_disque),
+            crate::audio::analyzer::mesurer_intensite_et_plage(&sur_disque),
         )
         .await
         {
@@ -623,7 +647,7 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
             }
         };
         match measured {
-            Ok(Some((lufs, peak, true_peak))) => {
+            Ok(Some((lufs, peak, true_peak, plage))) => {
                 let gain = track_gain_db(lufs);
                 let _ = repo.set(track_id, "rg_track_gain", &format_gain(gain));
                 let _ = repo.set(track_id, "rg_track_peak", &format_peak(peak));
@@ -640,6 +664,38 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
                 // et « tags du fichier » affiché sur une mesure Tune serait un
                 // affichage inventé.
                 let _ = repo.set(track_id, TRACK_SOURCE_KEY, SOURCE_ANALYSIS);
+
+                // ── PLAGE DYNAMIQUE ──────────────────────────────────────
+                //
+                // Elle voyage avec ce décodage-ci : `mesurer_intensite_et_plage`
+                // la calcule sur les mêmes échantillons, donc elle ne coûte que
+                // son arithmétique. Un balayage séparé relirait chaque fichier
+                // une seconde fois — 46 877 pistes sur le .18, mesuré le
+                // 09/09/2026.
+                //
+                // 🔴 LE TAG DU FICHIER FAIT FOI, TOUJOURS. `dr_track` peut déjà
+                // porter la valeur lue dans `DYNAMIC RANGE` au scan
+                // (`metadata/mod.rs`) : c'est celle que le producteur du disque
+                // a mesurée, et l'écraser par la nôtre remplacerait une donnée
+                // d'origine par une estimation. On n'écrit QUE dans le vide.
+                //
+                // `dr_source` dit d'où vient ce qui est en base — même
+                // raisonnement que `TRACK_SOURCE_KEY` juste au-dessus : sans
+                // lui, une valeur calculée s'afficherait comme une valeur du
+                // disque, ce qui serait un affichage inventé.
+                if let Some(dr) = plage {
+                    // `get_all` : le dépôt n'expose pas de lecture d'UNE clé,
+                    // et la ligne est de toute façon déjà en cache après
+                    // l'écriture des gains juste au-dessus.
+                    let existant = repo
+                        .get_all(track_id)
+                        .ok()
+                        .and_then(|m| m.get("dr_track").cloned());
+                    if peut_ecrire_le_dr(existant.as_deref()) {
+                        let _ = repo.set(track_id, "dr_track", &dr.to_string());
+                        let _ = repo.set(track_id, "dr_source", DR_SOURCE_ANALYSIS);
+                    }
+                }
             }
             // Le fichier a disparu ENTRE la résolution et le décodage — un
             // partage qui tombe pendant la passe, exactement le scénario qui a
@@ -1429,6 +1485,7 @@ fn now_epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod registre_tests {
+    use super::peut_ecrire_le_dr;
     use std::sync::Arc;
 
     use crate::db::backend::DbBackend;
@@ -1441,6 +1498,52 @@ mod registre_tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         Arc::new(db)
+    }
+
+    // ── PLAGE DYNAMIQUE : le tag du fichier fait foi ──────────────────────
+
+    /// 🔴 UN DR LU DANS LE FICHIER N'EST JAMAIS ÉCRASÉ PAR LE CALCUL.
+    ///
+    /// Le tag porte la valeur que le producteur du disque a mesurée ; la
+    /// remplacer par notre estimation perdrait une donnée d'origine.
+    ///
+    /// Ce témoin APPELLE la décision. Une première version recopiait la
+    /// condition dans le test et l'affirmait sur elle-même — un `assert` qui
+    /// se prouvait tout seul, vert quoi que fasse le code.
+    #[test]
+    fn le_dr_du_fichier_prime_sur_le_dr_calcule() {
+        assert!(
+            !peut_ecrire_le_dr(Some("14")),
+            "le calcul écraserait le tag du fichier"
+        );
+        assert!(
+            !peut_ecrire_le_dr(Some("0")),
+            "DR 0 est une VRAIE valeur, pas une absence"
+        );
+    }
+
+    /// LA CONTRE-ÉPREUVE — sans elle, un code qui n'écrirait JAMAIS serait vert.
+    #[test]
+    fn une_piste_sans_dr_recoit_le_dr_calcule() {
+        assert!(
+            peut_ecrire_le_dr(None),
+            "aucune piste ne recevrait jamais de DR calculé"
+        );
+    }
+
+    /// Une valeur VIDE n'est pas une valeur.
+    ///
+    /// Un tag présent mais vide (`DYNAMIC RANGE=`) existe sur des fichiers mal
+    /// étiquetés. Le traiter comme « déjà tagué » condamnerait ces pistes à
+    /// n'avoir jamais de DR, ni lu ni calculé.
+    #[test]
+    fn un_dr_vide_ou_blanc_ne_bloque_pas_le_calcul() {
+        for vide in ["", "   ", "\t", "\n"] {
+            assert!(
+                peut_ecrire_le_dr(Some(vide)),
+                "un tag vide ({vide:?}) passe pour une vraie valeur"
+            );
+        }
     }
 
     /// Une campagne, c'est du premier lot trouvé jusqu'au retour au repos —
