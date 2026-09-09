@@ -5248,7 +5248,15 @@ mod tests {
         // un redacteur lie du texte echangerait une lecture fausse contre une
         // ecriture refusee. Elles sont inscrites nominativement dans
         // `ECARTS_TOLERES` avec leur motif mesure.
-        assert_eq!(pg_latest_version(), 53, "latest PG migration must be 53");
+        // 54 : `semis_radios_paradise_annuaire_2026_09_09` (#3523). Jumelle
+        // SQLite : la 98. Le MEME fichier de semis est `include_str!` des deux
+        // cotes ; l'entree PostgreSQL y ajoute, par `concat!`, sa ligne
+        // `INSERT INTO schema_version` — le fichier ne peut pas la porter,
+        // puisqu'il est joue aussi contre une base SQLite ou la table n'existe
+        // pas, et cette entree est la PLUS HAUTE : sans marque, `MAX(version)`
+        // resterait a 53 et le semis serait rejoue a chaque demarrage (defaut
+        // de la 052, #3699).
+        assert_eq!(pg_latest_version(), 54, "latest PG migration must be 54");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
