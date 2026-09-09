@@ -846,7 +846,7 @@ pub(crate) async fn output_capabilities(
 /// Rendu en couples `(nom, max_channels)` et non en `AudioDevice` : ce type
 /// n'existe pas sans `local-audio`, et le reste de la chaîne n'a besoin que de
 /// ces deux valeurs.
-pub(crate) fn canaux_des_peripheriques_locaux() -> Vec<(String, u16)> {
+pub fn canaux_des_peripheriques_locaux() -> Vec<(String, u16)> {
     #[cfg(feature = "local-audio")]
     {
         tune_core::outputs::local::cached_audio_devices()
@@ -910,7 +910,7 @@ pub async fn output_capabilities_avec(
 /// L'identifiant est construit par `format!("local:{}", dev.name)` au moment
 /// de l'enregistrement (`startup.rs`, `background.rs`) : c'est ce même nom qui
 /// sert de clé ici.
-fn dispositions_du_peripherique_local(
+pub(crate) fn dispositions_du_peripherique_local(
     device_id: &str,
     peripheriques: &[(String, u16)],
 ) -> Option<Vec<String>> {
