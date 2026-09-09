@@ -117,6 +117,23 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
         )",
     "CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started_at)",
     "CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome)",
+    // Etiquettes posees sur un objet de STREAMING (#3699). Quatrieme chemin :
+    // le rattrapage rejoue a CHAQUE demarrage, seul filet pour une base
+    // PostgreSQL deja convertie AVANT cette version — elle porte
+    // `schema_version = 99` et ne recevra jamais la migration 052.
+    "CREATE TABLE IF NOT EXISTS streaming_item_tags (\
+            tag_id BIGINT NOT NULL,\
+            item_type TEXT NOT NULL,\
+            source TEXT NOT NULL,\
+            source_id TEXT NOT NULL,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            cover_url TEXT,\
+            created_at TEXT,\
+            PRIMARY KEY (tag_id, item_type, source, source_id)\
+        )",
+    "CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id)",
 ];
 
 // Every column SQLite gains via `add_column_if_missing` that the
