@@ -508,7 +508,16 @@ CREATE TABLE IF NOT EXISTS zones (
     lyrics_offset_ms INTEGER NOT NULL DEFAULT 0,
     -- DUP-1 (phase 2) : dernière fois que l'appareil a répondu (ISO 8601 UTC).
     -- NULL = jamais vue depuis la pose de la colonne. TEXT des deux côtés.
-    last_seen_at TEXT
+    last_seen_at TEXT,
+    -- #2269 — l'identifiant d'endpoint STABLE du backend, pour une sortie
+    -- locale : `wasapi:{0.0.0.00000000}.{guid}`, `coreaudio:<UID>`… C'est la
+    -- seule identité qui traverse un renommage, et `output_device_id` n'en
+    -- porte aucune : il vaut `local:{nom}`, donc un NOM. NULL = zone née avant
+    -- la colonne, ou périphérique jamais énuméré depuis ; jamais inventé.
+    -- Ne remplace PAS `output_device_id`, qui reste l'identité de la zone :
+    -- le réécrire renverrait tous les réglages accrochés sur une clef neuve.
+    -- Voir `outputs::identite_de_sortie` pour ce qui a le droit de s'en servir.
+    output_endpoint_id TEXT
 );
 
 -- Unified queue (v0.9 rc.2): a single ordered queue per zone holding both

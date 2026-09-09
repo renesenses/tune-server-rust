@@ -1738,6 +1738,35 @@ CREATE TABLE IF NOT EXISTS streaming_item_tags (
 CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
 ",
     },
+    Migration {
+        version: 98,
+        name: "zones_output_endpoint_id",
+        // #2269 — `zones.output_endpoint_id`, l'identifiant d'endpoint STABLE
+        // du backend pour une sortie locale.
+        //
+        // `output_device_id` vaut `local:{nom du peripherique}` : l'identite
+        // d'une zone locale est son NOM. Windows renomme l'endpoint au
+        // changement de taux d'echantillonnage et la zone ne retrouve plus
+        // rien. L'identifiant qui traverse un renommage existe pourtant depuis
+        // #2403 (`AudioDevice::endpoint_id`, capture a la decouverte, lu EN
+        // PREMIER par `resolve_device`) — rien ne le persistait.
+        //
+        // La colonne ne REMPLACE pas `output_device_id` : celui-ci reste
+        // l'identite de la zone, et tout ce qui s'y accroche — reglages, file,
+        // volume, index unique partiel `idx_zones_output_device_id` — reste en
+        // place. AUCUNE ligne existante n'est modifiee par cette migration :
+        // NULL veut dire « pas encore appris », jamais « inconnu donc
+        // n'importe lequel ». La valeur ne s'ecrit qu'au moment ou
+        // l'enumeration montre l'appareil sous le nom que la zone porte DEJA
+        // (`identite_de_sortie::Decision::Apprend`).
+        //
+        // TEXT des deux cotes : rien a rattraper en parite de types PG.
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95
+        // et 96.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2830,6 +2859,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "mac", "TEXT");
     // DUP-1 (phase 2) : derniere reponse de l'appareil, ISO 8601 UTC, NULL = jamais vue.
     add_column_if_missing(db, "zones", "last_seen_at", "TEXT");
+    // #2269 : identifiant d'endpoint stable de la sortie locale, NULL pour
+    // l'existant. Voir la migration 98 et `outputs::identite_de_sortie`.
+    add_column_if_missing(db, "zones", "output_endpoint_id", "TEXT");
     // BIB-B2 : empreinte du contenu audio decode, versionnee (env100ms-v1:<hex>).
     add_column_if_missing(db, "tracks", "audio_fingerprint", "TEXT");
 
@@ -3400,6 +3432,15 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         53,
         "parite_types_pg_sqlite",
         include_str!("../../migrations/postgres/053_parite_types_pg_sqlite.sql"),
+    ),
+    // Jumelle PostgreSQL de la migration SQLite 98 (#2269). Sans elle, tout le
+    // parc PostgreSQL (.15, .18, Docker) n'aurait pas la colonne et la lecture
+    // de `output_endpoint_id` y renverrait « column does not exist » — donc
+    // aucune re-association nulle part, en silence.
+    (
+        54,
+        "zones_output_endpoint_id",
+        include_str!("../../migrations/postgres/054_zones_output_endpoint_id.sql"),
     ),
 ];
 
@@ -5049,7 +5090,12 @@ mod tests {
         // un redacteur lie du texte echangerait une lecture fausse contre une
         // ecriture refusee. Elles sont inscrites nominativement dans
         // `ECARTS_TOLERES` avec leur motif mesure.
-        assert_eq!(pg_latest_version(), 53, "latest PG migration must be 53");
+        // 54 : `zones_output_endpoint_id` (#2269). Jumelle SQLite : la 98.
+        // L'identifiant d'endpoint stable d'une sortie locale, la seule
+        // identite qui traverse un renommage. TEXT des deux cotes, NULL pour
+        // l'existant — aucune ligne n'est modifiee, `output_device_id` reste
+        // l'identite de la zone.
+        assert_eq!(pg_latest_version(), 54, "latest PG migration must be 54");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

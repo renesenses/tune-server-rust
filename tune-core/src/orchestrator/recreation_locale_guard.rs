@@ -61,3 +61,25 @@ fn la_sortie_recreee_ne_code_pas_les_reglages_en_dur() {
         );
     }
 }
+
+/// #2269 — la sortie recréée doit demander à la ZONE l'identifiant d'endpoint
+/// qu'elle a enregistré.
+///
+/// C'est le seul chemin qui joue quand le périphérique n'est PAS énumérable, et
+/// c'est donc le seul où l'identité par le NOM mord vraiment. Le brancher
+/// ailleurs et pas ici, ce serait « écrit mais pas branché ».
+#[test]
+fn la_sortie_recreee_demande_son_identifiant_a_la_zone() {
+    let corps = corps_de_recreation();
+    assert!(
+        corps.contains("endpoint_id_de_la_sortie(device_id)"),
+        "`recreate_local_and_play` ne lit plus l'identifiant d'endpoint \
+         persisté de la zone : c'est le NOM qui repart en résolution, et un \
+         périphérique renommé reste introuvable (#2269)."
+    );
+    assert!(
+        corps.contains("with_options_and_endpoint("),
+        "l'identifiant est lu mais pas remis au constructeur : \
+         `with_options` code `endpoint_id = None` en dur (#2269)."
+    );
+}
