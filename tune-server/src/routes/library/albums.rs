@@ -490,7 +490,16 @@ pub(super) fn attach_track_tags(
         .into_iter()
         .map(|t| {
             let track_id = t.id;
-            let mut v = serde_json::to_value(&t).unwrap_or_default();
+            // `Track::to_json` et non `serde_json::to_value` : le modèle
+            // ajoute `channel_badge`, un champ CALCULÉ à partir de `channels`
+            // (5.1, 7.1.4 Atmos…). `/library/search` le servait — elle
+            // sérialisait par `to_json` — et les listes qui passent ici ne le
+            // servaient pas : la même piste portait sa pastille sur un écran
+            // et pas sur l'autre. Brancher la recherche sur ce seam (#3789)
+            // sans cette ligne aurait RETIRÉ la pastille de la recherche, une
+            // régression pour fermer un trou. La correction est additive : les
+            // autres surfaces gagnent le champ qu'elles auraient dû porter.
+            let mut v = t.to_json();
             if let (Some(track_id), Some(obj)) = (track_id, v.as_object_mut()) {
                 for (key, map) in tags {
                     if let Some(val) = map.get(&track_id) {

@@ -430,6 +430,16 @@ path = "tests/serveurs_multimedia_dans_la_fiche_2718.rs"
 [[test]]
 name = "ecoutes_par_piste_3518"
 path = "tests/ecoutes_par_piste_3518.rs"
+
+# #3789 : les MEMES trois colonnes, mais sur `/library/search`, qui ne passait
+# par aucun des deux enrichissements. Meme discipline que #3518 — la garde
+# interroge la ROUTE MONTEE et lit la charge JSON reellement rendue, pas la
+# fonction qui la fabrique. `autotests = false` plus haut : sans cette cible,
+# le fichier ne serait JAMAIS compile, donc vert contre rien.
+[[test]]
+name = "recherche_pistes_enrichies_3789"
+path = "tests/recherche_pistes_enrichies_3789.rs"
+
 # #1361 — « Retour à l'album en cours » : la route qui dit quel album jouer
 # rouvrir, et chez qui. `autotests = false` plus haut : sans cette cible, le
 # fichier ne serait jamais compilé.
