@@ -900,19 +900,53 @@ pub struct ResolvedQueueItem {
 /// l'ORDRE canonique de `transcode_source_to_file` (1b ReplayGain, 1c
 /// égaliseur, 1d convolveur FIR), pour qu'un bras ne puisse plus en oublier un.
 ///
+/// S'y ajoute le crossfeed casque (#2742), qui n'a JAMAIS eu de chemin ici :
+/// le fichier n'en porte pas — c'est même un garde-fou de `crossfeed.rs` — et
+/// seule la sortie locale l'installait. Il vient en dernier, comme sur elle.
+///
 /// Famille #1216 / #1168 / #1653 / #2950 : « un chemin corrigé, les autres nus ».
 #[derive(Default)]
 struct StreamingDsp {
     replaygain: Option<f64>,
     eq: Option<crate::audio::eq::EqProcessor>,
     convolver: Option<crate::audio::convolver::Convolver>,
+    /// Crossfeed casque (#2742) — quatrième étage, et le seul qui ne portait
+    /// AUCUN chemin réseau avant LAT-F1 : il n'était installé que par la
+    /// sortie locale, derrière `device_id.starts_with("local:")`. Le bras
+    /// progressif lui en donne un.
+    crossfeed: Option<crate::audio::crossfeed::CrossfeedProcessor>,
+    /// Le nombre de canaux du PCM que ce porteur va voir.
+    ///
+    /// Utile au seul crossfeed : l'égaliseur et le convolveur portent déjà le
+    /// leur, construits avec. Un crossfeed n'a de sens qu'en STÉRÉO, et la
+    /// valeur par défaut (0) le rend donc inerte — c'est voulu : un porteur
+    /// bâti sans dire combien de canaux il traite ne doit pas mélanger des
+    /// canaux au hasard.
+    channels: u16,
 }
 
 impl StreamingDsp {
     /// Vrai dès qu'un étage est réellement actif. En mode PURE (audiophile) les
     /// trois chargeurs rendent `None`, donc `false` — le flux reste intact.
     fn is_active(&self) -> bool {
-        self.replaygain.is_some() || self.eq.is_some() || self.convolver.is_some()
+        self.replaygain.is_some()
+            || self.eq.is_some()
+            || self.convolver.is_some()
+            || self.crossfeed.is_some()
+    }
+
+    /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
+    ///
+    /// `is_active()` ne prouve que la PRÉSENCE d'un processeur, et un porteur
+    /// peut le transporter sans jamais l'appeler : `process_pcm` rend
+    /// immédiatement dès que `channels != 2`. Un porteur bâti avec un nombre
+    /// de canaux faux — ou laissé à zéro par le `Default` — reste donc
+    /// « actif » tout en étant MUET sur le crossfeed. C'est le mode de panne
+    /// qu'une garde de site, purement textuelle, ne peut pas voir : le champ
+    /// existe, le chargement existe, l'appel existe, et rien ne sort.
+    #[cfg(test)]
+    fn crossfeed_executable(&self) -> bool {
+        self.crossfeed.is_some() && self.channels == 2
     }
 
     /// Applique les trois étages EN PLACE.
@@ -929,6 +963,12 @@ impl StreamingDsp {
         }
         if let Some(conv) = self.convolver.as_mut() {
             conv.process_pcm(pcm, bit_depth);
+        }
+        // Le crossfeed en DERNIER, comme sur la sortie locale, où il est
+        // appliqué après le convolveur (`local.rs`) : il élargit ou resserre
+        // l'image d'un signal déjà corrigé, il ne corrige pas.
+        if let Some(cf) = self.crossfeed.as_mut() {
+            cf.process_pcm(pcm, bit_depth, self.channels);
         }
     }
 }
@@ -1174,6 +1214,13 @@ mod dsd_passthrough_tests;
 
 #[cfg(test)]
 mod resolution_annoncee_tests;
+
+/// #2250 — « Lire » et « Lecture aléatoire » annoncent la MÊME résolution pour
+/// la même ligne. La garde voisine (`resolution_annoncee_tests`) éprouve la
+/// règle ; celle-ci éprouve les DEUX FORMES DE DEMANDE que les deux boutons
+/// construisent, en appelant `composer_le_now_playing`.
+#[cfg(test)]
+mod annonce_lire_contre_aleatoire;
 
 #[cfg(test)]
 mod wav_override_tests;

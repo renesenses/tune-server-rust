@@ -1,5 +1,32 @@
 use super::*;
 
+/// #2369 — ce que la zone OBTIENDRA d'une source DSD, à côté de ce qu'elle a
+/// DEMANDÉ (`dsd_mode`).
+///
+/// Le sélecteur propose « natif » et « dop ». Sur une sortie locale, les deux
+/// emballent le DSD en DoP : aucun chemin natif n'existe dans
+/// `tune-core/src/outputs/local.rs`. L'écran affichait donc « natif » pendant
+/// que du DoP partait, et le testeur qui bascule d'un mode à l'autre refait
+/// deux fois le même essai. `dsd_mode` reste ce qui est réglé ; ce champ dit
+/// ce qui part.
+///
+/// Une SEULE fonction pour les deux sites jumeaux (`list_zones` et
+/// `get_zone`) : c'est une copie qui dérive qui avait fait répondre deux
+/// choses différentes à la même question sur la même zone (#2189).
+///
+/// Les deux entrées sont celles-là mêmes dont se sert `resolve_local_track` —
+/// le préfixe `local:` de `output_device_id`, et `is_network_output_type` sur
+/// `output_type` — pour que le panneau ne puisse pas contredire le chemin
+/// audio.
+fn dsd_transport_value(zone: &Zone, dsd_mode: &str) -> Value {
+    let is_local = zone
+        .output_device_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("local:"));
+    let is_network = tune_core::orchestrator::is_network_output_type(zone.output_type.as_deref());
+    json!(tune_core::orchestrator::transport_dsd(is_local, is_network, dsd_mode).as_str())
+}
+
 pub(super) async fn sync_status(State(state): State<AppState>) -> Json<Value> {
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
@@ -123,15 +150,57 @@ pub(super) async fn network_health(
     let stream_bytes = mesure.map_or(0, |(octets, _)| octets);
     let bitrate_kbps = mesure.and_then(|(octets, fenetre)| debit_observe_kbps(octets, fenetre));
 
-    Json(json!({
-        "zone_id": id,
+    Json(corps_network_health(
+        id,
+        &poller,
+        stream_bytes,
+        bitrate_kbps,
+    ))
+}
+
+/// Le corps JSON de `GET /api/v1/zones/{id}/network-health`, sorti du
+/// gestionnaire pour qu'il soit ÉPROUVABLE — comme [`debit_observe_kbps`]
+/// juste au-dessus.
+///
+/// ## #3318 — pourquoi cette route mentait sur la famine d'anneau
+///
+/// `ZonePollerMetrics` porte depuis `22436699` deux mesures de ce que le DAC
+/// n'a PAS reçu : `famine_anneau_evenements` et `famine_anneau_silence_ms`.
+/// Le sondeur les y recopie à chaque tick (`tune-core/src/poller/tick.rs`,
+/// aux DEUX sites qui insèrent dans `shared_metrics` — le bras radio et le
+/// bras « zone en lecture »).
+///
+/// `GET /zones/sync-status` les rend sans rien faire : il sérialise la
+/// structure entière (`"poller": poller`). **Cette route-ci ne le pouvait
+/// pas** : elle bâtit son objet champ par champ, et les deux mesures n'y
+/// avaient jamais été ajoutées. Une zone dont l'anneau se vidait se lisait
+/// donc « saine » ici, avec les sept mêmes champs qu'une zone normale — ce
+/// qui est pire que de ne rien annoncer, puisqu'une route qui répond sans
+/// le champ se lit comme une absence de défaut.
+///
+/// Le piège est structurel : un champ ajouté à `ZonePollerMetrics` apparaît
+/// tout seul dans `sync-status` et JAMAIS ici. C'est ce que garde
+/// `sante_reseau_de_zone_tests.rs`.
+pub(super) fn corps_network_health(
+    zone_id: i64,
+    poller: &tune_core::poller::ZonePollerMetrics,
+    stream_bytes: u64,
+    bitrate_kbps: Option<f64>,
+) -> Value {
+    json!({
+        "zone_id": zone_id,
         "bytes_sent": stream_bytes,
         "bitrate_kbps": bitrate_kbps,
         "poll_latency_ms": poller.last_latency_ms,
         "max_latency_ms": poller.max_latency_ms,
         "poll_errors": poller.total_errors,
         "total_polls": poller.total_polls,
-    }))
+        // #3318 — ce que le DAC n'a pas reçu, par zone. Le cumul repart de
+        // zéro à chaque piste, comme les compteurs de la sortie qu'il
+        // recopie : c'est un état du flux EN COURS, pas un historique.
+        "famine_anneau_evenements": poller.famine_anneau_evenements,
+        "famine_anneau_silence_ms": poller.famine_anneau_silence_ms,
+    })
 }
 
 pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
@@ -253,36 +322,16 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             // demandé, pas ce qui part sur le fil.
             obj.insert("dop_active".into(), json!(ps.dop_active));
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
-            obj.insert("dsd_mode".into(), json!(zone_repo.get_dsd_mode(zone_id)));
-            obj.insert(
-                "lyrics_offset_ms".into(),
-                json!(zone_repo.get_lyrics_offset_ms(zone_id)),
-            );
-            obj.insert(
-                "dlna_native_flac".into(),
-                json!(zone_repo.get_dlna_native_flac(zone_id)),
-            );
-            obj.insert(
-                "alac_passthrough".into(),
-                json!(zone_repo.get_alac_passthrough(zone_id)),
-            );
-            obj.insert(
-                "aac_passthrough".into(),
-                json!(zone_repo.get_aac_passthrough(zone_id)),
-            );
-            obj.insert("dlna_lpcm".into(), json!(zone_repo.get_dlna_lpcm(zone_id)));
-            obj.insert(
-                "dlna_cap_16bit".into(),
-                json!(zone_repo.get_dlna_cap_16bit(zone_id)),
-            );
-            obj.insert(
-                "dlna_wav24".into(),
-                json!(zone_repo.get_dlna_wav24(zone_id)),
-            );
-            obj.insert(
-                "dlna_play_delay_ms".into(),
-                json!(zone_repo.get_dlna_play_delay_ms(zone_id)),
-            );
+            // #2369 — le mode DEMANDÉ n'est pas le transport OBTENU. Il reste
+            // ICI : `dsd_transport` est un état DÉDUIT de la sortie, pas un
+            // réglage de la zone, et il se lit comme `dop_active` juste
+            // au-dessus.
+            let dsd_mode = zone_repo.get_dsd_mode(zone_id);
+            obj.insert("dsd_transport".into(), dsd_transport_value(z, &dsd_mode));
+            // #2672 — les neuf réglages du panneau « Avancé · renderer »,
+            // `dsd_mode` compris, par l'injecteur partagé avec `get_zone` et
+            // `build_zone_json`.
+            crate::routes::zones::injecter_reglages_renderer(obj, &zone_repo, zone_id);
             // `autoplay_enabled` est VOLONTAIREMENT absent de la requete SQL
             // de `ZoneRepo` (migration v36 pouvant echouer en silence sous
             // Windows), donc `row_to_zone` le met a `false` sans exception —
@@ -443,30 +492,15 @@ pub(super) async fn get_zone(
                 obj.insert("resolving".into(), json!(ps.resolving));
                 // Voir la note au site jumeau : DoP en cours ⇒ volume inerte.
                 obj.insert("dop_active".into(), json!(ps.dop_active));
-                obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
+                // Voir la note au site jumeau : le mode demandé n'est pas le
+                // transport obtenu (#2369), et cet état déduit reste ici.
+                let dsd_mode = repo.get_dsd_mode(id);
                 obj.insert(
-                    "lyrics_offset_ms".into(),
-                    json!(repo.get_lyrics_offset_ms(id)),
+                    "dsd_transport".into(),
+                    dsd_transport_value(&zone, &dsd_mode),
                 );
-                obj.insert(
-                    "dlna_native_flac".into(),
-                    json!(repo.get_dlna_native_flac(id)),
-                );
-                obj.insert(
-                    "alac_passthrough".into(),
-                    json!(repo.get_alac_passthrough(id)),
-                );
-                obj.insert(
-                    "aac_passthrough".into(),
-                    json!(repo.get_aac_passthrough(id)),
-                );
-                obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
-                obj.insert("dlna_cap_16bit".into(), json!(repo.get_dlna_cap_16bit(id)));
-                obj.insert("dlna_wav24".into(), json!(repo.get_dlna_wav24(id)));
-                obj.insert(
-                    "dlna_play_delay_ms".into(),
-                    json!(repo.get_dlna_play_delay_ms(id)),
-                );
+                // #2672 — même injecteur que la liste et `build_zone_json`.
+                crate::routes::zones::injecter_reglages_renderer(obj, &repo, id);
                 // Meme correction que dans la liste : la valeur serialisee
                 // depuis la struct vaut toujours `false`.
                 // #2271 — meme paire que dans la liste.

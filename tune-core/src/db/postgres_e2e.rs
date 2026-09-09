@@ -18,26 +18,47 @@ use std::sync::Arc;
 
 use crate::db::backend::{DbBackend, PostgresBackend};
 
-/// Connect to the test PG instance pointed at by `TUNE_TEST_PG_URL`.
-/// Returns `None` when the env var is unset — caller short-circuits
-/// so the test is a no-op on default `cargo test`.
+/// La base d'épreuve désignée par `TUNE_TEST_PG_URL`.
+///
+/// Rend `None` dans UN SEUL cas : la variable n'est pas posée. Le `cargo test`
+/// ordinaire n'a pas de base, et ces épreuves n'y sont pas exécutées — c'est le
+/// saut, et il est recensé dans `derive_des_garde_fous_2816.rs`.
+///
+/// ⚠️ Une variable **posée** dont la connexion échoue ne saute PAS : elle fait
+/// TOMBER l'épreuve, en nommant l'adresse et l'erreur. Jusqu'au 09/09/2026, le
+/// `.ok()?` d'ici avalait l'échec de connexion et rendait `None` : une étape de
+/// `test-postgres.yml` dont la base était mal branchée affichait dix-neuf `ok`
+/// sur dix-neuf épreuves qui n'avaient touché aucune base. C'est le « vert
+/// contre rien » sous sa forme la plus trompeuse — la variable EST posée, donc
+/// la garde de recensement voit le témoin comme exécuté, et rien ne l'a été.
+/// Même doctrine que `pg_routes_serveur.rs` et `pg_2372_versions_par_piste.rs`.
 async fn pg_backend() -> Option<Arc<dyn DbBackend>> {
     let url = std::env::var("TUNE_TEST_PG_URL").ok()?;
-    let pool = sqlx::PgPool::connect(&url).await.ok()?;
+    let pool = sqlx::PgPool::connect(&url).await.unwrap_or_else(|e| {
+        panic!(
+            "TUNE_TEST_PG_URL est POSÉE ({url}) mais la connexion PostgreSQL \
+             échoue : {e}\n\
+             Un banc mal branché doit ROUGIR, jamais s'afficher vert : sans ce \
+             refus, ces épreuves rendraient `ok` sans avoir touché une base."
+        )
+    });
     Some(Arc::new(PostgresBackend::new(pool)))
 }
 
-/// Test-time guard that bails out cleanly when no PG is wired up.
-/// Use as `let db = pg_or_skip!();` at the top of every #[tokio::test]
-/// test function. Must be called inside a Tokio runtime because the
-/// PostgresBackend methods use `block_in_place` + `block_on` and
-/// expect to be reached from one.
+/// Garde d'exécution : `let db = pg_or_skip!();` en tête de chaque épreuve.
+///
+/// Sans base, l'épreuve s'ANNONCE sautée sur la sortie d'erreur puis rend la
+/// main. Doit être appelé depuis un exécuteur Tokio : les méthodes de
+/// `PostgresBackend` passent par `block_in_place` + `block_on`.
 macro_rules! pg_or_skip {
     () => {
         match pg_backend().await {
             Some(db) => db,
             None => {
-                eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+                eprintln!(
+                    "SAUT : TUNE_TEST_PG_URL non posée — une épreuve de {} rend la main sans toucher aucune base.",
+                    module_path!()
+                );
                 return;
             }
         }
@@ -646,7 +667,17 @@ async fn pg_1220_numeric_columns_have_numeric_types() {
         // #2886 — a virgule : l'entier coupait le son sous -46,02 dB.
         ("zones", "volume", &["double precision"]),
         ("zones", "last_position_ms", &["bigint"]),
-        ("queue_items", "position", &["integer"]),
+        // `bigint` accepte AUSSI (#3569). Ce que #1220 refuse, c'est une
+        // colonne restee TEXT — la these de l'epreuve est ecrite en tete. Or
+        // `queue_items` a un SECOND redacteur legitime : le DDL auto-reparateur
+        // de `postgres.rs` (`ensure_schema`), qui declare deliberement TOUT en
+        // BIGINT. Des que `pg_1706` laisse ce DDL recreer la table — ce qu'il
+        // fait exprès —, la colonne est bigint, et l'ancienne liste faisait
+        // tomber cette epreuve-ci sur l'ordre des epreuves. Les deux redacteurs
+        // divergent bel et bien, et RIEN ne les compare : `pg_schema_parity`
+        // (#2111) confronte les scripts numerotes a `PG_FULL_SCHEMA`, jamais a
+        // `ensure_schema`. Cet angle mort est instruit a part.
+        ("queue_items", "position", &["integer", "bigint"]),
         ("track_source_links", "confidence", &["double precision"]),
         ("bookmarks", "position_ms", &["bigint"]),
     ];
@@ -690,12 +721,21 @@ async fn pg_2468_runner_heals_bookmarks_position_integer_to_bigint() {
     };
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
 
+    // `>= 36` et non `= 36` (#3569). Le runner ne rejoue pas une migration
+    // manquante : il compare chaque version a `MAX(version)` et saute tout ce
+    // qui est <= (voir `run_pg_migrations`). Retirer la SEULE ligne 36 laissait
+    // donc le filigrane a 51, le runner sautait 036, et l'epreuve tombait sur
+    // `left: "integer"`. Elle passait quand elle a ete ecrite parce que 036
+    // etait alors la DERNIERE migration : la premiere 037 l'a cassee en
+    // silence, et personne ne l'a vu — aucune etape ne l'executait. Les scripts
+    // numerotes sont idempotents (c'est la these de tout ce runner), donc
+    // rejouer 036..051 est sans effet de bord.
     sqlx::raw_sql(
         "DELETE FROM bookmarks;
          ALTER TABLE bookmarks
              ALTER COLUMN position_ms TYPE INTEGER
              USING position_ms::integer;
-         DELETE FROM schema_version WHERE version = 36;",
+         DELETE FROM schema_version WHERE version >= 36;",
     )
     .execute(&pool)
     .await

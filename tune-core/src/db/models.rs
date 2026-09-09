@@ -165,9 +165,48 @@ pub struct Track {
     pub musicbrainz_recording_id: Option<String>,
     pub cover_path: Option<String>,
     pub comments: Option<String>,
+    /// Piste virtuelle d'une feuille CUE : le fichier image sur disque.
+    ///
+    /// `file_path` est `UNIQUE`, or une feuille découpe N pistes dans le MÊME
+    /// fichier. Les pistes CUE portent donc `file_path = NULL` (les deux
+    /// moteurs tolèrent plusieurs `NULL` sous un `UNIQUE`) et leur identité
+    /// dans le couple `(cue_media_path, cue_start_ms)` — l'index unique partiel
+    /// `idx_tracks_cue_identity`, posé par la migration SQLite 76 et par
+    /// `031_cue_colonnes_et_identite.sql` côté PostgreSQL.
+    #[serde(default)]
+    pub cue_media_path: Option<String>,
+    /// Début de la piste DANS `cue_media_path`, en millisecondes.
+    #[serde(default)]
+    pub cue_start_ms: Option<i64>,
+    /// Fin de la piste dans `cue_media_path`, ou `None` quand elle court
+    /// jusqu'au bout du fichier image (la dernière piste d'une feuille).
+    #[serde(default)]
+    pub cue_end_ms: Option<i64>,
 }
 
 impl Track {
+    /// Les bornes de la tranche à jouer, quand cette piste est une piste
+    /// virtuelle de feuille CUE.
+    ///
+    /// Rend `None` pour une piste ordinaire — c'est ce que lit la résolution de
+    /// flux pour décider si elle doit borner le décodage. Une ligne dont
+    /// `cue_media_path` est posé mais `cue_start_ms` absent n'est pas une
+    /// tranche : sans début, il n'y a rien à borner.
+    pub fn bornes_cue(&self) -> Option<(String, u64, Option<u64>)> {
+        let media = self.cue_media_path.as_deref()?;
+        if media.is_empty() {
+            return None;
+        }
+        let debut_ms = self.cue_start_ms?;
+        let debut = debut_ms.max(0) as u64;
+        // Une fin antérieure ou égale au début est une ligne incohérente : on
+        // la traite comme « jusqu'au bout du fichier » plutôt que de servir
+        // zéro octet — un silence est plus difficile à diagnostiquer qu'une
+        // piste trop longue.
+        let fin = self.cue_end_ms.filter(|f| *f > debut_ms).map(|f| f as u64);
+        Some((media.to_string(), debut, fin))
+    }
+
     /// Serialize to JSON with computed fields (`channel_badge`).
     pub fn to_json(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or_default();
@@ -211,6 +250,9 @@ impl Track {
             musicbrainz_recording_id: None,
             cover_path: None,
             comments: None,
+            cue_media_path: None,
+            cue_start_ms: None,
+            cue_end_ms: None,
         }
     }
 }
@@ -417,11 +459,68 @@ mod tests {
             musicbrainz_recording_id: None,
             cover_path: None,
             comments: None,
+            cue_media_path: None,
+            cue_start_ms: None,
+            cue_end_ms: None,
         };
         let json = serde_json::to_value(&track).unwrap();
         assert_eq!(json["title"], "So What");
         assert_eq!(json["duration_ms"], 562_000);
         assert_eq!(json["disc_number"], 1);
+    }
+
+    /// Une piste ORDINAIRE ne porte aucune borne : c'est la moitié qui garantit
+    /// que le branchement de la lecture ne touche pas les 100 % de pistes qui
+    /// ne viennent pas d'une feuille CUE.
+    #[test]
+    fn une_piste_ordinaire_n_a_pas_de_bornes_cue() {
+        let mut t = Track::new("So What".into());
+        t.file_path = Some("/music/so_what.flac".into());
+        assert_eq!(t.bornes_cue(), None);
+    }
+
+    #[test]
+    fn une_piste_cue_rend_son_media_et_ses_bornes() {
+        let mut t = Track::new("Aria".into());
+        t.cue_media_path = Some("/music/gould/image.wav".into());
+        t.cue_start_ms = Some(1_000);
+        t.cue_end_ms = Some(61_000);
+        assert_eq!(
+            t.bornes_cue(),
+            Some(("/music/gould/image.wav".into(), 1_000, Some(61_000)))
+        );
+    }
+
+    /// La DERNIÈRE piste d'une feuille court jusqu'au bout du fichier image :
+    /// pas de fin, et ce n'est pas une anomalie.
+    #[test]
+    fn une_derniere_piste_cue_n_a_pas_de_fin() {
+        let mut t = Track::new("Variatio 30".into());
+        t.cue_media_path = Some("/music/gould/image.wav".into());
+        t.cue_start_ms = Some(120_000);
+        assert_eq!(
+            t.bornes_cue(),
+            Some(("/music/gould/image.wav".into(), 120_000, None))
+        );
+    }
+
+    /// Une fin antérieure au début servirait zéro octet : elle est neutralisée
+    /// en « jusqu'au bout », jamais honorée telle quelle.
+    #[test]
+    fn une_fin_avant_le_debut_est_neutralisee() {
+        let mut t = Track::new("Incoherente".into());
+        t.cue_media_path = Some("/music/image.wav".into());
+        t.cue_start_ms = Some(60_000);
+        t.cue_end_ms = Some(10_000);
+        assert_eq!(t.bornes_cue().unwrap().2, None);
+    }
+
+    /// `cue_media_path` sans début n'est pas une tranche.
+    #[test]
+    fn un_media_sans_debut_ne_borne_rien() {
+        let mut t = Track::new("Sans debut".into());
+        t.cue_media_path = Some("/music/image.wav".into());
+        assert_eq!(t.bornes_cue(), None);
     }
 
     #[test]

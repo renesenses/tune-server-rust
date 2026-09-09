@@ -238,8 +238,40 @@ pub mod sql {
         // whose files carry no ALBUMARTIST tag (Bilou). The column keeps its
         // position, so row parsing is unchanged.
         format!(
-            "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments{}",
+            "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments, t.cue_media_path, t.cue_start_ms, t.cue_end_ms{}",
             track_from()
+        )
+    }
+
+    /// La piste virtuelle identifiée par sa tranche dans le fichier image.
+    ///
+    /// C'est l'identité que porte l'index unique partiel `idx_tracks_cue_identity`
+    /// (`tracks(cue_media_path, cue_start_ms) WHERE cue_media_path IS NOT NULL`).
+    /// Sans cette lecture, chaque scan RE-créerait la bibliothèque CUE : les
+    /// pistes n'ont pas de `file_path` sur lequel le pré-filtre incrémental
+    /// pourrait les reconnaître.
+    pub fn get_by_cue_identity<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE t.cue_media_path = {} AND t.cue_start_ms = {}",
+            select_track(),
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// Les fichiers image distincts que les pistes CUE référencent.
+    ///
+    /// Sert l'élagage : `get_all_file_info_by_path` filtre `file_path IS NOT
+    /// NULL`, donc une piste CUE n'est JAMAIS élaguée par le chemin ordinaire
+    /// du scan et resterait en base pour toujours quand son image disparaît.
+    pub fn cue_media_paths() -> &'static str {
+        "SELECT DISTINCT cue_media_path FROM tracks WHERE cue_media_path IS NOT NULL AND cue_media_path <> ''"
+    }
+
+    pub fn delete_by_cue_media<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM tracks WHERE cue_media_path = {}",
+            d.placeholder(1)
         )
     }
 
@@ -255,10 +287,15 @@ pub mod sql {
         )
     }
 
-    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments, cover_path";
+    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments, cover_path, cue_media_path, cue_start_ms, cue_end_ms";
+
+    /// Combien de colonnes `INSERT_COLS` porte — la seule source de vérité du
+    /// nombre de paramètres liés, pour les deux moteurs.
+    pub const NB_COLONNES_INSERT: usize = 31;
 
     pub fn insert<D: SqlDialect>(d: &D) -> String {
-        let placeholders: Vec<String> = (1..=28).map(|i| d.placeholder(i)).collect();
+        let placeholders: Vec<String> =
+            (1..=NB_COLONNES_INSERT).map(|i| d.placeholder(i)).collect();
         format!(
             "INSERT INTO tracks ({INSERT_COLS}) VALUES ({})",
             placeholders.join(", ")
@@ -869,9 +906,45 @@ impl TrackRepo {
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
     }
 
+    /// La piste virtuelle d'une feuille CUE, retrouvée par sa TRANCHE.
+    ///
+    /// C'est l'identité de ces lignes : elles n'ont pas de `file_path`, donc ni
+    /// `get_by_path` ni le pré-filtre incrémental du scan ne peuvent les
+    /// reconnaître. Sans cette lecture, chaque scan les ré-insérerait — ou se
+    /// heurterait à `idx_tracks_cue_identity` et perdrait la piste en silence.
+    pub fn get_by_cue_identity(
+        &self,
+        cue_media_path: &str,
+        cue_start_ms: i64,
+    ) -> Result<Option<Track>, TuneError> {
+        let sql = self.dialect_sql(sql::get_by_cue_identity, sql::get_by_cue_identity);
+        let params: [&dyn ToSqlValue; 2] = [&cue_media_path, &cue_start_ms];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+    }
+
+    /// Les fichiers image que les pistes CUE de la base référencent.
+    pub fn cue_media_paths(&self) -> Result<Vec<String>, TuneError> {
+        let rows = self.db.query_many(sql::cue_media_paths(), &[])?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_string()))
+            .collect())
+    }
+
+    /// Supprime toutes les pistes virtuelles adossées à ce fichier image.
+    ///
+    /// L'élagage ordinaire du scan ne les voit pas : `get_all_file_info_by_path`
+    /// filtre `file_path IS NOT NULL`. Sans ce geste, un album CUE dont le FLAC
+    /// a été effacé reste dans la bibliothèque POUR TOUJOURS, injouable.
+    pub fn delete_by_cue_media(&self, cue_media_path: &str) -> Result<u64, TuneError> {
+        let sql = self.dialect_sql(sql::delete_by_cue_media, sql::delete_by_cue_media);
+        let params: [&dyn ToSqlValue; 1] = [&cue_media_path];
+        Ok(self.db.execute(&sql, &params)? as u64)
+    }
+
     fn create_inner(&self, track: &Track) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::insert, sql::insert);
-        let params: [&dyn ToSqlValue; 28] = [
+        let params: [&dyn ToSqlValue; sql::NB_COLONNES_INSERT] = [
             &track.title,
             &track.album_id,
             &track.artist_id,
@@ -900,6 +973,9 @@ impl TrackRepo {
             &track.musicbrainz_recording_id,
             &track.comments,
             &track.cover_path,
+            &track.cue_media_path,
+            &track.cue_start_ms,
+            &track.cue_end_ms,
         ];
         // Capture the new track id atomically, BEFORE the file_first_seen
         // insert below — otherwise `last_insert_rowid()` at the end returns that
@@ -1881,7 +1957,7 @@ impl TrackRepo {
         let mut echecs = 0usize;
         let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
         for track in tracks {
-            let params: [&dyn ToSqlValue; 28] = [
+            let params: [&dyn ToSqlValue; sql::NB_COLONNES_INSERT] = [
                 &track.title,
                 &track.album_id,
                 &track.artist_id,
@@ -1910,6 +1986,9 @@ impl TrackRepo {
                 &track.musicbrainz_recording_id,
                 &track.comments,
                 &track.cover_path,
+                &track.cue_media_path,
+                &track.cue_start_ms,
+                &track.cue_end_ms,
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
         }
@@ -2435,6 +2514,9 @@ fn row_to_track(cols: &Vec<SqlValue>) -> Track {
         cover_path: cols.get(28).and_then(|v| v.as_string()),
         genres: cols.get(29).and_then(|v| v.as_string()),
         comments: cols.get(30).and_then(|v| v.as_string()),
+        cue_media_path: cols.get(31).and_then(|v| v.as_string()),
+        cue_start_ms: cols.get(32).and_then(|v| v.as_i64()),
+        cue_end_ms: cols.get(33).and_then(|v| v.as_i64()),
     }
 }
 

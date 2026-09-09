@@ -1482,6 +1482,157 @@ pub fn decode_to_pcm_streaming_seeked(
     )
 }
 
+/// Le décodage progressif d'une TRANCHE : `seek_s` donne le début, `duree_s`
+/// la longueur, tous deux dans le fichier source (#3631).
+///
+/// C'est ce que réclame une piste virtuelle de feuille CUE : le fichier image
+/// porte l'album entier, la piste n'en est qu'un intervalle. Le début passe par
+/// le même `seek_s` que le seek utilisateur ; la fin, elle, n'existait nulle
+/// part dans ce dépôt — c'est [`borner_la_fin`] qui la pose.
+pub fn decode_to_pcm_streaming_tranche(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
+    seek_s: f64,
+    duree_s: Option<f64>,
+) -> Result<(u16, u32), String> {
+    let tx = borner_la_fin(
+        tx,
+        duree_s,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+    );
+    decode_to_pcm_streaming_inner(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        Some(data_ready),
+        Some(levels_tx),
+        seek_s,
+        None,
+    )
+}
+
+/// Combien d'octets de PCM valent `duree_s` dans le format de sortie annoncé.
+///
+/// `None` dès qu'une des trois dimensions manque : sans cadence, sans nombre de
+/// canaux ou sans profondeur, un nombre d'octets ne veut rien dire. Mieux vaut
+/// ne PAS borner et le dire que borner au hasard — une borne fausse coupe la
+/// musique.
+pub(crate) fn octets_pour(
+    duree_s: f64,
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
+    bit_depth: Option<u16>,
+) -> Option<usize> {
+    if !duree_s.is_finite() || duree_s <= 0.0 {
+        return None;
+    }
+    let (sr, ch, bd) = (sample_rate?, channels?, bit_depth?);
+    if sr == 0 || ch == 0 || bd == 0 {
+        return None;
+    }
+    let octets_par_trame = ch as usize * (bd as usize / 8);
+    if octets_par_trame == 0 {
+        return None;
+    }
+    let trames = (duree_s * sr as f64).round();
+    if trames <= 0.0 {
+        return None;
+    }
+    Some((trames as usize).saturating_mul(octets_par_trame))
+}
+
+/// Interpose un relais qui ARRÊTE le flux après `duree_s` de PCM.
+///
+/// # Pourquoi un relais, et pas une borne dans chaque boucle
+///
+/// [`decode_to_pcm_streaming_inner`] a **cinq** boucles d'émission — symphonia,
+/// DSD, Opus, Monkey's Audio, et le repli AIFF/WavPack. Recopier la même
+/// arithmétique dans chacune, c'est cinq occasions de la faire diverger, et
+/// c'est toucher cinq chemins de lecture éprouvés pour un besoin qui ne
+/// concerne que les feuilles CUE. Le relais, lui, ne touche AUCUNE des cinq :
+/// il compte les octets qui sortent et lâche son récepteur quand le compte est
+/// atteint. Le `tx.send` suivant du décodeur échoue alors, et les cinq boucles
+/// savent déjà sortir proprement là-dessus (« consumer_dropped »).
+///
+/// # Ce qui n'est pas compté
+///
+/// Le tout premier bloc quand une profondeur cible est demandée : c'est
+/// l'en-tête WAV, que les cinq branches émettent avant la moindre trame. Le
+/// compter volerait 44 octets à la musique.
+///
+/// Sans `duree_s`, ou si le format de sortie n'est pas entièrement connu, le
+/// canal est rendu TEL QUEL : aucun relais, aucun coût, comportement d'avant à
+/// l'octet près.
+fn borner_la_fin(
+    tx: mpsc::Sender<Vec<u8>>,
+    duree_s: Option<f64>,
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
+    bit_depth: Option<u16>,
+) -> mpsc::Sender<Vec<u8>> {
+    let Some(duree_s) = duree_s else {
+        return tx;
+    };
+    let Some(budget) = octets_pour(duree_s, sample_rate, channels, bit_depth) else {
+        tracing::warn!(
+            duree_s,
+            ?sample_rate,
+            ?channels,
+            ?bit_depth,
+            "borne_de_fin_non_calculable — flux servi ENTIER"
+        );
+        return tx;
+    };
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("borne_de_fin_sans_runtime — flux servi ENTIER");
+        return tx;
+    };
+    let entete_a_epargner = bit_depth.is_some();
+    let (relais_tx, mut relais_rx) = mpsc::channel::<Vec<u8>>(8);
+    rt.spawn(async move {
+        let mut emis: usize = 0;
+        let mut premier = true;
+        while let Some(mut bloc) = relais_rx.recv().await {
+            if premier {
+                premier = false;
+                if entete_a_epargner {
+                    if tx.send(bloc).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            let reste = budget.saturating_sub(emis);
+            if bloc.len() > reste {
+                bloc.truncate(reste);
+            }
+            emis += bloc.len();
+            if !bloc.is_empty() && tx.send(bloc).await.is_err() {
+                break;
+            }
+            if emis >= budget {
+                break;
+            }
+        }
+        debug!(emis, budget, "borne_de_fin_atteinte");
+        // `relais_rx` et `tx` meurent ici : le décodeur voit son prochain
+        // envoi échouer et s'arrête de lui-même, et le consommateur voit la
+        // fin du flux.
+    });
+    relais_tx
+}
+
 /// Variante HTTP seekable du decodeur progressif. La source a deja prouve le
 /// support de `Range`; Symphonia peut donc lire l'atome `moov` a la fin d'un
 /// M4A puis revenir aux premiers paquets sans telecharger tout le media (#1885).
@@ -4792,5 +4943,162 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             our_pcm, ref_pcm,
             "decoded PCM must be byte-for-byte identical to the C++ reference decoder"
         );
+    }
+}
+
+// ===========================================================================
+// #3631 — la BORNE DE FIN : jouer une TRANCHE d'un fichier image CUE
+// ===========================================================================
+
+#[cfg(test)]
+mod borne_de_fin_tests {
+    use super::*;
+
+    const TAUX: u32 = 44_100;
+
+    /// Un vrai WAV 16 bits stéréo de `millisecondes`, sinusoïde grossière.
+    fn ecrire_wav(chemin: &std::path::Path, millisecondes: u32) {
+        let trames = TAUX * millisecondes / 1000;
+        let octets = trames * 4;
+        let mut f = Vec::new();
+        f.extend_from_slice(b"RIFF");
+        f.extend_from_slice(&(36 + octets).to_le_bytes());
+        f.extend_from_slice(b"WAVEfmt ");
+        f.extend_from_slice(&16u32.to_le_bytes());
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&2u16.to_le_bytes());
+        f.extend_from_slice(&TAUX.to_le_bytes());
+        f.extend_from_slice(&(TAUX * 4).to_le_bytes());
+        f.extend_from_slice(&4u16.to_le_bytes());
+        f.extend_from_slice(&16u16.to_le_bytes());
+        f.extend_from_slice(b"data");
+        f.extend_from_slice(&octets.to_le_bytes());
+        for n in 0..trames {
+            let v = ((n as f32 / 40.0).sin() * 8000.0) as i16;
+            f.extend_from_slice(&v.to_le_bytes());
+            f.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(chemin, f).unwrap();
+    }
+
+    /// Décode et rend (octets d'en-tête + octets de PCM) réellement émis.
+    async fn servir(chemin: &std::path::Path, seek_s: f64, duree_s: Option<f64>) -> usize {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let pret = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (niveaux, _niveaux_rx) = tokio::sync::mpsc::unbounded_channel();
+        let fp = chemin.to_string_lossy().to_string();
+        let tache = tokio::task::spawn_blocking(move || {
+            decode_to_pcm_streaming_tranche(
+                &fp,
+                Some(TAUX),
+                Some(2),
+                Some(16),
+                tx,
+                32768,
+                pret,
+                niveaux,
+                seek_s,
+                duree_s,
+            )
+        });
+        let mut total = 0usize;
+        while let Some(bloc) = rx.recv().await {
+            total += bloc.len();
+        }
+        tache.await.unwrap().unwrap();
+        total
+    }
+
+    fn octets_pcm(secondes: f64) -> usize {
+        (secondes * TAUX as f64).round() as usize * 4
+    }
+
+    /// La MOITIÉ QUI PROUVE : borné, le flux s'arrête à la durée demandée.
+    ///
+    /// 44 octets d'en-tête WAV, puis exactement une seconde de PCM — pas les
+    /// quatre secondes du fichier. C'est cela, jouer la piste 2 d'un CUE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn une_tranche_bornee_sert_exactement_sa_duree() {
+        let d = tempfile::TempDir::new().unwrap();
+        let f = d.path().join("image.wav");
+        ecrire_wav(&f, 4_000);
+
+        let servi = servir(&f, 1.0, Some(1.0)).await;
+        let attendu = 44 + octets_pcm(1.0);
+        // Le décodeur émet par blocs alignés sur la trame ; la borne coupe au
+        // dernier octet utile, donc l'égalité est EXACTE.
+        assert_eq!(
+            servi, attendu,
+            "tranche de 1 s servie en {servi} octets, attendu {attendu}"
+        );
+    }
+
+    /// LA CONTRE-ÉPREUVE : sans borne, le MÊME appel sert tout le reste du
+    /// fichier. Sans elle, le test ci-dessus passerait aussi sur un fichier
+    /// qui ne dure qu'une seconde — il ne prouverait rien.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sans_borne_le_meme_fichier_sert_tout_le_reste() {
+        let d = tempfile::TempDir::new().unwrap();
+        let f = d.path().join("image.wav");
+        ecrire_wav(&f, 4_000);
+
+        let borne = servir(&f, 1.0, Some(1.0)).await;
+        let entier = servir(&f, 1.0, None).await;
+        assert!(
+            entier > borne * 2,
+            "sans borne le flux devrait porter les 3 s restantes : borné {borne}, entier {entier}"
+        );
+        // ~3 s à 100 ms près : le décodeur peut rendre une queue de
+        // rééchantillonnage, jamais trois fois la matière.
+        let attendu = 44 + octets_pcm(3.0);
+        assert!(
+            entier.abs_diff(attendu) < octets_pcm(0.1),
+            "reste du fichier : {entier} octets, attendu ~{attendu}"
+        );
+    }
+
+    /// La DERNIÈRE piste d'une feuille n'a pas de fin : elle court jusqu'au
+    /// bout du fichier, et la borne ne doit rien couper.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn une_tranche_sans_fin_va_jusqu_au_bout() {
+        let d = tempfile::TempDir::new().unwrap();
+        let f = d.path().join("image.wav");
+        ecrire_wav(&f, 2_000);
+
+        let servi = servir(&f, 1.5, None).await;
+        let attendu = 44 + octets_pcm(0.5);
+        assert!(
+            servi.abs_diff(attendu) < octets_pcm(0.1),
+            "dernière tranche : {servi} octets, attendu ~{attendu}"
+        );
+    }
+
+    /// L'arithmétique de la borne, isolée : c'est elle qui décide où couper.
+    #[test]
+    fn le_budget_d_octets_suit_le_format_de_sortie() {
+        // 1 s de 44,1 kHz stéréo 16 bits = 44100 × 2 × 2.
+        assert_eq!(
+            octets_pour(1.0, Some(44_100), Some(2), Some(16)),
+            Some(176_400)
+        );
+        // 24 bits : trois octets par échantillon.
+        assert_eq!(
+            octets_pour(1.0, Some(96_000), Some(2), Some(24)),
+            Some(576_000)
+        );
+    }
+
+    /// CONTRE-ÉPREUVE de l'arithmétique : sans format complet, PAS de borne.
+    ///
+    /// Un nombre d'octets sans cadence ni profondeur ne veut rien dire, et une
+    /// borne fausse coupe la musique. Mieux vaut servir entier et le dire.
+    #[test]
+    fn sans_format_complet_aucune_borne_n_est_calculee() {
+        assert_eq!(octets_pour(1.0, None, Some(2), Some(16)), None);
+        assert_eq!(octets_pour(1.0, Some(44_100), None, Some(16)), None);
+        assert_eq!(octets_pour(1.0, Some(44_100), Some(2), None), None);
+        assert_eq!(octets_pour(0.0, Some(44_100), Some(2), Some(16)), None);
+        assert_eq!(octets_pour(-1.0, Some(44_100), Some(2), Some(16)), None);
+        assert_eq!(octets_pour(f64::NAN, Some(44_100), Some(2), Some(16)), None);
     }
 }

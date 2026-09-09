@@ -607,12 +607,11 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
 
         loop {
             let settings = crate::db::settings_repo::SettingsRepo::with_backend(backend.clone());
-            let enabled = settings
-                .get("community_sync_enabled")
-                .ok()
-                .flatten()
-                .map(|v| v == "true")
-                .unwrap_or(false);
+            // #3383 — le verrou PARTAGE, et non une lecture maison de la cle :
+            // un refus de telemetrie doit arreter cette boucle comme il arrete
+            // deja la contribution et les bios. C'etait la derniere famille
+            // d'envois AUTOMATIQUES a l'ignorer.
+            let enabled = crate::cloud::consent::sync_communautaire_autorise(&settings);
 
             if enabled {
                 // Resolve MBIDs first (no instance_id required) so freshly

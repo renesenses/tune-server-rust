@@ -38,9 +38,18 @@
 //! Un essai qui commence par « pas de variable, je saute » ne rougit jamais.
 //! Il ne peut pas : il s'annonce vert, `cargo` le compte comme passé, et le
 //! journal du job dit `ok` sur une ligne que personne ne relit. C'est le mode
-//! de panne le plus silencieux du dépôt — les TRENTE témoins recensés plus bas,
-//! dont les quinze épreuves E2E PostgreSQL de `postgres_e2e.rs`, sont dans ce
-//! cas AUJOURD'HUI, et rien ne le disait.
+//! de panne le plus silencieux du dépôt. Trente témoins étaient dans ce cas le
+//! 06/09/2026, dont les quinze épreuves E2E PostgreSQL de `postgres_e2e.rs`.
+//!
+//! Il en reste CINQ (#3569, 09/09/2026). Trois sont irréductibles — une
+//! session proxy vivante, un fichier DSD hors dépôt, une base de production.
+//! Les deux derniers sont bloqués par #3715 : exécutés, ils rougissent sur
+//! treize divergences de schéma réelles, et les rattacher aujourd'hui
+//! obligerait à les rendre verts par indulgence. Les vingt-cinq autres ne
+//! demandaient qu'une base jetable — sept rattachés par #3519/#3520, dix-huit
+//! par #3569 — et leur saut n'était pas de la prudence, c'était de la dette.
+//! Le stock est désormais tenu par un NOMBRE, `TEMOINS_SAUTES_TOLERES` : il ne
+//! peut plus monter sans qu'une main l'écrive.
 //!
 //! La garde ne les répare pas : elle les RECENSE. Un témoin sauté doit figurer
 //! dans `SAUTS_CONNUS` avec sa raison. Un témoin neuf qui saute fait rougir ;
@@ -117,41 +126,34 @@ const SELECTEURS_HORS_LIB: &[&str] = &["--test", "--bench", "--example", "--bin"
 // ---------------------------------------------------------------------------
 
 /// `(fichier, variable, témoins, raison)`.
+/// Nombre de témoins que `SAUTS_CONNUS` tolère, ENTRÉES ADDITIONNÉES.
+///
+/// La liste ci-dessous se relit ; sa SOMME, non. Sans ce nombre, une entrée qui
+/// gagne un témoin de plus passe pour une ligne de plus dans un tableau déjà
+/// long, et le stock des sauts grandit sans que personne ne l'ait décidé. Le
+/// poser en constante rend l'augmentation IMPOSSIBLE sans une main qui écrit le
+/// nouveau chiffre — c'est le seul geste que la porte demande, et c'est celui
+/// qui vaut décision.
+///
+/// Il ne peut que DESCENDRE au fil des rattachements. Le 06/09/2026 il valait
+/// trente ; #3519 et #3520 en ont retiré sept ; #3569 en a retiré dix-huit ;
+/// #3715 en retire les DEUX derniers qui fussent réductibles. Les trois qui
+/// restent sont irréductibles.
+const TEMOINS_SAUTES_TOLERES: usize = 3;
+
+/// `(fichier, variable, témoins, raison)`.
+///
+/// ⚠️ Les trois sauts qui restent sont **irréductibles** : ils exigent ce
+/// qu'aucun runner ne peut fournir — une session vivante, un fichier audio hors
+/// dépôt, une base de production.
+///
+/// Le quatrième, `pg_sqlite_type_parity`, ne l'était pas : il était BLOQUÉ par
+/// le rouge de #3715. Ce rouge est levé — la migration 053 convertit trois
+/// colonnes, les neuf qui restent sont inscrites nominativement dans
+/// `ECARTS_TOLERES` avec leur motif mesuré, et les deux tolérances périmées
+/// sont retirées. Son étape est posée dans `test-postgres.yml`, avec celle du
+/// témoin neuf de #3716. Cette liste ne porte donc plus AUCUN saut réductible.
 const SAUTS_CONNUS: &[(&str, &str, &[&str], &str)] = &[
-    (
-        "tune-core/src/db/pg_sqlite_type_parity.rs",
-        "TUNE_TEST_PG_URL",
-        &["aucune_exception_perimee", "parite_des_types_pg_sqlite"],
-        "Parité des types PG/SQLite : aucune étape de `test-postgres.yml` ne \
-         nomme un filtre qui les atteigne. À rattacher — une étape de plus, \
-         même base jetable.",
-    ),
-    (
-        "tune-core/src/db/postgres_e2e.rs",
-        "TUNE_TEST_PG_URL",
-        &[
-            "pg_1220_numeric_columns_have_numeric_types",
-            "pg_1752_l_antislash_de_windows_reste_litteral",
-            "pg_2168_facette_profonde_rend_le_meme_ensemble_que_sqlite",
-            "pg_2458_empty_mbid_album_artist_repair",
-            "pg_2468_runner_heals_bookmarks_position_integer_to_bigint",
-            "pg_3039_fenetre_et_decompte_des_ajouts_recents",
-            "pg_3101_les_jokers_du_nom_de_dossier_ne_filtrent_pas_plus_large",
-            "pg_albums_round_trip",
-            "pg_artists_round_trip",
-            "pg_history_round_trip",
-            "pg_hors_fonds_communautaire_compte_les_artistes_sans_mbid",
-            "pg_playlists_round_trip",
-            "pg_settings_round_trip",
-            "pg_tracks_round_trip",
-            "pg_zones_round_trip",
-        ],
-        "Les E2E historiques restent volontairement sur `scripts/pg-e2e.sh` : \
-         `test-postgres.yml` ne pose la base que pour cinq filtres nommés \
-         (#1706, #2860, #2441, `pg_config_backup`, `pg_schema_parity`). Quinze \
-         épreuves sur dix-neuf ne tournent donc sur AUCUNE porte. Le chiffre \
-         est ici pour qu'on le décide, au lieu de le découvrir.",
-    ),
     (
         "tune-core/src/orchestrator/tests.rs",
         "TUNE_DIAG_PROBE_URL",
@@ -171,26 +173,6 @@ const SAUTS_CONNUS: &[(&str, &str, &[&str], &str)] = &[
         "TUNE_REAL_DB",
         &["merge_scattered_on_a_real_database"],
         "Demande une base de production copiée à la main. Saut assumé.",
-    ),
-    (
-        "tune-server/tests/compilation_dans_les_reponses_album.rs",
-        "TUNE_TEST_PG_URL",
-        &["pg_i1957_la_colonne_est_un_entier_et_les_routes_servent_le_drapeau"],
-        "#1957 sur PostgreSQL : jamais rattaché. Le témoin SQLite jumeau tourne \
-         dans `ci.yml` ; celui-ci attend son étape.",
-    ),
-    (
-        "tune-server/tests/comptes_par_source_2147.rs",
-        "TUNE_TEST_PG_URL",
-        &["i2147_pg_la_ventilation_par_source_tourne_sur_postgresql"],
-        "#2147 sur PostgreSQL : jamais rattaché. Même famille que #3519/#3520.",
-    ),
-    (
-        "tune-server/tests/pg_2372_versions_par_piste.rs",
-        "TUNE_TEST_PG_URL",
-        &["pg_2372_versions_par_piste_rendent_le_meme_ordre_que_sqlite"],
-        "#2372 sur PostgreSQL : jamais rattaché, alors que le fichier porte \
-         `postgres` en `#![cfg]` et une cible `[[test]]` à lui.",
     ),
 ];
 
@@ -1233,6 +1215,27 @@ fn tout_temoin_sous_variable_d_environnement_est_recense() {
         }
     }
 
+    // 0. Le STOCK des sauts ne grandit pas tout seul.
+    //
+    // Les verdicts 1 et 2 tiennent la liste À JOUR ; ils ne tiennent pas sa
+    // TAILLE. Un témoin de plus inscrit dans une entrée existante les satisfait
+    // tous les deux — et le stock a grandi sans décision. Ce verdict-ci exige
+    // que le nombre soit ÉCRIT. Il vient en premier parce qu'il se lit d'un
+    // coup d'œil : un chiffre contre un chiffre.
+    let sautes_au_total: usize = sautes.values().map(Vec::len).sum();
+    assert_eq!(
+        sautes_au_total, TEMOINS_SAUTES_TOLERES,
+        "{sautes_au_total} témoin(s) sauté(s) pour {TEMOINS_SAUTES_TOLERES} \
+         toléré(s).\n\
+         Détail mesuré : {sautes:?}\n\
+         En HAUSSE : un témoin de plus ne s'exécute nulle part. Le rattacher à \
+         une étape qui pose sa variable, ou assumer le saut EN ÉCRIVANT le \
+         nouveau nombre dans TEMOINS_SAUTES_TOLERES — jamais en le laissant \
+         glisser.\n\
+         En BAISSE : un rattachement a réussi. Descendre le nombre, et retirer \
+         l'entrée devenue vide de SAUTS_CONNUS."
+    );
+
     // 1. Un saut non recensé est une DÉRIVE.
     //
     // Ce verdict passe AVANT la contre-épreuve de portée : quand une étape perd
@@ -1302,5 +1305,236 @@ fn tout_temoin_sous_variable_d_environnement_est_recense() {
         "aucun témoin n'est vu comme exécuté : soit une étape a perdu son bloc \
          `env:`, soit le calcul de portée est cassé. `test-postgres.yml` en \
          porte plusieurs, dont `pg_routes_serveur` (#3123)."
+    );
+}
+
+/// Les `required-features` de chaque cible `[[test]]` : `nom -> jeu exigé`.
+///
+/// Un fichier peut être gardé SANS porter le moindre `#![cfg]` : il suffit que
+/// sa cible exige une fonctionnalité. `plugin_wasm_contracts.rs` est dans ce
+/// cas — rien dans le fichier ne le dit, seul le manifeste le sait. Une garde
+/// qui ne lirait que les `#![cfg]` le raterait.
+fn fonctionnalites_requises(source: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut trouvees: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut dans_bloc = false;
+    let mut nom: Option<String> = None;
+    let mut exigees: BTreeSet<String> = BTreeSet::new();
+    let mut ferme = |nom: &mut Option<String>, exigees: &mut BTreeSet<String>| {
+        if let Some(n) = nom.take()
+            && !exigees.is_empty()
+        {
+            trouvees.insert(n, std::mem::take(exigees));
+        }
+        exigees.clear();
+    };
+    for ligne in source.lines() {
+        let t = ligne.trim();
+        if t.starts_with('[') {
+            ferme(&mut nom, &mut exigees);
+            dans_bloc = t == "[[test]]";
+            continue;
+        }
+        if !dans_bloc || t.starts_with('#') {
+            continue;
+        }
+        if let Some(reste) = t.strip_prefix("name")
+            && let Some(reste) = reste.trim_start().strip_prefix('=')
+        {
+            nom = Some(reste.trim().trim_matches('"').to_string());
+        } else if let Some(reste) = t.strip_prefix("required-features")
+            && let Some(reste) = reste.trim_start().strip_prefix('=')
+            && let Some(reste) = reste.trim().strip_prefix('[')
+        {
+            exigees = reste
+                .trim_end_matches(']')
+                .split(',')
+                .map(|f| f.trim().trim_matches('"').to_string())
+                .filter(|f| !f.is_empty())
+                .collect();
+        }
+    }
+    ferme(&mut nom, &mut exigees);
+    trouvees
+}
+
+/// Cette étape COMPILE-t-elle cette cible, avec ce jeu de fonctionnalités ?
+///
+/// La question n'est pas « exécute-t-elle ce témoin » — c'est celle de
+/// `execute`, une maille plus fine, réservée aux témoins sous variable
+/// d'environnement. Ici on demande seulement au compilateur de PASSER sur le
+/// fichier : un fichier que nulle étape ne compile ne peut rien prouver, quel
+/// que soit le nom de ses fonctions.
+fn compile(
+    etape: &Etape,
+    paquet: &str,
+    cible: &str,
+    exigees: &BTreeSet<String>,
+    par_defaut: &BTreeSet<String>,
+) -> bool {
+    if !etape.tout_le_workspace() && !etape.paquets().contains(&paquet) {
+        return false;
+    }
+    let mut actives = etape.fonctionnalites_nommees();
+    if !etape.sans_defauts() {
+        actives.extend(par_defaut.iter().cloned());
+    }
+    if !exigees.is_subset(&actives) {
+        return false;
+    }
+    // `--test x` ne construit QUE la cible `x` ; `--lib` n'en construit aucune.
+    if etape.mots.iter().any(|m| m == "--lib") {
+        return false;
+    }
+    let nommees = etape.cibles_nommees();
+    nommees.is_empty() || nommees.contains(&cible)
+}
+
+// ---------------------------------------------------------------------------
+// Les fichiers gardés par un jeu de fonctionnalités que NULLE porte n'active.
+//
+// Même maille que `SAUTS_CONNUS`, autre axe : là c'était la variable
+// d'environnement, ici c'est la fonctionnalité. Une entrée = un fichier, le
+// jeu qui le garde, et la raison pour laquelle aucune étape ne l'active.
+//
+// Mesure du 09/09/2026 sur `batch/bugs-9` (764bb053) : DOUZE fichiers gardés
+// par un jeu de fonctionnalités, DOUZE compilés par au moins une étape, zéro
+// sans porte. La liste est donc VIDE — et la garde ci-dessous refuse qu'elle
+// grossisse sans qu'on l'écrive.
+// ---------------------------------------------------------------------------
+/// `(caisse/chemin, raison)`.
+const SANS_PORTE_CONNUE: &[(&str, &str)] = &[];
+
+/// Tout fichier d'essais gardé par un JEU DE FONCTIONNALITÉS est compilé par
+/// au moins une étape qui l'active.
+///
+/// C'est le troisième mode de mort silencieuse d'un garde-fou, et le seul que
+/// ce fichier ne fermait pas encore. Les deux autres sont au-dessus : le
+/// fichier que personne n'enregistre (`autotests = false`), le témoin que nulle
+/// étape ne réveille (variable d'environnement). Celui-ci est plus discret que
+/// les deux : le fichier EST enregistré, il porte une cible, la garde des
+/// orphelins le voit — et `#![cfg(feature = "dj")]` le vide de sa substance
+/// dès que l'étape cesse de nommer `dj`. Le compilateur produit alors un
+/// binaire d'essai à ZÉRO test, `cargo` affiche `ok`, et personne ne relit la
+/// ligne.
+///
+/// Ce n'est pas une hypothèse : c'est #1427. Neuf essais de greffons ont dormi
+/// depuis la 0.9.61 parce que la CI validait `--features oaat` quand les
+/// binaires publiés en embarquaient six. Le dépôt en a tiré le job
+/// `test-shipped-features` — et UNE garde, `le_job_test_de_la_ci_active_bandcamp`
+/// (`workflows_bornes.rs`), qui nomme DEUX fonctionnalités à la main :
+/// `bandcamp`, et `karaoke` au titre de sa contre-épreuve. `concerts`,
+/// `plugins-wasm`, `dj` et `postgres` ne sont nommés par AUCUNE garde
+/// d'exécution : les retirer de cette ligne ne fait rougir personne. Cette
+/// porte-ci compte au lieu de nommer.
+///
+/// Elle est la jumelle, du côté de l'EXÉCUTION, de
+/// `toute_feature_declaree_est_activee_par_une_porte_clippy` (#2865) : cette
+/// dernière tient l'axe des lints, celle-ci celui du compilateur d'essais.
+///
+/// ⚠️ Sabotage qui doit le faire tomber : retirer `concerts,` de la ligne
+/// `cargo test` du job `test-shipped-features` (`ci.yml`). `concerts_plugin.rs`
+/// est alors NOMMÉ dans le message. `concerts` est choisi exprès : aucune autre
+/// garde du dépôt ne le nomme, la contre-épreuve mesure donc ce que CETTE
+/// porte-ci ajoute, et rien d'autre.
+#[test]
+fn tout_fichier_d_essais_derriere_un_jeu_de_fonctionnalites_est_compile_par_une_porte() {
+    let racine = racine();
+    let membres = membres(&racine);
+    let etapes = toutes_les_etapes(&racine);
+    assert!(
+        !etapes.is_empty(),
+        "aucune étape `cargo test` lue dans .github/workflows — le lecteur \
+         d'étapes est cassé, et cette garde passerait à vide"
+    );
+
+    let mut gardes = 0usize;
+    let mut sans_porte: Vec<(String, String)> = Vec::new();
+    let mut couverts: BTreeSet<String> = BTreeSet::new();
+
+    for (caisse, paquet) in &membres {
+        let dossier = racine.join(caisse).join("tests");
+        if !dossier.is_dir() {
+            continue;
+        }
+        let manifeste = lire(&racine.join(caisse).join("Cargo.toml"));
+        let requises = fonctionnalites_requises(&manifeste);
+        let par_defaut = defauts(&racine, caisse);
+        for (chemin, (cible, _)) in atteints(&racine, caisse) {
+            let fichier = racine.join(caisse).join(&chemin);
+            if !fichier.is_file() {
+                continue;
+            }
+            // Le jeu qui garde le fichier, des DEUX côtés : ce que le fichier
+            // dit de lui-même, et ce que le manifeste exige de sa cible.
+            let mut exigees = fonctionnalites_de_tete(&lire(&fichier));
+            if let Some(du_manifeste) = requises.get(&cible) {
+                exigees.extend(du_manifeste.iter().cloned());
+            }
+            if exigees.is_empty() {
+                continue;
+            }
+            gardes += 1;
+            let designation = format!("{caisse}/{chemin}");
+            let porteuse = etapes
+                .iter()
+                .any(|e| compile(e, paquet, &cible, &exigees, &par_defaut));
+            if porteuse {
+                couverts.insert(designation);
+            } else {
+                sans_porte.push((
+                    designation,
+                    exigees.into_iter().collect::<Vec<_>>().join(","),
+                ));
+            }
+        }
+    }
+
+    // Plancher : une garde qui ne trouve rien à garder doit ÉCHOUER, pas
+    // passer à vide. Douze fichiers gardés au 09/09/2026 ; en voir moins de
+    // huit veut dire que la lecture des `#![cfg]` ou des `required-features`
+    // s'est cassée, pas que le dépôt a rangé ses greffons.
+    assert!(
+        gardes >= 8,
+        "seulement {gardes} fichier(s) d'essais gardé(s) par un jeu de \
+         fonctionnalités : la lecture des `#![cfg(feature)]` ou des \
+         `required-features` ne voit plus ce qu'elle doit lire"
+    );
+
+    let inattendus: Vec<&(String, String)> = sans_porte
+        .iter()
+        .filter(|(chemin, _)| !SANS_PORTE_CONNUE.iter().any(|(c, _)| c == chemin))
+        .collect();
+    assert!(
+        inattendus.is_empty(),
+        "ces fichiers d'essais sont gardés par un jeu de fonctionnalités que \
+         NULLE étape `cargo test` n'active — ils compilent à VIDE et leurs \
+         essais ne tournent nulle part : {inattendus:?}\n\
+         Deux issues : ajouter la fonctionnalité à une étape de \
+         `.github/workflows/`, ou inscrire le fichier dans `SANS_PORTE_CONNUE` \
+         avec la RAISON."
+    );
+
+    // Une tolérance qui vieillit en silence est un garde-fou mort : une entrée
+    // devenue couverte doit rougir pour qu'on la RETIRE, pas dormir.
+    let perimees: Vec<&str> = SANS_PORTE_CONNUE
+        .iter()
+        .filter(|(chemin, _)| couverts.contains(*chemin))
+        .map(|(chemin, _)| *chemin)
+        .collect();
+    assert!(
+        perimees.is_empty(),
+        "SANS_PORTE_CONNUE ne décrit plus la réalité : {perimees:?} sont \
+         désormais compilés par une étape. Retire leur entrée."
+    );
+
+    // Contre-épreuve du calcul, sens POSITIF : un `compile` qui rendrait
+    // TOUJOURS faux remplirait `sans_porte` et se lirait dans le verdict
+    // ci-dessus ; un `compile` qui rendrait TOUJOURS vrai passerait ici à vide
+    // sans que rien ne le dise. Cette assertion-là le dit.
+    assert!(
+        !couverts.is_empty(),
+        "aucun fichier gardé n'est vu comme compilé : le calcul de portée est \
+         cassé. `ci.yml` en porte plusieurs, dont le job \
+         `test-shipped-features` qui active `dj,karaoke,bandcamp,concerts`."
     );
 }

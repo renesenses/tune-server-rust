@@ -149,6 +149,12 @@ async fn le_temoin_une_zone_locale_applique_le_crossfeed_sans_rien_annoncer() {
 /// Le cœur de #2742 : sur une zone DLNA, activer le crossfeed rend un statut
 /// qui dit `unavailable`, avec un motif STABLE et une phrase en clair.
 ///
+/// Le motif a changé avec LAT-F1 : `network_progressive_off` et non plus
+/// `non_local_output`. Une zone réseau PEUT désormais entendre le crossfeed —
+/// via le relais du bras progressif — mais seulement si l'opt-in
+/// `dsp_progressif_reseau` est armé, et il ne l'est pas ici. L'ancien message
+/// renvoyait l'utilisateur changer de zone ; le nouveau, cocher une case.
+///
 /// Avant, cette réponse ne portait que `crossfeed` (la valeur enregistrée) et
 /// `crossfeed_applied_live: false` — dont le commentaire dit lui-même qu'il ne
 /// signale pas un échec. L'utilisateur ne pouvait rien en déduire.
@@ -175,7 +181,7 @@ async fn une_zone_reseau_annonce_que_le_crossfeed_n_agira_pas() {
     );
     assert_eq!(
         st["reason"].as_str(),
-        Some("non_local_output"),
+        Some("network_progressive_off"),
         "le client lit ce code pour choisir sa traduction : {st}"
     );
     let detail = st["detail"].as_str().unwrap_or_default();
@@ -184,7 +190,7 @@ async fn une_zone_reseau_annonce_que_le_crossfeed_n_agira_pas() {
         "une contrainte sans explication, c'est le défaut de #2742"
     );
     assert!(
-        detail.contains("locale"),
+        detail.contains("progressif"),
         "l'explication doit dire ce que l'utilisateur PEUT faire : {detail}"
     );
     assert_eq!(
@@ -219,7 +225,7 @@ async fn la_relecture_verrouille_le_controle_meme_case_decochee() {
         Some(true),
         "le contrôle doit être verrouillé AVANT le premier clic : {corps}"
     );
-    assert_eq!(st["reason"].as_str(), Some("non_local_output"));
+    assert_eq!(st["reason"].as_str(), Some("network_progressive_off"));
 }
 
 /// Le mode PURE, sur une sortie locale, désarme le crossfeed — et le dit avec

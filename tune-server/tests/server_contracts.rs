@@ -43,6 +43,8 @@ mod collections_ordre_albums;
 mod compilation_dans_les_reponses_album;
 #[path = "config_secrets_et_roles.rs"]
 mod config_secrets_et_roles;
+#[path = "consommateur_hors_arbre.rs"]
+mod consommateur_hors_arbre;
 #[path = "contexte_de_session.rs"]
 mod contexte_de_session;
 #[path = "credits_enrichissement_statut.rs"]
@@ -57,6 +59,9 @@ mod enrich_artiste_langue_entete;
 mod enrichissement_repertoire;
 #[path = "eq_refus_premium_localise.rs"]
 mod eq_refus_premium_localise;
+// Etiqueter un album de STREAMING : les deux espaces d'identifiants (#3699).
+#[path = "etiquettes_streaming_3699.rs"]
+mod etiquettes_streaming_3699;
 #[path = "etiquettes_types_et_playlists.rs"]
 mod etiquettes_types_et_playlists;
 #[path = "explorateur_dossiers.rs"]
@@ -65,6 +70,8 @@ mod explorateur_dossiers;
 mod extraction_cd_ne_promet_pas_ce_qu_elle_ne_fait_pas;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
+#[path = "famine_mesuree_3205.rs"]
+mod famine_mesuree_3205;
 #[path = "favoris_cloisonnement_par_profil.rs"]
 mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
@@ -105,6 +112,8 @@ mod paroles_ecriture_fichiers;
 mod paroles_source_lrclib;
 #[path = "piste_artiste_par_id.rs"]
 mod piste_artiste_par_id;
+#[path = "plafond_zones_gratuit.rs"]
+mod plafond_zones_gratuit;
 #[path = "playlist_manager_cloisonnement_par_profil.rs"]
 mod playlist_manager_cloisonnement_par_profil;
 #[path = "playlists_cloisonnement_par_profil.rs"]

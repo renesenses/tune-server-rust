@@ -18,26 +18,71 @@ use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 
+/// La clé i18n du refus « plafond de zones du gratuit », dans
+/// `i18n_server.json`. Elle porte un `{n}` que l'appelant remplace par le
+/// plafond, et sa seconde moitié nomme les protocoles — c'est elle qui
+/// aurait évité #3672.
+const CLE_PLAFOND_ZONES: &str = "zone.freeCapReached";
+
+/// Le **code stable** du refus, le seul terme du contrat avec les clients :
+/// distinct de `premium_required`, qui désigne une FONCTION payante alors
+/// qu'ici rien n'est payant — l'utilisateur a simplement consommé ses zones.
+/// Même doctrine que `Feature::code` (#2392/#2419) : le client traduit sur le
+/// code, `message` n'est qu'un repli.
+const CODE_PLAFOND_ZONES: &str = "free_zone_cap_reached";
+
+/// Le 402 « vos zones gratuites sont prises », **seul** constructeur de cette
+/// forme (#3672, #3673).
+///
+/// `lang` est déjà résolu (`i18n::lang_from_header`). `error` reste
+/// `premium_required` : c'est là-dessus que les clients trient depuis #2178
+/// (`estRefusPremium`, `statutHttp`), et le casser leur ferait avaler le refus.
+/// Ce qui change, c'est que le sens vit désormais dans `code`, que les nombres
+/// voyagent, et que la phrase est traduite.
+fn refus_plafond_zones(actives: i64, limite: i64, lang: &str) -> axum::response::Response {
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        Json(json!({
+            "error": "premium_required",
+            "code": CODE_PLAFOND_ZONES,
+            "zone_limit": limite,
+            "zones_actives": actives,
+            "message": crate::i18n::t(lang, CLE_PLAFOND_ZONES)
+                .replace("{n}", &limite.to_string()),
+            "upgrade_url": "https://mozaiklabs.fr/pricing",
+        })),
+    )
+        .into_response()
+}
+
 /// Map an orchestrator play error to an appropriate HTTP status code.
 ///
 /// Streaming service failures (yt-dlp, API errors, auth) are upstream issues
 /// and should be 502 Bad Gateway, not 500 Internal Server Error.
 /// Device-offline errors are 503 Service Unavailable.
 /// Everything else is 500.
-fn play_error_response(e: String) -> axum::response::Response {
-    // Free-tier zone cap sentinel from orchestrator.play() → clean 402 the
-    // web/app can render as an upgrade prompt.
-    if let Some(msg) = e.strip_prefix("premium_required:") {
-        return (
-            StatusCode::PAYMENT_REQUIRED,
-            Json(json!({
-                "error": "premium_required",
-                "feature": "Unlimited Zones",
-                "message": msg,
-                "upgrade_url": "https://mozaiklabs.fr/pricing",
-            })),
-        )
-            .into_response();
+///
+/// `lang` est la langue de la requête (`i18n::lang_from_header`) : le refus du
+/// plafond de zones est la seule branche qui s'en serve aujourd'hui, mais elle
+/// est passée à TOUS les appelants pour que la suivante n'ait pas à rouvrir
+/// cinq signatures.
+fn play_error_response(e: String, lang: &str) -> axum::response::Response {
+    // Sentinelle « plafond de zones » de orchestrator.play() → 402 traduit,
+    // avec le code stable et les deux nombres. Le format est
+    // `free_zone_cap:<actives>:<limite>` : la phrase se compose ICI, pas dans
+    // le cœur, parce que c'est ici qu'on sait quelle langue l'utilisateur a
+    // choisie.
+    if let Some(chiffres) = e.strip_prefix("free_zone_cap:") {
+        let mut parts = chiffres.split(':');
+        let actives = parts
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let limite = parts
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        return refus_plafond_zones(actives, limite, lang);
     }
     // Orphan-zone sentinel from orchestrator.play(): the zone row has no
     // output_device_id, so playback can never produce sound (Yacine, 24/07).
@@ -391,6 +436,13 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     if let Some(obj) = v.as_object_mut() {
         crate::routes::zones::inject_metadata_anchor(obj, &zone_state);
         crate::routes::zones::inject_session_context(obj, &zone_state);
+        // #2672 — LE défaut. Cette charge utile, rendue par une vingtaine de
+        // routes de lecture, ne portait aucun des neuf réglages du panneau
+        // « Avancé · renderer », alors que `GET /zones` et `GET /zones/{id}`
+        // les portent. Un client qui remplace son objet zone par la réponse
+        // d'un `play` les voyait donc disparaître à chaque changement de
+        // fichier — sans qu'une seule ligne de la base ait bougé.
+        crate::routes::zones::injecter_reglages_renderer(obj, &zone_repo, zone_id);
     }
     // Où va le son — même champ que GET /zones et GET /zones/{id} (#1499).
     if let Some(ref zone) = zone_db {
@@ -1003,10 +1055,13 @@ mod refus_de_format_3234 {
     /// frontières ne peuvent pas diverger sans que ceci rougisse.
     #[tokio::test]
     async fn la_route_nomme_le_format_refuse_au_lieu_de_rendre_un_500() {
-        let reponse = play_error_response(format!(
-            "format_not_playable:{}",
-            tune_core::audio::iso_sacd::MOTIF_ISO_SACD_NON_EXTRAIT
-        ));
+        let reponse = play_error_response(
+            format!(
+                "format_not_playable:{}",
+                tune_core::audio::iso_sacd::MOTIF_ISO_SACD_NON_EXTRAIT
+            ),
+            "fr",
+        );
 
         assert_eq!(
             reponse.status(),
@@ -1104,7 +1159,7 @@ mod refus_de_format_3234 {
     /// sans quoi le nouveau 422 avalerait des pannes réelles.
     #[tokio::test]
     async fn une_panne_de_lecture_ordinaire_garde_son_code() {
-        let reponse = play_error_response("decode timeout".into());
+        let reponse = play_error_response("decode timeout".into(), "fr");
         assert_eq!(reponse.status(), StatusCode::BAD_GATEWAY);
         let corps = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
             .await
@@ -1196,8 +1251,13 @@ async fn play(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     body: Option<Json<PlayRequest>>,
 ) -> impl IntoResponse {
+    // La langue CHOISIE dans l'application, que le client web envoie sur
+    // chaque requete : c'est elle qui decide dans quelle langue un refus se
+    // lit (#3672). Relevee une fois, passee a tous les refus de ce handler.
+    let lang = crate::i18n::lang_from_header(&headers);
     // A user-initiated play starts (or takes over) the listening session on
     // this zone: stamp the caller's profile so record_listen — and every
     // autoplay / gapless advance that inherits it — tags listen_history to the
@@ -1456,7 +1516,7 @@ async fn play(
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
-            Err(e) => play_error_response(e).into_response(),
+            Err(e) => play_error_response(e, &lang).into_response(),
         };
     }
 
@@ -1558,7 +1618,7 @@ async fn play(
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
-            Err(e) => play_error_response(e).into_response(),
+            Err(e) => play_error_response(e, &lang).into_response(),
         };
     }
 
@@ -1687,7 +1747,7 @@ async fn play(
                 }
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
-            Err(e) => play_error_response(e).into_response(),
+            Err(e) => play_error_response(e, &lang).into_response(),
         };
     }
 
@@ -1764,7 +1824,7 @@ async fn play(
                     Json(build_zone_json_with_result(&state, zone_id, &result).await)
                         .into_response()
                 }
-                Err(e) => play_error_response(e),
+                Err(e) => play_error_response(e, &lang),
             };
         }
         // No now_playing — try queue fallback (same as empty-body path)
@@ -1909,7 +1969,7 @@ async fn play(
             persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
-        Err(e) => play_error_response(e),
+        Err(e) => play_error_response(e, &lang),
     }
 }
 
@@ -1925,7 +1985,12 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
     }
 }
 
-async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+async fn resume(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let current = state.playback.get_state(zone_id).await;
 
     // Zone à l'arrêt avec une piste en mémoire : on la rejoue — à la position
@@ -1979,7 +2044,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                     Json(build_zone_json_with_result(&state, zone_id, &result).await)
                         .into_response()
                 }
-                Err(e) => play_error_response(e),
+                Err(e) => play_error_response(e, &lang),
             };
         }
     }
@@ -2038,7 +2103,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
                             .into_response()
                     }
-                    Err(e) => play_error_response(e),
+                    Err(e) => play_error_response(e, &lang),
                 };
             }
         }
@@ -2074,7 +2139,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
                             .into_response()
                     }
-                    Err(e) => play_error_response(e),
+                    Err(e) => play_error_response(e, &lang),
                 };
             }
         }
@@ -2128,10 +2193,16 @@ fn reject_if_zone_has_no_output_device(
         .flatten()?;
     if zone.output_device_id.is_none() && zone.output_type.as_deref() != Some("browser") {
         warn!(zone_id, zone_name = %zone.name, "play_rejected_zone_without_output_device");
-        return Some(play_error_response(format!(
-            "zone_no_output_device:Zone '{}' has no output device assigned — assign an output device to this zone or delete it and re-create it from a device.",
-            zone.name
-        )));
+        // Cette branche-ci ne consulte pas la langue (son message nomme la
+        // zone, il n'est pas traduit) : la valeur passee est le defaut de
+        // l'application, comme `require_premium` sans en-tetes.
+        return Some(play_error_response(
+            format!(
+                "zone_no_output_device:Zone '{}' has no output device assigned — assign an output device to this zone or delete it and re-create it from a device.",
+                zone.name
+            ),
+            "fr",
+        ));
     }
     None
 }
@@ -2980,8 +3051,10 @@ async fn queue_move(
 async fn queue_jump(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<QueueJumpRequest>,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     match state
         .orchestrator
         .play_from_queue(zone_id, body.position)
@@ -2991,11 +3064,33 @@ async fn queue_jump(
             persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
-        Err(e) => play_error_response(e),
+        Err(e) => play_error_response(e, &lang),
     }
 }
 
+/// 🔴 #3669 — « Vider la file » est un ORDRE D'ARRÊT, pas un repeint d'écran.
+///
+/// Laurent (fil 182, Atoll ST300 en DLNA) : « Le vidage de la liste de lecture
+/// est visible à l'affichage. Mais l'album continue à être joué. » La route
+/// vidait la table, le préchargement, l'état en mémoire et le fichier
+/// persistant — QUATRE gestes dont aucun ne parlait au périphérique.
+///
+/// `stop_and_clear` porte pourtant « Stop playback » dans son nom et dans son
+/// commentaire : il écrit `PlayState::Stopped` dans un `HashMap` sous mutex et
+/// émet un évènement d'interface. C'est tout. Le renderer, lui, n'a jamais reçu
+/// de `Stop` et continue le flux qu'il tient déjà — « une mise en cache de
+/// l'album en cours qui ne peut être annulé ».
+///
+/// Le vrai arrêt est celui de la route `stop` : `get_zone_device_id` puis
+/// `orchestrator.stop(zone_id, device_id)`, qui persiste la position, écrit
+/// `last_play_state = "stopped"` EN BASE, ferme la session gapless, oublie la
+/// dernière émission réseau et coupe le flux sur la sortie. C'est ce même appel
+/// qui est posé ici, et il vient EN PREMIER : `orchestrator.stop` a besoin du
+/// `now_playing` encore présent pour retrouver le `stream_id` de la session à
+/// fermer, que `stop_and_clear` met à `None` juste après.
 async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+    let device_id = get_zone_device_id(&state, zone_id);
+    state.orchestrator.stop(zone_id, device_id.as_deref()).await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     queue_repo.clear(zone_id).ok();
     state.orchestrator.clear_prefetch().await;
@@ -3987,7 +4082,9 @@ async fn clear_zone_pin(
 async fn invoke_zone_pin(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     // `InvokeIndex` : l'appareil déclenche lui-même sa source. Tune n'a rien à
     // orchestrer, et surtout rien à acquitter à sa place.
     if let Some(service) = zone_pins_service(&state, zone_id).await {
@@ -4030,7 +4127,7 @@ async fn invoke_zone_pin(
         Ok(result) => {
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
-        Err(e) => play_error_response(e),
+        Err(e) => play_error_response(e, &lang),
     }
 }
 
@@ -4415,7 +4512,9 @@ fn reponse_shuffle(
 pub async fn shuffle_all(
     State(state): State<AppState>,
     Query(q): Query<ShuffleAllQuery>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     // Lu UNE fois par requête, puis passé à toutes les branches. Les cinq
@@ -4578,8 +4677,26 @@ pub async fn shuffle_all(
         duration_ms: track.as_ref().map(|t| t.duration_ms),
         seek_ms: None,
         temp_file_path: None,
+        // `None` DELIBERE, et non un oubli — #2250 demandait de les renseigner
+        // depuis `track` « comme les autres champs ». Ce serait un no-op :
+        //
+        // 1. leur unique consommateur est la branche « serveur media / podcast »
+        //    de `resolve_direct.rs` (les attributs `res@` du DIDL que le client
+        //    recopie), atteinte seulement quand `req.source` vaut autre chose
+        //    que `local` — ce que cette demande ne fait jamais (`source: None`) ;
+        // 2. la resolution ANNONCEE d'une piste locale est relue de la ligne
+        //    `tracks` par `composer_le_now_playing`, a partir du seul
+        //    `track_id` ci-dessus ;
+        // 3. le bouton « Lire » ne les transmet pas davantage : il passe
+        //    `body.sample_rate` / `body.bit_depth`, et un client qui demarre une
+        //    piste de la bibliotheque n'envoie ni l'un ni l'autre.
+        //
+        // Garde qui l'etablit en APPELANT les deux chemins sur la meme ligne :
+        // `tune-core/src/orchestrator/annonce_lire_contre_aleatoire.rs`.
         sample_rate: None,
         bit_depth: None,
+        // Meme raison : `composer_le_now_playing` les reprend de la ligne
+        // (`media_track_number` / `media_disc_number`) quand la demande se tait.
         media_format: None,
         track_number: None,
         disc_number: None,
@@ -4598,7 +4715,7 @@ pub async fn shuffle_all(
             }
             Json(resp).into_response()
         }
-        Err(e) => play_error_response(e),
+        Err(e) => play_error_response(e, &lang),
     }
 }
 
@@ -5194,7 +5311,7 @@ mod tests {
     }
 
     async fn parts(e: &str) -> (StatusCode, serde_json::Value) {
-        response_parts(play_error_response(e.to_string())).await
+        response_parts(play_error_response(e.to_string(), "fr")).await
     }
 
     async fn response_parts(resp: axum::response::Response) -> (StatusCode, serde_json::Value) {
@@ -5274,9 +5391,24 @@ mod tests {
 
     #[tokio::test]
     async fn sentinel_branches_unchanged() {
-        let (status, body) = parts("premium_required:3 zones max en Free").await;
+        // Le plafond de zones ne voyage plus comme une PHRASE toute faite
+        // (#3672) : la sentinelle porte les NOMBRES, et la phrase se compose
+        // ici, dans la langue de la requete. Le corps gagne au passage le code
+        // stable qui distingue « vos zones sont prises » de « cette fonction
+        // est payante » — c'est cette confusion-la qui a coute un prospect.
+        let (status, body) = parts("free_zone_cap:3:3").await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         assert_eq!(body["error"], "premium_required");
+        assert_eq!(body["code"], "free_zone_cap_reached");
+        assert_eq!(body["zone_limit"], 3);
+        assert_eq!(body["zones_actives"], 3);
+        assert!(
+            !body["message"]
+                .as_str()
+                .unwrap()
+                .contains("Free tier is limited"),
+            "la phrase anglaise codee en dur est revenue : {body}"
+        );
 
         let (status, body) = parts("zone_no_output_device:aucune sortie").await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -5939,5 +6071,133 @@ mod demarrage_detache_annonce_3270 {
             "// remplissage\n".repeat(60)
         );
         assert_eq!(demarrages_detaches_muets(&loin), vec![1]);
+    }
+}
+
+/// 🔴 #3669 — vider la file d'attente doit ARRÊTER le périphérique.
+///
+/// Garde de SITE D'APPEL : elle appelle `super::queue_clear`, la route montée
+/// sur `POST /zones/{id}/queue/clear`, et regarde ce qui est SORTI du serveur —
+/// la commande reçue par la sortie, et l'état de lecture écrit en base. Elle ne
+/// lit aucune source : `stop_and_clear` passait déjà cette zone en « stopped »
+/// dans son `HashMap`, et c'est précisément la mesure qui mentait.
+///
+/// Sans l'appel à `orchestrator.stop` posé dans `queue_clear`, les deux
+/// assertions tombent : `stop_call_count()` reste à 0 (le renderer n'a jamais
+/// reçu de `Stop` et continue son flux) et `get_last_play_state` reste
+/// `"playing"`.
+#[cfg(test)]
+mod vider_la_file_arrete_le_peripherique_3669 {
+    use crate::state::AppState;
+    use axum::extract::{Path, State};
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::outputs::mock::MockOutput;
+    use tune_core::playback::NowPlaying;
+
+    const APPAREIL: &str = "uuid:atoll-st300";
+
+    /// Une zone DLNA qui JOUE : une sortie enregistrée, une file, un
+    /// `now_playing`, et `last_play_state = "playing"` en base.
+    async fn zone_en_lecture() -> (AppState, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("AppState");
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = repo
+            .create("Salon", Some("dlna"), Some(APPAREIL))
+            .expect("création de zone");
+        state.outputs.lock().await.register(Box::new(
+            MockOutput::new(APPAREIL, "Atoll ST300").with_type("dlna"),
+        ));
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(
+                zone_id,
+                &[QueueInput::Streaming {
+                    source: "qobuz".into(),
+                    source_id: "a1".into(),
+                    title: "Piste".into(),
+                    artist: "Artiste".into(),
+                    album: None,
+                    cover_url: None,
+                    duration_ms: 200_000,
+                    track_number: None,
+                    disc_number: None,
+                }],
+            )
+            .expect("mise en file");
+        state
+            .playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "Piste".into(),
+                    source: "qobuz".into(),
+                    source_id: Some("a1".into()),
+                    duration_ms: 200_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        repo.save_play_state(zone_id, "playing")
+            .expect("état de lecture initial");
+        (state, zone_id)
+    }
+
+    /// Combien de `Stop` la sortie a REÇUS. Zéro est la mesure du défaut : le
+    /// renderer garde la main sur son flux.
+    async fn arrets_recus(state: &AppState) -> u64 {
+        let registre = state.outputs.lock().await;
+        let arc = registre.get(APPAREIL).expect("sortie enregistrée");
+        let sortie = arc.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("MockOutput")
+            .stop_call_count()
+    }
+
+    #[tokio::test]
+    async fn queue_clear_envoie_un_stop_a_la_sortie_et_ecrit_stopped_en_base() {
+        let (state, zone_id) = zone_en_lecture().await;
+        assert_eq!(
+            arrets_recus(&state).await,
+            0,
+            "rien ne doit être arrêté avant le geste"
+        );
+
+        let _ = super::queue_clear(State(state.clone()), Path(zone_id)).await;
+
+        assert_eq!(
+            arrets_recus(&state).await,
+            1,
+            "« vider la file » doit envoyer UN Stop au périphérique — sans lui, \
+             l'écran affiche « arrêté » et l'album continue (Laurent, fil 182)"
+        );
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("stopped".into()),
+            "la base doit dire « stopped » : c'est elle que relisent le poller \
+             et la reprise, pas le HashMap de PlaybackManager"
+        );
+        assert_eq!(
+            PlayQueueRepo::with_backend(state.backend.clone())
+                .count_all(zone_id)
+                .unwrap_or(-1),
+            0,
+            "et la file reste vidée — l'arrêt s'AJOUTE au geste, il ne le remplace pas"
+        );
+    }
+
+    /// L'autre moitié de la contre-épreuve, en positif : la route `stop`
+    /// produit exactement la même sortie observable. C'est elle qui nomme
+    /// l'appel manquant.
+    #[tokio::test]
+    async fn la_route_stop_produit_la_meme_sortie_observable() {
+        let (state, zone_id) = zone_en_lecture().await;
+        let _ = super::stop(State(state.clone()), Path(zone_id)).await;
+        assert_eq!(arrets_recus(&state).await, 1);
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("stopped".into())
+        );
     }
 }

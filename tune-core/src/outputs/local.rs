@@ -3531,6 +3531,222 @@ impl SharedDeviceResolution {
     }
 }
 
+/// Repli entier, HORS de toute branche : les DEUX chemins de sortie locale
+/// s'en servent.
+///
+/// Il vivait à l'intérieur du chemin PCM, où seul celui-ci pouvait l'appeler.
+/// La branche compressée — celle qu'emprunte TOUT flux non-WAV, donc toute
+/// piste servie par un serveur multimédia (`source=upnp`), une radio en FLAC,
+/// un podcast, Bandcamp — n'avait aucun repli et abandonnait à la première
+/// erreur (#3618, Belkadi Yacine, DENAFRIPS Terminator II :
+/// « Sample format 'f32' is not supported by hardware in any endianness »).
+/// Le remède était déjà écrit dans ce fichier ; il n'était pas branché.
+///
+/// Bit-perfect USB DACs (XMOS/Totaldac, Nagra, …) frequently reject
+/// float and only accept integer PCM: cpal's f32 build_output_stream
+/// then fails with "Sample format 'f32' is not supported by hardware".
+/// This builds the same stream in an integer format instead, converting
+/// the f32 ring-buffer samples on the fly (reuses symphonia's IntoSample,
+/// as orchestrator.rs already does). Only used as a fallback after both
+/// f32 attempts fail, so the f32 happy path is untouched (Pascal, XMOS
+/// USB Audio 2.0 → Totaldac).
+fn build_int_stream<T>(
+    device: &cpal::Device,
+    cfg: &cpal::StreamConfig,
+    ring_cb: Arc<RingBuf>,
+    vol_cb: Arc<AtomicU32>,
+    paused_cb: Arc<AtomicBool>,
+    silent_cb: Arc<AtomicBool>,
+    ds_cb: Arc<AtomicBool>,
+    min_buf: usize,
+    device_gone: Arc<AtomicBool>,
+    soft_mute_cb: crate::audio::soft_mute::SoftMuteGate,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample + Send + 'static,
+    f32: symphonia::core::audio::conv::IntoSample<T>,
+{
+    use symphonia::core::audio::conv::IntoSample;
+    let zero: T = 0.0f32.into_sample();
+    let mut scratch: Vec<f32> = Vec::new();
+    let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
+    device.build_output_stream(
+        cfg,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            let n = data.len();
+            // Rampe anti-« ploc » (#1590). Ce chemin sert les DAC
+            // qui refusent le flottant : la rampe y est armée par la
+            // même porte, donc toujours désarmée sur DoP, en PURE et
+            // en sortie exclusive.
+            ramp_cb.arm(soft_mute_cb.armed_ms());
+            let silence = paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
+            if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
+                data.fill(zero);
+                return;
+            }
+            if !ds_cb.load(Ordering::Acquire) {
+                if ring_cb.available() < min_buf {
+                    data.fill(zero);
+                    return;
+                }
+                ds_cb.store(true, Ordering::Release);
+            }
+            if scratch.len() < n {
+                scratch.resize(n, 0.0);
+            }
+            let buf = &mut scratch[..n];
+            let read = ring_cb.pop(buf);
+            let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+            // La rampe module le tampon f32 AVANT la conversion en
+            // mot entier : convertir puis multiplier ferait le
+            // produit dans le format du DAC, hors du contrat de
+            // `IntoSample`.
+            ramp_cb.apply(&mut buf[..read], v);
+            for (o, s) in data[..read].iter_mut().zip(&buf[..read]) {
+                *o = (*s).into_sample();
+            }
+            data[read..].fill(zero);
+        },
+        make_stream_error_cb(device_gone),
+        None,
+    )
+}
+
+/// Le pendant `f32` de [`build_int_stream`] pour le chemin « flux compressé ».
+///
+/// Extrait tel quel de la branche compressée, sans changer une ligne du rappel
+/// de rendu : le chemin heureux — celui de l'immense majorité des DAC — reste
+/// exactement ce qu'il était. Ce qui change est qu'il devient UNE tentative
+/// parmi d'autres au lieu d'être la seule (#3618).
+#[allow(clippy::too_many_arguments)]
+fn build_compressed_f32_stream(
+    device: &cpal::Device,
+    cfg: &cpal::StreamConfig,
+    ring_cb: Arc<RingBuf>,
+    vol_cb: Arc<AtomicU32>,
+    paused_cb: Arc<AtomicBool>,
+    silent_cb: Arc<AtomicBool>,
+    ds_cb: Arc<AtomicBool>,
+    min_buf: usize,
+    device_gone: Arc<AtomicBool>,
+    soft_mute_cb: crate::audio::soft_mute::SoftMuteGate,
+) -> Result<cpal::Stream, cpal::BuildStreamError> {
+    let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
+    device.build_output_stream(
+        cfg,
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            // Rampe anti-« ploc » (#1590) : au lieu de sauter de l'amplitude
+            // courante à zéro, le gain glisse sur quelques dizaines de
+            // millisecondes. `arm(0)` — DoP, PURE, sortie exclusive — rend
+            // exactement la coupure franche d'avant.
+            ramp_cb.arm(soft_mute_cb.armed_ms());
+            let silence = paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
+            if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
+                data.fill(0.0);
+                return;
+            }
+            // Wait for a minimum amount of data before starting to read from
+            // the ring buffer. This prevents the audio device from playing
+            // stale/garbage samples during track transitions.
+            if !ds_cb.load(Ordering::Acquire) {
+                if ring_cb.available() < min_buf {
+                    data.fill(0.0);
+                    return;
+                }
+                ds_cb.store(true, Ordering::Release);
+            }
+            let read = ring_cb.pop(data);
+            let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+            ramp_cb.apply(&mut data[..read], v);
+            if read < data.len() {
+                data[read..].fill(0.0);
+            }
+        },
+        make_stream_error_cb(device_gone),
+        None,
+    )
+}
+
+/// Le format d'échantillon d'une tentative d'ouverture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormatDeSortie {
+    F32,
+    I32,
+    I16,
+}
+
+impl FormatDeSortie {
+    pub(crate) fn nom(self) -> &'static str {
+        match self {
+            FormatDeSortie::F32 => "f32",
+            FormatDeSortie::I32 => "i32",
+            FormatDeSortie::I16 => "i16",
+        }
+    }
+}
+
+/// L'ordre dans lequel on tente d'ouvrir une sortie locale.
+///
+/// **C'est la règle du chemin PCM, extraite pour que la branche compressée
+/// puisse enfin l'emprunter** (#3618). Elle était écrite en dur dans un bloc de
+/// `play_url`, donc inatteignable depuis l'autre branche — et une piste servie
+/// par un serveur multimédia (`source=upnp`) arrive TOUJOURS par l'autre
+/// branche, parce que `orchestrator/commun.rs` l'envoie sur `resolve_direct`,
+/// qui rend l'URL inchangée : pas d'en-tête WAV, donc `parse_wav_header` rend
+/// `None`.
+///
+/// L'ordre est : `f32` d'abord, aux deux cadences — le chemin heureux reste
+/// intact et n'essaie rien de nouveau — puis la cascade entière `i32`/`i16`,
+/// cadence choisie puis cadence source. Les DAC USB bit-perfect
+/// (XMOS/Totaldac, Nagra, DENAFRIPS) refusent fréquemment le flottant :
+/// « Sample format 'f32' is not supported by hardware in any endianness ».
+///
+/// La cadence source n'est ajoutée que si elle diffère : inutile de tenter
+/// deux fois exactement la même ouverture.
+pub(crate) fn cascade_de_formats(
+    principal: &cpal::StreamConfig,
+    source: &cpal::StreamConfig,
+) -> Vec<(cpal::StreamConfig, FormatDeSortie)> {
+    let mut cadences = vec![principal.clone()];
+    if source.sample_rate != principal.sample_rate || source.channels != principal.channels {
+        cadences.push(source.clone());
+    }
+    let mut tentatives = Vec::with_capacity(cadences.len() * 3);
+    for c in &cadences {
+        tentatives.push((c.clone(), FormatDeSortie::F32));
+    }
+    for c in &cadences {
+        for f in [FormatDeSortie::I32, FormatDeSortie::I16] {
+            tentatives.push((c.clone(), f));
+        }
+    }
+    tentatives
+}
+
+/// Tente les ouvertures dans l'ordre et rend la PREMIÈRE acceptée.
+///
+/// Générique sur ce qu'ouvre `ouvrir` : la production y passe une fermeture qui
+/// appelle `build_compressed_f32_stream` / `build_int_stream::<i32>` /
+/// `::<i16>`, les épreuves y passent un périphérique factice qui note ce qu'on
+/// lui demande. Toutes les erreurs sont conservées : sans la première, on ne
+/// peut pas classer la panne ni la nommer à l'écran.
+pub(crate) fn ouvrir_premier_format_accepte<S, E, F>(
+    tentatives: &[(cpal::StreamConfig, FormatDeSortie)],
+    mut ouvrir: F,
+) -> Result<(S, cpal::StreamConfig, FormatDeSortie), Vec<E>>
+where
+    F: FnMut(&cpal::StreamConfig, FormatDeSortie) -> Result<S, E>,
+{
+    let mut echecs = Vec::new();
+    for (cfg, format) in tentatives {
+        match ouvrir(cfg, *format) {
+            Ok(s) => return Ok((s, cfg.clone(), *format)),
+            Err(e) => echecs.push(e),
+        }
+    }
+    Err(echecs)
+}
+
 fn record_shared_device_not_found(
     error: SharedDeviceResolution,
     requested_device: &str,
@@ -4825,71 +5041,128 @@ impl OutputTarget for LocalOutput {
                     }
                 };
 
-                let output_sr = output_config.sample_rate;
-                let output_ch = output_config.channels;
+                // Cadence SOURCE : le second candidat de la cascade. Certaines
+                // plateformes (PipeWire) acceptent une cadence arbitraire là où
+                // la cadence par défaut du périphérique est refusée.
+                let source_config = cpal::StreamConfig {
+                    channels: dec_ch,
+                    sample_rate: dec_sr,
+                    buffer_size: cpal::BufferSize::Default,
+                };
 
-                let ring_cap = (output_sr as usize) * (output_ch as usize) * 2;
-                starvation.begin_stream(output_sr, output_ch);
-                let ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
-                ring.clear(); // Defensive: zero-fill before callback can read
-                let ring_cb = ring.clone();
-                let vol_cb = volume.clone();
-                let paused_cb = paused.clone();
-                let silent_cb = force_silent.clone();
-                let soft_mute_cb = soft_mute.clone();
-                let mut ramp_cb = soft_mute_cb.ramp(output_sr, output_ch);
                 // Gate: output silence until enough real data has been buffered.
                 // Prevents stale/garbage audio during track transitions.
                 // Minimum: ~500ms of audio at the output sample rate.
                 // (v0.8.97=20ms, v0.8.98=200ms — still too low for macOS
                 // CoreAudio which can request 1024+ frame buffers.)
                 let data_started = Arc::new(AtomicBool::new(false));
-                let data_started_cb = data_started.clone();
-                let min_buffer_samples = (output_sr as usize) * (output_ch as usize) / 2; // ~500ms
 
-                let stream = match device.build_output_stream(
-                    &output_config,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        // Rampe anti-« ploc » (#1590) : au lieu de sauter de
-                        // l'amplitude courante à zéro, le gain glisse sur
-                        // quelques dizaines de millisecondes. `arm(0)` — DoP,
-                        // PURE, sortie exclusive — rend exactement la coupure
-                        // franche d'avant.
-                        ramp_cb.arm(soft_mute_cb.armed_ms());
-                        let silence =
-                            paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
-                        if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-                            data.fill(0.0);
-                            return;
+                // #3618 — la MÊME cascade que le chemin PCM, enfin branchée
+                // ici. Un DAC bit-perfect qui refuse le flottant faisait
+                // jusque-là échouer la première et unique tentative, et la
+                // zone s'arrêtait sans cause affichée. Tout ce qui vient d'un
+                // serveur multimédia arrive par cette branche.
+                let tentatives = cascade_de_formats(&output_config, &source_config);
+                let anneaux: std::cell::RefCell<Option<Arc<RingBuf>>> =
+                    std::cell::RefCell::new(None);
+                let ouverture = ouvrir_premier_format_accepte(&tentatives, |cfg, format| {
+                    let cap = (cfg.sample_rate as usize) * (cfg.channels as usize) * 2;
+                    let min_buf = (cfg.sample_rate as usize) * (cfg.channels as usize) / 2; // ~500ms
+                    starvation.begin_stream(cfg.sample_rate, cfg.channels);
+                    let r = Arc::new(RingBuf::new_metered(cap, starvation.clone()));
+                    r.clear(); // Defensive: zero-fill before callback can read
+                    data_started.store(false, Ordering::SeqCst);
+                    let bati = match format {
+                        FormatDeSortie::F32 => build_compressed_f32_stream(
+                            &device,
+                            cfg,
+                            r.clone(),
+                            volume.clone(),
+                            paused.clone(),
+                            force_silent.clone(),
+                            data_started.clone(),
+                            min_buf,
+                            device_gone.clone(),
+                            soft_mute.clone(),
+                        ),
+                        FormatDeSortie::I32 => build_int_stream::<i32>(
+                            &device,
+                            cfg,
+                            r.clone(),
+                            volume.clone(),
+                            paused.clone(),
+                            force_silent.clone(),
+                            data_started.clone(),
+                            min_buf,
+                            device_gone.clone(),
+                            soft_mute.clone(),
+                        ),
+                        FormatDeSortie::I16 => build_int_stream::<i16>(
+                            &device,
+                            cfg,
+                            r.clone(),
+                            volume.clone(),
+                            paused.clone(),
+                            force_silent.clone(),
+                            data_started.clone(),
+                            min_buf,
+                            device_gone.clone(),
+                            soft_mute.clone(),
+                        ),
+                    };
+                    if bati.is_ok() {
+                        *anneaux.borrow_mut() = Some(r);
+                    }
+                    bati
+                });
+
+                let (stream, actual_config, retenu) = match ouverture {
+                    Ok(t) => t,
+                    Err(echecs) => {
+                        // Tous les formats ont été refusés : la faute est au
+                        // périphérique, pas à l'encodage. Nommer la cause —
+                        // et surtout RENSEIGNER `open_failure`, le canal que
+                        // le sondeur draine à chaque tick. Sans lui la zone
+                        // s'arrêtait en silence, sans cause à l'écran (#3618).
+                        let premier = echecs
+                            .first()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "aucune tentative".to_string());
+                        let cause = classify_open_failure(&premier);
+                        warn!(
+                            device = %device_name,
+                            tentatives = tentatives.len(),
+                            first_error = %premier,
+                            formats = %tentatives
+                                .iter()
+                                .map(|(_, f)| f.nom())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            hint = %cause.log_hint(),
+                            "audio_stream_build_failed_compressed"
+                        );
+                        if let Ok(mut slot) = open_failure.lock() {
+                            *slot = Some(format!(
+                                "Sortie « {device_name} » : {}.",
+                                cause.user_message()
+                            ));
                         }
-                        // Wait for a minimum amount of data before starting
-                        // to read from the ring buffer. This prevents the
-                        // audio device from playing stale/garbage samples
-                        // during track transitions.
-                        if !data_started_cb.load(Ordering::Acquire) {
-                            if ring_cb.available() < min_buffer_samples {
-                                data.fill(0.0);
-                                return;
-                            }
-                            data_started_cb.store(true, Ordering::Release);
-                        }
-                        let read = ring_cb.pop(data);
-                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                        ramp_cb.apply(&mut data[..read], v);
-                        if read < data.len() {
-                            data[read..].fill(0.0);
-                        }
-                    },
-                    make_stream_error_cb(device_gone.clone()),
-                    None,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(error = %e, "audio_stream_build_failed_compressed");
                         playing.store(false, Ordering::SeqCst);
                         return;
                     }
                 };
+                let ring = anneaux
+                    .into_inner()
+                    .expect("une ouverture réussie a toujours posé son anneau");
+                if retenu != FormatDeSortie::F32 {
+                    info!(
+                        format = retenu.nom(),
+                        sample_rate = actual_config.sample_rate,
+                        "local_audio_fallback_to_integer_format"
+                    );
+                }
+                let output_sr = actual_config.sample_rate;
+                let output_ch = actual_config.channels;
 
                 info!(
                     device = %device_name,
@@ -6567,77 +6840,6 @@ impl OutputTarget for LocalOutput {
                     )
                 };
 
-            // Bit-perfect USB DACs (XMOS/Totaldac, Nagra, …) frequently reject
-            // float and only accept integer PCM: cpal's f32 build_output_stream
-            // then fails with "Sample format 'f32' is not supported by hardware".
-            // This builds the same stream in an integer format instead, converting
-            // the f32 ring-buffer samples on the fly (reuses symphonia's IntoSample,
-            // as orchestrator.rs already does). Only used as a fallback after both
-            // f32 attempts fail, so the f32 happy path is untouched (Pascal, XMOS
-            // USB Audio 2.0 → Totaldac).
-            fn build_int_stream<T>(
-                device: &cpal::Device,
-                cfg: &cpal::StreamConfig,
-                ring_cb: Arc<RingBuf>,
-                vol_cb: Arc<AtomicU32>,
-                paused_cb: Arc<AtomicBool>,
-                silent_cb: Arc<AtomicBool>,
-                ds_cb: Arc<AtomicBool>,
-                min_buf: usize,
-                device_gone: Arc<AtomicBool>,
-                soft_mute_cb: crate::audio::soft_mute::SoftMuteGate,
-            ) -> Result<cpal::Stream, cpal::BuildStreamError>
-            where
-                T: cpal::SizedSample + Send + 'static,
-                f32: symphonia::core::audio::conv::IntoSample<T>,
-            {
-                use symphonia::core::audio::conv::IntoSample;
-                let zero: T = 0.0f32.into_sample();
-                let mut scratch: Vec<f32> = Vec::new();
-                let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
-                device.build_output_stream(
-                    cfg,
-                    move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                        let n = data.len();
-                        // Rampe anti-« ploc » (#1590). Ce chemin sert les DAC
-                        // qui refusent le flottant : la rampe y est armée par la
-                        // même porte, donc toujours désarmée sur DoP, en PURE et
-                        // en sortie exclusive.
-                        ramp_cb.arm(soft_mute_cb.armed_ms());
-                        let silence =
-                            paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
-                        if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-                            data.fill(zero);
-                            return;
-                        }
-                        if !ds_cb.load(Ordering::Acquire) {
-                            if ring_cb.available() < min_buf {
-                                data.fill(zero);
-                                return;
-                            }
-                            ds_cb.store(true, Ordering::Release);
-                        }
-                        if scratch.len() < n {
-                            scratch.resize(n, 0.0);
-                        }
-                        let buf = &mut scratch[..n];
-                        let read = ring_cb.pop(buf);
-                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                        // La rampe module le tampon f32 AVANT la conversion en
-                        // mot entier : convertir puis multiplier ferait le
-                        // produit dans le format du DAC, hors du contrat de
-                        // `IntoSample`.
-                        ramp_cb.apply(&mut buf[..read], v);
-                        for (o, s) in data[..read].iter_mut().zip(&buf[..read]) {
-                            *o = (*s).into_sample();
-                        }
-                        data[read..].fill(zero);
-                    },
-                    make_stream_error_cb(device_gone),
-                    None,
-                )
-            }
-
             let finished_flag = Arc::new(AtomicBool::new(false));
 
             let ring_cap =
@@ -7005,6 +7207,30 @@ impl OutputTarget for LocalOutput {
                 feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
                 total_frames_fed += processed.source_frames;
             }
+            // ── #3318 — LA CLÉ QUI MANQUAIT ────────────────────────────
+            //
+            // `local_audio_slow_read` et `local_audio_read_error` ne portaient
+            // que des octets et des millisecondes : ni appareil, ni flux. Or
+            // la ligne symétrique côté producteur — `stream_delivery_stall`
+            // (`tune-stream-http/src/lib.rs`) — porte, elle, `stream_id`.
+            //
+            // Sans identifiant commun, la seule jointure possible entre « la
+            // sortie a attendu » et « le flux interne n'a rien servi » était
+            // l'HORODATAGE, et elle n'est valide que si une SEULE zone joue
+            // pendant la fenêtre. Sur la machine de #3318 — un seul cœur,
+            // 49 618 pistes, plusieurs sorties énumérées — ce n'est pas une
+            // hypothèse qu'on puisse tenir, et c'est exactement pour ça que
+            // le dossier était bloqué : les deux moitiés de la mesure
+            // existaient et ne se joignaient pas.
+            //
+            // L'identifiant n'est pas à inventer : il est déjà dans l'URL que
+            // ce fil est en train de tirer (`…/stream/<id>.<ext>`).
+            // `stream_id_de_l_uri` est la découpe du serveur de flux
+            // elle-même, appelée et non recopiée — le jour où la convention
+            // change, les deux bougent ensemble.
+            let cle_de_flux = crate::poller::decisions::stream_id_de_l_uri(Some(&url));
+            let cle_de_flux = cle_de_flux.as_deref();
+
             let mut total_bytes_read: u64 = 0;
             let mut first_data_logged = false;
             let stream_start = std::time::Instant::now();
@@ -7087,7 +7313,12 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
                     Err(e) => {
-                        warn!(error = %e, total_bytes_read, "local_audio_read_error");
+                        journaliser_erreur_de_lecture(
+                            &device_name,
+                            cle_de_flux,
+                            &e.to_string(),
+                            total_bytes_read,
+                        );
                         http_eof = true;
                         break;
                     }
@@ -7103,11 +7334,12 @@ impl OutputTarget for LocalOutput {
                     );
                     first_data_logged = true;
                 } else if read_elapsed.as_millis() > 5000 {
-                    warn!(
-                        bytes = n,
-                        wait_ms = read_elapsed.as_millis() as u64,
+                    journaliser_lecture_lente(
+                        &device_name,
+                        cle_de_flux,
+                        n,
+                        read_elapsed.as_millis() as u64,
                         total_bytes_read,
-                        "local_audio_slow_read"
                     );
                 }
 
@@ -9286,3 +9518,86 @@ mod renseignement_materiel_tests;
 /// D'ENTRÉE de cette branche qui est tenue, pas la branche.
 #[cfg(test)]
 mod zone_backend_asio_i1770;
+
+// ───────────────────────────────────────────────────────────────────────────
+// #3318 — les deux lignes de journal du fil de lecture de la sortie locale,
+// écrites ici plutôt qu'en ligne, pour DEUX raisons :
+//
+// 1. elles vivent au fond d'un `std::thread::spawn` qu'aucun test unitaire ne
+//    peut atteindre — ni périphérique ALSA, ni flux HTTP dans une épreuve ;
+//    sorties, elles s'éprouvent ;
+// 2. elles doivent porter la MÊME clé que `stream_delivery_stall`, sans quoi
+//    les deux moitiés de la mesure restent inutilisables ensemble.
+//
+// `cle_de_correlation_i3318.rs` garde le contenu émis ET le fait que le fil
+// de lecture les appelle bien avec la clé — « écrit mais pas branché » est
+// précisément le défaut qui a laissé ce dossier en plan.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Ce qu'on écrit à la place d'un identifiant de flux quand l'URL n'en porte
+/// pas.
+///
+/// Ce cas EXISTE et n'est pas un bug : la sortie locale sait aussi lire une
+/// radio ou un fichier servi par un tiers, dont l'URL n'a pas la forme
+/// `…/stream/<id>`. Un tiret est lisible dans un `grep` et ne se confond avec
+/// aucun identifiant ; un champ absent, lui, se serait lu comme une ligne
+/// d'une autre version.
+pub(crate) const FLUX_INCONNU: &str = "-";
+
+/// `local_audio_slow_read` — le fil de lecture a attendu ses octets.
+///
+/// `wait_ms` est la durée d'UN `reader.read()`, pas un cumul. Le seuil
+/// d'émission (5 s) est chez l'appelant : cette fonction écrit ce qu'on lui
+/// donne.
+///
+/// `stream_id` part en Display (`%`) et NON en Debug : `stream_delivery_stall`
+/// rend `stream_id=e32c865e-…` sans guillemets, et une clé de jointure qui ne
+/// s'écrit pas pareil des deux côtés ne se cherche pas d'un seul `grep`.
+pub(crate) fn journaliser_lecture_lente(
+    device: &str,
+    stream_id: Option<&str>,
+    bytes: usize,
+    wait_ms: u64,
+    total_bytes_read: u64,
+) {
+    warn!(
+        device = %device,
+        stream_id = %stream_id.unwrap_or(FLUX_INCONNU),
+        bytes,
+        wait_ms,
+        total_bytes_read,
+        "local_audio_slow_read — la sortie locale a attendu ses octets ; \
+         `stream_id` joint cette ligne au `stream_delivery_stall` du flux \
+         interne (#3318)"
+    );
+}
+
+/// `local_audio_read_error` — le flux interne a rendu une erreur au lieu
+/// d'octets, et le fil de lecture s'arrête là.
+///
+/// C'est la coupure FRANCHE du fil 1660 (« le flux s'interrompt complètement
+/// et la lecture s'arrête net »), par opposition à l'attente de
+/// [`journaliser_lecture_lente`]. Les deux sortent du même `reader.read()` :
+/// c'est pourquoi elles portent la même clé.
+pub(crate) fn journaliser_erreur_de_lecture(
+    device: &str,
+    stream_id: Option<&str>,
+    erreur: &str,
+    total_bytes_read: u64,
+) {
+    warn!(
+        device = %device,
+        stream_id = %stream_id.unwrap_or(FLUX_INCONNU),
+        error = %erreur,
+        total_bytes_read,
+        "local_audio_read_error — le flux interne a rendu une erreur ; \
+         `stream_id` joint cette ligne au `stream_delivery_stall` du flux \
+         interne (#3318)"
+    );
+}
+
+#[cfg(test)]
+mod cle_de_correlation_i3318;
+
+#[cfg(test)]
+mod repli_format_compresse_i3618;

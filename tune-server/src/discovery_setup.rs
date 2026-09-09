@@ -379,6 +379,25 @@ pub fn spawn_ssdp_handler(
                     info!(id = %id, kept_registered = soap_wakeable, "device_lost_zone_offline");
                 }
                 SsdpEvent::MediaServerDiscovered(ms) => {
+                    // Notre propre MediaServer : on ne se range pas dans sa
+                    // propre liste de serveurs du reseau (#3688). Le meme
+                    // rideau que pour les renderers, sur le chemin jumeau qui
+                    // n'en avait aucun.
+                    let notre_udn = tune_core::upnp_server::media_server_advert().map(|a| a.uuid);
+                    if est_notre_propre_serveur_multimedia(
+                        &ms,
+                        config.port,
+                        &nos_adresses(),
+                        notre_udn.as_deref(),
+                    ) {
+                        debug!(
+                            id = %ms.id,
+                            name = %ms.name,
+                            location = %ms.location,
+                            "ssdp_notre_propre_serveur_multimedia_ignore"
+                        );
+                        continue;
+                    }
                     let id = ms.id.clone();
                     media_servers.lock().await.insert(id.clone(), ms);
                     info!(id = %id, "media_server_registered");
@@ -493,6 +512,59 @@ fn nos_udn_de_facade(db: &Arc<dyn DbBackend>) -> Vec<String> {
 
 fn est_un_de_nos_udn_de_facade(db: &Arc<dyn DbBackend>, device_id: &str) -> bool {
     !device_id.is_empty() && nos_udn_de_facade(db).iter().any(|u| u == device_id)
+}
+
+/// Reconnaitre notre PROPRE serveur multimedia dans une annonce SSDP.
+///
+/// Le troisieme rideau. Les deux premiers — [`est_notre_propre_renderer`]
+/// (#2101, #2202) et [`est_un_de_nos_udn_de_facade`] (#2410) — ne gardent que
+/// le chemin `SsdpEvent::DeviceDiscovered`, celui des RENDERERS. Le chemin
+/// jumeau `SsdpEvent::MediaServerDiscovered` n'en avait aucun : il inserait
+/// dans le registre `media_servers` tout ce que le scanner lui donnait.
+///
+/// Or Tune publie AUSSI un MediaServer, et il l'annonce sur le meme groupe
+/// multicast que les appareils du reseau (`upnp_server::spawn_ssdp_advertiser`,
+/// `LOCATION` = [`tune_core::upnp_server::advert_location`]). Son propre
+/// ecouteur SSDP recoit cette annonce — et, depuis #1750, repond meme a ses
+/// propres M-SEARCH. Le serveur se rangeait donc dans sa propre liste de
+/// serveurs multimedia : « Tune Server » apparaissait dans Reglages > Serveurs
+/// multimedia comme un voisin, navigable par UPnP, alors que c'est la
+/// bibliotheque deja ouverte a l'ecran.
+///
+/// ⚠️ Ce rideau ne cree ni ne supprime aucune zone : un serveur multimedia
+/// n'est pas une sortie. Il ne repare donc PAS les zones fantomes deja
+/// persistees chez les testeurs de #3688 — voir le corps de la PR.
+///
+/// Les deux criteres, dans cet ordre, et pour la meme raison qu'au rideau des
+/// facades : l'UDN d'abord, parce qu'il ne depend d'aucune enumeration
+/// d'interfaces et survit a un `LOCATION` porte par un nom d'hote ; l'adresse
+/// ensuite, pour le cas ou l'annonceur n'a pas encore publie son UDN.
+///
+/// Et, comme pour les renderers, le test porte sur les TROIS a la fois —
+/// chemin de montage, port d'API, adresse locale. Le chemin et le port seuls
+/// ecarteraient aussi le MediaServer d'un AUTRE Tune du reseau, qui est, lui,
+/// un serveur parfaitement navigable : c'est nous qu'il faut exclure, pas nos
+/// semblables.
+fn est_notre_propre_serveur_multimedia(
+    ms: &tune_core::discovery::ssdp::MediaServerInfo,
+    port_api: u16,
+    nos_adresses: &[String],
+    notre_udn: Option<&str>,
+) -> bool {
+    if let Some(udn) = notre_udn
+        && !udn.is_empty()
+        && ms.id == udn
+    {
+        return true;
+    }
+    if ms.port != port_api {
+        return false;
+    }
+    let notre_mount = format!("{}/description.xml", tune_core::upnp_server::MOUNT_PATH);
+    if !ms.location.ends_with(&notre_mount) {
+        return false;
+    }
+    !ms.host.is_empty() && nos_adresses.iter().any(|a| a == &ms.host)
 }
 
 /// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et
@@ -2772,6 +2844,154 @@ mod tests {
 
             assert!(!est_un_de_nos_udn_de_facade(&backend, "true"));
             assert!(!est_un_de_nos_udn_de_facade(&backend, ""));
+        }
+    }
+
+    /// 🔴 #3688 — le troisieme rideau d'auto-exclusion.
+    ///
+    /// SITE D'APPEL GARDE : `spawn_ssdp_handler`, bras
+    /// `SsdpEvent::MediaServerDiscovered`, qui appelle
+    /// `est_notre_propre_serveur_multimedia(&ms, config.port, &nos_adresses(),
+    /// notre_udn.as_deref())` avant `media_servers.lock().await.insert(...)`.
+    ///
+    /// Les fixtures ne sont pas ecrites a la main : la `LOCATION` vient de
+    /// `tune_core::upnp_server::advert_location`, LA fonction qui compose ce
+    /// que l'annonceur publie, et l'`id` vient de la meme forme d'UDN que
+    /// `UpnpServer` tire au sort. Si la forme de l'annonce change, la garde
+    /// tombe avec elle au lieu de continuer a mesurer a vide.
+    mod auto_exclusion_du_serveur_multimedia {
+        use super::super::est_notre_propre_serveur_multimedia;
+        use tune_core::discovery::ssdp::MediaServerInfo;
+
+        const NOTRE_UDN: &str = "uuid:1e1f0a2c-6f2a-4a53-9f0d-1c9f4b7a55e1";
+        const PORT_API: u16 = 8888;
+
+        fn nos_adresses() -> Vec<String> {
+            vec![
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+                "192.168.0.39".to_string(),
+            ]
+        }
+
+        /// Une annonce telle que notre propre annonceur la produit.
+        fn annonce(id: &str, ip: &str, port: u16) -> MediaServerInfo {
+            let location = tune_core::upnp_server::advert_location(ip, port);
+            MediaServerInfo {
+                id: id.to_string(),
+                name: "Tune Server".to_string(),
+                manufacturer: "Tune".to_string(),
+                model: "Tune Server".to_string(),
+                content_directory_url: format!(
+                    "http://{ip}:{port}{}/ContentDirectory/control",
+                    tune_core::upnp_server::MOUNT_PATH
+                ),
+                location,
+                host: ip.to_string(),
+                port,
+                last_seen: std::time::Instant::now(),
+                max_age: std::time::Duration::from_secs(1800),
+            }
+        }
+
+        /// PREMIERE MOITIE — notre reflet est reconnu, par l'adresse comme par
+        /// l'UDN, et l'UDN suffit meme quand `nos_adresses()` ne contient pas
+        /// l'adresse annoncee (conteneur sans droits sur les interfaces, nom
+        /// d'hote dans la LOCATION, bascule Wi-Fi/Ethernet).
+        #[test]
+        fn notre_propre_serveur_multimedia_est_reconnu() {
+            let a_nous = nos_adresses();
+
+            // Par l'adresse + le port d'API + le chemin de montage.
+            let par_adresse = annonce(
+                "uuid:9f0f5c6e-1111-2222-3333-444455556666",
+                "192.168.0.39",
+                PORT_API,
+            );
+            assert!(
+                est_notre_propre_serveur_multimedia(&par_adresse, PORT_API, &a_nous, None),
+                "notre annonce sur notre adresse et notre port d'API doit etre reconnue"
+            );
+
+            // Par l'UDN seul : adresse INCONNUE de `nos_adresses()`, et pourtant
+            // c'est bien nous — un UDN de MediaServer est tire au sort par nous
+            // et persiste.
+            let par_udn = annonce(NOTRE_UDN, "10.8.0.4", PORT_API);
+            assert!(
+                !a_nous.iter().any(|a| a == "10.8.0.4"),
+                "la contre-epreuve n'a de sens que si l'adresse est inconnue"
+            );
+            assert!(
+                est_notre_propre_serveur_multimedia(&par_udn, PORT_API, &a_nous, Some(NOTRE_UDN)),
+                "notre UDN doit suffire quand l'adresse ne dit rien"
+            );
+        }
+
+        /// SECONDE MOITIE — la contre-epreuve. Trois voisins qui doivent tous
+        /// PASSER : un vrai serveur multimedia du reseau, un AUTRE Tune du
+        /// reseau (meme chemin, meme port, autre adresse), et notre propre
+        /// adresse mais sur un AUTRE port que celui de notre API.
+        ///
+        /// Sans elle, un rideau qui rendrait `true` en toutes circonstances
+        /// serait vert au premier test et ferait disparaitre tous les serveurs
+        /// multimedia des testeurs.
+        #[test]
+        fn les_serveurs_du_reseau_et_nos_semblables_passent() {
+            let a_nous = nos_adresses();
+
+            // Un vrai serveur multimedia du reseau (MinimServer, Synology…).
+            let voisin = MediaServerInfo {
+                id: "uuid:b59b8623-4822-4dd0-b077-44a8b91e9a46".to_string(),
+                name: "MinimServer[nas]".to_string(),
+                manufacturer: "MinimServer".to_string(),
+                model: "MinimServer".to_string(),
+                location: "http://192.168.0.20:9790/desc/device.xml".to_string(),
+                content_directory_url: "http://192.168.0.20:9790/dev/ContentDirectory/control"
+                    .to_string(),
+                host: "192.168.0.20".to_string(),
+                port: 9790,
+                last_seen: std::time::Instant::now(),
+                max_age: std::time::Duration::from_secs(1800),
+            };
+            assert!(
+                !est_notre_propre_serveur_multimedia(&voisin, PORT_API, &a_nous, Some(NOTRE_UDN)),
+                "un serveur multimedia du reseau doit rester visible"
+            );
+
+            // Un AUTRE Tune du reseau : meme chemin de montage, meme port,
+            // mais ce n'est pas nous — sa bibliotheque est parfaitement
+            // navigable et doit rester proposee.
+            let semblable = annonce(
+                "uuid:00000000-aaaa-bbbb-cccc-000000000001",
+                "192.168.0.77",
+                PORT_API,
+            );
+            assert!(
+                !est_notre_propre_serveur_multimedia(
+                    &semblable,
+                    PORT_API,
+                    &a_nous,
+                    Some(NOTRE_UDN)
+                ),
+                "le Tune du voisin n'est pas notre reflet"
+            );
+
+            // Notre adresse, notre chemin, mais un AUTRE port : ce n'est pas
+            // notre API, donc pas notre annonce.
+            let autre_port = annonce(
+                "uuid:00000000-aaaa-bbbb-cccc-000000000002",
+                "192.168.0.39",
+                9999,
+            );
+            assert!(
+                !est_notre_propre_serveur_multimedia(
+                    &autre_port,
+                    PORT_API,
+                    &a_nous,
+                    Some(NOTRE_UDN)
+                ),
+                "un autre service sur notre machine n'est pas notre MediaServer"
+            );
         }
     }
 

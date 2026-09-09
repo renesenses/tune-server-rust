@@ -386,8 +386,11 @@ mod presence;
 
 #[cfg(test)]
 mod debit_de_zone_tests;
+
 #[cfg(test)]
 mod fusion_tests;
+#[cfg(test)]
+mod sante_reseau_de_zone_tests;
 
 pub async fn create_zone_handler(
     state: State<AppState>,
@@ -423,6 +426,68 @@ pub(crate) fn inject_metadata_anchor(obj: &mut serde_json::Map<String, Value>, p
         track.insert("metadata_age_ms".into(), json!(age));
     }
 }
+/// Les neuf réglages du panneau « Avancé · renderer » d'une zone, dans la
+/// charge utile — **un seul endroit qui les écrit, pour trois charges utiles**.
+///
+/// #2672. Un testeur voit ces cases se décocher « à chaque changement de
+/// fichiers », sans redémarrage. Aucun chemin serveur ne les écrit pourtant :
+/// la SEULE écriture est `patch_zone` (`zones/ecriture.rs`), strictement
+/// partielle — chaque drapeau sous un `if let Some(...)`, donc un corps qui ne
+/// mentionne pas `dlna_lpcm` ne le remet jamais à `false`. Et ces colonnes
+/// n'appartiennent même pas à la struct `Zone` : aucun « update par struct
+/// entière » ne peut structurellement les écraser.
+///
+/// Ce n'était donc pas une écriture, c'était un RENDU. `GET /zones` et
+/// `GET /zones/{id}` portaient ces neuf clés ; `build_zone_json`
+/// (`routes/playback.rs`) — la charge utile que rendent une vingtaine de
+/// routes de lecture (`play`, `next`, `previous`, `pause`, `resume`, `stop`,
+/// `queue/jump`, `pins/{i}/invoke`) — ne les portait PAS. Un client qui
+/// remplace son objet zone par la réponse d'un `POST /zones/{id}/play` voyait
+/// les neuf clés disparaître : cases rendues décochées, base intacte, retour à
+/// la normale au prochain `GET /zones`. « À chaque changement de fichiers »
+/// décrit exactement les routes ci-dessus.
+///
+/// ⚠️ Ce que cela NE prouve pas : que le client web remplace au lieu de
+/// fusionner. Il ne vit pas dans ce dépôt. Mais le serveur n'a pas à laisser la
+/// question se poser — trois charges utiles décrivant la même zone doivent en
+/// dire la même chose, et c'est la QUATRIÈME fois que cette famille de
+/// divergences coûte un ticket (#2055, #2092, #2337, celui-ci).
+///
+/// Les copies à la main sont la cause : il n'y en a plus qu'une.
+pub(crate) fn injecter_reglages_renderer(
+    obj: &mut serde_json::Map<String, Value>,
+    repo: &ZoneRepo,
+    zone_id: i64,
+) {
+    obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(zone_id)));
+    obj.insert(
+        "lyrics_offset_ms".into(),
+        json!(repo.get_lyrics_offset_ms(zone_id)),
+    );
+    obj.insert(
+        "dlna_native_flac".into(),
+        json!(repo.get_dlna_native_flac(zone_id)),
+    );
+    obj.insert(
+        "alac_passthrough".into(),
+        json!(repo.get_alac_passthrough(zone_id)),
+    );
+    obj.insert(
+        "aac_passthrough".into(),
+        json!(repo.get_aac_passthrough(zone_id)),
+    );
+    obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(zone_id)));
+    obj.insert(
+        "dlna_cap_16bit".into(),
+        json!(repo.get_dlna_cap_16bit(zone_id)),
+    );
+    obj.insert("dlna_wav24".into(), json!(repo.get_dlna_wav24(zone_id)));
+    obj.insert(
+        "dlna_play_delay_ms".into(),
+        json!(repo.get_dlna_play_delay_ms(zone_id)),
+    );
+}
+
 /// La nature et l'identifiant de ce que l'auditeur a DEMANDÉ, dits au client.
 ///
 /// `POST /zones/:id/play` les déduit déjà du corps de la requête
@@ -781,7 +846,7 @@ pub(crate) async fn output_capabilities(
 /// Rendu en couples `(nom, max_channels)` et non en `AudioDevice` : ce type
 /// n'existe pas sans `local-audio`, et le reste de la chaîne n'a besoin que de
 /// ces deux valeurs.
-pub(crate) fn canaux_des_peripheriques_locaux() -> Vec<(String, u16)> {
+pub fn canaux_des_peripheriques_locaux() -> Vec<(String, u16)> {
     #[cfg(feature = "local-audio")]
     {
         tune_core::outputs::local::cached_audio_devices()
@@ -845,7 +910,7 @@ pub async fn output_capabilities_avec(
 /// L'identifiant est construit par `format!("local:{}", dev.name)` au moment
 /// de l'enregistrement (`startup.rs`, `background.rs`) : c'est ce même nom qui
 /// sert de clé ici.
-fn dispositions_du_peripherique_local(
+pub(crate) fn dispositions_du_peripherique_local(
     device_id: &str,
     peripheriques: &[(String, u16)],
 ) -> Option<Vec<String>> {

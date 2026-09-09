@@ -30,6 +30,36 @@ use crate::outputs::TransportState;
 
 const DEFAULT_PORT: u16 = 3483;
 
+/// Nom de la variable d'environnement qui deplace le port SlimProto.
+///
+/// UNE seule definition, parce qu'elle est lue a DEUX endroits : le serveur TCP
+/// ([`SlimProtoServer::resolve_port`]) et le repondeur de decouverte UDP
+/// ([`discovery::spawn`]). Les deux doivent tomber sur le meme port — une
+/// platine qui trouve Tune par diffusion sur un port et ne peut pas s'y
+/// connecter sur l'autre est pire qu'une platine qui ne trouve rien.
+///
+/// Elle est aussi le nom que lit un testeur : le message de
+/// [`CausePortIndisponible::phrase`] le lui donne quand le bind echoue, et
+/// `.env.tune.example` le documente (garde
+/// `le_port_slimproto_est_documente_pour_le_testeur`).
+pub const VARIABLE_PORT: &str = "TUNE_SLIMPROTO_PORT";
+
+/// Le port SlimProto effectif, `lecture` tenant lieu d'environnement.
+///
+/// Parametree plutot que lisant `std::env` directement : poser une variable
+/// d'environnement dans un test contamine toute la suite du binaire
+/// (`set_var` est vu par les autres tests, qui tournent en parallele).
+pub(crate) fn port_slimproto_depuis(lecture: impl Fn(&str) -> Option<String>) -> u16 {
+    lecture(VARIABLE_PORT)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
+
+/// Le port SlimProto effectif, lu dans l'environnement du processus.
+pub(crate) fn port_slimproto() -> u16 {
+    port_slimproto_depuis(|cle| std::env::var(cle).ok())
+}
+
 /// Sanity cap on a client message payload length (SqueezeBox control messages
 /// are tiny — HELO ~172 bytes). Rejects a mis-framed/huge length before we try
 /// to allocate for it.
@@ -841,10 +871,7 @@ impl SlimProtoServer {
     }
 
     fn resolve_port() -> u16 {
-        std::env::var("TUNE_SLIMPROTO_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_PORT)
+        port_slimproto()
     }
 
     /// Return a reference to the player registry (for use by other subsystems).
@@ -1591,6 +1618,61 @@ mod tests {
     fn default_port_is_3483() {
         // Without TUNE_SLIMPROTO_PORT set, the default port should be 3483.
         assert_eq!(DEFAULT_PORT, 3483);
+    }
+
+    /// La variable deplace le port — et une valeur illisible ne le deplace pas.
+    ///
+    /// Cette garde APPELLE la resolution que le serveur TCP et le repondeur UDP
+    /// utilisent tous les deux (`port_slimproto_depuis`) ; elle ne pose aucune
+    /// variable d'environnement, qui contaminerait le reste de la suite.
+    #[test]
+    fn la_variable_deplace_le_port() {
+        assert_eq!(
+            port_slimproto_depuis(|_| None),
+            DEFAULT_PORT,
+            "sans la variable, le port reste celui qu'attend une platine"
+        );
+        assert_eq!(
+            port_slimproto_depuis(|cle| (cle == VARIABLE_PORT).then(|| "3484".to_string())),
+            3484,
+            "un Lyrion/LMS qui tient 3483 doit pouvoir etre contourne par la variable"
+        );
+        assert_eq!(
+            port_slimproto_depuis(|cle| (cle == VARIABLE_PORT).then(|| "pas un port".to_string())),
+            DEFAULT_PORT,
+            "une valeur illisible retombe sur le defaut, elle ne fait pas echouer le demarrage"
+        );
+        assert_eq!(
+            port_slimproto_depuis(|cle| (cle == "TUNE_PORT").then(|| "3484".to_string())),
+            DEFAULT_PORT,
+            "seule VARIABLE_PORT deplace le port SlimProto"
+        );
+    }
+
+    /// Le nom de la variable doit etre DIT au testeur.
+    ///
+    /// Un Lyrion installe sur la meme machine tient le port 3483 : Tune reste
+    /// alors invisible des platines Squeezebox tant que l'un des deux ne bouge
+    /// pas. La seule façon de faire bouger Tune est cette variable ; elle
+    /// n'etait nommee QUE dans un message d'erreur, c'est-a-dire seulement
+    /// apres coup.
+    ///
+    /// Cette garde LIT un fichier de documentation parce que c'est son sujet :
+    /// elle epingle `.env.tune.example`, le fichier que le testeur copie en
+    /// `.env`. Renommer la constante sans toucher la documentation la fait
+    /// tomber.
+    #[test]
+    fn le_port_slimproto_est_documente_pour_le_testeur() {
+        let exemple = include_str!("../../../.env.tune.example");
+        assert!(
+            exemple.contains(VARIABLE_PORT),
+            "{VARIABLE_PORT} doit figurer dans .env.tune.example : c'est le seul \
+             moyen de deplacer Tune quand un Lyrion tient deja le port {DEFAULT_PORT}"
+        );
+        assert!(
+            exemple.contains(&DEFAULT_PORT.to_string()),
+            "la documentation doit dire QUEL port est pris par defaut"
+        );
     }
 
     #[test]

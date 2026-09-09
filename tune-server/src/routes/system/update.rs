@@ -94,25 +94,92 @@ pub(super) struct UpdateInstallParams {
 /// A caller that does NOT say `force` has not been told what it is about to
 /// interrupt, and that is the one we protect against.
 async fn playback_in_progress(playback: &tune_core::playback::PlaybackManager) -> bool {
-    playback
-        .all_states()
-        .await
-        .iter()
-        .any(|z| z.state == tune_core::playback::PlayState::Playing)
+    !playing_zone_ids(playback).await.is_empty()
 }
+
+/// Depuis combien de temps la position OBSERVÉE d'une zone doit-elle être
+/// immobile avant que le chemin de mise à jour cesse de la croire ?
+///
+/// **C'est la sortie qui manquait à #3581.** Une zone `Playing` en mémoire
+/// n'était contredite par rien : la sortie disparue du registre du sondeur, la
+/// boucle fait `continue` (`poller/tick.rs`, `outputs.get(&device_id) → None`)
+/// et plus personne n'observe la zone ; le seul détecteur de zone figée est
+/// DLNA-only (#3155) ; `startup.rs` ne remet à `stopped` que la COLONNE, pas la
+/// mémoire. Tades ne pouvait donc plus mettre à jour, et rien — ni l'écran, ni
+/// le corps du 409 — ne lui offrait de recours.
+///
+/// **Justification de la constante.** Elle doit être plus grande que le plus
+/// long silence LÉGITIME d'une lecture réelle, et franchement plus petite que
+/// le plafond de deux heures qu'elle remplace :
+/// - la position observée est réécrite toutes les **1 s**
+///   (`POLL_INTERVAL_MS = 1000`, `tune-core/src/poller.rs`) ;
+/// - la plus longue tolérance que le sondeur s'accorde AVANT de déclarer une
+///   zone en panne est `TRACK_LOAD_GRACE_SECS = 45` puis
+///   `STOPPED_FAILURE_THRESHOLD = 30` ticks, soit **75 s** ;
+/// - le plus long gel d'appareil mesuré sur ce dépôt est le réveil d'un ampli
+///   DLNA sorti de veille réseau, `BUDGET_REVEIL_STANDBY` ≈ **32 s**
+///   (`outputs/dlna.rs`) ;
+/// - la branche compressée de `outputs/local.rs` télécharge et décode la piste
+///   ENTIÈRE avant le premier échantillon (#3618) : quelques dizaines de
+///   secondes sur un mono-cœur — et pendant ce temps aucune avance n'a jamais
+///   été observée, donc le champ vaut `None` et la zone est tenue pour
+///   vivante de toute façon.
+///
+/// **600 s = 8 × le verdict de panne du sondeur, ≈ 19 × le plus long gel
+/// mesuré, et 12 × moins que `RESTART_DEFERRAL_MAX`.** Aucune lecture que le
+/// reste du serveur considère encore vivante ne peut franchir ce seuil ; une
+/// zone qui le franchit a cessé d'être observée depuis dix minutes.
+///
+/// Le pire cas d'un faux positif reste borné : la relance coupe un son qui,
+/// par construction, n'avance plus depuis dix minutes. Le pire cas d'un faux
+/// négatif était de deux heures d'attente muette. L'asymétrie tranche.
+const SILENCE_DE_POSITION_AVANT_ZONE_FIGEE: Duration = Duration::from_secs(600);
 
 /// Les zones qui jouent, par identifiant. Sert uniquement à nommer dans le
 /// journal ce qui retient la relance : le 30 août, `update_restarting` est
 /// tombé 24 s après le début d'un morceau et rien, dans le journal, ne disait
 /// ce que le chemin de mise à jour avait regardé (#2954).
+/// Une zone FIGÉE n'en fait pas partie : elle annonce `Playing` mais sa
+/// position observée n'a plus bougé depuis
+/// [`SILENCE_DE_POSITION_AVANT_ZONE_FIGEE`]. C'est le fantôme de #3581, et
+/// c'est ici qu'il cesse de retenir la mise à jour — au garde-fou d'entrée
+/// comme au report de la relance, puisque les deux passent par cette
+/// fonction. Le journal la NOMME, avec son âge : sans cela le correctif
+/// serait invisible dans un `diagnostic.md`.
 async fn playing_zone_ids(playback: &tune_core::playback::PlaybackManager) -> Vec<i64> {
-    playback
-        .all_states()
-        .await
-        .iter()
-        .filter(|z| z.state == tune_core::playback::PlayState::Playing)
-        .map(|z| z.zone_id)
-        .collect()
+    zones_en_lecture_vivante(playback, SILENCE_DE_POSITION_AVANT_ZONE_FIGEE).await
+}
+
+/// Le corps de [`playing_zone_ids`], seuil paramétré.
+///
+/// Le seuil est un argument pour que les épreuves puissent le tenir des deux
+/// côtés — un seuil nul doit écarter une zone déjà observée, un seuil de
+/// production doit garder celle qui vient de l'être — sans faire dormir dix
+/// minutes un test qu'on finirait par désarmer.
+async fn zones_en_lecture_vivante(
+    playback: &tune_core::playback::PlaybackManager,
+    silence_max: Duration,
+) -> Vec<i64> {
+    let mut vivantes = Vec::new();
+    for z in playback.all_states().await {
+        if z.state != tune_core::playback::PlayState::Playing {
+            continue;
+        }
+        if tune_core::playback::zone_figee(&z, silence_max) {
+            warn!(
+                zone_id = z.zone_id,
+                immobile_secs = z
+                    .derniere_avance_de_position
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or_default(),
+                seuil_secs = silence_max.as_secs(),
+                "update_zone_figee_ignoree"
+            );
+            continue;
+        }
+        vivantes.push(z.zone_id);
+    }
+    vivantes
 }
 
 /// Les zones qui retiennent la relance, NOMMÉES, et sous la forme que
@@ -2389,12 +2456,44 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
 
+    // #3581 — la phase `restart_pending_playback` était un mot sans sujet. Le
+    // binaire est DÉJÀ posé sur le disque, la mise à jour est acquise, et il ne
+    // manque plus que l'échange d'image : seule une zone retient. Le client
+    // sondait 180 s puis abandonnait sans un mot, et l'utilisateur concluait
+    // « la mise à jour ne fonctionne pas ».
+    //
+    // On rend donc, dans CETTE phase et elle seule, les trois choses qui
+    // manquaient : ce qui est déjà acquis, QUI retient (nommé), et le geste qui
+    // libère. `POST /zones/{id}/stop` remet inconditionnellement l'état mémoire
+    // à `Stopped` — sans garde, sans admin, sans vérifier que la zone joue
+    // vraiment (`routes/playback.rs`, `orchestrator/transport.rs` →
+    // `playback.stop`) — et la relance repart au tour de sonde suivant, cinq
+    // secondes plus tard. C'était déjà le recours ; il n'était annoncé nulle
+    // part. `force_hint` orientait vers le forçage, qui ne porte QUE sur le
+    // garde-fou d'entrée et ne touche pas ce report.
+    let (restart_pending_zones, recovery_hint) =
+        if phase.as_deref() == Some("restart_pending_playback") {
+            let ids = playing_zone_ids(&state.playback).await;
+            (
+                Some(zones_qui_retiennent(&state.backend, &ids)),
+                Some("POST /zones/{id}/stop"),
+            )
+        } else {
+            (None, None)
+        };
     Json(json!({
         "current_version": tune_core::version(),
         "phase": phase,
         "update_in_progress": phase.is_some() && !is_failed,
         "last_update_result": last_update_result,
         "available_update": available_update,
+        // `null` hors de la phase de report : rien à dire, rien à afficher.
+        "restart_pending_zones": restart_pending_zones,
+        "recovery_hint": recovery_hint,
+        // Le binaire est en place : ce qui reste n'est plus une installation,
+        // c'est une relance en attente. Le dire évite qu'un client conclue
+        // « échec » quand la mise à jour est en fait acquise.
+        "binary_installed": phase.as_deref() == Some("restart_pending_playback"),
     }))
 }
 
@@ -3430,6 +3529,146 @@ mod playback_guard_tests {
         pm.pause(8).await;
         pm.play(12, NowPlaying::default()).await;
         assert!(playback_in_progress(&pm).await);
+    }
+}
+
+/// #3581 — la SORTIE d'un état bloquant : une zone qui annonce `Playing` mais
+/// que plus personne n'observe avancer ne retient plus rien.
+///
+/// Tades ne pouvait pas mettre à jour son serveur, et n'avait aucun recours :
+/// sa Serenade était restée `Playing` en mémoire, le seul détecteur de zone
+/// figée est DLNA-only (#3155), `startup.rs` ne remet à `stopped` que la
+/// colonne, et la seule sortie automatique était le plafond de DEUX HEURES du
+/// report de relance.
+///
+/// Ces épreuves passent par [`super::zones_en_lecture_vivante`] — la fonction
+/// que le garde-fou d'entrée ET le report de relance appellent tous deux, via
+/// [`playing_zone_ids`]. Ce n'est pas une réplique du mécanisme.
+#[cfg(test)]
+mod zone_figee_tests {
+    use super::{SILENCE_DE_POSITION_AVANT_ZONE_FIGEE, zones_en_lecture_vivante};
+    use std::time::Duration;
+    use tune_core::playback::{NowPlaying, PlaybackManager};
+
+    /// Seuil nul : toute zone DÉJÀ observée est immobile « depuis plus
+    /// longtemps que le seuil ». C'est le seul moyen d'atteindre la branche
+    /// figée sans faire dormir dix minutes.
+    const TOUT_DE_SUITE: Duration = Duration::ZERO;
+
+    /// LE défaut : la zone a été observée, l'observation s'est arrêtée, et
+    /// elle retenait la mise à jour pour toujours.
+    #[tokio::test]
+    async fn une_zone_dont_la_position_ne_bouge_plus_ne_retient_plus_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        // Ce que le sondeur écrit chaque seconde sur une zone observée.
+        pm.update_position(12, 1_000).await;
+        assert!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE)
+                .await
+                .is_empty(),
+            "une zone observée dont la position n'avance plus au-delà du seuil \
+             doit cesser de retenir la mise à jour : c'est la sortie qui \
+             manquait à #3581"
+        );
+    }
+
+    /// La contre-épreuve du remède : une lecture RÉELLE ne doit jamais être
+    /// coupée. La zone vient d'être observée, le seuil est celui de
+    /// production — elle retient.
+    #[tokio::test]
+    async fn une_lecture_reelle_qui_avance_retient_toujours_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        pm.update_position(12, 1_000).await;
+        assert_eq!(
+            zones_en_lecture_vivante(&pm, SILENCE_DE_POSITION_AVANT_ZONE_FIGEE).await,
+            vec![12],
+            "au seuil de production, une zone observée il y a un instant est \
+             VIVANTE : la mise à jour ne doit pas lui couper le son"
+        );
+    }
+
+    /// « Jamais observée » n'est pas « immobile ». Une zone navigateur — aucun
+    /// périphérique, donc `poller/tick.rs` fait `continue` avant son unique
+    /// `update_position` — ne doit pas être déclarée figée par défaut.
+    #[tokio::test]
+    async fn une_zone_jamais_observee_reste_traitee_comme_jouant() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        assert_eq!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE).await,
+            vec![12],
+            "sans une seule avance observée, le serveur ne SAIT pas : il doit \
+             conclure « ça joue », jamais « c'est figé »"
+        );
+    }
+
+    /// Une RADIO est exclue du verdict : un flux live n'a pas de durée, et
+    /// plusieurs renderers en annoncent la position par à-coups. La couper
+    /// serait exactement le défaut grave que ce correctif doit éviter.
+    #[tokio::test]
+    async fn une_radio_immobile_retient_toujours_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(
+            12,
+            NowPlaying {
+                source: "radio".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        pm.update_position(12, 1_000).await;
+        assert_eq!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE).await,
+            vec![12],
+            "une radio ne doit JAMAIS être déclarée figée sur l'immobilité de \
+             sa position"
+        );
+    }
+
+    /// Une pause reste une pause : le fantôme ne doit pas ressusciter des
+    /// zones que le garde-fou laissait déjà passer.
+    #[tokio::test]
+    async fn une_zone_en_pause_reste_hors_du_compte() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        pm.update_position(12, 1_000).await;
+        pm.pause(12).await;
+        assert!(
+            zones_en_lecture_vivante(&pm, SILENCE_DE_POSITION_AVANT_ZONE_FIGEE)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// La constante de PRODUCTION, tenue par les deux bouts.
+    ///
+    /// Sans ce test, la façon la plus simple de rétablir le défaut — ramener
+    /// le seuil à l'infini — passerait au vert ; et la façon la plus simple de
+    /// créer un défaut GRAVE — le ramener à quelques secondes — aussi.
+    #[test]
+    fn le_seuil_de_production_est_borne_des_deux_cotes() {
+        assert_eq!(
+            SILENCE_DE_POSITION_AVANT_ZONE_FIGEE,
+            Duration::from_secs(600)
+        );
+        // Borne BASSE : le sondeur s'accorde lui-même jusqu'à 45 s de
+        // chargement de piste puis 30 ticks avant de déclarer une panne, soit
+        // 75 s. Un seuil sous cette barre couperait une lecture que le reste
+        // du serveur considère encore vivante.
+        assert!(
+            SILENCE_DE_POSITION_AVANT_ZONE_FIGEE > Duration::from_secs(75),
+            "sous le propre verdict de panne du sondeur (45 + 30 s), ce seuil \
+             couperait du son réel"
+        );
+        // Borne HAUTE : il doit être franchement meilleur que le plafond de
+        // deux heures qu'il remplace, sinon il n'offre aucune sortie.
+        assert!(
+            SILENCE_DE_POSITION_AVANT_ZONE_FIGEE * 10 < super::RESTART_DEFERRAL_MAX,
+            "le seuil doit libérer la mise à jour bien avant le plafond de \
+             deux heures, sans quoi il ne sert à rien"
+        );
     }
 }
 

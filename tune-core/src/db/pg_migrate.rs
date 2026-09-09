@@ -150,6 +150,11 @@ const MIGRATION_TABLES: &[&str] = &[
     "radio_favorites",
     "tags",
     "item_tags",
+    // Etiquettes posees sur un album de streaming (#3699). Sans cette ligne,
+    // tout l'etiquetage du catalogue Qobuz/Tidal/Bandcamp serait perdu a la
+    // bascule SQLite -> PostgreSQL — et c'est justement sur le streaming que
+    // l'etiquetage est le seul moyen de ranger.
+    "streaming_item_tags",
     "favorites",
     // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
     // seraient perdus à la bascule SQLite → PostgreSQL.
@@ -597,6 +602,28 @@ CREATE TABLE IF NOT EXISTS item_tags (
     UNIQUE(tag_id, item_type, item_id)
 );
 
+-- Etiquettes posees sur un objet de STREAMING (#3699). Une base creee par la
+-- bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne rejoue
+-- JAMAIS les scripts numerotes : sans cette declaration ici, la migration 052
+-- ne l'atteindrait pas — ni maintenant, ni jamais.
+--
+-- `tag_id` est BIGINT et non TEXT, contrairement au reste de ce schema : la
+-- copie de donnees lie NATIVEMENT les entiers (voir `insert_batch`), et il
+-- faut que `streaming_item_tags.tag_id` reste comparable a `tags.id`, que la
+-- migration 012 remet en BIGINT sur ces bases-la.
+CREATE TABLE IF NOT EXISTS streaming_item_tags (
+    tag_id BIGINT NOT NULL,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (tag_id, item_type, source, source_id)
+);
+
 CREATE TABLE IF NOT EXISTS album_ratings (
     id TEXT PRIMARY KEY,
     album_id TEXT NOT NULL,
@@ -803,6 +830,7 @@ CREATE INDEX IF NOT EXISTS idx_radio_stations_favorite ON radio_stations(is_favo
 CREATE INDEX IF NOT EXISTS idx_bookmarks_track_id ON bookmarks(track_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_type);
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
+CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
 CREATE INDEX IF NOT EXISTS idx_album_ratings_album ON album_ratings(album_id);
 CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
 CREATE INDEX IF NOT EXISTS idx_album_metadata_key ON album_metadata(key);
@@ -1121,6 +1149,9 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",
         "favorites" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "item_tags" => "ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",
+        // Cette table n'a PAS de colonne `id` : la clause par defaut
+        // `ON CONFLICT (id)` ci-dessous echouerait sur elle (#3699).
+        "streaming_item_tags" => "ON CONFLICT (tag_id, item_type, source, source_id) DO NOTHING",
         "album_ratings" => "ON CONFLICT (album_id, profile_id) DO NOTHING",
         "offline_cache" => "ON CONFLICT (source, source_id) DO NOTHING",
         "track_source_links" => "ON CONFLICT (track_id, service) DO NOTHING",

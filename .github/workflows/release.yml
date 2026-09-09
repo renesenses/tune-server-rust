@@ -125,15 +125,27 @@ jobs:
             platform: linux-x86_64
             ext: tar.gz
           # Les deux cibles ARM sont construites par `cross`, dans un
-          # conteneur qui ne porte pas les en-tetes ALSA de la CIBLE : leur
-          # `features:` n'a donc PAS `local-audio`, contrairement aux lignes
-          # natives Linux/Windows/macOS plus bas.
+          # conteneur qui ne portait pas les en-tetes ALSA de la CIBLE : elles
+          # ont longtemps ete livrees SANS `local-audio`, contrairement aux
+          # lignes natives Linux/Windows/macOS plus bas.
           #
-          # Ce n'est pas un oubli, c'est une contrainte — mais c'est une
-          # ABSENCE MESUREE, pas un arbitrage : sur l'artefact publie
-          # v0.9.141, `strings tune-server | grep -c cpal` rend 0 sur
-          # linux-aarch64 contre 175 sur linux-x86_64. Les binaires ARM
-          # livres n'ont pas de sortie audio locale. Voir #3355.
+          # `aarch64-unknown-linux-gnu` est REPAREE depuis la v0.9.143 :
+          # Cross.toml installe `libasound2-dev:$CROSS_DEB_ARCH` (#3620), et sa
+          # ligne `features:` reprend donc `local-audio`. L'etape « Verify
+          # local-audio is compiled into the ARM binary » plus bas la tient.
+          #
+          # `aarch64-unknown-linux-musl` reste SANS `local-audio`, et ce n'est
+          # pas un oubli : `alsa-sys` code le lien DYNAMIQUE en dur dans son
+          # `build.rs` (`pkg_config…statik(false)`), ce qu'une cible musl
+          # statique refuse par construction. Residu ouvert : #3621.
+          #
+          # Mesure sur les archives PUBLIEES,
+          # `readelf -d tune-server | grep -c 'libasound\.so'` :
+          #
+          #   cible                v0.9.140   v0.9.141   v0.9.143
+          #   linux-x86_64                1          1          1
+          #   linux-aarch64               0          0          1   <- #3620
+          #   linux-aarch64-musl          0          0          0   <- #3621
           #
           # Toute AUTRE fonctionnalite du `default` de tune-server doit
           # figurer dans chaque `features:` ci-dessous et dans chaque ligne
@@ -346,6 +358,84 @@ jobs:
         if: "!matrix.cross && runner.os == 'macOS'"
         run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
+      # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
+      # pas seulement dans la ligne `--features` qui l'a construit.
+      #
+      # `cloud-relay` est une fonctionnalite `default` de tune-server, et
+      # TOUTES les lignes de build ci-dessus sauf macOS passent
+      # `--no-default-features` : elle a donc disparu de tous les artefacts
+      # Linux et Windows livres jusqu'a la v0.9.141 sans qu'aucune porte ne
+      # rougisse. macOS ne l'a jamais perdue — c'est la seule ligne SANS
+      # `--no-default-features`, et cet ecart est precisement ce qui a cache le
+      # defaut. Contre-epreuve sur les archives PUBLIEES, marqueur
+      # `relay connection closed gracefully` :
+      #
+      #   cible                v0.9.140   v0.9.141
+      #   linux-x86_64                0          1
+      #   linux-aarch64               0          1
+      #   linux-aarch64-musl          0          1
+      #   windows-x86_64              0          1
+      #   macos-x86_64                1          1   <- jamais perdue
+      #   macos-aarch64               1          1   <- jamais perdue
+      #
+      # Contrairement a `local-audio`, `cloud-relay` ne lie AUCUNE bibliotheque
+      # systeme : `cloud-relay = ["dep:tokio-tungstenite"]`, avec
+      # `rustls-tls-webpki-roots`, donc tout est en Rust et le `readelf -d` de
+      # l'etape ALSA plus haut ne peut rien voir ici. Le seul temoin possible
+      # est une chaine de code.
+      #
+      # On cherche donc les octets EXACTS dans le fichier, sans passer par
+      # `strings | grep` :
+      #   - `strings` DECOUPE, et pas de la meme facon selon la cible. Mesure
+      #     sur l'artefact publie v0.9.143 : le marqueur
+      #     `wss://bridge.mozaiklabs.fr/ws/server` rend 0 sur macos-x86_64
+      #     alors que le code est bien la (`wss://` y est materialise a part),
+      #     contre 2 sur macos-aarch64. Une garde batie sur `strings` rougirait
+      #     au hasard de la cible ;
+      #   - `python3` est present sur les trois familles de runners et lit les
+      #     memes octets partout, y compris un ELF arm64 depuis un runner
+      #     x86_64 — comme `readelf`, et contrairement a `ldd`.
+      #
+      # Les deux marqueurs valent plus de 16 octets et n'existent QUE sous
+      # `cfg(feature = "cloud-relay")` : `tune-core/src/cloud/mod.rs` ne declare
+      # `pub mod relay` que sous cette fonctionnalite, et `spawn_relay_client`
+      # n'est appele que sous elle. On exige les DEUX : le premier prouve que le
+      # module est compile, le second qu'il est reellement BRANCHE au demarrage.
+      - name: Verify cloud-relay is compiled into the built binary
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/tune-server"
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN="$BIN.exe"; fi
+          PY=python3; command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" - "$BIN" <<'VERIF_CLOUD_RELAY'
+          import sys
+
+          chemin = sys.argv[1]
+          marqueurs = {
+              "tune-core/src/cloud/relay.rs": b"relay connection closed gracefully",
+              "tune-server/src/background.rs": b"cloud relay client spawned",
+          }
+          with open(chemin, "rb") as f:
+              octets = f.read()
+
+          manquants = []
+          for origine, marqueur in marqueurs.items():
+              vus = octets.count(marqueur)
+              print("%-34s %-34s %d" % (marqueur.decode(), origine, vus))
+              if vus == 0:
+                  manquants.append(origine)
+
+          if manquants:
+              print(
+                  "::error::cloud-relay est ABSENT de " + chemin + " : la ligne "
+                  "--features de cette cible ne le liste pas, ou "
+                  "--no-default-features l'a retire (#3355). Marqueurs "
+                  "introuvables : " + ", ".join(manquants)
+              )
+              sys.exit(1)
+
+          print("cloud-relay bien present dans " + chemin)
+          VERIF_CLOUD_RELAY
       # AirPlay 2 sender daemon (GPL, spawned as a subprocess) bundled next to
       # tune-server so AirPlay 2 works on native installs, not just Docker
       # (#700 / Bilou #1135). Built from a pinned rev of our fork.

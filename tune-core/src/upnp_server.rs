@@ -4265,6 +4265,9 @@ mod tests {
             musicbrainz_recording_id: None,
             cover_path: Some("ce0a963bb7eb63c3b33b4e00b6ab3427".into()),
             comments: None,
+            cue_media_path: None,
+            cue_start_ms: None,
+            cue_end_ms: None,
         }
     }
 
