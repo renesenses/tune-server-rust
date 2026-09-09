@@ -313,8 +313,13 @@ impl SsdpScanner {
         // Passive SSDP listener: some legacy renderers (e.g. Cyrus Stream X)
         // never answer M-SEARCH, they only multicast periodic NOTIFY
         // ssdp:alive announcements. Without this they are invisible to the
-        // active scanner above. Best-effort: if port 1900 can't be bound the
-        // task just exits and active discovery still works.
+        // active scanner above.
+        //
+        // ⚠️ Ce n'est PLUS « best-effort, la tache sort et la decouverte
+        // active continue » : depuis #1750 cette meme tache porte l'unique
+        // repondeur M-SEARCH, donc tout ce qui rend Tune visible des points de
+        // controle. Elle ne sort plus sur un bind refuse, elle reprend — et
+        // [`etat_ecoute_ssdp`] dit a tout moment si elle ecoute (#3687).
         let notify_state = self.state.clone();
         let notify_tx = self.event_tx.lock().await.clone();
         tokio::spawn(async move {
@@ -398,11 +403,27 @@ async fn scan_loop(
 /// processing path as active M-SEARCH replies. This is what makes legacy
 /// renderers that ignore M-SEARCH (but still announce themselves) discoverable.
 async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sender<SsdpEvent>) {
-    let socket = match bind_notify_socket() {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "ssdp_notify_listener_disabled");
-            return;
+    // On ne renonce plus (#3687). Cette boucle ne porte pas seulement
+    // l'ecoute passive des NOTIFY : depuis #1750 elle porte AUSSI l'unique
+    // repondeur M-SEARCH. Un `return` sur bind refuse rendait donc Tune
+    // invisible de tous les points de controle pour TOUTE la session, sans
+    // autre trace qu'une ligne `warn` dans une tache detachee. La cause
+    // typique — un autre programme SSDP demarre avant nous — est temporaire.
+    let socket = loop {
+        match lier_ecouteur_ssdp(SSDP_PORT) {
+            Ok(s) => break s,
+            Err(e) => {
+                let echecs = etat_ecoute_ssdp().map(|s| s.echecs).unwrap_or(1);
+                let delai = delai_de_reprise(echecs);
+                warn!(
+                    error = %e,
+                    echecs,
+                    reprise_dans_s = delai.as_secs(),
+                    "ssdp_notify_listener_bind_refuse — Tune ne repond a aucun M-SEARCH \
+                     tant que ce port n'est pas libre"
+                );
+                tokio::time::sleep(delai).await;
+            }
         }
     };
     info!("ssdp_notify_listener_started");
@@ -414,15 +435,14 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                 let data = &buf[..len];
                 let head = String::from_utf8_lossy(&data[..len.min(256)]);
 
-                // Un M-SEARCH qui vise notre MediaServer reçoit une réponse
-                // unicast — c'est CE chemin qui rend Tune visible du
-                // « Rechercher des appareils » d'un point de contrôle (JPlay
-                // iOS, BubbleUPnP…). Avant, seul un NOTIFY spontané toutes les
-                // dix minutes existait : sauf coïncidence avec la fenêtre
-                // d'écoute du contrôleur, le serveur n'apparaissait jamais
-                // (Stéphane Villerio, 12/08/2026). Les recherches qui ne nous
-                // concernent pas — un contrôleur cherchant des renderers —
-                // restent sans réponse.
+                // Un M-SEARCH qui vise notre MediaServer ou l'un de nos
+                // renderers recoit une reponse unicast — c'est CE chemin qui
+                // rend Tune visible du « Rechercher des appareils » d'un point
+                // de controle (JPlay iOS, BubbleUPnP…) et d'un pont UPnP
+                // (UPnPBridge de Lyrion). Avant, seul un NOTIFY spontane
+                // toutes les dix minutes existait : sauf coincidence avec la
+                // fenetre d'ecoute du controleur, le serveur n'apparaissait
+                // jamais (Stephane Villerio, 12/08/2026).
                 if head.starts_with("M-SEARCH") {
                     let full = String::from_utf8_lossy(data);
                     let st = full
@@ -435,51 +455,7 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                         .map(str::trim)
                         .unwrap_or("")
                         .to_string();
-                    if let Some(advert) = crate::upnp_server::media_server_advert() {
-                        for (st_reply, usn) in
-                            crate::upnp_server::msearch_reply_targets(&st, &advert.uuid)
-                        {
-                            let resp = crate::upnp_server::ssdp_msearch_response(
-                                &st_reply,
-                                &usn,
-                                &advert.location,
-                            );
-                            // `to` et `st` : sans eux la trace dit qu'une
-                            // réponse n'est pas partie, sans dire à qui ni pour
-                            // quelle identité — donc sans permettre d'agir
-                            // (#2417, même défaut).
-                            if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
-                                debug!(
-                                    to = %addr,
-                                    st = %st_reply,
-                                    error = %e,
-                                    "ssdp_msearch_reply_failed"
-                                );
-                            }
-                        }
-                    }
-                    // Les zones qui s'annoncent en MediaRenderer (#1750)
-                    // répondent aussi — un contrôleur qui cherche des sorties
-                    // (JPlay « Rechercher des renderers ») ne voit que par là.
-                    for adv in crate::upnp_renderer::renderer_adverts() {
-                        for (st_reply, usn) in
-                            crate::upnp_renderer::renderer_msearch_targets(&st, &adv.uuid)
-                        {
-                            let resp = crate::upnp_server::ssdp_msearch_response(
-                                &st_reply,
-                                &usn,
-                                &adv.location,
-                            );
-                            if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
-                                debug!(
-                                    to = %addr,
-                                    st = %st_reply,
-                                    error = %e,
-                                    "ssdp_renderer_msearch_reply_failed"
-                                );
-                            }
-                        }
-                    }
+                    repondre_au_msearch(&socket, addr, &st).await;
                     continue;
                 }
 
@@ -561,11 +537,167 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
     }
 }
 
+/// L'etat de l'ecouteur SSDP du port 1900 — et donc, indissociablement, du
+/// REPONDEUR M-SEARCH, qui n'a pas d'autre socket que celui-la.
+///
+/// #3687. Un testeur a passe une soiree au tcpdump et au M-SEARCH Python pour
+/// conclure — a tort pour la 0.9.141 — que Tune n'implemente pas le cote
+/// *device* de SSDP. Personne n'a pu lui repondre depuis un simple diagnostic,
+/// parce que rien, nulle part, ne disait deux choses pourtant decisives :
+///
+/// 1. **Si l'ecouteur du port 1900 a seulement reussi a se lier.** Depuis
+///    #1750 c'est `notify_listen_loop` qui repond aux M-SEARCH ; si son bind
+///    echoue — un autre programme SSDP tient deja le port, et un pont
+///    UPnP/DLNA en est un — Tune devient invisible de TOUS les points de
+///    controle, et la seule trace etait une ligne de journal `warn` dans une
+///    tache detachee.
+/// 2. **Si Tune a deja repondu a un M-SEARCH.** Seul l'ECHEC d'envoi etait
+///    journalise, en `debug`. Un serveur qui repond parfaitement et un serveur
+///    muet produisaient exactement le meme diagnostic : rien.
+///
+/// Meme forme et meme intention que [`crate::slimproto::etat_ecoute`] (#2938),
+/// pour la meme raison : un bind refuse au demarrage n'a aucun client
+/// WebSocket a prevenir, seul un etat qui survit peut etre relu.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EtatEcouteSsdp {
+    /// Le port sur lequel l'ecoute a ete tentee.
+    pub port: u16,
+    /// `true` si la liaison est en place et que le repondeur M-SEARCH tourne.
+    pub ecoute: bool,
+    /// Phrase lisible, `None` quand l'ecoute est en service.
+    pub message: Option<String>,
+    /// L'erreur du systeme, telle quelle (`os error 98`, `os error 10048`…).
+    pub erreur_systeme: Option<String>,
+    /// Liaisons refusees depuis le demarrage. Non nul avec `ecoute = true`
+    /// signifie que la reprise a fini par aboutir — l'information vaut d'etre
+    /// gardee, c'est elle qui date la fenetre d'invisibilite.
+    pub echecs: u32,
+    /// Reponses M-SEARCH effectivement emises depuis le demarrage. C'est LE
+    /// chiffre qui tranche « Tune repond-il ? » sans tcpdump.
+    pub reponses_msearch: u64,
+}
+
+static ETAT_ECOUTE_SSDP: std::sync::RwLock<Option<EtatEcouteSsdp>> = std::sync::RwLock::new(None);
+static REPONSES_MSEARCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// L'etat de l'ecouteur SSDP, ou `None` tant qu'aucune liaison n'a ete tentee.
+/// Lu par `/system/diagnostics/network` et par le rapport de bogue.
+pub fn etat_ecoute_ssdp() -> Option<EtatEcouteSsdp> {
+    let mut etat = ETAT_ECOUTE_SSDP.read().ok().and_then(|g| g.clone())?;
+    etat.reponses_msearch = REPONSES_MSEARCH.load(std::sync::atomic::Ordering::Relaxed);
+    Some(etat)
+}
+
+fn retenir_etat_ecoute_ssdp(etat: EtatEcouteSsdp) {
+    if let Ok(mut g) = ETAT_ECOUTE_SSDP.write() {
+        *g = Some(etat);
+    }
+}
+
+/// Les paliers de reprise, en secondes, puis le dernier a perpetuite.
+///
+/// `notify_listen_loop` RENONCAIT : un `return` sur echec de bind, et le
+/// repondeur M-SEARCH etait mort pour toute la session. Or la cause typique
+/// est temporaire — un autre programme SSDP demarre avant nous et s'arretera.
+const REPRISES_ECOUTE_SSDP: [u64; 5] = [5, 15, 30, 60, 120];
+
+fn delai_de_reprise(echecs: u32) -> Duration {
+    let i = (echecs.saturating_sub(1) as usize).min(REPRISES_ECOUTE_SSDP.len() - 1);
+    Duration::from_secs(REPRISES_ECOUTE_SSDP[i])
+}
+
+/// Lie l'ecouteur SSDP et RETIENT le resultat, succes comme echec.
+///
+/// C'est le seul point ou [`etat_ecoute_ssdp`] est ecrit : quel que soit
+/// l'appelant, l'etat publie dit la verite sur la derniere tentative.
+fn lier_ecouteur_ssdp(port: u16) -> Result<UdpSocket, String> {
+    let echecs = etat_ecoute_ssdp().map(|e| e.echecs).unwrap_or(0);
+    match bind_notify_socket(port) {
+        Ok(socket) => {
+            retenir_etat_ecoute_ssdp(EtatEcouteSsdp {
+                port,
+                ecoute: true,
+                message: None,
+                erreur_systeme: None,
+                echecs,
+                reponses_msearch: 0,
+            });
+            Ok(socket)
+        }
+        Err(e) => {
+            retenir_etat_ecoute_ssdp(EtatEcouteSsdp {
+                port,
+                ecoute: false,
+                message: Some(format!(
+                    "un autre programme tient deja le port UDP {port} : tant qu'il le \
+                     garde, Tune ne repond a aucun M-SEARCH et reste invisible des points \
+                     de controle et des ponts UPnP (LMS/squeeze2upnp, BubbleUPnP, JPlay)"
+                )),
+                erreur_systeme: Some(e.clone()),
+                echecs: echecs.saturating_add(1),
+                reponses_msearch: 0,
+            });
+            Err(e)
+        }
+    }
+}
+
+/// Emet toutes les reponses dues a un M-SEARCH de cible `st`, et rend le
+/// nombre de datagrammes effectivement partis — le meme nombre dont
+/// [`etat_ecoute_ssdp`] fait la somme.
+///
+/// Site d'appel unique : [`notify_listen_loop`], branche `M-SEARCH`.
+///
+/// Les recherches qui ne nous concernent pas — un controleur qui cherche une
+/// imprimante — restent sans reponse : `msearch_reply_targets` et
+/// `renderer_msearch_targets` rendent alors des listes vides, et le compteur
+/// ne bouge pas.
+async fn repondre_au_msearch(socket: &UdpSocket, addr: std::net::SocketAddr, st: &str) -> u64 {
+    let mut envoyees = 0u64;
+
+    // Le MediaServer. `media_server_advert()` rend `None` tant que le serveur
+    // UPnP n'est pas en service ou qu'aucune IP reseau n'est connue.
+    if let Some(advert) = crate::upnp_server::media_server_advert() {
+        for (st_reply, usn) in crate::upnp_server::msearch_reply_targets(st, &advert.uuid) {
+            let resp = crate::upnp_server::ssdp_msearch_response(&st_reply, &usn, &advert.location);
+            match socket.send_to(resp.as_bytes(), addr).await {
+                Ok(_) => envoyees += 1,
+                // `to` et `st` : sans eux la trace dit qu'une reponse n'est
+                // pas partie, sans dire a qui ni pour quelle identite — donc
+                // sans permettre d'agir (#2417, meme defaut).
+                Err(e) => {
+                    debug!(to = %addr, st = %st_reply, error = %e, "ssdp_msearch_reply_failed")
+                }
+            }
+        }
+    }
+
+    // Les zones qui s'annoncent en MediaRenderer (#1750) : un controleur qui
+    // cherche des sorties — JPlay « Rechercher des renderers », le pont
+    // UPnPBridge de Lyrion — ne voit que par la.
+    for adv in crate::upnp_renderer::renderer_adverts() {
+        for (st_reply, usn) in crate::upnp_renderer::renderer_msearch_targets(st, &adv.uuid) {
+            let resp = crate::upnp_server::ssdp_msearch_response(&st_reply, &usn, &adv.location);
+            match socket.send_to(resp.as_bytes(), addr).await {
+                Ok(_) => envoyees += 1,
+                Err(e) => {
+                    debug!(to = %addr, st = %st_reply, error = %e, "ssdp_renderer_msearch_reply_failed")
+                }
+            }
+        }
+    }
+
+    if envoyees > 0 {
+        REPONSES_MSEARCH.fetch_add(envoyees, std::sync::atomic::Ordering::Relaxed);
+    }
+    envoyees
+}
+
 /// Bind a UDP socket to the SSDP multicast port for passive listening.
 /// Uses SO_REUSEADDR/SO_REUSEPORT so it can coexist with other SSDP users on
 /// the host (other apps, our own UPnP server), and joins the multicast group
 /// on every real IPv4 interface for multi-NIC / VPN setups.
-fn bind_notify_socket() -> Result<UdpSocket, String> {
+fn bind_notify_socket(port: u16) -> Result<UdpSocket, String> {
     let sock2 = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
@@ -578,9 +710,9 @@ fn bind_notify_socket() -> Result<UdpSocket, String> {
     sock2
         .bind(&socket2::SockAddr::from(SocketAddrV4::new(
             Ipv4Addr::UNSPECIFIED,
-            SSDP_PORT,
+            port,
         )))
-        .map_err(|e| format!("bind 0.0.0.0:{SSDP_PORT}: {e}"))?;
+        .map_err(|e| format!("bind 0.0.0.0:{port}: {e}"))?;
 
     // Join the multicast group on each real interface (and the default).
     let mut joined = false;
@@ -1839,6 +1971,157 @@ mod tests {
             _st: None,
             max_age: None,
         }
+    }
+
+    // ── #3687 : dire si on ecoute, et compter ce qu'on repond ─────────────
+
+    /// 🔴 #3687 — LA GARDE de l'etat d'ecoute, dans les DEUX sens.
+    ///
+    /// SITE D'APPEL GARDE : `notify_listen_loop`, dont la premiere instruction
+    /// est `lier_ecouteur_ssdp(SSDP_PORT)` — la fonction appelee ici — et qui
+    /// reprend au lieu de sortir tant qu'elle rend `Err`.
+    ///
+    /// Le port n'est pas code en dur : on en fait attribuer un par le systeme,
+    /// pour ne pas courir contre les onze autres agents qui compilent sur la
+    /// meme machine, et pour ne toucher ni au 1900 ni a aucun service reel.
+    ///
+    /// La MOITIE ROUGE tient a un fait du noyau, mesure et non suppose : un
+    /// occupant qui ne pose NI `SO_REUSEADDR` NI `SO_REUSEPORT` fait refuser
+    /// notre liaison (`os error 98`). Un occupant qui pose `SO_REUSEADDR` la
+    /// laisserait passer — c'est d'ailleurs pourquoi `squeeze2upnp`, qui le
+    /// pose, n'est probablement PAS la cause du dossier de #3687.
+    #[tokio::test]
+    async fn l_etat_d_ecoute_dit_le_refus_puis_la_reprise() {
+        // L'occupant : aucune option de partage, exactement le cas ou le
+        // noyau refuse.
+        let occupant = std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("port ephemere");
+        let port = occupant.local_addr().unwrap().port();
+
+        // ── MOITIE ROUGE : le port est pris, on doit le DIRE ──────────────
+        let refus = lier_ecouteur_ssdp(port);
+        assert!(
+            refus.is_err(),
+            "un occupant sans SO_REUSEADDR doit faire refuser la liaison"
+        );
+        let etat = etat_ecoute_ssdp().expect("aucun etat retenu apres un bind refuse");
+        assert_eq!(etat.port, port);
+        assert!(
+            !etat.ecoute,
+            "l'etat doit dire que le repondeur ne tourne pas"
+        );
+        assert!(
+            etat.erreur_systeme.is_some(),
+            "l'erreur systeme est la moitie exploitable du diagnostic"
+        );
+        assert!(etat.echecs >= 1, "l'echec doit etre compte");
+        let message = etat
+            .message
+            .expect("une phrase lisible, pas seulement un code");
+        assert!(
+            message.contains("M-SEARCH"),
+            "la phrase doit nommer la consequence, pas seulement la cause : {message}"
+        );
+
+        // ── MOITIE VERTE : le port se libere, on doit le dire AUSSI ───────
+        // Sans elle, un `lier_ecouteur_ssdp` qui echouerait toujours serait
+        // vert au premier assert et rendrait Tune muet en le proclamant.
+        drop(occupant);
+        let socket = lier_ecouteur_ssdp(port).expect("le port libere doit se lier");
+        let etat = etat_ecoute_ssdp().expect("etat retenu apres un bind reussi");
+        assert_eq!(etat.port, port);
+        assert!(etat.ecoute, "l'etat doit dire que le repondeur tourne");
+        assert!(etat.erreur_systeme.is_none());
+        assert!(etat.message.is_none());
+        drop(socket);
+    }
+
+    /// 🔴 #3687 — LA GARDE du repondeur M-SEARCH.
+    ///
+    /// SITE D'APPEL GARDE : `notify_listen_loop`, branche
+    /// `head.starts_with("M-SEARCH")`, qui appelle
+    /// `repondre_au_msearch(&socket, addr, &st)`.
+    ///
+    /// Le testeur de #3687 conclut que Tune « n'implemente pas la partie
+    /// serveur/device » de SSDP. Cette garde mesure le contraire sur des
+    /// datagrammes reels, en loopback : la machine de compilation n'a pas de
+    /// multicast utile, et un temoin qui en supposerait un se contenterait de
+    /// SAUTER — un test saute n'est pas un test vert.
+    ///
+    /// Elle tranche du meme coup le « non etabli » du ticket : oui,
+    /// `renderer_msearch_targets` couvre `ssdp:all`, `upnp:rootdevice` ET
+    /// `urn:schemas-upnp-org:device:MediaRenderer:1`.
+    #[tokio::test]
+    async fn le_repondeur_msearch_repond_et_se_compte() {
+        const UDN: &str = "uuid:4c9e51b8-3a77-4d0e-8a34-2b0d6f5c9a10";
+        const LOCATION: &str = "http://127.0.0.1:8888/upnp/renderer/17/description.xml";
+
+        // Le controleur : un vrai socket, qui recevra de vrais datagrammes.
+        let controleur = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_nous = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let vers = controleur.local_addr().unwrap();
+
+        crate::upnp_renderer::set_renderer_adverts(vec![crate::upnp_renderer::RendererAdvert {
+            uuid: UDN.to_string(),
+            location: LOCATION.to_string(),
+        }]);
+
+        let avant = etat_ecoute_ssdp().map(|e| e.reponses_msearch).unwrap_or(0);
+
+        // ── MOITIE VERTE : les trois cibles qu'un pont UPnP peut viser ────
+        for st in [
+            "ssdp:all",
+            "upnp:rootdevice",
+            "urn:schemas-upnp-org:device:MediaRenderer:1",
+        ] {
+            let n = repondre_au_msearch(&a_nous, vers, st).await;
+            assert!(n > 0, "aucune reponse emise pour ST={st}");
+
+            let mut buf = [0u8; 2048];
+            let recu = tokio::time::timeout(Duration::from_secs(2), controleur.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("aucun datagramme recu pour ST={st}"))
+                .unwrap();
+            let texte = String::from_utf8_lossy(&buf[..recu.0]).to_string();
+            assert!(texte.starts_with("HTTP/1.1 200 OK"), "ST={st} : {texte}");
+            assert!(
+                texte.contains(&format!("LOCATION: {LOCATION}")),
+                "la reponse doit porter la LOCATION du renderer — ST={st} : {texte}"
+            );
+            assert!(texte.contains(UDN), "ST={st} : {texte}");
+            // On vide ce que ce tour a emis en plus du premier datagramme.
+            while tokio::time::timeout(Duration::from_millis(50), controleur.recv_from(&mut buf))
+                .await
+                .is_ok()
+            {}
+        }
+
+        // ── MOITIE ROUGE : une recherche qui ne nous concerne pas ─────────
+        // Sans elle, un repondeur qui repondrait a TOUT serait vert ci-dessus
+        // tout en inondant le reseau et en se faisant prendre pour une
+        // imprimante.
+        let n = repondre_au_msearch(&a_nous, vers, "urn:schemas-upnp-org:device:Printer:1").await;
+        assert_eq!(n, 0, "une recherche etrangere ne doit rien declencher");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                controleur.recv_from(&mut [0u8; 64])
+            )
+            .await
+            .is_err(),
+            "aucun datagramme ne doit partir pour une cible etrangere"
+        );
+
+        // Le compteur du diagnostic a bien suivi ce qui est parti.
+        if let Some(etat) = etat_ecoute_ssdp() {
+            assert!(
+                etat.reponses_msearch > avant,
+                "le compteur de reponses M-SEARCH doit avancer : {} -> {}",
+                avant,
+                etat.reponses_msearch
+            );
+        }
+
+        crate::upnp_renderer::set_renderer_adverts(Vec::new());
     }
 
     // ── #3616 : un datagramme n'est pas une fenêtre d'observation ─────────

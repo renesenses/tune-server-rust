@@ -322,39 +322,16 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             // demandé, pas ce qui part sur le fil.
             obj.insert("dop_active".into(), json!(ps.dop_active));
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+            // #2369 — le mode DEMANDÉ n'est pas le transport OBTENU. Il reste
+            // ICI : `dsd_transport` est un état DÉDUIT de la sortie, pas un
+            // réglage de la zone, et il se lit comme `dop_active` juste
+            // au-dessus.
             let dsd_mode = zone_repo.get_dsd_mode(zone_id);
-            // #2369 — le mode DEMANDÉ n'est pas le transport OBTENU.
             obj.insert("dsd_transport".into(), dsd_transport_value(z, &dsd_mode));
-            obj.insert("dsd_mode".into(), json!(dsd_mode));
-            obj.insert(
-                "lyrics_offset_ms".into(),
-                json!(zone_repo.get_lyrics_offset_ms(zone_id)),
-            );
-            obj.insert(
-                "dlna_native_flac".into(),
-                json!(zone_repo.get_dlna_native_flac(zone_id)),
-            );
-            obj.insert(
-                "alac_passthrough".into(),
-                json!(zone_repo.get_alac_passthrough(zone_id)),
-            );
-            obj.insert(
-                "aac_passthrough".into(),
-                json!(zone_repo.get_aac_passthrough(zone_id)),
-            );
-            obj.insert("dlna_lpcm".into(), json!(zone_repo.get_dlna_lpcm(zone_id)));
-            obj.insert(
-                "dlna_cap_16bit".into(),
-                json!(zone_repo.get_dlna_cap_16bit(zone_id)),
-            );
-            obj.insert(
-                "dlna_wav24".into(),
-                json!(zone_repo.get_dlna_wav24(zone_id)),
-            );
-            obj.insert(
-                "dlna_play_delay_ms".into(),
-                json!(zone_repo.get_dlna_play_delay_ms(zone_id)),
-            );
+            // #2672 — les neuf réglages du panneau « Avancé · renderer »,
+            // `dsd_mode` compris, par l'injecteur partagé avec `get_zone` et
+            // `build_zone_json`.
+            crate::routes::zones::injecter_reglages_renderer(obj, &zone_repo, zone_id);
             // `autoplay_enabled` est VOLONTAIREMENT absent de la requete SQL
             // de `ZoneRepo` (migration v36 pouvant echouer en silence sous
             // Windows), donc `row_to_zone` le met a `false` sans exception —
@@ -515,37 +492,15 @@ pub(super) async fn get_zone(
                 obj.insert("resolving".into(), json!(ps.resolving));
                 // Voir la note au site jumeau : DoP en cours ⇒ volume inerte.
                 obj.insert("dop_active".into(), json!(ps.dop_active));
-                let dsd_mode = repo.get_dsd_mode(id);
                 // Voir la note au site jumeau : le mode demandé n'est pas le
-                // transport obtenu (#2369).
+                // transport obtenu (#2369), et cet état déduit reste ici.
+                let dsd_mode = repo.get_dsd_mode(id);
                 obj.insert(
                     "dsd_transport".into(),
                     dsd_transport_value(&zone, &dsd_mode),
                 );
-                obj.insert("dsd_mode".into(), json!(dsd_mode));
-                obj.insert(
-                    "lyrics_offset_ms".into(),
-                    json!(repo.get_lyrics_offset_ms(id)),
-                );
-                obj.insert(
-                    "dlna_native_flac".into(),
-                    json!(repo.get_dlna_native_flac(id)),
-                );
-                obj.insert(
-                    "alac_passthrough".into(),
-                    json!(repo.get_alac_passthrough(id)),
-                );
-                obj.insert(
-                    "aac_passthrough".into(),
-                    json!(repo.get_aac_passthrough(id)),
-                );
-                obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
-                obj.insert("dlna_cap_16bit".into(), json!(repo.get_dlna_cap_16bit(id)));
-                obj.insert("dlna_wav24".into(), json!(repo.get_dlna_wav24(id)));
-                obj.insert(
-                    "dlna_play_delay_ms".into(),
-                    json!(repo.get_dlna_play_delay_ms(id)),
-                );
+                // #2672 — même injecteur que la liste et `build_zone_json`.
+                crate::routes::zones::injecter_reglages_renderer(obj, &repo, id);
                 // Meme correction que dans la liste : la valeur serialisee
                 // depuis la struct vaut toujours `false`.
                 // #2271 — meme paire que dans la liste.
