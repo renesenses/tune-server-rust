@@ -386,8 +386,11 @@ mod presence;
 
 #[cfg(test)]
 mod debit_de_zone_tests;
+
 #[cfg(test)]
 mod fusion_tests;
+#[cfg(test)]
+mod sante_reseau_de_zone_tests;
 
 pub async fn create_zone_handler(
     state: State<AppState>,
