@@ -3389,6 +3389,18 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "streaming_item_tags",
         include_str!("../../migrations/postgres/052_streaming_item_tags.sql"),
     ),
+    // #3715 — TROIS des treize colonnes que `pg_sqlite_type_parity` a nommees
+    // le 09/09/2026 a sa PREMIERE execution reelle. Pas les treize : la mesure
+    // montre que PostgreSQL REFUSE `text -> smallint` et `boolean -> smallint`
+    // en affectation, donc convertir une colonne dont un redacteur lie du texte
+    // echangerait une lecture fausse contre une ecriture refusee. Les neuf
+    // restantes sont inscrites nominativement dans `ECARTS_TOLERES`, avec leur
+    // motif mesure.
+    (
+        53,
+        "parite_types_pg_sqlite",
+        include_str!("../../migrations/postgres/053_parite_types_pg_sqlite.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -5021,7 +5033,23 @@ mod tests {
         // paire `source` + `source_id`. Meme forme que `streaming_favorites`,
         // instantane d'affichage compris, pour qu'un album retire du catalogue
         // degrade sa pochette sans vider la liste.
-        assert_eq!(pg_latest_version(), 52, "latest PG migration must be 52");
+        // 53 : `parite_types_pg_sqlite` (#3715). PAS de jumelle SQLite : c'est
+        // une migration de RATTRAPAGE, qui aligne PostgreSQL sur ce que SQLite
+        // declare deja. Trois colonnes, chacune justifiee par sa mesure :
+        // `album_metadata.album_id` (TEXT contre un `i64` lie -> `operator does
+        // not exist: text = bigint`, metadonnees d'album illisibles sur tout le
+        // parc migre), `network_mounts.active` (TEXT dans un `COALESCE(active,
+        // 1)` -> `COALESCE types text and integer cannot be matched`, aucun
+        // partage SMB remonte au demarrage) et `listen_history.context_position`
+        // (un RANG declare TEXT par inadvertance par la 046, sur les DEUX
+        // chemins).
+        // Les NEUF autres colonnes que `pg_sqlite_type_parity` nomme ne sont
+        // PAS converties : PostgreSQL refuse `text -> smallint` et
+        // `boolean -> smallint` en affectation, donc convertir une colonne dont
+        // un redacteur lie du texte echangerait une lecture fausse contre une
+        // ecriture refusee. Elles sont inscrites nominativement dans
+        // `ECARTS_TOLERES` avec leur motif mesure.
+        assert_eq!(pg_latest_version(), 53, "latest PG migration must be 53");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
