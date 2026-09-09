@@ -256,3 +256,76 @@ async fn le_ping_de_demarrage_respecte_le_refus() {
         "le ping de démarrage doit se taire quand la télémétrie est refusée"
     );
 }
+
+/// La preuve que le battement ne PART PAS — pas seulement que le plan dit non.
+///
+/// `plan_du_tour` garde la decision ; ce temoin-ci garde l'execution.
+/// `TelemetryReporter::send` fait, dans cet ordre : lire le verrou, puis
+/// `get_or_create_server_id` — qui ECRIT un identifiant en base la premiere
+/// fois — puis compter les pistes, puis poster. Cette ecriture est donc le
+/// premier effet observable de la collecte, et le dernier point d'observation
+/// avant le reseau, dont l'URL est une constante non injectable.
+///
+/// Sur une base neuve ou le refus vient d'etre pose, appeler `send` ne doit
+/// laisser AUCUN `server_id` : la fonction est sortie avant de collecter quoi
+/// que ce soit, donc avant de construire son client HTTP.
+///
+/// Ce que ce temoin ne prouve PAS : qu'aucun paquet ne quitte la machine.
+/// Rien dans cette suite ne peut l'etablir sans serveur d'essai, l'URL de
+/// destination n'etant pas parametrable. Il prouve que l'execution s'arrete
+/// avant la premiere ligne de collecte.
+#[tokio::test]
+async fn le_battement_refuse_n_atteint_meme_pas_la_collecte() {
+    let (app, state) = banc();
+    let reglages = reglages(&state);
+
+    poster(&app, "/api/v1/cloud/telemetry/disable").await;
+    assert_eq!(
+        reglages.get("server_id").ok().flatten(),
+        None,
+        "poser un refus ne doit rien creer par lui-meme"
+    );
+
+    tune_core::cloud::telemetry::TelemetryReporter::send(
+        &state.backend,
+        &state.services,
+        &tune_server::config::resolve_web_dir(),
+    )
+    .await;
+
+    assert_eq!(
+        reglages.get("server_id").ok().flatten(),
+        None,
+        "telemetrie refusee : `send` doit sortir AVANT get_or_create_server_id, \
+         donc avant toute collecte et tout POST"
+    );
+}
+
+/// La derniere famille d'envois AUTOMATIQUES qui ignorait le refus.
+///
+/// `community_sync::spawn` pousse, toutes les trente minutes, le titre,
+/// l'artiste, l'album, le genre, l'annee, l'ISRC et le format des pistes de la
+/// bibliotheque. Elle lisait `community_sync_enabled` en dur, sans consulter
+/// le verrou de telemetrie — pendant que sa jumelle `contribution_autorisee`
+/// le respectait. Un refus pose dans l'interface ne l'arretait pas.
+#[tokio::test]
+async fn le_refus_arrete_aussi_la_synchronisation_communautaire() {
+    let (app, state) = banc();
+    let reglages = reglages(&state);
+
+    reglages
+        .set(tune_core::cloud::consent::SYNC_SETTING_KEY, "true")
+        .expect("ecriture du reglage de synchronisation");
+    assert!(
+        tune_core::cloud::consent::sync_communautaire_autorise(&reglages),
+        "cochee et telemetrie acceptee : la boucle a le droit de tourner"
+    );
+
+    poster(&app, "/api/v1/cloud/telemetry/disable").await;
+
+    assert!(
+        !tune_core::cloud::consent::sync_communautaire_autorise(&reglages),
+        "le refus pose par la route doit arreter la boucle de synchronisation, \
+         meme explicitement cochee"
+    );
+}
