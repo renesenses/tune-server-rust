@@ -10,10 +10,33 @@ const AUTH_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const API_BASE: &str = "https://api.spotify.com/v1";
 const DEFAULT_CLIENT_ID: &str = "placeholder";
-// Spotify no longer accepts the `localhost` alias. Plain HTTP is allowed only
-// for an explicit loopback IP literal; Tune's default API port is 8888.
-// Remote installations must provide their registered HTTPS URI explicitly.
-const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8888/api/v1/streaming/spotify/callback";
+// Spotify n'accepte plus l'alias `localhost` : le HTTP en clair n'est admis
+// que pour un LITTERAL de boucle locale. C'est acquis depuis #2680 et ce
+// n'est pas ce qui change ici.
+//
+// Ce qui change, c'est le PORT. Il etait ecrit en dur a 8888 — le defaut de
+// Tune — alors que `TUNE_PORT` le deplace et que le serveur ecoute la ou on
+// le lui dit (`tune-server/src/bootstrap.rs:289`, `config.port`). Une
+// installation sur un autre port envoyait donc a Spotify une URI nommant un
+// port ou rien ne repond : l'autorisation aboutit et retombe sur le vide.
+// C'est exactement le doute que Krugy a formule sur le fil 34 — « le port
+// Tune est bien 8888 sur mon installe » — face a un defaut qui, a l'epoque,
+// en nommait un autre. Le port se DERIVE de celui qu'on ecoute.
+//
+// Cette valeur doit par ailleurs etre declaree A L'IDENTIQUE dans le tableau
+// de bord de l'application Spotify de l'utilisateur, et Tune ne peut pas le
+// faire a sa place : `GET /api/v1/system/env` la publie donc telle qu'elle
+// partira, pour qu'elle soit recopiable sans la deviner.
+//
+// Une installation distante reste tenue de fournir son URI HTTPS enregistree
+// (configuration explicite ou variable) : rien ici ne la devine.
+pub const DEFAULT_API_PORT: u16 = 8888;
+const REDIRECT_PATH: &str = "/api/v1/streaming/spotify/callback";
+
+/// L'URI de redirection par defaut d'un serveur qui ecoute sur `api_port`.
+pub fn default_redirect_uri(api_port: u16) -> String {
+    format!("http://127.0.0.1:{api_port}{REDIRECT_PATH}")
+}
 const SCOPES: &str = "user-read-private user-library-read playlist-read-private playlist-modify-private playlist-modify-public";
 
 pub struct SpotifyService {
@@ -44,26 +67,45 @@ impl Default for SpotifyService {
     }
 }
 
-fn resolve_redirect_uri(
+/// Ordre de priorite, inchange : configuration explicite, puis
+/// `TUNE_SPOTIFY_REDIRECT_URI`, puis l'ancienne `SPOTIFY_REDIRECT_URI`, puis
+/// le defaut derive du port ecoute.
+pub fn resolve_redirect_uri(
     explicit: Option<&str>,
     tune_env: Option<String>,
     legacy_env: Option<String>,
+    api_port: u16,
 ) -> String {
     explicit
         .filter(|uri| !uri.is_empty())
         .map(str::to_owned)
         .or_else(|| tune_env.filter(|uri| !uri.is_empty()))
         .or_else(|| legacy_env.filter(|uri| !uri.is_empty()))
-        .unwrap_or_else(|| DEFAULT_REDIRECT_URI.into())
+        .unwrap_or_else(|| default_redirect_uri(api_port))
+}
+
+/// L'URI que Tune enverra REELLEMENT a Spotify, lue depuis l'environnement du
+/// processus — la meme resolution que celle appliquee a la construction du
+/// service, au meme endroit, pour qu'une page de support ne puisse pas en
+/// afficher une autre (#2680).
+pub fn effective_redirect_uri(explicit: Option<&str>, api_port: u16) -> String {
+    resolve_redirect_uri(
+        explicit,
+        std::env::var("TUNE_SPOTIFY_REDIRECT_URI").ok(),
+        std::env::var("SPOTIFY_REDIRECT_URI").ok(),
+        api_port,
+    )
 }
 
 impl SpotifyService {
     pub fn new() -> Self {
-        Self::with_config(None, None)
+        Self::with_config(None, None, DEFAULT_API_PORT)
     }
 
-    /// Create a SpotifyService with explicit client_id and redirect_uri from TuneConfig.
-    pub fn with_config(client_id: Option<&str>, redirect_uri: Option<&str>) -> Self {
+    /// Create a SpotifyService with explicit client_id and redirect_uri from
+    /// TuneConfig. `api_port` est le port REELLEMENT ecoute : il ne sert qu'au
+    /// defaut, et n'ecrase jamais une URI explicite (#2680).
+    pub fn with_config(client_id: Option<&str>, redirect_uri: Option<&str>, api_port: u16) -> Self {
         let client_id = client_id
             .filter(|id| !id.is_empty())
             .map(str::to_owned)
@@ -72,11 +114,7 @@ impl SpotifyService {
                     .or_else(|_| std::env::var("SPOTIFY_CLIENT_ID"))
                     .unwrap_or_else(|_| DEFAULT_CLIENT_ID.into())
             });
-        let redirect_uri = resolve_redirect_uri(
-            redirect_uri,
-            std::env::var("TUNE_SPOTIFY_REDIRECT_URI").ok(),
-            std::env::var("SPOTIFY_REDIRECT_URI").ok(),
-        );
+        let redirect_uri = effective_redirect_uri(redirect_uri, api_port);
         Self {
             client: crate::http::client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -842,11 +880,60 @@ mod tests {
     #[test]
     fn spotify_default_redirect_uses_the_tune_port_and_an_explicit_loopback() {
         assert_eq!(
-            resolve_redirect_uri(None, None, None),
+            resolve_redirect_uri(None, None, None, DEFAULT_API_PORT),
             "http://127.0.0.1:8888/api/v1/streaming/spotify/callback"
         );
-        assert!(!DEFAULT_REDIRECT_URI.contains("localhost"));
-        assert!(!DEFAULT_REDIRECT_URI.contains(":8085/"));
+        let defaut = default_redirect_uri(DEFAULT_API_PORT);
+        assert!(!defaut.contains("localhost"));
+        assert!(!defaut.contains(":8085/"));
+    }
+
+    /// #2680 — le defaut SUIT le port ecoute.
+    ///
+    /// Un serveur demarre avec `TUNE_PORT=9000` envoyait a Spotify une URI en
+    /// 8888 : l'autorisation renvoie alors le navigateur vers un port ou rien
+    /// n'ecoute. Le port n'est pas une constante, c'est une mesure.
+    #[test]
+    fn spotify_default_redirect_follows_the_port_actually_listened_on() {
+        assert_eq!(
+            resolve_redirect_uri(None, None, None, 9000),
+            "http://127.0.0.1:9000/api/v1/streaming/spotify/callback"
+        );
+        assert_eq!(
+            resolve_redirect_uri(None, None, None, 8085),
+            "http://127.0.0.1:8085/api/v1/streaming/spotify/callback"
+        );
+        // L'hote reste un litteral de boucle locale a tout port : c'est la
+        // seule forme que Spotify accepte encore en HTTP clair.
+        for port in [80u16, 8085, 8888, 9000, 65535] {
+            let uri = default_redirect_uri(port);
+            assert!(uri.starts_with("http://127.0.0.1:"), "{uri}");
+            assert!(!uri.contains("localhost"), "{uri}");
+            assert!(
+                uri.ends_with("/api/v1/streaming/spotify/callback"),
+                "le chemin de callback ne doit jamais changer : {uri}"
+            );
+        }
+    }
+
+    /// Le port ne doit JAMAIS deplacer une URI que l'exploitant a ecrite.
+    ///
+    /// Une installation distante declare son URI HTTPS enregistree ; en
+    /// deriver le port la casserait a chaque changement de `TUNE_PORT`.
+    #[test]
+    fn spotify_port_never_overrides_an_explicit_redirect() {
+        assert_eq!(
+            resolve_redirect_uri(Some("https://tune.example/cb"), None, None, 9000),
+            "https://tune.example/cb"
+        );
+        assert_eq!(
+            resolve_redirect_uri(None, Some("https://env.example/cb".into()), None, 9000),
+            "https://env.example/cb"
+        );
+        assert_eq!(
+            resolve_redirect_uri(None, None, Some("https://old.example/cb".into()), 9000),
+            "https://old.example/cb"
+        );
     }
 
     #[test]
@@ -855,11 +942,11 @@ mod tests {
         let legacy_env = Some("https://env-legacy.example/callback".into());
 
         assert_eq!(
-            resolve_redirect_uri(None, tune_env.clone(), legacy_env.clone()),
+            resolve_redirect_uri(None, tune_env.clone(), legacy_env.clone(), DEFAULT_API_PORT),
             "https://env-tune.example/callback"
         );
         assert_eq!(
-            resolve_redirect_uri(None, None, legacy_env.clone()),
+            resolve_redirect_uri(None, None, legacy_env.clone(), DEFAULT_API_PORT),
             "https://env-legacy.example/callback"
         );
         assert_eq!(
@@ -867,6 +954,7 @@ mod tests {
                 Some("https://config.example/callback"),
                 tune_env,
                 legacy_env,
+                DEFAULT_API_PORT,
             ),
             "https://config.example/callback"
         );
@@ -877,6 +965,7 @@ mod tests {
         let svc = SpotifyService::with_config(
             Some("client-test"),
             Some("https://tune.example/api/v1/streaming/spotify/callback"),
+            DEFAULT_API_PORT,
         );
         let url = svc.auth_url("challenge-test");
 

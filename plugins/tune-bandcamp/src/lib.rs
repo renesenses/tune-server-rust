@@ -585,6 +585,17 @@ async fn bc_discover(Query(q): Query<DiscoverQuery>) -> impl IntoResponse {
 /// qualité d'un disque.
 const BC_STREAM_QUALITY: &str = "mp3-128";
 
+/// Ce qu'il faut dire à quelqu'un qui a ACHETÉ le disque.
+///
+/// Extraite en constante parce qu'elle doit se lire à l'identique sur les
+/// deux surfaces qui la portent : la fiche d'un album, et « Ma collection »
+/// — c'est-à-dire l'écran de l'acheteur, le seul où quelqu'un a payé pour
+/// mieux que ce que Tune lui sert. La répéter à la main, c'est se ménager
+/// de la faire diverger.
+const BC_NOTE_QUALITE: &str = "Bandcamp ne sert que du MPG 128 kbit/s sans session \
+                               d'achat. Pour la qualité d'origine, télécharger \
+                               l'album acheté et le lire depuis la bibliothèque.";
+
 /// Extraire le bloc `data-tralbum` d'une page album ou piste Bandcamp.
 ///
 /// L'ancien `/album/{id}` répondait « Bandcamp has no public album API ».
@@ -660,9 +671,7 @@ fn album_jouable(tralbum: &Value) -> Value {
         // n'affiche que l'album doit pouvoir le dire à l'utilisateur.
         "quality": BC_STREAM_QUALITY,
         "lossless": false,
-        "quality_note": "Bandcamp ne sert que du MPG 128 kbit/s sans session \
-                         d'achat. Pour la qualité d'origine, télécharger \
-                         l'album acheté et le lire depuis la bibliothèque.",
+        "quality_note": BC_NOTE_QUALITE,
     })
 }
 
@@ -1340,12 +1349,34 @@ pub(crate) async fn page_de_collection(
     }
 }
 
+/// L'extrait jouable d'un article de collection, s'il en a un.
+///
+/// 🔴 La réponse de `collection_items` porte un bloc `tracklists` que Tune
+/// jetait entièrement — mesuré le 09/09/2026 : trois articles, trois
+/// tracklists, une URL `mp3-128` chacune. Sans elle, un article de « Ma
+/// collection » arrivait au client SANS rien de jouable, alors que la même
+/// charge réseau la contenait déjà.
+///
+/// La clef est `<tralbum_type><tralbum_id>` — `t2513132945` pour une piste,
+/// `a787856765` pour un album. Convention de Bandcamp, vérifiée sur une
+/// réponse réelle, et pas devinée d'après le nom des champs.
+fn extrait_de_collection(brut: &Value, article: &Value) -> Option<String> {
+    let cle = format!(
+        "{}{}",
+        article["tralbum_type"].as_str()?,
+        article["tralbum_id"].as_i64()?
+    );
+    brut["tracklists"][cle.as_str()][0]["file"][BC_STREAM_QUALITY]
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Mettre une page de collection en forme pour un client Tune.
 ///
 /// Ne garde que ce qui sert au rapprochement avec la bibliothèque locale
 /// (lot 3) : qui, quoi, et de quel type. Le reste de la charge Bandcamp —
 /// prix, dates d'achat, compteurs — n'a pas à traverser l'API de Tune.
-fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
+pub fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
     let articles: Vec<Value> = brut["items"]
         .as_array()
         .map(|v| v.as_slice())
@@ -1358,6 +1389,27 @@ fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
                 "type": it["item_type"],
                 "url": it["item_url"],
                 "art_id": it["item_art_id"],
+                // 🔴 La pochette RÉSOLUE, comme `/discover`, `/search` et
+                // `/album` la servent déjà. « Ma collection » était la SEULE
+                // surface Bandcamp à rendre un `art_id` nu : le client ne
+                // recompose aucune URL bcbits — c'est l'oubli du préfixe `a`
+                // qui rendait 404 (#1768) — donc la vignette de l'acheteur
+                // restait vide sur l'écran de ses propres achats.
+                "pochette": pochette(it.get("item_art_id")),
+                // 🔴 De quoi lancer la lecture. Sans ce champ, le clic sur un
+                // article de collection n'avait RIEN à jouer et le geste
+                // restait inerte, alors que la réponse de Bandcamp portait
+                // déjà l'URL dans son bloc `tracklists`.
+                "extrait": extrait_de_collection(brut, it),
+                // 🔴 La règle de #2074 — « un flux à 128 kbit/s doit être
+                // annoncé PARTOUT où il apparaît » — n'était pas tenue ici.
+                // Découverte, recherche et fiche d'album le disaient toutes ;
+                // « Ma collection » ne disait rien. C'est précisément l'écran
+                // où le silence trompe : celui de quelqu'un qui a payé pour
+                // du sans perte et à qui Tune sert l'extrait de découverte.
+                "qualite": BC_STREAM_QUALITY,
+                "lossless": false,
+                "source": "bandcamp",
             })
         })
         .collect();
@@ -1368,6 +1420,14 @@ fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
         // Curseur à réémettre tel quel pour la page suivante.
         "more_available": brut["more_available"].as_bool().unwrap_or(false),
         "last_token": brut["last_token"],
+        // Sur l'enveloppe AUSSI, comme `/search` et `/discover` : un client
+        // qui n'affiche qu'un bandeau doit pouvoir le dire sans ouvrir un
+        // article. Et la note nomme le seul chemin qui rend à l'acheteur ce
+        // qu'il a payé — le téléchargement, que Tune ne peut pas faire à sa
+        // place, faute de session d'achat.
+        "qualite": BC_STREAM_QUALITY,
+        "lossless": false,
+        "quality_note": BC_NOTE_QUALITE,
     })
 }
 

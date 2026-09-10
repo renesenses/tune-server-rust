@@ -1235,6 +1235,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
             tune_core::scanner::cue_bibliotheque::inventorier_et_ecrire(
                 db.clone(),
                 &list_result.dossiers_avec_feuille_cue,
+                // 🔴 `music_dirs`, PAS `scan_dirs` : un scan ciblé ne porte que
+                // le sous-arbre demandé, et l'élagage CUE prendrait tout le
+                // reste de la bibliothèque pour « hors périmètre ». Ce sont les
+                // racines DÉCLARÉES qui bornent la décision, jamais l'étendue
+                // du scan en cours.
+                &music_dirs,
             );
         if inventaire_cue.dossiers > 0 {
             tracing::info!(

@@ -1475,6 +1475,30 @@
     "ro": "{name} a fost adăugat la favoritele tale Tune.",
     "sv": "{name} har lagts till bland dina Tune-favoriter."
   },
+  "radio.alreadyThereTitle": {
+    "fr": "✓ Radio déjà présente",
+    "en": "✓ Radio already there",
+    "de": "✓ Radio bereits vorhanden",
+    "es": "✓ La radio ya está",
+    "it": "✓ Radio già presente",
+    "zh": "✓ 电台已存在",
+    "ja": "✓ ラジオは登録済み",
+    "ko": "✓ 라디오가 이미 있습니다",
+    "ro": "✓ Radio deja prezent",
+    "sv": "✓ Radion finns redan"
+  },
+  "radio.alreadyThereBody": {
+    "fr": "{name} est déjà dans votre catalogue Tune. Elle a été remise dans vos favoris — aucun doublon n'a été créé.",
+    "en": "{name} is already in your Tune catalogue. It has been put back in your favourites — no duplicate was created.",
+    "de": "{name} ist bereits in deinem Tune-Katalog. Der Sender wurde wieder zu deinen Favoriten hinzugefügt — es wurde kein Duplikat angelegt.",
+    "es": "{name} ya está en tu catálogo de Tune. Se ha vuelto a añadir a tus favoritos: no se ha creado ningún duplicado.",
+    "it": "{name} è già nel tuo catalogo Tune. È stata rimessa nei preferiti: nessun duplicato è stato creato.",
+    "zh": "{name} 已在您的 Tune 电台列表中。已重新加入收藏，未创建重复条目。",
+    "ja": "{name} はすでに Tune のカタログにあります。お気に入りに戻しました。重複は作成されていません。",
+    "ko": "{name}은(는) 이미 Tune 목록에 있습니다. 즐겨찾기에 다시 추가했으며 중복 항목은 만들지 않았습니다.",
+    "ro": "{name} este deja în catalogul tău Tune. A fost pusă din nou la favorite — nu a fost creat niciun duplicat.",
+    "sv": "{name} finns redan i din Tune-katalog. Den har lagts tillbaka bland dina favoriter – ingen dubblett skapades."
+  },
   "radio.canCloseTab": {
     "fr": "Vous pouvez fermer cet onglet.",
     "en": "You can close this tab.",

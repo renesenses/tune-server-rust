@@ -67,7 +67,14 @@ jobs:
   preflight:
     name: Pre-release checks
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 60 minutes depuis #2808 : le controle `ci_status` ATTEND desormais que la
+    # porte obligatoire (`ci.yml`) ait FINI sur le commit promu, au lieu de la
+    # declarer verte pendant qu'elle tourne encore. Mesure du train v0.9.142 :
+    # tag pose a 09:49:47Z, `ci.yml` terminee a 10:17:26Z — vingt-huit minutes
+    # d'attente. A 20 minutes, ce job serait tue au milieu de son attente et
+    # rendrait un ROUGE qui ne dit rien du code. Le budget d'attente du script
+    # (40 min par defaut) tient sous ce plafond, marge comprise.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 

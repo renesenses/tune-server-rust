@@ -28,6 +28,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "aes-gcm"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ghash",
+ "subtle",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1140,6 +1165,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctr"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "ctutils"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1417,7 +1451,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1703,6 +1737,16 @@ dependencies = [
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "ghash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
+dependencies = [
+ "opaque-debug",
+ "polyval",
 ]
 
 [[package]]
@@ -2197,7 +2241,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2800,7 +2844,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3242,6 +3286,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "polyval"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1fe60d06143b2430aa532c94cfe9e29783047f06c0d7fd359a9a51b729fa25"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "opaque-debug",
+ "universal-hash",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3472,7 +3528,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3857,7 +3913,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3916,7 +3972,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4212,6 +4268,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "snow"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82"
+dependencies = [
+ "aes-gcm",
+ "blake2",
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "getrandom 0.3.4",
+ "ring",
+ "rustc_version",
+ "sha2 0.10.9",
+ "subtle",
 ]
 
 [[package]]
@@ -4748,10 +4821,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5222,7 +5295,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-bandcamp"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "async-trait",
  "axum",
@@ -5236,7 +5309,7 @@ dependencies = [
 
 [[package]]
 name = "tune-bridge"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "axum",
  "bytes",
@@ -5257,7 +5330,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "clap",
  "clap_complete",
@@ -5271,7 +5344,7 @@ dependencies = [
 
 [[package]]
 name = "tune-concerts"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "async-trait",
  "axum",
@@ -5284,13 +5357,14 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "ape-decoder",
  "argon2",
  "async-stream",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "blowfish",
  "bytes",
  "cbc",
@@ -5333,6 +5407,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "snow",
  "socket2 0.5.10",
  "sqlx",
  "srp",
@@ -5359,7 +5434,7 @@ dependencies = [
 
 [[package]]
 name = "tune-dj"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "async-trait",
  "axum",
@@ -5371,7 +5446,7 @@ dependencies = [
 
 [[package]]
 name = "tune-ffi"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "axum",
  "serde_json",
@@ -5384,7 +5459,7 @@ dependencies = [
 
 [[package]]
 name = "tune-http-types"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "axum",
  "reqwest",
@@ -5395,7 +5470,7 @@ dependencies = [
 
 [[package]]
 name = "tune-karaoke"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "async-trait",
  "axum",
@@ -5408,7 +5483,7 @@ dependencies = [
 
 [[package]]
 name = "tune-output-api"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "async-trait",
  "serde",
@@ -5417,7 +5492,7 @@ dependencies = [
 
 [[package]]
 name = "tune-plugin-runtime-wasm"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5426,12 +5501,13 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "argon2",
  "async-stream",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "dotenvy",
@@ -5451,11 +5527,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "snow",
  "socket2 0.5.10",
  "tar",
  "tempfile",
  "time",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "toml",
  "tower",
  "tower-http",
@@ -5479,7 +5557,7 @@ dependencies = [
 
 [[package]]
 name = "tune-smart-http"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "axum",
  "serde",
@@ -5491,7 +5569,7 @@ dependencies = [
 
 [[package]]
 name = "tune-stream-http"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "async-stream",
  "axum",
@@ -5505,7 +5583,7 @@ dependencies = [
 
 [[package]]
 name = "tune-streaming-http"
-version = "0.9.144"
+version = "0.9.145"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6139,7 +6217,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

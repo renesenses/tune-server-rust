@@ -4036,6 +4036,117 @@ async fn an_offline_zone_whose_device_is_still_registered_is_not_touched() {
     );
 }
 
+/// Une zone LOCALE hors ligne dont l'appareil a disparu de l'énumération.
+///
+/// C'est la zone 1 de Lulu : `local:audio-gd USB audio`, marquée `online:
+/// false` par le serveur lui-même, et un DAC que WASAPI n'énumère plus.
+fn zone_locale_hors_ligne(orch: &PlaybackOrchestrator, name: &str, dev: &str) -> i64 {
+    let repo = ZoneRepo::with_backend(orch.db.clone());
+    let id = repo.create(name, Some("local"), Some(dev)).unwrap();
+    repo.update_online(id, false).unwrap();
+    id
+}
+
+/// 🔴 CONTRE-ÉPREUVE #3738 — une zone locale hors ligne dont l'appareil a
+/// disparu REFUSE la lecture, au lieu de l'accepter puis de mourir 600 ms plus
+/// tard.
+///
+/// Le garde exemptait toute zone `local:` (« reputed always available »), donc
+/// il ignorait le `online: false` qu'il venait lui-même de lire. Remettre
+/// `|| dev_id.starts_with("local:")` rend ce témoin ROUGE : le garde rend
+/// `Ok(None)`, la lecture est acceptée, et `expect_err` tombe.
+#[tokio::test]
+async fn une_zone_locale_dont_le_dac_a_disparu_refuse_la_lecture_au_lieu_de_l_accepter() {
+    let orch = test_orchestrator();
+    let zone_id = zone_locale_hors_ligne(&orch, "audio-gd USB audio", "local:audio-gd USB audio");
+    // Le seul périphérique encore énuméré chez Lulu — et il ne porte PAS le nom
+    // de la zone, donc le rebond de #1287 ne trouvera rien. Il doit être tenté
+    // quand même ; c'est le refus qui doit suivre, pas une acceptation.
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("local:haut-parleurs", "Haut-parleurs").with_type("local"),
+    ));
+
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    let err = orch
+        .gate_or_rebind_offline_zone(zone_id, &zone)
+        .await
+        .expect_err(
+            "une zone locale hors ligne dont l'appareil n'est plus énuméré doit \
+             REFUSER d'emblée : l'accepter fait construire la file, résoudre et \
+             transcoder le fichier, puis arrêter la zone ~600 ms plus tard, sans \
+             qu'aucun refus n'apparaisse au journal (#3738, Lulu, fil 1731)",
+        );
+    assert!(
+        err.starts_with("zone_output_unavailable:"),
+        "le refus doit porter la sentinelle que la couche HTTP mappe sur un 409 : {err}"
+    );
+    assert!(
+        err.contains("réglages de la zone"),
+        "le message doit dire quoi faire : {err}"
+    );
+
+    // Rien n'a été touché en base : pas de rebond au hasard vers les
+    // haut-parleurs du PC. Sur un DAC audiophile, se rabattre en silence serait
+    // pire que de ne rien jouer.
+    let after = ZoneRepo::with_backend(orch.db.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.output_device_id.as_deref(),
+        Some("local:audio-gd USB audio")
+    );
+    assert!(!after.online);
+}
+
+/// L'AUTRE moitié, et elle est indispensable : la grâce reste.
+///
+/// L'exemption `local:` existait pour ne pas refuser une lecture pendant qu'un
+/// périphérique se réveille. La retirer sans ce témoin ferait régresser le cas
+/// nominal — et un refus sec sur une zone locale saine serait bien pire que le
+/// défaut qu'on corrige.
+///
+/// Le critère est « l'appareil est-il dans le registre vivant », pas le
+/// préfixe : une zone locale que la base croit hors ligne mais dont la sortie
+/// est enregistrée passe, sans rebond et sans écriture.
+#[tokio::test]
+async fn une_zone_locale_hors_ligne_mais_dont_la_sortie_est_enregistree_passe_toujours() {
+    let orch = test_orchestrator();
+    let zone_id = zone_locale_hors_ligne(&orch, "Bureau", "local:bureau");
+    {
+        let mut reg = orch.outputs.lock().await;
+        reg.register(Box::new(
+            MockOutput::new("local:bureau", "Bureau").with_type("local"),
+        ));
+        // Un homonyme qui aurait été choisi si on avait re-bindé à tort.
+        reg.register(Box::new(
+            MockOutput::new("local:bureau-bis", "Bureau").with_type("local"),
+        ));
+    }
+
+    let repo = ZoneRepo::with_backend(orch.db.clone());
+    let zone = repo.get(zone_id).unwrap().unwrap();
+    assert_eq!(
+        orch.gate_or_rebind_offline_zone(zone_id, &zone)
+            .await
+            .unwrap(),
+        None,
+        "le périphérique est joignable : la grâce doit tenir, quoi qu'en dise la base"
+    );
+    assert_eq!(
+        repo.get(zone_id)
+            .unwrap()
+            .unwrap()
+            .output_device_id
+            .as_deref(),
+        Some("local:bureau"),
+        "aucune écriture ne doit avoir eu lieu"
+    );
+}
+
 #[test]
 fn timeout_means_the_command_may_have_landed() {
     let err = format!(

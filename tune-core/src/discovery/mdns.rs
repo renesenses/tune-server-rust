@@ -20,6 +20,11 @@ pub const OAAT_SERVICE: &str = "_oaat._tcp.local.";
 /// l'enceinte qui s'annonce et la source de musique qui compose vers elle ;
 /// la constante vit dans [`super::sendspin`], avec sa source.
 pub const SENDSPIN_SERVICE: &str = super::sendspin::SERVICE_LECTEUR;
+/// Service que Tune ANNONCE en tant que serveur Sendspin (#3326, S2-a).
+///
+/// La spécification impose les deux modes de découverte au serveur — la
+/// phase 1 n'avait livré que le parcours. Voir `register_sendspin_server`.
+pub const SENDSPIN_SERVER_SERVICE: &str = super::sendspin::SERVICE_SERVEUR;
 
 #[derive(Debug, Clone)]
 pub enum MdnsEvent {
@@ -197,6 +202,57 @@ impl MdnsScanner {
             ip = %local_ip,
             port,
             "mdns_service_registered"
+        );
+        Ok(())
+    }
+
+    /// Annonce Tune comme SERVEUR Sendspin (#3326, S2-a).
+    ///
+    /// La spécification décrit deux modes de découverte et exige du serveur
+    /// qu'il supporte les deux : le parcours de `_sendspin._tcp.local.` (mode
+    /// serveur-initié, livré en phase 1 par `with_sendspin`) **et** cette
+    /// annonce de `_sendspin-server._tcp.local.` (mode client-initié), par
+    /// laquelle une enceinte peut composer vers nous.
+    ///
+    /// Le TXT `path` est REQUIS par la spécification et ne connaît aucun
+    /// défaut : c'est pourquoi il est écrit ici sans condition. Le port annoncé
+    /// est celui du serveur HTTP de Tune, où le point d'accès est réellement
+    /// monté — et non le 8927 « recommandé », qui ne décrirait pas la réalité.
+    pub fn register_sendspin_server(&self, port: u16) -> Result<(), String> {
+        let hostname = crate::discovery::system_hostname();
+        let service_name = format!("Tune ({hostname})");
+        let host_label = crate::discovery::mdns_host_label(&hostname);
+
+        let local_ip = crate::discovery::ssdp::get_local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into());
+
+        let properties = [
+            ("path", crate::sendspin::CHEMIN_POINT_D_ACCES),
+            ("name", service_name.as_str()),
+        ];
+
+        let svc = ServiceInfo::new(
+            SENDSPIN_SERVER_SERVICE,
+            &service_name,
+            &format!("{host_label}.local."),
+            &local_ip,
+            port,
+            &properties[..],
+        )
+        .map_err(|e| format!("mDNS sendspin register: {e}"))?;
+
+        self.daemon
+            .register(svc)
+            .map_err(|e| format!("mDNS sendspin register: {e}"))?;
+
+        info!(
+            service = SENDSPIN_SERVER_SERVICE,
+            name = %service_name,
+            ip = %local_ip,
+            port,
+            path = crate::sendspin::CHEMIN_POINT_D_ACCES,
+            "mdns_sendspin_server_registered"
         );
         Ok(())
     }

@@ -308,3 +308,104 @@ async fn renommer_une_station_ne_repasse_pas_son_adresse_par_la_sonde() {
         .expect("la station doit exister");
     assert_eq!(station_en_base.name, "Radio Paradise (Main)");
 }
+
+// ---------------------------------------------------------------------------
+// 3. Le résidu #3664 : le refus PROPOSE la station du catalogue qui porte le
+//    bon flux
+// ---------------------------------------------------------------------------
+//
+// Le premier manque du ticket d'origine — l'adresse n'est jamais validée à
+// l'enregistrement — est tenu par les essais ci-dessus. Le SECOND ne l'était
+// pas : « le message de refus dit "cherchez le lien écouter sur le site de la
+// radio", jamais "Tune connaît déjà Radio Paradise – Main Mix" » (#3664).
+//
+// Les deux rapprochements sont éprouvés séparément, puis leur contre-épreuve :
+// un refus qui ne rapproche rien doit rendre une liste VIDE, pas la première
+// station venue.
+
+/// Les noms des stations proposées par un refus.
+///
+/// `suggestions` doit être un TABLEAU, toujours — même vide. Un `null` obligerait
+/// l'écran à distinguer « aucune suggestion » de « ce serveur n'en propose
+/// pas », exactement ce que `corps_recherche` refuse de lui imposer.
+fn noms_proposes(corps: &Value) -> Vec<String> {
+    corps["suggestions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`suggestions` absent ou pas un tableau : {corps}"))
+        .iter()
+        .map(|s| {
+            s["name"]
+                .as_str()
+                .unwrap_or_else(|| panic!("suggestion sans nom : {s}"))
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn le_refus_propose_la_station_du_catalogue_qui_porte_le_meme_nom() {
+    let (app, _state) = app_et_etat();
+    let station = station_simulee().await;
+
+    // Le nom saisi par Belkadi Yacine, et une page web à la place du flux.
+    let (status, corps) = creer(&app, "Radio Paradise", &format!("{station}/page")).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{corps}");
+    assert_eq!(corps["error"], "radio_url_pas_un_flux");
+
+    let noms = noms_proposes(&corps);
+    assert!(
+        noms.iter().any(|n| n == "Radio Paradise - Main Mix"),
+        "le catalogue livré porte « Radio Paradise - Main Mix » depuis la \
+         migration 90 : le refus doit la proposer, il propose {noms:?}"
+    );
+    // Le message d'origine n'est pas remplacé : il est toujours là, et il
+    // nomme toujours ce que le serveur a rendu.
+    assert!(
+        corps["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("text/html")),
+        "le message de refus a été perdu : {corps}"
+    );
+}
+
+#[tokio::test]
+async fn le_refus_propose_la_station_du_catalogue_qui_partage_le_diffuseur() {
+    let (app, _state) = app_et_etat();
+    let station = station_simulee().await;
+
+    // Une station du catalogue local sur CE diffuseur…
+    let (status, corps) = creer(&app, "Le flux qui marche", &format!("{station}/flux")).await;
+    assert_eq!(status, StatusCode::CREATED, "{corps}");
+
+    // …et un refus dont le NOM ne ressemble à rien de connu. Seul l'hôte les
+    // rapproche — c'est le cas du ticket, où la page d'écoute vit sur
+    // `radioparadise.com` et le flux sur `stream.radioparadise.com`.
+    let (status, corps) = creer(&app, "Zzzz", &format!("{station}/page")).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{corps}");
+    let noms = noms_proposes(&corps);
+    assert!(
+        noms.iter().any(|n| n == "Le flux qui marche"),
+        "une station du catalogue vit sur le même diffuseur que l'adresse \
+         refusée : le refus doit la proposer, il propose {noms:?}"
+    );
+}
+
+#[tokio::test]
+async fn un_refus_qui_ne_rapproche_rien_ne_propose_rien() {
+    let (app, _state) = app_et_etat();
+
+    // Adresse malformée (aucun hôte à comparer) et nom qu'aucune station du
+    // catalogue livré ne porte : la liste doit être vide, et PRÉSENTE.
+    let (status, corps) = creer(&app, "Zzyxwv", "http;//zzyxwv.example.net/flux").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{corps}");
+    assert_eq!(corps["error"], "radio_url_separateur_faux");
+    assert_eq!(
+        noms_proposes(&corps),
+        Vec::<String>::new(),
+        "rien ne rapproche cette saisie du catalogue : proposer quoi que ce \
+         soit serait proposer au hasard"
+    );
+}

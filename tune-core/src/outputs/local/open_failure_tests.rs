@@ -55,6 +55,9 @@ fn every_cause_renders_for_both_audiences() {
         OpenFailure::ServerUnreachable,
         OpenFailure::DeviceGone,
         OpenFailure::Busy,
+        // #3575 — la variante que cpal rend INCONTOURNABLE sur ALSA : elle
+        // doit rendre pour les deux publics comme les autres.
+        OpenFailure::IndisponibleMotifPerdu,
         OpenFailure::Unknown,
     ] {
         assert!(!c.log_hint().is_empty(), "{c:?} has no log hint");
