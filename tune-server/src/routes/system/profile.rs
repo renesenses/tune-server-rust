@@ -191,8 +191,11 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
     let tier = state.license.license_state().await.tier;
 
     // --- network ----------------------------------------------------------
-    let advertise_ip = std::env::var("TUNE_ADVERTISE_IP")
-        .ok()
+    // Meme source que les URLs de flux : advertised_ip, sinon autodetection.
+    let advertise_ip = state
+        .config
+        .advertised_ip
+        .clone()
         .filter(|ip| !ip.is_empty())
         .or_else(|| tune_core::discovery::ssdp::get_local_ip().map(|ip| ip.to_string()));
     let network = json!({

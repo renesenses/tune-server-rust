@@ -526,7 +526,7 @@ pub async fn run_with(opts: RunOptions) {
     // règle PAS : une adresse sans port a besoin du port 80.
     for ligne in crate::adresse_d_accueil::lignes_d_accueil(
         config.port,
-        &routes::system::server_urls(config.port),
+        &routes::system::server_urls(&config),
     ) {
         eprintln!("{ligne}");
         info!(%ligne, "adresse_d_accueil");

@@ -25,7 +25,6 @@ pub struct TuneConfig {
     pub api_port: u16,
     pub stream_host: String,
     pub stream_port: u16,
-    pub advertise_ip: Option<String>,
     pub default_zone_id: Option<i64>,
 
     // WebSocket
@@ -159,7 +158,6 @@ impl Default for TuneConfig {
             api_port: 8888,
             stream_host: "0.0.0.0".into(),
             stream_port: 8080,
-            advertise_ip: None,
             default_zone_id: None,
             ws_heartbeat_interval: 30,
             stream_url_resolve_timeout: 15,
@@ -244,7 +242,6 @@ impl TuneConfig {
         env_u16("TUNE_API_PORT", &mut config.api_port);
         env_str("TUNE_STREAM_HOST", &mut config.stream_host);
         env_u16("TUNE_STREAM_PORT", &mut config.stream_port);
-        env_opt("TUNE_ADVERTISE_IP", &mut config.advertise_ip);
         env_opt("TUNE_API_KEY", &mut config.api_key);
         env_bool("TUNE_SCAN_ON_STARTUP", &mut config.scan_on_startup);
         env_bool("TUNE_WATCH_FILESYSTEM", &mut config.watch_filesystem);
