@@ -623,7 +623,7 @@ pub(super) async fn get_config(
     );
     // Adresses d'accès depuis un autre appareil (Android ne résout pas .local :
     // l'IP est la seule voie universelle — harmonique131, forum-hifi p.25).
-    config.insert("server_urls".to_string(), json!(server_urls(state.port)));
+    config.insert("server_urls".to_string(), json!(server_urls(&state.config)));
     // Nom de CETTE machine, affiché en permanence par l'interface (#2110).
     // Deux serveurs Tune sur un même réseau donnaient deux interfaces
     // identiques : Philippe et Alain ont conclu à une mise à jour ratée alors
@@ -2806,17 +2806,17 @@ pub(crate) fn resolve_server_name(configured: Option<&str>) -> String {
 }
 
 /// URLs d'accès au serveur depuis un autre appareil du réseau.
-/// Priorité à TUNE_ADVERTISE_IP (VPN/NordVPN : l'IP détectée serait celle du
-/// tunnel), sinon l'IP LAN détectée par la sonde UDP ; plus le nom mDNS
-/// (inutile sur Android, mais pratique partout ailleurs). L'IP est recalculée
-/// à chaque appel (elle change en cas de bascule filaire↔WiFi) ; le hostname
+/// Priorite a advertised_ip (tune.toml / TUNE_ADVERTISED_IP), la meme adresse
+/// que celle des URLs de flux (VPN/NordVPN : l'IP detectee serait celle du
+/// tunnel), sinon l'IP LAN detectee par la sonde UDP ; plus le nom mDNS
+/// (inutile sur Android, mais pratique partout ailleurs). L'IP est recalculee
+/// a chaque appel (elle change en cas de bascule filaire/WiFi) ; le hostname
 /// est mis en cache.
-pub(crate) fn server_urls(port: u16) -> Vec<String> {
+pub(crate) fn server_urls(config: &crate::config::TuneConfig) -> Vec<String> {
+    let port = config.port;
     let mut urls = Vec::new();
-    if let Ok(ip) = std::env::var("TUNE_ADVERTISE_IP") {
-        if !ip.is_empty() {
-            urls.push(format!("http://{ip}:{port}"));
-        }
+    if let Some(ip) = config.advertised_ip.clone().filter(|ip| !ip.is_empty()) {
+        urls.push(format!("http://{ip}:{port}"));
     }
     if urls.is_empty() {
         if let Some(ip) = tune_core::discovery::ssdp::get_local_ip() {
