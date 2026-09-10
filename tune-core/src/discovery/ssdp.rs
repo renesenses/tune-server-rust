@@ -176,9 +176,9 @@ pub fn media_server_reachable(age: Duration) -> bool {
 }
 
 #[derive(Debug)]
-struct SsdpResponse {
-    location: String,
-    usn: String,
+pub(crate) struct SsdpResponse {
+    pub(crate) location: String,
+    pub(crate) usn: String,
     _server: Option<String>,
     _st: Option<String>,
     /// `CACHE-CONTROL: max-age=N`, en secondes, quand l'en-tête est présent.
@@ -933,7 +933,7 @@ async fn send_msearch_from(
     Ok(parsed)
 }
 
-fn parse_ssdp_response(data: &[u8]) -> Option<SsdpResponse> {
+pub(crate) fn parse_ssdp_response(data: &[u8]) -> Option<SsdpResponse> {
     let text = std::str::from_utf8(data).ok()?;
 
     let mut location = None;
@@ -1009,7 +1009,7 @@ fn parse_cache_control_max_age(line: &str) -> Option<u64> {
     None
 }
 
-fn device_id_from_usn(usn: &str) -> String {
+pub(crate) fn device_id_from_usn(usn: &str) -> String {
     if let Some(uuid_part) = usn.split("::").next() {
         uuid_part.trim().to_string()
     } else {
@@ -1017,7 +1017,7 @@ fn device_id_from_usn(usn: &str) -> String {
     }
 }
 
-fn host_from_location(location: &str) -> Option<String> {
+pub(crate) fn host_from_location(location: &str) -> Option<String> {
     let after_scheme = location
         .strip_prefix("http://")
         .or_else(|| location.strip_prefix("https://"))?;
@@ -1036,7 +1036,7 @@ fn base_url_from_location(location: &str) -> String {
     format!("{scheme}{host_port}")
 }
 
-fn port_from_location(location: &str) -> u16 {
+pub(crate) fn port_from_location(location: &str) -> u16 {
     let after_scheme = location
         .strip_prefix("http://")
         .or_else(|| location.strip_prefix("https://"))
