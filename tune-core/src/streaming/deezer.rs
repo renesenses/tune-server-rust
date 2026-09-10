@@ -40,6 +40,13 @@ pub struct DeezerService {
     api_token: Option<String>,
     quality: String,
     proxy_base_url: Option<String>,
+    /// Deezer session cookie. The gateway binds the CSRF `api_token`
+    /// (`checkForm`) to the `sid` it sets during `deezer.getUserData`; a
+    /// follow-up call that carries the token without the cookie is refused
+    /// with `VALID_TOKEN_REQUIRED` ("Invalid CSRF token"). The shared reqwest
+    /// client has no cookie store, so it is captured and replayed by hand.
+    /// Mutex because `gw_api_call` reads and refreshes it through `&self`.
+    sid: std::sync::Mutex<Option<String>>,
     arl_rejected: bool,
     /// Cet ARL-ci a-t-il DÉJÀ authentifié dans ce processus ?
     ///
@@ -86,6 +93,7 @@ impl DeezerService {
             api_token: None,
             quality: "FLAC".into(),
             proxy_base_url: None,
+            sid: std::sync::Mutex::new(None),
             arl_rejected: false,
             arl_authenticated_once: false,
             arl_zero_user_streak: 0,
@@ -110,16 +118,30 @@ impl DeezerService {
             "{DEEZER_GW}?method={method}&input=3&api_version=1.0&api_token={}",
             self.api_token.as_deref().unwrap_or("")
         );
+        let cookie = match self.sid.lock().ok().and_then(|guard| guard.clone()) {
+            Some(sid) => format!("arl={arl}; sid={sid}"),
+            None => format!("arl={arl}"),
+        };
         let resp = self
             .client
             .post(&url)
-            .header("Cookie", format!("arl={arl}"))
+            .header("Cookie", cookie)
             .header("Accept", "application/json, text/plain, */*")
             .header("Accept-Language", "fr-FR,fr;q=0.9,en;q=0.8")
             .json(&params.unwrap_or(serde_json::json!({})))
             .send()
             .await
             .map_err(|e| format!("deezer gw: {e}"))?;
+        for value in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+            if let Ok(header) = value.to_str()
+                && let Some(rest) = header.strip_prefix("sid=")
+                && let Some(fresh) = rest.split(';').next()
+                && !fresh.is_empty()
+                && let Ok(mut guard) = self.sid.lock()
+            {
+                *guard = Some(fresh.to_string());
+            }
+        }
         let status = resp.status();
         let body = resp
             .text()
@@ -151,6 +173,12 @@ impl DeezerService {
         self.arl = Some(arl.into());
         self.license_token = None;
         self.api_token = None;
+        // Fresh authentication opens a fresh gateway session: a stale sid
+        // would pair the new checkForm with the old session and trip the same
+        // CSRF refusal the cookie exists to avoid.
+        if let Ok(mut guard) = self.sid.lock() {
+            *guard = None;
+        }
         self.arl_rejected = false;
         let result = self
             .gw_api_call("deezer.getUserData", None)

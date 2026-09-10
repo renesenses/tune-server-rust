@@ -468,6 +468,15 @@ pub fn router_with_plugins(
             "/deezer-proxy/{filename}",
             get(deezer_proxy_handler::handle_deezer_proxy),
         )
+        // DeezerService::get_stream_url emits `{base}/deezer/{id}.{ext}`, two
+        // segments. `{filename}` only matches one, so those URLs fell through
+        // to the SPA fallback and renderers received index.html labeled as
+        // FLAC. Both shapes route to the same handler; it only reads the last
+        // segment.
+        .route(
+            "/deezer-proxy/deezer/{filename}",
+            get(deezer_proxy_handler::handle_deezer_proxy),
+        )
         .with_state(state.services.clone());
 
     // Collect mountable skins before state is moved
