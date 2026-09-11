@@ -474,6 +474,11 @@ impl PlaybackOrchestrator {
             ..
         } = d;
         let radio_eq_profile = d.radio_eq_profile.clone();
+        // #3756 — la zone redemande la station : on oublie le verdict définitif
+        // qu'une tentative précédente avait pu porter sur elle. Un geste
+        // explicite de l'auditeur a toujours le droit de réessayer ; c'est la
+        // RELANCE AUTOMATIQUE du sondeur, et elle seule, que la mémoire borne.
+        self.oublier_radio_refusee(req.zone_id);
         // Local/OAAT outputs cannot play compressed streams directly —
         // they expect raw PCM in a WAV container.  For radio (infinite
         // stream), we decode the HTTP stream progressively to PCM and
@@ -523,6 +528,11 @@ impl PlaybackOrchestrator {
         let err_bus = self.event_bus.clone();
         let err_zone = req.zone_id;
         let err_station = title.clone();
+        // #3756 — de quoi RETENIR l'échec, pas seulement le dire. Le sondeur
+        // ne voit que le `Ok` de `play()` ; sans cette mémoire il relance une
+        // station que le décodeur vient de déclarer irrécupérable.
+        let refusees = self.radios_refusees.clone();
+        let refus_source_id = req.source_id.clone();
         tokio::spawn(async move {
             // Download + decode in a blocking thread since symphonia and
             // reqwest::blocking are both synchronous.
@@ -555,6 +565,23 @@ impl PlaybackOrchestrator {
                 Ok(Err(e)) => {
                     warn!(error = %e, "radio_local_decode_failed");
                     emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
+                    // Verdict DÉFINITIF ou simple panne ? Les deux préfixes
+                    // ci-dessous portent déjà, chacun dans son commentaire, la
+                    // phrase « ne guérira pas en réessayant » — mais personne
+                    // ne la lisait hors de la boucle de reconnexion interne.
+                    // Une coupure réseau, elle, n'entre pas ici : la reprise
+                    // légitime d'un flux qui tombe continue de marcher.
+                    let definitif = e.starts_with(super::radio::RADIO_NOT_AUDIO)
+                        || e.starts_with(super::radio::RADIO_HLS_UNSUPPORTED);
+                    if let (true, Some(sid)) = (definitif, refus_source_id.as_deref()) {
+                        warn!(
+                            zone_id = err_zone,
+                            source_id = sid,
+                            error = %e,
+                            "radio_echec_definitif_relance_desarmee_3756"
+                        );
+                        PlaybackOrchestrator::noter_radio_refusee(&refusees, err_zone, sid);
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "radio_local_decode_task_panic");
@@ -770,6 +797,9 @@ impl PlaybackOrchestrator {
             ..
         } = d;
         let radio_eq_profile = d.radio_eq_profile.clone();
+        // #3756 — la zone redemande la station : on oublie le verdict définitif
+        // porté par une tentative précédente (voir `decoder_la_radio_en_wav`).
+        self.oublier_radio_refusee(req.zone_id);
         // Network outputs (DLNA): check if the renderer supports the
         // radio stream format (typically AAC). If not, proxy + transcode
         // to WAV so the renderer can play it.
@@ -863,6 +893,12 @@ impl PlaybackOrchestrator {
             let err_bus = self.event_bus.clone();
             let err_zone = req.zone_id;
             let err_station = title.clone();
+            // #3756 — même mémoire que le chemin local/OAAT. Le journal du
+            // ticket vient d'une sortie ALSA, mais rien dans la boucle de
+            // relance du sondeur ne distingue les deux : armer un seul des
+            // deux chemins laisserait la relance sans fin sur l'autre.
+            let refusees = self.radios_refusees.clone();
+            let refus_source_id = req.source_id.clone();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     decode_radio_stream_to_pcm(
@@ -883,6 +919,17 @@ impl PlaybackOrchestrator {
                     Ok(Err(e)) => {
                         warn!(error = %e, "radio_dlna_decode_failed");
                         emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
+                        let definitif = e.starts_with(super::radio::RADIO_NOT_AUDIO)
+                            || e.starts_with(super::radio::RADIO_HLS_UNSUPPORTED);
+                        if let (true, Some(sid)) = (definitif, refus_source_id.as_deref()) {
+                            warn!(
+                                zone_id = err_zone,
+                                source_id = sid,
+                                error = %e,
+                                "radio_echec_definitif_relance_desarmee_3756"
+                            );
+                            PlaybackOrchestrator::noter_radio_refusee(&refusees, err_zone, sid);
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "radio_dlna_decode_task_panic");

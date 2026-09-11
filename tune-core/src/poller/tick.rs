@@ -912,7 +912,30 @@ impl PositionPoller {
 
                 if radio_stopped {
                     ps.radio_stopped_ticks = ps.radio_stopped_ticks.saturating_add(1);
-                    if ps.radio_stopped_ticks >= 3 && ps.radio_stopped_ticks < 6 {
+                    // #3756 — le décodeur a-t-il DÉJÀ rendu un verdict définitif
+                    // sur cette station ? Une adresse qui sert une page web, ou
+                    // un manifeste HLS, ne redeviendra pas un flux Icecast : la
+                    // relancer ne peut produire que le même échec, affiché « EN
+                    // DIRECT » sur du silence. Ce cas saute la relance et va
+                    // droit à l'abandon.
+                    //
+                    // Seul le verdict du DÉCODEUR compte ici : une coupure
+                    // réseau n'entre jamais dans cette mémoire, et la reprise
+                    // légitime d'un flux qui tombe garde ses trois essais.
+                    let station_refusee = zone_state
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.source_id.as_deref())
+                        .is_some_and(|sid| self.orchestrator.radio_deja_refusee(zone_id, sid));
+                    if station_refusee && ps.radio_stopped_ticks == 3 {
+                        info!(
+                            zone_id,
+                            ticks = ps.radio_stopped_ticks,
+                            "radio_auto_retry_refusee_echec_definitif_3756"
+                        );
+                    }
+                    if !station_refusee && ps.radio_stopped_ticks >= 3 && ps.radio_stopped_ticks < 6
+                    {
                         if zone_state.track_generation != ps.track_generation {
                             debug!(zone_id, "radio_auto_retry_skipped_generation_changed");
                             ps.radio_stopped_ticks = 0;
@@ -944,9 +967,39 @@ impl PositionPoller {
                                         // Reconnecting the *same* station — do
                                         // not add a duplicate listen-history row.
                                         match self.orchestrator.play_without_history(req).await {
+                                            // #3756 — `play()` rend `Ok` dès que
+                                            // l'ORDRE est accepté. Le décodage
+                                            // d'une radio tourne, lui, dans une
+                                            // tâche détachée
+                                            // (`resolve_direct`) et peut échouer
+                                            // une seconde plus tard : cet `Ok`
+                                            // ne prouve RIEN sur le flux.
+                                            //
+                                            // Il était pourtant journalisé
+                                            // `radio_auto_retry_success` et
+                                            // remettait le compteur à zéro —
+                                            // d'où la relance sans fin du fil
+                                            // 1734 : quatre « succès » pour huit
+                                            // `radio_local_decode_failed` et zéro
+                                            // `radio_renderer_stopped_giving_up`
+                                            // en 3 min 12 s.
+                                            //
+                                            // Le compteur n'est donc PLUS remis à
+                                            // zéro ici. Ce qui le remet à zéro,
+                                            // c'est la seule preuve qui vaille :
+                                            // un renderer qui joue, constaté au
+                                            // tick suivant (`!radio_stopped`,
+                                            // plus haut dans cette même
+                                            // branche). Une reprise qui MARCHE
+                                            // efface donc toujours le compteur ;
+                                            // une reprise qui échoue laisse la
+                                            // borne des six ticks arriver.
                                             Ok(_) => {
-                                                info!(zone_id, "radio_auto_retry_success");
-                                                ps.radio_stopped_ticks = 0;
+                                                info!(
+                                                    zone_id,
+                                                    ticks = ps.radio_stopped_ticks,
+                                                    "radio_auto_retry_ordre_accepte"
+                                                );
                                             }
                                             Err(e) => {
                                                 warn!(zone_id, error = %e, "radio_auto_retry_failed")
@@ -956,7 +1009,7 @@ impl PositionPoller {
                                 }
                             }
                         }
-                    } else if ps.radio_stopped_ticks >= 6 {
+                    } else if ps.radio_stopped_ticks >= 3 {
                         info!(
                             zone_id,
                             ticks = ps.radio_stopped_ticks,
