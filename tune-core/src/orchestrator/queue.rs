@@ -162,6 +162,11 @@ impl PlaybackOrchestrator {
             if source.is_empty() || source_id.is_empty() {
                 return;
             }
+            // #2723 — le fichier mis en cache doit être celui que la zone
+            // écoutera : préchauffer au maximum du service alors qu'elle
+            // demande `cd` fabriquerait un cache jamais utilisé, ou pire, un
+            // format différent de la piste précédente.
+            let provider_quality = preference_de_qualite(&db, zone_id).service_token(&source);
 
             // Resolve the next track's stream. Only a DASH (file://) result is
             // worth caching — a direct proxy stream isn't transcoded.
@@ -171,7 +176,7 @@ impl PlaybackOrchestrator {
                     return;
                 };
                 let svc = svc.read().await;
-                match svc.get_track_url(&source_id, None).await {
+                match svc.get_track_url(&source_id, provider_quality).await {
                     Ok(d) => d,
                     Err(_) => return,
                 }
@@ -631,6 +636,7 @@ impl PlaybackOrchestrator {
             if advance_source != "local" && advance_source != "radio" {
                 let services = self.services.clone();
                 let playback = self.playback.clone();
+                let db = self.db.clone();
                 let source = advance_source.clone();
                 // Épinglé AVANT la tâche : la résolution d'URL du service peut
                 // prendre plusieurs secondes, et lire la génération à son issue
@@ -640,6 +646,10 @@ impl PlaybackOrchestrator {
                 // la piste précédente sur l'horloge de la nouvelle (#1110).
                 let play_seq = self.playback.current_play_seq(zone_id).await;
                 tokio::spawn(async move {
+                    // #2723 — même règle que la lecture explicite : la piste
+                    // avancée sans blanc se résout à la qualité de la zone.
+                    let provider_quality =
+                        preference_de_qualite(&db, zone_id).service_token(&source);
                     let resolved = {
                         let registry = services.lock().await;
                         let Some(svc) = registry.get(&source) else {
@@ -648,7 +658,7 @@ impl PlaybackOrchestrator {
                         let svc = svc.clone();
                         drop(registry);
                         let svc = svc.read().await;
-                        svc.get_track_url(&source_id, None).await.ok()
+                        svc.get_track_url(&source_id, provider_quality).await.ok()
                     };
                     let Some(data) = resolved else {
                         debug!(zone_id, source = %source, "gapless_streaming_levels_url_unresolved");
