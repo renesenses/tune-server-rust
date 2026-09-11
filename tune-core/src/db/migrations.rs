@@ -1790,6 +1790,32 @@ CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(i
         // et 96.
         up: "",
     },
+    // #2001, piste 2 — l'ordre manuel des favoris.
+    //
+    // Le tri par champ (piste 1) est arrive avec la PR #2829 ; il ne rend pas
+    // le geste de Tades, qui voulait DEPLACER un favori a la souris. Il faut
+    // pour cela un rang ecrit par l'utilisateur, et donc une colonne.
+    //
+    // `position` est NULLABLE, et NULL veut dire « jamais range a la main » :
+    // c'est l'etat de TOUTES les lignes existantes, et le tri manuel les met en
+    // fin de liste (regle 2 de `favorites_sort`). Aucune valeur par defaut : un
+    // `DEFAULT 0` donnerait a tout le parc le meme rang, donc un ordre manuel
+    // qui ne range rien tout en pretendant exister.
+    //
+    // Les deux tables que Tune POSSEDE la recoivent — `favorites` (bibliotheque
+    // locale) et `streaming_favorites` (favoris de service enregistres chez
+    // Tune). Les favoris lus en direct chez Qobuz/Tidal n'ont pas de ligne ici
+    // et restent donc hors du rang manuel : arbitrage non rendu.
+    //
+    // Colonnes posees par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95, 96 et 99 :
+    // l'ALTER planterait le runner en « duplicate column name » sur une base
+    // qui les a deja, donc au premier demarrage apres mise a jour.
+    Migration {
+        version: 100,
+        name: "favoris_ordre_manuel",
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2935,6 +2961,21 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "favorites", "item_artist", "TEXT");
     add_column_if_missing(db, "favorites", "item_path", "TEXT");
 
+    // Rang manuel des favoris (migration 100, #2001 piste 2). NULL = jamais
+    // range a la main, ce qui est l'etat de toutes les lignes existantes et
+    // renvoie le favori en fin d'ordre manuel. Passe de surete du meme ordre
+    // que `is_compilation` ci-dessus, et pour la meme raison : les requetes de
+    // tri (`list_favorites_*_pour_tri`) NOMMENT la colonne — une base qui
+    // arriverait ici sans elle rendrait la liste des favoris vide des qu'un
+    // client demanderait un tri. PG : migration 057.
+    add_column_if_missing(db, "favorites", "position", "INTEGER");
+    // La jumelle sur `streaming_favorites` est posee PLUS BAS, apres le
+    // `CREATE TABLE IF NOT EXISTS streaming_favorites` de rattrapage : ici la
+    // table peut ne pas encore exister sur une base qui a saute la migration 58,
+    // et `add_column_if_missing` avale l'echec (`.ok()`) — la colonne
+    // manquerait alors en silence, et la requete de tri qui la NOMME rendrait
+    // une liste vide.
+
     // Provenance d'un embedding CLAP (#1732 phase 1) : NULL = analysé sur le
     // fichier, 'inherited:<id>' = copié depuis une jumelle (le DSD est exclu
     // de l'analyse ; l'héritage est sa seule voie vers les ambiances). Passe
@@ -3011,6 +3052,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         );",
     )
     .ok();
+    // Rang manuel des favoris de service (migration 100, #2001 piste 2) —
+    // jumelle de `favorites.position` posee plus haut, mais ICI parce que la
+    // table vient seulement d'etre garantie. PG : migration 057.
+    add_column_if_missing(db, "streaming_favorites", "position", "INTEGER");
+
     // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
     // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
     // on DBs that skipped the numbered unified-queue migration.
@@ -3499,6 +3545,15 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         56,
         "zones_drapeaux_entiers",
         include_str!("../../migrations/postgres/056_zones_drapeaux_entiers.sql"),
+    ),
+    // Jumelle de la migration SQLite 100 (#2001, piste 2) : le rang manuel des
+    // favoris. Sans elle, la colonne n'atteindrait jamais une base PostgreSQL
+    // deja creee — et les requetes de tri, qui la NOMMENT des cette version,
+    // y rendraient une erreur SQL, donc une liste de favoris vide (#2111).
+    (
+        57,
+        "favoris_ordre_manuel",
+        include_str!("../../migrations/postgres/057_favoris_ordre_manuel.sql"),
     ),
 ];
 
@@ -5440,7 +5495,15 @@ mod tests {
         // semis Radio Paradise (54) est une entree `concat!` de cette liste
         // et ne porte AUCUN fichier `054_*.sql` — un `ls migrations/postgres`
         // affiche 053 comme dernier et fait viser un numero deja pris.
-        assert_eq!(pg_latest_version(), 56, "latest PG migration must be 56");
+        // 57 : `favoris_ordre_manuel` (#2001, piste 2), jumelle de la SQLite
+        // 100. Pose `position` sur `favorites` ET `streaming_favorites` ; sans
+        // elle, aucune base PostgreSQL deja creee ne recevrait la colonne, que
+        // les requetes de tri NOMMENT desormais. Le 47 que le commit d'origine
+        // visait est pris depuis par `listen_history_album_id_bigint` (#2860) :
+        // le numero libre a ete remesure DANS LE CODE, entree par entree de
+        // PG_MIGRATIONS, et non par un `ls migrations/postgres` que la 54 —
+        // une entree `concat!` sans fichier — rendrait faux.
+        assert_eq!(pg_latest_version(), 57, "latest PG migration must be 57");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
