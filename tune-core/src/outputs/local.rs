@@ -2990,6 +2990,16 @@ impl RingBuf {
         Self::new_metered(capacity, Arc::new(RingStarvation::new()))
     }
 
+    /// Le compteur partagé de cet anneau, pour le rappel d'ERREUR du backend.
+    ///
+    /// Le rappel d'erreur ne touche pas l'anneau — il n'a rien à y lire — mais
+    /// il doit écrire dans le MÊME compteur, sans quoi la sous-alimentation du
+    /// pilote et la famine de l'anneau se retrouveraient dans deux relevés que
+    /// rien ne joint (#3205).
+    pub fn starvation(&self) -> Arc<RingStarvation> {
+        self.starvation.clone()
+    }
+
     /// Anneau dont la famine est comptée dans un compteur PARTAGÉ avec la
     /// sortie, seul moyen pour `/api/v1/system/diagnostics` de lire ce que le
     /// rappel a vécu.
@@ -3774,6 +3784,8 @@ where
     let zero: T = 0.0f32.into_sample();
     let mut scratch: Vec<f32> = Vec::new();
     let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
+    // Prélevé AVANT la fermeture de rendu, qui consomme `ring_cb` (#3205).
+    let famine_cb = ring_cb.starvation();
     device.build_output_stream(
         cfg,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
@@ -3811,7 +3823,7 @@ where
             }
             data[read..].fill(zero);
         },
-        make_stream_error_cb(device_gone),
+        make_stream_error_cb(device_gone, famine_cb),
         None,
     )
 }
@@ -3836,6 +3848,8 @@ fn build_compressed_f32_stream(
     soft_mute_cb: crate::audio::soft_mute::SoftMuteGate,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
+    // Prélevé AVANT la fermeture de rendu, qui consomme `ring_cb` (#3205).
+    let famine_cb = ring_cb.starvation();
     device.build_output_stream(
         cfg,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -3866,7 +3880,7 @@ fn build_compressed_f32_stream(
                 data[read..].fill(0.0);
             }
         },
-        make_stream_error_cb(device_gone),
+        make_stream_error_cb(device_gone, famine_cb),
         None,
     )
 }
@@ -7113,6 +7127,8 @@ impl OutputTarget for LocalOutput {
                  min_buf: usize,
                  soft_mute_cb: crate::audio::soft_mute::SoftMuteGate| {
                     let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
+                    // Prélevé AVANT la fermeture de rendu (#3205).
+                    let famine_cb = ring_cb.starvation();
                     device.build_output_stream(
                         cfg,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -7145,7 +7161,7 @@ impl OutputTarget for LocalOutput {
                                 data[read..].fill(0.0);
                             }
                         },
-                        make_stream_error_cb(device_gone.clone()),
+                        make_stream_error_cb(device_gone.clone(), famine_cb),
                         None,
                     )
                 };
@@ -8753,6 +8769,7 @@ impl OutputTarget for LocalOutput {
 /// playback thread cover that case.
 fn make_stream_error_cb(
     device_gone: Arc<AtomicBool>,
+    starvation: Arc<RingStarvation>,
 ) -> impl FnMut(cpal::StreamError) + Send + 'static {
     let mut last_warn: Option<std::time::Instant> = None;
     move |e: cpal::StreamError| {
@@ -8761,6 +8778,16 @@ fn make_stream_error_cb(
                 warn!(error = %e, "audio_stream_device_lost");
             }
             return;
+        }
+        // #3205 — le pilote n'a pas été servi à temps. On COMPTE avant de
+        // journaliser : le `warn!` ci-dessous est plafonné à une ligne par
+        // seconde, et ce plafond rendait la mesure impossible — une heure à
+        // 5 000 sous-alimentations et une heure à 3 600 laissaient le même
+        // journal. C'est ce chiffre qui décide du noyau `PREEMPT_RT` de
+        // Tune OS, et la famine de l'anneau ne peut pas le voir : sur un XRun
+        // cpal saute le rappel de données, donc l'anneau reste plein.
+        if matches!(e, cpal::StreamError::BufferUnderrun) {
+            starvation.record_driver_underrun();
         }
         if last_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
             warn!(error = %e, "audio_stream_error");

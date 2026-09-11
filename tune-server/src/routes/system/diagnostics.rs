@@ -145,8 +145,13 @@ const BUG_REPORT_MAX_BODY_CHARS: usize = 49_000;
 ///
 /// Ce qui est compté : un rappel du pilote à qui l'anneau a rendu MOINS
 /// d'échantillons qu'il n'en demandait, le reste étant parti en zéros vers le
-/// DAC. C'est un trou audible, et il capture toutes les causes à la fois —
-/// ordonnancement du noyau, réseau, décodage, convolution.
+/// DAC. C'est un trou audible, et il dit qu'un PRODUCTEUR n'a pas suivi —
+/// réseau, décodage, convolution.
+///
+/// 🔴 Il ne capture PAS l'ordonnancement du noyau, contrairement à ce que ce
+/// commentaire affirmait : sur un XRun, cpal saute le rappel de données, donc
+/// l'anneau reste plein et ce compteur ne bouge pas. `driver_underruns`, plus
+/// bas, est le chiffre qui voit cet incident-là.
 ///
 /// Ce qui n'est PAS compté ici : l'« underrun » ALSA que cpal remonte en
 /// `StreamError` et que la sortie locale laisse délibérément passer sans
@@ -180,6 +185,7 @@ async fn releve_famine_anneau(state: &AppState) -> Vec<Value> {
                 "output_name": output.name(),
                 "ring_starvation_events": famine.events,
                 "ring_starvation_missing_samples": famine.missing_samples,
+                "driver_underruns": famine.driver_underruns,
                 "served_samples": famine.served_samples,
                 "stream_ms": famine.stream_ms,
             }))
@@ -1759,17 +1765,20 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         md.push_str("## Ring starvation (famine de l'anneau audio)\n");
         for s in &ring_starvation {
             md.push_str(&format!(
-                "- {} : {} événement(s), {} échantillon(s) manquant(s) sur {} servis ({} ms de flux)\n",
+                "- {} : {} événement(s), {} échantillon(s) manquant(s) sur {} servis ({} ms de flux) ; {} sous-alimentation(s) du pilote\n",
                 s["output_name"].as_str().unwrap_or("?"),
                 s["ring_starvation_events"].as_u64().unwrap_or(0),
                 s["ring_starvation_missing_samples"].as_u64().unwrap_or(0),
                 s["served_samples"].as_u64().unwrap_or(0),
                 s["stream_ms"].as_u64().unwrap_or(0),
+                s["driver_underruns"].as_u64().unwrap_or(0),
             ));
         }
         md.push_str(
-            "  (un événement = un rappel audio comblé par des zéros ; sans rapport avec \
-             l'underrun ALSA, routinier et compté ailleurs)\n\n",
+            "  (un événement = un rappel audio comblé par des zéros, donc un \
+             PRODUCTEUR en retard ; la sous-alimentation du pilote est l'autre \
+             panne — le processus pas ordonnancé à temps — et c'est elle qui \
+             décide du noyau RT de Tune OS)\n\n",
         );
     }
     md.push_str("## Database\n");
