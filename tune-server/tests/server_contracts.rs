@@ -160,6 +160,8 @@ mod refus_de_peripherique_partage_dit_pourquoi;
 mod refus_exclusif_dit_sa_cause_i3108;
 #[path = "reidentification_album.rs"]
 mod reidentification_album;
+#[path = "reinitialisation_documentee_3854.rs"]
+mod reinitialisation_documentee_3854;
 #[path = "reprise_position_au_demarrage.rs"]
 mod reprise_position_au_demarrage;
 #[path = "rustsec_allowlists.rs"]

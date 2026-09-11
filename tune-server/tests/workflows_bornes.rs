@@ -1844,3 +1844,217 @@ fn toute_caisse_du_workspace_est_nommee_par_une_porte_clippy() {
          {perimees:?} — retirer l'entree plutot que la laisser rassurer"
     );
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #2813 — la garde de topologie des PR et des lots.
+//
+// Le 11/09/2026, 73 commits dormaient dans neuf branches `batch/*` sans aucune
+// PR vers `main` ; cinq etaient de vrais correctifs perdus, verts, fusionnes,
+// absents de la production. Le meme jour, deux PR ouvertes visaient une base
+// morte. `scripts/auditer-topologie-pr.sh` et
+// `.github/workflows/topologie-pr.yml` ferment ces deux trous EN MODE AUDIT.
+//
+// Les trois gardes ci-dessous tiennent les trois facons dont cette garde-la
+// pourrait devenir un generateur de vert :
+//   1. ne tourner sur AUCUNE PR ordinaire (filtre `paths:`, condition `ci:full`) ;
+//   2. juger par la PARENTE au lieu du CONTENU (`--is-ancestor`) ;
+//   3. se vider de sa substance et sortir en 0.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Lit un script du depot.
+fn script(fichier: &str) -> String {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    fs::read_to_string(racine.join("../scripts").join(fichier))
+        .unwrap_or_else(|e| panic!("scripts/{fichier} illisible : {e}"))
+}
+
+/// La section `on:` d'un workflow, c'est-a-dire tout ce qui suit `on:` jusqu'au
+/// prochain mot-cle a l'indentation zero.
+fn declencheurs(source: &str) -> String {
+    let mut dedans = false;
+    let mut bloc = String::new();
+    for ligne in source.lines() {
+        if ligne == "on:" {
+            dedans = true;
+            continue;
+        }
+        if !dedans {
+            continue;
+        }
+        if !ligne.is_empty() && !ligne.starts_with(' ') {
+            break;
+        }
+        if ligne.trim_start().starts_with('#') {
+            continue;
+        }
+        bloc.push_str(ligne);
+        bloc.push('\n');
+    }
+    assert!(
+        !bloc.is_empty(),
+        "section `on:` introuvable — l'analyse est cassee, pas le fichier"
+    );
+    bloc
+}
+
+/// Un garde qui ne tourne jamais ne garde rien.
+///
+/// Ce depot a deux facons eprouvees de rendre un job invisible sans que
+/// personne ne s'en apercoive :
+///
+///   · un filtre `paths:` sur `pull_request`. C'est le choix d'`audit-derive.yml`
+///     — legitime la-bas, parce que sa contre-epreuve ne concerne que les PR qui
+///     touchent le detecteur. Ici il serait FATAL : la PR a juger est justement
+///     celle qui ne touche pas le detecteur. Un `paths:` transformerait la garde
+///     en decoration ;
+///
+///   · une condition `if: needs.impact.outputs.full == 'true'`, qui ne s'ouvre
+///     que sous l'etiquette `ci:full`. Plusieurs jobs de `ci.yml` vivent ainsi
+///     (`test-shipped-features`, la matrice PostgreSQL) et ne tournent JAMAIS
+///     sur une PR de lot ordinaire.
+///
+/// Cette garde refuse les deux, et exige que le job de PR appelle bien le
+/// detecteur en mode `--pr`.
+#[test]
+fn la_garde_de_topologie_tourne_sur_toute_pr_ordinaire() {
+    let source = workflow("topologie-pr.yml");
+    let sur = declencheurs(&source);
+    assert!(
+        sur.contains("  pull_request:"),
+        "topologie-pr.yml ne se declenche pas sur `pull_request` : il ne jugera \
+         jamais une PR.\nSection `on:` lue :\n{sur}"
+    );
+    for interdit in ["paths:", "paths-ignore:"] {
+        assert!(
+            !sur.contains(interdit),
+            "topologie-pr.yml porte un filtre `{interdit}` dans sa section `on:`.\n\
+             La PR a juger est celle qui NE TOUCHE PAS le detecteur : un filtre de \
+             chemins rend cette garde aveugle a tout ce qu'elle doit voir.\n\
+             Section `on:` lue :\n{sur}"
+        );
+    }
+
+    let jobs = jobs(&source);
+    assert!(
+        !jobs.is_empty(),
+        "topologie-pr.yml : aucun job trouve — l'analyse est cassee, pas le fichier"
+    );
+    let (_, corps) = jobs.iter().find(|(nom, _)| nom == "base-vivante").expect(
+        "le job `base-vivante` a disparu de topologie-pr.yml : plus rien ne juge la \
+             base d'une PR ordinaire",
+    );
+
+    // Le seul `if:` tolere porte sur le TYPE D'EVENEMENT. Tout ce qui regarde
+    // un `needs`, une etiquette ou un profil de CI referme la garde.
+    for ligne in corps.lines().filter(|l| cle_de_job(l, "if:")) {
+        for poison in ["needs.", "labels", "ci:full", "inputs."] {
+            assert!(
+                !ligne.contains(poison),
+                "le job `base-vivante` est conditionne par `{poison}` :\n  {ligne}\n\
+                 Un garde derriere `ci:full` ou derriere un `needs.impact` ne tourne pas \
+                 sur une PR de lot ordinaire — c'est-a-dire sur la quasi-totalite des PR \
+                 de ce depot. Seul un `if:` sur `github.event_name` est acceptable ici."
+            );
+        }
+    }
+    assert!(
+        corps.contains("auditer-topologie-pr.sh --pr"),
+        "le job `base-vivante` n'appelle plus `scripts/auditer-topologie-pr.sh --pr` : \
+         il ne juge plus rien.\nCorps lu :\n{corps}"
+    );
+
+    // Un job sans plafond tourne SIX HEURES avant que GitHub ne le tue.
+    let sans_plafond: Vec<&str> = jobs
+        .iter()
+        .filter(|(_, c)| !c.lines().any(pose_un_plafond))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert!(
+        sans_plafond.is_empty(),
+        "ces jobs de topologie-pr.yml n'ont pas de `timeout-minutes` : {sans_plafond:?}"
+    );
+}
+
+/// 🔴 `--is-ancestor` SEUL donne des faux negatifs — quatre mesures le
+/// 09/09/2026, et un agent a failli reconstruire une branche entiere le 11/09
+/// pour rien : la commande repondait « non » alors que les DEUX ARBRES ETAIENT
+/// IDENTIQUES. Un lot repris par `git commit-tree`, un rebase, une reprise par
+/// l'API Git Data cassent la parente sans toucher au contenu.
+///
+/// Le verdict de la garde doit donc rester un verdict de CONTENU. Cette garde
+/// verifie que `apporte_du_contenu()` — la seule fonction qui tranche — n'a
+/// aucune trace de parente, et qu'elle garde bien ses deux mesures de contenu.
+///
+/// La contre-epreuve du script, elle, UTILISE `--is-ancestor` : c'est ainsi
+/// qu'elle prouve que le piege existe vraiment dans son decor. Ces occurrences
+/// vivent apres `autotest() {` et sont les seules tolerees.
+#[test]
+fn la_garde_de_topologie_ne_juge_jamais_par_is_ancestor() {
+    let source = script("auditer-topologie-pr.sh");
+
+    let debut = source
+        .find("apporte_du_contenu() {")
+        .expect("`apporte_du_contenu()` a disparu du detecteur : plus rien ne tranche");
+    let reste = &source[debut..];
+    let fin = reste
+        .find("\n}\n")
+        .expect("`apporte_du_contenu()` n'est pas refermee : l'analyse est cassee");
+    let corps = &reste[..fin];
+    // Les COMMENTAIRES ont le droit de nommer le piege — c'est meme la seule
+    // facon de le transmettre au prochain lecteur. Cette garde porte sur ce qui
+    // s'EXECUTE. Premiere version prise en defaut par elle-meme : elle
+    // rougissait sur le paragraphe qui explique pourquoi `--is-ancestor` est
+    // banni. Un garde qui interdit de PARLER du piege le fait oublier.
+    let code: String = corps
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !code.contains("--is-ancestor"),
+        "`apporte_du_contenu()` juge par la PARENTE :\n{corps}\n\
+         `git merge-base --is-ancestor` repond « non » sur une branche dont l'arbre \
+         est celui de main (reprise par commit-tree, rebase, API Git Data). Quatre \
+         faux negatifs mesures le 09/09/2026. Le verdict doit venir du CONTENU : \
+         arbres identiques, puis `git merge-tree --write-tree`, puis `git cherry`."
+    );
+    for mesure in ["merge-tree --write-tree", "git cherry"] {
+        assert!(
+            code.contains(mesure),
+            "`apporte_du_contenu()` n'utilise plus `{mesure}` : il ne reste plus de \
+             mesure de contenu capable de survivre a une fusion par ecrasement.\n{corps}"
+        );
+    }
+
+    // Hors contre-epreuve, la commande ne doit apparaitre NULLE PART.
+    let debut_autotest = source
+        .find("autotest() {")
+        .expect("`autotest()` a disparu : la contre-epreuve ne vit plus dans le script");
+    let avant: String = source[..debut_autotest]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !avant.contains("--is-ancestor"),
+        "`--is-ancestor` apparait dans la partie du detecteur qui rend le verdict, \
+         hors contre-epreuve. Seul le decor de `autotest()` a le droit de s'en servir, \
+         et uniquement pour PROUVER que le piege existe."
+    );
+}
+
+/// Un detecteur jamais vu rougir ne prouve rien, et un detecteur vide sort en 0.
+///
+/// `--autotest` rejoue chaque detection deux fois — etat conforme, ou elle doit
+/// se taire ; derive correspondante, ou elle doit rougir avec un motif nomme —
+/// sur de VRAIS depots git temporaires, sans reseau. Le minimum exige ici est ce
+/// qui empeche un autotest vide de passer pour vert.
+///
+/// Deux scenarios se verifient EUX-MEMES avant de servir de preuve, parce que
+/// leur construction tourne dans un `( … ) || { … }` ou bash DESACTIVE `set -e` :
+/// une commande de decor peut y echouer sans un mot, et c'est arrive.
+#[test]
+fn la_garde_de_topologie_passe_ses_contre_epreuves() {
+    autotest("auditer-topologie-pr.sh", 25);
+}
