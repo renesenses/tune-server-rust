@@ -247,3 +247,146 @@ async fn un_dossier_accentue_ne_fait_pas_disparaitre_ses_pistes() {
         "et le compte de son sous-dossier reste juste"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PostgreSQL — le dialecte de la requête groupée, sur une VRAIE base.
+//
+// `compter_pistes_par_sous_dossier` et le pré-filtre d'enfant direct ont DEUX
+// écritures : `instr` / `?n` sur SQLite, `strpos` / `$n` sur Postgres. Les neuf
+// épreuves ci-dessus montent toutes un `AppState` sur `:memory:` : elles
+// n'exécutent donc JAMAIS la seconde. « Écrit mais pas branché », appliqué à un
+// dialecte SQL — le mode d'échec que ce dépôt connaît par cœur.
+//
+// ⚠️ Doctrine du saut, reprise de `pg_3181_sections_accueil.rs` :
+// `TUNE_TEST_PG_URL` ABSENTE saute (le `cargo test` ordinaire n'a pas de base),
+// mais une variable POSÉE dont la connexion échoue fait TOMBER le test. Un banc
+// mal branché doit rougir, jamais s'afficher vert.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "postgres")]
+mod pg_3857 {
+    use super::{compte, encode, parcourir, titres};
+    use axum::http::StatusCode;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_server::state::AppState;
+
+    /// Les tables vidées avant la semence. `DELETE` et non `TRUNCATE` : la même
+    /// instruction doit valoir sur les deux moteurs, et SQLite ne connaît pas
+    /// `TRUNCATE`. La base PostgreSQL du banc est partagée entre les étapes.
+    const VIDAGE: &str = "DELETE FROM tracks;";
+
+    fn etat_postgres(url: &str) -> AppState {
+        let config = tune_server::config::TuneConfig {
+            database_url: Some(url.to_string()),
+            ..Default::default()
+        };
+        // Pas de `ok()?` : une connexion qui échoue doit ROUGIR, jamais sauter.
+        AppState::new("", 0, config).expect("AppState sur PostgreSQL")
+    }
+
+    /// Sème le MÊME scénario que `bibliotheque()`, en SQL littéral (les
+    /// marqueurs diffèrent d'un moteur à l'autre).
+    fn semer(state: &AppState, racine: &str) {
+        let sep = std::path::MAIN_SEPARATOR;
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("music_dirs", &format!("[{}]", serde_json::json!(racine)))
+            .expect("racines musique");
+        let mut sql = VIDAGE.to_string();
+        for (i, c) in [
+            format!("{racine}{sep}Artiste A{sep}Album 1{sep}01.flac"),
+            format!("{racine}{sep}Artiste A{sep}Album 1{sep}02.flac"),
+            format!("{racine}{sep}Artiste A{sep}Album 2{sep}01.flac"),
+            format!("{racine}{sep}Artiste B{sep}01.flac"),
+            format!("{racine}{sep}orpheline.flac"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            sql.push_str(&format!(
+                "INSERT INTO tracks (title, file_path, source) VALUES ({}, {}, 'local');",
+                serde_json::json!(format!("piste {i}")),
+                serde_json::json!(c),
+            ));
+        }
+        state.backend.execute_batch(&sql).expect("pistes témoins");
+    }
+
+    fn arborescence() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("dossier temporaire");
+        for d in [
+            "Artiste A/Album 1",
+            "Artiste A/Album 2",
+            "Artiste B",
+            "Vide",
+        ] {
+            std::fs::create_dir_all(tmp.path().join(d)).expect("sous-dossier");
+        }
+        tmp
+    }
+
+    /// Le dialecte `strpos` / `$n` rend EXACTEMENT ce que rend `instr` / `?n`.
+    ///
+    /// Les deux moteurs voient le même disque, la même semence et la même
+    /// requête HTTP ; les deux corps sont comparés tels quels. Réparer un moteur
+    /// en changeant ce que l'autre rend serait un échange, pas une correction.
+    #[tokio::test]
+    async fn les_deux_moteurs_rendent_les_memes_comptes_de_sous_dossiers() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+            return;
+        };
+        let tmp = arborescence();
+        let racine = tmp.path().to_string_lossy().to_string();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let pg = etat_postgres(&url);
+        semer(&pg, &racine);
+        let app_pg = tune_server::routes::router(pg);
+
+        let sqlite = AppState::new(":memory:", 0, Default::default()).expect("AppState SQLite");
+        semer(&sqlite, &racine);
+        let app_sqlite = tune_server::routes::router(sqlite);
+
+        for chemin in [
+            racine.clone(),
+            format!("{racine}{sep}Artiste A"),
+            format!("{racine}{sep}Artiste A{sep}Album 1"),
+            format!("{racine}{sep}Artiste B"),
+        ] {
+            let (s_pg, c_pg) = parcourir(&app_pg, &chemin).await;
+            let (s_lite, c_lite) = parcourir(&app_sqlite, &chemin).await;
+            assert_eq!(s_pg, StatusCode::OK, "PostgreSQL sur {chemin} : {c_pg}");
+            assert_eq!(s_lite, StatusCode::OK, "SQLite sur {chemin} : {c_lite}");
+            assert_eq!(
+                c_pg["directories"], c_lite["directories"],
+                "les sous-dossiers et leurs comptes diffèrent entre les deux \
+                 moteurs sur « {chemin} »"
+            );
+            assert_eq!(
+                titres(&c_pg),
+                titres(&c_lite),
+                "la liste de pistes diffère entre les deux moteurs sur « {chemin} »"
+            );
+        }
+
+        // Et les valeurs elles-mêmes, nommées : deux moteurs d'accord sur ZÉRO
+        // partout seraient d'accord pour rien.
+        let (_, racine_pg) = parcourir(&app_pg, &racine).await;
+        assert_eq!(compte(&racine_pg, "Artiste A"), 3, "PostgreSQL, récursif");
+        assert_eq!(compte(&racine_pg, "Artiste B"), 1);
+        assert_eq!(compte(&racine_pg, "Vide"), 0);
+        assert_eq!(
+            titres(&racine_pg),
+            vec!["piste 4".to_string()],
+            "PostgreSQL : la racine ne montre que le fichier qui y est POSÉ"
+        );
+        let (_, album_pg) =
+            parcourir(&app_pg, &format!("{racine}{sep}Artiste A{sep}Album 1")).await;
+        let mut t = titres(&album_pg);
+        t.sort();
+        assert_eq!(t, vec!["piste 0".to_string(), "piste 1".to_string()]);
+        // `encode` est utilisé par `parcourir` ; nommé ici pour que le module
+        // n'importe rien d'inutile.
+        let _ = encode("");
+    }
+}
