@@ -1306,26 +1306,70 @@ async fn classer_la_reponse(
         .known_id_for_location(&resp.location)
         .cloned()
         .unwrap_or_else(|| device_id_from_usn(&resp.usn));
-    let known = st.known_locations.contains_key(&dev_id);
+    let ancienne_location = st.known_locations.get(&dev_id).cloned();
     drop(st);
 
     seen_ids.insert(dev_id.clone());
 
-    if !known {
+    let Some(ancienne_location) = ancienne_location else {
         return Some((dev_id, resp));
-    } else {
-        let mut st = state.lock().await;
-        st.miss_count.remove(&dev_id);
-        // Réannonce d'un serveur déjà connu : on remet son horloge à zéro.
-        // C'est CE point qui garantit qu'un serveur bien vivant qui a raté
-        // un cycle — Wi-Fi qui hoquette, annonce perdue — ne disparaît
-        // pas : la seule réapparition suffit à annuler tout le compte à
-        // rebours (#2139).
-        if let Some(ms) = st.media_servers.get_mut(&dev_id) {
-            ms.last_seen = Instant::now();
-            ms.max_age = max_age_from_response(&resp);
+    };
+
+    // Résidu de #3829 — l'UDN est connu, mais sous une AUTRE adresse.
+    //
+    // Un appareil était déclaré « connu » sur la seule présence de son UDN
+    // dans `known_locations`, **sans jamais comparer la `LOCATION`**. Un
+    // renderer redémarré sur un autre port répond au balayage avec sa nouvelle
+    // adresse ; son UDN étant connu, la réponse ne faisait que rafraîchir sa
+    // fraîcheur et ressortait ici. Il n'est jamais absent (il répond), donc
+    // jamais oublié puis retrouvé : `known_locations`, `devices` et les URL de
+    // contrôle gardaient l'ancien port à vie, et `is_available()` répondait
+    // « indisponible » jusqu'à la première action SOAP — seule #3829 rattrapait
+    // le coup, et seulement pour qui jouait quelque chose.
+    //
+    // ⚠️ Écraser à l'aveugle était le piège : un appareil à plusieurs
+    // interfaces (Wi-Fi **et** Ethernet) annonce légitimement plusieurs
+    // `LOCATION` pour un seul UDN, et `known_locations` n'en tient qu'une. On
+    // basculerait alors d'une interface à l'autre à chaque cycle, en remplaçant
+    // l'`OutputTarget` à chaque bascule.
+    //
+    // La discrimination ne se devine pas, elle se MESURE : on ne remplace que
+    // si l'ancienne adresse ne répond plus. Deux interfaces vivantes ⇒
+    // l'ancienne répond ⇒ on garde celle qu'on avait, exactement comme avant.
+    // Un appareil qui a déménagé ⇒ l'ancienne est morte ⇒ on rend la réponse
+    // pour un réenregistrement complet, qui réécrit la `LOCATION`, l'hôte, le
+    // port et les URL de contrôle.
+    if ancienne_location != resp.location {
+        if l_adresse_repond_encore(&ancienne_location).await {
+            debug!(
+                id = %dev_id,
+                connue = %ancienne_location,
+                autre = %resp.location,
+                "ssdp_seconde_location_ignoree_l_ancienne_repond"
+            );
+        } else {
+            info!(
+                id = %dev_id,
+                ancienne = %ancienne_location,
+                nouvelle = %resp.location,
+                "ssdp_location_changee_appareil_reenregistre"
+            );
+            return Some((dev_id, resp));
         }
     }
+
+    let mut st = state.lock().await;
+    st.miss_count.remove(&dev_id);
+    // Réannonce d'un serveur déjà connu : on remet son horloge à zéro.
+    // C'est CE point qui garantit qu'un serveur bien vivant qui a raté
+    // un cycle — Wi-Fi qui hoquette, annonce perdue — ne disparaît
+    // pas : la seule réapparition suffit à annuler tout le compte à
+    // rebours (#2139).
+    if let Some(ms) = st.media_servers.get_mut(&dev_id) {
+        ms.last_seen = Instant::now();
+        ms.max_age = max_age_from_response(&resp);
+    }
+
     None
 }
 
@@ -1622,6 +1666,26 @@ fn max_age_from_response(resp: &SsdpResponse) -> Duration {
         .map(Duration::from_secs)
         .unwrap_or(MEDIA_SERVER_MIN_MAX_AGE)
         .max(MEDIA_SERVER_MIN_MAX_AGE)
+}
+
+/// Budget de la sonde de l'ANCIENNE `LOCATION` (voir `classer_la_reponse`).
+///
+/// Le client partagé porte un délai total de 30 s : sans cette borne, une
+/// adresse mise au trou noir (IP réattribuée, pare-feu qui jette) bloquerait le
+/// classement de tout le flux de réponses pendant une demi-minute.
+const BUDGET_SONDE_ANCIENNE_LOCATION: Duration = Duration::from_secs(2);
+
+/// L'adresse rend-elle encore un descripteur ?
+///
+/// Même geste que [`unicast_probe`], mais sur une `LOCATION` donnée plutôt que
+/// sur celle d'un appareil connu — c'est précisément l'ancienne adresse, celle
+/// que l'état porte encore, qu'on interroge avant d'accepter de la remplacer.
+async fn l_adresse_repond_encore(location: &str) -> bool {
+    let client = crate::http::client::shared();
+    match tokio::time::timeout(BUDGET_SONDE_ANCIENNE_LOCATION, client.get(location).send()).await {
+        Ok(Ok(resp)) => resp.status().is_success(),
+        Ok(Err(_)) | Err(_) => false,
+    }
 }
 
 async fn unicast_probe(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> bool {
@@ -2382,6 +2446,181 @@ mod tests {
             }
         }
         assert_eq!(discovered, 1, "un seul évènement de découverte attendu");
+    }
+
+    // ── Résidu de #3829 : une LOCATION qui change sous un UDN connu ──────
+
+    /// Même serveur que [`spawn_description_server`], mais **arrêtable** : la
+    /// tâche possède l'écouteur, l'abandonner ferme le port, et une connexion
+    /// vers ce port devient un refus immédiat — exactement ce que rend un
+    /// renderer redémarré ailleurs.
+    async fn spawn_description_server_arretable()
+    -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tache = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        AIOS_XML.len(),
+                        AIOS_XML
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, tache)
+    }
+
+    const USN_AIOS: &str = "uuid:9ab0c000-f668-11de-9976-0080-0006787c2e26::urn:schemas-upnp-org:device:MediaRenderer:1";
+
+    fn vider(rx: &mut mpsc::Receiver<SsdpEvent>) {
+        while rx.try_recv().is_ok() {}
+    }
+
+    /// L'état du scanner, tel qu'un diagnostic le lit : l'adresse retenue pour
+    /// cet UDN, et le port de l'appareil qui en découle.
+    async fn adresse_et_port(
+        state: &Arc<Mutex<ScannerState>>,
+        dev_id: &str,
+    ) -> (Option<String>, Option<u16>) {
+        let st = state.lock().await;
+        (
+            st.known_locations.get(dev_id).cloned(),
+            st.devices.get(dev_id).map(|d| d.port),
+        )
+    }
+
+    /// 🔴 LA GARDE du résidu laissé par #3840 (`classer_la_reponse`).
+    ///
+    /// SITE D'APPEL GARDÉ : `process_responses` → `classer_la_reponse`, la
+    /// branche « UDN déjà connu ». Le témoin ne relit aucune source : il
+    /// mesure ce que le scanner RETIENT après deux fenêtres d'annonces.
+    ///
+    /// Le second port est tiré par le système à l'exécution — aucune aiguille
+    /// de ce fichier ne peut donc s'y trouver elle-même.
+    #[tokio::test]
+    async fn i3829_un_renderer_qui_change_de_port_est_reenregistre() {
+        // La première vie de l'appareil.
+        let (addr_a, tache_a) = spawn_description_server_arretable().await;
+        // La seconde, liée AVANT de tuer la première : deux ports distincts,
+        // garantis par le système et non par un tirage au sort du test.
+        let (addr_b, _tache_b) = spawn_description_server_arretable().await;
+        assert_ne!(addr_a.port(), addr_b.port());
+        let loc_a = format!("http://{addr_a}/upnp/desc/aios_device/aios_device.xml");
+        let loc_b = format!("http://{addr_b}/upnp/desc/aios_device/aios_device.xml");
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, mut rx) = mpsc::channel(32);
+
+        process_responses(&state, &tx, vec![announcement(&loc_a, USN_AIOS)]).await;
+        let dev_id = state
+            .lock()
+            .await
+            .devices
+            .keys()
+            .next()
+            .cloned()
+            .expect("la première annonce doit enregistrer un appareil");
+        assert_eq!(
+            adresse_et_port(&state, &dev_id).await,
+            (Some(loc_a.clone()), Some(addr_a.port()))
+        );
+        vider(&mut rx);
+
+        // L'appareil redémarre : son ancien port ne répond plus.
+        tache_a.abort();
+        let _ = tache_a.await;
+
+        process_responses(&state, &tx, vec![announcement(&loc_b, USN_AIOS)]).await;
+
+        let (adresse, port) = adresse_et_port(&state, &dev_id).await;
+        assert_eq!(
+            adresse.as_deref(),
+            Some(loc_b.as_str()),
+            "l'adresse retenue doit suivre le renderer redémarré ; elle est              restée sur {loc_a}, et c'est elle que sondent `unicast_probe`,              `ssdp_device_lost` et le réenregistrement au démarrage"
+        );
+        assert_eq!(
+            port,
+            Some(addr_b.port()),
+            "le port de l'appareil doit être celui de la seconde vie"
+        );
+        assert!(
+            state.lock().await.devices.len() == 1,
+            "un renderer qui déménage reste UN appareil, pas deux"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(SsdpEvent::DeviceDiscovered(_))),
+            "sans un nouvel évènement de découverte, la sortie garde ses URL              de contrôle mortes et `is_available()` répond « indisponible »              jusqu'à la première action SOAP"
+        );
+    }
+
+    /// 🔴 LA CONTRE-ÉPREUVE du témoin ci-dessus — celle qui interdit le
+    /// correctif « évident ».
+    ///
+    /// Un appareil à plusieurs interfaces (Wi-Fi **et** Ethernet) annonce
+    /// légitimement plusieurs `LOCATION` pour un seul UDN. Écraser sur la
+    /// seule différence d'adresse ferait basculer l'appareil d'une interface à
+    /// l'autre à chaque cycle, en remplaçant l'`OutputTarget` à chaque
+    /// bascule. Ici les DEUX adresses répondent : rien ne doit bouger.
+    #[tokio::test]
+    async fn i3829_deux_interfaces_vivantes_ne_font_pas_demenager_l_appareil() {
+        let (addr_a, _tache_a) = spawn_description_server_arretable().await;
+        let (addr_b, _tache_b) = spawn_description_server_arretable().await;
+        assert_ne!(addr_a.port(), addr_b.port());
+        let loc_a = format!("http://{addr_a}/upnp/desc/aios_device/aios_device.xml");
+        let loc_b = format!("http://{addr_b}/upnp/desc/aios_device/aios_device.xml");
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, mut rx) = mpsc::channel(32);
+
+        process_responses(&state, &tx, vec![announcement(&loc_a, USN_AIOS)]).await;
+        let dev_id = state
+            .lock()
+            .await
+            .devices
+            .keys()
+            .next()
+            .cloned()
+            .expect("la première annonce doit enregistrer un appareil");
+        vider(&mut rx);
+
+        // La seconde interface s'annonce, trois cycles de suite. Les deux
+        // adresses répondent.
+        for _ in 0..3 {
+            process_responses(&state, &tx, vec![announcement(&loc_b, USN_AIOS)]).await;
+        }
+
+        let (adresse, port) = adresse_et_port(&state, &dev_id).await;
+        assert_eq!(
+            adresse.as_deref(),
+            Some(loc_a.as_str()),
+            "l'ancienne adresse répond encore : c'est un appareil à deux              interfaces, pas un appareil qui a déménagé. Elle doit être gardée."
+        );
+        assert_eq!(port, Some(addr_a.port()));
+        assert!(
+            state.lock().await.devices.len() == 1,
+            "deux interfaces d'un même UDN ne font qu'un appareil"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "aucun évènement ne doit être ré-émis : remplacer l'`OutputTarget`              à chaque annonce de l'autre interface est précisément la              régression que cette garde interdit"
+        );
     }
 
     #[tokio::test]
