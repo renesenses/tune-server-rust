@@ -329,8 +329,14 @@ mod pg_3857 {
     /// Les deux moteurs voient le même disque, la même semence et la même
     /// requête HTTP ; les deux corps sont comparés tels quels. Réparer un moteur
     /// en changeant ce que l'autre rend serait un échange, pas une correction.
+    /// ⚠️ Le nom porte `pg_3857` parce que cest le FILTRE de létape CI, et
+    /// que la garde `tout_temoin_sous_variable_d_environnement_est_recense`
+    /// (`derive_des_garde_fous_2816.rs`) confronte ce filtre au nom COMPLET du
+    /// témoin — lequel ne porte pas le module interne. Sans le préfixe ici,
+    /// létape existait et nexécutait rien : « écrit mais pas branché », et
+    /// cest la garde qui la dit.
     #[tokio::test]
-    async fn les_deux_moteurs_rendent_les_memes_comptes_de_sous_dossiers() {
+    async fn pg_3857_les_deux_moteurs_rendent_les_memes_comptes_de_sous_dossiers() {
         let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
             eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
             return;
