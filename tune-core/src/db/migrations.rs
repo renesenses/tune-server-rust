@@ -3454,6 +3454,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
              ON CONFLICT (version) DO NOTHING;\n"
         ),
     ),
+    (
+        55,
+        "zones_drapeaux_entiers",
+        include_str!("../../migrations/postgres/055_zones_drapeaux_entiers.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -5256,7 +5261,22 @@ mod tests {
         // pas, et cette entree est la PLUS HAUTE : sans marque, `MAX(version)`
         // resterait a 53 et le semis serait rejoue a chaque demarrage (defaut
         // de la 052, #3699).
-        assert_eq!(pg_latest_version(), 54, "latest PG migration must be 54");
+        // 55 : `zones_drapeaux_entiers` (#3726). PAS de jumelle SQLite :
+        // migration de RATTRAPAGE, comme la 53. QUATRE drapeaux ramenes a
+        // SMALLINT, chacun apres que son redacteur ait ete repare dans le MEME
+        // commit — c'est l'ordre que #3726 exige, et c'est la reparation du
+        // redacteur qui rend la conversion possible.
+        // `zones.is_hidden` : TEXT sur les DEUX chemins (aucun script numerote
+        // ne la declarait, seul `ENSURE_COLUMNS`), et NEUF des onze requetes
+        // qui la touchent tombaient — `list()` se rabattait sur `list_all()`,
+        // donc une zone supprimee reparaissait, et les trois comptes de zones
+        // rendaient 0. `zones.online` et `zones.dsp_enabled` : TEXT sur le
+        // chemin migre, et leurs redacteurs liaient une CHAINE dans une colonne
+        // SMALLINT sur le chemin natif. `profiles.is_admin` : `routes/cloud.rs`
+        // liait un BOOLEEN, donc la creation de profil SSO echouait en natif et
+        // ecrivait le litteral `true` en migre — ou `as_bool()` rend `None`,
+        // donc un administrateur se connectait avec le role `user`.
+        assert_eq!(pg_latest_version(), 55, "latest PG migration must be 55");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

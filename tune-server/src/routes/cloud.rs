@@ -298,11 +298,25 @@ async fn sso_callback(
         // default colour (not the SSO URL) so the fallback avatar circle has a
         // valid colour when disconnected; the cloud image is shown separately.
         let default_color = "#6366f1";
+        // `is_admin` est lie en ENTIER, pas en booleen. La colonne vaut
+        // SMALLINT sur toute installation PostgreSQL native (005), et
+        // PostgreSQL REFUSE l'affectation `boolean -> smallint` :
+        //
+        //   ERROR:  column "is_admin" is of type smallint but expression
+        //           is of type boolean
+        //
+        // Mesure du 11/09/2026 sur PostgreSQL 16.15 : cet INSERT echouait
+        // sur toute base PostgreSQL NATIVE, donc aucune premiere connexion
+        // SSO n'y creait de profil (#3726). Un entier passe sur les trois
+        // formes que porte cette colonne dans le parc — SMALLINT (natif),
+        // TEXT (base migree, `bigint -> text` est accepte) et INTEGER
+        // (SQLite) — et les lecteurs passent tous par `as_i64()`.
+        let is_admin: i64 = i64::from(user.is_admin);
         state
             .backend
             .execute_returning_id(
                 "INSERT INTO profiles (username, display_name, email, avatar_path, is_admin) VALUES (?, ?, ?, ?, ?)",
-                &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &default_color as &dyn ToSqlValue, &user.is_admin as &dyn ToSqlValue],
+                &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &default_color as &dyn ToSqlValue, &is_admin as &dyn ToSqlValue],
             )
             .unwrap_or(0)
     };
