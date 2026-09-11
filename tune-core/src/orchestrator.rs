@@ -746,6 +746,32 @@ pub struct PlaybackOrchestrator {
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     #[cfg(feature = "local-audio")]
     replis_de_peripherique_dits: std::sync::Mutex<HashMap<i64, String>>,
+    /// Stations dont le décodage a échoué d'un échec qui NE GUÉRIRA PAS :
+    /// `zone_id → source_id de la station` (#3756).
+    ///
+    /// Le décodage d'une radio tourne dans une tâche détachée
+    /// (`resolve_direct`) : `play()` rend `Ok` dès que l'ordre est accepté, et
+    /// l'échec arrive une seconde plus tard. Le sondeur, qui ne voit que ce
+    /// `Ok`, relançait la station indéfiniment — Belkadi Yacine : huit
+    /// `radio_local_decode_failed` et quatre `radio_auto_retry_success` en
+    /// 3 min 12 s de journal, zéro abandon.
+    ///
+    /// Seuls les verdicts DÉFINITIFS entrent ici : `radio_not_audio` (le
+    /// serveur rend une page web) et `radio_hls_unsupported` (Tune ne sait pas
+    /// lire ce format). Une coupure réseau n'y entre pas — la reprise
+    /// légitime d'un flux qui tombe doit continuer de marcher.
+    ///
+    /// L'entrée est posée par la tâche de décodage et **effacée à chaque
+    /// résolution radio**, c'est-à-dire dès que quelqu'un redemande la station
+    /// : un geste explicite de l'auditeur a toujours le droit de réessayer.
+    /// C'est le sondeur, et lui seul, qui consulte la mémoire AVANT de
+    /// relancer, et qui renonce donc sans même émettre la lecture.
+    ///
+    /// `Arc` et non un simple champ : la tâche détachée survit à l'appel qui
+    /// l'a créée et doit en garder une poignée.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    pub(crate) radios_refusees: Arc<std::sync::Mutex<HashMap<i64, String>>>,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -1043,7 +1069,41 @@ impl PlaybackOrchestrator {
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
+            radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Noter qu'une station a échoué d'un échec définitif sur cette zone
+    /// (#3756). Appelé par la tâche de décodage détachée.
+    pub(crate) fn noter_radio_refusee(
+        memoire: &std::sync::Mutex<HashMap<i64, String>>,
+        zone_id: i64,
+        source_id: &str,
+    ) {
+        if let Ok(mut m) = memoire.lock() {
+            m.insert(zone_id, source_id.to_string());
+        }
+    }
+
+    /// Oublier le verdict porté sur cette zone : la station est redemandée.
+    pub(crate) fn oublier_radio_refusee(&self, zone_id: i64) {
+        if let Ok(mut m) = self.radios_refusees.lock() {
+            m.remove(&zone_id);
+        }
+    }
+
+    /// Cette station a-t-elle DÉJÀ été refusée définitivement sur cette zone ?
+    ///
+    /// Le sondeur s'en sert pour ne pas relancer un flux dont le décodeur a
+    /// déjà dit qu'il ne guérirait pas. La comparaison porte sur le
+    /// `source_id` : changer de station sur la même zone efface le verdict,
+    /// puisqu'une autre station est une autre adresse.
+    pub fn radio_deja_refusee(&self, zone_id: i64, source_id: &str) -> bool {
+        self.radios_refusees
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&zone_id).cloned())
+            .is_some_and(|s| s == source_id)
     }
 
     // `radio_head_ok` vivait ici : un HEAD sur la station décidait s'il fallait

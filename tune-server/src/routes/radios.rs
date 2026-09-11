@@ -366,6 +366,30 @@ fn meme_diffuseur(a: &str, b: &str) -> bool {
 /// colonne d'origine (`radio_repo.rs`), les deux sont donc indistinguables. Ne
 /// proposer que « l'annuaire » demanderait d'abord de marquer l'origine, ce que
 /// le schéma ne fait pas.
+///
+/// ## Pourquoi cette fonction JOURNALISE, et sous ce nom-là
+///
+/// Le correctif d'origine (PR #3743, livré en v0.9.145) n'émettait **aucune
+/// trace nommée**, et l'audit du 10/09 en a tiré la conséquence : il est
+/// **invérifiable dans un binaire publié**. Les deux jetons candidats ne
+/// séparent rien — `suggestions` est une clef JSON de 11 octets qui vaut **94
+/// en v0.9.144 comme en v0.9.145** sur le binaire x86_64 (91/91 sur aarch64,
+/// le mot sert dans les métadonnées), et `radio_url_refusee` vaut **2 dans les
+/// deux**, la ligne de [`refus_url`] existant bien avant la suggestion.
+///
+/// `radio_refus_suggestion_catalogue_3664` est donc long, préfixé du domaine,
+/// et suffixé du numéro de l'issue : il ne peut se confondre avec rien, et sa
+/// seule présence dans un ELF date le binaire d'après ce correctif. Sa valeur
+/// est d'abord une **borne** : elle vaut 0 partout jusqu'à v0.9.145 incluse.
+///
+/// Écrit en LITTÉRAL et non derrière une constante : une constante partagée
+/// avec le banc ferait bouger l'aiguille et la meule ensemble, et le témoin
+/// resterait vert sous un sabotage du marqueur lui-même.
+///
+/// Elle est émise à la SORTIE de la fonction et non sur le chemin du refus,
+/// pour que le comptage distingue « le serveur sait proposer » de « le serveur
+/// a proposé quelque chose » : `proposees = 0` est une information, pas une
+/// absence de trace.
 fn suggestions_du_catalogue(
     repo: &RadioRepo,
     nom_saisi: Option<&str>,
@@ -375,6 +399,7 @@ fn suggestions_du_catalogue(
     let mut retenues: Vec<RadioStation> = Vec::new();
     let mut vues: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
+    let mut par_diffuseur = 0usize;
     if let Some(hote) = hote_comparable(url_refusee) {
         for st in &catalogue {
             if retenues.len() >= SUGGESTIONS_AU_PLUS {
@@ -384,6 +409,7 @@ fn suggestions_du_catalogue(
                 && st.id.is_some_and(|id| vues.insert(id))
             {
                 retenues.push(st.clone());
+                par_diffuseur += 1;
             }
         }
     }
@@ -400,6 +426,15 @@ fn suggestions_du_catalogue(
             }
         }
     }
+
+    tracing::info!(
+        catalogue = catalogue.len(),
+        proposees = retenues.len(),
+        par_diffuseur,
+        par_nom = retenues.len() - par_diffuseur,
+        url_refusee = %url_refusee,
+        "radio_refus_suggestion_catalogue_3664"
+    );
 
     retenues
 }
