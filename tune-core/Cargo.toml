@@ -180,6 +180,20 @@ path = "tests/journal_descriptif_illisible.rs"
 name = "journal_insertion_par_lot"
 path = "tests/journal_insertion_par_lot.rs"
 
+# #3807 — VU-metres et barregraphe morts sur une zone Diretta. `autotests =
+# false` en tete de ce manifeste : sans cette cible, le fichier ne serait
+# JAMAIS compile et la porte rendrait un vert contre rien. Declaree ici, au
+# MILIEU du manifeste, et non en queue ou tous les lots ajoutent la leur.
+[[test]]
+name = "niveaux_sortie_pull_3807"
+path = "tests/niveaux_sortie_pull_3807.rs"
+
+# #3907 — ce que l analyse spectrale du serveur resout vraiment. Meme raison :
+# `autotests = false`. Cible minuscule, elle ne tire que tune_core.
+[[test]]
+name = "spectre_resolution_serveur_3907"
+path = "tests/spectre_resolution_serveur_3907.rs"
+
 # Meme famille, meme raison (#2566) : abonne `tracing` GLOBAL, donc un binaire
 # a lui seul. Il compte les lignes qu une panne de sondage coute au journal —
 # 79 avant, 9 apres — sans toucher au reseau ni au recul exponentiel.
