@@ -47,7 +47,58 @@ use crate::outputs::registry::OutputRegistry;
 use crate::outputs::{OutputCommand, OutputCommandError, OutputCommandResult};
 use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::prefetch::PrefetchEngine;
+use crate::streaming::quality::StreamingQualityPreference;
 use crate::streaming::registry::ServiceRegistry;
+use crate::streaming::{StreamUrl, StreamingService};
+
+/// Demande le flux au service à la qualité voulue, avec UN rafraîchissement de
+/// jeton en cas de 401/403 — et la MÊME qualité sur la seconde tentative.
+///
+/// `quality` à `None` signifie « le maximum/par défaut du service » : c'est ce
+/// que la route passait inconditionnellement avant #2723, et c'est ce qui
+/// rendait le sélecteur de zone décoratif.
+async fn request_stream_at_quality(
+    service: &mut dyn StreamingService,
+    source_id: &str,
+    quality: Option<&str>,
+) -> Result<StreamUrl, String> {
+    match service.get_track_url(source_id, quality).await {
+        Ok(data) => Ok(data),
+        Err(ref error)
+            if {
+                let message = error.to_string();
+                message.contains("401") || message.contains("403")
+            } =>
+        {
+            info!(error = %error, "streaming_auth_error_attempting_refresh");
+            if service.refresh_if_needed().await.unwrap_or(false) {
+                service
+                    .get_track_url(source_id, quality)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
+                Err(error.to_string())
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// La préférence de qualité d'une zone, telle qu'elle est rangée dans
+/// `settings` sous `zone_<id>_quality`. Lue par les trois chemins qui
+/// résolvent une URL de service : lecture explicite, préchauffage DASH et
+/// avance sans blanc.
+fn preference_de_qualite(
+    db: &Arc<dyn crate::db::backend::DbBackend>,
+    zone_id: i64,
+) -> StreamingQualityPreference {
+    SettingsRepo::with_backend(db.clone())
+        .get(&format!("zone_{zone_id}_quality"))
+        .ok()
+        .flatten()
+        .map(|raw| StreamingQualityPreference::from_stored_json(&raw))
+        .unwrap_or_default()
+}
 
 /// Ce que l'auditeur avait demandé, et où il en était — les trois champs que
 /// « Continuer l'écoute » a besoin de retrouver pour ROUVRIR cet objet à la
