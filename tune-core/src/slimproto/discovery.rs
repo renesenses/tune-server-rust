@@ -156,6 +156,12 @@ pub fn spawn(identite: IdentiteServeur) {
                 Ok(x) => x,
                 Err(e) => {
                     debug!(error = %e, "slimproto_discovery_recv_error");
+                    // `continue` nu : une erreur de file persistante (ICMP
+                    // port-unreachable en rafale) tournerait a plein regime.
+                    // Ici le message est en `debug`, donc muet au niveau par
+                    // defaut : ce tour de boucle brulait du CPU sans laisser
+                    // la moindre trace (#2156).
+                    crate::temporisation_reseau::temporiser_apres_erreur_reseau().await;
                     continue;
                 }
             };

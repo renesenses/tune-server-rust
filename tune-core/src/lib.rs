@@ -68,6 +68,10 @@ pub mod social;
 pub mod stream_cache;
 pub mod streaming;
 mod system_sleep;
+/// Temporisation des boucles d'ecoute reseau apres une erreur — voir le module
+/// pour le pourquoi (issue #2156 : une erreur persistante sur `accept()`
+/// saturait un coeur et remplissait le disque au repos).
+pub mod temporisation_reseau;
 /// Chemins temporaires uniques par appel — voir le module pour le pourquoi
 /// (issue #2864 : deux tests du même binaire se volaient leur fichier).
 ///
