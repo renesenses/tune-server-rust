@@ -1,0 +1,165 @@
+name: Topologie des PR et des lots
+# Garde de topologie (#2813, parent #2808) — PREMIÈRE TRANCHE, en mode AUDIT.
+#
+# Ce qu'elle surveille, et pourquoi elle existe : voir l'en-tête de
+# `scripts/auditer-topologie-pr.sh`. En deux lignes : le 11/09/2026, 73 commits
+# dormaient dans neuf branches `batch/*` sans aucune PR vers `main` — cinq vrais
+# correctifs perdus après vérification par le contenu — et deux PR ouvertes
+# visaient une base morte (#3535 vers une RC abandonnée, #3758 vers un lot déjà
+# fusionné). Rien ne regardait ni l'un ni l'autre.
+#
+# ⚠️ CE WORKFLOW NE BLOQUE RIEN AUJOURD'HUI, ET C'EST VOULU.
+#    Un garde CI nouveau doit démarrer ÉTROIT : large d'emblée, il rougit sur du
+#    légitime et tout le monde apprend à l'ignorer. Le verdict est posé en
+#    ANNOTATIONS et dans le résumé de run ; l'étape sort en 0. Le passage en
+#    barrage se fait en posant la variable de dépôt `TOPOLOGIE_PR_BLOQUANTE` à
+#    `true` — un seul geste, réversible, sans toucher au fichier. Les conditions
+#    pour le faire sont écrites dans le rapport de #2813.
+#
+# ⚠️ Une PLANIFICATION ne s'exécute QUE depuis la branche par défaut. Tant que
+#    ce fichier n'a pas atteint `main`, seuls `pull_request` et le lancement
+#    manuel fonctionnent. Ce n'est pas un détail : c'est la différence entre
+#    « livré » et « armé ».
+#
+# ⚠️ Ce workflow ne RÉPARE rien : il ne pousse aucune branche, n'ouvre, ne ferme
+#    et ne commente aucune PR ni aucune issue. Remonter un lot engage la ligne
+#    de release ; la décision reste humaine.
+on:
+  # 🔴 AUCUN filtre `paths:` ici. Un garde de topologie qui ne tournerait que
+  #    sur les PR touchant son propre script ne garderait rien : la PR à juger
+  #    est justement celle qui ne le touche pas. La garde
+  #    `la_garde_de_topologie_tourne_sur_toute_pr_ordinaire`
+  #    (tune-server/tests/workflows_bornes.rs) refuse qu'un filtre réapparaisse,
+  #    et refuse aussi que le job soit conditionné à `needs.impact.outputs.full`
+  #    ou à une étiquette : plusieurs jobs de ce dépôt ne tournent que sous
+  #    `ci:full`, et un garde qui ne tourne jamais ne garde rien.
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  schedule:
+    # Une fois par jour, le matin. C'est la détection des lots orphelins : elle
+    # n'a de sens que sur l'état réel du dépôt, pas sur une PR.
+    - cron: "10 7 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: topologie-pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # La contre-épreuve tourne sur CHAQUE PR, avant tout verdict. Un détecteur
+  # dont on n'a pas vu la détection rougir ne prouve rien ; et un détecteur vidé
+  # de sa substance sortirait en 0 et passerait pour vert. `--autotest` rejoue
+  # 25 garanties sur de VRAIS dépôts git temporaires, sans accès réseau.
+  # ───────────────────────────────────────────────────────────────────────────
+  contre-epreuve:
+    name: Contre-épreuve de la garde de topologie
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rejouer les topologies simulées
+        run: bash scripts/auditer-topologie-pr.sh --autotest
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # B. La base de CETTE PR mène-t-elle quelque part ? Ce job tourne sur toute PR
+  #    ordinaire — c'est le seul `if:` du fichier, et il ne porte que sur le
+  #    type d'événement.
+  # ───────────────────────────────────────────────────────────────────────────
+  base-vivante:
+    name: Base de la PR
+    needs: contre-epreuve
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Les branches à comparer ne sont pas dans le checkout d'une PR. On ne
+      # récupère que ce qui sert : `main`, les RC (pour désigner la ligne
+      # active) et les lots (pour mesurer si la base est absorbée).
+      - name: Récupérer les refs à mesurer
+        env:
+          BASE_DE_LA_PR: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags --quiet origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/rc/*:refs/remotes/origin/rc/*" \
+            "+refs/heads/batch/*:refs/remotes/origin/batch/*" || true
+          git fetch --no-tags --quiet origin \
+            "+refs/heads/$BASE_DE_LA_PR:refs/remotes/origin/$BASE_DE_LA_PR" || true
+      - name: Juger la base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMERO_PR: ${{ github.event.pull_request.number }}
+          BLOQUANTE: ${{ vars.TOPOLOGIE_PR_BLOQUANTE }}
+        run: |
+          set -uo pipefail
+          bash scripts/auditer-topologie-pr.sh --pr "$NUMERO_PR" "$GITHUB_REPOSITORY" \
+            | tee /tmp/topologie.txt
+          code=${PIPESTATUS[0]}
+          {
+            echo "## Topologie de la PR"
+            echo
+            echo '```'
+            cat /tmp/topologie.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -eq 0 ]; then
+            exit 0
+          fi
+          # Une annotation par ligne signalée : c'est ce que le lecteur de la PR
+          # voit sans ouvrir le run.
+          grep '❌' /tmp/topologie.txt | sed 's/^ *❌ */::warning title=Topologie::/' || true
+          if [ "${BLOQUANTE:-}" = "true" ]; then
+            echo "::error title=Topologie::La garde de topologie est ARMÉE (TOPOLOGIE_PR_BLOQUANTE=true) et refuse cette PR."
+            exit "$code"
+          fi
+          echo "Mode AUDIT : la garde signale sans bloquer. Poser la variable de dépôt TOPOLOGIE_PR_BLOQUANTE=true pour l'armer."
+          exit 0
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # A. Les lots en avance sur `main` que personne ne remonte. Sur planification
+  #    et sur lancement manuel seulement : cette détection porte sur l'état du
+  #    dépôt, pas sur une PR, et la faire tourner sur chaque PR ne rendrait que
+  #    du bruit répété.
+  #
+  #    ⚠️ Elle vit ici, donc sur la branche par défaut : une PR ne peut ni la
+  #    modifier ni la neutraliser pour elle-même — GitHub n'exécute la version
+  #    planifiée que depuis `main`. C'est la seule part du critère « une PR ne
+  #    peut pas simuler le check qui doit la valider » que cette tranche couvre.
+  # ───────────────────────────────────────────────────────────────────────────
+  lots-orphelins:
+    name: Lots en avance sur main sans PR
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Récupérer toutes les branches
+        run: git fetch --no-tags --quiet origin "+refs/heads/*:refs/remotes/origin/*"
+      - name: Auditer la topologie
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          bash scripts/auditer-topologie-pr.sh "$GITHUB_REPOSITORY" | tee /tmp/topologie.txt
+          code=${PIPESTATUS[0]}
+          {
+            echo "## Topologie des PR et des lots"
+            echo
+            echo '```'
+            cat /tmp/topologie.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep '❌' /tmp/topologie.txt | sed 's/^ *❌ */::warning title=Topologie::/' || true
+          # L'audit planifié ne rougit PAS sur l'état existant : sept lots
+          # orphelins et trois PR mal basées ont été mesurés le 11/09/2026, et
+          # un run rouge tous les matins sur un fond connu n'apprend rien à
+          # personne. Le verdict est dans le résumé et dans les annotations.
+          echo "code de l'audit : $code (mode AUDIT — non bloquant)"
+          exit 0
