@@ -40,6 +40,26 @@ pub struct DeezerService {
     api_token: Option<String>,
     quality: String,
     proxy_base_url: Option<String>,
+    /// Cookie de session de la passerelle Deezer (#3866).
+    ///
+    /// La passerelle lie le jeton anti-CSRF (`checkForm`, renvoye en query
+    /// string par [`DeezerService::gw_api_call`]) au `sid` qu'elle pose par
+    /// `Set-Cookie` pendant `deezer.getUserData`. Un appel suivant qui porte
+    /// le jeton SANS le cookie est refuse — `VALID_TOKEN_REQUIRED`,
+    /// « Invalid CSRF token » — et `song.getData` ne rend alors jamais de
+    /// `TRACK_TOKEN`.
+    ///
+    /// Le client partage n'a AUCUN magasin de cookies
+    /// (`tune-core/src/http/client.rs` : ni `cookie_store`, ni `cookie_provider`),
+    /// le `Set-Cookie` est donc jete par reqwest. On capture et on rejoue a la
+    /// main. `Mutex` parce que `gw_api_call` le lit et le rafraichit a travers
+    /// un `&self`.
+    sid: std::sync::Mutex<Option<String>>,
+    /// Adresse de la passerelle. Vaut [`DEEZER_GW`] partout ailleurs ; seul
+    /// le temoin de cablage la deplace, pour prouver que le `sid` capture
+    /// repart VRAIMENT dans l'appel suivant — et pas seulement qu'une
+    /// fonction sait le mettre en forme.
+    gw_url: String,
     arl_rejected: bool,
     /// Cet ARL-ci a-t-il DÉJÀ authentifié dans ce processus ?
     ///
@@ -62,6 +82,27 @@ pub struct DeezerService {
 /// relevés espacés de cinq minutes, l'expiration est la lecture de loin la
 /// plus probable.
 const ARL_ZERO_USER_TOLERANCE: u8 = 1;
+
+/// Le `sid` porte par un en-tete `Set-Cookie`, s'il en porte un d'utilisable.
+///
+/// Rend `None` pour tout autre cookie (`arl=`, `dzr_uniq_id=`, …) et pour une
+/// valeur VIDE : `sid=;` est une SUPPRESSION de cookie, la retenir
+/// remplacerait une session encore valable par une chaine vide, ce que la
+/// passerelle refuserait exactement comme l'absence du cookie (#3866).
+fn sid_from_set_cookie(header: &str) -> Option<&str> {
+    let value = header.trim_start().strip_prefix("sid=")?;
+    let value = value.split(';').next()?.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+/// L'en-tete `Cookie` d'un appel passerelle : l'ARL seul tant qu'aucune
+/// session n'est ouverte, l'ARL ET le `sid` des qu'il y en a un (#3866).
+fn gateway_cookie_header(arl: &str, sid: Option<&str>) -> String {
+    match sid {
+        Some(sid) => format!("arl={arl}; sid={sid}"),
+        None => format!("arl={arl}"),
+    }
+}
 
 impl Default for DeezerService {
     fn default() -> Self {
@@ -86,6 +127,8 @@ impl DeezerService {
             api_token: None,
             quality: "FLAC".into(),
             proxy_base_url: None,
+            sid: std::sync::Mutex::new(None),
+            gw_url: DEEZER_GW.to_string(),
             arl_rejected: false,
             arl_authenticated_once: false,
             arl_zero_user_streak: 0,
@@ -94,6 +137,15 @@ impl DeezerService {
 
     pub fn set_proxy_base_url(&mut self, url: Option<String>) {
         self.proxy_base_url = url;
+    }
+
+    /// Deplace la passerelle. RESERVE aux epreuves : c'est ce qui permet au
+    /// temoin de cablage de faire parler une vraie passerelle sur la boucle
+    /// locale au lieu de se contenter d'eprouver une fonction pure que
+    /// personne n'appellerait.
+    #[cfg(test)]
+    fn set_gw_url(&mut self, url: String) {
+        self.gw_url = url;
     }
 
     pub fn has_full_streaming(&self) -> bool {
@@ -107,19 +159,34 @@ impl DeezerService {
     ) -> Result<serde_json::Value, String> {
         let arl = self.arl.as_ref().ok_or("deezer: no ARL")?;
         let url = format!(
-            "{DEEZER_GW}?method={method}&input=3&api_version=1.0&api_token={}",
+            "{}?method={method}&input=3&api_version=1.0&api_token={}",
+            self.gw_url,
             self.api_token.as_deref().unwrap_or("")
         );
+        // #3866 : le `checkForm` de la query string n'a de sens que porte par
+        // la session qui l'a emis. Sans le `sid`, la passerelle repond
+        // VALID_TOKEN_REQUIRED.
+        let sid_courant = self.sid.lock().ok().and_then(|guard| guard.clone());
+        let cookie = gateway_cookie_header(arl, sid_courant.as_deref());
         let resp = self
             .client
             .post(&url)
-            .header("Cookie", format!("arl={arl}"))
+            .header("Cookie", cookie)
             .header("Accept", "application/json, text/plain, */*")
             .header("Accept-Language", "fr-FR,fr;q=0.9,en;q=0.8")
             .json(&params.unwrap_or(serde_json::json!({})))
             .send()
             .await
             .map_err(|e| format!("deezer gw: {e}"))?;
+        // Capturer AVANT de consommer le corps : `resp.text()` prend `resp`.
+        for value in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+            if let Ok(header) = value.to_str()
+                && let Some(frais) = sid_from_set_cookie(header)
+                && let Ok(mut guard) = self.sid.lock()
+            {
+                *guard = Some(frais.to_string());
+            }
+        }
         let status = resp.status();
         let body = resp
             .text()
@@ -151,6 +218,12 @@ impl DeezerService {
         self.arl = Some(arl.into());
         self.license_token = None;
         self.api_token = None;
+        // Une authentification neuve ouvre une session neuve : un `sid`
+        // perime apparierait le NOUVEAU `checkForm` a l'ANCIENNE session et
+        // declencherait le refus CSRF que ce cookie existe pour eviter.
+        if let Ok(mut guard) = self.sid.lock() {
+            *guard = None;
+        }
         self.arl_rejected = false;
         let result = self
             .gw_api_call("deezer.getUserData", None)
@@ -1394,5 +1467,185 @@ mod tests {
         assert!(!svc.supports_write()); // need user_id too
         svc.user_id = Some(12345);
         assert!(svc.supports_write());
+    }
+
+    // ─── #3866 / #3865 : la session de la passerelle et la forme de l'URL ───
+
+    #[test]
+    fn le_sid_est_lu_dans_le_set_cookie_et_lui_seul() {
+        assert_eq!(
+            sid_from_set_cookie("sid=fr1a2b3c; expires=Thu, 01-Jan-2027 00:00:00 GMT; path=/"),
+            Some("fr1a2b3c")
+        );
+        // La passerelle repose l'arl dans la meme reponse : il ne doit pas
+        // etre pris pour un sid.
+        assert_eq!(sid_from_set_cookie("arl=zzzz; path=/"), None);
+        // Un nom qui SE TERMINE par sid n'est pas le sid.
+        assert_eq!(sid_from_set_cookie("dzr_sid=autre; path=/"), None);
+    }
+
+    #[test]
+    fn un_sid_vide_est_une_suppression_et_nest_pas_retenu() {
+        // `sid=;` est l'ordre d'oublier le cookie. Le retenir remplacerait une
+        // session encore valable par une chaine vide — un refus CSRF garanti.
+        assert_eq!(
+            sid_from_set_cookie("sid=; expires=Thu, 01-Jan-1970 00:00:00 GMT"),
+            None
+        );
+        assert_eq!(sid_from_set_cookie("sid=   ; path=/"), None);
+    }
+
+    #[test]
+    fn l_en_tete_cookie_porte_le_sid_des_qu_il_y_en_a_un() {
+        assert_eq!(gateway_cookie_header("ARL", None), "arl=ARL");
+        assert_eq!(
+            gateway_cookie_header("ARL", Some("SID")),
+            "arl=ARL; sid=SID"
+        );
+    }
+
+    /// Faux passerelle sur la boucle locale.
+    ///
+    /// Elle lit la requete ENTIERE (en-tetes + corps annonce), repond
+    /// COMPLETEMENT — `Content-Length` exact — puis ferme proprement. Une
+    /// reponse coupee en cours (RST) rendrait ce temoin intermittent ; c'est
+    /// la premiere chose a verifier s'il se met a vaciller.
+    ///
+    /// Rend, dans l'ordre, la valeur de l'en-tete `Cookie` de chaque requete.
+    async fn fausse_passerelle(
+        listener: tokio::net::TcpListener,
+        reponses: Vec<String>,
+    ) -> Vec<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut cookies = Vec::new();
+        for corps in reponses {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut recu: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.expect("lecture requete");
+                if n == 0 {
+                    break;
+                }
+                recu.extend_from_slice(&buf[..n]);
+                let texte = String::from_utf8_lossy(&recu).to_string();
+                if let Some(fin) = texte.find("\r\n\r\n") {
+                    let annonce = texte
+                        .to_ascii_lowercase()
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|reste| reste.split("\r\n").next().map(str::to_string))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if recu.len() >= fin + 4 + annonce {
+                        break;
+                    }
+                }
+            }
+            let texte = String::from_utf8_lossy(&recu).to_string();
+            cookies.push(
+                texte
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                    .map(|l| l[7..].trim().to_string())
+                    .unwrap_or_default(),
+            );
+            let tete = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Set-Cookie: sid=fr-SESSION-1; path=/; domain=.deezer.com\r\n\
+                 Set-Cookie: arl=RECOPIE; path=/\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                corps.len()
+            );
+            sock.write_all(tete.as_bytes())
+                .await
+                .expect("ecriture tete");
+            sock.write_all(corps.as_bytes())
+                .await
+                .expect("ecriture corps");
+            sock.flush().await.expect("flush");
+            let _ = sock.shutdown().await;
+        }
+        cookies
+    }
+
+    /// Temoin de CABLAGE (#3866) — le seul qui rougisse si le `sid` est
+    /// capture, mis en forme, et jamais envoye.
+    ///
+    /// Les trois temoins ci-dessus eprouvent des fonctions pures : elles
+    /// peuvent etre justes et n'etre appelees par personne (« ecrit mais pas
+    /// branche »). Celui-ci fait parler une vraie passerelle et LIT ce que le
+    /// SECOND appel a reellement envoye sur le fil.
+    #[tokio::test]
+    async fn le_sid_pose_par_getuserdata_repart_dans_l_appel_suivant() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind boucle locale");
+        let port = listener.local_addr().unwrap().port();
+        let serveur = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![
+                // 1. deezer.getUserData : rend le checkForm ET pose le sid.
+                r#"{"results":{"USER":{"USER_ID":42,"BLOG_NAME":"testeur","OPTIONS":{"license_token":"LIC"}},"checkForm":"CHECKFORM-1"}}"#.to_string(),
+                // 2. song.getData : ce qui compte ici est le cookie ENVOYE.
+                r#"{"results":{"TRACK_TOKEN":"TT"}}"#.to_string(),
+            ],
+        ));
+
+        let mut svc = DeezerService::new();
+        svc.set_gw_url(format!("http://127.0.0.1:{port}/ajax/gw-light.php"));
+
+        assert!(
+            svc.authenticate_arl(&"a".repeat(192)).await.unwrap(),
+            "la passerelle de l'epreuve rend USER_ID=42"
+        );
+        assert_eq!(svc.api_token.as_deref(), Some("CHECKFORM-1"));
+
+        svc.gw_api_call("song.getData", None)
+            .await
+            .expect("second appel passerelle");
+
+        let cookies = serveur.await.expect("faux serveur");
+        assert_eq!(cookies.len(), 2, "deux appels attendus");
+        assert!(
+            !cookies[0].contains("sid="),
+            "aucune session n'est encore ouverte au premier appel"
+        );
+        assert!(
+            cookies[0].contains("arl="),
+            "l'ARL part des le premier appel"
+        );
+        assert!(
+            cookies[1].contains("sid=fr-SESSION-1"),
+            "le sid pose par getUserData n'est PAS reparti dans song.getData (#3866)"
+        );
+        assert!(
+            cookies[1].contains("arl="),
+            "l'ARL doit rester a cote du sid, pas etre remplace par lui"
+        );
+    }
+
+    /// Contrat avec `tune-server/src/routes/mod.rs` : l'URL emise ici doit
+    /// correspondre a une route DECLAREE. Les deux ont diverge des le premier
+    /// jour (route a un segment, URL a deux) et les lecteurs recevaient
+    /// `index.html` etiquete `audio/flac` (#3865). Ne changer cette forme
+    /// qu'avec les routes ET le temoin de routage d'en face.
+    #[tokio::test]
+    async fn la_forme_de_l_url_proxy_suit_les_routes_declarees() {
+        let mut svc = DeezerService::new();
+        svc.arl = Some("a".repeat(192));
+        svc.license_token = Some("LIC".into());
+        svc.set_proxy_base_url(Some("http://192.168.1.10:8888/deezer-proxy".into()));
+
+        let stream = svc
+            .get_track_url("92720184", None)
+            .await
+            .expect("service entierement habilite : chemin proxy");
+
+        assert_eq!(
+            stream.url,
+            "http://192.168.1.10:8888/deezer-proxy/deezer/92720184.flac"
+        );
+        assert_eq!(stream.mime_type, "audio/flac");
     }
 }
