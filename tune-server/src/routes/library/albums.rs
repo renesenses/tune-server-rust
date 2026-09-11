@@ -1067,6 +1067,11 @@ pub(crate) struct PisteVue {
     pub(crate) year: Option<i64>,
     pub(crate) file_path: String,
     pub(crate) track_number: i64,
+    /// `albums.cover_path` — un CONDENSAT, pas un chemin (#1444) : le SHA-256
+    /// des octets de l'image pour toute écriture récente, l'ancien MD5 du
+    /// chemin de la pochette pour les entrées héritées. Vide quand l'album n'a
+    /// pas de pochette.
+    pub(crate) cover_path: String,
 }
 
 /// Le dossier d'un chemin, séparateurs `/` et `\` confondus (bibliothèques
@@ -1208,21 +1213,127 @@ pub(crate) fn dossier_de_l_album(chemin: &str) -> &str {
         dossier
     }
 }
+/// Ce qui a rapproché les albums d'un faisceau. Valeur STABLE : le client
+/// l'affiche et le serveur la relit dans la garde de la phase 1.
+pub(crate) const INDICE_DOSSIER_ET_TITRE: &str = "dossier_et_titre";
+/// Le second indice, celui que #3396 met en avant : deux albums dont la
+/// pochette est la MÊME, à l'octet près.
+pub(crate) const INDICE_POCHETTE_IDENTIQUE: &str = "pochette_identique";
+/// Le condensat d'une pochette, quand c'en est un.
+///
+/// `albums.cover_path` porte un condensat hexadécimal (#1444) : SHA-256 des
+/// octets de l'image pour toute écriture récente, MD5 du chemin de la pochette
+/// pour les entrées héritées. Les deux régimes sont SÛRS pour un rapprochement,
+/// et pour des raisons différentes :
+///
+/// - par le CONTENU, deux albums qui partagent le condensat partagent
+///   littéralement les mêmes octets d'image ;
+/// - par le CHEMIN, ils partagent le même fichier `cover.jpg` sur le disque.
+///   Deux copies du même octet dans deux dossiers rendent alors deux condensats
+///   différents : l'indice perd en sensibilité, jamais en sûreté.
+///
+/// Tout ce qui n'est pas un condensat (vide, `NULL`, chemin relatif d'une
+/// version ancienne) est écarté : la valeur ne serait plus une identité
+/// d'image, et c'est exactement là que naissent les rapprochements faux.
+fn condensat_de_pochette(valeur: &str) -> Option<&str> {
+    let valeur = valeur.trim();
+    super::artwork::is_hex_hash(valeur).then_some(valeur)
+}
+/// Les numéros de piste des membres d'un faisceau ne se recouvrent-ils pas ?
+///
+/// C'est le garde-fou que #3396 nomme lui-même : « deux tranches d'un même
+/// disque se complètent au lieu de se recouvrir. C'est ce qui distingue un
+/// album en deux CD d'un album et de sa réédition, que rien d'autre ne
+/// sépare. » Une réédition et son original portent tous deux les pistes 1..n :
+/// ils se recouvrent dès le numéro 1.
+///
+/// Le numéro `0` — piste non numérotée — ne compte pas : il est présent par
+/// défaut et ferait échouer la complémentarité de tout faisceau non étiqueté.
+fn numeros_complementaires<'a>(
+    numeros_par_album: impl Iterator<Item = &'a std::collections::BTreeSet<i64>>,
+) -> bool {
+    let mut vus: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    let mut complementaires = true;
+    for numeros in numeros_par_album {
+        if numeros.iter().any(|n| *n > 0 && !vus.insert(*n)) {
+            complementaires = false;
+        }
+    }
+    complementaires
+}
+/// Les membres forment-ils des TRANCHES, au sens fort ?
+///
+/// [`numeros_complementaires`] seul ne suffit pas à FONDER un rapprochement :
+/// il est vrai par vacuité quand rien n'est numéroté. Deux albums dont toutes
+/// les pistes portent le numéro `0` — une bibliothèque sans étiquettes — « se
+/// complètent » sans qu'aucune pièce ne le dise, et ils partageraient volontiers
+/// la pochette générique d'un label. C'est la famille de faux rapprochements
+/// que le faisceau par pochette ouvrirait en premier.
+///
+/// Chaque membre doit donc apporter **au moins un numéro réel**, en plus de ne
+/// recouvrir aucun de ses voisins.
+fn tranches_complementaires<'a>(
+    numeros_par_album: impl Iterator<Item = &'a std::collections::BTreeSet<i64>> + Clone,
+) -> bool {
+    numeros_par_album
+        .clone()
+        .all(|numeros| numeros.iter().any(|n| *n > 0))
+        && numeros_complementaires(numeros_par_album)
+}
 /// BIB-A2, phase 0 : les groupes d'albums qui sont PROBABLEMENT un seul album
-/// éclaté. Le faisceau (mesure du 30/08 sur .18 : 93 % des éclatements
-/// viennent de l'enregistreur, qui écrit sous l'artiste de la PISTE) :
-/// même dossier ET même titre normalisé, sur au moins deux albums. Chaque
-/// groupe dit ensuite si les numéros de piste sont complémentaires (aucun
-/// numéro commun : la signature d'un album coupé en deux) et si les années
-/// concordent. Rien n'est fusionné : le rapport nomme, le regroupement
-/// viendra avec sa contre-épreuve.
+/// éclaté. Deux faisceaux, jamais mélangés :
+///
+/// 1. **`dossier_et_titre`** (mesure du 30/08 sur .18 : 93 % des éclatements
+///    viennent de l'enregistreur, qui écrit sous l'artiste de la PISTE) :
+///    même dossier ET même titre normalisé, sur au moins deux albums.
+/// 2. **`pochette_identique`** (#3396) : même condensat de pochette, où que
+///    soient les fichiers et quel que soit le titre — MAIS seulement si les
+///    numéros de piste se complètent.
+///
+/// Chaque groupe dit ensuite si les numéros de piste sont complémentaires
+/// (aucun numéro commun : la signature d'un album coupé en deux) et si les
+/// années concordent. Rien n'est fusionné : le rapport nomme, l'absorption
+/// reste un geste manuel.
+///
+/// ## Pourquoi la complémentarité est EXIGÉE du second faisceau, pas du premier
+///
+/// Le faisceau par dossier est déjà borné par le disque : deux lignes `albums`
+/// dans un même répertoire sont presque toujours un éclatement, complémentaires
+/// ou non (l'enregistreur redouble parfois un numéro). La pochette, elle, ne
+/// borne rien — une réédition, un pressage japonais, un `Greatest Hits` et son
+/// volume 2 partagent souvent la même image. Sans la complémentarité, ce
+/// second faisceau proposerait de fusionner des albums que l'utilisateur a
+/// délibérément séparés : exactement le dégât contre lequel le ticket met en
+/// garde. Avec elle, il faut que les deux albums ne partagent AUCUN numéro de
+/// piste — ce que deux éditions du même disque ne font jamais, puisqu'elles
+/// commencent toutes deux à 1.
 pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
     use std::collections::{BTreeMap, BTreeSet};
-    // (dossier, clé de titre) → album_id → fiche (titre, artiste, année, numéros)
+    // album_id → fiche (titre, artiste, année, numéros)
     type Fiche = (String, String, Option<i64>, BTreeSet<i64>);
-    type Faisceaux = BTreeMap<(String, String), BTreeMap<i64, Fiche>>;
-    let mut faisceaux: Faisceaux = BTreeMap::new();
+    type Membres = BTreeMap<i64, Fiche>;
+    let mut faisceaux: BTreeMap<(String, String), Membres> = BTreeMap::new();
+    // Condensat de pochette → membres. Renseigné en même temps que le premier
+    // faisceau : une seule traversée des pistes.
+    let mut par_pochette: BTreeMap<String, Membres> = BTreeMap::new();
+    let fiche_neuve = |p: &PisteVue| {
+        (
+            p.album_title.clone(),
+            p.artist_name.clone(),
+            p.year,
+            BTreeSet::new(),
+        )
+    };
     for p in pistes {
+        if let Some(condensat) = condensat_de_pochette(&p.cover_path) {
+            par_pochette
+                .entry(condensat.to_string())
+                .or_default()
+                .entry(p.album_id)
+                .or_insert_with(|| fiche_neuve(p))
+                .3
+                .insert(p.track_number);
+        }
         // Le dossier de l'ALBUM, pas celui du fichier : un coffret rangé en
         // `.../Album/CD1` et `.../Album/CD2` doit tomber dans un seul
         // faisceau (#3396).
@@ -1236,48 +1347,77 @@ pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
         if cle.is_empty() {
             continue;
         }
-        let entree = faisceaux
+        faisceaux
             .entry((dossier.to_string(), cle))
             .or_default()
             .entry(p.album_id)
-            .or_insert_with(|| {
-                (
-                    p.album_title.clone(),
-                    p.artist_name.clone(),
-                    p.year,
-                    BTreeSet::new(),
-                )
-            });
-        entree.3.insert(p.track_number);
+            .or_insert_with(|| fiche_neuve(p))
+            .3
+            .insert(p.track_number);
     }
+    let fiches_json = |albums: &Membres| {
+        albums
+            .iter()
+            .map(|(id, (titre, artiste, annee, numeros))| {
+                json!({
+                    "id": id,
+                    "title": titre,
+                    "artist": artiste,
+                    "year": annee,
+                    "track_count": numeros.len(),
+                    "track_numbers": numeros,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
     let mut groupes = Vec::new();
+    // Les groupes déjà nommés par le dossier : le faisceau par pochette ne les
+    // redit pas. Un même éclatement proposé deux fois ferait croire à deux
+    // gestes à faire.
+    let mut deja_vus: BTreeSet<Vec<i64>> = BTreeSet::new();
     for ((dossier, cle), albums) in &faisceaux {
         if albums.len() < 2 {
             continue;
         }
-        let mut vus: BTreeSet<i64> = BTreeSet::new();
-        let mut complementaires = true;
-        for (_, _, _, numeros) in albums.values() {
-            if numeros.iter().any(|n| *n > 0 && !vus.insert(*n)) {
-                complementaires = false;
-            }
-        }
+        let complementaires = numeros_complementaires(albums.values().map(|a| &a.3));
         let annees: BTreeSet<Option<i64>> = albums.values().map(|a| a.2).collect();
         let total: usize = albums.values().map(|a| a.3.len()).sum();
+        deja_vus.insert(albums.keys().copied().collect());
         groupes.push(json!({
+            "indice": INDICE_DOSSIER_ET_TITRE,
             "dossier": dossier,
             "titre_normalise": cle,
             "numeros_complementaires": complementaires,
             "meme_annee": annees.len() == 1,
             "pistes": total,
-            "albums": albums.iter().map(|(id, (titre, artiste, annee, numeros))| json!({
-                "id": id,
-                "title": titre,
-                "artist": artiste,
-                "year": annee,
-                "track_count": numeros.len(),
-                "track_numbers": numeros,
-            })).collect::<Vec<_>>(),
+            "albums": fiches_json(albums),
+        }));
+    }
+    for (condensat, albums) in &par_pochette {
+        if albums.len() < 2 {
+            continue;
+        }
+        if !tranches_complementaires(albums.values().map(|a| &a.3)) {
+            continue;
+        }
+        let ids: Vec<i64> = albums.keys().copied().collect();
+        if !deja_vus.insert(ids) {
+            continue;
+        }
+        let annees: BTreeSet<Option<i64>> = albums.values().map(|a| a.2).collect();
+        let total: usize = albums.values().map(|a| a.3.len()).sum();
+        groupes.push(json!({
+            "indice": INDICE_POCHETTE_IDENTIQUE,
+            "pochette": condensat,
+            // Ces deux champs gardent la forme du rapport, mais un faisceau par
+            // pochette traverse les dossiers et les titres : les renseigner
+            // avec la valeur d'un seul membre serait faux.
+            "dossier": "",
+            "titre_normalise": "",
+            "numeros_complementaires": true,
+            "meme_annee": annees.len() == 1,
+            "pistes": total,
+            "albums": fiches_json(albums),
         }));
     }
     // Les plus sûrs d'abord : complémentaires et de même année, puis les plus gros.
@@ -1300,7 +1440,8 @@ pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
 /// `GET /library/albums/eclates` — les albums éclatés présumés (BIB-A2, phase 0).
 /// Lecture seule ; la bibliothèque entière est lue une fois (une requête).
 pub(super) async fn albums_eclates(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let sql = "SELECT t.album_id, al.title, ar.name, al.year, t.file_path, t.track_number \
+    let sql = "SELECT t.album_id, al.title, ar.name, al.year, t.file_path, t.track_number, \
+                      COALESCE(al.cover_path, '') \
                FROM tracks t \
                JOIN albums al ON al.id = t.album_id \
                LEFT JOIN artists ar ON ar.id = al.artist_id \
@@ -1318,6 +1459,7 @@ pub(super) async fn albums_eclates(State(state): State<AppState>) -> Result<Json
                 year: r.get(3).and_then(|v| v.as_i64()),
                 file_path: r.get(4).and_then(|v| v.as_string())?,
                 track_number: r.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
+                cover_path: r.get(6).and_then(|v| v.as_string()).unwrap_or_default(),
             })
         })
         .collect();
@@ -1350,6 +1492,24 @@ fn dossiers_de_l_album(state: &AppState, album_id: i64) -> std::collections::BTr
         // `.../Album/CD2` ont bien `.../Album` en commun (#3396).
         .map(|chemin| dossier_de_l_album(&chemin).to_string())
         .filter(|d| !d.is_empty())
+        .collect()
+}
+/// Les numéros de piste d'un album, pour la garde de complémentarité du
+/// faisceau « pochette identique » (#3396).
+fn numeros_de_piste_de_l_album(state: &AppState, album_id: i64) -> std::collections::BTreeSet<i64> {
+    let p1 = match state.backend.engine() {
+        Engine::Postgres => PostgresDialect.placeholder(1),
+        Engine::Sqlite => SqliteDialect.placeholder(1),
+    };
+    state
+        .backend
+        .query_many(
+            &format!("SELECT track_number FROM tracks WHERE album_id = {p1}"),
+            &[&album_id as &dyn ToSqlValue],
+        )
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_i64()))
         .collect()
 }
 
@@ -1416,11 +1576,39 @@ pub(super) async fn absorber_album(
             "seuls deux albums de la bibliothèque locale se regroupent".to_string(),
         );
     }
+    // Le SECOND indice de la phase 0 (#3396) : même pochette à l'octet près et
+    // numéros de piste complémentaires. Il traverse volontairement les dossiers
+    // ET les titres — c'est tout son intérêt : une compilation éclatée par
+    // artiste n'a ni l'un ni l'autre en commun. Il doit donc traverser aussi
+    // les deux gardes qui les vérifient, sinon la phase 0 proposerait un geste
+    // que la phase 1 décline, le défaut même que le retrait du marqueur de
+    // tranche avait déjà corrigé une fois.
+    //
+    // Il ne DISPENSE de rien d'autre : source locale, paire non déclarée
+    // distincte et albums différents restent exigés ci-dessus et ci-dessous.
+    let meme_pochette = match (
+        condensat_de_pochette(album_cible.cover_path.as_deref().unwrap_or_default()),
+        condensat_de_pochette(album_doublon.cover_path.as_deref().unwrap_or_default()),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    let par_la_pochette = meme_pochette
+        && tranches_complementaires(
+            [
+                numeros_de_piste_de_l_album(&state, cible),
+                numeros_de_piste_de_l_album(&state, doublon),
+            ]
+            .iter(),
+        );
     // La MÊME clé que la phase 0, marqueur de tranche retiré. Sans cela, la
     // phase 0 proposerait « Album Disc 1 » + « Album Disc 2 » et la phase 1
     // les refuserait par `titres_differents` : une surface ouverte sur un
     // geste que le serveur décline (#3396).
-    if cle_titre_sans_tranche(&album_cible.title) != cle_titre_sans_tranche(&album_doublon.title) {
+    if !par_la_pochette
+        && cle_titre_sans_tranche(&album_cible.title)
+            != cle_titre_sans_tranche(&album_doublon.title)
+    {
         return refus(
             StatusCode::CONFLICT,
             "titres_differents",
@@ -1432,10 +1620,11 @@ pub(super) async fn absorber_album(
     }
     let dossiers_cible = dossiers_de_l_album(&state, cible);
     let dossiers_doublon = dossiers_de_l_album(&state, doublon);
-    if dossiers_cible
-        .intersection(&dossiers_doublon)
-        .next()
-        .is_none()
+    if !par_la_pochette
+        && dossiers_cible
+            .intersection(&dossiers_doublon)
+            .next()
+            .is_none()
     {
         return refus(
             StatusCode::CONFLICT,
@@ -2169,6 +2358,19 @@ mod tests_albums_eclates {
         chemin: &str,
         n: i64,
     ) -> PisteVue {
+        piste_pochette(album_id, titre, artiste, annee, chemin, n, "")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn piste_pochette(
+        album_id: i64,
+        titre: &str,
+        artiste: &str,
+        annee: Option<i64>,
+        chemin: &str,
+        n: i64,
+        pochette: &str,
+    ) -> PisteVue {
         PisteVue {
             album_id,
             album_title: titre.into(),
@@ -2176,7 +2378,13 @@ mod tests_albums_eclates {
             year: annee,
             file_path: chemin.into(),
             track_number: n,
+            cover_path: pochette.into(),
         }
+    }
+
+    /// Un condensat de pochette bien formé, distinct pour chaque graine.
+    fn condensat(graine: u8) -> String {
+        format!("{:02x}", graine).repeat(32)
     }
 
     /// BIB-A2 : le cas de l'enregistreur — un même dossier, un même titre, deux
@@ -2282,6 +2490,204 @@ mod tests_albums_eclates {
             "ete 85 bande originale"
         );
         assert_eq!(cle_titre("..."), "");
+    }
+
+    /// #3396, l'indice que le ticket met en avant : la compilation éclatée par
+    /// ARTISTE. Trois dossiers, trois titres différents, aucun dossier commun —
+    /// donc le faisceau historique est aveugle — mais une seule et même
+    /// pochette, et des numéros de piste qui se complètent (1-2, 3-4, 5).
+    #[test]
+    fn la_compilation_eclatee_par_artiste_se_retrouve_par_sa_pochette() {
+        let p = condensat(0xab);
+        let pistes = vec![
+            piste_pochette(
+                1,
+                "Jazz 70 - Davis",
+                "Miles Davis",
+                Some(1970),
+                "/m/A/1.flac",
+                1,
+                &p,
+            ),
+            piste_pochette(
+                1,
+                "Jazz 70 - Davis",
+                "Miles Davis",
+                Some(1970),
+                "/m/A/2.flac",
+                2,
+                &p,
+            ),
+            piste_pochette(
+                2,
+                "Jazz 70 - Coltrane",
+                "John Coltrane",
+                Some(1970),
+                "/m/B/1.flac",
+                3,
+                &p,
+            ),
+            piste_pochette(
+                2,
+                "Jazz 70 - Coltrane",
+                "John Coltrane",
+                Some(1970),
+                "/m/B/2.flac",
+                4,
+                &p,
+            ),
+            piste_pochette(
+                3,
+                "Jazz 70 - Evans",
+                "Bill Evans",
+                Some(1970),
+                "/m/C/1.flac",
+                5,
+                &p,
+            ),
+        ];
+        let g = grouper_les_albums_eclates(&pistes);
+        assert_eq!(g.len(), 1, "{g:#?}");
+        assert_eq!(g[0]["indice"], super::INDICE_POCHETTE_IDENTIQUE);
+        assert_eq!(g[0]["pochette"], p);
+        assert_eq!(g[0]["pistes"], 5);
+        let ids: Vec<i64> = g[0]["albums"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    /// Le garde-fou du ticket : une RÉÉDITION partage la pochette de
+    /// l'original, et ses numéros de piste se recouvrent. Elle ne doit JAMAIS
+    /// être proposée à la fusion — c'est la distinction que l'utilisateur a
+    /// voulue.
+    #[test]
+    fn une_reedition_partage_la_pochette_mais_se_recouvre_donc_rien() {
+        let p = condensat(0x5c);
+        let pistes = vec![
+            piste_pochette(
+                1,
+                "Blue Train",
+                "John Coltrane",
+                Some(1957),
+                "/m/Orig/1.flac",
+                1,
+                &p,
+            ),
+            piste_pochette(
+                1,
+                "Blue Train",
+                "John Coltrane",
+                Some(1957),
+                "/m/Orig/2.flac",
+                2,
+                &p,
+            ),
+            piste_pochette(
+                2,
+                "Blue Train (Remaster)",
+                "John Coltrane",
+                Some(2003),
+                "/m/Remaster/1.flac",
+                1,
+                &p,
+            ),
+            piste_pochette(
+                2,
+                "Blue Train (Remaster)",
+                "John Coltrane",
+                Some(2003),
+                "/m/Remaster/2.flac",
+                2,
+                &p,
+            ),
+        ];
+        assert!(
+            grouper_les_albums_eclates(&pistes).is_empty(),
+            "une réédition ne se fusionne pas avec son original"
+        );
+    }
+
+    /// Ce qui n'est pas un condensat ne rapproche rien : une valeur vide, un
+    /// chemin relatif ou une chaîne hors alphabet hexadécimal partagés par
+    /// deux albums ne sont pas une identité d'image.
+    #[test]
+    fn une_pochette_qui_n_est_pas_un_condensat_ne_rapproche_rien() {
+        for valeur in ["", "covers/generique.jpg", "zzzz"] {
+            let pistes = vec![
+                piste_pochette(1, "Un", "A", Some(2000), "/m/A/1.flac", 1, valeur),
+                piste_pochette(2, "Deux", "B", Some(2000), "/m/B/1.flac", 2, valeur),
+            ];
+            assert!(
+                grouper_les_albums_eclates(&pistes).is_empty(),
+                "« {valeur} » n'est pas une identité d'image"
+            );
+        }
+    }
+
+    /// Sans numérotation, la complémentarité est vraie par VACUITÉ : deux
+    /// albums dont toutes les pistes portent le numéro 0 se « complètent »
+    /// sans qu'aucune pièce ne le dise. Une pochette générique de label
+    /// suffirait alors à les rapprocher — c'est la première famille de faux
+    /// que ce faisceau ouvrirait.
+    #[test]
+    fn sans_numerotation_la_pochette_partagee_ne_suffit_pas() {
+        let p = condensat(0x33);
+        let pistes = vec![
+            piste_pochette(1, "Sans titre A", "A", None, "/m/A/1.flac", 0, &p),
+            piste_pochette(1, "Sans titre A", "A", None, "/m/A/2.flac", 0, &p),
+            piste_pochette(2, "Sans titre B", "B", None, "/m/B/1.flac", 0, &p),
+        ];
+        assert!(
+            grouper_les_albums_eclates(&pistes).is_empty(),
+            "la complémentarité vide ne fonde rien"
+        );
+
+        // Et il suffit qu'UN membre ne soit pas numéroté pour que le faisceau
+        // retombe : la preuve doit venir de chacun d'eux.
+        let pistes = vec![
+            piste_pochette(1, "Sans titre A", "A", None, "/m/A/1.flac", 1, &p),
+            piste_pochette(1, "Sans titre A", "A", None, "/m/A/2.flac", 2, &p),
+            piste_pochette(2, "Sans titre B", "B", None, "/m/B/1.flac", 0, &p),
+        ];
+        assert!(
+            grouper_les_albums_eclates(&pistes).is_empty(),
+            "un membre non numéroté n'apporte aucune preuve"
+        );
+    }
+
+    /// Un éclatement déjà nommé par le dossier et le titre n'est pas redit une
+    /// seconde fois parce que les deux éclats partagent aussi leur pochette :
+    /// un même geste proposé deux fois ferait croire à deux gestes à faire.
+    #[test]
+    fn un_eclatement_deja_nomme_par_le_dossier_n_est_pas_redit() {
+        let p = condensat(0x11);
+        let pistes = vec![
+            piste_pochette(
+                1,
+                "Abbey Road",
+                "The Beatles",
+                Some(1969),
+                "/m/AR/1.flac",
+                1,
+                &p,
+            ),
+            piste_pochette(
+                2,
+                "Abbey Road",
+                "The Beatles feat. Billy Preston",
+                Some(1969),
+                "/m/AR/2.flac",
+                2,
+                &p,
+            ),
+        ];
+        let g = grouper_les_albums_eclates(&pistes);
+        assert_eq!(g.len(), 1, "{g:#?}");
+        assert_eq!(g[0]["indice"], super::INDICE_DOSSIER_ET_TITRE);
     }
 }
 

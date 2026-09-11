@@ -638,3 +638,187 @@ async fn un_titre_qui_porte_sa_tranche_est_un_seul_album() {
         "« CD 2 » et « CD 3 » ne sont pas le même album : {corps}"
     );
 }
+
+// ── #3396 — le faisceau « pochette identique » ──────────────────────────────
+
+/// Un condensat de pochette bien formé (64 hexadécimaux), distinct par graine.
+fn condensat(graine: u8) -> String {
+    format!("{graine:02x}").repeat(32)
+}
+
+fn poser_pochette(state: &Etat, album_id: i64, condensat: &str) {
+    state
+        .backend
+        .execute(
+            "UPDATE albums SET cover_path = ? WHERE id = ?",
+            &[&condensat as &dyn ToSqlValue, &album_id],
+        )
+        .unwrap();
+}
+
+/// La compilation éclatée par ARTISTE : deux dossiers, deux titres, aucun des
+/// deux indices historiques — mais la même pochette à l'octet près et des
+/// numéros de piste qui se complètent. Elle doit être proposée en phase 0 ET
+/// acceptée en phase 1 : proposer un geste que le serveur refuse est le défaut
+/// que ce faisceau ne doit pas rouvrir.
+#[tokio::test]
+async fn la_compilation_eclatee_par_artiste_est_proposee_puis_absorbee() {
+    let (app, state) = serveur();
+    let davis = artiste(&state, "Miles Davis");
+    let coltrane = artiste(&state, "John Coltrane");
+    let cible = album(&state, "Jazz 70 — Davis", davis);
+    let eclat = album(&state, "Jazz 70 — Coltrane", coltrane);
+    piste(&state, cible, davis, 1, "/musique/jazz70/davis/01.flac");
+    piste(&state, cible, davis, 2, "/musique/jazz70/davis/02.flac");
+    piste(
+        &state,
+        eclat,
+        coltrane,
+        3,
+        "/musique/jazz70/coltrane/01.flac",
+    );
+    let p = condensat(0xab);
+    poser_pochette(&state, cible, &p);
+    poser_pochette(&state, eclat, &p);
+
+    let (_, avant) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    let groupe = groupe_contenant(&avant, (cible, eclat))
+        .unwrap_or_else(|| panic!("la phase 0 doit voir le faisceau : {avant}"));
+    assert_eq!(groupe["indice"], "pochette_identique", "{groupe}");
+    assert_eq!(groupe["pochette"], p, "{groupe}");
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/absorber/{eclat}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps : {corps}");
+    assert_eq!(corps["pistes"].as_u64(), Some(1), "{corps}");
+    assert!(
+        !album_existe(&state, eclat),
+        "la ligne de l'éclat disparaît"
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ?",
+            cible
+        ),
+        3
+    );
+}
+
+/// Le garde-fou : une RÉÉDITION partage la pochette de son original et
+/// recommence à la piste 1. Ni proposée, ni absorbable — l'écran ne doit pas
+/// inviter à détruire une distinction voulue.
+#[tokio::test]
+async fn une_reedition_a_la_meme_pochette_mais_reste_un_album_a_part() {
+    let (app, state) = serveur();
+    let coltrane = artiste(&state, "John Coltrane");
+    let original = album(&state, "Blue Train", coltrane);
+    let remaster = album(&state, "Blue Train (Remaster)", coltrane);
+    piste(&state, original, coltrane, 1, "/musique/orig/01.flac");
+    piste(&state, original, coltrane, 2, "/musique/orig/02.flac");
+    piste(&state, remaster, coltrane, 1, "/musique/remaster/01.flac");
+    piste(&state, remaster, coltrane, 2, "/musique/remaster/02.flac");
+    let p = condensat(0x5c);
+    poser_pochette(&state, original, &p);
+    poser_pochette(&state, remaster, &p);
+
+    let (_, corps) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    assert!(
+        groupe_contenant(&corps, (original, remaster)).is_none(),
+        "une réédition n'est pas un éclat : {corps}"
+    );
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{original}/absorber/{remaster}"),
+    )
+    .await;
+    assert_eq!(
+        (statut, corps["error"].as_str()),
+        (StatusCode::CONFLICT, Some("titres_differents")),
+        "{corps}"
+    );
+}
+
+/// Deux pochettes DIFFÉRENTES ne dispensent de rien : sans dossier commun ni
+/// titre commun, le refus reste celui d'avant.
+#[tokio::test]
+async fn sans_pochette_commune_le_refus_reste_entier() {
+    let (app, state) = serveur();
+    let davis = artiste(&state, "Miles Davis");
+    let coltrane = artiste(&state, "John Coltrane");
+    let un = album(&state, "Jazz 70 — Davis", davis);
+    let deux = album(&state, "Jazz 70 — Coltrane", coltrane);
+    piste(&state, un, davis, 1, "/musique/jazz70/davis/01.flac");
+    piste(
+        &state,
+        deux,
+        coltrane,
+        2,
+        "/musique/jazz70/coltrane/01.flac",
+    );
+    poser_pochette(&state, un, &condensat(0x01));
+    poser_pochette(&state, deux, &condensat(0x02));
+
+    let (_, corps) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    assert!(
+        groupe_contenant(&corps, (un, deux)).is_none(),
+        "deux pochettes différentes ne rapprochent rien : {corps}"
+    );
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{un}/absorber/{deux}"),
+    )
+    .await;
+    assert_eq!(
+        (statut, corps["error"].as_str()),
+        (StatusCode::CONFLICT, Some("titres_differents")),
+        "{corps}"
+    );
+}
+
+/// Une paire déclarée distincte le reste, MÊME quand la pochette est la même :
+/// l'arbitrage de l'utilisateur prime sur tous les indices.
+#[tokio::test]
+async fn la_paire_declaree_distincte_prime_sur_la_pochette() {
+    let (app, state) = serveur();
+    let davis = artiste(&state, "Miles Davis");
+    let coltrane = artiste(&state, "John Coltrane");
+    let cible = album(&state, "Jazz 70 — Davis", davis);
+    let eclat = album(&state, "Jazz 70 — Coltrane", coltrane);
+    piste(&state, cible, davis, 1, "/musique/jazz70/davis/01.flac");
+    piste(
+        &state,
+        eclat,
+        coltrane,
+        2,
+        "/musique/jazz70/coltrane/01.flac",
+    );
+    let p = condensat(0x7f);
+    poser_pochette(&state, cible, &p);
+    poser_pochette(&state, eclat, &p);
+    inserer(
+        &state,
+        "INSERT INTO album_distinct_pairs (profile_id, album_a_id, album_b_id) VALUES (1, ?, ?)",
+        &[&cible as &dyn ToSqlValue, &eclat],
+    );
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/absorber/{eclat}"),
+    )
+    .await;
+    assert_eq!(
+        (statut, corps["error"].as_str()),
+        (StatusCode::CONFLICT, Some("paire_declaree_distincte")),
+        "{corps}"
+    );
+}
