@@ -1764,6 +1764,21 @@ async fn play(
         && body.track_ids.is_none()
         && body.start_index.is_none();
 
+    // #3733 — ce que la demande DÉSIGNAIT, relevé ici parce que la chaîne de
+    // résolution ci-dessous consomme `body.track_ids`.
+    //
+    // Jean-Luc Cassé, 0.9.143, Windows : « lecture des albums impossible ».
+    // Le refus qui suit (`400 "no tracks to play"`) n'écrivait AUCUNE ligne de
+    // journal, et l'interface v2 avale l'erreur. Serveur muet + client muet =
+    // « rien ne se passe », et le testeur n'a rien à envoyer. Sans ces trois
+    // valeurs, un refus ne dit pas si la ligne d'album a été vidée par
+    // `delete_orphans()` ou si le client a posté une liste de pistes vide.
+    let origine_demandee = (
+        body.album_id,
+        body.playlist_id,
+        body.track_ids.as_ref().map(|v| v.len()),
+    );
+
     // Resolve track list: containers (album/playlist) take priority so the full
     // collection is always queued, even when a track_id is also provided.
     let track_ids: Vec<i64> = if let Some(album_id) = body.album_id {
@@ -1845,6 +1860,20 @@ async fn play(
     };
 
     if track_ids.is_empty() {
+        // #3733 — le refus cesse d'être muet. Le CORPS de la réponse ne bouge
+        // pas d'un octet : les clients déjà livrés le comparent tel quel, et
+        // le geste ici est d'ajouter du journal, pas de changer le contrat.
+        //
+        // `warn!` et non `debug!` : `log_level` vaut `info` en service, et une
+        // trace posée plus bas aurait seulement changé de silence.
+        warn!(
+            zone_id,
+            album_id = ?origine_demandee.0,
+            playlist_id = ?origine_demandee.1,
+            pistes_demandees = ?origine_demandee.2,
+            "play_refuse_aucune_piste — la demande n'a résolu aucune piste ; \
+             400 « no tracks to play »"
+        );
         return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
     }
 
@@ -2737,12 +2766,11 @@ fn resoudre_pistes_d_album(
         // sœur — celle que la vue Artistes atteint. Le même album se jouait donc
         // depuis Artistes et rendait 400 « no tracks to play » depuis ces
         // grilles (Pascal, Totaldac, v0.9.21).
-        if let Some(sibling) =
-            tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
-                .find_populated_sibling(album_id)
-                .ok()
-                .flatten()
-        {
+        let soeur = tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+            .find_populated_sibling(album_id)
+            .ok()
+            .flatten();
+        if let Some(sibling) = soeur {
             ids = dedup_display_tracks(track_repo.list_by_album(sibling).unwrap_or_default())
                 .iter()
                 .filter_map(|t| t.id)
@@ -2753,6 +2781,21 @@ fn resoudre_pistes_d_album(
                     album_id, sibling, "album_recovered_via_populated_sibling"
                 );
             }
+        }
+        if ids.is_empty() {
+            // #3733 — le rattrapage a échoué, et LEQUEL des deux cas se produit
+            // décide où chercher. `soeur = None` : aucune ligne de même titre
+            // et même `artist_id` — un changement d'artiste d'album suffit à
+            // faire échouer la clause. `soeur = Some(n)` : la sœur existe mais
+            // est vide elle aussi. Seul le succès était journalisé jusqu'ici,
+            // donc l'échec — le seul cas que le testeur rapporte — ne laissait
+            // rien derrière lui.
+            warn!(
+                zone_id,
+                album_id,
+                soeur_peuplee = ?soeur,
+                "album_sans_piste_rattrapage_echoue"
+            );
         }
     }
     ids
