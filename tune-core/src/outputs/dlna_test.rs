@@ -41,6 +41,15 @@ mod tests {
         /// media tant qu'il n'est pas sorti de veille. Les `n` premieres
         /// lectures de `GetMediaInfo` rendent donc une `CurrentURI` VIDE.
         media_info_vide_restants: Arc<AtomicU32>,
+        /// #3580 — l'appareil range l'URI dans `GetPositionInfo` → `TrackURI`
+        /// et laisse `GetMediaInfo` → `CurrentURI` VIDE. Rien dans la
+        /// specification AVTransport ne l'interdit, et Tune ne lisait que le
+        /// second champ.
+        uri_seulement_dans_trackuri: Arc<Mutex<bool>>,
+        /// Ce que rend `GetPositionInfo` → `TrackURI`. Vide par defaut : c'est
+        /// ce que tous les bancs anterieurs voyaient, et ils doivent continuer
+        /// a le voir.
+        track_uri: Arc<Mutex<String>>,
         /// Corps des SetAVTransportURI reçus, dans l'ordre.
         set_uri_corps: Arc<Mutex<Vec<String>>>,
         /// « Salon » (#2581) : ce renderer refuse `Play` avec le code UPnP 701
@@ -119,6 +128,8 @@ mod tests {
                 current_uri: Arc::new(Mutex::new(String::new())),
                 media_info_fige: Arc::new(Mutex::new(false)),
                 media_info_vide_restants: Arc::new(AtomicU32::new(0)),
+                uri_seulement_dans_trackuri: Arc::new(Mutex::new(false)),
+                track_uri: Arc::new(Mutex::new(String::new())),
                 set_uri_corps: Arc::new(Mutex::new(Vec::new())),
                 salon_701_sans_media: Arc::new(Mutex::new(false)),
                 refus_701_restants: Arc::new(Mutex::new(0)),
@@ -323,7 +334,12 @@ mod tests {
                         .into_response();
                 }
                 let uri = extract_tag(&body, "CurrentURI");
-                if !*state.media_info_fige.lock().await {
+                if *state.uri_seulement_dans_trackuri.lock().await {
+                    // #3580 — l'URI est ACCEPTEE et RETENUE, mais elle ne
+                    // parait que dans le champ de la piste.
+                    *state.track_uri.lock().await = uri;
+                    state.current_uri.lock().await.clear();
+                } else if !*state.media_info_fige.lock().await {
                     *state.current_uri.lock().await = uri;
                 }
                 // « Salon » (#2581) : média accepté puis aussitôt perdu.
@@ -451,10 +467,11 @@ mod tests {
                     state.position_ms.load(Ordering::Relaxed)
                 };
                 let t = hms(ms);
+                let track_uri = state.track_uri.lock().await.clone();
                 soap_ok(
                     "GetPositionInfo",
                     &format!(
-                        "<Track>1</Track><TrackDuration>0:05:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI></TrackURI><RelTime>{t}</RelTime><AbsTime>{t}</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>"
+                        "<Track>1</Track><TrackDuration>0:05:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI>{track_uri}</TrackURI><RelTime>{t}</RelTime><AbsTime>{t}</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>"
                     ),
                 )
                 .into_response()
@@ -866,6 +883,174 @@ mod tests {
         assert!(
             state.set_uri_corps.lock().await.len() >= 2,
             "l'URI devait etre REPOSEE pendant l'attente, pas seulement posee une fois"
+        );
+        handle.abort();
+    }
+
+    /// #3580 — L'URI N'EST PAS TOUJOURS DANS `CurrentURI`.
+    ///
+    /// L'AVTransport publie DEUX champs qui nomment ce que le renderer tient :
+    /// `GetMediaInfo` → `CurrentURI`, et `GetPositionInfo` → `TrackURI`. Rien
+    /// n'oblige un appareil a renseigner les deux au meme instant. Tune ne
+    /// lisait que le premier : un renderer qui ACCEPTE l'URI, l'ACQUITTE,
+    /// ACQUITTE le `Play` et ne la publie que dans le second etait declare
+    /// « ne tient AUCUN media » jusqu'a epuisement du budget de reveil, puis
+    /// sa zone etait coupee — sur un verdict que le protocole contredisait
+    /// deux octets plus loin. C'est l'hypothese que #3580 nommait sans pouvoir
+    /// l'eprouver (« si le HEOS charge le flux ailleurs, la garde attend
+    /// quelque chose qui ne viendra jamais par ce chemin »).
+    ///
+    /// Le banc passe par `play_media` : c'est LUI qui prouve que la seconde
+    /// lecture est BRANCHEE, et pas seulement ecrite. Le budget de reveil est
+    /// raccourci a 300 ms — si la garde ne voyait pas le `TrackURI`, ce test
+    /// n'attendrait pas, il ECHOUERAIT.
+    ///
+    /// L'URL attendue porte le PORT du faux renderer, tire par le systeme a
+    /// l'execution : aucune aiguille du fichier ne peut se trouver elle-meme.
+    #[tokio::test]
+    async fn une_uri_tenue_seulement_dans_trackuri_est_reconnue() {
+        let state = MockState::default();
+        *state.uri_seulement_dans_trackuri.lock().await = true;
+        let (base, handle) = start_mock(state.clone()).await;
+        let url = format!("{base}/stream/tenue-ailleurs.flac");
+        let output = make_dlna(&base).with_budget_reveil_ms(300);
+        output
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/flac",
+                title: Some("FIP"),
+                ..Default::default()
+            })
+            .await
+            .expect(
+                "le renderer NOMME notre flux dans TrackURI : la lecture doit aboutir, \
+                 pas etre declaree « aucun media »",
+            );
+        assert!(
+            state.current_uri.lock().await.is_empty(),
+            "le banc ne vaut que si `CurrentURI` est RESTE vide — sinon il ne mesure rien"
+        );
+        assert_eq!(
+            *state.track_uri.lock().await,
+            url,
+            "le renderer devait tenir NOTRE flux, dans le champ de la piste"
+        );
+        handle.abort();
+    }
+
+    /// TEMOIN INVERSE — un `TrackURI` ETRANGER ne vaut pas acquittement.
+    ///
+    /// La seconde lecture ne retient `TrackURI` que s'il designe NOTRE flux.
+    /// Sans cette restriction, un appareil qui garde dans son champ de piste
+    /// l'URI de sa lecture PRECEDENTE — ou celle d'un autre serveur — verrait
+    /// Tune conclure « c'est parti » et afficher une lecture qui n'existe pas :
+    /// exactement l'etat imaginaire que toute cette verification existe pour
+    /// interdire. Ici `CurrentURI` est vide et `TrackURI` porte un flux
+    /// etranger : le verdict doit rester « ne tient AUCUN media ».
+    #[tokio::test]
+    async fn un_trackuri_etranger_ne_vaut_pas_acquittement() {
+        let state = MockState::default();
+        *state.media_info_fige.lock().await = true;
+        *state.current_uri.lock().await = String::new();
+        *state.track_uri.lock().await =
+            "http://192.168.1.42:8888/stream/lecture-d-un-autre-serveur.flac".into();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base).with_budget_reveil_ms(300);
+        let err = output
+            .play_media(&PlayMedia {
+                url: "http://192.168.1.18:8888/stream/le-notre.flac",
+                mime_type: "audio/flac",
+                ..Default::default()
+            })
+            .await
+            .expect_err(
+                "un TrackURI qui ne designe pas notre flux ne doit JAMAIS faire \
+                 conclure au succes",
+            );
+        assert!(
+            err.contains("AUCUN"),
+            "le verdict doit rester « il ne tient RIEN », pas « il joue autre \
+             chose » : la seconde lecture est un temoin POSITIF, elle ne \
+             remplace pas `CurrentURI` ({err})"
+        );
+        handle.abort();
+    }
+
+    /// TEMOIN INVERSE — les DEUX champs vides restent un echec.
+    ///
+    /// Sans ce cas, la lecture du second champ pourrait etre elargie jusqu'a
+    /// accepter n'importe quoi et ce fichier resterait vert. Ici l'appareil
+    /// acquitte tout et ne publie RIEN, nulle part : `play_media` doit rendre
+    /// `Err`, et le message doit nommer les deux champs.
+    #[tokio::test]
+    async fn les_deux_champs_vides_restent_un_echec() {
+        let state = MockState::default();
+        *state.media_info_fige.lock().await = true;
+        *state.current_uri.lock().await = String::new();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base).with_budget_reveil_ms(300);
+        let err = output
+            .play_media(&PlayMedia {
+                url: "http://192.168.1.18:8888/stream/rien-nulle-part.flac",
+                mime_type: "audio/flac",
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("AUCUN"),
+            "l'appareil ne tient RIEN : c'est ce que le message doit dire ({err})"
+        );
+        assert!(
+            err.contains("TrackURI"),
+            "le message doit dire que les DEUX champs ont ete lus ({err})"
+        );
+        handle.abort();
+    }
+
+    /// #3580 — LE MESSAGE NE PROMET PLUS UNE DUREE QUE LE TERRAIN DEMENT.
+    ///
+    /// Le message rendu quand l'appareil ne tient rien affirmait : « Un ampli
+    /// en veille reseau (Denon/HEOS) met 15 a 30 s a sortir de veille [...] —
+    /// allumez-le, puis relancez ». Le chiffre venait d'UN releve sur UN
+    /// AVR-X1600H en 0.9.121 (#2749), promu en explication generale.
+    ///
+    /// Le meme appareil, mesure en 0.9.145 (ticket support 109) : 3 min 06 s
+    /// entre le premier clic et la premiere URI tenue, AMPLI SOUS TENSION
+    /// pendant toute la fenetre. Le testeur a conteste le message — « ce qui
+    /// est totalement faux » — et la mesure lui donne raison. Un defaut
+    /// masque par sa propre explication coute plus cher qu'un « pas elucide » :
+    /// le message envoyait allumer un appareil deja allume.
+    ///
+    /// Ce temoin fige ce que le message ne doit plus faire. Il lit le message
+    /// REEL rendu par `play_media`, pas une constante.
+    #[tokio::test]
+    async fn le_message_d_echec_n_invente_pas_de_duree_de_reveil() {
+        let state = MockState::default();
+        *state.media_info_fige.lock().await = true;
+        *state.current_uri.lock().await = String::new();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base).with_budget_reveil_ms(300);
+        let err = output
+            .play_media(&PlayMedia {
+                url: "http://192.168.1.18:8888/stream/duree-inventee.flac",
+                mime_type: "audio/flac",
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        // L'aiguille est ASSEMBLEE, jamais ecrite : un grep de ce fichier ne
+        // peut pas la trouver et se declarer vert.
+        let plage_inventee = format!("{} à {} s", 10 + 5, 20 + 10);
+        assert!(
+            !err.contains(&plage_inventee),
+            "le message affirme de nouveau une plage de reveil que le terrain \
+             dement (3 min 06 s mesurees sur le meme AVR-X1600H en 0.9.145) : {err}"
+        );
+        assert!(
+            !err.contains("allumez-le"),
+            "le message renvoie de nouveau allumer un appareil qui repond deja \
+             en SOAP — c'est ce que le testeur a conteste : {err}"
         );
         handle.abort();
     }
