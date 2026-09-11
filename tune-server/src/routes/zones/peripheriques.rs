@@ -83,7 +83,14 @@ pub(super) async fn zone_identity_for_catalog(
             .filter(|v| !v.trim().is_empty())
     };
     let (mut brand, mut model) = (key("brand"), key("model"));
-    if brand.is_none() || model.is_none() {
+    // #3660 — une identité récusée ne se rattrape pas par la détection : ni
+    // préréglage communautaire demandé pour un appareil que l'utilisateur dit
+    // ne pas avoir, ni correction renvoyée au catalogue sur cette base. Un
+    // override explicite, lui, reste roi : c'est la détection qui est coupée,
+    // pas la parole de l'utilisateur.
+    if (brand.is_none() || model.is_none())
+        && !super::identite_appareil_effacee(&state.backend, zone_id)
+    {
         let zone = ZoneRepo::with_backend(state.backend.clone())
             .get(zone_id)
             .ok()

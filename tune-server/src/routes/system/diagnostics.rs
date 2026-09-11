@@ -335,10 +335,33 @@ fn hote_de_zone(
 /// eteinte, pas remplacee.
 fn groupe_json(motif: &str, cle: &str, zones: &[&ZoneVue]) -> Value {
     let en_ligne = zones.iter().filter(|z| z.online).count();
+    // #3747 — un groupe NOMMÉ n'est pas un groupe FUSIONNABLE.
+    //
+    // `POST /zones/{doublon}/fusionner-dans/{cible}` exige que les deux zones
+    // rendent la MÊME clé `cle_appareil`, non nulle ; elle refuse tout le
+    // reste par `409 zones_distinctes`. Or la SECONDE règle de ce rapport
+    // groupe par HÔTE, et par construction aucune de ses zones ne partage de
+    // clé d'appareil avec une autre : celles qui en partagent une sont déjà
+    // sorties par la première règle, et sont dans `deja`.
+    //
+    // Un groupe « même hôte, deux protocoles » sortait donc avec exactement la
+    // forme d'une famille fusionnable, alors qu'AUCUNE action ne peut le
+    // suivre : un Eversolo vu en SSDP/DLNA et en mDNS/AirPlay est deux espaces
+    // d'identifiants disjoints. Le refus de la route est correct ; c'est le
+    // rapport qui promettait ce qu'il ne pouvait pas tenir. Il le dit
+    // maintenant lui-même, et dit POURQUOI.
+    let fusionnable = !cle.starts_with("hote:");
     json!({
         "motif": motif,
         "cle": cle,
         "en_ligne": en_ligne,
+        "fusionnable": fusionnable,
+        "fusion_refusee_motif": (!fusionnable).then_some(
+            "deux protocoles de découverte différents sur le même hôte : \
+             SSDP/DLNA et mDNS/AirPlay n'ont aucun identifiant commun, et la \
+             fusion serait refusée (409 zones_distinctes). Supprimez la zone \
+             dont vous ne voulez pas ; ses réglages ne sont pas reportés.",
+        ),
         "zones": zones.iter().map(|z| json!({
             "id": z.id,
             "name": z.name,
@@ -3517,5 +3540,119 @@ mod tests_doublons_de_zones {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, [6, 8, 9], "les trois lignes sont un seul appareil");
+    }
+
+    /// La garde de `fusionner_zones`, recalculée ici : les deux zones doivent
+    /// rendre la MÊME clé d'appareil, non nulle. Tout le reste est
+    /// `409 zones_distinctes`.
+    ///
+    /// Le témoin ne relit donc pas le drapeau qu'il vient de poser : il
+    /// compare `fusionnable` à ce que la ROUTE ferait.
+    fn la_route_accepterait(groupe: &serde_json::Value, appareils: &[DiscoveredDevice]) -> bool {
+        let zones: Vec<ZoneVue> = groupe["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|z| {
+                zone(
+                    z["id"].as_i64().unwrap(),
+                    z["name"].as_str().unwrap(),
+                    z["output_type"].as_str().unwrap(),
+                    z["output_device_id"].as_str().unwrap(),
+                    z["online"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        let cles: Vec<Option<String>> = zones.iter().map(|z| cle_appareil(z, appareils)).collect();
+        cles[0].is_some() && cles.iter().all(|c| *c == cles[0])
+    }
+
+    /// #3747 — le rapport ne propose plus une fusion que la route refusera.
+    ///
+    /// Mesuré le 09/09 : un Eversolo vu en DLNA (SSDP, `uuid:…`) et en AirPlay
+    /// (mDNS, `airplay-<MAC>`) sort dans un groupe « même hôte, deux
+    /// protocoles ». Les deux zones ne partagent AUCUN identifiant, et la
+    /// route répond `409 zones_distinctes` — correctement. Ce qui manquait,
+    /// c'est que le rapport le dise AVANT.
+    #[test]
+    fn un_groupe_de_meme_hote_est_nomme_mais_pas_fusionnable() {
+        let zones = vec![
+            zone(
+                10,
+                "Eversolo",
+                "dlna",
+                "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE",
+                true,
+            ),
+            zone(
+                11,
+                "Eversolo",
+                "airplay2",
+                "airplay-AA:BB:CC:DD:EE:01",
+                true,
+            ),
+        ];
+        let dlna = DiscoveredDevice::new(
+            "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE".into(),
+            "Eversolo".into(),
+            OutputType::Dlna,
+            "192.168.1.17".into(),
+            49152,
+        );
+        let airplay = DiscoveredDevice::new(
+            "airplay-AA:BB:CC:DD:EE:01".into(),
+            "Eversolo".into(),
+            OutputType::Airplay,
+            "192.168.1.17".into(),
+            7000,
+        );
+        let appareils = vec![dlna, airplay];
+        let groupes = doublons_de_zones(&zones, &appareils);
+        assert_eq!(groupes.len(), 1, "{groupes:#?}");
+        let g = &groupes[0];
+        assert!(
+            g["cle"].as_str().unwrap().starts_with("hote:"),
+            "le groupe attendu est celui de la règle par hôte : {g:#?}"
+        );
+        assert!(
+            !la_route_accepterait(g, &appareils),
+            "prémisse du témoin : la route DOIT refuser ce groupe"
+        );
+        assert_eq!(
+            g["fusionnable"],
+            serde_json::json!(false),
+            "un groupe que la route refuse ne doit pas être annoncé fusionnable : {g:#?}"
+        );
+        assert!(
+            g["fusion_refusee_motif"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("zones_distinctes"),
+            "le refus doit être nommé, pas laissé à deviner : {g:#?}"
+        );
+    }
+
+    /// L'autre sens, et il est indispensable : un groupe RÉELLEMENT
+    /// fusionnable reste annoncé fusionnable, et sans motif de refus. Sans ce
+    /// témoin, poser `fusionnable: false` partout resterait vert.
+    #[test]
+    fn un_groupe_de_meme_appareil_reste_fusionnable() {
+        let zones = vec![
+            zone(8, "Chambre", "dlna", "uuid:RINCON_ABC", true),
+            zone(6, "Chambre", "dlna", "uuid:RINCON_ABC_MR", false),
+        ];
+        let groupes = doublons_de_zones(&zones, &[]);
+        assert_eq!(groupes.len(), 1, "{groupes:#?}");
+        let g = &groupes[0];
+        assert!(
+            la_route_accepterait(g, &[]),
+            "prémisse du témoin : la route DOIT accepter ce groupe"
+        );
+        assert_eq!(g["fusionnable"], serde_json::json!(true), "{g:#?}");
+        assert_eq!(
+            g["fusion_refusee_motif"],
+            serde_json::Value::Null,
+            "rien à refuser, donc aucun motif : {g:#?}"
+        );
     }
 }

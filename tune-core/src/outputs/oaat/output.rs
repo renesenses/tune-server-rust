@@ -772,12 +772,23 @@ impl OutputTarget for OaatOutput {
                         }
                     }
                     Err(_) => {
+                        // #3727 — « connect timed out » couvrait deux pannes
+                        // qui n'ont rien à voir : un appareil absent, et un
+                        // endpoint ALLUMÉ dont un autre serveur Tune a déjà
+                        // pris la main. Le délai ci-dessus porte sur la
+                        // poignée COMPLÈTE ; on redemande la seule couche TCP
+                        // pour savoir laquelle des deux on a sous les yeux.
+                        let cause = super::cause_de_connexion::cause_de_delai_depasse(
+                            endpoint_addr,
+                            super::cause_de_connexion::BUDGET_DE_SONDE,
+                        )
+                        .await;
                         if attempt < 15 {
                             let delay = 500 + 300 * attempt as u64;
-                            info!(device = %device_name, attempt, delay_ms = delay, "oaat: connect timed out, retry");
+                            info!(device = %device_name, addr = %endpoint_addr, attempt, delay_ms = delay, cause = cause.evenement(), detail = cause.message(), "oaat: connect timed out, retry");
                             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         } else {
-                            error!(device = %device_name, "oaat: connect timed out after 15 attempts");
+                            error!(device = %device_name, addr = %endpoint_addr, cause = cause.evenement(), detail = cause.message(), "oaat: connect timed out after 15 attempts");
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
