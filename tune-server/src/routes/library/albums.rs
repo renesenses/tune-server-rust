@@ -1261,6 +1261,25 @@ fn numeros_complementaires<'a>(
     }
     complementaires
 }
+/// Les membres forment-ils des TRANCHES, au sens fort ?
+///
+/// [`numeros_complementaires`] seul ne suffit pas à FONDER un rapprochement :
+/// il est vrai par vacuité quand rien n'est numéroté. Deux albums dont toutes
+/// les pistes portent le numéro `0` — une bibliothèque sans étiquettes — « se
+/// complètent » sans qu'aucune pièce ne le dise, et ils partageraient volontiers
+/// la pochette générique d'un label. C'est la famille de faux rapprochements
+/// que le faisceau par pochette ouvrirait en premier.
+///
+/// Chaque membre doit donc apporter **au moins un numéro réel**, en plus de ne
+/// recouvrir aucun de ses voisins.
+fn tranches_complementaires<'a>(
+    numeros_par_album: impl Iterator<Item = &'a std::collections::BTreeSet<i64>> + Clone,
+) -> bool {
+    numeros_par_album
+        .clone()
+        .all(|numeros| numeros.iter().any(|n| *n > 0))
+        && numeros_complementaires(numeros_par_album)
+}
 /// BIB-A2, phase 0 : les groupes d'albums qui sont PROBABLEMENT un seul album
 /// éclaté. Deux faisceaux, jamais mélangés :
 ///
@@ -1378,7 +1397,7 @@ pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
         if albums.len() < 2 {
             continue;
         }
-        if !numeros_complementaires(albums.values().map(|a| &a.3)) {
+        if !tranches_complementaires(albums.values().map(|a| &a.3)) {
             continue;
         }
         let ids: Vec<i64> = albums.keys().copied().collect();
@@ -1575,7 +1594,7 @@ pub(super) async fn absorber_album(
         _ => false,
     };
     let par_la_pochette = meme_pochette
-        && numeros_complementaires(
+        && tranches_complementaires(
             [
                 numeros_de_piste_de_l_album(&state, cible),
                 numeros_de_piste_de_l_album(&state, doublon),
@@ -2607,6 +2626,37 @@ mod tests_albums_eclates {
                 "« {valeur} » n'est pas une identité d'image"
             );
         }
+    }
+
+    /// Sans numérotation, la complémentarité est vraie par VACUITÉ : deux
+    /// albums dont toutes les pistes portent le numéro 0 se « complètent »
+    /// sans qu'aucune pièce ne le dise. Une pochette générique de label
+    /// suffirait alors à les rapprocher — c'est la première famille de faux
+    /// que ce faisceau ouvrirait.
+    #[test]
+    fn sans_numerotation_la_pochette_partagee_ne_suffit_pas() {
+        let p = condensat(0x33);
+        let pistes = vec![
+            piste_pochette(1, "Sans titre A", "A", None, "/m/A/1.flac", 0, &p),
+            piste_pochette(1, "Sans titre A", "A", None, "/m/A/2.flac", 0, &p),
+            piste_pochette(2, "Sans titre B", "B", None, "/m/B/1.flac", 0, &p),
+        ];
+        assert!(
+            grouper_les_albums_eclates(&pistes).is_empty(),
+            "la complémentarité vide ne fonde rien"
+        );
+
+        // Et il suffit qu'UN membre ne soit pas numéroté pour que le faisceau
+        // retombe : la preuve doit venir de chacun d'eux.
+        let pistes = vec![
+            piste_pochette(1, "Sans titre A", "A", None, "/m/A/1.flac", 1, &p),
+            piste_pochette(1, "Sans titre A", "A", None, "/m/A/2.flac", 2, &p),
+            piste_pochette(2, "Sans titre B", "B", None, "/m/B/1.flac", 0, &p),
+        ];
+        assert!(
+            grouper_les_albums_eclates(&pistes).is_empty(),
+            "un membre non numéroté n'apporte aucune preuve"
+        );
     }
 
     /// Un éclatement déjà nommé par le dossier et le titre n'est pas redit une
