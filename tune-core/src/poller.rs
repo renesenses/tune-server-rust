@@ -769,6 +769,12 @@ mod status_timeout_tests;
 #[cfg(test)]
 mod famine_anneau_i3318;
 
+/// #3814 — séparer « l'anneau a été réalimenté » de « le pilote a cessé de
+/// réclamer ». Le banc affame le `RingBuf` de production puis fait taire son
+/// consommateur, et rejoue la ligne collée par le testeur du fil 1747.
+#[cfg(test)]
+mod rappel_arrete_3814;
+
 #[cfg(test)]
 mod cadence_de_repos_tests;
 #[cfg(test)]
