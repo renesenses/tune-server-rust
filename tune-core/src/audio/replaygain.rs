@@ -34,6 +34,11 @@ const TRACK_BATCH: usize = 25;
 /// Provenance d'un `dr_track` CALCULÉ par cette passe, par opposition à celui
 /// lu dans les tags du fichier au scan. Voir l'écriture dans
 /// `analyze_track_batch`.
+///
+/// Jumeau de [`crate::metadata::DR_SOURCE_TAG`], écrit par le scan sur la
+/// valeur qu'il LIT dans le fichier (#3924). Les deux producteurs de
+/// `dr_track` marquent désormais la clef `dr_source` ; sans le second, une
+/// valeur non marquée ne se distinguait pas d'une valeur d'avant la clef.
 const DR_SOURCE_ANALYSIS: &str = "analysis";
 
 /// La plage calculée a-t-elle le droit de s'écrire ?
