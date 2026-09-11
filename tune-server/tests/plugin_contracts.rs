@@ -77,3 +77,10 @@ mod concerts_plugin;
 mod dj_plugin;
 #[path = "plugin_routes.rs"]
 mod plugin_routes;
+// Garde de la couture des FOURNISSEURS de sorties declares par un plugin.
+// Rattachee ici plutot qu en cible propre : `autotests = false` sur ce paquet,
+// donc un fichier non declare n est JAMAIS compile — vert contre rien. Et une
+// cible ajoutee en queue de Cargo.toml se conflicte a chaque lot, le manifeste
+// le dit lui-meme.
+#[path = "plugin_output_provider_seam.rs"]
+mod plugin_output_provider_seam;
