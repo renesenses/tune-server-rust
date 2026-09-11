@@ -397,6 +397,27 @@ impl PlaybackOrchestrator {
                     Some(16u32),
                     Some(2u32),
                 )
+            } else if is_browser_output {
+                // 🔴 #2076 / #2158 generalises — le DERNIER bras direct
+                // (serveur multimedia, podcast) rendait encore l'URL amont
+                // telle quelle, sans regarder si la sortie etait un onglet.
+                //
+                // Le client web reecrit une URL absolue en chemin relatif pour
+                // joindre l'hote qu'il a su atteindre. Sur une URL TIERCE, cela
+                // jette le domaine : l'onglet demande `cdn.exemple.org/…` A
+                // TUNE, qui ne connait pas ce chemin et repond par son repli
+                // SPA — `200 text/html`, « Failed to init decoder ». C'est mot
+                // pour mot la panne de Bilou (#2076, fil 1509), et les deux
+                // autres bras l'ont deja corrigee chacun de leur cote :
+                // Bandcamp par `relayer_bandcamp_au_reseau`, la radio par
+                // #2670, dont le commentaire nomme explicitement la meme cause.
+                //
+                // On relaie donc les octets VERBATIM, comme Bandcamp : aucun
+                // transcodage, la resolution annoncee par l'appelant est
+                // conservee (un ALAC 24 bits d'un NAS ne doit pas se retrouver
+                // etiquete 44,1/16 — Yves), et l'URL rendue est une adresse de
+                // Tune, que le client peut reecrire sans rien casser.
+                self.relayer_direct_au_navigateur(req, d).await
             } else {
                 // Media-server / podcast direct URL. Carry the real resolution the
                 // client passed from the DIDL res@ attributes (e.g. 24-bit ALAC)
@@ -630,6 +651,56 @@ impl PlaybackOrchestrator {
 
     /// Bandcamp vers un renderer réseau ou le navigateur : relais HTTP du flux
     /// HTTPS par une session mandataire, le codec annoncé venant de l'URL.
+    /// Relayer une URL TIERCE vers l'onglet, octet pour octet (#2076).
+    ///
+    /// Meme geste que [`Self::relayer_bandcamp_au_reseau`] — une session proxy
+    /// locale, `create_proxy_session(..., false)` — mais pour le bras generique
+    /// : serveur multimedia (UPnP/DLNA) et podcast.
+    ///
+    /// Rien n'est transcode. Le conteneur annonce est deduit de l'URL, et la
+    /// resolution que l'appelant a portee depuis les attributs `res@` du DIDL
+    /// est conservee telle quelle : c'est ce qui empeche un ALAC 24 bits d'un
+    /// NAS d'etre affiche en 44,1 kHz / 16 bits.
+    async fn relayer_direct_au_navigateur(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
+        let Directe {
+            audio_url,
+            mime_type,
+            duration_ms,
+            ..
+        } = d;
+        let conteneur = conteneur_depuis_url(audio_url, mime_type);
+        let info = StreamInfo {
+            format: conteneur.to_string(),
+            mime_type: mime_type.to_string(),
+            sample_rate: req.sample_rate.unwrap_or(44_100),
+            bit_depth: req.bit_depth.unwrap_or(16),
+            channels: 2,
+            file_size: None,
+            duration_ms: duration_ms.map(|d| d as u64),
+            ..Default::default()
+        };
+        let session_id = self
+            .streamer
+            .create_proxy_session(info, audio_url.to_string(), false)
+            .await;
+        let server_ip = self.server_ip();
+        let stream_url = self
+            .streamer
+            .get_stream_url(&session_id, &server_ip, conteneur);
+        info!(
+            url = %audio_url,
+            conteneur,
+            "direct_proxy_for_browser_output"
+        );
+        (
+            stream_url,
+            Some(session_id),
+            mime_type.to_string(),
+            req.sample_rate,
+            req.bit_depth.map(|b| b as u32),
+            None,
+        )
+    }
     async fn relayer_bandcamp_au_reseau(&self, d: Directe<'_>) -> FluxDirect {
         let Directe {
             audio_url,
@@ -844,5 +915,39 @@ impl PlaybackOrchestrator {
             };
             (direct_url, None, mime_type.to_string(), None, None, None)
         }
+    }
+}
+
+/// Le conteneur a annoncer pour une URL relayee verbatim.
+///
+/// L'extension de l'URL fait foi — c'est elle que le serveur amont a choisie.
+/// Faute d'extension reconnue, on retombe sur ce que dit le type MIME, et en
+/// dernier ressort sur `mp3`, l'encodage le plus repandu sur ces deux chemins
+/// (podcast, serveur multimedia). Le conteneur ne sert qu'a nommer l'extension
+/// de l'adresse rendue : les octets, eux, passent tels quels.
+fn conteneur_depuis_url(url: &str, mime: &str) -> &'static str {
+    let chemin = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
+    for (suffixe, conteneur) in [
+        (".flac", "flac"),
+        (".wav", "wav"),
+        (".m4a", "m4a"),
+        (".mp4", "m4a"),
+        (".aac", "aac"),
+        (".ogg", "ogg"),
+        (".opus", "opus"),
+        (".mp3", "mp3"),
+    ] {
+        if chemin.ends_with(suffixe) {
+            return conteneur;
+        }
+    }
+    match mime {
+        "audio/flac" | "audio/x-flac" => "flac",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => "m4a",
+        "audio/aac" => "aac",
+        "audio/ogg" | "application/ogg" => "ogg",
+        "audio/opus" => "opus",
+        _ => "mp3",
     }
 }

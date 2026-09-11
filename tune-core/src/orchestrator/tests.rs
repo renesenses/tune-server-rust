@@ -6320,6 +6320,96 @@ async fn bandcamp_is_proxied_for_a_browser_zone_without_an_output_device() {
 }
 
 #[tokio::test]
+async fn une_url_tierce_est_relayee_pour_une_zone_navigateur() {
+    // 🔴 #2076 / #2158 GÉNÉRALISÉS — le dernier bras direct (serveur
+    // multimédia, podcast) rendait encore l'URL amont telle quelle.
+    //
+    // Le client web réécrit une URL absolue en chemin relatif pour joindre
+    // l'hôte qu'il a su atteindre. Sur une URL TIERCE, cela jette le domaine :
+    // l'onglet demande le chemin À TUNE, qui répond par son repli SPA —
+    // `200 text/html`, « Failed to init decoder ». Exactement la panne de
+    // Bilou, sur un autre bras que le sien.
+    //
+    // Sabotage : retirer la branche `else if is_browser_output` de
+    // `resolve_direct.rs` fait tomber ce test.
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Ce PC", Some("browser"), None)
+        .unwrap();
+    const AMONT: &str = "http://192.168.1.42:8200/MediaItems/7391.flac";
+    let req = super::PlayRequest {
+        zone_id,
+        output_device_id: None,
+        track_id: None,
+        source: Some("upnp".into()),
+        source_id: Some(AMONT.into()),
+        title: Some("Un titre du NAS".into()),
+        artist_name: None,
+        album_title: None,
+        cover_url: None,
+        duration_ms: Some(212_000),
+        seek_ms: None,
+        temp_file_path: None,
+        sample_rate: Some(96_000),
+        bit_depth: Some(24),
+        media_format: None,
+        track_number: None,
+        disc_number: None,
+    };
+    let resolved = orch.resolve_direct_url(&req).await.unwrap();
+    let stream_id = resolved
+        .stream_id
+        .as_deref()
+        .expect("une zone navigateur doit recevoir une session proxy");
+    assert!(
+        resolved.url.ends_with(&format!("/stream/{stream_id}.flac")),
+        "l'onglet doit tirer le flux depuis Tune, sous la forme que le client \
+         sait réécrire — un seul segment après /stream/ : {}",
+        resolved.url
+    );
+    assert!(
+        !resolved.url.contains("192.168.1.42"),
+        "l'URL du serveur multimédia ne doit plus être rendue au navigateur : {}",
+        resolved.url
+    );
+    assert_eq!(resolved.origin_url.as_deref(), Some(AMONT));
+    // Rien n'est transcodé : la résolution portée par l'appelant survit, sans
+    // quoi un 24 bits du NAS s'afficherait en 44,1 / 16 (Yves).
+    assert_eq!(resolved.sample_rate, Some(96_000));
+    assert_eq!(resolved.bit_depth, Some(24));
+}
+#[tokio::test]
+async fn une_url_tierce_reste_directe_pour_une_sortie_reseau() {
+    // LE TÉMOIN : hors zone navigateur, rien ne bouge. Une sortie réseau
+    // continue de recevoir l'URL amont telle quelle — c'est ce que les
+    // renderers attendent, et interposer un relais là où rien ne le demandait
+    // serait une régression de bande passante et de latence.
+    let orch = test_orchestrator();
+    const AMONT: &str = "http://192.168.1.42:8200/MediaItems/7391.flac";
+    let req = super::PlayRequest {
+        zone_id: 1,
+        output_device_id: Some("dlna:renderer-1".into()),
+        track_id: None,
+        source: Some("upnp".into()),
+        source_id: Some(AMONT.into()),
+        title: Some("Un titre du NAS".into()),
+        artist_name: None,
+        album_title: None,
+        cover_url: None,
+        duration_ms: Some(212_000),
+        seek_ms: None,
+        temp_file_path: None,
+        sample_rate: Some(96_000),
+        bit_depth: Some(24),
+        media_format: None,
+        track_number: None,
+        disc_number: None,
+    };
+    let resolved = orch.resolve_direct_url(&req).await.unwrap();
+    assert_eq!(resolved.url, AMONT);
+    assert!(resolved.stream_id.is_none());
+}
+#[tokio::test]
 async fn bandcamp_is_decoded_to_wav_for_an_oaat_endpoint() {
     // Un endpoint OAAT ne consomme que du PCM en conteneur WAV.
     let orch = test_orchestrator();
