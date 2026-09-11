@@ -1129,7 +1129,8 @@ impl PlaybackOrchestrator {
                 &resolved.title,
                 resolved.artist.as_deref(),
                 habillage.album.as_deref(),
-            );
+            )
+            .await;
         }
 
         // `record_listen` alimente `listen_history`, la statistique locale. Il

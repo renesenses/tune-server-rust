@@ -563,7 +563,8 @@ impl PlaybackOrchestrator {
             &np.title,
             np.artist_name.as_deref(),
             np.album_title.as_deref(),
-        );
+        )
+        .await;
         // Use update_now_playing (not play) to avoid bumping track_generation —
         // the poller must keep its gapless_cooldown intact so it doesn't falsely
         // detect track-end on renderers that briefly report Stopped during

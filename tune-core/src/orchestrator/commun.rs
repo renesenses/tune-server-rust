@@ -526,7 +526,8 @@ impl PlaybackOrchestrator {
             &attente.title,
             attente.artist.as_deref(),
             attente.album.as_deref(),
-        );
+        )
+        .await;
 
         // Même exclusion que le chemin nominal : la radio n'entre pas dans
         // l'historique local (son titre au démarrage est un instantané figé),
