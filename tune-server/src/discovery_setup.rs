@@ -1667,6 +1667,40 @@ pub fn spawn_mdns_handler(
                                     // operant des le tour suivant.
                                     let _ = zone_repo.update_output_device(zid, &dev.id);
                                     info!(name = %dev.name, id = %dev.id, zone_id = zid, "mdns_hidden_zone_reanchored");
+                                } else if let Some((zid, masquee)) = zone_reseau_a_reancrer_par_mac(
+                                    &zone_repo,
+                                    &dev,
+                                    output_type_str,
+                                ) {
+                                    // #3919 — les trois filets par NOM viennent
+                                    // d'echouer ensemble : la zone a ete
+                                    // renommee. Sans ce quatrieme, le flux
+                                    // tombe dans `auto_create` et laisse les
+                                    // reglages sur une ligne orpheline. La MAC,
+                                    // elle, n'a pas bouge.
+                                    //
+                                    // Une zone SUPPRIMEE se re-ancre sans se
+                                    // demasquer, comme au-dessus : la
+                                    // suppression reste une suppression, et le
+                                    // garde-fou `is_device_hidden` redevient
+                                    // operant des le tour suivant.
+                                    let _ = zone_repo.update_output_device(zid, &dev.id);
+                                    let _ = zone_repo.set_identity(
+                                        zid,
+                                        &dev.host,
+                                        dev.mac_address.as_deref(),
+                                    );
+                                    if !masquee {
+                                        set_zone_online(&event_bus, &db, &dev.id, true);
+                                    }
+                                    info!(
+                                        name = %dev.name,
+                                        id = %dev.id,
+                                        zone_id = zid,
+                                        hidden = masquee,
+                                        mac = ?dev.mac_address,
+                                        "mdns_zone_reancree_par_mac"
+                                    );
                                 } else {
                                     // Cross-protocol dedup (forum #1183): the
                                     // same physical device may already be a
@@ -2019,6 +2053,104 @@ fn may_reanchor(
     dev_name: &str,
 ) -> bool {
     legacy_id != new_id && !new_id_taken && zone_name == dev_name
+}
+
+/// Le QUATRIEME filet de re-ancrage : la MAC que la zone porte deja (#3919).
+///
+/// ## Ce qu'il repare
+///
+/// Les trois filets precedents reposent tous, sans exception, sur une egalite
+/// EXACTE de noms : [`may_reanchor`] exige `zone_name == dev_name`, le
+/// rattrapage cherche `z.name == dev.name`, et `find_hidden_id_by_name`
+/// interroge la colonne `name`. Renommer une zone — le geste que tout le monde
+/// fait — les met les trois en defaut D'UN COUP. Au changement d'adresse
+/// suivant, un appareil qui n'annonce aucun identifiant durable (`_raop` ne
+/// publie pas de TXT `deviceid`) se voit offrir une zone NEUVE, et les
+/// reglages restent sur une ligne que plus rien ne relie a l'appareil.
+/// Reproduit de bout en bout sur 0.9.145 : deux lignes pour un seul Mac.
+///
+/// L'identite manquante etait DEJA sur la ligne. `zones.mac` est ecrite a la
+/// creation de la zone par `set_identity`, depuis `dev.mac_address` — pour
+/// l'AirPlay la MAC portee par le nom d'instance `_raop`
+/// (« 764D00C0BD51@Mac Studio »), sinon le TXT `deviceid`/`id`, a defaut la
+/// table ARP. La documentation de `set_identity` la nomme elle-meme « the
+/// durable cross-protocol key: it survives UUID changes AND DHCP
+/// renumbering ». Personne ne la relisait au retour de l'appareil : c'est un
+/// « ecrit mais pas branche », pas un mecanisme absent.
+///
+/// ## Pourquoi la MAC est recevable la ou l'adresse ne l'est pas
+///
+/// La regle de `outputs::identite_de_sortie` s'applique mot pour mot : **un
+/// identifiant qui peut designer un autre appareil physique n'identifie
+/// rien**. `{type}-{host}-{port}` le peut — le 13 aout, le DHCP a donne
+/// l'adresse d'une Apple TV a un Sonos et la zone a suivi. Une MAC, non : un
+/// OUI constructeur est globalement unique, et une MAC localement administree
+/// (Private Wi-Fi Address) est CHOISIE par l'appareil, jamais attribuee a un
+/// tiers. Elle peut changer — faux negatif, on retombe sur l'etat d'avant —
+/// elle ne peut pas pointer ailleurs. C'est l'asymetrie qui tranche, et elle
+/// repond a #1651 par le fond : si le Sonos a pris l'adresse de l'Apple TV,
+/// il annonce SA MAC, la zone « AppleTV14,1 » ne bouge pas.
+///
+/// ## Les quatre refus, chacun nomme
+///
+/// 1. **`nouvel_id_deja_pris`** — l'appareil a deja sa zone sous ce nouvel
+///    identifiant. En deplacer une seconde dessus partagerait la clef, et
+///    l'index unique partiel `idx_zones_output_device_id` la refuserait.
+/// 2. **Un autre protocole** — un Eversolo DMP-A8 est DLNA *et* AirPlay :
+///    deux sorties REELLES pour une seule MAC. Les reunir serait une FUSION
+///    de zones, pas une re-association (#3747).
+/// 3. **Plusieurs zones du meme type sur cette MAC** — les departager serait
+///    un tirage au sort.
+/// 4. **`type_decouvert` vide** — sans type, la comparaison ne distingue
+///    plus rien et rapprocherait n'importe quelle ligne a `output_type` NULL.
+///
+/// ## Ou il se place, et pourquoi la
+///
+/// APRES les trois filets par nom, AVANT le refus pour conflit de protocole
+/// et la creation automatique : il ne prend donc jamais la place d'un
+/// rattrapage qui fonctionne aujourd'hui, il n'agit que la ou le flux allait
+/// creer un doublon ou ne rien faire du tout.
+fn zone_a_reancrer_par_mac(
+    candidats: &[tune_core::db::zone_repo::ZoneParMac],
+    nouvel_id: &str,
+    nouvel_id_deja_pris: bool,
+    type_decouvert: &str,
+) -> Option<(i64, bool)> {
+    if nouvel_id_deja_pris || type_decouvert.is_empty() {
+        return None;
+    }
+    let mut du_bon_type = candidats.iter().filter(|z| {
+        z.output_type.eq_ignore_ascii_case(type_decouvert) && z.output_device_id != nouvel_id
+    });
+    let seule = du_bon_type.next()?;
+    if du_bon_type.next().is_some() {
+        return None;
+    }
+    Some((seule.id, seule.masquee))
+}
+
+/// [`zone_a_reancrer_par_mac`] branchee sur la base — meme partage que
+/// `legacy_zone_to_reanchor` / `may_reanchor` : la regle reste pure et
+/// eprouvable, la base ne fait qu'apporter les candidats.
+///
+/// `normalize_mac` sert ici de VALIDATION autant que de canonicalisation :
+/// `dev.mac_address` peut porter un identifiant opaque qui n'est pas une MAC
+/// (le TXT `id` d'un Chromecast est un UUID, et la table ARP peut n'avoir rien
+/// rendu). Un tel identifiant ne passe pas la regle du module, donc le filet
+/// ne s'arme pas — et ces appareils-la annoncent de toute facon un
+/// `stable_id`, donc un `output_device_id` qui ne contient aucune adresse.
+fn zone_reseau_a_reancrer_par_mac(
+    zone_repo: &tune_core::db::zone_repo::ZoneRepo,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+    type_decouvert: &str,
+) -> Option<(i64, bool)> {
+    let mac = tune_core::discovery::mac::normalize_mac(dev.mac_address.as_deref()?)?;
+    let candidats = zone_repo.zones_par_mac(&mac);
+    if candidats.is_empty() {
+        return None;
+    }
+    let deja_pris = matches!(zone_repo.get_by_device_id(&dev.id), Ok(Some(_)));
+    zone_a_reancrer_par_mac(&candidats, &dev.id, deja_pris, type_decouvert)
 }
 
 /// Pourquoi chaque fournisseur de sortie hors-arbre est actif ou inerte.
@@ -3867,6 +3999,258 @@ mod appareils_ignores_1280 {
             repo.list().unwrap().len(),
             1,
             "après déblocage, l'appareil revient au scan suivant"
+        );
+    }
+}
+
+/// #3919 — la zone RENOMMEE qui perd sa configuration au changement d'adresse.
+///
+/// Reproduit de bout en bout sur 0.9.145 : une zone AirPlay renommee « Salon
+/// (essai Matteo) », un appareil qui n'annonce aucun TXT `deviceid`, mDNS qui
+/// choisit l'autre adresse au redemarrage — et deux lignes pour un seul Mac,
+/// la configuration restee sur celle que plus rien ne relie a l'appareil.
+///
+/// Ces temoins tournent dans le job `Test` de la CI : la ligne nomme
+/// `-p tune-server`, et rien ici n'est derriere `local-audio`.
+#[cfg(test)]
+mod reancrage_par_mac {
+    use super::{zone_a_reancrer_par_mac, zone_reseau_a_reancrer_par_mac};
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::zone_repo::{ZoneParMac, ZoneRepo};
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    /// Relevee a `avahi-browse -rtp` le 11/09 : nom d'instance `_raop`
+    /// « 764D00C0BD51@Mac Studio », donc aucune adresse dedans.
+    const MAC_STUDIO: &str = "76:4D:00:C0:BD:51";
+    const MAC_APPLE_TV: &str = "BA:C9:C4:56:04:E8";
+    const MAC_SONOS: &str = "94:9F:3E:11:22:33";
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn appareil(id: &str, nom: &str, host: &str, mac: &str) -> DiscoveredDevice {
+        let mut dev = DiscoveredDevice::new(
+            id.to_string(),
+            nom.to_string(),
+            OutputType::Airplay,
+            host.to_string(),
+            7000,
+        );
+        dev.mac_address = Some(mac.to_string());
+        dev
+    }
+
+    fn candidat(id: i64, device_id: &str, output_type: &str, masquee: bool) -> ZoneParMac {
+        ZoneParMac {
+            id,
+            output_device_id: device_id.to_string(),
+            output_type: output_type.to_string(),
+            masquee,
+        }
+    }
+
+    #[test]
+    fn une_zone_renommee_retrouve_son_appareil_a_une_autre_adresse_par_sa_mac() {
+        let repo = ZoneRepo::with_backend(base());
+        let (zid, creee) = repo
+            .get_or_create("Mac13,1", Some("airplay"), "airplay-192.168.1.24-7000")
+            .unwrap();
+        assert!(creee, "la zone d'essai doit etre creee");
+        // Ce que la decouverte ecrit deja aujourd'hui a la creation.
+        repo.set_identity(zid, "192.168.1.24", Some(MAC_STUDIO))
+            .unwrap();
+        // Le geste que tout le monde fait, et qui met les TROIS filets par nom
+        // en defaut d'un coup.
+        repo.update_name(zid, "Salon (essai Matteo)").unwrap();
+
+        let revenu = appareil(
+            "airplay-192.168.1.41-7000",
+            "Mac13,1",
+            "192.168.1.41",
+            MAC_STUDIO,
+        );
+
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &revenu, "airplay"),
+            Some((zid, false)),
+            "la zone renommee doit retrouver son appareil par la MAC que sa \
+             ligne porte DEJA : sans ce filet la decouverte cree une zone \
+             NEUVE a cote, et les reglages restent sur une ligne orpheline \
+             (#3919, reproduit sur 0.9.145)"
+        );
+    }
+
+    #[test]
+    fn un_autre_appareil_ne_capture_pas_la_zone_quand_sa_mac_differe() {
+        // #1651 rejoue. Le 13/08 le DHCP a donne l'adresse de l'Apple TV a un
+        // Sonos et la zone « AppleTV14,1 » l'a suivi. Le Sonos annonce SA MAC :
+        // le filet se refuse tout seul, sans dependre du nom que
+        // l'utilisateur a tape.
+        let repo = ZoneRepo::with_backend(base());
+        let (zid, _) = repo
+            .get_or_create("AppleTV14,1", Some("airplay"), "airplay-192.168.1.37-7000")
+            .unwrap();
+        repo.set_identity(zid, "192.168.1.37", Some(MAC_APPLE_TV))
+            .unwrap();
+
+        let sonos = appareil(
+            "airplay-192.168.1.55-7000",
+            "Chambre",
+            "192.168.1.55",
+            MAC_SONOS,
+        );
+
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &sonos, "airplay"),
+            None,
+            "une MAC differente ne doit RIEN rapprocher : c'est l'Apple TV \
+             detournee sur le Sonos (#1651) qu'on refuse ici"
+        );
+    }
+
+    #[test]
+    fn une_zone_supprimee_se_reancre_sans_se_demasquer() {
+        let repo = ZoneRepo::with_backend(base());
+        let (zid, _) = repo
+            .get_or_create("Mac13,1", Some("airplay"), "airplay-192.168.1.24-7000")
+            .unwrap();
+        repo.set_identity(zid, "192.168.1.24", Some(MAC_STUDIO))
+            .unwrap();
+        repo.update_name(zid, "Salon (essai Matteo)").unwrap();
+        repo.delete(zid).unwrap();
+
+        let revenu = appareil(
+            "airplay-192.168.1.41-7000",
+            "Mac13,1",
+            "192.168.1.41",
+            MAC_STUDIO,
+        );
+
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &revenu, "airplay"),
+            Some((zid, true)),
+            "une zone SUPPRIMEE doit etre rendue comme masquee : l'appelant la \
+             re-ancre sans la demasquer, sinon la suppression de \
+             l'utilisateur est defaite au changement d'adresse suivant"
+        );
+    }
+
+    #[test]
+    fn deux_zones_de_meme_type_sur_la_meme_mac_ne_sont_pas_departagees() {
+        let candidats = [
+            candidat(3, "airplay-192.168.1.24-7000", "airplay", false),
+            candidat(8, "airplay-192.168.1.31-7000", "airplay", false),
+        ];
+        assert_eq!(
+            zone_a_reancrer_par_mac(&candidats, "airplay-192.168.1.41-7000", false, "airplay"),
+            None,
+            "deux zones revendiquant la meme MAC : en choisir une serait un \
+             tirage au sort, et le mauvais tirage envoie le son dans l'autre \
+             piece"
+        );
+    }
+
+    #[test]
+    fn la_zone_dlna_du_meme_appareil_nest_pas_une_reassociation_airplay() {
+        // L'Eversolo DMP-A8 est DLNA *et* AirPlay : deux sorties REELLES pour
+        // une seule MAC. Les reunir serait une FUSION de zones (#3747).
+        let candidats = [candidat(5, "uuid:9C41535E-0000-1000", "dlna", false)];
+        assert_eq!(
+            zone_a_reancrer_par_mac(&candidats, "airplay-192.168.1.17-5500", false, "airplay"),
+            None,
+            "une zone d'un AUTRE protocole sur la meme MAC n'est pas la meme \
+             sortie : la rapprocher serait une fusion de zones, pas une \
+             re-association (#3747)"
+        );
+    }
+
+    #[test]
+    fn une_zone_existe_deja_sous_le_nouvel_identifiant_rien_ne_bouge() {
+        let candidats = [candidat(3, "airplay-192.168.1.24-7000", "airplay", false)];
+        assert_eq!(
+            zone_a_reancrer_par_mac(&candidats, "airplay-192.168.1.41-7000", true, "airplay"),
+            None,
+            "l'appareil a deja sa zone sous ce nouvel identifiant : en \
+             deplacer une seconde dessus partagerait la clef, et l'index \
+             unique partiel idx_zones_output_device_id la refuserait"
+        );
+    }
+
+    #[test]
+    fn un_identifiant_opaque_qui_nest_pas_une_mac_narme_pas_le_filet() {
+        // Le TXT `id` d'un Chromecast est un UUID que `enrich_identity` range
+        // dans `mac_address` quand la table ARP n'a rien rendu. Il n'entre pas
+        // dans la regle — et ces appareils-la annoncent de toute facon un
+        // `stable_id`, donc un identifiant sans adresse dedans.
+        let repo = ZoneRepo::with_backend(base());
+        let (zid, _) = repo
+            .get_or_create("Salon", Some("airplay"), "airplay-192.168.1.24-7000")
+            .unwrap();
+        repo.set_identity(zid, "192.168.1.24", Some("a8f3c1de9b7045"))
+            .unwrap();
+        let mut revenu = appareil(
+            "airplay-192.168.1.41-7000",
+            "Salon",
+            "192.168.1.41",
+            MAC_STUDIO,
+        );
+        revenu.mac_address = Some("a8f3c1de9b7045".to_string());
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &revenu, "airplay"),
+            None,
+            "un identifiant qui n'est pas une MAC ne passe pas la regle : le \
+             filet doit rester desarme plutot que de rapprocher sur une \
+             chaine dont on ne sait pas ce qu'elle designe"
+        );
+    }
+
+    /// « Ecrit mais pas branche » est le defaut le plus cher de ce depot.
+    /// Ici l'ordre compte autant que l'appel : consulter la MAC APRES la
+    /// creation automatique ne trouverait plus qu'un doublon a contempler.
+    ///
+    /// ⚠️ Ce fichier est inclus en ENTIER, ce module compris. Les motifs sont
+    /// donc assembles a la compilation, sinon le garde se trouverait
+    /// LUI-MEME et resterait vrai quoi qu'il arrive (#2082).
+    #[test]
+    fn le_filet_par_mac_est_consulte_avant_la_creation_automatique() {
+        const SOURCE: &str = include_str!("discovery_setup.rs");
+        let filets_par_nom = concat!("mdns_hidden_zone_", "reanchored");
+        let appel = concat!("zone_reseau_a_reancrer_par_", "mac(");
+        let creation = concat!("mdns_zone_auto_", "created");
+
+        let apres_les_noms = SOURCE.find(filets_par_nom).unwrap_or_else(|| {
+            panic!(
+                "le filet par nom des zones masquees a disparu : ce garde ne \
+                 garde plus rien tant qu'il n'a pas suivi"
+            )
+        });
+        let pos_creation = SOURCE.find(creation).unwrap_or_else(|| {
+            panic!(
+                "le gestionnaire mDNS ne cree plus de zone automatiquement : \
+                 ce garde ne garde plus rien tant qu'il n'a pas suivi"
+            )
+        });
+        let pos_appel = SOURCE[apres_les_noms..]
+            .find(appel)
+            .map(|i| i + apres_les_noms)
+            .unwrap_or_else(|| {
+                panic!(
+                    "le gestionnaire mDNS ne consulte pas la MAC apres les \
+                     filets par nom : une zone RENOMMEE y recevra une zone \
+                     NEUVE a chaque changement d'adresse, reglages laisses \
+                     sur une ligne orpheline (#3919)"
+                )
+            });
+        assert!(
+            pos_appel < pos_creation,
+            "le filet par MAC est consulte APRES la creation automatique : la \
+             zone neuve est deja la, et la re-association n'a plus qu'un \
+             doublon a contempler (#3919)"
         );
     }
 }
