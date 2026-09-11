@@ -1535,6 +1535,64 @@ pub async fn register_local_outputs(state: &AppState) {
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
+        // créer quoi que ce soit.
+        //
+        // Une zone locale est identifiée par `local:{nom}`. Quand le pilote
+        // renomme l'endpoint — Windows le fait au changement de taux
+        // d'échantillonnage — la boucle ci-dessous ne reconnaît plus
+        // `local:{nouveau nom}` et offre à l'appareil une zone NEUVE, à côté
+        // de l'ancienne restée orpheline avec tous ses réglages. Cette passe
+        // fait suivre la zone à son appareil, par l'identifiant d'endpoint
+        // stable qu'elle a enregistré.
+        //
+        // La RÈGLE est ailleurs — `outputs::identite_de_sortie`, une fonction
+        // pure : liste BLANCHE de backends (WASAPI et CoreAudio seulement, cf.
+        // sa table), quatre refus nommés, aucune fusion de zones. Ici on ne
+        // fait que lui donner le parc et journaliser ce qu'elle a décidé.
+        //
+        // ⚠️ Elle ne fait pas revenir un appareil DÉBRANCHÉ : un périphérique
+        // absent de `devices` reste introuvable, identifiant ou pas.
+        let parc_pour_identite: Vec<tune_core::outputs::identite_de_sortie::SortieEnumeree> =
+            devices
+                .iter()
+                .map(
+                    |dev| tune_core::outputs::identite_de_sortie::SortieEnumeree {
+                        nom: dev.name.clone(),
+                        endpoint_id: dev.endpoint_id.clone(),
+                    },
+                )
+                .collect();
+        match zone_repo.appliquer_identite_de_sortie(&parc_pour_identite) {
+            Ok(rapport) => {
+                for r in &rapport.reassociees {
+                    info!(
+                        zone_id = r.zone_id,
+                        ancien = %r.ancien_device_id,
+                        nouveau = %r.nouveau_device_id,
+                        endpoint_id = %r.endpoint_id,
+                        "zone_locale_reassociee_par_identifiant_stable"
+                    );
+                }
+                // Les refus sont DITS. Une zone qui ne retrouve pas son
+                // appareil alors qu'elle en connaît l'identifiant est
+                // exactement ce qu'un rapport de bogue doit pouvoir nommer.
+                for (zone_id, motif) in &rapport.refus {
+                    warn!(
+                        zone_id,
+                        motif = %motif,
+                        "reassociation_de_zone_locale_refusee"
+                    );
+                }
+                if !rapport.apprises.is_empty() {
+                    info!(
+                        zones = rapport.apprises.len(),
+                        "identifiant_de_sortie_locale_appris"
+                    );
+                }
+            }
+            Err(e) => warn!(error = %e, "identite_de_sortie_locale_non_appliquee"),
+        }
         // #3529 : lecture unique, portée par `ZoneRepo`. Ce chemin-ci garde sa
         // règle propre — `local_zone_action` autorise la sortie système par
         // défaut, c'est le sens de #1770 — mais il ne relit plus le réglage

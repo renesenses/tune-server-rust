@@ -164,6 +164,9 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_seen_at TEXT",
+    // #2269 — l'identifiant d'endpoint stable d'une sortie locale. TEXT des
+    // deux cotes, NULL pour l'existant : rien a rattraper en parite de types.
+    "ALTER TABLE zones ADD COLUMN IF NOT EXISTS output_endpoint_id TEXT",
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_fingerprint TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT",
     // BIGINT, pas TEXT : `albums.id` est BIGINT, et la jointure de « Continuer

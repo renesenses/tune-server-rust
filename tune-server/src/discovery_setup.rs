@@ -387,7 +387,7 @@ pub fn spawn_ssdp_handler(
                     if est_notre_propre_serveur_multimedia(
                         &ms,
                         config.port,
-                        &nos_adresses(),
+                        &nos_adresses(config.advertised_ip.as_deref()),
                         notre_udn.as_deref(),
                     ) {
                         // INFO, pas DEBUG : ce rideau RETIRE une entree de la
@@ -582,10 +582,11 @@ fn est_notre_propre_serveur_multimedia(
 /// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et
 /// les formes locales, qu'un M-SEARCH émis depuis la machine elle-même peut
 /// nous renvoyer.
-fn nos_adresses() -> Vec<String> {
+fn nos_adresses(annoncee: Option<&str>) -> Vec<String> {
     nos_adresses_depuis(
         &tune_core::discovery::ssdp::local_ipv4_addresses(),
         tune_core::discovery::ssdp::get_local_ip(),
+        annoncee,
     )
 }
 
@@ -600,12 +601,31 @@ fn nos_adresses() -> Vec<String> {
 fn nos_adresses_depuis(
     interfaces: &[std::net::Ipv4Addr],
     elue: Option<std::net::Ipv4Addr>,
+    annoncee: Option<&str>,
 ) -> Vec<String> {
     let mut v = vec!["127.0.0.1".to_string(), "localhost".to_string()];
     for ip in interfaces.iter().copied().chain(elue) {
         let s = ip.to_string();
         if !v.contains(&s) {
             v.push(s);
+        }
+    }
+    // #3867 — l'adresse ANNONCEE est une reponse de plus a « quelle est mon
+    // adresse ? », et c'est celle que nos annonces portent reellement :
+    // `upnp_server::current_advert_ip` et `upnp_renderer` publient
+    // `advertised_ip` quand il est pose, PAS l'adresse elue par la sonde UDP.
+    // Elle n'a aucune raison de figurer dans `local_ipv4_addresses()` — c'est
+    // meme son objet : on la pose justement quand l'autodetection se trompe
+    // (multi-domicilie, VPN, pont Docker, NAT de conteneur).
+    //
+    // Sans elle, nos propres annonces reviennent sous une adresse que nous ne
+    // reconnaissons pas : le rideau `est_notre_propre_renderer` laisse passer
+    // nos facades, et Tune se recree ses zones « {zone} (Tune) » — le defaut
+    // meme de #3688, rouvert par le seul fait d'avoir configure une adresse.
+    if let Some(ip) = annoncee.map(str::trim).filter(|ip| !ip.is_empty()) {
+        let ip = ip.to_string();
+        if !v.contains(&ip) {
+            v.push(ip);
         }
     }
     v
@@ -651,7 +671,12 @@ async fn handle_ssdp_discovered(
 
     // Nos propres zones publiées : on ne se découvre pas soi-même.
     if let Some(loc) = dev.location.as_deref()
-        && est_notre_propre_renderer(loc, dev.port, config.port, &nos_adresses())
+        && est_notre_propre_renderer(
+            loc,
+            dev.port,
+            config.port,
+            &nos_adresses(config.advertised_ip.as_deref()),
+        )
     {
         debug!(
             id = %dev.id,
@@ -1099,7 +1124,7 @@ pub async fn reregister_known_renderers(state: &AppState) {
     // continuerait à sonder nos propres adresses à chaque démarrage, pour des
     // zones souvent supprimées depuis. Le magasin se soigne, comme il le fait
     // déjà pour les doublons par UDN.
-    let a_nous = nos_adresses();
+    let a_nous = nos_adresses(state.config.advertised_ip.as_deref());
     let port_api = state.config.port;
     let stored_len = stored.len();
     let stored: Vec<KnownRenderer> = stored
@@ -3202,7 +3227,7 @@ mod tests {
                 Ipv4Addr::new(172, 17, 0, 1),
             ];
             // L'élue est l'une d'elles : c'est le cas nominal.
-            let nous = super::super::nos_adresses_depuis(&interfaces, Some(interfaces[0]));
+            let nous = super::super::nos_adresses_depuis(&interfaces, Some(interfaces[0]), None);
 
             for ip in &interfaces {
                 let loc = format!("http://{ip}:8888/upnp/renderer/1/description.xml");
@@ -3221,12 +3246,61 @@ mod tests {
             assert_eq!(tri.len(), nous.len(), "doublons dans nos adresses");
         }
 
+        /// #3867 — l'adresse ANNONCÉE fait partie de nos adresses.
+        ///
+        /// `advertised_ip` existe précisément pour les hôtes où l'autodétection
+        /// se trompe : elle n'est donc PAS dans `local_ipv4_addresses()`, et
+        /// l'élue de la sonde UDP est une AUTRE adresse. Or c'est elle que nos
+        /// annonces portent (`upnp_server::current_advert_ip`). Sans elle ici,
+        /// nos propres façades reviennent méconnaissables et Tune recrée les
+        /// zones « (Tune) » de #3688 — sur le seul fait d'avoir configuré une
+        /// adresse.
+        #[test]
+        fn l_adresse_annoncee_compte_pour_nous() {
+            use std::net::Ipv4Addr;
+            // L'hôte est multi-domicilié : la sonde UDP élit le tunnel, et
+            // l'exploitant a posé l'adresse du LAN dans `advertised_ip`.
+            let interfaces = [Ipv4Addr::new(10, 8, 0, 2), Ipv4Addr::new(172, 17, 0, 1)];
+            let nous = super::super::nos_adresses_depuis(
+                &interfaces,
+                Some(interfaces[0]),
+                Some("192.168.1.41"),
+            );
+            let loc = "http://192.168.1.41:8888/upnp/renderer/1/description.xml";
+            assert!(
+                est_notre_propre_renderer(loc, 8888, 8888, &nous),
+                "notre propre façade annoncée sous advertised_ip doit être \
+                 reconnue : sinon Tune se redécouvre et recrée les zones \
+                 « (Tune) » de #3688 (#3867)"
+            );
+            // Et un voisin sur le même LAN reste pilotable.
+            let voisin = "http://192.168.1.77:8888/upnp/renderer/2/description.xml";
+            assert!(
+                !est_notre_propre_renderer(voisin, 8888, 8888, &nous),
+                "élargir la liste ne doit pas avaler un autre serveur Tune"
+            );
+            // Aucune adresse en double si l'annoncée est déjà énumérée.
+            let deja = super::super::nos_adresses_depuis(
+                &[Ipv4Addr::new(192, 168, 1, 41)],
+                None,
+                Some("192.168.1.41"),
+            );
+            assert_eq!(
+                deja.iter().filter(|a| *a == "192.168.1.41").count(),
+                1,
+                "l'adresse annoncée déjà énumérée ne doit pas être ajoutée deux fois"
+            );
+            // Une valeur vide ou blanche ne vaut pas une adresse.
+            let vide = super::super::nos_adresses_depuis(&[], None, Some("  "));
+            assert_eq!(vide, vec!["127.0.0.1".to_string(), "localhost".to_string()]);
+        }
         /// Ceinture et bretelles : énumération vide (conteneur sans droits sur
         /// les interfaces), l'élue reste une réponse valable.
         #[test]
         fn sans_enumeration_lelue_suffit_encore() {
             use std::net::Ipv4Addr;
-            let nous = super::super::nos_adresses_depuis(&[], Some(Ipv4Addr::new(192, 168, 1, 10)));
+            let nous =
+                super::super::nos_adresses_depuis(&[], Some(Ipv4Addr::new(192, 168, 1, 10)), None);
             let loc = "http://192.168.1.10:8888/upnp/renderer/1/description.xml";
             assert!(est_notre_propre_renderer(loc, 8888, 8888, &nous));
         }
@@ -3238,6 +3312,7 @@ mod tests {
             use std::net::Ipv4Addr;
             let nous = super::super::nos_adresses_depuis(
                 &[Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(172, 17, 0, 1)],
+                None,
                 None,
             );
             let loc = "http://192.168.1.77:8888/upnp/renderer/2/description.xml";

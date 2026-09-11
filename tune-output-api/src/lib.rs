@@ -373,9 +373,17 @@ pub struct OutputDspMetrics {
 ///
 /// « Famine » désigne ici une chose précise et une seule : le pilote a réclamé
 /// N échantillons au rappel, l'anneau en a rendu moins, et le manque a été
-/// comblé par des **zéros**. C'est un trou audible, et c'est le seul chiffre
-/// qui dise que l'audio a réellement sauté — quelle qu'en soit la cause :
-/// ordonnancement du noyau, réseau, décodage ou convolution.
+/// comblé par des **zéros**. C'est un trou audible, et il dit que le
+/// PRODUCTEUR n'a pas suivi : réseau, décodage ou convolution.
+///
+/// 🔴 **Il ne dit RIEN de l'ordonnancement du noyau**, contrairement à ce que
+/// ce commentaire a affirmé jusqu'ici. Quand le noyau réveille le fil de
+/// sortie trop tard, ALSA a déjà sous-alimenté le DAC ; cpal signale
+/// `StreamError::BufferUnderrun`, recouvre, et **saute le rappel de données**
+/// (`cpal/src/host/alsa/mod.rs`, branche `PollDescriptorsFlow::XRun`). Le
+/// rappel n'est jamais appelé, l'anneau est resté PLEIN, et `events` ne bouge
+/// pas d'un cran pendant que le DAC encaisse un trou. Le chiffre qui voit
+/// cet incident-là est [`driver_underruns`](Self::driver_underruns).
 ///
 /// ⚠️ **À ne pas confondre avec l'« underrun » ALSA** que cpal remonte en
 /// `StreamError` et que `make_stream_error_cb` laisse délibérément passer sans
@@ -401,6 +409,23 @@ pub struct OutputRingStarvation {
     /// Échantillons entrelacés réclamés par le pilote depuis le démarrage.
     /// Dénominateur de `missing_samples`.
     pub served_samples: u64,
+    /// Sous-alimentations du PILOTE depuis le démarrage du flux (#3205).
+    ///
+    /// Le pilote a réclamé des échantillons et le processus n'était pas là
+    /// pour les fournir : le fil de sortie n'a pas été ordonnancé à temps.
+    /// C'est LE chiffre qui décide du sort du noyau `PREEMPT_RT` de Tune OS —
+    /// s'il reste à zéro une heure de lecture sur noyau standard, le noyau RT
+    /// est un coût sans gain, et le Secure Boot revient.
+    ///
+    /// Jamais additionné à `events` : les deux décrivent des pannes disjointes
+    /// et une somme ne s'interpréterait plus (voir l'avertissement du type).
+    ///
+    /// `serde(default)` : cette structure est le contrat des greffons de sortie
+    /// HORS ARBRE. Un relevé sérialisé par un greffon construit avant ce champ
+    /// doit continuer à se relire — sans quoi l'ajout casserait les greffons
+    /// tiers, et en silence.
+    #[serde(default)]
+    pub driver_underruns: u64,
     /// Durée d'audio écoulée depuis le démarrage du flux, en millisecondes,
     /// déduite de `served_samples` et de la cadence (taux × canaux).
     ///
@@ -435,6 +460,10 @@ pub struct RingStarvation {
     events: AtomicU64,
     missing_samples: AtomicU64,
     served_samples: AtomicU64,
+    /// Sous-alimentations du pilote (#3205). Alimenté par le rappel d'ERREUR
+    /// du backend, pas par le rappel de données — c'est tout l'intérêt : sur
+    /// un XRun, le rappel de données n'est pas appelé.
+    driver_underruns: AtomicU64,
     /// Échantillons entrelacés par seconde (taux × canaux). Posé hors du
     /// rappel par [`begin_stream`](Self::begin_stream).
     samples_per_second: AtomicU32,
@@ -452,6 +481,7 @@ impl RingStarvation {
         self.events.store(0, Ordering::Relaxed);
         self.missing_samples.store(0, Ordering::Relaxed);
         self.served_samples.store(0, Ordering::Relaxed);
+        self.driver_underruns.store(0, Ordering::Relaxed);
         self.samples_per_second.store(
             sample_rate.saturating_mul(u32::from(channels)),
             Ordering::Relaxed,
@@ -483,6 +513,25 @@ impl RingStarvation {
         }
     }
 
+    /// Comptabiliser UNE sous-alimentation du pilote, telle que le backend la
+    /// remonte dans son rappel d'ERREUR (#3205).
+    ///
+    /// Volontairement séparé de [`record`](Self::record) : sur un XRun ALSA,
+    /// cpal saute le rappel de données, donc `record` n'est PAS appelé et
+    /// l'anneau paraît sain. Sans ce compteur-ci, un incident d'ordonnancement
+    /// ne laisse aucune trace chiffrée.
+    ///
+    /// Même contrat temps réel que `record` : un seul atomique `Relaxed`, rien
+    /// d'autre. Le rappel d'erreur tourne sur le fil de sortie du backend.
+    ///
+    /// Pas de garde `armed` ici, contrairement à `record` : un XRun ne peut pas
+    /// se produire avant que le pilote ait commencé à tirer des données, donc
+    /// il n'y a pas de silence de démarrage à écarter.
+    #[inline]
+    pub fn record_driver_underrun(&self) {
+        self.driver_underruns.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Relevé hors chemin temps réel.
     pub fn snapshot(&self) -> OutputRingStarvation {
         let served = self.served_samples.load(Ordering::Relaxed);
@@ -491,12 +540,132 @@ impl RingStarvation {
             events: self.events.load(Ordering::Relaxed),
             missing_samples: self.missing_samples.load(Ordering::Relaxed),
             served_samples: served,
+            driver_underruns: self.driver_underruns.load(Ordering::Relaxed),
             stream_ms: if cadence == 0 {
                 0
             } else {
                 served.saturating_mul(1000) / cadence
             },
         }
+    }
+}
+
+/// #3205 — la sous-alimentation du PILOTE et la famine de l'ANNEAU sont deux
+/// pannes disjointes, et le compteur doit les garder disjointes.
+///
+/// Ce module est EXÉCUTÉ à chaque PR : `tune-output-api` figure dans le `-p` du
+/// job `Test` de `ci.yml` et ne porte aucune feature. C'est délibéré — le
+/// câblage côté `local.rs` vit derrière `local-audio`, que ce job n'active pas,
+/// et n'est donc gardé que par un témoin de TEXTE
+/// (`tune-server/tests/famine_pilote_3205.rs`). Le contrat du compteur, lui,
+/// se teste pour de vrai, ici.
+#[cfg(test)]
+mod famine_pilote_3205 {
+    use super::*;
+
+    /// Le scénario exact d'un incident d'ORDONNANCEMENT, tel que cpal le
+    /// produit : le noyau réveille le fil de sortie trop tard, ALSA a déjà
+    /// sous-alimenté le DAC, cpal signale l'erreur, recouvre — et **saute le
+    /// rappel de données**. L'anneau, lui, est resté PLEIN.
+    ///
+    /// C'est la raison d'être de ce compteur : avant lui, cet incident-là ne
+    /// laissait aucun chiffre derrière lui, et c'est pourtant le seul qui
+    /// puisse décider du noyau `PREEMPT_RT` de Tune OS.
+    #[test]
+    fn un_incident_d_ordonnancement_ne_touche_pas_la_famine_de_l_anneau() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+
+        // Le flux tourne, l'anneau sert tout ce qu'on lui demande.
+        compteur.record(1_024, 1_024);
+        compteur.record(1_024, 1_024);
+
+        // XRun : cpal appelle le rappel d'ERREUR, jamais le rappel de données.
+        compteur.record_driver_underrun();
+
+        let releve = compteur.snapshot();
+        assert_eq!(
+            releve.driver_underruns, 1,
+            "la sous-alimentation du pilote n'est pas comptée : un trou audible              d'origine ordonnancement ne laisse aucune trace chiffrée, et #3205              redevient immesurable"
+        );
+        assert_eq!(
+            releve.events, 0,
+            "l'incident du PILOTE a été compté comme une famine de l'ANNEAU. Les              deux pannes sont disjointes — producteur en retard d'un côté,              processus pas ordonnancé de l'autre — et les confondre rend le              chiffre ininterprétable, donc inutile à l'arbitrage du noyau RT"
+        );
+        assert_eq!(
+            releve.missing_samples, 0,
+            "aucun échantillon n'a manqué DANS L'ANNEAU : le rappel de données              n'a même pas été appelé"
+        );
+    }
+
+    /// La réciproque : un producteur en retard ne doit pas gonfler le compteur
+    /// du pilote. Sans cette moitié, fusionner les deux compteurs passerait.
+    #[test]
+    fn une_famine_d_anneau_ne_compte_aucune_sous_alimentation_du_pilote() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+        compteur.record(1_024, 1_024);
+        compteur.record(1_024, 300);
+
+        let releve = compteur.snapshot();
+        assert_eq!(releve.events, 1);
+        assert_eq!(releve.missing_samples, 724);
+        assert_eq!(
+            releve.driver_underruns, 0,
+            "une famine de l'ANNEAU a été comptée comme une sous-alimentation du              PILOTE : le chiffre qui décide du noyau RT se met à monter quand              c'est le réseau ou le décodage qui est en retard"
+        );
+    }
+
+    /// Un flux neuf repart de zéro. #3205 veut un TAUX par heure de lecture ;
+    /// un compteur qui cumule des pistes sans rapport ne se compare à rien.
+    #[test]
+    fn un_flux_neuf_remet_le_compteur_du_pilote_a_zero() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+        compteur.record(512, 512);
+        compteur.record_driver_underrun();
+        compteur.record_driver_underrun();
+        assert_eq!(compteur.snapshot().driver_underruns, 2);
+
+        compteur.begin_stream(48_000, 2);
+        assert_eq!(
+            compteur.snapshot().driver_underruns,
+            0,
+            "un flux neuf hérite des sous-alimentations du précédent : le taux              par heure de lecture cumule des pistes sans rapport"
+        );
+    }
+
+    /// Le chiffre doit SORTIR. Un compteur que la route ne publie pas ne mesure
+    /// rien pour le testeur qui colle son rapport de diagnostic sur le forum —
+    /// et c'est ce rapport, sur un parc réel, qui doit trancher #3205.
+    #[test]
+    fn le_compteur_du_pilote_est_serialise_et_tolere_un_releve_ancien() {
+        let releve = OutputRingStarvation {
+            events: 0,
+            missing_samples: 0,
+            served_samples: 1,
+            driver_underruns: 7,
+            stream_ms: 0,
+        };
+        let json = serde_json::to_value(releve).unwrap();
+        assert_eq!(
+            json["driver_underruns"], 7,
+            "le compteur n'atteint pas la route : invisible dans le rapport de              diagnostic, donc inexistant pour la mesure"
+        );
+
+        // Un greffon de sortie hors arbre, construit avant ce champ, sérialise
+        // un relevé sans lui. Il doit continuer à se relire.
+        let ancien: OutputRingStarvation = serde_json::from_value(serde_json::json!({
+            "events": 3,
+            "missing_samples": 12,
+            "served_samples": 400,
+            "stream_ms": 9,
+        }))
+        .expect(
+            "un relevé produit par un greffon antérieur à ce champ ne se relit              plus : l'ajout casse les greffons de sortie hors arbre",
+        );
+        assert_eq!(ancien.driver_underruns, 0);
+        assert_eq!(ancien.events, 3);
     }
 }
 

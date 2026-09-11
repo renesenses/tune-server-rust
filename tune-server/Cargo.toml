@@ -224,6 +224,14 @@ required-features = ["postgres"]
 name = "ajouts_recents_fenetre"
 path = "tests/ajouts_recents_fenetre.rs"
 
+# #3839 : l ecran Ambiance ne pouvait pas dire que la tour texte du CLAP est
+# anglaise et que la traduction depend d une cle IA — le client ne voit aucune
+# cle. Le statut acoustique le porte desormais. Sans cette cible, `autotests =
+# false` plus haut laisserait ce fichier JAMAIS compile : un faux vert.
+[[test]]
+name = "ambiance_traduction_annoncee_3839"
+path = "tests/ambiance_traduction_annoncee_3839.rs"
+
 # #3101 : la portée de répertoire de l'audit de bibliothèque. Le motif LIKE de
 # `GET /export/library-audit.csv?dir=…` était écrit à la main, sans séparateur :
 # auditer `…/Rock` ramenait `…/Rockabilly` et le déclarait fantôme. Le témoin
