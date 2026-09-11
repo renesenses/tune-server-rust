@@ -2056,5 +2056,5 @@ fn la_garde_de_topologie_ne_juge_jamais_par_is_ancestor() {
 /// une commande de decor peut y echouer sans un mot, et c'est arrive.
 #[test]
 fn la_garde_de_topologie_passe_ses_contre_epreuves() {
-    autotest("auditer-topologie-pr.sh", 25);
+    autotest("auditer-topologie-pr.sh", 26);
 }

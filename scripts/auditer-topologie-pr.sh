@@ -337,7 +337,9 @@ juger_une_pr() {
   case "$base" in
     batch/*)
       apporte_du_contenu "$base"; etat=$?
-      if [ "$etat" -eq 1 ]; then
+      if [ "$etat" -eq 2 ]; then
+        na "#$num ($tete → $base) : base NON MESURABLE dans ce dépôt local. La garde n'a rien conclu sur elle — ce n'est pas « conforme »."
+      elif [ "$etat" -eq 1 ]; then
         jours=$(jours_depuis "$base")
         if [ "$jours" -gt "$JOURS_DORMANTE" ]; then
           ko "#$num ($tete → $base) : base ABSORBÉE dans $BRANCHE_DEFAUT et sans révision depuis $jours jours. Le lot est fini ; rebaser sur le lot courant."
@@ -359,6 +361,17 @@ juger_une_pr() {
 detection_bases_mortes() {
   echo "── B. PR ouvertes dont la base ne mène nulle part ──"
   local avant="$nb_ko" lignes num tete base
+  # ⭐ TOUTE la détection B compare au contenu de la branche par défaut. Si elle
+  #    n'est pas dans le dépôt local — checkout partiel, `fetch-depth` serré,
+  #    récupération silencieusement échouée sur un runner — chaque mesure rend
+  #    « indécidable » et la section se tait. Un vert qui n'a RIEN regardé est
+  #    exactement le piège que ce dépôt paie depuis des mois. Il est refusé ici,
+  #    avant la première PR jugée.
+  if ! ref "$BRANCHE_DEFAUT" >/dev/null; then
+    ko "$BRANCHE_DEFAUT est absente de ce dépôt local : la garde ne peut RIEN mesurer sur aucune base. Récupérer la branche par défaut avant de croire ce verdict (git fetch origin '+refs/heads/$BRANCHE_DEFAUT:refs/remotes/origin/$BRANCHE_DEFAUT')."
+    echo
+    return
+  fi
   lignes=$(printf '%s' "$PR_JSON" | jq -r '.[] | "\(.number)\t\(.head.ref)\t\(.base.ref)"')
   if [ -n "$PR_CIBLE" ]; then
     lignes=$(printf '%s\n' "$lignes" | awk -F'\t' -v n="$PR_CIBLE" '$1 == n')
@@ -583,6 +596,15 @@ autotest() {
   printf '%s' '[]' > "$PULLS"
   sortie=$( cd "$RACINE/vide" && bash "$SCRIPT_MOI" essai/depot 2>&1 )
   exige "n'a RIEN mesuré" "un dépôt où aucune branche batch/* n'a été récupérée fait ROUGIR au lieu de conclure « conforme »"
+
+  # ⭐ Le vert le plus dangereux : la branche par défaut absente du dépôt local.
+  #    Toute la détection B compare à son contenu ; sans elle, chaque mesure est
+  #    « indécidable » et la section se tairait — un vert qui n'a rien regardé.
+  ( cd "$D" && git update-ref -d refs/remotes/origin/main && git branch -q -m main jadis-main )
+  printf '%s' '[{"number":30,"head":{"ref":"fix/x"},"base":{"ref":"rc/v0.9.141"}}]' > "$PULLS"
+  sortie=$( cd "$D" && bash "$SCRIPT_MOI" --pr 30 essai/depot 2>&1 )
+  exige 'ne peut RIEN mesurer' "⭐ la branche par défaut absente du dépôt local fait ROUGIR — la section B ne se tait pas faute d'avoir pu mesurer"
+  ( cd "$D" && git branch -q -m jadis-main main && git update-ref refs/remotes/origin/main refs/heads/main )
 
   return "$rate"
 }
