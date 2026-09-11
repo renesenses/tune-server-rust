@@ -936,8 +936,16 @@ impl PlaybackOrchestrator {
             // `output_ms` ne compte plus l'attente de pré-tampon : les trois
             // termes s'additionnent maintenant pour donner `total_ms`, et un
             // blanc s'impute à la bonne étape sans relire la source.
+            // `stream_id` : #2352. `playback_timing` portait le `zone_id` et
+            // PAS le `stream_id` ; `stream_request` (tune-stream-http) porte
+            // l'inverse. Dans l'export d'un testeur, rattacher un demarrage a
+            // la connexion du renderer qui le sert se faisait donc par
+            // adjacence temporelle — ce qui ne tient plus des que deux zones
+            // demarrent dans la meme seconde. Les deux lignes portent
+            // desormais la meme clef, et `service_fichier_termine` aussi.
             info!(
                 zone_id = req.zone_id,
+                stream_id = resolved.stream_id.as_deref(),
                 resolve_ms,
                 prebuffer_ms,
                 output_ms = total_ms
