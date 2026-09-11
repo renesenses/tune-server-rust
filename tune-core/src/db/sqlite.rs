@@ -174,8 +174,32 @@ impl SqliteDb {
             read_pool.push(Arc::new(Mutex::new(rc)));
         }
 
+        // #2718 — dire QUEL fichier a été ouvert.
+        //
+        // Sur Linux, `db_path` vaut « tune.db » et se résout contre le
+        // RÉPERTOIRE COURANT du processus : Windows et macOS ont été relocalisés
+        // (#3185), Linux ne l'a jamais été. Le même binaire lancé depuis un
+        // autre dossier — ou sous un autre compte — ouvre donc un AUTRE
+        // `tune.db`, que `SQLITE_OPEN_CREATE` (plus haut) crée vide sans un mot.
+        // C'est « la bibliothèque a disparu » sans qu'une seule ligne n'ait été
+        // effacée, et c'est la première hypothèse à écarter chez un testeur
+        // Linux.
+        //
+        // Ce journal annonçait le chemin BRUT, « tune.db », qui ne désigne rien :
+        // il ne permettait même pas de savoir LAQUELLE des deux bases avait été
+        // ouverte. `std::path::absolute` le résout contre le répertoire courant
+        // sans toucher au disque — contrairement à `canonicalize`, qui suivrait
+        // les liens symboliques (ce qu'on veut justement voir, pas masquer) et
+        // qui échouerait sur un fichier créé à l'instant même.
+        //
+        // `path` est CONSERVÉ à côté : c'est la valeur telle qu'elle a été
+        // configurée, et la comparer à l'absolu est ce qui montre la résolution.
+        let chemin_absolu = std::path::absolute(path)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.to_string());
         info!(
             path,
+            chemin_absolu,
             readers = READ_POOL_SIZE,
             journal = if reliable_fs { "WAL" } else { "DELETE" },
             "sqlite_opened"
