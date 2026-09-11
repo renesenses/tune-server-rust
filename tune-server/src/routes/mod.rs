@@ -568,6 +568,49 @@ mod escape_tests {
     }
 }
 
+#[cfg(test)]
+mod deezer_proxy_route_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// Counterpart of proxy_url_shape_matches_the_registered_routes in
+    /// tune-core/src/streaming/deezer.rs: both URL shapes must reach the
+    /// Deezer proxy handler instead of falling through to the web fallback
+    /// (the original bug served index.html labeled as FLAC). "upstream not
+    /// available" is the handler's reply when the registered Deezer service
+    /// has no ARL, so that body proves the route matched and the handler
+    /// ran; the fallback would answer with HTML or a bare empty 404.
+    #[tokio::test]
+    async fn both_proxy_url_shapes_reach_the_deezer_handler() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let app = super::router(state);
+
+        for path in [
+            // Shape registered since the route exists.
+            "/deezer-proxy/92720184.flac",
+            // Shape emitted by DeezerService::get_track_url.
+            "/deezer-proxy/deezer/92720184.flac",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(
+                (status, body.as_ref()),
+                (StatusCode::NOT_FOUND, "upstream not available"),
+                "{path} did not reach the deezer proxy handler"
+            );
+        }
+    }
+}
+
 /// Garde-fou : écrire `zone_{id}_eq_profile` sans rafraîchir la sortie qui joue.
 ///
 /// L'égaliseur n'atteint le son d'une zone locale que si quelqu'un rebâtit

@@ -1406,4 +1406,30 @@ mod tests {
         svc.user_id = Some(12345);
         assert!(svc.supports_write());
     }
+
+    #[tokio::test]
+    async fn proxy_url_shape_matches_the_registered_routes() {
+        // Contract with tune-server/src/routes/mod.rs: the URL emitted here
+        // must match one of the two registered routes,
+        // /deezer-proxy/{filename} or /deezer-proxy/deezer/{filename}.
+        // The two diverged once (route declared with one segment, URL
+        // emitted with two) and renderers received index.html instead of
+        // FLAC. Change this shape only together with the routes and with
+        // the router test in tune-server/src/routes/mod.rs.
+        let mut svc = DeezerService::new();
+        svc.arl = Some("a".repeat(192));
+        svc.license_token = Some("license".into());
+        svc.set_proxy_base_url(Some("http://192.168.1.10:8888/deezer-proxy".into()));
+
+        let stream = svc
+            .get_track_url("92720184", None)
+            .await
+            .expect("fully entitled service must take the proxy path");
+
+        assert_eq!(
+            stream.url,
+            "http://192.168.1.10:8888/deezer-proxy/deezer/92720184.flac"
+        );
+        assert_eq!(stream.mime_type, "audio/flac");
+    }
 }
