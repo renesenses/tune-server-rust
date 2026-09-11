@@ -1,8 +1,40 @@
 pub mod auto_dj;
-pub mod crossfade;
 pub mod dj_player;
 pub mod gapless;
 pub mod queue;
+// `crossfade` a été retiré ici (#2211), pour la même raison que
+// `radio_handler` juste en dessous : un module complet, **sans un seul
+// appelant** dans tout le dépôt depuis sa création.
+//
+// Ce qu'il portait : un `CrossfadeHandler` dont `start_fade_out` lisait le
+// volume courant de l'`OutputTarget`, le mémorisait, le descendait à zéro par
+// pas de 10 par seconde, puis `finish_fade_in` le remontait — **deux fondus
+// séquentiels sur le volume de la sortie**, jamais deux flux mélangés. Sur une
+// sortie matérielle, ce volume est celui de la zone, persistant.
+//
+// Ce qu'il faisait réellement : **rien**. `git grep CrossfadeHandler` ne
+// rendait, hors de son propre fichier, que ses cinq tests. Aucun tick du
+// sondeur, aucune fin de piste, aucun bras de l'orchestrateur ne l'instanciait.
+// Le fichier a gardé exactement 156 lignes de la v0.9.129 à la v0.9.145 — le
+// correctif `09be1df6` que le ticket cite n'a jamais eu de PR et n'est ancêtre
+// d'aucun tag.
+//
+// Pourquoi la suppression compte : l'issue #2211 décrit ce mécanisme comme le
+// défaut à corriger, et lui donne P1 pour un creux audible entre les titres et
+// une altération du volume persistant de la zone. Tant que ce fichier vivait,
+// toute lecture du code confirmait ce récit — alors que le seul chemin que
+// l'utilisateur atteint est la route `POST /zones/{id}/crossfade`, fermée par
+// #2689 : elle refuse l'activation par un 501 `crossfade_unavailable` et force
+// la préférence persistée à `false`. Le fondu enchaîné n'existe donc sous
+// AUCUNE forme, pas même la mauvaise.
+//
+// L'arbitrage de Bertrand du 02/09/2026 sur #2211 est explicite : le vrai
+// fondu enchaîné mélangera deux flux décodés dans le moteur audio, sur la
+// sortie locale seulement, et **le volume matériel ne doit plus être touché**.
+// Ce module était la seule implémentation qui le touchait : le laisser en
+// place, c'était laisser la rampe à portée d'un `use`. Le garde
+// `tests/crossfade_pas_de_rampe_de_volume.rs` empêche qu'elle revienne.
+//
 // `radio_handler` a été retiré ici (#3018). C'était une SECONDE lecture des
 // métadonnées radio, sans aucun appelant depuis sa création : un
 // `RadioMetadataHandler` complet, avec sa propre structure `IcyMetadata`

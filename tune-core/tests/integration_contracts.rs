@@ -7,6 +7,8 @@
 mod aucune_fuite_de_temporaires;
 #[path = "audio_integration.rs"]
 mod audio_integration;
+#[path = "crossfade_pas_de_rampe_de_volume.rs"]
+mod crossfade_pas_de_rampe_de_volume;
 #[path = "dsd_streaming_repro.rs"]
 mod dsd_streaming_repro;
 #[path = "dsp_track_boundary.rs"]

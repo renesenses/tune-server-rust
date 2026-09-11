@@ -49,6 +49,26 @@ pub struct TuneConfig {
     pub dlna_slow_max_retries: u32,
 
     // Crossfade
+    /// ⚠️ Ces deux champs-ci ne pilotent RIEN, et ne le peuvent pas (#2211).
+    ///
+    /// Deux raisons se cumulent. D'abord `TuneConfig::from_env` — qui seul les
+    /// alimente depuis `TUNE_CROSSFADE_ENABLED` / `TUNE_CROSSFADE_DURATION` —
+    /// n'a **aucun appelant** dans le dépôt (voir la note sur `auto_update`
+    /// plus bas). Ensuite, et surtout, **plus personne ne les lit** : le seul
+    /// consommateur qu'ils aient jamais eu était
+    /// `playback::crossfade::CrossfadeHandler`, lui-même sans appelant, retiré
+    /// par #2211.
+    ///
+    /// Le fondu enchaîné n'existe sous aucune forme aujourd'hui : la route
+    /// `POST /zones/{id}/crossfade` refuse l'activation par un 501
+    /// `crossfade_unavailable` depuis #2689, et un vrai fondu demandera de
+    /// mélanger deux flux PCM décodés sur la sortie locale — pas une rampe de
+    /// volume.
+    ///
+    /// Laissés en place plutôt que retirés : sortir un champ d'une
+    /// configuration publique est un arbitrage de Bertrand, pas une retouche
+    /// (même règle que `auto_update`, #3217). Mais un lecteur qui tomberait
+    /// ici d'abord doit savoir qu'il regarde un réglage mort.
     pub crossfade_enabled: bool,
     pub crossfade_duration: f64,
 
