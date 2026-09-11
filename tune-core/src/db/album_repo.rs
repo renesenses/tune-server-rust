@@ -291,6 +291,14 @@ pub mod sql {
         )
     }
 
+    pub fn force_update_title<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET title = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn force_update_cover_path<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET cover_path = {} WHERE id = {}",
@@ -1542,6 +1550,31 @@ impl AlbumRepo {
 
     /// Like `update_cover_path` but always overwrites the existing value.
     /// Used by rescan endpoints where the user explicitly wants to refresh artwork.
+    /// Impose un titre à un album déjà en base.
+    ///
+    /// Le seul appelant est l'écriture des albums CUE. `get_or_create_for_folder`
+    /// identifie un album par son DOSSIER : quand la ligne existe déjà, il la
+    /// rend telle quelle et ne réconcilie que l'artiste
+    /// ([`Self::reclaim_unknown_artist`]). Le titre, lui, restait figé sur ce
+    /// que le premier scan avait posé — pour un album CUE d'avant la 0.9.144,
+    /// le NOM DU FICHIER FLAC.
+    ///
+    /// Signalé par Gros Bidon (Didier) le 09/09/2026, fil forum 1738 : « Suite
+    /// à la mise à jour 0.9.144 les feuilles CUE sont lues et interprétées. Par
+    /// contre le nom de l'album n'est pas mis à jour et garde le nom du fichier
+    /// FLAC. »
+    ///
+    /// ⚠️ Volontairement brutal, et volontairement réservé au chemin CUE : une
+    /// feuille CUE EST la source de métadonnées de l'album qu'elle décrit,
+    /// c'est tout son objet. Ailleurs, deux titres en désaccord désignent deux
+    /// éditions et ne se tranchent pas ici.
+    pub fn force_update_title(&self, album_id: i64, title: &str) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::force_update_title, sql::force_update_title);
+        let params: [&dyn ToSqlValue; 2] = [&title, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     pub fn force_update_cover_path(
         &self,
         album_id: i64,

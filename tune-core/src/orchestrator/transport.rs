@@ -136,14 +136,35 @@ impl PlaybackOrchestrator {
             return Ok(None);
         }
         let dev_id = zone.output_device_id.as_deref().unwrap_or("");
-        // Skip zones with no device yet (being configured) and `local:` zones,
-        // which are reputed always available. Then allow a grace window for SSDP
-        // polling gaps: if the device is still in the live registry it is
-        // reachable, whatever the DB says.
-        if dev_id.is_empty()
-            || dev_id.starts_with("local:")
-            || self.outputs.lock().await.contains(dev_id)
-        {
+        // Skip zones with no device yet (being configured). Then allow a grace
+        // window for SSDP polling gaps: if the device is still in the live
+        // registry it is reachable, whatever the DB says.
+        //
+        // 🔴 #3738 — une zone `local:` était exemptée ICI, « reputed always
+        // available ». C'est vrai d'une carte son intégrée ; c'est FAUX d'un
+        // DAC USB, qui disparaît de l'énumération dès qu'il est éteint,
+        // débranché, ou exposé par un autre hôte audio.
+        //
+        // Mesuré chez Lulu (0.9.143 Windows/WASAPI, fil 1731, ticket 105) : sa
+        // zone 1 porte `local:audio-gd USB audio`, le serveur l'avait
+        // CORRECTEMENT marquée `online: false`, et ce garde ignorait son propre
+        // verdict. Chaque clic était donc ACCEPTÉ — file construite, fichier
+        // résolu et transcodé, session de flux créée, `output_play_sent` —
+        // puis le sondeur découvrait l'échec d'ouverture et arrêtait la zone
+        // ~600 ms plus tard. Douze cycles entre 09:30 et 09:43, et
+        // `play_rejected_zone_offline` ABSENT du journal : c'est exactement ce
+        // que la condition `local:` prédisait. Vu de l'écran : rien ne se
+        // passe.
+        //
+        // ⚠️ La grâce, elle, RESTE — et c'est elle qui protège le cas nominal.
+        // Le critère utile n'a jamais été le préfixe de l'identifiant, mais
+        // « l'appareil est-il dans le registre vivant », c'est-à-dire la
+        // condition déjà écrite juste en dessous. Un périphérique local qui se
+        // réveille est enregistré : il passe par `contains` et n'est pas
+        // refusé. Seule une zone à la fois HORS LIGNE et ABSENTE du registre
+        // atteint désormais le rebond puis le refus nommé — comme toutes les
+        // autres familles de sorties depuis #1287.
+        if dev_id.is_empty() || self.outputs.lock().await.contains(dev_id) {
             return Ok(None);
         }
 
@@ -782,20 +803,11 @@ impl PlaybackOrchestrator {
             // Une session-canal (conversion à la volée) ne sait pas rejouer un
             // octet passé : la DIDL doit annoncer DLNA.ORG_OP=00, sans quoi le
             // renderer seeke par tranches et gèle à 0:00 (DMP-A8, DSD, 24/08).
-            let byte_seekable = match resolved.stream_id.as_deref() {
-                Some(sid) => {
-                    let session = {
-                        let sessions = self.streamer.sessions_state();
-                        let guard = sessions.lock().await;
-                        guard.get(sid).cloned()
-                    };
-                    match session {
-                        Some(s) => !s.is_channel().await,
-                        None => true,
-                    }
-                }
-                None => true,
-            };
+            // Mesurée ici comme aux trois sites de PRÉ-ARMEMENT : une seule
+            // question, une seule réponse (`media_byte_seekable`).
+            let byte_seekable = self
+                .media_byte_seekable(resolved.stream_id.as_deref())
+                .await;
             let media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
                 mime_type: &resolved.mime_type,

@@ -257,8 +257,13 @@ fn ip_d_identifiant_airplay(reste: &str) -> Option<&str> {
 
 /// La clé d'APPAREIL d'une zone : ce qui reste quand on retire ce qui
 /// n'identifie rien (mesure du 05/09 sur .18) :
-/// - UPnP : `uuid:` retiré, suffixe `_MR` retiré (l'UDN du sous-appareil
-///   MediaRenderer d'un Sonos a fait une deuxième zone), minuscules ;
+/// - UPnP : `uuid:` retiré, suffixe `_MR` ou `_MS` retiré, minuscules. Un
+///   Sonos annonce TROIS UDN pour un seul appareil : la racine ZonePlayer,
+///   `…_MR` (sous-appareil MediaRenderer) et `…_MS` (MediaServer). Les trois
+///   ont fait trois zones sur le serveur de test — relevé du 09/09 sur .18 :
+///   « Chambre » en 8 (racine), 6 (`_MR`) et 9 (`_MS`), « Cuisine » en 7, 11
+///   et 12. Ne retirer que `_MR` laissait la troisième hors du rapport ET
+///   inéligible à la fusion, alors que c'est le même haut-parleur ;
 /// - AirPlay historique `airplay-<ip>-<port>` : l'adresse ne dit rien de
 ///   stable (l'Apple TV du 13/08 est devenue un Sonos) ; si un appareil
 ///   découvert porte cette adresse ET une adresse matérielle, c'est elle la clé,
@@ -286,10 +291,15 @@ pub(crate) fn cle_appareil(
         return Some(format!("mac:{}", reste.to_ascii_lowercase()));
     }
     if let Some(reste) = id.strip_prefix("uuid:") {
-        return Some(format!(
-            "udn:{}",
-            reste.trim_end_matches("_MR").to_ascii_lowercase()
-        ));
+        // `strip_suffix` et non `trim_end_matches` : on retire UN suffixe de
+        // sous-appareil, pas une répétition. Les deux suffixes sont ceux que
+        // Sonos annonce et rien d'autre n'est deviné — une identité qu'on ne
+        // sait pas prouver ne doit pas devenir une fusion (13/08).
+        let socle = reste
+            .strip_suffix("_MR")
+            .or_else(|| reste.strip_suffix("_MS"))
+            .unwrap_or(reste);
+        return Some(format!("udn:{}", socle.to_ascii_lowercase()));
     }
     None
 }
@@ -357,7 +367,7 @@ pub(crate) fn doublons_de_zones(
             continue;
         }
         let motif = if cle.starts_with("udn:") {
-            "même appareil UPnP (UDN, suffixe _MR retiré)"
+            "même appareil UPnP (UDN, suffixe _MR ou _MS retiré)"
         } else if cle.starts_with("mac:") {
             "même appareil AirPlay (adresse matérielle)"
         } else {
@@ -816,6 +826,35 @@ const CANDIDATE_FACTOR: usize = 8;
 /// bon moment, et il etait inexploitable.
 const QUOTA_PAR_MODULE: f64 = 0.25;
 
+/// Part maximale du quota d'un module qu'un SEUL evenement peut occuper en
+/// premiere main.
+///
+/// [`QUOTA_PAR_MODULE`] a resolu le probleme d'un module qui chasse les
+/// autres. Il reste ENTIER un cran plus bas : a l'interieur d'un module, le
+/// quota se depense sur les lignes les plus RECENTES, donc sur la derniere
+/// rafale — et une rafale, par definition, repete le meme evenement.
+///
+/// Mesure sur le rapport de Reivax66 (ticket support 78, #3580, fenetre de
+/// 200 lignes couvrant 10:21 -> 10:42) : `tune_core::orchestrator` a exactement
+/// atteint son quota (50 lignes retenues, **60 ecartees**), et sur ces 50,
+/// **39 sont trois evenements repetes** — 13 `radio_local_decode_stream_connected`
+/// et 13 `radio_local_decode_started` tires d'une rafale de 200 ms, plus 13
+/// `orchestrator_play_retap_deduped_same_inflight_track` d'une autre. Les 60
+/// ecartees sont les plus ANCIENNES : celles des trois cycles de lecture qui
+/// ont echoue. Le rapport a donc jete la chaine de decision (`output_play_failed`,
+/// `initial_prebuffer_done`, `radio_proxy_transcode_for_dlna`) pour garder une
+/// rafale, et le dossier est reste inexploitable.
+///
+/// **Un huitieme** : sur une fenetre de 200, un evenement ne prend plus que 6
+/// des 50 lignes de son module en premiere main. Les trois rafales rendent 21
+/// places, et le budget du module couvre l'incident au lieu d'une seconde.
+///
+/// Ce n'est PAS un second mecanisme : c'est le meme, un cran plus bas, avec la
+/// meme reprise juste apres — voir `selectionner_lignes`, ou une ligne differee
+/// par ce quota-ci reprend la place que son module n'a pas depensee. Un module
+/// qui n'atteint pas son quota ne perd donc AUCUNE ligne, rafale comprise.
+const QUOTA_PAR_EVENEMENT: f64 = 0.125;
+
 /// Le module (`target` de tracing) d'une ligne de log, si elle en porte un.
 ///
 /// Format du writer (`fmt::layer()` par defaut, `bootstrap.rs`) :
@@ -841,8 +880,36 @@ fn module_de_la_ligne(ligne: &str) -> Option<&str> {
     Some(cible)
 }
 
+/// L'EVENEMENT d'une ligne : le premier mot du message, celui que `tracing`
+/// ecrit juste apres le module.
+///
+/// `… INFO tune_core::orchestrator: initial_prebuffer_done zone_id=5 …`
+/// rend `Some("initial_prebuffer_done")`.
+///
+/// Un nom d'evenement de ce depot est un identifiant Rust en minuscules, et il
+/// porte au moins un `_`. L'exigence n'est pas cosmetique : sans elle, un
+/// message redige en phrase — « Le renderer a acquitte Play… » — se ferait
+/// compter comme un evenement a lui tout seul et rationner a ce titre. Une
+/// ligne dont on ne sait pas nommer l'evenement rend `None` et ne repond alors
+/// que du quota de son module, exactement comme avant.
+fn evenement_de_la_ligne(ligne: &str) -> Option<&str> {
+    const NIVEAUX: [&str; 5] = [" ERROR ", " WARN ", " INFO ", " DEBUG ", " TRACE "];
+    let (_, apres) = NIVEAUX.iter().find_map(|n| ligne.split_once(n))?;
+    let mut mots = apres.split_whitespace();
+    // Le module, deja valide par `module_de_la_ligne` : on le saute.
+    let _cible = mots.next()?.strip_suffix(':')?;
+    let evenement = mots.next()?;
+    let bien_forme = evenement.len() >= 3
+        && evenement.contains('_')
+        && evenement
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    bien_forme.then_some(evenement)
+}
+
 /// Choisit `max_lines` lignes parmi `candidates`, en empechant un seul module
-/// d'occuper plus de [`QUOTA_PAR_MODULE`] de la fenetre.
+/// d'occuper plus de [`QUOTA_PAR_MODULE`] de la fenetre, ni un seul evenement
+/// plus de [`QUOTA_PAR_EVENEMENT`] du quota de son module.
 ///
 /// Deux passes, et la seconde est ce qui rend la premiere sans risque :
 ///
@@ -873,10 +940,15 @@ fn selectionner_lignes(
     }
 
     let quota = ((max_lines as f64 * QUOTA_PAR_MODULE).floor() as usize).max(1);
+    let quota_evenement = ((quota as f64 * QUOTA_PAR_EVENEMENT).floor() as usize).max(1);
     let mut comptes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut comptes_evenement: BTreeMap<String, usize> = BTreeMap::new();
     // `Option<String>` et non l'indice : on garde la ligne retenue et, pour
     // celles mises de cote, de quoi les reprendre en seconde passe.
     let mut retenues: Vec<usize> = Vec::with_capacity(max_lines);
+    // Repoussees par le quota d'EVENEMENT (#3580). Elles ne sont pas perdues :
+    // elles repassent juste apres, sur le budget non depense de leur module.
+    let mut differees: Vec<usize> = Vec::new();
     let mut ecartees: Vec<usize> = Vec::new();
 
     for (i, ligne) in candidates.iter().enumerate().rev() {
@@ -886,6 +958,42 @@ fn selectionner_lignes(
         match module_de_la_ligne(ligne) {
             Some(m) => {
                 let n = comptes.entry(m.to_string()).or_insert(0);
+                if *n >= quota {
+                    ecartees.push(i);
+                    continue;
+                }
+                // #3580 — le quota d'un module se depensait sur sa derniere
+                // RAFALE, qui repete le meme evenement. Une premiere main
+                // plafonnee par evenement fait couvrir l'incident au meme
+                // budget ; ce qui deborde repasse juste apres.
+                if let Some(e) = evenement_de_la_ligne(ligne) {
+                    let ne = comptes_evenement.entry(format!("{m}::{e}")).or_insert(0);
+                    if *ne >= quota_evenement {
+                        differees.push(i);
+                        continue;
+                    }
+                    *ne += 1;
+                }
+                *n += 1;
+                retenues.push(i);
+            }
+            // Non classable : jamais ecartee.
+            None => retenues.push(i),
+        }
+    }
+
+    // Reprise des differees. Le quota par evenement ne RETIRE rien a un
+    // module : il choisit seulement lesquelles de ses lignes il garde en
+    // premier. Un module qui n'a pas epuise son quota reprend donc ici toute
+    // sa rafale — c'est ce qui rend ce cran supplementaire sans risque, et
+    // c'est ce que verifie `aucun_module_ne_perd_de_ligne_par_le_quota_evenement`.
+    for i in std::mem::take(&mut differees) {
+        if retenues.len() >= max_lines {
+            break;
+        }
+        match module_de_la_ligne(&candidates[i]) {
+            Some(m) => {
+                let n = comptes.entry(m.to_string()).or_insert(0);
                 if *n < quota {
                     *n += 1;
                     retenues.push(i);
@@ -893,7 +1001,6 @@ fn selectionner_lignes(
                     ecartees.push(i);
                 }
             }
-            // Non classable : jamais ecartee.
             None => retenues.push(i),
         }
     }
@@ -1385,6 +1492,25 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
     drop(outputs);
+    // Le registre des serveurs multimedia, lu ici et rendu dans la section
+    // « Network » plus bas. Trie par nom : deux rapports du meme testeur
+    // doivent se comparer ligne a ligne.
+    let mut serveurs_multimedia: Vec<(String, String, u16, bool, u64)> = {
+        let registre = state.media_servers.lock().await;
+        registre
+            .values()
+            .map(|ms| {
+                (
+                    ms.name.clone(),
+                    ms.host.clone(),
+                    ms.port,
+                    ms.is_reachable(),
+                    ms.age().as_secs(),
+                )
+            })
+            .collect()
+    };
+    serveurs_multimedia.sort();
 
     let uptime_str = format!(
         "{}d {}h {}m {}s",
@@ -1521,6 +1647,26 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
 
     md.push_str("## Network\n");
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
+    // #2718 et tickets support 61, 87, 97, 98 — « plus de serveurs
+    // multimedia ». « Discovered devices » ne compte QUE les renderers ; le
+    // registre des serveurs multimedia est un autre registre, et ce rapport
+    // — celui que le testeur JOINT a son ticket — n'en disait pas un mot.
+    // Quatre rapports de suite ont donc ete lus sans que la liste dont le
+    // testeur signalait la disparition y figure une seule fois.
+    md.push_str(&format!(
+        "- Serveurs multimedia: {}\n",
+        serveurs_multimedia.len()
+    ));
+    for (nom, hote, port, joignable, age) in &serveurs_multimedia {
+        md.push_str(&format!(
+            "  - {nom} — {hote}:{port} — {} — vu il y a {age} s\n",
+            if *joignable {
+                "joignable"
+            } else {
+                "INJOIGNABLE"
+            }
+        ));
+    }
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
     // #2938 : cinq testeurs ont joint un journal ou le bind TCP 3483 echoue.
     // La ligne existait, noyee dans le journal et en anglais ; personne ne l'a
@@ -2725,6 +2871,252 @@ mod selection_de_lignes {
         assert!(!rapport.contains("écartées"), "rien à annoncer : {rapport}");
     }
 
+    // --- #3580 : le quota d'un module se depensait sur sa derniere rafale ---
+
+    /// Une ligne telle que `tracing` l'ecrit : module, puis EVENEMENT, puis
+    /// les champs. C'est la forme reelle des journaux de terrain — celle que
+    /// `ligne_de` ci-dessus ne reproduit pas (son message est une phrase).
+    fn ligne_evt(module: &str, evenement: &str, n: usize) -> String {
+        format!(
+            "2026-09-04T10:{:02}:{:02}.000+02:00  INFO {module}: {evenement} zone_id=5 n={n}",
+            21 + n / 60,
+            n % 60
+        )
+    }
+
+    #[test]
+    fn l_evenement_est_lu_dans_la_ligne() {
+        assert_eq!(
+            evenement_de_la_ligne(&ligne_evt(
+                "tune_core::orchestrator",
+                "initial_prebuffer_done",
+                1
+            )),
+            Some("initial_prebuffer_done")
+        );
+        // Un message redige en phrase n'est PAS un evenement : le compter
+        // comme tel le ferait rationner sous un nom qui n'existe pas.
+        assert_eq!(
+            evenement_de_la_ligne(
+                "2026-09-04T10:35:00.000+02:00  WARN tune_core::outputs::dlna: Le renderer a acquitte"
+            ),
+            None
+        );
+        // Ni un mot unique sans `_` : trop de messages commencent ainsi.
+        assert_eq!(
+            evenement_de_la_ligne(
+                "2026-09-04T10:35:00.000+02:00  INFO tune_core::poller: playing zone_id=5"
+            ),
+            None
+        );
+        // Une ligne sans module n'a pas d'evenement non plus.
+        assert_eq!(evenement_de_la_ligne("    at src/main.rs:42"), None);
+    }
+
+    /// Le journal de Reivax66 (ticket support 78, #3580), dans ses proportions
+    /// MESUREES sur le `diagnostic.md` recu : fenetre de 200 lignes couvrant
+    /// 10:21 -> 10:42, `tune_core::orchestrator` retenu a exactement 50 lignes
+    /// et **60 ecartees** — et sur les 50 retenues, **39 etaient trois
+    /// evenements repetes** tires de deux rafales de quelques centaines de ms.
+    ///
+    /// Ce que le rapport a donc jete : la chaine de decision des TROIS cycles
+    /// de lecture qui ont echoue (`radio_proxy_transcode_for_dlna`,
+    /// `initial_prebuffer_done`, `output_play_failed`). Sans elle, on ne peut
+    /// pas savoir ce que contenait l'URI envoyee au Denon ni a quel moment —
+    /// c'est-a-dire exactement la question du ticket.
+    fn journal_de_reivax66() -> Vec<String> {
+        let mut v = Vec::new();
+
+        // --- Les 60 plus ANCIENNES lignes du module : c'est ce que le
+        // rapport a jete. Trois cycles de lecture qui echouent, noyes dans le
+        // bavardage de la meme periode.
+        for cycle in 0..3usize {
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "radio_proxy_transcode_for_dlna",
+                cycle,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "initial_prebuffer_done",
+                cycle,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "output_play_failed",
+                cycle,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "orchestrator_play",
+                cycle,
+            ));
+        }
+        for i in 0..48 {
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "radio_local_decode_started",
+                i,
+            ));
+        }
+
+        // --- Les 50 plus RECENTES : celles que le quota gardait, et dont 39
+        // sont trois evenements repetes, tires de deux rafales.
+        for i in 0..13 {
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "radio_local_decode_stream_connected",
+                i,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "radio_local_decode_started",
+                100 + i,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "orchestrator_play_retap_deduped_same_inflight_track",
+                i,
+            ));
+        }
+        for i in 0..2 {
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "initial_prebuffer_done",
+                50 + i,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "orchestrator_play",
+                50 + i,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "output_play_sent",
+                50 + i,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "playback_timing",
+                50 + i,
+            ));
+        }
+        for i in 0..3 {
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "radio_proxy_transcode_for_dlna",
+                50 + i,
+            ));
+        }
+
+        // --- Le reste de la fenetre : deux modules qui, eux, la remplissent
+        // largement. Sans eux le quota ne mordrait pas, et le defaut ne se
+        // reproduirait pas.
+        for i in 0..100 {
+            v.push(ligne_evt(
+                "tune_core::outputs::local",
+                "local_audio_device_found",
+                i,
+            ));
+        }
+        for i in 0..200 {
+            v.push(ligne_evt(
+                "tune_core::http::streamer",
+                "radio_stream_session_created",
+                i,
+            ));
+        }
+        v
+    }
+
+    /// Compte les lignes du rapport dont l'EVENEMENT est exactement `e`.
+    ///
+    /// `contains` ne suffit pas : `orchestrator_play` est un prefixe de
+    /// `orchestrator_play_retap_deduped_same_inflight_track`, et un temoin qui
+    /// confond les deux ne mesure rien.
+    fn compte_evenement(rapport: &str, e: &str) -> usize {
+        rapport
+            .lines()
+            .filter(|l| evenement_de_la_ligne(l) == Some(e))
+            .count()
+    }
+
+    #[test]
+    fn le_rapport_de_reivax66_garde_la_chaine_de_decision() {
+        let rapport = lignes_utiles_pour_un_rapport(&journal_de_reivax66().join("\n"), 200);
+
+        // Le budget du module est INCHANGE : 50 lignes, son quota. Ce temoin
+        // n'achete rien avec des lignes en plus — il depense les memes
+        // autrement.
+        assert_eq!(
+            rapport
+                .lines()
+                .filter(|l| module_de_la_ligne(l) == Some("tune_core::orchestrator"))
+                .count(),
+            50,
+            "le quota du module a bouge, ce n'est plus la meme mesure :\n{rapport}"
+        );
+
+        // LE point du ticket : sans ces trois evenements, on ne peut pas dire
+        // ce que Tune a envoye au renderer, ni a quel moment.
+        assert_eq!(
+            compte_evenement(&rapport, "output_play_failed"),
+            3,
+            "les trois echecs de lecture sont de nouveau absents du rapport :\n{rapport}"
+        );
+        assert_eq!(
+            compte_evenement(&rapport, "initial_prebuffer_done"),
+            5,
+            "le prebuffer des cycles en echec manque :\n{rapport}"
+        );
+        assert_eq!(
+            compte_evenement(&rapport, "radio_proxy_transcode_for_dlna"),
+            6,
+            "l'origine des flux servis au renderer manque :\n{rapport}"
+        );
+    }
+
+    /// Le garde-fou du cran supplementaire, et le plus important des deux :
+    /// un module qui n'atteint PAS son quota ne doit perdre aucune ligne, meme
+    /// quand toutes ses lignes sont le meme evenement.
+    ///
+    /// Le cas est reel : dans le meme rapport, `tune_core::outputs::dlna` tient
+    /// 21 lignes pour un quota de 50, dont **8 `dlna_play_acquitte_mais_pas_
+    /// applique_relance`** — les lignes qui NOMMENT le defaut. Un plafond par
+    /// evenement applique sans reprise en aurait supprime deux.
+    #[test]
+    fn aucun_module_ne_perd_de_ligne_par_le_quota_evenement() {
+        let mut v = Vec::new();
+        for i in 0..8 {
+            v.push(ligne_evt(
+                "tune_core::outputs::dlna",
+                "dlna_play_acquitte_mais_pas_applique_relance",
+                i,
+            ));
+        }
+        for i in 0..13 {
+            v.push(ligne_evt("tune_core::outputs::dlna", "dlna_set_uri_ok", i));
+        }
+        // Un bavard a cote, pour que la fenetre soit effectivement disputee.
+        for i in 0..400 {
+            v.push(ligne_evt(
+                "tune_core::http::streamer",
+                "radio_stream_session_created",
+                i,
+            ));
+        }
+        let rapport = lignes_utiles_pour_un_rapport(&v.join("\n"), 200);
+        assert_eq!(
+            rapport
+                .lines()
+                .filter(|l| l.contains("dlna_play_acquitte_mais_pas_applique_relance"))
+                .count(),
+            8,
+            "le quota par evenement a mange des lignes d'un module qui n'avait \
+             pas epuise le sien :\n{rapport}"
+        );
+    }
+
     #[test]
     fn le_niveau_filtre_toujours_avant_le_quota() {
         // L'ordre compte : plafonner d'abord laisserait du DEBUG occuper un
@@ -3063,5 +3455,58 @@ mod tests_doublons_de_zones {
         );
         assert_eq!(cle_appareil(&z("local:hw:0,0"), &[]), None);
         assert_eq!(cle_appareil(&z("oaat:1081bb7a"), &[]), None);
+    }
+    /// Les TROIS UDN d'un Sonos ne font qu'un appareil, donc un seul groupe.
+    ///
+    /// Relevé du 09/09 sur .18 (`tune_v2.db`) : « Chambre » existe en racine
+    /// (id 8), en `_MR` (id 6) et en `_MS` (id 9) ; « Cuisine » en 7, 11 et
+    /// 12. Tant que seul `_MR` était retiré, la ligne `_MS` n'était ni nommée
+    /// par le rapport ni fusionnable par la route : elle restait à l'écran
+    /// sans aucun moyen de la faire disparaître sans perdre ses réglages.
+    #[test]
+    fn les_trois_udn_d_un_sonos_ne_font_qu_un_seul_groupe() {
+        let z = |dev: &str| zone(1, "z", "dlna", dev, true);
+        for suffixe in ["", "_MR", "_MS"] {
+            assert_eq!(
+                cle_appareil(&z(&format!("uuid:RINCON_B8E937B44D0801400{suffixe}")), &[])
+                    .as_deref(),
+                Some("udn:rincon_b8e937b44d0801400"),
+                "suffixe {suffixe:?}"
+            );
+        }
+        // Un suffixe qui n'est pas un sous-appareil Sonos ne s'efface pas :
+        // deux appareils différents ne doivent pas se retrouver dans le même
+        // groupe parce que leur UDN finit pareil.
+        assert_eq!(
+            cle_appareil(&z("uuid:ABC_MZ"), &[]).as_deref(),
+            Some("udn:abc_mz")
+        );
+        let zones = vec![
+            zone(8, "Chambre", "dlna", "uuid:RINCON_B8E937B44D0801400", true),
+            zone(
+                6,
+                "Chambre",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400_MR",
+                false,
+            ),
+            zone(
+                9,
+                "Chambre - Sonos Play:1 Media Renderer",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400_MS",
+                false,
+            ),
+        ];
+        let groupes = doublons_de_zones(&zones, &[]);
+        assert_eq!(groupes.len(), 1, "{groupes:#?}");
+        let mut ids: Vec<i64> = groupes[0]["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|z| z["id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [6, 8, 9], "les trois lignes sont un seul appareil");
     }
 }

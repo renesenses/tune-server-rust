@@ -223,3 +223,88 @@ importable.
 
 Et ce qu'elle ne livre pas, volontairement : la poignée de main Noise,
 l'appairage, l'encodage, l'horloge, la lecture.
+
+## 11. Corrections mesurées sur le fil (09/09/2026, brique S2-a)
+
+Ce qui suit ne vient pas d'une relecture de la spécification mais d'échanges
+**réellement observés** entre le serveur de Tune et l'implémentation de
+référence de l'Open Home Foundation (`aiosendspin`). Là où ces constats
+contredisent les sections 1 à 10 ci-dessus, **c'est le fil qui fait foi**.
+
+### 11.1 La clé de capacités d'un rôle est VERSIONNÉE
+
+Le § 4 annonçait `<rôle>_support`. Un `client/hello` réel porte
+**`player@v1_support`**, c'est-à-dire le nom du rôle *avec sa version*. Lire
+`player_support` rend `None` sur un lecteur courant — donc aucun codec, aucune
+fréquence, aucune profondeur.
+
+L'implémentation de référence, côté serveur, lit les deux et qualifie la forme
+non versionnée de « legacy ». `messages::ClientHello::support_du_lecteur` fait
+de même : clé versionnée d'abord, repli non versionné ensuite.
+
+### 11.2 Les types binaires de fragmentation ont changé
+
+Le § 3 donnait `1` pour la fragmentation et `2` pour l'appairage. L'état
+courant est : **`2` = fragment suivi d'autres, `3` = dernier fragment** (le bit
+0 porte le drapeau « dernier »). Le type `1` n'est plus attribué à la
+fragmentation.
+
+S2-a ne fragmente pas — c'est le sujet de S2-c — et refuse explicitement ce qui
+dépasse une trame plutôt que de tronquer. Le point est noté ici pour que S2-c
+reparte du fil et non de la section 3.
+
+### 11.3 Charge utile maximale : 65519 et non 65518
+
+`65535 − 16` (le tag AEAD). L'octet de type est **compris** dans cette charge,
+il ne s'en retranche pas une seconde fois.
+
+### 11.4 Il existe un mode de transition NON CHIFFRÉ, et c'est aujourd'hui le
+seul que parlent les lecteurs publiés
+
+C'est le constat le plus lourd de conséquence.
+
+- La version publiée d'`aiosendspin` (**6.0.5**, celle dont dépend le lecteur
+  de référence `sendspin` 7.5.0) **ne contient aucun module `noise/`**. Le
+  chiffrement n'existe que dans le dépôt git, pas dans une version publiée.
+- Mis face à notre serveur, ce lecteur envoie donc un **`client/hello` en
+  clair** comme tout premier message, sans `client/init` ni poignée de main.
+- Le serveur de référence (git) aiguille sur le premier message reçu :
+  `client/init` → poignée de main Noise ; `client/hello` → connexion **non
+  chiffrée acceptée en « mode transition »**, derrière un drapeau
+  `allow_unencrypted`, avec la trace « Accepting unencrypted legacy connection ».
+
+Autrement dit : **le Sendspin chiffré est spécifié et implémenté en git, mais
+aucun lecteur publié ne le parle encore.** Tune, qui n'implémente que la
+branche chiffrée, est conforme à la spécification et **ne peut aujourd'hui
+parler à aucun lecteur installé**.
+
+Faut-il implémenter le mode de transition ? C'est une décision de produit —
+accepter du non chiffré sur le réseau local pour parler à l'existant, ou
+attendre que l'écosystème publie le chiffrement — et elle n'est pas prise ici.
+
+### 11.5 Le prologue Noise est fait des OCTETS EXACTS des deux messages en clair
+
+`prologue = <texte client/init reçu> || <texte server/init envoyé>`, tels qu'ils
+ont circulé. Re-sérialiser l'un des deux, même à JSON équivalent, change le
+prologue.
+
+Mesuré : l'écart est fatal **dès le message Noise 1** — le prologue entre dans
+le hachage `h` avant que la charge utile du premier message ne soit chiffrée,
+et le répondeur échoue en la déchiffrant. Il n'atteint jamais le message 2.
+
+### 11.6 La PSK Sentinelle, telle qu'elle est calculée
+
+`SHA-256("sendspin-sentinel-psk-v1")`, et son identifiant
+`base64url(SHA-256("sendspin-psk-id-v1" || psk))`. Vérifié : notre dérivation et
+celle de l'implémentation de référence donnent le même `psk_id`, et une poignée
+de main aboutit dans les deux suites.
+
+Elle est **publique** : elle chiffre, elle n'authentifie personne.
+
+### 11.7 L'implémentation de référence ne sait pas décoder Opus
+
+Alors que la spécification écrit « Servers MUST support all audio codecs », le
+SDK de référence refuse qu'un lecteur annonce `opus` : « only PCM and FLAC are
+supported ». L'obligation porte sur le serveur, pas sur le lecteur — mais cela
+dit qu'en pratique FLAC et PCM suffisent aujourd'hui, ce qui allège S2-c :
+l'encodeur Opus n'est pas sur le chemin critique.

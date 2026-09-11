@@ -50,6 +50,23 @@ pub(super) const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
     ("dsd_lpcm_stream", || json!(false)),
     ("dsp_progressif_reseau", || json!(false)),
     ("auth_enabled", || json!(false)),
+    // #3577 — le panneau Paroles s'ouvre vide, et ce booléen dit LEQUEL des
+    // deux verrous s'est refermé.
+    //
+    // `routes/library/tracks.rs` n'interroge LRCLIB que si cette clé vaut la
+    // chaîne `"true"` ; sinon il rend `404 {"error":"no_lyrics"}` — le MÊME
+    // 404 que pour un titre réellement sans paroles. Absente de la fiche, sa
+    // valeur ne pouvait donc plus se déduire de rien : le `diagnostic.md` du
+    // ticket support 93 (Belkadi Yacine, 49 618 fichiers, 0.9.140) ne la
+    // portait pas, et l'issue a dû clore sur « valeur NON ÉTABLIE ».
+    //
+    // Le client web la lit déjà dans `GET /system/config` pour nommer le
+    // réglage dans l'état vide (tune-web-client#775) ; la fiche support doit
+    // pouvoir en dire autant, sans quoi le premier niveau de support ne peut
+    // pas trancher entre « rien à trouver » et « recherche en ligne éteinte ».
+    //
+    // Non sensible : un booléen de consentement, comme les huit au-dessus.
+    ("lyrics_lrclib_enabled", || json!(false)),
 ];
 
 /// Projette les settings bruts sur l'allowlist support. Les valeurs stockées
@@ -195,9 +212,48 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
         .ok()
         .filter(|ip| !ip.is_empty())
         .or_else(|| tune_core::discovery::ssdp::get_local_ip().map(|ip| ip.to_string()));
+    // #2718 et tickets support 61, 87, 97, 98 — « plus de serveurs
+    // multimedia ». La fiche decrivait les zones jusqu'a la marque et au
+    // modele du DAC, et ne disait RIEN des serveurs multimedia : quatre
+    // signalements sur trois semaines ont ete instruits sans jamais pouvoir
+    // dire combien Tune en voyait. #2718 s'est refermee « mecanisme non
+    // etabli » alors que la reponse tenait dans un compteur absent.
+    //
+    // Les champs sont EXACTEMENT ceux que `GET /network/media-servers` sert
+    // deja a tout utilisateur authentifie : la fiche n'expose rien de neuf.
+    let serveurs_multimedia: Vec<Value> = {
+        let registre = state.media_servers.lock().await;
+        let mut v: Vec<Value> = registre
+            .values()
+            .map(|ms| {
+                json!({
+                    "name": ms.name,
+                    "host": ms.host,
+                    "port": ms.port,
+                    "reachable": ms.is_reachable(),
+                    "last_seen_secs": ms.age().as_secs(),
+                })
+            })
+            .collect();
+        // Ordre stable : un `HashMap` rendrait la fiche differente a chaque
+        // ouverture, et deux fiches du meme testeur cesseraient d'etre
+        // comparables ligne a ligne — c'est precisement ce qu'on fait avec
+        // elles quand un defaut dure trois semaines.
+        v.sort_by(|a, b| {
+            a["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(b["name"].as_str().unwrap_or_default())
+        });
+        v
+    };
     let network = json!({
         "advertise_ip": advertise_ip,
         "port": state.port,
+        // Le compte SEPAREMENT de la liste : une liste vide et une liste
+        // absente se lisent pareil dans un JSON qu'on parcourt a l'oeil.
+        "media_servers_count": serveurs_multimedia.len(),
+        "media_servers": serveurs_multimedia,
     });
 
     Json(json!({
@@ -248,6 +304,31 @@ mod tests {
 
     /// Seules les clés de l'allowlist sortent ; un store contenant des secrets
     /// n'en laisse fuiter aucun, et les valeurs texte sont re-typées.
+    /// #3577 — le panneau Paroles s'ouvre vide et la fiche support ne disait
+    /// pas LEQUEL des deux verrous s'est referme.
+    ///
+    /// `routes/library/tracks.rs` rend le MEME `404 {"error":"no_lyrics"}`
+    /// pour « ce titre n'a pas de paroles » et pour « la recherche en ligne
+    /// est eteinte ». Sans ce booleen dans la fiche, l'ecart n'etait pas
+    /// mesurable apres coup : le `diagnostic.md` du ticket support 93 ne le
+    /// portait pas, et l'issue a du clore sur « valeur NON ETABLIE ».
+    #[test]
+    fn la_fiche_publie_le_consentement_des_paroles_en_ligne() {
+        assert!(
+            SUPPORT_SETTING_KEYS
+                .iter()
+                .any(|(k, _)| *k == "lyrics_lrclib_enabled"),
+            "sans cette cle, un ticket « panneau Paroles vide » reste indecidable"
+        );
+        // Absent du store = eteint, exactement la regle du serveur :
+        // `settings.get(...).as_deref() == Some("true")`.
+        let out = support_settings(|_| None);
+        assert_eq!(out["lyrics_lrclib_enabled"], json!(false));
+        // Et la valeur persistee est rendue telle quelle, re-typee.
+        let out = support_settings(|k| (k == "lyrics_lrclib_enabled").then(|| "true".to_string()));
+        assert_eq!(out["lyrics_lrclib_enabled"], json!(true));
+    }
+
     #[test]
     fn support_settings_filters_and_retypes() {
         let store = |k: &str| -> Option<String> {

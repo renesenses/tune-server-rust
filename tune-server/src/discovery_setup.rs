@@ -390,7 +390,19 @@ pub fn spawn_ssdp_handler(
                         &nos_adresses(),
                         notre_udn.as_deref(),
                     ) {
-                        debug!(
+                        // INFO, pas DEBUG : ce rideau RETIRE une entree de la
+                        // liste « Serveurs multimedia » que le testeur voit.
+                        // Le journal du ticket support 61 montre Tune lui-meme
+                        // enregistre comme serveur multimedia et presente dans
+                        // sa liste (`media_server_registered`
+                        // id=uuid:c4467384-…, 0.9.119) ; le ticket 97 dit qu'il
+                        // lisait « depuis le nas freebox ET DEPUIS TUNE ».
+                        // Depuis #3688 cette entree disparait — a raison ou
+                        // non, ce n'est pas la question ici. Sous DEBUG, un
+                        // testeur qui redit « plus de serveurs multimedia »
+                        // joindrait un journal qui n'en porte pas la trace, et
+                        // l'instruction repartirait a zero comme pour #2718.
+                        info!(
                             id = %ms.id,
                             name = %ms.name,
                             location = %ms.location,
@@ -1269,6 +1281,13 @@ pub fn spawn_mdns_handler(
             .unwrap_or(8888u16);
         if let Err(e) = mdns.register_self(port, tune_core::version()) {
             tracing::warn!(error = %e, "mdns_register_self_failed");
+        }
+        // #3326 S2-a — l'autre moitié de la découverte Sendspin. La
+        // spécification exige du serveur qu'il supporte les DEUX modes ; la
+        // phase 1 ne parcourait que le premier. Une annonce qui échoue ne doit
+        // pas empêcher le reste de la découverte de démarrer.
+        if let Err(e) = mdns.register_sendspin_server(port) {
+            tracing::warn!(error = %e, "mdns_register_sendspin_server_failed");
         }
         // Publish the scanner so routes (`/peers`, `/system/discover-servers`)
         // can list the discovered peers. AppState keeps it alive for the whole
