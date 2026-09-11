@@ -1014,6 +1014,13 @@ pub(super) async fn track_waveform(
     Json(json!({ "track_id": id, "waveform": points })).into_response()
 }
 
+/// Combien de pistes accumulées avant d'écrire le magasin étendu.
+///
+/// Écrire piste par piste ferait une transaction par fichier sur une
+/// bibliothèque de dizaines de milliers d'entrées ; tout garder en mémoire
+/// jusqu'à la fin ferait perdre la passe entière à la moindre interruption.
+const LOT_METADONNEES_ETENDUES: usize = 500;
+
 /// POST /api/v1/library/rescan-metadata
 ///
 /// Re-reads tags from audio files for all local tracks and updates the DB.
@@ -1045,6 +1052,20 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
             }
 
             let track_repo = TrackRepo::with_backend(backend_inner.clone());
+            // #3816 — le magasin ÉTENDU (commentaire, ISRC, compositeur,
+            // parolier, label, code-barres) est le seul que l'éditeur de piste
+            // lit, et la seule chose qui l'écrivait était la boucle de lot du
+            // scan. Or le scan ordinaire écarte les fichiers inchangés AVANT
+            // de constituer ses lots (`routes/system/scan.rs:1370-1381`) :
+            // une piste indexée avant que ce magasin existe n'était jamais
+            // relue, quel que soit le nombre de scans. Cette passe-ci, dont
+            // l'objet même est « relire les étiquettes des fichiers », le
+            // laissait intact — c'est le maillon qui manquait.
+            let meta_repo =
+                tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(
+                    backend_inner.clone(),
+                );
+            let mut etendues: Vec<(i64, std::collections::HashMap<String, String>)> = Vec::new();
             let tracks = match track_repo.list_all_local() {
                 Ok(t) => t,
                 Err(e) => {
@@ -1094,6 +1115,25 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                 };
                 let path = std::path::Path::new(&reel);
 
+                // AVANT `read_metadata`, et non après : les trois `continue`
+                // qui suivent laisseraient le magasin étendu en arrière pour
+                // une piste dont seules les étiquettes DE BASE sont illisibles.
+                // Même couple de fonctions que le scan (`scan.rs:1701` et
+                // `:1710`) : une seule définition de « relire les étiquettes
+                // étendues », partagée par les deux passes.
+                if let Some(track_id) = track.id {
+                    let ext = tune_core::metadata::read_extended_metadata(path);
+                    if !ext.is_empty() {
+                        etendues.push((track_id, ext));
+                    }
+                }
+                if etendues.len() >= LOT_METADONNEES_ETENDUES {
+                    if let Err(e) = meta_repo.set_batch_multi(&etendues) {
+                        tracing::warn!(error = %e, "rescan_extended_metadata_insert_failed");
+                    }
+                    etendues.clear();
+                }
+
                 let Some(meta) = tune_core::metadata::read_metadata(path) else {
                     errors += 1;
                     continue;
@@ -1109,6 +1149,15 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                         errors += 1;
                     }
                 }
+            }
+
+            // Le reliquat : sans lui, une bibliothèque de moins de
+            // LOT_METADONNEES_ETENDUES pistes n'écrirait jamais rien.
+            if !etendues.is_empty() {
+                if let Err(e) = meta_repo.set_batch_multi(&etendues) {
+                    tracing::warn!(error = %e, "rescan_extended_metadata_insert_failed");
+                }
+                etendues.clear();
             }
 
             // Refresh album genre/quality from their tracks
@@ -2532,5 +2581,123 @@ mod contrat_dlna_de_la_route_audio_3579 {
             .await
             .expect("corps");
         assert_eq!(&octets[..], b"0123456789");
+    }
+}
+
+/// #3816 — le magasin ÉTENDU d'une piste et la passe « relire les métadonnées ».
+///
+/// L'éditeur de piste (COMMENTAIRE, ISRC, COMPOSITEUR, PAROLIER, LABEL,
+/// CODE-BARRES) ne lit QUE `track_metadata`, par
+/// `GET /library/tracks/{id}/metadata`. Avant ce correctif, la seule chose au
+/// monde qui écrivait cette table était la boucle de lot du scan
+/// (`routes/system/scan.rs:1696-1712`) — et le scan ordinaire écarte les
+/// fichiers inchangés AVANT de constituer ses lots (`scan.rs:1370-1381`).
+/// Une piste indexée avant l'existence du magasin restait donc vide
+/// indéfiniment, quel que soit le nombre de scans lancés.
+///
+/// Cette épreuve passe par le ROUTEUR complet et par un VRAI fichier FLAC dont
+/// les étiquettes étendues ont été écrites sur le disque : elle ne réplique
+/// aucune logique, elle mesure l'état de la base après la passe.
+#[cfg(test)]
+mod magasin_etendu_relu_par_la_passe_3816 {
+    use crate::state::AppState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::db::track_metadata_repo::TrackMetadataRepo;
+
+    /// Le FLAC d'épreuve du dépôt, recopié dans un dossier temporaire et
+    /// étiqueté pour l'occasion. On n'écrit jamais dans la fixture d'origine.
+    async fn flac_etiquete(dir: &std::path::Path, champs: &HashMap<String, String>) -> String {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tune-core/tests/fixtures/test.flac");
+        let cible = dir.join("piste.flac");
+        std::fs::copy(&source, &cible).expect("copie du FLAC d'épreuve");
+        let chemin = cible.to_string_lossy().to_string();
+        tune_core::metadata::tag_writer::write_metadata_to_file(&chemin, champs)
+            .await
+            .expect("écriture des étiquettes étendues");
+        chemin
+    }
+
+    async fn par_la_route(state: &AppState, methode: &str, uri: &str) -> axum::response::Response {
+        super::super::router()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(methode)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("requête"),
+            )
+            .await
+            .expect("réponse")
+    }
+
+    #[tokio::test]
+    async fn la_relecture_remplit_le_magasin_que_l_editeur_lit() {
+        let dir = tempfile::tempdir().expect("dossier temporaire");
+        let mut champs = HashMap::new();
+        champs.insert("composer".to_string(), "António Carlos Jobim".to_string());
+        champs.insert("isrc".to_string(), "GBKRR0900301".to_string());
+        champs.insert("label".to_string(), "Token Productions".to_string());
+        let chemin = flac_etiquete(dir.path(), &champs).await;
+
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (title, format, file_path) VALUES ('Les eaux de mars', 'flac', ?1)",
+                &[&chemin as &dyn ToSqlValue],
+            )
+            .expect("insertion de la piste");
+        let id = state.backend.last_insert_rowid();
+
+        // L'ÉTAT DE DÉPART, et c'est le défaut du ticket : la ligne existe, le
+        // fichier porte ses balises, le magasin étendu est vide.
+        let repo = TrackMetadataRepo::with_backend(state.backend.clone());
+        assert!(
+            repo.get_all(id).expect("magasin").is_empty(),
+            "le magasin doit partir vide, sinon l'épreuve ne mesure rien"
+        );
+
+        let reponse = par_la_route(&state, "POST", "/rescan-metadata").await;
+        assert_eq!(reponse.status(), StatusCode::ACCEPTED);
+
+        // La passe est une tâche de fond : on attend qu'elle se déclare finie,
+        // borné, par la route d'état — pas par une pause fixe.
+        let mut reste = 200;
+        loop {
+            let corps = par_la_route(&state, "GET", "/rescan-metadata/status").await;
+            let octets = axum::body::to_bytes(corps.into_body(), usize::MAX)
+                .await
+                .expect("corps");
+            let json: serde_json::Value = serde_json::from_slice(&octets).expect("json");
+            if json["status"] == "idle" && json["result"] != serde_json::Value::Null {
+                break;
+            }
+            reste -= 1;
+            assert!(reste > 0, "la passe ne s'est jamais déclarée finie");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let magasin = repo.get_all(id).expect("magasin");
+        assert_eq!(
+            magasin.get("composer").map(String::as_str),
+            Some("António Carlos Jobim"),
+            "COMPOSITEUR — magasin après la passe : {magasin:?}"
+        );
+        assert_eq!(
+            magasin.get("isrc").map(String::as_str),
+            Some("GBKRR0900301"),
+            "ISRC — magasin après la passe : {magasin:?}"
+        );
+        assert_eq!(
+            magasin.get("label").map(String::as_str),
+            Some("Token Productions"),
+            "LABEL — magasin après la passe : {magasin:?}"
+        );
     }
 }
