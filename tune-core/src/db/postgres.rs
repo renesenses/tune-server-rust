@@ -157,7 +157,7 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // SUPPRIMEE reparait, `count()`/`count_online()`/`count_active()` rendent 0.
     // Meme mecanisme et meme forme que `listen_history.album_id` juste plus bas
     // (#2860). Sur une base existante ou elle est deja TEXT, cet ADD est un
-    // no-op et c'est la migration 055 qui la convertit (#3726).
+    // no-op et c'est la migration 056 qui la convertit (#3726).
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden SMALLINT DEFAULT 0",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS dsd_mode TEXT DEFAULT 'auto'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS autoplay_enabled TEXT DEFAULT '0'",

@@ -3455,9 +3455,9 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         ),
     ),
     (
-        55,
+        56,
         "zones_drapeaux_entiers",
-        include_str!("../../migrations/postgres/055_zones_drapeaux_entiers.sql"),
+        include_str!("../../migrations/postgres/056_zones_drapeaux_entiers.sql"),
     ),
 ];
 
@@ -5261,7 +5261,7 @@ mod tests {
         // pas, et cette entree est la PLUS HAUTE : sans marque, `MAX(version)`
         // resterait a 53 et le semis serait rejoue a chaque demarrage (defaut
         // de la 052, #3699).
-        // 55 : `zones_drapeaux_entiers` (#3726). PAS de jumelle SQLite :
+        // 56 : `zones_drapeaux_entiers` (#3726). PAS de jumelle SQLite :
         // migration de RATTRAPAGE, comme la 53. QUATRE drapeaux ramenes a
         // SMALLINT, chacun apres que son redacteur ait ete repare dans le MEME
         // commit — c'est l'ordre que #3726 exige, et c'est la reparation du
@@ -5276,7 +5276,14 @@ mod tests {
         // liait un BOOLEEN, donc la creation de profil SSO echouait en natif et
         // ecrivait le litteral `true` en migre — ou `as_bool()` rend `None`,
         // donc un administrateur se connectait avec le role `user`.
-        assert_eq!(pg_latest_version(), 55, "latest PG migration must be 55");
+        // 55 est prise par `zones_output_endpoint_id` (#2269, PR #3758).
+        // Arbitrage du 11/09/2026 : cette migration-ci passe en 56, l'autre
+        // garde 55 — anteriorite et maturite. Le numero libre a ete remesure
+        // DANS LE CODE, pas dans le repertoire : la jumelle PostgreSQL du
+        // semis Radio Paradise (54) est une entree `concat!` de cette liste
+        // et ne porte AUCUN fichier `054_*.sql` — un `ls migrations/postgres`
+        // affiche 053 comme dernier et fait viser un numero deja pris.
+        assert_eq!(pg_latest_version(), 56, "latest PG migration must be 56");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

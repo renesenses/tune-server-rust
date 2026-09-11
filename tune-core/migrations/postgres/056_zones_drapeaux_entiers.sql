@@ -1,4 +1,4 @@
--- 055_zones_drapeaux_entiers.sql
+-- 056_zones_drapeaux_entiers.sql
 --
 -- QUATRE drapeaux convertis en SMALLINT, chacun apres que son redacteur ait
 -- ete repare dans le MEME commit. Pas un de plus : la consigne de #2995 tient,
@@ -205,7 +205,7 @@ BEGIN
         c[1], c[2], c[2], c[2]);
       GET DIAGNOSTICS redressees = ROW_COUNT;
       IF redressees > 0 THEN
-        RAISE NOTICE 'migration 055: %.% — % ligne(s) booleennes ramenees a 1/0', c[1], c[2], redressees;
+        RAISE NOTICE 'migration 056: %.% — % ligne(s) booleennes ramenees a 1/0', c[1], c[2], redressees;
       END IF;
       EXECUTE format(
         'SELECT count(*) FROM %I WHERE %I IS NOT NULL AND %I !~ %L',
@@ -221,9 +221,9 @@ BEGIN
           EXECUTE format('ALTER TABLE %I ALTER COLUMN %I SET DEFAULT %s',
             c[1], c[2], regexp_replace(col_def, '[^0-9-]', '', 'g'));
         END IF;
-        RAISE NOTICE 'migration 055: %.% text->%', c[1], c[2], c[3];
+        RAISE NOTICE 'migration 056: %.% text->%', c[1], c[2], c[3];
       ELSE
-        RAISE NOTICE 'migration 055: SKIP %.% (% valeurs non entieres)', c[1], c[2], bad;
+        RAISE NOTICE 'migration 056: SKIP %.% (% valeurs non entieres)', c[1], c[2], bad;
       END IF;
     END IF;
   END LOOP;
@@ -241,6 +241,6 @@ SELECT setval(
 )
 WHERE pg_get_serial_sequence('profiles', 'id') IS NOT NULL;
 
-INSERT INTO schema_version (version, name) VALUES (55, 'zones_drapeaux_entiers')
+INSERT INTO schema_version (version, name) VALUES (56, 'zones_drapeaux_entiers')
   ON CONFLICT (version) DO NOTHING;
 COMMIT;
