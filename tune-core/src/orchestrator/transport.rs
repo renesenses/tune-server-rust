@@ -11,6 +11,23 @@ enum ResoluOuFini {
     Fini(PlayResult),
 }
 
+/// Le nom d'appareil à MONTRER dans un refus, ou `None` s'il n'y en a pas.
+///
+/// Un identifiant de sortie locale porte le nom que l'utilisateur voit dans son
+/// panneau son : `local:audio-gd USB audio`. Le nommer répond à la seule
+/// question qu'il se pose — lequel de mes appareils ? Un identifiant DLNA,
+/// AirPlay ou Chromecast porte un UUID : l'afficher serait du bruit, et le
+/// message générique reste alors le bon.
+///
+/// Rien n'est INVENTÉ ici : la fonction ne rend un nom que si elle en a un.
+pub(crate) fn nom_lisible_de_l_appareil(dev_id: &str) -> Option<String> {
+    let reste = dev_id.strip_prefix("local:")?.trim();
+    if reste.is_empty() {
+        return None;
+    }
+    Some(reste.to_string())
+}
+
 /// Ce que la demande impose par-dessus le flux résolu : pochette et album
 /// demandés, sinon ceux du flux. Relevés une fois, lus par trois temps.
 pub(super) struct Habillage {
@@ -200,17 +217,51 @@ impl PlaybackOrchestrator {
             return Ok(Some(new_id));
         }
 
-        let msg = format!(
-            "zone_output_unavailable:La sortie de cette zone n'est plus disponible. Choisissez une sortie dans les réglages de la zone « {} ».",
-            zone.name
+        // 🔴 #3737 — nommer l'APPAREIL, pas seulement la zone.
+        //
+        // Jean-Luc Cassé a DEUX zones nommées « audio-gd USB audio (local) » :
+        // le nom de zone ne lui dit pas laquelle est en cause, ni ce qui a
+        // disparu. Le serveur, lui, connaît les deux bouts — il les écrit déjà
+        // au journal juste au-dessus. Les mettre dans le message ne coûte rien
+        // et transforme « une sortie » en « votre DAC ».
+        let msg = match nom_lisible_de_l_appareil(dev_id) {
+            Some(appareil) => format!(
+                "zone_output_unavailable:La sortie « {appareil} » de la zone « {} » n'est plus disponible. \
+                 Vérifiez qu'elle est branchée et allumée, ou choisissez une autre sortie dans les réglages de la zone.",
+                zone.name
+            ),
+            None => format!(
+                "zone_output_unavailable:La sortie de cette zone n'est plus disponible. \
+                 Choisissez une sortie dans les réglages de la zone « {} ».",
+                zone.name
+            ),
+        };
+        warn!(
+            zone_id,
+            zone_name = %zone.name,
+            device = dev_id,
+            "play_rejected_zone_offline"
         );
-        warn!(zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
         if let Some(ref bus) = self.event_bus {
             bus.emit(
                 "zone.playback_error",
                 serde_json::json!({
                     "zone_id": zone_id,
                     "error": msg,
+                    // 🔴 #3737 — SANS ce drapeau, le message n'atteint personne.
+                    //
+                    // Le client ouvre une fenêtre de grâce de 30 s AVANT l'appel
+                    // HTTP (`playAndSync`), pour qu'un pré-transcodage lent se
+                    // lise « chargement… » plutôt que « panne » (#1146). Ce refus
+                    // arrive systématiquement DEDANS — il est synchrone — donc il
+                    // y était avalé et l'auditeur restait sur un rouet.
+                    //
+                    // C'est mot pour mot ce que `poller/tick.rs` dit qu'il ne
+                    // faut pas faire, quinze lignes de commentaire à l'appui, et
+                    // ce que ses deux émetteurs évitent en posant `fatal: true`.
+                    // Une sortie disparue ne revient pas dans les 30 s : ce refus
+                    // est fatal par nature.
+                    "fatal": true,
                 }),
             );
         }

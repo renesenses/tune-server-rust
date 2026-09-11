@@ -476,6 +476,16 @@ pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
         }
         // lofty may report "alac" directly for some M4A files
         "alac" => "alac".to_string(),
+        // 🔴 #3849 — les deux noms de types lofty qui ne sont pas des
+        // extensions. `FileType::WavPack` s'imprime « wavpack » et
+        // `FileType::Vorbis` « vorbis » ; ni l'un ni l'autre n'est reconnu par
+        // `AudioFormat::from_extension`, qui connaît « wv » et « ogg ».
+        // Écrire l'extension rend `tracks.format` homogène avec ce que le
+        // chemin SANS étiquette écrit déjà pour les mêmes fichiers.
+        //
+        // Garde : `tout_type_lofty_catalogue_donne_un_format_reconnu`.
+        "wavpack" => "wv".to_string(),
+        "vorbis" => "ogg".to_string(),
         other => other.to_string(),
     }
 }
@@ -4326,6 +4336,124 @@ mod tests {
         };
         assert_eq!(update.title.as_deref(), Some("New Title"));
         assert_eq!(update.year, Some(2024));
+    }
+
+    /// 🔴 CONTRE-ÉPREUVE #3849, depuis le FICHIER — un `.wv` ÉTIQUETÉ doit
+    /// laisser en base un format que la résolution de lecture comprend.
+    ///
+    /// Le témoin voisin part d'une chaîne ; celui-ci part des octets. Un
+    /// fichier SANS étiquette prend le chemin `tagless_fallback`, qui écrit
+    /// l'extension (« wv ») — ce n'est pas là que le défaut vit. Un fichier
+    /// ÉTIQUETÉ — un rip EAC, comme les 13 albums de Marco Polo — prend le
+    /// chemin lofty, qui écrit `format!("{:?}", file_type)` en minuscules.
+    ///
+    /// Les deux fixtures portent le MÊME PCM (empreinte
+    /// `b0bf58385502cddf726dd94e6a542ae0` des deux côtés, mesurée avec
+    /// `wvunpack` 5.6.0) : seule l'étiquette APEv2 en queue les sépare, posée
+    /// par `wvtag` 5.6.0. Le témoin isole donc bien l'étiquette, et rien
+    /// d'autre.
+    ///
+    /// Mesuré avant correction sur ce fichier exact :
+    /// `tracks.format = Some("wavpack")`, `from_extension(...) = None`.
+    /// Conséquence en lecture (`resolve_local.rs` : `let fmt =
+    /// track.format...; let source_format = AudioFormat::from_extension(&fmt)`)
+    /// : pas de format source, donc pas de transcodage, branche « servir le
+    /// fichier brut », et MIME de repli `audio/flac`. Le Denon de Marco Polo
+    /// recevait un `.wv` annoncé FLAC.
+    ///
+    /// ⚠️ Le témoin ne pose PAS l'étiquette lui-même : `write_metadata` rend
+    /// `Err("no primary tag")` sur un `.wv` qui n'en a pas encore. C'est un
+    /// défaut distinct, non traité ici.
+    #[test]
+    fn un_wavpack_etiquete_laisse_en_base_un_format_que_la_lecture_comprend() {
+        use crate::audio::formats::AudioFormat;
+
+        let nu = format!(
+            "{}/tests/fixtures/wavpack/rip_16_44100_stereo.wv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let etiquete = format!(
+            "{}/tests/fixtures/wavpack/rip_16_44100_stereo_etiquete.wv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+
+        // Le chemin SANS étiquette n'a jamais eu le défaut : il sert de repère.
+        let format_nu = read_metadata(std::path::Path::new(&nu))
+            .and_then(|m| m.format)
+            .expect("aucune métadonnée lue sur le .wv nu");
+        assert!(
+            AudioFormat::from_extension(&format_nu).is_some(),
+            "repère cassé : le .wv NU laisse déjà un format inconnu ({format_nu})"
+        );
+
+        let lu = read_metadata(std::path::Path::new(&etiquete))
+            .expect("aucune métadonnée lue sur le .wv étiqueté");
+        assert_eq!(
+            lu.title.as_deref(),
+            Some("Lento lugubre"),
+            "la fixture doit bien être étiquetée, sinon le témoin mesure l'autre chemin"
+        );
+        let format = lu.format.expect("aucun format lu sur le .wv étiqueté");
+        assert!(
+            AudioFormat::from_extension(&format).is_some(),
+            "un .wv étiqueté laisse `tracks.format = {format:?}`, que la résolution de \
+             lecture ne reconnaît pas : la piste part BRUTE, annoncée audio/flac (#3849)"
+        );
+    }
+
+    /// 🔴 GARDE #3849 — tout type lofty d'un format CATALOGUÉ doit ressortir
+    /// de `normalize_format` sous un nom que `AudioFormat::from_extension`
+    /// reconnaît.
+    ///
+    /// Le chemin étiqueté de `read_metadata` écrit littéralement
+    /// `format!("{:?}", tagged.file_type()).to_lowercase()` dans
+    /// `tracks.format`. Deux de ces noms ne sont PAS des extensions —
+    /// « wavpack » et « vorbis » — et `from_extension` rendait `None` pour
+    /// eux. Mesuré chez Marco Polo : sans format source, la piste prend la
+    /// branche « servir le fichier brut » et le MIME retombe sur
+    /// `audio/flac` ; son Denon recevait un `.wv` annoncé FLAC.
+    ///
+    /// Le témoin part de `LIBRARY_AUDIO_EXTENSIONS`, pas d'une liste recopiée :
+    /// un format ajouté au catalogue demain est couvert sans qu'on y pense.
+    ///
+    /// Sabotage : retirer `"wavpack" => "wv"` de `normalize_format` ET
+    /// `"wavpack" => Some(Self::WavPack)` de `from_extension` — le témoin
+    /// rougit en nommant `wv`/`wavpack`.
+    #[test]
+    fn tout_type_lofty_catalogue_donne_un_format_reconnu() {
+        use crate::audio::formats::AudioFormat;
+        use crate::audio::support::LIBRARY_AUDIO_EXTENSIONS;
+
+        let mut vus = 0usize;
+        for ext in LIBRARY_AUDIO_EXTENSIONS {
+            // `iso` est extrait en DSF par le parcours, et le DSD emprunte un
+            // chemin de métadonnées qui écrit l'extension telle quelle.
+            if matches!(*ext, "iso" | "dsf" | "dff") {
+                continue;
+            }
+            let Some(ft) = lofty::file::FileType::from_ext(ext) else {
+                continue;
+            };
+            vus += 1;
+
+            // EXACTEMENT l'expression du chemin étiqueté de `read_metadata`.
+            let brut = format!("{ft:?}").to_lowercase();
+
+            for profondeur in [None, Some(16u8), Some(24u8)] {
+                let normalise = normalize_format(&brut, profondeur);
+                assert!(
+                    AudioFormat::from_extension(&normalise).is_some(),
+                    "`.{ext}` -> lofty {ft:?} -> normalize_format(\"{brut}\", {profondeur:?}) \
+                     = \"{normalise}\", que `AudioFormat::from_extension` ne reconnaît PAS. \
+                     Une piste portant ce format en base est servie BRUTE, avec le MIME de \
+                     repli `audio/flac` (#3849)."
+                );
+            }
+        }
+        assert!(
+            vus >= 8,
+            "le témoin doit couvrir tout le catalogue, seulement {vus} types lofty vus"
+        );
     }
 
     #[test]

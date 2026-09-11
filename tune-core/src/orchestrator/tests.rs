@@ -4102,6 +4102,100 @@ async fn une_zone_locale_dont_le_dac_a_disparu_refuse_la_lecture_au_lieu_de_l_ac
     assert!(!after.online);
 }
 
+/// 🔴 CONTRE-ÉPREUVE #3737 — le refus « sortie indisponible » doit porter
+/// `fatal: true`, et NOMMER l'appareil.
+///
+/// Le refus est synchrone : il arrive dans la fenêtre de grâce de 30 s que le
+/// client ouvre AVANT l'appel HTTP (`playAndSync`), pour qu'un pré-transcodage
+/// lent se lise « chargement… » plutôt que « panne » (#1146). Sans
+/// `fatal: true`, `suppressedByPlayGrace` l'avale et l'auditeur reste sur un
+/// rouet : c'est mot pour mot ce que le commentaire de `poller/tick.rs`
+/// annonce comme « pire que le silence qu'on corrige », et que ses DEUX
+/// émetteurs évitent en posant le drapeau.
+///
+/// Le nom d'appareil, lui, est la moitié du message qui manquait : Jean-Luc
+/// Cassé a deux zones nommées « audio-gd USB audio (local) », et le nom de
+/// zone seul ne lui dit pas laquelle est en cause.
+///
+/// Sabotage qui rend ce témoin ROUGE : retirer la ligne `"fatal": true` du
+/// `bus.emit` de `gate_or_rebind_offline_zone`.
+#[tokio::test]
+async fn le_refus_de_sortie_disparue_est_marque_fatal_et_nomme_l_appareil() {
+    let bus = Arc::new(EventBus::new());
+    let mut orch = test_orchestrator();
+    orch.event_bus = Some(bus.clone());
+    let zone_id = zone_locale_hors_ligne(&orch, "Salon", "local:audio-gd USB audio");
+    // Le seul périphérique encore énuméré, et il ne porte pas le nom de la
+    // zone : le rebond de #1287 ne trouvera rien, le refus doit suivre.
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("local:haut-parleurs", "Haut-parleurs").with_type("local"),
+    ));
+
+    let mut rx = bus.subscribe();
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    let err = orch
+        .gate_or_rebind_offline_zone(zone_id, &zone)
+        .await
+        .expect_err("l'appareil a disparu : la lecture doit être refusée");
+    assert!(
+        err.starts_with("zone_output_unavailable:"),
+        "sentinelle attendue : {err}"
+    );
+    assert!(
+        err.contains("audio-gd USB audio"),
+        "le message doit NOMMER l'appareil qui manque, pas seulement la zone : {err}"
+    );
+
+    // L'événement poussé au client, c'est-à-dire ce que l'auditeur verra — ou
+    // ne verra pas.
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("aucun zone.playback_error n'a été émis dans les 2 s")
+        .expect("bus fermé");
+    assert_eq!(ev.event_type, "zone.playback_error");
+    assert_eq!(
+        ev.data.get("zone_id").and_then(|v| v.as_i64()),
+        Some(zone_id)
+    );
+    assert_eq!(
+        ev.data.get("fatal").and_then(|v| v.as_bool()),
+        Some(true),
+        "sans `fatal: true` la fenêtre de grâce de 30 s avale ce message et \
+         l'auditeur ne voit qu'un rouet (#3737, Jean-Luc Cassé, 0.9.143)"
+    );
+    assert!(
+        ev.data
+            .get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.contains("audio-gd USB audio")),
+        "l'événement doit porter le même message nommé que l'erreur HTTP : {:?}",
+        ev.data.get("error")
+    );
+}
+
+/// L'autre moitié : on ne fabrique pas un nom là où il n'y en a pas.
+///
+/// Un identifiant DLNA ou AirPlay porte un UUID. L'afficher entre guillemets
+/// comme un nom d'appareil donnerait un message pire que le générique.
+#[test]
+fn seul_un_identifiant_local_fournit_un_nom_d_appareil() {
+    use crate::orchestrator::transport::nom_lisible_de_l_appareil;
+    assert_eq!(
+        nom_lisible_de_l_appareil("local:audio-gd USB audio").as_deref(),
+        Some("audio-gd USB audio")
+    );
+    assert_eq!(
+        nom_lisible_de_l_appareil("dlna:uuid:5f9ec1b3-ed59-1900-4530-00a0ded1f1cf"),
+        None
+    );
+    assert_eq!(nom_lisible_de_l_appareil("local:"), None);
+    assert_eq!(nom_lisible_de_l_appareil("local:   "), None);
+    assert_eq!(nom_lisible_de_l_appareil(""), None);
+}
+
 /// L'AUTRE moitié, et elle est indispensable : la grâce reste.
 ///
 /// L'exemption `local:` existait pour ne pas refuser une lecture pendant qu'un
