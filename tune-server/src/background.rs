@@ -1851,6 +1851,48 @@ fn gethostname() -> Option<String> {
         })
 }
 
+/// La clé du réglage qui décide si Tune s'ANNONCE comme serveur Squeezebox.
+///
+/// Volontairement distincte de `squeezebox_enabled`, qui gouverne l'autre sens
+/// du protocole — voir [`annonce_slimproto_activee`].
+pub(crate) const CLE_ANNONCE_SLIMPROTO: &str = "slimproto_discovery_enabled";
+
+/// Tune doit-il répondre aux recherches de serveurs Squeezebox du réseau ?
+///
+/// # #3809 — le réglage que le testeur cochait ne gouvernait pas ce chemin
+///
+/// Un testeur (fil `bug-bonjour-4s0m58`, v0.9.145) voit Home Assistant se
+/// remplir de découvertes Squeezebox pointant sur son PC dès que Tune démarre,
+/// et s'arrêter dès qu'il l'arrête. Il écrit : *« Que je coche ou pas la
+/// découverte Squeezebox dans Tune ne change rien. »*
+///
+/// Il a raison, et le code le dit. L'unique interrupteur portant ce nom à
+/// l'écran — `settings.squeezeboxEnabled`, « Activer la découverte
+/// Squeezebox » — écrit `squeezebox_enabled`, dont les SEULS consommateurs sont
+/// `spawn_squeezebox_poller` (ce fichier) et la page d'état
+/// `routes/squeezebox.rs`. Tous deux gouvernent Tune **client** d'un Lyrion
+/// Music Server : ils vont chercher les platines qu'un LMS déclare. Le répondeur
+/// UDP du port 3483, lui — Tune **serveur**, celui que Home Assistant trouve —
+/// n'était gouverné par rien du tout : `spawn_slimproto_server` armait
+/// `discovery::spawn` à chaque démarrage, sans condition.
+///
+/// Les deux directions portent le même mot « découverte » et sont opposées.
+/// C'est ce malentendu que ce réglage sépare.
+///
+/// # Pourquoi vrai par défaut, et pourquoi seulement l'annonce
+///
+/// Le port 3483 a DEUX volets : la connexion de contrôle en TCP, par laquelle
+/// une platine Squeezebox pilote Tune, et le répondeur UDP qui permet à cette
+/// platine de trouver Tune toute seule. #2938 et #2349 ont coûté cher sur ce
+/// point précis — cinq testeurs dont le bind 3483 échouait, plus aucune platine
+/// ne voyant Tune. Ce réglage ne touche donc QUE l'annonce : le TCP reste armé
+/// quoi qu'il arrive, et la valeur par défaut laisse le comportement
+/// exactement tel qu'il est aujourd'hui. Seul un `false` explicite fait taire
+/// l'annonce.
+pub(crate) fn annonce_slimproto_activee(valeur: Option<&str>) -> bool {
+    !matches!(valeur.map(str::trim), Some("false") | Some("0"))
+}
+
 fn spawn_slimproto_server(state: &AppState, port_http: u16) {
     let local_ip = tune_core::discovery::ssdp::get_local_ip()
         .map(|ip| ip.to_string())
@@ -1883,6 +1925,27 @@ fn spawn_slimproto_server(state: &AppState, port_http: u16) {
     // Le volet UDP du port 3483 : sans lui, une Squeezebox ou un squeezelite
     // en decouverte automatique ne trouve jamais Tune — il fallait donner
     // l'adresse a la main. Le TCP seul est une porte sans sonnette.
+    //
+    // #3809 — mais une sonnette qui sonne chez le voisin. Sur un réseau qui
+    // porte déjà un LMS, Home Assistant redécouvre Tune en boucle comme second
+    // serveur Squeezebox. Ce chemin n'avait AUCUN interrupteur : celui que le
+    // testeur cochait gouverne l'autre sens du protocole. Voir
+    // `annonce_slimproto_activee` — l'annonce seule est gouvernée, jamais
+    // l'écoute TCP armée plus haut (#2938, #2349).
+    let annonce = annonce_slimproto_activee(
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .get(CLE_ANNONCE_SLIMPROTO)
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
+    if !annonce {
+        info!(
+            reglage = CLE_ANNONCE_SLIMPROTO,
+            "slimproto_annonce_desactivee — Tune ne repond plus aux recherches              de serveurs Squeezebox ; l'ecoute TCP 3483 reste armee"
+        );
+        return;
+    }
     tune_core::slimproto::discovery::spawn(tune_core::slimproto::discovery::IdentiteServeur {
         nom: "Tune".to_string(),
         port_http,
@@ -3516,5 +3579,104 @@ mod identite_de_sortie_branchee {
                  n'a plus qu'un doublon à contempler (#2269)."
             );
         }
+    }
+}
+
+/// #3809 — l'annonce SlimProto, et l'interrupteur qui ne la gouvernait pas.
+#[cfg(test)]
+mod annonce_slimproto_tests {
+    use super::*;
+
+    #[test]
+    fn sans_reglage_l_annonce_reste_armee_comme_avant() {
+        assert!(
+            annonce_slimproto_activee(None),
+            "un parc installé ne doit pas perdre la découverte de ses platines \
+             sur une mise à jour (#2938, #2349)"
+        );
+    }
+
+    #[test]
+    fn seul_un_refus_explicite_fait_taire_l_annonce() {
+        assert!(!annonce_slimproto_activee(Some("false")));
+        assert!(!annonce_slimproto_activee(Some("0")));
+        assert!(!annonce_slimproto_activee(Some("  false  ")));
+    }
+
+    #[test]
+    fn toute_autre_valeur_laisse_l_annonce_armee() {
+        for valeur in ["true", "1", "", "oui", "False"] {
+            assert!(
+                annonce_slimproto_activee(Some(valeur)),
+                "« {valeur} » n'est pas un refus : l'annonce reste armée"
+            );
+        }
+    }
+
+    /// La clé du réglage de l'annonce n'est PAS celle de l'intégration LMS.
+    ///
+    /// Les deux portent le mot « découverte » et vont en sens inverse : c'est
+    /// le malentendu exact que #3809 relève. Les confondre rebrancherait le
+    /// répondeur UDP sur un réglage dont la valeur par défaut est `false` —
+    /// plus aucune platine Squeezebox ne trouverait Tune (#2938, #2349).
+    #[test]
+    fn l_annonce_et_l_integration_lms_ne_partagent_pas_leur_cle() {
+        assert_ne!(CLE_ANNONCE_SLIMPROTO, "squeezebox_enabled");
+    }
+
+    /// Garde de SITE : sans appelant, `annonce_slimproto_activee` serait un
+    /// réglage de plus qui ne gouverne rien — exactement le défaut que #3809
+    /// dénonce. Le dépôt a déjà payé ce motif neuf fois en v0.9.146.
+    ///
+    /// Le marqueur est épelé en deux morceaux pour que ce test ne se compte pas
+    /// lui-même.
+    #[test]
+    fn le_repondeur_udp_ne_part_qu_apres_la_lecture_du_reglage() {
+        let source = include_str!("background.rs");
+        let lecture = concat!("annonce_slimproto_", "activee(");
+        let armement = concat!("slimproto::discovery::", "spawn(");
+        let pos_lecture = source
+            .find(&format!("    let annonce = {lecture}"))
+            .expect("le réglage doit être lu dans `spawn_slimproto_server` (#3809)");
+        let pos_armement = source
+            .find(&format!("    tune_core::{armement}"))
+            .expect("le répondeur UDP doit rester armé quelque part (#2938)");
+        assert!(
+            pos_lecture < pos_armement,
+            "le répondeur UDP s'armait avant toute lecture du réglage : \
+             l'annonce n'était gouvernée par rien (#3809)"
+        );
+    }
+
+    /// Le réglage ne doit toucher QUE l'annonce.
+    ///
+    /// `SlimProtoServer::spawn` (TCP 3483) et le serveur CLI 9090 sont armés
+    /// plus haut dans la même fonction, avant le `return` du refus : les
+    /// déplacer sous la garde couperait la joignabilité des platines, ce que
+    /// #2938 et #2349 interdisent.
+    #[test]
+    fn l_ecoute_tcp_reste_armee_meme_quand_l_annonce_se_tait() {
+        // ⚠️ Le corps est borné à la FONCTION, et chaque marqueur épelé en deux
+        // morceaux. Écrit autrement, ce témoin lisait le fichier entier — donc
+        // ses propres marqueurs — et restait VERT sur son propre sabotage :
+        // mesuré le 11/09, la garde retirée de la fonction ne le faisait pas
+        // rougir.
+        let source = include_str!("background.rs");
+        let debut = source
+            .find(concat!("fn spawn_slimproto_", "server(state: &AppState"))
+            .expect("la fonction doit exister");
+        let corps = &source[debut..];
+        let corps = &corps[..corps.find("\n}\n").expect("la fonction doit se fermer")];
+        let pos_tcp = corps
+            .find(concat!("SlimProtoServer::", "new_with_state"))
+            .expect("le serveur TCP doit être armé dans cette fonction (#2938)");
+        let pos_garde = corps
+            .find(concat!("if !", "annonce {"))
+            .expect("la garde de l'annonce doit exister dans cette fonction (#3809)");
+        assert!(
+            pos_tcp < pos_garde,
+            "l'écoute TCP 3483 doit être armée AVANT la garde : sans elle, \
+             aucune platine Squeezebox ne peut plus piloter Tune (#2938, #2349)"
+        );
     }
 }
