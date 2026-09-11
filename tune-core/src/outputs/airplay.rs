@@ -172,6 +172,42 @@ impl AirplayOutput {
     }
 }
 
+impl AirplayOutput {
+    /// Rend a l'appareil la session ouverte par un ANNOUNCE accepte quand la
+    /// suite du dialogue RTSP echoue.
+    ///
+    /// `teardown()` remonte les refus depuis #2629 — mais sur ce chemin-la il
+    /// n'avait aucun APPELANT. Le refus d'un SETUP est le cas ou la session
+    /// laissee derriere nous coute le plus cher : la tentative suivante
+    /// retrouve l'appareil « occupe » par nous-memes.
+    ///
+    /// Aucune erreur n'est propagee : la cause a rendre a l'appelant reste le
+    /// refus d'origine, pas ce qu'un TEARDOWN de rattrapage en a fait. Les
+    /// deux issues sont journalisees, c'est leur objet.
+    async fn rendre_session_annoncee(
+        &self,
+        session: &mut RtspSession,
+        etape: &'static str,
+        cause: &str,
+    ) {
+        match session.teardown().await {
+            Ok(()) => info!(
+                device = %self.name,
+                etape,
+                cause,
+                "airplay_session_annoncee_rendue"
+            ),
+            Err(erreur) => warn!(
+                device = %self.name,
+                etape,
+                cause,
+                error = %erreur,
+                "airplay_session_annoncee_non_rendue"
+            ),
+        }
+    }
+}
+
 impl RtspSession {
     async fn connect(host: &str, port: u16) -> Result<Self, String> {
         let stream = tokio::net::TcpStream::connect((host, port))
@@ -537,9 +573,27 @@ impl OutputTarget for AirplayOutput {
         let local_port = udp.local_addr().map(|a| a.port()).unwrap_or(6000);
 
         session.announce().await?;
-        session.setup(local_port).await?;
+
+        // A partir d'ici l'appareil a ACCEPTE un ANNOUNCE : une session RTSP
+        // lui est ouverte. Tout echec de la suite du dialogue doit la lui
+        // RENDRE. Sans cela `play_media` rendait `Err` en laissant simplement
+        // tomber la `RtspSession` : le socket TCP se ferme, mais aucun
+        // TEARDOWN n'est parti pour la session que l'ANNOUNCE venait
+        // d'ouvrir. Rien dans RTSP n'oblige un recepteur a liberer une
+        // session parce que le canal de controle se ferme (RFC 2326, l'etat
+        // de session est independant de la connexion) : c'est donc NOUS qui
+        // fabriquions l'« appareil occupe » de la tentative suivante (#2217).
+        if let Err(raison) = session.setup(local_port).await {
+            self.rendre_session_annoncee(&mut session, "SETUP", &raison)
+                .await;
+            return Err(raison);
+        }
         let (sequence, timestamp) = self.rtp.prochain();
-        session.record(sequence, timestamp).await?;
+        if let Err(raison) = session.record(sequence, timestamp).await {
+            self.rendre_session_annoncee(&mut session, "RECORD", &raison)
+                .await;
+            return Err(raison);
+        }
 
         let server_port = session.server_port;
         let target_addr = format!("{}:{}", self.host, server_port);
@@ -985,6 +1039,144 @@ mod tests {
         assert!(error.contains("TEARDOWN refused by device: 403"));
         assert!(request.starts_with("TEARDOWN rtsp://127.0.0.1/1 RTSP/1.0"));
         assert!(request.contains("Session: stale-session\r\n"));
+    }
+
+    /// Un faux recepteur RTSP qui repond ce qu'on lui dit, methode par
+    /// methode, et garde la liste des methodes recues.
+    ///
+    /// Il parle de vrais octets RTSP sur une vraie socket : l'aiguille n'est
+    /// dans aucun fichier inspecte, elle est le DIALOGUE. Le port est pris a
+    /// 0 et relu — un port fixe se fait voler par la session voisine.
+    async fn faux_recepteur(
+        refus: Vec<(&'static str, &'static str)>,
+    ) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tache = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut lecteur = BufReader::new(socket);
+            let mut methodes: Vec<String> = Vec::new();
+            loop {
+                let mut ligne = String::new();
+                if lecteur.read_line(&mut ligne).await.unwrap_or(0) == 0 {
+                    // L'emetteur a ferme le canal de controle.
+                    break;
+                }
+                let methode = ligne.split_whitespace().next().unwrap_or("").to_string();
+                let mut taille = 0usize;
+                loop {
+                    let mut entete = String::new();
+                    if lecteur.read_line(&mut entete).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let entete = entete.trim_end().to_string();
+                    if entete.is_empty() {
+                        break;
+                    }
+                    if let Some((cle, valeur)) = entete.split_once(':') {
+                        if cle.trim().eq_ignore_ascii_case("Content-Length") {
+                            taille = valeur.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if taille > 0 {
+                    // Le corps SDP de l'ANNOUNCE. Ne pas le consommer
+                    // desynchroniserait la lecture de la requete suivante.
+                    let mut corps = vec![0_u8; taille];
+                    lecteur.read_exact(&mut corps).await.unwrap();
+                }
+                let statut = refus
+                    .iter()
+                    .find(|(m, _)| *m == methode)
+                    .map(|(_, s)| *s)
+                    .unwrap_or("200 OK");
+                methodes.push(methode);
+                lecteur
+                    .get_mut()
+                    .write_all(
+                        format!("RTSP/1.0 {statut}\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            methodes
+        });
+        (port, tache)
+    }
+
+    async fn dialogue_airplay(refus: Vec<(&'static str, &'static str)>) -> (String, Vec<String>) {
+        let (port, recepteur) = faux_recepteur(refus).await;
+        let sortie = AirplayOutput::new(
+            "Faux recepteur".into(),
+            format!("airplay-127.0.0.1-{port}"),
+            "127.0.0.1".into(),
+            port,
+        );
+        let erreur = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sortie.play_media(&PlayMedia {
+                url: "file:///dev/null",
+                mime_type: "audio/wav",
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("play_media ne doit pas rester suspendu")
+        .expect_err("le recepteur a refuse : play_media doit rendre Err");
+        let methodes = tokio::time::timeout(std::time::Duration::from_secs(5), recepteur)
+            .await
+            .expect("le faux recepteur doit finir")
+            .unwrap();
+        (erreur, methodes)
+    }
+
+    /// Le coeur de #2217 cote emetteur.
+    ///
+    /// L'appareil ACCEPTE l'ANNOUNCE — une session lui est donc ouverte — puis
+    /// refuse le SETUP par 403. `play_media` rendait `Err` en laissant tomber
+    /// la `RtspSession` : le socket TCP se ferme, et rien n'a jamais rendu la
+    /// session. C'est le sender qui fabrique l'« appareil occupe » de la
+    /// tentative suivante.
+    #[tokio::test]
+    async fn un_setup_refuse_rend_la_session_ouverte_par_l_announce() {
+        let (erreur, methodes) = dialogue_airplay(vec![("SETUP", "403 Forbidden")]).await;
+
+        assert!(
+            erreur.contains("another sender") && erreur.contains("pairing"),
+            "le 403 doit rester le diagnostic actionnable de #2629, obtenu : {erreur}"
+        );
+        assert_eq!(
+            methodes,
+            vec!["ANNOUNCE", "SETUP", "TEARDOWN"],
+            "un ANNOUNCE accepte ouvre une session cote appareil ; sur SETUP \
+             refuse elle doit lui etre RENDUE avant que le socket se ferme (#2217)"
+        );
+    }
+
+    /// Le RECORD refuse laisse la meme session derriere lui : meme exigence.
+    #[tokio::test]
+    async fn un_record_refuse_rend_aussi_la_session() {
+        let (erreur, methodes) =
+            dialogue_airplay(vec![("RECORD", "453 Not Enough Bandwidth")]).await;
+
+        assert!(erreur.contains("RECORD failed: 453"), "obtenu : {erreur}");
+        assert_eq!(methodes, vec!["ANNOUNCE", "SETUP", "RECORD", "TEARDOWN"]);
+    }
+
+    /// La contre-epreuve du rattrapage : un ANNOUNCE refuse n'a rien ouvert.
+    /// Envoyer un TEARDOWN pour une session inexistante serait du bruit sur le
+    /// canal de controle d'un appareil qui vient deja de nous dire non.
+    #[tokio::test]
+    async fn un_announce_refuse_n_envoie_aucun_teardown() {
+        let (erreur, methodes) = dialogue_airplay(vec![("ANNOUNCE", "403 Forbidden")]).await;
+
+        assert!(erreur.contains("ANNOUNCE failed: 403"), "obtenu : {erreur}");
+        assert_eq!(
+            methodes,
+            vec!["ANNOUNCE"],
+            "rien n'a ete ouvert : il n'y a rien a rendre"
+        );
     }
 
     #[test]
