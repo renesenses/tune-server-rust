@@ -1286,6 +1286,64 @@ impl DlnaOutput {
     /// fenêtre exacte que ce réglage existe pour éviter, et sur les deux chemins
     /// qui ne s'exécutent QUE lorsque l'appareil est déjà en train de refuser.
     /// À 0 — le défaut de tout le monde — cette fonction ne fait rien.
+    /// Ce que le renderer dit TENIR — sur les **deux** champs que son
+    /// AVTransport publie, pas seulement sur le premier (#3580).
+    ///
+    /// `GetMediaInfo` → `CurrentURI` est le champ nominal, et c'est le seul
+    /// que Tune lisait. Mais l'AVTransport en publie un second,
+    /// `GetPositionInfo` → `TrackURI`, et rien dans la specification n'oblige
+    /// un renderer a renseigner les deux au meme instant : un appareil qui
+    /// traite `SetAVTransportURI` comme le CHARGEMENT D'UNE PISTE peut ne
+    /// remplir que le second. Vu de Tune, un tel appareil « ne tient AUCUN
+    /// media » pour toujours — verdict [`UriVerdict::PasEncore`], zone coupee,
+    /// message d'echec — alors que le protocole nomme NOTRE flux deux octets
+    /// plus loin. C'est la seule hypothese de #3580 que le dossier nommait
+    /// sans pouvoir l'eprouver ; elle ne coute rien a fermer.
+    ///
+    /// **Le cas nominal ne paie rien.** Le second champ n'est demande que si le
+    /// premier est vide, c'est-a-dire uniquement sur le chemin qui allait de
+    /// toute facon echouer. Une lecture qui demarre garde exactement une action
+    /// SOAP par relecture, comme avant.
+    ///
+    /// **Temoin POSITIF seulement, donc regression impossible.** `TrackURI`
+    /// n'est retenu que s'il designe NOTRE flux (verdict
+    /// [`UriVerdict::Appliquee`]). Un `TrackURI` vide, etranger, ou perime ne
+    /// change rien : on rend ce que `CurrentURI` disait, au mot pres. Le seul
+    /// verdict que cette lecture peut deplacer est « echec » → « succes », et
+    /// seulement quand l'appareil a NOMME l'URL qu'on vient de lui poser.
+    ///
+    /// Un renderer sans `GetPositionInfo` garde lui aussi l'ancienne conduite :
+    /// son refus est avale, pas propage — c'est `GetMediaInfo` seul qui decide
+    /// du silence SOAP (`soap_muet`), et lui seul.
+    async fn uri_tenue_par_le_renderer(
+        &self,
+        url_attendue: &str,
+    ) -> Result<Option<String>, String> {
+        let courante = self
+            .av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+            .await
+            .map(|xml| extract_tag(&xml, "CurrentURI"))?;
+        if courante.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+            return Ok(courante);
+        }
+        let Ok(xml) = self
+            .av_action("GetPositionInfo", "<InstanceID>0</InstanceID>")
+            .await
+        else {
+            return Ok(courante);
+        };
+        let piste = extract_tag(&xml, "TrackURI");
+        if verdict_uri_appliquee(piste.as_deref(), url_attendue) == UriVerdict::Appliquee {
+            info!(
+                device = %self.name,
+                track_uri = piste.as_deref().unwrap_or("-"),
+                "dlna_uri_tenue_lue_dans_trackuri"
+            );
+            return Ok(piste);
+        }
+        Ok(courante)
+    }
+
     async fn attendre_apres_set_uri(&self) {
         let delai = self.play_delay_ms.load(Ordering::Relaxed);
         if delai > 0 {
@@ -1749,20 +1807,18 @@ impl OutputTarget for DlnaOutput {
         // qui réécrit) ne conclut rien — zéro régression sur ces appareils.
         // La verification est EXTRAITE dans `verifier_uri_appliquee` : un test
         // qui la retranscrirait resterait vert pendant que CE chemin-ci se
-        // degrade. Elle ne recoit que les deux actions qu'elle pilote — relire
-        // `CurrentURI`, et reposer l'URI puis rejouer — pour qu'un banc puisse
-        // les simuler sans renderer (#2749).
+        // degrade. Elle ne recoit que les deux actions qu'elle pilote — lire ce
+        // que le renderer TIENT (`uri_tenue_par_le_renderer`, qui consulte les
+        // DEUX champs de l'AVTransport), et reposer l'URI puis rejouer — pour
+        // qu'un banc puisse les simuler sans renderer (#2749).
         let moi = &*self;
         let media_verif = media;
+        let url_verif = media.url;
         let mime_relance = attempt_mime.as_str();
         let verif = verifier_uri_appliquee(
             media.url,
             std::time::Duration::from_millis(self.budget_reveil_ms.load(Ordering::Relaxed)),
-            || async move {
-                moi.av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
-                    .await
-                    .map(|xml| extract_tag(&xml, "CurrentURI"))
-            },
+            || async move { moi.uri_tenue_par_le_renderer(url_verif).await },
             || async move {
                 warn!(device = %moi.name, url = media_verif.url, ctrl = %moi.url_av_transport(), "dlna_play_acquitte_mais_pas_applique_relance");
                 let _ = moi
@@ -1870,9 +1926,11 @@ impl OutputTarget for DlnaOutput {
                 } else {
                     format!(
                         "Le renderer a acquitté Play mais ne tient toujours AUCUN média après {secondes} s \
-                         (CurrentURI vide) : il ne joue pas autre chose, il n'a rien chargé. Un ampli en \
-                         veille réseau (Denon/HEOS) met 15 à 30 s à sortir de veille et à basculer sur son \
-                         entrée réseau — allumez-le, puis relancez"
+                         (ni CurrentURI ni TrackURI) : il ne joue pas autre chose, il n'a rien chargé. \
+                         Tune ne peut pas dire POURQUOI : l'appareil répond et n'exécute pas. Sur un ampli \
+                         en veille réseau (Denon/HEOS, Marantz), relancer aussitôt aboutit souvent — la \
+                         première tentative l'a réveillé ; le délai de bascule varie d'un appareil et d'un \
+                         état à l'autre, et peut dépasser cette attente"
                     )
                 });
             }
@@ -2666,6 +2724,16 @@ fn arret_effectif(transport_resp: &str) -> bool {
 /// rien. Le releve de terrain (AVR-X1600H, 0.9.121) donne 15 a 30 s entre
 /// l'ordre et l'URI reellement posee : une borne PRISE DANS cette plage ne
 /// corrigerait qu'une partie des cas, elle doit donc la couvrir en entier.
+///
+/// ⚠️ **Cette plage n'est PAS une loi, et le message d'echec ne doit plus la
+/// citer.** Le meme AVR-X1600H, mesure en 0.9.145 (ticket support 109,
+/// #3580) : 3 min 06 s entre le premier clic et la premiere URI tenue, ampli
+/// sous tension pendant toute la fenetre ; et 4,9 s quand il vient de jouer.
+/// Le testeur a conteste le « 15 a 30 s » affiche, et il avait raison de le
+/// faire — c'est un releve fait sur UN appareil dans UN etat, promu en
+/// explication generale. La borne reste a 30 s parce que la grace de
+/// chargement du sondeur la contraint (ci-dessous), pas parce que 30 s
+/// suffiraient : sur cet ampli-la, elles ne suffisent pas.
 ///
 /// **Pourquoi pas plus.** La borne haute n'est pas un gout. `play()` a DEJA
 /// bascule la zone en lecture et arme la grace de chargement du sondeur

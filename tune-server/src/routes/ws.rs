@@ -137,7 +137,10 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
         );
         let output_capabilities =
             crate::routes::zones::output_capabilities(state, z.output_device_id.as_deref()).await;
-        zone_snaps.push(serde_json::json!({
+        // #3514 — la meme decision que celle que la route applique, calculee
+        // par la meme fonction : ce n'est pas au client de la deviner.
+        let peut_avancer = crate::routes::playback::can_skip_next_publie(state, zid, &ps).await;
+        let mut snap = serde_json::json!({
             "zone_id": zid,
             "name": z.name,
             "online": z.online,
@@ -170,7 +173,37 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             ),
             "output_capabilities": output_capabilities,
             "resolving": ps.resolving,
-        }));
+            // #2337 — la decision « suivant » PUBLIEE, comme dans les trois
+            // autres charges utiles. Sans elle, le client qui nait sur
+            // l'instantane la recalcule depuis l'ordre brut de la file et se
+            // trompe des que l'aleatoire est arme.
+            "can_skip_next": peut_avancer,
+        });
+        // 🔴 #2672 — LA QUATRIEME CHARGE UTILE DE ZONE.
+        //
+        // `injecter_reglages_renderer` existait pour que les charges utiles
+        // decrivant une meme zone en disent la meme chose ; sa garde ne comptait
+        // que TROIS sites d'appel (`list_zones`, `get_zone`, `build_zone_json`)
+        // parce que son `code_de_production()` ne lisait que `zones.rs`,
+        // `lecture.rs` et le corps de `build_zone_json`. L'instantane du
+        // WebSocket — celui que le client rend a CHAQUE (re)connexion de son
+        // socket — n'y figurait pas, et ne portait aucun des neuf reglages
+        // « Avance · renderer ». Un client qui remplace son objet zone par cet
+        // instantane voyait les neuf cles DISPARAITRE : cases rendues
+        // decochees, base intacte.
+        //
+        // C'est exactement le defaut de #2672, une charge utile plus loin — et
+        // la cinquieme fois que cette famille coute un ticket (#2055, #2092,
+        // #2337, #2672, celle-ci). La garde lit desormais ce corps-ci aussi.
+        //
+        // ⚠️ Ce que cela NE prouve pas : que c'est CE chemin qui decochait les
+        // cases de Sevy Tabroc. Son declencheur declare est « a chaque
+        // changement de fichiers », que `build_zone_json` explique deja. Ceci
+        // est un residu de la meme famille, ferme parce qu'il est ouvert.
+        if let Some(obj) = snap.as_object_mut() {
+            crate::routes::zones::injecter_reglages_renderer(obj, &zone_repo, zid);
+        }
+        zone_snaps.push(snap);
     }
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
