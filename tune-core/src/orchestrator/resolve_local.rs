@@ -1122,6 +1122,43 @@ impl PlaybackOrchestrator {
             let (session_id, tx, data_ready) =
                 self.streamer.create_session(wav_info, true, 128).await;
 
+            // ── L'en-tête WAV part DANS le canal : le dire, sinon il en part DEUX ──
+            //
+            // La tâche ci-dessous envoie `build_wav_header(...)` comme premier
+            // bloc du canal. Sans ce drapeau, `handle_stream` croit le canal nu
+            // et PRÉFIXE son propre en-tête : le renderer reçoit 44 octets
+            // d'en-tête, puis 44 octets d'en-tête pris pour de l'audio, puis le
+            // porteur DoP — décalé de 44 octets, soit **2 modulo la trame de 6**
+            // (2 canaux x 24 bits).
+            //
+            // Le marqueur `0x05`/`0xFA` ne tombe alors sur l'octet de poids fort
+            // d'AUCUN mot de 24 bits : le DAC ne verrouille pas en DSD et joue le
+            // train DSD comme du PCM, c'est-à-dire du bruit blanc, dès le premier
+            // échantillon et sur toute la piste (#1894, Marco Polo, WiiM Pro ;
+            // #2369 sur la sortie locale — les deux tickets ne partagent que ce
+            // segment).
+            //
+            // Mesuré sur banc : `EN-TETES RIFF A = [0, 44]`, charge utile à
+            // l'octet 88. Les TROIS autres sessions de conversion posent ce
+            // drapeau — dont une dans ce même fichier, quelques centaines de
+            // lignes plus bas (le transcodage progressif), plus
+            // `resolve_stream.rs:485` et `:1577`. Celle-ci, née avec #1830 en
+            // 0.9.82, ne l'a jamais posé — c'est la date de la régression.
+            //
+            // Il rend aussi son office à la réserve d'en-tête
+            // (`wav_header_stash`), qu'un canal non déclaré ne remplit jamais :
+            // un renderer qui sonde avant de jouer consommait l'en-tête sur une
+            // connexion qu'il referme.
+            {
+                let sessions = self.streamer.sessions_state();
+                let sessions = sessions.lock().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    session
+                        .wav_header_included
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+
             info!(
                 file = %file_path,
                 dsd_rate,
@@ -1137,9 +1174,25 @@ impl PlaybackOrchestrator {
                 .and_then(|e| e.to_str())
                 .unwrap_or("dsf")
                 .to_lowercase();
+            let duree_ms = track.duration_ms as u64;
             tokio::task::spawn_blocking(move || {
                 // Send WAV header first
-                let wav_hdr = crate::audio::wav::build_wav_header(dop_channels, dop_rate, 24);
+                //
+                // AVEC la durée. `handle_stream` préfixait jusqu'ici son propre
+                // en-tête, bâti sur `StreamInfo` — donc avec `duration_ms` —, et
+                // c'était CELUI-LÀ que le renderer lisait. L'en-tête du canal,
+                // lui, partait sans durée : `UNKNOWN_DATA_SIZE`, soit un bloc
+                // `data` de ~2 Gio. Maintenant que la session déclare son
+                // en-tête, c'est celui-ci que le renderer lit : il doit dire la
+                // même chose qu'avant, sans quoi ce correctif échangerait un
+                // défaut contre un autre — une taille de 2 Gio là où le
+                // `Content-Length` annonce la vraie longueur.
+                let wav_hdr = crate::audio::wav::build_wav_header_with_duration(
+                    dop_channels,
+                    dop_rate,
+                    24,
+                    Some(duree_ms),
+                );
                 let rt = tokio::runtime::Handle::current();
                 let _ = rt.block_on(tx.send(wav_hdr.to_vec()));
                 data_ready.notify_one();
