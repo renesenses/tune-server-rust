@@ -102,10 +102,20 @@ pub(super) fn joindre_dr_par_piste(
     items: Vec<tune_core::db::models::Track>,
 ) -> Vec<Value> {
     let track_ids: Vec<i64> = items.iter().filter_map(|t| t.id).collect();
-    let dr = TrackMetadataRepo::with_backend(state.backend.clone())
+    let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
+    let dr = meta_repo
         .get_key_for_tracks("dr_track", &track_ids)
         .unwrap_or_default();
-    let mut items = super::albums::attach_track_tags(items, &[("dynamic_range", &dr)]);
+    // #3924 — la PROVENANCE de cette valeur, appariée à elle. Patatorz
+    // (fil 1683) demande si le nombre affiché est le sien ou celui de Tune ;
+    // depuis la v0.9.145 les deux existent, et jusqu'ici aucune route ne les
+    // séparait. Même appariement que sur les pistes d'un album — la fonction
+    // est PARTAGÉE, un second lecteur écrit ici aurait fini par diverger.
+    let dr_source = super::albums::provenance_du_dr(&meta_repo, &track_ids, &dr);
+    let mut items = super::albums::attach_track_tags(
+        items,
+        &[("dynamic_range", &dr), ("dynamic_range_source", &dr_source)],
+    );
     // #3518 — « Idéalement sur la même route que les autres listes de pistes,
     // pour que le tableau ait les mêmes colonnes partout » : ce chemin est le
     // seam unique des autres surfaces (`/library/tracks` filtré, non filtré,

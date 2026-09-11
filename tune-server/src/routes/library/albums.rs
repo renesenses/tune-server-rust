@@ -344,7 +344,13 @@ pub(super) async fn get_album(
             // `dynamic_range_source` dit d'OÙ sort la valeur (#1388) :
             // `album_tag` quand une piste porte `ALBUM DYNAMIC RANGE`,
             // `track_average` quand Tune l'a déduite de la moyenne arrondie des
-            // `DYNAMIC RANGE` des pistes. Les deux clés apparaissent et
+            // `dr_track` des pistes.
+            //
+            // ⚠️ `track_average` ne dit RIEN de la provenance de ces pistes :
+            // depuis la v0.9.145 un `dr_track` peut venir du tag du fichier ou
+            // du calcul de la passe d'analyse. Cette seconde question se lit
+            // piste par piste, sur les listes de pistes, sous la clé de même
+            // nom `dynamic_range_source` (#3924). Les deux clés apparaissent et
             // disparaissent ENSEMBLE : un client qui ne connaît que la première
             // ne voit aucun changement, celui qui lit la seconde peut annoncer
             // une mesure ou une déduction plutôt que de les confondre.
@@ -407,9 +413,15 @@ pub(super) async fn album_tracks(
         .get_key_for_tracks("dr_track", &track_ids)
         .ou_defaut_journalise();
 
+    // #3924 — et D'OU elle sort. Voir `provenance_du_dr`.
+    let dr_source = provenance_du_dr(&meta_repo, &track_ids, &dynamic_range);
     let mut items = attach_track_tags(
         items,
-        &[("grouping", &grouping), ("dynamic_range", &dynamic_range)],
+        &[
+            ("grouping", &grouping),
+            ("dynamic_range", &dynamic_range),
+            ("dynamic_range_source", &dr_source),
+        ],
     );
     // #3518 — « # Plays » et « Last Played », deux colonnes de la maquette V1
     // (Levente, 07/09/2026) que la route ne portait pas. C'est LE SITE D'APPEL :
@@ -418,6 +430,49 @@ pub(super) async fn album_tracks(
     // `indisponible` côté client.
     attacher_ecoutes(&state, &mut items);
     Json(json!(items))
+}
+
+/// La PROVENANCE du Dynamic Range par piste, appariée à sa valeur (#3924).
+///
+/// `track_metadata['dr_source']` dit laquelle des deux fabriques a produit le
+/// `dr_track` de la ligne : `"tag"` quand le scan l'a lu dans le fichier,
+/// `"analysis"` quand la passe d'analyse l'a calculé sur les échantillons
+/// (`tune-core/src/audio/replaygain.rs`). Patatorz, fil 1683, pose exactement
+/// cette question — « mesurés, calculés ou juste reportés » — et aucune route
+/// ne portait la réponse : la clef existait en base et n'était servie nulle
+/// part.
+///
+/// # Pourquoi un appariement, et pas la carte brute
+///
+/// La clef de sortie `dynamic_range_source` ne doit JAMAIS apparaître sans
+/// `dynamic_range` : une provenance seule décrirait une valeur que la charge
+/// utile ne porte pas, et l'écran afficherait « calculé par Tune » à côté
+/// d'un champ vide. C'est le même contrat que la fiche d'album, dont les deux
+/// clefs apparaissent et disparaissent ensemble (`album_detail`).
+///
+/// L'inverse reste permis et ne se comble PAS : un `dr_track` écrit avant que
+/// `dr_source` existe (toute base antérieure à la v0.9.145) n'a pas de
+/// provenance connue, et en inventer une — « tag », puisque c'était le seul
+/// producteur d'alors — serait un affichage fabriqué sur une base qu'un
+/// rattrapage a pu depuis recalculer. La valeur sort, la provenance se tait.
+///
+/// ⚠️ Fonction partagée, et non deux lectures écrites côte à côte : les deux
+/// surfaces de pistes (`albums::album_tracks` et `tracks::joindre_dr_par_piste`)
+/// servent le MÊME champ sous le MÊME nom, et c'est exactement l'argument que
+/// porte déjà `attach_track_tags` juste en dessous.
+pub(super) fn provenance_du_dr(
+    repo: &TrackMetadataRepo,
+    track_ids: &[i64],
+    dr: &std::collections::HashMap<i64, String>,
+) -> std::collections::HashMap<i64, String> {
+    // `ou_defaut_journalise` et non `unwrap_or_default` (#2861) : une panne de
+    // base rendrait ici une carte VIDE, indiscernable d'une bibliothèque sans
+    // provenance connue, et sans une ligne de journal.
+    let mut source = repo
+        .get_key_for_tracks("dr_source", track_ids)
+        .ou_defaut_journalise();
+    source.retain(|track_id, _| dr.contains_key(track_id));
+    source
 }
 
 /// Recopie des tags étendus (`track_metadata`) sur les pistes sérialisées
