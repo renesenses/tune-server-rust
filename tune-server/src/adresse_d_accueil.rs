@@ -27,8 +27,9 @@
 /// — schéma ET port — parce que le défaut qu'on corrige est précisément une
 /// adresse incomplète recopiée de mémoire.
 ///
-/// `urls` vient de `routes::system::server_urls(port)` : l'IP du réseau local
-/// d'abord (ou `TUNE_ADVERTISE_IP`), puis `<hôte>.local` quand il y en a un.
+/// `urls` vient de `routes::system::server_urls(config)` : l'IP du reseau
+/// local d'abord (reglage advertised_ip / TUNE_ADVERTISED_IP), puis le nom
+/// `.local` quand il y en a un.
 pub(crate) fn lignes_d_accueil(port: u16, urls: &[String]) -> Vec<String> {
     let mut lignes = vec!["Tune is listening. Open it at:".to_string()];
 

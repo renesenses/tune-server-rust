@@ -984,9 +984,11 @@ async fn configure_deezer_proxy(state: &AppState, config: &TuneConfig) {
             .as_any_mut()
             .downcast_mut::<tune_core::streaming::deezer::DeezerService>()
         {
-            let server_ip = tune_core::discovery::ssdp::get_local_ip()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "127.0.0.1".into());
+            // config.server_ip() honors advertised_ip (TUNE_ADVERTISED_IP);
+            // raw get_local_ip() ignored it, so renderers received proxy URLs
+            // on the autodetected interface even when an explicit LAN address
+            // was configured.
+            let server_ip = config.server_ip();
             deezer.set_proxy_base_url(Some(format!(
                 "http://{}:{}/deezer-proxy",
                 server_ip, config.port
