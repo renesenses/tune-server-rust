@@ -94,8 +94,13 @@ mod journal_pcm_alsa_ouvert;
 mod karaoke_plugin;
 #[path = "licence_activation_immediate.rs"]
 mod licence_activation_immediate;
+
+// `autotests = false` : sans cette declaration, le temoin du verdict de licence
+// ne serait jamais compile (#3673).
 #[path = "licence_grace_visible.rs"]
 mod licence_grace_visible;
+#[path = "licence_verdict_absent.rs"]
+mod licence_verdict_absent;
 #[path = "mono_downmix_dit_son_indisponibilite.rs"]
 mod mono_downmix_dit_son_indisponibilite;
 #[path = "notarisation_bornes.rs"]
