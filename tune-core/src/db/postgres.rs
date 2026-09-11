@@ -148,7 +148,17 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
 pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE alarms ADD COLUMN IF NOT EXISTS days_of_week TEXT DEFAULT '1111111'",
     "ALTER TABLE alarms ADD COLUMN IF NOT EXISTS multi_zone_ids TEXT",
-    "ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden TEXT DEFAULT '0'",
+    // SMALLINT, pas TEXT : cette colonne n'est declaree par AUCUN script
+    // numerote — `ENSURE_COLUMNS` est son seul redacteur de schema, et c'est
+    // pour cela qu'elle est restee TEXT sur les DEUX chemins. En TEXT, NEUF des
+    // onze requetes de `zone_repo.rs` qui la touchent tombent (`COALESCE types
+    // text and integer cannot be matched`, `operator does not exist: text =
+    // integer`) : `list()` se rabat alors sur `list_all()` et une zone
+    // SUPPRIMEE reparait, `count()`/`count_online()`/`count_active()` rendent 0.
+    // Meme mecanisme et meme forme que `listen_history.album_id` juste plus bas
+    // (#2860). Sur une base existante ou elle est deja TEXT, cet ADD est un
+    // no-op et c'est la migration 056 qui la convertit (#3726).
+    "ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden SMALLINT DEFAULT 0",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS dsd_mode TEXT DEFAULT 'auto'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS autoplay_enabled TEXT DEFAULT '0'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped'",

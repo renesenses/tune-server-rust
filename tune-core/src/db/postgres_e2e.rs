@@ -537,6 +537,179 @@ async fn pg_zones_round_trip() {
     assert_eq!(all.len(), 1);
 }
 
+/// #3726 — les ECRITURES de zone et de profil, sur une VRAIE base PostgreSQL.
+///
+/// Le frère `pg_sqlite_type_parity` compare des SCHEMAS. Il ne voit pas un
+/// rédacteur : le jour où quelqu'un réécrit `let val: String = if online …`,
+/// le schéma ne bouge pas, la porte de parité reste VERTE, et l'écriture
+/// redevient muette sur tout le parc. C'est ce témoin-ci qui garde les
+/// rédacteurs, et il ne se nourrit pas lui-même — il appelle les méthodes du
+/// dépôt, pas le SQL qu'il aurait recopié.
+///
+/// Ce que mesurait #3726, le 11/09/2026, sur PostgreSQL 16.15 :
+///
+/// | site | base native | base migrée |
+/// |---|---|---|
+/// | `update_muted` / `update_online` / `set_online_by_device` | `column … is of type smallint but expression is of type text` | passait |
+/// | `update_gapless_enabled` / `update_fixed_volume` / `update_autoplay_enabled` | idem (smallint / integer) | passait |
+/// | `update_dsp` | `column "dsp_preset_id" is of type bigint but expression is of type text` | MÊME ERREUR |
+/// | `count()` / `count_online()` / `count_active()` / `list()` | `COALESCE types text and integer cannot be matched` | idem |
+/// | INSERT profil SSO | `column "is_admin" is of type smallint but expression is of type boolean` | écrivait `true` en toutes lettres |
+///
+/// Les trois contre-épreuves de la fin REJOUENT les formes d'avant et EXIGENT
+/// l'erreur PostgreSQL littérale. Sans elles, ce témoin serait vert le jour où
+/// la colonne redeviendrait TEXT — il ne prouverait que l'accord du schéma avec
+/// lui-même.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3726_ecritures_de_zone_et_de_profil() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::zone_repo::ZoneRepo;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let repo = ZoneRepo::with_backend(db.clone());
+
+    let id = repo
+        .create("Salon", Some("dlna"), Some("uuid:3726"))
+        .unwrap();
+
+    // ── Les six réglages qui liaient une CHAÎNE dans une colonne numérique ──
+    repo.update_muted(id, true).expect("update_muted");
+    repo.update_online(id, true).expect("update_online");
+    repo.update_gapless_enabled(id, false)
+        .expect("update_gapless_enabled");
+    repo.update_fixed_volume(id, true)
+        .expect("update_fixed_volume");
+    repo.update_autoplay_enabled(id, true)
+        .expect("update_autoplay_enabled");
+    repo.set_online_by_device("uuid:3726", true)
+        .expect("set_online_by_device");
+
+    let z = repo.get(id).unwrap().unwrap();
+    assert!(z.muted, "muted n'est pas relu à 1");
+    assert!(z.online, "online n'est pas relu à 1");
+    assert!(!z.gapless_enabled, "gapless_enabled n'est pas relu à 0");
+    assert!(z.fixed_volume, "fixed_volume n'est pas relu à 1");
+    // `autoplay_enabled` est délibérément absente de `COLS` (le commentaire de
+    // `sql::COLS` dit pourquoi) : `row_to_zone` la rend toujours `false`. C'est
+    // `get_autoplay_enabled` qui lit la colonne.
+    assert!(
+        repo.get_autoplay_enabled(id),
+        "autoplay_enabled n'est pas relu à 1"
+    );
+
+    // ── #3726 point 1 : `update_dsp`, mort sur TOUT PostgreSQL ──────────────
+    repo.update_dsp(id, Some(7), true).expect("update_dsp");
+    assert_eq!(
+        repo.get_dsp_config(id).expect("get_dsp_config"),
+        (Some(7), true),
+        "le réglage DSP de zone ne se relit pas"
+    );
+    repo.update_dsp(id, None, false).expect("update_dsp(None)");
+    assert_eq!(
+        repo.get_dsp_config(id).expect("get_dsp_config"),
+        (None, false),
+        "effacer le préréglage DSP ne se relit pas"
+    );
+
+    // ── #3726 point 3 : les comptes de zones, et la SUPPRESSION ─────────────
+    assert_eq!(repo.count().expect("count"), 1);
+    assert_eq!(repo.count_online().expect("count_online"), 1);
+    assert_eq!(repo.list().expect("list").len(), 1);
+
+    repo.delete(id).expect("delete");
+    // Le cœur du défaut : `delete` est un masquage. Tant que `is_hidden` était
+    // TEXT, la requête filtrée tombait, le `Err(_)` attrape-tout de `list()` se
+    // rabattait sur `list_all()`, et la zone supprimée REPARAISSAIT.
+    assert_eq!(
+        repo.list().expect("list après delete").len(),
+        0,
+        "la zone supprimée reparaît : `list()` s'est rabattue sur `list_all()`"
+    );
+    assert_eq!(repo.count().expect("count après delete"), 0);
+    assert_eq!(repo.count_online().expect("count_online après delete"), 0);
+    assert!(
+        repo.is_device_hidden("uuid:3726"),
+        "is_device_hidden ne voit pas la zone masquée"
+    );
+    repo.unhide(id).expect("unhide");
+    assert_eq!(repo.count().expect("count après unhide"), 1);
+
+    // ── #3726 point 2 : le profil SSO ───────────────────────────────────────
+    let _ = db.execute("DELETE FROM profiles WHERE username = 'sso@3726'", &[]);
+    let is_admin: i64 = i64::from(true);
+    let nom = "sso@3726";
+    let couleur = "#6366f1";
+    db.execute_returning_id(
+        "INSERT INTO profiles (username, display_name, email, avatar_path, is_admin) \
+         VALUES (?, ?, ?, ?, ?)",
+        &[
+            &nom as &dyn ToSqlValue,
+            &nom as &dyn ToSqlValue,
+            &nom as &dyn ToSqlValue,
+            &couleur as &dyn ToSqlValue,
+            &is_admin as &dyn ToSqlValue,
+        ],
+    )
+    .expect("création de profil SSO");
+    let relu = db
+        .query_one(
+            "SELECT is_admin FROM profiles WHERE username = ?",
+            &[&nom as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        relu.first().and_then(|v| v.as_bool()),
+        Some(true),
+        "`as_bool()` rend None sur un SqlValue::Text : un administrateur se \
+         connecterait avec le rôle `user`"
+    );
+    let _ = db.execute("DELETE FROM profiles WHERE username = 'sso@3726'", &[]);
+
+    // ── CONTRE-ÉPREUVES : les formes d'AVANT doivent encore être refusées ───
+    //
+    // Elles prouvent que ce témoin garde la réparation et pas seulement
+    // l'accord du schéma avec lui-même : si `zones.online` redevenait TEXT, ces
+    // trois-là passeraient et le test tomberait ici.
+    let texte = "1";
+    let erreur = db
+        .execute(
+            "UPDATE zones SET online = ? WHERE id = ?",
+            &[&texte as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        )
+        .expect_err("lier une CHAÎNE dans `zones.online` doit être REFUSÉ");
+    assert!(
+        erreur.contains("is of type smallint") && erreur.contains("is of type text"),
+        "erreur inattendue pour `online <- text` : {erreur}"
+    );
+
+    let erreur = db
+        .execute(
+            "UPDATE zones SET dsp_preset_id = ? WHERE id = ?",
+            &[&texte as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        )
+        .expect_err("lier une CHAÎNE dans `zones.dsp_preset_id` doit être REFUSÉ");
+    assert!(
+        erreur.contains("is of type bigint") && erreur.contains("is of type text"),
+        "erreur inattendue pour `dsp_preset_id <- text` : {erreur}"
+    );
+
+    let booleen = true;
+    let erreur = db
+        .execute(
+            "UPDATE profiles SET is_admin = ? WHERE id = 1",
+            &[&booleen as &dyn ToSqlValue],
+        )
+        .expect_err("lier un BOOLÉEN dans `profiles.is_admin` doit être REFUSÉ");
+    assert!(
+        erreur.contains("is of type smallint") && erreur.contains("is of type boolean"),
+        "erreur inattendue pour `is_admin <- boolean` : {erreur}"
+    );
+
+    repo.delete(id).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_playlists_round_trip() {
     use crate::db::artist_repo::ArtistRepo;
