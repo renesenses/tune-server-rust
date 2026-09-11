@@ -3134,7 +3134,7 @@ fn header_read_retries_only_transient_kinds() {
 #[test]
 fn device_not_available_flags_device_gone() {
     let gone = Arc::new(AtomicBool::new(false));
-    let mut cb = make_stream_error_cb(gone.clone());
+    let mut cb = make_stream_error_cb(gone.clone(), Arc::new(RingStarvation::new()));
     cb(cpal::StreamError::DeviceNotAvailable);
     assert!(gone.load(Ordering::SeqCst));
     // Repeated invocations (WASAPI fires once, but belt-and-suspenders)
@@ -3143,12 +3143,68 @@ fn device_not_available_flags_device_gone() {
     assert!(gone.load(Ordering::SeqCst));
 }
 
+/// #3205 — un `BufferUnderrun` doit être COMPTÉ, et ne doit pas démonter le
+/// flux.
+///
+/// C'est le signal que cpal remonte quand ALSA a sous-alimenté le DAC : le
+/// processus n'a pas été ordonnancé à temps. Le `warn!` qui le journalise est
+/// plafonné à une ligne par seconde ; sans ce compteur, une heure à 5 000
+/// sous-alimentations et une heure à 3 600 rendent le même journal, et le
+/// chiffre dont #3205 fait dépendre le sort du noyau `PREEMPT_RT` de Tune OS
+/// n'existe pas.
+#[test]
+fn buffer_underrun_est_compte_sans_demonter_le_flux() {
+    let gone = Arc::new(AtomicBool::new(false));
+    let famine = Arc::new(RingStarvation::new());
+    let mut cb = make_stream_error_cb(gone.clone(), famine.clone());
+
+    cb(cpal::StreamError::BufferUnderrun);
+    cb(cpal::StreamError::BufferUnderrun);
+
+    assert_eq!(
+        famine.snapshot().driver_underruns,
+        2,
+        "les sous-alimentations du pilote ne sont pas comptées"
+    );
+    assert!(
+        !gone.load(Ordering::SeqCst),
+        "un underrun ALSA est routinier : il ne doit pas démonter le flux"
+    );
+    assert_eq!(
+        famine.snapshot().events,
+        0,
+        "l'underrun du PILOTE a été porté au compte de la famine de l'ANNEAU"
+    );
+}
+
+/// #3205 — seul `BufferUnderrun` compte. Un débranchement d'USB ou une erreur
+/// de backend ne doit pas gonfler le chiffre qui décide du noyau RT.
+#[test]
+fn les_autres_erreurs_ne_comptent_aucune_sous_alimentation() {
+    let gone = Arc::new(AtomicBool::new(false));
+    let famine = Arc::new(RingStarvation::new());
+    let mut cb = make_stream_error_cb(gone.clone(), famine.clone());
+
+    cb(cpal::StreamError::DeviceNotAvailable);
+    cb(cpal::StreamError::BackendSpecific {
+        err: cpal::BackendSpecificError {
+            description: "autre chose".into(),
+        },
+    });
+
+    assert_eq!(
+        famine.snapshot().driver_underruns,
+        0,
+        "une erreur qui n'est pas une sous-alimentation a été comptée comme telle"
+    );
+}
+
 /// Other stream errors (ALSA underruns are routine) must NOT tear down
 /// playback.
 #[test]
 fn generic_stream_error_does_not_flag_device_gone() {
     let gone = Arc::new(AtomicBool::new(false));
-    let mut cb = make_stream_error_cb(gone.clone());
+    let mut cb = make_stream_error_cb(gone.clone(), Arc::new(RingStarvation::new()));
     cb(cpal::StreamError::BackendSpecific {
         err: cpal::BackendSpecificError {
             description: "underrun".into(),

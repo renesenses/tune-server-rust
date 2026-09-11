@@ -1555,6 +1555,7 @@ fn compteurs_de_famine(famine: Option<tune_core::outputs::traits::OutputRingStar
         return json!({
             "total_underruns": Value::Null,
             "ring_starvation_missing_samples": Value::Null,
+            "driver_underruns": Value::Null,
             "served_samples": Value::Null,
             "stream_ms": Value::Null,
         });
@@ -1562,6 +1563,11 @@ fn compteurs_de_famine(famine: Option<tune_core::outputs::traits::OutputRingStar
     json!({
         "total_underruns": f.events,
         "ring_starvation_missing_samples": f.missing_samples,
+        // #3205 — le compteur qui décide du noyau RT. `total_underruns` garde
+        // son nom historique et son sens : la famine de l'ANNEAU. Celui-ci
+        // compte les fois où le PILOTE n'a pas été servi à temps, ce qu'aucun
+        // chiffre ne disait jusqu'ici.
+        "driver_underruns": f.driver_underruns,
         "served_samples": f.served_samples,
         "stream_ms": f.stream_ms,
     })
