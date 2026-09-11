@@ -1610,7 +1610,19 @@ mod tests {
         taille_de_lot: usize,
         cache: &std::path::Path,
     ) -> std::collections::BTreeMap<String, (String, bool, i64)> {
-        importer_par_lots_detail(fichiers, taille_de_lot, cache)
+        importer_par_lots_avec_reglage(fichiers, taille_de_lot, cache, true)
+    }
+
+    /// Comme [`importer_par_lots`], en choisissant `quality_split` : c'est lui
+    /// qui met — ou non — le dossier dans la clé d'une ligne album, et un
+    /// coffret ne se regroupe pas de la même façon des deux côtés (#3855).
+    fn importer_par_lots_avec_reglage(
+        fichiers: &[ScannedFile],
+        taille_de_lot: usize,
+        cache: &std::path::Path,
+        quality_split: bool,
+    ) -> std::collections::BTreeMap<String, (String, bool, i64)> {
+        importer_par_lots_detail_avec_reglage(fichiers, taille_de_lot, cache, quality_split)
             .into_iter()
             .map(|(chemin, (artiste, compilation, id, _titre))| {
                 (chemin, (artiste, compilation, id))
@@ -1628,6 +1640,16 @@ mod tests {
         taille_de_lot: usize,
         cache: &std::path::Path,
     ) -> std::collections::BTreeMap<String, (String, bool, i64, String)> {
+        importer_par_lots_detail_avec_reglage(fichiers, taille_de_lot, cache, true)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn importer_par_lots_detail_avec_reglage(
+        fichiers: &[ScannedFile],
+        taille_de_lot: usize,
+        cache: &std::path::Path,
+        quality_split: bool,
+    ) -> std::collections::BTreeMap<String, (String, bool, i64, String)> {
         use std::sync::Arc;
         use tune_core::db::album_repo::AlbumRepo;
         use tune_core::db::artist_repo::ArtistRepo;
@@ -1640,7 +1662,7 @@ mod tests {
         let artistes = ArtistRepo::with_backend(backend.clone());
         let mut imp = TrackImporter::new(
             backend.clone(),
-            true,
+            quality_split,
             cache.to_path_buf(),
             PorteeDuScan::TOUT,
         );
@@ -2215,6 +2237,109 @@ mod tests {
                 ("Various Artists", true),
                 "témoin : une vraie compilation le reste, fichier illisible compris ({chemin})"
             );
+        }
+    }
+
+    /// #3855 — LE COFFRET DE PIERRE M, à la forme exacte de ses captures.
+    ///
+    /// « The Complete RCA Album Collection » (Reiner / Chicago SO, 63 CD). Le
+    /// dossier `CD02 Strauss Ein Heldenleben` contient six fichiers ; l'éditeur
+    /// de balises affiche `Album Artist <different>` : cinq portent
+    /// « Fritz Reiner », un porte « Chicago Symphony Orchestra, Fritz Reiner ».
+    /// Dans Tune il voyait DEUX albums de même titre — la piste 2 d'un côté,
+    /// les pistes 1, 3, 4, 5 et 6 de l'autre.
+    ///
+    /// La clé d'une ligne album porte l'identifiant de l'artiste d'album
+    /// (`import`, plus bas) : deux valeurs d'`album_artist` dans un même
+    /// dossier ⇒ deux lignes. `decide_compilation_albums` est la règle qui
+    /// absorbe ce cas ; ce témoin mesure qu'elle joue, sur les DEUX réglages de
+    /// `quality_split` — le sien n'est pas connu, et l'album de 399 titres de
+    /// sa capture ne s'explique que si le dossier ne fait pas partie de la clé.
+    ///
+    /// ⚠️ Ce témoin ne dit PAS que le défaut de Pierre M est corrigé chez lui :
+    /// sa version n'est pas établie et une base construite avant #3232/#3528
+    /// garde ce que le premier scan a décidé. Il dit que le code d'aujourd'hui
+    /// ne le reproduit plus.
+    #[test]
+    fn un_coffret_dont_l_album_artist_varie_dans_un_dossier_ne_se_coupe_pas_en_deux_3855() {
+        const TITRE: &str = "The Complete RCA Album Collection";
+        const LONG: &str = "Chicago Symphony Orchestra, Fritz Reiner";
+        let tmp = tempfile::tempdir().unwrap();
+        let coffret = tmp.path().join("Reiner").join(TITRE);
+        let disque = |n: &str| coffret.join(n);
+        for n in ["CD01 Bartok", "CD02 Strauss Ein Heldenleben", "CD03 Mahler"] {
+            std::fs::create_dir_all(disque(n)).unwrap();
+        }
+        let piste = |dossier: &str,
+                     fichier: &str,
+                     artiste: &str,
+                     album_artiste: &str,
+                     numero_disque: u32,
+                     numero: u32| {
+            let chemin = disque(dossier).join(fichier).to_string_lossy().into_owned();
+            let mut f = sf(&chemin);
+            f.metadata = Some(TrackMetadata {
+                title: Some(format!("d{numero_disque} p{numero}")),
+                artist: Some(artiste.to_string()),
+                album: Some(TITRE.to_string()),
+                album_artist: Some(album_artiste.to_string()),
+                disc_number: Some(numero_disque),
+                track_number: Some(numero),
+                year: Some(2013),
+                ..Default::default()
+            });
+            f
+        };
+        let mut fichiers = Vec::new();
+        for p in 1..=3u32 {
+            fichiers.push(piste(
+                "CD01 Bartok",
+                &format!("0{p}.flac"),
+                "Bela Bartok",
+                LONG,
+                1,
+                p,
+            ));
+        }
+        // LE dossier de sa capture : six fichiers, deux valeurs d'album_artist.
+        for p in 1..=6u32 {
+            let aa = if p == 2 { LONG } else { "Fritz Reiner" };
+            fichiers.push(piste(
+                "CD02 Strauss Ein Heldenleben",
+                &format!("0{p}.flac"),
+                "Richard Strauss",
+                aa,
+                2,
+                p,
+            ));
+        }
+        for p in 1..=3u32 {
+            fichiers.push(piste(
+                "CD03 Mahler",
+                &format!("0{p}.flac"),
+                "Gustav Mahler",
+                LONG,
+                3,
+                p,
+            ));
+        }
+        for quality_split in [true, false] {
+            let cache = tmp.path().join(format!("cache{quality_split}"));
+            let rendu = importer_par_lots_avec_reglage(&fichiers, 500, &cache, quality_split);
+            let lignes: std::collections::BTreeSet<i64> = rendu
+                .iter()
+                .filter(|(chemin, _)| chemin.contains("CD02"))
+                .map(|(_, (_, _, id))| *id)
+                .collect();
+            assert_eq!(
+                lignes.len(),
+                1,
+                "quality_split={quality_split} : les six pistes de CD02 se sont réparties \
+                 sur {} lignes album — c'est le symptôme de #3855. Rendu : {rendu:?}",
+                lignes.len()
+            );
+            // Et le coffret ne perd aucune piste au passage.
+            assert_eq!(rendu.len(), 12, "quality_split={quality_split}");
         }
     }
 }
