@@ -102,16 +102,37 @@ pub mod sql {
     /// ignore les colonnes 5 et 6, et la réponse JSON garde sa forme.
     pub fn list_favorites_all_pour_tri<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT id, profile_id, item_type, item_id, created_at, item_name, item_artist FROM favorites WHERE profile_id = {} ORDER BY created_at DESC",
+            "SELECT id, profile_id, item_type, item_id, created_at, item_name, item_artist, position FROM favorites WHERE profile_id = {} ORDER BY created_at DESC",
             d.placeholder(1)
         )
     }
 
     pub fn list_favorites_by_type_pour_tri<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT id, profile_id, item_type, item_id, created_at, item_name, item_artist FROM favorites WHERE profile_id = {} AND item_type = {} ORDER BY created_at DESC",
+            "SELECT id, profile_id, item_type, item_id, created_at, item_name, item_artist, position FROM favorites WHERE profile_id = {} AND item_type = {} ORDER BY created_at DESC",
             d.placeholder(1),
             d.placeholder(2)
+        )
+    }
+
+    /// Efface le rang manuel de TOUT un onglet avant d'en reposer un
+    /// (#2001, piste 2). Voir [`super::ProfileRepo::reorder_favorites`] pour ce
+    /// que cette remise à zéro garantit.
+    pub fn raz_ordre_manuel<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE favorites SET position = NULL WHERE profile_id = {} AND item_type = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn poser_rang_manuel<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE favorites SET position = {} WHERE profile_id = {} AND item_type = {} AND item_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
         )
     }
 }
@@ -322,6 +343,9 @@ impl ProfileRepo {
             CleDeTri::Artiste => favorites_sort::trier_par(&mut rows, tri.sens, |r| {
                 r.get(6).and_then(|v| v.as_string())
             }),
+            CleDeTri::Manuel => favorites_sort::trier_par_rang(&mut rows, tri.sens, |r| {
+                r.get(7).and_then(|v| v.as_i64())
+            }),
             // La table `favorites` ne mémorise pas d'album — l'instantané
             // d'identité n'en garde pas. La clé reste acceptée (elle a un sens
             // pour les favoris de service) mais ne range rien ici : l'ordre
@@ -329,6 +353,74 @@ impl ProfileRepo {
             CleDeTri::Album => {}
         }
         Ok(rows.iter().map(row_to_favorite).collect())
+    }
+
+    /// Pose l'ordre manuel d'UN onglet (#2001, piste 2) — le geste que Tades
+    /// avait tenté à la souris. Rend le nombre de favoris effectivement rangés.
+    ///
+    /// `item_ids` est la liste **complète et ordonnée** de l'onglet
+    /// `(profile_id, item_type)`. Ce que cela garantit, et qu'il faut savoir
+    /// avant d'appeler :
+    ///
+    /// 1. **Un réordonnancement porte sur l'onglet ENTIER.** La transaction
+    ///    remet d'abord tout l'onglet à « sans rang », puis numérote `1..n` les
+    ///    ids reçus. Un favori de cet onglet absent de la liste retourne donc
+    ///    **en fin** d'ordre manuel — jamais à un rang qui entrerait en
+    ///    collision avec un autre. Les autres onglets du profil, et les autres
+    ///    profils, ne sont pas touchés : la clé du rang est
+    ///    `(profile_id, item_type)`.
+    /// 2. **Retiré puis rajouté = en fin de liste.** Le rang vit dans la ligne
+    ///    `favorites` ; `remove_favorite` la supprime, le rang avec elle, et
+    ///    `add_favorite` en crée une neuve à `position` NULL. Un favori qui
+    ///    revient ne reprend donc PAS son ancienne place — il faut le
+    ///    redéplacer. C'est délibéré : rien ne permet de distinguer « je l'ai
+    ///    retiré par erreur » de « je le remets pour le mettre ailleurs », et
+    ///    ressusciter un rang produirait des trous invisibles.
+    /// 3. **Deux clients qui réordonnent en même temps : le dernier gagne, en
+    ///    entier.** Tout passe dans un seul `write_tx`, donc jamais un
+    ///    entrelacement des deux ordres — l'état final est l'un des deux ordres
+    ///    envoyés, complet. Il n'y a **pas** de détection de conflit : un client
+    ///    qui réordonne à partir d'une liste périmée écrase l'autre sans le
+    ///    savoir. C'est le compromis assumé pour une liste de favoris ; une
+    ///    garde optimiste demanderait un jeton de version côté client.
+    ///
+    /// Un id inconnu du profil ne fait pas d'erreur : il ne met simplement à
+    /// jour aucune ligne, et n'est pas compté. Un id répété n'est honoré qu'à
+    /// sa première occurrence, pour que les rangs restent une suite sans trou.
+    pub fn reorder_favorites(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        item_ids: &[i64],
+    ) -> Result<usize, String> {
+        let mut vus = std::collections::HashSet::new();
+        let uniques: Vec<i64> = item_ids
+            .iter()
+            .copied()
+            .filter(|id| vus.insert(*id))
+            .collect();
+
+        let pid = profile_id.to_string();
+        let raz = self.dialect_sql(sql::raz_ordre_manuel, sql::raz_ordre_manuel);
+        let pose = self.dialect_sql(sql::poser_rang_manuel, sql::poser_rang_manuel);
+
+        let mut ranges = 0usize;
+        self.db.write_tx(&mut |tx| {
+            ranges = 0;
+            let params: [&dyn ToSqlValue; 2] = [&pid, &item_type];
+            tx.execute(&raz, &params)?;
+            for (rang, item_id) in uniques.iter().enumerate() {
+                // Rangs et identifiants liés en TEXTE : le miroir PostgreSQL
+                // porte ces colonnes en TEXT, et y lier un i64 rend
+                // « column is of type text but expression is of type bigint »
+                // — le 500 que `add_favorite` documente déjà juste au-dessus.
+                let (rang, iid) = ((rang as i64 + 1).to_string(), item_id.to_string());
+                let params: [&dyn ToSqlValue; 4] = [&rang, &pid, &item_type, &iid];
+                ranges += tx.execute(&pose, &params)?;
+            }
+            Ok(())
+        })?;
+        Ok(ranges)
     }
 }
 
@@ -464,6 +556,170 @@ mod tests {
     fn le_tri_par_album_est_sans_effet_sur_les_favoris_locaux() {
         let repo = repo_avec_favoris_dates();
         assert_eq!(range(&repo, "album", "asc"), vec![4, 3, 2, 1]);
+    }
+
+    // --- Ordre manuel (#2001, piste 2) ---------------------------------
+    //
+    // Le geste de Tades : deplacer un favori. Le tri par champ (piste 1) ne le
+    // rend pas — il range d'apres une donnee, pas d'apres une intention.
+
+    #[test]
+    fn l_ordre_manuel_se_relit_dans_l_ordre_pose() {
+        let repo = repo_avec_favoris_dates();
+        // L'ordre d'ajout est 1,2,3,4 ; la liste par defaut rend 4,3,2,1.
+        // On demande explicitement 3,1,4,2 — un ordre qu'AUCUN champ ne produit.
+        assert_eq!(
+            repo.reorder_favorites(1, "track", &[3, 1, 4, 2]).unwrap(),
+            4
+        );
+        assert_eq!(range(&repo, "manual", "asc"), vec![3, 1, 4, 2]);
+        assert_eq!(range(&repo, "manual", "desc"), vec![2, 4, 1, 3]);
+    }
+
+    /// Le temoin anti-regression : poser un ordre manuel ne doit RIEN changer
+    /// a ce que rendent les chemins existants. La colonne `position` n'est lue
+    /// que par `sort=manual`.
+    #[test]
+    fn poser_un_ordre_manuel_ne_change_pas_les_listes_sans_tri() {
+        let repo = repo_avec_favoris_dates();
+        let avant = ids(repo.list_favorites(1, None).unwrap());
+        let avant_titre = range(&repo, "title", "asc");
+        repo.reorder_favorites(1, "track", &[3, 1, 4, 2]).unwrap();
+        assert_eq!(
+            ids(repo.list_favorites(1, None).unwrap()),
+            avant,
+            "sans tri, l'ordre servi doit rester celui d'avant"
+        );
+        assert_eq!(range(&repo, "title", "asc"), avant_titre);
+        assert_eq!(range(&repo, "added", "asc"), vec![1, 2, 3, 4]);
+    }
+
+    /// Garantie 2 : le rang vit dans la LIGNE. La retirer l'emporte.
+    #[test]
+    fn un_favori_retire_puis_rajoute_revient_en_fin_d_ordre_manuel() {
+        let repo = repo_avec_favoris_dates();
+        repo.reorder_favorites(1, "track", &[3, 1, 4, 2]).unwrap();
+        assert_eq!(range(&repo, "manual", "asc"), vec![3, 1, 4, 2]);
+
+        // Le favori 3 etait PREMIER. On le retire, on le remet.
+        repo.remove_favorite(1, "track", 3).unwrap();
+        repo.add_favorite(1, "track", 3).unwrap();
+
+        // Il ne reprend pas sa place : il est sans rang, donc en fin de liste.
+        assert_eq!(range(&repo, "manual", "asc"), vec![1, 4, 2, 3]);
+        // Et il y reste en descendant — regle 2, un sans-rang ne remonte pas.
+        assert_eq!(range(&repo, "manual", "desc"), vec![2, 4, 1, 3]);
+    }
+
+    /// Garantie 1 : le rang est par (profil, item_type). Ranger les albums ne
+    /// doit pas defaire l'ordre des pistes — c'est exactement le motif
+    /// « un chemin corrige, les autres nus » applique aux onglets.
+    #[test]
+    fn reordonner_un_onglet_ne_touche_pas_les_autres() {
+        let repo = repo_avec_favoris_dates();
+        for album in [10_i64, 20, 30] {
+            repo.add_favorite(1, "album", album).unwrap();
+        }
+        repo.reorder_favorites(1, "track", &[3, 1, 4, 2]).unwrap();
+        repo.reorder_favorites(1, "album", &[30, 10, 20]).unwrap();
+
+        let tri = TriFavoris::depuis(Some("manual"), Some("asc")).unwrap();
+        assert_eq!(
+            ids(repo.list_favorites_sorted(1, Some("track"), tri).unwrap()),
+            vec![3, 1, 4, 2],
+            "l'ordre des pistes a survecu au rangement des albums"
+        );
+        assert_eq!(
+            ids(repo.list_favorites_sorted(1, Some("album"), tri).unwrap()),
+            vec![30, 10, 20]
+        );
+    }
+
+    /// Garantie 1, seconde moitie : un reordonnancement porte sur l'onglet
+    /// ENTIER. Un favori absent de la liste envoyee — ajoute par un autre
+    /// client entre-temps, par exemple — repart en fin, jamais a un rang qui
+    /// entrerait en collision.
+    #[test]
+    fn un_favori_absent_de_la_liste_envoyee_repart_en_fin() {
+        let repo = repo_avec_favoris_dates();
+        assert_eq!(repo.reorder_favorites(1, "track", &[4, 2]).unwrap(), 2);
+        let ordre = range(&repo, "manual", "asc");
+        assert_eq!(&ordre[..2], &[4, 2], "les deux ranges viennent en tete");
+        // Les deux autres n'ont pas de rang : ils ferment la marche, departages
+        // par `created_at DESC` comme partout ailleurs.
+        assert_eq!(&ordre[2..], &[3, 1]);
+    }
+
+    /// Garantie 3 : deux reordonnancements successifs ne s'entrelacent pas.
+    /// Le second ecrase entierement le premier — pas de rang orphelin qui
+    /// survivrait du premier ordre.
+    #[test]
+    fn le_dernier_reordonnancement_gagne_en_entier() {
+        let repo = repo_avec_favoris_dates();
+        repo.reorder_favorites(1, "track", &[1, 2, 3, 4]).unwrap();
+        repo.reorder_favorites(1, "track", &[4, 3]).unwrap();
+        let ordre = range(&repo, "manual", "asc");
+        assert_eq!(&ordre[..2], &[4, 3]);
+        // 1 et 2 avaient les rangs 1 et 2 au premier tour. S'ils les avaient
+        // gardes, ils seraient revenus EN TETE, devant 4 et 3.
+        assert_eq!(
+            &ordre[2..],
+            &[2, 1],
+            "les rangs du premier tour sont effaces"
+        );
+    }
+
+    #[test]
+    fn un_id_inconnu_ou_repete_ne_fait_pas_d_erreur() {
+        let repo = repo_avec_favoris_dates();
+        // 999 n'est pas en favori : il n'est pas compte, et ne decale rien.
+        assert_eq!(repo.reorder_favorites(1, "track", &[2, 999, 1]).unwrap(), 2);
+        assert_eq!(&range(&repo, "manual", "asc")[..2], &[2, 1]);
+
+        // Un id repete n'est honore qu'a sa premiere occurrence : les rangs
+        // restent une suite sans trou.
+        assert_eq!(repo.reorder_favorites(1, "track", &[3, 3, 1]).unwrap(), 2);
+        assert_eq!(&range(&repo, "manual", "asc")[..2], &[3, 1]);
+    }
+
+    #[test]
+    fn l_ordre_manuel_d_un_profil_ne_franchit_pas_les_profils() {
+        let repo = repo_avec_favoris_dates();
+        let bob = repo.create("bob", None, None).unwrap();
+        repo.add_favorite(bob, "track", 1).unwrap();
+        repo.add_favorite(bob, "track", 2).unwrap();
+
+        repo.reorder_favorites(1, "track", &[3, 1, 4, 2]).unwrap();
+        repo.reorder_favorites(bob, "track", &[2, 1]).unwrap();
+
+        assert_eq!(range(&repo, "manual", "asc"), vec![3, 1, 4, 2]);
+        let tri = TriFavoris::depuis(Some("manual"), Some("asc")).unwrap();
+        assert_eq!(
+            ids(repo.list_favorites_sorted(bob, None, tri).unwrap()),
+            vec![2, 1]
+        );
+    }
+
+    #[test]
+    fn sql_du_rang_manuel_emet_les_placeholders_du_moteur() {
+        // Un placeholder mal forme fait echouer la requete sur UN seul moteur —
+        // et l'ordre manuel serait muet sur PostgreSQL uniquement.
+        assert_eq!(
+            sql::poser_rang_manuel(&SqliteDialect),
+            "UPDATE favorites SET position = ? WHERE profile_id = ? AND item_type = ? AND item_id = ?"
+        );
+        assert_eq!(
+            sql::poser_rang_manuel(&PostgresDialect),
+            "UPDATE favorites SET position = $1 WHERE profile_id = $2 AND item_type = $3 AND item_id = $4"
+        );
+        assert!(sql::raz_ordre_manuel(&PostgresDialect).ends_with("item_type = $2"));
+        // La colonne du rang doit etre LUE par les requetes de tri, sinon le
+        // tri manuel range sur une colonne toujours absente.
+        assert!(sql::list_favorites_all_pour_tri(&SqliteDialect).contains("item_artist, position"));
+        assert!(
+            sql::list_favorites_by_type_pour_tri(&PostgresDialect)
+                .contains("item_artist, position")
+        );
     }
 
     #[test]

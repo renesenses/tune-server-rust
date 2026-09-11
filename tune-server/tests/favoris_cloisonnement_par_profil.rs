@@ -278,15 +278,20 @@ async fn le_voisin_n_efface_pas_le_label_du_profil_1() {
 
 // --- La famille entière, pas seulement les trois de la #2560 -----------
 
-/// #2560 nomme trois routes ; les sept voisines portent le même `{id}` de
+/// #2560 nomme trois routes ; les neuf voisines portent le même `{id}` de
 /// chemin et le même défaut. Corriger les trois seules reproduirait le motif
 /// « un chemin corrigé, les autres nus ».
+///
+/// ⚠️ Cette liste est la SEULE chose qui tienne la garde sur une route
+/// neuve : elle est écrite à la main, et une route ajoutée sans y entrer
+/// naît nue en silence. C'est ce qui a failli arriver aux deux routes de
+/// réordonnancement (#2001 piste 2), écrites avant que #2560 existe.
 #[tokio::test]
 async fn aucune_route_de_la_famille_favoris_ne_sert_le_voisin() {
     let state = etat();
     let app = appli(&state);
 
-    let surfaces: [(&str, &str, Option<Value>); 10] = [
+    let surfaces: [(&str, &str, Option<Value>); 12] = [
         ("GET", "/api/v1/profiles/1/favorites", None),
         (
             "POST",
@@ -324,6 +329,21 @@ async fn aucune_route_de_la_famille_favoris_ne_sert_le_voisin() {
             "POST",
             "/api/v1/profiles/1/favorites/facets/remove",
             Some(json!({"facet": "label", "value": "ECM Records"})),
+        ),
+        // #2001 piste 2 — les deux routes de reordonnancement. Ce sont des
+        // ECRITURES, et elles portent le meme `{id}` de chemin que les dix
+        // au-dessus : les laisser hors de cette liste rejouerait « un chemin
+        // corrige, les autres nus » sur les routes les plus recentes.
+        (
+            "POST",
+            "/api/v1/profiles/1/favorites/reorder",
+            Some(json!({"item_type": "album", "item_ids": [22]})),
+        ),
+        (
+            "POST",
+            "/api/v1/profiles/1/favorites/streaming/reorder",
+            Some(json!({"item_type": "track",
+                        "items": [{"service": "tidal", "service_id": "42"}]})),
         ),
     ];
 

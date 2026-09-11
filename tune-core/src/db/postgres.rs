@@ -57,8 +57,13 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             album TEXT,\
             cover_url TEXT,\
             created_at TEXT,\
+            position TEXT,\
             UNIQUE(profile_id, item_type, service, service_id)\
         )",
+    // Rang manuel (#2001 piste 2) sur une base ou la table PRE-EXISTE : le
+    // CREATE IF NOT EXISTS ci-dessus ne l'a alors pas ajoutee. Instruction
+    // separee, car une table qui echoue ne doit jamais bloquer la suivante.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS position TEXT",
     // Only re-attach the TEXT default while the column IS still text.
     // On a database healed by migration 012 the column is BIGINT and
     // already defaults to `nextval('streaming_favorites_id_seq')`, so
