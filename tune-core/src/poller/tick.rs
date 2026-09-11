@@ -731,7 +731,31 @@ impl PositionPoller {
             // Deux lignes par incident, jamais plus, quelle qu'en soit la
             // durée — voir `decisions::SuiviFamine`.
             let famine_courante = famine_anneau.unwrap_or_default();
-            if let Some(constat) = famine_anneau.and_then(|f| ps.famine.observer(f)) {
+            // —— #3814 : le dénominateur qui manquait ——
+            //
+            // `duree_ms` est l'horloge du PILOTE. Sans le temps réel à côté,
+            // « plus aucun rappel servi à court » se lit indifféremment comme
+            // « l'anneau est réalimenté » et comme « le pilote ne réclame
+            // plus rien ». Le sondeur, lui, a le droit de lire l'heure.
+            let ecoule_famine_ms = ps
+                .famine_releve_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let constat_famine = match famine_anneau {
+                Some(releve) if status.state == TransportState::Playing => {
+                    ps.famine_releve_at = Some(Instant::now());
+                    ps.famine.observer(releve, ecoule_famine_ms)
+                }
+                _ => {
+                    // Zone en pause ou à l'arrêt, ou sortie sans anneau : le
+                    // repère ne vaut plus rien. Le garder ferait compter toute
+                    // la pause comme du retard de pilote.
+                    ps.famine.reinitialiser();
+                    ps.famine_releve_at = None;
+                    None
+                }
+            };
+            if let Some(constat) = constat_famine {
                 match constat {
                     decisions::FamineAnneau::Debut(ep) => warn!(
                         zone_id,
@@ -752,9 +776,40 @@ impl PositionPoller {
                         echantillons_manquants = ep.echantillons_manquants,
                         silence_ms = ep.silence_ms,
                         duree_ms = ep.duree_ms,
+                        ecoule_ms = ep.ecoule_ms,
                         "famine_anneau_fin — l'anneau audio est réalimenté ; bilan de \
                          l'épisode : `silence_ms` de zéros envoyés au DAC sur `duree_ms` \
                          d'audio joué"
+                    ),
+                    decisions::FamineAnneau::RappelArrete(ep) => warn!(
+                        zone_id,
+                        device = %device_id,
+                        position_ms = status.position_ms,
+                        flux_ms = ep.flux_ms,
+                        rappels_a_court = ep.rappels_a_court,
+                        echantillons_manquants = ep.echantillons_manquants,
+                        silence_ms = ep.silence_ms,
+                        duree_ms = ep.duree_ms,
+                        ecoule_ms = ep.ecoule_ms,
+                        "rappel_pilote_arrete — le pilote de la sortie a cessé de réclamer \
+                         de l'audio : son horloge n'a avancé que de `duree_ms` sur \
+                         `ecoule_ms` de temps réel. Ce n'est PAS un anneau réalimenté : \
+                         mieux nourrir le producteur n'y changerait rien, la panne est \
+                         en aval de l'anneau"
+                    ),
+                    decisions::FamineAnneau::RappelRepris(ep) => warn!(
+                        zone_id,
+                        device = %device_id,
+                        position_ms = status.position_ms,
+                        flux_ms = ep.flux_ms,
+                        rappels_a_court = ep.rappels_a_court,
+                        echantillons_manquants = ep.echantillons_manquants,
+                        silence_ms = ep.silence_ms,
+                        duree_ms = ep.duree_ms,
+                        ecoule_ms = ep.ecoule_ms,
+                        "rappel_pilote_repris — le pilote réclame de nouveau son dû ; \
+                         bilan de l'arrêt : `duree_ms` d'audio joué sur `ecoule_ms` de \
+                         temps réel"
                     ),
                 }
             }

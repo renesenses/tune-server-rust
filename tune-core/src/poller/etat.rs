@@ -163,6 +163,13 @@ pub(super) struct ZonePollState {
     /// N'entre dans AUCUNE décision : rien ici n'arrête, ne relance ni
     /// n'avance quoi que ce soit. C'est un champ de constat.
     pub(super) famine: decisions::SuiviFamine,
+    /// L'instant du dernier relévé versé à [`ZonePollState::famine`].
+    ///
+    /// L'horloge murale vit ICI et pas dans le suivi : celui-ci reste
+    /// purement comptable, donc testable sans dormir. `None` tant qu'aucun
+    /// relévé n'a été pris, ou après une remise à zéro (pause, arrêt, sortie
+    /// sans anneau).
+    pub(super) famine_releve_at: Option<Instant>,
 }
 
 impl ZonePollState {
@@ -212,6 +219,7 @@ impl ZonePollState {
             gapless_dsd_skip_pos: None,
             gapless_armed: None,
             famine: decisions::SuiviFamine::default(),
+            famine_releve_at: None,
         }
     }
 }
