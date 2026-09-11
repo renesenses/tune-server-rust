@@ -445,6 +445,26 @@ pub struct Reassociation {
     pub endpoint_id: String,
 }
 
+/// Ce qu'une zone RESEAU garde de l'identite physique de son appareil (#3919).
+///
+/// Rendu par [`ZoneRepo::zones_par_mac`]. La decision, elle, est prise par
+/// l'appelant : ce type ne fait que porter la ligne telle que la base la
+/// donne, lignes masquees comprises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneParMac {
+    pub id: i64,
+    /// `zones.output_device_id` — pour un appareil sans identifiant durable,
+    /// la forme derivee de l'adresse (`{type}-{host}-{port}`), celle qui
+    /// change au changement d'adresse.
+    pub output_device_id: String,
+    /// `zones.output_type` — vide si la colonne est NULL.
+    pub output_type: String,
+    /// `zones.is_hidden` — une zone SUPPRIMEE est masquee, pas effacee. Elle
+    /// se re-ancre sans se demasquer, sinon la mise a jour ressusciterait ce
+    /// que l'utilisateur avait efface.
+    pub masquee: bool,
+}
+
 /// Ce qu'une passe d'identite de sortie a change, et ce qu'elle a refuse.
 ///
 /// Les refus sont RENDUS et non avales : c'est de quoi un journal, un rapport
@@ -1498,6 +1518,62 @@ impl ZoneRepo {
             .flatten()
             .and_then(|cols| cols.first().and_then(|v| v.as_string()))
             .filter(|id| !id.trim().is_empty())
+    }
+
+    /// Les zones dont `zones.mac` vaut cette MAC (#3919).
+    ///
+    /// `zones.mac` est ecrite a la CREATION de la zone par [`Self::set_identity`],
+    /// depuis `DiscoveredDevice::mac_address` — pour l'AirPlay la MAC portee
+    /// par le nom d'instance `_raop` (« 800A805D4DEE@DMP-A8 »), sinon le TXT
+    /// `deviceid`/`id`, a defaut la table ARP. La documentation de
+    /// `set_identity` la nomme deja « the durable cross-protocol key: it
+    /// survives UUID changes AND DHCP renumbering » — mais rien ne la relisait
+    /// quand l'appareil revenait a une autre adresse, et la decouverte creait
+    /// alors une zone NEUVE a cote de celle qui portait les reglages.
+    ///
+    /// Les lignes MASQUEES sont incluses : une zone supprimee detient encore
+    /// son `output_device_id`, et la re-ancrer sans la demasquer est la seule
+    /// facon de garder la suppression effective au changement d'adresse
+    /// suivant — c'est ce que fait deja `find_hidden_id_by_name`.
+    ///
+    /// Base anterieure a la colonne `mac` : liste vide plutot qu'une erreur,
+    /// meme repli que [`Self::find_visible_zone_by_identity`].
+    pub fn zones_par_mac(&self, mac: &str) -> Vec<ZoneParMac> {
+        let mac = mac.trim();
+        if mac.is_empty() {
+            return Vec::new();
+        }
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT id, COALESCE(output_device_id, ''), COALESCE(output_type, ''), \
+             COALESCE(is_hidden, 0) FROM zones \
+             WHERE mac IS NOT NULL AND mac <> '' AND UPPER(mac) = UPPER({placeholder}) \
+             ORDER BY id"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&mac];
+        // Lecture FORTE, meme raison que `find_visible_zone_by_identity` : une
+        // zone creee a l'instant doit etre visible de l'evenement de
+        // decouverte suivant.
+        match self.db.query_many_strong(&sql, &params) {
+            Ok(lignes) => lignes
+                .iter()
+                .filter_map(|l| {
+                    Some(ZoneParMac {
+                        id: l.first()?.as_i64()?,
+                        output_device_id: l.get(1)?.as_string()?,
+                        output_type: l.get(2)?.as_string()?,
+                        masquee: l.get(3).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+                    })
+                })
+                .collect(),
+            Err(e) => {
+                tracing::debug!(error = %e, "zones_par_mac_indisponible");
+                Vec::new()
+            }
+        }
     }
 
     /// Ecrire l'identifiant d'endpoint stable d'une zone.
