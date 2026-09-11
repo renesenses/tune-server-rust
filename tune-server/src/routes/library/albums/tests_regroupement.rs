@@ -822,3 +822,133 @@ async fn la_paire_declaree_distincte_prime_sur_la_pochette() {
         "{corps}"
     );
 }
+
+// ── #3396 — « de quoi écarter un groupe, pour qu'un faux positif ne revienne
+//    pas indéfiniment » ───────────────────────────────────────────────────────
+
+/// Le geste d'écart existait (`POST /albums/{id}/distinct/{autre}`, #1276) et
+/// la phase 1 le respectait ; la phase 0 l'IGNORAIT. Le faux positif écarté
+/// était donc reproposé à chaque analyse, et l'écran Métadonnées n'offrait que
+/// de le réécarter — sans fin.
+///
+/// Le témoin part de la charge utile réelle : un vrai éclatement d'enregistreur
+/// inséré en base, lu par la route publique. Il vérifie les trois temps, et
+/// surtout le troisième : l'écart est un ARBITRAGE, pas une suppression. Les
+/// deux lignes `albums` survivent, et révoquer l'arbitrage rend le groupe
+/// identique — rien n'a été perdu.
+#[tokio::test]
+async fn la_paire_ecartee_sort_du_rapport_et_y_revient_si_l_arbitrage_est_revoque() {
+    let (app, state) = serveur();
+    let (cible, eclat, _, _) = le_disque_eclate(&state);
+
+    let (_, avant) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    let groupe_avant = groupe_contenant(&avant, (cible, eclat))
+        .unwrap_or_else(|| panic!("la phase 0 doit voir l'éclatement : {avant}"));
+    assert_eq!(groupe_avant["indice"], "dossier_et_titre", "{groupe_avant}");
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{cible}/distinct/{eclat}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+
+    let (_, pendant) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    assert!(
+        groupe_contenant(&pendant, (cible, eclat)).is_none(),
+        "un groupe écarté ne doit plus être proposé : {pendant}"
+    );
+    // L'écart ne détruit RIEN : les deux albums et leurs pistes sont intacts.
+    assert!(album_existe(&state, cible) && album_existe(&state, eclat));
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ?",
+            eclat
+        ),
+        1,
+        "l'écart ne déplace aucune piste"
+    );
+
+    let (statut, corps) = appel(
+        &app,
+        "DELETE",
+        &format!("/api/v1/library/albums/{cible}/distinct/{eclat}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+
+    let (_, apres) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    let groupe_apres = groupe_contenant(&apres, (cible, eclat))
+        .unwrap_or_else(|| panic!("l'arbitrage révoqué, le groupe revient : {apres}"));
+    assert_eq!(
+        groupe_apres, groupe_avant,
+        "le groupe revient à l'identique"
+    );
+}
+
+/// Un coffret de trois tranches dont l'utilisateur n'a écarté qu'UNE paire.
+///
+/// L'arbitrage porte sur une paire, pas sur le groupe : le membre écarté sort,
+/// les deux autres restent proposés, et les champs dérivés — `pistes`,
+/// `numeros_complementaires` — ne décrivent plus que ce qui est rendu. Sans
+/// cela, un groupe amputé annoncerait un total qu'il ne contient pas.
+#[tokio::test]
+async fn un_groupe_de_trois_perd_le_membre_ecarte_et_garde_les_autres() {
+    let (app, state) = serveur();
+    let artiste_id = artiste(&state, "Keith Jarrett");
+    let un = album(&state, "Sun Bear Concerts Disc 1", artiste_id);
+    let deux = album(&state, "Sun Bear Concerts Disc 2", artiste_id);
+    let trois = album(&state, "Sun Bear Concerts Disc 3", artiste_id);
+    piste(&state, un, artiste_id, 1, "/musique/sun bear/01.flac");
+    piste(&state, un, artiste_id, 2, "/musique/sun bear/02.flac");
+    piste(&state, deux, artiste_id, 3, "/musique/sun bear/03.flac");
+    piste(&state, deux, artiste_id, 4, "/musique/sun bear/04.flac");
+    piste(&state, trois, artiste_id, 5, "/musique/sun bear/05.flac");
+    piste(&state, trois, artiste_id, 6, "/musique/sun bear/06.flac");
+
+    let (_, avant) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    let groupe = groupe_contenant(&avant, (un, trois))
+        .unwrap_or_else(|| panic!("les trois tranches forment un groupe : {avant}"));
+    assert_eq!(groupe["pistes"].as_u64(), Some(6), "{groupe}");
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/{un}/distinct/{trois}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+
+    let (_, apres) = appel(&app, "GET", "/api/v1/library/albums/eclates").await;
+    assert!(
+        groupe_contenant(&apres, (un, trois)).is_none(),
+        "la paire arbitrée ne survit dans aucun groupe : {apres}"
+    );
+    let restant = groupe_contenant(&apres, (un, deux))
+        .unwrap_or_else(|| panic!("les deux autres tranches restent proposées : {apres}"));
+    let membres: Vec<i64> = restant["albums"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_i64())
+        .collect();
+    assert_eq!(membres, vec![un, deux], "{restant}");
+    assert_eq!(
+        restant["pistes"].as_u64(),
+        Some(4),
+        "le total ne compte que les membres rendus : {restant}"
+    );
+    assert_eq!(restant["numeros_complementaires"], true, "{restant}");
+    // Le troisième disque existe toujours, avec ses pistes.
+    assert!(album_existe(&state, trois));
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ?",
+            trois
+        ),
+        2
+    );
+}
