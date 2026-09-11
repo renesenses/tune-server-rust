@@ -4029,7 +4029,12 @@ mod zone_figee_tests {
 
     /// « Jamais observée » n'est pas « immobile ». Une zone navigateur — aucun
     /// périphérique, donc `poller/tick.rs` fait `continue` avant son unique
-    /// `update_position` — ne doit pas être déclarée figée par défaut.
+    /// `update_position` — ne doit pas être déclarée figée par son immobilité.
+    ///
+    /// `NowPlaying::default()` n'annonce AUCUNE durée : c'est le cas où le
+    /// serveur n'a rien à comparer, et il ne conclut rien. La borne qui
+    /// s'applique quand la durée EST connue est tenue par les deux tests
+    /// suivants.
     #[tokio::test]
     async fn une_zone_jamais_observee_reste_traitee_comme_jouant() {
         let pm = PlaybackManager::new();
@@ -4042,6 +4047,58 @@ mod zone_figee_tests {
         );
     }
 
+    /// LE reste de #3581, après #3723 : la zone n'a JAMAIS été observée — donc
+    /// le prédicat d'immobilité ne mord pas — mais sa piste est finie. Elle
+    /// retenait la mise à jour sans aucune borne.
+    ///
+    /// La durée d'une milliseconde et la marge nulle ne sont qu'une échelle :
+    /// le fait tenu est « la fin annoncée est dépassée », et il est le même à
+    /// quatre minutes et dix.
+    #[tokio::test]
+    async fn une_piste_finie_sans_la_moindre_observation_ne_retient_plus_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(
+            12,
+            NowPlaying {
+                duration_ms: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        // Aucun `update_position` : c'est tout le sujet — personne n'observe
+        // cette zone, et personne ne l'observera jamais.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE)
+                .await
+                .is_empty(),
+            "une zone jamais observée dont la piste est FINIE doit cesser de \
+             retenir la mise à jour : c'est la moitié de #3581 que #3723 \
+             laissait ouverte"
+        );
+    }
+    /// La contre-épreuve du remède, et elle est sévère : marge NULLE, et la
+    /// zone n'a jamais été observée. Une piste d'une heure qui vient de
+    /// démarrer n'est pas finie — la mise à jour ne doit pas lui couper le son.
+    #[tokio::test]
+    async fn une_piste_encore_en_cours_sans_observation_retient_toujours_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(
+            12,
+            NowPlaying {
+                duration_ms: 3_600_000,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE).await,
+            vec![12],
+            "sans la moindre observation, une piste dont la fin annoncée n'est \
+             PAS atteinte reste une lecture : c'est la zone navigateur qui \
+             joue vraiment, et on ne la coupe pas"
+        );
+    }
     /// Une RADIO est exclue du verdict : un flux live n'a pas de durée, et
     /// plusieurs renderers en annoncent la position par à-coups. La couper
     /// serait exactement le défaut grave que ce correctif doit éviter.
