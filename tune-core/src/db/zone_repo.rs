@@ -436,6 +436,30 @@ pub mod sql {
     }
 }
 
+/// Une zone locale qui a retrouve son appareil sous un AUTRE nom (#2269).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reassociation {
+    pub zone_id: i64,
+    pub ancien_device_id: String,
+    pub nouveau_device_id: String,
+    pub endpoint_id: String,
+}
+
+/// Ce qu'une passe d'identite de sortie a change, et ce qu'elle a refuse.
+///
+/// Les refus sont RENDUS et non avales : c'est de quoi un journal, un rapport
+/// de bogue ou l'ecran peuvent dire pourquoi une zone n'a pas retrouve son
+/// appareil. Chaque motif nomme sa cause (voir `identite_de_sortie::Refus`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RapportDIdentite {
+    /// `(zone, identifiant appris)` — l'identite de la zone n'a pas bouge.
+    pub apprises: Vec<(i64, String)>,
+    pub reassociees: Vec<Reassociation>,
+    /// `(zone, motif)` — une re-association possible en apparence, refusee
+    /// parce qu'elle n'etait pas CERTAINE.
+    pub refus: Vec<(i64, String)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
     pub id: Option<i64>,
@@ -1418,6 +1442,135 @@ impl ZoneRepo {
     }
 
     /// Ecrit le volume en pour-cent (0..100), **sans arrondi** (#2886).
+    /// Ce que chaque zone LOCALE sait de son identite (#2269).
+    ///
+    /// Les lignes masquees sont incluses : une zone supprimee detient encore
+    /// son `output_device_id`, et l'index unique partiel
+    /// `idx_zones_output_device_id` ne fait pas la difference. C'est
+    /// `identite_de_sortie::decider` qui refuse ensuite de la deplacer.
+    ///
+    /// Base anterieure a la colonne : liste vide plutot qu'une erreur — le
+    /// meme repli que `ages_depuis_derniere_vue`.
+    pub fn sorties_locales_et_leur_identite(
+        &self,
+    ) -> Result<Vec<crate::outputs::identite_de_sortie::ZoneLocale>, String> {
+        const SQL: &str = "SELECT id, output_device_id, \
+             COALESCE(output_endpoint_id, ''), COALESCE(is_hidden, 0) \
+             FROM zones WHERE output_device_id LIKE 'local:%' ORDER BY id";
+        let lignes = match self.db.query_many_strong(SQL, &[]) {
+            Ok(l) => l,
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(lignes
+            .iter()
+            .filter_map(|l| {
+                let endpoint = l.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+                Some(crate::outputs::identite_de_sortie::ZoneLocale {
+                    id: l.first()?.as_i64()?,
+                    output_device_id: l.get(1)?.as_string()?,
+                    output_endpoint_id: (!endpoint.is_empty()).then_some(endpoint),
+                    masquee: l.get(3).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+                })
+            })
+            .collect())
+    }
+
+    /// L'identifiant d'endpoint stable enregistre pour cette sortie, s'il y en
+    /// a un.
+    ///
+    /// C'est ce que `recreate_local_and_play` demande quand le peripherique
+    /// n'est PAS enregistre : sans lui, la sortie recreee ne connait que le
+    /// NOM de la zone, et c'est le nom qui part dans la resolution.
+    pub fn endpoint_id_de_la_sortie(&self, device_id: &str) -> Option<String> {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql =
+            format!("SELECT output_endpoint_id FROM zones WHERE output_device_id = {placeholder}");
+        let params: [&dyn ToSqlValue; 1] = [&device_id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+            .filter(|id| !id.trim().is_empty())
+    }
+
+    /// Ecrire l'identifiant d'endpoint stable d'une zone.
+    pub fn update_output_endpoint_id(&self, id: i64, endpoint_id: &str) -> Result<(), String> {
+        let sql = self.update_field_sql("output_endpoint_id");
+        let params: [&dyn ToSqlValue; 2] = [&endpoint_id, &id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Confronter les zones locales au parc que l'enumeration vient de rendre,
+    /// et appliquer ce que la regle autorise (#2269).
+    ///
+    /// La DECISION est prise ailleurs — `outputs::identite_de_sortie`, une
+    /// fonction pure, eprouvee sans materiel. Ici on ne fait qu'ecrire ce
+    /// qu'elle a autorise, et rendre de quoi le journaliser.
+    ///
+    /// ⚠️ Ne fusionne, ne cree et ne supprime aucune zone. Une re-association
+    /// qui reviendrait a reunir deux zones est REFUSEE, pas arbitree.
+    pub fn appliquer_identite_de_sortie(
+        &self,
+        enumerees: &[crate::outputs::identite_de_sortie::SortieEnumeree],
+    ) -> Result<RapportDIdentite, String> {
+        use crate::outputs::identite_de_sortie::Decision;
+
+        // Un parc VIDE ne decide rien. L'enumeration peut echouer — pilote
+        // happe par une autre application, balayage interrompu — et prendre
+        // ce silence pour « plus aucun peripherique » ferait refuser toutes
+        // les zones locales d'un coup. Meme garde que celle que #3737 reclame
+        // nommement pour son point 1.
+        if enumerees.is_empty() {
+            return Ok(RapportDIdentite::default());
+        }
+        let zones = self.sorties_locales_et_leur_identite()?;
+        if zones.is_empty() {
+            return Ok(RapportDIdentite::default());
+        }
+        let mut rapport = RapportDIdentite::default();
+        for decision in crate::outputs::identite_de_sortie::decider(&zones, enumerees) {
+            match decision {
+                Decision::Rien { .. } => {}
+                Decision::Apprend {
+                    zone_id,
+                    endpoint_id,
+                } => {
+                    self.update_output_endpoint_id(zone_id, &endpoint_id)?;
+                    rapport.apprises.push((zone_id, endpoint_id));
+                }
+                Decision::Reassocie {
+                    zone_id,
+                    ancien_device_id,
+                    nouveau_device_id,
+                    endpoint_id,
+                } => {
+                    // `output_device_id` d'abord : c'est LUI l'identite de la
+                    // zone, et tout ce qui s'y accroche suit la ligne, pas la
+                    // clef. L'identifiant d'endpoint est deja le bon.
+                    self.update_output_device(zone_id, &nouveau_device_id)?;
+                    rapport.reassociees.push(Reassociation {
+                        zone_id,
+                        ancien_device_id,
+                        nouveau_device_id,
+                        endpoint_id,
+                    });
+                }
+                Decision::Refuse { zone_id, refus } => {
+                    rapport.refus.push((zone_id, refus.motif()));
+                }
+            }
+        }
+        Ok(rapport)
+    }
+
     pub fn update_volume(&self, id: i64, volume: f64) -> Result<(), String> {
         let sql = self.update_field_sql("volume");
         let params: [&dyn ToSqlValue; 2] = [&volume, &id];
@@ -4120,6 +4273,382 @@ mod ignored_zone_settings_tests {
         assert!(
             zone_settings_ignored() >= avant + 2,
             "host et mac absents doivent être comptés"
+        );
+    }
+}
+
+/// #2269 — l'identite d'une sortie locale, eprouvee sur une VRAIE base.
+///
+/// La regle elle-meme est eprouvee dans `outputs::identite_de_sortie` (pure,
+/// sans base). Ce module-ci tient l'autre moitie : que l'ecriture atteigne la
+/// base, et surtout que RIEN de ce qui est accroche a la zone ne se detache au
+/// passage. C'est le point delicat de la migration — des zones vivantes
+/// portent aujourd'hui une identite par NOM, et des reglages y sont accroches.
+#[cfg(test)]
+mod identite_de_sortie_tests {
+    use super::*;
+    use crate::outputs::identite_de_sortie::SortieEnumeree;
+
+    const AUDIO_GD: &str = "wasapi:{0.0.0.00000000}.{e0ea21cf-56cc-445f-8454-880d431d7cb0}";
+    const HAUT_PARLEURS: &str = "wasapi:{0.0.0.00000000}.{7bd3a1de-0000-4444-9999-1a2b3c4d5e6f}";
+
+    fn repo() -> ZoneRepo {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // La colonne arrive par la migration 99 comme par `CORE_SCHEMA` : on
+        // joue les migrations pour eprouver le chemin d'une base EXISTANTE.
+        crate::db::migrations::run_migrations(&db).unwrap();
+        ZoneRepo::new(db)
+    }
+
+    fn vue(repo: &ZoneRepo, sql: &str) -> Option<String> {
+        repo.db
+            .query_many_strong(sql, &[])
+            .unwrap()
+            .first()
+            .and_then(|l| l.first())
+            .and_then(|v| v.as_string().or_else(|| v.as_i64().map(|n| n.to_string())))
+    }
+
+    fn sortie(nom: &str, endpoint: &str) -> SortieEnumeree {
+        SortieEnumeree {
+            nom: nom.to_string(),
+            endpoint_id: endpoint.to_string(),
+        }
+    }
+
+    /// La colonne existe sur une base MIGREE, et vaut NULL pour l'existant.
+    #[test]
+    fn la_colonne_arrive_par_migration_et_ne_touche_aucune_ligne() {
+        let repo = repo();
+        let id = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_endpoint_id FROM zones WHERE id = {id}")
+            ),
+            None,
+            "une zone d'hier n'a AUCUN identifiant : NULL, jamais une valeur              devinee"
+        );
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_device_id FROM zones WHERE id = {id}")
+            )
+            .as_deref(),
+            Some("local:audio-gd USB audio"),
+            "la migration ne touche pas l'identite de la zone"
+        );
+    }
+
+    /// TEMOIN 1 — un appareil RENOMME est retrouve, et la zone garde tout.
+    ///
+    /// C'est le cas de #2269 : Windows renomme l'endpoint au changement de
+    /// taux d'echantillonnage. La zone doit suivre son appareil SANS perdre ce
+    /// qui lui est accroche.
+    #[test]
+    fn temoin_un_appareil_renomme_est_retrouve_et_la_zone_garde_ses_reglages() {
+        let repo = repo();
+        let id = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        repo.update_volume(id, 37.5).unwrap();
+        repo.update_dsd_mode(id, "dop").unwrap();
+        repo.update_lyrics_offset_ms(id, -250).unwrap();
+
+        // Passe 1 : l'appareil est la sous son nom. La zone APPREND.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("audio-gd USB audio", AUDIO_GD)])
+            .unwrap();
+        assert_eq!(rapport.apprises, vec![(id, AUDIO_GD.to_string())]);
+        assert!(rapport.reassociees.is_empty() && rapport.refus.is_empty());
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_device_id FROM zones WHERE id = {id}")
+            )
+            .as_deref(),
+            Some("local:audio-gd USB audio"),
+            "apprendre ne change AUCUNE identite"
+        );
+
+        // Passe 2 : le pilote a renomme l'endpoint. Meme GUID, autre nom.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("audio-gd USB audio (44,1 kHz)", AUDIO_GD)])
+            .unwrap();
+        assert_eq!(rapport.reassociees.len(), 1, "la zone doit avoir suivi");
+        assert_eq!(
+            rapport.reassociees[0].nouveau_device_id,
+            "local:audio-gd USB audio (44,1 kHz)"
+        );
+
+        // ── Ce qui compte vraiment : la zone est LA MEME ligne.
+        let zone = repo.get(id).unwrap().expect("la zone existe toujours");
+        assert_eq!(
+            zone.output_device_id.as_deref(),
+            Some("local:audio-gd USB audio (44,1 kHz)")
+        );
+        assert_eq!(zone.name, "Salon", "le nom choisi par l'auditeur reste");
+        assert_eq!(zone.volume, 37.5, "le volume reste accroche a la zone");
+        assert_eq!(repo.get_dsd_mode(id), "dop");
+        assert_eq!(repo.get_lyrics_offset_ms(id), -250);
+        assert_eq!(
+            vue(&repo, "SELECT COUNT(*) FROM zones").as_deref(),
+            Some("1"),
+            "AUCUNE zone neuve : c'est le doublon que ce chantier evite"
+        );
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_endpoint_id FROM zones WHERE id = {id}")
+            )
+            .as_deref(),
+            Some(AUDIO_GD),
+            "l'identifiant reste celui de l'appareil, pas celui du nom"
+        );
+    }
+
+    /// TEMOIN 2 — un AUTRE appareil n'est PAS pris pour l'ancien.
+    ///
+    /// Le contre-exemple qui commande tout : le 13/08, une adresse d'Apple TV
+    /// reprise par un Sonos. Ici le parc ne contient qu'un appareil, et son
+    /// identifiant n'est pas celui de la zone : elle ne doit RIEN recevoir.
+    #[test]
+    fn temoin_un_autre_appareil_nest_pas_pris_pour_lancien() {
+        let repo = repo();
+        let id = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        repo.update_output_endpoint_id(id, AUDIO_GD).unwrap();
+
+        // Le DAC est debranche. Il ne reste que les haut-parleurs du portable
+        // — c'est le parc exact du journal de Jean-Luc Casse.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("Haut-parleurs", HAUT_PARLEURS)])
+            .unwrap();
+
+        assert_eq!(rapport.reassociees, vec![]);
+        assert_eq!(rapport.apprises, vec![]);
+        assert_eq!(rapport.refus, vec![]);
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_device_id FROM zones WHERE id = {id}")
+            )
+            .as_deref(),
+            Some("local:audio-gd USB audio"),
+            "rabattre la zone sur le seul appareil present est EXACTEMENT le              degat du 13/08 : la zone reste sur son appareil absent"
+        );
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_endpoint_id FROM zones WHERE id = {id}")
+            )
+            .as_deref(),
+            Some(AUDIO_GD),
+            "et son identifiant n'est pas ecrase par celui du voisin"
+        );
+    }
+
+    /// Le refus est RENDU, avec son motif : c'est de quoi l'ecran peut dire
+    /// pourquoi la zone n'a pas retrouve son appareil.
+    #[test]
+    fn un_refus_nomme_sa_cause() {
+        let repo = repo();
+        let ancienne = repo
+            .create("Salon", Some("local"), Some("local:Ancien nom"))
+            .unwrap();
+        let deja_la = repo
+            .create("Bureau", Some("local"), Some("local:Nouveau nom"))
+            .unwrap();
+        repo.update_output_endpoint_id(ancienne, AUDIO_GD).unwrap();
+
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("Nouveau nom", AUDIO_GD)])
+            .unwrap();
+
+        assert_eq!(rapport.reassociees, vec![], "aucune fusion decidee ici");
+        assert_eq!(rapport.refus.len(), 1);
+        assert_eq!(rapport.refus[0].0, ancienne);
+        assert!(
+            rapport.refus[0].1.contains(&deja_la.to_string())
+                && rapport.refus[0].1.contains("fusion"),
+            "le motif doit nommer la zone qui bloque : {}",
+            rapport.refus[0].1
+        );
+    }
+
+    /// Un parc VIDE — enumeration echouee, pilote happe par une autre
+    /// application — ne decide rien du tout.
+    #[test]
+    fn un_parc_vide_ne_touche_a_rien() {
+        let repo = repo();
+        let id = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        assert_eq!(
+            repo.appliquer_identite_de_sortie(&[]).unwrap(),
+            RapportDIdentite::default()
+        );
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_endpoint_id FROM zones WHERE id = {id}")
+            ),
+            None
+        );
+    }
+
+    /// Une base ANTERIEURE a la colonne ne fait pas tomber la lecture : liste
+    /// vide, pas d'erreur. Meme repli que `ages_depuis_derniere_vue`.
+    #[test]
+    fn une_base_sans_la_colonne_rend_une_liste_vide() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, \
+             output_type TEXT, output_device_id TEXT, is_hidden INTEGER DEFAULT 0);
+             INSERT INTO zones (name, output_type, output_device_id) \
+             VALUES ('Salon', 'local', 'local:audio-gd USB audio');",
+        )
+        .unwrap();
+        let repo = ZoneRepo::new(db);
+        assert_eq!(repo.sorties_locales_et_leur_identite().unwrap(), vec![]);
+        assert_eq!(
+            repo.appliquer_identite_de_sortie(&[sortie("audio-gd USB audio", AUDIO_GD)])
+                .unwrap(),
+            RapportDIdentite::default()
+        );
+    }
+
+    /// Ce que `recreate_local_and_play` lit quand le peripherique n'est PAS
+    /// enregistre : sans cette lecture, c'est le NOM qui part en resolution.
+    #[test]
+    fn la_sortie_rend_son_identifiant_a_qui_la_recree() {
+        let repo = repo();
+        let id = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        assert_eq!(
+            repo.endpoint_id_de_la_sortie("local:audio-gd USB audio"),
+            None,
+            "rien d'appris : rien a rendre, et surtout rien a inventer"
+        );
+        repo.update_output_endpoint_id(id, AUDIO_GD).unwrap();
+        assert_eq!(
+            repo.endpoint_id_de_la_sortie("local:audio-gd USB audio")
+                .as_deref(),
+            Some(AUDIO_GD)
+        );
+        assert_eq!(repo.endpoint_id_de_la_sortie("local:inconnu"), None);
+    }
+
+    /// Le COMPTE DES COLLISIONS, sous l'index unique que porte le terrain.
+    ///
+    /// La migration ne pose AUCUNE contrainte sur `output_endpoint_id` : la
+    /// colonne naît NULL, sans index, sans UNIQUE. Ce qui peut percuter une
+    /// contrainte, c'est l'ECRITURE de `output_device_id` au moment d'une
+    /// ré-association — `idx_zones_output_device_id`, l'index unique PARTIEL
+    /// que `deduplicate_zones` pose sur toute base de testeur, et que le
+    /// `repo()` de ce module n'a pas. Une ré-association qui viserait un nom
+    /// déjà pris ferait donc, sur le terrain, un `UNIQUE constraint failed`
+    /// au DEMARRAGE — pas un refus propre.
+    ///
+    /// Ce témoin pose l'index POUR DE VRAI, compte les collisions avant et
+    /// après, et éprouve les deux branches : le nom libre (la zone suit) et
+    /// le nom pris (refus nommé, aucune écriture).
+    #[test]
+    fn sous_lindex_unique_de_terrain_la_passe_ne_percute_aucune_collision() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        // L'index que `deduplicate_zones` (startup.rs) pose sur toute base.
+        db.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id \
+             ON zones(output_device_id) WHERE output_device_id IS NOT NULL;",
+        )
+        .unwrap();
+        let repo = ZoneRepo::new(db);
+
+        let salon = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        repo.update_output_endpoint_id(salon, AUDIO_GD).unwrap();
+        let bureau = repo
+            .create("Bureau", Some("local"), Some("local:Haut-parleurs"))
+            .unwrap();
+        repo.update_output_endpoint_id(bureau, HAUT_PARLEURS)
+            .unwrap();
+
+        // ── Le compte, AVANT. Deux clefs, deux valeurs distinctes.
+        let collisions = |repo: &ZoneRepo, colonne: &str| -> i64 {
+            vue(
+                repo,
+                &format!(
+                    "SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM zones \
+                     WHERE {colonne} IS NOT NULL AND {colonne} <> '' \
+                     GROUP BY {colonne} HAVING COUNT(*) > 1)"
+                ),
+            )
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-1)
+        };
+        assert_eq!(
+            collisions(&repo, "output_endpoint_id"),
+            0,
+            "la nouvelle clef n'a aucune collision : c'est ce qui autorise \
+             à l'écrire sans arbitrage"
+        );
+        assert_eq!(collisions(&repo, "output_device_id"), 0);
+
+        // ── Branche 1 : le nom visé est LIBRE. La zone suit son appareil,
+        // l'écriture passe l'index.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[
+                sortie("audio-gd USB audio (44,1 kHz)", AUDIO_GD),
+                sortie("Haut-parleurs", HAUT_PARLEURS),
+            ])
+            .expect("aucune violation d'unicité : le nom visé était libre");
+        assert_eq!(rapport.reassociees.len(), 1);
+        assert_eq!(rapport.reassociees[0].zone_id, salon);
+        assert_eq!(collisions(&repo, "output_device_id"), 0);
+        assert_eq!(collisions(&repo, "output_endpoint_id"), 0);
+        assert_eq!(
+            vue(&repo, "SELECT COUNT(*) FROM zones").as_deref(),
+            Some("2")
+        );
+
+        // ── Branche 2 : le DAC revient sous le nom que l'AUTRE zone porte
+        // déjà. Sans le refus, `update_output_device` écrirait
+        // `local:Haut-parleurs` sur la zone Salon alors que Bureau le
+        // détient : `UNIQUE constraint failed: zones.output_device_id`, au
+        // DÉMARRAGE, sur la base d'un testeur. C'est le dégât que la règle
+        // évite, et l'index posé ci-dessus est celui qui le produirait.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("Haut-parleurs", AUDIO_GD)])
+            .expect("un refus, pas une violation d'unicité");
+        assert_eq!(
+            rapport.reassociees,
+            vec![],
+            "aucune écriture : le nom visé appartient à une autre zone"
+        );
+        assert!(
+            rapport.refus.iter().any(|(z, m)| *z == salon
+                && m.contains(&bureau.to_string())
+                && m.contains("fusion")),
+            "le nom pris doit produire un refus NOMMÉ, pas une écriture : {:?}",
+            rapport.refus
+        );
+        assert_eq!(collisions(&repo, "output_device_id"), 0);
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_device_id FROM zones WHERE id = {salon}")
+            )
+            .as_deref(),
+            Some("local:audio-gd USB audio (44,1 kHz)"),
+            "la zone refusée n'a PAS bougé"
         );
     }
 }
