@@ -231,6 +231,10 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // last_update_result the UI can show. Catches a silent Windows bat-swap
     // failure (came back on the old binary) instead of it looking like a no-op.
     crate::routes::system::update::record_post_update_result(state);
+    // #2266 — retenir la version qui tournait avant celle-ci, pour que l'ecran
+    // puisse nommer ce a quoi revenir. Independant de `record_post_update_result`,
+    // qui rend la main tot sur les chemins d'echec : voir `noter_la_version_vue`.
+    crate::routes::system::update::noter_la_version_vue(state);
 
     // Warm the ASIO device cache once at boot, while the audio devices are still
     // idle. An ASIO driver — notably SOtM Diretta — can't be re-enumerated once a
