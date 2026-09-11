@@ -2250,4 +2250,286 @@ mod tests {
             handle.abort();
         }
     }
+    // ───────────────────────────────────────────────────────────────────────
+    // #3829 — le renderer a redémarré sur un AUTRE port : Tune doit le
+    // redécouvrir par son UDN et rejouer, pas rappeler le port mort.
+    //
+    // Le faux renderer joue Platinum/1.0.5.13 : URLs de contrôle sous
+    // `/AVTransport/<udn>/control.xml`, port tiré au sort à chaque démarrage,
+    // et un répondeur SSDP qui donne la nouvelle `LOCATION` au `M-SEARCH`
+    // unicast. Le port neuf est ASSEMBLÉ À L'EXÉCUTION : aucune aiguille
+    // écrite dans ce fichier ne peut se trouver elle-même.
+    // ───────────────────────────────────────────────────────────────────────
+    mod i3829_port_de_controle_change {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+
+        const UDN: &str = "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE";
+        const FLUX: &str = "http://192.168.1.18:8888/stream/i3829.flac";
+
+        /// Un renderer Platinum sur un port tiré au sort : `description.xml`,
+        /// et les deux services de contrôle sous le chemin exact du relevé.
+        async fn demarrer_renderer(state: MockState) -> (u16, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = Router::new()
+                .route("/description.xml", axum::routing::get(description_xml))
+                .route(&format!("/AVTransport/{UDN}/control.xml"), post(av_handler))
+                .route(
+                    &format!("/RenderingControl/{UDN}/control.xml"),
+                    post(rc_handler),
+                )
+                .with_state(state);
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            (port, handle)
+        }
+
+        /// Le descriptif, aux chemins RELATIFS — c'est la forme Platinum, et
+        /// c'est la relecture qui doit les greffer sur le nouveau port.
+        async fn description_xml() -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let xml = format!(
+                r#"<?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0"><device>
+<deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+<friendlyName>Faux Platinum</friendlyName><manufacturer>Banc</manufacturer><modelName>3829</modelName>
+<UDN>{UDN}</UDN><serviceList>
+<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><serviceId>urn:upnp-org:serviceId:AVTransport</serviceId><controlURL>/AVTransport/{UDN}/control.xml</controlURL><eventSubURL>/AVTransport/{UDN}/event.xml</eventSubURL><SCPDURL>/AVTransport/scpd.xml</SCPDURL></service>
+<service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType><serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId><controlURL>/RenderingControl/{UDN}/control.xml</controlURL><eventSubURL>/RenderingControl/{UDN}/event.xml</eventSubURL><SCPDURL>/RenderingControl/scpd.xml</SCPDURL></service>
+<service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType><serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId><controlURL>/ConnectionManager/{UDN}/control.xml</controlURL><eventSubURL>/ConnectionManager/{UDN}/event.xml</eventSubURL><SCPDURL>/ConnectionManager/scpd.xml</SCPDURL></service>
+</serviceList></device></root>"#
+            );
+            ([("content-type", "text/xml")], xml).into_response()
+        }
+
+        /// Le répondeur SSDP de l'appareil : à chaque `M-SEARCH` reçu, une
+        /// réponse unicast portant la `LOCATION` courante. `location` est lue
+        /// À CHAQUE requête : le banc la fait changer quand l'appareil
+        /// « redémarre ». Compte les requêtes qui nommaient notre UDN.
+        async fn demarrer_repondeur_ssdp(
+            location: Arc<Mutex<Option<String>>>,
+            requetes: Arc<AtomicUsize>,
+        ) -> (u16, tokio::task::JoinHandle<()>) {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let handle = tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let Ok((n, de)) = socket.recv_from(&mut buf).await else {
+                        break;
+                    };
+                    let texte = String::from_utf8_lossy(&buf[..n]);
+                    if !texte.starts_with("M-SEARCH") || !texte.contains(&format!("ST: {UDN}")) {
+                        continue;
+                    }
+                    // Une redécouverte émet plusieurs datagrammes (deux formes
+                    // d'en-tête HOST, un `ssdp:all`) ; on ne compte que la
+                    // forme multicast par UDN, soit UN par redécouverte.
+                    if texte.contains("HOST: 239.255.255.250:1900") {
+                        requetes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let Some(loc) = location.lock().await.clone() else {
+                        // Appareil éteint : silence.
+                        continue;
+                    };
+                    let reponse = format!(
+                        "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nEXT:\r\n\
+                         LOCATION: {loc}\r\nSERVER: UPnP/1.0 DLNADOC/1.50 Platinum/1.0.5.13\r\n\
+                         ST: {UDN}\r\nUSN: {UDN}\r\n\r\n"
+                    );
+                    let _ = socket.send_to(reponse.as_bytes(), de).await;
+                }
+            });
+            (port, handle)
+        }
+
+        fn sortie(port_controle: u16, port_ssdp: u16) -> DlnaOutput {
+            DlnaOutput::new(
+                "Faux Platinum".into(),
+                UDN.into(),
+                "127.0.0.1".into(),
+                format!("http://127.0.0.1:{port_controle}/AVTransport/{UDN}/control.xml"),
+                format!("http://127.0.0.1:{port_controle}/RenderingControl/{UDN}/control.xml"),
+                None,
+            )
+            .with_redecouverte(port_ssdp, std::time::Duration::from_secs(2))
+        }
+
+        /// Attend que plus rien n'écoute sur `port` — le « redémarrage » de
+        /// l'appareil est effectif quand la connexion y est REFUSÉE.
+        async fn attendre_port_ferme(port: u16) {
+            for _ in 0..100 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("le port {port} écoute encore : le banc ne peut pas simuler le redémarrage");
+        }
+
+        /// LE témoin de #3829, par la route : `play_media`.
+        ///
+        /// 1. Tune apprend l'URL de contrôle sur le port A et joue.
+        /// 2. L'appareil « redémarre » : le port A ne répond plus (refus de
+        ///    connexion), la pile repart sur un port B tiré au sort, et le
+        ///    répondeur SSDP annonce la nouvelle `LOCATION`.
+        /// 3. La lecture suivante DOIT aboutir sur le port B, sans que
+        ///    personne n'ait redémarré Tune ni recréé la sortie.
+        #[tokio::test]
+        async fn apres_redemarrage_du_renderer_la_lecture_suit_le_nouveau_port() {
+            let location = Arc::new(Mutex::new(None));
+            let msearch_recus = Arc::new(AtomicUsize::new(0));
+            let (port_ssdp, ssdp) =
+                demarrer_repondeur_ssdp(location.clone(), msearch_recus.clone()).await;
+
+            // 1. Première vie de l'appareil, port A.
+            let etat_a = MockState::default();
+            let (port_a, vie_a) = demarrer_renderer(etat_a.clone()).await;
+            *location.lock().await = Some(format!("http://127.0.0.1:{port_a}/description.xml"));
+            let output = sortie(port_a, port_ssdp);
+            output
+                .play_media(&PlayMedia {
+                    url: FLUX,
+                    mime_type: "audio/flac",
+                    title: Some("Première vie"),
+                    ..Default::default()
+                })
+                .await
+                .expect("première lecture, port A");
+            assert_eq!(etat_a.play_count.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                msearch_recus.load(Ordering::Relaxed),
+                0,
+                "rien à redécouvrir tant que l'appareil répond"
+            );
+
+            // 2. Redémarrage : le port A meurt, la pile repart sur B.
+            vie_a.abort();
+            attendre_port_ferme(port_a).await;
+            let etat_b = MockState::default();
+            let (port_b, vie_b) = demarrer_renderer(etat_b.clone()).await;
+            assert_ne!(port_a, port_b, "le banc doit tirer un autre port");
+            *location.lock().await = Some(format!("http://127.0.0.1:{port_b}/description.xml"));
+
+            // 3. La lecture suivante suit l'appareil.
+            output
+                .play_media(&PlayMedia {
+                    url: FLUX,
+                    mime_type: "audio/flac",
+                    title: Some("Seconde vie"),
+                    ..Default::default()
+                })
+                .await
+                .expect("le renderer a changé de port : la lecture doit le suivre");
+            assert_eq!(
+                etat_b.play_count.load(Ordering::Relaxed),
+                1,
+                "le Play doit être arrivé sur la SECONDE vie de l'appareil"
+            );
+            assert_eq!(
+                *etat_b.current_uri.lock().await,
+                FLUX,
+                "l'URI doit être posée sur le nouveau port"
+            );
+            // L'aiguille : le port B, connu seulement à l'exécution.
+            let ctrl = output.url_av_transport();
+            assert!(
+                ctrl.contains(&format!("127.0.0.1:{port_b}/")),
+                "l'URL de contrôle doit porter le nouveau port {port_b} : {ctrl}"
+            );
+            assert_eq!(
+                msearch_recus.load(Ordering::Relaxed),
+                1,
+                "UNE redécouverte pour UN échec, pas une par action SOAP"
+            );
+            vie_b.abort();
+            ssdp.abort();
+        }
+
+        /// L'appareil est parti pour de bon : le `M-SEARCH` ne rend rien.
+        /// L'erreur d'ORIGINE est rendue, enrichie — pas remplacée — et la
+        /// seconde action dans le répit ne relance PAS de `M-SEARCH`.
+        #[tokio::test]
+        async fn sans_reponse_au_msearch_l_erreur_d_origine_est_rendue_enrichie() {
+            let location = Arc::new(Mutex::new(None)); // silence SSDP
+            let msearch_recus = Arc::new(AtomicUsize::new(0));
+            let (port_ssdp, ssdp) =
+                demarrer_repondeur_ssdp(location.clone(), msearch_recus.clone()).await;
+            let port_mort = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let output = sortie(port_mort, port_ssdp)
+                .with_redecouverte(port_ssdp, std::time::Duration::from_millis(300));
+
+            let debut = std::time::Instant::now();
+            let err = output
+                .set_volume(0.4)
+                .await
+                .expect_err("personne n'écoute et personne ne répond au M-SEARCH");
+            assert!(
+                err.starts_with("soap send:"),
+                "l'erreur d'origine doit rester en tête : {err}"
+            );
+            assert!(
+                err.contains(crate::outputs::dlna::MOTIF_REDECOUVERTE_ECHOUEE),
+                "l'erreur doit être enrichie du motif : {err}"
+            );
+            assert!(
+                debut.elapsed() < std::time::Duration::from_secs(3),
+                "un refus est instantané et le M-SEARCH borné : {:?}",
+                debut.elapsed()
+            );
+            // Dans le répit : pas de second M-SEARCH.
+            let err2 = output.set_volume(0.5).await.expect_err("toujours mort");
+            assert!(err2.starts_with("soap send:"), "{err2}");
+            assert_eq!(
+                msearch_recus.load(Ordering::Relaxed),
+                1,
+                "une seule redécouverte pour deux échecs dans le répit"
+            );
+            ssdp.abort();
+        }
+
+        /// Une faute SOAP APPLICATIVE n'est pas un motif : l'appareil est
+        /// joignable et dit autre chose. Aucun `M-SEARCH` ne doit partir.
+        #[tokio::test]
+        async fn une_faute_soap_applicative_ne_redecouvre_pas() {
+            use axum::response::IntoResponse;
+            let location = Arc::new(Mutex::new(None));
+            let msearch_recus = Arc::new(AtomicUsize::new(0));
+            let (port_ssdp, ssdp) =
+                demarrer_repondeur_ssdp(location.clone(), msearch_recus.clone()).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = Router::new().route(
+                &format!("/RenderingControl/{UDN}/control.xml"),
+                post(|| async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        soap_fault_upnp(714, "Illegal MIME-Type"),
+                    )
+                        .into_response()
+                }),
+            );
+            let vie = tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let output = sortie(port, port_ssdp);
+            let _ = output.set_volume(0.4).await;
+            assert_eq!(
+                msearch_recus.load(Ordering::Relaxed),
+                0,
+                "un 500 avec corps SOAP n'est pas un port mort : pas de M-SEARCH"
+            );
+            vie.abort();
+            ssdp.abort();
+        }
+    }
 }
