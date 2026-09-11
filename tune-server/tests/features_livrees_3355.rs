@@ -80,14 +80,28 @@ const HORS_PORTE: &[(&str, &str, &str)] = &[
     (
         "local-audio",
         "release.yml / linux-aarch64-musl",
-        "IMPOSSIBLE sans forker `alsa-sys`, pas seulement couteux (#3613). Son \
-         `build.rs` est `pkg_config::Config::new().statik(false).probe(\"alsa\")` \
-         : le `statik(false)` est un LITTERAL, pas une variable d'environnement \
-         comme le `LIBOPUS_STATIC` de #1288. La caisse emet donc toujours un \
-         lien DYNAMIQUE vers `libasound`, ce que l'etape « Verify musl binary \
-         is statically linked » de `release.yml` refuse par construction — et \
+        "Hors de portee tant que personne n'a construit `alsa-lib` contre musl \
+         aarch64 (#3613, remesure le 11/09/2026 sur `alsa-sys 0.4.0`). Le \
+         `build.rs` de la caisse est \
+         `pkg_config::Config::new().statik(false).probe(\"alsa\")` : le \
+         `statik(false)` est un LITTERAL, pas une variable d'environnement \
+         comme le `LIBOPUS_STATIC` de #1288. Elle emet donc toujours un lien \
+         DYNAMIQUE vers `libasound`, ce que l'etape « Verify musl binary is \
+         statically linked » de `release.yml` refuse par construction — et \
          cette garantie statique est la raison d'etre de la cible (NAS a vieille \
-         userland, Synology DSM). Un NAS n'a par ailleurs pas de DAC.",
+         userland, Synology DSM). Un NAS n'a par ailleurs pas de DAC. \
+         CORRECTION du mot « impossible » porte ici jusqu'au 11/09/2026 : le \
+         fork n'est PAS la seule voie. `alsa-sys` declare `links = \"alsa\"`, \
+         et cargo documente pour toute caisse a `links` une surcharge de script \
+         de build — `[target.aarch64-unknown-linux-musl.alsa]` dans \
+         `.cargo/config.toml`, avec `rustc-link-lib = [\"static=asound\"]` — qui \
+         REMPLACE la sortie du script, lequel n'est alors pas execute. Aucun \
+         en-tete n'est requis non plus : sans la fonctionnalite `use-bindgen` \
+         (elle n'est pas activee), les liaisons sont pre-generees dans la \
+         caisse. Ce qui reste non mesure, et qui est le vrai verrou : qu'une \
+         `libasound.a` musl aarch64 se lie dans un binaire `static-pie`, et \
+         qu'une alsa-lib statique — donc sans `dlopen`, donc sans ses greffons \
+         — serve a autre chose qu'un `hw:` direct.",
     ),
     (
         "local-audio",

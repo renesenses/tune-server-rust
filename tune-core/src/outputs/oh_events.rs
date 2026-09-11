@@ -348,7 +348,16 @@ impl UpnpEventListener {
                         let h = h.clone();
                         tokio::spawn(handle_notify(stream, h));
                     }
-                    Err(e) => warn!(error = %e, "oh_event_accept_error"),
+                    Err(e) => {
+                        warn!(error = %e, "oh_event_accept_error");
+                        // Meme raison qu'en `slimproto::mod` : une erreur
+                        // persistante ferait tourner cette boucle a vide
+                        // (#2156). Ce module est de surcroit CELUI QUI OUVRE
+                        // les descripteurs — un abonnement GENA par renderer,
+                        // renouvele toutes les 250 s — donc celui qui peut
+                        // amener l'EMFILE qu'il subirait ensuite.
+                        crate::temporisation_reseau::temporiser_apres_erreur_reseau().await;
+                    }
                 }
             }
         });
