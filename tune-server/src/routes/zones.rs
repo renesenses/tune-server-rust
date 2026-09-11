@@ -1117,6 +1117,12 @@ mod charge_utile_zone_guard;
 #[cfg(test)]
 mod contrat_des_retours_anticipes;
 
+/// #1770, annexe 4 — le nom demandé à `POST /zones` sur un périphérique qui a
+/// déjà une zone : honoré si elle était masquée, écarté si elle était visible.
+/// L'arbitrage est réservé à Bertrand ; ces témoins gardent l'état mesuré.
+#[cfg(test)]
+mod nom_de_zone_existante_guard;
+
 /// #1395 — le backend de sortie locale réellement actif, et le motif du repli,
 /// doivent arriver jusqu'au client.
 #[cfg(test)]

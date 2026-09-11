@@ -114,6 +114,11 @@ impl PlaybackOrchestrator {
         stream_id
     }
 
+    /// La qualité demandée pour cette zone. Voir [`preference_de_qualite`].
+    fn streaming_quality_preference(&self, zone_id: i64) -> StreamingQualityPreference {
+        preference_de_qualite(&self.db, zone_id)
+    }
+
     pub(super) async fn resolve_streaming_url(
         &self,
         service_name: &str,
@@ -137,7 +142,17 @@ impl PlaybackOrchestrator {
         // attaches, leaving the stream with 0 frames → playback stops.
         // (DEvir: seek on a TIDAL track → title stays but music stops.)
         // Only consider the prefetch buffer when NOT seeking.
-        let prefetched = if req.seek_ms.is_some_and(|ms| ms > 0) {
+        //
+        // #2723 — le tampon de préchargement est TOUJOURS rempli au maximum du
+        // service. Le servir alors que la zone demande autre chose ferait
+        // mentir le sélecteur : on l'ignore dès que la préférence n'est pas
+        // `max`.
+        let quality_preference = self.streaming_quality_preference(req.zone_id);
+        let provider_quality = quality_preference.service_token(service_name);
+
+        let prefetched = if req.seek_ms.is_some_and(|ms| ms > 0)
+            || quality_preference != StreamingQualityPreference::Max
+        {
             None
         } else {
             self.prefetch.take_prefetched(service_name, source_id).await
@@ -200,32 +215,35 @@ impl PlaybackOrchestrator {
         // soupçonne de dominer l'attente sur une piste 24/96 — sans pouvoir
         // le dire, faute de l'avoir jamais mesurée.
         let debut_url = std::time::Instant::now();
+        if !quality_preference.provider_can_select(service_name) {
+            warn!(
+                service = service_name,
+                requested_quality = %quality_preference,
+                "streaming_quality_not_selectable_using_provider_result"
+            );
+        }
+
         // Try to get the track URL; if it fails with an auth error, attempt
         // a token refresh and retry once. This handles Qobuz tokens expiring
         // mid-session (search still works without auth, but playback doesn't).
-        let stream_data = match svc.get_track_url(source_id, None).await {
-            Ok(data) => data,
-            Err(ref e)
-                if {
-                    let msg = e.to_string();
-                    msg.contains("401") || msg.contains("403")
-                } =>
-            {
-                info!(
-                    service = service_name,
-                    error = %e,
-                    "streaming_auth_error_attempting_refresh"
-                );
-                if svc.refresh_if_needed().await.unwrap_or(false) {
-                    svc.get_track_url(source_id, None)
-                        .await
-                        .map_err(|e| e.to_string())?
-                } else {
-                    return Err(e.to_string());
-                }
-            }
-            Err(e) => return Err(e.to_string()),
-        };
+        //
+        // Ask for the zone preference on the primary request and on the auth
+        // retry. Passing `None` means the provider's highest/default quality.
+        let stream_data =
+            request_stream_at_quality(&mut **svc, source_id, provider_quality).await?;
+        let quality_observation = quality_preference.observe(service_name, &stream_data);
+
+        info!(
+            service = service_name,
+            source_id,
+            requested_quality = quality_observation.requested,
+            provider_quality = quality_observation.provider_token,
+            delivered_codec = %quality_observation.delivered_codec,
+            delivered_sample_rate = quality_observation.delivered_sample_rate,
+            delivered_bit_depth = quality_observation.delivered_bit_depth,
+            delivered_bitrate = ?quality_observation.delivered_bitrate,
+            "streaming_quality_resolved"
+        );
 
         // `origine` dit LAQUELLE des deux formes le service a rendue, ce qui
         // change la lecture du chiffre : `fichier` = le fMP4 DASH a été
@@ -1880,10 +1898,18 @@ impl PlaybackOrchestrator {
                     let services = self.services.clone();
                     let service_name = service_name.to_string();
                     let source_id = source_id.to_string();
+                    // #2723 — la reprise après expiration redemandait le
+                    // maximum du service : sur une zone réglée en `cd`, la
+                    // seconde moitié d'une piste arrivait dans un AUTRE format
+                    // que la première.
+                    let provider_quality = preference_de_qualite(&self.db, req.zone_id)
+                        .service_token(&service_name)
+                        .map(str::to_string);
                     Some(std::sync::Arc::new(move || {
                         let services = services.clone();
                         let service_name = service_name.clone();
                         let source_id = source_id.clone();
+                        let provider_quality = provider_quality.clone();
                         Box::pin(async move {
                             let registry = services.lock().await;
                             let svc = registry
@@ -1891,9 +1917,12 @@ impl PlaybackOrchestrator {
                                 .ok_or_else(|| format!("unknown service: {service_name}"))?;
                             let mut svc = svc.write().await;
                             // Best-effort token refresh, then re-resolve with
-                            // the same default quality the initial play used.
+                            // exactly the quality used by the initial play.
                             let _ = svc.refresh_if_needed().await;
-                            match svc.get_track_url(&source_id, None).await {
+                            match svc
+                                .get_track_url(&source_id, provider_quality.as_deref())
+                                .await
+                            {
                                 Ok(data) => Ok(data.url),
                                 Err(e) => Err(e.to_string()),
                             }

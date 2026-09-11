@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 use crate::event_bus::{EventBus, TuneEvent};
-use crate::outputs::traits::OutputTarget;
+use crate::outputs::traits::{OutputProvider, OutputTarget};
 
 /// The plugin ABI generation. A plugin declares the version it was built
 /// against via [`TunePlugin::protocol_version`]; [`PluginLoader::setup_all`]
@@ -45,6 +45,11 @@ pub struct ZoneRequest {
 #[derive(Default)]
 pub struct PluginRegistrations {
     pub outputs: Vec<Box<dyn OutputTarget>>,
+    /// Providers that DISCOVER outputs, as opposed to `outputs`, which are
+    /// fixed instances known at `setup` time. The host hands these to
+    /// `spawn_output_providers`, which polls `discover()` for as long as the
+    /// server runs.
+    pub output_providers: Vec<Arc<dyn OutputProvider>>,
     /// `(plugin name, router)`. The host derives the mount path from the
     /// name — plugins do not choose their own prefix. Requires the
     /// `plugin-http` feature.
@@ -59,11 +64,12 @@ impl PluginRegistrations {
         if !self.routers.is_empty() {
             return false;
         }
-        self.outputs.is_empty() && self.zones.is_empty()
+        self.outputs.is_empty() && self.output_providers.is_empty() && self.zones.is_empty()
     }
 
     fn absorb(&mut self, other: PluginRegistrations) {
         self.outputs.extend(other.outputs);
+        self.output_providers.extend(other.output_providers);
         #[cfg(feature = "plugin-http")]
         self.routers.extend(other.routers);
         self.zones.extend(other.zones);
@@ -194,6 +200,36 @@ impl PluginContext {
         match self.registrations.lock() {
             Ok(mut reg) => reg.outputs.push(output),
             Err(_) => self.warn_registration_lost("output"),
+        }
+    }
+
+    /// Expose a provider that DISCOVERS outputs, instead of a fixed instance.
+    ///
+    /// [`register_output`](Self::register_output) covers the case where the
+    /// plugin already knows its devices at `setup` time. A network protocol
+    /// does not: Diretta targets appear and disappear while the server runs,
+    /// and the count is unknown until something answers on the wire. Calling
+    /// `register_output` N times cannot express that — the host would freeze
+    /// the device list at startup.
+    ///
+    /// The host hands providers to `spawn_output_providers`, which polls
+    /// `discover()` for as long as the server runs and gives every discovered
+    /// device the same zone lifecycle as built-in discovery: reconnect,
+    /// auto-create, hidden zones.
+    ///
+    /// A paid provider should declare
+    /// [`required_module`](OutputProvider::required_module). Returning an
+    /// empty list when the module is not owned is correct but silent, and
+    /// indistinguishable from a provider that is absent, mis-compiled, or on a
+    /// network that does not answer — a beta tester reinstalled his whole
+    /// system over exactly that ambiguity (#2392).
+    ///
+    /// `Arc`, not `Box`: the host keeps polling the provider from a background
+    /// task, so it needs shared ownership rather than a value it consumes.
+    pub fn register_output_provider(&self, provider: Arc<dyn OutputProvider>) {
+        match self.registrations.lock() {
+            Ok(mut reg) => reg.output_providers.push(provider),
+            Err(_) => self.warn_registration_lost("output provider"),
         }
     }
 
@@ -623,6 +659,7 @@ impl PluginLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outputs::traits::ProviderContext;
     use serde_json::json;
 
     struct TestPlugin {
@@ -1127,5 +1164,109 @@ mod tests {
         let recorded = events.lock().await;
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0], "playback.started");
+    }
+
+    // ─── register_output_provider ────────────────────────────────────────
+    //
+    // `register_output` couvre le cas où le plugin CONNAÎT ses appareils au
+    // moment du `setup`. Un protocole réseau, non : les cibles Diretta
+    // apparaissent et disparaissent pendant que le serveur tourne, et leur
+    // nombre est inconnu tant que rien n'a répondu sur le fil.
+    //
+    // Ces tests prouvent le COMPORTEMENT ; le câblage côté hôte est gardé
+    // séparément par `tune-server/tests/plugin_output_provider_seam.rs`.
+
+    struct FournisseurDeTest {
+        module: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl OutputProvider for FournisseurDeTest {
+        fn provider_name(&self) -> &str {
+            "fournisseur-de-test"
+        }
+
+        fn required_module(&self) -> Option<&str> {
+            self.module
+        }
+
+        async fn discover(&self, _ctx: &ProviderContext) -> Vec<Box<dyn OutputTarget>> {
+            Vec::new()
+        }
+    }
+
+    struct PluginFournisseur;
+
+    #[async_trait]
+    impl TunePlugin for PluginFournisseur {
+        fn name(&self) -> &str {
+            "plugin-fournisseur"
+        }
+        fn version(&self) -> &str {
+            "0.1.0"
+        }
+        fn description(&self) -> &str {
+            "Déclare un fournisseur de sorties, pas une sortie fixe"
+        }
+        async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
+            ctx.register_output_provider(Arc::new(FournisseurDeTest {
+                module: Some("diretta"),
+            }));
+            Ok(())
+        }
+        async fn teardown(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn un_fournisseur_declare_est_bien_collecte() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader.register(Box::new(PluginFournisseur)).await;
+        loader.setup_all("http://localhost:8888").await;
+
+        let reg = loader.take_registrations();
+
+        assert_eq!(
+            reg.output_providers.len(),
+            1,
+            "le fournisseur déclaré dans setup() n'est pas ressorti de take_registrations"
+        );
+        assert_eq!(
+            reg.output_providers[0].provider_name(),
+            "fournisseur-de-test"
+        );
+        // Le module payant doit traverser : c'est lui qui permet au serveur de
+        // dire « au repos faute d'habilitation » plutôt que de se taire (#2392).
+        assert_eq!(reg.output_providers[0].required_module(), Some("diretta"));
+        // Un fournisseur n'est PAS une sortie : il ne doit pas atterrir dans le
+        // registre des sorties, où il serait figé au démarrage.
+        assert!(reg.outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn un_fournisseur_seul_ne_rend_pas_les_enregistrements_vides() {
+        // `is_empty()` décide si l'hôte se donne la peine d'installer quoi que
+        // ce soit. L'oublier ferait silencieusement sauter l'installation d'un
+        // plugin qui ne déclare QU'un fournisseur — le cas de Diretta.
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader.register(Box::new(PluginFournisseur)).await;
+        loader.setup_all("http://localhost:8888").await;
+
+        assert!(!loader.take_registrations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn un_plugin_dont_le_setup_echoue_ne_laisse_aucun_fournisseur() {
+        // Même règle que pour les sorties : un plugin à moitié monté ne doit
+        // pas voir son fournisseur installé.
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader.register(Box::new(FailingPlugin)).await;
+        loader.setup_all("http://localhost:8888").await;
+
+        assert!(loader.take_registrations().output_providers.is_empty());
     }
 }

@@ -769,6 +769,12 @@ mod status_timeout_tests;
 #[cfg(test)]
 mod famine_anneau_i3318;
 
+/// #3814 — séparer « l'anneau a été réalimenté » de « le pilote a cessé de
+/// réclamer ». Le banc affame le `RingBuf` de production puis fait taire son
+/// consommateur, et rejoue la ligne collée par le testeur du fil 1747.
+#[cfg(test)]
+mod rappel_arrete_3814;
+
 #[cfg(test)]
 mod cadence_de_repos_tests;
 #[cfg(test)]
@@ -1036,3 +1042,12 @@ mod canal_radio_guard;
 /// procédé et même raison que `canal_radio_guard` ci-dessus.
 #[cfg(test)]
 mod position_publiee_guard;
+
+/// #3756 — la relance automatique d'une radio a désormais un fond.
+///
+/// Le banc fait jouer une station qui rend une page web au lieu d'un flux —
+/// le cas exact du fil 1734 — et vérifie que la zone finit par être
+/// abandonnée, que le verdict du décodeur est retenu, et qu'une radio qui
+/// avance n'est, elle, ni abandonnée ni refusée.
+#[cfg(test)]
+mod relance_radio_bornee_3756;

@@ -461,6 +461,80 @@ impl StreamingService for BandcampService {
             "de liste d'artistes suivis exploitable sans session d'achat",
         ))
     }
+    /// 🔴 #2778 — les FAVORIS Bandcamp : la liste de souhaits.
+    ///
+    /// FabienM, fil 1606 : « La gestion des favoris devrait pouvoir se faire
+    /// aussi si on connait l'identifiant Bandcamp. » Elle le peut, en LECTURE :
+    /// `wishlist_items` répond sans aucun cookie de session — mesuré le
+    /// 11/09/2026, `fan_id=50000` → 200, trois articles — et rend la même
+    /// enveloppe que la collection.
+    ///
+    /// Chaque album rendu porte pour `id` son adresse Bandcamp, donc
+    /// [`Self::get_album_tracks`] sait la rouvrir : un favori est JOUABLE, et
+    /// par l'album entier, comme un article de collection.
+    ///
+    /// `created_at` transporte la date d'ajout — c'est ce que l'écran Favoris
+    /// trie (#3489). Un article dont la date est illisible n'en porte aucune
+    /// plutôt qu'une inventée.
+    ///
+    /// Seuls les ALBUMS : Bandcamp range pistes et albums dans la même liste,
+    /// mais [`Self::get_track`] refuse une piste seule, et une entrée qu'on ne
+    /// sait pas ouvrir n'a rien à faire dans une liste de favoris. Les autres
+    /// types rendent `Ok(None)`, donc le dispatch d'origine reprend la main
+    /// octet pour octet.
+    async fn get_user_favorites_dated(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<Value>>, TuneError> {
+        if fav_type != "albums" {
+            return Ok(None);
+        }
+        let compte = compte_lie(&self.backend)
+            .map_err(TuneError::from)?
+            .ok_or_else(|| {
+                TuneError::from(
+                    "aucun compte Bandcamp lié — POST /api/v1/streaming/bandcamp/auth \
+                     avec {\"username\": \"…\"} d'abord",
+                )
+            })?;
+        let brut =
+            crate::page_de_liste_de_souhaits(compte.fan_id, BC_JETON_DEBUT, BC_COLLECTION_PAGE)
+                .await
+                .map_err(TuneError::from)?;
+        let articles = brut["items"].as_array().cloned().unwrap_or_default();
+        let mut sortie = Vec::new();
+        for (album, article) in albums_de_collection(&brut).into_iter().zip(articles.iter()) {
+            let mut element = serde_json::to_value(album).unwrap_or(Value::Null);
+            if let (Some(objet), Some(date)) =
+                (element.as_object_mut(), crate::date_ajout_bandcamp(article))
+            {
+                objet.insert("created_at".to_string(), Value::String(date));
+            }
+            sortie.push(element);
+        }
+        Ok(Some(sortie))
+    }
+    /// Ajouter un favori demande une session d'achat. Tune n'en a aucune.
+    ///
+    /// [`crate::lier_compte`] résout un pseudo en `fan_id` sur une page de
+    /// profil PUBLIQUE : aucun mot de passe, aucun cookie. La liste de souhaits
+    /// se LIT sans session ; elle ne s'écrit pas. Le refus par défaut du trait
+    /// dit « not supported », ce qui se lit comme un oubli — celui-ci dit
+    /// pourquoi, et où le geste existe vraiment.
+    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
+        let _ = (fav_type, item_id);
+        Err(TuneError::from(
+            "Bandcamp : ajouter un favori demande une session d'achat, que Tune n'a pas. \
+             La liste de souhaits se modifie sur bandcamp.com ; Tune la lit.",
+        ))
+    }
+    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
+        let _ = (fav_type, item_id);
+        Err(TuneError::from(
+            "Bandcamp : retirer un favori demande une session d'achat, que Tune n'a pas. \
+             La liste de souhaits se modifie sur bandcamp.com ; Tune la lit.",
+        ))
+    }
 
     /// Rien à mémoriser : le compte lié vit dans les réglages, écrit par
     /// [`crate::lier_compte`], et pas dans un jeton que le registre saurait
@@ -686,6 +760,60 @@ mod tests {
     /// Une base en mémoire AVEC son schéma : la table `settings` naît d'une
     /// MIGRATION, pas d'`init_schema`. Sans `run_migrations` toute écriture de
     /// réglage échoue, et ces épreuves seraient vertes contre rien.
+    /// 🔴 #2778 — les favoris passent par la LISTE DE SOUHAITS, et seulement
+    /// pour les albums.
+    ///
+    /// Aucun appel sortant ici : sans compte lié, la méthode doit refuser en
+    /// NOMMANT le geste qui manque, et les autres types de favoris rendre
+    /// `Ok(None)` pour que le dispatch d'origine reprenne la main, inchangé.
+    #[tokio::test]
+    async fn les_favoris_ne_couvrent_que_les_albums_et_nomment_ce_qui_manque() {
+        let svc = service_de_test();
+        for autre in ["tracks", "artists", "playlists"] {
+            assert!(
+                svc.get_user_favorites_dated(autre).await.unwrap().is_none(),
+                "{autre} doit retomber sur le dispatch d'origine, pas sur la liste de souhaits"
+            );
+        }
+        let echec = svc
+            .get_user_favorites_dated("albums")
+            .await
+            .expect_err("sans compte lié, la liste de souhaits n'est pas atteignable");
+        let message = echec.to_string();
+        assert!(
+            message.contains("aucun compte Bandcamp lié"),
+            "le refus doit nommer le geste qui manque : {message}"
+        );
+    }
+    /// 🔴 #2778 — écrire un favori est IMPOSSIBLE, et le refus le dit.
+    ///
+    /// `lier_compte` résout un pseudo sur une page de profil publique : Tune
+    /// n'a aucune session d'achat. Le défaut du trait répond « not supported »,
+    /// ce qui se lit comme un oubli ; celui-ci explique, et renvoie là où le
+    /// geste existe.
+    #[tokio::test]
+    async fn ajouter_un_favori_refuse_en_disant_pourquoi() {
+        let mut svc = service_de_test();
+        for message in [
+            svc.add_favorite("albums", "https://x.bandcamp.com/album/y")
+                .await
+                .expect_err("l'ajout doit échouer")
+                .to_string(),
+            svc.remove_favorite("albums", "https://x.bandcamp.com/album/y")
+                .await
+                .expect_err("le retrait doit échouer")
+                .to_string(),
+        ] {
+            assert!(
+                message.contains("session d'achat"),
+                "le refus doit nommer la cause, pas dire « not supported » : {message}"
+            );
+            assert!(
+                message.contains("bandcamp.com"),
+                "et dire où le geste existe vraiment : {message}"
+            );
+        }
+    }
     fn service_de_test() -> BandcampService {
         let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();

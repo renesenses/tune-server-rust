@@ -1391,13 +1391,31 @@ pub struct AlsaVariant {
 ///
 /// ## Ce que cette règle ne change PAS
 ///
-/// Elle ne change ni le nombre de périphériques publiés (le regroupement par
-/// nom reste entier — 43 fantômes → 48 zones chez JeromeQ, Ubuntu 24.04), ni
-/// le périphérique d'une zone déjà configurée : la résolution
-/// ([`resolve_device`]) travaille sur la liste BRUTE de `output_devices()`,
-/// jamais sur cette liste fusionnée, et apparie d'abord par `endpoint_id`. Une
-/// zone qui a mémorisé `sysdefault:…` continue donc d'ouvrir `sysdefault:…`.
-/// Seules les zones créées ensuite héritent du PCM matériel.
+/// Elle ne change pas le nombre de périphériques publiés : le regroupement par
+/// nom reste entier — 43 fantômes → 48 zones chez JeromeQ, Ubuntu 24.04.
+///
+/// ## ⚠️ Ce qu'une version antérieure de ce commentaire affirmait, et qui est FAUX
+///
+/// Il disait : « une zone qui a mémorisé `sysdefault:…` continue d'ouvrir
+/// `sysdefault:…` ; seules les zones créées ensuite héritent du PCM
+/// matériel », et cette phrase a circulé comme une consigne à donner aux
+/// testeurs — supprimer la zone et la recréer. **Aucune zone ne mémorise de
+/// PCM.** La table `zones` ne porte aucune colonne d'endpoint (`db/sqlite.rs`,
+/// `CREATE TABLE zones`) : elle ne retient que `output_device_id =
+/// "local:«nom d'affichage»"`. L'identifiant d'endpoint est RECALCULÉ à chaque
+/// démarrage et à chaque balayage à chaud, depuis cette liste-ci, par les deux
+/// seuls sites de production qui construisent une sortie locale
+/// (`tune-server/src/startup.rs` et `tune-server/src/background.rs`, via
+/// `with_options_and_endpoint`). Une zone existante hérite donc du `hw:` **au
+/// premier redémarrage**, sans qu'on ait à la supprimer ni à la recréer.
+///
+/// Ce qui restait vrai : la RÉSOLUTION ([`resolve_device`]) travaille sur la
+/// liste BRUTE de `output_devices()`, jamais sur cette liste fusionnée. Quand
+/// l'endpoint est connu elle apparie dessus et retrouve le `hw:` ; quand il est
+/// ABSENT — `recreate_local_and_play` le laisse délibérément vide — elle
+/// appariait par NOM, et les dix PCM de la carte portent le même. Elle rendait
+/// alors le premier énuméré, un greffon : le plafond de #1655 rentrait par la
+/// porte de derrière. C'est ce que [`preferer_le_pcm_materiel`] corrige.
 ///
 /// Quand aucune variante du groupe n'est un `hw:` — le cas d'une machine où
 /// PipeWire est le seul chemin praticable — le critère 1 ne départage rien et
@@ -8930,12 +8948,21 @@ pub(crate) enum DeviceMatch {
     ByDisplayName(usize),
     /// Retrouvé par sous-chaîne, et par une seule candidate.
     BySubstring(usize),
+    /// Retrouvé par NOM, puis ramené au PCM matériel de la même carte (#1655).
+    ///
+    /// `greffon` est le rang qu'un appariement par nom aurait rendu : un
+    /// `dmix:`/`sysdefault:`/`plughw:`, c'est-à-dire un convertisseur
+    /// logiciel. `retenu` est le `hw:` du même nom. Les deux rangs voyagent
+    /// ensemble pour que la décision puisse être JOURNALISÉE au lieu d'être
+    /// prise en silence.
+    ByAlsaHardwarePcm { retenu: usize, greffon: usize },
 }
 
 impl DeviceMatch {
     pub(crate) fn index(self) -> usize {
         match self {
             Self::ByEndpointId(i) | Self::ByDisplayName(i) | Self::BySubstring(i) => i,
+            Self::ByAlsaHardwarePcm { retenu, .. } => retenu,
         }
     }
 }
@@ -9057,7 +9084,16 @@ pub(crate) fn resolve_device(
     for &(index, candidate) in &matchable {
         let display_name = disambiguate_display_name(&candidate.raw_name, &mut seen_names);
         if display_name.to_lowercase() == search {
-            return DeviceResolution::Matched(DeviceMatch::ByDisplayName(index));
+            // 2 bis. Le nom ne distingue pas le PCM. Sur ALSA il en désigne une
+            //        dizaine pour la même carte, et le premier énuméré est le
+            //        plus souvent un greffon : voir `preferer_le_pcm_materiel`.
+            return match preferer_le_pcm_materiel(&matchable, index) {
+                Some(retenu) => DeviceResolution::Matched(DeviceMatch::ByAlsaHardwarePcm {
+                    retenu,
+                    greffon: index,
+                }),
+                None => DeviceResolution::Matched(DeviceMatch::ByDisplayName(index)),
+            };
         }
     }
 
@@ -9078,6 +9114,69 @@ pub(crate) fn resolve_device(
         // sous un autre nom. On préfère l'aveu d'ignorance.
         _ => DeviceResolution::NotFound,
     }
+}
+
+/// Ramener un appariement PAR NOM au PCM matériel de la même carte (#1655).
+///
+/// ## Pourquoi la résolution devait rattraper la découverte
+///
+/// La découverte regroupe les variantes ALSA homonymes et retient le `hw:`
+/// ([`variante_alsa_candidate_l_emporte`], #3240). La RÉSOLUTION, elle,
+/// travaille sur la liste BRUTE rendue par `host.output_devices()` : les dix
+/// PCM de la carte y sont tous présents, et ils portent tous **le même nom**.
+/// L'étape 2 rendait donc le PREMIER énuméré — `default`, `sysdefault:`,
+/// `dmix:` — c'est-à-dire un greffon qui accepte tout et rééchantillonne.
+/// `dmix` fixe la cadence de son esclave (`defaults.pcm.dmix.rate 48000`) :
+/// c'est exactement le plafond à 48 kHz de GgB sur l'Eversolo DAC-Z8 (#1655),
+/// remis en place par la résolution après que la découverte l'a écarté.
+///
+/// ## Quand ce chemin est réellement emprunté
+///
+/// L'étape 1 (identifiant d'endpoint) passe AVANT et reste souveraine : une
+/// zone dont la sortie a été enregistrée depuis l'énumération fusionnée porte
+/// déjà le `hw:`, et cette fonction ne change rien pour elle. Elle ne mord que
+/// sur les appariements où l'endpoint est ABSENT — au premier rang
+/// `recreate_local_and_play`, qui laisse délibérément `endpoint_id = None`
+/// parce que le périphérique n'est pas énumérable au moment où il reconstruit
+/// la sortie.
+///
+/// ## Ce qu'elle ne fait pas
+///
+/// - Elle ne sort jamais du groupe homonyme : seules les candidates portant le
+///   **même `raw_name`** que celle retenue par le nom sont examinées. Deux DAC
+///   distincts que Windows nomme tous deux « Haut-Parleurs » gardent donc leur
+///   départage par rang `(n)`, intact.
+/// - Elle ne s'applique qu'à ALSA *de fait* : [`alsa_pcm_is_direct_hardware`]
+///   rend `false` pour tout identifiant WASAPI, ASIO ou CoreAudio, si bien
+///   qu'aucune candidate n'y est « matérielle » et que la fonction rend `None`
+///   sans rien changer.
+/// - Elle ne re-décide pas des CAPACITÉS : la résolution ne les connaît pas.
+///   Seul le critère 1 de l'ordre total de la découverte est rejoué.
+///
+/// Le départage entre plusieurs `hw:` homonymes prend le plus petit
+/// identifiant — le même dernier cran que
+/// [`variante_alsa_candidate_l_emporte`], pour que le vainqueur ne dépende pas
+/// de l'ordre d'énumération d'alsa-lib.
+///
+/// Rend `None` quand il n'y a rien à corriger : candidate déjà matérielle, ou
+/// aucune candidate matérielle dans le groupe homonyme.
+fn preferer_le_pcm_materiel(
+    matchable: &[(usize, &DeviceIdentity)],
+    retenu_par_le_nom: usize,
+) -> Option<usize> {
+    let choisie = matchable
+        .iter()
+        .find(|(index, _)| *index == retenu_par_le_nom)
+        .map(|(_, candidate)| *candidate)?;
+    if alsa_pcm_is_direct_hardware(&choisie.endpoint_id) {
+        return None;
+    }
+    matchable
+        .iter()
+        .filter(|(_, candidate)| candidate.raw_name == choisie.raw_name)
+        .filter(|(_, candidate)| alsa_pcm_is_direct_hardware(&candidate.endpoint_id))
+        .min_by(|(_, a), (_, b)| a.endpoint_id.cmp(&b.endpoint_id))
+        .map(|(index, _)| *index)
 }
 
 /// La convention de désambiguïsation des noms d'affichage, en **un seul**
@@ -9228,6 +9327,18 @@ fn find_device_with_fallback(
 
     if let DeviceResolution::Matched(matched) = resolution {
         let index = matched.index();
+        if let DeviceMatch::ByAlsaHardwarePcm { greffon, .. } = matched {
+            // Une décision qui change ce qui sera OUVERT ne passe jamais en
+            // silence (#3209, #1655). Même famille de marqueur que la
+            // découverte, suffixée pour dire LEQUEL des deux chemins a
+            // corrigé.
+            info!(
+                requested = %device_name,
+                greffon_ecarte = %identities[greffon].endpoint_id,
+                endpoint_retenu = %identities[index].endpoint_id,
+                "local_audio_alsa_hardware_pcm_preferred_at_resolve"
+            );
+        }
         debug!(
             requested = %device_name,
             resolved = %identities[index].raw_name,
@@ -9922,3 +10033,6 @@ mod repli_format_compresse_i3618;
 
 #[cfg(test)]
 mod parc_lisible_sans_attendre_i3730;
+
+#[cfg(test)]
+mod pcm_materiel_a_la_resolution_i1655;

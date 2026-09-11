@@ -367,6 +367,13 @@ path = "tests/sources_trois_routes_i3226.rs"
 [[test]]
 name = "radio_adresse_pas_un_flux_3578"
 path = "tests/radio_adresse_pas_un_flux_3578.rs"
+# #3664 : le marqueur de journal du refus qui propose une station. Binaire a
+# part parce quil lit le JOURNAL : deux essais paralleles installant chacun
+# leur abonne tracing se disputent le cache dinteret des points demission, et
+# le verdict depend alors de lordre dordonnancement (mesure le 11/09/2026).
+[[test]]
+name = "radio_suggestion_marqueur_3664"
+path = "tests/radio_suggestion_marqueur_3664.rs"
 
 # #3543 : l'annuaire du site sert dix entrees Radio Paradise pour sept canaux,
 # dont trois adresses de flux servies DEUX fois sous deux noms. Chaque entree

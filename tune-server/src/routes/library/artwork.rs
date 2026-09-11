@@ -12,7 +12,12 @@ use tune_core::db::track_repo::TrackRepo;
 
 use super::artwork_cache_dir;
 
-fn is_hex_hash(s: &str) -> bool {
+/// Un condensat d'image tel que Tune les écrit : 32 hexadécimaux (MD5 hérité,
+/// adressé par le chemin) ou 64 (SHA-256 du CONTENU, #1444). C'est la seule
+/// forme qu'une adresse d'illustration prend en base ; le regroupement des
+/// albums éclatés s'en sert pour écarter tout ce qui n'est pas une identité
+/// d'image (#3396).
+pub(super) fn is_hex_hash(s: &str) -> bool {
     (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 

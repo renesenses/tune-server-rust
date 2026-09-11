@@ -60,6 +60,12 @@ use tokio::sync::Mutex;
 /// 48 kHz en stéréo, ce que son DENAFRIPS recevait.
 const CADENCE: u64 = 96_000;
 
+/// La cadence du sondeur (`POLL_INTERVAL_MS`) : le temps RÉEL qui sépare deux
+/// relèves. Les relèvés de ce fichier avancent d'une seconde d'audio par tick,
+/// donc d'exactement une seconde de temps réel : le pilote y tient toujours sa
+/// cadence, et aucun de ces cas n'est un rappel à l'arrêt (#3814).
+const TICK_MS: u64 = 1_000;
+
 /// Un relevé d'anneau cohérent : `served` échantillons servis à la cadence
 /// ci-dessus, dont `manquants` remplacés par des zéros sur `evenements`
 /// rappels.
@@ -79,7 +85,7 @@ fn releve(served: u64, evenements: u64, manquants: u64) -> OutputRingStarvation 
 #[test]
 fn le_premier_releve_sert_de_repere_et_ne_parle_pas() {
     let mut suivi = SuiviFamine::default();
-    assert!(suivi.observer(releve(96_000, 12, 4_800)).is_none());
+    assert!(suivi.observer(releve(96_000, 12, 4_800), TICK_MS).is_none());
 }
 
 /// Une seconde d'anneau vide : la ligne d'ouverture part, et elle porte le
@@ -87,8 +93,8 @@ fn le_premier_releve_sert_de_repere_et_ne_parle_pas() {
 #[test]
 fn l_anneau_qui_se_vide_ouvre_un_episode() {
     let mut suivi = SuiviFamine::default();
-    suivi.observer(releve(96_000, 0, 0));
-    let Some(FamineAnneau::Debut(ep)) = suivi.observer(releve(192_000, 40, 19_200)) else {
+    suivi.observer(releve(96_000, 0, 0), TICK_MS);
+    let Some(FamineAnneau::Debut(ep)) = suivi.observer(releve(192_000, 40, 19_200), TICK_MS) else {
         panic!("un anneau qui se vide doit ouvrir un épisode");
     };
     assert_eq!(ep.rappels_a_court, 40);
@@ -104,21 +110,21 @@ fn l_anneau_qui_se_vide_ouvre_un_episode() {
 #[test]
 fn une_famine_qui_dure_n_ecrit_pas_une_ligne_par_seconde() {
     let mut suivi = SuiviFamine::default();
-    suivi.observer(releve(96_000, 0, 0));
+    suivi.observer(releve(96_000, 0, 0), TICK_MS);
     assert!(matches!(
-        suivi.observer(releve(192_000, 40, 19_200)),
+        suivi.observer(releve(192_000, 40, 19_200), TICK_MS),
         Some(FamineAnneau::Debut(_))
     ));
     for n in 2..40u64 {
         let r = releve(96_000 * (n + 1), 40 * n, 19_200 * n);
         assert!(
-            suivi.observer(r).is_none(),
+            suivi.observer(r, TICK_MS).is_none(),
             "l'épisode dure : le tick {n} ne doit rien écrire de plus"
         );
     }
     // 40 s plus tard le producteur rattrape : les compteurs cessent de bouger.
     let dernier = releve(96_000 * 41, 40 * 39, 19_200 * 39);
-    let Some(FamineAnneau::Fin(ep)) = suivi.observer(dernier) else {
+    let Some(FamineAnneau::Fin(ep)) = suivi.observer(dernier, TICK_MS) else {
         panic!("la réalimentation doit fermer l'épisode");
     };
     assert_eq!(ep.rappels_a_court, 40 * 39);
@@ -137,7 +143,9 @@ fn une_lecture_saine_ne_dit_jamais_rien() {
     let mut suivi = SuiviFamine::default();
     for n in 0..600u64 {
         assert!(
-            suivi.observer(releve(96_000 * (n + 1), 0, 0)).is_none(),
+            suivi
+                .observer(releve(96_000 * (n + 1), 0, 0), TICK_MS)
+                .is_none(),
             "dix minutes de lecture saine ne doivent pas produire une ligne"
         );
     }
@@ -150,15 +158,15 @@ fn une_lecture_saine_ne_dit_jamais_rien() {
 #[test]
 fn un_flux_neuf_se_recale_mais_ferme_l_episode_ouvert() {
     let mut suivi = SuiviFamine::default();
-    suivi.observer(releve(96_000, 0, 0));
-    suivi.observer(releve(192_000, 40, 19_200));
+    suivi.observer(releve(96_000, 0, 0), TICK_MS);
+    suivi.observer(releve(192_000, 40, 19_200), TICK_MS);
     // Piste suivante : compteurs neufs, très en dessous des précédents.
-    let Some(FamineAnneau::Fin(ep)) = suivi.observer(releve(48_000, 0, 0)) else {
+    let Some(FamineAnneau::Fin(ep)) = suivi.observer(releve(48_000, 0, 0), TICK_MS) else {
         panic!("l'épisode ouvert doit se fermer sur le dernier relevé de la piste finie");
     };
     assert_eq!(ep.silence_ms, 200);
     // Et le flux neuf, lui, repart d'un repère muet.
-    assert!(suivi.observer(releve(144_000, 0, 0)).is_none());
+    assert!(suivi.observer(releve(144_000, 0, 0), TICK_MS).is_none());
 }
 
 /// Un flux qui n'a encore rien servi n'a pas de cadence : on ne peut pas
@@ -226,7 +234,7 @@ impl OutputTarget for SortieLocale {
     }
 }
 
-struct Banc {
+pub(super) struct Banc {
     poller: PositionPoller,
     metriques: PollerMetricsMap,
     anneau: Arc<std::sync::Mutex<Option<OutputRingStarvation>>>,
@@ -236,7 +244,7 @@ struct Banc {
 }
 
 impl Banc {
-    async fn monter(anneau_initial: Option<OutputRingStarvation>) -> Self {
+    pub(super) async fn monter(anneau_initial: Option<OutputRingStarvation>) -> Self {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
@@ -290,7 +298,7 @@ impl Banc {
     /// Poser un relevé d'anneau, puis faire tourner UN tick de sondeur —
     /// l'état de sondage est conservé d'un tick au suivant, comme dans la
     /// boucle réelle.
-    async fn tick_avec(&mut self, anneau: Option<OutputRingStarvation>) {
+    pub(super) async fn tick_avec(&mut self, anneau: Option<OutputRingStarvation>) {
         *self.anneau.lock().unwrap() = anneau;
         self.poller
             .tick(

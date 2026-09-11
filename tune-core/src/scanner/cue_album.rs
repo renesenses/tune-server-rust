@@ -181,9 +181,45 @@ fn index_du_dossier(dossier: &Path) -> HashMap<String, PathBuf> {
 }
 
 /// Résout une référence `FILE` dans le dossier de la feuille.
+///
+/// Le nom exact (à la casse près) prime toujours. À défaut, on tente la RACINE
+/// du nom : c'est le cas de terrain le plus fréquent derrière
+/// `cue-image-introuvable` — la feuille est écrite pendant le rip, quand
+/// l'image est encore un `.wav`, puis le WAV est converti (FLAC, APE,
+/// WavPack…) et supprimé sans que personne ne réécrive le `.cue`. La feuille
+/// désigne alors `Album.wav` à côté d'un `Album.flac` qui est exactement ce
+/// qu'elle découpe. Les temps d'une feuille sont des frames CD comptées depuis
+/// le début de l'image : une conversion qui garde les mêmes échantillons garde
+/// les mêmes temps.
+///
+/// Le repli ne DEVINE pas, et c'est ce qui le rend sûr :
+/// - il n'accepte qu'un candidat que le décodeur livré sait lire — sinon on
+///   remplacerait « introuvable » par un album injouable ;
+/// - il exige un candidat **unique**. Deux fichiers décodables de même racine
+///   (`Album.flac` et `Album.m4a`) laissent la feuille écartée avec son motif :
+///   on ne sait pas lequel elle découpe, et se tromper d'image produirait un
+///   album entier de pistes fausses.
 fn resoudre_image(index: &HashMap<String, PathBuf>, reference: &str) -> Option<PathBuf> {
     let nom = nom_nu(reference)?;
-    index.get(&nom.to_lowercase()).cloned()
+    let nom = nom.to_lowercase();
+    if let Some(exact) = index.get(&nom) {
+        return Some(exact.clone());
+    }
+    let racine = Path::new(&nom).file_stem()?.to_str()?;
+    if racine.is_empty() {
+        return None;
+    }
+    let mut candidats = index.iter().filter_map(|(cle, chemin)| {
+        let meme_racine = Path::new(cle.as_str())
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s == racine);
+        (meme_racine && crate::audio::support::native_decoder_supports(chemin)).then_some(chemin)
+    });
+    let premier = candidats.next()?;
+    // Ambigu : on préfère un album absent, que le rapport explique, à un album
+    // découpé sur le mauvais fichier.
+    candidats.next().is_none().then(|| premier.clone())
 }
 
 /// Clé de regroupement d'un album : le titre, réduit à ce qui se compare.
@@ -887,5 +923,95 @@ mod tests {
         assert_eq!(nom_nu("sous/dossier/album.flac"), Some("album.flac"));
         assert_eq!(nom_nu(".."), None);
         assert_eq!(nom_nu("   "), None);
+    }
+
+    /// Le cas de terrain le plus fréquent derrière `cue-image-introuvable` :
+    /// la feuille a été écrite PENDANT le rip, quand l'image était encore un
+    /// WAV ; le WAV a ensuite été converti (FLAC, APE, WavPack…) et supprimé,
+    /// sans que personne ne réécrive le `.cue`. La feuille désigne alors un
+    /// fichier qui n'existe plus, à côté du seul fichier qui la complète.
+    ///
+    /// Avant le repli par racine de nom, ce dossier ne produisait AUCUN album
+    /// et le rapport le comptait en « image introuvable ».
+    #[test]
+    fn resout_l_image_convertie_dans_un_autre_format() {
+        let d = tempfile::TempDir::new().unwrap();
+        let flac = d.path().join("image.flac");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac"),
+            &flac,
+        )
+        .unwrap();
+        // La feuille désigne « image.wav », qui n'existe plus.
+        fs::write(d.path().join("album.cue"), FEUILLE).unwrap();
+        let plan = planifier_dossier(d.path());
+        assert!(plan.ecartees.is_empty(), "{:?}", plan.ecartees);
+        assert_eq!(plan.albums.len(), 1, "la feuille doit décrire son album");
+        assert_eq!(plan.albums[0].pistes.len(), 2);
+        assert_eq!(
+            plan.albums[0].pistes[0].media, flac,
+            "les pistes doivent pointer le fichier réellement présent"
+        );
+    }
+
+    /// CONTRE-POIDS — le repli ne DEVINE pas. Deux fichiers décodables
+    /// partagent la racine du nom : on ne sait pas lequel la feuille découpe,
+    /// et elle reste écartée avec le motif qu'elle avait.
+    #[test]
+    fn le_repli_par_racine_refuse_de_choisir_entre_deux_candidats() {
+        let d = tempfile::TempDir::new().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        fs::copy(fixtures.join("test.flac"), d.path().join("image.flac")).unwrap();
+        fs::copy(fixtures.join("test.m4a"), d.path().join("image.m4a")).unwrap();
+        fs::write(d.path().join("album.cue"), FEUILLE).unwrap();
+        let plan = planifier_dossier(d.path());
+        assert!(plan.albums.is_empty(), "un album a été deviné");
+        assert_eq!(
+            plan.ecartees[0].1,
+            MotifEcart::ImageIntrouvable {
+                fichier: "image.wav".into()
+            }
+        );
+    }
+
+    /// CONTRE-POIDS — un fichier qui porte la racine du nom mais qu'aucun
+    /// décodeur livré ne lit n'est pas un candidat : sinon on remplacerait
+    /// « introuvable » par un album injouable.
+    #[test]
+    fn le_repli_par_racine_ignore_ce_que_le_decodeur_ne_lit_pas() {
+        let d = tempfile::TempDir::new().unwrap();
+        fs::write(d.path().join("image.mpc"), b"pas un decodeur connu").unwrap();
+        fs::write(d.path().join("album.cue"), FEUILLE).unwrap(); // FILE "image.wav"
+        let plan = planifier_dossier(d.path());
+        assert!(plan.albums.is_empty());
+        assert_eq!(
+            plan.ecartees[0].1,
+            MotifEcart::ImageIntrouvable {
+                fichier: "image.wav".into()
+            },
+            "le motif reste celui de la référence, pas celui du voisin"
+        );
+    }
+
+    /// CONTRE-POIDS — le nom exact prime toujours sur le repli. Un dossier qui
+    /// garde le WAV ET son FLAC continue d'être découpé sur le fichier que la
+    /// feuille NOMME.
+    #[test]
+    fn le_nom_exact_prime_sur_le_repli_par_racine() {
+        let d = tempfile::TempDir::new().unwrap();
+        ecrire_wav(&d.path().join("image.wav"), 200);
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac"),
+            d.path().join("image.flac"),
+        )
+        .unwrap();
+        fs::write(d.path().join("album.cue"), FEUILLE).unwrap();
+        let plan = planifier_dossier(d.path());
+        assert!(plan.ecartees.is_empty(), "{:?}", plan.ecartees);
+        assert_eq!(
+            plan.albums[0].pistes[0].media,
+            d.path().join("image.wav"),
+            "le fichier nommé par la feuille doit rester celui qu'on découpe"
+        );
     }
 }
