@@ -1972,11 +1972,27 @@ mod tests {
         // cassait — la barre restait à 0 %, le compteur à 0/N, et le bouton de
         // téléchargement ne s'affichait jamais.
         let exiges = champs_exiges_par_le_web();
-        assert!(
-            exiges.len() >= 11,
-            "le contrat s'est appauvri : {exiges:?} — il doit couvrir la forme \
-             historique ET celle que lit le web"
-        );
+
+        // Le compte `>= 11` gardait cette place. Il mesurait la carte du
+        // 31/08, dont le contrat exigeait AUSSI les cinq champs historiques :
+        // depuis, `api.ts` ne les déclare plus (la carte régénérée le 11/09 en
+        // liste cinq, pas onze). Un compte ne sait pas distinguer « le web a
+        // cessé de lire un champ » de « la carte s'est appauvrie » — il
+        // rougissait donc sur un changement légitime, et l'aurait fait taire
+        // en le rabaissant.
+        //
+        // Deux exigences NOMMÉES le remplacent, et couvrent strictement plus :
+        // les champs de #3002 doivent rester au contrat web, et le corps doit
+        // continuer de porter la forme historique même si plus personne ne la
+        // déclare — c'est ce que le compte protégeait par accident.
+        for champ in ["state", "progress", "converted", "current_file", "total"] {
+            assert!(
+                exiges.iter().any(|c| c == champ),
+                "le contrat web a perdu `{champ}` : c'est un des champs de #3002, \
+                 sans lui l'écran Convertisseur redevient indiscernable d'un blocage \
+                 — contrat={exiges:?}"
+            );
+        }
 
         for etat in [
             JobStatus::Running,
@@ -1992,6 +2008,17 @@ mod tests {
                     objet.contains_key(champ),
                     "état {} : champ obligatoire absent du corps : {champ} — \
                      corps={payload}",
+                    etat.as_str()
+                );
+            }
+            // La forme historique, que le contrat web ne déclare plus depuis
+            // que `api.ts` l'a retirée de son type. Les clients qui la lisent
+            // ne sont pas tous du web : la boucle ci-dessus ne la couvre plus,
+            // celle-ci la garde nommément.
+            for champ in ["status", "completed", "errors", "job_id"] {
+                assert!(
+                    objet.contains_key(champ),
+                    "état {} : la forme historique a perdu `{champ}` — corps={payload}",
                     etat.as_str()
                 );
             }

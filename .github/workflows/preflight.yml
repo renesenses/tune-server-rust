@@ -129,6 +129,22 @@ jobs:
           python3 scripts/preflight-web-contract.py --self-test
           python3 scripts/preflight-web-contract.py --web .web-client
 
+      # `docs/contrat-web.json` est CHARGÉE par `web_response_contracts.rs` pour
+      # juger les réponses du serveur, et rien ne la jugeait elle : le
+      # cartographe `web-contract-map.py` n'était exécuté par aucun poste de la
+      # CI. Mesuré le 11/09/2026 : la carte n'avait pas bougé depuis le 31/08
+      # pendant qu'`api.ts` recevait 71 commits, et citait encore dix routes que
+      # le client n'appelle plus. On validait contre un document figé en croyant
+      # vérifier un contrat.
+      #
+      # Ce poste dispose du SEUL endroit où la comparaison est honnête : le SHA
+      # web exact que la release embarque, déjà extrait du manifeste ci-dessus.
+      - name: Fraîcheur de la carte du contrat web
+        run: |
+          python3 scripts/web-contract-map.py --self-test
+          python3 scripts/verifier-carte-web.py --self-test
+          python3 scripts/verifier-carte-web.py --web .web-client
+
       - name: Run preflight checks
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -79,6 +79,60 @@ MOTIF_APPEL_NU = re.compile(
 
 MOTIF_INTERFACE = re.compile(r"^\s*export\s+(?:interface|type)\s+(?P<nom>[A-Z][A-Za-z0-9_]*)\s*=?\s*\{", re.M)
 
+# ── Corrections nominales, appliquées APRÈS extraction ───────────────────────
+#
+# Ce script extrait ce que le client DÉCLARE. Quand cette déclaration est
+# elle-même fausse — un type mort que plus personne n'appelle — la carte
+# recopie l'erreur, et le banc d'essai la fait respecter au serveur.
+#
+# La correction de #3002 vivait jusqu'ici à la main DANS `docs/contrat-web.json`.
+# Elle était donc perdue à la première régénération, qui aurait remis `lyrics`
+# et fait rougir `les_paroles_rendent_les_lignes_annoncees_au_web`. Une carte
+# qu'on ne peut pas régénérer sans casser un test est une carte qu'on ne
+# régénère jamais : c'est une des causes du gel du 31/08 au 11/09.
+#
+# Une entrée se justifie par un numéro d'issue et se retire dès que le client
+# est corrigé — ici, dès que `api.ts:getTrackLyrics`, qui n'a aucun appelant,
+# sera supprimée.
+CORRECTIONS: dict[tuple[str, str], dict] = {
+    ("GET", "/library/tracks/{}/lyrics"): {
+        "champs_obligatoires": ["synced", "source", "lines"],
+        "note": (
+            "#3002 — exigeait `lyrics`, que le serveur n'envoie pas : il rend "
+            "`lines`. L'exigence venait de `api.ts:getTrackLyrics`, une fonction "
+            "SANS AUCUN APPELANT dont `lib/lyrics.ts` documente lui-meme le type "
+            "comme la forme « historique ». Les vrais consommateurs (NowPlaying, "
+            "TvView) lisent `data.lines` via `fetchTrackLyrics`. Le serveur avait "
+            "raison, la carte recopiait un type mort."
+        ),
+    },
+}
+
+
+def appliquer_corrections(entrees: list[dict]) -> list[dict]:
+    """Substitue les contrats de `CORRECTIONS`, et signale ceux qui ne servent plus.
+
+    Une correction dont la route a disparu de la carte est une dette payée
+    ailleurs : la taire fossiliserait une exception sans objet.
+    """
+    vues: set[tuple[str, str]] = set()
+    for entree in entrees:
+        clef = (entree["methode"], entree["route"])
+        correction = CORRECTIONS.get(clef)
+        if correction is None:
+            continue
+        vues.add(clef)
+        entree["champs_obligatoires"] = list(correction["champs_obligatoires"])
+        entree["note"] = correction["note"]
+    for clef in CORRECTIONS:
+        if clef not in vues:
+            print(
+                f"  ✓ {clef[0]} {clef[1]} n'est plus cartographiee — retirer sa "
+                f"correction de CORRECTIONS",
+                file=sys.stderr,
+            )
+    return entrees
+
 
 def champs_du_bloc(bloc: str) -> tuple[list[str], list[str]]:
     """Champs de premier niveau d'un corps d'interface : (obligatoires, optionnels).
@@ -314,6 +368,7 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
             continue
         vues.add(cle)
         uniques.append(e)
+    uniques = appliquer_corrections(uniques)
     return sorted(uniques, key=lambda e: (e["route"], e["methode"])), non_resolus
 
 
@@ -357,6 +412,12 @@ def self_test() -> int:
 
       export function opaque(): Promise<{ [k: string]: unknown }> {
         return fetchJSON(`${BASE}/sans/champ`);
+      }
+
+      export function paroles(id: number): Promise<{
+        lyrics: string; synced: boolean; source: string;
+      }> {
+        return fetchJSON(`${BASE}/library/tracks/${id}/lyrics`);
       }
     """
     entrees, non_resolus = carte(types_src, api)
@@ -428,21 +489,39 @@ def self_test() -> int:
     if "/x/y-z" not in raisons:
         echecs.append("un type introuvable n'est PAS signalé — la carte se croirait complète")
 
+    # La correction nominale de #3002 : le client DÉCLARE `lyrics`, le serveur
+    # rend `lines`, et c'est le client qui a tort (fonction sans appelant).
+    # Sans cette substitution, chaque régénération remettrait `lyrics` et
+    # ferait rougir un test juste — donc plus personne ne régénérerait.
+    paroles = par_route.get("/library/tracks/{}/lyrics")
+    if paroles is None:
+        echecs.append("la route corrigee n'est meme pas cartographiee")
+    elif paroles["champs_obligatoires"] != ["synced", "source", "lines"]:
+        echecs.append(
+            "la correction nominale n'est pas appliquee : "
+            f"{paroles['champs_obligatoires']}"
+        )
+    elif "#3002" not in paroles.get("note", ""):
+        echecs.append("une correction s'applique sans dire de quelle issue elle vient")
+
     if echecs:
         for e in echecs:
             print(f"  ✗ {e}")
         print("SELF-TEST: ÉCHEC")
         return 1
-    print("SELF-TEST: ok — 16 garanties (déclaration générique ignorée, type nommé, "
+    print("SELF-TEST: ok — 17 garanties (déclaration générique ignorée, type nommé, "
           "optionnels, liste, paramètre d'URL, type en ligne, import en ligne, route "
           "à parenthèses, méthode HTTP, les deux non-résolutions, et les quatre du "
-          "type porté par l'annotation de retour)")
+          "type porté par l'annotation de retour, correction nominale)")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--web", help="racine du dépôt tune-web-client")
+    # Sans cette trace, rien dans le fichier ne dit de QUEL client il parle : la
+    # carte a vieilli onze jours sans que personne puisse le voir en la lisant.
+    ap.add_argument("--web-sha", help="commit du client web cartographié, inscrit dans la sortie")
     ap.add_argument("-o", "--out", help="fichier JSON de sortie (défaut : stdout)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -469,6 +548,16 @@ def main() -> int:
     entrees, non_resolus = carte(sources, api_path.read_text(encoding="utf-8", errors="ignore"))
 
     sortie = {
+        "genere_depuis": {
+            "web_sha": args.web_sha or "(non precise)",
+            "regenerer": "scripts/web-contract-map.py --web <tune-web-client> "
+                         "--web-sha <sha> -o docs/contrat-web.json",
+            "gardee_par": [
+                "tune-server/tests/web_response_contracts.rs "
+                "(la_carte_web_ne_cite_que_des_routes_encore_servies)",
+                "scripts/verifier-carte-web.py (preflight)",
+            ],
+        },
         "routes": entrees,
         "non_resolus": non_resolus,
         "resume": {
