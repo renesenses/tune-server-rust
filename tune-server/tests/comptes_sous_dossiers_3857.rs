@@ -304,11 +304,23 @@ mod pg_3857 {
         {
             sql.push_str(&format!(
                 "INSERT INTO tracks (title, file_path, source) VALUES ({}, {}, 'local');",
-                serde_json::json!(format!("piste {i}")),
-                serde_json::json!(c),
+                litteral(&format!("piste {i}")),
+                litteral(c),
             ));
         }
         state.backend.execute_batch(&sql).expect("pistes témoins");
+    }
+
+    /// Un littéral de chaîne SQL, apostrophes doublées.
+    ///
+    /// ⚠️ PAS `serde_json::json!`, qui rend des GUILLEMETS DOUBLES. SQLite les
+    /// accepte comme littéral de chaîne par repli ; PostgreSQL y lit un
+    /// IDENTIFIANT, et la semence tombe sur
+    /// `column "piste 0" does not exist`. C'est le job `Test (PostgreSQL)` de
+    /// cette PR qui l'a dit — la divergence est invisible sur SQLite, donc
+    /// invisible partout où ce témoin ne tourne pas sur une vraie base.
+    fn litteral(valeur: &str) -> String {
+        format!("'{}'", valeur.replace('\'', "''"))
     }
 
     fn arborescence() -> tempfile::TempDir {
