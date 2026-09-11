@@ -1280,21 +1280,37 @@ impl PlaybackOrchestrator {
     ) -> (bool, Option<String>) {
         let device_name = device_id.strip_prefix("local:").unwrap_or(device_id);
         // Les réglages, pas des littéraux : voir `reglages_sortie_locale`
-        // (#1770). `endpoint_id` et `origin_host` restent absents — les deux
-        // ne viennent QUE d'une énumération de périphériques
-        // (`AudioDevice::endpoint_id` / `.backend`), rien ne les persiste, et
-        // ce chemin n'en a pas : il existe précisément parce que le
-        // périphérique n'est PAS énumérable à cet instant. Les inventer serait
-        // pire que de les laisser vides.
+        // (#1770).
+        //
+        // #2269 — `endpoint_id` n'est plus absent. Il vient de la ZONE, où la
+        // passe d'identité l'a écrit la dernière fois que l'énumération a
+        // montré cet appareil (`zones.output_endpoint_id`). C'est le seul
+        // renseignement qui puisse arriver ici : ce chemin existe précisément
+        // parce que le périphérique n'est PAS énumérable à cet instant, et
+        // sans lui c'est le NOM qui part en résolution — d'où le
+        // `requested_device="audio-gd USB audio"` du journal de Jean-Luc.
+        //
+        // ⚠️ Cela ne fait pas revenir un appareil débranché : `resolve_device`
+        // et `select_wasapi_endpoint` ne cherchent que parmi les périphériques
+        // énumérés à l'instant. Ce que ça change, c'est le VERDICT — la zone
+        // dit quel endpoint elle possède, au lieu de dire quel nom elle
+        // cherche — et le retour de l'appareil sous un autre nom.
+        //
+        // `origin_host`, lui, reste absent : rien ne le persiste, et l'inventer
+        // serait pire que de le laisser vide.
         let (exclusive_mode, audio_backend) = self.reglages_sortie_locale();
+        let endpoint_id = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .endpoint_id_de_la_sortie(device_id);
         info!(
             device_id,
             exclusive_mode,
             audio_backend = %audio_backend,
+            endpoint_id = endpoint_id.as_deref().unwrap_or("<aucun>"),
             "output_not_found_recreating_local_output"
         );
-        let local_out = crate::outputs::local::LocalOutput::with_options(
+        let local_out = crate::outputs::local::LocalOutput::with_options_and_endpoint(
             device_name.to_string(),
+            endpoint_id,
             exclusive_mode,
             &audio_backend,
         );

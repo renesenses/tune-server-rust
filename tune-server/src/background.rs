@@ -2252,6 +2252,80 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         Err(_) => return,
     };
 
+    {
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
+        // créer quoi que ce soit.
+        //
+        // Une zone locale est identifiée par `local:{nom}`. Quand le pilote
+        // renomme l'endpoint — Windows le fait au changement de taux
+        // d'échantillonnage — la boucle ci-dessous ne reconnaît plus
+        // `local:{nouveau nom}` et offre à l'appareil une zone NEUVE, à côté
+        // de l'ancienne restée orpheline avec tous ses réglages. Cette passe
+        // fait suivre la zone à son appareil, par l'identifiant d'endpoint
+        // stable qu'elle a enregistré.
+        //
+        // La RÈGLE est ailleurs — `outputs::identite_de_sortie`, une fonction
+        // pure : liste BLANCHE de backends (WASAPI et CoreAudio seulement, cf.
+        // sa table), quatre refus nommés, aucune fusion de zones. Ici on ne
+        // fait que lui donner le parc et journaliser ce qu'elle a décidé.
+        //
+        // ⚠️ Elle ne fait pas revenir un appareil DÉBRANCHÉ : un périphérique
+        // absent de `devices` reste introuvable, identifiant ou pas.
+        let parc_pour_identite: Vec<tune_core::outputs::identite_de_sortie::SortieEnumeree> =
+            devices
+                .iter()
+                .map(
+                    |dev| tune_core::outputs::identite_de_sortie::SortieEnumeree {
+                        nom: dev.name.clone(),
+                        endpoint_id: dev.endpoint_id.clone(),
+                    },
+                )
+                .collect();
+        match zone_repo.appliquer_identite_de_sortie(&parc_pour_identite) {
+            Ok(rapport) => {
+                for r in &rapport.reassociees {
+                    info!(
+                        zone_id = r.zone_id,
+                        ancien = %r.ancien_device_id,
+                        nouveau = %r.nouveau_device_id,
+                        endpoint_id = %r.endpoint_id,
+                        "zone_locale_reassociee_par_identifiant_stable"
+                    );
+                }
+                // Les refus sont DITS. Une zone qui ne retrouve pas son
+                // appareil alors qu'elle en connaît l'identifiant est
+                // exactement ce qu'un rapport de bogue doit pouvoir nommer.
+                for (zone_id, motif) in &rapport.refus {
+                    warn!(
+                        zone_id,
+                        motif = %motif,
+                        "reassociation_de_zone_locale_refusee"
+                    );
+                }
+                if !rapport.apprises.is_empty() {
+                    info!(
+                        zones = rapport.apprises.len(),
+                        "identifiant_de_sortie_locale_appris"
+                    );
+                }
+                // Les télécommandes sont connectées, elles : une zone qui
+                // change d'appareil doit se rafraîchir à l'écran, sans quoi
+                // elles gardent l'ancien identifiant jusqu'au prochain
+                // rechargement complet.
+                for r in &rapport.reassociees {
+                    state.event_bus.emit_typed(
+                        tune_core::event_types::EventType::ZoneUpdated,
+                        serde_json::json!({
+                            "zone_id": r.zone_id,
+                            "device_id": r.nouveau_device_id,
+                        }),
+                    );
+                }
+            }
+            Err(e) => warn!(error = %e, "identite_de_sortie_locale_non_appliquee"),
+        }
+    }
     // Collect new device IDs first (no lock needed)
     let new_device_ids: std::collections::HashSet<String> = devices
         .iter()
@@ -3397,5 +3471,50 @@ mod exclusif_par_peripherique_i3245 {
             1,
             "un site cité dans un module de test ne doit pas être compté"
         );
+    }
+}
+
+/// #2269 — la passe d'identité doit courir AVANT l'enregistrement, aux DEUX
+/// points qui enregistrent une sortie locale.
+///
+/// « Écrit mais pas branché » est le défaut le plus cher de ce dépôt : une
+/// règle correcte, éprouvée, que personne n'appelle. Ici, l'ordre compte
+/// autant que l'appel — appliquer l'identité APRÈS la boucle
+/// d'enregistrement laisserait la zone neuve déjà créée, et la
+/// ré-association n'aurait plus qu'un doublon à contempler.
+#[cfg(test)]
+mod identite_de_sortie_branchee {
+    /// ⚠️ #2082 — ce fichier est inclus en ENTIER, ce module compris. Un motif
+    /// écrit d'un bloc se trouverait LUI-MÊME et rendrait le garde vrai quoi
+    /// qu'il arrive. Les deux motifs sont donc assemblés à la compilation.
+    const APPEL: &str = concat!("appliquer_identite_de_sortie(&", "parc_pour_identite)");
+    const CONSTRUCTEUR: &str = concat!("LocalOutput::with_options_and_", "endpoint(");
+
+    #[test]
+    fn les_deux_points_denregistrement_appliquent_lidentite_avant_denregistrer() {
+        for (fichier, source) in [
+            ("startup.rs", include_str!("startup.rs")),
+            ("background.rs", include_str!("background.rs")),
+        ] {
+            let appel = source.find(APPEL).unwrap_or_else(|| {
+                panic!(
+                    "{fichier} enregistre une sortie locale sans appliquer \
+                     l'identité de zone : un DAC revenu sous un autre nom y \
+                     recevrait une zone NEUVE à côté de l'ancienne (#2269)."
+                )
+            });
+            let construction = source.find(CONSTRUCTEUR).unwrap_or_else(|| {
+                panic!(
+                    "{fichier} ne construit plus de sortie locale : ce garde \
+                     ne garde plus rien tant qu'il n'a pas suivi."
+                )
+            });
+            assert!(
+                appel < construction,
+                "{fichier} applique l'identité APRÈS avoir enregistré la \
+                 sortie : la zone neuve est déjà créée, et la ré-association \
+                 n'a plus qu'un doublon à contempler (#2269)."
+            );
+        }
     }
 }
