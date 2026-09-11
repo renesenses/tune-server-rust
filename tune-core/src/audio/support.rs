@@ -39,7 +39,20 @@ pub const KNOWN_UNREAD_AUDIO_EXTENSIONS: &[&str] = &[
     "cue", // feuille de découpe, jamais interprétée
     "tta", "shn", "ofr", "ofs", // sans perte, formats de niche
     "m4b", "m4p", // livres audio, achats protégés
-    "dts", "ac3", "eac3", "mka", // conteneurs plutôt vidéo/multicanal
+    "dts", "ac3", "eac3", // conteneurs plutôt vidéo/multicanal
+    // Matroska. `mka` (piste audio seule) y était déjà ; `mkv` ne l'était
+    // NULLE PART — ni ici, ni au catalogue, ni chez le décodeur. Il
+    // retombait donc sur `NotAudio`, c'est-à-dire le `continue` muet de
+    // `walker.rs` : aucune piste, aucun compteur, aucune ligne de rapport.
+    // C'est le défaut de #2060 pour `.oga`, reproduit à l'identique sur
+    // l'extension que Didier apporte (#3633, fil 1717).
+    //
+    // Il reste dans les NON LUS, pas au catalogue : symphonia démuxe bien
+    // le Matroska (feature `mkv` de `Cargo.toml`), mais un MKV de concert
+    // porte presque toujours de l'AC-3/E-AC-3/TrueHD, et symphonia 0.6 ne
+    // fournit AUCUN de ces codecs. Le cataloguer promettrait une lecture
+    // que le binaire ne sait pas tenir.
+    "mka", "mkv", // Matroska : conteneur démuxé, contenu non décodé (#3633)
     "aac", // AAC brut : le catalogue exige aujourd'hui un conteneur m4a
     "ra", "rm", "amr", "spx",
 ];
@@ -407,6 +420,40 @@ mod tests {
                 ".{ext} est decodable mais ni catalogue ni declare non lu — il disparaitrait du scan sans une ligne de rapport"
             );
         }
+    }
+
+    /// #3633 — un `.mkv` est COMPTÉ, pas perdu.
+    ///
+    /// Le jumeau `.mka` est le témoin : même conteneur Matroska, même liste,
+    /// même appel. S'il tombait avec `.mkv`, ce test mesurerait la fonction et
+    /// non le défaut.
+    #[test]
+    fn un_mkv_est_declare_non_lu_comme_son_jumeau_mka() {
+        for nom in ["concert.mka", "concert.mkv", "Concert.MKV"] {
+            let LibraryAudioSupport::Unsupported(refus) =
+                library_audio_support_by_extension(Path::new(nom))
+            else {
+                panic!(
+                    "« {nom} » doit être DÉCLARÉ non lu : `NotAudio` est un \
+                     `continue` muet du parcours — ni compteur, ni ligne de \
+                     rapport, le fichier disparaît sans trace (#3633)"
+                );
+            };
+            assert_eq!(
+                refus.report_key,
+                nom.rsplit('.').next().unwrap().to_lowercase()
+            );
+        }
+        // CONTRE-ÉPREUVE : la liste ne s'est pas mise à tout avaler. Un format
+        // catalogué reste catalogué, et une pochette reste muette.
+        assert!(matches!(
+            library_audio_support_by_extension(Path::new("album.flac")),
+            LibraryAudioSupport::Supported
+        ));
+        assert!(matches!(
+            library_audio_support_by_extension(Path::new("cover.jpg")),
+            LibraryAudioSupport::NotAudio
+        ));
     }
 
     #[test]
