@@ -41,9 +41,17 @@
 //! qui ait le droit de lire l'heure.
 
 use super::decisions::{FamineAnneau, SuiviFamine, rappel_en_retard};
-use crate::outputs::local::RingBuf;
-use crate::outputs::traits::{OutputRingStarvation, RingStarvation};
+use crate::outputs::traits::OutputRingStarvation;
 use std::sync::Arc;
+
+// Le banc matériel ne se compile qu'avec la sortie locale : `outputs::local`
+// (et donc `RingBuf`) est derrière `local-audio`, et la porte `Test` de la CI
+// tourne sans cette caractéristique. Toute la comptabilité et le témoin de
+// branchement, eux, restent compilés partout.
+#[cfg(feature = "local-audio")]
+use crate::outputs::local::RingBuf;
+#[cfg(feature = "local-audio")]
+use crate::outputs::traits::RingStarvation;
 
 /// La cadence du sondeur (`POLL_INTERVAL_MS`).
 const TICK_MS: u64 = 1_000;
@@ -53,14 +61,17 @@ const CADENCE: u64 = 88_200;
 
 /// Le rappel du pilote : 512 trames stéréo, soit 1 024 échantillons
 /// entrelacés — 11,6 ms à 44,1 kHz.
+#[cfg(feature = "local-audio")]
 const RAPPEL: usize = 1_024;
 
 /// Un banc : l'anneau de production et ses compteurs de production.
+#[cfg(feature = "local-audio")]
 struct Banc {
     anneau: RingBuf,
     compteurs: Arc<RingStarvation>,
 }
 
+#[cfg(feature = "local-audio")]
 impl Banc {
     /// Un anneau de 2 s à 44,1 kHz stéréo — le dimensionnement de production
     /// (`ring_cap = taux × canaux × 2`, `outputs/local.rs`).
@@ -112,6 +123,7 @@ impl Banc {
 /// Avant #3814, ce second tick fermait l'épisode sur « l'anneau audio est
 /// réalimenté » alors que rien n'avait été réalimenté : le pilote avait
 /// simplement cessé de réclamer.
+#[cfg(feature = "local-audio")]
 #[test]
 fn un_rappel_qui_se_tait_ne_se_lit_pas_comme_un_anneau_realimente() {
     let banc = Banc::neuf();
@@ -176,6 +188,7 @@ fn un_rappel_qui_se_tait_ne_se_lit_pas_comme_un_anneau_realimente() {
 /// TÉMOIN VERT du banc : le producteur rattrape VRAIMENT son retard et le
 /// pilote continue de réclamer son dû. C'est là, et seulement là, que
 /// « l'anneau est réalimenté » est vrai — et le suivi doit toujours le dire.
+#[cfg(feature = "local-audio")]
 #[test]
 fn un_anneau_vraiment_realimente_se_ferme_toujours_sur_fin() {
     let banc = Banc::neuf();
