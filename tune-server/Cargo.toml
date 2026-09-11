@@ -231,6 +231,25 @@ path = "tests/ajouts_recents_fenetre.rs"
 [[test]]
 name = "ambiance_traduction_annoncee_3839"
 path = "tests/ambiance_traduction_annoncee_3839.rs"
+# Les trois gardes du RELAIS SUPPORT — la matiere qu un testeur envoie depuis
+# Tune (journaux coches, fiche systeme, pieces jointes, « marquer lu »). Elles
+# existaient depuis le 01/09/2026 sans AUCUNE cible : `autotests = false` plus
+# haut les laissait HORS COMPILATION, donc vertes contre rien, precisement sur
+# le chemin dont #2916 a mesure qu il jetait les journaux de 39 tickets sur 62
+# pendant vingt-trois jours sans une ligne rouge. Mesure du 11/09/2026 par
+# `cargo metadata` : 39 cibles declarees, aucune de ces trois.
+#
+# Posees ICI, au milieu du fichier, et non a la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent a chaque fois.
+[[test]]
+name = "support_journaux_joints"
+path = "tests/support_journaux_joints.rs"
+[[test]]
+name = "support_relais_diagnostic_sortant"
+path = "tests/support_relais_diagnostic_sortant.rs"
+[[test]]
+name = "support_relais_marquer_lu"
+path = "tests/support_relais_marquer_lu.rs"
 
 # #3101 : la portée de répertoire de l'audit de bibliothèque. Le motif LIKE de
 # `GET /export/library-audit.csv?dir=…` était écrit à la main, sans séparateur :
