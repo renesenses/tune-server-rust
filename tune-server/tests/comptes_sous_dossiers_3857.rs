@@ -335,7 +335,14 @@ mod pg_3857 {
     /// témoin — lequel ne porte pas le module interne. Sans le préfixe ici,
     /// létape existait et nexécutait rien : « écrit mais pas branché », et
     /// cest la garde qui la dit.
-    #[tokio::test]
+    // `flavor = "multi_thread"` n'est pas cosmétique : `AppState::new` sur
+    // PostgreSQL passe par `tokio::task::block_in_place` (`state.rs:555`), qui
+    // PANIQUE sur l'ordonnanceur mono-fil que `#[tokio::test]` monte par
+    // défaut — « can call blocking only when running on the multi-threaded
+    // runtime ». Mesuré sur le job `Test (PostgreSQL)` de la PR, pas deviné :
+    // c'est la première exécution réelle de ce témoin qui l'a dit. Les trois
+    // autres témoins PostgreSQL du dépôt le déclarent tous ainsi.
+    #[tokio::test(flavor = "multi_thread")]
     async fn pg_3857_les_deux_moteurs_rendent_les_memes_comptes_de_sous_dossiers() {
         let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
             eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
