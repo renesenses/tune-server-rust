@@ -673,6 +673,24 @@ async fn les_paroles_rendent_les_lignes_annoncees_au_web() {
 // démentie. On valide contre un document figé en croyant vérifier un contrat,
 // ce qui est pire que ne rien vérifier : ça donne l'illusion de la preuve.
 //
+// CE QUE LA SONDE INTERROGE — ET LE PIÈGE QU'ELLE ÉVITE
+//     Le ROUTEUR ASSEMBLÉ, jamais les sources. Le chemin soumis est celui
+//     qu'Axum SERT, `nest()` appliqués, pas celui qu'une caisse DÉCLARE.
+//
+//     La différence n'est pas théorique, et elle a déjà produit un faux
+//     diagnostic dans la relecture de ce lot : `tune-streaming-http` déclare
+//     `/youtube/moods`, mais `routes/mod.rs` monte cette caisse sous
+//     `.nest("/streaming", …)`, si bien que le chemin servi est
+//     `/api/v1/streaming/youtube/moods` — et il rend 200. Lire la déclaration
+//     et conclure « le vrai chemin est /api/v1/youtube/moods » revient à se
+//     tromper de référentiel, donc à déclarer morte une route vivante.
+//
+//     `la_sonde_interroge_le_routeur_assemble_pas_les_chemins_declares_en_caisse`
+//     garde cette propriété sur ce cas précis, dans les deux sens : le chemin
+//     complet répond, le chemin interne à la caisse ne répond pas. Un témoin
+//     qui ne vérifierait que le premier passerait au vert avec une sonde qui
+//     lit les sources.
+//
 // COMMENT LA SONDE ÉVITE D'EXÉCUTER QUOI QUE CE SOIT
 //     Interroger chaque route avec sa vraie méthode ferait tourner les vrais
 //     gestionnaires — réseau, disque, effets de bord — pour une question qui
@@ -699,23 +717,34 @@ const PREFIXE_GREFFONS: &str = "/ext/";
 /// Routes tolérées NOMMÉMENT, jamais par une règle vague. Une entrée se
 /// justifie par sa cause et se retire dès que la dette est payée.
 ///
-/// Les deux ci-dessous sont de VRAIS défauts, trouvés par cette garde même :
-/// le client appelle un chemin que le serveur ne sert pas. Les corriger
-/// demande de toucher au client web (périmètre de la session UI), pas à la
-/// carte — les laisser rougir en permanence apprendrait à ignorer le contrôle.
+/// Ces deux-là sont des chemins que la carte cite et que le routeur assemblé
+/// ne sert pas — c'est MESURÉ, par cette garde et par `curl` sur le .18. Ce
+/// qui suit chaque entrée est le relevé, pas un correctif : la première
+/// rédaction de ce fichier proposait une cause plausible et fausse pour
+/// chacune, et une cause fausse coûte plus cher qu'un simple constat.
 const FANTOMES_TOLERES: &[(&str, &str)] = &[
     (
         "/dj/waveform/{}",
-        "#1897 — le greffon DJ déclare `/waveform/{track_id}` et se monte sous \
-         `/api/v1/ext/dj`. `api.ts` appelle `${BASE}/dj/…` sans le préfixe \
-         `/ext` : tout l'écran DJ part en 404. Correctif côté client.",
+        "#1897 — RELEVÉ. Le serveur de série ne sert RIEN sous `/api/v1/dj/…` : \
+         `routes/mod.rs` l'écrit en toutes lettres depuis #917 (« the stock \
+         server no longer serves /dj »). Les mêmes chemins existent, declares \
+         par la caisse `plugins/tune-dj`, montee sous `/api/v1/ext/dj/…` — \
+         mais seulement si le binaire est compile avec `--features dj` ET le \
+         greffon installe (`plugin_dj_installed`). Sur le .18, \
+         `/api/v1/ext/dj/status/1` rend 404 lui AUSSI : prefixer l'appel web \
+         par `/ext` ne corrigerait rien. Ce qu'il faut trancher d'abord : le \
+         greffon DJ doit-il etre livre et installe, ou l'ecran retire ?",
     ),
     (
         "/streaming/youtube/moods/{}",
-        "#1897 — `tune-streaming-http` ne déclare que `/youtube/moods`, sans \
-         paramètre. `api.ts:getYoutubeMoodPlaylists` appelle \
-         `/streaming/youtube/moods/${params}` : 404. Correctif côté client ou \
-         route à écrire.",
+        "#1897 — RELEVÉ. Le segment `streaming` est le BON : \
+         `/api/v1/streaming/youtube/moods` rend 200 sur le .18, et cette garde \
+         ne le signale pas. Seule la variante a parametre \
+         `/streaming/youtube/moods/{params}`, qu'appelle \
+         `api.ts:getYoutubeMoodPlaylists`, n'a aucune route. Le gestionnaire de \
+         base rend `{\"moods\":[],\"message\":\"YouTube moods not yet \
+         implemented\"}` : c'est un TALON serveur a finir, pas un chemin faux \
+         cote client.",
     ),
 ];
 
@@ -761,6 +790,51 @@ async fn statut_de_sonde(app: &axum::Router, chemin: &str) -> StatusCode {
         .await
         .expect("routeur en echec")
         .status()
+}
+
+/// Le témoin qui manquait : une caisse NICHÉE, dont le chemin servi diffère
+/// du chemin déclaré.
+///
+/// `tune-streaming-http` déclare `.route("/youtube/moods", …)`. `routes/mod.rs`
+/// monte cette caisse sous `.nest("/streaming", …)`. Le chemin SERVI est donc
+/// `/api/v1/streaming/youtube/moods` — mesuré à 200 sur le .18 — et le chemin
+/// DÉCLARÉ, `/api/v1/youtube/moods`, ne répond pas.
+///
+/// Sans ce témoin, une sonde qui lirait les sources au lieu d'interroger le
+/// routeur assemblé passerait au vert tout en se trompant de référentiel, et
+/// déclarerait morte une route qui rend 200. C'est exactement le faux
+/// diagnostic qu'a produit la relecture de ce lot.
+///
+/// Les DEUX sens comptent : n'éprouver que le chemin complet laisserait passer
+/// une sonde qui répond « servi » à tout.
+#[tokio::test]
+async fn la_sonde_interroge_le_routeur_assemble_pas_les_chemins_declares_en_caisse() {
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let app = tune_server::routes::router(etat);
+
+    // Assemblés à l'exécution : une aiguille écrite en clair se trouverait
+    // elle-même si la garde venait un jour à relire les sources.
+    let interne = ["youtube", "moods"].join("/");
+    let prefixe_nest = "streaming";
+
+    let servi = format!("/api/v1/{prefixe_nest}/{interne}");
+    assert_ne!(
+        statut_de_sonde(&app, &servi).await,
+        StatusCode::NOT_FOUND,
+        "{servi} doit repondre : c'est le chemin que le routeur SERT, \
+         `nest(\"/{prefixe_nest}\", …)` applique. Une sonde qui le rate lit les \
+         sources au lieu d'interroger le routeur."
+    );
+
+    let declare = format!("/api/v1/{interne}");
+    assert_eq!(
+        statut_de_sonde(&app, &declare).await,
+        StatusCode::NOT_FOUND,
+        "{declare} est le chemin DECLARE dans la caisse, pas celui qui est \
+         servi. S'il repond, la sonde ne distingue plus les deux et ce banc ne \
+         prouve plus rien sur les caisses nichees."
+    );
 }
 
 #[test]

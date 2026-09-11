@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "5a788bc54d7f49d1f4f490a64e51f803c84cbb09",
+    "web_sha": "4d812e8c491c40beadf4cd3f9ae1c7e015caa50e",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -3891,6 +3891,22 @@
       ]
     },
     {
+      "route": "/zones/{}/album-en-cours",
+      "methode": "GET",
+      "type": "AlbumEnCours",
+      "liste": false,
+      "champs_obligatoires": [
+        "zone_id",
+        "kind",
+        "service",
+        "album_id",
+        "artist_id",
+        "path",
+        "origin"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/zones/{}/audiophile",
       "methode": "GET",
       "type": "AudiophileModeState",
@@ -5180,7 +5196,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 259,
+    "routes_cartographiees": 260,
     "appels_non_resolus": 144
   }
 }
