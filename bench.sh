@@ -2,7 +2,7 @@
 # Tune Server Rust — Performance Benchmarks
 # Usage: ./bench.sh [host:port]
 
-HOST=${1:-localhost:8085}
+HOST=${1:-localhost:8888}
 echo "=== Tune Rust Server Benchmarks ==="
 echo "Target: $HOST"
 echo "Date:   $(date -Iseconds)"

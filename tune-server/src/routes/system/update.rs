@@ -404,11 +404,354 @@ fn current_homebrew_installation() -> Option<HomebrewInstallation> {
         .and_then(homebrew_installation)
 }
 
-fn homebrew_update_refusal(installation: &HomebrewInstallation, current: &str) -> Value {
+/// Préfixe Homebrew qui POSSÈDE cette installation, déduit du chemin du Cellar
+/// et non de `PATH`.
+///
+/// C'est le point qui rend la mise à jour en place possible. Un serveur lancé
+/// par `brew services` reçoit le `PATH` du plist — `std_service_path_env`,
+/// c'est-à-dire `<prefix>/bin:<prefix>/sbin:/usr/bin:/bin:/usr/sbin:/sbin`
+/// (Homebrew, `Library/Homebrew/service.rb`) — mais un serveur lancé à la main
+/// depuis un terminal, ou par un automate, n'a aucune garantie de ce genre.
+/// Chercher `brew` dans `PATH` était donc le piège classique : il marche sur la
+/// machine du développeur et échoue chez le testeur.
+///
+/// Le Cellar, lui, dit tout : `/opt/homebrew/Cellar/tune-server/0.9.143/bin/tune-server`
+/// nomme son propre préfixe, `/opt/homebrew`. Apple Silicon, Intel
+/// (`/usr/local`) et Linuxbrew (`/home/linuxbrew/.linuxbrew`) sont couverts
+/// sans qu'aucun chemin ne soit écrit en dur.
+fn homebrew_prefix(executable: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut prefix = std::path::PathBuf::new();
+    for component in executable.components() {
+        if component.as_os_str() == std::ffi::OsStr::new("Cellar") {
+            return (!prefix.as_os_str().is_empty()).then_some(prefix);
+        }
+        prefix.push(component);
+    }
+    None
+}
+
+/// Tune tourne-t-il en root ? `brew` s'y refuse, et root passe pourtant tous
+/// les tests d'écriture — c'est le seul empêchement que le disque ne dit pas.
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // SAFETY: `geteuid` ne fait que lire un identifiant du processus.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
+}
+
+/// Un fichier est-il exécutable par quelqu'un ?
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
+/// Ce qui empêche Tune de conduire lui-même `brew upgrade`.
+///
+/// Chaque variante nomme une chose vérifiable sur la machine, pas une
+/// supposition : le refus rendu à l'écran doit dire QUOI manque.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HomebrewUpgradeBlock {
+    /// Le chemin du Cellar ne laisse aucun préfixe où accrocher `bin/brew`.
+    PrefixUnknown,
+    /// Aucun `brew` exécutable sous le préfixe qui possède cette installation.
+    BrewMissing(std::path::PathBuf),
+    /// Le Cellar n'appartient pas au compte qui fait tourner Tune : `brew
+    /// upgrade` échouerait à mi-chemin, après le téléchargement.
+    NotWritable {
+        path: std::path::PathBuf,
+        error: String,
+    },
+    /// Nulle part où poser le fichier de progression. Il DOIT survivre au
+    /// redémarrage — c'est le seul canal qui traverse l'échange de binaire —
+    /// donc sans lui l'écran ne peut plus rien suivre et on ne lance rien.
+    NoStateDir {
+        path: std::path::PathBuf,
+        error: String,
+    },
+    /// Tune tourne en root. `brew` REFUSE de s'exécuter en root — ce n'est pas
+    /// une préférence, c'est un abandon franc de sa part. Une installation
+    /// posée en LaunchDaemon système est donc hors d'atteinte, et il faut le
+    /// dire plutôt que de lancer un script qui échouera à la première ligne.
+    ///
+    /// La seule vérification qui ne peut PAS être remplacée par le test
+    /// d'écriture : root écrit partout, donc `probe_dir_writable` réussit
+    /// justement dans le cas où `brew` va refuser.
+    RunningAsRoot,
+}
+
+impl HomebrewUpgradeBlock {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::PrefixUnknown => "homebrew_prefix_unknown",
+            Self::BrewMissing(_) => "homebrew_brew_missing",
+            Self::NotWritable { .. } => "homebrew_cellar_not_writable",
+            Self::NoStateDir { .. } => "homebrew_state_dir_not_writable",
+            Self::RunningAsRoot => "homebrew_running_as_root",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::PrefixUnknown => {
+                "Homebrew prefix could not be derived from the Cellar path.".into()
+            }
+            Self::BrewMissing(path) => format!("No executable brew at {}.", path.display()),
+            Self::NotWritable { path, error } => format!(
+                "{} is not writable by the account running Tune ({error}).",
+                path.display()
+            ),
+            Self::NoStateDir { path, error } => format!(
+                "Progress file directory {} is not writable ({error}).",
+                path.display()
+            ),
+            Self::RunningAsRoot => "Tune runs as root, and Homebrew refuses to run as root.".into(),
+        }
+    }
+}
+
+/// Tout ce qu'il faut pour conduire la mise à jour, une fois mesuré.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomebrewUpgradePlan {
+    /// `<prefix>/bin/brew`, mesuré exécutable.
+    brew: std::path::PathBuf,
+    /// `<prefix>/opt/tune-server/bin/tune-server-launcher` — le lien stable qui
+    /// pointe TOUJOURS sur le keg courant, donc sur le nouveau après l'échange.
+    launcher: std::path::PathBuf,
+    /// Fichier d'état JSON, hors du Cellar : `brew` remplace le Cellar.
+    state_file: std::path::PathBuf,
+    /// Journal complet de `brew`, à côté.
+    log_file: std::path::PathBuf,
+    /// Le script lui-même.
+    script_file: std::path::PathBuf,
+}
+
+const HOMEBREW_STATE_FILE: &str = "tune-homebrew-upgrade.json";
+const HOMEBREW_LOG_FILE: &str = "tune-homebrew-upgrade.log";
+const HOMEBREW_SCRIPT_FILE: &str = "tune-homebrew-upgrade.sh";
+
+/// Mesure, sur CETTE machine, si Tune peut conduire `brew upgrade` lui-même.
+///
+/// Aucune de ces vérifications n'est un raisonnement : chacune touche le disque.
+fn homebrew_upgrade_plan(
+    installation: &HomebrewInstallation,
+    state_dir: &std::path::Path,
+) -> Result<HomebrewUpgradePlan, HomebrewUpgradeBlock> {
+    if running_as_root() {
+        return Err(HomebrewUpgradeBlock::RunningAsRoot);
+    }
+
+    let prefix =
+        homebrew_prefix(&installation.executable).ok_or(HomebrewUpgradeBlock::PrefixUnknown)?;
+
+    let brew = prefix.join("bin").join("brew");
+    if !is_executable(&brew) {
+        return Err(HomebrewUpgradeBlock::BrewMissing(brew));
+    }
+
+    // Le keg neuf atterrit dans `<prefix>/Cellar/tune-server`. Si ce répertoire
+    // n'accepte pas une écriture du compte qui fait tourner Tune, `brew upgrade`
+    // ira au bout du téléchargement pour échouer ensuite — exactement le défaut
+    // que le garde-fou d'écriture du chemin autonome existe déjà pour éviter.
+    let cellar = prefix.join("Cellar").join("tune-server");
+    if let Err(error) = probe_dir_writable(&cellar) {
+        return Err(HomebrewUpgradeBlock::NotWritable {
+            path: cellar,
+            error,
+        });
+    }
+
+    if let Err(error) = probe_dir_writable(state_dir) {
+        return Err(HomebrewUpgradeBlock::NoStateDir {
+            path: state_dir.to_path_buf(),
+            error,
+        });
+    }
+
+    Ok(HomebrewUpgradePlan {
+        brew,
+        launcher: prefix
+            .join("opt")
+            .join("tune-server")
+            .join("bin")
+            .join("tune-server-launcher"),
+        state_file: state_dir.join(HOMEBREW_STATE_FILE),
+        log_file: state_dir.join(HOMEBREW_LOG_FILE),
+        script_file: state_dir.join(HOMEBREW_SCRIPT_FILE),
+    })
+}
+
+/// Le script qui fait le travail.
+///
+/// **Pourquoi un script détaché et non un appel synchrone.** `brew upgrade`
+/// remplace le binaire EN COURS D'EXÉCUTION et les ressources web du Cellar,
+/// puis il faut redémarrer — et `brew upgrade` ne redémarre AUCUN service
+/// (mesuré : `Library/Homebrew/upgrade.rb` ne mentionne pas les services ; c'est
+/// pourquoi la formule elle-même écrit « Après une mise à jour, redémarrez le
+/// serveur »). Le redémarrage tue donc l'appelant. C'est le même problème que
+/// Windows, et c'est la même réponse : un script hors du processus, comme
+/// `tune-update.bat`.
+///
+/// **Aucune entrée utilisateur n'entre ici.** Les seuls chemins interpolés sont
+/// déduits de `current_exe` et de `db_path` ; le nom de la formule est une
+/// constante. Rien de ce que l'appelant HTTP envoie n'atteint le script.
+///
+/// **La progression traverse le redémarrage** parce qu'elle est sur le disque,
+/// hors du Cellar. Le serveur neuf relit le même fichier et l'écran retrouve
+/// l'opération là où elle en était.
+fn homebrew_upgrade_script(plan: &HomebrewUpgradePlan, server_pid: u32) -> String {
+    let brew = plan.brew.display();
+    let launcher = plan.launcher.display();
+    let state = plan.state_file.display();
+    let log = plan.log_file.display();
+    format!(
+        r#"#!/bin/sh
+# Écrit par Tune. Conduit la mise à jour Homebrew de tune-server puis relance le
+# serveur. Détaché de son parent : le redémarrage tue le serveur, pas ce script.
+set -u
+
+BREW='{brew}'
+LAUNCHER='{launcher}'
+STATE='{state}'
+LOG='{log}'
+SRV_PID={server_pid}
+
+export HOMEBREW_NO_AUTO_UPDATE=1
+export HOMEBREW_NO_ENV_HINTS=1
+export HOMEBREW_NO_COLOR=1
+export HOMEBREW_NO_EMOJI=1
+export NONINTERACTIVE=1
+
+etape() {{
+  printf '{{"phase":"%s","exit_code":%s,"pid":%s,"updated_at":%s}}\n' \
+    "$1" "${{2:-null}}" "$SRV_PID" "$(date +%s)" > "$STATE.tmp" 2>/dev/null \
+    && mv "$STATE.tmp" "$STATE" 2>/dev/null
+}}
+
+etape brew_update
+"$BREW" update >>"$LOG" 2>&1 || {{ etape failed_brew_update $?; exit 1; }}
+
+etape brew_upgrade
+"$BREW" upgrade tune-server >>"$LOG" 2>&1 || {{ etape failed_brew_upgrade $?; exit 1; }}
+
+etape restarting
+# Le service brew n'est redémarré QUE s'il est réellement démarré. Sinon
+# `brew services restart` en démarrerait un second à côté du serveur lancé à la
+# main, et les deux se disputeraient le port.
+if "$BREW" services list 2>/dev/null | grep -q '^tune-server[[:space:]][[:space:]]*started'; then
+  "$BREW" services restart tune-server >>"$LOG" 2>&1 || {{ etape failed_restart $?; exit 1; }}
+  etape done 0
+  exit 0
+fi
+
+# On ne coupe RIEN sans savoir qu'on peut relancer. Sans cette mesure, un
+# lanceur absent laissait Tune eteint — strictement pire que le refus qu'on
+# remplace. La mise a jour est acquise sur le disque ; il ne manque que la
+# relance, et l'ecran le dit avec la commande.
+if [ ! -x "$LAUNCHER" ]; then
+  etape failed_no_launcher 0
+  exit 1
+fi
+
+kill "$SRV_PID" 2>/dev/null
+i=0
+while kill -0 "$SRV_PID" 2>/dev/null && [ "$i" -lt 30 ]; do
+  sleep 1
+  i=$((i+1))
+done
+"$LAUNCHER" >>"$LOG" 2>&1 &
+etape done 0
+exit 0
+"#
+    )
+}
+
+/// Écrit le script et le lance DÉTACHÉ.
+///
+/// `setsid` est ce qui rend l'ensemble possible sur macOS : `brew services
+/// restart` passe par `launchctl`, qui abat le job — donc le serveur et tout ce
+/// qui reste dans sa session. Un script resté dans la session mourrait avec le
+/// serveur qu'il vient de faire redémarrer, à mi-chemin, sans jamais écrire
+/// `done`. C'est l'équivalent du `start /min` détaché du chemin Windows.
+fn spawn_homebrew_upgrade(plan: &HomebrewUpgradePlan, server_pid: u32) -> Result<(), String> {
+    let script = homebrew_upgrade_script(plan, server_pid);
+    std::fs::write(&plan.script_file, script)
+        .map_err(|e| format!("write {}: {e}", plan.script_file.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&plan.script_file, std::fs::Permissions::from_mode(0o700));
+    }
+    // Un journal neuf par tentative : sinon le rapport d'échec du testeur
+    // mélange trois essais et ne dit plus lequel a échoué.
+    let _ = std::fs::remove_file(&plan.log_file);
+
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg(&plan.script_file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid` est async-signal-safe et ne touche à aucun état de
+        // l'allocateur ni à un verrou du processus parent.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("spawn {}: {e}", plan.script_file.display()))
+}
+
+/// Où poser le fichier de progression : à côté de la base, jamais dans le
+/// Cellar que `brew` remplace.
+fn homebrew_state_dir(db_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Ce que le script a écrit, s'il a écrit quelque chose. Relu par
+/// `GET /system/update/status`, y compris par le serveur NEUF.
+fn homebrew_upgrade_state(state_dir: &std::path::Path) -> Option<Value> {
+    let raw = std::fs::read_to_string(state_dir.join(HOMEBREW_STATE_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn homebrew_update_refusal(
+    installation: &HomebrewInstallation,
+    current: &str,
+    blocked: Option<&HomebrewUpgradeBlock>,
+) -> Value {
     json!({
         "status": "managed_installation",
         "reason": "homebrew_managed_installation",
         "manager": "homebrew",
+        // `message` reste en anglais et reste dans la charge utile: c'est le
+        // repli des clients qui ne connaissent pas `reason`. La phrase que
+        // l'utilisateur LIT est rendue par le client, dans SA langue, à partir
+        // de `reason` et de `command` — le serveur n'a pas à connaître la
+        // langue de l'écran, et cette charge-ci est de surcroît recopiée telle
+        // quelle dans `last_update_result`, où une phrase traduite se figerait
+        // dans la langue du jour de l'écriture.
         "message": HOMEBREW_UPDATE_HINT,
         "detail": HOMEBREW_UPDATE_HINT,
         "command": HOMEBREW_UPDATE_COMMAND,
@@ -418,6 +761,14 @@ fn homebrew_update_refusal(installation: &HomebrewInstallation, current: &str) -
             &installation.cellar_version,
             current,
         ),
+        // POURQUOI Tune ne conduit pas la mise à jour lui-même sur cette
+        // machine — un motif de machine, et le détail qui nomme le chemin
+        // cherché. Un refus n'existe QUE dans ce cas : quand le plan tient, la
+        // route lance le travail et rend 202. Il n'y a donc pas de drapeau
+        // « c'est possible » à porter ici, et un champ constamment faux aurait
+        // eu l'air de dire quelque chose.
+        "upgrade_in_place_blocked_reason": blocked.map(HomebrewUpgradeBlock::reason),
+        "upgrade_in_place_detail": blocked.map(HomebrewUpgradeBlock::detail),
     })
 }
 
@@ -1489,17 +1840,96 @@ pub(super) async fn update_install(
     // (#2448). Never mutate any part of that unit behind the package manager's
     // back; tell both current and older clients how to take the supported path.
     if let Some(installation) = current_exe.as_deref().and_then(homebrew_installation) {
-        let refusal = homebrew_update_refusal(&installation, tune_core::version());
+        let state_dir = homebrew_state_dir(&state.config.db_path);
+        let blocage = match homebrew_upgrade_plan(&installation, &state_dir) {
+            Ok(plan) => {
+                // Le chemin Homebrew redémarre le serveur, tout comme le chemin
+                // autonome : les mêmes reports s'appliquent, mot pour mot. Ils
+                // sont répétés ici parce que cette branche rend avant eux.
+                if scan_in_progress(&state.backend) {
+                    warn!("update_deferred_scan_in_progress");
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "status": "blocked",
+                            "reason": "scan_in_progress",
+                            "message": "Update deferred: a library scan is in progress. It will be applied automatically once the scan finishes."
+                        })),
+                    )
+                        .into_response();
+                }
+                if !force && !playing.is_empty() {
+                    let zones = zones_qui_retiennent(&state.backend, &playing);
+                    warn!(zones = ?playing, "update_deferred_playback_in_progress");
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "status": "blocked",
+                            "reason": "playback_in_progress",
+                            "zones": zones,
+                            "force_available": true,
+                            "force_hint": "POST /system/update/install?force=true",
+                            "message": "Update deferred: music is playing and installing it would stop playback. It will be applied automatically once playback stops."
+                        })),
+                    )
+                        .into_response();
+                }
+                match spawn_homebrew_upgrade(&plan, std::process::id()) {
+                    Ok(()) => {
+                        info!(
+                            brew = %plan.brew.display(),
+                            cellar_version = %installation.cellar_version,
+                            binary_version = tune_core::version(),
+                            log = %plan.log_file.display(),
+                            "update_homebrew_upgrade_started"
+                        );
+                        *state.update_phase.lock().unwrap() = Some("homebrew_brew_update".into());
+                        return (
+                            StatusCode::ACCEPTED,
+                            Json(json!({
+                                "status": "homebrew_upgrade_started",
+                                "reason": "homebrew_upgrade_started",
+                                "manager": "homebrew",
+                                "command": HOMEBREW_UPDATE_COMMAND,
+                                "phase": "brew_update",
+                                "log": plan.log_file.to_string_lossy(),
+                                "installation_version": installation.cellar_version,
+                                "current_version": tune_core::version(),
+                            })),
+                        )
+                            .into_response();
+                    }
+                    // Le script n'a même pas pu être posé ou lancé. On retombe
+                    // sur le refus — jamais sur un silence.
+                    Err(error) => HomebrewUpgradeBlock::NoStateDir {
+                        path: state_dir.clone(),
+                        error,
+                    },
+                }
+            }
+            Err(block) => block,
+        };
+
+        let refusal = homebrew_update_refusal(&installation, tune_core::version(), Some(&blocage));
         info!(
             executable = %installation.executable.display(),
             cellar_version = %installation.cellar_version,
             binary_version = tune_core::version(),
             mismatch = refusal["installation_version_mismatch"].as_bool().unwrap_or(false),
+            blocked = refusal["upgrade_in_place_blocked_reason"].as_str().unwrap_or("none"),
             "update_skipped_homebrew"
         );
         let _ = SettingsRepo::with_backend(state.backend.clone())
             .set("last_update_result", &refusal.to_string());
-        return (StatusCode::OK, Json(refusal)).into_response();
+        // 409 et non 200. Le refus n'est pas une erreur du serveur, mais rendu
+        // en 200 il était INDISCERNABLE d'un succès pour son unique
+        // consommateur — le client web, qui ne teste que `res.ok` — et laissait
+        // le bouton « Installation… » tourner trois minutes dans le vide avant
+        // de revenir sans un mot (Yves, Homebrew macOS). Les quatre autres
+        // refus de cette même route rendent déjà 409 ; celui-ci rejoint la
+        // famille, et les clients qui la traitent déjà l'affichent sans rien
+        // apprendre de neuf.
+        return (StatusCode::CONFLICT, Json(refusal)).into_response();
     }
 
     // Guard: refuse update if .no-auto-update flag file exists
@@ -2429,6 +2859,11 @@ mod web_swap_tests {
 /// GET /system/update/status
 pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> {
     let phase = state.update_phase.lock().unwrap().clone();
+    // La progression d'une mise à jour Homebrew est sur le DISQUE, hors du
+    // Cellar, parce qu'elle doit traverser le redémarrage : `update_phase` est
+    // en mémoire et le processus qui l'a posée n'existe plus quand l'écran
+    // revient interroger. C'est le serveur NEUF qui relit ce fichier.
+    let homebrew_upgrade = homebrew_upgrade_state(&homebrew_state_dir(&state.config.db_path));
     let is_failed = phase
         .as_deref()
         .map(|p| p.starts_with("failed"))
@@ -2494,6 +2929,9 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
         // c'est une relance en attente. Le dire évite qu'un client conclue
         // « échec » quand la mise à jour est en fait acquise.
         "binary_installed": phase.as_deref() == Some("restart_pending_playback"),
+        // Ce que le script Homebrew détaché a écrit sur le disque, s'il tourne
+        // ou s'il vient de finir. `null` partout ailleurs.
+        "homebrew_upgrade": homebrew_upgrade,
     }))
 }
 
@@ -3591,7 +4029,12 @@ mod zone_figee_tests {
 
     /// « Jamais observée » n'est pas « immobile ». Une zone navigateur — aucun
     /// périphérique, donc `poller/tick.rs` fait `continue` avant son unique
-    /// `update_position` — ne doit pas être déclarée figée par défaut.
+    /// `update_position` — ne doit pas être déclarée figée par son immobilité.
+    ///
+    /// `NowPlaying::default()` n'annonce AUCUNE durée : c'est le cas où le
+    /// serveur n'a rien à comparer, et il ne conclut rien. La borne qui
+    /// s'applique quand la durée EST connue est tenue par les deux tests
+    /// suivants.
     #[tokio::test]
     async fn une_zone_jamais_observee_reste_traitee_comme_jouant() {
         let pm = PlaybackManager::new();
@@ -3604,6 +4047,58 @@ mod zone_figee_tests {
         );
     }
 
+    /// LE reste de #3581, après #3723 : la zone n'a JAMAIS été observée — donc
+    /// le prédicat d'immobilité ne mord pas — mais sa piste est finie. Elle
+    /// retenait la mise à jour sans aucune borne.
+    ///
+    /// La durée d'une milliseconde et la marge nulle ne sont qu'une échelle :
+    /// le fait tenu est « la fin annoncée est dépassée », et il est le même à
+    /// quatre minutes et dix.
+    #[tokio::test]
+    async fn une_piste_finie_sans_la_moindre_observation_ne_retient_plus_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(
+            12,
+            NowPlaying {
+                duration_ms: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        // Aucun `update_position` : c'est tout le sujet — personne n'observe
+        // cette zone, et personne ne l'observera jamais.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE)
+                .await
+                .is_empty(),
+            "une zone jamais observée dont la piste est FINIE doit cesser de \
+             retenir la mise à jour : c'est la moitié de #3581 que #3723 \
+             laissait ouverte"
+        );
+    }
+    /// La contre-épreuve du remède, et elle est sévère : marge NULLE, et la
+    /// zone n'a jamais été observée. Une piste d'une heure qui vient de
+    /// démarrer n'est pas finie — la mise à jour ne doit pas lui couper le son.
+    #[tokio::test]
+    async fn une_piste_encore_en_cours_sans_observation_retient_toujours_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(
+            12,
+            NowPlaying {
+                duration_ms: 3_600_000,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE).await,
+            vec![12],
+            "sans la moindre observation, une piste dont la fin annoncée n'est \
+             PAS atteinte reste une lecture : c'est la zone navigateur qui \
+             joue vraiment, et on ne la coupe pas"
+        );
+    }
     /// Une RADIO est exclue du verdict : un flux live n'a pas de durée, et
     /// plusieurs renderers en annoncent la position par à-coups. La couper
     /// serait exactement le défaut grave que ce correctif doit éviter.
@@ -4103,7 +4598,7 @@ mod homebrew_guard_tests {
             executable: "/opt/homebrew/Cellar/tune-server/0.9.71/bin/tune-server".into(),
             cellar_version: "0.9.71".into(),
         };
-        let response = homebrew_update_refusal(&installation, "0.9.110");
+        let response = homebrew_update_refusal(&installation, "0.9.110", None);
 
         assert_eq!(response["status"], "managed_installation");
         assert_eq!(response["reason"], "homebrew_managed_installation");
@@ -4536,5 +5031,453 @@ mod tests_zones_qui_retiennent {
     fn sans_zone_en_lecture_il_n_y_a_rien_a_nommer() {
         let b = backend();
         assert!(zones_qui_retiennent(&b, &[]).is_empty());
+    }
+}
+
+/// Ce que la mise à jour Homebrew EN PLACE doit tenir.
+///
+/// Aucun de ces tests ne relit le source : ils construisent un faux Cellar sur
+/// le disque, et le dernier exécute réellement le script produit contre un
+/// `brew` factice. Un test qui vérifierait que la fonction a été appelée ne
+/// prouverait pas que `brew` est trouvé ni que le fichier d'état bouge.
+#[cfg(test)]
+mod homebrew_upgrade_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        HomebrewInstallation, HomebrewUpgradeBlock, HomebrewUpgradePlan, homebrew_prefix,
+        homebrew_state_dir, homebrew_update_refusal, homebrew_upgrade_plan,
+        homebrew_upgrade_script, homebrew_upgrade_state,
+    };
+
+    /// Répertoire temporaire propre à un test, nettoyé à la fin.
+    ///
+    /// On passe par la sortie AUTORISÉE du dépôt, pas par un chemin composé à
+    /// la main : `tune-core/tests/aucune_fuite_de_temporaires.rs` bannit le
+    /// second geste, et `update.rs` appelle déjà `scratch_dir` quelques
+    /// dizaines de lignes plus haut.
+    type Bac = tune_core::test_scratch::ScratchDir;
+
+    fn bac(nom: &str) -> Bac {
+        tune_core::test_scratch::scratch_dir(&format!("tune-hb-{nom}"))
+    }
+
+    #[cfg(unix)]
+    fn ecrire_executable(chemin: &Path, contenu: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(chemin.parent().unwrap()).unwrap();
+        std::fs::write(chemin, contenu).unwrap();
+        std::fs::set_permissions(chemin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Faux préfixe Homebrew complet : `bin/brew` exécutable, Cellar peuplé.
+    #[cfg(unix)]
+    fn faux_prefixe(bac: &Bac, brew: &str) -> (PathBuf, HomebrewInstallation) {
+        let prefix = bac.path().join("opt/homebrew");
+        ecrire_executable(&prefix.join("bin/brew"), brew);
+        let exe = prefix.join("Cellar/tune-server/0.9.143/bin/tune-server");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        (
+            prefix,
+            HomebrewInstallation {
+                executable: exe,
+                cellar_version: "0.9.143".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn le_prefixe_se_deduit_du_cellar_pas_du_path() {
+        for (chemin, attendu) in [
+            (
+                "/opt/homebrew/Cellar/tune-server/0.9.143/bin/tune-server",
+                "/opt/homebrew",
+            ),
+            (
+                "/usr/local/Cellar/tune-server/0.9.71/bin/tune-server",
+                "/usr/local",
+            ),
+            (
+                "/home/linuxbrew/.linuxbrew/Cellar/tune-server/0.9.113_1/bin/tune-server",
+                "/home/linuxbrew/.linuxbrew",
+            ),
+        ] {
+            assert_eq!(
+                homebrew_prefix(Path::new(chemin)),
+                Some(PathBuf::from(attendu)),
+                "préfixe non déduit pour {chemin}"
+            );
+        }
+        // Une installation autonome n'a pas de préfixe Homebrew : on ne doit
+        // surtout pas inventer `/Applications/bin/brew`.
+        assert_eq!(
+            homebrew_prefix(Path::new("/Applications/Tune/tune-server")),
+            None
+        );
+    }
+
+    #[test]
+    fn l_etat_se_pose_a_cote_de_la_base_jamais_dans_le_cellar() {
+        assert_eq!(
+            homebrew_state_dir("/Users/yves/Library/Application Support/Tune/tune.db"),
+            PathBuf::from("/Users/yves/Library/Application Support/Tune")
+        );
+        // `db_path` sans répertoire : le répertoire courant, jamais une chaîne
+        // vide qui donnerait un chemin absolu inattendu.
+        assert_eq!(homebrew_state_dir("tune.db"), PathBuf::from("."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn le_plan_nomme_le_brew_du_prefixe_qui_possede_l_installation() {
+        let bac = bac("plan");
+        let (prefix, installation) = faux_prefixe(&bac, "#!/bin/sh\nexit 0\n");
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+
+        let plan = homebrew_upgrade_plan(&installation, &etat).expect("plan attendu");
+        assert_eq!(plan.brew, prefix.join("bin/brew"));
+        assert_eq!(
+            plan.launcher,
+            prefix.join("opt/tune-server/bin/tune-server-launcher")
+        );
+        assert_eq!(plan.state_file.parent().unwrap(), etat);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sans_brew_le_plan_refuse_et_nomme_le_chemin_cherche() {
+        let bac = bac("sansbrew");
+        let (prefix, installation) = faux_prefixe(&bac, "#!/bin/sh\nexit 0\n");
+        std::fs::remove_file(prefix.join("bin/brew")).unwrap();
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+
+        match homebrew_upgrade_plan(&installation, &etat) {
+            Err(HomebrewUpgradeBlock::BrewMissing(chemin)) => {
+                assert_eq!(chemin, prefix.join("bin/brew"));
+            }
+            autre => panic!("attendu BrewMissing, obtenu {autre:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn un_brew_non_executable_ne_compte_pas() {
+        let bac = bac("nonexec");
+        let (prefix, installation) = faux_prefixe(&bac, "#!/bin/sh\nexit 0\n");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            prefix.join("bin/brew"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+
+        assert!(matches!(
+            homebrew_upgrade_plan(&installation, &etat),
+            Err(HomebrewUpgradeBlock::BrewMissing(_))
+        ));
+    }
+
+    /// Root passe tous les tests d'écriture — c'est précisément pourquoi il
+    /// lui faut un garde à lui. Le test ne s'exécute que SI la suite tourne en
+    /// root ; sinon il vérifie l'autre moitié : hors root, ce n'est jamais ce
+    /// motif-là qui est rendu.
+    #[cfg(unix)]
+    #[test]
+    fn root_est_refuse_parce_que_brew_refuse_root() {
+        let bac = bac("root");
+        let (_prefix, installation) = faux_prefixe(&bac, "#!/bin/sh\nexit 0\n");
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+        let verdict = homebrew_upgrade_plan(&installation, &etat);
+        // SAFETY: lecture d'un identifiant du processus.
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(matches!(verdict, Err(HomebrewUpgradeBlock::RunningAsRoot)));
+        } else {
+            assert!(!matches!(verdict, Err(HomebrewUpgradeBlock::RunningAsRoot)));
+        }
+    }
+
+    #[test]
+    fn le_refus_dit_a_l_ecran_s_il_peut_offrir_le_bouton() {
+        let installation = HomebrewInstallation {
+            executable: "/opt/homebrew/Cellar/tune-server/0.9.71/bin/tune-server".into(),
+            cellar_version: "0.9.71".into(),
+        };
+
+        let sans_motif = homebrew_update_refusal(&installation, "0.9.110", None);
+        assert!(sans_motif["upgrade_in_place_blocked_reason"].is_null());
+        assert!(sans_motif["upgrade_in_place_detail"].is_null());
+
+        let bloque = homebrew_update_refusal(
+            &installation,
+            "0.9.110",
+            Some(&HomebrewUpgradeBlock::BrewMissing(
+                "/opt/homebrew/bin/brew".into(),
+            )),
+        );
+        assert_eq!(
+            bloque["upgrade_in_place_blocked_reason"],
+            "homebrew_brew_missing"
+        );
+        assert!(
+            bloque["upgrade_in_place_detail"]
+                .as_str()
+                .unwrap()
+                .contains("/opt/homebrew/bin/brew"),
+            "le détail doit nommer le chemin cherché : {bloque}"
+        );
+        // La commande manuelle reste rendue dans les DEUX cas : c'est la sortie
+        // de secours de l'utilisateur.
+        assert_eq!(sans_motif["command"], super::HOMEBREW_UPDATE_COMMAND);
+        assert_eq!(bloque["command"], super::HOMEBREW_UPDATE_COMMAND);
+    }
+
+    /// Attend qu'une condition devienne vraie, au plus `limite` dixièmes de
+    /// seconde. Un script détaché n'est pas synchrone avec le test.
+    /// Un processus jetable, dont ce témoin est seul propriétaire.
+    ///
+    /// Le script termine le PID qu'on lui nomme dès qu'il emprunte le repli
+    /// « hors service ». Un témoin qui lui passerait `std::process::id()` se
+    /// ferait donc abattre par le chemin même qu'il mesure — vécu en
+    /// contre-épreuve : la suite s'est arrêtée au milieu, sans ligne de
+    /// résultat.
+    #[cfg(unix)]
+    fn processus_sacrificiel() -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .expect("processus témoin")
+    }
+
+    #[cfg(unix)]
+    fn patienter(limite: u32, mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..limite {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        condition()
+    }
+
+    /// **La preuve du chemin nominal.** Le script produit est réellement
+    /// exécuté contre un `brew` factice qui journalise ses arguments et déclare
+    /// le service démarré. On vérifie ce que `brew` a REÇU et où le fichier
+    /// d'état a fini.
+    #[cfg(unix)]
+    #[test]
+    fn le_script_conduit_brew_puis_redemarre_le_service() {
+        let bac = bac("script");
+        let trace = bac.path().join("brew-args.txt");
+        let brew = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1\" = services ] && [ \"$2\" = list ]; then\n  echo 'tune-server  started  yves  /x/y.plist'\nfi\nexit 0\n",
+            trace.display()
+        );
+        let (_prefix, installation) = faux_prefixe(&bac, &brew);
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+        let plan = homebrew_upgrade_plan(&installation, &etat).expect("plan attendu");
+
+        let mut jetable = processus_sacrificiel();
+        let script = homebrew_upgrade_script(&plan, jetable.id());
+        std::fs::write(&plan.script_file, &script).unwrap();
+        let sortie = std::process::Command::new("/bin/sh")
+            .arg(&plan.script_file)
+            .output()
+            .expect("script exécutable");
+        assert!(
+            sortie.status.success(),
+            "le script a échoué : {}",
+            String::from_utf8_lossy(&sortie.stderr)
+        );
+
+        let recu = std::fs::read_to_string(&trace).unwrap();
+        assert!(recu.contains("update\n"), "brew update non appelé : {recu}");
+        assert!(
+            recu.contains("upgrade tune-server"),
+            "brew upgrade tune-server non appelé : {recu}"
+        );
+        assert!(
+            recu.contains("services restart tune-server"),
+            "le service démarré doit être redémarré : {recu}"
+        );
+
+        let fin = homebrew_upgrade_state(&etat).expect("fichier d'état attendu");
+        assert_eq!(fin["phase"], "done");
+        assert_eq!(fin["exit_code"], 0);
+        let _ = jetable.kill();
+        let _ = jetable.wait();
+    }
+
+    /// **La preuve du chemin d'échec.** `brew upgrade` sort en erreur : le
+    /// fichier d'état doit NOMMER l'étape et porter le code, et le service ne
+    /// doit surtout pas être redémarré sur une mise à jour qui n'a pas eu lieu.
+    #[cfg(unix)]
+    #[test]
+    fn un_upgrade_en_echec_s_arrete_et_se_nomme() {
+        let bac = bac("echec");
+        let trace = bac.path().join("brew-args.txt");
+        let brew = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1\" = upgrade ]; then exit 7; fi\nexit 0\n",
+            trace.display()
+        );
+        let (_prefix, installation) = faux_prefixe(&bac, &brew);
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+        let plan = homebrew_upgrade_plan(&installation, &etat).expect("plan attendu");
+
+        let mut jetable = processus_sacrificiel();
+        std::fs::write(
+            &plan.script_file,
+            homebrew_upgrade_script(&plan, jetable.id()),
+        )
+        .unwrap();
+        let sortie = std::process::Command::new("/bin/sh")
+            .arg(&plan.script_file)
+            .output()
+            .unwrap();
+        assert!(
+            !sortie.status.success(),
+            "un échec de brew doit sortir non nul"
+        );
+
+        let fin = homebrew_upgrade_state(&etat).expect("fichier d'état attendu");
+        assert_eq!(fin["phase"], "failed_brew_upgrade");
+        assert_eq!(fin["exit_code"], 7);
+        let recu = std::fs::read_to_string(&trace).unwrap();
+        assert!(
+            !recu.contains("services restart"),
+            "rien ne doit être redémarré après un upgrade en échec : {recu}"
+        );
+        // Le script s'est arrêté AVANT le repli, donc le processus nommé vit
+        // encore. C'est la seconde moitié de « il s'arrête » : sans elle, un
+        // script qui poursuivrait jusqu'au `kill` passerait pour correct.
+        assert!(
+            jetable.try_wait().unwrap().is_none(),
+            "un upgrade en échec ne doit arrêter AUCUN processus"
+        );
+        let _ = jetable.kill();
+        let _ = jetable.wait();
+    }
+
+    /// **La preuve du repli hors `brew services`.** Quand le serveur n'a pas
+    /// été lancé comme service, `brew services restart` en démarrerait un
+    /// SECOND à côté. Le script doit alors arrêter le processus nommé et
+    /// relancer le lanceur du keg.
+    #[cfg(unix)]
+    #[test]
+    fn hors_service_le_script_arrete_le_serveur_et_relance_le_lanceur() {
+        let bac = bac("repli");
+        let trace = bac.path().join("brew-args.txt");
+        // `services list` ne montre RIEN : le serveur n'est pas un service.
+        let brew = format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", trace.display());
+        let (prefix, installation) = faux_prefixe(&bac, &brew);
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+        let plan = homebrew_upgrade_plan(&installation, &etat).expect("plan attendu");
+
+        let temoin = bac.path().join("lanceur-appele.txt");
+        ecrire_executable(
+            &prefix.join("opt/tune-server/bin/tune-server-launcher"),
+            &format!("#!/bin/sh\ntouch '{}'\n", temoin.display()),
+        );
+
+        // Un vrai processus à arrêter, pour ne pas mesurer un `kill` dans le vide.
+        let mut victime = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .unwrap();
+        let pid = victime.id();
+
+        std::fs::write(&plan.script_file, homebrew_upgrade_script(&plan, pid)).unwrap();
+        let sortie = std::process::Command::new("/bin/sh")
+            .arg(&plan.script_file)
+            .output()
+            .unwrap();
+        assert!(sortie.status.success());
+
+        assert!(
+            patienter(50, || temoin.exists()),
+            "le lanceur du keg n'a pas été relancé"
+        );
+        let recu = std::fs::read_to_string(&trace).unwrap();
+        assert!(
+            !recu.contains("services restart"),
+            "hors service, aucun `brew services restart` ne doit partir : {recu}"
+        );
+        assert_eq!(homebrew_upgrade_state(&etat).unwrap()["phase"], "done");
+        // Le processus visé a bien été arrêté.
+        let _ = victime.wait();
+    }
+
+    /// **La preuve qu'on ne coupe rien sans pouvoir relancer.** Le lanceur du
+    /// keg est absent : le script doit s'arrêter AVANT le `kill`, laisser le
+    /// serveur en vie, et nommer ce qui manque. Un lanceur manquant qui
+    /// laisserait Tune éteint serait strictement pire que le refus remplacé.
+    #[cfg(unix)]
+    #[test]
+    fn sans_lanceur_le_script_n_arrete_pas_le_serveur() {
+        let bac = bac("sanslanceur");
+        let trace = bac.path().join("brew-args.txt");
+        // `services list` ne montre rien : on ira vers le repli.
+        let brew = format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", trace.display());
+        let (_prefix, installation) = faux_prefixe(&bac, &brew);
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+        let plan = homebrew_upgrade_plan(&installation, &etat).expect("plan attendu");
+        // Le lanceur n'est volontairement PAS créé.
+        assert!(!plan.launcher.exists());
+
+        let mut jetable = processus_sacrificiel();
+        std::fs::write(
+            &plan.script_file,
+            homebrew_upgrade_script(&plan, jetable.id()),
+        )
+        .unwrap();
+        let sortie = std::process::Command::new("/bin/sh")
+            .arg(&plan.script_file)
+            .output()
+            .unwrap();
+        assert!(
+            !sortie.status.success(),
+            "il manque quelque chose : sortie non nulle"
+        );
+
+        assert_eq!(
+            homebrew_upgrade_state(&etat).unwrap()["phase"],
+            "failed_no_launcher"
+        );
+        assert!(
+            jetable.try_wait().unwrap().is_none(),
+            "le serveur ne doit PAS être arrêté quand rien ne peut le relancer"
+        );
+        let _ = jetable.kill();
+        let _ = jetable.wait();
+    }
+
+    /// Le plan et le script ne portent AUCUNE entrée de l'appelant HTTP : tout
+    /// ce qui est interpolé vient de `current_exe` et de `db_path`.
+    #[cfg(unix)]
+    #[test]
+    fn le_script_n_interpole_que_des_chemins_mesures() {
+        let plan = HomebrewUpgradePlan {
+            brew: "/opt/homebrew/bin/brew".into(),
+            launcher: "/opt/homebrew/opt/tune-server/bin/tune-server-launcher".into(),
+            state_file: "/data/tune-homebrew-upgrade.json".into(),
+            log_file: "/data/tune-homebrew-upgrade.log".into(),
+            script_file: "/data/tune-homebrew-upgrade.sh".into(),
+        };
+        let script = homebrew_upgrade_script(&plan, 4242);
+        assert!(script.contains("BREW='/opt/homebrew/bin/brew'"));
+        assert!(script.contains("SRV_PID=4242"));
+        // Le nom de la formule est une constante, jamais une variable de shell
+        // qui pourrait porter autre chose.
+        assert!(script.contains("\"$BREW\" upgrade tune-server"));
+        assert!(script.contains("NONINTERACTIVE=1"));
     }
 }

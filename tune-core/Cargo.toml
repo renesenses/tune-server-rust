@@ -41,6 +41,32 @@ sha2 = { workspace = true }
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 getrandom = "0.2"
+
+# --- Sendspin (#3326) : cryptographie et encodage, sur TOUTES les plateformes.
+#
+# Ces quatre caisses ne doivent PAS retourner sous
+# `[target.'cfg(unix)'.dependencies]`. Ce bloc-là existe pour l'appairage
+# AirPlay 2, qui est effectivement unix ; Sendspin, lui, tourne partout où Tune
+# tourne — Windows compris. La CI « Windows + ASIO » est la garde : elle a
+# rougi sur `unresolved import snow / base64 / x25519_dalek / rand_core`
+# quand ces lignes étaient du mauvais côté du manifeste.
+#
+# `snow` : Noise KKpsk2, en pur Rust. Le résolveur par défaut s'appuie sur
+# `curve25519-dalek`, `chacha20poly1305`, `aes-gcm` et `sha2` — les mêmes
+# familles que le reste du manifeste ; le résolveur accéléré `ring` n'est pas
+# activé. Mesuré : les DEUX suites imposées au serveur
+# (`25519_ChaChaPoly_SHA256` et `25519_AESGCM_SHA256`) aboutissent. On
+# n'écrit pas Noise à la main : c'est de la cryptographie.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "default-resolver-crypto",
+    "std",
+] }
+# L'identifiant d'un pair Sendspin EST sa clé publique X25519, en base64url
+# sans remplissage.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
+rand_core = { version = "0.6", features = ["getrandom"] }
 blowfish = { workspace = true }
 chrono = { workspace = true }
 cbc = { workspace = true }
@@ -93,16 +119,6 @@ tokenizers = { version = "0.20", default-features = false, features = ["onig"], 
 # macOS + Linux : statfs pour détecter les montages réseau (scanner/watcher.rs).
 libc = "0.2"
 
-# AirPlay 2 HomeKit-style pairing (pair-setup SRP-6a + pair-verify Curve25519).
-# All pinned to the RustCrypto digest 0.10 / sha2 0.10 generation used across
-# the workspace so no duplicate hashing stack is pulled in.
-srp = "0.6"
-hkdf = "0.12"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-chacha20poly1305 = "0.10"
-rand_core = { version = "0.6", features = ["getrandom"] }
-
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "objc2-core-audio-types", "AudioHardware", "AudioHardwareDeprecated"], optional = true }
@@ -121,6 +137,13 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # `test-util` n'entre que dans les cibles de test : le binaire publié ne le
 # compile pas. Même déclaration que `tune-server` (#2073).
 tokio = { workspace = true, features = ["test-util"] }
+
+# `autotests = false` en tête de ce manifeste : sans cette cible, le fichier
+# ne serait JAMAIS compilé et la porte rendrait un vert contre rien (#3326,
+# S2-a).
+[[test]]
+name = "sendspin_poignee_s2a"
+path = "tests/sendspin_poignee_s2a.rs"
 
 [[test]]
 name = "integration_contracts"
@@ -279,6 +302,15 @@ path = "tests/octets_servis_inconnus_2394.rs"
 [[test]]
 name = "journal_egaliseur_i3479"
 path = "tests/journal_egaliseur_i3479.rs"
+
+# #3479, seconde moitie du message du 08/09 : la bascule d'egaliseur CHIFFRE sa
+# duree (`duree_ms`) et NOMME ce qui la retient (`amortissement`). Abonne
+# `tracing` GLOBAL, donc un test par binaire — meme raison que la cible
+# ci-dessus. `autotests = false` en tete de ce fichier : sans cette cible, le
+# fichier ne serait JAMAIS compile.
+[[test]]
+name = "reactivite_egaliseur_i3479"
+path = "tests/reactivite_egaliseur_i3479.rs"
 
 [build-dependencies]
 cc = "1"

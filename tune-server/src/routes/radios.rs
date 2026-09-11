@@ -286,18 +286,190 @@ async fn sonder_le_flux(client: &reqwest::Client, url: &str) -> Option<ProblemeU
     Some(ProblemeUrlFlux::PasUnFlux { type_mime })
 }
 
+/// Combien de stations du catalogue un refus propose au plus.
+///
+/// Trois, pas trente : au-delà, ce n'est plus une proposition, c'est une
+/// seconde liste de radios à lire dans une boîte d'erreur.
+const SUGGESTIONS_AU_PLUS: usize = 3;
+
+/// Deux écritures d'une même adresse de flux ramenées à une seule.
+///
+/// Insensible au schéma, à la casse et au `/` final — les trois écarts qu'on
+/// rencontre réellement entre l'annuaire, un copier-coller et une saisie. Rien
+/// de plus : ni requête, ni chemin, ni port ne sont touchés, parce qu'ils
+/// désignent bel et bien des flux différents.
+///
+/// Un SEUL exemplaire de cette règle, partagé par le rattrapage des logos
+/// ([`refresh_radio_logos`]) et par la porte anti-doublon d'[`add_from_web`] :
+/// deux copies finiraient par ne plus rapprocher les mêmes adresses, et le
+/// doublon reviendrait par le côté qui aurait pris du retard.
+fn flux_normalise(url: &str) -> String {
+    let sans_bords = url.trim().trim_end_matches('/').to_ascii_lowercase();
+    sans_bords
+        .strip_prefix("https://")
+        .or_else(|| sans_bords.strip_prefix("http://"))
+        .unwrap_or(&sans_bords)
+        .to_string()
+}
+
+/// L'hôte d'une adresse, en minuscules et sans `www.` — ou `None` si l'adresse
+/// n'en porte pas.
+///
+/// Volontairement séparé de [`favicon_from_url`], qui exige un point dans
+/// l'hôte (une favicon Google n'a aucun sens pour `localhost`) : ici un hôte
+/// sans point est un hôte parfaitement comparable à un autre.
+fn hote_comparable(url: &str) -> Option<String> {
+    let apres_schema = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))?;
+    let hote = apres_schema.split('/').next()?.to_ascii_lowercase();
+    let hote = hote.trim_start_matches("www.");
+    (!hote.is_empty()).then(|| hote.to_string())
+}
+
+/// Deux hôtes désignent-ils le même diffuseur ?
+///
+/// Égalité, ou l'un est un sous-domaine de l'autre. C'est exactement le cas du
+/// ticket : Belkadi Yacine a collé `radioparadise.com/listen/channels/main-mix`
+/// alors que le catalogue porte `stream.radioparadise.com/flacm`. Le point
+/// exigé dans le suffixe interdit à `paradise.com` de se rapprocher de
+/// `radioparadise.com`.
+fn meme_diffuseur(a: &str, b: &str) -> bool {
+    a == b || a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
+}
+
+/// Ce que le catalogue LIVRÉ connaît déjà, quand une adresse est refusée
+/// (#3664).
+///
+/// Le refus disait « cherchez le lien écouter sur le site de la radio » et
+/// jamais « Tune connaît déjà *Radio Paradise – Main Mix* », alors que la
+/// station est dans le catalogue depuis la migration 90. Deux rapprochements,
+/// dans cet ordre, tous deux par égalité — aucun score, aucun seuil, aucune
+/// dépendance de similarité :
+///
+/// 1. **par diffuseur** : la station du catalogue dont le flux vit sur le même
+///    hôte que l'adresse refusée. C'est le rapprochement qui marche quand
+///    l'utilisateur a nommé sa station comme il voulait ;
+/// 2. **par nom** : la station dont le nom CONTIENT ce qui a été saisi, à la
+///    casse près. C'est celui qui marche quand l'adresse est trop cassée pour
+///    porter un hôte (`http;//…`).
+///
+/// Le nom est comparé sur le NOM seul, et non par [`RadioRepo::search`], qui
+/// filtre aussi sur le genre et le pays : chercher une station nommée « Rock »
+/// y ramènerait toutes les stations rock du catalogue, ce qui n'est plus une
+/// proposition. Un nom de moins de trois caractères ne rapproche rien — « FM »
+/// désignerait la moitié du catalogue.
+///
+/// La suggestion vient du catalogue LOCAL, qui contient à la fois l'annuaire
+/// livré et ce que l'utilisateur y a ajouté : `radio_stations` ne porte aucune
+/// colonne d'origine (`radio_repo.rs`), les deux sont donc indistinguables. Ne
+/// proposer que « l'annuaire » demanderait d'abord de marquer l'origine, ce que
+/// le schéma ne fait pas.
+///
+/// ## Pourquoi cette fonction JOURNALISE, et sous ce nom-là
+///
+/// Le correctif d'origine (PR #3743, livré en v0.9.145) n'émettait **aucune
+/// trace nommée**, et l'audit du 10/09 en a tiré la conséquence : il est
+/// **invérifiable dans un binaire publié**. Les deux jetons candidats ne
+/// séparent rien — `suggestions` est une clef JSON de 11 octets qui vaut **94
+/// en v0.9.144 comme en v0.9.145** sur le binaire x86_64 (91/91 sur aarch64,
+/// le mot sert dans les métadonnées), et `radio_url_refusee` vaut **2 dans les
+/// deux**, la ligne de [`refus_url`] existant bien avant la suggestion.
+///
+/// `radio_refus_suggestion_catalogue_3664` est donc long, préfixé du domaine,
+/// et suffixé du numéro de l'issue : il ne peut se confondre avec rien, et sa
+/// seule présence dans un ELF date le binaire d'après ce correctif. Sa valeur
+/// est d'abord une **borne** : elle vaut 0 partout jusqu'à v0.9.145 incluse.
+///
+/// Écrit en LITTÉRAL et non derrière une constante : une constante partagée
+/// avec le banc ferait bouger l'aiguille et la meule ensemble, et le témoin
+/// resterait vert sous un sabotage du marqueur lui-même.
+///
+/// Elle est émise à la SORTIE de la fonction et non sur le chemin du refus,
+/// pour que le comptage distingue « le serveur sait proposer » de « le serveur
+/// a proposé quelque chose » : `proposees = 0` est une information, pas une
+/// absence de trace.
+fn suggestions_du_catalogue(
+    repo: &RadioRepo,
+    nom_saisi: Option<&str>,
+    url_refusee: &str,
+) -> Vec<RadioStation> {
+    let catalogue = repo.list().unwrap_or_default();
+    let mut retenues: Vec<RadioStation> = Vec::new();
+    let mut vues: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    let mut par_diffuseur = 0usize;
+    if let Some(hote) = hote_comparable(url_refusee) {
+        for st in &catalogue {
+            if retenues.len() >= SUGGESTIONS_AU_PLUS {
+                break;
+            }
+            if hote_comparable(&st.url).is_some_and(|h| meme_diffuseur(&h, &hote))
+                && st.id.is_some_and(|id| vues.insert(id))
+            {
+                retenues.push(st.clone());
+                par_diffuseur += 1;
+            }
+        }
+    }
+
+    let aiguille = nom_saisi.unwrap_or_default().trim().to_lowercase();
+    if aiguille.chars().count() >= 3 {
+        for st in &catalogue {
+            if retenues.len() >= SUGGESTIONS_AU_PLUS {
+                break;
+            }
+            if st.name.to_lowercase().contains(&aiguille) && st.id.is_some_and(|id| vues.insert(id))
+            {
+                retenues.push(st.clone());
+            }
+        }
+    }
+
+    tracing::info!(
+        catalogue = catalogue.len(),
+        proposees = retenues.len(),
+        par_diffuseur,
+        par_nom = retenues.len() - par_diffuseur,
+        url_refusee = %url_refusee,
+        "radio_refus_suggestion_catalogue_3664"
+    );
+
+    retenues
+}
+
 /// Le refus, mis en forme pour le client web.
 ///
 /// La forme du corps n'est pas libre : `api.ts` lit le TEXTE dans `message`
 /// (`detail`, à défaut `message`) et le CODE dans `error`. `AppError` met au
 /// contraire le texte dans `error` — l'utiliser ici afficherait « 400 Bad
 /// Request » à l'écran et le beau message dans un champ que personne ne lit.
-fn refus_url(probleme: &ProblemeUrlFlux, lang: &str) -> axum::response::Response {
+///
+/// `suggestions` s'AJOUTE à ces deux champs et ne les touche pas : un client
+/// qui ne le connaît pas affiche exactement ce qu'il affichait. Il est TOUJOURS
+/// présent, éventuellement vide — un écran n'a pas à distinguer « aucune
+/// suggestion » de « ce serveur n'en propose pas » (même règle que
+/// `corps_recherche`).
+fn refus_url(
+    probleme: &ProblemeUrlFlux,
+    lang: &str,
+    suggestions: &[RadioStation],
+) -> axum::response::Response {
     let message = probleme.message(lang);
-    tracing::warn!(code = probleme.code(), %message, "radio_url_refusee");
+    tracing::warn!(
+        code = probleme.code(),
+        %message,
+        suggestions = suggestions.len(),
+        "radio_url_refusee"
+    );
     (
         StatusCode::BAD_REQUEST,
-        Json(json!({ "error": probleme.code(), "message": message })),
+        Json(json!({
+            "error": probleme.code(),
+            "message": message,
+            "suggestions": suggestions,
+        })),
     )
         .into_response()
 }
@@ -504,15 +676,9 @@ pub async fn refresh_radio_logos(state: &AppState) -> RattrapageLogos {
         Err(_) => return RattrapageLogos::injoignable(),
     };
 
-    // Normalize a stream URL for matching: scheme-insensitive, no trailing slash.
-    let norm = |u: &str| {
-        u.trim()
-            .trim_end_matches('/')
-            .to_ascii_lowercase()
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .to_string()
-    };
+    // Rapprochement d'adresses : la MÊME règle que la porte anti-doublon
+    // d'`add_from_web`, en un seul exemplaire — voir [`flux_normalise`].
+    let norm = flux_normalise;
 
     let mut by_url: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -757,9 +923,40 @@ async fn media_server_radio_audio(
     with_media_server_radio_cleanup(response, state.streamer, stream_id)
 }
 
-async fn list_radios(State(state): State<AppState>) -> Json<Value> {
+/// Filtres de `GET /radios`.
+///
+/// 🔴 `list_radios` ne prenait AUCUN paramètre : `?favorite=true` était accepté
+/// par le routeur, ignoré par le code, et la liste complète repartait avec un
+/// 200. Le client ne pouvait pas le savoir.
+///
+/// Mesuré sur le .18 le 09/09/2026 : `GET /radios?favorite=true&limit=500` et
+/// `GET /radios?limit=500` rendent les MÊMES 46 lignes, dont 5 seulement
+/// portent `is_favorite`. Un appelant qui fait confiance au filtre affiche donc
+/// 41 stations qui ne sont pas en favori.
+///
+/// FabienM, fil forum 1739, 09/09/2026 : « Radio mis en favori n'apparaît pas
+/// dans le menu favoris. » Ce filtre est l'une des deux moitiés du défaut ;
+/// l'autre est côté client, qui ne demandait pas les stations du tout.
+///
+/// Un filtre silencieusement ignoré est pire qu'un filtre absent : absent, il
+/// rend une erreur et l'appelant le voit.
+#[derive(serde::Deserialize, Default)]
+struct ListRadiosQuery {
+    favorite: Option<bool>,
+}
+
+async fn list_radios(
+    State(state): State<AppState>,
+    Query(q): Query<ListRadiosQuery>,
+) -> Json<Value> {
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let items = repo.list().unwrap_or_default();
+    // `favorites()` trie déjà par nom et filtre en SQL — même chemin que
+    // `GET /radios/favorites`, plutôt qu'un second filtre à faire diverger.
+    let items = if q.favorite == Some(true) {
+        repo.favorites().unwrap_or_default()
+    } else {
+        repo.list().unwrap_or_default()
+    };
     Json(json!(items))
 }
 
@@ -780,18 +977,35 @@ async fn create_radio(
     // Refusé AVANT toute écriture : une adresse qu'aucun chemin de lecture ne
     // peut ouvrir n'a rien à faire en base, et le dire maintenant coûte à
     // l'utilisateur une correction au lieu d'une station muette (#2097).
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let url = match valider_url_flux(&body.url) {
         Ok(url) => url,
-        Err(probleme) => return refus_url(&probleme, &crate::i18n::lang_from_header(&headers)),
+        Err(probleme) => {
+            // Le rapprochement porte sur l'adresse SAISIE, pas sur la version
+            // normalisée : ici il n'y en a pas — c'est justement elle qui a
+            // été refusée (#3664).
+            let suggestions = suggestions_du_catalogue(&repo, Some(&body.name), &body.url);
+            return refus_url(
+                &probleme,
+                &crate::i18n::lang_from_header(&headers),
+                &suggestions,
+            );
+        }
     };
     // Puis ce que la FORME ne peut pas dire : le serveur rend-il un flux, ou
     // une page web ? Belkadi Yacine avait collé la page d'écoute de Radio
     // Paradise ; elle passe toutes les règles ci-dessus, et seule la LECTURE
     // le lui a appris, sur une station muette (#3578, fil forum 1698).
     if let Some(probleme) = sonder_le_flux(&state.http_client, &url).await {
-        return refus_url(&probleme, &crate::i18n::lang_from_header(&headers));
+        // C'est LE cas du résidu #3664 : l'adresse est une page web, et le
+        // catalogue livré porte le flux que l'utilisateur cherchait.
+        let suggestions = suggestions_du_catalogue(&repo, Some(&body.name), &url);
+        return refus_url(
+            &probleme,
+            &crate::i18n::lang_from_header(&headers),
+            &suggestions,
+        );
     }
-    let repo = RadioRepo::with_backend(state.backend.clone());
     let auto_logo = if body.logo_url.is_none() {
         favicon_from_url(body.homepage.as_deref().unwrap_or(&url))
     } else {
@@ -857,9 +1071,33 @@ async fn update_radio(
     // adresse que la règle refuserait aujourd'hui, reste donc modifiable —
     // on peut renommer, reclasser ou dé-favoriser sans être obligé de
     // réparer son adresse d'abord.
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    // Le nom sur lequel rapprocher : celui que la requête propose, sinon celui
+    // que la station porte déjà. Une modification qui ne touche qu'à l'adresse
+    // n'envoie pas de nom, et c'est le cas le plus courant (#3664).
+    let nom_pour_suggestion = body
+        .name
+        .clone()
+        .or_else(|| repo.get(id).ok().flatten().map(|s| s.name));
+    // Se proposer soi-même n'aide personne : la station qu'on est en train de
+    // modifier est écartée de ses propres suggestions.
+    let suggestions_hors_soi = |repo: &RadioRepo, nom: Option<&str>, url: &str| {
+        let mut v = suggestions_du_catalogue(repo, nom, url);
+        v.retain(|s| s.id != Some(id));
+        v
+    };
     let url_saisie = match body.url.as_deref().map(valider_url_flux) {
         Some(Err(probleme)) => {
-            return refus_url(&probleme, &crate::i18n::lang_from_header(&headers));
+            let suggestions = suggestions_hors_soi(
+                &repo,
+                nom_pour_suggestion.as_deref(),
+                body.url.as_deref().unwrap_or_default(),
+            );
+            return refus_url(
+                &probleme,
+                &crate::i18n::lang_from_header(&headers),
+                &suggestions,
+            );
         }
         Some(Ok(url)) => Some(url),
         None => None,
@@ -871,9 +1109,13 @@ async fn update_radio(
     if let Some(url) = url_saisie.as_deref()
         && let Some(probleme) = sonder_le_flux(&state.http_client, url).await
     {
-        return refus_url(&probleme, &crate::i18n::lang_from_header(&headers));
+        let suggestions = suggestions_hors_soi(&repo, nom_pour_suggestion.as_deref(), url);
+        return refus_url(
+            &probleme,
+            &crate::i18n::lang_from_header(&headers),
+            &suggestions,
+        );
     }
-    let repo = RadioRepo::with_backend(state.backend.clone());
     let Some(mut station) = repo.get(id).ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1057,6 +1299,52 @@ async fn add_from_web(
         }
     };
     let repo = RadioRepo::with_backend(state.backend.clone());
+    // Le catalogue porte-t-il DÉJÀ ce flux ? (#3543)
+    //
+    // L'annuaire du site sert le 09/09/2026 DIX entrées Radio Paradise pour
+    // sept canaux : trois adresses de flux y figurent DEUX fois, sous deux
+    // noms différents (`flacm`, `rock-flacm`, `mellow-flacm`). Le bouton
+    // « + Ajouter à Tune » de la page Radios tombe ici, une fois par entrée :
+    // sans cette porte, cliquer sur « Radio paradise - Main Mix » posait une
+    // SECONDE station sur l'adresse que « Radio Paradise - Main Mix » sert
+    // déjà, et le testeur se retrouvait dans sa propre liste avec le doublon
+    // qu'il était venu signaler.
+    //
+    // On ne refuse pas, on ne crée pas : on remet la station existante en
+    // favori — c'est ce que le geste demandait — et on le DIT. Le
+    // rapprochement est une égalité d'adresse normalisée, pas une heuristique :
+    // deux noms différents pour le même flux, c'est une seule station.
+    //
+    // Cette porte ne vaut QUE pour ce chemin. `POST /api/v1/radios` continue
+    // de créer ce qu'on lui demande : c'est une API, son appelant sait ce
+    // qu'il fait, et un client qui compte sur le 201 ne doit pas changer de
+    // comportement sous ses pieds.
+    if let Some(existante) = repo
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| flux_normalise(&s.url) == flux_normalise(&url))
+    {
+        if let Some(id) = existante.id {
+            repo.set_favorite(id, true).ok();
+            state.event_bus.emit(
+                "library.radios_changed",
+                json!({"action": "favorited", "id": id}),
+            );
+        }
+        tracing::info!(
+            url = %url,
+            station = %existante.name,
+            "radio_add_from_web_deja_presente"
+        );
+        let body_txt = crate::i18n::t(&lang, "radio.alreadyThereBody")
+            .replace("{name}", &echapper_html(&existante.name));
+        return axum::response::Html(page_ajout(
+            &crate::i18n::t(&lang, "radio.alreadyThereTitle"),
+            &body_txt,
+            &crate::i18n::t(&lang, "radio.canCloseTab"),
+        ));
+    }
     let station = RadioStation {
         id: None,
         name: q.name.clone(),
@@ -1080,20 +1368,30 @@ async fn add_from_web(
                 "library.radios_changed",
                 json!({"action": "created", "id": id}),
             );
-            let title = crate::i18n::t(&lang, "radio.addedTitle");
-            let body_txt =
-                crate::i18n::t(&lang, "radio.addedBody").replace("{name}", &echapper_html(&q.name));
-            let close = crate::i18n::t(&lang, "radio.canCloseTab");
-            format!(
-                r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
-<body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
-<div style="text-align:center"><h1 style="color:#4ade80">{title}</h1><p>{body_txt}</p><p style="color:#888;margin-top:2em">{close}</p></div>
-</body></html>"#
+            page_ajout(
+                &crate::i18n::t(&lang, "radio.addedTitle"),
+                &crate::i18n::t(&lang, "radio.addedBody")
+                    .replace("{name}", &echapper_html(&q.name)),
+                &crate::i18n::t(&lang, "radio.canCloseTab"),
             )
         }
         Err(e) => page_erreur_ajout(&lang, &echapper_html(&e)),
     };
     axum::response::Html(html)
+}
+
+/// La page « c'est fait » rendue par `add_from_web`.
+///
+/// Extraite parce qu'elle a désormais DEUX issues à porter — la station vient
+/// d'être ajoutée, ou elle était déjà là (#3543) — et qu'une page recopiée est
+/// une page qui divergera. Les textes arrivent déjà échappés.
+fn page_ajout(titre: &str, corps: &str, fermeture: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
+<body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+<div style="text-align:center"><h1 style="color:#4ade80">{titre}</h1><p>{corps}</p><p style="color:#888;margin-top:2em">{fermeture}</p></div>
+</body></html>"#
+    )
 }
 
 /// La page « ça n'a pas marché » rendue par `add_from_web`.

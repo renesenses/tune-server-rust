@@ -132,6 +132,9 @@ pub fn router(backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>) ->
         // Lot 2 — la collection d'un acheteur.
         .route("/collection/link", axum::routing::post(bc_lier_compte))
         .route("/collection", get(bc_collection))
+        // 🔴 #2778 — les favoris. Même enveloppe, même mise en forme, même
+        // pagination par curseur : seul le point d'entrée amont change.
+        .route("/wishlist", get(bc_wishlist))
         .with_state(etat.clone())
         .merge(routes_publiques())
 }
@@ -585,6 +588,17 @@ async fn bc_discover(Query(q): Query<DiscoverQuery>) -> impl IntoResponse {
 /// qualité d'un disque.
 const BC_STREAM_QUALITY: &str = "mp3-128";
 
+/// Ce qu'il faut dire à quelqu'un qui a ACHETÉ le disque.
+///
+/// Extraite en constante parce qu'elle doit se lire à l'identique sur les
+/// deux surfaces qui la portent : la fiche d'un album, et « Ma collection »
+/// — c'est-à-dire l'écran de l'acheteur, le seul où quelqu'un a payé pour
+/// mieux que ce que Tune lui sert. La répéter à la main, c'est se ménager
+/// de la faire diverger.
+const BC_NOTE_QUALITE: &str = "Bandcamp ne sert que du MPG 128 kbit/s sans session \
+                               d'achat. Pour la qualité d'origine, télécharger \
+                               l'album acheté et le lire depuis la bibliothèque.";
+
 /// Extraire le bloc `data-tralbum` d'une page album ou piste Bandcamp.
 ///
 /// L'ancien `/album/{id}` répondait « Bandcamp has no public album API ».
@@ -660,9 +674,7 @@ fn album_jouable(tralbum: &Value) -> Value {
         // n'affiche que l'album doit pouvoir le dire à l'utilisateur.
         "quality": BC_STREAM_QUALITY,
         "lossless": false,
-        "quality_note": "Bandcamp ne sert que du MPG 128 kbit/s sans session \
-                         d'achat. Pour la qualité d'origine, télécharger \
-                         l'album acheté et le lire depuis la bibliothèque.",
+        "quality_note": BC_NOTE_QUALITE,
     })
 }
 
@@ -1050,6 +1062,22 @@ async fn bc_tag_releases(Path(tag): Path<String>, Query(q): Query<TagQuery>) -> 
 // ---------------------------------------------------------------------------
 
 const BC_COLLECTION_API: &str = "https://bandcamp.com/api/fancollection/1/collection_items";
+/// 🔴 #2778 — la LISTE DE SOUHAITS, c'est-à-dire les favoris Bandcamp.
+///
+/// FabienM, fil 1606 : « La gestion des favoris devrait pouvoir se faire aussi
+/// si on connait l'identifiant Bandcamp. » Il a raison, et c'est mesuré :
+/// sondage du 11/09/2026 sur ce point d'entrée, **sans aucun cookie de
+/// session**, `fan_id=50000` → `200`, trois articles, `more_available: true`.
+/// L'enveloppe est la MÊME que celle de `collection_items` — `items`,
+/// `tracklists`, `last_token`, `more_available` — et les articles portent les
+/// mêmes noms de champ (`band_name`, `item_title`, `item_type`, `item_url`,
+/// `item_art_id`, `tralbum_type`, `tralbum_id`), plus un `added` daté.
+///
+/// C'est la différence décisive avec le mp3-128 et avec l'AJOUT d'un favori :
+/// LIRE la liste de souhaits ne demande aucune session d'achat, donc Tune le
+/// peut. L'écrire en demande une, donc Tune ne le pourra jamais — et
+/// [`crate::service`] le dit désormais en clair au lieu de « not supported ».
+const BC_WISHLIST_API: &str = "https://bandcamp.com/api/fancollection/1/wishlist_items";
 /// Jeton de départ : « tout ce qui est plus ancien que jamais », c'est-à-dire
 /// la page la plus récente. Convention de Bandcamp, pas la nôtre.
 const BC_JETON_DEBUT: &str = "9999999999::a::";
@@ -1305,6 +1333,47 @@ async fn bc_collection(
     }
 }
 
+/// `GET /wishlist` — les favoris du compte lié, page par page (#2778).
+///
+/// Strictement le pendant de [`bc_collection`] : même résolution du compte,
+/// même pagination par curseur, même mise en forme — donc mêmes pochettes
+/// résolues, mêmes extraits jouables et même annonce de qualité.
+async fn bc_wishlist(
+    axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
+    Query(q): Query<CollectionQuery>,
+) -> impl IntoResponse {
+    let fan_id = match compte_lie(&etat.backend) {
+        Ok(Some(c)) => c.fan_id,
+        Ok(None) => {
+            return (
+                StatusCode::PRECONDITION_REQUIRED,
+                Json(json!({
+                    "error": "aucun compte Bandcamp lié",
+                    "detail": "POST /collection/link avec {\"username\": \"…\"} d'abord.",
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(erreur = %e, "bandcamp_wishlist_reglages_illisibles");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "réglages Bandcamp illisibles",
+                    "detail": e,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let jeton = q
+        .older_than_token
+        .unwrap_or_else(|| BC_JETON_DEBUT.to_string());
+    match page_de_liste_de_souhaits(fan_id, &jeton, q.count).await {
+        Ok(brut) => Json(collection_mise_en_forme(&brut, fan_id)).into_response(),
+        Err(e) => passerelle_en_echec(e),
+    }
+}
 /// Une page brute de la collection d'un acheteur.
 ///
 /// Extraite pour que `bc_collection` et `BandcampService::get_user_albums`
@@ -1315,9 +1384,30 @@ pub(crate) async fn page_de_collection(
     jeton: &str,
     count: u32,
 ) -> Result<Value, String> {
+    page_fancollection(BC_COLLECTION_API, fan_id, jeton, count).await
+}
+/// Une page brute de la LISTE DE SOUHAITS — les favoris (#2778).
+pub(crate) async fn page_de_liste_de_souhaits(
+    fan_id: i64,
+    jeton: &str,
+    count: u32,
+) -> Result<Value, String> {
+    page_fancollection(BC_WISHLIST_API, fan_id, jeton, count).await
+}
+/// Une page de l'API `fancollection` de Bandcamp.
+///
+/// `collection_items` et `wishlist_items` prennent le MÊME corps et rendent la
+/// MÊME enveloppe (mesuré le 11/09/2026, sans cookie) : un seul appel sortant
+/// à maintenir pour les deux, plutôt que deux copies qui divergeront.
+async fn page_fancollection(
+    api: &str,
+    fan_id: i64,
+    jeton: &str,
+    count: u32,
+) -> Result<Value, String> {
     let client = tune_core::http::client::shared();
     let reponse = client
-        .post(BC_COLLECTION_API)
+        .post(api)
         .json(&json!({
             "fan_id": fan_id,
             "older_than_token": jeton,
@@ -1340,12 +1430,34 @@ pub(crate) async fn page_de_collection(
     }
 }
 
+/// L'extrait jouable d'un article de collection, s'il en a un.
+///
+/// 🔴 La réponse de `collection_items` porte un bloc `tracklists` que Tune
+/// jetait entièrement — mesuré le 09/09/2026 : trois articles, trois
+/// tracklists, une URL `mp3-128` chacune. Sans elle, un article de « Ma
+/// collection » arrivait au client SANS rien de jouable, alors que la même
+/// charge réseau la contenait déjà.
+///
+/// La clef est `<tralbum_type><tralbum_id>` — `t2513132945` pour une piste,
+/// `a787856765` pour un album. Convention de Bandcamp, vérifiée sur une
+/// réponse réelle, et pas devinée d'après le nom des champs.
+fn extrait_de_collection(brut: &Value, article: &Value) -> Option<String> {
+    let cle = format!(
+        "{}{}",
+        article["tralbum_type"].as_str()?,
+        article["tralbum_id"].as_i64()?
+    );
+    brut["tracklists"][cle.as_str()][0]["file"][BC_STREAM_QUALITY]
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Mettre une page de collection en forme pour un client Tune.
 ///
 /// Ne garde que ce qui sert au rapprochement avec la bibliothèque locale
 /// (lot 3) : qui, quoi, et de quel type. Le reste de la charge Bandcamp —
 /// prix, dates d'achat, compteurs — n'a pas à traverser l'API de Tune.
-fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
+pub fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
     let articles: Vec<Value> = brut["items"]
         .as_array()
         .map(|v| v.as_slice())
@@ -1358,6 +1470,27 @@ fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
                 "type": it["item_type"],
                 "url": it["item_url"],
                 "art_id": it["item_art_id"],
+                // 🔴 La pochette RÉSOLUE, comme `/discover`, `/search` et
+                // `/album` la servent déjà. « Ma collection » était la SEULE
+                // surface Bandcamp à rendre un `art_id` nu : le client ne
+                // recompose aucune URL bcbits — c'est l'oubli du préfixe `a`
+                // qui rendait 404 (#1768) — donc la vignette de l'acheteur
+                // restait vide sur l'écran de ses propres achats.
+                "pochette": pochette(it.get("item_art_id")),
+                // 🔴 De quoi lancer la lecture. Sans ce champ, le clic sur un
+                // article de collection n'avait RIEN à jouer et le geste
+                // restait inerte, alors que la réponse de Bandcamp portait
+                // déjà l'URL dans son bloc `tracklists`.
+                "extrait": extrait_de_collection(brut, it),
+                // 🔴 La règle de #2074 — « un flux à 128 kbit/s doit être
+                // annoncé PARTOUT où il apparaît » — n'était pas tenue ici.
+                // Découverte, recherche et fiche d'album le disaient toutes ;
+                // « Ma collection » ne disait rien. C'est précisément l'écran
+                // où le silence trompe : celui de quelqu'un qui a payé pour
+                // du sans perte et à qui Tune sert l'extrait de découverte.
+                "qualite": BC_STREAM_QUALITY,
+                "lossless": false,
+                "source": "bandcamp",
             })
         })
         .collect();
@@ -1368,6 +1501,14 @@ fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
         // Curseur à réémettre tel quel pour la page suivante.
         "more_available": brut["more_available"].as_bool().unwrap_or(false),
         "last_token": brut["last_token"],
+        // Sur l'enveloppe AUSSI, comme `/search` et `/discover` : un client
+        // qui n'affiche qu'un bandeau doit pouvoir le dire sans ouvrir un
+        // article. Et la note nomme le seul chemin qui rend à l'acheteur ce
+        // qu'il a payé — le téléchargement, que Tune ne peut pas faire à sa
+        // place, faute de session d'achat.
+        "qualite": BC_STREAM_QUALITY,
+        "lossless": false,
+        "quality_note": BC_NOTE_QUALITE,
     })
 }
 
@@ -2159,4 +2300,185 @@ pub async fn parutions_discographie(racine: &str) -> Vec<Value> {
         return Vec::new();
     };
     extraire_discographie(&page, racine)
+}
+
+/// La date de mise en favori d'un article de liste de souhaits (#2778, #3489).
+///
+/// Bandcamp l'écrit `"09 Sep 2026 08:06:58 GMT"` — mesuré, pas deviné. Aucun
+/// des formats que `tune_core::streaming::favorites_date` sait lire ne couvre
+/// cette forme, et le greffon n'a pas de dépendance calendaire : on la
+/// convertit ici vers la seule forme que l'écran Favoris trie sans parser,
+/// `%Y-%m-%dT%H:%M:%SZ`, à longueur constante — ordre lexicographique = ordre
+/// chronologique.
+///
+/// `None` dès que la valeur n'est pas reconnue. Une date fausse se trie, et se
+/// trie mal, sans que rien ne le dise ; une date absente se voit.
+pub(crate) fn date_ajout_bandcamp(article: &Value) -> Option<String> {
+    let brut = article.get("added")?.as_str()?.trim();
+    let mut morceaux = brut.split_whitespace();
+    let jour: u32 = morceaux.next()?.parse().ok()?;
+    let mois = match morceaux.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let annee: i32 = morceaux.next()?.parse().ok()?;
+    let heure = morceaux.next()?;
+    let mut hms = heure.split(':');
+    let h: u32 = hms.next()?.parse().ok()?;
+    let m: u32 = hms.next()?.parse().ok()?;
+    let sec: u32 = hms.next()?.parse().ok()?;
+    if !(1..=31).contains(&jour) || h > 23 || m > 59 || sec > 59 {
+        return None;
+    }
+    // Le fuseau est toujours GMT dans cette API ; refuser tout le reste plutôt
+    // que décaler une date d'une heure sans le dire.
+    if morceaux.next() != Some("GMT") {
+        return None;
+    }
+    Some(format!(
+        "{annee:04}-{mois:02}-{jour:02}T{h:02}:{m:02}:{sec:02}Z"
+    ))
+}
+
+#[cfg(test)]
+mod tests_favoris_2778 {
+    use super::*;
+    /// Une page de LISTE DE SOUHAITS telle que Bandcamp la rend RÉELLEMENT.
+    ///
+    /// Mesurée le 11/09/2026 sur `POST
+    /// https://bandcamp.com/api/fancollection/1/wishlist_items`, **sans aucun
+    /// cookie de session**, `fan_id=50000` : `200`, sept clefs de premier
+    /// niveau, trois articles, `more_available: true`. Les noms et la forme
+    /// sont recopiés de cette réponse, pas devinés d'après le code.
+    fn page_de_souhaits_reelle() -> Value {
+        json!({
+            "items": [
+                {
+                    "band_name": "DEERHOOF",
+                    "item_title": "Divine Schism",
+                    "item_type": "album",
+                    "item_url": "https://deerhoof.bandcamp.com/album/divine-schism",
+                    "item_art_id": 1107809698i64,
+                    "tralbum_type": "a",
+                    "tralbum_id": 1965114538i64,
+                    "added": "09 Sep 2026 08:06:58 GMT",
+                    "purchased": null,
+                    "num_streamable_tracks": 1
+                },
+                {
+                    // Volontairement sans `added` lisible : l'absence doit
+                    // rester une absence, jamais une date inventée.
+                    "band_name": "Sans Date",
+                    "item_title": "Inconnue",
+                    "item_type": "album",
+                    "item_url": "https://exemple.bandcamp.com/album/inconnue",
+                    "item_art_id": 2i64,
+                    "tralbum_type": "a",
+                    "tralbum_id": 2i64,
+                    "added": "pas une date"
+                }
+            ],
+            "tracklists": {
+                "a1965114538": [
+                    {
+                        "id": 2620226528i64,
+                        "title": "Sun Like It Hot",
+                        "track_number": 1,
+                        "duration": 767.92,
+                        "file": {
+                            "mp3-128": "https://bandcamp.com/stream_redirect?enc=mp3-128&track_id=2620226528"
+                        }
+                    }
+                ]
+            },
+            "item_lookup": {},
+            "purchase_infos": {},
+            "collectors": {},
+            "more_available": true,
+            "last_token": "1788555798:1780055222:a::"
+        })
+    }
+    /// 🔴 #2778 — la date d'ajout se lit, et elle se TRIE.
+    ///
+    /// Sabotage : rendre `None` depuis `date_ajout_bandcamp` fait tomber ce
+    /// test, et l'écran Favoris retombe sur le défaut de #3489 — clé de tri
+    /// vide pour toutes les entrées, donc aucun tri.
+    #[test]
+    fn la_date_dajout_se_normalise() {
+        let page = page_de_souhaits_reelle();
+        let articles = page["items"].as_array().unwrap();
+        assert_eq!(
+            date_ajout_bandcamp(&articles[0]).as_deref(),
+            Some("2026-09-09T08:06:58Z"),
+            "la forme rendue doit être triable telle quelle, en UTC"
+        );
+        assert_eq!(
+            date_ajout_bandcamp(&articles[1]),
+            None,
+            "une date illisible ne doit JAMAIS être remplacée par une invention"
+        );
+        assert_eq!(date_ajout_bandcamp(&json!({})), None);
+    }
+    /// Un fuseau autre que GMT est refusé plutôt que décalé en silence.
+    #[test]
+    fn un_fuseau_inattendu_est_refuse() {
+        assert_eq!(
+            date_ajout_bandcamp(&json!({"added": "09 Sep 2026 08:06:58 CEST"})),
+            None
+        );
+        assert_eq!(
+            date_ajout_bandcamp(&json!({"added": "09 Zzz 2026 08:06:58 GMT"})),
+            None
+        );
+    }
+    /// 🔴 #2778 — un favori est JOUABLE, comme un article de collection.
+    ///
+    /// L'enveloppe étant la même que celle de `collection_items`, la mise en
+    /// forme commune doit en tirer pochette résolue, extrait et adresse
+    /// d'album — c'est cette adresse que `streaming_album_id` rouvre.
+    #[test]
+    fn un_favori_porte_de_quoi_jouer() {
+        let mis = collection_mise_en_forme(&page_de_souhaits_reelle(), 50_000);
+        let premier = &mis["items"][0];
+        assert_eq!(
+            premier["url"],
+            json!("https://deerhoof.bandcamp.com/album/divine-schism"),
+            "l'adresse de l'album EST son identifiant de file"
+        );
+        assert!(
+            premier["pochette"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("1107809698"),
+            "la pochette doit être résolue, pas rendue en art_id nu : {premier}"
+        );
+        assert!(
+            premier["extrait"].as_str().is_some(),
+            "le bloc tracklists porte l'extrait — le jeter rendait le geste inerte : {premier}"
+        );
+        assert_eq!(premier["qualite"], json!(BC_STREAM_QUALITY));
+        assert_eq!(premier["lossless"], json!(false));
+        // La pagination par curseur est la même que pour la collection.
+        assert_eq!(mis["more_available"], json!(true));
+        assert_eq!(mis["last_token"], json!("1788555798:1780055222:a::"));
+    }
+    /// Le point d'entrée amont est bien celui de la liste de souhaits, et il
+    /// est DISTINCT de celui de la collection.
+    #[test]
+    fn les_deux_points_d_entree_ne_se_confondent_pas() {
+        assert_ne!(BC_WISHLIST_API, BC_COLLECTION_API);
+        assert!(BC_WISHLIST_API.ends_with("wishlist_items"));
+        assert!(BC_COLLECTION_API.ends_with("collection_items"));
+    }
 }

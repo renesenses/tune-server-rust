@@ -223,9 +223,27 @@ async fn install(state: &AppState, registrations: PluginRegistrations) -> Plugin
     // tune-core's `plugin-http` feature (see its Cargo.toml).
     let PluginRegistrations {
         outputs,
+        output_providers,
         routers,
         zones,
     } = registrations;
+
+    // Providers DISCOVER their devices, so they cannot go into the registry
+    // here: there is nothing to register yet. They are handed to the same
+    // background poller that serves out-of-tree providers passed through
+    // `RunOptions::output_providers` — one path, one lifecycle, so an in-tree
+    // plugin and an out-of-tree crate behave identically.
+    //
+    // Spawned BEFORE the fixed outputs below on purpose: `spawn_output_providers`
+    // only starts a task, it registers nothing synchronously, so it cannot race
+    // the registry lock taken just after.
+    if !output_providers.is_empty() {
+        info!(
+            providers = output_providers.len(),
+            "plugin_output_providers_spawned"
+        );
+        crate::discovery_setup::spawn_output_providers(state, output_providers);
+    }
 
     // device_ids this plugin actually got into the registry. A zone is only
     // created for one of these — see the zone loop below.

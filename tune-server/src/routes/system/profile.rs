@@ -212,9 +212,48 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
         .ok()
         .filter(|ip| !ip.is_empty())
         .or_else(|| tune_core::discovery::ssdp::get_local_ip().map(|ip| ip.to_string()));
+    // #2718 et tickets support 61, 87, 97, 98 — « plus de serveurs
+    // multimedia ». La fiche decrivait les zones jusqu'a la marque et au
+    // modele du DAC, et ne disait RIEN des serveurs multimedia : quatre
+    // signalements sur trois semaines ont ete instruits sans jamais pouvoir
+    // dire combien Tune en voyait. #2718 s'est refermee « mecanisme non
+    // etabli » alors que la reponse tenait dans un compteur absent.
+    //
+    // Les champs sont EXACTEMENT ceux que `GET /network/media-servers` sert
+    // deja a tout utilisateur authentifie : la fiche n'expose rien de neuf.
+    let serveurs_multimedia: Vec<Value> = {
+        let registre = state.media_servers.lock().await;
+        let mut v: Vec<Value> = registre
+            .values()
+            .map(|ms| {
+                json!({
+                    "name": ms.name,
+                    "host": ms.host,
+                    "port": ms.port,
+                    "reachable": ms.is_reachable(),
+                    "last_seen_secs": ms.age().as_secs(),
+                })
+            })
+            .collect();
+        // Ordre stable : un `HashMap` rendrait la fiche differente a chaque
+        // ouverture, et deux fiches du meme testeur cesseraient d'etre
+        // comparables ligne a ligne — c'est precisement ce qu'on fait avec
+        // elles quand un defaut dure trois semaines.
+        v.sort_by(|a, b| {
+            a["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(b["name"].as_str().unwrap_or_default())
+        });
+        v
+    };
     let network = json!({
         "advertise_ip": advertise_ip,
         "port": state.port,
+        // Le compte SEPAREMENT de la liste : une liste vide et une liste
+        // absente se lisent pareil dans un JSON qu'on parcourt a l'oeil.
+        "media_servers_count": serveurs_multimedia.len(),
+        "media_servers": serveurs_multimedia,
     });
 
     Json(json!({

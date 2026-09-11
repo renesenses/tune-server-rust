@@ -660,6 +660,65 @@ async fn persister_le_patch(
     Ok(())
 }
 
+/// Que faire du nom demandé quand le périphérique a DÉJÀ une zone ?
+/// (#1770, annexe 4)
+///
+/// ## L'asymétrie, mesurée
+///
+/// `POST /zones` porte une seule intention : « crée-moi une zone sur ce
+/// périphérique, appelle-la X ». Quand une zone existe déjà pour ce
+/// `output_device_id`, la route la rend telle quelle — `200 OK`,
+/// `zone_already_exists_returning` — et le nom demandé n'était honoré que sur
+/// la branche `is_device_hidden`. Sur une zone **visible** il était jeté
+/// **sans un mot** : ni journal, ni code d'état différent, ni champ dans la
+/// réponse. L'écran, lui, annonce « zone créée ». C'est aussi ce qui fait lire
+/// « ma zone a happé les périphériques » là où le serveur a simplement rendu
+/// une zone existante.
+///
+/// ## Ce que cette fonction NE tranche PAS
+///
+/// Deux conduites se valent, et le choix appartient à Bertrand — c'est
+/// exactement ce que l'étiquette `keep-open` de #1770 réserve :
+///
+/// - **honorer** le nom sur une zone visible comme sur une masquée : cohérent,
+///   mais cela renomme en silence une zone que quelqu'un d'autre écoute
+///   peut-être ;
+/// - **refuser** (`409`) en nommant la zone existante : honnête, mais c'est un
+///   contrat client qui change, et tout client déjà installé lit ce `200`
+///   comme un succès.
+///
+/// Cette fonction rend donc le comportement d'aujourd'hui, **inchangé**. Ce
+/// qu'elle apporte est ailleurs : un SEUL endroit nommé où l'arbitrage se
+/// posera, et la fin du silence sur la branche `Ecarte`. Le jour où
+/// l'arbitrage est rendu, c'est un bras du `match` de `create_zone` qui change,
+/// et les témoins de `nom_de_zone_existante_guard.rs` disent lequel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NomDeZoneExistante {
+    /// Le nom demandé est déjà celui de la zone : rien à décider, et surtout
+    /// rien à écrire en base.
+    DejaLeBon,
+    /// Zone MASQUÉE ressuscitée : elle reprend le nom demandé. Décidé de
+    /// longue date (« Update name in case device was renamed »), inchangé ici.
+    Honore,
+    /// Zone VISIBLE : le nom demandé est écarté, la zone garde le sien. C'est
+    /// le comportement d'aujourd'hui — et l'arbitrage en attente.
+    Ecarte,
+}
+
+pub(super) fn nom_de_zone_existante(
+    zone_masquee: bool,
+    nom_actuel: &str,
+    nom_demande: &str,
+) -> NomDeZoneExistante {
+    if nom_actuel == nom_demande {
+        NomDeZoneExistante::DejaLeBon
+    } else if zone_masquee {
+        NomDeZoneExistante::Honore
+    } else {
+        NomDeZoneExistante::Ecarte
+    }
+}
+
 pub(super) async fn create_zone(
     State(state): State<AppState>,
     Json(body): Json<CreateZone>,
@@ -702,17 +761,45 @@ pub(super) async fn create_zone(
         if let Ok(Some(existing)) = repo.get_by_device_id(device_id) {
             if let Some(id) = existing.id {
                 // Unhide if the zone was soft-deleted
-                if repo.is_device_hidden(device_id) {
+                let masquee = repo.is_device_hidden(device_id);
+                if masquee {
                     info!(
                         zone_id = id,
                         device_id, "unhiding_previously_deleted_zone_via_api"
                     );
-                    let _ = repo.unhide(id);
-                    // Update name in case device was renamed
-                    let _ = repo.update_name(id, &body.name);
+                    if let Err(e) = repo.unhide(id) {
+                        // Rendre `200 OK` ici, c'est annoncer « la voilà » d'une
+                        // zone qui reste masquée : l'utilisateur ne la verra
+                        // nulle part et croira l'avoir créée.
+                        return echec_ecriture(id, "is_hidden", "0", e);
+                    }
                     if let Some(ref ot) = body.output_type {
                         let _ = repo.update_output_type(id, ot);
                     }
+                }
+                // Le nom demandé : honoré, écarté, ou déjà le bon. UN seul
+                // endroit décide (#1770, annexe 4), et aucune des trois
+                // branches ne se tait.
+                match nom_de_zone_existante(masquee, &existing.name, &body.name) {
+                    NomDeZoneExistante::Honore => {
+                        if let Err(e) = repo.update_name(id, &body.name) {
+                            // Cette branche a DÉJÀ décidé d'honorer le nom :
+                            // rendre `200 OK` avec l'ancienne fiche serait dire
+                            // « c'est fait » d'une écriture qui a échoué.
+                            return echec_ecriture(id, "name", &body.name, e);
+                        }
+                    }
+                    // La perte cesse d'être silencieuse. Le code d'état et la
+                    // fiche rendue ne changent PAS : trancher entre « honorer »
+                    // et « 409 » appartient à Bertrand.
+                    NomDeZoneExistante::Ecarte => warn!(
+                        zone_id = id,
+                        device_id,
+                        nom_demande = %body.name,
+                        nom_conserve = %existing.name,
+                        "zone_existante_nom_demande_ecarte"
+                    ),
+                    NomDeZoneExistante::DejaLeBon => {}
                 }
                 let _ = repo.update_online(id, true);
                 // Le contrat client AVEC l'etat REEL. Une zone qui existe deja
@@ -860,8 +947,17 @@ pub(super) async fn create_zone(
                             zone_id = id,
                             device_id, "unique_constraint_recovery_unhiding_zone"
                         );
-                        let _ = repo.unhide(id);
-                        let _ = repo.update_name(id, &body.name);
+                        // Ce filet ne se déclenche QUE sur une zone masquée —
+                        // c'est ce que dit la contrainte UNIQUE qui vient
+                        // d'échouer. Honorer le nom est donc la branche déjà
+                        // décidée, et un échec d'écriture ne peut pas ressortir
+                        // en `200 OK` avec l'ancienne fiche (#1770, annexe 4).
+                        if let Err(e) = repo.unhide(id) {
+                            return echec_ecriture(id, "is_hidden", "0", e);
+                        }
+                        if let Err(e) = repo.update_name(id, &body.name) {
+                            return echec_ecriture(id, "name", &body.name, e);
+                        }
                         let _ = repo.update_online(id, true);
                         // Meme contrat, meme raison qu'au-dessus (#2284).
                         let v = crate::routes::playback::build_zone_json(&state, id).await;

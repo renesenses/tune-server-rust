@@ -4295,7 +4295,7 @@ mod identite_de_sortie_tests {
     fn repo() -> ZoneRepo {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        // La colonne arrive par la migration 98 comme par `CORE_SCHEMA` : on
+        // La colonne arrive par la migration 99 comme par `CORE_SCHEMA` : on
         // joue les migrations pour eprouver le chemin d'une base EXISTANTE.
         crate::db::migrations::run_migrations(&db).unwrap();
         ZoneRepo::new(db)
@@ -4542,5 +4542,113 @@ mod identite_de_sortie_tests {
             Some(AUDIO_GD)
         );
         assert_eq!(repo.endpoint_id_de_la_sortie("local:inconnu"), None);
+    }
+
+    /// Le COMPTE DES COLLISIONS, sous l'index unique que porte le terrain.
+    ///
+    /// La migration ne pose AUCUNE contrainte sur `output_endpoint_id` : la
+    /// colonne naît NULL, sans index, sans UNIQUE. Ce qui peut percuter une
+    /// contrainte, c'est l'ECRITURE de `output_device_id` au moment d'une
+    /// ré-association — `idx_zones_output_device_id`, l'index unique PARTIEL
+    /// que `deduplicate_zones` pose sur toute base de testeur, et que le
+    /// `repo()` de ce module n'a pas. Une ré-association qui viserait un nom
+    /// déjà pris ferait donc, sur le terrain, un `UNIQUE constraint failed`
+    /// au DEMARRAGE — pas un refus propre.
+    ///
+    /// Ce témoin pose l'index POUR DE VRAI, compte les collisions avant et
+    /// après, et éprouve les deux branches : le nom libre (la zone suit) et
+    /// le nom pris (refus nommé, aucune écriture).
+    #[test]
+    fn sous_lindex_unique_de_terrain_la_passe_ne_percute_aucune_collision() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        // L'index que `deduplicate_zones` (startup.rs) pose sur toute base.
+        db.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id \
+             ON zones(output_device_id) WHERE output_device_id IS NOT NULL;",
+        )
+        .unwrap();
+        let repo = ZoneRepo::new(db);
+
+        let salon = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        repo.update_output_endpoint_id(salon, AUDIO_GD).unwrap();
+        let bureau = repo
+            .create("Bureau", Some("local"), Some("local:Haut-parleurs"))
+            .unwrap();
+        repo.update_output_endpoint_id(bureau, HAUT_PARLEURS)
+            .unwrap();
+
+        // ── Le compte, AVANT. Deux clefs, deux valeurs distinctes.
+        let collisions = |repo: &ZoneRepo, colonne: &str| -> i64 {
+            vue(
+                repo,
+                &format!(
+                    "SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM zones \
+                     WHERE {colonne} IS NOT NULL AND {colonne} <> '' \
+                     GROUP BY {colonne} HAVING COUNT(*) > 1)"
+                ),
+            )
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-1)
+        };
+        assert_eq!(
+            collisions(&repo, "output_endpoint_id"),
+            0,
+            "la nouvelle clef n'a aucune collision : c'est ce qui autorise \
+             à l'écrire sans arbitrage"
+        );
+        assert_eq!(collisions(&repo, "output_device_id"), 0);
+
+        // ── Branche 1 : le nom visé est LIBRE. La zone suit son appareil,
+        // l'écriture passe l'index.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[
+                sortie("audio-gd USB audio (44,1 kHz)", AUDIO_GD),
+                sortie("Haut-parleurs", HAUT_PARLEURS),
+            ])
+            .expect("aucune violation d'unicité : le nom visé était libre");
+        assert_eq!(rapport.reassociees.len(), 1);
+        assert_eq!(rapport.reassociees[0].zone_id, salon);
+        assert_eq!(collisions(&repo, "output_device_id"), 0);
+        assert_eq!(collisions(&repo, "output_endpoint_id"), 0);
+        assert_eq!(
+            vue(&repo, "SELECT COUNT(*) FROM zones").as_deref(),
+            Some("2")
+        );
+
+        // ── Branche 2 : le DAC revient sous le nom que l'AUTRE zone porte
+        // déjà. Sans le refus, `update_output_device` écrirait
+        // `local:Haut-parleurs` sur la zone Salon alors que Bureau le
+        // détient : `UNIQUE constraint failed: zones.output_device_id`, au
+        // DÉMARRAGE, sur la base d'un testeur. C'est le dégât que la règle
+        // évite, et l'index posé ci-dessus est celui qui le produirait.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("Haut-parleurs", AUDIO_GD)])
+            .expect("un refus, pas une violation d'unicité");
+        assert_eq!(
+            rapport.reassociees,
+            vec![],
+            "aucune écriture : le nom visé appartient à une autre zone"
+        );
+        assert!(
+            rapport.refus.iter().any(|(z, m)| *z == salon
+                && m.contains(&bureau.to_string())
+                && m.contains("fusion")),
+            "le nom pris doit produire un refus NOMMÉ, pas une écriture : {:?}",
+            rapport.refus
+        );
+        assert_eq!(collisions(&repo, "output_device_id"), 0);
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_device_id FROM zones WHERE id = {salon}")
+            )
+            .as_deref(),
+            Some("local:audio-gd USB audio (44,1 kHz)"),
+            "la zone refusée n'a PAS bougé"
+        );
     }
 }

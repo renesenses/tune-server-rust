@@ -867,8 +867,84 @@ fn chemin_sur_montage_reseau(_chemin: &Path) -> bool {
     false
 }
 
+/// Fenetre bornee au-dela de laquelle une copie integrale reste defendable.
+///
+/// La copie prealable existe pour epargner au decodeur ses allers-retours par
+/// seek sur un montage reseau. Elle se paie en octets : le fichier ENTIER.
+/// Tant qu'on decode le fichier entier, l'echange est neutre. Des qu'on n'en
+/// demande qu'une fenetre, il ne l'est plus — copier 60 Mo pour en lire 2 est
+/// une amplification pure.
+///
+/// #2156 — c'est le regime de la passe acoustique : elle demande DIX SECONDES
+/// par piste (`audio/embedding.rs`, `decode_to_pcm(.., 0.0, 10.0)`) et
+/// parcourt la bibliotheque entiere, machine au repos. Sur un montage reseau,
+/// chaque piste etait donc rapatriee en entier puis jetee — la copie est
+/// supprimee par le `Drop` de [`StagedFile`], ce qui explique qu'un testeur
+/// cherchant « quel fichier Tune ecrit » ne trouve rien sur le disque.
+///
+/// **120 s, et ce nombre est mesure, pas choisi.** C'est la plus grande
+/// fenetre de tete qu'un appelant demande, avec de la marge : l'empreinte
+/// perceptuelle lit `FENETRE_S + MARGE_SILENCE_S` = **90 s**
+/// (`audio/empreinte.rs:46-48`), la passe acoustique et la sonde MQA en
+/// demandent **10**. Aucun chemin de LECTURE ne passe par ici avec une borne :
+/// ils passent tous `0.0`, la convention « pas de limite ».
 #[cfg(unix)]
-fn stage_locally_for_decode(src: &str) -> Option<Arc<StagedFile>> {
+pub(crate) const FENETRE_SANS_COPIE_S: f64 = 120.0;
+
+/// La lecture demandee est-elle une COURTE FENETRE DE TETE ?
+///
+/// Deux conditions, et les deux comptent :
+///
+/// * `max_duration_s` borne et courte — `0.0` est la convention « pas de
+///   limite » de [`decode_to_pcm`], un decodage integral pour lequel la copie
+///   garde tout son sens ;
+/// * `seek_s` nul — on lit depuis le DEBUT, donc de facon purement
+///   sequentielle. C'est la seule forme ou la copie prealable n'achete
+///   strictement rien : elle existe pour amortir des allers-retours par seek,
+///   et il n'y en a aucun.
+///
+/// La condition sur `seek_s` n'est pas un exces de prudence, elle a ete posee
+/// apres recensement des appelants. Trois passes lisent une fenetre de tete —
+/// l'empreinte acoustique (`audio/embedding.rs`, 10 s), la sonde MQA
+/// (`routes/mqa.rs`, 10 s) et l'empreinte perceptuelle (`audio/empreinte.rs`,
+/// 90 s) — et ce sont exactement celles qui parcourent la bibliotheque entiere
+/// en tache de fond. Deux autres lisent des fenetres AILLEURS dans le fichier :
+/// l'analyseur par segments (`audio/analyzer.rs`, un `seek` par segment) et le
+/// transcodage d'une tranche CUE (`orchestrator/transcodage.rs`, `debut_s`).
+/// Celles-la paient de vrais allers-retours et gardent le comportement
+/// d'aujourd'hui — la copie reste amortie par `STAGE_CACHE`.
+#[cfg(unix)]
+pub(crate) fn fenetre_de_tete_bornee(seek_s: f64, max_duration_s: f64) -> bool {
+    seek_s <= 0.0 && max_duration_s > 0.0 && max_duration_s <= FENETRE_SANS_COPIE_S
+}
+
+#[cfg(unix)]
+fn stage_locally_for_decode(
+    src: &str,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Option<Arc<StagedFile>> {
+    stager_pour_decodage(
+        src,
+        chemin_sur_montage_reseau(Path::new(src)),
+        seek_s,
+        max_duration_s,
+    )
+}
+
+/// Le corps de [`stage_locally_for_decode`], avec le verdict de montage et la
+/// fenetre EN PARAMETRE.
+///
+/// Separee pour que la garde puisse mesurer l'effet observable — les octets
+/// reellement recopies — sans avoir a fabriquer un montage reseau : aucune
+/// suite de tests ne peut monter un NFS.
+#[cfg(unix)]
+fn stager_pour_decodage(
+    src: &str,
+    sur_montage_reseau: bool,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Option<Arc<StagedFile>> {
     let src_path = Path::new(src);
     let tmp_dir = std::env::temp_dir();
     // ⚠️ Le critère est le TYPE de montage, pas le numéro de périphérique.
@@ -880,8 +956,18 @@ fn stage_locally_for_decode(src: &str) -> Option<Arc<StagedFile>> {
     // Seuls les montages RÉSEAU (nfs, cifs/smb, sshfs, webdav…) paient des
     // allers-retours par seek et justifient la copie préalable (Yves, NAS
     // en WiFi : 90 s et plus par piste sans elle).
-    if !chemin_sur_montage_reseau(src_path) {
+    if !sur_montage_reseau {
         return None; // stockage local : le décodeur lit sur place
+    }
+    // #2156 — une fenetre bornee ne justifie pas de rapatrier le fichier
+    // entier. Voir [`FENETRE_SANS_COPIE_S`].
+    if fenetre_de_tete_bornee(seek_s, max_duration_s) {
+        tracing::info!(
+            src = %src,
+            fenetre_s = max_duration_s,
+            "decode_source_stage_evite_fenetre_de_tete"
+        );
+        return None;
     }
 
     // Staging PIPELINÉ (phase 2, flag TUNE_STAGE_STREAM_DECODE) : au lieu de
@@ -1041,7 +1127,11 @@ fn mtime_secs(m: &std::fs::Metadata) -> i64 {
 }
 
 #[cfg(not(unix))]
-fn stage_locally_for_decode(_src: &str) -> Option<Arc<StagedFile>> {
+fn stage_locally_for_decode(
+    _src: &str,
+    _seek_s: f64,
+    _max_duration_s: f64,
+) -> Option<Arc<StagedFile>> {
     None
 }
 
@@ -1074,7 +1164,7 @@ pub fn decode_to_pcm(
     // decoder's many small seeks don't each cost a network round-trip (Yves: NAS
     // over WiFi, 90s+ per track). No-op for local files. The guard lives for the
     // whole decode; the temp is removed when it drops.
-    let _staged = stage_locally_for_decode(file_path);
+    let _staged = stage_locally_for_decode(file_path, seek_s, max_duration_s);
     let file_path: &str = _staged
         .as_ref()
         .and_then(|s| s.path.to_str())
@@ -2607,7 +2697,7 @@ fn decode_ape_streaming(
     // Mise en cache locale des sources réseau, comme le chemin par lots : le
     // décodeur APE fait un seek + une lecture par trame, et sur un NAS en WiFi
     // chaque aller-retour se paie. Le garde vit tout le décodage.
-    let _staged = stage_locally_for_decode(file_path);
+    let _staged = stage_locally_for_decode(file_path, 0.0, 0.0);
     let file_path: &str = _staged
         .as_ref()
         .and_then(|s| s.path.to_str())
@@ -5100,5 +5190,137 @@ mod borne_de_fin_tests {
         assert_eq!(octets_pour(0.0, Some(44_100), Some(2), Some(16)), None);
         assert_eq!(octets_pour(-1.0, Some(44_100), Some(2), Some(16)), None);
         assert_eq!(octets_pour(f64::NAN, Some(44_100), Some(2), Some(16)), None);
+    }
+}
+
+// ===========================================================================
+// #2156 — la copie prealable ne doit pas servir une FENETRE
+// ===========================================================================
+/// La copie locale d'une source reseau se paie en octets : le fichier ENTIER.
+/// Elle etait declenchee sans regarder ce qu'on demandait a lire. La passe
+/// acoustique, elle, demande DIX SECONDES par piste et parcourt toute la
+/// bibliotheque, machine au repos : chaque piste etait rapatriee en entier,
+/// lue sur dix secondes, puis EFFACEE par le `Drop` de `StagedFile` — un debit
+/// d'ecriture soutenu dont aucun fichier ne reste pour temoigner.
+///
+/// La garde mesure les OCTETS RECOPIES, pas la condition qui les declenche :
+/// les deux appels ne different que par la fenetre demandee, le verdict de
+/// montage vaut `true` des deux cotes.
+#[cfg(all(test, unix))]
+mod fenetre_bornee_sans_copie_2156 {
+    use super::*;
+
+    const TAILLE: usize = 512 * 1024;
+
+    #[test]
+    fn une_fenetre_bornee_ne_recopie_pas_le_fichier_entier() {
+        let d = crate::test_scratch::scratch_dir("tune-stage-2156-fenetre");
+        let src = d.join("source.bin");
+        std::fs::write(&src, vec![0xA5u8; TAILLE]).expect("ecriture de la source");
+        let chemin = src.to_string_lossy().to_string();
+
+        // Le regime de la passe acoustique : dix secondes d'une piste entiere.
+        let borne = stager_pour_decodage(&chemin, true, 0.0, 10.0);
+        let recopie = borne.as_ref().map(|s| s.bytes).unwrap_or(0);
+        assert!(
+            borne.is_none(),
+            "fenetre de 10 s : {recopie} octets ont quand meme ete recopies vers {:?}. \
+             C'est l'amplification de #2156 — tout le fichier ecrit sur le disque \
+             pour en lire dix secondes.",
+            borne.as_ref().map(|s| s.path.clone())
+        );
+    }
+
+    /// Contre-partie indispensable : sans elle, un staging entierement desarme
+    /// ferait passer la garde ci-dessus.
+    #[test]
+    fn un_decodage_integral_recopie_toujours_la_source_reseau() {
+        let d = crate::test_scratch::scratch_dir("tune-stage-2156-integral");
+        let src = d.join("source.bin");
+        std::fs::write(&src, vec![0x5Au8; TAILLE]).expect("ecriture de la source");
+        let chemin = src.to_string_lossy().to_string();
+
+        let integral = stager_pour_decodage(&chemin, true, 0.0, 0.0)
+            .expect("un decodage integral sur montage reseau doit toujours stager");
+        assert!(
+            integral.path.exists(),
+            "la copie annoncee n'existe pas sur le disque : {:?}",
+            integral.path
+        );
+        assert_eq!(
+            std::fs::metadata(&integral.path)
+                .expect("metadonnees de la copie")
+                .len(),
+            TAILLE as u64,
+            "la copie integrale doit porter tous les octets de la source"
+        );
+        // La copie vit dans STAGE_CACHE (Arc retenu) : son `Drop` ne passera
+        // pas, on la retire nous-memes plutot que de laisser un residu.
+        let _ = std::fs::remove_file(&integral.path);
+    }
+
+    /// Cablage. Le correctif ne vaut que si `decode_to_pcm` transmet SA
+    /// fenetre au staging : avec un `0.0` en dur au site d'appel, les deux
+    /// gardes ci-dessus resteraient vertes pendant que la passe acoustique
+    /// recopierait de nouveau chaque piste en entier. C'est la forme exacte du
+    /// piege « ecrit mais pas branche ».
+    #[test]
+    fn decode_to_pcm_transmet_sa_fenetre_au_staging() {
+        // L'aiguille est ASSEMBLEE, jamais ecrite en un morceau : ecrite telle
+        // quelle, elle figurerait dans le fichier qu'elle inspecte et le garde
+        // se trouverait LUI-MEME — vert quoi qu'il arrive au site d'appel.
+        // (Constate ici : la premiere version de ce garde restait verte alors
+        // que l'appel avait ete remplace par un `0.0` en dur.)
+        let aiguille = format!(
+            "stage_locally_for_decode(file_path, seek_s, {})",
+            "max_duration_s"
+        );
+        let occurrences = include_str!("decode.rs").matches(&aiguille).count();
+        assert_eq!(
+            occurrences, 1,
+            "decode_to_pcm ne transmet plus sa fenetre au staging (#2156) : \
+             {occurrences} occurrence(s) de `{aiguille}`. Les gardes d'effet \
+             resteraient vertes pendant que la passe acoustique recopierait de \
+             nouveau chaque piste en entier."
+        );
+    }
+
+    /// Le seuil lui-meme, aux bornes : `0.0` est la convention « pas de
+    /// limite » et doit rester du cote de la copie.
+    /// Une fenetre lue AILLEURS dans le fichier garde la copie : l'analyseur
+    /// par segments et la tranche CUE paient de vrais allers-retours.
+    #[test]
+    fn une_fenetre_avec_seek_recopie_toujours() {
+        let d = crate::test_scratch::scratch_dir("tune-stage-2156-seek");
+        let src = d.join("source.bin");
+        std::fs::write(&src, vec![0x3Cu8; TAILLE]).expect("ecriture de la source");
+        let chemin = src.to_string_lossy().to_string();
+
+        let avec_seek = stager_pour_decodage(&chemin, true, 30.0, 10.0)
+            .expect("une fenetre avec seek doit encore etre stagee");
+        assert_eq!(
+            std::fs::metadata(&avec_seek.path)
+                .expect("metadonnees de la copie")
+                .len(),
+            TAILLE as u64
+        );
+        let _ = std::fs::remove_file(&avec_seek.path);
+    }
+
+    /// Le seuil lui-meme, aux bornes.
+    #[test]
+    fn le_seuil_separe_bien_lintegral_de_la_fenetre() {
+        assert!(!fenetre_de_tete_bornee(0.0, 0.0), "0.0 = decodage integral");
+        assert!(fenetre_de_tete_bornee(0.0, 10.0), "la passe acoustique");
+        assert!(
+            fenetre_de_tete_bornee(0.0, 90.0),
+            "l'empreinte perceptuelle lit 90 s de tete : elle doit entrer aussi"
+        );
+        assert!(fenetre_de_tete_bornee(0.0, FENETRE_SANS_COPIE_S));
+        assert!(!fenetre_de_tete_bornee(0.0, FENETRE_SANS_COPIE_S + 1.0));
+        assert!(
+            !fenetre_de_tete_bornee(12.5, 10.0),
+            "une fenetre ailleurs dans le fichier paie de vrais seeks"
+        );
     }
 }

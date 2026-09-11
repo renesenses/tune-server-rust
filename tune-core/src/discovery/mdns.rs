@@ -20,6 +20,11 @@ pub const OAAT_SERVICE: &str = "_oaat._tcp.local.";
 /// l'enceinte qui s'annonce et la source de musique qui compose vers elle ;
 /// la constante vit dans [`super::sendspin`], avec sa source.
 pub const SENDSPIN_SERVICE: &str = super::sendspin::SERVICE_LECTEUR;
+/// Service que Tune ANNONCE en tant que serveur Sendspin (#3326, S2-a).
+///
+/// La spécification impose les deux modes de découverte au serveur — la
+/// phase 1 n'avait livré que le parcours. Voir `register_sendspin_server`.
+pub const SENDSPIN_SERVER_SERVICE: &str = super::sendspin::SERVICE_SERVEUR;
 
 #[derive(Debug, Clone)]
 pub enum MdnsEvent {
@@ -201,6 +206,57 @@ impl MdnsScanner {
         Ok(())
     }
 
+    /// Annonce Tune comme SERVEUR Sendspin (#3326, S2-a).
+    ///
+    /// La spécification décrit deux modes de découverte et exige du serveur
+    /// qu'il supporte les deux : le parcours de `_sendspin._tcp.local.` (mode
+    /// serveur-initié, livré en phase 1 par `with_sendspin`) **et** cette
+    /// annonce de `_sendspin-server._tcp.local.` (mode client-initié), par
+    /// laquelle une enceinte peut composer vers nous.
+    ///
+    /// Le TXT `path` est REQUIS par la spécification et ne connaît aucun
+    /// défaut : c'est pourquoi il est écrit ici sans condition. Le port annoncé
+    /// est celui du serveur HTTP de Tune, où le point d'accès est réellement
+    /// monté — et non le 8927 « recommandé », qui ne décrirait pas la réalité.
+    pub fn register_sendspin_server(&self, port: u16) -> Result<(), String> {
+        let hostname = crate::discovery::system_hostname();
+        let service_name = format!("Tune ({hostname})");
+        let host_label = crate::discovery::mdns_host_label(&hostname);
+
+        let local_ip = crate::discovery::ssdp::get_local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into());
+
+        let properties = [
+            ("path", crate::sendspin::CHEMIN_POINT_D_ACCES),
+            ("name", service_name.as_str()),
+        ];
+
+        let svc = ServiceInfo::new(
+            SENDSPIN_SERVER_SERVICE,
+            &service_name,
+            &format!("{host_label}.local."),
+            &local_ip,
+            port,
+            &properties[..],
+        )
+        .map_err(|e| format!("mDNS sendspin register: {e}"))?;
+
+        self.daemon
+            .register(svc)
+            .map_err(|e| format!("mDNS sendspin register: {e}"))?;
+
+        info!(
+            service = SENDSPIN_SERVER_SERVICE,
+            name = %service_name,
+            ip = %local_ip,
+            port,
+            path = crate::sendspin::CHEMIN_POINT_D_ACCES,
+            "mdns_sendspin_server_registered"
+        );
+        Ok(())
+    }
+
     pub fn start(&mut self) -> Result<(), String> {
         let mut has_bluos = false;
         for config in &self.configs {
@@ -340,16 +396,33 @@ async fn handle_event(
             // Phantom « SALON »). Et quand l'adresse IPv4 arrive après coup,
             // on RÉPARE l'appareil retenu au lieu de jeter l'annonce.
             if output_type == OutputType::Airplay {
-                match verdict_doublon_airplay(st.devices.values(), &device) {
+                let nouveau_est_raop = service_type == AIRPLAY_SERVICE;
+                match verdict_doublon_airplay(st.devices.values(), &device, nouveau_est_raop) {
                     DoublonAirplay::Nouveau => {}
                     DoublonAirplay::Ignorer => {
                         debug!(id = %dev_id, name = %device.name, host = %device.host, service = service_type, "mdns_dup_skipped");
                         drop(st);
                         return;
                     }
-                    DoublonAirplay::Reprendre { id_retenu } => {
+                    DoublonAirplay::Reprendre {
+                        id_retenu,
+                        adopter_l_adresse,
+                        adopter_le_port,
+                    } => {
                         if let Some(d) = st.devices.get_mut(&id_retenu) {
-                            d.host = device.host.clone();
+                            if adopter_l_adresse {
+                                d.host = device.host.clone();
+                            }
+                            if adopter_le_port {
+                                info!(
+                                    id = %id_retenu,
+                                    name = %d.name,
+                                    ancien_port = d.port,
+                                    port_raop = device.port,
+                                    "mdns_airplay_port_raop_adopte"
+                                );
+                                d.port = device.port;
+                            }
                             let repris = d.clone();
                             st.service_to_device
                                 .insert(info.get_fullname().to_string(), id_retenu.clone());
@@ -668,12 +741,24 @@ enum DoublonAirplay {
     /// Un appareil connu correspond et son adresse vaut mieux (ou autant) :
     /// on jette l'annonce.
     Ignorer,
-    /// Un appareil connu correspond mais il est ancré sur une adresse IPv6
-    /// alors que l'annonce apporte une IPv4 : on répare l'appareil retenu en
-    /// place (même identifiant, donc même zone) au lieu de jeter l'annonce.
-    /// C'est ce qui sort une zone du « Network is unreachable (os error 101) »
-    /// quand IPv6 n'est pas routé (#197).
-    Reprendre { id_retenu: String },
+    /// Un appareil connu correspond, mais l'annonce apporte quelque chose de
+    /// meilleur : on répare l'appareil retenu EN PLACE (même identifiant, donc
+    /// même zone) au lieu de jeter l'annonce.
+    ///
+    /// Deux réparations, indépendantes :
+    ///
+    /// - `adopter_l_adresse` — le retenu est ancré sur une IPv6 alors que
+    ///   l'annonce apporte une IPv4. C'est ce qui sort une zone du « Network
+    ///   is unreachable (os error 101) » quand IPv6 n'est pas routé (#197).
+    /// - `adopter_le_port` — l'annonce vient de `_raop._tcp` et porte un autre
+    ///   port que celui retenu. Voir [`verdict_doublon_airplay`] : le port de
+    ///   `_raop._tcp` EST le port du transport que `AirplayOutput` parle
+    ///   (#2217).
+    Reprendre {
+        id_retenu: String,
+        adopter_l_adresse: bool,
+        adopter_le_port: bool,
+    },
 }
 
 /// Deux appareils AirPlay sont LE MÊME appareil physique s'ils partagent
@@ -705,20 +790,47 @@ fn est_ipv4(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Le verdict, et avec lui le choix du PORT sur lequel la zone parlera.
+///
+/// Une même enceinte annonce `_raop._tcp` ET `_airplay._tcp`. Les deux
+/// produisent un `OutputType::Airplay`, donc un `AirplayOutput` — qui ne sait
+/// parler qu'une chose : le RTSP/RAOP d'AirPlay 1 (`ANNOUNCE`, `SETUP`,
+/// `RECORD`). Or ce sont deux services DNS-SD distincts, avec deux
+/// enregistrements SRV INDÉPENDANTS : le port de `_raop._tcp` est le port
+/// RAOP, celui de `_airplay._tcp` est le port du serveur AirPlay. Ils
+/// coïncident sur le matériel AirPlay 2 récent ; ils ne coïncident pas sur le
+/// matériel qui annonce encore RAOP ailleurs.
+///
+/// Le dédoublonnage rendait `Ignorer` dans les deux sens : le port retenu
+/// était donc celui du service qui avait gagné la COURSE de résolution mDNS,
+/// non celui du protocole réellement parlé. Une résolution dans l'autre ordre,
+/// au redémarrage suivant, changeait le port — et un appareil qui reçoit un
+/// `SETUP` RAOP sur le port de son serveur AirPlay a toutes les raisons de le
+/// REFUSER délibérément (#2217).
+///
+/// `nouveau_est_raop` dit d'où vient l'annonce ; c'est `handle_event` qui le
+/// sait, puisque c'est lui qui porte le `service_type`.
 fn verdict_doublon_airplay<'a>(
     existants: impl Iterator<Item = &'a DiscoveredDevice>,
     nouveau: &DiscoveredDevice,
+    nouveau_est_raop: bool,
 ) -> DoublonAirplay {
-    let doublon = existants
+    let Some(doublon) = existants
         .filter(|d| d.device_type == OutputType::Airplay && d.id != nouveau.id)
-        .find(|d| meme_appareil_airplay(d, nouveau));
-    match doublon {
-        None => DoublonAirplay::Nouveau,
-        Some(d) if est_ipv6(&d.host) && est_ipv4(&nouveau.host) => DoublonAirplay::Reprendre {
-            id_retenu: d.id.clone(),
-        },
-        Some(_) => DoublonAirplay::Ignorer,
+        .find(|d| meme_appareil_airplay(d, nouveau))
+    else {
+        return DoublonAirplay::Nouveau;
+    };
+    let adopter_l_adresse = est_ipv6(&doublon.host) && est_ipv4(&nouveau.host);
+    let adopter_le_port = nouveau_est_raop && doublon.port != nouveau.port;
+    if adopter_l_adresse || adopter_le_port {
+        return DoublonAirplay::Reprendre {
+            id_retenu: doublon.id.clone(),
+            adopter_l_adresse,
+            adopter_le_port,
+        };
     }
+    DoublonAirplay::Ignorer
 }
 
 /// L'identifiant durable d'un appareil.
@@ -927,10 +1039,25 @@ mod tests {
     }
 
     fn appareil(id: &str, host: &str, mac: Option<&str>, t: OutputType) -> DiscoveredDevice {
-        let mut d = DiscoveredDevice::new(id.into(), "SALON".into(), t, host.into(), 7000);
+        appareil_sur_port(id, host, mac, t, 7000)
+    }
+
+    fn appareil_sur_port(
+        id: &str,
+        host: &str,
+        mac: Option<&str>,
+        t: OutputType,
+        port: u16,
+    ) -> DiscoveredDevice {
+        let mut d = DiscoveredDevice::new(id.into(), "SALON".into(), t, host.into(), port);
         d.mac_address = mac.map(str::to_string);
         d
     }
+
+    /// Annonce venue de `_airplay._tcp` : elle n'apporte aucun port RAOP.
+    const ANNONCE_AIRPLAY: bool = false;
+    /// Annonce venue de `_raop._tcp` : son port SRV EST le port RAOP.
+    const ANNONCE_RAOP: bool = true;
 
     #[test]
     fn le_nom_raop_porte_la_mac_normalisee() {
@@ -962,7 +1089,7 @@ mod tests {
         );
         // L'adresse stockée (IPv4) vaut mieux que l'annonce (IPv6) : on jette.
         assert_eq!(
-            verdict_doublon_airplay([&stocke].into_iter(), &nouveau),
+            verdict_doublon_airplay([&stocke].into_iter(), &nouveau, ANNONCE_RAOP),
             DoublonAirplay::Ignorer
         );
     }
@@ -987,9 +1114,11 @@ mod tests {
             OutputType::Airplay,
         );
         assert_eq!(
-            verdict_doublon_airplay([&stocke].into_iter(), &nouveau),
+            verdict_doublon_airplay([&stocke].into_iter(), &nouveau, ANNONCE_RAOP),
             DoublonAirplay::Reprendre {
-                id_retenu: stocke.id.clone()
+                id_retenu: stocke.id.clone(),
+                adopter_l_adresse: true,
+                adopter_le_port: false,
             }
         );
     }
@@ -1011,7 +1140,7 @@ mod tests {
             OutputType::Airplay,
         );
         assert_eq!(
-            verdict_doublon_airplay([&gauche].into_iter(), &droite),
+            verdict_doublon_airplay([&gauche].into_iter(), &droite, ANNONCE_RAOP),
             DoublonAirplay::Nouveau
         );
     }
@@ -1033,7 +1162,91 @@ mod tests {
             OutputType::Airplay,
         );
         assert_eq!(
-            verdict_doublon_airplay([&stocke].into_iter(), &nouveau),
+            verdict_doublon_airplay([&stocke].into_iter(), &nouveau, ANNONCE_AIRPLAY),
+            DoublonAirplay::Ignorer
+        );
+    }
+
+    /// #2217 — le port sur lequel la zone parle ne doit pas dépendre de
+    /// l'ordre d'arrivée des annonces mDNS.
+    ///
+    /// L'enceinte est d'abord vue en `_airplay._tcp` (port 7000, le serveur
+    /// AirPlay). Son annonce `_raop._tcp` arrive ensuite, sur 5000 : c'est
+    /// CELUI-LÀ que `AirplayOutput` doit composer, puisque c'est le seul
+    /// protocole qu'il parle. Le verdict `Ignorer` laissait la zone envoyer
+    /// son `ANNOUNCE`/`SETUP` RAOP sur le port du serveur AirPlay.
+    #[test]
+    fn le_port_raop_arrive_en_second_reprend_le_port_du_service_airplay() {
+        let stocke = appareil_sur_port(
+            "airplay-192.168.1.50-7000",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+            7000,
+        );
+        let nouveau = appareil_sur_port(
+            "airplay-80:0A:80:5D:4D:EE",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+            5000,
+        );
+        assert_eq!(
+            verdict_doublon_airplay([&stocke].into_iter(), &nouveau, ANNONCE_RAOP),
+            DoublonAirplay::Reprendre {
+                id_retenu: stocke.id.clone(),
+                adopter_l_adresse: false,
+                adopter_le_port: true,
+            },
+            "le port de `_raop._tcp` est le port du transport RAOP : il ne se \
+             fait pas battre par la course de résolution mDNS (#2217)"
+        );
+    }
+
+    /// La contre-épreuve du sens inverse : une annonce `_airplay._tcp` qui
+    /// arrive après le RAOP ne doit RIEN déplacer. Adopter son port serait
+    /// exactement le défaut, dans l'autre sens.
+    #[test]
+    fn une_annonce_airplay_tardive_ne_deplace_pas_le_port_raop() {
+        let stocke = appareil_sur_port(
+            "airplay-80:0A:80:5D:4D:EE",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+            5000,
+        );
+        let nouveau = appareil_sur_port(
+            "airplay-192.168.1.50-7000",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+            7000,
+        );
+        assert_eq!(
+            verdict_doublon_airplay([&stocke].into_iter(), &nouveau, ANNONCE_AIRPLAY),
+            DoublonAirplay::Ignorer
+        );
+    }
+
+    /// Deux annonces du MÊME service et du même port : rien à reprendre.
+    /// Sans cette garde, `adopter_le_port` pourrait se déclencher à vide et
+    /// faire republier un `DeviceUpdated` à chaque annonce mDNS.
+    #[test]
+    fn un_meme_port_annonce_deux_fois_ne_reprend_rien() {
+        let stocke = appareil(
+            "airplay-80:0A:80:5D:4D:EE",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+        );
+        let nouveau = appareil(
+            "airplay-192.168.1.50-7000",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+        );
+        assert_eq!(
+            verdict_doublon_airplay([&stocke].into_iter(), &nouveau, ANNONCE_RAOP),
             DoublonAirplay::Ignorer
         );
     }
@@ -1054,7 +1267,7 @@ mod tests {
             OutputType::Airplay,
         );
         assert_eq!(
-            verdict_doublon_airplay([&dlna].into_iter(), &nouveau),
+            verdict_doublon_airplay([&dlna].into_iter(), &nouveau, ANNONCE_AIRPLAY),
             DoublonAirplay::Nouveau
         );
     }

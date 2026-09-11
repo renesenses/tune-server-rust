@@ -1,4 +1,4 @@
--- 054_zones_output_endpoint_id.sql
+-- 055_zones_output_endpoint_id.sql
 --
 -- #2269 — l'identifiant d'endpoint STABLE d'une sortie locale, par zone.
 --
@@ -16,7 +16,7 @@
 -- valeur n'est écrite qu'au moment où l'énumération montre l'appareil sous le
 -- nom que la zone porte DÉJÀ.
 --
--- TEXT comme côté SQLite (migration 98) : rien à rattraper dans la parité de
+-- TEXT comme côté SQLite (migration 99) : rien à rattraper dans la parité de
 -- types PostgreSQL.
 --
 -- Idempotent : ADD COLUMN IF NOT EXISTS est sûr à rejouer.
@@ -25,7 +25,7 @@ BEGIN;
 ALTER TABLE zones
     ADD COLUMN IF NOT EXISTS output_endpoint_id TEXT;
 
-INSERT INTO schema_version (version, name) VALUES (54, 'zones_output_endpoint_id')
+INSERT INTO schema_version (version, name) VALUES (55, 'zones_output_endpoint_id')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

@@ -137,6 +137,18 @@ impl AttemptError {
             Self::Json(_) => false,
         }
     }
+
+    /// Le code HTTP du refus, quand il y en a un.
+    ///
+    /// `None` pour une panne réseau ou un corps illisible : ces deux-là ne
+    /// portent aucun code, et les confondre avec un 404 ferait passer une
+    /// coupure de réseau pour une réponse du service (#3820).
+    fn statut_http(&self) -> Option<u16> {
+        match self {
+            Self::Http { status, .. } => Some(*status),
+            Self::Network(_) | Self::Json(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for AttemptError {
@@ -424,6 +436,34 @@ impl QobuzService {
     /// (#2370). Le jeton utilisateur est exigé d'emblée, pour la même raison
     /// que sur les autres favoris : sans lui Qobuz répond OK sans rien
     /// enregistrer.
+    ///
+    /// ## Le 404 du RETRAIT n'est pas une panne (#3820)
+    ///
+    /// FabienM, fil 1749 : `/playlist/subscribe` répond `{"status":"success"}`
+    /// à 15h21:56, et `/playlist/unsubscribe` sur le MÊME `playlist_id`
+    /// (25338101) répond **404 « No result matching given argument »** 35 s
+    /// plus tard. La route amont traduisait tout `Err` en **502**
+    /// (`tune-streaming-http`, `svc_response`), et le client lève un bandeau
+    /// rouge pour toute réponse ≥ 500 même quand l'appelant avale l'erreur
+    /// (`streamingFavorites.ts`, `.catch(() => {})`).
+    ///
+    /// Ce que Qobuz dit par ce 404, c'est **« il n'y a rien à retirer »**. Le
+    /// retrait d'un favori est idempotent par nature — comme un DELETE HTTP :
+    /// l'état visé est « cette playlist n'est pas dans mes souscriptions », et
+    /// il est atteint. Un 404 sur le retrait est donc traité comme un succès.
+    ///
+    /// La garde est **étroite à dessein** : uniquement le retrait, uniquement
+    /// 404, et uniquement à partir du **code HTTP** — jamais du texte du corps,
+    /// que Qobuz est libre de changer. La souscription, elle, continue de
+    /// remonter ses 404 : là, un « rien trouvé » veut dire que la playlist
+    /// n'existe pas et le geste a échoué pour de bon.
+    ///
+    /// ⚠️ Ce que cette garde ne tranche PAS : *pourquoi* Qobuz répond 404 après
+    /// un `subscribe` réussi. Les trois hypothèses de l'issue (playlist dont
+    /// l'utilisateur est propriétaire, autre paramètre attendu, souscription
+    /// pas encore visible) demandent un compte réel ; rien ici n'est testé
+    /// contre l'API de Qobuz. La trace ci-dessous existe pour qu'elles
+    /// deviennent mesurables dans les journaux d'un testeur.
     async fn souscription_playlist(
         &self,
         endpoint: &'static str,
@@ -432,8 +472,19 @@ impl QobuzService {
     ) -> Result<(), TuneError> {
         self.require_user_token(endpoint)?;
         let res = self
-            .api_post(endpoint, &[(PARAM_PLAYLIST_ID, playlist_id)])
+            .api_post_avec_statut(endpoint, &[(PARAM_PLAYLIST_ID, playlist_id)])
             .await;
+        let retrait = endpoint == ENDPOINT_DESOUSCRIPTION_PLAYLIST;
+        if retrait && matches!(res, Err((Some(404), _))) {
+            info!(
+                op,
+                fav_type = TYPE_FAVORI_PLAYLISTS,
+                item_id = playlist_id,
+                "qobuz_playlist_desouscription_deja_absente_3820"
+            );
+            return Ok(());
+        }
+        let res = res.map_err(|(_, message)| message);
         log_favorite_result(op, TYPE_FAVORI_PLAYLISTS, playlist_id, &res);
         res?;
         Ok(())
@@ -1611,6 +1662,28 @@ impl QobuzService {
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
+        self.api_post_avec_statut(path, params)
+            .await
+            .map_err(|(_, message)| message)
+    }
+
+    /// Comme [`Self::api_post`], mais rend AUSSI le code HTTP du refus.
+    ///
+    /// Un seul appelant en a besoin — le retrait d'une souscription de playlist,
+    /// qui doit distinguer « Qobuz dit 404 : il n'y a rien à retirer » d'une
+    /// panne (#3820). Le reste du connecteur passe par [`Self::api_post`], qui
+    /// délègue ici et jette le code : la logique de repli primaire/secondaire
+    /// n'est écrite qu'une fois, et les deux chemins ne peuvent pas diverger.
+    ///
+    /// Le code est lu sur [`AttemptError`] et **jamais** reconstitué en
+    /// relisant le texte de l'erreur : `"qobuz /playlist/unsubscribe: 404 …"`
+    /// contient bien « 404 », mais un corps JSON qui citerait ce nombre le
+    /// contiendrait aussi.
+    async fn api_post_avec_statut(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, (Option<u16>, String)> {
         let (primary, fallback) = self.bases_api();
         match self.api_post_at(primary, path, params).await {
             Ok(v) => Ok(v),
@@ -1618,9 +1691,9 @@ impl QobuzService {
                 log_fallback(self.proxy_first, path, &err);
                 self.api_post_at(fallback, path, params)
                     .await
-                    .map_err(|e| format!("qobuz {path}: {e}"))
+                    .map_err(|e| (e.statut_http(), format!("qobuz {path}: {e}")))
             }
-            Err(err) => Err(format!("qobuz {path}: {err}")),
+            Err(err) => Err((err.statut_http(), format!("qobuz {path}: {err}"))),
         }
     }
 
@@ -5264,6 +5337,115 @@ mod tests_souscription_playlist {
             recus.lock().expect("verrou d'essai").is_empty(),
             "aucune requête ne doit partir sans jeton utilisateur"
         );
+    }
+
+    /// Un serveur qui REFUSE, sous le code demandé, avec le corps exact que
+    /// Qobuz a renvoyé à FabienM le 10/09/2026 à 15h22:31.
+    async fn qobuz_refus_simule(code: u16) -> (String, Recus) {
+        use axum::{Router, http::StatusCode};
+
+        let recus: Recus = Arc::new(Mutex::new(Vec::new()));
+        let vus = recus.clone();
+        let app = Router::new().fallback(move |uri: axum::http::Uri, corps: String| {
+            let vus = vus.clone();
+            async move {
+                vus.lock()
+                    .expect("verrou d'essai")
+                    .push((uri.path().to_string(), corps));
+                (
+                    StatusCode::from_u16(code).expect("code d'essai valide"),
+                    r#"{"status":"error","code":404,"message":"No result matching given argument"}"#,
+                )
+            }
+        });
+
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), recus)
+    }
+
+    #[tokio::test]
+    async fn un_404_sur_le_retrait_vaut_deja_retire_et_non_une_panne() {
+        // #3820 — FabienM, fil 1749 : `/playlist/subscribe` répond
+        // `{"status":"success"}` à 15h21:56 puis `/playlist/unsubscribe` sur le
+        // MÊME identifiant (25338101) répond 404 « No result matching given
+        // argument » 35 s plus tard. La route amont traduisait cet `Err` en
+        // 502, et le client levait un bandeau rouge — sur un geste dont l'état
+        // visé (« cette playlist n'est pas dans mes souscriptions ») est
+        // pourtant ATTEINT.
+        let (base, recus) = qobuz_refus_simule(404).await;
+        let mut svc = service_essai(base);
+
+        svc.remove_favorite("playlists", "25338101")
+            .await
+            .expect("un 404 sur le retrait dit « rien à retirer », pas « panne »");
+
+        let (chemin, corps) = seul_appel(&recus);
+        assert_eq!(
+            chemin, "/playlist/unsubscribe",
+            "la requête doit bel et bien PARTIR : on avale le refus, on ne \
+             court-circuite pas l'appel"
+        );
+        assert!(corps.contains("playlist_id=25338101"), "corps : {corps}");
+    }
+
+    #[tokio::test]
+    async fn un_404_sur_la_souscription_reste_une_erreur() {
+        // La garde est étroite À DESSEIN. Sur la SOUSCRIPTION, « rien trouvé »
+        // veut dire que la playlist n'existe pas : le geste a échoué pour de
+        // bon et l'auditeur doit l'apprendre. Avaler le 404 des deux côtés
+        // rendrait tout cœur silencieusement vert.
+        let (base, _recus) = qobuz_refus_simule(404).await;
+        let mut svc = service_essai(base);
+
+        let err = svc
+            .add_favorite("playlists", "25338101")
+            .await
+            .expect_err("un 404 sur /playlist/subscribe reste un échec")
+            .to_string();
+        assert!(
+            err.contains("404"),
+            "l'erreur doit porter le code rendu par Qobuz. Message : {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_403_sur_le_retrait_reste_une_erreur() {
+        // Seul le 404 est avalé, et il l'est sur le CODE HTTP, jamais sur le
+        // texte du corps. Un 403 (jeton périmé) porte le même corps ici et doit
+        // pourtant remonter : sinon un compte déconnecté paraîtrait retirer
+        // ses favoris.
+        let (base, _recus) = qobuz_refus_simule(403).await;
+        let mut svc = service_essai(base);
+
+        let err = svc
+            .remove_favorite("playlists", "25338101")
+            .await
+            .expect_err("un 403 sur le retrait reste un échec")
+            .to_string();
+        assert!(
+            err.contains("403"),
+            "l'erreur doit porter le code rendu par Qobuz. Message : {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_404_sur_le_retrait_d_un_album_reste_une_erreur() {
+        // La garde vit dans `souscription_playlist` et ne couvre QUE les
+        // playlists : les trois autres types passent par /favorite/delete, dont
+        // la sémantique n'a pas été mesurée. Étendre la tolérance sans mesure
+        // serait une invention.
+        let (base, _recus) = qobuz_refus_simule(404).await;
+        let mut svc = service_essai(base);
+
+        svc.remove_favorite("albums", "0060254776343")
+            .await
+            .expect_err("le retrait d'un album garde son comportement d'avant");
     }
 }
 

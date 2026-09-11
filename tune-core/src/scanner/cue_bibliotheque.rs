@@ -64,6 +64,12 @@ pub struct BilanCue {
     pub pistes_mises_a_jour: usize,
     /// Pistes virtuelles supprimées parce que leur fichier image a disparu.
     pub pistes_elaguees: usize,
+    /// Albums dont le titre a été réconcilié depuis le `TITLE` de la feuille.
+    ///
+    /// Compté à part des créations : un album CUE d'avant la 0.9.144 est titré
+    /// du nom de son FLAC, et rien ne le corrigeait. Ce compteur dit combien de
+    /// lignes un scan a effectivement RENOMMÉES.
+    pub titres_corriges: usize,
     /// Écritures refusées par la base. Jamais fatales : une feuille bancale ne
     /// doit pas emporter le scan.
     pub echecs: usize,
@@ -228,7 +234,7 @@ fn ecrire_album(
         })
         .unwrap_or_else(|| "Album".to_string());
     let annee = album.annee.as_deref().and_then(annee_en_nombre);
-    let ligne_album = match (
+    let ligne = match (
         artist_id,
         album_repo.get_or_create_for_folder(
             &dossier.to_string_lossy(),
@@ -238,14 +244,50 @@ fn ecrire_album(
             None,
         ),
     ) {
-        (Some(_), Ok(a)) => a.id,
+        (Some(_), Ok(a)) => a,
         (_, Err(e)) => {
             warn!(dossier = %dossier.display(), error = %e, "cue_album_non_ecrit");
             bilan.echecs += album.pistes.len();
             return;
         }
-        (None, Ok(a)) => a.id,
+        (None, Ok(a)) => a,
     };
+    let ligne_album = ligne.id;
+
+    // 🔴 LE TITRE DE LA FEUILLE L'EMPORTE SUR CE QUI EST DÉJÀ EN BASE.
+    //
+    // `get_or_create_for_folder` identifie l'album par son DOSSIER. Quand la
+    // ligne existe déjà, il la rend telle quelle : il ne réconcilie que
+    // l'artiste (`reclaim_unknown_artist`), jamais le titre. Un album CUE
+    // indexé AVANT la 0.9.144 avait été vu comme un unique gros FLAC, donc
+    // titré du NOM DE CE FICHIER — et aucun rescan ne pouvait plus le corriger.
+    //
+    // Gros Bidon (Didier), fil forum 1738, le 09/09/2026 : « les feuilles CUE
+    // sont lues et interprétées. Par contre le nom de l'album n'est pas mis à
+    // jour et garde le nom du fichier FLAC. » Il a tout essayé — retirer les
+    // albums, retirer le dossier, vider la bibliothèque — et seule la dernière
+    // a marché, symptôme exact d'une ligne jamais réconciliée.
+    //
+    // On n'écrase QUE si la feuille porte un vrai `TITLE` : `titre_album`
+    // retombe sinon sur le nom du dossier, et remplacer un titre par un repli
+    // serait une régression.
+    if let (Some(id), Some(titre_feuille)) = (ligne_album, album.titre.as_deref()) {
+        let titre_feuille = titre_feuille.trim();
+        if !titre_feuille.is_empty() && ligne.title != titre_feuille {
+            match album_repo.force_update_title(id, titre_feuille) {
+                Ok(()) => {
+                    bilan.titres_corriges += 1;
+                    info!(
+                        album_id = id,
+                        avant = %ligne.title,
+                        apres = %titre_feuille,
+                        "cue_titre_album_reconcilie"
+                    );
+                }
+                Err(e) => warn!(album_id = id, error = %e, "cue_titre_album_non_ecrit"),
+            }
+        }
+    }
 
     // Une sonde par IMAGE, pas par piste : un vinyle en deux faces sonde deux
     // fichiers pour dix pistes.
@@ -315,6 +357,7 @@ fn ecrire_album(
 pub fn inventorier_et_ecrire(
     db: Arc<dyn DbBackend>,
     dossiers: &[PathBuf],
+    racines: &[String],
 ) -> (InventaireCue, BilanCue, HashSet<PathBuf>) {
     let artist_repo = ArtistRepo::with_backend(db.clone());
     let album_repo = AlbumRepo::with_backend(db.clone());
@@ -336,7 +379,7 @@ pub fn inventorier_et_ecrire(
         }
     });
 
-    bilan.pistes_elaguees = elaguer_les_pistes_cue(&track_repo);
+    bilan.pistes_elaguees = elaguer_les_pistes_cue(&track_repo, racines);
 
     if bilan != BilanCue::default() {
         info!(
@@ -354,16 +397,56 @@ pub fn inventorier_et_ecrire(
 
 /// Retire les pistes virtuelles dont le fichier image a disparu.
 ///
-/// ⚠️ **Un dossier absent n'est pas une image effacée.** Un NAS démonté, un
+/// ⚠️ **Un support absent n'est pas une image effacée.** Un NAS démonté, un
 /// disque externe débranché, un partage SMB en panne rendent `exists()` faux
 /// pour TOUTE la bibliothèque — et un élagage naïf effacerait des milliers de
-/// pistes qu'un remontage aurait rendues. La suppression n'a donc lieu que si
-/// le DOSSIER de l'image est toujours là et lisible : dans ce cas, et dans ce
-/// cas seulement, l'absence du fichier est un fait sur le stockage, pas sur le
-/// montage.
+/// pistes qu'un remontage aurait rendues.
+///
+/// 🔴 **Le discriminant est le plus proche ANCÊTRE lisible, pas le dossier
+/// parent.** La première version exigeait que le dossier DE L'IMAGE soit
+/// lisible, et prenait donc « l'utilisateur a effacé le dossier de l'album »
+/// pour « le montage a disparu » — les deux rendent `read_dir` fautif sur ce
+/// dossier-là. Gros Bidon (Didier), fil forum 1738 le 09/09/2026 : « je retire
+/// ces albums de ma bibliothèque et je refais une mise à jour complète.
+/// Malheureusement l'album ne disparait pas. […] J'ai l'impression que la
+/// suppression d'un fichier ou dossier n'est pas toujours vu par Tune. » Il a
+/// dû vider la bibliothèque entière pour s'en sortir.
+///
+/// On remonte donc la chaîne des parents, **bornée à la racine déclarée** : si
+/// un ancêtre répond, le stockage est là et l'absence est un fait réel ; si
+/// aucun ne répond jusqu'à la racine, c'est le montage qui manque.
+///
+/// ⚠️ Ce qui N'EST PAS traité ici, volontairement : une image qui n'est plus
+/// sous aucune racine déclarée. `verdict_purge` la classe `HorsPerimetre` et
+/// REFUSE de la supprimer — protection née de #1943, où un point de montage
+/// changé avait emporté 21 277 pistes de Yacine. Retirer un dossier des
+/// emplacements déclarés ne vide donc pas la bibliothèque, et c'est voulu.
 ///
 /// Rend le nombre de lignes supprimées.
-pub fn elaguer_les_pistes_cue(track_repo: &TrackRepo) -> usize {
+/// Le stockage répond-il quelque part au-dessus de ce dossier ?
+///
+/// Rend `true` dès qu'un ancêtre — le dossier lui-même compris — se laisse
+/// lire. C'est la seule chose qui sépare « ce dossier a été effacé » de « ce
+/// montage n'est pas là » : dans le premier cas le parent répond, dans le
+/// second plus rien ne répond jusqu'à la racine.
+fn un_ancetre_est_lisible(dossier: &Path, racine: &Path) -> bool {
+    let mut courant = Some(dossier);
+    while let Some(d) = courant {
+        if std::fs::read_dir(d).is_ok() {
+            return true;
+        }
+        if d == racine {
+            // 🔴 LA BORNE. Sans elle la remontée atteint `/`, toujours lisible
+            // — et « le montage a disparu » deviendrait indiscernable de « le
+            // fichier a été effacé », soit le défaut qu'on corrige, retourné.
+            return false;
+        }
+        courant = d.parent();
+    }
+    false
+}
+
+pub fn elaguer_les_pistes_cue(track_repo: &TrackRepo, racines: &[String]) -> usize {
     let images = match track_repo.cue_media_paths() {
         Ok(v) => v,
         Err(e) => {
@@ -371,6 +454,12 @@ pub fn elaguer_les_pistes_cue(track_repo: &TrackRepo) -> usize {
             return 0;
         }
     };
+    // Une liste de racines VIDE ne veut pas dire « tout est hors périmètre » :
+    // elle veut dire qu'on ne sait rien. On ne supprime alors RIEN — même
+    // raisonnement que `verdict_purge`, et même raison (#1943).
+    if racines.is_empty() {
+        return 0;
+    }
     let mut dossiers_lisibles: std::collections::HashMap<PathBuf, bool> =
         std::collections::HashMap::new();
     let mut supprimees = 0usize;
@@ -379,12 +468,22 @@ pub fn elaguer_les_pistes_cue(track_repo: &TrackRepo) -> usize {
         if chemin.exists() {
             continue;
         }
+        // Hors de toute racine déclarée : `HorsPerimetre`. On ne supprime pas —
+        // protection de #1943, et c'est ce qui fait que retirer un dossier des
+        // emplacements ne vide pas la bibliothèque.
+        let Some(racine) = racines
+            .iter()
+            .find(|r| crate::metadata::enrich_scope::sous_le_dossier(&image, r))
+        else {
+            continue;
+        };
+        let racine = Path::new(racine.trim_end_matches(['/', '\\']));
         let Some(dossier) = chemin.parent() else {
             continue;
         };
         let lisible = *dossiers_lisibles
             .entry(dossier.to_path_buf())
-            .or_insert_with(|| std::fs::read_dir(dossier).is_ok());
+            .or_insert_with(|| un_ancetre_est_lisible(dossier, racine));
         if !lisible {
             // Support absent : on ne touche à rien.
             continue;
@@ -407,6 +506,15 @@ mod tests {
     use super::*;
     use crate::db::sqlite::SqliteDb;
     use std::fs;
+
+    /// La racine déclarée d'un test : le dossier temporaire lui-même.
+    ///
+    /// L'élagage borne sa remontée à la racine et refuse d'agir hors d'elle
+    /// (#1943). Un test qui n'en passerait aucune n'élaguerait jamais rien —
+    /// et serait vert sans rien prouver.
+    fn racines(racine: &Path) -> Vec<String> {
+        vec![racine.to_string_lossy().into_owned()]
+    }
 
     fn base() -> Arc<dyn DbBackend> {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -453,6 +561,101 @@ mod tests {
         (d, image)
     }
 
+    /// 🔴 LE TITRE DE LA FEUILLE RÉCUPÈRE UN ALBUM TITRÉ DU NOM DU FLAC.
+    ///
+    /// Gros Bidon (Didier), fil forum 1738, 09/09/2026 : « Suite à la mise à
+    /// jour 0.9.144 les feuilles CUE sont lues et interprétées. Par contre le
+    /// nom de l'album n'est pas mis à jour et garde le nom du fichier FLAC. »
+    ///
+    /// C'est l'état de TOUTE bibliothèque montée avant la 0.9.144 : le gros
+    /// FLAC avait été indexé comme un fichier ordinaire et l'album porte son
+    /// nom. `get_or_create_for_folder` identifie l'album par son DOSSIER, donc
+    /// il retrouvait cette ligne et la rendait telle quelle — ne réconciliant
+    /// que l'artiste. Aucun rescan ne pouvait corriger le titre.
+    ///
+    /// Le témoin part de l'état d'AVANT, pas d'une base vierge : c'est tout
+    /// son intérêt. Sur une base vierge le titre est bon du premier coup, et
+    /// scanner deux fois de suite serait vert sans rien prouver.
+    #[test]
+    fn le_titre_de_la_feuille_remplace_le_nom_du_fichier() {
+        let d = tempfile::TempDir::new().unwrap();
+        let (dossier, _) = album_simple(d.path());
+        let db = base();
+        let album_repo = AlbumRepo::with_backend(db.clone());
+
+        // `artist_id` doit désigner une VRAIE ligne : la contrainte de clé
+        // étrangère refuse un 0 d'aisance, et le test échouerait avant même
+        // d'atteindre ce qu'il mesure.
+        let artiste = ArtistRepo::with_backend(db.clone())
+            .get_or_create("Glenn Gould", None, None)
+            .unwrap()
+            .id
+            .unwrap();
+
+        // L'état d'AVANT la 0.9.144 : l'album existe, titré du nom du FLAC.
+        let avant = album_repo
+            .get_or_create_for_folder(&dossier.to_string_lossy(), "image", artiste, None, None)
+            .unwrap();
+        let id = avant.id.unwrap();
+        assert_eq!(avant.title, "image");
+
+        let (_, bilan, _) = inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
+
+        assert_eq!(bilan.titres_corriges, 1, "bilan : {bilan:?}");
+        let apres = album_repo.get(id).unwrap().unwrap();
+        assert_eq!(
+            apres.title, "Goldberg Variations",
+            "le titre de la feuille n'a pas repris la main sur le nom du fichier"
+        );
+        assert_eq!(
+            apres.id,
+            Some(id),
+            "un album de plus a été créé au lieu du renommage"
+        );
+    }
+
+    /// LA CONTRE-ÉPREUVE — une feuille SANS `TITLE` n'écrase rien.
+    ///
+    /// `titre_album` retombe alors sur le nom du dossier. Remplacer un titre
+    /// existant par ce repli serait une régression : on ne renomme que sur un
+    /// vrai `TITLE`.
+    #[test]
+    fn une_feuille_sans_titre_ne_renomme_pas_l_album() {
+        const SANS_TITRE: &str = "PERFORMER \"Glenn Gould\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Aria\"\n    INDEX 01 00:00:00\n";
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = d.path().join("Gould - Goldberg");
+        fs::create_dir_all(&dossier).unwrap();
+        ecrire_wav(&dossier.join("image.wav"), 4_000);
+        fs::write(dossier.join("album.cue"), SANS_TITRE).unwrap();
+
+        let db = base();
+        let album_repo = AlbumRepo::with_backend(db.clone());
+        let artiste = ArtistRepo::with_backend(db.clone())
+            .get_or_create("Glenn Gould", None, None)
+            .unwrap()
+            .id
+            .unwrap();
+        let avant = album_repo
+            .get_or_create_for_folder(
+                &dossier.to_string_lossy(),
+                "Un vrai titre",
+                artiste,
+                None,
+                None,
+            )
+            .unwrap();
+        let id = avant.id.unwrap();
+
+        let (_, bilan, _) = inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
+
+        assert_eq!(bilan.titres_corriges, 0, "bilan : {bilan:?}");
+        assert_eq!(
+            album_repo.get(id).unwrap().unwrap().title,
+            "Un vrai titre",
+            "un repli sur le nom du dossier a écrasé un titre existant"
+        );
+    }
+
     /// LA MOITIÉ QUI PROUVE — le scan ÉCRIT.
     ///
     /// Avant #3631, `grep cue_media_path` ne rendait hors des tests de
@@ -464,7 +667,8 @@ mod tests {
         let (dossier, image) = album_simple(d.path());
         let db = base();
 
-        let (inv, bilan, images) = inventorier_et_ecrire(db.clone(), &[dossier]);
+        let (inv, bilan, images) =
+            inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
 
         assert_eq!(inv.albums, 1);
         assert_eq!(inv.pistes, 2);
@@ -526,7 +730,8 @@ mod tests {
         fs::write(dossier.join("album.cue"), FEUILLE).unwrap(); // pas de .wav
         let db = base();
 
-        let (inv, bilan, images) = inventorier_et_ecrire(db.clone(), &[dossier]);
+        let (inv, bilan, images) =
+            inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
 
         assert_eq!(inv.albums, 0);
         assert_eq!(inv.feuilles_ecartees, 1);
@@ -552,8 +757,9 @@ mod tests {
         let (dossier, _) = album_simple(d.path());
         let db = base();
 
-        let (_, premier, _) = inventorier_et_ecrire(db.clone(), &[dossier.clone()]);
-        let (_, second, _) = inventorier_et_ecrire(db.clone(), &[dossier]);
+        let (_, premier, _) =
+            inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        let (_, second, _) = inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
 
         assert_eq!(premier.pistes_creees, 2);
         assert_eq!(second.pistes_creees, 0, "second scan : {second:?}");
@@ -570,41 +776,111 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()]);
+        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
         assert_eq!(TrackRepo::with_backend(db.clone()).count().unwrap(), 2);
 
         fs::remove_file(&image).unwrap();
         fs::remove_file(dossier.join("album.cue")).unwrap();
-        let (_, bilan, _) = inventorier_et_ecrire(db.clone(), &[dossier]);
+        let (_, bilan, _) = inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
 
         assert_eq!(bilan.pistes_elaguees, 2, "bilan : {bilan:?}");
         assert_eq!(TrackRepo::with_backend(db).count().unwrap(), 0);
     }
 
-    /// LA CONTRE-ÉPREUVE de l'élagage — un NAS démonté n'efface RIEN.
+    /// 🔴 CE TÉMOIN INSCRIVAIT LE DÉFAUT QU'IL CROYAIT GARDER.
     ///
-    /// `exists()` est faux pour toute la bibliothèque quand le support est
-    /// absent. Un élagage naïf viderait des milliers de pistes qu'un remontage
-    /// aurait rendues. La suppression n'a lieu que si le DOSSIER est là.
+    /// Il faisait `remove_dir_all(dossier)` — le dossier de l'ALBUM — et
+    /// exigeait que rien ne soit élagué, au motif que « le dossier entier
+    /// disparu = support démonté ». Or effacer un album, c'est exactement
+    /// effacer son dossier : les deux rendaient `read_dir` fautif au même
+    /// endroit, et le code ne pouvait pas les distinguer.
+    ///
+    /// C'est le défaut rapporté par Gros Bidon (Didier), fil 1738 le
+    /// 09/09/2026 : ses albums CUE effacés du disque restaient en
+    /// bibliothèque, et il a dû la vider entièrement. Un témoin vert pendant
+    /// tout ce temps.
     #[test]
-    fn un_support_absent_n_elague_rien() {
+    fn un_dossier_dalbum_efface_emporte_ses_tranches() {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, _) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()]);
+        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
         let repo = TrackRepo::with_backend(db.clone());
         assert_eq!(repo.count().unwrap(), 2);
 
-        // Le dossier ENTIER disparaît : c'est la signature d'un support
-        // démonté, pas d'un fichier effacé.
+        // L'utilisateur efface l'album. La racine, elle, répond toujours.
         fs::remove_dir_all(&dossier).unwrap();
 
-        assert_eq!(elaguer_les_pistes_cue(&repo), 0);
+        assert_eq!(elaguer_les_pistes_cue(&repo, &racines(d.path())), 2);
+        assert_eq!(
+            repo.count().unwrap(),
+            0,
+            "un album effacé du disque doit quitter la bibliothèque"
+        );
+    }
+
+    /// LA CONTRE-ÉPREUVE — un support démonté n'efface RIEN.
+    ///
+    /// Ici c'est la RACINE DÉCLARÉE qui disparaît, ce que fait un NAS démonté :
+    /// plus rien ne répond jusqu'à elle. La remontée s'arrête à la borne.
+    /// Sans cette borne elle atteindrait `/`, toujours lisible, et viderait la
+    /// bibliothèque au premier démontage.
+    #[test]
+    fn un_support_absent_n_elague_rien() {
+        let d = tempfile::TempDir::new().unwrap();
+        let racine = d.path().join("Musique");
+        fs::create_dir_all(&racine).unwrap();
+        let (dossier, _) = album_simple(&racine);
+        let db = base();
+        let rac = vec![racine.to_string_lossy().into_owned()];
+        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &rac);
+        let repo = TrackRepo::with_backend(db.clone());
+        assert_eq!(repo.count().unwrap(), 2);
+
+        // Le montage entier s'en va : la racine déclarée n'est plus là.
+        fs::remove_dir_all(&racine).unwrap();
+
+        assert_eq!(elaguer_les_pistes_cue(&repo, &rac), 0);
         assert_eq!(
             repo.count().unwrap(),
             2,
             "un support absent ne doit JAMAIS vider la bibliothèque"
         );
+    }
+
+    /// #1943 — hors périmètre n'est pas « disparu ».
+    ///
+    /// Retirer un dossier des emplacements déclarés ne supprime RIEN : c'est la
+    /// protection née des 21 277 pistes de Yacine, effacées par un point de
+    /// montage qui avait changé. Didier s'attendait au contraire (fil 1738) —
+    /// c'est bien le comportement voulu, pas un défaut.
+    #[test]
+    fn un_dossier_retire_des_emplacements_ne_supprime_rien() {
+        let d = tempfile::TempDir::new().unwrap();
+        let (dossier, image) = album_simple(d.path());
+        let db = base();
+        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        let repo = TrackRepo::with_backend(db.clone());
+        assert_eq!(repo.count().unwrap(), 2);
+
+        fs::remove_file(&image).unwrap();
+        let ailleurs = vec![d.path().join("Autre").to_string_lossy().into_owned()];
+
+        assert_eq!(elaguer_les_pistes_cue(&repo, &ailleurs), 0);
+        assert_eq!(repo.count().unwrap(), 2, "hors périmètre = protégé");
+    }
+
+    /// Une liste de racines vide ne veut pas dire « tout est hors périmètre ».
+    #[test]
+    fn sans_racine_connue_on_ne_supprime_rien() {
+        let d = tempfile::TempDir::new().unwrap();
+        let (dossier, image) = album_simple(d.path());
+        let db = base();
+        inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
+        let repo = TrackRepo::with_backend(db.clone());
+        fs::remove_file(&image).unwrap();
+        assert_eq!(elaguer_les_pistes_cue(&repo, &[]), 0);
+        assert_eq!(repo.count().unwrap(), 2);
     }
 
     #[test]

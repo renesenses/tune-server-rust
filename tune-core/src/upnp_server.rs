@@ -84,6 +84,48 @@ pub fn radio_audio_url(base_url: &str, radio_id: i64) -> String {
     format!("{base_url}{API_PATH}/radios/{radio_id}/audio.wav")
 }
 
+/// URL Tune de la POCHETTE d'une station — la moitie de #1800 que le correctif
+/// `5d123568` n'avait pas faite.
+///
+/// #1800 reproche au dossier Radio de publier « l'URL du diffuseur, pas celle
+/// de Tune », et note que « toutes les autres branches du serveur media
+/// servent une URL Tune ». `5d123568` a corrige le `<res>` ; il n'a pas touche
+/// a `<upnp:albumArtURI>`, qui restait la DERNIERE adresse externe publiee par
+/// le serveur media. Mesure sur le DIDL emis par une base fraichement migree :
+/// 50 stations livrees, dont **25 portent un `logo_url`** — et les 25 le
+/// publiaient `https://mozaiklabs.fr/storage/radio-logos/*.png` tel quel au
+/// renderer. Les 25 autres n'ont pas de logo et n'emettent pas la balise.
+///
+/// Le relais existe pourtant deja, et un seul consommateur s'en sert. Le
+/// commentaire de `refresh_radio_logos`
+/// (`tune-server/src/routes/radios.rs`) le dit mot pour mot : « The web client
+/// proxies that URL through the LOCAL server (`artworkUrl` ->
+/// `/library/artwork/proxy`) ». Le client web passe par le relais, le serveur
+/// media non.
+///
+/// Deux formes de `logo_url` existent en base, et la seconde etait publiee
+/// TELLE QUELLE :
+/// * une URL absolue de l'annuaire (`refresh_radio_logos`) — relayee ici ;
+/// * un **condensat nu** du cache de pochettes, ecrit par
+///   `set_radio_artwork` (`radio.logo_url = Some(hash)`). Un condensat n'est
+///   pas une URI : `<upnp:albumArtURI>01KV5Z...</upnp:albumArtURI>` n'est
+///   resolvable par aucun point de controle. [`artwork_url`] sait deja le
+///   changer en URL Tune — c'est ce qu'il fait pour la pochette d'une piste.
+pub fn radio_logo_url(base_url: &str, logo: &str) -> String {
+    let logo = logo.trim();
+    if logo.starts_with("http://") || logo.starts_with("https://") {
+        // Deja servi par nous : ne pas relayer notre propre adresse.
+        if logo.starts_with(base_url) {
+            return logo.to_string();
+        }
+        return format!(
+            "{base_url}{API_PATH}/library/artwork/proxy?url={}",
+            urlencoding::encode(logo)
+        );
+    }
+    artwork_url(base_url, logo)
+}
+
 #[derive(Clone)]
 pub struct UpnpState {
     pub backend: Arc<dyn DbBackend>,
@@ -201,7 +243,13 @@ pub fn build_device_description(state: &UpnpState) -> String {
     </serviceList>
   </device>
 </root>"#,
-        friendly = state.friendly_name,
+        // Le nom est réglable (`upnp_friendly_name`, POST
+        // /api/v1/upnp/config) et partait ICI sans échappement : une
+        // esperluette ou un chevron dans « Salon & Cuisine » rendait
+        // `description.xml` illégal, et un point de contrôle strict — JPLAY
+        // décrit et appaire le serveur AVANT d'indexer (#2183) — ne peut alors
+        // plus décrire le MediaServer du tout.
+        friendly = crate::outputs::didl::escape_sain(&state.friendly_name),
         version = crate::version(),
         uuid = state.uuid,
         base = base,
@@ -1673,6 +1721,45 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                     Some(liste.track_count as u64),
                 )
             }),
+        // Un `<item>` publie doit savoir se decrire, exactement comme un
+        // conteneur. ContentDirectory:1 ne fait aucune difference : « If
+        // BrowseFlag is BrowseMetadata, ObjectID identifies the object to
+        // return metadata for » — n'importe quel objet, item compris.
+        //
+        // `radio/N` et `track/N` tombaient dans le bras par defaut et
+        // rendaient un DIDL VIDE avec `NumberReturned = 0`, sans fault : le
+        // point de controle recoit « cet objet existe et n'a pas de
+        // metadonnees », ce qui n'est pas une reponse prevue. Le trou etait
+        // deja constate dans le test
+        // [`tests::chaque_rayon_de_la_racine_s_ouvre_par_soap`], qui SAUTAIT
+        // les items pour cette raison (« C'est un trou reel du contrat CDS:1
+        // [...] Constate, pas corrige »). Le `continue` a ete retire avec ce
+        // correctif.
+        //
+        // C'est le mode d'echec type d'un indexeur (#2183, JPLAY iOS) :
+        // parcourir par `Browse`, puis valider chaque objet par
+        // `BrowseMetadata`. Un objet publie qui ne se decrit pas fait echouer
+        // l'indexation sans que rien ne soit journalise.
+        id if id.starts_with("radio/") => id
+            .strip_prefix("radio/")
+            .and_then(|n| n.parse::<i64>().ok())
+            .and_then(|radio_id| {
+                RadioRepo::with_backend(state.backend.clone())
+                    .get(radio_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|station| didl_radio_item(&station, &state.base_url())),
+        id if id.starts_with("track/") => id
+            .strip_prefix("track/")
+            .and_then(|n| n.parse::<i64>().ok())
+            .and_then(|track_id| {
+                TrackRepo::with_backend(state.backend.clone())
+                    .get(track_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|track| didl_track_item(&track, "tracks", &state.base_url())),
         _ => None,
     };
 
@@ -2311,13 +2398,13 @@ fn didl_albums_under(
         if let Some(ref artist_name) = album.artist_name {
             extra.push_str(&format!(
                 "<dc:creator>{}</dc:creator>",
-                quick_xml::escape::escape(artist_name)
+                crate::outputs::didl::escape_sain(artist_name)
             ));
         }
         if let Some(ref cover) = album.cover_path {
             extra.push_str(&format!(
                 "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                quick_xml::escape::escape(&artwork_url(base_url, cover))
+                crate::outputs::didl::escape_sain(&artwork_url(base_url, cover))
             ));
         }
         inner.push_str(&didl_container_ext(
@@ -2383,49 +2470,83 @@ fn browse_radios(state: &UpnpState, start: u64, count: u64) -> DidlResult {
 
 /// Le DIDL d'une liste de stations. `Browse` et `Search` passent par ici.
 ///
-/// L'item est bâti sur le même patron que celui d'une piste
-/// ([`crate::outputs::didl::DidlBuilder::build_item`], qui sert « All Tracks »
-/// — la rubrique que le ND8006 affiche correctement) :
-///
-/// * `restricted="1"` : attribut OBLIGATOIRE d'un objet DIDL-Lite. Les items de
-///   « All Tracks » le portent depuis toujours ; ceux du dossier Radio, jamais.
-/// * la pochette AVANT le `<res>` : la séquence DIDL-Lite ferme l'objet par ses
-///   `<res>`, après les propriétés. `didl_radios` était le seul émetteur du
-///   fichier à publier `<upnp:albumArtURI>` APRÈS — et depuis la
-///   synchronisation de l'annuaire de logos, 45 des 49 stations d'une base
-///   fraîche en portent une, donc 45 items sur 49 hors séquence.
+/// L'item est bati par [`didl_radio_item`], c'est-a-dire par le constructeur
+/// PARTAGE avec les pistes — ce que ce commentaire affirmait deja alors que le
+/// XML etait encore ecrit a la main juste en dessous. Voir la note de
+/// [`didl_radio_item`] pour ce que cette main manquait.
 fn didl_radios(stations: &[crate::db::radio_repo::RadioStation], base: &str) -> DidlResult {
     let mut inner = String::new();
     for station in stations {
-        let id = format!("radio/{}", station.id.unwrap_or(0));
-        let mut props = String::new();
-        if let Some(ref logo) = station.logo_url {
-            props.push_str(&format!(
-                "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                quick_xml::escape::escape(logo)
-            ));
-        }
-        let url = radio_audio_url(base, station.id.unwrap_or(0));
-        inner.push_str(&format!(
-            "<item id=\"{id}\" parentID=\"radios\" restricted=\"1\">\
-             <dc:title>{title}</dc:title>\
-             <upnp:class>object.item.audioItem.audioBroadcast</upnp:class>\
-             {props}\
-             <res protocolInfo=\"http-get:*:audio/wav:*\">{url}</res>\
-             </item>",
-            id = quick_xml::escape::escape(&id),
-            title = quick_xml::escape::escape(&station.name),
-            props = props,
-            url = quick_xml::escape::escape(&url),
-        ));
+        inner.push_str(&didl_radio_item(station, base));
     }
-
     let total = stations.len() as u64;
     DidlResult {
         xml: didl_wrap(&inner),
         total,
         returned: total,
     }
+}
+
+/// La classe DIDL d'une station. Elle reste `audioBroadcast` : c'est la valeur
+/// que [`CLASSES_PUBLIEES`] declare, et c'est par elle qu'un `Search` vise le
+/// dossier Radio (#1777, #2907). La changer rendrait la table menteuse et
+/// ferait disparaitre les radios de la recherche.
+const RADIO_UPNP_CLASS: &str = "object.item.audioItem.audioBroadcast";
+
+/// Le type MIME que la route `/{id}/audio.wav` sert reellement
+/// (`tune-server/src/routes/radios.rs`, `live_radio_head_response("audio/wav", ..)`).
+const RADIO_MIME: &str = "audio/wav";
+
+/// L'`<item>` d'UNE station, bati par le constructeur PARTAGE.
+///
+/// Le commentaire de `didl_radios` affirmait deja que l'item d'une station
+/// etait « bati sur le meme patron que celui d'une piste
+/// ([`crate::outputs::didl::DidlBuilder::build_item`]) ». Il ne l'etait pas :
+/// le XML etait ecrit a la main, et cette main manquait trois choses que le
+/// constructeur donne a tous les autres items du serveur :
+///
+/// 1. **`escape_sain`**. Le titre passait par `quick_xml::escape::escape` nu,
+///    qui n'ote pas les caracteres de controle. La note en tete de
+///    `outputs/didl.rs` dit ce que ca coute : « XML 1.0 interdit les
+///    caracteres de controle [...] npupnp (upmpdcli — HiFiMAN Serenade de
+///    Tades) repond alors 401 "Invalid Action" : son parseur echoue sur le
+///    CORPS, pas sur l'action. » Un seul NUL dans UN nom de station — et les
+///    noms viennent d'imports Radio Browser, du texte libre — rendait donc
+///    illegale l'enveloppe SOAP ENTIERE, soit un dossier Radio vide sans une
+///    ligne de journal. `didl_radios` etait le dernier emetteur d'item audio
+///    du depot a ne pas etre protege.
+/// 2. **[`crate::outputs::didl::DidlBuilder::live_stream`]**, ecrite pour la
+///    radio et jamais atteinte par le serveur media : un flux infini ne doit
+///    annoncer ni `duration=` ni `size=`. « Ecrit mais pas branche » —
+///    `.live_stream(` n'avait que deux appelants, tous deux dans le chemin
+///    PUSH (`outputs/dlna.rs`), aucun dans le serveur media.
+/// 3. **un seul emetteur**. Toute correction de conformite posee sur les items
+///    de piste sautait le dossier Radio, parce qu'il ne partageait pas leur
+///    code. C'est ce qui a fait durer #2103 six versions.
+///
+/// La sortie ne change QUE par ce qui etait faux : la classe reste
+/// `audioBroadcast`, le `protocolInfo` reste `http-get:*:audio/wav:*`
+/// ([`crate::outputs::didl::ProtocolStyle::Simple`], le style de tout le
+/// serveur media), et la pochette reste AVANT le `<res>`.
+fn didl_radio_item(station: &crate::db::radio_repo::RadioStation, base: &str) -> String {
+    let id = format!("radio/{}", station.id.unwrap_or(0));
+    let logo = station
+        .logo_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| radio_logo_url(base, l));
+    crate::outputs::didl::DidlBuilder::new(
+        &station.name,
+        &radio_audio_url(base, station.id.unwrap_or(0)),
+        RADIO_MIME,
+    )
+    .item_id(&id)
+    .parent_id("radios")
+    .upnp_class(RADIO_UPNP_CLASS)
+    .live_stream(true)
+    .album_art_opt(logo.as_deref())
+    .build_item()
 }
 
 fn browse_artist_albums(state: &UpnpState, artist_id: i64, base_url: &str) -> DidlResult {
@@ -2441,7 +2562,7 @@ fn browse_artist_albums(state: &UpnpState, artist_id: i64, base_url: &str) -> Di
         if let Some(ref cover) = album.cover_path {
             extra.push_str(&format!(
                 "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                quick_xml::escape::escape(&artwork_url(base_url, cover))
+                crate::outputs::didl::escape_sain(&artwork_url(base_url, cover))
             ));
         }
         inner.push_str(&didl_container_ext(
@@ -2502,6 +2623,30 @@ fn didl_container(
     didl_container_ext(id, parent_id, title, class, child_count, "")
 }
 
+/// L'`<container>` du serveur média — l'UNIQUE émetteur de conteneurs du
+/// fichier, appelé par la racine, les artistes, les albums, les genres, les
+/// années et les listes de lecture.
+///
+/// Deux manques, tous deux mesurés sur le DIDL réellement émis :
+///
+/// 1. **`restricted` est OBLIGATOIRE.** L'annexe B de ContentDirectory:1 le
+///    déclare `use="required"` sur `container` comme sur `item`. Le dépôt
+///    connaissait la règle et ne l'appliquait qu'aux items :
+///    [`crate::outputs::didl::DidlBuilder::build_item`] écrit
+///    `restricted="1"`, et le test
+///    `un_item_de_station_est_bati_comme_un_item_de_piste` l'exige d'une
+///    station. Aucun conteneur ne l'a jamais porté — la mesure
+///    d'origine, `Browse(artists)` : `<container id="artist/1"
+///    parentID="artists" childCount="1">`. Un point de contrôle qui valide
+///    contre le schéma rejette l'objet, donc le dossier.
+/// 2. **le texte libre passait par `quick_xml::escape::escape` nu.** Un nom
+///    d'artiste, un titre d'album, un genre ou un nom de liste vient des tags
+///    du fichier ; XML 1.0 y interdit les caractères de contrôle, et un
+///    séparateur NUL d'ID3v2.4 rendait l'enveloppe SOAP ENTIÈRE illégale —
+///    npupnp répond alors 401 « Invalid Action », son parseur ayant échoué sur
+///    le CORPS. C'est la note en tête de `outputs/didl.rs`. Elle avait été
+///    appliquée à tous les émetteurs d'ITEMS ; la porte conteneur est restée
+///    ouverte, et c'est celle par où passent les noms de tags.
 fn didl_container_ext(
     id: &str,
     parent_id: &str,
@@ -2510,18 +2655,19 @@ fn didl_container_ext(
     child_count: Option<u64>,
     extra_xml: &str,
 ) -> String {
+    use crate::outputs::didl::escape_sain;
     let cc = child_count
         .map(|c| format!(" childCount=\"{c}\""))
         .unwrap_or_default();
     format!(
-        "<container id=\"{id}\" parentID=\"{pid}\"{cc}>\
+        "<container id=\"{id}\" parentID=\"{pid}\" restricted=\"1\"{cc}>\
          <dc:title>{title}</dc:title>\
          <upnp:class>{class}</upnp:class>\
          {extra}\
          </container>",
-        id = quick_xml::escape::escape(id),
-        pid = quick_xml::escape::escape(parent_id),
-        title = quick_xml::escape::escape(title),
+        id = escape_sain(id),
+        pid = escape_sain(parent_id),
+        title = escape_sain(title),
         class = class,
         extra = extra_xml,
     )
@@ -3010,7 +3156,8 @@ mod tests {
                 "le dossier {genre:?} annonce {annonce} et ouvre {ouvert}"
             );
             // Le nombre doit être DANS le DIDL, porté par ce conteneur-là.
-            let attendu = format!("id=\"{id}\" parentID=\"genres\" childCount=\"{ouvert}\"");
+            let attendu =
+                format!("id=\"{id}\" parentID=\"genres\" restricted=\"1\" childCount=\"{ouvert}\"");
             assert!(
                 liste.xml.contains(&attendu),
                 "la liste n'annonce pas la taille de {genre:?} : {}",
@@ -3302,7 +3449,8 @@ mod tests {
             );
 
             // Le nombre doit être DANS le DIDL, porté par ce conteneur-là.
-            let attendu = format!("id=\"{id}\" parentID=\"0\" childCount=\"{ouvert}\"");
+            let attendu =
+                format!("id=\"{id}\" parentID=\"0\" restricted=\"1\" childCount=\"{ouvert}\"");
             assert!(
                 racine.xml.contains(&attendu),
                 "la racine n'annonce pas la taille du rayon {id} ({titre}) : {}",
@@ -3352,7 +3500,8 @@ mod tests {
         let ouvert = browse_direct_children(&state, &conteneur, 0, 100).total;
         assert_eq!(ouvert, 2, "l'album masqué ne doit pas s'ouvrir");
 
-        let attendu = format!("id=\"{conteneur}\" parentID=\"artists\" childCount=\"2\"");
+        let attendu =
+            format!("id=\"{conteneur}\" parentID=\"artists\" restricted=\"1\" childCount=\"2\"");
         let liste = browse_direct_children(&state, "artists", 0, 100);
         assert!(
             liste.xml.contains(&attendu),
@@ -3793,17 +3942,11 @@ mod tests {
                     "un <{balise}> du rayon {id} ({titre}) est publié sans \
                      identifiant : il est inatteignable au Browse suivant — {didl}"
                 );
-                if balise != "container" {
-                    // Un `<item>` est terminal : il porte son `<res>`, le point
-                    // de contrôle le lit dans la liste. `browse_metadata` ne
-                    // décrit AUJOURD'HUI que des conteneurs — `track/N` et
-                    // `radio/N` y tombent dans le bras par défaut et rendent un
-                    // DIDL vide. C'est un trou réel du contrat CDS:1, mais
-                    // c'est un AUTRE sujet que #2971 : l'élargir ici toucherait
-                    // le chemin de lecture que des testeurs utilisent en ce
-                    // moment. Constaté, pas corrigé.
-                    continue;
-                }
+                // Le `continue` qui sautait les `<item>` est parti : depuis
+                // ce correctif, `browse_metadata` decrit `track/N` et
+                // `radio/N` comme il decrit les conteneurs. Item ou conteneur,
+                // ContentDirectory:1 exige la meme chose — tout objet publie
+                // doit savoir se decrire.
                 let fils =
                     build_browse_response(&state, &corps_browse(enfant_id, "BrowseMetadata"));
                 assert!(
@@ -3818,6 +3961,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ContentDirectory:1 : **tout objet publie doit savoir se decrire**, item
+    /// comme conteneur. « If BrowseFlag is BrowseMetadata, ObjectID identifies
+    /// the object to return metadata for » — la specification ne distingue pas.
+    ///
+    /// `browse_metadata` ne connaissait que des conteneurs. `track/N` et
+    /// `radio/N`, pourtant publies par le Browse juste au-dessus, tombaient
+    /// dans le bras par defaut et rendaient un DIDL VIDE avec
+    /// `NumberReturned = 0` — sans fault, donc sans que rien ne le signale.
+    /// C'est le mode d'echec type d'un indexeur qui parcourt par `Browse` puis
+    /// valide chaque objet par `BrowseMetadata` (#2183, JPLAY iOS : « le
+    /// MediaServer est vu, decrit et appaire, mais l'indexation echoue »).
+    ///
+    /// TEMOINS, verts des deux cotes : un CONTENEUR se decrivait deja (c'est
+    /// la moitie qui marchait), et un identifiant INCONNU doit continuer a ne
+    /// rien rendre — sans quoi ce test passerait au vert pour la mauvaise
+    /// raison, en decrivant n'importe quoi.
+    #[test]
+    fn un_item_publie_sait_se_decrire_par_browse_metadata() {
+        let (state, _, _, _, _) = state_complet();
+
+        // --- TEMOIN 1 : un conteneur se decrivait deja.
+        let conteneur = build_browse_response(&state, &corps_browse("artists", "BrowseMetadata"));
+        assert_eq!(
+            champ_reponse(&conteneur, "NumberReturned"),
+            "1",
+            "temoin conteneur : {conteneur}"
+        );
+
+        // --- LE FAIT DE BASE : chaque ITEM publie par un rayon se decrit.
+        for rayon in ["tracks", "radios"] {
+            let liste = build_browse_response(&state, &corps_browse(rayon, "BrowseDirectChildren"));
+            let enfants = enfants_du_didl(&didl_de_la_reponse(&liste));
+            let items: Vec<_> = enfants
+                .iter()
+                .filter(|(balise, _)| balise != "container")
+                .collect();
+            assert!(
+                !items.is_empty(),
+                "le rayon {rayon} ne publie aucun item : {liste}"
+            );
+            for (_, item_id) in items {
+                let fiche = build_browse_response(&state, &corps_browse(item_id, "BrowseMetadata"));
+                assert!(
+                    !is_soap_fault(&fiche),
+                    "BrowseMetadata({item_id}) rend un fault : {fiche}"
+                );
+                assert_eq!(
+                    champ_reponse(&fiche, "NumberReturned"),
+                    "1",
+                    "l'objet {item_id} est publie par le rayon {rayon} mais ne \
+                     sait pas se decrire : {fiche}"
+                );
+                let didl = didl_de_la_reponse(&fiche);
+                assert!(
+                    didl.contains(&format!("id=\"{item_id}\"")),
+                    "BrowseMetadata({item_id}) decrit un AUTRE objet : {didl}"
+                );
+            }
+        }
+
+        // --- TEMOIN 2 : un identifiant inconnu ne se decrit toujours pas.
+        let inconnu =
+            build_browse_response(&state, &corps_browse("radio/999999", "BrowseMetadata"));
+        assert_eq!(
+            champ_reponse(&inconnu, "NumberReturned"),
+            "0",
+            "un objet inexistant ne doit rien decrire : {inconnu}"
+        );
     }
 
     /// Témoin anti-régression : le trajet SOAP ne doit RIEN changer au DIDL.
@@ -4352,6 +4565,195 @@ mod tests {
         assert!(xml.contains("application/x-dsd"), "{xml}");
         assert!(!xml.contains("audio/flac"), "{xml}");
         assert!(xml.contains("sampleFrequency=\"2822400\""), "{xml}");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2183, #1800, #2103 — ce que le serveur media publie doit d'abord
+    // PARSER, et se conformer au schema, chez un point de controle strict.
+    // -----------------------------------------------------------------------
+
+    /// Le document est-il du XML 1.0 bien forme ? Rendu par un VRAI parseur —
+    /// c'est ce que fait le point de controle, et une comparaison de chaine ne
+    /// mesure pas la meme chose.
+    fn xml_bien_forme(xml: &str) -> Result<(), String> {
+        let mut lecteur = quick_xml::Reader::from_str(xml);
+        lecteur.config_mut().check_end_names = true;
+        loop {
+            match lecteur.read_event() {
+                Ok(quick_xml::events::Event::Eof) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+
+    /// Le DIDL tel que le point de controle le lit : le contenu de `<Result>`,
+    /// des-echappe une fois. On mesure la SORTIE observable du trajet SOAP
+    /// complet, jamais la fonction qui l'a produite.
+    fn didl_du_soap(reponse: &str) -> String {
+        let debut = reponse
+            .find("<Result>")
+            .expect("pas de <Result> dans la reponse SOAP")
+            + "<Result>".len();
+        let fin = reponse.find("</Result>").expect("pas de </Result>");
+        quick_xml::escape::unescape(&reponse[debut..fin])
+            .expect("le contenu de <Result> n'est pas echappe correctement")
+            .into_owned()
+    }
+
+    /// La valeur du premier attribut `id` d'un en-tete `<container …`.
+    fn id_du_conteneur(entete: &str) -> Option<String> {
+        let reste = entete.strip_prefix("id=\"")?;
+        let fin = reste.find('"')?;
+        Some(
+            quick_xml::escape::unescape(&reste[..fin])
+                .ok()?
+                .into_owned(),
+        )
+    }
+
+    /// `restricted` est OBLIGATOIRE sur un objet DIDL-Lite, conteneur compris.
+    ///
+    /// Mesure d'origine, avant correctif, sur `Browse(artists)` :
+    /// `<container id="artist/1" parentID="artists" childCount="1">`. Les
+    /// ITEMS le portaient depuis toujours ; aucun CONTENEUR ne l'a jamais
+    /// porte. Le test descend l'arbre reel du serveur media par SOAP et
+    /// n'accepte aucune exception.
+    #[test]
+    fn aucun_conteneur_publie_ne_sort_sans_l_attribut_restricted() {
+        let (state, _, _, _, _) = state_complet();
+        let mut a_visiter = vec!["0".to_string()];
+        let mut conteneurs_vus = 0usize;
+        for _profondeur in 0..3 {
+            let mut suivants = Vec::new();
+            for oid in &a_visiter {
+                for drapeau in ["BrowseDirectChildren", "BrowseMetadata"] {
+                    let didl =
+                        didl_du_soap(&build_browse_response(&state, &corps_browse(oid, drapeau)));
+                    if let Err(e) = xml_bien_forme(&didl) {
+                        panic!("{drapeau}({oid}) rend un DIDL illisible : {e}\n{didl}");
+                    }
+                    for bout in didl.split("<container ").skip(1) {
+                        let entete = &bout[..bout.find('>').expect("en-tete non ferme")];
+                        conteneurs_vus += 1;
+                        assert!(
+                            entete.contains(" restricted=\""),
+                            "{drapeau}({oid}) publie un conteneur SANS l'attribut \
+                             obligatoire restricted : <container {entete}>"
+                        );
+                        if drapeau == "BrowseDirectChildren" {
+                            if let Some(id) = id_du_conteneur(entete) {
+                                suivants.push(id);
+                            }
+                        }
+                    }
+                }
+            }
+            a_visiter = suivants;
+        }
+        // Temoin : sans lui, un arbre vide rendrait ce test vert contre rien.
+        assert!(
+            conteneurs_vus >= 8,
+            "l'arbre parcouru ne porte que {conteneurs_vus} conteneurs : \
+             le test ne mesure plus rien"
+        );
+    }
+
+    /// Un caractere de controle dans un nom de TAG ne doit pas vider un
+    /// dossier.
+    ///
+    /// XML 1.0 les interdit et `quick_xml::escape::escape` ne les ote pas :
+    /// un separateur NUL d'ID3v2.4 dans un nom d'artiste ou un titre d'album
+    /// rendait l'enveloppe SOAP entiere illegale. npupnp (upmpdcli) repond
+    /// alors 401 « Invalid Action » — son parseur echoue sur le CORPS — et le
+    /// dossier se lit vide, sans une ligne de journal. Le correctif de #3771
+    /// avait ferme cette porte pour les ITEMS ; les CONTENEURS, ou entrent
+    /// justement les noms d'artistes, d'albums et de genres, restaient
+    /// ouverts.
+    #[test]
+    fn un_caractere_de_controle_dans_un_nom_de_tag_ne_vide_pas_le_dossier() {
+        use crate::db::models::{Album, Artist};
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let artiste_id = ArtistRepo::with_backend(backend.clone())
+            .create(&Artist::new("Miles\u{0}Davis".into()))
+            .unwrap();
+        let mut album = Album::new("Kind of\u{1}Blue".into());
+        album.artist_id = Some(artiste_id);
+        album.genre = Some("Ja\u{0}zz".into());
+        AlbumRepo::with_backend(backend.clone())
+            .create(&album)
+            .unwrap();
+        let state = UpnpState::new(backend, 8888, Some("192.168.1.18".into()));
+
+        let interdit = |c: char| !matches!(c, '\t' | '\n' | '\r') && c < '\u{20}';
+        for rayon in ["artists", "albums", "genres"] {
+            let reponse =
+                build_browse_response(&state, &corps_browse(rayon, "BrowseDirectChildren"));
+            let fautifs: Vec<u32> = reponse
+                .chars()
+                .filter(|c| interdit(*c))
+                .map(|c| c as u32)
+                .collect();
+            assert!(
+                fautifs.is_empty(),
+                "la reponse SOAP du rayon {rayon} porte des caracteres interdits \
+                 par XML 1.0 ({fautifs:?}) : un parseur strict rejette le CORPS \
+                 entier et le dossier se lit vide"
+            );
+            let didl = didl_du_soap(&reponse);
+            if let Err(e) = xml_bien_forme(&didl) {
+                panic!("le DIDL du rayon {rayon} ne parse pas : {e}\n{didl}");
+            }
+            // Temoin : le dossier n'est pas vide non plus — le correctif ne
+            // doit pas « assainir » en supprimant l'entree.
+            assert!(
+                reponse.contains("<NumberReturned>1</NumberReturned>"),
+                "le rayon {rayon} s'ouvre vide : {reponse}"
+            );
+        }
+    }
+
+    /// Le nom du serveur est reglable — il n'etait pas echappe dans
+    /// `description.xml`.
+    ///
+    /// `upnp_friendly_name` (POST /api/v1/upnp/config) part tel quel dans
+    /// `<friendlyName>`. « Salon & Cuisine » suffit a rendre le descriptif
+    /// illegal. Or #2183 tient sur cette etape : « le MediaServer est vu,
+    /// DECRIT et appaire » — un point de controle qui ne parse pas le
+    /// descriptif ne voit pas le serveur du tout.
+    #[test]
+    fn le_nom_du_serveur_ne_casse_plus_son_descriptif() {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        crate::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set("upnp_friendly_name", "Salon & Cuisine <Tune>")
+            .unwrap();
+        let state = UpnpState::new(backend, 8888, Some("192.168.1.18".into()));
+
+        let descriptif = build_device_description(&state);
+        if let Err(e) = xml_bien_forme(&descriptif) {
+            panic!("description.xml ne parse plus : {e}\n{descriptif}");
+        }
+        assert!(
+            descriptif.contains("<friendlyName>Salon &amp; Cuisine &lt;Tune&gt;</friendlyName>"),
+            "le nom du serveur n'est pas echappe : {descriptif}"
+        );
+        // Temoin : un nom ordinaire traverse inchange.
+        let db2 = SqliteDb::open_in_memory().unwrap();
+        db2.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db2).unwrap();
+        let state2 = UpnpState::new(Arc::new(db2), 8888, Some("192.168.1.18".into()));
+        assert!(
+            build_device_description(&state2).contains("<friendlyName>Tune Server</friendlyName>"),
+            "le nom par defaut a bouge"
+        );
     }
 }
 
@@ -5256,6 +5658,179 @@ mod ssdp_msearch_tests {
             premier_objet(&page2),
             "StartingIndex est ignore : les deux pages commencent sur le meme \
              objet.\npage 1 : {page1}\npage 2 : {page2}"
+        );
+    }
+
+    /// #1800, la moitie que `5d123568` n'a pas faite : **aucune adresse
+    /// externe ne doit sortir du dossier Radio.**
+    ///
+    /// Le titre du ticket est « le dossier Radio publie l'URL du diffuseur,
+    /// pas celle de Tune », et son corps note que « toutes les autres branches
+    /// du serveur media servent une URL Tune ». Le correctif de la v0.9.118 a
+    /// refait le `<res>` ; il n'a jamais touche a `<upnp:albumArtURI>`, qui
+    /// restait la derniere adresse externe publiee. Mesure sur le DIDL emis
+    /// par une base fraichement migree : 50 stations livrees, dont **25
+    /// portent un `logo_url`** — et les 25 le publiaient
+    /// `https://mozaiklabs.fr/storage/radio-logos/*.png` tel quel au renderer.
+    ///
+    /// Le relais existe pourtant, et le client WEB s'en sert deja — le
+    /// commentaire de `refresh_radio_logos` le dit mot pour mot. Seul le
+    /// serveur media ne passait pas par lui.
+    ///
+    /// TEMOIN, vert des deux cotes : rien n'est perdu — l'adresse d'origine
+    /// reste dans la requete du relais, donc la pochette reste atteignable.
+    #[test]
+    fn aucune_adresse_externe_ne_sort_du_dossier_radio() {
+        use crate::db::radio_repo::RadioStation;
+        let mut state = state_du_releve_nd8006();
+        state.advertised_ip = Some("192.168.1.18".into());
+        let base = state.base_url();
+        RadioRepo::with_backend(state.backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "Station a logo distant".into(),
+                url: "https://icecast.example/logo.aac".into(),
+                homepage: None,
+                logo_url: Some("https://mozaiklabs.fr/storage/radio-logos/abc.png".into()),
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: false,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+
+        let didl = browse_radios(&state, 0, 1000).xml;
+
+        // --- LE FAIT DE BASE : plus une seule adresse hors de Tune.
+        for morceau in didl.split("<upnp:albumArtURI>").skip(1) {
+            let uri = morceau.split("</upnp:albumArtURI>").next().unwrap();
+            assert!(
+                uri.starts_with(&base),
+                "une pochette du dossier Radio est publiee hors de Tune : {uri}"
+            );
+        }
+        assert!(
+            !didl.contains("<upnp:albumArtURI>https://"),
+            "le dossier Radio publie encore une pochette externe : {didl}"
+        );
+
+        // --- TEMOIN : la pochette reste atteignable, relayee par Tune.
+        let attendue = format!(
+            "<upnp:albumArtURI>{base}/api/v1/library/artwork/proxy?url={}</upnp:albumArtURI>",
+            urlencoding::encode("https://mozaiklabs.fr/storage/radio-logos/abc.png")
+        );
+        assert!(
+            didl.contains(&attendue),
+            "l'adresse d'origine n'est pas relayee : {didl}"
+        );
+    }
+
+    /// Un logo TELEVERSE par l'utilisateur sortait en **condensat nu**.
+    ///
+    /// `set_radio_artwork` ecrit `radio.logo_url = Some(hash)` — le nom de
+    /// l'entree du cache de pochettes, pas une adresse. Le serveur media le
+    /// recopiait tel quel : `<upnp:albumArtURI>ce0a963b...</upnp:albumArtURI>`,
+    /// que **aucun** point de controle ne sait resoudre. La pochette d'une
+    /// PISTE passe depuis toujours par [`artwork_url`], qui sait le changer en
+    /// URL Tune ; celle d'une station, jamais.
+    #[test]
+    fn un_logo_televerse_sort_en_uri_et_non_en_condensat() {
+        use crate::db::radio_repo::RadioStation;
+        let mut state = state_du_releve_nd8006();
+        state.advertised_ip = Some("192.168.1.18".into());
+        let base = state.base_url();
+        let condensat = "ce0a963bb7eb63c3b33b4e00b6ab3427";
+        RadioRepo::with_backend(state.backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "Station a logo televerse".into(),
+                url: "https://icecast.example/upload.aac".into(),
+                homepage: None,
+                logo_url: Some(condensat.into()),
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: false,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+
+        let didl = browse_radios(&state, 0, 1000).xml;
+        assert!(
+            didl.contains(&format!(
+                "<upnp:albumArtURI>{base}/api/v1/library/artwork/{condensat}</upnp:albumArtURI>"
+            )),
+            "le condensat n'est pas devenu une URI : {didl}"
+        );
+        assert!(
+            !didl.contains(&format!("<upnp:albumArtURI>{condensat}</upnp:albumArtURI>")),
+            "le condensat nu est encore publie : {didl}"
+        );
+    }
+
+    /// Un caractere de controle dans un NOM DE STATION rendait illegale
+    /// l'enveloppe SOAP entiere — donc un dossier Radio vide, sans journal.
+    ///
+    /// La note en tete de `outputs/didl.rs` dit exactement ce que ca coute :
+    /// « XML 1.0 interdit les caracteres de controle hors tabulation et fins de
+    /// ligne — et `escape` n'y touche pas [...] npupnp (upmpdcli — HiFiMAN
+    /// Serenade de Tades) repond alors 401 "Invalid Action" : son parseur
+    /// echoue sur le CORPS, pas sur l'action. » `texte_xml_sain` a ete ecrit
+    /// pour ca et protege tous les items de piste. Le dossier Radio ne passait
+    /// pas par lui : il etait le dernier emetteur d'item audio du depot a
+    /// echapper son titre avec `quick_xml::escape::escape` nu.
+    ///
+    /// Les noms de station viennent d'imports Radio Browser : du texte libre,
+    /// exactement la population pour laquelle ce garde a ete ecrit.
+    ///
+    /// TEMOIN : le nom reste lisible — on remplace par une espace, on ne perd
+    /// pas la station.
+    #[test]
+    fn un_caractere_de_controle_dans_un_nom_de_station_ne_casse_pas_la_reponse() {
+        use crate::db::radio_repo::RadioStation;
+        let state = state_du_releve_nd8006();
+        RadioRepo::with_backend(state.backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "Radio\u{0}Parasite".into(),
+                url: "https://icecast.example/nul.aac".into(),
+                homepage: None,
+                logo_url: None,
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: false,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+
+        let reponse = browse_action_response(&state, &soap_browse("radios", 0, 500));
+        let illegal: Vec<u32> = reponse
+            .chars()
+            .filter(|c| !matches!(c, '\t' | '\n' | '\r') && *c < '\u{20}')
+            .map(|c| c as u32)
+            .collect();
+        assert!(
+            illegal.is_empty(),
+            "la reponse SOAP du dossier Radio porte des caracteres interdits \
+             par XML 1.0 ({illegal:?}) : un parseur strict rejette le CORPS \
+             entier et le dossier se lit vide"
+        );
+
+        // --- TEMOIN : la station est toujours la, et lisible.
+        assert!(
+            reponse.contains("Radio Parasite"),
+            "le nom a ete perdu au lieu d'etre assaini : {reponse}"
         );
     }
 

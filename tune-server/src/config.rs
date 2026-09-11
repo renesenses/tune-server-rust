@@ -878,3 +878,63 @@ mod listen_socket_tests {
         socket.bind(&addr.into()).expect("bind IPv4");
     }
 }
+
+/// Le port annonce par la DOCUMENTATION doit etre celui que le code ecoute.
+///
+/// #2680 — `README.md` et `MIGRATION.md` ont annonce `TUNE_PORT | 8085` bien
+/// apres que le defaut du code soit passe a 8888. Un exploitant qui suit la
+/// doc ouvre son pare-feu sur un port mort, et surtout declare a Spotify une
+/// URI de redirection qui nomme ce port-la : c'est litteralement le doute que
+/// Krugy a formule sur le fil 34.
+///
+/// Une constante et une phrase de documentation ne se tiennent par rien : ce
+/// garde est le lien. Il est volontairement ETROIT — il ne verifie qu'une
+/// chose, la ligne de tableau `| `TUNE_PORT` | <n> | ...`, dans les deux
+/// fichiers ou elle existe.
+#[cfg(test)]
+mod port_documente_guard {
+    use super::*;
+
+    fn defaut_documente(markdown: &str, fichier: &str) -> u16 {
+        let ligne = markdown
+            .lines()
+            .find(|l| l.trim_start().starts_with("| `TUNE_PORT` |"))
+            .unwrap_or_else(|| panic!("{fichier} n'annonce plus TUNE_PORT dans son tableau"));
+        let colonne = ligne
+            .split('|')
+            .nth(2)
+            .unwrap_or_else(|| panic!("{fichier} : ligne TUNE_PORT malformee : {ligne}"))
+            .trim();
+        colonne
+            .parse::<u16>()
+            .unwrap_or_else(|e| panic!("{fichier} : defaut TUNE_PORT illisible ({colonne}) : {e}"))
+    }
+
+    #[test]
+    fn la_doc_annonce_le_port_que_le_code_ecoute() {
+        let attendu = TuneConfig::default().port;
+        for fichier in ["README.md", "MIGRATION.md"] {
+            let chemin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(fichier);
+            let markdown = std::fs::read_to_string(&chemin)
+                .unwrap_or_else(|e| panic!("{} illisible : {e}", chemin.display()));
+            assert_eq!(
+                defaut_documente(&markdown, fichier),
+                attendu,
+                "{fichier} annonce un autre port par defaut que `TuneConfig::default().port`"
+            );
+        }
+    }
+
+    /// Le defaut Spotify DERIVE de ce meme port : les deux ne peuvent plus
+    /// diverger en silence.
+    #[test]
+    fn l_uri_spotify_par_defaut_nomme_ce_port() {
+        let port = TuneConfig::default().port;
+        assert_eq!(
+            tune_core::streaming::spotify::default_redirect_uri(port),
+            format!("http://127.0.0.1:{port}/api/v1/streaming/spotify/callback")
+        );
+    }
+}

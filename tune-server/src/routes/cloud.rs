@@ -1041,24 +1041,17 @@ pub(crate) async fn validate_stored_license(state: &AppState) -> tune_core::lice
         return state.license.tier().await;
     };
 
-    // Default false: a missing verdict must NOT unlock a pending key.
-    let valid = body
-        .get("license_valid")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !valid {
-        // Server rejects it → keep the (Free/pending) cached tier; do not grant.
+    // Lecture unique du verdict (`tune_core::license::verdict_licence`) : ce
+    // corps etait interprete a quatre endroits, avec des defauts opposes sur le
+    // champ manquant. Ici la politique est inchangee : rien n'est persiste hors
+    // d'une confirmation, et un refus — transitoire ou meme expire — laisse le
+    // palier en cache tel quel. La cle vient d'etre posee en attente par
+    // `set_license_key`, donc le palier effectif est deja Free.
+    let tune_core::license::VerdictLicence::Confirmee { tier, expires_at } =
+        tune_core::license::verdict_licence(&body)
+    else {
         return state.license.tier().await;
-    }
-
-    let tier = match body.get("license_tier").and_then(|v| v.as_str()) {
-        Some("premium") => tune_core::license::Tier::Premium,
-        _ => tune_core::license::Tier::Free,
     };
-    let expires_at = body
-        .get("license_expires_at")
-        .and_then(|v| v.as_str())
-        .map(String::from);
     state
         .license
         .update_from_server(tier, expires_at.clone())
@@ -1156,26 +1149,29 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
         }
     };
 
-    let valid = body
-        .get("license_valid")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    // Meme lecture du verdict que les trois autres appelants
+    // (`tune_core::license::verdict_licence`). Celle-ci etait la seule a
+    // defaillir en ACCORDANT : `license_valid` absent valait `true`, et comme
+    // `license_tier` absent valait `"free"`, un corps sans champ de licence
+    // — point d'acces redirige, enveloppe d'erreur rendue en 200, schema qui a
+    // bouge — persistait Free sur un compte premium **et** repondait
+    // `status:"validated"`. Le bouton « Valider » du panneau retrogradait donc
+    // un payeur en annoncant un succes. Un verdict absent ne persiste plus
+    // rien : le palier en cache est rendu tel quel, sous `status:"cached"`.
+    let verdict = tune_core::license::verdict_licence(&body);
 
-    if !valid {
-        // Mirror the heartbeat guard: a bare `license_valid:false` is NOT an
-        // authoritative revocation. A key is always present here (checked above),
-        // so unless the server returned a genuine PAST `license_expires_at`, keep
-        // the cached premium tier and do NOT persist Free. Persisting Free used
-        // to permanently strip a valid key on a transient rejection (fingerprint
-        // re-binding, server hiccup) — and clicking "Valider" would re-trigger it
-        // even with the heartbeat fixed. Only a true past expiry revokes.
-        let expired_authoritatively = body
-            .get("license_expires_at")
-            .and_then(|v| v.as_str())
-            .map(tune_core::license::is_timestamp_past)
-            .unwrap_or(false);
-
-        if expired_authoritatively {
+    let (tier, expires_at) = match verdict {
+        tune_core::license::VerdictLicence::Absent => {
+            warn!("license_validate_sans_verdict_palier_conserve");
+            return Json(json!({
+                "status": "cached",
+                "tier": ls.tier,
+                "message": "The licence server returned no verdict; the cached tier is kept.",
+                "cached": true,
+            }))
+            .into_response();
+        }
+        tune_core::license::VerdictLicence::Expiree => {
             info!("license_invalidated_by_server_validate (authoritative expiry)");
             state
                 .license
@@ -1192,31 +1188,20 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
             }))
             .into_response();
         }
-
-        // Transient rejection: keep the cached tier — Premium survives within the
-        // offline grace window instead of being permanently revoked.
-        warn!("license_validate_rejected_keeping_cached_tier");
-        return Json(json!({
-            "status": "cached",
-            "tier": ls.tier,
-            "message": "Server could not confirm the license right now; Premium is retained (grace period).",
-            "cached": true,
-        }))
-        .into_response();
-    }
-
-    let tier_str = body
-        .get("license_tier")
-        .and_then(|v| v.as_str())
-        .unwrap_or("free");
-    let tier = match tier_str {
-        "premium" => tune_core::license::Tier::Premium,
-        _ => tune_core::license::Tier::Free,
+        tune_core::license::VerdictLicence::RefusTransitoire => {
+            // Un refus nu n'est pas une revocation : Premium survit dans la
+            // fenetre de grace au lieu d'etre detruit sur un hoquet.
+            warn!("license_validate_rejected_keeping_cached_tier");
+            return Json(json!({
+                "status": "cached",
+                "tier": ls.tier,
+                "message": "Server could not confirm the license right now; Premium is retained (grace period).",
+                "cached": true,
+            }))
+            .into_response();
+        }
+        tune_core::license::VerdictLicence::Confirmee { tier, expires_at } => (tier, expires_at),
     };
-    let expires_at = body
-        .get("license_expires_at")
-        .and_then(|v| v.as_str())
-        .map(String::from);
 
     state
         .license

@@ -1,0 +1,87 @@
+-- Second releve de NOTRE annuaire : les canaux Radio Paradise qui y sont
+-- apparus depuis le premier semis (#3523).
+--
+-- Source : GET https://mozaiklabs.fr/api/v1/radios, releve le 2026-09-09.
+-- 59 entrees servies ce jour-la (51 le 2026-08-30). 2 sont posees ici.
+--
+-- POURQUOI CE FICHIER EXISTE. Dre van Hoof demandait (fil 1693, #3523) que
+-- « les stations de Radio Paradise soient ajoutees par defaut : il s'agit
+-- maintenant d'environ 6 a 10 stations de differents genres ». L'operateur en
+-- publie SEPT (GET https://api.radioparadise.com/api/list_chan, releve le
+-- 2026-09-09 : main-mix, mellow, rock, global, beyond, serenity, kfat) et le
+-- catalogue livre n'en portait que DEUX.
+--
+-- CE FICHIER NE DECIDE RIEN QUE L'ANNUAIRE N'AIT DEJA DECIDE. Le semis du
+-- 2026-08-30 prescrit sa propre regeneration « a partir de l'annuaire du
+-- site » : ajouter ici une station absente de l'annuaire recreerait la
+-- divergence annuaire/produit qui EST le sujet de #2119. Les deux stations
+-- posees ci-dessous sont donc, l'une comme l'autre, des entrees de l'annuaire
+-- au 2026-09-09 (ids 68 et 70).
+--
+-- CE QUI A ETE ECARTE DU RELEVE DU 2026-09-09, ET POURQUOI.
+-- L'annuaire porte ce jour-la DIX entrees Radio Paradise, dont trois nommees
+-- exactement « Radio Paradise » et trois adresses de flux servies deux fois
+-- (#3543 — le defaut y a EMPIRE depuis son ouverture : quatre entrees et deux
+-- homonymes le 2026-09-07, dix entrees et trois homonymes le 2026-09-09).
+--
+--   * id 49 (`rock-flac`, « Radio Paradise », quality 128k) et id 63
+--     (`aac-128`, « Radio Paradise ») : ECARTEES, comme au semis precedent —
+--     meme nom, et chacune double un canal deja seme dans une version
+--     superieure.
+--   * id 66 (`mellow-flacm`, « Radio Paradise », quality 128k) : ECARTEE.
+--     Troisieme homonyme, et la meme adresse que l'id 68 qui, elle, porte un
+--     nom distinct et la bonne qualite. Son LOGO est en revanche repris
+--     ci-dessous : c'est le logo que NOTRE annuaire attache a
+--     `mellow-flacm`, et l'entree 68 n'en a pas. Sans lui, la station
+--     arriverait avec l'icone micro par defaut sur une installation hors
+--     ligne (#2421).
+--   * id 67 (`flacm`, « Radio paradise - Main Mix ») et id 69
+--     (`rock-flacm`, « Radio Paradise - Rock ») : ECARTEES. Ce sont les
+--     adresses exactes des deux stations deja semees le 2026-08-30 ; la garde
+--     `NOT EXISTS` les refuserait de toute facon.
+--   * id 71 (`serenity-flac`, « Radio Paradise - Serenity ») : ECARTEE, et
+--     c'est le seul ecart qui ne soit pas un doublon. `serenity-flacm`
+--     repond 404 (sonde du 2026-09-09) : le seul flux disponible est
+--     `serenity-flac`, c'est-a-dire FLAC SANS metadonnees. La station
+--     arriverait donc sans titre ni artiste a l'ecran, en permanence. Poser
+--     ca par defaut chez tout le monde est un arbitrage, pas un correctif :
+--     il est demande dans #3523 et n'est pas tranche ici. Elle reste
+--     ajoutable en un geste par le bouton « + Ajouter a Tune » de la page
+--     Radios, qui la sert deja.
+--   * `beyond-flacm` et `kfat-flacm` : sondes 200 `application/ogg` le
+--     2026-09-09, mais ABSENTS DE L'ANNUAIRE. Les poser ici ferait diverger
+--     le semis du site — exactement ce que #2119 reproche. L'ordre est :
+--     les ajouter d'abord sur mozaiklabs.fr (ce qui repare du meme coup le
+--     bouton « + Ajouter a Tune » et les logos), puis les semer.
+--
+-- SONDE DES DEUX ADRESSES POSEES (curl -r 0-1024, 2026-09-09) :
+--   http://stream.radioparadise.com/mellow-flacm  200 application/ogg
+--   http://stream.radioparadise.com/global-flacm  200 application/ogg
+-- et des deux logos (curl, 2026-09-09) :
+--   /storage/radio-logos/MXIBjXhqvPXmeEVIiyOwYoGDRx1sgwUVEi9szcLW.jpg 200 image/jpeg 16999 o
+--   /storage/radio-logos/01M1XYGW6KTCKBQZBDNP8VPC2C.jpg               200 image/jpeg 218550 o
+--
+-- MEMES REGLES QUE LE SEMIS DU 2026-08-30, et pour les memes raisons — voir
+-- son en-tete, qui les expose en detail :
+--   * UN SEUL FICHIER pour les deux bases : ce texte est `include_str!` DEUX
+--     fois (migration SQLite 98 et migration PostgreSQL 054). SQL portable :
+--     `INSERT ... SELECT ... WHERE NOT EXISTS`, ni `INSERT OR IGNORE` ni
+--     `ON CONFLICT`.
+--   * IDEMPOTENCE par `WHERE NOT EXISTS (... url = ... OR name = ...)` : une
+--     station deja posee a la main ou par « + Ajouter a Tune » n'est pas
+--     dupliquee, et le catalogue livre ne porte jamais deux fois le meme nom
+--     (test `le_catalogue_livre_a_une_forme_valide`).
+--   * AUCUN UPDATE, AUCUN DELETE : ce fichier ne touche a rien de ce que
+--     l'utilisateur a renomme, re-genre, remis en favori ou repointe.
+--   * Normalisation : US -> Etats-Unis, eclectic -> Eclectique. `codec` et
+--     `bitrate` restent NULL — l'annuaire ne sert qu'un champ `quality`.
+--   * `logo_url` absolu (prefixe https://mozaiklabs.fr), comme le fait
+--     `refresh_radio_logos`, qui n'ecrase jamais un logo deja pose.
+
+INSERT INTO radio_stations (name, url, homepage, logo_url, country, genre)
+SELECT 'Radio Paradise - Mellow Mix', 'http://stream.radioparadise.com/mellow-flacm', 'https://radioparadise.com/', 'https://mozaiklabs.fr/storage/radio-logos/MXIBjXhqvPXmeEVIiyOwYoGDRx1sgwUVEi9szcLW.jpg', 'États-Unis', 'Éclectique'
+WHERE NOT EXISTS (SELECT 1 FROM radio_stations WHERE url = 'http://stream.radioparadise.com/mellow-flacm' OR name = 'Radio Paradise - Mellow Mix');
+
+INSERT INTO radio_stations (name, url, homepage, logo_url, country, genre)
+SELECT 'Radio Paradise - Global Mix', 'http://stream.radioparadise.com/global-flacm', NULL, 'https://mozaiklabs.fr/storage/radio-logos/01M1XYGW6KTCKBQZBDNP8VPC2C.jpg', 'États-Unis', 'Éclectique'
+WHERE NOT EXISTS (SELECT 1 FROM radio_stations WHERE url = 'http://stream.radioparadise.com/global-flacm' OR name = 'Radio Paradise - Global Mix');

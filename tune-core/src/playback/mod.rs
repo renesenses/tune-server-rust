@@ -1,8 +1,40 @@
 pub mod auto_dj;
-pub mod crossfade;
 pub mod dj_player;
 pub mod gapless;
 pub mod queue;
+// `crossfade` a été retiré ici (#2211), pour la même raison que
+// `radio_handler` juste en dessous : un module complet, **sans un seul
+// appelant** dans tout le dépôt depuis sa création.
+//
+// Ce qu'il portait : un `CrossfadeHandler` dont `start_fade_out` lisait le
+// volume courant de l'`OutputTarget`, le mémorisait, le descendait à zéro par
+// pas de 10 par seconde, puis `finish_fade_in` le remontait — **deux fondus
+// séquentiels sur le volume de la sortie**, jamais deux flux mélangés. Sur une
+// sortie matérielle, ce volume est celui de la zone, persistant.
+//
+// Ce qu'il faisait réellement : **rien**. `git grep CrossfadeHandler` ne
+// rendait, hors de son propre fichier, que ses cinq tests. Aucun tick du
+// sondeur, aucune fin de piste, aucun bras de l'orchestrateur ne l'instanciait.
+// Le fichier a gardé exactement 156 lignes de la v0.9.129 à la v0.9.145 — le
+// correctif `09be1df6` que le ticket cite n'a jamais eu de PR et n'est ancêtre
+// d'aucun tag.
+//
+// Pourquoi la suppression compte : l'issue #2211 décrit ce mécanisme comme le
+// défaut à corriger, et lui donne P1 pour un creux audible entre les titres et
+// une altération du volume persistant de la zone. Tant que ce fichier vivait,
+// toute lecture du code confirmait ce récit — alors que le seul chemin que
+// l'utilisateur atteint est la route `POST /zones/{id}/crossfade`, fermée par
+// #2689 : elle refuse l'activation par un 501 `crossfade_unavailable` et force
+// la préférence persistée à `false`. Le fondu enchaîné n'existe donc sous
+// AUCUNE forme, pas même la mauvaise.
+//
+// L'arbitrage de Bertrand du 02/09/2026 sur #2211 est explicite : le vrai
+// fondu enchaîné mélangera deux flux décodés dans le moteur audio, sur la
+// sortie locale seulement, et **le volume matériel ne doit plus être touché**.
+// Ce module était la seule implémentation qui le touchait : le laisser en
+// place, c'était laisser la rampe à portée d'un `use`. Le garde
+// `tests/crossfade_pas_de_rampe_de_volume.rs` empêche qu'elle revienne.
+//
 // `radio_handler` a été retiré ici (#3018). C'était une SECONDE lecture des
 // métadonnées radio, sans aucun appelant depuis sa création : un
 // `RadioMetadataHandler` complet, avec sa propre structure `IcyMetadata`
@@ -413,6 +445,34 @@ pub struct ZoneState {
     /// d'état on ne conclut rien.
     #[serde(skip)]
     pub derniere_avance_de_position: Option<Instant>,
+    /// Instant où la question « quelqu'un observe-t-il cette zone avancer ? »
+    /// a été ROUVERTE par une commande — le début de la fenêtre que
+    /// [`Self::derniere_avance_de_position`] est chargée de remplir.
+    ///
+    /// #3723 a fermé la moitié du fantôme de #3581 : une zone OBSERVÉE puis
+    /// figée cesse de retenir la mise à jour. L'autre moitié restait ouverte,
+    /// et elle est la plus facile à produire : une zone que personne n'observe
+    /// JAMAIS. `derniere_avance_de_position` y vaut `None` à perpétuité — une
+    /// zone navigateur n'a pas de périphérique (`poller/tick.rs` fait
+    /// `continue` avant son unique `update_position`), et une zone dont la
+    /// sortie a disparu du registre du sondeur avant la première avance non
+    /// plus. `None` étant tenu pour « on ne conclut rien », ces zones-là
+    /// retenaient la mise à jour SANS AUCUNE BORNE.
+    ///
+    /// Le remède ne peut pas être un seuil de silence : sur ces zones il n'y a
+    /// rien à mesurer. Il y a en revanche un fait CONNU — la durée de la piste
+    /// — et un instant connu : celui où la commande a ouvert la fenêtre. Passé
+    /// `durée − position` plus une marge, la piste est FINIE ; ce qui prétend
+    /// encore la jouer ne la joue pas. C'est une mesure, pas une supposition.
+    ///
+    /// Posé par `play`, `resume` et `seek` — les trois commandes qui rouvrent
+    /// la question en laissant la zone en lecture — et effacé par `stop`,
+    /// exactement aux mêmes endroits que la remise à `None` de sa jumelle.
+    ///
+    /// `#[serde(skip)]` comme ses voisins `Instant` : après une restauration
+    /// d'état la fenêtre n'est pas datée, et on ne conclut rien.
+    #[serde(skip)]
+    pub observation_rouverte_a: Option<Instant>,
 }
 
 /// Vrai quand la nouvelle métadonnée now-playing change d'identité
@@ -484,6 +544,7 @@ impl Default for ZoneState {
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
             derniere_avance_de_position: None,
+            observation_rouverte_a: None,
         }
     }
 }
@@ -500,7 +561,9 @@ impl Default for ZoneState {
 ///   rien, cf. `playback_in_progress`) ;
 /// - `derniere_avance_de_position == None` n'est PAS un silence : c'est une
 ///   absence de mesure. Zone navigateur, radio sans position annoncée, piste
-///   qui démarre — on ne conclut rien ;
+///   qui démarre — on ne conclut rien **de l'immobilité**. Un second fait,
+///   lui, se conclut sans aucune observation : une piste dont la DURÉE est
+///   connue finit. Voir [`piste_finie_sans_la_moindre_observation`] ;
 /// - une RADIO est exclue par principe. Un flux live n'a pas de durée, et
 ///   plusieurs renderers en annoncent la position par à-coups ou pas du tout ;
 ///   figer la conclusion sur cette forme-là reviendrait à couper la seule
@@ -517,9 +580,62 @@ pub fn zone_figee(state: &ZoneState, silence_max: std::time::Duration) -> bool {
     if est_radio {
         return false;
     }
-    state
-        .derniere_avance_de_position
-        .is_some_and(|t| t.elapsed() >= silence_max)
+    match state.derniere_avance_de_position {
+        Some(t) => t.elapsed() >= silence_max,
+        None => piste_finie_sans_la_moindre_observation(state, silence_max),
+    }
+}
+
+/// Une zone que PERSONNE n'observe prétend-elle encore jouer une piste qui est
+/// FINIE depuis longtemps ?
+///
+/// C'est la moitié du fantôme de #3581 que #3723 n'a pas fermée. Sur une zone
+/// navigateur — aucun périphérique, donc `poller/tick.rs` s'arrête sur
+/// `get_zone_device_id → None` avant son unique `update_position` — et sur une
+/// zone dont la sortie a quitté le registre du sondeur avant la première
+/// avance, [`ZoneState::derniere_avance_de_position`] reste `None` POUR
+/// TOUJOURS. Le prédicat d'immobilité ne mord pas, et la zone retenait la mise
+/// à jour sans borne : garde-fou d'entrée refusant à l'infini, report de la
+/// relance allant jusqu'au plafond de deux heures, à chaque tentative.
+///
+/// Ce qu'on ne peut pas faire, et pourquoi : déclarer figée toute zone jamais
+/// observée après un simple délai couperait le son d'une zone navigateur qui
+/// joue réellement — elle n'est jamais observée NON PLUS. Le seuil de silence
+/// n'a rien à mesurer ici.
+///
+/// Ce qu'on peut mesurer, en revanche : une piste a une DURÉE, la fenêtre a
+/// une DATE d'ouverture ([`ZoneState::observation_rouverte_a`]), et la commande
+/// qui l'a ouverte a écrit la position de départ. Passé
+/// `durée − position + marge`, la piste est terminée ; ce qui prétend encore la
+/// jouer ne la joue pas. Une lecture réelle, elle, a enchaîné : un `play()` de
+/// la piste suivante rouvre la fenêtre et remet le verdict à zéro.
+///
+/// Trois refus, tous du côté sûr, et tous pour la même raison — une absence de
+/// donnée n'est pas une preuve :
+/// - **durée inconnue ou nulle** (`duration_ms <= 0`) : flux live, piste sans
+///   métadonnée de durée. Rien à comparer, on ne conclut rien ;
+/// - **fenêtre non datée** (`observation_rouverte_a == None`) : le champ est
+///   `#[serde(skip)]`, donc c'est l'état d'après une restauration. On ne
+///   conclut rien, comme `last_play_started_at` avant lui (#2630) ;
+/// - la **marge** est celle du prédicat appelant, ajoutée APRÈS la fin
+///   annoncée : elle couvre le décodage intégral d'une piste compressée avant
+///   le premier échantillon (#3618), un réveil d'ampli, une durée annoncée
+///   trop courte par la métadonnée. Au seuil de production (600 s), une piste
+///   de quatre minutes n'est mise en cause qu'au bout de quatorze.
+fn piste_finie_sans_la_moindre_observation(state: &ZoneState, marge: std::time::Duration) -> bool {
+    let Some(duree_ms) = state
+        .now_playing
+        .as_ref()
+        .map(|np| np.duration_ms)
+        .filter(|d| *d > 0)
+    else {
+        return false;
+    };
+    let Some(ouverture) = state.observation_rouverte_a else {
+        return false;
+    };
+    let reste_ms = duree_ms.saturating_sub(state.position_ms.max(0)).max(0) as u64;
+    ouverture.elapsed() >= std::time::Duration::from_millis(reste_ms) + marge
 }
 
 /// Build a materialised shuffle order: a Fisher-Yates permutation of
@@ -789,6 +905,10 @@ impl PlaybackManager {
         // Nouveau flux : la mesure d'avance d'avant ne décrit plus rien, et
         // rien n'a encore été observé de celui-ci. « Je ne sais pas » (#3581).
         state.derniere_avance_de_position = None;
+        // … et la fenêtre d'observation s'ouvre ICI. Sans cette date, « je ne
+        // sais pas » n'a pas de fin : c'est ce qui laissait une zone jamais
+        // observée retenir la mise à jour sans aucune borne (#3581).
+        state.observation_rouverte_a = Some(Instant::now());
         // Le verdict appartient au flux qui l'a produit. Tant que le backend
         // n'a pas observé le premier buffer du nouveau flux, mieux vaut
         // annoncer « non observé » que réutiliser la promesse de la piste
@@ -856,6 +976,9 @@ impl PlaybackManager {
             // La mesure d'avance date d'avant la pause : elle ne dit rien de
             // la lecture qui repart (#3581).
             state.derniere_avance_de_position = None;
+            // La reprise rouvre la fenêtre : ce qui reste à jouer se compte à
+            // partir de maintenant, et de `position_ms` (#3581).
+            state.observation_rouverte_a = Some(Instant::now());
         }
         self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
@@ -877,6 +1000,7 @@ impl PlaybackManager {
             state.paused_at = None;
             state.last_seek_at = None;
             state.derniere_avance_de_position = None;
+            state.observation_rouverte_a = None;
             // Keep position_ms and now_playing so the UI shows where
             // playback left off and can resume from the same position.
             now_playing_event_data(state)
@@ -906,6 +1030,7 @@ impl PlaybackManager {
             state.pending_resume_ms = None;
             state.metadata_changed_at_ms = None;
             state.derniere_avance_de_position = None;
+            state.observation_rouverte_a = None;
         }
         self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
@@ -968,6 +1093,9 @@ impl PlaybackManager {
             // observation repart d'ailleurs, la mesure d'avance d'avant ne
             // vaut plus (#3581).
             state.derniere_avance_de_position = None;
+            // Le déplacement rouvre la fenêtre, et il change ce qui reste à
+            // jouer : les deux se lisent ensemble (#3581).
+            state.observation_rouverte_a = Some(Instant::now());
         }
         self.emit(PlaybackEvent {
             event: "seek".into(),
@@ -1384,6 +1512,7 @@ mod tests {
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
             derniere_avance_de_position: None,
+            observation_rouverte_a: None,
         };
         let v = now_playing_event_data(&state);
         // Full NowPlaying is serialised…
@@ -1956,6 +2085,118 @@ mod zone_figee_tests {
                 .map(|d| Instant::now().checked_sub(d).expect("horloge trop jeune")),
             ..Default::default()
         }
+    }
+
+    /// Une zone que personne n'observe JAMAIS : `derniere_avance_de_position`
+    /// vaut `None` et vaudra `None` pour toujours. Seuls comptent alors la
+    /// durée annoncée, la position écrite par la commande, et la date à
+    /// laquelle cette commande a ouvert la fenêtre.
+    fn zone_jamais_observee(
+        duree_ms: i64,
+        position_ms: i64,
+        fenetre_ouverte_il_y_a: Option<Duration>,
+    ) -> ZoneState {
+        ZoneState {
+            zone_id: 12,
+            state: PlayState::Playing,
+            position_ms,
+            now_playing: Some(NowPlaying {
+                source: "library".into(),
+                duration_ms: duree_ms,
+                ..Default::default()
+            }),
+            derniere_avance_de_position: None,
+            observation_rouverte_a: fenetre_ouverte_il_y_a
+                .map(|d| Instant::now().checked_sub(d).expect("horloge trop jeune")),
+            ..Default::default()
+        }
+    }
+
+    /// Le fantôme qui restait après #3723 : quatre minutes de piste, la
+    /// fenêtre ouverte il y a une heure, et pas une seule observation. À dix
+    /// minutes de marge, la fin annoncée est dépassée de quarante-six minutes.
+    #[test]
+    fn une_piste_finie_depuis_longtemps_sans_observation_est_figee() {
+        assert!(zone_figee(
+            &zone_jamais_observee(240_000, 0, Some(Duration::from_secs(3600))),
+            DIX_MINUTES
+        ));
+    }
+
+    /// La contre-épreuve : la même zone, même absence totale d'observation,
+    /// mais la piste n'est pas finie. Couper ici, ce serait couper une zone
+    /// navigateur qui joue vraiment.
+    #[test]
+    fn une_piste_encore_en_cours_sans_observation_nest_pas_figee() {
+        assert!(!zone_figee(
+            &zone_jamais_observee(240_000, 0, Some(Duration::from_secs(60))),
+            DIX_MINUTES
+        ));
+    }
+
+    /// La marge s'ajoute APRÈS la fin annoncée, et elle est franche : à
+    /// quatre minutes de piste plus neuf de marge, on ne conclut pas encore.
+    #[test]
+    fn la_marge_sajoute_apres_la_fin_annoncee() {
+        assert!(!zone_figee(
+            &zone_jamais_observee(240_000, 0, Some(Duration::from_secs(240 + 540))),
+            DIX_MINUTES
+        ));
+        assert!(zone_figee(
+            &zone_jamais_observee(240_000, 0, Some(Duration::from_secs(240 + 601))),
+            DIX_MINUTES
+        ));
+    }
+
+    /// Une reprise en milieu de piste ne rejoue pas la piste entière : ce qui
+    /// reste se compte depuis `position_ms`. Sans cette soustraction, une
+    /// reprise à dix secondes de la fin attendrait la durée complète.
+    #[test]
+    fn ce_qui_reste_a_jouer_se_compte_depuis_la_position() {
+        // 3 600 000 ms de piste, reprise à 3 590 000 : il reste dix secondes.
+        assert!(zone_figee(
+            &zone_jamais_observee(3_600_000, 3_590_000, Some(Duration::from_secs(10 + 601))),
+            DIX_MINUTES
+        ));
+    }
+
+    /// Durée inconnue : rien à comparer, aucune conclusion. C'est le flux
+    /// live, et c'est aussi le défaut de métadonnée.
+    #[test]
+    fn sans_duree_annoncee_on_ne_conclut_rien() {
+        assert!(!zone_figee(
+            &zone_jamais_observee(0, 0, Some(Duration::from_secs(86_400))),
+            DIX_MINUTES
+        ));
+    }
+
+    /// Fenêtre non datée : c'est l'état d'après une restauration
+    /// (`#[serde(skip)]`). On ne conclut rien, comme partout ailleurs.
+    #[test]
+    fn sans_fenetre_datee_on_ne_conclut_rien() {
+        assert!(!zone_figee(
+            &zone_jamais_observee(240_000, 0, None),
+            DIX_MINUTES
+        ));
+    }
+
+    /// Une RADIO reste hors du verdict par les DEUX chemins. Son exclusion est
+    /// posée avant toute lecture de durée : même si un flux live en annonçait
+    /// une, il ne serait pas coupé.
+    #[test]
+    fn une_radio_finie_sans_observation_nest_jamais_figee() {
+        let mut z = zone_jamais_observee(240_000, 0, Some(Duration::from_secs(86_400)));
+        z.now_playing.as_mut().expect("now_playing").source = "radio".into();
+        assert!(!zone_figee(&z, DIX_MINUTES));
+    }
+
+    /// Une PAUSE ne retient rien, et le nouveau chemin ne doit pas la
+    /// ressusciter : le premier refus de `zone_figee` reste le premier.
+    #[test]
+    fn une_pause_reste_hors_du_verdict_meme_piste_finie() {
+        let mut z = zone_jamais_observee(240_000, 0, Some(Duration::from_secs(86_400)));
+        z.state = PlayState::Paused;
+        assert!(!zone_figee(&z, DIX_MINUTES));
     }
 
     /// Le fantôme de Tades : la Serenade dit `Playing`, sa position n'a plus

@@ -1740,6 +1740,29 @@ CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(i
     },
     Migration {
         version: 98,
+        name: "semis_radios_paradise_annuaire_2026_09_09",
+        // Les canaux Radio Paradise apparus dans NOTRE annuaire depuis le
+        // semis du 30/08 (#3523).
+        //
+        // Dre van Hoof demandait « environ 6 à 10 stations de différents
+        // genres » (fil 1693) ; l'opérateur en publie sept et le catalogue
+        // livré n'en portait que deux. L'annuaire de mozaiklabs.fr en sert
+        // désormais deux de plus sous un nom distinct et la bonne qualité :
+        // Mellow Mix et Global Mix. Ce sont celles-là, et seulement
+        // celles-là, que cette migration pose.
+        //
+        // Le fichier porte en tête le relevé, le sondage des flux ET des
+        // logos, et la raison de chaque écart — dont les trois homonymes de
+        // l'annuaire (#3543) et le cas Serenity, qui reste un arbitrage
+        // ouvert. C'est là qu'il faut lire le détail, pas ici.
+        //
+        // Le même fichier est `include_str!` par la migration PostgreSQL
+        // 054 : un seul texte pour les deux bases, donc aucune divergence
+        // possible.
+        up: include_str!("../../migrations/radios/annuaire_mozaiklabs_2026_09_09.sql"),
+    },
+    Migration {
+        version: 99,
         name: "zones_output_endpoint_id",
         // #2269 — `zones.output_endpoint_id`, l'identifiant d'endpoint STABLE
         // du backend pour une sortie locale.
@@ -2860,7 +2883,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // DUP-1 (phase 2) : derniere reponse de l'appareil, ISO 8601 UTC, NULL = jamais vue.
     add_column_if_missing(db, "zones", "last_seen_at", "TEXT");
     // #2269 : identifiant d'endpoint stable de la sortie locale, NULL pour
-    // l'existant. Voir la migration 98 et `outputs::identite_de_sortie`.
+    // l'existant. Voir la migration 99 et `outputs::identite_de_sortie`.
     add_column_if_missing(db, "zones", "output_endpoint_id", "TEXT");
     // BIB-B2 : empreinte du contenu audio decode, versionnee (env100ms-v1:<hex>).
     add_column_if_missing(db, "tracks", "audio_fingerprint", "TEXT");
@@ -3433,14 +3456,44 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "parite_types_pg_sqlite",
         include_str!("../../migrations/postgres/053_parite_types_pg_sqlite.sql"),
     ),
-    // Jumelle PostgreSQL de la migration SQLite 98 (#2269). Sans elle, tout le
+    // Jumelle de la migration SQLite 98 : les canaux Radio Paradise apparus
+    // dans l'annuaire depuis le semis du 30/08 (#3523). LE MÊME FICHIER que
+    // la migration SQLite — pas une copie : le SQL du semis est volontairement
+    // portable (`INSERT ... SELECT ... WHERE NOT EXISTS`), et deux fichiers
+    // jumeaux finiraient par diverger. Sans cette entrée, tout le parc
+    // PostgreSQL — .15, .18, Docker — resterait aux deux Radio Paradise du
+    // semis précédent.
+    //
+    // 🔴 LE `concat!` N'EST PAS DE LA COQUETTERIE. `run_pg_migrations` n'écrit
+    // rien dans `schema_version` : c'est le SQL lui-même qui pose sa ligne, et
+    // le fichier de semis ne peut pas la porter — il est joué AUSSI par la
+    // migration SQLite 98, où `schema_version` n'existe pas. La 042, jumelle du
+    // semis précédent, s'en tirait parce que des scripts plus HAUTS (043…)
+    // faisaient avancer `MAX(version)` derrière elle. Celle-ci est la plus
+    // haute : sans sa marque, `MAX(version)` resterait à 53, le semis serait
+    // rejoué à CHAQUE démarrage et le rapport de diagnostic dirait
+    // `up_to_date: false` à jamais. C'est exactement le défaut de la 052
+    // (#3699), que `la_derniere_migration_postgres_enregistre_son_numero`
+    // garde — mais ce test-là ne lit que `migrations/postgres/*.sql`, et ne
+    // verrait donc pas cette entrée-ci.
+    (
+        54,
+        "semis_radios_paradise_annuaire_2026_09_09",
+        concat!(
+            include_str!("../../migrations/radios/annuaire_mozaiklabs_2026_09_09.sql"),
+            "\nINSERT INTO schema_version (version, name) \
+             VALUES (54, 'semis_radios_paradise_annuaire_2026_09_09') \
+             ON CONFLICT (version) DO NOTHING;\n"
+        ),
+    ),
+    // Jumelle PostgreSQL de la migration SQLite 99 (#2269). Sans elle, tout le
     // parc PostgreSQL (.15, .18, Docker) n'aurait pas la colonne et la lecture
     // de `output_endpoint_id` y renverrait « column does not exist » — donc
     // aucune re-association nulle part, en silence.
     (
-        54,
+        55,
         "zones_output_endpoint_id",
-        include_str!("../../migrations/postgres/054_zones_output_endpoint_id.sql"),
+        include_str!("../../migrations/postgres/055_zones_output_endpoint_id.sql"),
     ),
 ];
 
@@ -4132,6 +4185,117 @@ mod tests {
         assert_eq!(lire("Vide").as_deref(), Some(""));
     }
 
+    /// #2269 — une base NÉE AVANT la colonne gagne `output_endpoint_id`, et
+    /// n'y perd aucune ligne.
+    ///
+    /// ⚠️ C'est le SEUL témoin qui éprouve ce chemin. Les témoins de
+    /// `zone_repo` partent d'un `init_schema()`, où `CORE_SCHEMA` pose déjà la
+    /// colonne : débrancher `add_column_if_missing` les laisse tous VERTS.
+    /// Sur le terrain, la base d'un testeur ne passe jamais par `CORE_SCHEMA`
+    /// — elle existe déjà — et c'est `add_column_if_missing` seul qui lui pose
+    /// la colonne. Sans lui, `sorties_locales_et_leur_identite` rend une liste
+    /// vide à jamais (« no such column »), et RIEN ne se ré-associe, en
+    /// silence : exactement le défaut « écrit mais pas branché ».
+    ///
+    /// Le compte des collisions sur la nouvelle clef est mesuré ici aussi :
+    /// après migration, aucune ligne ne porte de valeur, donc aucune n'entre
+    /// en collision — c'est ce qui autorise à poser la colonne sans arbitrer
+    /// quoi que ce soit sur la base des testeurs.
+    #[test]
+    fn une_base_ancienne_gagne_lidentifiant_dendpoint_sans_perdre_de_ligne() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        // La forme d'avant #2269 : `zones` sans `output_endpoint_id`, avec des
+        // réglages accrochés à la ligne.
+        db.execute_batch(
+            "CREATE TABLE zones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                output_type TEXT,
+                output_device_id TEXT,
+                volume REAL DEFAULT 100,
+                is_hidden INTEGER DEFAULT 0
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id
+                ON zones(output_device_id) WHERE output_device_id IS NOT NULL;
+            INSERT INTO zones (name, output_type, output_device_id, volume)
+                VALUES ('Salon', 'local', 'local:audio-gd USB audio', 37.5),
+                       ('Chambre', 'local', 'local:Haut-parleurs', 70.0);",
+        )
+        .unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(zones)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "output_endpoint_id"),
+            "`output_endpoint_id` manque après migration sur une base ANTÉRIEURE \
+             à la colonne : la ré-association ne pourra jamais rien lire, et \
+             `sorties_locales_et_leur_identite` rendra une liste vide à \
+             jamais (#2269). Colonnes : {cols:?}"
+        );
+
+        // AUCUNE ligne perdue, et les réglages restent accrochés là où ils sont.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM zones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "des zones ont disparu à la migration");
+        let volume: f64 = conn
+            .query_row(
+                "SELECT volume FROM zones WHERE output_device_id = 'local:audio-gd USB audio'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(volume, 37.5, "le volume de la zone a bougé");
+
+        // La valeur naît NULLE : « pas encore appris », jamais devinée.
+        let apprises: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zones WHERE output_endpoint_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            apprises, 0,
+            "la migration a INVENTÉ un identifiant : elle ne doit modifier \
+             aucune ligne"
+        );
+
+        // Le compte des collisions sur la NOUVELLE clef, mesuré et non supposé.
+        let collisions: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM zones \
+                 WHERE output_endpoint_id IS NOT NULL GROUP BY output_endpoint_id \
+                 HAVING COUNT(*) > 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            collisions, 0,
+            "la nouvelle clef entrerait en collision : la colonne ne peut pas \
+             être posée sans arbitrage"
+        );
+
+        // Et la lecture que le dépôt exécute vraiment passe.
+        conn.query_row(
+            "SELECT id, output_device_id, COALESCE(output_endpoint_id, ''), \
+             COALESCE(is_hidden, 0) FROM zones WHERE output_device_id LIKE 'local:%' \
+             ORDER BY id",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("le SELECT de `sorties_locales_et_leur_identite` doit passer");
+    }
+
     #[test]
     fn une_base_ancienne_gagne_le_drapeau_compilation() {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -4440,6 +4604,126 @@ mod tests {
         );
     }
 
+    /// Les canaux Radio Paradise que le catalogue livré doit porter (#3523).
+    ///
+    /// Dre van Hoof demandait « environ 6 à 10 stations de différents genres »
+    /// (fil 1693) ; l'opérateur en publie sept et le catalogue n'en portait que
+    /// deux. Les DEUX autres — Mellow Mix et Global Mix — sont posées par la
+    /// migration 98, relevées de l'annuaire du 09/09/2026.
+    ///
+    /// Ce test tient l'ADRESSE, pas le nom : renommer une station est le droit
+    /// de l'éditeur du catalogue, mais perdre un canal est une régression. Et
+    /// il tient l'inverse du défaut de #3543 : aucune station livrée ne doit
+    /// s'appeler « Radio Paradise » tout court — c'est le nom des trois
+    /// homonymes de l'annuaire, indiscernables à l'écran, et c'est la raison
+    /// pour laquelle ils sont écartés des deux semis.
+    #[test]
+    fn le_catalogue_livre_porte_les_canaux_radio_paradise_de_l_annuaire() {
+        const CANAUX: [&str; 4] = [
+            "http://stream.radioparadise.com/flacm",
+            "http://stream.radioparadise.com/rock-flacm",
+            "http://stream.radioparadise.com/mellow-flacm",
+            "http://stream.radioparadise.com/global-flacm",
+        ];
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let stations: Vec<(String, String)> = {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name, url FROM radio_stations ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        for canal in CANAUX {
+            let portant: Vec<&str> = stations
+                .iter()
+                .filter(|(_, u)| u == canal)
+                .map(|(n, _)| n.as_str())
+                .collect();
+            assert_eq!(
+                portant.len(),
+                1,
+                "le canal {canal} devrait être livré exactement une fois, \
+                 il l'est {} fois — noms : {portant:?}",
+                portant.len()
+            );
+        }
+
+        let homonymes: Vec<&str> = stations
+            .iter()
+            .filter(|(n, _)| n.trim() == "Radio Paradise")
+            .map(|(_, u)| u.as_str())
+            .collect();
+        assert!(
+            homonymes.is_empty(),
+            "le catalogue livré porte une station nommée « Radio Paradise » \
+             tout court — c'est le nom des homonymes de l'annuaire (#3543), \
+             indiscernables à l'écran : {homonymes:?}"
+        );
+    }
+
+    /// Le semis du 09/09 doit atteindre les bases PostgreSQL, et y MARQUER son
+    /// numéro (#3523).
+    ///
+    /// Écrit d'un seul côté, il laisserait tout le parc PostgreSQL — .15, .18,
+    /// Docker — aux deux Radio Paradise du semis précédent. Et enregistré sans
+    /// sa ligne `schema_version`, il serait rejoué à chaque démarrage puisque
+    /// `run_pg_migrations` n'écrit rien lui-même : c'est le défaut de la 052
+    /// (#3699), et la garde qui le tient (`la_derniere_migration_postgres_…`)
+    /// ne lit que `migrations/postgres/*.sql` — elle ne voit pas les entrées
+    /// qui, comme celle-ci, partagent le fichier de la migration SQLite.
+    ///
+    /// Ce test lit les SOURCES : il vaut quel que soit le jeu de features
+    /// compilé, `PG_MIGRATIONS` vivant derrière `#[cfg(feature = "postgres")]`
+    /// que la porte locale ne compile pas.
+    #[test]
+    fn le_semis_radio_paradise_du_09_09_atteint_postgres_et_marque_son_numero() {
+        const FICHIER: &str = "annuaire_mozaiklabs_2026_09_09.sql";
+        // Le CHEMIN, et ASSEMBLÉ À L'EXÉCUTION : `include_str!("migrations.rs")`
+        // rapporte ce test-ci avec le reste du fichier, donc toute aiguille
+        // écrite ici en toutes lettres se compterait elle-même.
+        let chemin = format!("../../migrations/radios/{FICHIER}");
+        let ce_fichier = include_str!("migrations.rs");
+
+        assert!(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("migrations/radios")
+                .join(FICHIER)
+                .exists(),
+            "le fichier de semis {FICHIER} a disparu"
+        );
+        assert_eq!(
+            ce_fichier.matches(&chemin).count(),
+            2,
+            "le semis {FICHIER} doit être `include_str!` DEUX fois — une fois \
+             par la migration SQLite, une fois par sa jumelle PostgreSQL. \
+             Écrit d'un seul côté, un des deux parcs reste sans les stations."
+        );
+        // Même précaution : l'aiguille est assemblée, sinon elle se trouverait
+        // elle-même et le test serait vert contre rien.
+        let nom = "semis_radios_paradise_annuaire_2026_09_09";
+        let marque = format!("VALUES (54, '{nom}')");
+        assert_eq!(
+            ce_fichier.matches(&marque).count(),
+            1,
+            "l'entrée PostgreSQL du semis n'inscrit pas sa ligne dans \
+             `schema_version` : elle est la plus haute, donc `MAX(version)` \
+             resterait en arrière et le semis serait rejoué à chaque démarrage \
+             (défaut de la 052, #3699)"
+        );
+        assert!(
+            MIGRATIONS.iter().any(|m| m.name == nom),
+            "la migration SQLite du semis a disparu ou changé de nom"
+        );
+    }
+
     /// Le semis ne doit rien planter qu'une migration ultérieure arrache.
     ///
     /// C'est l'erreur que les migrations 70 et 78 ont dû réparer : le semis
@@ -4520,6 +4804,32 @@ mod tests {
             depuis_annuaire.len()
         );
         semees.extend(depuis_annuaire);
+
+        // Le TROISIÈME semis, celui du relevé du 09/09 (migration 98, #3523) :
+        // même forme portable, même règle. Sans cette reprise, un semis ajouté
+        // après coup échapperait à la garde — et c'est le seul moment où on y
+        // pense.
+        let paradise = MIGRATIONS
+            .iter()
+            .find(|m| m.name == "semis_radios_paradise_annuaire_2026_09_09")
+            .expect("le semis Radio Paradise du 09/09 a disparu");
+        let depuis_paradise: Vec<String> = paradise
+            .up
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("WHERE NOT EXISTS (SELECT 1 FROM radio_stations WHERE url = ")
+            })
+            .filter_map(|l| litteraux_sql(l).into_iter().next())
+            .collect();
+        assert_eq!(
+            depuis_paradise.len(),
+            2,
+            "le semis du 09/09 devait poser deux stations, le relevé en trouve {}",
+            depuis_paradise.len()
+        );
+        semees.extend(depuis_paradise);
+
         for url in &semees {
             assert!(
                 url.starts_with("http"),
@@ -5090,12 +5400,20 @@ mod tests {
         // un redacteur lie du texte echangerait une lecture fausse contre une
         // ecriture refusee. Elles sont inscrites nominativement dans
         // `ECARTS_TOLERES` avec leur motif mesure.
-        // 54 : `zones_output_endpoint_id` (#2269). Jumelle SQLite : la 98.
+        // 54 : `semis_radios_paradise_annuaire_2026_09_09` (#3523). Jumelle
+        // SQLite : la 98. Le MEME fichier de semis est `include_str!` des deux
+        // cotes ; l'entree PostgreSQL y ajoute, par `concat!`, sa ligne
+        // `INSERT INTO schema_version` — le fichier ne peut pas la porter,
+        // puisqu'il est joue aussi contre une base SQLite ou la table n'existe
+        // pas, et cette entree est la PLUS HAUTE : sans marque, `MAX(version)`
+        // resterait a 53 et le semis serait rejoue a chaque demarrage (defaut
+        // de la 052, #3699).
+        // 55 : `zones_output_endpoint_id` (#2269). Jumelle SQLite : la 99.
         // L'identifiant d'endpoint stable d'une sortie locale, la seule
         // identite qui traverse un renommage. TEXT des deux cotes, NULL pour
         // l'existant — aucune ligne n'est modifiee, `output_device_id` reste
         // l'identite de la zone.
-        assert_eq!(pg_latest_version(), 54, "latest PG migration must be 54");
+        assert_eq!(pg_latest_version(), 55, "latest PG migration must be 55");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

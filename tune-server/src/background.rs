@@ -1518,31 +1518,36 @@ fn spawn_heartbeat(state: &AppState) {
                                     "active_since": active_since,
                                 }),
                             );
-                        } else if let Some(tier_str) =
-                            body.get("license_tier").and_then(|v| v.as_str())
-                        {
+                        } else if body.get("license_tier").and_then(|v| v.as_str()).is_some() {
                             // No conflict reported → make sure any prior conflict
                             // is cleared before applying the normal verdict.
                             license.clear_session_conflict().await;
 
-                            let valid = body
-                                .get("license_valid")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(true);
-
-                            // A genuine, authoritative revocation is a *past*
-                            // expiry date — not a bare `license_valid:false`,
-                            // which can be transient (fingerprint re-binding,
-                            // server hiccup, key bound to another machine while
-                            // the account is still premium).
-                            let expired_authoritatively = body
-                                .get("license_expires_at")
-                                .and_then(|v| v.as_str())
-                                .map(tune_core::license::is_timestamp_past)
-                                .unwrap_or(false);
+                            // Lecture unique du verdict, partagee avec les
+                            // trois autres appelants (#3673, meme motif que le
+                            // plafond de zones) : `tune_core::license::
+                            // verdict_licence`. Une revocation autoritaire est
+                            // une expiration *passee*, jamais un
+                            // `license_valid:false` nu — celui-la peut etre
+                            // transitoire (re-liaison d'empreinte, hoquet du
+                            // serveur, cle tenue par une autre machine alors
+                            // que le compte est toujours premium).
+                            let verdict = tune_core::license::verdict_licence(&body);
+                            let valid = matches!(
+                                verdict,
+                                tune_core::license::VerdictLicence::Confirmee { .. }
+                            );
+                            let expired_authoritatively =
+                                matches!(verdict, tune_core::license::VerdictLicence::Expiree);
+                            let sans_verdict =
+                                matches!(verdict, tune_core::license::VerdictLicence::Absent);
                             let has_key = ls.license_key.is_some();
 
-                            if !valid && has_key && !expired_authoritatively {
+                            if sans_verdict {
+                                // Le serveur ne s'est pas prononce : ne rien
+                                // persister, ni accorder ni revoquer.
+                                debug!("heartbeat_licence_sans_verdict_palier_conserve");
+                            } else if !valid && has_key && !expired_authoritatively {
                                 // Do NOT immediately strip a key-based Premium on
                                 // a transient rejection: persisting Free here used
                                 // to destroy the premium marker permanently. Keep
@@ -1569,14 +1574,13 @@ fn spawn_heartbeat(state: &AppState) {
                                     }),
                                 );
                             } else {
-                                let tier = match tier_str {
-                                    "premium" => tune_core::license::Tier::Premium,
-                                    _ => tune_core::license::Tier::Free,
+                                let tune_core::license::VerdictLicence::Confirmee {
+                                    tier,
+                                    expires_at,
+                                } = verdict
+                                else {
+                                    unreachable!("les autres verdicts sont traites plus haut")
                                 };
-                                let expires_at = body
-                                    .get("license_expires_at")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from);
 
                                 license.update_from_server(tier, expires_at.clone()).await;
                                 info!(tier = %tier, "license_validated_from_heartbeat");
@@ -1688,41 +1692,34 @@ async fn revalider_la_cle(
             let Ok(body) = resp.json::<serde_json::Value>().await else {
                 return Some((Verdict::Echec, "reponse illisible".into()));
             };
-            let valid = body
-                .get("license_valid")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let expired_authoritatively = body
-                .get("license_expires_at")
-                .and_then(|v| v.as_str())
-                .map(tune_core::license::is_timestamp_past)
-                .unwrap_or(false);
-            if !valid && !expired_authoritatively {
-                warn!("license_key_rejected_by_server (keeping cached tier within grace)");
-                return Some((
-                    Verdict::Echec,
-                    "cle refusee, palier conserve dans la grace".into(),
-                ));
-            }
-            if !valid {
-                info!(expired_authoritatively, "license_invalidated_by_server");
-                license
-                    .update_from_server(tune_core::license::Tier::Free, None)
-                    .await;
-                event_bus.emit(
-                    "license.updated",
-                    serde_json::json!({ "tier": "free", "expires_at": null }),
-                );
-                return Some((Verdict::Succes, "licence expiree, palier gratuit".into()));
-            }
-            let tier = match body.get("license_tier").and_then(|v| v.as_str()) {
-                Some("premium") => tune_core::license::Tier::Premium,
-                _ => tune_core::license::Tier::Free,
+            // Meme lecture du verdict que le battement et que les deux routes.
+            let (tier, expires_at) = match tune_core::license::verdict_licence(&body) {
+                tune_core::license::VerdictLicence::Absent => {
+                    warn!("license_revalidation_sans_verdict_palier_conserve");
+                    return Some((Verdict::Echec, "aucun verdict rendu".into()));
+                }
+                tune_core::license::VerdictLicence::RefusTransitoire => {
+                    warn!("license_key_rejected_by_server (keeping cached tier within grace)");
+                    return Some((
+                        Verdict::Echec,
+                        "cle refusee, palier conserve dans la grace".into(),
+                    ));
+                }
+                tune_core::license::VerdictLicence::Expiree => {
+                    info!("license_invalidated_by_server (expiration autoritaire)");
+                    license
+                        .update_from_server(tune_core::license::Tier::Free, None)
+                        .await;
+                    event_bus.emit(
+                        "license.updated",
+                        serde_json::json!({ "tier": "free", "expires_at": null }),
+                    );
+                    return Some((Verdict::Succes, "licence expiree, palier gratuit".into()));
+                }
+                tune_core::license::VerdictLicence::Confirmee { tier, expires_at } => {
+                    (tier, expires_at)
+                }
             };
-            let expires_at = body
-                .get("license_expires_at")
-                .and_then(|v| v.as_str())
-                .map(String::from);
             license.update_from_server(tier, expires_at.clone()).await;
             info!(tier = %tier, "license_revalidated_without_heartbeat");
             event_bus.emit(
