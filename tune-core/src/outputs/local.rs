@@ -242,6 +242,58 @@ impl Drop for SentinelleDuFilDeLecture {
     }
 }
 
+/// #3575 — dire QUI tient le PCM, au moment exact où nous n'arrivons pas à
+/// l'ouvrir.
+///
+/// [`SentinelleDuFilDeLecture`] et [`decider_la_relache_du_peripherique`]
+/// (v0.9.145) ne connaissent qu'un seul teneur possible : **notre propre fil
+/// précédent**. Leur auteur l'a écrit dans la PR #3753 — un PCM tenu par une
+/// **instance précédente du processus**, par un descripteur qui aurait survécu
+/// à l'`execv` de mise à jour, ou par un tout autre programme (Lyrion/LMS,
+/// `aplay`, un PipeWire en accès direct) leur est invisible. C'est pourtant
+/// l'hypothèse centrale du ticket, celle qui expliquerait « imprenable pour
+/// toute la vie du processus ».
+///
+/// Depuis le 07/09/2026 la même observation est redemandée à chaque tour et
+/// n'arrive jamais, parce qu'elle exige d'être prise **avant** le redémarrage
+/// qui l'efface :
+///
+/// ```text
+/// fuser -v /dev/snd/*
+/// ps -ef | grep -c "[t]une-server"
+/// ```
+///
+/// Cette fonction la prend toute seule, à la milliseconde où le refus tombe.
+/// Elle **n'ouvre rien, ne ferme rien, ne tue personne et n'attend pas** : sur
+/// une P0 de sortie audio, une rustine qui « libère » un PCM rendrait muette la
+/// chaîne d'un testeur. Elle écrit une ligne, et c'est tout.
+///
+/// Elle ne s'exécute que sur le motif [`OpenFailure::IndisponibleMotifPerdu`],
+/// celui où cpal a replié `EBUSY` sur « no longer available » : ailleurs, le
+/// motif est connu et il n'y a pas de teneur à chercher.
+///
+/// ⚠️ Un `teneurs=aucun_teneur_visible` **n'est pas** la preuve que personne ne
+/// tient le nœud : `/proc/<pid>/fd` d'un autre compte n'est pas lisible sans
+/// privilège. Il dit « je n'ai vu personne », et c'est déjà une information que
+/// l'on n'avait pas.
+#[cfg(target_os = "linux")]
+fn journaliser_les_teneurs_du_pcm(endpoint_id: &str, device_name: &str) {
+    use crate::audio::pcm_teneur;
+    let Some((noeud, teneurs)) = pcm_teneur::relever_les_teneurs(endpoint_id) else {
+        // PCM partageable, `/proc/asound/cards` absent, endpoint illisible :
+        // il n'y a rien à dire, et taire vaut mieux que designer un coupable.
+        return;
+    };
+    warn!(
+        device = %device_name,
+        endpoint_id,
+        noeud = %noeud.chemin(),
+        teneurs = %pcm_teneur::resume_des_teneurs(&teneurs),
+        teneur_etranger = pcm_teneur::un_teneur_etranger(&teneurs),
+        "local_audio_pcm_holder_probe — qui tient le PCM que nous ne pouvons pas ouvrir (#3575)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Audio host selection (WASAPI vs ASIO on Windows)
 // ---------------------------------------------------------------------------
@@ -5294,6 +5346,11 @@ impl OutputTarget for LocalOutput {
                     endpoint_id = %opened_endpoint_id,
                     "local_audio_compressed_open_endpoint"
                 );
+                // #3575 - meme nom que sur le chemin PCM : la garde de site lit
+                // UN motif, pas deux, et un troisieme chemin d'echec ajoute
+                // demain tombera dessus.
+                #[cfg(target_os = "linux")]
+                let pcm_ouvert = opened_endpoint_id.clone();
 
                 // Prefer device's default rate and resample if needed.
                 // Same rationale as the WAV path: opening at the source
@@ -5431,6 +5488,13 @@ impl OutputTarget for LocalOutput {
                             .map(|e| e.to_string())
                             .unwrap_or_else(|| "aucune tentative".to_string());
                         let cause = classify_open_failure(&premier);
+                        // #3575 — quand cpal a DÉTRUIT le motif, aller chercher
+                        // dans /proc qui tient le nœud PCM, au lieu d'attendre
+                        // un `fuser -v /dev/snd/*` que personne ne tapera.
+                        #[cfg(target_os = "linux")]
+                        if cause == OpenFailure::IndisponibleMotifPerdu {
+                            journaliser_les_teneurs_du_pcm(&pcm_ouvert, &device_name);
+                        }
                         warn!(
                             device = %device_name,
                             tentatives = tentatives.len(),
@@ -6915,6 +6979,12 @@ impl OutputTarget for LocalOutput {
             //
             // If the source rate happens to match the device rate, no
             // resampling occurs (zero overhead).
+            //
+            // #3575 - le PCM reellement OUVERT, retenu HORS du bloc de decision
+            // de cadence : opened_endpoint_id meurt avec ce bloc, et le chemin
+            // d'echec qui en a besoin est 300 lignes plus bas.
+            #[cfg(target_os = "linux")]
+            let pcm_ouvert = device.id().map(|id| id.to_string()).unwrap_or_default();
             let output_config = {
                 // First, get the device's default config (reflects actual
                 // operating rate on most platforms).
@@ -7304,6 +7374,15 @@ impl OutputTarget for LocalOutput {
                                     // started outside the user session, or a
                                     // USB DAC that went away.
                                     let cause = classify_open_failure(&first_err.to_string());
+                                    // #3575 — quand cpal a DÉTRUIT le motif,
+                                    // aller chercher dans /proc qui tient le
+                                    // nœud PCM, au lieu d'attendre un
+                                    // `fuser -v /dev/snd/*` que personne ne
+                                    // tapera.
+                                    #[cfg(target_os = "linux")]
+                                    if cause == OpenFailure::IndisponibleMotifPerdu {
+                                        journaliser_les_teneurs_du_pcm(&pcm_ouvert, &device_name);
+                                    }
                                     warn!(
                                         device = %device_name,
                                         first_error = %first_err,

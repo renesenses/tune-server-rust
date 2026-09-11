@@ -40,6 +40,9 @@ pub mod mixer;
 /// réglage `zone_{id}_mono_downmix` (#2362).
 pub mod mono_downmix;
 pub mod opus_ogg;
+/// Qui tient le PCM ALSA que nous n'arrivons pas à ouvrir (#3575) — lecture
+/// de /proc, aucun effet sur la chaîne audio.
+pub mod pcm_teneur;
 pub mod pipeline;
 pub mod replaygain;
 pub mod resample;

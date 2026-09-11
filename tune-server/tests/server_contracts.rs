@@ -53,6 +53,8 @@ mod contexte_de_session;
 mod credits_enrichissement_statut;
 #[path = "crossfeed_dit_son_indisponibilite.rs"]
 mod crossfeed_dit_son_indisponibilite;
+#[path = "dsp_egaliseur_dans_le_rapport_3479.rs"]
+mod dsp_egaliseur_dans_le_rapport_3479;
 #[path = "echec_de_decodage_dit_pourquoi_i3270.rs"]
 mod echec_de_decodage_dit_pourquoi_i3270;
 #[path = "enrich_artiste_langue_entete.rs"]
@@ -86,6 +88,8 @@ mod features_livrees_3355;
 mod file_promet_l_enchainement;
 #[path = "fonds_communautaire_par_mbid.rs"]
 mod fonds_communautaire_par_mbid;
+#[path = "garde_de_site_porteur_dop_3233.rs"]
+mod garde_de_site_porteur_dop_3233;
 #[path = "generateur_playlists_sans_ia.rs"]
 mod generateur_playlists_sans_ia;
 #[path = "http_client_seam.rs"]
@@ -178,6 +182,8 @@ mod support_journaux_joints;
 mod support_relais_diagnostic_sortant;
 #[path = "support_relais_marquer_lu.rs"]
 mod support_relais_marquer_lu;
+#[path = "teneur_du_pcm_branche_3575.rs"]
+mod teneur_du_pcm_branche_3575;
 #[path = "tests_orphelins.rs"]
 mod tests_orphelins;
 #[path = "tranches_dynamic_range.rs"]
