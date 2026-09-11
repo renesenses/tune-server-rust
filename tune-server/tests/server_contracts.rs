@@ -125,6 +125,8 @@ mod playlist_manager_cloisonnement_par_profil;
 mod playlists_cloisonnement_par_profil;
 #[path = "playlists_ecritures_partielles.rs"]
 mod playlists_ecritures_partielles;
+#[path = "playlists_pistes_de_service.rs"]
+mod playlists_pistes_de_service;
 #[path = "podcasts_radiofrance_cle.rs"]
 mod podcasts_radiofrance_cle;
 // #3266 — la portee des lignes `cargo test` de la CI, gardee par le workflow
