@@ -986,6 +986,13 @@ pub struct EpisodeFamine {
     /// depuis le début de la piste, la seule qui compte le temps réellement
     /// joué.
     pub flux_ms: u64,
+    /// Temps de l'HORLOGE MURALE couvert par l'épisode, mesuré par le sondeur.
+    ///
+    /// C'est le dénominateur qui manquait : `duree_ms` seul ne dit pas si le
+    /// pilote a réclamé son dû. 128 ms d'horloge de pilote sur 128 ms de temps
+    /// réel est une lecture normale ; 128 ms sur 1 000 ms est un rappel à
+    /// l'arrêt (#3814).
+    pub ecoule_ms: u64,
 }
 
 /// Ce qu'un tick a constaté sur l'anneau d'une zone.
@@ -994,19 +1001,79 @@ pub enum FamineAnneau {
     /// L'anneau vient de se vider : premier tick où le pilote est servi à
     /// court. Porte ce que ce tick-là a coûté.
     Debut(EpisodeFamine),
-    /// L'anneau est réalimenté : le pilote a été servi en entier sur tout
-    /// l'intervalle. Porte le bilan CUMULÉ depuis le début de l'épisode.
+    /// L'anneau est réalimenté : sur tout l'intervalle le pilote a réclamé
+    /// son dû — à la cadence du temps réel — et l'a reçu en entier. Porte le
+    /// bilan CUMULÉ depuis le début de l'épisode.
     Fin(EpisodeFamine),
+    /// Le pilote a CESSÉ de réclamer son dû : son horloge (`duree_ms`) n'a
+    /// pas suivi le temps réellement écoulé (`ecoule_ms`).
+    ///
+    /// C'est l'exact contraire d'un anneau réalimenté, et c'est le cas que
+    /// [`FamineAnneau::Fin`] annonçait à tort : « plus aucun rappel servi à
+    /// court » est vrai aussi bien quand le producteur a rattrapé son retard
+    /// que quand le CONSOMMATEUR s'est tu. Un pilote en marche réclame
+    /// ~1 000 ms d'audio par seconde de temps réel, anneau plein ou vide — un
+    /// anneau vide lui rend des zéros, il ne suspend pas ses rappels. Une
+    /// horloge de pilote qui stagne ne se corrige donc PAS en nourrissant
+    /// mieux l'anneau : c'est en aval qu'il faut chercher.
+    RappelArrete(EpisodeFamine),
+    /// Le pilote s'est remis à réclamer son dû à la cadence du temps réel.
+    /// Porte le bilan de tout l'arrêt.
+    RappelRepris(EpisodeFamine),
+}
+
+/// Intervalle de sondage en deçà duquel le rapport « horloge du pilote /
+/// temps réel » ne dit rien : deux relevés pris à 100 ms d'écart tombent dans
+/// le bruit d'un tampon de période.
+pub const ECOULE_MINIMAL_MS: u64 = 500;
+
+/// Ticks consécutifs en retard avant d'annoncer un rappel à l'arrêt quand
+/// AUCUNE famine n'est ouverte.
+///
+/// Trois, et pas un : entre deux pistes sans enchaînement continu, le flux de
+/// sortie se referme et ses compteurs restent figés jusqu'au `begin_stream`
+/// suivant, pendant que la zone se dit encore `Playing`. Ce trou-là dure
+/// quelques centaines de millisecondes (`playback_timing … total_ms=219` chez
+/// Didier) ; trois ticks de sondeur, soit environ trois secondes, le laissent
+/// passer sans écrire une ligne.
+pub const TICKS_AVANT_ARRET: u8 = 3;
+
+/// Le pilote a-t-il pris du retard sur le temps réel ?
+///
+/// `duree_ms` est l'avance de l'horloge du PILOTE entre deux relevés — les
+/// échantillons qu'il a réclamés, convertis en millisecondes par
+/// `RingStarvation::snapshot`. `ecoule_ms` est le temps de l'HORLOGE MURALE
+/// entre les deux mêmes relevés, mesuré par le sondeur.
+///
+/// Un pilote en marche tient les deux égaux à la gigue près. La moitié est un
+/// seuil volontairement grossier : il ne s'agit pas de mesurer une dérive mais
+/// de séparer « ça tourne » de « ça ne tourne plus ». Chez Dimitri (#3814),
+/// 128 ms d'horloge de pilote pour au moins 1 000 ms de temps réel donnent
+/// 12,8 % — on n'est pas près du seuil.
+pub fn rappel_en_retard(duree_ms: u64, ecoule_ms: u64) -> bool {
+    ecoule_ms >= ECOULE_MINIMAL_MS && duree_ms.saturating_mul(2) < ecoule_ms
+}
+
+/// Un retard de rappel en cours d'observation.
+#[derive(Debug, Clone, Copy)]
+struct Retard {
+    /// Le dernier relevé où le pilote tenait encore la cadence.
+    depuis: OutputRingStarvation,
+    /// Temps réel cumulé depuis ce relevé.
+    cumul_ms: u64,
+    /// Ticks consécutifs en retard.
+    ticks: u8,
+    /// L'arrêt a-t-il déjà été annoncé ? Si oui, sa reprise doit l'être aussi.
+    annonce: bool,
 }
 
 /// Le suivi de la famine d'UNE zone, d'un tick au suivant.
 ///
-/// Purement comptable : il ne lit pas l'heure (l'horloge du pilote, portée par
-/// les relevés, est la seule honnête — un tick de sondeur retardé par la même
-/// saturation de processeur mentirait sur la durée) et il ne journalise rien.
-/// L'appelant décide quoi écrire.
+/// Purement comptable : il ne lit pas l'heure (l'appelant lui verse le temps
+/// écoulé, mesuré une seule fois, ce qui rend tout le fichier testable sans
+/// dormir) et il ne journalise rien. L'appelant décide quoi écrire.
 ///
-/// Trois refus délibérés :
+/// Quatre refus délibérés :
 ///
 /// 1. **Le premier relevé ne dit jamais rien.** Il sert de repère. Des
 ///    compteurs déjà hauts au moment où on commence à regarder n'appartiennent
@@ -1019,6 +1086,13 @@ pub enum FamineAnneau {
 /// 3. **Une famine qui dure ne s'écrit qu'une fois.** Chez Yacine, l'anneau
 ///    reste vide 38 s d'affilée : au tick du sondeur, cela ferait 38 lignes
 ///    identiques. Deux suffisent, et la seconde porte le total.
+/// 4. **Un épisode ne se ferme jamais sur « réalimenté » quand le pilote
+///    s'est tu.** C'est le refus le plus récent (#3814) et le seul qui portait
+///    à conséquence : `courant.events == dernier.events` — « aucun nouveau
+///    rappel servi à court » — est vrai des deux côtés du diagnostic. Sans le
+///    temps réel pour dénominateur, le suivi appelait « anneau réalimenté »
+///    une sortie dont le rappel ne tournait plus, et envoyait chercher la
+///    panne chez le producteur.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SuiviFamine {
     /// Le relevé du tick précédent, quel qu'il soit.
@@ -1026,11 +1100,41 @@ pub struct SuiviFamine {
     /// Le relevé qui PRÉCÈDE l'épisode en cours — le dernier instant où
     /// l'anneau tenait encore. `None` quand rien n'est ouvert.
     avant_episode: Option<OutputRingStarvation>,
+    /// Temps réel cumulé depuis `avant_episode`.
+    cumul_episode_ms: u64,
+    /// Le retard du pilote en cours d'observation, s'il y en a un.
+    retard: Option<Retard>,
+    /// Le DERNIER intervalle observé était-il en retard ?
+    ///
+    /// Mémorisé parce que la branche « flux neuf » juge un intervalle qu'elle
+    /// ne voit plus : quand `begin_stream` a remis les compteurs à zéro, le
+    /// dernier intervalle du flux qui s'achève est déjà derrière. C'est
+    /// pourtant LUI qui dit si ce flux est mort d'un anneau vide ou d'un
+    /// rappel arrêté — et chez Dimitri la ligne tombe précisément là, au
+    /// seek qui relance la lecture.
+    dernier_intervalle_en_retard: bool,
 }
 
 impl SuiviFamine {
+    /// Repartir de zéro : la zone n'est plus en lecture, ou la sortie n'a plus
+    /// d'anneau à relire.
+    ///
+    /// Sans ça, un relevé pris avant une pause servirait de repère au relevé
+    /// pris après elle, et tout le temps de la pause compterait comme du
+    /// retard de pilote.
+    pub fn reinitialiser(&mut self) {
+        *self = Self::default();
+    }
+
     /// Verser un relevé et dire ce qu'il faut en écrire.
-    pub fn observer(&mut self, courant: OutputRingStarvation) -> Option<FamineAnneau> {
+    ///
+    /// `ecoule_ms` est le temps de l'horloge murale depuis le relevé
+    /// précédent, mesuré par l'appelant.
+    pub fn observer(
+        &mut self,
+        courant: OutputRingStarvation,
+        ecoule_ms: u64,
+    ) -> Option<FamineAnneau> {
         let Some(dernier) = self.dernier else {
             self.dernier = Some(courant);
             return None;
@@ -1038,34 +1142,108 @@ impl SuiviFamine {
 
         // Flux neuf : `begin_stream` a remis les compteurs à zéro.
         if courant.served_samples < dernier.served_samples || courant.events < dernier.events {
-            let bilan = self
-                .avant_episode
-                .take()
-                .map(|avant| FamineAnneau::Fin(episode(avant, dernier)));
+            let cumul = self.cumul_episode_ms;
+            // Le dernier intervalle de la piste qui s'achève décide du verdict :
+            // chez Dimitri, la ligne tombe AU seek, et c'est bien le flux
+            // mourant dont le rappel s'était arrêté.
+            let mourant_en_retard = self.dernier_intervalle_en_retard;
+            let bilan = self.avant_episode.take().map(|avant| {
+                let ep = episode(avant, dernier, cumul);
+                if mourant_en_retard {
+                    FamineAnneau::RappelArrete(ep)
+                } else {
+                    FamineAnneau::Fin(ep)
+                }
+            });
             self.dernier = Some(courant);
+            self.avant_episode = None;
+            self.cumul_episode_ms = 0;
+            self.retard = None;
+            self.dernier_intervalle_en_retard = false;
             return bilan;
         }
 
+        let duree_ms = courant.stream_ms.saturating_sub(dernier.stream_ms);
+        let en_retard = rappel_en_retard(duree_ms, ecoule_ms);
         let a_court = courant.events > dernier.events;
+
         let issue = if a_court {
             if self.avant_episode.is_none() {
                 self.avant_episode = Some(dernier);
-                Some(FamineAnneau::Debut(episode(dernier, courant)))
+                self.cumul_episode_ms = ecoule_ms;
+                Some(FamineAnneau::Debut(episode(dernier, courant, ecoule_ms)))
             } else {
+                self.cumul_episode_ms = self.cumul_episode_ms.saturating_add(ecoule_ms);
                 None
             }
+        } else if let Some(avant) = self.avant_episode.take() {
+            // Une famine ouverte se ferme ici, et son verdict dépend de ce que
+            // le PILOTE a fait de l'intervalle, pas seulement de ses rappels à
+            // court : un rappel arrêté ne produit plus d'événement, exactement
+            // comme un anneau réalimenté.
+            let cumul = self.cumul_episode_ms.saturating_add(ecoule_ms);
+            self.cumul_episode_ms = 0;
+            let ep = episode(avant, courant, cumul);
+            if en_retard {
+                self.retard = Some(Retard {
+                    depuis: dernier,
+                    cumul_ms: ecoule_ms,
+                    ticks: 1,
+                    annonce: true,
+                });
+                Some(FamineAnneau::RappelArrete(ep))
+            } else {
+                self.retard = None;
+                Some(FamineAnneau::Fin(ep))
+            }
+        } else if en_retard {
+            // Aucune famine : le pilote peut s'arrêter sans jamais avoir été
+            // servi à court (l'anneau reste plein), et RIEN ne le disait.
+            let mut retard = self.retard.unwrap_or(Retard {
+                depuis: dernier,
+                cumul_ms: 0,
+                ticks: 0,
+                annonce: false,
+            });
+            retard.cumul_ms = retard.cumul_ms.saturating_add(ecoule_ms);
+            retard.ticks = retard.ticks.saturating_add(1);
+            let annonce = !retard.annonce && retard.ticks >= TICKS_AVANT_ARRET;
+            if annonce {
+                retard.annonce = true;
+            }
+            let cumul = retard.cumul_ms;
+            let depuis = retard.depuis;
+            self.retard = Some(retard);
+            annonce.then(|| FamineAnneau::RappelArrete(episode(depuis, courant, cumul)))
         } else {
-            self.avant_episode
-                .take()
-                .map(|avant| FamineAnneau::Fin(episode(avant, courant)))
+            let repris = self.retard.take().and_then(|retard| {
+                retard.annonce.then(|| {
+                    FamineAnneau::RappelRepris(episode(
+                        retard.depuis,
+                        courant,
+                        retard.cumul_ms.saturating_add(ecoule_ms),
+                    ))
+                })
+            });
+            repris
         };
         self.dernier = Some(courant);
+        self.dernier_intervalle_en_retard = en_retard;
         issue
     }
 }
 
 /// Le bilan entre deux relevés du MÊME flux, `avant` étant le plus ancien.
-fn episode(avant: OutputRingStarvation, apres: OutputRingStarvation) -> EpisodeFamine {
+///
+/// `ecoule_ms` est le temps de l'horloge murale couvert par ces deux relevés.
+/// Il est porté par le bilan parce que `duree_ms` seul ne se lit pas : 128 ms
+/// d'audio joué est une broutille sur 128 ms de temps réel et une lecture à
+/// l'arrêt sur une seconde.
+fn episode(
+    avant: OutputRingStarvation,
+    apres: OutputRingStarvation,
+    ecoule_ms: u64,
+) -> EpisodeFamine {
     let manquants = apres.missing_samples.saturating_sub(avant.missing_samples);
     EpisodeFamine {
         rappels_a_court: apres.events.saturating_sub(avant.events),
@@ -1073,6 +1251,7 @@ fn episode(avant: OutputRingStarvation, apres: OutputRingStarvation) -> EpisodeF
         silence_ms: silence_ms(manquants, apres),
         duree_ms: apres.stream_ms.saturating_sub(avant.stream_ms),
         flux_ms: apres.stream_ms,
+        ecoule_ms,
     }
 }
 

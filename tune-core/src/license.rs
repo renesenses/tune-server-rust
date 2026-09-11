@@ -1081,6 +1081,84 @@ pub fn is_timestamp_past(timestamp: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Verdict du serveur de licences — lecture unique
+// ---------------------------------------------------------------------------
+
+/// Ce que la reponse du serveur de licences dit d'une cle.
+///
+/// **Une seule lecture** du corps rendu par `POST /api/v1/license/validate`
+/// (et des memes champs portes par la reponse du battement de coeur). Quatre
+/// endroits lisaient ce corps chacun de son cote — `validate_stored_license`,
+/// la route `POST /cloud/license/validate`, le battement et
+/// `revalider_la_cle` — avec des defauts **opposes** sur le champ manquant :
+/// deux defaillaient a `false`, deux a `true`. Celui de la route du bouton
+/// « Valider » etait le seul sans garde sur `license_tier` ; il persistait donc
+/// Free pour un compte premium tout en repondant `status:"validated"`.
+///
+/// La decision de **persister** n'appartient pas a ce type : chaque appelant
+/// garde sa politique (le battement a besoin de savoir si une cle est
+/// enregistree, la route doit choisir son `status`). Ce type ne dit que ce que
+/// le serveur a repondu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerdictLicence {
+    /// Le corps ne porte pas `license_valid` : le serveur ne s'est pas
+    /// prononce. Ne rien persister — ni accorder, ni revoquer. C'est le cas
+    /// d'un point d'acces redirige, d'une enveloppe d'erreur rendue en 200, ou
+    /// d'un schema qui a bouge.
+    Absent,
+    /// Cle confirmee : palier autoritaire a appliquer.
+    Confirmee {
+        tier: Tier,
+        expires_at: Option<String>,
+    },
+    /// `license_valid:false` **nu**. Ce n'est PAS une revocation : re-liaison
+    /// d'empreinte, hoquet du serveur, session tenue par une autre machine.
+    /// Garder le palier en cache ; la grace hors ligne expire d'elle-meme si
+    /// le refus persiste.
+    RefusTransitoire,
+    /// `license_valid:false` **avec** une `license_expires_at` deja passee :
+    /// la seule revocation autoritaire.
+    Expiree,
+}
+
+/// Lit le verdict porte par la reponse du serveur de licences.
+///
+/// Fonction pure : aucun acces base, aucun reseau, aucune horloge hors de
+/// [`is_timestamp_past`]. C'est ce qui la rend exhaustivement testable, et
+/// c'est tout l'interet de l'avoir sortie des quatre appelants.
+pub fn verdict_licence(body: &serde_json::Value) -> VerdictLicence {
+    // Defaut fermant : un verdict absent n'accorde rien. Il ne retire rien non
+    // plus — c'est la difference avec ce que faisait la route « Valider ».
+    let Some(valide) = body.get("license_valid").and_then(|v| v.as_bool()) else {
+        return VerdictLicence::Absent;
+    };
+
+    if !valide {
+        let expiree = body
+            .get("license_expires_at")
+            .and_then(|v| v.as_str())
+            .map(is_timestamp_past)
+            .unwrap_or(false);
+        return if expiree {
+            VerdictLicence::Expiree
+        } else {
+            VerdictLicence::RefusTransitoire
+        };
+    }
+
+    VerdictLicence::Confirmee {
+        tier: match body.get("license_tier").and_then(|v| v.as_str()) {
+            Some("premium") => Tier::Premium,
+            _ => Tier::Free,
+        },
+        expires_at: body
+            .get("license_expires_at")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    }
+}
+
 /// Check whether an ISO-8601 timestamp is older than `days` from now.
 /// Parse a timestamp coming either from our own settings (`...Z`) or from the
 /// licence server, which emits real ISO 8601 **with an offset**
@@ -2013,5 +2091,120 @@ mod tests {
         );
         assert_eq!(apres.days_since_validation, 0);
         assert!(mgr.is_premium().await);
+    }
+
+    // -----------------------------------------------------------------------
+    // Verdict du serveur de licences : la lecture unique (#3673, meme motif)
+    // -----------------------------------------------------------------------
+
+    /// L'aiguille est assemblee a l'execution : ecrite en clair, elle se
+    /// trouverait elle-meme si quelqu'un cherchait le champ dans ce fichier.
+    fn champ_verdict() -> String {
+        format!("{}_{}", "license", "valid")
+    }
+
+    fn corps(paires: &[(&str, serde_json::Value)]) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        for (k, v) in paires {
+            m.insert((*k).to_string(), v.clone());
+        }
+        serde_json::Value::Object(m)
+    }
+
+    #[test]
+    fn un_verdict_absent_n_accorde_rien_et_ne_retire_rien() {
+        // Le cas qui faisait retomber un compte premium en Free avec un
+        // `status:"validated"` : 200, corps lisible, mais aucun verdict.
+        assert_eq!(verdict_licence(&corps(&[])), VerdictLicence::Absent);
+        assert_eq!(
+            verdict_licence(&corps(&[("ok", serde_json::json!(true))])),
+            VerdictLicence::Absent,
+            "une enveloppe d'erreur rendue en 200 ne vaut pas verdict"
+        );
+        // Palier present, verdict absent : on ne devine pas non plus.
+        assert_eq!(
+            verdict_licence(&corps(&[("license_tier", serde_json::json!("premium"))])),
+            VerdictLicence::Absent
+        );
+        // Verdict present mais pas booleen : toujours pas un verdict.
+        assert_eq!(
+            verdict_licence(&corps(&[(&champ_verdict(), serde_json::json!("true"))])),
+            VerdictLicence::Absent
+        );
+    }
+
+    #[test]
+    fn un_refus_nu_est_transitoire_seule_une_expiration_passee_revoque() {
+        assert_eq!(
+            verdict_licence(&corps(&[(&champ_verdict(), serde_json::json!(false))])),
+            VerdictLicence::RefusTransitoire
+        );
+        // Expiration a venir : toujours transitoire.
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                (
+                    "license_expires_at",
+                    serde_json::json!("2099-01-01T00:00:00Z")
+                ),
+            ])),
+            VerdictLicence::RefusTransitoire
+        );
+        // Date illisible : `is_timestamp_past` echoue en OUVERT, donc pas de
+        // revocation sur une donnee malformee.
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                ("license_expires_at", serde_json::json!("pas-une-date")),
+            ])),
+            VerdictLicence::RefusTransitoire
+        );
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                (
+                    "license_expires_at",
+                    serde_json::json!("2000-01-01T00:00:00Z")
+                ),
+            ])),
+            VerdictLicence::Expiree
+        );
+    }
+
+    #[test]
+    fn une_confirmation_porte_le_palier_du_serveur_jamais_une_promesse_locale() {
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(true)),
+                ("license_tier", serde_json::json!("premium")),
+                (
+                    "license_expires_at",
+                    serde_json::json!("2099-01-01T00:00:00Z")
+                ),
+            ])),
+            VerdictLicence::Confirmee {
+                tier: Tier::Premium,
+                expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            }
+        );
+        // Confirmee sans palier nomme : Free, jamais Premium par defaut.
+        assert_eq!(
+            verdict_licence(&corps(&[(&champ_verdict(), serde_json::json!(true))])),
+            VerdictLicence::Confirmee {
+                tier: Tier::Free,
+                expires_at: None,
+            }
+        );
+        // Palier inconnu : Free, pas une promotion.
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(true)),
+                ("license_tier", serde_json::json!("ultimate")),
+            ])),
+            VerdictLicence::Confirmee {
+                tier: Tier::Free,
+                expires_at: None,
+            }
+        );
     }
 }

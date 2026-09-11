@@ -397,6 +397,27 @@ impl PlaybackOrchestrator {
                     Some(16u32),
                     Some(2u32),
                 )
+            } else if is_browser_output {
+                // 🔴 #2076 / #2158 generalises — le DERNIER bras direct
+                // (serveur multimedia, podcast) rendait encore l'URL amont
+                // telle quelle, sans regarder si la sortie etait un onglet.
+                //
+                // Le client web reecrit une URL absolue en chemin relatif pour
+                // joindre l'hote qu'il a su atteindre. Sur une URL TIERCE, cela
+                // jette le domaine : l'onglet demande `cdn.exemple.org/…` A
+                // TUNE, qui ne connait pas ce chemin et repond par son repli
+                // SPA — `200 text/html`, « Failed to init decoder ». C'est mot
+                // pour mot la panne de Bilou (#2076, fil 1509), et les deux
+                // autres bras l'ont deja corrigee chacun de leur cote :
+                // Bandcamp par `relayer_bandcamp_au_reseau`, la radio par
+                // #2670, dont le commentaire nomme explicitement la meme cause.
+                //
+                // On relaie donc les octets VERBATIM, comme Bandcamp : aucun
+                // transcodage, la resolution annoncee par l'appelant est
+                // conservee (un ALAC 24 bits d'un NAS ne doit pas se retrouver
+                // etiquete 44,1/16 — Yves), et l'URL rendue est une adresse de
+                // Tune, que le client peut reecrire sans rien casser.
+                self.relayer_direct_au_navigateur(req, d).await
             } else {
                 // Media-server / podcast direct URL. Carry the real resolution the
                 // client passed from the DIDL res@ attributes (e.g. 24-bit ALAC)
@@ -453,6 +474,11 @@ impl PlaybackOrchestrator {
             ..
         } = d;
         let radio_eq_profile = d.radio_eq_profile.clone();
+        // #3756 — la zone redemande la station : on oublie le verdict définitif
+        // qu'une tentative précédente avait pu porter sur elle. Un geste
+        // explicite de l'auditeur a toujours le droit de réessayer ; c'est la
+        // RELANCE AUTOMATIQUE du sondeur, et elle seule, que la mémoire borne.
+        self.oublier_radio_refusee(req.zone_id);
         // Local/OAAT outputs cannot play compressed streams directly —
         // they expect raw PCM in a WAV container.  For radio (infinite
         // stream), we decode the HTTP stream progressively to PCM and
@@ -502,6 +528,11 @@ impl PlaybackOrchestrator {
         let err_bus = self.event_bus.clone();
         let err_zone = req.zone_id;
         let err_station = title.clone();
+        // #3756 — de quoi RETENIR l'échec, pas seulement le dire. Le sondeur
+        // ne voit que le `Ok` de `play()` ; sans cette mémoire il relance une
+        // station que le décodeur vient de déclarer irrécupérable.
+        let refusees = self.radios_refusees.clone();
+        let refus_source_id = req.source_id.clone();
         tokio::spawn(async move {
             // Download + decode in a blocking thread since symphonia and
             // reqwest::blocking are both synchronous.
@@ -534,6 +565,23 @@ impl PlaybackOrchestrator {
                 Ok(Err(e)) => {
                     warn!(error = %e, "radio_local_decode_failed");
                     emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
+                    // Verdict DÉFINITIF ou simple panne ? Les deux préfixes
+                    // ci-dessous portent déjà, chacun dans son commentaire, la
+                    // phrase « ne guérira pas en réessayant » — mais personne
+                    // ne la lisait hors de la boucle de reconnexion interne.
+                    // Une coupure réseau, elle, n'entre pas ici : la reprise
+                    // légitime d'un flux qui tombe continue de marcher.
+                    let definitif = e.starts_with(super::radio::RADIO_NOT_AUDIO)
+                        || e.starts_with(super::radio::RADIO_HLS_UNSUPPORTED);
+                    if let (true, Some(sid)) = (definitif, refus_source_id.as_deref()) {
+                        warn!(
+                            zone_id = err_zone,
+                            source_id = sid,
+                            error = %e,
+                            "radio_echec_definitif_relance_desarmee_3756"
+                        );
+                        PlaybackOrchestrator::noter_radio_refusee(&refusees, err_zone, sid);
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "radio_local_decode_task_panic");
@@ -630,6 +678,56 @@ impl PlaybackOrchestrator {
 
     /// Bandcamp vers un renderer réseau ou le navigateur : relais HTTP du flux
     /// HTTPS par une session mandataire, le codec annoncé venant de l'URL.
+    /// Relayer une URL TIERCE vers l'onglet, octet pour octet (#2076).
+    ///
+    /// Meme geste que [`Self::relayer_bandcamp_au_reseau`] — une session proxy
+    /// locale, `create_proxy_session(..., false)` — mais pour le bras generique
+    /// : serveur multimedia (UPnP/DLNA) et podcast.
+    ///
+    /// Rien n'est transcode. Le conteneur annonce est deduit de l'URL, et la
+    /// resolution que l'appelant a portee depuis les attributs `res@` du DIDL
+    /// est conservee telle quelle : c'est ce qui empeche un ALAC 24 bits d'un
+    /// NAS d'etre affiche en 44,1 kHz / 16 bits.
+    async fn relayer_direct_au_navigateur(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
+        let Directe {
+            audio_url,
+            mime_type,
+            duration_ms,
+            ..
+        } = d;
+        let conteneur = conteneur_depuis_url(audio_url, mime_type);
+        let info = StreamInfo {
+            format: conteneur.to_string(),
+            mime_type: mime_type.to_string(),
+            sample_rate: req.sample_rate.unwrap_or(44_100),
+            bit_depth: req.bit_depth.unwrap_or(16),
+            channels: 2,
+            file_size: None,
+            duration_ms: duration_ms.map(|d| d as u64),
+            ..Default::default()
+        };
+        let session_id = self
+            .streamer
+            .create_proxy_session(info, audio_url.to_string(), false)
+            .await;
+        let server_ip = self.server_ip();
+        let stream_url = self
+            .streamer
+            .get_stream_url(&session_id, &server_ip, conteneur);
+        info!(
+            url = %audio_url,
+            conteneur,
+            "direct_proxy_for_browser_output"
+        );
+        (
+            stream_url,
+            Some(session_id),
+            mime_type.to_string(),
+            req.sample_rate,
+            req.bit_depth.map(|b| b as u32),
+            None,
+        )
+    }
     async fn relayer_bandcamp_au_reseau(&self, d: Directe<'_>) -> FluxDirect {
         let Directe {
             audio_url,
@@ -699,6 +797,9 @@ impl PlaybackOrchestrator {
             ..
         } = d;
         let radio_eq_profile = d.radio_eq_profile.clone();
+        // #3756 — la zone redemande la station : on oublie le verdict définitif
+        // porté par une tentative précédente (voir `decoder_la_radio_en_wav`).
+        self.oublier_radio_refusee(req.zone_id);
         // Network outputs (DLNA): check if the renderer supports the
         // radio stream format (typically AAC). If not, proxy + transcode
         // to WAV so the renderer can play it.
@@ -792,6 +893,12 @@ impl PlaybackOrchestrator {
             let err_bus = self.event_bus.clone();
             let err_zone = req.zone_id;
             let err_station = title.clone();
+            // #3756 — même mémoire que le chemin local/OAAT. Le journal du
+            // ticket vient d'une sortie ALSA, mais rien dans la boucle de
+            // relance du sondeur ne distingue les deux : armer un seul des
+            // deux chemins laisserait la relance sans fin sur l'autre.
+            let refusees = self.radios_refusees.clone();
+            let refus_source_id = req.source_id.clone();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     decode_radio_stream_to_pcm(
@@ -812,6 +919,17 @@ impl PlaybackOrchestrator {
                     Ok(Err(e)) => {
                         warn!(error = %e, "radio_dlna_decode_failed");
                         emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
+                        let definitif = e.starts_with(super::radio::RADIO_NOT_AUDIO)
+                            || e.starts_with(super::radio::RADIO_HLS_UNSUPPORTED);
+                        if let (true, Some(sid)) = (definitif, refus_source_id.as_deref()) {
+                            warn!(
+                                zone_id = err_zone,
+                                source_id = sid,
+                                error = %e,
+                                "radio_echec_definitif_relance_desarmee_3756"
+                            );
+                            PlaybackOrchestrator::noter_radio_refusee(&refusees, err_zone, sid);
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "radio_dlna_decode_task_panic");
@@ -844,5 +962,39 @@ impl PlaybackOrchestrator {
             };
             (direct_url, None, mime_type.to_string(), None, None, None)
         }
+    }
+}
+
+/// Le conteneur a annoncer pour une URL relayee verbatim.
+///
+/// L'extension de l'URL fait foi — c'est elle que le serveur amont a choisie.
+/// Faute d'extension reconnue, on retombe sur ce que dit le type MIME, et en
+/// dernier ressort sur `mp3`, l'encodage le plus repandu sur ces deux chemins
+/// (podcast, serveur multimedia). Le conteneur ne sert qu'a nommer l'extension
+/// de l'adresse rendue : les octets, eux, passent tels quels.
+fn conteneur_depuis_url(url: &str, mime: &str) -> &'static str {
+    let chemin = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
+    for (suffixe, conteneur) in [
+        (".flac", "flac"),
+        (".wav", "wav"),
+        (".m4a", "m4a"),
+        (".mp4", "m4a"),
+        (".aac", "aac"),
+        (".ogg", "ogg"),
+        (".opus", "opus"),
+        (".mp3", "mp3"),
+    ] {
+        if chemin.ends_with(suffixe) {
+            return conteneur;
+        }
+    }
+    match mime {
+        "audio/flac" | "audio/x-flac" => "flac",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => "m4a",
+        "audio/aac" => "aac",
+        "audio/ogg" | "application/ogg" => "ogg",
+        "audio/opus" => "opus",
+        _ => "mp3",
     }
 }

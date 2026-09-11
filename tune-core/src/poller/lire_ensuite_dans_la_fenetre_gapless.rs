@@ -166,6 +166,18 @@ impl Banc {
     /// renderer et l'horloge de fin de piste du poller sont deux champs, on
     /// les écrit. C'est l'injection réclamée — pas un `sleep` déguisé.
     async fn a(&mut self, position_ms: u64) {
+        self.poser(position_ms, DUREE_COURANTE_MS as u64).await;
+    }
+
+    /// Le même geste, mais le renderer n'annonce AUCUNE durée (`0`). C'est
+    /// le Devialet de FabienM (#1929, point 3) et le pont UPnP LMS
+    /// (Yacine/Jean-Pierre) : la durée que Tune connaît est celle de la
+    /// FILE, pas celle du renderer.
+    async fn a_sans_duree_annoncee(&mut self, position_ms: u64) {
+        self.poser(position_ms, 0).await;
+    }
+
+    async fn poser(&mut self, position_ms: u64, duree_annoncee_ms: u64) {
         {
             let reg = self.outputs.lock().await;
             let arc = reg.get(APPAREIL).unwrap();
@@ -173,7 +185,7 @@ impl Banc {
             let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
             mock.set_state(crate::outputs::traits::TransportState::Playing)
                 .await;
-            mock.set_duration(DUREE_COURANTE_MS as u64);
+            mock.set_duration(duree_annoncee_ms);
             mock.set_position(position_ms);
         }
         let ps = self.poll_states.get_mut(&self.zone_id).unwrap();
@@ -195,6 +207,17 @@ impl Banc {
     /// repart de zéro. C'est la chute de position du journal
     /// (`gapless_position_reset_detected prev_pos=… new_pos=0`).
     async fn le_renderer_enchaine(&mut self) {
+        self.enchainer(DUREE_SUIVANTE_MS as u64).await;
+    }
+
+    /// Le même enchaînement chez un renderer muet sur la durée : il passe à
+    /// l'URI armée et continue d'annoncer `0`. Ni avant ni après la
+    /// transition Tune n'apprend quoi que ce soit de lui.
+    async fn le_renderer_enchaine_sans_duree(&mut self) {
+        self.enchainer(0).await;
+    }
+
+    async fn enchainer(&mut self, duree_annoncee_ms: u64) {
         let reg = self.outputs.lock().await;
         let arc = reg.get(APPAREIL).unwrap();
         let sortie = arc.lock().await;
@@ -202,7 +225,7 @@ impl Banc {
             .as_any()
             .downcast_ref::<MockOutput>()
             .unwrap()
-            .simulate_gapless_transition(DUREE_SUIVANTE_MS as u64)
+            .simulate_gapless_transition(duree_annoncee_ms)
             .await;
     }
 
@@ -520,6 +543,79 @@ async fn hors_de_la_fenetre_lire_ensuite_se_comporte_comme_avant() {
     banc.tic().await;
     assert_eq!(banc.ecran().await, (1, INSEREE.to_string()));
     assert_eq!(banc.joue_par_le_renderer().await.as_deref(), Some(INSEREE));
+}
+
+/// **#1929, point 3 — un renderer qui annonce une durée de ZÉRO enchaîne
+/// quand même.**
+///
+/// Le tri du 02/09 range ce point parmi les « non corrigés » : *« Son
+/// Devialet annonce une durée de zéro (`reported_duration_ms=0`),
+/// l'enchaînement ne s'arme jamais »*. **La mesure dit le contraire, et ce
+/// témoin la rejoue sur la séquence** plutôt que sur un prédicat : deux
+/// pistes d'affilée, par la vraie file, avec le vrai sondeur.
+///
+/// Le repli existe depuis `should_arm_gapless` (`poller/decisions.rs`), qui
+/// n'arme pas sur la durée du renderer mais sur
+/// `sane_current_duration(rapportée, connue de la file)` — et il est
+/// BRANCHÉ : `poller/tick.rs` lui passe `track_duration_ms`, c'est-à-dire
+/// `now_playing.duration_ms`, la durée que le balayage a lue dans le
+/// fichier. Un renderer muet ne peut donc pas empêcher l'armement. Vérifié
+/// présent dès la v0.9.93, soit **avant** le signalement du 18/08.
+///
+/// Ce témoin ne dit rien du point 1 du ticket (« Tout lire » depuis
+/// Ambiance n'envoie qu'un seul titre) : là, le serveur reçoit une file
+/// d'une piste et la joue correctement jusqu'au bout.
+#[tokio::test]
+async fn une_duree_annoncee_nulle_n_empeche_pas_l_enchainement() {
+    let mut banc = Banc::monter().await;
+
+    // Hors de la fenêtre : rien ne part, exactement comme chez un renderer
+    // bavard. Sans ce premier temps, un armement qui partirait à n'importe
+    // quelle position passerait pour une réussite.
+    banc.a_sans_duree_annoncee(150_000).await;
+    banc.tic().await;
+    assert!(
+        banc.armees().await.is_empty(),
+        "une durée annoncée nulle ne doit pas faire armer n'importe quand : \
+         la fenêtre se calcule sur la durée CONNUE DE LA FILE (300 s), elle \
+         s'ouvre à 270 s"
+    );
+
+    // Dans la fenêtre, la durée de la file suffit à décider.
+    banc.a_sans_duree_annoncee(275_000).await;
+    banc.tic().await;
+    assert_eq!(
+        banc.armees().await,
+        vec![ARMEE.to_string()],
+        "LE FAIT : le renderer n'annonce aucune durée, et la suivante part \
+         quand même — l'armement se décide sur la durée que Tune connaît, \
+         pas sur celle qu'on lui rapporte (#1929, point 3)"
+    );
+
+    // Et la transition aboutit : le renderer reste muet sur la durée.
+    banc.le_renderer_enchaine_sans_duree().await;
+    banc.tic().await;
+
+    let (position, titre) = banc.ecran().await;
+    assert_eq!(
+        titre, ARMEE,
+        "l'écran doit avancer d'une piste : c'est l'arrêt en fin de premier \
+         titre que FabienM décrit"
+    );
+    assert_eq!(
+        position, 1,
+        "et la file doit pointer la ligne correspondante"
+    );
+    assert_eq!(
+        banc.joue_par_le_renderer().await.as_deref(),
+        Some(ARMEE),
+        "le renderer joue bien la piste qui lui a été armée"
+    );
+    assert!(
+        banc.play_complets().await.is_empty(),
+        "et sans blanc : un `Play` complet signerait un arrêt suivi d'une \
+         relance"
+    );
 }
 
 /// Le prédicat seul, sur ses quatre cas. Il décide de désarmer un

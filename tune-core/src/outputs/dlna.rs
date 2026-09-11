@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 use super::didl::{DidlBuilder, ProtocolStyle};
 use super::oh_events::{EventState, UpnpEventListener};
 use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
+use crate::discovery::redecouverte::{self, UrlsDeControle};
 use crate::http::error as http_error;
 
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
@@ -267,12 +268,115 @@ impl NiveauDidlAppris {
     }
 }
 
+/// Sur quelle URL de contrôle part une action SOAP. Résolue AU MOMENT de
+/// l'envoi par [`DlnaOutput::url_de`] — c'est ce qui permet au rejeu d'après
+/// redécouverte (#3829) de partir vers le nouveau port sans que l'appelant
+/// ait rien à savoir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoieSoap {
+    AvTransport,
+    RenderingControl,
+    /// Sonos, zone groupée : même hôte, chemin `/GroupRenderingControl/`.
+    GroupRenderingControl,
+    /// `ConnectionManager`, replié sur `AVTransport` quand le descripteur ne
+    /// l'annonçait pas.
+    ConnectionManager,
+}
+/// Ce qu'un envoi SOAP a rendu, AVANT interprétation.
+enum IssueSoap {
+    /// Le renderer a répondu : statut HTTP et corps, bruts.
+    Reponse {
+        statut: reqwest::StatusCode,
+        texte: String,
+    },
+    /// Aucune réponse exploitable.
+    Echec {
+        message: String,
+        /// La dernière tentative a expiré (voir [`SOAP_TIMEOUT_PREFIX`]).
+        timeout: bool,
+        /// Le port n'écoute plus (`ECONNREFUSED`, `10061`) — motif de
+        /// redécouverte (#3829).
+        refus: bool,
+        /// Les réessais ont été épuisés : on journalise `soap_all_retries_failed`.
+        apres_reessais: bool,
+    },
+}
+impl IssueSoap {
+    /// Le motif qui JUSTIFIE une redécouverte, ou rien.
+    ///
+    /// Deux cas, et deux seulement : le refus de connexion (le port n'écoute
+    /// plus) et le `404` sur l'URL de contrôle (le port écoute, mais plus ce
+    /// chemin-là — même pile, autre arborescence). PAS le timeout : l'appareil
+    /// est éteint, un `M-SEARCH` échouerait aussi et doublerait le délai. PAS
+    /// la faute SOAP applicative (`701`, `714`…), qui voyage dans un `500`
+    /// avec corps : l'appareil est joignable et dit autre chose.
+    fn motif_de_redecouverte(&self) -> Option<&'static str> {
+        match self {
+            IssueSoap::Echec { refus: true, .. } => Some("refus de connexion"),
+            IssueSoap::Reponse { statut, .. } if *statut == reqwest::StatusCode::NOT_FOUND => {
+                Some("404 sur l'URL de contrôle")
+            }
+            _ => None,
+        }
+    }
+}
+/// Ce que Tune ACCOLE à l'erreur d'origine quand la redécouverte n'a rien
+/// donné. Accolé, jamais préfixé : `SOAP_TIMEOUT_PREFIX` et
+/// `SOAP_HTTP_SANS_CORPS_PREFIX` restent en tête, là où l'orchestrateur les
+/// lit.
+pub const MOTIF_REDECOUVERTE_ECHOUEE: &str =
+    "le port de contrôle a changé ou l'appareil est injoignable";
+/// Répit entre deux redécouvertes du MÊME appareil. Le sondeur à 1 Hz et la
+/// lecture peuvent échouer sur le même port mort dans la même seconde : un
+/// seul `M-SEARCH` part, les autres appels rejouent sur ce qu'il a rapporté,
+/// ou rendent l'erreur enrichie s'il n'a rien rapporté.
+const REDECOUVERTE_REPIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bornes et mémoire de la redécouverte ciblée d'une sortie (#3829).
+struct Redecouverte {
+    /// Port SSDP visé par le `M-SEARCH` unicast (1900 hors banc).
+    port_ssdp: AtomicU64,
+    /// Budget d'attente de la réponse, en ms.
+    budget_ms: AtomicU64,
+    /// Dernière tentative : quand, et si elle a abouti. Le verrou est tenu
+    /// pendant tout le geste — c'est lui qui sérialise les appels concurrents.
+    derniere: tokio::sync::Mutex<Option<(std::time::Instant, bool)>>,
+}
+impl Redecouverte {
+    fn par_defaut() -> Self {
+        Self {
+            port_ssdp: AtomicU64::new(redecouverte::PORT_SSDP as u64),
+            budget_ms: AtomicU64::new(redecouverte::BUDGET_REPONSE.as_millis() as u64),
+            derniere: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+/// La `LOCATION` présumée d'une sortie construite sans descriptif : la racine
+/// de son URL de contrôle. Purement informative — la redécouverte relit la
+/// vraie `LOCATION` dans la réponse `M-SEARCH`.
+fn redecouverte_location_depuis(url_de_controle: &str) -> String {
+    let hote = crate::discovery::ssdp::host_from_location(url_de_controle).unwrap_or_default();
+    let port = crate::discovery::ssdp::port_from_location(url_de_controle);
+    format!("http://{hote}:{port}/")
+}
 pub struct DlnaOutput {
     name: String,
     device_id: String,
     host: String,
-    av_transport_url: String,
-    rendering_control_url: String,
+    /// Les URLs de contrôle et d'évènements de CET appareil, telles qu'on les
+    /// connaît MAINTENANT.
+    ///
+    /// Elles étaient quatre champs figés à la construction : ce que la
+    /// découverte avait appris la première fois, Tune l'appelait pour la vie
+    /// du processus. Or une pile Platinum tire un port au hasard à CHAQUE
+    /// démarrage (#3829 : 1145 → 1838, même appareil, même UDN) — après un
+    /// redémarrage du renderer, chaque action SOAP partait vers un port qui
+    /// n'écoutait plus (`10061` sous Windows, `ECONNREFUSED` ailleurs), et
+    /// seul un redémarrage de Tune s'en sortait. Elles sont maintenant lues
+    /// AU MOMENT de l'envoi ([`DlnaOutput::url_de`]) et rafraîchies par la
+    /// redécouverte ciblée ([`DlnaOutput::redecouvrir_les_urls`]).
+    urls: std::sync::RwLock<UrlsDeControle>,
+    /// Bornes et mémoire de la redécouverte ciblée (#3829).
+    redecouverte: Redecouverte,
     client: Client,
     /// Short-timeout client used for fire-and-forget Stop before play.
     stop_client: Client,
@@ -341,15 +445,9 @@ pub struct DlnaOutput {
     muted: AtomicBool,
     /// Micromega M-One uses a proprietary TCP protocol on port 7000 for volume.
     micromega_ip: Option<String>,
-    /// URL for the ConnectionManager service (used to query GetProtocolInfo).
-    /// Falls back to av_transport_url if not available.
-    connection_manager_url: Option<String>,
     /// Récepteur GENA partagé, `None` quand l'écoute n'a pas pu démarrer.
     /// Absent = comportement d'avant #2263, tout en sondage.
     event_listener: Option<Arc<UpnpEventListener>>,
-    /// `eventSubURL` absolues des services abonnables, par clé de service
-    /// (`avtransport`, `renderingcontrol`).
-    event_sub_urls: HashMap<String, String>,
     /// État poussé par le renderer. Partagé avec le récepteur.
     event_state: Arc<tokio::sync::Mutex<EventState>>,
     event_sub_ids: tokio::sync::Mutex<Vec<String>>,
@@ -466,12 +564,19 @@ impl DlnaOutput {
         } else {
             None
         };
+        let location = redecouverte_location_depuis(&av_transport_url);
         Self {
             name,
             device_id,
             host,
-            av_transport_url,
-            rendering_control_url,
+            urls: std::sync::RwLock::new(UrlsDeControle {
+                location,
+                av_transport: av_transport_url,
+                rendering_control: rendering_control_url,
+                connection_manager: connection_manager_url,
+                event_sub_urls: HashMap::new(),
+            }),
+            redecouverte: Redecouverte::par_defaut(),
             client: crate::http::client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -488,9 +593,7 @@ impl DlnaOutput {
             didl_niveau_appris: NiveauDidlAppris::neuf(),
             muted: AtomicBool::new(false),
             micromega_ip,
-            connection_manager_url,
             event_listener: None,
-            event_sub_urls: HashMap::new(),
             event_state: Arc::new(tokio::sync::Mutex::new(EventState::default())),
             event_sub_ids: tokio::sync::Mutex::new(Vec::new()),
             upnp_silence: AtomicBool::new(false),
@@ -534,8 +637,158 @@ impl DlnaOutput {
         event_sub_urls: HashMap<String, String>,
     ) -> Self {
         self.event_listener = listener;
-        self.event_sub_urls = event_sub_urls;
+        self.urls
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .event_sub_urls = event_sub_urls;
         self
+    }
+
+    /// Règle le `M-SEARCH` de la redécouverte ciblée (#3829) : port SSDP visé
+    /// et budget d'attente. Existe pour qu'un banc puisse tenir un faux
+    /// répondeur SSDP sans privilège sur le port 1900. Aucun appelant de
+    /// production : les défauts sont [`redecouverte::PORT_SSDP`] et
+    /// [`redecouverte::BUDGET_REPONSE`].
+    pub(crate) fn with_redecouverte(self, port_ssdp: u16, budget: std::time::Duration) -> Self {
+        self.redecouverte
+            .port_ssdp
+            .store(port_ssdp as u64, Ordering::Relaxed);
+        self.redecouverte
+            .budget_ms
+            .store(budget.as_millis() as u64, Ordering::Relaxed);
+        self
+    }
+
+    /// L'URL de contrôle `AVTransport` courante — celle que le prochain envoi
+    /// utilisera. Lecture brute pour les journaux et les bancs.
+    pub fn url_av_transport(&self) -> String {
+        self.url_de(VoieSoap::AvTransport)
+    }
+
+    /// L'URL de contrôle sur laquelle part une action, résolue À L'ENVOI.
+    fn url_de(&self, voie: VoieSoap) -> String {
+        let u = self.urls.read().unwrap_or_else(|e| e.into_inner());
+        match voie {
+            VoieSoap::AvTransport => u.av_transport.clone(),
+            VoieSoap::RenderingControl => u.rendering_control.clone(),
+            // Sonos refuse `RenderingControl` sur une zone groupée et ne
+            // répond que sur `GroupRenderingControl`, même hôte.
+            VoieSoap::GroupRenderingControl => u
+                .rendering_control
+                .replace("/RenderingControl/", "/GroupRenderingControl/"),
+            VoieSoap::ConnectionManager => u
+                .connection_manager
+                .clone()
+                .unwrap_or_else(|| u.av_transport.clone()),
+        }
+    }
+
+    /// L'`eventSubURL` absolue d'un service, si le descripteur l'annonçait.
+    fn url_evenements(&self, service: &str) -> Option<String> {
+        self.urls
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .event_sub_urls
+            .get(service)
+            .filter(|u| !u.is_empty())
+            .cloned()
+    }
+
+    /// #3829 — redécouvre l'appareil par son UDN et rafraîchit ses URLs.
+    ///
+    /// Appelée par [`DlnaOutput::soap_action`] sur un refus de connexion ou
+    /// un `404` sur l'URL de contrôle, et SEULEMENT là : un timeout dit que
+    /// l'appareil est éteint (la redécouverte échouerait aussi et doublerait
+    /// le délai), une faute SOAP applicative (`701`, `714`…) dit que
+    /// l'appareil est joignable et parle d'autre chose.
+    ///
+    /// Bornée : le verrou `derniere` couvre tout le geste, et une issue —
+    /// réussie ou non — vaut pour [`REDECOUVERTE_REPIT`]. Le sondeur à 1 Hz
+    /// et la lecture, tous deux en échec sur le même port mort, ne lancent
+    /// donc qu'UN `M-SEARCH` ; le second appel rejoue simplement sur les
+    /// URLs que le premier vient de rafraîchir.
+    ///
+    /// `Ok(())` veut dire « les URLs sont à jour, rejoue une fois » — y
+    /// compris quand elles n'ont pas changé : l'appareil a répondu au
+    /// `M-SEARCH`, il vaut donc un second essai. `Err` porte le motif que
+    /// l'appelant ACCOLE à l'erreur d'origine, sans jamais la remplacer.
+    async fn redecouvrir_les_urls(
+        &self,
+        url_en_echec: &str,
+        motif: &'static str,
+        action: &str,
+    ) -> Result<(), String> {
+        let mut derniere = self.redecouverte.derniere.lock().await;
+        if let Some((quand, reussie)) = *derniere
+            && quand.elapsed() < REDECOUVERTE_REPIT
+        {
+            if reussie {
+                debug!(device = %self.name, action, "dlna_redecouverte_recente_rejeu_direct");
+                return Ok(());
+            }
+            return Err(format!(
+                "redécouverte déjà tentée il y a {} ms sans réponse",
+                quand.elapsed().as_millis()
+            ));
+        }
+        // L'adresse à interroger est celle de l'URL qui vient d'échouer :
+        // c'est là que l'appareil était la dernière fois qu'on l'a vu.
+        let ip = crate::discovery::ssdp::host_from_location(url_en_echec)
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| self.host.clone());
+        let port_ssdp = self.redecouverte.port_ssdp.load(Ordering::Relaxed) as u16;
+        let budget =
+            std::time::Duration::from_millis(self.redecouverte.budget_ms.load(Ordering::Relaxed));
+        info!(
+            device = %self.name,
+            id = %self.device_id,
+            motif,
+            action,
+            url = url_en_echec,
+            ip = %ip,
+            "dlna_redecouverte_ciblee"
+        );
+        match redecouverte::redecouvrir(&ip, port_ssdp, &self.device_id, budget).await {
+            Ok(nouvelles) => {
+                let (ancienne, nouvelle) = {
+                    let mut u = self.urls.write().unwrap_or_else(|e| e.into_inner());
+                    let ancienne = u.av_transport.clone();
+                    // Les `eventSubURL` suivent : un abonnement GENA posé sur
+                    // l'ancien port ne recevrait plus rien.
+                    *u = nouvelles;
+                    (ancienne, u.av_transport.clone())
+                };
+                *derniere = Some((std::time::Instant::now(), true));
+                if ancienne != nouvelle {
+                    warn!(
+                        device = %self.name,
+                        id = %self.device_id,
+                        ancienne = %ancienne,
+                        nouvelle = %nouvelle,
+                        "dlna_redecouverte_port_de_controle_change"
+                    );
+                } else {
+                    info!(
+                        device = %self.name,
+                        id = %self.device_id,
+                        url = %nouvelle,
+                        "dlna_redecouverte_urls_inchangees_rejeu"
+                    );
+                }
+                Ok(())
+            }
+            Err(raison) => {
+                *derniere = Some((std::time::Instant::now(), false));
+                warn!(
+                    device = %self.name,
+                    id = %self.device_id,
+                    ip = %ip,
+                    raison = %raison,
+                    "dlna_redecouverte_echouee"
+                );
+                Err(raison)
+            }
+        }
     }
 
     /// Arme le « silence UPnP » à la construction (opt-in de zone relu au
@@ -571,11 +824,7 @@ impl DlnaOutput {
     /// La sortie peut-elle s'abonner ? (récepteur présent ET au moins
     /// l'`eventSubURL` d'AVTransport annoncée par le descripteur).
     pub fn peut_s_abonner(&self) -> bool {
-        self.event_listener.is_some()
-            && self
-                .event_sub_urls
-                .get("avtransport")
-                .is_some_and(|u| !u.is_empty())
+        self.event_listener.is_some() && self.url_evenements("avtransport").is_some()
     }
 
     /// S'abonne à `AVTransport` (état du transport, piste, durée) et à
@@ -599,8 +848,8 @@ impl DlnaOutput {
         let mut sub_ids = self.event_sub_ids.lock().await;
         let mut count = 0u32;
         for svc in ["avtransport", "renderingcontrol"] {
-            if let Some(url) = self.event_sub_urls.get(svc).filter(|u| !u.is_empty())
-                && let Some(path_id) = listener.subscribe(url, self.event_state.clone()).await
+            if let Some(url) = self.url_evenements(svc)
+                && let Some(path_id) = listener.subscribe(&url, self.event_state.clone()).await
             {
                 sub_ids.push(path_id);
                 count += 1;
@@ -735,11 +984,8 @@ impl DlnaOutput {
     /// l'appliquent, pas seulement celui qui sonde.
     async fn lire_volume(&self) -> Result<f64, String> {
         let volume_resp = if self.device_id.contains("RINCON") {
-            let grc_url = self
-                .rendering_control_url
-                .replace("/RenderingControl/", "/GroupRenderingControl/");
             self.soap_action(
-                &grc_url,
+                VoieSoap::GroupRenderingControl,
                 "urn:schemas-upnp-org:service:GroupRenderingControl:1",
                 "GetGroupVolume",
                 "<InstanceID>0</InstanceID>",
@@ -826,9 +1072,13 @@ impl DlnaOutput {
         }
     }
 
+    /// Une action SOAP vers `voie`, avec réessais, et — sur un refus de
+    /// connexion ou un `404` de l'URL de contrôle — UNE redécouverte ciblée
+    /// suivie d'UN rejeu (#3829). Jamais de boucle : le rejeu ne redécouvre
+    /// pas.
     async fn soap_action(
         &self,
-        url: &str,
+        voie: VoieSoap,
         service: &str,
         action: &str,
         body: &str,
@@ -843,44 +1093,74 @@ impl DlnaOutput {
   </s:Body>
 </s:Envelope>"#
         );
-
         let soap_action = format!("{service}#{action}");
+        let url = self.url_de(voie);
+        let issue = self.envoyer_soap(&url, &soap_action, &soap, action).await;
+        let Some(motif) = issue.motif_de_redecouverte() else {
+            return self.conclure(issue, action);
+        };
+        match self.redecouvrir_les_urls(&url, motif, action).await {
+            Ok(()) => {
+                let url = self.url_de(voie);
+                debug!(device = %self.name, action, url = %url, "dlna_redecouverte_rejeu");
+                let rejeu = self.envoyer_soap(&url, &soap_action, &soap, action).await;
+                self.conclure(rejeu, action)
+            }
+            // L'erreur d'ORIGINE, enrichie — pas une erreur neuve qui
+            // masquerait le `10061` : c'est lui la première information.
+            Err(raison) => self
+                .conclure(issue, action)
+                .map_err(|m| format!("{m} — {MOTIF_REDECOUVERTE_ECHOUEE} ({raison})")),
+        }
+    }
+    /// L'envoi proprement dit, avec ses réessais. Ne juge pas la réponse :
+    /// c'est [`DlnaOutput::conclure`] qui le fait, pour que le rejeu d'après
+    /// redécouverte soit interprété exactement comme le premier envoi.
+    async fn envoyer_soap(
+        &self,
+        url: &str,
+        soap_action: &str,
+        soap: &str,
+        action: &str,
+    ) -> IssueSoap {
         let mut last_err = String::new();
         let mut last_was_timeout = false;
-
         for attempt in 0..=SOAP_MAX_RETRIES {
             if attempt > 0 {
                 let delay = 200 * (1 << (attempt - 1));
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 debug!(device = %self.name, action, attempt, "soap_retry");
             }
-
             match self
                 .client
                 .post(url)
                 .header("Content-Type", "text/xml; charset=utf-8")
                 .header("SOAPAction", format!("\"{soap_action}\""))
-                .body(soap.clone())
+                .body(soap.to_string())
                 .send()
                 .await
             {
                 Ok(resp) => {
                     let statut = resp.status();
                     match resp.text().await {
-                        Ok(text) => {
-                            // Statut d'échec + corps vide : le renderer n'a pas
-                            // lu la requête (voir SOAP_HTTP_SANS_CORPS_PREFIX).
-                            // Un échec AVEC corps reste rendu tel quel — c'est
-                            // un défaut SOAP que l'appelant sait interpréter.
-                            if !statut.is_success() && text.trim().is_empty() {
-                                return Err(format!(
-                                    "{SOAP_HTTP_SANS_CORPS_PREFIX} {statut} sur {action}"
-                                ));
-                            }
-                            return Ok(text);
-                        }
+                        Ok(texte) => return IssueSoap::Reponse { statut, texte },
                         Err(e) => last_err = format!("soap read: {}", http_error::chain(&e)),
                     }
+                }
+                // #3829 — un refus de connexion est la réponse DÉFINITIVE du
+                // noyau distant : le port n'écoute pas. Le réessayer 200 ms
+                // plus tard ne change rien ; on rend la main tout de suite
+                // pour que la redécouverte ait lieu, et c'est ELLE qui rejoue.
+                // Reconnu au `kind()` de l'`io::Error`, jamais au texte :
+                // celui-ci est localisé (« Aucune connexion n'a pu être
+                // établie… (os error 10061) » sous Windows).
+                Err(e) if http_error::is_connection_refused(&e) => {
+                    return IssueSoap::Echec {
+                        message: format!("soap send: {}", http_error::chain(&e)),
+                        timeout: false,
+                        refus: true,
+                        apres_reessais: attempt > 0,
+                    };
                 }
                 // `is_connection_closed_early` : le renderer a raccroché avant
                 // d'avoir fini sa réponse. Sans ce troisième prédicat, la panne
@@ -901,29 +1181,67 @@ impl DlnaOutput {
                     last_was_timeout = e.is_timeout();
                     last_err = format!("soap send: {}", http_error::chain(&e));
                 }
-                Err(e) => return Err(format!("soap send: {}", http_error::chain(&e))),
+                Err(e) => {
+                    return IssueSoap::Echec {
+                        message: format!("soap send: {}", http_error::chain(&e)),
+                        timeout: false,
+                        refus: false,
+                        apres_reessais: false,
+                    };
+                }
             }
         }
-
-        http_error::hint_if_local_network_denied(&last_err);
-        warn!(device = %self.name, action, error = %last_err, "soap_all_retries_failed");
-        // Voir SOAP_TIMEOUT_PREFIX : un timeout laisse la commande peut-être
-        // exécutée, un refus de connexion non.
-        if last_was_timeout {
-            Err(format!("{SOAP_TIMEOUT_PREFIX} {last_err}"))
-        } else {
-            Err(last_err)
+        IssueSoap::Echec {
+            message: last_err,
+            timeout: last_was_timeout,
+            refus: false,
+            apres_reessais: true,
         }
     }
-
+    /// Interprète une issue d'envoi exactement comme avant #3829 : succès,
+    /// « statut d'échec sans corps », timeout préfixé, ou l'erreur telle
+    /// quelle.
+    fn conclure(&self, issue: IssueSoap, action: &str) -> Result<String, String> {
+        match issue {
+            IssueSoap::Reponse { statut, texte } => {
+                // Statut d'échec + corps vide : le renderer n'a pas lu la
+                // requête (voir SOAP_HTTP_SANS_CORPS_PREFIX). Un échec AVEC
+                // corps reste rendu tel quel — c'est un défaut SOAP que
+                // l'appelant sait interpréter.
+                if !statut.is_success() && texte.trim().is_empty() {
+                    return Err(format!(
+                        "{SOAP_HTTP_SANS_CORPS_PREFIX} {statut} sur {action}"
+                    ));
+                }
+                Ok(texte)
+            }
+            IssueSoap::Echec {
+                message,
+                timeout,
+                refus,
+                apres_reessais,
+            } => {
+                if apres_reessais || refus {
+                    http_error::hint_if_local_network_denied(&message);
+                    warn!(device = %self.name, action, error = %message, "soap_all_retries_failed");
+                }
+                // Voir SOAP_TIMEOUT_PREFIX : un timeout laisse la commande
+                // peut-être exécutée, un refus de connexion non.
+                if timeout {
+                    Err(format!("{SOAP_TIMEOUT_PREFIX} {message}"))
+                } else {
+                    Err(message)
+                }
+            }
+        }
+    }
     async fn av_action(&self, action: &str, body: &str) -> Result<String, String> {
-        self.soap_action(&self.av_transport_url, AV_TRANSPORT_URN, action, body)
+        self.soap_action(VoieSoap::AvTransport, AV_TRANSPORT_URN, action, body)
             .await
     }
-
     async fn rc_action(&self, action: &str, body: &str) -> Result<String, String> {
         self.soap_action(
-            &self.rendering_control_url,
+            VoieSoap::RenderingControl,
             RENDERING_CONTROL_URN,
             action,
             body,
@@ -968,6 +1286,64 @@ impl DlnaOutput {
     /// fenêtre exacte que ce réglage existe pour éviter, et sur les deux chemins
     /// qui ne s'exécutent QUE lorsque l'appareil est déjà en train de refuser.
     /// À 0 — le défaut de tout le monde — cette fonction ne fait rien.
+    /// Ce que le renderer dit TENIR — sur les **deux** champs que son
+    /// AVTransport publie, pas seulement sur le premier (#3580).
+    ///
+    /// `GetMediaInfo` → `CurrentURI` est le champ nominal, et c'est le seul
+    /// que Tune lisait. Mais l'AVTransport en publie un second,
+    /// `GetPositionInfo` → `TrackURI`, et rien dans la specification n'oblige
+    /// un renderer a renseigner les deux au meme instant : un appareil qui
+    /// traite `SetAVTransportURI` comme le CHARGEMENT D'UNE PISTE peut ne
+    /// remplir que le second. Vu de Tune, un tel appareil « ne tient AUCUN
+    /// media » pour toujours — verdict [`UriVerdict::PasEncore`], zone coupee,
+    /// message d'echec — alors que le protocole nomme NOTRE flux deux octets
+    /// plus loin. C'est la seule hypothese de #3580 que le dossier nommait
+    /// sans pouvoir l'eprouver ; elle ne coute rien a fermer.
+    ///
+    /// **Le cas nominal ne paie rien.** Le second champ n'est demande que si le
+    /// premier est vide, c'est-a-dire uniquement sur le chemin qui allait de
+    /// toute facon echouer. Une lecture qui demarre garde exactement une action
+    /// SOAP par relecture, comme avant.
+    ///
+    /// **Temoin POSITIF seulement, donc regression impossible.** `TrackURI`
+    /// n'est retenu que s'il designe NOTRE flux (verdict
+    /// [`UriVerdict::Appliquee`]). Un `TrackURI` vide, etranger, ou perime ne
+    /// change rien : on rend ce que `CurrentURI` disait, au mot pres. Le seul
+    /// verdict que cette lecture peut deplacer est « echec » → « succes », et
+    /// seulement quand l'appareil a NOMME l'URL qu'on vient de lui poser.
+    ///
+    /// Un renderer sans `GetPositionInfo` garde lui aussi l'ancienne conduite :
+    /// son refus est avale, pas propage — c'est `GetMediaInfo` seul qui decide
+    /// du silence SOAP (`soap_muet`), et lui seul.
+    async fn uri_tenue_par_le_renderer(
+        &self,
+        url_attendue: &str,
+    ) -> Result<Option<String>, String> {
+        let courante = self
+            .av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+            .await
+            .map(|xml| extract_tag(&xml, "CurrentURI"))?;
+        if courante.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+            return Ok(courante);
+        }
+        let Ok(xml) = self
+            .av_action("GetPositionInfo", "<InstanceID>0</InstanceID>")
+            .await
+        else {
+            return Ok(courante);
+        };
+        let piste = extract_tag(&xml, "TrackURI");
+        if verdict_uri_appliquee(piste.as_deref(), url_attendue) == UriVerdict::Appliquee {
+            info!(
+                device = %self.name,
+                track_uri = piste.as_deref().unwrap_or("-"),
+                "dlna_uri_tenue_lue_dans_trackuri"
+            );
+            return Ok(piste);
+        }
+        Ok(courante)
+    }
+
     async fn attendre_apres_set_uri(&self) {
         let delai = self.play_delay_ms.load(Ordering::Relaxed);
         if delai > 0 {
@@ -1120,8 +1496,9 @@ impl OutputTarget for DlnaOutput {
         // accept SetAVTransportURI while playing (implicit stop), but we still
         // send Stop for renderers like DMP-A8 that need it.  The short deadline
         // ensures we don't block 2-10s waiting for a slow SOAP response.
+        let url_stop = self.url_de(VoieSoap::AvTransport);
         let stop_fut = self.soap_action_fast(
-            &self.av_transport_url,
+            &url_stop,
             AV_TRANSPORT_URN,
             "Stop",
             "<InstanceID>0</InstanceID>",
@@ -1222,7 +1599,7 @@ impl OutputTarget for DlnaOutput {
                     niveau_didl += 1;
                     warn!(
                         device = %self.name,
-                        ctrl = %self.av_transport_url,
+                        ctrl = %self.url_av_transport(),
                         niveau = niveau_didl,
                         error = %e,
                         "dlna_set_uri_corps_illisible_didl_reduit"
@@ -1430,22 +1807,20 @@ impl OutputTarget for DlnaOutput {
         // qui réécrit) ne conclut rien — zéro régression sur ces appareils.
         // La verification est EXTRAITE dans `verifier_uri_appliquee` : un test
         // qui la retranscrirait resterait vert pendant que CE chemin-ci se
-        // degrade. Elle ne recoit que les deux actions qu'elle pilote — relire
-        // `CurrentURI`, et reposer l'URI puis rejouer — pour qu'un banc puisse
-        // les simuler sans renderer (#2749).
+        // degrade. Elle ne recoit que les deux actions qu'elle pilote — lire ce
+        // que le renderer TIENT (`uri_tenue_par_le_renderer`, qui consulte les
+        // DEUX champs de l'AVTransport), et reposer l'URI puis rejouer — pour
+        // qu'un banc puisse les simuler sans renderer (#2749).
         let moi = &*self;
         let media_verif = media;
+        let url_verif = media.url;
         let mime_relance = attempt_mime.as_str();
         let verif = verifier_uri_appliquee(
             media.url,
             std::time::Duration::from_millis(self.budget_reveil_ms.load(Ordering::Relaxed)),
+            || async move { moi.uri_tenue_par_le_renderer(url_verif).await },
             || async move {
-                moi.av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
-                    .await
-                    .map(|xml| extract_tag(&xml, "CurrentURI"))
-            },
-            || async move {
-                warn!(device = %moi.name, url = media_verif.url, ctrl = %moi.av_transport_url, "dlna_play_acquitte_mais_pas_applique_relance");
+                warn!(device = %moi.name, url = media_verif.url, ctrl = %moi.url_av_transport(), "dlna_play_acquitte_mais_pas_applique_relance");
                 let _ = moi
                     .reposer_uri(media_verif, item_id, mime_relance, niveau_didl)
                     .await;
@@ -1476,7 +1851,7 @@ impl OutputTarget for DlnaOutput {
                 warn!(
                     device = %self.name,
                     url = media.url,
-                    ctrl = %self.av_transport_url,
+                    ctrl = %self.url_av_transport(),
                     attente_ms = verif.attente_ms,
                     relances = verif.relances,
                     soap_muet = verif.soap_muet,
@@ -1486,7 +1861,7 @@ impl OutputTarget for DlnaOutput {
                 warn!(
                     device = %self.name,
                     url = media.url,
-                    ctrl = %self.av_transport_url,
+                    ctrl = %self.url_av_transport(),
                     tenue = uri_tenue.as_deref().unwrap_or("-"),
                     attente_ms = verif.attente_ms,
                     relances = verif.relances,
@@ -1551,9 +1926,11 @@ impl OutputTarget for DlnaOutput {
                 } else {
                     format!(
                         "Le renderer a acquitté Play mais ne tient toujours AUCUN média après {secondes} s \
-                         (CurrentURI vide) : il ne joue pas autre chose, il n'a rien chargé. Un ampli en \
-                         veille réseau (Denon/HEOS) met 15 à 30 s à sortir de veille et à basculer sur son \
-                         entrée réseau — allumez-le, puis relancez"
+                         (ni CurrentURI ni TrackURI) : il ne joue pas autre chose, il n'a rien chargé. \
+                         Tune ne peut pas dire POURQUOI : l'appareil répond et n'exécute pas. Sur un ampli \
+                         en veille réseau (Denon/HEOS, Marantz), relancer aussitôt aboutit souvent — la \
+                         première tentative l'a réveillé ; le délai de bascule varie d'un appareil et d'un \
+                         état à l'autre, et peut dépasser cette attente"
                     )
                 });
             }
@@ -1566,7 +1943,7 @@ impl OutputTarget for DlnaOutput {
             ));
         }
 
-        info!(device = %self.name, url = media.url, ctrl = %self.av_transport_url, delay_ms = play_delay, "dlna_play");
+        info!(device = %self.name, url = media.url, ctrl = %self.url_av_transport(), delay_ms = play_delay, "dlna_play");
         // La piste tourne : on s'abonne, et l'ancre repart de zéro sur cette
         // URI. Même moment que `OpenHomeOutput::play_media` — un abonnement
         // pris avant que le renderer ait la piste ne décrirait rien.
@@ -1643,12 +2020,9 @@ impl OutputTarget for DlnaOutput {
             // Sonos rejects RenderingControl SetVolume with 401.
             // Try GroupRenderingControl on the same host instead.
             if self.device_id.contains("RINCON") {
-                let grc_url = self
-                    .rendering_control_url
-                    .replace("/RenderingControl/", "/GroupRenderingControl/");
                 let grc_resp = self
                     .soap_action(
-                        &grc_url,
+                        VoieSoap::GroupRenderingControl,
                         "urn:schemas-upnp-org:service:GroupRenderingControl:1",
                         "SetGroupVolume",
                         &format!(
@@ -1917,7 +2291,7 @@ impl OutputTarget for DlnaOutput {
 
     async fn is_available(&self) -> bool {
         self.client
-            .get(&self.av_transport_url)
+            .get(self.url_av_transport())
             .timeout(std::time::Duration::from_secs(3))
             .send()
             .await
@@ -1982,13 +2356,9 @@ impl OutputTarget for DlnaOutput {
 
 impl DlnaOutput {
     pub async fn get_protocol_info(&self) -> Result<Vec<String>, String> {
-        let cm_url = self
-            .connection_manager_url
-            .as_deref()
-            .unwrap_or(&self.av_transport_url);
         let body = self
             .soap_action(
-                cm_url,
+                VoieSoap::ConnectionManager,
                 "urn:schemas-upnp-org:service:ConnectionManager:1",
                 "GetProtocolInfo",
                 "",
@@ -2354,6 +2724,16 @@ fn arret_effectif(transport_resp: &str) -> bool {
 /// rien. Le releve de terrain (AVR-X1600H, 0.9.121) donne 15 a 30 s entre
 /// l'ordre et l'URI reellement posee : une borne PRISE DANS cette plage ne
 /// corrigerait qu'une partie des cas, elle doit donc la couvrir en entier.
+///
+/// ⚠️ **Cette plage n'est PAS une loi, et le message d'echec ne doit plus la
+/// citer.** Le meme AVR-X1600H, mesure en 0.9.145 (ticket support 109,
+/// #3580) : 3 min 06 s entre le premier clic et la premiere URI tenue, ampli
+/// sous tension pendant toute la fenetre ; et 4,9 s quand il vient de jouer.
+/// Le testeur a conteste le « 15 a 30 s » affiche, et il avait raison de le
+/// faire — c'est un releve fait sur UN appareil dans UN etat, promu en
+/// explication generale. La borne reste a 30 s parce que la grace de
+/// chargement du sondeur la contraint (ci-dessous), pas parce que 30 s
+/// suffiraient : sur cet ampli-la, elles ne suffisent pas.
 ///
 /// **Pourquoi pas plus.** La borne haute n'est pas un gout. `play()` a DEJA
 /// bascule la zone en lecture et arme la grace de chargement du sondeur

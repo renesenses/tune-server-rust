@@ -786,12 +786,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
 
 [[package]]
-name = "const-oid"
-version = "0.9.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
-
-[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1191,7 +1185,6 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
- "digest 0.10.7",
  "fiat-crypto",
  "rustc_version",
  "subtle",
@@ -1269,16 +1262,6 @@ name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
-
-[[package]]
-name = "der"
-version = "0.7.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
-dependencies = [
- "const-oid",
- "zeroize",
-]
 
 [[package]]
 name = "deranged"
@@ -1382,31 +1365,6 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
-
-[[package]]
-name = "ed25519"
-version = "2.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
-dependencies = [
- "pkcs8",
- "signature",
-]
-
-[[package]]
-name = "ed25519-dalek"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
-dependencies = [
- "curve25519-dalek",
- "ed25519",
- "rand_core 0.6.4",
- "serde",
- "sha2 0.10.9",
- "subtle",
- "zeroize",
-]
 
 [[package]]
 name = "either"
@@ -1835,29 +1793,11 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hkdf"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
-dependencies = [
- "hmac 0.12.1",
-]
-
-[[package]]
-name = "hkdf"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
 dependencies = [
- "hmac 0.13.0",
-]
-
-[[package]]
-name = "hmac"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
-dependencies = [
- "digest 0.10.7",
+ "hmac",
 ]
 
 [[package]]
@@ -3246,16 +3186,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pkcs8"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
-dependencies = [
- "der",
- "spki",
-]
-
-[[package]]
 name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4213,15 +4143,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "signature"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
-dependencies = [
- "rand_core 0.6.4",
-]
-
-[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4325,16 +4246,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
-]
-
-[[package]]
-name = "spki"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
-dependencies = [
- "base64ct",
- "der",
 ]
 
 [[package]]
@@ -4490,8 +4401,8 @@ dependencies = [
  "futures-core",
  "futures-util",
  "hex",
- "hkdf 0.13.0",
- "hmac 0.13.0",
+ "hkdf",
+ "hmac",
  "itoa",
  "log",
  "md-5 0.11.0",
@@ -4530,19 +4441,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "url",
-]
-
-[[package]]
-name = "srp"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cdd40049b29ab1315ccba7ffcf1eece8162982eab14edfac3cf2c2ffab18193"
-dependencies = [
- "digest 0.10.7",
- "generic-array",
- "lazy_static",
- "num-bigint",
- "subtle",
 ]
 
 [[package]]
@@ -5295,7 +5193,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-bandcamp"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "async-trait",
  "axum",
@@ -5309,7 +5207,7 @@ dependencies = [
 
 [[package]]
 name = "tune-bridge"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "axum",
  "bytes",
@@ -5330,7 +5228,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "clap",
  "clap_complete",
@@ -5344,7 +5242,7 @@ dependencies = [
 
 [[package]]
 name = "tune-concerts"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "async-trait",
  "axum",
@@ -5357,7 +5255,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "ape-decoder",
  "argon2",
@@ -5375,11 +5273,9 @@ dependencies = [
  "cpal",
  "criterion",
  "csv",
- "ed25519-dalek",
  "flate2",
  "futures-util",
  "getrandom 0.2.17",
- "hkdf 0.12.4",
  "hostname",
  "if-addrs 0.13.4",
  "image",
@@ -5410,7 +5306,6 @@ dependencies = [
  "snow",
  "socket2 0.5.10",
  "sqlx",
- "srp",
  "symphonia",
  "tar",
  "tempfile",
@@ -5434,7 +5329,7 @@ dependencies = [
 
 [[package]]
 name = "tune-dj"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "async-trait",
  "axum",
@@ -5446,7 +5341,7 @@ dependencies = [
 
 [[package]]
 name = "tune-ffi"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "axum",
  "serde_json",
@@ -5459,7 +5354,7 @@ dependencies = [
 
 [[package]]
 name = "tune-http-types"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "axum",
  "reqwest",
@@ -5470,7 +5365,7 @@ dependencies = [
 
 [[package]]
 name = "tune-karaoke"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "async-trait",
  "axum",
@@ -5483,7 +5378,7 @@ dependencies = [
 
 [[package]]
 name = "tune-output-api"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "async-trait",
  "serde",
@@ -5492,7 +5387,7 @@ dependencies = [
 
 [[package]]
 name = "tune-plugin-runtime-wasm"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5501,7 +5396,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "argon2",
  "async-stream",
@@ -5557,7 +5452,7 @@ dependencies = [
 
 [[package]]
 name = "tune-smart-http"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "axum",
  "serde",
@@ -5569,7 +5464,7 @@ dependencies = [
 
 [[package]]
 name = "tune-stream-http"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "async-stream",
  "axum",
@@ -5583,7 +5478,7 @@ dependencies = [
 
 [[package]]
 name = "tune-streaming-http"
-version = "0.9.145"
+version = "0.9.146"
 dependencies = [
  "async-stream",
  "async-trait",

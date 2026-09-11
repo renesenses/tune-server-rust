@@ -21,7 +21,8 @@ issue prise. Label absent : panne d'infrastructure, donc arrêt sans écrire.
 
 Règles non négociables :
 
-- une PR unitaire cible `rc/vX.Y.Z` et ne contient pas de bump de version ;
+- une PR unitaire cible le lot courant `batch/<thème>`, ou la RC `rc/vX.Y.Z`
+  quand aucun lot ne porte le sujet ; elle ne contient pas de bump de version ;
 - `ci:full` est obligatoire pour les changements CI, release ou transversaux ;
 - seule une RC peut cibler `main` ;
 - un agent de correctif ne merge pas, ne tague pas et ne publie pas ;

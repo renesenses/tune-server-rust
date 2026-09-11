@@ -6,13 +6,25 @@ plus utilisée pour préparer ou taguer les releases.
 ## 1. Correctifs
 
 ```text
-fix/* ou feat/* -> PR -> rc/vX.Y.Z
+fix/* ou feat/* -> PR -> batch/<thème> -> PR -> rc/vX.Y.Z
 ```
 
-La PR exécute le profil rapide : formatage, analyse statique, tests unitaires
-et régressions ciblées. Le label `ci:full` force la batterie complète pour un
-changement transversal ou risqué. Aucun bump de version n'est fait dans une
-PR unitaire.
+Les correctifs sont groupés par thème dans une branche de lot `batch/*`. Chaque
+correctif y entre par sa propre PR ; le lot entre ensuite dans la RC par une PR
+unique, qui est la vraie porte. Quand aucun lot ouvert ne porte le sujet, une PR
+unitaire peut viser directement la RC.
+
+`scripts/determiner-profil-ci.sh` traite les deux bases à égalité : une PR dirigée
+vers `batch/*` comme vers `rc/*` exécute le profil rapide — formatage, analyse
+statique, tests unitaires et régressions ciblées. Toute autre base, tout push et
+toute entrée inconnue basculent en batterie complète : le routage est fail-closed.
+Le label `ci:full` force la batterie complète pour un changement transversal ou
+risqué. Aucun bump de version n'est fait dans une PR unitaire.
+
+Avant d'ouvrir un lot, vérifier qu'aucun lot déjà ouvert ne touche les mêmes
+fichiers : deux lots qui modifient le même fichier n'entrent en conflit qu'au
+moment de la RC, c'est-à-dire au pire moment. S'y rattacher plutôt qu'en créer un
+second.
 
 ## 2. Candidat de release
 

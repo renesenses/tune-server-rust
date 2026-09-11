@@ -48,14 +48,51 @@ fn corps_de_build_zone_json() -> &'static str {
     &TOUT[debut..fin]
 }
 
+/// 🔴 Le point aveugle SUIVANT (#2672, second tour).
+///
+/// Les deux contrôles ci-dessous ne lisaient que `zones.rs`, `lecture.rs` et le
+/// corps de `build_zone_json`. L'instantané du WebSocket — `build_snapshot`
+/// (`routes/ws.rs`), la charge utile que le client rend à chaque (re)connexion
+/// de son socket — est une QUATRIÈME description de la même zone, et elle leur
+/// était invisible : elle portait `queue_length`, `shuffle` et `repeat`, mais ni
+/// `can_skip_next` (#2337) ni aucun des neuf réglages « Avancé · renderer »
+/// (#2672). Même famille, même cause : une copie à la main.
+///
+/// On ne rend ici que le CORPS de `build_snapshot`. Le fichier entier
+/// apporterait le module de test, et les motifs cherchés s'y trouveraient
+/// eux-mêmes — la faute de #2082, celle contre laquelle `code_de_production` se
+/// découpe déjà.
+fn corps_de_build_snapshot() -> &'static str {
+    const TOUT: &str = include_str!("../ws.rs");
+    const DEBUT: &str = "async fn build_snapshot(state: &AppState)";
+    const FIN: &str = "\nasync fn handle_socket(";
+    let debut = TOUT
+        .find(DEBUT)
+        .unwrap_or_else(|| panic!("`build_snapshot` renommée : la découpe ne garde plus rien"));
+    let fin = TOUT[debut..]
+        .find(FIN)
+        .map(|i| debut + i)
+        .unwrap_or_else(|| panic!("`handle_socket` renommée : découpe perdue"));
+    &TOUT[debut..fin]
+}
+/// Les QUATRE fichiers qui construisent une charge utile de zone.
+fn toutes_les_charges_utiles() -> String {
+    format!(
+        "{}{}{}",
+        code_de_production(),
+        corps_de_build_zone_json(),
+        corps_de_build_snapshot()
+    )
+}
 /// `queue_length` sert de marqueur : c'est le champ que porte toute charge
 /// utile décrivant l'état de lecture d'une zone. Chacune doit porter aussi
 /// l'aléatoire, la répétition et la décision autoritaire « suivant ».
 #[test]
 fn toute_charge_utile_de_zone_porte_le_transport_et_la_decision_suivant() {
-    // Les deux fichiers qui construisent la charge utile. Compter sur un
-    // seul, c'était garder la moitié du code en croyant tout tenir (#2055).
-    let src = format!("{}{}", code_de_production(), corps_de_build_zone_json());
+    // Les QUATRE charges utiles. Compter sur un seul fichier, c'était garder
+    // la moitié du code en croyant tout tenir (#2055) ; en oublier une, c'est
+    // la même faute un cran plus loin (#2672, second tour).
+    let src = toutes_les_charges_utiles();
     // Les motifs ne portent PAS le `obj.insert(` qui les précède : rustfmt
     // coupe un appel long sur trois lignes dès que ses arguments grossissent,
     // et le compteur retomberait alors à zéro sans qu'une seule charge utile
@@ -76,11 +113,11 @@ fn toute_charge_utile_de_zone_porte_le_transport_et_la_decision_suivant() {
     let suivant = compter("can_skip_next");
 
     assert!(
-        etats >= 3,
+        etats >= 4,
         "le marqueur `queue_length` n'apparaît que {etats} fois — la forme \
          des charges utiles a changé, et ce contrôle ne garde plus rien. \
-         Il en faut au moins TROIS : les deux de `zones.rs` et celle de \
-         `build_zone_json` (#2055)."
+         Il en faut au moins QUATRE : les deux de `zones.rs`, celle de \
+         `build_zone_json` (#2055) et l'instantané WebSocket (#2672)."
     );
     assert_eq!(
         aleatoire, etats,
@@ -102,28 +139,29 @@ fn toute_charge_utile_de_zone_porte_le_transport_et_la_decision_suivant() {
 }
 
 /// 🔴 #2672 — LA GARDE. Les neuf réglages « Avancé · renderer » sortent des
-/// TROIS charges utiles de zone.
+/// QUATRE charges utiles de zone.
 ///
 /// SITES D'APPEL GARDÉS, nommément : `list_zones` et `get_zone`
-/// (`routes/zones/lecture.rs`) et `build_zone_json` (`routes/playback.rs`) —
-/// les trois appellent `crate::routes::zones::injecter_reglages_renderer`.
+/// (`routes/zones/lecture.rs`), `build_zone_json` (`routes/playback.rs`) et
+/// `build_snapshot` (`routes/ws.rs`) — les quatre appellent
+/// `crate::routes::zones::injecter_reglages_renderer`.
 ///
 /// Le contrôle ne compte plus les clés une à une : elles ne sont plus écrites
 /// qu'une fois, dans l'injecteur. Il compte les SITES D'APPEL, et les compare
-/// au nombre de charges utiles que `queue_length` denombre déjà. Trois charges
-/// utiles, trois appels — ou le contrôle tombe.
+/// au nombre de charges utiles que `queue_length` denombre déjà. Quatre charges
+/// utiles, quatre appels — ou le contrôle tombe.
 ///
-/// C'est la quatrième divergence de cette famille (#2055, #2092, #2337, puis
-/// celle-ci) : à chaque fois, une copie à la main d'une charge utile de zone a
-/// oublié un champ que les autres portaient.
+/// C'est la cinquième divergence de cette famille (#2055, #2092, #2337, #2672,
+/// puis l'instantané WebSocket) : à chaque fois, une copie à la main d'une
+/// charge utile de zone a oublié un champ que les autres portaient.
 #[test]
-fn les_trois_charges_utiles_injectent_les_reglages_renderer() {
-    let src = format!("{}{}", code_de_production(), corps_de_build_zone_json());
+fn les_quatre_charges_utiles_injectent_les_reglages_renderer() {
+    let src = toutes_les_charges_utiles();
 
     let charges =
         src.matches(r#""queue_length".into()"#).count() + src.matches(r#""queue_length":"#).count();
     assert!(
-        charges >= 3,
+        charges >= 4,
         "le marqueur `queue_length` n'apparaît que {charges} fois — la forme \
          des charges utiles a changé et ce contrôle ne garde plus rien."
     );

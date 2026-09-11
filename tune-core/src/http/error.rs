@@ -53,6 +53,33 @@ pub fn is_connection_closed_early(err: &(dyn Error + 'static)) -> bool {
     chain(err).contains(CONNECTION_CLOSED_EARLY)
 }
 
+/// Le pair a **refusé** la connexion : le port n'écoute plus.
+///
+/// C'est la signature d'un renderer dont la pile UPnP a redémarré sur un
+/// autre port — Platinum en tire un au hasard à chaque démarrage (#3829 :
+/// 1145 → 1838 sur le même appareil, même UDN). Elle se distingue du timeout
+/// (appareil éteint, SYN sans réponse) et du `IncompleteMessage` (le pair a
+/// accepté puis raccroché) : ici l'hôte est joignable et répond `RST`.
+///
+/// La détection porte sur [`std::io::ErrorKind::ConnectionRefused`], lu dans
+/// la chaîne des `source()`, et JAMAIS sur le texte : le libellé est
+/// localisé par le système — « Aucune connexion n'a pu être établie car
+/// l'ordinateur cible l'a expressément refusée. (os error 10061) » sous un
+/// Windows français, `Connection refused (os error 111)` sous Linux,
+/// `os error 61` sous macOS. La bibliothèque standard replie ces trois
+/// numéros sur le même `kind()`, et c'est lui qui fait foi.
+pub fn is_connection_refused(err: &(dyn Error + 'static)) -> bool {
+    let mut courant: Option<&(dyn Error + 'static)> = Some(err);
+    while let Some(e) = courant {
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            return true;
+        }
+        courant = e.source();
+    }
+    false
+}
 /// `EHOSTUNREACH` — the kernel dropped the SYN instead of putting it on the wire.
 const EHOSTUNREACH: &str = "os error 65";
 /// `EPERM` — the connection was refused by policy before any packet was built.
@@ -148,6 +175,105 @@ mod tests {
     /// deux prédicats. Le test tient le fait face à un vrai socket, pour que la
     /// montée de version de `reqwest`/`hyper` qui changerait cette
     /// classification tombe ici plutôt que chez un utilisateur.
+    /// #3829 — un port qui n'écoute plus se reconnaît à son `kind()`, pas à
+    /// son libellé.
+    ///
+    /// La couche du bas porte un `io::Error` de `kind` `ConnectionRefused`
+    /// dont le TEXTE est celui d'un Windows français (10061). Une détection
+    /// par chaîne de caractères sur `connection refused` resterait muette ;
+    /// celle-ci ne lit que le `kind`.
+    #[test]
+    fn un_refus_de_connexion_se_reconnait_au_kind_meme_en_francais_windows() {
+        #[derive(Debug)]
+        struct Enveloppe(std::io::Error);
+        impl fmt::Display for Enveloppe {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("tcp connect error")
+            }
+        }
+        impl Error for Enveloppe {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let windows_fr = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Aucune connexion n'a pu être établie car l'ordinateur cible l'a \
+             expressément refusée. (os error 10061)",
+        );
+        let err = Layer(
+            "error sending request for url (http://192.168.1.17:1145/AVTransport/control.xml)",
+            None,
+        );
+        // Une couche « reqwest », une couche « connect », l'`io::Error` au fond.
+        struct Haut(Layer, Enveloppe);
+        impl fmt::Debug for Haut {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "Haut")
+            }
+        }
+        impl fmt::Display for Haut {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Display::fmt(&self.0, f)
+            }
+        }
+        impl Error for Haut {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.1)
+            }
+        }
+        let haut = Haut(err, Enveloppe(windows_fr));
+        assert!(
+            !chain(&haut).to_lowercase().contains("connection refused"),
+            "le banc doit porter un libellé SANS le mot anglais : {}",
+            chain(&haut)
+        );
+        assert!(
+            is_connection_refused(&haut),
+            "prédicat muet sur {}",
+            chain(&haut)
+        );
+        // Contre-épreuve : un timeout, ou un autre `kind`, n'est pas un refus.
+        let timeout = Haut(
+            Layer("error sending request", None),
+            Enveloppe(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Connection refused (os error 111)",
+            )),
+        );
+        assert!(
+            !is_connection_refused(&timeout),
+            "le texte dit « refused » mais le kind dit timeout : le kind fait foi"
+        );
+    }
+    /// #3829, face à un VRAI socket : ce que `reqwest` rend quand le port ne
+    /// répond plus est bien reconnu par [`is_connection_refused`] — la chaîne
+    /// des `source()` descend jusqu'à l'`io::Error`. C'est ce qui permet à la
+    /// redécouverte DLNA de ne pas se déclencher sur un timeout.
+    #[tokio::test]
+    async fn un_port_qui_n_ecoute_plus_est_un_refus_de_connexion() {
+        // On prend un port libre, puis on le relâche : rien n'y écoute.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = crate::http::client::shared()
+            .post(format!("http://127.0.0.1:{port}/AVTransport/control.xml"))
+            .body("<s:Envelope/>")
+            .send()
+            .await
+            .expect_err("personne n'écoute : la requête ne peut pas réussir");
+        let rendu = chain(&err);
+        assert!(is_connection_refused(&err), "prédicat muet sur {rendu}");
+        assert!(
+            !err.is_timeout(),
+            "reqwest classerait ça en timeout : {rendu}"
+        );
+        assert!(
+            !is_connection_closed_early(&err),
+            "un refus n'est pas un raccroché : {rendu}"
+        );
+    }
     #[tokio::test]
     async fn un_socket_ferme_net_n_est_ni_connect_ni_timeout() {
         use tokio::io::AsyncReadExt;
