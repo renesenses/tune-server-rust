@@ -223,10 +223,11 @@ const VAGUE_INITIALE: &[(&str, &str)] = &[
     ),
     ("/offline/status", "/api/v1/offline/status"),
     ("/onboarding/status", "/api/v1/onboarding/status"),
-    // La recherche de stations ne rend plus un tableau nu : son corps doit
-    // porter de quoi distinguer « aucune station de ce nom » d'une panne
-    // (#2119). `fip` touche le catalogue livré, donc l'issue « résultats ».
-    ("/radios/search", "/api/v1/radios/search?q=fip"),
+    // `/radios/search` a quitté cette liste le 11/09/2026 : le client web ne
+    // l'appelle plus du tout, donc la carte ne la décrit plus et le contrat
+    // n'existe plus. Le comportement de #2119 (distinguer « aucune station de
+    // ce nom » d'une panne) reste gardé par `tests/radios_recherche_distinction.rs`,
+    // qui joue la route sans passer par la carte — aucune couverture perdue.
     ("/spotify-connect/status", "/api/v1/spotify-connect/status"),
     (
         "/streaming/youtube/auth/status",
@@ -656,5 +657,214 @@ async fn les_paroles_rendent_les_lignes_annoncees_au_web() {
         payload.get("lyrics").is_none(),
         "`lyrics` n'existe pas cote serveur : l'exiger etait une dette de carte, \
          pas un defaut de reponse"
+    );
+}
+
+// ── La carte ne doit pas survivre au serveur qu'elle décrit ──────────────────
+//
+// Tout ce fichier CHARGE `docs/contrat-web.json` et lui fait confiance. Rien,
+// jusqu'ici, ne vérifiait que cette carte décrit encore le serveur du jour :
+// elle n'a pas bougé du 31/08 au 11/09 pendant que `api.ts` recevait 71
+// commits, et elle citait encore quatre routes retirées depuis (#3662, #3637).
+//
+// Le défaut n'est pas qu'elle vieillisse — c'est que son vieillissement soit
+// MUET. Les tests ci-dessus ne jouent que les routes de `VAGUE_INITIALE` : une
+// entrée périmée ailleurs dans la carte n'est jamais interrogée, donc jamais
+// démentie. On valide contre un document figé en croyant vérifier un contrat,
+// ce qui est pire que ne rien vérifier : ça donne l'illusion de la preuve.
+//
+// COMMENT LA SONDE ÉVITE D'EXÉCUTER QUOI QUE CE SOIT
+//     Interroger chaque route avec sa vraie méthode ferait tourner les vrais
+//     gestionnaires — réseau, disque, effets de bord — pour une question qui
+//     ne porte que sur l'existence du chemin. La sonde emploie donc une
+//     méthode d'extension (`REPORT`) qu'aucun gestionnaire ne déclare : Axum
+//     répond 405 si le CHEMIN existe, 404 sinon, sans appeler personne.
+//
+// POURQUOI CETTE GARDE ET PAS UNE ÉGALITÉ AVEC UNE RÉGÉNÉRATION
+//     Une garde « régénérer et comparer » rougirait à chaque commit du dépôt
+//     web, hors du contrôle de l'auteur de la PR serveur. Celle-ci ne rougit
+//     que lorsque le serveur RETIRE un chemin que la carte cite encore —
+//     exactement le cas où la carte ment. Le versant fraîcheur (le web exige
+//     un champ que la carte ignore) est mesuré au préflight, qui dispose du
+//     SHA web publié : `scripts/verifier-carte-web.py`.
+
+/// Le point de montage des greffons. `router_with_plugins` monte chaque
+/// greffon sous `/api/v1/ext/{nom}` ; `routes::router()` — celui que ce banc
+/// construit — n'en monte AUCUN. Un chemin `/ext/…` ne peut donc jamais
+/// répondre ici, et son absence ne prouve rien sur le serveur livré. La garde
+/// s'en tait plutôt que d'accuser huit routes Bandcamp et deux Concerts
+/// parfaitement servies : un contrôle qui crie au loup est pire qu'absent.
+const PREFIXE_GREFFONS: &str = "/ext/";
+
+/// Routes tolérées NOMMÉMENT, jamais par une règle vague. Une entrée se
+/// justifie par sa cause et se retire dès que la dette est payée.
+///
+/// Les deux ci-dessous sont de VRAIS défauts, trouvés par cette garde même :
+/// le client appelle un chemin que le serveur ne sert pas. Les corriger
+/// demande de toucher au client web (périmètre de la session UI), pas à la
+/// carte — les laisser rougir en permanence apprendrait à ignorer le contrôle.
+const FANTOMES_TOLERES: &[(&str, &str)] = &[
+    (
+        "/dj/waveform/{}",
+        "#1897 — le greffon DJ déclare `/waveform/{track_id}` et se monte sous \
+         `/api/v1/ext/dj`. `api.ts` appelle `${BASE}/dj/…` sans le préfixe \
+         `/ext` : tout l'écran DJ part en 404. Correctif côté client.",
+    ),
+    (
+        "/streaming/youtube/moods/{}",
+        "#1897 — `tune-streaming-http` ne déclare que `/youtube/moods`, sans \
+         paramètre. `api.ts:getYoutubeMoodPlaylists` appelle \
+         `/streaming/youtube/moods/${params}` : 404. Correctif côté client ou \
+         route à écrire.",
+    ),
+];
+
+/// `/streaming/{}/albums{}` → `/api/v1/streaming/1/albums`.
+///
+/// Un `{}` qui occupe TOUT un segment est un paramètre de chemin. Un `{}`
+/// collé à la fin d'un segment vient d'une interpolation de chaîne de requête
+/// (`/radios${qs ? '?' + qs : ''}`) : il ne fait pas partie du chemin, et le
+/// garder fabriquerait un 404 imaginaire.
+fn chemin_de_sonde(route: &str) -> Option<String> {
+    let mut segments: Vec<String> = Vec::new();
+    for segment in route.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == "{}" {
+            segments.push("1".to_string());
+        } else if let Some(prefixe) = segment.strip_suffix("{}") {
+            if prefixe.is_empty() || prefixe.contains("{}") {
+                return None;
+            }
+            segments.push(prefixe.to_string());
+        } else if segment.contains("{}") {
+            return None; // forme inattendue : se taire plutôt qu'accuser
+        } else {
+            segments.push(segment.to_string());
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(format!("/api/v1/{}", segments.join("/")))
+}
+
+async fn statut_de_sonde(app: &axum::Router, chemin: &str) -> StatusCode {
+    let requete = Request::builder()
+        .method("REPORT")
+        .uri(chemin)
+        .body(Body::empty())
+        .expect("requete de sonde");
+    app.clone()
+        .oneshot(requete)
+        .await
+        .expect("routeur en echec")
+        .status()
+}
+
+#[test]
+fn la_sonde_distingue_un_parametre_de_chemin_d_une_chaine_de_requete() {
+    assert_eq!(
+        chemin_de_sonde("/zones/{}/dsp").as_deref(),
+        Some("/api/v1/zones/1/dsp")
+    );
+    // `/radios{}` vient de `${BASE}/radios${qs ? '?' + qs : ''}` : le `{}` est
+    // une chaîne de requête, pas un segment. Le traiter comme un paramètre
+    // interrogerait `/api/v1/radios/1`, qui existe, et la garde raterait une
+    // vraie disparition de `/radios`.
+    assert_eq!(
+        chemin_de_sonde("/radios{}").as_deref(),
+        Some("/api/v1/radios")
+    );
+    assert_eq!(
+        chemin_de_sonde("/streaming/{}/artists/{}/albums{}").as_deref(),
+        Some("/api/v1/streaming/1/artists/1/albums")
+    );
+}
+
+#[tokio::test]
+async fn la_carte_web_ne_cite_que_des_routes_encore_servies() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let app = tune_server::routes::router(etat);
+
+    // ── D'abord éprouver la SONDE, sinon la garde ne prouve rien ──
+    //
+    // Une sonde qui répondrait 404 partout rendrait la garde rouge en
+    // permanence ; une sonde qui ne répondrait jamais 404 la rendrait verte
+    // contre n'importe quelle carte. Les deux témoins sont assemblés à
+    // l'exécution : une aiguille écrite en clair dans ce fichier se trouverait
+    // elle-même si un jour la garde venait à lire les sources.
+    let temoin_servi = format!("/api/v1/{}", ["zo", "nes"].concat());
+    assert_ne!(
+        statut_de_sonde(&app, &temoin_servi).await,
+        StatusCode::NOT_FOUND,
+        "la sonde rend 404 sur une route servie : elle mesure autre chose que \
+         l'existence du chemin, et la garde qui s'en sert ne prouve rien"
+    );
+    let temoin_absent = format!(
+        "/api/v1/{}",
+        ["chemin", "qui", "n", "existe", "pas"].join("-")
+    );
+    assert_eq!(
+        statut_de_sonde(&app, &temoin_absent).await,
+        StatusCode::NOT_FOUND,
+        "la sonde ne rend jamais 404 : elle serait verte contre une carte \
+         entierement fausse"
+    );
+
+    let mut deja_sondes = std::collections::BTreeSet::new();
+    let mut fantomes: Vec<String> = Vec::new();
+    let mut toleres_sans_objet: Vec<String> = Vec::new();
+
+    for contrat in &carte.routes {
+        if contrat.route.starts_with(PREFIXE_GREFFONS) {
+            continue;
+        }
+        let Some(chemin) = chemin_de_sonde(&contrat.route) else {
+            continue;
+        };
+        if !deja_sondes.insert(chemin.clone()) {
+            continue;
+        }
+        let tolere = FANTOMES_TOLERES
+            .iter()
+            .any(|(route, _)| *route == contrat.route);
+        let absente = statut_de_sonde(&app, &chemin).await == StatusCode::NOT_FOUND;
+        match (tolere, absente) {
+            (false, true) => fantomes.push(format!("{} (sonde {chemin})", contrat.route)),
+            // La dette est payée : le dire, sinon la liste fossilise une
+            // exception sans objet et finit par tout tolérer.
+            (true, false) => toleres_sans_objet.push(contrat.route.clone()),
+            _ => {}
+        }
+    }
+
+    // Une tolérance dont la route a quitté la carte est morte elle aussi —
+    // c'est ce qui arrivera quand le client web sera corrigé, puisque la route
+    // changera de nom (`/dj/…` → `/ext/dj/…`).
+    let routes_de_la_carte: std::collections::BTreeSet<&str> =
+        carte.routes.iter().map(|c| c.route.as_str()).collect();
+    for (route, _) in FANTOMES_TOLERES {
+        if !routes_de_la_carte.contains(route) {
+            toleres_sans_objet.push((*route).to_string());
+        }
+    }
+    assert!(
+        toleres_sans_objet.is_empty(),
+        "FANTOMES_TOLERES garde {} entree(s) sans objet — la ou les retirer :\n    {}",
+        toleres_sans_objet.len(),
+        toleres_sans_objet.join("\n    ")
+    );
+
+    assert!(
+        fantomes.is_empty(),
+        "docs/contrat-web.json cite {} route(s) que le serveur ne sert plus :\n    {}\n\n\
+         Regenerer la carte : scripts/web-contract-map.py --web <tune-web-client> \
+         -o docs/contrat-web.json",
+        fantomes.len(),
+        fantomes.join("\n    ")
     );
 }
