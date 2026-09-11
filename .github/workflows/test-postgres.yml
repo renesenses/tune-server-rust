@@ -397,6 +397,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test comptes_par_source_2147 i2147_pg -- --nocapture --test-threads=1
 
+      # #3857 — la requete groupee des comptes de sous-dossiers et le
+      # pre-filtre d'enfant direct ont DEUX ecritures : `instr`/`?n` sur
+      # SQLite, `strpos`/`$n` sur Postgres. Les neuf epreuves du fichier
+      # montent toutes `:memory:` : sans cette etape, la seconde ecriture
+      # serait compilee et JAMAIS executee.
+      - name: Comptes de sous-dossiers sur PostgreSQL (#3857)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test server_contracts pg_3857 -- --nocapture --test-threads=1
       - name: Versions par piste sur PostgreSQL (#2372)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
