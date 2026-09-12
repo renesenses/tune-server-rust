@@ -16,7 +16,7 @@ use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSourceMode};
 
 use crate::error::AppError;
-use crate::routes::active_profile::ActiveProfile;
+use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
 use crate::state::AppState;
 
 pub(super) async fn version() -> Json<Value> {
@@ -270,6 +270,7 @@ pub(super) fn refus_backend_non_supporte(demande: &str) -> String {
 }
 pub(super) async fn get_config(
     headers: axum::http::HeaderMap,
+    profile: ActiveProfile,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let lang = crate::i18n::lang_from_header(&headers);
@@ -277,6 +278,16 @@ pub(super) async fn get_config(
     let all = settings.all().unwrap_or_default();
     let mut config = serde_json::Map::new();
     for (k, v) in all {
+        // 🔴 Les préférences des AUTRES profils ne sortent pas d'ici.
+        //
+        // Une fois `ui_preferences` rangé par profil, la table porte une ligne
+        // `ui_preferences:{pid}` par personne. Les publier toutes livrerait à
+        // chacun les réglages — et la photo d'avatar, donc plusieurs kilo-octets
+        // chacune — de tous les autres, sur une route appelée en boucle. Le
+        // blob du profil appelant est réinjecté plus bas, sous son nom nu.
+        if k.starts_with(&format!("{UI_PREFERENCES}:")) {
+            continue;
+        }
         // Voir `BACKEND_ACTIF_PAS_UN_REGLAGE` : une ligne écrite sous ce nom
         // n'est le réglage de personne, et la publier ici la ferait passer
         // pour le réglage auprès du client qui lit ce nom en premier.
@@ -374,6 +385,23 @@ pub(super) async fn get_config(
     ];
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
+    }
+
+    // Les préférences d'interface DU PROFIL APPELANT, sous leur nom nu.
+    //
+    // Le client lit `config.ui_preferences` et ne connaît pas le suffixe : il
+    // n'a donc rien à changer. `read_profile_pref` retombe sur la clé globale
+    // tant que ce profil n'a rien écrit, ce qui fait la reprise des
+    // installations existantes sans migration. Absente des deux côtés, la clé
+    // est RETIRÉE plutôt que laissée à sa valeur partagée — sans quoi un profil
+    // neuf hériterait du blob de quelqu'un d'autre par le vidage générique.
+    match read_profile_pref(&settings, profile.id(), UI_PREFERENCES) {
+        Some(blob) => {
+            config.insert(UI_PREFERENCES.to_string(), Value::String(blob));
+        }
+        None => {
+            config.remove(UI_PREFERENCES);
+        }
     }
 
     // Le plafond de la lecture aléatoire, tel qu'il s'APPLIQUERA (#2901).
@@ -807,6 +835,7 @@ fn expand_replaygain_source(
 
 pub(super) async fn update_config(
     _admin: crate::auth::RequireAdmin,
+    profile: ActiveProfile,
     State(state): State<AppState>,
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -881,6 +910,19 @@ pub(super) async fn update_config(
     };
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
+
+    // 🔴 Retiré de la boucle générique AVANT qu'elle ne l'écrive sous le nom nu.
+    //
+    // Laissé passer, le blob repartirait dans la clé partagée et ce correctif
+    // n'aurait aucun effet : chaque profil continuerait d'écraser les autres.
+    if let Some(brut) = values.remove(UI_PREFERENCES) {
+        let str_val = match brut {
+            Value::String(s) => s,
+            autre => autre.to_string(),
+        };
+        write_profile_pref(&settings, profile.id(), UI_PREFERENCES, &str_val);
+    }
+
     for (key, value) in values {
         let str_val = if value.is_string() {
             value
@@ -2580,6 +2622,29 @@ const DEFAULT_VISIBLE_FIELDS: &[&str] = &[
     "source_media",
 ];
 
+/// Les préférences d'interface du client web, rangées PAR PROFIL.
+///
+/// # Le défaut
+///
+/// Ce blob — thème du nouveau client, colonnes de pistes, facettes Oxygen, vue
+/// de démarrage, photo d'avatar — était un réglage d'INSTALLATION. Sur un
+/// serveur à plusieurs profils, la femme, le fils et le père partageaient donc
+/// un seul jeu de réglages : le dernier qui touchait à quoi que ce soit
+/// l'imposait aux deux autres.
+///
+/// L'incohérence sautait aux yeux dans ce fichier même : le thème de
+/// l'ANCIENNE interface est par profil depuis longtemps (`set_theme` /
+/// `get_theme`, plus bas, via `write_profile_pref`), celui de la NOUVELLE
+/// vivait ici, partagé. Deux thèmes, deux portées, cent lignes d'écart.
+///
+/// # La reprise est gratuite
+///
+/// `read_profile_pref` retombe sur la clé globale quand la clé du profil
+/// n'existe pas encore : une installation existante continue de lire son blob
+/// tel quel, et chaque profil s'en détache à sa première écriture. Aucune
+/// migration, aucun script.
+const UI_PREFERENCES: &str = "ui_preferences";
+
 fn metadata_fields_key(pid: i64) -> String {
     format!("metadata_visible_fields:{pid}")
 }
@@ -2848,6 +2913,7 @@ mod purge_hors_perimetre_tests {
         regrouper_hors_perimetre,
     };
     use crate::auth::RequireAdmin;
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
     use crate::state::AppState;
     use axum::Json;
     use axum::extract::State;
@@ -3628,6 +3694,7 @@ mod purge_hors_perimetre_tests {
         let objet = patch.as_object().expect("patch objet").clone();
         let reponse = super::update_config(
             RequireAdmin,
+            ActiveProfile(DEFAULT_PROFILE_ID),
             State(state.clone()),
             Json(super::ConfigPatch(objet)),
         )
@@ -3791,6 +3858,7 @@ mod purge_hors_perimetre_tests {
 #[cfg(test)]
 mod replaygain_source_tests {
     use super::get_config;
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
     use crate::state::AppState;
     use axum::extract::State;
     use axum::http::HeaderMap;
@@ -3801,7 +3869,13 @@ mod replaygain_source_tests {
     }
 
     async fn config_de(state: &AppState) -> serde_json::Value {
-        get_config(HeaderMap::new(), State(state.clone())).await.0
+        get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0
     }
 
     #[tokio::test]
@@ -3860,7 +3934,9 @@ mod replaygain_source_tests {
         let mut h = HeaderMap::new();
         h.insert("accept-language", "en-GB,en;q=0.9".parse().unwrap());
 
-        let c = get_config(h, State(state.clone())).await.0;
+        let c = get_config(h, ActiveProfile(DEFAULT_PROFILE_ID), State(state.clone()))
+            .await
+            .0;
         assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
         assert_eq!(c["replaygain_source"]["label"], "File tags, then analysis");
     }
@@ -4069,5 +4145,177 @@ mod replaygain_source_tests {
         );
         assert!((applique.preamp_db - (-3.5)).abs() < 1e-9);
         assert!(!applique.prevent_clipping);
+    }
+}
+
+/// Les préférences d'interface appartiennent au PROFIL, pas à l'installation.
+///
+/// Chantier multi-profil, lot B. Voir [`UI_PREFERENCES`] pour le défaut.
+#[cfg(test)]
+mod ui_preferences_par_profil_tests {
+    use super::{UI_PREFERENCES, get_config, update_config};
+    use crate::auth::RequireAdmin;
+    use crate::routes::active_profile::ActiveProfile;
+    use crate::state::AppState;
+    use axum::Json;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    const PERE: i64 = 1;
+    const FILS: i64 = 2;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// Écrit les préférences AU NOM d'un profil, comme le ferait son navigateur
+    /// en envoyant l'en-tête `X-Profile-Id`.
+    async fn ecrire(state: &AppState, pid: i64, blob: &str) {
+        let mut objet = serde_json::Map::new();
+        objet.insert(
+            UI_PREFERENCES.to_string(),
+            serde_json::Value::String(blob.to_string()),
+        );
+        update_config(
+            RequireAdmin,
+            ActiveProfile(pid),
+            State(state.clone()),
+            Json(super::ConfigPatch(objet)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("update_config a echoue"))
+        .into_response();
+    }
+
+    /// Relit la configuration telle que ce profil la voit.
+    async fn lire(state: &AppState, pid: i64) -> Option<String> {
+        get_config(HeaderMap::new(), ActiveProfile(pid), State(state.clone()))
+            .await
+            .0
+            .get(UI_PREFERENCES)
+            .and_then(|v| v.as_str().map(str::to_owned))
+    }
+
+    /// 🔴 LE DÉFAUT. Deux profils, deux thèmes — et chacun garde le sien.
+    #[tokio::test]
+    async fn chaque_profil_garde_ses_preferences() {
+        let state = etat();
+        ecrire(&state, PERE, r#"{"v2Theme":"midnight-orange"}"#).await;
+        ecrire(&state, FILS, r#"{"v2Theme":"noir-vert"}"#).await;
+
+        assert_eq!(
+            lire(&state, PERE).await.as_deref(),
+            Some(r#"{"v2Theme":"midnight-orange"}"#),
+            "le pere a herite du theme du fils : les preferences sont restees partagees"
+        );
+        assert_eq!(
+            lire(&state, FILS).await.as_deref(),
+            Some(r#"{"v2Theme":"noir-vert"}"#)
+        );
+    }
+
+    /// La reprise : une installation existante porte son blob sous la clé
+    /// GLOBALE. Chaque profil doit continuer de le lire tant qu'il n'a rien
+    /// écrit — sans quoi la mise à jour effacerait les réglages de tout le
+    /// monde à la première ouverture.
+    #[tokio::test]
+    async fn le_blob_historique_reste_lu_par_tous() {
+        let state = etat();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .set(UI_PREFERENCES, r#"{"v2Theme":"historique"}"#)
+            .unwrap();
+
+        for pid in [PERE, FILS] {
+            assert_eq!(
+                lire(&state, pid).await.as_deref(),
+                Some(r#"{"v2Theme":"historique"}"#),
+                "le profil {pid} ne lit plus le blob d'avant la mise a jour"
+            );
+        }
+    }
+
+    /// …et il se DÉTACHE à la première écriture, sans toucher aux autres.
+    #[tokio::test]
+    async fn la_premiere_ecriture_detache_un_profil_sans_toucher_aux_autres() {
+        let state = etat();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .set(UI_PREFERENCES, r#"{"v2Theme":"historique"}"#)
+            .unwrap();
+
+        ecrire(&state, FILS, r#"{"v2Theme":"a-moi"}"#).await;
+
+        assert_eq!(
+            lire(&state, FILS).await.as_deref(),
+            Some(r#"{"v2Theme":"a-moi"}"#)
+        );
+        assert_eq!(
+            lire(&state, PERE).await.as_deref(),
+            Some(r#"{"v2Theme":"historique"}"#),
+            "l'ecriture d'un profil a change ce que voit l'autre"
+        );
+    }
+
+    /// 🔴 La clé GLOBALE ne doit plus bouger. Si l'écriture retombait dans la
+    /// boucle générique, ce correctif n'aurait aucun effet visible ici mais
+    /// chaque profil continuerait d'ecraser les autres a la lecture de repli.
+    #[tokio::test]
+    async fn la_cle_partagee_n_est_plus_jamais_reecrite() {
+        let state = etat();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings.set(UI_PREFERENCES, "avant").unwrap();
+
+        ecrire(&state, FILS, "apres").await;
+
+        assert_eq!(
+            settings.get(UI_PREFERENCES).unwrap().as_deref(),
+            Some("avant"),
+            "la cle partagee a ete reecrite : le blob repart dans le reglage d'installation"
+        );
+        assert_eq!(
+            settings
+                .get(&format!("{UI_PREFERENCES}:{FILS}"))
+                .unwrap()
+                .as_deref(),
+            Some("apres")
+        );
+    }
+
+    /// 🔴 Personne ne voit les préférences des autres.
+    ///
+    /// La photo d'avatar vit dans ce blob : publier toutes les lignes
+    /// `ui_preferences:{pid}` livrerait plusieurs kilo-octets par personne, sur
+    /// une route appelée en boucle, et l'image de chacun à tout le monde.
+    #[tokio::test]
+    async fn les_blobs_des_autres_profils_ne_sont_pas_publies() {
+        let state = etat();
+        ecrire(&state, PERE, r#"{"avatarImage":"secret-du-pere"}"#).await;
+        ecrire(&state, FILS, r#"{"v2Theme":"a-moi"}"#).await;
+
+        let vu = get_config(HeaderMap::new(), ActiveProfile(FILS), State(state.clone()))
+            .await
+            .0;
+        let brut = serde_json::to_string(&vu).unwrap();
+        assert!(
+            !brut.contains("secret-du-pere"),
+            "les preferences du pere sortent dans la config servie au fils"
+        );
+        assert!(
+            !brut.contains(&format!("{UI_PREFERENCES}:")),
+            "les cles suffixees sont publiees telles quelles"
+        );
+    }
+
+    /// Un profil neuf sur une installation neuve n'a rien — et la clé est
+    /// ABSENTE plutôt que vide, pour que le client applique ses propres
+    /// défauts au lieu d'un blob d'emprunt.
+    #[tokio::test]
+    async fn un_profil_neuf_n_herite_de_personne() {
+        let state = etat();
+        ecrire(&state, PERE, r#"{"avatarImage":"secret-du-pere"}"#).await;
+        assert_eq!(lire(&state, FILS).await, None);
     }
 }
