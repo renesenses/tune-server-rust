@@ -63,7 +63,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     );
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
-    spawn_slimproto_server(state, config.port);
+    spawn_slimproto_server(state, config);
     spawn_social_sharing_listener(state);
     crate::routes::developer_api::spawn_webhook_dispatcher(state);
     #[cfg(feature = "oaat")]
@@ -976,6 +976,41 @@ async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
     }
 }
 
+/// La base d'URL du proxy Deezer, REMISE aux lecteurs du réseau.
+///
+/// #3867 — ce site lisait `get_local_ip()` brut, deux fonctions sous un
+/// annonceur SSDP qui, lui, respecte `advertised_ip`. Sur un hôte
+/// multi-domicilié (VPN, NordVPN, plusieurs cartes réseau), Tune s'annonçait
+/// donc à la bonne adresse et remettait en même temps des URL portant l'autre :
+/// le lecteur recevait une adresse qu'il ne sait pas joindre.
+///
+/// Le CONSOMMATEUR est `DeezerService::get_track_url`
+/// (`tune-core/src/streaming/deezer.rs`), qui bâtit `{base}/deezer/{id}.{ext}`
+/// et le rend comme `StreamUrl`. Pour une zone réseau (DLNA/UPnP), cette URL
+/// est celle que le renderer va chercher LUI-MÊME, depuis une autre machine :
+/// elle doit donc porter l'adresse par laquelle on nous joint.
+///
+/// Fonction et non expression en ligne, pour qu'un témoin puisse APPELER la
+/// décision réelle plutôt que d'en recopier les termes.
+pub fn base_du_proxy_deezer(config: &TuneConfig) -> String {
+    format!("http://{}:{}/deezer-proxy", config.server_ip(), config.port)
+}
+
+/// L'adresse que le serveur SlimProto REMET aux contrôleurs distants.
+///
+/// #3867, même défaut et même remède. Le CONSOMMATEUR est le serveur CLI du
+/// port 9090 (`tune-core/src/slimproto/cli_server.rs`), qui recopie cette
+/// adresse dans le `player_ip:{ip}:3483` de sa réponse d'état — une chaîne qui
+/// part sur le réseau, vers un contrôleur tiers (Squeeze-LX, Home Assistant).
+///
+/// Elle n'est PAS l'adresse attendue par `SlimProtoState::server_ip` : voir le
+/// commentaire de [`spawn_slimproto_server`], qui sépare les deux.
+///
+/// Fonction et non expression en ligne, pour la même raison que ci-dessus.
+pub fn adresse_slimproto_remise_aux_controleurs(config: &TuneConfig) -> String {
+    config.server_ip()
+}
+
 async fn configure_deezer_proxy(state: &AppState, config: &TuneConfig) {
     let registry = state.services.lock().await;
     if let Some(svc) = registry.get("deezer") {
@@ -984,13 +1019,7 @@ async fn configure_deezer_proxy(state: &AppState, config: &TuneConfig) {
             .as_any_mut()
             .downcast_mut::<tune_core::streaming::deezer::DeezerService>()
         {
-            let server_ip = tune_core::discovery::ssdp::get_local_ip()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "127.0.0.1".into());
-            deezer.set_proxy_base_url(Some(format!(
-                "http://{}:{}/deezer-proxy",
-                server_ip, config.port
-            )));
+            deezer.set_proxy_base_url(Some(base_du_proxy_deezer(config)));
             info!("deezer_proxy_configured");
         }
     }
@@ -1006,6 +1035,20 @@ fn spawn_alarm_scheduler(state: &AppState) {
 
 fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {
     if tune_core::notifications::is_enabled() {
+        // Site LAISSÉ sur l'autodétection, délibérément (#3867).
+        //
+        // Cette base ne part PAS sur le réseau. Son unique consommateur est
+        // `download_icon` (`tune-core/src/notifications.rs`), qui préfixe un
+        // `cover_path` en `/api/…` pour aller chercher la pochette SUR CE
+        // SERVEUR, depuis CE processus, la ranger dans un cache local, puis la
+        // passer à `show_notification` — AppleScript, toast Windows,
+        // `notify-send` : une notification affichée sur cette machine-ci.
+        //
+        // `advertised_ip` répond à « par quelle adresse me joint-ON ? ». Elle
+        // peut légitimement valoir une adresse NAT, publique ou de pair VPN que
+        // cet hôte ne sait pas joindre lui-même. Y basculer casserait une
+        // pochette qui s'affiche aujourd'hui, pour corriger un défaut que ce
+        // site n'a pas.
         let server_ip = tune_core::discovery::ssdp::get_local_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".into());
@@ -1893,8 +1936,28 @@ pub(crate) fn annonce_slimproto_activee(valeur: Option<&str>) -> bool {
     !matches!(valeur.map(str::trim), Some("false") | Some("0"))
 }
 
-fn spawn_slimproto_server(state: &AppState, port_http: u16) {
-    let local_ip = tune_core::discovery::ssdp::get_local_ip()
+fn spawn_slimproto_server(state: &AppState, config: &TuneConfig) {
+    // DEUX adresses, et non plus une — elles ne répondent pas à la même
+    // question (#3867).
+    //
+    // Celle-ci est REMISE à un tiers : le contrôleur distant qui interroge le
+    // serveur CLI du port 9090. Elle respecte donc le réglage d'adresse
+    // annoncée, comme l'annonceur SSDP de `spawn_upnp_advertiser`.
+    let adresse_remise = adresse_slimproto_remise_aux_controleurs(config);
+
+    // Celle-là, non, et c'est délibéré. `SlimProtoState::server_ip` n'a qu'UN
+    // consommateur dans le dépôt : `sonder_qui_tient_le_port`
+    // (`tune-core/src/slimproto/mod.rs`), qui tente une connexion TCP pour
+    // nommer QUI tient le port 3483 SUR CETTE MACHINE quand le bind échoue
+    // (#2938, #2349) — « un socket lié à 192.168.x.y:3483 seul refuse notre
+    // bind sur 0.0.0.0 sans jamais répondre sur 127.0.0.1 ». Le `strm s` de
+    // démarrage, lui, écrit `server_ip = 0` : le lecteur réutilise l'adresse
+    // de sa connexion de contrôle et ne lit jamais ce champ, malgré ce que
+    // dit encore la doc du champ là-bas.
+    //
+    // Y mettre l'adresse annoncée ferait sonder une AUTRE machine, et
+    // nommerait « un autre serveur écoute » un port pourtant libre ici.
+    let ip_sondee_localement = tune_core::discovery::ssdp::get_local_ip()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
@@ -1903,7 +1966,7 @@ fn spawn_slimproto_server(state: &AppState, port_http: u16) {
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
     let outputs = state.outputs.clone();
-    let server_ip = local_ip.clone();
+    let server_ip = ip_sondee_localement;
     tokio::spawn(async move {
         let server = Arc::new(tune_core::slimproto::SlimProtoServer::new_with_state(
             db, event_bus, outputs, server_ip,
@@ -1916,7 +1979,7 @@ fn spawn_slimproto_server(state: &AppState, port_http: u16) {
         players: tune_core::slimproto::new_player_registry(),
         server_name: "Tune".to_string(),
         server_version: tune_core::version().to_string(),
-        local_ip,
+        local_ip: adresse_remise,
     });
     tokio::spawn(tune_core::slimproto::cli_server::start_cli_server(
         cli_state,
@@ -1948,7 +2011,7 @@ fn spawn_slimproto_server(state: &AppState, port_http: u16) {
     }
     tune_core::slimproto::discovery::spawn(tune_core::slimproto::discovery::IdentiteServeur {
         nom: "Tune".to_string(),
-        port_http,
+        port_http: config.port,
         port_cli: 9090,
         version: tune_core::version().to_string(),
     });
