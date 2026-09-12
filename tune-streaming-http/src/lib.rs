@@ -2467,6 +2467,72 @@ mod temoin_statut_du_refus_i859 {
         assert_eq!(corps, "labels not supported for this service");
     }
 
+    /// **Les HUIT** refus par défaut du trait, pas seulement celui que la route
+    /// du label emprunte.
+    ///
+    /// L'essai précédent n'en interroge qu'un. Reposer `"…".into()` sur
+    /// `create_playlist` — ou sur n'importe lequel des sept autres — ferait
+    /// silencieusement redescendre sa route en 502 sans qu'aucun rouge ne
+    /// vienne. Un rouge qui ne vient pas est un défaut du témoin : celui-ci
+    /// ferme les huit.
+    ///
+    /// Le connecteur simulé ne surcharge AUCUNE de ces méthodes : c'est bien le
+    /// défaut de `tune-core` qui répond.
+    #[tokio::test]
+    async fn les_huit_refus_par_defaut_du_trait_sont_types() {
+        let mut svc = ServiceDHumeur {
+            nom: "essai-defauts".into(),
+            humeur: Humeur::PasserelleEnPanne,
+        };
+        let refus: Vec<(&str, TuneError)> = vec![
+            (
+                "create_playlist",
+                svc.create_playlist("x", None).await.unwrap_err(),
+            ),
+            (
+                "add_tracks_to_playlist",
+                svc.add_tracks_to_playlist("p", &[]).await.unwrap_err(),
+            ),
+            (
+                "delete_playlist",
+                svc.delete_playlist("p").await.unwrap_err(),
+            ),
+            (
+                "remove_tracks_from_playlist",
+                svc.remove_tracks_from_playlist("p", &[]).await.unwrap_err(),
+            ),
+            (
+                "get_album_label",
+                svc.get_album_label("a").await.unwrap_err(),
+            ),
+            (
+                "get_album_context",
+                svc.get_album_context("a").await.unwrap_err(),
+            ),
+            (
+                "add_favorite",
+                svc.add_favorite("albums", "i").await.unwrap_err(),
+            ),
+            (
+                "remove_favorite",
+                svc.remove_favorite("albums", "i").await.unwrap_err(),
+            ),
+        ];
+        assert_eq!(refus.len(), 8, "les huit defauts, pas sept");
+        for (methode, erreur) in refus {
+            assert!(
+                matches!(erreur, TuneError::Unsupported(_)),
+                "le defaut de `{methode}` est un refus delibere, pas une panne \
+                 d'amont : {erreur:?}"
+            );
+            assert_eq!(
+                statut_porte_par_l_erreur(&erreur),
+                Some(StatusCode::NOT_IMPLEMENTED),
+                "et sa route doit donc sortir en 501 : `{methode}`"
+            );
+        }
+    }
+
     /// Une réponse ÉDITORIALE refusée passe par `svc_response_editorial`, qui
     /// délègue à `svc_response`. Sans cet essai, la moitié éditoriale des
     /// routes pourrait garder le 502 sans que rien ne rougisse.
