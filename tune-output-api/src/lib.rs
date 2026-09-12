@@ -894,6 +894,286 @@ impl FormatOuvert {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// R5 de #2219 — le format SOURCE, porté par un type.
+//
+// [`FormatOuvert`] dit ce que le périphérique a ouvert, à la SORTIE du puits :
+// des `f32`, une cadence, des canaux. Il ne dit rien de l'entrée, et il ne le
+// peut pas — à l'entrée il y a des OCTETS, et des octets ne se lisent pas sans
+// profondeur. C'est ce que [`AudioSpec`] ajoute, et c'est tout ce qu'il ajoute :
+// les deux types sont les deux bouts de la conversion, pas deux façons de dire
+// la même chose.
+//
+// Ce qu'il remplace : `sample_rate: u32`, `bit_depth: u16`, `channels: u16` et
+// `frame_bytes: usize` circulant NUS et séparément. Quatre nombres dont trois
+// sont des étiquettes et le quatrième leur conséquence — que rien n'obligeait à
+// recalculer quand une étiquette changeait, et dont deux, tous deux `u16`,
+// s'intervertissaient sans un mot du compilateur.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Comment un mot PCM est écrit dans les octets d'un flux.
+///
+/// **Le jeu est FERMÉ, et aucune méthode de ce type n'a de bras `_`.** Ce n'est
+/// pas une commodité : `parse_wav_header` ne rend jamais rien d'autre que `0`,
+/// `16`, `24` ou `32`, et tout le chemin de lecture locale — octets par
+/// échantillon, octets par trame, alignement des trames, conversion en `f32`,
+/// conversion en `i32` natif — n'énumère que ces quatre-là. Une cinquième
+/// valeur n'est pas « moins précise », elle est **incohérente**, et de deux
+/// façons opposées selon le chemin : bruit blanc d'un côté, silence de l'autre.
+///
+/// Une profondeur ajoutée ici est donc réclamée par le compilateur partout où
+/// elle change quelque chose, au lieu de se glisser sous un repli silencieux.
+///
+/// # Le piège que ce type ferme
+///
+/// [`Self::FlottantIeee32`] et [`Self::Entier32`] font tous deux **quatre
+/// octets** et ne se décodent pas du tout pareil. Tant que la profondeur était
+/// un `u16`, le flottant se disait « 0 » — le sentinelle des en-têtes WAV — et
+/// `bit_depth == 32` était donc faux pour lui, tandis que `bit_depth / 8`
+/// rendait `0` octet. Chaque appelant devait se souvenir du cas particulier.
+/// Ici les deux sont des variantes distinctes de même largeur, et
+/// [`Self::octets`] répond `4` pour les deux sans que personne ait à y penser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProfondeurPcm {
+    /// Flottant IEEE 754 32 bits, petit-boutien. Se dit `0` dans un en-tête WAV
+    /// tel que ce dépôt le lit : c'est un sentinelle, pas une largeur.
+    FlottantIeee32,
+    /// Entier signé 16 bits, petit-boutien.
+    Entier16,
+    /// Entier signé 24 bits, petit-boutien, trois octets par mot.
+    Entier24,
+    /// Entier signé 32 bits, petit-boutien.
+    Entier32,
+}
+
+impl ProfondeurPcm {
+    /// Largeur d'un mot, en octets. Jamais nulle.
+    #[must_use]
+    pub const fn octets(self) -> usize {
+        match self {
+            Self::FlottantIeee32 => 4,
+            Self::Entier16 => 2,
+            Self::Entier24 => 3,
+            Self::Entier32 => 4,
+        }
+    }
+
+    /// La valeur telle qu'un en-tête WAV la déclare dans ce dépôt — `0` pour le
+    /// flottant.
+    ///
+    /// Existe pour les fonctions qui prennent encore un `u16` et qu'on ne
+    /// réécrit pas ici. Chaque appel est un endroit où l'étiquette redevient un
+    /// nombre nu : ils se comptent, et ils doivent diminuer.
+    #[must_use]
+    pub const fn bits_declares(self) -> u16 {
+        match self {
+            Self::FlottantIeee32 => 0,
+            Self::Entier16 => 16,
+            Self::Entier24 => 24,
+            Self::Entier32 => 32,
+        }
+    }
+
+    /// L'inverse, **partiel** : hors du jeu fermé, il n'y a pas de réponse.
+    ///
+    /// `None` n'est pas « on ne sait pas faire » mais « ce flux ne se décode
+    /// pas ici » : le seul geste sûr est de le refuser avant qu'un octet ne
+    /// parte au DAC.
+    #[must_use]
+    pub const fn depuis_bits_declares(bits: u16) -> Option<Self> {
+        match bits {
+            0 => Some(Self::FlottantIeee32),
+            16 => Some(Self::Entier16),
+            24 => Some(Self::Entier24),
+            32 => Some(Self::Entier32),
+            _ => None,
+        }
+    }
+}
+
+/// Le format d'un flux PCM : ce qu'il faut, et il faut tout, pour donner un
+/// sens à une suite d'octets.
+///
+/// # Pourquoi les champs sont PRIVÉS
+///
+/// C'est la raison d'être du type. `octets_par_trame` n'est pas rangé à côté
+/// des trois autres : il est **calculé** à chaque demande, à partir de la
+/// profondeur et des canaux. Il ne peut donc pas leur survivre.
+///
+/// Le défaut que cela ferme est réel et daté : à une frontière gapless,
+/// `local.rs` posait quatre affectations de suite — cadence, canaux,
+/// profondeur, puis `frame_bytes` recalculé à la main. Oublier la quatrième, ou
+/// la calculer avec l'ancienne profondeur, ne cassait aucune compilation :
+/// c'était un flux 24 bits lu par trames de 16, c'est-à-dire tout le reste de
+/// la piste décalé d'un octet — le bruit blanc de #3849. Ici la quatrième
+/// n'existe pas, et les trois autres ne se posent qu'ensemble.
+///
+/// La deuxième chose qui change : intervertir la profondeur et les canaux.
+/// Ils étaient tous deux `u16` et voisins dans quatre signatures.
+///
+/// Il faut être exact sur ce qui est gagné, parce que ce n'est pas le même
+/// verrou des deux côtés :
+///
+/// * par [`AudioSpec::nouvelle`], l'interversion est une **erreur de type** —
+///   [`ProfondeurPcm`] n'est pas un `u16`, le compilateur refuse ;
+/// * par [`AudioSpec::depuis_entete`], qui prend encore deux `u16` parce
+///   qu'un en-tête WAV rend deux nombres, l'interversion compile toujours.
+///   Elle est rattrapée à l'exécution par le jeu fermé : un flux stéréo
+///   intervertit ses arguments en « 2 bits », qui n'existe pas, et le format
+///   est REFUSÉ au lieu d'être mal lu. Mesuré — voir le témoin
+///   `une_profondeur_hors_du_jeu_ferme_est_refusee_pas_approchee`.
+///
+/// Ce qui reste ouvert, et qu'il faut nommer plutôt que taire : un flux à 16,
+/// 24 ou 32 CANAUX dont les arguments seraient intervertis passerait la porte.
+/// C'est la seule fenêtre, elle tient en une ligne de code, et elle disparaîtra
+/// le jour où `parse_wav_header` rendra directement un [`AudioSpec`].
+///
+/// # Ce que ce type ne prétend PAS
+///
+/// Il ne vérifie pas que les octets qu'on lui associe sont vraiment dans ce
+/// format-là. Une `AudioSpec` construite sur un mensonge reste un mensonge —
+/// aucun type ne lit à la place de l'en-tête. Ce qu'il garantit, c'est qu'à
+/// partir du moment où l'étiquette est posée, **plus personne ne la contredit
+/// en aval**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AudioSpec {
+    cadence: u32,
+    profondeur: ProfondeurPcm,
+    canaux: u16,
+}
+
+impl AudioSpec {
+    /// L'unique constructeur. `None` quand `canaux` est nul.
+    ///
+    /// Zéro canal n'est pas un format « vide » : c'est un diviseur nul.
+    /// `octets_par_trame` vaudrait `0`, et le calcul d'alignement qui suit —
+    /// `octets.len() / octets_par_trame` — **divise par zéro**, ce qui abat le
+    /// fil de lecture. Refuser ici, une fois, vaut mieux que porter la garde
+    /// dans chaque calcul : c'est l'invariant qui rend [`BlocPcm::trames`]
+    /// total.
+    #[must_use]
+    pub const fn nouvelle(cadence: u32, profondeur: ProfondeurPcm, canaux: u16) -> Option<Self> {
+        if canaux == 0 {
+            return None;
+        }
+        Some(Self {
+            cadence,
+            profondeur,
+            canaux,
+        })
+    }
+
+    /// Le même, depuis les trois nombres qu'un en-tête WAV rend.
+    ///
+    /// `None` dès que l'un des deux refus tombe : profondeur hors du jeu fermé,
+    /// ou zéro canal. C'est la porte d'entrée du type, et la seule : tout ce qui
+    /// entre dans le chemin de conversion passe par un de ces deux
+    /// constructeurs.
+    #[must_use]
+    pub const fn depuis_entete(cadence: u32, bits_declares: u16, canaux: u16) -> Option<Self> {
+        match ProfondeurPcm::depuis_bits_declares(bits_declares) {
+            Some(profondeur) => Self::nouvelle(cadence, profondeur, canaux),
+            None => None,
+        }
+    }
+
+    /// Cadence d'échantillonnage de la source, en hertz.
+    #[must_use]
+    pub const fn cadence(self) -> u32 {
+        self.cadence
+    }
+
+    /// Comment un mot est écrit dans les octets.
+    #[must_use]
+    pub const fn profondeur(self) -> ProfondeurPcm {
+        self.profondeur
+    }
+
+    /// Nombre de canaux entrelacés. Toujours au moins 1.
+    #[must_use]
+    pub const fn canaux(self) -> u16 {
+        self.canaux
+    }
+
+    /// Octets d'une trame complète — **déduit, jamais rangé**. Toujours ≥ 1.
+    #[must_use]
+    pub const fn octets_par_trame(self) -> usize {
+        self.profondeur.octets() * self.canaux as usize
+    }
+
+    /// Étiquette ces octets avec CE format, et rien d'autre.
+    ///
+    /// C'est le seul moyen d'obtenir un [`BlocPcm`], et un `BlocPcm` n'a aucun
+    /// moyen de changer d'étiquette ensuite.
+    #[must_use]
+    pub const fn bloc(self, octets: &[u8]) -> BlocPcm<'_> {
+        BlocPcm { spec: self, octets }
+    }
+}
+
+/// Des octets PCM **et** le format dans lequel ils ont un sens, indissociables.
+///
+/// # Ce que ce type interdit
+///
+/// De réétiqueter un bloc. `spec` est privé et n'a pas de mutateur ; il n'existe
+/// aucun `BlocPcm { .. }` littéral hors de cette caisse, et
+/// [`BlocPcm::spec`] rend une **copie**. Écrire dessus ne change rien au bloc —
+/// le compilateur refuse même d'essayer, puisqu'il n'y a rien à qui affecter.
+///
+/// Ce que cela vaut, concrètement : un bloc de 48 octets stéréo fait 12 trames
+/// en 16 bits, 8 en 24 bits et 6 en 32. Les trois lectures sont plausibles ; une
+/// seule est la bonne, et c'est celle du format qui a produit le bloc. Tant que
+/// les octets et le format voyageaient séparément, tenir les deux ensemble était
+/// une discipline. Ici c'est le type.
+///
+/// # La partition, qui n'est pas un détail
+///
+/// [`Self::octets_alignes`] et [`Self::reste_non_aligne`] découpent les octets en
+/// DEUX, sans recouvrement ni perte. Le reste est celui qu'une lecture réseau
+/// laisse à chaque tour — la trame coupée en deux par la frontière du tampon.
+/// Le jeter, c'est décaler tout le flux qui suit : le bruit blanc 24 bits de
+/// #3849. Le rendre explicitement, c'est obliger l'appelant à en faire quelque
+/// chose.
+#[derive(Debug, Clone, Copy)]
+pub struct BlocPcm<'a> {
+    spec: AudioSpec,
+    octets: &'a [u8],
+}
+
+impl<'a> BlocPcm<'a> {
+    /// Le format de ce bloc. Une copie : l'écrire ne réétiquette rien.
+    #[must_use]
+    pub const fn spec(&self) -> AudioSpec {
+        self.spec
+    }
+
+    /// Tous les octets du bloc, alignés ou non.
+    #[must_use]
+    pub const fn octets(&self) -> &'a [u8] {
+        self.octets
+    }
+
+    /// Le préfixe qui fait un nombre entier de trames. Décodable tel quel.
+    #[must_use]
+    pub fn octets_alignes(&self) -> &'a [u8] {
+        &self.octets[..self.trames() * self.spec.octets_par_trame()]
+    }
+
+    /// Le suffixe qui ne complète pas une trame : à REPORTER sur la lecture
+    /// suivante, jamais à jeter.
+    #[must_use]
+    pub fn reste_non_aligne(&self) -> &'a [u8] {
+        &self.octets[self.trames() * self.spec.octets_par_trame()..]
+    }
+
+    /// Nombre de trames complètes. Total : `octets_par_trame()` ne peut pas
+    /// être nul, l'invariant de [`AudioSpec::nouvelle`] s'en charge.
+    #[must_use]
+    pub fn trames(&self) -> usize {
+        self.octets.len() / self.spec.octets_par_trame()
+    }
+}
+
 /// L'état initial de l'empreinte : le décalage de base de FNV-1a 64 bits.
 ///
 /// Publié parce qu'il est la réponse à « ce puits n'a rien reçu » — un témoin

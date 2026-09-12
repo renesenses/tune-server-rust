@@ -127,9 +127,17 @@ fn corps_de_la_fermeture() -> &'static str {
 /// pourrait pas contourner la garde, alors qu'avant elle n'avait qu'à oublier
 /// de recopier les quatre lignes — ce qui est exactement le défaut que #3233
 /// décrit.
+///
+/// ⚠️ R5 (#2219) a changé l'ORTHOGRAPHE de la route, pas la route : le format
+/// source de l'étage est devenu un `AudioSpec` et `self.sample_rate` /
+/// `self.channels` sont désormais des accesseurs. Le motif est mis à jour
+/// mot pour mot — même appel, mêmes arguments, même place AVANT la conversion.
+/// C'est le prix d'une garde qui lit du texte, et c'est aussi sa force : elle
+/// a rougi dès le premier passage, au lieu de laisser une route se déplacer en
+/// silence.
 fn motif_de_la_route() -> String {
     [
-        "ifrefuser_le_porteur_dop(bloc.dop,self.sample_rate,self.channels){",
+        "ifrefuser_le_porteur_dop(bloc.dop,self.sample_rate(),self.channels()){",
         "returnPousseeVersLePuits::PorteurDopRefuse;",
         "}",
         // Ce qui SUIT est la moitié qui compte : la garde doit précéder la
@@ -170,7 +178,7 @@ fn la_route_unique_refuse_le_porteur_dop_avant_toute_conversion() {
         .and_then(|s| s.split("fn").next())
         .expect("#3233 — `EtageDeConversion::convertir` doit rester identifiable");
     assert!(
-        convertir.contains("adapt_channels(&mots,self.channels,self.output_ch)")
+        convertir.contains("adapt_channels(&mots,self.spec.canaux(),self.sortie.canaux)")
             && convertir.contains("rubato_resample_chunk("),
         "#3233 — la conversion source → sortie doit rester dans l'étage, \
          derrière la garde : l'en sortir rouvrirait la porte à une entrée PCM \
