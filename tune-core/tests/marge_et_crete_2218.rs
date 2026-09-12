@@ -53,7 +53,7 @@
 //! `tune-core` porte `autotests = false` : ce fichier est une cible `[[test]]`
 //! du manifeste, sinon il ne serait jamais compilé.
 
-use std::f64::consts::PI;
+use std::f64::consts::{FRAC_1_SQRT_2, PI};
 
 use tune_core::audio::convolver::Convolver;
 use tune_core::audio::crossfeed::CrossfeedProcessor;
@@ -508,7 +508,7 @@ fn q1_l_egaliseur_flottant_laisse_passer_les_overs_sans_les_ecreter() {
 /// gain crête), et ~40 % des échantillons sortent du rail, écrêtés dur.
 #[test]
 fn q1_un_carre_a_moins_0_05_dbfs_sous_un_plateau_grave_reserve_depasse_quand_meme() {
-    let p = profil(vec![bande("low_shelf", 80.0, 6.0, 0.707)]);
+    let p = profil(vec![bande("low_shelf", 80.0, 6.0, FRAC_1_SQRT_2)]);
     let mut eq = EqProcessor::new(&p, FS, 1);
     assert_eq!(
         eq.preamp_db(0),
@@ -550,7 +550,7 @@ fn q1_un_carre_a_moins_0_05_dbfs_sous_un_plateau_grave_reserve_depasse_quand_mem
 #[test]
 #[ignore = "défaut connu : la réserve automatique est un maximum FRÉQUENTIEL ; un carré sous un plateau +6 dB dépasse de ~0,5 dB en temps (issue B)"]
 fn q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_reponse_en_temps_d_un_plateau() {
-    let p = profil(vec![bande("low_shelf", 80.0, 6.0, 0.707)]);
+    let p = profil(vec![bande("low_shelf", 80.0, 6.0, FRAC_1_SQRT_2)]);
     let mut eq = EqProcessor::new(&p, FS, 1);
     let mut pcm = vers_pcm(&carre(50.0, -0.05, N), 24);
     let stats = eq.process_pcm(&mut pcm, 24);
@@ -572,7 +572,7 @@ fn q2_le_metre_de_crete_vraie_retrouve_la_crete_cachee_entre_deux_echantillons()
         dbfs(crete_ech),
         dbfs(crete_vraie)
     );
-    assert!((crete_ech - 0.9 * 0.7071).abs() < 1e-3);
+    assert!((crete_ech - 0.9 * FRAC_1_SQRT_2).abs() < 1e-3);
     assert!(
         (crete_vraie - 0.9).abs() < 0.9 * 0.003,
         "le mètre retrouve la crête cachée (+3 dB) à 0,3 % près : {crete_vraie}"
@@ -810,7 +810,7 @@ fn q3_pcm_mixer_apply_gain_tronque_vers_zero_lui_aussi() {
 /// signal passé à 32 bits, où ±1 LSB vaut −186 dBFS.
 #[test]
 fn q3_l_egaliseur_entier_requantifie_avec_un_dither_tpdf_a_toute_profondeur() {
-    let p = profil(vec![bande("high_shelf", 20_000.0, -1.0, 0.707)]);
+    let p = profil(vec![bande("high_shelf", 20_000.0, -1.0, FRAC_1_SQRT_2)]);
     let x = sinus(997.0, -20.0, N, 0.0);
 
     for bits in [16u16, 24] {
@@ -852,7 +852,7 @@ fn q3_l_egaliseur_entier_requantifie_avec_un_dither_tpdf_a_toute_profondeur() {
     EqProcessor::new(&p, FS, 1).process_pcm(&mut silence, 32);
     let vals = depuis_pcm(&silence, 32);
     assert!(
-        vals.iter().any(|&v| v == 1) && vals.iter().any(|&v| v == -1),
+        vals.contains(&1) && vals.contains(&-1),
         "le silence 32 bits ressort dithéré à ±1 LSB"
     );
 }
