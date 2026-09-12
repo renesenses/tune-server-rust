@@ -34,9 +34,19 @@ use tune_core::sendspin::suite::Suite;
 const MAX_NOISE: usize = 65535;
 
 /// Monte le VRAI routeur du point d'accès sur une socket éphémère.
+///
+/// **Mode de transition FERMÉ**, délibérément : tous les témoins de ce fichier
+/// éprouvent le chemin chiffré, et ils doivent le faire dans la configuration
+/// par défaut de Tune. Un chemin chiffré qui n'aurait été mesuré qu'avec la
+/// porte du clair ouverte ne prouverait pas grand-chose.
 async fn point_d_acces() -> String {
     let app = axum::Router::new()
-        .nest("/sendspin", tune_server::routes::sendspin::router::<()>())
+        .nest(
+            "/sendspin",
+            tune_server::routes::sendspin::router::<()>(
+                tune_core::sendspin::ModeTransition::ChiffrementSeul,
+            ),
+        )
         .with_state(());
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -323,13 +333,19 @@ async fn un_client_init_illisible_fait_fermer_sans_reponse_applicative() {
 fn le_point_d_acces_est_monte_a_la_racine_de_l_application() {
     let source = include_str!("../src/routes/mod.rs");
 
-    // Ligne par ligne, et en exigeant que le `.nest` soit le DEBUT de la ligne
-    // utile. Un simple `contains` sur la source entiere retrouvait la
-    // sous-chaine dans `// .nest("/sendspin", ...)` : la contre-epreuve a
-    // montre la garde verte alors que le point d'acces etait demonte.
+    // Ligne par ligne, en ecartant les lignes COMMENTEES. Un simple `contains`
+    // sur la source entiere retrouvait la sous-chaine dans
+    // `// .nest("/sendspin", ...)` : la contre-epreuve a montre la garde verte
+    // alors que le point d'acces etait demonte.
+    //
+    // Depuis le mode de transition, le montage prend un argument et rustfmt le
+    // coupe sur plusieurs lignes : la garde cherche donc l'APPEL, pas la ligne
+    // entiere, mais toujours sur une ligne non commentee.
     let est_monte = |bloc: &str| {
-        bloc.lines()
-            .any(|l| l.trim_start().starts_with(MONTAGE_ATTENDU))
+        bloc.lines().any(|l| {
+            let l = l.trim_start();
+            !l.starts_with("//") && l.contains(MONTAGE_ATTENDU)
+        })
     };
 
     assert!(
@@ -353,7 +369,7 @@ fn le_point_d_acces_est_monte_a_la_racine_de_l_application() {
 }
 
 /// Le montage attendu, ecrit une seule fois.
-const MONTAGE_ATTENDU: &str = r#".nest("/sendspin", sendspin::router())"#;
+const MONTAGE_ATTENDU: &str = "sendspin::router(";
 
 /// L'annonce mDNS est l'autre moitié de la découverte, et elle a le même
 /// défaut possible : exister sans être appelée.
@@ -397,8 +413,19 @@ async fn banc_de_preuve_lecteur_reel() {
         .with_max_level(tracing::Level::DEBUG)
         .try_init();
 
+    // Le banc arme le mode de transition : le lecteur de reference PUBLIE ne
+    // parle que le clair (aiosendspin 6.0.5 n'a aucun module `noise/`). Sans
+    // ca, ce banc ne peut recevoir que d'un lecteur bati sur le depot git.
+    let mode = match std::env::var("SENDSPIN_BANC_CHIFFRE_SEUL").as_deref() {
+        Ok("1") => tune_core::sendspin::ModeTransition::ChiffrementSeul,
+        _ => tune_core::sendspin::ModeTransition::ClairAccepte,
+    };
+    println!("mode de transition du banc : {}", mode.nom());
     let app = axum::Router::new()
-        .nest("/sendspin", tune_server::routes::sendspin::router::<()>())
+        .nest(
+            "/sendspin",
+            tune_server::routes::sendspin::router::<()>(mode),
+        )
         .with_state(());
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:8927")
         .await
@@ -431,7 +458,11 @@ async fn banc_de_preuve_lecteur_reel() {
     for pair in &vus {
         println!("--- client/hello REEL ---");
         println!("client_id       = {}", pair.client_id);
-        println!("suite           = {}", pair.suite);
+        println!("suite           = {:?}", pair.suite);
+        println!(
+            "transport       = {}",
+            if pair.chiffre { "noise" } else { "CLAIR" }
+        );
         println!("name            = {:?}", pair.nom);
         println!("supported_roles = {:?}", pair.roles);
         println!(

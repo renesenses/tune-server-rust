@@ -490,7 +490,17 @@ pub fn router_with_plugins(
         // `/api/v1` : le TXT mDNS annonce `/sendspin`, et une enceinte ne
         // connaît pas nos préfixes. Pas d'extracteur `WsAuthorized` non
         // plus — c'est la couche Noise qui authentifie, pas axum.
-        .nest("/sendspin", sendspin::router())
+        //
+        // Le mode de transition est LU ICI, une fois, depuis le réglage du
+        // processus. Il n'est jamais forcé : écrire une valeur en dur à cette
+        // ligne ouvrirait un point d'accès en clair sans que personne ne l'ait
+        // demandé, et le témoin
+        // `le_point_d_acces_monte_lit_le_reglage_et_ne_force_pas_le_clair`
+        // garde cette ligne pour ça.
+        .nest(
+            "/sendspin",
+            sendspin::router(tune_core::sendspin::ModeTransition::en_vigueur()),
+        )
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
         .with_state(state.clone())

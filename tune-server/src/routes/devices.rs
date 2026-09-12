@@ -96,6 +96,11 @@ async fn list_sendspin_players(State(state): State<AppState>) -> Json<Value> {
         // aucune zone Sendspin ne doit naître de cette liste.
         "playback_supported": false,
         "reason": tune_core::discovery::sendspin::MOTIF_PHASE_DECOUVERTE,
+        // #3326 — le MODE DE TRANSITION, publié ici pour qu'on puisse répondre
+        // à « ce serveur accepte-t-il du non chiffré ? » sans lire le code ni
+        // le journal. Le nom du réglage part avec l'état : sinon la réponse
+        // « oui » ne dit pas quoi changer.
+        "transition_mode": tune_core::sendspin::ModeTransition::en_vigueur().decrire(),
         "count": players.len(),
         "players": players,
         "handshaked_count": pairs.len(),

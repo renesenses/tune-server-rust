@@ -42,6 +42,19 @@
 //! C'est pourquoi [`poignee::PoigneeServeur`] conserve les deux textes tels
 //! quels et ne les reconstruit jamais. Le témoin
 //! `un_prologue_reconstruit_fait_echouer_la_poignee` garde ce point.
+//!
+//! ## Le mode de transition (ajouté le 11/09/2026)
+//!
+//! Aucun lecteur PUBLIÉ ne parle encore le Sendspin chiffré : `aiosendspin`
+//! 6.0.5 n'embarque aucun module `noise/` et ne connaît ni `client/init` ni
+//! `server/activate`. Tune, qui n'implémentait que la branche chiffrée, était
+//! conforme et incapable de parler à une enceinte installée.
+//!
+//! [`transition::ModeTransition`] ouvre une porte **supplémentaire** : un
+//! `client/hello` en clair comme tout premier message. Elle est **fermée par
+//! défaut**, elle ne remplace jamais la branche chiffrée — l'aiguillage se fait
+//! sur le TYPE du premier message, pas sur un échec — et une session qui
+//! l'emprunte est nommée comme telle dans le journal et au registre.
 
 pub mod identite;
 pub mod messages;
@@ -49,12 +62,14 @@ pub mod poignee;
 pub mod psk;
 pub mod registre;
 pub mod suite;
+pub mod transition;
 pub mod transport;
 
 pub use identite::Identite;
 pub use poignee::PoigneeServeur;
 pub use registre::PairVu;
 pub use suite::Suite;
+pub use transition::ModeTransition;
 pub use transport::TransportNoise;
 
 /// L'identité Sendspin de ce serveur, pour la durée du processus.
@@ -113,6 +128,15 @@ pub enum ErreurSendspin {
     Noise(String),
     /// La séquence a été jouée dans le désordre par notre propre code.
     EtatInattendu(&'static str),
+    /// Un pair a ouvert par un `client/hello` en clair alors que le mode de
+    /// transition n'est pas armé. Ce n'est pas une panne : c'est le refus
+    /// attendu, et le défaut.
+    ClairRefuse,
+    /// Un pair a prétendu **en clair** à un `client_id` que nous avons déjà vu
+    /// mener une poignée de main Noise. Refus de rétrogradation : ce pair sait
+    /// se connecter chiffré, rien ne justifie qu'il retombe en clair — et le
+    /// `client_id` d'une session en clair n'est qu'une prétention.
+    RetrogradationRefusee(String),
 }
 
 impl std::fmt::Display for ErreurSendspin {
@@ -129,6 +153,17 @@ impl std::fmt::Display for ErreurSendspin {
             Self::IdentifiantInvalide(d) => write!(f, "identifiant sendspin invalide : {d}"),
             Self::Noise(d) => write!(f, "couche noise : {d}"),
             Self::EtatInattendu(d) => write!(f, "séquence sendspin hors d'ordre : {d}"),
+            Self::ClairRefuse => write!(
+                f,
+                "client/hello en clair refusé : le mode de transition n'est pas armé \
+                 ({})",
+                transition::VARIABLE_ENVIRONNEMENT
+            ),
+            Self::RetrogradationRefusee(id) => write!(
+                f,
+                "rétrogradation refusée : {id} a déjà mené une poignée de main Noise, \
+                 il ne peut pas revenir en clair"
+            ),
         }
     }
 }

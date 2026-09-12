@@ -135,6 +135,13 @@ tokio = { workspace = true, features = ["test-util"] }
 name = "sendspin_point_d_acces_s2a"
 path = "tests/sendspin_point_d_acces_s2a.rs"
 
+# #3326 — le mode de transition (un `client/hello` en clair). `autotests =
+# false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
+# la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
+[[test]]
+name = "sendspin_mode_transition"
+path = "tests/sendspin_mode_transition.rs"
+
 [[test]]
 name = "server_contracts"
 path = "tests/server_contracts.rs"
