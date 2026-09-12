@@ -397,15 +397,50 @@ fn chaque_chemin_douverture_enregistre_le_peripherique_ouvert() {
 
     // 1. Les trois chemins EXCLUSIFS : chacun annonce sa lecture par une
     //    ligne `…_playing`, chacun doit enregistrer juste après.
-    for (marqueur, backend) in [
-        ("\"wasapi_exclusive_playing\"", "WASAPI"),
-        ("\"local_audio_asio_exclusive_playing\"", "ASIO"),
-        ("\"local_audio_exclusive_playing\"", "CoreAudio"),
+    //    R6 bis (#2219) : chaque bras vit dans son module `local/bras_<x>.rs` ;
+    //    on lit le module pour le marqueur, et `local.rs` pour l'APPEL — un
+    //    bras écrit mais pas branché enregistrerait dans le vide.
+    for (module, appel, marqueur, backend) in [
+        (
+            "bras_wasapi",
+            "bras_wasapi::jouer_via_wasapi(",
+            "\"wasapi_exclusive_playing\"",
+            "WASAPI",
+        ),
+        (
+            "bras_asio",
+            "bras_asio::jouer_via_asio(",
+            "\"local_audio_asio_exclusive_playing\"",
+            "ASIO",
+        ),
+        (
+            "bras_coreaudio",
+            "bras_coreaudio::jouer_via_coreaudio(",
+            "\"local_audio_exclusive_playing\"",
+            "CoreAudio",
+        ),
     ] {
-        let debut = src
+        assert!(
+            src.contains(appel),
+            "play_url n'appelle plus `{appel}` : le bras {backend} est un module que \
+             personne n'exécute (R6 bis, #2219)"
+        );
+        // Un appel par fichier, chemin en clair : `scripts/refonte/gardes.sh`
+        // inventorie les lecteurs par ce littéral.
+        use std::fs::read_to_string;
+        use std::path::Path;
+        let chemin = format!("src/outputs/local/{module}.rs");
+        let bras = match module {
+            "bras_wasapi" => read_to_string(Path::new("src/outputs/local/bras_wasapi.rs")),
+            "bras_asio" => read_to_string(Path::new("src/outputs/local/bras_asio.rs")),
+            "bras_coreaudio" => read_to_string(Path::new("src/outputs/local/bras_coreaudio.rs")),
+            autre => panic!("bras exclusif inconnu : {autre}"),
+        }
+        .unwrap_or_else(|e| panic!("{chemin} doit être lisible depuis la racine du crate : {e}"));
+        let debut = bras
             .find(marqueur)
-            .unwrap_or_else(|| panic!("marqueur {marqueur} introuvable dans local.rs"));
-        let fenetre = &src[debut..src.len().min(debut + 900)];
+            .unwrap_or_else(|| panic!("marqueur {marqueur} introuvable dans {chemin}"));
+        let fenetre = &bras[debut..bras.len().min(debut + 900)];
         assert!(
             fenetre.contains("note_opened_device(") && fenetre.contains(&format!("\"{backend}\"")),
             "le chemin {marqueur} joue sans dire QUEL périphérique il a ouvert \
