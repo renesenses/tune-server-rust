@@ -551,6 +551,12 @@ pub struct LocalOutput {
     /// Cette case rend ce verdict lisible hors du fil de rendu au lieu de le
     /// perdre après le journal `windows_exclusive_signal_contract`.
     signal_path_status: Arc<std::sync::Mutex<Option<OutputSignalPathStatus>>>,
+    /// REF-6b (#2219) : ce que l'étage courant fait RÉELLEMENT au signal —
+    /// posé à l'ouverture et à chaque frontière gapless par le fil de lecture
+    /// (`publier_les_transformations`), lu par le sondeur à chaque tour via
+    /// `OutputTarget::transformations_reelles`. `None` hors lecture : le
+    /// chemin du signal garde alors sa déduction depuis les réglages.
+    transformations_reelles: Arc<std::sync::Mutex<Option<TransformationsReelles>>>,
     /// Set by the playback thread when the audio device refuses to open, so
     /// the poller can stop the zone and tell the user on the very next tick
     /// instead of waiting out the stall heuristics. Cleared on every
@@ -761,6 +767,7 @@ impl LocalOutput {
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
+            transformations_reelles: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
             starvation: Arc::new(RingStarvation::new()),
         }
@@ -3575,6 +3582,20 @@ pub(super) trait Etage {
     fn transformations(&self) -> TransformationsReelles;
 }
 
+/// REF-6b (#2219) — pose dans le créneau de `LocalOutput` ce que l'étage fait
+/// RÉELLEMENT au signal, pour que le chemin du signal préfère la mesure à la
+/// déduction (#3987). Appelée à l'ouverture et à chaque frontière gapless :
+/// entre les deux, ni le format d'entrée, ni le format ouvert, ni le DSP posé
+/// ne changent sans repasser par là.
+fn publier_les_transformations(
+    creneau: &std::sync::Mutex<Option<TransformationsReelles>>,
+    etage: &impl Etage,
+) {
+    if let Ok(mut slot) = creneau.lock() {
+        *slot = Some(etage.transformations());
+    }
+}
+
 /// Ce qui distingue la boucle de la piste initiale de celle d'une piste
 /// enchaînée en gapless : **les noms d'événement journalisés**, rien d'autre.
 ///
@@ -4088,7 +4109,11 @@ impl OutputTarget for LocalOutput {
         if let Ok(mut slot) = self.signal_path_status.lock() {
             *slot = None;
         }
+        if let Ok(mut slot) = self.transformations_reelles.lock() {
+            *slot = None;
+        }
         let open_failure = self.open_failure.clone();
+        let transformations_reelles = self.transformations_reelles.clone();
         #[cfg(target_os = "windows")]
         let signal_path_status = self.signal_path_status.clone();
         let track_ended_naturally = self.track_ended_naturally.clone();
@@ -5092,6 +5117,8 @@ impl OutputTarget for LocalOutput {
                 sortie: FormatOuvert::new(output_sr, output_ch),
                 needs_resample,
             };
+            // REF-6b : dès que l'étage existe, l'écran peut savoir ce qu'il fait.
+            publier_les_transformations(&transformations_reelles, &etage);
             // R8 : le puits vient du backend (D1). CPAL partagé n'en fournit
             // qu'un, flottant — c'est le chemin DSP, le mot y est `f32` par
             // construction ; un puits natif ici n'est pas une erreur à
@@ -5474,6 +5501,8 @@ impl OutputTarget for LocalOutput {
                 etage.spec = nouvelle_spec;
                 etage.needs_resample = next_needs_resample;
                 etage.pcm_kind = LocalPcmKind::for_bit_depth(new_bd);
+                // REF-6b : la piste enchaînée a son propre format d'entrée.
+                publier_les_transformations(&transformations_reelles, &etage);
                 let sample_rate = etage.sample_rate();
                 let channels = etage.channels();
                 current_format.store(
@@ -5906,6 +5935,9 @@ impl OutputTarget for LocalOutput {
         if let Ok(mut slot) = self.signal_path_status.lock() {
             *slot = None;
         }
+        if let Ok(mut slot) = self.transformations_reelles.lock() {
+            *slot = None;
+        }
         *self.next_media.lock().unwrap() = None;
         *self.current_uri.lock().unwrap() = None;
         *self.track_title.lock().unwrap() = None;
@@ -6033,6 +6065,13 @@ impl OutputTarget for LocalOutput {
             .lock()
             .ok()
             .and_then(|status| status.clone())
+    }
+
+    /// REF-6b (#2219) : ce que l'étage courant a déclaré par
+    /// `publier_les_transformations` — à l'ouverture, puis à chaque
+    /// frontière gapless. `None` hors lecture.
+    fn transformations_reelles(&self) -> Option<TransformationsReelles> {
+        self.transformations_reelles.lock().ok().and_then(|t| *t)
     }
 
     fn ring_starvation(&self) -> Option<OutputRingStarvation> {
@@ -6500,3 +6539,7 @@ mod empreinte_du_puits_r1;
 /// décodeur de référence. Voir son en-tête pour ce qu'il ne couvre pas.
 #[cfg(test)]
 mod capture_bout_en_bout_2218;
+
+/// REF-6b (#2219) — l'étage dit ce qu'il fait, et `LocalOutput` le publie.
+#[cfg(test)]
+mod transformations_reelles_de_l_etage_ref6b;
