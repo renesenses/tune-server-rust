@@ -70,6 +70,18 @@ pub struct JournalBorne {
     /// Taille à partir de laquelle on tente la rotation. Égale au plafond en
     /// régime normal ; repoussée d'un plafond à chaque échec de renommage.
     seuil: u64,
+    /// Le descripteur tenu est-il celui de `<chemin>.1`, adopté après une
+    /// réouverture impossible ?
+    ///
+    /// Cet état n'était pas nommé, et c'est ce qui rendait le plafond inopérant
+    /// exactement quand il servait : une fois le renommage fait et la
+    /// réouverture échouée, `tourner` repassait par `rename`, qui ne pouvait
+    /// que rendre `ENOENT` — le chemin courant n'existe plus. Le seuil était
+    /// alors repoussé d'un plafond par tranche et `.1` grossissait **sans
+    /// borne**. Mesuré le 11/09/2026 : 654 Mio en 60 s avec un plafond de
+    /// 10 Mio, sous la même famine de descripteurs que celle qui emballait
+    /// `slimproto::accept` (#2156).
+    adopte: bool,
 }
 
 impl JournalBorne {
@@ -90,6 +102,7 @@ impl JournalBorne {
             ecrits,
             plafond,
             seuil: plafond,
+            adopte: false,
         })
     }
 
@@ -112,6 +125,36 @@ impl JournalBorne {
             // émis d'ici rentrerait dans la couche qui nous appelle.
             eprintln!("tune-server: rotation du journal impossible ({quoi}) : {e}");
         };
+
+        // Le descripteur tenu EST déjà la sauvegarde : une réouverture a
+        // échoué plus tôt. Renommer ne peut plus rien (le chemin courant
+        // n'existe pas) et repousser le seuil laisserait `.1` grossir sans
+        // borne. On le vide sur place — perdre la tranche précédente est le
+        // moindre mal face à un disque qui se remplit — puis on retente la
+        // réouverture, qui réussira dès que la cause (EMFILE) aura cédé.
+        if self.adopte {
+            match self.fichier.set_len(0) {
+                Ok(()) => {
+                    self.ecrits = 0;
+                    self.seuil = self.plafond;
+                }
+                Err(e) => {
+                    echec(e, "vidage de la sauvegarde adoptée");
+                    self.seuil = self.seuil.saturating_add(self.plafond);
+                }
+            }
+            if let Ok(neuf) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.chemin)
+            {
+                self.fichier = neuf;
+                self.adopte = false;
+                self.ecrits = 0;
+                self.seuil = self.plafond;
+            }
+            return;
+        }
 
         if let Err(e) = std::fs::rename(&self.chemin, &sauvegarde) {
             echec(e, "renommage");
@@ -137,6 +180,10 @@ impl JournalBorne {
                 // place. Le compteur repart de zéro : ce fichier vient d'être
                 // adopté vide du point de vue du plafond.
                 echec(e, "réouverture");
+                // Sans ce drapeau, le tour suivant retournait au `rename`
+                // ci-dessus, qui ne pouvait plus qu'échouer : c'est là que le
+                // plafond cessait de tenir (#2156).
+                self.adopte = true;
                 self.ecrits = 0;
                 self.seuil = self.plafond;
             }
@@ -165,15 +212,91 @@ mod tests {
 
     /// Un dossier temporaire à soi, sans dépendance : deux tests qui
     /// partageraient un chemin se voleraient leur `.1`.
-    fn dossier(nom: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tune-journal-{nom}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    ///
+    /// Le garde est rendu tel quel — il supprime le dossier à la sortie du
+    /// test, panique comprise. C'est cette famille qui pesait le plus lourd
+    /// dans #3030 : 1 657 des 3 204 résidus de `/tmp` étaient des
+    /// `tune-journal-*`.
+    fn dossier(nom: &str) -> tune_core::test_scratch::ScratchDir {
+        tune_core::test_scratch::scratch_dir(&format!("tune-journal-{nom}"))
     }
 
     fn taille(p: &std::path::Path) -> u64 {
         std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Le plafond tient AUSSI quand la réouverture est impossible.
+    ///
+    /// C'est l'état dans lequel une famine de descripteurs (EMFILE) met ce
+    /// module : le renommage passe, `OpenOptions::open` non. Le descripteur
+    /// tenu pointe alors sur `.1`, et avant ce correctif plus rien ne le
+    /// bornait — mesuré le 11/09/2026 : 654 Mio en 60 s pour un plafond de
+    /// 10 Mio (#2156).
+    ///
+    /// Le chemin courant est dirigé vers un sous-dossier inexistant : toute
+    /// réouverture échoue, comme sous EMFILE, sans avoir à épuiser les
+    /// descripteurs du binaire de test.
+    #[test]
+    fn le_plafond_tient_meme_quand_la_reouverture_est_impossible() {
+        let d = dossier("adopte");
+        let chemin = d.join("tune-server.log");
+        let sauvegarde = d.join("tune-server.log.1");
+        let mut j = JournalBorne::ouvrir(chemin.clone(), 100).unwrap();
+
+        // L'état d'après une réouverture échouée, reconstitué : le fichier a
+        // été renommé, le descripteur tenu est celui de `.1`, et le chemin
+        // courant ne pourra plus jamais être ouvert.
+        std::fs::rename(&chemin, &sauvegarde).unwrap();
+        j.adopte = true;
+        j.chemin = d.join("dossier-absent").join("tune-server.log");
+
+        for _ in 0..500 {
+            j.write_all(&[b'x'; 10]).unwrap();
+        }
+        j.flush().unwrap();
+
+        assert!(
+            taille(&sauvegarde) <= 200,
+            "5 000 octets écrits avec un plafond de 100 : la sauvegarde adoptée \
+             fait {} octets. Le journal grossit sans borne dès que la réouverture \
+             échoue — c'est le scénario que l'entête de ce module dit éviter (#2156).",
+            taille(&sauvegarde)
+        );
+    }
+
+    /// Garde de CÂBLAGE : la branche « réouverture impossible » lève bien le
+    /// drapeau qui fait entrer dans la branche adoptée.
+    ///
+    /// Le test ci-dessus pose `adopte` à la main : il mesure ce que fait la
+    /// branche adoptée, pas le fait qu'on y entre. Mesuré le 11/09/2026 —
+    /// retirer `self.adopte = true;` le laissait VERT pendant que le défaut
+    /// revenait entier. Cette garde-là tombe.
+    ///
+    /// Elle relit le texte du module, et c'est assumé : entrer réellement dans
+    /// cette branche demande un `open()` qui échoue alors que le `rename()`
+    /// juste avant a réussi — c'est-à-dire `EMFILE`, donc un `setrlimit` qui
+    /// contaminerait tout le binaire de test.
+    #[test]
+    fn la_reouverture_impossible_marque_le_journal_comme_adopte() {
+        let source = include_str!("journal.rs");
+        let Some(debut) = source.find("echec(e, \"réouverture\");") else {
+            panic!(
+                "la branche « réouverture impossible » a disparu de `tourner` : \
+                 vérifier que le plafond tient toujours quand le descripteur \
+                 reste sur `.1` (#2156)"
+            );
+        };
+        assert!(
+            source[debut..]
+                .chars()
+                .take(600)
+                .collect::<String>()
+                .contains("self.adopte = true;"),
+            "la réouverture échouée ne marque plus le journal comme adopté : \
+             le tour suivant repassera par `rename`, qui ne peut que rendre \
+             ENOENT, et `.1` grossira sans borne — 654 Mio mesurés en 60 s \
+             pour un plafond de 10 Mio (#2156)"
+        );
     }
 
     /// Le défaut de #539 tel quel : pendant que le processus vit, rien ne

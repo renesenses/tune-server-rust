@@ -1450,8 +1450,41 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                             // La tâche bloquante a paniqué : sans ce bras, la
                             // panique restait dans le `JoinError` et personne
                             // ne l'apprenait.
+                            //
+                            // Elle CONDAMNE la passe, exactement comme le
+                            // dépassement de délai juste en dessous, et pour une
+                            // raison plus dure encore : `AudioEmbedder::load` ne
+                            // verrouille rien lui-même, il bâtit une session ORT.
+                            // Une panique survenue là empoisonne le verrou
+                            // d'initialisation d'ORT — verrou interne à la
+                            // bibliothèque, que ce dépôt ne peut ni voir ni
+                            // désarmer — et un `std::sync::Mutex` empoisonné le
+                            // reste pour TOUTE la vie du processus. Chaque
+                            // tentative suivante repanique donc avant d'avoir rien
+                            // tenté.
+                            //
+                            // Sans ce verrouillage, la passe se replanifiait
+                            // toutes les `IDLE_SLEEP_SECS` et rejouait le même
+                            // échec indéfiniment. Mesuré chez Yves Corbat le
+                            // 01/09/2026 : 28 tentatives, 28 paniques
+                            // « Mutex poisoned », toutes en moins d'une
+                            // milliseconde, sur huit heures de journal — aucune
+                            // empreinte produite, et un avertissement identique
+                            // tous les quarts d'heure pour seule trace. La
+                            // première panique, celle qui a empoisonné le verrou,
+                            // précédait même la fenêtre du journal.
+                            //
+                            // Un quart d'heure d'attente ne désempoisonne rien :
+                            // mieux vaut une ligne qui dit quoi faire que
+                            // quatre-vingt-seize par jour qui ne disent rien.
                             Ok(Err(e)) => {
-                                warn!(error = %e, "audio_embedder_load_panicked")
+                                load_abandonne = true;
+                                warn!(
+                                    error = %e,
+                                    model = %p.display(),
+                                    intra_threads = threads,
+                                    "audio_embedder_load_panicked — l'analyse acoustique est abandonnée jusqu'au prochain redémarrage du serveur ; une panique dans l'initialisation ONNX empoisonne son verrou pour toute la vie du processus, et réessayer ne peut plus rien y changer"
+                                )
                             }
                             Err(_) => {
                                 load_abandonne = true;
@@ -2129,6 +2162,33 @@ mod tests {
             prod.contains("audio_embedder_load_panicked"),
             "une panique de la tâche bloquante reste sinon enfermée dans le \
              JoinError, et personne ne l'apprend."
+        );
+        // …et la dire ne suffit pas : elle doit CONDAMNER la passe.
+        //
+        // `AudioEmbedder::load` bâtit une session ORT. Une panique y empoisonne
+        // le verrou d'initialisation d'ORT, interne à la bibliothèque, et un
+        // `std::sync::Mutex` empoisonné le reste pour toute la vie du processus :
+        // toute tentative ultérieure repanique instantanément. Tant que ce bras
+        // ne verrouillait pas `load_abandonne`, la passe rejouait le même échec
+        // toutes les `IDLE_SLEEP_SECS`, sans fin — 28 tentatives, 28 paniques
+        // « Mutex poisoned » en moins d'une milliseconde chacune, sur les huit
+        // heures de journal d'Yves Corbat du 01/09/2026.
+        //
+        // Le garde tient sur la TRANCHE du bras, pas sur le fichier : trouver
+        // `load_abandonne = true` n'importe où serait satisfait par le bras du
+        // dépassement de délai, qui l'a toujours eu.
+        let bras_panique = prod.find("Ok(Err(e)) => {").expect(
+            "le bras de panique a changé de forme : le garde ne sait plus quelle tranche lire",
+        );
+        let fin_bras = prod[bras_panique..]
+            .find("\"audio_embedder_load_panicked")
+            .expect("le bras de panique ne journalise plus sous ce nom");
+        assert!(
+            prod[bras_panique..bras_panique + fin_bras].contains("load_abandonne = true"),
+            "le bras de panique ne condamne plus la passe : une panique dans \
+             l'initialisation ONNX empoisonne un verrou que rien ne désarme, et \
+             réessayer tous les quarts d'heure ne produit qu'un avertissement \
+             identique par tour — quatre-vingt-seize par jour, aucune empreinte."
         );
     }
 

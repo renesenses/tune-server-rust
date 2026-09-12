@@ -4,7 +4,9 @@ use std::time::Instant;
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
+use crate::cloud::rate_limit::{self, CloudScope};
 use crate::db::backend::{DbBackend, ToSqlValue};
+use crate::db::settings_repo::SettingsRepo;
 
 const CLOUD_LIBRARY_API: &str = "https://mozaiklabs.fr/api/v1/cloud-library";
 const SYNC_BATCH_SIZE: i64 = 200;
@@ -382,32 +384,51 @@ pub async fn push_changes(
 
         // 6. POST batch to cloud API
         if !changes.is_empty() {
+            // Un 429 du cloud est persisté EN BASE (CLD-1) : la synchro respecte
+            // le `Retry-After` reçu, redémarrage compris, au lieu de le
+            // redécouvrir à chaque cycle.
+            let settings = SettingsRepo::with_backend(backend.clone());
             let payload = serde_json::json!({
                 "server_id": server_id,
                 "changes": changes,
             });
 
-            match http_client
-                .post(format!("{CLOUD_LIBRARY_API}/{server_id}/sync"))
-                .bearer_auth(access_token)
-                .json(&payload)
-                .timeout(std::time::Duration::from_secs(30))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
+            // CLD-2 : un seul chemin d'appel borné — la portée retenue ne part
+            // pas, un 429 mémorise son échéance avant d'être lu ici.
+            let appel = rate_limit::appeler(
+                &settings,
+                CloudScope::LibrarySync,
+                http_client
+                    .post(format!("{CLOUD_LIBRARY_API}/{server_id}/sync"))
+                    .bearer_auth(access_token)
+                    .json(&payload)
+                    .timeout(std::time::Duration::from_secs(30)),
+            )
+            .await;
+            match appel {
+                rate_limit::AppelCloud::Retenu(backoff) => {
+                    debug!(
+                        scope = backoff.scope,
+                        until_epoch = backoff.until_epoch,
+                        retry_after_seconds = backoff.retry_after_seconds,
+                        "cloud_library_sync_deferred_rate_limit"
+                    );
+                    break;
+                }
+                rate_limit::AppelCloud::Reponse(resp) if resp.status().is_success() => {
                     debug!(
                         batch_size = changes.len(),
                         "cloud_library_sync_batch_pushed"
                     );
                 }
-                Ok(resp) => {
+                rate_limit::AppelCloud::Reponse(resp) => {
                     let status = resp.status();
                     // 429 (throttled) and 5xx are expected transient conditions
                     // from the community cloud — not a failure. Stop this batch
                     // and retry next cycle quietly instead of spamming a scary
                     // "batch_failed" warning (Jean Valjean saw 429s in his log).
-                    // Mirrors the bio_sync throttle handling.
+                    // Mirrors the bio_sync throttle handling. Le 429 est déjà
+                    // mémorisé par `rate_limit::appeler`.
                     if status.as_u16() == 429 || status.is_server_error() {
                         debug!(status = %status, "cloud_library_sync_throttled — retry next cycle");
                         break;
@@ -419,7 +440,7 @@ pub async fn push_changes(
                     // Don't mark as synced on failure — will retry next cycle
                     break;
                 }
-                Err(e) => {
+                rate_limit::AppelCloud::Erreur(e) => {
                     let msg = format!("cloud sync request: {e}");
                     warn!(error = %msg, "cloud_library_sync_request_failed");
                     report.errors.push(msg);

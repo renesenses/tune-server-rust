@@ -48,12 +48,25 @@ pub fn router() -> Router<AppState> {
         .route("/tickets/{id}/read", post(mark_read))
 }
 
+/// Corps JSON d'un ticket sans pièce jointe manuelle.
+///
+/// ⚠️ `zone`, `system` et `logs` doivent y figurer : le client les envoie sur
+/// CE chemin comme sur le multipart (case « joindre les journaux », cochée par
+/// défaut). Tant qu'ils manquaient ici, serde les jetait en silence, mozaiklabs
+/// ne recevait aucun `logs`, ne créait donc aucun `diagnostic.md` — et le ticket
+/// arrivait quand même en 201, le client annonçant « envoyé ».
 #[derive(Deserialize)]
 struct CreateBody {
     subject: String,
     body: String,
     #[serde(default)]
     category: Option<String>,
+    #[serde(default)]
+    zone: Option<String>,
+    #[serde(default)]
+    system: Option<Value>,
+    #[serde(default)]
+    logs: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -66,8 +79,9 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::list_tickets(&state.http_client, &auth).await,
+        support::list_tickets(&state.http_client, &auth, base.as_deref()).await,
         &headers,
     )
 }
@@ -111,13 +125,20 @@ async fn create_json(
         Ok(Json(p)) => p,
         Err(rej) => return rej.into_response(),
     };
+    let base = base_url(&state);
     finish(
         support::create_ticket(
             &state.http_client,
             &auth,
-            &payload.subject,
-            &payload.body,
-            payload.category.as_deref(),
+            &support::NewTicket {
+                subject: payload.subject,
+                body: payload.body,
+                category: payload.category,
+                zone: payload.zone,
+                system: payload.system,
+                logs: payload.logs,
+            },
+            base.as_deref(),
         )
         .await,
         &headers,
@@ -215,8 +236,10 @@ async fn create_multipart(
         );
     }
 
+    let base = base_url(&state);
     finish(
-        support::create_ticket_multipart(&state.http_client, &auth, fields, files).await,
+        support::create_ticket_multipart(&state.http_client, &auth, fields, files, base.as_deref())
+            .await,
         &headers,
     )
 }
@@ -316,6 +339,47 @@ mod tests {
         assert!(MAX_TOTAL_BYTES > 50 * 1024 * 1024);
     }
 
+    /// Le corps que le client web envoie réellement quand il n'y a AUCUNE pièce
+    /// jointe manuelle (`SupportView.submitTicket`, chemin JSON) : il porte
+    /// `logs` et `system`. `CreateBody` doit les retenir — serde jette en
+    /// silence tout champ absent de la structure, et c'est ainsi que le
+    /// diagnostic disparaissait sans une seule ligne de journal.
+    #[test]
+    fn le_corps_json_du_client_conserve_le_diagnostic() {
+        let brut = r##"{
+            "subject": "Coupure DLNA",
+            "body": "Le salon s'arrête au bout de dix secondes.",
+            "category": "bug",
+            "zone": "Salon",
+            "logs": "# Tune Bug Report\n\nERROR dlna_stall",
+            "system": { "os": "linux", "zones": 3 }
+        }"##;
+
+        let parsed: CreateBody = serde_json::from_str(brut).expect("corps client valide");
+
+        assert_eq!(
+            parsed.logs.as_deref(),
+            Some("# Tune Bug Report\n\nERROR dlna_stall"),
+            "le diagnostic doit survivre à la désérialisation"
+        );
+        assert_eq!(parsed.zone.as_deref(), Some("Salon"));
+        assert_eq!(
+            parsed.system.as_ref().map(|s| s["os"].clone()),
+            Some(json!("linux"))
+        );
+    }
+
+    /// Un client plus ancien n'envoie ni `logs` ni `system` : le ticket doit
+    /// s'ouvrir quand même (rétro-compatibilité, #1073).
+    #[test]
+    fn un_corps_sans_diagnostic_reste_accepte() {
+        let parsed: CreateBody = serde_json::from_str(r#"{"subject":"Question","body":"DSD ?"}"#)
+            .expect("corps minimal");
+        assert!(parsed.logs.is_none());
+        assert!(parsed.system.is_none());
+        assert!(parsed.category.is_none());
+    }
+
     // -----------------------------------------------------------------------
     // Le 429 du relais support : un message exploitable, dans la bonne langue,
     // et jamais un délai inventé (#2178).
@@ -355,10 +419,12 @@ mod tests {
         (code, serde_json::from_slice(&octets).unwrap(), retry)
     }
 
+    /// L'arrondi lui-même vit maintenant dans `routes::cloud_error`, avec sa
+    /// propre contre-épreuve ; on garde ici la règle telle qu'elle est VUE par
+    /// le support : le message parle de minutes, jamais de zéro.
     #[test]
     fn minutes_a_attendre_arrondit_au_superieur_sans_jamais_zero() {
-        // Jamais zéro : « réessaie dans 0 min » renverrait l'utilisateur trop
-        // tôt, donc sur un nouveau 429.
+        use crate::routes::cloud_error::minutes_a_attendre;
         assert_eq!(minutes_a_attendre(1), 1);
         assert_eq!(minutes_a_attendre(59), 1);
         assert_eq!(minutes_a_attendre(60), 1);
@@ -471,8 +537,9 @@ async fn detail(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::get_ticket(&state.http_client, &auth, id).await,
+        support::get_ticket(&state.http_client, &auth, id, base.as_deref()).await,
         &headers,
     )
 }
@@ -487,8 +554,16 @@ async fn reply(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::reply(&state.http_client, &auth, id, &payload.body).await,
+        support::reply(
+            &state.http_client,
+            &auth,
+            id,
+            &payload.body,
+            base.as_deref(),
+        )
+        .await,
         &headers,
     )
 }
@@ -504,10 +579,26 @@ async fn mark_read(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::mark_read(&state.http_client, &auth, id).await,
+        support::mark_read(&state.http_client, &auth, id, base.as_deref()).await,
         &headers,
     )
+}
+
+/// Racine du nuage à interroger, `None` pour la production.
+///
+/// Même réglage que le SSO, le marché de greffons, les couvertures
+/// communautaires et la validation de licence : `mozaik_base_url`. Sans lui, le
+/// chemin qui porte le diagnostic des tickets ne pouvait être éprouvé de bout
+/// en bout qu'en appelant mozaiklabs.fr pour de vrai — c'est-à-dire jamais
+/// (#2916).
+fn base_url(state: &AppState) -> Option<String> {
+    SettingsRepo::with_backend(state.backend.clone())
+        .get("mozaik_base_url")
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
@@ -547,16 +638,6 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
         .into_response())
 }
 
-/// Minutes à attendre, déduites des secondes annoncées par mozaiklabs.
-///
-/// L'arrondi se fait vers le HAUT, et jamais à zéro : renvoyer l'utilisateur
-/// « dans 0 min » le ferait revenir trop tôt et reprendre un 429. Le délai
-/// exact en secondes n'est pas perdu pour autant — il reste dans le corps
-/// (`retry_after`) et dans l'en-tête `Retry-After`, pour qui programme.
-fn minutes_a_attendre(secondes: u64) -> u64 {
-    secondes.div_ceil(60).max(1)
-}
-
 /// Remplace le texte d'un 429 par un message localisé et exploitable.
 ///
 /// Le limiteur de Laravel ne sait dire qu'une chose, en anglais et sans
@@ -576,12 +657,15 @@ fn minutes_a_attendre(secondes: u64) -> u64 {
 /// `tune_core::cloud::support`) n'est pas touché : les clients qui programment
 /// contre `rate_limited` gardent leur contrat.
 fn localiser_limite(value: &mut Value, headers: &HeaderMap, retry_after: Option<u64>) {
-    let lang = crate::i18n::lang_from_header(headers);
-    let message = match retry_after {
-        Some(secondes) => crate::i18n::t(&lang, "support.tropDeRequetesDelai")
-            .replace("{minutes}", &minutes_a_attendre(secondes).to_string()),
-        None => crate::i18n::t(&lang, "support.tropDeRequetes"),
-    };
+    // Même fabrique que le reste du nuage (`routes::cloud_error`), avec les
+    // clés propres au support : une seule règle d'arrondi, un seul endroit où
+    // la langue est résolue.
+    let message = crate::routes::cloud_error::message_limite(
+        headers,
+        retry_after,
+        "support.tropDeRequetes",
+        "support.tropDeRequetesDelai",
+    );
 
     // `build_result` garantit un objet sur un 429, mais on ne parie pas dessus.
     let Some(obj) = value.as_object_mut() else {

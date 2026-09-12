@@ -4,10 +4,114 @@ use serde_json::{Value, json};
 
 use crate::error::AppError;
 use crate::state::AppState;
+use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::track_repo::TrackRepo;
 
 use super::Pagination;
+
+/// La ventilation par source des compteurs de bibliothèque (#2147).
+///
+/// ## Pourquoi cette réponse, et pas un filtre
+///
+/// Le testeur voyait deux nombres qui ne se rejoignaient pas : le compte de
+/// pistes de l'écran Réglages → Bibliothèque et le `total_files` du rapport de
+/// scan, 142 de moins. Ce ne sont pas deux mesures de la même chose. Le
+/// rapport de scan compte des FICHIERS TROUVÉS SUR LE DISQUE ; le compteur,
+/// lui, compte les LIGNES de `tracks`, où cohabitent le local et tout ce que
+/// Qobuz, Tidal, la radio, les podcasts et Bandcamp ont posé. Une piste
+/// Qobuz n'a aucun fichier à trouver : elle ne peut pas figurer dans un
+/// rapport de scan, et pourtant elle est bien dans la bibliothèque.
+///
+/// Deux voies s'offraient :
+///
+/// **(a)** faire compter au tableau de bord la même population que le scan —
+/// `WHERE source = 'local'`. Les deux écrans deviendraient comparables d'un
+/// coup d'œil, mais le compte de pistes CHUTERAIT chez tout utilisateur de
+/// streaming, en retirant de l'affichage des pistes qu'il possède vraiment et
+/// qu'il peut jouer. On répondrait à « pourquoi deux nombres ? » en faisant
+/// disparaître l'un des deux, et une bibliothèque de 12 000 pistes annoncerait
+/// soudain 11 858 sans que rien n'ait été perdu. C'est un mensonge par
+/// soustraction, et il coûterait un signalement de perte de données.
+///
+/// **(b) — retenue.** Garder le total, et NOMMER ce qu'il contient. Le total
+/// reste juste ; s'y ajoute la ventilation qui explique l'écart. Le testeur
+/// n'a plus deux nombres inexplicables mais une décomposition : « 12 000
+/// pistes, dont 11 858 locales, 98 Qobuz, 40 Tidal, 4 radio » — et 11 858 est
+/// exactement ce que le rapport de scan lui montre. Rien n'est retiré, aucun
+/// champ existant ne change de valeur, et la question posée reçoit sa réponse.
+///
+/// Ce choix s'appuie sur un constat mesuré : **aucune route du serveur
+/// n'exposait de décompte par source**. `GROUP BY source` n'avait qu'une seule
+/// occurrence dans tout le dépôt (`history_repo.rs`, l'historique d'écoute,
+/// sans rapport). Ce n'était pas un filtre qui manquait, c'était le chiffre.
+///
+/// ## Ce que cette structure n'est pas
+///
+/// Ce n'est pas un canal d'état de plus : c'est la réponse de la route qui
+/// porte le compte, à l'endroit exact où le client lit déjà `tracks` et
+/// `albums`. L'ajout est PUREMENT ADDITIF — `tracks`, `albums`, `artists`
+/// gardent la valeur qu'ils avaient hier.
+pub(crate) struct VentilationParSource {
+    pistes: Vec<(String, i64)>,
+    albums: Vec<(String, i64)>,
+}
+
+impl VentilationParSource {
+    /// Lit les deux ventilations. Une erreur SQL ne fait pas tomber la route :
+    /// elle rend une ventilation VIDE, et les champs existants continuent de
+    /// répondre. Un tableau de bord qui perd sa décomposition reste lisible ;
+    /// un tableau de bord en 500 ne l'est pas.
+    pub(crate) fn lire(state: &AppState) -> Self {
+        Self {
+            pistes: TrackRepo::with_backend(state.backend.clone())
+                .count_by_source()
+                .unwrap_or_default(),
+            albums: AlbumRepo::with_backend(state.backend.clone())
+                .count_by_source()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn objet(seaux: &[(String, i64)]) -> Value {
+        Value::Object(
+            seaux
+                .iter()
+                .map(|(source, compte)| (source.clone(), json!(compte)))
+                .collect(),
+        )
+    }
+
+    fn local(seaux: &[(String, i64)]) -> i64 {
+        seaux
+            .iter()
+            .find(|(source, _)| source == "local")
+            .map(|(_, compte)| *compte)
+            .unwrap_or(0)
+    }
+
+    /// Les quatre champs à épingler dans la réponse d'une route de comptage.
+    /// Un seul point de vérité : `/library/stats` et `/system/stats` affichent
+    /// les mêmes compteurs sur deux écrans, ils doivent les ventiler pareil.
+    pub(crate) fn champs(&self) -> Vec<(String, Value)> {
+        vec![
+            ("tracks_by_source".to_string(), Self::objet(&self.pistes)),
+            ("tracks_local".to_string(), json!(Self::local(&self.pistes))),
+            ("albums_by_source".to_string(), Self::objet(&self.albums)),
+            ("albums_local".to_string(), json!(Self::local(&self.albums))),
+        ]
+    }
+}
+
+/// Ajoute les champs de ventilation à un objet JSON déjà construit.
+/// Sans effet si la valeur n'est pas un objet — la route répond quand même.
+pub(crate) fn ajouter_ventilation(cible: &mut Value, ventilation: &VentilationParSource) {
+    if let Some(objet) = cible.as_object_mut() {
+        for (nom, valeur) in ventilation.champs() {
+            objet.insert(nom, valeur);
+        }
+    }
+}
 
 pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let b = &state.backend;
@@ -45,7 +149,12 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
         .and_then(|r| r.first().and_then(|v| v.as_i64()))
         .unwrap_or(0);
 
-    Ok(Json(json!({
+    // `tracks` et `albums` restent le compte ENTIER de la table, toutes
+    // sources confondues — c'est la taille réelle de la bibliothèque, et la
+    // changer retirerait de l'écran des pistes que l'utilisateur possède
+    // (#2147). Ce qui manquait n'était pas un filtre mais la décomposition qui
+    // rend l'écart au rapport de scan lisible : elle s'ajoute ici.
+    let mut corps = json!({
         "artists": artists,
         "albums": albums,
         "tracks": tracks,
@@ -53,7 +162,9 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
         "zones": zones,
         "total_duration_ms": total_duration_ms,
         "total_size_bytes": total_size_bytes,
-    })))
+    });
+    ajouter_ventilation(&mut corps, &VentilationParSource::lire(&state));
+    Ok(Json(corps))
 }
 
 pub(super) async fn completeness_stats(

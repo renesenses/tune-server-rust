@@ -41,6 +41,32 @@ sha2 = { workspace = true }
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 getrandom = "0.2"
+
+# --- Sendspin (#3326) : cryptographie et encodage, sur TOUTES les plateformes.
+#
+# Ces quatre caisses ne doivent PAS retourner sous
+# `[target.'cfg(unix)'.dependencies]`. Ce bloc-là existe pour l'appairage
+# AirPlay 2, qui est effectivement unix ; Sendspin, lui, tourne partout où Tune
+# tourne — Windows compris. La CI « Windows + ASIO » est la garde : elle a
+# rougi sur `unresolved import snow / base64 / x25519_dalek / rand_core`
+# quand ces lignes étaient du mauvais côté du manifeste.
+#
+# `snow` : Noise KKpsk2, en pur Rust. Le résolveur par défaut s'appuie sur
+# `curve25519-dalek`, `chacha20poly1305`, `aes-gcm` et `sha2` — les mêmes
+# familles que le reste du manifeste ; le résolveur accéléré `ring` n'est pas
+# activé. Mesuré : les DEUX suites imposées au serveur
+# (`25519_ChaChaPoly_SHA256` et `25519_AESGCM_SHA256`) aboutissent. On
+# n'écrit pas Noise à la main : c'est de la cryptographie.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "default-resolver-crypto",
+    "std",
+] }
+# L'identifiant d'un pair Sendspin EST sa clé publique X25519, en base64url
+# sans remplissage.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
+rand_core = { version = "0.6", features = ["getrandom"] }
 blowfish = { workspace = true }
 chrono = { workspace = true }
 cbc = { workspace = true }
@@ -93,16 +119,6 @@ tokenizers = { version = "0.20", default-features = false, features = ["onig"], 
 # macOS + Linux : statfs pour détecter les montages réseau (scanner/watcher.rs).
 libc = "0.2"
 
-# AirPlay 2 HomeKit-style pairing (pair-setup SRP-6a + pair-verify Curve25519).
-# All pinned to the RustCrypto digest 0.10 / sha2 0.10 generation used across
-# the workspace so no duplicate hashing stack is pulled in.
-srp = "0.6"
-hkdf = "0.12"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-chacha20poly1305 = "0.10"
-rand_core = { version = "0.6", features = ["getrandom"] }
-
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "objc2-core-audio-types", "AudioHardware", "AudioHardwareDeprecated"], optional = true }
@@ -114,6 +130,20 @@ tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 # Lean criterion (no plotters/rayon) — just the bench harness.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Test-only : `#[tokio::test(start_paused = true)]`. Le chien de garde du budget
+# de transcodage (#3140) compte en MINUTES — un DSD256 de 20 min à × 2,2 met
+# 545 s à se décoder. Sans horloge virtuelle, l'éprouver coûterait ce temps-là
+# pour de vrai, et un test de budget qui dort est un test intermittent.
+# `test-util` n'entre que dans les cibles de test : le binaire publié ne le
+# compile pas. Même déclaration que `tune-server` (#2073).
+tokio = { workspace = true, features = ["test-util"] }
+
+# `autotests = false` en tête de ce manifeste : sans cette cible, le fichier
+# ne serait JAMAIS compilé et la porte rendrait un vert contre rien (#3326,
+# S2-a).
+[[test]]
+name = "sendspin_poignee_s2a"
+path = "tests/sendspin_poignee_s2a.rs"
 
 [[test]]
 name = "integration_contracts"
@@ -126,6 +156,12 @@ path = "tests/integration_contracts.rs"
 name = "terminologie_eq"
 path = "tests/terminologie_eq.rs"
 
+# Meme raison : `autotests = false`. Cible minuscule, elle ne tire que
+# tune_core et trois fixtures de quelques centaines d octets (#1405).
+[[test]]
+name = "autoeq_profils_reels"
+path = "tests/autoeq_profils_reels.rs"
+
 # Binaire de test a lui seul, DELIBEREMENT (#2665). `tracing` met en cache pour
 # tout le processus la decision « ce point d appel interesse-t-il quelqu un ? »
 # et le niveau maximal utile ; un abonne pose le temps d un await, dans un
@@ -136,6 +172,69 @@ path = "tests/terminologie_eq.rs"
 [[test]]
 name = "journal_descriptif_illisible"
 path = "tests/journal_descriptif_illisible.rs"
+
+# Meme famille, meme raison (#2890) : abonne `tracing` GLOBAL, donc un binaire
+# a lui seul. Il tient les deux bords du journal d insertion par lot — le lot
+# nominal est muet au niveau livre, l echec d insertion reste dit.
+[[test]]
+name = "journal_insertion_par_lot"
+path = "tests/journal_insertion_par_lot.rs"
+
+# #3807 — VU-metres et barregraphe morts sur une zone Diretta. `autotests =
+# false` en tete de ce manifeste : sans cette cible, le fichier ne serait
+# JAMAIS compile et la porte rendrait un vert contre rien. Declaree ici, au
+# MILIEU du manifeste, et non en queue ou tous les lots ajoutent la leur.
+[[test]]
+name = "niveaux_sortie_pull_3807"
+path = "tests/niveaux_sortie_pull_3807.rs"
+
+# #3907 — ce que l analyse spectrale du serveur resout vraiment. Meme raison :
+# `autotests = false`. Cible minuscule, elle ne tire que tune_core.
+[[test]]
+name = "spectre_resolution_serveur_3907"
+path = "tests/spectre_resolution_serveur_3907.rs"
+
+# Meme famille, meme raison (#2566) : abonne `tracing` GLOBAL, donc un binaire
+# a lui seul. Il compte les lignes qu une panne de sondage coute au journal —
+# 79 avant, 9 apres — sans toucher au reseau ni au recul exponentiel.
+[[test]]
+name = "journal_sondage_repos"
+path = "tests/journal_sondage_repos.rs"
+
+# Meme famille, meme raison (#2566), site frere : la zone EN LECTURE. Abonne
+# `tracing` GLOBAL, donc un binaire a lui seul et un seul essai dedans.
+[[test]]
+name = "journal_sondage_lecture"
+path = "tests/journal_sondage_lecture.rs"
+
+# #2505 : `.ape` decode incremental. `autotests = false` ci-dessus — un fichier
+# pose dans tests/ ne se compile pas tout seul.
+[[test]]
+name = "ape_incremental_i2505"
+path = "tests/ape_incremental_i2505.rs"
+
+# Binaire de test a lui seul, DELIBEREMENT (#2505) : il installe un
+# `#[global_allocator]` qui mesure le pic d'octets vivants. L'allocateur est
+# PROCESSUS-global — un test voisin qui allouerait en parallele fausserait la
+# mesure. `tests/ape_fixture_i2505.rs` n'est PAS une cible : c'est un module
+# partage, inclus par `#[path]` dans les deux binaires ci-dessus.
+[[test]]
+name = "ape_pic_memoire_i2505"
+path = "tests/ape_pic_memoire_i2505.rs"
+
+# `autotests = false` : sans cette cible, le fichier ne serait jamais compile.
+# Il tient le resume de fin de scan (#2939) — un scan qui perd des pistes ne
+# peut plus annoncer zero echec, et un scan qui reussit annonce toujours zero.
+[[test]]
+name = "scan_refus_insertion_comptes_2939"
+path = "tests/scan_refus_insertion_comptes_2939.rs"
+
+# `autotests = false` : sans cette cible, le fichier ne serait jamais compile.
+# #2569 / #2775 — l'instantane de file d'attente ne doit pas etre ecrase par une
+# base momentanement illisible, et DOIT l'etre quand l'utilisateur vide sa file.
+[[test]]
+name = "instantane_de_file_i2569_f4c821"
+path = "tests/instantane_de_file_i2569_f4c821.rs"
 
 [[bench]]
 name = "dsd_to_pcm"
@@ -157,6 +256,76 @@ postgres = ["dep:sqlx"]
 # untouched. The onnxruntime shared lib + model are provided at runtime.
 audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
 
+# #3248 : sur PostgreSQL, un INSERT conditionnel qui n'ecrit rien annulait la
+# transaction entiere, et la branche `returning` rendait `Ok(1)` en dur.
+# `autotests = false` ci-dessus — sans cette cible le fichier ne serait JAMAIS
+# compile, et la porte rendrait un vert contre rien. La garde de site et la
+# contre-epreuve SQLite s executent SANS base ; les trois epreuves PostgreSQL
+# demandent `TUNE_TEST_PG_URL` (absente = saut annonce, posee mais injoignable
+# = echec).
+[[test]]
+name = "pg_insert_conditionnel_f7c250"
+path = "tests/pg_insert_conditionnel_f7c250.rs"
+
+# #3256 : sur PostgreSQL, ` RETURNING id` etait ajoute a TOUT INSERT nu, y
+# compris vers les tables qui n'ont pas de colonne `id` (`task_runs`,
+# `streaming_auth`), et PostgreSQL refusait la requete entiere. `autotests =
+# false` ci-dessus — sans cette cible le fichier ne serait JAMAIS compile, et
+# la porte rendrait un vert contre rien. La garde de site et la contre-epreuve
+# SQLite s executent SANS base ; les quatre epreuves PostgreSQL demandent
+# `TUNE_TEST_PG_URL` (absente = saut annonce, posee mais injoignable = echec).
+[[test]]
+name = "pg_returning_id_hors_table_a_id_3256"
+path = "tests/pg_returning_id_hors_table_a_id_3256.rs"
+
+# #3205 : compteur de famine de l'anneau audio. `autotests = false` ci-dessus —
+# sans cette cible le fichier ne serait JAMAIS compile, et la porte rendrait un
+# vert contre rien.
+[[test]]
+name = "famine_anneau_i3205"
+path = "tests/famine_anneau_i3205.rs"
+
+# #3180 : une pochette de plus d un mebioctet n emporte plus le titre et l
+# artiste d un DSF. `autotests = false` ci-dessus — sans cette cible le fichier
+# ne serait JAMAIS compile, et la porte rendrait un vert contre rien.
+[[test]]
+name = "dsf_tag_volumineux_i3180_e7d445"
+path = "tests/dsf_tag_volumineux_i3180_e7d445.rs"
+
+# Meme famille que #2665 / #2890 : abonne `tracing` GLOBAL, donc un binaire a
+# lui seul et UN SEUL test dedans. Il tient les deux bords du journal du lecteur
+# de tag DSF — un tag ecarte nomme son motif, un fichier ordinaire se tait.
+[[test]]
+name = "journal_dsf_tag_ecarte_i3180_e7d445"
+path = "tests/journal_dsf_tag_ecarte_i3180_e7d445.rs"
+
+# #2394 : « zero octet servi » et « je ne sais pas » etaient le meme chiffre, et
+# c est ce chiffre qui coupe la zone. `autotests = false` ci-dessus — sans cette
+# cible le fichier ne serait JAMAIS compile, et la porte rendrait un vert contre
+# rien.
+[[test]]
+name = "octets_servis_inconnus_2394"
+path = "tests/octets_servis_inconnus_2394.rs"
+
+# Meme famille que #2665 / #2890 / #3180, quatrieme fois : abonne `tracing`
+# GLOBAL, donc un binaire a lui seul et UN SEUL test dedans. Il tient la trace
+# qui tranche entre les deux familles de « l'egaliseur coupe le son » (#3479) —
+# zone RESEAU (#3357) ou sortie LOCALE (#1735) — et son autre bord, une seule
+# ligne par changement. `autotests = false` ci-dessus : sans cette cible le
+# fichier ne serait JAMAIS compile.
+[[test]]
+name = "journal_egaliseur_i3479"
+path = "tests/journal_egaliseur_i3479.rs"
+
+# #3479, seconde moitie du message du 08/09 : la bascule d'egaliseur CHIFFRE sa
+# duree (`duree_ms`) et NOMME ce qui la retient (`amortissement`). Abonne
+# `tracing` GLOBAL, donc un test par binaire — meme raison que la cible
+# ci-dessus. `autotests = false` en tete de ce fichier : sans cette cible, le
+# fichier ne serait JAMAIS compile.
+[[test]]
+name = "reactivite_egaliseur_i3479"
+path = "tests/reactivite_egaliseur_i3479.rs"
+
 [build-dependencies]
 cc = "1"
 
@@ -170,3 +339,39 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
     "Win32_System_Power",
 ] }
+
+# #2219 — témoin de `resolve_streaming_url` par sa porte publique, avant que
+# la famille resolve_stream quitte orchestrator.rs. `autotests = false` ci-dessus :
+# sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "temoin_resolution_streaming"
+path = "tests/temoin_resolution_streaming.rs"
+
+[[test]]
+name = "temoin_resolution_locale"
+path = "tests/temoin_resolution_locale.rs"
+
+# #2060 / #3522 — une balise « Track N » ne doit pas voler la place du nom de
+# fichier. `autotests = false` plus haut : sans cette cible, le fichier ne
+# serait jamais compilé.
+[[test]]
+name = "titre_de_remplissage_2060"
+path = "tests/titre_de_remplissage_2060.rs"
+# #3419 — la reprise dans Tune des favoris posés chez le service. Même raison
+# que les cibles ci-dessus : `autotests = false` en tête de ce fichier, sans
+# cette déclaration le témoin ne serait jamais compilé et la porte rendrait un
+# vert contre rien.
+[[test]]
+name = "reprise_favoris_streaming"
+path = "tests/reprise_favoris_streaming.rs"
+
+# Meme famille que #2665 / #2890 / #3180 / #3479, cinquieme fois : abonne
+# `tracing` GLOBAL, donc un binaire a lui seul et UN SEUL test dedans. Il tient
+# les trois durees du demarrage d'une piste de service sur SORTIE LOCALE
+# (#3568) — assemblage de l'adresse, telechargement complet, transcodage WAV —
+# que rien ne mesurait au niveau livre. `autotests = false` en tete de ce
+# fichier : sans cette cible, le temoin ne serait jamais compile et la porte
+# rendrait un vert contre rien.
+[[test]]
+name = "journal_latence_demarrage_local_i3568"
+path = "tests/journal_latence_demarrage_local_i3568.rs"

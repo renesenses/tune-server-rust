@@ -15,6 +15,11 @@
 //!    seulement, aucun tiers.
 //! 3. **La passe LRCLIB** ([`run_lrclib_fill`]) — la seule qui sorte sur le
 //!    réseau, et donc la seule sous conditions strictes (voir plus bas).
+//! 4. **Le rattrapage de fond** ([`spawn`], [`rattraper_un_lot`]) — la passe
+//!    LRCLIB par petits lots, toute seule, quand rien ne joue. C'est le titre
+//!    littéral de l'issue : jusqu'ici les deux passes ci-dessus n'avaient
+//!    qu'un seul appelant, un bouton, et une bibliothèque à laquelle personne
+//!    ne pensait ne gagnait jamais une ligne de paroles.
 //!
 //! # Les trois sources, et où elles vivent déjà
 //!
@@ -236,14 +241,9 @@ pub fn candidates(
              FROM tracks t \
              JOIN artists ar ON ar.id = t.artist_id \
              LEFT JOIN albums al ON al.id = t.album_id \
-             WHERE t.id > {p1} \
-               AND t.title <> '' AND ar.name <> '' \
-               AND NOT {HAS_LRC} AND NOT {HAS_TAG} AND NOT {HAS_LRCLIB} \
-               AND NOT EXISTS (SELECT 1 FROM lyrics_cache c \
-                               WHERE c.track_id = t.id AND c.fetched_at >= {p2}) \
+             WHERE {ou} \
              ORDER BY t.id LIMIT {p3}",
-            p1 = d.placeholder(1),
-            p2 = d.placeholder(2),
+            ou = ou_candidates(d, 1, 2),
             p3 = d.placeholder(3),
         )
     });
@@ -262,6 +262,56 @@ pub fn candidates(
             })
         })
         .collect())
+}
+
+/// Le prédicat des pistes candidates, écrit UNE fois.
+///
+/// [`candidates`] le lit pour choisir, [`compter_les_candidats`] pour compter.
+/// Deux textes finiraient par diverger, et la couverture annoncée à l'écran ne
+/// serait plus celle que la passe traite — c'est la leçon de
+/// `CANDIDATS_EMPREINTE_WHERE` (BIB-B2, #2414), reprise telle quelle.
+///
+/// `p_after` porte le curseur `t.id >`, `p_cutoff` la fenêtre de re-tentative
+/// des échecs. Les deux tables jointes (`artists`, `albums`) sont à la charge
+/// de l'appelant : le compteur n'a besoin que de `artists`.
+fn ou_candidates(d: &dyn SqlDialect, p_after: usize, p_cutoff: usize) -> String {
+    format!(
+        "t.id > {p1} \
+           AND t.title <> '' AND ar.name <> '' \
+           AND NOT {HAS_LRC} AND NOT {HAS_TAG} AND NOT {HAS_LRCLIB} \
+           AND NOT EXISTS (SELECT 1 FROM lyrics_cache c \
+                           WHERE c.track_id = t.id AND c.fetched_at >= {p2})",
+        p1 = d.placeholder(p_after),
+        p2 = d.placeholder(p_cutoff),
+    )
+}
+
+/// Combien de pistes la passe interrogerait encore — le pendant de
+/// `compter_les_candidats_a_empreinter` (#2172).
+///
+/// [`coverage`] dit ce que la bibliothèque A ; ce compteur dit ce qu'il RESTE
+/// à faire, ce qui n'est pas la même chose : une piste sans paroles dont la
+/// recherche a déjà échoué il y a trois jours n'est pas candidate, et
+/// l'annoncer comme telle promettrait un travail qui n'aura pas lieu.
+///
+/// `None` : la requête a échoué (base trop ancienne, table absente). On ne rend
+/// pas `0`, qui se lirait « rien à faire ».
+pub fn compter_les_candidats(db: &Arc<dyn DbBackend>) -> Option<i64> {
+    let cutoff = crate::lyrics::negative_retry_cutoff();
+    let zero = 0i64;
+    let sql = dialect_sql(db, |d| {
+        format!(
+            "SELECT COUNT(*) FROM tracks t \
+             JOIN artists ar ON ar.id = t.artist_id \
+             WHERE {ou}",
+            ou = ou_candidates(d, 1, 2),
+        )
+    });
+    let params: [&dyn ToSqlValue; 2] = [&zero, &cutoff];
+    db.query_one(&sql, &params)
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +429,7 @@ pub fn run_local_index(
 
 /// Pourquoi une requête LRCLIB a échoué. Le distinguo est ce qui décide de la
 /// suite : un « ralentis » arrête la passe net, une panne de transport ne
-/// l'arrête qu'après [`MAX_CONSECUTIVE_FAILURES`] d'affilée.
+/// l'arrête qu'après `MAX_CONSECUTIVE_FAILURES` d'affilée.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchFailure {
     /// HTTP 429 / 503 — le service demande explicitement qu'on s'arrête.
@@ -437,6 +487,10 @@ pub enum FillStatus {
     RateLimited,
     /// Trop d'échecs réseau consécutifs.
     NetworkError,
+    /// Une zone s'est mise à jouer : la passe de fond lui cède la place
+    /// ([`FillOptions::ceder_a_la_lecture`], #2172). Comme [`Self::Capped`],
+    /// c'est un arrêt PROPRE — il reste du travail, et la reprise est gratuite.
+    CedeALaLecture,
 }
 
 /// Bilan d'un run de la passe LRCLIB.
@@ -485,6 +539,15 @@ pub struct FillOptions<'a> {
     /// passes concurrentes ne doublent pas la cadence. Injecté plutôt que
     /// codé en dur pour que les tests s'exécutent en millisecondes.
     pub limiter: &'a RateLimiter,
+    /// La passe doit-elle s'arrêter dès qu'une zone joue ? (#2172)
+    ///
+    /// `true` pour la passe DE FOND, qui n'a été demandée par personne à cet
+    /// instant précis : la même règle que le ReplayGain et que le rattrapage
+    /// des empreintes (`audio::replaygain::any_zone_playing`). `false` pour la
+    /// passe lancée depuis un bouton — l'utilisateur vient de la demander, et
+    /// la lui refuser parce qu'il écoute de la musique en même temps serait le
+    /// contraire d'un service.
+    pub ceder_a_la_lecture: bool,
 }
 
 impl FillOptions<'static> {
@@ -494,6 +557,25 @@ impl FillOptions<'static> {
         Self {
             max_requests: 500,
             limiter: &crate::http::fetch::LRCLIB,
+            ceder_a_la_lecture: false,
+        }
+    }
+
+    /// Les garde-fous d'UN LOT de la passe de fond (#2172).
+    ///
+    /// Deux différences avec [`Self::production`], et ce sont les deux raisons
+    /// d'être d'une passe automatique :
+    ///
+    /// - **Le lot est court** ([`LOT_DE_FOND`]). Une boucle de fond enchaîne
+    ///   des lots ; un lot de 500 tiendrait huit minutes pendant lesquelles
+    ///   aucune garde ne serait relue, et le bilan publié ne bougerait pas.
+    /// - **Elle cède à la lecture.** Personne n'a appuyé sur un bouton : la
+    ///   passe n'a aucun droit de disputer le réseau à une zone qui joue.
+    pub fn fond() -> Self {
+        Self {
+            max_requests: LOT_DE_FOND,
+            limiter: &crate::http::fetch::LRCLIB,
+            ceder_a_la_lecture: true,
         }
     }
 }
@@ -565,6 +647,18 @@ where
 
             if report.requested >= opts.max_requests {
                 report.status = FillStatus::Capped;
+                break 'outer;
+            }
+
+            // Relu à CHAQUE piste, et non une fois au début : un lot dure des
+            // dizaines de secondes, et la lecture démarre PENDANT — c'est ce
+            // que la passe ReplayGain a appris en #2495. Testé avant la
+            // réservation du créneau : céder après l'avoir pris le gaspille.
+            if opts.ceder_a_la_lecture
+                && let Some(zone) = crate::audio::replaygain::playing_zone_name(db)
+            {
+                info!(zone = %zone, "lyrics_fill_cede_a_la_lecture");
+                report.status = FillStatus::CedeALaLecture;
                 break 'outer;
             }
 
@@ -644,6 +738,117 @@ where
     );
     progress(&report);
     report
+}
+
+// ---------------------------------------------------------------------------
+// Passe 2 bis — le RATTRAPAGE de fond (#2172)
+// ---------------------------------------------------------------------------
+//
+// Ce que ce ticket reproche tient en son titre : « aucun passage de fond ne
+// récupère les paroles ». Les deux passes ci-dessus existaient déjà, mais
+// leur SEUL appelant était `POST /library/lyrics/fetch` — un bouton. Une
+// bibliothèque à laquelle personne ne pense n'a donc jamais gagné une seule
+// ligne de paroles.
+//
+// Le modèle est celui du rattrapage des empreintes livré en 0.9.140
+// (`audio::replaygain::empreinter_un_lot` + `compter_les_candidats_a_...`), et
+// il est repris bord pour bord plutôt que réinventé :
+//
+// - **Borné** : un lot, [`LOT_DE_FOND`] requêtes au plus.
+// - **Reprenable** : aucun curseur à conserver. Chaque requête écrit une ligne
+//   dans `lyrics_cache` — succès COMME échec —, ce qui sort la piste des
+//   candidates ; le lot suivant reprend donc là où le précédent s'est arrêté,
+//   même après un redémarrage. C'est déjà ce que dit l'en-tête du module.
+// - **Sous les gardes existantes** : le consentement `lyrics_lrclib_enabled`,
+//   le limiteur partagé ~1 req/s, l'arrêt au premier 429/503, l'arrêt après
+//   trois échecs réseau — plus celle qu'une passe de fond doit en propre, la
+//   lecture en cours.
+//
+// Et deux portes, exactement comme `GET`/`POST /library/duplicates/empreintes`
+// (`routes/library/duplicates.rs`) : une qui DIT la couverture, une qui FORCE
+// un lot sans attendre le créneau.
+
+/// Requêtes d'UN lot de fond.
+///
+/// 25, comme le lot d'empreintes (`replaygain::TRACK_BATCH`). Au débit du
+/// limiteur (~1 req/s) un lot tient une demi-minute : assez pour avancer,
+/// assez court pour que les gardes soient relues souvent et que l'arrêt sur
+/// lecture ne se fasse pas attendre.
+pub const LOT_DE_FOND: usize = 25;
+
+/// Délai entre deux lots quand il reste du travail.
+const REPOS_ENTRE_LOTS_SECS: u64 = 30;
+
+/// Délai quand il n'y a plus rien à faire, ou que le consentement manque. Un
+/// scan peut avoir ajouté des pistes entre-temps : on revient, mais de loin.
+const REPOS_AU_CALME_SECS: u64 = 900;
+
+/// Délai après un refus du service (429/503) ou une coupure réseau. LRCLIB est
+/// bénévole : quand il dit « ralentis », une heure n'est pas de trop.
+const REPOS_APRES_REFUS_SECS: u64 = 3600;
+
+/// Délai avant le premier lot. Plus tard que le ReplayGain (120 s) : le
+/// démarrage et le scan ont la priorité, et les paroles n'ont aucune urgence.
+const DELAI_DE_DEMARRAGE_SECS: u64 = 300;
+
+/// Combien de secondes attendre après un lot, selon la façon dont il s'est
+/// terminé.
+///
+/// Séparé de [`spawn`] pour être vérifiable : une boucle infinie ne s'éprouve
+/// pas, sa décision si. Et c'est bien la décision qui compte — confondre
+/// « plein » et « refusé » ferait marteler un service bénévole.
+fn repos_apres(status: FillStatus) -> u64 {
+    match status {
+        // Il reste du travail et rien ne s'y oppose : on enchaîne.
+        FillStatus::Capped => REPOS_ENTRE_LOTS_SECS,
+        // Une zone s'est mise à jouer pendant le lot : on repasse bientôt,
+        // mais on ne s'accroche pas.
+        FillStatus::CedeALaLecture => REPOS_ENTRE_LOTS_SECS,
+        // Plus de candidate, ou consentement retiré en cours de route : rien à
+        // faire. Un scan peut en ajouter, alors on revient — mais de loin.
+        FillStatus::Done | FillStatus::Refused => REPOS_AU_CALME_SECS,
+        // Le service a dit non : insister ne sert personne.
+        FillStatus::RateLimited | FillStatus::NetworkError => REPOS_APRES_REFUS_SECS,
+    }
+}
+
+/// UN lot de rattrapage, avec toutes les gardes (#2172).
+///
+/// Sert les deux appelants : la boucle de fond, et la route qui force un lot
+/// pour calibrer sur une vraie bibliothèque sans attendre le créneau. Un seul
+/// corps, donc un seul comportement à garder.
+pub async fn rattraper_un_lot(db: &Arc<dyn DbBackend>, http: &reqwest::Client) -> FillReport {
+    run_lrclib_fill(
+        db,
+        FillOptions::fond(),
+        |_| {},
+        |cand| async move { fetch_for_pass(http, &cand).await },
+    )
+    .await
+}
+
+/// La boucle de fond. Miroir de `audio::replaygain::spawn`.
+///
+/// Elle ne fait rien tant que `lyrics_lrclib_enabled` ne vaut pas `"true"` :
+/// interroger un service tiers gratuit pour toute une bibliothèque reste un
+/// geste que l'utilisateur pose, pas un défaut. Ce que ce spawn change, c'est
+/// qu'une fois ce geste posé **une** fois, il n'a plus à le reposer à chaque
+/// nouveau lot d'albums importés.
+pub fn spawn(backend: Arc<dyn DbBackend>, http: reqwest::Client) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(DELAI_DE_DEMARRAGE_SECS)).await;
+        loop {
+            let repos = if !lrclib_consent_given(&backend) {
+                REPOS_AU_CALME_SECS
+            } else if let Some(zone) = crate::audio::replaygain::playing_zone_name(&backend) {
+                debug!(zone = %zone, "lyrics_background_pause_lecture");
+                REPOS_ENTRE_LOTS_SECS
+            } else {
+                repos_apres(rattraper_un_lot(&backend, &http).await.status)
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(repos)).await;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -797,8 +1002,8 @@ pub struct ExportCandidate {
 ///
 /// Le prédicat d'exclusion suit la cible, et c'est ce qui rend la passe
 /// reprenable : en `.lrc` on écarte celles qui ont déjà un `.lrc`
-/// ([`HAS_LRC`]), en étiquette celles qui ont déjà une étiquette
-/// ([`HAS_TAG`]). Écrire l'un n'empêche donc jamais d'écrire l'autre plus
+/// (`HAS_LRC`), en étiquette celles qui ont déjà une étiquette
+/// (`HAS_TAG`). Écrire l'un n'empêche donc jamais d'écrire l'autre plus
 /// tard.
 pub fn export_candidates(
     db: &Arc<dyn DbBackend>,
@@ -999,7 +1204,12 @@ fn write_one_tag(cand: &ExportCandidate) -> WriteOutcome {
     if crate::metadata::tag_writer::is_unsupported_format(&cand.file_path) {
         return WriteOutcome::Nothing;
     }
-    if !std::path::Path::new(&cand.file_path).is_file() {
+    // Le chemin vient de `tracks.file_path`, donc en NFC ; le disque peut le
+    // porter en NFD. Un `is_file()` sur la graphie stockée refusait ici 147
+    // pistes de `.18` qui existent bel et bien, et la passe les comptait en
+    // « rien à écrire » — le corps était pourtant là (#1865). La garde reste :
+    // un fichier qu'AUCUNE graphie ne trouve est toujours écarté.
+    if crate::library::local_path::resolve_local_path(&cand.file_path).is_missing() {
         return WriteOutcome::Nothing;
     }
     // Dernière vérification avant d'ouvrir : la base peut ignorer une
@@ -1034,7 +1244,7 @@ mod tests {
     /// Base complète : `CORE_SCHEMA` **puis** les migrations — `track_metadata`
     /// et `lyrics_cache` n'existent que par migration, et l'indicateur les lit
     /// toutes les deux. (Même montage que `audio::embedding`.)
-    fn test_db() -> Arc<dyn DbBackend> {
+    pub(super) fn test_db() -> Arc<dyn DbBackend> {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
@@ -1044,7 +1254,7 @@ mod tests {
     /// Crée une piste avec un artiste réel : `tracks` n'a pas de colonne
     /// `artist_name`, la jointure sur `artists` est la seule source du nom, et
     /// la sélection des candidates l'exige.
-    fn make_track(db: &Arc<dyn DbBackend>, title: &str, artist: &str) -> i64 {
+    pub(super) fn make_track(db: &Arc<dyn DbBackend>, title: &str, artist: &str) -> i64 {
         let artist_id = ArtistRepo::with_backend(db.clone())
             .create(&Artist::new(artist.into()))
             .unwrap();
@@ -1054,13 +1264,13 @@ mod tests {
         TrackRepo::with_backend(db.clone()).create(&t).unwrap()
     }
 
-    fn consent(db: &Arc<dyn DbBackend>, on: bool) {
+    pub(super) fn consent(db: &Arc<dyn DbBackend>, on: bool) {
         SettingsRepo::with_backend(db.clone())
             .set(SETTING_LRCLIB_ENABLED, if on { "true" } else { "false" })
             .unwrap();
     }
 
-    fn some_lyrics() -> LrclibRaw {
+    pub(super) fn some_lyrics() -> LrclibRaw {
         LrclibRaw {
             synced_lyrics: Some("[00:10.00] Une ligne\n".into()),
             plain_lyrics: Some("Une ligne".into()),
@@ -1277,7 +1487,7 @@ mod tests {
     /// Limiteur « de test » : même code que la production, intervalle réduit
     /// pour que la suite s'exécute en millisecondes. Local à chaque test, donc
     /// aucun créneau n'est partagé entre tests parallèles.
-    fn fast_limiter() -> RateLimiter {
+    pub(super) fn fast_limiter() -> RateLimiter {
         RateLimiter::with_interval(Duration::from_millis(1))
     }
 
@@ -1285,6 +1495,10 @@ mod tests {
         FillOptions {
             max_requests: 100,
             limiter,
+            // Le défaut des essais est celui du bouton : aucune zone ne joue
+            // dans une base en mémoire, et la garde de lecture a ses propres
+            // épreuves plus bas.
+            ceder_a_la_lecture: false,
         }
     }
 
@@ -1475,6 +1689,7 @@ mod tests {
         let opts = FillOptions {
             max_requests: 2,
             limiter: &limiter,
+            ceder_a_la_lecture: false,
         };
         let calls = AtomicUsize::new(0);
         let first = run_lrclib_fill(
@@ -1520,6 +1735,7 @@ mod tests {
         let opts = FillOptions {
             max_requests: 100,
             limiter: &limiter,
+            ceder_a_la_lecture: false,
         };
         let start = std::time::Instant::now();
         let report = run_lrclib_fill(&db, opts, |_| {}, |_c| async { Ok(None) }).await;
@@ -1990,5 +2206,260 @@ mod tests {
         consent(&db, false);
         assert!(write_consent_given(&db));
         assert!(!lrclib_consent_given(&db));
+    }
+}
+
+/// Le rattrapage de fond (#2172) — ce que le titre de l'issue réclamait.
+///
+/// Ces gardes appellent les fonctions ; aucune ne lit le texte d'un fichier.
+/// La garde de lecture, en particulier, ne vaudrait rien autrement : c'est un
+/// chemin de code au milieu d'une boucle.
+#[cfg(test)]
+mod tests_rattrapage_de_fond {
+    use super::tests::{consent, fast_limiter, make_track, some_lyrics, test_db};
+    use super::*;
+    use crate::db::track_metadata_repo::TrackMetadataRepo;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Déclare une zone en train de jouer, comme l'orchestrateur le fait.
+    fn zone_qui_joue(db: &Arc<dyn DbBackend>, nom: &str) {
+        let nom = nom.to_string();
+        db.execute(
+            "INSERT INTO zones (name, last_play_state) VALUES (?1, 'playing')",
+            &[&nom as &dyn ToSqlValue],
+        )
+        .expect("zone d'essai");
+    }
+
+    #[tokio::test]
+    async fn une_zone_qui_joue_arrete_le_lot_sans_une_seule_requete() {
+        // La garde que doit sa passe de fond, et qu'aucune des deux passes
+        // manuelles n'avait : ne pas disputer le réseau à une zone qui joue.
+        let db = test_db();
+        for i in 0..5 {
+            make_track(&db, &format!("Piste {i}"), &format!("Artiste {i}"));
+        }
+        consent(&db, true);
+        zone_qui_joue(&db, "Salon");
+
+        let limiter = fast_limiter();
+        let appels = AtomicUsize::new(0);
+        let report = run_lrclib_fill(
+            &db,
+            FillOptions {
+                max_requests: 100,
+                limiter: &limiter,
+                ceder_a_la_lecture: true,
+            },
+            |_| {},
+            |_c| {
+                appels.fetch_add(1, Ordering::Relaxed);
+                async { Ok(Some(some_lyrics())) }
+            },
+        )
+        .await;
+
+        assert_eq!(report.status, FillStatus::CedeALaLecture);
+        assert_eq!(
+            appels.load(Ordering::Relaxed),
+            0,
+            "la passe de fond cède AVANT la première requête"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_meme_lecture_n_arrete_pas_la_passe_demandee_a_la_main() {
+        // Contre-épreuve de la précédente, et c'est elle qui prouve que la
+        // garde est bien gouvernée par l'option : l'utilisateur qui appuie sur
+        // « Compléter » en écoutant de la musique doit être servi.
+        let db = test_db();
+        for i in 0..3 {
+            make_track(&db, &format!("Piste {i}"), &format!("Artiste {i}"));
+        }
+        consent(&db, true);
+        zone_qui_joue(&db, "Salon");
+
+        let limiter = fast_limiter();
+        let appels = AtomicUsize::new(0);
+        let report = run_lrclib_fill(
+            &db,
+            FillOptions {
+                max_requests: 100,
+                limiter: &limiter,
+                ceder_a_la_lecture: false,
+            },
+            |_| {},
+            |_c| {
+                appels.fetch_add(1, Ordering::Relaxed);
+                async { Ok(Some(some_lyrics())) }
+            },
+        )
+        .await;
+
+        assert_eq!(report.status, FillStatus::Done);
+        assert_eq!(appels.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn le_lot_de_fond_est_borne_puis_reprend_ou_il_s_est_arrete() {
+        // « Borné ET reprenable » : deux lots consécutifs ne repassent jamais
+        // sur la même piste, sans qu'aucun curseur ne soit conservé — c'est
+        // `lyrics_cache` qui fait office de marque-page.
+        let db = test_db();
+        let total = LOT_DE_FOND + 4;
+        for i in 0..total {
+            make_track(&db, &format!("Piste {i}"), &format!("Artiste {i}"));
+        }
+        consent(&db, true);
+
+        let limiter = fast_limiter();
+        let vues = std::sync::Mutex::new(Vec::<i64>::new());
+        let options = FillOptions {
+            max_requests: LOT_DE_FOND,
+            limiter: &limiter,
+            ceder_a_la_lecture: true,
+        };
+
+        let premier = run_lrclib_fill(
+            &db,
+            options,
+            |_| {},
+            |c| {
+                vues.lock().expect("verrou d'essai").push(c.track_id);
+                async { Ok(Some(some_lyrics())) }
+            },
+        )
+        .await;
+        assert_eq!(
+            premier.status,
+            FillStatus::Capped,
+            "le lot s'arrête au plafond, il ne vide pas la bibliothèque"
+        );
+        assert_eq!(premier.requested, LOT_DE_FOND);
+
+        let second = run_lrclib_fill(
+            &db,
+            options,
+            |_| {},
+            |c| {
+                vues.lock().expect("verrou d'essai").push(c.track_id);
+                async { Ok(Some(some_lyrics())) }
+            },
+        )
+        .await;
+        assert_eq!(
+            second.status,
+            FillStatus::Done,
+            "le reste tient dans le second lot"
+        );
+        assert_eq!(second.requested, total - LOT_DE_FOND);
+
+        let vues = vues.into_inner().expect("verrou d'essai");
+        assert_eq!(vues.len(), total, "chaque piste a coûté UNE requête");
+        let uniques: std::collections::BTreeSet<i64> = vues.iter().copied().collect();
+        assert_eq!(
+            uniques.len(),
+            total,
+            "aucune piste n'est repayée : le second lot reprend où le premier s'est arrêté"
+        );
+    }
+
+    #[test]
+    fn le_compteur_de_candidates_compte_ce_que_la_passe_traiterait() {
+        // Le piège de BIB-B2 : un compteur écrit à côté du sélecteur finit par
+        // annoncer une population que la passe ne traite pas. Les deux lisent
+        // ici le MÊME prédicat, et cette garde le vérifie population par
+        // population.
+        let db = test_db();
+        let sans = make_track(&db, "Sans rien", "A");
+        let avec_tag = make_track(&db, "Avec etiquette", "B");
+        TrackMetadataRepo::with_backend(db.clone())
+            .set(avec_tag, META_KEY_TAG, "des paroles")
+            .unwrap();
+        let deja_cherchee = make_track(&db, "Deja cherchee", "C");
+        crate::lyrics::store_cache_entry(&db, deja_cherchee, "Deja cherchee", "C", None, None);
+
+        let attendues: Vec<i64> = candidates(&db, 0, 1000)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.track_id)
+            .collect();
+        assert_eq!(attendues, vec![sans], "seule la piste jamais cherchée");
+        assert_eq!(
+            compter_les_candidats(&db),
+            Some(attendues.len() as i64),
+            "le compteur et le sélecteur voient la même population"
+        );
+    }
+
+    #[test]
+    fn le_compteur_retombe_a_zero_quand_tout_est_pourvu() {
+        // Contre-épreuve : sans elle, un compteur bloqué sur une constante
+        // passerait l'épreuve précédente.
+        let db = test_db();
+        let t = make_track(&db, "Une piste", "A");
+        assert_eq!(compter_les_candidats(&db), Some(1));
+        crate::lyrics::store_cache_entry(&db, t, "Une piste", "A", None, Some("des paroles"));
+        assert_eq!(
+            compter_les_candidats(&db),
+            Some(0),
+            "une piste pourvue n'est plus candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn sans_consentement_le_lot_de_fond_ne_sort_pas_non_plus() {
+        // Le consentement gouverne la passe de fond exactement comme le
+        // bouton : c'est la réserve n° 1 du fil forum, et une passe qui tourne
+        // toute seule est précisément celle où l'oublier coûterait cher.
+        let db = test_db();
+        make_track(&db, "Une piste", "A");
+        consent(&db, false);
+        // Le client PARTAGÉ, pas un client nu : `http_client_seam` interdit
+        // toute construction hors de `http::client`, et un essai n'y échappe
+        // pas. Aucune requête ne part de toute façon — le consentement
+        // manque, c'est précisément ce qu'on vérifie.
+        let http = crate::http::client::shared().clone();
+        let report = rattraper_un_lot(&db, &http).await;
+        assert_eq!(
+            report.status,
+            FillStatus::Refused,
+            "aucune requête n'est émise sans lyrics_lrclib_enabled"
+        );
+        assert_eq!(report.requested, 0);
+    }
+
+    #[test]
+    fn un_refus_du_service_espace_bien_plus_qu_un_lot_plein() {
+        // La décision de la boucle, sortie de la boucle pour être éprouvée.
+        // Confondre « plein » et « refusé » ferait marteler LRCLIB toutes les
+        // trente secondes après un 429 — exactement ce que la réserve du fil
+        // forum interdit.
+        assert_eq!(repos_apres(FillStatus::Capped), REPOS_ENTRE_LOTS_SECS);
+        assert_eq!(
+            repos_apres(FillStatus::CedeALaLecture),
+            REPOS_ENTRE_LOTS_SECS
+        );
+        assert_eq!(repos_apres(FillStatus::Done), REPOS_AU_CALME_SECS);
+        assert_eq!(repos_apres(FillStatus::Refused), REPOS_AU_CALME_SECS);
+        assert_eq!(repos_apres(FillStatus::RateLimited), REPOS_APRES_REFUS_SECS);
+        assert_eq!(
+            repos_apres(FillStatus::NetworkError),
+            REPOS_APRES_REFUS_SECS
+        );
+        assert!(
+            REPOS_APRES_REFUS_SECS > REPOS_AU_CALME_SECS
+                && REPOS_AU_CALME_SECS > REPOS_ENTRE_LOTS_SECS,
+            "les trois repos sont ordonnés du plus court au plus long"
+        );
+    }
+
+    #[test]
+    fn le_lot_de_fond_cede_a_la_lecture_et_le_bouton_non() {
+        // Les deux jeux d'options ne peuvent pas dériver l'un de l'autre sans
+        // que cette garde le dise.
+        assert!(FillOptions::fond().ceder_a_la_lecture);
+        assert_eq!(FillOptions::fond().max_requests, LOT_DE_FOND);
+        assert!(!FillOptions::production().ceder_a_la_lecture);
     }
 }

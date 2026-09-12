@@ -154,6 +154,100 @@ fn reusable_session(
         .map(|a| (a.transport_id.clone(), a.session_id.clone()))
 }
 
+/// L'application Cast que Tune lance et pilote.
+///
+/// Une seule épellation dans tout le module : deux chemins qui ne viseraient
+/// pas la même application ne se parleraient pas, et le défaut serait muet.
+fn app_id_du_lecteur() -> String {
+    rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver.to_string()
+}
+
+/// Le transport de NOTRE lecteur sur ce récepteur, s'il y tourne.
+///
+/// **#2566 — pourquoi toute commande MÉDIA doit passer par ici.** Le canal
+/// média (`urn:x-cast:com.google.cast.media`) n'existe que dans les
+/// applications qui l'implémentent. `MediaChannel::get_status` envoie sa
+/// requête puis BLOQUE (`receive_find_map`, `vendor/rust_cast/src/channels/media.rs`)
+/// jusqu'à lire un `MEDIA_STATUS` portant son `request_id`. Adressé à une
+/// application qui ne parle pas ce dialecte, il n'obtient jamais de réponse :
+/// la lecture court jusqu'à l'échéance posée par `DeadlineTcpStream`, et la
+/// commande remonte l'expiration de son budget.
+///
+/// C'est exactement la forme du journal de Dimitri (#2566) : **79 échecs de
+/// suite** sur `media status: …`, jamais sur les quatre étapes précédentes.
+/// `connect receiver`, `GET_STATUS` et `connect transport` répondaient tous —
+/// l'appareil était donc joignable, et une application y tournait. Seul le
+/// canal média restait muet, tour après tour, sans jamais guérir : la signature
+/// d'une application qui ne peut pas répondre, pas d'un réseau lent.
+///
+/// Le module savait déjà ne viser que la nôtre — `plan_stop` (#2520) et
+/// `plan_play` (#1953) filtrent par `app_id` depuis leurs correctifs
+/// respectifs. Les quatre commandes restantes, elles, prenaient encore la
+/// PREMIÈRE application du récepteur, quelle qu'elle soit.
+///
+/// ⚠️ Ce que ce filtre ne fait PAS : prouver ce qui tournait chez Dimitri. Le
+/// journal ne nomme pas l'application, et l'issue le dit. Il supprime la classe
+/// entière « parler au canal média de quelqu'un d'autre » ; il ne démontre pas
+/// que c'était ce cas-là.
+///
+/// ⚠️ Ce qu'il change aussi, volontairement : une lecture lancée sur
+/// l'appareil par une AUTRE application n'est plus rapportée comme l'état de la
+/// zone Tune. Elle ne l'était de toute façon qu'au prix d'une question posée à
+/// un correspondant qui n'avait aucune raison d'y répondre.
+fn notre_transport(apps: &[rust_cast::channels::receiver::Application]) -> Option<String> {
+    reusable_session(apps, &app_id_du_lecteur()).map(|(transport_id, _)| transport_id)
+}
+
+/// Pourquoi aucune session de NOTRE lecteur n'était disponible.
+///
+/// **Le témoin qui manquait à #2520.** L'arrêt et la lecture savaient tous les
+/// deux dire *qu'*il n'y avait pas de session (`session_kept=false`,
+/// `session_reused=false`) ; aucun des deux ne disait *pourquoi*. Or les trois
+/// causes n'accusent pas le même coupable, et c'est exactement ce que le
+/// journal de FabienM doit trancher :
+///
+/// | raison | ce que ça veut dire | le carillon est-il notre faute ? |
+/// |---|---|---|
+/// | `appareil_au_repos` | l'application a quitté l'appareil entre l'arrêt et la lecture | oui, s'il n'y a pas eu de délai (voir `depuis_arret_ms`) |
+/// | `application_tierce` | YouTube, Spotify… occupent l'appareil | non : lancer la nôtre est obligatoire |
+/// | `statut_illisible` | `GET_STATUS` n'a pas répondu dans le budget | non : c'est un défaut de réseau, pas de session |
+///
+/// Sans cette distinction, un `session_reused=false` dans un journal ne se lit
+/// pas : il désigne aussi bien le défaut décrit par le ticket qu'un appareil
+/// que le testeur avait laissé à YouTube.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SansSession {
+    /// Aucune application ne tourne : l'appareil est retombé au repos.
+    AppareilAuRepos,
+    /// Une AUTRE application occupe l'appareil (YouTube, Spotify…).
+    ApplicationTierce,
+    /// `GET_STATUS` n'a pas répondu : on ignore ce qui tourne. Ce cas n'existe
+    /// qu'à la lecture — l'arrêt, lui, remonte l'erreur à son appelant.
+    StatutIllisible,
+}
+
+impl SansSession {
+    /// Ce que le journal porte. Trois chaînes DISTINCTES, sinon le témoin ne
+    /// témoigne de rien : c'est ce que verrouille
+    /// `les_trois_raisons_sont_distinctes_sinon_le_journal_ne_dit_rien`.
+    fn raison(self) -> &'static str {
+        match self {
+            Self::AppareilAuRepos => "appareil_au_repos",
+            Self::ApplicationTierce => "application_tierce",
+            Self::StatutIllisible => "statut_illisible",
+        }
+    }
+
+    /// Lit l'état du récepteur : `None` = `GET_STATUS` en échec.
+    fn depuis(apps: Option<&[rust_cast::channels::receiver::Application]>) -> Self {
+        match apps {
+            None => Self::StatutIllisible,
+            Some(apps) if apps.is_empty() => Self::AppareilAuRepos,
+            Some(_) => Self::ApplicationTierce,
+        }
+    }
+}
+
 /// Ce qu'un arrêt de zone envoie à un récepteur Cast.
 ///
 /// La décision est isolée ici parce que c'est la SEULE partie de l'arrêt
@@ -164,9 +258,81 @@ enum StopPlan {
     /// applicative reste ouverte, donc réutilisable par la lecture suivante.
     StopMedia { transport_id: String },
     /// Rien qui nous appartienne ne tourne : appareil au repos, ou occupé par
-    /// une AUTRE application. On n'envoie rien.
-    Leave,
+    /// une AUTRE application. On n'envoie rien — et le journal dit laquelle des
+    /// deux situations c'était.
+    Leave { raison: SansSession },
 }
+
+/// Ce qu'une lecture décide face au récepteur : reprendre la session en cours,
+/// ou relancer l'application — et dans ce cas, POURQUOI.
+///
+/// Même geste que [`plan_stop`] : la décision est extraite du fil pour qu'un
+/// test puisse l'interroger. Le comportement est celui d'avant (réutiliser
+/// quand `reusable_session` trouve notre application, lancer sinon) ; ce qui
+/// est neuf, c'est que la raison du lancement voyage jusqu'au journal.
+#[derive(Debug, PartialEq, Eq)]
+enum PlayPlan {
+    /// Notre application tourne : charger dans SA session, aucun `LAUNCH`.
+    Reuse {
+        transport_id: String,
+        session_id: String,
+    },
+    /// Il faut lancer l'application — c'est le `LAUNCH` qui fait carillonner.
+    Launch { raison: SansSession },
+}
+
+fn plan_play(
+    apps: Option<&[rust_cast::channels::receiver::Application]>,
+    app_id: &str,
+) -> PlayPlan {
+    match apps.and_then(|apps| reusable_session(apps, app_id)) {
+        Some((transport_id, session_id)) => PlayPlan::Reuse {
+            transport_id,
+            session_id,
+        },
+        None => PlayPlan::Launch {
+            raison: SansSession::depuis(apps),
+        },
+    }
+}
+
+/// L'heure du dernier arrêt, par appareil.
+///
+/// **Pourquoi cette horloge.** Le ticket #2520 nomme lui-même la mesure qui
+/// manque pour conclure : *« Combien de temps s'écoule entre le Stop et la
+/// relecture ? Si le carillon n'apparaît qu'au-delà d'un certain délai, la
+/// cause n'est pas notre `stop_app` mais la mise au repos autonome du
+/// récepteur. »* Le Default Media Receiver quitte de lui-même après une
+/// période d'inactivité que personne ici n'a mesurée : tant que le journal ne
+/// porte pas ce délai, un `session_reused=false` après un arrêt ne permet pas
+/// de départager le défaut de Tune et le comportement de l'appareil.
+///
+/// L'âge est CONSOMMÉ à la lecture : `depuis_arret_ms` n'apparaît donc que sur
+/// la première lecture qui suit un arrêt — précisément le geste que FabienM
+/// décrit — et jamais sur les pistes suivantes, où il ne voudrait plus rien
+/// dire.
+#[derive(Default)]
+struct StopClock(std::sync::Mutex<std::collections::HashMap<String, Instant>>);
+
+impl StopClock {
+    fn note_stop(&self, device_id: &str, at: Instant) {
+        self.lock().insert(device_id.to_string(), at);
+    }
+
+    fn take_age(&self, device_id: &str, now: Instant) -> Option<Duration> {
+        self.lock()
+            .remove(device_id)
+            .map(|stopped_at| now.saturating_duration_since(stopped_at))
+    }
+
+    /// Un verrou empoisonné ne doit pas faire tomber une commande Cast : cette
+    /// table ne sert qu'à journaliser, elle ne porte aucun état de lecture.
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Instant>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+static STOP_CLOCK: LazyLock<StopClock> = LazyLock::new(StopClock::default);
 
 /// Arrêter la lecture SANS quitter l'application du récepteur.
 ///
@@ -187,7 +353,7 @@ enum StopPlan {
 /// des quatre à s'adresser au récepteur.
 ///
 /// **2. Couper la musique de quelqu'un d'autre.** L'ancien arrêt prenait
-/// `applications.first()` sans regarder `app_id` : sur un appareil occupé par
+/// la PREMIÈRE application venue sans regarder `app_id` : sur un appareil occupé par
 /// YouTube ou Spotify, un arrêt de zone Tune quittait LEUR application. On ne
 /// vise plus que la nôtre.
 ///
@@ -214,11 +380,15 @@ enum StopPlan {
 /// met aussi au repos tout seul après une période d'inactivité — durée que je
 /// n'ai pas mesurée. Un arrêt suivi d'une reprise TRÈS tardive peut donc
 /// carillonner malgré ce correctif ; c'est une limite de l'appareil, pas de
-/// Tune.
+/// Tune. C'est précisément ce que [`StopClock`] rend mesurable : le
+/// `depuis_arret_ms` de la lecture suivante départage les deux causes sans
+/// qu'il faille écouter l'enceinte.
 fn plan_stop(apps: &[rust_cast::channels::receiver::Application], app_id: &str) -> StopPlan {
     match reusable_session(apps, app_id) {
         Some((transport_id, _)) => StopPlan::StopMedia { transport_id },
-        None => StopPlan::Leave,
+        None => StopPlan::Leave {
+            raison: SansSession::depuis(Some(apps)),
+        },
     }
 }
 
@@ -368,6 +538,7 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         let name = self.name.clone();
+        let device_key = self.device_id.clone();
         let timeout = self.command_timeout;
         let slots = Arc::clone(&self.command_slots);
 
@@ -381,24 +552,23 @@ impl OutputTarget for ChromecastOutput {
             // récepteur : un LAUNCH sur une application déjà lancée la
             // redémarre, et l'enceinte carillonne (#1953). Un GET_STATUS
             // en échec retombe sur le lancement — le comportement d'avant.
-            let app_id =
-                rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver.to_string();
-            let existing = device
-                .receiver
-                .get_status()
-                .ok()
-                .and_then(|s| reusable_session(&s.applications, &app_id));
+            let app_id = app_id_du_lecteur();
+            let status = device.receiver.get_status().ok();
+            let plan = plan_play(status.as_ref().map(|s| s.applications.as_slice()), &app_id);
 
-            let (transport_id, session_id, session_reused) = match existing {
-                Some((transport_id, session_id)) => (transport_id, session_id, true),
-                None => {
+            let (transport_id, session_id, session_reused, raison) = match plan {
+                PlayPlan::Reuse {
+                    transport_id,
+                    session_id,
+                } => (transport_id, session_id, true, "session_reutilisee"),
+                PlayPlan::Launch { raison } => {
                     let app = device
                         .receiver
                         .launch_app(
                             &rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver,
                         )
                         .map_err(|e| format!("launch app: {e}"))?;
-                    (app.transport_id, app.session_id, false)
+                    (app.transport_id, app.session_id, false, raison.raison())
                 }
             };
 
@@ -415,7 +585,25 @@ impl OutputTarget for ChromecastOutput {
             // `session_reused=false` sur une piste qui n'est pas la première
             // d'une écoute désigne le vrai coupable du carillon : la session
             // n'a pas survécu au changement de piste.
-            info!(device = %name, url, session_reused, "chromecast_play");
+            //
+            // `raison` dit LAQUELLE des trois causes a imposé le `LAUNCH`, et
+            // `depuis_arret_ms` — présent seulement sur la première lecture qui
+            // suit un arrêt — dit combien de temps l'appareil est resté sans
+            // rien jouer. Ensemble, les deux tranchent le scénario de FabienM :
+            // `raison=appareil_au_repos` avec un délai de quelques secondes
+            // accuse Tune ; le même avec plusieurs minutes accuse la mise au
+            // repos autonome du récepteur.
+            let depuis_arret_ms = STOP_CLOCK
+                .take_age(&device_key, Instant::now())
+                .map(|age| age.as_millis());
+            info!(
+                device = %name,
+                url,
+                session_reused,
+                raison,
+                depuis_arret_ms = ?depuis_arret_ms,
+                "chromecast_play"
+            );
             Ok::<(), String>(())
         })
         .await
@@ -436,19 +624,21 @@ impl OutputTarget for ChromecastOutput {
                 .receiver
                 .get_status()
                 .map_err(|e| format!("status: {e}"))?;
-            if let Some(app) = status.applications.first() {
+            // #2566 — la commande partait sur la PREMIÈRE application du
+            // récepteur. Voir `notre_transport`.
+            if let Some(transport_id) = notre_transport(&status.applications) {
                 device
                     .connection
-                    .connect(&app.transport_id)
+                    .connect(&transport_id)
                     .map_err(|e| format!("connect transport: {e}"))?;
                 let media_status = device
                     .media
-                    .get_status(&app.transport_id, None)
+                    .get_status(&transport_id, None)
                     .map_err(|e| format!("media status: {e}"))?;
                 if let Some(entry) = media_status.entries.first() {
                     device
                         .media
-                        .pause(&app.transport_id, entry.media_session_id)
+                        .pause(&transport_id, entry.media_session_id)
                         .map_err(|e| format!("pause: {e}"))?;
                 }
             }
@@ -472,19 +662,21 @@ impl OutputTarget for ChromecastOutput {
                 .receiver
                 .get_status()
                 .map_err(|e| format!("status: {e}"))?;
-            if let Some(app) = status.applications.first() {
+            // #2566 — la commande partait sur la PREMIÈRE application du
+            // récepteur. Voir `notre_transport`.
+            if let Some(transport_id) = notre_transport(&status.applications) {
                 device
                     .connection
-                    .connect(&app.transport_id)
+                    .connect(&transport_id)
                     .map_err(|e| format!("connect transport: {e}"))?;
                 let media_status = device
                     .media
-                    .get_status(&app.transport_id, None)
+                    .get_status(&transport_id, None)
                     .map_err(|e| format!("media status: {e}"))?;
                 if let Some(entry) = media_status.entries.first() {
                     device
                         .media
-                        .play(&app.transport_id, entry.media_session_id)
+                        .play(&transport_id, entry.media_session_id)
                         .map_err(|e| format!("play: {e}"))?;
                 }
             }
@@ -499,6 +691,7 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         let name = self.name.clone();
+        let device_key = self.device_id.clone();
         let timeout = self.command_timeout;
         let slots = Arc::clone(&self.command_slots);
         run_cast_command(host, port, timeout, slots, move |device| {
@@ -511,16 +704,29 @@ impl OutputTarget for ChromecastOutput {
                 .get_status()
                 .map_err(|e| format!("status: {e}"))?;
 
-            let app_id =
-                rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver.to_string();
-            let StopPlan::StopMedia { transport_id } = plan_stop(&status.applications, &app_id)
-            else {
+            let app_id = app_id_du_lecteur();
+            let transport_id = match plan_stop(&status.applications, &app_id) {
+                StopPlan::StopMedia { transport_id } => transport_id,
                 // Un arrêt réussi n'écrivait AUCUNE ligne : le seul témoin
                 // était le `device_stop_failed` de l'appelant, en cas d'erreur
                 // seulement. Un journal ne pouvait donc pas dire si un arrêt
                 // avait eu lieu — c'est ce qui a manqué pour instruire #2520.
-                info!(device = %name, session_kept = false, "chromecast_stop");
-                return Ok(());
+                //
+                // `decision=aucun_envoi` et sa `raison` séparent les deux cas
+                // que ce `false` confondait : un appareil déjà au repos (rien à
+                // arrêter, la lecture suivante carillonnera forcément) et un
+                // appareil tenu par une autre application (Tune n'y touche pas,
+                // délibérément).
+                StopPlan::Leave { raison } => {
+                    info!(
+                        device = %name,
+                        session_kept = false,
+                        decision = "aucun_envoi",
+                        raison = raison.raison(),
+                        "chromecast_stop"
+                    );
+                    return Ok(());
+                }
             };
 
             device
@@ -541,7 +747,17 @@ impl OutputTarget for ChromecastOutput {
             // `session_kept=true` sur l'arrêt et `session_reused=true` sur la
             // lecture qui suit : les deux lignes ensemble prouvent que la
             // session a survécu à l'arrêt, sans avoir à écouter l'enceinte.
-            info!(device = %name, session_kept = true, "chromecast_stop");
+            //
+            // L'heure est notée APRÈS l'envoi : c'est le début de la période
+            // pendant laquelle l'appareil ne joue plus rien, celle que la
+            // lecture suivante rapportera en `depuis_arret_ms`.
+            STOP_CLOCK.note_stop(&device_key, Instant::now());
+            info!(
+                device = %name,
+                session_kept = true,
+                decision = "stop_sans_quitter",
+                "chromecast_stop"
+            );
             Ok::<(), String>(())
         })
         .await
@@ -562,20 +778,22 @@ impl OutputTarget for ChromecastOutput {
                 .receiver
                 .get_status()
                 .map_err(|e| format!("status: {e}"))?;
-            if let Some(app) = status.applications.first() {
+            // #2566 — la commande partait sur la PREMIÈRE application du
+            // récepteur. Voir `notre_transport`.
+            if let Some(transport_id) = notre_transport(&status.applications) {
                 device
                     .connection
-                    .connect(&app.transport_id)
+                    .connect(&transport_id)
                     .map_err(|e| format!("connect transport: {e}"))?;
                 let media_status = device
                     .media
-                    .get_status(&app.transport_id, None)
+                    .get_status(&transport_id, None)
                     .map_err(|e| format!("media status: {e}"))?;
                 if let Some(entry) = media_status.entries.first() {
                     device
                         .media
                         .seek(
-                            &app.transport_id,
+                            &transport_id,
                             entry.media_session_id,
                             Some(position_secs),
                             None,
@@ -652,7 +870,16 @@ impl OutputTarget for ChromecastOutput {
             let volume = recv_status.volume.level.unwrap_or(0.5) as f64;
             let muted = recv_status.volume.muted.unwrap_or(false);
 
-            let Some(app) = recv_status.applications.first() else {
+            // #2566 — le sondage interrogeait le canal média de la PREMIÈRE
+            // application du récepteur. Quand ce n'était pas la nôtre, la
+            // requête restait sans réponse jusqu'à l'échéance : c'est le
+            // `media status: …` répété 79 fois dans le journal de Dimitri.
+            // Voir `notre_transport`.
+            //
+            // Le volume et la sourdine sont lus AVANT, sur le statut du
+            // RÉCEPTEUR : ils ne dépendent d'aucune application, et ce chemin
+            // continue donc de les rendre comme avant.
+            let Some(transport_id) = notre_transport(&recv_status.applications) else {
                 return Ok(OutputStatus {
                     ended_naturally: false,
                     volume,
@@ -663,12 +890,12 @@ impl OutputTarget for ChromecastOutput {
 
             device
                 .connection
-                .connect(&app.transport_id)
+                .connect(&transport_id)
                 .map_err(|e| format!("connect transport: {e}"))?;
 
             let media_status = device
                 .media
-                .get_status(&app.transport_id, None)
+                .get_status(&transport_id, None)
                 .map_err(|e| format!("media status: {e}"))?;
 
             let Some(entry) = media_status.entries.first() else {
@@ -1096,7 +1323,12 @@ mod deadline_tests {
                     // client échoue à l'écriture et non à la lecture.
                     let mut bytes = [0u8; 1024];
                     let _ = socket.read(&mut bytes).await;
-                    let _ = socket.set_linger(Some(Duration::ZERO));
+                    // `TcpStream::set_linger` est déprécié depuis tokio 1.53 :
+                    // SO_LINGER fait BLOQUER le fil à la fermeture. Ici c'est
+                    // le pair de test qui veut ce RST, pas Tune — on passe donc
+                    // par `socket2`, la voie que tokio désigne, plutôt que de
+                    // renoncer au seul moyen d'obtenir un vrai `ECONNRESET`.
+                    let _ = socket2::SockRef::from(&socket).set_linger(Some(Duration::ZERO));
                     drop(socket);
                 });
             }
@@ -1280,7 +1512,7 @@ mod stop_keeps_session_tests {
 
     #[test]
     fn notre_lecteur_est_vise_meme_derriere_une_autre_application() {
-        // `applications.first()` rendait YouTube : l'arrêt d'une zone Tune
+        // La première application venue, c'était YouTube : l'arrêt d'une zone Tune
         // quittait l'application d'un autre expéditeur.
         assert_eq!(
             plan_stop(
@@ -1297,14 +1529,21 @@ mod stop_keeps_session_tests {
     fn l_arret_ne_touche_pas_l_application_d_un_autre_expediteur() {
         assert_eq!(
             plan_stop(&[app(YOUTUBE)], DEFAULT_MEDIA_RECEIVER),
-            StopPlan::Leave,
+            StopPlan::Leave {
+                raison: SansSession::ApplicationTierce
+            },
             "YouTube occupe l'appareil : Tune n'a rien à y arrêter"
         );
     }
 
     #[test]
     fn l_arret_sur_un_appareil_au_repos_n_envoie_rien() {
-        assert_eq!(plan_stop(&[], DEFAULT_MEDIA_RECEIVER), StopPlan::Leave);
+        assert_eq!(
+            plan_stop(&[], DEFAULT_MEDIA_RECEIVER),
+            StopPlan::Leave {
+                raison: SansSession::AppareilAuRepos
+            }
+        );
     }
 
     /// Garde-fou de CONTENU, et non de comportement : l'appel part sur le fil,
@@ -1366,6 +1605,229 @@ mod stop_keeps_session_tests {
     }
 }
 
+/// #2520, troisième volet : le JOURNAL, faute de pouvoir écouter l'enceinte.
+///
+/// Le mécanisme est déjà corrigé — `plan_stop` relâche le média, `stop_app`
+/// n'a plus aucun appelant hors `vendor/`, et le garde-fou de contenu
+/// `le_module_ne_quitte_plus_l_application_du_recepteur` l'interdit. Mais
+/// l'issue porte `keep-open` + `bloque:terrain` : ce qui manque n'est pas un
+/// correctif, c'est de quoi TRANCHER chez FabienM si le carillon revient.
+///
+/// Le ticket nomme lui-même les deux questions qui décident, et auxquelles le
+/// journal d'alors ne répondait pas :
+///
+/// 1. *pourquoi* la session n'a-t-elle pas été réutilisée ? Un
+///    `session_reused=false` seul confond le défaut de Tune, un appareil laissé
+///    à YouTube et un `GET_STATUS` en échec ;
+/// 2. *combien de temps* s'est-il écoulé entre l'arrêt et la lecture ? Le
+///    Default Media Receiver se met au repos tout seul après une inactivité que
+///    personne n'a mesurée : au-delà, le carillon n'est plus notre fait.
+///
+/// Ces tests portent sur la DÉCISION et sur la MESURE, seules parties
+/// vérifiables sans matériel. Ils ne prouvent rien de l'audible.
+#[cfg(test)]
+mod journal_de_l_arret_tests {
+    use super::*;
+    use rust_cast::channels::receiver::Application;
+
+    const DEFAULT_MEDIA_RECEIVER: &str = "CC1AD845";
+    const YOUTUBE: &str = "233637DE";
+
+    fn app(app_id: &str) -> Application {
+        Application {
+            app_id: app_id.to_string(),
+            session_id: format!("session-{app_id}"),
+            transport_id: format!("transport-{app_id}"),
+            namespaces: vec![],
+            display_name: app_id.to_string(),
+            status_text: String::new(),
+        }
+    }
+
+    /// Sans trois chaînes distinctes, le champ `raison=` du journal ne
+    /// distingue rien : c'est la seule chose qu'un lecteur de journal voit.
+    #[test]
+    fn les_trois_raisons_sont_distinctes_sinon_le_journal_ne_dit_rien() {
+        let raisons = [
+            SansSession::AppareilAuRepos.raison(),
+            SansSession::ApplicationTierce.raison(),
+            SansSession::StatutIllisible.raison(),
+        ];
+        let mut uniques = raisons.to_vec();
+        uniques.sort_unstable();
+        uniques.dedup();
+        assert_eq!(
+            uniques.len(),
+            raisons.len(),
+            "deux causes qui s'écrivent pareil rendent le journal illisible : {raisons:?}"
+        );
+    }
+
+    /// L'arrêt qui n'envoie rien doit dire LEQUEL des deux cas c'était :
+    /// « l'appareil était déjà au repos » accuse le chemin de #2520, « une
+    /// autre application l'occupait » l'innocente.
+    #[test]
+    fn l_arret_sans_envoi_nomme_sa_cause() {
+        assert_eq!(
+            plan_stop(&[], DEFAULT_MEDIA_RECEIVER),
+            StopPlan::Leave {
+                raison: SansSession::AppareilAuRepos
+            }
+        );
+        assert_eq!(
+            plan_stop(&[app(YOUTUBE)], DEFAULT_MEDIA_RECEIVER),
+            StopPlan::Leave {
+                raison: SansSession::ApplicationTierce
+            }
+        );
+    }
+
+    /// La lecture qui relance l'application — donc celle qui fait carillonner
+    /// — doit nommer les TROIS causes séparément.
+    #[test]
+    fn la_lecture_qui_relance_nomme_sa_cause() {
+        assert_eq!(
+            plan_play(None, DEFAULT_MEDIA_RECEIVER),
+            PlayPlan::Launch {
+                raison: SansSession::StatutIllisible
+            },
+            "un GET_STATUS en échec n'est pas un appareil au repos"
+        );
+        assert_eq!(
+            plan_play(Some(&[]), DEFAULT_MEDIA_RECEIVER),
+            PlayPlan::Launch {
+                raison: SansSession::AppareilAuRepos
+            },
+            "c'est CE cas que le scénario de FabienM doit produire après un arrêt"
+        );
+        assert_eq!(
+            plan_play(Some(&[app(YOUTUBE)]), DEFAULT_MEDIA_RECEIVER),
+            PlayPlan::Launch {
+                raison: SansSession::ApplicationTierce
+            }
+        );
+    }
+
+    /// Non-régression : nommer la cause ne doit pas changer la DÉCISION. Tant
+    /// que `reusable_session` trouve notre application, on charge dans sa
+    /// session, sans `LAUNCH` — y compris derrière une autre application.
+    #[test]
+    fn nommer_la_cause_ne_change_pas_la_decision_de_reutiliser() {
+        for apps in [
+            vec![app(DEFAULT_MEDIA_RECEIVER)],
+            vec![app(YOUTUBE), app(DEFAULT_MEDIA_RECEIVER)],
+        ] {
+            assert_eq!(
+                plan_play(Some(&apps), DEFAULT_MEDIA_RECEIVER),
+                PlayPlan::Reuse {
+                    transport_id: "transport-CC1AD845".to_string(),
+                    session_id: "session-CC1AD845".to_string(),
+                },
+                "la réutilisation de session de #2048 doit rester intacte"
+            );
+        }
+    }
+
+    /// Le délai que le ticket réclame : « Combien de temps s'écoule entre le
+    /// Stop et la relecture ? »
+    #[test]
+    fn le_delai_depuis_l_arret_est_rendu_a_la_lecture_suivante() {
+        let clock = StopClock::default();
+        let arret = Instant::now();
+        clock.note_stop("chromecast:enfants", arret);
+
+        let age = clock
+            .take_age("chromecast:enfants", arret + Duration::from_secs(9))
+            .expect("un arrêt a été noté : la lecture suivante doit porter son délai");
+        assert_eq!(age, Duration::from_secs(9));
+    }
+
+    /// L'âge est CONSOMMÉ : `depuis_arret_ms` ne doit apparaître que sur la
+    /// PREMIÈRE lecture après un arrêt. Sur les pistes suivantes il désignerait
+    /// un arrêt qui n'a plus rien à voir, et le journal mentirait sur la seule
+    /// mesure qui tranche.
+    #[test]
+    fn le_delai_n_est_rendu_qu_a_la_premiere_lecture_apres_l_arret() {
+        let clock = StopClock::default();
+        let arret = Instant::now();
+        clock.note_stop("chromecast:enfants", arret);
+
+        assert!(
+            clock
+                .take_age("chromecast:enfants", arret + Duration::from_secs(3))
+                .is_some()
+        );
+        assert_eq!(
+            clock.take_age("chromecast:enfants", arret + Duration::from_secs(600)),
+            None,
+            "la deuxième piste d'une écoute ne suit aucun arrêt : elle ne doit porter aucun délai"
+        );
+    }
+
+    /// Une lecture qui ne suit AUCUN arrêt ne porte pas de délai — c'est le
+    /// contre-cas qui donne son sens au chiffre.
+    #[test]
+    fn une_lecture_sans_arret_prealable_ne_porte_aucun_delai() {
+        let clock = StopClock::default();
+        assert_eq!(
+            clock.take_age("chromecast:jamais-arrete", Instant::now()),
+            None
+        );
+    }
+
+    /// Deux zones Cast s'arrêtent indépendamment : l'arrêt de l'une ne doit pas
+    /// dater la lecture de l'autre.
+    #[test]
+    fn chaque_appareil_a_son_propre_arret() {
+        let clock = StopClock::default();
+        let arret = Instant::now();
+        clock.note_stop("chromecast:enfants", arret);
+
+        assert_eq!(
+            clock.take_age("chromecast:salon", arret + Duration::from_secs(1)),
+            None,
+            "le salon ne s'est pas arrêté : sa lecture ne suit pas l'arrêt des enfants"
+        );
+        assert!(
+            clock
+                .take_age("chromecast:enfants", arret + Duration::from_secs(1))
+                .is_some(),
+            "et l'arrêt des enfants doit toujours être là"
+        );
+    }
+
+    /// Garde-fou de CONTENU : les champs neufs partent bien sur les deux lignes
+    /// que le testeur relira. Aucun test ne peut observer un journal émis
+    /// depuis une commande Cast sans un vrai récepteur ; le seul témoin
+    /// rejouable est donc le source.
+    ///
+    /// Chaque marqueur est épelé en DEUX morceaux, comme
+    /// `le_module_ne_quitte_plus_l_application_du_recepteur` : sinon le test se
+    /// satisfait de sa propre chaîne et reste vert alors que le journal, lui,
+    /// ne porte plus rien.
+    #[test]
+    fn les_deux_lignes_du_journal_portent_les_champs_qui_tranchent() {
+        let source = include_str!("chromecast.rs");
+        for (ligne, champ) in [
+            (
+                "chromecast_stop",
+                concat!("decision = \"stop_sans", "_quitter\""),
+            ),
+            ("chromecast_stop", concat!("decision = \"aucun", "_envoi\"")),
+            (
+                "chromecast_play",
+                concat!("depuis_arret_ms = ?depuis", "_arret_ms"),
+            ),
+        ] {
+            assert!(
+                source.contains(champ),
+                "sans `{champ}`, la ligne `{ligne}` d'un journal de FabienM ne permet pas de \
+                 conclure (#2520)"
+            );
+        }
+    }
+}
+
 /// Regression tests for forum bug #1185: Chromecast devices presenting a
 /// self-signed X.509 **v1** certificate were rejected during the TLS
 /// handshake with `invalid peer certificate: Other(OtherError(
@@ -1373,6 +1835,137 @@ mod stop_keeps_session_tests {
 /// the stock signature-verification helpers failed before rust_cast's
 /// accept-everything `verify_server_cert` was even relevant. Fixed by the
 /// vendored rust_cast patch (vendor/rust_cast, `accept_unparseable_cert`).
+/// #2566 — le sondage d'état parlait au canal média de n'importe qui.
+///
+/// Le journal de Dimitri porte **79 échecs consécutifs** sur `media status: …`,
+/// et sur rien d'autre : les quatre étapes précédentes (`connect receiver`,
+/// `status`, `connect transport`) répondaient toutes. L'appareil était donc
+/// joignable, et une application y tournait — mais le canal média ne répondait
+/// jamais, tour après tour, pendant des dizaines de minutes.
+///
+/// `MediaChannel::get_status` attend un `MEDIA_STATUS` ou l'échéance : posée à
+/// une application qui n'implémente pas le canal média, la question ne revient
+/// pas, et la commande rend l'expiration de son budget. Une application
+/// étrangère explique donc un échec qui ne guérit jamais ; un réseau lent,
+/// non.
+///
+/// `plan_stop` (#2520) et `plan_play` (#1953) ne visent que NOTRE application
+/// depuis leurs correctifs. Les quatre commandes qui restaient — sondage,
+/// pause, reprise, déplacement — prenaient encore la première venue.
+///
+/// ⚠️ Ces tests portent sur la DÉCISION et sur le SITE. Rien ici ne prouve ce
+/// qui tournait sur l'appareil de Dimitri : le journal ne le nomme pas.
+#[cfg(test)]
+mod canal_media_de_notre_lecteur_tests {
+    use super::*;
+    use rust_cast::channels::receiver::Application;
+
+    const DEFAULT_MEDIA_RECEIVER: &str = "CC1AD845";
+    const YOUTUBE: &str = "233637DE";
+    /// L'écran de veille (« Backdrop ») d'un Chromecast. Une application de
+    /// plus qui n'est pas la nôtre : ce test ne prétend rien de ce qui tournait
+    /// chez Dimitri, il fixe la règle.
+    const BACKDROP: &str = "E8C28D3C";
+
+    fn app(app_id: &str) -> Application {
+        Application {
+            app_id: app_id.to_string(),
+            session_id: format!("session-{app_id}"),
+            transport_id: format!("transport-{app_id}"),
+            namespaces: vec![],
+            display_name: app_id.to_string(),
+            status_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn l_app_id_vise_est_celui_du_lecteur_par_defaut() {
+        assert_eq!(app_id_du_lecteur(), DEFAULT_MEDIA_RECEIVER);
+    }
+
+    #[test]
+    fn notre_lecteur_donne_son_transport() {
+        assert_eq!(
+            notre_transport(&[app(DEFAULT_MEDIA_RECEIVER)]),
+            Some("transport-CC1AD845".to_string())
+        );
+    }
+
+    #[test]
+    fn notre_lecteur_est_retrouve_derriere_une_application_tierce() {
+        assert_eq!(
+            notre_transport(&[app(YOUTUBE), app(DEFAULT_MEDIA_RECEIVER)]),
+            Some("transport-CC1AD845".to_string()),
+            "la première application venue n'est pas la nôtre"
+        );
+    }
+
+    #[test]
+    fn aucune_question_n_est_posee_a_l_ecran_de_veille() {
+        assert_eq!(
+            notre_transport(&[app(BACKDROP)]),
+            None,
+            "interroger le canal média d'une application étrangère laisse la \
+             commande courir jusqu'à l'échéance : c'est le `media status: …` \
+             répété 79 fois du journal de Dimitri (#2566)"
+        );
+    }
+
+    #[test]
+    fn un_appareil_au_repos_ne_fait_parler_personne() {
+        assert_eq!(notre_transport(&[]), None);
+    }
+
+    /// Garde de SITE, et non de comportement : les quatre commandes partent sur
+    /// le fil, aucun test ne peut les observer sans un vrai récepteur. Le seul
+    /// témoin rejouable est donc le source lui-même — même geste que
+    /// `le_module_ne_quitte_plus_l_application_du_recepteur` (#2520).
+    ///
+    /// Le marqueur est épelé en deux morceaux pour que ce test ne se contredise
+    /// pas tout seul.
+    ///
+    /// ⚠️ Sa limite, dite franchement : il interdit UNE épellation. Un chemin
+    /// réécrit autrement (`applications.iter().next()`) le laisserait vert. Il
+    /// garde la régression telle qu'elle s'est produite, pas toutes celles
+    /// qu'on pourrait inventer.
+    #[test]
+    fn aucune_commande_media_ne_part_sur_la_premiere_application_venue() {
+        let source = include_str!("chromecast.rs");
+        let marqueur = concat!("applications.", "first()");
+        assert!(
+            !source.contains(marqueur),
+            "une commande adressée au canal média de la première application \
+             venue reste sans réponse jusqu'à l'échéance (#2566) : toute \
+             commande média passe par `notre_transport`"
+        );
+    }
+
+    /// Le site guard ci-dessus n'interdit qu'une épellation ; celui-ci exige la
+    /// bonne. Les quatre commandes du canal média — sondage, pause, reprise,
+    /// déplacement — doivent toutes demander leur transport à
+    /// `notre_transport`. Une seule qui l'oublierait ferait rougir ce test
+    /// alors que le précédent resterait vert.
+    #[test]
+    fn les_quatre_commandes_media_demandent_leur_transport_au_meme_endroit() {
+        let source = include_str!("chromecast.rs");
+        // Épelé en deux morceaux : écrit d'un bloc, ce test se compterait
+        // lui-même et resterait vert sur son propre sabotage.
+        let sur_le_statut_du_recepteur = source
+            .matches(concat!("notre_transport(&", "status.applications)"))
+            .count();
+        let sur_le_sondage = source
+            .matches(concat!("notre_transport(&recv_", "status.applications)"))
+            .count();
+        assert_eq!(
+            (sur_le_statut_du_recepteur, sur_le_sondage),
+            (3, 1),
+            "pause, reprise et déplacement d'un côté, le sondage de l'autre : \
+             quatre commandes parlent au canal média, donc quatre appels à \
+             `notre_transport` (#2566)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod cast_tls_tests {
     use rust_cast::NoCertificateVerification;

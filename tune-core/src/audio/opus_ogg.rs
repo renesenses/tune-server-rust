@@ -303,15 +303,13 @@ mod tests {
         let pcm = sine_48k_stereo(seconds);
         let bytes = encode_ogg_opus(&pcm, 2, 128, 48000).expect("encode");
 
-        let dir = std::env::temp_dir().join(format!("tune-opus-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::scratch_dir("tune-opus-test");
         let path = dir.join("roundtrip.opus");
         std::fs::write(&path, &bytes).unwrap();
 
         let decoded =
             crate::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, f64::MAX)
                 .expect("decode back");
-        let _ = std::fs::remove_file(&path);
 
         assert_eq!(decoded.sample_rate, 48000);
         assert_eq!(decoded.channels, 2);
@@ -374,14 +372,12 @@ mod tests {
         let pcm = two_tone_48k_stereo(1.0, 440.0, 880.0, AMP);
         let bytes = encode_ogg_opus(&pcm, 2, 128, 48000).expect("encode");
 
-        let dir = std::env::temp_dir().join(format!("tune-opus-tones-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::scratch_dir("tune-opus-tones");
         let path = dir.join("two-tone.opus");
         std::fs::write(&path, &bytes).unwrap();
         let decoded =
             crate::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, f64::MAX)
                 .expect("decode back");
-        let _ = std::fs::remove_file(&path);
 
         assert_eq!(decoded.sample_rate, 48_000);
         assert_eq!(decoded.channels, 2);

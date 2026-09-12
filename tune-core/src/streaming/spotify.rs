@@ -1,6 +1,7 @@
 use reqwest::Client;
 use sha2::{Digest, Sha256};
-use tracing::info;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{info, warn};
 
 use super::traits::*;
 use crate::TuneError;
@@ -9,10 +10,33 @@ const AUTH_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const API_BASE: &str = "https://api.spotify.com/v1";
 const DEFAULT_CLIENT_ID: &str = "placeholder";
-// Spotify no longer accepts the `localhost` alias. Plain HTTP is allowed only
-// for an explicit loopback IP literal; Tune's default API port is 8888.
-// Remote installations must provide their registered HTTPS URI explicitly.
-const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8888/api/v1/streaming/spotify/callback";
+// Spotify n'accepte plus l'alias `localhost` : le HTTP en clair n'est admis
+// que pour un LITTERAL de boucle locale. C'est acquis depuis #2680 et ce
+// n'est pas ce qui change ici.
+//
+// Ce qui change, c'est le PORT. Il etait ecrit en dur a 8888 — le defaut de
+// Tune — alors que `TUNE_PORT` le deplace et que le serveur ecoute la ou on
+// le lui dit (`tune-server/src/bootstrap.rs:289`, `config.port`). Une
+// installation sur un autre port envoyait donc a Spotify une URI nommant un
+// port ou rien ne repond : l'autorisation aboutit et retombe sur le vide.
+// C'est exactement le doute que Krugy a formule sur le fil 34 — « le port
+// Tune est bien 8888 sur mon installe » — face a un defaut qui, a l'epoque,
+// en nommait un autre. Le port se DERIVE de celui qu'on ecoute.
+//
+// Cette valeur doit par ailleurs etre declaree A L'IDENTIQUE dans le tableau
+// de bord de l'application Spotify de l'utilisateur, et Tune ne peut pas le
+// faire a sa place : `GET /api/v1/system/env` la publie donc telle qu'elle
+// partira, pour qu'elle soit recopiable sans la deviner.
+//
+// Une installation distante reste tenue de fournir son URI HTTPS enregistree
+// (configuration explicite ou variable) : rien ici ne la devine.
+pub const DEFAULT_API_PORT: u16 = 8888;
+const REDIRECT_PATH: &str = "/api/v1/streaming/spotify/callback";
+
+/// L'URI de redirection par defaut d'un serveur qui ecoute sur `api_port`.
+pub fn default_redirect_uri(api_port: u16) -> String {
+    format!("http://127.0.0.1:{api_port}{REDIRECT_PATH}")
+}
 const SCOPES: &str = "user-read-private user-library-read playlist-read-private playlist-modify-private playlist-modify-public";
 
 pub struct SpotifyService {
@@ -26,6 +50,15 @@ pub struct SpotifyService {
     redirect_uri: String,
     token_expires: Option<std::time::Instant>,
     enabled_override: Option<bool>,
+    /// Posé par un appel HTTP qui s'est vu refuser le jeton (401).
+    ///
+    /// Les quatre méthodes HTTP prennent `&self` : elles ne peuvent pas
+    /// rafraîchir sur place comme le fait Tidal (dont l'état de jetons vit
+    /// derrière un `Mutex`). Ce drapeau est le relais : il transporte le refus
+    /// jusqu'au prochain `refresh_if_needed`, qui a `&mut self`. Sans lui, un
+    /// jeton révoqué produisait des 401 indéfiniment sans que rien ne tente
+    /// de le renouveler.
+    token_rejected: AtomicBool,
 }
 
 impl Default for SpotifyService {
@@ -34,26 +67,45 @@ impl Default for SpotifyService {
     }
 }
 
-fn resolve_redirect_uri(
+/// Ordre de priorite, inchange : configuration explicite, puis
+/// `TUNE_SPOTIFY_REDIRECT_URI`, puis l'ancienne `SPOTIFY_REDIRECT_URI`, puis
+/// le defaut derive du port ecoute.
+pub fn resolve_redirect_uri(
     explicit: Option<&str>,
     tune_env: Option<String>,
     legacy_env: Option<String>,
+    api_port: u16,
 ) -> String {
     explicit
         .filter(|uri| !uri.is_empty())
         .map(str::to_owned)
         .or_else(|| tune_env.filter(|uri| !uri.is_empty()))
         .or_else(|| legacy_env.filter(|uri| !uri.is_empty()))
-        .unwrap_or_else(|| DEFAULT_REDIRECT_URI.into())
+        .unwrap_or_else(|| default_redirect_uri(api_port))
+}
+
+/// L'URI que Tune enverra REELLEMENT a Spotify, lue depuis l'environnement du
+/// processus — la meme resolution que celle appliquee a la construction du
+/// service, au meme endroit, pour qu'une page de support ne puisse pas en
+/// afficher une autre (#2680).
+pub fn effective_redirect_uri(explicit: Option<&str>, api_port: u16) -> String {
+    resolve_redirect_uri(
+        explicit,
+        std::env::var("TUNE_SPOTIFY_REDIRECT_URI").ok(),
+        std::env::var("SPOTIFY_REDIRECT_URI").ok(),
+        api_port,
+    )
 }
 
 impl SpotifyService {
     pub fn new() -> Self {
-        Self::with_config(None, None)
+        Self::with_config(None, None, DEFAULT_API_PORT)
     }
 
-    /// Create a SpotifyService with explicit client_id and redirect_uri from TuneConfig.
-    pub fn with_config(client_id: Option<&str>, redirect_uri: Option<&str>) -> Self {
+    /// Create a SpotifyService with explicit client_id and redirect_uri from
+    /// TuneConfig. `api_port` est le port REELLEMENT ecoute : il ne sert qu'au
+    /// defaut, et n'ecrase jamais une URI explicite (#2680).
+    pub fn with_config(client_id: Option<&str>, redirect_uri: Option<&str>, api_port: u16) -> Self {
         let client_id = client_id
             .filter(|id| !id.is_empty())
             .map(str::to_owned)
@@ -62,11 +114,7 @@ impl SpotifyService {
                     .or_else(|_| std::env::var("SPOTIFY_CLIENT_ID"))
                     .unwrap_or_else(|_| DEFAULT_CLIENT_ID.into())
             });
-        let redirect_uri = resolve_redirect_uri(
-            redirect_uri,
-            std::env::var("TUNE_SPOTIFY_REDIRECT_URI").ok(),
-            std::env::var("SPOTIFY_REDIRECT_URI").ok(),
-        );
+        let redirect_uri = effective_redirect_uri(redirect_uri, api_port);
         Self {
             client: crate::http::client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -81,6 +129,16 @@ impl SpotifyService {
             redirect_uri,
             token_expires: None,
             enabled_override: None,
+            token_rejected: AtomicBool::new(false),
+        }
+    }
+
+    /// Enregistre un refus de jeton pour que le prochain tick le rafraîchisse.
+    ///
+    /// Appelé depuis les méthodes HTTP, qui n'ont que `&self` — d'où l'atomique.
+    fn note_token_rejected(&self) {
+        if !self.token_rejected.swap(true, Ordering::Relaxed) {
+            warn!("spotify_token_rejected_refresh_scheduled");
         }
     }
 
@@ -125,6 +183,7 @@ impl SpotifyService {
             .map_err(|e| format!("spotify api: {e}"))?;
 
         if resp.status() == 401 {
+            self.note_token_rejected();
             return Err("token expired".into());
         }
         resp.json().await.map_err(|e| format!("spotify json: {e}"))
@@ -247,6 +306,7 @@ impl SpotifyService {
             .await
             .map_err(|e| format!("spotify put: {e}"))?;
         if resp.status() == 401 {
+            self.note_token_rejected();
             return Err("token expired".into());
         }
         if !resp.status().is_success() {
@@ -266,6 +326,7 @@ impl SpotifyService {
             .await
             .map_err(|e| format!("spotify delete: {e}"))?;
         if resp.status() == 401 {
+            self.note_token_rejected();
             return Err("token expired".into());
         }
         if !resp.status().is_success() {
@@ -290,6 +351,7 @@ impl SpotifyService {
             .await
             .map_err(|e| format!("spotify post: {e}"))?;
         if resp.status() == 401 {
+            self.note_token_rejected();
             return Err("token expired".into());
         }
         if !resp.status().is_success() {
@@ -353,6 +415,7 @@ impl StreamingService for SpotifyService {
             let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
             self.token_expires =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(expires_in));
+            self.token_rejected.store(false, Ordering::Relaxed);
             let me = self.api_get("/me").await.ok();
             self.username = me
                 .as_ref()
@@ -384,6 +447,8 @@ impl StreamingService for SpotifyService {
         self.refresh_token = None;
         self.username = None;
         self.user_id = None;
+        self.token_expires = None;
+        self.token_rejected.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -670,14 +735,12 @@ impl StreamingService for SpotifyService {
     }
 
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
-        let needs_refresh = self
-            .token_expires
-            .map(|exp| {
-                exp.checked_duration_since(std::time::Instant::now())
-                    .map(|d| d.as_secs() < 300)
-                    .unwrap_or(true)
-            })
-            .unwrap_or(false);
+        let needs_refresh = spotify_needs_refresh(
+            self.token_expires,
+            self.access_token.is_some(),
+            self.refresh_token.is_some(),
+            self.token_rejected.load(Ordering::Relaxed),
+        );
 
         if !needs_refresh {
             return Ok(false);
@@ -710,6 +773,7 @@ impl StreamingService for SpotifyService {
             let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
             self.token_expires =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(expires_in));
+            self.token_rejected.store(false, Ordering::Relaxed);
             info!("spotify_token_refreshed");
             Ok(true)
         } else {
@@ -734,8 +798,15 @@ impl StreamingService for SpotifyService {
             self.refresh_token = tokens["refresh_token"].as_str().map(Into::into);
             self.username = tokens["username"].as_str().map(Into::into);
             self.user_id = tokens["user_id"].as_str().map(Into::into);
-            self.token_expires =
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+            // L'échéance reste `None` : la ligne persistée ne dit ni quand le
+            // jeton a été émis ni combien de temps il vit (`save_tokens`
+            // n'écrit que les jetons et l'identité). Inventer `now + 3600`
+            // faisait croire au rafraîchisseur qu'un jeton peut-être mort
+            // depuis des jours était valide, et le neutralisait 55 minutes.
+            // `spotify_needs_refresh` traite `None` comme « rafraîchir » —
+            // même convention que Tidal et YouTube.
+            self.token_expires = None;
+            self.token_rejected.store(false, Ordering::Relaxed);
             true
         } else {
             false
@@ -747,6 +818,37 @@ impl StreamingService for SpotifyService {
             self.username = me["display_name"].as_str().map(Into::into);
             self.user_id = me["id"].as_str().map(Into::into);
         }
+    }
+}
+
+/// Décide si le jeton d'accès doit être renouvelé.
+///
+/// `expires == None` signifie « échéance inconnue », l'état d'un jeton relu
+/// depuis la base au démarrage : `save_tokens` n'écrit ni la date d'émission ni
+/// la durée de vie. Convention alignée sur Tidal (`tidal.rs`,
+/// `refresh_if_needed`) et YouTube (`youtube.rs`, `token_needs_refresh`) : une
+/// échéance inconnue **déclenche** un rafraîchissement, elle ne vaut pas
+/// « valide ».
+///
+/// Spotify faisait exactement l'inverse : `None` ⇒ ne jamais rafraîchir, ce qui
+/// forçait `restore_tokens` à inventer `now + 3600`. Le rafraîchisseur
+/// périodique était alors neutralisé 55 minutes après chaque redémarrage, et
+/// aucun 401 ne rattrapait — d'où le `rejected`, posé par les méthodes HTTP.
+fn spotify_needs_refresh(
+    expires: Option<std::time::Instant>,
+    has_access: bool,
+    has_refresh: bool,
+    rejected: bool,
+) -> bool {
+    if rejected {
+        return has_access && has_refresh;
+    }
+    match expires {
+        Some(exp) => exp
+            .checked_duration_since(std::time::Instant::now())
+            .map(|d| d.as_secs() < 300)
+            .unwrap_or(true),
+        None => has_access && has_refresh,
     }
 }
 
@@ -778,11 +880,60 @@ mod tests {
     #[test]
     fn spotify_default_redirect_uses_the_tune_port_and_an_explicit_loopback() {
         assert_eq!(
-            resolve_redirect_uri(None, None, None),
+            resolve_redirect_uri(None, None, None, DEFAULT_API_PORT),
             "http://127.0.0.1:8888/api/v1/streaming/spotify/callback"
         );
-        assert!(!DEFAULT_REDIRECT_URI.contains("localhost"));
-        assert!(!DEFAULT_REDIRECT_URI.contains(":8085/"));
+        let defaut = default_redirect_uri(DEFAULT_API_PORT);
+        assert!(!defaut.contains("localhost"));
+        assert!(!defaut.contains(":8085/"));
+    }
+
+    /// #2680 — le defaut SUIT le port ecoute.
+    ///
+    /// Un serveur demarre avec `TUNE_PORT=9000` envoyait a Spotify une URI en
+    /// 8888 : l'autorisation renvoie alors le navigateur vers un port ou rien
+    /// n'ecoute. Le port n'est pas une constante, c'est une mesure.
+    #[test]
+    fn spotify_default_redirect_follows_the_port_actually_listened_on() {
+        assert_eq!(
+            resolve_redirect_uri(None, None, None, 9000),
+            "http://127.0.0.1:9000/api/v1/streaming/spotify/callback"
+        );
+        assert_eq!(
+            resolve_redirect_uri(None, None, None, 8085),
+            "http://127.0.0.1:8085/api/v1/streaming/spotify/callback"
+        );
+        // L'hote reste un litteral de boucle locale a tout port : c'est la
+        // seule forme que Spotify accepte encore en HTTP clair.
+        for port in [80u16, 8085, 8888, 9000, 65535] {
+            let uri = default_redirect_uri(port);
+            assert!(uri.starts_with("http://127.0.0.1:"), "{uri}");
+            assert!(!uri.contains("localhost"), "{uri}");
+            assert!(
+                uri.ends_with("/api/v1/streaming/spotify/callback"),
+                "le chemin de callback ne doit jamais changer : {uri}"
+            );
+        }
+    }
+
+    /// Le port ne doit JAMAIS deplacer une URI que l'exploitant a ecrite.
+    ///
+    /// Une installation distante declare son URI HTTPS enregistree ; en
+    /// deriver le port la casserait a chaque changement de `TUNE_PORT`.
+    #[test]
+    fn spotify_port_never_overrides_an_explicit_redirect() {
+        assert_eq!(
+            resolve_redirect_uri(Some("https://tune.example/cb"), None, None, 9000),
+            "https://tune.example/cb"
+        );
+        assert_eq!(
+            resolve_redirect_uri(None, Some("https://env.example/cb".into()), None, 9000),
+            "https://env.example/cb"
+        );
+        assert_eq!(
+            resolve_redirect_uri(None, None, Some("https://old.example/cb".into()), 9000),
+            "https://old.example/cb"
+        );
     }
 
     #[test]
@@ -791,11 +942,11 @@ mod tests {
         let legacy_env = Some("https://env-legacy.example/callback".into());
 
         assert_eq!(
-            resolve_redirect_uri(None, tune_env.clone(), legacy_env.clone()),
+            resolve_redirect_uri(None, tune_env.clone(), legacy_env.clone(), DEFAULT_API_PORT),
             "https://env-tune.example/callback"
         );
         assert_eq!(
-            resolve_redirect_uri(None, None, legacy_env.clone()),
+            resolve_redirect_uri(None, None, legacy_env.clone(), DEFAULT_API_PORT),
             "https://env-legacy.example/callback"
         );
         assert_eq!(
@@ -803,6 +954,7 @@ mod tests {
                 Some("https://config.example/callback"),
                 tune_env,
                 legacy_env,
+                DEFAULT_API_PORT,
             ),
             "https://config.example/callback"
         );
@@ -813,6 +965,7 @@ mod tests {
         let svc = SpotifyService::with_config(
             Some("client-test"),
             Some("https://tune.example/api/v1/streaming/spotify/callback"),
+            DEFAULT_API_PORT,
         );
         let url = svc.auth_url("challenge-test");
 
@@ -979,6 +1132,127 @@ mod tests {
         let mut svc = SpotifyService::new();
         let tokens = json!({"nothing": "here"});
         assert!(!svc.restore_tokens(&tokens));
+    }
+
+    // ------------------------------------------------------------------
+    // #2851 — le jeton restauré ne doit plus être cru valide une heure
+    // ------------------------------------------------------------------
+
+    /// Le défaut du ticket : `restore_tokens` fabriquait `now + 3600` pour un
+    /// jeton dont il ignore l'âge. La ligne persistée ne porte aucune date —
+    /// l'échéance doit rester inconnue.
+    #[test]
+    fn spotify_restauration_laisse_l_echeance_inconnue() {
+        let mut svc = SpotifyService::new();
+        assert!(svc.restore_tokens(&json!({
+            "access_token": "at",
+            "refresh_token": "rt",
+        })));
+        assert!(
+            svc.token_expires.is_none(),
+            "#2851 : la restauration ne doit inventer aucune échéance — \
+             rien dans la ligne persistée ne dit quand le jeton a été émis"
+        );
+    }
+
+    /// Conséquence directe : au premier tick du rafraîchisseur (300 s), le
+    /// jeton restauré est renouvelé au lieu d'être cru bon 55 minutes.
+    #[test]
+    fn spotify_echeance_inconnue_declenche_le_rafraichissement() {
+        let mut svc = SpotifyService::new();
+        assert!(svc.restore_tokens(&json!({
+            "access_token": "at",
+            "refresh_token": "rt",
+        })));
+        assert!(
+            spotify_needs_refresh(
+                svc.token_expires,
+                svc.access_token.is_some(),
+                svc.refresh_token.is_some(),
+                svc.token_rejected.load(Ordering::Relaxed),
+            ),
+            "#2851 : échéance inconnue ⇒ rafraîchir, comme Tidal et YouTube — \
+             la convention inverse neutralisait le rafraîchisseur périodique"
+        );
+    }
+
+    /// TÉMOIN anti-régression : un jeton réellement valide n'est PAS
+    /// rafraîchi inutilement. Vert avec comme sans le correctif.
+    #[test]
+    fn spotify_jeton_valide_n_est_pas_rafraichi() {
+        let dans_une_heure = Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        assert!(
+            !spotify_needs_refresh(dans_une_heure, true, true, false),
+            "un jeton valide une heure encore ne doit pas être renouvelé"
+        );
+    }
+
+    /// TÉMOIN : la marge de 300 s existante est préservée.
+    #[test]
+    fn spotify_marge_de_cinq_minutes_preservee() {
+        let bientot = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert!(spotify_needs_refresh(bientot, true, true, false));
+        let deja_passe = Some(std::time::Instant::now());
+        assert!(spotify_needs_refresh(deja_passe, true, true, false));
+    }
+
+    /// TÉMOIN : sans jeton de rafraîchissement, on ne boucle pas sur un
+    /// renouvellement impossible à chaque tick.
+    #[test]
+    fn spotify_sans_refresh_token_aucun_rafraichissement() {
+        assert!(!spotify_needs_refresh(None, true, false, false));
+        assert!(!spotify_needs_refresh(None, false, true, false));
+    }
+
+    /// Second volet du ticket : les quatre méthodes HTTP retombaient en
+    /// `Err("token expired")` sur un 401 sans que rien ne tente un
+    /// renouvellement. Le refus est désormais relayé jusqu'au tick suivant.
+    #[test]
+    fn spotify_401_programme_un_rafraichissement() {
+        let svc = SpotifyService::new();
+        assert!(
+            !svc.token_rejected.load(Ordering::Relaxed),
+            "aucun refus au départ"
+        );
+
+        // Ce que fait chacune des quatre méthodes HTTP en voyant un 401.
+        svc.note_token_rejected();
+
+        assert!(svc.token_rejected.load(Ordering::Relaxed));
+        let dans_une_heure = Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        assert!(
+            spotify_needs_refresh(dans_une_heure, true, true, true),
+            "#2851 : un 401 doit déclencher un renouvellement même si \
+             l'échéance en mémoire prétend que le jeton est encore bon"
+        );
+    }
+
+    /// Le refus relayé ne peut pas provoquer un renouvellement impossible.
+    #[test]
+    fn spotify_401_sans_refresh_token_ne_boucle_pas() {
+        assert!(!spotify_needs_refresh(None, true, false, true));
+    }
+
+    /// Se déconnecter efface le refus et l'échéance : la session suivante
+    /// repart d'un état neuf.
+    #[tokio::test]
+    async fn spotify_logout_efface_le_refus_et_l_echeance() {
+        let mut svc = SpotifyService::new();
+        svc.access_token = Some("at".into());
+        svc.refresh_token = Some("rt".into());
+        svc.token_expires = Some(std::time::Instant::now());
+        svc.note_token_rejected();
+
+        svc.logout().await.unwrap();
+
+        assert!(svc.token_expires.is_none());
+        assert!(!svc.token_rejected.load(Ordering::Relaxed));
+        assert!(!spotify_needs_refresh(
+            svc.token_expires,
+            svc.access_token.is_some(),
+            svc.refresh_token.is_some(),
+            svc.token_rejected.load(Ordering::Relaxed),
+        ));
     }
 
     #[test]

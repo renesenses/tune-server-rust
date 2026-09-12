@@ -29,6 +29,14 @@ pub struct MockOutput {
     play_calls: Arc<Mutex<Vec<PlayCall>>>,
     stop_calls: Arc<AtomicU64>,
     set_next_calls: Arc<Mutex<Vec<PlayCall>>>,
+    /// Chaque `set_volume` REÇUE, dans l'ordre (#2395).
+    ///
+    /// Le volume courant seul ne peut pas répondre à « l'appareil a-t-il reçu
+    /// une commande ? » : une consigne à la valeur déjà en place ne change
+    /// rien d'observable, et trois commandes identiques se lisent comme une.
+    /// C'est pourtant exactement la question du mode bit-perfect, où le défaut
+    /// était de RENVOYER 100 % à chaque piste à un appareil déjà à 100 %.
+    volume_calls: Arc<Mutex<Vec<f64>>>,
 }
 
 impl MockOutput {
@@ -48,6 +56,7 @@ impl MockOutput {
             play_calls: Arc::new(Mutex::new(Vec::new())),
             stop_calls: Arc::new(AtomicU64::new(0)),
             set_next_calls: Arc::new(Mutex::new(Vec::new())),
+            volume_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -89,8 +98,77 @@ impl MockOutput {
         self.set_next_calls.lock().await.len()
     }
 
+    /// Les commandes de volume reçues, dans l'ordre (#2395).
+    pub async fn volume_calls(&self) -> Vec<f64> {
+        self.volume_calls.lock().await.clone()
+    }
+
+    /// Combien de commandes de volume l'appareil a REÇUES (#2395).
+    ///
+    /// `0` est une réponse utile, et c'est même la plus fréquente ici : elle
+    /// prouve qu'aucune commande n'est partie, ce qu'un volume courant à 0,5
+    /// ne prouverait pas.
+    pub async fn volume_call_count(&self) -> usize {
+        self.volume_calls.lock().await.len()
+    }
+
     pub async fn last_play_url(&self) -> Option<String> {
         self.play_calls.lock().await.last().map(|c| c.url.clone())
+    }
+
+    /// Les titres passes a `set_next_media`, DANS L'ORDRE (#3026).
+    ///
+    /// Le COMPTE d'appels ne dit pas *quelle* piste a ete armee, et l'URL d'un
+    /// flux local est un identifiant de session opaque. Le titre est ce que le
+    /// renderer recoit dans ses metadonnees, donc ce que l'ecran doit nommer :
+    /// c'est la seule grandeur qui permette de comparer « ce qui part au
+    /// renderer » a « ce que la file affiche ».
+    pub async fn set_next_titles(&self) -> Vec<String> {
+        self.set_next_calls
+            .lock()
+            .await
+            .iter()
+            .map(|c| c.title.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// Les titres passes a `play_media`, DANS L'ORDRE.
+    pub async fn play_titles(&self) -> Vec<String> {
+        self.play_calls
+            .lock()
+            .await
+            .iter()
+            .map(|c| c.title.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// L'URI que le renderer joue reellement.
+    pub async fn current_uri(&self) -> Option<String> {
+        self.current_uri.lock().await.clone()
+    }
+
+    /// Le TITRE de ce que le renderer joue reellement, retrouve par l'URI telle
+    /// qu'elle lui a ete donnee. C'est la correspondance qui manque au journal
+    /// de #3026 : l'ecran doit nommer le flux physiquement en cours, pas un
+    /// index de file.
+    pub async fn current_title(&self) -> Option<String> {
+        let uri = self.current_uri.lock().await.clone()?;
+        let joue = self
+            .play_calls
+            .lock()
+            .await
+            .iter()
+            .find(|c| c.url == uri)
+            .and_then(|c| c.title.clone());
+        if joue.is_some() {
+            return joue;
+        }
+        self.set_next_calls
+            .lock()
+            .await
+            .iter()
+            .find(|c| c.url == uri)
+            .and_then(|c| c.title.clone())
     }
 
     pub async fn last_next_url(&self) -> Option<String> {
@@ -169,6 +247,10 @@ impl OutputTarget for MockOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        // La consigne est enregistrée TELLE QUE REÇUE, avant le clamp : le
+        // journal des commandes doit dire ce que l'appareil a reçu, pas ce
+        // qu'un mock bienveillant en a fait.
+        self.volume_calls.lock().await.push(volume);
         *self.volume.lock().await = volume.clamp(0.0, 1.0);
         Ok(())
     }

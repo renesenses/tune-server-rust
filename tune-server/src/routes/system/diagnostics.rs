@@ -6,7 +6,6 @@ use serde_json::{Value, json};
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
-use tune_core::db::migrations;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 
@@ -142,6 +141,354 @@ const BUG_REPORT_SUBMIT_URL: &str = "https://mozaiklabs.fr/api/v1/community/bug-
 /// The community endpoint caps the thread body at 50k chars; keep headroom.
 const BUG_REPORT_MAX_BODY_CHARS: usize = 49_000;
 
+/// Relevé de la famine de l'anneau audio, sortie par sortie (#3205).
+///
+/// Ce qui est compté : un rappel du pilote à qui l'anneau a rendu MOINS
+/// d'échantillons qu'il n'en demandait, le reste étant parti en zéros vers le
+/// DAC. C'est un trou audible, et il dit qu'un PRODUCTEUR n'a pas suivi —
+/// réseau, décodage, convolution.
+///
+/// 🔴 Il ne capture PAS l'ordonnancement du noyau, contrairement à ce que ce
+/// commentaire affirmait : sur un XRun, cpal saute le rappel de données, donc
+/// l'anneau reste plein et ce compteur ne bouge pas. `driver_underruns`, plus
+/// bas, est le chiffre qui voit cet incident-là.
+///
+/// Ce qui n'est PAS compté ici : l'« underrun » ALSA que cpal remonte en
+/// `StreamError` et que la sortie locale laisse délibérément passer sans
+/// démonter le flux (« ALSA underruns are routine »). Celui-là parle du
+/// PILOTE, pas de l'anneau ; il est routinier, et additionné au précédent il
+/// rendrait le chiffre inexploitable. Les deux vivent sous deux noms
+/// distincts, ici comme dans le contrat de sortie.
+///
+/// Pourquoi ce chiffre existe : Tune OS paie le Secure Boot et un dépôt COPR
+/// non signé pour un noyau `PREEMPT_RT` dont le bénéfice n'a jamais été
+/// mesuré. Avec un anneau de deux secondes et une garde de 500 ms, une latence
+/// d'ordonnancement de quelques millisecondes est invisible ; ce qui se voit,
+/// c'est le nombre de fois où le rappel a manqué de données. S'il reste à zéro
+/// une semaine sur un parc réel en noyau standard, le noyau RT est un coût
+/// sans gain.
+///
+/// `try_lock` et non `lock` : un diagnostic ne doit jamais attendre derrière
+/// une sortie en train de jouer — même choix que la section OAAT du rapport de
+/// bogue.
+async fn releve_famine_anneau(state: &AppState) -> Vec<Value> {
+    let outputs = state.outputs.lock().await;
+    outputs
+        .list()
+        .iter()
+        .filter_map(|id| {
+            let output = outputs.get(id)?;
+            let output = output.try_lock().ok()?;
+            let famine = output.ring_starvation()?;
+            Some(json!({
+                "output_id": id,
+                "output_name": output.name(),
+                "ring_starvation_events": famine.events,
+                "ring_starvation_missing_samples": famine.missing_samples,
+                "driver_underruns": famine.driver_underruns,
+                "served_samples": famine.served_samples,
+                "stream_ms": famine.stream_ms,
+            }))
+        })
+        .collect()
+}
+
+/// #3479 — ce que l'étage d'égalisation PRODUIT, et pas seulement ce qu'il
+/// annonce.
+///
+/// `eq_change_journal` (v0.9.141) et `duree_ms` / `amortissement` (v0.9.145)
+/// mesurent l'INSTALLATION de l'étage : famille de sortie, format avant et
+/// après, pré-gain, premier échec. Reivax66 en a déposé 25 lignes, toutes
+/// concordantes — `premier_echec="-"`, `format_avant == format_apres`, aucune
+/// famine d'anneau — pendant que son symptôme était « l'égaliseur coupe le son
+/// mais n'interrompt pas la lecture ».
+///
+/// Ces deux faits ne se contredisent pas : ils portent sur deux choses
+/// différentes. Un étage qui s'installe sans erreur peut rendre du **silence**
+/// échantillon par échantillon, et `EqProcessor` sait exactement quand cela
+/// arrive — `process_interleaved` compte `non_finite_samples` et remet le
+/// sample à zéro (`audio/eq.rs`). Une cascade de biquads devenue instable
+/// (coefficients extrêmes, Q élevé à cadence basse) produit des `NaN` en
+/// chaîne : l'anneau reste alimenté, servi à l'heure, et le DAC reçoit des
+/// zéros. C'est le seul mécanisme INTERNE à l'étage qui rende exactement le
+/// symptôme décrit.
+///
+/// Ce compteur existe depuis longtemps et atteint déjà
+/// `/zones/{id}/signal-path`. Mais le rapport de diagnostic — **ce que le
+/// testeur dépose** — ne le portait pas, et aucune ligne de journal ne le dit
+/// non plus. Il était donc mesuré et illisible, exactement comme la famine de
+/// l'anneau avant #3205.
+///
+/// ⚠️ Un `0` ici n'innocente pas l'égaliseur : il écarte le repliement sur
+/// zéro, pas un pré-gain mal calculé ni un étage en aval. Il retire une
+/// hypothèse de la liste, ce qui est tout ce qu'on lui demande.
+///
+/// ⚠️ **Ce que ce chiffre compte, exactement.** `process_stats` compte depuis
+/// la construction de l'`EqProcessor`. Sur le chemin `local_a_chaud`, un
+/// processeur neuf est bâti à chaque cran de curseur — sept en 1,5 s dans
+/// l'export de Reivax66 — et `inherit_state_from` lui transmet désormais les
+/// compteurs avec l'historique des filtres, faute de quoi le nombre repartait
+/// de zéro au moment même que le ticket décrit. Il reste remis à zéro quand la
+/// **forme** de la cascade change (une bande qui sort par `is_neutral()`,
+/// un changement de nombre de canaux) et à chaque nouvelle piste : ce n'est
+/// alors plus le même étage.
+///
+/// `try_lock` et non `lock`, même raison que [`releve_famine_anneau`] : un
+/// diagnostic n'attend jamais derrière une sortie en train de jouer.
+async fn releve_dsp_egaliseur(state: &AppState) -> Vec<Value> {
+    let outputs = state.outputs.lock().await;
+    outputs
+        .list()
+        .iter()
+        .filter_map(|id| {
+            let output = outputs.get(id)?;
+            let output = output.try_lock().ok()?;
+            let metriques = output.dsp_metrics()?;
+            Some(json!({
+                "output_id": id,
+                "output_name": output.name(),
+                "eq_overs": metriques.eq_overs,
+                "eq_non_finite_samples": metriques.eq_non_finite_samples,
+            }))
+        })
+        .collect()
+}
+
+/// CLD-3 — les reports 429 du cloud, lisibles dans le rapport.
+///
+/// Quand mozaiklabs.fr répond 429, chaque portée (`CloudScope`) retient ses
+/// appels jusqu'à l'échéance ; jusqu'ici seul `/cloud/telemetry/status` le
+/// disait, et personne ne le lisait. Le rapport de diagnostic est ce que le
+/// testeur colle sur le forum : une bio qui n'arrive pas, une proposition de
+/// métadonnées qui n'est pas envoyée, doivent pouvoir se lire comme « portée
+/// retenue encore N secondes », pas comme une panne muette. `remaining_seconds`
+/// est borné à zéro : une échéance passée n'est pas une dette négative.
+fn rapport_des_reports_cloud(
+    actifs: &[tune_core::cloud::rate_limit::ActiveCloudBackoff],
+    maintenant_epoch: u64,
+) -> Value {
+    let portees: Vec<Value> = actifs
+        .iter()
+        .map(|a| {
+            json!({
+                "scope": a.scope,
+                "until_epoch": a.until_epoch,
+                "remaining_seconds": a.until_epoch.saturating_sub(maintenant_epoch),
+                "retry_after_seconds": a.retry_after_seconds,
+            })
+        })
+        .collect();
+    json!({
+        "count": portees.len(),
+        "scopes": portees,
+    })
+}
+
+fn maintenant_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ── DUP-1, phase 0 — doublons présumés de zones, en LECTURE SEULE ───────────
+
+/// Ce que le diagnostic a besoin de savoir d'une zone. Projection de `Zone`
+/// pour que la règle se teste sans base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ZoneVue {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) output_type: String,
+    pub(crate) output_device_id: String,
+    pub(crate) online: bool,
+}
+
+pub(crate) fn zone_vue(z: &tune_core::db::zone_repo::Zone) -> Option<ZoneVue> {
+    Some(ZoneVue {
+        id: z.id?,
+        name: z.name.clone(),
+        output_type: z.output_type.clone().unwrap_or_default(),
+        output_device_id: z.output_device_id.clone()?,
+        online: z.online,
+    })
+}
+
+/// L'adresse IPv4 d'un identifiant AirPlay historique `airplay-<ip>-<port>`.
+fn ip_d_identifiant_airplay(reste: &str) -> Option<&str> {
+    let (hote, _port) = reste.rsplit_once('-')?;
+    let quatre =
+        hote.split('.').count() == 4 && hote.chars().all(|c| c.is_ascii_digit() || c == '.');
+    quatre.then_some(hote)
+}
+
+/// La clé d'APPAREIL d'une zone : ce qui reste quand on retire ce qui
+/// n'identifie rien (mesure du 05/09 sur .18) :
+/// - UPnP : `uuid:` retiré, suffixe `_MR` ou `_MS` retiré, minuscules. Un
+///   Sonos annonce TROIS UDN pour un seul appareil : la racine ZonePlayer,
+///   `…_MR` (sous-appareil MediaRenderer) et `…_MS` (MediaServer). Les trois
+///   ont fait trois zones sur le serveur de test — relevé du 09/09 sur .18 :
+///   « Chambre » en 8 (racine), 6 (`_MR`) et 9 (`_MS`), « Cuisine » en 7, 11
+///   et 12. Ne retirer que `_MR` laissait la troisième hors du rapport ET
+///   inéligible à la fusion, alors que c'est le même haut-parleur ;
+/// - AirPlay historique `airplay-<ip>-<port>` : l'adresse ne dit rien de
+///   stable (l'Apple TV du 13/08 est devenue un Sonos) ; si un appareil
+///   découvert porte cette adresse ET une adresse matérielle, c'est elle la clé,
+///   sinon l'adresse IP, faute de mieux ;
+/// - AirPlay `airplay-<mac>` : l'adresse matérielle.
+///
+/// `None` pour les sorties sans identité réseau (locale, navigateur, OAAT).
+pub(crate) fn cle_appareil(
+    zone: &ZoneVue,
+    appareils: &[tune_core::discovery::device::DiscoveredDevice],
+) -> Option<String> {
+    let id = zone.output_device_id.trim();
+    if let Some(reste) = id.strip_prefix("airplay-") {
+        if let Some(ip) = ip_d_identifiant_airplay(reste) {
+            let mac = appareils
+                .iter()
+                .find(|d| d.host == ip)
+                .and_then(|d| d.mac_address.as_deref())
+                .map(|m| m.to_ascii_lowercase());
+            return Some(match mac {
+                Some(m) => format!("mac:{m}"),
+                None => format!("ip:{ip}"),
+            });
+        }
+        return Some(format!("mac:{}", reste.to_ascii_lowercase()));
+    }
+    if let Some(reste) = id.strip_prefix("uuid:") {
+        // `strip_suffix` et non `trim_end_matches` : on retire UN suffixe de
+        // sous-appareil, pas une répétition. Les deux suffixes sont ceux que
+        // Sonos annonce et rien d'autre n'est deviné — une identité qu'on ne
+        // sait pas prouver ne doit pas devenir une fusion (13/08).
+        let socle = reste
+            .strip_suffix("_MR")
+            .or_else(|| reste.strip_suffix("_MS"))
+            .unwrap_or(reste);
+        return Some(format!("udn:{}", socle.to_ascii_lowercase()));
+    }
+    None
+}
+
+/// L'hôte réseau d'une zone, pour rapprocher deux PROTOCOLES d'un même
+/// appareil (Eversolo en DLNA et en AirPlay) : l'adresse de l'appareil
+/// découvert qui porte l'identifiant, ou l'adresse contenue dans un
+/// identifiant AirPlay historique.
+fn hote_de_zone(
+    zone: &ZoneVue,
+    appareils: &[tune_core::discovery::device::DiscoveredDevice],
+) -> Option<String> {
+    if let Some(d) = appareils.iter().find(|d| d.id == zone.output_device_id) {
+        return Some(d.host.clone());
+    }
+    zone.output_device_id
+        .strip_prefix("airplay-")
+        .and_then(ip_d_identifiant_airplay)
+        .map(str::to_string)
+}
+
+/// DUP-1 (phase 2) : dans un groupe, une zone hors ligne dont une jumelle est
+/// en ligne est PROBABLEMENT remplacee — l'appareil a change d'identifiant et
+/// l'ancienne ligne ne reviendra pas. C'est une proposition de fusion
+/// (`POST /zones/{doublon}/fusionner-dans/{cible}`), jamais une action, et
+/// jamais deduite de l'age seul : une zone seule, si vieille soit-elle, est
+/// eteinte, pas remplacee.
+fn groupe_json(motif: &str, cle: &str, zones: &[&ZoneVue]) -> Value {
+    let en_ligne = zones.iter().filter(|z| z.online).count();
+    // #3747 — un groupe NOMMÉ n'est pas un groupe FUSIONNABLE.
+    //
+    // `POST /zones/{doublon}/fusionner-dans/{cible}` exige que les deux zones
+    // rendent la MÊME clé `cle_appareil`, non nulle ; elle refuse tout le
+    // reste par `409 zones_distinctes`. Or la SECONDE règle de ce rapport
+    // groupe par HÔTE, et par construction aucune de ses zones ne partage de
+    // clé d'appareil avec une autre : celles qui en partagent une sont déjà
+    // sorties par la première règle, et sont dans `deja`.
+    //
+    // Un groupe « même hôte, deux protocoles » sortait donc avec exactement la
+    // forme d'une famille fusionnable, alors qu'AUCUNE action ne peut le
+    // suivre : un Eversolo vu en SSDP/DLNA et en mDNS/AirPlay est deux espaces
+    // d'identifiants disjoints. Le refus de la route est correct ; c'est le
+    // rapport qui promettait ce qu'il ne pouvait pas tenir. Il le dit
+    // maintenant lui-même, et dit POURQUOI.
+    let fusionnable = !cle.starts_with("hote:");
+    json!({
+        "motif": motif,
+        "cle": cle,
+        "en_ligne": en_ligne,
+        "fusionnable": fusionnable,
+        "fusion_refusee_motif": (!fusionnable).then_some(
+            "deux protocoles de découverte différents sur le même hôte : \
+             SSDP/DLNA et mDNS/AirPlay n'ont aucun identifiant commun, et la \
+             fusion serait refusée (409 zones_distinctes). Supprimez la zone \
+             dont vous ne voulez pas ; ses réglages ne sont pas reportés.",
+        ),
+        "zones": zones.iter().map(|z| json!({
+            "id": z.id,
+            "name": z.name,
+            "output_type": z.output_type,
+            "output_device_id": z.output_device_id,
+            "online": z.online,
+            "remplacee_probable": !z.online && en_ligne > 0,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// DUP-1, phase 0 : les groupes de zones qui désignent PROBABLEMENT le même
+/// appareil. Deux règles, dans cet ordre : même clé d'appareil (UDN ou adresse
+/// matérielle), puis même hôte sous deux protocoles. Rien n'est fusionné —
+/// les homonymes existent, une adresse se réattribue — le rapport NOMME, et
+/// l'utilisateur ou un chantier suivant tranche.
+pub(crate) fn doublons_de_zones(
+    zones: &[ZoneVue],
+    appareils: &[tune_core::discovery::device::DiscoveredDevice],
+) -> Vec<Value> {
+    use std::collections::BTreeMap;
+    let mut par_cle: BTreeMap<String, Vec<&ZoneVue>> = BTreeMap::new();
+    for z in zones {
+        if let Some(cle) = cle_appareil(z, appareils) {
+            par_cle.entry(cle).or_default().push(z);
+        }
+    }
+    let mut groupes = Vec::new();
+    let mut deja: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for (cle, zs) in &par_cle {
+        if zs.len() < 2 {
+            continue;
+        }
+        let motif = if cle.starts_with("udn:") {
+            "même appareil UPnP (UDN, suffixe _MR ou _MS retiré)"
+        } else if cle.starts_with("mac:") {
+            "même appareil AirPlay (adresse matérielle)"
+        } else {
+            "même adresse IP AirPlay (identifiant historique)"
+        };
+        deja.extend(zs.iter().map(|z| z.id));
+        groupes.push(groupe_json(motif, cle, zs));
+    }
+    let mut par_hote: BTreeMap<String, Vec<&ZoneVue>> = BTreeMap::new();
+    for z in zones {
+        if deja.contains(&z.id) {
+            continue;
+        }
+        if let Some(h) = hote_de_zone(z, appareils) {
+            par_hote.entry(h).or_default().push(z);
+        }
+    }
+    for (hote, zs) in &par_hote {
+        let types: std::collections::BTreeSet<&str> =
+            zs.iter().map(|z| z.output_type.as_str()).collect();
+        if zs.len() >= 2 && types.len() >= 2 {
+            groupes.push(groupe_json(
+                "même hôte, deux protocoles",
+                &format!("hote:{hote}"),
+                zs,
+            ));
+        }
+    }
+    groupes
+}
+
 pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let artists = ArtistRepo::with_backend(state.backend.clone())
         .count()
@@ -152,22 +499,23 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
-    let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        state
-            .db
-            .as_ref()
-            .and_then(|db| migrations::current_version(db).ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    // #3182 : lue sur le moteur ACTIF, et `null` quand elle n'est pas lisible.
+    // Le `else { 0 }` d'avant faisait dire à toute base PostgreSQL qu'elle
+    // n'avait jamais été migrée. Voir `super::version_de_schema`.
+    let db_version = super::version_de_schema(&state);
     let music_dirs = super::get_music_dirs_list(&state.backend);
     let uptime_secs = state.started_at.elapsed().as_secs();
 
     // Zone count
-    let zone_count = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let zone_count = zone_repo.count().unwrap_or(0);
+    // DUP-1 (phase 0) : les zones telles qu'elles sont, pour nommer les doublons.
+    let zones_vues: Vec<ZoneVue> = zone_repo
+        .list()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(zone_vue)
+        .collect();
 
     // Discovered devices grouped by type
     let scanner = &state.scanner;
@@ -232,12 +580,20 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     // Memory RSS
     let rss_mb = get_rss_mb();
 
-    // DB backend
-    let db_backend = settings
-        .get("db_engine")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "sqlite".into());
+    // #3205 — le seul chiffre qui dise si l'audio a réellement sauté.
+    let ring_starvation = releve_famine_anneau(&state).await;
+    // #3479 — ce que l'étage d'égalisation a réellement produit.
+    let dsp_egaliseur = releve_dsp_egaliseur(&state).await;
+
+    // DB backend — #3182.
+    //
+    // Il se lisait dans un réglage `settings.db_engine` que RIEN n'écrit :
+    // aucun `set("db_engine", …)` n'existe dans l'arbre (le seul autre point
+    // qui porte ce nom, `routes/system/config.rs`, le CALCULE déjà depuis le
+    // backend). La seule branche jamais empruntée était donc le
+    // `unwrap_or("sqlite")`, et `db_backend` — recopié dans `db.engine` plus
+    // bas — annonçait « sqlite » sur toute installation PostgreSQL.
+    let db_backend = state.backend.engine().as_str();
 
     Json(json!({
         "server_version": tune_core::version(),
@@ -255,6 +611,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "memory_rss_mb": rss_mb,
         "db_backend": db_backend,
         "active_zones": zone_count,
+        // DUP-1 (phase 0) : les zones qui désignent probablement le même appareil,
+        // nommées avec leur raison. Le rapport ne fusionne rien : sur .18 le 05/09,
+        // un Sonos, un Mac et un Eversolo avaient chacun deux zones.
+        "zones_doublons": doublons_de_zones(&zones_vues, &devices),
         // #2154 — une base incomplète ne doit plus pouvoir ignorer des
         // réglages pendant des mois sans laisser de trace dans le rapport.
         "zone_settings_ignored": tune_core::db::zone_repo::zone_settings_ignored(),
@@ -267,6 +627,18 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // sortie locale compilée.
         "audio_backend_status": audio_backend_status,
         "asio_available": asio_avail,
+        // #3205 — famine de l'anneau par sortie : `ring_starvation_events`
+        // compte les rappels comblés par des zéros, `..._missing_samples`
+        // dit combien d'échantillons ont manqué (un micro-trou et une
+        // coupure d'une seconde ne se ressemblent pas), et `served_samples`
+        // / `stream_ms` donnent le dénominateur qui rend le taux calculable.
+        // À NE PAS confondre avec l'underrun ALSA : voir `releve_famine_anneau`.
+        "ring_starvation": ring_starvation,
+        // #3479 — `eq_non_finite_samples` > 0 dit que l'étage d'égalisation a
+        // remis des échantillons à ZÉRO : c'est du silence produit par l'EQ
+        // lui-même, sur un anneau qui n'a pas eu faim. `eq_overs` dit
+        // l'inverse, la saturation. Les deux étaient mesurés et invisibles.
+        "dsp_egaliseur": dsp_egaliseur,
         // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
         // une ligne WARN que l'utilisateur ne verra jamais.
         "asio_warm_scan": crate::startup::asio_warm_status(),
@@ -282,6 +654,12 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
             "albums": albums,
             "last_result": scan_result,
         },
+        // CLD-3 — les portées cloud retenues par un 429, avec leur échéance :
+        // sans cela un enrichissement qui n'arrive pas ressemble à une panne.
+        "cloud_rate_limits": rapport_des_reports_cloud(
+            &tune_core::cloud::rate_limit::active_all(&settings),
+            maintenant_epoch(),
+        ),
         "features": tune_core::enabled_features(),
         // Legacy fields kept for backward compatibility
         "engine": "rust",
@@ -302,7 +680,12 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
             "metadata_engine": "lofty",
             "discovery_engine": "mdns-sd + socket2",
             "scanner_engine": "walkdir + rayon",
-            "db_engine": "rusqlite",
+            // #3182 : le PILOTE, pas une constante. `rusqlite` n'est même pas
+            // lié au processus quand le serveur tourne sur PostgreSQL.
+            "db_engine": match state.backend.engine() {
+                tune_core::db::engine::Engine::Sqlite => "rusqlite",
+                tune_core::db::engine::Engine::Postgres => "sqlx",
+            },
         },
     }))
 }
@@ -395,6 +778,18 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
     Json(json!({
         "discovered_devices": devices.len(),
         "registered_outputs": output_count,
+        // L'etat du canal TCP de SlimProto (port 3483). Sans ce champ, un bind
+        // refuse ne vivait que dans une ligne de journal, dans une tache
+        // detachee : le testeur n'avait AUCUN moyen de savoir que ses platines
+        // Squeezebox ne pourraient jamais se connecter (#2938). `null` tant
+        // qu'aucune tentative d'ecoute n'a eu lieu.
+        "slimproto": tune_core::slimproto::etat_ecoute(),
+        // L'etat de l'ecouteur SSDP (port 1900) et le nombre de reponses
+        // M-SEARCH emises. Sans ce champ, « Tune repond-il aux M-SEARCH ? » ne
+        // se mesurait qu'au tcpdump, chez le testeur — c'est exactement ce
+        // qu'a du faire celui de #3687. `null` tant qu'aucune liaison n'a ete
+        // tentee.
+        "ssdp": tune_core::discovery::ssdp::etat_ecoute_ssdp(),
         "devices": devices.iter().map(|d| json!({
             "id": d.id,
             "name": d.name,
@@ -528,6 +923,35 @@ const CANDIDATE_FACTOR: usize = 8;
 /// bon moment, et il etait inexploitable.
 const QUOTA_PAR_MODULE: f64 = 0.25;
 
+/// Part maximale du quota d'un module qu'un SEUL evenement peut occuper en
+/// premiere main.
+///
+/// [`QUOTA_PAR_MODULE`] a resolu le probleme d'un module qui chasse les
+/// autres. Il reste ENTIER un cran plus bas : a l'interieur d'un module, le
+/// quota se depense sur les lignes les plus RECENTES, donc sur la derniere
+/// rafale — et une rafale, par definition, repete le meme evenement.
+///
+/// Mesure sur le rapport de Reivax66 (ticket support 78, #3580, fenetre de
+/// 200 lignes couvrant 10:21 -> 10:42) : `tune_core::orchestrator` a exactement
+/// atteint son quota (50 lignes retenues, **60 ecartees**), et sur ces 50,
+/// **39 sont trois evenements repetes** — 13 `radio_local_decode_stream_connected`
+/// et 13 `radio_local_decode_started` tires d'une rafale de 200 ms, plus 13
+/// `orchestrator_play_retap_deduped_same_inflight_track` d'une autre. Les 60
+/// ecartees sont les plus ANCIENNES : celles des trois cycles de lecture qui
+/// ont echoue. Le rapport a donc jete la chaine de decision (`output_play_failed`,
+/// `initial_prebuffer_done`, `radio_proxy_transcode_for_dlna`) pour garder une
+/// rafale, et le dossier est reste inexploitable.
+///
+/// **Un huitieme** : sur une fenetre de 200, un evenement ne prend plus que 6
+/// des 50 lignes de son module en premiere main. Les trois rafales rendent 21
+/// places, et le budget du module couvre l'incident au lieu d'une seconde.
+///
+/// Ce n'est PAS un second mecanisme : c'est le meme, un cran plus bas, avec la
+/// meme reprise juste apres — voir `selectionner_lignes`, ou une ligne differee
+/// par ce quota-ci reprend la place que son module n'a pas depensee. Un module
+/// qui n'atteint pas son quota ne perd donc AUCUNE ligne, rafale comprise.
+const QUOTA_PAR_EVENEMENT: f64 = 0.125;
+
 /// Le module (`target` de tracing) d'une ligne de log, si elle en porte un.
 ///
 /// Format du writer (`fmt::layer()` par defaut, `bootstrap.rs`) :
@@ -553,8 +977,36 @@ fn module_de_la_ligne(ligne: &str) -> Option<&str> {
     Some(cible)
 }
 
+/// L'EVENEMENT d'une ligne : le premier mot du message, celui que `tracing`
+/// ecrit juste apres le module.
+///
+/// `… INFO tune_core::orchestrator: initial_prebuffer_done zone_id=5 …`
+/// rend `Some("initial_prebuffer_done")`.
+///
+/// Un nom d'evenement de ce depot est un identifiant Rust en minuscules, et il
+/// porte au moins un `_`. L'exigence n'est pas cosmetique : sans elle, un
+/// message redige en phrase — « Le renderer a acquitte Play… » — se ferait
+/// compter comme un evenement a lui tout seul et rationner a ce titre. Une
+/// ligne dont on ne sait pas nommer l'evenement rend `None` et ne repond alors
+/// que du quota de son module, exactement comme avant.
+fn evenement_de_la_ligne(ligne: &str) -> Option<&str> {
+    const NIVEAUX: [&str; 5] = [" ERROR ", " WARN ", " INFO ", " DEBUG ", " TRACE "];
+    let (_, apres) = NIVEAUX.iter().find_map(|n| ligne.split_once(n))?;
+    let mut mots = apres.split_whitespace();
+    // Le module, deja valide par `module_de_la_ligne` : on le saute.
+    let _cible = mots.next()?.strip_suffix(':')?;
+    let evenement = mots.next()?;
+    let bien_forme = evenement.len() >= 3
+        && evenement.contains('_')
+        && evenement
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    bien_forme.then_some(evenement)
+}
+
 /// Choisit `max_lines` lignes parmi `candidates`, en empechant un seul module
-/// d'occuper plus de [`QUOTA_PAR_MODULE`] de la fenetre.
+/// d'occuper plus de [`QUOTA_PAR_MODULE`] de la fenetre, ni un seul evenement
+/// plus de [`QUOTA_PAR_EVENEMENT`] du quota de son module.
 ///
 /// Deux passes, et la seconde est ce qui rend la premiere sans risque :
 ///
@@ -585,10 +1037,15 @@ fn selectionner_lignes(
     }
 
     let quota = ((max_lines as f64 * QUOTA_PAR_MODULE).floor() as usize).max(1);
+    let quota_evenement = ((quota as f64 * QUOTA_PAR_EVENEMENT).floor() as usize).max(1);
     let mut comptes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut comptes_evenement: BTreeMap<String, usize> = BTreeMap::new();
     // `Option<String>` et non l'indice : on garde la ligne retenue et, pour
     // celles mises de cote, de quoi les reprendre en seconde passe.
     let mut retenues: Vec<usize> = Vec::with_capacity(max_lines);
+    // Repoussees par le quota d'EVENEMENT (#3580). Elles ne sont pas perdues :
+    // elles repassent juste apres, sur le budget non depense de leur module.
+    let mut differees: Vec<usize> = Vec::new();
     let mut ecartees: Vec<usize> = Vec::new();
 
     for (i, ligne) in candidates.iter().enumerate().rev() {
@@ -598,6 +1055,42 @@ fn selectionner_lignes(
         match module_de_la_ligne(ligne) {
             Some(m) => {
                 let n = comptes.entry(m.to_string()).or_insert(0);
+                if *n >= quota {
+                    ecartees.push(i);
+                    continue;
+                }
+                // #3580 — le quota d'un module se depensait sur sa derniere
+                // RAFALE, qui repete le meme evenement. Une premiere main
+                // plafonnee par evenement fait couvrir l'incident au meme
+                // budget ; ce qui deborde repasse juste apres.
+                if let Some(e) = evenement_de_la_ligne(ligne) {
+                    let ne = comptes_evenement.entry(format!("{m}::{e}")).or_insert(0);
+                    if *ne >= quota_evenement {
+                        differees.push(i);
+                        continue;
+                    }
+                    *ne += 1;
+                }
+                *n += 1;
+                retenues.push(i);
+            }
+            // Non classable : jamais ecartee.
+            None => retenues.push(i),
+        }
+    }
+
+    // Reprise des differees. Le quota par evenement ne RETIRE rien a un
+    // module : il choisit seulement lesquelles de ses lignes il garde en
+    // premier. Un module qui n'a pas epuise son quota reprend donc ici toute
+    // sa rafale — c'est ce qui rend ce cran supplementaire sans risque, et
+    // c'est ce que verifie `aucun_module_ne_perd_de_ligne_par_le_quota_evenement`.
+    for i in std::mem::take(&mut differees) {
+        if retenues.len() >= max_lines {
+            break;
+        }
+        match module_de_la_ligne(&candidates[i]) {
+            Some(m) => {
+                let n = comptes.entry(m.to_string()).or_insert(0);
                 if *n < quota {
                     *n += 1;
                     retenues.push(i);
@@ -605,7 +1098,6 @@ fn selectionner_lignes(
                     ecartees.push(i);
                 }
             }
-            // Non classable : jamais ecartee.
             None => retenues.push(i),
         }
     }
@@ -1010,6 +1502,39 @@ pub(super) async fn set_log_level(
     }))
 }
 
+/// Ce qu'un rapport écrit à la place d'une version de schéma illisible.
+///
+/// Surtout pas `0` : le rapport est lu par un humain qui instruit un ticket, et
+/// `0` s'y lit « base jamais migrée ». « Inconnue » et « jamais migrée » sont
+/// deux états différents, et #3182 est né de les avoir confondus.
+const VERSION_DE_SCHEMA_INCONNUE: &str = "unknown";
+
+/// Rend une version de schéma telle qu'elle sera lue dans le markdown.
+///
+/// Fonction NUE — elle ne prend pas d'`AppState` — pour qu'une épreuve puisse
+/// la sonder sans base ; c'est le rendu qui est éprouvé, pas la condition.
+/// Ce que la ligne « Interface (web) » dit quand `web/version.json` n'existe
+/// pas. Surtout pas la version du serveur : deux numeros identiques feraient
+/// disparaitre l'ecart que #3380 existe pour rendre visible.
+const SANS_VERSION_INTERFACE: &str =
+    "inconnue (web/version.json absent : build web anterieur a #3380)";
+
+fn version_de_schema_affichee(version: Option<i32>) -> String {
+    version.map_or_else(|| VERSION_DE_SCHEMA_INCONNUE.to_string(), |v| v.to_string())
+}
+
+/// Une valeur de réglage telle qu'elle doit se LIRE dans le markdown (#2856).
+///
+/// Une chaîne perd ses guillemets JSON — `resample_policy: none`, pas
+/// `resample_policy: "none"` —, tout le reste s'écrit tel quel. Fonction NUE,
+/// éprouvable sans base ni `AppState`.
+fn valeur_lisible(valeur: &Value) -> String {
+    match valeur.as_str() {
+        Some(texte) => texte.to_string(),
+        None => valeur.to_string(),
+    }
+}
+
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
@@ -1023,16 +1548,17 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         .count()
         .unwrap_or(0);
     let uptime_secs = state.started_at.elapsed().as_secs();
-    let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        state
-            .db
-            .as_ref()
-            .and_then(|db| migrations::current_version(db).ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    // #3182 — voir `super::version_de_schema`. Ce rapport est ce que le
+    // testeur COLLE sur le forum : « Migration version: 0 » y était lu comme
+    // une base jamais migrée.
+    let db_version = super::version_de_schema(&state);
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    // #3380 — la version de l'INTERFACE. `web/` est deploye separement du
+    // binaire : sans elle, un bogue d'ecran s'instruit sans savoir quel ecran
+    // tournait. `None` quand `web/version.json` n'existe pas — JAMAIS un repli
+    // sur la version du serveur, qui rendrait l'ecart invisible.
+    let version_interface =
+        tune_core::interface_web::version_interface(&crate::config::resolve_web_dir());
     let music_dirs = super::get_music_dirs_list(&state.backend);
     let scan_status = settings
         .get("scan_status")
@@ -1063,6 +1589,25 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
     drop(outputs);
+    // Le registre des serveurs multimedia, lu ici et rendu dans la section
+    // « Network » plus bas. Trie par nom : deux rapports du meme testeur
+    // doivent se comparer ligne a ligne.
+    let mut serveurs_multimedia: Vec<(String, String, u16, bool, u64)> = {
+        let registre = state.media_servers.lock().await;
+        registre
+            .values()
+            .map(|ms| {
+                (
+                    ms.name.clone(),
+                    ms.host.clone(),
+                    ms.port,
+                    ms.is_reachable(),
+                    ms.age().as_secs(),
+                )
+            })
+            .collect()
+    };
+    serveurs_multimedia.sort();
 
     let uptime_str = format!(
         "{}d {}h {}m {}s",
@@ -1118,11 +1663,21 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     };
 
     // Build markdown text
+    let ring_starvation = releve_famine_anneau(&state).await;
+    let dsp_egaliseur = releve_dsp_egaliseur(&state).await;
     let mut md = String::new();
     md.push_str("# Tune Bug Report\n\n");
     md.push_str(&format!(
         "**Version**: {} (engine: rust)\n",
         tune_core::version()
+    ));
+    // #3380 : juste sous la version du serveur, parce que c'est la paire qui
+    // se lit — deux numeros qui divergent expliquent a eux seuls un ticket.
+    md.push_str(&format!(
+        "**Interface (web)**: {}\n",
+        version_interface
+            .as_deref()
+            .unwrap_or(SANS_VERSION_INTERFACE)
     ));
     md.push_str(&format!(
         "**Platform**: {} ({})\n",
@@ -1190,7 +1745,83 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
 
     md.push_str("## Network\n");
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
+    // #2718 et tickets support 61, 87, 97, 98 — « plus de serveurs
+    // multimedia ». « Discovered devices » ne compte QUE les renderers ; le
+    // registre des serveurs multimedia est un autre registre, et ce rapport
+    // — celui que le testeur JOINT a son ticket — n'en disait pas un mot.
+    // Quatre rapports de suite ont donc ete lus sans que la liste dont le
+    // testeur signalait la disparition y figure une seule fois.
+    md.push_str(&format!(
+        "- Serveurs multimedia: {}\n",
+        serveurs_multimedia.len()
+    ));
+    for (nom, hote, port, joignable, age) in &serveurs_multimedia {
+        md.push_str(&format!(
+            "  - {nom} — {hote}:{port} — {} — vu il y a {age} s\n",
+            if *joignable {
+                "joignable"
+            } else {
+                "INJOIGNABLE"
+            }
+        ));
+    }
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
+    // #2938 : cinq testeurs ont joint un journal ou le bind TCP 3483 echoue.
+    // La ligne existait, noyee dans le journal et en anglais ; personne ne l'a
+    // reliee a « ma platine n'apparait pas ». Ici elle est en haut du rapport,
+    // avec sa cause sondee.
+    match tune_core::slimproto::etat_ecoute() {
+        Some(etat) if !etat.ecoute => {
+            md.push_str(&format!(
+                "- **⚠ SlimProto (Squeezebox) HORS SERVICE** — port {} : {}\n",
+                etat.port,
+                etat.message.as_deref().unwrap_or("cause inconnue"),
+            ));
+            if let Some(err) = etat.erreur_systeme.as_deref() {
+                md.push_str(&format!("  - erreur systeme : {err}\n"));
+            }
+        }
+        Some(etat) => {
+            md.push_str(&format!(
+                "- SlimProto (Squeezebox): en ecoute sur {}\n",
+                etat.port
+            ));
+        }
+        None => {
+            md.push_str("- SlimProto (Squeezebox): aucune tentative d'ecoute\n");
+        }
+    }
+
+    // #3687 : un testeur a passe une soiree au tcpdump et au M-SEARCH Python
+    // pour savoir si Tune repond aux recherches SSDP. La reponse tient en une
+    // ligne, et elle est desormais ici — avec, en cas de panne, la cause.
+    match tune_core::discovery::ssdp::etat_ecoute_ssdp() {
+        Some(etat) if !etat.ecoute => {
+            md.push_str(&format!(
+                "- **⚠ Decouverte SSDP HORS SERVICE** — port {} : {}\n",
+                etat.port,
+                etat.message.as_deref().unwrap_or("cause inconnue"),
+            ));
+            if let Some(err) = etat.erreur_systeme.as_deref() {
+                md.push_str(&format!("  - erreur systeme : {err}\n"));
+            }
+        }
+        Some(etat) => {
+            md.push_str(&format!(
+                "- Decouverte SSDP: en ecoute sur {}, {} reponse(s) M-SEARCH emise(s)\n",
+                etat.port, etat.reponses_msearch
+            ));
+            if etat.echecs > 0 {
+                md.push_str(&format!(
+                    "  - {} liaison(s) refusee(s) avant reprise\n",
+                    etat.echecs
+                ));
+            }
+        }
+        None => {
+            md.push_str("- Decouverte SSDP: aucune tentative d'ecoute\n");
+        }
+    }
     md.push('\n');
 
     // #2392 : c'est CE bloc qui aurait épargné au bêta-testeur du module
@@ -1219,9 +1850,93 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         md.push('\n');
     }
 
+    // #3205 : sans cette section, une famine ne laissait AUCUNE trace dans ce
+    // que le testeur colle sur le forum — et c'est ce rapport, sur un parc
+    // réel, qui doit décider si le noyau RT de Tune OS sert à quelque chose.
+    if !ring_starvation.is_empty() {
+        md.push_str("## Ring starvation (famine de l'anneau audio)\n");
+        for s in &ring_starvation {
+            md.push_str(&format!(
+                "- {} : {} événement(s), {} échantillon(s) manquant(s) sur {} servis ({} ms de flux) ; {} sous-alimentation(s) du pilote\n",
+                s["output_name"].as_str().unwrap_or("?"),
+                s["ring_starvation_events"].as_u64().unwrap_or(0),
+                s["ring_starvation_missing_samples"].as_u64().unwrap_or(0),
+                s["served_samples"].as_u64().unwrap_or(0),
+                s["stream_ms"].as_u64().unwrap_or(0),
+                s["driver_underruns"].as_u64().unwrap_or(0),
+            ));
+        }
+        md.push_str(
+            "  (un événement = un rappel audio comblé par des zéros, donc un \
+             PRODUCTEUR en retard ; la sous-alimentation du pilote est l'autre \
+             panne — le processus pas ordonnancé à temps — et c'est elle qui \
+             décide du noyau RT de Tune OS)\n\n",
+        );
+    }
+    // #3479 : sans cette section, un etage d'egalisation qui rend du SILENCE
+    // ne laissait aucune trace dans ce que le testeur depose — ni ici, ni dans
+    // le journal. Reivax66 a fourni 25 lignes `eq_change_journal` toutes
+    // saines pendant que son son disparaissait : elles disent que l'etage
+    // s'installe, jamais ce qu'il produit.
+    if !dsp_egaliseur.is_empty() {
+        md.push_str("## DSP — egaliseur (ce que l'etage PRODUIT)\n");
+        for d in &dsp_egaliseur {
+            md.push_str(&format!(
+                "- {} : {} echantillon(s) remis a ZERO (non finis), {} saturation(s)\n",
+                d["output_name"].as_str().unwrap_or("?"),
+                d["eq_non_finite_samples"].as_u64().unwrap_or(0),
+                d["eq_overs"].as_u64().unwrap_or(0),
+            ));
+        }
+        md.push_str(
+            "  (un echantillon « remis a zero » = une cascade de biquads devenue \
+instable ; l'anneau reste alimente et le DAC recoit du silence. A ne pas \
+confondre avec la famine de l'anneau, comptee au-dessus)\n\n",
+        );
+    }
     md.push_str("## Database\n");
-    md.push_str(&format!("- Engine: sqlite\n"));
-    md.push_str(&format!("- Migration version: {db_version}\n"));
+    // #3182 : c'était `format!("- Engine: sqlite\n")` — un `format!` sans
+    // argument, donc une chaîne littérale, et toute installation PostgreSQL
+    // se déclarait SQLite dans son propre rapport. Sur le ticket 71 de
+    // jfpaquet cette ligne a failli faire écarter #3181, qui n'existe que
+    // parce que le moteur est PostgreSQL.
+    md.push_str(&format!("- Engine: {}\n", state.backend.engine()));
+    md.push_str(&format!(
+        "- Migration version: {}\n",
+        version_de_schema_affichee(db_version)
+    ));
+
+    // #2856 — le rapport ne portait AUCUNE section de réglages. Ni l'état de
+    // l'enrichissement au scan, ni le moteur audio : deux faits qu'il fallait
+    // redemander au testeur à chaque ticket de métadonnées ou de son, alors
+    // que le serveur les a sous la main. La fiche système (`/system/profile`)
+    // en portait déjà une partie ; le rapport, lui, est ce que le testeur
+    // COLLE sur le forum, et c'est là qu'on lit un ticket.
+    //
+    // La liste des réglages publiables est celle de la fiche, PARTAGÉE et non
+    // recopiée : deux listes auraient divergé, et la seconde n'aurait pas
+    // hérité de la garde qui interdit d'y faire entrer une clé secrète.
+    let reglages = super::profile::support_settings(|k| settings.get(k).ok().flatten());
+    let moteur_audio = super::profile::moteur_audio(&state);
+    md.push_str("\n## Settings\n");
+    md.push_str(&format!(
+        "- Audio backend: requested={}, active={}\n",
+        valeur_lisible(&moteur_audio["backend_requested"]),
+        valeur_lisible(&moteur_audio["backend_active"]),
+    ));
+    md.push_str(&format!(
+        "- Exclusive mode: requested={}, effective={}, forced={}{}\n",
+        valeur_lisible(&moteur_audio["exclusive_mode"]["requested"]),
+        valeur_lisible(&moteur_audio["exclusive_mode"]["effective"]),
+        valeur_lisible(&moteur_audio["exclusive_mode"]["forced"]),
+        match moteur_audio["exclusive_mode"]["detail"].as_str() {
+            Some(raison) => format!(" — {raison}"),
+            None => String::new(),
+        },
+    ));
+    for (cle, valeur) in &reglages {
+        md.push_str(&format!("- {cle}: {}\n", valeur_lisible(valeur)));
+    }
 
     // Recent logs (tail) — the single most useful part of a bug report. Reuses
     // the same collector as the /logs endpoint so the report matches what the
@@ -1249,6 +1964,9 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
 
     Json(json!({
         "version": tune_core::version(),
+        // #3380 — le champ que la telemetrie reprend et que l'admin mozaiklabs
+        // affichera a cote de `version`. `null` = interface non identifiable.
+        "ui_version": version_interface,
         "engine": "rust",
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -1274,12 +1992,24 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         "network": {
             "discovered_devices": devices.len(),
             "registered_outputs": output_count,
+            "slimproto": tune_core::slimproto::etat_ecoute(),
+            // Le pendant de la ligne markdown ci-dessus (#3687).
+            "ssdp": tune_core::discovery::ssdp::etat_ecoute_ssdp(),
         },
         "oaat_endpoints": oaat_endpoints,
+        "ring_starvation": ring_starvation,
+        // Le pendant JSON de la section markdown ci-dessus (#3479).
+        "dsp_egaliseur": dsp_egaliseur,
         "database": {
-            "engine": "sqlite",
+            // #3182 : même mensonge que la ligne markdown ci-dessus, dans le
+            // corps JSON que le client lit.
+            "engine": state.backend.engine().as_str(),
             "migration_version": db_version,
         },
+        // #2856 — les mêmes réglages que la section markdown, pour le client
+        // qui lit le JSON. Même source, donc jamais deux vérités.
+        "settings": reglages,
+        "audio": moteur_audio,
         "markdown": md,
     }))
 }
@@ -1508,9 +2238,14 @@ pub(super) async fn rearm_asio_warm_scan(
 
 /// Anonymous telemetry snapshot — returns what would be sent if telemetry
 /// is enabled. No data leaves the server unless the user explicitly opts in.
+///
+/// #3383 : `enabled` disait autrefois « le reglage vaut exactement `"true"` »,
+/// ce qui annonçait un opt-out sur une installation neuve qui n'avait rien
+/// decoche — et ignorait `TUNE_TELEMETRY`. Il dit maintenant l'etat EFFECTIF,
+/// le meme que les gardes d'envoi consultent, par le meme appel.
 pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let enabled = settings.get("telemetry_enabled").ok().flatten().as_deref() == Some("true");
+    let enabled = tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(&settings);
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
@@ -1541,14 +2276,27 @@ pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Va
     }))
 }
 
+/// #3383 — cette route ecrivait deja la bonne cle, mais personne ne la lisait :
+/// un aller-retour ferme sur lui-meme. Elle est desormais BRANCHEE, parce que
+/// `TelemetryReporter::is_enabled_for` consulte cette meme cle. Ce n'est donc
+/// plus un troisieme interrupteur mort a cote de deux autres, c'est le meme.
+///
+/// La reponse renvoie l'etat EFFECTIF et non ce qui vient d'etre demande :
+/// `TUNE_TELEMETRY=false` reste souverain, et un appelant qui rallume alors
+/// que l'exploitant a coupe doit le voir.
 pub(super) async fn telemetry_toggle(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let enabled = body["enabled"].as_bool().unwrap_or(false);
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let _ = settings.set("telemetry_enabled", if enabled { "true" } else { "false" });
-    Json(json!({ "enabled": enabled }))
+    let _ = settings.set(
+        tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY,
+        if enabled { "true" } else { "false" },
+    );
+    Json(json!({
+        "enabled": tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(&settings),
+    }))
 }
 
 pub(super) async fn api_stats(State(state): State<AppState>) -> Json<Value> {
@@ -2247,6 +2995,252 @@ mod selection_de_lignes {
         assert!(!rapport.contains("écartées"), "rien à annoncer : {rapport}");
     }
 
+    // --- #3580 : le quota d'un module se depensait sur sa derniere rafale ---
+
+    /// Une ligne telle que `tracing` l'ecrit : module, puis EVENEMENT, puis
+    /// les champs. C'est la forme reelle des journaux de terrain — celle que
+    /// `ligne_de` ci-dessus ne reproduit pas (son message est une phrase).
+    fn ligne_evt(module: &str, evenement: &str, n: usize) -> String {
+        format!(
+            "2026-09-04T10:{:02}:{:02}.000+02:00  INFO {module}: {evenement} zone_id=5 n={n}",
+            21 + n / 60,
+            n % 60
+        )
+    }
+
+    #[test]
+    fn l_evenement_est_lu_dans_la_ligne() {
+        assert_eq!(
+            evenement_de_la_ligne(&ligne_evt(
+                "tune_core::orchestrator",
+                "initial_prebuffer_done",
+                1
+            )),
+            Some("initial_prebuffer_done")
+        );
+        // Un message redige en phrase n'est PAS un evenement : le compter
+        // comme tel le ferait rationner sous un nom qui n'existe pas.
+        assert_eq!(
+            evenement_de_la_ligne(
+                "2026-09-04T10:35:00.000+02:00  WARN tune_core::outputs::dlna: Le renderer a acquitte"
+            ),
+            None
+        );
+        // Ni un mot unique sans `_` : trop de messages commencent ainsi.
+        assert_eq!(
+            evenement_de_la_ligne(
+                "2026-09-04T10:35:00.000+02:00  INFO tune_core::poller: playing zone_id=5"
+            ),
+            None
+        );
+        // Une ligne sans module n'a pas d'evenement non plus.
+        assert_eq!(evenement_de_la_ligne("    at src/main.rs:42"), None);
+    }
+
+    /// Le journal de Reivax66 (ticket support 78, #3580), dans ses proportions
+    /// MESUREES sur le `diagnostic.md` recu : fenetre de 200 lignes couvrant
+    /// 10:21 -> 10:42, `tune_core::orchestrator` retenu a exactement 50 lignes
+    /// et **60 ecartees** — et sur les 50 retenues, **39 etaient trois
+    /// evenements repetes** tires de deux rafales de quelques centaines de ms.
+    ///
+    /// Ce que le rapport a donc jete : la chaine de decision des TROIS cycles
+    /// de lecture qui ont echoue (`radio_proxy_transcode_for_dlna`,
+    /// `initial_prebuffer_done`, `output_play_failed`). Sans elle, on ne peut
+    /// pas savoir ce que contenait l'URI envoyee au Denon ni a quel moment —
+    /// c'est-a-dire exactement la question du ticket.
+    fn journal_de_reivax66() -> Vec<String> {
+        let mut v = Vec::new();
+
+        // --- Les 60 plus ANCIENNES lignes du module : c'est ce que le
+        // rapport a jete. Trois cycles de lecture qui echouent, noyes dans le
+        // bavardage de la meme periode.
+        for cycle in 0..3usize {
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "radio_proxy_transcode_for_dlna",
+                cycle,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "initial_prebuffer_done",
+                cycle,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "output_play_failed",
+                cycle,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "orchestrator_play",
+                cycle,
+            ));
+        }
+        for i in 0..48 {
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "radio_local_decode_started",
+                i,
+            ));
+        }
+
+        // --- Les 50 plus RECENTES : celles que le quota gardait, et dont 39
+        // sont trois evenements repetes, tires de deux rafales.
+        for i in 0..13 {
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "radio_local_decode_stream_connected",
+                i,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "radio_local_decode_started",
+                100 + i,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "orchestrator_play_retap_deduped_same_inflight_track",
+                i,
+            ));
+        }
+        for i in 0..2 {
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "initial_prebuffer_done",
+                50 + i,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "orchestrator_play",
+                50 + i,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "output_play_sent",
+                50 + i,
+            ));
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "playback_timing",
+                50 + i,
+            ));
+        }
+        for i in 0..3 {
+            v.push(ligne_evt(
+                "tune_core::orchestrator",
+                "radio_proxy_transcode_for_dlna",
+                50 + i,
+            ));
+        }
+
+        // --- Le reste de la fenetre : deux modules qui, eux, la remplissent
+        // largement. Sans eux le quota ne mordrait pas, et le defaut ne se
+        // reproduirait pas.
+        for i in 0..100 {
+            v.push(ligne_evt(
+                "tune_core::outputs::local",
+                "local_audio_device_found",
+                i,
+            ));
+        }
+        for i in 0..200 {
+            v.push(ligne_evt(
+                "tune_core::http::streamer",
+                "radio_stream_session_created",
+                i,
+            ));
+        }
+        v
+    }
+
+    /// Compte les lignes du rapport dont l'EVENEMENT est exactement `e`.
+    ///
+    /// `contains` ne suffit pas : `orchestrator_play` est un prefixe de
+    /// `orchestrator_play_retap_deduped_same_inflight_track`, et un temoin qui
+    /// confond les deux ne mesure rien.
+    fn compte_evenement(rapport: &str, e: &str) -> usize {
+        rapport
+            .lines()
+            .filter(|l| evenement_de_la_ligne(l) == Some(e))
+            .count()
+    }
+
+    #[test]
+    fn le_rapport_de_reivax66_garde_la_chaine_de_decision() {
+        let rapport = lignes_utiles_pour_un_rapport(&journal_de_reivax66().join("\n"), 200);
+
+        // Le budget du module est INCHANGE : 50 lignes, son quota. Ce temoin
+        // n'achete rien avec des lignes en plus — il depense les memes
+        // autrement.
+        assert_eq!(
+            rapport
+                .lines()
+                .filter(|l| module_de_la_ligne(l) == Some("tune_core::orchestrator"))
+                .count(),
+            50,
+            "le quota du module a bouge, ce n'est plus la meme mesure :\n{rapport}"
+        );
+
+        // LE point du ticket : sans ces trois evenements, on ne peut pas dire
+        // ce que Tune a envoye au renderer, ni a quel moment.
+        assert_eq!(
+            compte_evenement(&rapport, "output_play_failed"),
+            3,
+            "les trois echecs de lecture sont de nouveau absents du rapport :\n{rapport}"
+        );
+        assert_eq!(
+            compte_evenement(&rapport, "initial_prebuffer_done"),
+            5,
+            "le prebuffer des cycles en echec manque :\n{rapport}"
+        );
+        assert_eq!(
+            compte_evenement(&rapport, "radio_proxy_transcode_for_dlna"),
+            6,
+            "l'origine des flux servis au renderer manque :\n{rapport}"
+        );
+    }
+
+    /// Le garde-fou du cran supplementaire, et le plus important des deux :
+    /// un module qui n'atteint PAS son quota ne doit perdre aucune ligne, meme
+    /// quand toutes ses lignes sont le meme evenement.
+    ///
+    /// Le cas est reel : dans le meme rapport, `tune_core::outputs::dlna` tient
+    /// 21 lignes pour un quota de 50, dont **8 `dlna_play_acquitte_mais_pas_
+    /// applique_relance`** — les lignes qui NOMMENT le defaut. Un plafond par
+    /// evenement applique sans reprise en aurait supprime deux.
+    #[test]
+    fn aucun_module_ne_perd_de_ligne_par_le_quota_evenement() {
+        let mut v = Vec::new();
+        for i in 0..8 {
+            v.push(ligne_evt(
+                "tune_core::outputs::dlna",
+                "dlna_play_acquitte_mais_pas_applique_relance",
+                i,
+            ));
+        }
+        for i in 0..13 {
+            v.push(ligne_evt("tune_core::outputs::dlna", "dlna_set_uri_ok", i));
+        }
+        // Un bavard a cote, pour que la fenetre soit effectivement disputee.
+        for i in 0..400 {
+            v.push(ligne_evt(
+                "tune_core::http::streamer",
+                "radio_stream_session_created",
+                i,
+            ));
+        }
+        let rapport = lignes_utiles_pour_un_rapport(&v.join("\n"), 200);
+        assert_eq!(
+            rapport
+                .lines()
+                .filter(|l| l.contains("dlna_play_acquitte_mais_pas_applique_relance"))
+                .count(),
+            8,
+            "le quota par evenement a mange des lignes d'un module qui n'avait \
+             pas epuise le sien :\n{rapport}"
+        );
+    }
+
     #[test]
     fn le_niveau_filtre_toujours_avant_le_quota() {
         // L'ordre compte : plafonner d'abord laisserait du DEBUG occuper un
@@ -2319,6 +3313,438 @@ mod fournisseurs_de_sortie {
         assert_eq!(
             section_fournisseurs_de_sortie(&serde_json::json!({ "providers": [] })),
             ""
+        );
+    }
+}
+
+/// #3182 — « inconnue » n'est pas `0`.
+#[cfg(test)]
+mod version_de_schema_rendue {
+    use super::*;
+
+    /// Le distinguo qui fait tout le défaut : une version illisible s'écrit en
+    /// toutes lettres, jamais en `0`. `0` est une version PLAUSIBLE — celle
+    /// d'une base neuve jamais migrée — et c'est exactement ainsi que le
+    /// rapport de jfpaquet a été lu sur sa base de 77 291 pistes.
+    #[test]
+    fn une_version_illisible_ne_se_rend_pas_en_zero() {
+        let rendu = version_de_schema_affichee(None);
+        assert_ne!(rendu, "0");
+        assert_eq!(rendu, VERSION_DE_SCHEMA_INCONNUE);
+        // Et le rendu ne doit pas être un nombre : un lecteur qui compare
+        // « la version annoncée » à un numéro attendu doit buter dessus.
+        assert!(
+            rendu.parse::<i64>().is_err(),
+            "« {rendu} » se lit comme un numéro de migration"
+        );
+    }
+
+    /// La contre-épreuve : une version connue se rend telle quelle, `0`
+    /// compris. Une base SQLite neuve EST à la version 0, et le rapport doit
+    /// pouvoir le dire — c'est la lecture, pas le chiffre, qui était fausse.
+    #[test]
+    fn une_version_connue_se_rend_telle_quelle() {
+        assert_eq!(version_de_schema_affichee(Some(0)), "0");
+        assert_eq!(version_de_schema_affichee(Some(49)), "49");
+    }
+}
+
+#[cfg(test)]
+mod tests_reports_cloud {
+    use super::rapport_des_reports_cloud;
+    use tune_core::cloud::rate_limit::ActiveCloudBackoff;
+
+    /// CLD-3 : chaque portée retenue est nommée avec son échéance et le temps
+    /// restant ; une échéance passée rend zéro, jamais un négatif ; sans
+    /// report, `count` vaut zéro et la liste existe (le client n'a pas à
+    /// deviner l'absence).
+    #[test]
+    fn le_rapport_nomme_les_portees_retenues_et_borne_le_restant() {
+        let maintenant = 1_700_000_000u64;
+        let actifs = [
+            ActiveCloudBackoff {
+                scope: "bios_artists_read",
+                until_epoch: maintenant + 90,
+                retry_after_seconds: 120,
+            },
+            ActiveCloudBackoff {
+                scope: "telemetry",
+                until_epoch: maintenant - 5,
+                retry_after_seconds: 60,
+            },
+        ];
+        let r = rapport_des_reports_cloud(&actifs, maintenant);
+        assert_eq!(r["count"], 2);
+        assert_eq!(r["scopes"][0]["scope"], "bios_artists_read");
+        assert_eq!(r["scopes"][0]["remaining_seconds"], 90);
+        assert_eq!(r["scopes"][0]["retry_after_seconds"], 120);
+        assert_eq!(
+            r["scopes"][1]["remaining_seconds"], 0,
+            "une échéance passée n'est pas une dette"
+        );
+
+        let vide = rapport_des_reports_cloud(&[], maintenant);
+        assert_eq!(vide["count"], 0);
+        assert!(vide["scopes"].as_array().is_some_and(|v| v.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod tests_doublons_de_zones {
+    use super::{ZoneVue, cle_appareil, doublons_de_zones};
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    fn zone(id: i64, name: &str, t: &str, dev: &str, online: bool) -> ZoneVue {
+        ZoneVue {
+            id,
+            name: name.into(),
+            output_type: t.into(),
+            output_device_id: dev.into(),
+            online,
+        }
+    }
+
+    /// DUP-1 (phase 2) : « remplacée » ne vient que d'une jumelle en ligne.
+    /// Le Sonos hors ligne dont l'UDN racine est en ligne est probablement
+    /// remplacé ; deux zones d'un même appareil toutes deux hors ligne ne le
+    /// sont pas ; une zone seule n'apparaît même pas.
+    #[test]
+    fn remplacee_probable_ne_vient_que_d_une_jumelle_en_ligne() {
+        let zones = vec![
+            zone(
+                6,
+                "Chambre",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400_MR",
+                false,
+            ),
+            zone(
+                8,
+                "Chambre - Sonos",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400",
+                true,
+            ),
+            zone(30, "Bureau", "dlna", "uuid:BUREAU_MR", false),
+            zone(31, "Bureau - Node", "dlna", "uuid:BUREAU", false),
+            zone(12, "Lindemann", "dlna", "uuid:LINDEMANN", false),
+        ];
+        let groupes = doublons_de_zones(&zones, &[]);
+        let drapeau = |id: i64| {
+            groupes
+                .iter()
+                .flat_map(|g| g["zones"].as_array().cloned().unwrap_or_default())
+                .find(|z| z["id"].as_i64() == Some(id))
+                .map(|z| z["remplacee_probable"].as_bool().unwrap_or(false))
+        };
+        assert_eq!(
+            drapeau(6),
+            Some(true),
+            "hors ligne, jumelle en ligne : remplacée probable"
+        );
+        assert_eq!(drapeau(8), Some(false), "la jumelle en ligne ne l'est pas");
+        assert_eq!(
+            drapeau(30),
+            Some(false),
+            "deux zones hors ligne : éteintes, pas remplacées"
+        );
+        assert_eq!(drapeau(31), Some(false));
+        assert_eq!(drapeau(12), None, "une zone seule n'est pas un doublon");
+    }
+
+    /// La mesure du 05/09 sur .18, rejouée : le Sonos (UDN et UDN `_MR`), le
+    /// Mac (identifiant IP historique et adresse matérielle), l'Eversolo en
+    /// DLNA et en AirPlay ; le Lindemann et le décodeur restent seuls.
+    #[test]
+    fn les_doublons_de_dix_huit_sont_nommes_et_les_zones_seules_laissees() {
+        let zones = vec![
+            zone(
+                6,
+                "Chambre",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400_MR",
+                false,
+            ),
+            zone(
+                8,
+                "Chambre - Sonos Play:1",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400",
+                true,
+            ),
+            zone(
+                20,
+                "Mac Studio",
+                "airplay",
+                "airplay-76:4D:00:C0:BD:51",
+                false,
+            ),
+            zone(4, "Mac13,1", "airplay", "airplay-192.168.1.41-7000", true),
+            zone(
+                10,
+                "Eversolo DMP-A8",
+                "dlna",
+                "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE",
+                true,
+            ),
+            zone(
+                2,
+                "eversolo,1",
+                "airplay",
+                "airplay-192.168.1.17-5500",
+                true,
+            ),
+            zone(
+                13,
+                "Lindemann",
+                "dlna",
+                "uuid:e92cc83b-3083-4239-9b17-1026d9344dcc",
+                false,
+            ),
+            zone(
+                17,
+                "Décodeur TV UHD",
+                "dlna",
+                "uuid:00ababad-7947-1048-8a00-5cb13ebb9dd4",
+                true,
+            ),
+            zone(15, "Cet ordinateur", "browser", "", true),
+        ];
+        let mut mac = DiscoveredDevice::new(
+            "airplay-76:4D:00:C0:BD:51".into(),
+            "Mac Studio".into(),
+            OutputType::Airplay,
+            "192.168.1.41".into(),
+            7000,
+        );
+        mac.mac_address = Some("76:4D:00:C0:BD:51".into());
+        let eversolo = DiscoveredDevice::new(
+            "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE".into(),
+            "Eversolo".into(),
+            OutputType::Dlna,
+            "192.168.1.17".into(),
+            49152,
+        );
+        let appareils = vec![mac, eversolo];
+
+        let groupes = doublons_de_zones(&zones, &appareils);
+        let ids = |g: &serde_json::Value| -> Vec<i64> {
+            g["zones"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|z| z["id"].as_i64().unwrap())
+                .collect()
+        };
+        assert_eq!(groupes.len(), 3, "{groupes:#?}");
+        assert!(
+            groupes[0]["motif"]
+                .as_str()
+                .unwrap()
+                .contains("adresse matérielle")
+        );
+        assert_eq!(ids(&groupes[0]), [20, 4]);
+        assert_eq!(groupes[0]["en_ligne"], 1);
+        assert!(groupes[1]["motif"].as_str().unwrap().contains("UDN"));
+        assert_eq!(ids(&groupes[1]), [6, 8]);
+        assert_eq!(groupes[2]["motif"], "même hôte, deux protocoles");
+        assert_eq!(ids(&groupes[2]), [10, 2]);
+        let tous: Vec<i64> = groupes.iter().flat_map(ids).collect();
+        for seul in [13, 17, 15] {
+            assert!(!tous.contains(&seul), "la zone {seul} est seule");
+        }
+    }
+
+    /// La clé d'appareil : `_MR` et `uuid:` s'effacent, l'adresse IP se résout
+    /// en adresse matérielle quand un appareil découvert la porte, sinon reste
+    /// une adresse ; une sortie locale n'a pas de clé.
+    #[test]
+    fn la_cle_d_appareil_retire_ce_qui_n_identifie_rien() {
+        let z = |dev: &str| zone(1, "z", "dlna", dev, true);
+        assert_eq!(
+            cle_appareil(&z("uuid:RINCON_ABC_MR"), &[]).as_deref(),
+            Some("udn:rincon_abc")
+        );
+        assert_eq!(
+            cle_appareil(&z("uuid:RINCON_ABC"), &[]).as_deref(),
+            Some("udn:rincon_abc")
+        );
+        assert_eq!(
+            cle_appareil(&z("airplay-AA:BB:CC:DD:EE:FF"), &[]).as_deref(),
+            Some("mac:aa:bb:cc:dd:ee:ff")
+        );
+        assert_eq!(
+            cle_appareil(&z("airplay-192.168.1.37-7000"), &[]).as_deref(),
+            Some("ip:192.168.1.37")
+        );
+        assert_eq!(cle_appareil(&z("local:hw:0,0"), &[]), None);
+        assert_eq!(cle_appareil(&z("oaat:1081bb7a"), &[]), None);
+    }
+    /// Les TROIS UDN d'un Sonos ne font qu'un appareil, donc un seul groupe.
+    ///
+    /// Relevé du 09/09 sur .18 (`tune_v2.db`) : « Chambre » existe en racine
+    /// (id 8), en `_MR` (id 6) et en `_MS` (id 9) ; « Cuisine » en 7, 11 et
+    /// 12. Tant que seul `_MR` était retiré, la ligne `_MS` n'était ni nommée
+    /// par le rapport ni fusionnable par la route : elle restait à l'écran
+    /// sans aucun moyen de la faire disparaître sans perdre ses réglages.
+    #[test]
+    fn les_trois_udn_d_un_sonos_ne_font_qu_un_seul_groupe() {
+        let z = |dev: &str| zone(1, "z", "dlna", dev, true);
+        for suffixe in ["", "_MR", "_MS"] {
+            assert_eq!(
+                cle_appareil(&z(&format!("uuid:RINCON_B8E937B44D0801400{suffixe}")), &[])
+                    .as_deref(),
+                Some("udn:rincon_b8e937b44d0801400"),
+                "suffixe {suffixe:?}"
+            );
+        }
+        // Un suffixe qui n'est pas un sous-appareil Sonos ne s'efface pas :
+        // deux appareils différents ne doivent pas se retrouver dans le même
+        // groupe parce que leur UDN finit pareil.
+        assert_eq!(
+            cle_appareil(&z("uuid:ABC_MZ"), &[]).as_deref(),
+            Some("udn:abc_mz")
+        );
+        let zones = vec![
+            zone(8, "Chambre", "dlna", "uuid:RINCON_B8E937B44D0801400", true),
+            zone(
+                6,
+                "Chambre",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400_MR",
+                false,
+            ),
+            zone(
+                9,
+                "Chambre - Sonos Play:1 Media Renderer",
+                "dlna",
+                "uuid:RINCON_B8E937B44D0801400_MS",
+                false,
+            ),
+        ];
+        let groupes = doublons_de_zones(&zones, &[]);
+        assert_eq!(groupes.len(), 1, "{groupes:#?}");
+        let mut ids: Vec<i64> = groupes[0]["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|z| z["id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [6, 8, 9], "les trois lignes sont un seul appareil");
+    }
+
+    /// La garde de `fusionner_zones`, recalculée ici : les deux zones doivent
+    /// rendre la MÊME clé d'appareil, non nulle. Tout le reste est
+    /// `409 zones_distinctes`.
+    ///
+    /// Le témoin ne relit donc pas le drapeau qu'il vient de poser : il
+    /// compare `fusionnable` à ce que la ROUTE ferait.
+    fn la_route_accepterait(groupe: &serde_json::Value, appareils: &[DiscoveredDevice]) -> bool {
+        let zones: Vec<ZoneVue> = groupe["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|z| {
+                zone(
+                    z["id"].as_i64().unwrap(),
+                    z["name"].as_str().unwrap(),
+                    z["output_type"].as_str().unwrap(),
+                    z["output_device_id"].as_str().unwrap(),
+                    z["online"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        let cles: Vec<Option<String>> = zones.iter().map(|z| cle_appareil(z, appareils)).collect();
+        cles[0].is_some() && cles.iter().all(|c| *c == cles[0])
+    }
+
+    /// #3747 — le rapport ne propose plus une fusion que la route refusera.
+    ///
+    /// Mesuré le 09/09 : un Eversolo vu en DLNA (SSDP, `uuid:…`) et en AirPlay
+    /// (mDNS, `airplay-<MAC>`) sort dans un groupe « même hôte, deux
+    /// protocoles ». Les deux zones ne partagent AUCUN identifiant, et la
+    /// route répond `409 zones_distinctes` — correctement. Ce qui manquait,
+    /// c'est que le rapport le dise AVANT.
+    #[test]
+    fn un_groupe_de_meme_hote_est_nomme_mais_pas_fusionnable() {
+        let zones = vec![
+            zone(
+                10,
+                "Eversolo",
+                "dlna",
+                "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE",
+                true,
+            ),
+            zone(
+                11,
+                "Eversolo",
+                "airplay2",
+                "airplay-AA:BB:CC:DD:EE:01",
+                true,
+            ),
+        ];
+        let dlna = DiscoveredDevice::new(
+            "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE".into(),
+            "Eversolo".into(),
+            OutputType::Dlna,
+            "192.168.1.17".into(),
+            49152,
+        );
+        let airplay = DiscoveredDevice::new(
+            "airplay-AA:BB:CC:DD:EE:01".into(),
+            "Eversolo".into(),
+            OutputType::Airplay,
+            "192.168.1.17".into(),
+            7000,
+        );
+        let appareils = vec![dlna, airplay];
+        let groupes = doublons_de_zones(&zones, &appareils);
+        assert_eq!(groupes.len(), 1, "{groupes:#?}");
+        let g = &groupes[0];
+        assert!(
+            g["cle"].as_str().unwrap().starts_with("hote:"),
+            "le groupe attendu est celui de la règle par hôte : {g:#?}"
+        );
+        assert!(
+            !la_route_accepterait(g, &appareils),
+            "prémisse du témoin : la route DOIT refuser ce groupe"
+        );
+        assert_eq!(
+            g["fusionnable"],
+            serde_json::json!(false),
+            "un groupe que la route refuse ne doit pas être annoncé fusionnable : {g:#?}"
+        );
+        assert!(
+            g["fusion_refusee_motif"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("zones_distinctes"),
+            "le refus doit être nommé, pas laissé à deviner : {g:#?}"
+        );
+    }
+
+    /// L'autre sens, et il est indispensable : un groupe RÉELLEMENT
+    /// fusionnable reste annoncé fusionnable, et sans motif de refus. Sans ce
+    /// témoin, poser `fusionnable: false` partout resterait vert.
+    #[test]
+    fn un_groupe_de_meme_appareil_reste_fusionnable() {
+        let zones = vec![
+            zone(8, "Chambre", "dlna", "uuid:RINCON_ABC", true),
+            zone(6, "Chambre", "dlna", "uuid:RINCON_ABC_MR", false),
+        ];
+        let groupes = doublons_de_zones(&zones, &[]);
+        assert_eq!(groupes.len(), 1, "{groupes:#?}");
+        let g = &groupes[0];
+        assert!(
+            la_route_accepterait(g, &[]),
+            "prémisse du témoin : la route DOIT accepter ce groupe"
+        );
+        assert_eq!(g["fusionnable"], serde_json::json!(true), "{g:#?}");
+        assert_eq!(
+            g["fusion_refusee_motif"],
+            serde_json::Value::Null,
+            "rien à refuser, donc aucun motif : {g:#?}"
         );
     }
 }

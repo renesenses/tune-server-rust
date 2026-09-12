@@ -55,7 +55,7 @@ impl OutputRegistry {
             .collect()
     }
 
-    /// Like [`conflicting_outputs`], but also requires the conflicting output to
+    /// Like [`conflicting_outputs`](Self::conflicting_outputs), but also requires the conflicting output to
     /// live on the same `host` (case-insensitive). This is the precise
     /// "genuinely the same physical device seen both ways" test: an LMS
     /// Squeezebox player and that same LMS's UPnP-bridge DLNA renderer report

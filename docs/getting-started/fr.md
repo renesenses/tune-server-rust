@@ -27,6 +27,31 @@ brew install tune-server
 brew services start tune-server
 ```
 
+### Debian / Ubuntu (paquet .deb)
+
+Télécharger `tune-server_<version>_amd64.deb` (ou `_arm64.deb` pour un
+Raspberry Pi) depuis [GitHub Releases](https://github.com/renesenses/tune-server-rust/releases), puis :
+
+```bash
+sudo apt install ./tune-server_<version>_amd64.deb
+```
+
+Le service démarre tout seul et se relance au redémarrage de la machine.
+Indiquer ensuite les dossiers de musique dans `/etc/default/tune-server` :
+
+```bash
+sudo nano /etc/default/tune-server     # TUNE_MUSIC_DIRS=/srv/musique
+sudo systemctl restart tune-server
+journalctl -u tune-server -f
+```
+
+> Requiert Debian 12 ou Ubuntu 22.04 au minimum (glibc 2.35). Sur une base plus
+> ancienne, `apt` refuse l'installation avec un message clair plutôt que de
+> laisser un serveur à moitié fonctionnel.
+
+Détails (emplacements, mise à jour, désinstallation) :
+`/usr/share/doc/tune-server/README.Debian`.
+
 ### Windows
 
 Télécharger l'installeur `.exe` depuis [GitHub Releases](https://github.com/renesenses/tune-server-rust/releases) et le lancer.
@@ -114,7 +139,7 @@ Pour jouer **la même piste sur plusieurs zones simultanément** :
 
 **Réglages → Groupes de zones → Créer un groupe**
 
-Le serveur synchronise les sorties via NTP. La latence est ajustable par zone (**Réglages → Zones → Délai de sync**).
+Seuls les points de diffusion Tune regroupés par **OAAT** partagent une horloge et reçoivent des timestamps de présentation. Les groupes de sorties DLNA, AirPlay, Chromecast ou autres permettent un pilotage commun, mais Tune ne les présente pas comme un système multiroom synchronisé. Le délai réglable par zone est une correction manuelle, pas une mesure automatique de la latence acoustique.
 
 ---
 

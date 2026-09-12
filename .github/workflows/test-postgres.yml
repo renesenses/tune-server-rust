@@ -3,16 +3,20 @@ name: Tests (PostgreSQL)
 # Dual-engine test workflow.
 #
 # The default `cargo test` covers SQLite. This workflow boots a real
-# PostgreSQL 16 server and runs the `tune-core` tests with the
-# `postgres` feature enabled. It currently only exercises the
-# PostgresDb smoke tests (ping + version); per-repo PG tests will be
-# added as repos are migrated in subsequent phases.
+# PostgreSQL 16 server and runs the `tune-core` AND `tune-server` tests with the
+# `postgres` feature enabled.
+#
+# `tune-server` depuis #3123 : c'est la que vivent les requetes des ROUTES, et
+# elles n'avaient jamais ete jouees sur PostgreSQL.
 
 on:
   push:
     branches: [main, release/v0.9, "feature/postgres-support"]
     paths:
       - "tune-core/**"
+      # #3123 : sans cette ligne, un push qui ne touche que `tune-server` ne
+      # declenchait pas ce workflow — alors qu'il porte desormais les routes.
+      - "tune-server/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/test-postgres.yml"
@@ -33,21 +37,79 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Meme classifieur que ci.yml, meme script, meme contre-epreuve. Il n'existe
+  # ici que pour armer PostgreSQL sur les PR de lot QUI TOUCHENT DU RUST, sans
+  # le rearmer sur une PR de documentation vers `batch/*`.
+  #
+  # Il ne calcule PAS `full` : ce job ne se decide plus sur le profil.
+  impact:
+    name: Impact (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.classer.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Classer le diff
+        id: classer
+        env:
+          EVENEMENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Fail-closed comme ci.yml : hors PR, base introuvable ou diff
+          # impossible, on declare l'impact Rust et le job PostgreSQL tourne.
+          if [ "$EVENEMENT" != pull_request ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git cat-file -e "$BASE_SHA^{commit}" || ! git cat-file -e "$HEAD_SHA^{commit}"; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "base du diff introuvable : impact Rust par securite"
+            exit 0
+          fi
+          if ! git diff --no-renames --name-only -z "$BASE_SHA" "$HEAD_SHA" > /tmp/chemins-pg; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "diff impossible : impact Rust par securite"
+            exit 0
+          fi
+          if bash scripts/detecter-impact-ci.sh < /tmp/chemins-pg; then
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Contre-épreuve du classifieur
+        run: bash scripts/detecter-impact-ci.sh --autotest
+
   test-postgres:
     name: Test (PostgreSQL)
-    # Une PR de correctif vers batch/* ou rc/* garde le noyau Rust de ci.yml.
-    # Cette suite revient sur la promotion vers main ou des que ci:full
-    # l'exige.
-    #
+    needs: impact
     # Consequence de la levee du filtre `paths` : toute PR vers `main` passe
     # ici, y compris une promotion `rc/* -> main` qui ne touche aucun fichier
-    # Rust. C'est exactement le trou que #2808 demandait de fermer.
+    # Rust. C'est exactement le trou que #2808 demandait de fermer, et les trois
+    # premieres clauses ci-dessous sont celles de #2808, INTACTES.
+    #
+    # La quatrieme est neuve (#3123). Une PR de correctif vers `batch/*` ou
+    # `rc/*` sautait PostgreSQL en entier : c'est la que vivent les P2, donc la
+    # que le SQL s'ecrit, et il n'etait jamais joue sur PG avant la promotion.
+    # Elle s'ajoute en UNION : rien de ce qui tournait avant ne cesse de tourner
+    # — une promotion `rc/* -> main` sans une ligne de Rust reste couverte par
+    # la deuxieme clause, comme #2808 l'exige. Ce qui s'ajoute, c'est la PR de
+    # lot qui touche du Rust. Une PR de lot qui ne touche QUE de la
+    # documentation reste hors de ce job : les quatre clauses sont fausses.
     if: >-
       github.event_name != 'pull_request'
       || (!startsWith(github.base_ref, 'batch/') && !startsWith(github.base_ref, 'rc/'))
       || contains(github.event.pull_request.labels.*.name, 'ci:full')
+      || needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45 et non 30 : le job compile et execute un paquet de plus (#3123). Mesure
+    # du 01/09/2026 — le job tenait en 6 min 21 et 6 min 31 sur les deux
+    # dernieres executions reelles, et `tune-server` ajoute une compilation
+    # froide de ~4 min. Un plafond ne peut que faire echouer plus tot.
+    timeout-minutes: 45
 
     services:
       postgres:
@@ -80,8 +142,17 @@ jobs:
       # PostgresDb et tout tune-core avec le meme jeu postgres+oaat que le job
       # retire de ci.yml. On ne compile donc plus deux fois le crate pour deux
       # filtres qui etaient deja inclus dans cette execution.
-      - name: Tests tune-core avec PostgreSQL
-        run: cargo test -p tune-core --no-default-features --features postgres,oaat
+      #
+      # `-p tune-server` depuis #3123. Sur une PR de lot, ce paquet n'etait
+      # compile avec la feature `postgres` par AUCUNE porte : `test` de ci.yml
+      # ne l'active pas, et `test-shipped-features`, qui l'active, est derriere
+      # `full`. Un bloc `#[cfg(feature = "postgres")]` de `tune-server` pouvait
+      # donc casser sans que rien ne rougisse avant la promotion vers main.
+      # Cout mesure sur Shrek (arbre chaud) : 4 min 47 pour tune-core seul,
+      # 5 min 36 pour les deux, soit +49 s. La compilation de `tune-server` est
+      # ensuite REUTILISEE par l'etape « Routes de tune-server » plus bas.
+      - name: Tests tune-core et tune-server avec PostgreSQL
+        run: cargo test --no-fail-fast -p tune-core -p tune-server --no-default-features --features postgres,oaat
 
       # Real-schema regression for #1706: the self-healing DDL in
       # `ensure_schema` and migration 026 can only be proven against an actual
@@ -102,14 +173,258 @@ jobs:
       - name: Schema-drift regression (#1706)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
+
+      # #2860 — « Continuer l'ecoute » et « Ajoutes recemment » sur une VRAIE
+      # base. Ces requetes vivaient dans tune-server, que ce job ne compile
+      # pas : elles n'etaient donc jouees que sur SQLite, qui tolere
+      # precisement ce que PostgreSQL refuse. Elles sont descendues dans
+      # tune-core (db/home_queries.rs) pour que cette etape les EXECUTE.
+      # Le test porte ses trois contre-epreuves : il rejoue les formes
+      # d'avant et exige l'erreur PostgreSQL litterale.
+      - name: « Continuer l'écoute » sur PostgreSQL (#2860)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2860 -- --nocapture
+
+      # #2441 — le CONTEXTE de lecture, sur une vraie base. Meme angle mort que
+      # ci-dessus, une release plus tard : les deux requetes qui portent
+      # « Continuer l'ecoute » depuis listen_history (la derniere ecoute de
+      # chaque contexte, et la resolution des albums avec leur avancement)
+      # etaient elles aussi redigees dans tune-server, que ce job ne compile
+      # pas. Descendues dans tune-core (db/home_queries.rs), elles sont
+      # desormais EXECUTEES ici. Le test exige les memes nombres que le test
+      # SQLite jumeau : 3/5, 2/5, 1/5 de disque ecoute.
+      - name: Contexte de lecture sur PostgreSQL (#2441)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2441 -- --nocapture
+
+      # #3248 -- l'INSERT conditionnel sterile, sur une VRAIE base.
+      #
+      # Les temoins de #3248 existent depuis le 03/09 et sont declares dans
+      # `tune-core/Cargo.toml`, mais AUCUNE etape ne leur posait
+      # `TUNE_TEST_PG_URL`. La seule qui les executait -- « Tests tune-core et
+      # tune-server avec PostgreSQL », plus haut -- ne pose pas la variable :
+      # les trois epreuves y prenaient leur chemin « saut annonce » a chaque
+      # execution, et seules la garde de site et la contre-epreuve SQLite
+      # tournaient vraiment. Un vert contre rien, precisement ce que le ticket
+      # demandait d'eviter. Cette etape les EXECUTE, apres les migrations.
+      #
+      # Elle est la seule porte capable de voir le defaut : sur SQLite, un
+      # INSERT conditionnel qui n'ecrit rien rend deja 0 sans erreur. C'est
+      # PostgreSQL, et lui seul, qui annulait la transaction entiere.
+      - name: INSERT conditionnel stérile sur PostgreSQL (#3248)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_insert_conditionnel_f7c250 -- --nocapture
 
       # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
       # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
       # l'autre — et refuse toute colonne que le schema neuf a et qu'aucune
       # migration n'ajoute. Sans lui, la prochaine colonne oubliee se
       # decouvrirait comme les colonnes CUE : par hasard, des mois plus tard.
+      # Restauration de sauvegarde : le volume fixe ne se rearme jamais et le
+      # volume d'une zone armee ne se propage pas (#2395, #2477). La requete
+      # `UPDATE` de `import_zones` est desormais BATIE -- elle porte ou non la
+      # colonne `volume` -- et une requete batie doit rendre le meme resultat
+      # sur les deux moteurs. Les memes scenarios tournent sur SQLite dans le
+      # job `test` de ci.yml ; sans cette etape, PostgreSQL ne les verrait pas :
+      # l'etape « Tests tune-core avec PostgreSQL » ci-dessus ne pose pas
+      # TUNE_TEST_PG_URL, donc `pg_or_skip!` y saute.
+      - name: Volume fixe et restauration de sauvegarde (#2395)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_config_backup -- --nocapture
+
       - name: Parité du schéma PG (#2111)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test -p tune-core --no-default-features --features postgres pg_schema_parity -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_schema_parity -- --nocapture
+
+      # #3715 — le garde que #2995 demandait a son point 3, ENFIN execute.
+      #
+      # Il etait ecrit depuis le 31/08/2026 et n'avait JAMAIS tourne : aucune
+      # etape ne lui posait `TUNE_TEST_PG_URL`, donc ses deux temoins prenaient
+      # leur chemin « saut annonce » a chaque execution et cargo les comptait
+      # `ok`. Un garde compile mais jamais execute est aussi trompeur qu'un
+      # garde jamais compile.
+      #
+      # Premiere execution reelle le 09/09/2026 : 13 colonnes divergentes et 2
+      # tolerances perimees. La migration 053 en convertit 3 (4 lignes sur 13),
+      # les 9 restantes sont inscrites nominativement dans `ECARTS_TOLERES` avec
+      # leur motif MESURE. Cette etape est ce qui empeche la quatorzieme.
+      #
+      # ⚠️ `--test-threads=1` : les deux temoins montent des bases jetables et
+      # les `DROP DATABASE` s'interbloquent en parallele.
+      - name: Parité des types PG/SQLite (#2995, #3715)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib pg_sqlite_type_parity -- --nocapture --test-threads=1
+
+      # #3716 — le TROISIEME axe. `queue_items` a trois redacteurs de schema en
+      # PostgreSQL ; il n'existait de porte que sur deux des trois paires.
+      # `pg_schema_parity` confronte PG_FULL_SCHEMA aux scripts numerotes,
+      # `pg_sqlite_type_parity` PostgreSQL a SQLite — aucun des deux ne regarde
+      # `ensure_schema`, qui s'execute pourtant a CHAQUE demarrage et AVANT le
+      # lanceur de migrations. Sur une base vide ce sont SES types que
+      # l'installation neuve recoit.
+      - name: Parité ensure_schema / scripts numérotés (#3716)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib pg_ensure_schema_parity -- --nocapture --test-threads=1
+
+      # #3726 — les ECRITURES, et non plus seulement les schemas.
+      #
+      # Les trois portes ci-dessus comparent des SCHEMAS entre eux. Aucune ne
+      # voit un REDACTEUR : le jour ou quelqu'un reecrit
+      # `let val: String = if online …`, le schema ne bouge pas, les trois
+      # portes restent VERTES, et l'ecriture redevient muette sur tout le parc.
+      #
+      # MESURE du 11/09/2026 sur PostgreSQL 16.15, avant correctif :
+      #   * six reglages de zone (`muted`, `online`, `gapless_enabled`,
+      #     `fixed_volume`, `autoplay_enabled`, DSP) liaient une CHAINE dans une
+      #     colonne SMALLINT/INTEGER — morts sur toute installation NATIVE ;
+      #   * `update_dsp` etait mort sur les DEUX chemins (`dsp_preset_id` est
+      #     BIGINT et recevait un `String`) ;
+      #   * NEUF des onze requetes qui touchent `zones.is_hidden` tombaient, sur
+      #     les deux chemins : `list()` se rabattait alors sur `list_all()` et
+      #     une zone SUPPRIMEE reparaissait ;
+      #   * `execute_returning_id` envoyait le SQL BRUT a PostgreSQL (la poignee
+      #     de transaction ne traduisait pas les `?`) — neuf sites de production
+      #     dont la creation de profil SSO et l'inscription locale ;
+      #   * `profiles_id_seq` restait a 1 apres le semis de la 005, donc la
+      #     toute premiere creation de profil rendait `duplicate key`.
+      #
+      # Le temoin porte ses TROIS contre-epreuves : il rejoue les formes d'avant
+      # et exige l'erreur PostgreSQL litterale. Sans cette etape il serait
+      # compile et jamais execute — le defaut meme que #3715 a mesure.
+      - name: Écritures de zone et de profil sur PostgreSQL (#3726)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib pg_3726 -- --nocapture --test-threads=1
+
+      # #3123 — les requetes de tune-server, ENFIN executees sur PostgreSQL.
+      #
+      # Toutes les etapes ci-dessus visent `tune-core`. Les 419 litteraux SQL
+      # ecrits dans `tune-server/src` (54 fichiers, comptes le 01/09/2026)
+      # n'avaient jamais tourne sur PostgreSQL, sur aucune branche, avec aucune
+      # etiquette. #2860 puis #2441 ont chacun ete refermes en DESCENDANT la
+      # requete fautive dans `tune-core` pour qu'une porte l'execute ; cette
+      # etape retire cette obligation.
+      #
+      # Le test monte un `AppState` sur le moteur PostgreSQL — le chemin exact
+      # de la production — et fait passer douze requetes HTTP par le vrai
+      # routeur, bibliotheque VIDE : l'etat ou un agregat divise par zero.
+      # `--test-threads=1` : le test vide ses tables, et les `TRUNCATE CASCADE`
+      # s'interbloquent en parallele.
+      - name: Routes de tune-server sur PostgreSQL (#3123)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_routes_serveur -- --nocapture --test-threads=1
+
+      # #3181 — les sections d'accueil qui rendaient `200 []`.
+      #
+      # L'etape ci-dessus ne verifie que le STATUT, et ces routes repondent
+      # `200` avec un corps vide quand leur requete echoue : `SELECT DISTINCT`
+      # trie sur une colonne hors liste de selection pour « Autres versions »,
+      # `is_favorite = 0` sur une colonne TEXT pour « Radios recentes ». Un
+      # test de statut y est aveugle par construction. Celui-ci seme des
+      # lignes, exige qu'elles ressortent, et compare le corps a celui rendu
+      # par le meme serveur sur SQLite — meme ensemble, meme ordre.
+      - name: Sections d'accueil de #3181 sur PostgreSQL
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_3181_sections_accueil -- --nocapture --test-threads=1
+
+      # #3182 — le rapport de diagnostic mentait sur son propre moteur.
+      #
+      # C'est la seule etape qui puisse le voir : la contre-epreuve SQLite du
+      # meme fichier tourne dans `ci.yml`, mais sur SQLite le rapport disait
+      # « sqlite » AVANT comme APRES la correction. Sans une vraie base
+      # PostgreSQL, les deux suppositions — le litteral `- Engine: sqlite` et
+      # le `else { 0 }` de la version de schema — restent invisibles a toutes
+      # les portes.
+      - name: Moteur annoncé dans le rapport de diagnostic (#3182)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_3182_moteur_annonce_dans_le_rapport -- --nocapture --test-threads=1
+
+      # #3569 -- les E2E historiques de `postgres_e2e.rs`, ENFIN executees.
+      #
+      # Quinze epreuves sur dix-neuf n'avaient jamais tourne sur AUCUNE porte.
+      # Le fichier date de la mise en place du moteur PostgreSQL ; sa doctrine
+      # ecrite en tete disait « run via scripts/pg-e2e.sh », un script qui exige
+      # Docker et que personne n'a jamais branche a la CI. Les quatre epreuves
+      # visibles (#1706, #2860, #2441, `pg_config_backup`) le sont parce qu'une
+      # etape les nomme par un filtre ; les quinze autres prenaient leur chemin
+      # « saut annonce » a chaque execution, et `cargo` les comptait `ok`.
+      #
+      # Le filtre est le NOM DU MODULE : il prend les dix-neuf d'un coup, y
+      # compris celles que les etapes ci-dessus nomment deja. Les rejouer coute
+      # quelques secondes et supprime la question « laquelle manque ».
+      #
+      # `--test-threads=1` : chaque epreuve TRUNCATE les memes tables (voir
+      # `reset_schema`), et les `TRUNCATE ... CASCADE` s'interbloquent en
+      # parallele. Meme raison que l'etape des routes plus bas.
+      - name: E2E historiques de PostgreSQL (#3569)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib postgres_e2e -- --nocapture --test-threads=1
+
+      # #3569 -- les trois temoins PostgreSQL de `tune-server` que rien
+      # n'executait : le drapeau « compilation » (#1957), la ventilation par
+      # source (#2147) et les versions par piste (#2372). Chacun porte deja une
+      # contre-epreuve SQLite qui tourne dans `ci.yml` ; c'est le versant
+      # PostgreSQL qui n'avait jamais tourne.
+      #
+      # ⚠️ TROIS etapes et non une, parce que les trois fichiers ne vivent pas
+      # dans la meme cible : #1957 est tire par l'agregateur `server_contracts`
+      # (`autotests = false`), #2147 et #2372 ont chacun leur `[[test]]`. Une
+      # cible qui ne contient pas le filtre ne rend pas d'erreur : `cargo`
+      # affiche `test result: ok. 0 passed; 620 filtered out` et l'etape est
+      # VERTE sans avoir rien execute. Premiere redaction de ce lot :
+      # `--test server_contracts i2147_pg` -- zero test, vert. C'est la garde de
+      # recensement (`derive_des_garde_fous_2816.rs`) qui l'a dit, en comptant
+      # le temoin comme toujours saute.
+      - name: Drapeau « compilation » sur PostgreSQL (#1957)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test server_contracts pg_i1957 -- --nocapture --test-threads=1
+
+      - name: Ventilation par source sur PostgreSQL (#2147)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test comptes_par_source_2147 i2147_pg -- --nocapture --test-threads=1
+
+      # #3857 — la requete groupee des comptes de sous-dossiers et le
+      # pre-filtre d'enfant direct ont DEUX ecritures : `instr`/`?n` sur
+      # SQLite, `strpos`/`$n` sur Postgres. Les neuf epreuves du fichier
+      # montent toutes `:memory:` : sans cette etape, la seconde ecriture
+      # serait compilee et JAMAIS executee.
+      - name: Comptes de sous-dossiers sur PostgreSQL (#3857)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test server_contracts pg_3857 -- --nocapture --test-threads=1
+      - name: Versions par piste sur PostgreSQL (#2372)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_2372_versions_par_piste -- --nocapture --test-threads=1
+
+      # #3256 -- ` RETURNING id` seulement la ou la colonne EXISTE, sur une
+      # VRAIE base.
+      #
+      # Meme angle mort que l'etape de #3248 : les temoins existent depuis le
+      # 03/09 et sont declares dans `tune-core/Cargo.toml`, mais aucune etape
+      # ne leur posait `TUNE_TEST_PG_URL`, donc leurs quatre epreuves
+      # prenaient leur chemin « saut annonce » a chaque execution.
+      #
+      # Aucune autre porte ne peut les remplacer. Le defaut est un
+      # `ERROR: column "id" does not exist` rendu par PostgreSQL sur les
+      # tables a clef composite (`task_runs`, `streaming_auth`) ; sur SQLite
+      # la clause n'est jamais ajoutee, donc la contre-epreuve SQLite du meme
+      # fichier reste verte AVANT comme APRES le correctif. Il faut le moteur.
+      - name: RETURNING id hors des tables à colonne id sur PostgreSQL (#3256)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_returning_id_hors_table_a_id_3256 -- --nocapture

@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use axum::Router;
     use axum::extract::State;
@@ -36,6 +36,20 @@ mod tests {
         /// SetAVTransportURI accepté, sauf si `media_info_fige` est vrai.
         current_uri: Arc<Mutex<String>>,
         media_info_fige: Arc<Mutex<bool>>,
+        /// #2749 — l'ampli HEOS en VEILLE reseau : sa pile UPnP repond deja
+        /// (SetAVTransportURI et Play sont acquittes) mais il ne tient AUCUN
+        /// media tant qu'il n'est pas sorti de veille. Les `n` premieres
+        /// lectures de `GetMediaInfo` rendent donc une `CurrentURI` VIDE.
+        media_info_vide_restants: Arc<AtomicU32>,
+        /// #3580 — l'appareil range l'URI dans `GetPositionInfo` → `TrackURI`
+        /// et laisse `GetMediaInfo` → `CurrentURI` VIDE. Rien dans la
+        /// specification AVTransport ne l'interdit, et Tune ne lisait que le
+        /// second champ.
+        uri_seulement_dans_trackuri: Arc<Mutex<bool>>,
+        /// Ce que rend `GetPositionInfo` → `TrackURI`. Vide par defaut : c'est
+        /// ce que tous les bancs anterieurs voyaient, et ils doivent continuer
+        /// a le voir.
+        track_uri: Arc<Mutex<String>>,
         /// Corps des SetAVTransportURI reçus, dans l'ordre.
         set_uri_corps: Arc<Mutex<Vec<String>>>,
         /// « Salon » (#2581) : ce renderer refuse `Play` avec le code UPnP 701
@@ -53,6 +67,40 @@ mod tests {
         oublie_le_media_une_fois: Arc<Mutex<bool>>,
         /// Nombre de `Play` REFUSÉS avec un 701.
         play_refus_701: Arc<AtomicU32>,
+        /// Le renderer ACQUITTE le premier `Play` puis refuse tous les suivants
+        /// avec un 701 — c'est le `Play` de la relance (« acquitté mais jamais
+        /// appliqué ») qui se fait refuser. Ce chemin-là repose l'URI et rejoue,
+        /// exactement comme la boucle de #2581, mais sa réponse n'était pas
+        /// relue : le refus passait pour un acquittement.
+        relance_701: Arc<Mutex<bool>>,
+        /// Nombre TOTAL d'actions SOAP reçues, tous services confondus.
+        ///
+        /// L'instrument de mesure de #2263 : le sondeur passe par `get_status`
+        /// une fois par seconde et par zone pendant toute la lecture, et ce
+        /// compteur dit combien d'actions cela coûte VRAIMENT au renderer.
+        /// Annoncer une réduction sans le lire serait une promesse.
+        actions_soap: Arc<AtomicU32>,
+        /// Position rendue par `GetPositionInfo`, en ms.
+        position_ms: Arc<AtomicU32>,
+        /// La position avance-t-elle d'une seconde à chaque `GetPositionInfo` ?
+        /// Un renderer figé (position immobile alors qu'il se dit en lecture)
+        /// est le cas que la contre-vérification doit rattraper.
+        position_avance: Arc<AtomicBool>,
+        /// Le renderer REFUSE les `SUBSCRIBE` : c'est le repli qu'on veut
+        /// pouvoir prouver, pas seulement décrire.
+        abonnement_refuse: Arc<AtomicBool>,
+        /// Le renderer refuse tout RENOUVELLEMENT (le premier `SUBSCRIBE`
+        /// passe, les suivants sont rejetés) — un appareil redémarré qui ne
+        /// connaît plus le SID.
+        renouvellement_refuse: Arc<AtomicBool>,
+        /// Nombre de `SUBSCRIBE` reçus.
+        subscribe_count: Arc<AtomicU32>,
+        /// `TransportState` que le renderer POUSSE dans son `LastChange`. Peut
+        /// différer volontairement de `transport_state`, celui qu'il rend en
+        /// SOAP : c'est le renderer qui ment par évènement.
+        etat_pousse: Arc<Mutex<String>>,
+        /// Le renderer n'émet PAS `CurrentTrackDuration` dans son `LastChange`.
+        duree_jamais_poussee: Arc<AtomicBool>,
         /// Quand c'est `Some`, `SetVolume` est REFUSÉ avec ce code UPnP.
         ///
         /// C'est la panne d'Eric (#1393, fil forum) : un renderer Diretta et un
@@ -79,15 +127,150 @@ mod tests {
                 stop_exige_pause: Arc::new(Mutex::new(false)),
                 current_uri: Arc::new(Mutex::new(String::new())),
                 media_info_fige: Arc::new(Mutex::new(false)),
+                media_info_vide_restants: Arc::new(AtomicU32::new(0)),
+                uri_seulement_dans_trackuri: Arc::new(Mutex::new(false)),
+                track_uri: Arc::new(Mutex::new(String::new())),
                 set_uri_corps: Arc::new(Mutex::new(Vec::new())),
                 salon_701_sans_media: Arc::new(Mutex::new(false)),
                 refus_701_restants: Arc::new(Mutex::new(0)),
                 stop_oublie_le_media: Arc::new(Mutex::new(false)),
                 oublie_le_media_une_fois: Arc::new(Mutex::new(false)),
                 play_refus_701: Arc::new(AtomicU32::new(0)),
+                relance_701: Arc::new(Mutex::new(false)),
+                actions_soap: Arc::new(AtomicU32::new(0)),
+                position_ms: Arc::new(AtomicU32::new(90_000)),
+                // Position IMMOBILE par défaut : c'est ce que le renderer
+                // bouchonné rendait avant #2263, et les tests écrits contre lui
+                // le supposent. Chaque test qui veut un appareil qui avance
+                // vraiment l'arme explicitement.
+                position_avance: Arc::new(AtomicBool::new(false)),
+                abonnement_refuse: Arc::new(AtomicBool::new(false)),
+                renouvellement_refuse: Arc::new(AtomicBool::new(false)),
+                subscribe_count: Arc::new(AtomicU32::new(0)),
+                etat_pousse: Arc::new(Mutex::new("PLAYING".into())),
+                duree_jamais_poussee: Arc::new(AtomicBool::new(false)),
                 volume_refus_upnp: Arc::new(Mutex::new(None)),
             }
         }
+    }
+
+    fn hms(ms: u32) -> String {
+        let s = ms / 1000;
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    }
+
+    /// Le document `LastChange` d'`AVTransport` tel qu'un renderer l'envoie :
+    /// un XML ÉCHAPPÉ dans le texte de la propriété, pas un XML imbriqué.
+    fn propertyset_avtransport(etat: &str, uri: &str, duree: &str) -> String {
+        // Une durée vide = renderer qui n'émet PAS `CurrentTrackDuration`.
+        // La spec ne l'impose pas, et certains s'en dispensent.
+        let duree_xml = if duree.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<CurrentTrackDuration val="{duree}"/>"#)
+        };
+        let interieur = format!(
+            r#"<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"><InstanceID val="0"><TransportState val="{etat}"/><CurrentTrackURI val="{uri}"/>{duree_xml}</InstanceID></Event>"#
+        );
+        let echappe = interieur
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        format!(
+            r#"<?xml version="1.0"?><e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><LastChange>{echappe}</LastChange></e:property></e:propertyset>"#
+        )
+    }
+
+    /// Idem pour `RenderingControl`, avec ses trois voies — la voie `Master`
+    /// n'est pas la dernière du document, exprès.
+    fn propertyset_renderingcontrol(volume: u32, muet: u32) -> String {
+        let interieur = format!(
+            r#"<Event xmlns="urn:schemas-upnp-org:metadata-1-0/RCS/"><InstanceID val="0"><Volume channel="Master" val="{volume}"/><Mute channel="Master" val="{muet}"/><Volume channel="LF" val="11"/><Volume channel="RF" val="99"/></InstanceID></Event>"#
+        );
+        let echappe = interieur
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        format!(
+            r#"<?xml version="1.0"?><e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><LastChange>{echappe}</LastChange></e:property></e:propertyset>"#
+        )
+    }
+
+    /// Envoie un `NOTIFY` GENA à l'adresse de rappel, comme le ferait
+    /// l'appareil juste après avoir accepté l'abonnement.
+    async fn notifier(callback: &str, corps: String) {
+        let Ok(method) = reqwest::Method::from_bytes(b"NOTIFY") else {
+            return;
+        };
+        let client = crate::http::client::builder().build().unwrap_or_default();
+        let _ = client
+            .request(method, callback)
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .header("Content-Type", "text/xml")
+            .body(corps)
+            .send()
+            .await;
+    }
+
+    fn callback_de(entetes: &axum::http::HeaderMap) -> Option<String> {
+        entetes
+            .get("CALLBACK")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim_matches(['<', '>']).to_string())
+    }
+
+    /// `eventSubURL` d'`AVTransport` du renderer bouchonné.
+    async fn abonnement_avtransport(
+        State(state): State<MockState>,
+        entetes: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let n = state.subscribe_count.fetch_add(1, Ordering::Relaxed);
+        if state.abonnement_refuse.load(Ordering::Relaxed)
+            || (n > 0 && state.renouvellement_refuse.load(Ordering::Relaxed))
+        {
+            return (axum::http::StatusCode::PRECONDITION_FAILED, "").into_response();
+        }
+        if let Some(cb) = callback_de(&entetes) {
+            let etat = state.etat_pousse.lock().await.clone();
+            let duree = if state.duree_jamais_poussee.load(Ordering::Relaxed) {
+                ""
+            } else {
+                "0:05:00"
+            };
+            // Le `NOTIFY` initial part AVANT que la réponse au `SUBSCRIBE` ne
+            // soit rendue — l'ordre le plus dur, et un ordre que GENA autorise :
+            // rien n'oblige l'appareil à attendre que notre client ait fini de
+            // lire sa réponse. C'est l'ordre qui perdait l'état initial tant
+            // que le gestionnaire de rappel était enregistré après coup, et
+            // comme `AVTransport` n'émet plus rien tant que rien ne change,
+            // l'abonnement restait muet pour toujours. Le laisser en tâche
+            // détachée rendrait ce test complice du bogue : il gagnerait la
+            // course une fois sur deux et se dirait vert.
+            notifier(
+                &cb,
+                propertyset_avtransport(&etat, "http://tune.test/piste.flac", duree),
+            )
+            .await;
+        }
+        ([("SID", "uuid:mock-av"), ("TIMEOUT", "Second-300")], "").into_response()
+    }
+
+    async fn abonnement_renderingcontrol(
+        State(state): State<MockState>,
+        entetes: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        if state.abonnement_refuse.load(Ordering::Relaxed) {
+            return (axum::http::StatusCode::PRECONDITION_FAILED, "").into_response();
+        }
+        if let Some(cb) = callback_de(&entetes) {
+            notifier(&cb, propertyset_renderingcontrol(42, 0)).await;
+        }
+        ([("SID", "uuid:mock-rc"), ("TIMEOUT", "Second-300")], "").into_response()
     }
 
     fn extract_action(body: &str) -> String {
@@ -139,6 +322,7 @@ mod tests {
     async fn av_handler(State(state): State<MockState>, body: String) -> axum::response::Response {
         use axum::response::IntoResponse;
         let action = extract_action(&body);
+        state.actions_soap.fetch_add(1, Ordering::Relaxed);
         match action.as_str() {
             "SetAVTransportURI" => {
                 state.set_uri_corps.lock().await.push(body.clone());
@@ -150,7 +334,12 @@ mod tests {
                         .into_response();
                 }
                 let uri = extract_tag(&body, "CurrentURI");
-                if !*state.media_info_fige.lock().await {
+                if *state.uri_seulement_dans_trackuri.lock().await {
+                    // #3580 — l'URI est ACCEPTEE et RETENUE, mais elle ne
+                    // parait que dans le champ de la piste.
+                    *state.track_uri.lock().await = uri;
+                    state.current_uri.lock().await.clear();
+                } else if !*state.media_info_fige.lock().await {
                     *state.current_uri.lock().await = uri;
                 }
                 // « Salon » (#2581) : média accepté puis aussitôt perdu.
@@ -187,6 +376,16 @@ mod tests {
                 if charge_encore {
                     state.play_refus_701.fetch_add(1, Ordering::Relaxed);
                     *state.transport_state.lock().await = "TRANSITIONING".into();
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, soap_701())
+                        .into_response();
+                }
+                // Le premier `Play` est acquitté ; le suivant — celui de la
+                // relance — se fait refuser. Déterministe : c'est le COMPTE de
+                // Play acceptés qui décide, jamais une horloge.
+                if *state.relance_701.lock().await && state.play_count.load(Ordering::Relaxed) >= 1
+                {
+                    state.play_refus_701.fetch_add(1, Ordering::Relaxed);
+                    *state.transport_state.lock().await = "STOPPED".into();
                     return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, soap_701())
                         .into_response();
                 }
@@ -240,18 +439,43 @@ mod tests {
                 .into_response()
             }
             "GetMediaInfo" => {
-                let uri = state.current_uri.lock().await.clone();
+                // #2749 — les `n` premieres lectures rendent le VIDE : l'ampli
+                // n'est pas encore sorti de veille.
+                let encore_en_veille = state
+                    .media_info_vide_restants
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok();
+                let uri = if encore_en_veille {
+                    String::new()
+                } else {
+                    state.current_uri.lock().await.clone()
+                };
                 soap_ok(
                     "GetMediaInfo",
                     &format!("<NrTracks>1</NrTracks><CurrentURI>{uri}</CurrentURI>"),
                 )
                 .into_response()
             }
-            "GetPositionInfo" => soap_ok(
-                "GetPositionInfo",
-                "<Track>1</Track><TrackDuration>0:05:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI></TrackURI><RelTime>0:01:30</RelTime><AbsTime>0:01:30</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>",
-            )
-            .into_response(),
+            "GetPositionInfo" => {
+                // La position avance d'une seconde par relevé, comme sur un
+                // appareil qui joue. Un renderer FIGÉ (`position_avance` à
+                // faux) rend deux fois la même : c'est ce cas-là que la
+                // contre-vérification de l'état poussé doit rattraper.
+                let ms = if state.position_avance.load(Ordering::Relaxed) {
+                    state.position_ms.fetch_add(1000, Ordering::Relaxed) + 1000
+                } else {
+                    state.position_ms.load(Ordering::Relaxed)
+                };
+                let t = hms(ms);
+                let track_uri = state.track_uri.lock().await.clone();
+                soap_ok(
+                    "GetPositionInfo",
+                    &format!(
+                        "<Track>1</Track><TrackDuration>0:05:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI>{track_uri}</TrackURI><RelTime>{t}</RelTime><AbsTime>{t}</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>"
+                    ),
+                )
+                .into_response()
+            }
             _ => soap_ok(&action, "").into_response(),
         }
     }
@@ -259,6 +483,7 @@ mod tests {
     async fn rc_handler(State(state): State<MockState>, body: String) -> axum::response::Response {
         use axum::response::IntoResponse;
         let action = extract_action(&body);
+        state.actions_soap.fetch_add(1, Ordering::Relaxed);
         match action.as_str() {
             "SetVolume" => {
                 // Compté AVANT le refus : la commande a bien été émise, c'est
@@ -294,6 +519,16 @@ mod tests {
         let app = Router::new()
             .route("/AVTransport", post(av_handler))
             .route("/RenderingControl", post(rc_handler))
+            // `SUBSCRIBE` n'est pas une méthode HTTP standard : `any` est la
+            // seule façon de l'atteindre depuis axum.
+            .route(
+                "/AVTransport/event",
+                axum::routing::any(abonnement_avtransport),
+            )
+            .route(
+                "/RenderingControl/event",
+                axum::routing::any(abonnement_renderingcontrol),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -609,6 +844,213 @@ mod tests {
             dernier.contains("<CurrentURI></CurrentURI>"),
             "le média mort (notre hôte) devait être vidé, dernier envoi : {}",
             &dernier[..dernier.len().min(200)]
+        );
+        handle.abort();
+    }
+
+    /// #2749 — L'AMPLI SORT DE VEILLE, ET LA ZONE JOUE.
+    ///
+    /// Le renderer acquitte `SetAVTransportURI` puis `Play` — sa pile UPnP est
+    /// bien vivante — mais rend une `CurrentURI` VIDE tant qu'il n'a pas fini
+    /// de sortir de veille et de basculer sur son entree reseau. Tune y lisait
+    /// « il joue une autre source » et coupait la zone en 13,5 s.
+    ///
+    /// Ce test passe par `play_media` : c'est LUI qui prouve que la fenetre de
+    /// reveil est BRANCHEE, et pas seulement ecrite. Les six premieres
+    /// lectures — tout le bareme de #2390 — ne voient que du vide ; c'est la
+    /// septieme, celle de la fenetre de reveil, qui trouve l'URI.
+    #[tokio::test]
+    async fn un_ampli_qui_sort_de_veille_finit_par_jouer() {
+        let state = MockState::default();
+        state.media_info_vide_restants.store(6, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+        let url = "http://192.168.1.18:8888/stream/fip-reveil.flac";
+        output
+            .play_media(&PlayMedia {
+                url,
+                mime_type: "audio/flac",
+                title: Some("FIP"),
+                ..Default::default()
+            })
+            .await
+            .expect("l'ampli a fini de se reveiller : la lecture doit aboutir");
+        assert_eq!(
+            *state.current_uri.lock().await,
+            url,
+            "le renderer doit finir sur NOTRE flux"
+        );
+        assert!(
+            state.set_uri_corps.lock().await.len() >= 2,
+            "l'URI devait etre REPOSEE pendant l'attente, pas seulement posee une fois"
+        );
+        handle.abort();
+    }
+
+    /// #3580 — L'URI N'EST PAS TOUJOURS DANS `CurrentURI`.
+    ///
+    /// L'AVTransport publie DEUX champs qui nomment ce que le renderer tient :
+    /// `GetMediaInfo` → `CurrentURI`, et `GetPositionInfo` → `TrackURI`. Rien
+    /// n'oblige un appareil a renseigner les deux au meme instant. Tune ne
+    /// lisait que le premier : un renderer qui ACCEPTE l'URI, l'ACQUITTE,
+    /// ACQUITTE le `Play` et ne la publie que dans le second etait declare
+    /// « ne tient AUCUN media » jusqu'a epuisement du budget de reveil, puis
+    /// sa zone etait coupee — sur un verdict que le protocole contredisait
+    /// deux octets plus loin. C'est l'hypothese que #3580 nommait sans pouvoir
+    /// l'eprouver (« si le HEOS charge le flux ailleurs, la garde attend
+    /// quelque chose qui ne viendra jamais par ce chemin »).
+    ///
+    /// Le banc passe par `play_media` : c'est LUI qui prouve que la seconde
+    /// lecture est BRANCHEE, et pas seulement ecrite. Le budget de reveil est
+    /// raccourci a 300 ms — si la garde ne voyait pas le `TrackURI`, ce test
+    /// n'attendrait pas, il ECHOUERAIT.
+    ///
+    /// L'URL attendue porte le PORT du faux renderer, tire par le systeme a
+    /// l'execution : aucune aiguille du fichier ne peut se trouver elle-meme.
+    #[tokio::test]
+    async fn une_uri_tenue_seulement_dans_trackuri_est_reconnue() {
+        let state = MockState::default();
+        *state.uri_seulement_dans_trackuri.lock().await = true;
+        let (base, handle) = start_mock(state.clone()).await;
+        let url = format!("{base}/stream/tenue-ailleurs.flac");
+        let output = make_dlna(&base).with_budget_reveil_ms(300);
+        output
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/flac",
+                title: Some("FIP"),
+                ..Default::default()
+            })
+            .await
+            .expect(
+                "le renderer NOMME notre flux dans TrackURI : la lecture doit aboutir, \
+                 pas etre declaree « aucun media »",
+            );
+        assert!(
+            state.current_uri.lock().await.is_empty(),
+            "le banc ne vaut que si `CurrentURI` est RESTE vide — sinon il ne mesure rien"
+        );
+        assert_eq!(
+            *state.track_uri.lock().await,
+            url,
+            "le renderer devait tenir NOTRE flux, dans le champ de la piste"
+        );
+        handle.abort();
+    }
+
+    /// TEMOIN INVERSE — un `TrackURI` ETRANGER ne vaut pas acquittement.
+    ///
+    /// La seconde lecture ne retient `TrackURI` que s'il designe NOTRE flux.
+    /// Sans cette restriction, un appareil qui garde dans son champ de piste
+    /// l'URI de sa lecture PRECEDENTE — ou celle d'un autre serveur — verrait
+    /// Tune conclure « c'est parti » et afficher une lecture qui n'existe pas :
+    /// exactement l'etat imaginaire que toute cette verification existe pour
+    /// interdire. Ici `CurrentURI` est vide et `TrackURI` porte un flux
+    /// etranger : le verdict doit rester « ne tient AUCUN media ».
+    #[tokio::test]
+    async fn un_trackuri_etranger_ne_vaut_pas_acquittement() {
+        let state = MockState::default();
+        *state.media_info_fige.lock().await = true;
+        *state.current_uri.lock().await = String::new();
+        *state.track_uri.lock().await =
+            "http://192.168.1.42:8888/stream/lecture-d-un-autre-serveur.flac".into();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base).with_budget_reveil_ms(300);
+        let err = output
+            .play_media(&PlayMedia {
+                url: "http://192.168.1.18:8888/stream/le-notre.flac",
+                mime_type: "audio/flac",
+                ..Default::default()
+            })
+            .await
+            .expect_err(
+                "un TrackURI qui ne designe pas notre flux ne doit JAMAIS faire \
+                 conclure au succes",
+            );
+        assert!(
+            err.contains("AUCUN"),
+            "le verdict doit rester « il ne tient RIEN », pas « il joue autre \
+             chose » : la seconde lecture est un temoin POSITIF, elle ne \
+             remplace pas `CurrentURI` ({err})"
+        );
+        handle.abort();
+    }
+
+    /// TEMOIN INVERSE — les DEUX champs vides restent un echec.
+    ///
+    /// Sans ce cas, la lecture du second champ pourrait etre elargie jusqu'a
+    /// accepter n'importe quoi et ce fichier resterait vert. Ici l'appareil
+    /// acquitte tout et ne publie RIEN, nulle part : `play_media` doit rendre
+    /// `Err`, et le message doit nommer les deux champs.
+    #[tokio::test]
+    async fn les_deux_champs_vides_restent_un_echec() {
+        let state = MockState::default();
+        *state.media_info_fige.lock().await = true;
+        *state.current_uri.lock().await = String::new();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base).with_budget_reveil_ms(300);
+        let err = output
+            .play_media(&PlayMedia {
+                url: "http://192.168.1.18:8888/stream/rien-nulle-part.flac",
+                mime_type: "audio/flac",
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("AUCUN"),
+            "l'appareil ne tient RIEN : c'est ce que le message doit dire ({err})"
+        );
+        assert!(
+            err.contains("TrackURI"),
+            "le message doit dire que les DEUX champs ont ete lus ({err})"
+        );
+        handle.abort();
+    }
+
+    /// #3580 — LE MESSAGE NE PROMET PLUS UNE DUREE QUE LE TERRAIN DEMENT.
+    ///
+    /// Le message rendu quand l'appareil ne tient rien affirmait : « Un ampli
+    /// en veille reseau (Denon/HEOS) met 15 a 30 s a sortir de veille [...] —
+    /// allumez-le, puis relancez ». Le chiffre venait d'UN releve sur UN
+    /// AVR-X1600H en 0.9.121 (#2749), promu en explication generale.
+    ///
+    /// Le meme appareil, mesure en 0.9.145 (ticket support 109) : 3 min 06 s
+    /// entre le premier clic et la premiere URI tenue, AMPLI SOUS TENSION
+    /// pendant toute la fenetre. Le testeur a conteste le message — « ce qui
+    /// est totalement faux » — et la mesure lui donne raison. Un defaut
+    /// masque par sa propre explication coute plus cher qu'un « pas elucide » :
+    /// le message envoyait allumer un appareil deja allume.
+    ///
+    /// Ce temoin fige ce que le message ne doit plus faire. Il lit le message
+    /// REEL rendu par `play_media`, pas une constante.
+    #[tokio::test]
+    async fn le_message_d_echec_n_invente_pas_de_duree_de_reveil() {
+        let state = MockState::default();
+        *state.media_info_fige.lock().await = true;
+        *state.current_uri.lock().await = String::new();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base).with_budget_reveil_ms(300);
+        let err = output
+            .play_media(&PlayMedia {
+                url: "http://192.168.1.18:8888/stream/duree-inventee.flac",
+                mime_type: "audio/flac",
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        // L'aiguille est ASSEMBLEE, jamais ecrite : un grep de ce fichier ne
+        // peut pas la trouver et se declarer vert.
+        let plage_inventee = format!("{} à {} s", 10 + 5, 20 + 10);
+        assert!(
+            !err.contains(&plage_inventee),
+            "le message affirme de nouveau une plage de reveil que le terrain \
+             dement (3 min 06 s mesurees sur le meme AVR-X1600H en 0.9.145) : {err}"
+        );
+        assert!(
+            !err.contains("allumez-le"),
+            "le message renvoie de nouveau allumer un appareil qui repond deja \
+             en SOAP — c'est ce que le testeur a conteste : {err}"
         );
         handle.abort();
     }
@@ -1098,5 +1540,1181 @@ mod tests {
             "le renderer doit finir sur NOTRE flux"
         );
         handle.abort();
+    }
+
+    /// LA SŒUR NUE de #2581 : `play_media` contient DEUX séquences
+    /// `SetAVTransportURI` → `Play`. La première a la lecture du 701 (la boucle
+    /// à cinq essais, corrigée pour #2581) ; la seconde — la relance d'un Play
+    /// « acquitté mais jamais appliqué » — repose l'URI, rejoue… et **jetait la
+    /// réponse**. Un 701 sur ce Play ressortait donc sous le message « Le
+    /// renderer a acquitté Play mais joue toujours une autre source » : deux
+    /// affirmations fausses, sur le message même qui avait poussé un testeur à
+    /// réinstaller son système entier (#2396).
+    ///
+    /// Le mock est déterministe : c'est le NOMBRE de `Play` acceptés qui décide
+    /// du refus, jamais une horloge — aucune course, aucun tour sur deux.
+    #[tokio::test]
+    async fn un_701_sur_le_play_de_la_relance_est_nomme_et_non_travesti() {
+        let state = MockState::default();
+        // Le renderer acquitte tout mais n'applique jamais l'URI : c'est ce qui
+        // déclenche la relance (l'Eversolo de la course des 5 ms).
+        *state.media_info_fige.lock().await = true;
+        // …et il refuse le Play de cette relance avec le 701 de FabienM.
+        *state.relance_701.lock().await = true;
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let url = "http://192.168.1.74:8085/stream/relance-701.flac";
+        let erreur = output
+            .play_media(&PlayMedia {
+                url,
+                mime_type: "audio/flac",
+                title: Some("Never Let Me Down Again"),
+                ..Default::default()
+            })
+            .await
+            .expect_err("l'URI n'est jamais appliquée : la lecture doit échouer");
+
+        assert_eq!(
+            state.play_refus_701.load(Ordering::Relaxed),
+            1,
+            "le Play de la relance devait bien être refusé une fois"
+        );
+        assert!(
+            erreur.contains("701"),
+            "le message doit NOMMER le code que l'appareil a rendu : {erreur}"
+        );
+        assert!(
+            erreur.contains("REFUSÉ"),
+            "le message doit dire que l'appareil a refusé, pas acquitté : {erreur}"
+        );
+        assert!(
+            !erreur.contains("joue toujours une autre source"),
+            "l'appareil ne joue RIEN d'autre : il a refusé la transition — {erreur}"
+        );
+        handle.abort();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #2263 — Évènements GENA sur le chemin DLNA, et « silence UPnP »
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Le même renderer, mais abonnable : ses `eventSubURL` sont branchées et
+    /// un VRAI récepteur GENA écoute derrière.
+    async fn dlna_abonnable(base: &str, silence: bool) -> DlnaOutput {
+        let listener = crate::outputs::oh_events::UpnpEventListener::new("127.0.0.1".into())
+            .await
+            .expect("récepteur GENA");
+        let mut urls = std::collections::HashMap::new();
+        urls.insert(
+            "avtransport".to_string(),
+            format!("{base}/AVTransport/event"),
+        );
+        urls.insert(
+            "renderingcontrol".to_string(),
+            format!("{base}/RenderingControl/event"),
+        );
+        make_dlna(base)
+            .with_upnp_events(Some(std::sync::Arc::new(listener)), urls)
+            .with_upnp_silence(silence)
+    }
+
+    /// Attend que l'abonnement soit ÉTABLI, avec une échéance, et échoue fort
+    /// s'il ne l'est pas.
+    ///
+    /// Ce n'est pas une temporisation d'espoir : ce qui suit ne mesure quoi que
+    /// ce soit qu'à cette condition, alors la condition est posée en assertion.
+    /// Un test d'abonnement qui « mord un tour sur deux » est un test qui
+    /// compte AVANT que l'abonnement existe — ici c'est impossible.
+    async fn attendre_abonnement(sortie: &DlnaOutput, attendu: bool) {
+        let echeance = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let etat = sortie.etat_evenements().await;
+            if etat.abonne == attendu {
+                return;
+            }
+            if std::time::Instant::now() >= echeance {
+                panic!(
+                    "abonnement GENA attendu = {attendu}, obtenu {} après 5 s",
+                    etat.abonne
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Attend que le renderer ait livré son état initial COMPLET — celui du
+    /// transport (AVTransport) *et* celui du volume (RenderingControl).
+    ///
+    /// Deux abonnements, deux `NOTIFY` indépendants : `is_live()` est vrai dès
+    /// le premier arrivé. Compter les actions à ce moment-là donnerait tantôt
+    /// dix, tantôt onze — un `GetVolume` de plus tant que RenderingControl n'a
+    /// pas parlé. Ce n'est pas une gigue à masquer, c'est une PRÉCONDITION de
+    /// la mesure : on l'attend, et on échoue fort si elle ne vient pas.
+    async fn attendre_etat_initial_complet(sortie: &DlnaOutput) {
+        let echeance = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let s = sortie.get_status().await.expect("get_status");
+            if (s.volume * 100.0).round() as u32 == 42 && s.state == TransportState::Playing {
+                return;
+            }
+            if std::time::Instant::now() >= echeance {
+                panic!("état initial poussé incomplet après 5 s : {s:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Combien d'actions SOAP coûtent DIX relevés d'état — soit dix tours du
+    /// sondeur, soit dix secondes de lecture à la cadence actuelle.
+    async fn actions_pour_dix_releves(sortie: &DlnaOutput, compteur: &Arc<AtomicU32>) -> u32 {
+        compteur.store(0, Ordering::Relaxed);
+        for _ in 0..10 {
+            sortie.get_status().await.expect("get_status");
+        }
+        compteur.load(Ordering::Relaxed)
+    }
+
+    /// Le barème d'AVANT : trois actions par relevé, trente pour dix tours.
+    ///
+    /// C'est la contre-épreuve des deux tests suivants — sans elle, « on est
+    /// passé à dix » ne se compare à rien. Et c'est aussi la preuve du repli :
+    /// ce renderer-ci REFUSE l'abonnement, et la lecture n'en sait rien.
+    #[tokio::test]
+    async fn un_renderer_qui_refuse_l_abonnement_garde_les_trois_actions() {
+        let state = MockState::default();
+        state.abonnement_refuse.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, false).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, false).await;
+
+        let actions = actions_pour_dix_releves(&sortie, &state.actions_soap).await;
+        assert_eq!(
+            actions, 30,
+            "abonnement refusé : le relevé doit rester à GetPositionInfo + GetTransportInfo + GetVolume"
+        );
+        handle.abort();
+    }
+
+    /// Défaut, abonnement tenu : UNE action par relevé au lieu de trois.
+    ///
+    /// L'état, le volume et la coupure arrivent poussés ; seule la position
+    /// reste mesurée, parce qu'aucun renderer ne la pousse de façon fiable.
+    #[tokio::test]
+    async fn les_evenements_ramenent_le_releve_a_une_seule_action() {
+        let state = MockState::default();
+        state.position_avance.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, false).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, true).await;
+        attendre_etat_initial_complet(&sortie).await;
+
+        let actions = actions_pour_dix_releves(&sortie, &state.actions_soap).await;
+        assert_eq!(
+            actions, 10,
+            "abonnement tenu : seul GetPositionInfo doit rester (mesuré : {actions})"
+        );
+
+        // Et ce qui arrive par évènement est JUSTE, pas seulement bon marché.
+        let statut = sortie.get_status().await.expect("get_status");
+        assert_eq!(statut.state, TransportState::Playing, "état poussé");
+        assert_eq!(
+            (statut.volume * 100.0).round() as u32,
+            42,
+            "volume de la voie Master, pas celui de LF (11) ni de RF (99)"
+        );
+        assert!(!statut.muted, "Mute=0 poussé par RenderingControl");
+        let etat = sortie.etat_evenements().await;
+        assert!(etat.abonne);
+        assert!(
+            !etat.position_extrapolee,
+            "hors mode silence la position doit rester MESURÉE"
+        );
+        handle.abort();
+    }
+
+    /// « Silence UPnP » : plus AUCUNE action pendant la lecture.
+    #[tokio::test]
+    async fn le_silence_upnp_ne_coute_plus_aucune_action() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, true).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, true).await;
+
+        let actions = actions_pour_dix_releves(&sortie, &state.actions_soap).await;
+        assert_eq!(
+            actions, 0,
+            "silence UPnP : le renderer ne doit plus rien recevoir (mesuré : {actions})"
+        );
+
+        let statut = sortie.get_status().await.expect("get_status");
+        assert_eq!(statut.state, TransportState::Playing);
+        assert_eq!(statut.duration_ms, 300_000, "durée poussée par LastChange");
+        assert_eq!(
+            statut.current_uri.as_deref(),
+            Some("http://tune.test/piste.flac")
+        );
+        // Le prix, et il est DIT : la position n'est plus une mesure.
+        assert!(
+            sortie.etat_evenements().await.position_extrapolee,
+            "le mode silence doit s'annoncer comme extrapolant la position"
+        );
+        handle.abort();
+    }
+
+    /// Le silence n'est jamais un aveuglement : sans abonnement tenu, l'option
+    /// armée ne change rien et la sortie sonde comme avant.
+    ///
+    /// Contre-épreuve du garde : si `get_status` se contentait de regarder
+    /// l'interrupteur, ce test rendrait 0 action et un état inventé.
+    #[tokio::test]
+    async fn le_silence_arme_sans_abonnement_sonde_quand_meme() {
+        let state = MockState::default();
+        state.abonnement_refuse.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, true).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, false).await;
+
+        let actions = actions_pour_dix_releves(&sortie, &state.actions_soap).await;
+        assert_eq!(
+            actions, 30,
+            "option armée mais abonnement absent : repli COMPLET sur le sondage"
+        );
+        assert!(!sortie.etat_evenements().await.position_extrapolee);
+        handle.abort();
+    }
+
+    /// La position extrapolée avance avec l'horloge, et le déplacement fait
+    /// PAR Tune la recale tout de suite.
+    #[tokio::test]
+    async fn la_position_extrapolee_avance_et_le_seek_la_recale() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, true).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, true).await;
+
+        let debut = sortie.get_status().await.expect("get_status").position_ms;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let apres = sortie.get_status().await.expect("get_status").position_ms;
+        assert!(
+            apres >= debut + 300,
+            "la position extrapolée doit suivre l'horloge : {debut} → {apres}"
+        );
+
+        sortie.seek(120_000).await.expect("seek");
+        let recale = sortie.get_status().await.expect("get_status").position_ms;
+        assert!(
+            (120_000..121_000).contains(&recale),
+            "un déplacement passé par Tune recale l'ancre tout de suite : {recale}"
+        );
+        handle.abort();
+    }
+
+    /// Le renderer se dit en lecture par évènement, mais sa position ne bouge
+    /// plus : au bout de deux secondes, Tune va trancher à la source.
+    ///
+    /// C'est la garde qui tient la promesse « pas moins juste qu'avant » : un
+    /// appareil qui accepte l'abonnement puis se tait n'a pas le droit de
+    /// figer la file indéfiniment.
+    #[tokio::test]
+    async fn un_etat_pousse_que_la_position_dement_est_arbitre_en_soap() {
+        let state = MockState::default();
+        state.position_avance.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, false).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, true).await;
+        attendre_etat_initial_complet(&sortie).await;
+
+        // L'appareil s'est ARRÊTÉ, et son évènement dit toujours « PLAYING ».
+        state.position_avance.store(false, Ordering::Relaxed);
+        *state.transport_state.lock().await = "STOPPED".into();
+
+        // Premier relevé contradictoire : on n'en conclut rien, un tour où la
+        // position n'a pas bougé n'est pas une preuve.
+        state.actions_soap.store(0, Ordering::Relaxed);
+        let tot = sortie.get_status().await.expect("get_status");
+        assert_eq!(
+            tot.state,
+            TransportState::Playing,
+            "trop tôt pour douter : l'état poussé tient encore"
+        );
+        assert_eq!(
+            state.actions_soap.load(Ordering::Relaxed),
+            1,
+            "aucune action de plus tant que la contradiction ne dure pas"
+        );
+
+        // Passé le délai, on va lire l'état à la source. L'attente est PLUS
+        // LONGUE que le seuil, jamais une course contre lui.
+        tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+        state.actions_soap.store(0, Ordering::Relaxed);
+        let tard = sortie.get_status().await.expect("get_status");
+        assert_eq!(
+            tard.state,
+            TransportState::Stopped,
+            "la contradiction dure : c'est le transport qui tranche"
+        );
+        assert_eq!(
+            state.actions_soap.load(Ordering::Relaxed),
+            2,
+            "l'arbitrage coûte UN GetTransportInfo de plus, et seulement là"
+        );
+        handle.abort();
+    }
+
+    /// Un renouvellement REFUSÉ (l'appareil a redémarré, il ne connaît plus le
+    /// SID) doit couper l'abonnement, pas laisser servir un état gelé.
+    #[tokio::test]
+    async fn un_renouvellement_refuse_rend_l_abonnement_mort() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+
+        let etat = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::outputs::oh_events::EventState::default(),
+        ));
+        let listener = crate::outputs::oh_events::UpnpEventListener::new("127.0.0.1".into())
+            .await
+            .expect("récepteur");
+        let id = listener
+            .subscribe(&format!("{base}/AVTransport/event"), etat.clone())
+            .await
+            .expect("abonnement accepté");
+        assert!(etat.lock().await.alive, "abonnement tenu après SUBSCRIBE");
+
+        state.renouvellement_refuse.store(true, Ordering::Relaxed);
+        listener.renouveler_maintenant().await;
+        assert!(
+            !etat.lock().await.alive,
+            "un 412 au renouvellement doit tuer l'abonnement, pas passer pour un succès"
+        );
+
+        listener.unsubscribe(&id).await;
+        handle.abort();
+    }
+
+    /// L'état initial arrive AVANT la réponse au `SUBSCRIBE`, et il doit être
+    /// retenu quand même.
+    ///
+    /// Le renderer bouchonné émet son `NOTIFY` avant de répondre — l'ordre que
+    /// tout appareil rapide peut produire. Enregistrer le gestionnaire de
+    /// rappel après coup jetait cet état-là en silence, et `AVTransport`
+    /// n'émettant plus rien tant que rien ne change, l'abonnement restait muet
+    /// jusqu'à la piste suivante : abonné pour l'ordinateur, inutile en fait.
+    #[tokio::test]
+    async fn l_etat_initial_arrive_avant_la_reponse_au_subscribe_et_tient() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, false).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+
+        // Aucune attente : dès le retour de `play_media`, les deux `NOTIFY`
+        // initiaux sont derrière nous — le renderer les a émis avant de
+        // répondre. Ce qui suit tombe donc à faux si l'un d'eux a été perdu.
+        let etat = sortie.etat_evenements().await;
+        assert!(
+            etat.abonne,
+            "l'état poussé avant la réponse au SUBSCRIBE doit être retenu"
+        );
+        let statut = sortie.get_status().await.expect("get_status");
+        assert_eq!(statut.state, TransportState::Playing);
+        assert_eq!((statut.volume * 100.0).round() as u32, 42);
+        handle.abort();
+    }
+
+    /// Un renderer qui ne pousse PAS sa durée ne doit pas rendre le mode
+    /// silence aveugle sur ce point : Tune connaît la durée de la piste avant
+    /// même de lui envoyer l'URI.
+    ///
+    /// Sans ce repli, l'option opt-in dégraderait une TROISIÈME chose sans
+    /// l'annoncer — et une durée à zéro désarme la garde de fin de piste du
+    /// sondeur.
+    #[tokio::test]
+    async fn le_silence_tient_la_duree_que_tune_connait_quand_l_appareil_se_tait() {
+        let state = MockState::default();
+        state.duree_jamais_poussee.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, true).await;
+
+        // L'URI ANNONCÉE par le renderer dans son évènement est celle-ci : le
+        // couple (URI, durée) ne sert que s'il s'apparie.
+        let url = "http://tune.test/piste.flac".to_string();
+        let mut media = media_locatelli(&url);
+        media.duration_ms = Some(487_560);
+        sortie.play_media(&media).await.expect("play");
+        attendre_abonnement(&sortie, true).await;
+
+        state.actions_soap.store(0, Ordering::Relaxed);
+        let statut = sortie.get_status().await.expect("get_status");
+        assert_eq!(
+            statut.duration_ms, 487_560,
+            "durée de la bibliothèque, faute d'une durée poussée"
+        );
+        assert_eq!(
+            state.actions_soap.load(Ordering::Relaxed),
+            0,
+            "et sans aller la demander à l'appareil : le silence reste le silence"
+        );
+        handle.abort();
+    }
+
+    /// La durée d'une piste ne doit JAMAIS être servie pour une autre : elle
+    /// ferait sauter la garde « position au-delà de la fin » en plein morceau.
+    #[tokio::test]
+    async fn une_duree_annoncee_ne_vaut_que_pour_son_uri() {
+        let state = MockState::default();
+        state.duree_jamais_poussee.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, true).await;
+
+        // On joue une piste dont l'URL n'est PAS celle que le renderer
+        // annoncera dans son évènement : l'appariement doit échouer.
+        let mut media = media_locatelli("http://tune.test/AUTRE-piste.flac");
+        media.duration_ms = Some(487_560);
+        sortie.play_media(&media).await.expect("play");
+        attendre_abonnement(&sortie, true).await;
+
+        let statut = sortie.get_status().await.expect("get_status");
+        assert_eq!(
+            statut.current_uri.as_deref(),
+            Some("http://tune.test/piste.flac"),
+            "c'est bien une AUTRE piste que le renderer dit tenir"
+        );
+        assert_eq!(
+            statut.duration_ms, 0,
+            "durée inconnue vaut mieux que la durée d'une autre piste"
+        );
+        handle.abort();
+    }
+
+    /// #3107 — « rien ne part » : ce qu'une sortie REFUSE doit être DIT.
+    ///
+    /// Le constat de terrain (Bertrand, 01/09/2026, zone DLNA vers l'Eversolo
+    /// DMP-A8) est « cela ne démarre même pas ». Le même album en local vers la
+    /// zone navigateur démarre. Ce banc ne prétend pas rejouer l'appareil : il
+    /// mesure le SEUL fait qui manquait au dossier — ce que Tune ENVOIE
+    /// réellement à un renderer, et ce qu'il DIT quand ce renderer acquitte
+    /// tout et ne joue rien.
+    ///
+    /// Le défaut mesuré ici n'est pas dans la couche DLNA, qui rend bien une
+    /// erreur : il est juste au-dessus. `play_inner` range cette erreur dans
+    /// `PlayResult.error` et rend `Ok`. Seules les branches HTTP qui ATTENDENT
+    /// `play()` relisent ce corps ; `next`, `previous`, `resume`, `seek`,
+    /// l'avance automatique et l'autoplay du sondeur, les alarmes, la reprise
+    /// au démarrage, le transfert de zone et l'émulation de renderer UPnP
+    /// écrivent tous `Ok(_) =>` et poursuivent comme si la piste avait démarré.
+    /// La cause n'existait alors que dans le journal du serveur.
+    mod ce_que_la_sortie_refuse_est_annonce {
+        use super::*;
+        use crate::db::migrations::run_migrations;
+        use crate::db::sqlite::SqliteDb;
+        use crate::db::zone_repo::ZoneRepo;
+        use crate::event_bus::{EventBus, TuneEvent};
+        use crate::http::streamer::AudioStreamer;
+        use crate::orchestrator::{PlayRequest, PlaybackOrchestrator};
+        use crate::outputs::registry::OutputRegistry;
+        use crate::playback::PlaybackManager;
+        use crate::streaming::ServiceRegistry;
+        use tokio::sync::broadcast::Receiver;
+        use tokio::sync::broadcast::error::RecvError;
+
+        /// Le renderer factice porte déjà cet identifiant dans `make_dlna`.
+        const DEVICE_ID: &str = "mock-dlna-001";
+
+        /// L'URI qu'un renderer zombie tient et ne lâche pas : un flux Tune
+        /// périmé, servi par une AUTRE machine.
+        ///
+        /// Le `/stream/` est ce qui rend le verdict concluant — c'est la règle
+        /// de `verdict_uri_appliquee` : une URI étrangère qu'on ne sait pas
+        /// interpréter ne conclut RIEN, par choix, pour ne pas accuser à tort
+        /// les renderers qui réécrivent l'URI. L'origine, elle, reste étrangère
+        /// à notre serveur : ce média n'est donc pas vidé (cf.
+        /// `un_flux_etranger_n_est_pas_vide`).
+        const URI_ETRANGERE: &str = "http://192.168.1.42:9000/stream/vieux-flux.flac";
+
+        /// Un banc COMPLET : base, orchestrateur, bus d'évènements, une piste
+        /// locale réelle, et une zone DLNA dont la sortie est le renderer
+        /// factice.
+        ///
+        /// La chaîne entière est celle de production — `orch.play()` traverse
+        /// `play_inner`, `send_to_output` et le vrai `DlnaOutput`. Un banc qui
+        /// appellerait `send_to_output` à la main resterait vert alors que le
+        /// code de production se dégrade : c'est exactement ce que fait déjà
+        /// `output_send_error_fails_fast_to_stopped`, qui simule lui-même
+        /// l'arrêt de la zone.
+        async fn banc(
+            base: &str,
+        ) -> (
+            PlaybackOrchestrator,
+            i64,
+            Receiver<TuneEvent>,
+            tempfile::TempDir,
+        ) {
+            banc_avec(make_dlna(base)).await
+        }
+
+        /// Le meme banc, sur une sortie DLNA fournie par l'appelant.
+        async fn banc_avec(
+            sortie: DlnaOutput,
+        ) -> (
+            PlaybackOrchestrator,
+            i64,
+            Receiver<TuneEvent>,
+            tempfile::TempDir,
+        ) {
+            let db = SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            run_migrations(&db).unwrap();
+            let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+            let mut orch = PlaybackOrchestrator::new(
+                db.clone(),
+                Arc::new(PlaybackManager::new()),
+                Arc::new(AudioStreamer::new(0)),
+                Arc::new(Mutex::new(ServiceRegistry::new())),
+                Arc::new(Mutex::new(OutputRegistry::new())),
+                None,
+            );
+            let bus = Arc::new(EventBus::new());
+            let recu = bus.subscribe();
+            orch.event_bus = Some(bus);
+
+            // Un vrai fichier : le chemin passthrough réseau lit sa taille sur
+            // le disque, un chemin fantôme échouerait en `file_not_found` et le
+            // test mesurerait une tout autre panne. Cadence et profondeur
+            // suivent le fichier de test, pas l'album du ticket : ce qui est
+            // mesuré ici est la remontée de la cause, et un écart avec l'en-tête
+            // réel ferait décider un transcodage sans rapport.
+            let dir = tempfile::tempdir().unwrap();
+            let piste = dir.path().join("03 - On the Run.flac");
+            std::fs::copy(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+                &piste,
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Pink Floyd')",
+                &[],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO albums (id, title, artist_id) \
+                 VALUES (1, 'The Dark Side of the Moon', 1)",
+                &[],
+            )
+            .unwrap();
+            let chemin = piste.to_string_lossy().into_owned();
+            db.execute(
+                "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+                 duration_ms, sample_rate, bit_depth, channels) \
+                 VALUES (1, 'On the Run', 1, 1, ?, 'flac', 216000, 44100, 16, 2)",
+                &[&chemin as &dyn crate::db::backend::ToSqlValue],
+            )
+            .unwrap();
+
+            let zones = ZoneRepo::with_backend(db.clone());
+            let zone_id = zones
+                .create("Eversolo DMP-A8", Some("dlna"), Some(DEVICE_ID))
+                .unwrap();
+            zones.update_dlna_native_flac(zone_id, true).unwrap();
+            orch.outputs.lock().await.register(Box::new(sortie));
+            (orch, zone_id, recu, dir)
+        }
+
+        /// Collecte EN CONTINU les erreurs de lecture poussées aux clients.
+        ///
+        /// Vider le canal à la fin ne suffirait pas : la diffusion est bornée à
+        /// 256 messages, un décodage-pour-niveaux en publie pendant toute la
+        /// piste, et l'évènement cherché pourrait être écarté avant d'être lu —
+        /// un test vert au mauvais motif, puis rouge par intermittence.
+        fn collecter(mut recu: Receiver<TuneEvent>) -> Arc<Mutex<Vec<serde_json::Value>>> {
+            let vu = Arc::new(Mutex::new(Vec::new()));
+            let sortie = vu.clone();
+            tokio::spawn(async move {
+                loop {
+                    match recu.recv().await {
+                        Ok(ev) if ev.event_type == "zone.playback_error" => {
+                            sortie.lock().await.push(ev.data);
+                        }
+                        Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            });
+            vu
+        }
+
+        /// Ce que le collecteur a vu, en laissant à l'annonce le temps de
+        /// partir — au plus `delai`.
+        ///
+        /// L'émission est synchrone dans `play_inner`, mais le collecteur est
+        /// une tâche : lire juste après le retour de `play()` mesurerait
+        /// l'ordonnanceur, pas le code. On attend un fait, pas une durée — dès
+        /// que l'erreur est là, on rend la main.
+        async fn erreurs_apres(
+            vu: &Arc<Mutex<Vec<serde_json::Value>>>,
+            delai: std::time::Duration,
+        ) -> Vec<serde_json::Value> {
+            let fin = std::time::Instant::now() + delai;
+            loop {
+                let courant = vu.lock().await.clone();
+                if !courant.is_empty() || std::time::Instant::now() >= fin {
+                    return courant;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Les `CurrentURI` que le renderer factice a REÇUS, dans l'ordre.
+        ///
+        /// C'est le fait de base du ticket : pas un code HTTP — le symptôme est
+        /// précisément qu'il ment — mais la requête SOAP elle-même.
+        async fn uris_recues(state: &MockState) -> Vec<String> {
+            state
+                .set_uri_corps
+                .lock()
+                .await
+                .iter()
+                .map(|corps| extract_tag(corps, "CurrentURI"))
+                .collect()
+        }
+
+        /// Une lecture demandée à un renderer d'où RIEN ne part.
+        ///
+        /// Le renderer tient déjà un flux étranger et n'en changera pas : il
+        /// acquitte `SetAVTransportURI`, acquitte `Play`, et continue son
+        /// morceau. C'est le zombie constaté par SOAP direct sur le DMP-A8, et
+        /// c'est « rien ne part » dans sa forme la plus trompeuse — chaque code
+        /// de retour dit oui.
+        ///
+        /// Avant ce correctif : `play()` rendait `Ok`, la zone passait à
+        /// l'arrêt, et la cause — que le renderer avait pourtant donnée —
+        /// n'existait que dans une ligne `warn!` du journal du serveur.
+        #[tokio::test]
+        async fn un_renderer_qui_acquitte_sans_rien_jouer_fait_remonter_la_cause() {
+            let state = MockState::default();
+            *state.current_uri.lock().await = URI_ETRANGERE.into();
+            *state.media_info_fige.lock().await = true;
+            let (base, handle) = start_mock(state.clone()).await;
+            let (orch, zone_id, recu, _dir) = banc(&base).await;
+            let erreurs = collecter(recu);
+
+            let resultat = orch
+                .play(PlayRequest {
+                    zone_id,
+                    track_id: Some(1),
+                    source: Some("local".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("play() rend Ok — c'est justement le piège de ce ticket");
+
+            // 1. LE FAIT DE BASE — ce que Tune a réellement envoyé au renderer.
+            let url = resultat
+                .stream_url
+                .clone()
+                .expect("une lecture refusée doit quand même nommer son URL de flux");
+            let uris = uris_recues(&state).await;
+            assert!(
+                uris.iter().any(|u| *u == url),
+                "aucun SetAVTransportURI ne porte l'URL du flux ({url}) : {uris:?}"
+            );
+            assert!(
+                state.play_count.load(Ordering::Relaxed) >= 1,
+                "le renderer n'a ACQUITTÉ aucun Play : ce n'est pas le cas mesuré ici"
+            );
+
+            // 2. …et pourtant rien n'est parti : il tient toujours l'autre URI.
+            assert_eq!(
+                *state.current_uri.lock().await,
+                URI_ETRANGERE,
+                "le renderer devait rester sur son flux étranger"
+            );
+            assert!(
+                !resultat.output_sent,
+                "la sortie n'a rien accepté : output_sent doit valoir faux"
+            );
+
+            // 3. CE QUI ÉTAIT AVALÉ — la cause doit être POUSSÉE aux clients.
+            let erreurs = erreurs_apres(&erreurs, std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                erreurs.len(),
+                1,
+                "une et une seule erreur de lecture doit être annoncée : {erreurs:?}"
+            );
+            let erreur = &erreurs[0];
+            assert_eq!(erreur["zone_id"], zone_id, "l'erreur doit nommer la zone");
+            assert_eq!(
+                erreur["fatal"], true,
+                "sans `fatal`, la fenêtre de grâce d'après-lecture du client avale \
+                 le message — la zone s'arrête à la ligne suivante (#2630)"
+            );
+            let texte = erreur["error"].as_str().unwrap_or_default();
+            assert!(
+                texte.contains("acquitté Play"),
+                "le message doit NOMMER ce que le renderer a fait, pas dire \
+                 « erreur » : {texte:?}"
+            );
+            assert!(
+                texte.contains(URI_ETRANGERE),
+                "le message doit dire l'URI que le renderer tient encore : {texte:?}"
+            );
+
+            handle.abort();
+        }
+
+        /// Témoin vert — une lecture qui démarre n'annonce RIEN.
+        ///
+        /// Le même banc, le même appareil, le renderer nominal. Sans ce témoin,
+        /// une remontée d'erreur trop large passerait pour un correctif tout en
+        /// couvrant l'écran de messages sur des lectures parfaitement saines.
+        #[tokio::test]
+        async fn une_lecture_qui_demarre_n_annonce_aucune_erreur() {
+            let state = MockState::default();
+            let (base, handle) = start_mock(state.clone()).await;
+            let (orch, zone_id, recu, _dir) = banc(&base).await;
+            let erreurs = collecter(recu);
+
+            let resultat = orch
+                .play(PlayRequest {
+                    zone_id,
+                    track_id: Some(1),
+                    source: Some("local".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("la lecture doit aboutir");
+
+            let url = resultat.stream_url.clone().expect("une URL de flux");
+            assert!(resultat.output_sent, "la sortie a accepté le titre");
+            assert_eq!(
+                *state.current_uri.lock().await,
+                url,
+                "le renderer doit tenir NOTRE flux"
+            );
+            assert!(
+                state.play_count.load(Ordering::Relaxed) >= 1,
+                "le renderer doit avoir reçu un Play"
+            );
+            // Le délai est ATTENDU en entier : c'est ce qui donne son poids au
+            // témoin — une annonce en retard serait vue, pas manquée.
+            let erreurs = erreurs_apres(&erreurs, std::time::Duration::from_millis(500)).await;
+            assert!(
+                erreurs.is_empty(),
+                "une lecture qui démarre ne doit annoncer AUCUNE erreur : {erreurs:?}"
+            );
+
+            handle.abort();
+        }
+
+        /// #3580 — LE DENON DE REIVAX66 : il ACQUITTE tout et ne tient RIEN.
+        ///
+        /// Son journal (ticket support 78, 04/09/2026, zone « Home Theater ») :
+        /// `soap_muet=false` — l'appareil repond, et il repond OK, c'est pour
+        /// cela qu'il s'allume et bascule sur la bonne entree — puis
+        /// `dlna_play_uri_restee_vide attente_ms=41290 relances=4`, et
+        /// `canal="aucun — aucun renderer connecte a ce flux"`. Vu de lui :
+        /// un bouton Lire sans effet.
+        ///
+        /// Ce banc pose EXACTEMENT cet appareil — `GetMediaInfo` rend une
+        /// `CurrentURI` vide a chaque lecture, pour toujours — et traverse la
+        /// chaine de production entiere : `orch.play()` → `play_inner` →
+        /// `send_to_output` → le vrai `DlnaOutput`. Le point mesure n'est pas
+        /// le journal du serveur, qui portait deja tout : c'est ce que
+        /// l'AUDITEUR recoit.
+        ///
+        /// Le budget de reveil est raccourci a 300 ms — sans quoi cette epreuve
+        /// couterait les 30 s de `BUDGET_REVEIL_STANDBY`. Le cycle traverse est
+        /// le meme, au battement pres.
+        #[tokio::test]
+        async fn un_ampli_qui_ne_tient_aucun_media_fait_remonter_la_cause() {
+            let state = MockState::default();
+            // L'appareil de Reivax66 : sa pile SOAP repond, mais sa
+            // `CurrentURI` reste VIDE quoi qu'on lui envoie.
+            *state.media_info_fige.lock().await = true;
+            *state.current_uri.lock().await = String::new();
+            let (base, handle) = start_mock(state.clone()).await;
+            let (orch, zone_id, recu, _dir) =
+                banc_avec(make_dlna(&base).with_budget_reveil_ms(300)).await;
+            let erreurs = collecter(recu);
+            let resultat = orch
+                .play(PlayRequest {
+                    zone_id,
+                    track_id: Some(1),
+                    source: Some("local".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("play() rend Ok — c'est le piege de ce ticket");
+
+            // 1. LE FAIT DE BASE : l'ordre est bien parti, et il a ete acquitte.
+            let url = resultat
+                .stream_url
+                .clone()
+                .expect("une lecture refusee doit quand meme nommer son URL de flux");
+            let uris = uris_recues(&state).await;
+            assert!(
+                uris.iter().any(|u| *u == url),
+                "aucun SetAVTransportURI ne porte l'URL du flux ({url}) : {uris:?}"
+            );
+            assert!(
+                state.play_count.load(Ordering::Relaxed) >= 1,
+                "le renderer n'a ACQUITTE aucun Play : ce n'est pas le cas mesure ici"
+            );
+            assert!(
+                state.set_uri_corps.lock().await.len() >= 2,
+                "l'URI doit etre REPOSEE pendant l'attente — les « relances » du journal"
+            );
+            assert!(
+                !resultat.output_sent,
+                "le renderer ne tient rien : output_sent doit valoir faux"
+            );
+
+            // 2. CE QUE L'AUDITEUR RECOIT. Le journal du serveur portait deja
+            //    tout le cycle ; la question du ticket est celle-ci.
+            let erreurs = erreurs_apres(&erreurs, std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                erreurs.len(),
+                1,
+                "une et une seule erreur de lecture doit etre annoncee : {erreurs:?}"
+            );
+            let erreur = &erreurs[0];
+            assert_eq!(erreur["zone_id"], zone_id, "l'erreur doit nommer la zone");
+            assert_eq!(
+                erreur["fatal"], true,
+                "sans `fatal`, la fenetre de grace d'apres-lecture du client avale \
+                 le message et l'auditeur n'a, une fois de plus, que le silence"
+            );
+            let texte = erreur["error"].as_str().unwrap_or_default();
+            assert!(
+                texte.contains("acquitte Play") || texte.contains("acquitté Play"),
+                "le message doit NOMMER ce que l'appareil a fait : {texte:?}"
+            );
+            assert!(
+                texte.contains("AUCUN"),
+                "il ne joue pas autre chose — il ne tient RIEN, et c'est ce que \
+                 le message doit dire (#2749) : {texte:?}"
+            );
+            assert!(
+                texte.contains("veille"),
+                "le message doit nommer la conduite qui debloque : un ampli en \
+                 veille reseau, a rallumer : {texte:?}"
+            );
+            handle.abort();
+        }
+    }
+    // ───────────────────────────────────────────────────────────────────────
+    // #3829 — le renderer a redémarré sur un AUTRE port : Tune doit le
+    // redécouvrir par son UDN et rejouer, pas rappeler le port mort.
+    //
+    // Le faux renderer joue Platinum/1.0.5.13 : URLs de contrôle sous
+    // `/AVTransport/<udn>/control.xml`, port tiré au sort à chaque démarrage,
+    // et un répondeur SSDP qui donne la nouvelle `LOCATION` au `M-SEARCH`
+    // unicast. Le port neuf est ASSEMBLÉ À L'EXÉCUTION : aucune aiguille
+    // écrite dans ce fichier ne peut se trouver elle-même.
+    // ───────────────────────────────────────────────────────────────────────
+    mod i3829_port_de_controle_change {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+
+        const UDN: &str = "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE";
+        const FLUX: &str = "http://192.168.1.18:8888/stream/i3829.flac";
+
+        /// Un renderer Platinum sur un port tiré au sort : `description.xml`,
+        /// et les deux services de contrôle sous le chemin exact du relevé.
+        async fn demarrer_renderer(state: MockState) -> (u16, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = Router::new()
+                .route("/description.xml", axum::routing::get(description_xml))
+                .route(&format!("/AVTransport/{UDN}/control.xml"), post(av_handler))
+                .route(
+                    &format!("/RenderingControl/{UDN}/control.xml"),
+                    post(rc_handler),
+                )
+                .with_state(state);
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            (port, handle)
+        }
+
+        /// Le descriptif, aux chemins RELATIFS — c'est la forme Platinum, et
+        /// c'est la relecture qui doit les greffer sur le nouveau port.
+        async fn description_xml() -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let xml = format!(
+                r#"<?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0"><device>
+<deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+<friendlyName>Faux Platinum</friendlyName><manufacturer>Banc</manufacturer><modelName>3829</modelName>
+<UDN>{UDN}</UDN><serviceList>
+<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><serviceId>urn:upnp-org:serviceId:AVTransport</serviceId><controlURL>/AVTransport/{UDN}/control.xml</controlURL><eventSubURL>/AVTransport/{UDN}/event.xml</eventSubURL><SCPDURL>/AVTransport/scpd.xml</SCPDURL></service>
+<service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType><serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId><controlURL>/RenderingControl/{UDN}/control.xml</controlURL><eventSubURL>/RenderingControl/{UDN}/event.xml</eventSubURL><SCPDURL>/RenderingControl/scpd.xml</SCPDURL></service>
+<service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType><serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId><controlURL>/ConnectionManager/{UDN}/control.xml</controlURL><eventSubURL>/ConnectionManager/{UDN}/event.xml</eventSubURL><SCPDURL>/ConnectionManager/scpd.xml</SCPDURL></service>
+</serviceList></device></root>"#
+            );
+            ([("content-type", "text/xml")], xml).into_response()
+        }
+
+        /// Le répondeur SSDP de l'appareil : à chaque `M-SEARCH` reçu, une
+        /// réponse unicast portant la `LOCATION` courante. `location` est lue
+        /// À CHAQUE requête : le banc la fait changer quand l'appareil
+        /// « redémarre ». Compte les requêtes qui nommaient notre UDN.
+        async fn demarrer_repondeur_ssdp(
+            location: Arc<Mutex<Option<String>>>,
+            requetes: Arc<AtomicUsize>,
+        ) -> (u16, tokio::task::JoinHandle<()>) {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let handle = tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let Ok((n, de)) = socket.recv_from(&mut buf).await else {
+                        break;
+                    };
+                    let texte = String::from_utf8_lossy(&buf[..n]);
+                    if !texte.starts_with("M-SEARCH") || !texte.contains(&format!("ST: {UDN}")) {
+                        continue;
+                    }
+                    // Une redécouverte émet plusieurs datagrammes (deux formes
+                    // d'en-tête HOST, un `ssdp:all`) ; on ne compte que la
+                    // forme multicast par UDN, soit UN par redécouverte.
+                    if texte.contains("HOST: 239.255.255.250:1900") {
+                        requetes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let Some(loc) = location.lock().await.clone() else {
+                        // Appareil éteint : silence.
+                        continue;
+                    };
+                    let reponse = format!(
+                        "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nEXT:\r\n\
+                         LOCATION: {loc}\r\nSERVER: UPnP/1.0 DLNADOC/1.50 Platinum/1.0.5.13\r\n\
+                         ST: {UDN}\r\nUSN: {UDN}\r\n\r\n"
+                    );
+                    let _ = socket.send_to(reponse.as_bytes(), de).await;
+                }
+            });
+            (port, handle)
+        }
+
+        fn sortie(port_controle: u16, port_ssdp: u16) -> DlnaOutput {
+            DlnaOutput::new(
+                "Faux Platinum".into(),
+                UDN.into(),
+                "127.0.0.1".into(),
+                format!("http://127.0.0.1:{port_controle}/AVTransport/{UDN}/control.xml"),
+                format!("http://127.0.0.1:{port_controle}/RenderingControl/{UDN}/control.xml"),
+                None,
+            )
+            .with_redecouverte(port_ssdp, std::time::Duration::from_secs(2))
+        }
+
+        /// Attend que plus rien n'écoute sur `port` — le « redémarrage » de
+        /// l'appareil est effectif quand la connexion y est REFUSÉE.
+        async fn attendre_port_ferme(port: u16) {
+            for _ in 0..100 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("le port {port} écoute encore : le banc ne peut pas simuler le redémarrage");
+        }
+
+        /// LE témoin de #3829, par la route : `play_media`.
+        ///
+        /// 1. Tune apprend l'URL de contrôle sur le port A et joue.
+        /// 2. L'appareil « redémarre » : le port A ne répond plus (refus de
+        ///    connexion), la pile repart sur un port B tiré au sort, et le
+        ///    répondeur SSDP annonce la nouvelle `LOCATION`.
+        /// 3. La lecture suivante DOIT aboutir sur le port B, sans que
+        ///    personne n'ait redémarré Tune ni recréé la sortie.
+        #[tokio::test]
+        async fn apres_redemarrage_du_renderer_la_lecture_suit_le_nouveau_port() {
+            let location = Arc::new(Mutex::new(None));
+            let msearch_recus = Arc::new(AtomicUsize::new(0));
+            let (port_ssdp, ssdp) =
+                demarrer_repondeur_ssdp(location.clone(), msearch_recus.clone()).await;
+
+            // 1. Première vie de l'appareil, port A.
+            let etat_a = MockState::default();
+            let (port_a, vie_a) = demarrer_renderer(etat_a.clone()).await;
+            *location.lock().await = Some(format!("http://127.0.0.1:{port_a}/description.xml"));
+            let output = sortie(port_a, port_ssdp);
+            output
+                .play_media(&PlayMedia {
+                    url: FLUX,
+                    mime_type: "audio/flac",
+                    title: Some("Première vie"),
+                    ..Default::default()
+                })
+                .await
+                .expect("première lecture, port A");
+            assert_eq!(etat_a.play_count.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                msearch_recus.load(Ordering::Relaxed),
+                0,
+                "rien à redécouvrir tant que l'appareil répond"
+            );
+
+            // 2. Redémarrage : le port A meurt, la pile repart sur B.
+            vie_a.abort();
+            attendre_port_ferme(port_a).await;
+            let etat_b = MockState::default();
+            let (port_b, vie_b) = demarrer_renderer(etat_b.clone()).await;
+            assert_ne!(port_a, port_b, "le banc doit tirer un autre port");
+            *location.lock().await = Some(format!("http://127.0.0.1:{port_b}/description.xml"));
+
+            // 3. La lecture suivante suit l'appareil.
+            output
+                .play_media(&PlayMedia {
+                    url: FLUX,
+                    mime_type: "audio/flac",
+                    title: Some("Seconde vie"),
+                    ..Default::default()
+                })
+                .await
+                .expect("le renderer a changé de port : la lecture doit le suivre");
+            assert_eq!(
+                etat_b.play_count.load(Ordering::Relaxed),
+                1,
+                "le Play doit être arrivé sur la SECONDE vie de l'appareil"
+            );
+            assert_eq!(
+                *etat_b.current_uri.lock().await,
+                FLUX,
+                "l'URI doit être posée sur le nouveau port"
+            );
+            // L'aiguille : le port B, connu seulement à l'exécution.
+            let ctrl = output.url_av_transport();
+            assert!(
+                ctrl.contains(&format!("127.0.0.1:{port_b}/")),
+                "l'URL de contrôle doit porter le nouveau port {port_b} : {ctrl}"
+            );
+            assert_eq!(
+                msearch_recus.load(Ordering::Relaxed),
+                1,
+                "UNE redécouverte pour UN échec, pas une par action SOAP"
+            );
+            vie_b.abort();
+            ssdp.abort();
+        }
+
+        /// L'appareil est parti pour de bon : le `M-SEARCH` ne rend rien.
+        /// L'erreur d'ORIGINE est rendue, enrichie — pas remplacée — et la
+        /// seconde action dans le répit ne relance PAS de `M-SEARCH`.
+        #[tokio::test]
+        async fn sans_reponse_au_msearch_l_erreur_d_origine_est_rendue_enrichie() {
+            let location = Arc::new(Mutex::new(None)); // silence SSDP
+            let msearch_recus = Arc::new(AtomicUsize::new(0));
+            let (port_ssdp, ssdp) =
+                demarrer_repondeur_ssdp(location.clone(), msearch_recus.clone()).await;
+            let port_mort = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let output = sortie(port_mort, port_ssdp)
+                .with_redecouverte(port_ssdp, std::time::Duration::from_millis(300));
+
+            let debut = std::time::Instant::now();
+            let err = output
+                .set_volume(0.4)
+                .await
+                .expect_err("personne n'écoute et personne ne répond au M-SEARCH");
+            assert!(
+                err.starts_with("soap send:"),
+                "l'erreur d'origine doit rester en tête : {err}"
+            );
+            assert!(
+                err.contains(crate::outputs::dlna::MOTIF_REDECOUVERTE_ECHOUEE),
+                "l'erreur doit être enrichie du motif : {err}"
+            );
+            assert!(
+                debut.elapsed() < std::time::Duration::from_secs(3),
+                "un refus est instantané et le M-SEARCH borné : {:?}",
+                debut.elapsed()
+            );
+            // Dans le répit : pas de second M-SEARCH.
+            let err2 = output.set_volume(0.5).await.expect_err("toujours mort");
+            assert!(err2.starts_with("soap send:"), "{err2}");
+            assert_eq!(
+                msearch_recus.load(Ordering::Relaxed),
+                1,
+                "une seule redécouverte pour deux échecs dans le répit"
+            );
+            ssdp.abort();
+        }
+
+        /// Une faute SOAP APPLICATIVE n'est pas un motif : l'appareil est
+        /// joignable et dit autre chose. Aucun `M-SEARCH` ne doit partir.
+        #[tokio::test]
+        async fn une_faute_soap_applicative_ne_redecouvre_pas() {
+            use axum::response::IntoResponse;
+            let location = Arc::new(Mutex::new(None));
+            let msearch_recus = Arc::new(AtomicUsize::new(0));
+            let (port_ssdp, ssdp) =
+                demarrer_repondeur_ssdp(location.clone(), msearch_recus.clone()).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = Router::new().route(
+                &format!("/RenderingControl/{UDN}/control.xml"),
+                post(|| async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        soap_fault_upnp(714, "Illegal MIME-Type"),
+                    )
+                        .into_response()
+                }),
+            );
+            let vie = tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let output = sortie(port, port_ssdp);
+            let _ = output.set_volume(0.4).await;
+            assert_eq!(
+                msearch_recus.load(Ordering::Relaxed),
+                0,
+                "un 500 avec corps SOAP n'est pas un port mort : pas de M-SEARCH"
+            );
+            vie.abort();
+            ssdp.abort();
+        }
     }
 }

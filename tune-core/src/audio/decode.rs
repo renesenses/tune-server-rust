@@ -111,7 +111,13 @@ fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
 /// et la largeur annoncée redevient celle des octets réellement écrits — c'est
 /// ce désaccord-là qui faisait lire des trames de 32 bits dans des octets de
 /// 16 (#2157).
-fn container_bit_depth(bd: u16) -> u16 {
+///
+/// La même règle vaut pour la profondeur **de sortie** négociée par
+/// l'orchestrateur : `encode_wav`, `pcm_to_i32` (FLAC) et `convert_pcm_bit_depth`
+/// n'écrivent que 16, 24 ou 32 bits. Une cible hors de cet ensemble n'est pas
+/// « approximative », elle est ININSCRIPTIBLE — voir `transcode_source_to_file`
+/// (#1437).
+pub(crate) fn container_bit_depth(bd: u16) -> u16 {
     match bd {
         0..=16 => 16,
         17..=24 => 24,
@@ -296,9 +302,21 @@ struct StreamingPcmAdapter {
 ///
 /// Network chunks are not required to end on a sample or frame boundary.  The
 /// incomplete tail is therefore retained until the next call, while complete
-/// frames go through the same channel/rate adapter as file decoding.  A final
-/// partial frame is an invalid payload and is reported instead of silently
-/// truncating it.
+/// frames go through the same channel/rate adapter as file decoding.
+///
+/// **En fin de flux, le report n'est plus possible** : il n'y a pas de bloc
+/// suivant auquel préfixer le reliquat. Des trois issues — jeter, compléter par
+/// des zéros, reporter — seule la première tient ici. Un reliquat de 1 à 3
+/// octets est une FRACTION d'échantillon : il ne porte aucune valeur PCM
+/// décodable, le compléter par des zéros fabriquerait un échantillon qui
+/// n'existe pas (donc un micro-clic), et le reporter n'a plus de destinataire.
+/// `finish()` le jette donc et en rend le compte, à charge pour l'appelant de
+/// le journaliser.
+///
+/// Cette fonction rendait une `Err` : une piste jouée INTÉGRALEMENT échouait sur
+/// ses 1 à 2 derniers octets, la sortie OAAT remontait un refus non rejouable,
+/// le poller coupait la zone et la transition gapless déjà armée était annulée
+/// (#3163, Steve Taylor, fil 1641).
 pub(crate) struct StreamingPcmByteAdapter {
     pcm: StreamingPcmAdapter,
     source_bit_depth: u16,
@@ -482,19 +500,23 @@ impl StreamingPcmByteAdapter {
         ))
     }
 
-    pub(crate) fn finish(&mut self) -> Result<Vec<u8>, String> {
-        if !self.source_leftover.is_empty() {
-            return Err(format!(
-                "PCM stream ended with {} byte(s) outside a complete {}-byte source frame",
-                self.source_leftover.len(),
-                self.source_frame_bytes
-            ));
-        }
+    /// Taille d'une trame source, en octets — ce qu'un reliquat n'a pas atteint.
+    pub(crate) fn source_frame_bytes(&self) -> usize {
+        self.source_frame_bytes
+    }
+
+    /// Termine le flux.
+    ///
+    /// Rend les octets adaptés restants **et le nombre d'octets source jetés**
+    /// parce qu'ils ne complétaient pas une trame. Ce compte vaut 0 sur un flux
+    /// dont la longueur tombe juste ; l'appelant journalise le cas contraire.
+    pub(crate) fn finish(&mut self) -> Result<(Vec<u8>, usize), String> {
+        // Jeté, pas complété ni reporté : voir la note de type.
+        let residu_abandonne = std::mem::take(&mut self.source_leftover).len();
         let adapted = self.pcm.finish()?;
-        Ok(convert_pcm_bit_depth(
-            &adapted,
-            self.source_bit_depth,
-            self.target_bit_depth,
+        Ok((
+            convert_pcm_bit_depth(&adapted, self.source_bit_depth, self.target_bit_depth),
+            residu_abandonne,
         ))
     }
 }
@@ -748,6 +770,13 @@ static STAGE_CACHE: LazyLock<Mutex<StageCache>> =
 /// plateformes. Un bloc `cfg(linux)` ne serait ni compilé ni testé depuis
 /// macOS — c'est ainsi qu'une fonction morte a déjà été livrée (#2277).
 /// Le point de montage le plus LONG qui préfixe le chemin gagne.
+///
+/// Son unique appelant de production, [`chemin_sur_montage_reseau`], n'existe
+/// que sur Linux et Android : ailleurs (Darwin passe par `statfs`) elle n'a
+/// d'appelant que ses tests, et le compilateur la signale « never used ».
+/// L'`allow` est donc borné à ces plateformes-là — le rendre inconditionnel
+/// masquerait la mort de la fonction le jour où l'appelant Linux disparaîtrait.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 fn montage_reseau_depuis_mounts(mounts: &str, cible: &str) -> bool {
     const TYPES_RESEAU: &[&str] = &[
         "nfs",
@@ -838,8 +867,84 @@ fn chemin_sur_montage_reseau(_chemin: &Path) -> bool {
     false
 }
 
+/// Fenetre bornee au-dela de laquelle une copie integrale reste defendable.
+///
+/// La copie prealable existe pour epargner au decodeur ses allers-retours par
+/// seek sur un montage reseau. Elle se paie en octets : le fichier ENTIER.
+/// Tant qu'on decode le fichier entier, l'echange est neutre. Des qu'on n'en
+/// demande qu'une fenetre, il ne l'est plus — copier 60 Mo pour en lire 2 est
+/// une amplification pure.
+///
+/// #2156 — c'est le regime de la passe acoustique : elle demande DIX SECONDES
+/// par piste (`audio/embedding.rs`, `decode_to_pcm(.., 0.0, 10.0)`) et
+/// parcourt la bibliotheque entiere, machine au repos. Sur un montage reseau,
+/// chaque piste etait donc rapatriee en entier puis jetee — la copie est
+/// supprimee par le `Drop` de [`StagedFile`], ce qui explique qu'un testeur
+/// cherchant « quel fichier Tune ecrit » ne trouve rien sur le disque.
+///
+/// **120 s, et ce nombre est mesure, pas choisi.** C'est la plus grande
+/// fenetre de tete qu'un appelant demande, avec de la marge : l'empreinte
+/// perceptuelle lit `FENETRE_S + MARGE_SILENCE_S` = **90 s**
+/// (`audio/empreinte.rs:46-48`), la passe acoustique et la sonde MQA en
+/// demandent **10**. Aucun chemin de LECTURE ne passe par ici avec une borne :
+/// ils passent tous `0.0`, la convention « pas de limite ».
 #[cfg(unix)]
-fn stage_locally_for_decode(src: &str) -> Option<Arc<StagedFile>> {
+pub(crate) const FENETRE_SANS_COPIE_S: f64 = 120.0;
+
+/// La lecture demandee est-elle une COURTE FENETRE DE TETE ?
+///
+/// Deux conditions, et les deux comptent :
+///
+/// * `max_duration_s` borne et courte — `0.0` est la convention « pas de
+///   limite » de [`decode_to_pcm`], un decodage integral pour lequel la copie
+///   garde tout son sens ;
+/// * `seek_s` nul — on lit depuis le DEBUT, donc de facon purement
+///   sequentielle. C'est la seule forme ou la copie prealable n'achete
+///   strictement rien : elle existe pour amortir des allers-retours par seek,
+///   et il n'y en a aucun.
+///
+/// La condition sur `seek_s` n'est pas un exces de prudence, elle a ete posee
+/// apres recensement des appelants. Trois passes lisent une fenetre de tete —
+/// l'empreinte acoustique (`audio/embedding.rs`, 10 s), la sonde MQA
+/// (`routes/mqa.rs`, 10 s) et l'empreinte perceptuelle (`audio/empreinte.rs`,
+/// 90 s) — et ce sont exactement celles qui parcourent la bibliotheque entiere
+/// en tache de fond. Deux autres lisent des fenetres AILLEURS dans le fichier :
+/// l'analyseur par segments (`audio/analyzer.rs`, un `seek` par segment) et le
+/// transcodage d'une tranche CUE (`orchestrator/transcodage.rs`, `debut_s`).
+/// Celles-la paient de vrais allers-retours et gardent le comportement
+/// d'aujourd'hui — la copie reste amortie par `STAGE_CACHE`.
+#[cfg(unix)]
+pub(crate) fn fenetre_de_tete_bornee(seek_s: f64, max_duration_s: f64) -> bool {
+    seek_s <= 0.0 && max_duration_s > 0.0 && max_duration_s <= FENETRE_SANS_COPIE_S
+}
+
+#[cfg(unix)]
+fn stage_locally_for_decode(
+    src: &str,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Option<Arc<StagedFile>> {
+    stager_pour_decodage(
+        src,
+        chemin_sur_montage_reseau(Path::new(src)),
+        seek_s,
+        max_duration_s,
+    )
+}
+
+/// Le corps de [`stage_locally_for_decode`], avec le verdict de montage et la
+/// fenetre EN PARAMETRE.
+///
+/// Separee pour que la garde puisse mesurer l'effet observable — les octets
+/// reellement recopies — sans avoir a fabriquer un montage reseau : aucune
+/// suite de tests ne peut monter un NFS.
+#[cfg(unix)]
+fn stager_pour_decodage(
+    src: &str,
+    sur_montage_reseau: bool,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Option<Arc<StagedFile>> {
     let src_path = Path::new(src);
     let tmp_dir = std::env::temp_dir();
     // ⚠️ Le critère est le TYPE de montage, pas le numéro de périphérique.
@@ -851,8 +956,18 @@ fn stage_locally_for_decode(src: &str) -> Option<Arc<StagedFile>> {
     // Seuls les montages RÉSEAU (nfs, cifs/smb, sshfs, webdav…) paient des
     // allers-retours par seek et justifient la copie préalable (Yves, NAS
     // en WiFi : 90 s et plus par piste sans elle).
-    if !chemin_sur_montage_reseau(src_path) {
+    if !sur_montage_reseau {
         return None; // stockage local : le décodeur lit sur place
+    }
+    // #2156 — une fenetre bornee ne justifie pas de rapatrier le fichier
+    // entier. Voir [`FENETRE_SANS_COPIE_S`].
+    if fenetre_de_tete_bornee(seek_s, max_duration_s) {
+        tracing::info!(
+            src = %src,
+            fenetre_s = max_duration_s,
+            "decode_source_stage_evite_fenetre_de_tete"
+        );
+        return None;
     }
 
     // Staging PIPELINÉ (phase 2, flag TUNE_STAGE_STREAM_DECODE) : au lieu de
@@ -1012,7 +1127,11 @@ fn mtime_secs(m: &std::fs::Metadata) -> i64 {
 }
 
 #[cfg(not(unix))]
-fn stage_locally_for_decode(_src: &str) -> Option<Arc<StagedFile>> {
+fn stage_locally_for_decode(
+    _src: &str,
+    _seek_s: f64,
+    _max_duration_s: f64,
+) -> Option<Arc<StagedFile>> {
     None
 }
 
@@ -1045,7 +1164,7 @@ pub fn decode_to_pcm(
     // decoder's many small seeks don't each cost a network round-trip (Yves: NAS
     // over WiFi, 90s+ per track). No-op for local files. The guard lives for the
     // whole decode; the temp is removed when it drops.
-    let _staged = stage_locally_for_decode(file_path);
+    let _staged = stage_locally_for_decode(file_path, seek_s, max_duration_s);
     let file_path: &str = _staged
         .as_ref()
         .and_then(|s| s.path.to_str())
@@ -1453,6 +1572,157 @@ pub fn decode_to_pcm_streaming_seeked(
     )
 }
 
+/// Le décodage progressif d'une TRANCHE : `seek_s` donne le début, `duree_s`
+/// la longueur, tous deux dans le fichier source (#3631).
+///
+/// C'est ce que réclame une piste virtuelle de feuille CUE : le fichier image
+/// porte l'album entier, la piste n'en est qu'un intervalle. Le début passe par
+/// le même `seek_s` que le seek utilisateur ; la fin, elle, n'existait nulle
+/// part dans ce dépôt — c'est [`borner_la_fin`] qui la pose.
+pub fn decode_to_pcm_streaming_tranche(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
+    seek_s: f64,
+    duree_s: Option<f64>,
+) -> Result<(u16, u32), String> {
+    let tx = borner_la_fin(
+        tx,
+        duree_s,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+    );
+    decode_to_pcm_streaming_inner(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        Some(data_ready),
+        Some(levels_tx),
+        seek_s,
+        None,
+    )
+}
+
+/// Combien d'octets de PCM valent `duree_s` dans le format de sortie annoncé.
+///
+/// `None` dès qu'une des trois dimensions manque : sans cadence, sans nombre de
+/// canaux ou sans profondeur, un nombre d'octets ne veut rien dire. Mieux vaut
+/// ne PAS borner et le dire que borner au hasard — une borne fausse coupe la
+/// musique.
+pub(crate) fn octets_pour(
+    duree_s: f64,
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
+    bit_depth: Option<u16>,
+) -> Option<usize> {
+    if !duree_s.is_finite() || duree_s <= 0.0 {
+        return None;
+    }
+    let (sr, ch, bd) = (sample_rate?, channels?, bit_depth?);
+    if sr == 0 || ch == 0 || bd == 0 {
+        return None;
+    }
+    let octets_par_trame = ch as usize * (bd as usize / 8);
+    if octets_par_trame == 0 {
+        return None;
+    }
+    let trames = (duree_s * sr as f64).round();
+    if trames <= 0.0 {
+        return None;
+    }
+    Some((trames as usize).saturating_mul(octets_par_trame))
+}
+
+/// Interpose un relais qui ARRÊTE le flux après `duree_s` de PCM.
+///
+/// # Pourquoi un relais, et pas une borne dans chaque boucle
+///
+/// [`decode_to_pcm_streaming_inner`] a **cinq** boucles d'émission — symphonia,
+/// DSD, Opus, Monkey's Audio, et le repli AIFF/WavPack. Recopier la même
+/// arithmétique dans chacune, c'est cinq occasions de la faire diverger, et
+/// c'est toucher cinq chemins de lecture éprouvés pour un besoin qui ne
+/// concerne que les feuilles CUE. Le relais, lui, ne touche AUCUNE des cinq :
+/// il compte les octets qui sortent et lâche son récepteur quand le compte est
+/// atteint. Le `tx.send` suivant du décodeur échoue alors, et les cinq boucles
+/// savent déjà sortir proprement là-dessus (« consumer_dropped »).
+///
+/// # Ce qui n'est pas compté
+///
+/// Le tout premier bloc quand une profondeur cible est demandée : c'est
+/// l'en-tête WAV, que les cinq branches émettent avant la moindre trame. Le
+/// compter volerait 44 octets à la musique.
+///
+/// Sans `duree_s`, ou si le format de sortie n'est pas entièrement connu, le
+/// canal est rendu TEL QUEL : aucun relais, aucun coût, comportement d'avant à
+/// l'octet près.
+fn borner_la_fin(
+    tx: mpsc::Sender<Vec<u8>>,
+    duree_s: Option<f64>,
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
+    bit_depth: Option<u16>,
+) -> mpsc::Sender<Vec<u8>> {
+    let Some(duree_s) = duree_s else {
+        return tx;
+    };
+    let Some(budget) = octets_pour(duree_s, sample_rate, channels, bit_depth) else {
+        tracing::warn!(
+            duree_s,
+            ?sample_rate,
+            ?channels,
+            ?bit_depth,
+            "borne_de_fin_non_calculable — flux servi ENTIER"
+        );
+        return tx;
+    };
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("borne_de_fin_sans_runtime — flux servi ENTIER");
+        return tx;
+    };
+    let entete_a_epargner = bit_depth.is_some();
+    let (relais_tx, mut relais_rx) = mpsc::channel::<Vec<u8>>(8);
+    rt.spawn(async move {
+        let mut emis: usize = 0;
+        let mut premier = true;
+        while let Some(mut bloc) = relais_rx.recv().await {
+            if premier {
+                premier = false;
+                if entete_a_epargner {
+                    if tx.send(bloc).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            let reste = budget.saturating_sub(emis);
+            if bloc.len() > reste {
+                bloc.truncate(reste);
+            }
+            emis += bloc.len();
+            if !bloc.is_empty() && tx.send(bloc).await.is_err() {
+                break;
+            }
+            if emis >= budget {
+                break;
+            }
+        }
+        debug!(emis, budget, "borne_de_fin_atteinte");
+        // `relais_rx` et `tx` meurent ici : le décodeur voit son prochain
+        // envoi échouer et s'arrête de lui-même, et le consommateur voit la
+        // fin du flux.
+    });
+    relais_tx
+}
+
 /// Variante HTTP seekable du decodeur progressif. La source a deja prouve le
 /// support de `Range`; Symphonia peut donc lire l'atome `moov` a la fin d'un
 /// M4A puis revenir aux premiers paquets sans telecharger tout le media (#1885).
@@ -1640,9 +1910,51 @@ fn decode_to_pcm_streaming_inner(
         return Ok((output_bd, sr));
     }
 
+    // Monkey's Audio (.ape) : décodage réellement incrémental (#2505).
+    //
+    // C'EST le chemin emprunté à la lecture d'un `.ape` : l'orchestrateur
+    // appelle `decode_to_pcm_streaming_with_levels` / `_seeked`, qui aboutissent
+    // tous deux ici. `.ape` était rangé avec `aiff`/`aif`/`wv` dans le repli
+    // « décodage intégral puis découpage » juste en dessous — le nom
+    // « streaming » mentait pour ces quatre extensions.
+    //
+    // `catch_unwind` : le catch symphonia plus bas ne couvre pas cette branche
+    // (return anticipé), et un panic du décodeur entropique tiers sur un
+    // fichier corrompu tuerait le worker au lieu de produire une erreur propre.
+    if ext == "ape" {
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| "no tokio runtime for streaming decode")?;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            decode_ape_streaming(
+                file_path,
+                target_sample_rate,
+                target_channels,
+                target_bit_depth,
+                tx,
+                chunk_size,
+                &mut first_chunk_sent,
+                &data_ready,
+                &levels_tx,
+                &rt,
+                seek_s,
+            )
+        }));
+        return match result {
+            Ok(inner) => inner,
+            Err(_) => Err("ape: decoder panicked (corrupt file?)".into()),
+        };
+    }
     // Non-symphonia formats: fall back to full decode then stream chunks.
     // This still benefits from the session being created early.
-    if matches!(ext.as_str(), "aiff" | "aif" | "wv" | "ape") {
+    //
+    // `.ape` en est SORTI (#2505) : il a désormais son propre chemin
+    // incrémental juste au-dessus. `aiff`/`aif`/`wv` restent ici parce que
+    // leurs décodeurs (`audio::aiff::decode_aiff_to_pcm`,
+    // `audio::wavpack::decode_wavpack_to_pcm`) n'exposent QUE le décodage
+    // intégral : leur donner le même traitement demande de les réécrire en
+    // décodeurs par blocs, ce qui est un autre chantier que #2505. Ils
+    // souffrent du même défaut et il est nommé ici plutôt que tu.
+    if matches!(ext.as_str(), "aiff" | "aif" | "wv") {
         let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, 0.0, 0.0)?;
         // Use target_bit_depth if provided, otherwise use the decoder's native depth.
         // This ensures the PCM byte encoding matches the WAV header declaration.
@@ -2054,166 +2366,542 @@ fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// SPIKE (#1145): decode a Monkey's Audio (.ape) file to PCM using the
-/// pure-Rust `ape-decoder` crate. Returns right-justified i32 samples in a
-/// `DecodedAudio`, matching the symphonia path's contract.
+/// En-tête `.ape` validé, partagé par le décodage par lots et le décodage
+/// incrémental (#2505).
 ///
-/// The crate decodes to interleaved little-endian PCM bytes at the file's
-/// native bit depth (16/24/32). We deinterleave into right-justified i32
-/// samples so `pcm_bytes()` / `convert_pcm_bit_depth()` behave exactly as for
-/// the symphonia decoders. `seek_s` uses the crate's sample-accurate
-/// `decode_from`; `max_duration_s` truncates the sample buffer afterward.
+/// Les deux chemins doivent refuser EXACTEMENT les mêmes fichiers : si la
+/// conversion rejetait un en-tête que la lecture accepte, le fichier forgé
+/// entrerait quand même dans le décodeur par la porte de la lecture.
+struct ApeHeaderInfo {
+    sample_rate: u32,
+    channels: u32,
+    /// Profondeur native annoncée par le fichier (8/16/24/32).
+    bit_depth: u16,
+    /// Profondeur rendue au reste du pipeline : le 8 bits est élargi en 16,
+    /// profondeur minimale du WAV.
+    out_bit_depth: u16,
+    is_signed_8bit: bool,
+    total_samples: u64,
+    total_frames: u32,
+    blocks_per_frame: u32,
+}
+
+impl ApeHeaderInfo {
+    /// Nombre d'échantillons ENTRELACÉS (canaux compris) d'une trame APE.
+    /// C'est la granularité réelle du décodage : `ape-decoder` code le flux en
+    /// trames indépendantes de `blocks_per_frame` blocs, et n'en décode jamais
+    /// moins.
+    fn frame_interleaved_samples(&self) -> usize {
+        (self.blocks_per_frame as usize).saturating_mul(self.channels as usize)
+    }
+}
+
+/// Ouvre un `.ape` et valide son en-tête AVANT tout décodage.
 ///
-/// NOT production-hardened: no local staging tuning, decodes the whole file
-/// into memory (a large 24/96 .ape can be ~1 GB PCM — the streaming path in
-/// decode_to_pcm_streaming_inner already routes .ape through full decode + chunk).
-fn decode_ape_to_pcm(
+/// Garde-fous : refus du virgule flottante (non géré par le pipeline entier),
+/// des profondeurs hors 8/16/24/32, des comptes de canaux et des fréquences
+/// invraisemblables. Ils protègent d'un en-tête forgé ; le plafond
+/// d'allocation, lui, n'appartient qu'au chemin par lots (voir
+/// `decode_ape_to_pcm`), le chemin incrémental ne matérialisant jamais la
+/// piste entière.
+///
+/// `bras` nomme le chemin qui ouvre — `"progressif"` ou `"fichier"`. Il part
+/// dans le journal parce que c'est LA question qu'un rapport de terrain sur un
+/// `.ape` muet ne permettait pas de trancher : le décodeur incrémental livré en
+/// v0.9.131 (#2505) n'est branché que sur le premier, et rien dans le journal
+/// ne disait lequel avait servi (#3311).
+fn ape_open_checked(
     file_path: &str,
-    seek_s: f64,
-    max_duration_s: f64,
-) -> Result<DecodedAudio, String> {
-    use std::io::BufReader;
-
+    bras: &str,
+) -> Result<
+    (
+        ape_decoder::ApeDecoder<std::io::BufReader<File>>,
+        ApeHeaderInfo,
+    ),
+    String,
+> {
     let file = File::open(file_path).map_err(|e| format!("open ape: {e}"))?;
-    let mut decoder =
-        ape_decoder::ApeDecoder::new(BufReader::new(file)).map_err(|e| format!("ape open: {e}"))?;
-
-    // Copy out the fields we need BEFORE any &mut decode call: info() borrows
-    // the decoder immutably and decode_all/decode_from borrow it mutably.
-    let (sample_rate, channels, bit_depth, is_float, is_signed_8bit, total_samples) = {
-        let info = decoder.info();
-        (
-            info.sample_rate,
-            info.channels as u32,
-            info.bits_per_sample,
-            info.is_floating_point,
-            info.is_signed_8bit,
-            info.total_samples,
-        )
-    };
-
-    if is_float {
+    let decoder = ape_decoder::ApeDecoder::new(std::io::BufReader::new(file))
+        .map_err(|e| format!("ape open: {e}"))?;
+    let info = decoder.info();
+    let sample_rate = info.sample_rate;
+    let channels = info.channels as u32;
+    let bit_depth = info.bits_per_sample;
+    // Ce que le fichier DIT de lui-même, avant tout décodage et avant tout
+    // garde-fou : version APE, niveau de compression, format, découpage en
+    // trames et durée. Au niveau `info` DÉLIBÉRÉMENT — le journal exporté par
+    // « Diagnostics » est filtré à `info`, et une ligne `debug` n'y figurerait
+    // pas. Une seule ligne par ouverture de `.ape` (#3311).
+    tracing::info!(
+        file = file_path,
+        bras,
+        version = info.version,
+        compression = info.compression_level,
+        sample_rate,
+        bit_depth,
+        channels,
+        floating_point = info.is_floating_point,
+        total_blocks = info.total_samples,
+        total_frames = info.total_frames,
+        blocks_per_frame = info.blocks_per_frame,
+        duree_s = info.duration_ms as f64 / 1000.0,
+        pcm_declare_octets = info
+            .total_samples
+            .saturating_mul(u64::from(info.channels))
+            .saturating_mul(u64::from(info.bits_per_sample / 8).max(1)),
+        "ape_ouvert"
+    );
+    if info.is_floating_point {
         return Err("Monkey's Audio (.ape) floating-point source not supported".into());
     }
     if !matches!(bit_depth, 8 | 16 | 24 | 32) {
         return Err(format!("ape: unsupported bit depth {bit_depth}"));
     }
     // Garde-fous d'en-tête : un fichier corrompu/forgé peut annoncer des
-    // valeurs absurdes que le décodage intégral en mémoire transformerait en
-    // allocation démesurée (un 24/96 légitime fait déjà ~1 Go de PCM).
+    // valeurs absurdes que le décodage transformerait en allocation démesurée.
     if channels == 0 || channels > 8 {
         return Err(format!("ape: implausible channel count {channels}"));
     }
     if sample_rate == 0 || sample_rate > 384_000 {
         return Err(format!("ape: implausible sample rate {sample_rate}"));
     }
-    // Plafond d'allocation calculé depuis l'en-tête, AVANT decode_all.
-    const MAX_APE_PCM_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-    let bytes_per = u64::from(bit_depth / 8).max(1);
-    let expected_bytes = total_samples
-        .saturating_mul(u64::from(channels))
-        .saturating_mul(bytes_per);
-    if expected_bytes > MAX_APE_PCM_BYTES {
-        return Err(format!(
-            "ape: decoded size would exceed {} GiB (header claims {total_samples} samples)",
-            MAX_APE_PCM_BYTES / (1024 * 1024 * 1024)
-        ));
-    }
-
-    // Sample-accurate seek: decode from the requested sample offset onward.
-    let start_sample = if seek_s > 0.0 {
-        (seek_s * sample_rate as f64) as u64
-    } else {
-        0
+    let header = ApeHeaderInfo {
+        sample_rate,
+        channels,
+        bit_depth,
+        out_bit_depth: if bit_depth == 8 { 16 } else { bit_depth },
+        is_signed_8bit: info.is_signed_8bit,
+        total_samples: info.total_samples,
+        total_frames: info.total_frames,
+        blocks_per_frame: info.blocks_per_frame,
     };
+    Ok((decoder, header))
+}
 
-    let pcm: Vec<u8> = if start_sample > 0 {
-        decoder
-            .decode_from(start_sample)
-            .map_err(|e| format!("ape decode_from: {e}"))?
-    } else {
-        decoder
-            .decode_all()
-            .map_err(|e| format!("ape decode_all: {e}"))?
-    };
-
-    // Deinterleave native-depth LE PCM bytes into right-justified i32 samples.
-    let bytes_per_sample = (bit_depth / 8) as usize;
+/// Déinterleave un bloc de PCM natif petit-boutiste en échantillons `i32`
+/// justifiés à droite, AJOUTÉS à `out` (le tampon est réutilisé d'une trame à
+/// l'autre : c'est ce qui rend le décodage incrémental à mémoire bornée).
+///
+/// L'élargissement 8 → 16 bits est replié ici : il était appliqué en fin de
+/// décodage sur le tampon entier, ce qu'un chemin incrémental ne peut plus
+/// faire. Le résultat est identique bit à bit.
+fn ape_pcm_to_i32(pcm: &[u8], header: &ApeHeaderInfo, out: &mut Vec<i32>) -> Result<(), String> {
+    let bytes_per_sample = (header.bit_depth / 8) as usize;
     if bytes_per_sample == 0 || pcm.len() % bytes_per_sample != 0 {
         return Err("ape: PCM byte length not aligned to sample size".into());
     }
-    let mut samples: Vec<i32> = Vec::with_capacity(pcm.len() / bytes_per_sample);
-    match bit_depth {
+    out.reserve(pcm.len() / bytes_per_sample);
+    match header.bit_depth {
         8 => {
             // APE 8-bit is unsigned by default; is_signed_8bit overrides.
-            let signed = is_signed_8bit;
-            for b in &pcm {
+            let signed = header.is_signed_8bit;
+            for b in pcm {
                 let v = if signed {
                     *b as i8 as i32
                 } else {
                     *b as i32 - 128
                 };
-                samples.push(v);
+                // 8 bits élargi en 16 pour la suite du pipeline.
+                out.push(v << 8);
             }
         }
         16 => {
             for b in pcm.chunks_exact(2) {
-                samples.push(i16::from_le_bytes([b[0], b[1]]) as i32);
+                out.push(i16::from_le_bytes([b[0], b[1]]) as i32);
             }
         }
         24 => {
             for b in pcm.chunks_exact(3) {
                 let v = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
                 // sign-extend 24-bit -> i32
-                samples.push((v << 8) >> 8);
+                out.push((v << 8) >> 8);
             }
         }
         32 => {
             for b in pcm.chunks_exact(4) {
-                samples.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                out.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
             }
         }
-        _ => unreachable!(),
+        other => return Err(format!("ape: unsupported bit depth {other}")),
     }
+    Ok(())
+}
 
-    // Optional truncation to max_duration_s (whole frames).
-    if max_duration_s > 0.0 {
-        let max_samples = (max_duration_s * sample_rate as f64 * channels as f64) as usize;
-        if samples.len() > max_samples {
-            samples.truncate(max_samples);
+/// Position de départ d'une lecture `.ape` : trame contenant l'échantillon visé
+/// et reliquat entrelacé à jeter DANS cette trame.
+///
+/// `ApeDecoder::seek` est exact à l'échantillon (`SeekResult.skip_samples`) :
+/// c'est la propriété que le module revendique et que le passage à
+/// l'incrémental ne doit pas perdre. `decode_from` — employé jusqu'ici —
+/// s'appuie sur le même `seek`, mais ne rend QUE la fin de la trame trouvée
+/// (une trame APE ≈ 6,7 s à 44,1 kHz) : la lecture depuis un point de recherche
+/// s'arrêtait donc au bout de quelques secondes.
+fn ape_start_position(
+    decoder: &mut ape_decoder::ApeDecoder<std::io::BufReader<File>>,
+    header: &ApeHeaderInfo,
+    seek_s: f64,
+) -> Result<(u32, usize), String> {
+    if seek_s <= 0.0 {
+        return Ok((0, 0));
+    }
+    let start_sample = (seek_s * header.sample_rate as f64) as u64;
+    if start_sample == 0 {
+        return Ok((0, 0));
+    }
+    let pos = decoder
+        .seek(start_sample)
+        .map_err(|e| format!("ape seek: {e}"))?;
+    Ok((
+        pos.frame_index,
+        (pos.skip_samples as usize).saturating_mul(header.channels as usize),
+    ))
+}
+
+/// Décode un Monkey's Audio (`.ape`) ENTIER en PCM, trame par trame.
+///
+/// Rend des `i32` justifiés à droite dans un `DecodedAudio`, exactement comme
+/// le chemin symphonia. Ce chemin-ci est celui des consommateurs qui exigent la
+/// piste entière en mémoire (conversion, analyse) : son contrat est
+/// `DecodedAudio`, donc il alloue la piste. Le plafond d'allocation lui reste
+/// donc attaché.
+///
+/// La lecture, elle, ne passe plus par ici : `decode_to_pcm_streaming_inner`
+/// route `.ape` vers `decode_ape_streaming`, qui émet au fil de l'eau (#2505).
+///
+/// Même trame par trame, ce chemin économise déjà le tampon d'octets
+/// intermédiaire : `decode_all` matérialisait la totalité du PCM natif (2 à 3
+/// octets/échantillon) EN PLUS du vecteur `i32` final (4 octets/échantillon).
+///
+/// `seek_s` reste exact à l'échantillon ; `max_duration_s` ARRÊTE maintenant le
+/// décodage au lieu de tronquer un tampon déjà rempli.
+fn decode_ape_to_pcm(
+    file_path: &str,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
+    let (mut decoder, header) = ape_open_checked(file_path, "fichier")?;
+    // Plafond d'allocation calculé depuis l'en-tête, AVANT tout décodage.
+    // Il garde CE chemin, dont le contrat (`DecodedAudio`) est de rendre la
+    // piste entière : ici, et ici seulement, une piste longue devient
+    // réellement un gigaoctet en mémoire.
+    const MAX_APE_PCM_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+    let bytes_per = u64::from(header.bit_depth / 8).max(1);
+    let expected_bytes = header
+        .total_samples
+        .saturating_mul(u64::from(header.channels))
+        .saturating_mul(bytes_per);
+    if expected_bytes > MAX_APE_PCM_BYTES {
+        // Nommé dans le journal, et pas seulement rendu à l'appelant : c'est
+        // le mur DUR de ce bras, franchi par un 24/96 au-delà de ~52 minutes,
+        // et un rapport de terrain doit pouvoir le lire (#3311).
+        tracing::warn!(
+            file = file_path,
+            plafond_octets = MAX_APE_PCM_BYTES,
+            pcm_declare_octets = expected_bytes,
+            total_blocks = header.total_samples,
+            channels = header.channels,
+            bit_depth = header.bit_depth,
+            "ape_lots_plafond_depasse"
+        );
+        return Err(format!(
+            "ape: decoded size would exceed {} GiB (header claims {} samples)",
+            MAX_APE_PCM_BYTES / (1024 * 1024 * 1024),
+            header.total_samples
+        ));
+    }
+    let (start_frame, mut skip_interleaved) = ape_start_position(&mut decoder, &header, seek_s)?;
+    // `max_duration_s` borne le décodage : on s'arrête dès que la fenêtre est
+    // pleine, sans décoder la fin de la piste pour la jeter ensuite.
+    let max_samples: usize = if max_duration_s > 0.0 {
+        (max_duration_s * header.sample_rate as f64 * header.channels as f64) as usize
+    } else {
+        usize::MAX
+    };
+    let start_sample = (start_frame as u64).saturating_mul(u64::from(header.blocks_per_frame));
+    let expected_out = (header
+        .total_samples
+        .saturating_sub(start_sample)
+        .min(usize::MAX as u64) as usize)
+        .saturating_mul(header.channels as usize)
+        .min(max_samples);
+    let mut samples: Vec<i32> = Vec::with_capacity(expected_out);
+    let mut frame_samples: Vec<i32> = Vec::with_capacity(header.frame_interleaved_samples());
+    for frame_idx in start_frame..header.total_frames {
+        if samples.len() >= max_samples {
+            break;
         }
+        let frame_pcm = decoder
+            .decode_frame(frame_idx)
+            .map_err(|e| format!("ape decode_frame {frame_idx}: {e}"))?;
+        frame_samples.clear();
+        ape_pcm_to_i32(&frame_pcm, &header, &mut frame_samples)?;
+        drop(frame_pcm);
+        let from = skip_interleaved.min(frame_samples.len());
+        skip_interleaved = 0;
+        let room = max_samples.saturating_sub(samples.len());
+        let to = frame_samples.len().min(from.saturating_add(room));
+        samples.extend_from_slice(&frame_samples[from..to]);
     }
-
-    // 8-bit is widened to 16-bit for the rest of the pipeline (WAV min depth).
-    let out_bd = if bit_depth == 8 { 16 } else { bit_depth };
-    if bit_depth == 8 {
-        for s in samples.iter_mut() {
-            *s <<= 8;
-        }
-    }
-
-    let total_frames = samples.len() as f64 / channels as f64;
-    let duration_s = total_frames / sample_rate as f64;
-
+    let out_bd = header.out_bit_depth;
+    let total_frames = samples.len() as f64 / header.channels as f64;
+    let duration_s = total_frames / header.sample_rate as f64;
     debug!(
         file = file_path,
         samples = samples.len(),
-        rate = sample_rate,
-        channels,
+        rate = header.sample_rate,
+        channels = header.channels,
         bit_depth = out_bd,
         duration_s,
-        "decoded_ape (spike #1145)"
+        "decoded_ape"
     );
-
     Ok(DecodedAudio {
         samples_i32: samples,
         bit_depth: out_bd,
-        sample_rate,
-        channels,
+        sample_rate: header.sample_rate,
+        channels: header.channels,
         duration_s,
     })
 }
 
+/// Décodage `.ape` réellement incrémental : émet des blocs PCM au fil de l'eau,
+/// sans jamais matérialiser la piste entière (#2505).
+///
+/// Jusqu'ici `decode_to_pcm_streaming_inner` rangeait `.ape` avec `aiff`/`wv`
+/// dans le repli « décodage intégral puis découpage » : rien ne sortait avant
+/// que le fichier entier ne soit décodé, et un 24/96 d'une heure demandait
+/// ~2 Gio de PCM natif plus ~2,8 Gio de `i32` — fatal sur un NUC, un Raspberry
+/// Pi ou une Tune OS.
+///
+/// Mémoire : O(trame APE + `chunk_size`), indépendante de la durée de la piste.
+///
+/// La granularité de décodage n'est pas choisie ici : `ape-decoder` code le
+/// flux en trames indépendantes de `blocks_per_frame` blocs (294 912 blocs pour
+/// APE ≥ 3950, soit ≈ 6,7 s à 44,1 kHz) et `decode_frame` est l'unité la plus
+/// fine qu'il expose. La granularité d'ÉMISSION, elle, est celle des autres
+/// chemins progressifs : `frame_aligned_chunk_len(chunk_size, ...)`, exactement
+/// comme le chemin symphonia et le chemin DSD.
+#[allow(clippy::too_many_arguments)]
+fn decode_ape_streaming(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    first_chunk_sent: &mut bool,
+    data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
+    levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
+    rt: &tokio::runtime::Handle,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
+    // Mise en cache locale des sources réseau, comme le chemin par lots : le
+    // décodeur APE fait un seek + une lecture par trame, et sur un NAS en WiFi
+    // chaque aller-retour se paie. Le garde vit tout le décodage.
+    let _staged = stage_locally_for_decode(file_path, 0.0, 0.0);
+    let file_path: &str = _staged
+        .as_ref()
+        .and_then(|s| s.path.to_str())
+        .unwrap_or(file_path);
+
+    let (mut decoder, header) = ape_open_checked(file_path, "progressif")?;
+    let source_bd = header.out_bit_depth;
+    let output_bd = target_bit_depth.unwrap_or(source_bd);
+    let output_rate = target_sample_rate.unwrap_or(header.sample_rate);
+    let output_channels = target_channels.unwrap_or(header.channels);
+    let output_ch = checked_channels(output_channels, "stream target")?;
+    let mut pcm_adapter = StreamingPcmAdapter::new(
+        source_bd,
+        header.channels,
+        output_channels,
+        header.sample_rate,
+        output_rate,
+    )?;
+
+    let (start_frame, mut skip_interleaved) = ape_start_position(&mut decoder, &header, seek_s)?;
+
+    if target_bit_depth.is_some() {
+        let wav_hdr = super::wav::build_wav_header(output_ch, output_rate, output_bd);
+        if rt.block_on(tx.send(wav_hdr.to_vec())).is_err() {
+            return Ok((output_bd, output_rate));
+        }
+        if let Some(n) = data_ready {
+            n.notify_one();
+        }
+        *first_chunk_sent = true;
+        debug!(
+            source_rate = header.sample_rate,
+            output_rate,
+            output_bd,
+            channels = output_ch,
+            "streaming_decode_wav_header_sent_ape"
+        );
+    }
+
+    let flush_len = frame_aligned_chunk_len(chunk_size, output_bd, output_ch);
+    let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
+    let mut frame_samples: Vec<i32> = Vec::with_capacity(header.frame_interleaved_samples());
+    let mut total_output_samples = 0usize;
+    let mut source_samples_seen = 0usize;
+    // Journal #3311 : un `.ape` muet ne laissait AUCUNE trace entre l'ouverture
+    // et la fin du décodage — pour une image de CD d'une heure, c'est toute la
+    // fenêtre de la panne. Trois repères bornent désormais cette fenêtre :
+    // l'ouverture (`ape_ouvert`), le PREMIER bloc PCM réellement émis, et la
+    // fin ou l'erreur, qui portent l'une comme l'autre la position atteinte.
+    let chrono = std::time::Instant::now();
+    let mut trames_decodees: u32 = 0;
+    let mut derniere_trace = std::time::Instant::now();
+    let position_s = |echantillons: usize| -> f64 {
+        seek_s + echantillons as f64 / output_ch as f64 / output_rate as f64
+    };
+
+    for frame_idx in start_frame..header.total_frames {
+        let frame_pcm = decoder.decode_frame(frame_idx).map_err(|e| {
+            // La position ATTEINTE, pas seulement l'indice de trame : c'est
+            // elle qui dit au testeur où le fichier lâche (#3311).
+            tracing::warn!(
+                file = file_path,
+                frame = frame_idx,
+                total_frames = header.total_frames,
+                position_s = position_s(total_output_samples),
+                ecoule_s = chrono.elapsed().as_secs_f64(),
+                erreur = %e,
+                "ape_streaming_trame_refusee"
+            );
+            format!(
+                "ape decode_frame {frame_idx}/{} à {:.1} s: {e}",
+                header.total_frames,
+                position_s(total_output_samples)
+            )
+        })?;
+        frame_samples.clear();
+        ape_pcm_to_i32(&frame_pcm, &header, &mut frame_samples)?;
+        // Le PCM natif de la trame ne sert plus : le rendre avant l'adaptation
+        // garde le pic au niveau d'UNE trame.
+        drop(frame_pcm);
+        trames_decodees += 1;
+        let from = skip_interleaved.min(frame_samples.len());
+        skip_interleaved = 0;
+        if from == frame_samples.len() {
+            continue;
+        }
+        source_samples_seen += frame_samples.len() - from;
+        let adapted = pcm_adapter.push(&frame_samples[from..])?;
+        total_output_samples += adapted.len();
+        append_pcm_samples(&mut pcm_buf, &adapted, source_bd, output_bd);
+        while pcm_buf.len() >= flush_len {
+            let chunk: Vec<u8> = pcm_buf.drain(..flush_len).collect();
+            // PCM d'abord, niveaux ensuite : même raison que le chemin
+            // symphonia — ne pas retarder le flux audio.
+            let premier = !*first_chunk_sent;
+            match rt.block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
+                tx.send(chunk.clone()),
+            )) {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    debug!("ape_streaming_consumer_dropped");
+                    return Ok((output_bd, output_rate));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        file = file_path,
+                        timeout_secs = SEND_TIMEOUT_SECS,
+                        frame = frame_idx,
+                        position_s = position_s(total_output_samples),
+                        "ape_streaming_send_timeout"
+                    );
+                    return Ok((output_bd, output_rate));
+                }
+            }
+            if premier {
+                // Le repère qui manquait : à `info`, donc présent dans le
+                // journal exporté. « Ouvert mais jamais un octet » et « des
+                // octets puis un arrêt » ne se ressemblent plus.
+                tracing::info!(
+                    file = file_path,
+                    delai_ms = chrono.elapsed().as_millis() as u64,
+                    frame = frame_idx,
+                    octets = chunk.len(),
+                    "ape_streaming_premier_bloc"
+                );
+            }
+            if !*first_chunk_sent {
+                *first_chunk_sent = true;
+                if let Some(n) = data_ready {
+                    n.notify_one();
+                }
+            }
+            if let Some(ltx) = levels_tx {
+                super::tap::send_windowed_pcm(ltx, &chunk, output_bd, output_ch, output_rate);
+            }
+        }
+        if derniere_trace.elapsed() >= std::time::Duration::from_secs(10) {
+            derniere_trace = std::time::Instant::now();
+            debug!(
+                file = file_path,
+                frame = frame_idx,
+                total_frames = header.total_frames,
+                position_s = position_s(total_output_samples),
+                ecoule_s = chrono.elapsed().as_secs_f64(),
+                "ape_streaming_progression"
+            );
+        }
+    }
+
+    let tail = if source_samples_seen > 0 {
+        pcm_adapter.finish()?
+    } else {
+        Vec::new()
+    };
+    total_output_samples += tail.len();
+    append_pcm_samples(&mut pcm_buf, &tail, source_bd, output_bd);
+    if !pcm_buf.is_empty() {
+        let chunk = std::mem::take(&mut pcm_buf);
+        match rt.block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
+            tx.send(chunk.clone()),
+        )) {
+            Ok(Ok(())) => {
+                if !*first_chunk_sent {
+                    *first_chunk_sent = true;
+                    if let Some(n) = data_ready {
+                        n.notify_one();
+                    }
+                }
+                if let Some(ltx) = levels_tx {
+                    super::tap::send_windowed_pcm(ltx, &chunk, output_bd, output_ch, output_rate);
+                }
+            }
+            Ok(Err(_)) => debug!("ape_streaming_consumer_dropped (final)"),
+            Err(_) => tracing::warn!(
+                timeout_secs = SEND_TIMEOUT_SECS,
+                "ape_streaming_send_timeout (final)"
+            ),
+        }
+    }
+
+    let out_frames = total_output_samples as f64 / output_ch as f64;
+    let duration_s = out_frames / output_rate as f64;
+    // Le troisième repère de #3311, à `info` comme les deux autres : un
+    // journal qui porte `ape_ouvert` sans `ape_streaming_termine` dit que le
+    // décodage s'est arrêté en vol, et `position_s` dit où.
+    tracing::info!(
+        file = file_path,
+        samples = total_output_samples,
+        source_rate = header.sample_rate,
+        rate = output_rate,
+        source_channels = header.channels,
+        channels = output_channels,
+        source_bd,
+        output_bd,
+        duration_s,
+        trames_decodees,
+        total_frames = header.total_frames,
+        ecoule_s = chrono.elapsed().as_secs_f64(),
+        "ape_streaming_termine"
+    );
+    Ok((output_bd, output_rate))
+}
 /// Remux a Tidal HI-RES DASH FLAC-in-fMP4 file into a native `.flac` file
 /// WITHOUT decoding or re-encoding (#1146). The source is already FLAC (Tidal
 /// delivers FLAC frames inside a fragmented MP4), so the old path — decode to
@@ -2558,6 +3246,12 @@ fn decode_symphonia(
         let mut packet_samples: Vec<i32> = Vec::new();
         decoded.copy_to_vec_interleaved::<i32>(&mut packet_samples);
         all_samples.extend_from_slice(&packet_samples);
+        // Débit de décodage observable sans coût (#3140) : un paquet FLAC vaut
+        // quelques dizaines de millisecondes d'audio. Inerte sans balise.
+        super::decode_progress::publier(
+            all_samples.len() as u64 / source_channels.max(1) as u64 * 1000
+                / source_rate.max(1) as u64,
+        );
     }
 
     if all_samples.len() > max_samples {
@@ -3002,6 +3696,13 @@ fn decode_dsd_to_pcm(
         let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
+            // Débit de décodage observable sans coût (#3140) : un super-bloc
+            // DSF vaut ~3 ms d'audio en DSD256, ~12 ms en DSD64, et le budget
+            // du transcodage a besoin de savoir à quelle vitesse CET hôte
+            // avance sur CE fichier. Inerte quand personne n'a posé de balise.
+            super::decode_progress::publier(
+                all_samples.len() as u64 / channels as u64 * 1000 / output_rate as u64,
+            );
             if all_samples.len() >= needed {
                 break;
             }
@@ -3027,6 +3728,10 @@ fn decode_dsd_to_pcm(
         let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
+            // Même balise que la branche DSF (#3140).
+            super::decode_progress::publier(
+                all_samples.len() as u64 / channels as u64 * 1000 / output_rate as u64,
+            );
             if all_samples.len() >= needed {
                 break;
             }
@@ -3642,15 +4347,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // in and the poller replayed the head of the track over and over —
         // #1270 « boucle de 2-3 s en début de piste » (liste Bertrand 13/08).
         let single = std::fs::read(fixture_path("test_vorbis.ogg")).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("tune_chained_vorbis_{}.ogg", std::process::id()));
+        let path = crate::test_scratch::scratch_file("tune_chained_vorbis", ".ogg");
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();
 
-        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
-        let _ = std::fs::remove_file(&path);
-        let result = result.unwrap();
+        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0).unwrap();
 
         // Each link is ~2 s: the chained file must decode BOTH (~4 s), not
         // stop at the first boundary (~2 s).
@@ -3705,15 +4407,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // replays the head of the track: the same « boucle de 2-3 s » of
         // #1270 that #1632 fixed for Vorbis, on the libopus path this time.
         let single = std::fs::read(fixture_path("test.opus")).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("tune_chained_opus_{}.opus", std::process::id()));
+        let path = crate::test_scratch::scratch_file("tune_chained_opus", ".opus");
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();
 
-        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
-        let _ = std::fs::remove_file(&path);
-        let result = result.unwrap();
+        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0).unwrap();
 
         // Each link is ~2 s: the chained file must decode BOTH (~4 s), not
         // stop at the first boundary (~2 s).
@@ -4116,7 +4815,9 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         for byte in &source {
             output.extend(adapter.push(std::slice::from_ref(byte)).unwrap());
         }
-        output.extend(adapter.finish().unwrap());
+        let (fin, residu) = adapter.finish().unwrap();
+        output.extend(fin);
+        assert_eq!(residu, 0, "an aligned stream drops nothing");
         assert_eq!(output, source, "identity adaptation must be byte-for-byte");
     }
 
@@ -4139,7 +4840,9 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         for chunk in source.chunks(137) {
             output.extend(adapter.push(chunk).unwrap());
         }
-        output.extend(adapter.finish().unwrap());
+        let (fin, residu) = adapter.finish().unwrap();
+        output.extend(fin);
+        assert_eq!(residu, 0, "an aligned stream drops nothing");
 
         assert_eq!(output.len() % 2, 0, "16-bit mono frames must stay aligned");
         assert_eq!(
@@ -4149,15 +4852,85 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         );
     }
 
+    /// Une trame finale incomplète est JETÉE, et comptée (#3163).
+    ///
+    /// Cinq octets ne font pas une trame stéréo 24 bits. Ils ne portent pas non
+    /// plus d'audio : les compléter par des zéros fabriquerait un échantillon
+    /// inventé. `finish()` les abandonne et rend leur nombre, au lieu de faire
+    /// échouer un flux qui a par ailleurs été livré en entier.
     #[test]
-    fn streaming_pcm_bytes_refuse_a_partial_final_frame() {
+    fn streaming_pcm_bytes_abandonne_une_trame_finale_incomplete() {
         let mut adapter = StreamingPcmByteAdapter::new(24, 2, 96_000, 16, 1, 48_000)
             .expect("valid conversion adapter");
+        assert_eq!(adapter.source_frame_bytes(), 6);
         assert!(adapter.push(&[0; 5]).unwrap().is_empty());
-        let error = adapter
+        let (fin, residu) = adapter
             .finish()
-            .expect_err("five bytes are not a stereo 24-bit frame");
-        assert!(error.contains("outside a complete 6-byte source frame"));
+            .expect("cinq octets orphelins ne doivent plus faire échouer le flux");
+        assert_eq!(residu, 5, "le nombre d'octets jetés doit être rendu");
+        assert!(
+            fin.is_empty(),
+            "rien n'a été complété : aucun échantillon inventé, donc aucun clic"
+        );
+    }
+
+    /// La contre-épreuve, sur un fait de base : **un flux dont la longueur
+    /// n'est pas un multiple de la taille d'échantillon aboutit, et le nombre
+    /// d'octets délivrés est celui attendu** (#3163).
+    ///
+    /// L'adaptateur est ici une identité 44,1 kHz / 16 bits / stéréo — le
+    /// format exact du fil 1641, où `Content-Length` livrait 1 à 2 octets
+    /// au-delà de la dernière trame complète.
+    #[test]
+    fn un_residu_de_fin_de_flux_aboutit_et_delivre_les_octets_attendus() {
+        const TRAMES: usize = 1_000;
+        let audio: Vec<u8> = (0..TRAMES * 4).map(|i| (i % 251) as u8).collect();
+
+        // Le témoin : longueur multiple de la trame, rien ne bouge d'un octet.
+        let mut temoin = StreamingPcmByteAdapter::new(16, 2, 44_100, 16, 2, 44_100)
+            .expect("adaptateur identité valide");
+        let mut sortie_temoin = Vec::new();
+        for morceau in audio.chunks(137) {
+            sortie_temoin.extend(temoin.push(morceau).unwrap());
+        }
+        let (fin_temoin, residu_temoin) = temoin.finish().unwrap();
+        sortie_temoin.extend(fin_temoin);
+        assert_eq!(residu_temoin, 0);
+        assert_eq!(sortie_temoin, audio, "un flux aligné est rendu tel quel");
+
+        // 1 puis 2 octets orphelins : les deux reliquats observés en production.
+        for orphelins in [1usize, 2, 3] {
+            let mut flux = audio.clone();
+            flux.extend(std::iter::repeat_n(0xAB, orphelins));
+            assert_ne!(
+                flux.len() % 4,
+                0,
+                "le flux doit justement NE PAS être un multiple de la trame"
+            );
+
+            let mut adapter = StreamingPcmByteAdapter::new(16, 2, 44_100, 16, 2, 44_100)
+                .expect("adaptateur identité valide");
+            let mut sortie = Vec::new();
+            for morceau in flux.chunks(137) {
+                sortie.extend(adapter.push(morceau).unwrap());
+            }
+            let (fin, residu) = adapter
+                .finish()
+                .expect("un reliquat sous-trame ne doit pas faire échouer le flux");
+            sortie.extend(fin);
+
+            assert_eq!(residu, orphelins, "le compte de ce qui est jeté");
+            assert_eq!(
+                sortie.len(),
+                TRAMES * 4,
+                "le nombre d'octets délivrés est celui des trames complètes"
+            );
+            assert_eq!(
+                sortie, sortie_temoin,
+                "le contenu audio délivré est identique au témoin, au reliquat près : \
+                 rien n'est décalé, rien n'est complété, donc aucun clic"
+            );
+        }
     }
 
     #[test]
@@ -4259,6 +5032,295 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert_eq!(
             our_pcm, ref_pcm,
             "decoded PCM must be byte-for-byte identical to the C++ reference decoder"
+        );
+    }
+}
+
+// ===========================================================================
+// #3631 — la BORNE DE FIN : jouer une TRANCHE d'un fichier image CUE
+// ===========================================================================
+
+#[cfg(test)]
+mod borne_de_fin_tests {
+    use super::*;
+
+    const TAUX: u32 = 44_100;
+
+    /// Un vrai WAV 16 bits stéréo de `millisecondes`, sinusoïde grossière.
+    fn ecrire_wav(chemin: &std::path::Path, millisecondes: u32) {
+        let trames = TAUX * millisecondes / 1000;
+        let octets = trames * 4;
+        let mut f = Vec::new();
+        f.extend_from_slice(b"RIFF");
+        f.extend_from_slice(&(36 + octets).to_le_bytes());
+        f.extend_from_slice(b"WAVEfmt ");
+        f.extend_from_slice(&16u32.to_le_bytes());
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&2u16.to_le_bytes());
+        f.extend_from_slice(&TAUX.to_le_bytes());
+        f.extend_from_slice(&(TAUX * 4).to_le_bytes());
+        f.extend_from_slice(&4u16.to_le_bytes());
+        f.extend_from_slice(&16u16.to_le_bytes());
+        f.extend_from_slice(b"data");
+        f.extend_from_slice(&octets.to_le_bytes());
+        for n in 0..trames {
+            let v = ((n as f32 / 40.0).sin() * 8000.0) as i16;
+            f.extend_from_slice(&v.to_le_bytes());
+            f.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(chemin, f).unwrap();
+    }
+
+    /// Décode et rend (octets d'en-tête + octets de PCM) réellement émis.
+    async fn servir(chemin: &std::path::Path, seek_s: f64, duree_s: Option<f64>) -> usize {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let pret = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (niveaux, _niveaux_rx) = tokio::sync::mpsc::unbounded_channel();
+        let fp = chemin.to_string_lossy().to_string();
+        let tache = tokio::task::spawn_blocking(move || {
+            decode_to_pcm_streaming_tranche(
+                &fp,
+                Some(TAUX),
+                Some(2),
+                Some(16),
+                tx,
+                32768,
+                pret,
+                niveaux,
+                seek_s,
+                duree_s,
+            )
+        });
+        let mut total = 0usize;
+        while let Some(bloc) = rx.recv().await {
+            total += bloc.len();
+        }
+        tache.await.unwrap().unwrap();
+        total
+    }
+
+    fn octets_pcm(secondes: f64) -> usize {
+        (secondes * TAUX as f64).round() as usize * 4
+    }
+
+    /// La MOITIÉ QUI PROUVE : borné, le flux s'arrête à la durée demandée.
+    ///
+    /// 44 octets d'en-tête WAV, puis exactement une seconde de PCM — pas les
+    /// quatre secondes du fichier. C'est cela, jouer la piste 2 d'un CUE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn une_tranche_bornee_sert_exactement_sa_duree() {
+        let d = tempfile::TempDir::new().unwrap();
+        let f = d.path().join("image.wav");
+        ecrire_wav(&f, 4_000);
+
+        let servi = servir(&f, 1.0, Some(1.0)).await;
+        let attendu = 44 + octets_pcm(1.0);
+        // Le décodeur émet par blocs alignés sur la trame ; la borne coupe au
+        // dernier octet utile, donc l'égalité est EXACTE.
+        assert_eq!(
+            servi, attendu,
+            "tranche de 1 s servie en {servi} octets, attendu {attendu}"
+        );
+    }
+
+    /// LA CONTRE-ÉPREUVE : sans borne, le MÊME appel sert tout le reste du
+    /// fichier. Sans elle, le test ci-dessus passerait aussi sur un fichier
+    /// qui ne dure qu'une seconde — il ne prouverait rien.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sans_borne_le_meme_fichier_sert_tout_le_reste() {
+        let d = tempfile::TempDir::new().unwrap();
+        let f = d.path().join("image.wav");
+        ecrire_wav(&f, 4_000);
+
+        let borne = servir(&f, 1.0, Some(1.0)).await;
+        let entier = servir(&f, 1.0, None).await;
+        assert!(
+            entier > borne * 2,
+            "sans borne le flux devrait porter les 3 s restantes : borné {borne}, entier {entier}"
+        );
+        // ~3 s à 100 ms près : le décodeur peut rendre une queue de
+        // rééchantillonnage, jamais trois fois la matière.
+        let attendu = 44 + octets_pcm(3.0);
+        assert!(
+            entier.abs_diff(attendu) < octets_pcm(0.1),
+            "reste du fichier : {entier} octets, attendu ~{attendu}"
+        );
+    }
+
+    /// La DERNIÈRE piste d'une feuille n'a pas de fin : elle court jusqu'au
+    /// bout du fichier, et la borne ne doit rien couper.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn une_tranche_sans_fin_va_jusqu_au_bout() {
+        let d = tempfile::TempDir::new().unwrap();
+        let f = d.path().join("image.wav");
+        ecrire_wav(&f, 2_000);
+
+        let servi = servir(&f, 1.5, None).await;
+        let attendu = 44 + octets_pcm(0.5);
+        assert!(
+            servi.abs_diff(attendu) < octets_pcm(0.1),
+            "dernière tranche : {servi} octets, attendu ~{attendu}"
+        );
+    }
+
+    /// L'arithmétique de la borne, isolée : c'est elle qui décide où couper.
+    #[test]
+    fn le_budget_d_octets_suit_le_format_de_sortie() {
+        // 1 s de 44,1 kHz stéréo 16 bits = 44100 × 2 × 2.
+        assert_eq!(
+            octets_pour(1.0, Some(44_100), Some(2), Some(16)),
+            Some(176_400)
+        );
+        // 24 bits : trois octets par échantillon.
+        assert_eq!(
+            octets_pour(1.0, Some(96_000), Some(2), Some(24)),
+            Some(576_000)
+        );
+    }
+
+    /// CONTRE-ÉPREUVE de l'arithmétique : sans format complet, PAS de borne.
+    ///
+    /// Un nombre d'octets sans cadence ni profondeur ne veut rien dire, et une
+    /// borne fausse coupe la musique. Mieux vaut servir entier et le dire.
+    #[test]
+    fn sans_format_complet_aucune_borne_n_est_calculee() {
+        assert_eq!(octets_pour(1.0, None, Some(2), Some(16)), None);
+        assert_eq!(octets_pour(1.0, Some(44_100), None, Some(16)), None);
+        assert_eq!(octets_pour(1.0, Some(44_100), Some(2), None), None);
+        assert_eq!(octets_pour(0.0, Some(44_100), Some(2), Some(16)), None);
+        assert_eq!(octets_pour(-1.0, Some(44_100), Some(2), Some(16)), None);
+        assert_eq!(octets_pour(f64::NAN, Some(44_100), Some(2), Some(16)), None);
+    }
+}
+
+// ===========================================================================
+// #2156 — la copie prealable ne doit pas servir une FENETRE
+// ===========================================================================
+/// La copie locale d'une source reseau se paie en octets : le fichier ENTIER.
+/// Elle etait declenchee sans regarder ce qu'on demandait a lire. La passe
+/// acoustique, elle, demande DIX SECONDES par piste et parcourt toute la
+/// bibliotheque, machine au repos : chaque piste etait rapatriee en entier,
+/// lue sur dix secondes, puis EFFACEE par le `Drop` de `StagedFile` — un debit
+/// d'ecriture soutenu dont aucun fichier ne reste pour temoigner.
+///
+/// La garde mesure les OCTETS RECOPIES, pas la condition qui les declenche :
+/// les deux appels ne different que par la fenetre demandee, le verdict de
+/// montage vaut `true` des deux cotes.
+#[cfg(all(test, unix))]
+mod fenetre_bornee_sans_copie_2156 {
+    use super::*;
+
+    const TAILLE: usize = 512 * 1024;
+
+    #[test]
+    fn une_fenetre_bornee_ne_recopie_pas_le_fichier_entier() {
+        let d = crate::test_scratch::scratch_dir("tune-stage-2156-fenetre");
+        let src = d.join("source.bin");
+        std::fs::write(&src, vec![0xA5u8; TAILLE]).expect("ecriture de la source");
+        let chemin = src.to_string_lossy().to_string();
+
+        // Le regime de la passe acoustique : dix secondes d'une piste entiere.
+        let borne = stager_pour_decodage(&chemin, true, 0.0, 10.0);
+        let recopie = borne.as_ref().map(|s| s.bytes).unwrap_or(0);
+        assert!(
+            borne.is_none(),
+            "fenetre de 10 s : {recopie} octets ont quand meme ete recopies vers {:?}. \
+             C'est l'amplification de #2156 — tout le fichier ecrit sur le disque \
+             pour en lire dix secondes.",
+            borne.as_ref().map(|s| s.path.clone())
+        );
+    }
+
+    /// Contre-partie indispensable : sans elle, un staging entierement desarme
+    /// ferait passer la garde ci-dessus.
+    #[test]
+    fn un_decodage_integral_recopie_toujours_la_source_reseau() {
+        let d = crate::test_scratch::scratch_dir("tune-stage-2156-integral");
+        let src = d.join("source.bin");
+        std::fs::write(&src, vec![0x5Au8; TAILLE]).expect("ecriture de la source");
+        let chemin = src.to_string_lossy().to_string();
+
+        let integral = stager_pour_decodage(&chemin, true, 0.0, 0.0)
+            .expect("un decodage integral sur montage reseau doit toujours stager");
+        assert!(
+            integral.path.exists(),
+            "la copie annoncee n'existe pas sur le disque : {:?}",
+            integral.path
+        );
+        assert_eq!(
+            std::fs::metadata(&integral.path)
+                .expect("metadonnees de la copie")
+                .len(),
+            TAILLE as u64,
+            "la copie integrale doit porter tous les octets de la source"
+        );
+        // La copie vit dans STAGE_CACHE (Arc retenu) : son `Drop` ne passera
+        // pas, on la retire nous-memes plutot que de laisser un residu.
+        let _ = std::fs::remove_file(&integral.path);
+    }
+
+    /// Cablage. Le correctif ne vaut que si `decode_to_pcm` transmet SA
+    /// fenetre au staging : avec un `0.0` en dur au site d'appel, les deux
+    /// gardes ci-dessus resteraient vertes pendant que la passe acoustique
+    /// recopierait de nouveau chaque piste en entier. C'est la forme exacte du
+    /// piege « ecrit mais pas branche ».
+    #[test]
+    fn decode_to_pcm_transmet_sa_fenetre_au_staging() {
+        // L'aiguille est ASSEMBLEE, jamais ecrite en un morceau : ecrite telle
+        // quelle, elle figurerait dans le fichier qu'elle inspecte et le garde
+        // se trouverait LUI-MEME — vert quoi qu'il arrive au site d'appel.
+        // (Constate ici : la premiere version de ce garde restait verte alors
+        // que l'appel avait ete remplace par un `0.0` en dur.)
+        let aiguille = format!(
+            "stage_locally_for_decode(file_path, seek_s, {})",
+            "max_duration_s"
+        );
+        let occurrences = include_str!("decode.rs").matches(&aiguille).count();
+        assert_eq!(
+            occurrences, 1,
+            "decode_to_pcm ne transmet plus sa fenetre au staging (#2156) : \
+             {occurrences} occurrence(s) de `{aiguille}`. Les gardes d'effet \
+             resteraient vertes pendant que la passe acoustique recopierait de \
+             nouveau chaque piste en entier."
+        );
+    }
+
+    /// Le seuil lui-meme, aux bornes : `0.0` est la convention « pas de
+    /// limite » et doit rester du cote de la copie.
+    /// Une fenetre lue AILLEURS dans le fichier garde la copie : l'analyseur
+    /// par segments et la tranche CUE paient de vrais allers-retours.
+    #[test]
+    fn une_fenetre_avec_seek_recopie_toujours() {
+        let d = crate::test_scratch::scratch_dir("tune-stage-2156-seek");
+        let src = d.join("source.bin");
+        std::fs::write(&src, vec![0x3Cu8; TAILLE]).expect("ecriture de la source");
+        let chemin = src.to_string_lossy().to_string();
+
+        let avec_seek = stager_pour_decodage(&chemin, true, 30.0, 10.0)
+            .expect("une fenetre avec seek doit encore etre stagee");
+        assert_eq!(
+            std::fs::metadata(&avec_seek.path)
+                .expect("metadonnees de la copie")
+                .len(),
+            TAILLE as u64
+        );
+        let _ = std::fs::remove_file(&avec_seek.path);
+    }
+
+    /// Le seuil lui-meme, aux bornes.
+    #[test]
+    fn le_seuil_separe_bien_lintegral_de_la_fenetre() {
+        assert!(!fenetre_de_tete_bornee(0.0, 0.0), "0.0 = decodage integral");
+        assert!(fenetre_de_tete_bornee(0.0, 10.0), "la passe acoustique");
+        assert!(
+            fenetre_de_tete_bornee(0.0, 90.0),
+            "l'empreinte perceptuelle lit 90 s de tete : elle doit entrer aussi"
+        );
+        assert!(fenetre_de_tete_bornee(0.0, FENETRE_SANS_COPIE_S));
+        assert!(!fenetre_de_tete_bornee(0.0, FENETRE_SANS_COPIE_S + 1.0));
+        assert!(
+            !fenetre_de_tete_bornee(12.5, 10.0),
+            "une fenetre ailleurs dans le fichier paie de vrais seeks"
         );
     }
 }

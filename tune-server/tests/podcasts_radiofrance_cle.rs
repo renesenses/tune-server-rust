@@ -14,7 +14,12 @@
 //!    (`radiofrance_api_key`) et un message dans la langue de l'interface ;
 //! 2. une clé vide compte comme absente ;
 //! 3. avec une clé, la porte s'ouvre : la même requête ne rend plus jamais
-//!    `radiofrance_cle_absente`.
+//!    `radiofrance_cle_absente` ;
+//! 4. **le réglage que ce 412 désigne est réellement saisissable.** C'était la
+//!    moitié manquante : le serveur renvoyait vers `radiofrance_api_key`, mais
+//!    aucun écran n'offrait ce champ. Radio France n'apparaissait pas dans
+//!    « Services & jetons » (`GET /api/v1/services/tokens`), la seule surface
+//!    de saisie de clés du produit — le renvoi ne menait nulle part.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -159,4 +164,162 @@ async fn avec_cle_la_porte_s_ouvre_sans_annoncer_configuration_requise() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "corps = {corps}");
     assert_ne!(corps["error"], "radiofrance_cle_absente", "corps = {corps}");
     assert_eq!(corps["code"], "bad_request", "corps = {corps}");
+}
+
+// ---------------------------------------------------------------------------
+// 3. Le réglage que le 412 désigne est saisissable — sinon le renvoi ment
+// ---------------------------------------------------------------------------
+
+const SERVICES: &str = "/api/v1/services/tokens";
+
+async fn poster(app: &axum::Router, chemin: &str, corps: Value) -> (StatusCode, Value) {
+    let reponse = app
+        .clone()
+        .oneshot(
+            Request::post(chemin)
+                .header("content-type", "application/json")
+                .body(Body::from(corps.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = reponse.status();
+    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let recu: Value = serde_json::from_slice(&octets).unwrap_or(json!(null));
+    (status, recu)
+}
+
+fn service<'a>(liste: &'a Value, id: &str) -> Option<&'a Value> {
+    liste.as_array()?.iter().find(|s| s["id"] == id)
+}
+
+/// Le défaut restant de #1026 : le 412 nomme `radiofrance_api_key`, mais
+/// « Services & jetons » — la seule surface où l'on saisit une clé — ignorait
+/// Radio France. L'utilisateur lisait « renseignez le réglage
+/// radiofrance_api_key » sans trouver nulle part où le renseigner.
+#[tokio::test]
+async fn radio_france_figure_dans_les_services_avec_son_champ_de_cle() {
+    let (app, _state) = app_et_etat();
+
+    let (status, liste) = lire(&app, SERVICES, None).await;
+    assert_eq!(status, StatusCode::OK, "liste = {liste}");
+
+    let rf = service(&liste, "radiofrance")
+        .unwrap_or_else(|| panic!("aucun service « radiofrance » dans {liste}"));
+
+    // Le champ de saisie, et sa clé : `save()` écrit `{id}_{champ}`, donc
+    // « radiofrance » + « api_key » = `radiofrance_api_key`, exactement le
+    // réglage que nomme le 412 et que lit la route Podcasts.
+    let champs = rf["fields"].as_array().expect("fields absent");
+    assert_eq!(champs.len(), 1, "rf = {rf}");
+    assert_eq!(champs[0]["key"], "api_key", "rf = {rf}");
+}
+
+/// Le badge « configuré » se lit là où la route Podcasts lit la clé : il ne
+/// peut donc pas annoncer une source active que l'écran Podcasts refuse.
+/// Une clé vide compte comme absente des deux côtés.
+#[tokio::test]
+async fn le_badge_configure_dit_la_meme_chose_que_l_ecran_podcasts() {
+    let (app, state) = app_et_etat();
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+
+    let (_, liste) = lire(&app, SERVICES, None).await;
+    assert_eq!(
+        service(&liste, "radiofrance").expect("service absent")["configured"],
+        json!(false),
+        "liste = {liste}"
+    );
+
+    // Clé vide : la route Podcasts la tient pour absente, le badge aussi.
+    reglages.set("radiofrance_api_key", "").unwrap();
+    let (_, liste) = lire(&app, SERVICES, None).await;
+    assert_eq!(
+        service(&liste, "radiofrance").expect("service absent")["configured"],
+        json!(false),
+        "liste = {liste}"
+    );
+
+    reglages.set("radiofrance_api_key", "clef-de-test").unwrap();
+    let (_, liste) = lire(&app, SERVICES, None).await;
+    assert_eq!(
+        service(&liste, "radiofrance").expect("service absent")["configured"],
+        json!(true),
+        "liste = {liste}"
+    );
+}
+
+/// La boucle complète, telle que la vit l'utilisateur : il lit le 412, ouvre
+/// « Services & jetons », saisit sa clé dans le champ que le serveur annonce,
+/// et la source s'ouvre.
+#[tokio::test]
+async fn saisir_la_cle_dans_les_services_ouvre_la_source_podcasts() {
+    let (app, _state) = app_et_etat();
+
+    let (status, corps) = lire(&app, ROUTES_SOUS_CLE[0], None).await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "corps = {corps}");
+    let reglage = corps["setting"]
+        .as_str()
+        .expect("setting absent")
+        .to_string();
+
+    // Le champ annoncé par la liste, pas un chemin deviné.
+    let (_, liste) = lire(&app, SERVICES, None).await;
+    let rf = service(&liste, "radiofrance").expect("service absent");
+    let champ = rf["fields"][0]["key"].as_str().expect("champ absent");
+    assert_eq!(
+        format!("radiofrance_{champ}"),
+        reglage,
+        "le champ offert n'écrit pas le réglage que le 412 désigne"
+    );
+
+    let (status, _) = poster(
+        &app,
+        &format!("{SERVICES}/radiofrance"),
+        json!({ champ: "clef-de-test" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Comme le témoin « avec clé » plus haut : station inconnue, refusée APRÈS
+    // la porte de la clé et AVANT tout appel réseau à Radio France.
+    let (status, corps) = lire(
+        &app,
+        "/api/v1/podcasts/radiofrance/shows?station=INEXISTANTE",
+        None,
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::PRECONDITION_FAILED,
+        "la source refuse encore la clé saisie depuis « Services & jetons » : corps = {corps}"
+    );
+    assert_ne!(corps["error"], "radiofrance_cle_absente", "corps = {corps}");
+}
+
+/// Témoin anti-régression : ajouter Radio France n'a fait perdre aucun des
+/// services déjà offerts. Vert des deux côtés du correctif.
+#[tokio::test]
+async fn les_services_deja_offerts_sont_tous_encore_la() {
+    let (app, _state) = app_et_etat();
+    let (status, liste) = lire(&app, SERVICES, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for id in [
+        "musicbrainz",
+        "discogs",
+        "lastfm",
+        "listenbrainz",
+        "genius",
+        "tidal",
+        "qobuz",
+        "spotify",
+        "deezer",
+    ] {
+        assert!(
+            service(&liste, id).is_some(),
+            "service « {id} » perdu : liste = {liste}"
+        );
+    }
 }

@@ -5,7 +5,7 @@ use reqwest::Client;
 use tracing::{debug, info, warn};
 
 use super::didl::DidlBuilder;
-use super::oh_events::{EventState, OpenHomeEventListener};
+use super::oh_events::{EventState, UpnpEventListener};
 use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 const SOAP_MAX_RETRIES: usize = 2;
@@ -23,7 +23,7 @@ pub struct OpenHomeOutput {
     host_addr: String,
     service_urls: HashMap<String, String>,
     event_sub_urls: HashMap<String, String>,
-    event_listener: Option<Arc<OpenHomeEventListener>>,
+    event_listener: Option<Arc<UpnpEventListener>>,
     event_state: Arc<tokio::sync::Mutex<EventState>>,
     event_sub_ids: tokio::sync::Mutex<Vec<String>>,
     client: Client,
@@ -37,7 +37,7 @@ impl OpenHomeOutput {
         host: String,
         port: u16,
         service_paths: HashMap<String, String>,
-        event_listener: Option<Arc<OpenHomeEventListener>>,
+        event_listener: Option<Arc<UpnpEventListener>>,
         event_sub_paths: HashMap<String, String>,
     ) -> Self {
         let base = format!("http://{}:{}", host, port);
@@ -69,6 +69,21 @@ impl OpenHomeOutput {
 
     fn svc_url(&self, key: &str) -> Option<&String> {
         self.service_urls.get(key)
+    }
+
+    /// Le service `av.openhome.org:Pins:1` de ce renderer, s'il en publie un
+    /// (#2722).
+    ///
+    /// Rend `None` — SANS le moindre aller-retour réseau — dès que le
+    /// descriptif collecté à la découverte ne porte pas ce service. C'est le
+    /// cas de la grande majorité des appareils, et c'est ce qui permet à la
+    /// fiche de zone de répondre « non pris en charge » sans attendre.
+    pub fn pins_service(&self) -> Option<super::openhome_pins::PinsService> {
+        let url = self.svc_url(super::openhome_pins::PINS_SERVICE_KEY)?;
+        Some(super::openhome_pins::PinsService::new(
+            url.clone(),
+            self.client.clone(),
+        ))
     }
 
     async fn soap_call(
@@ -343,10 +358,18 @@ impl OutputTarget for OpenHomeOutput {
             volume,
             self.svc_url("playlist").is_some(),
         )
+        .with_percent_volume()
     }
 
     fn host(&self) -> Option<&str> {
         Some(&self.host_addr)
+    }
+
+    /// Sans cette redescente, le défaut de `OutputTarget` rend `&()` et une
+    /// route ne peut PAS retrouver l'`OpenHomeOutput` enregistré — donc pas
+    /// atteindre son service `Pins:1` (#2722).
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
@@ -584,7 +607,11 @@ impl OutputTarget for OpenHomeOutput {
     }
 }
 
-fn extract_tag(xml: &str, tag: &str) -> Option<String> {
+/// Extrait le texte d'une balise d'une réponse SOAP.
+///
+/// `pub(crate)` depuis #2722 : le client `Pins:1` (`openhome_pins.rs`) dissèque
+/// les mêmes enveloppes et n'a aucune raison d'en recopier une seconde.
+pub(crate) fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();

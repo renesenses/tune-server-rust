@@ -29,6 +29,34 @@ pub struct PluginManifest {
     pub event_subscriptions: Vec<String>,
 }
 
+impl PluginManifest {
+    /// Ce greffon peut-il tourner sur un serveur en version `server_version` ?
+    ///
+    /// `min_server_version` était lu par le manifeste et par personne d'autre :
+    /// aucun appelant dans le dépôt (#3408). C'est pourtant le seul énoncé de
+    /// compatibilité qu'un greffon wasm produise, et le gestionnaire
+    /// d'extensions du client attend un champ `compatible` — qu'aucune route
+    /// n'émettait.
+    ///
+    /// **Une absence vaut « compatible », jamais l'inverse.** Un manifeste qui
+    /// ne déclare rien, ou qui déclare une chaîne dont on ne sait rien faire,
+    /// ne doit pas faire griser une extension qui fonctionne : c'est
+    /// exactement le défaut vécu par Querite, où un champ ABSENT valait
+    /// « incompatible » et grisait tout l'écran.
+    pub fn compatible_with(&self, server_version: &str) -> bool {
+        let Some(minimum) = self.min_server_version.as_deref().map(str::trim) else {
+            return true;
+        };
+        if minimum.is_empty() {
+            return true;
+        }
+        // `is_newer(minimum, serveur)` = « le minimum exigé est postérieur au
+        // serveur », donc incompatible. Toute autre issue — égal, ou serveur
+        // plus récent — est compatible.
+        !crate::updater::is_newer(minimum, server_version)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginState {
@@ -223,6 +251,62 @@ fn load_manifest(path: &Path) -> Result<PluginManifest, String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn manifeste(min: Option<&str>) -> PluginManifest {
+        PluginManifest {
+            id: "x".into(),
+            name: "X".into(),
+            version: "1.0.0".into(),
+            description: String::new(),
+            author: String::new(),
+            entry_point: "main.wasm".into(),
+            permissions: vec![],
+            min_server_version: min.map(str::to_string),
+            premium: false,
+            event_subscriptions: vec![],
+        }
+    }
+
+    /// Le sens de la règle : une absence vaut « compatible ».
+    ///
+    /// C'est le cœur de #3408. Le client grisait toute la liste parce qu'un
+    /// champ ABSENT y valait faux ; côté serveur, un manifeste muet doit
+    /// répondre « oui », sans quoi on aurait déplacé le défaut au lieu de le
+    /// corriger.
+    #[test]
+    fn un_manifeste_muet_est_compatible() {
+        assert!(manifeste(None).compatible_with("0.9.140"));
+        assert!(manifeste(Some("")).compatible_with("0.9.140"));
+        assert!(manifeste(Some("   ")).compatible_with("0.9.140"));
+    }
+
+    /// Et une exigence qu'on ne sait pas lire non plus : `parse_version`
+    /// n'extrait aucun nombre de « demain », les deux versions se comparent
+    /// donc égales et le greffon reste proposé. Refuser sur une chaîne
+    /// incomprise ferait exactement le mal qu'on répare.
+    #[test]
+    fn une_exigence_illisible_ne_grise_rien() {
+        assert!(manifeste(Some("demain")).compatible_with("0.9.140"));
+    }
+
+    /// Le témoin qui doit dire NON : un greffon qui exige plus récent que ce
+    /// binaire. Sans lui, `compatible` serait un `true` constant déguisé.
+    #[test]
+    fn une_exigence_posterieure_au_serveur_est_incompatible() {
+        assert!(!manifeste(Some("1.0.0")).compatible_with("0.9.140"));
+        assert!(!manifeste(Some("0.9.141")).compatible_with("0.9.140"));
+    }
+
+    /// Les cas de bord de la comparaison, empruntés au même `is_newer` que la
+    /// mise à jour : égalité, serveur plus récent, pré-version.
+    #[test]
+    fn egalite_et_serveur_plus_recent_sont_compatibles() {
+        assert!(manifeste(Some("0.9.140")).compatible_with("0.9.140"));
+        assert!(manifeste(Some("0.9.0")).compatible_with("0.9.140"));
+        // Le serveur est une pré-version de ce que le greffon exige : il n'y
+        // est pas encore.
+        assert!(!manifeste(Some("0.9.140")).compatible_with("0.9.140-rc1"));
+    }
 
     #[test]
     fn parse_manifest() {

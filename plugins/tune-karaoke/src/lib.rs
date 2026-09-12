@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::backend::DbBackend;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::event_bus::TuneEvent;
 use tune_core::lyrics;
 use tune_core::playback::PlaybackManager;
@@ -170,6 +171,11 @@ pub fn router(
 /// Compute the index of the currently-active lyric line for a playhead at
 /// `position_ms`: the last line whose `time_ms <= position_ms`. Returns `-1`
 /// before the first line (or when there are no lines).
+///
+/// ⚠️ `position_ms` doit être la position **déjà corrigée** du décalage de la
+/// zone — [`lyrics::sync_position_ms`]. Cette fonction ne connaît pas la zone
+/// et ne peut donc pas l'appliquer elle-même ; c'est `now_for_zone` qui le
+/// fait, là où la zone est connue (#2997).
 fn current_line_index(lines: &[lyrics::LyricLine], position_ms: i64) -> i64 {
     let mut idx: i64 = -1;
     for (i, line) in lines.iter().enumerate() {
@@ -263,17 +269,39 @@ async fn lyrics_for_track(
 /// is feasible precisely because the host hands the plugin an
 /// `Arc<PlaybackManager>` (a `tune-core` type) at construction, so reading a
 /// zone's now-playing track id + position needs nothing from `tune-server`.
+///
+/// `current_index` tient compte du décalage `zones.lyrics_offset_ms` de la
+/// zone (#2997). C'est le seul endroit du serveur qui le PEUT : la route des
+/// paroles ne reçoit qu'un id de piste, jamais une zone, alors que ce
+/// décalage est par zone. Ici la zone est dans le chemin, et la réponse —
+/// qui porte déjà `position_ms` — n'a jamais été partageable entre zones :
+/// l'appliquer ne coûte donc rien en cache.
+///
+/// `lines` garde ses horodatages d'origine et `position_ms` reste la position
+/// brute : le contrat existant ne bouge pas. Seul `current_index` est calculé
+/// sur la position corrigée. Pour qu'un client qui recalcule lui-même puisse
+/// retomber sur le même index, la réponse porte désormais `lyrics_offset_ms` —
+/// sans lui, il obtiendrait l'index d'avant le réglage et contredirait
+/// `current_index` sans pouvoir savoir pourquoi.
 async fn now_for_zone(
     State(state): State<KaraokeState>,
     Path(zone_id): Path<i64>,
 ) -> impl IntoResponse {
     let zone_state = state.playback.get_state(zone_id).await;
 
+    // Décalage des paroles propre à cette zone (#2997). Lu ici, avant toute
+    // sortie anticipée, pour que la réponse le porte dans tous les cas : un
+    // client qui l'apprend seulement quand une piste a des paroles ne pourrait
+    // pas afficher le réglage effectif d'une zone à l'arrêt.
+    let offset_ms = ZoneRepo::with_backend(state.backend.clone()).get_lyrics_offset_ms(zone_id);
+    let sync_position = lyrics::sync_position_ms(zone_state.position_ms, offset_ms);
+
     let Some(np) = zone_state.now_playing.as_ref() else {
         return Json(json!({
             "zone_id": zone_id,
             "track_id": Value::Null,
             "position_ms": zone_state.position_ms,
+            "lyrics_offset_ms": offset_ms,
             "current_index": -1,
             "lines": [],
             "error": "nothing playing",
@@ -287,6 +315,7 @@ async fn now_for_zone(
             "zone_id": zone_id,
             "track_id": Value::Null,
             "position_ms": zone_state.position_ms,
+            "lyrics_offset_ms": offset_ms,
             "current_index": -1,
             "lines": [],
             "error": "current track is not in the library",
@@ -309,11 +338,12 @@ async fn now_for_zone(
     .await
     {
         Ok(ly) => {
-            let current_index = current_line_index(&ly.lines, zone_state.position_ms);
+            let current_index = current_line_index(&ly.lines, sync_position);
             Json(json!({
                 "zone_id": zone_id,
                 "track_id": track_id,
                 "position_ms": zone_state.position_ms,
+                "lyrics_offset_ms": offset_ms,
                 "current_index": current_index,
                 "synced": ly.synced,
                 "source": ly.source,
@@ -328,6 +358,7 @@ async fn now_for_zone(
                 "zone_id": zone_id,
                 "track_id": track_id,
                 "position_ms": zone_state.position_ms,
+                "lyrics_offset_ms": offset_ms,
                 "current_index": -1,
                 "lines": [],
                 "error": format!("lyrics fetch failed: {e}"),

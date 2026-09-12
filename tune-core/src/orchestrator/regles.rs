@@ -1,0 +1,796 @@
+use super::*;
+
+/// Le rang qu'il faut écrire dans `listen_history`, sachant l'état de la zone.
+///
+/// Toute la subtilité est le tirage aléatoire. En lecture séquentielle, le
+/// rang est ce qui permet de reprendre la playlist à la piste 7. En lecture
+/// aléatoire, il ne désigne plus rien de reproductible : la permutation
+/// (`shuffle_order`) est régénérée à chaque activation, donc « position 7 »
+/// dans le tirage d'hier tombera sur une autre piste demain. L'arbitrage rendu
+/// sur #2441 est de RE-TIRER plutôt que de faire semblant de rejouer le même
+/// tirage — ce que cette fonction inscrit à l'écriture, faute de quoi il
+/// faudrait redevenir l'état « aléatoire » de la zone au moment où l'accueil
+/// s'affiche, ce qui n'existe plus.
+///
+/// Un `None` en base se relit donc « rouvre au début », que ce soit parce
+/// qu'on re-tire ou parce que la ligne est antérieure à la migration 94.
+pub fn rang_a_retenir(shuffle: bool, queue_position: i64) -> Option<i64> {
+    if shuffle || queue_position < 0 {
+        None
+    } else {
+        Some(queue_position)
+    }
+}
+
+/// Le forçage WAV d'une zone s'applique-t-il à CETTE source ?
+///
+/// « Forcer le WAV » (`dlna_lpcm` / `dlna_wav24`) existe pour contourner le
+/// décodeur ALAC du renderer — le LHC-56 de Yves claque au démarrage sur de
+/// l'ALAC direct. L'appliquer aussi aux sources FLAC est un dommage
+/// collatéral, jamais l'objectif.
+///
+/// Tant que les deux réglages s'excluaient, « Forcer le WAV » l'emportait en
+/// silence sur « FLAC natif » : un FLAC partait en WAV sans que rien ne
+/// l'explique, et l'utilisateur en déduisait que Tune gardait en mémoire les
+/// réglages du morceau précédent (forum #1437). Les deux cases décrivent en
+/// réalité deux sources différentes et peuvent coexister : l'ALAC part en WAV,
+/// le FLAC reste du FLAC.
+///
+/// L'exception exige l'opt-in `dlna_native_flac`. Sans lui, une source FLAC
+/// continue de suivre le forçage — ce dont ont besoin les renderers qui ne
+/// savent pas lire le FLAC.
+pub fn wav_override_applies(
+    force_wav_requested: bool,
+    source_is_flac: bool,
+    native_flac_opt_in: bool,
+) -> bool {
+    force_wav_requested && !(source_is_flac && native_flac_opt_in)
+}
+
+/// Le plafond 16 bits s'applique-t-il à CETTE lecture ?
+///
+/// Certains renderers annoncent `audio/flac` mais ne décodent que 16 bits : un
+/// FLAC ou un ALAC 24 bits servi direct joue le SILENCE (Ruark R3, Yves #1137).
+/// Deux sources l'activent, en OU : le drapeau de zone `dlna_cap_16bit` et le
+/// quirk `force_16bit` du catalogue d'appareils (marque + modèle choisis pour
+/// la zone, `device_catalog::resolve_zone_quirks`). Le quirk ne peut
+/// qu'activer le plafond, jamais le désactiver. Sans objet jusqu'à 16 bits, et
+/// hors sortie réseau.
+///
+/// `pub` pour la même raison que [`is_network_output_type`] et
+/// [`wav_override_applies`] : le miroir du chemin du signal
+/// (`tune-server/src/routes/zones/signal_path.rs`) recopiait cette condition
+/// SANS le quirk catalogue. Sur un Ruark R3 et une source 24 bits,
+/// l'orchestrateur transcodait en 16 bits pendant que le panneau annonçait un
+/// passthrough bit-perfect (#3183, troisième ligne de l'écart n° 3). Le
+/// paramètre `catalogue_force_16bit` est OBLIGATOIRE : un appelant ne peut
+/// plus oublier cette source-là.
+pub fn dlna_cap_16bit_applies(
+    is_network_output: bool,
+    bit_depth: u16,
+    zone_cap_16bit: bool,
+    catalogue_force_16bit: bool,
+) -> bool {
+    is_network_output && bit_depth > 16 && (zone_cap_16bit || catalogue_force_16bit)
+}
+
+/// La source doit-elle etre transcodee POUR LA SORTIE ?
+///
+/// Quatrieme condition partagee entre la decision
+/// (`orchestrator/resolve_local.rs`) et le miroir du chemin du signal
+/// (`tune-server/src/routes/zones/signal_path.rs`) — et la seule des quatre
+/// qui divergeait ENCORE quand les trois lignes du tableau de #3183 ont ete
+/// declarees reconciliees. Personne ne l'avait comptee : elle n'etait pas dans
+/// le tableau.
+///
+/// L'ecart porte sur un `output_type` et un format, un seul de chaque. Le
+/// Default Media Receiver d'un Chromecast ne decode pas l'AIFF, qu'un renderer
+/// DLNA joue direct : la decision choisit donc entre
+/// [`AudioFormat::needs_transcode_for_chromecast`] et
+/// [`AudioFormat::needs_transcode_for_dlna`] selon le type de la zone (#1210,
+/// Mika, BeoPlay A9 via CAST), tandis que le miroir n'appelait QUE la seconde.
+/// Sur une zone `chromecast` et une source AIFF, l'orchestrateur transcode
+/// donc pendant que le panneau annonce un passthrough bit-perfect — la faute
+/// exacte du Ruark R3, sur un autre couple.
+///
+/// Le `output_type` est un parametre OBLIGATOIRE, et `is_network_output` n'en
+/// est PAS un : il est deduit ici par [`is_network_output_type`]. C'est ce qui
+/// portait l'ecart, un appelant ne peut plus l'oublier ni le recalculer de
+/// travers.
+pub fn needs_transcode_for_output_applies(
+    output_type: Option<&str>,
+    source_format: Option<AudioFormat>,
+    dsd_passthrough: bool,
+    alac_passthrough: bool,
+    aac_passthrough: bool,
+) -> bool {
+    is_network_output_type(output_type)
+        && !dsd_passthrough
+        && !alac_passthrough
+        && !aac_passthrough
+        && source_format.is_some_and(|f| {
+            if output_type == Some("chromecast") {
+                f.needs_transcode_for_chromecast()
+            } else {
+                f.needs_transcode_for_dlna()
+            }
+        })
+}
+
+/// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
+/// file served on the HI-RES streaming path (cache-hit → a previously-finished
+/// transcode instead of a fresh one), so it stays OFF until validated on a real
+/// DLNA renderer. Enable with `TUNE_DASH_WARM_CACHE=1`.
+/// Facteur linéaire d'un trim de gain par renderer (`zone_{id}_gain_trim_db`).
+/// Clampe à ±12 dB — au-delà, on harmonise plus rien, on casse.
+pub(super) fn gain_trim_factor(trim_db: f64) -> f64 {
+    10f64.powf(trim_db.clamp(-12.0, 12.0) / 20.0)
+}
+
+pub(super) fn dash_warm_cache_enabled() -> bool {
+    std::env::var("TUNE_DASH_WARM_CACHE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// DIDL `res@duration` (ms) for a native passthrough stream served raw to a
+/// network renderer (FLAC/ALAC/… sent as-is, not transcoded).
+///
+/// Prefer the file container's authoritative duration (`probed_secs`, read from
+/// the FLAC STREAMINFO / lofty properties — the true playable length of the
+/// bytes we serve) over the scanned `track.duration_ms`, which can be a few
+/// seconds too long (recovered by a slow/fallback NAS scan, or drifted vs. the
+/// real sample count). An over-long `res@duration` makes the gapless-queued
+/// (SetNextAVTransportURI) track cut near EOF and lose its progress display on
+/// the Marantz ND 8006 (#1132), because the renderer models the auto-advanced
+/// track purely from the DIDL instead of re-probing the stream.
+///
+/// Falls back to the scanned duration when the probe failed or is non-positive
+/// (e.g. a NAS read timeout), so we never blank the duration entirely.
+pub(super) fn passthrough_didl_duration_ms(probed_secs: Option<f64>, scanned_ms: i64) -> i64 {
+    probed_secs
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .map(|s| (s * 1000.0).round() as i64)
+        .filter(|&ms| ms > 0)
+        .unwrap_or(scanned_ms)
+}
+
+/// Recover a local file's real duration (ms) at play time when the DB row has
+/// none (`duration_ms <= 0`). DSD (`.dsf`/`.dff`) is computed from the header —
+/// lofty (which `get_duration` uses) reports 0 for most DSD files, which is how
+/// the 0 got into the DB in the first place — everything else falls back to
+/// lofty. Returns `None` when no positive duration can be determined.
+pub(super) async fn probe_local_duration_ms(
+    file_path: &str,
+    source_format: Option<AudioFormat>,
+) -> Option<i64> {
+    if source_format == Some(AudioFormat::Dsd) {
+        let p = file_path.to_string();
+        return tokio::task::spawn_blocking(move || {
+            let dur = if p.to_ascii_lowercase().ends_with(".dff") {
+                crate::audio::dff::parse_dff(&p)
+                    .ok()
+                    .and_then(|i| i.duration_ms())
+            } else {
+                crate::audio::dsf::parse_dsf(&p)
+                    .ok()
+                    .and_then(|i| i.duration_ms())
+            };
+            dur.map(|ms| ms as i64)
+        })
+        .await
+        .ok()
+        .flatten()
+        .filter(|&ms| ms > 0);
+    }
+    crate::audio::analyzer::get_duration(file_path)
+        .await
+        .ok()
+        .map(|s| (s * 1000.0) as i64)
+        .filter(|&ms| ms > 0)
+}
+
+/// La commande de transport a-t-elle pu être exécutée malgré l'erreur remontée ?
+///
+/// Un timeout SOAP (voir [`crate::outputs::dlna::SOAP_TIMEOUT_PREFIX`]) ne prouve
+/// rien : la requête a pu atteindre un renderer lent et être honorée, seule la
+/// réponse a manqué. Un refus de connexion, lui, est concluant — rien n'est
+/// parti. Ce prédicat décide si l'on conserve la session de flux.
+pub(crate) fn command_may_have_landed(err: &str) -> bool {
+    // `contains` et non `starts_with` : send_to_output enveloppe l'erreur de la
+    // sortie dans « Output device error: {e} », le marqueur n'est donc jamais en
+    // tête. Un test couvre précisément ce chemin — s'y fier plutôt qu'à la forme
+    // supposée de la chaîne.
+    err.contains(crate::outputs::dlna::SOAP_TIMEOUT_PREFIX)
+}
+
+/// Le flux qui part sur le fil est-il du DSD BRUT ?
+///
+/// `application/x-dsd` par défaut, ou le MIME que le lecteur a lui-même
+/// annoncé pour le DSF/DFF (`audio/x-dsf`, `audio/dff`…) : le passthrough
+/// reprend celui-là quand il existe, parce que certains renderers n'acceptent
+/// que le MIME exact qu'ils publient. Aucun MIME PCM ne porte ces trois
+/// lettres, donc la reconnaissance ne peut pas mordre à côté — un FLAC servi à
+/// la même zone n'est jamais confondu avec un DSD.
+pub fn est_dsd_brut(mime_type: &str) -> bool {
+    let m = mime_type.to_ascii_lowercase();
+    m.contains("dsd") || m.contains("dsf") || m.contains("dff")
+}
+
+/// Should a network output be fed from a pre-transcoded temp file (blocking,
+/// Content-Length known) rather than a streaming session?
+///
+/// A temp file is required for renderers that reject chunked transfer
+/// (darTZeel LHC-208 etc.): every non-WAV target (FLAC), and every WAV target a
+/// renderer demands as raw LPCM (`dlna_needs_wav`). L'exception est
+/// `wav_diffusable` : une cible WAV dont la session progressive annonce déjà un
+/// Content-Length exact (`StreamInfo::wav_content_length`) ET dont le décodeur
+/// travaille au fil de l'eau. Deux sources y entrent, pour la même raison —
+/// passer par le fichier leur est FATAL, pas seulement lent :
+///
+/// - le DSD sous la bascule `dsd_lpcm_stream` : en DSD256/512 le décodage
+///   dépasse le budget du fichier temporaire et le renderer joue du silence ;
+/// - le Monkey's Audio (`.ape`) vers un renderer qui a ANNONCÉ le LPCM
+///   (#3311) — voir [`cible_wav_pour_ape_reseau`].
+///
+/// `dsp_active` ne compte que si la cible n'est PAS du WAV. Depuis LAT-F1
+/// (phase 0) le bras progressif applique lui-même égaliseur, convolveur et
+/// ReplayGain au fil de l'eau (`spawn_streaming_dsp_relay`, le relais de
+/// #2863) : une cible WAV garde le démarrage immédiat AVEC son traitement.
+/// Avant, toute zone à traitement actif repassait par le fichier entier —
+/// 46 à 62 s de silence sur une zone DLNA avec égaliseur (#3357). Une cible
+/// non WAV (FLAC ré-encodé) passe encore par le fichier : l'encodeur n'est
+/// branché que là. La famille #1216 (traitement perdu en silence) reste
+/// couverte : le traitement est appliqué, d'un côté ou de l'autre.
+///
+/// Kept a pure function so the decision matrix is unit-testable without an
+/// orchestrator.
+pub(super) fn use_file_transcode_for(
+    is_network: bool,
+    target_is_wav: bool,
+    dlna_needs_wav: bool,
+    wav_diffusable: bool,
+    dsp_active: bool,
+) -> bool {
+    is_network && (!target_is_wav || (dlna_needs_wav && !wav_diffusable))
+        || (dsp_active && !target_is_wav)
+}
+
+/// #3311 — un Monkey's Audio (`.ape`) servi à un renderer RÉSEAU doit-il
+/// partir en WAV progressif plutôt qu'en FLAC ré-encodé par le fichier ?
+///
+/// Le décodeur `.ape` incrémental livré en v0.9.131 (#2505, PR #3177) n'est
+/// branché que sur le bras progressif (`decode_ape_streaming`). Or `.ape` a
+/// `needs_transcode_for_dlna() == true` et `dlna_transcode_target() == Flac` :
+/// sur une zone réseau la cible est donc le FLAC, et `use_file_transcode_for`
+/// rend `true` ; et si le renderer n'annonce pas `audio/flac`, `dlna_needs_wav`
+/// donne un WAV que le MÊME prédicat renvoie AUSSI au fichier. Les deux issues
+/// aboutissent à `decode_to_pcm` → `decode_ape_to_pcm`, la piste entière en
+/// mémoire — exactement ce que #2505 a chassé de l'autre bras. AUCUN `.ape`
+/// joué sur une zone réseau n'atteignait donc le correctif annoncé.
+///
+/// Mesuré sur Shrek (profil release), image de CD d'une heure 16/44 stéréo
+/// fabriquée par répétition de trames :
+///
+/// | bras | premier octet PCM | pic RSS |
+/// |---|---|---|
+/// | progressif (`decode_ape_streaming`) | 0,70 ms | plat |
+/// | par lots (`decode_ape_to_pcm`) | jamais avant la fin, 59,2 s | 2,37 Gio |
+///
+/// Et le plafond d'en-tête du bras par lots REFUSE net au-delà de 2 Gio de PCM
+/// déclaré — un 24/96 dépasse ce seuil vers 52 minutes.
+///
+/// Le renderer doit avoir ANNONCÉ le LPCM (sonde `GetProtocolInfo`,
+/// `dlna_accepte_lpcm`) : le format servi sur le fil change, et une sonde
+/// inconcluante garde le FLAC. Même garde que [`cible_wav_pour_traitement`].
+///
+/// Fonction pure, comme ses deux voisines : la matrice se teste sans
+/// orchestrateur.
+pub(super) fn cible_wav_pour_ape_reseau(
+    src_est_ape: bool,
+    is_network: bool,
+    renderer_accepte_lpcm: bool,
+) -> bool {
+    src_est_ape && is_network && renderer_accepte_lpcm
+}
+
+/// LAT-F1 (phase 1) — une zone réseau à traitement actif dont la cible serait
+/// un FICHIER (FLAC ré-encodé) doit-elle partir en WAV progressif ?
+///
+/// La phase 0 a branché le traitement sur le bras progressif, mais n'y envoie
+/// que les cibles DÉJÀ WAV. Un renderer qui lit le FLAC (Beoplay A9, Linn,
+/// LHC-208…) recevait donc toujours le FLAC ré-encodé par le fichier entier :
+/// 46 à 62 s de silence au premier morceau d'une zone avec égaliseur (#3357).
+///
+/// Choisir le WAV pour ces zones change le FORMAT servi au renderer — donc :
+/// - opt-in explicite (`dsp_progressif_reseau`, Réglages → Lecture), à froid
+///   rien ne bouge ;
+/// - le renderer doit avoir ANNONCÉ le LPCM à la profondeur servie (sonde
+///   `GetProtocolInfo` ; inconcluante ⇒ non, on garde le fichier) ;
+/// - jamais sur un DSD : il a sa propre branche WAV, déjà progressive.
+///
+/// Fonction pure, comme `use_file_transcode_for` : la matrice se teste sans
+/// orchestrateur. L'ordre des branches de `decider_le_format_de_sortie` fait
+/// le reste — une cible déjà WAV (OAAT, locale, navigateur, `dlna_needs_wav`)
+/// n'arrive jamais jusqu'ici.
+pub(super) fn cible_wav_pour_traitement(
+    dsp_active: bool,
+    is_network: bool,
+    src_est_dsd: bool,
+    opt_in: bool,
+    renderer_accepte_lpcm: bool,
+) -> bool {
+    dsp_active && is_network && !src_est_dsd && opt_in && renderer_accepte_lpcm
+}
+
+/// Le relais DSP au fil de l'eau doit-il être inséré sur le bras progressif ?
+///
+/// LAT-F1 (phase 0) a branché égaliseur, convolveur et ReplayGain sur ce bras
+/// sans regarder QUI le consomme. Or une sortie LOCALE y passe toujours —
+/// `local_needs_wav` transcode en WAV tout format source connu, parce que le
+/// parseur de `LocalOutput` ne lit que du PCM simple — et `LocalOutput`
+/// applique DÉJÀ ces trois étages dans sa boucle de lecture (`set_eq`,
+/// `set_replaygain_factor`, son propre convolveur, réinstallés à chaque
+/// lecture par le chemin de `transport.rs`).
+///
+/// Les deux chemins se cumulaient donc, et le cumul est MESURÉ
+/// (`le_cumul_double_les_decibels_et_eleve_le_gain_au_carre`) : courbe
+/// d'égaliseur **doublée en dB**, facteur ReplayGain **au carré**, réponse
+/// impulsionnelle convoluée deux fois. Régression livrée en v0.9.139 et
+/// v0.9.140, audible sur toute la population de #1416.
+///
+/// Le relais n'a de sens que pour les sorties qui ne traitent RIEN
+/// elles-mêmes : réseau, OAAT, navigateur. Une sortie `local:` s'en passe.
+pub(super) fn relais_dsp_progressif(dsp_actif: bool, sortie_est_locale: bool) -> bool {
+    dsp_actif && !sortie_est_locale
+}
+
+/// Le bras FICHIER doit-il cuire le traitement de zone dans le fichier ?
+///
+/// Même défaut que [`relais_dsp_progressif`], sur l'autre bras, et la même
+/// réponse : une sortie LOCALE applique déjà égaliseur, convolveur et
+/// ReplayGain elle-même. Les cuire aussi dans le fichier pré-transcodé les
+/// appliquerait deux fois.
+///
+/// Le ReplayGain portait cette garde depuis LAT-F2 — « A -6 dB track played
+/// at -12 dB, quietly » — mais il la portait SEUL : `load_eq_processor` et
+/// `load_convolver` étaient appelés sans condition juste au-dessus de lui.
+/// L'asymétrie n'avait pas de raison d'être.
+///
+/// Ce bras est aujourd'hui INATTEIGNABLE pour une sortie locale, et c'est
+/// gardé : `use_file_transcode_for` y reçoit `dsp_active = (navigateur ||
+/// réseau) && eq_forces_transcode`, faux pour elle, et
+/// `une_zone_locale_avec_egaliseur_ne_traite_pas_deux_fois` le vérifie de
+/// bout en bout. La garde est donc une ceinture, pas la correction d'un
+/// symptôme observé : elle ferme la porte par laquelle le doublement
+/// reviendrait le jour où quelqu'un relâche ce prédicat.
+pub(super) fn traitement_cuit_dans_le_fichier(sortie_est_locale: bool) -> bool {
+    !sortie_est_locale
+}
+
+/// La cible d'un TRANSCODAGE doit être un format que l'encodeur sait produire.
+///
+/// `AudioFormat::dlna_transcode_target` rend « AIFF » pour une source AIFF,
+/// parce que les renderers le lisent nativement — vrai en passthrough, faux
+/// dès qu'un traitement force le transcodage : l'encodeur n'a pas de bras
+/// AIFF (ni MP3, ni OGG) et substituait du FLAC en silence, que le serveur
+/// servait sous `.aiff` / `audio/aiff`. Le renderer DLNA de Cyrille restait
+/// muet (#3357, 60 207 920 octets de FLAC étiquetés AIFF). Ici, tout ce que
+/// l'encodeur ne sait pas écrire devient FLAC AVANT que l'extension et le
+/// type MIME n'en soient dérivés : un FLAC s'annonce FLAC.
+pub(super) fn cible_encodable(
+    cible: crate::audio::formats::AudioFormat,
+) -> crate::audio::formats::AudioFormat {
+    use crate::audio::formats::AudioFormat;
+    match cible {
+        AudioFormat::Wav | AudioFormat::Flac => cible,
+        _ => AudioFormat::Flac,
+    }
+}
+
+/// Le bras streaming HTTPS doit-il PRÉ-TRANSCODER au lieu de servir les octets
+/// du CDN verbatim ?
+///
+/// Deux raisons, et la seconde manquait : le renderer ne sait pas lire le MIME
+/// amont (Denon, Marantz, Revox — pas d'`audio/flac` dans leur Sink), OU un
+/// traitement de zone doit entrer dans le signal. Une session proxy ne décode
+/// rien : égaliseur, convolveur et ReplayGain y sont perdus EN SILENCE. C'est
+/// le bras que ni #1168 (navigateur), ni #1653 (sorties PULL), ni #2950 (bras
+/// progressif de `play_inner`) n'atteignaient — aucun ne passe par ici.
+///
+/// Fonction pure : la matrice de décision se teste sans orchestrateur, comme
+/// `use_file_transcode_for`.
+pub(super) fn streaming_needs_pretranscode(renderer_supports_mime: bool, dsp_active: bool) -> bool {
+    !renderer_supports_mime || dsp_active
+}
+
+/// Format d'encodage du pré-transcodage streaming.
+///
+/// WAV/LPCM quand le renderer a REFUSÉ le MIME amont : c'est le profil
+/// `DLNA.ORG_PN=LPCM`, 16 bits seulement, d'où le plafond historique (#1137,
+/// Ruark R3 / LHC-62 muets en 24 bits sous ce profil).
+///
+/// FLAC quand il l'accepte et que SEUL le traitement impose le pré-transcodage :
+/// le plafond 16 bits n'a alors aucune raison d'être, et l'appliquer
+/// dégraderait un Hi-Res 24 bits pour un simple égaliseur. C'est le même
+/// arbitrage que le bras DASH, qui encode déjà en FLAC pleine profondeur quand
+/// le renderer sait le lire.
+pub(super) fn streaming_pretranscode_format(renderer_supports_mime: bool) -> &'static str {
+    if renderer_supports_mime {
+        "flac"
+    } else {
+        "wav"
+    }
+}
+
+/// Les types de sortie qui poussent l'audio vers un appareil PAR LE RÉSEAU.
+///
+/// **L'unique exemplaire de cette liste.** Elle était recopiée à l'identique en
+/// trois endroits — `is_push_uri_output_type`, `resolve_local_track` et
+/// [`PlaybackOrchestrator::seek`] — et #2893 en réclamait une quatrième. Toutes
+/// y passent désormais : un renderer ajouté ici l'est partout, alors qu'une
+/// copie oubliée serait restée MUETTE (un morceau qui repart du début).
+///
+/// `pub` depuis #2189 : il existait une QUATRIÈME copie, hors de cette caisse
+/// — `build_signal_path` (`tune-server/src/routes/zones.rs`) — et elle avait
+/// déjà dérivé : cinq types au lieu de six, `slimproto` manquant. Le panneau
+/// et le chemin audio répondaient donc à deux questions différentes sur la
+/// même zone. Le miroir d'affichage appelle maintenant CETTE fonction.
+pub fn is_network_output_type(output_type: Option<&str>) -> bool {
+    matches!(
+        output_type,
+        Some("dlna")
+            | Some("openhome")
+            | Some("chromecast")
+            | Some("bluos")
+            | Some("squeezebox")
+            | Some("slimproto")
+    )
+}
+
+/// La sortie va CHERCHER le flux elle-même et reçoit donc nos octets **tels
+/// quels** : `hqplayer`, `airplay2`, `diretta`, tout greffon hors dépôt.
+///
+/// C'est la troisième famille de `pull_output_needs_dsp_transcode`, extraite
+/// telle quelle — ni élargie, ni rétrécie. Elle existe séparément parce que le
+/// panneau du chemin du signal en a besoin SANS les drapeaux d'exécution
+/// (`is_local`, `is_oaat`, format source) : il n'a que le type de la zone.
+///
+/// La conséquence pour l'affichage est directe et c'est tout le sujet de
+/// #2189 : sur ces sorties, le transport ne touche AUCUN échantillon, donc il
+/// est bit-perfect. Le seul traitement qui puisse s'y appliquer est celui que
+/// `pull_output_needs_dsp_transcode` force — EQ, correction de pièce,
+/// ReplayGain — et le panneau le compte déjà à part. Le bras par défaut de
+/// `build_signal_path` rendait `false` inconditionnellement : une zone
+/// HQPlayer était déclarée « non bit-perfect » sur un FLAC 44,1/16 servi
+/// octet pour octet (Alex Campbell, 0.9.98 Linux, fil 1524).
+pub fn is_pull_dsp_output_type(output_type: Option<&str>) -> bool {
+    output_type.is_some() && !is_network_output_type(output_type) && output_type != Some("browser")
+}
+
+/// Is `output_type` (from [`PlaybackOrchestrator::output_type_of`]) one of the
+/// push-URI renderer types (DLNA/OpenHome/Chromecast/BluOS/Squeezebox/
+/// Slimproto) that receives a URI and can restart playback from byte 0 on a
+/// redundant `SetAVTransportURI` (or equivalent) — the failure mode the
+/// duplicate-net-play coalescing in `play_inner` (#1129) guards against?
+/// Pull-based outputs — `local`, and out-of-tree outputs like `oaat` and
+/// `diretta` that fetch/stream audio themselves rather than being pushed a
+/// URI — never exhibit it, so they must be excluded here rather than only via
+/// a `device_id` naming convention (a pull output has no reason to prefix its
+/// `device_id` with `"local:"`). Pure so it's unit-testable without an
+/// orchestrator or a registered output.
+/// True when an output receives the stream with none of our DSP applied to it,
+/// so an active EQ / room correction / ReplayGain must force the transcode path
+/// to be heard at all.
+///
+/// The push-URI renderers of [`is_push_uri_output_type`] and browser zones are
+/// handled by their own flags. What this covers is the third family: a PULL
+/// output that fetches the audio itself and is not built in — `diretta`, and
+/// anything an out-of-tree plugin registers. It was silently absent from the
+/// list, so the EQ was computed and thrown away (Eric, forum ; same hole as
+/// #1216 on a Beoplay A9).
+///
+/// Excluded on purpose:
+/// - `local` and `oaat`, which already transcode as soon as the source format
+///   is known, so the DSP reaches them;
+/// - an unknown format, which there is no safe way to transcode;
+/// - DSD, because converting a native DSD stream to PCM in order to apply an
+///   EQ would be a degradation decided on the listener's behalf.
+pub(super) fn pull_output_needs_dsp_transcode(
+    output_type: Option<&str>,
+    is_local: bool,
+    is_oaat: bool,
+    source_format: Option<AudioFormat>,
+) -> bool {
+    // La part « type de sortie » vit dans [`is_pull_dsp_output_type`], d'où le
+    // panneau du chemin du signal la lit aussi (#2189). Même ensemble, à la
+    // lettre : `is_push_uri_output_type` n'est qu'un alias de
+    // `is_network_output_type`, que la fonction extraite appelle.
+    is_pull_dsp_output_type(output_type)
+        && !is_local
+        && !is_oaat
+        && source_format.is_some()
+        && source_format != Some(AudioFormat::Dsd)
+}
+
+/// Les sorties qui reçoivent une URI et peuvent repartir de l'octet 0 sur un
+/// envoi redondant (Revox S100) — la porte de coalescence de #1129.
+///
+/// Même ensemble que [`is_network_output_type`], et ce n'est pas un hasard :
+/// « pousser une URI » est précisément ce que fait une sortie réseau ici. La
+/// liste ne vit donc qu'à UN endroit ; ce nom-ci reste pour que la porte #1129
+/// se lise pour ce qu'elle est.
+pub(super) fn is_push_uri_output_type(output_type: Option<&str>) -> bool {
+    is_network_output_type(output_type)
+}
+
+/// Profondeur de bits admissible par un appareil de lecture, en sortie.
+///
+/// Plancher a 16 : en dessous, plus rien ne lit le PCM de facon fiable.
+/// Plafond a 24 : c'est la limite de la quasi-totalite des lecteurs reseau —
+/// le Marantz ND8006 de Jean Valjean affiche « format non supporte » et reste
+/// muet devant un flux 32 bits, qu'il soit transcode en WAV ou envoye en FLAC
+/// direct (#1610). Le 32 bits venait de `track.bit_depth`, donc du scan : le
+/// format FLAC l'autorise, et rien ne le ramenait a une valeur jouable.
+///
+/// La regle etait deja appliquee a trois endroits, ecrite de trois facons
+/// (`max(16).min(24)`, `min(24).max(16)`) — et oubliee au quatrieme. Une
+/// fonction unique rend l'oubli impossible a reproduire.
+pub(crate) fn cap_output_bit_depth(bit_depth: u16) -> u16 {
+    bit_depth.clamp(16, 24)
+}
+
+/// Resolution ANNONCEE d'une piste : frequence ou profondeur, telle que le
+/// client l'affiche.
+///
+/// `ligne` est la valeur de la ligne `tracks` (la source, ce que le scan a lu
+/// dans le fichier). `resolu` est celle du `ResolvedStream` — pour une piste
+/// locale c'est la resolution de SORTIE, et `resolve_local_track` la fabrique
+/// quand la ligne se tait (`unwrap_or(44100)` / `unwrap_or(16)`, puis
+/// `cap_output_bit_depth`). La substituer affiche un chiffre que personne n'a
+/// mesure.
+///
+/// Le streaming, lui, n'a pas de ligne en bibliotheque : `resolu` y EST la
+/// resolution de la source, et reste le repli legitime.
+pub(crate) fn resolution_annoncee(
+    ligne: Option<u32>,
+    resolu: Option<u32>,
+    source_locale: bool,
+) -> Option<u32> {
+    if source_locale {
+        // La ligne, ou rien. Jamais un chiffre fabrique par la sortie.
+        ligne
+    } else {
+        ligne.or(resolu)
+    }
+}
+
+/// Faut-il emballer ce DSD en DoP (trames PCM 24 bits au seizième du débit) ?
+///
+/// - **Sortie locale** : « natif » et « dop » y mènent tous deux, une carte son
+///   ne recevant pas de DSD autrement.
+/// - **Renderer réseau** : uniquement sur choix EXPLICITE « dop ». En « auto »
+///   ou « natif », c'est `should_dsd_passthrough` qui tranche entre l'envoi du
+///   fichier tel quel et le transcodage.
+///
+/// Règle extraite en fonction libre parce que son absence côté réseau était
+/// invisible : `"dop"` n'était comparé qu'à un seul endroit du dépôt, sous un
+/// garde `is_local_output` (#1772).
+/// Cadence et canaux à ANNONCER pour un flux DoP, le fichier faisant foi.
+///
+/// L'en-tête WAV et la charge utile doivent décrire la même chose. L'encodeur
+/// (`decode_dsd_to_dop_streaming`) se construit sur ce que rend
+/// `parse_dsf`/`parse_dff` ; annoncer la ligne `tracks` à la place revient à
+/// parier que la base et le fichier concordent. Quand ils divergent d'un canal,
+/// chaque mot de 24 bits est décalé, le marqueur DoP ne tombe plus sur l'octet
+/// de poids fort, et le DAC joue le train DSD comme du PCM : du bruit blanc.
+///
+/// La base ne sert que de repli, pour un en-tête illisible — mieux vaut
+/// diffuser avec des valeurs approximatives que refuser de lire.
+pub(super) fn dop_wire_params(
+    probe: Option<(u32, u32)>,
+    db_rate: Option<u32>,
+    db_channels: u32,
+) -> (u32, u16) {
+    let rate = probe
+        .map(|(sr, _)| sr)
+        .unwrap_or_else(|| db_rate.unwrap_or(2_822_400));
+    let channels = probe
+        .map(|(_, ch)| ch as u16)
+        .unwrap_or(db_channels as u16)
+        .max(2);
+    (rate, channels)
+}
+
+/// Le conteneur peut-il porter plus de 16 bits alors que la base l'ignore ?
+///
+/// Seul l'ALAC est concerné : sa profondeur ne se lit ni dans les tags ni par
+/// `lofty`, mais dans le cookie magique du fichier. Tous les autres conteneurs
+/// renseignent la leur au scan, donc les sonder serait de l'E/S pour rien.
+pub(super) fn conteneur_a_profondeur_cachee(fmt: Option<AudioFormat>) -> bool {
+    matches!(fmt, Some(AudioFormat::Alac))
+}
+
+/// Profondeur réelle lue DANS le fichier, quand la base ne la connaît pas.
+///
+/// Rend `None` — donc « garder ce que dit la base » — dès que le conteneur
+/// n'est pas concerné, que le fichier est illisible, ou que la sonde ne trouve
+/// rien. Ne jamais échouer la lecture pour une profondeur : au pire on reste
+/// sur le comportement d'avant.
+pub(super) fn profondeur_sondee_si_la_base_ignore(
+    file_path: &str,
+    fmt: Option<AudioFormat>,
+) -> Option<u16> {
+    if !conteneur_a_profondeur_cachee(fmt) {
+        return None;
+    }
+    let (_, bd) = crate::metadata::probe_m4a_props(std::path::Path::new(file_path))?;
+    let bd = bd?;
+    info!(
+        path = %file_path,
+        bit_depth = bd,
+        "alac_bit_depth_probed_from_file_for_wav24"
+    );
+    Some(bd)
+}
+
+/// Ce qu'une source DSD DEVIENT réellement en sortie — et non ce que le
+/// sélecteur de la zone affiche.
+///
+/// #2369 — le sélecteur propose « natif » et « dop ». Sur une sortie LOCALE,
+/// [`dop_requested`] rendait `true` pour les deux, à l'identique : les deux
+/// emballent le DSD en DoP. Le testeur qui coche « natif » choisit un chemin
+/// qui n'existe pas. La mesure qui le fixe, sur `v0.9.143` comme sur
+/// `batch/bugs-9` : `SND_PCM_FORMAT_DSD`, `DSD_U32` et `dsd_native` ont ZÉRO
+/// occurrence dans `tune-core/src/outputs/local.rs`, et le flux y est ouvert
+/// par `build_output_stream` typé — `f32`, puis un repli entier `i16`/`i32`.
+/// Aucun de ces types ne peut porter du 1 bit.
+///
+/// Cette énumération ne change RIEN au son : [`dop_requested`] s'en déduit et
+/// garde exactement la même table de vérité — le témoin obligatoire est
+/// `la_table_de_verite_de_dop_requested_est_inchangee`. Elle sépare la
+/// DÉCISION, pour que le journal et l'API puissent nommer ce qui part sur le
+/// fil au lieu de répéter ce qui a été demandé. Ouvrir le vrai chemin natif
+/// est le chantier de #2369 ; il vit dans `outputs/local.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportDsd {
+    /// Rien n'emballe le DSD ici. La piste sera transcodée en PCM, ou servie
+    /// telle quelle par un chemin qui a son propre arbitrage
+    /// (`should_dsd_passthrough`, en réseau).
+    Pcm,
+    /// DoP demandé explicitement, et obtenu — le comportement de référence,
+    /// qui ne doit pas bouger.
+    Dop,
+    /// La zone demande « natif » sur une sortie LOCALE. Aucun chemin natif
+    /// n'existe : c'est du DoP qui part, exactement comme en mode « dop ».
+    /// C'est le mensonge de #2369, nommé plutôt que corrigé — le corriger
+    /// suppose d'ouvrir le périphérique dans un format DSD, ce qui n'est pas
+    /// une décision d'orchestrateur.
+    NatifServiEnDop,
+}
+
+impl TransportDsd {
+    /// Libellé stable, pour le journal et pour l'API. Ce sont des identifiants
+    /// que l'interface lit : ils ne se traduisent pas et ne changent pas.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pcm => "pcm",
+            Self::Dop => "dop",
+            Self::NatifServiEnDop => "natif_servi_en_dop",
+        }
+    }
+
+    /// Le réglage de la zone est-il tenu tel qu'il est écrit à l'écran ?
+    ///
+    /// Faux uniquement pour [`Self::NatifServiEnDop`] : c'est le seul cas où
+    /// ce qui part diffère de ce qui a été demandé.
+    #[must_use]
+    pub fn tient_sa_promesse(self) -> bool {
+        !matches!(self, Self::NatifServiEnDop)
+    }
+}
+
+/// Le transport qu'une source DSD obtiendra, sachant la sortie et le réglage
+/// de la zone.
+///
+/// `is_local` se lit sur le PRÉFIXE de `output_device_id` (`local:`), pas sur
+/// `output_type` — c'est la source dont se sert `resolve_local_track`, et le
+/// miroir d'affichage doit se servir de la même, faute de quoi le panneau et
+/// le chemin audio répondraient à deux questions différentes (le défaut
+/// qu'avait déjà corrigé #2189 sur [`is_network_output_type`]).
+#[must_use]
+pub fn transport_dsd(is_local: bool, is_network: bool, dsd_mode: &str) -> TransportDsd {
+    if is_local {
+        return match dsd_mode {
+            "native" => TransportDsd::NatifServiEnDop,
+            "dop" => TransportDsd::Dop,
+            _ => TransportDsd::Pcm,
+        };
+    }
+    if is_network && dsd_mode == "dop" {
+        return TransportDsd::Dop;
+    }
+    TransportDsd::Pcm
+}
+
+/// Un emballage DoP part-il ? Déduit de [`transport_dsd`] : c'est la MÊME
+/// décision, lue en booléen par les appelants qui n'ont pas besoin du détail.
+///
+/// Écrite ainsi plutôt qu'en double pour qu'il ne puisse pas exister deux
+/// réponses à la même question — la dérive qu'a coûtée chaque copie de
+/// `is_network_output_type` (#2189).
+pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) -> bool {
+    transport_dsd(is_local, is_network, dsd_mode) != TransportDsd::Pcm
+}
+
+/// Cette piste est-elle du 1 bit (DSF/DFF) ? Le format vient de la base, tel
+/// que le scan l'a écrit.
+pub fn est_source_dsd(format: Option<&str>) -> bool {
+    format.is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "dsf" | "dff" | "dsd"))
+}
+
+/// Le fichier à décoder pour ré-alimenter les VU-mètres après une avance
+/// gapless — `None` quand il n'y a rien à mesurer.
+///
+/// Le DSD en était exclu tout court (`file_path.filter(|_| !is_dsd)`), pour un
+/// motif qui n'existe plus : `decode_to_pcm_streaming_with_levels` décode
+/// DSF/DFF **en flux** depuis #1423, exactement comme le transcode de la
+/// première lecture. L'exclusion laissait donc la zone SANS forwarder après
+/// chaque enchaînement — `bump_levels_gen` venait de tuer le précédent — et
+/// les aiguilles gelaient sur leur dernière valeur pour tout le reste de
+/// l'album, alors que le FLAC de la même zone continuait de les animer
+/// (#1541, Smart DX1 en `dsd_mode: pcm`).
+///
+/// Ce que le DSD garde en propre, c'est le PRIX : rendre du 1 bit en PCM coûte
+/// cher, et sur le seul chemin qui ne mesure rien — OAAT en DSD natif, cf.
+/// [`PlaybackOrchestrator::output_produces_levels`] — ce serait précisément le
+/// décodage retiré pour débloquer Zicmu (`dsd_streaming_send_timeout`, #2280).
+/// On ne le paie que si la sortie publie vraiment des niveaux ; les autres
+/// formats gardent leur comportement, sans nouvelle condition.
+pub(crate) fn fichier_a_mesurer_apres_avance(
+    format: Option<&str>,
+    file_path: Option<String>,
+    la_sortie_mesure: bool,
+) -> Option<String> {
+    file_path.filter(|_| !est_source_dsd(format) || la_sortie_mesure)
+}
+
+/// Decode an infinite radio HTTP stream to PCM and send chunks through the
+/// session channel.  Runs on a blocking thread (called via spawn_blocking).
+///
+/// Whether a prefetch buffer is too short to stand in for the whole track.
+///
+/// An UNKNOWN duration (`duration_ms == 0`) is treated as truncated. The 30s
+/// prefetch mode buffers only the head of the track, and `duration_ms` is not
+/// always populated for streaming queue items (Qobuz) — when it is 0 the old
+/// `duration_ms > 0 && …` guard evaluated false and the partial buffer was
+/// served to a DLNA renderer anyway. The renderer then stalls at the buffer's
+/// end (Patricia Barber / Qobuz on an Eversolo DMP-A8: `bytes_sent=0`,
+/// `peak_pos=30000`, zone force-stopped). Callers only consult this for network
+/// outputs, so local gapless (which serves the buffer) is unaffected.
+pub(super) fn prefetch_buffer_truncated(buffered_ms: u64, duration_ms: u64) -> bool {
+    duration_ms == 0 || buffered_ms + 2000 < duration_ms
+}
+
+/// Uses symphonia with `ReadOnlySource` to handle the non-seekable HTTP stream.
+/// Decodes packets progressively and converts to interleaved 16-bit PCM bytes.
+/// The loop runs until the stream ends, the sender is dropped (stop), or an
+/// unrecoverable error occurs.
+/// Choose a renderer-safe WAV output sample rate for a decoded radio stream.
+///
+/// Most DLNA/UPnP renderers only lock onto 44.1/48 kHz (and higher standard
+/// multiples). HE-AAC / aacPlus streams (Radio Morow: `morow_hi.aacp`) decode
+/// at the AAC-LC core rate — typically 22050 Hz — because symphonia does not
+/// apply the SBR extension that would double the rate to 44100. A 22050 Hz WAV
+/// is reported as PLAYING yet emitted as SILENCE by many renderers (Yves,
+/// LHC-60). We upsample any sub-44.1 kHz stream to 44100 Hz so sound is
+/// guaranteed. Streams already at 44.1 kHz or above pass through unchanged, so
+/// stations that already work incur no extra CPU and no quality change.
+pub(crate) fn renderer_safe_wav_rate(source_rate: u32) -> u32 {
+    if source_rate < 44_100 {
+        44_100
+    } else {
+        source_rate
+    }
+}

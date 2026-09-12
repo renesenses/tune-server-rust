@@ -57,8 +57,13 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             album TEXT,\
             cover_url TEXT,\
             created_at TEXT,\
+            position TEXT,\
             UNIQUE(profile_id, item_type, service, service_id)\
         )",
+    // Rang manuel (#2001 piste 2) sur une base ou la table PRE-EXISTE : le
+    // CREATE IF NOT EXISTS ci-dessus ne l'a alors pas ajoutee. Instruction
+    // separee, car une table qui echoue ne doit jamais bloquer la suivante.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS position TEXT",
     // Only re-attach the TEXT default while the column IS still text.
     // On a database healed by migration 012 the column is BIGINT and
     // already defaults to `nextval('streaming_favorites_id_seq')`, so
@@ -117,6 +122,23 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
         )",
     "CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started_at)",
     "CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome)",
+    // Etiquettes posees sur un objet de STREAMING (#3699). Quatrieme chemin :
+    // le rattrapage rejoue a CHAQUE demarrage, seul filet pour une base
+    // PostgreSQL deja convertie AVANT cette version — elle porte
+    // `schema_version = 99` et ne recevra jamais la migration 052.
+    "CREATE TABLE IF NOT EXISTS streaming_item_tags (\
+            tag_id BIGINT NOT NULL,\
+            item_type TEXT NOT NULL,\
+            source TEXT NOT NULL,\
+            source_id TEXT NOT NULL,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            cover_url TEXT,\
+            created_at TEXT,\
+            PRIMARY KEY (tag_id, item_type, source, source_id)\
+        )",
+    "CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id)",
 ];
 
 // Every column SQLite gains via `add_column_if_missing` that the
@@ -131,14 +153,41 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
 pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE alarms ADD COLUMN IF NOT EXISTS days_of_week TEXT DEFAULT '1111111'",
     "ALTER TABLE alarms ADD COLUMN IF NOT EXISTS multi_zone_ids TEXT",
-    "ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden TEXT DEFAULT '0'",
+    // SMALLINT, pas TEXT : cette colonne n'est declaree par AUCUN script
+    // numerote — `ENSURE_COLUMNS` est son seul redacteur de schema, et c'est
+    // pour cela qu'elle est restee TEXT sur les DEUX chemins. En TEXT, NEUF des
+    // onze requetes de `zone_repo.rs` qui la touchent tombent (`COALESCE types
+    // text and integer cannot be matched`, `operator does not exist: text =
+    // integer`) : `list()` se rabat alors sur `list_all()` et une zone
+    // SUPPRIMEE reparait, `count()`/`count_online()`/`count_active()` rendent 0.
+    // Meme mecanisme et meme forme que `listen_history.album_id` juste plus bas
+    // (#2860). Sur une base existante ou elle est deja TEXT, cet ADD est un
+    // no-op et c'est la migration 056 qui la convertit (#3726).
+    "ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden SMALLINT DEFAULT 0",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS dsd_mode TEXT DEFAULT 'auto'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS autoplay_enabled TEXT DEFAULT '0'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT",
+    "ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_seen_at TEXT",
+    // #2269 — l'identifiant d'endpoint stable d'une sortie locale. TEXT des
+    // deux cotes, NULL pour l'existant : rien a rattraper en parite de types.
+    "ALTER TABLE zones ADD COLUMN IF NOT EXISTS output_endpoint_id TEXT",
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_fingerprint TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT",
-    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT",
-    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT",
+    // BIGINT, pas TEXT : `albums.id` est BIGINT, et la jointure de « Continuer
+    // l'ecoute » compare les deux. En TEXT, PostgreSQL rend `operator does not
+    // exist: text = bigint` et la section disparait en silence (#2860). Sur une
+    // base existante ou la colonne est deja TEXT, cet ADD est un no-op et c'est
+    // la migration 047 qui la convertit.
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id BIGINT",
+    // BIGINT, pas TEXT : `profiles.id` est BIGINT et `history_repo` filtre par
+    // `profile_id = <entier>`. En TEXT, PostgreSQL rend `operator does not
+    // exist: text = bigint` et l'historique du profil rend une liste vide.
+    // Meme mecanisme exact qu'`album_id` juste au-dessus (#2860, #2995) : la
+    // colonne n'arrive par aucun script numerote, la 012 ne l'a jamais vue.
+    // Sur une base existante ou elle est deja TEXT, cet ADD est un no-op et
+    // c'est la migration 049 qui la convertit.
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id BIGINT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source TEXT",
@@ -151,7 +200,13 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT",
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT",
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT",
-    "ALTER TABLE playlists ADD COLUMN IF NOT EXISTS profile_id TEXT NOT NULL DEFAULT '1'",
+    // BIGINT, pas TEXT : `PlaylistRepo::list()` et `count()` lient le profil en
+    // `i64` (`WHERE p.profile_id = $1`). En TEXT, PostgreSQL rend `operator
+    // does not exist: text = bigint` et la liste des playlists est vide sur
+    // toute installation PostgreSQL native (#2995). Sur une base existante ou
+    // elle est deja TEXT, cet ADD est un no-op et c'est la migration 049 qui la
+    // convertit.
+    "ALTER TABLE playlists ADD COLUMN IF NOT EXISTS profile_id BIGINT NOT NULL DEFAULT 1",
     // #1706: heals a queue_items that predates the numbering columns —
     // the CREATE above only fires on a database that has no queue_items
     // at all. BIGINT (not TEXT): the values are bound as i64 and read

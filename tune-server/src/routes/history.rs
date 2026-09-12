@@ -3,6 +3,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::track_repo::TrackRepo;
@@ -148,7 +149,7 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
     let rows = state
         .backend
         .query_many(&sql, &[&limit as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .iter()
         .map(|cols| {

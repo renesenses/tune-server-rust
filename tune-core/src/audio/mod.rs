@@ -4,12 +4,18 @@ pub mod alac_encoder;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
+pub mod autoeq;
 pub mod channels;
 pub mod convolver;
 pub mod crossfeed;
 pub mod dash_growth;
 pub mod decode;
+/// Balise d'avancement du décodage (#3140) — le débit réel de l'hôte, mesuré
+/// sur le décodage en cours, sans le coûter.
+pub mod decode_progress;
 pub mod dff;
+#[cfg(test)]
+mod dop_porteur_bout_en_bout;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
@@ -17,23 +23,34 @@ pub mod dsf;
 pub mod embedding;
 /// READ side of audio embeddings (storage + cosine) — always compiled, no ort.
 pub mod embedding_store;
+pub mod empreinte;
 pub mod encoder;
 pub mod eq;
 pub mod eq_presets;
 pub mod faststart;
+/// Mémoire du volume d'avant l'armement du mode bit-perfect (#2395).
+pub mod fixed_volume;
 pub mod formats;
 pub mod http_range;
 pub mod iso_sacd;
 pub mod levels;
 pub mod m4a;
 pub mod mixer;
+/// Le repli mono dit quand il n'agit pas (#3254) — la disponibilité par zone du
+/// réglage `zone_{id}_mono_downmix` (#2362).
+pub mod mono_downmix;
 pub mod opus_ogg;
+/// Qui tient le PCM ALSA que nous n'arrivons pas à ouvrir (#3575) — lecture
+/// de /proc, aucun effet sur la chaîne audio.
+pub mod pcm_teneur;
 pub mod pipeline;
 pub mod replaygain;
 pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
+/// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
+pub mod soft_mute;
 pub mod staged_growth;
 pub mod support;
 pub mod tap;

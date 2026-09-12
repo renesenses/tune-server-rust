@@ -1,0 +1,48 @@
+#!/bin/sh
+# Post-suppression.
+set -e
+
+TUNE_HOME=/opt/tune
+TUNE_DATA=/var/lib/tune
+
+case "$1" in
+remove)
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    ;;
+
+purge)
+    # dpkg ne connaît que les fichiers qu'il a posés. La mise à jour intégrée
+    # en crée d'autres (tune-server.old, web/ réécrit) : sans ce ménage,
+    # /opt/tune survivrait à un purge avec un binaire orphelin dedans.
+    rm -rf "$TUNE_HOME"
+
+    # /var/lib/tune est DÉLIBÉRÉMENT conservé, contrairement à ce que la
+    # charte Debian suggère : il contient la base de la bibliothèque, les
+    # pochettes et les fichiers importés — parfois des années de travail
+    # d'indexation. Un `apt purge` mal visé ne doit pas les effacer.
+    # (Même choix que plexmediaserver.) Suppression manuelle :
+    #     sudo rm -rf /var/lib/tune && sudo deluser tune
+    if [ -d "$TUNE_DATA" ]; then
+        echo "Note : vos données Tune sont conservées dans $TUNE_DATA."
+        echo "      Pour les effacer : sudo rm -rf $TUNE_DATA && sudo deluser tune"
+    fi
+
+    # /etc/default/tune-server est un conffile : dpkg le supprime lui-même
+    # au purge, on n'y touche pas.
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    ;;
+
+upgrade | failed-upgrade | abort-install | abort-upgrade | disappear) ;;
+
+*)
+    echo "postrm appelé avec un argument inconnu : $1" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

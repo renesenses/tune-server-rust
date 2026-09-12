@@ -151,12 +151,8 @@ impl RelayClient {
                     self.handle_message(&text).await;
                 }
                 Some(Ok(tungstenite::Message::Ping(data))) => {
-                    let tx = self.ws_tx.lock().await;
-                    if let Some(tx) = tx.as_ref() {
-                        let pong = serde_json::json!({"type": "relay.pong"}).to_string();
-                        let _ = tx.send(pong).await;
-                    }
-                    drop(tx);
+                    let pong = serde_json::json!({"type": "relay.pong"}).to_string();
+                    emettre_vers_le_relais(&self.ws_tx, pong).await;
                     let _ = data; // ping data handled by tungstenite
                 }
                 Some(Ok(tungstenite::Message::Close(_))) | None | Some(Err(_)) => break,
@@ -181,11 +177,8 @@ impl RelayClient {
 
         match msg_type {
             "relay.ping" => {
-                let tx = self.ws_tx.lock().await;
-                if let Some(tx) = tx.as_ref() {
-                    let pong = serde_json::json!({"type": "relay.pong"}).to_string();
-                    let _ = tx.send(pong).await;
-                }
+                let pong = serde_json::json!({"type": "relay.pong"}).to_string();
+                emettre_vers_le_relais(&self.ws_tx, pong).await;
             }
             "relay.request" => {
                 let id = v
@@ -261,10 +254,7 @@ impl RelayClient {
                         "body": resp_body,
                     });
 
-                    let tx = ws_tx.lock().await;
-                    if let Some(tx) = tx.as_ref() {
-                        let _ = tx.send(resp.to_string()).await;
-                    }
+                    emettre_vers_le_relais(&ws_tx, resp.to_string()).await;
                 });
             }
             "relay.stream_request" => {
@@ -312,38 +302,34 @@ impl RelayClient {
                                 "content_length": content_length,
                             });
 
-                            {
-                                let tx = ws_tx.lock().await;
-                                if let Some(tx) = tx.as_ref() {
-                                    let _ = tx.send(start_msg.to_string()).await;
-                                }
-                            }
+                            emettre_vers_le_relais(&ws_tx, start_msg.to_string()).await;
 
                             use futures_util::StreamExt;
                             let mut stream = resp.bytes_stream();
                             while let Some(chunk) = stream.next().await {
                                 match chunk {
                                     Ok(bytes) => {
-                                        let tx = ws_tx.lock().await;
-                                        if let Some(tx) = tx.as_ref() {
-                                            // Trame TEXTE `BINARY:<id>:<base64>`.
-                                            // Le canal vers le relais ne porte
-                                            // que du texte
-                                            // (`mpsc::Sender<String>`), d'ou
-                                            // l'encodage. Une trame binaire
-                                            // prefixee de l'identifiant etait
-                                            // assemblee ici puis jetee sans
-                                            // etre envoyee : elle laissait
-                                            // croire a un second format de fil
-                                            // qui n'a jamais existe.
-                                            let _ = tx
-                                                .send(format!(
-                                                    "BINARY:{}:{}",
-                                                    id,
-                                                    base64_encode(&bytes)
-                                                ))
-                                                .await;
-                                        }
+                                        // Trame TEXTE `BINARY:<id>:<base64>`.
+                                        // Le canal vers le relais ne porte que
+                                        // du texte (`mpsc::Sender<String>`),
+                                        // d'ou l'encodage. Une trame binaire
+                                        // prefixee de l'identifiant etait
+                                        // assemblee ici puis jetee sans etre
+                                        // envoyee : elle laissait croire a un
+                                        // second format de fil qui n'a jamais
+                                        // existe.
+                                        //
+                                        // C'est ICI que la liaison lente se
+                                        // fait sentir : ce `send` attend que le
+                                        // relais ait de la place. Il attend
+                                        // sans le verrou, sinon le `relay.pong`
+                                        // ne partirait plus et la session
+                                        // entiere serait coupee.
+                                        emettre_vers_le_relais(
+                                            &ws_tx,
+                                            format!("BINARY:{}:{}", id, base64_encode(&bytes)),
+                                        )
+                                        .await;
                                     }
                                     Err(e) => {
                                         warn!(id = %id, error = %e, "stream chunk error");
@@ -353,10 +339,7 @@ impl RelayClient {
                             }
 
                             let end_msg = serde_json::json!({"type": "relay.stream_end", "id": id});
-                            let tx = ws_tx.lock().await;
-                            if let Some(tx) = tx.as_ref() {
-                                let _ = tx.send(end_msg.to_string()).await;
-                            }
+                            emettre_vers_le_relais(&ws_tx, end_msg.to_string()).await;
                         }
                         Err(e) => {
                             warn!(id = %id, error = %e, "relay stream request failed");
@@ -366,16 +349,146 @@ impl RelayClient {
                                 "status": 502,
                                 "headers": {},
                             });
-                            let tx = ws_tx.lock().await;
-                            if let Some(tx) = tx.as_ref() {
-                                let _ = tx.send(resp.to_string()).await;
-                            }
+                            emettre_vers_le_relais(&ws_tx, resp.to_string()).await;
                         }
                     }
                 });
             }
             _ => {}
         }
+    }
+}
+
+/// Emet une trame vers le relais SANS retenir le verrou du canal pendant
+/// l'attente.
+///
+/// `ws_tx` est partage par tous les emetteurs du client : les morceaux audio
+/// de chaque flux en cours, les reponses d'API, et le `relay.pong` du
+/// battement de coeur. Le canal est borne (256) et c'est voulu : quand le
+/// navigateur distant lit moins vite que le disque ne debite — une
+/// bibliotheque audiophile en FLAC 24/96 sur une liaison mobile, exactement le
+/// cas de l'ecoute a distance — `send` attend. C'est la contre-pression, elle
+/// evite de charger un album entier en memoire.
+///
+/// Attendre **le verrou en main** transforme cette contre-pression en panne
+/// generale. La tache du flux sature garde le verrou pendant toute l'attente ;
+/// le `relay.pong` ne peut plus etre emis ; le relais ne voit plus de
+/// battement et coupe la connexion au bout de 90 s (`heartbeat_timeout`,
+/// `tune-bridge/src/ws_server.rs`). Toute l'ecoute distante tombe — les autres
+/// flux, l'API, la session entiere — parce qu'UN auditeur a une liaison lente.
+///
+/// Le `Sender` est donc clone hors du verrou, et l'attente se fait sans lui.
+/// C'est la meme regle que `transmettre_morceau` applique deja de l'autre cote
+/// du fil, cote relais.
+///
+/// L'ordre d'un flux donne est preserve : chaque flux est pompe par une seule
+/// tache, qui attend un `send` avant d'entamer le suivant.
+///
+/// Rend `false` quand le canal est ferme (relais deconnecte).
+pub(crate) async fn emettre_vers_le_relais(
+    ws_tx: &Arc<tokio::sync::Mutex<Option<mpsc::Sender<String>>>>,
+    trame: String,
+) -> bool {
+    // Le clone sort du verrou, le garde meurt ici : rien n'est tenu pendant le
+    // `send` qui suit.
+    let canal = { ws_tx.lock().await.clone() };
+    match canal {
+        Some(tx) => tx.send(trame).await.is_ok(),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod emission_vers_le_relais_tests {
+    use super::emettre_vers_le_relais;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+
+    fn canal(
+        capacite: usize,
+    ) -> (
+        Arc<Mutex<Option<mpsc::Sender<String>>>>,
+        mpsc::Receiver<String>,
+    ) {
+        let (tx, rx) = mpsc::channel::<String>(capacite);
+        (Arc::new(Mutex::new(Some(tx))), rx)
+    }
+
+    /// L'EPREUVE. Le canal est plein : l'emission suivante doit attendre — la
+    /// contre-pression est voulue. Ce qui ne doit PAS arriver, c'est qu'elle
+    /// attende en gardant le verrou : `ws_tx` est aussi le chemin du
+    /// `relay.pong`, et un pong qui ne part plus fait couper la session
+    /// entiere par le relais au bout de 90 s.
+    ///
+    /// Un auditeur sur liaison lente ne doit couter que son propre flux.
+    #[tokio::test]
+    async fn un_envoi_bloque_ne_retient_pas_le_verrou_du_canal() {
+        let (ws_tx, _rx) = canal(1);
+
+        // Saturer le canal : l'unique place est prise et personne ne lit.
+        assert!(emettre_vers_le_relais(&ws_tx, "premier".to_string()).await);
+
+        // Le morceau audio suivant ne peut plus passer : il va attendre.
+        let mut bloque = Box::pin(emettre_vers_le_relais(
+            &ws_tx,
+            "BINARY:req-1:ZkxhQw==".to_string(),
+        ));
+        assert!(
+            futures_util::poll!(&mut bloque).is_pending(),
+            "le canal est plein : l'emission devait attendre",
+        );
+
+        // Pendant cette attente, le battement de coeur doit pouvoir emettre.
+        assert!(
+            ws_tx.try_lock().is_ok(),
+            "le verrou est retenu pendant l'attente : le relay.pong ne peut \
+             plus partir, le relais coupera la session au bout de 90 s",
+        );
+    }
+
+    /// Le temoin positif de l'epreuve ci-dessus : tant qu'il reste de la
+    /// place, l'emission aboutit sans attendre, et la trame arrive intacte.
+    #[tokio::test]
+    async fn la_trame_arrive_intacte_au_relais() {
+        let (ws_tx, mut rx) = canal(4);
+        assert!(emettre_vers_le_relais(&ws_tx, "BINARY:req-1:ZkxhQw==".to_string()).await);
+        assert_eq!(rx.recv().await.as_deref(), Some("BINARY:req-1:ZkxhQw=="));
+    }
+
+    /// Deux flux, une seule place : le second attend, mais le verrou reste
+    /// libre pour tous les autres emetteurs du client.
+    #[tokio::test]
+    async fn un_flux_sature_ne_bloque_pas_le_reste_du_client() {
+        let (ws_tx, mut rx) = canal(1);
+        assert!(emettre_vers_le_relais(&ws_tx, "BINARY:lent:AAAA".to_string()).await);
+
+        let mut lent = Box::pin(emettre_vers_le_relais(
+            &ws_tx,
+            "BINARY:lent:BBBB".to_string(),
+        ));
+        assert!(futures_util::poll!(&mut lent).is_pending());
+
+        // Le relais lit une trame : la place liberee doit profiter au flux en
+        // attente, sans qu'aucun verrou n'ait ete retenu entre-temps.
+        assert_eq!(rx.recv().await.as_deref(), Some("BINARY:lent:AAAA"));
+        assert!(lent.await);
+        assert_eq!(rx.recv().await.as_deref(), Some("BINARY:lent:BBBB"));
+    }
+
+    /// Relais deconnecte : `ws_tx` ne porte plus de canal. L'emission ne
+    /// panique pas, elle dit non.
+    #[tokio::test]
+    async fn sans_canal_ouvert_lemission_echoue_sans_paniquer() {
+        let ws_tx: Arc<Mutex<Option<mpsc::Sender<String>>>> = Arc::new(Mutex::new(None));
+        assert!(!emettre_vers_le_relais(&ws_tx, "relay.pong".to_string()).await);
+    }
+
+    /// Canal ferme cote relais : l'echec est signale, pas avale en silence.
+    #[tokio::test]
+    async fn un_canal_ferme_est_signale_a_lappelant() {
+        let (ws_tx, rx) = canal(1);
+        drop(rx);
+        assert!(!emettre_vers_le_relais(&ws_tx, "relay.pong".to_string()).await);
     }
 }
 

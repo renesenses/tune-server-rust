@@ -59,28 +59,63 @@ fn tous_les_chemins_attendent_leur_reponse() {
 /// `outputs::oaat::integration_test::juger_reponse_decide_les_huit_issues`.
 /// Ici on vérifie seulement que le helper délègue toujours à cette fonction au
 /// lieu de rejuger dans son coin.
+///
+/// ## Depuis #2758, l'attente vit un cran plus bas
+///
+/// `attendre_accord_format` prend un `ConnectedEndpoint`, qui ne se construit
+/// que par un `connect()` TCP suivi d'un handshake : rien de tout cela ne se
+/// pilote depuis un test. La boucle a donc été déplacée dans
+/// `attendre_accord_format_sur`, qui prend le CANAL de réponses — un `mpsc`
+/// ordinaire qu'un test alimente à la main. C'est ce déplacement qui rend le
+/// défaut du Zicmu éprouvable sans DAC.
+///
+/// Le garde suit la mécanique là où elle vit, et ajoute une exigence : le
+/// helper qui reste doit **déléguer**, pas rejuger. S'il se remettait à
+/// décider, sa décision échapperait de nouveau aux tests de comportement — ce
+/// qui est exactement le piège de #2297.
 #[test]
 fn le_helper_delegue_sa_decision_a_la_fonction_pure() {
     let src = source();
-    let debut = src
-        .find("async fn attendre_accord_format(")
-        .expect("le helper doit exister");
-    let fin = src[debut..]
-        .find("\n}\n")
-        .map(|i| debut + i)
-        .unwrap_or(src.len());
-    let corps = &src[debut..fin];
 
+    let corps_de = |signature: &str| -> String {
+        let debut = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` doit exister dans {SRC}"));
+        let fin = src[debut..]
+            .find("\n}\n")
+            .map(|i| debut + i)
+            .unwrap_or(src.len());
+        src[debut..fin].to_string()
+    };
+
+    // 1. L'enveloppe ne fait que passer le canal : aucun jugement chez elle.
+    let enveloppe = corps_de("async fn attendre_accord_format(");
+    assert_eq!(
+        enveloppe.matches("attendre_accord_format_sur(").count(),
+        1,
+        "`attendre_accord_format` doit déléguer à `attendre_accord_format_sur` : \
+         c'est ce qui garantit que les six points d'appel de production passent \
+         par la mécanique réellement testée, et non par une copie (#2758)"
+    );
+    assert_eq!(
+        enveloppe.matches("juger_reponse(").count(),
+        0,
+        "l'enveloppe ne doit rien juger elle-même : tout ce qu'elle déciderait \
+         serait hors de portée des tests (#2297)"
+    );
+
+    // 2. La mécanique délègue les trois issues à la fonction pure.
+    let corps = corps_de("pub(crate) async fn attendre_accord_format_sur(");
     assert_eq!(
         corps.matches("juger_reponse(").count(),
         3,
-        "le helper doit déléguer les TROIS issues de l'attente — réponse reçue, \
-         canal fermé, silence — à `juger_reponse` ; toute décision qu'il prend \
-         lui-même échappe aux tests de comportement (#2297)"
+        "la boucle doit déléguer les TROIS issues de l'attente — réponse reçue, \
+         canal fermé, silence — à `juger_reponse` ; toute décision qu'elle prend \
+         elle-même échappe aux tests de comportement (#2297)"
     );
     assert!(
         !corps.contains("FormatReject"),
-        "le helper ne doit plus statuer sur les messages : c'est le rôle de \
+        "la boucle ne doit pas statuer sur les messages : c'est le rôle de \
          `juger_reponse`, qui est testée pour ce qu'elle décide (#2297)"
     );
 }

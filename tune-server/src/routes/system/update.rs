@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -6,7 +8,7 @@ use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
 use tune_core::db::settings_repo::SettingsRepo;
-use tune_core::updater::{ReleaseAsset, ReleaseInfo, UpdateChecker};
+use tune_core::updater::{ReleaseAsset, ReleaseInfo, UpdateChannel, UpdateChecker};
 
 use crate::state::AppState;
 
@@ -22,6 +24,11 @@ const SCAN_GUARD_STALE_SECS: u64 = 12 * 3600;
 /// update restart that would otherwise kill a long scan mid-import (the batches
 /// never persist, so the library stays empty and the scan looks "stuck" — the
 /// user re-triggers it and the next auto-update kills it again).
+///
+/// L'horodatage est EXIGÉ. Sans lui la fenêtre d'ancienneté n'a rien à
+/// mesurer, et le report que ce garde-fou pose n'a plus aucune sortie — il
+/// n'existe même pas de `force` pour le contourner ici, contrairement au
+/// garde-fou de la lecture (#2976).
 fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> bool {
     let settings = SettingsRepo::with_backend(backend.clone());
     let scanning = settings.get("scan_status").ok().flatten().as_deref() == Some("scanning");
@@ -39,9 +46,22 @@ fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBacke
         .unwrap_or(0);
     match started {
         Some(t) => now.saturating_sub(t) < SCAN_GUARD_STALE_SECS,
-        // No/invalid start time recorded: treat as fresh so we err on the side
-        // of protecting the scan rather than killing it.
-        None => true,
+        // Aucun horodatage lisible : ce n'est PAS un scan que ce binaire a
+        // annoncé. Les deux seuls chemins de production qui posent
+        // `scan_status = "scanning"` — le manuel/planifié et celui du
+        // démarrage — passent désormais par `scan::marquer_scan_en_cours`,
+        // qui écrit la date AVANT le statut. Un scan vivant est donc toujours
+        // daté ; « scanning » sans date ne peut plus venir que d'une base
+        // laissée par une version antérieure, c'est-à-dire du cas même que la
+        // fenêtre d'ancienneté existe pour dénouer : un scan mort.
+        //
+        // Le traiter comme frais, ce qu'on faisait, rendait le report
+        // ÉTERNEL : `POST /system/update/install` rendait 409
+        // `scan_in_progress` à chaque tentative, en promettant une reprise
+        // « une fois le scan terminé » que rien ne pouvait déclencher. Une
+        // mise à jour reportée se rattrape à la tentative suivante ; un scan
+        // coupé se relance. L'asymétrie tranche dans ce sens (#2976).
+        None => false,
     }
 }
 
@@ -74,11 +94,203 @@ pub(super) struct UpdateInstallParams {
 /// A caller that does NOT say `force` has not been told what it is about to
 /// interrupt, and that is the one we protect against.
 async fn playback_in_progress(playback: &tune_core::playback::PlaybackManager) -> bool {
-    playback
-        .all_states()
-        .await
-        .iter()
-        .any(|z| z.state == tune_core::playback::PlayState::Playing)
+    !playing_zone_ids(playback).await.is_empty()
+}
+
+/// Depuis combien de temps la position OBSERVÉE d'une zone doit-elle être
+/// immobile avant que le chemin de mise à jour cesse de la croire ?
+///
+/// **C'est la sortie qui manquait à #3581.** Une zone `Playing` en mémoire
+/// n'était contredite par rien : la sortie disparue du registre du sondeur, la
+/// boucle fait `continue` (`poller/tick.rs`, `outputs.get(&device_id) → None`)
+/// et plus personne n'observe la zone ; le seul détecteur de zone figée est
+/// DLNA-only (#3155) ; `startup.rs` ne remet à `stopped` que la COLONNE, pas la
+/// mémoire. Tades ne pouvait donc plus mettre à jour, et rien — ni l'écran, ni
+/// le corps du 409 — ne lui offrait de recours.
+///
+/// **Justification de la constante.** Elle doit être plus grande que le plus
+/// long silence LÉGITIME d'une lecture réelle, et franchement plus petite que
+/// le plafond de deux heures qu'elle remplace :
+/// - la position observée est réécrite toutes les **1 s**
+///   (`POLL_INTERVAL_MS = 1000`, `tune-core/src/poller.rs`) ;
+/// - la plus longue tolérance que le sondeur s'accorde AVANT de déclarer une
+///   zone en panne est `TRACK_LOAD_GRACE_SECS = 45` puis
+///   `STOPPED_FAILURE_THRESHOLD = 30` ticks, soit **75 s** ;
+/// - le plus long gel d'appareil mesuré sur ce dépôt est le réveil d'un ampli
+///   DLNA sorti de veille réseau, `BUDGET_REVEIL_STANDBY` ≈ **32 s**
+///   (`outputs/dlna.rs`) ;
+/// - la branche compressée de `outputs/local.rs` télécharge et décode la piste
+///   ENTIÈRE avant le premier échantillon (#3618) : quelques dizaines de
+///   secondes sur un mono-cœur — et pendant ce temps aucune avance n'a jamais
+///   été observée, donc le champ vaut `None` et la zone est tenue pour
+///   vivante de toute façon.
+///
+/// **600 s = 8 × le verdict de panne du sondeur, ≈ 19 × le plus long gel
+/// mesuré, et 12 × moins que `RESTART_DEFERRAL_MAX`.** Aucune lecture que le
+/// reste du serveur considère encore vivante ne peut franchir ce seuil ; une
+/// zone qui le franchit a cessé d'être observée depuis dix minutes.
+///
+/// Le pire cas d'un faux positif reste borné : la relance coupe un son qui,
+/// par construction, n'avance plus depuis dix minutes. Le pire cas d'un faux
+/// négatif était de deux heures d'attente muette. L'asymétrie tranche.
+const SILENCE_DE_POSITION_AVANT_ZONE_FIGEE: Duration = Duration::from_secs(600);
+
+/// Les zones qui jouent, par identifiant. Sert uniquement à nommer dans le
+/// journal ce qui retient la relance : le 30 août, `update_restarting` est
+/// tombé 24 s après le début d'un morceau et rien, dans le journal, ne disait
+/// ce que le chemin de mise à jour avait regardé (#2954).
+/// Une zone FIGÉE n'en fait pas partie : elle annonce `Playing` mais sa
+/// position observée n'a plus bougé depuis
+/// [`SILENCE_DE_POSITION_AVANT_ZONE_FIGEE`]. C'est le fantôme de #3581, et
+/// c'est ici qu'il cesse de retenir la mise à jour — au garde-fou d'entrée
+/// comme au report de la relance, puisque les deux passent par cette
+/// fonction. Le journal la NOMME, avec son âge : sans cela le correctif
+/// serait invisible dans un `diagnostic.md`.
+async fn playing_zone_ids(playback: &tune_core::playback::PlaybackManager) -> Vec<i64> {
+    zones_en_lecture_vivante(playback, SILENCE_DE_POSITION_AVANT_ZONE_FIGEE).await
+}
+
+/// Le corps de [`playing_zone_ids`], seuil paramétré.
+///
+/// Le seuil est un argument pour que les épreuves puissent le tenir des deux
+/// côtés — un seuil nul doit écarter une zone déjà observée, un seuil de
+/// production doit garder celle qui vient de l'être — sans faire dormir dix
+/// minutes un test qu'on finirait par désarmer.
+async fn zones_en_lecture_vivante(
+    playback: &tune_core::playback::PlaybackManager,
+    silence_max: Duration,
+) -> Vec<i64> {
+    let mut vivantes = Vec::new();
+    for z in playback.all_states().await {
+        if z.state != tune_core::playback::PlayState::Playing {
+            continue;
+        }
+        if tune_core::playback::zone_figee(&z, silence_max) {
+            warn!(
+                zone_id = z.zone_id,
+                immobile_secs = z
+                    .derniere_avance_de_position
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or_default(),
+                seuil_secs = silence_max.as_secs(),
+                "update_zone_figee_ignoree"
+            );
+            continue;
+        }
+        vivantes.push(z.zone_id);
+    }
+    vivantes
+}
+
+/// Les zones qui retiennent la relance, NOMMÉES, et sous la forme que
+/// l'interface peut afficher telle quelle.
+///
+/// Le journal les nomme depuis #2954 (`update_deferred_playback_in_progress
+/// zones=[…]`). La réponse rendue à l'appelant, elle, ne portait qu'un motif
+/// `playback_in_progress` et une phrase générique — l'utilisateur voyait un
+/// refus sans sujet.
+///
+/// Tades (#3581) ne pouvait donc ni voir QUELLE zone prétendait jouer — sa
+/// Serenade était à l'arrêt — ni savoir qu'une sortie existait : `?force=true`
+/// est dans la route depuis #2976, et rien, dans la réponse, ne l'annonçait.
+/// #3155 a établi qu'aucun détecteur ne rattrape une zone locale figée ; tant
+/// que c'est vrai, le seul recours possible est de nommer la zone et de dire
+/// qu'on peut passer outre. La borne haute du report reste, elle, à deux
+/// heures.
+///
+/// Un nom introuvable en base ne fait pas échouer le refus : l'identifiant est
+/// rendu seul, ce qui vaut toujours mieux que rien.
+fn zones_qui_retiennent(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    ids: &[i64],
+) -> Vec<Value> {
+    let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    ids.iter()
+        .map(|id| {
+            let nom = repo.get(*id).ok().flatten().map(|z| z.name);
+            json!({ "id": id, "name": nom })
+        })
+        .collect()
+}
+
+/// Plafond du report de la relance. Passé ce délai on relance MALGRÉ une zone
+/// annoncée en lecture.
+///
+/// Il faut une sortie, sans quoi une zone oubliée bloque les mises à jour pour
+/// toujours — et #3155 a établi qu'aucun détecteur ne rattrape une zone locale
+/// figée : une zone peut rester `Playing` en mémoire indéfiniment sans qu'un
+/// seul échantillon sorte. Deux heures couvrent un album ou une œuvre longue
+/// d'un bout à l'autre ; au-delà, une zone qui « joue » encore est plus
+/// probablement une zone figée sans auditeur qu'une session réelle, et la mise
+/// à jour reprend la main.
+const RESTART_DEFERRAL_MAX: Duration = Duration::from_secs(2 * 3600);
+
+/// Cadence de relecture de l'état de lecture pendant le report. Une lecture de
+/// l'état en mémoire (un verrou, une `HashMap`) toutes les 5 s : le coût est
+/// nul pour la lecture en cours, et la relance suit la fin du morceau à 5 s
+/// près.
+const RESTART_DEFERRAL_POLL: Duration = Duration::from_secs(5);
+
+/// Comment le report de la relance s'est terminé.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartRelease {
+    /// Rien ne jouait : la relance part sans attendre.
+    Idle,
+    /// Une lecture était en cours et s'est arrêtée d'elle-même.
+    PlaybackEnded(Duration),
+    /// Le plafond a expiré, la zone annonce toujours une lecture, on relance.
+    WindowExpired(Duration),
+}
+
+/// Retient la relance tant qu'une zone joue — bornée par
+/// [`RESTART_DEFERRAL_MAX`].
+///
+/// **C'est ici que se joue le défaut de #2954, pas au garde-fou d'entrée.** Le
+/// garde-fou de `update_install` consulte l'état de lecture UNE fois, à la
+/// réception de la requête, avant un téléchargement de 38 Mo — et un appelant
+/// qui passe `?force=true` le saute entièrement. Or ce que la requête autorise,
+/// c'est de télécharger et d'installer : deux actes inaudibles. Ce qui coupe le
+/// son, c'est l'échange d'image (`execv`), plusieurs secondes ou plusieurs
+/// minutes plus tard, et il ne consultait rien du tout. Le 30 août la lecture a
+/// démarré à 15:42:00 et `update_reexec` est tombé à 15:42:24 sans qu'une seule
+/// ligne dise ce qui avait été regardé.
+///
+/// Le report est donc posé au dernier instant utile, et il ne dépend PAS de
+/// `force` : l'utilisateur averti que « la musique va s'arrêter » a été averti
+/// d'un état de lecture qui datait de sa requête, pas de celui de la relance.
+/// Le binaire est déjà remplacé sur le disque quand on arrive ici — la mise à
+/// jour est acquise, même si le processus meurt pendant l'attente, la prochaine
+/// ouverture démarre la nouvelle version. Seul l'échange d'image attend.
+///
+/// Une zone en PAUSE ne retient rien : `playback_in_progress` ne compte que
+/// `PlayState::Playing`, exactement comme le frein de repos du poller depuis
+/// #3120. Les deux chemins disent la même chose de « actif ».
+async fn defer_restart_until_quiet(
+    playback: &tune_core::playback::PlaybackManager,
+    max: Duration,
+    poll: Duration,
+) -> RestartRelease {
+    if !playback_in_progress(playback).await {
+        return RestartRelease::Idle;
+    }
+    let zones = playing_zone_ids(playback).await;
+    warn!(
+        zones = ?zones,
+        max_secs = max.as_secs(),
+        "update_restart_deferred_playback"
+    );
+    let started = tokio::time::Instant::now();
+    loop {
+        let waited = started.elapsed();
+        if waited >= max {
+            return RestartRelease::WindowExpired(waited);
+        }
+        // Le dernier pas est rogné pour atterrir exactement sur le plafond.
+        tokio::time::sleep(poll.min(max - waited)).await;
+        if !playback_in_progress(playback).await {
+            return RestartRelease::PlaybackEnded(started.elapsed());
+        }
+    }
 }
 
 /// Can we actually create a file in `dir`? Permission *bits* are not the
@@ -192,11 +404,354 @@ fn current_homebrew_installation() -> Option<HomebrewInstallation> {
         .and_then(homebrew_installation)
 }
 
-fn homebrew_update_refusal(installation: &HomebrewInstallation, current: &str) -> Value {
+/// Préfixe Homebrew qui POSSÈDE cette installation, déduit du chemin du Cellar
+/// et non de `PATH`.
+///
+/// C'est le point qui rend la mise à jour en place possible. Un serveur lancé
+/// par `brew services` reçoit le `PATH` du plist — `std_service_path_env`,
+/// c'est-à-dire `<prefix>/bin:<prefix>/sbin:/usr/bin:/bin:/usr/sbin:/sbin`
+/// (Homebrew, `Library/Homebrew/service.rb`) — mais un serveur lancé à la main
+/// depuis un terminal, ou par un automate, n'a aucune garantie de ce genre.
+/// Chercher `brew` dans `PATH` était donc le piège classique : il marche sur la
+/// machine du développeur et échoue chez le testeur.
+///
+/// Le Cellar, lui, dit tout : `/opt/homebrew/Cellar/tune-server/0.9.143/bin/tune-server`
+/// nomme son propre préfixe, `/opt/homebrew`. Apple Silicon, Intel
+/// (`/usr/local`) et Linuxbrew (`/home/linuxbrew/.linuxbrew`) sont couverts
+/// sans qu'aucun chemin ne soit écrit en dur.
+fn homebrew_prefix(executable: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut prefix = std::path::PathBuf::new();
+    for component in executable.components() {
+        if component.as_os_str() == std::ffi::OsStr::new("Cellar") {
+            return (!prefix.as_os_str().is_empty()).then_some(prefix);
+        }
+        prefix.push(component);
+    }
+    None
+}
+
+/// Tune tourne-t-il en root ? `brew` s'y refuse, et root passe pourtant tous
+/// les tests d'écriture — c'est le seul empêchement que le disque ne dit pas.
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // SAFETY: `geteuid` ne fait que lire un identifiant du processus.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
+}
+
+/// Un fichier est-il exécutable par quelqu'un ?
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
+/// Ce qui empêche Tune de conduire lui-même `brew upgrade`.
+///
+/// Chaque variante nomme une chose vérifiable sur la machine, pas une
+/// supposition : le refus rendu à l'écran doit dire QUOI manque.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HomebrewUpgradeBlock {
+    /// Le chemin du Cellar ne laisse aucun préfixe où accrocher `bin/brew`.
+    PrefixUnknown,
+    /// Aucun `brew` exécutable sous le préfixe qui possède cette installation.
+    BrewMissing(std::path::PathBuf),
+    /// Le Cellar n'appartient pas au compte qui fait tourner Tune : `brew
+    /// upgrade` échouerait à mi-chemin, après le téléchargement.
+    NotWritable {
+        path: std::path::PathBuf,
+        error: String,
+    },
+    /// Nulle part où poser le fichier de progression. Il DOIT survivre au
+    /// redémarrage — c'est le seul canal qui traverse l'échange de binaire —
+    /// donc sans lui l'écran ne peut plus rien suivre et on ne lance rien.
+    NoStateDir {
+        path: std::path::PathBuf,
+        error: String,
+    },
+    /// Tune tourne en root. `brew` REFUSE de s'exécuter en root — ce n'est pas
+    /// une préférence, c'est un abandon franc de sa part. Une installation
+    /// posée en LaunchDaemon système est donc hors d'atteinte, et il faut le
+    /// dire plutôt que de lancer un script qui échouera à la première ligne.
+    ///
+    /// La seule vérification qui ne peut PAS être remplacée par le test
+    /// d'écriture : root écrit partout, donc `probe_dir_writable` réussit
+    /// justement dans le cas où `brew` va refuser.
+    RunningAsRoot,
+}
+
+impl HomebrewUpgradeBlock {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::PrefixUnknown => "homebrew_prefix_unknown",
+            Self::BrewMissing(_) => "homebrew_brew_missing",
+            Self::NotWritable { .. } => "homebrew_cellar_not_writable",
+            Self::NoStateDir { .. } => "homebrew_state_dir_not_writable",
+            Self::RunningAsRoot => "homebrew_running_as_root",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::PrefixUnknown => {
+                "Homebrew prefix could not be derived from the Cellar path.".into()
+            }
+            Self::BrewMissing(path) => format!("No executable brew at {}.", path.display()),
+            Self::NotWritable { path, error } => format!(
+                "{} is not writable by the account running Tune ({error}).",
+                path.display()
+            ),
+            Self::NoStateDir { path, error } => format!(
+                "Progress file directory {} is not writable ({error}).",
+                path.display()
+            ),
+            Self::RunningAsRoot => "Tune runs as root, and Homebrew refuses to run as root.".into(),
+        }
+    }
+}
+
+/// Tout ce qu'il faut pour conduire la mise à jour, une fois mesuré.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomebrewUpgradePlan {
+    /// `<prefix>/bin/brew`, mesuré exécutable.
+    brew: std::path::PathBuf,
+    /// `<prefix>/opt/tune-server/bin/tune-server-launcher` — le lien stable qui
+    /// pointe TOUJOURS sur le keg courant, donc sur le nouveau après l'échange.
+    launcher: std::path::PathBuf,
+    /// Fichier d'état JSON, hors du Cellar : `brew` remplace le Cellar.
+    state_file: std::path::PathBuf,
+    /// Journal complet de `brew`, à côté.
+    log_file: std::path::PathBuf,
+    /// Le script lui-même.
+    script_file: std::path::PathBuf,
+}
+
+const HOMEBREW_STATE_FILE: &str = "tune-homebrew-upgrade.json";
+const HOMEBREW_LOG_FILE: &str = "tune-homebrew-upgrade.log";
+const HOMEBREW_SCRIPT_FILE: &str = "tune-homebrew-upgrade.sh";
+
+/// Mesure, sur CETTE machine, si Tune peut conduire `brew upgrade` lui-même.
+///
+/// Aucune de ces vérifications n'est un raisonnement : chacune touche le disque.
+fn homebrew_upgrade_plan(
+    installation: &HomebrewInstallation,
+    state_dir: &std::path::Path,
+) -> Result<HomebrewUpgradePlan, HomebrewUpgradeBlock> {
+    if running_as_root() {
+        return Err(HomebrewUpgradeBlock::RunningAsRoot);
+    }
+
+    let prefix =
+        homebrew_prefix(&installation.executable).ok_or(HomebrewUpgradeBlock::PrefixUnknown)?;
+
+    let brew = prefix.join("bin").join("brew");
+    if !is_executable(&brew) {
+        return Err(HomebrewUpgradeBlock::BrewMissing(brew));
+    }
+
+    // Le keg neuf atterrit dans `<prefix>/Cellar/tune-server`. Si ce répertoire
+    // n'accepte pas une écriture du compte qui fait tourner Tune, `brew upgrade`
+    // ira au bout du téléchargement pour échouer ensuite — exactement le défaut
+    // que le garde-fou d'écriture du chemin autonome existe déjà pour éviter.
+    let cellar = prefix.join("Cellar").join("tune-server");
+    if let Err(error) = probe_dir_writable(&cellar) {
+        return Err(HomebrewUpgradeBlock::NotWritable {
+            path: cellar,
+            error,
+        });
+    }
+
+    if let Err(error) = probe_dir_writable(state_dir) {
+        return Err(HomebrewUpgradeBlock::NoStateDir {
+            path: state_dir.to_path_buf(),
+            error,
+        });
+    }
+
+    Ok(HomebrewUpgradePlan {
+        brew,
+        launcher: prefix
+            .join("opt")
+            .join("tune-server")
+            .join("bin")
+            .join("tune-server-launcher"),
+        state_file: state_dir.join(HOMEBREW_STATE_FILE),
+        log_file: state_dir.join(HOMEBREW_LOG_FILE),
+        script_file: state_dir.join(HOMEBREW_SCRIPT_FILE),
+    })
+}
+
+/// Le script qui fait le travail.
+///
+/// **Pourquoi un script détaché et non un appel synchrone.** `brew upgrade`
+/// remplace le binaire EN COURS D'EXÉCUTION et les ressources web du Cellar,
+/// puis il faut redémarrer — et `brew upgrade` ne redémarre AUCUN service
+/// (mesuré : `Library/Homebrew/upgrade.rb` ne mentionne pas les services ; c'est
+/// pourquoi la formule elle-même écrit « Après une mise à jour, redémarrez le
+/// serveur »). Le redémarrage tue donc l'appelant. C'est le même problème que
+/// Windows, et c'est la même réponse : un script hors du processus, comme
+/// `tune-update.bat`.
+///
+/// **Aucune entrée utilisateur n'entre ici.** Les seuls chemins interpolés sont
+/// déduits de `current_exe` et de `db_path` ; le nom de la formule est une
+/// constante. Rien de ce que l'appelant HTTP envoie n'atteint le script.
+///
+/// **La progression traverse le redémarrage** parce qu'elle est sur le disque,
+/// hors du Cellar. Le serveur neuf relit le même fichier et l'écran retrouve
+/// l'opération là où elle en était.
+fn homebrew_upgrade_script(plan: &HomebrewUpgradePlan, server_pid: u32) -> String {
+    let brew = plan.brew.display();
+    let launcher = plan.launcher.display();
+    let state = plan.state_file.display();
+    let log = plan.log_file.display();
+    format!(
+        r#"#!/bin/sh
+# Écrit par Tune. Conduit la mise à jour Homebrew de tune-server puis relance le
+# serveur. Détaché de son parent : le redémarrage tue le serveur, pas ce script.
+set -u
+
+BREW='{brew}'
+LAUNCHER='{launcher}'
+STATE='{state}'
+LOG='{log}'
+SRV_PID={server_pid}
+
+export HOMEBREW_NO_AUTO_UPDATE=1
+export HOMEBREW_NO_ENV_HINTS=1
+export HOMEBREW_NO_COLOR=1
+export HOMEBREW_NO_EMOJI=1
+export NONINTERACTIVE=1
+
+etape() {{
+  printf '{{"phase":"%s","exit_code":%s,"pid":%s,"updated_at":%s}}\n' \
+    "$1" "${{2:-null}}" "$SRV_PID" "$(date +%s)" > "$STATE.tmp" 2>/dev/null \
+    && mv "$STATE.tmp" "$STATE" 2>/dev/null
+}}
+
+etape brew_update
+"$BREW" update >>"$LOG" 2>&1 || {{ etape failed_brew_update $?; exit 1; }}
+
+etape brew_upgrade
+"$BREW" upgrade tune-server >>"$LOG" 2>&1 || {{ etape failed_brew_upgrade $?; exit 1; }}
+
+etape restarting
+# Le service brew n'est redémarré QUE s'il est réellement démarré. Sinon
+# `brew services restart` en démarrerait un second à côté du serveur lancé à la
+# main, et les deux se disputeraient le port.
+if "$BREW" services list 2>/dev/null | grep -q '^tune-server[[:space:]][[:space:]]*started'; then
+  "$BREW" services restart tune-server >>"$LOG" 2>&1 || {{ etape failed_restart $?; exit 1; }}
+  etape done 0
+  exit 0
+fi
+
+# On ne coupe RIEN sans savoir qu'on peut relancer. Sans cette mesure, un
+# lanceur absent laissait Tune eteint — strictement pire que le refus qu'on
+# remplace. La mise a jour est acquise sur le disque ; il ne manque que la
+# relance, et l'ecran le dit avec la commande.
+if [ ! -x "$LAUNCHER" ]; then
+  etape failed_no_launcher 0
+  exit 1
+fi
+
+kill "$SRV_PID" 2>/dev/null
+i=0
+while kill -0 "$SRV_PID" 2>/dev/null && [ "$i" -lt 30 ]; do
+  sleep 1
+  i=$((i+1))
+done
+"$LAUNCHER" >>"$LOG" 2>&1 &
+etape done 0
+exit 0
+"#
+    )
+}
+
+/// Écrit le script et le lance DÉTACHÉ.
+///
+/// `setsid` est ce qui rend l'ensemble possible sur macOS : `brew services
+/// restart` passe par `launchctl`, qui abat le job — donc le serveur et tout ce
+/// qui reste dans sa session. Un script resté dans la session mourrait avec le
+/// serveur qu'il vient de faire redémarrer, à mi-chemin, sans jamais écrire
+/// `done`. C'est l'équivalent du `start /min` détaché du chemin Windows.
+fn spawn_homebrew_upgrade(plan: &HomebrewUpgradePlan, server_pid: u32) -> Result<(), String> {
+    let script = homebrew_upgrade_script(plan, server_pid);
+    std::fs::write(&plan.script_file, script)
+        .map_err(|e| format!("write {}: {e}", plan.script_file.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&plan.script_file, std::fs::Permissions::from_mode(0o700));
+    }
+    // Un journal neuf par tentative : sinon le rapport d'échec du testeur
+    // mélange trois essais et ne dit plus lequel a échoué.
+    let _ = std::fs::remove_file(&plan.log_file);
+
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg(&plan.script_file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid` est async-signal-safe et ne touche à aucun état de
+        // l'allocateur ni à un verrou du processus parent.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("spawn {}: {e}", plan.script_file.display()))
+}
+
+/// Où poser le fichier de progression : à côté de la base, jamais dans le
+/// Cellar que `brew` remplace.
+fn homebrew_state_dir(db_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Ce que le script a écrit, s'il a écrit quelque chose. Relu par
+/// `GET /system/update/status`, y compris par le serveur NEUF.
+fn homebrew_upgrade_state(state_dir: &std::path::Path) -> Option<Value> {
+    let raw = std::fs::read_to_string(state_dir.join(HOMEBREW_STATE_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn homebrew_update_refusal(
+    installation: &HomebrewInstallation,
+    current: &str,
+    blocked: Option<&HomebrewUpgradeBlock>,
+) -> Value {
     json!({
         "status": "managed_installation",
         "reason": "homebrew_managed_installation",
         "manager": "homebrew",
+        // `message` reste en anglais et reste dans la charge utile: c'est le
+        // repli des clients qui ne connaissent pas `reason`. La phrase que
+        // l'utilisateur LIT est rendue par le client, dans SA langue, à partir
+        // de `reason` et de `command` — le serveur n'a pas à connaître la
+        // langue de l'écran, et cette charge-ci est de surcroît recopiée telle
+        // quelle dans `last_update_result`, où une phrase traduite se figerait
+        // dans la langue du jour de l'écriture.
         "message": HOMEBREW_UPDATE_HINT,
         "detail": HOMEBREW_UPDATE_HINT,
         "command": HOMEBREW_UPDATE_COMMAND,
@@ -206,6 +761,14 @@ fn homebrew_update_refusal(installation: &HomebrewInstallation, current: &str) -
             &installation.cellar_version,
             current,
         ),
+        // POURQUOI Tune ne conduit pas la mise à jour lui-même sur cette
+        // machine — un motif de machine, et le détail qui nomme le chemin
+        // cherché. Un refus n'existe QUE dans ce cas : quand le plan tient, la
+        // route lance le travail et rend 202. Il n'y a donc pas de drapeau
+        // « c'est possible » à porter ici, et un champ constamment faux aurait
+        // eu l'air de dire quelque chose.
+        "upgrade_in_place_blocked_reason": blocked.map(HomebrewUpgradeBlock::reason),
+        "upgrade_in_place_detail": blocked.map(HomebrewUpgradeBlock::detail),
     })
 }
 
@@ -391,6 +954,67 @@ const UPDATE_PUBLIC_KEY: &str = "RWRjeNGnrhiQYHaMp7e0Cmr6PCC4tEY7UwenBFrbDBoIPDB
 /// au fil forum a envoyé Jean Valjean vérifier SON réseau. Il n'y était pour
 /// rien. Un message qui ne nomme pas la cause fait chercher au mauvais endroit
 /// — et le seul qui puisse trancher, c'est le code qui a vu la réponse HTTP.
+/// Le dernier maillon du canal (#2266) : le réglage relu dans la base ARME
+/// bien le vérificateur que les deux routes utilisent.
+///
+/// Ce test ne passe pas par le réseau — il n'interroge pas l'API des releases,
+/// il vérifie que `checker_for` porte le canal enregistré. C'est exactement le
+/// maillon qu'un « écrit mais pas branché » casserait sans qu'aucun test de
+/// filtrage ne bronche : `select_release` pourrait être parfait pendant que les
+/// routes construiraient encore un vérificateur en `Auto`.
+#[cfg(test)]
+mod canal_branche_sur_le_verificateur {
+    use super::{checker_for, update_channel};
+    use tune_core::updater::UpdateChannel;
+
+    fn etat() -> crate::state::AppState {
+        crate::state::AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// LE TÉMOIN, côté serveur : base neuve, réglage jamais écrit → `Auto`,
+    /// c'est-à-dire le vérificateur d'avant #2266.
+    #[test]
+    fn sans_reglage_le_verificateur_reste_en_auto() {
+        let state = etat();
+        assert_eq!(update_channel(&state.backend), UpdateChannel::Auto);
+        assert_eq!(checker_for(&state.backend).channel(), UpdateChannel::Auto);
+    }
+
+    #[test]
+    fn le_reglage_enregistre_arme_le_verificateur() {
+        let state = etat();
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        for canal in [
+            UpdateChannel::Stable,
+            UpdateChannel::Beta,
+            UpdateChannel::Auto,
+        ] {
+            settings
+                .set(UpdateChannel::SETTING_KEY, canal.as_str())
+                .unwrap();
+            assert_eq!(update_channel(&state.backend), canal);
+            assert_eq!(
+                checker_for(&state.backend).channel(),
+                canal,
+                "le vérificateur des routes doit porter le canal {}",
+                canal.as_str()
+            );
+        }
+    }
+
+    /// Une valeur illisible ne doit jamais OUVRIR le canal bêta : le repli est
+    /// le comportement historique.
+    #[test]
+    fn valeur_illisible_retombe_sur_auto() {
+        let state = etat();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set(UpdateChannel::SETTING_KEY, "nightly")
+            .unwrap();
+        assert_eq!(update_channel(&state.backend), UpdateChannel::Auto);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpdateBlame {
     /// Rien n'a répondu : réseau, DNS, proxy, coupure. Chez l'utilisateur.
@@ -686,19 +1310,593 @@ kwD8rrpp1dpGuBsy+q0AByW/UZ9CjNSAOJH5bivNcpTQDNkE1aB073ruWxcwOeuJXwpWeh/XVMnkDIoV
     }
 }
 
+/// Le canal de mise à jour effectivement en vigueur, relu dans la base.
+///
+/// **C'est le seul lecteur du réglage**, et les DEUX routes qui interrogent
+/// l'API des releases passent par lui — `update_check` et `update_install`.
+/// Un canal que seule la route de lecture consulterait laisserait
+/// `POST /update/install` installer la préversion que `GET /update/check`
+/// venait de refuser d'annoncer : le réglage serait décoratif.
+///
+/// Une valeur illisible (base écrite par une version postérieure, réglage
+/// bricolé à la main) retombe sur [`UpdateChannel::Auto`] : le comportement
+/// historique est le repli sûr, jamais une ouverture du canal bêta.
+fn update_channel(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> UpdateChannel {
+    SettingsRepo::with_backend(backend.clone())
+        .get(UpdateChannel::SETTING_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| UpdateChannel::parse(&raw))
+        .unwrap_or_default()
+}
+
+/// Le vérificateur de releases ARMÉ du canal enregistré.
+///
+/// Les deux routes qui interrogent l'API des releases passent par ici : c'est
+/// le point unique où le réglage rejoint le cœur, et donc le seul endroit à
+/// éprouver pour savoir que le réglage est BRANCHÉ.
+fn checker_for(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> UpdateChecker {
+    UpdateChecker::with_channel(update_channel(backend))
+}
+
+/// La clé où le vérificateur périodique dépose ce qu'il a TROUVÉ — jamais ce
+/// qu'il a fait, puisqu'il n'installe rien.
+///
+/// Distincte de `last_update_result`, qui porte le résultat de la DERNIÈRE
+/// installation appliquée : confondre les deux ferait passer une simple
+/// disponibilité pour une mise à jour effectuée.
+/// La version qui tournait AVANT celle-ci.
+///
+/// #2266 — DEvir demande de pouvoir revenir a la version precedente « sans
+/// naviguer dans l'historique ou les tags de GitHub ». Le premier obstacle
+/// n'est pas le mecanisme d'echange du binaire : c'est que **le serveur ne
+/// sait pas d'ou il vient**. Aucune des traces existantes ne le dit —
+/// `last_update_result` ne porte que la version COURANTE (et, en cas d'echec,
+/// celle qu'on ATTENDAIT), et le binaire parque en `<exe>.old` par
+/// [`install_unix`] survit bien mais sans etiquette de version.
+///
+/// Cette cle porte un FAIT, pas une promesse : elle ne dit pas qu'un retour
+/// arriere est possible — il ne l'est pas encore, et la migration de base a
+/// rebours reste la question ouverte du ticket. Elle dit d'ou l'on vient, ce
+/// qui est le minimum sans lequel un ecran ne peut proposer NI le binaire
+/// parque, NI la release GitHub correspondante.
+pub(crate) const CLE_VERSION_PRECEDENTE: &str = "previous_version";
+
+/// La version constatee au demarrage precedent. Sert uniquement a detecter le
+/// changement ; c'est [`CLE_VERSION_PRECEDENTE`] que l'ecran lit.
+pub(crate) const CLE_VERSION_VUE: &str = "last_seen_version";
+
+/// Ce que le demarrage doit retenir, au vu de la version constatee la fois
+/// d'avant. `None` = ne rien ecrire.
+///
+/// Fonction pure, pour que la regle soit eprouvable sans base ni disque.
+///
+/// Trois cas, et le troisieme est celui qui compte :
+///
+/// - **Premiere mise en route** (`vue` absente ou vide) : on ne vient de nulle
+///   part, il n'y a rien a dire.
+/// - **La version a change** : c'est le seul moment ou l'on APPREND quelque
+///   chose, et `vue` est justement la version que l'on quitte.
+/// - **Redemarrage sur la meme version** : `None`. Ne rien ecrire est ici le
+///   comportement a TENIR, pas une paresse. Un testeur qui vient de subir une
+///   mauvaise mise a jour redemarre plusieurs fois avant de demander de
+///   l'aide ; recalculer la cle a chaque demarrage effacerait, des le premier
+///   de ces redemarrages, la seule trace de ce qu'il cherche a retrouver.
+///
+/// Une RETROGRADATION est traitee comme une montee : revenir de 0.9.140 a
+/// 0.9.139 enregistre 0.9.140. Le champ repond « quelle version tournait juste
+/// avant », pas « quelle version etait la plus recente » — et c'est bien la
+/// premiere question qu'on se pose quand on veut annuler le geste qu'on vient
+/// de faire, dans un sens comme dans l'autre.
+pub(crate) fn version_precedente(vue: Option<&str>, courante: &str) -> Option<String> {
+    let vue = vue.map(str::trim).filter(|v| !v.is_empty())?;
+    (vue != courante.trim()).then(|| vue.to_string())
+}
+
+#[cfg(test)]
+mod version_precedente_tests {
+    use super::{CLE_VERSION_PRECEDENTE, CLE_VERSION_VUE, version_precedente};
+
+    #[test]
+    fn premiere_mise_en_route_ne_vient_de_nulle_part() {
+        assert_eq!(version_precedente(None, "0.9.140"), None);
+        assert_eq!(version_precedente(Some(""), "0.9.140"), None);
+        assert_eq!(version_precedente(Some("   "), "0.9.140"), None);
+    }
+
+    #[test]
+    fn une_montee_de_version_enregistre_celle_qu_on_quitte() {
+        assert_eq!(
+            version_precedente(Some("0.9.139"), "0.9.140"),
+            Some("0.9.139".to_string())
+        );
+    }
+
+    /// Le cas qui a motive la cle. Un redemarrage ne doit RIEN ecrire : sinon
+    /// `previous_version` vaudrait la version courante des le premier
+    /// redemarrage, et l'ecran proposerait de « revenir » a la version que
+    /// l'utilisateur veut precisement quitter.
+    #[test]
+    fn un_redemarrage_sur_la_meme_version_n_ecrit_rien() {
+        assert_eq!(version_precedente(Some("0.9.140"), "0.9.140"), None);
+        // Un reglage recopie a la main ne fabrique pas un faux changement.
+        assert_eq!(version_precedente(Some(" 0.9.140 "), "0.9.140"), None);
+    }
+
+    #[test]
+    fn une_retrogradation_enregistre_aussi_la_version_quittee() {
+        assert_eq!(
+            version_precedente(Some("0.9.140"), "0.9.139"),
+            Some("0.9.140".to_string())
+        );
+    }
+
+    /// Les deux cles sont des noms de reglages PERSISTES : les changer rendrait
+    /// illisibles les bases deja ecrites. Figees ici pour que le changement
+    /// soit un geste delibere.
+    #[test]
+    fn les_cles_de_reglage_sont_figees() {
+        assert_eq!(CLE_VERSION_PRECEDENTE, "previous_version");
+        assert_eq!(CLE_VERSION_VUE, "last_seen_version");
+    }
+
+    /// Garde de cablage, cote LECTURE : une cle ecrite qu'aucune route ne rend
+    /// serait « ecrite mais pas branchee ».
+    ///
+    /// L'ancrage se fait sur la SIGNATURE ENTIERE, pas sur `pub(super) async fn
+    /// update_status`. Ce fragment-la apparait QUATRE fois dans ce fichier —
+    /// deux gardes de cablage qui le citent (dont celle-ci), la vraie
+    /// definition, et un extrait de code factice dans
+    /// `scan_guard_tests`. Un `find` dessus s'arretait sur le premier, et le
+    /// bloc examine englobait alors le source de CE test : l'assertion sur
+    /// `CLE_VERSION_PRECEDENTE` se satisfaisait de sa propre mention et ne
+    /// pouvait plus rougir. Mesure faite : sous sabotage (ligne
+    /// `previous_version` retiree de la route), elle restait VERTE. La
+    /// signature complete, elle, est unique.
+    #[test]
+    fn update_status_publie_la_version_precedente() {
+        let source = include_str!("update.rs");
+        // Assemblee par `concat!` et JAMAIS ecrite d'un seul tenant : ecrite
+        // en clair, la signature apparaitrait deux fois dans ce fichier — la
+        // vraie definition et cette constante — et le temoin d'unicite
+        // ci-dessous rougirait sur sa propre copie. Mesure faite : il a
+        // effectivement rougi, sur un fichier par ailleurs intact.
+        const SIGNATURE: &str = concat!(
+            "pub(super) async fn update_status(State(state): ",
+            "State<AppState>) -> Json<Value> {"
+        );
+        assert_eq!(
+            source.matches(SIGNATURE).count(),
+            1,
+            "temoin : la signature d'ancrage doit etre unique dans ce fichier"
+        );
+        let debut = source.find(SIGNATURE).expect("temoin : signature trouvee");
+        let fin = source[debut..]
+            .find("\n/// Compare the version an in-progress update")
+            .map(|f| debut + f)
+            .expect("temoin : la borne de fin de la route doit exister");
+        let bloc = &source[debut..fin];
+        // Temoin : le bloc examine est bien le CORPS DE LA ROUTE, et non un
+        // morceau de ce module de tests.
+        assert!(
+            bloc.contains("\"current_version\": tune_core::version()"),
+            "temoin : le bloc examine doit etre le corps de `update_status`"
+        );
+        assert!(
+            !bloc.contains("fn update_status_publie_la_version_precedente"),
+            "temoin : le bloc ne doit pas contenir le source de ce test"
+        );
+        assert!(
+            bloc.contains("CLE_VERSION_PRECEDENTE"),
+            "`update_status` doit relire la version precedente (#2266)"
+        );
+        assert!(
+            bloc.contains("\"previous_version\""),
+            "`update_status` doit publier la cle JSON `previous_version` (#2266)"
+        );
+    }
+
+    /// Garde de cablage, cote ECRITURE : sans appel au demarrage, la cle n'est
+    /// jamais posee et la route publierait eternellement `null`.
+    #[test]
+    fn le_demarrage_note_la_version_vue() {
+        let startup = include_str!("../../startup.rs");
+        assert!(
+            startup.contains("pub async fn init_state"),
+            "temoin : le fichier lu doit etre celui qui initialise l'etat"
+        );
+        assert!(
+            startup.contains("update::noter_la_version_vue(state)"),
+            "`init_state` doit appeler `noter_la_version_vue` (#2266)"
+        );
+    }
+}
+
+pub(crate) const CLE_MISE_A_JOUR_DISPONIBLE: &str = "update_available_release";
+
+/// Délai avant le premier contrôle après le démarrage.
+///
+/// La boucle ne part pas au tour zéro : le démarrage a déjà de quoi faire, et
+/// surtout une machine qui redémarre en boucle (unité systemd `Restart=always`
+/// devant un défaut de configuration) taperait l'API des releases à chaque
+/// relance. Deux minutes suffisent à sortir de cette fenêtre-là.
+const DELAI_PREMIER_CONTROLE: Duration = Duration::from_secs(120);
+
+/// L'annonce déposée en base quand une version plus récente existe.
+///
+/// Fonction pure, pour que ce que l'écran lira soit éprouvable sans réseau.
+fn annonce_de_release(current: &str, release: &ReleaseInfo, channel: UpdateChannel) -> Value {
+    let (setting, effective) = channel_fields(channel, current);
+    json!({
+        "current": current,
+        "latest": release.version,
+        "tag_name": release.tag_name,
+        "name": release.name,
+        "published_at": release.published_at,
+        "html_url": release.html_url,
+        "channel": setting,
+        "effective_channel": effective,
+        "checked_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    })
+}
+
+/// Un tour du vérificateur périodique : interroger, consigner, et RIEN d'autre.
+///
+/// Le canal est relu À CHAQUE TOUR, par `checker_for` — le même point unique
+/// que les deux routes. Le lire une fois au lancement rendrait le réglage
+/// `update_channel` inopérant jusqu'au prochain redémarrage : quelqu'un qui
+/// passe de `beta` à `stable` doit être entendu au tour suivant, pas au
+/// prochain démarrage.
+///
+/// Une erreur réseau NE TOUCHE PAS l'annonce déjà déposée : une coupure de
+/// liaison n'est pas la preuve qu'une version a disparu.
+async fn tour_de_verification(state: &AppState) {
+    let current = tune_core::version();
+    let channel = update_channel(&state.backend);
+    let checker = checker_for(&state.backend);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    match checker.check().await {
+        Ok(Some(release)) => {
+            let annonce = annonce_de_release(current, &release, channel);
+            if let Err(e) = settings.set(CLE_MISE_A_JOUR_DISPONIBLE, &annonce.to_string()) {
+                warn!(error = %e, "update_available_write_failed");
+            }
+            info!(
+                version = %release.version,
+                current,
+                channel = channel.as_str(),
+                "update_available"
+            );
+        }
+        // Plus rien à annoncer : la version installée est à jour, ou l'annonce
+        // précédente portait une version que le canal ne propose plus. Effacer
+        // évite qu'un écran garde éternellement un point rouge périmé.
+        Ok(None) => {
+            let _ = settings.delete(CLE_MISE_A_JOUR_DISPONIBLE);
+        }
+        Err(e) => {
+            warn!(error = %e, "update_check_failed");
+        }
+    }
+}
+
+/// #3217 — le vérificateur périodique de mises à jour, enfin LANCÉ.
+///
+/// ## Ce qui était en place, et ce qui ne l'était pas
+///
+/// `TUNE_AUTO_UPDATE` était déclaré (`config.rs:130`), par défaut à `false`
+/// (`config.rs:220`) et réglable par l'environnement (`config.rs:299`) — et lu
+/// NULLE PART. En face, `UpdateChecker::spawn_periodic` avait une seule
+/// occurrence dans tout le dépôt : sa propre définition. Poser
+/// `TUNE_AUTO_UPDATE=true` dans une unité systemd ou un `docker-compose`
+/// n'obtenait rien, sans un mot au journal.
+///
+/// ## Pourquoi il NOTIFIE et n'installe pas
+///
+/// La garde anti-coupure de la route d'installation (#2954) repose sur une
+/// prémisse écrite noir sur blanc en tête de ce fichier : « toute installation est
+/// aujourd'hui un geste délibéré ». Celui qui ne passe pas `?force=true` n'a
+/// pas été prévenu de ce qu'il s'apprête à interrompre — l'écran, lui, prévient
+/// puis force. Un vérificateur qui installerait tout seul n'est prévenu par
+/// personne : il n'a pas d'interface pour avertir, et il ne peut pas dire
+/// `force` de bonne foi. Le souvenir du 10/08/2026 sur le .18 est dans le même
+/// commentaire : six mises à jour en une journée, deux qui ont ré-exécuté
+/// pendant que la zone 12 diffusait.
+///
+/// Ce lanceur ne touche donc à aucun chemin d'installation. Il interroge,
+/// journalise `update_available` et dépose l'annonce sous
+/// [`CLE_MISE_A_JOUR_DISPONIBLE`], que `GET /system/update/status` rend. Le
+/// geste d'installation reste entier, délibéré, et la garde de #2954 garde
+/// exactement ce qu'elle gardait. Une garde de site le tient
+/// (`le_verificateur_periodique_n_installe_rien`).
+///
+/// ## Ce que le réglage veut dire désormais
+///
+/// `TUNE_AUTO_UPDATE=true` = « préviens-moi quand une version paraît ». C'est
+/// moins que ce que le nom promet, et c'est délibéré : passer à l'installation
+/// automatique demanderait de rouvrir la garde anti-coupure, ce qui est un
+/// arbitrage de Bertrand et non une décision d'implémentation.
+pub(crate) fn spawn_verificateur_de_mise_a_jour(state: AppState, auto_update: bool) {
+    if !auto_update {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(DELAI_PREMIER_CONTROLE).await;
+        let cadence = Duration::from_secs(tune_core::updater::CHECK_INTERVAL_SECS);
+        loop {
+            tour_de_verification(&state).await;
+            tokio::time::sleep(cadence).await;
+        }
+    });
+}
+
+/// Câblage et portée du vérificateur périodique (#3217).
+///
+/// Ce qui a été perdu pendant des mois, c'est un APPEL — pas une logique :
+/// `spawn_periodic` était écrit, complet, et personne ne le lançait. Aucun test
+/// de comportement ne pouvait le voir : ils passaient tous sans que la boucle
+/// tourne jamais. Même procédé que `scan_scheduler_cablage_tests`, pour la
+/// même raison.
+#[cfg(test)]
+mod verificateur_periodique_cablage {
+    use super::*;
+
+    /// Le seul endroit qui lance les passes de fond doit porter l'appel, et lui
+    /// passer `config.auto_update` — sans quoi `TUNE_AUTO_UPDATE` redevient un
+    /// réglage accepté et sans effet.
+    #[test]
+    fn le_verificateur_periodique_est_lance_au_demarrage() {
+        let background = include_str!("../../background.rs");
+        // Témoin : si `include_str!` pointait sur un fichier vide ou faux,
+        // l'assertion suivante échouerait pour la mauvaise raison.
+        assert!(
+            background.contains("pub async fn spawn_background_tasks"),
+            "témoin : le fichier lu doit être celui qui câble les passes de fond"
+        );
+        // Espaces normalisés : l'appel dépasse la largeur de `rustfmt`, qui le
+        // replie sur trois lignes. Un garde qui exigerait la ligne d'un seul
+        // tenant tomberait au premier `cargo fmt`, pour rien.
+        let serre: String = background.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            serre.contains(
+                "update::spawn_verificateur_de_mise_a_jour( state.clone(), config.auto_update, );"
+            ) || serre.contains(
+                "update::spawn_verificateur_de_mise_a_jour(state.clone(), config.auto_update);"
+            ),
+            "spawn_verificateur_de_mise_a_jour doit être appelé depuis \
+             background.rs, en lui passant `config.auto_update` — sans cet \
+             appel, `TUNE_AUTO_UPDATE` est de nouveau sans effet (#3217)"
+        );
+    }
+
+    /// 🔴 Le réglage doit être lu par la configuration que le serveur CHARGE.
+    ///
+    /// Il y a deux `TuneConfig` dans ce dépôt. `TUNE_AUTO_UPDATE` n'était lu
+    /// que par celle de `tune-core`, dont `from_env()` n'a aucun appelant : le
+    /// drapeau n'était donc pas seulement ignoré, il était déclaré dans une
+    /// configuration que rien ne construit. Celle qui atteint
+    /// `spawn_background_tasks` est `tune_server::config::TuneConfig`, et c'est
+    /// elle que ce test lit.
+    #[test]
+    fn le_reglage_est_lu_par_la_configuration_du_serveur() {
+        let config = include_str!("../../config.rs");
+        assert!(
+            config.contains("pub fn load() -> Self"),
+            "témoin : le fichier lu doit être celui que le serveur charge"
+        );
+        assert!(
+            config.contains("pub auto_update: bool"),
+            "`auto_update` doit être un champ de la TuneConfig du serveur (#3217)"
+        );
+        let serre: String = config.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            serre.contains(
+                "std::env::var(\"TUNE_AUTO_UPDATE\") { config.auto_update = v == \"true\";"
+            ),
+            "TUNE_AUTO_UPDATE doit être lu par `TuneConfig::load` — sans cela le \
+             réglage reste accepté et sans effet (#3217)"
+        );
+    }
+
+    /// 🔴 Garde de site : le vérificateur périodique n'installe RIEN.
+    ///
+    /// La garde anti-coupure de #2954 se justifie par « toute installation est
+    /// un geste délibéré ». Un tour de vérification qui appellerait un chemin
+    /// d'installation ferait tomber cette prémisse, et rouvrirait les
+    /// micro-coupures du 10/08/2026 — cette fois sans personne devant l'écran.
+    /// Brancher l'installation automatique est un arbitrage, pas une retouche :
+    /// il doit rougir ici avant d'être livré.
+    #[test]
+    fn le_verificateur_periodique_n_installe_rien() {
+        let source = include_str!("update.rs");
+        let debut = source
+            .find("async fn tour_de_verification")
+            .expect("témoin : `tour_de_verification` doit exister dans ce fichier");
+        let fin = source[debut..]
+            .find("\n/// Câblage et portée du vérificateur périodique")
+            .map(|f| debut + f)
+            .expect("témoin : la borne de fin du bloc doit exister");
+        let bloc = &source[debut..fin];
+        assert!(
+            bloc.contains("spawn_verificateur_de_mise_a_jour"),
+            "témoin : le bloc lu doit contenir le lanceur — {} octets",
+            bloc.len()
+        );
+        for interdit in [
+            "update_install",
+            "install_unix",
+            "install_windows",
+            "update_apply",
+            "defer_restart_until_quiet",
+        ] {
+            assert!(
+                !bloc.contains(interdit),
+                "le vérificateur périodique appelle `{interdit}` : il installerait \
+                 sans que personne ait été prévenu, et la garde anti-coupure de \
+                 #2954 repose sur le contraire (#3217)"
+            );
+        }
+    }
+
+    /// 🔴 L'annonce doit être LUE quelque part.
+    ///
+    /// Une notification déposée en base qu'aucune route ne rend serait le
+    /// défaut « écrit mais pas branché » à l'autre bout : le vérificateur
+    /// tournerait, l'écran ne verrait rien, et `TUNE_AUTO_UPDATE` resterait
+    /// aussi muet qu'avant. `GET /system/update/status` est le point de lecture.
+    #[test]
+    fn l_annonce_est_rendue_par_la_route_de_statut() {
+        let source = include_str!("update.rs");
+        let debut = source
+            .find("pub(super) async fn update_status")
+            .expect("témoin : `update_status` doit exister dans ce fichier");
+        let fin = source[debut..]
+            .find("\n/// Compare the version an in-progress update")
+            .map(|f| debut + f)
+            .expect("témoin : la borne de fin de la route doit exister");
+        let bloc = &source[debut..fin];
+        assert!(
+            bloc.contains("CLE_MISE_A_JOUR_DISPONIBLE"),
+            "`update_status` doit relire la clé du vérificateur périodique (#3217)"
+        );
+        assert!(
+            bloc.contains("\"available_update\": available_update"),
+            "`update_status` doit RENDRE l'annonce, pas seulement la lire (#3217)"
+        );
+    }
+
+    /// L'annonce déposée porte de quoi décider : la version, le canal qui l'a
+    /// choisie, et la date du contrôle.
+    #[test]
+    fn l_annonce_dit_la_version_le_canal_et_la_date() {
+        let release = ReleaseInfo {
+            tag_name: "v0.9.141".into(),
+            version: "0.9.141".into(),
+            name: "Tune 0.9.141".into(),
+            body: String::new(),
+            published_at: "2026-09-06T10:00:00Z".into(),
+            html_url: "https://example.invalid/releases/v0.9.141".into(),
+            assets: Vec::new(),
+        };
+        let annonce = annonce_de_release("0.9.140", &release, UpdateChannel::Stable);
+        assert_eq!(annonce["current"], "0.9.140");
+        assert_eq!(annonce["latest"], "0.9.141");
+        assert_eq!(annonce["tag_name"], "v0.9.141");
+        assert_eq!(annonce["channel"], "stable");
+        assert_eq!(annonce["effective_channel"], "stable");
+        assert!(
+            annonce["checked_at"].as_u64().unwrap_or(0) > 1_700_000_000,
+            "la date du contrôle doit être un horodatage réel : {annonce}"
+        );
+        // Le canal `auto` doit sortir RÉSOLU, sans quoi un écran affichant
+        // « auto » ne dit pas à l'utilisateur ce qu'il va recevoir.
+        let auto = annonce_de_release("0.9.140-rc2", &release, UpdateChannel::Auto);
+        assert_eq!(auto["channel"], "auto");
+        assert_eq!(auto["effective_channel"], "beta");
+    }
+}
+
+/// Les deux champs que toute réponse de `/update/check` porte désormais :
+/// le réglage tel qu'il est enregistré, et le canal EFFECTIF une fois `auto`
+/// résolu contre le binaire en cours. Sans le second, un écran affichant
+/// « auto » ne dit pas à l'utilisateur ce qu'il va recevoir.
+fn channel_fields(channel: UpdateChannel, current: &str) -> (&'static str, &'static str) {
+    (channel.as_str(), channel.effective(current))
+}
+
+/// GET /system/update/channel — le réglage, et ce qu'il donne concrètement.
+pub(super) async fn update_channel_get(State(state): State<AppState>) -> Json<Value> {
+    let current = tune_core::version();
+    let channel = update_channel(&state.backend);
+    let (setting, effective) = channel_fields(channel, current);
+    Json(json!({
+        "channel": setting,
+        "effective_channel": effective,
+        "current": current,
+        "choices": ["auto", "stable", "beta"],
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct UpdateChannelBody {
+    channel: String,
+}
+
+/// PUT /system/update/channel — choisir stable, bêta, ou revenir à `auto`.
+///
+/// Réservé à l'administrateur, comme `update_install` : ce réglage décide de ce
+/// que la machine acceptera d'installer.
+///
+/// Une valeur inconnue est REFUSÉE (400) plutôt qu'ignorée. Un `200` pour rien
+/// laisserait l'écran croire que « nightly » a été retenu alors que le serveur
+/// serait resté sur `auto`.
+pub(super) async fn update_channel_set(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Json(body): Json<UpdateChannelBody>,
+) -> impl IntoResponse {
+    let Some(channel) = UpdateChannel::parse(&body.channel) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "unknown_channel",
+                "message": format!("Unknown update channel '{}'", body.channel),
+                "choices": ["auto", "stable", "beta"],
+            })),
+        )
+            .into_response();
+    };
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(e) = settings.set(UpdateChannel::SETTING_KEY, channel.as_str()) {
+        error!(error = %e, "update_channel_write_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "settings_write_failed", "message": e})),
+        )
+            .into_response();
+    }
+
+    let current = tune_core::version();
+    let (setting, effective) = channel_fields(channel, current);
+    info!(channel = setting, effective, "update_channel_set");
+    (
+        StatusCode::OK,
+        Json(json!({
+            "channel": setting,
+            "effective_channel": effective,
+            "current": current,
+            "choices": ["auto", "stable", "beta"],
+        })),
+    )
+        .into_response()
+}
+
 /// GET /system/update/check
 ///
 /// Fetches the latest release from GitHub, compares versions, and returns update info.
-pub(super) async fn update_check() -> Json<Value> {
-    let checker = UpdateChecker::new();
+pub(super) async fn update_check(State(state): State<AppState>) -> Json<Value> {
     let current = tune_core::version();
+    let channel = update_channel(&state.backend);
+    let (setting, effective) = channel_fields(channel, current);
+    let checker = checker_for(&state.backend);
     let homebrew = current_homebrew_installation();
     let installation_version_mismatch = homebrew
         .as_ref()
         .is_some_and(|install| !homebrew_version_matches(&install.cellar_version, current));
 
     match checker.check().await {
-        Ok(Some(release)) => Json(update_release_payload(current, &release, homebrew.as_ref())),
+        Ok(Some(release)) => {
+            let mut payload = update_release_payload(current, &release, homebrew.as_ref());
+            payload["channel"] = json!(setting);
+            payload["effective_channel"] = json!(effective);
+            Json(payload)
+        }
         Ok(None) => Json(json!({
             "current": current,
             "latest": current,
@@ -711,6 +1909,8 @@ pub(super) async fn update_check() -> Json<Value> {
             "installation_manager": homebrew.as_ref().map(|_| "homebrew"),
             "installation_version": homebrew.as_ref().map(|install| &install.cellar_version),
             "installation_version_mismatch": installation_version_mismatch,
+            "channel": setting,
+            "effective_channel": effective,
         })),
         Err(e) => {
             warn!(error = %e, "update_check_failed");
@@ -719,6 +1919,8 @@ pub(super) async fn update_check() -> Json<Value> {
                 "latest": null,
                 "update_available": false,
                 "error": e,
+                "channel": setting,
+                "effective_channel": effective,
             }))
         }
     }
@@ -730,15 +1932,38 @@ pub(super) async fn update_check() -> Json<Value> {
 /// cycle in the background and returns immediately.  Progress is exposed via
 /// `GET /system/update/status` (`phase` field).
 ///
-/// `?force=true` overrides the deferral guards that exist to protect work in
-/// progress (currently: playback). The UI sets it on the install button, which
-/// sits directly under the warning that playback will stop.
+/// `?force=true` overrides the *request-time* deferral guard that protects work
+/// in progress (currently: playback). The UI sets it on the install button,
+/// which sits directly under the warning that playback will stop. It does NOT
+/// override the restart deferral — see [`defer_restart_until_quiet`].
 pub(super) async fn update_install(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<UpdateInstallParams>,
 ) -> impl IntoResponse {
     let force = params.force.unwrap_or(false);
+
+    // Journaliser l'entrée AVANT tout garde-fou. Sur l'incident du 30 août
+    // (#2954), le journal montrait `update_download_starting` puis
+    // `update_restarting` 4 s plus tard, et rien ne permettait de départager
+    // « le garde-fou a été court-circuité par `force` » de « le garde-fou a
+    // regardé un état de lecture qui disait autre chose ». Les deux pistes
+    // étaient strictement indiscernables sur le journal du testeur. Ces trois
+    // champs — l'intention de l'appelant, son identité, et ce que le serveur
+    // voyait de la lecture au même instant — rendent le prochain signalement
+    // imputable sans témoin.
+    let origin = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+    let playing = playing_zone_ids(&state.playback).await;
+    info!(
+        force,
+        origin = %origin,
+        playing_zones = ?playing,
+        "update_install_requested"
+    );
     // Prevent concurrent updates
     {
         let phase = state.update_phase.lock().unwrap();
@@ -782,17 +2007,96 @@ pub(super) async fn update_install(
     // (#2448). Never mutate any part of that unit behind the package manager's
     // back; tell both current and older clients how to take the supported path.
     if let Some(installation) = current_exe.as_deref().and_then(homebrew_installation) {
-        let refusal = homebrew_update_refusal(&installation, tune_core::version());
+        let state_dir = homebrew_state_dir(&state.config.db_path);
+        let blocage = match homebrew_upgrade_plan(&installation, &state_dir) {
+            Ok(plan) => {
+                // Le chemin Homebrew redémarre le serveur, tout comme le chemin
+                // autonome : les mêmes reports s'appliquent, mot pour mot. Ils
+                // sont répétés ici parce que cette branche rend avant eux.
+                if scan_in_progress(&state.backend) {
+                    warn!("update_deferred_scan_in_progress");
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "status": "blocked",
+                            "reason": "scan_in_progress",
+                            "message": "Update deferred: a library scan is in progress. It will be applied automatically once the scan finishes."
+                        })),
+                    )
+                        .into_response();
+                }
+                if !force && !playing.is_empty() {
+                    let zones = zones_qui_retiennent(&state.backend, &playing);
+                    warn!(zones = ?playing, "update_deferred_playback_in_progress");
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "status": "blocked",
+                            "reason": "playback_in_progress",
+                            "zones": zones,
+                            "force_available": true,
+                            "force_hint": "POST /system/update/install?force=true",
+                            "message": "Update deferred: music is playing and installing it would stop playback. It will be applied automatically once playback stops."
+                        })),
+                    )
+                        .into_response();
+                }
+                match spawn_homebrew_upgrade(&plan, std::process::id()) {
+                    Ok(()) => {
+                        info!(
+                            brew = %plan.brew.display(),
+                            cellar_version = %installation.cellar_version,
+                            binary_version = tune_core::version(),
+                            log = %plan.log_file.display(),
+                            "update_homebrew_upgrade_started"
+                        );
+                        *state.update_phase.lock().unwrap() = Some("homebrew_brew_update".into());
+                        return (
+                            StatusCode::ACCEPTED,
+                            Json(json!({
+                                "status": "homebrew_upgrade_started",
+                                "reason": "homebrew_upgrade_started",
+                                "manager": "homebrew",
+                                "command": HOMEBREW_UPDATE_COMMAND,
+                                "phase": "brew_update",
+                                "log": plan.log_file.to_string_lossy(),
+                                "installation_version": installation.cellar_version,
+                                "current_version": tune_core::version(),
+                            })),
+                        )
+                            .into_response();
+                    }
+                    // Le script n'a même pas pu être posé ou lancé. On retombe
+                    // sur le refus — jamais sur un silence.
+                    Err(error) => HomebrewUpgradeBlock::NoStateDir {
+                        path: state_dir.clone(),
+                        error,
+                    },
+                }
+            }
+            Err(block) => block,
+        };
+
+        let refusal = homebrew_update_refusal(&installation, tune_core::version(), Some(&blocage));
         info!(
             executable = %installation.executable.display(),
             cellar_version = %installation.cellar_version,
             binary_version = tune_core::version(),
             mismatch = refusal["installation_version_mismatch"].as_bool().unwrap_or(false),
+            blocked = refusal["upgrade_in_place_blocked_reason"].as_str().unwrap_or("none"),
             "update_skipped_homebrew"
         );
         let _ = SettingsRepo::with_backend(state.backend.clone())
             .set("last_update_result", &refusal.to_string());
-        return (StatusCode::OK, Json(refusal)).into_response();
+        // 409 et non 200. Le refus n'est pas une erreur du serveur, mais rendu
+        // en 200 il était INDISCERNABLE d'un succès pour son unique
+        // consommateur — le client web, qui ne teste que `res.ok` — et laissait
+        // le bouton « Installation… » tourner trois minutes dans le vide avant
+        // de revenir sans un mot (Yves, Homebrew macOS). Les quatre autres
+        // refus de cette même route rendent déjà 409 ; celui-ci rejoint la
+        // famille, et les clients qui la traitent déjà l'affichent sans rien
+        // apprendre de neuf.
+        return (StatusCode::CONFLICT, Json(refusal)).into_response();
     }
 
     // Guard: refuse update if .no-auto-update flag file exists
@@ -859,17 +2163,30 @@ pub(super) async fn update_install(
             .into_response();
     }
 
-    // Guard: don't restart while music is playing. The restart re-execs the
-    // process, which kills every output mid-stream — and says so nowhere, so
-    // the listener just hears the music cut out (#1462). An update that lands
-    // after the album is worth more than one that interrupts it.
-    if !force && playback_in_progress(&state.playback).await {
-        warn!("update_deferred_playback_in_progress");
+    // Guard: don't even DOWNLOAD while music is playing. The restart re-execs
+    // the process, which kills every output mid-stream — and says so nowhere,
+    // so the listener just hears the music cut out (#1462). An update that
+    // lands after the album is worth more than one that interrupts it.
+    //
+    // Ce garde-fou-ci ne protège plus le son à lui seul : il consulte l'état de
+    // lecture à la RÉCEPTION de la requête, et `force` le saute. C'est
+    // `defer_restart_until_quiet` qui tient l'échange d'image (#2954). Ce qu'il
+    // évite encore, et qui vaut d'être gardé : 38 Mo tirés du réseau pendant
+    // qu'une zone joue — la contention est exactement le terrain des coupures
+    // signalées dans le même fil (#2952).
+    if !force && !playing.is_empty() {
+        let zones = zones_qui_retiennent(&state.backend, &playing);
+        warn!(zones = ?playing, "update_deferred_playback_in_progress");
         return (
             StatusCode::CONFLICT,
             Json(json!({
                 "status": "blocked",
                 "reason": "playback_in_progress",
+                // Ce que le journal savait déjà et que l'appelant n'avait pas :
+                // QUI retient, et qu'il existe une sortie (#3581).
+                "zones": zones,
+                "force_available": true,
+                "force_hint": "POST /system/update/install?force=true",
                 "message": "Update deferred: music is playing and installing it would stop playback. It will be applied automatically once playback stops."
             })),
         )
@@ -882,7 +2199,12 @@ pub(super) async fn update_install(
     }
 
     // 1. Check for update (fast — just a GitHub API call)
-    let checker = UpdateChecker::new();
+    //
+    // MÊME canal que `/update/check`. C'est ici que le réglage cesse d'être
+    // décoratif : sans lui, l'installation retomberait sur le canal déduit du
+    // binaire et poserait la préversion que la vérification venait de refuser
+    // d'annoncer (#2266).
+    let checker = checker_for(&state.backend);
     let release = match checker.check().await {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -916,6 +2238,8 @@ pub(super) async fn update_install(
         version = %release.version,
         asset = %asset.name,
         size = asset.size,
+        force,
+        playing_zones = ?playing,
         "update_download_starting"
     );
 
@@ -1155,6 +2479,41 @@ pub(super) async fn update_install(
         );
 
         // --- Restart ---
+        //
+        // Le nouveau binaire est en place sur le disque : la mise à jour est
+        // acquise. Il ne reste que l'échange d'image, et c'est LUI, et lui
+        // seul, qui coupe le son. On ne le fait pas au milieu d'un morceau
+        // (#2954) — pas même quand la requête portait `force`, qui décrivait
+        // l'état de lecture d'il y a un téléchargement. Borné par
+        // `RESTART_DEFERRAL_MAX` pour qu'une zone oubliée en lecture ne bloque
+        // pas les mises à jour à vie.
+        if playback_in_progress(&state.playback).await {
+            set_phase("restart_pending_playback");
+        }
+        match defer_restart_until_quiet(
+            &state.playback,
+            RESTART_DEFERRAL_MAX,
+            RESTART_DEFERRAL_POLL,
+        )
+        .await
+        {
+            RestartRelease::Idle => {}
+            RestartRelease::PlaybackEnded(waited) => {
+                info!(
+                    waited_secs = waited.as_secs(),
+                    "update_restart_window_clear"
+                );
+            }
+            RestartRelease::WindowExpired(waited) => {
+                let zones = playing_zone_ids(&state.playback).await;
+                warn!(
+                    waited_secs = waited.as_secs(),
+                    zones = ?zones,
+                    "update_restart_deferral_expired"
+                );
+            }
+        }
+
         set_phase("restarting");
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1634,7 +2993,7 @@ mod web_swap_tests {
 
     #[test]
     fn swap_replaces_and_cleans() {
-        let tmp = std::env::temp_dir().join(format!("tune-swap-{}", std::process::id()));
+        let tmp = tune_core::test_scratch::scratch_dir("tune-swap");
         let src = tmp.join("src");
         let target = tmp.join("web");
         std::fs::create_dir_all(src.join("assets")).unwrap();
@@ -1649,12 +3008,11 @@ mod web_swap_tests {
         assert!(target.join("assets/a.js").exists());
         assert!(!tmp.join("web.old").exists(), "backup must be cleaned");
         assert!(!tmp.join("web.new").exists(), "staging must be cleaned");
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn swap_into_missing_target_works() {
-        let tmp = std::env::temp_dir().join(format!("tune-swap2-{}", std::process::id()));
+        let tmp = tune_core::test_scratch::scratch_dir("tune-swap2");
         let src = tmp.join("src");
         let target = tmp.join("web");
         std::fs::create_dir_all(&src).unwrap();
@@ -1662,13 +3020,17 @@ mod web_swap_tests {
 
         swap_dir_atomic(&src, &target).unwrap();
         assert!(target.join("index.html").exists());
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }
 
 /// GET /system/update/status
 pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> {
     let phase = state.update_phase.lock().unwrap().clone();
+    // La progression d'une mise à jour Homebrew est sur le DISQUE, hors du
+    // Cellar, parce qu'elle doit traverser le redémarrage : `update_phase` est
+    // en mémoire et le processus qui l'a posée n'existe plus quand l'écran
+    // revient interroger. C'est le serveur NEUF qui relit ce fichier.
+    let homebrew_upgrade = homebrew_upgrade_state(&homebrew_state_dir(&state.config.db_path));
     let is_failed = phase
         .as_deref()
         .map(|p| p.starts_with("failed"))
@@ -1678,17 +3040,70 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
     // record_post_update_result). Lets the UI surface a silent swap failure —
     // e.g. Windows came back on the old binary — instead of the update just
     // looking like it did nothing.
-    let last_update_result = SettingsRepo::with_backend(state.backend.clone())
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let last_update_result = settings
         .get("last_update_result")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
 
+    // #3217 — ce que le vérificateur périodique a TROUVÉ, s'il tourne. C'est
+    // l'autre moitié de `TUNE_AUTO_UPDATE` : sans un endroit où la lire,
+    // l'annonce déposée en base serait « écrite mais pas branchée ». `null`
+    // quand le réglage est à `false`, quand aucun tour n'a encore eu lieu, ou
+    // quand la version installée est déjà la dernière du canal.
+    let available_update = settings
+        .get(CLE_MISE_A_JOUR_DISPONIBLE)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    // #3581 — la phase `restart_pending_playback` était un mot sans sujet. Le
+    // binaire est DÉJÀ posé sur le disque, la mise à jour est acquise, et il ne
+    // manque plus que l'échange d'image : seule une zone retient. Le client
+    // sondait 180 s puis abandonnait sans un mot, et l'utilisateur concluait
+    // « la mise à jour ne fonctionne pas ».
+    //
+    // On rend donc, dans CETTE phase et elle seule, les trois choses qui
+    // manquaient : ce qui est déjà acquis, QUI retient (nommé), et le geste qui
+    // libère. `POST /zones/{id}/stop` remet inconditionnellement l'état mémoire
+    // à `Stopped` — sans garde, sans admin, sans vérifier que la zone joue
+    // vraiment (`routes/playback.rs`, `orchestrator/transport.rs` →
+    // `playback.stop`) — et la relance repart au tour de sonde suivant, cinq
+    // secondes plus tard. C'était déjà le recours ; il n'était annoncé nulle
+    // part. `force_hint` orientait vers le forçage, qui ne porte QUE sur le
+    // garde-fou d'entrée et ne touche pas ce report.
+    let (restart_pending_zones, recovery_hint) =
+        if phase.as_deref() == Some("restart_pending_playback") {
+            let ids = playing_zone_ids(&state.playback).await;
+            (
+                Some(zones_qui_retiennent(&state.backend, &ids)),
+                Some("POST /zones/{id}/stop"),
+            )
+        } else {
+            (None, None)
+        };
     Json(json!({
         "current_version": tune_core::version(),
         "phase": phase,
         "update_in_progress": phase.is_some() && !is_failed,
         "last_update_result": last_update_result,
+        "available_update": available_update,
+        // #2266 — d'ou vient ce serveur. Un FAIT, pas un bouton : l'ecran peut
+        // enfin NOMMER la version precedente (et pointer sa release) au lieu
+        // de renvoyer l'utilisateur aux tags de GitHub. `null` sur une
+        // installation qui n'a jamais change de version.
+        "previous_version": settings.get(CLE_VERSION_PRECEDENTE).ok().flatten(),
+        // `null` hors de la phase de report : rien à dire, rien à afficher.
+        "restart_pending_zones": restart_pending_zones,
+        "recovery_hint": recovery_hint,
+        // Le binaire est en place : ce qui reste n'est plus une installation,
+        // c'est une relance en attente. Le dire évite qu'un client conclue
+        // « échec » quand la mise à jour est en fait acquise.
+        "binary_installed": phase.as_deref() == Some("restart_pending_playback"),
+        // Ce que le script Homebrew détaché a écrit sur le disque, s'il tourne
+        // ou s'il vient de finir. `null` partout ailleurs.
+        "homebrew_upgrade": homebrew_upgrade,
     }))
 }
 
@@ -1710,6 +3125,40 @@ fn swap_took(expected: &str, actual: &str) -> Option<bool> {
 /// bat-swap failure (#1220): the binary swap could be blocked (antivirus, a
 /// locked/relaunched .exe) and the server would come back on the OLD version
 /// with no error anywhere — "the update did nothing". Consumes the markers.
+/// Tenir a jour « d'ou vient ce serveur » (#2266).
+///
+/// Appelee au demarrage a cote de [`record_post_update_result`], et
+/// deliberement SEPAREE d'elle. Deux raisons, et la seconde est un defaut
+/// evite :
+///
+/// - Cette comptabilite ne depend d'AUCUN marqueur laisse sur le disque par un
+///   installeur, donc d'aucune plateforme. Elle vaut sous Windows — dont le
+///   `.bat` fait `del` de l'ancien binaire, qu'aucun `<exe>.old` ne survit —
+///   comme sous Homebrew et sous Docker, ou l'echange se fait hors de Tune.
+/// - `record_post_update_result` rend la main TOT : des que `current_exe()`
+///   echoue, et des qu'un marqueur d'echec de `.bat` est present. Y greffer ce
+///   calcul l'aurait rendu muet exactement dans les cas d'echec ou savoir d'ou
+///   l'on vient sert le plus.
+///
+/// Aucune erreur n'est propagee : ne pas savoir d'ou l'on vient ne doit pas
+/// empecher un serveur de demarrer.
+pub fn noter_la_version_vue(state: &AppState) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let courante = tune_core::version();
+    let vue = settings.get(CLE_VERSION_VUE).ok().flatten();
+    if let Some(precedente) = version_precedente(vue.as_deref(), courante) {
+        info!(
+            previous = %precedente,
+            current = courante,
+            "version_changed_since_last_start"
+        );
+        let _ = settings.set(CLE_VERSION_PRECEDENTE, &precedente);
+    }
+    // Ecrite a CHAQUE demarrage, y compris le tout premier : c'est elle qui
+    // fera la comparaison la prochaine fois.
+    let _ = settings.set(CLE_VERSION_VUE, courante);
+}
+
 pub fn record_post_update_result(state: &AppState) {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -1816,46 +3265,214 @@ pub(super) async fn update_apply() -> impl IntoResponse {
     }))
 }
 
-/// GET /system/changelog — fetch from GitHub releases, cache 1 hour.
-pub(super) async fn changelog() -> Json<Value> {
+/// Paramètres de `GET /system/changelog`. Le client envoie aussi `limit`, que
+/// la route n'a jamais lu ; serde l'ignore, comme avant.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(super) struct ChangelogQuery {
+    /// Langue demandée explicitement (`?lang=en`). Sinon `Accept-Language`.
+    pub lang: Option<String>,
+}
+
+/// GET /system/changelog — notes de version depuis les releases GitHub, dans
+/// la langue demandée, cache 1 heure.
+///
+/// La langue vient de [`crate::i18n::lang_from_request`] : `?lang=` explicite,
+/// sinon `Accept-Language`, sinon `fr` (#3089). Les notes sont traduites À LA
+/// PUBLICATION — un bloc par langue dans le corps de la release, cf.
+/// [`blocs_par_langue`] — et la route sert le bloc de la langue demandée, ou
+/// le français en repli, en le DISANT : `lang` est la langue effectivement
+/// servie, `fallback` vaut `true` dès qu'au moins une entrée n'a pas pu être
+/// servie dans la langue demandée. Chaque entrée porte aussi ses propres
+/// `lang`/`fallback`, car une release ancienne (français seul) peut côtoyer
+/// une release traduite dans la même liste.
+///
+/// Le cache mémorise les releases BRUTES, pas une réponse rendue : la
+/// dérivation par langue est un découpage de texte, sans réseau, refait à
+/// chaque appel. Un cache de réponses aurait dû être indexé par langue, sans
+/// quoi le premier appelant fixait la langue de tous les autres pendant une
+/// heure (piège nommé dans l'arbitrage de #3089).
+pub(super) async fn changelog(
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ChangelogQuery>,
+) -> Json<Value> {
     use std::sync::OnceLock;
     use tokio::sync::Mutex;
 
-    static CACHE: OnceLock<Mutex<(std::time::Instant, Value)>> = OnceLock::new();
+    let lang = crate::i18n::base_tag(&crate::i18n::lang_from_request(q.lang.as_deref(), &headers));
+
+    static CACHE: OnceLock<Mutex<(std::time::Instant, Vec<Value>)>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| {
         Mutex::new((
             std::time::Instant::now() - std::time::Duration::from_secs(7200),
-            json!([]),
+            Vec::new(),
         ))
     });
     let mut guard = cache.lock().await;
 
-    if guard.0.elapsed() < std::time::Duration::from_secs(3600)
-        && guard.1.as_array().is_some_and(|a| !a.is_empty())
-    {
-        return Json(json!({ "version": tune_core::version(), "entries": guard.1 }));
-    }
-
-    let entries = match fetch_github_changelog().await {
-        Ok(e) => {
-            *guard = (std::time::Instant::now(), e.clone());
-            e
-        }
-        Err(_) => guard.1.clone(),
-    };
+    let releases =
+        if guard.0.elapsed() < std::time::Duration::from_secs(3600) && !guard.1.is_empty() {
+            guard.1.clone()
+        } else {
+            match fetch_github_releases().await {
+                Ok(r) => {
+                    *guard = (std::time::Instant::now(), r.clone());
+                    r
+                }
+                Err(_) => guard.1.clone(),
+            }
+        };
     drop(guard);
 
-    // Le cache démarre à `json!([])`. Sur un serveur fraîchement lancé et sans
-    // réseau, les deux branches ci-dessus rendent donc un tableau VIDE, et le
-    // panneau « Quoi de neuf » s'affiche désert — ce qui se lit non pas comme
-    // « je n'ai pas pu joindre la source » mais comme « cette version
-    // n'apporte rien ». Le repli en dur existait depuis toujours pour ce cas ;
-    // il n'était simplement jamais appelé.
-    if entries.as_array().is_none_or(|a| a.is_empty()) {
-        return changelog_hardcoded();
+    // Le cache démarre vide. Sur un serveur fraîchement lancé et sans réseau,
+    // les deux branches ci-dessus rendent donc une liste VIDE, et le panneau
+    // « Quoi de neuf » s'affiche désert — ce qui se lit non pas comme « je
+    // n'ai pas pu joindre la source » mais comme « cette version n'apporte
+    // rien ». Le repli en dur existait depuis toujours pour ce cas ; il
+    // n'était simplement jamais appelé.
+    if releases.is_empty() {
+        return changelog_hardcoded(&lang);
     }
 
-    Json(json!({ "version": tune_core::version(), "entries": entries }))
+    let NotesServies {
+        entries,
+        lang: servie,
+        fallback,
+    } = entrees_pour_langue(&releases, &lang);
+    Json(json!({
+        "version": tune_core::version(),
+        "lang": servie,
+        "fallback": fallback,
+        "entries": entries,
+    }))
+}
+
+/// Marqueur ouvrant un bloc de langue dans un corps de release :
+/// `<!-- lang:en -->`, seul sur sa ligne. Rend la base de l'étiquette, ou
+/// `None` si la ligne n'est pas un marqueur.
+fn marqueur_de_langue(line: &str) -> Option<String> {
+    let inner = line
+        .trim()
+        .strip_prefix("<!--")?
+        .strip_suffix("-->")?
+        .trim()
+        .strip_prefix("lang:")?;
+    let tag = crate::i18n::base_tag(inner);
+    (!tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphabetic())).then_some(tag)
+}
+
+/// Découpe un corps de release en blocs `(langue, texte)`, dans l'ordre.
+///
+/// Format de publication multilingue (docs/RELEASE-WORKFLOW.md, « Notes de
+/// version multilingues ») : le français d'abord, tel qu'il a toujours été
+/// écrit, puis un bloc par traduction, chacun ouvert par un commentaire HTML
+/// `<!-- lang:xx -->` seul sur sa ligne. Le commentaire est invisible sur la
+/// page GitHub et traverse le proxy `mozaiklabs.fr` comme n'importe quel
+/// texte : rien à télécharger de plus, rien à parser de plus qu'un corps.
+///
+/// Compatibilité : une release ANCIENNE n'a aucun marqueur — tout son corps
+/// est le bloc `fr`. Un préambule sans marqueur est de même le bloc `fr`, et
+/// un `<!-- lang:fr -->` explicite est accepté. Un bloc vide (marqueur laissé
+/// sans texte) est ignoré : il ne « couvre » pas la langue, elle repliera.
+fn blocs_par_langue(body: &str) -> Vec<(String, String)> {
+    let mut blocs: Vec<(String, String)> = Vec::new();
+    let mut courant = String::from("fr");
+    let mut texte = String::new();
+    let clore = |lang: &str, texte: &mut String, blocs: &mut Vec<(String, String)>| {
+        if texte.trim().is_empty() {
+            texte.clear();
+        } else {
+            blocs.push((lang.to_string(), std::mem::take(texte)));
+        }
+    };
+    for line in body.lines() {
+        if let Some(lang) = marqueur_de_langue(line) {
+            clore(&courant, &mut texte, &mut blocs);
+            courant = lang;
+            continue;
+        }
+        texte.push_str(line);
+        texte.push('\n');
+    }
+    clore(&courant, &mut texte, &mut blocs);
+    blocs
+}
+
+/// Le texte des notes à servir pour `lang`, avec la langue effectivement
+/// servie et le drapeau de repli. Cherche d'abord le bloc de la langue
+/// demandée, puis le bloc `fr` ; sans aucun des deux (corps vide, ou notes
+/// publiées sans français — cas non prévu par le format), rend le corps
+/// entier, étiqueté `fr` et en repli.
+fn notes_dans_la_langue(body: &str, lang: &str) -> (String, String, bool) {
+    let blocs = blocs_par_langue(body);
+    if let Some((_, texte)) = blocs.iter().find(|(l, _)| l == lang) {
+        return (texte.clone(), lang.to_string(), false);
+    }
+    if let Some((_, texte)) = blocs.iter().find(|(l, _)| l == "fr") {
+        return (texte.clone(), "fr".to_string(), lang != "fr");
+    }
+    (body.to_string(), "fr".to_string(), lang != "fr")
+}
+
+/// Ce que la route rend pour une langue : les entrées, la langue servie et le
+/// drapeau de repli agrégé.
+struct NotesServies {
+    entries: Vec<Value>,
+    /// La langue demandée si au moins une entrée est servie dedans, sinon
+    /// `fr` : c'est ce que le panneau affiche majoritairement.
+    lang: String,
+    /// `true` dès qu'une entrée n'a pas pu être servie dans la langue
+    /// demandée — le client peut alors dire « notes en français ».
+    fallback: bool,
+}
+
+/// Dérive les entrées du panneau depuis les releases brutes, pour `lang`.
+/// Sans réseau : c'est la partie testable de la route.
+fn entrees_pour_langue(releases: &[Value], lang: &str) -> NotesServies {
+    let mut fallback = false;
+    let mut une_dans_la_langue = false;
+    let entries: Vec<Value> = releases
+        .iter()
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?;
+            let version = tag.strip_prefix('v').unwrap_or(tag);
+            let date = r["published_at"]
+                .as_str()
+                .unwrap_or("")
+                .split('T')
+                .next()
+                .unwrap_or("");
+            let body = r["body"].as_str().unwrap_or("");
+            let (texte, servie, repli) = notes_dans_la_langue(body, lang);
+            fallback |= repli;
+            une_dans_la_langue |= !repli;
+            let ParsedBody {
+                mut features,
+                fixes,
+                improvements,
+            } = parse_release_body(&texte);
+            if features.is_empty() && fixes.is_empty() && improvements.is_empty() {
+                features.push(format!("Release {version}"));
+            }
+            Some(json!({
+                "version": version,
+                "date": date,
+                "lang": servie,
+                "fallback": repli,
+                "features": features,
+                "fixes": fixes,
+                "improvements": improvements,
+            }))
+        })
+        .collect();
+    NotesServies {
+        entries,
+        lang: if une_dans_la_langue {
+            lang.to_string()
+        } else {
+            "fr".to_string()
+        },
+        fallback,
+    }
 }
 
 /// Les trois listes du panneau « Quoi de neuf », telles qu'il les attend.
@@ -1878,14 +3495,79 @@ enum Section {
     Other,
 }
 
-/// Classe un intitulé (titre de section) par mots-clés, FR et EN.
+/// Mots-clés de titre, par rubrique, dans les dix langues de l'interface
+/// (`crate::i18n::SUPPORTED`). Le format de publication multilingue
+/// (docs/RELEASE-WORKFLOW.md, « Notes de version multilingues ») impose aux
+/// blocs traduits les titres que cette table reconnaît : rédacteur et lecteur
+/// partagent la même liste, sinon les puces d'un bloc allemand tomberaient en
+/// `Other` et le panneau afficherait « Release x.y.z » à la place des notes.
+/// Comparaison en minuscules, par sous-chaîne, dans l'ordre : corrections,
+/// puis améliorations, puis nouveautés.
+const TITRES_CORRECTIONS: &[&str] = &[
+    "correct",
+    "fix",
+    "bug", // fr, en (et « Buggfixar » sv)
+    "korrektur",
+    "fehler",
+    "behoben", // de
+    "correc",
+    "correz",
+    "corect",
+    "remed", // es, it, ro
+    "rätt",
+    "ratt", // sv
+    "修复",
+    "修正",
+    "수정", // zh, ja, ko
+];
+const TITRES_AMELIORATIONS: &[&str] = &[
+    "amélio",
+    "ameli",
+    "improv", // fr, en
+    "verbesser",
+    "mejor",
+    "miglior", // de, es, it
+    "îmbunăt",
+    "imbunat",
+    "förbättr",
+    "forbattr", // ro, sv
+    "改进",
+    "优化",
+    "改善",
+    "개선", // zh, ja, ko
+];
+const TITRES_NOUVEAUTES: &[&str] = &[
+    "nouveaut",
+    "feature",
+    "ajout", // fr, en
+    "neuheit",
+    "neuerung",
+    "neue funktion", // de
+    "noved",
+    "nuevas func",
+    "novit",
+    "nuove", // es, it
+    "noutăț",
+    "noutat",
+    "nyhet",
+    "nya funktion", // ro, sv
+    "新功能",
+    "新增",
+    "新機能",
+    "새로운 기능",
+    "신규", // zh, ja, ko
+];
+
+/// Classe un intitulé (titre de section) par mots-clés, dans les dix langues
+/// de l'interface.
 fn section_from_title(title: &str) -> Section {
     let l = title.to_lowercase();
-    if l.contains("correct") || l.contains("fix") || l.contains("bug") {
+    let contient = |mots: &[&str]| mots.iter().any(|m| l.contains(m));
+    if contient(TITRES_CORRECTIONS) {
         Section::Fixes
-    } else if l.contains("amélio") || l.contains("ameli") || l.contains("improv") {
+    } else if contient(TITRES_AMELIORATIONS) {
         Section::Improvements
-    } else if l.contains("nouveaut") || l.contains("feature") || l.contains("ajout") {
+    } else if contient(TITRES_NOUVEAUTES) {
         Section::Features
     } else {
         Section::Other
@@ -1991,7 +3673,10 @@ fn parse_release_body(body: &str) -> ParsedBody {
     out
 }
 
-async fn fetch_github_changelog() -> Result<Value, String> {
+/// Les releases GitHub BRUTES (JSON de l'API, 20 dernières), via le proxy
+/// `mozaiklabs.fr` puis GitHub. La dérivation en entrées du panneau, par
+/// langue, est faite par [`entrees_pour_langue`] — hors réseau, donc testable.
+async fn fetch_github_releases() -> Result<Vec<Value>, String> {
     let client = tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .user_agent("Tune/2.0")
@@ -2027,36 +3712,7 @@ async fn fetch_github_changelog() -> Result<Value, String> {
             resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())?
         }
     };
-    let entries: Vec<Value> = releases
-        .iter()
-        .filter_map(|r| {
-            let tag = r["tag_name"].as_str()?;
-            let version = tag.strip_prefix('v').unwrap_or(tag);
-            let date = r["published_at"]
-                .as_str()
-                .unwrap_or("")
-                .split('T')
-                .next()
-                .unwrap_or("");
-            let body = r["body"].as_str().unwrap_or("");
-            let ParsedBody {
-                mut features,
-                fixes,
-                improvements,
-            } = parse_release_body(body);
-            if features.is_empty() && fixes.is_empty() && improvements.is_empty() {
-                features.push(format!("Release {version}"));
-            }
-            Some(json!({
-                "version": version,
-                "date": date,
-                "features": features,
-                "fixes": fixes,
-                "improvements": improvements,
-            }))
-        })
-        .collect();
-    Ok(json!(entries))
+    Ok(releases)
 }
 
 /// Dernier recours quand la source distante est injoignable ET que le cache
@@ -2068,9 +3724,14 @@ async fn fetch_github_changelog() -> Result<Value, String> {
 /// Ces notes sont figées et ne suivent pas les releases : elles valent mieux
 /// qu'un panneau vide, pas mieux que les vraies notes. Chaque entrée porte sa
 /// version et sa date, donc rien n'est présenté comme récent à tort.
-fn changelog_hardcoded() -> Json<Value> {
+///
+/// Ces notes n'existent qu'en français : `lang` le dit, et `fallback` vaut
+/// `true` dès que la langue demandée n'est pas `fr` (#3089).
+fn changelog_hardcoded(lang: &str) -> Json<Value> {
     Json(json!({
         "version": tune_core::version(),
+        "lang": "fr",
+        "fallback": lang != "fr",
         // Dit au client que ces notes sont un secours, pas l'actualité du
         // produit. Sans ce drapeau, le panneau badge sa première entrée
         // « Récent » — soit « v0.8.15 » annoncée comme la version en cours sur
@@ -2281,14 +3942,78 @@ mod scan_guard_tests {
         assert!(scan_in_progress(&b));
     }
 
+    /// Remplace `scanning_without_start_time_blocks_update`, qui épinglait
+    /// l'inverse (« pas de date ⇒ on protège le scan »). La règle a changé,
+    /// délibérément : tant que le scan de démarrage n'horodatait pas, cette
+    /// branche était le SEUL comportement possible pour lui, donc un report
+    /// perpétuel déguisé en prudence. Maintenant que les deux chemins de
+    /// production datent leur annonce (`scan::marquer_scan_en_cours`), un scan
+    /// vivant ne passe plus jamais par ici : ne reste que la base héritée
+    /// d'une version antérieure tuée en plein scan — exactement ce que la
+    /// fenêtre d'ancienneté doit dénouer (#2976).
     #[test]
-    fn scanning_without_start_time_blocks_update() {
-        // Err on the side of protecting the scan when no start time is recorded.
+    fn scanning_without_start_time_no_longer_blocks_update() {
         let b = backend();
         SettingsRepo::with_backend(b.clone())
             .set("scan_status", "scanning")
             .unwrap();
-        assert!(scan_in_progress(&b));
+        assert!(
+            !scan_in_progress(&b),
+            "« scanning » sans horodatage ne peut venir que d'un scan mort : \
+             le bloquer indéfiniment n'a aucune sortie"
+        );
+    }
+
+    /// Même chose pour un horodatage illisible : `parse::<u64>()` échoue, et
+    /// le garde-fou ne doit pas retomber sur un blocage sans issue.
+    #[test]
+    fn scanning_with_unparsable_start_time_does_not_block_update() {
+        let b = backend();
+        let s = SettingsRepo::with_backend(b.clone());
+        s.set("scan_status", "scanning").unwrap();
+        s.set("scan_started_at", "2026-08-30T15:42:00Z").unwrap();
+        assert!(!scan_in_progress(&b));
+    }
+
+    /// TÉMOIN. Un scan RÉELLEMENT en cours doit continuer de différer la mise
+    /// à jour. L'annonce est faite par la FONCTION DE PRODUCTION que les deux
+    /// scans appellent, jamais par une transcription : si elle cesse
+    /// d'horodater, ce test tombe.
+    #[test]
+    fn scan_annonce_par_la_production_bloque_la_mise_a_jour() {
+        let b = backend();
+        crate::routes::system::scan::marquer_scan_en_cours(&b);
+        assert!(
+            scan_in_progress(&b),
+            "un scan vivant, annoncé par le chemin de production, doit différer la mise à jour"
+        );
+    }
+
+    /// L'autre sens, sur la MÊME annonce de production : passé la fenêtre
+    /// d'ancienneté, le scan ne bloque plus. Avant #2976 le scan de démarrage
+    /// n'était pas daté et ne pouvait donc JAMAIS franchir cette fenêtre.
+    #[test]
+    fn scan_annonce_par_la_production_puis_perime_laisse_passer() {
+        let b = backend();
+        crate::routes::system::scan::marquer_scan_en_cours(&b);
+        let s = SettingsRepo::with_backend(b.clone());
+        let pose: u64 = s
+            .get("scan_started_at")
+            .unwrap()
+            .expect("le chemin de production doit horodater son annonce")
+            .trim()
+            .parse()
+            .expect("l'horodatage doit être un epoch en secondes");
+        assert!(
+            now_secs().saturating_sub(pose) < 60,
+            "l'horodatage posé doit être celui de maintenant"
+        );
+        s.set(
+            "scan_started_at",
+            &(pose - (super::SCAN_GUARD_STALE_SECS + 3600)).to_string(),
+        )
+        .unwrap();
+        assert!(!scan_in_progress(&b));
     }
 
     #[test]
@@ -2301,6 +4026,102 @@ mod scan_guard_tests {
         let stale = now_secs() - (super::SCAN_GUARD_STALE_SECS + 3600);
         s.set("scan_started_at", &stale.to_string()).unwrap();
         assert!(!scan_in_progress(&b));
+    }
+}
+
+/// Le scan de DÉMARRAGE, éprouvé de bout en bout — c'est lui, et lui seul,
+/// que #2976 laissait indatable.
+///
+/// Le vrai `spawn_auto_scan` est exécuté sur un dossier de musique temporaire.
+/// `ScanStatusGuard` remet `scan_status` à `idle` en fin de tâche, mais il
+/// n'efface PAS `scan_started_at` : la trace que le scan de démarrage a bien
+/// daté son annonce survit à sa terminaison, et se lit donc sans course.
+#[cfg(test)]
+mod scan_de_demarrage_tests {
+    use super::scan_in_progress;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::db::sqlite::SqliteDb;
+
+    #[tokio::test]
+    async fn le_scan_de_demarrage_horodate_son_annonce_et_devient_perimable() {
+        // Le dossier doit exister pendant TOUT le scan : le handle est gardé
+        // en vie jusqu'à la fin du test, et il n'est pas dans /tmp partagé.
+        let dossier = tempfile::tempdir().unwrap();
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&[dossier.path().to_string_lossy()]).unwrap(),
+            )
+            .unwrap();
+
+        let bus = Arc::new(tune_core::event_bus::EventBus::new());
+        let fini = crate::auto_scan::spawn_auto_scan(backend.clone(), bus);
+        for _ in 0..600 {
+            if fini.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            fini.load(Ordering::Acquire),
+            "le scan de démarrage n'a pas terminé"
+        );
+
+        // 1. Le scan de démarrage a DATÉ son annonce. C'est l'écriture qui
+        //    manquait : sans elle tout ce qui suit est indécidable.
+        let pose: u64 = settings
+            .get("scan_started_at")
+            .unwrap()
+            .expect("le scan de démarrage doit poser `scan_started_at` (#2976)")
+            .trim()
+            .parse()
+            .expect("`scan_started_at` doit être un epoch en secondes parseable");
+        let maintenant = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            maintenant.saturating_sub(pose) < 300,
+            "l'horodatage doit être celui de ce scan-ci"
+        );
+
+        // 2. Le processus meurt pendant le scan : `ScanStatusGuard` ne
+        //    s'exécute pas, la base garde « scanning ». C'est l'état exact que
+        //    laisse une coupure de courant ou un `kill -9`.
+        settings.set("scan_status", "scanning").unwrap();
+
+        // TÉMOIN : tant que la fenêtre n'est pas franchie, la mise à jour
+        //    reste différée — la correction ne tue pas un scan vivant.
+        assert!(
+            scan_in_progress(&backend),
+            "un scan de démarrage récent doit continuer de différer la mise à jour"
+        );
+
+        // 3. Treize heures plus tard, le garde-fou le déclare périmé et la
+        //    mise à jour passe. C'est ce que le scan de démarrage ne pouvait
+        //    PAS faire avant #2976, faute de date.
+        settings
+            .set(
+                "scan_started_at",
+                &(pose - (super::SCAN_GUARD_STALE_SECS + 3600)).to_string(),
+            )
+            .unwrap();
+        assert!(
+            !scan_in_progress(&backend),
+            "passé la fenêtre d'ancienneté, un scan de démarrage mort ne doit plus rien bloquer"
+        );
+
+        drop(dossier);
     }
 }
 
@@ -2352,6 +4173,438 @@ mod playback_guard_tests {
         pm.pause(8).await;
         pm.play(12, NowPlaying::default()).await;
         assert!(playback_in_progress(&pm).await);
+    }
+}
+
+/// #3581 — la SORTIE d'un état bloquant : une zone qui annonce `Playing` mais
+/// que plus personne n'observe avancer ne retient plus rien.
+///
+/// Tades ne pouvait pas mettre à jour son serveur, et n'avait aucun recours :
+/// sa Serenade était restée `Playing` en mémoire, le seul détecteur de zone
+/// figée est DLNA-only (#3155), `startup.rs` ne remet à `stopped` que la
+/// colonne, et la seule sortie automatique était le plafond de DEUX HEURES du
+/// report de relance.
+///
+/// Ces épreuves passent par [`super::zones_en_lecture_vivante`] — la fonction
+/// que le garde-fou d'entrée ET le report de relance appellent tous deux, via
+/// [`playing_zone_ids`]. Ce n'est pas une réplique du mécanisme.
+#[cfg(test)]
+mod zone_figee_tests {
+    use super::{SILENCE_DE_POSITION_AVANT_ZONE_FIGEE, zones_en_lecture_vivante};
+    use std::time::Duration;
+    use tune_core::playback::{NowPlaying, PlaybackManager};
+
+    /// Seuil nul : toute zone DÉJÀ observée est immobile « depuis plus
+    /// longtemps que le seuil ». C'est le seul moyen d'atteindre la branche
+    /// figée sans faire dormir dix minutes.
+    const TOUT_DE_SUITE: Duration = Duration::ZERO;
+
+    /// LE défaut : la zone a été observée, l'observation s'est arrêtée, et
+    /// elle retenait la mise à jour pour toujours.
+    #[tokio::test]
+    async fn une_zone_dont_la_position_ne_bouge_plus_ne_retient_plus_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        // Ce que le sondeur écrit chaque seconde sur une zone observée.
+        pm.update_position(12, 1_000).await;
+        assert!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE)
+                .await
+                .is_empty(),
+            "une zone observée dont la position n'avance plus au-delà du seuil \
+             doit cesser de retenir la mise à jour : c'est la sortie qui \
+             manquait à #3581"
+        );
+    }
+
+    /// La contre-épreuve du remède : une lecture RÉELLE ne doit jamais être
+    /// coupée. La zone vient d'être observée, le seuil est celui de
+    /// production — elle retient.
+    #[tokio::test]
+    async fn une_lecture_reelle_qui_avance_retient_toujours_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        pm.update_position(12, 1_000).await;
+        assert_eq!(
+            zones_en_lecture_vivante(&pm, SILENCE_DE_POSITION_AVANT_ZONE_FIGEE).await,
+            vec![12],
+            "au seuil de production, une zone observée il y a un instant est \
+             VIVANTE : la mise à jour ne doit pas lui couper le son"
+        );
+    }
+
+    /// « Jamais observée » n'est pas « immobile ». Une zone navigateur — aucun
+    /// périphérique, donc `poller/tick.rs` fait `continue` avant son unique
+    /// `update_position` — ne doit pas être déclarée figée par son immobilité.
+    ///
+    /// `NowPlaying::default()` n'annonce AUCUNE durée : c'est le cas où le
+    /// serveur n'a rien à comparer, et il ne conclut rien. La borne qui
+    /// s'applique quand la durée EST connue est tenue par les deux tests
+    /// suivants.
+    #[tokio::test]
+    async fn une_zone_jamais_observee_reste_traitee_comme_jouant() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        assert_eq!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE).await,
+            vec![12],
+            "sans une seule avance observée, le serveur ne SAIT pas : il doit \
+             conclure « ça joue », jamais « c'est figé »"
+        );
+    }
+
+    /// LE reste de #3581, après #3723 : la zone n'a JAMAIS été observée — donc
+    /// le prédicat d'immobilité ne mord pas — mais sa piste est finie. Elle
+    /// retenait la mise à jour sans aucune borne.
+    ///
+    /// La durée d'une milliseconde et la marge nulle ne sont qu'une échelle :
+    /// le fait tenu est « la fin annoncée est dépassée », et il est le même à
+    /// quatre minutes et dix.
+    #[tokio::test]
+    async fn une_piste_finie_sans_la_moindre_observation_ne_retient_plus_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(
+            12,
+            NowPlaying {
+                duration_ms: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        // Aucun `update_position` : c'est tout le sujet — personne n'observe
+        // cette zone, et personne ne l'observera jamais.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE)
+                .await
+                .is_empty(),
+            "une zone jamais observée dont la piste est FINIE doit cesser de \
+             retenir la mise à jour : c'est la moitié de #3581 que #3723 \
+             laissait ouverte"
+        );
+    }
+    /// La contre-épreuve du remède, et elle est sévère : marge NULLE, et la
+    /// zone n'a jamais été observée. Une piste d'une heure qui vient de
+    /// démarrer n'est pas finie — la mise à jour ne doit pas lui couper le son.
+    #[tokio::test]
+    async fn une_piste_encore_en_cours_sans_observation_retient_toujours_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(
+            12,
+            NowPlaying {
+                duration_ms: 3_600_000,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE).await,
+            vec![12],
+            "sans la moindre observation, une piste dont la fin annoncée n'est \
+             PAS atteinte reste une lecture : c'est la zone navigateur qui \
+             joue vraiment, et on ne la coupe pas"
+        );
+    }
+    /// Une RADIO est exclue du verdict : un flux live n'a pas de durée, et
+    /// plusieurs renderers en annoncent la position par à-coups. La couper
+    /// serait exactement le défaut grave que ce correctif doit éviter.
+    #[tokio::test]
+    async fn une_radio_immobile_retient_toujours_la_mise_a_jour() {
+        let pm = PlaybackManager::new();
+        pm.play(
+            12,
+            NowPlaying {
+                source: "radio".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        pm.update_position(12, 1_000).await;
+        assert_eq!(
+            zones_en_lecture_vivante(&pm, TOUT_DE_SUITE).await,
+            vec![12],
+            "une radio ne doit JAMAIS être déclarée figée sur l'immobilité de \
+             sa position"
+        );
+    }
+
+    /// Une pause reste une pause : le fantôme ne doit pas ressusciter des
+    /// zones que le garde-fou laissait déjà passer.
+    #[tokio::test]
+    async fn une_zone_en_pause_reste_hors_du_compte() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        pm.update_position(12, 1_000).await;
+        pm.pause(12).await;
+        assert!(
+            zones_en_lecture_vivante(&pm, SILENCE_DE_POSITION_AVANT_ZONE_FIGEE)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// La constante de PRODUCTION, tenue par les deux bouts.
+    ///
+    /// Sans ce test, la façon la plus simple de rétablir le défaut — ramener
+    /// le seuil à l'infini — passerait au vert ; et la façon la plus simple de
+    /// créer un défaut GRAVE — le ramener à quelques secondes — aussi.
+    #[test]
+    fn le_seuil_de_production_est_borne_des_deux_cotes() {
+        assert_eq!(
+            SILENCE_DE_POSITION_AVANT_ZONE_FIGEE,
+            Duration::from_secs(600)
+        );
+        // Borne BASSE : le sondeur s'accorde lui-même jusqu'à 45 s de
+        // chargement de piste puis 30 ticks avant de déclarer une panne, soit
+        // 75 s. Un seuil sous cette barre couperait une lecture que le reste
+        // du serveur considère encore vivante.
+        assert!(
+            SILENCE_DE_POSITION_AVANT_ZONE_FIGEE > Duration::from_secs(75),
+            "sous le propre verdict de panne du sondeur (45 + 30 s), ce seuil \
+             couperait du son réel"
+        );
+        // Borne HAUTE : il doit être franchement meilleur que le plafond de
+        // deux heures qu'il remplace, sinon il n'offre aucune sortie.
+        assert!(
+            SILENCE_DE_POSITION_AVANT_ZONE_FIGEE * 10 < super::RESTART_DEFERRAL_MAX,
+            "le seuil doit libérer la mise à jour bien avant le plafond de \
+             deux heures, sans quoi il ne sert à rien"
+        );
+    }
+}
+
+/// Le report de la relance — la moitié qui manquait à #2954.
+///
+/// L'horloge est celle de tokio, mise en pause : `start_paused = true` fait
+/// avancer le temps VIRTUEL dès que toutes les tâches dorment. Ces tests
+/// traversent deux heures de plafond sans qu'une seule seconde réelle passe.
+/// Aucun `sleep` réel : un test qui attendrait vraiment 24 s finirait désarmé.
+///
+/// Ils portent sur `defer_restart_until_quiet` — la fonction que la tâche
+/// d'installation appelle juste avant `set_phase("restarting")`, pas une
+/// réplique de son mécanisme. Dégrader son corps fait tomber ces tests.
+#[cfg(test)]
+mod restart_deferral_tests {
+    use super::{RestartRelease, defer_restart_until_quiet};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tune_core::playback::{NowPlaying, PlaybackManager};
+
+    const MAX: Duration = Duration::from_secs(2 * 3600);
+    const POLL: Duration = Duration::from_secs(5);
+
+    /// Les valeurs de PRODUCTION, pas celles du test.
+    ///
+    /// Les cas ci-dessous passent leurs propres bornes pour rester lisibles ;
+    /// ce test-ci est le seul qui tienne les constantes réelles. Sans lui, un
+    /// plafond porté à l'infini — la façon la plus simple de rétablir le défaut
+    /// « une zone oubliée bloque les mises à jour à vie » — passerait au vert.
+    #[test]
+    fn the_production_ceiling_is_finite_and_the_poll_is_short() {
+        assert_eq!(
+            super::RESTART_DEFERRAL_MAX,
+            MAX,
+            "le plafond du report doit rester borné : sans sortie, une zone \
+             laissée en lecture — ou figée, ce qu'aucun détecteur ne rattrape \
+             (#3155) — bloque les mises à jour pour toujours"
+        );
+        assert_eq!(
+            super::RESTART_DEFERRAL_POLL,
+            POLL,
+            "la relance doit suivre la fin du morceau de près, sinon le report \
+             devient une attente en soi"
+        );
+        assert!(super::RESTART_DEFERRAL_POLL < super::RESTART_DEFERRAL_MAX);
+    }
+
+    /// LA moitié qui décrit l'incident : la lecture démarre, la relance se
+    /// présente 24 s plus tard, et elle N'A PAS LIEU. Le journal du 30 août
+    /// montre `local_audio_playing_after_prefill` à 15:42:00 et
+    /// `update_reexec` à 15:42:24.
+    #[tokio::test(start_paused = true)]
+    async fn restart_waits_while_a_zone_plays() {
+        let pm = PlaybackManager::new();
+        pm.play(20, NowPlaying::default()).await;
+
+        // 24 s de plafond : la fenêtre exacte de l'incident. Rien ne s'arrête,
+        // donc la seule sortie est le plafond — et on doit l'avoir ATTENDU.
+        let short = Duration::from_secs(24);
+        let started = tokio::time::Instant::now();
+        let release = defer_restart_until_quiet(&pm, short, POLL).await;
+
+        assert_eq!(release, RestartRelease::WindowExpired(short));
+        assert_eq!(
+            started.elapsed(),
+            short,
+            "la relance est partie avant la fin de la fenêtre"
+        );
+    }
+
+    /// L'autre moitié, qui compte autant : quand plus rien ne joue, la relance
+    /// part — et sans rien attendre du tout.
+    #[tokio::test(start_paused = true)]
+    async fn restart_goes_ahead_when_nothing_plays() {
+        let pm = PlaybackManager::new();
+        let started = tokio::time::Instant::now();
+
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        assert_eq!(release, RestartRelease::Idle);
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "une mise à jour hors lecture ne doit rien payer"
+        );
+    }
+
+    /// Une zone arrêtée entre-temps libère la relance au tour de scrutation
+    /// suivant : c'est le cas nominal — la mise à jour prend la fin du morceau,
+    /// pas son milieu.
+    #[tokio::test(start_paused = true)]
+    async fn restart_fires_as_soon_as_playback_stops() {
+        let pm = Arc::new(PlaybackManager::new());
+        pm.play(20, NowPlaying::default()).await;
+
+        let stopper = Arc::clone(&pm);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            stopper.stop(20).await;
+        });
+
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        match release {
+            RestartRelease::PlaybackEnded(waited) => {
+                assert!(
+                    waited >= Duration::from_secs(90) && waited <= Duration::from_secs(90) + POLL,
+                    "libérée à {waited:?}, attendu entre 90 s et 95 s"
+                );
+            }
+            other => panic!("attendu PlaybackEnded, obtenu {other:?}"),
+        }
+    }
+
+    /// Le piège symétrique : une zone oubliée EN LECTURE ne bloque pas les
+    /// mises à jour à vie. #3155 a établi qu'aucun détecteur ne rattrape une
+    /// zone locale figée — elle peut rester `Playing` indéfiniment sans qu'un
+    /// échantillon sorte. Le plafond est la sortie, et il est atteint.
+    #[tokio::test(start_paused = true)]
+    async fn a_zone_left_playing_forever_does_not_block_updates_forever() {
+        let pm = PlaybackManager::new();
+        pm.play(20, NowPlaying::default()).await;
+
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        assert_eq!(release, RestartRelease::WindowExpired(MAX));
+    }
+
+    /// Une zone en PAUSE ne retient rien. Sans quoi une zone laissée en pause
+    /// des jours durant bloquerait toutes les mises à jour jusqu'au plafond,
+    /// pour un son que personne n'écoute. C'est aussi ce que dit le frein de
+    /// repos du poller depuis #3120 : la pause n'est pas une lecture.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_zone_never_holds_the_restart() {
+        let pm = PlaybackManager::new();
+        pm.play(20, NowPlaying::default()).await;
+        pm.pause(20).await;
+
+        let started = tokio::time::Instant::now();
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        assert_eq!(release, RestartRelease::Idle);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// Le corps du handler `update_install`, isolé du fichier source.
+    ///
+    /// `include_str!` rend le fichier ENTIER, ce module de test compris — où le
+    /// nom de la fonction surveillée apparaît en toutes lettres, et où le
+    /// fichier compte huit modules `#[cfg(test)]` intercalés dans la
+    /// production. Sans cette découpe, le garde-fou ci-dessous se prouverait
+    /// lui-même et resterait vert quel que soit le code d'installation.
+    fn corps_de_update_install(source: &str) -> &str {
+        let debut = source
+            .find("pub(super) async fn update_install(")
+            .expect("handler `update_install` introuvable dans le source");
+        let reste = &source[debut..];
+        // Jusqu'au prochain handler de premier niveau, ou au prochain module de
+        // test — le premier des deux.
+        let fin = reste[1..]
+            .find("\npub(super) async fn ")
+            .into_iter()
+            .chain(reste[1..].find("\n#[cfg(test)]"))
+            .min()
+            .map(|i| i + 1)
+            .unwrap_or(reste.len());
+        &reste[..fin]
+    }
+
+    /// Le report est-il POSÉ SUR LE CHEMIN DE LA RELANCE ?
+    ///
+    /// Les tests ci-dessus éprouvent le mécanisme ; celui-ci éprouve son
+    /// branchement. C'est exactement la faille de #2954 : le garde-fou de
+    /// lecture existait, il était juste consulté au mauvais endroit. Un
+    /// correctif juste qui n'est appelé nulle part ne coupe rien.
+    #[test]
+    fn the_install_task_defers_the_restart_before_re_execing() {
+        let corps = corps_de_update_install(include_str!("update.rs"));
+        let defer = corps
+            .find("defer_restart_until_quiet(")
+            .expect("la tâche d'installation n'appelle plus le report de relance (#2954)");
+        let restart = corps
+            .find("set_phase(\"restarting\")")
+            .expect("phase `restarting` introuvable dans `update_install`");
+        assert!(
+            defer < restart,
+            "le report doit être consulté AVANT la phase `restarting` : \
+             c'est l'échange d'image qui coupe le son, pas le téléchargement"
+        );
+    }
+
+    /// Contre-épreuve du garde-fou statique : sur un source d'où l'appel a
+    /// disparu, il doit tomber. Un détecteur qui trouve son motif partout ne
+    /// détecte rien.
+    #[test]
+    fn the_call_site_guard_falls_on_a_source_without_the_call() {
+        // Un handler nu : rien à trouver.
+        let nu = "pub(super) async fn update_install(s: S) {\n    set_phase(\"restarting\");\n}\n";
+        assert!(
+            !corps_de_update_install(nu).contains("defer_restart_until_quiet("),
+            "le détecteur trouve l'appel dans un handler qui ne l'a pas"
+        );
+        // Le report posé dans un AUTRE handler ne compte pas : la découpe doit
+        // s'arrêter au handler suivant.
+        let ailleurs = "pub(super) async fn update_install(s: S) {\n    set_phase(\"restarting\");\n}\n\
+             \npub(super) async fn update_status(s: S) {\n    defer_restart_until_quiet(&s.playback);\n}\n";
+        assert!(
+            !corps_de_update_install(ailleurs).contains("defer_restart_until_quiet("),
+            "la découpe déborde sur le handler suivant"
+        );
+        // Ni un module de test intercalé.
+        let en_test = "pub(super) async fn update_install(s: S) {\n    set_phase(\"restarting\");\n}\n\
+             \n#[cfg(test)]\nmod t {\n    defer_restart_until_quiet(&s.playback);\n}\n";
+        assert!(
+            !corps_de_update_install(en_test).contains("defer_restart_until_quiet("),
+            "la coupe à `#[cfg(test)]` ne tient pas"
+        );
+    }
+
+    /// Treize zones sur .18 : le report regarde toutes les zones, pas la
+    /// première venue. Une seule qui joue suffit à retenir.
+    #[tokio::test(start_paused = true)]
+    async fn one_playing_zone_among_idle_ones_holds_the_restart() {
+        let pm = PlaybackManager::new();
+        pm.play(4, NowPlaying::default()).await;
+        pm.stop(4).await;
+        pm.play(8, NowPlaying::default()).await;
+        pm.pause(8).await;
+        pm.play(20, NowPlaying::default()).await;
+
+        let short = Duration::from_secs(60);
+        assert_eq!(
+            defer_restart_until_quiet(&pm, short, POLL).await,
+            RestartRelease::WindowExpired(short)
+        );
     }
 }
 
@@ -2551,7 +4804,7 @@ mod homebrew_guard_tests {
             executable: "/opt/homebrew/Cellar/tune-server/0.9.71/bin/tune-server".into(),
             cellar_version: "0.9.71".into(),
         };
-        let response = homebrew_update_refusal(&installation, "0.9.110");
+        let response = homebrew_update_refusal(&installation, "0.9.110", None);
 
         assert_eq!(response["status"], "managed_installation");
         assert_eq!(response["reason"], "homebrew_managed_installation");
@@ -2675,7 +4928,7 @@ mod changelog_fallback_tests {
     /// précisément le moment où le repli sert.
     #[test]
     fn le_repli_satisfait_le_contrat_du_panneau() {
-        let body = changelog_hardcoded().0;
+        let body = changelog_hardcoded("fr").0;
         let entries = body["entries"]
             .as_array()
             .expect("le repli doit exposer un tableau `entries`");
@@ -2695,7 +4948,7 @@ mod changelog_fallback_tests {
     /// S'il disparaît, le panneau rebadge « Récent » sur une entrée de juin.
     #[test]
     fn le_repli_sannonce_comme_tel() {
-        let body = changelog_hardcoded().0;
+        let body = changelog_hardcoded("fr").0;
         assert_eq!(
             body["offline"],
             serde_json::json!(true),
@@ -2708,7 +4961,7 @@ mod changelog_fallback_tests {
     /// ligne muette dans le panneau — le défaut même qu'on corrige.
     #[test]
     fn chaque_entree_du_repli_est_affichable() {
-        let body = changelog_hardcoded().0;
+        let body = changelog_hardcoded("fr").0;
         for e in body["entries"].as_array().unwrap() {
             let v = e["version"].as_str().unwrap_or("");
             assert!(!v.is_empty(), "entrée sans version : {e}");
@@ -2724,5 +4977,713 @@ mod changelog_fallback_tests {
                 "version {v} : rubriques vides, la ligne serait muette"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod changelog_lang_tests {
+    //! #3089 — les notes de version sont traduites À LA PUBLICATION, un bloc
+    //! par langue dans le corps de la release ; la route sert la langue
+    //! demandée, ou le français en le disant. Aucun réseau : on part des
+    //! releases brutes telles que l'API les rend.
+    use super::{
+        Section, blocs_par_langue, changelog_hardcoded, entrees_pour_langue, section_from_title,
+    };
+    use serde_json::{Value, json};
+
+    /// Corps publié selon le format multilingue : français d'abord, sans
+    /// marqueur, puis un bloc anglais.
+    const CORPS_TRADUIT: &str = "\
+## Nouveautés
+- Recherche dans un serveur UPnP
+## Corrections
+- Pochette erronée dans les compilations
+
+<!-- lang:en -->
+## Features
+- Search inside a UPnP server
+## Bug fixes
+- Wrong cover art in compilations
+";
+
+    /// Corps d'une release ANCIENNE : français seul, aucun marqueur.
+    const CORPS_ANCIEN: &str = "\
+## Corrections
+- Lecture qui s'arrêtait au premier morceau
+";
+
+    fn release(tag: &str, body: &str) -> Value {
+        json!({ "tag_name": tag, "published_at": "2026-09-06T19:06:57Z", "body": body })
+    }
+
+    #[test]
+    fn langue_demandee_presente_elle_est_servie() {
+        let r = [release("v0.9.141", CORPS_TRADUIT)];
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "en");
+        assert!(
+            !n.fallback,
+            "la langue demandée existe : aucun repli à déclarer"
+        );
+        let e = &n.entries[0];
+        assert_eq!(e["lang"], json!("en"));
+        assert_eq!(e["fallback"], json!(false));
+        assert_eq!(e["features"], json!(["Search inside a UPnP server"]));
+        assert_eq!(e["fixes"], json!(["Wrong cover art in compilations"]));
+        // Le bloc français ne fuit pas dans la réponse anglaise.
+        assert!(
+            !e.to_string().contains("Pochette"),
+            "le bloc français a fui dans la réponse anglaise : {e}"
+        );
+    }
+
+    #[test]
+    fn langue_absente_repli_francais_declare() {
+        let r = [release("v0.9.141", CORPS_TRADUIT)];
+        let n = entrees_pour_langue(&r, "de");
+        assert_eq!(
+            n.lang, "fr",
+            "sans bloc allemand, c'est le français qui est servi"
+        );
+        assert!(n.fallback, "le repli doit être DIT, pas silencieux");
+        let e = &n.entries[0];
+        assert_eq!(e["lang"], json!("fr"));
+        assert_eq!(e["fallback"], json!(true));
+        assert_eq!(e["features"], json!(["Recherche dans un serveur UPnP"]));
+        assert!(
+            !e.to_string().contains("Search inside"),
+            "le bloc anglais a été servi à un appel allemand : {e}"
+        );
+    }
+
+    #[test]
+    fn release_ancienne_sans_marqueur_reste_francaise() {
+        let r = [release("v0.9.129", CORPS_ANCIEN)];
+        // Demandée en français : servie telle quelle, sans repli.
+        let n = entrees_pour_langue(&r, "fr");
+        assert_eq!(n.lang, "fr");
+        assert!(!n.fallback);
+        assert_eq!(
+            n.entries[0]["fixes"],
+            json!(["Lecture qui s'arrêtait au premier morceau"])
+        );
+        // Demandée en anglais : même contenu, repli déclaré.
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "fr");
+        assert!(n.fallback);
+        assert_eq!(n.entries[0]["fallback"], json!(true));
+        assert_eq!(
+            n.entries[0]["fixes"],
+            json!(["Lecture qui s'arrêtait au premier morceau"])
+        );
+    }
+
+    #[test]
+    fn releases_traduites_et_anciennes_cohabitent() {
+        // Une liste réelle mêle des releases publiées avant et après le
+        // format : chaque entrée dit sa langue, l'agrégat dit le repli.
+        let r = [
+            release("v0.9.141", CORPS_TRADUIT),
+            release("v0.9.129", CORPS_ANCIEN),
+        ];
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "en", "au moins une entrée est en anglais");
+        assert!(
+            n.fallback,
+            "une entrée n'a pas pu l'être : le repli est déclaré"
+        );
+        assert_eq!(n.entries[0]["lang"], json!("en"));
+        assert_eq!(n.entries[0]["fallback"], json!(false));
+        assert_eq!(n.entries[1]["lang"], json!("fr"));
+        assert_eq!(n.entries[1]["fallback"], json!(true));
+    }
+
+    #[test]
+    fn le_marqueur_tolere_espaces_casse_et_region() {
+        let blocs =
+            blocs_par_langue("Préambule\n<!--lang:EN-GB-->\nBody\n<!--  lang: de  -->\nText\n");
+        let langues: Vec<&str> = blocs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(langues, ["fr", "en", "de"]);
+        assert_eq!(blocs[1].1.trim(), "Body");
+    }
+
+    #[test]
+    fn un_bloc_vide_ne_couvre_pas_sa_langue() {
+        // Un marqueur laissé sans texte (traduction oubliée) ne doit pas
+        // produire un panneau vide : la langue replie sur le français.
+        let r = [release(
+            "v0.9.141",
+            "## Corrections\n- Un correctif\n<!-- lang:en -->\n\n",
+        )];
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "fr");
+        assert!(n.fallback);
+        assert_eq!(n.entries[0]["fixes"], json!(["Un correctif"]));
+    }
+
+    #[test]
+    fn un_commentaire_html_quelconque_nest_pas_un_marqueur() {
+        // `<!-- generated by git-cliff -->` (pied de cliff.toml) et autres
+        // commentaires ne découpent rien.
+        let blocs = blocs_par_langue("## Corrections\n- x\n<!-- generated by git-cliff -->\n");
+        assert_eq!(blocs.len(), 1);
+        assert_eq!(blocs[0].0, "fr");
+    }
+
+    #[test]
+    fn les_titres_traduits_se_classent() {
+        for (titre, attendu) in [
+            ("Fehlerbehebungen", Section::Fixes),
+            ("Correcciones", Section::Fixes),
+            ("Correzioni", Section::Fixes),
+            ("Rättningar", Section::Fixes),
+            ("修复", Section::Fixes),
+            ("バグ修正", Section::Fixes),
+            ("버그 수정", Section::Fixes),
+            ("Verbesserungen", Section::Improvements),
+            ("Mejoras", Section::Improvements),
+            ("Miglioramenti", Section::Improvements),
+            ("Îmbunătățiri", Section::Improvements),
+            ("Förbättringar", Section::Improvements),
+            ("改进", Section::Improvements),
+            ("改善", Section::Improvements),
+            ("개선", Section::Improvements),
+            ("Neuheiten", Section::Features),
+            ("Novedades", Section::Features),
+            ("Novità", Section::Features),
+            ("Noutăți", Section::Features),
+            ("Nyheter", Section::Features),
+            ("新功能", Section::Features),
+            ("新機能", Section::Features),
+            ("새로운 기능", Section::Features),
+            // Inchangé : ce qui n'est pas une rubrique du panneau reste dehors.
+            ("Mise à jour", Section::Other),
+            ("Downloads", Section::Other),
+            ("Lecture", Section::Other),
+        ] {
+            assert!(
+                section_from_title(titre) == attendu,
+                "« {titre} » mal classé"
+            );
+        }
+    }
+
+    #[test]
+    fn le_repli_en_dur_dit_sa_langue() {
+        let fr = changelog_hardcoded("fr").0;
+        assert_eq!(fr["lang"], json!("fr"));
+        assert_eq!(fr["fallback"], json!(false));
+        let en = changelog_hardcoded("en").0;
+        assert_eq!(
+            en["lang"],
+            json!("fr"),
+            "le secours n'existe qu'en français"
+        );
+        assert_eq!(en["fallback"], json!(true));
+    }
+}
+
+/// #3581 — ce que le refus de mise à jour rend à l'appelant.
+#[cfg(test)]
+mod tests_zones_qui_retiennent {
+    use super::zones_qui_retiennent;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::zone_repo::ZoneRepo;
+
+    fn backend() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().expect("base en mémoire");
+        db.init_schema().expect("schéma");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        Arc::new(db)
+    }
+
+    /// Le refus doit NOMMER la zone. Tades voyait « playback_in_progress » et
+    /// rien d'autre : il ne pouvait pas savoir que c'était sa Serenade que le
+    /// serveur croyait en lecture.
+    #[test]
+    fn le_refus_nomme_la_zone_qui_retient() {
+        let b = backend();
+        let repo = ZoneRepo::with_backend(b.clone());
+        let id = repo
+            .create("Serenade", Some("dlna"), None)
+            .expect("création de zone");
+
+        let rendu = zones_qui_retiennent(&b, &[id]);
+
+        assert_eq!(rendu.len(), 1);
+        assert_eq!(rendu[0]["id"].as_i64(), Some(id));
+        assert_eq!(rendu[0]["name"].as_str(), Some("Serenade"));
+    }
+
+    /// Contre-épreuve : un identifiant sans zone en base ne fait pas échouer le
+    /// refus et ne fabrique pas de nom. L'identifiant seul vaut mieux que rien
+    /// — c'est exactement le cas d'une zone figée en mémoire dont la ligne a
+    /// disparu (#3155).
+    #[test]
+    fn un_identifiant_sans_zone_rend_un_nom_vide_sans_echouer() {
+        let b = backend();
+        let rendu = zones_qui_retiennent(&b, &[4242]);
+
+        assert_eq!(rendu.len(), 1);
+        assert_eq!(rendu[0]["id"].as_i64(), Some(4242));
+        assert!(rendu[0]["name"].is_null());
+    }
+
+    /// Aucune zone en lecture : rien à nommer. Une garde qui rendrait toujours
+    /// une entrée se lirait comme un refus permanent.
+    #[test]
+    fn sans_zone_en_lecture_il_n_y_a_rien_a_nommer() {
+        let b = backend();
+        assert!(zones_qui_retiennent(&b, &[]).is_empty());
+    }
+}
+
+/// Ce que la mise à jour Homebrew EN PLACE doit tenir.
+///
+/// Aucun de ces tests ne relit le source : ils construisent un faux Cellar sur
+/// le disque, et le dernier exécute réellement le script produit contre un
+/// `brew` factice. Un test qui vérifierait que la fonction a été appelée ne
+/// prouverait pas que `brew` est trouvé ni que le fichier d'état bouge.
+#[cfg(test)]
+mod homebrew_upgrade_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        HomebrewInstallation, HomebrewUpgradeBlock, HomebrewUpgradePlan, homebrew_prefix,
+        homebrew_state_dir, homebrew_update_refusal, homebrew_upgrade_plan,
+        homebrew_upgrade_script, homebrew_upgrade_state,
+    };
+
+    /// Répertoire temporaire propre à un test, nettoyé à la fin.
+    ///
+    /// On passe par la sortie AUTORISÉE du dépôt, pas par un chemin composé à
+    /// la main : `tune-core/tests/aucune_fuite_de_temporaires.rs` bannit le
+    /// second geste, et `update.rs` appelle déjà `scratch_dir` quelques
+    /// dizaines de lignes plus haut.
+    type Bac = tune_core::test_scratch::ScratchDir;
+
+    fn bac(nom: &str) -> Bac {
+        tune_core::test_scratch::scratch_dir(&format!("tune-hb-{nom}"))
+    }
+
+    #[cfg(unix)]
+    fn ecrire_executable(chemin: &Path, contenu: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(chemin.parent().unwrap()).unwrap();
+        std::fs::write(chemin, contenu).unwrap();
+        std::fs::set_permissions(chemin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Faux préfixe Homebrew complet : `bin/brew` exécutable, Cellar peuplé.
+    #[cfg(unix)]
+    fn faux_prefixe(bac: &Bac, brew: &str) -> (PathBuf, HomebrewInstallation) {
+        let prefix = bac.path().join("opt/homebrew");
+        ecrire_executable(&prefix.join("bin/brew"), brew);
+        let exe = prefix.join("Cellar/tune-server/0.9.143/bin/tune-server");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        (
+            prefix,
+            HomebrewInstallation {
+                executable: exe,
+                cellar_version: "0.9.143".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn le_prefixe_se_deduit_du_cellar_pas_du_path() {
+        for (chemin, attendu) in [
+            (
+                "/opt/homebrew/Cellar/tune-server/0.9.143/bin/tune-server",
+                "/opt/homebrew",
+            ),
+            (
+                "/usr/local/Cellar/tune-server/0.9.71/bin/tune-server",
+                "/usr/local",
+            ),
+            (
+                "/home/linuxbrew/.linuxbrew/Cellar/tune-server/0.9.113_1/bin/tune-server",
+                "/home/linuxbrew/.linuxbrew",
+            ),
+        ] {
+            assert_eq!(
+                homebrew_prefix(Path::new(chemin)),
+                Some(PathBuf::from(attendu)),
+                "préfixe non déduit pour {chemin}"
+            );
+        }
+        // Une installation autonome n'a pas de préfixe Homebrew : on ne doit
+        // surtout pas inventer `/Applications/bin/brew`.
+        assert_eq!(
+            homebrew_prefix(Path::new("/Applications/Tune/tune-server")),
+            None
+        );
+    }
+
+    #[test]
+    fn l_etat_se_pose_a_cote_de_la_base_jamais_dans_le_cellar() {
+        assert_eq!(
+            homebrew_state_dir("/Users/yves/Library/Application Support/Tune/tune.db"),
+            PathBuf::from("/Users/yves/Library/Application Support/Tune")
+        );
+        // `db_path` sans répertoire : le répertoire courant, jamais une chaîne
+        // vide qui donnerait un chemin absolu inattendu.
+        assert_eq!(homebrew_state_dir("tune.db"), PathBuf::from("."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn le_plan_nomme_le_brew_du_prefixe_qui_possede_l_installation() {
+        let bac = bac("plan");
+        let (prefix, installation) = faux_prefixe(&bac, "#!/bin/sh\nexit 0\n");
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+
+        let plan = homebrew_upgrade_plan(&installation, &etat).expect("plan attendu");
+        assert_eq!(plan.brew, prefix.join("bin/brew"));
+        assert_eq!(
+            plan.launcher,
+            prefix.join("opt/tune-server/bin/tune-server-launcher")
+        );
+        assert_eq!(plan.state_file.parent().unwrap(), etat);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sans_brew_le_plan_refuse_et_nomme_le_chemin_cherche() {
+        let bac = bac("sansbrew");
+        let (prefix, installation) = faux_prefixe(&bac, "#!/bin/sh\nexit 0\n");
+        std::fs::remove_file(prefix.join("bin/brew")).unwrap();
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+
+        match homebrew_upgrade_plan(&installation, &etat) {
+            Err(HomebrewUpgradeBlock::BrewMissing(chemin)) => {
+                assert_eq!(chemin, prefix.join("bin/brew"));
+            }
+            autre => panic!("attendu BrewMissing, obtenu {autre:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn un_brew_non_executable_ne_compte_pas() {
+        let bac = bac("nonexec");
+        let (prefix, installation) = faux_prefixe(&bac, "#!/bin/sh\nexit 0\n");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            prefix.join("bin/brew"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+
+        assert!(matches!(
+            homebrew_upgrade_plan(&installation, &etat),
+            Err(HomebrewUpgradeBlock::BrewMissing(_))
+        ));
+    }
+
+    /// Root passe tous les tests d'écriture — c'est précisément pourquoi il
+    /// lui faut un garde à lui. Le test ne s'exécute que SI la suite tourne en
+    /// root ; sinon il vérifie l'autre moitié : hors root, ce n'est jamais ce
+    /// motif-là qui est rendu.
+    #[cfg(unix)]
+    #[test]
+    fn root_est_refuse_parce_que_brew_refuse_root() {
+        let bac = bac("root");
+        let (_prefix, installation) = faux_prefixe(&bac, "#!/bin/sh\nexit 0\n");
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+        let verdict = homebrew_upgrade_plan(&installation, &etat);
+        // SAFETY: lecture d'un identifiant du processus.
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(matches!(verdict, Err(HomebrewUpgradeBlock::RunningAsRoot)));
+        } else {
+            assert!(!matches!(verdict, Err(HomebrewUpgradeBlock::RunningAsRoot)));
+        }
+    }
+
+    #[test]
+    fn le_refus_dit_a_l_ecran_s_il_peut_offrir_le_bouton() {
+        let installation = HomebrewInstallation {
+            executable: "/opt/homebrew/Cellar/tune-server/0.9.71/bin/tune-server".into(),
+            cellar_version: "0.9.71".into(),
+        };
+
+        let sans_motif = homebrew_update_refusal(&installation, "0.9.110", None);
+        assert!(sans_motif["upgrade_in_place_blocked_reason"].is_null());
+        assert!(sans_motif["upgrade_in_place_detail"].is_null());
+
+        let bloque = homebrew_update_refusal(
+            &installation,
+            "0.9.110",
+            Some(&HomebrewUpgradeBlock::BrewMissing(
+                "/opt/homebrew/bin/brew".into(),
+            )),
+        );
+        assert_eq!(
+            bloque["upgrade_in_place_blocked_reason"],
+            "homebrew_brew_missing"
+        );
+        assert!(
+            bloque["upgrade_in_place_detail"]
+                .as_str()
+                .unwrap()
+                .contains("/opt/homebrew/bin/brew"),
+            "le détail doit nommer le chemin cherché : {bloque}"
+        );
+        // La commande manuelle reste rendue dans les DEUX cas : c'est la sortie
+        // de secours de l'utilisateur.
+        assert_eq!(sans_motif["command"], super::HOMEBREW_UPDATE_COMMAND);
+        assert_eq!(bloque["command"], super::HOMEBREW_UPDATE_COMMAND);
+    }
+
+    /// Attend qu'une condition devienne vraie, au plus `limite` dixièmes de
+    /// seconde. Un script détaché n'est pas synchrone avec le test.
+    /// Un processus jetable, dont ce témoin est seul propriétaire.
+    ///
+    /// Le script termine le PID qu'on lui nomme dès qu'il emprunte le repli
+    /// « hors service ». Un témoin qui lui passerait `std::process::id()` se
+    /// ferait donc abattre par le chemin même qu'il mesure — vécu en
+    /// contre-épreuve : la suite s'est arrêtée au milieu, sans ligne de
+    /// résultat.
+    #[cfg(unix)]
+    fn processus_sacrificiel() -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .expect("processus témoin")
+    }
+
+    #[cfg(unix)]
+    fn patienter(limite: u32, mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..limite {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        condition()
+    }
+
+    /// **La preuve du chemin nominal.** Le script produit est réellement
+    /// exécuté contre un `brew` factice qui journalise ses arguments et déclare
+    /// le service démarré. On vérifie ce que `brew` a REÇU et où le fichier
+    /// d'état a fini.
+    #[cfg(unix)]
+    #[test]
+    fn le_script_conduit_brew_puis_redemarre_le_service() {
+        let bac = bac("script");
+        let trace = bac.path().join("brew-args.txt");
+        let brew = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1\" = services ] && [ \"$2\" = list ]; then\n  echo 'tune-server  started  yves  /x/y.plist'\nfi\nexit 0\n",
+            trace.display()
+        );
+        let (_prefix, installation) = faux_prefixe(&bac, &brew);
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+        let plan = homebrew_upgrade_plan(&installation, &etat).expect("plan attendu");
+
+        let mut jetable = processus_sacrificiel();
+        let script = homebrew_upgrade_script(&plan, jetable.id());
+        std::fs::write(&plan.script_file, &script).unwrap();
+        let sortie = std::process::Command::new("/bin/sh")
+            .arg(&plan.script_file)
+            .output()
+            .expect("script exécutable");
+        assert!(
+            sortie.status.success(),
+            "le script a échoué : {}",
+            String::from_utf8_lossy(&sortie.stderr)
+        );
+
+        let recu = std::fs::read_to_string(&trace).unwrap();
+        assert!(recu.contains("update\n"), "brew update non appelé : {recu}");
+        assert!(
+            recu.contains("upgrade tune-server"),
+            "brew upgrade tune-server non appelé : {recu}"
+        );
+        assert!(
+            recu.contains("services restart tune-server"),
+            "le service démarré doit être redémarré : {recu}"
+        );
+
+        let fin = homebrew_upgrade_state(&etat).expect("fichier d'état attendu");
+        assert_eq!(fin["phase"], "done");
+        assert_eq!(fin["exit_code"], 0);
+        let _ = jetable.kill();
+        let _ = jetable.wait();
+    }
+
+    /// **La preuve du chemin d'échec.** `brew upgrade` sort en erreur : le
+    /// fichier d'état doit NOMMER l'étape et porter le code, et le service ne
+    /// doit surtout pas être redémarré sur une mise à jour qui n'a pas eu lieu.
+    #[cfg(unix)]
+    #[test]
+    fn un_upgrade_en_echec_s_arrete_et_se_nomme() {
+        let bac = bac("echec");
+        let trace = bac.path().join("brew-args.txt");
+        let brew = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1\" = upgrade ]; then exit 7; fi\nexit 0\n",
+            trace.display()
+        );
+        let (_prefix, installation) = faux_prefixe(&bac, &brew);
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+        let plan = homebrew_upgrade_plan(&installation, &etat).expect("plan attendu");
+
+        let mut jetable = processus_sacrificiel();
+        std::fs::write(
+            &plan.script_file,
+            homebrew_upgrade_script(&plan, jetable.id()),
+        )
+        .unwrap();
+        let sortie = std::process::Command::new("/bin/sh")
+            .arg(&plan.script_file)
+            .output()
+            .unwrap();
+        assert!(
+            !sortie.status.success(),
+            "un échec de brew doit sortir non nul"
+        );
+
+        let fin = homebrew_upgrade_state(&etat).expect("fichier d'état attendu");
+        assert_eq!(fin["phase"], "failed_brew_upgrade");
+        assert_eq!(fin["exit_code"], 7);
+        let recu = std::fs::read_to_string(&trace).unwrap();
+        assert!(
+            !recu.contains("services restart"),
+            "rien ne doit être redémarré après un upgrade en échec : {recu}"
+        );
+        // Le script s'est arrêté AVANT le repli, donc le processus nommé vit
+        // encore. C'est la seconde moitié de « il s'arrête » : sans elle, un
+        // script qui poursuivrait jusqu'au `kill` passerait pour correct.
+        assert!(
+            jetable.try_wait().unwrap().is_none(),
+            "un upgrade en échec ne doit arrêter AUCUN processus"
+        );
+        let _ = jetable.kill();
+        let _ = jetable.wait();
+    }
+
+    /// **La preuve du repli hors `brew services`.** Quand le serveur n'a pas
+    /// été lancé comme service, `brew services restart` en démarrerait un
+    /// SECOND à côté. Le script doit alors arrêter le processus nommé et
+    /// relancer le lanceur du keg.
+    #[cfg(unix)]
+    #[test]
+    fn hors_service_le_script_arrete_le_serveur_et_relance_le_lanceur() {
+        let bac = bac("repli");
+        let trace = bac.path().join("brew-args.txt");
+        // `services list` ne montre RIEN : le serveur n'est pas un service.
+        let brew = format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", trace.display());
+        let (prefix, installation) = faux_prefixe(&bac, &brew);
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+        let plan = homebrew_upgrade_plan(&installation, &etat).expect("plan attendu");
+
+        let temoin = bac.path().join("lanceur-appele.txt");
+        ecrire_executable(
+            &prefix.join("opt/tune-server/bin/tune-server-launcher"),
+            &format!("#!/bin/sh\ntouch '{}'\n", temoin.display()),
+        );
+
+        // Un vrai processus à arrêter, pour ne pas mesurer un `kill` dans le vide.
+        let mut victime = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .unwrap();
+        let pid = victime.id();
+
+        std::fs::write(&plan.script_file, homebrew_upgrade_script(&plan, pid)).unwrap();
+        let sortie = std::process::Command::new("/bin/sh")
+            .arg(&plan.script_file)
+            .output()
+            .unwrap();
+        assert!(sortie.status.success());
+
+        assert!(
+            patienter(50, || temoin.exists()),
+            "le lanceur du keg n'a pas été relancé"
+        );
+        let recu = std::fs::read_to_string(&trace).unwrap();
+        assert!(
+            !recu.contains("services restart"),
+            "hors service, aucun `brew services restart` ne doit partir : {recu}"
+        );
+        assert_eq!(homebrew_upgrade_state(&etat).unwrap()["phase"], "done");
+        // Le processus visé a bien été arrêté.
+        let _ = victime.wait();
+    }
+
+    /// **La preuve qu'on ne coupe rien sans pouvoir relancer.** Le lanceur du
+    /// keg est absent : le script doit s'arrêter AVANT le `kill`, laisser le
+    /// serveur en vie, et nommer ce qui manque. Un lanceur manquant qui
+    /// laisserait Tune éteint serait strictement pire que le refus remplacé.
+    #[cfg(unix)]
+    #[test]
+    fn sans_lanceur_le_script_n_arrete_pas_le_serveur() {
+        let bac = bac("sanslanceur");
+        let trace = bac.path().join("brew-args.txt");
+        // `services list` ne montre rien : on ira vers le repli.
+        let brew = format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", trace.display());
+        let (_prefix, installation) = faux_prefixe(&bac, &brew);
+        let etat = bac.path().join("data");
+        std::fs::create_dir_all(&etat).unwrap();
+        let plan = homebrew_upgrade_plan(&installation, &etat).expect("plan attendu");
+        // Le lanceur n'est volontairement PAS créé.
+        assert!(!plan.launcher.exists());
+
+        let mut jetable = processus_sacrificiel();
+        std::fs::write(
+            &plan.script_file,
+            homebrew_upgrade_script(&plan, jetable.id()),
+        )
+        .unwrap();
+        let sortie = std::process::Command::new("/bin/sh")
+            .arg(&plan.script_file)
+            .output()
+            .unwrap();
+        assert!(
+            !sortie.status.success(),
+            "il manque quelque chose : sortie non nulle"
+        );
+
+        assert_eq!(
+            homebrew_upgrade_state(&etat).unwrap()["phase"],
+            "failed_no_launcher"
+        );
+        assert!(
+            jetable.try_wait().unwrap().is_none(),
+            "le serveur ne doit PAS être arrêté quand rien ne peut le relancer"
+        );
+        let _ = jetable.kill();
+        let _ = jetable.wait();
+    }
+
+    /// Le plan et le script ne portent AUCUNE entrée de l'appelant HTTP : tout
+    /// ce qui est interpolé vient de `current_exe` et de `db_path`.
+    #[cfg(unix)]
+    #[test]
+    fn le_script_n_interpole_que_des_chemins_mesures() {
+        let plan = HomebrewUpgradePlan {
+            brew: "/opt/homebrew/bin/brew".into(),
+            launcher: "/opt/homebrew/opt/tune-server/bin/tune-server-launcher".into(),
+            state_file: "/data/tune-homebrew-upgrade.json".into(),
+            log_file: "/data/tune-homebrew-upgrade.log".into(),
+            script_file: "/data/tune-homebrew-upgrade.sh".into(),
+        };
+        let script = homebrew_upgrade_script(&plan, 4242);
+        assert!(script.contains("BREW='/opt/homebrew/bin/brew'"));
+        assert!(script.contains("SRV_PID=4242"));
+        // Le nom de la formule est une constante, jamais une variable de shell
+        // qui pourrait porter autre chose.
+        assert!(script.contains("\"$BREW\" upgrade tune-server"));
+        assert!(script.contains("NONINTERACTIVE=1"));
     }
 }

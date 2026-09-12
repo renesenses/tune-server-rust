@@ -46,16 +46,22 @@ karaoke = ["dep:tune-karaoke"]
 # (`catalogued() == false`), donc jamais proposés à l'installation tant qu'aucun
 # écran ne les atteint. Voir docs/plugins/README.md.
 bandcamp = ["dep:tune-bandcamp"]
+# Concerts (#2363) : la tache d'abonnement et la route de lecture, sorties du
+# coeur toujours-compile. Hors catalogue tant qu'aucun ecran ne les consomme.
+concerts = ["dep:tune-concerts"]
 
 [dependencies]
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
+tune-http-types = { path = "../tune-http-types" }
+tune-smart-http = { path = "../tune-smart-http" }
 tune-stream-http = { path = "../tune-stream-http" }
 tune-streaming-http = { path = "../tune-streaming-http" }
 tune-plugin-runtime-wasm = { path = "../tune-plugin-runtime-wasm", optional = true }
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
+tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
@@ -92,6 +98,19 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"
+# Test-only (#3326, S2-a) : jouer le ROLE CLIENT du protocole Sendspin contre
+# notre propre point d'acces, sur une vraie connexion WebSocket. `axum` sait
+# accepter une connexion, pas en ouvrir une.
+tokio-tungstenite = "0.26"
+# Test-only : le repondeur Noise du temoin est ecrit DANS le fichier de test,
+# et non emprunte au code de production. Une secondeQ implementation du cote
+# client verifie la sequence au lieu de la recopier.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "default-resolver-crypto",
+    "std",
+] }
+base64 = "0.22"
 # Test-only : fabriquer des horodatages passés pour rejouer une machine restée
 # hors ligne (tests/licence_grace_visible.rs, #1999).
 chrono = { workspace = true }
@@ -99,10 +118,42 @@ chrono = { workspace = true }
 # tests/plugin_routes.rs.
 async-trait = { workspace = true }
 tempfile = "3"
+# Test-only : fabriquer de vraies pochettes JPEG/PNG et relire les dimensions
+# servies, pour que la contre-épreuve de `?size=` porte sur des pixels et non
+# sur une longueur d'octets (#2996).
+image = { workspace = true }
+# Test-only : `#[tokio::test(start_paused = true)]`. La sonde d'avancement des
+# images d'artistes se relit toutes les trois secondes et la passe qu'elle
+# observe dure des heures — sans horloge virtuelle, l'éprouver coûterait ce
+# temps-là pour de vrai (routes/library/artwork.rs, #2073). `test-util` n'entre
+# que dans les cibles de test : le binaire publié ne le compile pas.
+tokio = { workspace = true, features = ["test-util"] }
+
+# `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
+# point d'accès Sendspin doit être une cible déclarée pour être compilé.
+[[test]]
+name = "sendspin_point_d_acces_s2a"
+path = "tests/sendspin_point_d_acces_s2a.rs"
+
+# #3326 — le mode de transition (un `client/hello` en clair). `autotests =
+# false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
+# la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
+[[test]]
+name = "sendspin_mode_transition"
+path = "tests/sendspin_mode_transition.rs"
 
 [[test]]
 name = "server_contracts"
 path = "tests/server_contracts.rs"
+
+# #1362 — « un morceau présent deux fois dans un album ne doit pas se jouer
+# deux fois ». Le fichier existe depuis que le défaut a été corrigé, mais
+# `autotests = false` (plus haut) le laissait HORS COMPILATION : la garde
+# n'était donc exécutée par personne, ni en local ni en CI. Elle l'est
+# désormais.
+[[test]]
+name = "album_lecture_en_double"
+path = "tests/album_lecture_en_double.rs"
 
 [[test]]
 name = "appliance_contracts"
@@ -116,3 +167,371 @@ path = "tests/plugin_contracts.rs"
 name = "plugin_wasm_contracts"
 path = "tests/plugin_wasm_contracts.rs"
 required-features = ["plugins-wasm"]
+
+# Cible à elle seule, et NON un module de `server_contracts` : le test installe
+# un abonné `tracing` GLOBAL pour lire le journal. `tracing` met en cache, pour
+# tout le processus, la décision « ce point d'appel intéresse-t-il quelqu'un ? »
+# — un abonné posé au milieu d'un binaire qui lance des tests en parallèle rend
+# des captures vides de façon imprévisible (leçon de
+# `tune-core/tests/journal_descriptif_illisible.rs`). Un binaire, un test.
+[[test]]
+name = "panne_sql_journalisee"
+path = "tests/panne_sql_journalisee.rs"
+
+# Même raison, mot pour mot : abonné `tracing` GLOBAL, donc un binaire à lui
+# seul et un seul essai dedans. Celui-ci lit le journal au niveau TRACE pour
+# prouver qu'aucune clef d'API développeur ni chemin d'adresse de webhook n'y
+# apparaît (#2795).
+[[test]]
+name = "cles_developpeur_hors_journal"
+path = "tests/cles_developpeur_hors_journal.rs"
+
+# Meme raison, mot pour mot : abonne `tracing` GLOBAL, donc un binaire a lui
+# seul et un seul essai dedans. Celui-ci compte les lignes qu'un sondeur
+# HQPlayer en panne coute au journal, et les tours de boucle qu'il fait sur
+# vingt-quatre heures (#2566).
+[[test]]
+name = "journal_sondage_hqplayer"
+path = "tests/journal_sondage_hqplayer.rs"
+# Les requêtes SQL de `tune-server` sur une VRAIE base PostgreSQL (#3123).
+# Cible à elle seule, derrière `required-features`, pour deux raisons : elle
+# monte un `AppState` sur le moteur PostgreSQL (impossible sans la feature), et
+# `test-postgres.yml` la lance seule, avec `TUNE_TEST_PG_URL` posée, sans
+# rejouer les 467 contrats SQLite de `server_contracts`.
+[[test]]
+name = "pg_routes_serveur"
+path = "tests/pg_routes_serveur.rs"
+required-features = ["postgres"]
+
+# Les deux sections d'accueil de #3181 sur PostgreSQL, et la contre-epreuve
+# SQLite dans le meme test. Cible separee de `pg_routes_serveur`, qui sonde une
+# bibliotheque VIDE et n'exige qu'un statut : celle-ci seme des lignes et exige
+# qu'elles ressortent, ce qu'un test de statut ne peut pas voir quand la panne
+# est avalee en `200 []`.
+[[test]]
+name = "pg_3181_sections_accueil"
+path = "tests/pg_3181_sections_accueil.rs"
+required-features = ["postgres"]
+
+# #2372 : la route par piste `GET /library/tracks/{id}/versions`. Ce n'est PAS
+# la route de `pg_3181_sections_accueil` — sa SQL est distincte et n'a jamais
+# porté de `DISTINCT`. Depuis ce lot, le TRI des versions descend de la requête
+# vers Rust : `ORDER BY al.title` ne range pas pareil sous la collation binaire
+# de SQLite et sous la collation locale de PostgreSQL. Cette cible sème
+# exactement les titres qui divergent et exige le même ordre des deux côtés.
+# `autotests = false` plus haut — sans cette entrée, le fichier ne serait
+# jamais compilé, donc vert contre rien.
+[[test]]
+name = "pg_2372_versions_par_piste"
+path = "tests/pg_2372_versions_par_piste.rs"
+required-features = ["postgres"]
+
+# Depuis #3039, la fenetre des ajouts recents est un parametre borne.
+[[test]]
+name = "ajouts_recents_fenetre"
+path = "tests/ajouts_recents_fenetre.rs"
+
+# #3839 : l ecran Ambiance ne pouvait pas dire que la tour texte du CLAP est
+# anglaise et que la traduction depend d une cle IA — le client ne voit aucune
+# cle. Le statut acoustique le porte desormais. Sans cette cible, `autotests =
+# false` plus haut laisserait ce fichier JAMAIS compile : un faux vert.
+[[test]]
+name = "ambiance_traduction_annoncee_3839"
+path = "tests/ambiance_traduction_annoncee_3839.rs"
+
+# #3101 : la portée de répertoire de l'audit de bibliothèque. Le motif LIKE de
+# `GET /export/library-audit.csv?dir=…` était écrit à la main, sans séparateur :
+# auditer `…/Rock` ramenait `…/Rockabilly` et le déclarait fantôme. Le témoin
+# passe par la ROUTE MONTÉE, avec de vrais fichiers sur le disque, et non par
+# `folder_like_pattern` — c'est le site d'appel qui avait dérivé, pas le
+# constructeur de motif. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait JAMAIS compilé, donc vert contre rien.
+#
+# Posée ICI, au milieu du fichier, et non à la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent à chaque fois.
+[[test]]
+name = "portee_audit_repertoire_3101"
+path = "tests/portee_audit_repertoire_3101.rs"
+
+# Canal stable / beta : quelles versions `/update/check` a le droit de proposer
+# (#2266). Le defaut `auto` reproduit le comportement d'avant.
+[[test]]
+name = "canal_de_mise_a_jour"
+path = "tests/canal_de_mise_a_jour.rs"
+
+# #2939 : la carte de dedoublonnage du scan et la contrainte `file_path UNIQUE`
+# n'avaient pas la meme portee. `autotests = false` plus haut — sans cette
+# cible, le fichier ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "portee_unicite_file_path_2939"
+path = "tests/portee_unicite_file_path_2939.rs"
+
+# #3185 : la base ne doit plus dependre du repertoire de lancement (fil forum
+# 616). La regle et sa migration vivent hors de tout `cfg`, donc ce fichier
+# s'execute sur Linux comme sur macOS. `autotests = false` plus haut — sans
+# cette cible, il ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "base_unique_lancement_i3185"
+path = "tests/base_unique_lancement_i3185.rs"
+
+# #3733 : `POST /zones/{id}/play` rendait `400 "no tracks to play"` sans AUCUNE
+# ligne de journal, et la v2 avale l'erreur — serveur muet + client muet, et
+# « lecture des albums impossible » n'etait instruisable par personne. Abonne
+# `tracing` GLOBAL, donc un binaire a lui seul et un seul essai dedans (lecon
+# de `panne_sql_journalisee`). `autotests = false` plus haut — sans cette
+# cible, le fichier ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "refus_de_lecture_audible_3733"
+path = "tests/refus_de_lecture_audible_3733.rs"
+
+# #3810 : la route du bouton « Enrichir les metadonnees » n'ecrivait rien a
+# l'entree — sa seule trace etait la fin de passe, qui sur 262 858 pistes
+# arrive dans plusieurs semaines — et un refus de quota partait en 429 muet.
+# Meme raison que ci-dessus pour le binaire dedie : abonne `tracing` GLOBAL,
+# un binaire, un essai. `autotests = false` plus haut — sans cette cible, le
+# fichier ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "enrichissement_audible_3810"
+path = "tests/enrichissement_audible_3810.rs"
+
+# #2718 : sur Linux `db_path` vaut « tune.db » et se resout contre le REPERTOIRE
+# COURANT (Windows et macOS ont ete relocalises par #3185, Linux jamais), et
+# `SQLITE_OPEN_CREATE` cree une base vide en silence — « la bibliotheque a
+# disparu » sans qu'une ligne soit effacee. `sqlite_opened` annoncait le chemin
+# BRUT, qui ne designe aucun fichier. Binaire dedie pour DEUX raisons cumulees :
+# abonne `tracing` global, et `set_current_dir` global au processus.
+# `autotests = false` plus haut — sans cette cible, le fichier ne serait jamais
+# compile, donc vert contre rien.
+[[test]]
+name = "base_ouverte_nommee_2718"
+path = "tests/base_ouverte_nommee_2718.rs"
+
+# La migration Windows vers %LOCALAPPDATA% copiait le `.db` SEUL, sans son
+# `-wal` ni son `-shm`. `autotests = false` plus haut — sans cette cible, le
+# fichier ne serait jamais compile, donc vert contre rien. Et le test lui-meme
+# ne porte AUCUN `cfg` : il eprouve sur Linux la regle et ses effets de bord,
+# que `#[cfg(target_os = "windows")]` derobait a toute machine de compilation.
+[[test]]
+name = "migration_windows_annexes_sqlite"
+path = "tests/migration_windows_annexes_sqlite.rs"
+
+# #3182 : le rapport de diagnostic se declarait « sqlite » sur toute
+# installation PostgreSQL, et « Migration version: 0 » sur une base de 77 291
+# pistes. `autotests = false` plus haut — sans cette cible, le fichier ne
+# serait jamais compile, donc vert contre rien.
+#
+# PAS de `required-features`, contrairement a `pg_routes_serveur` et
+# `pg_3181_sections_accueil` : la contre-epreuve SQLite de ce fichier ne
+# demande aucune base externe, et doit tourner dans le `cargo test --workspace`
+# ordinaire — sinon reparer PostgreSQL en cassant SQLite passerait toutes les
+# portes. Seule l'epreuve PostgreSQL porte `#[cfg(feature = "postgres")]`.
+[[test]]
+name = "pg_3182_moteur_annonce_dans_le_rapport"
+path = "tests/pg_3182_moteur_annonce_dans_le_rapport.rs"
+
+# #2856 : le rapport de bogue ne portait AUCUNE section de reglages — ni
+# l'etat de l'enrichissement au scan, ni le moteur audio. Deux faits qu'il
+# fallait redemander au testeur a chaque ticket, alors que le serveur les a
+# sous la main. La garde passe par les ROUTES MONTEES
+# (`/system/bug-report/markdown`, `/system/bug-report`, `/system/profile`) :
+# un essai qui appellerait `support_settings` en direct resterait vert alors
+# meme que le rapport ne l'appelle pas. Sa seconde moitie ecrit de VRAIS
+# secrets en base et exige qu'aucun ne ressorte, ni son nom ni sa valeur.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait
+# JAMAIS compile, donc vert contre rien.
+#
+# Posee ICI, a cote de la cible de #3182 qui garde le meme rapport, et non a
+# la fin : deux lots qui ajoutent chacun leur cible en queue de `Cargo.toml`
+# se conflictent a chaque fois.
+[[test]]
+name = "rapport_reglages_2856"
+path = "tests/rapport_reglages_2856.rs"
+
+# #3226 : `sources` ne gouvernait que la boucle des services, jamais le bloc
+# `local` ni les radios — la pilule « Qobuz » rendait donc `local + qobuz`.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait jamais
+# compile, donc vert contre rien.
+[[test]]
+name = "recherche_sources_i3226"
+path = "tests/recherche_sources_i3226.rs"
+
+# #2746 : `/system/peers` n'itérait que le registre manuel. `discovered_tune_peers()`
+# existait et n'avait aucun appelant du côté du panneau, donc l'écran annonçait
+# « aucun serveur Tune détecté » sur un réseau où mDNS voyait des serveurs.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait jamais
+# compilé, donc vert contre rien.
+[[test]]
+name = "pairs_decouverts_i2746"
+path = "tests/pairs_decouverts_i2746.rs"
+
+# #2147 : le compteur de pistes comptait la table ENTIERE pendant que le
+# rapport de scan ne comptait que les fichiers du disque — 142 pistes d'ecart
+# chez le testeur, sans explication. `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait jamais compile, donc vert contre rien.
+#
+# PAS de `required-features`, meme motif que la cible PostgreSQL de #3182
+# ci-dessus : l'epreuve SQLite ne demande aucune base externe et doit tourner
+# dans le `cargo test --workspace` ordinaire — sinon reparer PostgreSQL en
+# cassant SQLite passerait toutes les portes. Seule l'epreuve PostgreSQL de ce
+# fichier porte `#[cfg(feature = "postgres")]`.
+[[test]]
+name = "comptes_par_source_2147"
+path = "tests/comptes_par_source_2147.rs"
+
+# #3542 : `POST /podcasts/subscriptions` rendait 201 dans les deux cas —
+# creation reelle et abonnement deja present — sans porter l'identifiant de la
+# ligne. `autotests = false` plus haut : sans cette cible, le fichier ne serait
+# JAMAIS compile, donc vert contre rien.
+#
+# Pas de `required-features` : le banc monte une base SQLite en memoire et
+# appelle la route par son URL, il ne demande aucune base externe ni reseau.
+[[test]]
+name = "podcasts_abonnement_identifiant_3542"
+path = "tests/podcasts_abonnement_identifiant_3542.rs"
+
+# #3226 generalise : `sources` gouverne desormais AUSSI le bloc local de
+# `/home/other-versions`, `/home/artist-releases` et
+# `/library/tracks/{id}/versions`, la ou il ne filtrait que la boucle des
+# services (quand il existait). `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+#
+# Pas de `required-features` : le banc monte deux services factices et une
+# base SQLite en memoire, il ne demande aucune base externe et doit tourner
+# dans le `cargo test --workspace` ordinaire.
+[[test]]
+name = "sources_trois_routes_i3226"
+path = "tests/sources_trois_routes_i3226.rs"
+
+# #3578 : une adresse de station qui rend une PAGE WEB etait acceptee a
+# l'enregistrement et ne se decouvrait qu'a la lecture. Le juge
+# (`non_audio_content_type`) existait deja et n'avait qu'UN appelant.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Pas de `required-features` : le banc monte un faux serveur de station sur
+# 127.0.0.1 et une base SQLite en memoire, il ne demande ni base externe ni
+# reseau sortant.
+[[test]]
+name = "radio_adresse_pas_un_flux_3578"
+path = "tests/radio_adresse_pas_un_flux_3578.rs"
+# #3664 : le marqueur de journal du refus qui propose une station. Binaire a
+# part parce quil lit le JOURNAL : deux essais paralleles installant chacun
+# leur abonne tracing se disputent le cache dinteret des points demission, et
+# le verdict depend alors de lordre dordonnancement (mesure le 11/09/2026).
+[[test]]
+name = "radio_suggestion_marqueur_3664"
+path = "tests/radio_suggestion_marqueur_3664.rs"
+
+# #3543 : l'annuaire du site sert dix entrees Radio Paradise pour sept canaux,
+# dont trois adresses de flux servies DEUX fois sous deux noms. Chaque entree
+# porte son bouton « + Ajouter a Tune », qui tombe sur `GET /radios/add` et
+# creait sans broncher un doublon dans la liste du testeur — `radio_stations`
+# n'a aucune contrainte d'unicite. Le temoin passe par la ROUTE MONTEE.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Pas de `required-features` : `add_from_web` ne sonde pas le flux, le banc
+# n'ouvre aucune connexion sortante et monte une base SQLite en memoire.
+[[test]]
+name = "radio_ajout_web_sans_doublon_3543"
+path = "tests/radio_ajout_web_sans_doublon_3543.rs"
+# #3383 : la bascule « désactiver la télémétrie » n'éteignait rien — la route
+# n'écrivait pas, et les sept gardes d'envoi ne lisaient que `TUNE_TELEMETRY`.
+# Le témoin passe par les ROUTES MONTÉES puis appelle les décisions de
+# production (`background::plan_du_tour`, `consent::contribution_autorisee`) :
+# débrancher la conduite le fait rougir. `autotests = false` plus haut : sans
+# cette cible, le fichier ne serait JAMAIS compilé, donc vert contre rien.
+[[test]]
+name = "refus_telemetrie_honore_3383"
+path = "tests/refus_telemetrie_honore_3383.rs"
+
+# #3322 : `output_capabilities.channel_layouts` était déclaré, publié, et vide
+# sur les 14 zones — `v1()` le posait à `Vec::new()` et aucun builder ne
+# permettait de l'écrire. Le témoin passe par les DEUX routes de zone puis par
+# `output_capabilities_avec`, l'appel de production commun. `autotests = false`
+# plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, donc vert
+# contre rien.
+[[test]]
+name = "dispositions_de_canaux_3322"
+path = "tests/dispositions_de_canaux_3322.rs"
+
+# #3462 — la garde qui verifie qu'un SlimProto mort au demarrage apparait dans
+# la grille de composants de `/system/health`, celle que trois ecrans affichent
+# deja. Fichier a part : `etat_ecoute()` est un etat GLOBAL au processus, le
+# poser depuis un test contaminerait tous les autres tests du meme binaire.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+[[test]]
+name = "sante_slimproto_i3462"
+path = "tests/sante_slimproto_i3462.rs"
+
+# #2718 — « plus de serveurs multimedia ». La fiche support et le rapport de
+# bogue decrivaient les zones jusqu'au modele du DAC et ne comptaient PAS les
+# serveurs multimedia : quatre tickets (61, 87, 97, 98) instruits sans jamais
+# pouvoir dire combien Tune en voyait. Le temoin passe par les ROUTES MONTEES.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+[[test]]
+name = "serveurs_multimedia_dans_la_fiche_2718"
+path = "tests/serveurs_multimedia_dans_la_fiche_2718.rs"
+
+# #3518 : « # Plays » et « Last Played », deux colonnes de la maquette V1 que
+# AUCUNE route de liste de pistes ne portait. La garde passe par le ROUTEUR
+# MONTE : un essai qui appellerait `plays_for_tracks` en direct resterait vert
+# alors meme que la route ne l'appelle pas — le defaut « ecrit mais pas
+# branche » que ce depot connait par coeur. `autotests = false` plus haut :
+# sans cette cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+[[test]]
+name = "ecoutes_par_piste_3518"
+path = "tests/ecoutes_par_piste_3518.rs"
+
+# #3789 : les MEMES trois colonnes, mais sur `/library/search`, qui ne passait
+# par aucun des deux enrichissements. Meme discipline que #3518 — la garde
+# interroge la ROUTE MONTEE et lit la charge JSON reellement rendue, pas la
+# fonction qui la fabrique. `autotests = false` plus haut : sans cette cible,
+# le fichier ne serait JAMAIS compile, donc vert contre rien.
+[[test]]
+name = "recherche_pistes_enrichies_3789"
+path = "tests/recherche_pistes_enrichies_3789.rs"
+
+# #1361 — « Retour à l'album en cours » : la route qui dit quel album jouer
+# rouvrir, et chez qui. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
+[[test]]
+name = "album_en_cours_1361"
+path = "tests/album_en_cours_1361.rs"
+# #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
+# que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
+# une variable d'environnement que plus aucune etape ne pose. `autotests =
+# false` plus haut : sans cette cible, la garde des gardes ne serait elle-meme
+# jamais compilee — la panne exacte qu'elle refuse.
+#
+# Pas de `required-features` : elle ne lit que des fichiers du depot (manifestes,
+# sources, workflows) et doit tourner sur CHAQUE porte `cargo test -p
+# tune-server`, y compris la plus etroite.
+[[test]]
+name = "derive_des_garde_fous_2816"
+path = "tests/derive_des_garde_fous_2816.rs"
+# #3529 : le recensement des chemins qui creent une zone. Il lit la SOURCE de
+# `tune-server/src` et echoue sur tout site nouveau qui ne consulte pas
+# « Creer automatiquement les zones ». Cible a elle seule parce qu'elle ne
+# monte aucun `AppState` et n'a besoin d'aucune feature — et `autotests = false`
+# plus haut : sans cette entree, le fichier ne serait JAMAIS compile, donc vert
+# contre rien.
+[[test]]
+name = "zones_auto_create_recension"
+path = "tests/zones_auto_create_recension.rs"
+
+# #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
+# rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
+# jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
+# rien ne gardait la VALEUR (`max_limit` partait tel quel dans `LIMIT {n}` : `0`
+# vidait la collection, un negatif faisait diverger SQLite et PostgreSQL). Le
+# temoin passe par les ROUTES MONTEES. `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait JAMAIS compile, donc vert contre rien.
+#
+# Posée ICI, au milieu du fichier, et non à la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent à chaque fois.
+[[test]]
+name = "borne_smart_collections_2732"
+path = "tests/borne_smart_collections_2732.rs"

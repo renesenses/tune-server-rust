@@ -8,7 +8,7 @@ use tune_core::discovery::renderer_identity::{
     IdentityVerdict, RendererIdentity, compare_at_same_location,
 };
 use tune_core::outputs::OutputRegistry;
-use tune_core::outputs::oh_events::OpenHomeEventListener;
+use tune_core::outputs::oh_events::UpnpEventListener;
 
 use tune_core::event_bus::EventBus;
 use tune_core::event_types::EventType;
@@ -26,7 +26,36 @@ use crate::state::AppState;
 /// token became `PORThttp`, the URL failed to parse, and every SOAP call died with
 /// `soap send: builder error` (Yves: no sound, UI stuck on "loading title"). This
 /// mirrors the MediaServer handling in `ssdp.rs`.
-fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
+/// Les deux services DLNA dont Tune sait lire les évènements : l'état du
+/// transport et le volume. Le `ConnectionManager` n'a rien à pousser qui nous
+/// intéresse — s'y abonner coûterait un renouvellement toutes les 250 s pour
+/// rien.
+pub(crate) const SERVICES_EVENEMENTS_DLNA: [&str; 2] = ["avtransport", "renderingcontrol"];
+
+/// `eventSubURL` absolues des services abonnables, à partir des chemins bruts
+/// du descripteur.
+///
+/// Passe par [`resolve_control_url`] pour la MÊME raison que les `controlURL` :
+/// une radio Frontier Silicon (Ruark, Stream 94i) publie des URL déjà absolues,
+/// que concaténer à `host:port` rendrait injoignables. Le piège avait déjà
+/// mordu sur les URL de contrôle ; le corriger d'un seul côté l'aurait
+/// simplement déplacé.
+pub(crate) fn urls_evenements_dlna(
+    host: &str,
+    port: u16,
+    brut: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    SERVICES_EVENEMENTS_DLNA
+        .iter()
+        .filter_map(|svc| {
+            brut.get(*svc)
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| ((*svc).to_string(), resolve_control_url(host, port, p)))
+        })
+        .collect()
+}
+
+pub(crate) fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
     if control_url.starts_with("http://") || control_url.starts_with("https://") {
         control_url.to_string()
     } else {
@@ -286,7 +315,7 @@ fn persist_known_renderer(
 pub fn spawn_ssdp_handler(
     state: &AppState,
     config: &TuneConfig,
-    oh_listener: Option<Arc<OpenHomeEventListener>>,
+    oh_listener: Option<Arc<UpnpEventListener>>,
 ) {
     let (ssdp_tx, mut ssdp_rx) = tokio::sync::mpsc::channel(64);
     {
@@ -350,6 +379,37 @@ pub fn spawn_ssdp_handler(
                     info!(id = %id, kept_registered = soap_wakeable, "device_lost_zone_offline");
                 }
                 SsdpEvent::MediaServerDiscovered(ms) => {
+                    // Notre propre MediaServer : on ne se range pas dans sa
+                    // propre liste de serveurs du reseau (#3688). Le meme
+                    // rideau que pour les renderers, sur le chemin jumeau qui
+                    // n'en avait aucun.
+                    let notre_udn = tune_core::upnp_server::media_server_advert().map(|a| a.uuid);
+                    if est_notre_propre_serveur_multimedia(
+                        &ms,
+                        config.port,
+                        &nos_adresses(config.advertised_ip.as_deref()),
+                        notre_udn.as_deref(),
+                    ) {
+                        // INFO, pas DEBUG : ce rideau RETIRE une entree de la
+                        // liste « Serveurs multimedia » que le testeur voit.
+                        // Le journal du ticket support 61 montre Tune lui-meme
+                        // enregistre comme serveur multimedia et presente dans
+                        // sa liste (`media_server_registered`
+                        // id=uuid:c4467384-…, 0.9.119) ; le ticket 97 dit qu'il
+                        // lisait « depuis le nas freebox ET DEPUIS TUNE ».
+                        // Depuis #3688 cette entree disparait — a raison ou
+                        // non, ce n'est pas la question ici. Sous DEBUG, un
+                        // testeur qui redit « plus de serveurs multimedia »
+                        // joindrait un journal qui n'en porte pas la trace, et
+                        // l'instruction repartirait a zero comme pour #2718.
+                        info!(
+                            id = %ms.id,
+                            name = %ms.name,
+                            location = %ms.location,
+                            "ssdp_notre_propre_serveur_multimedia_ignore"
+                        );
+                        continue;
+                    }
                     let id = ms.id.clone();
                     media_servers.lock().await.insert(id.clone(), ms);
                     info!(id = %id, "media_server_registered");
@@ -466,13 +526,67 @@ fn est_un_de_nos_udn_de_facade(db: &Arc<dyn DbBackend>, device_id: &str) -> bool
     !device_id.is_empty() && nos_udn_de_facade(db).iter().any(|u| u == device_id)
 }
 
+/// Reconnaitre notre PROPRE serveur multimedia dans une annonce SSDP.
+///
+/// Le troisieme rideau. Les deux premiers — [`est_notre_propre_renderer`]
+/// (#2101, #2202) et [`est_un_de_nos_udn_de_facade`] (#2410) — ne gardent que
+/// le chemin `SsdpEvent::DeviceDiscovered`, celui des RENDERERS. Le chemin
+/// jumeau `SsdpEvent::MediaServerDiscovered` n'en avait aucun : il inserait
+/// dans le registre `media_servers` tout ce que le scanner lui donnait.
+///
+/// Or Tune publie AUSSI un MediaServer, et il l'annonce sur le meme groupe
+/// multicast que les appareils du reseau (`upnp_server::spawn_ssdp_advertiser`,
+/// `LOCATION` = [`tune_core::upnp_server::advert_location`]). Son propre
+/// ecouteur SSDP recoit cette annonce — et, depuis #1750, repond meme a ses
+/// propres M-SEARCH. Le serveur se rangeait donc dans sa propre liste de
+/// serveurs multimedia : « Tune Server » apparaissait dans Reglages > Serveurs
+/// multimedia comme un voisin, navigable par UPnP, alors que c'est la
+/// bibliotheque deja ouverte a l'ecran.
+///
+/// ⚠️ Ce rideau ne cree ni ne supprime aucune zone : un serveur multimedia
+/// n'est pas une sortie. Il ne repare donc PAS les zones fantomes deja
+/// persistees chez les testeurs de #3688 — voir le corps de la PR.
+///
+/// Les deux criteres, dans cet ordre, et pour la meme raison qu'au rideau des
+/// facades : l'UDN d'abord, parce qu'il ne depend d'aucune enumeration
+/// d'interfaces et survit a un `LOCATION` porte par un nom d'hote ; l'adresse
+/// ensuite, pour le cas ou l'annonceur n'a pas encore publie son UDN.
+///
+/// Et, comme pour les renderers, le test porte sur les TROIS a la fois —
+/// chemin de montage, port d'API, adresse locale. Le chemin et le port seuls
+/// ecarteraient aussi le MediaServer d'un AUTRE Tune du reseau, qui est, lui,
+/// un serveur parfaitement navigable : c'est nous qu'il faut exclure, pas nos
+/// semblables.
+fn est_notre_propre_serveur_multimedia(
+    ms: &tune_core::discovery::ssdp::MediaServerInfo,
+    port_api: u16,
+    nos_adresses: &[String],
+    notre_udn: Option<&str>,
+) -> bool {
+    if let Some(udn) = notre_udn
+        && !udn.is_empty()
+        && ms.id == udn
+    {
+        return true;
+    }
+    if ms.port != port_api {
+        return false;
+    }
+    let notre_mount = format!("{}/description.xml", tune_core::upnp_server::MOUNT_PATH);
+    if !ms.location.ends_with(&notre_mount) {
+        return false;
+    }
+    !ms.host.is_empty() && nos_adresses.iter().any(|a| a == &ms.host)
+}
+
 /// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et
 /// les formes locales, qu'un M-SEARCH émis depuis la machine elle-même peut
 /// nous renvoyer.
-fn nos_adresses() -> Vec<String> {
+fn nos_adresses(annoncee: Option<&str>) -> Vec<String> {
     nos_adresses_depuis(
         &tune_core::discovery::ssdp::local_ipv4_addresses(),
         tune_core::discovery::ssdp::get_local_ip(),
+        annoncee,
     )
 }
 
@@ -487,12 +601,31 @@ fn nos_adresses() -> Vec<String> {
 fn nos_adresses_depuis(
     interfaces: &[std::net::Ipv4Addr],
     elue: Option<std::net::Ipv4Addr>,
+    annoncee: Option<&str>,
 ) -> Vec<String> {
     let mut v = vec!["127.0.0.1".to_string(), "localhost".to_string()];
     for ip in interfaces.iter().copied().chain(elue) {
         let s = ip.to_string();
         if !v.contains(&s) {
             v.push(s);
+        }
+    }
+    // #3867 — l'adresse ANNONCEE est une reponse de plus a « quelle est mon
+    // adresse ? », et c'est celle que nos annonces portent reellement :
+    // `upnp_server::current_advert_ip` et `upnp_renderer` publient
+    // `advertised_ip` quand il est pose, PAS l'adresse elue par la sonde UDP.
+    // Elle n'a aucune raison de figurer dans `local_ipv4_addresses()` — c'est
+    // meme son objet : on la pose justement quand l'autodetection se trompe
+    // (multi-domicilie, VPN, pont Docker, NAT de conteneur).
+    //
+    // Sans elle, nos propres annonces reviennent sous une adresse que nous ne
+    // reconnaissons pas : le rideau `est_notre_propre_renderer` laisse passer
+    // nos facades, et Tune se recree ses zones « {zone} (Tune) » — le defaut
+    // meme de #3688, rouvert par le seul fait d'avoir configure une adresse.
+    if let Some(ip) = annoncee.map(str::trim).filter(|ip| !ip.is_empty()) {
+        let ip = ip.to_string();
+        if !v.contains(&ip) {
+            v.push(ip);
         }
     }
     v
@@ -525,7 +658,7 @@ async fn handle_ssdp_discovered(
     db: &Arc<dyn DbBackend>,
     config: &TuneConfig,
     event_bus: &Arc<tune_core::event_bus::EventBus>,
-    oh_listener: &Option<Arc<OpenHomeEventListener>>,
+    oh_listener: &Option<Arc<UpnpEventListener>>,
     playback: &Arc<tune_core::playback::PlaybackManager>,
     _license: &Arc<tune_core::license::LicenseManager>,
     seen_hosts: &mut std::collections::HashSet<String>,
@@ -538,7 +671,12 @@ async fn handle_ssdp_discovered(
 
     // Nos propres zones publiées : on ne se découvre pas soi-même.
     if let Some(loc) = dev.location.as_deref()
-        && est_notre_propre_renderer(loc, dev.port, config.port, &nos_adresses())
+        && est_notre_propre_renderer(
+            loc,
+            dev.port,
+            config.port,
+            &nos_adresses(config.advertised_ip.as_deref()),
+        )
     {
         debug!(
             id = %dev.id,
@@ -646,6 +784,14 @@ async fn handle_ssdp_discovered(
                 );
             }
             let delay = crate::config::resolve_play_delay(db, config, &dev.id, &dev.name);
+            let evt_urls = dev
+                .capabilities
+                .get("event_sub_urls")
+                .and_then(|v| {
+                    serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone())
+                        .ok()
+                })
+                .unwrap_or_default();
             let dlna = tune_core::outputs::dlna::DlnaOutput::new(
                 dev.name.clone(),
                 dev.id.clone(),
@@ -654,7 +800,12 @@ async fn handle_ssdp_discovered(
                 rc,
                 cm_url,
             )
-            .with_play_delay(delay);
+            .with_play_delay(delay)
+            .with_upnp_events(
+                oh_listener.clone(),
+                urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
+            )
+            .with_upnp_silence(crate::config::resolve_upnp_silence(db, &dev.id));
             let mut reg = outputs.lock().await;
             register_discovered_output(
                 &mut reg,
@@ -723,7 +874,7 @@ async fn handle_ssdp_discovered(
         seen_hosts.insert(dev.host.clone());
         set_zone_online(event_bus, db, &dev.id, true);
         if let Some(zone_id) = zone.id {
-            let vol = zone.volume as f64 / 100.0;
+            let vol = zone.volume / 100.0;
             playback.set_volume(zone_id, vol).await;
             // Backfill the host on zones created before host-based dedup existed,
             // so a later UUID change (Denon restart) can reconnect by host (#942).
@@ -754,7 +905,7 @@ async fn handle_ssdp_discovered(
             .get(existing_zone_id)
             .ok()
             .flatten()
-            .map(|z| z.volume as f64 / 100.0);
+            .map(|z| z.volume / 100.0);
         if let Some(vol) = vol {
             playback.set_volume(existing_zone_id, vol).await;
         }
@@ -774,13 +925,10 @@ async fn handle_ssdp_discovered(
             }),
         );
     } else if !is_tv {
-        // Check zone_auto_create setting
-        let auto_create = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
-            .get("zone_auto_create")
-            .ok()
-            .flatten()
-            .map(|v| v != "false")
-            .unwrap_or(true);
+        // Check zone_auto_create setting — #3529 : lecture unique, portée par
+        // `ZoneRepo`. Elle était recopiée mot pour mot en cinq endroits, ce
+        // qui a permis à cinq autres chemins de ne jamais la recopier.
+        let auto_create = zone_repo.zone_auto_create_autorise();
         if !auto_create {
             info!(name = %dev.name, id = %dev.id, "ssdp_zone_auto_create_disabled_skipping");
             return;
@@ -880,6 +1028,19 @@ async fn handle_ssdp_discovered(
                 // Persist host + MAC so a later UUID change, protocol change
                 // or DHCP renumbering reconnects here (#942, #1239).
                 let _ = zone_repo.set_identity(zid, &dev.host, dev.mac_address.as_deref());
+                // #3589 — « à la découverte d'un appareil reconnu ». C'est
+                // ICI, et à la création manuelle, que « personne n'a rien
+                // réglé » est vrai par construction : la zone n'existait pas
+                // il y a une ligne. La provenance s'ouvre AVANT, sinon la
+                // préconfiguration refuse d'agir — c'est voulu.
+                crate::routes::zones::ouvrir_provenance_de_zone(db, zid);
+                crate::routes::zones::preconfigurer_zone_decouverte(
+                    db,
+                    zid,
+                    dev.manufacturer.as_deref(),
+                    dev.model.as_deref(),
+                    Some(type_str),
+                );
                 event_bus.emit_typed(
                     EventType::ZoneCreated,
                     charge_utile_zone_creee(
@@ -905,6 +1066,35 @@ async fn handle_ssdp_discovered(
             }
         }
     }
+}
+
+/// Borne d'une sonde de renderer connu au démarrage. Un appareil éteint ne
+/// doit pas retenir les autres : avant LAT-Z2 chaque timeout s'insérait devant
+/// les suivants, le démarrage sondait un par un.
+const SONDE_RENDERER_BORNE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sonde tous les renderers connus EN MÊME TEMPS, chacun borné, et rend les
+/// résultats dans l'ordre reçu — l'appelant applique ensuite séquentiellement.
+/// La durée totale est celle de la sonde la plus lente, plus la borne au pire,
+/// et non la somme.
+async fn sonder_les_renderers_en_parallele(
+    renderers: Vec<KnownRenderer>,
+    borne: std::time::Duration,
+) -> Vec<(
+    KnownRenderer,
+    Option<tune_core::discovery::device::DiscoveredDevice>,
+)> {
+    futures_util::future::join_all(renderers.into_iter().map(|kr| async move {
+        let sonde = tokio::time::timeout(
+            borne,
+            tune_core::discovery::ssdp::probe_renderer(&kr.device_id, &kr.location),
+        )
+        .await
+        .ok()
+        .flatten();
+        (kr, sonde)
+    }))
+    .await
 }
 
 /// Re-probe every persisted renderer at startup and re-register the reachable
@@ -934,7 +1124,7 @@ pub async fn reregister_known_renderers(state: &AppState) {
     // continuerait à sonder nos propres adresses à chaque démarrage, pour des
     // zones souvent supprimées depuis. Le magasin se soigne, comme il le fait
     // déjà pour les doublons par UDN.
-    let a_nous = nos_adresses();
+    let a_nous = nos_adresses(state.config.advertised_ip.as_deref());
     let port_api = state.config.port;
     let stored_len = stored.len();
     let stored: Vec<KnownRenderer> = stored
@@ -963,20 +1153,29 @@ pub async fn reregister_known_renderers(state: &AppState) {
     }
     info!(count = renderers.len(), "reregistering_known_renderers");
 
-    // No OpenHome event listener here: the live SSDP handler's listener isn't
-    // reachable from AppState, and creating a second one would race it for the
-    // fixed :8890 bind at boot (`OpenHomeEventListener::new` falls back to an
-    // ephemeral port when 8890 is taken) — a subtle regression on the primary
-    // listener. DLNA renderers (the #1126 case, e.g. Cyrus Stream X2) ignore the
-    // listener entirely; an OpenHome renderer re-attached here gets its push
-    // events back on its next SSDP advertise (which re-registers it with the real
-    // listener) and polls its state until then.
-    let oh_listener: Option<Arc<OpenHomeEventListener>> = None;
+    // LE récepteur du processus, pas un second.
+    //
+    // Ce chemin s'en passait : celui du gestionnaire SSDP n'était pas
+    // atteignable depuis `AppState`, et en créer un autre aurait couru contre
+    // lui pour le port fixe 8890 (`UpnpEventListener::new` retombe alors sur un
+    // port éphémère). L'argument tenait tant que DLNA ignorait les évènements ;
+    // depuis #2263 il ne les ignore plus, et un renderer récupéré ICI — le cas
+    // #1126, le Cyrus Stream X2 qui ne répond plus au multicast après un
+    // redémarrage — serait resté le seul à sonder à trois actions par seconde.
+    // `create_oh_listener` est mémoïsé : il rend le récepteur déjà en place, ou
+    // le crée si ce chemin arrive le premier.
+    let oh_listener: Option<Arc<UpnpEventListener>> = crate::startup::create_oh_listener().await;
 
     let mut seen_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut recovered = 0usize;
-    for kr in renderers {
-        match tune_core::discovery::ssdp::probe_renderer(&kr.device_id, &kr.location).await {
+    // LAT-Z2 : les sondes partent toutes ensemble, chacune bornée, et le
+    // résultat revient dans l'ordre du magasin. L'application (identité,
+    // enregistrement, déduplicat par hôte) reste séquentielle et
+    // déterministe : deux registres de renderers persistés coexistent, avec
+    // des verdicts d'identité qui ne doivent pas courir l'un contre l'autre.
+    let sondes = sonder_les_renderers_en_parallele(renderers, SONDE_RENDERER_BORNE).await;
+    for (kr, sonde) in sondes {
+        match sonde {
             Some(dev) => {
                 // `dev.id` est l'identifiant qu'on VIENT de passer en argument :
                 // `build_renderer_device` le recopie tel quel. Le comparer à
@@ -1090,6 +1289,10 @@ pub fn spawn_mdns_handler(
             .with_bluos()
             .with_oaat()
             .with_squeezebox()
+            // Lecteurs Sendspin (#3326, phase 1). On les PARCOURT sans jamais
+            // enregistrer de sortie : voir le bras `OutputType::Sendspin` du
+            // `match` ci-dessous.
+            .with_sendspin()
             // Browse peer Tune servers too, so this server can list the other
             // Tune servers on the network (#1273). Each server already announces
             // itself via `register_self`; without this it never browsed back.
@@ -1103,6 +1306,13 @@ pub fn spawn_mdns_handler(
             .unwrap_or(8888u16);
         if let Err(e) = mdns.register_self(port, tune_core::version()) {
             tracing::warn!(error = %e, "mdns_register_self_failed");
+        }
+        // #3326 S2-a — l'autre moitié de la découverte Sendspin. La
+        // spécification exige du serveur qu'il supporte les DEUX modes ; la
+        // phase 1 ne parcourait que le premier. Une annonce qui échoue ne doit
+        // pas empêcher le reste de la découverte de démarrer.
+        if let Err(e) = mdns.register_sendspin_server(port) {
+            tracing::warn!(error = %e, "mdns_register_sendspin_server_failed");
         }
         // Publish the scanner so routes (`/peers`, `/system/discover-servers`)
         // can list the discovered peers. AppState keeps it alive for the whole
@@ -1259,9 +1469,45 @@ pub fn spawn_mdns_handler(
                                 settings.set("lms_host", &lms_addr).ok();
                                 settings.set("squeezebox_host", &lms_addr).ok();
                                 settings.set("squeezebox_enabled", "true").ok();
+                                // On mémorise l'ADRESSE trouvée, pas un simple
+                                // « oui » : le panneau des réglages n'affiche
+                                // « Auto-détecté : … » que si l'adresse en
+                                // vigueur est encore celle-là. Un drapeau
+                                // booléen resterait vrai après une saisie
+                                // manuelle, et il faudrait l'effacer depuis la
+                                // route de configuration générique — un second
+                                // écrivain, donc un second endroit à oublier
+                                // (#2066).
+                                settings.set("lms_host_auto", &lms_addr).ok();
                                 info!(host = %lms_addr, "mdns_lms_discovered_auto_configured");
                             }
                             (None, "squeezebox")
+                        }
+                        // Sendspin (#3326) — phase 1 : DÉCOUVERTE SEULE.
+                        //
+                        // On rend `None` volontairement. Tout ce qui suit dans
+                        // cette boucle — enregistrement de la sortie,
+                        // reconnexion, création automatique de zone, montée en
+                        // priorité — est gardé par `if let Some(output)` :
+                        // aucune zone Sendspin ne peut donc naître, et aucune
+                        // zone existante ne peut être capturée par une annonce
+                        // Sendspin. C'est exactement ce qu'on veut tant que la
+                        // lecture n'existe pas : un appareil visible, jamais un
+                        // appareil qui promet.
+                        //
+                        // La liste, elle, est servie par `GET /devices/sendspin`.
+                        OutputType::Sendspin => {
+                            info!(
+                                name = %dev.name,
+                                host = %dev.host,
+                                port = dev.port,
+                                path = ?dev
+                                    .capabilities
+                                    .get(tune_core::discovery::sendspin::CLE_CHEMIN)
+                                    .and_then(|v| v.as_str()),
+                                "sendspin_lecteur_decouvert_sans_sortie"
+                            );
+                            (None, "sendspin")
                         }
                         _ => (None, ""),
                     };
@@ -1319,7 +1565,7 @@ pub fn spawn_mdns_handler(
                         } else if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
                             set_zone_online(&event_bus, &db, &dev.id, true);
                             if let Some(zone_id) = zone.id {
-                                let vol = zone.volume as f64 / 100.0;
+                                let vol = zone.volume / 100.0;
                                 playback.set_volume(zone_id, vol).await;
                             }
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
@@ -1421,6 +1667,40 @@ pub fn spawn_mdns_handler(
                                     // operant des le tour suivant.
                                     let _ = zone_repo.update_output_device(zid, &dev.id);
                                     info!(name = %dev.name, id = %dev.id, zone_id = zid, "mdns_hidden_zone_reanchored");
+                                } else if let Some((zid, masquee)) = zone_reseau_a_reancrer_par_mac(
+                                    &zone_repo,
+                                    &dev,
+                                    output_type_str,
+                                ) {
+                                    // #3919 — les trois filets par NOM viennent
+                                    // d'echouer ensemble : la zone a ete
+                                    // renommee. Sans ce quatrieme, le flux
+                                    // tombe dans `auto_create` et laisse les
+                                    // reglages sur une ligne orpheline. La MAC,
+                                    // elle, n'a pas bouge.
+                                    //
+                                    // Une zone SUPPRIMEE se re-ancre sans se
+                                    // demasquer, comme au-dessus : la
+                                    // suppression reste une suppression, et le
+                                    // garde-fou `is_device_hidden` redevient
+                                    // operant des le tour suivant.
+                                    let _ = zone_repo.update_output_device(zid, &dev.id);
+                                    let _ = zone_repo.set_identity(
+                                        zid,
+                                        &dev.host,
+                                        dev.mac_address.as_deref(),
+                                    );
+                                    if !masquee {
+                                        set_zone_online(&event_bus, &db, &dev.id, true);
+                                    }
+                                    info!(
+                                        name = %dev.name,
+                                        id = %dev.id,
+                                        zone_id = zid,
+                                        hidden = masquee,
+                                        mac = ?dev.mac_address,
+                                        "mdns_zone_reancree_par_mac"
+                                    );
                                 } else {
                                     // Cross-protocol dedup (forum #1183): the
                                     // same physical device may already be a
@@ -1460,16 +1740,9 @@ pub fn spawn_mdns_handler(
                                             "mdns_zone_skipped_conflicting_protocol"
                                         );
                                     } else {
-                                        // Check zone_auto_create setting
-                                        let auto_create =
-                                        tune_core::db::settings_repo::SettingsRepo::with_backend(
-                                            db.clone(),
-                                        )
-                                        .get("zone_auto_create")
-                                        .ok()
-                                        .flatten()
-                                        .map(|v| v != "false")
-                                        .unwrap_or(true);
+                                        // Check zone_auto_create setting (#3529 :
+                                        // lecture unique, portée par `ZoneRepo`).
+                                        let auto_create = zone_repo.zone_auto_create_autorise();
                                         if !auto_create {
                                             info!(name = %dev.name, id = %dev.id, "mdns_zone_auto_create_disabled_skipping");
                                         } else {
@@ -1782,6 +2055,104 @@ fn may_reanchor(
     legacy_id != new_id && !new_id_taken && zone_name == dev_name
 }
 
+/// Le QUATRIEME filet de re-ancrage : la MAC que la zone porte deja (#3919).
+///
+/// ## Ce qu'il repare
+///
+/// Les trois filets precedents reposent tous, sans exception, sur une egalite
+/// EXACTE de noms : [`may_reanchor`] exige `zone_name == dev_name`, le
+/// rattrapage cherche `z.name == dev.name`, et `find_hidden_id_by_name`
+/// interroge la colonne `name`. Renommer une zone — le geste que tout le monde
+/// fait — les met les trois en defaut D'UN COUP. Au changement d'adresse
+/// suivant, un appareil qui n'annonce aucun identifiant durable (`_raop` ne
+/// publie pas de TXT `deviceid`) se voit offrir une zone NEUVE, et les
+/// reglages restent sur une ligne que plus rien ne relie a l'appareil.
+/// Reproduit de bout en bout sur 0.9.145 : deux lignes pour un seul Mac.
+///
+/// L'identite manquante etait DEJA sur la ligne. `zones.mac` est ecrite a la
+/// creation de la zone par `set_identity`, depuis `dev.mac_address` — pour
+/// l'AirPlay la MAC portee par le nom d'instance `_raop`
+/// (« 764D00C0BD51@Mac Studio »), sinon le TXT `deviceid`/`id`, a defaut la
+/// table ARP. La documentation de `set_identity` la nomme elle-meme « the
+/// durable cross-protocol key: it survives UUID changes AND DHCP
+/// renumbering ». Personne ne la relisait au retour de l'appareil : c'est un
+/// « ecrit mais pas branche », pas un mecanisme absent.
+///
+/// ## Pourquoi la MAC est recevable la ou l'adresse ne l'est pas
+///
+/// La regle de `outputs::identite_de_sortie` s'applique mot pour mot : **un
+/// identifiant qui peut designer un autre appareil physique n'identifie
+/// rien**. `{type}-{host}-{port}` le peut — le 13 aout, le DHCP a donne
+/// l'adresse d'une Apple TV a un Sonos et la zone a suivi. Une MAC, non : un
+/// OUI constructeur est globalement unique, et une MAC localement administree
+/// (Private Wi-Fi Address) est CHOISIE par l'appareil, jamais attribuee a un
+/// tiers. Elle peut changer — faux negatif, on retombe sur l'etat d'avant —
+/// elle ne peut pas pointer ailleurs. C'est l'asymetrie qui tranche, et elle
+/// repond a #1651 par le fond : si le Sonos a pris l'adresse de l'Apple TV,
+/// il annonce SA MAC, la zone « AppleTV14,1 » ne bouge pas.
+///
+/// ## Les quatre refus, chacun nomme
+///
+/// 1. **`nouvel_id_deja_pris`** — l'appareil a deja sa zone sous ce nouvel
+///    identifiant. En deplacer une seconde dessus partagerait la clef, et
+///    l'index unique partiel `idx_zones_output_device_id` la refuserait.
+/// 2. **Un autre protocole** — un Eversolo DMP-A8 est DLNA *et* AirPlay :
+///    deux sorties REELLES pour une seule MAC. Les reunir serait une FUSION
+///    de zones, pas une re-association (#3747).
+/// 3. **Plusieurs zones du meme type sur cette MAC** — les departager serait
+///    un tirage au sort.
+/// 4. **`type_decouvert` vide** — sans type, la comparaison ne distingue
+///    plus rien et rapprocherait n'importe quelle ligne a `output_type` NULL.
+///
+/// ## Ou il se place, et pourquoi la
+///
+/// APRES les trois filets par nom, AVANT le refus pour conflit de protocole
+/// et la creation automatique : il ne prend donc jamais la place d'un
+/// rattrapage qui fonctionne aujourd'hui, il n'agit que la ou le flux allait
+/// creer un doublon ou ne rien faire du tout.
+fn zone_a_reancrer_par_mac(
+    candidats: &[tune_core::db::zone_repo::ZoneParMac],
+    nouvel_id: &str,
+    nouvel_id_deja_pris: bool,
+    type_decouvert: &str,
+) -> Option<(i64, bool)> {
+    if nouvel_id_deja_pris || type_decouvert.is_empty() {
+        return None;
+    }
+    let mut du_bon_type = candidats.iter().filter(|z| {
+        z.output_type.eq_ignore_ascii_case(type_decouvert) && z.output_device_id != nouvel_id
+    });
+    let seule = du_bon_type.next()?;
+    if du_bon_type.next().is_some() {
+        return None;
+    }
+    Some((seule.id, seule.masquee))
+}
+
+/// [`zone_a_reancrer_par_mac`] branchee sur la base — meme partage que
+/// `legacy_zone_to_reanchor` / `may_reanchor` : la regle reste pure et
+/// eprouvable, la base ne fait qu'apporter les candidats.
+///
+/// `normalize_mac` sert ici de VALIDATION autant que de canonicalisation :
+/// `dev.mac_address` peut porter un identifiant opaque qui n'est pas une MAC
+/// (le TXT `id` d'un Chromecast est un UUID, et la table ARP peut n'avoir rien
+/// rendu). Un tel identifiant ne passe pas la regle du module, donc le filet
+/// ne s'arme pas — et ces appareils-la annoncent de toute facon un
+/// `stable_id`, donc un `output_device_id` qui ne contient aucune adresse.
+fn zone_reseau_a_reancrer_par_mac(
+    zone_repo: &tune_core::db::zone_repo::ZoneRepo,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+    type_decouvert: &str,
+) -> Option<(i64, bool)> {
+    let mac = tune_core::discovery::mac::normalize_mac(dev.mac_address.as_deref()?)?;
+    let candidats = zone_repo.zones_par_mac(&mac);
+    if candidats.is_empty() {
+        return None;
+    }
+    let deja_pris = matches!(zone_repo.get_by_device_id(&dev.id), Ok(Some(_)));
+    zone_a_reancrer_par_mac(&candidats, &dev.id, deja_pris, type_decouvert)
+}
+
 /// Pourquoi chaque fournisseur de sortie hors-arbre est actif ou inerte.
 ///
 /// #2392 : un module payant sans droit se retirait sans un mot. Vu de
@@ -1920,7 +2291,7 @@ pub fn spawn_output_providers(
                     if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev_id) {
                         set_zone_online(&event_bus, &db, &dev_id, true);
                         if let Some(zone_id) = zone.id {
-                            let vol = zone.volume as f64 / 100.0;
+                            let vol = zone.volume / 100.0;
                             playback.set_volume(zone_id, vol).await;
                         }
                         info!(name = %name, id = %dev_id, "provider_zone_reconnected");
@@ -1943,15 +2314,8 @@ pub fn spawn_output_providers(
                             set_zone_online(&event_bus, &db, &dev_id, true);
                             info!(name = %name, id = %dev_id, old_id = ?z.output_device_id, "provider_zone_device_updated");
                         } else {
-                            let auto_create =
-                                tune_core::db::settings_repo::SettingsRepo::with_backend(
-                                    db.clone(),
-                                )
-                                .get("zone_auto_create")
-                                .ok()
-                                .flatten()
-                                .map(|v| v != "false")
-                                .unwrap_or(true);
+                            // #3529 : lecture unique, portée par `ZoneRepo`.
+                            let auto_create = zone_repo.zone_auto_create_autorise();
                             if !auto_create {
                                 info!(name = %name, id = %dev_id, "provider_zone_auto_create_disabled_skipping");
                             } else {
@@ -2086,12 +2450,128 @@ fn refus_nommes(instantane: &serde_json::Value) -> Vec<(String, String, String)>
         .unwrap_or_default()
 }
 
+/// Écart minimal entre deux recherches SSDP déclenchées par la connexion d'un
+/// client (LAT-Z3). Même valeur que la cadence courte du scanner : un client
+/// qui se reconnecte en boucle ne doit pas transformer le réseau en rafale de
+/// M-SEARCH.
+const RECHERCHE_A_LA_CONNEXION_ECART_MIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Dernière recherche déclenchée par une connexion ; partagée par tous les
+/// clients — c'est le réseau qu'on protège, pas chaque client.
+static DERNIERE_RECHERCHE_A_LA_CONNEXION: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Une recherche est due si aucune n'est partie, ou si la dernière remonte à
+/// au moins `ecart_min`.
+fn recherche_due(
+    derniere: Option<std::time::Instant>,
+    maintenant: std::time::Instant,
+    ecart_min: std::time::Duration,
+) -> bool {
+    derniere.is_none_or(|d| maintenant.duration_since(d) >= ecart_min)
+}
+
+/// Réserve la fenêtre : rend `true` et note l'instant si une recherche est due,
+/// `false` sinon. Deux clients qui se connectent ensemble n'en déclenchent
+/// qu'une.
+fn reserver_la_recherche(
+    verrou: &std::sync::Mutex<Option<std::time::Instant>>,
+    ecart_min: std::time::Duration,
+) -> bool {
+    let maintenant = std::time::Instant::now();
+    let mut derniere = verrou.lock().unwrap_or_else(|e| e.into_inner());
+    if recherche_due(*derniere, maintenant, ecart_min) {
+        *derniere = Some(maintenant);
+        true
+    } else {
+        false
+    }
+}
+
+/// LAT-Z3 : un client qui se connecte veut voir ses appareils tout de suite,
+/// pas au prochain tour du scanner (30 à 120 s). On lance une recherche SSDP
+/// en tâche détachée — la connexion ne l'attend pas — au plus une par
+/// [`RECHERCHE_A_LA_CONNEXION_ECART_MIN`]. Les réponses passent par le même
+/// chemin qu'une découverte vivante (`handle_ssdp_discovered`).
+pub fn declencher_la_recherche_a_la_connexion(state: &AppState) -> bool {
+    if !reserver_la_recherche(
+        &DERNIERE_RECHERCHE_A_LA_CONNEXION,
+        RECHERCHE_A_LA_CONNEXION_ECART_MIN,
+    ) {
+        return false;
+    }
+    let scanner = state.scanner.clone();
+    tokio::spawn(async move {
+        let appareils = scanner.rescan().await.len();
+        info!(appareils, "ssdp_recherche_a_la_connexion_d_un_client");
+    });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AnnonceAppareil, find_cross_protocol_zone_conflict, may_reanchor, refus_nommes,
         register_discovered_output, resolve_control_url, statut_du_fournisseur,
     };
+
+    /// LAT-Z3 : la règle de la fenêtre — jamais lancée → due ; lancée il y a
+    /// moins de l'écart → pas due ; l'écart atteint → due.
+    #[test]
+    fn la_recherche_a_la_connexion_est_due_une_fois_par_fenetre() {
+        let ecart = std::time::Duration::from_secs(30);
+        let t0 = std::time::Instant::now();
+        assert!(super::recherche_due(None, t0, ecart));
+        assert!(!super::recherche_due(
+            Some(t0),
+            t0 + std::time::Duration::from_secs(5),
+            ecart
+        ));
+        assert!(super::recherche_due(Some(t0), t0 + ecart, ecart));
+    }
+
+    /// Deux clients qui se connectent ensemble ne réservent qu'une recherche ;
+    /// une fois l'écart passé, la suivante repart.
+    #[test]
+    fn deux_connexions_dans_la_fenetre_ne_reservent_qu_une_recherche() {
+        let verrou = std::sync::Mutex::new(None);
+        let ecart = std::time::Duration::from_millis(50);
+        assert!(super::reserver_la_recherche(&verrou, ecart));
+        assert!(!super::reserver_la_recherche(&verrou, ecart));
+        std::thread::sleep(ecart);
+        assert!(super::reserver_la_recherche(&verrou, ecart));
+    }
+
+    /// LAT-Z2 : trois renderers connus dont l'adresse ne répond pas sont sondés
+    /// ensemble — le tout tient dans une borne (et non trois), et l'ordre du
+    /// magasin est conservé, ce qui garde l'application déterministe.
+    #[tokio::test]
+    async fn les_sondes_des_renderers_connus_partent_ensemble_et_reviennent_dans_l_ordre() {
+        let borne = std::time::Duration::from_millis(800);
+        let renderers: Vec<super::KnownRenderer> = (1..=3)
+            .map(|i| super::KnownRenderer {
+                device_id: format!("uuid:absent-{i}"),
+                location: format!("http://10.255.255.{i}:8080/desc.xml"),
+                name: format!("Absent {i}"),
+                mac: String::new(),
+                manufacturer: String::new(),
+                model: String::new(),
+            })
+            .collect();
+        let depart = std::time::Instant::now();
+        let sondes = super::sonder_les_renderers_en_parallele(renderers, borne).await;
+        let duree = depart.elapsed();
+        assert!(
+            duree < borne * 2,
+            "trois sondes bornées à {borne:?} doivent tenir en parallèle, pas en série : {duree:?}"
+        );
+        let ordre: Vec<&str> = sondes.iter().map(|(kr, _)| kr.device_id.as_str()).collect();
+        assert_eq!(ordre, ["uuid:absent-1", "uuid:absent-2", "uuid:absent-3"]);
+        assert!(
+            sondes.iter().all(|(_, s)| s.is_none()),
+            "aucune adresse ne répond"
+        );
+    }
     use tune_core::db::zone_repo::Zone;
     use tune_core::discovery::device::{DiscoveredDevice, OutputType};
     use tune_core::event_bus::EventBus;
@@ -2102,7 +2582,7 @@ mod tests {
             name: name.to_string(),
             output_type: Some(output_type.to_string()),
             output_device_id: Some(device_id.to_string()),
-            volume: 50,
+            volume: 50.0,
             muted: false,
             online: true,
             gapless_enabled: true,
@@ -2543,6 +3023,154 @@ mod tests {
         }
     }
 
+    /// 🔴 #3688 — le troisieme rideau d'auto-exclusion.
+    ///
+    /// SITE D'APPEL GARDE : `spawn_ssdp_handler`, bras
+    /// `SsdpEvent::MediaServerDiscovered`, qui appelle
+    /// `est_notre_propre_serveur_multimedia(&ms, config.port, &nos_adresses(),
+    /// notre_udn.as_deref())` avant `media_servers.lock().await.insert(...)`.
+    ///
+    /// Les fixtures ne sont pas ecrites a la main : la `LOCATION` vient de
+    /// `tune_core::upnp_server::advert_location`, LA fonction qui compose ce
+    /// que l'annonceur publie, et l'`id` vient de la meme forme d'UDN que
+    /// `UpnpServer` tire au sort. Si la forme de l'annonce change, la garde
+    /// tombe avec elle au lieu de continuer a mesurer a vide.
+    mod auto_exclusion_du_serveur_multimedia {
+        use super::super::est_notre_propre_serveur_multimedia;
+        use tune_core::discovery::ssdp::MediaServerInfo;
+
+        const NOTRE_UDN: &str = "uuid:1e1f0a2c-6f2a-4a53-9f0d-1c9f4b7a55e1";
+        const PORT_API: u16 = 8888;
+
+        fn nos_adresses() -> Vec<String> {
+            vec![
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+                "192.168.0.39".to_string(),
+            ]
+        }
+
+        /// Une annonce telle que notre propre annonceur la produit.
+        fn annonce(id: &str, ip: &str, port: u16) -> MediaServerInfo {
+            let location = tune_core::upnp_server::advert_location(ip, port);
+            MediaServerInfo {
+                id: id.to_string(),
+                name: "Tune Server".to_string(),
+                manufacturer: "Tune".to_string(),
+                model: "Tune Server".to_string(),
+                content_directory_url: format!(
+                    "http://{ip}:{port}{}/ContentDirectory/control",
+                    tune_core::upnp_server::MOUNT_PATH
+                ),
+                location,
+                host: ip.to_string(),
+                port,
+                last_seen: std::time::Instant::now(),
+                max_age: std::time::Duration::from_secs(1800),
+            }
+        }
+
+        /// PREMIERE MOITIE — notre reflet est reconnu, par l'adresse comme par
+        /// l'UDN, et l'UDN suffit meme quand `nos_adresses()` ne contient pas
+        /// l'adresse annoncee (conteneur sans droits sur les interfaces, nom
+        /// d'hote dans la LOCATION, bascule Wi-Fi/Ethernet).
+        #[test]
+        fn notre_propre_serveur_multimedia_est_reconnu() {
+            let a_nous = nos_adresses();
+
+            // Par l'adresse + le port d'API + le chemin de montage.
+            let par_adresse = annonce(
+                "uuid:9f0f5c6e-1111-2222-3333-444455556666",
+                "192.168.0.39",
+                PORT_API,
+            );
+            assert!(
+                est_notre_propre_serveur_multimedia(&par_adresse, PORT_API, &a_nous, None),
+                "notre annonce sur notre adresse et notre port d'API doit etre reconnue"
+            );
+
+            // Par l'UDN seul : adresse INCONNUE de `nos_adresses()`, et pourtant
+            // c'est bien nous — un UDN de MediaServer est tire au sort par nous
+            // et persiste.
+            let par_udn = annonce(NOTRE_UDN, "10.8.0.4", PORT_API);
+            assert!(
+                !a_nous.iter().any(|a| a == "10.8.0.4"),
+                "la contre-epreuve n'a de sens que si l'adresse est inconnue"
+            );
+            assert!(
+                est_notre_propre_serveur_multimedia(&par_udn, PORT_API, &a_nous, Some(NOTRE_UDN)),
+                "notre UDN doit suffire quand l'adresse ne dit rien"
+            );
+        }
+
+        /// SECONDE MOITIE — la contre-epreuve. Trois voisins qui doivent tous
+        /// PASSER : un vrai serveur multimedia du reseau, un AUTRE Tune du
+        /// reseau (meme chemin, meme port, autre adresse), et notre propre
+        /// adresse mais sur un AUTRE port que celui de notre API.
+        ///
+        /// Sans elle, un rideau qui rendrait `true` en toutes circonstances
+        /// serait vert au premier test et ferait disparaitre tous les serveurs
+        /// multimedia des testeurs.
+        #[test]
+        fn les_serveurs_du_reseau_et_nos_semblables_passent() {
+            let a_nous = nos_adresses();
+
+            // Un vrai serveur multimedia du reseau (MinimServer, Synology…).
+            let voisin = MediaServerInfo {
+                id: "uuid:b59b8623-4822-4dd0-b077-44a8b91e9a46".to_string(),
+                name: "MinimServer[nas]".to_string(),
+                manufacturer: "MinimServer".to_string(),
+                model: "MinimServer".to_string(),
+                location: "http://192.168.0.20:9790/desc/device.xml".to_string(),
+                content_directory_url: "http://192.168.0.20:9790/dev/ContentDirectory/control"
+                    .to_string(),
+                host: "192.168.0.20".to_string(),
+                port: 9790,
+                last_seen: std::time::Instant::now(),
+                max_age: std::time::Duration::from_secs(1800),
+            };
+            assert!(
+                !est_notre_propre_serveur_multimedia(&voisin, PORT_API, &a_nous, Some(NOTRE_UDN)),
+                "un serveur multimedia du reseau doit rester visible"
+            );
+
+            // Un AUTRE Tune du reseau : meme chemin de montage, meme port,
+            // mais ce n'est pas nous — sa bibliotheque est parfaitement
+            // navigable et doit rester proposee.
+            let semblable = annonce(
+                "uuid:00000000-aaaa-bbbb-cccc-000000000001",
+                "192.168.0.77",
+                PORT_API,
+            );
+            assert!(
+                !est_notre_propre_serveur_multimedia(
+                    &semblable,
+                    PORT_API,
+                    &a_nous,
+                    Some(NOTRE_UDN)
+                ),
+                "le Tune du voisin n'est pas notre reflet"
+            );
+
+            // Notre adresse, notre chemin, mais un AUTRE port : ce n'est pas
+            // notre API, donc pas notre annonce.
+            let autre_port = annonce(
+                "uuid:00000000-aaaa-bbbb-cccc-000000000002",
+                "192.168.0.39",
+                9999,
+            );
+            assert!(
+                !est_notre_propre_serveur_multimedia(
+                    &autre_port,
+                    PORT_API,
+                    &a_nous,
+                    Some(NOTRE_UDN)
+                ),
+                "un autre service sur notre machine n'est pas notre MediaServer"
+            );
+        }
+    }
+
     mod known_renderers_par_location {
         use super::super::{KnownRenderer, dedup_renderers_by_location, persist_known_renderer};
         use std::sync::Arc;
@@ -2731,7 +3359,7 @@ mod tests {
                 Ipv4Addr::new(172, 17, 0, 1),
             ];
             // L'élue est l'une d'elles : c'est le cas nominal.
-            let nous = super::super::nos_adresses_depuis(&interfaces, Some(interfaces[0]));
+            let nous = super::super::nos_adresses_depuis(&interfaces, Some(interfaces[0]), None);
 
             for ip in &interfaces {
                 let loc = format!("http://{ip}:8888/upnp/renderer/1/description.xml");
@@ -2750,12 +3378,61 @@ mod tests {
             assert_eq!(tri.len(), nous.len(), "doublons dans nos adresses");
         }
 
+        /// #3867 — l'adresse ANNONCÉE fait partie de nos adresses.
+        ///
+        /// `advertised_ip` existe précisément pour les hôtes où l'autodétection
+        /// se trompe : elle n'est donc PAS dans `local_ipv4_addresses()`, et
+        /// l'élue de la sonde UDP est une AUTRE adresse. Or c'est elle que nos
+        /// annonces portent (`upnp_server::current_advert_ip`). Sans elle ici,
+        /// nos propres façades reviennent méconnaissables et Tune recrée les
+        /// zones « (Tune) » de #3688 — sur le seul fait d'avoir configuré une
+        /// adresse.
+        #[test]
+        fn l_adresse_annoncee_compte_pour_nous() {
+            use std::net::Ipv4Addr;
+            // L'hôte est multi-domicilié : la sonde UDP élit le tunnel, et
+            // l'exploitant a posé l'adresse du LAN dans `advertised_ip`.
+            let interfaces = [Ipv4Addr::new(10, 8, 0, 2), Ipv4Addr::new(172, 17, 0, 1)];
+            let nous = super::super::nos_adresses_depuis(
+                &interfaces,
+                Some(interfaces[0]),
+                Some("192.168.1.41"),
+            );
+            let loc = "http://192.168.1.41:8888/upnp/renderer/1/description.xml";
+            assert!(
+                est_notre_propre_renderer(loc, 8888, 8888, &nous),
+                "notre propre façade annoncée sous advertised_ip doit être \
+                 reconnue : sinon Tune se redécouvre et recrée les zones \
+                 « (Tune) » de #3688 (#3867)"
+            );
+            // Et un voisin sur le même LAN reste pilotable.
+            let voisin = "http://192.168.1.77:8888/upnp/renderer/2/description.xml";
+            assert!(
+                !est_notre_propre_renderer(voisin, 8888, 8888, &nous),
+                "élargir la liste ne doit pas avaler un autre serveur Tune"
+            );
+            // Aucune adresse en double si l'annoncée est déjà énumérée.
+            let deja = super::super::nos_adresses_depuis(
+                &[Ipv4Addr::new(192, 168, 1, 41)],
+                None,
+                Some("192.168.1.41"),
+            );
+            assert_eq!(
+                deja.iter().filter(|a| *a == "192.168.1.41").count(),
+                1,
+                "l'adresse annoncée déjà énumérée ne doit pas être ajoutée deux fois"
+            );
+            // Une valeur vide ou blanche ne vaut pas une adresse.
+            let vide = super::super::nos_adresses_depuis(&[], None, Some("  "));
+            assert_eq!(vide, vec!["127.0.0.1".to_string(), "localhost".to_string()]);
+        }
         /// Ceinture et bretelles : énumération vide (conteneur sans droits sur
         /// les interfaces), l'élue reste une réponse valable.
         #[test]
         fn sans_enumeration_lelue_suffit_encore() {
             use std::net::Ipv4Addr;
-            let nous = super::super::nos_adresses_depuis(&[], Some(Ipv4Addr::new(192, 168, 1, 10)));
+            let nous =
+                super::super::nos_adresses_depuis(&[], Some(Ipv4Addr::new(192, 168, 1, 10)), None);
             let loc = "http://192.168.1.10:8888/upnp/renderer/1/description.xml";
             assert!(est_notre_propre_renderer(loc, 8888, 8888, &nous));
         }
@@ -2767,6 +3444,7 @@ mod tests {
             use std::net::Ipv4Addr;
             let nous = super::super::nos_adresses_depuis(
                 &[Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(172, 17, 0, 1)],
+                None,
                 None,
             );
             let loc = "http://192.168.1.77:8888/upnp/renderer/2/description.xml";
@@ -3027,7 +3705,7 @@ mod retrait_serveur_multimedia {
 /// #1281 — dédoublonnage des identités SSDP d'un même appareil physique.
 #[cfg(test)]
 mod dedup_identites_ssdp_1281 {
-    use super::OpenHomeEventListener;
+    use super::UpnpEventListener;
     use tune_core::discovery::device::{DiscoveredDevice, OutputType};
 
     /// Un renderer SSDP synthétique complet : les URLs de service suffisent à
@@ -3046,7 +3724,7 @@ mod dedup_identites_ssdp_1281 {
     /// donc pas masquer le défaut.
     async fn annoncer(state: &crate::state::AppState, dev: &DiscoveredDevice) {
         let mut seen = std::collections::HashSet::new();
-        let listener: Option<std::sync::Arc<OpenHomeEventListener>> = None;
+        let listener: Option<std::sync::Arc<UpnpEventListener>> = None;
         super::handle_ssdp_discovered(
             dev,
             &state.outputs,
@@ -3141,7 +3819,7 @@ mod dedup_identites_ssdp_1281 {
 /// aucun des deux ne peut rester vert sur un correctif mort.
 #[cfg(test)]
 mod appareils_ignores_1280 {
-    use super::OpenHomeEventListener;
+    use super::UpnpEventListener;
     use tune_core::db::ignored_device_repo::{IgnoredDevice, IgnoredDeviceRepo};
     use tune_core::discovery::device::{DiscoveredDevice, OutputType};
 
@@ -3158,7 +3836,7 @@ mod appareils_ignores_1280 {
     /// deux scans réels.
     async fn annoncer(state: &crate::state::AppState, dev: &DiscoveredDevice) {
         let mut seen = std::collections::HashSet::new();
-        let listener: Option<std::sync::Arc<OpenHomeEventListener>> = None;
+        let listener: Option<std::sync::Arc<UpnpEventListener>> = None;
         super::handle_ssdp_discovered(
             dev,
             &state.outputs,
@@ -3321,6 +3999,258 @@ mod appareils_ignores_1280 {
             repo.list().unwrap().len(),
             1,
             "après déblocage, l'appareil revient au scan suivant"
+        );
+    }
+}
+
+/// #3919 — la zone RENOMMEE qui perd sa configuration au changement d'adresse.
+///
+/// Reproduit de bout en bout sur 0.9.145 : une zone AirPlay renommee « Salon
+/// (essai Matteo) », un appareil qui n'annonce aucun TXT `deviceid`, mDNS qui
+/// choisit l'autre adresse au redemarrage — et deux lignes pour un seul Mac,
+/// la configuration restee sur celle que plus rien ne relie a l'appareil.
+///
+/// Ces temoins tournent dans le job `Test` de la CI : la ligne nomme
+/// `-p tune-server`, et rien ici n'est derriere `local-audio`.
+#[cfg(test)]
+mod reancrage_par_mac {
+    use super::{zone_a_reancrer_par_mac, zone_reseau_a_reancrer_par_mac};
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::zone_repo::{ZoneParMac, ZoneRepo};
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    /// Relevee a `avahi-browse -rtp` le 11/09 : nom d'instance `_raop`
+    /// « 764D00C0BD51@Mac Studio », donc aucune adresse dedans.
+    const MAC_STUDIO: &str = "76:4D:00:C0:BD:51";
+    const MAC_APPLE_TV: &str = "BA:C9:C4:56:04:E8";
+    const MAC_SONOS: &str = "94:9F:3E:11:22:33";
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn appareil(id: &str, nom: &str, host: &str, mac: &str) -> DiscoveredDevice {
+        let mut dev = DiscoveredDevice::new(
+            id.to_string(),
+            nom.to_string(),
+            OutputType::Airplay,
+            host.to_string(),
+            7000,
+        );
+        dev.mac_address = Some(mac.to_string());
+        dev
+    }
+
+    fn candidat(id: i64, device_id: &str, output_type: &str, masquee: bool) -> ZoneParMac {
+        ZoneParMac {
+            id,
+            output_device_id: device_id.to_string(),
+            output_type: output_type.to_string(),
+            masquee,
+        }
+    }
+
+    #[test]
+    fn une_zone_renommee_retrouve_son_appareil_a_une_autre_adresse_par_sa_mac() {
+        let repo = ZoneRepo::with_backend(base());
+        let (zid, creee) = repo
+            .get_or_create("Mac13,1", Some("airplay"), "airplay-192.168.1.24-7000")
+            .unwrap();
+        assert!(creee, "la zone d'essai doit etre creee");
+        // Ce que la decouverte ecrit deja aujourd'hui a la creation.
+        repo.set_identity(zid, "192.168.1.24", Some(MAC_STUDIO))
+            .unwrap();
+        // Le geste que tout le monde fait, et qui met les TROIS filets par nom
+        // en defaut d'un coup.
+        repo.update_name(zid, "Salon (essai Matteo)").unwrap();
+
+        let revenu = appareil(
+            "airplay-192.168.1.41-7000",
+            "Mac13,1",
+            "192.168.1.41",
+            MAC_STUDIO,
+        );
+
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &revenu, "airplay"),
+            Some((zid, false)),
+            "la zone renommee doit retrouver son appareil par la MAC que sa \
+             ligne porte DEJA : sans ce filet la decouverte cree une zone \
+             NEUVE a cote, et les reglages restent sur une ligne orpheline \
+             (#3919, reproduit sur 0.9.145)"
+        );
+    }
+
+    #[test]
+    fn un_autre_appareil_ne_capture_pas_la_zone_quand_sa_mac_differe() {
+        // #1651 rejoue. Le 13/08 le DHCP a donne l'adresse de l'Apple TV a un
+        // Sonos et la zone « AppleTV14,1 » l'a suivi. Le Sonos annonce SA MAC :
+        // le filet se refuse tout seul, sans dependre du nom que
+        // l'utilisateur a tape.
+        let repo = ZoneRepo::with_backend(base());
+        let (zid, _) = repo
+            .get_or_create("AppleTV14,1", Some("airplay"), "airplay-192.168.1.37-7000")
+            .unwrap();
+        repo.set_identity(zid, "192.168.1.37", Some(MAC_APPLE_TV))
+            .unwrap();
+
+        let sonos = appareil(
+            "airplay-192.168.1.55-7000",
+            "Chambre",
+            "192.168.1.55",
+            MAC_SONOS,
+        );
+
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &sonos, "airplay"),
+            None,
+            "une MAC differente ne doit RIEN rapprocher : c'est l'Apple TV \
+             detournee sur le Sonos (#1651) qu'on refuse ici"
+        );
+    }
+
+    #[test]
+    fn une_zone_supprimee_se_reancre_sans_se_demasquer() {
+        let repo = ZoneRepo::with_backend(base());
+        let (zid, _) = repo
+            .get_or_create("Mac13,1", Some("airplay"), "airplay-192.168.1.24-7000")
+            .unwrap();
+        repo.set_identity(zid, "192.168.1.24", Some(MAC_STUDIO))
+            .unwrap();
+        repo.update_name(zid, "Salon (essai Matteo)").unwrap();
+        repo.delete(zid).unwrap();
+
+        let revenu = appareil(
+            "airplay-192.168.1.41-7000",
+            "Mac13,1",
+            "192.168.1.41",
+            MAC_STUDIO,
+        );
+
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &revenu, "airplay"),
+            Some((zid, true)),
+            "une zone SUPPRIMEE doit etre rendue comme masquee : l'appelant la \
+             re-ancre sans la demasquer, sinon la suppression de \
+             l'utilisateur est defaite au changement d'adresse suivant"
+        );
+    }
+
+    #[test]
+    fn deux_zones_de_meme_type_sur_la_meme_mac_ne_sont_pas_departagees() {
+        let candidats = [
+            candidat(3, "airplay-192.168.1.24-7000", "airplay", false),
+            candidat(8, "airplay-192.168.1.31-7000", "airplay", false),
+        ];
+        assert_eq!(
+            zone_a_reancrer_par_mac(&candidats, "airplay-192.168.1.41-7000", false, "airplay"),
+            None,
+            "deux zones revendiquant la meme MAC : en choisir une serait un \
+             tirage au sort, et le mauvais tirage envoie le son dans l'autre \
+             piece"
+        );
+    }
+
+    #[test]
+    fn la_zone_dlna_du_meme_appareil_nest_pas_une_reassociation_airplay() {
+        // L'Eversolo DMP-A8 est DLNA *et* AirPlay : deux sorties REELLES pour
+        // une seule MAC. Les reunir serait une FUSION de zones (#3747).
+        let candidats = [candidat(5, "uuid:9C41535E-0000-1000", "dlna", false)];
+        assert_eq!(
+            zone_a_reancrer_par_mac(&candidats, "airplay-192.168.1.17-5500", false, "airplay"),
+            None,
+            "une zone d'un AUTRE protocole sur la meme MAC n'est pas la meme \
+             sortie : la rapprocher serait une fusion de zones, pas une \
+             re-association (#3747)"
+        );
+    }
+
+    #[test]
+    fn une_zone_existe_deja_sous_le_nouvel_identifiant_rien_ne_bouge() {
+        let candidats = [candidat(3, "airplay-192.168.1.24-7000", "airplay", false)];
+        assert_eq!(
+            zone_a_reancrer_par_mac(&candidats, "airplay-192.168.1.41-7000", true, "airplay"),
+            None,
+            "l'appareil a deja sa zone sous ce nouvel identifiant : en \
+             deplacer une seconde dessus partagerait la clef, et l'index \
+             unique partiel idx_zones_output_device_id la refuserait"
+        );
+    }
+
+    #[test]
+    fn un_identifiant_opaque_qui_nest_pas_une_mac_narme_pas_le_filet() {
+        // Le TXT `id` d'un Chromecast est un UUID que `enrich_identity` range
+        // dans `mac_address` quand la table ARP n'a rien rendu. Il n'entre pas
+        // dans la regle — et ces appareils-la annoncent de toute facon un
+        // `stable_id`, donc un identifiant sans adresse dedans.
+        let repo = ZoneRepo::with_backend(base());
+        let (zid, _) = repo
+            .get_or_create("Salon", Some("airplay"), "airplay-192.168.1.24-7000")
+            .unwrap();
+        repo.set_identity(zid, "192.168.1.24", Some("a8f3c1de9b7045"))
+            .unwrap();
+        let mut revenu = appareil(
+            "airplay-192.168.1.41-7000",
+            "Salon",
+            "192.168.1.41",
+            MAC_STUDIO,
+        );
+        revenu.mac_address = Some("a8f3c1de9b7045".to_string());
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &revenu, "airplay"),
+            None,
+            "un identifiant qui n'est pas une MAC ne passe pas la regle : le \
+             filet doit rester desarme plutot que de rapprocher sur une \
+             chaine dont on ne sait pas ce qu'elle designe"
+        );
+    }
+
+    /// « Ecrit mais pas branche » est le defaut le plus cher de ce depot.
+    /// Ici l'ordre compte autant que l'appel : consulter la MAC APRES la
+    /// creation automatique ne trouverait plus qu'un doublon a contempler.
+    ///
+    /// ⚠️ Ce fichier est inclus en ENTIER, ce module compris. Les motifs sont
+    /// donc assembles a la compilation, sinon le garde se trouverait
+    /// LUI-MEME et resterait vrai quoi qu'il arrive (#2082).
+    #[test]
+    fn le_filet_par_mac_est_consulte_avant_la_creation_automatique() {
+        const SOURCE: &str = include_str!("discovery_setup.rs");
+        let filets_par_nom = concat!("mdns_hidden_zone_", "reanchored");
+        let appel = concat!("zone_reseau_a_reancrer_par_", "mac(");
+        let creation = concat!("mdns_zone_auto_", "created");
+
+        let apres_les_noms = SOURCE.find(filets_par_nom).unwrap_or_else(|| {
+            panic!(
+                "le filet par nom des zones masquees a disparu : ce garde ne \
+                 garde plus rien tant qu'il n'a pas suivi"
+            )
+        });
+        let pos_creation = SOURCE.find(creation).unwrap_or_else(|| {
+            panic!(
+                "le gestionnaire mDNS ne cree plus de zone automatiquement : \
+                 ce garde ne garde plus rien tant qu'il n'a pas suivi"
+            )
+        });
+        let pos_appel = SOURCE[apres_les_noms..]
+            .find(appel)
+            .map(|i| i + apres_les_noms)
+            .unwrap_or_else(|| {
+                panic!(
+                    "le gestionnaire mDNS ne consulte pas la MAC apres les \
+                     filets par nom : une zone RENOMMEE y recevra une zone \
+                     NEUVE a chaque changement d'adresse, reglages laisses \
+                     sur une ligne orpheline (#3919)"
+                )
+            });
+        assert!(
+            pos_appel < pos_creation,
+            "le filet par MAC est consulte APRES la creation automatique : la \
+             zone neuve est deja la, et la re-association n'a plus qu'un \
+             doublon a contempler (#3919)"
         );
     }
 }

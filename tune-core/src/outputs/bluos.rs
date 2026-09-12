@@ -29,6 +29,43 @@ impl BluosOutput {
         format!("http://{}:{}", self.host, self.port)
     }
 
+    /// L'URL `/Add` envoyee au Node, construite a UN SEUL endroit.
+    ///
+    /// `play_media` et `set_next_media` la fabriquaient chacun de leur cote,
+    /// quinze lignes identiques au caractere pres. Ce sont deux soeurs du meme
+    /// chemin : toute correction portee a l'une (l'encodage du parametre `url`
+    /// est le candidat nomme par #1996) aurait laisse l'autre nue, et le defaut
+    /// gapless ne se voit qu'a la fin du morceau — la ou il est le plus cher a
+    /// diagnostiquer. Une seule construction, deux appelants.
+    ///
+    /// BluOS attend `url` SANS re-encodage : `.query()` doublerait l'encodage
+    /// de `http://` dans l'URL de flux, et le Node echouerait en silence. Les
+    /// autres parametres, eux, sont bien encodes.
+    ///
+    /// Le texte « en cours de lecture » du Node se pose via title1/title2/
+    /// title3, PAS via title/artist/album : la BluOS Custom Integration API
+    /// impose « title1, title2 and title3 MUST be used […] Do not use values
+    /// such as album, artist and name ». Le Node ignore silencieusement les
+    /// mauvais noms (Bilou, fil « Lecture BluOS »). D'ou title1=titre,
+    /// title2=artiste, title3=album — les trois lignes qu'il relit dans son
+    /// XML de statut (`<title1>…` a `get_status`).
+    fn build_add_url(&self, media: &PlayMedia<'_>) -> String {
+        let mut add_url = format!("{}/Add?url={}", self.base_url(), media.url);
+        if let Some(t) = media.title {
+            add_url.push_str(&format!("&title1={}", urlencoding::encode(t)));
+        }
+        if let Some(a) = media.artist {
+            add_url.push_str(&format!("&title2={}", urlencoding::encode(a)));
+        }
+        if let Some(al) = media.album {
+            add_url.push_str(&format!("&title3={}", urlencoding::encode(al)));
+        }
+        if let Some(img) = media.cover_url {
+            add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
+        }
+        add_url
+    }
+
     async fn api_get(&self, path: &str, params: &[(&str, &str)]) -> Result<String, String> {
         let url = format!("{}/{}", self.base_url(), path);
         let resp = self
@@ -90,6 +127,22 @@ fn queue_stayed_empty(add_body: &str) -> bool {
     xml_attr(add_body, "playlist", "length") == Some("0")
 }
 
+/// Le Node a-t-il ACQUITTE un `/Clear` sans vider sa file ?
+///
+/// La BluOS Custom Integration API (v1.7, § 5.4 « Clear Queue ») documente la
+/// reponse d'un Clear reussi : `<playlist modified="0" length="0" id="1056"/>`
+/// — la longueur annoncee est 0. Une longueur qu'on sait lire et qui n'est PAS
+/// nulle dit donc que la file est restee pleine, et que l'entree 0 que le
+/// `/Play?id=0` de `play_media` va jouer n'est pas celle qu'on vient
+/// d'ajouter : c'est une piste de l'album precedent (Scordia).
+///
+/// Une reponse qu'on ne sait pas lire ne signale rien — meme sens de defaut
+/// que `queue_stayed_empty`, on ne declare personne en panne sur notre
+/// ignorance du dialecte.
+fn clear_laisse_la_file_pleine(clear_body: &str) -> bool {
+    xml_attr(clear_body, "playlist", "length").is_some_and(|l| l != "0")
+}
+
 /// Le Node a-t-il refuse la piste tout en repondant 200 ?
 ///
 /// Vrai seulement quand les DEUX reponses concordent : la file annoncee par
@@ -129,7 +182,7 @@ impl OutputTarget for BluosOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, true, true, true, true)
+        OutputCapabilities::v1(true, true, true, true, true, true).with_percent_volume()
     }
 
     fn host(&self) -> Option<&str> {
@@ -142,8 +195,40 @@ impl OutputTarget for BluosOutput {
         // auto-advanced onto them at every track transition (Scordia: a new CD
         // plays track 1, then jumps to the previous CD's tracks — "in memory"
         // yet absent from Tune's own queue/history, because they live on the
-        // Node). Fire-and-forget: a failed Clear must not block playback.
-        let _ = self.api_get("Clear", &[]).await;
+        // Node).
+        //
+        // Le resultat etait JETE (`let _ = …`). Qu'un Clear rate n'empeche pas
+        // la lecture est le sens voulu et on le garde ; qu'il soit MUET ne l'est
+        // pas. Quand le Node est injoignable ou repond 500, ses pistes restent
+        // en file et le `/Play?id=0` plus bas joue l'entree 0 — donc une piste
+        // de l'album precedent, exactement le defaut que ce Clear existe pour
+        // empecher. Et la garde des deux signaux de #1514 ne peut pas le voir :
+        // la file n'est pas vide et l'appareil joue. Sans cette ligne de
+        // journal, la seule commande qui a echoue ne laisse aucune trace.
+        //
+        // L'ORDRE, lui, etait deja garanti par le `.await` : l'`Add` ne part
+        // qu'une fois la reponse du Clear recue. Cf le temoin
+        // `l_add_ne_part_pas_avant_que_le_clear_ait_rendu`.
+        match self.api_get("Clear", &[]).await {
+            Ok(corps) => {
+                if clear_laisse_la_file_pleine(&corps) {
+                    // Acquitte n'est pas applique : 200, et une file encore
+                    // pleine. L'entree 0 n'est pas la notre.
+                    warn!(
+                        device = %self.name,
+                        reply = %truncate_body(&corps),
+                        "bluos_clear_acquitte_file_non_videe"
+                    );
+                } else {
+                    debug!(
+                        device = %self.name,
+                        reply = %truncate_body(&corps),
+                        "bluos_clear_reply"
+                    );
+                }
+            }
+            Err(e) => warn!(device = %self.name, error = %e, "bluos_clear_echec"),
+        }
 
         // Play THROUGH the Node's queue (/Add then /Play?id=0), not as a
         // /Play?url= custom stream. The custom stream lives OUTSIDE the queue:
@@ -153,28 +238,8 @@ impl OutputTarget for BluosOutput {
         // bluos_stop). Queue entries also render their title1/2/3 lines on the
         // Node display, where the custom-stream play showed the title only.
         //
-        // BluOS expects the url parameter without re-encoding — .query()
-        // would double-encode http:// in the stream URL, causing silent failure.
-        let mut add_url = format!("{}/Add?url={}", self.base_url(), media.url);
-        // The Node's now-playing text is set via title1/title2/title3, NOT
-        // title/artist/album: the BluOS Custom Integration API mandates
-        // "title1, title2 and title3 MUST be used […] Do not use values such as
-        // album, artist and name". The Node silently ignores title/artist/album
-        // (Bilou, forum "Lecture BluOS"). Map title1=track title,
-        // title2=artist, title3=album — the three now-playing lines the Node
-        // reads back in its status XML (<title1>… at get_status).
-        if let Some(t) = media.title {
-            add_url.push_str(&format!("&title1={}", urlencoding::encode(t)));
-        }
-        if let Some(a) = media.artist {
-            add_url.push_str(&format!("&title2={}", urlencoding::encode(a)));
-        }
-        if let Some(al) = media.album {
-            add_url.push_str(&format!("&title3={}", urlencoding::encode(al)));
-        }
-        if let Some(img) = media.cover_url {
-            add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
-        }
+        // Construction partagee avec `set_next_media` : cf `build_add_url`.
+        let add_url = self.build_add_url(media);
         let add_resp = self
             .client
             .get(&add_url)
@@ -187,6 +252,17 @@ impl OutputTarget for BluosOutput {
             .await
             .map_err(|e| format!("bluos Add read: {e}"))?;
         if !add_status.is_success() {
+            // Meme angle mort que #1874, sur l'autre facon de refuser : on
+            // savait que le Node avait dit non, jamais A QUOI. Le refus par
+            // code HTTP n'ecrivait rien du tout dans le journal — l'`Err` remonte
+            // a l'utilisateur, pas au diagnostic.
+            warn!(
+                device = %self.name,
+                add_url = %add_url,
+                status = %add_status,
+                reply = %truncate_body(&add_body),
+                "bluos_add_http_error"
+            );
             return Err(format!(
                 "bluos Add: HTTP {add_status} — {}",
                 truncate_body(&add_body)
@@ -354,23 +430,11 @@ impl OutputTarget for BluosOutput {
         // fetched at end of track — no stream_request, Node stopped at pos=0
         // for ~25 s until the poller killed the zone (stopped_early_waiting →
         // bluos_stop).
-        // Raw URL construction (no .query()) to avoid double-encoding, same as play_media.
-        let mut add_url = format!("{}/Add?url={}", self.base_url(), media.url);
-        // Same title1/title2/title3 mapping as play_media (the Node ignores
-        // title/artist/album), so the gapless-staged next track also carries its
-        // now-playing text instead of only the cover.
-        if let Some(t) = media.title {
-            add_url.push_str(&format!("&title1={}", urlencoding::encode(t)));
-        }
-        if let Some(a) = media.artist {
-            add_url.push_str(&format!("&title2={}", urlencoding::encode(a)));
-        }
-        if let Some(al) = media.album {
-            add_url.push_str(&format!("&title3={}", urlencoding::encode(al)));
-        }
-        if let Some(img) = media.cover_url {
-            add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
-        }
+        // Exactement la meme URL que `play_media` — meme constructeur, y compris
+        // le title1/title2/title3 (le Node ignore title/artist/album), pour que
+        // la piste preparee en gapless porte elle aussi son texte et pas
+        // seulement sa pochette. Cf `build_add_url`.
+        let add_url = self.build_add_url(media);
         // La reponse etait jetee en entier — statut ET corps. Un Node qui
         // repondait 404, ou qui acceptait l'appel sans rien mettre en file,
         // etait indiscernable d'un Node qui a bien pris la piste suivante.
@@ -395,14 +459,31 @@ impl OutputTarget for BluosOutput {
         let add_status = add_resp.status();
         let add_body = add_resp.text().await.unwrap_or_default();
         if !add_status.is_success() {
+            warn!(
+                device = %self.name,
+                add_url = %add_url,
+                status = %add_status,
+                reply = %truncate_body(&add_body),
+                "bluos_add_http_error_gapless"
+            );
             return Err(format!(
                 "bluos Add (gapless): HTTP {add_status} — {}",
                 truncate_body(&add_body)
             ));
         }
         if queue_stayed_empty(&add_body) {
+            // `add_url` manquait ici, et NULLE PART ailleurs sur ce chemin.
+            //
+            // #1874 posait le probleme en une phrase — « l'URL envoyee n'est
+            // journalisee que sur le chemin qui reussit » — et la PR #1870 l'a
+            // reglee pour `play_media` seulement. La soeur gapless est restee
+            // nue : on y savait que le Node avait laisse sa file vide, jamais
+            // sur QUELLE URL. C'est precisement le champ qui a permis d'ecarter
+            // l'hypothese d'encodage sur l'autre chemin (#1996) ; sans lui, le
+            // meme diagnostic est impossible ici.
             warn!(
                 device = %self.name,
+                add_url = %add_url,
                 reply = %truncate_body(&add_body),
                 "bluos_set_next_queue_still_empty"
             );
@@ -485,6 +566,38 @@ mod tests {
     const PLAY_PAUSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?> <state>pause</state>"#;
     const PLAY_STREAM: &str = r#"<?xml version="1.0" encoding="UTF-8"?> <state>stream</state>"#;
 
+    // ── Le `Clear` qui precede l'`Add` : son resultat etait jete (#1996) ──
+    //
+    // `let _ = self.api_get("Clear", &[]).await` : tir-et-oublie AU SENS DU
+    // RESULTAT. Un Clear qui echoue laisse les pistes de l'album precedent en
+    // file ; le `/Play?id=0` qui suit joue alors l'entree 0, pas la notre — et
+    // Tune voit une file pleine et un appareil qui joue, donc la garde des deux
+    // signaux ne signale rien. Le seul temoin possible etait ce journal.
+
+    /// La reponse d'un `/Clear` reussi, telle que la documente la BluOS Custom
+    /// Integration API v1.7, § 5.4 « Clear Queue ».
+    const CLEAR_OK: &str =
+        r#"<?xml version="1.0" encoding="UTF-8"?> <playlist modified="0" length="0" id="1056"/>"#;
+    /// Le meme appel ACQUITTE — 200 — mais la file est restee pleine.
+    const CLEAR_FILE_PLEINE: &str =
+        r#"<?xml version="1.0" encoding="UTF-8"?> <playlist modified="1" length="3" id="1056"/>"#;
+
+    #[test]
+    fn un_clear_qui_vide_la_file_ne_signale_rien() {
+        assert!(!clear_laisse_la_file_pleine(CLEAR_OK));
+    }
+
+    #[test]
+    fn un_clear_acquitte_qui_laisse_la_file_pleine_est_detecte() {
+        assert!(clear_laisse_la_file_pleine(CLEAR_FILE_PLEINE));
+    }
+
+    #[test]
+    fn une_reponse_de_clear_illisible_ne_signale_rien() {
+        assert!(!clear_laisse_la_file_pleine("<ok/>"));
+        assert!(!clear_laisse_la_file_pleine(""));
+    }
+
     #[test]
     fn file_vide_et_pause_est_un_refus() {
         assert!(add_play_rejected(ADD_EMPTY, PLAY_PAUSE));
@@ -547,5 +660,424 @@ mod tests {
         // ne connait pas le dialecte ne doit pas remplir le journal.
         assert!(!queue_stayed_empty("<ok/>"));
         assert!(!queue_stayed_empty(""));
+    }
+
+    // ── L'URL envoyee au Node : une construction, deux chemins de refus ────
+    //
+    // #1874 : « l'URL envoyee n'est journalisee que sur le chemin qui reussit ».
+    // La PR #1870 a corrige `play_media` ; `set_next_media` est restee nue, et
+    // aucun des deux refus par code HTTP n'ecrivait quoi que ce soit.
+
+    /// Le flux exact du journal de Bilou du 20/08/2026 (#1996), champ par champ.
+    /// C'est la seule URL `/Add` du dossier dont on ait la trace ecrite.
+    const FLUX_BILOU: &str =
+        "http://192.168.1.12:8888/stream/968625a7-3a25-48a1-a86a-b962ce981046.flac";
+    const POCHETTE_BILOU: &str =
+        "http://192.168.1.12:8888/api/v1/library/artwork/8050fd92adf127e5743911262ca65407";
+
+    fn media_bilou(url: &str) -> PlayMedia<'_> {
+        PlayMedia {
+            url,
+            mime_type: "audio/flac",
+            title: Some("Come on In"),
+            artist: Some("Bridge City Sinners"),
+            album: Some("Bridge City Sinners"),
+            cover_url: Some(POCHETTE_BILOU),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn l_url_add_reproduit_celle_du_journal_de_bilou() {
+        // `url` part BRUT (le re-encoder casserait `http://` cote Node) tandis
+        // que title1/2/3 et image sont encodes. L'asymetrie est deliberee ;
+        // elle est ici figee sur la seule trace ecrite qu'on ait du terrain.
+        let node = BluosOutput::new(
+            "Salon".into(),
+            "bluos-192.168.1.23-11000".into(),
+            "192.168.1.23".into(),
+            11000,
+        );
+        assert_eq!(
+            node.build_add_url(&media_bilou(FLUX_BILOU)),
+            format!(
+                "http://192.168.1.23:11000/Add?url={FLUX_BILOU}\
+                 &title1=Come%20on%20In\
+                 &title2=Bridge%20City%20Sinners\
+                 &title3=Bridge%20City%20Sinners\
+                 &image=http%3A%2F%2F192.168.1.12%3A8888%2Fapi%2Fv1%2Flibrary%2Fartwork%2F8050fd92adf127e5743911262ca65407"
+            )
+        );
+    }
+
+    #[test]
+    fn un_media_sans_metadonnees_n_ajoute_aucun_parametre_vide() {
+        let node = BluosOutput::new("Salon".into(), "d".into(), "192.168.1.23".into(), 11000);
+        let nu = PlayMedia {
+            url: FLUX_BILOU,
+            mime_type: "audio/flac",
+            ..Default::default()
+        };
+        assert_eq!(
+            node.build_add_url(&nu),
+            format!("http://192.168.1.23:11000/Add?url={FLUX_BILOU}")
+        );
+    }
+
+    // ── Banc d'essai : un Node bouchonne, en local ────────────────────────
+    //
+    // Aucun trafic ne sort de la machine. Le bouchon LIT la requete avant de
+    // repondre (axum s'en charge) — un mock qui ferme sans lire provoque un RST
+    // qui detruit la reponse en vol.
+
+    #[derive(Clone, Default)]
+    struct JournalCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl JournalCapture {
+        fn texte(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for JournalCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
+        type Writer = JournalCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct NodeBouchon {
+        /// Les URI recues, path + query, DANS L'ORDRE — `/Clear`, `/Add` et
+        /// `/Play` y passent tous les trois. C'est ce qui permet d'eprouver que
+        /// l'`Add` ne part pas avant que le `Clear` ait rendu.
+        recues: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        code_add: axum::http::StatusCode,
+        corps_add: String,
+        code_clear: axum::http::StatusCode,
+        corps_clear: String,
+        corps_play: String,
+        /// Le temps que le Node met a repondre au `/Clear`. Le bouchon
+        /// n'inscrit l'appel qu'APRES cette latence : un `Add` lance sans
+        /// attendre s'inscrirait donc AVANT lui.
+        latence_clear: std::time::Duration,
+    }
+
+    impl Default for NodeBouchon {
+        /// Un Node NOMINAL : il vide sa file, prend la piste, et joue.
+        fn default() -> Self {
+            Self {
+                recues: Default::default(),
+                code_add: axum::http::StatusCode::OK,
+                corps_add: ADD_OK.to_string(),
+                code_clear: axum::http::StatusCode::OK,
+                corps_clear: CLEAR_OK.to_string(),
+                corps_play: PLAY_STREAM.to_string(),
+                latence_clear: std::time::Duration::ZERO,
+            }
+        }
+    }
+
+    async fn add_bouchon(
+        axum::extract::State(etat): axum::extract::State<NodeBouchon>,
+        uri: axum::http::Uri,
+    ) -> (axum::http::StatusCode, String) {
+        etat.recues.lock().unwrap().push(uri.to_string());
+        (etat.code_add, etat.corps_add.clone())
+    }
+
+    async fn clear_bouchon(
+        axum::extract::State(etat): axum::extract::State<NodeBouchon>,
+        uri: axum::http::Uri,
+    ) -> (axum::http::StatusCode, String) {
+        tokio::time::sleep(etat.latence_clear).await;
+        etat.recues.lock().unwrap().push(uri.to_string());
+        (etat.code_clear, etat.corps_clear.clone())
+    }
+
+    async fn play_bouchon(
+        axum::extract::State(etat): axum::extract::State<NodeBouchon>,
+        uri: axum::http::Uri,
+    ) -> (axum::http::StatusCode, String) {
+        etat.recues.lock().unwrap().push(uri.to_string());
+        (axum::http::StatusCode::OK, etat.corps_play.clone())
+    }
+
+    async fn demarrer_bouchon(etat: NodeBouchon) -> (u16, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new()
+            .route("/Add", axum::routing::get(add_bouchon))
+            .route("/Clear", axum::routing::get(clear_bouchon))
+            .route("/Play", axum::routing::get(play_bouchon))
+            .with_state(etat);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn le_refus_gapless_nomme_l_url_envoyee_comme_le_fait_play_media() {
+        // LA contre-epreuve de #1874 sur la soeur oubliee par #1870.
+        //
+        // Le Node accepte l'appel gapless et laisse sa file vide — exactement la
+        // reponse du terrain. L'avertissement doit dire CE QU'IL a refuse, pas
+        // seulement qu'il a refuse. Sans le champ `add_url`, ce test tombe.
+        let recues = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, tache) = demarrer_bouchon(NodeBouchon {
+            recues: recues.clone(),
+            code_add: axum::http::StatusCode::OK,
+            corps_add: ADD_EMPTY.to_string(),
+            ..Default::default()
+        })
+        .await;
+        let node = BluosOutput::new("Salon".into(), "d".into(), "127.0.0.1".into(), port);
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let media = media_bilou(FLUX_BILOU);
+        let attendu = node.build_add_url(&media);
+        // `set_default` et non `with_default` : la closure de `with_default` ne
+        // peut pas `await`, et un `block_on` imbrique figerait l'executeur
+        // mono-thread du test avec le bouchon dedans.
+        let garde = tracing::subscriber::set_default(abonne);
+        let issue = node.set_next_media(&media).await;
+        drop(garde);
+        tache.abort();
+
+        // Une preparation gapless ratee degrade vers une transition normale :
+        // elle ne doit PAS interrompre la lecture en cours.
+        assert!(issue.is_ok(), "{issue:?}");
+
+        let log = journal.texte();
+        assert!(log.contains("bluos_set_next_queue_still_empty"), "{log}");
+        assert!(
+            log.contains("add_url="),
+            "le refus gapless doit porter l'URL envoyee : {log}"
+        );
+        assert!(
+            log.contains("968625a7-3a25-48a1-a86a-b962ce981046.flac"),
+            "l'URL de flux doit etre lisible dans le journal : {log}"
+        );
+        assert!(
+            log.contains("title1=Come%20on%20In"),
+            "les parametres envoyes doivent etre lisibles : {log}"
+        );
+
+        // Et le chemin gapless envoie EXACTEMENT ce que `build_add_url` fabrique
+        // — c'est ce qui empeche les deux soeurs de diverger a nouveau.
+        let recues = recues.lock().unwrap().clone();
+        assert_eq!(recues.len(), 1, "{recues:?}");
+        assert!(
+            attendu.ends_with(&recues[0]),
+            "envoye={} attendu={attendu}",
+            recues[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn un_add_refuse_par_code_http_nomme_aussi_l_url_envoyee() {
+        // L'autre facon de refuser : le Node repond 404. Rien n'etait journalise
+        // du tout — l'`Err` remonte a l'utilisateur, jamais au diagnostic.
+        let recues = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, tache) = demarrer_bouchon(NodeBouchon {
+            recues,
+            code_add: axum::http::StatusCode::NOT_FOUND,
+            corps_add: "<nothing/>".to_string(),
+            ..Default::default()
+        })
+        .await;
+        let node = BluosOutput::new("Salon".into(), "d".into(), "127.0.0.1".into(), port);
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let media = media_bilou(FLUX_BILOU);
+        let garde = tracing::subscriber::set_default(abonne);
+        let issue = node.play_media(&media).await;
+        drop(garde);
+        tache.abort();
+
+        assert!(issue.is_err(), "un Add en 404 doit remonter une erreur");
+        let log = journal.texte();
+        assert!(log.contains("bluos_add_http_error"), "{log}");
+        assert!(
+            log.contains("968625a7-3a25-48a1-a86a-b962ce981046.flac"),
+            "le refus par code HTTP doit nommer l'URL envoyee : {log}"
+        );
+    }
+
+    /// Joue la piste de Bilou sur un Node bouchonne.
+    ///
+    /// Rend l'issue, le journal de niveau WARN, et les URI recues DANS L'ORDRE.
+    async fn jouer_sur_bouchon(etat: NodeBouchon) -> (Result<(), String>, String, Vec<String>) {
+        let recues = etat.recues.clone();
+        let (port, tache) = demarrer_bouchon(etat).await;
+        let node = BluosOutput::new("Salon".into(), "d".into(), "127.0.0.1".into(), port);
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        // `set_default` et non `with_default` : cf le test gapless plus haut.
+        let garde = tracing::subscriber::set_default(abonne);
+        let issue = node.play_media(&media_bilou(FLUX_BILOU)).await;
+        drop(garde);
+        tache.abort();
+
+        let appels = recues.lock().unwrap().clone();
+        (issue, journal.texte(), appels)
+    }
+
+    #[tokio::test]
+    async fn un_clear_refuse_par_le_node_est_ecrit_dans_le_journal() {
+        // Le Node repond 500 au Clear : ses pistes restent en file, et
+        // `/Play?id=0` va jouer l'entree 0 — celle de l'album precedent.
+        // C'etait un silence COMPLET : `let _ =` jetait l'`Err`.
+        let (issue, log, appels) = jouer_sur_bouchon(NodeBouchon {
+            code_clear: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            corps_clear: "<error/>".to_string(),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(
+            log.contains("bluos_clear_echec"),
+            "un Clear refuse par le Node doit etre journalise : {log}"
+        );
+        // Non bloquant : un Clear rate ne doit pas empecher la lecture.
+        assert!(issue.is_ok(), "{issue:?}");
+        assert!(
+            appels.iter().any(|u| u.starts_with("/Add?")),
+            "l'Add doit partir quand meme : {appels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_clear_acquitte_sans_vider_la_file_est_signale() {
+        // Acquitte n'est pas applique : 200, et `length="3"`. Rien n'echoue au
+        // sens HTTP, et pourtant l'entree 0 n'est plus la notre.
+        let (issue, log, _) = jouer_sur_bouchon(NodeBouchon {
+            corps_clear: CLEAR_FILE_PLEINE.to_string(),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(
+            log.contains("bluos_clear_acquitte_file_non_videe"),
+            "un Clear acquitte qui laisse la file pleine doit etre signale : {log}"
+        );
+        assert!(issue.is_ok(), "{issue:?}");
+    }
+
+    #[tokio::test]
+    async fn l_add_ne_part_pas_avant_que_le_clear_ait_rendu() {
+        // Le bouchon n'inscrit le `/Clear` qu'apres 150 ms. Un `Add` lance sans
+        // attendre la reponse s'inscrirait donc en premier.
+        let (issue, _, appels) = jouer_sur_bouchon(NodeBouchon {
+            latence_clear: std::time::Duration::from_millis(150),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(issue.is_ok(), "{issue:?}");
+        assert_eq!(appels.len(), 3, "{appels:?}");
+        assert!(appels[0].starts_with("/Clear"), "{appels:?}");
+        assert!(appels[1].starts_with("/Add?"), "{appels:?}");
+        assert!(appels[2].starts_with("/Play?"), "{appels:?}");
+    }
+
+    #[tokio::test]
+    async fn le_temoin_un_node_nominal_ne_change_pas_de_conduite() {
+        // Contre-epreuve : quand tout se passe bien, RIEN ne doit s'ecrire en
+        // WARN, et les trois memes appels partent, dans le meme ordre qu'avant.
+        let (issue, log, appels) = jouer_sur_bouchon(NodeBouchon::default()).await;
+
+        assert!(issue.is_ok(), "{issue:?}");
+        assert!(
+            log.trim().is_empty(),
+            "le cas nominal doit rester muet : {log}"
+        );
+        assert_eq!(appels.len(), 3, "{appels:?}");
+        assert!(appels[2].contains("id=0"), "{appels:?}");
+    }
+
+    // ── Garde de site : plus aucune commande du Node jetee en silence ──────
+
+    /// La partie PRODUCTION de ce fichier, sans le module de test.
+    ///
+    /// `include_str!` rend le fichier ENTIER, ce module compris — ou le motif
+    /// cherche apparait en toutes lettres, dans le garde-fou lui-meme. Sans la
+    /// coupe, il se prouverait tout seul et resterait vert quoi qu'il arrive au
+    /// code de production.
+    fn production_de_ce_fichier(source: &str) -> &str {
+        source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(avant, _)| avant)
+            .expect("la coupe `#[cfg(test)] mod tests {` doit exister")
+    }
+
+    #[test]
+    fn aucune_commande_envoyee_au_node_ne_jette_son_resultat() {
+        let production = production_de_ce_fichier(include_str!("bluos.rs"));
+        for (i, ligne) in production.lines().enumerate() {
+            assert!(
+                !ligne.contains("let _ = self.api_get("),
+                "bluos.rs:{} — `{}` : le resultat d'une commande envoyee au Node \
+                 est jete. Un Clear qui echoue laisse les pistes de l'album \
+                 precedent en file, et le `/Play?id=0` qui suit joue l'entree 0 \
+                 (#1996). Journaliser l'echec, ou le remonter.",
+                i + 1,
+                ligne.trim()
+            );
+        }
+    }
+
+    #[test]
+    fn le_garde_de_site_mord_vraiment() {
+        // Contre-epreuve du detecteur : il doit voir le motif en production, et
+        // ne PAS se prouver sur le module de test qui le contient.
+        let en_production = concat!(
+            "fn f() {\n",
+            "    let _ = self.api_get(\"Clear\", &[]).await;\n",
+            "}\n",
+            "#[cfg(test)]\nmod tests {\n}\n"
+        );
+        assert!(
+            production_de_ce_fichier(en_production).contains("let _ = self.api_get("),
+            "le detecteur doit voir le motif en production"
+        );
+
+        let seulement_dans_les_tests = concat!(
+            "fn f() {}\n",
+            "#[cfg(test)]\nmod tests {\n",
+            "    // let _ = self.api_get(\n",
+            "}\n"
+        );
+        assert!(
+            !production_de_ce_fichier(seulement_dans_les_tests).contains("let _ = self.api_get("),
+            "le detecteur ne doit pas se prouver sur son propre module de test"
+        );
     }
 }

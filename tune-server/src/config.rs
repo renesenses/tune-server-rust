@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use tracing::info;
+use std::path::{Path, PathBuf};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -49,6 +50,22 @@ pub struct TuneConfig {
     /// Overridable via `TUNE_FREE_MAX_ZONES`. Default 3.
     #[serde(default = "default_free_max_zones")]
     pub free_max_zones: i64,
+    /// `TUNE_AUTO_UPDATE` — « préviens-moi quand une version paraît » (#3217).
+    ///
+    /// À `true`, le serveur lance un vérificateur périodique (toutes les six
+    /// heures) qui interroge la liste des releases sur le canal enregistré et
+    /// dépose ce qu'il trouve, que `GET /system/update/status` rend sous
+    /// `available_update`. Il **n'installe rien** : la garde anti-coupure de
+    /// #2954 tient parce que toute installation est un geste délibéré, et un
+    /// vérificateur n'a personne à prévenir avant de couper la musique.
+    ///
+    /// 🔴 Le champ existait déjà — dans l'AUTRE `TuneConfig`, celle de
+    /// `tune-core/src/config.rs`, dont `from_env()` n'a AUCUN appelant dans le
+    /// dépôt. Le serveur charge cette structure-ci (`TuneConfig::load`), pas
+    /// celle-là : `TUNE_AUTO_UPDATE` n'était donc pas seulement lu nulle part,
+    /// il était déclaré dans une configuration que rien ne construit.
+    #[serde(default)]
+    pub auto_update: bool,
 }
 
 fn default_free_max_zones() -> i64 {
@@ -96,6 +113,42 @@ pub fn resolve_play_delay(
     zone_override.unwrap_or_else(|| config.play_delay_for(device_name))
 }
 
+/// Clé du réglage « silence UPnP » d'une zone. Même forme que
+/// `zone_{id}_upnp_renderer` : la clé est SUPPRIMÉE à la désactivation, pour
+/// que l'absence de clé et le défaut désarmé soient un seul et même état.
+pub fn cle_silence_upnp(zone_id: i64) -> String {
+    format!("zone_{zone_id}_upnp_silence")
+}
+
+/// L'option « silence UPnP » est-elle armée sur la zone qui porte cet appareil ?
+///
+/// Strictement opt-in : sans zone, sans réglage, ou sur un réglage illisible,
+/// la réponse est `false` et la sortie garde le régime par défaut (évènements
+/// + position mesurée). Relu à CHAQUE construction de `DlnaOutput`, comme
+/// `resolve_play_delay`, pour que le choix survive à un redémarrage et à une
+/// redécouverte — pas seulement à un PATCH en direct.
+pub fn resolve_upnp_silence(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    device_id: &str,
+) -> bool {
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::db::zone_repo::ZoneRepo;
+    let Some(zone_id) = ZoneRepo::with_backend(db.clone())
+        .get_by_device_id(device_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.id)
+    else {
+        return false;
+    };
+    SettingsRepo::with_backend(db.clone())
+        .get(&cle_silence_upnp(zone_id))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+}
+
 impl Default for TuneConfig {
     fn default() -> Self {
         Self {
@@ -121,8 +174,40 @@ impl Default for TuneConfig {
             local_exclusive_mode: false,
             tidal_quality: "HI_RES_LOSSLESS".into(),
             free_max_zones: default_free_max_zones(),
+            // Le défaut historique : personne n'est prévenu de rien tant qu'il
+            // ne l'a pas demandé. Poser le drapeau ne déclenche qu'un contrôle
+            // périodique, jamais une installation.
+            auto_update: false,
         }
     }
+}
+
+/// L'adresse annoncee, resolue depuis les DEUX orthographes d'environnement.
+///
+/// #3867 : quatre reponses coexistaient a « quelle est mon adresse ? ». Celle
+/// qui compte — `TuneConfig::advertised_ip` — n'etait alimentee que par
+/// `TUNE_ADVERTISED_IP` (avec D). `TUNE_ADVERTISE_IP` (sans D) n'etait lu que
+/// par `routes::system::server_urls` et la fiche systeme : une adresse posee
+/// sous ce nom s'affichait a l'ecran sans jamais etre annoncee en SSDP, ni
+/// portee par les URL de flux remises aux lecteurs.
+///
+/// Fonction PURE : elle ne lit pas l'environnement, pour etre eprouvee sans
+/// `set_var` (qui casserait la suite `--workspace` en parallele).
+///
+/// Rend `(adresse, l_ancien_nom_a_servi)`. Le nom publie l'emporte quand les
+/// deux sont poses ; une valeur vide ne compte pour aucun des deux ; `None`
+/// laisse intacte la valeur venue de `tune.toml`.
+pub(crate) fn adresse_annoncee_depuis_env(
+    avec_d: Option<&str>,
+    sans_d: Option<&str>,
+) -> (Option<String>, bool) {
+    if let Some(ip) = avec_d.filter(|ip| !ip.is_empty()) {
+        return (Some(ip.to_string()), false);
+    }
+    if let Some(ip) = sans_d.filter(|ip| !ip.is_empty()) {
+        return (Some(ip.to_string()), true);
+    }
+    (None, false)
 }
 
 impl TuneConfig {
@@ -197,33 +282,29 @@ impl TuneConfig {
             config.artwork_dir = format!("{data_dir}\\{}", config.artwork_dir);
         }
 
-        // On macOS, resolve relative paths to ~/Library/Application Support/Tune/
-        // so Tune works correctly regardless of the working directory (e.g. inside
-        // a signed .app bundle where CWD is read-only).  Backward-compat: if
-        // tune.db already exists in the CWD, keep using it.
+        // macOS, #3185 : UN SEUL chemin de base, quel que soit le repertoire de
+        // lancement. Le code precedent gardait la base trouvee dans le
+        // repertoire courant quand il y en avait une ; le meme binaire ouvrait
+        // donc DEUX bases differentes selon son lanceur — le `.command` depuis
+        // le dossier d'installation, le LaunchAgent depuis `/`. C'est le
+        // « si je le relance manuellement je perds les zones » du fil 616.
+        //
+        // La regle vit dans `plan_base_macos`, une fonction pure compilee sur
+        // TOUTES les plateformes : ce bloc-ci ne fait plus que lui donner ce
+        // qu'elle ne peut pas savoir (le HOME, le repertoire courant, ce qui
+        // existe sur le disque) et appliquer son plan.
         #[cfg(target_os = "macos")]
-        if !std::path::Path::new(&config.db_path).is_absolute() {
-            let cwd_db = std::path::Path::new(&config.db_path);
-            if !cwd_db.exists() {
-                if let Ok(home) = std::env::var("HOME") {
-                    let app_support =
-                        std::path::PathBuf::from(&home).join("Library/Application Support/Tune");
-                    if std::fs::create_dir_all(&app_support).is_ok() {
-                        let abs_path = app_support.join(&config.db_path);
-                        info!(path = %abs_path.display(), "db_path_resolved_to_app_support");
-                        config.db_path = abs_path.to_string_lossy().into_owned();
-
-                        if !std::path::Path::new(&config.artwork_dir).is_absolute() {
-                            let art_path = app_support.join(&config.artwork_dir);
-                            std::fs::create_dir_all(&art_path).ok();
-                            info!(path = %art_path.display(), "artwork_dir_resolved_to_app_support");
-                            config.artwork_dir = art_path.to_string_lossy().into_owned();
-                        }
-                    }
-                }
-            } else {
-                info!(path = %cwd_db.display(), "db_path_using_existing_local_db");
-            }
+        {
+            let repertoire_courant = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let home = std::env::var("HOME").ok();
+            let plan = plan_base_macos(
+                &config.db_path,
+                &config.artwork_dir,
+                home.as_deref(),
+                &repertoire_courant,
+                |chemin| chemin.exists(),
+            );
+            appliquer_plan_base_macos(&mut config, plan);
         }
 
         if let Ok(v) = std::env::var("TUNE_WEB_DIR") {
@@ -234,6 +315,13 @@ impl TuneConfig {
         }
         if let Ok(v) = std::env::var("TUNE_AUTO_SCAN") {
             config.auto_scan = v == "true";
+        }
+        // #3217 — `TUNE_AUTO_UPDATE` était lu par `tune-core/src/config.rs`,
+        // c'est-à-dire par une `TuneConfig` que le serveur ne construit jamais.
+        // Il est lu ICI, dans la configuration qui atteint réellement
+        // `spawn_background_tasks`.
+        if let Ok(v) = std::env::var("TUNE_AUTO_UPDATE") {
+            config.auto_update = v == "true";
         }
         if let Ok(v) = std::env::var("QOBUZ_APP_ID")
             && !v.is_empty()
@@ -273,9 +361,24 @@ impl TuneConfig {
         {
             config.openai_api_key = Some(v);
         }
-        if let Ok(v) = std::env::var("TUNE_ADVERTISED_IP")
-            && !v.is_empty()
-        {
+        // #3867 — une seule notion d'adresse annoncee, deux orthographes
+        // d'environnement. `TUNE_ADVERTISED_IP` est le nom publie
+        // (`.env.tune.example`) ; `TUNE_ADVERTISE_IP` (sans D) a vecu sa propre
+        // vie dans `server_urls` et la fiche systeme, sans jamais atteindre ce
+        // champ — c'est-a-dire sans jamais atteindre SSDP, les zones ni
+        // l'orchestrateur. Les deux alimentent desormais le MEME champ, seule
+        // source de verite ; l'ancien nom est accepte et signale.
+        let (ip_annoncee, ancien_nom) = adresse_annoncee_depuis_env(
+            std::env::var("TUNE_ADVERTISED_IP").ok().as_deref(),
+            std::env::var("TUNE_ADVERTISE_IP").ok().as_deref(),
+        );
+        if let Some(v) = ip_annoncee {
+            if ancien_nom {
+                warn!(
+                    adresse = %v,
+                    "TUNE_ADVERTISE_IP est obsolete (sans D) : renommer en TUNE_ADVERTISED_IP"
+                );
+            }
             config.advertised_ip = Some(v);
         }
         if let Ok(v) = std::env::var("TUNE_DATABASE_URL")
@@ -542,12 +645,238 @@ pub(crate) fn dual_stack_listen_socket(
     Some((socket, addr))
 }
 
+/// Le dossier de donnees de Tune sous macOS, relatif a `$HOME`.
+pub const MACOS_DATA_SUBDIR: &str = "Library/Application Support/Tune";
+
+/// Ce que le demarrage doit faire de la base, une fois la regle appliquee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionBaseMacos {
+    /// `db_path` etait deja absolu : la configuration a tranche, on n'y touche pas.
+    CheminAbsolu,
+    /// `HOME` est introuvable : rien a resoudre, les chemins restent tels quels.
+    HomeIntrouvable,
+    /// Rien a deplacer — la base d'`Application Support` est la seule.
+    Aucune,
+    /// Une base vit dans le repertoire de lancement et **aucune** dans
+    /// `Application Support` : elle doit y etre recopiee avant l'ouverture.
+    Migrer { source: PathBuf },
+    /// Les DEUX existent. `Application Support` l'emporte, et l'autre est
+    /// laissee EN PLACE, intacte, nommee dans le journal.
+    DeuxBases { delaissee: PathBuf },
+}
+
+/// Le plan rendu par la regle : les chemins retenus, et ce qu'il faut faire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanBaseMacos {
+    /// Le chemin de base retenu. Il ne depend JAMAIS du repertoire courant
+    /// des lors que `home` est connu : c'est tout l'objet de #3185.
+    pub db_path: String,
+    /// Le dossier de pochettes retenu, resolu par la meme regle.
+    pub artwork_dir: String,
+    /// Le dossier de donnees a creer, quand il y en a un.
+    pub app_support: Option<PathBuf>,
+    pub action: ActionBaseMacos,
+}
+
+/// La regle de #3185 : ou vit la base, et que faire de celle qu'on trouve
+/// ailleurs.
+///
+/// Fonction **pure**, et volontairement **sans `cfg`** : le bloc qu'elle
+/// remplace vivait sous `#[cfg(target_os = "macos")]`, donc n'existait pour
+/// aucun compilateur hors d'un Mac — un test qui aurait porte le meme `cfg`
+/// aurait ete vert contre rien. Tout ce que la regle a besoin de savoir lui
+/// est passe : le HOME, le repertoire courant, et un predicat d'existence.
+/// Le patron est celui de `tune_core::config::resolve_local_audio_backend`,
+/// qui prend son `lookup` en parametre « pour que la regle soit verifiable
+/// sans toucher a l'environnement du processus ».
+///
+/// Les regles, dans l'ordre :
+/// 1. un `db_path` **absolu** est honore tel quel — l'utilisateur a decide ;
+/// 2. sans `HOME`, rien n'est resolu : on ne fabrique pas un chemin au hasard ;
+/// 3. sinon le chemin retenu est TOUJOURS
+///    `$HOME/Library/Application Support/Tune/<db_path>`, que le repertoire
+///    courant contienne une base ou non. C'est l'invariant du correctif ;
+/// 4. si une base traine dans le repertoire courant et qu'il n'y en a pas
+///    encore sous `Application Support`, elle est **recopiee** ([`ActionBaseMacos::Migrer`]) ;
+/// 5. si les DEUX existent, `Application Support` gagne — c'est le seul choix
+///    qui ne depende pas du lanceur — et **aucune des deux n'est detruite**
+///    ([`ActionBaseMacos::DeuxBases`]). Le journal nomme la delaissee pour que
+///    l'utilisateur puisse la recuperer ou l'effacer lui-meme.
+pub fn plan_base_macos(
+    db_path: &str,
+    artwork_dir: &str,
+    home: Option<&str>,
+    repertoire_courant: &Path,
+    existe: impl Fn(&Path) -> bool,
+) -> PlanBaseMacos {
+    let inchange = |action| PlanBaseMacos {
+        db_path: db_path.to_string(),
+        artwork_dir: artwork_dir.to_string(),
+        app_support: None,
+        action,
+    };
+    if Path::new(db_path).is_absolute() {
+        return inchange(ActionBaseMacos::CheminAbsolu);
+    }
+    let Some(home) = home else {
+        return inchange(ActionBaseMacos::HomeIntrouvable);
+    };
+    let app_support = PathBuf::from(home).join(MACOS_DATA_SUBDIR);
+    let cible = app_support.join(db_path);
+    let locale = repertoire_courant.join(db_path);
+    // Lance DEPUIS `Application Support` : les deux chemins designent le meme
+    // fichier. Rien a migrer, et surtout rien a « delaisser ».
+    let action = if locale == cible {
+        ActionBaseMacos::Aucune
+    } else {
+        match (existe(&locale), existe(&cible)) {
+            (true, false) => ActionBaseMacos::Migrer { source: locale },
+            (true, true) => ActionBaseMacos::DeuxBases { delaissee: locale },
+            (false, _) => ActionBaseMacos::Aucune,
+        }
+    };
+    // `artwork_dir` suivait le meme chemin dans l'ancien bloc — mais SEULEMENT
+    // dans la branche « aucune base locale », donc lui aussi dependait du
+    // repertoire de lancement. Il est desormais resolu dans tous les cas.
+    let artwork_dir = if Path::new(artwork_dir).is_absolute() {
+        artwork_dir.to_string()
+    } else {
+        app_support.join(artwork_dir).to_string_lossy().into_owned()
+    };
+    PlanBaseMacos {
+        db_path: cible.to_string_lossy().into_owned(),
+        artwork_dir,
+        app_support: Some(app_support),
+        action,
+    }
+}
+
+/// Recopie une base SQLite **et ses annexes** vers `cible`, sans jamais
+/// effacer la source — reexportee depuis [`tune_core::db_backup`].
+///
+/// #3227 l'avait ecrite ici pour la migration macOS ; la migration Windows
+/// vers `%LOCALAPPDATA%\TuneServer` avait besoin du meme geste, au mot pres.
+/// Plutot que d'en tenir deux exemplaires, la mise en oeuvre vit desormais
+/// dans `tune_core::db_backup` — la caisse qui portait deja la connaissance
+/// « le `-wal` et le `-shm` voyagent avec la base », dans `create_backup`,
+/// `replace_database` et `prune_backups`, et que les DEUX chemins de
+/// migration atteignent. Un seul geste, un seul endroit a corriger la
+/// prochaine fois.
+///
+/// Les deux versions ont ete comparees ligne a ligne avant la fusion : elles
+/// etaient **identiques** — meme ordre, memes messages d'erreur, meme
+/// renoncement. Aucun comportement n'a ete arbitre au passage.
+pub use tune_core::db_backup::copier_base_sqlite;
+
+/// Applique le plan de [`plan_base_macos`] : cree le dossier de donnees,
+/// migre s'il le faut, puis pose les chemins definitifs dans la configuration.
+///
+/// Sans `cfg`, comme la regle : les effets de bord aussi sont ainsi eprouves
+/// sur Shrek. Seul l'appel — qui lit `HOME` et le repertoire courant du
+/// processus — reste sous `#[cfg(target_os = "macos")]`.
+///
+/// Deux replis, tous deux journalises :
+///
+/// * `Application Support` **increable** : les chemins d'entree sont conserves,
+///   c'est-a-dire exactement le comportement d'avant le correctif. Un dossier
+///   de donnees inaccessible n'est pas une raison pour refuser de demarrer ;
+/// * migration **echouee** : le chemin retenu reste malgre tout celui
+///   d'`Application Support`, et l'echec sort en `error!`. Repartir sur la base
+///   du repertoire courant reintroduirait precisement l'ambiguite que #3185
+///   corrige ; la base d'origine, elle, est intacte et le journal la nomme.
+pub fn appliquer_plan_base_macos(config: &mut TuneConfig, plan: PlanBaseMacos) {
+    if matches!(
+        plan.action,
+        ActionBaseMacos::CheminAbsolu | ActionBaseMacos::HomeIntrouvable
+    ) {
+        if plan.action == ActionBaseMacos::HomeIntrouvable {
+            warn!(db_path = %plan.db_path, "db_path_home_introuvable");
+        }
+        return;
+    }
+    let Some(app_support) = plan.app_support.as_ref() else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(app_support) {
+        warn!(
+            path = %app_support.display(),
+            error = %e,
+            "db_path_app_support_increable"
+        );
+        return;
+    }
+    match &plan.action {
+        ActionBaseMacos::Migrer { source } => {
+            info!(
+                from = %source.display(),
+                to = %plan.db_path,
+                "db_migration_vers_app_support"
+            );
+            match copier_base_sqlite(source, Path::new(&plan.db_path)) {
+                Ok(octets) => info!(
+                    octets,
+                    from = %source.display(),
+                    to = %plan.db_path,
+                    "db_migration_reussie_base_d_origine_conservee"
+                ),
+                Err(e) => error!(
+                    error = %e,
+                    from = %source.display(),
+                    to = %plan.db_path,
+                    "db_migration_echouee_base_d_origine_intacte"
+                ),
+            }
+        }
+        ActionBaseMacos::DeuxBases { delaissee } => {
+            warn!(
+                retenue = %plan.db_path,
+                delaissee = %delaissee.display(),
+                "db_deux_bases_application_support_l_emporte_l_autre_est_laissee_intacte"
+            );
+        }
+        _ => {}
+    }
+    info!(path = %plan.db_path, "db_path_resolved_to_app_support");
+    config.db_path = plan.db_path;
+    if config.artwork_dir != plan.artwork_dir {
+        std::fs::create_dir_all(&plan.artwork_dir).ok();
+        info!(path = %plan.artwork_dir, "artwork_dir_resolved_to_app_support");
+        config.artwork_dir = plan.artwork_dir;
+    }
+}
+
 #[cfg(test)]
 mod listen_socket_tests {
     use super::*;
 
+    /// L'hôte sait-il vraiment JOINDRE `::1` ?
+    ///
+    /// Une pile IPv6 peut exister, une socket peut s'y lier, et la boucle
+    /// locale rester INJOIGNABLE : sur Shrek, `connect("::1")` rend
+    /// `NetworkUnreachable` (code 101). Les deux sauts d'origine de l'épreuve
+    /// ci-dessous ne voyaient pas ce cas-là — elle tombait donc sur un défaut
+    /// de l'HÔTE en nommant « connexion ::1 refusée », jamais sur un défaut du
+    /// serveur. La question se pose ici, une fois, sur une socket à part.
+    fn boucle_locale_ipv6_joignable() -> bool {
+        let Ok(temoin) = std::net::TcpListener::bind("[::1]:0") else {
+            return false;
+        };
+        let Ok(port) = temoin.local_addr().map(|a| a.port()) else {
+            return false;
+        };
+        std::net::TcpStream::connect(("::1", port)).is_ok()
+    }
+
     /// Le point du correctif #1321 : une seule socket doit servir les clients
     /// IPv4 (Chrome, 127.0.0.1) ET IPv6 (Firefox, ::1).
+    ///
+    /// ⚠️ Cette épreuve ne devient JAMAIS un no-op complet (#3569). Ses deux
+    /// sauts d'origine — pas de socket double pile, `bind` refusé — rendaient
+    /// la main sans avoir rien exigé : sur un hôte sans IPv6, elle s'affichait
+    /// verte en n'ayant mesuré aucune des deux familles. La moitié IPv4 du
+    /// contrat ne dépend d'aucune capacité de l'hôte : elle est exigée
+    /// d'abord, et sans condition. Seule la moitié IPv6 s'annonce sautée, et
+    /// elle le dit.
     #[test]
     fn dual_stack_socket_accepts_both_families() {
         let Some((socket, addr)) = dual_stack_listen_socket(0) else {
@@ -562,11 +891,27 @@ mod listen_socket_tests {
         let listener: std::net::TcpListener = socket.into();
         let port = listener.local_addr().expect("local_addr").port();
 
-        for target in ["127.0.0.1", "::1"] {
-            let client = std::net::TcpStream::connect((target, port));
-            assert!(client.is_ok(), "connexion {target} refusée : {client:?}");
-            drop(listener.accept().expect("accept"));
+        let v4 = std::net::TcpStream::connect(("127.0.0.1", port));
+        assert!(
+            v4.is_ok(),
+            "connexion 127.0.0.1 refusée sur la socket double pile : {v4:?}"
+        );
+        drop(listener.accept().expect("accept IPv4"));
+
+        if !boucle_locale_ipv6_joignable() {
+            eprintln!(
+                "SAUT PARTIEL : `::1` est injoignable sur cet hôte. La moitié \
+                 IPv4 du contrat de #1321 vient d'être EXIGÉE ; la moitié IPv6 \
+                 ne peut l'être nulle part sans boucle locale IPv6 routée."
+            );
+            return;
         }
+        let v6 = std::net::TcpStream::connect(("::1", port));
+        assert!(
+            v6.is_ok(),
+            "connexion ::1 refusée sur la socket double pile : {v6:?}"
+        );
+        drop(listener.accept().expect("accept IPv6"));
     }
 
     #[test]
@@ -574,5 +919,124 @@ mod listen_socket_tests {
         let socket = ipv4_listen_socket();
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
         socket.bind(&addr.into()).expect("bind IPv4");
+    }
+}
+
+/// Le port annonce par la DOCUMENTATION doit etre celui que le code ecoute.
+///
+/// #2680 — `README.md` et `MIGRATION.md` ont annonce `TUNE_PORT | 8085` bien
+/// apres que le defaut du code soit passe a 8888. Un exploitant qui suit la
+/// doc ouvre son pare-feu sur un port mort, et surtout declare a Spotify une
+/// URI de redirection qui nomme ce port-la : c'est litteralement le doute que
+/// Krugy a formule sur le fil 34.
+///
+/// Une constante et une phrase de documentation ne se tiennent par rien : ce
+/// garde est le lien. Il est volontairement ETROIT — il ne verifie qu'une
+/// chose, la ligne de tableau `| `TUNE_PORT` | <n> | ...`, dans les deux
+/// fichiers ou elle existe.
+#[cfg(test)]
+mod port_documente_guard {
+    use super::*;
+
+    fn defaut_documente(markdown: &str, fichier: &str) -> u16 {
+        let ligne = markdown
+            .lines()
+            .find(|l| l.trim_start().starts_with("| `TUNE_PORT` |"))
+            .unwrap_or_else(|| panic!("{fichier} n'annonce plus TUNE_PORT dans son tableau"));
+        let colonne = ligne
+            .split('|')
+            .nth(2)
+            .unwrap_or_else(|| panic!("{fichier} : ligne TUNE_PORT malformee : {ligne}"))
+            .trim();
+        colonne
+            .parse::<u16>()
+            .unwrap_or_else(|e| panic!("{fichier} : defaut TUNE_PORT illisible ({colonne}) : {e}"))
+    }
+
+    #[test]
+    fn la_doc_annonce_le_port_que_le_code_ecoute() {
+        let attendu = TuneConfig::default().port;
+        for fichier in ["README.md", "MIGRATION.md"] {
+            let chemin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(fichier);
+            let markdown = std::fs::read_to_string(&chemin)
+                .unwrap_or_else(|e| panic!("{} illisible : {e}", chemin.display()));
+            assert_eq!(
+                defaut_documente(&markdown, fichier),
+                attendu,
+                "{fichier} annonce un autre port par defaut que `TuneConfig::default().port`"
+            );
+        }
+    }
+
+    /// Le defaut Spotify DERIVE de ce meme port : les deux ne peuvent plus
+    /// diverger en silence.
+    #[test]
+    fn l_uri_spotify_par_defaut_nomme_ce_port() {
+        let port = TuneConfig::default().port;
+        assert_eq!(
+            tune_core::streaming::spotify::default_redirect_uri(port),
+            format!("http://127.0.0.1:{port}/api/v1/streaming/spotify/callback")
+        );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// #3867 — l'adresse annoncee n'a qu'une seule destination
+// ───────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod adresse_annoncee_3867 {
+    use super::adresse_annoncee_depuis_env;
+
+    /// Le defaut mesure : `TUNE_ADVERTISE_IP` (sans D) etait lu par
+    /// `server_urls` et la fiche systeme, et par RIEN d'autre. L'annonceur
+    /// SSDP (`background.rs`, via `config.advertised_ip`), les URL de flux des
+    /// zones (`routes/zones.rs`) et l'orchestrateur (`orchestrator/commun.rs`)
+    /// lisent tous `advertised_ip` : une adresse posee sous l'ancien nom ne les
+    /// atteignait jamais. Elle doit desormais y arriver, et etre signalee.
+    #[test]
+    fn l_ancien_nom_sans_d_alimente_le_champ_annonce() {
+        let (ip, ancien) = adresse_annoncee_depuis_env(None, Some("192.168.1.100"));
+        assert_eq!(
+            ip.as_deref(),
+            Some("192.168.1.100"),
+            "TUNE_ADVERTISE_IP (sans D) doit alimenter advertised_ip : sans cela \
+             l'adresse s'affiche a l'ecran mais n'est ni annoncee en SSDP ni \
+             portee par les URL de flux (#3867)"
+        );
+        assert!(ancien, "l'emploi de l'ancien nom doit etre signale");
+    }
+
+    /// Le nom publie (`.env.tune.example`) l'emporte quand les deux sont poses,
+    /// et ne declenche aucun avertissement.
+    #[test]
+    fn le_nom_publie_l_emporte_sans_avertissement() {
+        let (ip, ancien) = adresse_annoncee_depuis_env(Some("10.0.0.1"), Some("192.168.1.100"));
+        assert_eq!(ip.as_deref(), Some("10.0.0.1"));
+        assert!(!ancien, "TUNE_ADVERTISED_IP ne doit rien deprecier");
+    }
+
+    /// Une variable posee mais VIDE ne vaut pas une adresse — sans quoi
+    /// `advertised_ip = Some("")` ferait annoncer `http://:8888`, et le repli
+    /// d'autodetection ne s'appliquerait jamais.
+    #[test]
+    fn une_valeur_vide_ne_compte_pour_aucun_des_deux_noms() {
+        assert_eq!(adresse_annoncee_depuis_env(Some(""), None), (None, false));
+        assert_eq!(adresse_annoncee_depuis_env(None, Some("")), (None, false));
+        let (ip, ancien) = adresse_annoncee_depuis_env(Some(""), Some("192.168.1.100"));
+        assert_eq!(
+            ip.as_deref(),
+            Some("192.168.1.100"),
+            "un TUNE_ADVERTISED_IP vide ne doit pas masquer l'ancien nom"
+        );
+        assert!(ancien);
+    }
+
+    /// Rien dans l'environnement : la valeur de `tune.toml` doit survivre.
+    /// `load()` n'ecrit le champ que sur un `Some`.
+    #[test]
+    fn sans_environnement_la_valeur_de_tune_toml_survit() {
+        assert_eq!(adresse_annoncee_depuis_env(None, None), (None, false));
     }
 }

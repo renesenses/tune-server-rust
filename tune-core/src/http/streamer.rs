@@ -75,15 +75,35 @@ pub struct StreamInfo {
 impl StreamInfo {
     /// Calculate the expected WAV file size from audio parameters and duration.
     /// Returns `44 + data_bytes` (WAV header + raw PCM data).
+    ///
+    /// `data_bytes` est **arrondi vers le bas sur une trame entière**. Une
+    /// durée en millisecondes ne tombe presque jamais sur un nombre entier de
+    /// trames : 192 705 ms en 44,1 kHz / 16 bits / stéréo donnent
+    /// 192 705 × 176 400 / 1 000 = 33 993 162 octets, soit 8 498 290 trames
+    /// **plus 2 octets**. Cette longueur est annoncée en `Content-Length` ; le
+    /// client HTTP livre exactement ce nombre d'octets puis signale une fin de
+    /// corps propre, et les 1 à 3 derniers octets ne sont pas de l'audio — ils
+    /// sont une fraction de trame. Côté OAAT, `StreamingPcmByteAdapter::finish()`
+    /// les retrouvait dans son reliquat et faisait échouer la piste APRÈS
+    /// qu'elle a été jouée en entier, ce qui coupait la zone et annulait une
+    /// transition gapless déjà prête (#3163, Steve Taylor, fil 1641 : reliquat
+    /// de 2 octets à 21:57:32, puis de 1 octet à 22:09:29).
+    ///
+    /// Un octet de moins annoncé ne retire aucun audio : ces octets n'existent
+    /// pas dans le flux décodé, la durée réelle diffère de toute façon de la
+    /// durée en bibliothèque.
     pub fn wav_content_length(&self) -> Option<u64> {
         let dur = self.duration_ms?;
         if self.sample_rate == 0 || self.channels == 0 || self.bit_depth == 0 {
             return None;
         }
         let bytes_per_sample = self.bit_depth as u64 / 8;
-        let data_bytes =
-            dur * self.sample_rate as u64 * self.channels as u64 * bytes_per_sample / 1000;
-        Some(44 + data_bytes)
+        let frame_bytes = self.channels as u64 * bytes_per_sample;
+        if frame_bytes == 0 {
+            return None;
+        }
+        let data_bytes = dur * self.sample_rate as u64 * frame_bytes / 1000;
+        Some(44 + data_bytes - data_bytes % frame_bytes)
     }
 }
 
@@ -132,6 +152,29 @@ pub struct StreamSession {
     /// PCM nu, sans RIFF. Le consommateur qui voit passer l'en-tête le range
     /// ici ; chaque nouvelle connexion partant de l'octet 0 le reçoit d'abord.
     pub wav_header_stash: std::sync::OnceLock<Vec<u8>>,
+    /// Position, DANS LE FLUX, du prochain octet que le canal rendra.
+    ///
+    /// Un canal de conversion est un TUYAU : il ne connaît qu'un sens et ne
+    /// rejoue pas un octet passé. Le corps HTTP honore pourtant les reprises
+    /// `Range: bytes=N-` par un vrai 206 (l'Eversolo DMP-A8 jette un 200 et
+    /// redemande le même offset en boucle — la « boucle de 4-7 s » des DSD
+    /// convertis). Le 206 annonce donc N ; les octets, eux, sortent d'où le
+    /// tuyau en est.
+    ///
+    /// Sur du PCM ordinaire l'écart s'entend comme un saut. Sur un porteur DoP
+    /// il est FATAL : le marqueur `0x05`/`0xFA` vit dans l'octet de poids fort
+    /// d'un mot de 24 bits, et le renderer place les octets reçus sur la grille
+    /// de trames que l'offset ANNONCÉ implique. Un écart qui n'est pas un
+    /// multiple de la trame décale chaque mot, le marqueur ne tombe plus au bon
+    /// endroit, le DAC ne verrouille pas en DSD et joue le train DSD comme du
+    /// PCM — du bruit blanc (#1894).
+    ///
+    /// Ce compteur donne au corps HTTP l'offset réel de chaque bloc reçu, dont
+    /// il déduit le rognage de phase (`rognage_de_phase`, `tune-stream-http`).
+    /// Il compte les octets TIRÉS du canal, en-tête WAV compris : c'est la
+    /// position du tuyau, pas celle des octets livrés — ceux qu'une connexion
+    /// avortée a emportés dans son tampon de coalescence sont bien consommés.
+    pub octets_du_canal: std::sync::atomic::AtomicU64,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
     /// Comptabilité du ramasse-miettes — voir `cleanup_stale_sessions_with`.
@@ -169,6 +212,58 @@ pub struct StreamSession {
     /// calls `claim_channel_consumer()` to bump this and supersede the older
     /// connection, which then hands off the channel and ends. `0` = no consumer.
     pub consumer_epoch: std::sync::atomic::AtomicU64,
+    /// Vrai dès que le canal PCM de cette session a été observé PLEIN, donc
+    /// dès que le producteur a pris de l'avance sur le lecteur au moins une
+    /// fois. Sans ce témoin, « canal vide » ne veut rien dire : au démarrage
+    /// il l'est toujours, le temps que le décodeur prenne son avance.
+    pub channel_was_full: std::sync::atomic::AtomicBool,
+    /// Vrai une fois l'alerte `stream_producer_ran_dry` émise. Une seule
+    /// ligne par session : elle dit un FAIT ponctuel — le producteur a cessé
+    /// d'être en avance — et le répéter à chaque morceau noierait le journal.
+    pub dry_alert_emitted: std::sync::atomic::AtomicBool,
+    /// Vrai tant que le blocage EN COURS a déjà été signalé.
+    ///
+    /// Contrairement à `dry_alert_emitted`, ce témoin se RÉARME au premier
+    /// tour de boucle sain : une ligne par BLOCAGE, et non une par session.
+    ///
+    /// La règle « une seule ligne par session » perdait la moitié de la
+    /// matière de #2952. Le journal de Belkadi Yacine porte DEUX blocages dans
+    /// la MÊME piste — donc la même session : `local_audio_slow_read`
+    /// `wait_ms=38594` à 15:47:42 puis `wait_ms=44853` à 15:48:36, tous deux
+    /// entre le début de la piste (15:46:47, déduit de `wall_secs=290` sur le
+    /// `track_end_gap` de 15:51:37) et sa fin. La même paire se répète sur la
+    /// piste suivante (35 191 ms puis 35 367 ms). Avec un seul tir par
+    /// session, le second blocage de chaque piste n'aurait JAMAIS de ligne
+    /// côté serveur — et le lecteur du journal, voyant deux attentes de la
+    /// sortie locale en face d'une seule ligne du flux, conclurait que la
+    /// seconde n'a pas de contrepartie. C'est l'absence prise pour une preuve.
+    ///
+    /// Le débit reste borné : un blocage dure au moins
+    /// `DELIVERY_STALL_THRESHOLD`, donc au plus une ligne toutes les 20 s par
+    /// session, quoi qu'il arrive.
+    pub stall_alert_emitted: std::sync::atomic::AtomicBool,
+    /// Nombre de blocages signalés depuis le début de la session. Porté par la
+    /// ligne (`blocage = n`) pour qu'un journal dise tout de suite si l'on lit
+    /// le premier trou de la piste ou le troisième.
+    pub stall_alerts: std::sync::atomic::AtomicU32,
+    /// Instant du `yield` EN COURS du corps HTTP, s'il y en a un.
+    ///
+    /// `note_delivery_stall` ne se prononce qu'APRÈS coup : la durée d'un
+    /// `yield` n'est connue qu'au RETOUR de ce `yield`. Un blocage qui ne
+    /// finit jamais — la connexion meurt, la zone est arrêtée, le corps est
+    /// lâché en vol — ne laisse donc AUCUNE ligne : le seul endroit qui
+    /// mesure n'est jamais atteint. C'est la forme même de #3575 (« sortie
+    /// locale imprenable pour toute la vie du processus »), et c'est le pire
+    /// cas qui se taise. Ce champ tient l'attente en vol pour que la
+    /// sentinelle du corps puisse la NOMMER au moment où le corps est lâché.
+    ///
+    /// `tokio::time::Instant` et non `std::time::Instant` : l'horloge du test
+    /// se met en pause et s'avance à la main, sans quoi le vert dépendrait de
+    /// la charge de la machine.
+    pub attente_transport_en_vol: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Vrai une fois l'alerte `stream_delivery_abandoned` émise. Un corps ne
+    /// se lâche qu'une fois : pas de réarmement ici.
+    pub abandon_alert_emitted: std::sync::atomic::AtomicBool,
     /// Wakes an older radio consumer the instant a newer one claims the channel
     /// so it releases the `rx` lock promptly instead of staying parked in
     /// `recv_chunk()`. Paired with `consumer_epoch`; see `claim_channel_consumer`.
@@ -260,6 +355,7 @@ impl StreamSession {
             detected_channels: std::sync::atomic::AtomicU16::new(0),
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
             wav_header_stash: std::sync::OnceLock::new(),
+            octets_du_canal: std::sync::atomic::AtomicU64::new(0),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
             gc_seen_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -267,6 +363,12 @@ impl StreamSession {
             active_consumers: std::sync::atomic::AtomicU32::new(0),
             consumer_watch_armed: std::sync::atomic::AtomicBool::new(false),
             consumer_epoch: std::sync::atomic::AtomicU64::new(0),
+            channel_was_full: std::sync::atomic::AtomicBool::new(false),
+            dry_alert_emitted: std::sync::atomic::AtomicBool::new(false),
+            stall_alert_emitted: std::sync::atomic::AtomicBool::new(false),
+            stall_alerts: std::sync::atomic::AtomicU32::new(0),
+            attente_transport_en_vol: std::sync::Mutex::new(None),
+            abandon_alert_emitted: std::sync::atomic::AtomicBool::new(false),
             consumer_supersede: std::sync::Arc::new(tokio::sync::Notify::new()),
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -333,7 +435,137 @@ impl StreamSession {
             (max.saturating_sub(tx.capacity()), max)
         })
     }
+
+    /// Enregistre un remplissage observé du canal et dit s'il faut ALERTER.
+    ///
+    /// Rend `true` la PREMIÈRE fois que le canal, après avoir été observé
+    /// PLEIN, est trouvé VIDE — et jamais ensuite. C'est le seul instant qui
+    /// se lit sans ambiguïté : le producteur avait pris de l'avance, il ne
+    /// l'a plus. Un canal vide au DÉMARRAGE ne dit rien (il l'est toujours,
+    /// le temps que le décodeur démarre), et c'est pourquoi la condition
+    /// n'est pas « vide » mais « vide après avoir été plein ».
+    ///
+    /// C'est la trace symétrique de `local_audio_slow_read` (outputs/local.rs)
+    /// : celle-ci dit qu'on a attendu, celle-là dit QUI faisait attendre. Une
+    /// attente de la sortie locale SANS cette ligne dans la même fenêtre
+    /// disculpe le producteur — le canal était plein, les octets étaient là.
+    pub fn note_channel_fill(&self, buffered: usize, max: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if max > 0 && buffered >= max {
+            self.channel_was_full.store(true, Relaxed);
+            return false;
+        }
+        if buffered > 0 || !self.channel_was_full.load(Relaxed) {
+            return false;
+        }
+        !self.dry_alert_emitted.swap(true, Relaxed)
+    }
+
+    /// Enregistre les deux attentes d'un tour de boucle du corps HTTP et dit
+    /// s'il faut ALERTER.
+    ///
+    /// `note_channel_fill` ne couvre qu'UNE des deux moitiés du problème : le
+    /// producteur qui se tarit. L'autre moitié ne laisse aucune trace du tout
+    /// — quand les octets sont DÉJÀ dans le canal et que c'est le corps HTTP
+    /// qui n'est plus servi (réacteur affamé, socket qui ne se vide pas), le
+    /// canal reste PLEIN, `note_channel_fill` se tait, et la sortie locale
+    /// attend dans un `reader.read()` sans limite de temps sans que rien côté
+    /// serveur ne le dise. C'est exactement le trou laissé ouvert par #2952 :
+    /// « on sait que `reader.read()` ne rend rien ; on ne sait pas si c'est le
+    /// décodage, le transcodage, l'écriture dans la session ou le socket ».
+    ///
+    /// Les deux attentes se mesurent au même endroit et se lisent ensemble :
+    ///
+    /// - `attente_producteur` — temps passé DANS `recv_chunk()`. Le canal était
+    ///   vide, on attendait le décodeur.
+    /// - `attente_transport` — temps passé DANS le `yield`, c'est-à-dire entre
+    ///   le moment où le corps a rendu un morceau et celui où on est revenu
+    ///   lui en demander un autre. Les octets étaient en main ; c'est en aval
+    ///   qu'ils n'avançaient pas.
+    ///
+    /// Une seule ligne par session, la première fois que l'une des deux
+    /// dépasse le seuil, et elle porte les DEUX valeurs plus le remplissage du
+    /// canal : c'est ce triplet qui départage, sans rien redemander au
+    /// testeur, « le producteur n'a rien produit » de « les octets étaient là
+    /// et ne sont pas partis ».
+    ///
+    /// # Une ligne par BLOCAGE, pas une par session
+    ///
+    /// Le témoin se réarme au premier tour sain. Voir `stall_alert_emitted` :
+    /// #2952 porte deux blocages par piste, donc deux par session, et la règle
+    /// d'origine en effaçait un sur deux.
+    pub fn note_delivery_stall(
+        &self,
+        attente_producteur: std::time::Duration,
+        attente_transport: std::time::Duration,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if attente_producteur < DELIVERY_STALL_THRESHOLD
+            && attente_transport < DELIVERY_STALL_THRESHOLD
+        {
+            // Tour sain : le blocage précédent, s'il y en avait un, est fini.
+            // Le prochain aura droit à sa ligne.
+            self.stall_alert_emitted.store(false, Relaxed);
+            return false;
+        }
+        let premier = !self.stall_alert_emitted.swap(true, Relaxed);
+        if premier {
+            self.stall_alerts.fetch_add(1, Relaxed);
+        }
+        premier
+    }
+
+    /// Note qu'un `yield` du corps HTTP COMMENCE : les octets sont en main, et
+    /// c'est en aval qu'on attend maintenant.
+    pub fn debut_attente_transport(&self) {
+        if let Ok(mut slot) = self.attente_transport_en_vol.lock() {
+            *slot = Some(tokio::time::Instant::now());
+        }
+    }
+
+    /// Note que le `yield` en cours est REVENU, et rend sa durée.
+    ///
+    /// Rend zéro si aucun `yield` n'était en vol : un appel sans début apparié
+    /// ne doit pas inventer une attente.
+    pub fn fin_attente_transport(&self) -> std::time::Duration {
+        self.attente_transport_en_vol
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .map(|debut| debut.elapsed())
+            .unwrap_or_default()
+    }
+
+    /// Le corps a été LÂCHÉ alors qu'un `yield` était encore en vol : rend la
+    /// durée de l'attente abandonnée s'il faut ALERTER, `None` sinon.
+    ///
+    /// C'est la seule mesure possible d'un blocage qui ne finit jamais :
+    /// `note_delivery_stall` attend le retour du `yield`, qui n'aura pas lieu.
+    /// Sous le seuil, rien — un corps lâché entre deux morceaux est le cas
+    /// ORDINAIRE (le renderer a fini, la zone a changé de piste).
+    pub fn note_delivery_abandoned(&self) -> Option<std::time::Duration> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let debut = self
+            .attente_transport_en_vol
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())?;
+        let attente = debut.elapsed();
+        if attente < DELIVERY_STALL_THRESHOLD {
+            return None;
+        }
+        (!self.abandon_alert_emitted.swap(true, Relaxed)).then_some(attente)
+    }
 }
+
+/// Au-delà de cette attente, un flux interne est tenu pour BLOQUÉ.
+///
+/// Très au-dessus de toute contre-pression légitime : la sortie locale ne lit
+/// qu'au fil de son anneau (2 s) et un renderer réseau qui tamponne peut
+/// laisser le corps en attente plusieurs secondes sans que rien n'aille mal.
+/// Les attentes mesurées chez le testeur de #2952 valent 35 à 56 s ; ce seuil
+/// les attrape toutes et ne dit rien d'une lecture saine.
+pub const DELIVERY_STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Type alias for the shared sessions map, used by both core and server.
 pub type SharedSessions = Arc<Mutex<HashMap<String, Arc<StreamSession>>>>;
@@ -419,6 +651,224 @@ pub fn forget_radio_now(stream_id: &str) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Par où le renderer apprend qu'un morceau a changé (#2991)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `publish_radio_now` ci-dessus DÉPOSE le titre courant. Il ne dit rien de ce
+// qui va le RELIRE. Or le seul canal qui puisse porter un changement de morceau
+// jusqu'à un renderer DLNA en cours de flux est la fenêtre ICY, et elle ne
+// s'ouvre que si trois choses se rencontrent :
+//
+//   1. le now-playing de la zone porte un `stream_id` — sans lui, le dépôt
+//      ci-dessus n'a même pas lieu (la garde du poller) ;
+//   2. la requête du renderer a été servie par la branche « flux » de
+//      `handle_stream` — les branches fichier et mandataire n'insèrent AUCUN
+//      bloc ICY, quoi que le renderer ait demandé ;
+//   3. le renderer a demandé les métadonnées en cours de flux (en-tête ICY de
+//      requête) et la fenêtre `icy-metaint` lui a été accordée.
+//
+// Quand l'une des trois manque, tout continue de fonctionner CÔTÉ TUNE — le
+// now-playing de l'interface est mis à jour par un autre chemin — et l'écran du
+// lecteur réseau reste figé sur le premier morceau. C'est exactement le tableau
+// décrit par Serge Asselin (Hifi Rose RS250A, fil 1529) : « dans Tune ça
+// fonctionne, mais sur le RS250A l'écran demeure avec la pochette et le titre de
+// la première écoute ».
+//
+// On ne pouvait pas trancher laquelle des trois mordait : rien ne les
+// rapprochait. Ce registre le fait, par le `stream_id`, la seule clé que le
+// gestionnaire de flux et le poller partagent déjà — même patron que
+// `RADIO_NOW`, et la même durée de vie (voir `remove_session`).
+
+/// La branche de `handle_stream` qui a servi la requête. Seule [`VOIE_FLUX`]
+/// sait découper le corps et y insérer des blocs ICY (`decoupe_icy`) ; les deux
+/// autres recopient des octets et ne peuvent, par construction, porter aucune
+/// mise à jour de métadonnées.
+pub const VOIE_FLUX: &str = "flux";
+/// Branche fichier (`serve_file`) : Range, `Content-Length`, aucun ICY.
+pub const VOIE_FICHIER: &str = "fichier";
+/// Branche mandataire (`proxy_stream`) : recopie de l'amont, aucun ICY.
+pub const VOIE_MANDATAIRE: &str = "mandataire";
+
+/// Ce qui a été négocié avec le renderer sur une session de flux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanalIcy {
+    /// Le renderer a demandé les métadonnées en cours de flux (en-tête ICY de
+    /// requête ; le gestionnaire de flux le lit sous le nom `wants_icy`).
+    pub demande: bool,
+    /// La fenêtre `icy-metaint` lui a effectivement été annoncée.
+    pub accorde: bool,
+    /// La branche qui l'a servi (une des trois constantes ci-dessus).
+    pub voie: &'static str,
+    /// La reponse a-t-elle ete servie au contrat FICHIER — `Content-Length`
+    /// fini + `Accept-Ranges` — plutot qu'en corps chunke ?
+    ///
+    /// Une radio bornee est le cas ORDINAIRE d'un renderer reseau :
+    /// `accepts_chunked_live_stream` ne rend `true` que pour un agent `Lavf`
+    /// (ou absent), tout le reste recoit le contrat fichier (#1689). Les blocs
+    /// ICY y sont entrelaces exactement de la meme facon — mais la reponse, elle,
+    /// se presente au renderer comme un FICHIER, et c'est la moitie de la
+    /// negociation qu'aucun journal ne portait. On la NOTE ; on n'en conclut
+    /// rien : rien dans ce depot ne prouve qu'un appareil cesse de lire l'ICY
+    /// parce que la reponse est bornee.
+    pub borne: bool,
+}
+
+static ICY_NEGOCIE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, CanalIcy>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Noter ce qui a été négocié pour une session. Appelé par le gestionnaire de
+/// flux sur les TROIS branches — y compris celles qui ne portent pas d'ICY :
+/// « aucune trace » et « servi par une voie sans ICY » sont deux diagnostics
+/// différents, et c'est justement celui-là qu'on n'avait pas.
+pub fn note_icy_channel(
+    stream_id: &str,
+    demande: bool,
+    accorde: bool,
+    voie: &'static str,
+    borne: bool,
+) {
+    if let Ok(mut map) = ICY_NEGOCIE.lock() {
+        map.insert(
+            stream_id.to_string(),
+            CanalIcy {
+                demande,
+                accorde,
+                voie,
+                borne,
+            },
+        );
+    }
+}
+
+/// Relire ce qui a été négocié, si un renderer s'est connecté à ce flux.
+pub fn icy_channel(stream_id: &str) -> Option<CanalIcy> {
+    ICY_NEGOCIE.lock().ok()?.get(stream_id).copied()
+}
+
+/// Oublier une session terminée (même vie que [`forget_radio_now`]).
+pub fn forget_icy_channel(stream_id: &str) {
+    if let Ok(mut map) = ICY_NEGOCIE.lock() {
+        map.remove(stream_id);
+    }
+}
+
+/// Le verdict : par où — ou par où PAS — le changement de morceau atteint le
+/// renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanalRadio {
+    /// Fenêtre ICY accordée : les blocs partent, l'écran peut suivre. `borne`
+    /// dit sous quel contrat la réponse a été servie — corps chunké, ou fichier
+    /// borné (`Content-Length` + `Accept-Ranges`, le cas de tout renderer dont
+    /// l'agent n'est pas `Lavf`). Le verdict reste le même : les blocs partent.
+    /// Seul le libellé du journal change, parce que c'est l'information qui
+    /// manquait pour instruire le cas d'un appareil qui ne suit pas (#2991).
+    Icy { borne: bool },
+    /// Servi par une branche qui n'insère aucun bloc ICY (fichier, mandataire).
+    VoieSansIcy,
+    /// Le renderer n'a pas demandé les métadonnées en cours de flux.
+    IcyNonDemande,
+    /// Demandé, mais la session ne remplissait pas les conditions d'ouverture.
+    IcyRefuse,
+    /// Un `stream_id` existe, mais aucun renderer ne s'y est encore connecté.
+    AucuneConnexion,
+    /// Le now-playing ne porte AUCUN `stream_id` : rien n'est même publié.
+    SansStreamId,
+}
+
+impl CanalRadio {
+    /// Le changement de morceau atteint-il réellement le renderer ?
+    pub fn atteint_le_renderer(self) -> bool {
+        matches!(self, CanalRadio::Icy { .. })
+    }
+
+    /// Le libellé qui part au journal. Écrit pour être lu SEUL : une seule
+    /// ligne doit suffire à savoir laquelle des branches mord.
+    ///
+    /// L'en-tête de requête n'y est pas épelé : le garde #3018
+    /// (`tune-core/tests/pochette_radio_source_unique.rs`) réserve cette chaîne
+    /// à `src/radio_metadata.rs`, pour qu'une recherche dans le code ne trouve
+    /// qu'UN endroit où l'on lit les métadonnées radio. Le gestionnaire de flux
+    /// le nomme, lui, dans `icy_metadata_negotiated`.
+    pub fn libelle(self) -> &'static str {
+        match self {
+            CanalRadio::Icy { borne: false } => {
+                "icy — fenêtre accordée sur un corps chunké, les blocs partent"
+            }
+            CanalRadio::Icy { borne: true } => {
+                "icy — fenêtre accordée, mais la réponse est servie au contrat FICHIER \
+                 (Content-Length + Accept-Ranges) : les blocs partent quand même, reste à \
+                 savoir si l'appareil les lit"
+            }
+            CanalRadio::VoieSansIcy => {
+                "aucun — servi par une voie qui n'insère aucun bloc ICY (fichier ou mandataire)"
+            }
+            CanalRadio::IcyNonDemande => {
+                "aucun — le renderer n'a pas demandé les métadonnées en cours de flux"
+            }
+            CanalRadio::IcyRefuse => "aucun — métadonnées demandées, fenêtre ICY refusée",
+            CanalRadio::AucuneConnexion => "aucun — aucun renderer connecté à ce flux",
+            CanalRadio::SansStreamId => "aucun — le now-playing ne porte pas de stream_id",
+        }
+    }
+}
+
+/// Trancher, pour le `stream_id` d'un now-playing radio, par où le changement
+/// de morceau va passer.
+///
+/// Fonction PURE au sens qui compte ici : elle ne lit que les deux registres et
+/// se prouve donc sans réseau, sans renderer et sans Hifi Rose. C'est elle que
+/// le poller appelle, et c'est elle que les épreuves appellent.
+pub fn canal_radio(stream_id: Option<&str>) -> CanalRadio {
+    let Some(sid) = stream_id else {
+        return CanalRadio::SansStreamId;
+    };
+    match icy_channel(sid) {
+        None => CanalRadio::AucuneConnexion,
+        Some(c) if c.accorde => CanalRadio::Icy { borne: c.borne },
+        Some(c) if c.voie != VOIE_FLUX => CanalRadio::VoieSansIcy,
+        Some(c) if c.demande => CanalRadio::IcyRefuse,
+        Some(_) => CanalRadio::IcyNonDemande,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Le journal de la POUSSÉE, et non celui de l'intention (#2991)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `canal_radio` ci-dessus dit par où le changement DEVRAIT passer ; il le
+// déduit de deux registres. Il ne prouve pas qu'un bloc soit réellement parti,
+// et il ne dit NI le titre NI l'URL de pochette qui sont partis. C'est
+// exactement ce qui manquait au dernier aller-retour avec le testeur : « la
+// pochette ne change pas » ne se distinguait pas de « la pochette part vide ».
+//
+// Le bloc, lui, est reconstruit toutes les 16 384 octets — plus de dix fois par
+// seconde sur un WAV 44,1 kHz. Le journaliser à chaque insertion noierait tout.
+// Ce suivi ne laisse passer que le PREMIER bloc, puis les CHANGEMENTS : une
+// ligne par morceau, ce qui est précisément le rythme du symptôme.
+#[derive(Debug, Default)]
+pub struct SuiviBlocIcy {
+    dernier: Option<String>,
+}
+impl SuiviBlocIcy {
+    pub fn nouveau() -> Self {
+        Self::default()
+    }
+    /// Rend `true` au premier bloc, puis seulement quand le titre OU la
+    /// pochette changent.
+    ///
+    /// Les deux champs sont séparés par un octet qui ne peut pas figurer dans
+    /// une URL ni dans un titre : sans lui, `("ab", "c")` et `("a", "bc")`
+    /// auraient la même empreinte et un changement passerait pour un doublon.
+    pub fn a_journaliser(&mut self, titre: &str, pochette: Option<&str>) -> bool {
+        let empreinte = format!("{titre}\u{1f}{}", pochette.unwrap_or(""));
+        if self.dernier.as_deref() == Some(empreinte.as_str()) {
+            return false;
+        }
+        self.dernier = Some(empreinte);
+        true
+    }
+}
 pub struct AudioStreamer {
     sessions: Arc<Mutex<HashMap<String, Arc<StreamSession>>>>,
     port: u16,
@@ -489,6 +939,24 @@ impl AudioStreamer {
         }
     }
 
+    /// La session `stream_id` existe-t-elle encore ?
+    ///
+    /// C'est la seule question qui vaille pour une session NON RADIO, et elle
+    /// n'avait pas de réponse : [`Self::radio_producer_done`] ne répond que pour
+    /// la radio, parce que `producer_done` n'est armé que par les appels à
+    /// `decode_radio_stream_to_pcm`. Une session de fichier, de transcodage ou
+    /// de proxy laisse ce drapeau à `false` toute sa vie.
+    ///
+    /// Ce qui tue une session de PISTE, c'est [`Self::cleanup_stale_sessions`] :
+    /// [`SESSION_IDLE_TIMEOUT`] sans un octet servi — ce qu'une lecture EN PAUSE
+    /// atteint sans le moindre effort, le commentaire de la borne le dit
+    /// lui-même. Une fois la session retirée de la table, `/stream/{id}` répond
+    /// 404 (`tune-stream-http`) et TOUTES les familles de sorties reprennent sur
+    /// du vide — la locale comprise, qui va chercher son PCM en HTTP
+    /// (`outputs/local.rs`, `local_audio_http_fetch_failed`).
+    pub async fn session_alive(&self, stream_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(stream_id)
+    }
     pub async fn wait_data_ready(&self, stream_id: &str, timeout_ms: u64) -> bool {
         let session = {
             let sessions = self.sessions.lock().await;
@@ -713,6 +1181,8 @@ impl AudioStreamer {
         // Le registre des titres radio suit la vie de la session : sans ça il
         // grossirait d'une entree par flux ecoute, et pour toujours.
         forget_radio_now(stream_id);
+        // Même vie pour le canal négocié (#2991) : une entrée par flux écouté.
+        forget_icy_channel(stream_id);
         // Clean up temp transcode files created by the pre-transcode pipeline.
         // Only delete files under the system temp dir with the tune-transcode prefix
         // to avoid accidentally removing actual music files.
@@ -952,39 +1422,120 @@ fn is_temp_transcode_file(path: &str) -> bool {
         || file_name.starts_with("tune-faststart-")
 }
 
+/// Charge utile maximale d'un bloc ICY : l'octet de longueur qui le precede
+/// compte des groupes de 16 octets et ne monte pas au-dela de 255. Il n'existe
+/// donc AUCUNE facon d'annoncer plus de 4080 octets de metadonnees.
+pub const ICY_CHARGE_MAX: usize = 255 * 16;
+/// Refermer une declaration ICY coupee, sur une frontiere de caractere.
+///
+/// Appelee seulement quand le titre SEUL depasse la charge maximale : on garde
+/// ce qui tient et l'on repose le `';` de fin, sans quoi le bloc est illisible.
+fn tronque_declaration_icy(charge: &str) -> String {
+    const FIN: &str = "';";
+    let budget = ICY_CHARGE_MAX - FIN.len();
+    let mut coupe = budget.min(charge.len());
+    while coupe > 0 && !charge.is_char_boundary(coupe) {
+        coupe -= 1;
+    }
+    format!("{}{FIN}", &charge[..coupe])
+}
+// ── Pourquoi ce bloc JETTE au lieu de COUPER (#2991) ──
+//
+// L'ancien code posait `len_byte = (payload.len() / 16).min(255)` puis
+// recopiait `payload[..len_byte * 16]` : une charge trop longue partait COUPEE.
+// Coupee au milieu de l'URL de pochette, donc sans son `';` de fermeture ; et
+// coupee en OCTETS, donc au milieu d'un caractere accentue des que le titre en
+// portait un. Un lecteur qui parse la declaration entiere rejette alors le bloc
+// COMPLET — ni le titre ni la pochette ne changent, ce qui est mot pour mot le
+// symptome instruit ici. Un bloc VALIDE sans pochette vaut mieux qu'un bloc
+// tronque que personne ne peut lire : le titre passe d'abord, la pochette n'est
+// ajoutee que si elle tient.
 pub fn build_icy_metadata(
     artist: Option<&str>,
     title: Option<&str>,
     cover_url: Option<&str>,
 ) -> Vec<u8> {
-    let mut parts = Vec::new();
     let stream_title = match (artist, title) {
         (Some(a), Some(t)) => Some(format!("{a} - {t}")),
         (Some(a), None) => Some(a.to_string()),
         (None, Some(t)) => Some(t.to_string()),
         (None, None) => None,
     };
-    if let Some(st) = stream_title {
-        parts.push(format!("StreamTitle='{st}';"));
-    }
+    let mut charge = match stream_title {
+        Some(st) => format!("StreamTitle='{st}';"),
+        None => String::new(),
+    };
     if let Some(url) = cover_url {
-        parts.push(format!("StreamUrl='{url}';"));
+        let declaration = format!("StreamUrl='{url}';");
+        if charge.len() + declaration.len() <= ICY_CHARGE_MAX {
+            charge.push_str(&declaration);
+        }
     }
-    if parts.is_empty() {
+    if charge.len() > ICY_CHARGE_MAX {
+        charge = tronque_declaration_icy(&charge);
+    }
+    if charge.is_empty() {
         return vec![0u8];
     }
-    let mut payload = parts.join("").into_bytes();
+    let mut payload = charge.into_bytes();
     let pad = (16 - payload.len() % 16) % 16;
     payload.resize(payload.len() + pad, 0);
-    let len_byte = (payload.len() / 16).min(255) as u8;
-    let mut block = vec![len_byte];
-    block.extend_from_slice(&payload[..len_byte as usize * 16]);
+    // 255 au plus par construction : la charge ne depasse plus ICY_CHARGE_MAX.
+    let len_byte = (payload.len() / 16) as u8;
+    let mut block = Vec::with_capacity(1 + payload.len());
+    block.push(len_byte);
+    block.extend_from_slice(&payload);
     block
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Un canal VIDE ne prouve rien tant que le producteur n'a jamais été en
+    /// avance : au démarrage il l'est toujours, le temps que le décodeur
+    /// prenne son élan. `note_channel_fill` doit rester muet.
+    #[test]
+    fn un_canal_vide_qui_n_a_jamais_ete_plein_n_alerte_pas() {
+        let session = StreamSession::new("s".into(), StreamInfo::default(), false, 4);
+        assert!(!session.note_channel_fill(0, 4), "vide au démarrage");
+        assert!(!session.note_channel_fill(1, 4), "un morceau en attente");
+        assert!(
+            !session.note_channel_fill(0, 4),
+            "de nouveau vide, jamais plein"
+        );
+        assert!(!session.note_channel_fill(3, 4), "presque plein, pas plein");
+        assert!(!session.note_channel_fill(0, 4), "toujours jamais plein");
+    }
+
+    /// Le seul instant qui se lit sans ambiguïté : le canal a été PLEIN, il
+    /// est maintenant VIDE. Le producteur avait de l'avance, il ne l'a plus.
+    /// Une seule ligne par session — le fait est ponctuel.
+    #[test]
+    fn un_canal_plein_puis_vide_alerte_une_seule_fois() {
+        let session = StreamSession::new("s".into(), StreamInfo::default(), false, 4);
+        assert!(!session.note_channel_fill(0, 4), "démarrage");
+        assert!(!session.note_channel_fill(4, 4), "plein : rien à dire");
+        assert!(
+            session.note_channel_fill(0, 4),
+            "plein puis vide : c'est LÀ que le producteur a lâché"
+        );
+        assert!(!session.note_channel_fill(0, 4), "une seule fois");
+        assert!(!session.note_channel_fill(4, 4), "de nouveau plein");
+        assert!(
+            !session.note_channel_fill(0, 4),
+            "et toujours une seule fois"
+        );
+    }
+
+    /// Un canal de capacité nulle n'existe pas dans le dépôt, mais le verdict
+    /// ne doit pas s'inventer un « plein » à partir d'un maximum de 0.
+    #[test]
+    fn une_capacite_nulle_ne_vaut_pas_plein() {
+        let session = StreamSession::new("s".into(), StreamInfo::default(), false, 4);
+        assert!(!session.note_channel_fill(0, 0));
+        assert!(!session.note_channel_fill(0, 4));
+    }
 
     #[tokio::test]
     async fn create_and_remove_session() {
@@ -1135,6 +1686,10 @@ mod tests {
         assert!(radio_now(sid).is_none());
     }
 
+    /// L'attribut `#[test]` manquait : la fonction compilait, ne s'exécutait
+    /// jamais, et couvrait pourtant le seul bloc ICY qui parte vers l'écran
+    /// d'un lecteur réseau (#3018). Ses deux voisines l'avaient.
+    #[test]
     fn icy_metadata_block() {
         let block = build_icy_metadata(Some("Artist"), Some("Title"), None);
         assert!(block.len() > 1);
@@ -1496,6 +2051,66 @@ mod tests {
         assert_eq!(info.wav_content_length(), Some(expected));
     }
 
+    /// La longueur annoncée doit tomber sur une TRAME entière (#3163).
+    ///
+    /// 192 705 ms est la durée en bibliothèque de « Culture Of Fear »
+    /// (Thievery Corporation), la piste du fil 1641. En 44,1 kHz / 16 bits /
+    /// stéréo la formule brute rend 33 993 162 octets, soit 8 498 290 trames
+    /// **plus 2 octets** — exactement le reliquat de 2 octets du journal de
+    /// Steve Taylor. Le client HTTP lit précisément ce `Content-Length`, donc
+    /// ces 2 octets entrent dans l'adaptateur PCM et s'y retrouvent coincés :
+    /// une fraction de trame n'est pas de l'audio.
+    #[test]
+    fn wav_content_length_tombe_sur_une_trame_entiere() {
+        for (duration_ms, sample_rate, bit_depth, channels) in [
+            (192_705u64, 44_100u32, 16u16, 2u16), // reliquat brut de 2 octets
+            (224_774, 44_100, 16, 2),             // reliquat brut de 1 octet
+            (192_705, 96_000, 24, 2),             // trame de 6 octets
+            (1_001, 44_100, 32, 6),               // trame de 24 octets
+        ] {
+            let info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate,
+                bit_depth,
+                channels,
+                file_size: None,
+                duration_ms: Some(duration_ms),
+                ..Default::default()
+            };
+            let frame_bytes = channels as u64 * (bit_depth as u64 / 8);
+            let annoncee = info.wav_content_length().expect("longueur connue");
+            assert_eq!(
+                (annoncee - 44) % frame_bytes,
+                0,
+                "{duration_ms} ms en {sample_rate}/{bit_depth}/{channels} : \
+                 la longueur annoncée coupe au milieu d'une trame de {frame_bytes} octets"
+            );
+            let brute = duration_ms * sample_rate as u64 * frame_bytes / 1000;
+            assert_eq!(
+                annoncee,
+                44 + brute - brute % frame_bytes,
+                "seul le reliquat sous-trame doit disparaître, pas une trame entière"
+            );
+        }
+    }
+
+    /// Le témoin vert : une durée qui tombe déjà juste ne perd pas un octet.
+    #[test]
+    fn wav_content_length_ne_change_rien_quand_la_duree_tombe_juste() {
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44_100,
+            bit_depth: 16,
+            channels: 2,
+            file_size: None,
+            duration_ms: Some(180_000),
+            ..Default::default()
+        };
+        assert_eq!(info.wav_content_length(), Some(180 * 44100 * 2 * 2 + 44));
+    }
+
     // ─── Péremption des sessions : activité, pas âge (#2536) ────────
     //
     // Les bornes réelles se comptent en dizaines de minutes ; les tests
@@ -1526,8 +2141,12 @@ mod tests {
         }
     }
 
+    /// Passe par la primitive de PRODUCTION. Recopier ici
+    /// `sessions_state().lock().contains_key(...)` aurait mesuré la
+    /// transcription et non `session_alive`, dont dépend maintenant la reprise
+    /// d'une piste (#2512).
     async fn session_presente(streamer: &AudioStreamer, id: &str) -> bool {
-        streamer.sessions_state().lock().await.contains_key(id)
+        streamer.session_alive(id).await
     }
 
     async fn patienter(ms: u64) {
@@ -1663,5 +2282,255 @@ mod tests {
 
         assert_eq!(retires, 0);
         assert!(session_presente(&streamer, &id).await);
+    }
+
+    // ────────────── #2991 — par où le renderer apprend le changement ─────────
+    //
+    // Ces épreuves appellent `canal_radio`, la fonction que le poller appelle.
+    // Chaque identifiant porte la clé de l'agent : les deux registres sont des
+    // `static`, partagés par toutes les épreuves du même binaire.
+
+    /// La branche que la garde du poller traversait EN SILENCE. Sans
+    /// `stream_id`, rien n'est publié — et il faut que ça se sache.
+    /// #2512 — la brique sur laquelle la reprise d'une PISTE décide.
+    ///
+    /// `une_session_muette_est_ramassee` prouve que le balayage retire la
+    /// session ; celui-ci prouve que `session_alive` le SAIT. Si elle répondait
+    /// « vivante » pour une session déjà retirée, `resume` reprendrait sur du
+    /// vide exactement comme avant le correctif.
+    #[tokio::test]
+    async fn une_session_ramassee_n_est_plus_vivante() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready) = streamer.create_session(info_de_test(), false, 8).await;
+        assert!(
+            streamer.session_alive(&id).await,
+            "une session fraîche est vivante"
+        );
+        // Une lecture EN PAUSE ne sert plus un octet : c'est très exactement ce
+        // que le ramasse-miettes appelle « muette ».
+        patienter(900).await;
+        streamer
+            .cleanup_stale_sessions_with(
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_secs(3_600),
+            )
+            .await;
+        assert!(
+            !streamer.session_alive(&id).await,
+            "après le balayage la session n'existe plus : la reprise doit le voir"
+        );
+    }
+    #[test]
+    fn sans_stream_id_le_canal_le_dit_au_lieu_de_se_taire() {
+        assert_eq!(canal_radio(None), CanalRadio::SansStreamId);
+        assert!(!canal_radio(None).atteint_le_renderer());
+        assert!(
+            canal_radio(None).libelle().contains("stream_id"),
+            "le libellé doit nommer la cause, il est lu SEUL au journal"
+        );
+    }
+
+    /// Un `stream_id` connu du poller mais auquel aucun renderer ne s'est
+    /// connecté ne prouve rien : ce n'est ni un succès ni un refus d'ICY.
+    #[test]
+    fn sans_connexion_le_canal_ne_conclut_pas_a_l_icy() {
+        let sid = "i2991-a4f218-jamais-connecte";
+        forget_icy_channel(sid);
+        assert_eq!(canal_radio(Some(sid)), CanalRadio::AucuneConnexion);
+    }
+
+    /// Les deux hypothèses ouvertes du ticket, que rien ne distinguait :
+    /// « le renderer n'a pas demandé l'ICY » et « il l'a demandé et on le lui a
+    /// accordé ». Elles rendent maintenant deux verdicts différents.
+    #[test]
+    fn le_canal_distingue_l_icy_accorde_du_non_demande() {
+        let accorde = "i2991-a4f218-accorde";
+        note_icy_channel(accorde, true, true, VOIE_FLUX, false);
+        assert_eq!(canal_radio(Some(accorde)), CanalRadio::Icy { borne: false });
+        assert!(canal_radio(Some(accorde)).atteint_le_renderer());
+
+        let muet = "i2991-a4f218-non-demande";
+        note_icy_channel(muet, false, false, VOIE_FLUX, false);
+        assert_eq!(canal_radio(Some(muet)), CanalRadio::IcyNonDemande);
+        assert!(!canal_radio(Some(muet)).atteint_le_renderer());
+
+        let refuse = "i2991-a4f218-refuse";
+        note_icy_channel(refuse, true, false, VOIE_FLUX, false);
+        assert_eq!(canal_radio(Some(refuse)), CanalRadio::IcyRefuse);
+
+        forget_icy_channel(accorde);
+        forget_icy_channel(muet);
+        forget_icy_channel(refuse);
+    }
+
+    /// Les branches fichier et mandataire ne découpent pas le corps : elles ne
+    /// peuvent porter AUCUN bloc, même à un renderer qui a demandé l'ICY. Ce
+    /// verdict-là ne doit pas être confondu avec un refus.
+    #[test]
+    fn une_voie_sans_decoupe_ne_porte_aucun_bloc_meme_si_l_icy_est_demande() {
+        for voie in [VOIE_FICHIER, VOIE_MANDATAIRE] {
+            let sid = format!("i2991-a4f218-voie-{voie}");
+            note_icy_channel(&sid, true, false, voie, false);
+            assert_eq!(
+                canal_radio(Some(&sid)),
+                CanalRadio::VoieSansIcy,
+                "la voie « {voie} » n'insère aucun bloc ICY"
+            );
+            forget_icy_channel(&sid);
+        }
+    }
+
+    // ───── #2991 — ce que le bloc ICY emporte, et ce qu'il n'emporte plus ─────
+    /// CONTRE-ÉPREUVE. Une charge trop longue partait COUPÉE : plus de `';` de
+    /// fermeture, donc une déclaration que rien ne peut refermer. Un lecteur
+    /// qui parse la déclaration entière rejette le bloc COMPLET — le titre AVEC
+    /// la pochette, ce qui est le symptôme instruit ici.
+    ///
+    /// Rouge avant le correctif : le bloc se terminait par des `a` d'URL.
+    #[test]
+    fn un_bloc_icy_trop_long_part_valide_au_lieu_de_partir_coupe() {
+        let pochette = format!("https://img.example.org/{}.jpg", "a".repeat(4200));
+        let bloc = build_icy_metadata(Some("Pink Floyd"), Some("Time"), Some(&pochette));
+        assert_eq!(
+            bloc.len(),
+            1 + bloc[0] as usize * 16,
+            "l'octet de longueur doit décrire EXACTEMENT la charge servie"
+        );
+        assert!(
+            bloc.len() <= 1 + ICY_CHARGE_MAX,
+            "aucun bloc ne peut dépasser ce que son octet de longueur sait annoncer"
+        );
+        let charge = std::str::from_utf8(&bloc[1..])
+            .expect("la charge doit rester de l'UTF-8 valide")
+            .trim_end_matches('\0')
+            .to_string();
+        assert!(
+            charge.starts_with("StreamTitle='Pink Floyd - Time';"),
+            "le titre passe d'abord : c'est lui qu'on garde si les deux ne tiennent pas ; \
+             charge = {charge:?}"
+        );
+        assert!(
+            charge.ends_with("';"),
+            "toute déclaration doit être refermée, sinon le bloc entier est illisible ; \
+             fin = {:?}",
+            &charge[charge.len().saturating_sub(40)..]
+        );
+        assert!(
+            !charge.contains("StreamUrl="),
+            "une pochette qui ne tient pas est JETÉE, pas coupée ; charge = {charge:?}"
+        );
+    }
+    /// CONTRE-ÉPREUVE. La coupe se faisait en OCTETS : un titre accentué —
+    /// c'est-à-dire un titre français sur deux — partait coupé au milieu d'un
+    /// caractère, et le bloc n'était plus de l'UTF-8.
+    ///
+    /// Rouge avant le correctif : `from_utf8` échouait.
+    #[test]
+    fn un_titre_accentue_trop_long_ne_part_pas_coupe_au_milieu_d_un_caractere() {
+        let titre = "é".repeat(2100);
+        let bloc = build_icy_metadata(None, Some(&titre), Some("https://img.example.org/x.jpg"));
+        let charge = std::str::from_utf8(&bloc[1..])
+            .expect("le bloc doit rester de l'UTF-8 valide même quand le titre déborde");
+        assert!(charge.trim_end_matches('\0').ends_with("';"));
+        assert_eq!(bloc.len(), 1 + bloc[0] as usize * 16);
+    }
+    /// TÉMOIN. Le cas ordinaire — un titre et une pochette qui tiennent — ne
+    /// bouge pas d'un octet.
+    #[test]
+    fn un_bloc_icy_ordinaire_porte_toujours_le_titre_et_la_pochette() {
+        let bloc = build_icy_metadata(
+            Some("Pink Floyd"),
+            Some("Time"),
+            Some("https://img.radioparadise.com/covers/l/x.jpg"),
+        );
+        let charge = std::str::from_utf8(&bloc[1..]).expect("UTF-8");
+        assert!(charge.contains("StreamTitle='Pink Floyd - Time';"));
+        assert!(charge.contains("StreamUrl='https://img.radioparadise.com/covers/l/x.jpg';"));
+        assert_eq!(bloc.len(), 1 + bloc[0] as usize * 16);
+    }
+    /// CONTRE-ÉPREUVE. Le contrat sous lequel la réponse est servie — chunké ou
+    /// fichier borné — est la moitié de la négociation qu'aucun journal ne
+    /// portait. Un renderer dont l'agent n'est pas `Lavf` reçoit TOUJOURS le
+    /// contrat fichier : c'est le cas ordinaire, et il se lisait « fenêtre
+    /// accordée, les blocs partent », exactement comme un corps chunké.
+    ///
+    /// Rouge avant le correctif : les deux rendaient `CanalRadio::Icy` et le
+    /// MÊME libellé.
+    #[test]
+    fn le_canal_nomme_le_contrat_sous_lequel_la_reponse_est_servie() {
+        let chunke = "i2991-b2092-chunke";
+        let borne = "i2991-b2092-borne";
+        note_icy_channel(chunke, true, true, VOIE_FLUX, false);
+        note_icy_channel(borne, true, true, VOIE_FLUX, true);
+        assert_eq!(
+            canal_radio(Some(chunke)),
+            CanalRadio::Icy { borne: false },
+            "un corps chunké reste ce qu'il était"
+        );
+        assert_eq!(canal_radio(Some(borne)), CanalRadio::Icy { borne: true });
+        // On NOTE le contrat, on n'en conclut pas l'échec : rien dans ce dépôt
+        // ne prouve qu'un appareil cesse de lire l'ICY parce que la réponse est
+        // bornée. Déclarer l'échec ici serait un faux rouge pour tous les
+        // renderers que ce chemin sert correctement.
+        assert!(
+            canal_radio(Some(borne)).atteint_le_renderer(),
+            "les blocs partent dans les deux cas — seul le libellé change"
+        );
+        assert!(
+            canal_radio(Some(borne)).libelle().contains("FICHIER"),
+            "le libellé est lu SEUL au journal : il doit nommer le contrat"
+        );
+        assert_ne!(
+            canal_radio(Some(borne)).libelle(),
+            canal_radio(Some(chunke)).libelle(),
+            "les deux contrats doivent se distinguer d'une ligne de journal"
+        );
+        forget_icy_channel(chunke);
+        forget_icy_channel(borne);
+    }
+    /// CONTRE-ÉPREUVE. Le bloc est reconstruit plus de dix fois par seconde :
+    /// journaliser chaque insertion noierait le journal, ne rien journaliser
+    /// est l'état d'aujourd'hui. Une ligne par morceau, et une pochette qui
+    /// change SEULE doit se voir — c'est la moitié du ticket.
+    #[test]
+    fn le_suivi_du_bloc_icy_ne_journalise_que_les_changements() {
+        let mut suivi = SuiviBlocIcy::nouveau();
+        assert!(suivi.a_journaliser("Time", Some("https://c/1.jpg")));
+        assert!(
+            !suivi.a_journaliser("Time", Some("https://c/1.jpg")),
+            "le même bloc ne repart pas au journal dix fois par seconde"
+        );
+        assert!(
+            suivi.a_journaliser("Time", Some("https://c/2.jpg")),
+            "une POCHETTE qui change seule doit se voir : c'est la moitié du ticket"
+        );
+        assert!(suivi.a_journaliser("Money", Some("https://c/2.jpg")));
+        assert!(
+            suivi.a_journaliser("Money", None),
+            "perdre la pochette est un changement, pas un silence"
+        );
+        let mut ambigu = SuiviBlocIcy::nouveau();
+        assert!(ambigu.a_journaliser("ab", Some("c")));
+        assert!(
+            ambigu.a_journaliser("a", Some("bc")),
+            "deux champs ne doivent pas se confondre par simple concaténation"
+        );
+    }
+    /// Le registre suit la vie de la session, comme `RADIO_NOW` : sinon il
+    /// grossirait d'une entrée par flux écouté, et un `stream_id` réémployé
+    /// hériterait du verdict d'un autre appareil.
+    #[tokio::test]
+    async fn retirer_une_session_oublie_son_canal() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready, _session) = streamer.create_radio_session(info_de_test(), 8).await;
+        note_icy_channel(&id, true, true, VOIE_FLUX, false);
+        assert_eq!(canal_radio(Some(&id)), CanalRadio::Icy { borne: false });
+
+        streamer.remove_session(&id).await;
+        assert_eq!(
+            canal_radio(Some(&id)),
+            CanalRadio::AucuneConnexion,
+            "le canal négocié doit mourir avec la session"
+        );
     }
 }

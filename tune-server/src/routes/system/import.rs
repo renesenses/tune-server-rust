@@ -12,6 +12,41 @@ use tune_core::db::track_repo::TrackRepo;
 
 use crate::state::AppState;
 
+/// DIRE que la bibliothèque a changé, à la fin d'un import.
+///
+/// Les trois imports (Roon, Plex, JRiver) écrivent des artistes, des albums et
+/// des pistes DIRECTEMENT en base : ils ne passent ni par le scanner ni par le
+/// surveillant de fichiers, donc aucun des deux ne parle pour eux. Ils
+/// n'annonçaient rien — `import_jriver` émettait bien `import.completed`, mais
+/// ce nom n'apparaît nulle part dans le client : le bundle web publié de la
+/// v0.9.127 ne contient pas la chaîne. Les listes en mémoire restaient donc
+/// telles quelles après un import, et il fallait changer le tri pour voir
+/// arriver les albums — le contournement que Patatorz décrit (fil forum
+/// #1517, issue #2186).
+///
+/// C'est le MÊME événement que celui du surveillant (`auto_scan.rs`), pour la
+/// même raison : `library.scan.completed` ferait afficher au client une
+/// bannière de fin de scan, alors qu'aucun scan n'a eu lieu. Ici on veut
+/// seulement que les listes se rechargent.
+///
+/// Rien d'importé, rien à dire : un import qui n'a rien écrit ne doit pas
+/// déclencher un rechargement complet de la grille côté client (même garde que
+/// le `if had_changes` du surveillant).
+fn annoncer_bibliotheque_modifiee(
+    event_bus: &tune_core::event_bus::EventBus,
+    source: &str,
+    imported: i64,
+) {
+    if imported <= 0 {
+        return;
+    }
+    event_bus.emit(
+        tune_core::event_types::EventType::LibraryUpdated.as_str(),
+        json!({ "source": source, "imported": imported }),
+    );
+    tracing::info!(source, imported, "import_library_updated_emis");
+}
+
 #[derive(Deserialize)]
 pub(super) struct ImportTrackEntry {
     title: String,
@@ -35,6 +70,7 @@ pub(super) async fn import_roon(
 ) -> impl IntoResponse {
     let task_id = uuid_v4();
     let backend = state.backend.clone();
+    let event_bus = state.event_bus.clone();
     let tid = task_id.clone();
 
     // Store initial task status
@@ -211,6 +247,7 @@ pub(super) async fn import_roon(
             errors = errors.len(),
             "roon_import_complete"
         );
+        annoncer_bibliotheque_modifiee(&event_bus, "roon_import", imported.into());
     });
 
     (
@@ -238,6 +275,7 @@ pub(super) async fn import_plex(
     let plex_url = body.plex_url.trim_end_matches('/').to_string();
     let token = body.plex_token.clone();
     let library_id = body.library_id.clone();
+    let event_bus = state.event_bus.clone();
     let tid = task_id.clone();
 
     let settings = SettingsRepo::with_backend(backend.clone());
@@ -401,6 +439,7 @@ pub(super) async fn import_plex(
             errors = errors.len(),
             "plex_import_complete"
         );
+        annoncer_bibliotheque_modifiee(&event_bus, "plex_import", imported.into());
     });
 
     (
@@ -487,12 +526,18 @@ pub(super) async fn import_jriver(
                 settings
                     .set(&key, &format!("completed:{imported}:{skipped}"))
                     .ok();
+                // `import.completed` reste émis : c'est le contrat existant du
+                // suivi de tâche. Mais AUCUN client ne l'écoute — la chaîne
+                // n'apparaît pas dans le bundle web publié — donc il ne
+                // rafraîchit rien. Le rechargement des listes passe par
+                // `library.updated`, ci-dessous.
                 event_bus.emit(
                     "import.completed",
                     json!({
                         "source": "jriver", "imported": imported, "skipped": skipped,
                     }),
                 );
+                annoncer_bibliotheque_modifiee(&event_bus, "jriver_import", imported as i64);
             }
             Err(e) => {
                 settings.set(&key, &format!("error:{e}")).ok();
@@ -607,4 +652,224 @@ fn parse_jriver_xml(
     }
 
     Ok((imported, skipped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AppState;
+    use std::time::Duration;
+    use tokio::sync::broadcast::Receiver;
+    use tune_core::event_bus::TuneEvent;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// Attendre `library.updated` sur le bus, ou renoncer.
+    ///
+    /// Les imports travaillent dans une tâche détachée : l'événement est le
+    /// SEUL signal de fin observable de l'extérieur. Un import qui n'annonce
+    /// rien fait donc expirer ce délai — c'est exactement ce que ces tests
+    /// mesurent, et c'est ce qui les fait tomber quand on débranche l'émetteur.
+    async fn attendre_library_updated(rx: &mut Receiver<TuneEvent>) -> Option<TuneEvent> {
+        let fin = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let reste = fin.saturating_duration_since(tokio::time::Instant::now());
+            if reste.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(reste, rx.recv()).await {
+                Ok(Ok(ev)) if ev.event_type == "library.updated" => return Some(ev),
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) | Err(_) => return None,
+            }
+        }
+    }
+
+    fn piste(titre: &str, chemin: &str) -> ImportTrackEntry {
+        ImportTrackEntry {
+            title: titre.into(),
+            artist: Some("Sokratis Sinopoulos".into()),
+            album: Some("Eight Winds".into()),
+            file_path: Some(chemin.into()),
+            duration_ms: Some(240_000),
+            track_number: Some(1),
+            genre: Some("Jazz".into()),
+        }
+    }
+
+    /// Chemin d'ajout n° 1 : import Roon.
+    ///
+    /// Il écrit artiste, album et piste DIRECTEMENT en base, sans passer par le
+    /// scanner ni par le surveillant de fichiers. Personne ne parle pour lui :
+    /// s'il n'annonce pas lui-même, la grille du client garde ce qu'elle avait
+    /// (#2186).
+    #[tokio::test]
+    async fn import_roon_annonce_la_bibliotheque_modifiee() {
+        let state = etat();
+        let mut rx = state.event_bus.subscribe();
+
+        let body = ImportRoonRequest {
+            roon_db_path: None,
+            data: Some(vec![piste("Walking", "/music/eight-winds/01.flac")]),
+        };
+        let _ = import_roon(State(state.clone()), Json(body)).await;
+
+        let ev = attendre_library_updated(&mut rx).await.expect(
+            "l'import Roon doit annoncer `library.updated` : sans lui la grille \
+                     du client ne recharge rien (#2186)",
+        );
+        assert_eq!(ev.data["source"], "roon_import");
+        assert_eq!(ev.data["imported"], 1);
+    }
+
+    /// Chemin d'ajout n° 2 : import JRiver.
+    ///
+    /// Il émettait déjà `import.completed` — un nom que le client n'écoute
+    /// nulle part. Émettre n'est pas annoncer : ce test exige l'événement que
+    /// la vue bibliothèque consomme réellement.
+    #[tokio::test]
+    async fn import_jriver_annonce_la_bibliotheque_modifiee() {
+        let state = etat();
+        let mut rx = state.event_bus.subscribe();
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("library.xml");
+        std::fs::write(
+            &xml,
+            r#"<MPL>
+                 <Item>
+                   <Field Name="Name">Walking</Field>
+                   <Field Name="Artist">Sokratis Sinopoulos</Field>
+                   <Field Name="Album">Eight Winds</Field>
+                   <Field Name="Filename">/music/eight-winds/01.flac</Field>
+                 </Item>
+               </MPL>"#,
+        )
+        .unwrap();
+
+        let body = ImportJriverRequest {
+            xml_path: xml.to_string_lossy().to_string(),
+        };
+        let _ = import_jriver(State(state.clone()), Json(body)).await;
+
+        let ev = attendre_library_updated(&mut rx).await.expect(
+            "l'import JRiver doit annoncer `library.updated` : `import.completed` \
+                     n'est écouté par aucun client (#2186)",
+        );
+        assert_eq!(ev.data["source"], "jriver_import");
+        assert_eq!(ev.data["imported"], 1);
+    }
+
+    /// Un import qui n'a rien écrit ne doit RIEN annoncer.
+    ///
+    /// Sans cette garde, un import à vide ferait recharger toute la grille du
+    /// client pour rien — c'est la même retenue que le `if had_changes` du
+    /// surveillant de fichiers.
+    #[tokio::test]
+    async fn un_import_vide_n_annonce_rien() {
+        let state = etat();
+        let mut rx = state.event_bus.subscribe();
+
+        let body = ImportRoonRequest {
+            roon_db_path: None,
+            data: Some(vec![]),
+        };
+        let _ = import_roon(State(state.clone()), Json(body)).await;
+
+        // Court délai : on cherche une ABSENCE, il suffit de laisser la tâche
+        // détachée aller jusqu'au bout.
+        let vu = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            !matches!(vu, Ok(Ok(ref ev)) if ev.event_type == "library.updated"),
+            "un import sans piste ne doit pas déclencher de rechargement"
+        );
+    }
+
+    /// Le corps d'un handler, isolé du fichier source.
+    ///
+    /// `include_str!` rend le fichier ENTIER, ce module de test compris — où
+    /// les noms des trois handlers et celui de l'annonce apparaissent en toutes
+    /// lettres. Sans la coupe à `#[cfg(test)]` ci-dessous, ce garde-fou se
+    /// prouverait lui-même et resterait vert quel que soit le code de
+    /// production.
+    fn corps_du_handler(source: &str, nom: &str) -> String {
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(avant, _)| avant)
+            .unwrap_or(source);
+        let debut = production
+            .find(&format!("pub(super) async fn {nom}("))
+            .unwrap_or_else(|| panic!("handler `{nom}` introuvable dans le source"));
+        let reste = &production[debut..];
+        // Jusqu'au prochain élément de premier niveau, ou la fin.
+        let fin = reste[1..]
+            .find("\npub(super) async fn ")
+            .or_else(|| reste[1..].find("\nfn "))
+            .or_else(|| reste[1..].find("\n#[derive("))
+            .map(|i| i + 1)
+            .unwrap_or(reste.len());
+        reste[..fin].to_string()
+    }
+
+    /// LES TROIS chemins d'import annoncent — y compris Plex.
+    ///
+    /// Les deux tests de comportement ci-dessus couvrent Roon et JRiver. Plex
+    /// interroge un serveur distant : l'éprouver demanderait un serveur HTTP
+    /// simulé, banni ici pour son instabilité. Ce garde-fou statique le couvre
+    /// quand même — c'est le motif « un chemin corrigé, les autres nus » qu'on
+    /// veut empêcher de revenir, et il tombe si l'annonce disparaît de N'IMPORTE
+    /// LEQUEL des trois.
+    #[test]
+    fn les_trois_imports_annoncent_la_bibliotheque_modifiee() {
+        let source = include_str!("import.rs");
+        for nom in ["import_roon", "import_plex", "import_jriver"] {
+            let corps = corps_du_handler(source, nom);
+            assert!(
+                corps.contains("annoncer_bibliotheque_modifiee(&event_bus"),
+                "`{nom}` écrit des albums en base sans annoncer `library.updated` : \
+                 la vue bibliothèque du client ne rechargera pas (#2186)"
+            );
+        }
+    }
+
+    /// Contre-épreuve du détecteur lui-même.
+    ///
+    /// Un garde-fou qui trouve l'annonce partout est un garde-fou de façade. On
+    /// lui donne donc un handler nu, et un fichier dont SEUL le module de test
+    /// contient l'annonce — les deux cas qui le feraient mentir.
+    #[test]
+    fn le_detecteur_de_handler_ne_se_prouve_pas_lui_meme() {
+        let nu = "\npub(super) async fn import_roon(x: u8) -> u8 {\n    x\n}\n\
+                  \npub(super) async fn import_plex(y: u8) -> u8 {\n    y\n}\n";
+        assert!(
+            !corps_du_handler(nu, "import_roon").contains("annoncer_bibliotheque_modifiee"),
+            "un handler nu ne doit pas passer pour annoncant"
+        );
+
+        // Le corps s'arrête bien au handler suivant : sans cela, l'annonce de
+        // `import_plex` couvrirait `import_roon` resté muet.
+        let voisin = "\npub(super) async fn import_roon(x: u8) -> u8 {\n    x\n}\n\
+                      \npub(super) async fn import_plex(y: u8) -> u8 {\n    \
+                      annoncer_bibliotheque_modifiee(&event_bus, \"plex_import\", 1);\n    y\n}\n";
+        assert!(
+            !corps_du_handler(voisin, "import_roon").contains("annoncer_bibliotheque_modifiee"),
+            "l'annonce du handler VOISIN ne doit pas compter pour celui-ci"
+        );
+        assert!(
+            corps_du_handler(voisin, "import_plex").contains("annoncer_bibliotheque_modifiee"),
+            "le handler qui annonce vraiment doit etre reconnu"
+        );
+
+        // Le module de test ne doit rien prouver.
+        let seulement_en_test = "\npub(super) async fn import_roon(x: u8) -> u8 {\n    x\n}\n\
+             \n#[cfg(test)]\nmod tests {\n    \
+             fn t() { annoncer_bibliotheque_modifiee(&event_bus, \"roon_import\", 1); }\n}\n";
+        assert!(
+            !corps_du_handler(seulement_en_test, "import_roon")
+                .contains("annoncer_bibliotheque_modifiee"),
+            "le module de test ne doit pas servir de preuve au code de production"
+        );
+    }
 }

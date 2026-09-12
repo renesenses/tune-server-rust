@@ -150,6 +150,11 @@ const MIGRATION_TABLES: &[&str] = &[
     "radio_favorites",
     "tags",
     "item_tags",
+    // Etiquettes posees sur un album de streaming (#3699). Sans cette ligne,
+    // tout l'etiquetage du catalogue Qobuz/Tidal/Bandcamp serait perdu a la
+    // bascule SQLite -> PostgreSQL — et c'est justement sur le streaming que
+    // l'etiquetage est le seul moyen de ranger.
+    "streaming_item_tags",
     "favorites",
     // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
     // seraient perdus à la bascule SQLite → PostgreSQL.
@@ -273,6 +278,7 @@ CREATE TABLE IF NOT EXISTS tracks (
     file_mtime TEXT,
     file_size TEXT,
     audio_hash TEXT,
+    audio_fingerprint TEXT,
     source TEXT DEFAULT 'local',
     source_id TEXT,
     isrc TEXT,
@@ -377,7 +383,9 @@ CREATE TABLE IF NOT EXISTS zones (
     aac_passthrough TEXT DEFAULT 0,
     dlna_lpcm TEXT DEFAULT 0,
     dlna_cap_16bit TEXT DEFAULT 0,
-    lyrics_offset_ms TEXT DEFAULT 0
+    lyrics_offset_ms TEXT DEFAULT 0,
+    last_seen_at TEXT,
+    output_endpoint_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
@@ -447,7 +455,8 @@ CREATE TABLE IF NOT EXISTS listen_history (
     album_id TEXT,
     profile_id TEXT,
     context_type TEXT,
-    context_id TEXT
+    context_id TEXT,
+    context_position TEXT
 );
 
 CREATE TABLE IF NOT EXISTS radio_stations (
@@ -515,6 +524,7 @@ CREATE TABLE IF NOT EXISTS favorites (
     item_name TEXT,
     item_artist TEXT,
     item_path TEXT,
+    position TEXT,
     UNIQUE(profile_id, item_type, item_id)
 );
 -- Instantané d'identité des favoris (SQLite v66 / PG 017) : nécessaire ici
@@ -523,6 +533,12 @@ CREATE TABLE IF NOT EXISTS favorites (
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_name TEXT;
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_artist TEXT;
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_path TEXT;
+-- Rang manuel (#2001 piste 2, SQLite 100 / PG 057). TEXT comme le reste de ce
+-- schéma miroir : la copie SQLite→PostgreSQL lie chaque valeur en texte et
+-- PostgreSQL n'a pas de cast implicite texte→entier à l'INSERT. `as_i64`
+-- reconvertit à la relecture, et le rang est comparé en Rust — donc jamais par
+-- un ORDER BY qui mettrait « 10 » avant « 2 » ici et pas sur SQLite.
+ALTER TABLE favorites ADD COLUMN IF NOT EXISTS position TEXT;
 
 -- Albums masqués (#1391). Tout en TEXT comme le reste de ce schéma (la copie
 -- lie chaque valeur en texte) ; la migration 041 ramène `profile_id` et
@@ -577,8 +593,14 @@ CREATE TABLE IF NOT EXISTS streaming_favorites (
     album TEXT,
     cover_url TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    position TEXT,
     UNIQUE(profile_id, item_type, service, service_id)
 );
+-- Rattrapage de la bascule : une base créée par une version antérieure de ce
+-- schéma a la table SANS `position`, et le `CREATE TABLE IF NOT EXISTS`
+-- ci-dessus ne la corrige pas. Même raison que les trois colonnes d'identité de
+-- `favorites` juste au-dessus (#2111).
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS position TEXT;
 
 CREATE TABLE IF NOT EXISTS tags (
     id TEXT PRIMARY KEY,
@@ -592,6 +614,28 @@ CREATE TABLE IF NOT EXISTS item_tags (
     item_type TEXT NOT NULL,
     item_id TEXT NOT NULL,
     UNIQUE(tag_id, item_type, item_id)
+);
+
+-- Etiquettes posees sur un objet de STREAMING (#3699). Une base creee par la
+-- bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne rejoue
+-- JAMAIS les scripts numerotes : sans cette declaration ici, la migration 052
+-- ne l'atteindrait pas — ni maintenant, ni jamais.
+--
+-- `tag_id` est BIGINT et non TEXT, contrairement au reste de ce schema : la
+-- copie de donnees lie NATIVEMENT les entiers (voir `insert_batch`), et il
+-- faut que `streaming_item_tags.tag_id` reste comparable a `tags.id`, que la
+-- migration 012 remet en BIGINT sur ces bases-la.
+CREATE TABLE IF NOT EXISTS streaming_item_tags (
+    tag_id BIGINT NOT NULL,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (tag_id, item_type, source, source_id)
 );
 
 CREATE TABLE IF NOT EXISTS album_ratings (
@@ -800,6 +844,7 @@ CREATE INDEX IF NOT EXISTS idx_radio_stations_favorite ON radio_stations(is_favo
 CREATE INDEX IF NOT EXISTS idx_bookmarks_track_id ON bookmarks(track_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_type);
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
+CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
 CREATE INDEX IF NOT EXISTS idx_album_ratings_album ON album_ratings(album_id);
 CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
 CREATE INDEX IF NOT EXISTS idx_album_metadata_key ON album_metadata(key);
@@ -872,6 +917,8 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS alac_passthrough TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS aac_passthrough TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_lpcm TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_seen_at TEXT;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS output_endpoint_id TEXT;
 
 -- listen_history: streaming source id + album id + profile scoping (v32/v37/v45)
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;
@@ -880,6 +927,9 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;
 -- listen_history: ce que l'auditeur a demande (SQLite migration v84, #2441)
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT;
+-- listen_history: ou l'auditeur en etait dans cet objet (SQLite migration v94,
+-- #2441). TEXT comme album_id / profile_id ici : ce schema porte tout en TEXT.
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_position TEXT;
 
 -- smart_playlists: match_mode (SQLite migration v48)
 ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DEFAULT 'all';
@@ -901,6 +951,7 @@ ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS disc_number TEXT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_media_path TEXT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_start_ms BIGINT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_end_ms BIGINT;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_fingerprint TEXT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE
@@ -1113,6 +1164,9 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",
         "favorites" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "item_tags" => "ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",
+        // Cette table n'a PAS de colonne `id` : la clause par defaut
+        // `ON CONFLICT (id)` ci-dessous echouerait sur elle (#3699).
+        "streaming_item_tags" => "ON CONFLICT (tag_id, item_type, source, source_id) DO NOTHING",
         "album_ratings" => "ON CONFLICT (album_id, profile_id) DO NOTHING",
         "offline_cache" => "ON CONFLICT (source, source_id) DO NOTHING",
         "track_source_links" => "ON CONFLICT (track_id, service) DO NOTHING",
@@ -1229,53 +1283,16 @@ fn get_sqlite_columns(db: &SqliteDb, table: &str) -> Result<Vec<String>, String>
     Ok(cols)
 }
 
-/// After migrating data with explicit IDs, the PG sequences are still
-/// at 1. Reset them to MAX(id)+1 so new inserts don't collide.
-async fn reset_sequences(pool: &PgPool) -> Result<(), String> {
-    // Tables with TEXT PRIMARY KEY named "id"
-    let tables = [
-        "artists",
-        "albums",
-        "tracks",
-        "track_credits",
-        "playlists",
-        "playlist_tracks",
-        "zones",
-        "play_queue",
-        "streaming_queue",
-        "listen_history",
-        "radio_stations",
-        "radio_favorites",
-        "profiles",
-        "favorites",
-        "tags",
-        "item_tags",
-        "album_ratings",
-        "smart_playlists",
-        "smart_collections",
-        "bookmarks",
-        "alarms",
-        "network_mounts",
-        "podcast_subscriptions",
-        "offline_cache",
-        "sync_links",
-        "sync_link_snapshots",
-        "track_source_links",
-    ];
-
-    for table in &tables {
-        let seq_name = format!("{table}_id_seq");
-        let sql = format!(
-            "SELECT setval('{seq_name}', COALESCE((SELECT MAX(id) FROM {table}), 0) + 1, false)"
-        );
-        match sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await {
-            Ok(_) => {}
-            Err(e) => {
-                // Sequence might not exist for tables without BIGSERIAL
-                info!(table, error = %e, "pg_sequence_reset_skipped");
-            }
-        }
-    }
-
-    Ok(())
-}
+// `reset_sequences` vivait ici : après une migration qui insère des `id`
+// explicites, elle repositionnait chaque séquence PostgreSQL à MAX(id)+1.
+// Elle n'a plus d'appelant depuis « PG migration — TEXT PRIMARY KEY for all
+// tables, remove sequences » (7b947b01), et elle ne pourrait plus servir telle
+// quelle : sa liste de tables décrit le schéma BIGSERIAL d'avant, et son
+// `MAX(id) + 1` sur une colonne devenue TEXT n'a pas d'opérateur en PG — les
+// erreurs partaient en `pg_sequence_reset_skipped`, donc en silence.
+//
+// ⚠️ Il reste TROIS séquences vivantes que rien ne repositionne après une
+// migration SQLite → PG : `zones_id_seq` (ici l.350), `streaming_favorites_id_seq`
+// (ici l.569 et db/postgres.rs) et `queue_items_id_seq` (db/postgres.rs). Le
+// correctif demande un PostgreSQL réel pour être prouvé ; il n'est PAS fait ici,
+// et rebrancher cette fonction-là ne l'aurait pas fait non plus.

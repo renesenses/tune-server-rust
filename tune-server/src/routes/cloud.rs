@@ -247,6 +247,14 @@ async fn sso_callback(
         .set_account_premium(user.premium, user.license_expires_at.clone())
         .await;
 
+    // Droits de MODULE payants (SKU distincts du palier, ex. la sortie
+    // Diretta). Ils voyagent avec le compte, jamais avec la clé : sans cet
+    // appel, `set_modules` n'avait qu'un seul appelant — le battement de fond
+    // (`background.rs`, HEARTBEAT_INTERVAL = 1 h). Un compte qui vient d'être
+    // lié s'entendait donc répondre « module_not_owned / purchase_module »
+    // pendant une heure pour un module qu'il possède (#2138).
+    state.license.set_modules(user.modules.clone()).await;
+
     // Qobuz endpoint order (founder flag): persist and push into the live
     // QobuzService so the order applies without a restart.
     state
@@ -290,11 +298,25 @@ async fn sso_callback(
         // default colour (not the SSO URL) so the fallback avatar circle has a
         // valid colour when disconnected; the cloud image is shown separately.
         let default_color = "#6366f1";
+        // `is_admin` est lie en ENTIER, pas en booleen. La colonne vaut
+        // SMALLINT sur toute installation PostgreSQL native (005), et
+        // PostgreSQL REFUSE l'affectation `boolean -> smallint` :
+        //
+        //   ERROR:  column "is_admin" is of type smallint but expression
+        //           is of type boolean
+        //
+        // Mesure du 11/09/2026 sur PostgreSQL 16.15 : cet INSERT echouait
+        // sur toute base PostgreSQL NATIVE, donc aucune premiere connexion
+        // SSO n'y creait de profil (#3726). Un entier passe sur les trois
+        // formes que porte cette colonne dans le parc — SMALLINT (natif),
+        // TEXT (base migree, `bigint -> text` est accepte) et INTEGER
+        // (SQLite) — et les lecteurs passent tous par `as_i64()`.
+        let is_admin: i64 = i64::from(user.is_admin);
         state
             .backend
             .execute_returning_id(
                 "INSERT INTO profiles (username, display_name, email, avatar_path, is_admin) VALUES (?, ?, ?, ?, ?)",
-                &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &default_color as &dyn ToSqlValue, &user.is_admin as &dyn ToSqlValue],
+                &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &default_color as &dyn ToSqlValue, &is_admin as &dyn ToSqlValue],
             )
             .unwrap_or(0)
     };
@@ -377,33 +399,66 @@ async fn sso_disconnect(State(state): State<AppState>) -> Json<Value> {
 // Telemetry
 // ---------------------------------------------------------------------------
 
+/// #3383 — `enabled` dit desormais l'etat EFFECTIF, celui que les gardes
+/// d'envoi consultent, et non plus la seule variable d'environnement.
+///
+/// `env_override` est ajoute pour repondre a la question que l'issue laissait
+/// ouverte : que montrer quand l'exploitant impose un etat que l'utilisateur
+/// ne peut pas changer. Vrai = `TUNE_TELEMETRY` coupe a l'echelle de la
+/// machine, la bascule de l'interface ne peut rien rallumer. Champ AJOUTE :
+/// un client qui l'ignore lit `enabled` comme avant.
 async fn telemetry_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let enabled = TelemetryReporter::is_enabled();
+    let enabled = TelemetryReporter::is_enabled_for(&settings);
     let server_id = settings.get("server_id").ok().flatten();
     let rate_limits = tune_core::cloud::rate_limit::active_all(&settings);
     Json(json!({
         "enabled": enabled,
+        "env_override": !TelemetryReporter::is_enabled(),
         "server_id": server_id,
         "rate_limits": rate_limits,
     }))
 }
 
+/// Ecrit le consentement, au lieu de se contenter de le relire (#3383).
+///
+/// `TUNE_TELEMETRY=false` reste souverain : la reponse renvoie l'etat
+/// EFFECTIF, donc `false`, et l'interface voit tout de suite que son clic n'a
+/// pas pris — au lieu de basculer une case que le rafraichissement suivant
+/// remettra en place toute seule.
 async fn telemetry_enable(State(state): State<AppState>) -> Json<Value> {
-    // Telemetry is now env-var-driven (TUNE_TELEMETRY=false to disable).
-    // This endpoint creates/returns the server_id for informational purposes.
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings
+        .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "true")
+        .ok();
     TelemetryReporter::get_or_create_server_id(&settings);
     info!("telemetry_enabled");
-    Json(json!({ "enabled": TelemetryReporter::is_enabled() }))
+    Json(json!({
+        "enabled": TelemetryReporter::is_enabled_for(&settings),
+        "env_override": !TelemetryReporter::is_enabled(),
+    }))
 }
 
-async fn telemetry_disable(State(_state): State<AppState>) -> Json<Value> {
-    // Telemetry is now disabled via TUNE_TELEMETRY=false env var.
-    info!("telemetry_disable_requested_use_env_var");
-    Json(
-        json!({ "enabled": TelemetryReporter::is_enabled(), "note": "Set TUNE_TELEMETRY=false to disable telemetry" }),
-    )
+/// Le refus est ECRIT, et les sept gardes d'envoi le lisent (#3383).
+///
+/// Avant ce correctif, cette route ne liait meme pas son `State` : elle
+/// journalisait « posez TUNE_TELEMETRY=false » et repondait `enabled: true`
+/// juste apres que l'utilisateur eut demande l'inverse.
+///
+/// Ce qui continue de partir, et c'est deliberé : la revalidation horaire de
+/// la cle de licence (trois champs, rien de descriptif) et le rafraichissement
+/// des droits premium SSO. Un opt-out ne doit jamais se payer en
+/// fonctionnalites perdues — voir `background::heartbeat_plan` (LIC-1).
+async fn telemetry_disable(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings
+        .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "false")
+        .ok();
+    info!("telemetry_disabled");
+    Json(json!({
+        "enabled": TelemetryReporter::is_enabled_for(&settings),
+        "env_override": !TelemetryReporter::is_enabled(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +476,7 @@ async fn marketplace_list(State(state): State<AppState>) -> Json<Value> {
 async fn marketplace_install(
     Path(name): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
@@ -465,7 +521,7 @@ async fn marketplace_install(
         }
         Err(e) => {
             warn!(plugin = %name, error = %e, "marketplace_install_failed");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response()
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
         }
     }
 }
@@ -478,6 +534,7 @@ struct VoteRequest {
 async fn marketplace_vote(
     Path(name): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<VoteRequest>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -486,7 +543,9 @@ async fn marketplace_vote(
 
     match mp.vote(&name, body.up).await {
         Ok(()) => Json(json!({"name": name, "voted": true, "up": body.up})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
+        }
     }
 }
 
@@ -502,6 +561,7 @@ struct ArtistImageReport {
 
 async fn report_artist_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<ArtistImageReport>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -515,7 +575,9 @@ async fn report_artist_image(
     .await
     {
         Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
+        }
     }
 }
 
@@ -533,6 +595,7 @@ struct CoverSubmitRequest {
 
 async fn submit_community_cover(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CoverSubmitRequest>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -572,7 +635,7 @@ async fn submit_community_cover(
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => {
             warn!(error = %e, "community_cover_submit_failed");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response()
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
         }
     }
 }
@@ -584,6 +647,7 @@ struct CoverSyncRequest {
 
 async fn sync_community_covers(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CoverSyncRequest>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
@@ -601,7 +665,12 @@ async fn sync_community_covers(
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "community_covers_sync_failed");
-                return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
+                return crate::routes::cloud_error::reponse(
+                    &e,
+                    &headers,
+                    StatusCode::BAD_GATEWAY,
+                    json!({}),
+                );
             }
         };
 
@@ -820,11 +889,12 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
         );
     }
 
-    let zone_limit = if ls.tier == tune_core::license::Tier::Premium {
-        None
-    } else {
-        Some(state.license.free_zone_limit())
-    };
+    // Meme lecture que `/system/config` et que le refus de lecture : une seule
+    // implementation du plafond (#3673). Cette route-ci en tenait sa propre
+    // copie ternaire, identique a celle de `/system/config` a un `serde_json::
+    // Value::Null` pres — deux ecritures d'une meme regle, donc deux occasions
+    // de deriver.
+    let zone_limit = state.license.limite_zones().await;
 
     // Floating-license single-session model: when set, `tier` above is already
     // Free (premium is gated off here) and this object tells the UI WHY — the
@@ -857,6 +927,33 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// POST /cloud/license/activate — enregistre la clé **et** la fait confirmer en
+/// ligne dans le même aller-retour.
+///
+/// C'est la route qu'appelle le panneau « Tune Premium License » du client web
+/// (`activateLicense()`), et la seule que ce panneau appelle au moment où
+/// l'utilisateur colle sa clé.
+///
+/// Elle se contentait de `set_license_key`, qui depuis c15dcc61 (« require
+/// online validation before Premium ») stocke la clé **en attente** — palier
+/// Free, aucune validation. La route rendait donc `tier: "free"` pour une clé
+/// parfaitement valide, et le panneau annonçait « invalide » au premier essai
+/// (#1279, Alex Campbell, licence Lifetime). Il fallait ensuite actionner
+/// « Valider » (`/cloud/license/validate`) pour obtenir l'aller-retour manquant.
+/// La route jumelle `POST /system/license` avait, elle, reçu l'appel à
+/// `validate_stored_license` dans ce même commit ; celle-ci était restée en
+/// arrière. Les deux font désormais la même chose.
+///
+/// Ce n'est pas un simple confort d'affichage : le battement de cœur, seul
+/// autre chemin qui promeut une clé en attente, ne part pas quand la télémétrie
+/// est refusée (`heartbeat_plan`, `send_heartbeat: false`). Sans validation
+/// ici, une clé posée sur une machine sans télémétrie restait en attente
+/// indéfiniment.
+///
+/// Le palier rendu est le palier **effectif** relu après validation, jamais une
+/// promesse locale : serveur de licences injoignable ou clé refusée ⇒ `pending`
+/// et Free, exactement comme avant. Aucune clé ne débloque quoi que ce soit
+/// sans confirmation en ligne.
 async fn license_activate(
     State(state): State<AppState>,
     Json(body): Json<Value>,
@@ -872,14 +969,22 @@ async fn license_activate(
     if let Err(e) = state.license.set_license_key(key).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
     }
+    let tier = validate_stored_license(&state).await;
+    let premium = tier == tune_core::license::Tier::Premium;
     let ls = state.license.license_state().await;
-    state.event_bus.emit(
-        "license.updated",
-        json!({"tier": ls.tier, "expires_at": ls.expires_at}),
-    );
+    // `validate_stored_license` a déjà émis l'événement quand le serveur de
+    // licences a tranché. On ne l'émet ici que dans le cas contraire : la clé a
+    // tout de même changé, les écoutants doivent relire le statut.
+    if !premium {
+        state.event_bus.emit(
+            "license.updated",
+            json!({"tier": ls.tier, "expires_at": ls.expires_at}),
+        );
+    }
     Json(json!({
-        "status": "activated",
+        "status": if premium { "activated" } else { "pending" },
         "tier": ls.tier,
+        "expires_at": ls.expires_at,
         "license_key": key,
     }))
     .into_response()
@@ -892,6 +997,23 @@ async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
         json!({"tier": "free", "expires_at": null}),
     );
     Json(json!({"status": "deactivated", "tier": "free"}))
+}
+
+/// URL du point de validation de licence chez mozaiklabs.fr.
+///
+/// Le réglage `mozaik_base_url` la redirige — le même réglage que le SSO, le
+/// marché de greffons et les couvertures communautaires honorent déjà partout
+/// dans ce fichier. L'URL était la seule de cloud.rs à rester en dur, ce qui
+/// rendait l'activation de licence intestable autrement qu'en appelant le
+/// serveur de licences de production.
+pub(crate) fn license_validate_url(settings: &SettingsRepo) -> String {
+    let base = settings
+        .get("mozaik_base_url")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://mozaiklabs.fr".to_string());
+    format!("{}/api/v1/license/validate", base.trim_end_matches('/'))
 }
 
 /// Validate the currently-stored license key against mozaiklabs.fr and apply
@@ -918,7 +1040,7 @@ pub(crate) async fn validate_stored_license(state: &AppState) -> tune_core::lice
 
     let resp = state
         .http_client
-        .post("https://mozaiklabs.fr/api/v1/license/validate")
+        .post(license_validate_url(&settings))
         .timeout(std::time::Duration::from_secs(10))
         .json(&payload)
         .send()
@@ -933,24 +1055,17 @@ pub(crate) async fn validate_stored_license(state: &AppState) -> tune_core::lice
         return state.license.tier().await;
     };
 
-    // Default false: a missing verdict must NOT unlock a pending key.
-    let valid = body
-        .get("license_valid")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !valid {
-        // Server rejects it → keep the (Free/pending) cached tier; do not grant.
+    // Lecture unique du verdict (`tune_core::license::verdict_licence`) : ce
+    // corps etait interprete a quatre endroits, avec des defauts opposes sur le
+    // champ manquant. Ici la politique est inchangee : rien n'est persiste hors
+    // d'une confirmation, et un refus — transitoire ou meme expire — laisse le
+    // palier en cache tel quel. La cle vient d'etre posee en attente par
+    // `set_license_key`, donc le palier effectif est deja Free.
+    let tune_core::license::VerdictLicence::Confirmee { tier, expires_at } =
+        tune_core::license::verdict_licence(&body)
+    else {
         return state.license.tier().await;
-    }
-
-    let tier = match body.get("license_tier").and_then(|v| v.as_str()) {
-        Some("premium") => tune_core::license::Tier::Premium,
-        _ => tune_core::license::Tier::Free,
     };
-    let expires_at = body
-        .get("license_expires_at")
-        .and_then(|v| v.as_str())
-        .map(String::from);
     state
         .license
         .update_from_server(tier, expires_at.clone())
@@ -962,20 +1077,159 @@ pub(crate) async fn validate_stored_license(state: &AppState) -> tune_core::lice
     tier
 }
 
+// ---------------------------------------------------------------------------
+// Le corps de `POST /cloud/license/validate` — le seul porteur de vérité
+// ---------------------------------------------------------------------------
+
+/// Pourquoi `POST /cloud/license/validate` a rendu ce qu'il a rendu (#3906).
+///
+/// Cette route répond **HTTP 200 dans toutes ses sorties d'échec**, et c'est
+/// délibéré : lever le statut ferait jeter la réponse par les deux clients
+/// déployés — `TuneAPIClient.checkResponse` côté Swift et le client web —
+/// qui abandonnent sur un code d'erreur alors qu'ils lisent aujourd'hui le
+/// corps. L'arbitrage est tenu : **le code de statut ne bouge pas**. Ce qui
+/// manquait est ailleurs — le corps ne portait pas de quoi distinguer les
+/// sorties les unes des autres.
+///
+/// `status` ne prend que **cinq** valeurs (`validated`, `invalid`, `cached`,
+/// `error`, `no_license`) pour **neuf** sorties. `cached` en recouvre trois
+/// (point d'accès en 404, verdict absent, refus non autoritaire) et `error`
+/// trois autres (requête qui n'aboutit pas, statut distant, corps illisible).
+/// Un client qui veut les séparer n'avait qu'une issue : analyser le champ
+/// `message`, composé **en anglais** — ce que le client web déployé fait
+/// aujourd'hui pour retrouver un 429 (`statutDistantDepuisMessage`,
+/// tune-web-client v0.9.146).
+///
+/// Trois champs lèvent l'ambiguïté, sans toucher au statut HTTP :
+///
+/// - `reason` — un code stable, **un par sortie**, jamais traduit ;
+/// - `ok` — vrai seulement quand le verdict distant a été **posé** ici ;
+/// - `upstream_status` — le statut de mozaiklabs.fr **en nombre**, pour que
+///   personne n'ait plus à lire une phrase anglaise pour distinguer un
+///   plafond de requêtes (429) d'une panne (502).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotifValidation {
+    /// Aucune clé n'est enregistrée sur ce serveur.
+    AucuneCle,
+    /// La requête vers mozaiklabs.fr n'a pas abouti : réseau, DNS, délai.
+    RequeteEchouee,
+    /// Le point d'accès distant répond 404 : rien n'est conclu.
+    PointAccesAbsent,
+    /// mozaiklabs.fr a répondu un statut d'erreur — 429 compris.
+    StatutDistant,
+    /// La réponse distante n'est pas un JSON lisible.
+    ReponseIllisible,
+    /// Le corps ne porte pas `license_valid` : le serveur ne s'est pas prononcé.
+    SansVerdict,
+    /// `license_valid:false` **nu** : ni révocation, ni confirmation.
+    RefusTransitoire,
+    /// Expiration passée confirmée : le palier est ramené à `free`.
+    Expiree,
+    /// Le verdict distant est posé.
+    Confirmee,
+}
+
+impl MotifValidation {
+    /// Le discriminant **stable** que le client teste. `snake_case`, jamais
+    /// traduit, jamais recomposé à partir d'une phrase.
+    fn code(self) -> &'static str {
+        match self {
+            Self::AucuneCle => "no_license_key",
+            Self::RequeteEchouee => "request_failed",
+            Self::PointAccesAbsent => "endpoint_not_found",
+            Self::StatutDistant => "upstream_error",
+            Self::ReponseIllisible => "unreadable_response",
+            Self::SansVerdict => "no_verdict",
+            Self::RefusTransitoire => "rejected_transient",
+            Self::Expiree => "expired",
+            Self::Confirmee => "confirmed",
+        }
+    }
+
+    /// Le `status` historique, **inchangé** : deux clients déployés le lisent,
+    /// et le client web en fait déjà cinq écrans distincts. `reason` s'ajoute
+    /// à côté ; il ne le remplace pas.
+    fn status(self) -> &'static str {
+        match self {
+            Self::AucuneCle => "no_license",
+            Self::RequeteEchouee | Self::StatutDistant | Self::ReponseIllisible => "error",
+            Self::PointAccesAbsent | Self::SansVerdict | Self::RefusTransitoire => "cached",
+            Self::Expiree => "invalid",
+            Self::Confirmee => "validated",
+        }
+    }
+
+    /// Vrai quand l'aller-retour a **abouti** et que le verdict distant a été
+    /// appliqué ici.
+    ///
+    /// Ce n'est pas la promesse d'un palier premium : un compte confirmé en
+    /// `free` rend `ok:true` avec `tier:"free"`. C'est la réponse à la seule
+    /// question que le bouton « Valider » posait sans pouvoir l'obtenir —
+    /// « la validation a-t-elle eu lieu ? ». `Expiree` rend `false` : le
+    /// serveur a bien parlé, mais la clé ne vaut rien.
+    fn succes(self) -> bool {
+        matches!(self, Self::Confirmee)
+    }
+}
+
+/// Le corps rendu par la route, augmenté des champs que le client teste.
+///
+/// Fonction **pure** : c'est elle que les essais exercent, sans axum, sans
+/// réseau et sans base. `status`, `reason` et `ok` sont posés **après** le
+/// corps d'origine, donc un site d'appel distrait ne peut pas les contredire.
+/// `upstream_status` est toujours présent — `null` quand aucun aller-retour
+/// n'a eu lieu — pour qu'un client typé n'ait pas à distinguer « absent » de
+/// « nul ».
+fn corps_validation(motif: MotifValidation, corps: Value) -> Value {
+    let mut objet = match corps {
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    objet
+        .entry("upstream_status".to_string())
+        .or_insert(Value::Null);
+    objet.insert("status".to_string(), json!(motif.status()));
+    objet.insert("reason".to_string(), json!(motif.code()));
+    objet.insert("ok".to_string(), json!(motif.succes()));
+    Value::Object(objet)
+}
+
+/// La réponse HTTP. **200 dans les neuf cas** — voir [`MotifValidation`].
+fn reponse_validation(motif: MotifValidation, corps: Value) -> axum::response::Response {
+    Json(corps_validation(motif, corps)).into_response()
+}
+
+/// Le message du cas « statut distant », mot pour mot.
+///
+/// ⚠️ Le client web déployé (tune-web-client v0.9.146,
+/// `statutDistantDepuisMessage`) extrait le code distant de cette phrase par
+/// `^Server returned (\d{3})\b` : c'est aujourd'hui son seul moyen de
+/// distinguer un plafond de requêtes d'une panne. Le corps porte désormais
+/// `upstream_status`, mais tant que ce client tourne, reformuler cette phrase
+/// lui retire la distinction **sans un seul rouge**. D'où la garde
+/// `le_message_du_statut_distant_garde_le_prefixe_que_le_client_analyse`.
+fn message_statut_distant(status: StatusCode) -> String {
+    format!("Server returned {status}")
+}
+
 /// POST /cloud/license/validate
 ///
-/// Triggers an immediate license validation against mozaiklabs.fr.
-/// Returns the authoritative tier from the server, or the cached state
-/// if the server is unreachable (graceful degradation).
+/// Déclenche une validation immédiate contre mozaiklabs.fr et rend le palier
+/// autoritaire, ou l'état en cache si le serveur est injoignable.
+///
+/// 🔴 **Répond 200 dans ses neuf sorties** : c'est le contrat, pas un oubli
+/// (#3906). La vérité vit dans le corps, et le champ qui la porte est
+/// `reason` — voir [`MotifValidation`].
 async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
     let ls = state.license.license_state().await;
     let Some(ref key) = ls.license_key else {
-        return Json(json!({
-            "status": "no_license",
-            "tier": "free",
-            "message": "No license key configured",
-        }))
-        .into_response();
+        return reponse_validation(
+            MotifValidation::AucuneCle,
+            json!({
+                "tier": "free",
+                "message": "No license key configured",
+            }),
+        );
     };
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -990,7 +1244,7 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
 
     let resp = match state
         .http_client
-        .post("https://mozaiklabs.fr/api/v1/license/validate")
+        .post(license_validate_url(&settings))
         .timeout(std::time::Duration::from_secs(10))
         .json(&payload)
         .send()
@@ -999,38 +1253,43 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "license_validate_request_failed");
-            return Json(json!({
-                "status": "error",
-                "tier": ls.tier,
-                "message": format!("Validation request failed: {e}"),
-                "cached": true,
-            }))
-            .into_response();
+            return reponse_validation(
+                MotifValidation::RequeteEchouee,
+                json!({
+                    "tier": ls.tier,
+                    "message": format!("Validation request failed: {e}"),
+                    "cached": true,
+                }),
+            );
         }
     };
 
     // 404 means the server endpoint doesn't exist yet — keep cached state.
     if resp.status() == StatusCode::NOT_FOUND {
         info!("license_validate_endpoint_not_found, keeping cached state");
-        return Json(json!({
-            "status": "cached",
-            "tier": ls.tier,
-            "message": "Validation endpoint not available yet",
-            "cached": true,
-        }))
-        .into_response();
+        return reponse_validation(
+            MotifValidation::PointAccesAbsent,
+            json!({
+                "tier": ls.tier,
+                "message": "Validation endpoint not available yet",
+                "cached": true,
+                "upstream_status": StatusCode::NOT_FOUND.as_u16(),
+            }),
+        );
     }
 
     if !resp.status().is_success() {
         let status = resp.status();
         warn!(status = %status, "license_validate_server_error");
-        return Json(json!({
-            "status": "error",
-            "tier": ls.tier,
-            "message": format!("Server returned {status}"),
-            "cached": true,
-        }))
-        .into_response();
+        return reponse_validation(
+            MotifValidation::StatutDistant,
+            json!({
+                "tier": ls.tier,
+                "message": message_statut_distant(status),
+                "cached": true,
+                "upstream_status": status.as_u16(),
+            }),
+        );
     }
 
     // Parse the server's authoritative response.
@@ -1038,36 +1297,40 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "license_validate_parse_failed");
-            return Json(json!({
-                "status": "error",
-                "tier": ls.tier,
-                "message": format!("Failed to parse response: {e}"),
-                "cached": true,
-            }))
-            .into_response();
+            return reponse_validation(
+                MotifValidation::ReponseIllisible,
+                json!({
+                    "tier": ls.tier,
+                    "message": format!("Failed to parse response: {e}"),
+                    "cached": true,
+                }),
+            );
         }
     };
 
-    let valid = body
-        .get("license_valid")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-
-    if !valid {
-        // Mirror the heartbeat guard: a bare `license_valid:false` is NOT an
-        // authoritative revocation. A key is always present here (checked above),
-        // so unless the server returned a genuine PAST `license_expires_at`, keep
-        // the cached premium tier and do NOT persist Free. Persisting Free used
-        // to permanently strip a valid key on a transient rejection (fingerprint
-        // re-binding, server hiccup) — and clicking "Valider" would re-trigger it
-        // even with the heartbeat fixed. Only a true past expiry revokes.
-        let expired_authoritatively = body
-            .get("license_expires_at")
-            .and_then(|v| v.as_str())
-            .map(tune_core::license::is_timestamp_past)
-            .unwrap_or(false);
-
-        if expired_authoritatively {
+    // Meme lecture du verdict que les trois autres appelants
+    // (`tune_core::license::verdict_licence`). Celle-ci etait la seule a
+    // defaillir en ACCORDANT : `license_valid` absent valait `true`, et comme
+    // `license_tier` absent valait `"free"`, un corps sans champ de licence
+    // — point d'acces redirige, enveloppe d'erreur rendue en 200, schema qui a
+    // bouge — persistait Free sur un compte premium **et** repondait
+    // `status:"validated"`. Le bouton « Valider » du panneau retrogradait donc
+    // un payeur en annoncant un succes. Un verdict absent ne persiste plus
+    // rien : le palier en cache est rendu tel quel, sous `status:"cached"`.
+    let verdict = tune_core::license::verdict_licence(&body);
+    let (tier, expires_at) = match verdict {
+        tune_core::license::VerdictLicence::Absent => {
+            warn!("license_validate_sans_verdict_palier_conserve");
+            return reponse_validation(
+                MotifValidation::SansVerdict,
+                json!({
+                    "tier": ls.tier,
+                    "message": "The licence server returned no verdict; the cached tier is kept.",
+                    "cached": true,
+                }),
+            );
+        }
+        tune_core::license::VerdictLicence::Expiree => {
             info!("license_invalidated_by_server_validate (authoritative expiry)");
             state
                 .license
@@ -1077,38 +1340,29 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
                 "license.updated",
                 json!({"tier": "free", "expires_at": null}),
             );
-            return Json(json!({
-                "status": "invalid",
-                "tier": "free",
-                "message": "License key is not valid",
-            }))
-            .into_response();
+            return reponse_validation(
+                MotifValidation::Expiree,
+                json!({
+                    "tier": "free",
+                    "message": "License key is not valid",
+                }),
+            );
         }
-
-        // Transient rejection: keep the cached tier — Premium survives within the
-        // offline grace window instead of being permanently revoked.
-        warn!("license_validate_rejected_keeping_cached_tier");
-        return Json(json!({
-            "status": "cached",
-            "tier": ls.tier,
-            "message": "Server could not confirm the license right now; Premium is retained (grace period).",
-            "cached": true,
-        }))
-        .into_response();
-    }
-
-    let tier_str = body
-        .get("license_tier")
-        .and_then(|v| v.as_str())
-        .unwrap_or("free");
-    let tier = match tier_str {
-        "premium" => tune_core::license::Tier::Premium,
-        _ => tune_core::license::Tier::Free,
+        tune_core::license::VerdictLicence::RefusTransitoire => {
+            // Un refus nu n'est pas une revocation : Premium survit dans la
+            // fenetre de grace au lieu d'etre detruit sur un hoquet.
+            warn!("license_validate_rejected_keeping_cached_tier");
+            return reponse_validation(
+                MotifValidation::RefusTransitoire,
+                json!({
+                    "tier": ls.tier,
+                    "message": "Server could not confirm the license right now; Premium is retained (grace period).",
+                    "cached": true,
+                }),
+            );
+        }
+        tune_core::license::VerdictLicence::Confirmee { tier, expires_at } => (tier, expires_at),
     };
-    let expires_at = body
-        .get("license_expires_at")
-        .and_then(|v| v.as_str())
-        .map(String::from);
 
     state
         .license
@@ -1121,13 +1375,283 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
     );
 
     let updated = state.license.license_state().await;
-    Json(json!({
-        "status": "validated",
-        "tier": updated.tier,
-        "expires_at": updated.expires_at,
-        "last_validated": updated.last_validated,
-    }))
-    .into_response()
+    reponse_validation(
+        MotifValidation::Confirmee,
+        json!({
+            "tier": updated.tier,
+            "expires_at": updated.expires_at,
+            "last_validated": updated.last_validated,
+        }),
+    )
+}
+
+/// #3906 — les neuf sorties de `POST /cloud/license/validate` doivent être
+/// **distinguables par le corps**, puisque le code de statut vaut 200 pour
+/// toutes.
+///
+/// Ces essais ne tiennent ni base ni réseau : [`corps_validation`] est pure,
+/// et la garde de site est textuelle. Ils tournent donc dans le job `Test`
+/// (`ci.yml` l. 262, `-p tune-server`), pas seulement dans `ci:full`.
+#[cfg(test)]
+mod validation_licence_3906 {
+    use super::{MotifValidation, corps_validation, message_statut_distant};
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    /// Recensement exhaustif des motifs.
+    ///
+    /// Le `match` ci-dessous est la garde : ajouter un dixième motif sans
+    /// l'inscrire ici **ne compile plus**. Sans lui, une dixième sortie
+    /// pourrait naître sans que le moindre essai la voie — c'est exactement
+    /// la famille de défaut que ce ticket corrige.
+    fn tous_les_motifs() -> Vec<MotifValidation> {
+        use MotifValidation::*;
+        let recensement = vec![
+            AucuneCle,
+            RequeteEchouee,
+            PointAccesAbsent,
+            StatutDistant,
+            ReponseIllisible,
+            SansVerdict,
+            RefusTransitoire,
+            Expiree,
+            Confirmee,
+        ];
+        for motif in &recensement {
+            match motif {
+                AucuneCle | RequeteEchouee | PointAccesAbsent | StatutDistant
+                | ReponseIllisible | SansVerdict | RefusTransitoire | Expiree | Confirmee => {}
+            }
+        }
+        recensement
+    }
+
+    #[test]
+    fn les_neuf_sorties_portent_un_motif_distinct() {
+        let motifs = tous_les_motifs();
+        assert_eq!(
+            motifs.len(),
+            9,
+            "le recensement doit couvrir les neuf sorties de la route"
+        );
+        let mut vus = std::collections::BTreeSet::new();
+        for motif in &motifs {
+            assert!(
+                vus.insert(motif.code()),
+                "deux sorties partagent le code « {} » : un client ne peut pas les distinguer, \
+                 et le statut HTTP vaut 200 pour les deux",
+                motif.code()
+            );
+        }
+    }
+
+    #[test]
+    fn les_trois_sorties_cached_se_distinguent_par_leur_motif() {
+        let cached = [
+            MotifValidation::PointAccesAbsent,
+            MotifValidation::SansVerdict,
+            MotifValidation::RefusTransitoire,
+        ];
+        let codes: std::collections::BTreeSet<_> = cached.iter().map(|m| m.code()).collect();
+        for motif in cached {
+            assert_eq!(
+                motif.status(),
+                "cached",
+                "{:?} doit garder le `status` que les clients déployés lisent",
+                motif
+            );
+        }
+        assert_eq!(
+            codes.len(),
+            3,
+            "les trois sorties « cached » — 404 distant, verdict absent, refus transitoire — \
+             doivent porter TROIS codes : sans cela le client ne peut pas dire à l'utilisateur \
+             lequel des trois lui est arrivé. Codes obtenus : {codes:?}"
+        );
+    }
+
+    #[test]
+    fn les_trois_sorties_error_se_distinguent_par_leur_motif() {
+        let erreurs = [
+            MotifValidation::RequeteEchouee,
+            MotifValidation::StatutDistant,
+            MotifValidation::ReponseIllisible,
+        ];
+        let codes: std::collections::BTreeSet<_> = erreurs.iter().map(|m| m.code()).collect();
+        for motif in erreurs {
+            assert_eq!(
+                motif.status(),
+                "error",
+                "{:?} doit garder le `status` que les clients déployés lisent",
+                motif
+            );
+        }
+        assert_eq!(
+            codes.len(),
+            3,
+            "les trois sorties « error » — requête qui n'aboutit pas, statut distant, corps \
+             illisible — doivent porter TROIS codes. Codes obtenus : {codes:?}"
+        );
+    }
+
+    #[test]
+    fn seule_une_licence_confirmee_rend_ok_vrai() {
+        for motif in tous_les_motifs() {
+            let attendu = motif == MotifValidation::Confirmee;
+            assert_eq!(
+                motif.succes(),
+                attendu,
+                "`ok` doit valoir {attendu} pour {motif:?} : c'est le seul champ que le client \
+                 peut tester sans connaître l'histoire de cette route"
+            );
+        }
+    }
+
+    #[test]
+    fn le_corps_porte_les_trois_champs_sans_perdre_le_reste() {
+        let corps = corps_validation(
+            MotifValidation::StatutDistant,
+            json!({
+                "tier": "premium",
+                "message": "Server returned 429 Too Many Requests",
+                "cached": true,
+                "upstream_status": 429,
+            }),
+        );
+        assert_eq!(
+            corps["status"],
+            json!("error"),
+            "le `status` historique est conservé"
+        );
+        assert_eq!(
+            corps["reason"],
+            json!("upstream_error"),
+            "`reason` est le seul discriminant stable de cette sortie"
+        );
+        assert_eq!(
+            corps["ok"],
+            json!(false),
+            "un statut distant d'erreur ne pose aucun palier"
+        );
+        assert_eq!(
+            corps["upstream_status"],
+            json!(429),
+            "429 doit être lisible en NOMBRE : sans lui le client doit analyser une phrase anglaise"
+        );
+        assert_eq!(
+            corps["tier"],
+            json!("premium"),
+            "le corps d'origine doit survivre"
+        );
+        assert_eq!(
+            corps["cached"],
+            json!(true),
+            "le corps d'origine doit survivre"
+        );
+    }
+
+    #[test]
+    fn upstream_status_est_toujours_present_meme_sans_aller_retour() {
+        for motif in tous_les_motifs() {
+            let corps = corps_validation(motif, json!({ "tier": "free" }));
+            assert!(
+                corps.get("upstream_status").is_some(),
+                "`upstream_status` doit exister pour {motif:?}, fût-il nul : un client typé ne \
+                 doit pas avoir à distinguer « champ absent » de « pas d'aller-retour »"
+            );
+        }
+        let sans_aller_retour = corps_validation(MotifValidation::RequeteEchouee, json!({}));
+        assert!(
+            sans_aller_retour["upstream_status"].is_null(),
+            "aucune requête n'a abouti : il n'y a pas de statut distant à annoncer"
+        );
+    }
+
+    #[test]
+    fn le_motif_fait_foi_sur_un_corps_qui_se_contredit() {
+        let corps = corps_validation(
+            MotifValidation::RefusTransitoire,
+            json!({ "status": "validated", "ok": true, "reason": "confirmed" }),
+        );
+        assert_eq!(
+            corps["status"],
+            json!("cached"),
+            "le motif écrase un `status` menteur"
+        );
+        assert_eq!(corps["ok"], json!(false), "le motif écrase un `ok` menteur");
+        assert_eq!(
+            corps["reason"],
+            json!("rejected_transient"),
+            "le motif écrase un `reason` menteur"
+        );
+    }
+
+    #[test]
+    fn le_message_du_statut_distant_garde_le_prefixe_que_le_client_analyse() {
+        let plafond = message_statut_distant(StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            plafond.starts_with("Server returned 429"),
+            "le client web déployé (tune-web-client v0.9.146, `statutDistantDepuisMessage`) \
+             extrait le code distant par `^Server returned (\\d{{3}})` : reformuler cette phrase \
+             lui retire la distinction 429/502 sans un seul rouge. Message obtenu : « {plafond} »"
+        );
+        let panne = message_statut_distant(StatusCode::BAD_GATEWAY);
+        assert!(
+            panne.starts_with("Server returned 502"),
+            "même contrat pour une panne du serveur distant. Message obtenu : « {panne} »"
+        );
+    }
+
+    /// Le corps de la route, découpé dans son propre source.
+    ///
+    /// Les aiguilles sont construites à l'exécution : écrites en clair, ce
+    /// module se compterait lui-même.
+    fn corps_de_la_route() -> String {
+        let source = include_str!("cloud.rs");
+        let entete = format!("async fn license{}validate(", "_");
+        let debut = source
+            .find(&entete)
+            .expect("la route `license_validate` doit exister dans ce fichier");
+        let reste = &source[debut..];
+        let fin = reste
+            .find("\n}\n")
+            .expect("la route doit se fermer sur une accolade en colonne 0");
+        reste[..fin].to_string()
+    }
+
+    /// Garde de SITE : aucune sortie de la route ne doit répondre sans motif.
+    ///
+    /// Une dixième sortie écrite à la main — `Json(json!(…)).into_response()` —
+    /// rendrait un corps sans `reason`, sans `ok` et sans `upstream_status`,
+    /// avec le même HTTP 200 que toutes les autres. Invisible à l'œil, et
+    /// invisible aux essais de corps ci-dessus, qui n'exercent que la fonction
+    /// pure. C'est cette garde-là qui la voit.
+    #[test]
+    fn aucune_sortie_de_license_validate_ne_repond_sans_motif() {
+        let corps = corps_de_la_route();
+        let echappatoire = format!(".into{}response()", "_");
+        assert_eq!(
+            corps.matches(&echappatoire).count(),
+            0,
+            "une sortie de `license_validate` construit sa réponse à la main au lieu de passer \
+             par `reponse_validation` : elle rendra un 200 sans `reason`, et le client ne pourra \
+             pas la distinguer des huit autres (#3906)"
+        );
+        let fabrique = format!("reponse{}validation(", "_");
+        assert_eq!(
+            corps.matches(&fabrique).count(),
+            9,
+            "la route doit avoir exactement neuf sorties, toutes passées par `reponse_validation`"
+        );
+        for motif in tous_les_motifs() {
+            let nom = format!("{}::{:?}", "MotifValidation", motif);
+            assert!(
+                corps.contains(&nom),
+                "le motif {nom} n'est employé par AUCUNE sortie de la route : soit la sortie a \
+                 disparu, soit elle répond désormais sous un autre motif"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

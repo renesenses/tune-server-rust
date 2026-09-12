@@ -221,7 +221,7 @@ pub async fn pull_community_enrichments(
 /// community metadata but only has a handful. Fills `musicbrainz_recording_id`
 /// (and `genre` when empty); never overwrites an MBID that already exists.
 ///
-/// Each attempted track is stamped with a `mb_resolve_tried` = <unix-seconds>
+/// Each attempted track is stamped with a `mb_resolve_tried` = `<unix-seconds>`
 /// sentinel so the sweep advances across the whole library instead of retrying
 /// the same first 100 rows every cycle; an unresolved track is re-tried once its
 /// stamp is older than `RESOLVE_RETRY_SECS`, catching MBIDs the cloud backfill
@@ -355,7 +355,7 @@ pub async fn resolve_missing_mbids(
 /// (never overwrites the user's own file tags). The `/extra` endpoint is served
 /// from Tune's own cloud, so there is no MusicBrainz rate limit to respect here.
 ///
-/// Each processed track is stamped with a `mb_extra_synced` = <unix-seconds>
+/// Each processed track is stamped with a `mb_extra_synced` = `<unix-seconds>`
 /// sentinel so the sweep advances across the library; a track is re-pulled once
 /// its stamp is older than `EXTRA_RESWEEP_SECS`, catching extra the cloud derived
 /// after our first pass.
@@ -607,12 +607,11 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
 
         loop {
             let settings = crate::db::settings_repo::SettingsRepo::with_backend(backend.clone());
-            let enabled = settings
-                .get("community_sync_enabled")
-                .ok()
-                .flatten()
-                .map(|v| v == "true")
-                .unwrap_or(false);
+            // #3383 — le verrou PARTAGE, et non une lecture maison de la cle :
+            // un refus de telemetrie doit arreter cette boucle comme il arrete
+            // deja la contribution et les bios. C'etait la derniere famille
+            // d'envois AUTOMATIQUES a l'ignorer.
+            let enabled = crate::cloud::consent::sync_communautaire_autorise(&settings);
 
             if enabled {
                 // Resolve MBIDs first (no instance_id required) so freshly

@@ -23,3 +23,6 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 # Lot 2 : mémoriser le pseudo et le fan_id resolus (SettingsRepo).
 tokio = { workspace = true }
+# #3003 : dire qu'un onglet de recherche est arrivé vide sur une panne réseau
+# plutôt que de le laisser passer pour « Bandcamp n'a rien ».
+tracing = { workspace = true }

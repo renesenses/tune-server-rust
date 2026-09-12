@@ -17,10 +17,10 @@
 //!
 //! On reprend donc la solution qui a réparé les favoris :
 //! 1. **instantané d'identité** (`item_name`/`item_artist`) figé au masquage ;
-//! 2. **réconciliation** au démarrage et post-scan ([`HiddenRepo::reconcile`]),
+//! 2. **réconciliation** au démarrage et post-scan ([`HiddenRepo::reconcile`](crate::db::hidden_repo::HiddenRepo::reconcile)),
 //!    qui re-rattache chaque marqueur orphelin à l'album vivant retrouvé par
 //!    identité — mêmes règles que les favoris, via
-//!    [`find_album_by_identity`] partagé.
+//!    `find_album_by_identity` partagé.
 //!
 //! Un rescan ORDINAIRE ne menace même pas le marqueur : aucune écriture de
 //! scan ne touche `hidden_items`, et l'album mis à jour garde son rowid. La

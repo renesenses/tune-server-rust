@@ -31,6 +31,35 @@ pub const REFERENCE_LUFS: f64 = -18.0;
 /// never monopolises the CPU on a big library — it chips away over time.
 const TRACK_BATCH: usize = 25;
 
+/// Provenance d'un `dr_track` CALCULÉ par cette passe, par opposition à celui
+/// lu dans les tags du fichier au scan. Voir l'écriture dans
+/// `analyze_track_batch`.
+///
+/// Jumeau de [`crate::metadata::DR_SOURCE_TAG`], écrit par le scan sur la
+/// valeur qu'il LIT dans le fichier (#3924). Les deux producteurs de
+/// `dr_track` marquent désormais la clef `dr_source` ; sans le second, une
+/// valeur non marquée ne se distinguait pas d'une valeur d'avant la clef.
+const DR_SOURCE_ANALYSIS: &str = "analysis";
+
+/// La plage calculée a-t-elle le droit de s'écrire ?
+///
+/// 🔴 LE TAG DU FICHIER FAIT FOI. `dr_track` a DEUX producteurs : le scan, qui
+/// lit `DYNAMIC RANGE` dans le fichier (`metadata/mod.rs`), et cette passe, qui
+/// le calcule. Le premier porte la valeur que le producteur du disque a
+/// mesurée ; la remplacer par une estimation perdrait une donnée d'origine.
+///
+/// ⚠️ Une valeur VIDE n'est pas une valeur. Un tag présent mais vide
+/// (`DYNAMIC RANGE=`) existe sur des fichiers mal étiquetés ; le traiter comme
+/// « déjà tagué » condamnerait ces pistes à n'avoir jamais de DR, ni lu ni
+/// calculé.
+///
+/// Fonction à part, et non un `if` dans la boucle : une garde écrite contre la
+/// boucle devrait monter une base, des fichiers et un décodeur pour juger deux
+/// lignes de condition. Ici elle APPELLE la décision.
+fn peut_ecrire_le_dr(existant: Option<&str>) -> bool {
+    !existant.is_some_and(|v| !v.trim().is_empty())
+}
+
 /// Pause between per-file analyses (each one fully decodes a track). Keeps the
 /// pass "nice": it must never compete with playback or make the machine hot.
 const PER_FILE_PAUSE_MS: u64 = 400;
@@ -262,6 +291,52 @@ pub fn track_gain_db(lufs: f64) -> f64 {
 /// tels quels dès qu'un mode est réarmé — les recalculer coûte des heures de
 /// décodage. Couper l'analyse suspend le travail, elle ne le jette pas.
 pub fn analysis_enabled(backend: &Arc<dyn DbBackend>) -> bool {
+    matches!(etat_de_l_analyse(backend), EtatAnalyse::Active)
+}
+
+/// Pourquoi la passe décode — ou ne décode pas.
+///
+/// [`analysis_enabled`] rend un booléen, et un booléen ne sait pas dire
+/// POURQUOI. C'est ce qui a rendu le défaut invisible : le 09/09/2026, le .18
+/// portait 13 463 pistes sans plage dynamique et 19 lignes de registre disant
+/// « aucune piste ni album sans ReplayGain » depuis le 29/08. La passe n'avait
+/// rien fini : elle n'avait jamais démarré, parce que `replaygain_mode` était
+/// ABSENT de la table des réglages — ce qui vaut `Off`. Les deux états
+/// écrivaient la même phrase.
+///
+/// D'où cette énumération : le registre inscrit l'état, pas une interprétation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EtatAnalyse {
+    /// Un mode est armé et la coche n'est pas décochée : la passe travaille.
+    Active,
+    /// `replaygain_analysis_enabled = false` — la coche « Analyse ReplayGain ».
+    CocheDecochee,
+    /// `replaygain_mode` vaut explicitement « Désactivé ».
+    ModeDesactive,
+    /// `replaygain_mode` est ABSENT. État d'une installation NEUVE : le défaut
+    /// de l'API est `"off"` (`routes/system/config.rs`) et la clé n'est écrite
+    /// qu'au premier réglage. Distinct de [`Self::ModeDesactive`] à dessein —
+    /// « jamais choisi » et « choisi Désactivé » appellent des réponses
+    /// opposées quand on se demande pourquoi une bibliothèque n'a pas de DR.
+    ModeAbsent,
+}
+
+impl EtatAnalyse {
+    /// La phrase inscrite au registre. `None` quand la passe est active : il
+    /// n'y a alors pas de motif d'inaction à raconter.
+    pub(crate) fn motif(self) -> Option<&'static str> {
+        match self {
+            Self::Active => None,
+            Self::CocheDecochee => Some("analyse desactivee : replaygain_analysis_enabled = false"),
+            Self::ModeDesactive => Some("analyse desactivee : replaygain_mode = off"),
+            Self::ModeAbsent => {
+                Some("analyse desactivee : replaygain_mode ABSENT (vaut off) — jamais regle")
+            }
+        }
+    }
+}
+
+pub(crate) fn etat_de_l_analyse(backend: &Arc<dyn DbBackend>) -> EtatAnalyse {
     let settings = SettingsRepo::with_backend(backend.clone());
     let opted_out = settings
         .get(ANALYSIS_ENABLED_KEY)
@@ -270,15 +345,20 @@ pub fn analysis_enabled(backend: &Arc<dyn DbBackend>) -> bool {
         .map(|v| v == "false")
         .unwrap_or(false);
     if opted_out {
-        return false;
+        return EtatAnalyse::CocheDecochee;
     }
-    let mode = settings
-        .get(MODE_KEY)
-        .ok()
-        .flatten()
-        .map(|v| ReplayGainMode::from_setting(&v))
-        .unwrap_or(ReplayGainMode::Off);
-    mode != ReplayGainMode::Off
+    // La distinction ABSENT / « off » se joue ici, et nulle part ailleurs :
+    // `unwrap_or(Off)` écrasait les deux cas en un seul.
+    let Some(brut) = settings.get(MODE_KEY).ok().flatten() else {
+        return EtatAnalyse::ModeAbsent;
+    };
+    // Illisible vaut `Off`, comme dans `ReplayGainSettings::load` : dans le
+    // doute on travaille MOINS, jamais plus.
+    if ReplayGainMode::from_setting(&brut) == ReplayGainMode::Off {
+        EtatAnalyse::ModeDesactive
+    } else {
+        EtatAnalyse::Active
+    }
 }
 
 /// Verrou GLOBAL des analyses lourdes : UNE seule passe décode à la fois.
@@ -355,16 +435,24 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // transition (`repos_deja_inscrit`). C'est la réponse littérale à « ça
         // n'a rien fait » : la passe a tourné, elle n'a rien trouvé. Sans
         // cette ligne, une bibliothèque déjà entièrement analysée serait
-        // indistinguable d'une passe jamais lancée. Sans le drapeau, la même
-        // ligne se réécrirait toutes les IDLE_SLEEP_SECS et chasserait tout
-        // l'historique utile hors de la rétention.
+        // indistinguable d'une passe jamais lancée. Sans le MOTIF mémorisé, la
+        // même ligne se réécrirait toutes les IDLE_SLEEP_SECS et chasserait
+        // tout l'historique utile hors de la rétention — et, pire, un passage
+        // de « fini » à « désactivée » ne s'inscrirait jamais.
         let registre = crate::db::task_run_repo::TaskRunRepo::with_backend(backend.clone());
         let mut campagne: Option<crate::db::task_run_repo::Execution> = None;
         let mut analysees: i64 = 0;
-        let mut repos_deja_inscrit = false;
+        // PAS un booléen : le DERNIER motif inscrit. Un `bool` ne sait dire que
+        // « déjà au repos », si bien qu'une bibliothèque finie puis une passe
+        // coupée à la main n'écrivaient qu'une seule ligne, la première — et
+        // l'utilisateur qui décoche « Analyse ReplayGain » ne voyait RIEN
+        // changer au registre. Comparer les motifs inscrit une ligne à chaque
+        // changement d'état, et une seule.
+        let mut dernier_repos: Option<&'static str> = None;
 
         loop {
-            if analysis_enabled(&backend) {
+            let etat = etat_de_l_analyse(&backend);
+            if etat == EtatAnalyse::Active {
                 if thermal.should_hold("replaygain") {
                     tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
                     continue;
@@ -380,7 +468,22 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                         // Une passe à la fois (#1576) : si le sweep acoustique
                         // décode, on attend notre tour plutôt que d'empiler.
                         let _slot = ANALYSIS_SLOT.lock().await;
-                        analyze_track_batch(&backend).await
+                        // BIB-B2 : quand le ReplayGain n'a plus de piste, le
+                        // meme creneau sert au rattrapage des empreintes des
+                        // pistes deja analysees (avant la colonne, ou apres un
+                        // changement de version de l'algorithme).
+                        // Le créneau se transmet de rattrapage en rattrapage :
+                        // ReplayGain d'abord (la passe nominale), puis les
+                        // empreintes, puis la plage dynamique. Chacun ne voit
+                        // le disque que lorsque le précédent n'a plus rien —
+                        // jamais deux décodages en même temps.
+                        match analyze_track_batch(&backend).await {
+                            0 => match empreinter_un_lot(&backend).await {
+                                0 => rattraper_un_lot_de_dr(&backend).await,
+                                n => n,
+                            },
+                            n => n,
+                        }
                     }
                 };
                 // La lecture peut avoir démarré PENDANT le lot, qui a alors
@@ -399,7 +502,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                         analysees = 0;
                     }
                     analysees += did as i64 + albums as i64;
-                    repos_deja_inscrit = false;
+                    dernier_repos = None;
                 }
 
                 if playing {
@@ -409,7 +512,8 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                         &registre,
                         &mut campagne,
                         &mut analysees,
-                        &mut repos_deja_inscrit,
+                        &mut dernier_repos,
+                        "aucune piste ni album sans ReplayGain, empreinte ni plage dynamique",
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
                 } else {
@@ -425,7 +529,10 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     &registre,
                     &mut campagne,
                     &mut analysees,
-                    &mut repos_deja_inscrit,
+                    &mut dernier_repos,
+                    // `motif()` ne rend `None` que sur `Active`, cas exclu par
+                    // la branche ; le repli n'est là que pour ne pas paniquer.
+                    etat.motif().unwrap_or("analyse desactivee"),
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
             }
@@ -442,7 +549,8 @@ fn clore_campagne(
     registre: &crate::db::task_run_repo::TaskRunRepo,
     campagne: &mut Option<crate::db::task_run_repo::Execution>,
     analysees: &mut i64,
-    repos_deja_inscrit: &mut bool,
+    dernier_repos: &mut Option<&'static str>,
+    motif: &'static str,
 ) {
     if let Some(e) = campagne.take() {
         let n = *analysees;
@@ -452,14 +560,17 @@ fn clore_campagne(
             Some(&format!("{n} elements analyses")),
         );
         *analysees = 0;
-        *repos_deja_inscrit = true;
+        *dernier_repos = Some(motif);
         return;
     }
-    if !*repos_deja_inscrit {
+    // Une ligne par CHANGEMENT de motif. Même motif qu'au tour précédent : la
+    // situation n'a pas bougé, le registre n'a rien de neuf à dire et ne
+    // chasse pas l'historique utile hors de la rétention.
+    if *dernier_repos != Some(motif) {
         registre
             .ouvrir(crate::db::task_run_repo::TACHE_REPLAYGAIN)
-            .rien_a_faire(Some("aucune piste ni album sans ReplayGain"));
-        *repos_deja_inscrit = true;
+            .rien_a_faire(Some(motif));
+        *dernier_repos = Some(motif);
     }
 }
 
@@ -594,7 +705,7 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
         // fichier monopolise le disque pendant des minutes.
         let measured = match mesurer_en_cedant_a_la_lecture(
             backend,
-            crate::audio::analyzer::measure_loudness_and_peak(&sur_disque),
+            crate::audio::analyzer::mesurer_intensite_et_plage(&sur_disque),
         )
         .await
         {
@@ -616,7 +727,7 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
             }
         };
         match measured {
-            Ok(Some((lufs, peak, true_peak))) => {
+            Ok(Some((lufs, peak, true_peak, plage))) => {
                 let gain = track_gain_db(lufs);
                 let _ = repo.set(track_id, "rg_track_gain", &format_gain(gain));
                 let _ = repo.set(track_id, "rg_track_peak", &format_peak(peak));
@@ -633,6 +744,38 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
                 // et « tags du fichier » affiché sur une mesure Tune serait un
                 // affichage inventé.
                 let _ = repo.set(track_id, TRACK_SOURCE_KEY, SOURCE_ANALYSIS);
+
+                // ── PLAGE DYNAMIQUE ──────────────────────────────────────
+                //
+                // Elle voyage avec ce décodage-ci : `mesurer_intensite_et_plage`
+                // la calcule sur les mêmes échantillons, donc elle ne coûte que
+                // son arithmétique. Un balayage séparé relirait chaque fichier
+                // une seconde fois — 46 877 pistes sur le .18, mesuré le
+                // 09/09/2026.
+                //
+                // 🔴 LE TAG DU FICHIER FAIT FOI, TOUJOURS. `dr_track` peut déjà
+                // porter la valeur lue dans `DYNAMIC RANGE` au scan
+                // (`metadata/mod.rs`) : c'est celle que le producteur du disque
+                // a mesurée, et l'écraser par la nôtre remplacerait une donnée
+                // d'origine par une estimation. On n'écrit QUE dans le vide.
+                //
+                // `dr_source` dit d'où vient ce qui est en base — même
+                // raisonnement que `TRACK_SOURCE_KEY` juste au-dessus : sans
+                // lui, une valeur calculée s'afficherait comme une valeur du
+                // disque, ce qui serait un affichage inventé.
+                if let Some(dr) = plage {
+                    // `get_all` : le dépôt n'expose pas de lecture d'UNE clé,
+                    // et la ligne est de toute façon déjà en cache après
+                    // l'écriture des gains juste au-dessus.
+                    let existant = repo
+                        .get_all(track_id)
+                        .ok()
+                        .and_then(|m| m.get("dr_track").cloned());
+                    if peut_ecrire_le_dr(existant.as_deref()) {
+                        let _ = repo.set(track_id, "dr_track", &dr.to_string());
+                        let _ = repo.set(track_id, "dr_source", DR_SOURCE_ANALYSIS);
+                    }
+                }
             }
             // Le fichier a disparu ENTRE la résolution et le décodage — un
             // partage qui tombe pendant la passe, exactement le scénario qui a
@@ -672,6 +815,10 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
                 );
             }
         }
+        // BIB-B2 : l'empreinte du contenu, dans la meme passe. Le fichier
+        // vient d'etre decode en entier ; 60 s de plus en mono 11 kHz ne
+        // pesent rien, et la piste ne repassera pas par ici.
+        empreinter_la_piste(backend, track_id, &sur_disque).await;
         // Sentinel = unix seconds, so an album pass can tell a track has been
         // handled even when it produced no gain.
         let _ = repo.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
@@ -691,17 +838,402 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     done
 }
 
+/// BIB-B2 : la marque « pas d'empreinte possible » (silence, fichier
+/// indecodable), versionnee comme une empreinte : elle sort la piste du
+/// rattrapage sans jamais se comparer a rien (`deserialiser` la refuse).
+fn marque_sans_empreinte() -> String {
+    format!("{}:-", crate::audio::empreinte::VERSION)
+}
+
+/// Calcule et pose l'empreinte du contenu d'une piste (BIB-B2). Le decodage
+/// (90 s au plus, mono 11 kHz) part en tache bloquante. Rend `true` si une
+/// valeur a ete ecrite (empreinte ou marque).
+async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin: &str) -> bool {
+    let chemin_owned = chemin.to_string();
+    let calcul = tokio::task::spawn_blocking(move || {
+        crate::audio::empreinte::empreinte_du_fichier(&chemin_owned)
+    })
+    .await;
+    let valeur = match calcul {
+        Ok(Ok(Some(e))) => e.serialiser(),
+        Ok(Ok(None)) => {
+            debug!(track_id, path = %chemin, "empreinte_silence — marque posee");
+            marque_sans_empreinte()
+        }
+        Ok(Err(e)) => {
+            warn!(track_id, path = %chemin, error = %e, "empreinte_decodage_echoue — marque posee");
+            marque_sans_empreinte()
+        }
+        Err(e) => {
+            warn!(track_id, path = %chemin, error = %e, "empreinte_tache_interrompue");
+            return false;
+        }
+    };
+    match crate::db::track_repo::TrackRepo::with_backend(backend.clone())
+        .set_audio_fingerprint(track_id, &valeur)
+    {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(track_id, error = %e, "empreinte_ecriture_echouee");
+            false
+        }
+    }
+}
+
+/// BIB-B2 : rattrapage borne des empreintes — les pistes deja analysees par
+/// le ReplayGain (donc jamais reprises par [`analyze_track_batch`]) qui n'ont
+/// pas d'empreinte de la version courante. Memes gardes que le ReplayGain :
+/// reglage, lecture en cours, chemin introuvable reporte (#1865), DSD ecarte
+/// (le reechantillonneur DSD→PCM peut boucler sur certains rips SACD).
+/// Le prédicat des pistes À EMPREINTER, partagé entre le rattrapage et son
+/// compteur (BIB-B2 phase D) : deux textes finiraient par diverger, et la
+/// couverture annoncée ne serait plus celle que le rattrapage traite.
+/// Paramètres, dans l'ordre : motif `VERSION:%`, seuil de report.
+const CANDIDATS_EMPREINTE_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' \
+           AND (t.audio_fingerprint IS NULL OR t.audio_fingerprint NOT LIKE ?) \
+           AND EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_analyzed') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
+                   AND m.value > ?) \
+           AND LOWER(COALESCE(t.format, '')) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff')";
+
+/// Combien de pistes le rattrapage traiterait encore. `None` : base
+/// antérieure à la colonne `audio_fingerprint` (rien à compter).
+pub fn compter_les_candidats_a_empreinter(backend: &Arc<dyn DbBackend>) -> Option<i64> {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let motif = format!("{}:%", crate::audio::empreinte::VERSION);
+    backend
+        .query_one(
+            &format!("SELECT COUNT(*) FROM tracks t WHERE {CANDIDATS_EMPREINTE_WHERE}"),
+            &[&motif as &dyn ToSqlValue, &seuil_report as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+}
+
+pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let motif = format!("{}:%", crate::audio::empreinte::VERSION);
+    let rows = match backend.query_many(
+        &format!(
+            "SELECT t.id, t.file_path FROM tracks t WHERE {CANDIDATS_EMPREINTE_WHERE} LIMIT ?"
+        ),
+        &[
+            &motif as &dyn ToSqlValue,
+            &seuil_report as &dyn ToSqlValue,
+            &(TRACK_BATCH as i64) as &dyn ToSqlValue,
+        ],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // Base anterieure a la colonne : rien a rattraper, sans bruit.
+            if !(e.contains("no such column") || e.contains("does not exist")) {
+                warn!(error = %e, "empreinte_candidate_query_failed");
+            }
+            return 0;
+        }
+    };
+    if rows.is_empty() {
+        return 0;
+    }
+    let repo = TrackMetadataRepo::with_backend(backend.clone());
+    let mut done = 0usize;
+    for r in &rows {
+        if !analysis_enabled(backend) || any_zone_playing(backend) {
+            break;
+        }
+        let Some(track_id) = r.first().and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let Some(path) = r
+            .get(1)
+            .and_then(|v| v.as_string())
+            .filter(|p| !p.is_empty())
+        else {
+            continue;
+        };
+        let sur_disque = match resolve_local_path(&path) {
+            LocalPath::Found(reel) => reel,
+            LocalPath::Missing => {
+                warn!(track_id, path = %path, "empreinte_path_unresolved — piste REPORTEE (#1865)");
+                let _ = repo.set(
+                    track_id,
+                    PATH_UNRESOLVED_KEY,
+                    &deferral_stamp(now_epoch_secs() as i64),
+                );
+                done += 1;
+                continue;
+            }
+        };
+        if empreinter_la_piste(backend, track_id, &sur_disque).await {
+            done += 1;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(PER_FILE_PAUSE_MS)).await;
+    }
+    info!(empreintes = done, "empreinte_lot");
+    done
+}
+
+/// La marque « pas de plage dynamique possible pour ce fichier » : estampille
+/// unix, posée quand le rattrapage a VRAIMENT essayé et n'a rien obtenu
+/// (fichier illisible, silencieux, décodage bloqué, taille hors de portée).
+///
+/// Sans elle, le rattrapage reprendrait les mêmes fichiers à chaque réveil,
+/// pour toujours : c'est la boucle infinie que `rg_analyzed` évite déjà à la
+/// passe nominale (#1155). Introuvable n'en fait PAS partie — un partage
+/// démonté se reporte, il ne se condamne pas (#1865).
+const DR_INDISPONIBLE_KEY: &str = "dr_indisponible";
+
+/// Le prédicat des pistes SANS plage dynamique que la passe nominale ne
+/// repassera JAMAIS voir.
+///
+/// 🔴 C'est le trou mesuré sur le .18 le 09/09/2026 : 33 414 pistes sur 46 877
+/// portaient déjà `rg_analyzed` — posé avant que le DR n'existe — et
+/// `analyze_track_batch` les écarte par construction. Aucune route ne remet ce
+/// témoin à zéro (seule une migration DSD l'a jamais fait). Sans ce
+/// rattrapage, 71 % de la bibliothèque n'aurait jamais de DR calculé, quoi que
+/// fasse l'utilisateur. Même raisonnement et même forme que
+/// [`CANDIDATS_EMPREINTE_WHERE`] (BIB-B2), pour la même raison.
+///
+/// Les deux populations visées, et elles seules :
+/// * `rg_analyzed` — analysées avant l'arrivée du DR ;
+/// * `rg_track_gain` — gain lu dans les tags du fichier, donc jamais décodées.
+///
+/// Ce qui est écarté, et pourquoi :
+/// * un `dr_track` NON VIDE — le tag du disque fait foi, cf. [`peut_ecrire_le_dr`] ;
+///   la comparaison sur `TRIM(...) != ''` suit exactement cette règle, un tag
+///   présent mais vide n'étant pas une valeur ;
+/// * [`DR_INDISPONIBLE_KEY`] — déjà essayé, en vain ;
+/// * `rg_skipped_oversized` — la passe nominale a refusé de décoder ce fichier
+///   pour ne pas saturer la mémoire (#1109) ; le rattrapage n'a aucune raison
+///   d'être moins prudent ;
+/// * un report de chemin encore frais (#1865).
+///
+/// Paramètre : le seuil de report.
+const CANDIDATS_DR_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' \
+           AND EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key IN ('rg_analyzed', 'rg_track_gain')) \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'dr_track' AND TRIM(m.value) != '') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'dr_indisponible') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_skipped_oversized') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
+                   AND m.value > ?)";
+
+/// Calcule la plage dynamique d'un lot de pistes que la passe nominale a
+/// laissées derrière elle. Rend combien de lignes ont AVANCÉ (0 ⇒ plus rien).
+///
+/// N'écrit QUE `dr_track` / `dr_source`. Surtout pas les gains : sur une piste
+/// `rg_track_gain`, ils viennent des tags du fichier et les remplacer par une
+/// mesure changerait le niveau de lecture sous les pieds de l'utilisateur, qui
+/// n'a rien demandé de tel. Le rattrapage comble un vide, il ne révise rien.
+///
+/// Débit mesuré le 09/09/2026 sur le .18 (Core i7-3615QM, machine au repos) :
+/// 171 ×RT sur 24 pistes réelles, dont ~4,6 % imputables au DR lui-même.
+pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let rows = match backend.query_many(
+        &format!(
+            "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels \
+             FROM tracks t WHERE {CANDIDATS_DR_WHERE} LIMIT ?"
+        ),
+        &[
+            &seuil_report as &dyn ToSqlValue,
+            &(TRACK_BATCH as i64) as &dyn ToSqlValue,
+        ],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "dr_candidate_query_failed");
+            return 0;
+        }
+    };
+    if rows.is_empty() {
+        debug!("dr_rattrapage_rien_a_faire");
+        return 0;
+    }
+
+    let repo = TrackMetadataRepo::with_backend(backend.clone());
+    let mut done = 0usize;
+    let mut deferred = 0usize;
+    for r in &rows {
+        // Mêmes deux gardes que la passe nominale, relues AVANT CHAQUE fichier
+        // et pas seulement entre deux lots : 25 fichiers à 180 s, c'est plus
+        // d'une heure de décodage après un « Désactivé » ou un appui sur
+        // « Lecture » (#2496, #1310).
+        if !analysis_enabled(backend) {
+            info!("dr_rattrapage_desactive_mid_lot — reglage coupe, arret");
+            break;
+        }
+        if any_zone_playing(backend) {
+            debug!("dr_rattrapage_cede_a_la_lecture — zone en lecture, pause");
+            break;
+        }
+        let Some(track_id) = r.first().and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let Some(path) = r
+            .get(1)
+            .and_then(|v| v.as_string())
+            .filter(|p| !p.is_empty())
+        else {
+            continue;
+        };
+        // La base est en NFC, le disque peut être en NFD (macOS, SMB/CIFS).
+        let sur_disque = match resolve_local_path(&path) {
+            LocalPath::Found(reel) => reel,
+            LocalPath::Missing => {
+                // AUCUN `dr_indisponible` : un partage démonté redeviendra
+                // lisible, et la marque serait définitive (#1865).
+                deferred += 1;
+                warn!(
+                    track_id,
+                    path = %path,
+                    "dr_path_unresolved — piste REPORTEE, pas marquee indisponible (#1865)"
+                );
+                let _ = repo.set(
+                    track_id,
+                    PATH_UNRESOLVED_KEY,
+                    &deferral_stamp(now_epoch_secs() as i64),
+                );
+                // Compté : la ligne ne ressortira pas de la prochaine requête,
+                // le rattrapage a donc bel et bien avancé.
+                done += 1;
+                continue;
+            }
+        };
+        let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
+
+        let est = estimated_analysis_bytes(
+            r.get(2).and_then(|v| v.as_i64()),
+            r.get(3).and_then(|v| v.as_i64()),
+            r.get(4).and_then(|v| v.as_i64()),
+        );
+        if est > MAX_ANALYSIS_EST_BYTES {
+            warn!(
+                track_id,
+                path = %path,
+                estimated_mb = est / 1_048_576,
+                "dr_rattrapage_fichier_trop_gros — decode complet ecarte (#1109)"
+            );
+            let _ = repo.set(track_id, DR_INDISPONIBLE_KEY, &now_epoch_secs().to_string());
+            done += 1;
+            continue;
+        }
+
+        let measured = match mesurer_en_cedant_a_la_lecture(
+            backend,
+            crate::audio::analyzer::mesurer_intensite_et_plage(&sur_disque),
+        )
+        .await
+        {
+            Issue::Terminee(m) => m,
+            Issue::CedeeALaLecture => {
+                // Renoncé, pas essayé : aucune marque, la piste sera reprise.
+                info!(
+                    track_id,
+                    path = %path,
+                    "dr_rattrapage_cede_en_cours — lecture demarree, fichier abandonne SANS temoin"
+                );
+                break;
+            }
+        };
+
+        let mut mesuree = false;
+        match measured {
+            Ok(Some((_lufs, _peak, _true_peak, Some(dr)))) => {
+                mesuree = true;
+                // 🔴 LE TAG DU FICHIER FAIT FOI. La requête a bien écarté les
+                // pistes qui en portaient un, mais un scan a pu en poser un
+                // PENDANT le décodage — jusqu'à 180 s de fenêtre. On relit.
+                let existant = repo
+                    .get_all(track_id)
+                    .ok()
+                    .and_then(|m| m.get("dr_track").cloned());
+                if peut_ecrire_le_dr(existant.as_deref()) {
+                    let _ = repo.set(track_id, "dr_track", &dr.to_string());
+                    let _ = repo.set(track_id, "dr_source", DR_SOURCE_ANALYSIS);
+                }
+            }
+            // Le fichier a disparu ENTRE la résolution et le décodage : un
+            // partage qui tombe pendant la passe. On reporte, on ne condamne pas.
+            Ok(None) if resolve_local_path(&path).is_missing() => {
+                deferred += 1;
+                warn!(
+                    track_id,
+                    path = %path,
+                    "dr_path_disparu_pendant_analyse — REPORTEE (#1865)"
+                );
+                let _ = repo.set(
+                    track_id,
+                    PATH_UNRESOLVED_KEY,
+                    &deferral_stamp(now_epoch_secs() as i64),
+                );
+                done += 1;
+                continue;
+            }
+            // Présent mais illisible, silencieux, ou plage non calculable.
+            Ok(_) => debug!(track_id, path = %path, "dr_rattrapage_sans_plage"),
+            Err(_elapsed) => warn!(
+                track_id,
+                path = %path,
+                timeout_s = PER_TRACK_ANALYSIS_TIMEOUT_SECS,
+                "dr_rattrapage_timeout — fichier bloquant, marque pour que le lot AVANCE (#1155)"
+            ),
+        }
+        if !mesuree {
+            let _ = repo.set(track_id, DR_INDISPONIBLE_KEY, &now_epoch_secs().to_string());
+        }
+        done += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(PER_FILE_PAUSE_MS)).await;
+    }
+
+    info!(rattrapees = done - deferred, deferred, "dr_rattrapage_lot");
+    done
+}
+
 /// Compute album ReplayGain for one album whose tracks are all analysed but that
 /// still lacks album gain. Returns 1 if an album was processed, else 0.
 ///
 /// Album gain uses the duration-weighted energy mean of the tracks' loudness
 /// (recovered from each `rg_track_gain`), matching how ReplayGain 2.0 shares one
 /// gain across an album to preserve inter-track dynamics; album peak is the max
-/// track peak. Written to EVERY track of the album (ReplayGain album tags are
+/// track peak. Written to the tracks of the album (ReplayGain album tags are
 /// per-track).
+///
+/// # Deux gardes, et pourquoi
+///
+/// La première version prenait un album dès qu'**une** piste lui manquait un
+/// gain d'album, puis moyennait les seules pistes qui avaient un
+/// `rg_track_gain` **à cet instant** — parfois une sur douze — et écrivait le
+/// résultat sur toutes. Ce gain-là ne se recalculait jamais : toutes les
+/// pistes portant désormais un `rg_album_gain`, l'album sortait
+/// définitivement de la sélection. Mesuré sur le .18 : **179 albums,
+/// 2 385 pistes**, dont un album de 64 pistes dont le gain vient de 2.
+///
+/// * **Complétude, à la SÉLECTION** — un album n'est pris que lorsque
+///   *toutes* ses pistes ont un `rg_track_gain`. Même raisonnement que
+///   `true_peak_complete` plus bas, qui refuse déjà un `rg_album_true_peak`
+///   tiré d'un maximum partiel : une moyenne partielle n'est pas une moyenne.
+///   La garde est dans la requête, et pas dans la boucle, pour que l'album
+///   incomplet ne soit pas RECHOISI à chaque tour — il affamerait tous les
+///   autres.
+/// * **Provenance, à l'ÉCRITURE** — voir [`peut_ecrire_le_gain_album`]. Les
+///   tags du fichier et la mesure de Tune s'écrivent sous la même clé ; une
+///   valeur qui n'est pas estampillée de notre main ne s'écrase pas.
 pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // An album that has track gains but no album gain yet. One at a time keeps
     // it cheap (pure arithmetic, no decode) and interleaved with the track pass.
+    //
+    // 🔴 GARDE DE COMPLÉTUDE : le troisième `NOT EXISTS` écarte l'album dont
+    // une seule piste n'a pas encore son `rg_track_gain`. Sans lui, le gain
+    // d'album se calculait sur le sous-ensemble analysé à cet instant, puis se
+    // figeait pour toujours.
     let album_row = backend
         .query_one(
             "SELECT t.album_id FROM tracks t \
@@ -709,6 +1241,11 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
              WHERE t.album_id IS NOT NULL \
                AND NOT EXISTS (SELECT 1 FROM track_metadata a \
                      WHERE a.track_id = t.id AND a.key = 'rg_album_gain') \
+               AND NOT EXISTS (SELECT 1 FROM tracks t2 \
+                     WHERE t2.album_id = t.album_id \
+                       AND NOT EXISTS (SELECT 1 FROM track_metadata g2 \
+                             WHERE g2.track_id = t2.id \
+                               AND g2.key = 'rg_track_gain')) \
              LIMIT 1",
             &[],
         )
@@ -724,7 +1261,9 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
         "SELECT t.id, t.duration_ms, \
                 (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_gain'), \
                 (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_peak'), \
-                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_true_peak') \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_true_peak'), \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_album_gain'), \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_album_source') \
          FROM tracks t WHERE t.album_id = ?",
         &[&album_id as &dyn ToSqlValue],
     ) {
@@ -746,6 +1285,9 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let mut n = 0usize;
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut track_ids: Vec<i64> = Vec::new();
+    // Les pistes sur lesquelles il est LICITE d'écrire le gain d'album : les
+    // autres portent une valeur venue des tags du fichier.
+    let mut ecrivables: Vec<i64> = Vec::new();
 
     for r in &rows {
         let tid = match r.first().and_then(|v| v.as_i64()) {
@@ -753,6 +1295,11 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
             None => continue,
         };
         track_ids.push(tid);
+        let gain_album_en_place = r.get(5).and_then(|v| v.as_string());
+        let temoin_album = r.get(6).and_then(|v| v.as_string());
+        if peut_ecrire_le_gain_album(gain_album_en_place.as_deref(), temoin_album.as_deref()) {
+            ecrivables.push(tid);
+        }
         let dur = r.get(1).and_then(|v| v.as_i64()).unwrap_or(0).max(1) as f64;
         // gain string like "-6.50 dB" → lufs = REFERENCE - gain
         if let Some(gain) = r.get(2).and_then(|v| v.as_string()).and_then(parse_gain_db) {
@@ -791,7 +1338,18 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let true_peak_str =
         (true_peak_complete && true_peak_max > 0.0).then(|| format_peak(true_peak_max));
 
-    for tid in &track_ids {
+    // 🔴 GARDE DE PROVENANCE : `ecrivables`, et non `track_ids`. Une piste dont
+    // le `rg_album_gain` vient des tags du fichier garde sa valeur — et ne
+    // reçoit surtout pas l'estampille `ALBUM_SOURCE_KEY`, qui la ferait passer
+    // pour une mesure de Tune au tour suivant.
+    if ecrivables.is_empty() {
+        debug!(
+            album_id,
+            "replaygain_album_tout_vient_des_tags — rien à écrire"
+        );
+        return 0;
+    }
+    for tid in &ecrivables {
         let _ = repo.set(*tid, "rg_album_gain", &gain_str);
         let _ = repo.set(*tid, "rg_album_peak", &peak_str);
         if let Some(tp) = &true_peak_str {
@@ -803,8 +1361,34 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
         // d'album, elle, est de Tune.
         let _ = repo.set(*tid, ALBUM_SOURCE_KEY, SOURCE_ANALYSIS);
     }
-    info!(album_id, tracks = track_ids.len(), gain = %gain_str, "replaygain_album");
+    info!(
+        album_id,
+        tracks = track_ids.len(),
+        ecrites = ecrivables.len(),
+        gain = %gain_str,
+        "replaygain_album"
+    );
     1
+}
+
+/// Le gain d'album déjà posé sur cette piste est-il à nous ?
+///
+/// Jumeau album de [`peut_ecrire_le_dr`] : une valeur déjà présente ne
+/// s'écrase pas. Les tags du fichier et la mesure de Tune s'écrivent sous la
+/// **même** clé `rg_album_gain` — le scan y verse ce qu'il lit dans le fichier
+/// (`crate::metadata`) — et seule l'estampille [`ALBUM_SOURCE_KEY`] à
+/// [`SOURCE_ANALYSIS`] dit que la valeur en place vient d'ici. Sans elle, on
+/// est devant un tag de l'utilisateur : on n'y touche pas.
+///
+/// Le refus est par PISTE, et non par album : les pistes encore vierges
+/// reçoivent le gain calculé, donc l'album sort de la sélection au tour
+/// suivant. Un refus par album, lui, le ferait rechoisir indéfiniment.
+fn peut_ecrire_le_gain_album(gain_existant: Option<&str>, temoin: Option<&str>) -> bool {
+    match gain_existant {
+        None => true,
+        Some(v) if v.trim().is_empty() => true,
+        Some(_) => temoin.is_some_and(|t| t.trim() == SOURCE_ANALYSIS),
+    }
 }
 
 /// Parse a ReplayGain gain string ("-6.50 dB", "+3.2", "-6.50dB") to dB.
@@ -836,6 +1420,16 @@ pub const PREVENT_CLIPPING_KEY: &str = "replaygain_prevent_clipping";
 /// `peak × factor` ne dépasse pas `10^(plafond/20)`. Avec le true peak
 /// stocké, cela laisse la marge inter-échantillons aux DAC qui la demandent.
 pub const TRUE_PEAK_CEILING_KEY: &str = "replaygain_true_peak_ceiling_db";
+
+/// Au-delà de ce pic, la valeur tagée n'est plus une amplitude normalisée.
+///
+/// Un pic ReplayGain vaut `1.0` à la pleine échelle. Un master écrêté monte
+/// légitimement au-dessus (`1.02`, `1.1`) : le plafond est posé à `4.0`
+/// (+12 dBFS) pour que ces pics-là continuent de protéger. Une valeur plus
+/// haute — `32768`, `8388607` — est une échelle d'ÉCHANTILLON écrite par un
+/// vieux tagueur ; l'utiliser comme pic ferait tomber le facteur sur son
+/// plancher, soit 60 dB de trop peu.
+pub const PEAK_MAX_PLAUSIBLE: f64 = 4.0;
 
 /// Témoin de provenance du gain de PISTE (#1627) : posé par la passe d'analyse
 /// à côté de `rg_track_gain`. Absent ⇒ la valeur vient des tags du fichier.
@@ -906,6 +1500,57 @@ impl ReplayGainSourceMode {
             Self::Off => "off",
             Self::FileTagsOnly => "file_tags",
             Self::TagsThenAnalysis => "tags_then_analysis",
+        }
+    }
+
+    /// Relit une des trois valeurs de [`as_str`](Self::as_str).
+    ///
+    /// Rend `None` — et JAMAIS un repli silencieux — sur tout le reste. Un
+    /// `_ => Self::Off` en fin de `match` serait ici la faute classique : un
+    /// mode mal orthographié couperait le ReplayGain sans le dire, en
+    /// répondant « c'est fait ». L'appelant doit refuser la demande.
+    pub fn from_setting(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "file_tags" => Some(Self::FileTagsOnly),
+            "tags_then_analysis" => Some(Self::TagsThenAnalysis),
+            _ => None,
+        }
+    }
+}
+
+/// Les écritures que le mode à trois valeurs de #1627 REPRÉSENTE.
+///
+/// C'est la moitié écriture de [`active_source_mode`], et sa réciproque :
+/// aucune clé nouvelle n'est persistée, les deux axes existants restent la
+/// seule vérité en base. On traduit seulement « néant / tags du fichier /
+/// calcul » vers les `settings` que tout le reste du serveur lit déjà
+/// ([`ReplayGainSettings::load`], [`analysis_enabled`]) — donc les chemins
+/// d'application du gain ne changent pas d'un octet.
+///
+/// `granularite` est l'axe piste/album, que les trois modes ne portent PAS :
+/// il est conservé tel qu'il est, jamais deviné.
+pub fn source_mode_settings(
+    mode: ReplayGainSourceMode,
+    granularite: ReplayGainMode,
+) -> Vec<(&'static str, &'static str)> {
+    // `Off` ne peut pas servir de granularité : réécrire `off` en réponse à
+    // « tags du fichier » ne changerait RIEN tout en répondant « ok ». Le
+    // repli est `track`, la granularité par défaut de l'interface.
+    let granularite = match granularite {
+        ReplayGainMode::Album => "album",
+        _ => "track",
+    };
+    match mode {
+        // « Néant » ne touche PAS à la coche d'analyse : `analysis_enabled`
+        // rend déjà `false` quand le mode est `off` (#2496), et l'écraser
+        // détruirait le choix de l'utilisateur pour le jour où il rallume.
+        ReplayGainSourceMode::Off => vec![(MODE_KEY, "off")],
+        ReplayGainSourceMode::FileTagsOnly => {
+            vec![(MODE_KEY, granularite), (ANALYSIS_ENABLED_KEY, "false")]
+        }
+        ReplayGainSourceMode::TagsThenAnalysis => {
+            vec![(MODE_KEY, granularite), (ANALYSIS_ENABLED_KEY, "true")]
         }
     }
 }
@@ -1037,10 +1682,25 @@ pub fn stored_gain_detail(
         .ok()?;
     let pick = |gain_key: &str, peak_key: &str, true_peak_key: &str| -> Option<TrackGain> {
         let gain_db = meta.get(gain_key).cloned().and_then(parse_gain_db)?;
+        // Un pic ReplayGain est une AMPLITUDE NORMALISÉE, pas une valeur
+        // d'échantillon. Le tag est importé VERBATIM du fichier
+        // (`metadata/mod.rs`, `ItemKey::ReplayGainTrackPeak` → `rg_track_peak`)
+        // et certains vieux tagueurs y écrivent l'échelle de l'échantillon :
+        // `32768` en 16 bits, `8388607` en 24 bits. `gain_factor` calcule alors
+        // `plafond / pic`, tombe sur le plancher `0.001` de son `clamp` final,
+        // et la piste sort 60 dB trop bas — inaudible, sans qu'aucun message ne
+        // le dise.
+        //
+        // Le plafond est `PEAK_MAX_PLAUSIBLE` = 4 (+12 dBFS) et non 1 : un
+        // master écrêté dépasse légitimement la pleine échelle (1,02 ; 1,1) et
+        // son pic doit continuer de protéger. Au-delà, la valeur n'est plus un
+        // pic normalisé mais une autre échelle ; l'IGNORER fait retomber
+        // `prevent_clipping` sur le cas « aucun pic tagué », ce qui vaut mieux
+        // que d'éteindre le son.
         let read_peak = |key: &str| {
             meta.get(key)
                 .and_then(|p| p.trim().parse::<f64>().ok())
-                .filter(|p| *p > 0.0)
+                .filter(|p| *p > 0.0 && *p <= PEAK_MAX_PLAUSIBLE)
         };
         // Le true peak (inter-échantillons, #1694) PRIME quand il existe :
         // c'est lui qui voit les overs que le sample peak rate, et c'est
@@ -1204,6 +1864,7 @@ fn now_epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod registre_tests {
+    use super::peut_ecrire_le_dr;
     use std::sync::Arc;
 
     use crate::db::backend::DbBackend;
@@ -1218,6 +1879,109 @@ mod registre_tests {
         Arc::new(db)
     }
 
+    // ── PLAGE DYNAMIQUE : le tag du fichier fait foi ──────────────────────
+
+    /// 🔴 UN DR LU DANS LE FICHIER N'EST JAMAIS ÉCRASÉ PAR LE CALCUL.
+    ///
+    /// Le tag porte la valeur que le producteur du disque a mesurée ; la
+    /// remplacer par notre estimation perdrait une donnée d'origine.
+    ///
+    /// Ce témoin APPELLE la décision. Une première version recopiait la
+    /// condition dans le test et l'affirmait sur elle-même — un `assert` qui
+    /// se prouvait tout seul, vert quoi que fasse le code.
+    #[test]
+    fn le_dr_du_fichier_prime_sur_le_dr_calcule() {
+        assert!(
+            !peut_ecrire_le_dr(Some("14")),
+            "le calcul écraserait le tag du fichier"
+        );
+        assert!(
+            !peut_ecrire_le_dr(Some("0")),
+            "DR 0 est une VRAIE valeur, pas une absence"
+        );
+    }
+
+    /// LA CONTRE-ÉPREUVE — sans elle, un code qui n'écrirait JAMAIS serait vert.
+    #[test]
+    fn une_piste_sans_dr_recoit_le_dr_calcule() {
+        assert!(
+            peut_ecrire_le_dr(None),
+            "aucune piste ne recevrait jamais de DR calculé"
+        );
+    }
+
+    /// Une valeur VIDE n'est pas une valeur.
+    ///
+    /// Un tag présent mais vide (`DYNAMIC RANGE=`) existe sur des fichiers mal
+    /// étiquetés. Le traiter comme « déjà tagué » condamnerait ces pistes à
+    /// n'avoir jamais de DR, ni lu ni calculé.
+    #[test]
+    fn un_dr_vide_ou_blanc_ne_bloque_pas_le_calcul() {
+        for vide in ["", "   ", "\t", "\n"] {
+            assert!(
+                peut_ecrire_le_dr(Some(vide)),
+                "un tag vide ({vide:?}) passe pour une vraie valeur"
+            );
+        }
+    }
+
+    /// Le motif inscrit quand ces tests-ci ferment une campagne : ils
+    /// éprouvent le COMPTE de lignes, pas leur texte.
+    const MOTIF: &str = "rien a faire";
+
+    /// Le registre inscrit UNE ligne par changement d'état — et il en inscrit
+    /// bien une quand on passe de « plus rien à faire » à « désactivée ».
+    #[test]
+    fn le_registre_inscrit_le_changement_de_motif_et_pas_la_repetition() {
+        let registre = TaskRunRepo::with_backend(base());
+
+        let mut campagne: Option<Execution> = None;
+        let mut analysees = 0i64;
+        let mut dernier: Option<&'static str> = None;
+        let lignes = || {
+            registre
+                .lister(Some(TACHE_REPLAYGAIN), 50)
+                .unwrap()
+                .into_iter()
+                .filter_map(|r| r.detail)
+                .collect::<Vec<_>>()
+        };
+
+        super::clore_campagne(
+            &registre,
+            &mut campagne,
+            &mut analysees,
+            &mut dernier,
+            "fini",
+        );
+        assert_eq!(lignes().len(), 1);
+        // Répétition : rien de neuf, on ne chasse pas l'historique utile hors
+        // de la rétention.
+        super::clore_campagne(
+            &registre,
+            &mut campagne,
+            &mut analysees,
+            &mut dernier,
+            "fini",
+        );
+        assert_eq!(lignes().len(), 1);
+
+        // 🔴 LE DÉFAUT : avec l'ancien drapeau booléen, ce passage n'écrivait
+        // RIEN. L'utilisateur décochait « Analyse ReplayGain » et le registre
+        // continuait d'affirmer qu'il n'y avait « rien à faire ».
+        super::clore_campagne(
+            &registre,
+            &mut campagne,
+            &mut analysees,
+            &mut dernier,
+            "desactivee",
+        );
+        let l = lignes();
+        assert_eq!(l.len(), 2, "le changement d'état doit s'inscrire : {l:?}");
+        assert!(l.iter().any(|d| d.contains("desactivee")), "{l:?}");
+        assert!(l.iter().any(|d| d.contains("fini")), "{l:?}");
+    }
+
     /// Une campagne, c'est du premier lot trouvé jusqu'au retour au repos —
     /// PAS un lot. La boucle en enchaîne des centaines : une ligne par lot
     /// consommerait toute la rétention en quelques minutes sans jamais rien
@@ -1228,7 +1992,7 @@ mod registre_tests {
         let registre = TaskRunRepo::with_backend(db.clone());
         let mut campagne: Option<Execution> = None;
         let mut analysees: i64 = 0;
-        let mut repos = false;
+        let mut repos: Option<&'static str> = None;
 
         // Trois lots successifs, comme la boucle les enchaîne.
         for lot in [12i64, 30, 8] {
@@ -1237,7 +2001,7 @@ mod registre_tests {
                 analysees = 0;
             }
             analysees += lot;
-            repos = false;
+            repos = None;
         }
         assert_eq!(
             registre.lister(Some(TACHE_REPLAYGAIN), 10).unwrap().len(),
@@ -1245,7 +2009,7 @@ mod registre_tests {
             "trois lots, UNE ligne"
         );
 
-        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos);
+        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos, MOTIF);
 
         let l = registre.lister(Some(TACHE_REPLAYGAIN), 10).unwrap();
         assert_eq!(l.len(), 1);
@@ -1262,10 +2026,10 @@ mod registre_tests {
         let registre = TaskRunRepo::with_backend(db.clone());
         let mut campagne: Option<Execution> = None;
         let mut analysees: i64 = 0;
-        let mut repos = false;
+        let mut repos: Option<&'static str> = None;
 
         for _ in 0..5 {
-            super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos);
+            super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos, MOTIF);
         }
 
         let l = registre.lister(Some(TACHE_REPLAYGAIN), 10).unwrap();
@@ -1289,14 +2053,14 @@ mod registre_tests {
         let registre = TaskRunRepo::with_backend(db.clone());
         let mut campagne: Option<Execution> = None;
         let mut analysees: i64 = 0;
-        let mut repos = false;
+        let mut repos: Option<&'static str> = None;
 
-        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos);
+        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos, MOTIF);
         campagne = Some(registre.ouvrir(TACHE_REPLAYGAIN));
         analysees = 7;
-        repos = false;
-        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos);
-        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos);
+        repos = None;
+        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos, MOTIF);
+        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos, MOTIF);
 
         let l = registre.lister(Some(TACHE_REPLAYGAIN), 10).unwrap();
         assert_eq!(l.len(), 2, "un repos, puis une campagne — et rien de plus");
@@ -1386,6 +2150,308 @@ mod tests {
 
     fn temoins(db: &crate::db::sqlite::SqliteDb) -> std::collections::HashMap<String, String> {
         TrackMetadataRepo::new(db.clone()).get_all(42).unwrap()
+    }
+
+    fn empreinte_de(db: &crate::db::sqlite::SqliteDb, id: i64) -> Option<String> {
+        db.query_one(
+            &format!("SELECT audio_fingerprint FROM tracks WHERE id = {id}"),
+            &[],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_string()))
+    }
+
+    /// BIB-B2 : la passe ReplayGain pose aussi l'empreinte du contenu, dans
+    /// la foulée du décodage.
+    #[tokio::test]
+    async fn la_passe_replaygain_pose_aussi_l_empreinte() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ape/sine_16s_c3000.wav"
+        );
+        let (db, backend) = base_avec_piste(fixture);
+        assert_eq!(analyze_track_batch(&backend).await, 1);
+        let e = empreinte_de(&db, 42).expect("l'empreinte est posée");
+        assert!(e.starts_with("env100ms-v1:") && e.len() > 20, "{e}");
+        assert!(temoins(&db).contains_key("rg_analyzed"));
+        // Rien à rattraper ensuite : la piste porte déjà la version courante.
+        assert_eq!(empreinter_un_lot(&backend).await, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Rattrapage de la PLAGE DYNAMIQUE — les pistes que la passe nominale
+    // n'ira jamais revoir (33 414 sur 46 877 mesurées sur le .18 le
+    // 09/09/2026).
+    // ---------------------------------------------------------------------
+
+    /// Un WAV de 9 s dont la PLAGE DYNAMIQUE est connue d'avance.
+    ///
+    /// La fixture `sine_16s_c3000.wav` ne pouvait pas servir : elle dure 1 s,
+    /// soit UN bloc de 3 s. L'algorithme TT compare le DEUXIÈME pic au RMS des
+    /// 20 % de blocs les plus forts — avec un seul bloc il n'y a pas de second
+    /// pic, et `finish()` rend `None` à dessein. Un test bâti dessus
+    /// n'éprouvait pas le rattrapage : il constatait l'absence de plage.
+    ///
+    /// Signal : 3 blocs de 3 s, chacun 132 cycles de sinus pleine échelle à
+    /// 441 Hz (0,2993 s) puis du silence. Par canal et par bloc :
+    ///   pic  = 1,0  (441 Hz à 44 100 Hz = 100 éch./cycle, l'éch. 25 vaut 1,0)
+    ///   RMS  = √(2 · 0,09977 · 0,5) = 0,3159   (RMS RÉFÉRENCÉ SINUS)
+    /// Les trois blocs étant identiques : pic₂ = 1,0, et les 20 % les plus
+    /// forts de 3 blocs font 1 bloc, donc RMS₂₀ = 0,3159.
+    ///   DR = 20 · log₁₀(1,0 / 0,3159) = 10,01 → arrondi à 10.
+    fn wav_de_plage_connue(chemin: &std::path::Path) {
+        use std::io::Write;
+        const SR: u32 = 44_100;
+        const BLOCS: u32 = 3;
+        const CYCLES: u32 = 132; // 13 200 éch. sur les 132 300 du bloc
+        let frames = (SR * 3 * BLOCS) as usize;
+        let mut pcm: Vec<u8> = Vec::with_capacity(frames * 4);
+        for i in 0..frames {
+            let dans_le_bloc = i % (SR * 3) as usize;
+            let v: i16 = if dans_le_bloc < (CYCLES * 100) as usize {
+                let phase = (dans_le_bloc % 100) as f64 / 100.0;
+                ((phase * std::f64::consts::TAU).sin() * 32_767.0).round() as i16
+            } else {
+                0
+            };
+            pcm.extend_from_slice(&v.to_le_bytes());
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        let n = pcm.len() as u32;
+        let mut v: Vec<u8> = Vec::with_capacity(n as usize + 44);
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + n).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&2u16.to_le_bytes()); // stéréo
+        v.extend_from_slice(&SR.to_le_bytes());
+        v.extend_from_slice(&(SR * 4).to_le_bytes());
+        v.extend_from_slice(&4u16.to_le_bytes());
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(&pcm);
+        let mut f = std::fs::File::create(chemin).unwrap();
+        f.write_all(&v).unwrap();
+        f.flush().unwrap();
+    }
+
+    /// Le cas du .18, reproduit : une piste porte `rg_analyzed` (posé avant
+    /// que le DR n'existe) et aucune plage. `analyze_track_batch` l'écarte
+    /// pour toujours ; le rattrapage doit la reprendre, calculer, écrire — et
+    /// ne jamais y revenir.
+    #[tokio::test]
+    async fn le_rattrapage_dr_reprend_les_pistes_que_la_passe_ecarte_a_jamais() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("plage.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
+        let repo = TrackMetadataRepo::new(db.clone());
+
+        // L'état hérité : analysée, mais sans plage. C'est exactement ce que
+        // la base du .18 contenait sur 71 % de ses pistes.
+        repo.set(42, "rg_analyzed", "1700000000").unwrap();
+        repo.set(42, "rg_track_gain", "-6.50 dB").unwrap();
+
+        // CONTRE-ÉPREUVE de l'utilité même du rattrapage : la passe nominale
+        // ne rend rien sur cette piste, et ne lui donnera donc JAMAIS de DR.
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            0,
+            "la passe nominale doit bien écarter cette piste — sans cela le \
+             rattrapage ne défendrait rien"
+        );
+        assert!(!temoins(&db).contains_key("dr_track"));
+
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 1);
+        let t = temoins(&db);
+        assert_eq!(
+            t.get("dr_track").map(String::as_str),
+            Some("10"),
+            "la plage du signal construit vaut 10 dB, cf. wav_de_plage_connue"
+        );
+        assert_eq!(t.get("dr_source").map(String::as_str), Some("analysis"));
+        // Le gain des tags n'a PAS bougé : le rattrapage comble un vide, il ne
+        // révise pas le niveau de lecture sous les pieds de l'utilisateur.
+        assert_eq!(t.get("rg_track_gain").map(String::as_str), Some("-6.50 dB"));
+
+        // Et il ne boucle pas : la piste porte désormais une plage.
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 0);
+    }
+
+    /// 🔴 LE TAG DU FICHIER FAIT FOI. Une plage lue au scan n'est jamais
+    /// remplacée par une estimation — mais un tag VIDE n'est pas une valeur.
+    #[tokio::test]
+    async fn le_rattrapage_dr_respecte_le_tag_du_fichier_mais_pas_un_tag_vide() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("plage.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
+        let repo = TrackMetadataRepo::new(db.clone());
+        repo.set(42, "rg_analyzed", "1700000000").unwrap();
+
+        // Plage venue du disque : intouchable, et même pas candidate. La
+        // valeur 14 est DIFFÉRENTE des 10 que le calcul rendrait — sans cet
+        // écart, le test serait vert même si le calcul écrasait le tag.
+        repo.set(42, "dr_track", "14").unwrap();
+        repo.set(42, "dr_source", "tag").unwrap();
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 0);
+        let t = temoins(&db);
+        assert_eq!(t.get("dr_track").map(String::as_str), Some("14"));
+        assert_eq!(t.get("dr_source").map(String::as_str), Some("tag"));
+
+        // CONTRE-ÉPREUVE : un tag présent mais VIDE (`DYNAMIC RANGE=`) existe
+        // sur des fichiers mal étiquetés. Le traiter comme « déjà tagué »
+        // condamnerait ces pistes à n'avoir jamais de plage, ni lue ni
+        // calculée — le rattrapage doit les reprendre.
+        repo.set(42, "dr_track", "   ").unwrap();
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 1);
+        let t = temoins(&db);
+        assert_eq!(t.get("dr_track").map(String::as_str), Some("10"));
+        assert_eq!(t.get("dr_source").map(String::as_str), Some("analysis"));
+    }
+
+    /// Un fichier introuvable se REPORTE, un fichier illisible se MARQUE. Sans
+    /// la marque, le rattrapage reprendrait éternellement les mêmes pistes.
+    #[tokio::test]
+    async fn le_rattrapage_dr_reporte_les_absents_et_marque_les_illisibles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent = tmp.path().join("absente.flac");
+        let (db, backend) = base_avec_piste(absent.to_string_lossy().as_ref());
+        let repo = TrackMetadataRepo::new(db.clone());
+        repo.set(42, "rg_analyzed", "1700000000").unwrap();
+
+        // Introuvable : reporté, JAMAIS marqué indisponible (#1865) — le
+        // partage remonté doit rendre la piste au rattrapage.
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 1);
+        let t = temoins(&db);
+        assert!(t.contains_key("rg_path_unresolved"));
+        assert!(
+            !t.contains_key("dr_indisponible"),
+            "un absent ne se condamne pas : il se reporte (#1865)"
+        );
+
+        // Présent mais illisible : là, la marque est légitime, et elle sort la
+        // piste du rattrapage pour de bon.
+        std::fs::write(&absent, b"ceci n'est pas de l'audio").unwrap();
+        repo.delete(42, "rg_path_unresolved").unwrap();
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 1);
+        assert!(temoins(&db).contains_key("dr_indisponible"));
+        assert_eq!(
+            rattraper_un_lot_de_dr(&backend).await,
+            0,
+            "sans la marque, ce fichier reviendrait à chaque réveil, pour toujours"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Le registre disait la même phrase pour deux états opposés.
+    // ---------------------------------------------------------------------
+
+    /// Le 09/09/2026, le .18 portait 19 lignes « aucune piste ni album sans
+    /// ReplayGain » depuis le 29/08 pendant que 13 463 pistes attendaient. La
+    /// passe n'avait pas fini : `replaygain_mode` était ABSENT, ce qui vaut
+    /// `off`. Les deux états s'écrivaient pareil, donc rien n'était visible.
+    #[test]
+    fn l_etat_de_l_analyse_distingue_absent_desactive_et_decoche() {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        let reglages = SettingsRepo::with_backend(backend.clone());
+
+        // Installation NEUVE : la clé n'existe pas. C'est le cas du .18.
+        assert_eq!(etat_de_l_analyse(&backend), EtatAnalyse::ModeAbsent);
+        assert!(!analysis_enabled(&backend));
+
+        reglages.set(MODE_KEY, "off").unwrap();
+        assert_eq!(etat_de_l_analyse(&backend), EtatAnalyse::ModeDesactive);
+
+        reglages.set(MODE_KEY, "track").unwrap();
+        assert_eq!(etat_de_l_analyse(&backend), EtatAnalyse::Active);
+        assert!(analysis_enabled(&backend));
+
+        reglages.set(ANALYSIS_ENABLED_KEY, "false").unwrap();
+        assert_eq!(etat_de_l_analyse(&backend), EtatAnalyse::CocheDecochee);
+
+        // Le point de tout l'exercice : TROIS phrases distinctes, aucune vide.
+        let motifs: Vec<&str> = [
+            EtatAnalyse::ModeAbsent,
+            EtatAnalyse::ModeDesactive,
+            EtatAnalyse::CocheDecochee,
+        ]
+        .iter()
+        .map(|e| e.motif().expect("un motif d'inaction"))
+        .collect();
+        assert_eq!(
+            motifs
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "deux états opposés ne doivent plus écrire la même ligne : {motifs:?}"
+        );
+        assert_eq!(EtatAnalyse::Active.motif(), None);
+    }
+
+    /// BIB-B2 : le rattrapage traite les pistes déjà analysées par le
+    /// ReplayGain (jamais reprises par la passe), reporte les chemins
+    /// introuvables sans marque, et ne repasse pas sur ce qu'il a fait.
+    #[tokio::test]
+    async fn le_rattrapage_empreinte_les_pistes_analysees_et_reporte_les_absentes() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ape/sine_16s_c3000.wav"
+        );
+        let (db, backend) = base_avec_piste(fixture);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent = tmp
+            .path()
+            .join("absente.flac")
+            .to_string_lossy()
+            .to_string();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, \
+             sample_rate, channels) VALUES (43, 'Absente', 1, 1, ?, 300000, 44100, 2)",
+            &[&absent],
+        )
+        .unwrap();
+        let meta = TrackMetadataRepo::new(db.clone());
+        meta.set(42, "rg_analyzed", "1").unwrap();
+        meta.set(43, "rg_analyzed", "1").unwrap();
+        assert_eq!(empreinte_de(&db, 42), None, "avant : rien");
+
+        assert_eq!(
+            empreinter_un_lot(&backend).await,
+            2,
+            "une empreinte, un report"
+        );
+        let e = empreinte_de(&db, 42).expect("la piste analysée reçoit son empreinte");
+        assert!(e.starts_with("env100ms-v1:"), "{e}");
+        assert_eq!(
+            empreinte_de(&db, 43),
+            None,
+            "un chemin introuvable ne reçoit ni empreinte ni marque"
+        );
+        let m43 = TrackMetadataRepo::new(db.clone()).get_all(43).unwrap();
+        assert!(
+            m43.contains_key(PATH_UNRESOLVED_KEY),
+            "le report est daté : {m43:?}"
+        );
+
+        assert_eq!(
+            empreinter_un_lot(&backend).await,
+            0,
+            "rien à refaire : faite, ou reportée"
+        );
+        // Une version périmée est reprise.
+        crate::db::track_repo::TrackRepo::with_backend(backend.clone())
+            .set_audio_fingerprint(42, "vieille-v0:abcd")
+            .unwrap();
+        assert_eq!(empreinter_un_lot(&backend).await, 1);
+        assert!(empreinte_de(&db, 42).unwrap().starts_with("env100ms-v1:"));
     }
 
     /// LE défaut. Un fichier introuvable N'EST PAS un fichier indécodable :
@@ -1865,6 +2931,98 @@ mod tests {
         );
     }
 
+    /// La réciproque : ÉCRIRE l'un des trois modes, et le relire tel quel.
+    ///
+    /// C'est le tour complet — `source_mode_settings` pose les deux réglages,
+    /// `active_source_mode` les relit — donc aucune des deux moitiés ne peut
+    /// dériver sans que ce test le dise.
+    #[test]
+    fn ecrire_un_des_trois_modes_le_rend_actif_et_preserve_la_granularite() {
+        let (_db, backend) = sweep_db(1);
+        let settings = SettingsRepo::with_backend(backend.clone());
+        let poser = |mode: ReplayGainSourceMode| {
+            let granularite = ReplayGainSettings::load(&backend).mode;
+            for (cle, valeur) in source_mode_settings(mode, granularite) {
+                settings.set(cle, valeur).unwrap();
+            }
+        };
+
+        // 2- fichier depuis « néant » : la granularité par défaut est `track`.
+        // Le piège évité ici : repartir de la granularité persistée (`off`)
+        // écrirait `replaygain_mode = off`, donc RIEN, en répondant « ok ».
+        poser(ReplayGainSourceMode::FileTagsOnly);
+        assert_eq!(settings.get(MODE_KEY).unwrap().as_deref(), Some("track"));
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::FileTagsOnly
+        );
+
+        // La granularité album est CONSERVÉE quand on change de source.
+        settings.set(MODE_KEY, "album").unwrap();
+        poser(ReplayGainSourceMode::TagsThenAnalysis);
+        assert_eq!(
+            settings.get(MODE_KEY).unwrap().as_deref(),
+            Some("album"),
+            "changer de source ne doit jamais reculer l'album vers la piste"
+        );
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::TagsThenAnalysis
+        );
+
+        // 1- néant coupe le gain SANS écraser la coche d'analyse : c'est le
+        // choix de l'utilisateur pour le jour où il rallume.
+        poser(ReplayGainSourceMode::Off);
+        assert_eq!(settings.get(MODE_KEY).unwrap().as_deref(), Some("off"));
+        assert_eq!(
+            settings.get(ANALYSIS_ENABLED_KEY).unwrap().as_deref(),
+            Some("true"),
+            "« néant » ne doit toucher qu'un seul des deux axes"
+        );
+        assert_eq!(active_source_mode(&backend), ReplayGainSourceMode::Off);
+
+        // Aucune clé nouvelle en base : les deux axes restent la seule vérité.
+        for mode in [
+            ReplayGainSourceMode::Off,
+            ReplayGainSourceMode::FileTagsOnly,
+            ReplayGainSourceMode::TagsThenAnalysis,
+        ] {
+            for (cle, _) in source_mode_settings(mode, ReplayGainMode::Track) {
+                assert!(
+                    cle == MODE_KEY || cle == ANALYSIS_ENABLED_KEY,
+                    "clé persistée inattendue : {cle}"
+                );
+            }
+        }
+    }
+
+    /// Un mode inconnu n'est pas un mode : il ne doit rien rendre du tout.
+    ///
+    /// Le repli `_ => Off` serait ici la faute qui coûte cher — une faute de
+    /// frappe couperait le ReplayGain en silence, ou pire, l'allumerait.
+    #[test]
+    fn un_mode_inconnu_ne_se_replie_sur_rien() {
+        assert_eq!(
+            ReplayGainSourceMode::from_setting("off"),
+            Some(ReplayGainSourceMode::Off)
+        );
+        assert_eq!(
+            ReplayGainSourceMode::from_setting("  FILE_TAGS  "),
+            Some(ReplayGainSourceMode::FileTagsOnly)
+        );
+        assert_eq!(
+            ReplayGainSourceMode::from_setting("tags_then_analysis"),
+            Some(ReplayGainSourceMode::TagsThenAnalysis)
+        );
+        for inconnu in ["", "calcul", "track", "album", "tags", "analysis", "true"] {
+            assert_eq!(
+                ReplayGainSourceMode::from_setting(inconnu),
+                None,
+                "« {inconnu} » doit être refusé, jamais interprété"
+            );
+        }
+    }
+
     /// La provenance du gain, sur les trois configurations qui existent en base.
     #[test]
     fn la_provenance_distingue_un_tag_de_fichier_d_une_mesure_tune() {
@@ -2003,6 +3161,207 @@ mod tests {
         let e = (10f64.powf(-12.0 / 10.0) + 10f64.powf(-18.0 / 10.0)) / 2.0;
         let album_lufs = 10.0 * e.log10();
         assert!(album_lufs < -12.0 && album_lufs > -18.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Le gain d'album, figé sur un sous-ensemble et écrasant les tags
+    // -----------------------------------------------------------------------
+
+    /// Une base minimale avec de VRAIS albums : des pistes, leurs gains de
+    /// piste, et rien d'autre. Aucune de ces valeurs n'est produite par la
+    /// passe elle-même — c'est l'état de départ d'une bibliothèque à moitié
+    /// analysée, la forme exacte du .18.
+    fn base_albums() -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE tracks (id INTEGER PRIMARY KEY, album_id INTEGER, file_path TEXT,
+                                  duration_ms INTEGER, sample_rate INTEGER, channels INTEGER);
+             CREATE TABLE track_metadata (track_id INTEGER NOT NULL, key TEXT NOT NULL,
+                                          value TEXT NOT NULL, PRIMARY KEY (track_id, key));",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        (db, backend)
+    }
+
+    fn piste(db: &crate::db::sqlite::SqliteDb, id: i64, album: i64) {
+        let chemin = format!("/album{album}/{id}.flac");
+        db.execute(
+            "INSERT INTO tracks (id, album_id, file_path, duration_ms, sample_rate, channels) \
+             VALUES (?, ?, ?, 300000, 44100, 2)",
+            &[&id, &album, &chemin],
+        )
+        .unwrap();
+    }
+
+    fn gain_album(meta: &TrackMetadataRepo, id: i64) -> Option<String> {
+        meta.get_all(id).unwrap().get("rg_album_gain").cloned()
+    }
+
+    /// 🔴 LE DÉFAUT №1 — la sélection prenait un album dès qu'UNE piste lui
+    /// manquait un gain d'album, puis moyennait les seules pistes qui avaient
+    /// un `rg_track_gain` à cet instant. Le résultat, écrit sur toutes les
+    /// pistes, sortait l'album de la sélection : il ne se recalculait plus
+    /// jamais. Mesuré sur la base du .18 le 12/09/2026 : **179 albums,
+    /// 2 385 pistes**, dont un album de 64 pistes dont le gain vient de 2.
+    ///
+    /// La garde est dans la REQUÊTE, et le témoin le vérifie deux fois : un
+    /// album incomplet ne doit pas recevoir de gain, et il ne doit pas non
+    /// plus affamer les albums complets en se faisant rechoisir sans fin.
+    #[test]
+    fn le_gain_dalbum_attend_que_toutes_les_pistes_soient_analysees() {
+        let (db, backend) = base_albums();
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+
+        // Album 1 : trois pistes, UNE SEULE analysée.
+        for id in 1..=3 {
+            piste(&db, id, 1);
+        }
+        meta.set(1, "rg_track_gain", "-6.00 dB").unwrap();
+        meta.set(1, "rg_track_peak", "0.98").unwrap();
+
+        // Album 2 : deux pistes, toutes deux analysées.
+        for id in 11..=12 {
+            piste(&db, id, 2);
+        }
+        meta.set(11, "rg_track_gain", "-9.00 dB").unwrap();
+        meta.set(11, "rg_track_peak", "0.90").unwrap();
+        meta.set(12, "rg_track_gain", "-5.00 dB").unwrap();
+        meta.set(12, "rg_track_peak", "0.99").unwrap();
+
+        // Plusieurs tours : l'ordre que rend la requête ne doit rien changer.
+        let mut traites = 0;
+        for _ in 0..4 {
+            traites += analyze_album_batch(&backend);
+        }
+
+        for id in 1..=3 {
+            assert_eq!(
+                gain_album(&meta, id),
+                None,
+                "piste {id} : l'album 1 est incomplet (1 piste analysée sur 3), \
+                 il ne doit porter AUCUN gain d'album"
+            );
+        }
+        assert_eq!(
+            traites, 1,
+            "l'album 2 est complet : l'album incomplet ne doit pas l'affamer"
+        );
+        for id in 11..=12 {
+            assert!(
+                gain_album(&meta, id).is_some(),
+                "piste {id} : album complet, gain d'album attendu"
+            );
+        }
+    }
+
+    /// 🔴 LE DÉFAUT №2 — `rg_album_gain` et `rg_album_peak` étaient écrits
+    /// INCONDITIONNELLEMENT sur toutes les pistes de l'album. Or le scan
+    /// verse sous ces MÊMES clés ce qu'il lit dans les tags du fichier : la
+    /// valeur de l'utilisateur disparaissait sans un mot, et recevait même
+    /// l'estampille `rg_album_source = analysis` qui la faisait passer pour
+    /// une mesure de Tune au tour suivant.
+    #[test]
+    fn le_gain_dalbum_venu_des_tags_nest_pas_ecrase() {
+        let (db, backend) = base_albums();
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        for id in 1..=3 {
+            piste(&db, id, 1);
+        }
+        for (id, g, p) in [
+            (1i64, "-6.00 dB", "0.98"),
+            (2, "-8.00 dB", "0.91"),
+            (3, "-4.00 dB", "0.99"),
+        ] {
+            meta.set(id, "rg_track_gain", g).unwrap();
+            meta.set(id, "rg_track_peak", p).unwrap();
+        }
+        // La piste 1 porte un gain d'album VENU DU FICHIER. Ce qui le dit :
+        // l'ABSENCE de témoin `rg_album_source` à côté.
+        meta.set(1, "rg_album_gain", "-9.99 dB").unwrap();
+        meta.set(1, "rg_album_peak", "0.55").unwrap();
+
+        assert_eq!(analyze_album_batch(&backend), 1, "l'album est complet");
+
+        let m1 = meta.get_all(1).unwrap();
+        assert_eq!(
+            m1.get("rg_album_gain").map(String::as_str),
+            Some("-9.99 dB"),
+            "le gain d'album lu dans les tags du fichier ne doit PAS être écrasé"
+        );
+        assert_eq!(
+            m1.get("rg_album_peak").map(String::as_str),
+            Some("0.55"),
+            "son pic d'album non plus"
+        );
+        assert!(
+            !m1.contains_key(ALBUM_SOURCE_KEY),
+            "et il ne doit surtout pas être estampillé comme une mesure de Tune"
+        );
+
+        // Les pistes vierges, elles, reçoivent le calcul : sans quoi l'album
+        // serait rechoisi à chaque tour, indéfiniment.
+        for id in 2..=3 {
+            let m = meta.get_all(id).unwrap();
+            assert!(
+                m.get("rg_album_gain").is_some_and(|v| v != "-9.99 dB"),
+                "piste {id} : gain d'album calculé attendu, vu {:?}",
+                m.get("rg_album_gain")
+            );
+            assert_eq!(
+                m.get(ALBUM_SOURCE_KEY).map(String::as_str),
+                Some(SOURCE_ANALYSIS),
+                "piste {id} : ce que Tune écrit, Tune l'estampille"
+            );
+        }
+    }
+
+    /// La garde de provenance ne doit pas geler NOS propres valeurs : une
+    /// piste estampillée `rg_album_source = analysis` reste reprenable, sans
+    /// quoi aucun gain d'album ne pourrait plus jamais être corrigé.
+    #[test]
+    fn notre_propre_gain_dalbum_reste_recalculable() {
+        let (db, backend) = base_albums();
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        for id in 1..=3 {
+            piste(&db, id, 1);
+        }
+        for (id, g, p) in [
+            (1i64, "-6.00 dB", "0.98"),
+            (2, "-8.00 dB", "0.91"),
+            (3, "-4.00 dB", "0.99"),
+        ] {
+            meta.set(id, "rg_track_gain", g).unwrap();
+            meta.set(id, "rg_track_peak", p).unwrap();
+        }
+        meta.set(1, "rg_album_gain", "-9.99 dB").unwrap();
+        meta.set(1, ALBUM_SOURCE_KEY, SOURCE_ANALYSIS).unwrap();
+
+        assert_eq!(analyze_album_batch(&backend), 1);
+        assert!(
+            gain_album(&meta, 1).is_some_and(|v| v != "-9.99 dB"),
+            "une valeur que Tune a écrite lui-même doit rester reprenable"
+        );
+    }
+
+    /// Le cœur de la garde de provenance, isolé.
+    #[test]
+    fn peut_ecrire_le_gain_album_ne_cede_quau_temoin() {
+        assert!(peut_ecrire_le_gain_album(None, None), "rien en place");
+        assert!(peut_ecrire_le_gain_album(Some("  "), None), "valeur vide");
+        assert!(
+            !peut_ecrire_le_gain_album(Some("-9.99 dB"), None),
+            "sans témoin, la valeur vient des tags du fichier"
+        );
+        assert!(
+            !peut_ecrire_le_gain_album(Some("-9.99 dB"), Some("tag")),
+            "un témoin qui ne dit pas « analysis » ne nous autorise rien"
+        );
+        assert!(
+            peut_ecrire_le_gain_album(Some("-9.99 dB"), Some(SOURCE_ANALYSIS)),
+            "notre propre mesure se reprend"
+        );
     }
     // -----------------------------------------------------------------------
     // #2496 — « Désactivé » doit désactiver
@@ -2585,5 +3944,113 @@ mod tests {
         w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
         w.extend_from_slice(&donnees);
         std::fs::write(path, w).unwrap();
+    }
+}
+
+/// Le pic tagué dans la mauvaise échelle éteignait le son (Refs #2157).
+///
+/// Les témoins passent par `playback_factor`, le SITE D'APPEL de production :
+/// c'est lui qu'appellent `orchestrator/resolve_local.rs:1523` (sortie locale),
+/// `orchestrator/transport.rs:1373` et `orchestrator/dsp.rs:1123`. Ils ne
+/// supposent aucun périphérique audio — seulement une base et la décision de
+/// gain.
+#[cfg(test)]
+mod garde_pic_hors_echelle {
+    use super::*;
+    use crate::db::sqlite::SqliteDb;
+
+    /// Une piste, ReplayGain en mode piste, anti-écrêtage à son défaut d'usine.
+    fn base_replaygain(gain_db: &str, pic: Option<&str>) -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Ella Fitzgerald')",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Clap Hands', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, \
+             sample_rate, channels) VALUES (42, 'Autumn Leaves', 1, 1, '/x/42.flac', 300000, \
+             44100, 2)",
+            &[],
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        SettingsRepo::with_backend(backend.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        meta.set(42, "rg_track_gain", gain_db).unwrap();
+        if let Some(p) = pic {
+            meta.set(42, "rg_track_peak", p).unwrap();
+        }
+        backend
+    }
+
+    /// LE défaut : `32768` (16 bits) et `8388607` (24 bits) sont des échelles
+    /// d'échantillon, pas des amplitudes. `gain_factor` en tirait
+    /// `plafond / pic`, tombait sur le plancher `0.001` du `clamp` final, et la
+    /// piste sortait 60 dB trop bas — inaudible, sans message.
+    #[test]
+    fn un_pic_tague_en_echelle_d_echantillon_n_eteint_plus_la_piste() {
+        for pic in ["32768", "32767.0", "8388607", "2147483647"] {
+            let backend = base_replaygain("-6.0 dB", Some(pic));
+            let f = playback_factor(&backend, 42);
+            assert!(
+                f > 0.001,
+                "pic {pic} : facteur {f} — le plancher du clamp, soit -60 dB"
+            );
+            // Le pic est ignoré : il ne reste que le gain tagué, -6 dB.
+            let attendu = 10f64.powf(-6.0 / 20.0);
+            assert!(
+                (f - attendu).abs() < 1e-9,
+                "pic {pic} : facteur {f}, attendu {attendu} (le gain seul)"
+            );
+        }
+    }
+
+    /// Contre-épreuve, l'autre moitié : un pic PLAUSIBLE doit continuer de
+    /// protéger. Un master écrêté à `1.1` avec un gain de +6 dB dépasserait la
+    /// pleine échelle ; `prevent_clipping` doit tirer le facteur à `1/1.1`.
+    #[test]
+    fn un_pic_plausible_protege_toujours_de_l_ecretage() {
+        let backend = base_replaygain("+6.0 dB", Some("1.1"));
+        let f = playback_factor(&backend, 42);
+        let attendu = 1.0 / 1.1;
+        assert!(
+            (f - attendu).abs() < 1e-9,
+            "facteur {f}, attendu {attendu} : l'anti-écrêtage ne tire plus"
+        );
+        assert!(
+            f < 10f64.powf(6.0 / 20.0),
+            "le gain brut est passé tel quel"
+        );
+
+        // Et la borne elle-même : `PEAK_MAX_PLAUSIBLE` est retenu, pas rejeté.
+        let backend = base_replaygain("+12.0 dB", Some("4.0"));
+        let f = playback_factor(&backend, 42);
+        assert!(
+            (f - 0.25).abs() < 1e-9,
+            "facteur {f}, attendu 0.25 : le pic 4.0 doit encore protéger"
+        );
+    }
+
+    /// Un pic hors échelle ne doit pas se distinguer d'un pic ABSENT : c'est
+    /// tout le sens du repli. Sans ce témoin, le premier test passerait au vert
+    /// sur un `factor` mis à 1.0 en dur.
+    #[test]
+    fn un_pic_hors_echelle_vaut_exactement_un_pic_absent() {
+        let sans = playback_factor(&base_replaygain("-6.0 dB", None), 42);
+        let ferraille = playback_factor(&base_replaygain("-6.0 dB", Some("32768")), 42);
+        assert!(
+            (sans - ferraille).abs() < 1e-12,
+            "sans pic {sans} != pic hors échelle {ferraille}"
+        );
     }
 }

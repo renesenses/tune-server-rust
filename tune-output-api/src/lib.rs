@@ -10,6 +10,7 @@
 //! `outputs::traits` so in-tree code is unaffected.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Version du contrat de capacités compris par ce binaire.
 pub const OUTPUT_CAPABILITIES_VERSION: u16 = 1;
@@ -91,6 +92,92 @@ impl std::error::Error for OutputCommandError {}
 
 pub type OutputCommandResult<T> = Result<T, OutputCommandError>;
 
+/// Résolution de volume que la sortie tient RÉELLEMENT (#1274).
+///
+/// `can_set_volume` répond « cette sortie sait régler le volume » ; il ne dit
+/// pas *avec quelle finesse*. La question n'existait pas tant que l'API ne
+/// parlait qu'en pour-cent : le pas de l'interface et le pas du protocole
+/// étaient le même nombre. Elle apparaît avec `volume_db`, qui permet enfin de
+/// viser −18 dB — une consigne que sept des treize sorties intégrées ne
+/// peuvent pas recevoir telle quelle.
+///
+/// Ce que chaque sortie envoie réellement, relevé dans son `set_volume` :
+///
+/// | sortie | ce qui part sur le fil | grille |
+/// |---|---|---|
+/// | locale | facteur × 1000, entier | `Linear { steps: 1000 }` |
+/// | SlimProto | gain 16.16, 65536 = unité | `Linear { steps: 65536 }` |
+/// | DLNA/UPnP, OpenHome, BluOS, Squeezebox, HQPlayer, OAAT | entier 0..100 | `Linear { steps: 100 }` |
+/// | AirPlay (RTSP) | des dB, un chiffre après la virgule | `Decibels { step_mdb: 100 }` |
+/// | Chromecast, AirPlay 2, bridge, mock | un flottant | `Continuous` |
+///
+/// Sur une grille de 100 pas, un pas ne vaut pas partout la même chose en dB :
+/// 0,09 dB sous la pleine échelle, mais **6,02 dB** entre 1 % et 2 %, et
+/// au-dessous de 1 % il n'y a plus rien du tout. C'est la raison d'être de
+/// [`VolumeResolution::holds`] : une consigne en dB plus basse que le plus
+/// petit pas ne *manque* pas sa cible, elle **éteint** la zone — et le serveur
+/// répondait 200 sur ce silence.
+///
+/// La valeur par défaut est `Continuous`, y compris pour un plugin ancien
+/// (`version == 0`) : aucune consigne ne lui est refusée, exactement comme
+/// avant l'existence de ce champ. Ce champ ne ferme donc jamais une porte
+/// qui était ouverte ; il n'en ouvre une que là où une sortie a déclaré sa
+/// grille.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VolumeResolution {
+    /// Le niveau voyage en flottant : la sortie n'impose aucune grille.
+    #[default]
+    Continuous,
+    /// Grille linéaire de `steps` intervalles égaux sur `0..=1`.
+    ///
+    /// `steps: 100` est le pour-cent entier de UPnP RenderingControl et de la
+    /// plupart des protocoles réseau.
+    Linear { steps: u32 },
+    /// Grille en décibels, exprimée en millièmes de dB pour rester comparable
+    /// sans flottant (`100` = 0,1 dB, le pas d'AirPlay).
+    Decibels { step_mdb: u32 },
+}
+
+impl VolumeResolution {
+    /// Le plus petit niveau **non nul** que la grille sache représenter.
+    ///
+    /// `None` pour `Continuous` et pour `Decibels` : ni l'un ni l'autre ne
+    /// transforme un niveau audible en silence. Une grille en dB n'a pas de
+    /// plancher de représentation — c'est le mute, pas l'arrondi, qui coupe.
+    #[must_use]
+    pub fn smallest_audible(&self) -> Option<f64> {
+        match self {
+            Self::Linear { steps } if *steps > 0 => Some(1.0 / f64::from(*steps)),
+            _ => None,
+        }
+    }
+
+    /// Le même seuil, en dB — le chiffre à montrer à qui règle sa chaîne.
+    #[must_use]
+    pub fn floor_db(&self) -> Option<f64> {
+        self.smallest_audible().map(|l| 20.0 * l.log10())
+    }
+
+    /// Cette sortie sait-elle tenir ce niveau linéaire ?
+    ///
+    /// Le silence (`0.0`) est toujours tenable : c'est le mute, et toute
+    /// grille sait envoyer zéro. Au-dessus, un niveau est tenable dès qu'il
+    /// atteint le premier pas ; la tolérance couvre le fait que `10^(-40/20)`
+    /// ne rend pas `0.01` au bit près, et qu'un plancher annoncé doit être
+    /// accepté par le contrôle qui l'annonce.
+    #[must_use]
+    pub fn holds(&self, linear: f64) -> bool {
+        if linear.is_nan() {
+            return false;
+        }
+        match self.smallest_audible() {
+            None => true,
+            Some(pas) => linear <= 0.0 || linear >= pas * (1.0 - 1e-9),
+        }
+    }
+}
+
 /// Capacités déclarées par une sortie.
 ///
 /// `version == 0` signifie « plugin ancien, contrat inconnu ». Le serveur le
@@ -111,6 +198,12 @@ pub struct OutputCapabilities {
     pub formats: Vec<String>,
     #[serde(default)]
     pub channel_layouts: Vec<String>,
+    /// La finesse que cette sortie tient réellement (#1274).
+    ///
+    /// Additif : absent d'une charge utile ancienne, il vaut `Continuous`,
+    /// et rien ne change pour la sortie qui ne le déclare pas.
+    #[serde(default)]
+    pub volume_resolution: VolumeResolution,
 }
 
 impl OutputCapabilities {
@@ -132,7 +225,44 @@ impl OutputCapabilities {
             can_gapless,
             formats: Vec::new(),
             channel_layouts: Vec::new(),
+            volume_resolution: VolumeResolution::Continuous,
         }
+    }
+
+    /// Déclare les dispositions de canaux que cette sortie sait rendre (#3322).
+    ///
+    /// `v1` pose `channel_layouts: Vec::new()` en dur, et il n'existait AUCUN
+    /// chemin d'écriture : le champ était déclaré, publié, et vide sur les
+    /// quatorze zones mesurées le 04/09/2026. C'est le builder qui manquait.
+    ///
+    /// La liste vide garde son sens : « on ne sait pas », jamais « aucune ».
+    /// Une sortie qui ignore le nombre de canaux de son appareil ne doit rien
+    /// déclarer plutôt qu'inventer une valeur.
+    #[must_use]
+    pub fn with_channel_layouts(mut self, layouts: Vec<String>) -> Self {
+        self.channel_layouts = layouts;
+        self
+    }
+
+    /// Déclare une grille linéaire de `steps` pas (voir [`VolumeResolution`]).
+    #[must_use]
+    pub fn with_linear_volume(mut self, steps: u32) -> Self {
+        self.volume_resolution = VolumeResolution::Linear { steps };
+        self
+    }
+
+    /// Déclare le pour-cent entier — la grille de la majorité des protocoles
+    /// réseau, et la seule sur laquelle une consigne en dB peut se perdre.
+    #[must_use]
+    pub fn with_percent_volume(self) -> Self {
+        self.with_linear_volume(100)
+    }
+
+    /// Déclare une grille en décibels, en millièmes de dB (`100` = 0,1 dB).
+    #[must_use]
+    pub fn with_decibel_volume(mut self, step_mdb: u32) -> Self {
+        self.volume_resolution = VolumeResolution::Decibels { step_mdb };
+        self
     }
 
     pub fn supports(&self, command: OutputCommand) -> bool {
@@ -237,6 +367,306 @@ pub struct OutputSignalPathStatus {
 pub struct OutputDspMetrics {
     pub eq_overs: u64,
     pub eq_non_finite_samples: u64,
+}
+
+/// Famine de l'anneau, telle que le rappel audio temps réel l'a vécue (#3205).
+///
+/// « Famine » désigne ici une chose précise et une seule : le pilote a réclamé
+/// N échantillons au rappel, l'anneau en a rendu moins, et le manque a été
+/// comblé par des **zéros**. C'est un trou audible, et il dit que le
+/// PRODUCTEUR n'a pas suivi : réseau, décodage ou convolution.
+///
+/// 🔴 **Il ne dit RIEN de l'ordonnancement du noyau**, contrairement à ce que
+/// ce commentaire a affirmé jusqu'ici. Quand le noyau réveille le fil de
+/// sortie trop tard, ALSA a déjà sous-alimenté le DAC ; cpal signale
+/// `StreamError::BufferUnderrun`, recouvre, et **saute le rappel de données**
+/// (`cpal/src/host/alsa/mod.rs`, branche `PollDescriptorsFlow::XRun`). Le
+/// rappel n'est jamais appelé, l'anneau est resté PLEIN, et `events` ne bouge
+/// pas d'un cran pendant que le DAC encaisse un trou. Le chiffre qui voit
+/// cet incident-là est [`driver_underruns`](Self::driver_underruns).
+///
+/// ⚠️ **À ne pas confondre avec l'« underrun » ALSA** que cpal remonte en
+/// `StreamError` et que `make_stream_error_cb` laisse délibérément passer sans
+/// démonter le flux (« ALSA underruns are routine »). Celui-là décrit le
+/// PILOTE qui n'a pas été servi à temps par le processus ; il est routinier,
+/// il est remonté par une couche qui ne voit pas l'anneau, et il ne dit pas si
+/// des zéros sont partis vers le DAC. Additionner les deux produirait un
+/// nombre que plus rien ne permettrait d'interpréter — et c'est précisément ce
+/// nombre qui doit décider du sort du noyau `PREEMPT_RT` de Tune OS. Les deux
+/// vivent donc sous deux noms distincts et ne sont jamais cumulés.
+///
+/// Un compteur d'ÉVÉNEMENTS seul ne distingue pas un micro-trou d'une coupure
+/// d'une seconde, et un compteur brut ne se compare pas d'une machine à
+/// l'autre ; d'où les quatre champs : les deux premiers disent la gravité, les
+/// deux derniers donnent le dénominateur qui rend le taux calculable après une
+/// heure de lecture (`events` par heure, `missing_samples / served_samples`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputRingStarvation {
+    /// Rappels qui ont manqué de données depuis le démarrage du flux.
+    pub events: u64,
+    /// Échantillons entrelacés manquants, cumulés sur tous les événements.
+    pub missing_samples: u64,
+    /// Échantillons entrelacés réclamés par le pilote depuis le démarrage.
+    /// Dénominateur de `missing_samples`.
+    pub served_samples: u64,
+    /// Sous-alimentations du PILOTE depuis le démarrage du flux (#3205).
+    ///
+    /// Le pilote a réclamé des échantillons et le processus n'était pas là
+    /// pour les fournir : le fil de sortie n'a pas été ordonnancé à temps.
+    /// C'est LE chiffre qui décide du sort du noyau `PREEMPT_RT` de Tune OS —
+    /// s'il reste à zéro une heure de lecture sur noyau standard, le noyau RT
+    /// est un coût sans gain, et le Secure Boot revient.
+    ///
+    /// Jamais additionné à `events` : les deux décrivent des pannes disjointes
+    /// et une somme ne s'interpréterait plus (voir l'avertissement du type).
+    ///
+    /// `serde(default)` : cette structure est le contrat des greffons de sortie
+    /// HORS ARBRE. Un relevé sérialisé par un greffon construit avant ce champ
+    /// doit continuer à se relire — sans quoi l'ajout casserait les greffons
+    /// tiers, et en silence.
+    #[serde(default)]
+    pub driver_underruns: u64,
+    /// Durée d'audio écoulée depuis le démarrage du flux, en millisecondes,
+    /// déduite de `served_samples` et de la cadence (taux × canaux).
+    ///
+    /// Déduite du COMPTE d'échantillons plutôt que d'une horloge : le rappel
+    /// audio est temps réel et n'a pas le droit de lire l'heure, et le temps
+    /// consommé par le pilote est de toute façon la seule base honnête pour un
+    /// taux d'événements par heure de lecture.
+    pub stream_ms: u64,
+}
+
+/// Les compteurs vivants derrière [`OutputRingStarvation`], partagés entre le
+/// rappel audio et le fil qui répond à `/api/v1/system/diagnostics`.
+///
+/// ⚠️ **Contrat temps réel.** [`record`](Self::record) est appelé DEPUIS le
+/// rappel du pilote. Il n'a le droit de rien allouer, de rien verrouiller et
+/// de rien journaliser : uniquement des atomiques en `Ordering::Relaxed`. Une
+/// seule ligne de log ici fabriquerait la famine qu'elle prétend mesurer. Le
+/// test `drains_temps_reel_ne_font_aucune_allocation` (outputs/local.rs) tient
+/// cette garde : il enveloppe les drains dans un allocateur instrumenté.
+///
+/// `Relaxed` suffit : ces compteurs ne publient aucune donnée, ils ne font que
+/// se compter eux-mêmes. Un lecteur peut voir deux champs d'instants
+/// légèrement différents ; sur un compteur d'incidents cumulé, c'est sans
+/// conséquence, et c'est le prix à ne pas payer dans le rappel.
+#[derive(Debug, Default)]
+pub struct RingStarvation {
+    /// Le flux a-t-il vraiment démarré ? Tant qu'un premier rappel n'a pas été
+    /// servi ENTIÈREMENT, rien n'est compté : au démarrage l'anneau est vide
+    /// par construction, et compter ce silence-là ferait passer chaque début
+    /// de piste pour un incident.
+    armed: AtomicBool,
+    events: AtomicU64,
+    missing_samples: AtomicU64,
+    served_samples: AtomicU64,
+    /// Sous-alimentations du pilote (#3205). Alimenté par le rappel d'ERREUR
+    /// du backend, pas par le rappel de données — c'est tout l'intérêt : sur
+    /// un XRun, le rappel de données n'est pas appelé.
+    driver_underruns: AtomicU64,
+    /// Échantillons entrelacés par seconde (taux × canaux). Posé hors du
+    /// rappel par [`begin_stream`](Self::begin_stream).
+    samples_per_second: AtomicU32,
+}
+
+impl RingStarvation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Armer un flux neuf : remet les compteurs à zéro et enregistre la
+    /// cadence. Appelé par le producteur, JAMAIS depuis le rappel.
+    pub fn begin_stream(&self, sample_rate: u32, channels: u16) {
+        self.armed.store(false, Ordering::Relaxed);
+        self.events.store(0, Ordering::Relaxed);
+        self.missing_samples.store(0, Ordering::Relaxed);
+        self.served_samples.store(0, Ordering::Relaxed);
+        self.driver_underruns.store(0, Ordering::Relaxed);
+        self.samples_per_second.store(
+            sample_rate.saturating_mul(u32::from(channels)),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Comptabiliser UN rappel : `demande` = ce que le pilote a réclamé,
+    /// `rendu` = ce que l'anneau a effectivement fourni. La différence part en
+    /// zéros vers le DAC.
+    ///
+    /// Chemin temps réel — voir le contrat sur le type.
+    #[inline]
+    pub fn record(&self, demande: usize, rendu: usize) {
+        if !self.armed.load(Ordering::Relaxed) {
+            // Le flux n'a pas encore démarré : on n'arme qu'au premier rappel
+            // servi en entier, ce qui donne le même point de départ à tous les
+            // backends, qu'ils aient ou non leur propre garde de pré-remplissage.
+            if demande == 0 || rendu < demande {
+                return;
+            }
+            self.armed.store(true, Ordering::Relaxed);
+        }
+        self.served_samples
+            .fetch_add(demande as u64, Ordering::Relaxed);
+        if rendu < demande {
+            self.events.fetch_add(1, Ordering::Relaxed);
+            self.missing_samples
+                .fetch_add((demande - rendu) as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Comptabiliser UNE sous-alimentation du pilote, telle que le backend la
+    /// remonte dans son rappel d'ERREUR (#3205).
+    ///
+    /// Volontairement séparé de [`record`](Self::record) : sur un XRun ALSA,
+    /// cpal saute le rappel de données, donc `record` n'est PAS appelé et
+    /// l'anneau paraît sain. Sans ce compteur-ci, un incident d'ordonnancement
+    /// ne laisse aucune trace chiffrée.
+    ///
+    /// Même contrat temps réel que `record` : un seul atomique `Relaxed`, rien
+    /// d'autre. Le rappel d'erreur tourne sur le fil de sortie du backend.
+    ///
+    /// Pas de garde `armed` ici, contrairement à `record` : un XRun ne peut pas
+    /// se produire avant que le pilote ait commencé à tirer des données, donc
+    /// il n'y a pas de silence de démarrage à écarter.
+    #[inline]
+    pub fn record_driver_underrun(&self) {
+        self.driver_underruns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Relevé hors chemin temps réel.
+    pub fn snapshot(&self) -> OutputRingStarvation {
+        let served = self.served_samples.load(Ordering::Relaxed);
+        let cadence = u64::from(self.samples_per_second.load(Ordering::Relaxed));
+        OutputRingStarvation {
+            events: self.events.load(Ordering::Relaxed),
+            missing_samples: self.missing_samples.load(Ordering::Relaxed),
+            served_samples: served,
+            driver_underruns: self.driver_underruns.load(Ordering::Relaxed),
+            stream_ms: if cadence == 0 {
+                0
+            } else {
+                served.saturating_mul(1000) / cadence
+            },
+        }
+    }
+}
+
+/// #3205 — la sous-alimentation du PILOTE et la famine de l'ANNEAU sont deux
+/// pannes disjointes, et le compteur doit les garder disjointes.
+///
+/// Ce module est EXÉCUTÉ à chaque PR : `tune-output-api` figure dans le `-p` du
+/// job `Test` de `ci.yml` et ne porte aucune feature. C'est délibéré — le
+/// câblage côté `local.rs` vit derrière `local-audio`, que ce job n'active pas,
+/// et n'est donc gardé que par un témoin de TEXTE
+/// (`tune-server/tests/famine_pilote_3205.rs`). Le contrat du compteur, lui,
+/// se teste pour de vrai, ici.
+#[cfg(test)]
+mod famine_pilote_3205 {
+    use super::*;
+
+    /// Le scénario exact d'un incident d'ORDONNANCEMENT, tel que cpal le
+    /// produit : le noyau réveille le fil de sortie trop tard, ALSA a déjà
+    /// sous-alimenté le DAC, cpal signale l'erreur, recouvre — et **saute le
+    /// rappel de données**. L'anneau, lui, est resté PLEIN.
+    ///
+    /// C'est la raison d'être de ce compteur : avant lui, cet incident-là ne
+    /// laissait aucun chiffre derrière lui, et c'est pourtant le seul qui
+    /// puisse décider du noyau `PREEMPT_RT` de Tune OS.
+    #[test]
+    fn un_incident_d_ordonnancement_ne_touche_pas_la_famine_de_l_anneau() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+
+        // Le flux tourne, l'anneau sert tout ce qu'on lui demande.
+        compteur.record(1_024, 1_024);
+        compteur.record(1_024, 1_024);
+
+        // XRun : cpal appelle le rappel d'ERREUR, jamais le rappel de données.
+        compteur.record_driver_underrun();
+
+        let releve = compteur.snapshot();
+        assert_eq!(
+            releve.driver_underruns, 1,
+            "la sous-alimentation du pilote n'est pas comptée : un trou audible              d'origine ordonnancement ne laisse aucune trace chiffrée, et #3205              redevient immesurable"
+        );
+        assert_eq!(
+            releve.events, 0,
+            "l'incident du PILOTE a été compté comme une famine de l'ANNEAU. Les              deux pannes sont disjointes — producteur en retard d'un côté,              processus pas ordonnancé de l'autre — et les confondre rend le              chiffre ininterprétable, donc inutile à l'arbitrage du noyau RT"
+        );
+        assert_eq!(
+            releve.missing_samples, 0,
+            "aucun échantillon n'a manqué DANS L'ANNEAU : le rappel de données              n'a même pas été appelé"
+        );
+    }
+
+    /// La réciproque : un producteur en retard ne doit pas gonfler le compteur
+    /// du pilote. Sans cette moitié, fusionner les deux compteurs passerait.
+    #[test]
+    fn une_famine_d_anneau_ne_compte_aucune_sous_alimentation_du_pilote() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+        compteur.record(1_024, 1_024);
+        compteur.record(1_024, 300);
+
+        let releve = compteur.snapshot();
+        assert_eq!(releve.events, 1);
+        assert_eq!(releve.missing_samples, 724);
+        assert_eq!(
+            releve.driver_underruns, 0,
+            "une famine de l'ANNEAU a été comptée comme une sous-alimentation du              PILOTE : le chiffre qui décide du noyau RT se met à monter quand              c'est le réseau ou le décodage qui est en retard"
+        );
+    }
+
+    /// Un flux neuf repart de zéro. #3205 veut un TAUX par heure de lecture ;
+    /// un compteur qui cumule des pistes sans rapport ne se compare à rien.
+    #[test]
+    fn un_flux_neuf_remet_le_compteur_du_pilote_a_zero() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+        compteur.record(512, 512);
+        compteur.record_driver_underrun();
+        compteur.record_driver_underrun();
+        assert_eq!(compteur.snapshot().driver_underruns, 2);
+
+        compteur.begin_stream(48_000, 2);
+        assert_eq!(
+            compteur.snapshot().driver_underruns,
+            0,
+            "un flux neuf hérite des sous-alimentations du précédent : le taux              par heure de lecture cumule des pistes sans rapport"
+        );
+    }
+
+    /// Le chiffre doit SORTIR. Un compteur que la route ne publie pas ne mesure
+    /// rien pour le testeur qui colle son rapport de diagnostic sur le forum —
+    /// et c'est ce rapport, sur un parc réel, qui doit trancher #3205.
+    #[test]
+    fn le_compteur_du_pilote_est_serialise_et_tolere_un_releve_ancien() {
+        let releve = OutputRingStarvation {
+            events: 0,
+            missing_samples: 0,
+            served_samples: 1,
+            driver_underruns: 7,
+            stream_ms: 0,
+        };
+        let json = serde_json::to_value(releve).unwrap();
+        assert_eq!(
+            json["driver_underruns"], 7,
+            "le compteur n'atteint pas la route : invisible dans le rapport de              diagnostic, donc inexistant pour la mesure"
+        );
+
+        // Un greffon de sortie hors arbre, construit avant ce champ, sérialise
+        // un relevé sans lui. Il doit continuer à se relire.
+        let ancien: OutputRingStarvation = serde_json::from_value(serde_json::json!({
+            "events": 3,
+            "missing_samples": 12,
+            "served_samples": 400,
+            "stream_ms": 9,
+        }))
+        .expect(
+            "un relevé produit par un greffon antérieur à ce champ ne se relit              plus : l'ajout casse les greffons de sortie hors arbre",
+        );
+        assert_eq!(ancien.driver_underruns, 0);
+        assert_eq!(ancien.events, 3);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,11 +940,18 @@ pub trait OutputTarget: Send + Sync {
     ///
     /// Push-based outputs do their work on a background thread: by the time
     /// the device refuses to open, `play_url()` has long since returned `Ok`.
-    /// Without a channel like this one the failure stays invisible until the
-    /// poller's stall heuristics give up — roughly 73 seconds later — and
-    /// meanwhile the UI shows a track advancing in total silence (Yacine,
-    /// 8 Aug 2026: a DAC his account had no permission to open, and an hour
-    /// spent looking for the cause because nothing said so).
+    /// Without a channel like this one the failure stays invisible while the
+    /// UI shows a track advancing in total silence (Yacine, 8 Aug 2026: a DAC
+    /// his account had no permission to open, and an hour spent looking for
+    /// the cause because nothing said so).
+    ///
+    /// This doc used to promise a safety net that does not exist for a local
+    /// output: "the poller's stall heuristics give up — roughly 73 seconds
+    /// later". Measured on #3108: the frozen-position watchdog
+    /// (`dlna_playing_stall_eligible`) is gated on `output_type == "dlna"`, so
+    /// a local zone whose position stops advancing is caught by NOTHING and
+    /// stays "playing" forever. This channel is not a shortcut to a slower
+    /// path — for a local output it is the ONLY path.
     ///
     /// The message is user-facing and returned **once**: the implementation
     /// clears it, so the caller owns it and no stale error can kill the next
@@ -566,6 +1003,14 @@ pub trait OutputTarget: Send + Sync {
 
     /// Compteurs DSP de la piste courante, quand la sortie peut les observer.
     fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
+        None
+    }
+    /// Famine de l'anneau observée par le rappel temps réel de cette sortie
+    /// (#3205), ou `None` quand la sortie ne rend pas l'audio elle-même — un
+    /// renderer réseau reçoit un flux déjà encodé et n'a aucun anneau à
+    /// affamer. Défaut `None`, donc une sortie hors-arbre existante compile et
+    /// se comporte exactement comme avant.
+    fn ring_starvation(&self) -> Option<OutputRingStarvation> {
         None
     }
 }
@@ -669,5 +1114,102 @@ mod tests {
                 command: OutputCommand::Seek,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod resolution_de_volume {
+    use super::*;
+
+    /// Le chiffre qui a motivé tout ce module : sur une grille de 100 pas, le
+    /// plus petit niveau audible vaut −40 dB. Une consigne au-dessous ne
+    /// baisse pas le son, elle le coupe.
+    #[test]
+    fn le_pour_cent_plafonne_la_finesse_a_moins_quarante_db() {
+        let pour_cent = VolumeResolution::Linear { steps: 100 };
+        assert_eq!(pour_cent.smallest_audible(), Some(0.01));
+        let plancher = pour_cent.floor_db().expect("une grille a un plancher");
+        assert!((plancher - (-40.0)).abs() < 1e-12, "{plancher}");
+    }
+
+    /// La frontière, des deux côtés, sur les valeurs que produit vraiment
+    /// `db_to_linear` — pas sur des littéraux choisis pour tomber juste.
+    #[test]
+    fn la_frontiere_du_pour_cent_tient_des_deux_cotes() {
+        let pour_cent = VolumeResolution::Linear { steps: 100 };
+        let lineaire = |db: f64| 10f64.powf(db / 20.0);
+        // −40 dB EST le plancher : il doit être accepté par le contrôle qui
+        // l'annonce, malgré l'inexactitude de 10^(-2) en binaire.
+        assert!(pour_cent.holds(lineaire(-40.0)), "le plancher annoncé");
+        assert!(
+            pour_cent.holds(lineaire(-18.0)),
+            "−18 dB, la cible de l'issue"
+        );
+        assert!(pour_cent.holds(lineaire(0.0)));
+        // Au-dessous, la valeur envoyée s'arrondirait à zéro.
+        assert!(!pour_cent.holds(lineaire(-40.1)));
+        assert!(!pour_cent.holds(lineaire(-46.1)));
+        assert!(!pour_cent.holds(lineaire(-50.0)));
+        // Le silence reste tenable : c'est le mute, pas un arrondi raté.
+        assert!(pour_cent.holds(0.0));
+    }
+
+    /// Une grille fine ou continue ne refuse rien : le garde-fou ne doit pas
+    /// mordre là où le matériel suit.
+    #[test]
+    fn les_grilles_fines_ne_refusent_rien_d_audible() {
+        for resolution in [
+            VolumeResolution::Continuous,
+            VolumeResolution::Decibels { step_mdb: 100 },
+            VolumeResolution::Linear { steps: 65536 },
+            VolumeResolution::Linear { steps: 1000 },
+        ] {
+            assert!(resolution.holds(10f64.powf(-50.0 / 20.0)), "{resolution:?}");
+        }
+        // Le millième de la sortie locale s'arrête tout de même à −60 dB.
+        let locale = VolumeResolution::Linear { steps: 1000 };
+        let plancher = locale.floor_db().expect("grille");
+        assert!((plancher - (-60.0)).abs() < 1e-12, "{plancher}");
+        assert!(!locale.holds(10f64.powf(-61.0 / 20.0)));
+        // Ni le continu ni les dB n'ont de plancher de représentation.
+        assert_eq!(VolumeResolution::Continuous.floor_db(), None);
+        assert_eq!(
+            VolumeResolution::Decibels { step_mdb: 100 }.floor_db(),
+            None
+        );
+    }
+
+    /// Le champ est ADDITIF : une charge utile écrite avant son existence se
+    /// relit sans erreur, et vaut « continu », donc ne refuse rien.
+    #[test]
+    fn une_charge_utile_sans_le_champ_reste_lisible_et_permissive() {
+        let ancien = serde_json::json!({
+            "version": 1,
+            "can_pause": true,
+            "can_resume": true,
+            "can_seek": true,
+            "can_set_volume": true,
+            "can_mute": true,
+            "can_gapless": false,
+        });
+        let capabilities: OutputCapabilities = serde_json::from_value(ancien).unwrap();
+        assert_eq!(capabilities.volume_resolution, VolumeResolution::Continuous);
+        assert!(capabilities.volume_resolution.holds(0.0001));
+    }
+
+    /// Et il est lisible par un client : la grille sort nommée, avec son
+    /// nombre de pas, pas sous forme d'un entier opaque.
+    #[test]
+    fn la_grille_est_publiee_sous_un_nom_lisible() {
+        let capabilities =
+            OutputCapabilities::v1(true, true, true, true, true, false).with_percent_volume();
+        let json = serde_json::to_value(&capabilities).unwrap();
+        assert_eq!(json["volume_resolution"]["kind"], "linear");
+        assert_eq!(json["volume_resolution"]["steps"], 100);
+        let airplay =
+            OutputCapabilities::v1(true, true, false, true, true, false).with_decibel_volume(100);
+        let json = serde_json::to_value(&airplay).unwrap();
+        assert_eq!(json["volume_resolution"]["kind"], "decibels");
+        assert_eq!(json["volume_resolution"]["step_mdb"], 100);
     }
 }

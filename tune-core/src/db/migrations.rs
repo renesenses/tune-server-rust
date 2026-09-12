@@ -1588,6 +1588,234 @@ CREATE INDEX IF NOT EXISTS idx_ignored_devices_mac ON ignored_devices(mac);
 CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
 ",
     },
+    // « Dans la Smart Collection "World Music" [il] n'a pas les bons albums,
+    // c'est un peu mélangé (Folk, Folk Métal, Folk Rock) » (#1426, Jean
+    // Valjean, forum « F5 obligatoire »).
+    //
+    // Le moteur de règles fait exactement ce qu'on lui demande : le préréglage
+    // livré (migrations 41 puis 47) porte `genre CONTIENT folk`, qui compile en
+    // `t.genre LIKE '%folk%' COLLATE NOCASE`. « Folk Metal » et « Folk Rock »
+    // entrent donc dans la collection PAR CONSTRUCTION. C'est le préréglage qui
+    // promet, par son nom, plus étroit que sa règle — pas
+    // `smart_collections::compile_rule`.
+    //
+    // Seul `folk` passe en égalité stricte. `world` et `ethnic` gardent
+    // « contient », où la sous-chaîne est utile et non trompeuse (« World
+    // Fusion », « Ethnic Jazz ») ; `folk` est le seul des trois dont les dérivés
+    // forment des genres franchement différents. Les tags composés du type
+    // « Folk, World, & Country » restent pris — par la règle `world`, le
+    // `match_mode` étant `any`.
+    //
+    // Patron de la migration 67 (`fix_sans_pochette_rule`, jumelle PG 018) :
+    // UPDATE gardé sur la chaîne de règles EXACTE du semis, donc
+    //   - une collection personnalisée par l'utilisateur n'est jamais touchée,
+    //   - la migration est idempotente par le même garde,
+    //   - et les bibliothèques DÉJÀ installées sont réparées, ce qu'un simple
+    //     changement du semis (`INSERT OR IGNORE`, création seulement) ne fait
+    //     pas.
+    // Sur une installation neuve, 41/47 sèment l'ancienne règle et celle-ci la
+    // corrige dans la même passe.
+    Migration {
+        version: 93,
+        name: "resserrer_folk_dans_world_music",
+        up: "
+UPDATE smart_collections
+SET rules = '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"world\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"ethnic\"},{\"field\":\"genre\",\"operator\":\"equals\",\"value\":\"folk\"}]'
+WHERE name LIKE '%World%'
+  AND rules = '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"world\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"ethnic\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"folk\"}]';
+",
+    },
+    Migration {
+        version: 94,
+        name: "listen_history_rang_dans_le_contexte",
+        // OU l'auditeur en etait dans l'objet qu'il avait demande.
+        //
+        // La migration 84 a pose CE QU'il avait demande (`context_type` /
+        // `context_id`). Il manquait le RANG : sans lui, « Continuer l'ecoute »
+        // peut rouvrir la bonne playlist, mais toujours a son debut. L'arbitrage
+        // rendu sur #2441 est « objet courant + position », pas l'instantane de
+        // la file entiere — pour un artiste ou un label, la file est batie par
+        // une requete qui change d'un jour a l'autre, « conserver l'ordre » n'y
+        // a aucun sens, et ecrire la file a chaque ecoute couterait un facteur
+        // dix sur le volume, pour une section d'accueil.
+        //
+        // NULL a deux sens, et un seul est « on ne sait pas » :
+        // * ligne anterieure a cette migration — inconnu, on rouvre au debut ;
+        // * ecoute en lecture ALEATOIRE — le rang est deliberement laisse vide.
+        //   Rejouer le meme tirage n'aurait pas de sens : on RE-TIRE. C'est la
+        //   seconde moitie de l'arbitrage, ecrite ici plutot que devinee a la
+        //   lecture, parce que l'etat « aleatoire » de la zone n'existe plus au
+        //   moment ou l'accueil s'affiche.
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici — meme regle qu'aux migrations 79 et 84, et
+        // l'ALTER planterait le runner en « duplicate column name » sur une
+        // base qui l'a deja.
+        up: "",
+    },
+    Migration {
+        version: 95,
+        name: "zones_last_seen_at",
+        // DUP-1 (phase 2) : `zones.last_seen_at`, la derniere fois qu'un
+        // appareil a REPONDU (ISO 8601 UTC). `online` n'a qu'un etat : une
+        // zone eteinte depuis deux minutes et une zone abandonnee depuis
+        // trois semaines portaient la meme ligne. La colonne n'est ecrite
+        // qu'au passage EN LIGNE, jamais au passage hors ligne : c'est ce qui
+        // garde la mesure « derniere fois vue ».
+        //
+        // NULL pour toutes les lignes existantes, jamais now() : poser la date
+        // de la mise a jour sur une zone morte depuis trois semaines la ferait
+        // passer pour recente, precisement la ou ce chantier veut la verite.
+        //
+        // TEXT des deux cotes (patron `ignored_devices.created_at`) : rien a
+        // rattraper dans la parite de types PostgreSQL.
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84 et 94.
+        up: "",
+    },
+    Migration {
+        version: 96,
+        name: "tracks_audio_fingerprint",
+        // BIB-B2 : `tracks.audio_fingerprint`, l'empreinte du CONTENU audio
+        // decode (`audio/empreinte.rs`). `audio_hash` hache 64 Ko d'octets
+        // du conteneur et ne reconnait que la copie exacte ; deux encodages
+        // d'un meme master n'ont aucun octet en commun. L'empreinte, elle,
+        // se compare avec tolerance. Posee par la passe ReplayGain (le
+        // fichier vient d'etre decode) et par un rattrapage borne pour les
+        // pistes deja analysees. Versionnee dans la valeur ; NULL pour
+        // l'existant. TEXT des deux cotes : rien a rattraper en parite.
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95.
+        up: "",
+    },
+    // #3699 — etiqueter un album de streaming. `item_tags.item_id` est un
+    // `INTEGER` : la clef primaire d'un objet de la base LOCALE. Un album
+    // Qobuz, Tidal ou Bandcamp n'en a pas — il porte la paire
+    // `source` + `source_id`. La table locale ne peut donc pas le designer, et
+    // le client avait raison de cacher le bouton Etiquettes sur un album de
+    // streaming : le serveur n'aurait rien su en faire.
+    //
+    // Meme forme que les FAVORIS, qui ont deja resolu exactement ce probleme
+    // (`streaming_favorites`, migration 58) : une table a part, indexee sur la
+    // paire, et un INSTANTANE d'affichage (`title`, `artist`, `album`,
+    // `cover_url`) pose a l'etiquetage. C'est cet instantane qui repond au
+    // troisieme point du ticket : un album de streaming peut DISPARAITRE du
+    // catalogue, et la liste par etiquette doit continuer de s'afficher. Comme
+    // elle se rend depuis l'instantane, elle n'interroge jamais le service :
+    // un `source_id` mort degrade sa pochette, il ne bloque pas l'ecran.
+    //
+    // PAS DE COLONNE `id` : la clef naturelle (tag_id, item_type, source,
+    // source_id) EST la clef primaire — meme choix que `favorite_facets`
+    // (migration PG 038) et `task_runs` (87), et pour la meme raison : une
+    // colonne `id` impose la divergence AUTOINCREMENT / BIGSERIAL que la
+    // bascule SQLite -> PostgreSQL a deja payee cher (#1706). C'est aussi ce
+    // qui rend le deuxieme point du ticket structurel : l'unicite porte sur la
+    // PAIRE, pas sur un entier, donc le meme album Qobuz etiquete deux fois ne
+    // peut pas creer deux lignes.
+    //
+    // `tag_id` reste INTEGER ici et BIGINT cote PostgreSQL (jamais TEXT) : la
+    // jointure avec `tags.id` doit rester possible sur les deux moteurs, et la
+    // copie SQLite -> PG lie nativement les entiers (voir le commentaire de
+    // `insert_batch` dans `pg_migrate.rs`).
+    Migration {
+        version: 97,
+        name: "streaming_item_tags",
+        up: "
+CREATE TABLE IF NOT EXISTS streaming_item_tags (
+    tag_id INTEGER NOT NULL,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (tag_id, item_type, source, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
+",
+    },
+    Migration {
+        version: 98,
+        name: "semis_radios_paradise_annuaire_2026_09_09",
+        // Les canaux Radio Paradise apparus dans NOTRE annuaire depuis le
+        // semis du 30/08 (#3523).
+        //
+        // Dre van Hoof demandait « environ 6 à 10 stations de différents
+        // genres » (fil 1693) ; l'opérateur en publie sept et le catalogue
+        // livré n'en portait que deux. L'annuaire de mozaiklabs.fr en sert
+        // désormais deux de plus sous un nom distinct et la bonne qualité :
+        // Mellow Mix et Global Mix. Ce sont celles-là, et seulement
+        // celles-là, que cette migration pose.
+        //
+        // Le fichier porte en tête le relevé, le sondage des flux ET des
+        // logos, et la raison de chaque écart — dont les trois homonymes de
+        // l'annuaire (#3543) et le cas Serenity, qui reste un arbitrage
+        // ouvert. C'est là qu'il faut lire le détail, pas ici.
+        //
+        // Le même fichier est `include_str!` par la migration PostgreSQL
+        // 054 : un seul texte pour les deux bases, donc aucune divergence
+        // possible.
+        up: include_str!("../../migrations/radios/annuaire_mozaiklabs_2026_09_09.sql"),
+    },
+    Migration {
+        version: 99,
+        name: "zones_output_endpoint_id",
+        // #2269 — `zones.output_endpoint_id`, l'identifiant d'endpoint STABLE
+        // du backend pour une sortie locale.
+        //
+        // `output_device_id` vaut `local:{nom du peripherique}` : l'identite
+        // d'une zone locale est son NOM. Windows renomme l'endpoint au
+        // changement de taux d'echantillonnage et la zone ne retrouve plus
+        // rien. L'identifiant qui traverse un renommage existe pourtant depuis
+        // #2403 (`AudioDevice::endpoint_id`, capture a la decouverte, lu EN
+        // PREMIER par `resolve_device`) — rien ne le persistait.
+        //
+        // La colonne ne REMPLACE pas `output_device_id` : celui-ci reste
+        // l'identite de la zone, et tout ce qui s'y accroche — reglages, file,
+        // volume, index unique partiel `idx_zones_output_device_id` — reste en
+        // place. AUCUNE ligne existante n'est modifiee par cette migration :
+        // NULL veut dire « pas encore appris », jamais « inconnu donc
+        // n'importe lequel ». La valeur ne s'ecrit qu'au moment ou
+        // l'enumeration montre l'appareil sous le nom que la zone porte DEJA
+        // (`identite_de_sortie::Decision::Apprend`).
+        //
+        // TEXT des deux cotes : rien a rattraper en parite de types PG.
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95
+        // et 96.
+        up: "",
+    },
+    // #2001, piste 2 — l'ordre manuel des favoris.
+    //
+    // Le tri par champ (piste 1) est arrive avec la PR #2829 ; il ne rend pas
+    // le geste de Tades, qui voulait DEPLACER un favori a la souris. Il faut
+    // pour cela un rang ecrit par l'utilisateur, et donc une colonne.
+    //
+    // `position` est NULLABLE, et NULL veut dire « jamais range a la main » :
+    // c'est l'etat de TOUTES les lignes existantes, et le tri manuel les met en
+    // fin de liste (regle 2 de `favorites_sort`). Aucune valeur par defaut : un
+    // `DEFAULT 0` donnerait a tout le parc le meme rang, donc un ordre manuel
+    // qui ne range rien tout en pretendant exister.
+    //
+    // Les deux tables que Tune POSSEDE la recoivent — `favorites` (bibliotheque
+    // locale) et `streaming_favorites` (favoris de service enregistres chez
+    // Tune). Les favoris lus en direct chez Qobuz/Tidal n'ont pas de ligne ici
+    // et restent donc hors du rang manuel : arbitrage non rendu.
+    //
+    // Colonnes posees par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95, 96 et 99 :
+    // l'ALTER planterait le runner en « duplicate column name » sur une base
+    // qui les a deja, donc au premier demarrage apres mise a jour.
+    Migration {
+        version: 100,
+        name: "favoris_ordre_manuel",
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2320,6 +2548,18 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // rien à annoncer — ni dans le journal, ni à l'écran d'attente (#1701). Le
     // « +1 » est la passe finale (colonnes de sûreté, file unifiée, ANALYZE),
     // qui tourne à chaque démarrage et pèse, elle aussi, sur une grosse base.
+    // Une base en AVANCE sur le binaire : dit ici, une fois, au demarrage.
+    // Sans cette ligne le cas est parfaitement muet — `pending` vaut 0 et tout
+    // se passe comme si la base etait a jour (#2266).
+    if schema_en_avance(current_version, latest_version()) {
+        tracing::warn!(
+            version_base = current_version,
+            version_binaire = latest_version(),
+            "schema_en_avance_sur_le_binaire — cette base a ete migree par une \
+             version plus recente de Tune. Aucune migration inverse n'existe : \
+             une requete sur une colonne inconnue de cette version echouera."
+        );
+    }
     let floor = current_version.max(if tables_exist { 1 } else { 0 });
     let pending = MIGRATIONS.iter().filter(|m| m.version > floor).count();
     let started = std::time::Instant::now();
@@ -2666,6 +2906,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // OpenHome must end up with ONE zone even when names and UUIDs all
     // differ and the IP changes (forum #1239, Bilou: 3 « Node » zones).
     add_column_if_missing(db, "zones", "mac", "TEXT");
+    // DUP-1 (phase 2) : derniere reponse de l'appareil, ISO 8601 UTC, NULL = jamais vue.
+    add_column_if_missing(db, "zones", "last_seen_at", "TEXT");
+    // #2269 : identifiant d'endpoint stable de la sortie locale, NULL pour
+    // l'existant. Voir la migration 99 et `outputs::identite_de_sortie`.
+    add_column_if_missing(db, "zones", "output_endpoint_id", "TEXT");
+    // BIB-B2 : empreinte du contenu audio decode, versionnee (env100ms-v1:<hex>).
+    add_column_if_missing(db, "tracks", "audio_fingerprint", "TEXT");
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
@@ -2675,6 +2922,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // local ou une chaine de service de streaming.
     add_column_if_missing(db, "listen_history", "context_type", "TEXT");
     add_column_if_missing(db, "listen_history", "context_id", "TEXT");
+    // Rang de la piste dans cet objet (migration 94, #2441). NULL = inconnu
+    // (ligne d'avant la migration) OU tirage aleatoire, cas ou l'on RE-TIRE
+    // au lieu de rejouer le meme ordre.
+    add_column_if_missing(db, "listen_history", "context_position", "INTEGER");
 
     // Playlists scoped per profile (migration v55). Safety pass so DBs from any
     // prior version get the column regardless of which migration they came from.
@@ -2709,6 +2960,21 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "favorites", "item_name", "TEXT");
     add_column_if_missing(db, "favorites", "item_artist", "TEXT");
     add_column_if_missing(db, "favorites", "item_path", "TEXT");
+
+    // Rang manuel des favoris (migration 100, #2001 piste 2). NULL = jamais
+    // range a la main, ce qui est l'etat de toutes les lignes existantes et
+    // renvoie le favori en fin d'ordre manuel. Passe de surete du meme ordre
+    // que `is_compilation` ci-dessus, et pour la meme raison : les requetes de
+    // tri (`list_favorites_*_pour_tri`) NOMMENT la colonne — une base qui
+    // arriverait ici sans elle rendrait la liste des favoris vide des qu'un
+    // client demanderait un tri. PG : migration 057.
+    add_column_if_missing(db, "favorites", "position", "INTEGER");
+    // La jumelle sur `streaming_favorites` est posee PLUS BAS, apres le
+    // `CREATE TABLE IF NOT EXISTS streaming_favorites` de rattrapage : ici la
+    // table peut ne pas encore exister sur une base qui a saute la migration 58,
+    // et `add_column_if_missing` avale l'echec (`.ok()`) — la colonne
+    // manquerait alors en silence, et la requete de tri qui la NOMME rendrait
+    // une liste vide.
 
     // Provenance d'un embedding CLAP (#1732 phase 1) : NULL = analysé sur le
     // fichier, 'inherited:<id>' = copié depuis une jumelle (le DSD est exclu
@@ -2767,6 +3033,30 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
+    // Etiquettes posees sur un objet de STREAMING (migration v97, #3699) ;
+    // re-creee inconditionnellement pour la meme raison que la table
+    // ci-dessus : une base venue de n'importe quelle version anterieure doit
+    // l'avoir, quel que soit le chemin de migration qu'elle a emprunte.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS streaming_item_tags (\
+            tag_id INTEGER NOT NULL,\
+            item_type TEXT NOT NULL,\
+            source TEXT NOT NULL,\
+            source_id TEXT NOT NULL,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            cover_url TEXT,\
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),\
+            PRIMARY KEY (tag_id, item_type, source, source_id)\
+        );",
+    )
+    .ok();
+    // Rang manuel des favoris de service (migration 100, #2001 piste 2) —
+    // jumelle de `favorites.position` posee plus haut, mais ICI parce que la
+    // table vient seulement d'etre garantie. PG : migration 057.
+    add_column_if_missing(db, "streaming_favorites", "position", "INTEGER");
+
     // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
     // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
     // on DBs that skipped the numbered unified-queue migration.
@@ -2812,6 +3102,30 @@ pub fn current_version(db: &SqliteDb) -> Result<i32, String> {
 
 pub fn latest_version() -> i32 {
     MIGRATIONS.last().map(|m| m.version).unwrap_or(0)
+}
+
+/// La base a-t-elle ete migree par une version PLUS RECENTE que ce binaire ?
+///
+/// C'est la signature d'un RETOUR A UNE VERSION ANTERIEURE : on redescend d'un
+/// binaire, la base, elle, ne redescend pas. Aucune migration inverse n'existe
+/// dans ce depot — `Migration` n'a qu'un champ `up`, `PG_MIGRATIONS` qu'un SQL
+/// montant — et il n'y a donc rien pour ramener le schema en arriere.
+///
+/// Ce cas n'etait DISTINGUE nulle part : `run_migrations` calcule
+/// `floor = current_version.max(...)`, ne trouve aucune migration `> floor`,
+/// et rend `Ok(())` en silence ; la route de diagnostic, elle, comparait
+/// `v >= l` et annoncait donc `up_to_date: true` sur une base en avance. Le
+/// serveur demarre — puis casse a la premiere requete qui touche une colonne
+/// que sa version ne connait pas. C'est le risque nomme au ticket #2266
+/// (« La migration de base a rebours ») et il n'etait ni mesure ni dit.
+///
+/// Deux sites d'appel :
+/// - `run_migrations` / `run_pg_migrations`, pour le DIRE au journal de
+///   demarrage ;
+/// - `tune-server/src/routes/system/database.rs`, `etat_du_schema`, pour le
+///   rendre au champ `schema_ahead` de `GET /system/database/status`.
+pub fn schema_en_avance(version_base: i32, version_binaire: i32) -> bool {
+    version_base > version_binaire
 }
 
 // ─── PostgreSQL migration runner ─────────────────────────────────────
@@ -3108,6 +3422,139 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "ignored_devices",
         include_str!("../../migrations/postgres/044_ignored_devices.sql"),
     ),
+    // Jumelle de la SQLite 93 (#1426). C'est une migration de DONNÉES, pas de
+    // schéma : sans elle, le parc PostgreSQL garderait « genre contient folk »
+    // dans le préréglage « World Music » — et donc Folk Metal et Folk Rock —
+    // pour toujours. PostgreSQL ne sème pas les collections intelligentes
+    // lui-même : elles y sont arrivées par la bascule SQLite → PostgreSQL.
+    (
+        45,
+        "resserrer_folk_dans_world_music",
+        include_str!("../../migrations/postgres/045_resserrer_folk_dans_world_music.sql"),
+    ),
+    // #2441 — le RANG dans l'objet demandé. La 037 avait posé CE QUE
+    // l'auditeur avait demandé ; sans le rang, « Continuer l'écoute » rouvre
+    // la bonne playlist mais toujours à sa première piste. NULL vaut aussi
+    // « on re-tire » : en lecture aléatoire, le rang n'est délibérément pas
+    // écrit.
+    (
+        46,
+        "listen_history_rang_dans_le_contexte",
+        include_str!("../../migrations/postgres/046_listen_history_rang_dans_le_contexte.sql"),
+    ),
+    // #2860 — `listen_history.album_id` est TEXT et `albums.id` BIGINT : la
+    // jointure de « Continuer l'ecoute » rend `operator does not exist:
+    // text = bigint`, avalee par `unwrap_or_default()`, donc section vide sur
+    // TOUTE installation PostgreSQL. La 012 convertit deja cette colonne, mais
+    // elle ne l'a jamais vue : `album_id` n'arrive par aucun script numerote,
+    // seulement par ENSURE_COLUMNS, joue APRES. Cette migration rejoue la
+    // conversion maintenant que la colonne existe.
+    (
+        47,
+        "listen_history_album_id_bigint",
+        include_str!("../../migrations/postgres/047_listen_history_album_id_bigint.sql"),
+    ),
+    // #2886 — `zones.volume` passe d'INTEGER a DOUBLE PRECISION. Pas de
+    // jumelle SQLite : SQLite est a typage dynamique et l'affinite INTEGER ne
+    // convertit une decimale que si c'est SANS PERTE, donc une base deja
+    // creee stocke deja 0,4 tel quel. PostgreSQL, lui, REFUSE un f64 dans une
+    // colonne integer — sans cette migration, tout reglage de volume echouerait
+    // sur PG. Le test `un_volume_fractionnaire_survit_a_une_colonne_declaree_integer`
+    // tient l'autre moitie de la preuve.
+    (
+        48,
+        "zones_volume_a_virgule",
+        include_str!("../../migrations/postgres/048_zones_volume_a_virgule.sql"),
+    ),
+    (
+        49,
+        "profile_id_bigint",
+        include_str!("../../migrations/postgres/049_profile_id_bigint.sql"),
+    ),
+    (
+        50,
+        "zones_last_seen_at",
+        include_str!("../../migrations/postgres/050_zones_last_seen_at.sql"),
+    ),
+    (
+        51,
+        "tracks_audio_fingerprint",
+        include_str!("../../migrations/postgres/051_tracks_audio_fingerprint.sql"),
+    ),
+    // Jumelle PostgreSQL de la migration SQLite 97 (#3699). Les deux listes
+    // sont SEPAREES — `run_migrations` ne prend qu'un `SqliteDb` — donc sans
+    // cette entree tout le parc PostgreSQL (.15, .18, Docker) n'aurait pas la
+    // table, et etiqueter un album de streaming y echouerait en erreur SQL.
+    (
+        52,
+        "streaming_item_tags",
+        include_str!("../../migrations/postgres/052_streaming_item_tags.sql"),
+    ),
+    // #3715 — TROIS des treize colonnes que `pg_sqlite_type_parity` a nommees
+    // le 09/09/2026 a sa PREMIERE execution reelle. Pas les treize : la mesure
+    // montre que PostgreSQL REFUSE `text -> smallint` et `boolean -> smallint`
+    // en affectation, donc convertir une colonne dont un redacteur lie du texte
+    // echangerait une lecture fausse contre une ecriture refusee. Les neuf
+    // restantes sont inscrites nominativement dans `ECARTS_TOLERES`, avec leur
+    // motif mesure.
+    (
+        53,
+        "parite_types_pg_sqlite",
+        include_str!("../../migrations/postgres/053_parite_types_pg_sqlite.sql"),
+    ),
+    // Jumelle de la migration SQLite 98 : les canaux Radio Paradise apparus
+    // dans l'annuaire depuis le semis du 30/08 (#3523). LE MÊME FICHIER que
+    // la migration SQLite — pas une copie : le SQL du semis est volontairement
+    // portable (`INSERT ... SELECT ... WHERE NOT EXISTS`), et deux fichiers
+    // jumeaux finiraient par diverger. Sans cette entrée, tout le parc
+    // PostgreSQL — .15, .18, Docker — resterait aux deux Radio Paradise du
+    // semis précédent.
+    //
+    // 🔴 LE `concat!` N'EST PAS DE LA COQUETTERIE. `run_pg_migrations` n'écrit
+    // rien dans `schema_version` : c'est le SQL lui-même qui pose sa ligne, et
+    // le fichier de semis ne peut pas la porter — il est joué AUSSI par la
+    // migration SQLite 98, où `schema_version` n'existe pas. La 042, jumelle du
+    // semis précédent, s'en tirait parce que des scripts plus HAUTS (043…)
+    // faisaient avancer `MAX(version)` derrière elle. Celle-ci est la plus
+    // haute : sans sa marque, `MAX(version)` resterait à 53, le semis serait
+    // rejoué à CHAQUE démarrage et le rapport de diagnostic dirait
+    // `up_to_date: false` à jamais. C'est exactement le défaut de la 052
+    // (#3699), que `la_derniere_migration_postgres_enregistre_son_numero`
+    // garde — mais ce test-là ne lit que `migrations/postgres/*.sql`, et ne
+    // verrait donc pas cette entrée-ci.
+    (
+        54,
+        "semis_radios_paradise_annuaire_2026_09_09",
+        concat!(
+            include_str!("../../migrations/radios/annuaire_mozaiklabs_2026_09_09.sql"),
+            "\nINSERT INTO schema_version (version, name) \
+             VALUES (54, 'semis_radios_paradise_annuaire_2026_09_09') \
+             ON CONFLICT (version) DO NOTHING;\n"
+        ),
+    ),
+    // Jumelle PostgreSQL de la migration SQLite 99 (#2269). Sans elle, tout le
+    // parc PostgreSQL (.15, .18, Docker) n'aurait pas la colonne et la lecture
+    // de `output_endpoint_id` y renverrait « column does not exist » — donc
+    // aucune re-association nulle part, en silence.
+    (
+        55,
+        "zones_output_endpoint_id",
+        include_str!("../../migrations/postgres/055_zones_output_endpoint_id.sql"),
+    ),
+    (
+        56,
+        "zones_drapeaux_entiers",
+        include_str!("../../migrations/postgres/056_zones_drapeaux_entiers.sql"),
+    ),
+    // Jumelle de la migration SQLite 100 (#2001, piste 2) : le rang manuel des
+    // favoris. Sans elle, la colonne n'atteindrait jamais une base PostgreSQL
+    // deja creee — et les requetes de tri, qui la NOMMENT des cette version,
+    // y rendraient une erreur SQL, donc une liste de favoris vide (#2111).
+    (
+        57,
+        "favoris_ordre_manuel",
+        include_str!("../../migrations/postgres/057_favoris_ordre_manuel.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -3196,6 +3643,16 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
 
     // Même décompte que côté SQLite : de quoi annoncer l'avancement au lieu de
     // laisser croire à un serveur planté (#1701). Le « +1 » est l'ANALYZE final.
+    // Meme mesure que cote SQLite (#2266) : une base en avance sur le binaire
+    // est dite, une fois, au demarrage.
+    if schema_en_avance(current, pg_latest_version()) {
+        tracing::warn!(
+            version_base = current,
+            version_binaire = pg_latest_version(),
+            "schema_en_avance_sur_le_binaire — cette base a ete migree par une \
+             version plus recente de Tune. Aucune migration inverse n'existe."
+        );
+    }
     let pending = PG_MIGRATIONS
         .iter()
         .filter(|&&(v, _, _)| v > current)
@@ -3331,6 +3788,130 @@ mod tests {
         run_migrations(&db).unwrap();
         run_migrations(&db).unwrap();
         assert_eq!(current_version(&db).unwrap(), latest_version());
+    }
+
+    /// #1426 — le préréglage « World Music » livré ne doit plus porter
+    /// « genre CONTIENT folk », qui ramasse « Folk Metal » et « Folk Rock ».
+    /// `world` et `ethnic` gardent « contient », où la sous-chaîne est utile.
+    #[test]
+    fn world_music_livre_avec_folk_en_egalite_stricte() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let regles: String = conn
+            .query_row(
+                "SELECT rules FROM smart_collections WHERE name LIKE '%World%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("le préréglage « World Music » doit être semé");
+
+        assert!(
+            regles.contains(r#"{"field":"genre","operator":"equals","value":"folk"}"#),
+            "folk doit être en égalité stricte : {regles}"
+        );
+        assert!(
+            !regles.contains(r#"{"field":"genre","operator":"contains","value":"folk"}"#),
+            "« contient folk » ramasse Folk Metal et Folk Rock (#1426) : {regles}"
+        );
+        for garde in [
+            "\"contains\",\"value\":\"world\"",
+            "\"contains\",\"value\":\"ethnic\"",
+        ] {
+            assert!(
+                regles.contains(garde),
+                "seul `folk` change ; `world` et `ethnic` restent en « contient » : {regles}"
+            );
+        }
+    }
+
+    /// La correction #1426 est gardée sur la chaîne de règles EXACTE du semis :
+    /// une collection que l'utilisateur a retouchée ne doit JAMAIS être
+    /// réécrite sous ses pieds — c'est la contrepartie de réparer les
+    /// bibliothèques déjà installées.
+    #[test]
+    fn world_music_personnalisee_nest_pas_reecrite() {
+        const SUR_MESURE: &str = r#"[{"field":"genre","operator":"contains","value":"gnawa"}]"#;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        {
+            // On remet la base dans l'état d'un utilisateur qui avait déjà
+            // retouché sa collection AVANT que la 93 n'arrive : règles sur
+            // mesure, et la 93 retirée du registre pour qu'elle rejoue.
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "UPDATE smart_collections SET rules = ?1 WHERE name LIKE '%World%'",
+                rusqlite::params![SUR_MESURE],
+            )
+            .unwrap();
+            // `>= 93` et non `= 93` : le runner repart de MAX(version), donc
+            // effacer la seule 93 ne la ferait PAS rejouer dès qu'une
+            // migration ultérieure existe — le test se serait tu en croyant
+            // prouver quelque chose. Il ne dépend plus de sa place dans la
+            // liste (#2441, migration 94).
+            conn.execute("DELETE FROM _migrations WHERE version >= 93", [])
+                .unwrap();
+        }
+        run_migrations(&db).unwrap();
+        assert_eq!(
+            current_version(&db).unwrap(),
+            latest_version(),
+            "la 93 doit bien avoir rejoué"
+        );
+
+        let conn = db.connection().lock().unwrap();
+        let regles: String = conn
+            .query_row(
+                "SELECT rules FROM smart_collections WHERE name LIKE '%World%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            regles, SUR_MESURE,
+            "une collection personnalisée doit rester intacte (#1426)"
+        );
+        drop(conn);
+
+        // Contre-épreuve DANS le test : sans elle, « rien n'a bougé » serait
+        // aussi vrai d'une migration vide. On repose la chaîne LIVRÉE, on fait
+        // rejouer la 93, et cette fois elle DOIT mordre.
+        const LIVREE: &str = concat!(
+            r#"[{"field":"genre","operator":"contains","value":"world"},"#,
+            r#"{"field":"genre","operator":"contains","value":"ethnic"},"#,
+            r#"{"field":"genre","operator":"contains","value":"folk"}]"#
+        );
+        {
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "UPDATE smart_collections SET rules = ?1 WHERE name LIKE '%World%'",
+                rusqlite::params![LIVREE],
+            )
+            .unwrap();
+            // Même raison qu'au-dessus : c'est le plancher MAX(version) qui
+            // décide de ce qui rejoue.
+            conn.execute("DELETE FROM _migrations WHERE version >= 93", [])
+                .unwrap();
+        }
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let regles: String = conn
+            .query_row(
+                "SELECT rules FROM smart_collections WHERE name LIKE '%World%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            regles, LIVREE,
+            "sur la chaîne livrée, la 93 doit mordre — sinon le garde ci-dessus \
+             ne prouve rien"
+        );
+        assert!(regles.contains(r#""operator":"equals","value":"folk""#));
     }
 
     /// Forum #1328 : décalage des paroles par zone. Vérifie la colonne ET son
@@ -3664,6 +4245,117 @@ mod tests {
         assert_eq!(lire("Vide").as_deref(), Some(""));
     }
 
+    /// #2269 — une base NÉE AVANT la colonne gagne `output_endpoint_id`, et
+    /// n'y perd aucune ligne.
+    ///
+    /// ⚠️ C'est le SEUL témoin qui éprouve ce chemin. Les témoins de
+    /// `zone_repo` partent d'un `init_schema()`, où `CORE_SCHEMA` pose déjà la
+    /// colonne : débrancher `add_column_if_missing` les laisse tous VERTS.
+    /// Sur le terrain, la base d'un testeur ne passe jamais par `CORE_SCHEMA`
+    /// — elle existe déjà — et c'est `add_column_if_missing` seul qui lui pose
+    /// la colonne. Sans lui, `sorties_locales_et_leur_identite` rend une liste
+    /// vide à jamais (« no such column »), et RIEN ne se ré-associe, en
+    /// silence : exactement le défaut « écrit mais pas branché ».
+    ///
+    /// Le compte des collisions sur la nouvelle clef est mesuré ici aussi :
+    /// après migration, aucune ligne ne porte de valeur, donc aucune n'entre
+    /// en collision — c'est ce qui autorise à poser la colonne sans arbitrer
+    /// quoi que ce soit sur la base des testeurs.
+    #[test]
+    fn une_base_ancienne_gagne_lidentifiant_dendpoint_sans_perdre_de_ligne() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        // La forme d'avant #2269 : `zones` sans `output_endpoint_id`, avec des
+        // réglages accrochés à la ligne.
+        db.execute_batch(
+            "CREATE TABLE zones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                output_type TEXT,
+                output_device_id TEXT,
+                volume REAL DEFAULT 100,
+                is_hidden INTEGER DEFAULT 0
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id
+                ON zones(output_device_id) WHERE output_device_id IS NOT NULL;
+            INSERT INTO zones (name, output_type, output_device_id, volume)
+                VALUES ('Salon', 'local', 'local:audio-gd USB audio', 37.5),
+                       ('Chambre', 'local', 'local:Haut-parleurs', 70.0);",
+        )
+        .unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(zones)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "output_endpoint_id"),
+            "`output_endpoint_id` manque après migration sur une base ANTÉRIEURE \
+             à la colonne : la ré-association ne pourra jamais rien lire, et \
+             `sorties_locales_et_leur_identite` rendra une liste vide à \
+             jamais (#2269). Colonnes : {cols:?}"
+        );
+
+        // AUCUNE ligne perdue, et les réglages restent accrochés là où ils sont.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM zones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "des zones ont disparu à la migration");
+        let volume: f64 = conn
+            .query_row(
+                "SELECT volume FROM zones WHERE output_device_id = 'local:audio-gd USB audio'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(volume, 37.5, "le volume de la zone a bougé");
+
+        // La valeur naît NULLE : « pas encore appris », jamais devinée.
+        let apprises: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zones WHERE output_endpoint_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            apprises, 0,
+            "la migration a INVENTÉ un identifiant : elle ne doit modifier \
+             aucune ligne"
+        );
+
+        // Le compte des collisions sur la NOUVELLE clef, mesuré et non supposé.
+        let collisions: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM zones \
+                 WHERE output_endpoint_id IS NOT NULL GROUP BY output_endpoint_id \
+                 HAVING COUNT(*) > 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            collisions, 0,
+            "la nouvelle clef entrerait en collision : la colonne ne peut pas \
+             être posée sans arbitrage"
+        );
+
+        // Et la lecture que le dépôt exécute vraiment passe.
+        conn.query_row(
+            "SELECT id, output_device_id, COALESCE(output_endpoint_id, ''), \
+             COALESCE(is_hidden, 0) FROM zones WHERE output_device_id LIKE 'local:%' \
+             ORDER BY id",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("le SELECT de `sorties_locales_et_leur_identite` doit passer");
+    }
+
     #[test]
     fn une_base_ancienne_gagne_le_drapeau_compilation() {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -3972,6 +4664,126 @@ mod tests {
         );
     }
 
+    /// Les canaux Radio Paradise que le catalogue livré doit porter (#3523).
+    ///
+    /// Dre van Hoof demandait « environ 6 à 10 stations de différents genres »
+    /// (fil 1693) ; l'opérateur en publie sept et le catalogue n'en portait que
+    /// deux. Les DEUX autres — Mellow Mix et Global Mix — sont posées par la
+    /// migration 98, relevées de l'annuaire du 09/09/2026.
+    ///
+    /// Ce test tient l'ADRESSE, pas le nom : renommer une station est le droit
+    /// de l'éditeur du catalogue, mais perdre un canal est une régression. Et
+    /// il tient l'inverse du défaut de #3543 : aucune station livrée ne doit
+    /// s'appeler « Radio Paradise » tout court — c'est le nom des trois
+    /// homonymes de l'annuaire, indiscernables à l'écran, et c'est la raison
+    /// pour laquelle ils sont écartés des deux semis.
+    #[test]
+    fn le_catalogue_livre_porte_les_canaux_radio_paradise_de_l_annuaire() {
+        const CANAUX: [&str; 4] = [
+            "http://stream.radioparadise.com/flacm",
+            "http://stream.radioparadise.com/rock-flacm",
+            "http://stream.radioparadise.com/mellow-flacm",
+            "http://stream.radioparadise.com/global-flacm",
+        ];
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let stations: Vec<(String, String)> = {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name, url FROM radio_stations ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        for canal in CANAUX {
+            let portant: Vec<&str> = stations
+                .iter()
+                .filter(|(_, u)| u == canal)
+                .map(|(n, _)| n.as_str())
+                .collect();
+            assert_eq!(
+                portant.len(),
+                1,
+                "le canal {canal} devrait être livré exactement une fois, \
+                 il l'est {} fois — noms : {portant:?}",
+                portant.len()
+            );
+        }
+
+        let homonymes: Vec<&str> = stations
+            .iter()
+            .filter(|(n, _)| n.trim() == "Radio Paradise")
+            .map(|(_, u)| u.as_str())
+            .collect();
+        assert!(
+            homonymes.is_empty(),
+            "le catalogue livré porte une station nommée « Radio Paradise » \
+             tout court — c'est le nom des homonymes de l'annuaire (#3543), \
+             indiscernables à l'écran : {homonymes:?}"
+        );
+    }
+
+    /// Le semis du 09/09 doit atteindre les bases PostgreSQL, et y MARQUER son
+    /// numéro (#3523).
+    ///
+    /// Écrit d'un seul côté, il laisserait tout le parc PostgreSQL — .15, .18,
+    /// Docker — aux deux Radio Paradise du semis précédent. Et enregistré sans
+    /// sa ligne `schema_version`, il serait rejoué à chaque démarrage puisque
+    /// `run_pg_migrations` n'écrit rien lui-même : c'est le défaut de la 052
+    /// (#3699), et la garde qui le tient (`la_derniere_migration_postgres_…`)
+    /// ne lit que `migrations/postgres/*.sql` — elle ne voit pas les entrées
+    /// qui, comme celle-ci, partagent le fichier de la migration SQLite.
+    ///
+    /// Ce test lit les SOURCES : il vaut quel que soit le jeu de features
+    /// compilé, `PG_MIGRATIONS` vivant derrière `#[cfg(feature = "postgres")]`
+    /// que la porte locale ne compile pas.
+    #[test]
+    fn le_semis_radio_paradise_du_09_09_atteint_postgres_et_marque_son_numero() {
+        const FICHIER: &str = "annuaire_mozaiklabs_2026_09_09.sql";
+        // Le CHEMIN, et ASSEMBLÉ À L'EXÉCUTION : `include_str!("migrations.rs")`
+        // rapporte ce test-ci avec le reste du fichier, donc toute aiguille
+        // écrite ici en toutes lettres se compterait elle-même.
+        let chemin = format!("../../migrations/radios/{FICHIER}");
+        let ce_fichier = include_str!("migrations.rs");
+
+        assert!(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("migrations/radios")
+                .join(FICHIER)
+                .exists(),
+            "le fichier de semis {FICHIER} a disparu"
+        );
+        assert_eq!(
+            ce_fichier.matches(&chemin).count(),
+            2,
+            "le semis {FICHIER} doit être `include_str!` DEUX fois — une fois \
+             par la migration SQLite, une fois par sa jumelle PostgreSQL. \
+             Écrit d'un seul côté, un des deux parcs reste sans les stations."
+        );
+        // Même précaution : l'aiguille est assemblée, sinon elle se trouverait
+        // elle-même et le test serait vert contre rien.
+        let nom = "semis_radios_paradise_annuaire_2026_09_09";
+        let marque = format!("VALUES (54, '{nom}')");
+        assert_eq!(
+            ce_fichier.matches(&marque).count(),
+            1,
+            "l'entrée PostgreSQL du semis n'inscrit pas sa ligne dans \
+             `schema_version` : elle est la plus haute, donc `MAX(version)` \
+             resterait en arrière et le semis serait rejoué à chaque démarrage \
+             (défaut de la 052, #3699)"
+        );
+        assert!(
+            MIGRATIONS.iter().any(|m| m.name == nom),
+            "la migration SQLite du semis a disparu ou changé de nom"
+        );
+    }
+
     /// Le semis ne doit rien planter qu'une migration ultérieure arrache.
     ///
     /// C'est l'erreur que les migrations 70 et 78 ont dû réparer : le semis
@@ -4052,6 +4864,32 @@ mod tests {
             depuis_annuaire.len()
         );
         semees.extend(depuis_annuaire);
+
+        // Le TROISIÈME semis, celui du relevé du 09/09 (migration 98, #3523) :
+        // même forme portable, même règle. Sans cette reprise, un semis ajouté
+        // après coup échapperait à la garde — et c'est le seul moment où on y
+        // pense.
+        let paradise = MIGRATIONS
+            .iter()
+            .find(|m| m.name == "semis_radios_paradise_annuaire_2026_09_09")
+            .expect("le semis Radio Paradise du 09/09 a disparu");
+        let depuis_paradise: Vec<String> = paradise
+            .up
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("WHERE NOT EXISTS (SELECT 1 FROM radio_stations WHERE url = ")
+            })
+            .filter_map(|l| litteraux_sql(l).into_iter().next())
+            .collect();
+        assert_eq!(
+            depuis_paradise.len(),
+            2,
+            "le semis du 09/09 devait poser deux stations, le relevé en trouve {}",
+            depuis_paradise.len()
+        );
+        semees.extend(depuis_paradise);
+
         for url in &semees {
             assert!(
                 url.starts_with("http"),
@@ -4565,7 +5403,107 @@ mod tests {
         // et par `album_distinct_pairs` (#1276), tous deux fusionnés pendant
         // que cette branche passait ses portes — d'où le renumérotage, fait
         // AVANT qu'aucune base ne voie l'ancien numéro.
-        assert_eq!(pg_latest_version(), 44, "latest PG migration must be 44");
+        // 45 : `resserrer_folk_dans_world_music` (#1426), jumelle de la
+        // SQLite 93. Migration de DONNÉES : sans jumelle PG, le préréglage
+        // « World Music » garderait « contient folk » sur tout le parc
+        // PostgreSQL.
+        // 46 : `listen_history_rang_dans_le_contexte` (#2441). ⚠️ Cette
+        // migration a été ajoutée SANS remonter la borne ci-dessous : la
+        // branche était donc déjà ROUGE sur ce test avant #2860. Personne ne
+        // l'a vu parce que « Test (PostgreSQL) » est SAUTÉ sur une PR vers
+        // `batch/*` ou `rc/*` sans l'étiquette `ci:full` — c'est cette
+        // PR-ci, qui la porte, qui a réveillé le test.
+        // 47 : `listen_history_album_id_bigint` (#2860). `album_id` était
+        // TEXT contre `albums.id` BIGINT : la jointure de « Continuer
+        // l'écoute » rendait `operator does not exist: text = bigint`, avalé
+        // par `unwrap_or_default()`, donc section vide sur tout le parc
+        // PostgreSQL.
+        // 48 : `zones_volume_a_virgule` (#2886). `zones.volume` était un
+        // INTEGER : sous 0,005 linéaire (−46,0205999133 dB) la valeur
+        // persistée tombait à 0 et la zone se rallumait MUETTE. PAS de jumelle
+        // SQLite — voir le commentaire de l'entrée 48 dans PG_MIGRATIONS.
+        // 49 : `profile_id_bigint` (#2995). `listen_history.profile_id` et
+        // `playlists.profile_id` étaient TEXT sur toute installation
+        // PostgreSQL NATIVE, contre `profiles.id` BIGINT et un `i64` lié :
+        // `PlaylistRepo::list()` rendait `operator does not exist: text =
+        // bigint`, donc liste de playlists vide. Même cause que la 47 —
+        // les colonnes n'arrivent par aucun script numéroté, seulement par
+        // `ENSURE_COLUMNS`, et la 012 qui les vise ne les a jamais vues.
+        // Ce sont les DEUX dernières colonnes dans ce cas : la mesure de
+        // #2995 en compte cinq, dont trois déjà réparées.
+        // 50 : `zones_last_seen_at` (DUP-1, phase 2). Jumelle SQLite : la 95.
+        // `online` n'a qu'un etat ; la derniere reponse datee distingue une
+        // zone eteinte d'une zone abandonnee. TEXT des deux cotes, NULL pour
+        // l'existant.
+        // 51 : `tracks_audio_fingerprint` (BIB-B2). Jumelle SQLite : la 96.
+        // L'empreinte du contenu audio decode, versionnee, NULL pour
+        // l'existant ; TEXT des deux cotes.
+        // 52 : `streaming_item_tags` (#3699). Jumelle SQLite : la 97.
+        // `item_tags.item_id` est un entier — la clef primaire d'un objet
+        // LOCAL. Un album Qobuz, Tidal ou Bandcamp n'en a pas : il porte la
+        // paire `source` + `source_id`. Meme forme que `streaming_favorites`,
+        // instantane d'affichage compris, pour qu'un album retire du catalogue
+        // degrade sa pochette sans vider la liste.
+        // 53 : `parite_types_pg_sqlite` (#3715). PAS de jumelle SQLite : c'est
+        // une migration de RATTRAPAGE, qui aligne PostgreSQL sur ce que SQLite
+        // declare deja. Trois colonnes, chacune justifiee par sa mesure :
+        // `album_metadata.album_id` (TEXT contre un `i64` lie -> `operator does
+        // not exist: text = bigint`, metadonnees d'album illisibles sur tout le
+        // parc migre), `network_mounts.active` (TEXT dans un `COALESCE(active,
+        // 1)` -> `COALESCE types text and integer cannot be matched`, aucun
+        // partage SMB remonte au demarrage) et `listen_history.context_position`
+        // (un RANG declare TEXT par inadvertance par la 046, sur les DEUX
+        // chemins).
+        // Les NEUF autres colonnes que `pg_sqlite_type_parity` nomme ne sont
+        // PAS converties : PostgreSQL refuse `text -> smallint` et
+        // `boolean -> smallint` en affectation, donc convertir une colonne dont
+        // un redacteur lie du texte echangerait une lecture fausse contre une
+        // ecriture refusee. Elles sont inscrites nominativement dans
+        // `ECARTS_TOLERES` avec leur motif mesure.
+        // 54 : `semis_radios_paradise_annuaire_2026_09_09` (#3523). Jumelle
+        // SQLite : la 98. Le MEME fichier de semis est `include_str!` des deux
+        // cotes ; l'entree PostgreSQL y ajoute, par `concat!`, sa ligne
+        // `INSERT INTO schema_version` — le fichier ne peut pas la porter,
+        // puisqu'il est joue aussi contre une base SQLite ou la table n'existe
+        // pas, et cette entree est la PLUS HAUTE : sans marque, `MAX(version)`
+        // resterait a 53 et le semis serait rejoue a chaque demarrage (defaut
+        // de la 052, #3699).
+        // 55 : `zones_output_endpoint_id` (#2269). Jumelle SQLite : la 99.
+        // L'identifiant d'endpoint stable d'une sortie locale, la seule
+        // identite qui traverse un renommage. TEXT des deux cotes, NULL pour
+        // l'existant — aucune ligne n'est modifiee, `output_device_id` reste
+        // l'identite de la zone.
+        // 56 : `zones_drapeaux_entiers` (#3726). PAS de jumelle SQLite :
+        // migration de RATTRAPAGE, comme la 53. QUATRE drapeaux ramenes a
+        // SMALLINT, chacun apres que son redacteur ait ete repare dans le MEME
+        // commit — c'est l'ordre que #3726 exige, et c'est la reparation du
+        // redacteur qui rend la conversion possible.
+        // `zones.is_hidden` : TEXT sur les DEUX chemins (aucun script numerote
+        // ne la declarait, seul `ENSURE_COLUMNS`), et NEUF des onze requetes
+        // qui la touchent tombaient — `list()` se rabattait sur `list_all()`,
+        // donc une zone supprimee reparaissait, et les trois comptes de zones
+        // rendaient 0. `zones.online` et `zones.dsp_enabled` : TEXT sur le
+        // chemin migre, et leurs redacteurs liaient une CHAINE dans une colonne
+        // SMALLINT sur le chemin natif. `profiles.is_admin` : `routes/cloud.rs`
+        // liait un BOOLEEN, donc la creation de profil SSO echouait en natif et
+        // ecrivait le litteral `true` en migre — ou `as_bool()` rend `None`,
+        // donc un administrateur se connectait avec le role `user`.
+        // 55 est prise par `zones_output_endpoint_id` (#2269, PR #3758).
+        // Arbitrage du 11/09/2026 : cette migration-ci passe en 56, l'autre
+        // garde 55 — anteriorite et maturite. Le numero libre a ete remesure
+        // DANS LE CODE, pas dans le repertoire : la jumelle PostgreSQL du
+        // semis Radio Paradise (54) est une entree `concat!` de cette liste
+        // et ne porte AUCUN fichier `054_*.sql` — un `ls migrations/postgres`
+        // affiche 053 comme dernier et fait viser un numero deja pris.
+        // 57 : `favoris_ordre_manuel` (#2001, piste 2), jumelle de la SQLite
+        // 100. Pose `position` sur `favorites` ET `streaming_favorites` ; sans
+        // elle, aucune base PostgreSQL deja creee ne recevrait la colonne, que
+        // les requetes de tri NOMMENT desormais. Le 47 que le commit d'origine
+        // visait est pris depuis par `listen_history_album_id_bigint` (#2860) :
+        // le numero libre a ete remesure DANS LE CODE, entree par entree de
+        // PG_MIGRATIONS, et non par un `ls migrations/postgres` que la 54 —
+        // une entree `concat!` sans fichier — rendrait faux.
+        assert_eq!(pg_latest_version(), 57, "latest PG migration must be 57");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
@@ -4994,6 +5932,13 @@ mod tests {
         for (fichier, nom) in [
             ("029_format_lowercase.sql", "format_lowercase"),
             ("030_format_conteneur_dsd.sql", "format_conteneur_dsd"),
+            // #1426 — le préréglage « World Music » est arrivé sur PostgreSQL
+            // par la bascule, jamais par un semis PG : sans jumelle, « contient
+            // folk » y resterait pour toujours.
+            (
+                "045_resserrer_folk_dans_world_music.sql",
+                "resserrer_folk_dans_world_music",
+            ),
         ] {
             assert!(
                 MIGRATIONS.iter().any(|m| m.name == nom),
@@ -5072,6 +6017,118 @@ mod tests {
             "`task_runs` manque à ENSURE_TABLES : les bases PostgreSQL déjà \
              converties (schema_version 99) resteraient sans registre pour \
              toujours"
+        );
+    }
+
+    /// La migration PostgreSQL la plus haute doit ENREGISTRER son numero.
+    ///
+    /// `run_pg_migrations` n'ecrit rien dans `schema_version` : il applique le
+    /// SQL de chaque script et passe au suivant. C'est le script lui-meme qui
+    /// pose sa ligne, et seul le PLUS HAUT fait avancer `MAX(version)`. Un
+    /// dernier script qui l'oublie laisse la base se croire une version en
+    /// arriere : le rapport de diagnostic annonce `up_to_date: false` pour
+    /// toujours, et le script est rejoue a chaque demarrage.
+    ///
+    /// C'est arrive a la 052 (#3699), et rien de local ne l'a vu :
+    /// `pg_migrations_are_contiguous_and_include_numeric_heals` vit derriere
+    /// `#[cfg(feature = "postgres")]`, que la porte locale ne compile pas.
+    /// Cette garde-ci lit les FICHIERS : elle vaut quel que soit le jeu de
+    /// features.
+    ///
+    /// Elle ne juge QUE le plus haut : dix-neuf scripts anterieurs n'ont pas
+    /// cette ligne et n'en ont pas besoin — un script plus haut les couvre.
+    #[test]
+    fn la_derniere_migration_postgres_enregistre_son_numero() {
+        let dossier = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        let mut scripts: Vec<(u32, String)> = fs::read_dir(&dossier)
+            .expect("migrations/postgres lisible")
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".sql"))
+            .filter_map(|n| n.get(..3)?.parse::<u32>().ok().map(|v| (v, n)))
+            .collect();
+        scripts.sort();
+        let (numero, nom) = scripts.last().cloned().expect("au moins un script PG");
+        let sql = fs::read_to_string(dossier.join(&nom)).unwrap();
+        let attendu = format!("INSERT INTO schema_version (version, name) VALUES ({numero},");
+        assert!(
+            sql.contains(&attendu),
+            "« {nom} » est la migration PostgreSQL la plus haute et n'enregistre \
+             pas son numero : la base restera bloquee a la version precedente, \
+             le rapport de diagnostic dira `up_to_date: false` a jamais et le \
+             script sera rejoue a chaque demarrage. Ajoute, dans son BEGIN/COMMIT :\n\
+             {attendu} '<nom>')\n    ON CONFLICT (version) DO NOTHING;"
+        );
+    }
+
+    /// `streaming_item_tags` (#3699) doit exister sur les QUATRE chemins par
+    /// lesquels une base arrive a la vie — exactement comme `task_runs`.
+    ///
+    /// Le chemin qu'on oublie est le troisieme : une base creee par
+    /// l'assistant SQLite -> PostgreSQL enregistre `schema_version = 99` et ne
+    /// rejoue **jamais** les scripts PG numerotes. Sur ces bases-la, la
+    /// migration 052 ne s'appliquera pas — ni maintenant, ni jamais — et
+    /// etiqueter un album Qobuz y rendrait une erreur SQL pour toujours.
+    ///
+    /// Ce test lit les SOURCES : il vaut donc quel que soit le jeu de features
+    /// compile, `PG_MIGRATIONS` vivant derriere `#[cfg(feature = "postgres")]`.
+    #[test]
+    fn les_etiquettes_de_streaming_existent_sur_les_quatre_chemins() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // 1. Migration SQLite — les bases SQLite existantes ET neuves.
+        assert!(
+            MIGRATIONS.iter().any(|m| m.name == "streaming_item_tags"),
+            "la migration SQLite `streaming_item_tags` a disparu"
+        );
+        // 2. Migration PG numerotee — les bases PostgreSQL sur la piste
+        //    numerotee (.15, .18, Docker).
+        let ce_fichier = include_str!("migrations.rs");
+        assert!(
+            ce_fichier.contains("052_streaming_item_tags.sql"),
+            "`streaming_item_tags` existe cote SQLite mais n'est pas \
+             enregistree dans PG_MIGRATIONS : tout le parc PostgreSQL \
+             resterait sans la table"
+        );
+        assert!(
+            racine
+                .join("migrations/postgres/052_streaming_item_tags.sql")
+                .exists(),
+            "l'entree PG_MIGRATIONS pointe sur un fichier absent"
+        );
+        // 3. `PG_FULL_SCHEMA` — une base montee d'un bloc par la bascule
+        //    SQLite -> PostgreSQL, qui ne rejouera aucun script numerote.
+        let pg_neuf = fs::read_to_string(racine.join("src/db/pg_migrate.rs")).unwrap();
+        assert!(
+            pg_neuf.contains("CREATE TABLE IF NOT EXISTS streaming_item_tags"),
+            "`streaming_item_tags` manque a PG_FULL_SCHEMA : une base creee \
+             par la bascule porte schema_version 99 et ne recevrait JAMAIS la \
+             migration 052"
+        );
+        // 3 bis. Et la table doit etre COPIEE a la bascule, sans quoi tout
+        //        l'etiquetage du catalogue de streaming serait perdu ce
+        //        jour-la — le defaut mesure sur `favorite_facets` (#2442).
+        assert!(
+            pg_neuf.contains("\"streaming_item_tags\","),
+            "`streaming_item_tags` n'est pas dans MIGRATION_TABLES : les \
+             etiquettes posees sur des albums de streaming seraient perdues a \
+             la bascule SQLite -> PostgreSQL"
+        );
+        // 3 ter. Cette table n'a pas de colonne `id` : la clause par defaut
+        //        `ON CONFLICT (id)` de la copie echouerait sur elle.
+        assert!(
+            pg_neuf.contains("ON CONFLICT (tag_id, item_type, source, source_id) DO NOTHING"),
+            "la copie SQLite -> PG n'a pas de clause ON CONFLICT propre a \
+             `streaming_item_tags`, qui n'a PAS de colonne `id` : la clause \
+             par defaut `ON CONFLICT (id)` echouerait"
+        );
+        // 4. `ENSURE_TABLES` — le rattrapage rejoue a CHAQUE demarrage, seul
+        //    filet pour une base deja convertie AVANT cette version.
+        let ensure = fs::read_to_string(racine.join("src/db/postgres.rs")).unwrap();
+        assert!(
+            ensure.contains("CREATE TABLE IF NOT EXISTS streaming_item_tags"),
+            "`streaming_item_tags` manque a ENSURE_TABLES : les bases \
+             PostgreSQL deja converties (schema_version 99) resteraient sans \
+             la table pour toujours"
         );
     }
 }

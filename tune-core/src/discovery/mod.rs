@@ -3,7 +3,9 @@ pub mod mac;
 pub mod mdns;
 pub mod minimal_dmr;
 mod oui_audio;
+pub mod redecouverte;
 pub mod renderer_identity;
+pub mod sendspin;
 pub mod ssdp;
 pub mod xml_parser;
 

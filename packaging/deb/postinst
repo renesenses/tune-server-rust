@@ -1,0 +1,73 @@
+#!/bin/sh
+# Post-installation du paquet tune-server.
+#
+# Contrat : idempotent (rejoué à chaque mise à jour), et jamais fatal pour une
+# raison qui n'empêche pas le serveur de tourner — un `exit 1` ici laisse dpkg
+# dans un état « half-configured » que l'utilisateur ne sait pas réparer.
+set -e
+
+TUNE_HOME=/opt/tune
+TUNE_DATA=/var/lib/tune
+
+case "$1" in
+configure)
+    # --- Utilisateur système dédié -------------------------------------
+    # Pas de shell, pas de mot de passe : ce compte ne sert qu'au service.
+    if ! getent group tune >/dev/null; then
+        addgroup --system tune
+    fi
+    # Le répertoire AVANT le compte : `adduser --home` avertit bruyamment
+    # (« home dir can't be accessed ») si la cible n'existe pas encore.
+    mkdir -p "$TUNE_DATA"
+    if ! getent passwd tune >/dev/null; then
+        adduser --system --ingroup tune --home "$TUNE_DATA" --no-create-home \
+                --gecos "Tune music server" --disabled-password \
+                --shell /usr/sbin/nologin tune
+    fi
+    # Les DAC USB sont exposés sous /dev/snd, groupe `audio`. Sans ça la
+    # « sortie locale » ne liste aucun périphérique.
+    if getent group audio >/dev/null; then
+        adduser tune audio >/dev/null 2>&1 || true
+    fi
+
+    # --- Répertoires ----------------------------------------------------
+    install -d -o tune -g tune -m 0755 "$TUNE_DATA"
+    # /opt/tune appartient à `tune` et NON à root : la mise à jour intégrée
+    # (Réglages → Mise à jour) réécrit le binaire et web/ en place, comme sur
+    # l'image Tune OS. Avec un /opt/tune root-only elle échouerait en
+    # « Permission denied » sans que l'utilisateur comprenne pourquoi.
+    chown -R tune:tune "$TUNE_HOME"
+
+    # --- Service --------------------------------------------------------
+    # `/run/systemd/system` n'existe pas dans un conteneur ou sous un autre
+    # init : le paquet s'installe quand même, il ne démarre simplement rien.
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable tune-server.service >/dev/null 2>&1 || true
+        if [ -z "$2" ]; then
+            # Première installation : on démarre.
+            systemctl start tune-server.service >/dev/null 2>&1 || true
+        else
+            # Mise à jour : on ne redémarre que si le service tournait déjà.
+            systemctl try-restart tune-server.service >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if [ -z "$2" ]; then
+        echo ""
+        echo "Tune est installé. Ouvrez http://localhost:8888 dans un navigateur."
+        echo "Indiquez vos dossiers de musique dans /etc/default/tune-server,"
+        echo "puis : sudo systemctl restart tune-server"
+        echo ""
+    fi
+    ;;
+
+abort-upgrade | abort-remove | abort-deconfigure) ;;
+
+*)
+    echo "postinst appelé avec un argument inconnu : $1" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

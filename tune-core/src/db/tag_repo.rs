@@ -160,18 +160,110 @@ pub mod sql {
         )
     }
 
+    /// Le compte annonce par `/tags` porte sur les DEUX espaces
+    /// d'identifiants (#3699) : la table locale ET la table de streaming.
+    ///
+    /// Deux sous-requetes correlees plutot que deux LEFT JOIN : joindre les
+    /// deux tables a la fois multiplierait les lignes (trois albums locaux et
+    /// deux albums Qobuz donneraient six), et le `COUNT` mentirait par
+    /// construction. Une etiquette sans aucun objet rend toujours 0, comme
+    /// avant.
     pub fn count_per_tag() -> &'static str {
-        "SELECT t.id, t.name, t.color, COUNT(it.id) as item_count \
-         FROM tags t LEFT JOIN item_tags it ON t.id = it.tag_id \
-         GROUP BY t.id, t.name, t.color ORDER BY t.name"
+        "SELECT t.id, t.name, t.color, \
+         (SELECT COUNT(*) FROM item_tags it WHERE it.tag_id = t.id) \
+         + (SELECT COUNT(*) FROM streaming_item_tags s WHERE s.tag_id = t.id) as item_count \
+         FROM tags t ORDER BY t.name"
     }
 
     pub fn count_per_tag_by_type<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT t.id, t.name, t.color, COUNT(it.id) as item_count \
-             FROM tags t LEFT JOIN item_tags it ON t.id = it.tag_id AND it.item_type = {} \
-             GROUP BY t.id, t.name, t.color ORDER BY t.name",
+            "SELECT t.id, t.name, t.color, \
+             (SELECT COUNT(*) FROM item_tags it WHERE it.tag_id = t.id AND it.item_type = {}) \
+             + (SELECT COUNT(*) FROM streaming_item_tags s WHERE s.tag_id = t.id AND s.item_type = {}) as item_count \
+             FROM tags t ORDER BY t.name",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    // --- Etiquettes posees sur un objet de STREAMING (#3699) ---
+    //
+    // Meme forme que `streaming_favorites_repo::sql` : la designation est la
+    // PAIRE `source` + `source_id`, jamais un entier, et `created_at` est
+    // rempli par l'expression « maintenant » du moteur plutot que par un
+    // DEFAULT de colonne — la table PostgreSQL creee par `ENSURE_TABLES` n'en
+    // porte pas, et sans cela la valeur serait NULL.
+
+    /// L'instantane d'affichage est ecrit A L'ETIQUETAGE. Un second passage
+    /// sur la meme paire ne cree pas de ligne (la clef primaire EST la paire)
+    /// et ne rafraichit pas l'instantane : ce qui a ete range reste range tel
+    /// qu'on l'avait vu.
+    pub fn tag_streaming_item<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO streaming_item_tags \
+             (tag_id, item_type, source, source_id, title, artist, album, cover_url, created_at) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}) \
+             ON CONFLICT (tag_id, item_type, source, source_id) DO NOTHING",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.now_iso8601(),
+        )
+    }
+
+    pub fn untag_streaming_item<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM streaming_item_tags \
+             WHERE tag_id = {} AND item_type = {} AND source = {} AND source_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+        )
+    }
+
+    /// Toutes les lignes de streaming d'une etiquette a la suppression de
+    /// celle-ci. Il n'y a pas de clef etrangere : le schema PostgreSQL de
+    /// bascule n'en porte aucune, et sur SQLite `PRAGMA foreign_keys` n'est
+    /// pas garanti actif. Le nettoyage est donc EXPLICITE.
+    pub fn untag_streaming_all<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM streaming_item_tags WHERE tag_id = {}",
             d.placeholder(1)
+        )
+    }
+
+    const COLS_STREAMING: &str = "SELECT item_type, source, source_id, title, artist, album, cover_url \
+         FROM streaming_item_tags";
+
+    pub fn streaming_items_by_tag<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{COLS_STREAMING} WHERE tag_id = {} AND item_type = {} ORDER BY created_at DESC, source, source_id",
+            d.placeholder(1),
+            d.placeholder(2),
+        )
+    }
+
+    pub fn all_streaming_items_by_tag<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{COLS_STREAMING} WHERE tag_id = {} ORDER BY item_type, source, source_id",
+            d.placeholder(1),
+        )
+    }
+
+    pub fn tags_for_streaming_item<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT t.id, t.name, t.color FROM tags t \
+             JOIN streaming_item_tags s ON t.id = s.tag_id \
+             WHERE s.item_type = {} AND s.source = {} AND s.source_id = {} ORDER BY t.name",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
         )
     }
 
@@ -208,6 +300,28 @@ pub struct TagWithCount {
     #[serde(flatten)]
     pub tag: Tag,
     pub count: i64,
+}
+
+/// Un objet de STREAMING porteur d'une etiquette (#3699).
+///
+/// Sa designation est la PAIRE `source` + `source_id` — jamais un entier :
+/// un album Qobuz, Tidal ou Bandcamp n'a pas de clef primaire dans la base
+/// locale, c'est tout le sujet du ticket.
+///
+/// Les quatre derniers champs sont l'INSTANTANE pose a l'etiquetage, sur le
+/// modele de [`StreamingFavorite`](super::streaming_favorites_repo). Ils
+/// existent pour que la liste par etiquette se rende SANS interroger le
+/// catalogue : un album de streaming peut disparaitre, et l'ecran doit
+/// continuer de s'afficher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingTagItem {
+    pub item_type: String,
+    pub source: String,
+    pub source_id: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub cover_url: Option<String>,
 }
 
 pub struct TagRepo {
@@ -266,7 +380,19 @@ impl TagRepo {
         Ok(())
     }
 
+    /// Supprime une etiquette — et ses poses de streaming AVEC elle (#3699).
+    ///
+    /// `item_tags` porte une clef etrangere `ON DELETE CASCADE` cote SQLite et
+    /// sur une base PostgreSQL neuve. `streaming_item_tags` n'en porte AUCUNE,
+    /// deliberement : le schema PostgreSQL de bascule n'a pas de contraintes,
+    /// et sur SQLite `PRAGMA foreign_keys` n'est pas garanti actif. Le
+    /// nettoyage est donc explicite, ici, avant la ligne de l'etiquette — sans
+    /// quoi le compte de `/tags` continuerait de compter des poses orphelines
+    /// pour une etiquette qui n'existe plus.
     pub fn delete(&self, id: i64) -> Result<(), String> {
+        let purge = self.dialect_sql(sql::untag_streaming_all, sql::untag_streaming_all);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&purge, &params)?;
         let sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
@@ -349,7 +475,15 @@ impl TagRepo {
     pub fn list_with_counts(&self, item_type: Option<&str>) -> Result<Vec<TagWithCount>, String> {
         let rows = if let Some(itype) = item_type {
             let sql = self.dialect_sql(sql::count_per_tag_by_type, sql::count_per_tag_by_type);
-            let params: [&dyn ToSqlValue; 1] = [&itype];
+            // DEUX liaisons pour UNE valeur. Depuis #3699 la requete compte les
+            // deux espaces d'identifiants, et `item_type` est filtre une fois
+            // dans CHAQUE sous-requete. Sur SQLite le marqueur est `?`, qui
+            // IGNORE l'indice demande : deux marqueurs reclament deux liaisons,
+            // meme quand la valeur est la meme. Avec une seule, la requete
+            // rendait « Wrong number of parameters passed to query. Got 1,
+            // needed 2 » — donc `/api/v1/tags/?item_type=album` rendait une
+            // liste VIDE (`unwrap_or_default`), sans le moindre journal.
+            let params: [&dyn ToSqlValue; 2] = [&itype, &itype];
             self.db.query_many(&sql, &params)?
         } else {
             self.db.query_many(sql::count_per_tag(), &[])?
@@ -418,6 +552,96 @@ impl TagRepo {
             .collect())
     }
 
+    // --- Etiquettes posees sur un objet de STREAMING (#3699) ---
+
+    /// Pose une etiquette sur un objet designe par `source` + `source_id`.
+    ///
+    /// `item_type` passe par le MEME garde-fou que la pose locale : la liste
+    /// fermee `TAGGABLE_ITEM_TYPES`. Un type inconnu ecrirait une ligne
+    /// qu'aucune route de lecture ne nomme — la panne silencieuse que #2256 a
+    /// fermee cote local n'a aucune raison de rouvrir ici.
+    pub fn tag_streaming_item(&self, tag_id: i64, item: &StreamingTagItem) -> Result<(), String> {
+        verifier_item_type(&item.item_type)?;
+        if item.source.trim().is_empty() || item.source_id.trim().is_empty() {
+            return Err(
+                "source et source_id sont obligatoires : un objet de streaming se \
+                 designe par la PAIRE, jamais par l'un des deux seul"
+                    .into(),
+            );
+        }
+        let sql = self.dialect_sql(sql::tag_streaming_item, sql::tag_streaming_item);
+        let item_type = item.item_type.as_str();
+        let source = item.source.as_str();
+        let source_id = item.source_id.as_str();
+        let title = item.title.as_deref();
+        let artist = item.artist.as_deref();
+        let album = item.album.as_deref();
+        let cover_url = item.cover_url.as_deref();
+        let params: [&dyn ToSqlValue; 8] = [
+            &tag_id, &item_type, &source, &source_id, &title, &artist, &album, &cover_url,
+        ];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Retire une etiquette d'un objet de streaming.
+    ///
+    /// **Volontairement sans verification d'`item_type`**, pour la meme raison
+    /// que [`untag_item`](Self::untag_item) : une ligne ecrite avant un
+    /// resserrement de la liste doit rester deracinable.
+    pub fn untag_streaming_item(
+        &self,
+        tag_id: i64,
+        item_type: &str,
+        source: &str,
+        source_id: &str,
+    ) -> Result<(), String> {
+        let sql = self.dialect_sql(sql::untag_streaming_item, sql::untag_streaming_item);
+        let params: [&dyn ToSqlValue; 4] = [&tag_id, &item_type, &source, &source_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Les objets de streaming d'une etiquette, pour un type donne.
+    ///
+    /// Rendus depuis l'INSTANTANE de la table : aucun appel au service. C'est
+    /// la garde du troisieme point du ticket — un `source_id` retire du
+    /// catalogue ne peut ni vider cette liste, ni la faire attendre.
+    pub fn streaming_items_by_tag(
+        &self,
+        tag_id: i64,
+        item_type: &str,
+    ) -> Result<Vec<StreamingTagItem>, String> {
+        let sql = self.dialect_sql(sql::streaming_items_by_tag, sql::streaming_items_by_tag);
+        let params: [&dyn ToSqlValue; 2] = [&tag_id, &item_type];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_streaming_tag_item).collect())
+    }
+
+    /// Tous les objets de streaming d'une etiquette, tous types confondus.
+    pub fn all_streaming_items_by_tag(&self, tag_id: i64) -> Result<Vec<StreamingTagItem>, String> {
+        let sql = self.dialect_sql(
+            sql::all_streaming_items_by_tag,
+            sql::all_streaming_items_by_tag,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&tag_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_streaming_tag_item).collect())
+    }
+
+    /// Les etiquettes posees sur un objet de streaming.
+    pub fn tags_for_streaming_item(
+        &self,
+        item_type: &str,
+        source: &str,
+        source_id: &str,
+    ) -> Result<Vec<Tag>, String> {
+        let sql = self.dialect_sql(sql::tags_for_streaming_item, sql::tags_for_streaming_item);
+        let params: [&dyn ToSqlValue; 3] = [&item_type, &source, &source_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_tag).collect())
+    }
+
     pub fn items_by_all_tags(&self, tag_ids: &[i64], item_type: &str) -> Result<Vec<i64>, String> {
         if tag_ids.is_empty() {
             return Ok(vec![]);
@@ -436,6 +660,18 @@ impl TagRepo {
             .into_iter()
             .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
             .collect())
+    }
+}
+
+fn row_to_streaming_tag_item(cols: &Vec<SqlValue>) -> StreamingTagItem {
+    StreamingTagItem {
+        item_type: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+        source: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        source_id: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+        title: cols.get(3).and_then(|v| v.as_string()),
+        artist: cols.get(4).and_then(|v| v.as_string()),
+        album: cols.get(5).and_then(|v| v.as_string()),
+        cover_url: cols.get(6).and_then(|v| v.as_string()),
     }
 }
 
@@ -728,5 +964,174 @@ mod tests {
         let repo = TagRepo::with_backend(backend);
         let id = repo.create("X", None).unwrap();
         assert!(repo.get(id).unwrap().is_some());
+    }
+
+    // --- Etiquettes posees sur un objet de STREAMING (#3699) ---
+
+    fn base() -> SqliteDb {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        db
+    }
+
+    fn album_qobuz(source_id: &str, titre: &str) -> StreamingTagItem {
+        StreamingTagItem {
+            item_type: "album".into(),
+            source: "qobuz".into(),
+            source_id: source_id.into(),
+            title: Some(titre.into()),
+            artist: Some("Keith Jarrett".into()),
+            album: None,
+            cover_url: Some(format!("https://static.qobuz.com/{source_id}.jpg")),
+        }
+    }
+
+    /// Poser, lire, retirer — dans l'espace du streaming.
+    #[test]
+    fn etiqueter_un_album_de_streaming() {
+        let repo = TagRepo::new(base());
+        let id = repo.create("Nuit", None).unwrap();
+
+        repo.tag_streaming_item(id, &album_qobuz("0060254735368", "The Koln Concert"))
+            .unwrap();
+
+        let items = repo.streaming_items_by_tag(id, "album").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, "qobuz");
+        assert_eq!(items[0].source_id, "0060254735368");
+        // L'instantane est bien la : c'est lui qui rendra la ligne quand le
+        // catalogue ne repondra plus.
+        assert_eq!(items[0].title.as_deref(), Some("The Koln Concert"));
+        assert_eq!(items[0].artist.as_deref(), Some("Keith Jarrett"));
+
+        let tags = repo
+            .tags_for_streaming_item("album", "qobuz", "0060254735368")
+            .unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "Nuit");
+
+        repo.untag_streaming_item(id, "album", "qobuz", "0060254735368")
+            .unwrap();
+        assert!(repo.streaming_items_by_tag(id, "album").unwrap().is_empty());
+    }
+
+    /// Deuxieme point du ticket : **l'unicite porte sur la PAIRE**.
+    ///
+    /// Etiqueter deux fois le meme album Qobuz ne doit pas creer deux lignes.
+    /// Et deux albums de sources DIFFERENTES qui portent le meme `source_id`
+    /// restent deux objets distincts — c'est exactement le piege des
+    /// collections, ou l'identifiant 1 designe deux objets selon l'espace.
+    #[test]
+    fn l_unicite_porte_sur_la_paire_pas_sur_un_entier() {
+        let repo = TagRepo::new(base());
+        let id = repo.create("Nuit", None).unwrap();
+
+        repo.tag_streaming_item(id, &album_qobuz("12345", "Un"))
+            .unwrap();
+        repo.tag_streaming_item(id, &album_qobuz("12345", "Un"))
+            .unwrap();
+        assert_eq!(
+            repo.streaming_items_by_tag(id, "album").unwrap().len(),
+            1,
+            "le meme album Qobuz etiquete deux fois a cree deux lignes"
+        );
+
+        // Meme `source_id`, autre source : un AUTRE objet.
+        let mut tidal = album_qobuz("12345", "Un");
+        tidal.source = "tidal".into();
+        repo.tag_streaming_item(id, &tidal).unwrap();
+        assert_eq!(
+            repo.streaming_items_by_tag(id, "album").unwrap().len(),
+            2,
+            "« qobuz/12345 » et « tidal/12345 » ont ete confondus : \
+             un identifiant seul ne designe rien sans sa source"
+        );
+
+        // Et le meme identifiant dans l'espace LOCAL est encore un troisieme
+        // objet : les deux tables ne se marchent pas dessus.
+        repo.tag_item(id, "album", 12345).unwrap();
+        assert_eq!(repo.items_by_tag(id, "album").unwrap(), vec![12345]);
+        assert_eq!(repo.streaming_items_by_tag(id, "album").unwrap().len(), 2);
+    }
+
+    /// Un `item_type` inconnu est refuse ici AUSSI — le garde-fou de #2256 ne
+    /// doit pas rouvrir par la porte du streaming.
+    #[test]
+    fn item_type_inconnu_refuse_dans_l_espace_du_streaming() {
+        let repo = TagRepo::new(base());
+        let id = repo.create("Nuit", None).unwrap();
+        let mut mauvais = album_qobuz("1", "Un");
+        mauvais.item_type = "albums".into();
+        let err = repo.tag_streaming_item(id, &mauvais).unwrap_err();
+        assert!(err.contains("albums"), "{err}");
+        assert!(
+            repo.streaming_items_by_tag(id, "albums")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Une designation incomplete est refusee : la PAIRE, ou rien.
+    #[test]
+    fn une_source_sans_identifiant_est_refusee() {
+        let repo = TagRepo::new(base());
+        let id = repo.create("Nuit", None).unwrap();
+        let mut sans = album_qobuz("", "Un");
+        assert!(repo.tag_streaming_item(id, &sans).is_err());
+        sans.source_id = "12".into();
+        sans.source = "  ".into();
+        assert!(repo.tag_streaming_item(id, &sans).is_err());
+    }
+
+    /// Le compte annonce par `/tags` porte sur les DEUX espaces.
+    #[test]
+    fn le_compte_porte_sur_les_deux_espaces() {
+        let repo = TagRepo::new(base());
+        let id = repo.create("Nuit", None).unwrap();
+        repo.tag_item(id, "album", 1).unwrap();
+        repo.tag_item(id, "album", 2).unwrap();
+        repo.tag_streaming_item(id, &album_qobuz("12345", "Un"))
+            .unwrap();
+
+        let total = repo.list_with_counts(None).unwrap();
+        assert_eq!(total.len(), 1);
+        assert_eq!(
+            total[0].count, 3,
+            "le compte ignore l'espace du streaming : 2 albums locaux + 1 Qobuz"
+        );
+
+        let par_type = repo.list_with_counts(Some("album")).unwrap();
+        assert_eq!(par_type[0].count, 3);
+        let autres = repo.list_with_counts(Some("artist")).unwrap();
+        assert_eq!(
+            autres[0].count, 0,
+            "une etiquette sans artiste doit rendre 0"
+        );
+    }
+
+    /// Supprimer une etiquette emporte ses poses de streaming.
+    ///
+    /// Il n'y a pas de clef etrangere sur cette table : sans le nettoyage
+    /// explicite de `delete`, les lignes survivraient a l'etiquette et le
+    /// compte d'une etiquette RECREEE sous le meme identifiant repartirait
+    /// faux.
+    #[test]
+    fn supprimer_une_etiquette_emporte_ses_poses_de_streaming() {
+        let db = base();
+        let repo = TagRepo::new(db);
+        let id = repo.create("Nuit", None).unwrap();
+        repo.tag_streaming_item(id, &album_qobuz("12345", "Un"))
+            .unwrap();
+        repo.delete(id).unwrap();
+        assert!(
+            repo.streaming_items_by_tag(id, "album").unwrap().is_empty(),
+            "les poses de streaming ont survecu a la suppression de l'etiquette"
+        );
+        assert!(
+            repo.tags_for_streaming_item("album", "qobuz", "12345")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

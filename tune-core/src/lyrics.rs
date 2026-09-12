@@ -86,6 +86,34 @@ impl LrclibRaw {
     }
 }
 
+/// Position de lecture à utiliser pour choisir la ligne de paroles active,
+/// une fois appliqué le décalage `zones.lyrics_offset_ms` de la zone.
+///
+/// **Implémentation de référence unique** du réglage (#2997) : tout code qui
+/// surligne une ligne de paroles pour une zone doit passer par ici plutôt que
+/// de comparer les horodatages à la position brute.
+///
+/// `offset_ms` positif = paroles **retardées**. Le serveur apprend le titre
+/// avant que l'auditeur ne l'entende (tampon de Tune, puis du renderer), donc
+/// les paroles défilent en avance et il faut les retarder : on recule la
+/// position d'autant, ce qui revient à avancer d'autant l'instant où chaque
+/// ligne devient active. Décalage **par zone**, parce que la profondeur du
+/// tampon appartient à l'appareil ; à ne pas confondre avec `sync_delay_ms`,
+/// qui décale l'AUDIO pour aligner deux pièces.
+///
+/// Deux propriétés dont les appelants dépendent :
+/// - un décalage de **zéro** rend la position inchangée, donc exactement le
+///   comportement d'avant ce réglage ;
+/// - le résultat ne descend jamais sous zéro — une position négative n'existe
+///   pas, et laisserait le début du morceau sans ligne active.
+///
+/// C'est le calcul que le client web tient déjà dans `TvView.svelte`
+/// (`syncPos = max(0, pos - lyricsOffsetMs)`) : cette fonction est la même
+/// règle, côté serveur, pour les surfaces qui connaissent la zone.
+pub fn sync_position_ms(position_ms: i64, offset_ms: i32) -> i64 {
+    position_ms.saturating_sub(offset_ms as i64).max(0)
+}
+
 // ---------------------------------------------------------------------------
 // LRC parser (canonical implementation lives in metadata::lyrics)
 // ---------------------------------------------------------------------------
@@ -109,12 +137,284 @@ pub fn parse_lrc(lrc: &str) -> Vec<LyricLine> {
 // LRCLIB fetch
 // ---------------------------------------------------------------------------
 
+/// Vrai si ce jeton, seul, est une mention de QUALITÉ audio (format, résolution).
+///
+/// Le vocabulaire est volontairement **court et fermé** : c'est lui qui borne
+/// le risque. Un jeton inconnu fait renoncer au nettoyage tout entier
+/// ([`album_sans_mention_de_qualite`]), donc élargir cette liste élargit le
+/// risque de mutiler un titre légitime — « 24 Carat Black », « 24/7 », « 1999 ».
+fn jeton_de_qualite(jeton: &str) -> bool {
+    let j = jeton.to_ascii_lowercase();
+
+    // Conteneurs et familles, en toutes lettres.
+    if matches!(
+        j.as_str(),
+        "sacd"
+            | "dsd"
+            | "dsd64"
+            | "dsd128"
+            | "dsd256"
+            | "dsd512"
+            | "dsf"
+            | "dff"
+            | "mqa"
+            | "flac"
+            | "wav"
+            | "alac"
+            | "aiff"
+            | "hi-res"
+            | "hires"
+            | "hi-rez"
+            | "16bit"
+            | "16bits"
+            | "24bit"
+            | "24bits"
+            | "32bit"
+            | "32bits"
+    ) {
+        return true;
+    }
+
+    // « 96kHz », « 44.1 kHz » réduit à un seul jeton par la découpe.
+    let sans_unite = j
+        .strip_suffix("khz")
+        .map(|s| s.trim_end_matches(' '))
+        .unwrap_or(j.as_str());
+    let unite_vue = sans_unite.len() != j.len();
+    if unite_vue && frequence_plausible(sans_unite) {
+        return true;
+    }
+
+    // « 24/96 », « 24-192 », « 32x384 » : une profondeur ET une fréquence, les
+    // deux plausibles. C'est ce couple qui distingue « 24/96 » de « 24/7 ».
+    let mut morceaux = sans_unite.splitn(2, |c| c == '/' || c == '-' || c == 'x');
+    match (morceaux.next(), morceaux.next()) {
+        (Some(profondeur), Some(frequence)) => {
+            matches!(profondeur, "16" | "24" | "32") && frequence_plausible(frequence)
+        }
+        _ => false,
+    }
+}
+
+/// Vrai si cette chaîne est une fréquence d'échantillonnage courante, en kHz.
+///
+/// Fermée elle aussi, et pour la même raison : c'est elle qui refuse le « 7 »
+/// de « 24/7 ».
+fn frequence_plausible(f: &str) -> bool {
+    matches!(
+        f,
+        "44" | "44.1"
+            | "48"
+            | "88"
+            | "88.2"
+            | "96"
+            | "176"
+            | "176.4"
+            | "192"
+            | "352"
+            | "352.8"
+            | "384"
+    )
+}
+
+/// Vrai si ce jeton est une année civile plausible (1900-2099).
+fn jeton_d_annee(jeton: &str) -> bool {
+    jeton.len() == 4
+        && jeton.bytes().all(|b| b.is_ascii_digit())
+        && matches!(&jeton[..2], "19" | "20")
+}
+
+/// Découpe un segment de fin de titre en jetons.
+///
+/// On coupe sur les espaces et les parenthèses/crochets/virgules, **jamais**
+/// sur `-`, `/` ni `.` : « 24/96 », « 24-96 » et « 44.1 » doivent rester d'un
+/// seul tenant, sinon « 96 » seul deviendrait indistinguable d'un nombre
+/// quelconque.
+fn jetons(segment: &str) -> Vec<&str> {
+    segment
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | ',' | ';'))
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Classement d'un segment de fin de titre.
+enum Segment {
+    /// Tous les jetons sont reconnus, et au moins un est une mention de qualité.
+    Qualite,
+    /// Tous les jetons sont reconnus, mais ce ne sont que des années.
+    AnneeSeule,
+    /// Au moins un jeton n'est pas reconnu : on ne touche à rien.
+    Inconnu,
+}
+
+fn classer(segment: &str) -> Segment {
+    let jetons = jetons(segment);
+    if jetons.is_empty() {
+        return Segment::Inconnu;
+    }
+    let mut qualite_vue = false;
+    for jeton in jetons {
+        if jeton_de_qualite(jeton) {
+            qualite_vue = true;
+        } else if !jeton_d_annee(jeton) {
+            return Segment::Inconnu;
+        }
+    }
+    if qualite_vue {
+        Segment::Qualite
+    } else {
+        Segment::AnneeSeule
+    }
+}
+
+/// Détache le dernier segment d'un titre, sous une des trois formes reconnues,
+/// et rend `(tête, segment)`.
+///
+/// Les trois formes, dans cet ordre : un groupe parenthésé ou crocheté final,
+/// une queue après un tiret entouré d'espaces, un dernier mot.
+fn detacher_le_dernier_segment(titre: &str) -> Option<(&str, &str)> {
+    let t = titre.trim_end();
+    if t.is_empty() {
+        return None;
+    }
+
+    // 1. « … (24-96) », « … [SACD] »
+    let fermante = t.chars().next_back()?;
+    if let Some(ouvrante) = match fermante {
+        ')' => Some('('),
+        ']' => Some('['),
+        _ => None,
+    } {
+        if let Some(i) = t.rfind(ouvrante) {
+            let dedans = &t[i + ouvrante.len_utf8()..t.len() - fermante.len_utf8()];
+            return Some((&t[..i], dedans));
+        }
+        return None;
+    }
+
+    // 2. « … - 24/96 » : le tiret DOIT être précédé d'un espace, sinon
+    //    « Raconte-moi » y laisserait sa dernière syllabe.
+    let mut derniere_coupe = None;
+    for (i, c) in t.char_indices() {
+        if matches!(c, '-' | '\u{2013}' | '\u{2014}')
+            && t[..i].chars().next_back().is_some_and(char::is_whitespace)
+        {
+            derniere_coupe = Some((i, c));
+        }
+    }
+    if let Some((i, c)) = derniere_coupe {
+        return Some((&t[..i], t[i + c.len_utf8()..].trim_start()));
+    }
+
+    // 3. « … 24/96 » — sans tiret ni parenthèse, le testeur en signale aussi.
+    let i = t.rfind(char::is_whitespace)?;
+    Some((&t[..i], t[i..].trim_start()))
+}
+
+/// Retire d'un titre d'album les mentions de qualité que certains testeurs
+/// ajoutent pour distinguer leurs éditions (« Innuendo - 24/96 »,
+/// « Unplugged - SACD(2021) »), afin que LRCLIB puisse retrouver l'album.
+///
+/// **La règle est conservatrice, et le sens de l'erreur est choisi** : rater un
+/// nettoyage est sans conséquence (la recherche échoue comme aujourd'hui),
+/// mutiler un titre légitime en aurait une. Donc :
+///
+/// - on ne retire que des segments de **fin** de titre, jamais du milieu ni du
+///   début — « 24 Carat Black » ressort intact ;
+/// - un segment n'est retiré que si **tous** ses jetons sont reconnus ; un seul
+///   mot inconnu arrête le nettoyage sur-le-champ — « The Wall (Remastered) »
+///   ressort intact ;
+/// - une **année seule** n'est jamais un motif de nettoyage : elle n'est
+///   emportée que si une mention de qualité a été retirée à sa gauche — « 1999 »
+///   et « Unplugged (2021) » ressortent intacts ;
+/// - si le nettoyage vide le titre, on rend le titre d'origine.
+pub fn album_sans_mention_de_qualite(album: &str) -> String {
+    let origine = album.trim();
+    let mut courant = origine;
+    let mut qualite_vue = false;
+
+    while let Some((tete, segment)) = detacher_le_dernier_segment(courant) {
+        if tete.trim().is_empty() {
+            // Le titre entier est la mention : ce n'est pas un suffixe.
+            break;
+        }
+        match classer(segment) {
+            Segment::Inconnu => break,
+            Segment::Qualite => {
+                qualite_vue = true;
+                courant = tete;
+            }
+            Segment::AnneeSeule => courant = tete,
+        }
+    }
+
+    if !qualite_vue {
+        return origine.to_string();
+    }
+    let propre = courant
+        .trim_end_matches(['-', '\u{2013}', '\u{2014}', ' '])
+        .trim();
+    if propre.is_empty() {
+        origine.to_string()
+    } else {
+        propre.to_string()
+    }
+}
+
+/// Titre d'album de REPLI pour une seconde tentative LRCLIB, ou `None`.
+///
+/// `None` veut dire « il n'y a rien à retenter » : pas d'album, ou un titre que
+/// [`album_sans_mention_de_qualite`] laisse inchangé. C'est cette fonction qui
+/// garantit que la requête supplémentaire est **bornée aux titres porteurs
+/// d'une mention de qualité** et n'est jamais payée par les autres.
+pub fn album_de_repli(album_name: Option<&str>) -> Option<String> {
+    let album = album_name.map(str::trim).filter(|a| !a.is_empty())?;
+    let propre = album_sans_mention_de_qualite(album);
+    (propre != album).then_some(propre)
+}
+
 /// Fetch raw lyrics from LRCLIB for a given artist/track/album/duration.
 ///
 /// Returns `Ok(None)` when LRCLIB has no entry (HTTP 404), `Err` on
-/// network/protocol failures. Short 5 s timeout: this is called from an
-/// interactive endpoint and must fail fast.
+/// network/protocol failures.
+///
+/// #3815 — une seconde tentative, et une seule : si le premier appel rend 404
+/// **et** que le titre d'album porte une mention de qualité (« Innuendo -
+/// 24/96 »), on rejoue avec le titre nettoyé. L'ordre compte : le titre tel
+/// quel passe TOUJOURS en premier, donc rien de ce qui marche aujourd'hui ne
+/// peut régresser. Un 429/503 sort par `?` sans rien retenter.
 pub async fn fetch_lrclib_raw(
+    client: &reqwest::Client,
+    artist: &str,
+    track_name: &str,
+    album_name: Option<&str>,
+    duration_secs: Option<i64>,
+) -> Result<Option<LrclibRaw>, String> {
+    let premier = lrclib_get(client, artist, track_name, album_name, duration_secs).await?;
+    if premier.is_some() {
+        return Ok(premier);
+    }
+    match album_de_repli(album_name) {
+        Some(propre) => {
+            debug!(album_nettoye = %propre, "lrclib_retry_album_nettoye");
+            lrclib_get(
+                client,
+                artist,
+                track_name,
+                Some(propre.as_str()),
+                duration_secs,
+            )
+            .await
+        }
+        None => Ok(None),
+    }
+}
+
+/// Un appel à `/api/get`, et rien d'autre.
+///
+/// Short 5 s timeout: this is called from an interactive endpoint and must
+/// fail fast.
+async fn lrclib_get(
     client: &reqwest::Client,
     artist: &str,
     track_name: &str,
@@ -449,6 +749,48 @@ pub async fn get_lyrics(
 mod tests {
     use super::*;
 
+    // ── #2997 : sémantique du décalage de paroles par zone ─────────────────
+
+    #[test]
+    fn decalage_nul_rend_la_position_inchangee() {
+        // TÉMOIN : c'est le cas de toutes les zones existantes. Zéro doit être
+        // l'identité, sinon le correctif déplacerait les paroles de tout le
+        // monde en prétendant ne rien changer.
+        for pos in [0, 1, 12_340, 16_000, 3_600_000] {
+            assert_eq!(sync_position_ms(pos, 0), pos, "position {pos}");
+        }
+    }
+
+    #[test]
+    fn decalage_positif_retarde_les_paroles() {
+        // Positif = paroles retardées : on lit les horodatages comme si l'on
+        // était PLUS TÔT dans le morceau, donc chaque ligne s'active plus tard.
+        assert_eq!(sync_position_ms(16_000, 3_000), 13_000);
+        assert_eq!(sync_position_ms(60_000, 60_000), 0);
+    }
+
+    #[test]
+    fn decalage_negatif_avance_les_paroles() {
+        assert_eq!(sync_position_ms(28_000, -3_000), 31_000);
+    }
+
+    #[test]
+    fn la_position_corrigee_ne_descend_jamais_sous_zero() {
+        // Au tout début d'un morceau, un décalage positif dépasse la position.
+        // Une position négative n'existe pas et laisserait le début du morceau
+        // sans ligne active.
+        assert_eq!(sync_position_ms(1_000, 5_000), 0);
+        assert_eq!(sync_position_ms(0, 60_000), 0);
+    }
+
+    #[test]
+    fn les_bornes_du_reglage_ne_debordent_pas() {
+        // Le réglage est borné à ±60 s par la route ; ces bornes doivent
+        // rester sans surprise même à des positions extrêmes.
+        assert_eq!(sync_position_ms(i64::MAX, -60_000), i64::MAX);
+        assert_eq!(sync_position_ms(i64::MIN, 60_000), 0);
+    }
+
     #[test]
     fn parse_lrc_basic() {
         let lrc = "\
@@ -526,5 +868,102 @@ mod tests {
 
         let missing = LyricsCacheEntry::default();
         assert!(!missing.negative_still_fresh());
+    }
+
+    // ── #3815 : la mention de qualité ne part plus dans /api/get ───────────
+    //
+    // Les témoins vont PAR PAIRES : ce qui doit être nettoyé, et ce qui doit
+    // rester intact. C'est la seconde moitié qui fait la valeur de la règle —
+    // une règle plus large passerait la première liste et casserait la seconde.
+
+    #[test]
+    fn les_trois_exemples_du_testeur_sont_nettoyes() {
+        // TÉMOIN : les trois titres cités mot pour mot par Pierre M (fil 1748).
+        // Si l'un d'eux cesse d'être nettoyé, le ticket n'est plus couvert.
+        assert_eq!(
+            album_sans_mention_de_qualite("Unplugged - SACD(2021)"),
+            "Unplugged"
+        );
+        assert_eq!(
+            album_sans_mention_de_qualite("Innuendo - 24/96"),
+            "Innuendo"
+        );
+        assert_eq!(
+            album_sans_mention_de_qualite("A Kind of Magic - 24/96(1986)"),
+            "A Kind of Magic"
+        );
+    }
+
+    #[test]
+    fn les_formes_voisines_sont_nettoyees_aussi() {
+        // « avec ou sans parenthèse, des tirets,... » — les trois formes de
+        // suffixe que le testeur décrit, et les conteneurs les plus courants.
+        for (sale, propre) in [
+            ("Innuendo (24/96)", "Innuendo"),
+            ("Innuendo [24-96]", "Innuendo"),
+            ("Innuendo 24/192", "Innuendo"),
+            ("Brothers in Arms - SACD", "Brothers in Arms"),
+            ("Brothers in Arms – DSD64", "Brothers in Arms"),
+            ("Love Over Gold - 24/192 (1982)", "Love Over Gold"),
+            ("Kind of Blue (Hi-Res)", "Kind of Blue"),
+            ("Kind of Blue - 96kHz", "Kind of Blue"),
+            ("Kind of Blue - 24bit", "Kind of Blue"),
+            ("Kind of Blue (MQA)", "Kind of Blue"),
+            (
+                "Raconte-moi... (Bonus Edition) - 2010 (24-96)",
+                "Raconte-moi... (Bonus Edition)",
+            ),
+        ] {
+            assert_eq!(album_sans_mention_de_qualite(sale), propre, "« {sale} »");
+        }
+    }
+
+    #[test]
+    fn un_titre_legitime_ressort_intact() {
+        // TÉMOIN INVERSE, et c'est le plus important des deux : une fusion à
+        // tort coûte plus cher qu'un nettoyage manqué. Chacun de ces titres
+        // contient de quoi tromper une règle trop large — un nombre, une
+        // profondeur, une fréquence, une année, un mot d'édition.
+        for intact in [
+            "24 Carat Black",        // la mention est au DÉBUT, pas en suffixe
+            "24/7",                  // « 7 » n'est pas une fréquence
+            "Rock 24/7",             // idem, cette fois EN suffixe
+            "1999",                  // une année seule ne fonde rien
+            "Unplugged (2021)",      // idem, même entre parenthèses
+            "96 Tears",              // un nombre qui n'est pas un suffixe
+            "The Wall (Remastered)", // un mot inconnu arrête tout
+            "Kind of Blue (Legacy Edition)",
+            "Hi-Res Audio Sampler", // la mention est au DÉBUT
+            "SACD",                 // le titre ENTIER est la mention
+            "DSD",
+            "24/96",
+            "Innuendo",
+            "MTV Unplugged in New York",
+            "Sixteen Stone",
+            "Aqualung - 40th Anniversary Edition",
+        ] {
+            assert_eq!(
+                album_sans_mention_de_qualite(intact),
+                intact,
+                "« {intact} » ne doit PAS être touché"
+            );
+        }
+    }
+
+    #[test]
+    fn le_repli_n_existe_que_si_le_nettoyage_change_quelque_chose() {
+        // TÉMOIN : c'est lui qui borne le COÛT. `None` = pas de seconde
+        // requête. Si un titre sans mention de qualité rendait `Some`, chaque
+        // échec LRCLIB paierait un appel de plus — sur une passe de fond,
+        // le double du trafic vers un service communautaire sans clef d'API.
+        assert_eq!(album_de_repli(None), None);
+        assert_eq!(album_de_repli(Some("")), None);
+        assert_eq!(album_de_repli(Some("   ")), None);
+        assert_eq!(album_de_repli(Some("Innuendo")), None);
+        assert_eq!(album_de_repli(Some("The Wall (Remastered)")), None);
+        assert_eq!(
+            album_de_repli(Some("Innuendo - 24/96")),
+            Some("Innuendo".to_string())
+        );
     }
 }

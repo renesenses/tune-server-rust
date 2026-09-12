@@ -757,6 +757,58 @@ impl TidalService {
         resp.json().await.map_err(|e| format!("tidal json: {e}"))
     }
 
+    /// Les favoris d'un type, **enveloppes comprises** (#3489).
+    ///
+    /// Tidal ne sert pas l'objet nu : chaque entrée de
+    /// `/users/{id}/favorites/{type}` est une enveloppe
+    /// `{"created": "…", "item": {…}}`. Les trois lecteurs typés faisaient
+    /// `item.get("item")` et jetaient l'enveloppe — donc la date — sans que
+    /// rien ne le dise. La donnée que réclamait #3489 était déjà dans la
+    /// réponse ; c'est le parseur qui la perdait.
+    ///
+    /// Un seul point de lecture pour deux projections : la liste typée, et la
+    /// liste sérialisée datée que sert la route des favoris.
+    async fn favoris_bruts(&self, type_tidal: &str) -> Result<Vec<serde_json::Value>, TuneError> {
+        let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
+        let data = self
+            .api_get(&format!(
+                "/users/{user_id}/favorites/{type_tidal}?limit=100"
+            ))
+            .await?;
+        Ok(data["items"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// La clé sous laquelle Tidal date la mise en favori — sur l'ENVELOPPE,
+    /// pas sur l'objet.
+    const CLES_DATE_FAVORI: &[&str] = &["created"];
+
+    /// UNE enveloppe de favori, sérialisée avec sa date (#3489).
+    ///
+    /// Fonction pure : c'est ici que se joue le correctif — que la date se lise
+    /// sur l'enveloppe et non sur l'objet qu'elle contient —, et une fonction
+    /// pure se met sous garde sans serveur simulé. Lire `created` sur
+    /// `enveloppe["item"]` rendrait une liste entière sans une seule date, et
+    /// le tri resterait aussi inerte qu'avant le correctif : les essais de ce
+    /// fichier le disent en rouge.
+    ///
+    /// `None` quand l'enveloppe ne contient pas d'objet : c'est déjà ce que
+    /// faisaient les trois lecteurs typés (`filter_map`).
+    fn favori_date(enveloppe: &serde_json::Value, fav_type: &str) -> Option<serde_json::Value> {
+        let brut = enveloppe.get("item")?;
+        let mut element = match fav_type {
+            "tracks" => serde_json::to_value(Self::map_track(brut)),
+            "albums" => serde_json::to_value(Self::map_album(brut)),
+            _ => serde_json::to_value(Self::map_artist(brut)),
+        }
+        .ok()?;
+        crate::streaming::favorites_date::greffer_created_at(
+            &mut element,
+            enveloppe,
+            Self::CLES_DATE_FAVORI,
+        );
+        Some(element)
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let tags = item["mediaMetadata"]["tags"].as_array();
         let is_hires = tags
@@ -1453,9 +1505,14 @@ impl StreamingService for TidalService {
         track_id: &str,
         quality: Option<&str>,
     ) -> Result<StreamUrl, TuneError> {
+        let requested_quality = quality.unwrap_or(self.quality.as_str());
+        // A signed URL is only reusable for the quality it was resolved at.
+        // Keying on the track alone made a prior `max` play silently defeat a
+        // later per-zone `cd`/`low` selection (and vice versa).
+        let cache_key = format!("{track_id}:{requested_quality}");
         {
             let cache = self.url_cache.lock().await;
-            if let Some(cached) = cache.get(track_id) {
+            if let Some(cached) = cache.get(&cache_key) {
                 // A cached DASH `file://` entry becomes stale once the temp file
                 // is consumed and deleted after playback. Serving it again makes
                 // the transcode open a missing/empty file (os error 2) and the
@@ -1487,8 +1544,6 @@ impl StreamingService for TidalService {
                 );
             }
         }
-
-        let requested_quality = quality.unwrap_or(self.quality.as_str());
 
         // Quality fallback cascade: HI_RES_LOSSLESS → HI_RES → LOSSLESS → HIGH
         // Try the highest quality first, fall back only on API errors or
@@ -1769,7 +1824,7 @@ impl StreamingService for TidalService {
         {
             let mut cache = self.url_cache.lock().await;
             cache.set(
-                track_id.to_string(),
+                cache_key,
                 CachedUrl {
                     url: url.clone(),
                     mime_type: mime_type.to_string(),
@@ -1941,20 +1996,33 @@ impl StreamingService for TidalService {
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
-        let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
-        let data = self
-            .api_get(&format!("/users/{user_id}/favorites/tracks?limit=100"))
-            .await?;
-        let tracks = data["items"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("item").map(Self::map_track))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(tracks)
+        let enveloppes = self.favoris_bruts("tracks").await?;
+        Ok(enveloppes
+            .iter()
+            .filter_map(|e| e.get("item").map(Self::map_track))
+            .collect())
+    }
+
+    /// #3489 — la date de mise en favori, que Tidal porte dans l'enveloppe
+    /// sous `created` et que les lecteurs typés jetaient avec elle.
+    ///
+    /// Les playlists retombent sur `None` : `get_user_playlists` lit
+    /// `/users/{id}/playlists`, qui n'est pas une liste de favoris et dont
+    /// aucune date de mise en favori n'a été établie.
+    async fn get_user_favorites_dated(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        let enveloppes = match fav_type {
+            "tracks" | "albums" | "artists" => self.favoris_bruts(fav_type).await?,
+            _ => return Ok(None),
+        };
+        Ok(Some(
+            enveloppes
+                .iter()
+                .filter_map(|e| Self::favori_date(e, fav_type))
+                .collect(),
+        ))
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
@@ -2057,39 +2125,19 @@ impl StreamingService for TidalService {
     }
 
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
-        // Use stored user_id instead of /users/me
-        let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
-        let data = self
-            .api_get(&format!("/users/{user_id}/favorites/albums?limit=100"))
-            .await?;
-        let albums = data["items"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("item").map(Self::map_album))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(albums)
+        let enveloppes = self.favoris_bruts("albums").await?;
+        Ok(enveloppes
+            .iter()
+            .filter_map(|e| e.get("item").map(Self::map_album))
+            .collect())
     }
 
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
-        // Use stored user_id instead of /users/me
-        let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
-        let data = self
-            .api_get(&format!("/users/{user_id}/favorites/artists?limit=100"))
-            .await?;
-        let artists = data["items"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("item").map(Self::map_artist))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(artists)
+        let enveloppes = self.favoris_bruts("artists").await?;
+        Ok(enveloppes
+            .iter()
+            .filter_map(|e| e.get("item").map(Self::map_artist))
+            .collect())
     }
 
     async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
@@ -3591,5 +3639,51 @@ mod tests {
             resolve_tidal_url("/mediatracks/abc/0.flac"),
             "https://sp-pr-cf.audio.tidal.com/mediatracks/abc/0.flac"
         );
+    }
+
+    /// #3489 — la date de Tidal est sur l'ENVELOPPE, et les trois lecteurs
+    /// typés la jetaient en faisant `item.get("item")`. La donnée était déjà
+    /// dans la réponse ; c'est le parseur qui la perdait.
+    ///
+    /// Contre-épreuve : faites lire la date sur `enveloppe["item"]` au lieu de
+    /// l'enveloppe, et cet essai passe au rouge — comme la liste entière, qui
+    /// ressortirait alors sans une seule date.
+    #[test]
+    fn favori_date_lit_la_date_sur_l_enveloppe() {
+        let enveloppe = json!({
+            "created": "2019-04-18T09:53:31.000+0000",
+            "item": {
+                "id": 789,
+                "title": "Kind of Blue",
+                "artist": {"name": "Miles Davis", "id": 42},
+                "numberOfTracks": 5,
+            },
+        });
+        let element = TidalService::favori_date(&enveloppe, "albums").expect("un album");
+        assert_eq!(element["source_id"], json!("789"));
+        assert_eq!(element["title"], json!("Kind of Blue"));
+        assert_eq!(
+            element["created_at"],
+            json!("2019-04-18T09:53:31Z"),
+            "la date de l'enveloppe doit atteindre le client"
+        );
+    }
+
+    /// Une enveloppe sans objet est ignorée — exactement ce que faisait déjà
+    /// le `filter_map` des lecteurs typés.
+    #[test]
+    fn une_enveloppe_sans_objet_est_ignoree() {
+        let enveloppe = json!({"created": "2019-04-18T09:53:31.000+0000"});
+        assert!(TidalService::favori_date(&enveloppe, "albums").is_none());
+    }
+
+    /// Un favori que Tidal n'a pas daté sort sans la clé, et garde tout le
+    /// reste de son contrat.
+    #[test]
+    fn favori_date_sans_date_garde_le_contrat() {
+        let enveloppe = json!({"item": {"id": 42, "name": "Miles Davis"}});
+        let element = TidalService::favori_date(&enveloppe, "artists").expect("un artiste");
+        assert!(element.get("created_at").is_none());
+        assert_eq!(element["name"], json!("Miles Davis"));
     }
 }

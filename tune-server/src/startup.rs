@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use tune_core::outputs::oh_events::OpenHomeEventListener;
+use tune_core::outputs::oh_events::UpnpEventListener;
 
 use crate::config::TuneConfig;
 use crate::state::AppState;
@@ -231,6 +231,10 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // last_update_result the UI can show. Catches a silent Windows bat-swap
     // failure (came back on the old binary) instead of it looking like a no-op.
     crate::routes::system::update::record_post_update_result(state);
+    // #2266 — retenir la version qui tournait avant celle-ci, pour que l'ecran
+    // puisse nommer ce a quoi revenir. Independant de `record_post_update_result`,
+    // qui rend la main tot sur les chemins d'echec : voir `noter_la_version_vue`.
+    crate::routes::system::update::noter_la_version_vue(state);
 
     // Warm the ASIO device cache once at boot, while the audio devices are still
     // idle. An ASIO driver — notably SOtM Diretta — can't be re-enumerated once a
@@ -251,6 +255,11 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     ouvrir_le_registre_des_executions(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
+    // #3688 — les zones qui sont notre PROPRE facade MediaRenderer revenue
+    // par SSDP. Apres `ensure_zones_is_hidden` (la colonne doit exister) et,
+    // comme le dedoublonnage juste au-dessus, AVANT que la moindre tache de
+    // decouverte ne demarre.
+    masquer_les_zones_reflet(state);
     cleanup_orphan_queues(state);
     reconcile_favorites(state);
     deduplicate_radios(state);
@@ -310,9 +319,14 @@ fn reset_zones_offline(state: &AppState) {
 /// Réglages d'avancement d'enrichissement dont l'état « en cours » est écrit en
 /// base. Chacun ne connaît que deux écritures : `running` au lancement et à
 /// chaque jalon, `done` à la fin NORMALE de la boucle.
-const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 3] = [
+const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 4] = [
     "enrich_all_status",
     "artist_artwork_enrich_result",
+    // Passe « crédits MusicBrainz » (#2799). Elle dure des heures sur une
+    // grosse bibliothèque à 1 req/s : un arrêt en cours de route est le cas
+    // NORMAL, pas l'exception. Sans cette ligne, `running` resterait en base
+    // pour toujours — le défaut #2002, à l'identique.
+    crate::routes::library::credits_mb::REGLAGE_AVANCEMENT_CREDITS,
     // Passe de fond « paroles » (#2172) : sans cette ligne, un arrêt en cours
     // de passe laisserait `status: "running"` en base pour toujours et le
     // bouton de relance grisé — exactement le défaut #2002. La constante
@@ -341,7 +355,12 @@ const DRAPEAUX_AVANCEMENT_ENRICHISSEMENT: [&str; 2] =
 /// ⚠️ Les compteurs sont CONSERVÉS. « Interrompu à 5 650 / 16 261 » se
 /// comprend ; un réglage effacé ne dirait plus rien du tout, et l'utilisateur
 /// ne saurait pas où sa passe s'est arrêtée.
-fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
+/// `pub(crate)` parce que le démarrage n'est plus le seul déclencheur : la fin
+/// d'une passe d'images d'artistes qui s'est arrêtée sans écrire son `done`
+/// applique la MÊME réécriture, tout de suite, sans attendre un redémarrage
+/// (`routes::library::artwork::FinDePasseArtistes`, #2073). Deux règles
+/// séparées auraient divergé au premier champ neutralisé.
+pub(crate) fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
     let mut valeur = match serde_json::from_str::<serde_json::Value>(brut) {
         Ok(v) => v,
         Err(_) => {
@@ -484,6 +503,164 @@ fn deduplicate_zones(state: &AppState) {
     ) {
         tracing::warn!(error = %e, "zone_unique_index_failed");
     }
+}
+
+/// Les façades MediaRenderer que NOUS publions, et la zone qui porte chacune.
+///
+/// La clé `upnp_renderer_udn_{K}` est posée par `renderer_udn`
+/// (`routes/upnp_media_renderer.rs:110`) la première fois que la zone `K` est
+/// annoncée en MediaRenderer, et elle ne bouge plus ensuite — c'est tout
+/// l'objet de #1719 : un UDN qui changerait à chaque démarrage casserait
+/// l'appairage des points de contrôle.
+///
+/// Le suffixe de la clé est donc l'identifiant de la zone **propriétaire** de
+/// la façade. C'est lui qu'il faut ici, et c'est pour cela que cette lecture ne
+/// réutilise pas `discovery_setup::nos_udn_de_facade`, qui ne rend que
+/// les valeurs : sans le propriétaire, on ne peut pas distinguer un reflet
+/// d'une zone qui porterait sa propre façade.
+///
+/// Le suffixe est exigé **entier**, en `i64`. Un `starts_with` seul accepterait
+/// une clé hors convention (`upnp_renderer_udn_default`, une clé future) dont
+/// la valeur ne désigne aucune zone : le rapprochement plus bas masquerait
+/// alors une vraie sortie en se réclamant d'un propriétaire qui n'existe pas.
+fn nos_facades_par_zone(db: &Arc<dyn tune_core::db::backend::DbBackend>) -> Vec<(i64, String)> {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .all()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(cle, valeur)| {
+            let proprietaire: i64 = cle.strip_prefix("upnp_renderer_udn_")?.parse().ok()?;
+            let valeur = valeur.trim().to_string();
+            (!valeur.is_empty()).then_some((proprietaire, valeur))
+        })
+        .collect()
+}
+
+/// #3688 — reprendre les zones qui sont NOTRE PROPRE reflet.
+///
+/// ## Le mécanisme
+///
+/// Tune publie chaque zone opt-in en MediaRenderer UPnP sous le nom
+/// `« {zone} (Tune) »` (`routes/upnp_media_renderer.rs:153`), sur le même
+/// groupe multicast que les appareils du réseau. Son propre écouteur SSDP
+/// reçoit cette annonce. Deux rideaux la reconnaissent aujourd'hui —
+/// `est_notre_propre_renderer` (#2101, #2202, par l'adresse) et
+/// `est_un_de_nos_udn_de_facade` (#2410, par l'UDN), tous deux dans
+/// `discovery_setup::handle_ssdp_discovered`. **Ils empêchent la création d'une
+/// zone de plus ; ils ne défont pas celles qui sont déjà en base.**
+///
+/// Or elles y sont : chez trois testeurs, jusqu'à quatre générations du même
+/// appareil, chacune avec un `(Tune)` de plus. Et le rideau par UDN est récent
+/// (#2410) — tout ce qui a été créé avant lui est resté.
+///
+/// ## L'identité, et pourquoi elle tranche sans ambiguïté
+///
+/// L'identité d'une zone est `zones.output_device_id`, sous index unique
+/// partiel (`idx_zones_output_device_id`, posé par [`deduplicate_zones`]). Une
+/// zone née de notre propre façade porte donc, comme identité, **exactement**
+/// l'UDN que nous avons tiré au sort pour cette façade et rangé dans
+/// `upnp_renderer_udn_{K}`. Le rapprochement est une égalité de chaînes entre
+/// deux valeurs que nous écrivons nous-mêmes : il ne devine rien.
+///
+/// ## Mesuré, sur des données réelles, avant d'être écrit
+///
+/// Relevé du 09/09/2026 sur `tune_v2.db` du serveur de pré-production (« le
+/// .18 »), 21 zones :
+///
+/// ```text
+/// collisions sur output_device_id ......................... 0
+/// clés upnp_renderer_udn_* ................................ 1
+///   upnp_renderer_udn_10 = uuid:558dcf82-5868-4126-951a-570149376da6
+/// zones dont output_device_id est l'une de nos façades .... 1
+///   zone 16 « Eversolo DMP-A8 (Tune) » (dlna) ← upnp_renderer_udn_10
+/// ```
+///
+/// Un seul reflet, et **aucun faux positif** : la zone 14
+/// « ASUS PB238 (Tune) » porte le même suffixe `(Tune)` mais l'UDN
+/// `uuid:aef5e377-…`, qui n'est dans aucune de nos clés — c'est la façade d'un
+/// **autre** Tune du réseau (192.168.1.42), une sortie parfaitement pilotable
+/// qui doit rester. C'est nous qu'il faut exclure, pas nos semblables : filtrer
+/// sur le nom aurait emporté les deux.
+///
+/// ## Masquer, et non supprimer
+///
+/// [`tune_core::db::zone_repo::ZoneRepo::delete`] pose `is_hidden = 1`. C'est
+/// ce qu'il faut : la ligne garde son `output_device_id`, donc
+/// `is_device_hidden` reconnaît l'UDN au tour de découverte suivant et
+/// `get_or_create` rend la zone masquée **telle quelle** au lieu d'en créer une
+/// neuve. Une suppression dure libérerait l'identité et laisserait le reflet
+/// renaître au premier cycle. Rien n'est perdu : la ligne, sa file et ses
+/// réglages restent, et `POST /zones/{id}/unhide` les rend.
+///
+/// ## Ce que cette passe ne fait PAS
+///
+/// - Elle ne touche pas à `upnp_renderer_udn_{K}`. Cette clé est ce qui permet
+///   de reconnaître le reflet ; la purger — la « fuite adjacente » relevée sur
+///   #3687 — rendrait les reflets déjà persistés **définitivement**
+///   méconnaissables. Seule `zone_{id}_upnp_renderer` serait sans risque, et
+///   elle n'est pas le sujet ici.
+/// - Elle ne rend pas `format!("{} (Tune)", …)` idempotent. #3688 le dit :
+///   masquer le suffixe sans couper la boucle est *pire*, parce qu'on perd la
+///   trace lisible. La boucle est coupée par les deux rideaux ; le suffixe
+///   reste le témoin de ce qui a existé.
+/// - Elle ne fusionne rien : les doublons d'un même appareil sous deux UDN
+///   différents (Sonos `_MR` / racine / `_MS`, ré-ancrage AirPlay IP → MAC)
+///   sont un autre dossier, avec un autre mécanisme et un autre propriétaire.
+///
+/// Rend le nombre de zones masquées.
+fn masquer_les_zones_reflet(state: &AppState) -> usize {
+    let facades = nos_facades_par_zone(&state.backend);
+    if facades.is_empty() {
+        return 0;
+    }
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let zones = match zone_repo.list() {
+        Ok(z) => z,
+        Err(e) => {
+            warn!(error = %e, "zones_reflet_lecture_echouee");
+            return 0;
+        }
+    };
+    let mut masquees = 0usize;
+    for zone in zones {
+        let (Some(zid), Some(device_id)) = (zone.id, zone.output_device_id.as_deref()) else {
+            continue;
+        };
+        let Some(proprietaire) = facades
+            .iter()
+            .find(|(_, udn)| udn == device_id)
+            .map(|(k, _)| *k)
+        else {
+            continue;
+        };
+        // Auto-référence : la zone porte SA PROPRE façade comme identité. La
+        // masquer coûterait une vraie sortie, et rien n'établit qu'un tel cas
+        // existe — il n'y en a aucun sur le relevé du .18. On le dit, on n'y
+        // touche pas.
+        if proprietaire == zid {
+            warn!(
+                zone_id = zid,
+                name = %zone.name,
+                device_id = %device_id,
+                "zone_reflet_auto_reference_conservee"
+            );
+            continue;
+        }
+        match zone_repo.delete(zid) {
+            Ok(()) => {
+                masquees += 1;
+                info!(
+                    zone_id = zid,
+                    name = %zone.name,
+                    device_id = %device_id,
+                    zone_source = proprietaire,
+                    "zone_reflet_masquee"
+                );
+            }
+            Err(e) => warn!(zone_id = zid, error = %e, "zone_reflet_masquage_echoue"),
+        }
+    }
+    masquees
 }
 
 /// Re-rattache les favoris orphelins aux items vivants retrouvés par identité
@@ -665,14 +842,22 @@ async fn restore_queue_metadata(state: &AppState, config: &TuneConfig) {
     for snap in &snapshots {
         let zone_id = snap.zone_id;
 
-        // Determine queue length from DB (authoritative after restore_all_queues).
-        let local_count = queue_repo.count(zone_id).unwrap_or(0);
-        let streaming_count = queue_repo.count_streaming(zone_id).unwrap_or(0);
-        let queue_len = if local_count > 0 {
-            local_count
-        } else {
-            streaming_count
-        };
+        // Longueur de la file lue en base (autoritaire apres restore_all_queues).
+        //
+        // 🔴 #2055 — `if local > 0 { local } else { streaming }` etait le
+        // dernier reste de l'ancienne regle « un seul type de file active par
+        // zone ». Depuis la migration 53 la file est UNE suite de positions
+        // 0..N-1 ou lignes locales et lignes de service se melangent :
+        // l'autoplay du sondeur ajoute des pistes de service derriere l'album
+        // en cours. Sur une telle file, cette formule ne comptait que l'album,
+        // et les pistes ajoutees redevenaient injoignables au premier
+        // redemarrage — le sondeur concluait « file terminee » a la fin de
+        // l'album.
+        //
+        // `count_all`, la meme source que `Orchestrator::play_from_queue` :
+        // c'est lui qui RESOUT la position que `next_position` calcule a
+        // partir de cette longueur. Les deux doivent compter les memes lignes.
+        let queue_len = queue_repo.count_all(zone_id).unwrap_or(0);
 
         if queue_len > 0 {
             state
@@ -776,7 +961,7 @@ async fn restore_zone_volumes(state: &AppState) {
     if let Ok(zones) = zone_repo.list() {
         for zone in &zones {
             if let Some(id) = zone.id {
-                let vol = (zone.volume as f64) / 100.0;
+                let vol = zone.volume / 100.0;
                 if zone.fixed_volume {
                     // Contrat « Volume fixe (bit-perfect) » : 100 % est un
                     // ENGAGEMENT, pas un oubli — le DoP meurt au moindre gain
@@ -865,7 +1050,7 @@ async fn restore_oaat_groups(state: &AppState) {
         .ok()
         .flatten()
         .unwrap_or_else(|| "[]".into());
-    let mut groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
+    let groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
 
     let mut restored = 0usize;
     let mut to_probe: Vec<(String, String, Vec<(String, u16)>)> = Vec::new();
@@ -984,16 +1169,109 @@ async fn restore_oaat_groups(state: &AppState) {
 #[cfg(not(feature = "oaat"))]
 async fn restore_oaat_groups(_state: &AppState) {}
 
-/// Create the OpenHome event listener (shared between SSDP handler and outputs).
-pub async fn create_oh_listener() -> Option<Arc<OpenHomeEventListener>> {
-    let server_ip = tune_core::discovery::ssdp::get_local_ip()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "127.0.0.1".into());
-    match OpenHomeEventListener::new(server_ip).await {
-        Ok(l) => Some(Arc::new(l)),
-        Err(e) => {
-            tracing::warn!(error = %e, "oh_event_listener_init_failed");
-            None
+/// LE récepteur GENA du processus. Créé une seule fois, quel que soit l'appelant.
+///
+/// La mémoïsation n'est pas un raffinement : elle lève l'obstacle qui privait
+/// d'évènements tout renderer récupéré au redémarrage (#1126). Ce chemin-là
+/// n'atteignait pas le récepteur du gestionnaire SSDP depuis `AppState`, et en
+/// créer un second aurait couru contre lui pour le port fixe 8890 —
+/// [`UpnpEventListener::new`] retombant alors sur un port éphémère, au
+/// détriment du premier. Une cellule unique rend le même récepteur aux deux, et
+/// la course disparaît au lieu d'être contournée (#2263).
+static RECEPTEUR_EVENEMENTS: tokio::sync::OnceCell<Option<Arc<UpnpEventListener>>> =
+    tokio::sync::OnceCell::const_new();
+
+/// Create the UPnP (GENA) event listener, shared between the SSDP handler,
+/// the restart-recovery path and the outputs. Idempotent.
+pub async fn create_oh_listener() -> Option<Arc<UpnpEventListener>> {
+    RECEPTEUR_EVENEMENTS
+        .get_or_init(|| async {
+            let server_ip = tune_core::discovery::ssdp::get_local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            match UpnpEventListener::new(server_ip).await {
+                Ok(l) => Some(Arc::new(l)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "oh_event_listener_init_failed");
+                    None
+                }
+            }
+        })
+        .await
+        .clone()
+}
+
+/// Pourquoi un dossier propose par la configuration n'entre pas en base au
+/// PREMIER demarrage. Le motif est journalise : l'utilisateur qui ne voit rien
+/// arriver doit pouvoir lire pourquoi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MotifEcart {
+    Absent,
+    PasUnDossier,
+    Illisible,
+    Vide,
+}
+
+impl MotifEcart {
+    fn code(self) -> &'static str {
+        match self {
+            MotifEcart::Absent => "absent",
+            MotifEcart::PasUnDossier => "pas_un_dossier",
+            MotifEcart::Illisible => "illisible",
+            MotifEcart::Vide => "vide",
+        }
+    }
+}
+
+/// Ce dossier merite-t-il d'etre SEME comme bibliotheque au premier demarrage ?
+///
+/// #3686. L'image Docker impose `TUNE_MUSIC_DIRS='["/music"]'` **et**
+/// `TUNE_AUTO_SCAN=true`, et son `VOLUME ["/music"]` fait fabriquer par Docker
+/// un volume anonyme VIDE quand l'utilisateur ne monte rien dessus. Le dossier
+/// existe donc toujours, il est toujours scannable, et a chaque recreation de
+/// conteneur sans `/data` persistant la base repart neuve : `already_set` est
+/// faux, `["/music"]` est seme, et le scan part dans la foulee sur ce que la
+/// base vient de dire. Johannes Henke (Synology DS224+, fil 1615) voit « le
+/// scan partir aussitot sur le mauvais dossier » et demande, sans reponse
+/// pendant quatre jours, comment partir sans dossier du tout.
+///
+/// `/music` n'est pas un choix de l'utilisateur, c'est un defaut d'image ; le
+/// semer en base le rend indiscernable d'un choix delibere. On ne seme donc que
+/// ce qui a une chance d'etre une bibliotheque.
+///
+/// La garde d'existence n'est pas inventee ici : c'est exactement celle que
+/// `POST /system/config/music-dirs` applique deja depuis l'interface
+/// (`routes/system/config.rs`, `add_music_dir` : `!path.exists()` →
+/// « directory does not exist », `!path.is_dir()` → « path is not a
+/// directory »). Le chemin de l'interface la subissait, le chemin
+/// environnement/Docker ne la subissait pas.
+///
+/// ⚠️ Le critere « vide » s'entend au sens strict : **pas la moindre entree**.
+/// Un dossier qui contient des fichiers non audio est retenu — c'est peut-etre
+/// une bibliotheque dont le scan dira ce qu'il trouve. Un dossier sans aucune
+/// entree, lui, est la signature d'un volume anonyme.
+///
+/// ⚠️ Ce test ne s'applique QU'AU SEMIS du premier demarrage. Il ne retire
+/// jamais un dossier deja en base, et il ne touche pas au scanner : la regle
+/// de #2356 — « une racine injoignable est TOUJOURS retenue », pour qu'elle
+/// atteigne `missing_dirs` et protege la purge — vit dans
+/// `tune-core/src/scanner/walker.rs` et n'est pas concernee.
+pub(crate) fn dossier_semable(chemin: &str) -> Result<(), MotifEcart> {
+    let p = std::path::Path::new(chemin);
+    if !p.exists() {
+        return Err(MotifEcart::Absent);
+    }
+    if !p.is_dir() {
+        return Err(MotifEcart::PasUnDossier);
+    }
+    match std::fs::read_dir(p) {
+        Err(_) => Err(MotifEcart::Illisible),
+        Ok(mut entrees) => {
+            if entrees.next().is_none() {
+                Err(MotifEcart::Vide)
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -1018,12 +1296,33 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
                 .map(|d| tune_core::scanner::walker::normalize_path(d))
                 .filter(|d| !d.is_empty())
                 .collect();
-            settings
-                .set(
-                    "music_dirs",
-                    &serde_json::to_string(&normalized_dirs).unwrap(),
-                )
-                .ok();
+            // #3686 — on ne seme pas un dossier que l'image a invente.
+            let mut retenus: Vec<String> = Vec::new();
+            for d in normalized_dirs {
+                match dossier_semable(&d) {
+                    Ok(()) => retenus.push(d),
+                    Err(motif) => tracing::info!(
+                        dossier = %d,
+                        motif = motif.code(),
+                        "music_dirs_semis_dossier_ecarte"
+                    ),
+                }
+            }
+            // ⚠️ Ne RIEN ecrire quand il ne reste rien — surtout pas « [] ».
+            // Le commentaire de `image/build-sunxi-image.sh` decrit le piege
+            // mot pour mot : une liste vide persistee est ensuite traitee par
+            // `already_set` comme un choix DELIBERE, l'image ne scanne plus
+            // jamais rien, et aucune edition ulterieure du fichier n'y change
+            // quoi que ce soit. Clef absente, l'utilisateur garde la main : le
+            // scan automatique sort proprement sur `auto_scan_skipped_no_dirs`
+            // et l'ecran Reglages attend qu'on lui dise ou est la musique.
+            if retenus.is_empty() {
+                tracing::info!("music_dirs_semis_ignore_aucun_dossier_utilisable");
+            } else {
+                settings
+                    .set("music_dirs", &serde_json::to_string(&retenus).unwrap())
+                    .ok();
+            }
         }
     }
 
@@ -1115,11 +1414,11 @@ async fn resolve_ytdlp(state: &AppState) {
 /// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
 /// fonctionnalités.
 #[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
-fn seed_volume_for(zone_volume: i32, fixed_volume: bool) -> f64 {
+fn seed_volume_for(zone_volume: f64, fixed_volume: bool) -> f64 {
     if fixed_volume {
         1.0
     } else {
-        (zone_volume as f64 / 100.0).clamp(0.0, 1.0)
+        (zone_volume / 100.0).clamp(0.0, 1.0)
     }
 }
 
@@ -1170,7 +1469,15 @@ pub async fn register_local_outputs(state: &AppState) {
     // Prefer DB-persisted backend (set via UI) over config/env default
     let audio_backend_owned = state.effective_audio_backend();
     let audio_backend = &audio_backend_owned;
-    let exclusive_mode = state.effective_exclusive_mode();
+    // #3245 — le mode exclusif se décide PAR PÉRIPHÉRIQUE, dans la boucle.
+    //
+    // Ce qui est lu ici, c'est la DEMANDE : la contrainte de plateforme, elle,
+    // dépend du backend sous lequel CHAQUE sortie sera ouverte, et ce backend
+    // n'est pas le réglage global (`openable_local_backend`, #1770). Calculer
+    // `effective_exclusive_mode()` une fois puis le passer identique à chaque
+    // `LocalOutput` faisait déborder « ASIO est exclusif par nature » sur des
+    // sorties qui ne sont pas ASIO.
+    let exclusive_demande = state.requested_exclusive_mode();
     // Publish it: this is the value the outputs below are built with, and the
     // only honest answer for the signal path until the next restart.
     if let Ok(mut slot) = state.active_audio_backend.write() {
@@ -1232,13 +1539,69 @@ pub async fn register_local_outputs(state: &AppState) {
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-        let auto_create =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                .get("zone_auto_create")
-                .ok()
-                .flatten()
-                .map(|v| v != "false")
-                .unwrap_or(true);
+        // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
+        // créer quoi que ce soit.
+        //
+        // Une zone locale est identifiée par `local:{nom}`. Quand le pilote
+        // renomme l'endpoint — Windows le fait au changement de taux
+        // d'échantillonnage — la boucle ci-dessous ne reconnaît plus
+        // `local:{nouveau nom}` et offre à l'appareil une zone NEUVE, à côté
+        // de l'ancienne restée orpheline avec tous ses réglages. Cette passe
+        // fait suivre la zone à son appareil, par l'identifiant d'endpoint
+        // stable qu'elle a enregistré.
+        //
+        // La RÈGLE est ailleurs — `outputs::identite_de_sortie`, une fonction
+        // pure : liste BLANCHE de backends (WASAPI et CoreAudio seulement, cf.
+        // sa table), quatre refus nommés, aucune fusion de zones. Ici on ne
+        // fait que lui donner le parc et journaliser ce qu'elle a décidé.
+        //
+        // ⚠️ Elle ne fait pas revenir un appareil DÉBRANCHÉ : un périphérique
+        // absent de `devices` reste introuvable, identifiant ou pas.
+        let parc_pour_identite: Vec<tune_core::outputs::identite_de_sortie::SortieEnumeree> =
+            devices
+                .iter()
+                .map(
+                    |dev| tune_core::outputs::identite_de_sortie::SortieEnumeree {
+                        nom: dev.name.clone(),
+                        endpoint_id: dev.endpoint_id.clone(),
+                    },
+                )
+                .collect();
+        match zone_repo.appliquer_identite_de_sortie(&parc_pour_identite) {
+            Ok(rapport) => {
+                for r in &rapport.reassociees {
+                    info!(
+                        zone_id = r.zone_id,
+                        ancien = %r.ancien_device_id,
+                        nouveau = %r.nouveau_device_id,
+                        endpoint_id = %r.endpoint_id,
+                        "zone_locale_reassociee_par_identifiant_stable"
+                    );
+                }
+                // Les refus sont DITS. Une zone qui ne retrouve pas son
+                // appareil alors qu'elle en connaît l'identifiant est
+                // exactement ce qu'un rapport de bogue doit pouvoir nommer.
+                for (zone_id, motif) in &rapport.refus {
+                    warn!(
+                        zone_id,
+                        motif = %motif,
+                        "reassociation_de_zone_locale_refusee"
+                    );
+                }
+                if !rapport.apprises.is_empty() {
+                    info!(
+                        zones = rapport.apprises.len(),
+                        "identifiant_de_sortie_locale_appris"
+                    );
+                }
+            }
+            Err(e) => warn!(error = %e, "identite_de_sortie_locale_non_appliquee"),
+        }
+        // #3529 : lecture unique, portée par `ZoneRepo`. Ce chemin-ci garde sa
+        // règle propre — `local_zone_action` autorise la sortie système par
+        // défaut, c'est le sens de #1770 — mais il ne relit plus le réglage
+        // lui-même.
+        let auto_create = zone_repo.zone_auto_create_autorise();
         // Un backend est censé marquer une seule sortie par défaut. `find`
         // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
         let system_default_device_id = first_system_default_name(
@@ -1250,11 +1613,36 @@ pub async fn register_local_outputs(state: &AppState) {
 
         for dev in &devices {
             let device_id = format!("local:{}", dev.name);
+            // `dev.backend` est l'hôte qui a énuméré ce nom. Il compte ici plus
+            // qu'ailleurs : quand ASIO n'expose rien, la boucle ci-dessus a
+            // ré-énuméré en WASAPI, si bien que ces noms-là sont des noms
+            // WASAPI alors que la lecture demandera toujours l'hôte « asio »
+            // (#3230).
+            // #3245 — la contrainte de plateforme se pose sur le backend
+            // OUVRABLE de CE périphérique, pas sur le réglage global. Même
+            // rectification que `with_origin_host` juste en dessous, et pour
+            // la même raison : sans elle, un nom WASAPI héritait de l'exclusif
+            // imposé par ASIO et Tune ouvrait WASAPI en mode exclusif, coupant
+            // le son de toutes les autres applications de la machine.
+            let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
+                audio_backend,
+                Some(dev.backend.as_str()),
+                exclusive_demande,
+            );
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
-                exclusive_mode,
+                statut_exclusif.effective,
                 audio_backend,
+            )
+            .with_origin_host(&dev.backend);
+            info!(
+                device_id = %device_id,
+                hote_origine = %dev.backend,
+                demande = exclusive_demande,
+                effectif = statut_exclusif.effective,
+                impose = statut_exclusif.forced,
+                "local_output_exclusive_mode_par_peripherique"
             );
             // Ensemencer la sortie avec le volume stocké.
             //
@@ -1291,11 +1679,20 @@ pub async fn register_local_outputs(state: &AppState) {
                 "local_audio_output_registered"
             );
 
-            let zone_name = if dev.is_default {
-                "This Computer".to_string()
-            } else {
-                dev.name.clone()
-            };
+            // #1770 : l'étiquette générique ne se minte qu'une fois. Changer
+            // de moteur audio change le NOM du périphérique système, donc son
+            // `device_id`, donc la ligne en base — et la sortie système WASAPI
+            // se voyait offrir un second « This Computer » à côté de celui
+            // d'ASIO (jfpaquet, 0.9.130). La mesure exclut l'appareil courant :
+            // sa propre zone ne doit pas compter contre lui.
+            let generique_deja_pris = zone_repo
+                .etiquette_generique_locale_prise(&device_id)
+                .unwrap_or(false);
+            let zone_name = tune_core::config::nom_de_zone_locale(
+                &dev.name,
+                dev.is_default,
+                generique_deja_pris,
+            );
 
             let zone_exists = zone_repo
                 .get_by_device_id(&device_id)
@@ -1385,10 +1782,13 @@ pub async fn register_local_outputs(state: &AppState) {
 /// musique.
 ///
 /// ⚠️ On lit la table que les ROUTES ecrivent (`mount_type/server/share/…/
-/// active`), pas celle de `mount_manager.rs` (`host/share_name/…/auto_mount`),
-/// qui porte le meme nom, des colonnes differentes, et n'est construite nulle
-/// part hors tests. Batir le remontage sur `auto_mount` interrogerait une table
-/// que le serveur ne remplit jamais.
+/// active`). Une SECONDE definition de `network_mounts` a longtemps coexiste,
+/// dans `tune-core/src/mount_manager.rs` (`host/share_name/…/auto_mount`) :
+/// meme nom, colonnes differentes, jamais construite hors tests. Elle a ete
+/// supprimee par #1914 ; le test `network_mounts_n_a_qu_une_definition_par_moteur`
+/// (tune-core, `db/migrations.rs`) empeche desormais qu'une concurrente
+/// reapparaisse. Batir le remontage sur `auto_mount` interrogerait donc une
+/// colonne qui n'existe plus.
 ///
 /// Chaque montage est independant : un partage injoignable est journalise et
 /// n'empeche ni les autres ni le demarrage. Un NAS eteint ne doit pas empecher
@@ -1592,11 +1992,339 @@ async fn noter_montage(
 }
 
 #[cfg(test)]
+mod semis_des_dossiers_de_bibliotheque_tests {
+    use super::*;
+
+    /// Une arborescence reelle : un dossier plein, un dossier vide (le volume
+    /// anonyme de Docker), un fichier, et un chemin absent.
+    fn arbre() -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir(t.path().join("plein")).unwrap();
+        std::fs::write(t.path().join("plein/a.flac"), b"pas vraiment du flac").unwrap();
+        std::fs::create_dir(t.path().join("vide")).unwrap();
+        std::fs::write(t.path().join("fichier.txt"), b"x").unwrap();
+        t
+    }
+
+    /// 🔴 #3686 — les quatre verdicts, dans les deux sens.
+    ///
+    /// SITE D'APPEL GARDE : `persist_initial_settings`, boucle
+    /// `for d in normalized_dirs { match dossier_semable(&d) { … } }`.
+    #[test]
+    fn un_dossier_vide_ou_absent_n_est_pas_semable_un_dossier_plein_l_est() {
+        let t = arbre();
+        let p = |n: &str| t.path().join(n).to_string_lossy().to_string();
+
+        // MOITIE VERTE — ce qui doit passer.
+        assert_eq!(dossier_semable(&p("plein")), Ok(()));
+
+        // MOITIE ROUGE — ce qui doit etre ecarte, et POURQUOI.
+        assert_eq!(dossier_semable(&p("vide")), Err(MotifEcart::Vide));
+        assert_eq!(
+            dossier_semable(&p("fichier.txt")),
+            Err(MotifEcart::PasUnDossier)
+        );
+        assert_eq!(dossier_semable(&p("jamais-monte")), Err(MotifEcart::Absent));
+    }
+
+    /// 🔴 #3686 — LA garde du semis, sur la fonction de production.
+    ///
+    /// SITE D'APPEL GARDE : `persist_initial_settings`, appelee par
+    /// `startup::init_state` (`persist_initial_settings(state, config);`).
+    ///
+    /// Le cas de Johannes : conteneur recree, base neuve, l'image impose
+    /// `["/music"]` — ici un dossier vide qui joue le volume anonyme.
+    #[test]
+    fn le_premier_demarrage_n_ecrit_ni_le_volume_anonyme_ni_une_liste_vide() {
+        let t = arbre();
+        let vide = t.path().join("vide").to_string_lossy().to_string();
+        let plein = t.path().join("plein").to_string_lossy().to_string();
+
+        // ── MOITIE ROUGE : SEUL un dossier inutilisable est propose ───────
+        // Rien ne doit etre ecrit — et surtout pas « [] », qui vaudrait
+        // « l'utilisateur a tout retire » pour tous les demarrages suivants.
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let mut config = TuneConfig::default();
+        config.music_dirs = vec![vide.clone()];
+        persist_initial_settings(&state, &config);
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        assert_eq!(
+            settings.get("music_dirs").ok().flatten(),
+            None,
+            "un volume anonyme vide ne doit RIEN semer — pas meme « [] », qui \
+             condamnerait l'installation a ne plus jamais rien scanner"
+        );
+
+        // ── MOITIE VERTE : une vraie bibliotheque est bien semee ──────────
+        // Sans elle, un `dossier_semable` qui refuserait tout serait vert
+        // ci-dessus tout en empechant TOUTE installation Docker de demarrer.
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let mut config = TuneConfig::default();
+        config.music_dirs = vec![vide, plein.clone()];
+        persist_initial_settings(&state, &config);
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        let ecrit = settings
+            .get("music_dirs")
+            .ok()
+            .flatten()
+            .expect("un dossier utilisable doit etre seme");
+        let liste: Vec<String> = serde_json::from_str(&ecrit).unwrap();
+        assert_eq!(
+            liste,
+            vec![tune_core::scanner::walker::normalize_path(&plein)],
+            "seul le dossier utilisable doit entrer en base"
+        );
+    }
+
+    /// 🔴 #3686 — la liste que l'utilisateur a editee reste intouchable.
+    ///
+    /// Le garde `already_set` existait avant (Frederic : un dossier trop large
+    /// retire par l'interface revenait a chaque redemarrage). Le filtre ne
+    /// doit pas l'avoir affaibli.
+    #[test]
+    fn une_liste_deja_posee_n_est_jamais_touchee() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        settings.set("music_dirs", "[]").unwrap();
+
+        let t = arbre();
+        let mut config = TuneConfig::default();
+        config.music_dirs = vec![t.path().join("plein").to_string_lossy().to_string()];
+        persist_initial_settings(&state, &config);
+
+        assert_eq!(
+            settings.get("music_dirs").ok().flatten().as_deref(),
+            Some("[]"),
+            "« tout retire » reste « tout retire »"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zones_reflet_tests {
+    use super::*;
+
+    /// L'UDN que la zone « Eversolo DMP-A8 » du .18 a tiré au sort pour sa
+    /// propre façade, et sous lequel elle s'est ensuite redécouverte.
+    const UDN_DE_NOTRE_FACADE: &str = "uuid:558dcf82-5868-4126-951a-570149376da6";
+    /// L'UDN réel de l'Eversolo, tel qu'il s'annonce sur le réseau.
+    const UDN_DE_L_APPAREIL: &str = "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE";
+    /// L'UDN de la façade d'un **autre** Tune du réseau (192.168.1.42). Même
+    /// suffixe « (Tune) » dans le nom, mais ce n'est pas nous.
+    const UDN_DU_TUNE_VOISIN: &str = "uuid:aef5e377-bc40-4807-8bb9-30f09fc0a6e8";
+
+    /// La scène relevée le 09/09/2026 sur `tune_v2.db` du .18, réduite aux
+    /// trois zones qui décident. Elle n'est pas inventée : les trois UDN
+    /// ci-dessus sont ceux de la base, et le rapprochement `zone 16 ←
+    /// upnp_renderer_udn_10` y a été mesuré par une jointure SQL avant qu'une
+    /// ligne de ce fichier ne soit écrite.
+    ///
+    /// Rend `(state, id de l'appareil, id du reflet, id du Tune voisin)`.
+    fn scene_du_18() -> (AppState, i64, i64, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+
+        let appareil = zones
+            .create("Eversolo DMP-A8", Some("dlna"), Some(UDN_DE_L_APPAREIL))
+            .unwrap();
+        // La zone a été armée en MediaRenderer : `renderer_udn` a posé sa clé.
+        settings
+            .set(
+                &format!("upnp_renderer_udn_{appareil}"),
+                UDN_DE_NOTRE_FACADE,
+            )
+            .unwrap();
+        // Notre propre façade, revenue par SSDP et devenue une zone.
+        let reflet = zones
+            .create(
+                "Eversolo DMP-A8 (Tune)",
+                Some("dlna"),
+                Some(UDN_DE_NOTRE_FACADE),
+            )
+            .unwrap();
+        // La façade d'un AUTRE Tune : même forme de nom, autre identité.
+        let voisin = zones
+            .create("ASUS PB238 (Tune)", Some("dlna"), Some(UDN_DU_TUNE_VOISIN))
+            .unwrap();
+
+        (state, appareil, reflet, voisin)
+    }
+
+    fn ids_visibles(state: &AppState) -> Vec<i64> {
+        tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter_map(|z| z.id)
+            .collect()
+    }
+
+    /// 🔴 #3688 — LA GARDE, dans les deux sens.
+    ///
+    /// SITE D'APPEL GARDÉ : `startup::init_state`, ligne
+    /// `masquer_les_zones_reflet(state);`, juste après `ensure_zones_is_hidden`
+    /// et avant que la moindre tâche de découverte ne démarre.
+    ///
+    /// La moitié ROUGE mesure ce que le ticket décrit : notre propre façade
+    /// devenue une zone doit disparaître de la liste. La moitié VERTE est ce
+    /// qui empêche le remède d'être pire que le mal — une passe qui masquerait
+    /// tout ce qui porte « (Tune) », ou tout ce qui est `dlna`, serait verte
+    /// sur la première moitié **et** ferait disparaître l'appareil réel et le
+    /// Tune du voisin.
+    #[test]
+    fn le_reflet_est_masque_et_ni_l_appareil_ni_le_tune_du_voisin_ne_bougent() {
+        let (state, appareil, reflet, voisin) = scene_du_18();
+        assert_eq!(
+            ids_visibles(&state).len(),
+            3,
+            "la scène de départ doit bien porter les trois zones"
+        );
+
+        let masquees = masquer_les_zones_reflet(&state);
+
+        // ── MOITIÉ ROUGE ────────────────────────────────────────────────────
+        assert_eq!(
+            masquees, 1,
+            "une seule zone est notre reflet : la {reflet}. Un nombre plus grand \
+             veut dire que la passe a mordu sur une sortie RÉELLE — l'Eversolo \
+             lui-même ({appareil}), ou le Tune du voisin ({voisin}), qui porte \
+             le même suffixe « (Tune) » et n'est pas nous."
+        );
+        let visibles = ids_visibles(&state);
+        assert!(
+            !visibles.contains(&reflet),
+            "la zone {reflet} « Eversolo DMP-A8 (Tune) » porte EXACTEMENT l'UDN \
+             de notre propre façade ({UDN_DE_NOTRE_FACADE}) : elle est notre \
+             reflet et ne doit plus être proposée comme sortie (#3688). \
+             Zones encore visibles : {visibles:?}"
+        );
+
+        // ── MOITIÉ VERTE : la contre-épreuve ────────────────────────────────
+        assert!(
+            visibles.contains(&appareil),
+            "l'Eversolo réel (zone {appareil}) doit rester : c'est la sortie que \
+             l'auditeur écoute"
+        );
+        assert!(
+            visibles.contains(&voisin),
+            "la zone {voisin} « ASUS PB238 (Tune) » est la façade d'un AUTRE Tune \
+             du réseau — une sortie parfaitement pilotable. Elle porte le même \
+             suffixe « (Tune) » que le reflet et doit pourtant survivre : c'est \
+             nous qu'il faut exclure, pas nos semblables."
+        );
+    }
+
+    /// 🔴 #3688 — l'autre moitié de « stable » : reprendre une fois suffit.
+    ///
+    /// SITE D'APPEL GARDÉ : le même, plus
+    /// `ZoneRepo::get_or_create` (`zone_repo.rs:867`), que
+    /// `discovery_setup::handle_ssdp_discovered` appelle à chaque annonce SSDP.
+    ///
+    /// Sans cette garde, `masquer_les_zones_reflet` pourrait masquer par une
+    /// suppression dure : la première moitié du test précédent serait verte, et
+    /// le reflet renaîtrait au premier tour de découverte avec un id neuf et
+    /// des réglages vierges — exactement le symptôme « je la supprime, elle
+    /// revient » de #1281.
+    #[test]
+    fn le_reflet_repris_ne_renait_pas_a_la_decouverte_suivante() {
+        let (state, _appareil, reflet, _voisin) = scene_du_18();
+        assert_eq!(masquer_les_zones_reflet(&state), 1);
+
+        let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        // Le tour de découverte suivant, mot pour mot : la façade s'annonce de
+        // nouveau, et le chemin SSDP demande sa zone.
+        let (id, creee) = zones
+            .get_or_create("Eversolo DMP-A8 (Tune)", Some("dlna"), UDN_DE_NOTRE_FACADE)
+            .unwrap();
+        assert!(
+            !creee,
+            "la découverte suivante a CRÉÉ une zone de plus pour notre propre \
+             façade : la reprise n'a pas tenu l'identité (#3688)"
+        );
+        assert_eq!(
+            id, reflet,
+            "l'identité doit rester celle de la ligne reprise, pas un id neuf"
+        );
+        assert!(
+            !ids_visibles(&state).contains(&reflet),
+            "et la zone reprise doit rester hors de la liste"
+        );
+    }
+
+    /// 🔴 #3688 — les deux refus. Une passe qui masque des zones doit dire
+    /// « non » plus souvent qu'elle ne dit « oui ».
+    ///
+    /// SITE D'APPEL GARDÉ : `nos_facades_par_zone`, le `parse::<i64>()` du
+    /// suffixe, et le test `proprietaire == zid` de `masquer_les_zones_reflet`.
+    ///
+    /// 1. **Clé hors convention.** `upnp_renderer_udn_default` n'est pas une
+    ///    façade de zone : son suffixe ne se lit pas en `i64`. Un
+    ///    `starts_with` seul — c'est ce que fait
+    ///    `discovery_setup::nos_udn_de_facade`, et c'est correct là-bas — la
+    ///    retiendrait ici, et masquerait une vraie sortie au nom d'un
+    ///    propriétaire inexistant.
+    /// 2. **Auto-référence.** Une zone dont l'identité est sa PROPRE façade
+    ///    n'a pas de zone source distincte : la masquer coûterait une sortie
+    ///    sans rien réparer. Aucun cas de ce genre n'existe sur le relevé du
+    ///    .18 ; on le journalise et on n'y touche pas.
+    #[test]
+    fn ni_une_cle_hors_convention_ni_une_auto_reference_ne_masquent_une_zone() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+
+        let hors_convention = zones
+            .create("Ampli du salon", Some("dlna"), Some("uuid:hors-convention"))
+            .unwrap();
+        settings
+            .set("upnp_renderer_udn_default", "uuid:hors-convention")
+            .unwrap();
+
+        let auto = zones
+            .create(
+                "Zone qui se pointe elle-meme",
+                Some("dlna"),
+                Some("uuid:auto"),
+            )
+            .unwrap();
+        settings
+            .set(&format!("upnp_renderer_udn_{auto}"), "uuid:auto")
+            .unwrap();
+
+        assert_eq!(
+            masquer_les_zones_reflet(&state),
+            0,
+            "aucune de ces deux zones n'est un reflet — ni la {hors_convention} \
+             (clé `upnp_renderer_udn_default`, dont le suffixe n'est pas un id de \
+             zone) ni la {auto} (qui porte sa PROPRE façade) : la passe ne doit \
+             rien masquer"
+        );
+        let visibles = ids_visibles(&state);
+        assert!(
+            visibles.contains(&hors_convention),
+            "une clé dont le suffixe n'est pas un id de zone ne désigne aucune \
+             façade : la zone {hors_convention} doit rester"
+        );
+        assert!(
+            visibles.contains(&auto),
+            "la zone {auto} porte sa propre façade : elle n'a pas de zone source \
+             distincte et ne doit pas être masquée"
+        );
+    }
+}
+
+#[cfg(test)]
 mod restore_zone_volumes_tests {
     use super::*;
     use tune_core::db::zone_repo::ZoneRepo;
 
-    fn state_with_zone(volume: i32, fixed: bool) -> (AppState, i64) {
+    fn state_with_zone(volume: f64, fixed: bool) -> (AppState, i64) {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let repo = ZoneRepo::with_backend(state.backend.clone());
         let id = repo
@@ -1615,7 +2343,7 @@ mod restore_zone_volumes_tests {
     /// d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
     async fn fixed_volume_zone_restarts_at_full_scale() {
-        let (state, id) = state_with_zone(100, true);
+        let (state, id) = state_with_zone(100.0, true);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
@@ -1633,7 +2361,7 @@ mod restore_zone_volumes_tests {
     /// le code d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
     async fn non_fixed_zone_at_full_scale_is_restored_verbatim() {
-        let (state, id) = state_with_zone(100, false);
+        let (state, id) = state_with_zone(100.0, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
@@ -1646,11 +2374,11 @@ mod restore_zone_volumes_tests {
     /// le désaccord que #1548 a soigné côté affichage sans le supprimer.
     #[tokio::test]
     async fn memory_agrees_with_db_for_every_stored_level() {
-        for stocke in [0, 20, 55, 99, 100] {
+        for stocke in [0.0, 20.0, 55.0, 99.0, 100.0] {
             let (state, id) = state_with_zone(stocke, false);
             restore_zone_volumes(&state).await;
             let vol = state.playback.get_state(id).await.volume;
-            let attendu = stocke as f64 / 100.0;
+            let attendu = stocke / 100.0;
             assert!(
                 (vol - attendu).abs() < 1e-9,
                 "base {stocke} % / mémoire {vol} — les deux doivent dire la même chose"
@@ -1665,31 +2393,84 @@ mod restore_zone_volumes_tests {
     /// le seul endroit où le volume stocké atteint vraiment le son.
     #[test]
     fn local_output_is_seeded_with_the_stored_level() {
-        assert!((seed_volume_for(30, false) - 0.30).abs() < 1e-9);
-        assert!((seed_volume_for(0, false) - 0.0).abs() < 1e-9);
-        assert!((seed_volume_for(100, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(30.0, false) - 0.30).abs() < 1e-9);
+        assert!((seed_volume_for(0.0, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, false) - 1.0).abs() < 1e-9);
     }
 
     /// Une zone bit-perfect ne s'ensemence jamais autrement qu'à pleine échelle,
     /// quelle que soit la valeur qui traîne en base (forum 1320, Cyrille).
     #[test]
     fn fixed_volume_output_is_seeded_at_full_scale() {
-        assert!((seed_volume_for(20, true) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(100, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(20.0, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, true) - 1.0).abs() < 1e-9);
     }
 
     /// Une valeur aberrante en base ne doit pas amplifier — le gain est un
     /// multiplicateur appliqué à chaque échantillon.
     #[test]
     fn out_of_range_stored_level_never_amplifies() {
-        assert!((seed_volume_for(150, false) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(-5, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(150.0, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(-5.0, false) - 0.0).abs() < 1e-9);
+    }
+
+    /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.
+    ///
+    /// `restore_zone_volumes` est le pont entre la colonne et le son après un
+    /// redémarrage. Avec `zones.volume` en `INTEGER`, tout réglage sous
+    /// **0,005 linéaire — soit −46,0205999133 dB exactement** — était persisté
+    /// à 0 : la zone revenait à zéro, indiscernable d'un mute volontaire.
+    ///
+    /// Ce test balaie les deux côtés du seuil mesuré et exige que le niveau
+    /// restauré soit celui qui a été stocké, à l'ulp près.
+    #[tokio::test]
+    async fn un_volume_sous_le_seuil_mesure_ne_revient_pas_muet() {
+        const SEUIL_DB: f64 = -46.020_599_913_279_62;
+        assert!(
+            (20.0 * 0.005f64.log10() - SEUIL_DB).abs() < 1e-12,
+            "le seuil est 20·log10(0,005)"
+        );
+
+        for cible_db in [-40.0, -46.0, SEUIL_DB, SEUIL_DB - 0.001, -48.0, -60.0] {
+            let lineaire: f64 = 10f64.powf(cible_db / 20.0);
+            let (state, id) = state_with_zone(lineaire * 100.0, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            assert!(
+                vol > 0.0,
+                "{cible_db} dB : la zone se rallume MUETTE (volume restauré {vol})"
+            );
+            assert!(
+                (vol - lineaire).abs() < 1e-12,
+                "{cible_db} dB : restauré à {vol} au lieu de {lineaire}"
+            );
+            // Et le chemin qui atteint vraiment le son dit la même chose.
+            assert!((seed_volume_for(lineaire * 100.0, false) - lineaire).abs() < 1e-12);
+        }
+    }
+
+    /// Témoin anti-régression #2886 : les volumes USUELS ne bougent pas d'un
+    /// iota. Multiples exacts de 1 %, donc déjà parfaits avant le correctif.
+    #[tokio::test]
+    async fn les_volumes_usuels_reviennent_identiques() {
+        for pour_cent in [
+            0.0, 1.0, 5.0, 10.0, 20.0, 30.0, 50.0, 70.0, 90.0, 99.0, 100.0,
+        ] {
+            let (state, id) = state_with_zone(pour_cent, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            let attendu = pour_cent / 100.0;
+            assert!(
+                (vol - attendu).abs() < 1e-12,
+                "{pour_cent} % restauré à {vol} au lieu de {attendu}"
+            );
+        }
     }
 
     /// Un volume ordinaire est restauré tel quel, fixed ou pas.
     #[tokio::test]
     async fn ordinary_volume_is_restored_verbatim() {
-        let (state, id) = state_with_zone(55, false);
+        let (state, id) = state_with_zone(55.0, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!((vol - 0.55).abs() < 1e-9, "volume restauré: {vol}");

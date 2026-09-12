@@ -11,6 +11,23 @@ pub enum AudioFormat {
     Ogg,
     Opus,
     Aiff,
+    /// Conteneur MP4 dont le codec n'est PAS determine (#3605).
+    ///
+    /// `.m4a` est un conteneur ISO BMFF qui porte de l'AAC **ou** de l'ALAC :
+    /// l'extension seule ne tranche pas, et le code faisait comme si elle le
+    /// tranchait — vers le codec avec perte. Un `.m4a` etait donc annonce
+    /// `audio/aac`, c'est-a-dire un flux ADTS **nu**, alors qu'un `.m4a` n'est
+    /// jamais de l'ADTS. Cette variante dit ce qu'on sait — le conteneur — et
+    /// rien de ce qu'on ignore.
+    ///
+    /// Elle n'apparait que par [`AudioFormat::from_extension`], c'est-a-dire
+    /// quand la colonne `tracks.format` porte encore l'extension brute. Le
+    /// scanner, lui, sonde le codec reel et ecrit `alac` ou `aac`
+    /// (`metadata::probe_m4a_props`, `metadata::normalize_format`) ; le seul
+    /// chemin qui ecrit `m4a` est `tagless_fallback_no_props`, emprunte quand
+    /// la lecture des balises echoue ou depasse son delai sur un NAS lent
+    /// (#3232) — et qui, par contrat, ne fait AUCUNE entree-sortie.
+    M4a,
     Dsd,
     WavPack,
     Ape,
@@ -23,13 +40,33 @@ impl AudioFormat {
             "flac" => Some(Self::Flac),
             "wav" => Some(Self::Wav),
             "mp3" => Some(Self::Mp3),
-            "m4a" | "aac" => Some(Self::Aac),
+            // `.aac` est un flux ADTS nu ; `.m4a` est un conteneur MP4.
+            // Les confondre est la faute de #3605.
+            "aac" => Some(Self::Aac),
+            "m4a" => Some(Self::M4a),
             "alac" => Some(Self::Alac),
             "ogg" | "oga" => Some(Self::Ogg),
             "opus" => Some(Self::Opus),
             "aiff" | "aif" => Some(Self::Aiff),
             "dsf" | "dff" | "dst" | "dsd" => Some(Self::Dsd),
             "wv" => Some(Self::WavPack),
+            // 🔴 #3849 — `tracks.format` ne contient PAS toujours une extension.
+            //
+            // Sur un fichier ÉTIQUETÉ, `metadata::read_metadata` écrit le nom
+            // du type détecté par lofty : `format!("{:?}", file_type)` en
+            // minuscules. Pour un `.wv` avec tags — un rip EAC, par exemple —
+            // cela donne « wavpack », et pour un `.ogg` Vorbis « vorbis ».
+            // Aucun des deux n'est une extension, donc cette fonction rendait
+            // `None`, et la conséquence était mesurée chez Marco Polo : sans
+            // format source, `needs_transcode_for_output` est faux, la piste
+            // prend la branche « servir le fichier brut », et le MIME retombe
+            // sur `audio/flac` — un `.wv` livré tel quel au Denon sous
+            // l'étiquette FLAC.
+            //
+            // Les reconnaître ici répare AUSSI les lignes déjà écrites, ce
+            // qu'une correction limitée au scanner ne ferait pas.
+            "wavpack" => Some(Self::WavPack),
+            "vorbis" => Some(Self::Ogg),
             "ape" => Some(Self::Ape),
             "wma" | "asf" => Some(Self::Wma),
             _ => None,
@@ -43,7 +80,7 @@ impl AudioFormat {
             Self::Wav => "wav",
             Self::Mp3 => "mp3",
             Self::Aac => "adts",
-            Self::Alac => "ipod",
+            Self::Alac | Self::M4a => "ipod",
             Self::Ogg => "ogg",
             Self::Opus => "opus",
             Self::Aiff => "aiff",
@@ -57,7 +94,9 @@ impl AudioFormat {
             Self::Flac => "flac",
             Self::Wav => "pcm_s16le",
             Self::Mp3 => "libmp3lame",
-            Self::Aac => "aac",
+            // `M4a` n'est jamais une cible d'encodage : la valeur est
+            // celle d'aujourd'hui, elle ne decide de rien.
+            Self::Aac | Self::M4a => "aac",
             Self::Alac => "alac",
             Self::Ogg => "libvorbis",
             Self::Opus => "libopus",
@@ -74,7 +113,9 @@ impl AudioFormat {
             Self::Wav => "audio/wav",
             Self::Mp3 => "audio/mpeg",
             Self::Aac => "audio/aac",
-            Self::Alac => "audio/mp4",
+            // Un conteneur MP4, quel que soit son codec : `audio/mp4` est
+            // juste pour de l'ALAC comme pour de l'AAC-en-MP4 (#3605).
+            Self::Alac | Self::M4a => "audio/mp4",
             Self::Ogg => "audio/ogg",
             Self::Opus => "audio/opus",
             Self::Aiff => "audio/aiff",
@@ -239,6 +280,7 @@ impl AudioFormat {
             Self::Wav => "WAV",
             Self::Mp3 => "MP3",
             Self::Aac => "AAC",
+            Self::M4a => "M4A",
             Self::Alac => "ALAC",
             Self::Ogg => "OGG",
             Self::Opus => "OPUS",
@@ -264,6 +306,7 @@ impl AudioFormat {
         matches!(
             self,
             Self::Aac
+                | Self::M4a
                 | Self::WavPack
                 | Self::Ape
                 | Self::Alac
@@ -695,7 +738,10 @@ mod tests {
 
     #[test]
     fn from_extension_m4a() {
-        assert_eq!(AudioFormat::from_extension("m4a"), Some(AudioFormat::Aac));
+        // #3605 : les deux extensions ne designent PAS la meme chose.
+        // `.m4a` est un conteneur MP4, qui porte de l'AAC ou de l'ALAC ;
+        // `.aac` est un flux ADTS nu. Ce test figeait leur confusion.
+        assert_eq!(AudioFormat::from_extension("m4a"), Some(AudioFormat::M4a));
         assert_eq!(AudioFormat::from_extension("aac"), Some(AudioFormat::Aac));
     }
 
@@ -950,5 +996,76 @@ mod tests {
         // Existing can_passthrough (without channels) defaults to 2ch
         let caps = dlna_capabilities();
         assert!(can_passthrough(AudioFormat::Flac, 96000, 24, &caps));
+    }
+}
+
+#[cfg(test)]
+mod conteneur_mp4_3605 {
+    use super::AudioFormat;
+
+    /// Le fait du ticket : `.m4a` est un conteneur, pas un codec, et il ne
+    /// doit plus tomber sur la variante du flux ADTS nu.
+    #[test]
+    fn un_point_m4a_nest_plus_de_l_aac_nu() {
+        assert_eq!(AudioFormat::from_extension("m4a"), Some(AudioFormat::M4a));
+        assert_eq!(AudioFormat::M4a.mime_type(), "audio/mp4");
+    }
+
+    /// Contre-épreuve : un `.aac` EST de l'ADTS nu, et il garde son type.
+    /// Sans cette moitié, renommer l'AAC en bloc passerait pour un correctif.
+    #[test]
+    fn un_point_aac_reste_un_flux_adts_nu() {
+        assert_eq!(AudioFormat::from_extension("aac"), Some(AudioFormat::Aac));
+        assert_eq!(AudioFormat::Aac.mime_type(), "audio/aac");
+    }
+
+    /// Les deux conteneurs MP4 de l'énumération rendent le MÊME type : c'est
+    /// tout l'intérêt, `audio/mp4` est juste pour l'ALAC comme pour l'AAC en
+    /// MP4. La contradiction que le ticket mesurait — la table connaissait le
+    /// bon type et ne le rendait que pour une extension qu'aucun encodeur ne
+    /// produit — n'existe plus.
+    #[test]
+    fn les_deux_conteneurs_mp4_rendent_le_meme_type() {
+        assert_eq!(
+            AudioFormat::M4a.mime_type(),
+            AudioFormat::Alac.mime_type(),
+            "un conteneur MP4 est un conteneur MP4"
+        );
+        assert_eq!(AudioFormat::M4a.container_format(), "ipod");
+    }
+
+    /// Ce que le correctif NE change PAS, et qui doit être verrouillé : aucune
+    /// décision de lecture ne bouge. Un `.m4a` reste annoncé avec perte et
+    /// reste transcodé pour un renderer réseau — exactement comme avant, quand
+    /// il tombait sur `Aac`. On corrige ce qu'on ANNONCE, pas ce qu'on décide.
+    #[test]
+    fn aucune_decision_ne_change_pour_un_point_m4a() {
+        assert!(
+            !AudioFormat::M4a.is_lossless(),
+            "le codec est inconnu : ne pas promettre du sans perte"
+        );
+        assert!(AudioFormat::M4a.needs_transcode_for_dlna());
+        assert!(AudioFormat::M4a.needs_transcode_for_chromecast());
+        assert_eq!(AudioFormat::M4a.dlna_transcode_target(), AudioFormat::Flac);
+    }
+
+    /// Le profil DLNA ne bouge pas non plus : `audio/mp4` et `audio/aac`
+    /// partagent le même bras `AAC_ISO`. Seul le troisième champ du
+    /// `protocolInfo` change. Épreuve posée ici parce que c'est la garantie
+    /// qui rend le correctif sûr côté serveur multimédia.
+    #[test]
+    fn le_profil_dlna_annonce_est_inchange() {
+        assert_eq!(
+            crate::outputs::didl::dlna_flags_for_mime_bd_sr(
+                AudioFormat::M4a.mime_type(),
+                Some(16),
+                Some(44_100)
+            ),
+            crate::outputs::didl::dlna_flags_for_mime_bd_sr(
+                AudioFormat::Aac.mime_type(),
+                Some(16),
+                Some(44_100)
+            ),
+        );
     }
 }

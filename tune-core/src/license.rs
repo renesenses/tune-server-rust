@@ -128,6 +128,45 @@ impl Feature {
         }
     }
 
+    /// Le **code stable** du droit, tel qu'il voyage dans un refus 402.
+    ///
+    /// `display_name` est une étiquette anglaise destinée à l'œil et au
+    /// journal ; elle peut être reformulée sans prévenir. Ce code-ci ne le
+    /// peut pas : c'est le terme du contrat qu'un client traduit avec ses
+    /// propres chaînes (#2419), au même titre que `ModuleRefusal::code` pour
+    /// les modules payants (#2392). Le renommer casse la traduction des
+    /// clients déjà installés.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Feature::UnlimitedZones => "unlimited_zones",
+            Feature::MultiroomSync => "multiroom_sync",
+            Feature::DspEq => "dsp_eq",
+            Feature::CloudRelay => "cloud_relay",
+            Feature::OaatProtocol => "oaat_protocol",
+            Feature::CloudBackup => "cloud_backup",
+            Feature::SyncedLyrics => "synced_lyrics",
+            Feature::ListeningStats => "listening_stats",
+            Feature::MultiScrobbling => "multi_scrobbling",
+            Feature::AiRecommendations => "ai_recommendations",
+            Feature::AcousticAnalysis => "acoustic_analysis",
+            Feature::PlaylistTransfer => "playlist_transfer",
+            Feature::AdvancedAlarms => "advanced_alarms",
+            Feature::MultiProfiles => "multi_profiles",
+            Feature::WeeklyDigest => "weekly_digest",
+            Feature::AutoEnrichment => "auto_enrichment",
+            Feature::RoomCorrection => "room_correction",
+            Feature::CloudConfigBackup => "cloud_config_backup",
+            Feature::SocialSharing => "social_sharing",
+            Feature::DeveloperApi => "developer_api",
+            Feature::PluginMarketplace => "plugin_marketplace",
+            Feature::MultiServer => "multi_server",
+            Feature::DacCalibration => "dac_calibration",
+            Feature::BatchConverter => "batch_converter",
+            Feature::PlaylistsHub => "playlists_hub",
+            Feature::Declick => "declick",
+        }
+    }
+
     /// Whether the feature is actually available / functional right now — a
     /// PRODUCT decision, independent of licence entitlement. The Premium
     /// "Fonctionnalités" grid colours each widget from this combined with the
@@ -220,6 +259,33 @@ pub struct LicenseState {
 /// Free-tier zone cap when not overridden. Configurable at runtime via
 /// `TUNE_FREE_MAX_ZONES` (see `TuneConfig`); premium is always unlimited.
 const DEFAULT_FREE_MAX_ZONES: i64 = 3;
+
+// ---------------------------------------------------------------------------
+// Plafond de zones du palier gratuit
+// ---------------------------------------------------------------------------
+
+/// Ce que le plafond de zones dit à un instant donné : combien de zones
+/// consomment le quota, et quel est le quota (`None` = illimité).
+///
+/// Un seul type, produit par un seul calcul
+/// ([`LicenseManager::plafond_zones`]) : le refus de lecture, l'affichage de
+/// `/system/config` et celui de `/cloud/license/status` lisent tous les trois
+/// le même objet. Avant #3673 chacun refaisait sa propre version du chiffre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlafondZones {
+    /// Zones qui consomment le quota — en ligne, non masquées, déjà jouées.
+    /// Vaut 0 quand la question ne se pose pas (Premium).
+    pub actives: i64,
+    /// Le plafond, ou `None` pour illimité (Premium).
+    pub limite: Option<i64>,
+}
+
+impl PlafondZones {
+    /// Le quota est-il consommé ? `false` dès que la limite est `None`.
+    pub fn atteint(&self) -> bool {
+        self.limite.is_some_and(|l| self.actives >= l)
+    }
+}
 // Offline grace once a key HAS been validated online at least once. Shortened
 // from 30 to 14 days: enough tolerance for an intermittently-connected server,
 // but a revoked or lapsed key falls back to Free sooner. The initial online
@@ -357,13 +423,45 @@ impl LicenseManager {
         effective_tier(&*self.state.read().await) == Tier::Premium
     }
 
-    /// Check whether adding a new zone is allowed.
-    /// Free tier: max `free_max_zones`.  Premium: unlimited.
-    pub async fn check_zone_limit(&self, current_count: i64) -> bool {
+    /// Le plafond de zones **en vigueur** : `None` = illimité (Premium),
+    /// `Some(n)` = le palier gratuit et son nombre.
+    ///
+    /// C'est LA lecture du chiffre. `/system/config` et `/cloud/license/status`
+    /// affichaient la même condition ternaire recopiée à la main, chacune de
+    /// son côté (#3673) : elles appellent désormais celle-ci.
+    pub async fn limite_zones(&self) -> Option<i64> {
         match effective_tier(&*self.state.read().await) {
-            Tier::Premium => true,
-            Tier::Free => current_count < self.free_max_zones,
+            Tier::Premium => None,
+            Tier::Free => Some(self.free_max_zones),
         }
+    }
+
+    /// L'état du plafond de zones : combien consomment le quota, et quel est
+    /// le quota. **Seule** implémentation de la règle (#3673).
+    ///
+    /// L'assiette est celle que #667 a tranchée — `ZoneRepo::count_active` :
+    /// en ligne, non masquée, et **déjà jouée** (`last_track_id IS NOT NULL`).
+    /// Une zone auto-découverte jamais utilisée ne consomme rien : c'est ce
+    /// qui a débloqué JeromeQ (forum #783), à qui la découverte réseau avait
+    /// rempli le quota avant qu'il ne joue quoi que ce soit.
+    ///
+    /// Ce qui existait ici avant s'appelait `check_zone_limit(current_count)`
+    /// et laissait l'**appelant** choisir ce qu'il comptait — donc la règle.
+    /// Il n'avait plus aucun appelant hors de ses propres tests : c'était une
+    /// seconde règle écrite mais pas branchée, prête à revenir à l'assiette
+    /// d'avant #667 dès que quelqu'un lui aurait passé `count_online()`.
+    pub async fn plafond_zones(&self) -> PlafondZones {
+        let limite = self.limite_zones().await;
+        // Ne compter que si la question se pose : un serveur Premium n'a pas
+        // à interroger la base pour s'entendre dire « illimité ».
+        let actives = if limite.is_some() {
+            crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                .count_active()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        PlafondZones { actives, limite }
     }
 
     /// Clone snapshot of the current license state (for API responses). The
@@ -830,7 +928,7 @@ const GRACE_NOTICE_AFTER_DAYS: i64 = 2;
 pub enum GracePhase {
     /// Confirmé en ligne récemment — rien à signaler.
     Ok,
-    /// Pas de confirmation depuis au moins [`GRACE_NOTICE_AFTER_DAYS`] jours,
+    /// Pas de confirmation depuis au moins `GRACE_NOTICE_AFTER_DAYS` jours,
     /// mais la fenêtre court toujours : **le premium est intact**.
     Grace,
     /// La fenêtre est écoulée : les droits premium sont retombés en Free en
@@ -858,7 +956,7 @@ pub struct OfflineGrace {
     pub source: GraceSource,
     /// Dernière confirmation en ligne réussie (ISO-8601 Zulu). `None` = jamais.
     pub since: Option<String>,
-    /// Instant où la fenêtre se referme (`since` + [`GRACE_PERIOD_DAYS`]).
+    /// Instant où la fenêtre se referme (`since` + `GRACE_PERIOD_DAYS`).
     pub until: Option<String>,
     /// Jours entiers restants, arrondis au supérieur ; 0 une fois écoulée.
     pub days_remaining: i64,
@@ -972,7 +1070,7 @@ fn format_utc(dt: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 /// Whether an ISO-8601 (`%Y-%m-%dT%H:%M:%SZ`) timestamp lies in the past.
-/// Unlike [`is_expired`] (which fails *closed*: malformed → expired), this fails
+/// Unlike `is_expired` (which fails *closed*: malformed → expired), this fails
 /// *open*: unparseable input returns `false` so malformed server data never
 /// triggers a license revocation. Used by the heartbeat to tell a genuine past
 /// expiry from a transient `license_valid:false` verdict.
@@ -980,6 +1078,84 @@ pub fn is_timestamp_past(timestamp: &str) -> bool {
     match chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ") {
         Ok(parsed) => parsed.and_utc() < chrono::Utc::now(),
         Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verdict du serveur de licences — lecture unique
+// ---------------------------------------------------------------------------
+
+/// Ce que la reponse du serveur de licences dit d'une cle.
+///
+/// **Une seule lecture** du corps rendu par `POST /api/v1/license/validate`
+/// (et des memes champs portes par la reponse du battement de coeur). Quatre
+/// endroits lisaient ce corps chacun de son cote — `validate_stored_license`,
+/// la route `POST /cloud/license/validate`, le battement et
+/// `revalider_la_cle` — avec des defauts **opposes** sur le champ manquant :
+/// deux defaillaient a `false`, deux a `true`. Celui de la route du bouton
+/// « Valider » etait le seul sans garde sur `license_tier` ; il persistait donc
+/// Free pour un compte premium tout en repondant `status:"validated"`.
+///
+/// La decision de **persister** n'appartient pas a ce type : chaque appelant
+/// garde sa politique (le battement a besoin de savoir si une cle est
+/// enregistree, la route doit choisir son `status`). Ce type ne dit que ce que
+/// le serveur a repondu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerdictLicence {
+    /// Le corps ne porte pas `license_valid` : le serveur ne s'est pas
+    /// prononce. Ne rien persister — ni accorder, ni revoquer. C'est le cas
+    /// d'un point d'acces redirige, d'une enveloppe d'erreur rendue en 200, ou
+    /// d'un schema qui a bouge.
+    Absent,
+    /// Cle confirmee : palier autoritaire a appliquer.
+    Confirmee {
+        tier: Tier,
+        expires_at: Option<String>,
+    },
+    /// `license_valid:false` **nu**. Ce n'est PAS une revocation : re-liaison
+    /// d'empreinte, hoquet du serveur, session tenue par une autre machine.
+    /// Garder le palier en cache ; la grace hors ligne expire d'elle-meme si
+    /// le refus persiste.
+    RefusTransitoire,
+    /// `license_valid:false` **avec** une `license_expires_at` deja passee :
+    /// la seule revocation autoritaire.
+    Expiree,
+}
+
+/// Lit le verdict porte par la reponse du serveur de licences.
+///
+/// Fonction pure : aucun acces base, aucun reseau, aucune horloge hors de
+/// [`is_timestamp_past`]. C'est ce qui la rend exhaustivement testable, et
+/// c'est tout l'interet de l'avoir sortie des quatre appelants.
+pub fn verdict_licence(body: &serde_json::Value) -> VerdictLicence {
+    // Defaut fermant : un verdict absent n'accorde rien. Il ne retire rien non
+    // plus — c'est la difference avec ce que faisait la route « Valider ».
+    let Some(valide) = body.get("license_valid").and_then(|v| v.as_bool()) else {
+        return VerdictLicence::Absent;
+    };
+
+    if !valide {
+        let expiree = body
+            .get("license_expires_at")
+            .and_then(|v| v.as_str())
+            .map(is_timestamp_past)
+            .unwrap_or(false);
+        return if expiree {
+            VerdictLicence::Expiree
+        } else {
+            VerdictLicence::RefusTransitoire
+        };
+    }
+
+    VerdictLicence::Confirmee {
+        tier: match body.get("license_tier").and_then(|v| v.as_str()) {
+            Some("premium") => Tier::Premium,
+            _ => Tier::Free,
+        },
+        expires_at: body
+            .get("license_expires_at")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     }
 }
 
@@ -1413,14 +1589,48 @@ mod tests {
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
-        let mgr = LicenseManager::new_with_limit(backend, 3);
+        let mgr = LicenseManager::new_with_limit(backend.clone(), 3);
         assert_eq!(mgr.tier().await, Tier::Free);
         assert!(!mgr.is_premium().await);
         assert!(!mgr.check_feature(Feature::DspEq).await);
         // Free tier is capped at the configured limit (3 here).
         assert_eq!(mgr.free_zone_limit(), 3);
-        assert!(mgr.check_zone_limit(2).await);
-        assert!(!mgr.check_zone_limit(3).await);
+        assert_eq!(mgr.limite_zones().await, Some(3));
+        // Le plafond mesure lui-même son assiette (#3673) : ce n'est plus
+        // l'appelant qui annonce un nombre, c'est la base qui le dit.
+        let zones = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let id = zones
+                .create(
+                    &format!("Zone {n}"),
+                    Some("dlna"),
+                    Some(&format!("uuid:{n}")),
+                )
+                .unwrap();
+            zones.update_online(id, true).unwrap();
+            ids.push(id);
+        }
+        // Trois zones en ligne mais DORMANTES : le quota est intact.
+        let p = mgr.plafond_zones().await;
+        assert_eq!(p.actives, 0, "une zone jamais jouee ne consomme rien");
+        assert!(!p.atteint());
+        // Deux zones jouées : encore une place.
+        for id in &ids[..2] {
+            zones
+                .save_playback_position(*id, 0, Some(1), Some("local"), None)
+                .unwrap();
+        }
+        assert_eq!(mgr.plafond_zones().await.actives, 2);
+        assert!(!mgr.plafond_zones().await.atteint());
+        // La troisième consomme la dernière : le plafond est atteint.
+        zones
+            .save_playback_position(ids[2], 0, Some(1), Some("local"), None)
+            .unwrap();
+        let p = mgr.plafond_zones().await;
+        assert_eq!(p.actives, 3);
+        assert_eq!(p.limite, Some(3));
+        assert!(p.atteint(), "3 zones jouees sur un plafond de 3 = atteint");
     }
 
     #[tokio::test]
@@ -1454,7 +1664,9 @@ mod tests {
         assert_eq!(mgr.tier().await, Tier::Premium);
         assert!(mgr.is_premium().await);
         assert!(mgr.check_feature(Feature::CloudRelay).await);
-        assert!(mgr.check_zone_limit(100).await);
+        // Premium : plus de plafond du tout, quel que soit le nombre de zones.
+        assert_eq!(mgr.limite_zones().await, None);
+        assert!(!mgr.plafond_zones().await.atteint());
 
         mgr.clear_license().await;
         assert_eq!(mgr.tier().await, Tier::Free);
@@ -1879,5 +2091,120 @@ mod tests {
         );
         assert_eq!(apres.days_since_validation, 0);
         assert!(mgr.is_premium().await);
+    }
+
+    // -----------------------------------------------------------------------
+    // Verdict du serveur de licences : la lecture unique (#3673, meme motif)
+    // -----------------------------------------------------------------------
+
+    /// L'aiguille est assemblee a l'execution : ecrite en clair, elle se
+    /// trouverait elle-meme si quelqu'un cherchait le champ dans ce fichier.
+    fn champ_verdict() -> String {
+        format!("{}_{}", "license", "valid")
+    }
+
+    fn corps(paires: &[(&str, serde_json::Value)]) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        for (k, v) in paires {
+            m.insert((*k).to_string(), v.clone());
+        }
+        serde_json::Value::Object(m)
+    }
+
+    #[test]
+    fn un_verdict_absent_n_accorde_rien_et_ne_retire_rien() {
+        // Le cas qui faisait retomber un compte premium en Free avec un
+        // `status:"validated"` : 200, corps lisible, mais aucun verdict.
+        assert_eq!(verdict_licence(&corps(&[])), VerdictLicence::Absent);
+        assert_eq!(
+            verdict_licence(&corps(&[("ok", serde_json::json!(true))])),
+            VerdictLicence::Absent,
+            "une enveloppe d'erreur rendue en 200 ne vaut pas verdict"
+        );
+        // Palier present, verdict absent : on ne devine pas non plus.
+        assert_eq!(
+            verdict_licence(&corps(&[("license_tier", serde_json::json!("premium"))])),
+            VerdictLicence::Absent
+        );
+        // Verdict present mais pas booleen : toujours pas un verdict.
+        assert_eq!(
+            verdict_licence(&corps(&[(&champ_verdict(), serde_json::json!("true"))])),
+            VerdictLicence::Absent
+        );
+    }
+
+    #[test]
+    fn un_refus_nu_est_transitoire_seule_une_expiration_passee_revoque() {
+        assert_eq!(
+            verdict_licence(&corps(&[(&champ_verdict(), serde_json::json!(false))])),
+            VerdictLicence::RefusTransitoire
+        );
+        // Expiration a venir : toujours transitoire.
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                (
+                    "license_expires_at",
+                    serde_json::json!("2099-01-01T00:00:00Z")
+                ),
+            ])),
+            VerdictLicence::RefusTransitoire
+        );
+        // Date illisible : `is_timestamp_past` echoue en OUVERT, donc pas de
+        // revocation sur une donnee malformee.
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                ("license_expires_at", serde_json::json!("pas-une-date")),
+            ])),
+            VerdictLicence::RefusTransitoire
+        );
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                (
+                    "license_expires_at",
+                    serde_json::json!("2000-01-01T00:00:00Z")
+                ),
+            ])),
+            VerdictLicence::Expiree
+        );
+    }
+
+    #[test]
+    fn une_confirmation_porte_le_palier_du_serveur_jamais_une_promesse_locale() {
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(true)),
+                ("license_tier", serde_json::json!("premium")),
+                (
+                    "license_expires_at",
+                    serde_json::json!("2099-01-01T00:00:00Z")
+                ),
+            ])),
+            VerdictLicence::Confirmee {
+                tier: Tier::Premium,
+                expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            }
+        );
+        // Confirmee sans palier nomme : Free, jamais Premium par defaut.
+        assert_eq!(
+            verdict_licence(&corps(&[(&champ_verdict(), serde_json::json!(true))])),
+            VerdictLicence::Confirmee {
+                tier: Tier::Free,
+                expires_at: None,
+            }
+        );
+        // Palier inconnu : Free, pas une promotion.
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(true)),
+                ("license_tier", serde_json::json!("ultimate")),
+            ])),
+            VerdictLicence::Confirmee {
+                tier: Tier::Free,
+                expires_at: None,
+            }
+        );
     }
 }

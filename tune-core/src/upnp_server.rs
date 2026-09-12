@@ -16,7 +16,6 @@ use crate::db::radio_repo::RadioRepo;
 use std::sync::Arc;
 
 use crate::db::backend::DbBackend;
-use crate::db::engine::Engine;
 use crate::db::track_repo::TrackRepo;
 use crate::discovery::ssdp;
 
@@ -83,6 +82,48 @@ pub fn track_audio_url(base_url: &str, track_id: i64) -> String {
 /// appliquer son contrat HTTP live et nettoyer la session à la déconnexion.
 pub fn radio_audio_url(base_url: &str, radio_id: i64) -> String {
     format!("{base_url}{API_PATH}/radios/{radio_id}/audio.wav")
+}
+
+/// URL Tune de la POCHETTE d'une station — la moitie de #1800 que le correctif
+/// `5d123568` n'avait pas faite.
+///
+/// #1800 reproche au dossier Radio de publier « l'URL du diffuseur, pas celle
+/// de Tune », et note que « toutes les autres branches du serveur media
+/// servent une URL Tune ». `5d123568` a corrige le `<res>` ; il n'a pas touche
+/// a `<upnp:albumArtURI>`, qui restait la DERNIERE adresse externe publiee par
+/// le serveur media. Mesure sur le DIDL emis par une base fraichement migree :
+/// 50 stations livrees, dont **25 portent un `logo_url`** — et les 25 le
+/// publiaient `https://mozaiklabs.fr/storage/radio-logos/*.png` tel quel au
+/// renderer. Les 25 autres n'ont pas de logo et n'emettent pas la balise.
+///
+/// Le relais existe pourtant deja, et un seul consommateur s'en sert. Le
+/// commentaire de `refresh_radio_logos`
+/// (`tune-server/src/routes/radios.rs`) le dit mot pour mot : « The web client
+/// proxies that URL through the LOCAL server (`artworkUrl` ->
+/// `/library/artwork/proxy`) ». Le client web passe par le relais, le serveur
+/// media non.
+///
+/// Deux formes de `logo_url` existent en base, et la seconde etait publiee
+/// TELLE QUELLE :
+/// * une URL absolue de l'annuaire (`refresh_radio_logos`) — relayee ici ;
+/// * un **condensat nu** du cache de pochettes, ecrit par
+///   `set_radio_artwork` (`radio.logo_url = Some(hash)`). Un condensat n'est
+///   pas une URI : `<upnp:albumArtURI>01KV5Z...</upnp:albumArtURI>` n'est
+///   resolvable par aucun point de controle. [`artwork_url`] sait deja le
+///   changer en URL Tune — c'est ce qu'il fait pour la pochette d'une piste.
+pub fn radio_logo_url(base_url: &str, logo: &str) -> String {
+    let logo = logo.trim();
+    if logo.starts_with("http://") || logo.starts_with("https://") {
+        // Deja servi par nous : ne pas relayer notre propre adresse.
+        if logo.starts_with(base_url) {
+            return logo.to_string();
+        }
+        return format!(
+            "{base_url}{API_PATH}/library/artwork/proxy?url={}",
+            urlencoding::encode(logo)
+        );
+    }
+    artwork_url(base_url, logo)
 }
 
 #[derive(Clone)]
@@ -202,7 +243,13 @@ pub fn build_device_description(state: &UpnpState) -> String {
     </serviceList>
   </device>
 </root>"#,
-        friendly = state.friendly_name,
+        // Le nom est réglable (`upnp_friendly_name`, POST
+        // /api/v1/upnp/config) et partait ICI sans échappement : une
+        // esperluette ou un chevron dans « Salon & Cuisine » rendait
+        // `description.xml` illégal, et un point de contrôle strict — JPLAY
+        // décrit et appaire le serveur AVANT d'indexer (#2183) — ne peut alors
+        // plus décrire le MediaServer du tout.
+        friendly = crate::outputs::didl::escape_sain(&state.friendly_name),
         version = crate::version(),
         uuid = state.uuid,
         base = base,
@@ -517,22 +564,31 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
 /// titre : la regle reste celle de #2312 — n'annoncer QUE ce qu'on evalue,
 /// jamais l'inverse. Le test `les_capacites_annoncees_sont_toutes_evaluees`
 /// tient l'invariant dans les deux sens.
-const SEARCH_CAPS: &str = "upnp:class,dc:title";
+///
+/// `@refID` s'y ajoute pour #1390. Ce n'est pas un champ de recherche de plus :
+/// c'est le suffixe que la specification ContentDirectory:1 donne en EXEMPLE
+/// (`… and @refID exists false`, « exclure les objets de reference ») et que
+/// les points de controle collent derriere CHAQUE critere de classe. Ne pas
+/// l'evaluer le faisait tomber dans le bras « autre champ » d'`evaluer_criteres`
+/// — donc un SOAP 708, donc un dossier vide chez Foobar2000 et WiiM la ou
+/// Emby et Serviio remplissaient (Roro62, fil forum, #1390).
+const SEARCH_CAPS: &str = "upnp:class,dc:title,@refID";
 
 /// L'action `Search` de ContentDirectory.
 ///
 /// Portee volontairement etroite, et annoncee comme telle : on sait rendre
-/// **les pistes**. C'est ce que demandent les clients d'indexation, et c'est
-/// la seule chose qu'on puisse servir sans inventer un moteur de criteres
-/// complet — un `SearchCriteria` peut porter des expressions booleennes
-/// arbitraires que personne ici ne sait evaluer.
+/// **ce que `browse_*` publie deja** — pistes, radios, artistes, albums,
+/// genres, listes de lecture. C'est ce que demandent les clients d'indexation et les menus des
+/// lecteurs reseau, et c'est tout ce qu'on puisse servir sans inventer un
+/// moteur de criteres complet : un `SearchCriteria` peut porter des
+/// expressions booleennes arbitraires que personne ici ne sait evaluer.
 ///
-/// Un critere qui ne vise pas des pistes rend une liste VIDE plutot qu'une
-/// faute : un client qui cherche des images ou des videos doit lire « rien de
-/// tel ici », pas « ce serveur est casse ».
+/// Un critere qui ne vise aucune classe publiee rend une liste VIDE plutot
+/// qu'une faute : un client qui cherche des images ou des videos doit lire
+/// « rien de tel ici », pas « ce serveur est casse ».
 ///
-/// La pagination est celle de `browse_all_tracks`, deja eprouvee — le client
-/// redemande par tranches, exactement comme sur le conteneur « All Tracks ».
+/// La pagination des pistes est celle de `browse_all_tracks`, deja eprouvee —
+/// le client redemande par tranches, exactement comme sur « All Tracks ».
 fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     let (container_id, criteria, start, count, sort_criteria) = parse_search_request(soap_body);
     if !sort_criteria.trim().is_empty() {
@@ -547,8 +603,8 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     };
     let base_url = state.base_url();
 
-    let didl = if criteres.classe_correspond {
-        match search_tracks_in_container(
+    let didl = match criteres.cible {
+        Some(CibleRecherche::Pistes) => match search_tracks_in_container(
             state,
             &container_id,
             start,
@@ -558,9 +614,21 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
         ) {
             Some(result) => result,
             None => return soap_fault(710, "No such container"),
+        },
+        Some(cible) => {
+            match search_containers_in_container(
+                state,
+                cible,
+                &container_id,
+                start,
+                count,
+                &criteres.titres,
+            ) {
+                Some(result) => result,
+                None => return soap_fault(710, "No such container"),
+            }
         }
-    } else {
-        empty_didl()
+        None => empty_didl(),
     };
 
     format!(
@@ -581,39 +649,170 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     )
 }
 
-/// Évalue le sous-ensemble de SearchCriteria réellement annoncé.
+/// La rubrique qu'un `SearchCriteria` vise, une fois réduite à ce que Tune
+/// publie réellement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CibleRecherche {
+    Pistes,
+    Radios,
+    Artistes,
+    Albums,
+    Genres,
+    Listes,
+}
+
+impl CibleRecherche {
+    /// Le conteneur racine où cette rubrique se parcourt. C'est, avec la
+    /// racine « 0 », la seule portée où une recherche de cette classe a un
+    /// sens : chercher des artistes DANS un album ne rend rien.
+    fn conteneur_racine(self) -> &'static str {
+        match self {
+            CibleRecherche::Pistes => "tracks",
+            CibleRecherche::Radios => "radios",
+            CibleRecherche::Artistes => "artists",
+            CibleRecherche::Albums => "albums",
+            CibleRecherche::Genres => "genres",
+            CibleRecherche::Listes => "playlists",
+        }
+    }
+}
+
+/// Les classes DIDL que Tune publie RÉELLEMENT, avec les ancêtres qu'un
+/// `derivedfrom` a le droit de nommer pour les atteindre.
 ///
-/// Tune annonce uniquement `upnp:class`. Toute expression qui mentionne un
-/// autre champ ou combine plusieurs prédicats reçoit le SOAP 708 prévu par
-/// ContentDirectory, au lieu de rendre mensongèrement toute la bibliothèque.
+/// `Search` ne peut rendre que ce qui existe : cette table est la liste
+/// exhaustive, et c'est elle qui dit quelle rubrique une expression vise.
+/// Les six entrées correspondent une à une aux `browse_*` : `browse_all_tracks`,
+/// `browse_radios`, `browse_artists`, `browse_albums`, `browse_genres`,
+/// `browse_playlists`.
 ///
-/// Le booléen indique si la classe fixe de nos éléments
-/// (`object.item.audioItem.musicTrack`) satisfait le prédicat. `*` reste le
-/// raccourci d'indexation historique vers toutes les pistes.
-fn evaluate_supported_class_criteria(criteria: &str) -> Result<bool, ()> {
+/// Le rayon « Years » n'y figure pas, et c'est un manque ASSUMÉ : ses
+/// conteneurs portent `object.container`, la classe générique, qu'aucun
+/// `SearchCriteria` ne peut viser sans ramener aussi les quatre autres
+/// rubriques de conteneurs. Il se parcourt par `Browse`, pas par `Search`.
+///
+/// Les ancêtres sont volontairement PROCHES. `object.item`, `object.container`
+/// ou `object` balaieraient tout, et c'est exactement le garde que tient le
+/// test `une_recherche_d_images_ou_de_videos_ne_rend_rien` : sans lui,
+/// « object.item.imageItem » passerait par la clause `object.item` et rendrait
+/// toute la discothèque à un client qui cherche des photos.
+const CLASSES_PUBLIEES: [(CibleRecherche, &str, &[&str]); 6] = [
+    (
+        CibleRecherche::Pistes,
+        "object.item.audioitem.musictrack",
+        &["object.item.audioitem"],
+    ),
+    (
+        CibleRecherche::Radios,
+        "object.item.audioitem.audiobroadcast",
+        &["object.item.audioitem"],
+    ),
+    (
+        CibleRecherche::Artistes,
+        "object.container.person.musicartist",
+        &["object.container.person"],
+    ),
+    (
+        CibleRecherche::Albums,
+        "object.container.album.musicalbum",
+        &["object.container.album"],
+    ),
+    (
+        CibleRecherche::Genres,
+        "object.container.genre.musicgenre",
+        &["object.container.genre"],
+    ),
+    (
+        CibleRecherche::Listes,
+        "object.container.playlistcontainer",
+        // Aucun ancêtre : le seul que DIDL-Lite lui donne est
+        // `object.container`, et la table le refuse délibérément — le nommer
+        // ferait de « tous les conteneurs » une recherche de listes de
+        // lecture. Un point de contrôle nomme la classe exacte, c'est ce
+        // qu'envoie l'entrée « Playlists » du menu d'un lecteur réseau.
+        &[],
+    ),
+];
+
+/// Un prédicat `upnp:class` appliqué à UNE classe publiée.
+fn predicat_de_classe(op: &str, valeur: &str, classe: &str, ancetres: &[&str]) -> Result<bool, ()> {
+    match op {
+        "=" => Ok(classe == valeur),
+        "!=" => Ok(classe != valeur),
+        "contains" => Ok(classe.contains(valeur)),
+        "doesnotcontain" => Ok(!classe.contains(valeur)),
+        "derivedfrom" => Ok(valeur == classe || ancetres.iter().any(|a| *a == valeur)),
+        _ => Err(()),
+    }
+}
+
+/// Évalue le sous-ensemble de SearchCriteria réellement annoncé, et rend les
+/// rubriques que le prédicat laisse passer.
+///
+/// Tune annonce `upnp:class` et `dc:title`. Toute expression qui mentionne un
+/// autre champ reçoit le SOAP 708 prévu par ContentDirectory, au lieu de
+/// rendre mensongèrement toute la bibliothèque.
+///
+/// `*` reste le raccourci d'indexation historique — il laisse passer tout ce
+/// qu'on publie, et [`cible_unique`] le ramène aux pistes.
+fn cibles_du_predicat(criteria: &str) -> Result<Vec<CibleRecherche>, ()> {
     let c = criteria.trim();
     if c == "*" {
-        return Ok(true);
+        return Ok(CLASSES_PUBLIEES
+            .iter()
+            .map(|(cible, _, _)| *cible)
+            .collect());
     }
     let parts: Vec<&str> = c.split_whitespace().collect();
     if parts.len() != 3 || !parts[0].eq_ignore_ascii_case("upnp:class") {
         return Err(());
     }
-    let value = parts[2]
+    let valeur = parts[2]
         .strip_prefix('"')
         .and_then(|v| v.strip_suffix('"'))
         .ok_or(())?
         .to_ascii_lowercase();
-    let track_class = "object.item.audioitem.musictrack";
-    match parts[1].to_ascii_lowercase().as_str() {
-        "=" => Ok(track_class == value),
-        "!=" => Ok(track_class != value),
-        "contains" => Ok(track_class.contains(&value)),
-        "doesnotcontain" => Ok(!track_class.contains(&value)),
-        "derivedfrom" => Ok((value == "object.item.audioitem" || value == track_class)
-            && (track_class == value || track_class.starts_with(&(value + ".")))),
-        _ => Err(()),
+    let op = parts[1].to_ascii_lowercase();
+    let mut retenues = Vec::new();
+    for (cible, classe, ancetres) in CLASSES_PUBLIEES {
+        if predicat_de_classe(&op, &valeur, classe, ancetres)? {
+            retenues.push(cible);
+        }
     }
+    Ok(retenues)
+}
+
+/// Une expression de classe peut laisser passer PLUSIEURS rubriques :
+/// `derivedfrom "object.item.audioItem"` vise à la fois les pistes et les
+/// radios. La règle est choisie pour ne rien changer à ce qui marchait — les
+/// pistes l'emportent, parce que c'est le parcours d'indexation historique
+/// (#1516) et qu'il doit rendre exactement la même chose qu'avant.
+///
+/// Sinon une rubrique unique est servie. Une ambiguïté entre plusieurs
+/// rubriques non-pistes rend une liste vide plutôt qu'un mélange qu'aucun
+/// point de contrôle ne saurait paginer.
+fn cible_unique(cibles: &[CibleRecherche]) -> Option<CibleRecherche> {
+    if cibles.contains(&CibleRecherche::Pistes) {
+        return Some(CibleRecherche::Pistes);
+    }
+    match cibles {
+        [seule] => Some(*seule),
+        _ => None,
+    }
+}
+
+/// Le prédicat vu du seul point de vue des PISTES.
+///
+/// Forme historique conservée : c'est elle qui porte l'invariant de #2312 —
+/// n'annoncer que ce qu'on évalue — et les tests qui le tiennent.
+///
+/// La recherche de production passe désormais par [`evaluer_criteres`], qui
+/// intersecte TOUTES les rubriques publiées puis conclut par [`cible_unique`] ;
+/// ce raccourci « est-ce des pistes ? » n'y a plus d'appelant. Portée `test`
+/// pour le dire, plutôt que de laisser croire à une seconde porte d'entrée.
+#[cfg(test)]
+fn evaluate_supported_class_criteria(criteria: &str) -> Result<bool, ()> {
+    Ok(cibles_du_predicat(criteria)?.contains(&CibleRecherche::Pistes))
 }
 
 /// Un predicat sur `dc:title`.
@@ -688,8 +887,9 @@ fn sans_accents_minuscule(s: &str) -> String {
 /// Ce qu'un `SearchCriteria` demande, une fois reduit a ce qu'on sait faire.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CriteresRecherche {
-    /// La classe fixe de nos elements satisfait-elle les predicats de classe ?
-    pub(crate) classe_correspond: bool,
+    /// La rubrique visee, ou `None` si aucune classe publiee ne convient —
+    /// une recherche de photos, par exemple, rend une liste vide.
+    pub(crate) cible: Option<CibleRecherche>,
     pub(crate) titres: Vec<PredicatTitre>,
 }
 
@@ -698,16 +898,18 @@ pub(crate) struct CriteresRecherche {
 /// Portee, volontairement etroite et alignee sur `SEARCH_CAPS` :
 /// - `*`, le raccourci d'indexation historique ;
 /// - des predicats sur `upnp:class` et `dc:title` ;
+/// - `@refID exists true|false`, la clause d'existence des exemples de la
+///   specification (#1390) ;
 /// - leur conjonction par `and`.
 ///
-/// Tout le reste — `or`, parentheses, autre champ, `exists` — rend `Err`, donc
-/// un SOAP 708. C'est la lecon de #2312 : mieux vaut refuser explicitement que
-/// rendre la bibliotheque entiere en faisant croire qu'on a cherche.
+/// Tout le reste — `or`, parentheses, autre champ — rend `Err`, donc un SOAP
+/// 708. C'est la lecon de #2312 : mieux vaut refuser explicitement que rendre
+/// la bibliotheque entiere en faisant croire qu'on a cherche.
 pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> {
     let c = criteria.trim();
     if c == "*" {
         return Ok(CriteresRecherche {
-            classe_correspond: true,
+            cible: Some(CibleRecherche::Pistes),
             titres: Vec::new(),
         });
     }
@@ -715,13 +917,18 @@ pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> 
         return Err(());
     }
 
-    let mut classe_correspond = true;
+    // On part de TOUT ce qu'on publie, et chaque predicat de classe restreint.
+    // La conjonction se lit donc comme une intersection, ce qu'elle est.
+    let mut cibles: Vec<CibleRecherche> = CLASSES_PUBLIEES
+        .iter()
+        .map(|(cible, _, _)| *cible)
+        .collect();
     let mut titres = Vec::new();
     for predicat in decouper_conjonction(c)? {
         let (champ, op, valeur) = decouper_predicat(&predicat)?;
         if champ.eq_ignore_ascii_case("upnp:class") {
-            classe_correspond &=
-                evaluate_supported_class_criteria(&format!("{champ} {op} \"{valeur}\""))?;
+            let retenues = cibles_du_predicat(&format!("{champ} {op} \"{valeur}\""))?;
+            cibles.retain(|cible| retenues.contains(cible));
         } else if champ.eq_ignore_ascii_case("dc:title") {
             let op = match op.to_ascii_lowercase().as_str() {
                 "contains" => OpTitre::Contient,
@@ -731,12 +938,29 @@ pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> 
                 _ => return Err(()),
             };
             titres.push(PredicatTitre { op, valeur });
+        } else if champ.eq_ignore_ascii_case("@refID") {
+            // `@refID exists false` = « pas les objets de reference ». Tune
+            // n'en publie AUCUN — aucun `<item>` ni `<container>` sorti d'ici
+            // ne porte de `refID` —, donc tout ce que nous publions satisfait
+            // deja ce predicat : il ne restreint rien.
+            //
+            // Sa forme inverse, `@refID exists true`, ne peut rendre que la
+            // liste vide, pour la meme raison. Vide, pas en faute : c'est la
+            // regle deja tenue par `une_classe_inconnue_ou_ambigue_rend_une_liste_vide`.
+            if !op.eq_ignore_ascii_case("exists") {
+                return Err(());
+            }
+            match valeur.to_ascii_lowercase().as_str() {
+                "false" => {}
+                "true" => cibles.clear(),
+                _ => return Err(()),
+            }
         } else {
             return Err(());
         }
     }
     Ok(CriteresRecherche {
-        classe_correspond,
+        cible: cible_unique(&cibles),
         titres,
     })
 }
@@ -795,11 +1019,21 @@ fn decouper_predicat(p: &str) -> Result<(String, String, String), ()> {
     let champ = it.next().ok_or(())?.to_string();
     let op = it.next().ok_or(())?.to_string();
     let brut = it.next().ok_or(())?.trim().to_string();
-    let valeur = brut
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .ok_or(())?
-        .to_string();
+    let valeur = match brut.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        Some(v) => v.to_string(),
+        // `exists` prend un booleen NU — `@refID exists false`, sans
+        // guillemets, comme dans les exemples de la specification. Exiger des
+        // guillemets partout faisait echouer le decoupage AVANT meme qu'on
+        // regarde le champ, et le critere entier partait en 708 (#1390).
+        // La tolerance s'arrete la : elle n'est ouverte que pour `exists`, et
+        // seulement pour `true`/`false`.
+        None if op.eq_ignore_ascii_case("exists")
+            && (brut.eq_ignore_ascii_case("true") || brut.eq_ignore_ascii_case("false")) =>
+        {
+            brut
+        }
+        None => return Err(()),
+    };
     Ok((champ, op, valeur))
 }
 
@@ -874,6 +1108,146 @@ fn search_tracks_in_container(
         }
         _ => None,
     }
+}
+
+/// Assez large pour une bibliotheque reelle (2 222 albums sur la
+/// bibliotheque de reference), assez borne pour qu'un `Search` ne batisse
+/// jamais un DIDL de plusieurs megaoctets en memoire. Meme regle et meme
+/// ordre de grandeur que `candidats_par_titre` pour les pistes.
+const MAX_CANDIDATS_CONTENEURS: i64 = 10_000;
+
+/// Les rubriques NON-pistes d'un `Search` : artistes, albums, genres, radios,
+/// listes de lecture.
+///
+/// C'est le trou que decrit le fil forum #1439 (#1777, Jean Valjean, Marantz
+/// ND8006, releve du 30/08/2026) : le meme serveur montre ses conteneurs
+/// PLEINS par « Parcourir les dossiers » — le chemin `Browse` — et VIDES par
+/// les entrees Artistes / Albums / Genres / Radios du menu de l'appareil, qui
+/// passent par `Search`. Seule « Titres » repondait, parce que `Search` ne
+/// connaissait qu'une classe, `object.item.audioItem.musicTrack` : toute
+/// expression visant un conteneur retombait sur un DIDL vide, sans faute ni
+/// trace. Les rubriques existent pourtant deja — ce sont celles de `browse_*`,
+/// et ce sont leurs emetteurs DIDL qui servent ici.
+///
+/// La lecture est BORNEE puis paginee en memoire, parce qu'un predicat de
+/// titre doit s'appliquer AVANT la page — sinon deux pages successives ne
+/// porteraient pas sur le meme ensemble. `TotalMatches` reflete donc ce qui a
+/// ete retenu, comme pour `candidats_par_titre`.
+fn search_containers_in_container(
+    state: &UpnpState,
+    cible: CibleRecherche,
+    container_id: &str,
+    start: u64,
+    count: u64,
+    titres: &[PredicatTitre],
+) -> Option<DidlResult> {
+    // Chercher des artistes DANS un album n'a pas de sens : la liste est vide,
+    // elle n'est pas fautive. Seul un identifiant qu'on ne publie nulle part
+    // merite le 710 — c'est la meme distinction que fait `search_tracks_in_container`
+    // entre ses branches connues et son bras par defaut.
+    if container_id != "0" && container_id != cible.conteneur_racine() {
+        return if conteneur_publie(container_id) {
+            Some(empty_didl())
+        } else {
+            None
+        };
+    }
+    let base_url = state.base_url();
+    match cible {
+        // Traitees par `search_tracks_in_container`, qui pagine en base.
+        CibleRecherche::Pistes => None,
+        CibleRecherche::Artistes => {
+            let artistes = ArtistRepo::with_backend(state.backend.clone())
+                .list(MAX_CANDIDATS_CONTENEURS, 0)
+                .unwrap_or_default();
+            let retenus = retenir_par_titre(artistes, titres, |a| a.name.as_str());
+            let (page, total) = paginer(retenus, start, count);
+            Some(didl_artistes(state, &page, "artists", total))
+        }
+        CibleRecherche::Albums => {
+            let albums = AlbumRepo::with_backend(state.backend.clone())
+                .list(MAX_CANDIDATS_CONTENEURS, 0)
+                .unwrap_or_default();
+            let retenus = retenir_par_titre(albums, titres, |a| a.title.as_str());
+            let (page, total) = paginer(retenus, start, count);
+            let mut didl = didl_albums_under(&page, "albums", &base_url);
+            didl.total = total;
+            Some(didl)
+        }
+        CibleRecherche::Genres => {
+            let genres = lire_genres(state);
+            let retenus = retenir_par_titre(genres, titres, |g| g.0.as_str());
+            let (page, total) = paginer(retenus, start, count);
+            let mut didl = didl_genres(&page);
+            didl.total = total;
+            Some(didl)
+        }
+        // #2971 : `browse_playlists` publie déjà ces conteneurs, et
+        // `Search` ne les trouvait pas — le dossier « Playlists » plein par
+        // un verbe, vide par l'autre. Même source, même émetteur DIDL.
+        CibleRecherche::Listes => {
+            let listes = lire_listes_publiables(state);
+            let retenues = retenir_par_titre(listes, titres, |l| l.name.as_str());
+            let (page, total) = paginer(retenues, start, count);
+            let mut didl = didl_listes(&page);
+            didl.total = total;
+            Some(didl)
+        }
+        CibleRecherche::Radios => {
+            let stations = RadioRepo::with_backend(state.backend.clone())
+                .list()
+                .unwrap_or_default();
+            let retenues = retenir_par_titre(stations, titres, |s| s.name.as_str());
+            let (page, total) = paginer(retenues, start, count);
+            let mut didl = didl_radios(&page, &base_url);
+            didl.total = total;
+            Some(didl)
+        }
+    }
+}
+
+/// Les identifiants de conteneur que le serveur publie — la racine, les
+/// rubriques de [`ROOT_CONTAINERS`] et leurs enfants navigables. La liste doit
+/// suivre `browse_direct_children` : un conteneur qu'on sait ouvrir doit se
+/// laisser interroger, meme pour rendre une liste vide.
+fn conteneur_publie(id: &str) -> bool {
+    id == "0"
+        || ROOT_CONTAINERS.iter().any(|(racine, _, _)| *racine == id)
+        || ["artist/", "album/", "genre/", "year/", "playlist/"]
+            .iter()
+            .any(|prefixe| id.starts_with(prefixe))
+}
+
+/// Applique les predicats `dc:title` au nom visible d'objets non-pistes.
+///
+/// Le nom visible est celui que le DIDL met dans `<dc:title>` : le nom de
+/// l'artiste, le titre de l'album, le nom du genre ou de la station. Chercher
+/// sur autre chose rendrait deux resultats differents selon la rubrique.
+fn retenir_par_titre<T>(
+    items: Vec<T>,
+    titres: &[PredicatTitre],
+    nom: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    if titres.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|item| titres.iter().all(|p| p.satisfait(nom(item))))
+        .collect()
+}
+
+/// La page demandee et le total retenu. Meme borne de page que les pistes :
+/// rendre moins que demande est permis, c'est `TotalMatches` qui dit la
+/// taille reelle et un point de controle correct pagine a partir de la.
+fn paginer<T>(items: Vec<T>, start: u64, count: u64) -> (Vec<T>, u64) {
+    const MAX_PAGE: usize = 500;
+    let total = items.len();
+    let debut = usize::try_from(start).unwrap_or(usize::MAX).min(total);
+    let demande = usize::try_from(count).unwrap_or(usize::MAX).min(MAX_PAGE);
+    let fin = debut.saturating_add(demande).min(total);
+    let page = items.into_iter().skip(debut).take(fin - debut).collect();
+    (page, total as u64)
 }
 
 /// Toute la bibliotheque ne passe pas en memoire : on demande d'abord a la
@@ -1232,55 +1606,24 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
             "object.container.storageFolder",
             Some(ROOT_CONTAINERS.len() as u64),
         )),
-        "artists" => Some(didl_container(
-            "artists",
-            "0",
-            "Artists",
-            "object.container",
-            None,
-        )),
-        "albums" => Some(didl_container(
-            "albums",
-            "0",
-            "Albums",
-            "object.container",
-            None,
-        )),
-        "genres" => Some(didl_container(
-            "genres",
-            "0",
-            "Genres",
-            "object.container",
-            None,
-        )),
-        "years" => Some(didl_container(
-            "years",
-            "0",
-            "Years",
-            "object.container",
-            None,
-        )),
-        "tracks" => Some(didl_container(
-            "tracks",
-            "0",
-            "All Tracks",
-            "object.container",
-            None,
-        )),
-        "radios" => Some(didl_container(
-            "radios",
-            "0",
-            "Radio",
-            "object.container",
-            None,
-        )),
-        "playlists" => Some(didl_container(
-            "playlists",
-            "0",
-            "Playlists",
-            "object.container",
-            None,
-        )),
+        // Les sept rubriques racine se décrivent depuis `ROOT_CONTAINERS`,
+        // seule source de vérité de leur identifiant, de leur titre et de leur
+        // classe — sept branches recopiées à la main finissaient toujours par
+        // diverger de la liste. Et chacune annonce le nombre d'enfants que son
+        // Browse ouvrira : c'est ce que le point de contrôle affiche AVANT
+        // d'ouvrir, la différence entre une bibliothèque et un dossier.
+        id if ROOT_CONTAINERS.iter().any(|(racine, _, _)| *racine == id) => ROOT_CONTAINERS
+            .iter()
+            .find(|(racine, _, _)| *racine == id)
+            .map(|(racine, titre, classe)| {
+                didl_container(
+                    racine,
+                    "0",
+                    titre,
+                    classe,
+                    compter_enfants_racine(state, racine),
+                )
+            }),
         id if id.starts_with("artist/") => {
             let artist_id: i64 = id
                 .strip_prefix("artist/")
@@ -1292,12 +1635,21 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                 .ok()
                 .flatten()
                 .map(|a| {
+                    // Décrit avec le même nombre d'albums que la liste
+                    // d'artistes en annonce : deux vues du même artiste ne
+                    // doivent pas donner deux tailles.
+                    let nb = AlbumRepo::with_backend(state.backend.clone())
+                        .count_by_artists(&[artist_id])
+                        .unwrap_or_default()
+                        .get(&artist_id)
+                        .copied()
+                        .unwrap_or(0);
                     didl_container(
                         id,
                         "artists",
                         &a.name,
                         "object.container.person.musicArtist",
-                        None,
+                        u64::try_from(nb).ok(),
                     )
                 })
         }
@@ -1324,13 +1676,23 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
         // Un genre est un conteneur comme un autre : sans cette branche, un
         // point de contrôle strict qui décrit l'objet avant de l'ouvrir
         // n'obtenait rien et abandonnait la navigation.
+        //
+        // Sa taille est celle que la LISTE annonce, prise à la même source :
+        // deux vues d'un même genre ne doivent pas donner deux tailles. Un
+        // identifiant qui n'est pas un genre publié n'a pas de compteur —
+        // l'absence d'attribut vaut mieux qu'un zéro, qui se lirait « dossier
+        // vide » alors qu'il s'agit d'un dossier inconnu.
         id if id.starts_with("genre/") => decode_genre_id(id).map(|genre| {
+            let nb = lire_genres(state)
+                .into_iter()
+                .find(|(publie, _)| *publie == genre)
+                .map(|(_, nb)| nb);
             didl_container(
                 id,
                 "genres",
                 &genre,
                 "object.container.genre.musicGenre",
-                None,
+                nb,
             )
         }),
         // Même règle que `genre/` : une année est un conteneur comme un autre,
@@ -1359,6 +1721,45 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                     Some(liste.track_count as u64),
                 )
             }),
+        // Un `<item>` publie doit savoir se decrire, exactement comme un
+        // conteneur. ContentDirectory:1 ne fait aucune difference : « If
+        // BrowseFlag is BrowseMetadata, ObjectID identifies the object to
+        // return metadata for » — n'importe quel objet, item compris.
+        //
+        // `radio/N` et `track/N` tombaient dans le bras par defaut et
+        // rendaient un DIDL VIDE avec `NumberReturned = 0`, sans fault : le
+        // point de controle recoit « cet objet existe et n'a pas de
+        // metadonnees », ce qui n'est pas une reponse prevue. Le trou etait
+        // deja constate dans le test
+        // [`tests::chaque_rayon_de_la_racine_s_ouvre_par_soap`], qui SAUTAIT
+        // les items pour cette raison (« C'est un trou reel du contrat CDS:1
+        // [...] Constate, pas corrige »). Le `continue` a ete retire avec ce
+        // correctif.
+        //
+        // C'est le mode d'echec type d'un indexeur (#2183, JPLAY iOS) :
+        // parcourir par `Browse`, puis valider chaque objet par
+        // `BrowseMetadata`. Un objet publie qui ne se decrit pas fait echouer
+        // l'indexation sans que rien ne soit journalise.
+        id if id.starts_with("radio/") => id
+            .strip_prefix("radio/")
+            .and_then(|n| n.parse::<i64>().ok())
+            .and_then(|radio_id| {
+                RadioRepo::with_backend(state.backend.clone())
+                    .get(radio_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|station| didl_radio_item(&station, &state.base_url())),
+        id if id.starts_with("track/") => id
+            .strip_prefix("track/")
+            .and_then(|n| n.parse::<i64>().ok())
+            .and_then(|track_id| {
+                TrackRepo::with_backend(state.backend.clone())
+                    .get(track_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|track| didl_track_item(&track, "tracks", &state.base_url())),
         _ => None,
     };
 
@@ -1388,10 +1789,10 @@ fn browse_direct_children(
         "0" => browse_root(state),
         "artists" => browse_artists(state, start, count),
         "albums" => browse_albums(state, start, count),
-        "genres" => browse_genres(state),
-        "years" => browse_years(state),
+        "genres" => browse_genres(state, start, count),
+        "years" => browse_years(state, start, count),
         "tracks" => browse_all_tracks(state, start, count, &base_url),
-        "radios" => browse_radios(state),
+        "radios" => browse_radios(state, start, count),
         "playlists" => browse_playlists(state, start, count),
         id if id.starts_with("artist/") => {
             let artist_id: i64 = id
@@ -1538,21 +1939,24 @@ const PLAYLIST_FETCH_CAP: i64 = 10_000;
 /// `total` est le nombre RÉEL de listes publiables, pas la taille de la page :
 /// c'est lui que le point de contrôle lit pour savoir s'il reste des pages.
 fn browse_playlists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
-    let listes: Vec<_> = PlaylistRepo::with_backend(state.backend.clone())
-        .list(UPNP_PROFILE_ID, PLAYLIST_FETCH_CAP, 0)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|liste| liste.track_count > 0 && liste.id.is_some())
-        .collect();
+    let listes = lire_listes_publiables(state);
 
     let total = listes.len();
     let debut = usize::try_from(start).unwrap_or(usize::MAX).min(total);
     let demande = usize::try_from(count).unwrap_or(usize::MAX);
     let fin = debut.saturating_add(demande).min(total);
-    let page = &listes[debut..fin];
+    let mut didl = didl_listes(&listes[debut..fin]);
+    didl.total = total as u64;
+    didl
+}
 
+/// Le DIDL d'une liste de listes de lecture. `Browse` et `Search` passent par
+/// ici, comme `didl_genres` pour les genres : deux emetteurs pour la meme
+/// rubrique finiraient par diverger, et c'est exactement ce que #1777 avait
+/// laisse arriver — le meme dossier plein par un verbe, vide par l'autre.
+fn didl_listes(listes: &[crate::db::playlist_repo::Playlist]) -> DidlResult {
     let mut inner = String::new();
-    for liste in page {
+    for liste in listes {
         inner.push_str(&didl_container(
             &format!("playlist/{}", liste.id.unwrap_or(0)),
             "playlists",
@@ -1561,12 +1965,26 @@ fn browse_playlists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
             Some(liste.track_count as u64),
         ));
     }
-
+    let total = listes.len() as u64;
     DidlResult {
         xml: didl_wrap(&inner),
-        total: total as u64,
-        returned: page.len() as u64,
+        total,
+        returned: total,
     }
+}
+
+/// Les listes de lecture que « Playlists » publie réellement : celles qui ont
+/// au moins une piste et une identité. Extraite de `browse_playlists` pour que
+/// le `childCount` du conteneur racine et la liste qu'il ouvre appliquent le
+/// MÊME filtre — annoncer 9 listes et n'en ouvrir que 7 serait pire que de
+/// n'annoncer aucun nombre.
+fn lire_listes_publiables(state: &UpnpState) -> Vec<crate::db::playlist_repo::Playlist> {
+    PlaylistRepo::with_backend(state.backend.clone())
+        .list(UPNP_PROFILE_ID, PLAYLIST_FETCH_CAP, 0)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|liste| liste.track_count > 0 && liste.id.is_some())
+        .collect()
 }
 
 /// Les pistes d'une liste de lecture, **dans l'ordre de la liste**.
@@ -1637,12 +2055,59 @@ fn pistes_dans_l_ordre(state: &UpnpState, ids: &[i64]) -> Vec<Track> {
         .collect()
 }
 
-fn browse_root(_state: &UpnpState) -> DidlResult {
+/// Le nombre d'enfants d'un conteneur RACINE, calculé sans bâtir leur DIDL.
+///
+/// C'est ce qui sépare une bibliothèque d'un dossier : sans `childCount`, la
+/// racine d'un serveur Tune distant se lit comme sept dossiers anonymes, et
+/// c'est exactement le reproche de #2299. L'attribut est standard — tout point
+/// de contrôle le rend déjà, et la vue « Serveurs multimédia » aussi
+/// (`network.rs::parse_didl_browse_response` le lit en `child_count`). Aucun
+/// écran n'est à dessiner pour que ce nombre s'affiche.
+///
+/// Chaque branche appelle la MÊME source que le `browse_*` correspondant —
+/// `lire_genres`, `lire_annees` et `lire_listes_publiables` ont été extraites
+/// pour ça. Le test [`le_nombre_annonce_est_celui_qui_s_ouvre`] verrouille
+/// l'égalité avec `browse_direct_children(..., 0, 0).total` pour chaque entrée
+/// de [`ROOT_CONTAINERS`] : un compteur qui diverge de ce que le conteneur
+/// ouvre serait pire que pas de compteur du tout.
+///
+/// `None` pour un identifiant qui n'est pas une racine : l'appelant n'émet
+/// alors aucun attribut, plutôt qu'un zéro qui se lirait « dossier vide ».
+fn compter_enfants_racine(state: &UpnpState, object_id: &str) -> Option<u64> {
+    let n: i64 = match object_id {
+        "artists" => ArtistRepo::with_backend(state.backend.clone())
+            .count()
+            .ok()?,
+        "albums" => AlbumRepo::with_backend(state.backend.clone())
+            .count()
+            .ok()?,
+        "genres" => lire_genres(state).len() as i64,
+        "years" => lire_annees(state).len() as i64,
+        "tracks" => TrackRepo::with_backend(state.backend.clone())
+            .count()
+            .ok()?,
+        "radios" => RadioRepo::with_backend(state.backend.clone())
+            .list()
+            .ok()?
+            .len() as i64,
+        "playlists" => lire_listes_publiables(state).len() as i64,
+        _ => return None,
+    };
+    u64::try_from(n).ok()
+}
+
+fn browse_root(state: &UpnpState) -> DidlResult {
     let containers = ROOT_CONTAINERS;
 
     let mut inner = String::new();
     for (id, title, class) in &containers {
-        inner.push_str(&didl_container(id, "0", title, class, None));
+        inner.push_str(&didl_container(
+            id,
+            "0",
+            title,
+            class,
+            compter_enfants_racine(state, id),
+        ));
     }
 
     DidlResult {
@@ -1656,16 +2121,43 @@ fn browse_artists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let repo = ArtistRepo::with_backend(state.backend.clone());
     let total = repo.count().unwrap_or(0) as u64;
     let artists = repo.list(count as i64, start as i64).unwrap_or_default();
+    didl_artistes(state, &artists, "artists", total)
+}
+
+/// Le DIDL d'une liste d'artistes. `Browse` et `Search` passent tous deux par
+/// ici : deux vues d'un meme artiste doivent dire exactement la meme chose.
+///
+/// Chaque artiste annonce son nombre d'albums — celui que `browse_artist_albums`
+/// ouvrira, puisque [`AlbumRepo::count_by_artists`] applique le prédicat de
+/// `list_by_artist`. Les comptes de toute la page viennent d'UNE requête : une
+/// par artiste ferait cinq cents allers-retours sur une seule page de Browse.
+fn didl_artistes(
+    state: &UpnpState,
+    artists: &[crate::db::models::Artist],
+    parent_id: &str,
+    total: u64,
+) -> DidlResult {
+    let ids: Vec<i64> = artists.iter().filter_map(|a| a.id).collect();
+    let nb_albums = AlbumRepo::with_backend(state.backend.clone())
+        .count_by_artists(&ids)
+        .unwrap_or_default();
 
     let mut inner = String::new();
-    for artist in &artists {
+    for artist in artists {
         let id = format!("artist/{}", artist.id.unwrap_or(0));
+        // Un artiste absent de la réponse groupée n'a aucun album visible :
+        // c'est un zéro, pas une inconnue. On l'annonce, sinon un dossier sans
+        // attribut se lit comme un dossier dont on ignore la taille.
+        let nb = artist
+            .id
+            .and_then(|aid| nb_albums.get(&aid).copied())
+            .unwrap_or(0);
         inner.push_str(&didl_container(
             &id,
-            "artists",
+            parent_id,
             &artist.name,
             "object.container.person.musicArtist",
-            None,
+            u64::try_from(nb).ok(),
         ));
     }
 
@@ -1681,39 +2173,12 @@ fn browse_albums(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let total = repo.count().unwrap_or(0) as u64;
     let albums = repo.list(count as i64, start as i64).unwrap_or_default();
 
-    let mut inner = String::new();
-    for album in &albums {
-        let id = format!("album/{}", album.id.unwrap_or(0));
-        let child_count = album.track_count.map(|c| c as u64);
-        let mut extra = String::new();
-        if let Some(ref artist_name) = album.artist_name {
-            extra.push_str(&format!(
-                "<dc:creator>{}</dc:creator>",
-                quick_xml::escape::escape(artist_name)
-            ));
-        }
-        if let Some(ref cover) = album.cover_path {
-            let url = artwork_url(&state.base_url(), cover);
-            extra.push_str(&format!(
-                "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                quick_xml::escape::escape(&url)
-            ));
-        }
-        inner.push_str(&didl_container_ext(
-            &id,
-            "albums",
-            &album.title,
-            "object.container.album.musicAlbum",
-            child_count,
-            &extra,
-        ));
-    }
-
-    DidlResult {
-        xml: didl_wrap(&inner),
-        total,
-        returned: albums.len() as u64,
-    }
+    // `didl_albums_under` emet exactement ce conteneur — createur, pochette,
+    // nombre de pistes. Seul le total differe : ici c'est la table entiere,
+    // pas la page, pour que le point de controle sache qu'il reste des pages.
+    let mut didl = didl_albums_under(&albums, "albums", &state.base_url());
+    didl.total = total;
+    didl
 }
 
 /// Toute la bibliothèque à plat, paginée.
@@ -1772,39 +2237,37 @@ fn browse_all_tracks(state: &UpnpState, start: u64, count: u64, base_url: &str) 
     }
 }
 
-fn browse_genres(state: &UpnpState) -> DidlResult {
-    // Fetch distinct genres from the albums table.
-    //
-    // `COLLATE NOCASE` is SQLite-only — PostgreSQL rejects it — so the sort is
-    // dialect-specific. `LOWER(genre)` is the portable equivalent and gives
-    // the same ordering on both.
-    let order = match state.backend.engine() {
-        Engine::Postgres => "LOWER(genre)",
-        Engine::Sqlite => "genre COLLATE NOCASE",
-    };
-    let genres: Vec<String> = state
-        .backend
-        .query_many(
-            &format!(
-                "SELECT DISTINCT genre FROM albums \
-                 WHERE genre IS NOT NULL AND genre != '' ORDER BY {order}"
-            ),
-            &[],
-        )
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|row| row.first().and_then(|v| v.as_string()))
-        .collect();
+/// Le rayon « Genres », page par page.
+///
+/// `start` et `count` viennent de `StartingIndex` / `RequestedCount`, comme
+/// pour `browse_radios` (#3115) : ils etaient purement ignores ici, et un
+/// point de controle qui pagine strictement lisait une reponse hors contrat.
+/// `TotalMatches` reste le nombre REEL de genres — c'est lui qui dit qu'il
+/// reste des pages. Meme decoupage que la branche `Genres` de `Search`, par
+/// le meme `paginer` : les deux verbes doivent rendre la meme page.
+fn browse_genres(state: &UpnpState, start: u64, count: u64) -> DidlResult {
+    let (page, total) = paginer(lire_genres(state), start, count);
+    let mut didl = didl_genres(&page);
+    didl.total = total;
+    didl
+}
 
+/// Le DIDL d'une liste de genres. `Browse` et `Search` passent par ici.
+///
+/// Chaque genre annonce le nombre d'albums qu'il OUVRE : c'est la moitié que
+/// #2941 avait laissée dehors, faute d'un compteur qui ne mente pas. Il tient
+/// maintenant parce que l'étiquette et le compte sortent du même appel
+/// ([`AlbumRepo::genre_counts`]), lui-même calé sur `list_by_genre`.
+fn didl_genres(genres: &[(String, u64)]) -> DidlResult {
     let mut inner = String::new();
-    for genre in &genres {
+    for (genre, nb) in genres {
         let id = format!("genre/{}", urlencoding::encode(genre));
         inner.push_str(&didl_container(
             &id,
             "genres",
             genre,
             "object.container.genre.musicGenre",
-            None,
+            Some(*nb),
         ));
     }
 
@@ -1814,6 +2277,31 @@ fn browse_genres(state: &UpnpState) -> DidlResult {
         total,
         returned: total,
     }
+}
+
+/// Les genres publiés sous le rayon « Genres », chacun avec sa taille.
+///
+/// Ce n'est PAS `SELECT DISTINCT genre`. Cette requête-là rendait la valeur
+/// BRUTE de la colonne, alors que [`browse_genre_albums`] passe par
+/// `AlbumRepo::list_by_genre`, qui la DÉCOUPE avant de comparer. Un album
+/// étiqueté « Jazz; Blues » publiait donc un dossier « Jazz; Blues » qui
+/// n'ouvrait rien, et ni « Blues » ni aucun autre composant n'avait de
+/// dossier. Mesuré sur cinq albums de test, deux des cinq dossiers publiés
+/// ouvraient zéro album — exactement le reproche de #2299 : ça se parcourt
+/// comme un dossier, et le dossier est vide.
+///
+/// [`AlbumRepo::genre_counts`] rend les jetons que `list_by_genre` sait
+/// retrouver, et leur nombre d'albums visibles. Un genre qui n'ouvre rien n'en
+/// sort pas : la règle de [`ROOT_CONTAINERS`] — aucun conteneur annoncé qui
+/// s'ouvre vide — descend ainsi d'un niveau, comme elle le fait déjà pour les
+/// listes de lecture.
+fn lire_genres(state: &UpnpState) -> Vec<(String, u64)> {
+    AlbumRepo::with_backend(state.backend.clone())
+        .genre_counts()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(genre, nb)| u64::try_from(nb).ok().map(|nb| (genre, nb)))
+        .collect()
 }
 
 /// Les albums d'un genre.
@@ -1835,8 +2323,46 @@ fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlRe
 /// `ROOT_CONTAINERS` (aucun conteneur annoncé qui s'ouvre vide) descend d'un
 /// niveau. Les albums sans année (`NULL` ou 0) restent visibles par les
 /// autres conteneurs, mais aucun dossier « année inconnue » n'est inventé.
-fn browse_years(state: &UpnpState) -> DidlResult {
-    let years: Vec<i64> = state
+/// Le rayon « Years », page par page — meme regle que `browse_genres`.
+fn browse_years(state: &UpnpState, start: u64, count: u64) -> DidlResult {
+    let (page, total) = paginer(lire_annees(state), start, count);
+    let mut didl = didl_annees(&page);
+    didl.total = total;
+    didl
+}
+
+/// Le DIDL d'une liste d'annees.
+///
+/// La classe reste `object.container`, la plus generique : DIDL-Lite n'en
+/// definit aucune pour une annee. C'est aussi pourquoi `Search` ne sait pas
+/// viser ce rayon — aucun `SearchCriteria` ne peut nommer une classe que
+/// quatre autres rubriques portent aussi. Constate, pas corrige ici :
+/// changer cette classe changerait ce que les points de controle deja
+/// installes lisent de ce dossier.
+fn didl_annees(annees: &[i64]) -> DidlResult {
+    let mut inner = String::new();
+    for annee in annees {
+        inner.push_str(&didl_container(
+            &format!("year/{annee}"),
+            "years",
+            &annee.to_string(),
+            "object.container",
+            None,
+        ));
+    }
+    let total = annees.len() as u64;
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total,
+        returned: total,
+    }
+}
+
+/// Les années publiées par « Years ». Extraite de `browse_years` pour que le
+/// `childCount` du conteneur racine et la liste qu'il ouvre viennent de la
+/// MÊME requête, et ne puissent pas diverger.
+fn lire_annees(state: &UpnpState) -> Vec<i64> {
+    state
         .backend
         .query_many(
             "SELECT DISTINCT year FROM albums \
@@ -1846,25 +2372,7 @@ fn browse_years(state: &UpnpState) -> DidlResult {
         .unwrap_or_default()
         .iter()
         .filter_map(|row| row.first().and_then(|v| v.as_i64()))
-        .collect();
-
-    let mut inner = String::new();
-    for annee in &years {
-        inner.push_str(&didl_container(
-            &format!("year/{annee}"),
-            "years",
-            &annee.to_string(),
-            "object.container",
-            None,
-        ));
-    }
-
-    let total = years.len() as u64;
-    DidlResult {
-        xml: didl_wrap(&inner),
-        total,
-        returned: total,
-    }
+        .collect()
 }
 
 /// Les albums d'une année — le même rendu que ceux d'un genre.
@@ -1890,13 +2398,13 @@ fn didl_albums_under(
         if let Some(ref artist_name) = album.artist_name {
             extra.push_str(&format!(
                 "<dc:creator>{}</dc:creator>",
-                quick_xml::escape::escape(artist_name)
+                crate::outputs::didl::escape_sain(artist_name)
             ));
         }
         if let Some(ref cover) = album.cover_path {
             extra.push_str(&format!(
                 "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                quick_xml::escape::escape(&artwork_url(base_url, cover))
+                crate::outputs::didl::escape_sain(&artwork_url(base_url, cover))
             ));
         }
         inner.push_str(&didl_container_ext(
@@ -1917,40 +2425,128 @@ fn didl_albums_under(
     }
 }
 
-fn browse_radios(state: &UpnpState) -> DidlResult {
+/// Le dossier Radio, PAGINÉ comme tous les autres conteneurs peuplés.
+///
+/// `StartingIndex` et `RequestedCount` étaient purement ignorés : mesuré sur un
+/// Tune local portant 49 stations, un `Browse` demandant dix éléments recevait
+/// les quarante-neuf, avec `NumberReturned = 49` — et `StartingIndex = 10`
+/// rendait exactement la même première page. La spécification
+/// ContentDirectory:1 borne `NumberReturned` par `RequestedCount` et fait
+/// commencer la réponse au `StartingIndex` demandé ; un point de contrôle qui
+/// pagine reçoit donc une réponse hors contrat, et le dossier se lit vide
+/// (#2103, #1800, Jean Valjean, Marantz ND8006, fil forum #1439).
+///
+/// Le correctif de la v0.9.118 (`5d123568`) n'avait touché QUE le `<res>` :
+/// URL Tune stable et `audio/wav` à la place de l'URL du diffuseur. L'enveloppe
+/// de la réponse, elle, n'a jamais été paginée — ni avant, ni après. C'est la
+/// moitié restée dehors, et elle explique que le symptôme n'ait pas bougé huit
+/// versions plus tard.
+///
+/// `Search` sur les mêmes lignes paginait déjà correctement
+/// (`search_containers_in_container`) : c'est le témoin qui isole le verbe.
+fn browse_radios(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let repo = RadioRepo::with_backend(state.backend.clone());
     let stations = repo.list().unwrap_or_default();
-    let base = state.base_url();
+    let (page, total) = paginer(stations, start, count);
+    let mut didl = didl_radios(&page, &state.base_url());
+    // `TotalMatches` dit la taille RÉELLE du dossier, pas celle de la page :
+    // c'est de là que le point de contrôle sait qu'il reste des pages.
+    didl.total = total;
+    // Le journal que la vérification terrain de #2103 réclame explicitement :
+    // « le journal dira si le Browse sur radios arrive jusqu'au serveur et ce
+    // qu'il répond. Si le Browse n'arrive pas, le défaut n'est pas dans le
+    // contenu du dossier mais dans le chemin qui y mène. » Sans cette ligne,
+    // un dossier Radio vide sur le ND8006 ne permet pas de séparer les deux,
+    // et elles n'ont pas la même correction.
+    tracing::info!(
+        start,
+        count,
+        rendues = didl.returned,
+        total,
+        "upnp_browse_radios"
+    );
+    didl
+}
 
+/// Le DIDL d'une liste de stations. `Browse` et `Search` passent par ici.
+///
+/// L'item est bati par [`didl_radio_item`], c'est-a-dire par le constructeur
+/// PARTAGE avec les pistes — ce que ce commentaire affirmait deja alors que le
+/// XML etait encore ecrit a la main juste en dessous. Voir la note de
+/// [`didl_radio_item`] pour ce que cette main manquait.
+fn didl_radios(stations: &[crate::db::radio_repo::RadioStation], base: &str) -> DidlResult {
     let mut inner = String::new();
-    for station in &stations {
-        let id = format!("radio/{}", station.id.unwrap_or(0));
-        let mut res = String::new();
-        let url = radio_audio_url(&base, station.id.unwrap_or(0));
-        res.push_str(&format!(
-            "<res protocolInfo=\"http-get:*:audio/wav:*\">{url}</res>",
-            url = quick_xml::escape::escape(&url),
-        ));
-        if let Some(ref logo) = station.logo_url {
-            res.push_str(&format!(
-                "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                quick_xml::escape::escape(logo)
-            ));
-        }
-        inner.push_str(&format!(
-            "<item id=\"{id}\" parentID=\"radios\"><dc:title>{title}</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class>{res}</item>",
-            id = quick_xml::escape::escape(&id),
-            title = quick_xml::escape::escape(&station.name),
-            res = res,
-        ));
+    for station in stations {
+        inner.push_str(&didl_radio_item(station, base));
     }
-
     let total = stations.len() as u64;
     DidlResult {
         xml: didl_wrap(&inner),
         total,
         returned: total,
     }
+}
+
+/// La classe DIDL d'une station. Elle reste `audioBroadcast` : c'est la valeur
+/// que [`CLASSES_PUBLIEES`] declare, et c'est par elle qu'un `Search` vise le
+/// dossier Radio (#1777, #2907). La changer rendrait la table menteuse et
+/// ferait disparaitre les radios de la recherche.
+const RADIO_UPNP_CLASS: &str = "object.item.audioItem.audioBroadcast";
+
+/// Le type MIME que la route `/{id}/audio.wav` sert reellement
+/// (`tune-server/src/routes/radios.rs`, `live_radio_head_response("audio/wav", ..)`).
+const RADIO_MIME: &str = "audio/wav";
+
+/// L'`<item>` d'UNE station, bati par le constructeur PARTAGE.
+///
+/// Le commentaire de `didl_radios` affirmait deja que l'item d'une station
+/// etait « bati sur le meme patron que celui d'une piste
+/// ([`crate::outputs::didl::DidlBuilder::build_item`]) ». Il ne l'etait pas :
+/// le XML etait ecrit a la main, et cette main manquait trois choses que le
+/// constructeur donne a tous les autres items du serveur :
+///
+/// 1. **`escape_sain`**. Le titre passait par `quick_xml::escape::escape` nu,
+///    qui n'ote pas les caracteres de controle. La note en tete de
+///    `outputs/didl.rs` dit ce que ca coute : « XML 1.0 interdit les
+///    caracteres de controle [...] npupnp (upmpdcli — HiFiMAN Serenade de
+///    Tades) repond alors 401 "Invalid Action" : son parseur echoue sur le
+///    CORPS, pas sur l'action. » Un seul NUL dans UN nom de station — et les
+///    noms viennent d'imports Radio Browser, du texte libre — rendait donc
+///    illegale l'enveloppe SOAP ENTIERE, soit un dossier Radio vide sans une
+///    ligne de journal. `didl_radios` etait le dernier emetteur d'item audio
+///    du depot a ne pas etre protege.
+/// 2. **[`crate::outputs::didl::DidlBuilder::live_stream`]**, ecrite pour la
+///    radio et jamais atteinte par le serveur media : un flux infini ne doit
+///    annoncer ni `duration=` ni `size=`. « Ecrit mais pas branche » —
+///    `.live_stream(` n'avait que deux appelants, tous deux dans le chemin
+///    PUSH (`outputs/dlna.rs`), aucun dans le serveur media.
+/// 3. **un seul emetteur**. Toute correction de conformite posee sur les items
+///    de piste sautait le dossier Radio, parce qu'il ne partageait pas leur
+///    code. C'est ce qui a fait durer #2103 six versions.
+///
+/// La sortie ne change QUE par ce qui etait faux : la classe reste
+/// `audioBroadcast`, le `protocolInfo` reste `http-get:*:audio/wav:*`
+/// ([`crate::outputs::didl::ProtocolStyle::Simple`], le style de tout le
+/// serveur media), et la pochette reste AVANT le `<res>`.
+fn didl_radio_item(station: &crate::db::radio_repo::RadioStation, base: &str) -> String {
+    let id = format!("radio/{}", station.id.unwrap_or(0));
+    let logo = station
+        .logo_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| radio_logo_url(base, l));
+    crate::outputs::didl::DidlBuilder::new(
+        &station.name,
+        &radio_audio_url(base, station.id.unwrap_or(0)),
+        RADIO_MIME,
+    )
+    .item_id(&id)
+    .parent_id("radios")
+    .upnp_class(RADIO_UPNP_CLASS)
+    .live_stream(true)
+    .album_art_opt(logo.as_deref())
+    .build_item()
 }
 
 fn browse_artist_albums(state: &UpnpState, artist_id: i64, base_url: &str) -> DidlResult {
@@ -1966,7 +2562,7 @@ fn browse_artist_albums(state: &UpnpState, artist_id: i64, base_url: &str) -> Di
         if let Some(ref cover) = album.cover_path {
             extra.push_str(&format!(
                 "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                quick_xml::escape::escape(&artwork_url(base_url, cover))
+                crate::outputs::didl::escape_sain(&artwork_url(base_url, cover))
             ));
         }
         inner.push_str(&didl_container_ext(
@@ -2027,6 +2623,30 @@ fn didl_container(
     didl_container_ext(id, parent_id, title, class, child_count, "")
 }
 
+/// L'`<container>` du serveur média — l'UNIQUE émetteur de conteneurs du
+/// fichier, appelé par la racine, les artistes, les albums, les genres, les
+/// années et les listes de lecture.
+///
+/// Deux manques, tous deux mesurés sur le DIDL réellement émis :
+///
+/// 1. **`restricted` est OBLIGATOIRE.** L'annexe B de ContentDirectory:1 le
+///    déclare `use="required"` sur `container` comme sur `item`. Le dépôt
+///    connaissait la règle et ne l'appliquait qu'aux items :
+///    [`crate::outputs::didl::DidlBuilder::build_item`] écrit
+///    `restricted="1"`, et le test
+///    `un_item_de_station_est_bati_comme_un_item_de_piste` l'exige d'une
+///    station. Aucun conteneur ne l'a jamais porté — la mesure
+///    d'origine, `Browse(artists)` : `<container id="artist/1"
+///    parentID="artists" childCount="1">`. Un point de contrôle qui valide
+///    contre le schéma rejette l'objet, donc le dossier.
+/// 2. **le texte libre passait par `quick_xml::escape::escape` nu.** Un nom
+///    d'artiste, un titre d'album, un genre ou un nom de liste vient des tags
+///    du fichier ; XML 1.0 y interdit les caractères de contrôle, et un
+///    séparateur NUL d'ID3v2.4 rendait l'enveloppe SOAP ENTIÈRE illégale —
+///    npupnp répond alors 401 « Invalid Action », son parseur ayant échoué sur
+///    le CORPS. C'est la note en tête de `outputs/didl.rs`. Elle avait été
+///    appliquée à tous les émetteurs d'ITEMS ; la porte conteneur est restée
+///    ouverte, et c'est celle par où passent les noms de tags.
 fn didl_container_ext(
     id: &str,
     parent_id: &str,
@@ -2035,18 +2655,19 @@ fn didl_container_ext(
     child_count: Option<u64>,
     extra_xml: &str,
 ) -> String {
+    use crate::outputs::didl::escape_sain;
     let cc = child_count
         .map(|c| format!(" childCount=\"{c}\""))
         .unwrap_or_default();
     format!(
-        "<container id=\"{id}\" parentID=\"{pid}\"{cc}>\
+        "<container id=\"{id}\" parentID=\"{pid}\" restricted=\"1\"{cc}>\
          <dc:title>{title}</dc:title>\
          <upnp:class>{class}</upnp:class>\
          {extra}\
          </container>",
-        id = quick_xml::escape::escape(id),
-        pid = quick_xml::escape::escape(parent_id),
-        title = quick_xml::escape::escape(title),
+        id = escape_sain(id),
+        pid = escape_sain(parent_id),
+        title = escape_sain(title),
         class = class,
         extra = extra_xml,
     )
@@ -2472,6 +3093,124 @@ mod tests {
         );
     }
 
+    /// Une bibliothèque étiquetée comme le sont les vraies : valeurs composées
+    /// par point-virgule ET par barre oblique, tableau JSON structuré, et un
+    /// album masqué (#1391) dont le genre ne doit plus paraître.
+    fn state_des_genres_composes() -> UpnpState {
+        use crate::db::hidden_repo::HiddenRepo;
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = AlbumRepo::with_backend(backend.clone());
+        repo.create(&album_with_genre("Kind of Blue", "Jazz; Blues"))
+            .unwrap();
+        repo.create(&album_with_genre("Bitches Brew", "Jazz"))
+            .unwrap();
+        repo.create(&album_with_genre("Liege & Lief", "Folk/Rock"))
+            .unwrap();
+        // Étiquetage moderne : rien dans la colonne héritée, tout dans le
+        // tableau JSON — que `list_by_genre` sait lire et que le
+        // `SELECT DISTINCT genre` ignorait complètement.
+        let mut structure = album_with_genre("Music for Airports", "");
+        structure.genre = None;
+        structure.genres = Some("[\"Ambient\"]".into());
+        repo.create(&structure).unwrap();
+        let masque = repo.create(&album_with_genre("Brouillon", "Zouk")).unwrap();
+        HiddenRepo::with_backend(backend.clone())
+            .hide_album(masque)
+            .unwrap();
+        UpnpState::new(backend, 8888, None)
+    }
+
+    /// #2299 — TOUT dossier de genre publié doit s'ouvrir, et sur exactement
+    /// ce qu'il annonce.
+    ///
+    /// Le rayon « Genres » publiait la valeur BRUTE de la colonne, alors que
+    /// `browse_genre_albums` passe par `list_by_genre`, qui la DÉCOUPE avant
+    /// de comparer. Relevé sur Shrek AVANT correctif, avec ce même jeu :
+    ///
+    /// ```text
+    ///   "Folk/Rock"   -> genre/Folk%2FRock     ouvre 0 album(s)
+    ///   "Jazz; Blues" -> genre/Jazz%3B%20Blues ouvre 0 album(s)
+    /// ```
+    ///
+    /// Deux dossiers sur cinq ouvraient le vide : « ça se parcourt comme un
+    /// dossier », et le dossier ne contient rien.
+    #[test]
+    fn chaque_genre_publie_ouvre_ce_qu_il_annonce() {
+        let state = state_des_genres_composes();
+        let publies = lire_genres(&state);
+        assert!(
+            !publies.is_empty(),
+            "une bibliothèque étiquetée doit publier des genres"
+        );
+        let liste = browse_genres(&state, 0, UNLIMITED_BROWSE_COUNT);
+        for (genre, annonce) in &publies {
+            let id = format!("genre/{}", urlencoding::encode(genre));
+            let ouvert = browse_direct_children(&state, &id, 0, 0).total;
+            assert!(ouvert > 0, "le dossier {genre:?} s'ouvre VIDE");
+            assert_eq!(
+                *annonce, ouvert,
+                "le dossier {genre:?} annonce {annonce} et ouvre {ouvert}"
+            );
+            // Le nombre doit être DANS le DIDL, porté par ce conteneur-là.
+            let attendu =
+                format!("id=\"{id}\" parentID=\"genres\" restricted=\"1\" childCount=\"{ouvert}\"");
+            assert!(
+                liste.xml.contains(&attendu),
+                "la liste n'annonce pas la taille de {genre:?} : {}",
+                liste.xml
+            );
+            assert!(
+                browse_metadata(&state, &id).xml.contains(&attendu),
+                "BrowseMetadata({id}) et la liste ne disent pas la même taille"
+            );
+        }
+        assert_eq!(
+            compter_enfants_racine(&state, "genres"),
+            Some(publies.len() as u64),
+            "le rayon racine doit compter comme la liste qu'il ouvre"
+        );
+    }
+
+    /// #2299 — chaque COMPOSANT d'un genre composé a son propre dossier, et la
+    /// valeur brute n'est plus publiée telle quelle.
+    #[test]
+    fn un_genre_compose_publie_ses_composants() {
+        let state = state_des_genres_composes();
+        let noms: Vec<String> = lire_genres(&state).into_iter().map(|(g, _)| g).collect();
+        for attendu in ["Jazz", "Blues", "Folk", "Rock"] {
+            assert!(
+                noms.iter().any(|g| g == attendu),
+                "« {attendu} » doit avoir son dossier : {noms:?}"
+            );
+        }
+        assert!(
+            !noms.iter().any(|g| g.contains(';') || g.contains('/')),
+            "aucune valeur composée ne doit être publiée telle quelle : {noms:?}"
+        );
+        // « Jazz » ouvre les DEUX albums qui le portent, le composé compris.
+        assert_eq!(
+            browse_direct_children(&state, "genre/Jazz", 0, 0).total,
+            2,
+            "Jazz doit ouvrir l'album simple ET l'album composé"
+        );
+        // Un genre porté par le seul tableau JSON existe aussi : le
+        // `SELECT DISTINCT genre` l'ignorait.
+        assert!(
+            noms.iter().any(|g| g == "Ambient"),
+            "le genre du tableau JSON manque : {noms:?}"
+        );
+        // Un genre dont tous les albums sont masqués (#1391) DISPARAÎT, au
+        // lieu de rester comme dossier vide.
+        assert!(
+            !noms.iter().any(|g| g == "Zouk"),
+            "un genre entièrement masqué ne doit plus être publié : {noms:?}"
+        );
+    }
+
     /// Contre-échec : sans la branche `genre/`, ce test rendait 0 — c'est
     /// exactement ce que Jean Valjean voyait à l'écran.
     #[test]
@@ -2682,6 +3421,97 @@ mod tests {
             so_what_id,
             blue_id,
         )
+    }
+
+    /// #2299 — « une vraie bibliothèque, pas un dossier ».
+    ///
+    /// Un dossier ne dit pas combien il contient ; une bibliothèque si. Chaque
+    /// rubrique racine annonce donc sa taille, à la racine ET en
+    /// `BrowseMetadata`, et ce nombre est EXACTEMENT celui que le conteneur
+    /// ouvre : promettre 3 214 albums et en montrer 2 900 se lit comme une
+    /// bibliothèque abîmée, pas comme un compteur approximatif.
+    #[test]
+    fn chaque_rayon_racine_annonce_la_taille_qu_il_ouvre() {
+        let (state, _, _, _, _) = state_complet();
+        let racine = browse_root(&state);
+
+        for (id, titre, _) in ROOT_CONTAINERS.iter() {
+            let ouvert = browse_direct_children(&state, id, 0, 0).total;
+            assert!(
+                ouvert > 0,
+                "le rayon {id} ({titre}) s'ouvre vide sur une bibliothèque peuplée"
+            );
+
+            assert_eq!(
+                compter_enfants_racine(&state, id),
+                Some(ouvert),
+                "le compteur du rayon {id} ({titre}) diverge de ce qu'il ouvre"
+            );
+
+            // Le nombre doit être DANS le DIDL, porté par ce conteneur-là.
+            let attendu =
+                format!("id=\"{id}\" parentID=\"0\" restricted=\"1\" childCount=\"{ouvert}\"");
+            assert!(
+                racine.xml.contains(&attendu),
+                "la racine n'annonce pas la taille du rayon {id} ({titre}) : {}",
+                racine.xml
+            );
+            let meta = browse_metadata(&state, id);
+            assert!(
+                meta.xml.contains(&attendu),
+                "BrowseMetadata({id}) n'annonce pas sa taille : {}",
+                meta.xml
+            );
+        }
+    }
+
+    /// #2299 — un artiste annonce le nombre d'albums qu'il OUVRE, masqués
+    /// exclus (#1391). Une liste de neuf cents noms sans compteur est un
+    /// arbre de dossiers ; avec, c'est un index d'artistes.
+    #[test]
+    fn un_artiste_annonce_le_nombre_d_albums_qu_il_ouvre() {
+        use crate::db::hidden_repo::HiddenRepo;
+        use crate::db::models::Album;
+
+        let (state, _, _, _, _) = state_complet();
+        let backend = state.backend.clone();
+        let artiste = ArtistRepo::with_backend(backend.clone())
+            .list(10, 0)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("state_complet crée un artiste");
+        let artist_id = artiste.id.unwrap();
+
+        let album_repo = AlbumRepo::with_backend(backend.clone());
+        // Un second album visible…
+        let mut sketches = Album::new("Sketches of Spain".into());
+        sketches.artist_id = Some(artist_id);
+        album_repo.create(&sketches).unwrap();
+        // …et un troisième MASQUÉ, qui ne doit compter pour rien.
+        let mut brouillon = Album::new("Brouillon".into());
+        brouillon.artist_id = Some(artist_id);
+        let masque = album_repo.create(&brouillon).unwrap();
+        HiddenRepo::with_backend(backend.clone())
+            .hide_album(masque)
+            .unwrap();
+
+        let conteneur = format!("artist/{artist_id}");
+        let ouvert = browse_direct_children(&state, &conteneur, 0, 100).total;
+        assert_eq!(ouvert, 2, "l'album masqué ne doit pas s'ouvrir");
+
+        let attendu =
+            format!("id=\"{conteneur}\" parentID=\"artists\" restricted=\"1\" childCount=\"2\"");
+        let liste = browse_direct_children(&state, "artists", 0, 100);
+        assert!(
+            liste.xml.contains(&attendu),
+            "la liste d'artistes n'annonce pas les albums de {conteneur} : {}",
+            liste.xml
+        );
+        assert!(
+            browse_metadata(&state, &conteneur).xml.contains(&attendu),
+            "BrowseMetadata({conteneur}) et la liste ne disent pas la même taille"
+        );
     }
 
     /// #1802 — le conteneur racine « Playlists » est de retour, et il liste de
@@ -2932,6 +3762,307 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // #2971 — le contrat vu depuis le POINT DE CONTRÔLE, pas depuis l'intérieur
+    // -----------------------------------------------------------------------
+
+    /// Un corps SOAP `Browse` tel qu'un point de contrôle l'envoie.
+    fn corps_browse(object_id: &str, browse_flag: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+    <ObjectID>{object_id}</ObjectID>
+    <BrowseFlag>{browse_flag}</BrowseFlag>
+    <Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount>
+    <SortCriteria></SortCriteria>
+  </u:Browse></s:Body>
+</s:Envelope>"#
+        )
+    }
+
+    /// Le texte d'une balise de la `BrowseResponse`, brut.
+    fn champ_reponse(soap: &str, balise: &str) -> String {
+        let ouvrant = format!("<{balise}>");
+        let fermant = format!("</{balise}>");
+        let debut = soap
+            .find(&ouvrant)
+            .unwrap_or_else(|| panic!("réponse sans <{balise}> : {soap}"))
+            + ouvrant.len();
+        let fin = soap[debut..]
+            .find(&fermant)
+            .unwrap_or_else(|| panic!("réponse sans </{balise}> : {soap}"))
+            + debut;
+        soap[debut..fin].to_string()
+    }
+
+    /// Le DIDL **tel que le point de contrôle le lit** : extrait de `<Result>`
+    /// puis déséchappé. Passer par ce chemin est le tout l'intérêt du test —
+    /// `browse_root` peut être juste et la réponse SOAP fausse.
+    fn didl_de_la_reponse(soap: &str) -> String {
+        unescape(&champ_reponse(soap, "Result"))
+            .expect("le <Result> doit se déséchapper")
+            .into_owned()
+    }
+
+    /// Les `(balise, id)` des enfants directs d'un DIDL — conteneurs ET items.
+    fn enfants_du_didl(didl: &str) -> Vec<(String, String)> {
+        let mut reader = quick_xml::Reader::from_str(didl);
+        let mut buf = Vec::new();
+        let mut sortie = Vec::new();
+        loop {
+            let (nom, id) = match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) | Ok(Event::Empty(e)) => (
+                    String::from_utf8_lossy(e.name().as_ref()).into_owned(),
+                    e.attributes()
+                        .flatten()
+                        .find(|a| a.key.as_ref() == b"id")
+                        .map(|a| String::from_utf8_lossy(&a.value).into_owned())
+                        .unwrap_or_default(),
+                ),
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("DIDL mal formé : {e} — {didl}"),
+                _ => {
+                    buf.clear();
+                    continue;
+                }
+            };
+            if nom == "container" || nom == "item" {
+                sortie.push((nom, id));
+            }
+            buf.clear();
+        }
+        sortie
+    }
+
+    /// #2971 — Jean Valjean, fil 1625 : « on voit seulement Artistes, Albums,
+    /// Genres, Pistes et Radio live », alors que la racine du serveur en
+    /// montre sept.
+    ///
+    /// Les cinq raccourcis manquants sont une liste **codée en dur dans le
+    /// client web** (`tune-web-client`, qui livre depuis `main`) ; ce dépôt-ci
+    /// n'a rien à corriger. Ce que ce test verrouille est l'autre moitié du
+    /// contrat, celle qui vit ici : **la réponse SOAP** que le client parse
+    /// annonce bien SEPT rayons, et chacun des sept s'ouvre.
+    ///
+    /// Les tests voisins ([`la_racine_n_annonce_aucun_conteneur_impossible_a_ouvrir`],
+    /// [`chaque_rayon_racine_annonce_la_taille_qu_il_ouvre`]) travaillent sur
+    /// `browse_root`/`browse_direct_children` — des fonctions internes. Entre
+    /// elles et le point de contrôle il reste `browse_action_response`, qui
+    /// **échappe** le DIDL dans `<Result>` et publie `NumberReturned` /
+    /// `TotalMatches`. Un double échappement, une troncature par
+    /// `RequestedCount`, un compteur désaccordé : rien de tout cela n'est vu
+    /// par les tests internes, et tout cela se lit chez le testeur comme des
+    /// rayons manquants — exactement le symptôme de ce fil.
+    #[test]
+    fn la_reponse_soap_de_la_racine_annonce_les_sept_rayons() {
+        let (state, _, _, _, _) = state_complet();
+
+        let soap = build_browse_response(&state, &corps_browse("0", "BrowseDirectChildren"));
+        assert!(!is_soap_fault(&soap), "la racine rend un fault : {soap}");
+
+        let attendu = ROOT_CONTAINERS.len().to_string();
+        assert_eq!(
+            champ_reponse(&soap, "NumberReturned"),
+            attendu,
+            "NumberReturned ne compte pas les sept rayons : {soap}"
+        );
+        assert_eq!(
+            champ_reponse(&soap, "TotalMatches"),
+            attendu,
+            "TotalMatches ne compte pas les sept rayons : {soap}"
+        );
+
+        // Et le DIDL réellement transporté en contient autant — c'est ce
+        // nombre-là, pas l'annonce, que le client compte pour dessiner ses
+        // rayons.
+        let didl = didl_de_la_reponse(&soap);
+        let enfants = enfants_du_didl(&didl);
+        assert_eq!(
+            enfants.len(),
+            ROOT_CONTAINERS.len(),
+            "la racine transporte {} conteneurs pour {} annoncés : {didl}",
+            enfants.len(),
+            ROOT_CONTAINERS.len()
+        );
+        for (balise, _) in &enfants {
+            assert_eq!(balise, "container", "la racine ne publie que des dossiers");
+        }
+
+        // Chaque rayon attendu est là, adressable, et dans l'ordre déclaré :
+        // le client web ouvre par cet identifiant-là, pas par le titre.
+        let ids: Vec<&str> = enfants.iter().map(|(_, id)| id.as_str()).collect();
+        let voulus: Vec<&str> = ROOT_CONTAINERS.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, voulus, "les rayons de la racine ont changé : {didl}");
+        for (id, titre, _) in ROOT_CONTAINERS.iter() {
+            assert!(
+                didl.contains(&format!("<dc:title>{titre}</dc:title>")),
+                "le rayon {id} arrive sans titre lisible : {didl}"
+            );
+        }
+    }
+
+    /// #2971, seconde moitié : un rayon annoncé doit s'OUVRIR par SOAP.
+    ///
+    /// « Un rayon listé mais non navigable est pire qu'un rayon absent » — la
+    /// règle est déjà écrite en tête de [`ROOT_CONTAINERS`], elle n'était
+    /// vérifiée qu'en interne. Ici on descend dans les sept par le même
+    /// chemin que le testeur, et on exige de chaque enfant un identifiant non
+    /// vide : **une entrée sans `id` est impubliable en DIDL** — un point de
+    /// contrôle n'a alors rien à renvoyer au `Browse` suivant, et le dossier
+    /// se lit comme cassé.
+    #[test]
+    fn chaque_rayon_de_la_racine_s_ouvre_par_soap() {
+        let (state, _, _, _, _) = state_complet();
+
+        for (id, titre, _) in ROOT_CONTAINERS.iter() {
+            let soap = build_browse_response(&state, &corps_browse(id, "BrowseDirectChildren"));
+            assert!(
+                !is_soap_fault(&soap),
+                "le rayon {id} ({titre}) rend un fault : {soap}"
+            );
+
+            let didl = didl_de_la_reponse(&soap);
+            let enfants = enfants_du_didl(&didl);
+            assert!(
+                !enfants.is_empty(),
+                "le rayon {id} ({titre}) s'ouvre vide par SOAP sur une \
+                 bibliothèque peuplée : {didl}"
+            );
+            assert_eq!(
+                champ_reponse(&soap, "NumberReturned"),
+                enfants.len().to_string(),
+                "le rayon {id} ({titre}) annonce autre chose que ce qu'il \
+                 transporte : {soap}"
+            );
+
+            for (balise, enfant_id) in &enfants {
+                assert!(
+                    !enfant_id.is_empty(),
+                    "un <{balise}> du rayon {id} ({titre}) est publié sans \
+                     identifiant : il est inatteignable au Browse suivant — {didl}"
+                );
+                // Le `continue` qui sautait les `<item>` est parti : depuis
+                // ce correctif, `browse_metadata` decrit `track/N` et
+                // `radio/N` comme il decrit les conteneurs. Item ou conteneur,
+                // ContentDirectory:1 exige la meme chose — tout objet publie
+                // doit savoir se decrire.
+                let fils =
+                    build_browse_response(&state, &corps_browse(enfant_id, "BrowseMetadata"));
+                assert!(
+                    !is_soap_fault(&fils),
+                    "l'enfant {enfant_id} du rayon {id} rend un fault : {fils}"
+                );
+                assert_eq!(
+                    champ_reponse(&fils, "NumberReturned"),
+                    "1",
+                    "le conteneur {enfant_id} du rayon {id} ({titre}) est \
+                     annoncé mais ne sait pas se décrire : {fils}"
+                );
+            }
+        }
+    }
+
+    /// ContentDirectory:1 : **tout objet publie doit savoir se decrire**, item
+    /// comme conteneur. « If BrowseFlag is BrowseMetadata, ObjectID identifies
+    /// the object to return metadata for » — la specification ne distingue pas.
+    ///
+    /// `browse_metadata` ne connaissait que des conteneurs. `track/N` et
+    /// `radio/N`, pourtant publies par le Browse juste au-dessus, tombaient
+    /// dans le bras par defaut et rendaient un DIDL VIDE avec
+    /// `NumberReturned = 0` — sans fault, donc sans que rien ne le signale.
+    /// C'est le mode d'echec type d'un indexeur qui parcourt par `Browse` puis
+    /// valide chaque objet par `BrowseMetadata` (#2183, JPLAY iOS : « le
+    /// MediaServer est vu, decrit et appaire, mais l'indexation echoue »).
+    ///
+    /// TEMOINS, verts des deux cotes : un CONTENEUR se decrivait deja (c'est
+    /// la moitie qui marchait), et un identifiant INCONNU doit continuer a ne
+    /// rien rendre — sans quoi ce test passerait au vert pour la mauvaise
+    /// raison, en decrivant n'importe quoi.
+    #[test]
+    fn un_item_publie_sait_se_decrire_par_browse_metadata() {
+        let (state, _, _, _, _) = state_complet();
+
+        // --- TEMOIN 1 : un conteneur se decrivait deja.
+        let conteneur = build_browse_response(&state, &corps_browse("artists", "BrowseMetadata"));
+        assert_eq!(
+            champ_reponse(&conteneur, "NumberReturned"),
+            "1",
+            "temoin conteneur : {conteneur}"
+        );
+
+        // --- LE FAIT DE BASE : chaque ITEM publie par un rayon se decrit.
+        for rayon in ["tracks", "radios"] {
+            let liste = build_browse_response(&state, &corps_browse(rayon, "BrowseDirectChildren"));
+            let enfants = enfants_du_didl(&didl_de_la_reponse(&liste));
+            let items: Vec<_> = enfants
+                .iter()
+                .filter(|(balise, _)| balise != "container")
+                .collect();
+            assert!(
+                !items.is_empty(),
+                "le rayon {rayon} ne publie aucun item : {liste}"
+            );
+            for (_, item_id) in items {
+                let fiche = build_browse_response(&state, &corps_browse(item_id, "BrowseMetadata"));
+                assert!(
+                    !is_soap_fault(&fiche),
+                    "BrowseMetadata({item_id}) rend un fault : {fiche}"
+                );
+                assert_eq!(
+                    champ_reponse(&fiche, "NumberReturned"),
+                    "1",
+                    "l'objet {item_id} est publie par le rayon {rayon} mais ne \
+                     sait pas se decrire : {fiche}"
+                );
+                let didl = didl_de_la_reponse(&fiche);
+                assert!(
+                    didl.contains(&format!("id=\"{item_id}\"")),
+                    "BrowseMetadata({item_id}) decrit un AUTRE objet : {didl}"
+                );
+            }
+        }
+
+        // --- TEMOIN 2 : un identifiant inconnu ne se decrit toujours pas.
+        let inconnu =
+            build_browse_response(&state, &corps_browse("radio/999999", "BrowseMetadata"));
+        assert_eq!(
+            champ_reponse(&inconnu, "NumberReturned"),
+            "0",
+            "un objet inexistant ne doit rien decrire : {inconnu}"
+        );
+    }
+
+    /// Témoin anti-régression : le trajet SOAP ne doit RIEN changer au DIDL.
+    ///
+    /// C'est la garde qui manquait le plus. Un correctif DLNA « qui élargit »
+    /// (un filtre, un échappement, une pagination) passerait les deux tests
+    /// ci-dessus tout en modifiant ce que des testeurs écoutent en ce moment.
+    /// On compare donc caractère pour caractère, pour la racine et pour les
+    /// sept rayons, le DIDL sorti de `<Result>` avec celui que rend
+    /// `browse_direct_children` — le sérialiseur SOAP transporte, il ne
+    /// réécrit pas.
+    #[test]
+    fn le_trajet_soap_ne_reecrit_pas_le_didl_des_rayons() {
+        let (state, _, _, _, _) = state_complet();
+
+        let racine = build_browse_response(&state, &corps_browse("0", "BrowseDirectChildren"));
+        assert_eq!(
+            didl_de_la_reponse(&racine),
+            browse_direct_children(&state, "0", 0, UNLIMITED_BROWSE_COUNT).xml,
+            "le trajet SOAP a réécrit le DIDL de la racine"
+        );
+
+        for (id, titre, _) in ROOT_CONTAINERS.iter() {
+            let soap = build_browse_response(&state, &corps_browse(id, "BrowseDirectChildren"));
+            assert_eq!(
+                didl_de_la_reponse(&soap),
+                browse_direct_children(&state, id, 0, UNLIMITED_BROWSE_COUNT).xml,
+                "le trajet SOAP a réécrit le DIDL du rayon {id} ({titre})"
+            );
+        }
+    }
+
     #[test]
     fn description_publie_les_urls_sous_le_prefixe_upnp() {
         // Régression #1613 : les URLs de contrôle publiées doivent porter le
@@ -2985,7 +4116,7 @@ mod tests {
         let mut state = UpnpState::new(backend, 8888, None);
         state.advertised_ip = Some("192.168.1.18".into());
 
-        let didl = browse_radios(&state);
+        let didl = browse_radios(&state, 0, 100);
         let url = radio_audio_url(&state.base_url(), station_id);
 
         assert!(didl.total >= 1);
@@ -3347,6 +4478,9 @@ mod tests {
             musicbrainz_recording_id: None,
             cover_path: Some("ce0a963bb7eb63c3b33b4e00b6ab3427".into()),
             comments: None,
+            cue_media_path: None,
+            cue_start_ms: None,
+            cue_end_ms: None,
         }
     }
 
@@ -3431,6 +4565,195 @@ mod tests {
         assert!(xml.contains("application/x-dsd"), "{xml}");
         assert!(!xml.contains("audio/flac"), "{xml}");
         assert!(xml.contains("sampleFrequency=\"2822400\""), "{xml}");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2183, #1800, #2103 — ce que le serveur media publie doit d'abord
+    // PARSER, et se conformer au schema, chez un point de controle strict.
+    // -----------------------------------------------------------------------
+
+    /// Le document est-il du XML 1.0 bien forme ? Rendu par un VRAI parseur —
+    /// c'est ce que fait le point de controle, et une comparaison de chaine ne
+    /// mesure pas la meme chose.
+    fn xml_bien_forme(xml: &str) -> Result<(), String> {
+        let mut lecteur = quick_xml::Reader::from_str(xml);
+        lecteur.config_mut().check_end_names = true;
+        loop {
+            match lecteur.read_event() {
+                Ok(quick_xml::events::Event::Eof) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+
+    /// Le DIDL tel que le point de controle le lit : le contenu de `<Result>`,
+    /// des-echappe une fois. On mesure la SORTIE observable du trajet SOAP
+    /// complet, jamais la fonction qui l'a produite.
+    fn didl_du_soap(reponse: &str) -> String {
+        let debut = reponse
+            .find("<Result>")
+            .expect("pas de <Result> dans la reponse SOAP")
+            + "<Result>".len();
+        let fin = reponse.find("</Result>").expect("pas de </Result>");
+        quick_xml::escape::unescape(&reponse[debut..fin])
+            .expect("le contenu de <Result> n'est pas echappe correctement")
+            .into_owned()
+    }
+
+    /// La valeur du premier attribut `id` d'un en-tete `<container …`.
+    fn id_du_conteneur(entete: &str) -> Option<String> {
+        let reste = entete.strip_prefix("id=\"")?;
+        let fin = reste.find('"')?;
+        Some(
+            quick_xml::escape::unescape(&reste[..fin])
+                .ok()?
+                .into_owned(),
+        )
+    }
+
+    /// `restricted` est OBLIGATOIRE sur un objet DIDL-Lite, conteneur compris.
+    ///
+    /// Mesure d'origine, avant correctif, sur `Browse(artists)` :
+    /// `<container id="artist/1" parentID="artists" childCount="1">`. Les
+    /// ITEMS le portaient depuis toujours ; aucun CONTENEUR ne l'a jamais
+    /// porte. Le test descend l'arbre reel du serveur media par SOAP et
+    /// n'accepte aucune exception.
+    #[test]
+    fn aucun_conteneur_publie_ne_sort_sans_l_attribut_restricted() {
+        let (state, _, _, _, _) = state_complet();
+        let mut a_visiter = vec!["0".to_string()];
+        let mut conteneurs_vus = 0usize;
+        for _profondeur in 0..3 {
+            let mut suivants = Vec::new();
+            for oid in &a_visiter {
+                for drapeau in ["BrowseDirectChildren", "BrowseMetadata"] {
+                    let didl =
+                        didl_du_soap(&build_browse_response(&state, &corps_browse(oid, drapeau)));
+                    if let Err(e) = xml_bien_forme(&didl) {
+                        panic!("{drapeau}({oid}) rend un DIDL illisible : {e}\n{didl}");
+                    }
+                    for bout in didl.split("<container ").skip(1) {
+                        let entete = &bout[..bout.find('>').expect("en-tete non ferme")];
+                        conteneurs_vus += 1;
+                        assert!(
+                            entete.contains(" restricted=\""),
+                            "{drapeau}({oid}) publie un conteneur SANS l'attribut \
+                             obligatoire restricted : <container {entete}>"
+                        );
+                        if drapeau == "BrowseDirectChildren" {
+                            if let Some(id) = id_du_conteneur(entete) {
+                                suivants.push(id);
+                            }
+                        }
+                    }
+                }
+            }
+            a_visiter = suivants;
+        }
+        // Temoin : sans lui, un arbre vide rendrait ce test vert contre rien.
+        assert!(
+            conteneurs_vus >= 8,
+            "l'arbre parcouru ne porte que {conteneurs_vus} conteneurs : \
+             le test ne mesure plus rien"
+        );
+    }
+
+    /// Un caractere de controle dans un nom de TAG ne doit pas vider un
+    /// dossier.
+    ///
+    /// XML 1.0 les interdit et `quick_xml::escape::escape` ne les ote pas :
+    /// un separateur NUL d'ID3v2.4 dans un nom d'artiste ou un titre d'album
+    /// rendait l'enveloppe SOAP entiere illegale. npupnp (upmpdcli) repond
+    /// alors 401 « Invalid Action » — son parseur echoue sur le CORPS — et le
+    /// dossier se lit vide, sans une ligne de journal. Le correctif de #3771
+    /// avait ferme cette porte pour les ITEMS ; les CONTENEURS, ou entrent
+    /// justement les noms d'artistes, d'albums et de genres, restaient
+    /// ouverts.
+    #[test]
+    fn un_caractere_de_controle_dans_un_nom_de_tag_ne_vide_pas_le_dossier() {
+        use crate::db::models::{Album, Artist};
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let artiste_id = ArtistRepo::with_backend(backend.clone())
+            .create(&Artist::new("Miles\u{0}Davis".into()))
+            .unwrap();
+        let mut album = Album::new("Kind of\u{1}Blue".into());
+        album.artist_id = Some(artiste_id);
+        album.genre = Some("Ja\u{0}zz".into());
+        AlbumRepo::with_backend(backend.clone())
+            .create(&album)
+            .unwrap();
+        let state = UpnpState::new(backend, 8888, Some("192.168.1.18".into()));
+
+        let interdit = |c: char| !matches!(c, '\t' | '\n' | '\r') && c < '\u{20}';
+        for rayon in ["artists", "albums", "genres"] {
+            let reponse =
+                build_browse_response(&state, &corps_browse(rayon, "BrowseDirectChildren"));
+            let fautifs: Vec<u32> = reponse
+                .chars()
+                .filter(|c| interdit(*c))
+                .map(|c| c as u32)
+                .collect();
+            assert!(
+                fautifs.is_empty(),
+                "la reponse SOAP du rayon {rayon} porte des caracteres interdits \
+                 par XML 1.0 ({fautifs:?}) : un parseur strict rejette le CORPS \
+                 entier et le dossier se lit vide"
+            );
+            let didl = didl_du_soap(&reponse);
+            if let Err(e) = xml_bien_forme(&didl) {
+                panic!("le DIDL du rayon {rayon} ne parse pas : {e}\n{didl}");
+            }
+            // Temoin : le dossier n'est pas vide non plus — le correctif ne
+            // doit pas « assainir » en supprimant l'entree.
+            assert!(
+                reponse.contains("<NumberReturned>1</NumberReturned>"),
+                "le rayon {rayon} s'ouvre vide : {reponse}"
+            );
+        }
+    }
+
+    /// Le nom du serveur est reglable — il n'etait pas echappe dans
+    /// `description.xml`.
+    ///
+    /// `upnp_friendly_name` (POST /api/v1/upnp/config) part tel quel dans
+    /// `<friendlyName>`. « Salon & Cuisine » suffit a rendre le descriptif
+    /// illegal. Or #2183 tient sur cette etape : « le MediaServer est vu,
+    /// DECRIT et appaire » — un point de controle qui ne parse pas le
+    /// descriptif ne voit pas le serveur du tout.
+    #[test]
+    fn le_nom_du_serveur_ne_casse_plus_son_descriptif() {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        crate::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set("upnp_friendly_name", "Salon & Cuisine <Tune>")
+            .unwrap();
+        let state = UpnpState::new(backend, 8888, Some("192.168.1.18".into()));
+
+        let descriptif = build_device_description(&state);
+        if let Err(e) = xml_bien_forme(&descriptif) {
+            panic!("description.xml ne parse plus : {e}\n{descriptif}");
+        }
+        assert!(
+            descriptif.contains("<friendlyName>Salon &amp; Cuisine &lt;Tune&gt;</friendlyName>"),
+            "le nom du serveur n'est pas echappe : {descriptif}"
+        );
+        // Temoin : un nom ordinaire traverse inchange.
+        let db2 = SqliteDb::open_in_memory().unwrap();
+        db2.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db2).unwrap();
+        let state2 = UpnpState::new(Arc::new(db2), 8888, Some("192.168.1.18".into()));
+        assert!(
+            build_device_description(&state2).contains("<friendlyName>Tune Server</friendlyName>"),
+            "le nom par defaut a bouge"
+        );
     }
 }
 
@@ -3714,6 +5037,10 @@ mod ssdp_msearch_tests {
         for champ in SEARCH_CAPS.split(',') {
             let critere = if champ == "upnp:class" {
                 format!("{champ} = \"object.item.audioItem.musicTrack\"")
+            } else if champ.starts_with('@') {
+                // Un attribut ne se compare pas, il EXISTE ou non : c'est la
+                // seule forme que la specification lui donne.
+                format!("{champ} exists false")
             } else {
                 format!("{champ} contains \"x\"")
             };
@@ -3737,7 +5064,7 @@ mod ssdp_msearch_tests {
     #[test]
     fn un_predicat_de_titre_est_reconnu() {
         let c = evaluer_criteres("dc:title contains \"Kind of Blue\"").unwrap();
-        assert!(c.classe_correspond);
+        assert_eq!(c.cible, Some(CibleRecherche::Pistes));
         assert_eq!(
             c.titres,
             vec![PredicatTitre {
@@ -3753,7 +5080,7 @@ mod ssdp_msearch_tests {
             "upnp:class derivedfrom \"object.item.audioItem\" and dc:title contains \"So What\"",
         )
         .unwrap();
-        assert!(c.classe_correspond);
+        assert_eq!(c.cible, Some(CibleRecherche::Pistes));
         assert_eq!(c.titres.len(), 1);
         assert_eq!(c.titres[0].valeur, "So What");
     }
@@ -3765,6 +5092,875 @@ mod ssdp_msearch_tests {
         let c = evaluer_criteres("dc:title contains \"Peaches and Cream\"").unwrap();
         assert_eq!(c.titres.len(), 1);
         assert_eq!(c.titres[0].valeur, "Peaches and Cream");
+    }
+
+    // --- Le menu d'un lecteur reseau passe par Search (#1777, fil 1439) ---
+
+    /// L'etat du releve du 30/08/2026 : un artiste, deux albums donc deux
+    /// genres, une station de radio. De quoi remplir les quatre rubriques que
+    /// le ND8006 voit vides.
+    fn state_du_releve_nd8006() -> UpnpState {
+        use crate::db::radio_repo::RadioStation;
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        let artiste_id = ArtistRepo::with_backend(backend.clone())
+            .create(&crate::db::models::Artist::new("Miles Davis".into()))
+            .unwrap();
+        let albums = AlbumRepo::with_backend(backend.clone());
+        let mut kind_of_blue = crate::db::models::Album::new("Kind of Blue".into());
+        kind_of_blue.genre = Some("Jazz".into());
+        kind_of_blue.artist_id = Some(artiste_id);
+        albums.create(&kind_of_blue).unwrap();
+        let mut the_wall = crate::db::models::Album::new("The Wall".into());
+        the_wall.genre = Some("Rock".into());
+        albums.create(&the_wall).unwrap();
+        RadioRepo::with_backend(backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "FIP HiFi".into(),
+                url: "https://icecast.example/fip-hifi.aac".into(),
+                homepage: None,
+                logo_url: None,
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: true,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+        UpnpState::new(backend, 8888, None)
+    }
+
+    /// Le defaut du fil forum #1439, tenu sur les quatre rubriques a la fois.
+    ///
+    /// Jean Valjean voit, dans la MEME session sur son Marantz ND8006 :
+    /// « Parcourir les dossiers » plein — Artists, Albums, Genres, jusqu'aux
+    /// morceaux — et les entrees Artistes / Albums / Genres / Radios du menu
+    /// de l'appareil vides. Le premier chemin est `Browse`, le second
+    /// `Search`. Les deux sont ici cote a cote : ce que l'un montre, l'autre
+    /// doit le trouver.
+    #[test]
+    fn le_menu_du_lecteur_voit_les_memes_rubriques_que_le_parcours_de_dossiers() {
+        let state = state_du_releve_nd8006();
+        for (classe, conteneur, attendu) in [
+            (
+                "object.container.person.musicArtist",
+                "artists",
+                "Miles Davis",
+            ),
+            (
+                "object.container.album.musicAlbum",
+                "albums",
+                "Kind of Blue",
+            ),
+            ("object.container.genre.musicGenre", "genres", "Jazz"),
+            ("object.item.audioItem.audioBroadcast", "radios", "FIP HiFi"),
+        ] {
+            let parcours = browse_direct_children(&state, conteneur, 0, 100);
+            assert!(
+                parcours.xml.contains(attendu),
+                "« Parcourir les dossiers » ne montre deja pas {attendu} dans {conteneur} : {}",
+                parcours.xml
+            );
+
+            let reponse = search_action_response(
+                &state,
+                &soap_search(
+                    "0",
+                    &format!("upnp:class derivedfrom &quot;{classe}&quot;"),
+                    0,
+                    100,
+                ),
+            );
+            assert!(
+                reponse.contains("<u:SearchResponse"),
+                "{classe} : {reponse}"
+            );
+            assert!(
+                reponse.contains(attendu),
+                "le menu du lecteur lit « liste vide » pour {classe} : {reponse}"
+            );
+            assert!(
+                !reponse.contains("<NumberReturned>0</NumberReturned>"),
+                "{classe} : {reponse}"
+            );
+        }
+    }
+
+    fn soap_browse(object_id: &str, start: u64, count: u64) -> String {
+        format!(
+            r#"<?xml version="1.0"?><s:Envelope><s:Body>
+<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+<ObjectID>{object_id}</ObjectID>
+<BrowseFlag>BrowseDirectChildren</BrowseFlag>
+<Filter>*</Filter>
+<StartingIndex>{start}</StartingIndex>
+<RequestedCount>{count}</RequestedCount>
+<SortCriteria></SortCriteria>
+</u:Browse></s:Body></s:Envelope>"#
+        )
+    }
+
+    /// Un compteur de l'enveloppe SOAP — `NumberReturned` ou `TotalMatches`.
+    fn compteur(reponse: &str, balise: &str) -> u64 {
+        let ouvrant = format!("<{balise}>");
+        let fermant = format!("</{balise}>");
+        let debut = reponse
+            .find(&ouvrant)
+            .unwrap_or_else(|| panic!("{balise} absent de : {reponse}"))
+            + ouvrant.len();
+        let fin = debut
+            + reponse[debut..]
+                .find(&fermant)
+                .unwrap_or_else(|| panic!("{balise} non ferme dans : {reponse}"));
+        reponse[debut..fin]
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{balise} n'est pas un entier dans : {reponse}"))
+    }
+
+    /// Le nombre d'objets que le DIDL TRANSPORTE réellement. Le corps est
+    /// échappé dans `<Result>` : un objet s'y lit `&lt;item ` ou
+    /// `&lt;container `.
+    fn objets_transportes(reponse: &str) -> u64 {
+        (reponse.matches("&lt;item ").count() + reponse.matches("&lt;container ").count()) as u64
+    }
+
+    /// L'identifiant du premier objet transporté, pour distinguer deux pages.
+    fn premier_objet(reponse: &str) -> String {
+        let marque = "id=&quot;";
+        let debut = reponse
+            .find(marque)
+            .unwrap_or_else(|| panic!("aucun objet dans : {reponse}"))
+            + marque.len();
+        let fin = debut + reponse[debut..].find("&quot;").expect("id non ferme");
+        reponse[debut..fin].to_string()
+    }
+
+    /// Tous les identifiants transportes par un DIDL echappe, dans l'ordre.
+    ///
+    /// `premier_objet` ne distingue que deux pages ; ici on verrouille la
+    /// LISTE — un identifiant de conteneur qui bouge casse les favoris des
+    /// points de controle DLNA, qui les memorisent tels quels.
+    fn ids_transportes(reponse: &str) -> Vec<String> {
+        const MARQUE: &str = "id=&quot;";
+        let mut ids = Vec::new();
+        let mut reste = reponse;
+        while let Some(p) = reste.find(MARQUE) {
+            let debut = p + MARQUE.len();
+            let fin = debut
+                + reste[debut..]
+                    .find("&quot;")
+                    .expect("un id ouvert doit se fermer");
+            ids.push(reste[debut..fin].to_string());
+            reste = &reste[fin..];
+        }
+        ids
+    }
+
+    /// #2971 — une base ou CHACUN des sept rayons racine porte de quoi
+    /// paginer : trois annees, trois genres, trois listes de lecture peuplees.
+    ///
+    /// `state_du_releve_nd8006` ne suffit pas : sans annee ni liste de
+    /// lecture, deux des sept rayons y sont vides, et un rayon vide ne
+    /// mesure aucune pagination.
+    fn state_aux_sept_rayons() -> UpnpState {
+        use crate::db::models::{Album, Artist};
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        let artiste = ArtistRepo::with_backend(backend.clone())
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+        let albums = AlbumRepo::with_backend(backend.clone());
+        let pistes = TrackRepo::with_backend(backend.clone());
+        let listes = PlaylistRepo::with_backend(backend.clone());
+        for (titre, genre, annee) in [
+            ("Kind of Blue", "Jazz", 1959),
+            ("Bitches Brew", "Fusion", 1970),
+            ("The Wall", "Rock", 1979),
+        ] {
+            let mut album = Album::new(titre.into());
+            album.genre = Some(genre.into());
+            album.year = Some(annee);
+            album.artist_id = Some(artiste);
+            album.artist_name = Some("Miles Davis".into());
+            let album_id = albums.create(&album).unwrap();
+
+            let mut piste = Track::new(format!("{titre} — ouverture"));
+            piste.album_id = Some(album_id);
+            piste.album_title = Some(titre.into());
+            piste.artist_id = Some(artiste);
+            piste.artist_name = Some("Miles Davis".into());
+            piste.file_path = Some(format!("/music/{annee}.flac"));
+            let piste_id = pistes.create(&piste).unwrap();
+
+            let liste = listes
+                .create(&format!("Liste {annee}"), None, UPNP_PROFILE_ID)
+                .unwrap();
+            listes.set_tracks(liste, &[piste_id]).unwrap();
+        }
+        UpnpState::new(backend, 8888, None)
+    }
+
+    /// #2971 — le VERBE BROWSE des rayons « Years » et « Genres ».
+    ///
+    /// FAIT DE BASE, sur la reponse SOAP : un rayon ne transporte jamais plus
+    /// que le `RequestedCount` demande, il annonce exactement ce qu'il
+    /// transporte, son `TotalMatches` dit la taille du dossier et non celle de
+    /// la page, et deux pages successives ne commencent pas sur le meme objet.
+    ///
+    /// MESURE AVANT — trois annees, trois genres, `RequestedCount=2` :
+    /// `years` et `genres` rendaient `NumberReturned=3` et transportaient les
+    /// trois, et `StartingIndex=2` rendait la MEME premiere page.
+    /// `browse_direct_children` laissait tomber `start` et `count` sur ces
+    /// deux branches — les deux SEULES du dispatcher a le faire, une fois
+    /// `browse_radios` corrige par #3115. Un point de controle qui pagine
+    /// strictement lit une reponse hors contrat ContentDirectory:1.
+    ///
+    /// TEMOINS, verts des DEUX cotes et sur la meme base : la racine annonce
+    /// ses SEPT rayons, dans le meme ordre et avec les memes identifiants —
+    /// un identifiant qui bouge casse les favoris DLNA —, et les cinq autres
+    /// rayons respectaient deja leur `RequestedCount`.
+    #[test]
+    fn les_rayons_annees_et_genres_paginent_leur_reponse_browse() {
+        let state = state_aux_sept_rayons();
+
+        // --- TEMOIN 1 : la racine, ses sept rayons, leur ordre.
+        let racine = browse_action_response(&state, &soap_browse("0", 0, 0));
+        assert!(
+            !is_soap_fault(&racine),
+            "la racine rend un fault : {racine}"
+        );
+        assert_eq!(
+            ids_transportes(&racine),
+            vec![
+                "artists",
+                "albums",
+                "genres",
+                "years",
+                "tracks",
+                "radios",
+                "playlists"
+            ],
+            "les rayons de la racine ont change d'ordre ou d'identifiant : {racine}"
+        );
+        assert_eq!(
+            compteur(&racine, "NumberReturned"),
+            7,
+            "la racine n'annonce plus sept rayons : {racine}"
+        );
+
+        // --- TEMOIN 2 : les cinq rayons qui paginaient deja.
+        for rayon in ["artists", "albums", "tracks", "radios", "playlists"] {
+            let page = browse_action_response(&state, &soap_browse(rayon, 0, 2));
+            assert_eq!(
+                compteur(&page, "NumberReturned"),
+                objets_transportes(&page),
+                "temoin {rayon} : {page}"
+            );
+            assert!(
+                compteur(&page, "NumberReturned") <= 2,
+                "temoin {rayon} : RequestedCount=2 depasse — {page}"
+            );
+        }
+
+        // --- LE FAIT DE BASE : les deux rayons de ce ticket.
+        for rayon in ["years", "genres"] {
+            let page1 = browse_action_response(&state, &soap_browse(rayon, 0, 2));
+            let annonce1 = compteur(&page1, "NumberReturned");
+            assert_eq!(
+                annonce1,
+                objets_transportes(&page1),
+                "le rayon {rayon} annonce {annonce1} elements et en transporte {} : {page1}",
+                objets_transportes(&page1)
+            );
+            assert_ne!(annonce1, 0, "le rayon {rayon} est vide : {page1}");
+            assert!(
+                annonce1 <= 2,
+                "NumberReturned={annonce1} pour un RequestedCount=2 — le rayon \
+                 {rayon} sort du contrat ContentDirectory:1 : {page1}"
+            );
+            assert_eq!(
+                compteur(&page1, "TotalMatches"),
+                3,
+                "TotalMatches doit dire la taille du dossier {rayon}, pas celle \
+                 de la page : {page1}"
+            );
+
+            let page2 = browse_action_response(&state, &soap_browse(rayon, 2, 2));
+            assert_eq!(
+                compteur(&page2, "NumberReturned"),
+                objets_transportes(&page2),
+                "page 2 de {rayon} : {page2}"
+            );
+            assert_ne!(
+                premier_objet(&page1),
+                premier_objet(&page2),
+                "StartingIndex est ignore sur {rayon} : les deux pages \
+                 commencent sur le meme objet.\npage 1 : {page1}\npage 2 : {page2}"
+            );
+        }
+    }
+
+    /// #2971 — le VERBE SEARCH du rayon « Playlists ».
+    ///
+    /// Le menu d'un lecteur reseau passe par `Search`, le parcours de dossiers
+    /// par `Browse` : c'est la lecon de #1777, et elle n'avait ete tiree que
+    /// pour quatre rubriques sur six. `CLASSES_PUBLIEES` ne nommait pas
+    /// `object.container.playlistContainer` — la classe que `browse_playlists`
+    /// publie pourtant sur CHAQUE liste. Une recherche de listes de lecture
+    /// retombait donc sur `cible = None`, donc sur un DIDL vide, sans faute ni
+    /// trace : le dossier « Playlists » plein par un verbe, vide par l'autre.
+    ///
+    /// MESURE AVANT, trois listes peuplees en base :
+    /// `Browse(playlists)` rendait `NumberReturned=3` et
+    /// `Search(upnp:class derivedfrom "object.container.playlistContainer")`
+    /// rendait `NumberReturned=0`.
+    ///
+    /// TEMOINS verts des DEUX cotes : les quatre rubriques que `Search`
+    /// servait deja, sur la meme base et dans le meme test.
+    #[test]
+    fn le_menu_du_lecteur_trouve_aussi_les_listes_de_lecture() {
+        const CLASSE_LISTE: &str = "object.container.playlistContainer";
+        let state = state_aux_sept_rayons();
+
+        // --- TEMOINS : ce que Search sert deja.
+        for (classe, attendu) in [
+            ("object.container.person.musicArtist", "Miles Davis"),
+            ("object.container.album.musicAlbum", "Kind of Blue"),
+            ("object.container.genre.musicGenre", "Jazz"),
+            ("object.item.audioItem.musicTrack", "ouverture"),
+        ] {
+            let reponse = search_action_response(
+                &state,
+                &soap_search(
+                    "0",
+                    &format!("upnp:class derivedfrom &quot;{classe}&quot;"),
+                    0,
+                    100,
+                ),
+            );
+            assert!(!is_soap_fault(&reponse), "temoin {classe} : {reponse}");
+            assert_ne!(
+                compteur(&reponse, "NumberReturned"),
+                0,
+                "temoin {classe} : la rubrique est vide — {reponse}"
+            );
+            assert!(
+                reponse.contains(attendu),
+                "temoin {classe} : {attendu} absent — {reponse}"
+            );
+        }
+
+        // --- LE FAIT DE BASE : la meme rubrique par les DEUX verbes.
+        let parcours = browse_action_response(&state, &soap_browse("playlists", 0, 100));
+        assert_eq!(
+            compteur(&parcours, "NumberReturned"),
+            3,
+            "le parcours de dossiers ne montre deja pas les trois listes : {parcours}"
+        );
+
+        let recherche = search_action_response(
+            &state,
+            &soap_search(
+                "0",
+                &format!("upnp:class derivedfrom &quot;{CLASSE_LISTE}&quot;"),
+                0,
+                100,
+            ),
+        );
+        assert!(
+            !is_soap_fault(&recherche),
+            "chercher des listes de lecture rend un fault : {recherche}"
+        );
+        assert_eq!(
+            compteur(&recherche, "NumberReturned"),
+            compteur(&parcours, "NumberReturned"),
+            "le menu du lecteur lit « liste vide » la ou le parcours de \
+             dossiers montre trois listes.\nBrowse : {parcours}\nSearch : {recherche}"
+        );
+        assert_eq!(
+            compteur(&recherche, "TotalMatches"),
+            3,
+            "TotalMatches : {recherche}"
+        );
+        assert_eq!(
+            ids_transportes(&recherche),
+            ids_transportes(&parcours),
+            "les deux verbes ne publient pas les memes listes.\nBrowse : \
+             {parcours}\nSearch : {recherche}"
+        );
+
+        // --- Et ce verbe-la pagine, comme les autres rubriques.
+        let page2 = search_action_response(
+            &state,
+            &soap_search(
+                "playlists",
+                &format!("upnp:class derivedfrom &quot;{CLASSE_LISTE}&quot;"),
+                2,
+                1,
+            ),
+        );
+        assert_eq!(
+            compteur(&page2, "NumberReturned"),
+            1,
+            "la deuxieme page ne rend pas la piece demandee : {page2}"
+        );
+        assert_eq!(
+            compteur(&page2, "TotalMatches"),
+            3,
+            "TotalMatches doit rester celui du dossier : {page2}"
+        );
+        assert_ne!(
+            premier_objet(&page2),
+            premier_objet(&recherche),
+            "StartingIndex est ignore par la recherche de listes.\npage 1 : \
+             {recherche}\npage 2 : {page2}"
+        );
+
+        // --- Chercher des listes DANS un album n'a pas de sens : vide, pas
+        // en faute. C'est la regle deja tenue par les autres rubriques.
+        let hors_portee = search_action_response(
+            &state,
+            &soap_search(
+                "albums",
+                &format!("upnp:class derivedfrom &quot;{CLASSE_LISTE}&quot;"),
+                0,
+                100,
+            ),
+        );
+        assert!(!is_soap_fault(&hors_portee), "hors portee : {hors_portee}");
+        assert_eq!(
+            compteur(&hors_portee, "NumberReturned"),
+            0,
+            "hors portee : {hors_portee}"
+        );
+    }
+
+    /// #2103 et #1800 — le dossier Radio vu VIDE sur le Marantz ND8006, huit
+    /// versions apres le correctif livre en v0.9.118.
+    ///
+    /// FAIT DE BASE, sur la reponse `Browse` du conteneur Radio : elle annonce
+    /// autant d'elements qu'elle en transporte, ce nombre n'est pas zero, il
+    /// ne depasse jamais le `RequestedCount` demande, et deux pages
+    /// successives ne commencent pas sur le meme objet.
+    ///
+    /// MESURE REELLE AVANT — Tune local, 49 stations, capture SOAP dans la PR :
+    /// `RequestedCount=10` rendait `NumberReturned=49` et transportait 49
+    /// items ; `StartingIndex=10` rendait la MEME premiere page.
+    /// `browse_radios` ignorait purement ses deux arguments de pagination, et
+    /// c'est la moitie que le correctif `5d123568` (v0.9.118) n'avait pas
+    /// touchee : il n'avait refait que le `<res>`.
+    ///
+    /// TEMOINS, verts des DEUX cotes, sur la meme base et dans le meme test :
+    /// `Search` vise les memes stations par l'autre verbe, deja pagine ; et le
+    /// conteneur `albums` est le chemin que le testeur voit PLEIN. S'ils
+    /// passaient au rouge, le defaut ne serait pas la pagination du dossier
+    /// Radio mais la base elle-meme.
+    #[test]
+    fn le_dossier_radio_annonce_exactement_ce_qu_il_transporte() {
+        let state = state_du_releve_nd8006();
+        let total_stations = RadioRepo::with_backend(state.backend.clone())
+            .list()
+            .unwrap()
+            .len() as u64;
+        assert!(
+            total_stations > 10,
+            "le jeu d'essai doit porter assez de stations pour qu'une page en \
+             laisse dehors — {total_stations} seulement"
+        );
+
+        // --- TEMOIN 1 : l'autre verbe, sur les memes stations.
+        let recherche = search_action_response(
+            &state,
+            &soap_search(
+                "0",
+                "upnp:class derivedfrom &quot;object.item.audioItem.audioBroadcast&quot;",
+                0,
+                5,
+            ),
+        );
+        assert_eq!(
+            compteur(&recherche, "NumberReturned"),
+            objets_transportes(&recherche),
+            "temoin Search : {recherche}"
+        );
+        assert_eq!(
+            compteur(&recherche, "NumberReturned"),
+            5,
+            "temoin Search : {recherche}"
+        );
+        assert_eq!(
+            compteur(&recherche, "TotalMatches"),
+            total_stations,
+            "temoin Search : {recherche}"
+        );
+
+        // --- TEMOIN 2 : l'autre chemin, celui que le testeur voit plein.
+        let albums = browse_action_response(&state, &soap_browse("albums", 0, 1));
+        assert_eq!(
+            compteur(&albums, "NumberReturned"),
+            objets_transportes(&albums),
+            "temoin albums : {albums}"
+        );
+        assert_eq!(
+            compteur(&albums, "NumberReturned"),
+            1,
+            "temoin albums : {albums}"
+        );
+        assert_eq!(
+            compteur(&albums, "TotalMatches"),
+            2,
+            "temoin albums : {albums}"
+        );
+
+        // --- LE FAIT DE BASE : premiere page du dossier Radio.
+        let page1 = browse_action_response(&state, &soap_browse("radios", 0, 5));
+        let annonce1 = compteur(&page1, "NumberReturned");
+        assert_eq!(
+            annonce1,
+            objets_transportes(&page1),
+            "le dossier Radio annonce {annonce1} elements et en transporte {} : {page1}",
+            objets_transportes(&page1)
+        );
+        assert_ne!(annonce1, 0, "le dossier Radio est vide : {page1}");
+        assert!(
+            annonce1 <= 5,
+            "NumberReturned={annonce1} pour un RequestedCount=5 — la reponse \
+             sort du contrat ContentDirectory:1 : {page1}"
+        );
+        assert_eq!(
+            compteur(&page1, "TotalMatches"),
+            total_stations,
+            "TotalMatches doit dire la taille du dossier, pas celle de la page : {page1}"
+        );
+
+        // --- Et la page suivante en est bien une.
+        let page2 = browse_action_response(&state, &soap_browse("radios", 5, 5));
+        let annonce2 = compteur(&page2, "NumberReturned");
+        assert_eq!(annonce2, objets_transportes(&page2), "page 2 : {page2}");
+        assert!(annonce2 <= 5, "page 2 : {page2}");
+        assert_ne!(
+            premier_objet(&page1),
+            premier_objet(&page2),
+            "StartingIndex est ignore : les deux pages commencent sur le meme \
+             objet.\npage 1 : {page1}\npage 2 : {page2}"
+        );
+    }
+
+    /// #1800, la moitie que `5d123568` n'a pas faite : **aucune adresse
+    /// externe ne doit sortir du dossier Radio.**
+    ///
+    /// Le titre du ticket est « le dossier Radio publie l'URL du diffuseur,
+    /// pas celle de Tune », et son corps note que « toutes les autres branches
+    /// du serveur media servent une URL Tune ». Le correctif de la v0.9.118 a
+    /// refait le `<res>` ; il n'a jamais touche a `<upnp:albumArtURI>`, qui
+    /// restait la derniere adresse externe publiee. Mesure sur le DIDL emis
+    /// par une base fraichement migree : 50 stations livrees, dont **25
+    /// portent un `logo_url`** — et les 25 le publiaient
+    /// `https://mozaiklabs.fr/storage/radio-logos/*.png` tel quel au renderer.
+    ///
+    /// Le relais existe pourtant, et le client WEB s'en sert deja — le
+    /// commentaire de `refresh_radio_logos` le dit mot pour mot. Seul le
+    /// serveur media ne passait pas par lui.
+    ///
+    /// TEMOIN, vert des deux cotes : rien n'est perdu — l'adresse d'origine
+    /// reste dans la requete du relais, donc la pochette reste atteignable.
+    #[test]
+    fn aucune_adresse_externe_ne_sort_du_dossier_radio() {
+        use crate::db::radio_repo::RadioStation;
+        let mut state = state_du_releve_nd8006();
+        state.advertised_ip = Some("192.168.1.18".into());
+        let base = state.base_url();
+        RadioRepo::with_backend(state.backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "Station a logo distant".into(),
+                url: "https://icecast.example/logo.aac".into(),
+                homepage: None,
+                logo_url: Some("https://mozaiklabs.fr/storage/radio-logos/abc.png".into()),
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: false,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+
+        let didl = browse_radios(&state, 0, 1000).xml;
+
+        // --- LE FAIT DE BASE : plus une seule adresse hors de Tune.
+        for morceau in didl.split("<upnp:albumArtURI>").skip(1) {
+            let uri = morceau.split("</upnp:albumArtURI>").next().unwrap();
+            assert!(
+                uri.starts_with(&base),
+                "une pochette du dossier Radio est publiee hors de Tune : {uri}"
+            );
+        }
+        assert!(
+            !didl.contains("<upnp:albumArtURI>https://"),
+            "le dossier Radio publie encore une pochette externe : {didl}"
+        );
+
+        // --- TEMOIN : la pochette reste atteignable, relayee par Tune.
+        let attendue = format!(
+            "<upnp:albumArtURI>{base}/api/v1/library/artwork/proxy?url={}</upnp:albumArtURI>",
+            urlencoding::encode("https://mozaiklabs.fr/storage/radio-logos/abc.png")
+        );
+        assert!(
+            didl.contains(&attendue),
+            "l'adresse d'origine n'est pas relayee : {didl}"
+        );
+    }
+
+    /// Un logo TELEVERSE par l'utilisateur sortait en **condensat nu**.
+    ///
+    /// `set_radio_artwork` ecrit `radio.logo_url = Some(hash)` — le nom de
+    /// l'entree du cache de pochettes, pas une adresse. Le serveur media le
+    /// recopiait tel quel : `<upnp:albumArtURI>ce0a963b...</upnp:albumArtURI>`,
+    /// que **aucun** point de controle ne sait resoudre. La pochette d'une
+    /// PISTE passe depuis toujours par [`artwork_url`], qui sait le changer en
+    /// URL Tune ; celle d'une station, jamais.
+    #[test]
+    fn un_logo_televerse_sort_en_uri_et_non_en_condensat() {
+        use crate::db::radio_repo::RadioStation;
+        let mut state = state_du_releve_nd8006();
+        state.advertised_ip = Some("192.168.1.18".into());
+        let base = state.base_url();
+        let condensat = "ce0a963bb7eb63c3b33b4e00b6ab3427";
+        RadioRepo::with_backend(state.backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "Station a logo televerse".into(),
+                url: "https://icecast.example/upload.aac".into(),
+                homepage: None,
+                logo_url: Some(condensat.into()),
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: false,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+
+        let didl = browse_radios(&state, 0, 1000).xml;
+        assert!(
+            didl.contains(&format!(
+                "<upnp:albumArtURI>{base}/api/v1/library/artwork/{condensat}</upnp:albumArtURI>"
+            )),
+            "le condensat n'est pas devenu une URI : {didl}"
+        );
+        assert!(
+            !didl.contains(&format!("<upnp:albumArtURI>{condensat}</upnp:albumArtURI>")),
+            "le condensat nu est encore publie : {didl}"
+        );
+    }
+
+    /// Un caractere de controle dans un NOM DE STATION rendait illegale
+    /// l'enveloppe SOAP entiere — donc un dossier Radio vide, sans journal.
+    ///
+    /// La note en tete de `outputs/didl.rs` dit exactement ce que ca coute :
+    /// « XML 1.0 interdit les caracteres de controle hors tabulation et fins de
+    /// ligne — et `escape` n'y touche pas [...] npupnp (upmpdcli — HiFiMAN
+    /// Serenade de Tades) repond alors 401 "Invalid Action" : son parseur
+    /// echoue sur le CORPS, pas sur l'action. » `texte_xml_sain` a ete ecrit
+    /// pour ca et protege tous les items de piste. Le dossier Radio ne passait
+    /// pas par lui : il etait le dernier emetteur d'item audio du depot a
+    /// echapper son titre avec `quick_xml::escape::escape` nu.
+    ///
+    /// Les noms de station viennent d'imports Radio Browser : du texte libre,
+    /// exactement la population pour laquelle ce garde a ete ecrit.
+    ///
+    /// TEMOIN : le nom reste lisible — on remplace par une espace, on ne perd
+    /// pas la station.
+    #[test]
+    fn un_caractere_de_controle_dans_un_nom_de_station_ne_casse_pas_la_reponse() {
+        use crate::db::radio_repo::RadioStation;
+        let state = state_du_releve_nd8006();
+        RadioRepo::with_backend(state.backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "Radio\u{0}Parasite".into(),
+                url: "https://icecast.example/nul.aac".into(),
+                homepage: None,
+                logo_url: None,
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: false,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+
+        let reponse = browse_action_response(&state, &soap_browse("radios", 0, 500));
+        let illegal: Vec<u32> = reponse
+            .chars()
+            .filter(|c| !matches!(c, '\t' | '\n' | '\r') && *c < '\u{20}')
+            .map(|c| c as u32)
+            .collect();
+        assert!(
+            illegal.is_empty(),
+            "la reponse SOAP du dossier Radio porte des caracteres interdits \
+             par XML 1.0 ({illegal:?}) : un parseur strict rejette le CORPS \
+             entier et le dossier se lit vide"
+        );
+
+        // --- TEMOIN : la station est toujours la, et lisible.
+        assert!(
+            reponse.contains("Radio Parasite"),
+            "le nom a ete perdu au lieu d'etre assaini : {reponse}"
+        );
+    }
+
+    /// L'item d'une station doit etre bati comme celui d'une piste — la
+    /// rubrique « All Tracks » que le ND8006 affiche correctement.
+    ///
+    /// `restricted` est un attribut OBLIGATOIRE d'un objet DIDL-Lite, et la
+    /// sequence DIDL-Lite ferme l'objet par ses `<res>`, apres les proprietes.
+    /// `didl_radios` etait le seul emetteur du fichier a publier la pochette
+    /// APRES le `<res>` ; sur une base fraiche, 45 des 49 stations en portent
+    /// une depuis la synchronisation de l'annuaire de logos.
+    #[test]
+    fn un_item_de_station_est_bati_comme_un_item_de_piste() {
+        use crate::db::radio_repo::RadioStation;
+
+        let state = state_du_releve_nd8006();
+        RadioRepo::with_backend(state.backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "Station a logo".into(),
+                url: "https://icecast.example/logo.aac".into(),
+                homepage: None,
+                logo_url: Some("https://exemple.test/logo.png".into()),
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: false,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+
+        let didl = browse_radios(&state, 0, 1000).xml;
+        assert!(
+            didl.contains("parentID=\"radios\" restricted=\"1\""),
+            "l'item d'une station ne porte pas l'attribut obligatoire \
+             restricted, la ou celui d'une piste le porte : {didl}"
+        );
+
+        let item = didl
+            .split("<item ")
+            .find(|bloc| bloc.contains("Station a logo"))
+            .unwrap_or_else(|| panic!("station absente du DIDL : {didl}"));
+        let art = item
+            .find("<upnp:albumArtURI>")
+            .unwrap_or_else(|| panic!("pochette absente : {item}"));
+        let res = item
+            .find("<res ")
+            .unwrap_or_else(|| panic!("res absent : {item}"));
+        assert!(
+            art < res,
+            "la pochette est publiee APRES le <res> : la sequence DIDL-Lite \
+             ferme l'objet par ses <res> — {item}"
+        );
+    }
+
+    /// Le garde de non-regression du parcours d'indexation (#1516).
+    ///
+    /// `derivedfrom "object.item.audioItem"` laisse desormais passer DEUX
+    /// classes — pistes et radios. La regle est que les pistes l'emportent :
+    /// un client qui indexe doit recevoir exactement ce qu'il recevait avant,
+    /// sinon reparer une rubrique en casserait une autre.
+    #[test]
+    fn l_indexation_vise_toujours_les_pistes_et_rien_d_autre() {
+        for c in ["*", "upnp:class derivedfrom \"object.item.audioItem\""] {
+            assert_eq!(
+                evaluer_criteres(c).unwrap().cible,
+                Some(CibleRecherche::Pistes),
+                "{c}"
+            );
+        }
+    }
+
+    /// Une classe qu'on ne publie pas, ou une expression qui en vise
+    /// plusieurs, rend une liste VIDE — jamais une faute, et jamais un
+    /// melange qu'aucun point de controle ne saurait paginer.
+    #[test]
+    fn une_classe_inconnue_ou_ambigue_rend_une_liste_vide() {
+        for critere in [
+            "upnp:class derivedfrom \"object.item.imageItem\"",
+            "upnp:class != \"object.item.audioItem.musicTrack\"",
+        ] {
+            assert_eq!(evaluer_criteres(critere).unwrap().cible, None, "{critere}");
+        }
+    }
+
+    /// Un predicat de titre doit mordre sur les conteneurs comme il mord sur
+    /// les pistes : sinon `Search` rendrait toute la rubrique en laissant
+    /// croire qu'il a cherche — la faute exacte de #2312.
+    #[test]
+    fn un_predicat_de_titre_filtre_aussi_les_conteneurs() {
+        let state = state_du_releve_nd8006();
+        let reponse = search_action_response(
+            &state,
+            &soap_search(
+                "0",
+                "upnp:class derivedfrom &quot;object.container.album.musicAlbum&quot; \
+                 and dc:title contains &quot;Kind&quot;",
+                0,
+                100,
+            ),
+        );
+        assert!(reponse.contains("Kind of Blue"), "{reponse}");
+        assert!(!reponse.contains("The Wall"), "{reponse}");
+        assert!(
+            reponse.contains("<NumberReturned>1</NumberReturned>"),
+            "{reponse}"
+        );
+    }
+
+    /// Chercher des artistes DANS un album n'a pas de sens : la liste est
+    /// vide, elle n'est pas fautive. Seul un identifiant qu'on ne publie
+    /// nulle part merite le 710 — la meme distinction que pour les pistes.
+    #[test]
+    fn chercher_une_rubrique_hors_de_sa_portee_rend_une_liste_vide() {
+        let state = state_du_releve_nd8006();
+        let artiste = "upnp:class derivedfrom &quot;object.container.person.musicArtist&quot;";
+
+        let dans_un_album =
+            search_action_response(&state, &soap_search("album/1", artiste, 0, 100));
+        assert!(
+            dans_un_album.contains("<NumberReturned>0</NumberReturned>"),
+            "{dans_un_album}"
+        );
+        assert!(!dans_un_album.contains("<errorCode>"), "{dans_un_album}");
+
+        let inconnu = search_action_response(&state, &soap_search("chose/42", artiste, 0, 100));
+        assert!(inconnu.contains("<errorCode>710</errorCode>"), "{inconnu}");
     }
 
     /// Ce qu'on ne sait pas evaluer doit etre REFUSE, pas approxime : c'est
@@ -3864,5 +6060,103 @@ mod ssdp_msearch_tests {
         assert!(result.xml.contains("So What"), "{}", result.xml);
         assert!(!result.xml.contains("Live"), "{}", result.xml);
         assert!(!result.xml.contains("Blue in Green"), "{}", result.xml);
+    }
+
+    /// #2103 et #1800 tenus ensemble, sur la population qui les a ouverts :
+    /// les stations LIVREES par les migrations, dont le `codec` est NULL.
+    ///
+    /// PREMISSE, verifiee dans le test lui-meme : la migration 33
+    /// `seed_default_radios` n'ecrit que `name`, `url`, `genre` et `country`.
+    /// Les stations d'un serveur neuf ont donc toutes `codec = NULL`. C'est
+    /// exactement ce que dit #2103 : le correctif de #1788 deduisait le type
+    /// MIME du codec, et sur cette population il ne deduisait rien.
+    ///
+    /// FAIT DE BASE : chaque station livree — codec NULL compris — sort du
+    /// `Browse` avec une URL de TUNE et un type MIME utilisable, et le dossier
+    /// n'est pas vide. Les deux defauts se tiennent dans la meme assertion
+    /// parce que le correctif de #1800 les a supprimes ensemble : en publiant
+    /// `radio_audio_url` avec un `audio/wav` CONSTANT, il a retire le codec du
+    /// chemin. Plus une ligne du serveur media ne le lit — `radio_mime_type`
+    /// n'existe plus dans le depot.
+    ///
+    /// TEMOIN LATERAL, vert des deux cotes et sur la meme base : le conteneur
+    /// `albums`, le chemin que Jean Valjean voit PLEIN sur son ND8006. S'il
+    /// passait au rouge, le defaut ne serait pas le dossier Radio mais la base
+    /// d'essai.
+    #[test]
+    fn chaque_station_livree_sans_codec_sort_avec_une_url_tune_et_un_mime() {
+        let mut state = state_du_releve_nd8006();
+        // IP forcee : l'URL publiee doit etre comparable caractere par
+        // caractere, sans dependre de l'interface de la machine de build.
+        state.advertised_ip = Some("192.168.1.18".into());
+        let base = state.base_url();
+        let stations = RadioRepo::with_backend(state.backend.clone())
+            .list()
+            .unwrap();
+        let total = stations.len();
+
+        // --- PREMISSE : le jeu d'essai EST celui de #2103.
+        assert!(
+            total >= 20,
+            "le jeu d'essai doit porter les stations livrees par les \
+             migrations — {total} seulement"
+        );
+        let sans_codec = stations.iter().filter(|s| s.codec.is_none()).count();
+        assert_eq!(
+            sans_codec, total,
+            "la premisse de #2103 a change : {sans_codec} stations sur {total} \
+             ont un codec NULL"
+        );
+
+        // --- LE FAIT DE BASE, station par station.
+        let didl = browse_radios(&state, 0, 500);
+        for station in &stations {
+            let attendue = radio_audio_url(&base, station.id.unwrap_or(0));
+            assert!(
+                didl.xml
+                    .contains(&format!("http-get:*:audio/wav:*\">{attendue}</res>")),
+                "« {} » (codec {:?}) n'est pas publiee sur une URL de Tune avec \
+                 un type MIME : {}",
+                station.name,
+                station.codec,
+                didl.xml
+            );
+            assert!(
+                !didl.xml.contains(&station.url),
+                "le DIDL publie encore l'URL du diffuseur pour « {} » : {}",
+                station.name,
+                station.url
+            );
+        }
+
+        // --- Et le dossier n'est pas vide : la reponse SOAP compte.
+        let reponse = browse_action_response(&state, &soap_browse("radios", 0, 500));
+        assert!(
+            !is_soap_fault(&reponse),
+            "le dossier Radio rend un fault : {reponse}"
+        );
+        let rendus = compteur(&reponse, "NumberReturned");
+        assert_ne!(
+            rendus, 0,
+            "dossier Radio VIDE sur {total} stations sans codec : {reponse}"
+        );
+        assert_eq!(
+            rendus, total as u64,
+            "le dossier Radio annonce {rendus} elements pour {total} stations : \
+             {reponse}"
+        );
+        assert_eq!(
+            rendus,
+            objets_transportes(&reponse),
+            "annonce et transport divergent : {reponse}"
+        );
+
+        // --- TEMOIN LATERAL : le chemin que le testeur voit plein.
+        let albums = browse_action_response(&state, &soap_browse("albums", 0, 10));
+        assert_eq!(
+            compteur(&albums, "NumberReturned"),
+            2,
+            "temoin albums : {albums}"
+        );
     }
 }

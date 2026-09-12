@@ -9,22 +9,87 @@ use serde_json::{Value, json};
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
-use tune_core::db::migrations;
 use tune_core::db::track_repo::TrackRepo;
 
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Les deux verdicts que porte la version de schema, calcules AU MEME ENDROIT.
+///
+/// `up_to_date` garde son sens historique — « rien ne reste a appliquer » — pour
+/// ne pas changer sous les pieds des clients qui le lisent deja. `schema_ahead`
+/// est le fait nouveau : la base a ete migree par une version PLUS RECENTE que
+/// ce binaire.
+///
+/// `None` quand la comparaison est impossible (moteur qui ne rend pas sa
+/// version) : une comparaison qu'on ne peut pas faire ne rend pas `false`, elle
+/// ne rend rien.
+///
+/// C'est l'unique producteur des deux champs de `database_status` : la garde
+/// `mod tests_schema` ci-dessous l'APPELLE, et le site d'appel est la ligne
+/// `let (up_to_date, schema_ahead) = etat_du_schema(version, latest);`.
+fn etat_du_schema(version: Option<i32>, latest: Option<i32>) -> (Option<bool>, Option<bool>) {
+    match (version, latest) {
+        (Some(v), Some(l)) => (
+            Some(v >= l),
+            Some(tune_core::db::migrations::schema_en_avance(v, l)),
+        ),
+        _ => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod tests_schema {
+    use super::etat_du_schema;
+
+    /// Le cas de #2266 : on redescend d'une version, la base reste au schema de
+    /// la suivante. « Rien a appliquer » reste vrai — mais l'installation est
+    /// cassee, et c'est `schema_ahead` qui le dit.
+    #[test]
+    fn une_base_en_avance_est_dite_en_avance() {
+        assert_eq!(etat_du_schema(Some(64), Some(60)), (Some(true), Some(true)));
+    }
+
+    /// Contre-epreuve : une base exactement a jour ne doit PAS lever le drapeau.
+    /// Sans cette moitie, un `schema_ahead` constamment vrai passerait la garde
+    /// precedente.
+    #[test]
+    fn une_base_a_jour_ne_leve_pas_le_drapeau() {
+        assert_eq!(
+            etat_du_schema(Some(60), Some(60)),
+            (Some(true), Some(false))
+        );
+    }
+
+    /// Et une base en retard reste ce qu'elle etait : pas a jour, pas en avance.
+    #[test]
+    fn une_base_en_retard_n_est_ni_a_jour_ni_en_avance() {
+        assert_eq!(
+            etat_du_schema(Some(58), Some(60)),
+            (Some(false), Some(false))
+        );
+    }
+
+    /// Une comparaison impossible ne rend rien, des DEUX cotes.
+    #[test]
+    fn sans_version_les_deux_verdicts_sont_absents() {
+        assert_eq!(etat_du_schema(None, Some(60)), (None, None));
+        assert_eq!(etat_du_schema(Some(60), None), (None, None));
+    }
+}
+
 pub(super) async fn database_status(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    // The migration version is a SQLite notion; PG tracks its own and reports 0.
-    let version = state
-        .db
-        .as_ref()
-        .and_then(|db| migrations::current_version(db).ok())
-        .unwrap_or(0);
-    let latest = migrations::latest_version();
+    // #3182 : le commentaire d'origine — « the migration version is a SQLite
+    // notion; PG tracks its own and reports 0 » — décrivait le défaut au lieu
+    // de le corriger. PostgreSQL tient bien SA table `schema_version`, elle est
+    // lisible, et « 0 » face à un `latest` SQLite rendait `up_to_date: false`
+    // à demeure sur une base parfaitement à jour.
+    let engine = state.backend.engine();
+    let version = super::version_de_schema(&state);
+    let latest = super::version_de_schema_cible(engine);
+    let (up_to_date, schema_ahead) = etat_du_schema(version, latest);
     let row = state.backend.query_one(
         "SELECT \
          (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
@@ -42,12 +107,16 @@ pub(super) async fn database_status(
         })
         .unwrap_or((0, 0, 0));
 
-    let engine_name = format!("{:?}", state.backend.engine()).to_lowercase();
     Ok(Json(json!({
-        "engine": engine_name,
+        "engine": engine.as_str(),
         "migration_version": version,
         "latest_version": latest,
-        "up_to_date": version >= latest,
+        "up_to_date": up_to_date,
+        // #2266 — « a jour » et « en avance » ne sont PAS la meme chose. Une
+        // base migree par une version posterieure remplit `v >= l` : elle etait
+        // donc annoncee « a jour », alors que c'est la signature d'un retour a
+        // une version anterieure, et qu'aucune migration inverse n'existe.
+        "schema_ahead": schema_ahead,
         "artists": artists,
         "albums": albums,
         "tracks": tracks,
@@ -606,6 +675,13 @@ fn persist_database_url(url: &str) -> Result<std::path::PathBuf, String> {
 /// PostgreSQL. Unlike the update flow there is no binary swap involved, so
 /// spawning the SAME executable is safe on Windows too (the update path must
 /// NOT spawn — see update.rs — but here no .bat is waiting on our exit).
+///
+/// Même portée que [`persist_database_url`] juste au-dessus : la migration
+/// SQLite → PostgreSQL n'existe que sous `postgres`, et son unique appelant
+/// vit dans le bloc `#[cfg(feature = "postgres")]` de `migrate_database`.
+/// L'attribut manquait ici seul — d'où une fonction sans appelant dans toutes
+/// les configurations de la CI, qui ne compile pas `postgres`.
+#[cfg(feature = "postgres")]
 fn restart_after_migration() {
     tokio::spawn(async {
         // Let the HTTP response flush to the client first.

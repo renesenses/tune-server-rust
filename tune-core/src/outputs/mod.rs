@@ -15,6 +15,7 @@ pub mod dlna_buffer_stats;
 #[cfg(test)]
 mod dlna_test;
 pub mod hqplayer;
+pub mod identite_de_sortie;
 #[cfg(feature = "local-audio")]
 pub mod local;
 pub mod mock;
@@ -22,6 +23,7 @@ pub mod mock;
 pub mod oaat;
 pub mod oh_events;
 pub mod openhome;
+pub mod openhome_pins;
 pub mod registry;
 pub mod slimproto;
 pub mod squeezebox;
@@ -33,5 +35,5 @@ pub mod wasapi_exclusive;
 pub use registry::OutputRegistry;
 pub use traits::{
     OutputCapabilities, OutputCommand, OutputCommandError, OutputCommandResult, OutputStatus,
-    OutputTarget, PlayMedia, TransportState,
+    OutputTarget, PlayMedia, TransportState, VolumeResolution,
 };

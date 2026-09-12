@@ -71,6 +71,41 @@ async fn body_of(app: &axum::Router, path: &str) -> (StatusCode, String) {
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
+async fn post_json(app: &axum::Router, path: &str, body: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// The two settings keys `install`/`update` write, read straight back from the
+/// database — the only place that decides what the next boot does.
+fn reglages_d_installation(state: &AppState, name: &str) -> (Option<String>, Option<String>) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    (
+        settings
+            .get(&format!("plugin_{name}_installed"))
+            .ok()
+            .flatten(),
+        settings
+            .get(&format!("plugin_{name}_enabled"))
+            .ok()
+            .flatten(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Mounting
 // ---------------------------------------------------------------------------
@@ -498,6 +533,132 @@ async fn opt_in_plugin_loads_after_install() {
     assert_eq!(entry["enabled"], true);
 }
 
+// ---------------------------------------------------------------------------
+// #3484 — « installé mais impossible de le démarrer »
+// ---------------------------------------------------------------------------
+//
+// La porte qui charge un greffon (`PluginLoader::setup_all`) ne s'ouvre qu'au
+// démarrage. `install` et `uninstall` le disaient par `restart_required` ;
+// `enable` et `disable` ne le disaient pas, alors que ce sont les deux routes
+// que l'écran appelle pour l'interrupteur d'un greffon déjà installé. Le
+// gestionnaire de la nouvelle interface ne montre sa bannière que sur ce champ
+// (`tune-web-client`, `src/components/v2/PluginsV2.svelte` : install et bascule
+// passent par le même `act()`, dont la seule décision est
+// `if (res?.restart_required) restartNeeded = true;`). Sans lui, basculer
+// annonçait « activé » et rien ne chargeait.
+//
+// Les trois épreuves ci-dessous portent sur les trois cas qui se distinguent,
+// et le témoin vert du milieu est celui qui compte : `restart_required` doit
+// être un CONSTAT (l'état demandé diffère-t-il de ce qui tourne ?), pas un
+// `true` constant qui enverrait couper la musique pour rien.
+
+/// Activer un greffon qui ne tourne pas : le redémarrage est annoncé.
+#[tokio::test]
+async fn activer_un_greffon_dormant_annonce_le_redemarrage() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    // Pas installé : `setup_all` le laisse dormant, il ne tourne pas.
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/optin/enable", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], true);
+    assert_eq!(
+        body["restart_required"], true,
+        "le réglage est écrit mais aucun routeur n'est monté : sans ce champ \
+         l'écran annonce « activé » et rien ne charge — {body}"
+    );
+
+    // Et le réglage a bien été posé : le champ ne remplace pas l'écriture.
+    let (_installed, enabled) = reglages_d_installation(&state, "optin");
+    assert_eq!(enabled.as_deref(), Some("true"));
+}
+
+/// Témoin vert — réactiver un greffon DÉJÀ chargé ne demande rien.
+///
+/// C'est ce cas qui interdit un `true` constant : la bannière enverrait
+/// redémarrer un serveur qui n'a rien à recharger, et la lecture s'arrêterait
+/// pour rien.
+#[tokio::test]
+async fn reactiver_un_greffon_deja_charge_ne_demande_aucun_redemarrage() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_optin_installed", "true")
+        .unwrap();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/optin/enable", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["restart_required"], false,
+        "le greffon tourne déjà : rien à recharger — {body}"
+    );
+}
+
+/// Désactiver un greffon qui TOURNE : ses routes restent montées jusqu'au
+/// prochain démarrage, et le champ doit le dire.
+#[tokio::test]
+async fn desactiver_un_greffon_charge_annonce_le_redemarrage() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_optin_installed", "true")
+        .unwrap();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/optin/disable", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], false);
+    assert_eq!(
+        body["restart_required"], true,
+        "le greffon tourne encore : ses routes ne tomberont qu'au prochain \
+         démarrage — {body}"
+    );
+}
+
+/// La fiche d'un greffon COMPILÉ installé mais pas encore chargé porte le même
+/// champ que la fiche wasm dans le même état.
+///
+/// Les deux boucles de `list_plugins` décrivaient le même fait — installé, pas
+/// chargé, redémarrage attendu — et une seule le disait. Un écran ne peut pas
+/// deviner que le champ manque : il lit `undefined` et conclut « rien à
+/// faire ».
+#[tokio::test]
+async fn la_fiche_d_un_greffon_installe_non_charge_annonce_le_redemarrage() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    // Installé APRÈS le démarrage : c'est exactement la fenêtre entre le clic
+    // « Installer » et le redémarrage.
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_optin_installed", "true")
+        .unwrap();
+
+    let app = tune_server::routes::router(state.clone());
+    let (_status, body) = body_of(&app, "/api/v1/plugins").await;
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "optin")
+        .expect("le greffon dormant reste listé");
+    assert_eq!(entry["installed"], true);
+    assert_eq!(entry["enabled"], false);
+    assert_eq!(
+        entry["restart_required"], true,
+        "installé et pas chargé : la fiche doit l'annoncer comme la fiche wasm — {entry}"
+    );
+}
+
 /// `dj` et `karaoke` sont compilés dans TOUS les binaires publiés — les six
 /// lignes de build de `release.yml` les listent avec `bandcamp`. Ils ne
 /// doivent pourtant plus figurer dans le gestionnaire : aucun écran du client
@@ -576,4 +737,481 @@ async fn uncatalogued_dj_still_loads_when_installed_by_hand() {
         .find(|p| p["name"] == "dj")
         .expect("un greffon qui tourne reste listé, hors catalogue ou non");
     assert_eq!(entry["enabled"], true);
+}
+
+// ---------------------------------------------------------------------------
+// Installation — un nom qui ne désigne rien ne doit rien écrire (#2132)
+// ---------------------------------------------------------------------------
+
+/// Un greffon hors catalogue, comme DJ et Karaoké : compilé, dormant, et que
+/// le gestionnaire ne propose PAS. Il ne figure ni dans `plugin_info` ni dans
+/// `plugin_available` — c'est précisément ce qui le rend utile ici.
+struct Uncatalogued;
+
+#[async_trait]
+impl TunePlugin for Uncatalogued {
+    fn name(&self) -> &str {
+        "horscatalogue"
+    }
+    fn version(&self) -> &str {
+        "3.0.0"
+    }
+    fn description(&self) -> &str {
+        "Compilé, dormant, jamais proposé"
+    }
+    fn default_enabled(&self) -> bool {
+        false
+    }
+    fn catalogued(&self) -> bool {
+        false
+    }
+    async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+        Ok(())
+    }
+    async fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Le défaut du ticket : `POST /plugins/{nom}/install` répondait
+/// « installed » + « restart_required » pour N'IMPORTE quel nom, en posant
+/// deux réglages que le démarrage ne peut satisfaire — le catalogue distant
+/// sert encore « Synchronized Lyrics » (`platforms: "python"`), et un testeur
+/// a « bien mis le plugin » sans aucun résultat.
+///
+/// La preuve est prise **dans la base**, pas sur le code de retour : ce sont
+/// `plugin_{nom}_installed` / `_enabled` qui décidaient de la promesse.
+#[tokio::test]
+async fn un_nom_de_greffon_inconnu_n_ecrit_rien_et_le_dit() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/lyrics/install", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "un nom que ce binaire ne porte pas doit être refusé (corps : {body})"
+    );
+    assert_eq!(body["error"], "plugin_inconnu");
+    assert_eq!(body["name"], "lyrics");
+
+    assert_eq!(
+        reglages_d_installation(&state, "lyrics"),
+        (None, None),
+        "aucun réglage ne doit être posé pour un greffon qui ne peut pas charger"
+    );
+}
+
+/// La mise à jour écrit le MÊME réglage que l'installation : laisser ce
+/// chemin ouvert rouvrait le trou par le bouton « Mettre à jour ».
+#[tokio::test]
+async fn la_mise_a_jour_refuse_aussi_un_nom_inconnu() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/karaoke-python/update", "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "corps : {body}");
+    assert_eq!(body["error"], "plugin_inconnu");
+    assert_eq!(
+        reglages_d_installation(&state, "karaoke-python"),
+        (None, None)
+    );
+}
+
+/// Témoin : le garde-fou n'a pas fermé la porte à ce qui s'installe vraiment.
+/// Un opt-in catalogué passe, et les deux réglages sont bien posés.
+#[tokio::test]
+async fn un_greffon_compile_s_installe_toujours() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/optin/install", "{}").await;
+    assert_eq!(status, StatusCode::OK, "corps : {body}");
+    assert_eq!(body["status"], "installed");
+    assert_eq!(body["restart_required"], true);
+
+    assert_eq!(
+        reglages_d_installation(&state, "optin"),
+        (Some("true".into()), Some("true".into())),
+        "l'installation d'un greffon réel doit toujours poser ses deux réglages"
+    );
+}
+
+/// Témoin anti-régression de #2090 : « retiré du catalogue » n'est pas
+/// « condamné ». Un greffon hors catalogue n'apparaît dans AUCUNE des deux
+/// listes publiées par `init` — un garde-fou bâti sur elles l'aurait refusé —
+/// et il doit pourtant rester installable par qui le nomme.
+#[tokio::test]
+async fn un_greffon_hors_catalogue_reste_installable_par_son_nom() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Uncatalogued)]).await;
+
+    let charges: Vec<&str> = state
+        .plugin_info
+        .get()
+        .map(|v| v.iter().map(|p| p.name.as_str()).collect())
+        .unwrap_or_default();
+    let proposes: Vec<&str> = state
+        .plugin_available
+        .get()
+        .map(|v| v.iter().map(|p| p.name.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !charges.contains(&"horscatalogue") && !proposes.contains(&"horscatalogue"),
+        "le témoin ne prouve rien s'il figure dans l'une des deux listes \
+         (chargés : {charges:?}, proposés : {proposes:?})"
+    );
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = post_json(&app, "/api/v1/plugins/horscatalogue/install", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "un greffon compilé mais hors catalogue reste installable nommément (corps : {body})"
+    );
+    assert_eq!(
+        reglages_d_installation(&state, "horscatalogue"),
+        (Some("true".into()), Some("true".into()))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Le second catalogue : la clef de réglages `plugins` (#2132)
+// ---------------------------------------------------------------------------
+
+/// Les fiches que porte la clef de réglages `plugins`.
+///
+/// Cette clef n'est écrite NULLE PART dans ce dépôt — `git grep 'set("plugins"'
+/// ne rend rien, `get("plugins")` rend trois lectures. Ce qu'elle contient
+/// vient donc de la table `settings` d'avant, celle du Tune écrit en Python
+/// que la migration conserve, et le serveur la rendait telle quelle : aucun
+/// `type`, aucun `platforms`, rien qui distingue une fiche vivante d'une fiche
+/// morte. Les noms et libellés repris ici sont ceux du relevé du catalogue en
+/// ligne du 29/08/2026 (« Synchronized Lyrics », « Karaoké », « Mode DJ »).
+///
+/// `horscatalogue` est le **témoin vivant** : un greffon que ce binaire porte
+/// réellement, dont la fiche doit traverser le tri sans une virgule de
+/// changement. Les trois autres ne désignent rien ici — et surtout pas les
+/// greffons `dj` / `karaoke` compilés dans le jeu livré, dont les noms sont
+/// `dj` et `karaoke` tout court.
+const FICHES_HERITEES: &str = r#"[
+  {"name":"lyrics","display_name":"Synchronized Lyrics","version":"0.1.0",
+   "installed":true,"enabled":true},
+  {"name":"karaoke-python","display_name":"Karaoké","version":"0.1.0",
+   "installed":true,"enabled":true},
+  {"name":"dj-mode","display_name":"Mode DJ","version":"0.1.0",
+   "installed":false,"enabled":false},
+  {"name":"horscatalogue","display_name":"Compilé, dormant, jamais proposé",
+   "version":"3.0.0","installed":true,"enabled":true}
+]"#;
+
+/// Les quatre noms semés, et eux seuls. On ne compte JAMAIS la liste entière :
+/// le jeu de fonctionnalités livré compile aussi `dj`, `karaoke` et
+/// `plugins-wasm`, qui ajoutent leurs propres entrées — compter le tout
+/// reviendrait à supposer un jeu de features, faux hors CI (cf. le
+/// commentaire de `opt_in_plugin_is_listed_as_installable_not_loaded`).
+const SEMES: [&str; 4] = ["lyrics", "karaoke-python", "dj-mode", "horscatalogue"];
+
+fn semer_les_fiches_heritees(state: &AppState) {
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugins", FICHES_HERITEES)
+        .unwrap();
+}
+
+/// Les fiches héritées effectivement rendues, dans l'ordre.
+fn fiches_heritees_rendues(liste: &Value) -> Vec<&Value> {
+    liste
+        .as_array()
+        .expect("la liste des greffons est un tableau")
+        .iter()
+        .filter(|f| f["name"].as_str().is_some_and(|n| SEMES.contains(&n)))
+        .collect()
+}
+
+async fn delete_json(app: &axum::Router, path: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(Request::delete(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Le défaut du ticket, pris sur un fait de base : le CONTENU de la liste
+/// rendue par le gestionnaire, jamais un code HTTP.
+///
+/// `GET /api/v1/plugins` recopiait la clef `plugins` telle quelle en tête de
+/// sa réponse. « Synchronized Lyrics » — la fiche que cherche exactement un
+/// utilisateur qui veut des paroles — y était donc encore PROPOSÉE, sur un
+/// serveur qui ne peut rien en faire.
+#[tokio::test]
+async fn le_gestionnaire_ne_propose_plus_les_fiches_de_l_ere_python() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Uncatalogued)]).await;
+    semer_les_fiches_heritees(&state);
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/plugins").await;
+    assert_eq!(status, StatusCode::OK);
+    let liste: Value = serde_json::from_str(&body).unwrap();
+
+    let rendues = fiches_heritees_rendues(&liste);
+    let noms: Vec<&str> = rendues.iter().filter_map(|f| f["name"].as_str()).collect();
+    assert_eq!(
+        noms,
+        vec!["horscatalogue"],
+        "aucune fiche de l'ère Python ne doit rester proposée, et la seule \
+         fiche vivante doit rester là (rendues : {noms:?})"
+    );
+
+    // Témoin vert : la fiche gardée sort INCHANGÉE. Un identifiant qui bouge
+    // casse les installations existantes ; un libellé qui bouge casse la
+    // reconnaissance à l'écran.
+    //
+    // « Inchangée » se vérifie champ à champ depuis #3408, et non par égalité
+    // de l'objet entier : le tri AJOUTE désormais `compatible` aux fiches
+    // qu'il garde (une fiche gardée est, par construction, un greffon que ce
+    // binaire sait charger). L'égalité stricte confondait « aucun champ
+    // modifié » — ce que la garantie promet — avec « aucun champ ajouté », ce
+    // qu'elle n'a jamais promis.
+    let gardee = rendues[0];
+    let semee: Value = serde_json::from_str(FICHES_HERITEES).unwrap();
+    let attendue = semee
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "horscatalogue")
+        .unwrap();
+    for (clef, valeur) in attendue.as_object().unwrap() {
+        assert_eq!(
+            gardee.get(clef),
+            Some(valeur),
+            "la fiche vivante doit traverser le tri sans qu'un champ bouge \
+             (champ « {clef} », fiche rendue : {gardee})"
+        );
+    }
+    assert_eq!(
+        gardee["compatible"], true,
+        "une fiche héritée gardée nomme un greffon chargeable : elle doit \
+         être dite compatible, sans quoi l'écran la grise ({gardee})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `compatible` : le champ que la route n'émettait pas (#3408)
+// ---------------------------------------------------------------------------
+
+/// Le défaut du ticket, pris là où il se produit : dans le CORPS de la liste.
+///
+/// Querite, 05/09/2026 : toutes ses extensions portaient le badge rouge
+/// « INCOMPATIBLE » et le bouton « Installer » du catalogue était grisé. La
+/// cause n'est pas un calcul faux, c'est une ABSENCE : `GET /api/v1/plugins`
+/// n'émettait `compatible` sur aucune de ses trois entrées, et un champ absent
+/// est faux en JavaScript. L'écran précédent le masquait en normalisant la
+/// liste avant affichage ; le nouveau lisait la réponse telle quelle.
+///
+/// Le correctif client ne suffit pas et c'est tout l'objet de ce test : les
+/// clients DÉJÀ PUBLIÉS — ceux des testeurs, ceux des versions passées — n'ont
+/// pas cette normalisation. Seul le champ côté serveur les protège.
+///
+/// On n'énumère pas les entrées attendues : le jeu de fonctionnalités livré en
+/// compile d'autres (dj, karaoke, bandcamp, plugins-wasm). L'assertion porte
+/// sur TOUTES les entrées rendues, quelles qu'elles soient — c'est exactement
+/// la promesse de Querite : plus une seule fiche muette.
+#[tokio::test]
+async fn aucune_fiche_de_la_liste_ne_sort_sans_compatible() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(
+        &state,
+        "http://127.0.0.1:0",
+        vec![Box::new(Loads), Box::new(OptIn), Box::new(Uncatalogued)],
+    )
+    .await;
+    // Une fiche héritée VIVANTE dans le lot : la quatrième famille d'entrées,
+    // celle qui ressort de la clef de réglages `plugins` (#2132).
+    semer_les_fiches_heritees(&state);
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/plugins").await;
+    assert_eq!(status, StatusCode::OK);
+    let liste: Value = serde_json::from_str(&body).unwrap();
+    let entrees = liste.as_array().expect("un tableau");
+    assert!(!entrees.is_empty(), "la liste ne doit pas être vide");
+
+    for fiche in entrees {
+        let nom = fiche["name"].as_str().unwrap_or("<sans nom>");
+        assert!(
+            fiche.get("compatible").and_then(Value::as_bool).is_some(),
+            "« {nom} » sort sans `compatible` : le client la grisera ({fiche})"
+        );
+        assert_eq!(
+            fiche["compatible"], true,
+            "rien n'est incompatible sur ce serveur nu — « {nom} » ({fiche})"
+        );
+    }
+
+    // Et nommément les deux familles du relevé de Querite : l'intégrée
+    // (xtune) et une SDK (bandcamp chez lui, `loads` ici).
+    for attendu in ["xtune", "loads", "optin", "horscatalogue"] {
+        let fiche = entrees
+            .iter()
+            .find(|f| f["name"] == attendu)
+            .unwrap_or_else(|| panic!("« {attendu} » doit figurer dans la liste"));
+        assert_eq!(fiche["compatible"], true, "{fiche}");
+    }
+}
+
+/// La fiche unitaire répond comme la liste.
+///
+/// `/plugins/{nom}` sert le même type au client (`MergedPlugin`, contrat web),
+/// et `compatible` y est tout aussi obligatoire. Deux verdicts différents pour
+/// la même extension selon la route serait le défaut d'origine sous une autre
+/// forme : l'écran de détail grisant ce que la liste propose.
+#[tokio::test]
+async fn la_fiche_unitaire_porte_aussi_compatible() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Loads)]).await;
+
+    let app = tune_server::routes::router(state.clone());
+
+    // Chargé.
+    let (status, body) = body_of(&app, "/api/v1/plugins/loads").await;
+    assert_eq!(status, StatusCode::OK);
+    let fiche: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(fiche["status"], "loaded", "{fiche}");
+    assert_eq!(fiche["compatible"], true, "{fiche}");
+
+    // Inconnu de ce binaire : « pas installé » n'est pas « incompatible ».
+    // Le client doit pouvoir afficher la raison réelle, pas un badge rouge
+    // qui parle de version.
+    let (status, body) = body_of(&app, "/api/v1/plugins/inconnu").await;
+    assert_eq!(status, StatusCode::OK);
+    let fiche: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(fiche["status"], "not_installed", "{fiche}");
+    assert_eq!(fiche["compatible"], true, "{fiche}");
+}
+
+/// `GET /api/v1/system/plugins` est l'alias historique, et il lisait la clef
+/// `plugins` par lui-même : la fiche morte y revenait même une fois écartée de
+/// `/plugins`. Ici la réponse ne contient QUE des fiches héritées, donc le
+/// compte porte sur la liste entière.
+#[tokio::test]
+async fn l_alias_system_plugins_trie_comme_la_liste() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Uncatalogued)]).await;
+    semer_les_fiches_heritees(&state);
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/system/plugins").await;
+    assert_eq!(status, StatusCode::OK);
+    let liste: Value = serde_json::from_str(&body).unwrap();
+    let noms: Vec<&str> = liste
+        .as_array()
+        .expect("un tableau")
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    assert_eq!(
+        noms,
+        vec!["horscatalogue"],
+        "l'alias doit rendre exactement une fiche, la vivante (rendues : {noms:?})"
+    );
+}
+
+/// Le sort de la fiche que l'utilisateur croit avoir installée.
+///
+/// Sur un serveur ≤ v0.9.124, un clic sur « Synchronized Lyrics » posait
+/// `plugin_lyrics_installed=true` et `plugin_lyrics_enabled=true` puis
+/// répondait « installé, redémarrage requis ». Le garde-fou d'`install` a
+/// fermé la porte, mais ces deux réglages sont toujours dans les bases : la
+/// fiche du greffon continuait de se dire « installed ».
+///
+/// Elle est désormais dite `unavailable` — et rien n'est détruit dans le dos
+/// de l'utilisateur : les deux réglages restent en base, et `DELETE` reste la
+/// sortie qui les enlève.
+#[tokio::test]
+async fn une_fiche_installee_avant_le_garde_fou_est_dite_indisponible() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings.set("plugin_lyrics_installed", "true").unwrap();
+    settings.set("plugin_lyrics_enabled", "true").unwrap();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/plugins/lyrics").await;
+    assert_eq!(status, StatusCode::OK);
+    let fiche: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        fiche["status"], "unavailable",
+        "un réglage hérité ne doit plus valoir confirmation d'installation : {fiche}"
+    );
+    assert_eq!(fiche["installed"], false);
+    assert_eq!(fiche["enabled"], false);
+
+    // Rien n'a été effacé : la trace de l'utilisateur survit à la lecture.
+    assert_eq!(
+        reglages_d_installation(&state, "lyrics"),
+        (Some("true".into()), Some("true".into())),
+        "la route de lecture ne doit rien écrire ni rien détruire"
+    );
+
+    // Et la sortie existe : le bouton « Désinstaller » enlève bien les deux
+    // réglages morts.
+    let (status, corps) = delete_json(&app, "/api/v1/plugins/lyrics").await;
+    assert_eq!(status, StatusCode::OK, "corps : {corps}");
+    assert_eq!(
+        reglages_d_installation(&state, "lyrics"),
+        (None, None),
+        "la désinstallation doit rester la sortie d'une fiche morte"
+    );
+}
+
+/// Témoin vert de l'autre côté : un greffon que ce binaire porte vraiment,
+/// installé et en attente de redémarrage, reste annoncé « installé ». Le tri
+/// ne touche pas ce qui charge.
+#[tokio::test]
+async fn un_greffon_reel_en_attente_de_redemarrage_reste_installe() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    // Installé APRÈS `init` : le greffon ne chargera qu'au prochain boot, donc
+    // il ne figure pas dans l'instantané des chargés — c'est exactement la
+    // situation où la fiche ne tient que par ses réglages.
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings.set("plugin_optin_installed", "true").unwrap();
+    settings.set("plugin_optin_enabled", "true").unwrap();
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/plugins/optin").await;
+    assert_eq!(status, StatusCode::OK);
+    let fiche: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        fiche["status"], "installed",
+        "un greffon compilé installé doit rester annoncé installé : {fiche}"
+    );
+    assert_eq!(fiche["installed"], true);
+    assert_eq!(fiche["enabled"], true);
 }

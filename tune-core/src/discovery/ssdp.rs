@@ -94,13 +94,21 @@ pub enum MediaServerVerdict {
 ///    (`IDLE_SCAN_INTERVAL`, 120 s), c'est **au minimum quinze cycles
 ///    consécutifs manqués** avant même d'être candidat ;
 /// 3. le verdict `ExpiredNeedsProbe` n'est pas un retrait : l'appelant doit
-///    encore obtenir un échec de [`unicast_probe`] sur la `LOCATION`.
+///    encore obtenir un échec de `unicast_probe` sur la `LOCATION`.
 ///
 /// Le critère est un TEMPS ÉCOULÉ, pas un nombre de cycles manqués, et c'est
-/// délibéré : `process_responses` est appelée aussi bien par la boucle de
-/// balayage que par le récepteur de NOTIFY, une réponse à la fois. Un décompte
-/// de cycles y dériverait — chaque datagramme d'un appareil VOISIN compterait
-/// comme un cycle manqué pour tous les autres. Une horloge, non.
+/// délibéré : un décompte de cycles dériverait dès qu'un appelant apporte
+/// autre chose qu'une fenêtre d'observation complète — chaque datagramme d'un
+/// appareil VOISIN compterait comme un cycle manqué pour tous les autres. Une
+/// horloge, non.
+///
+/// ⚠️ Ce raisonnement décrivait un danger BIEN RÉEL, et il portait juste : les
+/// serveurs multimédia y ont échappé, les renderers non. `miss_count` /
+/// `MISS_GRACE_CYCLES`, eux, comptent bien des cycles — et le récepteur de
+/// NOTIFY appelait `process_responses` une réponse à la fois. C'est #3616.
+/// La correction n'a pas été de transformer ce compteur-là en horloge, mais de
+/// rendre au NOTIFY isolé sa sémantique propre :
+/// [`enregistrer_une_annonce`] n'appelle plus [`oublier_les_absents`].
 pub fn media_server_verdict(
     seen_this_cycle: bool,
     age: Duration,
@@ -168,9 +176,9 @@ pub fn media_server_reachable(age: Duration) -> bool {
 }
 
 #[derive(Debug)]
-struct SsdpResponse {
-    location: String,
-    usn: String,
+pub(crate) struct SsdpResponse {
+    pub(crate) location: String,
+    pub(crate) usn: String,
     _server: Option<String>,
     _st: Option<String>,
     /// `CACHE-CONTROL: max-age=N`, en secondes, quand l'en-tête est présent.
@@ -305,8 +313,13 @@ impl SsdpScanner {
         // Passive SSDP listener: some legacy renderers (e.g. Cyrus Stream X)
         // never answer M-SEARCH, they only multicast periodic NOTIFY
         // ssdp:alive announcements. Without this they are invisible to the
-        // active scanner above. Best-effort: if port 1900 can't be bound the
-        // task just exits and active discovery still works.
+        // active scanner above.
+        //
+        // ⚠️ Ce n'est PLUS « best-effort, la tache sort et la decouverte
+        // active continue » : depuis #1750 cette meme tache porte l'unique
+        // repondeur M-SEARCH, donc tout ce qui rend Tune visible des points de
+        // controle. Elle ne sort plus sur un bind refuse, elle reprend — et
+        // [`etat_ecoute_ssdp`] dit a tout moment si elle ecoute (#3687).
         let notify_state = self.state.clone();
         let notify_tx = self.event_tx.lock().await.clone();
         tokio::spawn(async move {
@@ -326,9 +339,9 @@ impl SsdpScanner {
     }
 
     pub async fn rescan(&self) -> Vec<DiscoveredDevice> {
-        let responses = search_all(&self.search_targets).await;
+        let reponses = rechercher_en_flux(&self.search_targets);
         let event_tx = self.event_tx.lock().await.clone();
-        process_responses(&self.state, &event_tx, responses).await;
+        traiter_le_flux(&self.state, &event_tx, reponses).await;
         let state = self.state.lock().await;
         state.devices.values().cloned().collect()
     }
@@ -344,6 +357,35 @@ impl SsdpScanner {
     }
 }
 
+/// Le recensement periodique du balayage — extrait pour etre mesurable, et
+/// elargi au registre qu'il ne nommait pas.
+///
+/// `devices` ne compte QUE les renderers : les serveurs multimedia vivent dans
+/// `media_servers`, deliberement hors de `devices` (voir le champ). Cette
+/// ligne etait donc muette sur la seule question que quatre tickets de suite
+/// ont posee — « combien de serveurs multimedia Tune voit-il ? » (tickets
+/// support 61, 87, 97 et 98, Belkadi Yacine, du 28/08 au 08/09/2026).
+///
+/// Le journal du ticket 87 la porte HUIT fois, toutes `devices=0`, et il a
+/// fallu argumenter PAR L'ABSENCE de lignes `ssdp_media_server_discovered`
+/// pour en deduire le compte des serveurs. Une absence n'est pas une preuve :
+/// le compte est desormais ecrit, sur une ligne qui existait deja et qui
+/// n'ajoute donc aucun bruit.
+///
+/// Rend `true` quand la ligne a ete emise.
+fn recenser_si_l_heure_est_venue(st: &mut ScannerState) -> bool {
+    if st.last_periodic_rescan.elapsed() < PERIODIC_RESCAN_INTERVAL {
+        return false;
+    }
+    info!(
+        devices = st.devices.len(),
+        serveurs = st.media_servers.len(),
+        "ssdp_periodic_rescan"
+    );
+    st.last_periodic_rescan = Instant::now();
+    true
+}
+
 async fn scan_loop(
     state: Arc<Mutex<ScannerState>>,
     targets: Vec<String>,
@@ -355,16 +397,13 @@ async fn scan_loop(
     let mut fast_retry = 0usize;
     let mut ever_found = false;
     loop {
-        let responses = search_all(&targets).await;
-        process_responses(&state, &event_tx, responses).await;
+        let reponses = rechercher_en_flux(&targets);
+        traiter_le_flux(&state, &event_tx, reponses).await;
 
         let has_devices = {
             let mut st = state.lock().await;
             st.initial_scan_done = true;
-            if st.last_periodic_rescan.elapsed() >= PERIODIC_RESCAN_INTERVAL {
-                info!(devices = st.devices.len(), "ssdp_periodic_rescan");
-                st.last_periodic_rescan = Instant::now();
-            }
+            recenser_si_l_heure_est_venue(&mut st);
             !st.devices.is_empty()
         };
         if has_devices {
@@ -390,11 +429,27 @@ async fn scan_loop(
 /// processing path as active M-SEARCH replies. This is what makes legacy
 /// renderers that ignore M-SEARCH (but still announce themselves) discoverable.
 async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sender<SsdpEvent>) {
-    let socket = match bind_notify_socket() {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "ssdp_notify_listener_disabled");
-            return;
+    // On ne renonce plus (#3687). Cette boucle ne porte pas seulement
+    // l'ecoute passive des NOTIFY : depuis #1750 elle porte AUSSI l'unique
+    // repondeur M-SEARCH. Un `return` sur bind refuse rendait donc Tune
+    // invisible de tous les points de controle pour TOUTE la session, sans
+    // autre trace qu'une ligne `warn` dans une tache detachee. La cause
+    // typique — un autre programme SSDP demarre avant nous — est temporaire.
+    let socket = loop {
+        match lier_ecouteur_ssdp(SSDP_PORT) {
+            Ok(s) => break s,
+            Err(e) => {
+                let echecs = etat_ecoute_ssdp().map(|s| s.echecs).unwrap_or(1);
+                let delai = delai_de_reprise(echecs);
+                warn!(
+                    error = %e,
+                    echecs,
+                    reprise_dans_s = delai.as_secs(),
+                    "ssdp_notify_listener_bind_refuse — Tune ne repond a aucun M-SEARCH \
+                     tant que ce port n'est pas libre"
+                );
+                tokio::time::sleep(delai).await;
+            }
         }
     };
     info!("ssdp_notify_listener_started");
@@ -406,15 +461,14 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                 let data = &buf[..len];
                 let head = String::from_utf8_lossy(&data[..len.min(256)]);
 
-                // Un M-SEARCH qui vise notre MediaServer reçoit une réponse
-                // unicast — c'est CE chemin qui rend Tune visible du
-                // « Rechercher des appareils » d'un point de contrôle (JPlay
-                // iOS, BubbleUPnP…). Avant, seul un NOTIFY spontané toutes les
-                // dix minutes existait : sauf coïncidence avec la fenêtre
-                // d'écoute du contrôleur, le serveur n'apparaissait jamais
-                // (Stéphane Villerio, 12/08/2026). Les recherches qui ne nous
-                // concernent pas — un contrôleur cherchant des renderers —
-                // restent sans réponse.
+                // Un M-SEARCH qui vise notre MediaServer ou l'un de nos
+                // renderers recoit une reponse unicast — c'est CE chemin qui
+                // rend Tune visible du « Rechercher des appareils » d'un point
+                // de controle (JPlay iOS, BubbleUPnP…) et d'un pont UPnP
+                // (UPnPBridge de Lyrion). Avant, seul un NOTIFY spontane
+                // toutes les dix minutes existait : sauf coincidence avec la
+                // fenetre d'ecoute du controleur, le serveur n'apparaissait
+                // jamais (Stephane Villerio, 12/08/2026).
                 if head.starts_with("M-SEARCH") {
                     let full = String::from_utf8_lossy(data);
                     let st = full
@@ -427,51 +481,7 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                         .map(str::trim)
                         .unwrap_or("")
                         .to_string();
-                    if let Some(advert) = crate::upnp_server::media_server_advert() {
-                        for (st_reply, usn) in
-                            crate::upnp_server::msearch_reply_targets(&st, &advert.uuid)
-                        {
-                            let resp = crate::upnp_server::ssdp_msearch_response(
-                                &st_reply,
-                                &usn,
-                                &advert.location,
-                            );
-                            // `to` et `st` : sans eux la trace dit qu'une
-                            // réponse n'est pas partie, sans dire à qui ni pour
-                            // quelle identité — donc sans permettre d'agir
-                            // (#2417, même défaut).
-                            if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
-                                debug!(
-                                    to = %addr,
-                                    st = %st_reply,
-                                    error = %e,
-                                    "ssdp_msearch_reply_failed"
-                                );
-                            }
-                        }
-                    }
-                    // Les zones qui s'annoncent en MediaRenderer (#1750)
-                    // répondent aussi — un contrôleur qui cherche des sorties
-                    // (JPlay « Rechercher des renderers ») ne voit que par là.
-                    for adv in crate::upnp_renderer::renderer_adverts() {
-                        for (st_reply, usn) in
-                            crate::upnp_renderer::renderer_msearch_targets(&st, &adv.uuid)
-                        {
-                            let resp = crate::upnp_server::ssdp_msearch_response(
-                                &st_reply,
-                                &usn,
-                                &adv.location,
-                            );
-                            if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
-                                debug!(
-                                    to = %addr,
-                                    st = %st_reply,
-                                    error = %e,
-                                    "ssdp_renderer_msearch_reply_failed"
-                                );
-                            }
-                        }
-                    }
+                    repondre_au_msearch(&socket, addr, &st).await;
                     continue;
                 }
 
@@ -537,12 +547,10 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                     }
                     continue;
                 }
-                // ssdp:alive (or update): reuse the M-SEARCH processing path.
-                // process_responses dedups by location/USN, so repeated
-                // announcements for an already-known device are cheap.
-                if let Some(resp) = parse_ssdp_response(data) {
-                    process_responses(&state, &event_tx, vec![resp]).await;
-                } else {
+                // `ssdp:alive` (ou `ssdp:update`) : UN datagramme, donc
+                // `enregistrer_une_annonce` et surtout PAS le bilan de fenêtre
+                // de `process_responses` — voir le contrat des deux fonctions.
+                if !enregistrer_une_annonce(&state, &event_tx, data).await {
                     debug!(from = %addr, bytes = len, "ssdp_notify_unparseable");
                 }
             }
@@ -555,11 +563,167 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
     }
 }
 
+/// L'etat de l'ecouteur SSDP du port 1900 — et donc, indissociablement, du
+/// REPONDEUR M-SEARCH, qui n'a pas d'autre socket que celui-la.
+///
+/// #3687. Un testeur a passe une soiree au tcpdump et au M-SEARCH Python pour
+/// conclure — a tort pour la 0.9.141 — que Tune n'implemente pas le cote
+/// *device* de SSDP. Personne n'a pu lui repondre depuis un simple diagnostic,
+/// parce que rien, nulle part, ne disait deux choses pourtant decisives :
+///
+/// 1. **Si l'ecouteur du port 1900 a seulement reussi a se lier.** Depuis
+///    #1750 c'est `notify_listen_loop` qui repond aux M-SEARCH ; si son bind
+///    echoue — un autre programme SSDP tient deja le port, et un pont
+///    UPnP/DLNA en est un — Tune devient invisible de TOUS les points de
+///    controle, et la seule trace etait une ligne de journal `warn` dans une
+///    tache detachee.
+/// 2. **Si Tune a deja repondu a un M-SEARCH.** Seul l'ECHEC d'envoi etait
+///    journalise, en `debug`. Un serveur qui repond parfaitement et un serveur
+///    muet produisaient exactement le meme diagnostic : rien.
+///
+/// Meme forme et meme intention que [`crate::slimproto::etat_ecoute`] (#2938),
+/// pour la meme raison : un bind refuse au demarrage n'a aucun client
+/// WebSocket a prevenir, seul un etat qui survit peut etre relu.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EtatEcouteSsdp {
+    /// Le port sur lequel l'ecoute a ete tentee.
+    pub port: u16,
+    /// `true` si la liaison est en place et que le repondeur M-SEARCH tourne.
+    pub ecoute: bool,
+    /// Phrase lisible, `None` quand l'ecoute est en service.
+    pub message: Option<String>,
+    /// L'erreur du systeme, telle quelle (`os error 98`, `os error 10048`…).
+    pub erreur_systeme: Option<String>,
+    /// Liaisons refusees depuis le demarrage. Non nul avec `ecoute = true`
+    /// signifie que la reprise a fini par aboutir — l'information vaut d'etre
+    /// gardee, c'est elle qui date la fenetre d'invisibilite.
+    pub echecs: u32,
+    /// Reponses M-SEARCH effectivement emises depuis le demarrage. C'est LE
+    /// chiffre qui tranche « Tune repond-il ? » sans tcpdump.
+    pub reponses_msearch: u64,
+}
+
+static ETAT_ECOUTE_SSDP: std::sync::RwLock<Option<EtatEcouteSsdp>> = std::sync::RwLock::new(None);
+static REPONSES_MSEARCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// L'etat de l'ecouteur SSDP, ou `None` tant qu'aucune liaison n'a ete tentee.
+/// Lu par `/system/diagnostics/network` et par le rapport de bogue.
+pub fn etat_ecoute_ssdp() -> Option<EtatEcouteSsdp> {
+    let mut etat = ETAT_ECOUTE_SSDP.read().ok().and_then(|g| g.clone())?;
+    etat.reponses_msearch = REPONSES_MSEARCH.load(std::sync::atomic::Ordering::Relaxed);
+    Some(etat)
+}
+
+fn retenir_etat_ecoute_ssdp(etat: EtatEcouteSsdp) {
+    if let Ok(mut g) = ETAT_ECOUTE_SSDP.write() {
+        *g = Some(etat);
+    }
+}
+
+/// Les paliers de reprise, en secondes, puis le dernier a perpetuite.
+///
+/// `notify_listen_loop` RENONCAIT : un `return` sur echec de bind, et le
+/// repondeur M-SEARCH etait mort pour toute la session. Or la cause typique
+/// est temporaire — un autre programme SSDP demarre avant nous et s'arretera.
+const REPRISES_ECOUTE_SSDP: [u64; 5] = [5, 15, 30, 60, 120];
+
+fn delai_de_reprise(echecs: u32) -> Duration {
+    let i = (echecs.saturating_sub(1) as usize).min(REPRISES_ECOUTE_SSDP.len() - 1);
+    Duration::from_secs(REPRISES_ECOUTE_SSDP[i])
+}
+
+/// Lie l'ecouteur SSDP et RETIENT le resultat, succes comme echec.
+///
+/// C'est le seul point ou [`etat_ecoute_ssdp`] est ecrit : quel que soit
+/// l'appelant, l'etat publie dit la verite sur la derniere tentative.
+fn lier_ecouteur_ssdp(port: u16) -> Result<UdpSocket, String> {
+    let echecs = etat_ecoute_ssdp().map(|e| e.echecs).unwrap_or(0);
+    match bind_notify_socket(port) {
+        Ok(socket) => {
+            retenir_etat_ecoute_ssdp(EtatEcouteSsdp {
+                port,
+                ecoute: true,
+                message: None,
+                erreur_systeme: None,
+                echecs,
+                reponses_msearch: 0,
+            });
+            Ok(socket)
+        }
+        Err(e) => {
+            retenir_etat_ecoute_ssdp(EtatEcouteSsdp {
+                port,
+                ecoute: false,
+                message: Some(format!(
+                    "un autre programme tient deja le port UDP {port} : tant qu'il le \
+                     garde, Tune ne repond a aucun M-SEARCH et reste invisible des points \
+                     de controle et des ponts UPnP (LMS/squeeze2upnp, BubbleUPnP, JPlay)"
+                )),
+                erreur_systeme: Some(e.clone()),
+                echecs: echecs.saturating_add(1),
+                reponses_msearch: 0,
+            });
+            Err(e)
+        }
+    }
+}
+
+/// Emet toutes les reponses dues a un M-SEARCH de cible `st`, et rend le
+/// nombre de datagrammes effectivement partis — le meme nombre dont
+/// [`etat_ecoute_ssdp`] fait la somme.
+///
+/// Site d'appel unique : [`notify_listen_loop`], branche `M-SEARCH`.
+///
+/// Les recherches qui ne nous concernent pas — un controleur qui cherche une
+/// imprimante — restent sans reponse : `msearch_reply_targets` et
+/// `renderer_msearch_targets` rendent alors des listes vides, et le compteur
+/// ne bouge pas.
+async fn repondre_au_msearch(socket: &UdpSocket, addr: std::net::SocketAddr, st: &str) -> u64 {
+    let mut envoyees = 0u64;
+
+    // Le MediaServer. `media_server_advert()` rend `None` tant que le serveur
+    // UPnP n'est pas en service ou qu'aucune IP reseau n'est connue.
+    if let Some(advert) = crate::upnp_server::media_server_advert() {
+        for (st_reply, usn) in crate::upnp_server::msearch_reply_targets(st, &advert.uuid) {
+            let resp = crate::upnp_server::ssdp_msearch_response(&st_reply, &usn, &advert.location);
+            match socket.send_to(resp.as_bytes(), addr).await {
+                Ok(_) => envoyees += 1,
+                // `to` et `st` : sans eux la trace dit qu'une reponse n'est
+                // pas partie, sans dire a qui ni pour quelle identite — donc
+                // sans permettre d'agir (#2417, meme defaut).
+                Err(e) => {
+                    debug!(to = %addr, st = %st_reply, error = %e, "ssdp_msearch_reply_failed")
+                }
+            }
+        }
+    }
+
+    // Les zones qui s'annoncent en MediaRenderer (#1750) : un controleur qui
+    // cherche des sorties — JPlay « Rechercher des renderers », le pont
+    // UPnPBridge de Lyrion — ne voit que par la.
+    for adv in crate::upnp_renderer::renderer_adverts() {
+        for (st_reply, usn) in crate::upnp_renderer::renderer_msearch_targets(st, &adv.uuid) {
+            let resp = crate::upnp_server::ssdp_msearch_response(&st_reply, &usn, &adv.location);
+            match socket.send_to(resp.as_bytes(), addr).await {
+                Ok(_) => envoyees += 1,
+                Err(e) => {
+                    debug!(to = %addr, st = %st_reply, error = %e, "ssdp_renderer_msearch_reply_failed")
+                }
+            }
+        }
+    }
+
+    if envoyees > 0 {
+        REPONSES_MSEARCH.fetch_add(envoyees, std::sync::atomic::Ordering::Relaxed);
+    }
+    envoyees
+}
+
 /// Bind a UDP socket to the SSDP multicast port for passive listening.
 /// Uses SO_REUSEADDR/SO_REUSEPORT so it can coexist with other SSDP users on
 /// the host (other apps, our own UPnP server), and joins the multicast group
 /// on every real IPv4 interface for multi-NIC / VPN setups.
-fn bind_notify_socket() -> Result<UdpSocket, String> {
+fn bind_notify_socket(port: u16) -> Result<UdpSocket, String> {
     let sock2 = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
@@ -572,9 +736,9 @@ fn bind_notify_socket() -> Result<UdpSocket, String> {
     sock2
         .bind(&socket2::SockAddr::from(SocketAddrV4::new(
             Ipv4Addr::UNSPECIFIED,
-            SSDP_PORT,
+            port,
         )))
-        .map_err(|e| format!("bind 0.0.0.0:{SSDP_PORT}: {e}"))?;
+        .map_err(|e| format!("bind 0.0.0.0:{port}: {e}"))?;
 
     // Join the multicast group on each real interface (and the default).
     let mut joined = false;
@@ -625,31 +789,41 @@ fn usn_from_raw(data: &[u8]) -> Option<String> {
     None
 }
 
-async fn search_all(targets: &[String]) -> Vec<SsdpResponse> {
-    let mut all_responses = Vec::new();
+/// La recherche active, au fil de l'eau (LAT-Z1) : les réponses partent dans
+/// un canal dès leur réception, la tâche se termine à la fin de la fenêtre
+/// d'écoute. Même parcours qu'avant (cibles, puis interfaces, puis le repli
+/// Windows sur 0.0.0.0 quand rien n'est venu).
+fn rechercher_en_flux(targets: &[String]) -> mpsc::Receiver<SsdpResponse> {
+    let (tx, rx) = mpsc::channel(64);
+    let targets = targets.to_vec();
+    tokio::spawn(async move {
+        diffuser_les_reponses(&targets, &tx).await;
+    });
+    rx
+}
 
+async fn diffuser_les_reponses(targets: &[String], tx: &mpsc::Sender<SsdpResponse>) {
+    let mut total = 0usize;
     for target in targets {
-        match send_msearch(target).await {
-            Ok(responses) => all_responses.extend(responses),
+        match send_msearch(target, tx).await {
+            Ok(n) => total += n,
             Err(e) => debug!(target, error = %e, "msearch_failed"),
         }
     }
-
     // Windows multi-NIC fallback: retry with 0.0.0.0
-    if all_responses.is_empty() && cfg!(target_os = "windows") {
+    if total == 0 && cfg!(target_os = "windows") {
         debug!("ssdp_windows_fallback_0000");
         for target in targets {
-            if let Ok(responses) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED).await {
-                all_responses.extend(responses);
+            if let Ok(n) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED, tx).await {
+                total += n;
             }
         }
     }
-
-    all_responses
+    debug!(total, "ssdp_search_window_closed");
 }
 
-async fn send_msearch(target: &str) -> Result<Vec<SsdpResponse>, String> {
-    let mut all_responses = Vec::new();
+async fn send_msearch(target: &str, tx: &mpsc::Sender<SsdpResponse>) -> Result<usize, String> {
+    let mut total = 0usize;
     let mut tried = std::collections::HashSet::new();
 
     // Enumerate all real network interfaces (works in Docker macvlan, VPN, multi-NIC)
@@ -663,24 +837,28 @@ async fn send_msearch(target: &str) -> Result<Vec<SsdpResponse>, String> {
             {
                 tried.insert(ip);
                 debug!(interface = %iface.name, ip = %ip, "ssdp_probing_interface");
-                if let Ok(resps) = send_msearch_from(target, ip).await {
-                    all_responses.extend(resps);
+                if let Ok(n) = send_msearch_from(target, ip, tx).await {
+                    total += n;
                 }
             }
         }
     }
 
     // Fallback: also try 0.0.0.0 if no interface found or no responses
-    if all_responses.is_empty()
-        && let Ok(resps) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED).await
+    if total == 0
+        && let Ok(n) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED, tx).await
     {
-        all_responses.extend(resps);
+        total += n;
     }
 
-    Ok(all_responses)
+    Ok(total)
 }
 
-async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpResponse>, String> {
+async fn send_msearch_from(
+    target: &str,
+    bind_ip: Ipv4Addr,
+    tx: &mpsc::Sender<SsdpResponse>,
+) -> Result<usize, String> {
     // Use socket2 with explicit multicast interface binding for VPN compat
     let sock2 = socket2::Socket::new(
         socket2::Domain::IPV4,
@@ -719,7 +897,7 @@ async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpRe
         .await
         .map_err(|e| format!("send: {e}"))?;
 
-    let mut responses = Vec::new();
+    let mut parsed = 0usize;
     let mut buf = [0u8; 4096];
     let mut recv_count: u32 = 0;
 
@@ -733,7 +911,12 @@ async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpRe
             Ok(Ok((len, addr))) => {
                 recv_count += 1;
                 if let Some(resp) = parse_ssdp_response(&buf[..len]) {
-                    responses.push(resp);
+                    parsed += 1;
+                    // Au fil de l'eau : la réponse part tout de suite, le
+                    // consommateur l'enregistre pendant que l'écoute continue.
+                    if tx.send(resp).await.is_err() {
+                        break;
+                    }
                 } else {
                     debug!(from = %addr, bytes = len, "ssdp_unparseable_response");
                 }
@@ -745,12 +928,12 @@ async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpRe
             Err(_) => break,
         }
     }
-    debug!(bind = %bind_ip, target, recv_count, parsed = responses.len(), "ssdp_search_done");
+    debug!(bind = %bind_ip, target, recv_count, parsed, "ssdp_search_done");
 
-    Ok(responses)
+    Ok(parsed)
 }
 
-fn parse_ssdp_response(data: &[u8]) -> Option<SsdpResponse> {
+pub(crate) fn parse_ssdp_response(data: &[u8]) -> Option<SsdpResponse> {
     let text = std::str::from_utf8(data).ok()?;
 
     let mut location = None;
@@ -826,7 +1009,7 @@ fn parse_cache_control_max_age(line: &str) -> Option<u64> {
     None
 }
 
-fn device_id_from_usn(usn: &str) -> String {
+pub(crate) fn device_id_from_usn(usn: &str) -> String {
     if let Some(uuid_part) = usn.split("::").next() {
         uuid_part.trim().to_string()
     } else {
@@ -834,7 +1017,7 @@ fn device_id_from_usn(usn: &str) -> String {
     }
 }
 
-fn host_from_location(location: &str) -> Option<String> {
+pub(crate) fn host_from_location(location: &str) -> Option<String> {
     let after_scheme = location
         .strip_prefix("http://")
         .or_else(|| location.strip_prefix("https://"))?;
@@ -853,7 +1036,7 @@ fn base_url_from_location(location: &str) -> String {
     format!("{scheme}{host_port}")
 }
 
-fn port_from_location(location: &str) -> u16 {
+pub(crate) fn port_from_location(location: &str) -> u16 {
     let after_scheme = location
         .strip_prefix("http://")
         .or_else(|| location.strip_prefix("https://"))
@@ -989,259 +1172,411 @@ pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDe
     ))
 }
 
+/// ⚠️ CONTRAT — cette fonction prend une **fenêtre d'observation COMPLÈTE**.
+///
+/// `responses` doit être la totalité de ce qui a été entendu pendant une
+/// fenêtre où *tous* les appareils vivants avaient l'occasion de parler : le
+/// lot de réponses d'un M-SEARCH. Elle se termine par [`oublier_les_absents`],
+/// qui traite « absent du lot » comme « n'a pas répondu à l'appel » et fait
+/// perdre une vie (`miss_count`) à chaque appareil connu qui n'y figure pas.
+///
+/// ⛔ **Ne JAMAIS l'appeler avec un seul datagramme.** C'était le défaut de
+/// #3616 : l'écouteur NOTIFY passif lui passait `vec![resp]`, un unique
+/// `ssdp:alive`. `seen_ids` ne contenait alors qu'un appareil — celui qui
+/// venait de parler — et **tous les autres** prenaient un cycle manqué. Avec
+/// `MISS_GRACE_CYCLES` = 3, trois annonces spontanées de n'importe quels
+/// voisins bavards (box, téléviseur, imprimante) suffisaient à mettre toute la
+/// liste en sonde de dernière chance, sans qu'aucune horloge n'intervienne :
+/// 124 s entre `ssdp_device_discovered` et `ssdp_device_lost` chez le testeur,
+/// puis `Discovered devices: 0`.
+///
+/// La même fonction servait deux appelants aux sémantiques opposées. Elles
+/// sont désormais séparées, et c'est le NOM qui porte la différence :
+/// - fenêtre complète → `process_responses` / [`traiter_le_flux`] ;
+/// - annonce isolée → [`enregistrer_une_annonce`], qui n'oublie jamais.
 async fn process_responses(
     state: &Arc<Mutex<ScannerState>>,
     event_tx: &mpsc::Sender<SsdpEvent>,
     responses: Vec<SsdpResponse>,
 ) {
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut new_devices: Vec<(String, SsdpResponse)> = Vec::new();
-
-    // Dedup by location
     let mut seen_locations: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut new_devices: Vec<(String, SsdpResponse)> = Vec::new();
     for resp in responses {
-        if seen_locations.contains(&resp.location) {
-            continue;
+        if let Some(nouveau) =
+            classer_la_reponse(state, &mut seen_ids, &mut seen_locations, resp).await
+        {
+            new_devices.push(nouveau);
         }
-        seen_locations.insert(resp.location.clone());
+    }
+    for (dev_id, resp) in new_devices {
+        enregistrer_l_appareil(state, event_tx, dev_id, resp).await;
+    }
+    oublier_les_absents(state, event_tx, &seen_ids).await;
+}
 
-        if let Some(host_str) = host_from_location(&resp.location) {
-            if let Ok(ip) = host_str.parse::<std::net::Ipv4Addr>() {
-                if is_virtual_ip(ip) {
-                    debug!(
-                        location = %resp.location,
-                        ip = %ip,
-                        "ssdp_response_rejected_virtual_ip_in_location"
-                    );
-                    continue;
-                }
-            }
+/// L'autre moitié du contrat : **UN** datagramme `NOTIFY ssdp:alive`, tel que
+/// l'écouteur passif le reçoit (`notify_listen_loop`, site d'appel unique).
+///
+/// Une annonce spontanée dit « je suis là ». Elle ne dit **rien** des autres
+/// appareils : celui qui se tait à cet instant précis n'est pas absent, il n'a
+/// simplement pas parlé dans cette microseconde. D'où la règle, qui est tout
+/// le correctif de #3616 : **un NOTIFY isolé enregistre, jamais il n'oublie.**
+/// Aucun appel à [`oublier_les_absents`] ici — le vieillissement reste
+/// l'affaire du balayage périodique, qui, lui, voit tout le monde.
+///
+/// Rend `false` quand le datagramme n'a pas pu être analysé, pour que
+/// l'appelant journalise `ssdp_notify_unparseable` avec son émetteur.
+async fn enregistrer_une_annonce(
+    state: &Arc<Mutex<ScannerState>>,
+    event_tx: &mpsc::Sender<SsdpEvent>,
+    data: &[u8],
+) -> bool {
+    let Some(resp) = parse_ssdp_response(data) else {
+        return false;
+    };
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_locations: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some((dev_id, resp)) =
+        classer_la_reponse(state, &mut seen_ids, &mut seen_locations, resp).await
+    {
+        enregistrer_l_appareil(state, event_tx, dev_id, resp).await;
+    }
+    true
+}
+
+/// SSDP au fil de l'eau (LAT-Z1) : les réponses arrivent par un canal pendant
+/// toute la fenêtre d'écoute, et chaque appareil est classé puis enregistré dès
+/// la sienne — un renderer qui répond en 200 ms apparaît en 200 ms, la fenêtre
+/// de [`SEARCH_TIMEOUT`] ne borne plus que l'écoute. Le déduplicat intra-fenêtre
+/// et le bilan des absents sont inchangés : ils courent sur le lot entier, à la
+/// fermeture du canal.
+async fn traiter_le_flux(
+    state: &Arc<Mutex<ScannerState>>,
+    event_tx: &mpsc::Sender<SsdpEvent>,
+    mut reponses: mpsc::Receiver<SsdpResponse>,
+) {
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_locations: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(resp) = reponses.recv().await {
+        if let Some((dev_id, resp)) =
+            classer_la_reponse(state, &mut seen_ids, &mut seen_locations, resp).await
+        {
+            enregistrer_l_appareil(state, event_tx, dev_id, resp).await;
         }
+    }
+    oublier_les_absents(state, event_tx, &seen_ids).await;
+}
 
-        // Un appareil est identifié par sa LOCATION, pas par l'UDN de
-        // l'annonce : les frères embarqués d'un HEOS partagent la première
-        // et diffèrent par le second (#1703, cf. `known_id_for_location`).
-        // Le déduplicat par `seen_locations` ci-dessus ne couvre qu'un seul
-        // lot ; le NOTIFY passif appelle cette fonction avec **une** réponse
-        // à la fois, donc chaque annonce d'un frère y échappait.
-        let st = state.lock().await;
-        let dev_id = st
-            .known_id_for_location(&resp.location)
-            .cloned()
-            .unwrap_or_else(|| device_id_from_usn(&resp.usn));
-        let known = st.known_locations.contains_key(&dev_id);
-        drop(st);
+/// Première passe, réponse par réponse : déduplicat par LOCATION, rejet des IP
+/// virtuelles, identification ; un appareil connu voit sa fraîcheur rafraîchie
+/// ici même, un nouveau est rendu pour être enregistré.
+async fn classer_la_reponse(
+    state: &Arc<Mutex<ScannerState>>,
+    seen_ids: &mut std::collections::HashSet<String>,
+    seen_locations: &mut std::collections::HashSet<String>,
+    resp: SsdpResponse,
+) -> Option<(String, SsdpResponse)> {
+    if seen_locations.contains(&resp.location) {
+        return None;
+    }
+    seen_locations.insert(resp.location.clone());
 
-        seen_ids.insert(dev_id.clone());
-
-        if !known {
-            new_devices.push((dev_id, resp));
-        } else {
-            let mut st = state.lock().await;
-            st.miss_count.remove(&dev_id);
-            // Réannonce d'un serveur déjà connu : on remet son horloge à zéro.
-            // C'est CE point qui garantit qu'un serveur bien vivant qui a raté
-            // un cycle — Wi-Fi qui hoquette, annonce perdue — ne disparaît
-            // pas : la seule réapparition suffit à annuler tout le compte à
-            // rebours (#2139).
-            if let Some(ms) = st.media_servers.get_mut(&dev_id) {
-                ms.last_seen = Instant::now();
-                ms.max_age = max_age_from_response(&resp);
+    if let Some(host_str) = host_from_location(&resp.location) {
+        if let Ok(ip) = host_str.parse::<std::net::Ipv4Addr>() {
+            if is_virtual_ip(ip) {
+                debug!(
+                    location = %resp.location,
+                    ip = %ip,
+                    "ssdp_response_rejected_virtual_ip_in_location"
+                );
+                return None;
             }
         }
     }
 
-    // Fetch device descriptions for new devices
-    for (dev_id, resp) in new_devices {
-        match fetch_device_description(&resp.location).await {
-            Ok(desc) => {
+    // Un appareil est identifié par sa LOCATION, pas par l'UDN de
+    // l'annonce : les frères embarqués d'un HEOS partagent la première
+    // et diffèrent par le second (#1703, cf. `known_id_for_location`).
+    // Le déduplicat par `seen_locations` ci-dessus ne couvre qu'un seul
+    // lot ; le NOTIFY passif appelle cette fonction avec **une** réponse
+    // à la fois, donc chaque annonce d'un frère y échappait.
+    let st = state.lock().await;
+    let dev_id = st
+        .known_id_for_location(&resp.location)
+        .cloned()
+        .unwrap_or_else(|| device_id_from_usn(&resp.usn));
+    let ancienne_location = st.known_locations.get(&dev_id).cloned();
+    drop(st);
+
+    seen_ids.insert(dev_id.clone());
+
+    let Some(ancienne_location) = ancienne_location else {
+        return Some((dev_id, resp));
+    };
+
+    // Résidu de #3829 — l'UDN est connu, mais sous une AUTRE adresse.
+    //
+    // Un appareil était déclaré « connu » sur la seule présence de son UDN
+    // dans `known_locations`, **sans jamais comparer la `LOCATION`**. Un
+    // renderer redémarré sur un autre port répond au balayage avec sa nouvelle
+    // adresse ; son UDN étant connu, la réponse ne faisait que rafraîchir sa
+    // fraîcheur et ressortait ici. Il n'est jamais absent (il répond), donc
+    // jamais oublié puis retrouvé : `known_locations`, `devices` et les URL de
+    // contrôle gardaient l'ancien port à vie, et `is_available()` répondait
+    // « indisponible » jusqu'à la première action SOAP — seule #3829 rattrapait
+    // le coup, et seulement pour qui jouait quelque chose.
+    //
+    // ⚠️ Écraser à l'aveugle était le piège : un appareil à plusieurs
+    // interfaces (Wi-Fi **et** Ethernet) annonce légitimement plusieurs
+    // `LOCATION` pour un seul UDN, et `known_locations` n'en tient qu'une. On
+    // basculerait alors d'une interface à l'autre à chaque cycle, en remplaçant
+    // l'`OutputTarget` à chaque bascule.
+    //
+    // La discrimination ne se devine pas, elle se MESURE : on ne remplace que
+    // si l'ancienne adresse ne répond plus. Deux interfaces vivantes ⇒
+    // l'ancienne répond ⇒ on garde celle qu'on avait, exactement comme avant.
+    // Un appareil qui a déménagé ⇒ l'ancienne est morte ⇒ on rend la réponse
+    // pour un réenregistrement complet, qui réécrit la `LOCATION`, l'hôte, le
+    // port et les URL de contrôle.
+    if ancienne_location != resp.location {
+        if l_adresse_repond_encore(&ancienne_location).await {
+            debug!(
+                id = %dev_id,
+                connue = %ancienne_location,
+                autre = %resp.location,
+                "ssdp_seconde_location_ignoree_l_ancienne_repond"
+            );
+        } else {
+            info!(
+                id = %dev_id,
+                ancienne = %ancienne_location,
+                nouvelle = %resp.location,
+                "ssdp_location_changee_appareil_reenregistre"
+            );
+            return Some((dev_id, resp));
+        }
+    }
+
+    let mut st = state.lock().await;
+    st.miss_count.remove(&dev_id);
+    // Réannonce d'un serveur déjà connu : on remet son horloge à zéro.
+    // C'est CE point qui garantit qu'un serveur bien vivant qui a raté
+    // un cycle — Wi-Fi qui hoquette, annonce perdue — ne disparaît
+    // pas : la seule réapparition suffit à annuler tout le compte à
+    // rebours (#2139).
+    if let Some(ms) = st.media_servers.get_mut(&dev_id) {
+        ms.last_seen = Instant::now();
+        ms.max_age = max_age_from_response(&resp);
+    }
+
+    None
+}
+
+/// Deuxième passe, appareil par appareil : description, classement renderer ou
+/// serveur multimédia, repli MinimalDMR, enregistrement et évènement.
+async fn enregistrer_l_appareil(
+    state: &Arc<Mutex<ScannerState>>,
+    event_tx: &mpsc::Sender<SsdpEvent>,
+    dev_id: String,
+    resp: SsdpResponse,
+) {
+    match fetch_device_description(&resp.location).await {
+        Ok(desc) => {
+            let host = host_from_location(&resp.location).unwrap_or_default();
+            let port = port_from_location(&resp.location);
+
+            let device_type = if desc.is_openhome() {
+                OutputType::Openhome
+            } else if desc.is_media_renderer() {
+                OutputType::Dlna
+            } else if desc.has_av_transport() {
+                // Non-standard deviceType but supports AVTransport (WiiM, foobar2000 foo_upnp, etc.)
+                debug!(
+                    id = %dev_id,
+                    name = %desc.friendly_name,
+                    device_type = %desc.device_type,
+                    "ssdp_non_standard_renderer_accepted"
+                );
+                OutputType::Dlna
+            } else if desc.is_media_server() {
+                let cd_url = desc
+                    .services
+                    .iter()
+                    .find(|s| s.service_type.contains("ContentDirectory"))
+                    .map(|s| s.control_url.clone())
+                    .unwrap_or_default();
+                if !cd_url.is_empty() {
+                    let host = host_from_location(&resp.location).unwrap_or_default();
+                    let base = base_url_from_location(&resp.location);
+                    let full_cd_url = if cd_url.starts_with("http") {
+                        cd_url
+                    } else {
+                        format!("{base}{cd_url}")
+                    };
+                    let ms = MediaServerInfo {
+                        id: dev_id.clone(),
+                        name: desc.friendly_name.clone(),
+                        manufacturer: desc.manufacturer.clone(),
+                        model: desc.model_name.clone(),
+                        location: resp.location.clone(),
+                        content_directory_url: full_cd_url,
+                        host,
+                        port,
+                        last_seen: Instant::now(),
+                        max_age: max_age_from_response(&resp),
+                    };
+                    // Record the media server as known so later SSDP cycles
+                    // skip it (see the `!known` gate above). Renderers are
+                    // recorded the same way further down; media servers were
+                    // omitted, so every ~2 min cycle re-fetched their
+                    // description and re-logged this INFO line — dozens of
+                    // duplicate `ssdp_media_server_discovered` entries that
+                    // drowned the playback traces in tester logs and made
+                    // DLNA issues undiagnosable (#954).
+                    {
+                        let mut st = state.lock().await;
+                        st.known_locations
+                            .insert(dev_id.clone(), resp.location.clone());
+                        // Le registre de fraîcheur, sans lequel rien
+                        // n'expire (#2139).
+                        st.media_servers.insert(dev_id.clone(), ms.clone());
+                    }
+                    info!(
+                        id = %dev_id,
+                        name = %ms.name,
+                        location = %ms.location,
+                        cd_url = %ms.content_directory_url,
+                        "ssdp_media_server_discovered"
+                    );
+                    let _ = event_tx.send(SsdpEvent::MediaServerDiscovered(ms)).await;
+                }
+                return;
+            } else {
+                debug!(
+                    id = %dev_id,
+                    name = %desc.friendly_name,
+                    device_type = %desc.device_type,
+                    "ssdp_device_skipped"
+                );
+                return;
+            };
+
+            let device =
+                build_renderer_device(&dev_id, &resp.location, host, port, device_type, &desc);
+
+            let mut st = state.lock().await;
+            st.create_failures.remove(&resp.location);
+            st.known_locations.insert(dev_id.clone(), resp.location);
+            st.miss_count.remove(&dev_id);
+            st.devices.insert(dev_id.clone(), device.clone());
+            drop(st);
+
+            info!(id = %dev_id, name = %device.name, "ssdp_device_discovered");
+            let _ = event_tx
+                .send(SsdpEvent::DeviceDiscovered(Box::new(device)))
+                .await;
+        }
+        Err(e) => {
+            let failure_count = {
+                let mut st = state.lock().await;
+                let count = st.create_failures.entry(resp.location.clone()).or_insert(0);
+                *count += 1;
+                *count
+            };
+
+            // Try MinimalDMR probe on first failure
+            if failure_count == 1 {
                 let host = host_from_location(&resp.location).unwrap_or_default();
                 let port = port_from_location(&resp.location);
-
-                let device_type = if desc.is_openhome() {
-                    OutputType::Openhome
-                } else if desc.is_media_renderer() {
-                    OutputType::Dlna
-                } else if desc.has_av_transport() {
-                    // Non-standard deviceType but supports AVTransport (WiiM, foobar2000 foo_upnp, etc.)
-                    debug!(
-                        id = %dev_id,
-                        name = %desc.friendly_name,
-                        device_type = %desc.device_type,
-                        "ssdp_non_standard_renderer_accepted"
+                let base_url = format!("http://{host}:{port}");
+                let fallback_name = format!("Renderer ({host})");
+                if let Some(probe) = super::minimal_dmr::probe_minimal_dmr(
+                    &base_url,
+                    Some(&resp.location),
+                    &fallback_name,
+                )
+                .await
+                {
+                    let mut device = DiscoveredDevice::new(
+                        dev_id.clone(),
+                        probe.name.clone(),
+                        OutputType::Dlna,
+                        host,
+                        port,
                     );
-                    OutputType::Dlna
-                } else if desc.is_media_server() {
-                    let cd_url = desc
-                        .services
-                        .iter()
-                        .find(|s| s.service_type.contains("ContentDirectory"))
-                        .map(|s| s.control_url.clone())
-                        .unwrap_or_default();
-                    if !cd_url.is_empty() {
-                        let host = host_from_location(&resp.location).unwrap_or_default();
-                        let base = base_url_from_location(&resp.location);
-                        let full_cd_url = if cd_url.starts_with("http") {
-                            cd_url
-                        } else {
-                            format!("{base}{cd_url}")
-                        };
-                        let ms = MediaServerInfo {
-                            id: dev_id.clone(),
-                            name: desc.friendly_name.clone(),
-                            manufacturer: desc.manufacturer.clone(),
-                            model: desc.model_name.clone(),
-                            location: resp.location.clone(),
-                            content_directory_url: full_cd_url,
-                            host,
-                            port,
-                            last_seen: Instant::now(),
-                            max_age: max_age_from_response(&resp),
-                        };
-                        // Record the media server as known so later SSDP cycles
-                        // skip it (see the `!known` gate above). Renderers are
-                        // recorded the same way further down; media servers were
-                        // omitted, so every ~2 min cycle re-fetched their
-                        // description and re-logged this INFO line — dozens of
-                        // duplicate `ssdp_media_server_discovered` entries that
-                        // drowned the playback traces in tester logs and made
-                        // DLNA issues undiagnosable (#954).
-                        {
-                            let mut st = state.lock().await;
-                            st.known_locations
-                                .insert(dev_id.clone(), resp.location.clone());
-                            // Le registre de fraîcheur, sans lequel rien
-                            // n'expire (#2139).
-                            st.media_servers.insert(dev_id.clone(), ms.clone());
-                        }
-                        info!(
-                            id = %dev_id,
-                            name = %ms.name,
-                            location = %ms.location,
-                            cd_url = %ms.content_directory_url,
-                            "ssdp_media_server_discovered"
-                        );
-                        let _ = event_tx.send(SsdpEvent::MediaServerDiscovered(ms)).await;
+                    device.location = Some(resp.location.clone());
+                    let mut svc_urls = std::collections::HashMap::new();
+                    svc_urls.insert("AVTransport".to_string(), probe.av_transport_url.clone());
+                    if let Some(ref rc) = probe.rendering_control_url {
+                        svc_urls.insert("RenderingControl".to_string(), rc.clone());
                     }
-                    continue;
-                } else {
-                    debug!(
-                        id = %dev_id,
-                        name = %desc.friendly_name,
-                        device_type = %desc.device_type,
-                        "ssdp_device_skipped"
+                    device.capabilities.insert(
+                        "service_urls".into(),
+                        serde_json::to_value(&svc_urls).unwrap_or_default(),
                     );
-                    continue;
-                };
+                    device
+                        .capabilities
+                        .insert("minimal_dmr".into(), serde_json::Value::Bool(true));
+                    super::mac::enrich_identity(&mut device);
 
-                let device =
-                    build_renderer_device(&dev_id, &resp.location, host, port, device_type, &desc);
-
-                let mut st = state.lock().await;
-                st.create_failures.remove(&resp.location);
-                st.known_locations.insert(dev_id.clone(), resp.location);
-                st.miss_count.remove(&dev_id);
-                st.devices.insert(dev_id.clone(), device.clone());
-                drop(st);
-
-                info!(id = %dev_id, name = %device.name, "ssdp_device_discovered");
-                let _ = event_tx
-                    .send(SsdpEvent::DeviceDiscovered(Box::new(device)))
-                    .await;
-            }
-            Err(e) => {
-                let failure_count = {
                     let mut st = state.lock().await;
-                    let count = st.create_failures.entry(resp.location.clone()).or_insert(0);
-                    *count += 1;
-                    *count
-                };
+                    st.create_failures.remove(&resp.location);
+                    st.known_locations.insert(dev_id.clone(), resp.location);
+                    st.miss_count.remove(&dev_id);
+                    st.devices.insert(dev_id.clone(), device.clone());
+                    drop(st);
 
-                // Try MinimalDMR probe on first failure
-                if failure_count == 1 {
-                    let host = host_from_location(&resp.location).unwrap_or_default();
-                    let port = port_from_location(&resp.location);
-                    let base_url = format!("http://{host}:{port}");
-                    let fallback_name = format!("Renderer ({host})");
-                    if let Some(probe) = super::minimal_dmr::probe_minimal_dmr(
-                        &base_url,
-                        Some(&resp.location),
-                        &fallback_name,
-                    )
-                    .await
-                    {
-                        let mut device = DiscoveredDevice::new(
-                            dev_id.clone(),
-                            probe.name.clone(),
-                            OutputType::Dlna,
-                            host,
-                            port,
-                        );
-                        device.location = Some(resp.location.clone());
-                        let mut svc_urls = std::collections::HashMap::new();
-                        svc_urls.insert("AVTransport".to_string(), probe.av_transport_url.clone());
-                        if let Some(ref rc) = probe.rendering_control_url {
-                            svc_urls.insert("RenderingControl".to_string(), rc.clone());
-                        }
-                        device.capabilities.insert(
-                            "service_urls".into(),
-                            serde_json::to_value(&svc_urls).unwrap_or_default(),
-                        );
-                        device
-                            .capabilities
-                            .insert("minimal_dmr".into(), serde_json::Value::Bool(true));
-                        super::mac::enrich_identity(&mut device);
-
-                        let mut st = state.lock().await;
-                        st.create_failures.remove(&resp.location);
-                        st.known_locations.insert(dev_id.clone(), resp.location);
-                        st.miss_count.remove(&dev_id);
-                        st.devices.insert(dev_id.clone(), device.clone());
-                        drop(st);
-
-                        info!(id = %dev_id, name = %probe.name, "ssdp_minimal_dmr_discovered");
-                        let _ = event_tx
-                            .send(SsdpEvent::DeviceDiscovered(Box::new(device)))
-                            .await;
-                        continue;
-                    }
+                    info!(id = %dev_id, name = %probe.name, "ssdp_minimal_dmr_discovered");
+                    let _ = event_tx
+                        .send(SsdpEvent::DeviceDiscovered(Box::new(device)))
+                        .await;
+                    return;
                 }
+            }
 
-                if failure_count <= 3 {
-                    // La LOCATION, et pas seulement l'UUID (#2417).
-                    //
-                    // Pour un échec RÉSEAU l'adresse survivait par accident,
-                    // parce que le message d'erreur l'embarque :
-                    // « HTTP fetch http://192.168.1.1:1900/rootDesc.xml: …
-                    // operation timed out ». Pour un échec de PARSING, non :
-                    // « XML parse error: ill-formed document: expected
-                    // `</meta>`, but `</head>` was found » ne porte aucune
-                    // URL. C'est exactement le cas qui en a besoin, et c'était
-                    // le seul qui ne l'avait pas.
-                    //
-                    // Cette erreur-là est la signature d'une page HTML — un
-                    // `<meta>` non refermé dans un `<head>`. Une adresse
-                    // annoncée en SSDP rend donc du HTML là où le scanner
-                    // attend une description UPnP, et sans l'URL on ne peut ni
-                    // l'ouvrir dans un navigateur, ni chercher qui l'annonce.
-                    // Le journal de FabienM (fil forum 1535) est resté
-                    // indiagnosticable pour cette seule raison.
-                    warn!(
-                        id = %dev_id,
-                        location = %resp.location,
-                        error = %e,
-                        "ssdp_device_create_failed"
-                    );
-                }
-                let mut st = state.lock().await;
-                if st.create_failures.len() > 200 {
-                    st.create_failures.retain(|_, c| *c < 50);
-                }
+            if failure_count <= 3 {
+                // La LOCATION, et pas seulement l'UUID (#2417).
+                //
+                // Pour un échec RÉSEAU l'adresse survivait par accident,
+                // parce que le message d'erreur l'embarque :
+                // « HTTP fetch http://192.168.1.1:1900/rootDesc.xml: …
+                // operation timed out ». Pour un échec de PARSING, non :
+                // « XML parse error: ill-formed document: expected
+                // `</meta>`, but `</head>` was found » ne porte aucune
+                // URL. C'est exactement le cas qui en a besoin, et c'était
+                // le seul qui ne l'avait pas.
+                //
+                // Cette erreur-là est la signature d'une page HTML — un
+                // `<meta>` non refermé dans un `<head>`. Une adresse
+                // annoncée en SSDP rend donc du HTML là où le scanner
+                // attend une description UPnP, et sans l'URL on ne peut ni
+                // l'ouvrir dans un navigateur, ni chercher qui l'annonce.
+                // Le journal de FabienM (fil forum 1535) est resté
+                // indiagnosticable pour cette seule raison.
+                warn!(
+                    id = %dev_id,
+                    location = %resp.location,
+                    error = %e,
+                    "ssdp_device_create_failed"
+                );
+            }
+            let mut st = state.lock().await;
+            if st.create_failures.len() > 200 {
+                st.create_failures.retain(|_, c| *c < 50);
             }
         }
     }
+}
 
-    // Grace period: check for lost devices
+/// Troisième passe, sur le lot entier : les appareils qui n'ont pas répondu
+/// perdent une vie (sonde unicast avant l'oubli), les serveurs multimédia
+/// périmés sont re-sondés.
+async fn oublier_les_absents(
+    state: &Arc<Mutex<ScannerState>>,
+    event_tx: &mpsc::Sender<SsdpEvent>,
+    seen_ids: &std::collections::HashSet<String>,
+) {
     let mut lost_ids = Vec::new();
     {
         let mut st = state.lock().await;
@@ -1331,6 +1666,26 @@ fn max_age_from_response(resp: &SsdpResponse) -> Duration {
         .map(Duration::from_secs)
         .unwrap_or(MEDIA_SERVER_MIN_MAX_AGE)
         .max(MEDIA_SERVER_MIN_MAX_AGE)
+}
+
+/// Budget de la sonde de l'ANCIENNE `LOCATION` (voir `classer_la_reponse`).
+///
+/// Le client partagé porte un délai total de 30 s : sans cette borne, une
+/// adresse mise au trou noir (IP réattribuée, pare-feu qui jette) bloquerait le
+/// classement de tout le flux de réponses pendant une demi-minute.
+const BUDGET_SONDE_ANCIENNE_LOCATION: Duration = Duration::from_secs(2);
+
+/// L'adresse rend-elle encore un descripteur ?
+///
+/// Même geste que [`unicast_probe`], mais sur une `LOCATION` donnée plutôt que
+/// sur celle d'un appareil connu — c'est précisément l'ancienne adresse, celle
+/// que l'état porte encore, qu'on interroge avant d'accepter de la remplacer.
+async fn l_adresse_repond_encore(location: &str) -> bool {
+    let client = crate::http::client::shared();
+    match tokio::time::timeout(BUDGET_SONDE_ANCIENNE_LOCATION, client.get(location).send()).await {
+        Ok(Ok(resp)) => resp.status().is_success(),
+        Ok(Err(_)) | Err(_) => false,
+    }
 }
 
 async fn unicast_probe(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> bool {
@@ -1708,6 +2063,350 @@ mod tests {
         }
     }
 
+    // ── #3687 : dire si on ecoute, et compter ce qu'on repond ─────────────
+
+    /// 🔴 #3687 — LA GARDE de l'etat d'ecoute, dans les DEUX sens.
+    ///
+    /// SITE D'APPEL GARDE : `notify_listen_loop`, dont la premiere instruction
+    /// est `lier_ecouteur_ssdp(SSDP_PORT)` — la fonction appelee ici — et qui
+    /// reprend au lieu de sortir tant qu'elle rend `Err`.
+    ///
+    /// Le port n'est pas code en dur : on en fait attribuer un par le systeme,
+    /// pour ne pas courir contre les onze autres agents qui compilent sur la
+    /// meme machine, et pour ne toucher ni au 1900 ni a aucun service reel.
+    ///
+    /// La MOITIE ROUGE tient a un fait du noyau, mesure et non suppose : un
+    /// occupant qui ne pose NI `SO_REUSEADDR` NI `SO_REUSEPORT` fait refuser
+    /// notre liaison (`os error 98`). Un occupant qui pose `SO_REUSEADDR` la
+    /// laisserait passer — c'est d'ailleurs pourquoi `squeeze2upnp`, qui le
+    /// pose, n'est probablement PAS la cause du dossier de #3687.
+    #[tokio::test]
+    async fn l_etat_d_ecoute_dit_le_refus_puis_la_reprise() {
+        // L'occupant : aucune option de partage, exactement le cas ou le
+        // noyau refuse.
+        let occupant = std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("port ephemere");
+        let port = occupant.local_addr().unwrap().port();
+
+        // ── MOITIE ROUGE : le port est pris, on doit le DIRE ──────────────
+        let refus = lier_ecouteur_ssdp(port);
+        assert!(
+            refus.is_err(),
+            "un occupant sans SO_REUSEADDR doit faire refuser la liaison"
+        );
+        let etat = etat_ecoute_ssdp().expect("aucun etat retenu apres un bind refuse");
+        assert_eq!(etat.port, port);
+        assert!(
+            !etat.ecoute,
+            "l'etat doit dire que le repondeur ne tourne pas"
+        );
+        assert!(
+            etat.erreur_systeme.is_some(),
+            "l'erreur systeme est la moitie exploitable du diagnostic"
+        );
+        assert!(etat.echecs >= 1, "l'echec doit etre compte");
+        let message = etat
+            .message
+            .expect("une phrase lisible, pas seulement un code");
+        assert!(
+            message.contains("M-SEARCH"),
+            "la phrase doit nommer la consequence, pas seulement la cause : {message}"
+        );
+
+        // ── MOITIE VERTE : le port se libere, on doit le dire AUSSI ───────
+        // Sans elle, un `lier_ecouteur_ssdp` qui echouerait toujours serait
+        // vert au premier assert et rendrait Tune muet en le proclamant.
+        drop(occupant);
+        let socket = lier_ecouteur_ssdp(port).expect("le port libere doit se lier");
+        let etat = etat_ecoute_ssdp().expect("etat retenu apres un bind reussi");
+        assert_eq!(etat.port, port);
+        assert!(etat.ecoute, "l'etat doit dire que le repondeur tourne");
+        assert!(etat.erreur_systeme.is_none());
+        assert!(etat.message.is_none());
+        drop(socket);
+    }
+
+    /// 🔴 #3687 — LA GARDE du repondeur M-SEARCH.
+    ///
+    /// SITE D'APPEL GARDE : `notify_listen_loop`, branche
+    /// `head.starts_with("M-SEARCH")`, qui appelle
+    /// `repondre_au_msearch(&socket, addr, &st)`.
+    ///
+    /// Le testeur de #3687 conclut que Tune « n'implemente pas la partie
+    /// serveur/device » de SSDP. Cette garde mesure le contraire sur des
+    /// datagrammes reels, en loopback : la machine de compilation n'a pas de
+    /// multicast utile, et un temoin qui en supposerait un se contenterait de
+    /// SAUTER — un test saute n'est pas un test vert.
+    ///
+    /// Elle tranche du meme coup le « non etabli » du ticket : oui,
+    /// `renderer_msearch_targets` couvre `ssdp:all`, `upnp:rootdevice` ET
+    /// `urn:schemas-upnp-org:device:MediaRenderer:1`.
+    #[tokio::test]
+    async fn le_repondeur_msearch_repond_et_se_compte() {
+        const UDN: &str = "uuid:4c9e51b8-3a77-4d0e-8a34-2b0d6f5c9a10";
+        const LOCATION: &str = "http://127.0.0.1:8888/upnp/renderer/17/description.xml";
+
+        // Le controleur : un vrai socket, qui recevra de vrais datagrammes.
+        let controleur = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_nous = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let vers = controleur.local_addr().unwrap();
+
+        crate::upnp_renderer::set_renderer_adverts(vec![crate::upnp_renderer::RendererAdvert {
+            uuid: UDN.to_string(),
+            location: LOCATION.to_string(),
+        }]);
+
+        let avant = etat_ecoute_ssdp().map(|e| e.reponses_msearch).unwrap_or(0);
+
+        // ── MOITIE VERTE : les trois cibles qu'un pont UPnP peut viser ────
+        for st in [
+            "ssdp:all",
+            "upnp:rootdevice",
+            "urn:schemas-upnp-org:device:MediaRenderer:1",
+        ] {
+            let n = repondre_au_msearch(&a_nous, vers, st).await;
+            assert!(n > 0, "aucune reponse emise pour ST={st}");
+
+            let mut buf = [0u8; 2048];
+            let recu = tokio::time::timeout(Duration::from_secs(2), controleur.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("aucun datagramme recu pour ST={st}"))
+                .unwrap();
+            let texte = String::from_utf8_lossy(&buf[..recu.0]).to_string();
+            assert!(texte.starts_with("HTTP/1.1 200 OK"), "ST={st} : {texte}");
+            assert!(
+                texte.contains(&format!("LOCATION: {LOCATION}")),
+                "la reponse doit porter la LOCATION du renderer — ST={st} : {texte}"
+            );
+            assert!(texte.contains(UDN), "ST={st} : {texte}");
+            // On vide ce que ce tour a emis en plus du premier datagramme.
+            while tokio::time::timeout(Duration::from_millis(50), controleur.recv_from(&mut buf))
+                .await
+                .is_ok()
+            {}
+        }
+
+        // ── MOITIE ROUGE : une recherche qui ne nous concerne pas ─────────
+        // Sans elle, un repondeur qui repondrait a TOUT serait vert ci-dessus
+        // tout en inondant le reseau et en se faisant prendre pour une
+        // imprimante.
+        let n = repondre_au_msearch(&a_nous, vers, "urn:schemas-upnp-org:device:Printer:1").await;
+        assert_eq!(n, 0, "une recherche etrangere ne doit rien declencher");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                controleur.recv_from(&mut [0u8; 64])
+            )
+            .await
+            .is_err(),
+            "aucun datagramme ne doit partir pour une cible etrangere"
+        );
+
+        // Le compteur du diagnostic a bien suivi ce qui est parti.
+        if let Some(etat) = etat_ecoute_ssdp() {
+            assert!(
+                etat.reponses_msearch > avant,
+                "le compteur de reponses M-SEARCH doit avancer : {} -> {}",
+                avant,
+                etat.reponses_msearch
+            );
+        }
+
+        crate::upnp_renderer::set_renderer_adverts(Vec::new());
+    }
+
+    // ── #3616 : un datagramme n'est pas une fenêtre d'observation ─────────
+
+    /// Un `NOTIFY ssdp:alive` BRUT, tel qu'il sort de la socket multicast.
+    /// C'est exactement ce que `notify_listen_loop` tient dans `data` au
+    /// moment où il appelle `enregistrer_une_annonce(&state, &event_tx, data)`.
+    ///
+    /// Le témoin est bâti sur des datagrammes fabriqués et non sur un vrai
+    /// SSDP : la machine de compilation n'a pas de multicast utile, et un
+    /// témoin qui en supposerait un se contenterait de SAUTER — un test sauté
+    /// n'est pas un test vert.
+    fn datagramme_notify_alive(location: &str, usn: &str) -> Vec<u8> {
+        format!(
+            "NOTIFY * HTTP/1.1\r\n\
+             HOST: 239.255.255.250:1900\r\n\
+             CACHE-CONTROL: max-age=1800\r\n\
+             LOCATION: {location}\r\n\
+             NT: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\
+             NTS: ssdp:alive\r\n\
+             USN: {usn}\r\n\
+             \r\n"
+        )
+        .into_bytes()
+    }
+
+    /// Pose un appareil connu dans l'état du scanner, LOCATION sur un port
+    /// FERMÉ : la sonde unicast de dernière chance y échouera à coup sûr et
+    /// vite. Si cet appareil disparaît, c'est bien qu'on l'a fait vieillir.
+    async fn poser_un_appareil_connu(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> String {
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ecoute.local_addr().unwrap();
+        drop(ecoute);
+        let location = format!("http://{addr}/upnp/description.xml");
+        let mut st = state.lock().await;
+        st.devices.insert(
+            dev_id.to_string(),
+            DiscoveredDevice::new(
+                dev_id.to_string(),
+                "Ampli du salon".to_string(),
+                OutputType::Dlna,
+                "127.0.0.1".to_string(),
+                addr.port(),
+            ),
+        );
+        st.known_locations
+            .insert(dev_id.to_string(), location.clone());
+        location
+    }
+
+    /// 🔴 #3616 — LA GARDE. Site d'appel gardé : `notify_listen_loop`, branche
+    /// `ssdp:alive`, qui appelle `enregistrer_une_annonce`.
+    ///
+    /// Avant, cette branche appelait `process_responses(&state, &event_tx,
+    /// vec![resp])` : UN datagramme traité comme une fenêtre d'observation
+    /// complète. `seen_ids` ne contenait que l'émetteur, et `oublier_les_absents`
+    /// faisait perdre une vie à tous les autres. Avec `MISS_GRACE_CYCLES` = 3,
+    /// trois annonces spontanées de n'importe quels voisins — box, téléviseur,
+    /// imprimante — mettaient toute la liste en sonde de dernière chance.
+    #[tokio::test]
+    async fn un_notify_de_voisin_ne_fait_pas_vieillir_les_autres_appareils() {
+        const AMPLI: &str = "uuid:129b92ad-826c-4b86-a905-7ea60f4a9e8c";
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, mut rx) = mpsc::channel(32);
+        poser_un_appareil_connu(&state, AMPLI).await;
+
+        // Le voisin bavard : un vrai renderer, qui s'annonce spontanément,
+        // encore et encore — et qui ne dit RIEN de l'ampli.
+        let addr = spawn_description_server().await;
+        let voisin = datagramme_notify_alive(
+            &format!("http://{addr}/aios.xml"),
+            "uuid:9ab0c000-f668-11de-9976-0080-0006787c2e26::urn:schemas-upnp-org:device:MediaRenderer:1",
+        );
+
+        let annonces = MISS_GRACE_CYCLES + 2;
+        for _ in 0..annonces {
+            assert!(
+                enregistrer_une_annonce(&state, &tx, &voisin).await,
+                "le datagramme NOTIFY fabriqué doit s'analyser"
+            );
+        }
+
+        let st = state.lock().await;
+        assert!(
+            st.devices.contains_key(AMPLI),
+            "l'ampli n'a rien fait de mal : {annonces} annonces d'un VOISIN ne \
+             doivent pas le faire disparaître (#3616). Appareils restants : {:?}",
+            st.devices.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            st.miss_count.get(AMPLI).copied().unwrap_or(0),
+            0,
+            "un NOTIFY isolé ne dit rien des autres appareils : aucun cycle \
+             manqué ne doit être compté à l'ampli"
+        );
+        drop(st);
+
+        // Le voisin, lui, a bien été enregistré : la branche ENREGISTRE encore.
+        let mut decouvertes = 0;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                SsdpEvent::DeviceDiscovered(_) => decouvertes += 1,
+                SsdpEvent::DeviceLost(id) => {
+                    panic!("aucune perte ne doit être émise, or {id} est déclaré perdu")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            decouvertes, 1,
+            "le voisin doit être découvert une fois : « enregistrer, jamais oublier »"
+        );
+    }
+
+    /// L'AUTRE MOITIÉ de la contre-épreuve : le même scénario passé par
+    /// `process_responses`, c'est-à-dire par l'ancien site d'appel. Le bilan de
+    /// fenêtre s'applique, l'ampli perd une vie par datagramme et disparaît.
+    ///
+    /// Ce test n'entérine pas un défaut : il épingle le CONTRAT de
+    /// `process_responses` — « ce lot est tout ce qui a été entendu, l'absent
+    /// n'a pas répondu ». C'est ce contrat qui rendait `vec![resp]` fautif, et
+    /// c'est lui qui prouve que la garde ci-dessus mordrait sur une régression.
+    #[tokio::test]
+    async fn contre_epreuve_un_seul_datagramme_pris_pour_une_fenetre_perd_les_autres() {
+        const AMPLI: &str = "uuid:129b92ad-826c-4b86-a905-7ea60f4a9e8c";
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, _rx) = mpsc::channel(32);
+        poser_un_appareil_connu(&state, AMPLI).await;
+
+        let addr = spawn_description_server().await;
+        let location = format!("http://{addr}/aios.xml");
+        let voisin = || {
+            announcement(
+                &location,
+                "uuid:9ab0c000-f668-11de-9976-0080-0006787c2e26::urn:schemas-upnp-org:device:MediaRenderer:1",
+            )
+        };
+
+        for _ in 0..MISS_GRACE_CYCLES {
+            process_responses(&state, &tx, vec![voisin()]).await;
+        }
+
+        assert!(
+            !state.lock().await.devices.contains_key(AMPLI),
+            "contre-épreuve muette : si l'ampli SURVIT ici, c'est que le \
+             mécanisme de #3616 n'existe plus et que la garde ci-dessus ne \
+             garde plus rien"
+        );
+    }
+
+    /// LAT-Z1 : une réponse reçue tôt est enregistrée tout de suite, pendant que
+    /// la fenêtre d'écoute est encore ouverte (le canal est vivant) — pas à sa
+    /// fermeture. Avant, `search_all` entassait les réponses jusqu'à
+    /// `SEARCH_TIMEOUT` et un appareil répondant en 200 ms attendait 6 s.
+    #[tokio::test]
+    async fn une_reponse_precoce_est_enregistree_pendant_la_fenetre() {
+        let addr = spawn_description_server().await;
+        let location = format!("http://{addr}/zone1/desc.xml");
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (ev_tx, mut ev_rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(8);
+        let etat = state.clone();
+        let traitement = tokio::spawn(async move { traiter_le_flux(&etat, &ev_tx, rx).await });
+
+        tx.send(announcement(&location, "uuid:zone-1::urn:x"))
+            .await
+            .expect("le canal est ouvert");
+
+        // La fenêtre est toujours ouverte (`tx` vivant) : l'appareil doit déjà
+        // être là, sans attendre la fermeture.
+        let mut vu = false;
+        for _ in 0..60 {
+            if !state.lock().await.devices.is_empty() {
+                vu = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            vu,
+            "l'appareil doit être enregistré pendant la fenêtre, pas après sa fermeture"
+        );
+        assert!(
+            matches!(ev_rx.try_recv(), Ok(SsdpEvent::DeviceDiscovered(_))),
+            "l'évènement de découverte doit être parti pendant la fenêtre"
+        );
+
+        drop(tx);
+        traitement
+            .await
+            .expect("le traitement se termine à la fermeture du canal");
+    }
+
     #[tokio::test]
     async fn cinq_udn_a_une_seule_location_ne_font_qu_un_lecteur() {
         let addr = spawn_description_server().await;
@@ -1747,6 +2446,181 @@ mod tests {
             }
         }
         assert_eq!(discovered, 1, "un seul évènement de découverte attendu");
+    }
+
+    // ── Résidu de #3829 : une LOCATION qui change sous un UDN connu ──────
+
+    /// Même serveur que [`spawn_description_server`], mais **arrêtable** : la
+    /// tâche possède l'écouteur, l'abandonner ferme le port, et une connexion
+    /// vers ce port devient un refus immédiat — exactement ce que rend un
+    /// renderer redémarré ailleurs.
+    async fn spawn_description_server_arretable()
+    -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tache = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        AIOS_XML.len(),
+                        AIOS_XML
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, tache)
+    }
+
+    const USN_AIOS: &str = "uuid:9ab0c000-f668-11de-9976-0080-0006787c2e26::urn:schemas-upnp-org:device:MediaRenderer:1";
+
+    fn vider(rx: &mut mpsc::Receiver<SsdpEvent>) {
+        while rx.try_recv().is_ok() {}
+    }
+
+    /// L'état du scanner, tel qu'un diagnostic le lit : l'adresse retenue pour
+    /// cet UDN, et le port de l'appareil qui en découle.
+    async fn adresse_et_port(
+        state: &Arc<Mutex<ScannerState>>,
+        dev_id: &str,
+    ) -> (Option<String>, Option<u16>) {
+        let st = state.lock().await;
+        (
+            st.known_locations.get(dev_id).cloned(),
+            st.devices.get(dev_id).map(|d| d.port),
+        )
+    }
+
+    /// 🔴 LA GARDE du résidu laissé par #3840 (`classer_la_reponse`).
+    ///
+    /// SITE D'APPEL GARDÉ : `process_responses` → `classer_la_reponse`, la
+    /// branche « UDN déjà connu ». Le témoin ne relit aucune source : il
+    /// mesure ce que le scanner RETIENT après deux fenêtres d'annonces.
+    ///
+    /// Le second port est tiré par le système à l'exécution — aucune aiguille
+    /// de ce fichier ne peut donc s'y trouver elle-même.
+    #[tokio::test]
+    async fn i3829_un_renderer_qui_change_de_port_est_reenregistre() {
+        // La première vie de l'appareil.
+        let (addr_a, tache_a) = spawn_description_server_arretable().await;
+        // La seconde, liée AVANT de tuer la première : deux ports distincts,
+        // garantis par le système et non par un tirage au sort du test.
+        let (addr_b, _tache_b) = spawn_description_server_arretable().await;
+        assert_ne!(addr_a.port(), addr_b.port());
+        let loc_a = format!("http://{addr_a}/upnp/desc/aios_device/aios_device.xml");
+        let loc_b = format!("http://{addr_b}/upnp/desc/aios_device/aios_device.xml");
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, mut rx) = mpsc::channel(32);
+
+        process_responses(&state, &tx, vec![announcement(&loc_a, USN_AIOS)]).await;
+        let dev_id = state
+            .lock()
+            .await
+            .devices
+            .keys()
+            .next()
+            .cloned()
+            .expect("la première annonce doit enregistrer un appareil");
+        assert_eq!(
+            adresse_et_port(&state, &dev_id).await,
+            (Some(loc_a.clone()), Some(addr_a.port()))
+        );
+        vider(&mut rx);
+
+        // L'appareil redémarre : son ancien port ne répond plus.
+        tache_a.abort();
+        let _ = tache_a.await;
+
+        process_responses(&state, &tx, vec![announcement(&loc_b, USN_AIOS)]).await;
+
+        let (adresse, port) = adresse_et_port(&state, &dev_id).await;
+        assert_eq!(
+            adresse.as_deref(),
+            Some(loc_b.as_str()),
+            "l'adresse retenue doit suivre le renderer redémarré ; elle est              restée sur {loc_a}, et c'est elle que sondent `unicast_probe`,              `ssdp_device_lost` et le réenregistrement au démarrage"
+        );
+        assert_eq!(
+            port,
+            Some(addr_b.port()),
+            "le port de l'appareil doit être celui de la seconde vie"
+        );
+        assert!(
+            state.lock().await.devices.len() == 1,
+            "un renderer qui déménage reste UN appareil, pas deux"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(SsdpEvent::DeviceDiscovered(_))),
+            "sans un nouvel évènement de découverte, la sortie garde ses URL              de contrôle mortes et `is_available()` répond « indisponible »              jusqu'à la première action SOAP"
+        );
+    }
+
+    /// 🔴 LA CONTRE-ÉPREUVE du témoin ci-dessus — celle qui interdit le
+    /// correctif « évident ».
+    ///
+    /// Un appareil à plusieurs interfaces (Wi-Fi **et** Ethernet) annonce
+    /// légitimement plusieurs `LOCATION` pour un seul UDN. Écraser sur la
+    /// seule différence d'adresse ferait basculer l'appareil d'une interface à
+    /// l'autre à chaque cycle, en remplaçant l'`OutputTarget` à chaque
+    /// bascule. Ici les DEUX adresses répondent : rien ne doit bouger.
+    #[tokio::test]
+    async fn i3829_deux_interfaces_vivantes_ne_font_pas_demenager_l_appareil() {
+        let (addr_a, _tache_a) = spawn_description_server_arretable().await;
+        let (addr_b, _tache_b) = spawn_description_server_arretable().await;
+        assert_ne!(addr_a.port(), addr_b.port());
+        let loc_a = format!("http://{addr_a}/upnp/desc/aios_device/aios_device.xml");
+        let loc_b = format!("http://{addr_b}/upnp/desc/aios_device/aios_device.xml");
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, mut rx) = mpsc::channel(32);
+
+        process_responses(&state, &tx, vec![announcement(&loc_a, USN_AIOS)]).await;
+        let dev_id = state
+            .lock()
+            .await
+            .devices
+            .keys()
+            .next()
+            .cloned()
+            .expect("la première annonce doit enregistrer un appareil");
+        vider(&mut rx);
+
+        // La seconde interface s'annonce, trois cycles de suite. Les deux
+        // adresses répondent.
+        for _ in 0..3 {
+            process_responses(&state, &tx, vec![announcement(&loc_b, USN_AIOS)]).await;
+        }
+
+        let (adresse, port) = adresse_et_port(&state, &dev_id).await;
+        assert_eq!(
+            adresse.as_deref(),
+            Some(loc_a.as_str()),
+            "l'ancienne adresse répond encore : c'est un appareil à deux              interfaces, pas un appareil qui a déménagé. Elle doit être gardée."
+        );
+        assert_eq!(port, Some(addr_a.port()));
+        assert!(
+            state.lock().await.devices.len() == 1,
+            "deux interfaces d'un même UDN ne font qu'un appareil"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "aucun évènement ne doit être ré-émis : remplacer l'`OutputTarget`              à chaque annonce de l'autre interface est précisément la              régression que cette garde interdit"
+        );
     }
 
     #[tokio::test]
@@ -2062,6 +2936,78 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    /// #2718 — le recensement périodique doit nommer les DEUX registres.
+    ///
+    /// `ssdp_periodic_rescan` est la seule ligne que TOUTE installation écrit
+    /// périodiquement au sujet de la découverte. Elle ne portait que
+    /// `devices`, c'est-à-dire les renderers. Le journal du ticket support 87
+    /// la porte huit fois — `devices=0` à chaque fois — et sur cette base il a
+    /// fallu argumenter par l'ABSENCE de `ssdp_media_server_discovered` pour
+    /// dire combien de serveurs multimédia Tune voyait. Une absence n'est pas
+    /// une preuve.
+    ///
+    /// La garde exige le compte des serveurs sur cette ligne, avec un registre
+    /// dont les deux moitiés diffèrent : `devices=0` et `serveurs=1`. Un
+    /// recensement qui recompterait `devices` sous les deux noms serait rouge.
+    #[test]
+    fn le_recensement_periodique_nomme_les_serveurs_multimedia() {
+        let mut st = ScannerState::new();
+        st.media_servers.insert(
+            "uuid:freebox".into(),
+            MediaServerInfo {
+                id: "uuid:freebox".into(),
+                name: "Freebox Server".into(),
+                manufacturer: "Freebox SA".into(),
+                model: "Freebox Server".into(),
+                location: "http://192.168.0.254:52424/device.xml".into(),
+                content_directory_url: "http://192.168.0.254:52424/cd".into(),
+                host: "192.168.0.254".into(),
+                port: 52424,
+                last_seen: Instant::now(),
+                max_age: MEDIA_SERVER_MIN_MAX_AGE,
+            },
+        );
+        // L'heure est venue : on recule la dernière trace au-delà de
+        // l'intervalle, sans attendre les 300 s réelles.
+        st.last_periodic_rescan = Instant::now()
+            .checked_sub(PERIODIC_RESCAN_INTERVAL + Duration::from_secs(1))
+            .expect("horloge du processus trop jeune pour reculer de 301 s");
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let emise =
+            tracing::subscriber::with_default(abonne, || recenser_si_l_heure_est_venue(&mut st));
+        assert!(
+            emise,
+            "l'intervalle est dépassé : le recensement devait être émis"
+        );
+
+        let texte = journal.texte();
+        let ligne = texte
+            .lines()
+            .find(|l| l.contains("ssdp_periodic_rescan"))
+            .unwrap_or_else(|| {
+                panic!("aucune trace ssdp_periodic_rescan dans le journal :\n{texte}")
+            });
+        assert!(
+            ligne.contains("serveurs=1"),
+            "le recensement ne dit pas combien de SERVEURS MULTIMÉDIA sont \
+             connus — c'est la question posée par les tickets support 61, 87, \
+             97 et 98, et la seule ligne périodique du journal ne la répond \
+             toujours pas.\nattendu quelque part : serveurs=1\nligne : {ligne}"
+        );
+        assert!(
+            ligne.contains("devices=0"),
+            "le compte des renderers doit rester lisible, et rester DISTINCT \
+             de celui des serveurs : ici 0 renderer pour 1 serveur.\n\
+             ligne : {ligne}"
+        );
     }
 
     /// L'UDN annonce par le descripteur doit ressortir de `build_renderer_device`.

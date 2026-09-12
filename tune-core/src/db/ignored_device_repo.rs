@@ -8,7 +8,7 @@
 //!
 //! # Pourquoi une table, et pas le masquage de zone existant
 //!
-//! `zones.is_hidden` (+ [`ZoneRepo::hidden_zones_by_host`], #1281) empêche
+//! `zones.is_hidden` (+ [`ZoneRepo::hidden_zones_by_host`](crate::db::zone_repo::ZoneRepo::hidden_zones_by_host), #1281) empêche
 //! bien une ZONE supprimée de renaître. Mais il ne porte que ce qui a déjà une
 //! zone, et seulement pour les zones réseau `dlna`/`openhome` :
 //!
@@ -51,7 +51,7 @@
 //! rester détectables mais pas visibles ». Le blocage porte donc sur la
 //! PROPOSITION — enregistrement de sortie, création de zone, liste
 //! d'appareils — jamais sur l'écoute SSDP/mDNS elle-même. Et il est
-//! réversible : [`IgnoredDeviceRepo::unignore`] libère TOUTES les identités
+//! réversible : [`IgnoredDeviceRepo::unignore`](crate::db::ignored_device_repo::IgnoredDeviceRepo::unignore) libère TOUTES les identités
 //! du même appareil, sans quoi l'utilisateur se piégerait lui-même.
 
 use std::sync::Arc;

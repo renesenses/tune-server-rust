@@ -42,6 +42,37 @@ impl DffInfo {
         self.compression.trim_end() == "DST"
     }
 
+    /// Le seul garde qui autorise `data_offset`/`data_size` à partir vers le
+    /// convertisseur DSD→PCM ou DSD→DoP. Liste BLANCHE : tout ce qui n'est pas
+    /// du DSD non compressé est refusé, y compris une compression inconnue.
+    ///
+    /// Il vivait en double — un message soigné dans `read_dff_data`, qui n'a
+    /// aucun appelant dans le dépôt, et un message générique dans
+    /// `DffStreamReader::open`, seul chemin réellement emprunté. L'utilisateur
+    /// ne recevait donc jamais l'explication utile. Une seule source ici.
+    pub fn ensure_raw_dsd(&self) -> Result<(), String> {
+        if self.is_dst() {
+            // Message distinct du cas « compression inconnue » : ici le fichier
+            // est parfaitement lisible et sa durée est connue, seul le décodage
+            // manque. Le mot « decode » n'est pas décoratif : `playback.rs` s'en
+            // sert pour rendre un 502 (contenu illisible) au lieu d'un 500
+            // (panne de Tune).
+            return Err(format!(
+                "DFF: cannot decode DST compressed audio ({} frames at {} fps) — \
+                 convert to uncompressed DSD in the meantime",
+                self.dst_frames.unwrap_or(0),
+                self.dst_frame_rate.unwrap_or(0)
+            ));
+        }
+        if self.compression != "DSD " {
+            return Err(format!(
+                "DFF: cannot decode compression '{}' (only uncompressed DSD supported)",
+                self.compression
+            ));
+        }
+        Ok(())
+    }
+
     /// Track duration in milliseconds from the DSDIFF header. DSD is 1 bit per
     /// sample, so samples-per-channel = data_size*8/channels, and
     /// duration = samples-per-channel / sample_rate. `None` if the header can't
@@ -231,6 +262,18 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
                 // que la taille compressée ne permet pas de déduire. Les trames
                 // DSTF restent où elles sont, `data_offset` pointant sur le
                 // début de l'enveloppe pour qui saura les décoder un jour.
+                //
+                // L'ID du chunk sonore fait FOI sur la nature des octets ; CMPR
+                // n'en est qu'une DÉCLARATION, et elle peut manquer ou mentir.
+                // Sans cette ligne, un DSDIFF dont le CMPR est absent retombait
+                // sur le défaut `"DSD "` (plus bas), `is_dst()` répondait faux,
+                // le garde de `DffStreamReader::open` laissait passer, et
+                // `data_offset` — qui pointe ici sur l'ENVELOPPE — envoyait des
+                // en-têtes ASCII et des trames à codage arithmétique dans
+                // `DsdToPcmStreamer`/`DsdToDoP` : du bruit blanc pleine échelle
+                // vers l'ampli. En cas de désaccord entre le chunk et CMPR, on
+                // tranche donc toujours du côté qui REFUSE de lire.
+                compression = Some("DST ".to_string());
                 let dst_end = pos + 12 + chunk_size;
                 while file
                     .stream_position()
@@ -300,22 +343,7 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
 /// byte layout is already ch0_byte0, ch1_byte0, ch0_byte1, ch1_byte1, ...
 /// so no de-interleaving is needed — just read the raw bytes.
 pub fn read_dff_data(path: &str, info: &DffInfo) -> Result<Vec<u8>, String> {
-    if info.is_dst() {
-        // Message distinct du cas « compression inconnue » : ici le fichier est
-        // parfaitement lisible et sa durée est connue, seul le décodage manque.
-        return Err(format!(
-            "DFF: DST compressed audio not supported yet ({} frames at {} fps) — \
-             convert to uncompressed DSD in the meantime",
-            info.dst_frames.unwrap_or(0),
-            info.dst_frame_rate.unwrap_or(0)
-        ));
-    }
-    if info.compression != "DSD " {
-        return Err(format!(
-            "DFF: unsupported compression '{}' (only uncompressed DSD supported)",
-            info.compression
-        ));
-    }
+    info.ensure_raw_dsd()?;
 
     let mut file = File::open(path).map_err(|e| format!("dff open: {e}"))?;
     file.seek(SeekFrom::Start(info.data_offset))
@@ -349,12 +377,10 @@ impl DffStreamReader {
     /// `read_chunk_size`: how many bytes to read per `next_chunk()` call.
     /// Must be a multiple of `channels` to maintain byte alignment.
     pub fn open(path: &str, info: &DffInfo, read_chunk_size: usize) -> Result<Self, String> {
-        if info.compression != "DSD " {
-            return Err(format!(
-                "DFF: unsupported compression '{}' (only uncompressed DSD supported)",
-                info.compression
-            ));
-        }
+        // Seul point de passage vers `DsdToPcmStreamer` et `DsdToDoP` pour un
+        // DFF (decode.rs:1971, 2103, 2252) : c'est ici que le refus doit être
+        // à la fois SÛR et EXPLICABLE.
+        info.ensure_raw_dsd()?;
 
         let mut file = File::open(path).map_err(|e| format!("dff open: {e}"))?;
         file.seek(SeekFrom::Start(info.data_offset))
@@ -545,7 +571,10 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
                 break;
             }
             b"DST " => {
-                // Même lecture que dans `parse_dff` : seul FRTE est requis ici.
+                // Même lecture que dans `parse_dff` : seul FRTE est requis ici,
+                // et l'ID du chunk prime sur CMPR pour la même raison de
+                // sécurité (cf. le commentaire de `parse_dff`).
+                compression = Some("DST ".to_string());
                 let dst_end = pos + 12 + chunk_size;
                 while cursor
                     .stream_position()
@@ -612,6 +641,19 @@ mod tests {
     /// Fichier DSDIFF compressé DST : même en-tête, mais CMPR = "DST " et un
     /// chunk "DST " contenant FRTE puis des trames DSTF.
     fn build_dff_dst(channels: u16, sample_rate: u32, frames: u32, frame_rate: u16) -> Vec<u8> {
+        build_dff_dst_opt_cmpr(channels, sample_rate, frames, frame_rate, true)
+    }
+
+    /// Même fichier, mais le sous-chunk CMPR peut être OMIS. Les octets audio
+    /// restent exactement les mêmes — seule la DÉCLARATION disparaît. C'est le
+    /// cas qui décide si Tune se fie au chunk sonore ou à une étiquette.
+    fn build_dff_dst_opt_cmpr(
+        channels: u16,
+        sample_rate: u32,
+        frames: u32,
+        frame_rate: u16,
+        with_cmpr: bool,
+    ) -> Vec<u8> {
         let mut prop = Vec::new();
         prop.extend_from_slice(b"SND ");
         prop.extend_from_slice(b"FS  ");
@@ -620,9 +662,11 @@ mod tests {
         prop.extend_from_slice(b"CHNL");
         prop.extend_from_slice(&2u64.to_be_bytes());
         prop.extend_from_slice(&channels.to_be_bytes());
-        prop.extend_from_slice(b"CMPR");
-        prop.extend_from_slice(&4u64.to_be_bytes());
-        prop.extend_from_slice(b"DST ");
+        if with_cmpr {
+            prop.extend_from_slice(b"CMPR");
+            prop.extend_from_slice(&4u64.to_be_bytes());
+            prop.extend_from_slice(b"DST ");
+        }
 
         // Contenu du chunk DST : FRTE, puis deux trames factices. Leur contenu
         // n'a pas à être décodable : on vérifie l'enveloppe, pas le codec.
@@ -650,6 +694,115 @@ mod tests {
         buf.extend_from_slice(&(dst.len() as u64).to_be_bytes());
         buf.extend_from_slice(&dst);
         buf
+    }
+
+    /// Écrit un buffer dans un vrai fichier temporaire : `DffStreamReader::open`
+    /// et `read_dff_data` prennent un CHEMIN, pas un buffer, et ce sont eux le
+    /// chemin réellement emprunté à la lecture. `tempfile` donne un nom unique
+    /// par exécution et le supprime — deux agents ne peuvent pas se marcher
+    /// dessus, contrairement à un chemin fixe sous /tmp.
+    fn write_tmp_dff(bytes: &[u8]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut tmp = tempfile::Builder::new()
+            .prefix("i1387-dff-")
+            .suffix(".dff")
+            .tempfile()
+            .unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp.flush().unwrap();
+        tmp
+    }
+
+    /// ⚠️ LE CAS QUI ENVOYAIT DU BRUIT À L'AMPLI.
+    ///
+    /// Un DSDIFF dont les données vivent dans un chunk `DST ` mais dont le
+    /// sous-chunk CMPR est absent. Avant le correctif, `compression` retombait
+    /// sur le défaut `"DSD "`, `is_dst()` répondait faux, le garde laissait
+    /// passer, et `data_offset` — qui pointe sur l'ENVELOPPE DST — envoyait
+    /// « FRTE », « DSTF » et des trames à codage arithmétique dans le
+    /// convertisseur DSD→PCM/DoP. Contre-épreuve : retirer la ligne
+    /// `compression = Some("DST ")` de la branche `b"DST "` rend ce test ROUGE.
+    #[test]
+    fn dst_without_cmpr_is_still_recognised_and_refused() {
+        let bytes = build_dff_dst_opt_cmpr(2, 2_822_400, 4500, 75, false);
+        let info = parse_dff_from_bytes(&bytes).unwrap();
+
+        assert!(
+            info.is_dst(),
+            "le chunk sonore est 'DST ' : l'absence de CMPR ne doit pas le faire passer pour du DSD brut"
+        );
+        assert!(
+            info.ensure_raw_dsd().is_err(),
+            "des trames DST ne doivent jamais atteindre le convertisseur"
+        );
+
+        // Et le refus doit tenir sur le chemin RÉEL, pas seulement en mémoire.
+        let tmp = write_tmp_dff(&bytes);
+        let path = tmp.path().to_str().unwrap();
+        let info = parse_dff(path).unwrap();
+        assert!(info.is_dst());
+        assert!(DffStreamReader::open(path, &info, 4096).is_err());
+    }
+
+    /// Le refus doit ÊTRE COMPRÉHENSIBLE. Il remonte tel quel à l'utilisateur
+    /// via `zone.playback_error` (« Impossible de décoder la piste : … »).
+    /// Contre-épreuve : sans l'appel à `ensure_raw_dsd` dans
+    /// `DffStreamReader::open`, le message redevient « unsupported compression
+    /// 'DST ' » — sans le mot DST en clair, sans la durée, sans remède — et ce
+    /// test passe au ROUGE.
+    #[test]
+    fn dst_refusal_names_the_format_and_the_remedy() {
+        let bytes = build_dff_dst(2, 2_822_400, 4500, 75);
+        let tmp = write_tmp_dff(&bytes);
+        let path = tmp.path().to_str().unwrap();
+        let info = parse_dff(path).unwrap();
+
+        // `.err().unwrap()` et non `unwrap_err()` : `DffStreamReader` n'est pas
+        // `Debug`, et le rendre `Debug` pour un test serait la queue qui remue
+        // le chien.
+        let err = DffStreamReader::open(path, &info, 4096)
+            .err()
+            .expect("un DFF/DST doit être refusé");
+        assert!(err.contains("DST"), "le format doit être nommé : {err}");
+        assert!(
+            err.contains("4500") && err.contains("75"),
+            "le fichier est lisible et sa durée connue, il faut le dire : {err}"
+        );
+        assert!(
+            err.contains("convert"),
+            "un refus sans remède n'aide personne : {err}"
+        );
+        // `playback.rs` rend un 502 (contenu illisible) au lieu d'un 500
+        // (panne de Tune) sur les erreurs contenant « decode ».
+        assert!(
+            err.contains("decode"),
+            "doit être classé 502, pas 500 : {err}"
+        );
+    }
+
+    /// GARDE ANTI-RÉGRESSION — doit rester VERT avant comme après.
+    /// Un refus trop large qui bloquerait les DSD non compressés serait pire
+    /// que le défaut d'origine : c'est ce que Marco Polo écoute aujourd'hui.
+    #[test]
+    fn uncompressed_dsd_still_opens_and_reads() {
+        let dsd = vec![0x69u8; 4096];
+        let bytes = build_dff_header(2, 2_822_400, &dsd);
+        let tmp = write_tmp_dff(&bytes);
+        let path = tmp.path().to_str().unwrap();
+
+        let info = parse_dff(path).unwrap();
+        assert!(!info.is_dst());
+        assert!(info.ensure_raw_dsd().is_ok());
+
+        let mut reader = DffStreamReader::open(path, &info, 1024)
+            .expect("un DFF non compressé doit continuer à s'ouvrir");
+        let mut total = Vec::new();
+        while let Some(chunk) = reader.next_chunk().unwrap() {
+            total.extend_from_slice(&chunk);
+        }
+        assert_eq!(total, dsd, "les octets DSD doivent sortir intacts");
+
+        assert_eq!(read_dff_data(path, &info).unwrap(), dsd);
     }
 
     #[test]

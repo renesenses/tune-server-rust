@@ -197,7 +197,7 @@ Measured on production server (.18): Intel 8-core, 16 GB RAM, 44,623 audio files
 cargo build --release --package tune-server
 
 # Run
-TUNE_PORT=8085 TUNE_MUSIC_DIRS='["/path/to/music"]' TUNE_AUTO_SCAN=true \
+TUNE_PORT=8888 TUNE_MUSIC_DIRS='["/path/to/music"]' TUNE_AUTO_SCAN=true \
   ./target/release/tune-server
 
 # Run tests
@@ -210,12 +210,13 @@ Configuration via `tune.toml` or environment variables (env vars take precedence
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `TUNE_PORT` | 8085 | HTTP port |
+| `TUNE_PORT` | 8888 | HTTP port |
 | `TUNE_DB_PATH` | tune.db | SQLite database path |
 | `TUNE_WEB_DIR` | web | Web client directory |
 | `TUNE_ARTWORK_DIR` | artwork_cache | Artwork cache directory |
 | `TUNE_MUSIC_DIRS` | [] | JSON array or comma-separated paths |
 | `TUNE_AUTO_SCAN` | false | Scan music dirs on startup |
+| `TUNE_AUTO_UPDATE` | false | Check for new releases every 6 h and record the notice (never installs) |
 | `TUNE_LOG_LEVEL` | info | Log level (trace/debug/info/warn/error) |
 | `QOBUZ_APP_ID` | | Qobuz API app ID |
 | `QOBUZ_APP_SECRET` | | Qobuz API app secret |
@@ -292,7 +293,7 @@ services:
       - tune-data:/data
       - /path/to/music:/music:ro
     environment:
-      - TUNE_PORT=8085
+      - TUNE_PORT=8888
       - TUNE_DB_PATH=/data/tune.db
       - TUNE_ARTWORK_DIR=/data/artwork_cache
       - TUNE_AUTO_SCAN=true

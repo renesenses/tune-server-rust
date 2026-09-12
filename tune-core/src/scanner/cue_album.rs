@@ -181,9 +181,45 @@ fn index_du_dossier(dossier: &Path) -> HashMap<String, PathBuf> {
 }
 
 /// Résout une référence `FILE` dans le dossier de la feuille.
+///
+/// Le nom exact (à la casse près) prime toujours. À défaut, on tente la RACINE
+/// du nom : c'est le cas de terrain le plus fréquent derrière
+/// `cue-image-introuvable` — la feuille est écrite pendant le rip, quand
+/// l'image est encore un `.wav`, puis le WAV est converti (FLAC, APE,
+/// WavPack…) et supprimé sans que personne ne réécrive le `.cue`. La feuille
+/// désigne alors `Album.wav` à côté d'un `Album.flac` qui est exactement ce
+/// qu'elle découpe. Les temps d'une feuille sont des frames CD comptées depuis
+/// le début de l'image : une conversion qui garde les mêmes échantillons garde
+/// les mêmes temps.
+///
+/// Le repli ne DEVINE pas, et c'est ce qui le rend sûr :
+/// - il n'accepte qu'un candidat que le décodeur livré sait lire — sinon on
+///   remplacerait « introuvable » par un album injouable ;
+/// - il exige un candidat **unique**. Deux fichiers décodables de même racine
+///   (`Album.flac` et `Album.m4a`) laissent la feuille écartée avec son motif :
+///   on ne sait pas lequel elle découpe, et se tromper d'image produirait un
+///   album entier de pistes fausses.
 fn resoudre_image(index: &HashMap<String, PathBuf>, reference: &str) -> Option<PathBuf> {
     let nom = nom_nu(reference)?;
-    index.get(&nom.to_lowercase()).cloned()
+    let nom = nom.to_lowercase();
+    if let Some(exact) = index.get(&nom) {
+        return Some(exact.clone());
+    }
+    let racine = Path::new(&nom).file_stem()?.to_str()?;
+    if racine.is_empty() {
+        return None;
+    }
+    let mut candidats = index.iter().filter_map(|(cle, chemin)| {
+        let meme_racine = Path::new(cle.as_str())
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s == racine);
+        (meme_racine && crate::audio::support::native_decoder_supports(chemin)).then_some(chemin)
+    });
+    let premier = candidats.next()?;
+    // Ambigu : on préfère un album absent, que le rapport explique, à un album
+    // découpé sur le mauvais fichier.
+    candidats.next().is_none().then(|| premier.clone())
 }
 
 /// Clé de regroupement d'un album : le titre, réduit à ce qui se compare.
@@ -392,6 +428,124 @@ fn album_depuis(mut groupe: Vec<FeuilleResolue>) -> AlbumCue {
         annee,
         pistes,
     }
+}
+
+/// Combien de dossiers porteurs de feuilles l'inventaire visite au plus.
+///
+/// L'inventaire relit chaque `.cue` : sur un partage réseau c'est une lecture
+/// par feuille, et une bibliothèque pathologique (un `.cue` dans chacun des
+/// 100 000 dossiers d'un disque de sauvegarde) transformerait le rapport de
+/// scan en second parcours complet. Le plafond borne ce coût ; ce qui a été
+/// laissé de côté est COMPTÉ ([`InventaireCue::dossiers_non_inventories`]),
+/// jamais tu — un inventaire tronqué en silence se lit comme un inventaire
+/// faux, et c'est exactement le reproche déjà fait au rapport de scan (#2050).
+///
+/// Calibré au-dessus du plus gros cas connu : Gros Bidon (Didier, fil 1495)
+/// annonce 2 600 albums CUE, soit ~2 600 dossiers.
+pub const PLAFOND_DOSSIERS_INVENTORIES: usize = 20_000;
+
+/// Ce que les feuilles CUE d'une bibliothèque décrivent réellement.
+///
+/// Le rapport de scan sait aujourd'hui dire « 2 600 fichiers `.cue` ignorés »
+/// et rien de plus. Ce décompte ne distingue pas la feuille qui décrit un
+/// album parfaitement découpable de celle qui a perdu son FLAC — or c'est
+/// précisément la distinction dont dépend la suite du chantier, et celle que
+/// le ticket #1763 liste comme NON établie : « la part de `.cue` orphelins
+/// dans sa bibliothèque » et « la proportion de dossiers multi-CUE ».
+///
+/// Ces chiffres se mesurent sur la bibliothèque du testeur, pendant un scan
+/// ordinaire, sans rien lui demander d'exporter.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InventaireCue {
+    /// Dossiers réellement inventoriés.
+    pub dossiers: usize,
+    /// Dossiers laissés de côté par [`PLAFOND_DOSSIERS_INVENTORIES`].
+    pub dossiers_non_inventories: usize,
+    /// Albums décrits par les feuilles retenues.
+    pub albums: usize,
+    /// Ceux d'entre eux qui naissent de PLUSIEURS feuilles (le cas du vinyle
+    /// numérisé face par face). C'est la mesure que le ticket réclame pour
+    /// décider si livrer le mono-feuille seul serait un progrès ou une
+    /// régression — un album coupé en deux demi-albums est pire qu'absent.
+    pub albums_multi_feuilles: usize,
+    /// Feuilles qui ont contribué à un album.
+    pub feuilles_retenues: usize,
+    /// Pistes virtuelles que ces albums contiennent.
+    pub pistes: usize,
+    /// Feuilles écartées, toutes raisons confondues.
+    pub feuilles_ecartees: usize,
+    /// Le détail par clé stable de [`MotifEcart::cle`].
+    pub ecarts_par_cle: std::collections::BTreeMap<&'static str, usize>,
+    /// Échantillon nominatif « chemin (motif) » des feuilles écartées,
+    /// plafonné par [`super::walker::PLAFOND_CHEMINS_ECARTES`].
+    ///
+    /// Les compteurs disent COMBIEN, jamais LESQUELLES ; sans cette liste, un
+    /// testeur qui voit « 14 feuilles écartées » ne peut pas aller vérifier
+    /// une seule d'entre elles.
+    pub chemins_ecartes: Vec<String>,
+}
+
+/// Inventorie les dossiers qui portent au moins une feuille CUE.
+///
+/// **Ne rend jamais d'erreur** et ne modifie rien : c'est une lecture, faite
+/// pour que le rapport de fin de scan dise ce que les feuilles décrivent au
+/// lieu de les compter comme des fichiers ignorés de plus.
+///
+/// `dossiers` vient du parcours de bibliothèque, qui a déjà vu passer chaque
+/// `.cue` — on ne re-parcourt donc pas l'arborescence, on ne relit que les
+/// dossiers concernés.
+pub fn inventorier(dossiers: &[PathBuf]) -> InventaireCue {
+    inventorier_avec(dossiers, |_, _| {})
+}
+
+/// Le même inventaire, en donnant chaque plan à un visiteur.
+///
+/// C'est par là que le scan ÉCRIT (voir [`super::cue_bibliotheque`]). La
+/// lecture d'un `.cue` est une entrée-sortie par feuille, parfois sur un
+/// partage réseau : inventorier d'abord puis re-planifier pour écrire
+/// doublerait ce coût sur toute la bibliothèque. Le visiteur voit exactement
+/// ce que l'inventaire compte — impossible que le rapport et la base divergent.
+pub fn inventorier_avec(
+    dossiers: &[PathBuf],
+    mut visiteur: impl FnMut(&Path, &PlanCue),
+) -> InventaireCue {
+    let mut inv = InventaireCue::default();
+
+    let retenus = dossiers.len().min(PLAFOND_DOSSIERS_INVENTORIES);
+    inv.dossiers_non_inventories = dossiers.len() - retenus;
+
+    for dossier in &dossiers[..retenus] {
+        let plan = planifier_dossier(dossier);
+        if plan.est_vide() {
+            // Le dossier portait un `.cue` au moment du parcours et n'en porte
+            // plus : disparu entre-temps, ou devenu illisible. Il ne compte pas
+            // comme inventorié — le rapport dirait sinon avoir regardé un
+            // dossier dont il n'a rien lu.
+            continue;
+        }
+        inv.dossiers += 1;
+        visiteur(dossier, &plan);
+
+        for album in &plan.albums {
+            inv.albums += 1;
+            inv.feuilles_retenues += album.feuilles.len();
+            inv.pistes += album.pistes.len();
+            if album.feuilles.len() > 1 {
+                inv.albums_multi_feuilles += 1;
+            }
+        }
+
+        for (chemin, motif) in &plan.ecartees {
+            inv.feuilles_ecartees += 1;
+            *inv.ecarts_par_cle.entry(motif.cle()).or_insert(0) += 1;
+            super::walker::pousser_chemin_ecarte(
+                &mut inv.chemins_ecartes,
+                format!("{} ({})", chemin.display(), motif.motif()),
+            );
+        }
+    }
+
+    inv
 }
 
 #[cfg(test)]
@@ -631,6 +785,136 @@ mod tests {
         assert!(planifier_dossier(&d.path().join("nexiste-pas")).est_vide());
     }
 
+    /// L'inventaire répond aux deux questions que le ticket #1763 dit non
+    /// établies : quelle part des feuilles est orpheline, et quelle part des
+    /// albums est en multi-CUE.
+    ///
+    /// Le dossier de test porte les trois cas côte à côte, parce que c'est
+    /// ainsi qu'ils se présentent chez Gros Bidon : un rip EAC ordinaire, un
+    /// vinyle numérisé face par face, et une feuille dont le FLAC a été perdu.
+    #[test]
+    fn l_inventaire_chiffre_les_albums_le_multi_cue_et_les_orphelines() {
+        let d = tempfile::TempDir::new().unwrap();
+
+        // 1. Un rip ordinaire : une feuille, une image, deux pistes.
+        let simple = d.path().join("Gould - Goldberg");
+        fs::create_dir_all(&simple).unwrap();
+        ecrire_wav(&simple.join("image.wav"), 200);
+        fs::write(simple.join("album.cue"), FEUILLE).unwrap();
+
+        // 2. Un vinyle numérisé face par face : DEUX feuilles, UN album.
+        let vinyle = d.path().join("Camel - Stationary Traveller");
+        fs::create_dir_all(&vinyle).unwrap();
+        ecrire_wav(&vinyle.join("Side A.wav"), 50);
+        ecrire_wav(&vinyle.join("Side B.wav"), 50);
+        fs::write(
+            vinyle.join("A.cue"),
+            "TITLE \"Stationary Traveller\"\nFILE \"Side A.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 00:04:00\n",
+        )
+        .unwrap();
+        fs::write(
+            vinyle.join("B.cue"),
+            "TITLE \"Stationary Traveller\"\nFILE \"Side B.wav\" WAVE\nTRACK 06 AUDIO\nINDEX 01 00:00:00\nTRACK 07 AUDIO\nINDEX 01 00:03:00\n",
+        )
+        .unwrap();
+
+        // 3. Une feuille dont l'image a disparu.
+        let orphelin = d.path().join("Perdu");
+        fs::create_dir_all(&orphelin).unwrap();
+        fs::write(orphelin.join("album.cue"), FEUILLE).unwrap();
+
+        let inv = inventorier(&[simple.clone(), vinyle.clone(), orphelin.clone()]);
+
+        assert_eq!(inv.dossiers, 3);
+        assert_eq!(inv.dossiers_non_inventories, 0);
+        assert_eq!(inv.albums, 2, "le vinyle est UN album, pas deux");
+        assert_eq!(inv.albums_multi_feuilles, 1);
+        assert_eq!(inv.feuilles_retenues, 3);
+        assert_eq!(inv.pistes, 6, "2 pour le rip, 4 pour le vinyle");
+        assert_eq!(inv.feuilles_ecartees, 1);
+        assert_eq!(
+            inv.ecarts_par_cle,
+            std::collections::BTreeMap::from([("cue-image-introuvable", 1)])
+        );
+        // LAQUELLE, pas seulement combien : sans le chemin, le testeur qui lit
+        // « 1 feuille écartée » ne peut aller vérifier aucune des 2 600.
+        assert_eq!(inv.chemins_ecartes.len(), 1);
+        assert!(
+            inv.chemins_ecartes[0].contains("Perdu")
+                && inv.chemins_ecartes[0].contains("rien à découper"),
+            "obtenu : {:?}",
+            inv.chemins_ecartes
+        );
+    }
+
+    /// Le cas de Rhorn — `.cue` posé sur un `.mpc` — est compté à part.
+    ///
+    /// Il ne se confond pas avec l'orpheline : le fichier EST là, c'est le
+    /// décodeur qui manque. Deux motifs distincts, deux réponses distinctes à
+    /// donner au testeur.
+    #[test]
+    fn l_inventaire_distingue_l_image_non_decodable_de_l_image_absente() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = d.path().join("Rhorn");
+        fs::create_dir_all(&dossier).unwrap();
+        fs::write(dossier.join("image.mpc"), b"fixture").unwrap();
+        fs::write(
+            dossier.join("album.cue"),
+            "TITLE \"Album\"\nFILE \"image.mpc\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+        )
+        .unwrap();
+
+        let inv = inventorier(&[dossier]);
+
+        assert_eq!(
+            inv.albums, 0,
+            "aucun album fantôme sur un format non décodé"
+        );
+        assert_eq!(
+            inv.ecarts_par_cle,
+            std::collections::BTreeMap::from([("cue-image-non-decodable", 1)])
+        );
+    }
+
+    /// Un dossier vidé entre le parcours et la relecture ne compte pas comme
+    /// inventorié : le rapport dirait sinon avoir regardé un dossier dont il
+    /// n'a rien lu.
+    #[test]
+    fn un_dossier_qui_a_perdu_ses_feuilles_ne_compte_pas() {
+        let d = tempfile::TempDir::new().unwrap();
+        let inv = inventorier(&[d.path().to_path_buf(), d.path().join("nexiste-pas")]);
+        assert_eq!(inv, InventaireCue::default());
+    }
+
+    /// Le plafond borne la RELECTURE, et il le dit.
+    ///
+    /// Une troncature silencieuse se lit comme un inventaire faux — c'est le
+    /// reproche déjà fait au rapport de scan (#2050). Le test compare au
+    /// plafond réel plutôt qu'à un nombre écrit à la main, sinon il passerait
+    /// encore après qu'on aurait changé la constante sans y toucher.
+    #[test]
+    fn au_dela_du_plafond_les_dossiers_non_lus_sont_comptes() {
+        let d = tempfile::TempDir::new().unwrap();
+        ecrire_wav(&d.path().join("image.wav"), 50);
+        fs::write(d.path().join("album.cue"), FEUILLE).unwrap();
+
+        // Un dossier réel en tête, puis du remplissage inexistant : le test
+        // mesure le plafond, il n'a pas à relire 20 000 fois la même feuille.
+        let mut dossiers = vec![d.path().to_path_buf()];
+        dossiers.extend(std::iter::repeat_n(
+            d.path().join("nexiste-pas"),
+            PLAFOND_DOSSIERS_INVENTORIES + 2,
+        ));
+        let inv = inventorier(&dossiers);
+
+        assert_eq!(
+            inv.dossiers_non_inventories, 3,
+            "les dossiers laissés de côté sont COMPTÉS, pas tus"
+        );
+        assert_eq!(inv.dossiers, 1, "le dossier réel a bien été lu");
+        assert_eq!(inv.albums, 1);
+    }
+
     #[test]
     fn nom_nu_coupe_les_deux_separateurs() {
         assert_eq!(nom_nu("album.flac"), Some("album.flac"));
@@ -639,5 +923,95 @@ mod tests {
         assert_eq!(nom_nu("sous/dossier/album.flac"), Some("album.flac"));
         assert_eq!(nom_nu(".."), None);
         assert_eq!(nom_nu("   "), None);
+    }
+
+    /// Le cas de terrain le plus fréquent derrière `cue-image-introuvable` :
+    /// la feuille a été écrite PENDANT le rip, quand l'image était encore un
+    /// WAV ; le WAV a ensuite été converti (FLAC, APE, WavPack…) et supprimé,
+    /// sans que personne ne réécrive le `.cue`. La feuille désigne alors un
+    /// fichier qui n'existe plus, à côté du seul fichier qui la complète.
+    ///
+    /// Avant le repli par racine de nom, ce dossier ne produisait AUCUN album
+    /// et le rapport le comptait en « image introuvable ».
+    #[test]
+    fn resout_l_image_convertie_dans_un_autre_format() {
+        let d = tempfile::TempDir::new().unwrap();
+        let flac = d.path().join("image.flac");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac"),
+            &flac,
+        )
+        .unwrap();
+        // La feuille désigne « image.wav », qui n'existe plus.
+        fs::write(d.path().join("album.cue"), FEUILLE).unwrap();
+        let plan = planifier_dossier(d.path());
+        assert!(plan.ecartees.is_empty(), "{:?}", plan.ecartees);
+        assert_eq!(plan.albums.len(), 1, "la feuille doit décrire son album");
+        assert_eq!(plan.albums[0].pistes.len(), 2);
+        assert_eq!(
+            plan.albums[0].pistes[0].media, flac,
+            "les pistes doivent pointer le fichier réellement présent"
+        );
+    }
+
+    /// CONTRE-POIDS — le repli ne DEVINE pas. Deux fichiers décodables
+    /// partagent la racine du nom : on ne sait pas lequel la feuille découpe,
+    /// et elle reste écartée avec le motif qu'elle avait.
+    #[test]
+    fn le_repli_par_racine_refuse_de_choisir_entre_deux_candidats() {
+        let d = tempfile::TempDir::new().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        fs::copy(fixtures.join("test.flac"), d.path().join("image.flac")).unwrap();
+        fs::copy(fixtures.join("test.m4a"), d.path().join("image.m4a")).unwrap();
+        fs::write(d.path().join("album.cue"), FEUILLE).unwrap();
+        let plan = planifier_dossier(d.path());
+        assert!(plan.albums.is_empty(), "un album a été deviné");
+        assert_eq!(
+            plan.ecartees[0].1,
+            MotifEcart::ImageIntrouvable {
+                fichier: "image.wav".into()
+            }
+        );
+    }
+
+    /// CONTRE-POIDS — un fichier qui porte la racine du nom mais qu'aucun
+    /// décodeur livré ne lit n'est pas un candidat : sinon on remplacerait
+    /// « introuvable » par un album injouable.
+    #[test]
+    fn le_repli_par_racine_ignore_ce_que_le_decodeur_ne_lit_pas() {
+        let d = tempfile::TempDir::new().unwrap();
+        fs::write(d.path().join("image.mpc"), b"pas un decodeur connu").unwrap();
+        fs::write(d.path().join("album.cue"), FEUILLE).unwrap(); // FILE "image.wav"
+        let plan = planifier_dossier(d.path());
+        assert!(plan.albums.is_empty());
+        assert_eq!(
+            plan.ecartees[0].1,
+            MotifEcart::ImageIntrouvable {
+                fichier: "image.wav".into()
+            },
+            "le motif reste celui de la référence, pas celui du voisin"
+        );
+    }
+
+    /// CONTRE-POIDS — le nom exact prime toujours sur le repli. Un dossier qui
+    /// garde le WAV ET son FLAC continue d'être découpé sur le fichier que la
+    /// feuille NOMME.
+    #[test]
+    fn le_nom_exact_prime_sur_le_repli_par_racine() {
+        let d = tempfile::TempDir::new().unwrap();
+        ecrire_wav(&d.path().join("image.wav"), 200);
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac"),
+            d.path().join("image.flac"),
+        )
+        .unwrap();
+        fs::write(d.path().join("album.cue"), FEUILLE).unwrap();
+        let plan = planifier_dossier(d.path());
+        assert!(plan.ecartees.is_empty(), "{:?}", plan.ecartees);
+        assert_eq!(
+            plan.albums[0].pistes[0].media,
+            d.path().join("image.wav"),
+            "le fichier nommé par la feuille doit rester celui qu'on découpe"
+        );
     }
 }

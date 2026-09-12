@@ -31,7 +31,12 @@ use crate::state::AppState;
 /// authentifié (pas seulement admin).
 /// Interdit : toute clé contenant un secret (api_key, jwt_secret,
 /// license_key, discogs_token, auth_tokens_*, mots de passe…).
-const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
+///
+/// `pub(super)` depuis #2856 : le RAPPORT DE BOGUE ne portait aucune section
+/// de réglages, et c'est cette même liste qu'il doit rendre. Deux listes
+/// auraient divergé, et la seconde n'aurait pas hérité de la garde de
+/// `est_secret` posée ci-dessous.
+pub(super) const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
     ("community_sync_enabled", || json!(false)),
     // Consentement de contribution (bios + images d'artistes). Non sensible,
     // et utile en support : « est-ce que cette instance envoie quelque chose ? »
@@ -43,13 +48,31 @@ const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
     ("resample_policy", || json!("none")),
     ("prefetch_mode", || json!("30s")),
     ("dsd_lpcm_stream", || json!(false)),
+    ("dsp_progressif_reseau", || json!(false)),
     ("auth_enabled", || json!(false)),
+    // #3577 — le panneau Paroles s'ouvre vide, et ce booléen dit LEQUEL des
+    // deux verrous s'est refermé.
+    //
+    // `routes/library/tracks.rs` n'interroge LRCLIB que si cette clé vaut la
+    // chaîne `"true"` ; sinon il rend `404 {"error":"no_lyrics"}` — le MÊME
+    // 404 que pour un titre réellement sans paroles. Absente de la fiche, sa
+    // valeur ne pouvait donc plus se déduire de rien : le `diagnostic.md` du
+    // ticket support 93 (Belkadi Yacine, 49 618 fichiers, 0.9.140) ne la
+    // portait pas, et l'issue a dû clore sur « valeur NON ÉTABLIE ».
+    //
+    // Le client web la lit déjà dans `GET /system/config` pour nommer le
+    // réglage dans l'état vide (tune-web-client#775) ; la fiche support doit
+    // pouvoir en dire autant, sans quoi le premier niveau de support ne peut
+    // pas trancher entre « rien à trouver » et « recherche en ligne éteinte ».
+    //
+    // Non sensible : un booléen de consentement, comme les huit au-dessus.
+    ("lyrics_lrclib_enabled", || json!(false)),
 ];
 
 /// Projette les settings bruts sur l'allowlist support. Les valeurs stockées
 /// en texte ("true", "1.5", "none") sont re-typées quand c'est du JSON valide,
 /// sinon renvoyées telles quelles en chaîne.
-fn support_settings(get: impl Fn(&str) -> Option<String>) -> Map<String, Value> {
+pub(super) fn support_settings(get: impl Fn(&str) -> Option<String>) -> Map<String, Value> {
     let mut out = Map::new();
     for (key, default) in SUPPORT_SETTING_KEYS {
         let value = match get(key) {
@@ -61,21 +84,54 @@ fn support_settings(get: impl Fn(&str) -> Option<String>) -> Map<String, Value> 
     out
 }
 
+/// Le nom du backend audio réellement ACTIF.
+pub(super) fn backend_audio_actif(state: &AppState) -> &'static str {
+    #[cfg(feature = "local-audio")]
+    {
+        tune_core::outputs::local::active_backend_name(&state.display_audio_backend())
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        let _ = &state.config.local_audio_backend;
+        "none"
+    }
+}
+
+/// Le MOTEUR AUDIO tel qu'un ticket doit pouvoir le lire (#2856).
+///
+/// Trois faits, jamais un seul : ce qui a été DEMANDÉ, ce qui TOURNE, et ce
+/// que le mode exclusif vaut réellement — avec la raison quand les deux
+/// diffèrent. C'est exactement l'écart que #3192 a mesuré chez jfpaquet :
+/// sous ASIO, décocher « mode exclusif » reste sans effet (un pilote ASIO
+/// ouvert en partagé n'existe pas), le son de toutes les autres applications
+/// disparaît, et rien ne le dit. Un ticket qui ne porte que le backend actif
+/// oblige à réécrire au testeur pour apprendre ces trois valeurs.
+///
+/// Aucun secret ici : trois booléens, deux noms de backend et une phrase
+/// figée du binaire.
+pub(super) fn moteur_audio(state: &AppState) -> Value {
+    let exclusif = state.exclusive_mode_status();
+    json!({
+        "backend_requested": state.effective_audio_backend(),
+        "backend_active": backend_audio_actif(state),
+        "exclusive_mode": {
+            "requested": exclusif.requested,
+            "effective": exclusif.effective,
+            "forced": exclusif.forced,
+            "detail": exclusif.detail,
+        },
+    })
+}
+
 pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // --- server -----------------------------------------------------------
-    let audio_backend = {
-        #[cfg(feature = "local-audio")]
-        {
-            tune_core::outputs::local::active_backend_name(&state.display_audio_backend())
-        }
-        #[cfg(not(feature = "local-audio"))]
-        {
-            let _ = &state.config.local_audio_backend;
-            "none"
-        }
-    };
+    let audio_backend = backend_audio_actif(&state);
+    // #2856 : la fiche ne portait que le backend ACTIF. Elle porte désormais
+    // aussi le DEMANDÉ et l'état du mode exclusif, les deux faits qu'il
+    // fallait redemander au testeur à chaque ticket audio.
+    let audio = moteur_audio(&state);
     let server = json!({
         "version": tune_core::version(),
         "os": std::env::consts::OS,
@@ -87,6 +143,7 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
         "process_started_at": state.process_started_at_rfc3339(),
         "database_engine": state.backend.engine().as_str(),
         "audio_backend": audio_backend,
+        "audio": audio,
     });
 
     // --- library ----------------------------------------------------------
@@ -155,9 +212,48 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
         .ok()
         .filter(|ip| !ip.is_empty())
         .or_else(|| tune_core::discovery::ssdp::get_local_ip().map(|ip| ip.to_string()));
+    // #2718 et tickets support 61, 87, 97, 98 — « plus de serveurs
+    // multimedia ». La fiche decrivait les zones jusqu'a la marque et au
+    // modele du DAC, et ne disait RIEN des serveurs multimedia : quatre
+    // signalements sur trois semaines ont ete instruits sans jamais pouvoir
+    // dire combien Tune en voyait. #2718 s'est refermee « mecanisme non
+    // etabli » alors que la reponse tenait dans un compteur absent.
+    //
+    // Les champs sont EXACTEMENT ceux que `GET /network/media-servers` sert
+    // deja a tout utilisateur authentifie : la fiche n'expose rien de neuf.
+    let serveurs_multimedia: Vec<Value> = {
+        let registre = state.media_servers.lock().await;
+        let mut v: Vec<Value> = registre
+            .values()
+            .map(|ms| {
+                json!({
+                    "name": ms.name,
+                    "host": ms.host,
+                    "port": ms.port,
+                    "reachable": ms.is_reachable(),
+                    "last_seen_secs": ms.age().as_secs(),
+                })
+            })
+            .collect();
+        // Ordre stable : un `HashMap` rendrait la fiche differente a chaque
+        // ouverture, et deux fiches du meme testeur cesseraient d'etre
+        // comparables ligne a ligne — c'est precisement ce qu'on fait avec
+        // elles quand un defaut dure trois semaines.
+        v.sort_by(|a, b| {
+            a["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(b["name"].as_str().unwrap_or_default())
+        });
+        v
+    };
     let network = json!({
         "advertise_ip": advertise_ip,
         "port": state.port,
+        // Le compte SEPAREMENT de la liste : une liste vide et une liste
+        // absente se lisent pareil dans un JSON qu'on parcourt a l'oeil.
+        "media_servers_count": serveurs_multimedia.len(),
+        "media_servers": serveurs_multimedia,
     });
 
     Json(json!({
@@ -190,8 +286,49 @@ mod tests {
         }
     }
 
+    /// La même exigence, mais énoncée par la classification du dépôt plutôt
+    /// que par une liste de fragments écrite à la main ici (#2856). C'est
+    /// `tune_core::secrets::est_secret` qui décide ailleurs ce qu'on caviarde ;
+    /// une clé qu'elle juge secrète n'a rien à faire dans une fiche jointe à un
+    /// ticket, ni dans le rapport de bogue qui lit la même liste.
+    #[test]
+    fn l_allowlist_ne_porte_aucune_cle_jugee_secrete_par_le_depot() {
+        for (key, _) in SUPPORT_SETTING_KEYS {
+            assert!(
+                !tune_core::secrets::est_secret(key),
+                "le réglage {key:?} est classé secret par tune_core::secrets \
+                 et ne doit pas partir dans un ticket support (#2856)"
+            );
+        }
+    }
+
     /// Seules les clés de l'allowlist sortent ; un store contenant des secrets
     /// n'en laisse fuiter aucun, et les valeurs texte sont re-typées.
+    /// #3577 — le panneau Paroles s'ouvre vide et la fiche support ne disait
+    /// pas LEQUEL des deux verrous s'est referme.
+    ///
+    /// `routes/library/tracks.rs` rend le MEME `404 {"error":"no_lyrics"}`
+    /// pour « ce titre n'a pas de paroles » et pour « la recherche en ligne
+    /// est eteinte ». Sans ce booleen dans la fiche, l'ecart n'etait pas
+    /// mesurable apres coup : le `diagnostic.md` du ticket support 93 ne le
+    /// portait pas, et l'issue a du clore sur « valeur NON ETABLIE ».
+    #[test]
+    fn la_fiche_publie_le_consentement_des_paroles_en_ligne() {
+        assert!(
+            SUPPORT_SETTING_KEYS
+                .iter()
+                .any(|(k, _)| *k == "lyrics_lrclib_enabled"),
+            "sans cette cle, un ticket « panneau Paroles vide » reste indecidable"
+        );
+        // Absent du store = eteint, exactement la regle du serveur :
+        // `settings.get(...).as_deref() == Some("true")`.
+        let out = support_settings(|_| None);
+        assert_eq!(out["lyrics_lrclib_enabled"], json!(false));
+        // Et la valeur persistee est rendue telle quelle, re-typee.
+        let out = support_settings(|k| (k == "lyrics_lrclib_enabled").then(|| "true".to_string()));
+        assert_eq!(out["lyrics_lrclib_enabled"], json!(true));
+    }
+
     #[test]
     fn support_settings_filters_and_retypes() {
         let store = |k: &str| -> Option<String> {

@@ -8,7 +8,9 @@ pub mod artist_releases;
 pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
+pub mod cloud_error;
 pub mod connect;
+pub(crate) mod convert_destination;
 pub mod converter;
 pub mod dac_calibration;
 pub mod dashboard;
@@ -20,6 +22,7 @@ pub mod digest;
 pub mod discogs;
 pub mod eq_pro;
 pub mod export;
+pub(crate) mod filtre_sources;
 pub mod graphql;
 pub mod history;
 pub mod home;
@@ -41,6 +44,9 @@ pub mod multi_server;
 pub mod network;
 pub mod offline;
 pub mod onboarding;
+// `panne_sql` a demenage dans `tune-http-types` : les caisses de routes
+// extraites (`tune-smart-http`…) l'empruntent aussi, et une caisse extraite ne
+// peut pas dependre de `tune-server` sans fabriquer un cycle.
 pub mod party;
 pub mod peers;
 pub mod playback;
@@ -57,15 +63,13 @@ pub mod roon_bridge;
 pub mod sacd_rip;
 pub mod scrobbler;
 pub mod search;
+pub mod sendspin;
 pub mod service_tokens;
 pub mod setlistfm;
 pub mod shazam;
 pub mod siri;
 pub mod skins;
-pub mod smart_ai;
-pub mod smart_collections;
-pub mod smart_playlists;
-pub mod smart_refs;
+pub use tune_smart_http::{smart_ai, smart_collections, smart_playlists, smart_refs};
 pub mod snapcast;
 pub mod social;
 pub mod sonos;
@@ -88,7 +92,6 @@ pub mod upnp;
 pub mod upnp_media_renderer;
 pub mod upnp_media_server;
 pub mod versions;
-pub mod visualizer;
 pub mod voice;
 pub mod widget;
 pub mod ws;
@@ -366,7 +369,6 @@ pub fn router_with_plugins(
         .nest("/room-calibration", room_calibration::router())
         .nest("/room-correction", room_correction::router())
         .nest("/outputs", airplay_pairing::router())
-        .nest("/visualizer", visualizer::router())
         .nest("/graphql", graphql::router())
         .nest("/eq", eq_pro::router())
         .nest("/siri", siri::router())
@@ -467,6 +469,15 @@ pub fn router_with_plugins(
             "/deezer-proxy/{filename}",
             get(deezer_proxy_handler::handle_deezer_proxy),
         )
+        // #3865 : `DeezerService::get_track_url` emet `{base}/deezer/{id}.{ext}`
+        // — DEUX segments — et `{filename}` n'en traverse qu'UN en axum 0.8.
+        // Ces URL tombaient donc dans le repli statique et les lecteurs
+        // recevaient `index.html` etiquete `audio/flac`. Les deux formes
+        // menent au meme gestionnaire : il ne lit que le dernier segment.
+        .route(
+            "/deezer-proxy/deezer/{filename}",
+            get(deezer_proxy_handler::handle_deezer_proxy),
+        )
         .with_state(state.services.clone());
 
     // Collect mountable skins before state is moved
@@ -475,6 +486,21 @@ pub fn router_with_plugins(
     let mut app = Router::new()
         .nest("/api/v1", api)
         .nest("/ws", ws::router())
+        // #3326 S2-a — point d'accès Sendspin. À la RACINE et non sous
+        // `/api/v1` : le TXT mDNS annonce `/sendspin`, et une enceinte ne
+        // connaît pas nos préfixes. Pas d'extracteur `WsAuthorized` non
+        // plus — c'est la couche Noise qui authentifie, pas axum.
+        //
+        // Le mode de transition est LU ICI, une fois, depuis le réglage du
+        // processus. Il n'est jamais forcé : écrire une valeur en dur à cette
+        // ligne ouvrirait un point d'accès en clair sans que personne ne l'ait
+        // demandé, et le témoin
+        // `le_point_d_acces_monte_lit_le_reglage_et_ne_force_pas_le_clair`
+        // garde cette ligne pour ça.
+        .nest(
+            "/sendspin",
+            sendspin::router(tune_core::sendspin::ModeTransition::en_vigueur()),
+        )
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
         .with_state(state.clone())
@@ -558,6 +584,53 @@ mod escape_tests {
     }
 }
 
+/// Pendant du temoin `la_forme_de_l_url_proxy_suit_les_routes_declarees` de
+/// `tune-core/src/streaming/deezer.rs` (#3865).
+#[cfg(test)]
+mod deezer_proxy_route_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// Les DEUX formes d'URL doivent atteindre le gestionnaire du proxy
+    /// Deezer au lieu de tomber dans le repli statique — le defaut d'origine
+    /// servait `index.html` a un lecteur qui attendait du FLAC.
+    ///
+    /// « upstream not available » est la reponse du gestionnaire quand le
+    /// service Deezer enregistre n'a pas d'ARL (`AppState::new` l'enregistre,
+    /// `state.rs:349`) : ce corps-la prouve que la route a matche ET que le
+    /// gestionnaire a tourne. Le repli, lui, rendrait du HTML ou un 404 nu.
+    /// Aucun appel reseau : `gw_api_call` refuse des l'absence d'ARL.
+    #[tokio::test]
+    async fn les_deux_formes_atteignent_le_gestionnaire_deezer() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let app = super::router(state);
+
+        for chemin in [
+            // Forme declaree depuis que la route existe.
+            "/deezer-proxy/92720184.flac",
+            // Forme reellement emise par `DeezerService::get_track_url`.
+            "/deezer-proxy/deezer/92720184.flac",
+        ] {
+            let reponse = app
+                .clone()
+                .oneshot(Request::get(chemin).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = reponse.status();
+            let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let corps = String::from_utf8_lossy(&corps);
+            assert_eq!(
+                (status, corps.as_ref()),
+                (StatusCode::NOT_FOUND, "upstream not available"),
+                "{chemin} n'a pas atteint le gestionnaire du proxy Deezer (#3865)"
+            );
+        }
+    }
+}
+
 /// Garde-fou : écrire `zone_{id}_eq_profile` sans rafraîchir la sortie qui joue.
 ///
 /// L'égaliseur n'atteint le son d'une zone locale que si quelqu'un rebâtit
@@ -624,10 +697,59 @@ mod eq_refresh_guard {
         ("_mono_downmix", "refresh_zone_mono_downmix"),
     ];
 
+    /// REF-T (#2219) : un module de test sorti de son fichier en module enfant
+    /// n'est pas une route. Il se reconnaît à sa déclaration `#[cfg(test)]`
+    /// suivie de `mod <nom>;` dans le fichier parent `<dossier>.rs`. Sans cette
+    /// règle, le garde-fou verrait `zones/signal_path_tests.rs` poser les clés
+    /// DSP pour préparer ses cas et le prendrait pour une route sans
+    /// rafraîchisseur — ce que `zones.rs` n'était pas quand il les contenait.
+    fn est_module_de_test_sorti(chemin: &Path) -> bool {
+        let (Some(dossier), Some(nom)) =
+            (chemin.parent(), chemin.file_stem().and_then(|s| s.to_str()))
+        else {
+            return false;
+        };
+        let Ok(parent) = fs::read_to_string(dossier.with_extension("rs")) else {
+            return false;
+        };
+        let lignes: Vec<&str> = parent.lines().map(str::trim).collect();
+        lignes.iter().enumerate().any(|(i, l)| {
+            *l == format!("mod {nom};")
+                && lignes[i.saturating_sub(3)..i]
+                    .iter()
+                    .any(|a| *a == "#[cfg(test)]")
+        })
+    }
+
+    /// REF-4 (#2219) : un module de PRODUCTION sorti d'un fichier de routes en
+    /// module enfant (`mod <nom>;` sans `#[cfg(test)]` dans `<dossier>.rs`) est
+    /// un morceau de ce fichier, pas une route à part. Il se lit AVEC son
+    /// parent, sous le nom du parent : la granularité « au fichier de route »
+    /// est conservée telle quelle (`zones.rs` + `zones/signal_path.rs` = ce
+    /// que `zones.rs` était). Rend le nom du fichier parent.
+    fn parent_de_production(chemin: &Path) -> Option<String> {
+        let dossier = chemin.parent()?;
+        let nom = chemin.file_stem()?.to_str()?;
+        let fichier_parent = dossier.with_extension("rs");
+        let parent = fs::read_to_string(&fichier_parent).ok()?;
+        let lignes: Vec<&str> = parent.lines().map(str::trim).collect();
+        let declare = lignes.iter().enumerate().any(|(i, l)| {
+            *l == format!("mod {nom};")
+                && !lignes[i.saturating_sub(3)..i]
+                    .iter()
+                    .any(|a| *a == "#[cfg(test)]")
+        });
+        if !declare {
+            return None;
+        }
+        fichier_parent.file_name()?.to_str().map(str::to_string)
+    }
+
     #[test]
     fn every_route_writing_a_dsp_setting_refreshes_the_live_output() {
         let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
         let mut sources: Vec<(String, String)> = Vec::new();
+        let mut enfants: Vec<(Option<String>, usize)> = Vec::new();
 
         let mut piles = vec![racine.clone()];
         while let Some(dir) = piles.pop() {
@@ -640,6 +762,9 @@ mod eq_refresh_guard {
                 if chemin.extension().and_then(|e| e.to_str()) != Some("rs") {
                     continue;
                 }
+                if est_module_de_test_sorti(&chemin) {
+                    continue;
+                }
                 let nom = chemin
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -649,7 +774,19 @@ mod eq_refresh_guard {
                     nom,
                     fs::read_to_string(&chemin).expect("lecture du fichier"),
                 ));
+                enfants.push((parent_de_production(&chemin), sources.len() - 1));
             }
+        }
+        // Les modules enfants de production rejoignent le texte de leur parent.
+        for (parent, index) in enfants.into_iter().rev() {
+            let Some(parent) = parent else { continue };
+            let (_, texte) = sources.remove(index);
+            let (_, source_parent) = sources
+                .iter_mut()
+                .find(|(nom, _)| *nom == parent)
+                .unwrap_or_else(|| panic!("le fichier parent {parent} doit être dans src/routes"));
+            source_parent.push('\n');
+            source_parent.push_str(&texte);
         }
 
         for (cle, rafraichisseur) in REGLAGES_A_RAFRAICHIR {

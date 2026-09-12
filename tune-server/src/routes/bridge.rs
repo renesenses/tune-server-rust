@@ -9,6 +9,7 @@ use axum::routing::get;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
+use tune_core::db::zone_repo::CreationDeZone;
 use tune_core::outputs::bridge::{BridgeCommand, BridgeOutput, BridgeResponse};
 
 use crate::state::AppState;
@@ -269,12 +270,23 @@ async fn handle_devices(
 
         registered.lock().await.push(full_id.clone());
 
-        // Auto-create zone if not exists
-        match zone_repo.get_or_create(&dev.name, Some(&dev.device_type), &full_id) {
-            Ok((zid, true)) => {
+        // Auto-create zone if not exists — #3529 : un pont annonce ses
+        // appareils tout seul, sans que l'utilisateur ait rien demandé. La
+        // naissance d'une zone est donc soumise à « Créer automatiquement les
+        // zones », comme pour les autres découvertes.
+        match zone_repo.get_or_create_si_autorise(
+            &dev.name,
+            Some(&dev.device_type),
+            &full_id,
+            "bridge_devices",
+        ) {
+            Ok(CreationDeZone::Creee(zid)) => {
                 info!(name = %dev.name, zone_id = zid, "bridge zone created");
             }
-            Ok((_, false)) => {
+            Ok(CreationDeZone::Refusee) => {
+                info!(name = %dev.name, id = %full_id, "bridge_zone_auto_create_disabled_skipping");
+            }
+            Ok(CreationDeZone::Existante(_)) => {
                 let _ = zone_repo.set_online_by_device(&full_id, true);
                 info!(name = %dev.name, id = %full_id, "bridge zone reconnected");
             }

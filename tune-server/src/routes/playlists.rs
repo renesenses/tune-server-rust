@@ -40,6 +40,18 @@ struct UpdatePlaylist {
 struct AddTracks {
     track_ids: Vec<i64>,
     position: Option<i64>,
+    /// Pistes de service (Qobuz, Tidal…) que le client joint à la demande.
+    ///
+    /// `AddToPlaylistModal.buildAddArgs()` (tune-web-client) le remplit dès que
+    /// la piste n'a pas d'`id` local, et laisse alors `track_ids` VIDE. Le
+    /// champ n'etait pas declare ici : serde ecarte en silence tout champ
+    /// inconnu, `add_tracks` n'ajoutait donc rien et repondait quand meme
+    /// `201 Created` (#1848).
+    ///
+    /// Le contenu n'est pas typé : la route ne peut de toute façon pas le
+    /// stocker (voir `add_tracks`), elle n'a besoin que de savoir COMBIEN il y
+    /// en a pour pouvoir le dire.
+    streaming_tracks: Option<Vec<Value>>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +108,42 @@ pub fn router() -> Router<AppState> {
         .route("/match", post(match_tracks))
 }
 
+/// La playlist existe ET appartient au profil appelant, sinon `404` (#2794).
+///
+/// Un seul point de refus pour toutes les routes privées par id : celles qui
+/// mutent `playlist_tracks` ne peuvent pas porter le filtre dans leur propre
+/// `WHERE` (la table des pistes ne connaît pas le profil), elles s'appuient
+/// donc sur cette lecture cloisonnée. Le propriétaire d'une playlist ne change
+/// jamais — aucune route ne transfère `profile_id` —, la fenêtre entre la
+/// vérification et l'écriture n'ouvre donc sur rien.
+///
+/// `pub(crate)` : les mêmes accès par id existent hors de ce module —
+/// `playlist_manager` (transfert, fusion, export, synchronisation d'un lien) et
+/// `playback` (`playlist_id` dans le corps de `POST /zones/{id}/play`). Un
+/// second point de refus serait un second endroit où se tromper de code de
+/// statut ; ils passent tous par celui-ci.
+pub(crate) fn owned_or_404(
+    repo: &PlaylistRepo,
+    id: i64,
+    profile_id: i64,
+) -> Result<tune_core::db::playlist_repo::Playlist, AppError> {
+    match repo.get_for_profile(id, profile_id) {
+        Ok(Some(pl)) => Ok(pl),
+        Ok(None) => Err(AppError::not_found("playlist not found")),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
+/// Variante pour les handlers qui rendent `impl IntoResponse` plutôt qu'un
+/// `Result<_, AppError>`.
+pub(crate) fn owned_or_404_response(
+    repo: &PlaylistRepo,
+    id: i64,
+    profile_id: i64,
+) -> Result<tune_core::db::playlist_repo::Playlist, axum::response::Response> {
+    owned_or_404(repo, id, profile_id).map_err(IntoResponse::into_response)
+}
+
 async fn list_playlists(
     State(state): State<AppState>,
     profile: ActiveProfile,
@@ -109,9 +157,28 @@ async fn list_playlists(
     Json(json!(items))
 }
 
-async fn get_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+/// #2794 — le cloisonnement par profil ne tenait qu'au listing. Toute route
+/// privée qui désigne une playlist par son id doit filtrer sur le profil
+/// appelant, sinon une simple énumération d'entiers donne accès aux playlists
+/// des autres profils : lecture, modification, suppression, export, partage.
+///
+/// **Contrat retenu : `404`**, le même que pour une playlist inexistante. Un
+/// `403` distinguerait « existe mais pas à vous » de « n'existe pas » et
+/// rendrait l'énumération exploitable malgré le verrou.
+///
+/// Un administrateur n'a **aucun contournement implicite** : il agit pour un
+/// autre profil en l'annonçant par l'en-tête `X-Profile-Id`, que
+/// [`ActiveProfile`] n'accorde qu'aux rôles `admin` et `api-token`.
+///
+/// Le partage public par jeton (`GET /playlists/shared/{token}`) reste
+/// délibérément hors profil : le jeton EST l'autorisation.
+async fn get_playlist(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.get(id) {
+    match repo.get_for_profile(id, profile.id()) {
         Ok(Some(pl)) => Json(json!(pl)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -140,12 +207,19 @@ async fn create_playlist(
 
 async fn update_playlist(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Json(body): Json<UpdatePlaylist>,
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.update(id, body.name.as_deref(), body.description.as_deref()) {
-        Ok(_) => match repo.get(id) {
+    match repo.update_for_profile(
+        id,
+        profile.id(),
+        body.name.as_deref(),
+        body.description.as_deref(),
+    ) {
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Ok(true) => match repo.get_for_profile(id, profile.id()) {
             Ok(Some(playlist)) => Json(json!(playlist)).into_response(),
             Ok(None) => StatusCode::NOT_FOUND.into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -154,10 +228,19 @@ async fn update_playlist(
     }
 }
 
-async fn delete_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+/// Une suppression qui n'a rien supprimé répondait `204` : le « 200 pour
+/// rien ». Elle répond maintenant `404`, que la playlist n'existe pas ou
+/// qu'elle appartienne à un autre profil — la base est la seule source de
+/// vérité, pas le code de retour.
+async fn delete_playlist(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.delete(id) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+    match repo.delete_for_profile(id, profile.id()) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -168,9 +251,11 @@ async fn delete_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> 
 /// seule. On remonte un 500 explicite.
 async fn get_tracks(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
+    owned_or_404(&repo, id, profile.id())?;
     let track_ids = repo
         .get_track_ids(id)
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -182,13 +267,73 @@ async fn get_tracks(
 
 async fn add_tracks(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Json(body): Json<AddTracks>,
 ) -> impl IntoResponse {
+    // #1848 — Dominique Comet : « lorsqu'on sélectionne une piste nous n'avons
+    // pas les mêmes possibilités sur la bibliothèque et sur Qobuz ».
+    //
+    // Le client OFFRE « ajouter à une playlist » sur une piste de service
+    // (`StreamingView.svelte`, trois listes : album, playlist, recherche) et
+    // poste alors `streaming_tracks` avec `track_ids` vide. Ce champ n'étant
+    // pas déclaré, serde l'écartait : `add_tracks_deduped(id, &[], …)`
+    // n'ajoutait rien, la route répondait `201 Created` avec la playlist, et le
+    // modal lisait ce 201 comme un succès — il affichait « ajoutée » devant une
+    // playlist restée vide.
+    //
+    // Ce n'est PAS réparable en stockant la piste : `playlist_tracks.track_id`
+    // est `NOT NULL REFERENCES tracks(id)` dans les trois définitions de schéma
+    // (sqlite.rs, migrations/postgres, pg_migrate.rs). Une playlist locale ne
+    // PEUT pas porter une piste de service. Le refus est donc légitime — c'est
+    // de le déguiser en succès qui ne l'était pas. Même doctrine que #1959 sur
+    // `save_queue_as_playlist` : 422 avec la raison, et le compte des ignorées
+    // sur le cas mixte.
+    let distantes = body.streaming_tracks.as_ref().map_or(0, Vec::len);
+
+    if distantes > 0 && body.track_ids.is_empty() {
+        tracing::warn!(
+            playlist_id = id,
+            distantes,
+            "playlist_add_tracks_refused_streaming_only"
+        );
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "Cette demande ne porte que des pistes de service ({distantes}), \
+                 qui ne peuvent pas entrer dans une playlist locale. \
+                 Ajoutez-les à une playlist du service, ou ajoutez d'abord ces \
+                 titres à votre bibliothèque."
+            ),
+        )
+            .into_response();
+    }
+
     let repo = PlaylistRepo::with_backend(state.backend.clone());
+    if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
+        return r;
+    }
     match repo.add_tracks_deduped(id, &body.track_ids, body.position) {
         Ok(_) => match repo.get(id) {
-            Ok(Some(playlist)) => (StatusCode::CREATED, Json(json!(playlist))).into_response(),
+            Ok(Some(playlist)) => {
+                let mut corps = json!(playlist);
+                if distantes > 0 {
+                    // Une demande mixte perd ses pistes de service en chemin.
+                    // Le taire produirait le défaut d'à côté : une playlist
+                    // plus courte que la demande, sans que rien ne dise
+                    // pourquoi.
+                    tracing::info!(
+                        playlist_id = id,
+                        ajoutees = body.track_ids.len(),
+                        ignorees = distantes,
+                        "playlist_add_tracks_skipped_streaming"
+                    );
+                    if let Some(obj) = corps.as_object_mut() {
+                        obj.insert("skipped_streaming".into(), json!(distantes));
+                    }
+                }
+                (StatusCode::CREATED, Json(corps)).into_response()
+            }
             Ok(None) => StatusCode::NOT_FOUND.into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         },
@@ -198,10 +343,14 @@ async fn add_tracks(
 
 async fn remove_track(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Json(body): Json<RemoveTrack>,
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
+    if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
+        return r;
+    }
     match repo.remove_track(id, body.position) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -210,10 +359,14 @@ async fn remove_track(
 
 async fn remove_tracks_batch(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Json(body): Json<RemoveTracksBody>,
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
+    if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
+        return r;
+    }
     match repo.remove_tracks_at_positions(id, &body.positions) {
         Ok(removed) => Json(json!({"removed": removed})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -222,10 +375,14 @@ async fn remove_tracks_batch(
 
 async fn reorder_tracks(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Json(body): Json<ReorderTracksBody>,
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
+    if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
+        return r;
+    }
     match repo.reorder_tracks(id, &body.track_ids) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -238,13 +395,14 @@ async fn duplicate_playlist(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    let original = match repo.get(id) {
-        Ok(Some(p)) => p,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        // A database error is not "no such playlist": answering 404 for a
-        // failed read sends the client off looking for a playlist that does
-        // exist (#2798).
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    // Le filtre par profil est DANS la lecture : dupliquer la playlist d'un
+    // autre profil la recopierait sous son propre profil, donc l'exfiltrerait
+    // (#2794). A database error is not "no such playlist": answering 404 for a
+    // failed read sends the client off looking for a playlist that does
+    // exist (#2798).
+    let original = match owned_or_404_response(&repo, id, profile.id()) {
+        Ok(p) => p,
+        Err(r) => return r,
     };
 
     // Reading the source track list used to be `unwrap_or_default()`: a
@@ -286,18 +444,16 @@ struct ExportQuery {
 
 async fn export_m3u(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Query(q): Query<ExportQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let fmt = q.format.as_deref().unwrap_or("m3u");
     if fmt != "m3u" {
-        return export_multi_format(State(state.clone()), id, fmt).await;
+        return export_multi_format(State(state.clone()), profile, id, fmt).await;
     }
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    let playlist = match repo.get(id) {
-        Ok(Some(p)) => p,
-        _ => return Err(AppError::not_found("playlist not found")),
-    };
+    let playlist = owned_or_404(&repo, id, profile.id())?;
 
     // Exporter un M3U vide sur erreur de base produit un fichier qui a l'air
     // valide et détruit la playlist chez qui le réimporte (#2797).
@@ -339,15 +495,12 @@ async fn export_m3u(
 
 async fn export_multi_format(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     id: i64,
     format: &str,
 ) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, String), AppError> {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    let playlist = repo
-        .get(id)
-        .ok()
-        .flatten()
-        .ok_or(AppError::not_found("playlist not found"))?;
+    let playlist = owned_or_404(&repo, id, profile.id())?;
     let track_ids = repo
         .get_track_ids(id)
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -521,7 +674,12 @@ async fn import_m3u_file(
     // empty map, so EVERY line fell through to "not found" and the import
     // answered 201 with 0 matched — a success that describes nothing that
     // happened (#2798, same shape as #2119). Refuse before writing anything.
-    let path_to_id = match track_repo.get_all_local_file_info() {
+    // Toutes sources : la question posée par une ligne de .m3u est « quelle
+    // ligne de la base possède ce chemin ? », et une seule peut le posséder
+    // (`file_path TEXT UNIQUE`). Restreindre à `source = 'local'` faisait
+    // retomber sur la recherche FTS — ou sur « introuvable » — une piste que la
+    // base tenait pourtant sous une source d'importation (#2939).
+    let path_to_id = match track_repo.get_all_file_info_by_path() {
         Ok(map) => map,
         Err(e) => {
             tracing::warn!(error = %e, "m3u_import_file_index_unavailable");
@@ -555,8 +713,8 @@ async fn import_m3u_file(
         total_entries += 1;
 
         // Exact path match (O(1) map lookup).
-        if let Some((id, _, _)) = path_to_id.get(line) {
-            track_ids.push(*id);
+        if let Some(info) = path_to_id.get(line) {
+            track_ids.push(info.id);
             matched += 1;
             continue;
         }
@@ -1067,12 +1225,16 @@ async fn list_all_playlists(State(state): State<AppState>, profile: ActiveProfil
     Json(json!(items))
 }
 
-async fn share_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+async fn share_playlist(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.get(id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    // Publier la playlist d'un autre profil sous un jeton public est la pire
+    // forme de la fuite : elle survit à la fermeture de la session (#2794).
+    if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
+        return r;
     }
 
     // Unguessable share token: 128 bits from a CSPRNG. The old token was
@@ -1141,12 +1303,15 @@ async fn get_shared_playlist(
 /// A local track is available when its file still exists on disk; a missing file
 /// (deleted/moved/unplugged drive) is reported unavailable. Previously this was
 /// a stub that returned the raw playlist, so the UI spun on "vérification…".
-async fn recover_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+async fn recover_playlist(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    let pl = match repo.get(id) {
-        Ok(Some(p)) => p,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    let pl = match owned_or_404_response(&repo, id, profile.id()) {
+        Ok(p) => p,
+        Err(r) => return r,
     };
 
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
@@ -1198,9 +1363,16 @@ async fn recover_playlist(State(state): State<AppState>, Path(id): Path<i64>) ->
 
 async fn transfer_playlist(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<TransferPlaylist>,
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
+    // L'id voyage dans le corps et non dans le chemin, mais c'est le même
+    // accès direct par id : verser la playlist d'un autre profil dans sa file
+    // en révèle tout le contenu (#2794).
+    if let Err(r) = owned_or_404_response(&repo, body.playlist_id, profile.id()) {
+        return r;
+    }
     let track_ids = match repo.get_track_ids(body.playlist_id) {
         Ok(ids) => ids,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -1220,6 +1392,7 @@ async fn transfer_playlist(
 /// diff, which matches on title+artist since the two sides share no track ids.
 async fn diff_playlist_tracks(
     state: &AppState,
+    profile_id: i64,
     service: &str,
     playlist_id: &str,
 ) -> Vec<(String, String)> {
@@ -1255,6 +1428,17 @@ async fn diff_playlist_tracks(
         let pid: i64 = playlist_id.parse().unwrap_or(0);
         let prepo = PlaylistRepo::with_backend(state.backend.clone());
         let trepo = TrackRepo::with_backend(state.backend.clone());
+        // Un diff sur la playlist d'un autre profil en listerait titres et
+        // artistes ligne à ligne (#2794) : hors profil, la comparaison porte
+        // sur une liste vide, exactement comme une playlist inexistante.
+        if prepo
+            .get_for_profile(pid, profile_id)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return Vec::new();
+        }
         prepo
             .get_track_ids(pid)
             .unwrap_or_default()
@@ -1286,10 +1470,23 @@ async fn diff_playlist_tracks(
 
 async fn diff_playlists(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<DiffPlaylists>,
 ) -> impl IntoResponse {
-    let src = diff_playlist_tracks(&state, &body.source_service, &body.source_playlist_id).await;
-    let tgt = diff_playlist_tracks(&state, &body.target_service, &body.target_playlist_id).await;
+    let src = diff_playlist_tracks(
+        &state,
+        profile.id(),
+        &body.source_service,
+        &body.source_playlist_id,
+    )
+    .await;
+    let tgt = diff_playlist_tracks(
+        &state,
+        profile.id(),
+        &body.target_service,
+        &body.target_playlist_id,
+    )
+    .await;
 
     let norm =
         |t: &str, a: &str| format!("{}|{}", t.trim().to_lowercase(), a.trim().to_lowercase());
@@ -1325,7 +1522,7 @@ async fn diff_playlists(
             let prepo = PlaylistRepo::with_backend(state.backend.clone());
             id.parse::<i64>()
                 .ok()
-                .and_then(|pid| prepo.get(pid).ok().flatten())
+                .and_then(|pid| prepo.get_for_profile(pid, profile.id()).ok().flatten())
                 .map(|p| p.name)
                 .unwrap_or_else(|| id.to_string())
         } else {
@@ -1347,8 +1544,15 @@ async fn diff_playlists(
 // Recovery apply
 // ---------------------------------------------------------------------------
 
-async fn apply_recovery(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+async fn apply_recovery(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
+    if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
+        return r;
+    }
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
     let mut recovered = 0i64;

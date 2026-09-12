@@ -23,8 +23,15 @@ name: Preflight
 # - cargo_deny: licenses and duplicate-dep checks pass
 # - web_api_contract: le client web n'appelle aucune route que le serveur
 #   ne sert pas (scripts/preflight-web-contract.py, lu depuis main)
-# - ci_status: all check-runs on the commit are green (skipped for
-#   workflow_dispatch on a branch that hasn't had CI yet)
+# - ci_status: les PORTES DE RELEASE du commit sont vertes (skipped for
+#   workflow_dispatch on a branch that hasn't had CI yet). Portes = les
+#   executions de `ci.yml`, `test-postgres.yml` et `widget-ci.yml` sur ce
+#   commit, et elles seules : les sondes planifiees, les robots d'issues, la
+#   machinerie du train et les AUDITS de gouvernance s'accrochent au meme
+#   commit sans etre des tests. « Derive des garde-fous » rougit par
+#   construction pendant un train (gel des tags ouvert, armement a `true`) et
+#   a bloque v0.9.131 ; voir le commentaire de `RELEASE_GATE_WORKFLOWS` dans
+#   scripts/preflight-check.py. Une absence de porte reconnue est un REFUS.
 
 on:
   workflow_call:
@@ -60,7 +67,14 @@ jobs:
   preflight:
     name: Pre-release checks
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 60 minutes depuis #2808 : le controle `ci_status` ATTEND desormais que la
+    # porte obligatoire (`ci.yml`) ait FINI sur le commit promu, au lieu de la
+    # declarer verte pendant qu'elle tourne encore. Mesure du train v0.9.142 :
+    # tag pose a 09:49:47Z, `ci.yml` terminee a 10:17:26Z — vingt-huit minutes
+    # d'attente. A 20 minutes, ce job serait tue au milieu de son attente et
+    # rendrait un ROUGE qui ne dit rien du code. Le budget d'attente du script
+    # (40 min par defaut) tient sous ce plafond, marge comprise.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -114,6 +128,22 @@ jobs:
         run: |
           python3 scripts/preflight-web-contract.py --self-test
           python3 scripts/preflight-web-contract.py --web .web-client
+
+      # `docs/contrat-web.json` est CHARGÉE par `web_response_contracts.rs` pour
+      # juger les réponses du serveur, et rien ne la jugeait elle : le
+      # cartographe `web-contract-map.py` n'était exécuté par aucun poste de la
+      # CI. Mesuré le 11/09/2026 : la carte n'avait pas bougé depuis le 31/08
+      # pendant qu'`api.ts` recevait 71 commits, et citait encore dix routes que
+      # le client n'appelle plus. On validait contre un document figé en croyant
+      # vérifier un contrat.
+      #
+      # Ce poste dispose du SEUL endroit où la comparaison est honnête : le SHA
+      # web exact que la release embarque, déjà extrait du manifeste ci-dessus.
+      - name: Fraîcheur de la carte du contrat web
+        run: |
+          python3 scripts/web-contract-map.py --self-test
+          python3 scripts/verifier-carte-web.py --self-test
+          python3 scripts/verifier-carte-web.py --web .web-client
 
       - name: Run preflight checks
         env:

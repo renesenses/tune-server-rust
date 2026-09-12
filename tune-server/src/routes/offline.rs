@@ -5,6 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -598,7 +599,7 @@ async fn sync_offline(State(state): State<AppState>) -> Result<impl IntoResponse
 
     let completed: Vec<(i64, String)> = state.backend
         .query_many("SELECT id, file_path FROM offline_cache WHERE status = 'completed' AND file_path IS NOT NULL", &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| {
             let id = r.get(0).and_then(|v| v.as_i64())?;
@@ -642,7 +643,7 @@ async fn clear_offline(State(state): State<AppState>) -> Result<impl IntoRespons
             "SELECT file_path FROM offline_cache WHERE file_path IS NOT NULL",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| r.first().and_then(|v| v.as_string()))
         .collect();

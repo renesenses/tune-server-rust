@@ -1,7 +1,6 @@
 pub mod bio_sync;
 pub mod community;
 pub mod community_sync;
-pub mod concert_alerts;
 pub mod consent;
 pub mod digest;
 pub mod library_sync;
@@ -10,8 +9,10 @@ pub mod playlist_hub;
 pub mod plugins;
 pub mod rate_limit;
 pub mod recommendations;
+pub mod refusal;
 #[cfg(feature = "cloud-relay")]
 pub mod relay;
 pub mod sso;
 pub mod support;
 pub mod telemetry;
+pub mod tune_tested;

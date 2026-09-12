@@ -1,0 +1,327 @@
+{
+ "source": "https://mozaiklabs.fr/api/v1/forum — relu par API le 2026-09-01, LECTURE SEULE. Extrait fige : aucune donnee inventee.",
+ "scenario_a": {
+  "quoi": "fenetre du 28 au 30/08/2026 — instants de ronde REELS lus dans ~/.claude/tune-agents/journaux/tri.log",
+  "instants": [
+   "2026-08-28T16:05:55+02:00",
+   "2026-08-28T17:31:12+02:00",
+   "2026-08-29T18:31:01+02:00"
+  ],
+  "rates": [
+   5922,
+   5949,
+   5958
+  ],
+  "controle_positif": 5970,
+  "temoin": 1588,
+  "fils": [
+   {
+    "id": 1577,
+    "slug": "after-going-to-big-screen-mode-navigating-becomes-impossible-gemlPM",
+    "title": "After going to big screen mode, navigating becomes impossible",
+    "author": "Dimitri",
+    "created_at": "2026-08-27T12:07:15+02:00",
+    "extrait": "On the Now Playing screen,&nbsp;I want to switch on Big Screen mode (with the VU",
+    "replies": [
+     {
+      "id": 5832,
+      "author": "Dimitri",
+      "created_at": "2026-08-27T12:08:51+02:00",
+      "extrait": "As a matter of fact, I don't even have to go into Big screen mode. After going t"
+     },
+     {
+      "id": 5833,
+      "author": "GgB",
+      "created_at": "2026-08-27T12:13:50+02:00",
+      "extrait": "idem sur Linux et je rajouterais que les fenêtres \"chemin du signal\" et \"file d'"
+     },
+     {
+      "id": 5850,
+      "author": "Bertrand",
+      "created_at": "2026-08-27T13:53:18+02:00",
+      "extrait": "Dimitri, GgB — thank you both. This one matters, and your two reports taken toge"
+     },
+     {
+      "id": 5857,
+      "author": "Dimitri",
+      "created_at": "2026-08-27T14:40:32+02:00",
+      "extrait": "Hi Bertrand, Here's the screenshot of the console: After I clicked on Now Playin"
+     },
+     {
+      "id": 5864,
+      "author": "GgB",
+      "created_at": "2026-08-27T15:24:58+02:00",
+      "extrait": "Il semble que le blocage ne se pose pas quand on passe par les radios live, par "
+     },
+     {
+      "id": 5871,
+      "author": "Bertrand",
+      "created_at": "2026-08-27T17:29:55+02:00",
+      "extrait": "Bonjour GgB, Je vais être direct : ce que vous venez d'écrire est l'observation "
+     },
+     {
+      "id": 5881,
+      "author": "Bertrand",
+      "created_at": "2026-08-27T18:41:30+02:00",
+      "extrait": "Dimitri, GgB — this one is solved. The cause is found, and it has been verified "
+     },
+     {
+      "id": 5884,
+      "author": "GgB",
+      "created_at": "2026-08-27T18:51:08+02:00",
+      "extrait": "Après 5-6 mn d'attente pas de blocage du menu de gauche, j'ai navigué dans diver"
+     },
+     {
+      "id": 5886,
+      "author": "Bertrand",
+      "created_at": "2026-08-27T20:46:10+02:00",
+      "extrait": "Bonjour GgB, Merci d'avoir retest&eacute;, et merci surtout d'avoir not&eacute; "
+     },
+     {
+      "id": 5893,
+      "author": "GgB",
+      "created_at": "2026-08-27T22:21:37+02:00",
+      "extrait": "J'ai fait effectivement des tests avec deux machines et 3 OS (Manjaro Debian Fed"
+     },
+     {
+      "id": 5898,
+      "author": "Bertrand",
+      "created_at": "2026-08-28T10:04:38+02:00",
+      "extrait": "Bonjour GgB, Merci : votre r&eacute;ponse tranche une vraie ambigu&iuml;t&eacute"
+     },
+     {
+      "id": 5901,
+      "author": "Bertrand",
+      "created_at": "2026-08-28T12:23:45+02:00",
+      "extrait": "Bonjour GgB, Je dois revenir sur mon message de ce matin et le corriger. Je vous"
+     },
+     {
+      "id": 5914,
+      "author": "Bertrand",
+      "created_at": "2026-08-28T14:23:30+02:00",
+      "extrait": "Bonjour GgB, La 0.9.118 est disponible, et elle contient la correction du blocag"
+     },
+     {
+      "id": 5929,
+      "author": "GgB",
+      "created_at": "2026-08-28T21:31:08+02:00",
+      "extrait": "Bertrand Je ne suis pas chez moi actuellement donc dans l'impossibilité de faire"
+     },
+     {
+      "id": 5934,
+      "author": "Bertrand",
+      "created_at": "2026-08-28T22:40:31+02:00",
+      "extrait": "Bonjour Gérard, Merci de m'avoir prévenu : sans cela, j'aurais attendu un retour"
+     },
+     {
+      "id": 5949,
+      "author": "Dimitri",
+      "created_at": "2026-08-29T12:00:45+02:00",
+      "extrait": "Hi Bertrand, I can confirm that this issue is resolved. I did exactly as you des"
+     },
+     {
+      "id": 5951,
+      "author": "Bertrand",
+      "created_at": "2026-08-29T13:34:46+02:00",
+      "extrait": "Hi Dimitri, Thank you &mdash; and thank you for more than the kind words. Yours "
+     }
+    ]
+   },
+   {
+    "id": 1579,
+    "slug": "demande-de-fonctionnalite-radio-dartistes-sur-qobuz-s5fDgT",
+    "title": "Demande de fonctionnalité : Radio d'artistes sur Qobuz",
+    "author": "Sandro",
+    "created_at": "2026-08-27T16:06:00+02:00",
+    "extrait": "Une fois qu'on a trouvé un artiste intéressant sur Qobuz, serait-il possible d'a",
+    "replies": [
+     {
+      "id": 5878,
+      "author": "Bertrand",
+      "created_at": "2026-08-27T18:05:55+02:00",
+      "extrait": "Bonjour Sandro, Demande claire, et le besoin que vous décrivez est le bon : déco"
+     },
+     {
+      "id": 5899,
+      "author": "Pierre M",
+      "created_at": "2026-08-28T10:25:02+02:00",
+      "extrait": "Bonjour, je suis intéressé par cette fonction mais je n'arrive pas à la faire ma"
+     },
+     {
+      "id": 5903,
+      "author": "Bertrand",
+      "created_at": "2026-08-28T12:32:32+02:00",
+      "extrait": "Bonjour Pierre, Réponse franche d'abord : vous n'avez rien raté et vous n'avez r"
+     },
+     {
+      "id": 5910,
+      "author": "Sandro",
+      "created_at": "2026-08-28T13:36:37+02:00",
+      "extrait": "Personnellement, je préférerais un mix automatique puisant dans l'ensemble de so"
+     },
+     {
+      "id": 5917,
+      "author": "Bertrand",
+      "created_at": "2026-08-28T15:24:22+02:00",
+      "extrait": "Bonjour Sandro, Merci pour cette réponse. Elle est argumentée, et la capture ann"
+     },
+     {
+      "id": 5922,
+      "author": "Sandro",
+      "created_at": "2026-08-28T16:48:03+02:00",
+      "extrait": "Merci pour votre réponse, Bertrand. Concernant la première question, je dirais o"
+     },
+     {
+      "id": 5923,
+      "author": "Bertrand",
+      "created_at": "2026-08-28T17:05:20+02:00",
+      "extrait": "Bonjour Sandro, Merci d'avoir répondu à deux séries de questions dans la même jo"
+     }
+    ]
+   },
+   {
+    "id": 1591,
+    "slug": "acces-rapide-aux-albums-dans-les-dosiers-collections-BlfjB5",
+    "title": "Accès rapide aux albums dans les dossiers \"Collections\"",
+    "author": "Lulu",
+    "created_at": "2026-08-28T15:31:31+02:00",
+    "extrait": "Bonjour, Question 1 : Afin de facilité la recherche d'albums dans les dossiers \"",
+    "replies": [
+     {
+      "id": 5921,
+      "author": "Bertrand",
+      "created_at": "2026-08-28T16:45:04+02:00",
+      "extrait": "Bonjour JLuc, Merci pour ces deux questions. Je commence par la seconde, car c'e"
+     },
+     {
+      "id": 5926,
+      "author": "Lulu",
+      "created_at": "2026-08-28T20:55:55+02:00",
+      "extrait": "Bonsoir Bertrand, Merci pour ces réponses complètes et précises. Concernant la q"
+     },
+     {
+      "id": 5930,
+      "author": "Bertrand",
+      "created_at": "2026-08-28T21:33:43+02:00",
+      "extrait": "Bonsoir JLuc, Merci pour cette réponse : elle tranche la question que je vous po"
+     },
+     {
+      "id": 5958,
+      "author": "Lulu",
+      "created_at": "2026-08-29T14:36:43+02:00",
+      "extrait": "Bonjour Bertrand, Je viens de consulter les transferts d'albums de la Bibliothèq"
+     },
+     {
+      "id": 5960,
+      "author": "Bertrand",
+      "created_at": "2026-08-29T14:59:39+02:00",
+      "extrait": "Bonjour JLuc, Vous n'avez pas rêvé, et vous n'avez rien mal lu : ce que vous voy"
+     },
+     {
+      "id": 5973,
+      "author": "Lulu",
+      "created_at": "2026-08-29T20:13:17+02:00",
+      "extrait": "Bonsoir Claude, Je peux développer mon cas, mais j'ai trouvé une solution pour r"
+     },
+     {
+      "id": 6029,
+      "author": "Lulu",
+      "created_at": "2026-08-31T11:43:49+02:00",
+      "extrait": "Bonjour, Merci beaucoup pour l'ajout de l'ascenseur alphabétique dans les dossie"
+     }
+    ]
+   },
+   {
+    "id": 1611,
+    "slug": "v09124-recherche-versions-incomplete-aN76zn",
+    "title": "v0.9.124: recherche versions incomplète",
+    "author": "FabienM",
+    "created_at": "2026-08-29T15:39:42+02:00",
+    "extrait": "Je pense que l'algorithme de la recherche d'une version est incomplet. Exemple i",
+    "replies": [
+     {
+      "id": 5965,
+      "author": "Bertrand",
+      "created_at": "2026-08-29T16:34:46+02:00",
+      "extrait": "Bonjour Fabien, Merci d'avoir refait l'essai. Vous r&eacute;pondez pr&eacute;cis"
+     },
+     {
+      "id": 5970,
+      "author": "FabienM",
+      "created_at": "2026-08-29T18:03:30+02:00",
+      "extrait": "Lorsque je cherche directement « Somebody » dans la recherche Qobuz de Tune j'ob"
+     }
+    ]
+   },
+   {
+    "id": 1588,
+    "slug": "reunion-communaute-tune-28-aout-2026",
+    "title": "Réunion de la communauté Tune — ce vendredi 28 août à 18 h",
+    "author": "Admin",
+    "created_at": "2026-08-28T13:16:39+02:00",
+    "extrait": "Bonjour à tous, On se retrouve ce soir pour la réunion de la communauté Tune. 📅 ",
+    "replies": []
+   }
+  ]
+ },
+ "scenario_b": {
+  "quoi": "fil neuf portant deja des reponses au tour suivant — fil 903 (reponse 4052 a +5 min 20 s)",
+  "instants": [
+   "2026-06-22T09:00:00+02:00",
+   "2026-07-13T12:50:00+02:00"
+  ],
+  "rate": 4052,
+  "temoin": 750,
+  "controle_positif": 1018,
+  "fils": [
+   {
+    "id": 903,
+    "slug": "tune-v08239-quality-badge-instant-repeat-metadata-fix-radio-history-Frw35X",
+    "title": "Tune v0.8.239 — Quality badge instant, repeat metadata fix, radio history",
+    "author": "Admin",
+    "created_at": "2026-07-03T08:40:24+02:00",
+    "extrait": "Tune v0.8.239 Nouveautés Quality badge instant — Le badge qualité (format/sample",
+    "replies": [
+     {
+      "id": 4052,
+      "author": "Benjithom",
+      "created_at": "2026-07-03T08:45:44+02:00",
+      "extrait": "Bertrand, Aprés l'echec de la lecture sur la version 238 , la lecture refonction"
+     }
+    ]
+   },
+   {
+    "id": 750,
+    "slug": "rencontres-teams-3-sessions-cette-semaine-Exo0qF",
+    "title": "Rencontres Teams — 3 sessions cette semaine !",
+    "author": "Admin",
+    "created_at": "2026-06-22T09:09:27+02:00",
+    "extrait": "Bonjour a tous, Trois rencontres Teams sont programmees cette semaine pour echan",
+    "replies": [
+     {
+      "id": 3610,
+      "author": "Admin",
+      "created_at": "2026-06-22T09:11:18+02:00",
+      "extrait": "Correction : les jours sont lundi, mercredi et vendredi (pas dimanche, mardi, je"
+     }
+    ]
+   },
+   {
+    "id": 1018,
+    "slug": "quelle-version-tester-en-prioite-083x-ou-09rcx-bfj9FN",
+    "title": "Quelle version tester en priorité ? 0.8.3x ou 0.9.RCx",
+    "author": "Sergio",
+    "created_at": "2026-07-13T12:35:00+02:00",
+    "extrait": "Bonjour, comme d'autres testeurs je pense (en tout cas c'est mon cas), n'ayant p",
+    "replies": [
+     {
+      "id": 4333,
+      "author": "Bertrand",
+      "created_at": "2026-07-13T12:40:35+02:00",
+      "extrait": "Bonjour Sergio, Dans le doute, reste env0.8.x. Si tu as un peut plus de temps al"
+     }
+    ]
+   }
+  ]
+ }
+}

@@ -5,6 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::warn;
 
 use crate::state::AppState;
 
@@ -18,6 +19,29 @@ pub fn router() -> Router<AppState> {
         .route("/rooms/{id}/group", post(group_rooms))
 }
 
+/// « Cet appareil découvert est-il un Sonos ? »
+///
+/// Le seul critère dont dispose ce fichier : le fabricant ou le modèle
+/// annoncés dans le descriptif UPnP. Il n'y a **aucune** découverte propre à
+/// Sonos ici — ces routes filtrent le résultat de la découverte DLNA
+/// générique, par laquelle une enceinte Sonos joue déjà.
+///
+/// Le prédicat était écrit deux fois, à l'identique, dans `list_rooms` et
+/// `list_speakers` : deux routes qui doivent rendre le MÊME ensemble
+/// d'appareils sous deux formes différentes. Deux copies, c'est deux chances
+/// de diverger sans que rien ne le dise.
+///
+/// Ce que ce prédicat ne fait pas, et qu'il faudra : reconnaître un Sonos à
+/// son identifiant `RINCON_…`. C'est le marqueur fiable — `outputs/dlna.rs`
+/// s'en sert déjà (`device_id.contains("RINCON")`) pour router le volume vers
+/// `GroupRenderingControl`. Ici on dépend encore d'un descriptif que la
+/// découverte peut n'avoir jamais réussi à lire.
+fn est_un_sonos(d: &tune_core::discovery::device::DiscoveredDevice) -> bool {
+    let mfr = d.manufacturer.as_deref().unwrap_or("").to_lowercase();
+    let model = d.model.as_deref().unwrap_or("").to_lowercase();
+    mfr.contains("sonos") || model.contains("sonos")
+}
+
 /// Return DLNA devices whose manufacturer or model contains "Sonos".
 async fn list_rooms(State(state): State<AppState>) -> Json<Value> {
     let scanner = &state.scanner;
@@ -25,11 +49,7 @@ async fn list_rooms(State(state): State<AppState>) -> Json<Value> {
 
     let sonos: Vec<Value> = devices
         .iter()
-        .filter(|d| {
-            let mfr = d.manufacturer.as_deref().unwrap_or("").to_lowercase();
-            let model = d.model.as_deref().unwrap_or("").to_lowercase();
-            mfr.contains("sonos") || model.contains("sonos")
-        })
+        .filter(|d| est_un_sonos(d))
         .map(|d| {
             json!({
                 "id": d.id,
@@ -66,11 +86,7 @@ async fn list_speakers(State(state): State<AppState>) -> Json<Value> {
 
     let speakers: Vec<Value> = devices
         .iter()
-        .filter(|d| {
-            let mfr = d.manufacturer.as_deref().unwrap_or("").to_lowercase();
-            let model = d.model.as_deref().unwrap_or("").to_lowercase();
-            mfr.contains("sonos") || model.contains("sonos")
-        })
+        .filter(|d| est_un_sonos(d))
         .map(|d| {
             json!({
                 "uid": d.id,
@@ -147,15 +163,46 @@ async fn set_room_volume(
 
 #[derive(Deserialize)]
 struct GroupBody {
+    #[allow(dead_code)]
     room_ids: Vec<String>,
 }
 
-/// Group rooms together. This is a placeholder -- real Sonos grouping
-/// requires the Sonos-specific household/group API or UPnP group rendering.
-async fn group_rooms(Path(id): Path<String>, Json(body): Json<GroupBody>) -> Json<Value> {
-    Json(json!({
-        "coordinator": id,
-        "members": body.room_ids,
-        "status": "grouping not yet implemented — requires Sonos household API",
-    }))
+/// POST /sonos/rooms/{id}/group — **refuse**, faute de savoir grouper.
+///
+/// Cette route répondait **200 OK** en renvoyant `coordinator`, `members`, et
+/// un champ `status` valant « grouping not yet implemented ». Un appelant qui
+/// ne lit pas ce champ — c'est-à-dire tout appelant écrit contre le code HTTP,
+/// ce qu'est `fetchJSON` côté client — voyait un **succès**, et un objet dont
+/// la forme est exactement celle d'un groupe formé : un coordinateur, ses
+/// membres. Rien n'avait été envoyé à la moindre enceinte.
+///
+/// Ce n'est pas de la cosmétique de code d'état : un 200 qui décrit un groupe
+/// inexistant se propage. L'interface l'afficherait, une reprise après
+/// redémarrage le persisterait, et le défaut se signalerait bien plus tard
+/// sous la forme « le groupage Sonos ne marche pas », loin d'ici.
+///
+/// Ce qui manque réellement, et qui n'est pas cette route :
+///
+/// * grouper une enceinte Sonos, c'est appeler `SetAVTransportURI` sur le
+///   service **AVTransport du MEMBRE** avec `CurrentURI = x-rincon:RINCON_…`
+///   désignant le coordinateur — pas une action du service de topologie, qui
+///   est en lecture seule ;
+/// * le serveur ne sait pas aujourd'hui QUI est coordinateur : cela se lit
+///   dans `ZoneGroupTopology`, service que rien n'interroge ici.
+///
+/// Tant que ces deux morceaux manquent, la seule réponse honnête est un refus.
+/// 501 plutôt que 400 : la requête n'a rien de fautif, c'est le serveur qui ne
+/// sait pas faire.
+async fn group_rooms(Path(id): Path<String>, Json(_body): Json<GroupBody>) -> impl IntoResponse {
+    warn!(coordinator = %id, "sonos_group_non_implemente");
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "sonos_grouping_not_implemented",
+            "message": "Le groupage multi-pièces Sonos n'est pas implémenté : \
+                        ce serveur n'interroge pas le service ZoneGroupTopology \
+                        et n'envoie aucun x-rincon: aux enceintes. Aucun groupe \
+                        n'a été formé.",
+        })),
+    )
 }

@@ -4,6 +4,7 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -81,6 +82,18 @@ pub(crate) async fn gate_enrichment(state: &AppState) -> Result<bool, (StatusCod
     if !is_premium {
         let (used, limit) = get_daily_enrichment_usage(&settings);
         if used >= limit {
+            // #3810 — un refus de quota cesse d'être muet côté serveur.
+            //
+            // Le 429 partait sans une ligne de journal, et l'interface v2
+            // avale le corps de l'erreur pour afficher un « échec du
+            // démarrage » générique (#3732). Le testeur lisait donc un message
+            // qui ne nomme pas la cause, et le serveur n'en gardait aucune
+            // trace : le refus était invisible des DEUX côtés.
+            tracing::warn!(
+                used,
+                limit,
+                "enrichissement_refuse_quota_gratuit — palier gratuit, quota du jour épuisé"
+            );
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({
@@ -129,6 +142,46 @@ pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoRes
 }
 
 // ---------------------------------------------------------------------------
+// Le fonds communautaire est indexé par MBID (#2258)
+// ---------------------------------------------------------------------------
+
+/// Ce que la clé du fonds communautaire de biographies écarte, dit à
+/// l'utilisateur (#2258).
+///
+/// `cloud::bio_sync::download_artist_bios` interroge mozaiklabs.fr par
+/// `?musicbrainz_ids=…` : **le fonds est indexé par MBID**. Les deux requêtes
+/// qui l'alimentent — envoi et candidats au téléchargement — exigent donc un
+/// MBID non vide, et un artiste qui n'en a pas est écarté des deux côtés.
+///
+/// Ce n'est pas un défaut de ces requêtes : c'est la conséquence d'un choix de
+/// clé, et la lever enverrait des identifiants vides à une API qui s'en sert
+/// d'index. Ce qui était un défaut, c'est que cette exclusion soit
+/// **totalement silencieuse** : le testeur voyait cent vingt fiches vides sans
+/// pouvoir distinguer une panne, une source avare et une clé qu'il ne possède
+/// pas.
+///
+/// Deux nombres, donc, et le nom de la clé qui les produit. Le remède est
+/// nommé lui aussi : `batch_match_artist_mbids` existe déjà et tourne dans
+/// `POST /system/enrich` comme dans `POST /system/enrichment/run` — il
+/// n'accepte un appariement par le nom qu'au-dessus d'un score MusicBrainz de
+/// 90 (`metadata::matcher::lookup_artist`), précisément parce qu'un mauvais
+/// MBID rattacherait une biographie étrangère.
+///
+/// ⚠ À ne pas confondre avec `bio_last_run.artists.sans_source`, qui compte
+/// les artistes que les sources LOCALES ne peuvent pas servir (ni MBID ni clé
+/// Last.fm). Poser une clé Last.fm remet celui-là à zéro et ne change rien à
+/// celui-ci.
+fn fonds_communautaire(artist_repo: &ArtistRepo) -> Value {
+    let hors = artist_repo.hors_fonds_communautaire().unwrap_or_default();
+    json!({
+        "cle": "musicbrainz_id",
+        "bios_non_partagees": hors.bios_non_partagees,
+        "artistes_non_servis": hors.artistes_non_servis,
+        "remede": "artist_mbid_matching",
+    })
+}
+
+// ---------------------------------------------------------------------------
 // POST /system/enrich-bios — bio enrichment
 // ---------------------------------------------------------------------------
 
@@ -149,6 +202,9 @@ pub(super) async fn enrich_bios(
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let without_artist_bio = artist_repo.list_without_bio().unwrap_or_default().len();
     let without_album_bio = album_repo.list_without_bio().unwrap_or_default().len();
+    // Le compte est pris AVANT que les passes soient lancées : il décrit la
+    // bibliothèque telle que l'utilisateur vient de la soumettre.
+    let hors_fonds = fonds_communautaire(&artist_repo);
 
     // One task registered for both bio passes; it clears when the last of the
     // two spawned futures drops its Arc clone of the guard.
@@ -178,6 +234,11 @@ pub(super) async fn enrich_bios(
             "artists_without_bio": without_artist_bio,
             "albums_without_bio": without_album_bio,
             "premium": is_premium,
+            // #2258 — une part de `artists_without_bio` ne peut RIEN attendre
+            // du fonds communautaire, faute de MBID. Le dire ici, dans la
+            // réponse même du bouton, plutôt que de laisser l'utilisateur
+            // conclure d'un écran vide.
+            "fonds_communautaire": hors_fonds,
         })),
     )
 }
@@ -201,7 +262,7 @@ pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> i
                 "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL AND source = 'local'",
                 &[],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first()?.as_i64()?;
@@ -271,7 +332,15 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
     let total_artists = artist_repo.count().unwrap_or(0);
     let total_albums = album_repo.count().unwrap_or(0);
 
-    // Artists with bios
+    // Artists with bios — par soustraction, ce chiffre ne vaut que ce que vaut
+    // la requête retranchée.
+    //
+    // `list_without_bio` exigeait un identifiant MusicBrainz non vide : tout
+    // artiste sans MBID sortait de `v` et se retrouvait donc compté ICI, du
+    // côté des artistes « pourvus d'une biographie ». Avec 0,9 % de couverture
+    // MBID mesurée sur une bibliothèque réelle, le panneau annonçait ~99 % de
+    // biographies devant des fiches vides (#1311). La requête ne filtre plus
+    // sur le MBID ; ce calcul devient exact sans changer de forme.
     let artists_with_bio = artist_repo
         .list_without_bio()
         .map(|v| total_artists - v.len() as i64)
@@ -324,6 +393,22 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
     // Last enrichment run timestamp
     let last_run = settings.get("enrichment_last_run").ok().flatten();
 
+    // Le bilan des deux passes de biographies (#1311).
+    //
+    // `bio_batch` rangeait déjà ces deux clés à la fin de chaque passe, et
+    // **personne ne les relisait** : une recherche de `artist_bio_enrich_result`
+    // dans tout le dépôt ne rendait que la ligne de l'écriture. Le serveur
+    // savait donc dire pourquoi une passe était rentrée à vide, et ne le disait
+    // à personne — c'est le vrai défaut derrière « les bios ne sont pas
+    // disponibles » : pas un décompte faux, une absence de retour.
+    //
+    // Les voici, sous une clé qui leur est propre pour ne rien déplacer de ce
+    // que `stats` promet déjà.
+    let bio_last_run = json!({
+        "artists": bilan_bio(&settings, "artist_bio_enrich_result"),
+        "albums": bilan_bio(&settings, "album_bio_enrich_result"),
+    });
+
     Json(json!({
         "premium": is_premium,
         "daily_used": daily_used,
@@ -339,7 +424,29 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
             "albums_with_bio": albums_with_bio,
         },
         "last_run": last_run,
+        "bio_last_run": bio_last_run,
+        // #2258 — la part de la bibliothèque que la clé du fonds
+        // communautaire écarte, des deux côtés. Sous une clé propre : ce n'est
+        // pas un décompte de bibliothèque comme ceux de `stats`, c'est la
+        // mesure d'une exclusion et le nom de sa cause.
+        "fonds_communautaire": fonds_communautaire(&artist_repo),
     }))
+}
+
+/// Le bilan de la dernière passe de biographies rangé sous `cle`, tel que
+/// `tune_core::metadata::bio_batch::bilan_de_passe` l'a écrit.
+///
+/// Rend `null` quand la clé est absente (aucune passe n'a encore tourné) ou
+/// quand sa valeur n'est pas du JSON lisible : un bilan illisible ne doit pas
+/// faire tomber tout le panneau d'enrichissement, qui porte aussi les
+/// décomptes de la bibliothèque.
+fn bilan_bio(settings: &SettingsRepo, cle: &str) -> Value {
+    settings
+        .get(cle)
+        .ok()
+        .flatten()
+        .and_then(|brut| serde_json::from_str::<Value>(&brut).ok())
+        .unwrap_or(Value::Null)
 }
 
 /// Helper to produce a JSON null for the daily_limit field on Premium.
@@ -400,7 +507,11 @@ pub(super) struct EnrichmentRunBody {
 /// garde que le scan ciblé, mais en REFUS franc plutôt qu'en repli silencieux :
 /// ici un repli enrichirait toute la bibliothèque, exactement ce que
 /// l'utilisateur demandait d'éviter (#1660).
-fn resoudre_portee(
+///
+/// `pub(crate)` : `/library/enrich-all` — la route que le bouton
+/// « Enrichir les métadonnées » de `SettingsView.svelte` appelle réellement —
+/// valide son `path` avec CETTE fonction, pas une copie.
+pub(crate) fn resoudre_portee(
     state: &AppState,
     path: &str,
 ) -> Result<tune_core::metadata::enrich_scope::EnrichScope, (StatusCode, Json<Value>)> {
@@ -550,7 +661,7 @@ pub(super) async fn enrichment_run(
                 "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL AND source = 'local'",
                 &[],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first()?.as_i64()?;
@@ -693,7 +804,7 @@ fn merge_duplicate_albums(
     let dupe_rows = db.query_many(
         "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
         &[],
-    ).unwrap_or_default();
+    ).ou_defaut_journalise();
     let dupes: Vec<(String, String)> = dupe_rows
         .iter()
         .map(|r| {
@@ -736,9 +847,11 @@ fn merge_duplicate_albums(
             }
         }
     }
-    db.execute_batch(
-        "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
-    ).ok();
+    db.execute_batch(&format!(
+        "UPDATE albums SET track_count = {}",
+        tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
+    ))
+    .ok();
     Ok(deleted)
 }
 
@@ -756,7 +869,7 @@ fn cleanup_orphan_artwork(
          UNION SELECT image_path FROM artists WHERE image_path IS NOT NULL",
             &[],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &rows {
         if let Some(path) = r[0].as_string() {

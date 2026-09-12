@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use std::sync::Arc;
 use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
-use tune_core::db::zone_repo::ZoneRepo;
+use tune_core::db::zone_repo::{CreationDeZone, ZoneRepo};
 use tune_core::discovery::device::dedup_devices;
 use tune_core::discovery::renderer_identity::{
     Evidence, IdentityVerdict, RendererIdentity, compare_at_same_location,
@@ -45,6 +45,14 @@ pub fn router() -> Router<AppState> {
         // donne déjà la priorité au segment littéral, la ligne est ici pour
         // que la lecture le montre.
         .route("/ignored", get(list_ignored_devices))
+        // #3326 — lecteurs Sendspin vus sur le réseau. Route séparée, et non
+        // une entrée de plus dans `GET /devices` : ce que `GET /devices` liste
+        // est offert à la création de zone, et `POST /zones` accepte
+        // n'importe quel `output_device_id` sans vérifier le registre des
+        // sorties (`routes/zones/ecriture.rs`). Y verser un appareil qui ne
+        // joue pas encore fabriquerait une zone muette — le contraire de ce
+        // que la phase 1 doit livrer.
+        .route("/sendspin", get(list_sendspin_players))
         .route(
             "/{device_id}/ignore",
             post(ignore_device).delete(unignore_device),
@@ -65,7 +73,54 @@ async fn device_catalog() -> Json<Value> {
     Json(json!(tune_core::device_catalog::catalog()))
 }
 
+/// `GET /devices/sendspin` — les lecteurs Sendspin vus sur le réseau (#3326).
+///
+/// Phase 1 du chantier : Tune sait les VOIR, pas encore leur envoyer de son.
+/// Chaque entrée le dit explicitement (`playable: false` et un motif), et
+/// `supported` en tête de la charge utile le dit pour la liste entière — un
+/// client n'a donc pas à déduire d'un tableau vide qu'il ne se passe rien.
+async fn list_sendspin_players(State(state): State<AppState>) -> Json<Value> {
+    let players = state.discovered_sendspin_players().await;
+    // #3326 S2-a — les pairs qui ont mené une poignée de main Noise jusqu'au
+    // bout, avec ce qu'ils ont dit d'eux dans leur `client/hello`. C'est une
+    // liste DIFFÉRENTE de `players` : celle-ci vient du réseau (mDNS), celle-là
+    // du protocole. Un pair peut figurer dans l'une sans l'autre — une enceinte
+    // qui compose vers nous n'a aucune raison de s'annoncer en mDNS.
+    let pairs = tune_core::sendspin::registre::decrire();
+    Json(json!({
+        "service": tune_core::discovery::sendspin::SERVICE_LECTEUR,
+        "server_service": tune_core::discovery::sendspin::SERVICE_SERVEUR,
+        "server_path": tune_core::sendspin::CHEMIN_POINT_D_ACCES,
+        "server_id": tune_core::sendspin::identite_du_serveur().id(),
+        // S2-a monte le tuyau chiffré ; elle ne joue rien. Tant que c'est faux,
+        // aucune zone Sendspin ne doit naître de cette liste.
+        "playback_supported": false,
+        "reason": tune_core::discovery::sendspin::MOTIF_PHASE_DECOUVERTE,
+        // #3326 — le MODE DE TRANSITION, publié ici pour qu'on puisse répondre
+        // à « ce serveur accepte-t-il du non chiffré ? » sans lire le code ni
+        // le journal. Le nom du réglage part avec l'état : sinon la réponse
+        // « oui » ne dit pas quoi changer.
+        "transition_mode": tune_core::sendspin::ModeTransition::en_vigueur().decrire(),
+        "count": players.len(),
+        "players": players,
+        "handshaked_count": pairs.len(),
+        "handshaked": pairs,
+    }))
+}
+
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
+    let peripheriques = crate::routes::zones::canaux_des_peripheriques_locaux();
+    Json(json!(liste_des_appareils(&state, &peripheriques).await))
+}
+
+/// Le corps de `GET /devices` (et `/devices/list`), le parc audio local pris en
+/// paramètre.
+///
+/// Même découpe que `zones::output_capabilities` / `output_capabilities_avec`
+/// (#3322) : le handler va chercher le parc réel, cette fonction ne fait que
+/// s'en servir. Un témoin peut donc l'appeler avec un parc connu, sans dépendre
+/// de la carte son de la machine qui exécute les tests.
+pub async fn liste_des_appareils(state: &AppState, peripheriques: &[(String, u16)]) -> Vec<Value> {
     let scanner = &state.scanner;
     let discovered = scanner.devices().await;
 
@@ -85,7 +140,59 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
     // cessent d'être PROPOSÉS.
     retirer_appareils_ignores(&mut items, &state.backend);
 
-    Json(json!(items))
+    // #3322 — DERNIÈRE étape, après les retraits : ce qui sort d'ici est
+    // exactement ce que le client reçoit.
+    enrichir_les_dispositions_de_canaux(&mut items, peripheriques);
+    items
+}
+
+/// #3322 — `GET /devices` publiait les capacités BRUTES du registre.
+///
+/// `GET /zones` et `GET /zones/{id}` complètent `channel_layouts` depuis le
+/// parc audio énuméré (`zones::output_capabilities_avec`) ; `GET /devices`
+/// non. Le MÊME appareil répondait donc deux choses selon la route empruntée,
+/// et c'est `GET /devices` que la grille « Appareils » du client interroge
+/// (`ZoneManagerView.svelte`, `api.getDevices()`).
+///
+/// Surtout : cette grille liste les appareils qu'AUCUNE zone n'utilise encore.
+/// Pour ceux-là `GET /zones` ne peut rien publier — il n'y a pas de zone. La
+/// route des zones ne pouvait donc pas couvrir le cas ; il fallait celle-ci.
+///
+/// La règle est celle des zones, à la lettre :
+///
+/// * une sortie qui déclare déjà ses dispositions garde les siennes ;
+/// * une sortie `local:` connue du parc reçoit celles que son appareil sait
+///   rendre, déduites de `AudioDevice::max_channels` ;
+/// * tout le reste garde `[]`, qui dit « on ne sait pas » et jamais
+///   « aucune » — un renderer réseau négocie ses canaux DANS le flux.
+///
+/// Une entrée sans contrat de capacités du tout (`output_capabilities` absent
+/// ou `null`) n'en reçoit pas un : déclarer des canaux sans dire ce que la
+/// sortie sait faire par ailleurs fabriquerait un contrat à moitié inventé.
+pub fn enrichir_les_dispositions_de_canaux(items: &mut [Value], peripheriques: &[(String, u16)]) {
+    for item in items.iter_mut() {
+        let deja_declarees = item
+            .pointer("/output_capabilities/channel_layouts")
+            .and_then(Value::as_array)
+            .is_some_and(|liste| !liste.is_empty());
+        if deja_declarees {
+            continue;
+        }
+        let Some(device_id) = item.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let Some(dispositions) =
+            crate::routes::zones::dispositions_du_peripherique_local(&device_id, peripheriques)
+        else {
+            continue;
+        };
+        if let Some(capacites) = item
+            .get_mut("output_capabilities")
+            .and_then(Value::as_object_mut)
+        {
+            capacites.insert("channel_layouts".into(), json!(dispositions));
+        }
+    }
 }
 
 /// L'identité d'une entrée de `GET /devices`, telle qu'elle est sérialisée.
@@ -181,10 +288,13 @@ fn build_device_list(
     all_output_info: &[Value],
 ) -> Vec<Value> {
     // Même dédoublonnage que POST /devices/scan : un appareil qui s'annonce
-    // sous plusieurs identités (mDNS + SSDP, cf. #1880) est regroupé par hôte,
-    // les identités secondaires rabattues dans capabilities["alternatives"].
+    // sous plusieurs identités (mDNS + SSDP, cf. #1880) est regroupé, les
+    // identités secondaires rabattues dans capabilities["alternatives"].
     // Sans ce repli, GET /devices renvoyait chaque identité comme une entrée
     // distincte et la barre latérale affichait l'appareil en double (#2452).
+    // Le regroupement se fait sur l'identité annoncée (stable_id), à défaut
+    // sur (hôte, nom) — et NON sur l'hôte seul, qui ramenait à une seule
+    // entrée les dix platines annoncées par un même serveur Lyrion (#2942).
     let deduped = dedup_devices(discovered);
 
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -343,6 +453,13 @@ fn forget_manual_device(state: &AppState, device_id: &str) {
     }
 }
 
+/// Zone d'un appareil que l'utilisateur a ajouté **à la main**
+/// (`POST /devices/add`, puis sa ré-inscription au démarrage).
+///
+/// #3529 : ce chemin n'est volontairement PAS soumis à « Créer automatiquement
+/// les zones ». Le geste de l'utilisateur vaut consentement, et le réglage ne
+/// porte que sur ce qui se crée tout seul. Le re-sondage des DLNA mémorisés,
+/// lui, se crée tout seul : il passe par [`ensure_zone_automatique`].
 fn ensure_zone(state: &AppState, name: &str, type_str: &str, device_id: &str) -> Option<i64> {
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     match zone_repo.get_or_create(name, Some(type_str), device_id) {
@@ -351,6 +468,34 @@ fn ensure_zone(state: &AppState, name: &str, type_str: &str, device_id: &str) ->
                 let _ = zone_repo.set_online_by_device(device_id, true);
             }
             Some(zid)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Zone d'un appareil retrouvé **tout seul** par le re-sondage des DLNA
+/// mémorisés (`reprobe_dlna_with_backoff` → `register_discovered_dlna`).
+///
+/// #3529 — ce chemin tourne à chaque démarrage, avec réessais, sans aucun
+/// geste de l'utilisateur : il est soumis au réglage. Une zone déjà connue est
+/// remise en ligne comme avant ; seule la naissance est refusée.
+fn ensure_zone_automatique(
+    state: &AppState,
+    name: &str,
+    type_str: &str,
+    device_id: &str,
+    origine: &str,
+) -> Option<i64> {
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+    match zone_repo.get_or_create_si_autorise(name, Some(type_str), device_id, origine) {
+        Ok(CreationDeZone::Creee(zid)) => Some(zid),
+        Ok(CreationDeZone::Existante(zid)) => {
+            let _ = zone_repo.set_online_by_device(device_id, true);
+            Some(zid)
+        }
+        Ok(CreationDeZone::Refusee) => {
+            info!(name = %name, device_id = %device_id, "discovered_dlna_zone_auto_create_disabled_skipping");
+            None
         }
         Err(_) => None,
     }
@@ -459,7 +604,19 @@ pub async fn register_manual_device(
                 format!("{base}{rc}"),
                 cm_url,
             )
-            .with_play_delay(delay);
+            .with_play_delay(delay)
+            .with_upnp_events(
+                crate::startup::create_oh_listener().await,
+                crate::discovery_setup::urls_evenements_dlna(
+                    &dev.host,
+                    dev.port,
+                    &desc.event_sub_urls(),
+                ),
+            )
+            .with_upnp_silence(crate::config::resolve_upnp_silence(
+                &state.backend,
+                &device_id,
+            ));
             state.outputs.lock().await.register(Box::new(dlna));
 
             let zone_id = ensure_zone(state, &device_name, "dlna", &device_id);
@@ -1015,11 +1172,19 @@ async fn register_discovered_dlna(
         format!("{base}{rc}"),
         cm_url,
     )
-    .with_play_delay(delay);
+    .with_play_delay(delay)
+    .with_upnp_events(
+        crate::startup::create_oh_listener().await,
+        crate::discovery_setup::urls_evenements_dlna(&dev.host, dev.port, &desc.event_sub_urls()),
+    )
+    .with_upnp_silence(crate::config::resolve_upnp_silence(
+        &state.backend,
+        &dev.uuid,
+    ));
     // Registry is keyed by device_id (the uuid): a later multicast discovery
     // replaces this entry rather than duplicating it.
     state.outputs.lock().await.register(Box::new(dlna));
-    let _ = ensure_zone(state, &device_name, "dlna", &dev.uuid);
+    let _ = ensure_zone_automatique(state, &device_name, "dlna", &dev.uuid, "discovered_dlna");
     // Drive auto_resume: it waits on `device.reconnected` to resume a zone that
     // was playing before the restart — the multicast path may never fire for a
     // lazy SSDP responder, which is the whole point of #1126.
@@ -1159,7 +1324,16 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
                         format!("{base}{rc}"),
                         cm_url,
                     )
-                    .with_play_delay(delay);
+                    .with_play_delay(delay)
+                    .with_upnp_events(
+                        crate::startup::create_oh_listener().await,
+                        crate::discovery_setup::urls_evenements_dlna(
+                            &d.host,
+                            d.port,
+                            &desc.event_sub_urls(),
+                        ),
+                    )
+                    .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &d.id));
                     outputs.register(Box::new(dlna));
                     registered += 1;
                 }
@@ -1335,12 +1509,81 @@ async fn device_status(
     };
     let output = output.lock().await;
     match output.get_status().await {
-        Ok(status) => Json(json!(status)).into_response(),
+        Ok(status) => {
+            let mut corps = json!(status);
+            // #2263 — d'où vient ce qu'on vient de rendre. Une position
+            // extrapolée a exactement la même forme qu'une position mesurée :
+            // sans ce champ, rien ne distingue les deux, et le mode « silence
+            // UPnP » deviendrait précisément l'interrupteur muet qu'il ne doit
+            // pas être. Absent pour toute sortie qui n'est pas DLNA — additif.
+            if let Some(dlna) = output.as_any().downcast_ref::<DlnaOutput>()
+                && let Some(obj) = corps.as_object_mut()
+            {
+                obj.insert("upnp_events".into(), json!(dlna.etat_evenements().await));
+            }
+            Json(corps).into_response()
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }
 
 // --- Device buffer stats ---
+
+/// Les compteurs de sous-alimentation d'une sortie, tels qu'ELLE les a mesurés
+/// (#3205).
+///
+/// # Pourquoi ce n'est pas un `0` par défaut
+///
+/// Les deux routes `buffer-stats` publiaient `"total_underruns": 0` **écrit en
+/// dur**, sur toutes les sorties et en toutes circonstances. C'est le chiffre
+/// même dont #3205 fait dépendre le sort du noyau `PREEMPT_RT` de Tune OS :
+/// « si les xruns sont à zéro sur noyau standard, le noyau RT est un coût sans
+/// gain ». Un zéro fabriqué ne se distingue pas d'un zéro mesuré, et il rend
+/// donc la conclusion *automatique* — dans le sens du retrait, sans qu'aucune
+/// mesure ait eu lieu.
+///
+/// La règle est celle que `poller/famine_anneau_i3318.rs` s'était déjà donnée :
+/// une sortie sans anneau ne doit rien faire remonter du tout, **et surtout pas
+/// un zéro qui se lirait comme « mesuré, et sain »**. D'où :
+///
+/// * `null` — cette sortie n'observe pas sa famine. C'est le cas de tout
+///   renderer réseau : il reçoit un flux déjà encodé et n'a aucun anneau à
+///   affamer. `ring_starvation()` rend `None`, et c'est la valeur par défaut du
+///   trait, donc aussi celle de toute sortie hors-arbre ;
+/// * un nombre — il a été compté par le rappel temps réel de cette sortie.
+///   `0` y redevient une information : « mesuré, et rien n'a manqué ».
+///
+/// `total_disconnections` reste à `null` : aucun compteur de déconnexion
+/// n'existe dans l'arbre. Le mettre à `0` serait la même invention.
+fn compteurs_de_famine(famine: Option<tune_core::outputs::traits::OutputRingStarvation>) -> Value {
+    let Some(f) = famine else {
+        return json!({
+            "total_underruns": Value::Null,
+            "ring_starvation_missing_samples": Value::Null,
+            "driver_underruns": Value::Null,
+            "served_samples": Value::Null,
+            "stream_ms": Value::Null,
+        });
+    };
+    json!({
+        "total_underruns": f.events,
+        "ring_starvation_missing_samples": f.missing_samples,
+        // #3205 — le compteur qui décide du noyau RT. `total_underruns` garde
+        // son nom historique et son sens : la famine de l'ANNEAU. Celui-ci
+        // compte les fois où le PILOTE n'a pas été servi à temps, ce qu'aucun
+        // chiffre ne disait jusqu'ici.
+        "driver_underruns": f.driver_underruns,
+        "served_samples": f.served_samples,
+        "stream_ms": f.stream_ms,
+    })
+}
+
+/// Recopie les champs de [`compteurs_de_famine`] dans l'objet d'une sortie.
+fn poser_compteurs(cible: &mut serde_json::Map<String, Value>, famine: Value) {
+    if let Value::Object(champs) = famine {
+        cible.extend(champs);
+    }
+}
 
 fn buffer_settings_for(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
@@ -1366,15 +1609,16 @@ async fn all_buffer_stats(State(state): State<AppState>) -> Json<Value> {
         if let Some(output) = outputs.get(device_id) {
             let output = output.lock().await;
             let (buffer_s, auto) = buffer_settings_for(&state.backend, device_id);
-            stats.push(json!({
-                "device_id": device_id,
-                "device_name": output.name(),
-                "buffer_s": buffer_s,
-                "auto": auto,
-                "manual_override": !auto,
-                "total_disconnections": 0,
-                "total_underruns": 0,
-            }));
+            let mut ligne = serde_json::Map::new();
+            ligne.insert("device_id".into(), json!(device_id));
+            ligne.insert("device_name".into(), json!(output.name()));
+            ligne.insert("buffer_s".into(), json!(buffer_s));
+            ligne.insert("auto".into(), json!(auto));
+            ligne.insert("manual_override".into(), json!(!auto));
+            // #3205 — aucun compteur de déconnexion n'existe : `null`, pas `0`.
+            ligne.insert("total_disconnections".into(), Value::Null);
+            poser_compteurs(&mut ligne, compteurs_de_famine(output.ring_starvation()));
+            stats.push(Value::Object(ligne));
         }
     }
     Json(json!(stats))
@@ -1394,16 +1638,16 @@ async fn device_buffer_stats(
     };
     let output = output.lock().await;
     let (buffer_s, auto) = buffer_settings_for(&state.backend, &device_id);
-    Json(json!({
-        "device_id": device_id,
-        "device_name": output.name(),
-        "buffer_s": buffer_s,
-        "auto": auto,
-        "manual_override": !auto,
-        "total_disconnections": 0,
-        "total_underruns": 0,
-    }))
-    .into_response()
+    let mut corps = serde_json::Map::new();
+    corps.insert("device_id".into(), json!(device_id));
+    corps.insert("device_name".into(), json!(output.name()));
+    corps.insert("buffer_s".into(), json!(buffer_s));
+    corps.insert("auto".into(), json!(auto));
+    corps.insert("manual_override".into(), json!(!auto));
+    // #3205 — aucun compteur de déconnexion n'existe : `null`, pas `0`.
+    corps.insert("total_disconnections".into(), Value::Null);
+    poser_compteurs(&mut corps, compteurs_de_famine(output.ring_starvation()));
+    Json(Value::Object(corps)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -2385,6 +2629,77 @@ mod list_devices_dedup_tests {
         assert_eq!(
             items[0].get("registered").and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    /// Dix platines Squeezebox annoncées en renderers DLNA par le même serveur
+    /// Lyrion : chacune porte l'adresse du LMS, son propre nom et son propre
+    /// UDN (#2942, signalement de Sergio sur le fil forum 208).
+    fn platines_derriere_un_lms() -> Vec<DiscoveredDevice> {
+        const PIECES: [&str; 10] = [
+            "Salon", "Cuisine", "Chambre", "Bureau", "Cave", "Garage", "Terrasse", "Atelier",
+            "Couloir", "Grenier",
+        ];
+        PIECES
+            .iter()
+            .enumerate()
+            .map(|(n, piece)| {
+                let mut d = DiscoveredDevice::new(
+                    format!("dlna-uuid:lms-{n}"),
+                    format!("Squeezebox {piece}"),
+                    OutputType::Dlna,
+                    "192.168.1.10".into(),
+                    9000 + n as u16,
+                );
+                d.stable_id = Some(format!("uuid:lms-{n}"));
+                d
+            })
+            .collect()
+    }
+
+    #[test]
+    fn liste_garde_les_appareils_distincts_derriere_une_meme_adresse() {
+        // #2942 — GET /devices n'en renvoyait qu'UNE : le repli groupait sur
+        // l'adresse seule. Le fait mesuré est le nombre d'entrées rendues.
+        let mut devices = platines_derriere_un_lms();
+        // TÉMOIN, vert des deux côtés : le Marantz sous ses deux identités
+        // reste UNE entrée — c'est ce que #1880/#2452 exigent.
+        devices.extend(marantz_deux_identites());
+
+        let items = build_device_list(devices, &std::collections::HashSet::new(), &[]);
+
+        assert_eq!(
+            items.len(),
+            11,
+            "dix platines + un Marantz replié = 11 entrées, obtenu : {:?}",
+            items
+                .iter()
+                .map(|i| i.get("name").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        );
+        let platines: Vec<&str> = items
+            .iter()
+            .filter(|i| i.get("host").and_then(Value::as_str) == Some("192.168.1.10"))
+            .filter_map(|i| i.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            platines.len(),
+            10,
+            "les dix platines doivent être listées, obtenu : {platines:?}"
+        );
+        // TÉMOIN : une seule entrée pour le Marantz, l'identité UPnP en primaire.
+        let marantz: Vec<&Value> = items
+            .iter()
+            .filter(|i| i.get("host").and_then(Value::as_str) == Some("192.168.1.50"))
+            .collect();
+        assert_eq!(
+            marantz.len(),
+            1,
+            "les deux identités d'un même appareil restent UNE entrée, obtenu : {marantz:?}"
+        );
+        assert_eq!(
+            marantz[0].get("id").and_then(Value::as_str),
+            Some("uuid:56fcb4ae-8f52-4a80-9d1c-000000000000")
         );
     }
 

@@ -231,3 +231,151 @@ fn find_lib(root: &Path, name: &str) -> Option<PathBuf> {
     }
     None
 }
+
+/// Gardes de la chaîne de SIGNATURE macOS (#1641).
+///
+/// Ce module ne teste pas du code Rust : il teste le workflow qui produit les
+/// binaires macOS. C'est délibéré, et c'est ici que ça a sa place — `ensure_loaded`
+/// est la ligne exacte que la validation de bibliothèque faisait échouer.
+///
+/// Ce qui s'est passé : tune-server est signé « Developer ID » avec runtime
+/// durci (`codesign --options runtime`), ce qui active la VALIDATION DE
+/// BIBLIOTHÈQUE. Le processus ne charge plus alors que des dylibs de sa propre
+/// Team ID. Or `ort::init_from` fait un `dlopen` sur la `libonnxruntime.dylib`
+/// officielle de Microsoft, signée « adhoc, linker-signed », SANS Team ID. Le
+/// noyau refusait :
+///
+/// ```text
+/// code signature in <…> 'libonnxruntime.1.21.0.dylib' not valid for use in
+/// process: mapping process and mapped file (non-platform) have different Team IDs
+/// ```
+///
+/// Le moteur CLAP était bien DANS le binaire publié — vérifié par marqueurs sur
+/// les six cibles de la v0.9.121 — mais il ne pouvait pas charger son runtime.
+/// La jauge restait à 0 % sur tout macOS, sans exception, depuis toujours.
+///
+/// Deux chemins macOS signent ce même binaire : le tarball (`package/tune-server`)
+/// et le .app du DMG (`Contents/Resources/tune-server`). Les deux étaient nus.
+/// C'est exactement le motif « un chemin corrigé, les autres nus » — d'où ces
+/// gardes, qui couvrent les DEUX.
+#[cfg(test)]
+mod signature_macos_tests {
+    /// Le workflow de publication, lu à la compilation. Une modification qui
+    /// retirerait la permission casse le test AVANT de partir en release.
+    const RELEASE_YML: &str = include_str!("../../../.github/workflows/release.yml");
+    /// Le fichier de permissions lui-même.
+    const DROITS: &str = include_str!("../../../packaging/macos/tune-server.entitlements");
+    /// La permission sans laquelle rien de tout cela ne charge.
+    const CLE: &str = "com.apple.security.cs.disable-library-validation";
+
+    /// Le fichier de permissions existe et porte la clé. `include_str!` fait
+    /// déjà la moitié du travail : si le fichier disparaît, ça ne compile plus.
+    #[test]
+    fn le_fichier_de_permissions_porte_la_cle() {
+        assert!(
+            DROITS.contains(CLE),
+            "packaging/macos/tune-server.entitlements ne contient pas {CLE} — \
+             sans cette clé le runtime durci refuse le dlopen de libonnxruntime.dylib (#1641)"
+        );
+    }
+
+    /// AUCUN commentaire XML dans ce plist.
+    ///
+    /// Mesuré, pas supposé. Un commentaire XML qui contient `--` est illégal en
+    /// XML, et le lecteur de plist d'AMFI — celui qu'appelle
+    /// `codesign --entitlements` — refuse alors le FICHIER ENTIER :
+    ///
+    /// ```text
+    /// Failed to parse entitlements: AMFIUnserializeXML: syntax error near line 5
+    /// codesign sort avec le code 1, le binaire garde sa signature précédente
+    /// ```
+    ///
+    /// Or toute prose technique sur ce sujet contient `--` : `--options
+    /// runtime`, `--entitlements`, `--sign`. La première version de ce
+    /// correctif documentait la clé dans le plist et s'est fait rejeter ainsi.
+    /// L'échec est bruyant (code 1, donc le job de publication tombe), mais il
+    /// tombe AU MILIEU d'un train de publication, ce qui est le pire moment.
+    ///
+    /// La règle « aucun commentaire » est plus stricte que « pas de `--` dans
+    /// un commentaire », et c'est voulu : elle est vérifiable d'un coup d'œil,
+    /// et l'explication a déjà deux foyers, ici et dans release.yml.
+    #[test]
+    fn le_fichier_de_permissions_ne_contient_aucun_commentaire_xml() {
+        assert!(
+            !DROITS.contains("<!--"),
+            "packaging/macos/tune-server.entitlements contient un commentaire XML : \
+             dès qu'il portera un `--` (et toute prose sur codesign en porte), AMFI refusera \
+             le fichier entier (« AMFIUnserializeXML: syntax error »), codesign sortira en \
+             erreur et le train de publication tombera en plein vol (#1641). Documenter dans \
+             release.yml et dans ce module, pas dans le plist."
+        );
+    }
+
+    /// Chemin 1 — le tarball macOS (celui qu'installe Homebrew). Il est signé
+    /// par la fonction `sign_horodate`, dont le TROISIÈME argument est le
+    /// fichier de permissions. Passer une chaîne vide là, comme pour ffmpeg,
+    /// reproduirait le défaut à l'identique.
+    #[test]
+    fn le_tarball_est_signe_avec_les_permissions() {
+        let attendu = "sign_horodate package/tune-server fr.mozaiklabs.tune-server \"$DROITS\"";
+        assert!(
+            RELEASE_YML.contains(attendu),
+            "release.yml ne signe plus package/tune-server avec le fichier de permissions \
+             (attendu : `{attendu}`) — l'analyse acoustique retomberait à 0 % sur macOS (#1641)"
+        );
+    }
+
+    /// Chemin 2 — le binaire imbriqué dans le .app du DMG. Toute ligne
+    /// `codesign` qui signe un `tune-server` en runtime durci doit porter
+    /// `--entitlements`. La règle est écrite sur la FORME de la ligne, pas sur
+    /// son texte exact, pour qu'un second chemin ajouté demain y tombe aussi.
+    #[test]
+    fn tout_codesign_de_tune_server_en_runtime_durci_porte_les_permissions() {
+        let mut vues = 0usize;
+        for ligne in RELEASE_YML.lines() {
+            let l = ligne.trim();
+            if !l.starts_with("codesign ") || !l.contains("--options runtime") {
+                continue;
+            }
+            // Seules les lignes qui visent un tune-server nommément. Celles de
+            // `sign_horodate` visent `"$cible"` et sont couvertes par le test
+            // ci-dessus ; ffmpeg et airplay-daemon n'ont pas besoin de la
+            // permission, ils ne chargent aucune dylib tierce.
+            if !l.contains("tune-server\"") && !l.contains("tune-server ") {
+                continue;
+            }
+            vues += 1;
+            assert!(
+                l.contains("--entitlements"),
+                "release.yml signe un tune-server en runtime durci SANS --entitlements — \
+                 le dlopen de libonnxruntime.dylib sera refusé (#1641) : {l}"
+            );
+        }
+        assert!(
+            vues >= 1,
+            "aucune ligne `codesign … --options runtime … tune-server` trouvée dans \
+             release.yml : la garde #1641 ne surveille plus rien, elle a été contournée \
+             par une réécriture du workflow"
+        );
+    }
+
+    /// La garde ne vaut que si elle relit la signature PRODUITE. Une commande
+    /// bien écrite qui échoue en silence repartirait pour un train entier.
+    /// Les deux chemins doivent donc vérifier leur propre sortie.
+    #[test]
+    fn les_deux_chemins_relisent_la_signature_produite() {
+        let verifs = RELEASE_YML
+            .lines()
+            .filter(|l| l.contains("codesign -d --entitlements - --xml"))
+            .count();
+        assert!(
+            verifs >= 2,
+            "release.yml ne relit plus la signature produite sur les DEUX chemins macOS \
+             (tarball et .app) : {verifs} vérification(s) trouvée(s), 2 attendues (#1641)"
+        );
+        assert!(
+            RELEASE_YML.matches(CLE).count() >= 2,
+            "release.yml ne cherche plus {CLE} dans les signatures produites (#1641)"
+        );
+    }
+}

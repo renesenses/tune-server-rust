@@ -45,6 +45,30 @@ jobs:
     timeout-minutes: 20  # Build Web Client — <1 min
     steps:
       - uses: actions/checkout@v4
+      # Symetrique de « Verify web-client version matches release tag », plus
+      # bas. Le client web avait sa garde ; le SERVEUR n'en avait aucune.
+      # Vecu sur la v0.9.128 : le tag a ete pose alors que Cargo.toml declarait
+      # encore 0.9.127. Les artefacts sont partis, et le binaire repond DEUX
+      # versions selon qui demande — `tune_core::version()` lit TUNE_VERSION
+      # (pose depuis le tag) et dit 0.9.128, tandis que tout `env!(
+      # "CARGO_PKG_VERSION")` dit 0.9.127 : `tune-server --version`,
+      # `routes/mediasync.rs` (`server_version`) et les trois greffons. Un
+      # testeur annonce alors une version qu'il n'execute pas.
+      - name: Verify workspace version matches release tag
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          # Meme regle que pour le client : on compare la base X.Y.Z, le
+          # suffixe -rcN vit sur le tag git seul.
+          TAG_BASE="${TAG_VERSION%%-*}"
+          WS_VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+          [ -n "$WS_VERSION" ] || { echo "::error::version introuvable dans [workspace.package] de Cargo.toml"; exit 1; }
+          if [ "$TAG_BASE" != "$WS_VERSION" ]; then
+            echo "::error::Cargo.toml [workspace.package] declare $WS_VERSION alors que le tag vaut $TAG_BASE."
+            echo "::error::Commiter le bump du workspace AVANT de taguer, puis relancer cette release."
+            exit 1
+          fi
+          echo "workspace version $WS_VERSION == base du tag $TAG_BASE"
       - name: Lire le SHA web du manifeste
         id: web
         shell: bash
@@ -100,12 +124,44 @@ jobs:
             os: ubuntu-22.04
             platform: linux-x86_64
             ext: tar.gz
+          # Les deux cibles ARM sont construites par `cross`, dans un
+          # conteneur qui ne portait pas les en-tetes ALSA de la CIBLE : elles
+          # ont longtemps ete livrees SANS `local-audio`, contrairement aux
+          # lignes natives Linux/Windows/macOS plus bas.
+          #
+          # `aarch64-unknown-linux-gnu` est REPAREE depuis la v0.9.143 :
+          # Cross.toml installe `libasound2-dev:$CROSS_DEB_ARCH` (#3620), et sa
+          # ligne `features:` reprend donc `local-audio`. L'etape « Verify
+          # local-audio is compiled into the ARM binary » plus bas la tient.
+          #
+          # `aarch64-unknown-linux-musl` reste SANS `local-audio`, et ce n'est
+          # pas un oubli : `alsa-sys` code le lien DYNAMIQUE en dur dans son
+          # `build.rs` (`pkg_config…statik(false)`), ce qu'une cible musl
+          # statique refuse par construction. Residu ouvert : #3621.
+          #
+          # Mesure sur les archives PUBLIEES,
+          # `readelf -d tune-server | grep -c 'libasound\.so'` :
+          #
+          #   cible                v0.9.140   v0.9.141   v0.9.143
+          #   linux-x86_64                1          1          1
+          #   linux-aarch64               0          0          1   <- #3620
+          #   linux-aarch64-musl          0          0          0   <- #3621
+          #
+          # Toute AUTRE fonctionnalite du `default` de tune-server doit
+          # figurer dans chaque `features:` ci-dessous et dans chaque ligne
+          # `cargo build` qui passe `--no-default-features` : c'est
+          # `cloud-relay` qui manquait partout jusqu'a la v0.9.141, et rien
+          # n'a rougi. La garde
+          # `toute_feature_par_defaut_est_livree_par_toute_ligne_de_build_de_release`
+          # (tune-server/tests/features_livrees_3355.rs) lit ce fichier et
+          # refuse desormais un nouvel oubli ; les deux exceptions ARM
+          # ci-dessus y sont inscrites avec leur raison.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
             platform: linux-aarch64
             ext: tar.gz
             cross: true
-            features: oaat,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+            features: oaat,cloud-relay,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -115,7 +171,7 @@ jobs:
             platform: linux-aarch64-musl
             ext: tar.gz
             cross: true
-            features: oaat,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+            features: oaat,cloud-relay,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -199,6 +255,33 @@ jobs:
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
 
+      # Garde-fou #3613 : la sortie audio LOCALE doit être DANS le binaire ARM
+      # livré, pas seulement dans la ligne de build.
+      #
+      # C'est la leçon de #3355 : la garde qui existait lisait ce qu'on LINTE,
+      # pas ce qu'on EXPÉDIE. Les archives ARM sont parties sans `cpal` depuis
+      # le 20/05/2026 — `strings tune-server | grep -c cpal` rend 175 sur
+      # linux-x86_64 et 0 sur linux-aarch64 en v0.9.141 — alors que l'image
+      # Tune OS du Raspberry Pi installe EXACTEMENT cette archive.
+      #
+      # On lit l'ELF, pas la configuration. `alsa-sys` lie ALSA en DYNAMIQUE
+      # (`pkg_config…statik(false)`, codé en dur dans son `build.rs`) : un
+      # binaire qui porte réellement cpal déclare donc `libasound.so.2` en
+      # NEEDED. `readelf` est indépendant de l'architecture — il lit l'ELF
+      # arm64 depuis un runner x86_64, contrairement à `ldd`.
+      - name: Verify local-audio is compiled into the ARM binary
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/tune-server"
+          NEEDED="$(readelf -d "$BIN" 2>/dev/null | grep -c 'libasound\.so' || true)"
+          if [ "${NEEDED:-0}" -eq 0 ]; then
+            echo "::error::Le binaire linux-aarch64 ne lie pas ALSA : la sortie audio locale est ABSENTE de l'artefact publié (#3613)."
+            readelf -d "$BIN" || true
+            exit 1
+          fi
+          echo "libasound.so déclaré en NEEDED : la sortie locale est bien dans l'artefact."
+
       # Garde-fou #1288 : la cible musl n'a d'intérêt que si le binaire est
       # RÉELLEMENT statique (NAS à vieille userland, Alpine ARM). Une dépendance
       # native qui repasse en lien dynamique — comme libopus l'a fait en v0.9.53,
@@ -256,7 +339,7 @@ jobs:
 
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -269,12 +352,90 @@ jobs:
 
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
+      # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
+      # pas seulement dans la ligne `--features` qui l'a construit.
+      #
+      # `cloud-relay` est une fonctionnalite `default` de tune-server, et
+      # TOUTES les lignes de build ci-dessus sauf macOS passent
+      # `--no-default-features` : elle a donc disparu de tous les artefacts
+      # Linux et Windows livres jusqu'a la v0.9.141 sans qu'aucune porte ne
+      # rougisse. macOS ne l'a jamais perdue — c'est la seule ligne SANS
+      # `--no-default-features`, et cet ecart est precisement ce qui a cache le
+      # defaut. Contre-epreuve sur les archives PUBLIEES, marqueur
+      # `relay connection closed gracefully` :
+      #
+      #   cible                v0.9.140   v0.9.141
+      #   linux-x86_64                0          1
+      #   linux-aarch64               0          1
+      #   linux-aarch64-musl          0          1
+      #   windows-x86_64              0          1
+      #   macos-x86_64                1          1   <- jamais perdue
+      #   macos-aarch64               1          1   <- jamais perdue
+      #
+      # Contrairement a `local-audio`, `cloud-relay` ne lie AUCUNE bibliotheque
+      # systeme : `cloud-relay = ["dep:tokio-tungstenite"]`, avec
+      # `rustls-tls-webpki-roots`, donc tout est en Rust et le `readelf -d` de
+      # l'etape ALSA plus haut ne peut rien voir ici. Le seul temoin possible
+      # est une chaine de code.
+      #
+      # On cherche donc les octets EXACTS dans le fichier, sans passer par
+      # `strings | grep` :
+      #   - `strings` DECOUPE, et pas de la meme facon selon la cible. Mesure
+      #     sur l'artefact publie v0.9.143 : le marqueur
+      #     `wss://bridge.mozaiklabs.fr/ws/server` rend 0 sur macos-x86_64
+      #     alors que le code est bien la (`wss://` y est materialise a part),
+      #     contre 2 sur macos-aarch64. Une garde batie sur `strings` rougirait
+      #     au hasard de la cible ;
+      #   - `python3` est present sur les trois familles de runners et lit les
+      #     memes octets partout, y compris un ELF arm64 depuis un runner
+      #     x86_64 — comme `readelf`, et contrairement a `ldd`.
+      #
+      # Les deux marqueurs valent plus de 16 octets et n'existent QUE sous
+      # `cfg(feature = "cloud-relay")` : `tune-core/src/cloud/mod.rs` ne declare
+      # `pub mod relay` que sous cette fonctionnalite, et `spawn_relay_client`
+      # n'est appele que sous elle. On exige les DEUX : le premier prouve que le
+      # module est compile, le second qu'il est reellement BRANCHE au demarrage.
+      - name: Verify cloud-relay is compiled into the built binary
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/tune-server"
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN="$BIN.exe"; fi
+          PY=python3; command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" - "$BIN" <<'VERIF_CLOUD_RELAY'
+          import sys
+
+          chemin = sys.argv[1]
+          marqueurs = {
+              "tune-core/src/cloud/relay.rs": b"relay connection closed gracefully",
+              "tune-server/src/background.rs": b"cloud relay client spawned",
+          }
+          with open(chemin, "rb") as f:
+              octets = f.read()
+
+          manquants = []
+          for origine, marqueur in marqueurs.items():
+              vus = octets.count(marqueur)
+              print("%-34s %-34s %d" % (marqueur.decode(), origine, vus))
+              if vus == 0:
+                  manquants.append(origine)
+
+          if manquants:
+              print(
+                  "::error::cloud-relay est ABSENT de " + chemin + " : la ligne "
+                  "--features de cette cible ne le liste pas, ou "
+                  "--no-default-features l'a retire (#3355). Marqueurs "
+                  "introuvables : " + ", ".join(manquants)
+              )
+              sys.exit(1)
+
+          print("cloud-relay bien present dans " + chemin)
+          VERIF_CLOUD_RELAY
       # AirPlay 2 sender daemon (GPL, spawned as a subprocess) bundled next to
       # tune-server so AirPlay 2 works on native installs, not just Docker
       # (#700 / Bilou #1135). Built from a pinned rev of our fork.
@@ -376,12 +537,33 @@ jobs:
             # « A timestamp was expected but was not found ». C'est arrive sur
             # la v0.9.119 (x86_64-apple-darwin) : panne d'Apple, rien de local.
             # On reessaie donc, au lieu de perdre le train sur un aleas reseau.
+            # #1641 — permission de chargement de bibliothèque. Le runtime
+            # durci (`--options runtime`) active la validation de bibliothèque :
+            # tune-server ne peut alors charger QUE des dylibs de sa propre Team
+            # ID. L'analyse acoustique (CLAP) fait un `dlopen` sur la
+            # `libonnxruntime.dylib` de Microsoft, signée adhoc et SANS Team ID —
+            # le noyau la refusait, et la jauge restait à 0 % sur tout macOS.
+            # Le plist ne porte AUCUN commentaire XML. Un commentaire contenant
+            # deux tirets consecutifs est illegal en XML, et AMFI — le lecteur
+            # de plist qu'appelle « codesign --entitlements » — refuse alors le
+            # FICHIER ENTIER (« AMFIUnserializeXML: syntax error »), codesign
+            # sort en erreur, et ce job tombe en plein train de publication.
+            # Or toute prose sur ce sujet contient deux tirets consecutifs.
+            # L'explication vit donc ici et dans tune-core/src/audio/runtime.rs,
+            # jamais dans le plist. Un test la verrouille.
+            DROITS="$GITHUB_WORKSPACE/packaging/macos/tune-server.entitlements"
+            # Le troisième argument est le fichier de permissions, vide pour les
+            # binaires qui n'en ont pas besoin (ffmpeg, airplay-daemon).
             sign_horodate() {
-              local cible="$1" identifiant="$2" i
+              local cible="$1" identifiant="$2" droits="$3" i
               for i in 1 2 3 4 5; do
-                if codesign --force --options runtime --timestamp \
-                     --identifier "$identifiant" --sign "$IDENTITY" "$cible"; then
-                  return 0
+                if [ -n "$droits" ]; then
+                  codesign --force --options runtime --timestamp \
+                    --entitlements "$droits" \
+                    --identifier "$identifiant" --sign "$IDENTITY" "$cible" && return 0
+                else
+                  codesign --force --options runtime --timestamp \
+                    --identifier "$identifiant" --sign "$IDENTITY" "$cible" && return 0
                 fi
                 echo "::warning::codesign --timestamp a echoue sur $cible (essai $i/5) — nouvelle tentative dans $((i * 15)) s"
                 sleep $((i * 15))
@@ -389,14 +571,25 @@ jobs:
               echo "::error::codesign --timestamp a echoue 5 fois sur $cible — serveur d'horodatage Apple injoignable"
               return 1
             }
-            sign_horodate package/tune-server fr.mozaiklabs.tune-server
+            sign_horodate package/tune-server fr.mozaiklabs.tune-server "$DROITS"
             if [ -n "$DAEMON" ]; then
-              sign_horodate "package/$DAEMON" fr.mozaiklabs.airplay-daemon
+              sign_horodate "package/$DAEMON" fr.mozaiklabs.airplay-daemon ""
             fi
             if [ -f package/ffmpeg ]; then
-              sign_horodate package/ffmpeg fr.mozaiklabs.ffmpeg
+              sign_horodate package/ffmpeg fr.mozaiklabs.ffmpeg ""
             fi
             codesign --verify --strict --verbose=2 package/tune-server
+            # Garde #1641 : une signature qui « réussit » sans porter la
+            # permission repart pour un train entier de macOS sans analyse
+            # acoustique, et personne ne le voit avant le rapport d'un testeur.
+            # On relit donc la signature PRODUITE, pas la commande écrite.
+            if codesign -d --entitlements - --xml package/tune-server 2>/dev/null \
+                 | grep -q "com.apple.security.cs.disable-library-validation"; then
+              echo "OK — package/tune-server porte disable-library-validation (#1641)"
+            else
+              echo "::error::package/tune-server est signé en runtime durci SANS com.apple.security.cs.disable-library-validation — l'analyse acoustique (CLAP) ne pourra pas charger libonnxruntime.dylib sur macOS (#1641)."
+              exit 1
+            fi
           elif [ "$RUNNER_OS" = "macOS" ]; then
             echo "::warning::APPLE_TEAM_ID is unset — shipping an ad-hoc signed binary. macOS users will lose their Local Network grant on upgrade."
           fi
@@ -709,7 +902,12 @@ jobs:
           PLIST
           if [ -n "$APPLE_TEAM_ID" ]; then
             IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
-            codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
+            # #1641 — même permission que pour le tarball, et pour la même
+            # raison : sans elle le runtime durci refuse le `dlopen` de
+            # libonnxruntime.dylib et l'analyse acoustique reste à 0 %. Le .app
+            # était le SECOND chemin macOS, aussi nu que le premier.
+            DROITS="$GITHUB_WORKSPACE/packaging/macos/tune-server.entitlements"
+            codesign --force --options runtime --entitlements "$DROITS" --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
             # Sign the nested AirPlay 2 daemon BEFORE the outer .app (inside-out
             # signing) so the bundle stays valid and notarization does not reject
             # an unsigned executable.
@@ -720,6 +918,18 @@ jobs:
               codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/ffmpeg"
             fi
             codesign --force --options runtime --sign "$IDENTITY" "$APP"
+            # Garde #1641, jumelle de celle du tarball : on relit la signature
+            # produite sur le binaire IMBRIQUÉ, celui qui fera le `dlopen`.
+            # Signer le .app par-dessus ne resigne pas ce binaire, mais un
+            # `--force` mal placé le ferait — et la permission repartirait en
+            # silence.
+            if codesign -d --entitlements - --xml "$APP/Contents/Resources/tune-server" 2>/dev/null \
+                 | grep -q "com.apple.security.cs.disable-library-validation"; then
+              echo "OK — $APP/Contents/Resources/tune-server porte disable-library-validation (#1641)"
+            else
+              echo "::error::Le tune-server du .app est signé en runtime durci SANS com.apple.security.cs.disable-library-validation — l'analyse acoustique (CLAP) ne pourra pas charger libonnxruntime.dylib (#1641)."
+              exit 1
+            fi
           fi
           DMG_DIR="dmg-staging"
           mkdir -p "$DMG_DIR"
@@ -790,10 +1000,19 @@ jobs:
             echo "::warning::moins de 15 Gi libres avant hdiutil — la creation du DMG risque d'echouer"
             df -h /
           fi
+          # v0.9.136 : deux echecs identiques « No space left on device » — non pas
+          # sur le disque du runner (104 Gi libres) mais DANS l'image temporaire
+          # que `hdiutil create -srcfolder` dimensionne lui-meme, trop juste pour
+          # le .app (`could not access /Volumes/Tune Server/…/tune-server`).
+          # On lui donne la taille : le contenu mesure, plus moitie, plus 64 Mo.
+          # UDZO recomprime ensuite, la taille finale du .dmg ne change pas.
+          taille_ko=$(du -sk "$DMG_DIR" | awk '{print $1}')
+          taille_mo=$(( taille_ko / 1024 * 3 / 2 + 64 ))
+          echo "Contenu du DMG : $(( taille_ko / 1024 )) Mo — image temporaire de ${taille_mo} Mo"
           dmg_cree=""
           for i in 1 2 3; do
             sleep 10
-            if hdiutil create -volname "Tune Server" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG_NAME"; then
+            if hdiutil create -volname "Tune Server" -srcfolder "$DMG_DIR" -size "${taille_mo}m" -ov -format UDZO "$DMG_NAME"; then
               dmg_cree="oui"
               break
             fi
@@ -1262,6 +1481,18 @@ jobs:
   stage-docker:
     name: Stage Docker image
     needs: publish
+    # Un workflow appele ne peut PAS obtenir plus de permissions que le job
+    # qui l'appelle. `docker.yml` demande `packages: write` pour pousser
+    # l'image ; ce workflow-ci n'accorde globalement que `contents: write`.
+    # Sans ce bloc, GitHub refuse le fichier ENTIER avant de lancer le
+    # moindre job — `startup_failure`, zero job, aucun message dans les
+    # journaux. C'est ce qui a bloque le train de la v0.9.128 le 30/08 :
+    # trois tentatives identiques, et ni actionlint ni le dry-run du
+    # controleur ne peuvent l'attraper (l'un ne resout pas les permissions
+    # entre workflows, l'autre s'arrete aux tags).
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker.yml
     with:
       version: ${{ needs.publish.outputs.version }}

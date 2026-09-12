@@ -181,6 +181,144 @@ async fn now_computes_current_line_index_from_position() {
     assert_eq!(body["lines"].as_array().unwrap().len(), 3);
 }
 
+// ── #2997 : le décalage de paroles de la ZONE est enfin appliqué ───────────
+//
+// `zones.lyrics_offset_ms` était stocké, exposé et borné à ±60 s sans qu'une
+// seule ligne ne s'en trouve décalée. `/now/{zone_id}` est la seule surface du
+// serveur qui puisse l'appliquer : elle connaît la zone, et sa réponse — qui
+// porte `position_ms` — n'a jamais été partageable entre zones.
+//
+// Deux zones, même piste, même position : seul le décalage les distingue.
+
+/// Crée une zone, lui pose un décalage de paroles, la met en lecture sur
+/// `track_id` à `position_ms`, puis rend l'id de la zone.
+async fn zone_playing_at(
+    state: &AppState,
+    name: &str,
+    track_id: i64,
+    offset_ms: i32,
+    position_ms: i64,
+) -> i64 {
+    let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let zone_id = zones.create(name, Some("local"), None).unwrap();
+    zones.update_lyrics_offset_ms(zone_id, offset_ms).unwrap();
+
+    let mut np = NowPlaying::from_track(
+        &TrackRepo::with_backend(state.backend.clone())
+            .get(track_id)
+            .unwrap()
+            .unwrap(),
+    );
+    np.track_id = Some(track_id);
+    state.playback.play(zone_id, np).await;
+    state.playback.update_position(zone_id, position_ms).await;
+    zone_id
+}
+
+#[tokio::test]
+async fn now_applique_le_decalage_de_paroles_de_la_zone() {
+    let state = new_state();
+    let track_id = seed_track(&state, "Décalée", "Artiste");
+    seed_lyrics_cache(&state, track_id, "Décalée", "Artiste", LRC);
+
+    // Position 16 s. Sans décalage, l'index actif est 1 (ligne à 15 s).
+    // Avec +3 s de décalage — paroles RETARDÉES — on lit les paroles comme
+    // si l'on était à 13 s : la ligne à 15 s n'est pas encore atteinte, la
+    // ligne active redevient la 0 (12,34 s).
+    let zone_id = zone_playing_at(&state, "Salon retardé", track_id, 3_000, 16_000).await;
+
+    let app = app_with_karaoke(&state);
+    let (status, body) = get_json(&app, &format!("/api/v1/ext/karaoke/now/{zone_id}")).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(
+        body["lyrics_offset_ms"], 3_000,
+        "la réponse doit porter le décalage appliqué : {body:?}"
+    );
+    assert_eq!(
+        body["position_ms"], 16_000,
+        "la position reste BRUTE — le contrat existant ne bouge pas : {body:?}"
+    );
+    assert_eq!(
+        body["current_index"], 0,
+        "16 s moins 3 s de décalage → ligne 0, pas la 1 : {body:?}"
+    );
+    // Les horodatages des lignes ne sont pas touchés : seul l'index l'est.
+    assert_eq!(body["lines"][0]["time_ms"], 12_340, "body: {body:?}");
+    assert_eq!(body["lines"][1]["time_ms"], 15_000, "body: {body:?}");
+}
+
+#[tokio::test]
+async fn un_decalage_negatif_avance_les_paroles() {
+    let state = new_state();
+    let track_id = seed_track(&state, "Avancée", "Artiste");
+    seed_lyrics_cache(&state, track_id, "Avancée", "Artiste", LRC);
+
+    // Position 28 s, décalage -3 s : on lit comme si l'on était à 31 s, donc
+    // la ligne à 30 s est déjà active (index 2) alors qu'elle ne le serait
+    // pas sans décalage.
+    let zone_id = zone_playing_at(&state, "Salon avancé", track_id, -3_000, 28_000).await;
+
+    let app = app_with_karaoke(&state);
+    let (_, body) = get_json(&app, &format!("/api/v1/ext/karaoke/now/{zone_id}")).await;
+
+    assert_eq!(
+        body["current_index"], 2,
+        "28 s plus 3 s d'avance → ligne 2 (sans décalage ce serait 1) : {body:?}"
+    );
+    assert_eq!(body["lyrics_offset_ms"], -3_000, "body: {body:?}");
+}
+
+#[tokio::test]
+async fn temoin_un_decalage_de_zero_rend_exactement_l_index_d_origine() {
+    // TÉMOIN ANTI-RÉGRESSION — **vert avant comme après le correctif**.
+    //
+    // Une zone sans décalage est le cas de TOUTES les zones existantes : la
+    // réponse doit être exactement celle d'avant. D'où l'absence délibérée
+    // d'assertion sur `lyrics_offset_ms` ici : ce champ est nouveau, l'exiger
+    // ferait échouer ce témoin sur la version d'avant et il ne témoignerait
+    // plus de rien. Ce qui est vérifié, c'est ce qui ne DOIT PAS bouger —
+    // l'index actif, la position brute, les horodatages des lignes.
+    let state = new_state();
+    let track_id = seed_track(&state, "Témoin", "Artiste");
+    seed_lyrics_cache(&state, track_id, "Témoin", "Artiste", LRC);
+
+    let zone_id = zone_playing_at(&state, "Salon témoin", track_id, 0, 16_000).await;
+
+    let app = app_with_karaoke(&state);
+    let (status, body) = get_json(&app, &format!("/api/v1/ext/karaoke/now/{zone_id}")).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["position_ms"], 16_000, "body: {body:?}");
+    assert_eq!(
+        body["current_index"], 1,
+        "décalage nul ⇒ index d'origine : {body:?}"
+    );
+    let lines = body["lines"].as_array().expect("lines");
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["time_ms"], 12_340, "body: {body:?}");
+    assert_eq!(lines[1]["time_ms"], 15_000, "body: {body:?}");
+    assert_eq!(lines[2]["time_ms"], 30_000, "body: {body:?}");
+}
+
+#[tokio::test]
+async fn now_avec_zone_a_l_arret_porte_quand_meme_le_decalage() {
+    // Le réglage doit être lisible même quand rien ne joue : sinon un client
+    // ne peut pas afficher le décalage effectif d'une zone au repos.
+    let state = new_state();
+    let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let zone_id = zones.create("Zone muette", Some("local"), None).unwrap();
+    zones.update_lyrics_offset_ms(zone_id, 1_500).unwrap();
+
+    let app = app_with_karaoke(&state);
+    let (status, body) = get_json(&app, &format!("/api/v1/ext/karaoke/now/{zone_id}")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["lyrics_offset_ms"], 1_500, "body: {body:?}");
+    assert_eq!(body["current_index"], -1);
+    assert_eq!(body["error"], "nothing playing");
+}
+
 #[tokio::test]
 async fn now_with_nothing_playing_reports_empty() {
     let state = new_state();

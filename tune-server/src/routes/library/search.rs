@@ -113,19 +113,40 @@ pub(super) async fn search(
             .unwrap_or_default()
     };
 
-    // Build track JSON: FTS tracks first, then metadata-only tracks.
-    // Annotate with matched_metadata where applicable.
-    let mut track_results: Vec<Value> = Vec::with_capacity(tracks.len() + extra_tracks.len());
-    for t in tracks.iter().chain(extra_tracks.iter()) {
-        let mut v = t.to_json();
-        if let Some(id) = t.id {
-            if let Some(meta) = matched_metadata.get(&id) {
-                v.as_object_mut()
-                    .unwrap()
-                    .insert("matched_metadata".into(), json!(meta));
-            }
+    // La charge des pistes : celles du prédicat de recherche d'abord, puis
+    // celles trouvées par leurs seules métadonnées.
+    //
+    // #3789 — la recherche sortait des pistes NUES : ni `dynamic_range`, ni
+    // `play_count`, ni `last_played_at`, là où les MÊMES pistes listées par
+    // `/library/tracks` ou par la fiche d'un album les portent. L'écran de
+    // recherche rend pourtant ses titres avec la même table à colonnes
+    // (`ListePistesV2`) : trois colonnes s'y vidaient selon l'écran d'où on
+    // venait, ce qui se lit « mes fichiers ne sont pas tagués ».
+    //
+    // On passe par le seam de `super::tracks`, celui-là même que `tracks.rs`
+    // désigne comme « le seam unique des trois autres surfaces » : un second
+    // recopieur écrit ici aurait fini par diverger.
+    //
+    // UN SEUL appel pour toute la page — les deux moitiés (FTS et
+    // métadonnées) sont concaténées d'abord —, donc DEUX requêtes indexées
+    // par page, et zéro sur une page vide. Pas une par piste.
+    let toutes: Vec<tune_core::db::models::Track> =
+        tracks.into_iter().chain(extra_tracks).collect();
+    let mut track_results = super::tracks::joindre_dr_par_piste(&state, toutes);
+
+    // L'annotation propre à cette route se pose APRÈS, sur le JSON déjà
+    // enrichi : les pistes trouvées par leurs métadonnées disent laquelle a
+    // correspondu.
+    for v in track_results.iter_mut() {
+        let Some(id) = v.get("id").and_then(Value::as_i64) else {
+            continue;
+        };
+        let Some(meta) = matched_metadata.get(&id) else {
+            continue;
+        };
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("matched_metadata".into(), json!(meta));
         }
-        track_results.push(v);
     }
 
     Json(json!({
@@ -233,19 +254,28 @@ pub(super) async fn acoustic_search(
     // file copied in two folders → same title/artist/duration), keeping the
     // best-ranked occurrence, then truncate and annotate each with its cosine.
     let tracks = dedup_ranked_tracks(tracks);
-    let items: Vec<Value> = tracks
-        .iter()
-        .take(limit)
-        .map(|t| {
-            let mut v = t.to_json();
-            if let (Some(obj), Some(id)) = (v.as_object_mut(), t.id) {
-                if let Some(s) = scores.get(&id) {
-                    obj.insert("similarity".into(), json!(s));
-                }
-            }
-            v
-        })
-        .collect();
+
+    // #3789 — l'écran Ambiance rend ses résultats dans la MÊME table à
+    // colonnes que la recherche par texte (`ListePistesV2`, `SearchV2.svelte`
+    // l. 680) : sans le seam, ses trois colonnes seraient vides alors que la
+    // liste juste au-dessous les porte.
+    //
+    // La troncature à `limit` a lieu AVANT l'enrichissement : les deux
+    // requêtes indexées ne portent que sur la page rendue, pas sur le
+    // sur-échantillonnage à 2× qu'exige le dédoublonnage.
+    let tracks: Vec<tune_core::db::models::Track> = tracks.into_iter().take(limit).collect();
+    let mut items = super::tracks::joindre_dr_par_piste(&state, tracks);
+    for v in items.iter_mut() {
+        let Some(id) = v.get("id").and_then(Value::as_i64) else {
+            continue;
+        };
+        let Some(s) = scores.get(&id) else {
+            continue;
+        };
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("similarity".into(), json!(s));
+        }
+    }
 
     Ok(Json(json!({
         "query": query,
@@ -427,6 +457,16 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     #[cfg(not(feature = "audio-embedding"))]
     let paused_reason: Option<&str> = None;
 
+    // #3839 — la tour texte du CLAP est entrainee en anglais. Une requete
+    // francaise n'est traduite que si l'utilisateur a configure une cle IA, et
+    // le client n'a AUCUN moyen de le savoir : les cles ne sortent d'aucune
+    // route. Sans cette ligne, l'ecran Ambiance ne peut ni conseiller l'anglais
+    // ni renvoyer aux reglages — c'est le silence que JeromeQ a rencontre
+    // (fil 1751). Le serveur SAIT ; il le dit ici.
+    let translation_available = tune_core::ai::translate::cle_disponible(
+        &tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone()),
+    );
+
     Json(json!({
         "available": available,
         "enabled": enabled,
@@ -447,5 +487,8 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         // et la jauge ne finissait jamais (#1819).
         "pending_tracks": (eligible - processed).max(0),
         "throttle": throttle,
+        // Une requete libre en francais est-elle traduite avant d'atteindre la
+        // tour texte ? `false` = elle part brute, et l'ecran doit le dire.
+        "translation_available": translation_available,
     }))
 }

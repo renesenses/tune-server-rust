@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -14,11 +15,46 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
-    const RECORD_COLS: &str = "id, track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, listened_at, zone_id, context_type, context_id";
+    const RECORD_COLS: &str = "id, track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, listened_at, zone_id, context_type, context_id, context_position";
+
+    /// Les mêmes colonnes, mais avec `track_id` RÉSOLU.
+    ///
+    /// 🔴 `listen_history.track_id` est **toujours NULL** : le seul site
+    /// d'insertion passe `track_id: None`. La liste rendait donc ce NULL tel
+    /// quel, et le client ne pouvait désigner aucune écoute locale.
+    ///
+    /// FabienM, fil forum 1739, 09/09/2026 : « Manque des contrôles dans les
+    /// titres du menu historique. Exemple ici : le titre Racing in the street
+    /// n'a aucun contrôle comme les 2 autres titres. » Sa capture montre
+    /// l'inverse de l'attendu — la piste LOCALE est nue, les deux Qobuz ont
+    /// leurs boutons : une piste de service est désignée par `source` +
+    /// `source_id`, qui eux sont bien enregistrés.
+    ///
+    /// Mesure sur le .18, `GET /library/history?limit=60` : **38 écoutes
+    /// locales sur 38 sans `track_id`**, contre 22 écoutes de service avec
+    /// leur `source_id`.
+    ///
+    /// `top_tracks` avait déjà ce défaut et le résout depuis longtemps, avec
+    /// le commentaire qui en dit la conséquence (« tapping a track on the home
+    /// screen did nothing »). La correction n'avait jamais été portée ici.
+    ///
+    /// ⚠️ On rapproche par titre **ET album**, pas par titre seul comme
+    /// `top_tracks` : sur une bibliothèque réelle « Intro » ou « Untitled »
+    /// existent des dizaines de fois, et un rapprochement par titre seul
+    /// rendrait l'identifiant d'une AUTRE piste — pire qu'un bouton absent.
+    /// Sans `album_id` sur la ligne, on préfère ne rien résoudre.
+    const RECORD_COLS_RESOLUS: &str = "h.id, COALESCE(h.track_id, t.id) as track_id, h.title, \
+         h.artist_name, h.album_title, h.source, h.source_id, h.album_id, h.duration_ms, \
+         h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position";
+
+    /// La jointure qui résout `track_id`, commune aux deux listes.
+    const JOINTURE_PISTE: &str = " FROM listen_history h \
+         LEFT JOIN tracks t ON t.title = h.title AND t.album_id = h.album_id \
+         WHERE h.source != 'radio' ORDER BY h.listened_at DESC";
 
     pub fn record<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id, context_type, context_id) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id, context_type, context_id, context_position) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -31,7 +67,8 @@ pub mod sql {
             d.placeholder(10),
             d.placeholder(11),
             d.placeholder(12),
-            d.placeholder(13)
+            d.placeholder(13),
+            d.placeholder(14)
         )
     }
 
@@ -42,14 +79,14 @@ pub mod sql {
     // Stats already filter `source != 'radio'`; align the list with them.
     pub fn recent<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {RECORD_COLS} FROM listen_history WHERE source != 'radio' ORDER BY listened_at DESC LIMIT {}",
+            "SELECT {RECORD_COLS_RESOLUS}{JOINTURE_PISTE} LIMIT {}",
             d.placeholder(1)
         )
     }
 
     pub fn recent_paginated<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {RECORD_COLS} FROM listen_history WHERE source != 'radio' ORDER BY listened_at DESC LIMIT {} OFFSET {}",
+            "SELECT {RECORD_COLS_RESOLUS}{JOINTURE_PISTE} LIMIT {} OFFSET {}",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -85,6 +122,56 @@ pub mod sql {
              GROUP BY h.title, h.artist_name \
              ORDER BY plays DESC LIMIT {}",
             d.placeholder(1)
+        )
+    }
+
+    /// L'écoute de plusieurs pistes d'un coup : compte et dernière fois (#3518).
+    ///
+    /// # Pourquoi le rapprochement se fait par titre + interprète
+    ///
+    /// Parce que `listen_history.track_id` est **toujours NULL**. Le seul site
+    /// qui écrit l'historique — `orchestrator::commun::record_listen` — passe
+    /// `track_id: None`, avec le commentaire qui l'explique. Une jointure sur
+    /// `h.track_id = t.id` rendrait donc `play_count = 0` pour la bibliothèque
+    /// entière : la colonne exacte que #3518 refuse, celle qui affiche « jamais
+    /// joué » pour une piste jouée cent fois.
+    ///
+    /// Le rapprochement est le MÊME que celui de `top_tracks` et de
+    /// `track_plays` — égalité stricte sur `title` et `artist_name` —, et c'est
+    /// délibéré : la colonne d'un album doit donner le même nombre que l'écran
+    /// « Titres les plus écoutés », sans quoi deux vues de la même donnée se
+    /// contrediraient à l'écran.
+    ///
+    /// # La radio est exclue
+    ///
+    /// Comme partout ailleurs dans ce fichier : le titre d'une ligne de radio
+    /// est un instantané figé qui ne correspond pas à ce qui passait vraiment.
+    ///
+    /// # Le compte est GLOBAL, pas par profil
+    ///
+    /// L'arbitrage que l'issue laissait ouvert. `listen_history.profile_id`
+    /// n'est rempli que si la requête de lecture portait un `X-Profile-Id` ; il
+    /// est NULL sur la grande majorité des lignes, et `full_dashboard` filtre
+    /// par égalité stricte, donc une vue par profil les écarterait toutes. Un
+    /// compte par profil rendrait aujourd'hui zéro presque partout. Global, il
+    /// donne le même nombre que `/library/history/top-tracks`, que le client
+    /// affiche déjà. Une variante par profil pourra s'ajouter en paramètre
+    /// sans changer la forme de la réponse.
+    ///
+    /// `id_list` n'est composé que d'entiers, produits par l'appelant à partir
+    /// des identifiants qu'il a lus en base — jamais d'une chaîne du client.
+    pub fn plays_for_tracks(id_list: &str) -> String {
+        format!(
+            "SELECT t.id, COUNT(h.id), MAX(h.listened_at) \
+             FROM tracks t \
+             LEFT JOIN artists a ON a.id = t.artist_id \
+             LEFT JOIN listen_history h \
+                    ON h.source != 'radio' \
+                   AND h.title = t.title \
+                   AND (h.artist_name = a.name \
+                        OR (h.artist_name IS NULL AND a.name IS NULL)) \
+             WHERE t.id IN ({id_list}) \
+             GROUP BY t.id"
         )
     }
 
@@ -172,6 +259,15 @@ pub struct ListenRecord {
     /// non INTEGER : une playlist locale a un id numerique, un album Qobuz
     /// une chaine. La colonne doit accueillir les deux.
     pub context_id: Option<String>,
+    /// Rang de la piste DANS cet objet, au moment ou elle a ete jouee : la
+    /// position dans la file de la zone. C'est ce qui permet de rouvrir la
+    /// playlist a la piste 7 plutot qu'a son debut (#2441, migration 94).
+    ///
+    /// `None` a deux causes, et l'une n'est pas une ignorance : une ligne
+    /// anterieure a la migration 94 (rang inconnu), OU une ecoute en lecture
+    /// ALEATOIRE. Dans ce second cas le rang est laisse vide a dessein — on
+    /// RE-TIRE au lieu de rejouer le meme tirage.
+    pub context_position: Option<i64>,
 }
 
 pub struct HistoryRepo {
@@ -200,7 +296,7 @@ impl HistoryRepo {
 
     pub fn record(&self, rec: &ListenRecord) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::record, sql::record);
-        let params: [&dyn ToSqlValue; 13] = [
+        let params: [&dyn ToSqlValue; 14] = [
             &rec.track_id,
             &rec.title,
             &rec.artist_name,
@@ -214,6 +310,7 @@ impl HistoryRepo {
             &rec.profile_id,
             &rec.context_type,
             &rec.context_id,
+            &rec.context_position,
         ];
         Ok(self.db.execute_returning_id(&sql, &params)?)
     }
@@ -262,6 +359,39 @@ impl HistoryRepo {
 
     /// How many times a track (matched by `title` + `artist_name`) was played,
     /// excluding radio. Mirrors the dashboard "top tracks" grouping.
+    /// Compte d'écoutes et dernière écoute, pour un lot de pistes (#3518).
+    ///
+    /// Rend une entrée par piste **trouvée**, avec `(compte, derniere)`. Une
+    /// piste jamais jouée rend `(0, None)` : ici le zéro est une information,
+    /// pas une absence, et l'appelant doit pouvoir le distinguer d'un échec.
+    ///
+    /// Une seule requête pour toute la page, quel que soit le nombre de
+    /// pistes ; aucune du tout sur une liste vide.
+    pub fn plays_for_tracks(
+        &self,
+        track_ids: &[i64],
+    ) -> Result<HashMap<i64, (i64, Option<String>)>, String> {
+        if track_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let id_list = track_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let rows = self.db.query_many(&sql::plays_for_tracks(&id_list), &[])?;
+        let mut map = HashMap::new();
+        for cols in rows {
+            let Some(id) = cols.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let compte = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+            let derniere = cols.get(2).and_then(|v| v.as_string());
+            map.insert(id, (compte, derniere));
+        }
+        Ok(map)
+    }
+
     pub fn track_plays(&self, title: &str, artist_name: Option<&str>) -> Result<i64, String> {
         let count = |sql: &str, params: &[&dyn ToSqlValue]| -> Result<i64, String> {
             Ok(self
@@ -1214,6 +1344,7 @@ fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
         profile_id: None,
         context_type: cols.get(11).and_then(|v| v.as_string()),
         context_id: cols.get(12).and_then(|v| v.as_string()),
+        context_position: cols.get(13).and_then(|v| v.as_i64()),
     }
 }
 
@@ -1227,6 +1358,123 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         HistoryRepo::new(db)
+    }
+
+    /// Un dépôt ET sa base : résoudre `track_id` demande de vraies pistes.
+    fn repo_et_base() -> (HistoryRepo, Arc<dyn DbBackend>) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let partagee: Arc<dyn DbBackend> = Arc::new(db);
+        (
+            HistoryRepo {
+                db: partagee.clone(),
+            },
+            partagee,
+        )
+    }
+
+    /// Une écoute nue : seuls les champs qui comptent pour ces témoins-ci.
+    fn ecoute_locale_nue(titre: &str, album_id: Option<i64>) -> ListenRecord {
+        ListenRecord {
+            id: None,
+            track_id: None,
+            title: titre.into(),
+            artist_name: None,
+            album_title: None,
+            source: "local".into(),
+            source_id: None,
+            album_id,
+            duration_ms: 0,
+            listened_at: None,
+            zone_id: None,
+            cover_url: None,
+            profile_id: None,
+            context_type: None,
+            context_id: None,
+            context_position: None,
+        }
+    }
+
+    /// 🔴 L'HISTORIQUE REND UN `track_id` UTILISABLE — fil 1739.
+    ///
+    /// FabienM, 09/09/2026 : « Manque des contrôles dans les titres du menu
+    /// historique. Exemple ici : le titre Racing in the street n'a aucun
+    /// contrôle comme les 2 autres titres. »
+    ///
+    /// `listen_history.track_id` est TOUJOURS NULL — le seul site d'insertion
+    /// passe `None`. Le client désigne une piste locale par son identifiant :
+    /// sans lui, `corpsDeLecture` rend `null` et TOUTE la barre d'actions
+    /// disparaît. Une piste de service, elle, s'identifie par `source` +
+    /// `source_id`, bien enregistrés — d'où l'inversion que Fabien a vue.
+    ///
+    /// Mesure sur le .18 : 38 écoutes locales sur 38 sans `track_id`.
+    #[test]
+    fn l_historique_resout_le_track_id_dune_ecoute_locale() {
+        let (repo, db) = repo_et_base();
+        db.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Springsteen')",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (7, 'Live 1975-85', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, artist_id, album_id) VALUES (42, 'Racing In The Street', 1, 7)",
+            &[],
+        )
+        .unwrap();
+
+        repo.record(&ecoute_locale_nue("Racing In The Street", Some(7)))
+            .unwrap();
+
+        assert_eq!(
+            repo.recent(10).unwrap()[0].track_id,
+            Some(42),
+            "l'écoute locale sort sans identifiant : le client ne peut ni la \
+             lire, ni l'enfiler, ni la mettre en favori — aucun contrôle"
+        );
+    }
+
+    /// LA CONTRE-ÉPREUVE — on ne résout JAMAIS vers une autre piste.
+    ///
+    /// `top_tracks` rapproche par titre SEUL. Sur une bibliothèque réelle,
+    /// « Intro » ou « Untitled » existent des dizaines de fois : rendre
+    /// l'identifiant d'un homonyme ferait lire le mauvais morceau, ce qui est
+    /// pire qu'un bouton absent. On exige donc le même album.
+    #[test]
+    fn un_homonyme_dun_autre_album_ne_resout_rien() {
+        let (repo, db) = repo_et_base();
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'Divers')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (7, 'A', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (8, 'B', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, artist_id, album_id) VALUES (42, 'Intro', 1, 7)",
+            &[],
+        )
+        .unwrap();
+
+        // L'écoute vient de l'album 8 ; la seule piste « Intro » est sur le 7.
+        repo.record(&ecoute_locale_nue("Intro", Some(8))).unwrap();
+
+        assert_eq!(
+            repo.recent(10).unwrap()[0].track_id,
+            None,
+            "un homonyme d'un AUTRE album a été résolu : le client lirait le \
+             mauvais morceau, ce qui est pire qu'un bouton absent"
+        );
     }
 
     /// #2441 — l'ecoute doit garder la trace de CE QUE l'auditeur a demande.
@@ -1261,6 +1509,7 @@ mod tests {
             profile_id: None,
             context_type: Some("playlist".into()),
             context_id: Some("42".into()),
+            context_position: Some(6),
         };
         repo.record(&depuis_une_playlist).unwrap();
 
@@ -1278,6 +1527,12 @@ mod tests {
             Some("42"),
             "le type est la mais pas l'identifiant : on saurait que c'etait \
              une playlist sans jamais savoir LAQUELLE"
+        );
+        assert_eq!(
+            relu[0].context_position,
+            Some(6),
+            "le rang n'a pas survecu : on rouvrirait la bonne playlist, mais \
+             toujours a sa premiere piste (#2441, migration 94)"
         );
 
         // Une piste jouee seule dit « track », pas « playlist » : les deux
@@ -1302,6 +1557,7 @@ mod tests {
             title: "All Blues".into(),
             context_type: None,
             context_id: None,
+            context_position: None,
             ..depuis_une_playlist.clone()
         };
         repo.record(&sans_contexte).unwrap();
@@ -1332,6 +1588,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         };
 
         repo.record(&rec).unwrap();
@@ -1369,6 +1626,7 @@ mod tests {
                 profile_id: None,
                 context_type: None,
                 context_id: None,
+                context_position: None,
             })
             .unwrap();
         }
@@ -1389,6 +1647,7 @@ mod tests {
                 profile_id: None,
                 context_type: None,
                 context_id: None,
+                context_position: None,
             })
             .unwrap();
         }
@@ -1421,6 +1680,7 @@ mod tests {
                 profile_id: None,
                 context_type: None,
                 context_id: None,
+                context_position: None,
             })
             .unwrap();
         }
@@ -1452,6 +1712,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
@@ -1476,6 +1737,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         })
         .unwrap();
         repo.record(&ListenRecord {
@@ -1494,6 +1756,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         })
         .unwrap();
 
@@ -1523,6 +1786,7 @@ mod tests {
                 profile_id: None,
                 context_type: None,
                 context_id: None,
+                context_position: None,
             })
             .unwrap();
         }
@@ -1536,12 +1800,13 @@ mod tests {
     fn sql_builders_dialect_placeholders() {
         let s = SqliteDialect;
         let p = PostgresDialect;
-        // 13 colonnes depuis #2441 : `context_type` et `context_id` se sont
+        // 14 colonnes depuis #2441 : `context_type` et `context_id`
+        // (migration 84) puis `context_position` (migration 94) se sont
         // ajoutees aux onze precedentes.
-        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
         assert!(
             sql::record(&p)
-                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)")
+                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)")
         );
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
         assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
@@ -1573,6 +1838,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         })
         .unwrap();
 
@@ -1606,11 +1872,186 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
         let dash = repo.full_dashboard("7d", None, None, 10).unwrap();
         assert_eq!(dash.totals.plays, 1);
         assert_eq!(dash.totals.unique_artists, 1);
+    }
+
+    /// Deux pistes du même album, du même interprète : `So What` (id 1) et
+    /// `Blue in Green` (id 2).
+    fn pose_un_album(repo: &HistoryRepo) {
+        repo.db
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Miles Davis')",
+                &[],
+            )
+            .expect("artiste");
+        repo.db
+            .execute(
+                "INSERT INTO albums (id, title, artist_id, track_count) \
+                 VALUES (1, 'Kind of Blue', 1, 2)",
+                &[],
+            )
+            .expect("album");
+        for (id, titre) in [(1, "So What"), (2, "Blue in Green")] {
+            repo.db
+                .execute(
+                    &format!(
+                        "INSERT INTO tracks (id, title, artist_id, album_id, file_path) \
+                         VALUES ({id}, '{titre}', 1, 1, '/musique/{id}.flac')"
+                    ),
+                    &[],
+                )
+                .expect("piste");
+        }
+    }
+
+    /// Une écoute écrite par le VRAI chemin — `record`, celui de
+    /// l'orchestrateur —, donc avec `track_id` à NULL comme en production.
+    fn ecoute(repo: &HistoryRepo, titre: &str, artiste: Option<&str>, source: &str, quand: &str) {
+        let id = repo
+            .record(&ListenRecord {
+                id: None,
+                track_id: None,
+                title: titre.into(),
+                artist_name: artiste.map(Into::into),
+                album_title: Some("Kind of Blue".into()),
+                source: source.into(),
+                source_id: None,
+                album_id: Some(1),
+                duration_ms: 562_000,
+                listened_at: None,
+                zone_id: None,
+                cover_url: None,
+                profile_id: None,
+                context_type: None,
+                context_id: None,
+                context_position: None,
+            })
+            .expect("ecoute enregistree");
+        // `record` laisse la base dater la ligne ; on la repositionne pour que
+        // « la derniere ecoute » soit verifiable et non dependante de l'heure
+        // de la machine d'essai.
+        repo.db
+            .execute(
+                &format!("UPDATE listen_history SET listened_at = '{quand}' WHERE id = {id}"),
+                &[],
+            )
+            .expect("date d'ecoute");
+    }
+
+    /// #3518 — le socle des colonnes « # Plays » et « Last Played » de la
+    /// maquette V1 : deux pistes du même album, l'une jouée, l'autre non.
+    ///
+    /// Le zéro compte : il dit « jamais jouée », et l'écran doit pouvoir
+    /// l'afficher au lieu de laisser la case vide.
+    #[test]
+    fn l_ecoute_par_piste_se_compte_et_se_date() {
+        let repo = fresh_repo();
+        pose_un_album(&repo);
+        for jour in ["2026-09-01T10:00:00Z", "2026-09-05T21:30:00Z"] {
+            ecoute(&repo, "So What", Some("Miles Davis"), "local", jour);
+        }
+        let stats = repo.plays_for_tracks(&[1, 2]).expect("lecture");
+        assert_eq!(
+            stats.get(&1),
+            Some(&(2i64, Some("2026-09-05T21:30:00Z".to_string()))),
+            "deux ecoutes, et la DERNIERE des deux"
+        );
+        assert_eq!(
+            stats.get(&2),
+            Some(&(0i64, None)),
+            "une piste jamais jouee rend zero, pas une absence"
+        );
+    }
+
+    /// La cause du ticket, mise sous garde. `listen_history.track_id` est
+    /// TOUJOURS NULL — `record_listen` passe `track_id: None` — donc une
+    /// jointure sur cette colonne rendrait zéro partout. Ce test écrit
+    /// l'historique par le vrai chemin (`record`) et exige que le compte
+    /// remonte quand même.
+    #[test]
+    fn le_compte_remonte_malgre_un_track_id_toujours_nul() {
+        let repo = fresh_repo();
+        pose_un_album(&repo);
+        ecoute(
+            &repo,
+            "So What",
+            Some("Miles Davis"),
+            "local",
+            "2026-09-05T21:30:00Z",
+        );
+        let nuls = repo
+            .db
+            .query_one(
+                "SELECT COUNT(*) FROM listen_history WHERE track_id IS NULL",
+                &[],
+            )
+            .expect("compte")
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        assert_eq!(nuls, 1, "l'orchestrateur n'ecrit jamais de track_id");
+        assert_eq!(
+            repo.plays_for_tracks(&[1])
+                .expect("lecture")
+                .get(&1)
+                .map(|s| s.0),
+            Some(1)
+        );
+    }
+
+    /// La radio ne compte pas : le titre d'une ligne de radio est un
+    /// instantané figé qui ne correspond pas à ce qui passait vraiment. Même
+    /// exclusion que `top_tracks`, `track_plays` et la liste d'historique.
+    #[test]
+    fn la_radio_ne_compte_pas_dans_l_ecoute_d_une_piste() {
+        let repo = fresh_repo();
+        pose_un_album(&repo);
+        ecoute(
+            &repo,
+            "So What",
+            Some("Miles Davis"),
+            "radio",
+            "2026-09-05T21:30:00Z",
+        );
+        assert_eq!(
+            repo.plays_for_tracks(&[1]).expect("lecture").get(&1),
+            Some(&(0i64, None))
+        );
+    }
+
+    /// Un homonyme d'un AUTRE interprète ne gonfle pas le compte : le
+    /// rapprochement porte sur le couple titre + interprète, celui de
+    /// `top_tracks`.
+    #[test]
+    fn un_homonyme_d_un_autre_interprete_ne_compte_pas() {
+        let repo = fresh_repo();
+        pose_un_album(&repo);
+        ecoute(
+            &repo,
+            "So What",
+            Some("Bill Evans"),
+            "local",
+            "2026-09-05T21:30:00Z",
+        );
+        assert_eq!(
+            repo.plays_for_tracks(&[1]).expect("lecture").get(&1),
+            Some(&(0i64, None)),
+            "meme titre, autre interprete : ce n'est pas la meme piste"
+        );
+    }
+
+    /// Une liste vide ne part pas en base, et un identifiant inconnu ne rend
+    /// rien plutôt qu'une ligne fantôme.
+    #[test]
+    fn une_liste_vide_ou_inconnue_ne_rend_rien() {
+        let repo = fresh_repo();
+        pose_un_album(&repo);
+        assert!(repo.plays_for_tracks(&[]).expect("lecture").is_empty());
+        assert!(repo.plays_for_tracks(&[9999]).expect("lecture").is_empty());
     }
 }

@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -75,17 +76,63 @@ fn queue_file_path(db_path: &str, zone_id: i64) -> PathBuf {
 }
 
 /// Save the current queue state for a zone to a JSON file.
+///
+/// 🔴 #2569 / #2775 — **une lecture qui ÉCHOUE ne dit pas « la file est
+/// vide » : elle ne dit rien.**
+///
+/// Les trois lectures ci-dessous portaient un `unwrap_or_default()`, qui
+/// confond exactement ces deux réponses. La base répond `Err` (« database is
+/// locked »), l'instantané se construit sur une file vide, et il ÉCRASE sur le
+/// disque l'instantané d'une file de quarante titres. Ce n'est pas une
+/// hypothèse : #1997 a établi ici même qu'un lot de scan tient la connexion
+/// SQLite partagée pendant que l'utilisateur agit sur sa file — le chemin
+/// d'ÉCRITURE s'est vu ajouter des reprises pour ça (`set_queue_retrying`), la
+/// LECTURE n'en a jamais eu.
+///
+/// Le critère n'est donc pas « la file est-elle vide ? » mais **`Err` contre
+/// `Ok(vide)`** :
+///
+/// * `Err` — la base est illisible. On ne sait rien, on n'écrit rien, et
+///   l'instantané précédent survit.
+/// * `Ok(vec![])` — la file est réellement vide, parce que l'utilisateur l'a
+///   vidée. Elle DOIT s'écrire : refuser d'écrire une file vide ferait
+///   réapparaître au redémarrage une file que l'utilisateur a effacée, le
+///   défaut symétrique et le plus insidieux des deux.
 pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_state: &ZoneState) {
+    let repo = PlayQueueRepo::with_backend(db.clone());
+
+    // Les trois lectures d'abord, AVANT de toucher au disque : un instantané ne
+    // s'écrit que s'il repose sur une base qui a répondu.
+    let local_items = match repo.get_queue(zone_id) {
+        Ok(items) => items,
+        Err(e) => {
+            warn!(zone_id, error = %e, "queue_persist_read_failed_snapshot_kept");
+            return;
+        }
+    };
+    let streaming_items = match repo.get_streaming_queue(zone_id) {
+        Ok(items) => items,
+        Err(e) => {
+            warn!(zone_id, error = %e, "queue_persist_read_failed_snapshot_kept");
+            return;
+        }
+    };
+    // La liste unifiée ordonnée : celle que la restauration préfère, donc celle
+    // dont la perte coûte la file entière.
+    let entries = match repo.get_ordered(zone_id) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(zone_id, error = %e, "queue_persist_read_failed_snapshot_kept");
+            return;
+        }
+    };
+
     let dir = queue_dir(db_path);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(zone_id, error = %e, "queue_persist_mkdir_failed");
         return;
     }
 
-    let repo = PlayQueueRepo::with_backend(db.clone());
-
-    // Gather local queue track IDs
-    let local_items = repo.get_queue(zone_id).unwrap_or_default();
     let local_track_ids: Vec<i64> = local_items.iter().map(|i| i.track_id).collect();
     let current_position = local_items
         .iter()
@@ -94,7 +141,6 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
         .unwrap_or(zone_state.queue_position);
 
     // Gather streaming queue
-    let streaming_items = repo.get_streaming_queue(zone_id).unwrap_or_default();
     let streaming_tracks: Vec<StreamingQueueEntry> = streaming_items
         .iter()
         .map(|item| StreamingQueueEntry {
@@ -109,8 +155,7 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
         .collect();
 
     // The authoritative ordered unified list (local + streaming interleaved by
-    // position). Preferred on restore.
-    let entries = repo.get_ordered(zone_id).unwrap_or_default();
+    // position). Preferred on restore. Lue plus haut, avec son erreur.
     let items: Vec<QueueSnapshotItem> = entries
         .iter()
         .map(|e| QueueSnapshotItem {
@@ -151,7 +196,7 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
     let path = queue_file_path(db_path, zone_id);
     match serde_json::to_string_pretty(&snapshot) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = ecrire_atomiquement(&path, &json) {
                 warn!(zone_id, error = %e, "queue_persist_write_failed");
             }
         }
@@ -161,19 +206,98 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
     }
 }
 
+/// Écrit `contenu` dans `path` **d'un seul coup**, par un fichier temporaire
+/// suivi d'un renommage.
+///
+/// 🔴 #2569 / #2775 — `persist_queue_async` fait `tokio::spawn` puis
+/// `spawn_blocking` : deux persistances lancées coup sur coup n'ont AUCUN ordre
+/// garanti, et leurs deux tâches bloquantes écrivaient LE MÊME fichier en même
+/// temps. `std::fs::write` tronque puis écrit : deux écritures concurrentes de
+/// longueurs différentes laissent un JSON DÉCHIRÉ.
+///
+/// Ce n'est pas une crainte de principe, c'est mesuré : trois fils persistant
+/// une file dont la taille varie ont produit **19 fichiers illisibles sur 901
+/// lectures** (2,1 %). Au redémarrage suivant, `restore_all_queues` échoue sur
+/// `queue_restore_parse_failed` et passe la zone SANS BRUIT — l'instantané est
+/// perdu, et l'utilisateur retrouve la file que la base contient, c'est-à-dire
+/// le seul titre en cours.
+///
+/// Le renommage rend l'écriture indivisible : le fichier de destination est
+/// toujours un instantané COMPLET, celui d'avant ou celui d'après, jamais un
+/// mélange des deux. Le nom du temporaire porte l'identifiant du fil, sans quoi
+/// deux persistances se battraient pour le même temporaire et on n'aurait fait
+/// que déplacer la course.
+fn ecrire_atomiquement(path: &Path, contenu: &str) -> std::io::Result<()> {
+    // Un temporaire par écrivain : le renommage est indivisible, l'écriture du
+    // temporaire ne l'est pas. Le suffixe `.tmp` le tient hors de la
+    // restauration, qui ne lit que les `.json`.
+    static ECRIVAIN: AtomicU64 = AtomicU64::new(0);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        ECRIVAIN.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, contenu)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Ce que la restauration au démarrage a RÉELLEMENT remis en file.
+///
+/// 🔴 #3663 — la restauration appelait `append`, l'enveloppe qui jette le bilan
+/// de `insert_at_bilan`. Elle perdait donc des pistes en silence par DEUX
+/// chemins, et le journal de démarrage annonçait la longueur de l'INSTANTANÉ
+/// dans les deux cas : le filtre amont, qui écarte un identifiant local absent
+/// de `tracks` avant même l'insertion, et la garde `WHERE EXISTS` de
+/// l'insertion unifiée, qui saute la ligne disparue entre-temps.
+///
+/// Rendu par [`restore_all_queues`] pour que ce bilan soit VÉRIFIABLE par un
+/// appel, et pas seulement lisible dans un journal. Même forme que
+/// `InsertOutcome` : ce qui était demandé, ce qui est entré, ce qui est tombé.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BilanRestauration {
+    /// Zones dont l'instantané a été réinjecté.
+    pub zones_restaurees: usize,
+    /// Zones dont l'instantané existe mais n'a pas pu être réécrit en base.
+    pub zones_en_echec: usize,
+    /// Lignes présentes dans les instantanés retenus.
+    pub pistes_demandees: usize,
+    /// Lignes réellement écrites dans la file.
+    pub pistes_restaurees: usize,
+    /// Identifiants locaux tombés, filtre amont et garde d'insertion réunis.
+    pub pistes_absentes: usize,
+}
+
+impl BilanRestauration {
+    /// Vrai dès qu'au moins une piste d'instantané n'est pas revenue en file.
+    pub fn a_perdu_des_pistes(&self) -> bool {
+        self.pistes_absentes > 0
+    }
+}
+
 /// Restore all saved queue snapshots from disk and repopulate the DB tables.
 /// Called at server startup.
-pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
+///
+/// Rend le [`BilanRestauration`] de la passe — voir #3663.
+pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) -> BilanRestauration {
+    let mut bilan = BilanRestauration::default();
     let dir = queue_dir(db_path);
     if !dir.exists() {
-        return;
+        return bilan;
     }
 
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) => {
             warn!(error = %e, "queue_restore_readdir_failed");
-            return;
+            return bilan;
         }
     };
 
@@ -235,6 +359,16 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
         // for snapshots written before the unification. Stale local track IDs
         // (deleted from the library) are filtered out.
         let track_repo = crate::db::track_repo::TrackRepo::with_backend(db.clone());
+        // #3663 — combien de lignes l'instantané PORTAIT. Sans ce compte, une
+        // file remontée amputée est indiscernable d'une file courte : le filtre
+        // ci-dessous écarte les identifiants périmés sans rien dire, et
+        // `queue_restored` annonçait la longueur de l'instantané dans les deux
+        // cas.
+        let demandees = if !snapshot.items.is_empty() {
+            snapshot.items.len()
+        } else {
+            snapshot.local_track_ids.len() + snapshot.streaming_tracks.len()
+        };
         let mut inputs: Vec<QueueInput> = Vec::new();
         if !snapshot.items.is_empty() {
             for it in &snapshot.items {
@@ -279,27 +413,65 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
             }
         }
         if inputs.is_empty() {
-            debug!(zone_id, "queue_restore_nothing_valid");
+            debug!(zone_id, demandees, "queue_restore_nothing_valid");
+            bilan.pistes_demandees += demandees;
+            bilan.pistes_absentes += demandees;
             continue;
         }
-        if let Err(e) = repo.append(zone_id, &inputs) {
-            warn!(
-                zone_id,
-                items = inputs.len(),
-                error = %e,
-                "queue_restore_append_failed"
-            );
-            failed += 1;
-            continue;
-        }
+        // 🔴 #3663 — `append` jette le bilan de l'insertion unifiée. La garde
+        // `WHERE EXISTS` posée par #3231 SAUTE la piste disparue au lieu
+        // d'annuler toute la transaction : c'est un progrès, mais l'appelant
+        // qui n'en lit pas le compte ne peut plus dire ce qu'il a remis. On
+        // consomme donc le bilan ici, comme la route `queue/add` le fait
+        // depuis le même correctif.
+        let outcome = match repo.insert_at_bilan(zone_id, &inputs, None) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                warn!(
+                    zone_id,
+                    items = inputs.len(),
+                    error = %e,
+                    "queue_restore_append_failed"
+                );
+                failed += 1;
+                bilan.pistes_demandees += demandees;
+                bilan.pistes_absentes += demandees;
+                continue;
+            }
+        };
         if snapshot.current_position > 0 {
             repo.set_current_pos(zone_id, snapshot.current_position)
                 .ok();
         }
 
         restored += 1;
+        let restaurees = outcome.inserted();
+        let absentes = demandees.saturating_sub(restaurees);
+        bilan.pistes_demandees += demandees;
+        bilan.pistes_restaurees += restaurees;
+        bilan.pistes_absentes += absentes;
+        if absentes > 0 {
+            // Même vocabulaire que `queue_add_pistes_absentes` sur la route :
+            // ce que l'instantané portait, ce qui est revenu, ce qui manque.
+            // `apercu_ids_absents` ne peut nommer que les pertes vues par
+            // l'insertion — celles du filtre amont sont déjà écartées de
+            // `inputs`, et c'est l'écart des comptes qui les révèle.
+            let apercu: Vec<i64> = outcome.skipped.iter().take(10).copied().collect();
+            warn!(
+                zone_id,
+                demandees,
+                restaurees,
+                absentes,
+                sautees_a_l_insertion = outcome.skipped.len(),
+                apercu_ids_absents = ?apercu,
+                position = snapshot.current_position,
+                "queue_restore_pistes_absentes — la file remontée est plus courte que son instantané"
+            );
+        }
         info!(
             zone_id,
+            demandees,
+            restaurees,
             local_tracks = snapshot.local_track_ids.len(),
             streaming_tracks = snapshot.streaming_tracks.len(),
             position = snapshot.current_position,
@@ -317,6 +489,9 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
             restored, "queues_restore_incomplete_zones_will_appear_empty"
         );
     }
+    bilan.zones_restaurees = restored;
+    bilan.zones_en_echec = failed;
+    bilan
 }
 
 /// Load all queue snapshots from disk without modifying the DB.
@@ -538,5 +713,89 @@ mod tests {
         for (i, e) in restored.iter().enumerate() {
             assert_eq!(e.position, i as i64);
         }
+    }
+
+    /// 🔴 #3663 — la restauration au démarrage doit DIRE ce qu'elle a perdu.
+    ///
+    /// Garde de SITE D'APPEL : elle appelle `restore_all_queues`, la fonction
+    /// que `startup.rs` invoque au démarrage, et lit son bilan. Elle ne vérifie
+    /// pas que `insert_at_bilan` sait compter — c'est déjà gardé chez lui —
+    /// mais que CET appelant-ci consomme le compte au lieu de le jeter, ce que
+    /// faisait l'enveloppe `append`.
+    ///
+    /// Les deux moitiés sont ici : une file amputée doit rendre
+    /// `pistes_absentes = 1`, et la MÊME file intacte doit rendre 0. Sans la
+    /// consommation du bilan, la première assertion tombe.
+    #[test]
+    fn la_restauration_declare_les_pistes_qui_ne_sont_pas_revenues_3663() {
+        assert_eq!(
+            restauration_apres_suppression(true),
+            (2, 1, 1),
+            "une piste disparue de la bibliothèque : la file remonte à 1 sur 2, \
+             et le bilan doit le DIRE — sans lui, le démarrage annonce 2"
+        );
+    }
+
+    #[test]
+    fn la_restauration_ne_declare_aucune_perte_quand_tout_est_la_3663() {
+        assert_eq!(
+            restauration_apres_suppression(false),
+            (2, 2, 0),
+            "contre-épreuve : rien n'a disparu, rien ne doit être annoncé perdu"
+        );
+    }
+
+    /// Enregistre une file de deux pistes locales, la sauvegarde, la vide,
+    /// supprime éventuellement la seconde piste de la bibliothèque, puis
+    /// restaure. Rend `(demandees, restaurees, absentes)`.
+    fn restauration_apres_suppression(supprimer: bool) -> (usize, usize, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tune.db");
+        let db_path_str = db_path.to_str().unwrap();
+        let sqlite = SqliteDb::open_in_memory().unwrap();
+        sqlite.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&sqlite).unwrap();
+        let db: std::sync::Arc<dyn crate::db::backend::DbBackend> = std::sync::Arc::new(sqlite);
+        db.execute(
+            "INSERT INTO zones (id, name, output_type) VALUES (1, 'Salon', 'local')",
+            &[],
+        )
+        .unwrap();
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+        for i in 1..=2i64 {
+            let titre = format!("Piste {i}");
+            db.execute(
+                "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms) VALUES (?, ?, 1, 1, 180000)",
+                &[&i as &dyn crate::db::backend::ToSqlValue, &titre.as_str()],
+            )
+            .unwrap();
+        }
+        let repo = PlayQueueRepo::with_backend(db.clone());
+        repo.set_queue(1, &[1, 2]).unwrap();
+        let zone_state = ZoneState {
+            zone_id: 1,
+            queue_position: 0,
+            queue_length: 2,
+            ..Default::default()
+        };
+        save_queue(&db, db_path_str, 1, &zone_state);
+        repo.clear(1).unwrap();
+        if supprimer {
+            db.execute("DELETE FROM tracks WHERE id = 2", &[]).unwrap();
+        }
+
+        let bilan = restore_all_queues(&db, db_path_str);
+
+        (
+            bilan.pistes_demandees,
+            bilan.pistes_restaurees,
+            bilan.pistes_absentes,
+        )
     }
 }

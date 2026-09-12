@@ -3,6 +3,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
@@ -268,7 +269,7 @@ async fn wrapped(
              GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|cols| {
             json!({
@@ -286,7 +287,7 @@ async fn wrapped(
              GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10",
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|cols| {
             json!({
@@ -305,7 +306,7 @@ async fn wrapped(
              GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT 10",
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|cols| {
             json!({
@@ -327,7 +328,7 @@ async fn wrapped(
     );
     let days: Vec<String> = b
         .query_many(&days_sql, &[&year_start as &dyn ToSqlValue, &year_end])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.first().and_then(|v| v.as_string()))
         .collect();

@@ -1,0 +1,38 @@
+-- #2441 — OU l'auditeur en etait dans l'objet qu'il avait demande.
+--
+-- La migration 037 (jumelle SQLite 84) a pose CE QU'il avait demande :
+-- `context_type` et `context_id`. Il manquait le RANG. Sans lui, « Continuer
+-- l'ecoute » sait rouvrir la bonne playlist, mais toujours a sa premiere
+-- piste — ce qui n'est pas « continuer ».
+--
+-- L'arbitrage rendu sur #2441 est « objet courant + position », PAS
+-- l'instantane de la file entiere :
+--   * pour un ARTISTE ou un LABEL, la file est batie par une requete qui
+--     change d'un jour a l'autre (un album ajoute, une etiquette corrigee) —
+--     « conserver l'ordre » n'y a aucun sens ;
+--   * ecrire la file complete a chaque ecoute couterait un facteur dix sur le
+--     volume de `listen_history`, pour alimenter une section d'accueil.
+--
+-- NULL a DEUX sens, et un seul est une ignorance :
+--   * ligne anterieure a cette migration — rang inconnu, on rouvre au debut ;
+--   * ecoute en lecture ALEATOIRE — le rang est laisse vide a dessein. La
+--     permutation de tirage est regeneree a chaque activation : « position 7 »
+--     du tirage d'hier tombera sur une autre piste demain. On RE-TIRE plutot
+--     que de faire semblant de rejouer le meme ordre. La decision est prise a
+--     l'ECRITURE (`rang_a_retenir`, tune-core/src/orchestrator.rs) parce que
+--     l'etat « aleatoire » de la zone n'existe plus au moment ou l'accueil
+--     s'affiche.
+--
+-- TEXT et non INTEGER : ce schema PostgreSQL porte deja `album_id`,
+-- `profile_id`, `zone_id` et `duration_ms` en TEXT sur cette meme table. Une
+-- colonne d'un autre type y serait la seule exception, et `SqlValue::as_i64`
+-- convertit le TEXT a la relecture.
+--
+-- Jumelle de la migration SQLite 94. Les deux listes sont SEPAREES —
+-- `run_migrations` ne prend qu'un `SqliteDb` — donc une colonne posee d'un
+-- seul cote ne repare que la moitie du parc (#1612, #2111).
+--
+-- Idempotent : `IF NOT EXISTS`, sans danger a rejouer sur une base deja
+-- migree depuis SQLite ou la colonne est deja la.
+ALTER TABLE listen_history
+    ADD COLUMN IF NOT EXISTS context_position TEXT;

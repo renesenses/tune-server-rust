@@ -2,6 +2,7 @@ use axum::Json;
 use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::{SqlValue, ToSqlValue};
 use tune_core::db::engine::Engine;
@@ -111,7 +112,7 @@ fn where_with_prefix(
     let mut parts: Vec<String> = conds.to_vec();
     parts.push(format!(
         "t.file_path LIKE {like_ph}{}",
-        tune_core::db::track_repo::like_escape_clause(engine)
+        tune_core::db::track_repo::like_escape_clause()
     ));
     (parts.join(" AND "), all)
 }
@@ -247,7 +248,7 @@ fn folder_children(
     let (where_sql, all) = where_with_prefix(engine, conds, params, &folder_like_pattern(&base));
     let sql = format!("SELECT t.file_path FROM tracks t WHERE {where_sql}");
     let refs: Vec<&dyn ToSqlValue> = all.iter().map(|v| v as &dyn ToSqlValue).collect();
-    let rows = state.backend.query_many(&sql, &refs).unwrap_or_default();
+    let rows = state.backend.query_many(&sql, &refs).ou_defaut_journalise();
 
     // Aggregate the immediate child segment (portable: no engine-specific SQL
     // string surgery, no case/normalization equality traps). A row with no

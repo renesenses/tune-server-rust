@@ -12,8 +12,26 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-const SUPPORT_API: &str = "https://mozaiklabs.fr/api/v1/support/tickets";
+/// Racine du nuage mozaiklabs, redirigeable par le réglage `mozaik_base_url`.
+///
+/// Le support était le dernier appelant du nuage à garder son URL en dur, alors
+/// que le SSO, le marché de greffons, les couvertures communautaires et la
+/// validation de licence honorent tous ce réglage. Conséquence : le chemin qui
+/// porte le diagnostic (#2916) n'était éprouvable qu'en unités — la
+/// désérialisation d'un côté, la construction du corps de l'autre — et rien ne
+/// prouvait que la route joignait les deux ni que les octets sortaient.
+const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// URL de la collection des tickets pour une racine donnée.
+fn tickets_url(base_url: Option<&str>) -> String {
+    let base = base_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_BASE_URL)
+        .trim_end_matches('/');
+    format!("{base}/api/v1/support/tickets")
+}
 
 /// `Ok(body)` sur 2xx ; `Err((status, body))` sinon — le status HTTP de
 /// mozaiklabs (401/403/422…) est préservé pour être renvoyé au client.
@@ -45,25 +63,52 @@ impl SupportAuth {
     }
 }
 
+/// Un ticket tel que le client web l'a composé.
+///
+/// `logs` et `system` sont **le diagnostic** : le markdown produit par
+/// `/system/bug-report/markdown` et la fiche système. mozaiklabs matérialise
+/// `logs` en pièce jointe `diagnostic.md` à la création du ticket. Sans eux,
+/// le ticket arrive sans journal alors que le client a coché « joindre les
+/// journaux » et annonce l'envoi réussi.
+#[derive(Default)]
+pub struct NewTicket {
+    pub subject: String,
+    pub body: String,
+    pub category: Option<String>,
+    pub zone: Option<String>,
+    pub system: Option<Value>,
+    pub logs: Option<String>,
+}
+
+/// Corps JSON envoyé à mozaiklabs pour l'ouverture d'un ticket.
+///
+/// Extrait de [`create_ticket`] pour être vérifiable sans réseau : c'est
+/// exactement ici que `logs` et `system` étaient perdus.
+fn ticket_payload(ticket: &NewTicket) -> Value {
+    json!({
+        "subject": ticket.subject,
+        "body": ticket.body,
+        "category": ticket.category,
+        "zone": ticket.zone,
+        "system": ticket.system,
+        "logs": ticket.logs,
+        "tune_version": crate::version(),
+        "platform": std::env::consts::OS,
+    })
+}
+
 /// Ouvre un ticket. Injecte automatiquement la version de Tune et l'OS —
 /// le SAV voit la config sans la demander.
 pub async fn create_ticket(
     http_client: &reqwest::Client,
     auth: &SupportAuth,
-    subject: &str,
-    body: &str,
-    category: Option<&str>,
+    ticket: &NewTicket,
+    base_url: Option<&str>,
 ) -> SupportResult {
-    let payload = json!({
-        "subject": subject,
-        "body": body,
-        "category": category,
-        "tune_version": crate::version(),
-        "platform": std::env::consts::OS,
-    });
+    let payload = ticket_payload(ticket);
 
     let resp = auth
-        .apply(http_client.post(SUPPORT_API))
+        .apply(http_client.post(tickets_url(base_url)))
         .json(&payload)
         .timeout(TIMEOUT)
         .send()
@@ -95,6 +140,7 @@ pub async fn create_ticket_multipart(
     auth: &SupportAuth,
     fields: Vec<(String, String)>,
     files: Vec<AttachmentUpload>,
+    base_url: Option<&str>,
 ) -> SupportResult {
     let mut form = reqwest::multipart::Form::new()
         .text("tune_version", crate::version())
@@ -119,7 +165,7 @@ pub async fn create_ticket_multipart(
     }
 
     let resp = auth
-        .apply(http_client.post(SUPPORT_API))
+        .apply(http_client.post(tickets_url(base_url)))
         .multipart(form)
         .timeout(TIMEOUT)
         .send()
@@ -130,9 +176,13 @@ pub async fn create_ticket_multipart(
 }
 
 /// Liste les tickets du compte premium.
-pub async fn list_tickets(http_client: &reqwest::Client, auth: &SupportAuth) -> SupportResult {
+pub async fn list_tickets(
+    http_client: &reqwest::Client,
+    auth: &SupportAuth,
+    base_url: Option<&str>,
+) -> SupportResult {
     let resp = auth
-        .apply(http_client.get(SUPPORT_API))
+        .apply(http_client.get(tickets_url(base_url)))
         .timeout(TIMEOUT)
         .send()
         .await
@@ -146,9 +196,10 @@ pub async fn get_ticket(
     http_client: &reqwest::Client,
     auth: &SupportAuth,
     id: i64,
+    base_url: Option<&str>,
 ) -> SupportResult {
     let resp = auth
-        .apply(http_client.get(format!("{SUPPORT_API}/{id}")))
+        .apply(http_client.get(format!("{}/{id}", tickets_url(base_url))))
         .timeout(TIMEOUT)
         .send()
         .await
@@ -163,9 +214,10 @@ pub async fn reply(
     auth: &SupportAuth,
     id: i64,
     body: &str,
+    base_url: Option<&str>,
 ) -> SupportResult {
     let resp = auth
-        .apply(http_client.post(reply_url(id)))
+        .apply(http_client.post(reply_url(base_url, id)))
         .json(&json!({ "body": body }))
         .timeout(TIMEOUT)
         .send()
@@ -188,9 +240,10 @@ pub async fn mark_read(
     http_client: &reqwest::Client,
     auth: &SupportAuth,
     id: i64,
+    base_url: Option<&str>,
 ) -> SupportResult {
     let resp = auth
-        .apply(http_client.post(read_url(id)))
+        .apply(http_client.post(read_url(base_url, id)))
         .timeout(TIMEOUT)
         .send()
         .await
@@ -204,13 +257,13 @@ pub async fn mark_read(
 /// Le singulier n'est pas un détail : mozaiklabs expose `…/reply` ET son alias
 /// `…/replies`, et se tromper de forme rendrait un 404 que le relais
 /// propagerait tel quel. Isolé pour être vérifié par un test.
-fn reply_url(id: i64) -> String {
-    format!("{SUPPORT_API}/{id}/reply")
+fn reply_url(base_url: Option<&str>, id: i64) -> String {
+    format!("{}/{id}/reply", tickets_url(base_url))
 }
 
 /// URL de marquage « lu » d'un ticket.
-fn read_url(id: i64) -> String {
-    format!("{SUPPORT_API}/{id}/read")
+fn read_url(base_url: Option<&str>, id: i64) -> String {
+    format!("{}/{id}/read", tickets_url(base_url))
 }
 
 /// 502 Bad Gateway quand mozaiklabs est injoignable (réseau, timeout).
@@ -429,18 +482,94 @@ mod tests {
     #[test]
     fn les_urls_amont_suivent_le_contrat_laravel() {
         assert_eq!(
-            reply_url(42),
+            tickets_url(None),
+            "https://mozaiklabs.fr/api/v1/support/tickets"
+        );
+        assert_eq!(
+            reply_url(None, 42),
             "https://mozaiklabs.fr/api/v1/support/tickets/42/reply"
         );
         assert_eq!(
-            read_url(42),
+            read_url(None, 42),
             "https://mozaiklabs.fr/api/v1/support/tickets/42/read"
         );
+    }
+
+    /// `mozaik_base_url` redirige le support comme il redirige déjà le SSO, le
+    /// marché de greffons et la validation de licence. Une racine vide ou avec
+    /// un `/` final ne doit pas fabriquer une URL bancale.
+    #[test]
+    fn la_racine_du_nuage_est_redirigeable() {
+        assert_eq!(
+            tickets_url(Some("http://127.0.0.1:9000")),
+            "http://127.0.0.1:9000/api/v1/support/tickets"
+        );
+        assert_eq!(
+            tickets_url(Some("http://127.0.0.1:9000/")),
+            "http://127.0.0.1:9000/api/v1/support/tickets"
+        );
+        // Réglage présent mais vide : on retombe sur la production, jamais sur
+        // une URL relative qui partirait nulle part.
+        assert_eq!(tickets_url(Some("")), tickets_url(None));
+        assert_eq!(tickets_url(Some("   ")), tickets_url(None));
     }
 
     #[test]
     fn un_2xx_reste_un_succes() {
         let value = build_result(201, r#"{"ticket":{"id":7}}"#, None).expect("2xx = succès");
         assert_eq!(value["ticket"]["id"], json!(7));
+    }
+
+    /// Le chemin JSON — celui d'un ticket SANS pièce jointe manuelle, c'est-à-dire
+    /// la majorité — laissait tomber `logs` et `system`. Le client les envoie,
+    /// mozaiklabs sait les recevoir (`StoreSupportTicketRequest`) et matérialise
+    /// `logs` en pièce jointe `diagnostic.md` ; seul ce corps-ci ne les portait
+    /// pas, et l'envoi rendait quand même un 201 « ticket ouvert ».
+    ///
+    /// Mesuré en production le 2026-08-29 : 39 tickets sur 62 sans le moindre
+    /// journal — exactement ceux qui n'avaient aucune pièce jointe manuelle,
+    /// donc exactement ceux passés par ici.
+    #[test]
+    fn le_corps_json_porte_le_diagnostic() {
+        let ticket = NewTicket {
+            subject: "Coupure DLNA".into(),
+            body: "Le salon s'arrête au bout de dix secondes.".into(),
+            category: Some("bug".into()),
+            zone: Some("Salon".into()),
+            system: Some(json!({ "os": "linux", "zones": 3 })),
+            logs: Some("# Tune Bug Report\n\nERROR dlna_stall".into()),
+        };
+
+        let payload = ticket_payload(&ticket);
+
+        assert_eq!(
+            payload["logs"], "# Tune Bug Report\n\nERROR dlna_stall",
+            "le diagnostic doit partir avec le ticket"
+        );
+        assert_eq!(payload["system"]["os"], "linux");
+        assert_eq!(payload["zone"], "Salon");
+        assert_eq!(payload["subject"], "Coupure DLNA");
+        assert_eq!(payload["category"], "bug");
+        // Version et OS restent injectées par le serveur, jamais par le client.
+        assert_eq!(payload["tune_version"], crate::version());
+        assert_eq!(payload["platform"], std::env::consts::OS);
+    }
+
+    /// Case décochée, ou serveur sans journal accessible : les champs partent à
+    /// `null`, ce que les règles `nullable` de mozaiklabs acceptent — pas de 422.
+    #[test]
+    fn un_ticket_sans_diagnostic_reste_valide() {
+        let ticket = NewTicket {
+            subject: "Question".into(),
+            body: "Comment activer le DSD ?".into(),
+            ..Default::default()
+        };
+
+        let payload = ticket_payload(&ticket);
+
+        assert!(payload["logs"].is_null());
+        assert!(payload["system"].is_null());
+        assert!(payload["category"].is_null());
+        assert!(payload["zone"].is_null());
     }
 }

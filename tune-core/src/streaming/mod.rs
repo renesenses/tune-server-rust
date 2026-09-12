@@ -1,9 +1,12 @@
 pub mod amazon;
 pub mod deezer;
 pub mod deezer_decrypt;
+pub mod favorites_date;
+pub mod favorites_import;
 pub mod matching;
 pub mod podcasts;
 pub mod qobuz;
+pub mod quality;
 pub mod radiofrance;
 pub mod registry;
 pub mod spotify;

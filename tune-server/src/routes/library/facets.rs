@@ -2,6 +2,7 @@ use axum::Json;
 use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::SqlValue;
 use tune_core::db::engine::Engine;
@@ -156,10 +157,13 @@ fn build_facet_conditions(
     if exclude != "genre" && !sel.genres.is_empty() {
         let n = sel.genres.len();
         let in_part = ph.in_list_ci("t.genre", n).expect("liste non vide");
-        let like_part = (0..n)
-            .map(|_| format!("t.genres LIKE {}", ph.take()))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        // ⚠️ `or_like_ci` des DEUX côtés, comme le `in_list_ci` juste au-dessus
+        // et comme les facettes sœurs (label, compositeur). Un `LIKE` nu est
+        // insensible à la casse en SQLite mais SENSIBLE en PostgreSQL : le
+        // même « JAZZ » dans `t.genres` était trouvé sur l'installation par
+        // défaut et perdu sur PostgreSQL, alors que la colonne `t.genre`, elle,
+        // était comparée sans la casse des deux côtés (#1821).
+        let like_part = ph.or_like_ci("t.genres", n).expect("liste non vide");
         conds.push(format!("({in_part} OR {like_part})"));
         for g in &sel.genres {
             params.push(SqlValue::Text(g.clone()));
@@ -227,6 +231,16 @@ fn build_facet_conditions(
             }
         }
     }
+    // CRD-6 : « instrument » est une facette à part entière — elle ne se filtre
+    // pas elle-même — et vient des crédits, pas d'une colonne de `tracks`.
+    if exclude != "instrument" {
+        if let Some(c) = ph.in_list_ci("tc.instrument", sel.instruments.len()) {
+            conds.push(tune_core::db::facet_filter::instrument_exists(engine, &c));
+            for v in &sel.instruments {
+                params.push(SqlValue::Text(v.clone()));
+            }
+        }
+    }
     if exclude != "artist" {
         // `tracks` has no artist_name column (artist is a FK to `artists`), and
         // these conditions run against `FROM tracks t` with no join, so resolve
@@ -267,7 +281,7 @@ fn build_facet_conditions(
             conds.push(format!(
                 "t.file_path LIKE {}{}",
                 ph.take(),
-                tune_core::db::track_repo::like_escape_clause(engine)
+                tune_core::db::track_repo::like_escape_clause()
             ));
             params.push(SqlValue::Text(
                 tune_core::db::track_repo::folder_like_pattern(fld),
@@ -333,6 +347,20 @@ fn build_facet_conditions(
                 "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND {c})"
             ));
             for v in &sel.original_years {
+                params.push(SqlValue::Int(*v));
+            }
+        }
+    }
+    // Dynamic Range (#2144) : JUMEAU strict du prédicat de
+    // `TrackRepo::list_filtered`, tous deux bâtis par `facet_filter` pour que
+    // le rail ne puisse pas compter autrement que la liste qu'il filtre.
+    if exclude != "dr" {
+        if let Some(c) = ph.in_list(
+            tune_core::db::facet_filter::DR_ALBUM_VALUE,
+            sel.dynamic_ranges.len(),
+        ) {
+            conds.push(tune_core::db::facet_filter::dr_album_in(engine, &c));
+            for v in &sel.dynamic_ranges {
                 params.push(SqlValue::Int(*v));
             }
         }
@@ -422,6 +450,11 @@ pub(super) fn collection_album_ids(state: &AppState, name: &str) -> Vec<i64> {
 /// aggregation. `country`/`mood`/`source` are read from the open `track_metadata`
 /// key/value store (release_country / mood / source_media), which the client
 /// cannot aggregate without a per-track fetch.
+///
+/// `dr` (Dynamic Range, #2144) s'y lit aussi mais n'est PAS dans le jeu par
+/// défaut : sur une bibliothèque sans tag DR — le cas de très loin le plus
+/// courant — elle est vide, et une facette morte coûterait une requête à
+/// chaque ouverture du rail pour ne rien montrer.
 pub(super) async fn library_facets(
     Query(q): Query<FacetQuery>,
     RawQuery(raw): RawQuery,
@@ -462,7 +495,7 @@ pub(super) async fn library_facets(
         // The column / key is chosen from this fixed allow-list only, so the
         // formatted SQL below is never influenced by request input.
         let rows: Vec<(String, i64)> = match field.as_str() {
-            "genre" => column_facet(&state, "genre", limit, &conds, &params),
+            "genre" => genre_facet(&state, limit, &conds, &params),
             "label" => column_facet(&state, "label", limit, &conds, &params),
             // Le classique se navigue par compositeur avant de se naviguer par
             // artiste : colonne `tracks` directe, donc même facette de colonne.
@@ -480,6 +513,16 @@ pub(super) async fn library_facets(
             "rating" => rating_facet(&state, limit, &conds, &params),
             "collection" => collection_facet(&state, &q, engine),
             "original_year" => original_year_facet(&state, limit, &conds, &params),
+            // Dynamic Range (#2144). Absente du jeu par DÉFAUT : sur une
+            // bibliothèque non taguée elle est vide, et une facette morte dans
+            // le rail coûte une requête pour ne rien montrer. Un client la
+            // demande explicitement (`fields=…,dr`).
+            "dr" => dr_facet(&state, engine, limit, &conds, &params),
+            // Instrument (CRD-6) : vient de `track_credits`, remplie par la passe
+            // automatique (CRD-5). Comme `dr`, absente du jeu par défaut : vide
+            // tant que les crédits ne sont pas là, un client la demande
+            // explicitement (`fields=…,instrument`).
+            "instrument" => instrument_facet(&state, engine, limit, &conds, &params),
             "favorite" => favorite_facet(&state, &conds, &params),
             "playlist" => playlist_facet(&state, limit, &conds, &params),
             "untagged" => untagged_facet(&state, &conds, &params),
@@ -530,13 +573,72 @@ fn original_year_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
             let y = it.next()?.as_i64()?;
             let count = it.next()?.as_i64().unwrap_or(0);
             Some((y.to_string(), count))
+        })
+        .collect()
+}
+
+/// Les Dynamic Range présents, du plus dynamique au plus compressé (#2144).
+///
+/// # Pourquoi une valeur par pastille, et non des tranches nommées
+///
+/// Le ticket demande de « classer et filtrer par tranches », MinimServer cité
+/// en modèle — mais ses bornes exactes n'ont jamais été relevées, et la
+/// couverture réelle des bibliothèques en tags DR n'a jamais été mesurée. Une
+/// tranche gravée ici vivrait dans le contrat HTTP et survivrait à la mesure
+/// qui la contredirait. Le rail rend donc les valeurs RÉELLES avec leurs
+/// effectifs, et la sémantique de facette fait la tranche : cocher DR14, DR15
+/// et DR16, c'est demander « DR14 et au-dessus » — en OU, comme trois formats.
+///
+/// La grille d'albums garde en parallèle sa tranche à bornes libres
+/// (`?dr_min=`/`?dr_max=` sur `/library/albums`) : un intervalle ouvert n'a pas
+/// sa place dans un rail de cases à cocher, et réciproquement.
+///
+/// `JOIN` (et non `LEFT JOIN`) : un album sans tag n'est pas une valeur de
+/// facette. Un effectif nul ne remonte donc jamais, et une bibliothèque
+/// entièrement non taguée rend un tableau vide — l'écran n'affiche alors pas
+/// de facette plutôt qu'une facette morte.
+fn dr_facet(
+    state: &AppState,
+    engine: Engine,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    // Décroissant, comme `year` : l'auditeur qui ouvre cette facette cherche
+    // ses disques les plus dynamiques, pas les plus écrasés.
+    let sql = format!(
+        "SELECT dr.dr, COUNT(*) AS n FROM tracks t \
+         JOIN ({source}) dr ON dr.album_id = t.album_id{where_clause} \
+         GROUP BY dr.dr ORDER BY dr.dr DESC{limit_clause}",
+        source = tune_core::db::facet_filter::dr_album_source(engine)
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(&sql, &bound)
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let dr = it.next()?.as_i64()?;
+            let count = it.next()?.as_i64().unwrap_or(0);
+            Some((dr.to_string(), count))
         })
         .collect()
 }
@@ -609,7 +711,7 @@ fn playlist_facet(
     let brut: Vec<(String, i64)> = state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -677,7 +779,7 @@ fn column_facet(
     let brut: Vec<(String, i64)> = state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -690,6 +792,86 @@ fn column_facet(
         })
         .collect();
     fusionner_les_casses(brut)
+}
+
+/// Rail « Genre » : une entrée par GENRE, pas par chaîne brute de colonne.
+///
+/// `column_facet` groupe sur la seule colonne `t.genre`. Or le filtre jumeau
+/// (`build_facet_conditions` ici, `TrackRepo::list_filtered` côté liste) retient
+/// une piste si `LOWER(t.genre) = LOWER(?)` **OU** si le tableau JSON
+/// `t.genres` contient la valeur. Le rail comptait donc STRICTEMENT MOINS que
+/// ce que son propre filtre sait trouver : tout genre SECONDAIRE restait
+/// invisible, même coché il aurait rendu des pistes.
+///
+/// C'est ce qui rendait le classement dépendant du logiciel de gravure (#1821,
+/// DEvir) : un disque gravé avec deux champs `GENRE` (Vorbis) ou deux atomes
+/// `©gen` (MP4) n'apparaissait que sous son premier genre, tandis que le même
+/// disque acheté ailleurs, avec « Jazz; Fusion » dans un unique `TCON`,
+/// apparaissait sous les deux.
+///
+/// ⚠️ On compte exactement l'UNION que le filtre teste — `{t.genre}` ∪ les
+/// éléments de `t.genres` — et RIEN de plus. En particulier on ne redécoupe
+/// PAS `t.genre` : le filtre le compare en entier, donc annoncer « Jazz » pour
+/// une ligne dont la colonne vaut « Jazz; Fusion » rendrait un compteur qui
+/// ment, précisément le défaut de #1864.
+fn genre_facet(
+    state: &AppState,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let extra = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
+    // Pas de LIMIT en SQL : l'éclatement des valeurs multiples change les
+    // effectifs, donc le classement. La troncature se fait après le compte.
+    let sql = format!(
+        "SELECT t.genre, t.genres, COUNT(*) AS n FROM tracks t \
+         WHERE ((t.genre IS NOT NULL AND t.genre <> '') \
+         OR (t.genres IS NOT NULL AND t.genres <> '')){extra} \
+         GROUP BY t.genre, t.genres ORDER BY n DESC"
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    let mut brut: Vec<(String, i64)> = Vec::new();
+    for row in state
+        .backend
+        .query_many(&sql, &bound)
+        .ou_defaut_journalise()
+    {
+        let mut it = row.into_iter();
+        let colonne = it.next().and_then(|v| v.as_string());
+        let tableau = it.next().and_then(|v| v.as_string());
+        let n = it.next().and_then(|v| v.as_i64()).unwrap_or(0);
+
+        let mut valeurs: Vec<String> = Vec::new();
+        if let Some(json) = tableau.as_deref() {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json) {
+                valeurs.extend(arr.into_iter().filter(|g| !g.trim().is_empty()));
+            }
+        }
+        if let Some(g) = colonne.as_deref().filter(|g| !g.trim().is_empty()) {
+            valeurs.push(g.to_string());
+        }
+        // Une ligne ne compte qu'une fois par genre, même si la colonne
+        // répète le premier élément du tableau (le cas courant).
+        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for v in valeurs {
+            if vus.insert(v.to_lowercase()) {
+                brut.push((v, n));
+            }
+        }
+    }
+    let mut sortie = fusionner_les_casses(brut);
+    sortie.sort_by(|a, b| b.1.cmp(&a.1));
+    if let Some(n) = limit {
+        sortie.truncate(n.max(0) as usize);
+    }
+    sortie
 }
 
 /// Regroupe les orthographes qui ne diffèrent que par la casse.
@@ -756,7 +938,7 @@ fn rating_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -845,7 +1027,7 @@ fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(St
             "SELECT name, rules, match_mode FROM smart_collections ORDER BY name",
             &[],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     for row in &rows {
         let name = row.first().and_then(|v| v.as_string()).unwrap_or_default();
         if name.is_empty() || manual_names.contains(&name.to_lowercase()) {
@@ -862,7 +1044,7 @@ fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(St
         // Résolveur branché sur la base + profil par défaut (1), cohérent avec
         // la convention « profil 1 » du reste des facettes ; laisse les
         // nouveaux critères référence/favori compter correctement.
-        let resolver = crate::routes::smart_refs::DbRefResolver::new(state);
+        let resolver = crate::routes::smart_refs::DbRefResolver::new(&state.backend);
         let ctx = crate::routes::smart_refs::RefCtx::root(
             &resolver,
             Some(crate::routes::active_profile::DEFAULT_PROFILE_ID),
@@ -939,7 +1121,7 @@ pub(super) fn smart_collection_track_ids(state: &AppState, name: &str) -> Option
         .get(2)
         .and_then(|v| v.as_string())
         .unwrap_or_else(|| "all".into());
-    let resolver = crate::routes::smart_refs::DbRefResolver::new(state);
+    let resolver = crate::routes::smart_refs::DbRefResolver::new(&state.backend);
     let ctx = crate::routes::smart_refs::RefCtx::root(
         &resolver,
         Some(crate::routes::active_profile::DEFAULT_PROFILE_ID),
@@ -988,7 +1170,7 @@ fn artist_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -1002,6 +1184,50 @@ fn artist_facet(
 
 /// Count distinct values of an extended tag in the `track_metadata` k/v store,
 /// optionally narrowed to the tracks matching the active-facet conditions.
+/// La facette « instrument » (CRD-6) : chaque instrument des crédits, avec le
+/// nombre de pistes qui le portent, resserré par les autres facettes actives.
+/// Sur PostgreSQL `track_credits.track_id` est du texte : le sous-ensemble de
+/// pistes est projeté dans le même type (`track_id_pour_track_credits`).
+fn instrument_facet(
+    state: &AppState,
+    engine: Engine,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let narrow = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND tc.track_id IN (SELECT {} FROM tracks t WHERE {})",
+            tune_core::db::facet_filter::track_id_pour_track_credits(engine),
+            conds.join(" AND ")
+        )
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let sql = format!(
+        "SELECT tc.instrument AS value, COUNT(DISTINCT tc.track_id) AS n FROM track_credits tc \
+         WHERE tc.instrument IS NOT NULL AND tc.instrument <> ''{narrow} \
+         GROUP BY tc.instrument ORDER BY n DESC, value ASC{limit_clause}"
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(&sql, &bound)
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let value = it.next()?.as_string()?;
+            let count = it.next()?.as_i64().unwrap_or(0);
+            Some((value, count))
+        })
+        .collect()
+}
+
 fn kv_facet(
     state: &AppState,
     key: &str,
@@ -1030,7 +1256,7 @@ fn kv_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -1045,6 +1271,87 @@ fn kv_facet(
 mod tests {
     use super::*;
     use crate::routes::smart_refs::{EmptyResolver, RefCtx};
+
+    /// CRD-6 : la facette « instrument » compte les pistes par instrument des
+    /// crédits ; elle ne se filtre pas elle-même ; sa sélection resserre les
+    /// autres facettes et la liste des pistes.
+    #[tokio::test]
+    async fn la_facette_instrument_compte_les_pistes_et_filtre_les_autres() {
+        use tune_core::db::backend::ToSqlValue;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        let piste = |titre: &str, annee: i64| {
+            b.execute(
+                "INSERT INTO tracks (title, file_path, year) VALUES (?1, ?2, ?3)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &format!("/m/{titre}.flac") as &dyn ToSqlValue,
+                    &annee as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let credit = |track: i64, instrument: &str| {
+            b.execute(
+                "INSERT INTO track_credits (track_id, artist_name, role, instrument, position) VALUES (?1, ?2, 'performer', ?3, 0)",
+                &[&track.to_string() as &dyn ToSqlValue, &"Musicien" as &dyn ToSqlValue, &instrument as &dyn ToSqlValue],
+            )
+            .unwrap();
+        };
+        let a = piste("A", 1998);
+        let bb = piste("B", 2004);
+        let _c = piste("C", 2004);
+        credit(a, "oud");
+        credit(bb, "oud");
+        credit(bb, "piano");
+
+        async fn facettes(state: &AppState, raw: &str) -> Value {
+            // `fields` arrive par l'extracteur `Query`, les facettes à plusieurs
+            // valeurs par la chaîne brute : on nourrit les deux, comme axum.
+            let fields = raw
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("fields="))
+                .map(str::to_string);
+            let Json(v) = library_facets(
+                Query(FacetQuery {
+                    fields,
+                    ..Default::default()
+                }),
+                RawQuery(Some(raw.to_string())),
+                State(state.clone()),
+            )
+            .await
+            .ok()
+            .expect("la route répond");
+            v
+        }
+        let v = facettes(&state, "fields=instrument").await;
+        assert_eq!(v["instrument"][0]["value"], "oud");
+        assert_eq!(v["instrument"][0]["count"], 2);
+        assert_eq!(v["instrument"][1]["value"], "piano");
+        assert_eq!(v["instrument"][1]["count"], 1);
+
+        // Sélectionner « piano » ne vide pas la facette instrument elle-même,
+        // mais resserre les années à celle de la piste B.
+        let v = facettes(&state, "fields=instrument,year&instrument=piano").await;
+        assert_eq!(v["instrument"].as_array().unwrap().len(), 2, "{v}");
+        assert_eq!(v["year"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["year"][0]["value"], "2004");
+
+        // La liste des pistes suit le même filtre.
+        let filtre = tune_core::db::facet_filter::TrackFilter {
+            instruments: vec!["OUD".into()],
+            ..Default::default()
+        };
+        let (pistes, total) =
+            tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
+                .list_filtered(&filtre, 50, 0)
+                .unwrap();
+        assert_eq!(total, 2, "casse indifférente");
+        let titres: Vec<&str> = pistes.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titres, ["A", "B"]);
+    }
 
     /// La liste des étiquettes surveillées est FERMÉE : c'est elle qui garantit
     /// que le SQL formaté ne dépend jamais de l'entrée de la requête.
@@ -1151,7 +1458,7 @@ mod tests {
         let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
         assert_eq!(
             conds[0],
-            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR t.genres LIKE $3 OR t.genres LIKE $4)"
+            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR (LOWER(t.genres) LIKE LOWER($3) OR LOWER(t.genres) LIKE LOWER($4)))"
         );
         assert_eq!(conds[1], "t.year = $5");
         assert_eq!(
@@ -1287,7 +1594,7 @@ mod tests {
         // pas laisser de trou dans la liaison.
         assert_eq!(
             conds[0],
-            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR t.genres LIKE $3 OR t.genres LIKE $4)"
+            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR (LOWER(t.genres) LIKE LOWER($3) OR LOWER(t.genres) LIKE LOWER($4)))"
         );
         assert_eq!(params.len(), 4);
 
@@ -1307,7 +1614,7 @@ mod tests {
         assert_eq!(
             conds,
             vec![
-                "(LOWER(t.genre) = LOWER($1) OR t.genres LIKE $2)".to_string(),
+                "(LOWER(t.genre) = LOWER($1) OR LOWER(t.genres) LIKE LOWER($2))".to_string(),
                 "t.year = $3".to_string(),
                 "LOWER(t.format) = LOWER($4)".to_string(),
                 "LOWER(t.label) LIKE LOWER($5)".to_string(),
@@ -1363,7 +1670,7 @@ mod tests {
         let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
         assert_eq!(
             conds,
-            vec!["(LOWER(t.genre) = LOWER($1) OR t.genres LIKE $2)"]
+            vec!["(LOWER(t.genre) = LOWER($1) OR LOWER(t.genres) LIKE LOWER($2))"]
         );
         assert_eq!(texte(&params[0]), "Jazz, Blues");
     }

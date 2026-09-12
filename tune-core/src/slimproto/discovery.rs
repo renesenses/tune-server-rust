@@ -125,17 +125,26 @@ async fn adresse_face_a(correspondant: std::net::SocketAddr) -> Option<String> {
 /// Arme le répondeur de découverte. Tourne pour toujours.
 pub fn spawn(identite: IdentiteServeur) {
     tokio::spawn(async move {
-        let port: u16 = std::env::var("TUNE_SLIMPROTO_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(super::DEFAULT_PORT);
+        // La MEME resolution que le serveur TCP (`SlimProtoServer::resolve_port`).
+        // Une seconde lecture de la variable, ecrite a la main ici, laisserait le
+        // repondeur UDP et le serveur TCP diverger a la premiere retouche : la
+        // platine trouverait Tune par diffusion sur un port et ne pourrait pas
+        // s'y connecter sur l'autre.
+        let port: u16 = super::port_slimproto();
         let socket = match UdpSocket::bind(("0.0.0.0", port)).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 // Un LMS déjà installé sur la machine tient peut-être ce port :
-                // le dire, plutôt qu'échouer en silence — le TCP, lui,
-                // fonctionne toujours.
-                warn!(port, error = %e, "slimproto_discovery_bind_failed — la découverte UDP des Squeezebox est désactivée ; les lecteurs devront recevoir l'adresse du serveur à la main");
+                // le dire, plutôt qu'échouer en silence.
+                //
+                // ⚠️ Ce message affirmait « le TCP, lui, fonctionne toujours ».
+                // Le terrain le contredit : cinq journaux de testeurs, deux
+                // systèmes, montrent le bind TCP 3483 qui échoue lui aussi, et
+                // deux d'entre eux le montrent tomber en MÊME TEMPS que l'UDP
+                // (#2938). Rassurer sur le TCP ici, c'est mentir juste au
+                // moment où le canal de lecture est mort. L'état réel du TCP se
+                // lit désormais dans `super::etat_ecoute()`.
+                warn!(port, error = %e, "slimproto_discovery_bind_failed — la découverte UDP des Squeezebox est désactivée ; les lecteurs devront recevoir l'adresse du serveur à la main. L'état du canal TCP est à vérifier séparément (/system/diagnostics/network, champ « slimproto »)");
                 return;
             }
         };
@@ -147,6 +156,12 @@ pub fn spawn(identite: IdentiteServeur) {
                 Ok(x) => x,
                 Err(e) => {
                     debug!(error = %e, "slimproto_discovery_recv_error");
+                    // `continue` nu : une erreur de file persistante (ICMP
+                    // port-unreachable en rafale) tournerait a plein regime.
+                    // Ici le message est en `debug`, donc muet au niveau par
+                    // defaut : ce tour de boucle brulait du CPU sans laisser
+                    // la moindre trace (#2156).
+                    crate::temporisation_reseau::temporiser_apres_erreur_reseau().await;
                     continue;
                 }
             };

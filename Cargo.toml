@@ -1,14 +1,25 @@
 [workspace]
-members = ["tune-core", "tune-server", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp"]
+# Union des deux cotes : ce lot ajoute `tune-http-types` et `tune-smart-http`
+# (caisses extraites), `rc` ajoute `plugins/tune-concerts` (#2768). Une liste
+# de membres est un inventaire, pas un echantillon — en retirer un le sort de
+# `--workspace`, donc de la porte, sans que rien ne rougisse.
+#
+# `tune-output-api` est INSCRIT depuis #3266, alors qu'il etait deja membre :
+# cargo promeut membre toute dependance `path` interne, et `tune-core` le prend
+# ainsi (`tune-core/Cargo.toml:9`). Membre implicite, il echappait a tout ce qui
+# lit cette liste — dont la garde `cargo test`, qui restait verte pendant que
+# ses SEPT essais n'etaient executes par aucune porte. Le rendre explicite ne
+# change rien pour cargo ; ca rend l'inventaire vrai.
+members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tune-smart-http", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp", "plugins/tune-concerts"]
 # tune-desktop and tune-widget are Tauri apps, each with its own workspace and
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
 # (cargo fmt --all, tests, clippy) or its build matrix.
-exclude = ["tune-desktop", "tune-widget"]
+exclude = ["tune-desktop", "tune-widget", "vendor/rust_cast"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.127"
+version = "0.9.145"
 edition = "2024"
 # Business Source License 1.1 (see LICENSE). SPDX id BUSL-1.1 — NOT MIT: the
 # old value misdeclared far broader rights to audit/SBOM tools (issue #1147).
@@ -50,7 +61,26 @@ rusqlite = { version = "0.39", features = ["bundled", "functions"] }
 urlencoding = "2"
 toml = "0.8"
 cpal = "0.17"
-rust_cast = "0.21"
+# Fork MAISON, atteint par un chemin et NON par `[patch.crates-io]` — la
+# distinction décide si tune-core est constructible hors de ce dépôt.
+#
+# Un `[patch]` n'est honoré que depuis le manifeste racine du workspace qu'on
+# CONSTRUIT. Un consommateur externe — un binaire composeur qui dépend de
+# `tune-core` par git ou par chemin, c'est-à-dire le montage que
+# `docs/plugins/README.md` recommande lui-même — ne le voit pas : cargo résout
+# alors le vrai `rust_cast` 0.21.0 de crates.io, qui n'a pas la méthode que
+# `chromecast.rs` appelle, et le build casse sur un `E0599` incompréhensible.
+#
+# Une dépendance `path` INTERNE au dépôt, elle, est honorée partout : le
+# consommateur clone tout l'arbre, le chemin relatif se résout chez lui aussi.
+# C'est déjà ce que dit `plugins/tune-dj/Cargo.toml` — cargo ne casse que sur
+# un chemin pointant HORS du clone.
+#
+# `vendor/rust_cast` est dans `exclude` : c'est du code TIERS (MIT, azasypkin),
+# qui n'a pas à passer sous `cargo fmt --all` ni sous la porte clippy du
+# dépôt. La garde `toute_caisse_du_workspace_est_nommee_par_une_porte_clippy`
+# ne le réclame donc pas.
+rust_cast = { path = "vendor/rust_cast" }
 sha2 = "0.10"
 jsonwebtoken = "9"
 argon2 = { version = "0.5", features = ["std"] }
@@ -92,15 +122,6 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 dotenvy = "0.15"
-
-# Chromecast fix (#1185): rust_cast 0.21.0 with a patched TLS verifier that
-# tolerates the X.509 v1 self-signed certificates presented by older
-# Chromecast devices (rustls-webpki refuses to parse v1 certs, so the stock
-# signature-verification helpers abort the handshake with
-# `UnsupportedCertVersion` even under connect_without_host_verification).
-# See vendor/rust_cast/src/lib.rs, `accept_unparseable_cert`.
-[patch.crates-io]
-rust_cast = { path = "vendor/rust_cast" }
 
 [profile.dev]
 opt-level = 0

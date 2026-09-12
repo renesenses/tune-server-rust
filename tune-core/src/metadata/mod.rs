@@ -3,10 +3,11 @@ pub mod artist_split;
 pub mod auto_fix;
 pub mod batch;
 pub mod bio_batch;
-pub mod credit_enricher;
+pub mod credits_mb;
 pub mod enrich_scope;
 pub mod enrichment;
 pub mod fingerprint;
+pub mod instruments;
 pub mod lastfm;
 pub mod lyrics;
 pub mod matcher;
@@ -96,6 +97,25 @@ pub struct TrackMetadata {
     pub cover_art: Option<(Vec<u8>, String)>,
     pub credits: Vec<TrackCredit>,
     pub comment: Option<String>,
+    /// Vrai quand `artist` (et donc l'artiste d'album) ne vient PAS des
+    /// balises mais du CHEMIN : les tags n'ont pas pu être lus du tout — délai
+    /// dépassé sur le stockage, ou lofty incapable d'ouvrir le fichier. Seuls
+    /// les replis « tout depuis le chemin » le posent :
+    /// [`tagless_fallback_no_props`], `tagless_fallback` et `m4a_fallback`.
+    ///
+    /// Il existe parce qu'un nom de dossier n'est pas un artiste : compté
+    /// comme tel, il fabrique un DEUXIÈME artiste dans un dossier qui n'en a
+    /// qu'un et fait basculer l'album entier en « Various Artists ». Le
+    /// symptôme est intermittent — les délais dépassés changent d'un scan à
+    /// l'autre — et c'est le « au hasard » rapporté par Pierre M (#3232).
+    /// Toute décision qui dépend des balises doit donc ÉCARTER ce fichier :
+    /// voir `decide_compilation_folders` / `decide_compilation_albums`.
+    ///
+    /// `dsf_dff_fallback` ne le pose pas : il lit de VRAIES balises ID3v2 et
+    /// n'emprunte au chemin que les champs manquants — il avait d'ailleurs
+    /// déjà cessé d'en déduire `album_artist` (#1656).
+    #[serde(default)]
+    pub artist_from_path: bool,
 }
 
 /// One unsafe character removed from untrusted metadata.
@@ -362,6 +382,38 @@ pub fn split_genre_tag(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Assemble la liste des genres d'une piste à partir des valeurs BRUTES du tag.
+///
+/// Un fichier peut porter ses genres de DEUX façons, selon le logiciel qui l'a
+/// gravé, et les deux sont légitimes :
+///
+///   * **plusieurs valeurs** — Vorbis Comment répète le champ (`GENRE=Jazz`,
+///     `GENRE=Fusion`), MP4 répète l'atome `©gen`, ID3v2.4 sépare les valeurs
+///     d'un `TCON` par un octet nul ;
+///   * **une seule chaîne** — ID3v2.3 n'a pas de multivaleur, l'étiqueteur
+///     écrit `TCON = "Jazz; Fusion"` ou `"Jazz/Fusion"`.
+///
+/// Chaque valeur brute est donc redécoupée par `split_genre_tag`, ce qui couvre
+/// aussi les fichiers qui mêlent les deux conventions. Le dédoublonnage passe
+/// par `genre_key` — la clé canonique de la bibliothèque, pas un
+/// `to_lowercase()` réécrit sur place — pour que « Hip-Hop » et « Hip Hop »,
+/// écrits par deux marchands sur le même disque, ne comptent qu'une fois.
+///
+/// L'ordre d'apparition est conservé : le premier genre reste le genre
+/// principal (colonne `tracks.genre`).
+pub fn genres_from_tag_values<S: AsRef<str>>(values: &[S]) -> Vec<String> {
+    let mut vus = std::collections::HashSet::new();
+    let mut sortie = Vec::new();
+    for valeur in values {
+        for g in split_genre_tag(valeur.as_ref()) {
+            if vus.insert(genre_key(&g)) {
+                sortie.push(g);
+            }
+        }
+    }
+    sortie
+}
+
 /// Canonical grouping key for a genre label, insensitive to case AND to the
 /// space-vs-hyphen separator, so "Trip Hop" and "Trip-Hop" (or "trip hop")
 /// collapse to a single key ("trip hop"). Used to dedup the library genre
@@ -424,6 +476,16 @@ pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
         }
         // lofty may report "alac" directly for some M4A files
         "alac" => "alac".to_string(),
+        // 🔴 #3849 — les deux noms de types lofty qui ne sont pas des
+        // extensions. `FileType::WavPack` s'imprime « wavpack » et
+        // `FileType::Vorbis` « vorbis » ; ni l'un ni l'autre n'est reconnu par
+        // `AudioFormat::from_extension`, qui connaît « wv » et « ogg ».
+        // Écrire l'extension rend `tracks.format` homogène avec ce que le
+        // chemin SANS étiquette écrit déjà pour les mêmes fichiers.
+        //
+        // Garde : `tout_type_lofty_catalogue_donne_un_format_reconnu`.
+        "wavpack" => "wv".to_string(),
+        "vorbis" => "ogg".to_string(),
         other => other.to_string(),
     }
 }
@@ -528,17 +590,18 @@ struct DsfHeaderInfo {
 
 /// Parse a DSF file header to extract sample rate, channel count, duration,
 /// and the metadata (ID3v2) offset.
-fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, ()> {
+fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, &'static str> {
     use std::io::Read;
 
-    let mut f =
-        std::fs::File::open(&*crate::library::artwork::extended_path(path)).map_err(|_| ())?;
+    let mut f = std::fs::File::open(&*crate::library::artwork::extended_path(path))
+        .map_err(|_| "ouverture_impossible")?;
     let mut header = [0u8; 92]; // DSD chunk (28) + fmt chunk header (64 is plenty)
-    f.read_exact(&mut header).map_err(|_| ())?;
+    f.read_exact(&mut header)
+        .map_err(|_| "entete_dsd_trop_court")?;
 
     // Verify "DSD " magic
     if &header[0..4] != b"DSD " {
-        return Err(());
+        return Err("magie_dsd_absente");
     }
 
     // DSD chunk: bytes 4-11 = chunk size (u64 LE, should be 28)
@@ -551,7 +614,7 @@ fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, ()> {
 
     // fmt chunk should start at offset 28
     if &header[28..32] != b"fmt " {
-        return Err(());
+        return Err("magie_fmt_absente");
     }
 
     // fmt chunk layout (all little-endian):
@@ -660,6 +723,21 @@ impl Id3v2Tags {
     }
     fn genre(&self) -> Option<&str> {
         self.get("TCON")
+    }
+
+    /// TOUTES les trames `TCON`, dans l'ordre du fichier.
+    ///
+    /// `get()` ne rend que la première, ce qui suffit à la plupart des trames
+    /// mais pas au genre : un étiqueteur peut écrire une trame `TCON` par
+    /// genre au lieu d'une seule chaîne séparée. Jumeau du chemin lofty, qui
+    /// lit lui aussi toutes les valeurs depuis #1821 — les deux doivent rendre
+    /// la même liste pour le même fichier.
+    fn genres(&self) -> Vec<&str> {
+        self.text_frames
+            .iter()
+            .filter(|(id, _)| id == "TCON")
+            .map(|(_, v)| v.as_str())
+            .collect()
     }
 
     /// Parse track number from TRCK frame ("7" or "7/11").
@@ -1069,55 +1147,403 @@ fn decode_utf16(data: &[u8], little_endian: bool) -> String {
     String::from_utf16_lossy(&code_units)
 }
 
+/// Nombre d'octets que le lecteur de tag DSF tient en mémoire d'un seul bloc.
+///
+/// Ce n'est PLUS un plafond de REFUS. Un tag plus gros n'est plus jeté en
+/// bloc : il est relu trame par trame par [`read_id3v2_selected_frames`], qui
+/// ne copie que les trames utiles et SAUTE les autres d'un `seek` — elles ne
+/// sont jamais allouées.
+///
+/// Le chiffre ne bouge pas, parce que c'est lui qui borne la pointe mémoire du
+/// scan : [`try_read_metadata`] est appelé par le pool de `scanner/walker.rs`,
+/// à `SCAN_IO_CONCURRENCY = 32` lectures simultanées, soit 32 Mio de pointe.
+/// C'est la contrainte mesurée sur ce scanner (JeromeQ : 261 fichiers, 6,1 Gio
+/// de RSS sur une machine de 8 Gio, tué par l'OOM killer), la même que citent
+/// [`MAX_RETAINED_COVER_BYTES`] et les deux passes lofty de ce fichier.
+const DSF_TAG_READ_BUDGET: usize = 1_048_576;
+
+/// Origine de l'appel au lecteur de tag ID3v2 brut. Décide si un rejet PARLE.
+///
+/// Les rejets de ce lecteur étaient tous MUETS : un fichier dont le tag entier
+/// était écarté ne laissait aucune trace, et c'est ce qui a rendu #3180
+/// invisible deux mois (Benjithom fil 1100 : titre = nom de fichier ;
+/// Pierre M fil 920 : tags ignorés en bloc et albums DSD sans pochette).
+///
+/// Mais le même lecteur sert aussi une sonde spéculative en tête de MP3/WAV, où
+/// ne rien trouver est le cas NORMAL. Y journaliser un rejet noierait un scan
+/// de dizaines de milliers de fichiers. C'est donc le SITE D'APPEL qui tranche,
+/// pas le lecteur : un `warn!` par fichier réellement écarté, zéro ligne sur un
+/// fichier ordinaire.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Id3ReadSite {
+    /// Tag d'un `.dsf`, à l'offset annoncé par son en-tête DSD.
+    ///
+    /// lofty 0.24 ne connaît pas le format DSF — pas de variante `FileType`, le
+    /// mot n'apparaît nulle part dans ses sources —, donc `Probe::read()` échoue
+    /// sur tout `.dsf` et ce lecteur est la SEULE source de titre, d'artiste,
+    /// d'album et de pochette du format. Il n'y a aucun filet derrière : tout
+    /// rejet est une perte sèche et doit laisser une trace.
+    DsfTag,
+    /// Sonde spéculative à l'offset 0 d'un fichier NON-DSF dont lofty a rendu un
+    /// titre vide. N'y trouver aucun tag est le cas normal et fréquent — un
+    /// FLAC sans titre le traverse à chaque scan. Muette, donc.
+    LeadingProbe,
+}
+
+/// Trames qu'un tag hors budget vaut la peine d'être relu pour.
+///
+/// Exactement ce que [`parse_id3v2_tag`] consomme : les trames de texte
+/// (`T…`, `TXXX` compris) et `UFID`/`UFI`, où Picard écrit l'identifiant
+/// MusicBrainz. Plus `APIC`/`PIC` quand c'est la pochette qu'on est venu
+/// chercher.
+///
+/// Le critère est SÉMANTIQUE, pas une taille : on ne devine pas ce qui est
+/// « gros », on sait ce qui est utile. La trame qui fait déborder le budget est
+/// toujours l'image, et elle n'est copiée que sur le chemin qui la demande.
+fn id3v2_frame_worth_reading(frame_id: &[u8], want_picture: bool) -> bool {
+    if want_picture && (frame_id == b"APIC".as_slice() || frame_id == b"PIC".as_slice()) {
+        return true;
+    }
+    frame_id.first() == Some(&b'T')
+        || frame_id == b"UFID".as_slice()
+        || frame_id == b"UFI".as_slice()
+}
+
+/// Plafond du seul chemin POCHETTE ([`extract_dsf_cover`]).
+///
+/// Plus haut que [`DSF_TAG_READ_BUDGET`] pour une raison de site d'appel, pas de
+/// goût : la pochette n'est extraite qu'UNE fois par album, par la boucle
+/// d'import séquentielle de `scan_import.rs` (garde `albums_with_cover`), alors
+/// que le tag est lu pour CHAQUE fichier sur un pool de 32 lectures
+/// simultanées. Une seule allocation à la fois, donc.
+///
+/// Le chiffre n'est pas choisi : c'est [`MAX_RETAINED_COVER_BYTES`], la seule
+/// borne MESURÉE du dépôt pour une pochette intégrée. Au-delà, Tune refuse déjà
+/// de tenir une pochette en mémoire quel que soit le conteneur ; le DSF suit la
+/// même règle et l'album retombe sur la pochette de son dossier.
+const DSF_COVER_FRAME_BUDGET: usize = MAX_RETAINED_COVER_BYTES;
+
 /// Read the raw ID3v2 tag bytes from a DSF file's metadata chunk.
 ///
 /// DSF files store an ID3v2 tag at the byte offset specified in the DSD
 /// chunk header (bytes 20-27). Returns the tag as a contiguous buffer
 /// (ID3v2 header + body), or `None` if there is no tag or it looks invalid.
-fn read_dsf_id3v2_raw(path: &Path, metadata_offset: Option<u64>) -> Option<Vec<u8>> {
+///
+/// # #3180 — la pochette n'emporte plus le texte
+///
+/// Ce lecteur refusait EN BLOC tout tag de plus d'un mégaoctet. Dans un `.dsf`,
+/// le tag ID3v2 contient la pochette (`APIC`) : sur un rip SACD elle dépasse
+/// couramment le mégaoctet à elle seule. Le refus rendait donc `None` pour la
+/// TOTALITÉ du tag — plus de titre, plus d'artiste, plus d'album, plus de
+/// pochette — et `dsf_dff_fallback` retombait sur `path.file_stem()`. Une seule
+/// ligne expliquait les deux plaintes du ticket.
+///
+/// Le plafond n'est pas relevé : il borne une pointe mémoire réelle. Ce qui
+/// change, c'est qu'il ne décide plus du sort du TEXTE. Au-dessus du budget, le
+/// tag est reparcouru trame par trame et seules les trames utiles sont copiées.
+fn read_dsf_id3v2_raw(
+    path: &Path,
+    metadata_offset: Option<u64>,
+    site: Id3ReadSite,
+    want_picture: bool,
+) -> Option<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
-
-    let offset = metadata_offset?;
-
-    let mut f = std::fs::File::open(&*crate::library::artwork::extended_path(path)).ok()?;
-    let file_len = f.metadata().ok()?.len();
-
-    // Sanity check: offset must be within the file, with room for at least
-    // the 10-byte ID3v2 header.
-    if offset + 10 > file_len {
+    // Un rejet ne parle que depuis le tag d'un `.dsf` — voir [`Id3ReadSite`].
+    let rejet = |motif: &str, detail: String| {
+        if site == Id3ReadSite::DsfTag {
+            tracing::warn!(
+                path = %path.display(),
+                motif = motif,
+                detail = %detail,
+                "dsf_id3v2_tag_ecarte"
+            );
+        }
+    };
+    let Some(offset) = metadata_offset else {
+        // Pas un rejet : l'en-tête DSD annonce 0 quand le fichier n'a aucun tag.
+        // `debug!`, sinon chaque `.dsf` nu d'une bibliothèque écrirait un `warn!`.
+        if site == Id3ReadSite::DsfTag {
+            tracing::debug!(path = %path.display(), "dsf_id3v2_aucun_chunk_metadata");
+        }
+        return None;
+    };
+    let mut f = match std::fs::File::open(&*crate::library::artwork::extended_path(path)) {
+        Ok(f) => f,
+        Err(e) => {
+            rejet("ouverture_impossible", e.to_string());
+            return None;
+        }
+    };
+    let file_len = match f.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            rejet("taille_illisible", e.to_string());
+            return None;
+        }
+    };
+    // `offset + 10` débordait en silence sur un offset corrompu proche de
+    // `u64::MAX` : en release le calcul boucle, rend un petit nombre, et la
+    // garde PASSE au lieu d'arrêter. `checked_add` la ferme.
+    match offset.checked_add(10) {
+        Some(fin) if fin <= file_len => {}
+        _ => {
+            rejet(
+                "offset_hors_fichier",
+                format!("offset={offset} taille={file_len}"),
+            );
+            return None;
+        }
+    }
+    if let Err(e) = f.seek(SeekFrom::Start(offset)) {
+        rejet("positionnement_impossible", e.to_string());
         return None;
     }
-
-    f.seek(SeekFrom::Start(offset)).ok()?;
-
     // Read the ID3v2 header to get the tag size
     let mut header = [0u8; 10];
-    f.read_exact(&mut header).ok()?;
-
-    if &header[0..3] != b"ID3" {
+    if let Err(e) = f.read_exact(&mut header) {
+        rejet("entete_id3v2_illisible", e.to_string());
         return None;
     }
-
+    if &header[0..3] != b"ID3" {
+        rejet(
+            "pas_un_tag_id3v2",
+            format!("offset={offset} magie={:02x?}", &header[0..3]),
+        );
+        return None;
+    }
     let tag_size = syncsafe_to_u32(&header[6..10]) as usize;
     let total_tag_bytes = 10 + tag_size;
 
-    // Cap read at 1 MB to avoid OOM on corrupt files
-    if total_tag_bytes > 1_048_576 {
-        return None;
+    // Cas courant : le tag tient dans le budget, il est lu d'un bloc — pochette
+    // comprise, donc `extract_dsf_cover` ne change pas d'un octet ici.
+    if total_tag_bytes <= DSF_TAG_READ_BUDGET {
+        let mut tag_data = Vec::with_capacity(total_tag_bytes);
+        tag_data.extend_from_slice(&header);
+        if let Err(e) = f.by_ref().take(tag_size as u64).read_to_end(&mut tag_data) {
+            rejet("corps_du_tag_illisible", e.to_string());
+            return None;
+        }
+        if tag_data.len() < total_tag_bytes {
+            // Lecture COURTE — le troisième `return None` muet. Le tag annonce
+            // plus d'octets que le fichier n'en porte, mais les trames
+            // COMPLÈTES avant la coupure restent valables et `parse_id3v2_tag`
+            // borne son parcours à `data.len()`. On rend ce qui a été lu au lieu
+            // de jeter un titre parfaitement lisible parce que l'image derrière
+            // est tronquée.
+            tracing::warn!(
+                path = %path.display(),
+                annonce = total_tag_bytes,
+                lu = tag_data.len(),
+                "dsf_id3v2_tag_tronque"
+            );
+        }
+        return Some(tag_data);
     }
 
-    // Read the full tag into memory
-    let mut tag_data = vec![0u8; total_tag_bytes];
-    tag_data[..10].copy_from_slice(&header);
-    f.read_exact(&mut tag_data[10..]).ok()?;
+    // Tag AU-DESSUS du budget : c'est ici que #3180 rendait `None`.
+    match read_id3v2_selected_frames(&mut f, &header, offset, file_len, want_picture) {
+        Some(recompose) => {
+            tracing::debug!(
+                path = %path.display(),
+                taille_tag = total_tag_bytes,
+                budget = DSF_TAG_READ_BUDGET,
+                retenu = recompose.len(),
+                "dsf_id3v2_tag_hors_budget_relu_par_trames"
+            );
+            Some(recompose)
+        }
+        None => {
+            // Le parcours par trames n'est pas sûr ici (voir
+            // `read_id3v2_selected_frames`), ou n'a rien retenu. Reste le
+            // préfixe : on lit le budget et on rend ce qu'il contient, que
+            // `parse_id3v2_tag` sait parcourir jusqu'à la coupure. Moins bon que
+            // le parcours, infiniment mieux que l'ancien `None`.
+            if f.seek(SeekFrom::Start(offset)).is_err() {
+                rejet(
+                    "hors_budget_repositionnement_impossible",
+                    format!("taille={total_tag_bytes} budget={DSF_TAG_READ_BUDGET}"),
+                );
+                return None;
+            }
+            let mut prefixe = Vec::with_capacity(DSF_TAG_READ_BUDGET);
+            if f.by_ref()
+                .take(DSF_TAG_READ_BUDGET as u64)
+                .read_to_end(&mut prefixe)
+                .is_err()
+                || prefixe.len() <= 10
+            {
+                rejet(
+                    "hors_budget_prefixe_illisible",
+                    format!("taille={total_tag_bytes} budget={DSF_TAG_READ_BUDGET}"),
+                );
+                return None;
+            }
+            tracing::warn!(
+                path = %path.display(),
+                taille_tag = total_tag_bytes,
+                budget = DSF_TAG_READ_BUDGET,
+                motif = "trames_non_parcourables",
+                "dsf_id3v2_tag_hors_budget_lu_en_prefixe"
+            );
+            Some(prefixe)
+        }
+    }
+}
 
-    Some(tag_data)
+/// Relit un tag ID3v2 trop gros pour le budget en ne copiant QUE les trames
+/// utiles, les autres étant sautées d'un `seek` — jamais allouées.
+///
+/// Rend un tag ID3v2 **recomposé** (en-tête + trames retenues, taille corrigée)
+/// que [`parse_id3v2_tag`] lit sans savoir qu'il a été rebâti. C'est ce qui
+/// évite de redire ici sa logique de décodage : un seul décodeur, un seul
+/// endroit où le corriger.
+///
+/// Rend `None` quand le parcours ne serait pas fiable — l'appelant retombe alors
+/// sur un préfixe plutôt que sur rien.
+fn read_id3v2_selected_frames(
+    f: &mut std::fs::File,
+    header: &[u8; 10],
+    tag_offset: u64,
+    file_len: u64,
+    want_picture: bool,
+) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let major = header[3];
+    if !(2..=4).contains(&major) {
+        return None;
+    }
+    let flags = header[5];
+    let tag_size = syncsafe_to_u32(&header[6..10]) as u64;
+    // Désynchronisation GLOBALE (fanion 0x80) en v2.2/v2.3 : le bourrage
+    // 0xFF 0x00 est réparti sur TOUT le bloc de trames et les tailles annoncées
+    // ne valent qu'une fois ce bourrage retiré. Sauter de trame en trame sur le
+    // flux stocké désaligne tout dès la première. En v2.4 la désynchronisation
+    // est PAR TRAME et la taille compte les octets STOCKÉS : le parcours reste
+    // juste, `parse_id3v2_tag` défaisant le bourrage trame par trame.
+    if major <= 3 && flags & 0x80 != 0 {
+        return None;
+    }
+    // Fin du tag, bornée par le fichier : une taille annoncée plus grande que ce
+    // que le fichier porte ne doit pas nous faire lire au-delà.
+    let tag_end = tag_offset
+        .saturating_add(10)
+        .saturating_add(tag_size)
+        .min(file_len);
+    let mut cursor = tag_offset.saturating_add(10);
+    // En-tête étendu (v2.3/v2.4) : sauté, il n'est pas recopié.
+    if major >= 3 && flags & 0x40 != 0 {
+        let mut ext = [0u8; 4];
+        f.seek(SeekFrom::Start(cursor)).ok()?;
+        f.read_exact(&mut ext).ok()?;
+        let ext_size = if major == 4 {
+            syncsafe_to_u32(&ext) as u64
+        } else {
+            u32::from_be_bytes(ext) as u64
+        };
+        cursor = cursor.saturating_add(ext_size.max(4));
+    }
+    let (id_len, frame_header_len) = if major == 2 {
+        (3usize, 6u64)
+    } else {
+        (4usize, 10u64)
+    };
+    // Ce que le parcours s'autorise à copier EN TOUT. Le chemin pochette ajoute
+    // de quoi tenir une image PAR-DESSUS le texte — il tourne seul, une fois par
+    // album. Le chemin métadonnées garde le budget du scan, à 32 lectures
+    // simultanées.
+    let allocation_max = if want_picture {
+        (DSF_COVER_FRAME_BUDGET + DSF_TAG_READ_BUDGET) as u64
+    } else {
+        DSF_TAG_READ_BUDGET as u64
+    };
+    let mut kept: Vec<u8> = Vec::new();
+    f.seek(SeekFrom::Start(cursor)).ok()?;
+    while cursor.saturating_add(frame_header_len) <= tag_end {
+        let mut entete = [0u8; 10];
+        let n = frame_header_len as usize;
+        if f.read_exact(&mut entete[..n]).is_err() {
+            break;
+        }
+        cursor += frame_header_len;
+        // Bourrage de fin de tag : des octets nuls, plus aucune trame derrière.
+        if entete[0] == 0 {
+            break;
+        }
+        let frame_size = match major {
+            4 => syncsafe_to_u32(&entete[4..8]) as u64,
+            3 => u32::from_be_bytes([entete[4], entete[5], entete[6], entete[7]]) as u64,
+            // v2.2 : taille sur 3 octets, gros-boutiste.
+            _ => ((entete[3] as u64) << 16) | ((entete[4] as u64) << 8) | (entete[5] as u64),
+        };
+        if frame_size == 0 || cursor.saturating_add(frame_size) > tag_end {
+            break;
+        }
+        // Deux plafonds, un par nature de trame : l'image a le sien
+        // (`DSF_COVER_FRAME_BUDGET`), le texte celui du scan. Une image
+        // au-dessus du sien est SAUTÉE — l'album retombe sur la pochette de son
+        // dossier, comme n'importe quel autre conteneur — sans que le texte
+        // autour d'elle en souffre.
+        let id = &entete[..id_len];
+        let est_image = id == b"APIC".as_slice() || id == b"PIC".as_slice();
+        let plafond_trame = if est_image {
+            DSF_COVER_FRAME_BUDGET as u64
+        } else {
+            DSF_TAG_READ_BUDGET as u64
+        };
+        let garder = id3v2_frame_worth_reading(id, want_picture)
+            && frame_size <= plafond_trame
+            && kept.len() as u64 + frame_header_len + frame_size <= allocation_max;
+        if garder {
+            let mut corps = vec![0u8; frame_size as usize];
+            if f.read_exact(&mut corps).is_err() {
+                break;
+            }
+            kept.extend_from_slice(&entete[..n]);
+            kept.extend_from_slice(&corps);
+        } else {
+            // La trame écartée n'est jamais lue : on passe par-dessus.
+            if f.seek(SeekFrom::Current(frame_size as i64)).is_err() {
+                break;
+            }
+        }
+        cursor += frame_size;
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    // Tag recomposé : le même en-tête, sans le fanion d'en-tête étendu (0x40,
+    // non recopié) ni celui de pied de page (0x10, laissé derrière), et la
+    // taille syncsafe des seules trames retenues.
+    let mut out = Vec::with_capacity(10 + kept.len());
+    out.extend_from_slice(header);
+    out[5] &= !(0x40u8 | 0x10u8);
+    let taille = kept.len();
+    out[6] = ((taille >> 21) & 0x7F) as u8;
+    out[7] = ((taille >> 14) & 0x7F) as u8;
+    out[8] = ((taille >> 7) & 0x7F) as u8;
+    out[9] = (taille & 0x7F) as u8;
+    out.extend_from_slice(&kept);
+    Some(out)
 }
 
 /// Read and parse the ID3v2 metadata chunk from a DSF file.
 fn read_dsf_id3v2_tags(path: &Path, metadata_offset: Option<u64>) -> Option<Id3v2Tags> {
-    let tag_data = read_dsf_id3v2_raw(path, metadata_offset)?;
-    parse_id3v2_tag(&tag_data)
+    let tag_data = read_dsf_id3v2_raw(path, metadata_offset, Id3ReadSite::DsfTag, false)?;
+    match parse_id3v2_tag(&tag_data) {
+        Some(tags) => Some(tags),
+        None => {
+            // Le tag a été LU mais pas compris : version hors 2.2–2.4, en-tête
+            // étendu incohérent… Muet jusqu'ici, alors que c'est le dernier
+            // point avant le repli sur le nom de fichier.
+            tracing::warn!(
+                path = %path.display(),
+                octets = tag_data.len(),
+                motif = "tag_illisible",
+                "dsf_id3v2_tag_ecarte"
+            );
+            None
+        }
+    }
 }
 
 /// Decode the image bytes and MIME type from an ID3v2 picture frame body.
@@ -1210,10 +1636,28 @@ pub(crate) fn extract_dsf_cover(path: &Path) -> Option<(Vec<u8>, String)> {
         return None;
     }
 
-    let info = parse_dsf_header_full(path).ok()?;
-    let tag_data = read_dsf_id3v2_raw(path, info.metadata_offset)?;
-
-    let (mime, data) = parse_id3v2_tag(&tag_data)?.picture?;
+    let info = match parse_dsf_header_full(path) {
+        Ok(info) => info,
+        Err(motif) => {
+            // `debug!` et pas `warn!` : la passe de métadonnées a déjà parlé au
+            // niveau WARN pour ce même fichier (`dsf_entete_illisible`), et le
+            // redire ici doublerait chaque ligne d'un scan de DSF abîmés.
+            tracing::debug!(path = %path.display(), motif, "dsf_pochette_entete_illisible");
+            return None;
+        }
+    };
+    // `want_picture` : sur un tag hors budget, c'est le seul chemin qui copie la
+    // trame APIC. La passe de métadonnées, elle, la saute — d'où deux plafonds.
+    let tag_data = read_dsf_id3v2_raw(path, info.metadata_offset, Id3ReadSite::DsfTag, true)?;
+    let (mime, data) = match parse_id3v2_tag(&tag_data).and_then(|t| t.picture) {
+        Some(p) => p,
+        None => {
+            // Cas NORMAL et fréquent : un DSF tagué sans pochette intégrée.
+            // `debug!` — un `warn!` ici parlerait pour un album sur deux.
+            tracing::debug!(path = %path.display(), "dsf_aucune_pochette_integree");
+            return None;
+        }
+    };
     Some((data, mime))
 }
 
@@ -1226,7 +1670,36 @@ pub(crate) fn extract_dsf_cover(path: &Path) -> Option<(Vec<u8>, String)> {
 ///
 /// For DFF files (or if DSF header / ID3v2 parsing fails), we fall back to
 /// deriving title/album/artist from the file path.
+///
+/// Forme sans balise lofty : lofty n'a rien ouvert, ou n'a rendu aucune
+/// balise. Voir [`dsf_dff_fallback_complete`] pour l'ordre des sources.
 fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
+    dsf_dff_fallback_complete(path, None)
+}
+
+/// Le repli DSF/DFF, avec la balise que lofty a déjà rendue quand il en a une.
+///
+/// # #3180 — trois sources, dans cet ordre, et rien n'est écrasé
+///
+/// 1. les VRAIES balises ID3v2 du fichier, lues par notre propre lecteur ;
+/// 2. ce que lofty avait lu dans sa balise (`tag_lofty`), pour les seuls
+///    champs que le lecteur maison n'a pas rendus ;
+/// 3. le nom de fichier et l'arborescence, pour ce qui manque encore.
+///
+/// Avant, ce repli remplaçait EN BLOC la balise lofty : un `.dsf` dont lofty
+/// lisait bien l'artiste, l'album et l'année mais pas le titre repartait
+/// avec l'artiste = nom du dossier grand-parent et l'année perdue (Pierre M,
+/// fil 920). Et le titre de secours était `file_stem()` BRUT, numéro de piste
+/// compris — « 01 - The Beat Goes On » chez Benjithom (fil 1100) — alors que
+/// les deux autres replis passaient déjà par [`extract_title_from_filename`].
+///
+/// Le passage par le chemin est journalisé en `info!` avec les champs
+/// fabriqués : c'était le seul repli muet, et une piste ainsi remplie était
+/// indistinguable d'une piste correctement taguée.
+fn dsf_dff_fallback_complete(
+    path: &Path,
+    tag_lofty: Option<&lofty::tag::Tag>,
+) -> Option<TrackMetadata> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     if ext != "dsf" && ext != "dff" {
         return None;
@@ -1244,7 +1717,14 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
                 info.duration_ms,
                 info.metadata_offset,
             ),
-            Err(_) => (None, None, None, None),
+            Err(motif) => {
+                // Muet jusqu'ici : un `.dsf` dont l'en-tête DSD ne se lit pas
+                // perdait d'un coup fréquence, canaux, durée ET tag, sans une
+                // ligne. lofty ne connaissant pas le format, il n'y a aucun
+                // second lecteur derrière pour rattraper.
+                tracing::warn!(path = %path.display(), motif, "dsf_entete_illisible");
+                (None, None, None, None)
+            }
         }
     } else {
         // DFF (DSDIFF) has no fmt/ID3 chunk like DSF. Previously this arm
@@ -1295,12 +1775,13 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         compilation,
         credits,
     ) = if let Some(ref tags) = id3_tags {
-        let raw_genre = tags.genre().map(|s| s.to_string());
-        let genres = raw_genre
-            .as_deref()
-            .map(split_genre_tag)
-            .unwrap_or_default();
-        let genre = genres.first().cloned().or(raw_genre);
+        // Toutes les trames `TCON`, comme le chemin lofty (#1821).
+        let raw_genres: Vec<&str> = tags.genres();
+        let genres = genres_from_tag_values(&raw_genres);
+        let genre = genres
+            .first()
+            .cloned()
+            .or_else(|| raw_genres.first().map(|s| s.to_string()));
 
         let compilation_str = tags.get("TCMP").unwrap_or("");
         let compilation = matches!(compilation_str, "1" | "true" | "True");
@@ -1370,17 +1851,70 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         )
     };
 
-    // Fall back to filename/directory for fields the ID3v2 tag didn't provide.
     // Treat a present-but-empty/whitespace tag as absent: a file whose ALBUM tag
     // is "" (not missing) otherwise produced a blank, untitled album that no
     // amount of re-scanning could name (Bilou #1093). `filter` drops the empty
     // value so the folder-name fallback kicks in.
-    let title = title
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
+    let non_vide = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+    let title = non_vide(title);
+    let mut artist = non_vide(artist);
+    let mut album = non_vide(album);
+    let mut album_artist = non_vide(album_artist);
+    let mut year = year;
+    let mut track_number = track_number;
+    let mut disc_number = disc_number;
+    let mut genre = non_vide(genre);
+
+    // Source 2 (#3180) : ce que lofty avait DÉJÀ lu n'est pas écrasé. Ce
+    // repli est appelé avec sa balise quand lofty a rendu un titre vide sur un
+    // DSD ; l'artiste, l'album et l'année qu'il y avait lus restent bons et
+    // ne doivent pas céder devant un nom de dossier.
+    if let Some(tag) = tag_lofty {
+        use lofty::tag::{Accessor, ItemKey};
+        let texte = |s: Option<std::borrow::Cow<'_, str>>| non_vide(s.map(|s| s.to_string()));
+        artist = artist.or_else(|| texte(tag.artist()));
+        album = album.or_else(|| texte(tag.album()));
+        album_artist = album_artist
+            .or_else(|| non_vide(tag.get_string(ItemKey::AlbumArtist).map(|s| s.to_string())));
+        year = year.or_else(|| tag.date().map(|d| d.year as u32));
+        track_number = track_number.or_else(|| tag.track());
+        disc_number = disc_number.or_else(|| tag.disk());
+        genre = genre.or_else(|| texte(tag.genre()));
+    }
+
+    // Source 3 : le nom de fichier et l'arborescence, pour ce qui manque
+    // encore. Le titre de secours est le nom de fichier SANS son numéro de
+    // piste — « 01 - The Beat Goes On » devient « The Beat Goes On » et le
+    // numéro va dans `track_number` s'il n'y était pas (#3180). Le même
+    // découpage que `tagless_fallback` et le repli à balises partielles.
+    let (numero_du_nom, titre_du_nom) = extract_title_from_filename(path);
     let (album_du_chemin, artiste_du_chemin, disque_du_chemin) = album_artiste_du_chemin(path);
-    let album = album.filter(|s| !s.trim().is_empty()).or(album_du_chemin);
+    let titre_du_chemin = title.is_none();
+    let artiste_du_chemin_pris = artist.is_none() && artiste_du_chemin.is_some();
+    let album_du_chemin_pris = album.is_none() && album_du_chemin.is_some();
+    let title = title
+        .or(titre_du_nom)
+        .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
+    let track_number = track_number.or(numero_du_nom);
+    let album = album.or(album_du_chemin);
     let artist = artist.or(artiste_du_chemin);
+    if titre_du_chemin || artiste_du_chemin_pris || album_du_chemin_pris {
+        // `info!` et non `debug!` : c'est la trace qui manquait deux mois
+        // durant. Elle ne parle QUE quand un champ a été fabriqué depuis le
+        // chemin — un DSD entièrement tagué passe ici sans bruit.
+        tracing::info!(
+            path = %path.display(),
+            titre_du_nom_de_fichier = titre_du_chemin,
+            artiste_du_dossier = artiste_du_chemin_pris,
+            album_du_dossier = album_du_chemin_pris,
+            title = ?title,
+            artist = ?artist,
+            album = ?album,
+            "dsf_dff_fallback_depuis_le_chemin"
+        );
+    } else {
+        tracing::debug!(path = %path.display(), "dsf_dff_fallback_metadata");
+    }
     // `album_artist` n'est PLUS déduit du chemin. C'est le seul repli à tags
     // partiels : le fichier peut porter un ARTIST par piste sans ALBUMARTIST,
     // et y coller un nom de dossier faisait arriver le champ REMPLI au scan.
@@ -1459,6 +1993,9 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         cover_art: None,
         credits,
         comment: None,
+        // Ce repli lit de VRAIES balises ID3v2 : rien n'est fabriqué depuis
+        // le chemin côté artiste d'album (#1656).
+        artist_from_path: false,
     })
 }
 
@@ -1490,8 +2027,13 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
     Some(TrackMetadata {
         title,
         album,
-        artist: artist.clone(),
-        album_artist: artist,
+        artist,
+        // Déduit du CHEMIN, donc jamais présenté comme un artiste d'album :
+        // même arbitrage que le repli DSD (#1656) et même motif que #3232 —
+        // un nom de dossier compté comme artiste bascule le dossier entier en
+        // « Various Artists ». Absent, le champ laisse le scan épingler
+        // l'artiste réel du dossier.
+        album_artist: None,
         album_artist_sort: None,
         track_number,
         disc_number,
@@ -1504,6 +2046,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         original_date: None,
         genre: None,
         genres: vec![],
+        artist_from_path: true,
         format: Some("alac".to_string()),
         file_size,
         sample_rate: None,
@@ -1534,7 +2077,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
 /// toujours un vrai titre d'album (« Greatest Hits Vol. 2 »), et le confondre
 /// avec un disque effacerait un album entier. Un préfixe suivi d'autre chose
 /// qu'un nombre — `Disco`, `CD Rip` — ne correspond pas non plus.
-pub(crate) fn numero_de_disque(nom: &str) -> Option<u32> {
+pub fn numero_de_disque(nom: &str) -> Option<u32> {
     let nom = nom.trim().to_lowercase();
     // « disque » avant « disc », sinon « disque 2 » se lirait « disc » + « ue 2 ».
     for prefixe in ["disque", "disc", "disk", "cd"] {
@@ -1623,8 +2166,10 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
     TrackMetadata {
         title,
         album,
-        artist: artist.clone(),
-        album_artist: artist,
+        artist,
+        // Voir `TrackMetadata::artist_from_path` : déduit du chemin, ce nom
+        // n'est pas un artiste d'album (#1656, #3232).
+        album_artist: None,
         album_artist_sort: None,
         track_number,
         disc_number,
@@ -1637,6 +2182,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         original_date: None,
         genre: None,
         genres: vec![],
+        artist_from_path: true,
         format,
         file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
             .ok()
@@ -1687,8 +2233,14 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
     TrackMetadata {
         title,
         album,
-        artist: artist.clone(),
-        album_artist: artist,
+        artist,
+        // C'est CE repli qu'emprunte un fichier dont la lecture des balises a
+        // dépassé le délai sur un NAS lent. Lui donner le nom du dossier pour
+        // artiste d'album fabriquait un second artiste dans le dossier et
+        // basculait l'album en « Various Artists » un scan sur deux — le
+        // « au hasard » de Pierre M (#3232). Absent : voir
+        // `TrackMetadata::artist_from_path`.
+        album_artist: None,
         album_artist_sort: None,
         track_number,
         disc_number,
@@ -1701,6 +2253,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         original_date: None,
         genre: None,
         genres: vec![],
+        artist_from_path: true,
         format: Some(ext),
         file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
             .ok()
@@ -1732,20 +2285,25 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
 ///   "01 - Title.wav" -> (Some(1), Some("Title"))
 ///   "01. Title.wav"  -> (Some(1), Some("Title"))
 ///   "01_Title.wav"   -> (Some(1), Some("Title"))
+///   "D1 03 - Title.dsf" -> (Some(3), Some("Title"))   (marque de disque sautée)
 ///   "Title.wav"      -> (None, Some("Title"))
 fn extract_title_from_filename(path: &Path) -> (Option<u32>, Option<String>) {
     let file_name = match path.file_stem().and_then(|s| s.to_str()) {
         Some(n) => n,
         None => return (None, None),
     };
-    if let Some(first_char) = file_name.chars().next()
+    // Rips multi-disques : « D1 03 - Titre » ou « d2-11. Titre ». La marque de
+    // disque n'est sautée QUE si un numéro de piste la suit — « D12 - Purple
+    // Pills » garde son titre entier (#3180).
+    let sans_disque = sauter_marque_de_disque(file_name).unwrap_or(file_name);
+    if let Some(first_char) = sans_disque.chars().next()
         && first_char.is_ascii_digit()
     {
-        let num_str: String = file_name
+        let num_str: String = sans_disque
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect();
-        let after = file_name[num_str.len()..].trim_start_matches([' ', '-', '.', '_']);
+        let after = sans_disque[num_str.len()..].trim_start_matches([' ', '-', '.', '_']);
         let title = if after.is_empty() {
             Some(file_name.to_string())
         } else {
@@ -1755,6 +2313,231 @@ fn extract_title_from_filename(path: &Path) -> (Option<u32>, Option<String>) {
     } else {
         (None, Some(file_name.to_string()))
     }
+}
+
+/// Un titre de balise qui ne dit rien d'autre que « la piste numéro N ».
+///
+/// Ce n'est pas une invention de Tune : c'est ce qu'écrivent les logiciels de
+/// gravure quand le disque n'est pas reconnu — `Track 01`, `Piste 1`,
+/// `Audio Track 6`, `Untitled`. La balise EXISTE, elle est parfaitement lisible,
+/// et elle ne porte aucune information. Le nom du fichier, lui, en porte une
+/// quand l'auditeur a rangé sa bibliothèque à la main.
+///
+/// Mesuré chez **Belkadi Yacine** (#2060, #3522, tickets support 85→92 du
+/// 07/09/2026) : dix-neuf FLAC nommés `01 Ballade De Melody Nelson.flac` …
+/// `19 Glory Box (Mudflap Mix).flac`, affichés « Track 1 » … « Track 19 » dans
+/// Tune. Son journal le confirme au moment de la lecture —
+/// `orchestrator_play … title=Track 6` pour le fichier `06 Melody.flac` — et
+/// son scan ne signale AUCUN échec de lecture de balise
+/// (`batched_scan_complete total=25 metadata_ok=19 metadata_failed=0`).
+/// Le titre affiché vient donc bien de la balise, pas d'un repli.
+///
+/// La liste est volontairement étroite : le mot doit être un marqueur de
+/// position, seul ou suivi d'un nombre, et RIEN d'autre. « Trackspotting »,
+/// « Piste noire », « Track Of My Tears » n'en sont pas.
+pub(crate) fn titre_de_remplissage(titre: &str) -> bool {
+    let t = titre.trim().to_lowercase();
+    if t.is_empty() {
+        return true;
+    }
+    if matches!(
+        t.as_str(),
+        "untitled" | "unknown" | "no title" | "sans titre" | "titre inconnu" | "aucun titre"
+    ) {
+        return true;
+    }
+    // « untitled track » avant « track » : le préfixe le plus long d'abord,
+    // sinon `strip_prefix("track")` ne verrait jamais les composés.
+    for prefixe in [
+        "audio track",
+        "untitled track",
+        "unknown track",
+        "track",
+        "piste",
+        "plage",
+    ] {
+        let Some(reste) = t.strip_prefix(prefixe) else {
+            continue;
+        };
+        let reste = reste.trim_start_matches([' ', '-', '_', '.', '#', ':']);
+        let reste = reste
+            .strip_prefix("no.")
+            .or_else(|| reste.strip_prefix("n°"))
+            .unwrap_or(reste)
+            .trim_start_matches([' ', '-', '_', '.', '#']);
+        if reste.is_empty() || reste.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Le titre que la piste portera, entre celui de la BALISE et celui tiré du nom
+/// de fichier.
+///
+/// **La balise gagne.** Deux exceptions, et deux seulement :
+///
+/// 1. la balise n'a pas de titre — le repli historique (JP Robbe), inchangé ;
+/// 2. la balise porte un titre de REMPLISSAGE ([`titre_de_remplissage`]) *et*
+///    le nom de fichier en porte un autre, qui n'en est pas un.
+///
+/// Trois verrous encadrent la seconde, pour qu'aucune balise réelle ne puisse
+/// être écrasée :
+///
+/// - le nom de fichier doit contenir au moins une LETTRE. `06.flac` donne
+///   « 06 » : un numéro n'apprend rien de plus que « Track 6 », et le
+///   remplacement serait une régression pure ;
+/// - le nom de fichier ne doit pas être lui-même un remplissage. Un morceau
+///   réellement intitulé « Track 9 » est rangé dans `09 Track 9.flac` : les
+///   deux côtés disent la même chose, donc rien ne bouge ;
+/// - les deux titres doivent différer, sinon il n'y a rien à faire.
+///
+/// Le sens du remplacement est donc toujours « une balise vide de sens cède à
+/// une information réelle », jamais l'inverse.
+pub(crate) fn titre_retenu(du_tag: Option<String>, du_nom: Option<String>) -> Option<String> {
+    let Some(tag) = du_tag.filter(|t| !t.trim().is_empty()) else {
+        return du_nom;
+    };
+    let Some(nom) = du_nom.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
+        return Some(tag);
+    };
+    if !titre_de_remplissage(&tag)
+        || titre_de_remplissage(nom)
+        || !nom.chars().any(char::is_alphabetic)
+        || nom.to_lowercase() == tag.trim().to_lowercase()
+    {
+        return Some(tag);
+    }
+    Some(nom.to_string())
+}
+
+#[cfg(test)]
+mod tests_titre_de_remplissage {
+    use super::{titre_de_remplissage, titre_retenu};
+
+    #[test]
+    fn les_formes_ecrites_par_les_logiciels_de_gravure() {
+        for t in [
+            "Track 1",
+            "Track 19",
+            "track06",
+            "Track-06",
+            "Track_6",
+            "Track.6",
+            "Track #6",
+            "Track No. 6",
+            "Audio Track 06",
+            "Untitled Track 3",
+            "Unknown Track",
+            "Piste 6",
+            "Plage 12",
+            "Track",
+            "Untitled",
+            "Sans titre",
+            "  Track 6  ",
+        ] {
+            assert!(titre_de_remplissage(t), "{t} est un remplissage");
+        }
+    }
+
+    /// Contre-épreuve : la liste est étroite, et elle doit le rester. Un seul
+    /// faux positif ici ferait DISPARAÎTRE un vrai titre au profit d'un nom de
+    /// fichier.
+    #[test]
+    fn aucun_vrai_titre_ne_passe_pour_un_remplissage() {
+        for t in [
+            "Trackspotting",
+            "Track Of My Tears",
+            "Piste noire",
+            "Plage privée",
+            "Fast Track to Nowhere",
+            "Untitled #23",
+            "Unknown Pleasures",
+            "Glory Box",
+            "06 Melody",
+            "9",
+        ] {
+            assert!(!titre_de_remplissage(t), "{t} est un vrai titre");
+        }
+    }
+
+    #[test]
+    fn le_cas_de_yacine() {
+        assert_eq!(
+            titre_retenu(Some("Track 6".into()), Some("Melody".into())).as_deref(),
+            Some("Melody")
+        );
+    }
+
+    #[test]
+    fn la_balise_gagne_des_qu_elle_dit_quelque_chose() {
+        assert_eq!(
+            titre_retenu(Some("Glory Box".into()), Some("piste six".into())).as_deref(),
+            Some("Glory Box")
+        );
+    }
+
+    #[test]
+    fn un_nom_sans_lettre_ne_remplace_rien() {
+        assert_eq!(
+            titre_retenu(Some("Track 6".into()), Some("06".into())).as_deref(),
+            Some("Track 6")
+        );
+        assert_eq!(
+            titre_retenu(Some("Track 6".into()), Some("6 - 6".into())).as_deref(),
+            Some("Track 6")
+        );
+    }
+
+    #[test]
+    fn deux_remplissages_ne_se_remplacent_pas() {
+        assert_eq!(
+            titre_retenu(Some("Track 9".into()), Some("Track 9".into())).as_deref(),
+            Some("Track 9")
+        );
+        assert_eq!(
+            titre_retenu(Some("Track 9".into()), Some("Piste 9".into())).as_deref(),
+            Some("Track 9")
+        );
+    }
+
+    #[test]
+    fn le_repli_historique_du_titre_absent_est_intact() {
+        assert_eq!(
+            titre_retenu(None, Some("Toy Box".into())).as_deref(),
+            Some("Toy Box")
+        );
+        assert_eq!(
+            titre_retenu(Some("   ".into()), Some("Toy Box".into())).as_deref(),
+            Some("Toy Box")
+        );
+        // Rien des deux côtés : rien à rendre.
+        assert_eq!(titre_retenu(None, None), None);
+        // Une balise de remplissage SANS nom de fichier exploitable reste :
+        // « Track 6 » vaut mieux que rien.
+        assert_eq!(
+            titre_retenu(Some("Track 6".into()), None).as_deref(),
+            Some("Track 6")
+        );
+    }
+}
+/// Saute une marque de disque « D1 » / « d02 » en tête de nom de fichier,
+/// mais seulement si un numéro de piste vient juste derrière (séparé par
+/// espace, tiret, point ou soulignement). Rend `None` sinon.
+fn sauter_marque_de_disque(nom: &str) -> Option<&str> {
+    let reste = nom.strip_prefix(['D', 'd'])?;
+    let chiffres = reste.chars().take_while(|c| c.is_ascii_digit()).count();
+    if !(1..=2).contains(&chiffres) {
+        return None;
+    }
+    let apres = &reste[chiffres..];
+    let sans_separateur = apres.trim_start_matches([' ', '-', '.', '_']);
+    if sans_separateur.len() == apres.len() {
+        return None;
+    }
+    sans_separateur
+        .starts_with(|c: char| c.is_ascii_digit())
+        .then_some(sans_separateur)
 }
 
 /// Écarter une durée MP3 franchement incohérente avec la taille du fichier.
@@ -1847,7 +2630,7 @@ fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
 /// none — the vast majority — pay the full price every time.
 fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
     let ext = path.extension()?.to_str()?.to_lowercase();
-    if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
+    if !matches!(ext.as_str(), "flac" | "ogg" | "oga" | "opus") {
         return None;
     }
     // Vorbis comments live in the file header; a bounded prefix read finds them
@@ -1891,6 +2674,15 @@ fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
     None
 }
 
+/// Provenance d'un `dr_track` LU DANS LE TAG du fichier (#3924).
+///
+/// Jumeau de `crate::audio::replaygain::DR_SOURCE_ANALYSIS`, qui marque la
+/// valeur CALCULEE par la passe d'analyse. Les deux vivent a cote de leur
+/// ecrivain plutot que dans un module commun : chacune est lue par un seul
+/// point de code, et aucun consommateur ne les compare — les routes qui les
+/// servent recopient la chaine sans l'interpreter (`dynamic_range_source`).
+pub(crate) const DR_SOURCE_TAG: &str = "tag";
+
 /// Reduce a Dynamic Range tag to its bare digits.
 ///
 /// Tools disagree on the form: DROffline MK2 and foobar2000 write `12`, `DR12`
@@ -1925,7 +2717,7 @@ fn normalise_dr(raw: &str) -> String {
 
 fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_lowercase();
-    if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
+    if !matches!(ext.as_str(), "flac" | "ogg" | "oga" | "opus") {
         return None;
     }
     // The Vorbis comment block lives in the file header (FLAC metadata blocks
@@ -2086,6 +2878,9 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     // Benjithom). Because a (mostly-empty) tag *is* present, the `None` branch
     // above never fires. So when lofty's title is empty for a DSD file, prefer
     // our own ID3v2.2/.3/.4 parser, which reads those frames correctly.
+    //
+    // La balise lofty est passée au repli : ce qu'elle contient de bon —
+    // artiste, album, année — n'est plus remplacé par l'arborescence (#3180).
     {
         let ext = path
             .extension()
@@ -2095,7 +2890,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         if matches!(ext.as_str(), "dsf" | "dff")
             && tag.title().map_or(true, |t| t.trim().is_empty())
         {
-            if let Some(meta) = dsf_dff_fallback(path) {
+            if let Some(meta) = dsf_dff_fallback_complete(path, Some(tag)) {
                 if meta
                     .title
                     .as_deref()
@@ -2126,7 +2921,17 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
 
     let credits = parse_credits(tag);
 
-    let mut raw_genre = tag.genre().map(|s| s.to_string());
+    // TOUTES les valeurs du tag de genre, pas seulement la première (#1821).
+    // `Accessor::genre()` ne rend que la première : un FLAC gravé avec deux
+    // champs `GENRE`, ou un M4A avec deux atomes `©gen`, perdait tous ses
+    // genres secondaires — alors que le MÊME disque, acheté chez un marchand
+    // qui écrit « Jazz; Fusion » dans un unique `TCON`, les gardait tous les
+    // deux. Le classement dépendait donc du logiciel de gravure, pas de la
+    // musique (DEvir, #1821).
+    let mut raw_genres: Vec<String> = tag
+        .get_strings(ItemKey::Genre)
+        .map(|s| s.to_string())
+        .collect();
     // MP3s carrying two prepended ID3v2 tags (iTunes M4A→MP3 leftover + Mp3Tag
     // re-tag) make lofty merge last-wins, so a stale genre overrides the user's.
     // Read the first tag like every standard player does — no-op unless a second
@@ -2137,14 +2942,16 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         .is_some_and(|e| e.eq_ignore_ascii_case("mp3"))
     {
         if let Some(g) = mp3_first_tag_genre_if_dual(path) {
-            raw_genre = Some(g);
+            // Le premier tag REMPLACE la fusion de lofty : c'est tout ce que
+            // lisent les autres lecteurs, valeurs multiples comprises.
+            raw_genres = vec![g];
         }
     }
-    let genres = raw_genre
-        .as_deref()
-        .map(split_genre_tag)
-        .unwrap_or_default();
-    let genre = genres.first().cloned().or(raw_genre);
+    let genres = genres_from_tag_values(&raw_genres);
+    let genre = genres
+        .first()
+        .cloned()
+        .or_else(|| raw_genres.first().cloned());
 
     // lofty can't distinguish ALAC (lossless) from AAC (lossy) in an M4A/MP4
     // container and reports no bit depth for either, so a tagged ALAC file was
@@ -2175,7 +2982,11 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     let mut artist = tag.artist().map(|s| s.to_string());
     let mut album = tag.album().map(|s| s.to_string());
     if title.as_deref().map_or(true, |t| t.trim().is_empty()) {
-        if let Some(raw) = read_dsf_id3v2_raw(path, Some(0)) {
+        // `LeadingProbe` : sonde spéculative, ne rien trouver est le cas
+        // normal — elle ne journalise donc aucun rejet. Sans cette
+        // distinction, chaque fichier sans titre d'une bibliothèque
+        // produirait une ligne de journal par scan.
+        if let Some(raw) = read_dsf_id3v2_raw(path, Some(0), Id3ReadSite::LeadingProbe, false) {
             if let Some(id3) = parse_id3v2_tag(&raw) {
                 let prefer = |cur: Option<String>, alt: Option<&str>| -> Option<String> {
                     if cur.as_deref().map_or(true, |x| x.trim().is_empty()) {
@@ -2202,8 +3013,17 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     // Montreux Alexander FLACs have TITLE+ALBUM but no TRACKNUMBER). Fill each
     // MISSING field individually — never override a value the tag already has.
     let (fname_track, fname_title) = extract_title_from_filename(path);
-    if title.as_deref().map_or(true, |t| t.trim().is_empty()) {
-        title = fname_title;
+    let titre_du_tag = title.clone();
+    title = titre_retenu(title, fname_title);
+    if title != titre_du_tag && titre_du_tag.is_some() {
+        // Ne se produit QUE sur le cas ci-dessous (un titre vide n'était pas
+        // `Some`), donc une ligne par fichier de remplissage et rien d'autre.
+        tracing::info!(
+            path = %path.display(),
+            titre_du_tag = ?titre_du_tag,
+            titre_retenu = ?title,
+            "titre_de_remplissage_ecarte_au_profit_du_nom_de_fichier"
+        );
     }
     // Le dossier parent n'est pas toujours l'album : sous `.../Titre/CD2/`,
     // c'est un disque, et l'album est au-dessus (#1656).
@@ -2308,6 +3128,8 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         }),
         credits,
         comment: tag.comment().map(|s| s.to_string()),
+        // Chemin nominal : les balises ont été lues.
+        artist_from_path: false,
     })
 }
 
@@ -2483,7 +3305,32 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         if let Some(v) = find_vorbis_comment(&header, "DYNAMIC RANGE")
             .or_else(|| find_vorbis_comment(&header, "DR"))
         {
-            meta.insert("dr_track".into(), normalise_dr(&v));
+            let dr = normalise_dr(&v);
+            // #3924 — LA PROVENANCE S'ECRIT AVEC LA VALEUR, jamais apres.
+            //
+            // Depuis la v0.9.145, `dr_track` a DEUX producteurs : cette
+            // lecture-ci, qui prend le tag du fichier, et la passe d'analyse
+            // (`audio::replaygain`), qui CALCULE la valeur et se marque
+            // `dr_source = "analysis"`. Sans le pendant ici, la clef ne
+            // couvrait qu'un producteur sur deux, et l'ecart se payait deux
+            // fois :
+            //
+            // * une valeur venue du tag n'etait separable d'une valeur venue
+            //   d'un calcul par AUCUNE lecture — c'est le fil 1683, ou
+            //   Patatorz, qui mesure ses DR lui-meme, demande « d'ou ca
+            //   sort » et ou personne ne peut lui repondre ;
+            // * pire, un fichier analyse PUIS retague gardait
+            //   `dr_source = "analysis"` sur une valeur desormais lue dans le
+            //   tag : la clef ne se contentait plus de manquer, elle mentait.
+            //
+            // Rien n'est ecrit sur une valeur VIDE (`DYNAMIC RANGE=` existe
+            // sur des fichiers mal etiquetes) : la meme regle que
+            // `replaygain::peut_ecrire_le_dr`, une valeur vide n'est pas une
+            // valeur et n'a donc pas de provenance.
+            if !dr.trim().is_empty() {
+                meta.insert("dr_source".into(), DR_SOURCE_TAG.into());
+            }
+            meta.insert("dr_track".into(), dr);
         }
     }
     if let Some(v) = get(ItemKey::CopyrightMessage) {
@@ -2564,6 +3411,13 @@ pub struct MetadataUpdate {
     pub year: Option<u32>,
     pub composer: Option<String>,
     pub label: Option<String>,
+    /// MBID de l'**enregistrement** MusicBrainz.
+    ///
+    /// Il désigne une prise, pas le rang d'une piste dans une édition :
+    /// c'est la seule clé qui dise « ce morceau-ci est le même que
+    /// celui-là » d'une édition à l'autre. Écrit tel quel, jamais déduit
+    /// d'un titre.
+    pub musicbrainz_recording_id: Option<String>,
 }
 
 impl MetadataUpdate {
@@ -2589,6 +3443,11 @@ impl MetadataUpdate {
         clean("genre", &mut update.genre, &mut corrections);
         clean("composer", &mut update.composer, &mut corrections);
         clean("label", &mut update.label, &mut corrections);
+        clean(
+            "musicbrainz_recording_id",
+            &mut update.musicbrainz_recording_id,
+            &mut corrections,
+        );
         (update, corrections)
     }
 }
@@ -2647,6 +3506,12 @@ pub fn write_metadata(path: &Path, update: &MetadataUpdate) -> Result<(), String
     }
     if let Some(ref v) = update.label {
         tag.insert(TagItem::new(ItemKey::Label, ItemValue::Text(v.clone())));
+    }
+    if let Some(ref v) = update.musicbrainz_recording_id {
+        tag.insert(TagItem::new(
+            ItemKey::MusicBrainzRecordingId,
+            ItemValue::Text(v.clone()),
+        ));
     }
 
     tag.save_to_path(path, WriteOptions::default())
@@ -2964,6 +3829,9 @@ mod tests_dossier_de_disque {
         assert_eq!(m.album.as_deref(), Some("VA-Best of 80s"));
         assert_eq!(m.artist.as_deref(), Some("Various Artists"));
         assert_eq!(m.disc_number, Some(2));
+        // #3232 : ce repli se dénonce, et n'invente plus d'artiste d'album.
+        assert!(m.artist_from_path);
+        assert_eq!(m.album_artist, None);
     }
 }
 
@@ -3036,6 +3904,7 @@ mod tests {
             year: None,
             composer: None,
             label: None,
+            musicbrainz_recording_id: None,
         };
         let (clean, corrections) = update.sanitized();
         assert_eq!(clean.title.as_deref(), Some("A B"));
@@ -3497,9 +4366,128 @@ mod tests {
             year: Some(2024),
             composer: Some("Composer".into()),
             label: None,
+            musicbrainz_recording_id: None,
         };
         assert_eq!(update.title.as_deref(), Some("New Title"));
         assert_eq!(update.year, Some(2024));
+    }
+
+    /// 🔴 CONTRE-ÉPREUVE #3849, depuis le FICHIER — un `.wv` ÉTIQUETÉ doit
+    /// laisser en base un format que la résolution de lecture comprend.
+    ///
+    /// Le témoin voisin part d'une chaîne ; celui-ci part des octets. Un
+    /// fichier SANS étiquette prend le chemin `tagless_fallback`, qui écrit
+    /// l'extension (« wv ») — ce n'est pas là que le défaut vit. Un fichier
+    /// ÉTIQUETÉ — un rip EAC, comme les 13 albums de Marco Polo — prend le
+    /// chemin lofty, qui écrit `format!("{:?}", file_type)` en minuscules.
+    ///
+    /// Les deux fixtures portent le MÊME PCM (empreinte
+    /// `b0bf58385502cddf726dd94e6a542ae0` des deux côtés, mesurée avec
+    /// `wvunpack` 5.6.0) : seule l'étiquette APEv2 en queue les sépare, posée
+    /// par `wvtag` 5.6.0. Le témoin isole donc bien l'étiquette, et rien
+    /// d'autre.
+    ///
+    /// Mesuré avant correction sur ce fichier exact :
+    /// `tracks.format = Some("wavpack")`, `from_extension(...) = None`.
+    /// Conséquence en lecture (`resolve_local.rs` : `let fmt =
+    /// track.format...; let source_format = AudioFormat::from_extension(&fmt)`)
+    /// : pas de format source, donc pas de transcodage, branche « servir le
+    /// fichier brut », et MIME de repli `audio/flac`. Le Denon de Marco Polo
+    /// recevait un `.wv` annoncé FLAC.
+    ///
+    /// ⚠️ Le témoin ne pose PAS l'étiquette lui-même : `write_metadata` rend
+    /// `Err("no primary tag")` sur un `.wv` qui n'en a pas encore. C'est un
+    /// défaut distinct, non traité ici.
+    #[test]
+    fn un_wavpack_etiquete_laisse_en_base_un_format_que_la_lecture_comprend() {
+        use crate::audio::formats::AudioFormat;
+
+        let nu = format!(
+            "{}/tests/fixtures/wavpack/rip_16_44100_stereo.wv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let etiquete = format!(
+            "{}/tests/fixtures/wavpack/rip_16_44100_stereo_etiquete.wv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+
+        // Le chemin SANS étiquette n'a jamais eu le défaut : il sert de repère.
+        let format_nu = read_metadata(std::path::Path::new(&nu))
+            .and_then(|m| m.format)
+            .expect("aucune métadonnée lue sur le .wv nu");
+        assert!(
+            AudioFormat::from_extension(&format_nu).is_some(),
+            "repère cassé : le .wv NU laisse déjà un format inconnu ({format_nu})"
+        );
+
+        let lu = read_metadata(std::path::Path::new(&etiquete))
+            .expect("aucune métadonnée lue sur le .wv étiqueté");
+        assert_eq!(
+            lu.title.as_deref(),
+            Some("Lento lugubre"),
+            "la fixture doit bien être étiquetée, sinon le témoin mesure l'autre chemin"
+        );
+        let format = lu.format.expect("aucun format lu sur le .wv étiqueté");
+        assert!(
+            AudioFormat::from_extension(&format).is_some(),
+            "un .wv étiqueté laisse `tracks.format = {format:?}`, que la résolution de \
+             lecture ne reconnaît pas : la piste part BRUTE, annoncée audio/flac (#3849)"
+        );
+    }
+
+    /// 🔴 GARDE #3849 — tout type lofty d'un format CATALOGUÉ doit ressortir
+    /// de `normalize_format` sous un nom que `AudioFormat::from_extension`
+    /// reconnaît.
+    ///
+    /// Le chemin étiqueté de `read_metadata` écrit littéralement
+    /// `format!("{:?}", tagged.file_type()).to_lowercase()` dans
+    /// `tracks.format`. Deux de ces noms ne sont PAS des extensions —
+    /// « wavpack » et « vorbis » — et `from_extension` rendait `None` pour
+    /// eux. Mesuré chez Marco Polo : sans format source, la piste prend la
+    /// branche « servir le fichier brut » et le MIME retombe sur
+    /// `audio/flac` ; son Denon recevait un `.wv` annoncé FLAC.
+    ///
+    /// Le témoin part de `LIBRARY_AUDIO_EXTENSIONS`, pas d'une liste recopiée :
+    /// un format ajouté au catalogue demain est couvert sans qu'on y pense.
+    ///
+    /// Sabotage : retirer `"wavpack" => "wv"` de `normalize_format` ET
+    /// `"wavpack" => Some(Self::WavPack)` de `from_extension` — le témoin
+    /// rougit en nommant `wv`/`wavpack`.
+    #[test]
+    fn tout_type_lofty_catalogue_donne_un_format_reconnu() {
+        use crate::audio::formats::AudioFormat;
+        use crate::audio::support::LIBRARY_AUDIO_EXTENSIONS;
+
+        let mut vus = 0usize;
+        for ext in LIBRARY_AUDIO_EXTENSIONS {
+            // `iso` est extrait en DSF par le parcours, et le DSD emprunte un
+            // chemin de métadonnées qui écrit l'extension telle quelle.
+            if matches!(*ext, "iso" | "dsf" | "dff") {
+                continue;
+            }
+            let Some(ft) = lofty::file::FileType::from_ext(ext) else {
+                continue;
+            };
+            vus += 1;
+
+            // EXACTEMENT l'expression du chemin étiqueté de `read_metadata`.
+            let brut = format!("{ft:?}").to_lowercase();
+
+            for profondeur in [None, Some(16u8), Some(24u8)] {
+                let normalise = normalize_format(&brut, profondeur);
+                assert!(
+                    AudioFormat::from_extension(&normalise).is_some(),
+                    "`.{ext}` -> lofty {ft:?} -> normalize_format(\"{brut}\", {profondeur:?}) \
+                     = \"{normalise}\", que `AudioFormat::from_extension` ne reconnaît PAS. \
+                     Une piste portant ce format en base est servie BRUTE, avec le MIME de \
+                     repli `audio/flac` (#3849)."
+                );
+            }
+        }
+        assert!(
+            vus >= 8,
+            "le témoin doit couvrir tout le catalogue, seulement {vus} types lofty vus"
+        );
     }
 
     #[test]
@@ -3715,7 +4703,21 @@ mod tests {
         assert_eq!(meta.title.as_deref(), Some("Untagged Song"));
         assert_eq!(meta.album.as_deref(), Some("Best Of"));
         assert_eq!(meta.artist.as_deref(), Some("Jean-Luc"));
-        assert_eq!(meta.album_artist.as_deref(), Some("Jean-Luc"));
+        // ÉPINGLAGE CORRIGÉ (#3232). Ce test exigeait auparavant
+        // `album_artist == Some("Jean-Luc")` — c'est-à-dire le nom du DOSSIER
+        // présenté comme un artiste d'album. Compté par la décision
+        // « compilation », ce faux artiste bascule un dossier entier en
+        // « Various Artists » dès qu'un seul de ses fichiers passe par ce
+        // repli. Le champ reste donc ABSENT, exactement comme le repli DSD
+        // depuis #1656, et le drapeau dit POURQUOI.
+        assert_eq!(
+            meta.album_artist, None,
+            "un nom de dossier n'est pas un artiste d'album (#1656, #3232)"
+        );
+        assert!(
+            meta.artist_from_path,
+            "le repli sans balises doit se dénoncer comme déduit du chemin"
+        );
         assert_eq!(meta.track_number, Some(7));
         // Holds through both fallback paths: tagless_fallback (lofty parsed props)
         // and tagless_fallback_no_props (lofty failed) both normalise to "wav".
@@ -3798,6 +4800,30 @@ mod tests {
             let (num, title) = extract_title_from_filename(Path::new(name));
             assert_eq!(num, want_num, "track number for {name}");
             assert_eq!(title.as_deref(), Some(want_title), "title for {name}");
+        }
+    }
+
+    #[test]
+    fn nom_de_fichier_prefixes_de_numero_et_marque_de_disque() {
+        // #3180 : les préfixes que le repli DSD laissait dans le titre.
+        let cas = [
+            ("01 - The Beat Goes On.dsf", Some(1), "The Beat Goes On"),
+            ("01. Titre.dsf", Some(1), "Titre"),
+            ("1-Titre.dff", Some(1), "Titre"),
+            ("D1 03 - Titre.dsf", Some(3), "Titre"),
+            ("d2_11.Titre.dsf", Some(11), "Titre"),
+            ("D01-04 Titre.dsf", Some(4), "Titre"),
+            // Marque de disque sans numéro derrière : rien n'est retiré.
+            ("D12 - Purple Pills.dsf", None, "D12 - Purple Pills"),
+            ("Dance 01.dsf", None, "Dance 01"),
+            ("D1.dsf", None, "D1"),
+            // Uniquement un numéro : le nom entier reste le titre.
+            ("07.dsf", Some(7), "07"),
+        ];
+        for (nom, numero_attendu, titre_attendu) in cas {
+            let (numero, titre) = extract_title_from_filename(Path::new(nom));
+            assert_eq!(numero, numero_attendu, "numéro pour {nom}");
+            assert_eq!(titre.as_deref(), Some(titre_attendu), "titre pour {nom}");
         }
     }
 
@@ -3947,9 +4973,135 @@ mod tests {
         let meta = dsf_dff_fallback(Path::new("/music/Miles Davis/Kind of Blue/01-So What.dsf"));
         assert!(meta.is_some());
         let meta = meta.unwrap();
-        assert_eq!(meta.title.as_deref(), Some("01-So What"));
+        // #3180 : le titre de secours n'emporte plus le numéro de piste, qui
+        // va dans `track_number`. Ce témoin figeait « 01-So What ».
+        assert_eq!(meta.title.as_deref(), Some("So What"));
+        assert_eq!(meta.track_number, Some(1));
         assert_eq!(meta.album.as_deref(), Some("Kind of Blue"));
         assert_eq!(meta.artist.as_deref(), Some("Miles Davis"));
+    }
+
+    #[test]
+    fn dsf_fallback_titre_de_secours_sans_numero_de_piste() {
+        // Benjithom, fil 1100 : « 01 - The Beat Goes On.dsf » s'affichait tel
+        // quel. Le numéro part dans `track_number`, le titre est nettoyé.
+        let meta = dsf_dff_fallback(Path::new(
+            "/music/Sonny & Cher/Look at Us/01 - The Beat Goes On.dsf",
+        ))
+        .unwrap();
+        assert_eq!(meta.title.as_deref(), Some("The Beat Goes On"));
+        assert_eq!(meta.track_number, Some(1));
+        assert_eq!(meta.album.as_deref(), Some("Look at Us"));
+        assert_eq!(meta.artist.as_deref(), Some("Sonny & Cher"));
+
+        // Rip multi-disque : marque de disque puis numéro de piste.
+        let meta = dsf_dff_fallback(Path::new("/music/A/B/D1 03 - Titre.dff")).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Titre"));
+        assert_eq!(meta.track_number, Some(3));
+
+        // Sans numéro : le nom entier reste le titre, rien n'est inventé.
+        let meta = dsf_dff_fallback(Path::new("/music/A/B/Blue in Green.dsf")).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Blue in Green"));
+        assert_eq!(meta.track_number, None);
+    }
+
+    #[test]
+    fn dsf_fallback_ne_remplace_pas_la_balise_lofty() {
+        // Pierre M, fil 920 : lofty avait lu artiste, album et année, seul le
+        // titre manquait. Le repli renvoyait TOUT depuis l'arborescence :
+        // artiste = dossier grand-parent, année perdue. Il ne comble plus que
+        // ce qui manque.
+        use lofty::tag::{Accessor, ItemKey, Tag, TagType};
+        use std::io::Write;
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("Dossier Rip").join("Sous-dossier");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("07 - Man On The Corner.dsf");
+        // Un `.dsf` SANS tag ID3v2 : le lecteur maison ne rend rien.
+        std::fs::File::create(&file_path)
+            .unwrap()
+            .write_all(&build_dsf_bytes(None))
+            .unwrap();
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_artist("Genesis".into());
+        tag.set_album("Abacab".into());
+        tag.insert_text(ItemKey::RecordingDate, "1981".into());
+        tag.set_genre("Rock".into());
+
+        let meta = dsf_dff_fallback_complete(&file_path, Some(&tag)).unwrap();
+        assert_eq!(
+            meta.artist.as_deref(),
+            Some("Genesis"),
+            "artiste de la balise, pas du dossier"
+        );
+        assert_eq!(
+            meta.album.as_deref(),
+            Some("Abacab"),
+            "album de la balise, pas du dossier"
+        );
+        assert_eq!(meta.year, Some(1981), "année de la balise conservée");
+        assert_eq!(meta.genre.as_deref(), Some("Rock"));
+        // Le titre manquait partout : nom de fichier, numéro retiré.
+        assert_eq!(meta.title.as_deref(), Some("Man On The Corner"));
+        assert_eq!(meta.track_number, Some(7));
+        assert_eq!(meta.disc_number, None);
+        assert_eq!(meta.album_artist, None);
+
+        // Sans balise lofty, le même fichier retombe bien sur le chemin —
+        // c'est le comportement des deux autres sites d'appel, inchangé.
+        let meta = dsf_dff_fallback_complete(&file_path, None).unwrap();
+        assert_eq!(meta.artist.as_deref(), Some("Dossier Rip"));
+        assert_eq!(meta.album.as_deref(), Some("Sous-dossier"));
+        assert_eq!(meta.year, None);
+    }
+
+    #[test]
+    fn dsf_fallback_les_vraies_balises_priment_sur_lofty() {
+        // Le lecteur maison a lu le tag ID3v2 : c'est LUI la source, la
+        // balise lofty (suspecte, puisque son titre est vide) ne comble que
+        // les trous — ici l'année, absente du tag ID3v2.
+        use lofty::tag::{Accessor, ItemKey, Tag, TagType};
+        use std::io::Write;
+        let tmp = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let id3_tag = build_id3v2_tag(&[("TIT2", "So What"), ("TPE1", "Miles Davis")]);
+        std::fs::File::create(tmp.path())
+            .unwrap()
+            .write_all(&build_dsf_bytes(Some(&id3_tag)))
+            .unwrap();
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_artist("Mauvais artiste".into());
+        tag.set_album("Kind of Blue".into());
+        tag.insert_text(ItemKey::RecordingDate, "1959".into());
+
+        let meta = dsf_dff_fallback_complete(tmp.path(), Some(&tag)).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("So What"));
+        assert_eq!(meta.artist.as_deref(), Some("Miles Davis"));
+        assert_eq!(meta.album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(meta.year, Some(1959));
+    }
+
+    #[test]
+    fn try_read_metadata_dsf_titre_vide_garde_les_balises_et_nettoie_le_titre() {
+        // De bout en bout : un `.dsf` dont le tag ID3v2 porte artiste et album
+        // mais pas de titre. lofty rend une balise au titre vide ; le repli
+        // doit garder l'artiste du tag (pas le dossier) et tirer le titre du
+        // nom de fichier, numéro retiré.
+        use std::io::Write;
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("V_DSF").join("Genesis - Abacab");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("07 - Man On The Corner.dsf");
+        let id3_tag = build_id3v2_tag(&[("TPE1", "Genesis"), ("TALB", "Abacab"), ("TDRC", "1981")]);
+        std::fs::File::create(&file_path)
+            .unwrap()
+            .write_all(&build_dsf_bytes(Some(&id3_tag)))
+            .unwrap();
+        let meta = try_read_metadata(&file_path).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Man On The Corner"));
+        assert_eq!(meta.track_number, Some(7));
+        assert_eq!(meta.artist.as_deref(), Some("Genesis"));
+        assert_eq!(meta.album.as_deref(), Some("Abacab"));
+        assert_eq!(meta.year, Some(1981));
     }
 
     #[test]
@@ -4305,5 +5457,352 @@ mod tests {
         let taille = 4_800_000u64;
         let duree_reelle_a_320k = taille * 8 * 1000 / 320_000;
         assert_eq!(duree_reelle_a_320k, taille / 40);
+    }
+    /// L'identifiant d'enregistrement écrit par [`write_metadata`] doit
+    /// ressortir de [`try_read_metadata`]. C'est le maillon qui relie
+    /// l'ingestion au parcours : le parcours ne lit que le FICHIER, donc un
+    /// identifiant qui n'atteint pas l'étiquette n'atteindra jamais la base.
+    ///
+    /// L'assertion porte sur le CONTENU relu, jamais sur le code de retour :
+    /// un `Ok(())` ne prouverait pas qu'une étiquette a été posée.
+    #[test]
+    fn l_identifiant_d_enregistrement_ecrit_est_relu_depuis_le_fichier() {
+        let dir = tempfile::tempdir().unwrap();
+        let fichier = dir.path().join("piste.flac");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac"),
+            &fichier,
+        )
+        .unwrap();
+
+        assert_eq!(
+            try_read_metadata(&fichier)
+                .unwrap()
+                .musicbrainz_recording_id,
+            None,
+            "la fixture porte deja un identifiant : le test ne prouverait rien"
+        );
+
+        let update = MetadataUpdate {
+            title: None,
+            artist: None,
+            album: None,
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            year: None,
+            composer: None,
+            label: None,
+            musicbrainz_recording_id: Some("11111111-2222-3333-4444-555555555555".into()),
+        };
+        write_metadata(&fichier, &update).expect("ecriture refusee");
+
+        assert_eq!(
+            try_read_metadata(&fichier)
+                .unwrap()
+                .musicbrainz_recording_id
+                .as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "l'identifiant n'a pas ete inscrit dans l'etiquette du fichier"
+        );
+    }
+}
+
+/// #1821 — le genre ne doit pas dépendre du logiciel qui a gravé le fichier.
+///
+/// DEvir : « songs purchased from different platforms or labels end up being
+/// categorized under different genres ». La cause mesurée n'est pas le
+/// vocabulaire des marchands, c'est l'ENCODAGE : la même intention « ce disque
+/// est du Jazz ET de la Fusion » s'écrit de deux façons légitimes selon le
+/// format et l'étiqueteur, et Tune n'en lisait qu'une.
+///
+/// #3924 — LA PROVENANCE DU DYNAMIC RANGE, ÉCRITE PAR LE SCAN.
+///
+/// Patatorz (fil forum 1683, 11/09/2026) mesure ses DR lui-même et demande si
+/// le nombre que Tune affiche est le sien ou celui de Tune : « il serait bon
+/// de comprendre d'où ça sort ». Depuis la v0.9.145 les deux existent —
+/// `dr_track` a un second producteur, la passe d'analyse, qui se marque
+/// `dr_source = "analysis"` — mais le premier, cette lecture-ci, ne marquait
+/// RIEN : une valeur sans marque ne se distinguait pas d'une valeur d'avant
+/// la clef, et un fichier analysé puis retagué gardait « analysis » sur une
+/// valeur venue du tag.
+///
+/// L'épreuve ouvre un VRAI conteneur — la fixture FLAC du dépôt, avec un
+/// `DYNAMIC RANGE` écrit par lofty — et relit par la fonction de production.
+/// Un test sur une chaîne ne dirait rien du chemin réel : le bloc de DR est
+/// lu par `read_vorbis_header`, à côté de lofty, et c'est cette conjonction
+/// que le témoin traverse.
+#[cfg(test)]
+mod provenance_du_dr_3924 {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::VorbisComments;
+
+    /// Une copie de la fixture FLAC, éventuellement taguée `DYNAMIC RANGE`.
+    ///
+    /// `scratch_file` et non un chemin nu : le fichier disparaît à la sortie
+    /// de portée même quand l'épreuve échoue, et son nom porte le pid — deux
+    /// binaires de test concurrents sur la même machine de compilation ne
+    /// peuvent pas se voler leur copie (#2864, #3030).
+    fn gabarit(dr: Option<&str>, epreuve: &str) -> crate::test_scratch::ScratchFile {
+        let source =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        let copie = crate::test_scratch::scratch_file(&format!("dr3924-{epreuve}"), "-test.flac");
+        std::fs::copy(&source, &copie).expect("copie du gabarit");
+        if let Some(v) = dr {
+            // `FlacFile` et le bloc Vorbis Comment BRUT, pas l'API générique
+            // de lofty : `DYNAMIC RANGE` n'a aucun `ItemKey` — c'est
+            // précisément pourquoi `read_extended_metadata` le lit à côté de
+            // lofty, par `read_vorbis_header`. Un tag générique ne pourrait
+            // pas l'écrire, et le témoin se validerait contre rien.
+            let chemin: &std::path::Path = &copie;
+            let mut fh = std::fs::File::open(chemin).expect("ouverture du gabarit");
+            let mut flac = FlacFile::read_from(&mut fh, ParseOptions::new()).expect("lecture FLAC");
+            drop(fh);
+            if flac.vorbis_comments().is_none() {
+                flac.set_vorbis_comments(VorbisComments::default());
+            }
+            flac.vorbis_comments_mut()
+                .expect("bloc Vorbis Comment")
+                .insert("DYNAMIC RANGE".to_string(), v.to_string());
+            flac.save_to_path(chemin, WriteOptions::default())
+                .expect("écriture du tag");
+        }
+        copie
+    }
+
+    /// Le cas du fil 1683 : le fichier porte le DR que son propriétaire a
+    /// mesuré. La valeur sort — et elle sort DITE.
+    #[test]
+    fn un_dr_lu_dans_le_tag_sort_avec_sa_provenance_3924() {
+        let chemin = gabarit(Some("DR14"), "tag");
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("dr_track").map(String::as_str),
+            Some("14"),
+            "témoin : le tag doit d'abord être lu. Relevé : {meta:?}"
+        );
+        assert_eq!(
+            meta.get("dr_source").map(String::as_str),
+            Some("tag"),
+            "#3924 — le scan doit MARQUER la provenance en même temps que la \
+             valeur. Sans cette marque, rien ne sépare ce 14 mesuré par \
+             Patatorz d'un 14 calculé par la passe d'analyse. Relevé : {meta:?}"
+        );
+    }
+
+    /// TÉMOIN VERT — un fichier sans tag de DR n'annonce aucune provenance.
+    ///
+    /// Sans lui, écrire `dr_source` inconditionnellement passerait : la clef
+    /// décrirait alors une valeur qui n'existe pas, et la fiche afficherait
+    /// « lue dans les tags » à côté d'un champ vide.
+    #[test]
+    fn sans_tag_de_dr_aucune_provenance_n_est_inventee_3924() {
+        let chemin = gabarit(None, "sans-tag");
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("dr_track"),
+            None,
+            "témoin : la fixture ne porte pas de DR. Relevé : {meta:?}"
+        );
+        assert_eq!(
+            meta.get("dr_source"),
+            None,
+            "une provenance sans valeur décrirait le vide. Relevé : {meta:?}"
+        );
+    }
+
+    // ── PAS D'ÉPREUVE POUR LE TAG VIDE, ET C'EST MESURÉ ───────────────────
+    //
+    // `read_extended_metadata` refuse d'écrire une provenance sur une valeur
+    // vide (`!dr.trim().is_empty()`). Cette branche n'a PAS de témoin ici, et
+    // ce n'est pas un oubli : elle est inatteignable par un vrai fichier
+    // écrit avec lofty.
+    //
+    // Mesure du 11/09/2026, sur ce banc même, avec `gabarit(Some("   "))` :
+    //
+    //     left:  None          (ce que la lecture rend pour `dr_track`)
+    //     right: Some("")      (ce qu'un tag blanc devrait donner)
+    //
+    // Deux verrous en amont, et il suffit du premier :
+    //
+    // * `find_vorbis_comment` (plus haut) écarte déjà une valeur VIDE
+    //   (`if !value.is_empty()`), donc `DYNAMIC RANGE=` ne franchit jamais la
+    //   lecture ;
+    // * lofty ne persiste pas une valeur purement blanche : le `"   "` écrit
+    //   ci-dessus n'est pas ressorti du fichier.
+    //
+    // Écrire malgré tout une épreuve sur ce cas aurait donné un témoin VERT
+    // qui ne prouve rien — il resterait vert si l'on retirait la garde du
+    // code, puisque la valeur n'arrive pas jusqu'à elle. La garde reste
+    // néanmoins écrite : un fichier étiqueté par un autre outil, ou un
+    // `normalise_dr` retouché, peut rendre ce cas atteignable, et alors c'est
+    // elle qui empêche d'annoncer la provenance d'un vide.
+}
+
+/// Ces épreuves construisent de VRAIS fichiers dans les trois conteneurs qui
+/// couvrent la bibliothèque d'un testeur — FLAC (Vorbis Comment), M4A (atomes
+/// MP4) et MP3 (trames ID3v2) — parce qu'un garde-fou qui ne monterait qu'un
+/// seul format ne dirait rien des deux autres : chacun a sa propre façon de
+/// porter plusieurs valeurs.
+#[cfg(test)]
+mod genres_multivalues_i1821 {
+    use lofty::config::WriteOptions;
+    use lofty::file::TaggedFileExt;
+    use lofty::prelude::*;
+    use lofty::tag::{ItemKey, ItemValue, TagItem};
+
+    /// Copie d'un gabarit sous un nom qui porte À LA FOIS la clé de l'agent et
+    /// le nom de l'épreuve : deux tests du même binaire ne peuvent pas se voler
+    /// leur fichier, et un nettoyage par glob commun ne peut pas emporter
+    /// celui d'un autre.
+    ///
+    /// ⚠️ Le nom de l'épreuve ne suffisait PAS (#2864) : sans pid, deux
+    /// binaires de test concurrents — deux agents sur la même machine de
+    /// compilation, `/tmp` partagé — visaient le même `i1821-<épreuve>-<nom>`.
+    /// `scratch_name` ajoute le pid ET un compteur ; l'étiquette ne sert plus
+    /// qu'à la lisibilité d'un résidu dans `/tmp`.
+    fn gabarit(nom: &str, epreuve: &str) -> crate::test_scratch::ScratchFile {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(nom);
+        // `nom` porte l'EXTENSION, et lofty choisit son analyseur dessus :
+        // elle doit rester en dernier. Le suffixe unique se glisse donc
+        // avant, jamais après.
+        //
+        // `ScratchFile` et non un chemin nu : la copie disparaît à la sortie
+        // de portée, y compris quand l'épreuve échoue — c'est justement le
+        // cas qui laissait le plus de résidus (#3030).
+        let copie =
+            crate::test_scratch::scratch_file(&format!("i1821-{epreuve}"), &format!("-{nom}"));
+        std::fs::copy(&source, &copie).expect("copie du gabarit");
+        copie
+    }
+
+    /// Écrit N valeurs de genre en tant qu'ÉLÉMENTS SÉPARÉS du tag — la façon
+    /// native de Vorbis Comment (champ `GENRE` répété), de MP4 (atome `©gen`
+    /// répété) et d'ID3v2.4 (`TCON` multivalué).
+    fn ecrire_genres_separes(chemin: &std::path::Path, genres: &[&str]) {
+        let mut fichier = lofty::read_from_path(chemin).expect("lecture du gabarit");
+        let tag = fichier.primary_tag_mut().expect("tag principal");
+        tag.remove_key(ItemKey::Genre);
+        for g in genres {
+            tag.push(TagItem::new(
+                ItemKey::Genre,
+                ItemValue::Text((*g).to_string()),
+            ));
+        }
+        tag.save_to_path(chemin, WriteOptions::default())
+            .expect("écriture du tag");
+    }
+
+    /// Écrit les mêmes genres en UNE SEULE chaîne séparée — ce qu'écrit un
+    /// étiqueteur limité à ID3v2.3, qui n'a pas de multivaleur.
+    fn ecrire_genres_en_une_chaine(chemin: &std::path::Path, chaine: &str) {
+        let mut fichier = lofty::read_from_path(chemin).expect("lecture du gabarit");
+        let tag = fichier.primary_tag_mut().expect("tag principal");
+        tag.remove_key(ItemKey::Genre);
+        tag.push(TagItem::new(
+            ItemKey::Genre,
+            ItemValue::Text(chaine.to_string()),
+        ));
+        tag.save_to_path(chemin, WriteOptions::default())
+            .expect("écriture du tag");
+    }
+
+    #[test]
+    fn les_trois_conteneurs_rendent_tous_les_genres_du_tag() {
+        // On récolte les TROIS lectures avant d'affirmer quoi que ce soit :
+        // une assertion posée dans la boucle s'arrêterait au premier format et
+        // ne dirait rien des deux autres — le faux garde-fou exact qu'on veut
+        // éviter ici. Sans le correctif, le message rouge nomme les trois.
+        let lu: Vec<(&str, Vec<String>, Option<String>)> = ["test.flac", "test.m4a", "test.mp3"]
+            .into_iter()
+            .map(|nom| {
+                let chemin = gabarit(nom, "trois-conteneurs");
+                ecrire_genres_separes(&chemin, &["Jazz", "Fusion"]);
+                let meta = super::read_metadata(&chemin).expect("lecture des métadonnées");
+                (nom, meta.genres, meta.genre)
+            })
+            .collect();
+
+        let attendu = vec!["Jazz".to_string(), "Fusion".to_string()];
+        let perdus: Vec<&str> = lu
+            .iter()
+            .filter(|(_, genres, _)| *genres != attendu)
+            .map(|(nom, _, _)| *nom)
+            .collect();
+        assert!(
+            perdus.is_empty(),
+            "les genres secondaires du tag sont perdus sur {perdus:?} — lu : {lu:?}"
+        );
+        for (nom, _, genre) in &lu {
+            assert_eq!(
+                genre.as_deref(),
+                Some("Jazz"),
+                "{nom} : le genre principal reste le premier du tag"
+            );
+        }
+    }
+
+    #[test]
+    fn les_deux_conventions_decrivent_la_meme_musique() {
+        // Le cœur de #1821 : le même disque, gravé une fois en valeurs
+        // séparées et une fois en chaîne unique, doit se ranger IDENTIQUEMENT.
+        // Avant le correctif, la chaîne unique rendait deux genres et les
+        // valeurs séparées un seul — d'où deux classements pour un seul disque.
+        let separe = gabarit("test.flac", "deux-conventions-separe");
+        ecrire_genres_separes(&separe, &["Jazz", "Fusion"]);
+
+        let unique = gabarit("test.mp3", "deux-conventions-unique");
+        ecrire_genres_en_une_chaine(&unique, "Jazz; Fusion");
+
+        let a = super::read_metadata(&separe).expect("FLAC à valeurs séparées");
+        let b = super::read_metadata(&unique).expect("MP3 à chaîne unique");
+        assert_eq!(
+            a.genres, b.genres,
+            "deux gravures de la même intention donnent deux classements"
+        );
+        assert_eq!(a.genre, b.genre);
+    }
+
+    #[test]
+    fn un_genre_unique_reste_intact() {
+        // Contre-garde : le cas courant — un seul genre — ne bouge pas.
+        for nom in ["test.flac", "test.m4a", "test.mp3"] {
+            let chemin = gabarit(nom, "genre-unique");
+            ecrire_genres_separes(&chemin, &["Rock"]);
+            let meta = super::read_metadata(&chemin).expect("lecture");
+            assert_eq!(meta.genres, vec!["Rock".to_string()], "{nom}");
+            assert_eq!(meta.genre.as_deref(), Some("Rock"), "{nom}");
+        }
+    }
+
+    #[test]
+    fn deux_orthographes_du_meme_genre_ne_comptent_quune_fois() {
+        // Un marchand écrit « Hip-Hop », l'autre « Hip Hop ». Un fichier
+        // regravé peut porter les deux ; `genre_key` — la clé canonique de la
+        // bibliothèque, pas un `to_lowercase()` réécrit sur place — les
+        // ramène à un seul genre.
+        assert_eq!(
+            super::genres_from_tag_values(&["Hip-Hop", "hip hop", "Trip Hop"]),
+            vec!["Hip-Hop".to_string(), "Trip Hop".to_string()]
+        );
+    }
+
+    #[test]
+    fn une_valeur_peut_elle_meme_etre_separee() {
+        // Les deux conventions se mêlent dans un même fichier : deux champs
+        // `GENRE`, dont l'un porte encore un séparateur.
+        assert_eq!(
+            super::genres_from_tag_values(&["Jazz", "Fusion; Latin Jazz"]),
+            vec![
+                "Jazz".to_string(),
+                "Fusion".to_string(),
+                "Latin Jazz".to_string()
+            ]
+        );
     }
 }

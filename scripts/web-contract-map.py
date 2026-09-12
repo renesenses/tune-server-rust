@@ -49,7 +49,89 @@ MOTIF_APPEL = re.compile(
     re.S,
 )
 
+# SECONDE forme d'appel : le type ne porte pas sur `fetchJSON<>`, mais sur
+# l'annotation de retour de la fonction qui l'enveloppe.
+#
+#     export function getConversionStatus(jobId: string): Promise<{
+#       state: 'converting' | 'done' | 'error';
+#       progress: number; converted: number; download_size?: string;
+#     }> {
+#       return fetchJSON(`${BASE}/converter/status/${encodeURIComponent(jobId)}`);
+#     }
+#
+# `MOTIF_APPEL` exige `fetchJSON<`. Ces appels-là étaient donc TOTALEMENT
+# invisibles : ni cartographiés, ni même rangés dans `non_resolus` — la carte
+# se taisait au lieu de dire qu'elle ne savait pas, ce qui est le pire des
+# deux : on lit « 236 routes cartographiées » et on croit le compte complet.
+#
+# Quarante appels d'`api.ts` écrivent leur type ainsi, dont
+# `/converter/status/{}`. C'est ce trou qui a laissé passer #3002 : l'écran
+# Convertisseur lit `state`, `progress`, `converted` et `download_size`, que le
+# serveur n'envoyait pas — quatre champs fantômes qu'aucun contrôle ne pouvait
+# voir, puisque la route elle-même n'entrait pas dans la carte.
+MOTIF_RETOUR_PROMESSE = re.compile(r"\)\s*:\s*Promise<\s*(?P<liste>Array<\s*)?\{")
+
+# L'appel SANS type, celui que `MOTIF_APPEL` ignore. Reprendre ici la forme
+# typée la dédoublerait.
+MOTIF_APPEL_NU = re.compile(
+    r"fetchJSON\(\s*(?P<q>[`'\"])\$\{BASE\}(?P<route>(?:(?!(?P=q)).)*)", re.S
+)
+
 MOTIF_INTERFACE = re.compile(r"^\s*export\s+(?:interface|type)\s+(?P<nom>[A-Z][A-Za-z0-9_]*)\s*=?\s*\{", re.M)
+
+# ── Corrections nominales, appliquées APRÈS extraction ───────────────────────
+#
+# Ce script extrait ce que le client DÉCLARE. Quand cette déclaration est
+# elle-même fausse — un type mort que plus personne n'appelle — la carte
+# recopie l'erreur, et le banc d'essai la fait respecter au serveur.
+#
+# La correction de #3002 vivait jusqu'ici à la main DANS `docs/contrat-web.json`.
+# Elle était donc perdue à la première régénération, qui aurait remis `lyrics`
+# et fait rougir `les_paroles_rendent_les_lignes_annoncees_au_web`. Une carte
+# qu'on ne peut pas régénérer sans casser un test est une carte qu'on ne
+# régénère jamais : c'est une des causes du gel du 31/08 au 11/09.
+#
+# Une entrée se justifie par un numéro d'issue et se retire dès que le client
+# est corrigé — ici, dès que `api.ts:getTrackLyrics`, qui n'a aucun appelant,
+# sera supprimée.
+CORRECTIONS: dict[tuple[str, str], dict] = {
+    ("GET", "/library/tracks/{}/lyrics"): {
+        "champs_obligatoires": ["synced", "source", "lines"],
+        "note": (
+            "#3002 — exigeait `lyrics`, que le serveur n'envoie pas : il rend "
+            "`lines`. L'exigence venait de `api.ts:getTrackLyrics`, une fonction "
+            "SANS AUCUN APPELANT dont `lib/lyrics.ts` documente lui-meme le type "
+            "comme la forme « historique ». Les vrais consommateurs (NowPlaying, "
+            "TvView) lisent `data.lines` via `fetchTrackLyrics`. Le serveur avait "
+            "raison, la carte recopiait un type mort."
+        ),
+    },
+}
+
+
+def appliquer_corrections(entrees: list[dict]) -> list[dict]:
+    """Substitue les contrats de `CORRECTIONS`, et signale ceux qui ne servent plus.
+
+    Une correction dont la route a disparu de la carte est une dette payée
+    ailleurs : la taire fossiliserait une exception sans objet.
+    """
+    vues: set[tuple[str, str]] = set()
+    for entree in entrees:
+        clef = (entree["methode"], entree["route"])
+        correction = CORRECTIONS.get(clef)
+        if correction is None:
+            continue
+        vues.add(clef)
+        entree["champs_obligatoires"] = list(correction["champs_obligatoires"])
+        entree["note"] = correction["note"]
+    for clef in CORRECTIONS:
+        if clef not in vues:
+            print(
+                f"  ✓ {clef[0]} {clef[1]} n'est plus cartographiee — retirer sa "
+                f"correction de CORRECTIONS",
+                file=sys.stderr,
+            )
+    return entrees
 
 
 def champs_du_bloc(bloc: str) -> tuple[list[str], list[str]]:
@@ -151,6 +233,45 @@ def normaliser_route(route: str) -> str:
     return route.rstrip("/") or "/"
 
 
+def appels_types_par_le_retour(api_ts: str) -> list[tuple[str, str, str, bool]]:
+    """La seconde forme d'appel : `(route brute, méthode, corps du type, liste)`.
+
+    Voir `MOTIF_RETOUR_PROMESSE`. On ne retient que les appels **non typés** :
+    une fonction peut parfaitement annoncer son retour ET écrire
+    `fetchJSON<T>(…)`, auquel cas `MOTIF_APPEL` la cartographie déjà.
+    """
+    trouves: list[tuple[str, str, str, bool]] = []
+    for m in MOTIF_RETOUR_PROMESSE.finditer(api_ts):
+        debut = m.end() - 1  # l'accolade ouvrante du type en ligne
+        corps = corps_apres_accolade(api_ts, debut)
+        if corps is None:
+            continue
+
+        # Le corps de la FONCTION commence après le type. On borne la recherche
+        # à la déclaration exportée suivante : sans cette borne, une fonction
+        # sans appel s'attribuerait la route de sa voisine.
+        apres = api_ts[debut + len(corps) + 1 :]
+        fin = apres.find("\nexport ")
+        if fin != -1:
+            apres = apres[:fin]
+
+        m_appel = MOTIF_APPEL_NU.search(apres)
+        if m_appel is None:
+            continue
+
+        # La méthode vit dans les options, juste après l'URL — même fenêtre
+        # bornée que pour la forme typée.
+        suite = apres[m_appel.end() : m_appel.end() + 400]
+        m_meth = re.search(r"method:\s*['\"`](GET|POST|PUT|PATCH|DELETE)['\"`]", suite, re.I)
+        trouves.append((
+            m_appel.group("route"),
+            m_meth.group(1).upper() if m_meth else "GET",
+            corps,
+            bool(m.group("liste")),
+        ))
+    return trouves
+
+
 def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]:
     """Construit la carte, et la liste de ce qui n'a pas pu être résolu."""
     types = dictionnaire_des_types(sources)
@@ -215,6 +336,30 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
             "champs_optionnels": connu["optionnels"],
         })
 
+    # Seconde forme : le type est sur l'annotation de retour (#3002).
+    for route_brute, methode, corps, liste in appels_types_par_le_retour(api_ts):
+        route = normaliser_route(route_brute)
+        if not route:
+            non_resolus.append({
+                "route": route_brute[:60], "type": "(retour de fonction)",
+                "raison": "interpolation non fermée — route non fiable",
+            })
+            continue
+        obligatoires, optionnels = champs_du_bloc(corps)
+        if not obligatoires and not optionnels:
+            # `Promise<{ [k: string]: unknown }>` et consorts : la carte ne
+            # doit annoncer AUCUN champ obligatoire plutôt qu'un champ faux.
+            non_resolus.append({
+                "route": route, "type": "(retour de fonction)",
+                "raison": "type en ligne sans champ de premier niveau",
+            })
+            continue
+        entrees.append({
+            "route": route, "methode": methode, "type": "(retour de fonction)",
+            "liste": liste,
+            "champs_obligatoires": obligatoires, "champs_optionnels": optionnels,
+        })
+
     # Dédoublonner : la même route peut être appelée plusieurs fois.
     vues, uniques = set(), []
     for e in entrees:
@@ -223,6 +368,7 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
             continue
         vues.add(cle)
         uniques.append(e)
+    uniques = appliquer_corrections(uniques)
     return sorted(uniques, key=lambda e: (e["route"], e["methode"])), non_resolus
 
 
@@ -251,6 +397,28 @@ def self_test() -> int:
       export const dev = (id) => fetchJSON<Zone>(`${BASE}/devices/${encodeURIComponent(id)}?x=1`);
       export const listP = () => fetchJSON<{ presets: Zone[] }>(`${BASE}/eq/presets`);
       export const newP = (b) => fetchJSON<Zone>(`${BASE}/eq/presets`, { method: 'POST', body: b });
+
+      export function statutConv(jobId: string): Promise<{
+        state: 'converting' | 'done' | 'error';
+        progress: number;
+        download_size?: string;
+      }> {
+        return fetchJSON(`${BASE}/converter/status/${encodeURIComponent(jobId)}`);
+      }
+
+      export function annulerConv(jobId: string): Promise<{ status: string }> {
+        return fetchJSON(`${BASE}/converter/jobs/${jobId}`, { method: 'DELETE' });
+      }
+
+      export function opaque(): Promise<{ [k: string]: unknown }> {
+        return fetchJSON(`${BASE}/sans/champ`);
+      }
+
+      export function paroles(id: number): Promise<{
+        lyrics: string; synced: boolean; source: string;
+      }> {
+        return fetchJSON(`${BASE}/library/tracks/${id}/lyrics`);
+      }
     """
     entrees, non_resolus = carte(types_src, api)
     par_route = {e["route"]: e for e in entrees}
@@ -281,6 +449,34 @@ def self_test() -> int:
     if "/devices/{}" not in par_route:
         echecs.append(f"encodeURIComponent tronque la route : {sorted(par_route)}")
 
+    # Seconde forme : type sur l'annotation de retour, appel `fetchJSON()` nu.
+    # C'est le trou par lequel `/converter/status/{}` a échappé à la carte,
+    # donc au banc d'essai, donc à #3002.
+    if "/converter/status/{}" not in par_route:
+        echecs.append(
+            "un type porté par l'annotation de retour n'est pas cartographié "
+            f"— routes vues : {sorted(par_route)}"
+        )
+    else:
+        conv = par_route["/converter/status/{}"]
+        if conv["champs_obligatoires"] != ["state", "progress"]:
+            echecs.append(f"champs du retour de fonction mal lus : {conv['champs_obligatoires']}")
+        elif conv["champs_optionnels"] != ["download_size"]:
+            echecs.append("`download_size?` est compté comme obligatoire")
+        elif conv["liste"]:
+            echecs.append("un objet nu est marqué comme liste")
+
+    annul = [e for e in entrees if e["route"] == "/converter/jobs/{}"]
+    if not annul:
+        echecs.append("la seconde forme perd la route quand le type tient sur une ligne")
+    elif annul[0]["methode"] != "DELETE":
+        echecs.append(f"la méthode de la seconde forme est fausse : {annul[0]['methode']}")
+
+    if "/sans/champ" in par_route:
+        echecs.append("un type sans champ de premier niveau est cartographié comme un contrat")
+    elif not any(nr.get("route") == "/sans/champ" for nr in non_resolus):
+        echecs.append("un type sans champ n'est même pas signalé comme non résolu")
+
     eq = {e["methode"]: e for e in entrees if e["route"] == "/eq/presets"}
     if set(eq) != {"GET", "POST"}:
         echecs.append(f"GET et POST sur la même route ne sont pas distingués : {sorted(eq)}")
@@ -293,20 +489,39 @@ def self_test() -> int:
     if "/x/y-z" not in raisons:
         echecs.append("un type introuvable n'est PAS signalé — la carte se croirait complète")
 
+    # La correction nominale de #3002 : le client DÉCLARE `lyrics`, le serveur
+    # rend `lines`, et c'est le client qui a tort (fonction sans appelant).
+    # Sans cette substitution, chaque régénération remettrait `lyrics` et
+    # ferait rougir un test juste — donc plus personne ne régénérerait.
+    paroles = par_route.get("/library/tracks/{}/lyrics")
+    if paroles is None:
+        echecs.append("la route corrigee n'est meme pas cartographiee")
+    elif paroles["champs_obligatoires"] != ["synced", "source", "lines"]:
+        echecs.append(
+            "la correction nominale n'est pas appliquee : "
+            f"{paroles['champs_obligatoires']}"
+        )
+    elif "#3002" not in paroles.get("note", ""):
+        echecs.append("une correction s'applique sans dire de quelle issue elle vient")
+
     if echecs:
         for e in echecs:
             print(f"  ✗ {e}")
         print("SELF-TEST: ÉCHEC")
         return 1
-    print("SELF-TEST: ok — 12 garanties (déclaration générique ignorée, type nommé, "
+    print("SELF-TEST: ok — 17 garanties (déclaration générique ignorée, type nommé, "
           "optionnels, liste, paramètre d'URL, type en ligne, import en ligne, route "
-          "à parenthèses, méthode HTTP, et les deux non-résolutions)")
+          "à parenthèses, méthode HTTP, les deux non-résolutions, et les quatre du "
+          "type porté par l'annotation de retour, correction nominale)")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--web", help="racine du dépôt tune-web-client")
+    # Sans cette trace, rien dans le fichier ne dit de QUEL client il parle : la
+    # carte a vieilli onze jours sans que personne puisse le voir en la lisant.
+    ap.add_argument("--web-sha", help="commit du client web cartographié, inscrit dans la sortie")
     ap.add_argument("-o", "--out", help="fichier JSON de sortie (défaut : stdout)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -333,6 +548,16 @@ def main() -> int:
     entrees, non_resolus = carte(sources, api_path.read_text(encoding="utf-8", errors="ignore"))
 
     sortie = {
+        "genere_depuis": {
+            "web_sha": args.web_sha or "(non precise)",
+            "regenerer": "scripts/web-contract-map.py --web <tune-web-client> "
+                         "--web-sha <sha> -o docs/contrat-web.json",
+            "gardee_par": [
+                "tune-server/tests/web_response_contracts.rs "
+                "(la_carte_web_ne_cite_que_des_routes_encore_servies)",
+                "scripts/verifier-carte-web.py (preflight)",
+            ],
+        },
         "routes": entrees,
         "non_resolus": non_resolus,
         "resume": {

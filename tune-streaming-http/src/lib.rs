@@ -1011,6 +1011,28 @@ async fn lire_favoris(
     svc: &dyn StreamingService,
     fav_type: &str,
 ) -> Result<Value, tune_core::TuneError> {
+    // #3489 — Didier (forum 1666) : « trié sur Date d'ajout : l'ordre n'est pas
+    // respecté ; je change le sens avec la petite flèche : rien ne change ; "Par
+    // défaut" et "Date d'ajout" affichent la même chose ». Les trois symptômes
+    // n'en font qu'un : la réponse ne transportait AUCUNE date, donc la clé de
+    // tri du client valait la chaîne vide pour toutes les entrées.
+    //
+    // C'est ICI que le correctif se branche. `get_user_favorites_dated` peut
+    // rester parfaite dans Qobuz et Tidal : sans cette ligne, personne ne
+    // l'appelle et la route sert exactement ce qu'elle servait avant.
+    //
+    // `Ok(None)` = « ce connecteur n'a pas de date à ajouter » et non « pas de
+    // favoris » : on reprend alors le dispatch typé, inchangé. Les connecteurs
+    // qui ne surchargent rien — Deezer, Spotify, YouTube, Amazon, Bandcamp —
+    // passent donc par le chemin d'avant, octet pour octet.
+    if let Some(items) = svc.get_user_favorites_dated(fav_type).await? {
+        let cle = TypeFavori::parse(fav_type)
+            .map(TypeFavori::cle)
+            .ok_or_else(|| format!("unknown favorite type: {fav_type}"))?;
+        let mut reponse = serde_json::Map::new();
+        reponse.insert(cle.to_string(), Value::Array(items));
+        return Ok(Value::Object(reponse));
+    }
     match TypeFavori::parse(fav_type) {
         Some(TypeFavori::Tracks) => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
         Some(TypeFavori::Albums) => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
@@ -1559,6 +1581,10 @@ mod tests_cache_utilisateur {
         pub(super) lectures: Arc<AtomicUsize>,
         pub(super) delai: Duration,
         pub(super) recherches: RecherchesVues,
+        /// #3489 — la date brute que ce connecteur prétend porter sur ses
+        /// favoris d'album, ou `None` pour un connecteur qui n'en transporte
+        /// aucune. `None` par défaut : les essais d'avant ne changent pas.
+        pub(super) date_brute: Option<String>,
     }
 
     impl ServiceCompteur {
@@ -1664,10 +1690,53 @@ mod tests_cache_utilisateur {
         async fn add_favorite(&mut self, _f: &str, _i: &str) -> Result<(), TuneError> {
             Ok(())
         }
+
+        /// #3489 — un connecteur qui date ses albums, comme Qobuz et Tidal.
+        /// `None` quand `date_brute` est vide : c'est le repli que doivent
+        /// suivre tous les connecteurs qui ne surchargent rien.
+        async fn get_user_favorites_dated(
+            &self,
+            fav_type: &str,
+        ) -> Result<Option<Vec<Value>>, TuneError> {
+            let Some(date) = self.date_brute.as_deref() else {
+                return Ok(None);
+            };
+            if fav_type != "albums" {
+                return Ok(None);
+            }
+            self.lit();
+            let brut = json!({ "created": date });
+            let mut element = json!({"source_id": "a1", "title": "Live with the Orchestra"});
+            tune_core::streaming::favorites_date::greffer_created_at(
+                &mut element,
+                &brut,
+                &["created"],
+            );
+            Ok(Some(vec![element]))
+        }
     }
 
     fn etat_essai(nom: &str, lectures: Arc<AtomicUsize>, delai: Duration) -> StreamingHttpState {
         etat_essai_complet(nom, lectures, delai, RecherchesVues::default())
+    }
+
+    /// Un état dont le connecteur date — ou non — ses favoris d'album (#3489).
+    pub(super) fn etat_essai_date(nom: &str, date_brute: Option<&str>) -> StreamingHttpState {
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServiceCompteur {
+            nom: nom.to_string(),
+            lectures: Arc::new(AtomicUsize::new(0)),
+            delai: Duration::ZERO,
+            recherches: RecherchesVues::default(),
+            date_brute: date_brute.map(str::to_string),
+        }));
+        StreamingHttpState::new(
+            backend,
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        )
     }
 
     pub(super) fn etat_essai_complet(
@@ -1684,6 +1753,7 @@ mod tests_cache_utilisateur {
             lectures,
             delai,
             recherches,
+            date_brute: None,
         }));
         StreamingHttpState::new(
             backend,
@@ -2051,5 +2121,79 @@ mod tests_route_recherche {
                 "la recherche ne doit rien mémoriser sous `{ressource}`"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_favoris_dates {
+    use super::tests_cache_utilisateur::etat_essai_date;
+    use super::*;
+
+    async fn corps(r: Response) -> Value {
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 20)
+            .await
+            .expect("corps lisible");
+        serde_json::from_slice(&octets).expect("json")
+    }
+
+    fn sans_tri() -> Query<TriQuery> {
+        Query(TriQuery {
+            sort: None,
+            order: None,
+        })
+    }
+
+    /// #3489, le site d'appel. `get_user_favorites_dated` peut être parfaite
+    /// dans Qobuz et Tidal : si `lire_favoris` ne l'appelle pas, la route sert
+    /// ce qu'elle servait avant et le tri « Date d'ajout » reste inerte.
+    ///
+    /// Contre-épreuve : retirez le `if let Some(items) = …` de `lire_favoris`
+    /// et cet essai passe au rouge — la réponse revient à la liste sans date.
+    #[tokio::test]
+    async fn la_route_sert_la_date_que_le_connecteur_transporte() {
+        let etat = etat_essai_date("essai-date-favoris", Some("2019-04-18T09:53:31.000+0000"));
+        let r = service_favorites(
+            State(etat),
+            Path((String::from("essai-date-favoris"), String::from("albums"))),
+            sans_tri(),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let corps = corps(r).await;
+        let albums = corps["albums"].as_array().expect("la cle `albums`");
+        assert_eq!(albums.len(), 1);
+        assert_eq!(
+            albums[0]["created_at"],
+            json!("2019-04-18T09:53:31Z"),
+            "la route doit transporter la date : c'est l'objet de #3489"
+        );
+        assert_eq!(
+            albums[0]["source_id"],
+            json!("a1"),
+            "et ne rien perdre du contrat d'avant"
+        );
+    }
+
+    /// Un connecteur qui ne transporte aucune date garde le comportement
+    /// d'avant, à l'octet près : `Ok(None)` veut dire « pas de date », pas
+    /// « pas de favoris ». Sans cette moitié, le correctif viderait l'écran
+    /// Favoris de Deezer, Spotify, YouTube, Amazon et Bandcamp.
+    #[tokio::test]
+    async fn un_connecteur_sans_date_rend_exactement_ce_qu_il_rendait() {
+        let etat = etat_essai_date("essai-date-absente", None);
+        let r = service_favorites(
+            State(etat),
+            Path((String::from("essai-date-absente"), String::from("tracks"))),
+            sans_tri(),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let corps = corps(r).await;
+        let pistes = corps["tracks"].as_array().expect("la cle `tracks`");
+        assert_eq!(pistes.len(), 3, "les trois pistes du service simule");
+        assert!(
+            pistes.iter().all(|p| p.get("created_at").is_none()),
+            "aucune date inventee la ou le service n'en donne pas"
+        );
     }
 }

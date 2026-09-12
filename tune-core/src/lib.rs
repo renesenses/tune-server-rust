@@ -21,6 +21,7 @@ pub mod db;
 pub mod db_backup;
 pub mod deezer_proxy;
 pub mod device_catalog;
+pub mod device_preconfig;
 pub mod digest;
 pub mod discovery;
 pub mod event_bus;
@@ -29,6 +30,7 @@ pub mod favorites_sort;
 pub mod health;
 pub mod health_monitor;
 pub mod http;
+pub mod interface_web;
 pub mod library;
 pub mod license;
 pub mod lyrics;
@@ -55,6 +57,8 @@ pub mod room_correction;
 pub mod scanner;
 pub mod scrobble;
 pub mod secret_envelope;
+pub mod secrets;
+pub mod sendspin;
 pub mod services_manager;
 pub mod skins;
 pub mod sleep_timer;
@@ -64,6 +68,19 @@ pub mod social;
 pub mod stream_cache;
 pub mod streaming;
 mod system_sleep;
+/// Temporisation des boucles d'ecoute reseau apres une erreur — voir le module
+/// pour le pourquoi (issue #2156 : une erreur persistante sur `accept()`
+/// saturait un coeur et remplissait le disque au repos).
+pub mod temporisation_reseau;
+/// Chemins temporaires uniques par appel — voir le module pour le pourquoi
+/// (issue #2864 : deux tests du même binaire se volaient leur fichier).
+///
+/// `pub` et non `#[cfg(test)]` : `cfg(test)` ne traverse PAS les frontières
+/// de caisse. Les binaires de test de `tune-server` — y compris les cibles
+/// agrégées `server_contracts` et `appliance_contracts` — en ont besoin
+/// aussi, et une seconde copie du compteur ne protégerait plus rien.
+#[doc(hidden)]
+pub mod test_scratch;
 pub mod transcode_cache;
 pub mod updater;
 pub mod upnp_renderer;

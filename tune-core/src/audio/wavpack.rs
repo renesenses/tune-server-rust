@@ -31,12 +31,23 @@ const FLAG_MONO: u32 = 1 << 2;
 const FLAG_HYBRID: u32 = 1 << 3;
 const FLAG_JOINT_STEREO: u32 = 1 << 4;
 const _FLAG_CROSS_DECORR: u32 = 1 << 5;
-const FLAG_FALSE_STEREO: u32 = 1 << 27;
-const FLAG_DSD: u32 = 1 << 29;
+// 🔴 Deux valeurs fausses jusqu'ici, mesurées contre `include/wavpack.h` de
+// WavPack 5.6.0 :
+//   * FALSE_STEREO vaut 0x4000_0000 (bit 30), pas `1 << 27` (bit inutilisé) —
+//     un bloc mono déguisé en stéréo était donc décodé comme du vrai stéréo,
+//     et le canal droit sortait du néant.
+//   * DSD_FLAG vaut 0x8000_0000 (bit 31) ; `1 << 29` est NEW_SHAPING. Le refus
+//     « DSD WavPack not supported » ne se déclenchait JAMAIS : un .wv DSD
+//     partait dans le décodeur PCM, c'est-à-dire en bruit.
+const FLAG_FALSE_STEREO: u32 = 0x4000_0000;
+const FLAG_DSD: u32 = 0x8000_0000;
 const FLAG_INITIAL_BLOCK: u32 = 1 << 11;
 const FLAG_FINAL_BLOCK: u32 = 1 << 12;
 const _FLAG_EXTENDED_INT: u32 = 1 << 8;
-const FLAG_LEFT_SHIFT_MASK: u32 = 0x03 << 13; // bits 13-14
+// 🔴 SHIFT_MASK vaut `0x1f << 13` dans le format (cinq bits, décalage de 0 à
+// 31). Le masque de DEUX bits utilisé jusqu'ici tronquait tout décalage ≥ 4 :
+// un 24 bits stocké en 20 bits + shift 4 sortait 16 fois trop bas.
+const FLAG_LEFT_SHIFT_MASK: u32 = 0x1F << 13; // bits 13-17
 const FLAG_SAMPLE_RATE_MASK: u32 = 0x0F << 23; // bits 23-26
 
 // Sub-block IDs (low 5 bits)
@@ -45,6 +56,7 @@ const SUB_DECORR_WEIGHTS: u8 = 0x03;
 const SUB_DECORR_SAMPLES: u8 = 0x04;
 const SUB_ENTROPY_VARS: u8 = 0x05;
 const SUB_BITSTREAM: u8 = 0x0A;
+const SUB_WVX_BITSTREAM: u8 = 0x0C;
 const SUB_INT32_INFO: u8 = 0x09;
 const SUB_CHANNEL_INFO: u8 = 0x0D;
 const SUB_SAMPLE_RATE: u8 = 0x27; // non-standard rate (ID with ODD flag = 0x07 | 0x20)
@@ -69,7 +81,7 @@ struct BlockHeader {
     block_index: u32,
     block_samples: u32,
     flags: u32,
-    _crc: u32,
+    crc: u32,
 }
 
 impl BlockHeader {
@@ -83,6 +95,12 @@ impl BlockHeader {
 
     fn is_mono(&self) -> bool {
         self.flags & FLAG_MONO != 0
+    }
+
+    /// `MONO_DATA` = `MONO_FLAG | FALSE_STEREO` : le bloc ne porte qu'un canal
+    /// de données, qu'il soit annoncé mono ou « stéréo faux ».
+    fn is_mono_data(&self) -> bool {
+        self.flags & (FLAG_MONO | FLAG_FALSE_STEREO) != 0
     }
 
     fn is_hybrid(&self) -> bool {
@@ -187,7 +205,7 @@ fn read_block_header(r: &mut impl Read) -> Result<BlockHeader, String> {
         block_index,
         block_samples,
         flags,
-        _crc: crc,
+        crc,
     })
 }
 
@@ -254,12 +272,82 @@ fn parse_sub_blocks(data: &[u8]) -> Vec<SubBlock> {
 }
 
 // ── Entropy decoding (adaptive Golomb/Rice with 3 medians) ─────────────
+//
+// Tout ce qui suit — modèle à trois médianes, report `holding_one` /
+// `holding_zero`, séries de zéros, `read_code`, `exp2s`, passes de
+// décorrélation, mixage joint stereo, CRC de bloc — est un portage fidèle du
+// décodeur de référence WavPack 5.6.0 (`read_words.c`, `unpack.c`,
+// `decorr_utils.c`, `entropy_utils.c`) :
+//
+//   Copyright (c) 1998 - 2022 David Bryant / Conifer Software.
+//   Distribué sous licence BSD à 3 clauses (fichier COPYING de WavPack).
+//
+// La version précédente de ce module était une reconstitution de tête, non
+// validée sur un seul fichier réel : elle décodait du bruit à pleine échelle
+// (#3849). Ne pas « simplifier » ces fonctions : chaque décalage et chaque
+// arrondi est celui du format, pas un choix d'écriture.
+
+const LIMIT_ONES: u32 = 16;
+const MAX_TERM: i32 = 8;
+
+/// `exp2_table` de WavPack : `exp2_table[i] | 0x100 == round(256 * 2^(i/256))`.
+const EXP2_TABLE: [u8; 256] = [
+    0x00, 0x01, 0x01, 0x02, 0x03, 0x03, 0x04, 0x05, 0x06, 0x06, 0x07, 0x08, 0x08, 0x09, 0x0a, 0x0b,
+    0x0b, 0x0c, 0x0d, 0x0e, 0x0e, 0x0f, 0x10, 0x10, 0x11, 0x12, 0x13, 0x13, 0x14, 0x15, 0x16, 0x16,
+    0x17, 0x18, 0x19, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1d, 0x1e, 0x1f, 0x20, 0x20, 0x21, 0x22, 0x23,
+    0x24, 0x24, 0x25, 0x26, 0x27, 0x28, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3a, 0x3b, 0x3c, 0x3d,
+    0x3e, 0x3f, 0x40, 0x41, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x48, 0x49, 0x4a, 0x4b,
+    0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a,
+    0x5b, 0x5c, 0x5d, 0x5e, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
+    0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x87, 0x88, 0x89, 0x8a,
+    0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b,
+    0x9c, 0x9d, 0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad,
+    0xaf, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0,
+    0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc8, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf, 0xd0, 0xd2, 0xd3, 0xd4,
+    0xd6, 0xd7, 0xd8, 0xd9, 0xdb, 0xdc, 0xdd, 0xde, 0xe0, 0xe1, 0xe2, 0xe4, 0xe5, 0xe6, 0xe8, 0xe9,
+    0xea, 0xec, 0xed, 0xee, 0xf0, 0xf1, 0xf2, 0xf4, 0xf5, 0xf6, 0xf8, 0xf9, 0xfa, 0xfc, 0xfd, 0xff,
+];
+
+/// `wp_exp2s` de WavPack. **Le logarithme est SIGNÉ** : les échantillons de
+/// décorrélation sont stockés en `int16_t`, et un log négatif se décode en
+/// `-exp2s(-log)`. L'ancienne version prenait le bit 15 pour un signe et les
+/// bits 8-14 pour un exposant, d'où un décalage de plus de 100 rangs (panique
+/// en débogage, valeur arbitraire en production).
+fn exp2s(log: i32) -> i32 {
+    if log < 0 {
+        // `wrapping_neg` : un log de -32768 (borne d'un `int16_t`) donne
+        // 0x8000_0000, dont la negation deborde. Le C de reference deborde
+        // pareil et retombe sur la meme valeur ; on ne panique pas ici.
+        return exp2s(log.wrapping_neg()).wrapping_neg();
+    }
+
+    let value = (EXP2_TABLE[(log & 0xff) as usize] as u32) | 0x100;
+    let log = log >> 8;
+
+    if log <= 9 {
+        (value >> (9 - log)) as i32
+    } else {
+        (value << ((log - 9) & 0x1f)) as i32
+    }
+}
+
+/// `count_bits` de WavPack : rang du bit de poids fort, +1.
+#[inline]
+fn count_bits(v: u32) -> u32 {
+    if v == 0 { 0 } else { 32 - v.leading_zeros() }
+}
 
 /// Bitstream reader for the compressed audio data.
 struct BitstreamReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
     bit_pos: u32, // 0-7, bit within current byte (LSB first)
+    /// Vrai dès qu'on a lu au-delà de la fin du flux. Le décodeur de
+    /// référence « enroule » ; ici on rend des zéros et on le SIGNALE, pour
+    /// que le bloc soit refusé au lieu de produire du bruit.
+    overrun: bool,
 }
 
 impl<'a> BitstreamReader<'a> {
@@ -268,11 +356,13 @@ impl<'a> BitstreamReader<'a> {
             data,
             byte_pos: 0,
             bit_pos: 0,
+            overrun: false,
         }
     }
 
     fn read_bit(&mut self) -> Option<u32> {
         if self.byte_pos >= self.data.len() {
+            self.overrun = true;
             return None;
         }
         let bit = ((self.data[self.byte_pos] >> self.bit_pos) & 1) as u32;
@@ -284,6 +374,12 @@ impl<'a> BitstreamReader<'a> {
         Some(bit)
     }
 
+    /// `getbit` : hors flux, rend 0 et arme `overrun`.
+    #[inline]
+    fn getbit(&mut self) -> u32 {
+        self.read_bit().unwrap_or(0)
+    }
+
     fn read_bits(&mut self, n: u32) -> Option<u32> {
         let mut value = 0u32;
         for i in 0..n {
@@ -292,7 +388,18 @@ impl<'a> BitstreamReader<'a> {
         Some(value)
     }
 
+    /// `getbits` : hors flux, complète par des zéros et arme `overrun`.
+    #[inline]
+    fn getbits(&mut self, n: u32) -> u32 {
+        let mut value = 0u32;
+        for i in 0..n {
+            value |= self.getbit() << i;
+        }
+        value
+    }
+
     /// Count consecutive zero bits (unary code), return the count.
+    #[cfg(test)]
     fn read_unary(&mut self) -> Option<u32> {
         let mut count = 0u32;
         loop {
@@ -309,144 +416,245 @@ impl<'a> BitstreamReader<'a> {
     }
 }
 
+/// `read_code` de WavPack : une valeur de 0 à `maxcode` inclus, en
+/// `count_bits(maxcode)` bits ou un de moins.
+fn read_code(bs: &mut BitstreamReader, maxcode: u32) -> u32 {
+    if maxcode < 2 {
+        return if maxcode != 0 { bs.getbit() } else { 0 };
+    }
+
+    let bitcount = count_bits(maxcode);
+    let extras = ((1u64 << bitcount) - maxcode as u64 - 1) as u32;
+    let mut code = bs.getbits(bitcount - 1);
+
+    if code >= extras {
+        code = (code << 1).wrapping_sub(extras).wrapping_add(bs.getbit());
+    }
+
+    code
+}
+
 /// Median tracking for adaptive entropy coding.
 /// WavPack uses 3 medians per channel to adapt to signal statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct MedianValues {
     median: [u32; 3],
 }
 
 impl MedianValues {
     fn new() -> Self {
-        Self { median: [0; 3] }
+        Self::default()
     }
 
-    fn from_bytes(data: &[u8]) -> Self {
-        let mut median = [0u32; 3];
-        for (i, m) in median.iter_mut().enumerate() {
-            let offset = i * 4;
-            if offset + 4 <= data.len() {
-                *m = u32::from_le_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                ]);
-            }
-        }
-        Self { median }
-    }
-
-    /// Get the current divisor from the median.
-    /// The GET_MED macro from WavPack: (median >> 4) + 1
+    /// `GET_MED(med)` : `(median[med] >> 4) + 1`.
+    #[inline]
     fn get_med(&self, idx: usize) -> u32 {
         (self.median[idx] >> 4) + 1
     }
 
-    /// INC_MED: median += ((median + GET_MED) / GET_MED) * 5
+    /// Constantes de temps des trois médianes : `DIV0`, `DIV1`, `DIV2`.
+    ///
+    /// 🔴 Ce sont des CONSTANTES (128, 64, 32), pas `GET_MED(med)`. L'ancienne
+    /// version divisait par la médiane elle-même : sur le premier échantillon
+    /// réel mesuré, la médiane tombait à 852 au lieu de 870, et tout le flux
+    /// entropique décalait derrière.
+    const DIV: [u32; 3] = [128, 64, 32];
+
+    /// `INC_MEDn()` : `median += ((median + DIV) / DIV) * 5`.
+    #[inline]
     fn inc_med(&mut self, idx: usize) {
-        let get = self.get_med(idx);
-        self.median[idx] += ((self.median[idx] + get) / get) * 5;
+        let div = Self::DIV[idx];
+        self.median[idx] = self.median[idx]
+            .wrapping_add(((self.median[idx].wrapping_add(div)) / div).wrapping_mul(5));
     }
 
-    /// DEC_MED: median -= ((median + (GET_MED - 2)) / GET_MED) * 2
+    /// `DEC_MEDn()` : `median -= ((median + DIV - 2) / DIV) * 2`.
+    #[inline]
     fn dec_med(&mut self, idx: usize) {
-        let get = self.get_med(idx);
-        self.median[idx] =
-            self.median[idx].saturating_sub(((self.median[idx] + get - 2) / get) * 2);
+        let div = Self::DIV[idx];
+        self.median[idx] = self.median[idx]
+            .wrapping_sub(((self.median[idx].wrapping_add(div - 2)) / div).wrapping_mul(2));
     }
 }
 
-/// Read one entropy-coded residual from the bitstream, using the 3-median model.
-fn read_residual(bs: &mut BitstreamReader, medians: &mut MedianValues) -> Option<i32> {
-    // If all medians are zero, read elided zero run
-    if medians.median[0] < 2 && medians.median[1] < 2 && medians.median[2] < 2 {
-        // Zeroes mode: if bit is 0, return 0; if bit is 1, reinitialize medians
-        // Actually, in WavPack the "zeroes" mode uses a different encoding.
-        // When medians are low, we read a single bit. If 0, sample = 0.
-        // If 1, we need to read the value normally with medians reset.
-        // But this is a simplification -- the real WavPack uses a zero-run mechanism.
-        // For robustness, we'll just use the normal path when medians are near zero.
-    }
+/// État partagé du décodeur entropique (`struct words_data`).
+///
+/// 🔴 `holding_one`, `holding_zero` et `zeros_acc` sont communs AUX DEUX
+/// canaux : le compte unaire d'un échantillon porte la moitié de celui du
+/// suivant. C'est ce report qui manquait entièrement à l'ancien décodeur, et
+/// sans lui le flux se désynchronise dès le deuxième échantillon.
+struct WordsData {
+    c: [MedianValues; 2],
+    holding_one: u32,
+    holding_zero: bool,
+    zeros_acc: u32,
+}
 
-    // Read the value using the three-level Golomb code.
-    //
-    // Level 0: Read unary count of ones to determine which median to use
-    // If first bit is 0: value < med[0], read extra bits using med[0] as divisor
-    // If first bits are 10: med[0] <= value < med[0]+med[1], read extra bits
-    // If first bits are 110+: value >= med[0]+med[1], read remaining with med[2]
-
-    let bit0 = bs.read_bit()?;
-
-    let value = if bit0 == 0 {
-        // Value is in range [0, med[0])
-        let div = medians.get_med(0);
-        let extra = read_code(bs, div)?;
-        medians.dec_med(0);
-        extra
-    } else {
-        let bit1 = bs.read_bit()?;
-        if bit1 == 0 {
-            // Value is in range [med[0], med[0] + med[1])
-            let base = medians.get_med(0);
-            let div = medians.get_med(1);
-            let extra = read_code(bs, div)?;
-            medians.inc_med(0);
-            medians.dec_med(1);
-            base + extra
-        } else {
-            // Value is >= med[0] + med[1], use unary + med[2]
-            let base = medians.get_med(0) + medians.get_med(1);
-            let ones = bs.read_unary()?;
-            let div = medians.get_med(2);
-            let extra = read_code(bs, div)?;
-            medians.inc_med(0);
-            medians.inc_med(1);
-
-            // For each extra unary one, add med[2] and inc_med(2)
-            let mut bonus = 0u32;
-            for _ in 0..ones {
-                bonus += div;
-                medians.inc_med(2);
-            }
-
-            if ones == 0 {
-                medians.dec_med(2);
-            }
-
-            base + bonus + extra
+impl WordsData {
+    fn new() -> Self {
+        Self {
+            c: [MedianValues::new(), MedianValues::new()],
+            holding_one: 0,
+            holding_zero: false,
+            zeros_acc: 0,
         }
-    };
-
-    // Read sign bit
-    if value != 0 {
-        let sign = bs.read_bit()?;
-        if sign != 0 {
-            Some(!(value as i32)) // ~value = -(value+1) in two's complement
-        } else {
-            Some(value as i32)
-        }
-    } else {
-        Some(0)
     }
 }
 
-/// Read a value in [0, limit) using log2(limit) bits, with the "excess" technique
-/// for non-power-of-2 divisors.
-fn read_code(bs: &mut BitstreamReader, limit: u32) -> Option<u32> {
-    if limit <= 1 {
-        return Some(0);
-    }
-    let bits = 32 - (limit - 1).leading_zeros(); // ceil(log2(limit))
-    let max_code = (1u32 << bits) - limit; // number of short codes
-
-    let mut value = bs.read_bits(bits - 1)?;
-    if value >= max_code {
-        value = (value << 1) | bs.read_bit()?;
-        value -= max_code;
+/// Lit un compte de zéros / de uns codé « Elias gamma » (voir `read_words.c`).
+/// Rend `None` sur fin de flux (`cbits == 33`).
+fn read_gamma(bs: &mut BitstreamReader) -> Option<u32> {
+    let mut cbits = 0u32;
+    while cbits < 33 && bs.getbit() != 0 {
+        cbits += 1;
     }
 
-    Some(value)
+    if cbits == 33 {
+        return None;
+    }
+
+    if cbits < 2 {
+        return Some(cbits);
+    }
+
+    let mut mask = 1u32;
+    let mut acc = 0u32;
+    loop {
+        cbits -= 1;
+        if cbits == 0 {
+            break;
+        }
+        if bs.getbit() != 0 {
+            acc |= mask;
+        }
+        mask <<= 1;
+    }
+
+    Some(acc | mask)
+}
+
+/// `get_words_lossless` de WavPack : remplit `buffer` (entrelacé en stéréo)
+/// avec les résidus entropiques. Rend le nombre d'échantillons produits.
+fn get_words_lossless(
+    w: &mut WordsData,
+    bs: &mut BitstreamReader,
+    buffer: &mut [i32],
+    is_mono: bool,
+) -> usize {
+    let nsamples = buffer.len();
+    let mut csamples = 0usize;
+
+    while csamples < nsamples {
+        let mut chan = if is_mono { 0 } else { csamples & 1 };
+
+        if w.holding_zero {
+            w.holding_zero = false;
+            let maxcode = w.c[chan].get_med(0).wrapping_sub(1);
+            let low = read_code(bs, maxcode);
+            w.c[chan].dec_med(0);
+            buffer[csamples] = if bs.getbit() != 0 {
+                !(low as i32)
+            } else {
+                low as i32
+            };
+
+            csamples += 1;
+            if csamples == nsamples {
+                break;
+            }
+            chan = if is_mono { 0 } else { csamples & 1 };
+        }
+
+        if w.c[0].median[0] < 2 && w.holding_one == 0 && w.c[1].median[0] < 2 {
+            if w.zeros_acc != 0 {
+                w.zeros_acc -= 1;
+                if w.zeros_acc != 0 {
+                    buffer[csamples] = 0;
+                    csamples += 1;
+                    continue;
+                }
+            } else {
+                match read_gamma(bs) {
+                    None => break,
+                    Some(v) => w.zeros_acc = v,
+                }
+
+                if w.zeros_acc != 0 {
+                    w.c[0].median = [0; 3];
+                    w.c[1].median = [0; 3];
+                    buffer[csamples] = 0;
+                    csamples += 1;
+                    continue;
+                }
+            }
+        }
+
+        // Compte unaire, plafonné à LIMIT_ONES puis étendu en Elias gamma.
+        let mut ones_count = 0u32;
+        while ones_count < LIMIT_ONES + 1 && bs.getbit() != 0 {
+            ones_count += 1;
+        }
+
+        if ones_count >= LIMIT_ONES {
+            if ones_count == LIMIT_ONES + 1 {
+                break; // WORD_EOF
+            }
+            match read_gamma(bs) {
+                None => break,
+                Some(v) => ones_count = v + LIMIT_ONES,
+            }
+        }
+
+        // Report d'un demi-compte sur l'échantillon suivant.
+        let carry = w.holding_one;
+        w.holding_one = ones_count & 1;
+        w.holding_zero = (!ones_count) & 1 != 0;
+        let ones_count = (ones_count >> 1) + carry;
+
+        let c = &mut w.c[chan];
+        let mut low: u32;
+        let high: u32;
+
+        // Arithmetique NON SIGNEE et modulaire, comme en C : un fichier abime
+        // peut faire deborder ces sommes, et une panique dans un decodeur est
+        // un deni de service, pas une protection. Le CRC du bloc refusera le
+        // resultat de toute facon.
+        if ones_count == 0 {
+            low = 0;
+            high = c.get_med(0) - 1;
+            c.dec_med(0);
+        } else {
+            low = c.get_med(0);
+            c.inc_med(0);
+
+            if ones_count == 1 {
+                high = low.wrapping_add(c.get_med(1)).wrapping_sub(1);
+                c.dec_med(1);
+            } else {
+                low = low.wrapping_add(c.get_med(1));
+                c.inc_med(1);
+
+                if ones_count == 2 {
+                    high = low.wrapping_add(c.get_med(2)).wrapping_sub(1);
+                    c.dec_med(2);
+                } else {
+                    low = low.wrapping_add((ones_count - 2).wrapping_mul(c.get_med(2)));
+                    high = low.wrapping_add(c.get_med(2)).wrapping_sub(1);
+                    c.inc_med(2);
+                }
+            }
+        }
+
+        low = low.wrapping_add(read_code(bs, high.wrapping_sub(low)));
+        buffer[csamples] = if bs.getbit() != 0 {
+            !(low as i32)
+        } else {
+            low as i32
+        };
+        csamples += 1;
+    }
+
+    csamples
 }
 
 // ── Decorrelation ──────────────────────────────────────────────────────
@@ -491,14 +699,31 @@ fn parse_decorr_terms(data: &[u8]) -> Vec<DecorrPass> {
     passes
 }
 
+/// `read_decorr_weights`. 🔴 Les poids sont assignés **de la DERNIÈRE passe
+/// vers la première** (`while (--dpp >= wps->decorr_passes)`), et un bloc peut
+/// en porter moins qu'il n'y a de termes — les passes de tête restent alors à
+/// zéro. L'ancienne version remplissait depuis la passe 0, donc à l'envers.
 fn parse_decorr_weights(data: &[u8], passes: &mut [DecorrPass], is_mono: bool) {
-    let mut idx = 0;
     for pass in passes.iter_mut() {
+        pass.weight_a = 0;
+        pass.weight_b = 0;
+    }
+
+    let mut termcnt = if is_mono { data.len() } else { data.len() / 2 };
+    let mut idx = 0usize;
+
+    for pass in passes.iter_mut().rev() {
+        if termcnt == 0 {
+            break;
+        }
+        termcnt -= 1;
+
         if idx >= data.len() {
             break;
         }
         pass.weight_a = restore_weight(data[idx] as i8);
         idx += 1;
+
         if !is_mono {
             if idx >= data.len() {
                 break;
@@ -509,66 +734,83 @@ fn parse_decorr_weights(data: &[u8], passes: &mut [DecorrPass], is_mono: bool) {
     }
 }
 
-/// Restore weight from stored byte value.
-/// if (weight >= 0) weight = (weight << 3) + ((weight + 7) >> 4);
-/// if (weight < 0) weight = (weight << 3) - ((-weight + 7) >> 4);
+/// `restore_weight` de WavPack :
+/// ```c
+/// if ((result = (int) weight * 8) > 0)
+///     result += (result + 64) >> 7;
+/// ```
+/// 🔴 La correction d'arrondi ne s'applique QU'AUX poids positifs. L'ancienne
+/// version la retranchait aussi des poids négatifs : jusqu'à 7 rangs d'écart
+/// sur un poids, soit une prédiction fausse à chaque échantillon.
 fn restore_weight(stored: i8) -> i32 {
-    let s = stored as i32;
-    if s >= 0 {
-        (s << 3) + ((s + 7) >> 4)
-    } else {
-        (s << 3) - ((-s + 7) >> 4)
+    let mut result = (stored as i32) * 8;
+    if result > 0 {
+        result += (result + 64) >> 7;
     }
+    result
 }
 
+/// `read_decorr_samples`. 🔴 Comme les poids, les échantillons sont lus **de la
+/// dernière passe vers la première**, et chaque valeur est un `int16_t` passé
+/// par `exp2s` — d'où l'importance du signe corrigé dans `exp2s`.
 fn parse_decorr_samples(data: &[u8], passes: &mut [DecorrPass], is_mono: bool) {
-    let mut offset = 0;
-
     for pass in passes.iter_mut() {
-        let term = pass.term;
+        pass.samples_a = [0; 8];
+        pass.samples_b = [0; 8];
+    }
 
-        if term > 8 {
-            // Terms 17, 18: 2 samples per channel
+    let mut offset = 0usize;
+    let take = |data: &[u8], offset: &mut usize| -> Option<i32> {
+        if *offset + 2 > data.len() {
+            return None;
+        }
+        let v = i16::from_le_bytes([data[*offset], data[*offset + 1]]) as i32;
+        *offset += 2;
+        Some(exp2s(v))
+    };
+
+    for pass in passes.iter_mut().rev() {
+        if offset >= data.len() {
+            break;
+        }
+
+        if pass.term > MAX_TERM {
+            // Termes 17 et 18 : deux échantillons par canal.
             for j in 0..2 {
-                if offset + 2 <= data.len() {
-                    pass.samples_a[j] = exp2s(u16::from_le_bytes([data[offset], data[offset + 1]]));
-                    offset += 2;
+                match take(data, &mut offset) {
+                    Some(v) => pass.samples_a[j] = v,
+                    None => return,
                 }
             }
             if !is_mono {
                 for j in 0..2 {
-                    if offset + 2 <= data.len() {
-                        pass.samples_b[j] =
-                            exp2s(u16::from_le_bytes([data[offset], data[offset + 1]]));
-                        offset += 2;
+                    match take(data, &mut offset) {
+                        Some(v) => pass.samples_b[j] = v,
+                        None => return,
                     }
                 }
             }
-        } else if term < 0 {
-            // Cross-channel terms: 1 sample each
-            if offset + 2 <= data.len() {
-                pass.samples_a[0] = exp2s(u16::from_le_bytes([data[offset], data[offset + 1]]));
-                offset += 2;
+        } else if pass.term < 0 {
+            // Termes croisés : un échantillon par canal, A puis B.
+            match take(data, &mut offset) {
+                Some(v) => pass.samples_a[0] = v,
+                None => return,
             }
-            if offset + 2 <= data.len() {
-                pass.samples_b[0] = exp2s(u16::from_le_bytes([data[offset], data[offset + 1]]));
-                offset += 2;
+            match take(data, &mut offset) {
+                Some(v) => pass.samples_b[0] = v,
+                None => return,
             }
         } else {
-            // Terms 1-8: term samples per channel
-            let count = term as usize;
-            for j in 0..count {
-                if offset + 2 <= data.len() {
-                    pass.samples_a[j] = exp2s(u16::from_le_bytes([data[offset], data[offset + 1]]));
-                    offset += 2;
+            // Termes 1-8 : `term` échantillons par canal, entrelacés A/B.
+            for m in 0..pass.term.max(0) as usize {
+                match take(data, &mut offset) {
+                    Some(v) => pass.samples_a[m] = v,
+                    None => return,
                 }
-            }
-            if !is_mono {
-                for j in 0..count {
-                    if offset + 2 <= data.len() {
-                        pass.samples_b[j] =
-                            exp2s(u16::from_le_bytes([data[offset], data[offset + 1]]));
-                        offset += 2;
+                if !is_mono {
+                    match take(data, &mut offset) {
+                        Some(v) => pass.samples_b[m] = v,
+                        None => return,
                     }
                 }
             }
@@ -576,295 +818,213 @@ fn parse_decorr_samples(data: &[u8], passes: &mut [DecorrPass], is_mono: bool) {
     }
 }
 
-/// Convert log2-encoded 16-bit value back to integer.
-/// This is WavPack's exp2s() function.
-fn exp2s(val: u16) -> i32 {
-    if val == 0 {
-        return 0;
-    }
-
-    let sign = val & 0x8000 != 0;
-    let exp = ((val >> 8) & 0x7F) as u32;
-    let mantissa = (val & 0xFF) as u32;
-
-    // result = (mantissa | 0x100) << exp, shifted right by 9
-    let mut result = if exp > 9 {
-        ((mantissa | 0x100) as i32) << (exp - 9)
-    } else {
-        ((mantissa | 0x100) as i32) >> (9 - exp)
-    };
-
-    if sign {
-        result = -result;
-    }
-
-    result
+/// `apply_weight_i` : variante sans débordement possible sur 32 bits.
+#[inline]
+fn apply_weight_i(weight: i32, sample: i32) -> i32 {
+    (weight.wrapping_mul(sample).wrapping_add(512)) >> 10
 }
 
-/// Apply weight update: weight += delta * sign(sample * residual)
+/// `apply_weight_f` : variante utilisée quand l'échantillon déborde de 16 bits.
+/// ⚠️ Ce n'est PAS `(w * s + 512) >> 10` : l'arrondi diffère, et le format
+/// dépend de celui-ci au bit près.
+#[inline]
+fn apply_weight_f(weight: i32, sample: i32) -> i32 {
+    ((((sample & 0xffff).wrapping_mul(weight)) >> 9)
+        .wrapping_add(((sample & !0xffff_i32) >> 9).wrapping_mul(weight))
+        .wrapping_add(1))
+        >> 1
+}
+
+/// `apply_weight` : choisit la variante selon la magnitude de l'échantillon.
+#[inline]
+fn apply_weight(weight: i32, sample: i32) -> i32 {
+    if sample != (sample as i16) as i32 {
+        apply_weight_f(weight, sample)
+    } else {
+        apply_weight_i(weight, sample)
+    }
+}
+
+/// `update_weight` : `weight += delta * sign(source ^ result)`.
 #[inline]
 fn update_weight(weight: &mut i32, delta: i32, source: i32, result: i32) {
     if source != 0 && result != 0 {
-        if (source ^ result) >= 0 {
-            *weight += delta;
-        } else {
-            *weight -= delta;
+        let s = (source ^ result) >> 31;
+        *weight = (delta ^ s).wrapping_add(weight.wrapping_sub(s));
+    }
+}
+
+/// `update_weight_clip` : idem, borné à ±1024 (termes croisés uniquement).
+#[inline]
+fn update_weight_clip(weight: &mut i32, delta: i32, source: i32, result: i32) {
+    if source != 0 && result != 0 {
+        let s = (source ^ result) >> 31;
+        let mut w = (*weight ^ s).wrapping_add(delta.wrapping_sub(s));
+        if w > 1024 {
+            w = 1024;
+        }
+        *weight = (w ^ s).wrapping_sub(s);
+    }
+}
+
+/// `decorr_stereo_pass` : une passe de décorrélation sur un tampon entrelacé.
+fn decorr_stereo_pass(dpp: &mut DecorrPass, buffer: &mut [i32]) {
+    let n = buffer.len() / 2;
+    let delta = dpp.delta;
+
+    match dpp.term {
+        17 => {
+            for i in 0..n {
+                let sam = dpp.samples_a[0]
+                    .wrapping_mul(2)
+                    .wrapping_sub(dpp.samples_a[1]);
+                dpp.samples_a[1] = dpp.samples_a[0];
+                let tmp = buffer[i * 2];
+                dpp.samples_a[0] = apply_weight(dpp.weight_a, sam).wrapping_add(tmp);
+                buffer[i * 2] = dpp.samples_a[0];
+                update_weight(&mut dpp.weight_a, delta, sam, tmp);
+
+                let sam = dpp.samples_b[0]
+                    .wrapping_mul(2)
+                    .wrapping_sub(dpp.samples_b[1]);
+                dpp.samples_b[1] = dpp.samples_b[0];
+                let tmp = buffer[i * 2 + 1];
+                dpp.samples_b[0] = apply_weight(dpp.weight_b, sam).wrapping_add(tmp);
+                buffer[i * 2 + 1] = dpp.samples_b[0];
+                update_weight(&mut dpp.weight_b, delta, sam, tmp);
+            }
+        }
+        18 => {
+            for i in 0..n {
+                let sam = dpp.samples_a[0]
+                    .wrapping_add(dpp.samples_a[0].wrapping_sub(dpp.samples_a[1]) >> 1);
+                dpp.samples_a[1] = dpp.samples_a[0];
+                let tmp = buffer[i * 2];
+                dpp.samples_a[0] = apply_weight(dpp.weight_a, sam).wrapping_add(tmp);
+                buffer[i * 2] = dpp.samples_a[0];
+                update_weight(&mut dpp.weight_a, delta, sam, tmp);
+
+                let sam = dpp.samples_b[0]
+                    .wrapping_add(dpp.samples_b[0].wrapping_sub(dpp.samples_b[1]) >> 1);
+                dpp.samples_b[1] = dpp.samples_b[0];
+                let tmp = buffer[i * 2 + 1];
+                dpp.samples_b[0] = apply_weight(dpp.weight_b, sam).wrapping_add(tmp);
+                buffer[i * 2 + 1] = dpp.samples_b[0];
+                update_weight(&mut dpp.weight_b, delta, sam, tmp);
+            }
+        }
+        -1 => {
+            for i in 0..n {
+                let sam = buffer[i * 2].wrapping_add(apply_weight(dpp.weight_a, dpp.samples_a[0]));
+                update_weight_clip(&mut dpp.weight_a, delta, dpp.samples_a[0], buffer[i * 2]);
+                buffer[i * 2] = sam;
+                dpp.samples_a[0] = buffer[i * 2 + 1].wrapping_add(apply_weight(dpp.weight_b, sam));
+                update_weight_clip(&mut dpp.weight_b, delta, sam, buffer[i * 2 + 1]);
+                buffer[i * 2 + 1] = dpp.samples_a[0];
+            }
+        }
+        -2 => {
+            for i in 0..n {
+                let sam =
+                    buffer[i * 2 + 1].wrapping_add(apply_weight(dpp.weight_b, dpp.samples_b[0]));
+                update_weight_clip(
+                    &mut dpp.weight_b,
+                    delta,
+                    dpp.samples_b[0],
+                    buffer[i * 2 + 1],
+                );
+                buffer[i * 2 + 1] = sam;
+                dpp.samples_b[0] = buffer[i * 2].wrapping_add(apply_weight(dpp.weight_a, sam));
+                update_weight_clip(&mut dpp.weight_a, delta, sam, buffer[i * 2]);
+                buffer[i * 2] = dpp.samples_b[0];
+            }
+        }
+        -3 => {
+            for i in 0..n {
+                let sam_a =
+                    buffer[i * 2].wrapping_add(apply_weight(dpp.weight_a, dpp.samples_a[0]));
+                update_weight_clip(&mut dpp.weight_a, delta, dpp.samples_a[0], buffer[i * 2]);
+                let sam_b =
+                    buffer[i * 2 + 1].wrapping_add(apply_weight(dpp.weight_b, dpp.samples_b[0]));
+                update_weight_clip(
+                    &mut dpp.weight_b,
+                    delta,
+                    dpp.samples_b[0],
+                    buffer[i * 2 + 1],
+                );
+                dpp.samples_b[0] = sam_a;
+                buffer[i * 2] = sam_a;
+                dpp.samples_a[0] = sam_b;
+                buffer[i * 2 + 1] = sam_b;
+            }
+        }
+        _ => {
+            // Termes 1 à 8 : tampon circulaire de 8 échantillons par canal.
+            let mut m = 0usize;
+            let mut k = (dpp.term & (MAX_TERM - 1)) as usize;
+            for i in 0..n {
+                let sam = dpp.samples_a[m];
+                dpp.samples_a[k] = apply_weight(dpp.weight_a, sam).wrapping_add(buffer[i * 2]);
+                update_weight(&mut dpp.weight_a, delta, sam, buffer[i * 2]);
+                buffer[i * 2] = dpp.samples_a[k];
+
+                let sam = dpp.samples_b[m];
+                dpp.samples_b[k] = apply_weight(dpp.weight_b, sam).wrapping_add(buffer[i * 2 + 1]);
+                update_weight(&mut dpp.weight_b, delta, sam, buffer[i * 2 + 1]);
+                buffer[i * 2 + 1] = dpp.samples_b[k];
+
+                m = (m + 1) & (MAX_TERM as usize - 1);
+                k = (k + 1) & (MAX_TERM as usize - 1);
+            }
         }
     }
 }
 
-/// Apply weight: (weight * sample + 512) >> 10
-#[inline]
-fn apply_weight(weight: i32, sample: i32) -> i32 {
-    ((weight as i64 * sample as i64 + 512) >> 10) as i32
-}
+/// `decorr_mono_pass`.
+fn decorr_mono_pass(dpp: &mut DecorrPass, buffer: &mut [i32]) {
+    let delta = dpp.delta;
 
-/// Apply decorrelation passes to a block of interleaved or mono residuals.
-fn apply_decorrelation(
-    passes: &mut [DecorrPass],
-    left: &mut [i32],
-    right: &mut [i32],
-    is_mono: bool,
-) {
-    let num_samples = left.len();
-
-    for pass in passes.iter_mut() {
-        let term = pass.term;
-        let delta = pass.delta;
-
-        match term {
-            1..=8 => {
-                // Simple delay decorrelation
-                let t = term as usize;
-                for i in 0..num_samples {
-                    let idx = if i < t {
-                        // Use stored samples for the first few
-                        i
-                    } else {
-                        i
-                    };
-
-                    // Channel A
-                    let src_a = if i < t {
-                        pass.samples_a[i]
-                    } else {
-                        left[i - t]
-                    };
-                    let pred_a = apply_weight(pass.weight_a, src_a);
-                    let result_a = left[i] + pred_a;
-                    update_weight(&mut pass.weight_a, delta, src_a, left[i]);
-                    left[i] = result_a;
-
-                    if !is_mono {
-                        let src_b = if i < t {
-                            pass.samples_b[i]
-                        } else {
-                            right[i - t]
-                        };
-                        let pred_b = apply_weight(pass.weight_b, src_b);
-                        let result_b = right[i] + pred_b;
-                        update_weight(&mut pass.weight_b, delta, src_b, right[i]);
-                        right[i] = result_b;
-                    }
-
-                    // Update stored samples (for next block)
-                    if i >= num_samples - t {
-                        let store_idx = t - (num_samples - i);
-                        if store_idx < 8 {
-                            pass.samples_a[store_idx] = left[i];
-                            if !is_mono {
-                                pass.samples_b[store_idx] = right[i];
-                            }
-                        }
-                    }
-
-                    let _ = idx; // suppress unused warning
-                }
+    match dpp.term {
+        17 => {
+            for s in buffer.iter_mut() {
+                let sam = dpp.samples_a[0]
+                    .wrapping_mul(2)
+                    .wrapping_sub(dpp.samples_a[1]);
+                dpp.samples_a[1] = dpp.samples_a[0];
+                dpp.samples_a[0] = apply_weight(dpp.weight_a, sam).wrapping_add(*s);
+                update_weight(&mut dpp.weight_a, delta, sam, *s);
+                *s = dpp.samples_a[0];
             }
-            17 => {
-                // pred = 2*s[-1] - s[-2]
-                for i in 0..num_samples {
-                    let (s1_a, s2_a) = if i == 0 {
-                        (pass.samples_a[0], pass.samples_a[1])
-                    } else if i == 1 {
-                        (left[0], pass.samples_a[0])
-                    } else {
-                        (left[i - 1], left[i - 2])
-                    };
-                    let pred_src_a = 2i64 * s1_a as i64 - s2_a as i64;
-                    let pred_src_a = pred_src_a as i32;
-                    let pred_a = apply_weight(pass.weight_a, pred_src_a);
-                    let result_a = left[i] + pred_a;
-                    update_weight(&mut pass.weight_a, delta, pred_src_a, left[i]);
-                    left[i] = result_a;
-
-                    if !is_mono {
-                        let (s1_b, s2_b) = if i == 0 {
-                            (pass.samples_b[0], pass.samples_b[1])
-                        } else if i == 1 {
-                            (right[0], pass.samples_b[0])
-                        } else {
-                            (right[i - 1], right[i - 2])
-                        };
-                        let pred_src_b = 2i64 * s1_b as i64 - s2_b as i64;
-                        let pred_src_b = pred_src_b as i32;
-                        let pred_b = apply_weight(pass.weight_b, pred_src_b);
-                        let result_b = right[i] + pred_b;
-                        update_weight(&mut pass.weight_b, delta, pred_src_b, right[i]);
-                        right[i] = result_b;
-                    }
-                }
-
-                // Store last 2 samples for next block
-                if num_samples >= 2 {
-                    pass.samples_a[0] = left[num_samples - 1];
-                    pass.samples_a[1] = left[num_samples - 2];
-                    if !is_mono {
-                        pass.samples_b[0] = right[num_samples - 1];
-                        pass.samples_b[1] = right[num_samples - 2];
-                    }
-                } else if num_samples == 1 {
-                    pass.samples_a[1] = pass.samples_a[0];
-                    pass.samples_a[0] = left[0];
-                    if !is_mono {
-                        pass.samples_b[1] = pass.samples_b[0];
-                        pass.samples_b[0] = right[0];
-                    }
-                }
+        }
+        18 => {
+            for s in buffer.iter_mut() {
+                let sam = dpp.samples_a[0]
+                    .wrapping_mul(3)
+                    .wrapping_sub(dpp.samples_a[1])
+                    >> 1;
+                dpp.samples_a[1] = dpp.samples_a[0];
+                dpp.samples_a[0] = apply_weight(dpp.weight_a, sam).wrapping_add(*s);
+                update_weight(&mut dpp.weight_a, delta, sam, *s);
+                *s = dpp.samples_a[0];
             }
-            18 => {
-                // pred = 3*s[-1] - 2*s[-2]  (but WavPack uses a special formulation)
-                // Actually: pred = s[-1] + (s[-1] - s[-2]) / 2
-                //         = (3*s[-1] - s[-2]) / 2
-                for i in 0..num_samples {
-                    let (s1_a, s2_a) = if i == 0 {
-                        (pass.samples_a[0], pass.samples_a[1])
-                    } else if i == 1 {
-                        (left[0], pass.samples_a[0])
-                    } else {
-                        (left[i - 1], left[i - 2])
-                    };
-                    let pred_src_a = (3i64 * s1_a as i64 - s2_a as i64) >> 1;
-                    let pred_src_a = pred_src_a as i32;
-                    let pred_a = apply_weight(pass.weight_a, pred_src_a);
-                    let result_a = left[i] + pred_a;
-                    update_weight(&mut pass.weight_a, delta, pred_src_a, left[i]);
-                    left[i] = result_a;
-
-                    if !is_mono {
-                        let (s1_b, s2_b) = if i == 0 {
-                            (pass.samples_b[0], pass.samples_b[1])
-                        } else if i == 1 {
-                            (right[0], pass.samples_b[0])
-                        } else {
-                            (right[i - 1], right[i - 2])
-                        };
-                        let pred_src_b = (3i64 * s1_b as i64 - s2_b as i64) >> 1;
-                        let pred_src_b = pred_src_b as i32;
-                        let pred_b = apply_weight(pass.weight_b, pred_src_b);
-                        let result_b = right[i] + pred_b;
-                        update_weight(&mut pass.weight_b, delta, pred_src_b, right[i]);
-                        right[i] = result_b;
-                    }
-                }
-
-                if num_samples >= 2 {
-                    pass.samples_a[0] = left[num_samples - 1];
-                    pass.samples_a[1] = left[num_samples - 2];
-                    if !is_mono {
-                        pass.samples_b[0] = right[num_samples - 1];
-                        pass.samples_b[1] = right[num_samples - 2];
-                    }
-                } else if num_samples == 1 {
-                    pass.samples_a[1] = pass.samples_a[0];
-                    pass.samples_a[0] = left[0];
-                    if !is_mono {
-                        pass.samples_b[1] = pass.samples_b[0];
-                        pass.samples_b[0] = right[0];
-                    }
-                }
+        }
+        _ => {
+            let mut m = 0usize;
+            let mut k = (dpp.term & (MAX_TERM - 1)) as usize;
+            for s in buffer.iter_mut() {
+                let sam = dpp.samples_a[m];
+                dpp.samples_a[k] = apply_weight(dpp.weight_a, sam).wrapping_add(*s);
+                update_weight(&mut dpp.weight_a, delta, sam, *s);
+                *s = dpp.samples_a[k];
+                m = (m + 1) & (MAX_TERM as usize - 1);
+                k = (k + 1) & (MAX_TERM as usize - 1);
             }
-            -1 => {
-                // Cross-channel: use right channel to predict left
-                for i in 0..num_samples {
-                    let src_b = if i == 0 {
-                        pass.samples_b[0]
-                    } else {
-                        right[i - 1]
-                    };
-                    let pred_a = apply_weight(pass.weight_a, src_b);
-                    let result_a = left[i] + pred_a;
-                    update_weight(&mut pass.weight_a, delta, src_b, left[i]);
-                    left[i] = result_a;
 
-                    // Right channel: use current left to predict right
-                    let pred_b = apply_weight(pass.weight_b, left[i]);
-                    let result_b = right[i] + pred_b;
-                    update_weight(&mut pass.weight_b, delta, left[i], right[i]);
-                    right[i] = result_b;
+            if m != 0 {
+                let tmp = dpp.samples_a;
+                for (k, slot) in dpp.samples_a.iter_mut().enumerate() {
+                    *slot = tmp[(m + k) & (MAX_TERM as usize - 1)];
                 }
-
-                if num_samples >= 1 {
-                    pass.samples_a[0] = left[num_samples - 1];
-                    pass.samples_b[0] = right[num_samples - 1];
-                }
-            }
-            -2 => {
-                // Cross-channel: use left channel to predict right
-                for i in 0..num_samples {
-                    let src_a = if i == 0 {
-                        pass.samples_a[0]
-                    } else {
-                        left[i - 1]
-                    };
-                    let pred_b = apply_weight(pass.weight_b, src_a);
-                    let result_b = right[i] + pred_b;
-                    update_weight(&mut pass.weight_b, delta, src_a, right[i]);
-                    right[i] = result_b;
-
-                    let pred_a = apply_weight(pass.weight_a, right[i]);
-                    let result_a = left[i] + pred_a;
-                    update_weight(&mut pass.weight_a, delta, right[i], left[i]);
-                    left[i] = result_a;
-                }
-
-                if num_samples >= 1 {
-                    pass.samples_a[0] = left[num_samples - 1];
-                    pass.samples_b[0] = right[num_samples - 1];
-                }
-            }
-            -3 => {
-                // Cross-channel: average
-                for i in 0..num_samples {
-                    let src_b = if i == 0 {
-                        pass.samples_b[0]
-                    } else {
-                        right[i - 1]
-                    };
-                    let pred_a = apply_weight(pass.weight_a, src_b);
-                    let result_a = left[i] + pred_a;
-                    update_weight(&mut pass.weight_a, delta, src_b, left[i]);
-                    left[i] = result_a;
-
-                    let src_a = if i == 0 {
-                        pass.samples_a[0]
-                    } else {
-                        left[i - 1]
-                    };
-                    let pred_b = apply_weight(pass.weight_b, src_a);
-                    let result_b = right[i] + pred_b;
-                    update_weight(&mut pass.weight_b, delta, src_a, right[i]);
-                    right[i] = result_b;
-                }
-
-                if num_samples >= 1 {
-                    pass.samples_a[0] = left[num_samples - 1];
-                    pass.samples_b[0] = right[num_samples - 1];
-                }
-            }
-            _ => {
-                // Unknown term, skip
-                warn!(term, "unknown_decorrelation_term");
             }
         }
     }
@@ -872,20 +1032,36 @@ fn apply_decorrelation(
 
 // ── Block decoding ─────────────────────────────────────────────────────
 
+/// Résultat du décodage d'un bloc : les deux canaux, plus le CRC calculé.
+struct DecodedBlock {
+    left: Vec<i32>,
+    right: Vec<i32>,
+}
+
 /// Decode a single WavPack block into i32 samples (left and right channels).
-fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<(Vec<i32>, Vec<i32>), String> {
+///
+/// 🔴 Rend `Err` dès que le CRC du bloc ne correspond pas. Sans ce contrôle,
+/// une désynchronisation du flux binaire rendait des échantillons plein bande
+/// SANS la moindre trace — c'est le mécanisme de #3849.
+fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<DecodedBlock, String> {
     let sub_blocks = parse_sub_blocks(block_data);
 
     let mut decorr_passes: Vec<DecorrPass> = Vec::new();
-    let mut medians_a = MedianValues::new();
-    let mut medians_b = MedianValues::new();
+    let mut words = WordsData::new();
     let mut bitstream_data: &[u8] = &[];
+    let mut wvx_data: Option<&[u8]> = None;
     let mut int32_info: Option<(u8, u8, u8, u8)> = None;
 
-    let is_mono = header.is_mono();
+    let is_mono = header.is_mono_data();
 
+    // 🔴 L'identifiant d'un sous-bloc tient sur SIX bits. Le bit 0x20
+    // (`ID_OPTIONAL_DATA`) marque une métadonnée qu'un décodeur a le droit
+    // d'ignorer. Masquer par 0x1F comme avant confond `0x25` (optionnel) avec
+    // `0x05` (variables d'entropie) : sur un fichier produit par l'encodeur
+    // officiel, les trois octets nuls de `0x25` écrasaient les six médianes,
+    // et le flux se décodait à côté dès le premier échantillon.
     for sub in &sub_blocks {
-        match sub.id & 0x1F {
+        match sub.id {
             SUB_DECORR_TERMS => {
                 decorr_passes = parse_decorr_terms(&sub.data);
             }
@@ -896,12 +1072,25 @@ fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<(Vec<i32>, Ve
                 parse_decorr_samples(&sub.data, &mut decorr_passes, is_mono);
             }
             SUB_ENTROPY_VARS => {
-                // 6 u32s: median_a[0..3] then median_b[0..3]
-                if sub.data.len() >= 12 {
-                    medians_a = MedianValues::from_bytes(&sub.data[0..12]);
+                // 🔴 SIX valeurs de 16 bits, chacune passée par `exp2s` — pas
+                // six mots de 32 bits lus tels quels (ancienne lecture).
+                let need = if is_mono { 6 } else { 12 };
+                if sub.data.len() < need {
+                    return Err(format!(
+                        "entropy vars too short: {} < {need}",
+                        sub.data.len()
+                    ));
                 }
-                if !is_mono && sub.data.len() >= 24 {
-                    medians_b = MedianValues::from_bytes(&sub.data[12..24]);
+                for i in 0..3 {
+                    let raw = u16::from_le_bytes([sub.data[i * 2], sub.data[i * 2 + 1]]) as i32;
+                    words.c[0].median[i] = exp2s(raw) as u32;
+                }
+                if !is_mono {
+                    for i in 0..3 {
+                        let o = 6 + i * 2;
+                        let raw = u16::from_le_bytes([sub.data[o], sub.data[o + 1]]) as i32;
+                        words.c[1].median[i] = exp2s(raw) as u32;
+                    }
                 }
             }
             SUB_INT32_INFO => {
@@ -909,8 +1098,14 @@ fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<(Vec<i32>, Ve
                     int32_info = Some((sub.data[0], sub.data[1], sub.data[2], sub.data[3]));
                 }
             }
-            id if id == (SUB_BITSTREAM & 0x1F) => {
+            id if id == SUB_BITSTREAM => {
                 bitstream_data = &sub.data;
+            }
+            id if id == SUB_WVX_BITSTREAM => {
+                // Les 4 premiers octets portent le CRC des bits supplémentaires.
+                if sub.data.len() > 4 {
+                    wvx_data = Some(&sub.data[4..]);
+                }
             }
             _ => {}
         }
@@ -918,157 +1113,157 @@ fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<(Vec<i32>, Ve
 
     let num_samples = header.block_samples as usize;
     if num_samples == 0 {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(DecodedBlock {
+            left: Vec::new(),
+            right: Vec::new(),
+        });
     }
 
-    // Entropy decode the residuals
-    let mut left = Vec::with_capacity(num_samples);
-    let mut right = Vec::with_capacity(num_samples);
+    let total = if is_mono {
+        num_samples
+    } else {
+        num_samples * 2
+    };
+    let mut buffer = vec![0i32; total];
 
     let mut bs = BitstreamReader::new(bitstream_data);
+    if !bitstream_data.is_empty() {
+        let produced = get_words_lossless(&mut words, &mut bs, &mut buffer, is_mono);
+        let frames = if is_mono { produced } else { produced / 2 };
+        if frames != num_samples {
+            return Err(format!(
+                "bitstream ended early: {frames}/{num_samples} samples"
+            ));
+        }
+    }
 
-    // Check if all medians are zero on both channels - this indicates a "zeroes" block
-    let all_zeros = medians_a.median.iter().all(|&m| m == 0)
-        && (is_mono || medians_b.median.iter().all(|&m| m == 0));
+    // Passes de décorrélation, dans l'ordre de stockage.
+    for dpp in decorr_passes.iter_mut() {
+        if is_mono {
+            decorr_mono_pass(dpp, &mut buffer);
+        } else {
+            decorr_stereo_pass(dpp, &mut buffer);
+        }
+    }
 
-    if all_zeros && bitstream_data.is_empty() {
-        // Silent block
-        left.resize(num_samples, 0);
-        right.resize(num_samples, 0);
-    } else if all_zeros {
-        // Zeroes mode with possible embedded non-zero runs
-        // In WavPack, when medians are all zero, a special zero-run encoding is used.
-        // Read pairs of (zero_count, value) where zero_count uses exp-Golomb.
-        let mut i = 0;
-        while i < num_samples {
-            // Read a bit to see if this is a zero or non-zero
-            let bit = bs.read_bit().unwrap_or(0);
-            if bit == 0 {
-                // Zero sample
-                left.push(0);
-                if !is_mono {
-                    right.push(0);
-                }
-                i += 1;
-            } else {
-                // Non-zero: re-initialize medians and decode remaining normally
-                medians_a.median = [0; 3];
-                medians_b.median = [0; 3];
-                // Read the remaining samples with normal entropy coding
-                while i < num_samples {
-                    let res_a = read_residual(&mut bs, &mut medians_a).unwrap_or(0);
-                    left.push(res_a);
-                    if !is_mono {
-                        let res_b = read_residual(&mut bs, &mut medians_b).unwrap_or(0);
-                        right.push(res_b);
-                    }
-                    i += 1;
-                }
-            }
+    // Joint stereo puis CRC — dans cet ordre, le CRC porte sur les valeurs
+    // remixées. `bptr[0] += (bptr[1] -= (bptr[0] >> 1))`.
+    let mut crc: u32 = 0xffff_ffff;
+    if is_mono {
+        for s in buffer.iter() {
+            crc = crc.wrapping_mul(3).wrapping_add(*s as u32);
         }
     } else {
-        // Normal entropy decoding
-        for _ in 0..num_samples {
-            let res_a = read_residual(&mut bs, &mut medians_a).unwrap_or(0);
-            left.push(res_a);
-
-            if !is_mono {
-                let res_b = read_residual(&mut bs, &mut medians_b).unwrap_or(0);
-                right.push(res_b);
-            }
-        }
-    }
-
-    // Fill right channel for mono
-    if is_mono {
-        right.resize(num_samples, 0);
-    }
-
-    // Apply decorrelation passes (in order — passes are already reversed during parsing)
-    apply_decorrelation(&mut decorr_passes, &mut left, &mut right, is_mono);
-
-    // Joint stereo decode
-    if header.is_joint_stereo() && !is_mono {
+        let joint = header.is_joint_stereo();
         for i in 0..num_samples {
-            // In WavPack joint stereo: left = mid, right = side
-            // Reconstruct: left -= right / 2; right += left
-            // Which gives: left = mid - side/2, right = left + side = mid + side/2
-            // But WavPack actually uses: right -= left; then left += right/2
-            // Wait -- WavPack joint stereo stores (left-right, right) -> (side, right)
-            // No, looking at the source more carefully:
-            // In WavPack, joint stereo: stored = (left - right, right)
-            // Decode: left = stored_left + (stored_right >> 1), right = left - stored_left
-            // Actually the standard WavPack joint stereo:
-            // On encode: side = left - right; mid = right + (side >> 1)
-            // stored: (side, mid) in the left/right arrays
-            // On decode: right = mid - (side >> 1); left = right + side
-            // But conventions vary. The most common WavPack approach:
-            left[i] += right[i] >> 1;
-            right[i] = left[i] - right[i];
-            // This gives: if stored left=side, right=mid:
-            // new_left = side + mid/2 ... no that's wrong too.
-            // Let me use the correct WavPack convention:
-            // WavPack stores: left = (L+R)/2 (mid), right = L-R (side) NO
-            // Actually WavPack joint stereo is simple:
-            // During encoding: right = left - right (side = L - R), left unchanged
-            // During decoding: right = left - right (R = L - side)
-            // BUT that's cross_decorrelation, not joint stereo.
-            // Joint stereo in WavPack:
-            // right -= (left >> 1); left += right;
-            // Let me just use what the reference decoder does.
+            if joint {
+                let l = buffer[i * 2];
+                let r = buffer[i * 2 + 1].wrapping_sub(l >> 1);
+                buffer[i * 2 + 1] = r;
+                buffer[i * 2] = l.wrapping_add(r);
+            }
+            let l = buffer[i * 2] as u32;
+            let r = buffer[i * 2 + 1] as u32;
+            crc = crc
+                .wrapping_add(crc << 3)
+                .wrapping_add(l << 1)
+                .wrapping_add(l)
+                .wrapping_add(r);
         }
-        // Correction: let me redo this properly based on WavPack source.
-        // The actual joint stereo decode is:
-        // for each sample:
-        //   left += (right >> 1)   -- but with proper rounding
-        //   right = left - right
-        // This is already done above in the loop, but let me verify the loop
-        // wasn't overwritten. Actually we did it inline. The issue is we need
-        // to undo the in-loop correction. Let me rewrite:
-        // Actually wait, the loop above already computed the correct values.
-        // left[i] += right[i] >> 1 means: new_left = old_left + old_right/2
-        // right[i] = left[i] - right[i] means: new_right = new_left - old_right
-        //          = old_left + old_right/2 - old_right = old_left - old_right/2
-        // So if stored as (mid-ish, side):
-        //   L = mid + side/2, R = mid - side/2
-        // That is the standard mid/side. This is correct.
     }
 
-    // Handle false stereo (mono encoded as stereo)
-    if header.is_false_stereo() && !is_mono {
-        right.copy_from_slice(&left);
+    if crc != header.crc {
+        return Err(format!(
+            "block CRC mismatch at index {}: computed {:08x}, expected {:08x}",
+            header.block_index, crc, header.crc
+        ));
     }
 
-    // Apply left shift
-    let shift = header.left_shift();
+    if bs.overrun {
+        return Err(format!("bitstream overrun at block {}", header.block_index));
+    }
+
+    // `fixup_samples` : bits supplémentaires, puis décalage final.
+    let mut shift = header.left_shift();
+
+    if let Some((sent_bits, zeros, ones, dups)) = int32_info {
+        let (sent_bits, zeros, ones, dups) = (
+            (sent_bits & 0x1f) as u32,
+            (zeros & 0x1f) as u32,
+            (ones & 0x1f) as u32,
+            (dups & 0x1f) as u32,
+        );
+
+        if let Some(wvx) = wvx_data {
+            // Les bits de poids faible voyagent dans un second flux (`WVX`).
+            let mask = if sent_bits >= 32 {
+                u32::MAX
+            } else {
+                (1u32 << sent_bits) - 1
+            };
+            let mut xbs = BitstreamReader::new(wvx);
+            for s in buffer.iter_mut() {
+                let data = xbs.getbits(sent_bits);
+                *s = (((*s as u32) << sent_bits) | (data & mask)) as i32;
+                apply_extended_int(s, zeros, ones, dups);
+            }
+            if xbs.overrun {
+                return Err(format!(
+                    "wvx bitstream overrun at block {}",
+                    header.block_index
+                ));
+            }
+        } else if sent_bits == 0 && (zeros + ones + dups) != 0 {
+            for s in buffer.iter_mut() {
+                apply_extended_int(s, zeros, ones, dups);
+            }
+        } else {
+            // Rien à reconstituer échantillon par échantillon : tout se
+            // ramène au décalage final.
+            shift += zeros + sent_bits + ones + dups;
+        }
+    }
+
+    shift &= 0x1f;
     if shift > 0 {
-        for s in left.iter_mut() {
-            *s <<= shift;
-        }
-        for s in right.iter_mut() {
-            *s <<= shift;
+        for s in buffer.iter_mut() {
+            *s = ((*s as u32) << shift) as i32;
         }
     }
 
-    // Apply int32 info if present
-    if let Some((_sent_bits, _zeros, _ones, _dups)) = int32_info {
-        // int32 info extends the sample to 32 bits.
-        // sent_bits: extra bits appended to each sample
-        // zeros: extra zero LSBs
-        // ones: extra one LSBs
-        // dups: duplicate sign bit LSBs
-        // For now, handle the simple zero-padding case
-        if _zeros > 0 {
-            for s in left.iter_mut() {
-                *s <<= _zeros;
-            }
-            for s in right.iter_mut() {
-                *s <<= _zeros;
-            }
+    // Désentrelacement.
+    let (left, right) = if is_mono {
+        // `FALSE_STEREO` : bloc mono à restituer en stéréo identique.
+        let right = if header.is_false_stereo() {
+            buffer.clone()
+        } else {
+            Vec::new()
+        };
+        (buffer, right)
+    } else {
+        let mut left = Vec::with_capacity(num_samples);
+        let mut right = Vec::with_capacity(num_samples);
+        for i in 0..num_samples {
+            left.push(buffer[i * 2]);
+            right.push(buffer[i * 2 + 1]);
         }
-    }
+        (left, right)
+    };
 
-    Ok((left, right))
+    Ok(DecodedBlock { left, right })
+}
+
+/// Bits de poids faible reconstitués (`zeros` / `ones` / `dups`).
+#[inline]
+fn apply_extended_int(s: &mut i32, zeros: u32, ones: u32, dups: u32) {
+    if zeros != 0 {
+        *s = ((*s as u32) << zeros) as i32;
+    } else if ones != 0 {
+        *s = ((((*s).wrapping_add(1) as u32) << ones) as i32).wrapping_sub(1);
+    } else if dups != 0 {
+        let bit = *s & 1;
+        *s = (((((*s).wrapping_add(bit)) as u32) << dups) as i32).wrapping_sub(bit);
+    }
 }
 
 // ── Public API ─────────────────────────────────────────────────────────
@@ -1143,7 +1338,11 @@ pub fn parse_wavpack(path: &str) -> Result<WavPackInfo, String> {
     })
 }
 
-/// Decode a WavPack file to interleaved i16 PCM.
+/// Decode a WavPack file to interleaved i32 PCM.
+///
+/// 🔴 Un bloc dont le CRC ne colle pas fait ÉCHOUER le décodage. Rendre du
+/// PCM faux plutôt qu'une erreur, c'est ce qui a envoyé du bruit blanc à
+/// pleine échelle dans les DAC des testeurs pendant trois mois (#3849).
 pub fn decode_wavpack_to_pcm(
     path: &str,
     _target_sample_rate: Option<u32>,
@@ -1176,11 +1375,13 @@ pub fn decode_wavpack_to_pcm(
         let r = first_header.sample_rate();
         if r == 0 { 44100 } else { r }
     };
+
     let source_channels = if first_header.is_mono() && !first_header.is_false_stereo() {
         1u32
     } else {
         2u32
     };
+
     let bits = first_header.bits_per_sample();
 
     // Seek back to start to process all blocks
@@ -1238,12 +1439,16 @@ pub fn decode_wavpack_to_pcm(
         }
 
         // Decode this block
-        let (left, right) = match decode_block(&header, &block_data) {
-            Ok(lr) => lr,
+        let decoded = match decode_block(&header, &block_data) {
+            Ok(d) => d,
             Err(e) => {
-                warn!(error = %e, block_index = header.block_index, "wavpack_block_decode_error");
-                // Skip corrupt block
-                continue;
+                warn!(
+                    error = %e,
+                    block_index = header.block_index,
+                    file = path,
+                    "wavpack_block_decode_error"
+                );
+                return Err(format!("wavpack decode failed: {e}"));
             }
         };
 
@@ -1257,15 +1462,17 @@ pub fn decode_wavpack_to_pcm(
             0
         };
 
-        for i in start_in_block..left.len() {
+        for i in start_in_block..decoded.left.len() {
             if all_samples.len() >= max_samples {
                 break;
             }
-
-            all_samples.push(left[i]);
-
+            all_samples.push(decoded.left[i]);
             if out_channels == 2 {
-                let r = if i < right.len() { right[i] } else { left[i] };
+                let r = if i < decoded.right.len() {
+                    decoded.right[i]
+                } else {
+                    decoded.left[i]
+                };
                 all_samples.push(r);
             }
         }
@@ -1298,7 +1505,6 @@ pub fn decode_wavpack_to_pcm(
         duration_s,
     })
 }
-
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1498,15 +1704,34 @@ mod tests {
     }
 
     #[test]
-    fn exp2s_roundtrip() {
-        // Test known values
+    fn exp2s_signed_log() {
+        // `wp_exp2s` prend un logarithme SIGNE : exp2s(-x) == -exp2s(x).
         assert_eq!(exp2s(0), 0);
-        // A positive value: exp=9, mantissa=0 -> (0x100) << 0 = 256
-        let val = (9u16 << 8) | 0;
-        assert_eq!(exp2s(val), 256);
-        // Negative: same magnitude
-        let neg_val = val | 0x8000;
-        assert_eq!(exp2s(neg_val), -256);
+        assert_eq!(exp2s(0x900), 256); // table[0]|0x100 = 256, exposant 9
+        assert_eq!(exp2s(-0x900), -256);
+        assert_eq!(exp2s(0xA00), 512); // exposant 10 : 256 << 1
+        assert_eq!(exp2s(-0xA00), -512);
+        // La mantisse passe par exp2_table, pas par l'octet brut :
+        // 2^(0x80/256) = 1.414..., 256 * 1.414 = 362 -> table[0x80] = 0x6a.
+        assert_eq!(exp2s(0x980), 0x16a);
+    }
+
+    /// Garde de non-regression sur #3849 : un log negatif de forte magnitude
+    /// se decode en valeur negative bornee, PAS en decalage de plus de 100
+    /// rangs. L'ancienne version prenait le bit 15 pour un signe et les bits
+    /// 8-14 pour un exposant : `attempt to shift left with overflow` en
+    /// debogage, echantillon arbitraire en production.
+    #[test]
+    fn exp2s_negative_log_is_not_a_huge_shift() {
+        for raw in [0xFFFFu16, 0xF600, 0x8900, 0x8001] {
+            let log = raw as i16 as i32;
+            let v = exp2s(log);
+            assert!(v <= 0, "log {log} doit rendre une valeur negative ou nulle");
+            assert_eq!(v, -exp2s(-log), "exp2s doit etre impair");
+        }
+        // Borne exacte d'un `int16_t` : ne doit pas paniquer (l'ancienne
+        // version y decalait de 118 rangs).
+        let _ = exp2s(i16::MIN as i32);
     }
 
     #[test]
@@ -1638,5 +1863,195 @@ mod tests {
     fn parse_nonexistent_file() {
         let result = parse_wavpack("/nonexistent/file.wv");
         assert!(result.is_err());
+    }
+
+    // ── Fichiers WavPack REELS (#3849) ─────────────────────────────────
+    //
+    // Depuis la PR #55, ce decodeur n'avait jamais vu un `.wv` produit par
+    // l'encodeur officiel : la case « Test with real .wv files (lossless) »
+    // du plan de test n'a jamais ete cochee, et les 30 tests unitaires
+    // portaient sur des en-tetes fabriques a la main. Resultat mesure le
+    // 11/09/2026 sur un fichier de l'encodeur WavPack 5.6.0 : 264 569
+    // echantillons faux sur 264 600, SNR -109 dB — du bruit a pleine bande,
+    // exactement ce que Marco Polo entendait sur ses 13 albums.
+    //
+    // Les quatre fichiers de `tests/fixtures/wavpack/` viennent de
+    // `wavpack 5.6.0` (Ubuntu noble, paquet officiel). Les empreintes
+    // attendues sont celles de `wvunpack` 5.6.0 — le decodeur de REFERENCE —
+    // et non celles de ce module : un temoin qui se nourrit de sa propre
+    // sortie ne garde rien.
+    //
+    // Fabrication reproductible (Linux, paquet `wavpack`) :
+    //   wavpack -y -q             source_16_44100_stereo.wav -o rip_16_44100_stereo.wv
+    //   wavpack -y -q -hh -x4     source_24_96000_stereo.wav -o hires_24_96000_stereo.wv
+    //   wavpack -y -q             source_16_44100_mono.wav   -o mono_16_44100.wv
+    //   wavpack -y -q             source_24_44100_shift8.wav -o falsestereo_shift8_24_44100.wv
+    //   wvunpack -y -q <f>.wv -o ref.wav      # puis empreinte des i32 en LE
+
+    fn fixture_path(name: &str) -> String {
+        format!(
+            "{}/tests/fixtures/wavpack/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    fn empreinte_i32(samples: &[i32]) -> String {
+        use md5::{Digest, Md5};
+        let mut h = Md5::new();
+        for s in samples {
+            h.update(s.to_le_bytes());
+        }
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// (fichier, canaux, cadence, profondeur, nb d'echantillons, empreinte)
+    const FIXTURES: &[(&str, u32, u32, u16, usize, &str)] = &[
+        // Rip CD : 16 bits / 44,1 kHz stereo, joint stereo — le cas de #3849.
+        (
+            "rip_16_44100_stereo.wv",
+            2,
+            44100,
+            16,
+            17640,
+            "b0bf58385502cddf726dd94e6a542ae0",
+        ),
+        // Haute resolution 24/96 en mode `-hh -x4` : termes de decorrelation
+        // supplementaires, et magnitudes qui basculent `apply_weight` sur la
+        // variante « f » (arrondi different, et le format en depend).
+        (
+            "hires_24_96000_stereo.wv",
+            2,
+            96000,
+            24,
+            11520,
+            "feb8d2d3a0f4763167bc6f3032ea82b0",
+        ),
+        // Mono : `MONO_FLAG`, six variables d'entropie au lieu de douze.
+        (
+            "mono_16_44100.wv",
+            1,
+            44100,
+            16,
+            8820,
+            "4952d667c890843d942caf56e0b653b0",
+        ),
+        // `FALSE_STEREO` (deux canaux identiques, encodes en un seul) et
+        // `INT32_DATA` avec `zeros = 8`. Le drapeau FALSE_STEREO etait lu au
+        // bit 27 au lieu du bit 30 : le bloc passait pour du vrai stereo, et
+        // les six variables d'entropie qu'il porte etaient lues comme douze.
+        (
+            "falsestereo_int32zeros_24_44100.wv",
+            2,
+            44100,
+            24,
+            17640,
+            "33fb92370bdebf5d15275b884e557378",
+        ),
+        // `SHIFT_MASK` = 8. ⚠️ Ce fichier a ete fabrique EXPRES pour ce
+        // drapeau : un WAV `WAVE_FORMAT_EXTENSIBLE` de conteneur 24 bits avec
+        // `wValidBitsPerSample = 16`, d'ou `shift = 24 - 16 = 8` dans
+        // l'en-tete WavPack. La premiere version du jeu d'epreuves croyait le
+        // couvrir et ne le couvrait PAS : l'encodeur avait choisi
+        // `INT32_DATA/zeros` pour ce contenu, le decalage valait 0, et le
+        // sabotage du masque restait VERT. Verifie a la main sur les
+        // drapeaux : 0x14bd1832 >> 13 & 0x1F = 8, que le masque de deux bits
+        // tronquait a 0 — soit 256 fois trop bas.
+        (
+            "shift8_24_44100_stereo.wv",
+            2,
+            44100,
+            24,
+            17640,
+            "fde7ae70718c6bf728921f45133fc60c",
+        ),
+    ];
+
+    #[test]
+    fn decode_bit_a_bit_des_fichiers_wavpack_reels() {
+        for (name, channels, rate, bits, count, md5) in FIXTURES {
+            let path = fixture_path(name);
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "fixture absente : {path}"
+            );
+
+            let info = parse_wavpack(&path).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            assert_eq!(info.channels, *channels, "{name}: canaux (en-tete)");
+            assert_eq!(info.sample_rate, *rate, "{name}: cadence (en-tete)");
+            assert_eq!(info.bits_per_sample, *bits as u32, "{name}: profondeur");
+
+            let audio = decode_wavpack_to_pcm(&path, None, None, 0.0, 0.0)
+                .unwrap_or_else(|e| panic!("{name}: decodage refuse : {e}"));
+
+            assert_eq!(audio.channels, *channels, "{name}: canaux (PCM)");
+            assert_eq!(audio.sample_rate, *rate, "{name}: cadence (PCM)");
+            assert_eq!(audio.bit_depth, *bits, "{name}: profondeur (PCM)");
+            assert_eq!(
+                audio.samples_i32.len(),
+                *count,
+                "{name}: nombre d'echantillons"
+            );
+            assert_eq!(
+                empreinte_i32(&audio.samples_i32),
+                *md5,
+                "{name}: le PCM decode ne correspond pas a celui de wvunpack 5.6.0 — \
+                 le decodeur n'est plus sans perte"
+            );
+        }
+    }
+
+    /// Le format porte un CRC par bloc. Tant qu'il n'etait pas verifie, une
+    /// desynchronisation du flux binaire sortait en PCM plein bande sans une
+    /// ligne de journal — c'est le mecanisme par lequel #3849 a pu durer trois
+    /// mois. Ce temoin exige un refus dans les deux cas possibles.
+    ///
+    /// ⚠️ Le premier cas est le seul qui garde le CRC **sans ambiguite** : on
+    /// n'abime pas le flux, on abime la SOMME stockee dans l'en-tete du bloc.
+    /// Le nombre d'echantillons et la longueur du flux restent exacts, donc
+    /// aucune des autres gardes (fin prematuree, depassement) ne peut se
+    /// declencher — seule la comparaison de CRC peut refuser. Un temoin qui
+    /// abimerait le flux pourrait rester VERT en ayant retire la verification
+    /// de CRC, et garderait alors autre chose que ce qu'il annonce.
+    #[test]
+    fn un_bloc_abime_est_refuse_et_non_rendu_en_bruit() {
+        let src = std::fs::read(fixture_path("rip_16_44100_stereo.wv")).unwrap();
+        let dir = crate::test_scratch::scratch_dir("wavpack-crc");
+
+        let decoder = |octets: &[u8], nom: &str| -> Result<DecodedAudio, String> {
+            let chemin = dir.join(nom);
+            std::fs::write(&chemin, octets).unwrap();
+            decode_wavpack_to_pcm(chemin.to_str().unwrap(), None, None, 0.0, 0.0)
+        };
+
+        // 1. La SOMME du premier bloc est fausse d'un bit. Le flux, lui, est
+        //    intact : seule la verification de CRC peut s'en apercevoir.
+        let mut somme_fausse = src.clone();
+        somme_fausse[28] ^= 0x01; // champ `crc` de l'en-tete de bloc (offset 28..32)
+        let err = decoder(&somme_fausse, "somme.wv").err().unwrap_or_else(|| {
+            panic!(
+                "un bloc dont le CRC ne correspond pas a ete decode SANS erreur : \
+                 la verification de CRC n'est plus faite, et une desynchronisation \
+                 repartira en bruit blanc silencieux (#3849)"
+            )
+        });
+        assert!(
+            err.contains("CRC"),
+            "le refus doit nommer le CRC, obtenu : {err}"
+        );
+
+        // 2. Le flux entropique lui-meme est abime. Peu importe laquelle des
+        //    gardes se declenche : ce qui ne doit PAS arriver, c'est du PCM.
+        let mut flux_abime = src.clone();
+        flux_abime[1024] ^= 0xFF;
+        let err = decoder(&flux_abime, "flux.wv").err().unwrap_or_else(|| {
+            panic!(
+                "un flux WavPack abime a ete decode SANS erreur : c'est du bruit \
+                 servi au DAC, pas de la musique"
+            )
+        });
+        assert!(
+            err.contains("CRC") || err.contains("bitstream"),
+            "le refus doit nommer la cause, obtenu : {err}"
+        );
     }
 }

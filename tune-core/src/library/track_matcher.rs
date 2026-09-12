@@ -133,13 +133,51 @@ pub fn similarity(a: &str, b: &str) -> f64 {
     matches as f64 / len_a.max(len_b) as f64
 }
 
+/// Un ISRC comparable : majuscules, sans séparateur ni espace.
+///
+/// L'ISRC s'écrit de deux façons pour le même enregistrement : la forme
+/// d'affichage `FR-Z12-88-00001`, que portent les balises de fichiers, et la
+/// forme compacte `FRZ128800001`, que rendent les API de streaming. Les
+/// comparer telles quelles fait de deux écritures du même enregistrement deux
+/// enregistrements différents.
+///
+/// ## Ce qui manquait (#2264)
+///
+/// Le dépôt comparait les ISRC de DEUX façons :
+///
+/// | site | comparaison |
+/// |---|---|
+/// | `tune-server/src/routes/versions.rs` | pliée (cette fonction, recopiée) |
+/// | `library/track_matcher.rs::match_by_isrc` | `eq_ignore_ascii_case` **brut** |
+///
+/// Or `match_by_isrc` est le chemin RAPIDE de [`find_best_match`] : quand il
+/// échoue, on retombe sur le rapprochement par titre approché, qui peut
+/// désigner un autre enregistrement. Une piste locale étiquetée
+/// `FR-Z12-88-00001` ne pouvait donc pas se rattacher à sa jumelle Qobuz
+/// `FRZ128800001` — et c'est ce chemin que suivent le transfert de playlist
+/// (`routes/playlist_manager.rs:318`), les radios (`routes/radios.rs:1876`)
+/// et `playlist_transfer.rs:96`.
+///
+/// L'arbitrage du 01/09/2026 sur #2264 retient l'ISRC comme clé d'identité du
+/// groupe de versions. Une clé ne peut pas se comparer de deux façons : c'est
+/// le socle, posé avant le groupe persistant lui-même.
+pub fn normaliser_isrc(brut: &str) -> String {
+    brut.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
 pub fn match_by_isrc(source_isrc: &str, candidates: &[MatchCandidate]) -> Option<MatchCandidate> {
-    if source_isrc.is_empty() {
+    let source = normaliser_isrc(source_isrc);
+    if source.is_empty() {
         return None;
     }
     candidates
         .iter()
-        .find(|c| !c.isrc.is_empty() && c.isrc.eq_ignore_ascii_case(source_isrc))
+        .find(|c| {
+            let candidat = normaliser_isrc(&c.isrc);
+            !candidat.is_empty() && candidat == source
+        })
         .map(|c| {
             let mut result = c.clone();
             result.score = 1.0;
@@ -451,5 +489,82 @@ mod tests {
         let result = find_best_match("Unknown Song", "Nobody", "", 0, &[]);
         assert_eq!(result.status, "not_found");
         assert!(result.best_match.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // #2264 — l'identité d'ENREGISTREMENT se compare d'une seule façon.
+    //
+    // Les gardes passent par `find_best_match`, l'entrée que `streaming::
+    // matching::best_stream_match` appelle : un témoin qui appellerait
+    // `normaliser_isrc` en direct resterait vert alors même que le chemin
+    // rapide ne l'emploie pas.
+    // -----------------------------------------------------------------
+
+    fn candidat(titre: &str, isrc: &str) -> MatchCandidate {
+        MatchCandidate {
+            title: titre.into(),
+            artist_name: "Miles Davis".into(),
+            album_title: String::new(),
+            source_id: "qobuz-1".into(),
+            duration_ms: 0,
+            isrc: isrc.into(),
+            score: 0.0,
+            match_method: String::new(),
+            confidence: String::new(),
+        }
+    }
+
+    /// La forme d'affichage (balises de fichiers) et la forme compacte (API de
+    /// streaming) désignent le MÊME enregistrement.
+    #[test]
+    fn un_isrc_a_tirets_rejoint_sa_forme_compacte() {
+        let m = find_best_match(
+            "So What",
+            "Miles Davis",
+            "FR-Z12-88-00001",
+            0,
+            &[candidat("Autre chose", "FRZ128800001")],
+        );
+        assert_eq!(m.status, "matched", "{m:?}");
+        let trouve = m.best_match.expect("un rattachement par ISRC");
+        assert_eq!(
+            trouve.match_method, "isrc",
+            "c'est le chemin RAPIDE qui doit répondre, pas le titre approché — \
+             ici les titres ne se ressemblent même pas"
+        );
+        assert_eq!(trouve.score, 1.0);
+    }
+
+    /// La contre-épreuve : plier l'écriture ne fait pas se rejoindre deux
+    /// enregistrements DIFFÉRENTS, même quand tout le reste concorde.
+    #[test]
+    fn deux_isrc_differents_ne_se_rejoignent_pas_par_l_isrc() {
+        let m = find_best_match(
+            "So What",
+            "Miles Davis",
+            "FR-Z12-88-00001",
+            0,
+            &[candidat("So What", "US-Z99-99-99999")],
+        );
+        assert_ne!(
+            m.best_match.as_ref().map(|c| c.match_method.as_str()),
+            Some("isrc"),
+            "deux ISRC distincts ne sont pas le même enregistrement : {m:?}"
+        );
+
+        // Et un ISRC réduit au vide par le pliage ne rattache rien : sinon
+        // « --- » rejoindrait « /// », et toute piste sans ISRC utilisable
+        // s'accrocherait à la première venue.
+        let m = find_best_match(
+            "So What",
+            "Miles Davis",
+            "---",
+            0,
+            &[candidat("Autre chose", "///")],
+        );
+        assert!(
+            m.best_match.is_none(),
+            "rien ne doit être rattaché sur une clé vide : {m:?}"
+        );
     }
 }

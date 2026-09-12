@@ -80,6 +80,9 @@ pub struct SourceTrack {
     pub format: Option<String>,
     pub file_size: u64,
     pub has_cover: bool,
+    /// MBID d'enregistrement porté par le fichier (étiquette Picard), puis
+    /// celui du pressage une fois l'appariement accepté.
+    pub musicbrainz_recording_id: Option<String>,
 }
 
 impl SourceTrack {
@@ -348,6 +351,13 @@ pub struct ReleaseTrack {
     pub disc: u32,
     pub position: u32,
     pub title: String,
+    /// MBID de l'enregistrement, quand le pressage le donne.
+    ///
+    /// Reste une chaîne opaque : le placement n'en lit jamais le contenu, ce
+    /// qui laisse la règle du dessus intacte. Il est porté ici parce que
+    /// l'appariement est le seul endroit qui sache quel fichier va avec
+    /// quelle piste — jeté ici, l'identifiant n'est plus rattrapable.
+    pub recording_id: Option<String>,
 }
 
 /// Per-file correction chosen by the user, applied before planning.
@@ -357,6 +367,8 @@ pub struct TrackOverride {
     pub title: Option<String>,
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
+    /// MBID d'enregistrement retenu pour ce fichier.
+    pub musicbrainz_recording_id: Option<String>,
 }
 
 /// What a chosen release would change for one source file.
@@ -374,6 +386,13 @@ pub struct TrackProposal {
     /// Shown to the user, because a positional guess deserves more suspicion
     /// than a track-number hit.
     pub method: Option<String>,
+    /// MBID de l'enregistrement apparié, quand le pressage le donne.
+    ///
+    /// Volontairement absent de [`TrackProposal::changes_anything`] : ce
+    /// n'est pas une correction que l'utilisateur arbitre, mais l'identité
+    /// de la prise. Le compter ferait passer pour modifiées des pistes que
+    /// rien ne change.
+    pub proposed_recording_id: Option<String>,
 }
 
 impl TrackProposal {
@@ -491,6 +510,7 @@ pub fn match_release_tracks(
                 proposed_disc_number: hit.map(|r| r.disc),
                 matched: hit.is_some(),
                 method: method[si].map(String::from),
+                proposed_recording_id: hit.and_then(|r| r.recording_id.clone()),
             }
         })
         .collect()
@@ -516,6 +536,9 @@ pub fn apply_track_overrides(tracks: &mut [SourceTrack], overrides: &[TrackOverr
         }
         if let Some(d) = over.disc_number {
             track.disc_number = Some(d);
+        }
+        if let Some(rid) = clean(over.musicbrainz_recording_id.as_deref()) {
+            track.musicbrainz_recording_id = Some(rid);
         }
     }
 }
@@ -1655,6 +1678,15 @@ mod tests {
             disc,
             position,
             title: title.into(),
+            recording_id: None,
+        }
+    }
+
+    /// Une piste de pressage qui porte son identifiant d'enregistrement.
+    fn rt_mbid(disc: u32, position: u32, title: &str, rid: &str) -> ReleaseTrack {
+        ReleaseTrack {
+            recording_id: Some(rid.into()),
+            ..rt(disc, position, title)
         }
     }
 
@@ -1800,6 +1832,7 @@ mod tests {
             title: Some("New".into()),
             track_number: Some(7),
             disc_number: None,
+            musicbrainz_recording_id: None,
         }];
 
         apply_track_overrides(&mut tracks, &overrides);
@@ -1838,6 +1871,7 @@ mod tests {
             title: Some("Apocalypse Please".into()),
             track_number: Some(2),
             disc_number: None,
+            musicbrainz_recording_id: None,
         }];
         apply_track_overrides(&mut tracks, &overrides);
 
@@ -2119,6 +2153,118 @@ mod tests {
             dest_root
                 .join("Muse/2003 - Absolution/01 - Intro.flac")
                 .exists()
+        );
+    }
+    // -- L'identifiant d'enregistrement à travers l'appariement --
+
+    /// Le pressage donne un identifiant par piste ; il doit ressortir avec la
+    /// proposition. L'appariement est le seul endroit qui sache quel fichier
+    /// va avec quelle piste, donc le seul qui puisse rattacher l'identifiant
+    /// au bon fichier.
+    #[test]
+    fn l_appariement_rend_l_identifiant_d_enregistrement() {
+        let sources = vec![track("Intro", 1), track("Apocalypse Please", 2)];
+        let release = vec![
+            rt_mbid(1, 1, "Intro", "rec-intro"),
+            rt_mbid(1, 2, "Apocalypse Please", "rec-apo"),
+        ];
+        let out = match_release_tracks(&sources, &release);
+        assert_eq!(out[0].method.as_deref(), Some("disc_and_number"));
+        assert_eq!(
+            out[0].proposed_recording_id.as_deref(),
+            Some("rec-intro"),
+            "l'identifiant du pressage n'est pas rendu avec la proposition"
+        );
+        assert_eq!(out[1].proposed_recording_id.as_deref(), Some("rec-apo"));
+    }
+
+    /// L'identifiant suit la DÉCISION d'appariement, pas le rang dans la
+    /// liste : apparié par le titre, c'est l'identifiant de la piste retenue
+    /// qui remonte, pas celui du même indice.
+    #[test]
+    fn l_identifiant_suit_l_appariement_et_pas_le_rang() {
+        let mut a = track("Time Is Running Out", 9);
+        a.source_path = "/dl/a.flac".into();
+        let release = vec![
+            rt_mbid(1, 1, "Intro", "rec-intro"),
+            rt_mbid(1, 2, "Time Is Running Out!", "rec-time"),
+        ];
+        let out = match_release_tracks(&[a], &release);
+        assert_eq!(out[0].method.as_deref(), Some("title"));
+        assert_eq!(
+            out[0].proposed_recording_id.as_deref(),
+            Some("rec-time"),
+            "l'identifiant ne suit pas la piste reellement appariee"
+        );
+    }
+
+    /// Un pressage muet ne fait pas naître un identifiant.
+    #[test]
+    fn sans_identifiant_au_pressage_rien_n_est_invente() {
+        let sources = vec![track("Intro", 1)];
+        let out = match_release_tracks(&sources, &[rt(1, 1, "Intro")]);
+        assert!(out[0].matched);
+        assert_eq!(out[0].proposed_recording_id, None);
+    }
+
+    /// Un fichier qu'aucune piste ne réclame reste sans identifiant.
+    #[test]
+    fn un_fichier_non_apparie_reste_sans_identifiant() {
+        let sources = vec![track("Intro", 1), track("Inconnu", 2)];
+        let out = match_release_tracks(&sources, &[rt_mbid(1, 1, "Intro", "rec-intro")]);
+        assert_eq!(out[0].proposed_recording_id.as_deref(), Some("rec-intro"));
+        assert!(!out[1].matched);
+        assert_eq!(out[1].proposed_recording_id, None);
+    }
+
+    /// TÉMOIN — l'identifiant n'est pas une correction que l'utilisateur
+    /// arbitre : il ne doit pas faire passer une proposition pour modifiée,
+    /// sans quoi l'écran d'ingestion présenterait comme changées des pistes
+    /// que rien ne change.
+    #[test]
+    fn l_identifiant_ne_rend_pas_une_proposition_modifiee() {
+        let sources = vec![track("Intro", 1)];
+        let out = match_release_tracks(&sources, &[rt_mbid(1, 1, "Intro", "rec-intro")]);
+        assert_eq!(out[0].proposed_recording_id.as_deref(), Some("rec-intro"));
+        assert!(
+            !out[0].changes_anything(),
+            "meme titre et meme rang : l'identifiant ne doit rien changer a l'arbitrage"
+        );
+    }
+
+    /// Ce que l'utilisateur a accepté doit atterrir sur le fichier source :
+    /// c'est de là que l'écriture d'étiquette le reprend.
+    #[test]
+    fn les_corrections_acceptees_portent_l_identifiant() {
+        let mut tracks = vec![track("Intro", 1)];
+        let overrides = vec![TrackOverride {
+            source_path: tracks[0].source_path.clone(),
+            musicbrainz_recording_id: Some("rec-intro".into()),
+            ..Default::default()
+        }];
+        apply_track_overrides(&mut tracks, &overrides);
+        assert_eq!(
+            tracks[0].musicbrainz_recording_id.as_deref(),
+            Some("rec-intro"),
+            "l'identifiant accepte n'atteint pas le fichier source"
+        );
+        assert_eq!(tracks[0].title.as_deref(), Some("Intro"));
+    }
+
+    /// Un identifiant vide n'écrase pas celui que le fichier portait déjà.
+    #[test]
+    fn un_identifiant_vide_n_ecrase_pas_celui_du_fichier() {
+        let mut tracks = vec![track("Intro", 1)];
+        tracks[0].musicbrainz_recording_id = Some("rec-du-fichier".into());
+        let overrides = vec![TrackOverride {
+            source_path: tracks[0].source_path.clone(),
+            musicbrainz_recording_id: Some("   ".into()),
+            ..Default::default()
+        }];
+        apply_track_overrides(&mut tracks, &overrides);
+        assert_eq!(
+            tracks[0].musicbrainz_recording_id.as_deref(),
+            Some("rec-du-fichier")
         );
     }
 }

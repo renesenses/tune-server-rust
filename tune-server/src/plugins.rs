@@ -129,6 +129,20 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
             },
         )))
         .await;
+
+    // Concerts (#2363) : la tâche d'abonnement 24 h et la route de lecture,
+    // sorties du cœur toujours-compilé. Elle y était démarrée SANS condition
+    // par `background.rs` — elle ne tourne désormais que chez ceux qui ont
+    // installé le plugin. Sa seule dépendance est la base : lire les artistes
+    // de la bibliothèque, et lire `instance_id` / `community_sync_enabled`.
+    #[cfg(feature = "concerts")]
+    loader
+        .register(Box::new(tune_concerts::ConcertsPlugin::new(
+            tune_concerts::HostServices {
+                backend: state.backend.clone(),
+            },
+        )))
+        .await;
 }
 
 /// Builds the plugins an out-of-tree binary wants registered.
@@ -160,6 +174,13 @@ pub async fn init(
         info!(plugin_name = %plugin.name(), "plugin_registered_out_of_tree");
         loader.register(plugin).await;
     }
+    // Publish the registered set BEFORE `setup_all`, which retains only what
+    // loaded — afterwards the loader no longer knows what this binary carries.
+    // Published unconditionally, ahead of the early return: an empty list and
+    // an unpublished one must mean the same thing to a reader, which they do
+    // (`OnceLock::get() -> None` degrades to the empty slice).
+    let _ = state.plugin_names.set(loader.registered_names().await);
+
     if loader.plugin_count().await == 0 {
         return Vec::new();
     }
@@ -202,9 +223,27 @@ async fn install(state: &AppState, registrations: PluginRegistrations) -> Plugin
     // tune-core's `plugin-http` feature (see its Cargo.toml).
     let PluginRegistrations {
         outputs,
+        output_providers,
         routers,
         zones,
     } = registrations;
+
+    // Providers DISCOVER their devices, so they cannot go into the registry
+    // here: there is nothing to register yet. They are handed to the same
+    // background poller that serves out-of-tree providers passed through
+    // `RunOptions::output_providers` — one path, one lifecycle, so an in-tree
+    // plugin and an out-of-tree crate behave identically.
+    //
+    // Spawned BEFORE the fixed outputs below on purpose: `spawn_output_providers`
+    // only starts a task, it registers nothing synchronously, so it cannot race
+    // the registry lock taken just after.
+    if !output_providers.is_empty() {
+        info!(
+            providers = output_providers.len(),
+            "plugin_output_providers_spawned"
+        );
+        crate::discovery_setup::spawn_output_providers(state, output_providers);
+    }
 
     // device_ids this plugin actually got into the registry. A zone is only
     // created for one of these — see the zone loop below.

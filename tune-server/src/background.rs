@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
 
+use tune_core::db::zone_repo::CreationDeZone;
 use tune_core::outputs::OutputRegistry;
+use tune_core::poller::{JournalSondage, TraceEchecSondage};
 
 use crate::config::TuneConfig;
 use crate::state::AppState;
@@ -17,6 +19,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_dash_temp_gc();
     spawn_position_poller(state);
     spawn_token_refresher(state);
+    spawn_tune_tested_refresher(state);
     spawn_upnp_advertiser(state, config).await;
     // Renderers UPnP par zone (#1750) : annonceur propre, relu à chaque
     // cycle — l'opt-in d'une zone prend effet sans redémarrage.
@@ -28,12 +31,18 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
+    spawn_reprise_favoris_streaming(state);
+    // CRD-5 : passe automatique des crédits, bornée par tour et reprenable par
+    // curseur, derrière le même droit premium que les biographies. Une garde
+    // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du
+    // code mort pendant des mois pour une ligne comme celle-ci.
+    crate::routes::library::credits::spawn_passe_automatique_credits(state);
     spawn_community_sync(state);
     spawn_replaygain_analysis(state);
+    spawn_lyrics_catchup(state);
     #[cfg(feature = "audio-embedding")]
     spawn_audio_embedding(state);
     spawn_radio_logo_refresh(state);
-    spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
     // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
@@ -41,6 +50,17 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // un réglage que plus personne ne relisait. Un test de câblage garde la
     // ligne.
     crate::routes::system::scan::spawn_scan_scheduler(state.clone(), config.auto_scan);
+    // Vérificateur périodique de mises à jour (#3217). Même défaut que la ligne
+    // ci-dessus, et même remède : `UpdateChecker::spawn_periodic` n'avait qu'UNE
+    // occurrence dans tout le dépôt — sa définition — et `TUNE_AUTO_UPDATE`
+    // était accepté, réglable, et sans effet. Il NOTIFIE et n'installe rien :
+    // la garde anti-coupure de #2954 se justifie par « toute installation est
+    // un geste délibéré », et une installation automatique la ferait tomber.
+    // Un test de câblage garde la ligne.
+    crate::routes::system::update::spawn_verificateur_de_mise_a_jour(
+        state.clone(),
+        config.auto_update,
+    );
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config.port);
@@ -476,6 +496,17 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                                 format!("{base}{av}"),
                                 format!("{base}{rc}"),
                                 cm_url,
+                            )
+                            .with_upnp_events(
+                                crate::startup::create_oh_listener().await,
+                                crate::discovery_setup::urls_evenements_dlna(
+                                    &d.host,
+                                    d.port,
+                                    &desc.event_sub_urls(),
+                                ),
+                            )
+                            .with_upnp_silence(
+                                crate::config::resolve_upnp_silence(&state.backend, &d.id),
                             );
                             outputs.register(Box::new(dlna));
                             registered += 1;
@@ -525,17 +556,30 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     }
                 }
 
-                // Auto-created zones start dormant and don't count against the
-                // free tier; the cap is enforced at first play in
-                // orchestrator.play(). So discovery may always register a device.
-                match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
-                    Ok((zid, true)) => {
+                // #3529 — ce lot tourne à CHAQUE démarrage et ne consultait pas
+                // « Créer automatiquement les zones ». Le commentaire qui
+                // tenait ici lieu de justification (« auto-created zones start
+                // dormant … discovery may always register a device ») parle du
+                // plafond du palier gratuit, PAS du réglage : une zone naît en
+                // ligne (`online` vaut `DEFAULT 1` au schéma). D'où « elles
+                // apparaissent ET s'activent toutes seules », chez Fabien, sur
+                // une installation où la case est décochée.
+                match zone_repo.get_or_create_si_autorise(
+                    &d.name,
+                    Some("dlna"),
+                    &d.id,
+                    "ssdp_startup",
+                ) {
+                    Ok(CreationDeZone::Creee(zid)) => {
                         let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
                     }
-                    Ok((zid, false)) => {
+                    Ok(CreationDeZone::Existante(zid)) => {
                         let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         let _ = zone_repo.set_online_by_device(&d.id, true);
+                    }
+                    Ok(CreationDeZone::Refusee) => {
+                        info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_auto_create_disabled_skipping");
                     }
                     Err(e) => {
                         tracing::warn!(name = %d.name, device_id = %d.id, error = %e, "ssdp_startup_zone_create_failed");
@@ -557,6 +601,104 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
     });
 }
 
+/// Plein rythme d'un sondeur d'intégration : l'hôte répond, on le rappelle
+/// chaque minute.
+pub const SONDAGE_INTERVALLE_BASE_SECS: u64 = 60;
+/// Plancher de fréquence quand il ne répond plus. Dix minutes : un hôte éteint
+/// ne coûte plus que six connexions perdues par heure.
+pub const SONDAGE_INTERVALLE_MAX_SECS: u64 = 600;
+
+/// Cadence du prochain tour d'un sondeur d'intégration.
+///
+/// Écrite en clair dans `spawn_squeezebox_poller`, elle en est extraite parce
+/// qu'il fallait la donner **aussi** à `spawn_hqplayer_poller` (#2566) : ce
+/// dernier était le seul sondeur sans aucun recul. Un hôte HQPlayer saisi puis
+/// débranché était rappelé toutes les soixante secondes, sans fin — **1 440
+/// connexions perdues et 1 440 lignes de journal par jour**, pour un appareil
+/// dont on savait depuis la première seconde qu'il ne répondait pas.
+///
+/// Le retour au plein rythme est immédiat, et il ne dépend pas d'un succès :
+/// une intégration coupée ou un hôte vidé y ramènent aussi, pour qu'un hôte
+/// fraîchement saisi soit pris tout de suite.
+///
+/// Fonction pure, et testée comme telle (`journal_sondage_hqplayer.rs`) : une
+/// cadence éprouvée par de vraies attentes est un test qui dure dix minutes et
+/// qui clignote.
+pub fn prochain_intervalle_sondage(actuel_secs: u64, echec: bool) -> u64 {
+    if echec {
+        actuel_secs
+            .saturating_mul(2)
+            .min(SONDAGE_INTERVALLE_MAX_SECS)
+    } else {
+        SONDAGE_INTERVALLE_BASE_SECS
+    }
+}
+
+/// Point d'émission du journal d'un sondage HQPlayer en échec (#2566).
+///
+/// Fonction à part, et publique, pour une seule raison : le garde
+/// `tests/journal_sondage_hqplayer.rs` compte les lignes que `tracing` reçoit
+/// de **ce point-ci**, pas d'une copie. Elle reste dans `tune_server::background`
+/// pour que la cible du module — celle que l'export de diagnostic comptabilise
+/// (`QUOTA_PAR_MODULE`, #1974) — désigne bien le sondeur d'intégration et non
+/// le poller.
+///
+/// Ce que le journal dit désormais, pour un HQPlayer débranché :
+/// les **cinq premiers** échecs en entier, avec l'erreur, l'hôte et la cadence
+/// suivante — de quoi établir la cause et vérifier que le recul monte —, puis
+/// un récapitulatif portant le TOTAL aux paliers 8, 16, 32… Un échec isolé
+/// reste dit en entier : c'est le n° 1.
+pub fn journaliser_echec_hqplayer(
+    journal: &mut JournalSondage,
+    host: &str,
+    error: &dyn std::fmt::Display,
+    next_retry_secs: u64,
+) {
+    match journal.compter_echec() {
+        TraceEchecSondage::Detaille => tracing::debug!(
+            error = %error,
+            host = %host,
+            next_retry_secs,
+            "hqplayer_poll_failed"
+        ),
+        TraceEchecSondage::Recapitulatif => tracing::debug!(
+            error = %error,
+            host = %host,
+            echecs = journal.echecs(),
+            detaillees = tune_core::poller::ECHECS_SONDAGE_DETAILLES,
+            next_retry_secs,
+            "hqplayer_poll_still_failing"
+        ),
+        TraceEchecSondage::Muet => {}
+    }
+}
+
+/// Point d'émission du journal d'un sondage HQPlayer qui répond (#2566).
+///
+/// `hqplayer_poll_registered` partait à **chaque tour**, au niveau `INFO` : un
+/// HQPlayer qui marche écrivait 1 440 lignes par jour pour dire qu'il marchait
+/// toujours. C'est le même défaut que les 79 lignes du ticket, à l'envers — un
+/// journal qui crie pour rien noie celui qui dirait quelque chose — et il est
+/// ici plus grave, parce qu'`INFO` traverse les filtres par défaut.
+///
+/// Reste dit : la **première** découverte, et chaque **retour** après une panne
+/// qu'on avait cessé de détailler, avec le total d'échecs.
+pub fn journaliser_succes_hqplayer(
+    journal: &mut JournalSondage,
+    host: &str,
+    deja_annonce: &mut bool,
+) {
+    let retour = journal.cloturer();
+    if retour.is_some() || !*deja_annonce {
+        info!(
+            host = %host,
+            echecs = retour.unwrap_or(0),
+            "hqplayer_poll_registered"
+        );
+        *deja_annonce = true;
+    }
+}
+
 fn spawn_squeezebox_poller(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -568,9 +710,9 @@ fn spawn_squeezebox_poller(state: &AppState) {
         // with `lms_cli_command: TCP connect failed` every minute. Backing off
         // stops the spam and the wasted connects; a reachable LMS is polled
         // normally and recovery resets the interval immediately.
-        const BASE_INTERVAL_SECS: u64 = 60;
-        const MAX_INTERVAL_SECS: u64 = 600; // 10 min ceiling for a dead LMS
-        let mut interval_secs = BASE_INTERVAL_SECS;
+        // Cadence partagée avec le sondeur HQPlayer : voir
+        // `prochain_intervalle_sondage` (60 s de base, 600 s de plancher).
+        let mut interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
         loop {
             let settings =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -594,10 +736,10 @@ fn spawn_squeezebox_poller(state: &AppState) {
                             info!(count = players.len(), lms = %host, "squeezebox_poll_discovered");
                         }
                         // Reachable → back to normal cadence.
-                        interval_secs = BASE_INTERVAL_SECS;
+                        interval_secs = prochain_intervalle_sondage(interval_secs, false);
                     }
                     Err(e) => {
-                        interval_secs = (interval_secs * 2).min(MAX_INTERVAL_SECS);
+                        interval_secs = prochain_intervalle_sondage(interval_secs, true);
                         tracing::debug!(
                             error = %e,
                             lms = %host,
@@ -609,7 +751,7 @@ fn spawn_squeezebox_poller(state: &AppState) {
             } else {
                 // Integration off / no host configured — idle at base cadence so
                 // a freshly configured host is picked up promptly.
-                interval_secs = BASE_INTERVAL_SECS;
+                interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
@@ -621,6 +763,13 @@ fn spawn_hqplayer_poller(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        // Même cadence et même comptabilité de journal que le sondeur
+        // Squeezebox ci-dessus (#2566). Ce sondeur-ci était le seul à n'avoir
+        // ni l'une ni l'autre : 1 440 tours et 1 440 lignes par jour, que
+        // l'hôte réponde ou non.
+        let mut interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
+        let mut journal = JournalSondage::default();
+        let mut deja_annonce = false;
         loop {
             let settings =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -639,15 +788,21 @@ fn spawn_hqplayer_poller(state: &AppState) {
             if enabled && !host.is_empty() {
                 match crate::routes::hqplayer::discover_and_register(&state).await {
                     Ok(_) => {
-                        info!(host = %host, "hqplayer_poll_registered");
+                        journaliser_succes_hqplayer(&mut journal, &host, &mut deja_annonce);
+                        interval_secs = prochain_intervalle_sondage(interval_secs, false);
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, host = %host, "hqplayer_poll_failed");
+                        interval_secs = prochain_intervalle_sondage(interval_secs, true);
+                        journaliser_echec_hqplayer(&mut journal, &host, &e, interval_secs);
                     }
                 }
+            } else {
+                // Intégration coupée ou hôte non saisi : plein rythme, pour
+                // qu'un hôte fraîchement configuré soit pris tout de suite.
+                interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
         }
     });
 }
@@ -715,6 +870,40 @@ fn spawn_position_poller(state: &AppState) {
         state.poller_metrics.clone(),
     );
     poller.spawn();
+}
+
+/// #3589, volet A — le catalogue « Tune tested », au démarrage puis toutes les
+/// six heures.
+///
+/// Six heures, et non l'heure du `Cache-Control: public, max-age=3600` mesuré
+/// sur la réponse du site : une validation d'appareil n'est pas une urgence, et
+/// `version` étant un entier qui ne recule jamais, un tour qui ne trouve rien
+/// de neuf ne coûte qu'une comparaison.
+///
+/// 🔴 Ne rend jamais d'erreur : hors ligne, `rafraichir` rend `Repli` et
+/// l'instance garde ce qu'elle a — le dernier catalogue rangé, ou le catalogue
+/// embarqué si elle n'en a jamais obtenu.
+fn spawn_tune_tested_refresher(state: &AppState) {
+    let db = state.backend.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        loop {
+            // `interval` déclenche IMMÉDIATEMENT son premier tour : c'est le
+            // « au démarrage » de l'issue, sans second appel à écrire.
+            ticker.tick().await;
+            match tune_core::cloud::tune_tested::rafraichir(&db).await {
+                tune_core::cloud::tune_tested::Issue::Range { avant, apres } => {
+                    tracing::info!(avant, apres, "tune_tested_catalogue_mis_a_jour");
+                }
+                tune_core::cloud::tune_tested::Issue::Inchange(v) => {
+                    tracing::debug!(version = v, "tune_tested_catalogue_inchange");
+                }
+                tune_core::cloud::tune_tested::Issue::Repli(raison) => {
+                    tracing::debug!(%raison, "tune_tested_catalogue_repli");
+                }
+            }
+        }
+    });
 }
 
 fn spawn_token_refresher(state: &AppState) {
@@ -829,10 +1018,22 @@ fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {
 }
 
 fn spawn_telemetry_reporter(state: &AppState) {
-    tune_core::cloud::telemetry::spawn_startup_ping(state.services.clone());
+    // #3383 : le ping de demarrage recoit la base, parce qu'il doit lire le
+    // consentement avant d'envoyer version, OS, arch et liste des services.
+    // #3380 : les deux envois recoivent le repertoire web REELLEMENT servi
+    // (`resolve_web_dir`, le meme que le routeur), pour y relire la version de
+    // l'interface a chaque battement. Sans ce chemin, mozaiklabs ne connait que
+    // la version du binaire — et `web/` est deploye separement.
+    let web_dir = crate::config::resolve_web_dir();
+    tune_core::cloud::telemetry::spawn_startup_ping(
+        state.backend.clone(),
+        state.services.clone(),
+        web_dir.clone(),
+    );
     tune_core::cloud::telemetry::TelemetryReporter::spawn(
         state.backend.clone(),
         state.services.clone(),
+        web_dir,
     );
 }
 
@@ -857,13 +1058,35 @@ fn spawn_telemetry_reporter(state: &AppState) {
 /// memoire. Elles sont locales et n'appellent personne.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Reprise rapprochée après un battement — ou une revalidation de clé — en
+/// échec : 1 min, puis 5, puis 15, puis la cadence horaire. Sans elle, un
+/// hôte injoignable au démarrage (réseau pas encore monté, coupure) laissait
+/// la licence non confirmée pendant une heure pleine (LIC-3). Un 429 n'est
+/// pas un échec de ce type : son `Retry-After` est respecté tel quel.
+const REPRISES_BATTEMENT_SECS: [u64; 3] = [60, 300, 900];
+
+fn prochain_intervalle_battement(echecs_consecutifs: u32) -> std::time::Duration {
+    if echecs_consecutifs == 0 {
+        return HEARTBEAT_INTERVAL;
+    }
+    REPRISES_BATTEMENT_SECS
+        .get(echecs_consecutifs as usize - 1)
+        .map(|s| std::time::Duration::from_secs(*s))
+        .unwrap_or(HEARTBEAT_INTERVAL)
+}
+
 /// Ce qu'un tour de battement a le droit de faire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HeartbeatPlan {
+pub struct HeartbeatPlan {
     /// Envoyer la charge utile a `POST /api/v1/heartbeat`.
-    send_heartbeat: bool,
+    pub send_heartbeat: bool,
     /// Rafraichir les droits premium du compte SSO (`GET /api/v1/user`).
-    refresh_account: bool,
+    pub refresh_account: bool,
+    /// La clé de licence se revalide par `POST /api/v1/license/validate`,
+    /// une charge à trois champs sans rien de descriptif — donc même quand
+    /// la télémétrie est refusée. Sans cela, un Premium à CLÉ en opt-out
+    /// retombait en Free au bout de la grâce de 14 jours (LIC-1).
+    pub revalidate_key: bool,
 }
 
 /// Decide ce que fait le tour de battement en fonction de l'opt-out telemetrie.
@@ -883,7 +1106,21 @@ fn heartbeat_plan(telemetry_enabled: bool) -> HeartbeatPlan {
     HeartbeatPlan {
         send_heartbeat: telemetry_enabled,
         refresh_account: true,
+        revalidate_key: true,
     }
+}
+
+/// Le plan d'UN tour, decide a partir des reglages de CETTE instance.
+///
+/// #3383 — c'est le seul site d'appel de `heartbeat_plan` en production, et
+/// c'est ici que se lit le consentement. `is_enabled_for` et non `is_enabled` :
+/// le refus pose dans l'interface (`POST /cloud/telemetry/disable`) compte
+/// autant que celui pose dans l'environnement (`TUNE_TELEMETRY=false`).
+///
+/// Fonction et non expression en ligne, pour qu'un temoin puisse APPELER la
+/// decision reelle plutot que d'en recopier les termes.
+pub fn plan_du_tour(settings: &tune_core::db::settings_repo::SettingsRepo) -> HeartbeatPlan {
+    heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(settings))
 }
 
 /// Lightweight heartbeat — honours `TUNE_TELEMETRY` (#2416).
@@ -956,8 +1193,9 @@ fn spawn_heartbeat(state: &AppState) {
 
         let registre = tune_core::db::task_run_repo::TaskRunRepo::with_backend(backend.clone());
 
+        let mut echecs_consecutifs: u32 = 0;
         loop {
-            let plan = heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled());
+            let plan = plan_du_tour(&settings);
 
             // Registre des executions automatisees (#2080) : un cycle = une
             // ligne. Le battement est la seule passe dont l'echec est INVISIBLE
@@ -995,29 +1233,28 @@ fn spawn_heartbeat(state: &AppState) {
                 if plan.refresh_account {
                     refresh_account_premium(&backend, &license, &services).await;
                 }
-                suivi.rien_a_faire(Some(
-                    "telemetrie desactivee — marqueur local seulement, rien n'est parti",
-                ));
-                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-                continue;
-            }
-
-            if let Some(backoff) = tune_core::cloud::rate_limit::active(
-                &settings,
-                tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
-            ) {
-                debug!(
-                    scope = backoff.scope,
-                    until_epoch = backoff.until_epoch,
-                    retry_after_seconds = backoff.retry_after_seconds,
-                    "heartbeat_deferred_rate_limit"
-                );
-                // Le heartbeat cloud est differe, pas le rafraichissement SSO :
-                // les deux routes ont des compteurs distincts.
-                if plan.refresh_account {
-                    refresh_account_premium(&backend, &license, &services).await;
+                // La clé, elle, se revalide quand même : trois champs, rien de
+                // descriptif (LIC-1). `None` quand aucune clé n'est enregistrée.
+                let revalidation = if plan.revalidate_key {
+                    revalider_la_cle(&client, &settings, &license, &event_bus, &server_id).await
+                } else {
+                    None
+                };
+                match revalidation {
+                    Some((verdict, detail)) => {
+                        echecs_consecutifs =
+                            if verdict == tune_core::db::task_run_repo::Verdict::Echec {
+                                echecs_consecutifs + 1
+                            } else {
+                                0
+                            };
+                        suivi.terminer(verdict, None, Some(&detail));
+                    }
+                    None => suivi.rien_a_faire(Some(
+                        "telemetrie desactivee — marqueur local seulement, rien n'est parti",
+                    )),
                 }
-                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                tokio::time::sleep(prochain_intervalle_battement(echecs_consecutifs)).await;
                 continue;
             }
 
@@ -1203,14 +1440,39 @@ fn spawn_heartbeat(state: &AppState) {
             let mut verdict = tune_core::db::task_run_repo::Verdict::Echec;
             let mut motif = String::from("hote injoignable");
 
-            match client
-                .post("https://mozaiklabs.fr/api/v1/heartbeat")
-                .header("Accept", "application/json")
-                .json(&payload)
-                .send()
-                .await
+            // CLD-2 : un seul chemin d'appel borné. La portée retenue ne part
+            // pas ; la branche « retenu » est celle du pré-contrôle d'avant, au
+            // même endroit dans le tour : rafraîchir le compte SSO si prévu
+            // (les deux routes ont des compteurs distincts), dormir l'intervalle
+            // plein, passer au tour suivant sans clore le suivi ni compter un
+            // échec. La charge utile a été relevée pour rien : une fois par
+            // heure, quelques lectures de base.
+            match tune_core::cloud::rate_limit::appeler(
+                &settings,
+                tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
+                client
+                    .post("https://mozaiklabs.fr/api/v1/heartbeat")
+                    .header("Accept", "application/json")
+                    .json(&payload),
+            )
+            .await
             {
-                Ok(resp) if resp.status().is_success() => {
+                tune_core::cloud::rate_limit::AppelCloud::Retenu(backoff) => {
+                    debug!(
+                        scope = backoff.scope,
+                        until_epoch = backoff.until_epoch,
+                        retry_after_seconds = backoff.retry_after_seconds,
+                        "heartbeat_deferred_rate_limit"
+                    );
+                    if plan.refresh_account {
+                        refresh_account_premium(&backend, &license, &services).await;
+                    }
+                    tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                    continue;
+                }
+                tune_core::cloud::rate_limit::AppelCloud::Reponse(resp)
+                    if resp.status().is_success() =>
+                {
                     verdict = tune_core::db::task_run_repo::Verdict::Succes;
                     motif = format!("accepte ({})", resp.status().as_u16());
                     debug!(instance_id = %instance_id, tracks, uptime_s, "heartbeat_sent");
@@ -1256,31 +1518,36 @@ fn spawn_heartbeat(state: &AppState) {
                                     "active_since": active_since,
                                 }),
                             );
-                        } else if let Some(tier_str) =
-                            body.get("license_tier").and_then(|v| v.as_str())
-                        {
+                        } else if body.get("license_tier").and_then(|v| v.as_str()).is_some() {
                             // No conflict reported → make sure any prior conflict
                             // is cleared before applying the normal verdict.
                             license.clear_session_conflict().await;
 
-                            let valid = body
-                                .get("license_valid")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(true);
-
-                            // A genuine, authoritative revocation is a *past*
-                            // expiry date — not a bare `license_valid:false`,
-                            // which can be transient (fingerprint re-binding,
-                            // server hiccup, key bound to another machine while
-                            // the account is still premium).
-                            let expired_authoritatively = body
-                                .get("license_expires_at")
-                                .and_then(|v| v.as_str())
-                                .map(tune_core::license::is_timestamp_past)
-                                .unwrap_or(false);
+                            // Lecture unique du verdict, partagee avec les
+                            // trois autres appelants (#3673, meme motif que le
+                            // plafond de zones) : `tune_core::license::
+                            // verdict_licence`. Une revocation autoritaire est
+                            // une expiration *passee*, jamais un
+                            // `license_valid:false` nu — celui-la peut etre
+                            // transitoire (re-liaison d'empreinte, hoquet du
+                            // serveur, cle tenue par une autre machine alors
+                            // que le compte est toujours premium).
+                            let verdict = tune_core::license::verdict_licence(&body);
+                            let valid = matches!(
+                                verdict,
+                                tune_core::license::VerdictLicence::Confirmee { .. }
+                            );
+                            let expired_authoritatively =
+                                matches!(verdict, tune_core::license::VerdictLicence::Expiree);
+                            let sans_verdict =
+                                matches!(verdict, tune_core::license::VerdictLicence::Absent);
                             let has_key = ls.license_key.is_some();
 
-                            if !valid && has_key && !expired_authoritatively {
+                            if sans_verdict {
+                                // Le serveur ne s'est pas prononce : ne rien
+                                // persister, ni accorder ni revoquer.
+                                debug!("heartbeat_licence_sans_verdict_palier_conserve");
+                            } else if !valid && has_key && !expired_authoritatively {
                                 // Do NOT immediately strip a key-based Premium on
                                 // a transient rejection: persisting Free here used
                                 // to destroy the premium marker permanently. Keep
@@ -1307,14 +1574,13 @@ fn spawn_heartbeat(state: &AppState) {
                                     }),
                                 );
                             } else {
-                                let tier = match tier_str {
-                                    "premium" => tune_core::license::Tier::Premium,
-                                    _ => tune_core::license::Tier::Free,
+                                let tune_core::license::VerdictLicence::Confirmee {
+                                    tier,
+                                    expires_at,
+                                } = verdict
+                                else {
+                                    unreachable!("les autres verdicts sont traites plus haut")
                                 };
-                                let expires_at = body
-                                    .get("license_expires_at")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from);
 
                                 license.update_from_server(tier, expires_at.clone()).await;
                                 info!(tier = %tier, "license_validated_from_heartbeat");
@@ -1330,22 +1596,20 @@ fn spawn_heartbeat(state: &AppState) {
                         // else: no license fields in response — keep cached state.
                     }
                 }
-                Ok(resp) => {
-                    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        tune_core::cloud::rate_limit::defer_from_headers(
-                            &settings,
-                            tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
-                            resp.headers(),
-                        );
-                    }
+                tune_core::cloud::rate_limit::AppelCloud::Reponse(resp) => {
                     debug!(status = %resp.status(), "heartbeat_rejected");
                     motif = format!("refuse ({})", resp.status().as_u16());
                 }
-                Err(e) => {
+                tune_core::cloud::rate_limit::AppelCloud::Erreur(e) => {
                     debug!(error = %e, "heartbeat_failed");
                 }
             }
 
+            echecs_consecutifs = if verdict == tune_core::db::task_run_repo::Verdict::Echec {
+                echecs_consecutifs + 1
+            } else {
+                0
+            };
             suivi.terminer(verdict, None, Some(&motif));
 
             // Refresh the account premium (SSO) from /api/v1/user so a lapsed
@@ -1355,7 +1619,7 @@ fn spawn_heartbeat(state: &AppState) {
                 refresh_account_premium(&backend, &license, &services).await;
             }
 
-            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+            tokio::time::sleep(prochain_intervalle_battement(echecs_consecutifs)).await;
         }
     });
 }
@@ -1364,6 +1628,120 @@ fn spawn_heartbeat(state: &AppState) {
 /// (SSO). No-op if not connected (no access token). On an expired access token,
 /// tries the refresh_token grant once and retries. On any network failure the
 /// cached state is kept (the offline grace in `LicenseManager` covers it).
+/// La charge d'une revalidation de clé, et rien d'autre : la clé, l'empreinte
+/// matérielle et l'identifiant de serveur que la route attend. Aucune version,
+/// aucun nom d'hôte, aucun compte de pistes — c'est ce qui la distingue du
+/// battement, et ce qui autorise à l'envoyer quand la télémétrie est refusée.
+fn charge_de_revalidation(
+    license_key: &str,
+    hardware_fingerprint: &str,
+    server_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "license_key": license_key,
+        "hardware_fingerprint": hardware_fingerprint,
+        "server_id": server_id,
+    })
+}
+
+/// Revalide la clé de licence sans battement, par
+/// `POST /api/v1/license/validate` (la route que le bouton « Valider » du
+/// panneau appelle déjà). Même lecture de la réponse que le battement : une
+/// clé refusée hors expiration garde son palier dans la grâce, une expiration
+/// autoritaire dégrade, une confirmation restampe `license_last_validated`.
+///
+/// `None` quand aucune clé n'est enregistrée (rien à revalider) ; sinon le
+/// verdict et son motif pour le registre des tâches.
+async fn revalider_la_cle(
+    client: &reqwest::Client,
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    license: &Arc<tune_core::license::LicenseManager>,
+    event_bus: &Arc<tune_core::event_bus::EventBus>,
+    server_id: &str,
+) -> Option<(tune_core::db::task_run_repo::Verdict, String)> {
+    use tune_core::db::task_run_repo::Verdict;
+
+    let ls = license.license_state().await;
+    let key = ls.license_key.clone()?;
+
+    let payload = charge_de_revalidation(&key, &ls.hardware_fingerprint, server_id);
+    // CLD-2 : le même chemin borné que le battement, même portée.
+    let resp = tune_core::cloud::rate_limit::appeler(
+        settings,
+        tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
+        client
+            .post(crate::routes::cloud::license_validate_url(settings))
+            .header("Accept", "application/json")
+            .json(&payload),
+    )
+    .await;
+
+    match resp {
+        tune_core::cloud::rate_limit::AppelCloud::Retenu(backoff) => {
+            debug!(
+                scope = backoff.scope,
+                until_epoch = backoff.until_epoch,
+                "license_revalidation_deferred_rate_limit"
+            );
+            Some((
+                Verdict::Echec,
+                "revalidation differee (429 en cours)".into(),
+            ))
+        }
+        tune_core::cloud::rate_limit::AppelCloud::Reponse(resp) if resp.status().is_success() => {
+            let Ok(body) = resp.json::<serde_json::Value>().await else {
+                return Some((Verdict::Echec, "reponse illisible".into()));
+            };
+            // Meme lecture du verdict que le battement et que les deux routes.
+            let (tier, expires_at) = match tune_core::license::verdict_licence(&body) {
+                tune_core::license::VerdictLicence::Absent => {
+                    warn!("license_revalidation_sans_verdict_palier_conserve");
+                    return Some((Verdict::Echec, "aucun verdict rendu".into()));
+                }
+                tune_core::license::VerdictLicence::RefusTransitoire => {
+                    warn!("license_key_rejected_by_server (keeping cached tier within grace)");
+                    return Some((
+                        Verdict::Echec,
+                        "cle refusee, palier conserve dans la grace".into(),
+                    ));
+                }
+                tune_core::license::VerdictLicence::Expiree => {
+                    info!("license_invalidated_by_server (expiration autoritaire)");
+                    license
+                        .update_from_server(tune_core::license::Tier::Free, None)
+                        .await;
+                    event_bus.emit(
+                        "license.updated",
+                        serde_json::json!({ "tier": "free", "expires_at": null }),
+                    );
+                    return Some((Verdict::Succes, "licence expiree, palier gratuit".into()));
+                }
+                tune_core::license::VerdictLicence::Confirmee { tier, expires_at } => {
+                    (tier, expires_at)
+                }
+            };
+            license.update_from_server(tier, expires_at.clone()).await;
+            info!(tier = %tier, "license_revalidated_without_heartbeat");
+            event_bus.emit(
+                "license.updated",
+                serde_json::json!({ "tier": tier, "expires_at": expires_at }),
+            );
+            Some((Verdict::Succes, format!("cle revalidee, palier {tier}")))
+        }
+        tune_core::cloud::rate_limit::AppelCloud::Reponse(resp) => {
+            debug!(status = %resp.status(), "license_revalidation_rejected");
+            Some((
+                Verdict::Echec,
+                format!("refuse ({})", resp.status().as_u16()),
+            ))
+        }
+        tune_core::cloud::rate_limit::AppelCloud::Erreur(e) => {
+            debug!(error = %e, "license_revalidation_failed");
+            Some((Verdict::Echec, "hote injoignable".into()))
+        }
+    }
+}
+
 async fn refresh_account_premium(
     backend: &Arc<dyn tune_core::db::backend::DbBackend>,
     license: &Arc<tune_core::license::LicenseManager>,
@@ -1473,6 +1851,48 @@ fn gethostname() -> Option<String> {
         })
 }
 
+/// La clé du réglage qui décide si Tune s'ANNONCE comme serveur Squeezebox.
+///
+/// Volontairement distincte de `squeezebox_enabled`, qui gouverne l'autre sens
+/// du protocole — voir [`annonce_slimproto_activee`].
+pub(crate) const CLE_ANNONCE_SLIMPROTO: &str = "slimproto_discovery_enabled";
+
+/// Tune doit-il répondre aux recherches de serveurs Squeezebox du réseau ?
+///
+/// # #3809 — le réglage que le testeur cochait ne gouvernait pas ce chemin
+///
+/// Un testeur (fil `bug-bonjour-4s0m58`, v0.9.145) voit Home Assistant se
+/// remplir de découvertes Squeezebox pointant sur son PC dès que Tune démarre,
+/// et s'arrêter dès qu'il l'arrête. Il écrit : *« Que je coche ou pas la
+/// découverte Squeezebox dans Tune ne change rien. »*
+///
+/// Il a raison, et le code le dit. L'unique interrupteur portant ce nom à
+/// l'écran — `settings.squeezeboxEnabled`, « Activer la découverte
+/// Squeezebox » — écrit `squeezebox_enabled`, dont les SEULS consommateurs sont
+/// `spawn_squeezebox_poller` (ce fichier) et la page d'état
+/// `routes/squeezebox.rs`. Tous deux gouvernent Tune **client** d'un Lyrion
+/// Music Server : ils vont chercher les platines qu'un LMS déclare. Le répondeur
+/// UDP du port 3483, lui — Tune **serveur**, celui que Home Assistant trouve —
+/// n'était gouverné par rien du tout : `spawn_slimproto_server` armait
+/// `discovery::spawn` à chaque démarrage, sans condition.
+///
+/// Les deux directions portent le même mot « découverte » et sont opposées.
+/// C'est ce malentendu que ce réglage sépare.
+///
+/// # Pourquoi vrai par défaut, et pourquoi seulement l'annonce
+///
+/// Le port 3483 a DEUX volets : la connexion de contrôle en TCP, par laquelle
+/// une platine Squeezebox pilote Tune, et le répondeur UDP qui permet à cette
+/// platine de trouver Tune toute seule. #2938 et #2349 ont coûté cher sur ce
+/// point précis — cinq testeurs dont le bind 3483 échouait, plus aucune platine
+/// ne voyant Tune. Ce réglage ne touche donc QUE l'annonce : le TCP reste armé
+/// quoi qu'il arrive, et la valeur par défaut laisse le comportement
+/// exactement tel qu'il est aujourd'hui. Seul un `false` explicite fait taire
+/// l'annonce.
+pub(crate) fn annonce_slimproto_activee(valeur: Option<&str>) -> bool {
+    !matches!(valeur.map(str::trim), Some("false") | Some("0"))
+}
+
 fn spawn_slimproto_server(state: &AppState, port_http: u16) {
     let local_ip = tune_core::discovery::ssdp::get_local_ip()
         .map(|ip| ip.to_string())
@@ -1505,11 +1925,88 @@ fn spawn_slimproto_server(state: &AppState, port_http: u16) {
     // Le volet UDP du port 3483 : sans lui, une Squeezebox ou un squeezelite
     // en decouverte automatique ne trouve jamais Tune — il fallait donner
     // l'adresse a la main. Le TCP seul est une porte sans sonnette.
+    //
+    // #3809 — mais une sonnette qui sonne chez le voisin. Sur un réseau qui
+    // porte déjà un LMS, Home Assistant redécouvre Tune en boucle comme second
+    // serveur Squeezebox. Ce chemin n'avait AUCUN interrupteur : celui que le
+    // testeur cochait gouverne l'autre sens du protocole. Voir
+    // `annonce_slimproto_activee` — l'annonce seule est gouvernée, jamais
+    // l'écoute TCP armée plus haut (#2938, #2349).
+    let annonce = annonce_slimproto_activee(
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .get(CLE_ANNONCE_SLIMPROTO)
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
+    if !annonce {
+        info!(
+            reglage = CLE_ANNONCE_SLIMPROTO,
+            "slimproto_annonce_desactivee — Tune ne repond plus aux recherches              de serveurs Squeezebox ; l'ecoute TCP 3483 reste armee"
+        );
+        return;
+    }
     tune_core::slimproto::discovery::spawn(tune_core::slimproto::discovery::IdentiteServeur {
         nom: "Tune".to_string(),
         port_http,
         port_cli: 9090,
         version: tune_core::version().to_string(),
+    });
+}
+
+/// Le délai avant la reprise des favoris de service : le démarrage a mieux à
+/// faire, et les jetons des services sont restaurés puis rafraîchis dans les
+/// premières secondes. 90 s, comme la veille Bandcamp, pour la même raison.
+const REPRISE_FAVORIS_DELAI_SECS: u64 = 90;
+
+/// Reprend UNE fois, au démarrage, les favoris posés chez Qobuz/Tidal/… dans
+/// la table de Tune (#3419).
+///
+/// # Pourquoi un appelant, et pas seulement une route
+///
+/// Sans passage automatique, la reprise ne serait qu'une route que personne
+/// n'appelle : les clients déjà publiés ne la connaissent pas, et le défaut —
+/// une règle « Favori · est · Piste » qui rend 0 — resterait entier jusqu'à ce
+/// qu'un client soit mis à jour. L'issue le propose explicitement :
+/// « une route de synchronisation explicite, appelable au démarrage ou depuis
+/// les Réglages ».
+///
+/// # Sur quel profil
+///
+/// Sur `active_profile_id` — le modèle mono-actif que `/profiles/switch` et
+/// l'orchestrateur (marquage de l'historique) utilisent déjà —, à défaut le
+/// profil 1. Au démarrage il n'y a aucune requête, donc aucun `X-Profile-Id` :
+/// c'est la seule identité que la machine possède à cet instant. Les autres
+/// profils d'un foyer se reprennent par la route, qui agit sur l'appelant.
+///
+/// # Une passe, pas une veille
+///
+/// Aucune répétition : la reprise n'ajoute jamais qu'au premier passage, et la
+/// question « faut-il resynchroniser périodiquement, et que faire d'un favori
+/// retiré chez le service » demande un arbitrage que ce correctif ne tranche
+/// pas (voir `tune_core::streaming::favorites_import`).
+fn spawn_reprise_favoris_streaming(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(REPRISE_FAVORIS_DELAI_SECS)).await;
+        let profil =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("active_profile_id")
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .filter(|&id| id > 0)
+                .unwrap_or(1);
+        let comptes = crate::routes::profiles::reprendre_les_favoris(&state, profil, None).await;
+        let services = comptes.as_object().map(|o| o.len()).unwrap_or(0);
+        if services > 0 {
+            info!(
+                profile_id = profil,
+                services,
+                comptes = %comptes,
+                "reprise_favoris_streaming_au_demarrage"
+            );
+        }
     });
 }
 
@@ -1595,21 +2092,27 @@ fn spawn_replaygain_analysis(state: &AppState) {
     tune_core::audio::replaygain::spawn(state.backend.clone());
 }
 
+/// #2172 — le rattrapage des paroles.
+///
+/// Le titre de l'issue disait « aucun passage de fond ne récupère les
+/// paroles » : les deux passes de `library::lyrics_pass` existaient depuis la
+/// 0.9.118, mais leur SEUL appelant était `POST /library/lyrics/fetch`, un
+/// bouton. Cette ligne est ce qui manquait — sans elle, le cœur reste du code
+/// que rien n'atteint, exactement comme `spawn_scan_scheduler` avant #2469.
+///
+/// Ne fait rien tant que `lyrics_lrclib_enabled` n'est pas activé, s'efface
+/// devant toute zone qui joue, et ne demande jamais plus de `LOT_DE_FOND`
+/// paroles d'affilée.
+fn spawn_lyrics_catchup(state: &AppState) {
+    tune_core::library::lyrics_pass::spawn(state.backend.clone(), state.http_client.clone());
+}
+
 /// Background CLAP audio-embedding sweep for the acoustic Smart Radio. Opt-in
 /// build (feature-gated) AND opt-in at runtime (`audio_embedding_enabled`); the
 /// loop no-ops cheaply until enabled and a model is present.
 #[cfg(feature = "audio-embedding")]
 fn spawn_audio_embedding(state: &AppState) {
     tune_core::audio::embedding::spawn(state.backend.clone(), state.license.clone());
-}
-
-fn spawn_concert_alerts(state: &AppState) {
-    tune_core::cloud::concert_alerts::spawn(state.backend.clone());
-
-    // Veille Bandcamp : un appel reseau par artiste, donc en arriere-plan et
-    // sur les seuls favoris. Sans le plugin, la fonction n'existe pas.
-    #[cfg(feature = "bandcamp")]
-    crate::bandcamp_sweep::spawn(state.backend.clone());
 }
 
 fn spawn_cloud_library_sync(state: &AppState) {
@@ -1653,6 +2156,11 @@ fn spawn_memory_diagnostics(
     streamer: Arc<tune_core::http::streamer::AudioStreamer>,
 ) {
     tokio::spawn(async move {
+        // Le relevé lui-même n'existe que sur Linux (`/proc/self/statm`) : la
+        // base de comparaison suit la même portée, sinon elle est déclarée et
+        // jamais lue ailleurs. `rss_delta_mb` reste donc mesuré partout où la
+        // trace tourne — c'est-à-dire sur Linux, et nulle part ailleurs.
+        #[cfg(target_os = "linux")]
         let mut rss_initial_mb: Option<u64> = None;
         loop {
             #[cfg(target_os = "linux")]
@@ -1807,6 +2315,80 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         Err(_) => return,
     };
 
+    {
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
+        // créer quoi que ce soit.
+        //
+        // Une zone locale est identifiée par `local:{nom}`. Quand le pilote
+        // renomme l'endpoint — Windows le fait au changement de taux
+        // d'échantillonnage — la boucle ci-dessous ne reconnaît plus
+        // `local:{nouveau nom}` et offre à l'appareil une zone NEUVE, à côté
+        // de l'ancienne restée orpheline avec tous ses réglages. Cette passe
+        // fait suivre la zone à son appareil, par l'identifiant d'endpoint
+        // stable qu'elle a enregistré.
+        //
+        // La RÈGLE est ailleurs — `outputs::identite_de_sortie`, une fonction
+        // pure : liste BLANCHE de backends (WASAPI et CoreAudio seulement, cf.
+        // sa table), quatre refus nommés, aucune fusion de zones. Ici on ne
+        // fait que lui donner le parc et journaliser ce qu'elle a décidé.
+        //
+        // ⚠️ Elle ne fait pas revenir un appareil DÉBRANCHÉ : un périphérique
+        // absent de `devices` reste introuvable, identifiant ou pas.
+        let parc_pour_identite: Vec<tune_core::outputs::identite_de_sortie::SortieEnumeree> =
+            devices
+                .iter()
+                .map(
+                    |dev| tune_core::outputs::identite_de_sortie::SortieEnumeree {
+                        nom: dev.name.clone(),
+                        endpoint_id: dev.endpoint_id.clone(),
+                    },
+                )
+                .collect();
+        match zone_repo.appliquer_identite_de_sortie(&parc_pour_identite) {
+            Ok(rapport) => {
+                for r in &rapport.reassociees {
+                    info!(
+                        zone_id = r.zone_id,
+                        ancien = %r.ancien_device_id,
+                        nouveau = %r.nouveau_device_id,
+                        endpoint_id = %r.endpoint_id,
+                        "zone_locale_reassociee_par_identifiant_stable"
+                    );
+                }
+                // Les refus sont DITS. Une zone qui ne retrouve pas son
+                // appareil alors qu'elle en connaît l'identifiant est
+                // exactement ce qu'un rapport de bogue doit pouvoir nommer.
+                for (zone_id, motif) in &rapport.refus {
+                    warn!(
+                        zone_id,
+                        motif = %motif,
+                        "reassociation_de_zone_locale_refusee"
+                    );
+                }
+                if !rapport.apprises.is_empty() {
+                    info!(
+                        zones = rapport.apprises.len(),
+                        "identifiant_de_sortie_locale_appris"
+                    );
+                }
+                // Les télécommandes sont connectées, elles : une zone qui
+                // change d'appareil doit se rafraîchir à l'écran, sans quoi
+                // elles gardent l'ancien identifiant jusqu'au prochain
+                // rechargement complet.
+                for r in &rapport.reassociees {
+                    state.event_bus.emit_typed(
+                        tune_core::event_types::EventType::ZoneUpdated,
+                        serde_json::json!({
+                            "zone_id": r.zone_id,
+                            "device_id": r.nouveau_device_id,
+                        }),
+                    );
+                }
+            }
+            Err(e) => warn!(error = %e, "identite_de_sortie_locale_non_appliquee"),
+        }
+    }
     // Collect new device IDs first (no lock needed)
     let new_device_ids: std::collections::HashSet<String> = devices
         .iter()
@@ -1836,12 +2418,29 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             }
 
             // New device found — register it
+            // L'hôte qui a énuméré ce nom voyage avec lui (#3230).
+            //
+            // #3245 — et le mode exclusif se décide AVEC lui. Ce chemin-ci est
+            // celui qui rendait le débordement certain : quand ASIO est
+            // configuré, ce rescan FORCE l'énumération WASAPI (voir
+            // `scan_backend` plus haut), donc tous les noms qu'il enregistre
+            // sont des noms WASAPI. `state.effective_exclusive_mode()` valait
+            // pourtant `true`, imposé par ASIO, et `LocalOutput` ouvrait ces
+            // sorties en WASAPI EXCLUSIF — le son des autres applications de la
+            // machine disparaissait sur un périphérique que personne n'avait
+            // demandé en exclusif (jfpaquet, Asus Essence STX II).
+            let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
+                &configured_backend,
+                Some(dev.backend.as_str()),
+                state.requested_exclusive_mode(),
+            );
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
-                state.effective_exclusive_mode(),
+                statut_exclusif.effective,
                 &configured_backend,
-            );
+            )
+            .with_origin_host(&dev.backend);
             outputs.register(Box::new(local_out));
             registered_count += 1;
 
@@ -1933,13 +2532,9 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // Phase 2: Create zones and emit events (no lock held)
     if !new_devices_to_zone.is_empty() {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-        let auto_create =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                .get("zone_auto_create")
-                .ok()
-                .flatten()
-                .map(|v| v != "false")
-                .unwrap_or(true);
+        // #3529 — même lecture du réglage que partout ailleurs, mais elle
+        // n'est plus recopiée : `ZoneRepo` la porte une fois pour toutes.
+        let auto_create = zone_repo.zone_auto_create_autorise();
         let system_default_device_id = crate::startup::first_system_default_name(
             new_devices_to_zone
                 .iter()
@@ -1956,11 +2551,15 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             if is_asio_configured {
                 continue;
             }
-            let zone_name = if *is_default {
-                "This Computer".to_string()
-            } else {
-                dev_name.clone()
-            };
+            // #1770 : même règle qu'au démarrage — l'étiquette générique ne se
+            // minte qu'une fois. Un DAC branché à chaud qui devient la sortie
+            // système ne doit pas produire un second « This Computer » à côté
+            // de celui que porte déjà une autre sortie locale.
+            let generique_deja_pris = zone_repo
+                .etiquette_generique_locale_prise(device_id)
+                .unwrap_or(false);
+            let zone_name =
+                tune_core::config::nom_de_zone_locale(dev_name, *is_default, generique_deja_pris);
 
             // #1770 : le rescan peut créer au plus UNE zone, celle de la sortie
             // système. Les autres sorties restent enregistrées pour que
@@ -2199,6 +2798,134 @@ mod heartbeat_cadence_et_optout_tests {
         );
     }
 
+    /// LIC-1 : l'opt-out coupe le battement DESCRIPTIF, pas la revalidation de
+    /// la clé. Sans elle, `license_last_validated` n'est plus jamais restampé
+    /// et `LicenseManager::load` dégrade un Premium à clé en Free à J+14.
+    #[test]
+    fn la_cle_se_revalide_meme_telemetrie_eteinte() {
+        assert!(
+            heartbeat_plan(false).revalidate_key,
+            "refuser la telemetrie ne doit pas faire perdre une licence a cle"
+        );
+    }
+
+    /// Ce qui autorise cet envoi en opt-out : la charge ne porte que la clé,
+    /// l'empreinte et l'identifiant de serveur — rien de descriptif.
+    #[test]
+    fn la_revalidation_ne_porte_que_trois_champs() {
+        let charge = super::charge_de_revalidation("TUNE-TEST", "empreinte", "srv");
+        let objet = charge.as_object().expect("un objet JSON");
+        let mut clefs: Vec<&str> = objet.keys().map(String::as_str).collect();
+        clefs.sort_unstable();
+        assert_eq!(
+            clefs,
+            ["hardware_fingerprint", "license_key", "server_id"],
+            "la revalidation ne doit rien porter de descriptif (version, hote, pistes…)"
+        );
+    }
+
+    /// La branche opt-out du battement appelle bien la revalidation, entre le
+    /// rafraîchissement du compte et le `continue`. Lu dans le code de
+    /// production seul : ce module cite le nom dans ses commentaires.
+    #[test]
+    fn la_branche_optout_revalide_la_cle() {
+        // (voir aussi `le_battement_emprunte_le_chemin_d_appel_unique` plus bas)
+        let source = include_str!("background.rs");
+        let production = source
+            .split(&format!("#[cfg({})]", "test"))
+            .next()
+            .expect("source vide");
+        let debut = production
+            .find("if !plan.send_heartbeat {")
+            .expect("branche opt-out introuvable");
+        let branche = &production[debut..];
+        let fin = branche
+            .find("continue;")
+            .expect("fin de la branche opt-out");
+        assert!(
+            branche[..fin].contains(&format!("revalider_la_cle{}", "(")),
+            "la branche opt-out du battement doit revalider la cle (LIC-1)"
+        );
+    }
+
+    /// CLD-2 : le battement et la revalidation de clé passent par
+    /// `rate_limit::appeler`, et la partie de production de ce fichier ne
+    /// vérifie plus la portée ni ne mémorise le 429 elle-même. La branche
+    /// « retenu » du battement garde ses trois gestes : rafraîchir le compte
+    /// SSO si prévu, dormir l'intervalle plein, passer au tour suivant.
+    #[test]
+    fn le_battement_emprunte_le_chemin_d_appel_unique() {
+        let source = include_str!("background.rs");
+        let production = source
+            .split(&format!("#[cfg({})]", "test"))
+            .next()
+            .expect("source vide");
+        assert!(!production.contains(&format!("rate_limit::active{}", "(")));
+        assert!(!production.contains(&format!("defer_from_headers{}", "(")));
+        assert_eq!(
+            production
+                .matches(&format!("rate_limit::appeler{}", "("))
+                .count(),
+            2,
+            "le battement et la revalidation, et rien d'autre dans ce fichier"
+        );
+        let retenu = production
+            .find("AppelCloud::Retenu(backoff) => {\n                    debug!(")
+            .expect("branche retenu du battement");
+        let branche = &production[retenu..retenu + 900];
+        for geste in [
+            "refresh_account_premium(",
+            "sleep(HEARTBEAT_INTERVAL)",
+            "continue;",
+        ] {
+            assert!(
+                branche.contains(geste),
+                "{geste} doit rester dans la branche retenue"
+            );
+        }
+    }
+
+    /// LIC-3 : après un échec, le battement revient vite (1, 5, 15 min), puis
+    /// retrouve sa cadence horaire ; sans échec, il ne bat pas plus souvent.
+    #[test]
+    fn la_reprise_apres_echec_est_rapprochee_puis_horaire() {
+        use super::prochain_intervalle_battement as prochain;
+        assert_eq!(prochain(0), HEARTBEAT_INTERVAL);
+        assert_eq!(prochain(1).as_secs(), 60);
+        assert_eq!(prochain(2).as_secs(), 300);
+        assert_eq!(prochain(3).as_secs(), 900);
+        assert_eq!(prochain(4), HEARTBEAT_INTERVAL);
+        assert_eq!(prochain(u32::MAX), HEARTBEAT_INTERVAL);
+    }
+
+    /// Les deux sommeils qui suivent un verdict (opt-out, fin de cycle) passent
+    /// par la reprise ; seul le sommeil du 429 garde l'heure pleine, parce que
+    /// le serveur a lui-même dit quand revenir.
+    #[test]
+    fn les_sommeils_apres_verdict_passent_par_la_reprise() {
+        let source = include_str!("background.rs");
+        let production = source
+            .split(&format!("#[cfg({})]", "test"))
+            .next()
+            .expect("source vide");
+        let corps = production
+            .split("fn spawn_heartbeat")
+            .nth(1)
+            .expect("spawn_heartbeat introuvable");
+        assert_eq!(
+            corps
+                .matches("sleep(prochain_intervalle_battement(")
+                .count(),
+            2,
+            "les sommeils apres verdict doivent passer par prochain_intervalle_battement"
+        );
+        assert_eq!(
+            corps.matches("sleep(HEARTBEAT_INTERVAL)").count(),
+            1,
+            "seul le sommeil du 429 garde HEARTBEAT_INTERVAL"
+        );
+    }
+
     /// Seule la boucle du battement change de cadence. Les autres boucles de ce
     /// fichier partagent le meme 300 s et ne sont pas concernees : elles doivent
     /// rester exactement au nombre ou elles etaient.
@@ -2217,9 +2944,12 @@ mod heartbeat_cadence_et_optout_tests {
         );
     }
 
-    /// Le battement doit lire l'opt-out par le MEME mecanisme que la telemetrie
-    /// (`TelemetryReporter::is_enabled`), pas par une seconde lecture maison de
-    /// la variable d'environnement.
+    /// Le battement doit lire l'opt-out par le MEME mecanisme que le reste des
+    /// envois (`TelemetryReporter::is_enabled_for`), pas par une seconde
+    /// lecture maison de la variable d'environnement.
+    ///
+    /// #3383 : `is_enabled_for` et non `is_enabled` — le second ne connait que
+    /// l'environnement, et laissait la bascule de l'interface sans effet.
     #[test]
     fn l_optout_reutilise_le_mecanisme_de_la_telemetrie() {
         // On ne regarde QUE le code de production : les modules de test citent
@@ -2231,10 +2961,65 @@ mod heartbeat_cadence_et_optout_tests {
             .next()
             .expect("source vide");
         assert!(
-            production.contains(&format!("TelemetryReporter::{}()", "is_enabled")),
-            "l'opt-out du battement doit reutiliser TelemetryReporter::is_enabled, \
+            production.contains(&format!("TelemetryReporter::{}(", "is_enabled_for")),
+            "l'opt-out du battement doit reutiliser TelemetryReporter::is_enabled_for, \
              pas relire TUNE_TELEMETRY pour son compte"
         );
+    }
+
+    /// #3383 — le battement lit le reglage ECRIT par la bascule de
+    /// l'interface, et pas seulement la variable d'environnement.
+    ///
+    /// Ce temoin APPELLE `plan_du_tour`, c'est-a-dire l'unique expression que
+    /// la boucle de production evalue a chaque tour : debrancher la conduite
+    /// le fait rougir, ce qu'une recherche de chaine dans le fichier ne ferait
+    /// pas.
+    #[test]
+    fn le_refus_pose_dans_l_interface_coupe_le_battement() {
+        let db = base_de_test();
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(db);
+
+        // Rien de pose : comportement d'avant, le battement part.
+        assert!(
+            super::plan_du_tour(&reglages).send_heartbeat,
+            "une installation qui n'a rien decoche doit continuer d'emettre"
+        );
+
+        // `POST /cloud/telemetry/disable` ecrit ceci, et rien d'autre.
+        reglages
+            .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "false")
+            .expect("ecriture du reglage");
+        let plan = super::plan_du_tour(&reglages);
+        assert!(
+            !plan.send_heartbeat,
+            "le refus pose dans l'interface doit couper la charge utile descriptive"
+        );
+        // Et la licence, elle, continue de vivre — LIC-1 : un opt-out ne se
+        // paie jamais en fonctionnalites perdues, y compris a J+15.
+        assert!(
+            plan.revalidate_key,
+            "refuser la telemetrie ne doit pas faire perdre une licence a cle"
+        );
+        assert!(
+            plan.refresh_account,
+            "refuser la telemetrie ne doit pas degrader un compte premium"
+        );
+
+        // Et il se rallume.
+        reglages
+            .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "true")
+            .expect("ecriture du reglage");
+        assert!(
+            super::plan_du_tour(&reglages).send_heartbeat,
+            "re-cocher doit reellement rallumer"
+        );
+    }
+
+    fn base_de_test() -> std::sync::Arc<dyn tune_core::db::backend::DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().expect("base en memoire");
+        db.init_schema().expect("schema");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        std::sync::Arc::new(db)
     }
 }
 
@@ -2345,5 +3130,553 @@ mod heartbeat_server_id_tests {
                 );
             }
         }
+    }
+}
+
+/// GARDE DE SITE (#1770) — les deux chemins qui NOMMENT une zone locale
+/// doivent passer par `config::nom_de_zone_locale`, jamais écrire l'étiquette
+/// générique en dur.
+///
+/// C'est la précondition du correctif. La règle « on ne minte pas deux fois
+/// l'étiquette générique » vit dans `tune-core::config` ; un site qui écrit
+/// `"This Computer"` lui-même ne la consulte pas et refabrique le doublon —
+/// deux zones du même nom après une bascule ASIO → WASAPI, mesuré chez
+/// jfpaquet en 0.9.130.
+///
+/// Pourquoi une garde textuelle : les deux fonctions visées sont derrière
+/// `#[cfg(feature = "local-audio")]` et demandent un `AppState` complet plus de
+/// vrais périphériques. La garde lit le code de PRODUCTION seul — le module de
+/// test est retranché avant l'examen, sans quoi sa propre contre-épreuve le
+/// ferait rougir. Sa contre-épreuve est
+/// `la_garde_refuse_une_etiquette_ecrite_en_dur`.
+#[cfg(test)]
+mod etiquette_generique_i1770 {
+    /// Le code de production d'un fichier : tout ce qui précède le premier
+    /// module de test. L'aiguille est construite à l'exécution, sinon ce
+    /// module se retrancherait au mauvais endroit dès qu'on le relit par
+    /// `include_str!`.
+    fn production(source: &str) -> &str {
+        let marqueur_test = format!("#[cfg({})]", "test");
+        source.split(&marqueur_test).next().unwrap_or("")
+    }
+
+    /// Les étiquettes génériques écrites en dur, en littéral Rust, dans le
+    /// code de production. Rendues par numéro de ligne (1-indexé).
+    fn etiquettes_en_dur(source: &str) -> Vec<usize> {
+        let production = production(source);
+        let mut lignes = Vec::new();
+        for etiquette in tune_core::config::ETIQUETTES_LOCALES_GENERIQUES {
+            let aiguille = format!("\"{etiquette}\"");
+            let mut curseur = 0usize;
+            while let Some(pos) = production[curseur..].find(&aiguille) {
+                let debut = curseur + pos;
+                lignes.push(production[..debut].lines().count());
+                curseur = debut + aiguille.len();
+            }
+        }
+        lignes.sort_unstable();
+        lignes
+    }
+
+    fn appels_a_la_regle(source: &str) -> usize {
+        production(source)
+            .matches("config::nom_de_zone_locale(")
+            .count()
+    }
+
+    #[test]
+    fn les_deux_sites_de_nommage_local_passent_par_la_regle() {
+        let fichiers = [
+            (
+                "tune-server/src/background.rs",
+                include_str!("background.rs"),
+            ),
+            ("tune-server/src/startup.rs", include_str!("startup.rs")),
+        ];
+        let mut total = 0usize;
+        for (chemin, source) in fichiers {
+            total += appels_a_la_regle(source);
+            let en_dur = etiquettes_en_dur(source);
+            assert!(
+                en_dur.is_empty(),
+                "{chemin} écrit une étiquette de zone locale générique en dur, \
+                 ligne(s) {en_dur:?}. Ce site ne consulte donc pas \
+                 `config::nom_de_zone_locale` et peut minter un second \
+                 « This Computer » à côté de celui d'un autre moteur audio \
+                 (#1770, jfpaquet, 0.9.130)"
+            );
+        }
+        assert_eq!(
+            total, 2,
+            "les deux seuls sites qui nomment une zone locale issue d'une \
+             énumération sont `register_local_outputs` (startup.rs) et \
+             `rescan_local_audio_devices` (background.rs). Un site de plus ou \
+             de moins : reprendre le recensement de #1770 avant de toucher à \
+             ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur lui-même. Sans elle, `etiquettes_en_dur`
+    /// pourrait ne rien détecter du tout et la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_une_etiquette_ecrite_en_dur() {
+        let fabrique = "fn f() {\n    let zone_name = \"This Computer\".to_string();\n}\n";
+        assert_eq!(
+            etiquettes_en_dur(fabrique),
+            vec![2],
+            "le détecteur doit rougir sur un site qui écrit l'étiquette en dur"
+        );
+        assert_eq!(
+            appels_a_la_regle(fabrique),
+            0,
+            "et ne doit compter aucun appel à la règle là où il n'y en a pas"
+        );
+    }
+
+    /// TÉMOIN — le détecteur ne rougit pas sur un site conforme.
+    #[test]
+    fn temoin_un_site_conforme_passe() {
+        let fabrique = "fn f() {\n    let zone_name = \
+                        tune_core::config::nom_de_zone_locale(&n, d, p);\n}\n";
+        assert!(etiquettes_en_dur(fabrique).is_empty());
+        assert_eq!(appels_a_la_regle(fabrique), 1);
+    }
+}
+
+/// GARDE DE SITE (#1770) — les deux chemins qui enregistrent une sortie locale
+/// à partir d'une énumération doivent ÉTIQUETER l'hôte qui a énuméré le nom.
+///
+/// C'est la précondition du correctif. La rectification du backend vit dans
+/// `LocalOutput::with_origin_host` (tune-core), donc une sortie qui n'étiquette
+/// pas son origine n'est pas rectifiée : elle repart avec `asio` sur un nom
+/// WASAPI, et `AsioExclusiveOutput` la refuse — c'est exactement la panne de
+/// jfpaquet.
+///
+/// Pourquoi une garde textuelle et pas une épreuve de bout en bout : les deux
+/// fonctions visées sont derrière `#[cfg(feature = "local-audio")]` et
+/// demandent un `AppState` complet plus de vrais périphériques. La garde lit le
+/// code de PRODUCTION seul — le module de test est retranché avant l'examen,
+/// sans quoi il se prouverait lui-même. Sa propre contre-épreuve est
+/// `la_garde_refuse_un_site_sans_etiquette` : le détecteur doit rougir sur un
+/// extrait fabriqué qui n'étiquette rien.
+#[cfg(test)]
+mod etiquette_hote_origine_i1770 {
+    /// Les sites d'enregistrement de ce fichier qui n'enchaînent PAS
+    /// `.with_origin_host(...)` sur le constructeur, rendus par numéro de
+    /// ligne (1-indexé) dans le fichier d'origine.
+    fn sites_sans_etiquette(source: &str) -> Vec<usize> {
+        // Aiguille construite à l'exécution : écrite en clair, ce module se
+        // compterait lui-même dès qu'on le relit par `include_str!`.
+        let marqueur_test = format!("#[cfg({})]", "test");
+        let production = source.split(&marqueur_test).next().unwrap_or("");
+
+        const CONSTRUCTEUR: &str = "LocalOutput::with_options_and_endpoint(";
+        const ETIQUETTE: &str = ".with_origin_host(";
+
+        let mut manquants = Vec::new();
+        let mut curseur = 0usize;
+        while let Some(pos) = production[curseur..].find(CONSTRUCTEUR) {
+            let debut = curseur + pos;
+            // La chaîne d'appel tient largement dans 800 octets : le plus long
+            // des deux sites en fait moins de 300. La borne est reculée sur une
+            // frontière de caractère — ces fichiers sont pleins d'accents et de
+            // tirets cadratins, et trancher au milieu d'un « — » panique.
+            let mut fin = (debut + 800).min(production.len());
+            while fin > debut && !production.is_char_boundary(fin) {
+                fin -= 1;
+            }
+            if !production[debut..fin].contains(ETIQUETTE) {
+                manquants.push(production[..debut].lines().count());
+            }
+            curseur = debut + CONSTRUCTEUR.len();
+        }
+        manquants
+    }
+
+    /// Combien de sites ce fichier porte, étiquetés ou non.
+    fn nombre_de_sites(source: &str) -> usize {
+        let marqueur_test = format!("#[cfg({})]", "test");
+        source
+            .split(&marqueur_test)
+            .next()
+            .unwrap_or("")
+            .matches("LocalOutput::with_options_and_endpoint(")
+            .count()
+    }
+
+    #[test]
+    fn les_deux_sites_d_enregistrement_local_etiquettent_l_hote_d_origine() {
+        let fichiers = [
+            (
+                "tune-server/src/background.rs",
+                include_str!("background.rs"),
+            ),
+            ("tune-server/src/startup.rs", include_str!("startup.rs")),
+        ];
+
+        let mut total = 0usize;
+        for (chemin, source) in fichiers {
+            total += nombre_de_sites(source);
+            let manquants = sites_sans_etiquette(source);
+            assert!(
+                manquants.is_empty(),
+                "{chemin} enregistre une sortie locale sans étiqueter l'hôte \
+                 qui a énuméré son nom, ligne(s) {manquants:?}. Sans \
+                 `.with_origin_host(&dev.backend)`, \
+                 `config::openable_local_backend` n'est jamais consultée : la \
+                 sortie repart avec le backend CONFIGURÉ (`asio`) sur un nom \
+                 énuméré par WASAPI, et `AsioExclusiveOutput::new` ne peut que \
+                 la refuser (#1770, jfpaquet, 0.9.130)"
+            );
+        }
+
+        assert_eq!(
+            total, 2,
+            "les deux seuls sites d'enregistrement d'une sortie locale issue \
+             d'une énumération sont `register_local_outputs` (startup.rs) et \
+             `rescan_local_audio_devices` (background.rs). Un site de plus ou \
+             de moins : reprendre le recensement de #1770 avant de toucher à \
+             ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur lui-même. Sans elle, `sites_sans_etiquette`
+    /// pourrait ne rien détecter du tout et la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_un_site_sans_etiquette() {
+        let sain = "let o = LocalOutput::with_options_and_endpoint(\n    n, e, x, b,\n)\n.with_origin_host(&dev.backend);\n";
+        assert!(
+            sites_sans_etiquette(sain).is_empty(),
+            "le détecteur doit accepter un site correctement étiqueté"
+        );
+
+        let malade = "let o = LocalOutput::with_options_and_endpoint(\n    n, e, x, &configured_backend,\n);\noutputs.register(Box::new(o));\n";
+        assert_eq!(
+            sites_sans_etiquette(malade),
+            vec![1],
+            "le détecteur doit nommer la ligne d'un site qui n'étiquette pas \
+             son hôte d'origine"
+        );
+
+        // Et il ne doit pas se laisser sauver par une étiquette posée
+        // très loin, sur un AUTRE appel.
+        let loin = format!(
+            "let o = LocalOutput::with_options_and_endpoint(n, e, x, b);\n{}\n.with_origin_host(&dev.backend);\n",
+            "// remplissage\n".repeat(80)
+        );
+        assert_eq!(
+            sites_sans_etiquette(&loin),
+            vec![1],
+            "une étiquette hors de la chaîne d'appel ne doit pas compter"
+        );
+    }
+}
+
+/// #3245 — le mode exclusif d'une sortie locale doit se décider PAR
+/// PÉRIPHÉRIQUE, sur les DEUX sites qui en enregistrent une.
+///
+/// La règle est `tune_core::config::local_exclusive_mode_du_peripherique` :
+/// elle compose `openable_local_backend` (le backend sous lequel CE nom
+/// s'ouvrira, #1770) avec `exclusive_mode_status` (la contrainte ASIO, #3192).
+/// Un site qui passe à la place la valeur MACHINE —
+/// `effective_exclusive_mode()` — impose l'exclusif d'ASIO à une sortie qui
+/// sera ouverte en WASAPI ; Tune ouvre alors WASAPI en exclusif et la machine
+/// perd le son de toutes ses autres applications (jfpaquet, Asus Essence
+/// STX II).
+///
+/// Garde TEXTUELLE, et pour la même raison que sa jumelle
+/// `etiquette_hote_origine_i1770` : les deux fonctions visées sont derrière
+/// `#[cfg(feature = "local-audio")]` et demandent un `AppState` complet plus
+/// de vrais périphériques. Elle nomme les SITES D'APPEL et lit le code de
+/// PRODUCTION seul — le module de test est retranché avant l'examen, sans quoi
+/// il se prouverait lui-même. Sa contre-épreuve est
+/// `la_garde_refuse_un_site_qui_impose_la_valeur_machine`.
+#[cfg(test)]
+mod exclusif_par_peripherique_i3245 {
+    const CONSTRUCTEUR: &str = "LocalOutput::with_options_and_endpoint(";
+    /// Le nom de la variable que les deux sites remplissent avec la règle.
+    /// C'est bien le SITE D'APPEL qui est nommé : la garde n'accepte pas un
+    /// booléen calculé ailleurs et recopié.
+    const REGLE: &str = "statut_exclusif.effective";
+
+    /// Les ARGUMENTS d'un appel au constructeur, parenthèses comprises.
+    ///
+    /// Une simple fenêtre d'octets — celle de la garde de #1770 — ne
+    /// conviendrait pas ici : le site de `startup.rs` journalise
+    /// `statut_exclusif.effective` juste après l'appel, et une fenêtre large se
+    /// laisserait sauver par cette TRACE pendant que l'ARGUMENT, lui, serait
+    /// redevenu la valeur machine. On lit donc exactement la liste
+    /// d'arguments, en comptant les parenthèses.
+    fn arguments_du_constructeur(source: &str, debut: usize) -> Option<&str> {
+        let ouvre = debut + CONSTRUCTEUR.len() - 1;
+        let mut profondeur = 0i32;
+        for (i, octet) in source[ouvre..].bytes().enumerate() {
+            match octet {
+                b'(' => profondeur += 1,
+                b')' => {
+                    profondeur -= 1;
+                    if profondeur == 0 {
+                        return Some(&source[ouvre..ouvre + i + 1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Le code de production seul : l'aiguille est construite à l'exécution,
+    /// sans quoi ce module se compterait lui-même à travers `include_str!`.
+    fn production(source: &str) -> &str {
+        let marqueur_test = format!("#[cfg({})]", "test");
+        let coupe = source.find(&marqueur_test).unwrap_or(source.len());
+        &source[..coupe]
+    }
+
+    /// Les sites d'enregistrement dont l'ARGUMENT de mode exclusif ne vient PAS
+    /// de la règle par périphérique, par numéro de ligne (1-indexé).
+    fn sites_sans_regle_par_peripherique(source: &str) -> Vec<usize> {
+        let production = production(source);
+        let mut manquants = Vec::new();
+        let mut curseur = 0usize;
+        while let Some(pos) = production[curseur..].find(CONSTRUCTEUR) {
+            let debut = curseur + pos;
+            let conforme = arguments_du_constructeur(production, debut)
+                .is_some_and(|args| args.contains(REGLE));
+            if !conforme {
+                manquants.push(production[..debut].lines().count());
+            }
+            curseur = debut + CONSTRUCTEUR.len();
+        }
+        manquants
+    }
+
+    /// Combien de sites ce fichier porte, conformes ou non.
+    fn nombre_de_sites_i3245(source: &str) -> usize {
+        production(source).matches(CONSTRUCTEUR).count()
+    }
+
+    #[test]
+    fn les_deux_sites_d_enregistrement_local_decident_l_exclusif_par_peripherique() {
+        let fichiers = [
+            (
+                "tune-server/src/background.rs",
+                include_str!("background.rs"),
+            ),
+            ("tune-server/src/startup.rs", include_str!("startup.rs")),
+        ];
+
+        let mut total = 0usize;
+        for (chemin, source) in fichiers {
+            total += nombre_de_sites_i3245(source);
+            let manquants = sites_sans_regle_par_peripherique(source);
+            assert!(
+                manquants.is_empty(),
+                "{chemin} construit une sortie locale sans décider son mode \
+                 exclusif PAR PÉRIPHÉRIQUE, ligne(s) {manquants:?}. Sans \
+                 `local_exclusive_mode_du_peripherique(...)` en ARGUMENT, la \
+                 contrainte « ASIO est exclusif par nature » déborde sur un nom \
+                 énuméré par WASAPI : Tune ouvre WASAPI en EXCLUSIF et la \
+                 machine perd le son de toutes ses autres applications (#3245, \
+                 jfpaquet, Asus Essence STX II)"
+            );
+        }
+
+        assert_eq!(
+            total, 2,
+            "les deux seuls sites d'enregistrement d'une sortie locale issue \
+             d'une énumération sont `register_local_outputs` (startup.rs) et \
+             `rescan_local_audio_devices` (background.rs). Un site de plus ou \
+             de moins : reprendre le recensement avant de toucher à ce compte"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur lui-même. Sans elle,
+    /// `sites_sans_regle_par_peripherique` pourrait ne rien détecter du tout et
+    /// la garde serait verte contre rien.
+    #[test]
+    fn la_garde_refuse_un_site_qui_impose_la_valeur_machine() {
+        let sain = "let x = regle(b, Some(&dev.backend), d);\nlet o = LocalOutput::with_options_and_endpoint(n, e, statut_exclusif.effective, b);\n";
+        assert!(
+            sites_sans_regle_par_peripherique(sain).is_empty(),
+            "le détecteur doit accepter un site dont l'ARGUMENT vient de la règle"
+        );
+        assert_eq!(nombre_de_sites_i3245(sain), 1);
+
+        let malade = "let s = state.clone();\nlet o = LocalOutput::with_options_and_endpoint(n, e, state.effective_exclusive_mode(), b);\n";
+        assert_eq!(
+            sites_sans_regle_par_peripherique(malade),
+            vec![2],
+            "le détecteur doit nommer la ligne d'un site qui impose la valeur \
+             MACHINE à chaque périphérique — c'est le défaut de #3245"
+        );
+
+        // LE CAS QUI COMPTE, et celui qu'une simple fenêtre d'octets raterait :
+        // l'argument est redevenu la valeur machine, mais la TRACE voisine
+        // nomme encore la règle. C'est exactement la forme du site de
+        // `startup.rs`. Un détecteur qui lirait 800 octets autour de l'appel
+        // resterait vert ici, contre un défaut bien vivant.
+        let sauve_par_sa_trace = "let s = state.clone();\nlet o = LocalOutput::with_options_and_endpoint(n, e, state.effective_exclusive_mode(), b);\ninfo!(effectif = statut_exclusif.effective);\n";
+        assert_eq!(
+            sites_sans_regle_par_peripherique(sauve_par_sa_trace),
+            vec![2],
+            "une trace qui NOMME la règle ne doit pas tenir lieu de l'avoir \
+             APPELÉE : c'est l'argument qui atteint le pilote, pas le journal"
+        );
+
+        // Et le retranchement du module de test doit vraiment couper.
+        let avec_tests = format!(
+            "let o = LocalOutput::with_options_and_endpoint(n, e, x, b);\n#[cfg({})]\nmod t {{ LocalOutput::with_options_and_endpoint(n, e, statut_exclusif.effective, b) }}\n",
+            "test"
+        );
+        assert_eq!(
+            nombre_de_sites_i3245(&avec_tests),
+            1,
+            "un site cité dans un module de test ne doit pas être compté"
+        );
+    }
+}
+
+/// #2269 — la passe d'identité doit courir AVANT l'enregistrement, aux DEUX
+/// points qui enregistrent une sortie locale.
+///
+/// « Écrit mais pas branché » est le défaut le plus cher de ce dépôt : une
+/// règle correcte, éprouvée, que personne n'appelle. Ici, l'ordre compte
+/// autant que l'appel — appliquer l'identité APRÈS la boucle
+/// d'enregistrement laisserait la zone neuve déjà créée, et la
+/// ré-association n'aurait plus qu'un doublon à contempler.
+#[cfg(test)]
+mod identite_de_sortie_branchee {
+    /// ⚠️ #2082 — ce fichier est inclus en ENTIER, ce module compris. Un motif
+    /// écrit d'un bloc se trouverait LUI-MÊME et rendrait le garde vrai quoi
+    /// qu'il arrive. Les deux motifs sont donc assemblés à la compilation.
+    const APPEL: &str = concat!("appliquer_identite_de_sortie(&", "parc_pour_identite)");
+    const CONSTRUCTEUR: &str = concat!("LocalOutput::with_options_and_", "endpoint(");
+
+    #[test]
+    fn les_deux_points_denregistrement_appliquent_lidentite_avant_denregistrer() {
+        for (fichier, source) in [
+            ("startup.rs", include_str!("startup.rs")),
+            ("background.rs", include_str!("background.rs")),
+        ] {
+            let appel = source.find(APPEL).unwrap_or_else(|| {
+                panic!(
+                    "{fichier} enregistre une sortie locale sans appliquer \
+                     l'identité de zone : un DAC revenu sous un autre nom y \
+                     recevrait une zone NEUVE à côté de l'ancienne (#2269)."
+                )
+            });
+            let construction = source.find(CONSTRUCTEUR).unwrap_or_else(|| {
+                panic!(
+                    "{fichier} ne construit plus de sortie locale : ce garde \
+                     ne garde plus rien tant qu'il n'a pas suivi."
+                )
+            });
+            assert!(
+                appel < construction,
+                "{fichier} applique l'identité APRÈS avoir enregistré la \
+                 sortie : la zone neuve est déjà créée, et la ré-association \
+                 n'a plus qu'un doublon à contempler (#2269)."
+            );
+        }
+    }
+}
+
+/// #3809 — l'annonce SlimProto, et l'interrupteur qui ne la gouvernait pas.
+#[cfg(test)]
+mod annonce_slimproto_tests {
+    use super::*;
+
+    #[test]
+    fn sans_reglage_l_annonce_reste_armee_comme_avant() {
+        assert!(
+            annonce_slimproto_activee(None),
+            "un parc installé ne doit pas perdre la découverte de ses platines \
+             sur une mise à jour (#2938, #2349)"
+        );
+    }
+
+    #[test]
+    fn seul_un_refus_explicite_fait_taire_l_annonce() {
+        assert!(!annonce_slimproto_activee(Some("false")));
+        assert!(!annonce_slimproto_activee(Some("0")));
+        assert!(!annonce_slimproto_activee(Some("  false  ")));
+    }
+
+    #[test]
+    fn toute_autre_valeur_laisse_l_annonce_armee() {
+        for valeur in ["true", "1", "", "oui", "False"] {
+            assert!(
+                annonce_slimproto_activee(Some(valeur)),
+                "« {valeur} » n'est pas un refus : l'annonce reste armée"
+            );
+        }
+    }
+
+    /// La clé du réglage de l'annonce n'est PAS celle de l'intégration LMS.
+    ///
+    /// Les deux portent le mot « découverte » et vont en sens inverse : c'est
+    /// le malentendu exact que #3809 relève. Les confondre rebrancherait le
+    /// répondeur UDP sur un réglage dont la valeur par défaut est `false` —
+    /// plus aucune platine Squeezebox ne trouverait Tune (#2938, #2349).
+    #[test]
+    fn l_annonce_et_l_integration_lms_ne_partagent_pas_leur_cle() {
+        assert_ne!(CLE_ANNONCE_SLIMPROTO, "squeezebox_enabled");
+    }
+
+    /// Garde de SITE : sans appelant, `annonce_slimproto_activee` serait un
+    /// réglage de plus qui ne gouverne rien — exactement le défaut que #3809
+    /// dénonce. Le dépôt a déjà payé ce motif neuf fois en v0.9.146.
+    ///
+    /// Le marqueur est épelé en deux morceaux pour que ce test ne se compte pas
+    /// lui-même.
+    #[test]
+    fn le_repondeur_udp_ne_part_qu_apres_la_lecture_du_reglage() {
+        let source = include_str!("background.rs");
+        let lecture = concat!("annonce_slimproto_", "activee(");
+        let armement = concat!("slimproto::discovery::", "spawn(");
+        let pos_lecture = source
+            .find(&format!("    let annonce = {lecture}"))
+            .expect("le réglage doit être lu dans `spawn_slimproto_server` (#3809)");
+        let pos_armement = source
+            .find(&format!("    tune_core::{armement}"))
+            .expect("le répondeur UDP doit rester armé quelque part (#2938)");
+        assert!(
+            pos_lecture < pos_armement,
+            "le répondeur UDP s'armait avant toute lecture du réglage : \
+             l'annonce n'était gouvernée par rien (#3809)"
+        );
+    }
+
+    /// Le réglage ne doit toucher QUE l'annonce.
+    ///
+    /// `SlimProtoServer::spawn` (TCP 3483) et le serveur CLI 9090 sont armés
+    /// plus haut dans la même fonction, avant le `return` du refus : les
+    /// déplacer sous la garde couperait la joignabilité des platines, ce que
+    /// #2938 et #2349 interdisent.
+    #[test]
+    fn l_ecoute_tcp_reste_armee_meme_quand_l_annonce_se_tait() {
+        // ⚠️ Le corps est borné à la FONCTION, et chaque marqueur épelé en deux
+        // morceaux. Écrit autrement, ce témoin lisait le fichier entier — donc
+        // ses propres marqueurs — et restait VERT sur son propre sabotage :
+        // mesuré le 11/09, la garde retirée de la fonction ne le faisait pas
+        // rougir.
+        let source = include_str!("background.rs");
+        let debut = source
+            .find(concat!("fn spawn_slimproto_", "server(state: &AppState"))
+            .expect("la fonction doit exister");
+        let corps = &source[debut..];
+        let corps = &corps[..corps.find("\n}\n").expect("la fonction doit se fermer")];
+        let pos_tcp = corps
+            .find(concat!("SlimProtoServer::", "new_with_state"))
+            .expect("le serveur TCP doit être armé dans cette fonction (#2938)");
+        let pos_garde = corps
+            .find(concat!("if !", "annonce {"))
+            .expect("la garde de l'annonce doit exister dans cette fonction (#3809)");
+        assert!(
+            pos_tcp < pos_garde,
+            "l'écoute TCP 3483 doit être armée AVANT la garde : sans elle, \
+             aucune platine Squeezebox ne peut plus piloter Tune (#2938, #2349)"
+        );
     }
 }

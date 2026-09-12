@@ -49,6 +49,26 @@ pub struct TuneConfig {
     pub dlna_slow_max_retries: u32,
 
     // Crossfade
+    /// ⚠️ Ces deux champs-ci ne pilotent RIEN, et ne le peuvent pas (#2211).
+    ///
+    /// Deux raisons se cumulent. D'abord `TuneConfig::from_env` — qui seul les
+    /// alimente depuis `TUNE_CROSSFADE_ENABLED` / `TUNE_CROSSFADE_DURATION` —
+    /// n'a **aucun appelant** dans le dépôt (voir la note sur `auto_update`
+    /// plus bas). Ensuite, et surtout, **plus personne ne les lit** : le seul
+    /// consommateur qu'ils aient jamais eu était
+    /// `playback::crossfade::CrossfadeHandler`, lui-même sans appelant, retiré
+    /// par #2211.
+    ///
+    /// Le fondu enchaîné n'existe sous aucune forme aujourd'hui : la route
+    /// `POST /zones/{id}/crossfade` refuse l'activation par un 501
+    /// `crossfade_unavailable` depuis #2689, et un vrai fondu demandera de
+    /// mélanger deux flux PCM décodés sur la sortie locale — pas une rampe de
+    /// volume.
+    ///
+    /// Laissés en place plutôt que retirés : sortir un champ d'une
+    /// configuration publique est un arbitrage de Bertrand, pas une retouche
+    /// (même règle que `auto_update`, #3217). Mais un lecteur qui tomberait
+    /// ici d'abord doit savoir qu'il regarde un réglage mort.
     pub crossfade_enabled: bool,
     pub crossfade_duration: f64,
 
@@ -127,6 +147,17 @@ pub struct TuneConfig {
     pub log_level: String,
 
     // Update
+    /// ⚠️ Ce champ-ci ne pilote RIEN, et ne le peut pas.
+    ///
+    /// `TuneConfig::from_env` — juste en dessous — n'a **aucun appelant** dans
+    /// le dépôt : le serveur charge `tune_server::config::TuneConfig::load`,
+    /// une AUTRE structure du même nom. C'est là, et là seulement, que
+    /// `TUNE_AUTO_UPDATE` est lu et atteint `spawn_background_tasks` (#3217).
+    ///
+    /// Laissé en place plutôt que retiré : sortir un champ d'une configuration
+    /// publique est un arbitrage de Bertrand, pas une retouche. Mais un
+    /// lecteur qui tomberait ici d'abord doit savoir qu'il regarde la copie
+    /// morte.
     pub auto_update: bool,
 }
 
@@ -389,14 +420,313 @@ pub fn local_audio_backend_from_env() -> Option<String> {
     resolve_local_audio_backend(|key| std::env::var(key).ok())
 }
 
+/// Contrainte de plateforme qui prive le réglage « mode exclusif » de son
+/// effet.
+///
+/// #3192 — jfpaquet (Asus Essence STX II, Windows) : Tune coupe le son de
+/// toutes les autres applications, et DÉCOCHER « mode exclusif » n'y change
+/// rien. Le serveur avait raison sur le fond — un pilote ASIO ne s'ouvre pas
+/// en partagé, ça n'existe pas — mais il l'imposait EN SILENCE. Le défaut
+/// n'est pas la règle, c'est que le réglage ment : l'utilisateur décoche une
+/// case, elle reste sans effet, et rien ne le lui dit.
+///
+/// Les codes sont **stables** et destinés à la machine (le client les
+/// traduit), sur le modèle de `LocalBackendFallback` et de `runtime_reasons`
+/// du chemin du signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusiveModeConstraint {
+    /// ASIO n'a **pas** de mode partagé : le pilote se prend en entier ou pas
+    /// du tout. Ce n'est pas un choix de Tune, c'est la nature du pilote —
+    /// d'où « imposé » et non « ignoré ».
+    AsioAlwaysExclusive,
+}
+
+impl ExclusiveModeConstraint {
+    /// Code stable, celui que porte la charge utile JSON.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::AsioAlwaysExclusive => "asio_always_exclusive",
+        }
+    }
+
+    /// Phrase courte, dans la langue du chemin du signal — le serveur y écrit
+    /// déjà ses `detail` en français.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::AsioAlwaysExclusive => {
+                "ASIO prend le périphérique en exclusivité : son pilote n'a pas \
+                 de mode partagé. Les autres applications n'auront plus de son \
+                 sur ce périphérique. Pour le partager, choisissez un autre \
+                 backend (WASAPI)."
+            }
+        }
+    }
+
+    /// Toutes les variantes. Sert la contre-épreuve permanente : une
+    /// contrainte ajoutée sans code ni libellé fait tomber le test qui
+    /// parcourt cette liste.
+    pub const ALL: [Self; 1] = [Self::AsioAlwaysExclusive];
+}
+
+/// Ce que le mode exclusif VAUT réellement, à côté de ce que le réglage
+/// demande — et pourquoi, quand les deux diffèrent.
+///
+/// Additif : aucun champ ne remplace `local_exclusive_mode`, qui reste publié
+/// tel quel. Un client qui ne lit pas cette structure voit le même écran
+/// qu'avant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExclusiveModeStatus {
+    /// Ce que l'utilisateur a demandé (la case, ou le fichier de config).
+    pub requested: bool,
+    /// Ce qui sera réellement appliqué à l'ouverture du périphérique.
+    pub effective: bool,
+    /// `true` dès que la contrainte s'applique — **y compris quand la case
+    /// était déjà cochée**. C'est ce champ qui doit VERROUILLER le contrôle :
+    /// la question n'est pas « le réglage a-t-il été changé ? » mais « ce
+    /// réglage a-t-il encore un sens ? ».
+    pub forced: bool,
+    /// Pourquoi. `None` = le réglage est honoré tel quel.
+    pub reason: Option<ExclusiveModeConstraint>,
+    /// La même chose en clair, pour un écran qui n'a pas de table de
+    /// traduction.
+    pub detail: Option<&'static str>,
+}
+
+/// La règle, isolée de toute plateforme pour être vérifiable partout.
+///
+/// `on_windows` est un PARAMÈTRE, pas un `cfg!` : le chemin ASIO ne se compile
+/// et ne s'exécute que sous Windows, donc un essai entouré du même `cfg`
+/// serait vert contre rien. Même intention que le `lookup` de
+/// [`resolve_local_audio_backend`] — la règle doit être éprouvable sans
+/// dépendre de la machine qui l'éprouve.
+///
+/// Le `cfg!` reste au CÂBLAGE, dans [`local_exclusive_mode_status`].
+pub fn exclusive_mode_status(
+    backend: &str,
+    requested: bool,
+    on_windows: bool,
+) -> ExclusiveModeStatus {
+    // Hors Windows, `asio` est une valeur héritée (#1268) : aucun host ASIO ne
+    // s'y ouvre, donc rien n'est imposé et le réglage est honoré tel quel.
+    let reason = (on_windows && backend.eq_ignore_ascii_case("asio"))
+        .then_some(ExclusiveModeConstraint::AsioAlwaysExclusive);
+    let forced = reason.is_some();
+    ExclusiveModeStatus {
+        requested,
+        effective: requested || forced,
+        forced,
+        reason,
+        detail: reason.map(ExclusiveModeConstraint::detail),
+    }
+}
+
+/// Même règle, câblée sur la plateforme de ce binaire.
+pub fn local_exclusive_mode_status(backend: &str, requested: bool) -> ExclusiveModeStatus {
+    exclusive_mode_status(backend, requested, cfg!(target_os = "windows"))
+}
+
+/// Le mode exclusif d'UN périphérique, sachant l'hôte qui a ÉNUMÉRÉ son nom.
+///
+/// [`exclusive_mode_status`] répond pour une MACHINE : elle ne connaît que le
+/// réglage `local_audio_backend`. Or ce réglage n'est PAS celui sous lequel
+/// chaque sortie sera ouverte — [`openable_local_backend`] le rectifie par
+/// périphérique depuis #1770, et `LocalOutput::with_origin_host` l'applique à
+/// la construction : un nom énuméré par WASAPI s'ouvre en WASAPI, même quand
+/// le réglage dit « asio ».
+///
+/// Sans cette composition, la contrainte « ASIO est exclusif par nature »
+/// DÉBORDE sur des sorties qui ne sont pas ASIO. Les deux sites
+/// d'enregistrement passaient `AppState::effective_exclusive_mode()` — donc
+/// `true` dès que le réglage vaut « asio » — à CHAQUE sortie de la boucle, et
+/// `LocalOutput` ouvre alors WASAPI en mode EXCLUSIF (la branche
+/// `exclusive_mode && audio_backend != "asio"`, qui journalise
+/// `local_audio_wasapi_exclusive_mode_active`). Le rescan à chaud est le
+/// chemin qui le rend certain : il FORCE l'énumération WASAPI quand ASIO est
+/// configuré, donc il enregistre des noms WASAPI avec un exclusif imposé par
+/// ASIO. La machine perdait le son de toutes ses autres applications sur un
+/// périphérique que personne n'avait demandé en exclusif (#3245, jfpaquet,
+/// Asus Essence STX II).
+///
+/// Ce que cette règle NE fait pas : elle n'invente aucun réglage par zone. Le
+/// mode exclusif reste un réglage de MACHINE, demandé une fois ; ce qui devient
+/// per-périphérique, c'est la CONTRAINTE de plateforme, qui l'était déjà —
+/// elle n'était simplement pas consultée au bon endroit.
+///
+/// `on_windows` reste un PARAMÈTRE, pour la raison écrite sur
+/// [`exclusive_mode_status`] : le chemin ASIO ne se compile et ne s'exécute que
+/// sous Windows, et une épreuve entourée du même `cfg!` serait verte contre
+/// rien.
+pub fn exclusive_mode_du_peripherique(
+    configured_backend: &str,
+    origin_host: Option<&str>,
+    requested: bool,
+    on_windows: bool,
+) -> ExclusiveModeStatus {
+    exclusive_mode_status(
+        &openable_local_backend(configured_backend, origin_host),
+        requested,
+        on_windows,
+    )
+}
+
+/// Même règle, câblée sur la plateforme de ce binaire. C'est celle que les deux
+/// sites d'enregistrement d'une sortie locale appellent.
+pub fn local_exclusive_mode_du_peripherique(
+    configured_backend: &str,
+    origin_host: Option<&str>,
+    requested: bool,
+) -> ExclusiveModeStatus {
+    exclusive_mode_du_peripherique(
+        configured_backend,
+        origin_host,
+        requested,
+        cfg!(target_os = "windows"),
+    )
+}
+
 /// ASIO est exclusif par nature : le demander implique le mode exclusif.
 ///
 /// Partagé par les deux chemins de configuration (`tune-core` et
 /// `tune-server`) pour qu'ils ne puissent pas diverger.
+///
+/// ⚠️ Ce chemin-ci — le fichier de config et l'environnement — n'a **jamais**
+/// eu de garde de plateforme, contrairement à `AppState::effective_exclusive_mode`
+/// qui en a reçu une avec #1268. Il délègue donc avec `on_windows = true`,
+/// c'est-à-dire exactement ce qu'il faisait déjà : une seule règle, une seule
+/// écriture, et l'écart entre les deux chemins devient visible ici au lieu
+/// d'être enfoui dans deux copies.
 pub fn asio_implies_exclusive(backend: &str, exclusive_mode: &mut bool) {
-    if backend.eq_ignore_ascii_case("asio") && !*exclusive_mode {
-        *exclusive_mode = true;
+    *exclusive_mode = exclusive_mode_status(backend, *exclusive_mode, true).effective;
+}
+
+/// Le backend sous lequel une sortie locale peut RÉELLEMENT être ouverte,
+/// sachant l'hôte audio qui a ÉNUMÉRÉ son nom.
+///
+/// `configured` est le réglage `local_audio_backend` ; `origin_host` est
+/// `AudioDevice::backend`, c'est-à-dire le nom de l'hôte cpal qui a produit ce
+/// nom de périphérique (« ASIO », « WASAPI », « CoreAudio », « ALSA »).
+/// `None` ou vide = origine inconnue, et le réglage passe tel quel.
+///
+/// # Pourquoi cette règle existe (#1770)
+///
+/// Deux chemins énumèrent en WASAPI alors qu'ASIO est configuré, et les DEUX
+/// sont voulus :
+///
+/// - `tune-server/src/startup.rs` : quand l'hôte ASIO répond mais n'expose
+///   aucune sortie, on ré-énumère en WASAPI pour que l'utilisateur ait quand
+///   même des sorties ;
+/// - `tune-server/src/background.rs` : le rescan à chaud force WASAPI, parce
+///   que resonder ASIO en cours de session peut faire appeler `abort()` au
+///   pilote et tuer le processus.
+///
+/// Les noms ainsi obtenus (« Speakers », « Haut-parleurs ») sont des noms
+/// WASAPI. Les étiqueter `asio` les rend INOUVRABLES, sur chacun des
+/// consommateurs de ce champ, sans exception :
+///
+/// - `select_host(audio_backend)` n'ouvre l'hôte ASIO que pour `"asio"` ; un
+///   nom WASAPI n'y figure pas, et `resolve_device` REFUSE sans repli parce
+///   que l'hôte d'origine diffère de l'hôte ouvert (#3230) ;
+/// - la branche `exclusive_mode && audio_backend == "asio"` envoie ce nom à
+///   `AsioExclusiveOutput::new`, qui ne peut que le refuser — mesuré chez
+///   jfpaquet le 02/09 en 0.9.130 :
+///   `asio_device_not_found_listing_available requested=Speakers
+///   available=["Essence STX II ASIO(64)"]`, deux fois en une minute ;
+/// - `LocalOutput::is_available` interroge le même `select_host` : la zone est
+///   annoncée hors ligne alors que le périphérique est là ;
+/// - même le délai de relâchement (500 ms « ASIO » contre 200 ms) est faux.
+///
+/// Aucun consommateur n'a besoin de la valeur CONFIGURÉE : tous ont besoin de
+/// l'hôte réellement ouvrable. C'est ce que rend cette fonction.
+///
+/// La réciproque n'est pas traitée, et c'est délibéré : seul `configured ==
+/// "asio"` ouvre l'hôte ASIO (`select_host`), donc rien d'autre ne peut
+/// produire des noms ASIO. Promouvoir un réglage vers `asio` sur la foi d'une
+/// étiquette d'origine ARMERAIT le mode exclusif ASIO que personne n'a
+/// demandé ; on laisse la valeur intacte.
+///
+/// `on_windows` n'est pas un paramètre parce qu'aucune plateforme n'entre dans
+/// cette règle : elle ne compare que deux chaînes. Hors Windows, `configured`
+/// vaut rarement `asio` (valeur héritée, #1268) et `origin_host` ne vaudra
+/// jamais `ASIO` — le repli sur `"wasapi"` y est alors sans effet, puisque
+/// `select_host` ouvre de toute façon l'hôte par défaut pour toute valeur
+/// autre que `asio`.
+pub fn openable_local_backend(configured: &str, origin_host: Option<&str>) -> String {
+    let Some(origin) = origin_host.map(str::trim).filter(|h| !h.is_empty()) else {
+        return configured.to_string();
+    };
+    if configured.eq_ignore_ascii_case("asio") && !origin.eq_ignore_ascii_case("asio") {
+        // `"wasapi"` plutôt que le nom de l'hôte d'origine : c'est le
+        // vocabulaire que le reste du code compare (`audio_backend == "asio"`,
+        // `audio_backend != "asio"`), et `select_host` traite toute valeur
+        // autre que `asio` de la même façon — elle ouvre l'hôte par défaut,
+        // celui-là même qui a énuméré ce nom.
+        return "wasapi".to_string();
     }
+    configured.to_string()
+}
+
+/// Les étiquettes génériques que porte une zone locale attachée à la SORTIE
+/// SYSTÈME. Deux, parce que les versions passées écrivaient la française sur
+/// un macOS en français : un renommage de la machine ou un changement de
+/// langue mintait alors une seconde zone par défaut sous l'autre étiquette
+/// (Philippe Vella, #1233).
+///
+/// Source unique : la clause SQL de `ZoneRepo` en est construite, et la règle
+/// de nommage ci-dessous la consulte. Ajouter une langue ici les corrige
+/// toutes les deux.
+pub const ETIQUETTES_LOCALES_GENERIQUES: [&str; 2] = ["This Computer", "Cet ordinateur"];
+
+/// L'étiquette générique effectivement POSÉE sur une zone locale nouvellement
+/// créée. Les autres entrées de [`ETIQUETTES_LOCALES_GENERIQUES`] ne servent
+/// qu'à RECONNAÎTRE l'héritage.
+pub const ETIQUETTE_LOCALE_GENERIQUE: &str = ETIQUETTES_LOCALES_GENERIQUES[0];
+
+/// Vrai si ce nom de zone est l'une des étiquettes génériques, quelle que soit
+/// la casse.
+pub fn est_etiquette_locale_generique(nom: &str) -> bool {
+    ETIQUETTES_LOCALES_GENERIQUES
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(nom))
+}
+
+/// Le nom à donner à une zone locale qu'on s'apprête à CRÉER (#1770).
+///
+/// # Pourquoi cette règle existe
+///
+/// Le `device_id` d'une sortie locale est dérivé du NOM du périphérique
+/// (`local:<nom>`). Changer de moteur audio change donc l'identifiant de la
+/// sortie système : sous ASIO c'est `local:Essence STX II ASIO(64)`, sous
+/// WASAPI c'est `local:Speakers`. Ce sont deux lignes différentes en base, et
+/// `ZoneRepo::get_or_create` ne rapproche que par `output_device_id` : au
+/// premier démarrage qui suit la bascule ASIO → WASAPI, la sortie système
+/// WASAPI n'a pas de zone, elle en obtient une — et l'ancienne, celle d'ASIO,
+/// reste visible. Toutes deux s'appellent « This Computer ». C'est le doublon
+/// mesuré chez jfpaquet le 02/09/2026 en 0.9.130 : deux zones du même nom,
+/// l'une qui joue, l'autre non.
+///
+/// `ZoneRepo::hide_duplicate_generic_local` ne rattrapait pas ce cas : elle
+/// n'est appelée que sur la branche « la zone existait déjà », jamais sur la
+/// branche de création.
+///
+/// La règle posée ici est la plus conservatrice des deux possibles : on ne
+/// masque RIEN — masquer la zone ASIO la ferait disparaître pour de bon, la
+/// découverte ne ressuscitant jamais une zone masquée — on refuse simplement
+/// de minter une seconde fois l'étiquette générique. La nouvelle zone prend le
+/// nom de son périphérique, exactement comme une sortie non-défaut, et les
+/// deux zones deviennent distinguables dans le sélecteur.
+///
+/// Sur une base neuve, `generique_deja_pris` est faux et le comportement est
+/// mot pour mot celui d'avant.
+pub fn nom_de_zone_locale(
+    nom_appareil: &str,
+    est_defaut: bool,
+    generique_deja_pris: bool,
+) -> String {
+    if est_defaut && !generique_deja_pris {
+        return ETIQUETTE_LOCALE_GENERIQUE.to_string();
+    }
+    nom_appareil.to_string()
 }
 
 fn env_str(key: &str, target: &mut String) {
@@ -550,6 +880,246 @@ mod tests {
         assert!(!off);
     }
 
+    // -----------------------------------------------------------------
+    // #3192 — le réglage « mode exclusif » ne doit plus MENTIR.
+    //
+    // Ces essais portent sur `exclusive_mode_status`, qui prend la plateforme
+    // en paramètre. C'est délibéré : le chemin ASIO ne se compile que sous
+    // Windows, et un essai entouré du même `cfg` ne serait exécuté par aucune
+    // des cibles Linux/macOS de la CI — vert contre rien.
+    // -----------------------------------------------------------------
+
+    /// 1. ASIO + case DÉCOCHÉE : la contrainte l'emporte (c'est la nature du
+    ///    pilote), **et la raison est donnée**. C'est tout le ticket : avant,
+    ///    le premier point était vrai et le second manquait.
+    #[test]
+    fn asio_impose_l_exclusif_et_dit_pourquoi() {
+        let s = exclusive_mode_status("asio", false, true);
+        assert!(
+            s.effective,
+            "ASIO n'a pas de mode partagé : l'exclusif s'applique"
+        );
+        assert!(
+            s.forced,
+            "et le contrôle doit être annoncé comme IMPOSÉ, pas honoré"
+        );
+        assert_eq!(s.reason, Some(ExclusiveModeConstraint::AsioAlwaysExclusive));
+        let detail = s
+            .detail
+            .expect("une contrainte sans explication, c'est le défaut de #3192");
+        assert!(
+            detail.contains("WASAPI"),
+            "l'explication doit dire à l'utilisateur ce qu'il PEUT faire \
+             (changer de backend), pas seulement ce qu'il subit : {detail}"
+        );
+        assert!(
+            !s.requested,
+            "`requested` doit rester ce que l'utilisateur a demandé, sinon \
+             l'écran ne peut pas dire que son choix a été écrasé"
+        );
+    }
+
+    /// 2. WASAPI + case décochée : le réglage est honoré, rien n'est imposé,
+    ///    et le son des autres applications reste.
+    #[test]
+    fn wasapi_decoche_reste_partage() {
+        let s = exclusive_mode_status("wasapi", false, true);
+        assert!(!s.effective, "le réglage de l'utilisateur doit être honoré");
+        assert!(!s.forced);
+        assert_eq!(s.reason, None);
+        assert_eq!(s.detail, None);
+    }
+
+    /// 3. WASAPI + case cochée : l'exclusif demandé reste l'exclusif appliqué,
+    ///    et il n'est pas présenté comme imposé — l'utilisateur l'a choisi.
+    #[test]
+    fn wasapi_coche_reste_exclusif_et_choisi() {
+        let s = exclusive_mode_status("wasapi", true, true);
+        assert!(s.effective);
+        assert!(
+            !s.forced,
+            "un exclusif CHOISI ne doit pas se présenter comme subi : sinon \
+             l'écran verrouillerait une case que l'utilisateur peut décocher"
+        );
+        assert_eq!(s.reason, None);
+    }
+
+    /// 4. **Le témoin.** Hors Windows rien ne change : une valeur `asio`
+    ///    héritée d'une bibliothèque migrée (#1268) n'impose rien, parce
+    ///    qu'aucun host ASIO ne s'y ouvrira jamais.
+    #[test]
+    fn hors_windows_rien_n_est_impose() {
+        let s = exclusive_mode_status("asio", false, false);
+        assert!(
+            !s.effective,
+            "hors Windows, `asio` est une valeur morte : elle ne doit armer \
+             aucun chemin exclusif (le hog mode CoreAudio, bien réel sur macOS)"
+        );
+        assert!(!s.forced);
+        assert_eq!(s.reason, None);
+        assert_eq!(s.detail, None);
+        // Et l'exclusif explicitement demandé reste honoré, partout.
+        assert!(exclusive_mode_status("alsa", true, false).effective);
+        assert!(!exclusive_mode_status("alsa", true, false).forced);
+    }
+
+    /// La case DÉJÀ cochée sous ASIO reste `forced` : l'écran doit la
+    /// verrouiller aussi dans ce cas, sinon l'utilisateur la décoche et
+    /// retombe exactement dans le défaut.
+    #[test]
+    fn asio_deja_coche_reste_impose() {
+        let s = exclusive_mode_status("ASIO", true, true);
+        assert!(s.effective);
+        assert!(
+            s.forced,
+            "`forced` répond à « ce réglage a-t-il encore un sens ? », pas à \
+             « a-t-il été changé ? »"
+        );
+        assert!(s.requested, "et le choix de l'utilisateur reste lisible");
+    }
+
+    // -----------------------------------------------------------------
+    // #3245 — la contrainte ASIO ne doit pas DÉBORDER sur un périphérique
+    // qui ne sera pas ouvert en ASIO.
+    //
+    // Même parti que #3192 juste au-dessus : `on_windows` est un paramètre.
+    // Un essai entouré de `cfg!(windows)` ne serait exécuté par aucune des
+    // cibles Linux/macOS de la CI — vert contre rien, alors que le défaut
+    // décrit ici ne vit que sous Windows.
+    // -----------------------------------------------------------------
+
+    /// Le cas de jfpaquet, à la lettre : réglage « asio », et un nom énuméré
+    /// par WASAPI — ce que le rescan à chaud produit à chaque cycle, puisqu'il
+    /// FORCE WASAPI quand ASIO est configuré. Avant #3245, cette sortie-là
+    /// recevait l'exclusif imposé par ASIO et Tune ouvrait WASAPI en exclusif :
+    /// le son de toutes les autres applications disparaissait.
+    #[test]
+    fn asio_n_impose_plus_l_exclusif_a_un_nom_enumere_par_wasapi() {
+        let s = exclusive_mode_du_peripherique("asio", Some("WASAPI"), false, true);
+        assert!(
+            !s.effective,
+            "ce périphérique s'ouvrira en WASAPI (openable_local_backend) :              rien n'y impose l'exclusif, et l'utilisateur ne l'a pas demandé"
+        );
+        assert!(!s.forced, "aucune contrainte ne s'applique à cette sortie");
+        assert_eq!(s.reason, None);
+        assert_eq!(s.detail, None);
+        assert!(!s.requested);
+    }
+
+    /// …et le vrai périphérique ASIO garde sa contrainte, mot pour mot. Sans
+    /// cette moitié-ci, on aurait « corrigé » en désarmant l'exclusif partout,
+    /// c'est-à-dire en rendant le pilote ASIO inouvrable.
+    #[test]
+    fn le_peripherique_asio_garde_sa_contrainte() {
+        let s = exclusive_mode_du_peripherique("asio", Some("ASIO"), false, true);
+        assert!(s.effective, "un pilote ASIO ouvert en partagé n'existe pas");
+        assert!(s.forced);
+        assert_eq!(s.reason, Some(ExclusiveModeConstraint::AsioAlwaysExclusive));
+        assert!(s.detail.is_some());
+    }
+
+    /// L'exclusif DEMANDÉ reste honoré sur toutes les sorties : ce correctif
+    /// retire un débordement, il ne retire pas un choix.
+    #[test]
+    fn l_exclusif_demande_reste_honore_sur_toute_sortie() {
+        for origine in [Some("WASAPI"), Some("ASIO"), None] {
+            let s = exclusive_mode_du_peripherique("asio", origine, true, true);
+            assert!(
+                s.effective,
+                "origine {origine:?} : l'utilisateur l'a demandé"
+            );
+        }
+    }
+
+    /// Origine INCONNUE : la règle par périphérique doit rendre exactement la
+    /// règle machine. C'est ce qui garantit qu'aucun site qui n'étiquette pas
+    /// son hôte d'origine ne change de comportement au passage de #3245.
+    #[test]
+    fn sans_origine_connue_la_regle_est_celle_de_la_machine() {
+        for backend in ["asio", "ASIO", "wasapi", "auto", ""] {
+            for demande in [false, true] {
+                for windows in [false, true] {
+                    for origine in [None, Some(""), Some("   ")] {
+                        assert_eq!(
+                            exclusive_mode_du_peripherique(backend, origine, demande, windows),
+                            exclusive_mode_status(backend, demande, windows),
+                            "backend {backend}, demande {demande}, windows {windows},                              origine {origine:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// CONTRE-ÉPREUVE de l'essai précédent : la règle par périphérique ne doit
+    /// PAS être un synonyme de la règle machine. Il existe au moins un couple
+    /// (backend, origine) où les deux DIVERGENT — sans quoi les essais
+    /// ci-dessus resteraient verts contre une fonction qui ignore
+    /// `origin_host`, c'est-à-dire contre le défaut lui-même.
+    #[test]
+    fn la_regle_par_peripherique_diverge_bien_de_la_regle_machine() {
+        let machine = exclusive_mode_status("asio", false, true);
+        let peripherique = exclusive_mode_du_peripherique("asio", Some("WASAPI"), false, true);
+        assert_ne!(
+            machine, peripherique,
+            "si ces deux valeurs étaient égales, `exclusive_mode_du_peripherique`              ignorerait l'hôte d'origine et #3245 serait toujours vivant"
+        );
+        assert!(machine.effective && !peripherique.effective);
+    }
+
+    /// Contre-épreuve permanente : toute contrainte ajoutée doit avoir un code
+    /// distinct et une explication non vide. Une variante posée sans câblage
+    /// fait rougir ceci.
+    #[test]
+    fn toute_contrainte_a_un_code_distinct_et_une_explication() {
+        let mut codes: Vec<&str> = Vec::new();
+        for c in ExclusiveModeConstraint::ALL {
+            assert!(!c.code().is_empty(), "code vide pour {c:?}");
+            assert!(
+                c.detail().len() > 20,
+                "explication trop courte pour {c:?} : elle est destinée à un \
+                 humain qui vient de perdre le son de sa visioconférence"
+            );
+            assert!(!codes.contains(&c.code()), "code dupliqué : {}", c.code());
+            codes.push(c.code());
+        }
+        assert_eq!(codes.len(), ExclusiveModeConstraint::ALL.len());
+    }
+
+    /// Le code stable doit être celui que porte le JSON — pas une chaîne
+    /// recopiée à côté.
+    #[test]
+    fn le_code_serialise_est_le_code_stable() {
+        let s = exclusive_mode_status("asio", false, true);
+        let v = serde_json::to_value(&s).expect("le statut doit être sérialisable");
+        assert_eq!(
+            v["reason"].as_str(),
+            Some(ExclusiveModeConstraint::AsioAlwaysExclusive.code()),
+            "le client lit ce code, il ne doit pas dériver du nom Rust"
+        );
+        assert_eq!(v["forced"].as_bool(), Some(true));
+        assert_eq!(v["requested"].as_bool(), Some(false));
+        assert_eq!(v["effective"].as_bool(), Some(true));
+    }
+
+    /// Une seule règle : le raccourci historique du chemin de configuration
+    /// doit rendre exactement ce que rend la règle. S'ils divergent, un `.env`
+    /// et la page de réglages ne diront plus la même chose.
+    #[test]
+    fn asio_implies_exclusive_est_la_meme_regle() {
+        for backend in ["asio", "ASIO", "wasapi", "auto", ""] {
+            for demande in [false, true] {
+                let mut par_le_raccourci = demande;
+                asio_implies_exclusive(backend, &mut par_le_raccourci);
+                assert_eq!(
+                    par_le_raccourci,
+                    exclusive_mode_status(backend, demande, true).effective,
+                    "divergence sur ({backend:?}, {demande})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn parse_music_dirs_json() {
         let dirs = parse_music_dirs(r#"["/music", "/data/flac"]"#);
@@ -614,5 +1184,142 @@ mod tests {
         let back: TuneConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.api_port, 8888);
         assert_eq!(back.max_sample_rate, 192_000);
+    }
+}
+
+/// #1770 — la règle « une sortie s'ouvre sous l'hôte qui l'a énumérée ».
+///
+/// Ces essais ne dépendent d'aucune plateforme : la règle ne compare que deux
+/// chaînes, et c'est précisément pour ça qu'elle vit ici et pas dans le chemin
+/// Windows qu'aucune porte de ce dépôt ne compile.
+#[cfg(test)]
+mod backend_ouvrable_i1770 {
+    use super::openable_local_backend;
+
+    /// Le cas de jfpaquet. ASIO configuré, endpoint trouvé par l'énumération
+    /// WASAPI de repli : l'étiqueter `asio` l'envoie à `AsioExclusiveOutput`,
+    /// qui ne peut que le refuser.
+    #[test]
+    fn un_nom_wasapi_sous_asio_ne_reste_pas_asio() {
+        assert_eq!(
+            openable_local_backend("asio", Some("WASAPI")),
+            "wasapi",
+            "un nom énuméré par WASAPI doit s'ouvrir sous WASAPI, sinon ni \
+             select_host ni AsioExclusiveOutput ne le retrouvent (#1770)"
+        );
+    }
+
+    /// TÉMOIN — un vrai périphérique ASIO ne bouge pas d'un iota. Si cet essai
+    /// tombe, le correctif a désarmé le chemin ASIO au lieu de le protéger.
+    #[test]
+    fn temoin_un_nom_asio_sous_asio_reste_asio() {
+        assert_eq!(
+            openable_local_backend("asio", Some("ASIO")),
+            "asio",
+            "un périphérique réellement énuméré par ASIO doit garder ASIO"
+        );
+    }
+
+    /// Origine inconnue : on ne sait rien, on ne touche à rien. C'est le cas de
+    /// `PlaybackOrchestrator::recreate_local_and_play`, qui recrée une sortie à
+    /// partir du seul `device_id` sans jamais avoir vu d'`AudioDevice`.
+    #[test]
+    fn origine_inconnue_laisse_le_reglage_intact() {
+        for origine in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                openable_local_backend("asio", origine),
+                "asio",
+                "sans hôte d'origine il n'y a rien à corriger : {origine:?}"
+            );
+        }
+    }
+
+    /// La réciproque n'est PAS traitée, délibérément : promouvoir vers `asio`
+    /// armerait le mode exclusif ASIO que personne n'a demandé.
+    #[test]
+    fn un_reglage_non_asio_n_est_jamais_promu_en_asio() {
+        for configure in ["wasapi", "auto", ""] {
+            assert_eq!(
+                openable_local_backend(configure, Some("ASIO")),
+                configure,
+                "aucune étiquette d'origine ne doit promouvoir un réglage vers \
+                 ASIO — seul le réglage ouvre l'hôte ASIO"
+            );
+        }
+    }
+
+    /// Les hôtes des autres plateformes traversent sans effet de bord : le
+    /// réglage y est déjà celui qui ouvre l'hôte par défaut.
+    #[test]
+    fn les_hotes_hors_windows_ne_changent_rien() {
+        assert_eq!(openable_local_backend("auto", Some("CoreAudio")), "auto");
+        assert_eq!(openable_local_backend("auto", Some("ALSA")), "auto");
+        assert_eq!(openable_local_backend("wasapi", Some("WASAPI")), "wasapi");
+    }
+
+    /// La casse du réglage vient de la base et de l'environnement, pas d'un
+    /// littéral : `ASIO` doit être reconnu comme `asio`.
+    #[test]
+    fn la_casse_du_reglage_et_de_l_hote_est_ignoree() {
+        assert_eq!(openable_local_backend("ASIO", Some("Wasapi")), "wasapi");
+        assert_eq!(openable_local_backend("Asio", Some("asio")), "Asio");
+    }
+}
+
+/// #1770 — la règle « on ne minte pas deux fois l'étiquette générique ».
+///
+/// Comme la règle voisine, elle ne dépend d'aucune plateforme : c'est
+/// exactement pour ça qu'elle vit ici et non dans le chemin Windows qu'aucune
+/// porte de ce dépôt ne compile.
+#[cfg(test)]
+mod nom_de_zone_locale_i1770 {
+    use super::{ETIQUETTE_LOCALE_GENERIQUE, est_etiquette_locale_generique, nom_de_zone_locale};
+
+    /// Le cas de la bascule ASIO → WASAPI. Une zone « This Computer » existe
+    /// déjà (celle d'ASIO) ; la sortie système WASAPI, qui porte un AUTRE
+    /// `device_id`, ne doit pas en minter une seconde du même nom.
+    #[test]
+    fn la_sortie_systeme_ne_reprend_pas_une_etiquette_deja_prise() {
+        assert_eq!(
+            nom_de_zone_locale("Speakers", true, true),
+            "Speakers",
+            "après une bascule de moteur audio, la nouvelle sortie système \
+             doit prendre le nom de son périphérique : deux zones nommées \
+             « This Computer » sont indiscernables dans le sélecteur (#1770, \
+             jfpaquet, 0.9.130)"
+        );
+    }
+
+    /// TÉMOIN — base neuve, aucune étiquette générique posée : le
+    /// comportement d'origine est intact. Si cet essai tombe, le correctif a
+    /// privé la première zone locale de son nom au lieu de protéger la
+    /// seconde.
+    #[test]
+    fn temoin_base_neuve_la_sortie_systeme_garde_l_etiquette_generique() {
+        assert_eq!(
+            nom_de_zone_locale("Speakers", true, false),
+            ETIQUETTE_LOCALE_GENERIQUE,
+            "sur une base neuve la sortie système s'appelle toujours \
+             « This Computer »"
+        );
+    }
+
+    /// Une sortie qui n'est pas la sortie système n'a jamais porté
+    /// l'étiquette générique, prise ou non.
+    #[test]
+    fn une_sortie_non_defaut_porte_toujours_son_nom() {
+        assert_eq!(nom_de_zone_locale("BL650", false, false), "BL650");
+        assert_eq!(nom_de_zone_locale("BL650", false, true), "BL650");
+    }
+
+    /// Les deux étiquettes héritées sont reconnues, la casse est ignorée, et
+    /// un nom choisi par l'utilisateur ne l'est pas.
+    #[test]
+    fn la_reconnaissance_couvre_les_deux_langues_et_pas_le_reste() {
+        assert!(est_etiquette_locale_generique("This Computer"));
+        assert!(est_etiquette_locale_generique("Cet ordinateur"));
+        assert!(est_etiquette_locale_generique("this computer"));
+        assert!(!est_etiquette_locale_generique("Salon"));
+        assert!(!est_etiquette_locale_generique("Speakers"));
     }
 }

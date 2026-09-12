@@ -1,0 +1,71 @@
+tune-server pour Debian / Ubuntu
+================================
+
+Ce que le paquet pose
+---------------------
+
+  /opt/tune/                    programme (binaire, client web, plugins,
+                                airplay-daemon, ffmpeg minimal)
+  /usr/bin/tune-server          lien symbolique vers /opt/tune/tune-server
+  /lib/systemd/system/tune-server.service
+  /etc/default/tune-server      configuration (conffile : conservé aux MAJ)
+  /var/lib/tune/                données : base SQLite, pochettes, imports
+
+Le service tourne sous l'utilisateur système « tune », membre du groupe
+« audio » pour voir les DAC USB via ALSA.
+
+Premiers pas
+------------
+
+  sudo apt install ./tune-server_<version>_<arch>.deb
+  # le service démarre tout seul
+  xdg-open http://localhost:8888
+
+Puis renseigner les dossiers de musique dans /etc/default/tune-server et :
+
+  sudo systemctl restart tune-server
+  journalctl -u tune-server -f
+
+Pourquoi /opt et pas /usr/bin
+-----------------------------
+
+Tune sait se mettre à jour tout seul (Réglages → Mise à jour) : il réécrit
+son propre binaire et le dossier web/ à côté de lui. Pour que cela continue
+de marcher une fois empaqueté, /opt/tune appartient à l'utilisateur « tune »
+et l'unité systemd utilise ProtectSystem=full (et non strict), qui laisse
+/opt inscriptible.
+
+Conséquence à connaître : après une mise à jour intégrée, les fichiers de
+/opt/tune ne correspondent plus aux sommes de contrôle enregistrées par dpkg
+(`debsums` le signalera), et réinstaller le .deb ramène la version du paquet.
+Les deux canaux fonctionnent, ils ne se synchronisent simplement pas.
+
+Compatibilité glibc
+-------------------
+
+Les binaires sont construits sur Ubuntu 22.04 (glibc 2.35) et le ffmpeg
+embarqué référence des symboles GLIBC_2.35. Le paquet déclare donc
+`Depends: libc6 (>= 2.35)`.
+
+C'est l'intérêt principal du .deb face à l'archive .tar.gz : sur une
+distribution trop ancienne (Debian 11 et sa glibc 2.31), apt REFUSE
+l'installation avec un message clair, là où l'archive s'extrayait très bien
+puis échouait au lancement sur « /lib/x86_64-linux-gnu/libc.so.6: version
+GLIBC_2.35 not found ».
+
+Distributions couvertes : Debian 12+ (glibc 2.36), Ubuntu 22.04+,
+Raspberry Pi OS bookworm+, et tout dérivé de ces bases.
+
+Désinstallation
+---------------
+
+  sudo apt remove tune-server          # enlève le programme, garde les données
+  sudo apt purge  tune-server          # enlève aussi /opt/tune
+
+/var/lib/tune n'est JAMAIS supprimé automatiquement, même au purge : il
+contient l'index de la bibliothèque, qui peut représenter des heures de scan.
+Pour l'effacer :
+
+  sudo rm -rf /var/lib/tune && sudo deluser tune
+
+ -- Mozaiklabs <contact@mozaiklabs.fr>

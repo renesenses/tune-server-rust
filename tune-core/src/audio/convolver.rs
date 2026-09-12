@@ -1090,8 +1090,7 @@ mod tests {
     /// fichiers mono, jamais un stereo (Daniel, 24/08/2026).
     #[test]
     fn deux_filtres_mono_deviennent_un_stereo_par_canal() {
-        let dir = std::env::temp_dir().join(format!("tune-fir-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::scratch_dir("tune-fir");
         let g = dir.join("gauche.wav");
         let d = dir.join("droite.wav");
         let out = dir.join("combine.wav");
@@ -1122,16 +1121,13 @@ mod tests {
             "le canal droit doit porter le filtre droit, complete de zeros — un \
              zero est neutre pour une convolution, contrairement a une repetition"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Des cadences differentes sont un refus, pas un rattrapage silencieux :
     /// convoluer a deux cadences decalerait un canal par rapport a l'autre.
     #[test]
     fn deux_cadences_differentes_sont_refusees() {
-        let dir = std::env::temp_dir().join(format!("tune-fir-sr-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::scratch_dir("tune-fir-sr");
         let g = dir.join("g.wav");
         let d = dir.join("d.wav");
         let out = dir.join("o.wav");
@@ -1149,16 +1145,13 @@ mod tests {
             "le refus doit NOMMER les deux cadences, sinon l'utilisateur ne sait \
              pas lequel de ses deux fichiers reexporter — recu : {e}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Le fichier combine doit vraiment traverser le convolveur : deux
     /// impulsions de signes opposes doivent ressortir de signes opposes.
     #[test]
     fn le_stereo_combine_convolue_chaque_canal_avec_son_filtre() {
-        let dir = std::env::temp_dir().join(format!("tune-fir-conv-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::scratch_dir("tune-fir-conv");
         let g = dir.join("g.wav");
         let d = dir.join("d.wav");
         let out = dir.join("o.wav");
@@ -1193,7 +1186,5 @@ mod tests {
              gauche, les deux canaux partagent le meme filtre : {}",
             sortie[i + 1]
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

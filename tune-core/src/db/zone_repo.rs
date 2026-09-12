@@ -147,7 +147,7 @@ pub mod sql {
     /// si la survivante est vierge, et a savoir si le doublon apporte vraiment
     /// quelque chose. Voir `ZoneRepo::merge_duplicate_settings` pour la regle
     /// et pour l'absence deliberee de `gapless_enabled`.
-    const REGLAGES_A_FUSIONNER: &[(&str, &str)] = &[
+    pub(super) const REGLAGES_A_FUSIONNER: &[(&str, &str)] = &[
         // Drapeaux : defaut 0, donc seul un 1 se reporte.
         ("fixed_volume", "0"),
         ("alac_passthrough", "0"),
@@ -173,7 +173,7 @@ pub mod sql {
     /// journaux de DEvir). Le report de ces deux reglages se fait desormais la
     /// ou ils sont reellement ranges, voir
     /// [`ZoneRepo::reporter_reglages_de_doublons`].
-    const REGLAGES_NULLABLES: &[&str] = &["max_sample_rate"];
+    pub(super) const REGLAGES_NULLABLES: &[&str] = &["max_sample_rate"];
 
     /// Les zones en doublon, survivante d'abord dans chaque groupe.
     ///
@@ -259,6 +259,52 @@ pub mod sql {
         )
     }
 
+    /// L'instant courant en ISO 8601 UTC, calcule par la base elle-meme :
+    /// aucun format a produire cote Rust, et le meme texte des deux cotes.
+    pub fn maintenant_iso(engine: Engine) -> &'static str {
+        match engine {
+            Engine::Sqlite => "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            Engine::Postgres => {
+                "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
+            }
+        }
+    }
+
+    /// Passage EN LIGNE : `online` ET `last_seen_at` (DUP-1, phase 2). Le
+    /// passage hors ligne, lui, ne touche pas a la date — c'est ce qui en
+    /// fait une « derniere fois vue ».
+    pub fn marquer_en_ligne_par_appareil<D: SqlDialect>(d: &D, engine: Engine) -> String {
+        format!(
+            "UPDATE zones SET online = {}, last_seen_at = {} WHERE output_device_id = {}",
+            d.placeholder(1),
+            maintenant_iso(engine),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn marquer_en_ligne_par_id<D: SqlDialect>(d: &D, engine: Engine) -> String {
+        format!(
+            "UPDATE zones SET online = {}, last_seen_at = {} WHERE id = {}",
+            d.placeholder(1),
+            maintenant_iso(engine),
+            d.placeholder(2)
+        )
+    }
+
+    /// Age, en secondes, de la derniere reponse de chaque zone qui en a une.
+    pub fn ages_depuis_derniere_vue(engine: Engine) -> &'static str {
+        match engine {
+            Engine::Sqlite => {
+                "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', last_seen_at) AS INTEGER) \
+                 FROM zones WHERE last_seen_at IS NOT NULL"
+            }
+            Engine::Postgres => {
+                "SELECT id, CAST(EXTRACT(EPOCH FROM (now() - last_seen_at::timestamptz)) AS BIGINT) \
+                 FROM zones WHERE last_seen_at IS NOT NULL"
+            }
+        }
+    }
+
     pub fn set_online_by_device<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET online = {} WHERE output_device_id = {}",
@@ -267,12 +313,25 @@ pub mod sql {
         )
     }
 
+    /// `('This Computer', 'Cet ordinateur')` — construit depuis
+    /// [`crate::config::ETIQUETTES_LOCALES_GENERIQUES`], source unique de la
+    /// liste. Aucune de ces étiquettes ne porte d'apostrophe ; ajouter une
+    /// langue qui en porterait demanderait un échappement ici.
+    pub fn etiquettes_locales_generiques() -> String {
+        crate::config::ETIQUETTES_LOCALES_GENERIQUES
+            .iter()
+            .map(|e| format!("'{e}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub fn rename_generic_local_label<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET name = {} \
-             WHERE id = {} AND name IN ('This Computer', 'Cet ordinateur')",
+             WHERE id = {} AND name IN ({})",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            etiquettes_locales_generiques()
         )
     }
 
@@ -280,8 +339,23 @@ pub mod sql {
         format!(
             "UPDATE zones SET is_hidden = 1 \
              WHERE id <> {} AND output_type = 'local' \
-             AND name IN ('This Computer', 'Cet ordinateur') \
+             AND name IN ({}) \
              AND COALESCE(is_hidden, 0) = 0",
+            d.placeholder(1),
+            etiquettes_locales_generiques()
+        )
+    }
+
+    /// Compte les zones locales VISIBLES qui portent déjà une étiquette
+    /// générique, en excluant l'appareil qu'on s'apprête à traiter (#1770).
+    pub fn etiquette_generique_locale_prise<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM zones \
+             WHERE output_type = 'local' \
+             AND name IN ({}) \
+             AND COALESCE(is_hidden, 0) = 0 \
+             AND (output_device_id IS NULL OR output_device_id <> {})",
+            etiquettes_locales_generiques(),
             d.placeholder(1)
         )
     }
@@ -362,13 +436,67 @@ pub mod sql {
     }
 }
 
+/// Une zone locale qui a retrouve son appareil sous un AUTRE nom (#2269).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reassociation {
+    pub zone_id: i64,
+    pub ancien_device_id: String,
+    pub nouveau_device_id: String,
+    pub endpoint_id: String,
+}
+
+/// Ce qu'une zone RESEAU garde de l'identite physique de son appareil (#3919).
+///
+/// Rendu par [`ZoneRepo::zones_par_mac`]. La decision, elle, est prise par
+/// l'appelant : ce type ne fait que porter la ligne telle que la base la
+/// donne, lignes masquees comprises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneParMac {
+    pub id: i64,
+    /// `zones.output_device_id` — pour un appareil sans identifiant durable,
+    /// la forme derivee de l'adresse (`{type}-{host}-{port}`), celle qui
+    /// change au changement d'adresse.
+    pub output_device_id: String,
+    /// `zones.output_type` — vide si la colonne est NULL.
+    pub output_type: String,
+    /// `zones.is_hidden` — une zone SUPPRIMEE est masquee, pas effacee. Elle
+    /// se re-ancre sans se demasquer, sinon la mise a jour ressusciterait ce
+    /// que l'utilisateur avait efface.
+    pub masquee: bool,
+}
+
+/// Ce qu'une passe d'identite de sortie a change, et ce qu'elle a refuse.
+///
+/// Les refus sont RENDUS et non avales : c'est de quoi un journal, un rapport
+/// de bogue ou l'ecran peuvent dire pourquoi une zone n'a pas retrouve son
+/// appareil. Chaque motif nomme sa cause (voir `identite_de_sortie::Refus`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RapportDIdentite {
+    /// `(zone, identifiant appris)` — l'identite de la zone n'a pas bouge.
+    pub apprises: Vec<(i64, String)>,
+    pub reassociees: Vec<Reassociation>,
+    /// `(zone, motif)` — une re-association possible en apparence, refusee
+    /// parce qu'elle n'etait pas CERTAINE.
+    pub refus: Vec<(i64, String)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
     pub id: Option<i64>,
     pub name: String,
     pub output_type: Option<String>,
     pub output_device_id: Option<String>,
-    pub volume: i32,
+    /// Volume persiste, en POUR-CENT (0..100), a virgule.
+    ///
+    /// #2886 — c'etait un `i32`, et la colonne un `INTEGER`. L'ecriture
+    /// arrondissait `(v * 100).round()`, ce qui coute jusqu'a 3 dB vers
+    /// -37 dB et, **sous 0,005 lineaire (= -46,0205999133 dB exactement)**,
+    /// tombait a 0 : la zone se rallumait MUETTE au redemarrage. La valeur
+    /// commandee est desormais persistee telle quelle.
+    ///
+    /// L'echelle reste 0..100 et non 0..1 : ainsi aucune ligne existante n'a
+    /// besoin d'etre convertie, seul le TYPE de la colonne s'elargit.
+    pub volume: f64,
     pub muted: bool,
     pub online: bool,
     pub gapless_enabled: bool,
@@ -491,8 +619,8 @@ pub fn zone_creee_contrat_client(
         // Le TYPE et non la chaine « off » : un renommage de variante suit ici
         // tout seul.
         obj.insert("repeat".into(), json!(crate::playback::RepeatMode::Off));
-        let vol = zone.map(|z| z.volume).unwrap_or(50);
-        let lineaire = vol as f64 / 100.0;
+        let vol = zone.map(|z| z.volume).unwrap_or(50.0);
+        let lineaire = vol / 100.0;
         obj.insert("volume".into(), json!(lineaire));
         // #1274 — la lecture en dB accompagne le volume PARTOUT où il sort,
         // ici comprise : ce contrat-ci est celui d'une zone qui vient de
@@ -508,6 +636,169 @@ pub fn zone_creee_contrat_client(
 
 pub struct ZoneRepo {
     db: Arc<dyn DbBackend>,
+}
+
+/// Bilan d'une fusion explicite de deux zones (DUP-1, phase 1) : ce qui a
+/// suivi le doublon jusqu'à la cible, et ce qui a été laissé exprès.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RapportDeFusion {
+    pub doublon: i64,
+    pub cible: i64,
+    /// Lignes de file d'attente passées du doublon à la cible.
+    pub file_reportee: usize,
+    /// La cible avait déjà une file : celle du doublon n'y a pas été mêlée.
+    pub file_conservee_sur_la_cible: bool,
+    pub alarmes_reportees: usize,
+    pub historique_reporte: usize,
+    /// Réglages de `settings` posés sur la cible parce qu'elle n'en avait pas.
+    pub reglages_reportes: usize,
+    pub groupes_reecrits: bool,
+    pub zone_par_defaut_reportee: bool,
+}
+
+/// Une base ancienne ou partielle : la table ou la colonne n'existe pas.
+fn schema_incomplet(e: &str) -> bool {
+    e.contains("no such table") || e.contains("no such column") || e.contains("does not exist")
+}
+
+/// Les réglages d'une zone qui vivent dans `settings` : le préfixe de
+/// convention `zone_{id}_…` et les quatre clés qui l'ignorent (calibration
+/// DAC, pièce, réponse impulsionnelle, renderer UPnP).
+fn cles_de_zone(id: i64) -> (String, [String; 4]) {
+    (
+        format!("zone_{id}_"),
+        [
+            format!("dac_profile_{id}"),
+            format!("room_profile_{id}"),
+            format!("ir_path_{id}"),
+            format!("upnp_renderer_udn_{id}"),
+        ],
+    )
+}
+
+/// Reporte sur `cible` les réglages `settings` de `doublon` qu'elle n'a pas
+/// encore : un réglage explicite de la cible ne cède jamais, et les clés du
+/// doublon ne sont pas effacées (un report est réversible). `connues` sert de
+/// mémoire : ce qui vient d'être posé compte comme posé pour la suite.
+fn reporter_les_cles_de_zone(
+    settings: &super::settings_repo::SettingsRepo,
+    connues: &mut std::collections::HashMap<String, String>,
+    apportees: &[(String, String)],
+    doublon: i64,
+    cible: i64,
+) -> Result<usize, String> {
+    let (prefixe_doublon, exactes_doublon) = cles_de_zone(doublon);
+    let (prefixe_cible, exactes_cible) = cles_de_zone(cible);
+    let mut reportees = 0usize;
+    for (cle, valeur) in apportees {
+        let vers = if let Some(quoi) = cle.strip_prefix(&prefixe_doublon) {
+            format!("{prefixe_cible}{quoi}")
+        } else if let Some(rang) = exactes_doublon.iter().position(|c| c == cle) {
+            exactes_cible[rang].clone()
+        } else {
+            continue;
+        };
+        if valeur.trim().is_empty() {
+            continue;
+        }
+        if connues.get(&vers).is_some_and(|v| !v.trim().is_empty()) {
+            continue;
+        }
+        settings.set(&vers, valeur)?;
+        connues.insert(vers.clone(), valeur.clone());
+        reportees += 1;
+        tracing::info!(depuis = %cle, vers = %vers, "zone_reglage_reporte_depuis_doublon");
+    }
+    Ok(reportees)
+}
+
+/// Remplace `doublon` par `cible` dans une liste JSON d'identifiants de zones
+/// (`[4, 20]`), sans créer de répétition. `None` si rien ne change ou si la
+/// liste n'est pas lisible : on ne réécrit pas ce qu'on ne comprend pas.
+fn remplacer_dans_la_liste(brut: &str, doublon: i64, cible: i64) -> Option<String> {
+    let ids: Vec<i64> = serde_json::from_str(brut).ok()?;
+    if !ids.contains(&doublon) {
+        return None;
+    }
+    let mut sortie: Vec<i64> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = if id == doublon { cible } else { id };
+        if !sortie.contains(&id) {
+            sortie.push(id);
+        }
+    }
+    serde_json::to_string(&sortie).ok()
+}
+
+/// Réécrit le réglage `zone_groups` (liste JSON de groupes portant `zone_ids`
+/// et `leader_id`) pour que le doublon y cède sa place à la cible.
+fn reecrire_les_groupes(brut: &str, doublon: i64, cible: i64) -> Option<String> {
+    let mut groupes: Vec<serde_json::Value> = serde_json::from_str(brut).ok()?;
+    let mut change = false;
+    for groupe in groupes.iter_mut() {
+        if let Some(ids) = groupe.get("zone_ids").and_then(|v| v.as_array()).cloned() {
+            let mut sortie: Vec<i64> = Vec::with_capacity(ids.len());
+            for id in ids.iter().filter_map(|v| v.as_i64()) {
+                let id = if id == doublon {
+                    change = true;
+                    cible
+                } else {
+                    id
+                };
+                if !sortie.contains(&id) {
+                    sortie.push(id);
+                }
+            }
+            groupe["zone_ids"] = serde_json::json!(sortie);
+        }
+        if groupe.get("leader_id").and_then(|v| v.as_i64()) == Some(doublon) {
+            groupe["leader_id"] = serde_json::json!(cible);
+            change = true;
+        }
+    }
+    if !change {
+        return None;
+    }
+    serde_json::to_string(&groupes).ok()
+}
+
+/// Ce qu'a fait une demande de création de zone soumise au réglage
+/// « Créer automatiquement les zones » (`zone_auto_create`).
+///
+/// Trois issues, et pas deux : refuser une naissance n'est pas la même chose
+/// que retrouver une zone connue. Les cinq chemins de découverte qui
+/// ignoraient le réglage (#3529) ne regardaient que le booléen `created` de
+/// [`ZoneRepo::get_or_create`], lequel ne dit rien du réglage — il ne pouvait
+/// donc pas les avertir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationDeZone {
+    /// Une zone vient de naître.
+    Creee(i64),
+    /// Une zone existait déjà pour cet appareil, visible ou masquée. La
+    /// reconnexion d'une zone connue n'est JAMAIS soumise au réglage.
+    Existante(i64),
+    /// `zone_auto_create` est décoché et cet appareil n'a jamais eu de zone.
+    Refusee,
+}
+
+impl CreationDeZone {
+    /// L'identifiant de la zone, sauf quand la création a été refusée.
+    pub fn id(&self) -> Option<i64> {
+        match self {
+            Self::Creee(id) | Self::Existante(id) => Some(*id),
+            Self::Refusee => None,
+        }
+    }
+
+    /// Vrai seulement quand une zone vient de naître.
+    pub fn vient_de_naitre(&self) -> bool {
+        matches!(self, Self::Creee(_))
+    }
+
+    /// Vrai quand le réglage a bloqué la naissance.
+    pub fn refusee(&self) -> bool {
+        matches!(self, Self::Refusee)
+    }
 }
 
 impl ZoneRepo {
@@ -663,6 +954,81 @@ impl ZoneRepo {
         }
     }
 
+    /// Le réglage « Créer automatiquement les zones ».
+    ///
+    /// Absent ou illisible vaut **coché** : c'est le défaut posé par
+    /// `routes/system/config.rs`, et une base neuve ne doit pas se comporter
+    /// comme si l'utilisateur avait décoché.
+    ///
+    /// Cette lecture était recopiée à l'identique en cinq endroits de
+    /// `tune-server` (#1770 en avait ajouté une sixième). Elle vit désormais
+    /// ici, une seule fois : `git grep '"zone_auto_create"'` sur le dépôt doit
+    /// ne rendre que cette ligne, le défaut de `system/config.rs` et la liste
+    /// de `secrets.rs`.
+    pub fn zone_auto_create_autorise(&self) -> bool {
+        super::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .get("zone_auto_create")
+            .ok()
+            .flatten()
+            .map(|v| v != "false")
+            .unwrap_or(true)
+    }
+
+    /// [`Self::get_or_create`], mais soumis au réglage « Créer automatiquement
+    /// les zones ».
+    ///
+    /// #3529 — la garde était recopiée dans cinq chemins de création et
+    /// **absente** de cinq autres, dont trois qui tournent seuls, sans aucun
+    /// geste de l'utilisateur : le lot SSDP de démarrage, le re-sondage des
+    /// DLNA mémorisés, et les sondeurs Squeezebox et HQPlayer. C'est la
+    /// duplication qui les a laissés passer, la garde descend donc d'un étage.
+    ///
+    /// Règle : **seule la naissance d'une zone est soumise au réglage**. Un
+    /// appareil qui a déjà une zone est rendu [`CreationDeZone::Existante`]
+    /// sans consulter quoi que ce soit, pour que la reconnexion
+    /// (`set_online_by_device`) et le rattachement d'identité
+    /// (`set_identity`) continuent de fonctionner réglage décoché — c'est la
+    /// condition posée par l'issue, et c'est aussi ce que faisaient déjà les
+    /// cinq chemins gardés.
+    ///
+    /// `origine` nomme le chemin appelant. Il n'apparaît que dans le journal,
+    /// pour qu'un refus soit attribuable sans lire le code.
+    pub fn get_or_create_si_autorise(
+        &self,
+        name: &str,
+        output_type: Option<&str>,
+        output_device_id: &str,
+        origine: &str,
+    ) -> Result<CreationDeZone, String> {
+        // Même question, et dans le même ordre, que la voie rapide de
+        // `get_or_create` : une zone masquée compte comme existante ici aussi,
+        // sinon un appareil supprimé repasserait par la case création.
+        if let Some(id) = self
+            .get_by_device_id(output_device_id)?
+            .and_then(|zone| zone.id)
+        {
+            return Ok(CreationDeZone::Existante(id));
+        }
+
+        if !self.zone_auto_create_autorise() {
+            tracing::info!(
+                name = %name,
+                device_id = %output_device_id,
+                origine = %origine,
+                "zone_auto_create_refusee"
+            );
+            return Ok(CreationDeZone::Refusee);
+        }
+
+        // La course reste possible entre le contrôle ci-dessus et l'INSERT :
+        // `get_or_create` la rattrape, et un `created = false` inattendu se
+        // lit alors comme une zone existante.
+        match self.get_or_create(name, output_type, output_device_id)? {
+            (id, true) => Ok(CreationDeZone::Creee(id)),
+            (id, false) => Ok(CreationDeZone::Existante(id)),
+        }
+    }
+
     /// Remove duplicate zones that share the same output_device_id, keeping only
     /// the one with the lowest id. Returns the number of duplicates removed.
     ///
@@ -762,36 +1128,20 @@ impl ZoneRepo {
             let Some((survivante, doublons)) = ids.split_first() else {
                 continue;
             };
-            let prefixe_survivante = format!("zone_{survivante}_");
             for doublon in doublons {
-                let prefixe_doublon = format!("zone_{doublon}_");
-                for (cle, valeur) in &apportees {
-                    let Some(quoi) = cle.strip_prefix(&prefixe_doublon) else {
-                        continue;
-                    };
-                    if valeur.trim().is_empty() {
-                        continue;
+                match reporter_les_cles_de_zone(
+                    &settings,
+                    &mut connues,
+                    &apportees,
+                    *doublon,
+                    *survivante,
+                ) {
+                    Ok(n) => reportees += n,
+                    Err(e) if manque(&e) => {
+                        tracing::warn!(error = %e, "zone_reglages_table_absente_report_saute");
+                        return Ok(());
                     }
-                    let cible = format!("{prefixe_survivante}{quoi}");
-                    let deja_pose = connues.get(&cible).is_some_and(|v| !v.trim().is_empty());
-                    if deja_pose {
-                        continue;
-                    }
-                    match settings.set(&cible, valeur) {
-                        Ok(()) => {}
-                        Err(e) if manque(&e) => {
-                            tracing::warn!(error = %e, "zone_reglages_table_absente_report_saute");
-                            return Ok(());
-                        }
-                        Err(e) => return Err(e),
-                    }
-                    connues.insert(cible.clone(), valeur.clone());
-                    reportees += 1;
-                    tracing::info!(
-                        depuis = %cle,
-                        vers = %cible,
-                        "zone_reglage_reporte_depuis_doublon"
-                    );
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -800,6 +1150,251 @@ impl ZoneRepo {
             tracing::info!(reglages = reportees, "zone_reglages_reportes");
         }
         Ok(())
+    }
+
+    /// Fusionne explicitement la zone `doublon` dans la zone `cible` (DUP-1,
+    /// phase 1).
+    ///
+    /// Le dédoublonnage du démarrage ([`Self::deduplicate`]) ne voit que des
+    /// zones au même `output_device_id`. Or les doublons mesurés sur le
+    /// serveur de test le 05/09 portent des identifiants **différents** pour
+    /// le même appareil : l'UDN racine et l'UDN du sous-appareil `_MR` d'un
+    /// Sonos, l'identifiant IP d'hier et le MAC d'aujourd'hui d'un Mac en
+    /// AirPlay. Ici, l'appelant a déjà établi que c'est le même appareil (la
+    /// phase 0 nomme les groupes, `cle_appareil` côté serveur) ; la fusion ne
+    /// décide rien d'elle-même et n'est jamais automatique.
+    ///
+    /// Ce qui suit le doublon, dans l'ordre : les colonnes de réglage (même
+    /// règle que [`Self::merge_duplicate_settings`] : la cible restée au défaut
+    /// prend la valeur du doublon, un réglage explicite ne cède jamais), les
+    /// clés `settings` de la zone, la file d'attente (seulement si la cible
+    /// n'en a pas : on ne mêle pas deux files), les alarmes (colonne et liste
+    /// `multi_zone_ids`), l'historique d'écoute, la file de flux héritée, les
+    /// groupes de zones et la zone par défaut. Puis le doublon est **masqué**,
+    /// pas supprimé : son identifiant reste occupé, et la découverte
+    /// (`is_device_hidden`) ne le fait pas renaître.
+    ///
+    /// Les étapes ne sont pas une seule transaction : chacune ne fait que
+    /// reporter ou réaffecter, aucune n'efface, et le masquage vient en
+    /// dernier. Une panne au milieu laisse deux zones et des réglages en
+    /// double, jamais une perte.
+    pub fn fusionner(&self, doublon: i64, cible: i64) -> Result<RapportDeFusion, String> {
+        if doublon == cible {
+            return Err("une zone ne se fusionne pas dans elle-même".to_string());
+        }
+        if self.get(doublon)?.is_none() {
+            return Err(format!("zone {doublon} inconnue"));
+        }
+        if self.get(cible)?.is_none() {
+            return Err(format!("zone {cible} inconnue"));
+        }
+        self.reporter_les_colonnes_vers(doublon, cible)?;
+        let reglages_reportes = self.reporter_les_reglages_vers(doublon, cible)?;
+        let (file_reportee, file_conservee_sur_la_cible) =
+            self.reporter_la_file_vers(doublon, cible)?;
+        let alarmes_reportees = self.reporter_les_alarmes_vers(doublon, cible)?;
+        let historique_reporte = self.reporter_une_table_vers("listen_history", doublon, cible)?;
+        self.reporter_une_table_vers("streaming_queue", doublon, cible)?;
+        let (groupes_reecrits, zone_par_defaut_reportee) =
+            self.reporter_les_references_vers(doublon, cible)?;
+        self.delete(doublon)?;
+        tracing::info!(
+            doublon,
+            cible,
+            file_reportee,
+            reglages_reportes,
+            alarmes_reportees,
+            "zone_fusionnee"
+        );
+        Ok(RapportDeFusion {
+            doublon,
+            cible,
+            file_reportee,
+            file_conservee_sur_la_cible,
+            alarmes_reportees,
+            historique_reporte,
+            reglages_reportes,
+            groupes_reecrits,
+            zone_par_defaut_reportee,
+        })
+    }
+
+    fn marque(&self, n: usize) -> String {
+        match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(n),
+            Engine::Postgres => PostgresDialect.placeholder(n),
+        }
+    }
+
+    /// Les colonnes de réglage de `cible` restées au défaut prennent la valeur
+    /// de `doublon` — [`sql::merge_duplicate_settings`] pour deux zones
+    /// nommées au lieu d'un regroupement par identifiant.
+    fn reporter_les_colonnes_vers(&self, doublon: i64, cible: i64) -> Result<(), String> {
+        let (p1, p2, p3) = (self.marque(1), self.marque(2), self.marque(3));
+        let mut instructions: Vec<String> = Vec::new();
+        for (colonne, defaut) in sql::REGLAGES_A_FUSIONNER {
+            instructions.push(format!(
+                "UPDATE zones SET {colonne} = (SELECT d.{colonne} FROM zones d WHERE d.id = {p1}) \
+                 WHERE id = {p2} AND COALESCE({colonne}, {defaut}) = {defaut} \
+                   AND EXISTS (SELECT 1 FROM zones d WHERE d.id = {p3} \
+                               AND COALESCE(d.{colonne}, {defaut}) <> {defaut})"
+            ));
+        }
+        for colonne in sql::REGLAGES_NULLABLES {
+            instructions.push(format!(
+                "UPDATE zones SET {colonne} = (SELECT d.{colonne} FROM zones d WHERE d.id = {p1}) \
+                 WHERE id = {p2} AND {colonne} IS NULL \
+                   AND EXISTS (SELECT 1 FROM zones d WHERE d.id = {p3} AND d.{colonne} IS NOT NULL)"
+            ));
+        }
+        instructions.push(format!(
+            "UPDATE zones SET dsd_mode = (SELECT d.dsd_mode FROM zones d WHERE d.id = {p1}) \
+             WHERE id = {p2} AND COALESCE(dsd_mode, 'auto') = 'auto' \
+               AND EXISTS (SELECT 1 FROM zones d WHERE d.id = {p3} \
+                           AND COALESCE(d.dsd_mode, 'auto') <> 'auto')"
+        ));
+        let params: [&dyn ToSqlValue; 3] = [&doublon, &cible, &doublon];
+        for instruction in &instructions {
+            match self.db.execute(instruction, &params) {
+                Ok(_) => {}
+                Err(e) if schema_incomplet(&e) => {
+                    tracing::warn!(error = %e, "zone_fusion_colonne_absente_sautee");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn reporter_les_reglages_vers(&self, doublon: i64, cible: i64) -> Result<usize, String> {
+        let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let mut connues: std::collections::HashMap<String, String> = match settings.all() {
+            Ok(v) => v.into_iter().collect(),
+            Err(e) if schema_incomplet(&e) => {
+                tracing::warn!(error = %e, "zone_fusion_reglages_table_absente");
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
+        };
+        let apportees: Vec<(String, String)> = connues
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        reporter_les_cles_de_zone(&settings, &mut connues, &apportees, doublon, cible)
+    }
+
+    /// La file du doublon passe à la cible **seulement si la cible n'en a
+    /// pas** : deux files ne se mêlent pas, et celle de la zone en ligne est
+    /// celle que l'utilisateur voit.
+    fn reporter_la_file_vers(&self, doublon: i64, cible: i64) -> Result<(usize, bool), String> {
+        let compte = format!(
+            "SELECT COUNT(*) FROM queue_items WHERE zone_id = {}",
+            self.marque(1)
+        );
+        let params: [&dyn ToSqlValue; 1] = [&cible];
+        let deja = match self.db.query_many_strong(&compte, &params) {
+            Ok(lignes) => lignes
+                .first()
+                .and_then(|l| l.first())
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            Err(e) if schema_incomplet(&e) => return Ok((0, false)),
+            Err(e) => return Err(e),
+        };
+        if deja > 0 {
+            return Ok((0, true));
+        }
+        Ok((
+            self.reporter_une_table_vers("queue_items", doublon, cible)?,
+            false,
+        ))
+    }
+
+    /// `UPDATE {table} SET zone_id = cible WHERE zone_id = doublon`, tolérant
+    /// aux tables héritées absentes.
+    fn reporter_une_table_vers(
+        &self,
+        table: &str,
+        doublon: i64,
+        cible: i64,
+    ) -> Result<usize, String> {
+        let sql = format!(
+            "UPDATE {table} SET zone_id = {} WHERE zone_id = {}",
+            self.marque(1),
+            self.marque(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&cible, &doublon];
+        match self.db.execute(&sql, &params) {
+            Ok(n) => Ok(n),
+            Err(e) if schema_incomplet(&e) => {
+                tracing::warn!(table, error = %e, "zone_fusion_table_absente_sautee");
+                Ok(0)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Les alarmes : la colonne `zone_id`, puis la liste `multi_zone_ids`.
+    fn reporter_les_alarmes_vers(&self, doublon: i64, cible: i64) -> Result<usize, String> {
+        let n = self.reporter_une_table_vers("alarms", doublon, cible)?;
+        let lignes = match self.db.query_many_strong(
+            "SELECT id, multi_zone_ids FROM alarms WHERE multi_zone_ids IS NOT NULL",
+            &[],
+        ) {
+            Ok(l) => l,
+            Err(e) if schema_incomplet(&e) => return Ok(n),
+            Err(e) => return Err(e),
+        };
+        let maj = format!(
+            "UPDATE alarms SET multi_zone_ids = {} WHERE id = {}",
+            self.marque(1),
+            self.marque(2)
+        );
+        for ligne in &lignes {
+            let Some(id) = ligne.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(brut) = ligne.get(1).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let Some(reecrit) = remplacer_dans_la_liste(&brut, doublon, cible) else {
+                continue;
+            };
+            let params: [&dyn ToSqlValue; 2] = [&reecrit, &id];
+            self.db.execute(&maj, &params)?;
+        }
+        Ok(n)
+    }
+
+    /// Les références par valeur dans `settings` : `zone_groups` et
+    /// `default_zone_id`.
+    fn reporter_les_references_vers(
+        &self,
+        doublon: i64,
+        cible: i64,
+    ) -> Result<(bool, bool), String> {
+        let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let mut groupes_reecrits = false;
+        if let Some(reecrit) = settings
+            .get("zone_groups")
+            .ok()
+            .flatten()
+            .and_then(|brut| reecrire_les_groupes(&brut, doublon, cible))
+        {
+            settings.set("zone_groups", &reecrit)?;
+            groupes_reecrits = true;
+        }
+        let mut zone_par_defaut_reportee = false;
+        if settings
+            .get("default_zone_id")
+            .ok()
+            .flatten()
+            .is_some_and(|valeur| valeur.trim() == doublon.to_string())
+        {
+            settings.set("default_zone_id", &cible.to_string())?;
+            zone_par_defaut_reportee = true;
+        }
+        Ok((groupes_reecrits, zone_par_defaut_reportee))
     }
 
     /// Rendre leur prefixe `local:` aux zones locales qui l'ont perdu.
@@ -866,7 +1461,193 @@ impl ZoneRepo {
         Ok(())
     }
 
-    pub fn update_volume(&self, id: i64, volume: i32) -> Result<(), String> {
+    /// Ecrit le volume en pour-cent (0..100), **sans arrondi** (#2886).
+    /// Ce que chaque zone LOCALE sait de son identite (#2269).
+    ///
+    /// Les lignes masquees sont incluses : une zone supprimee detient encore
+    /// son `output_device_id`, et l'index unique partiel
+    /// `idx_zones_output_device_id` ne fait pas la difference. C'est
+    /// `identite_de_sortie::decider` qui refuse ensuite de la deplacer.
+    ///
+    /// Base anterieure a la colonne : liste vide plutot qu'une erreur — le
+    /// meme repli que `ages_depuis_derniere_vue`.
+    pub fn sorties_locales_et_leur_identite(
+        &self,
+    ) -> Result<Vec<crate::outputs::identite_de_sortie::ZoneLocale>, String> {
+        const SQL: &str = "SELECT id, output_device_id, \
+             COALESCE(output_endpoint_id, ''), COALESCE(is_hidden, 0) \
+             FROM zones WHERE output_device_id LIKE 'local:%' ORDER BY id";
+        let lignes = match self.db.query_many_strong(SQL, &[]) {
+            Ok(l) => l,
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(lignes
+            .iter()
+            .filter_map(|l| {
+                let endpoint = l.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+                Some(crate::outputs::identite_de_sortie::ZoneLocale {
+                    id: l.first()?.as_i64()?,
+                    output_device_id: l.get(1)?.as_string()?,
+                    output_endpoint_id: (!endpoint.is_empty()).then_some(endpoint),
+                    masquee: l.get(3).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+                })
+            })
+            .collect())
+    }
+
+    /// L'identifiant d'endpoint stable enregistre pour cette sortie, s'il y en
+    /// a un.
+    ///
+    /// C'est ce que `recreate_local_and_play` demande quand le peripherique
+    /// n'est PAS enregistre : sans lui, la sortie recreee ne connait que le
+    /// NOM de la zone, et c'est le nom qui part dans la resolution.
+    pub fn endpoint_id_de_la_sortie(&self, device_id: &str) -> Option<String> {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql =
+            format!("SELECT output_endpoint_id FROM zones WHERE output_device_id = {placeholder}");
+        let params: [&dyn ToSqlValue; 1] = [&device_id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+            .filter(|id| !id.trim().is_empty())
+    }
+
+    /// Les zones dont `zones.mac` vaut cette MAC (#3919).
+    ///
+    /// `zones.mac` est ecrite a la CREATION de la zone par [`Self::set_identity`],
+    /// depuis `DiscoveredDevice::mac_address` — pour l'AirPlay la MAC portee
+    /// par le nom d'instance `_raop` (« 800A805D4DEE@DMP-A8 »), sinon le TXT
+    /// `deviceid`/`id`, a defaut la table ARP. La documentation de
+    /// `set_identity` la nomme deja « the durable cross-protocol key: it
+    /// survives UUID changes AND DHCP renumbering » — mais rien ne la relisait
+    /// quand l'appareil revenait a une autre adresse, et la decouverte creait
+    /// alors une zone NEUVE a cote de celle qui portait les reglages.
+    ///
+    /// Les lignes MASQUEES sont incluses : une zone supprimee detient encore
+    /// son `output_device_id`, et la re-ancrer sans la demasquer est la seule
+    /// facon de garder la suppression effective au changement d'adresse
+    /// suivant — c'est ce que fait deja `find_hidden_id_by_name`.
+    ///
+    /// Base anterieure a la colonne `mac` : liste vide plutot qu'une erreur,
+    /// meme repli que [`Self::find_visible_zone_by_identity`].
+    pub fn zones_par_mac(&self, mac: &str) -> Vec<ZoneParMac> {
+        let mac = mac.trim();
+        if mac.is_empty() {
+            return Vec::new();
+        }
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT id, COALESCE(output_device_id, ''), COALESCE(output_type, ''), \
+             COALESCE(is_hidden, 0) FROM zones \
+             WHERE mac IS NOT NULL AND mac <> '' AND UPPER(mac) = UPPER({placeholder}) \
+             ORDER BY id"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&mac];
+        // Lecture FORTE, meme raison que `find_visible_zone_by_identity` : une
+        // zone creee a l'instant doit etre visible de l'evenement de
+        // decouverte suivant.
+        match self.db.query_many_strong(&sql, &params) {
+            Ok(lignes) => lignes
+                .iter()
+                .filter_map(|l| {
+                    Some(ZoneParMac {
+                        id: l.first()?.as_i64()?,
+                        output_device_id: l.get(1)?.as_string()?,
+                        output_type: l.get(2)?.as_string()?,
+                        masquee: l.get(3).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+                    })
+                })
+                .collect(),
+            Err(e) => {
+                tracing::debug!(error = %e, "zones_par_mac_indisponible");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Ecrire l'identifiant d'endpoint stable d'une zone.
+    pub fn update_output_endpoint_id(&self, id: i64, endpoint_id: &str) -> Result<(), String> {
+        let sql = self.update_field_sql("output_endpoint_id");
+        let params: [&dyn ToSqlValue; 2] = [&endpoint_id, &id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Confronter les zones locales au parc que l'enumeration vient de rendre,
+    /// et appliquer ce que la regle autorise (#2269).
+    ///
+    /// La DECISION est prise ailleurs — `outputs::identite_de_sortie`, une
+    /// fonction pure, eprouvee sans materiel. Ici on ne fait qu'ecrire ce
+    /// qu'elle a autorise, et rendre de quoi le journaliser.
+    ///
+    /// ⚠️ Ne fusionne, ne cree et ne supprime aucune zone. Une re-association
+    /// qui reviendrait a reunir deux zones est REFUSEE, pas arbitree.
+    pub fn appliquer_identite_de_sortie(
+        &self,
+        enumerees: &[crate::outputs::identite_de_sortie::SortieEnumeree],
+    ) -> Result<RapportDIdentite, String> {
+        use crate::outputs::identite_de_sortie::Decision;
+
+        // Un parc VIDE ne decide rien. L'enumeration peut echouer — pilote
+        // happe par une autre application, balayage interrompu — et prendre
+        // ce silence pour « plus aucun peripherique » ferait refuser toutes
+        // les zones locales d'un coup. Meme garde que celle que #3737 reclame
+        // nommement pour son point 1.
+        if enumerees.is_empty() {
+            return Ok(RapportDIdentite::default());
+        }
+        let zones = self.sorties_locales_et_leur_identite()?;
+        if zones.is_empty() {
+            return Ok(RapportDIdentite::default());
+        }
+        let mut rapport = RapportDIdentite::default();
+        for decision in crate::outputs::identite_de_sortie::decider(&zones, enumerees) {
+            match decision {
+                Decision::Rien { .. } => {}
+                Decision::Apprend {
+                    zone_id,
+                    endpoint_id,
+                } => {
+                    self.update_output_endpoint_id(zone_id, &endpoint_id)?;
+                    rapport.apprises.push((zone_id, endpoint_id));
+                }
+                Decision::Reassocie {
+                    zone_id,
+                    ancien_device_id,
+                    nouveau_device_id,
+                    endpoint_id,
+                } => {
+                    // `output_device_id` d'abord : c'est LUI l'identite de la
+                    // zone, et tout ce qui s'y accroche suit la ligne, pas la
+                    // clef. L'identifiant d'endpoint est deja le bon.
+                    self.update_output_device(zone_id, &nouveau_device_id)?;
+                    rapport.reassociees.push(Reassociation {
+                        zone_id,
+                        ancien_device_id,
+                        nouveau_device_id,
+                        endpoint_id,
+                    });
+                }
+                Decision::Refuse { zone_id, refus } => {
+                    rapport.refus.push((zone_id, refus.motif()));
+                }
+            }
+        }
+        Ok(rapport)
+    }
+
+    pub fn update_volume(&self, id: i64, volume: f64) -> Result<(), String> {
         let sql = self.update_field_sql("volume");
         let params: [&dyn ToSqlValue; 2] = [&volume, &id];
         self.db.execute(&sql, &params)?;
@@ -874,7 +1655,7 @@ impl ZoneRepo {
     }
 
     pub fn update_muted(&self, id: i64, muted: bool) -> Result<(), String> {
-        let val: String = if muted { "1".into() } else { "0".into() };
+        let val: i64 = i64::from(muted);
         let sql = self.update_field_sql("muted");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
         self.db.execute(&sql, &params)?;
@@ -903,15 +1684,48 @@ impl ZoneRepo {
     }
 
     pub fn update_online(&self, id: i64, online: bool) -> Result<(), String> {
-        let val: String = if online { "1".into() } else { "0".into() };
-        let sql = self.update_field_sql("online");
+        let val: i64 = i64::from(online);
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        if online {
+            let engine = self.db.engine();
+            let sql = self.dialect_sql(
+                |d| sql::marquer_en_ligne_par_id(d, engine),
+                |d| sql::marquer_en_ligne_par_id(d, engine),
+            );
+            match self.db.execute(&sql, &params) {
+                Ok(_) => return Ok(()),
+                // Base anterieure a la colonne : on ecrit au moins `online`.
+                Err(e) if e.contains("no such column") || e.contains("does not exist") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let sql = self.update_field_sql("online");
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
+    /// L'age, en secondes, de la derniere reponse de chaque zone qui en a une
+    /// (DUP-1, phase 2). Une zone absente de la carte n'a jamais ete vue
+    /// depuis la pose de la colonne. Base anterieure a la colonne : carte vide.
+    pub fn ages_depuis_derniere_vue(&self) -> Result<std::collections::HashMap<i64, i64>, String> {
+        let lignes = match self
+            .db
+            .query_many_strong(sql::ages_depuis_derniere_vue(self.db.engine()), &[])
+        {
+            Ok(l) => l,
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                return Ok(Default::default());
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(lignes
+            .iter()
+            .filter_map(|l| Some((l.first()?.as_i64()?, l.get(1)?.as_i64()?)))
+            .collect())
+    }
+
     pub fn update_gapless_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
-        let val: String = if enabled { "1".into() } else { "0".into() };
+        let val: i64 = i64::from(enabled);
         let sql = self.update_field_sql("gapless_enabled");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
         self.db.execute(&sql, &params)?;
@@ -919,7 +1733,7 @@ impl ZoneRepo {
     }
 
     pub fn update_fixed_volume(&self, id: i64, enabled: bool) -> Result<(), String> {
-        let val: String = if enabled { "1".into() } else { "0".into() };
+        let val: i64 = i64::from(enabled);
         let sql = self.update_field_sql("fixed_volume");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
         self.db.execute(&sql, &params)?;
@@ -927,7 +1741,7 @@ impl ZoneRepo {
     }
 
     pub fn update_autoplay_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
-        let val: String = if enabled { "1".into() } else { "0".into() };
+        let val: i64 = i64::from(enabled);
         let sql = self.update_field_sql("autoplay_enabled");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
         visible_setting_write(id, "autoplay_enabled", self.db.execute(&sql, &params))
@@ -1470,9 +2284,23 @@ impl ZoneRepo {
     }
 
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
-        let val: String = if online { "1".into() } else { "0".into() };
-        let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
+        let val: i64 = i64::from(online);
         let params: [&dyn ToSqlValue; 2] = [&val, &device_id];
+        if online {
+            // DUP-1 (phase 2) : le passage en ligne date la derniere reponse.
+            let engine = self.db.engine();
+            let sql = self.dialect_sql(
+                |d| sql::marquer_en_ligne_par_appareil(d, engine),
+                |d| sql::marquer_en_ligne_par_appareil(d, engine),
+            );
+            match self.db.execute(&sql, &params) {
+                Ok(n) => return Ok(n),
+                // Base anterieure a la colonne : on ecrit au moins `online`.
+                Err(e) if e.contains("no such column") || e.contains("does not exist") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
         self.db.execute(&sql, &params)
     }
 
@@ -1504,13 +2332,63 @@ impl ZoneRepo {
     /// twins, leaving both "This Computer" and "Cet ordinateur" in the picker
     /// (Philippe Vella). Only the exact generic labels are touched — a
     /// user-renamed zone is never hidden. Returns the number hidden.
+    ///
+    /// ⚠️ **La zone gardée doit elle-même porter l'étiquette générique**
+    /// (#1770). Sans cette condition, appeler cette fonction avec une zone
+    /// nommée « Speakers » masquait la zone « This Computer » de l'autre
+    /// moteur audio : il n'y avait alors aucune jumelle, seulement une zone
+    /// étrangère effacée en silence — et une zone masquée ne revient jamais
+    /// par la découverte (`get_or_create` la rend telle quelle). Le scénario
+    /// est celui de la bascule ASIO → WASAPI : l'utilisateur retrouvait sa
+    /// zone ASIO absente du sélecteur au démarrage suivant.
+    ///
+    /// Une zone gardée introuvable ou renommée par l'utilisateur ne masque
+    /// donc rien, et rend `Ok(0)`.
     pub fn hide_duplicate_generic_local(&self, keep_id: i64) -> Result<usize, String> {
+        let gardee_est_generique = self
+            .get(keep_id)?
+            .is_some_and(|z| crate::config::est_etiquette_locale_generique(&z.name));
+        if !gardee_est_generique {
+            tracing::debug!(
+                zone_id = keep_id,
+                "zone_gardee_non_generique_aucun_masquage"
+            );
+            return Ok(0);
+        }
         let sql = self.dialect_sql(
             sql::hide_duplicate_generic_local,
             sql::hide_duplicate_generic_local,
         );
         let params: [&dyn ToSqlValue; 1] = [&keep_id];
         self.db.execute(&sql, &params)
+    }
+
+    /// Une zone locale VISIBLE porte-t-elle déjà l'étiquette générique, sur un
+    /// AUTRE appareil que `device_id` ? (#1770)
+    ///
+    /// C'est la mesure que consulte [`crate::config::nom_de_zone_locale`]
+    /// avant de nommer une zone qu'on s'apprête à créer. L'exclusion par
+    /// `device_id` compte : la zone de l'appareil courant, si elle existe, est
+    /// justement celle qu'on ne veut pas compter contre lui-même.
+    ///
+    /// Base antérieure à `is_hidden` / `output_device_id` : rend `false`,
+    /// c'est-à-dire le comportement d'avant le correctif.
+    pub fn etiquette_generique_locale_prise(&self, device_id: &str) -> Result<bool, String> {
+        let sql = self.dialect_sql(
+            sql::etiquette_generique_locale_prise,
+            sql::etiquette_generique_locale_prise,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&device_id];
+        match self.db.query_many_strong(&sql, &params) {
+            Ok(lignes) => Ok(lignes
+                .first()
+                .and_then(|l| l.first())
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0),
+            Err(e) if schema_incomplet(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Soft-delete EVERY zone and clear the free-tier activation markers.
@@ -1591,10 +2469,9 @@ impl ZoneRepo {
     }
 
     pub fn update_dsp(&self, id: i64, preset_id: Option<i64>, enabled: bool) -> Result<(), String> {
-        let preset_str: Option<String> = preset_id.map(|v| v.to_string());
-        let en: String = if enabled { "1".into() } else { "0".into() };
+        let en: i64 = i64::from(enabled);
         let sql = self.dialect_sql(sql::update_dsp, sql::update_dsp);
-        let params: [&dyn ToSqlValue; 3] = [&preset_str, &en, &id];
+        let params: [&dyn ToSqlValue; 3] = [&preset_id, &en, &id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -1670,7 +2547,9 @@ fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
         output_type: cols.get(2).and_then(|v| v.as_string()),
         output_device_id: cols.get(3).and_then(|v| v.as_string()),
-        volume: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(20) as i32,
+        // `as_f64` accepte Int, Real ET Text : les trois formes que les deux
+        // moteurs peuvent rendre pour cette colonne (#2886).
+        volume: cols.get(4).and_then(|v| v.as_f64()).unwrap_or(20.0),
         muted: cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
         online: cols.get(6).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
         gapless_enabled: cols.get(7).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
@@ -1699,11 +2578,154 @@ mod tests {
     /// Base complete : `settings` n'est pas dans `init_schema`, elle vient des
     /// migrations. Les tests qui touchent aux reglages hors colonnes en ont
     /// besoin ; les autres restent sur la base minimale.
-    fn test_db_migree() -> SqliteDb {
+    pub(super) fn test_db_migree() -> SqliteDb {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         db
+    }
+
+    /// #1770 — la mesure que consulte la règle de nommage. Une zone locale
+    /// VISIBLE portant l'étiquette générique, sur un AUTRE appareil, la rend
+    /// vraie.
+    #[test]
+    fn l_etiquette_generique_prise_par_un_autre_appareil_est_vue() {
+        let repo = ZoneRepo::new(test_db());
+        repo.create(
+            "This Computer",
+            Some("local"),
+            Some("local:Essence STX II ASIO(64)"),
+        )
+        .unwrap();
+
+        assert!(
+            repo.etiquette_generique_locale_prise("local:Speakers")
+                .unwrap(),
+            "la zone ASIO porte déjà l'étiquette : la sortie système WASAPI \
+             ne doit pas en minter une seconde (#1770)"
+        );
+    }
+
+    /// TÉMOIN — la zone de l'appareil courant ne compte pas contre lui-même,
+    /// sinon un simple redémarrage renommerait la zone système à chaque tour.
+    #[test]
+    fn temoin_sa_propre_zone_ne_compte_pas_contre_l_appareil() {
+        let repo = ZoneRepo::new(test_db());
+        repo.create("This Computer", Some("local"), Some("local:Speakers"))
+            .unwrap();
+
+        assert!(
+            !repo
+                .etiquette_generique_locale_prise("local:Speakers")
+                .unwrap(),
+            "l'appareil qui porte déjà l'étiquette ne se la prend pas à \
+             lui-même"
+        );
+    }
+
+    /// Une zone masquée ne prend rien : elle n'est pas dans le sélecteur, donc
+    /// aucun doublon visible n'est possible.
+    #[test]
+    fn une_zone_masquee_ne_prend_pas_l_etiquette() {
+        let repo = ZoneRepo::new(test_db());
+        let id = repo
+            .create("This Computer", Some("local"), Some("local:Vieux DAC"))
+            .unwrap();
+        repo.delete(id).unwrap();
+
+        assert!(
+            !repo
+                .etiquette_generique_locale_prise("local:Speakers")
+                .unwrap()
+        );
+    }
+
+    /// Une zone d'un autre type (DLNA) qui s'appellerait ainsi ne compte pas :
+    /// la règle ne porte que sur les sorties locales.
+    #[test]
+    fn une_zone_non_locale_ne_prend_pas_l_etiquette() {
+        let repo = ZoneRepo::new(test_db());
+        repo.create("This Computer", Some("dlna"), Some("uuid:42"))
+            .unwrap();
+
+        assert!(
+            !repo
+                .etiquette_generique_locale_prise("local:Speakers")
+                .unwrap()
+        );
+    }
+
+    /// #1770 — `hide_duplicate_generic_local` ne masque plus rien quand la
+    /// zone GARDÉE ne porte pas l'étiquette générique. Sans cette condition,
+    /// la zone système WASAPI (« Speakers ») effaçait en silence la zone ASIO
+    /// « This Computer », qu'aucune découverte ne ressuscite ensuite.
+    #[test]
+    fn une_zone_gardee_non_generique_ne_masque_personne() {
+        let repo = ZoneRepo::new(test_db());
+        let asio = repo
+            .create(
+                "This Computer",
+                Some("local"),
+                Some("local:Essence STX II ASIO(64)"),
+            )
+            .unwrap();
+        let wasapi = repo
+            .create("Speakers", Some("local"), Some("local:Speakers"))
+            .unwrap();
+
+        assert_eq!(
+            repo.hide_duplicate_generic_local(wasapi).unwrap(),
+            0,
+            "garder « Speakers » ne désigne aucune jumelle : rien ne doit \
+             être masqué (#1770)"
+        );
+        assert!(
+            repo.list().unwrap().iter().any(|z| z.id == Some(asio)),
+            "la zone ASIO doit rester dans le sélecteur"
+        );
+    }
+
+    /// TÉMOIN — le cas de Philippe Vella (#1233) marche toujours : deux
+    /// étiquettes génériques, la gardée en est une, la jumelle est masquée.
+    /// Si cet essai tombe, le correctif a désarmé la déduplication au lieu de
+    /// la borner.
+    #[test]
+    fn temoin_deux_etiquettes_generiques_la_jumelle_est_toujours_masquee() {
+        let repo = ZoneRepo::new(test_db());
+        let ancienne = repo
+            .create(
+                "Cet ordinateur",
+                Some("local"),
+                Some("local:MacBook de Jean"),
+            )
+            .unwrap();
+        let vivante = repo
+            .create("This Computer", Some("local"), Some("local:MacBook"))
+            .unwrap();
+
+        assert_eq!(repo.hide_duplicate_generic_local(vivante).unwrap(), 1);
+        let visibles = repo.list().unwrap();
+        assert!(visibles.iter().any(|z| z.id == Some(vivante)));
+        assert!(
+            !visibles.iter().any(|z| z.id == Some(ancienne)),
+            "la jumelle générique doit toujours être masquée (#1233)"
+        );
+    }
+
+    /// Une zone renommée par l'utilisateur n'est jamais masquée, même quand la
+    /// gardée est bien générique. C'est le contrat d'origine, reconduit.
+    #[test]
+    fn temoin_une_zone_renommee_n_est_jamais_masquee() {
+        let repo = ZoneRepo::new(test_db());
+        let salon = repo
+            .create("Salon", Some("local"), Some("local:Ampli"))
+            .unwrap();
+        let vivante = repo
+            .create("This Computer", Some("local"), Some("local:Speakers"))
+            .unwrap();
+
+        assert_eq!(repo.hide_duplicate_generic_local(vivante).unwrap(), 0);
+        assert!(repo.list().unwrap().iter().any(|z| z.id == Some(salon)));
     }
 
     #[test]
@@ -1716,13 +2738,13 @@ mod tests {
             .unwrap();
         let zone = repo.get(id).unwrap().unwrap();
         assert_eq!(zone.name, "Living Room");
-        assert_eq!(zone.volume, 50);
+        assert_eq!(zone.volume, 50.0);
         assert!(!zone.muted);
 
-        repo.update_volume(id, 75).unwrap();
+        repo.update_volume(id, 75.0).unwrap();
         repo.update_muted(id, true).unwrap();
         let updated = repo.get(id).unwrap().unwrap();
-        assert_eq!(updated.volume, 75);
+        assert_eq!(updated.volume, 75.0);
         assert!(updated.muted);
 
         // delete is a soft-delete (is_hidden=1): the row is kept for later
@@ -1730,6 +2752,148 @@ mod tests {
         repo.delete(id).unwrap();
         assert!(repo.list().unwrap().is_empty());
         assert!(repo.is_device_hidden("uuid:123"));
+    }
+
+    // ── #3529 : la garde « Créer automatiquement les zones », une fois ────
+    //
+    // Ces essais éprouvent la garde elle-même. Le fait que les cinq chemins de
+    // découverte y passent bien est éprouvé à part, par le recensement
+    // `tune-server/tests/zones_auto_create_recension.rs` : un essai de
+    // comportement ne peut pas voir un SIXIÈME site qui ne l'appellerait pas,
+    // et c'est exactement ainsi que ces cinq-là sont passés.
+
+    /// Le cas de Fabien : réglage décoché, appareil jamais vu. Aucune zone.
+    #[test]
+    fn auto_create_decoche_refuse_un_appareil_inconnu() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        settings.set("zone_auto_create", "false").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("FIP Salon", Some("squeezebox"), "sb:aa:bb", "essai")
+            .unwrap();
+
+        assert_eq!(issue, CreationDeZone::Refusee);
+        assert!(issue.id().is_none());
+        assert!(!issue.vient_de_naitre());
+        assert!(
+            repo.list().unwrap().is_empty(),
+            "aucune zone ne doit exister apres un refus"
+        );
+        assert!(
+            repo.get_by_device_id("sb:aa:bb").unwrap().is_none(),
+            "le refus ne doit pas non plus laisser de zone masquee derriere lui"
+        );
+    }
+
+    /// La condition posée par l'issue : la garde bloque la NAISSANCE, jamais
+    /// la reconnexion. Une zone connue reste retrouvable réglage décoché,
+    /// sans quoi un appareil qui se rebranche deviendrait injoignable.
+    #[test]
+    fn auto_create_decoche_laisse_reconnecter_une_zone_connue() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        let connue = repo
+            .create("Salon", Some("dlna"), Some("uuid:connu"))
+            .unwrap();
+        settings.set("zone_auto_create", "false").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("Salon", Some("dlna"), "uuid:connu", "essai")
+            .unwrap();
+
+        assert_eq!(issue, CreationDeZone::Existante(connue));
+        assert!(!issue.refusee());
+        repo.set_online_by_device("uuid:connu", true).unwrap();
+        assert!(repo.get(connue).unwrap().unwrap().online);
+    }
+
+    /// Une zone SUPPRIMÉE (masquée) est une zone existante, pas un appareil
+    /// inconnu : le refus ne doit pas la faire renaître par la porte de
+    /// derrière, ni la ressusciter.
+    #[test]
+    fn auto_create_decoche_ne_ressuscite_pas_une_zone_supprimee() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        let supprimee = repo
+            .create("Salon", Some("dlna"), Some("uuid:efface"))
+            .unwrap();
+        repo.delete(supprimee).unwrap();
+        settings.set("zone_auto_create", "false").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("Salon", Some("dlna"), "uuid:efface", "essai")
+            .unwrap();
+
+        assert_eq!(issue, CreationDeZone::Existante(supprimee));
+        assert!(
+            repo.is_device_hidden("uuid:efface"),
+            "elle doit rester masquee"
+        );
+        assert!(repo.list().unwrap().is_empty());
+    }
+
+    /// Réglage coché : rien ne change, la zone naît.
+    #[test]
+    fn auto_create_coche_cree_la_zone() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        settings.set("zone_auto_create", "true").unwrap();
+
+        let issue = repo
+            .get_or_create_si_autorise("HQPlayer", Some("hqplayer"), "hqplayer-1.2.3.4", "essai")
+            .unwrap();
+
+        let id = issue.id().expect("une zone doit naitre");
+        assert!(issue.vient_de_naitre());
+        assert_eq!(issue, CreationDeZone::Creee(id));
+        assert_eq!(repo.list().unwrap().len(), 1);
+    }
+
+    /// Base neuve : le réglage n'est pas encore écrit. Le défaut est « coché »
+    /// (`system/config.rs`), pas « décoché » — une installation neuve doit
+    /// continuer de proposer ses zones toute seule.
+    #[test]
+    fn reglage_absent_vaut_coche() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+        assert!(settings.get("zone_auto_create").unwrap().is_none());
+
+        assert!(repo.zone_auto_create_autorise());
+        assert!(
+            repo.get_or_create_si_autorise("Salon", Some("dlna"), "uuid:neuf", "essai")
+                .unwrap()
+                .vient_de_naitre()
+        );
+    }
+
+    /// La seconde moitié du constat de Fabien : « et s'activent toutes
+    /// seules ». Une zone naît **en ligne**, parce que `INSERT INTO zones`
+    /// n'écrit pas `online` et que le schéma vaut `DEFAULT 1`.
+    ///
+    /// Cet essai ne corrige rien, il FIXE le fait : la naissance en ligne est
+    /// désormais un comportement éprouvé, et non un effet de bord du schéma
+    /// que personne ne verrait changer. C'est le refus de la naissance, plus
+    /// haut, qui traite le symptôme ; retourner ce défaut à 0 laisserait
+    /// hors ligne les zones que les chemins de découverte créent
+    /// légitimement — plusieurs ne rappellent `set_online_by_device` que dans
+    /// leur branche « zone déjà connue ».
+    #[test]
+    fn une_zone_creee_nait_en_ligne() {
+        let db = test_db_migree();
+        let repo = ZoneRepo::new(db);
+        let id = repo
+            .create("Salon", Some("dlna"), Some("uuid:naissance"))
+            .unwrap();
+        assert!(
+            repo.get(id).unwrap().unwrap().online,
+            "une zone naissante est en ligne : c'est le DEFAULT 1 du schema"
+        );
     }
 
     /// #1832 — les reglages ranges dans `settings` (profil d'egaliseur en
@@ -2142,7 +3306,7 @@ mod tests {
 
         let id = repo.create("Default Zone", None, None).unwrap();
         let zone = repo.get(id).unwrap().unwrap();
-        assert_eq!(zone.volume, 50);
+        assert_eq!(zone.volume, 50.0);
         assert!(!zone.muted);
         assert!(zone.online);
         assert!(zone.output_type.is_none());
@@ -2171,11 +3335,154 @@ mod tests {
 
         let id = repo.create("Zone", None, None).unwrap();
 
-        repo.update_volume(id, 0).unwrap();
-        assert_eq!(repo.get(id).unwrap().unwrap().volume, 0);
+        repo.update_volume(id, 0.0).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 0.0);
 
-        repo.update_volume(id, 100).unwrap();
-        assert_eq!(repo.get(id).unwrap().unwrap().volume, 100);
+        repo.update_volume(id, 100.0).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 100.0);
+    }
+
+    /// #2886 — le SEUIL, mesure et non estime.
+    ///
+    /// L'ecriture d'avant etait `update_volume(id, (v * 100.0).round() as i32)`.
+    /// `f64::round` arrondit a l'oppose de zero, donc l'entier vaut 0 pour tout
+    /// `v` **strictement inferieur a 0,005** — et 0,005 lineaire, c'est
+    /// `20*log10(0,005) = -46,0205999133 dB` **exactement**. « Environ -46 dB »
+    /// de l'enonce n'est pas une approximation de mesure : c'est ce nombre-la.
+    ///
+    /// Ce test ne touche pas la base : il cloue l'arithmetique qui a servi a
+    /// identifier la conversion fautive, pour que le chiffre ne se perde pas.
+    #[test]
+    fn le_seuil_du_silence_vaut_moins_quarante_six_virgule_zero_deux_db() {
+        const SEUIL_LINEAIRE: f64 = 0.005;
+        const SEUIL_DB: f64 = -46.020_599_913_279_62;
+        assert!(
+            (20.0 * SEUIL_LINEAIRE.log10() - SEUIL_DB).abs() < 1e-12,
+            "0,005 lineaire vaut {} dB",
+            20.0 * SEUIL_LINEAIRE.log10()
+        );
+
+        // L'ecriture d'AVANT, reproduite ici pour montrer ou elle bascule.
+        let ecriture_d_avant = |v: f64| (v.clamp(0.0, 1.0) * 100.0).round() as i32;
+        assert_eq!(
+            ecriture_d_avant(SEUIL_LINEAIRE),
+            1,
+            "au seuil : encore audible"
+        );
+        assert_eq!(
+            ecriture_d_avant(SEUIL_LINEAIRE - f64::EPSILON),
+            0,
+            "un ulp sous le seuil : MUET"
+        );
+        // -48 dB, le reglage plausible cite par l'issue.
+        assert_eq!(ecriture_d_avant(10f64.powf(-48.0 / 20.0)), 0);
+    }
+
+    /// #2886 — le couple ECRITURE / RELECTURE, sur toute la plage utile.
+    ///
+    /// C'est le test qui rougit contre le code d'avant : `update_volume`
+    /// arrondissait au pour-cent entier, donc tout reglage qui n'etait pas un
+    /// multiple exact de 1 % revenait ailleurs apres redemarrage. Il rougit
+    /// des -0,25 dB, et il rougit en SILENCE (0) sous -46,0205999133 dB.
+    #[test]
+    fn le_volume_persiste_se_relit_a_l_identique_de_zero_a_moins_quatre_vingts_db() {
+        let repo = ZoneRepo::new(test_db());
+        let id = repo.create("Zone", None, None).unwrap();
+
+        for n in 0..=320 {
+            let cible_db = -f64::from(n) / 4.0; // 0 → -80 dB par pas de 0,25
+            let lineaire = 10f64.powf(cible_db / 20.0);
+
+            repo.update_volume(id, lineaire * 100.0).unwrap();
+            let relu = repo.get(id).unwrap().unwrap().volume / 100.0;
+
+            assert!(
+                (relu - lineaire).abs() <= 1e-12 * lineaire.max(1e-9),
+                "{cible_db} dB : ecrit {lineaire}, relu {relu} — la persistance a bouge le niveau"
+            );
+            // Et surtout : ce qui etait audible le reste.
+            assert!(
+                relu > 0.0,
+                "{cible_db} dB : la zone se rallume MUETTE (relu {relu})"
+            );
+        }
+
+        // Le zero commande reste du zero : on ne rallume personne.
+        repo.update_volume(id, 0.0).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 0.0);
+    }
+
+    /// #2886 — les volumes USUELS ne bougent pas d'un iota.
+    ///
+    /// Temoin anti-regression : un correctif sur le volume touche le niveau
+    /// sonore reel. Chacun de ces reglages est un multiple exact de 1 %, donc
+    /// l'ancien code les rendait deja parfaitement — ils doivent sortir
+    /// EXACTEMENT pareil apres le passage a la virgule.
+    #[test]
+    fn les_volumes_usuels_ne_bougent_pas_d_un_iota() {
+        let repo = ZoneRepo::new(test_db());
+        let id = repo.create("Zone", None, None).unwrap();
+
+        for pour_cent in [
+            0, 1, 5, 10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 95, 99, 100,
+        ] {
+            let pour_cent = f64::from(pour_cent);
+            repo.update_volume(id, pour_cent).unwrap();
+            let relu = repo.get(id).unwrap().unwrap();
+            assert_eq!(
+                relu.volume, pour_cent,
+                "{pour_cent} % : la colonne doit rendre le meme nombre qu'avant"
+            );
+            // Et le lineaire que la lecture en tire est celui d'avant, au bit pres.
+            assert_eq!(relu.volume / 100.0, pour_cent / 100.0);
+        }
+    }
+
+    /// #2886 — pourquoi il n'y a PAS de migration SQLite.
+    ///
+    /// SQLite est a typage dynamique : l'affinite INTEGER ne convertit une
+    /// decimale en entier que si la conversion est SANS PERTE. Une base creee
+    /// avant ce correctif, dont la colonne est encore declaree `INTEGER`,
+    /// stocke donc 0,4 tel quel. Seul PostgreSQL, qui type reellement ses
+    /// colonnes, exige la migration 048.
+    ///
+    /// Ce test le PROUVE sur une table declaree a l'ancienne au lieu de le
+    /// supposer : si un jour SQLite changeait d'avis, il rougirait ici plutot
+    /// que chez un utilisateur.
+    #[test]
+    fn un_volume_fractionnaire_survit_a_une_colonne_declaree_integer() {
+        let backend: Arc<dyn DbBackend> = Arc::new(SqliteDb::open_in_memory().unwrap());
+        backend
+            .execute(
+                "CREATE TABLE zones_ancienne (id INTEGER PRIMARY KEY, volume INTEGER DEFAULT 50)",
+                &[],
+            )
+            .unwrap();
+        backend
+            .execute(
+                "INSERT INTO zones_ancienne (id, volume) VALUES (1, 50)",
+                &[],
+            )
+            .unwrap();
+
+        let vol: f64 = 0.398_107_170_553_497_2 * 100.0; // -8 dB
+        backend
+            .execute(
+                "UPDATE zones_ancienne SET volume = ? WHERE id = 1",
+                &[&vol as &dyn ToSqlValue],
+            )
+            .unwrap();
+
+        let relu = backend
+            .query_one("SELECT volume FROM zones_ancienne WHERE id = 1", &[])
+            .unwrap()
+            .unwrap()[0]
+            .as_f64()
+            .unwrap();
+        assert!(
+            (relu - vol).abs() < 1e-12,
+            "SQLite a rabote {vol} en {relu} — il FAUDRAIT alors une migration SQLite"
+        );
     }
 
     #[test]
@@ -2379,7 +3686,7 @@ mod tests {
             .get_or_create("Jean-Marie DAC", Some("dlna"), "uuid:jm-dac")
             .unwrap();
         assert!(created);
-        repo.update_volume(id1, 75).unwrap();
+        repo.update_volume(id1, 75.0).unwrap();
 
         // Soft-delete the zone
         repo.delete(id1).unwrap();
@@ -2578,6 +3885,237 @@ mod autoplay_mode_tests {
     fn zone(repo: &ZoneRepo) -> i64 {
         repo.create("Salon", Some("dlna"), Some("uuid:salon"))
             .unwrap()
+    }
+
+    fn valeur_texte(repo: &ZoneRepo, sql: &str) -> Option<String> {
+        repo.db
+            .query_many_strong(sql, &[])
+            .unwrap()
+            .first()
+            .and_then(|l| l.first())
+            .and_then(|v| v.as_string().or_else(|| v.as_i64().map(|n| n.to_string())))
+    }
+
+    /// DUP-1 (phase 1) : la fusion reporte ce que la cible n'a pas réglé,
+    /// jamais ce qu'elle a choisi ; le doublon sort de la liste sans libérer
+    /// son identifiant ; groupes et zone par défaut suivent.
+    #[test]
+    fn fusionner_reporte_sans_ecraser_et_masque_le_doublon() {
+        let repo = ZoneRepo::new(super::tests::test_db_migree());
+        let doublon = repo
+            .create(
+                "Chambre",
+                Some("dlna"),
+                Some("uuid:RINCON_B8E937B44D0801400_MR"),
+            )
+            .unwrap();
+        let cible = repo
+            .create(
+                "Chambre - Sonos Play:1",
+                Some("dlna"),
+                Some("uuid:RINCON_B8E937B44D0801400"),
+            )
+            .unwrap();
+        repo.update_fixed_volume(doublon, true).unwrap();
+        repo.update_dsd_mode(doublon, "dop").unwrap();
+        repo.update_dsd_mode(cible, "native").unwrap();
+        let settings = super::super::settings_repo::SettingsRepo::with_backend(repo.db.clone());
+        settings
+            .set(&format!("zone_{doublon}_eq_profile"), "salon")
+            .unwrap();
+        settings
+            .set(&format!("zone_{doublon}_crossfeed"), "on")
+            .unwrap();
+        settings
+            .set(&format!("zone_{cible}_crossfeed"), "off")
+            .unwrap();
+        settings
+            .set(&format!("ir_path_{doublon}"), "/ir/salon.wav")
+            .unwrap();
+        settings
+            .set("default_zone_id", &doublon.to_string())
+            .unwrap();
+        settings
+            .set(
+                "zone_groups",
+                &format!(
+                    r#"[{{"id":1,"group_id":"1","name":"Bas","leader_id":{doublon},"zone_ids":[{doublon},{cible},7]}}]"#
+                ),
+            )
+            .unwrap();
+
+        let rapport = repo.fusionner(doublon, cible).unwrap();
+
+        let apres = repo.get(cible).unwrap().unwrap();
+        assert!(
+            apres.fixed_volume,
+            "la cible était au défaut : le volume fixe du doublon s'applique"
+        );
+        assert_eq!(
+            valeur_texte(
+                &repo,
+                &format!("SELECT dsd_mode FROM zones WHERE id = {cible}")
+            )
+            .as_deref(),
+            Some("native"),
+            "un réglage explicite de la cible ne cède jamais"
+        );
+        assert_eq!(
+            settings
+                .get(&format!("zone_{cible}_eq_profile"))
+                .unwrap()
+                .as_deref(),
+            Some("salon")
+        );
+        assert_eq!(
+            settings
+                .get(&format!("zone_{cible}_crossfeed"))
+                .unwrap()
+                .as_deref(),
+            Some("off")
+        );
+        assert_eq!(
+            settings
+                .get(&format!("ir_path_{cible}"))
+                .unwrap()
+                .as_deref(),
+            Some("/ir/salon.wav")
+        );
+        assert_eq!(
+            rapport.reglages_reportes, 2,
+            "eq_profile et ir_path ; crossfeed refusé"
+        );
+        assert_eq!(
+            settings.get("default_zone_id").unwrap(),
+            Some(cible.to_string())
+        );
+        let groupes = settings.get("zone_groups").unwrap().unwrap();
+        assert!(
+            groupes.contains(&format!(r#""zone_ids":[{cible},7]"#))
+                && groupes.contains(&format!(r#""leader_id":{cible}"#)),
+            "le doublon cède sa place dans le groupe : {groupes}"
+        );
+        assert!(rapport.zone_par_defaut_reportee && rapport.groupes_reecrits);
+        assert!(
+            repo.list().unwrap().iter().all(|z| z.id != Some(doublon)),
+            "le doublon sort de la liste"
+        );
+        assert!(
+            repo.is_device_hidden("uuid:RINCON_B8E937B44D0801400_MR"),
+            "l'identifiant reste occupé : la découverte ne recrée pas la zone"
+        );
+        assert!(
+            repo.fusionner(cible, cible).is_err(),
+            "pas de fusion dans soi-même"
+        );
+        assert!(
+            repo.fusionner(doublon, 999).is_err(),
+            "cible inconnue refusée"
+        );
+    }
+
+    /// DUP-1 (phase 1) : la file suit le doublon seulement si la cible n'en a
+    /// pas ; on ne mêle jamais deux files.
+    #[test]
+    fn fusionner_reporte_la_file_seulement_si_la_cible_n_en_a_pas() {
+        let repo = ZoneRepo::new(super::tests::test_db_migree());
+        let a = repo.create("A", Some("dlna"), Some("uuid:x_MR")).unwrap();
+        let b = repo.create("B", Some("dlna"), Some("uuid:x")).unwrap();
+        let c = repo.create("C", Some("dlna"), Some("uuid:y_MR")).unwrap();
+        let d = repo.create("D", Some("dlna"), Some("uuid:y")).unwrap();
+        repo.db
+            .execute_batch(&format!(
+                "INSERT INTO queue_items (zone_id, position, title) VALUES \
+                 ({a}, 0, 'un'), ({a}, 1, 'deux'), ({c}, 0, 'trois'), ({d}, 0, 'quatre');"
+            ))
+            .unwrap();
+        let r1 = repo.fusionner(a, b).unwrap();
+        assert_eq!(
+            (r1.file_reportee, r1.file_conservee_sur_la_cible),
+            (2, false)
+        );
+        let r2 = repo.fusionner(c, d).unwrap();
+        assert_eq!(
+            (r2.file_reportee, r2.file_conservee_sur_la_cible),
+            (0, true)
+        );
+        let compte = |zone: i64| {
+            valeur_texte(
+                &repo,
+                &format!("SELECT COUNT(*) FROM queue_items WHERE zone_id = {zone}"),
+            )
+        };
+        assert_eq!(
+            compte(b).as_deref(),
+            Some("2"),
+            "la file de A est arrivée sur B"
+        );
+        assert_eq!(compte(d).as_deref(), Some("1"), "la file de D est intacte");
+        assert_eq!(
+            compte(c).as_deref(),
+            Some("1"),
+            "celle de C n'a pas été mêlée"
+        );
+    }
+
+    #[test]
+    fn remplacer_dans_la_liste_ne_repete_pas_et_ne_touche_pas_l_illisible() {
+        assert_eq!(
+            remplacer_dans_la_liste("[4, 20, 6]", 20, 4).as_deref(),
+            Some("[4,6]")
+        );
+        assert_eq!(
+            remplacer_dans_la_liste("[20, 6]", 20, 4).as_deref(),
+            Some("[4,6]")
+        );
+        assert_eq!(remplacer_dans_la_liste("[1, 2]", 20, 4), None);
+        assert_eq!(remplacer_dans_la_liste("pas une liste", 20, 4), None);
+    }
+
+    /// DUP-1 (phase 2) : le passage EN LIGNE date la zone, le passage hors
+    /// ligne ne touche pas a la date, et l'age se lit en secondes ; une zone
+    /// jamais vue n'a pas d'age.
+    #[test]
+    fn le_passage_en_ligne_date_la_zone_et_le_passage_hors_ligne_garde_la_date() {
+        let repo = repo();
+        let vue = repo
+            .create("Salon", Some("dlna"), Some("uuid:salon"))
+            .unwrap();
+        let jamais = repo
+            .create("Cave", Some("dlna"), Some("uuid:cave"))
+            .unwrap();
+        let lue = |id: i64| {
+            valeur_texte(
+                &repo,
+                &format!("SELECT last_seen_at FROM zones WHERE id = {id}"),
+            )
+        };
+        assert_eq!(lue(vue), None, "avant tout passage en ligne : NULL");
+
+        repo.set_online_by_device("uuid:salon", true).unwrap();
+        let date = lue(vue).expect("le passage en ligne pose la date");
+        assert!(
+            date.ends_with('Z') && date.len() == 20,
+            "ISO 8601 UTC : {date}"
+        );
+
+        repo.set_online_by_device("uuid:salon", false).unwrap();
+        assert_eq!(
+            lue(vue).as_deref(),
+            Some(date.as_str()),
+            "hors ligne ne touche pas la date"
+        );
+        assert_eq!(lue(jamais), None);
+
+        let ages = repo.ages_depuis_derniere_vue().unwrap();
+        assert!(
+            ages.get(&vue).is_some_and(|a| (0..=5).contains(a)),
+            "age en secondes : {ages:?}"
+        );
+        assert!(!ages.contains_key(&jamais), "jamais vue : pas d'age");
+
+        repo.update_online(jamais, true).unwrap();
+        assert!(lue(jamais).is_some(), "par identifiant aussi");
     }
 
     /// Defaut inchange : une zone neuve n'enchaine rien.
@@ -2810,6 +4348,382 @@ mod ignored_zone_settings_tests {
         assert!(
             zone_settings_ignored() >= avant + 2,
             "host et mac absents doivent être comptés"
+        );
+    }
+}
+
+/// #2269 — l'identite d'une sortie locale, eprouvee sur une VRAIE base.
+///
+/// La regle elle-meme est eprouvee dans `outputs::identite_de_sortie` (pure,
+/// sans base). Ce module-ci tient l'autre moitie : que l'ecriture atteigne la
+/// base, et surtout que RIEN de ce qui est accroche a la zone ne se detache au
+/// passage. C'est le point delicat de la migration — des zones vivantes
+/// portent aujourd'hui une identite par NOM, et des reglages y sont accroches.
+#[cfg(test)]
+mod identite_de_sortie_tests {
+    use super::*;
+    use crate::outputs::identite_de_sortie::SortieEnumeree;
+
+    const AUDIO_GD: &str = "wasapi:{0.0.0.00000000}.{e0ea21cf-56cc-445f-8454-880d431d7cb0}";
+    const HAUT_PARLEURS: &str = "wasapi:{0.0.0.00000000}.{7bd3a1de-0000-4444-9999-1a2b3c4d5e6f}";
+
+    fn repo() -> ZoneRepo {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // La colonne arrive par la migration 99 comme par `CORE_SCHEMA` : on
+        // joue les migrations pour eprouver le chemin d'une base EXISTANTE.
+        crate::db::migrations::run_migrations(&db).unwrap();
+        ZoneRepo::new(db)
+    }
+
+    fn vue(repo: &ZoneRepo, sql: &str) -> Option<String> {
+        repo.db
+            .query_many_strong(sql, &[])
+            .unwrap()
+            .first()
+            .and_then(|l| l.first())
+            .and_then(|v| v.as_string().or_else(|| v.as_i64().map(|n| n.to_string())))
+    }
+
+    fn sortie(nom: &str, endpoint: &str) -> SortieEnumeree {
+        SortieEnumeree {
+            nom: nom.to_string(),
+            endpoint_id: endpoint.to_string(),
+        }
+    }
+
+    /// La colonne existe sur une base MIGREE, et vaut NULL pour l'existant.
+    #[test]
+    fn la_colonne_arrive_par_migration_et_ne_touche_aucune_ligne() {
+        let repo = repo();
+        let id = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_endpoint_id FROM zones WHERE id = {id}")
+            ),
+            None,
+            "une zone d'hier n'a AUCUN identifiant : NULL, jamais une valeur              devinee"
+        );
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_device_id FROM zones WHERE id = {id}")
+            )
+            .as_deref(),
+            Some("local:audio-gd USB audio"),
+            "la migration ne touche pas l'identite de la zone"
+        );
+    }
+
+    /// TEMOIN 1 — un appareil RENOMME est retrouve, et la zone garde tout.
+    ///
+    /// C'est le cas de #2269 : Windows renomme l'endpoint au changement de
+    /// taux d'echantillonnage. La zone doit suivre son appareil SANS perdre ce
+    /// qui lui est accroche.
+    #[test]
+    fn temoin_un_appareil_renomme_est_retrouve_et_la_zone_garde_ses_reglages() {
+        let repo = repo();
+        let id = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        repo.update_volume(id, 37.5).unwrap();
+        repo.update_dsd_mode(id, "dop").unwrap();
+        repo.update_lyrics_offset_ms(id, -250).unwrap();
+
+        // Passe 1 : l'appareil est la sous son nom. La zone APPREND.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("audio-gd USB audio", AUDIO_GD)])
+            .unwrap();
+        assert_eq!(rapport.apprises, vec![(id, AUDIO_GD.to_string())]);
+        assert!(rapport.reassociees.is_empty() && rapport.refus.is_empty());
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_device_id FROM zones WHERE id = {id}")
+            )
+            .as_deref(),
+            Some("local:audio-gd USB audio"),
+            "apprendre ne change AUCUNE identite"
+        );
+
+        // Passe 2 : le pilote a renomme l'endpoint. Meme GUID, autre nom.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("audio-gd USB audio (44,1 kHz)", AUDIO_GD)])
+            .unwrap();
+        assert_eq!(rapport.reassociees.len(), 1, "la zone doit avoir suivi");
+        assert_eq!(
+            rapport.reassociees[0].nouveau_device_id,
+            "local:audio-gd USB audio (44,1 kHz)"
+        );
+
+        // ── Ce qui compte vraiment : la zone est LA MEME ligne.
+        let zone = repo.get(id).unwrap().expect("la zone existe toujours");
+        assert_eq!(
+            zone.output_device_id.as_deref(),
+            Some("local:audio-gd USB audio (44,1 kHz)")
+        );
+        assert_eq!(zone.name, "Salon", "le nom choisi par l'auditeur reste");
+        assert_eq!(zone.volume, 37.5, "le volume reste accroche a la zone");
+        assert_eq!(repo.get_dsd_mode(id), "dop");
+        assert_eq!(repo.get_lyrics_offset_ms(id), -250);
+        assert_eq!(
+            vue(&repo, "SELECT COUNT(*) FROM zones").as_deref(),
+            Some("1"),
+            "AUCUNE zone neuve : c'est le doublon que ce chantier evite"
+        );
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_endpoint_id FROM zones WHERE id = {id}")
+            )
+            .as_deref(),
+            Some(AUDIO_GD),
+            "l'identifiant reste celui de l'appareil, pas celui du nom"
+        );
+    }
+
+    /// TEMOIN 2 — un AUTRE appareil n'est PAS pris pour l'ancien.
+    ///
+    /// Le contre-exemple qui commande tout : le 13/08, une adresse d'Apple TV
+    /// reprise par un Sonos. Ici le parc ne contient qu'un appareil, et son
+    /// identifiant n'est pas celui de la zone : elle ne doit RIEN recevoir.
+    #[test]
+    fn temoin_un_autre_appareil_nest_pas_pris_pour_lancien() {
+        let repo = repo();
+        let id = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        repo.update_output_endpoint_id(id, AUDIO_GD).unwrap();
+
+        // Le DAC est debranche. Il ne reste que les haut-parleurs du portable
+        // — c'est le parc exact du journal de Jean-Luc Casse.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("Haut-parleurs", HAUT_PARLEURS)])
+            .unwrap();
+
+        assert_eq!(rapport.reassociees, vec![]);
+        assert_eq!(rapport.apprises, vec![]);
+        assert_eq!(rapport.refus, vec![]);
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_device_id FROM zones WHERE id = {id}")
+            )
+            .as_deref(),
+            Some("local:audio-gd USB audio"),
+            "rabattre la zone sur le seul appareil present est EXACTEMENT le              degat du 13/08 : la zone reste sur son appareil absent"
+        );
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_endpoint_id FROM zones WHERE id = {id}")
+            )
+            .as_deref(),
+            Some(AUDIO_GD),
+            "et son identifiant n'est pas ecrase par celui du voisin"
+        );
+    }
+
+    /// Le refus est RENDU, avec son motif : c'est de quoi l'ecran peut dire
+    /// pourquoi la zone n'a pas retrouve son appareil.
+    #[test]
+    fn un_refus_nomme_sa_cause() {
+        let repo = repo();
+        let ancienne = repo
+            .create("Salon", Some("local"), Some("local:Ancien nom"))
+            .unwrap();
+        let deja_la = repo
+            .create("Bureau", Some("local"), Some("local:Nouveau nom"))
+            .unwrap();
+        repo.update_output_endpoint_id(ancienne, AUDIO_GD).unwrap();
+
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("Nouveau nom", AUDIO_GD)])
+            .unwrap();
+
+        assert_eq!(rapport.reassociees, vec![], "aucune fusion decidee ici");
+        assert_eq!(rapport.refus.len(), 1);
+        assert_eq!(rapport.refus[0].0, ancienne);
+        assert!(
+            rapport.refus[0].1.contains(&deja_la.to_string())
+                && rapport.refus[0].1.contains("fusion"),
+            "le motif doit nommer la zone qui bloque : {}",
+            rapport.refus[0].1
+        );
+    }
+
+    /// Un parc VIDE — enumeration echouee, pilote happe par une autre
+    /// application — ne decide rien du tout.
+    #[test]
+    fn un_parc_vide_ne_touche_a_rien() {
+        let repo = repo();
+        let id = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        assert_eq!(
+            repo.appliquer_identite_de_sortie(&[]).unwrap(),
+            RapportDIdentite::default()
+        );
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_endpoint_id FROM zones WHERE id = {id}")
+            ),
+            None
+        );
+    }
+
+    /// Une base ANTERIEURE a la colonne ne fait pas tomber la lecture : liste
+    /// vide, pas d'erreur. Meme repli que `ages_depuis_derniere_vue`.
+    #[test]
+    fn une_base_sans_la_colonne_rend_une_liste_vide() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, \
+             output_type TEXT, output_device_id TEXT, is_hidden INTEGER DEFAULT 0);
+             INSERT INTO zones (name, output_type, output_device_id) \
+             VALUES ('Salon', 'local', 'local:audio-gd USB audio');",
+        )
+        .unwrap();
+        let repo = ZoneRepo::new(db);
+        assert_eq!(repo.sorties_locales_et_leur_identite().unwrap(), vec![]);
+        assert_eq!(
+            repo.appliquer_identite_de_sortie(&[sortie("audio-gd USB audio", AUDIO_GD)])
+                .unwrap(),
+            RapportDIdentite::default()
+        );
+    }
+
+    /// Ce que `recreate_local_and_play` lit quand le peripherique n'est PAS
+    /// enregistre : sans cette lecture, c'est le NOM qui part en resolution.
+    #[test]
+    fn la_sortie_rend_son_identifiant_a_qui_la_recree() {
+        let repo = repo();
+        let id = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        assert_eq!(
+            repo.endpoint_id_de_la_sortie("local:audio-gd USB audio"),
+            None,
+            "rien d'appris : rien a rendre, et surtout rien a inventer"
+        );
+        repo.update_output_endpoint_id(id, AUDIO_GD).unwrap();
+        assert_eq!(
+            repo.endpoint_id_de_la_sortie("local:audio-gd USB audio")
+                .as_deref(),
+            Some(AUDIO_GD)
+        );
+        assert_eq!(repo.endpoint_id_de_la_sortie("local:inconnu"), None);
+    }
+
+    /// Le COMPTE DES COLLISIONS, sous l'index unique que porte le terrain.
+    ///
+    /// La migration ne pose AUCUNE contrainte sur `output_endpoint_id` : la
+    /// colonne naît NULL, sans index, sans UNIQUE. Ce qui peut percuter une
+    /// contrainte, c'est l'ECRITURE de `output_device_id` au moment d'une
+    /// ré-association — `idx_zones_output_device_id`, l'index unique PARTIEL
+    /// que `deduplicate_zones` pose sur toute base de testeur, et que le
+    /// `repo()` de ce module n'a pas. Une ré-association qui viserait un nom
+    /// déjà pris ferait donc, sur le terrain, un `UNIQUE constraint failed`
+    /// au DEMARRAGE — pas un refus propre.
+    ///
+    /// Ce témoin pose l'index POUR DE VRAI, compte les collisions avant et
+    /// après, et éprouve les deux branches : le nom libre (la zone suit) et
+    /// le nom pris (refus nommé, aucune écriture).
+    #[test]
+    fn sous_lindex_unique_de_terrain_la_passe_ne_percute_aucune_collision() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        // L'index que `deduplicate_zones` (startup.rs) pose sur toute base.
+        db.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id \
+             ON zones(output_device_id) WHERE output_device_id IS NOT NULL;",
+        )
+        .unwrap();
+        let repo = ZoneRepo::new(db);
+
+        let salon = repo
+            .create("Salon", Some("local"), Some("local:audio-gd USB audio"))
+            .unwrap();
+        repo.update_output_endpoint_id(salon, AUDIO_GD).unwrap();
+        let bureau = repo
+            .create("Bureau", Some("local"), Some("local:Haut-parleurs"))
+            .unwrap();
+        repo.update_output_endpoint_id(bureau, HAUT_PARLEURS)
+            .unwrap();
+
+        // ── Le compte, AVANT. Deux clefs, deux valeurs distinctes.
+        let collisions = |repo: &ZoneRepo, colonne: &str| -> i64 {
+            vue(
+                repo,
+                &format!(
+                    "SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM zones \
+                     WHERE {colonne} IS NOT NULL AND {colonne} <> '' \
+                     GROUP BY {colonne} HAVING COUNT(*) > 1)"
+                ),
+            )
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-1)
+        };
+        assert_eq!(
+            collisions(&repo, "output_endpoint_id"),
+            0,
+            "la nouvelle clef n'a aucune collision : c'est ce qui autorise \
+             à l'écrire sans arbitrage"
+        );
+        assert_eq!(collisions(&repo, "output_device_id"), 0);
+
+        // ── Branche 1 : le nom visé est LIBRE. La zone suit son appareil,
+        // l'écriture passe l'index.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[
+                sortie("audio-gd USB audio (44,1 kHz)", AUDIO_GD),
+                sortie("Haut-parleurs", HAUT_PARLEURS),
+            ])
+            .expect("aucune violation d'unicité : le nom visé était libre");
+        assert_eq!(rapport.reassociees.len(), 1);
+        assert_eq!(rapport.reassociees[0].zone_id, salon);
+        assert_eq!(collisions(&repo, "output_device_id"), 0);
+        assert_eq!(collisions(&repo, "output_endpoint_id"), 0);
+        assert_eq!(
+            vue(&repo, "SELECT COUNT(*) FROM zones").as_deref(),
+            Some("2")
+        );
+
+        // ── Branche 2 : le DAC revient sous le nom que l'AUTRE zone porte
+        // déjà. Sans le refus, `update_output_device` écrirait
+        // `local:Haut-parleurs` sur la zone Salon alors que Bureau le
+        // détient : `UNIQUE constraint failed: zones.output_device_id`, au
+        // DÉMARRAGE, sur la base d'un testeur. C'est le dégât que la règle
+        // évite, et l'index posé ci-dessus est celui qui le produirait.
+        let rapport = repo
+            .appliquer_identite_de_sortie(&[sortie("Haut-parleurs", AUDIO_GD)])
+            .expect("un refus, pas une violation d'unicité");
+        assert_eq!(
+            rapport.reassociees,
+            vec![],
+            "aucune écriture : le nom visé appartient à une autre zone"
+        );
+        assert!(
+            rapport.refus.iter().any(|(z, m)| *z == salon
+                && m.contains(&bureau.to_string())
+                && m.contains("fusion")),
+            "le nom pris doit produire un refus NOMMÉ, pas une écriture : {:?}",
+            rapport.refus
+        );
+        assert_eq!(collisions(&repo, "output_device_id"), 0);
+        assert_eq!(
+            vue(
+                &repo,
+                &format!("SELECT output_device_id FROM zones WHERE id = {salon}")
+            )
+            .as_deref(),
+            Some("local:audio-gd USB audio (44,1 kHz)"),
+            "la zone refusée n'a PAS bougé"
         );
     }
 }
