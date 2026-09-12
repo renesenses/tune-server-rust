@@ -845,6 +845,237 @@ pub trait PuitsDEchantillons {
     fn ecrire(&mut self, mots: &[f32]) -> bool;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// T8 de #2218 — le puits de CAPTURE.
+//
+// R1 (#3958) a nommé la frontière producteur → puits et l'a démontrée avec un
+// puits jetable, `PuitsEmpreinte`, qui vivait dans son propre fichier de
+// témoins. Ce qui suit est ce puits-là, devenu un type de première classe de
+// la caisse de contrat : le MÊME hachage, aux mêmes octets près — les quatre
+// relevés de R1 tombent dessus sans être retouchés —, plus les deux choses
+// qu'un puits de capture doit rendre et qu'un puits jetable n'avait pas :
+//
+//   * le **format réellement ouvert**, qui n'est pas celui de la source. Une
+//     piste 44,1 kHz servie sur un périphérique ouvert à 48 kHz est livrée à
+//     48 kHz, et rien dans le dépôt ne le publiait : `audio/tap.rs` publie
+//     depuis le DÉCODAGE (`send_windowed_pcm`, appelé neuf fois depuis
+//     `audio/decode.rs` et zéro fois depuis la boucle producteur, relevé le
+//     12/09/2026), donc au format SOURCE. Un consommateur qui croit voir ce
+//     qui part au DAC voit en fait ce qui entre dans la conversion ;
+//   * la **retenue** des mots, pour qu'un témoin puisse comparer le signal
+//     livré à une référence externe et pas seulement une empreinte à une
+//     empreinte.
+//
+// Pourquoi ici, et pas derrière `local-audio` : cette caisse n'a AUCUNE
+// fonctionnalité et figure dans le `-p` du job `Test` de `ci.yml` (ligne 262),
+// qui tourne sur toutes les PR Rust. Tout ce qui est ici est donc exécuté à
+// chaque PR ; tout ce qui reste dans `outputs::local` ne l'est que sous
+// `ci:full`. C'est la raison d'être de ce découpage.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Le format que la sortie a **réellement ouvert**, à l'autre bout du puits.
+///
+/// Ce n'est pas le format du fichier : entre les deux il y a l'adaptation de
+/// canaux et le rééchantillonnage. C'est le seul format dans lequel les mots
+/// d'un [`PuitsDEchantillons`] ont un sens — les interpréter avec la cadence
+/// de la source donne une durée fausse, et les désentrelacer avec le nombre de
+/// canaux de la source intervertit les voies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatOuvert {
+    /// Cadence du périphérique, en hertz.
+    pub cadence: u32,
+    /// Nombre de canaux entrelacés dans chaque bloc livré.
+    pub canaux: u16,
+}
+
+impl FormatOuvert {
+    pub fn new(cadence: u32, canaux: u16) -> Self {
+        Self { cadence, canaux }
+    }
+}
+
+/// L'état initial de l'empreinte : le décalage de base de FNV-1a 64 bits.
+///
+/// Publié parce qu'il est la réponse à « ce puits n'a rien reçu » — un témoin
+/// qui exige `empreinte() != EMPREINTE_DU_VIDE` dit exactement cela, là où
+/// `mots() > 0` dirait la même chose deux fois.
+pub const EMPREINTE_DU_VIDE: u64 = 0xcbf2_9ce4_8422_2325;
+
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Le puits de capture : il **hache les mots livrés** et publie le **format
+/// réellement ouvert**.
+///
+/// Il ne joue rien, ne bloque jamais et n'alloue rien en régime permanent
+/// quand la retenue est désactivée. Branché à la place de l'anneau cpal, il
+/// transforme la chaîne de lecture en instrument de mesure : ce qui aurait été
+/// envoyé au DAC devient une empreinte comparable.
+///
+/// # Ce que l'empreinte hache
+///
+/// Les **octets** des `f32`, petit-boutistes, pas leur valeur. Deux nombres
+/// mathématiquement égaux mais de représentations différentes — `0.0` et
+/// `-0.0`, deux `NaN` — doivent se voir, parce qu'un DAC les voit. C'est
+/// FNV-1a 64 bits, à l'identique de ce que R1 a mesuré ; les relevés de
+/// `empreinte_du_puits_r1.rs` sont donc valides sur ce type sans être repris.
+///
+/// # Ce que ce puits ne fait PAS
+///
+/// Il n'implémente pas [`OutputTarget`] : une sortie, c'est un transport, une
+/// file, des commandes et un état ; un puits, c'est une extrémité de PCM. Les
+/// deux se rencontrent dans `outputs::local`, pas ici. Il n'est pas non plus
+/// partageable entre fils — le trait prend `&mut self`, et le producteur est
+/// seul à écrire.
+pub struct CaptureOutput {
+    format: FormatOuvert,
+    empreinte: u64,
+    mots: u64,
+    blocs: u64,
+    blocs_vides: u64,
+    blocs_non_alignes: u64,
+    retenue: Option<Vec<f32>>,
+    plafond_de_retenue: usize,
+    retenue_complete: bool,
+    vivant: bool,
+}
+
+impl CaptureOutput {
+    /// Un puits qui ne retient rien : il ne garde que l'empreinte et les
+    /// comptes. C'est la forme utilisable sur une piste entière.
+    pub fn ouvert(format: FormatOuvert) -> Self {
+        Self {
+            format,
+            empreinte: EMPREINTE_DU_VIDE,
+            mots: 0,
+            blocs: 0,
+            blocs_vides: 0,
+            blocs_non_alignes: 0,
+            retenue: None,
+            plafond_de_retenue: 0,
+            retenue_complete: true,
+            vivant: true,
+        }
+    }
+
+    /// Un puits qui retient en plus les `plafond_de_retenue` premiers mots.
+    ///
+    /// Le plafond est explicite et son dépassement est **constaté**, jamais
+    /// silencieux : [`CaptureOutput::retenue_complete`] passe à `false` dès
+    /// qu'un mot livré n'a pas été retenu. Une retenue tronquée sans le dire
+    /// ferait comparer une référence entière à un tronçon, et c'est
+    /// exactement la forme de faux vert que cette tranche existe pour éviter.
+    pub fn avec_retenue(format: FormatOuvert, plafond_de_retenue: usize) -> Self {
+        let mut puits = Self::ouvert(format);
+        puits.retenue = Some(Vec::new());
+        puits.plafond_de_retenue = plafond_de_retenue;
+        puits
+    }
+
+    /// Le format réellement ouvert, tel qu'il a été convenu à l'ouverture.
+    pub fn format(&self) -> FormatOuvert {
+        self.format
+    }
+
+    /// L'empreinte de tout ce qui a été livré, dans l'ordre de livraison.
+    pub fn empreinte(&self) -> u64 {
+        self.empreinte
+    }
+
+    /// Le nombre de mots livrés — canaux compris.
+    pub fn mots(&self) -> u64 {
+        self.mots
+    }
+
+    /// Le nombre d'appels à `ecrire`, blocs vides compris.
+    pub fn blocs(&self) -> u64 {
+        self.blocs
+    }
+
+    /// Les appels à `ecrire` qui n'ont apporté aucun mot.
+    pub fn blocs_vides(&self) -> u64 {
+        self.blocs_vides
+    }
+
+    /// Les blocs dont la longueur n'est **pas** un multiple du nombre de
+    /// canaux ouverts.
+    ///
+    /// Un seul suffit à décaler toutes les trames suivantes : la voie gauche
+    /// part à droite et n'y revient jamais. Aucun anneau ne le signale — il
+    /// range des mots, pas des trames — et c'est donc au puits de le compter.
+    pub fn blocs_non_alignes(&self) -> u64 {
+        self.blocs_non_alignes
+    }
+
+    /// Le nombre de trames livrées, au format ouvert.
+    pub fn trames(&self) -> u64 {
+        if self.format.canaux == 0 {
+            return 0;
+        }
+        self.mots / u64::from(self.format.canaux)
+    }
+
+    /// La durée livrée, en millisecondes, **à la cadence ouverte**.
+    ///
+    /// C'est le chiffre que la cadence source rendrait faux : 8,7 % d'écart
+    /// entre 44,1 et 48 kHz.
+    pub fn duree_livree_ms(&self) -> u64 {
+        if self.format.cadence == 0 {
+            return 0;
+        }
+        self.trames() * 1000 / u64::from(self.format.cadence)
+    }
+
+    /// Les mots retenus, ou `None` si ce puits ne retient rien.
+    pub fn mots_livres(&self) -> Option<&[f32]> {
+        self.retenue.as_deref()
+    }
+
+    /// Faux dès qu'un mot livré n'a pas tenu sous le plafond de retenue.
+    pub fn retenue_complete(&self) -> bool {
+        self.retenue_complete
+    }
+
+    /// Déclare le puits mort : les écritures suivantes rendront `false`.
+    ///
+    /// C'est le rappel arraché du monde réel (#1626), reproductible sans
+    /// périphérique.
+    pub fn declarer_mort(&mut self) {
+        self.vivant = false;
+    }
+
+    /// Le puits consomme-t-il encore ?
+    pub fn vivant(&self) -> bool {
+        self.vivant
+    }
+}
+
+impl PuitsDEchantillons for CaptureOutput {
+    fn ecrire(&mut self, mots: &[f32]) -> bool {
+        self.blocs += 1;
+        if mots.is_empty() {
+            self.blocs_vides += 1;
+        }
+        if self.format.canaux != 0 && mots.len() % usize::from(self.format.canaux) != 0 {
+            self.blocs_non_alignes += 1;
+        }
+        self.mots += mots.len() as u64;
+        for mot in mots {
+            for octet in mot.to_bits().to_le_bytes() {
+                self.empreinte ^= u64::from(octet);
+                self.empreinte = self.empreinte.wrapping_mul(FNV_PRIME);
+            }
+        }
+        if let Some(retenue) = self.retenue.as_mut() {
+            let place = self.plafond_de_retenue.saturating_sub(retenue.len());
+            if place < mots.len() {
+                self.retenue_complete = false;
+            }
+            retenue.extend_from_slice(&mots[..place.min(mots.len())]);
+        }
+        self.vivant
+    }
+}
+
 #[async_trait::async_trait]
 pub trait OutputTarget: Send + Sync {
     fn name(&self) -> &str;

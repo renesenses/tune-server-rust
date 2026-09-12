@@ -18,55 +18,33 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
-use super::{
-    EtageDeConversion, LocalPcmKind, LocalPcmProcessor, PousseeVersLePuits, PuitsDEchantillons,
-};
+use super::{EtageDeConversion, LocalPcmKind, LocalPcmProcessor, PousseeVersLePuits};
+use crate::outputs::traits::{CaptureOutput, FormatOuvert};
 
-/// Un puits qui n'écrit nulle part : il **hache** ce qu'il reçoit.
+/// Le puits qui n'écrit nulle part et **hache** ce qu'il reçoit.
 ///
-/// C'est le premier autre puits que le chemin partagé ait jamais eu, et il
-/// démontre ce que R1 devait démontrer : le producteur n'a aucune idée de ce
-/// qu'il alimente. Le puits de capture de #2218 se branchera exactement ici.
-struct PuitsEmpreinte {
-    /// FNV-1a sur les OCTETS des `f32`, pas sur leur valeur : deux nombres
-    /// égaux mais de représentations différentes doivent se voir.
-    empreinte: u64,
-    mots: usize,
-    blocs: usize,
-    /// Le puits reste-t-il vivant ? Un témoin met ça à `false` pour vérifier
-    /// que le producteur constate un puits mort.
-    vivant: bool,
-}
-
-impl PuitsEmpreinte {
-    fn neuf() -> Self {
-        Self {
-            empreinte: 0xcbf2_9ce4_8422_2325,
-            mots: 0,
-            blocs: 0,
-            vivant: true,
-        }
-    }
-}
-
-impl PuitsDEchantillons for PuitsEmpreinte {
-    fn ecrire(&mut self, mots: &[f32]) -> bool {
-        self.blocs += 1;
-        self.mots += mots.len();
-        for mot in mots {
-            for octet in mot.to_bits().to_le_bytes() {
-                self.empreinte ^= u64::from(octet);
-                self.empreinte = self.empreinte.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-        self.vivant
-    }
+/// C'était `PuitsEmpreinte`, écrit ici même par R1. T8 (#2218) l'a promu dans
+/// `tune-output-api` sous le nom [`CaptureOutput`], à l'octet près — même
+/// FNV-1a, même décalage de base, même ordre — parce que c'est LE puits de
+/// capture, et qu'il n'y a aucune raison d'en tenir deux.
+///
+/// Ce que la substitution démontre, et que rien d'autre ne pouvait démontrer :
+/// les **quatre relevés ci-dessous, mesurés sur la chaîne en ligne d'avant la
+/// réorganisation (`5318d073`), tombent sur le puits de capture sans être
+/// retouchés d'un chiffre**. Le producteur n'a toujours aucune idée de ce
+/// qu'il alimente, et le puits de #2218 reçoit bien les octets de `play_url`.
+///
+/// `neuf()` ouvre au format identité (44,1 kHz stéréo) : R1 ne mesure que des
+/// empreintes, et le format ouvert n'entre dans aucun de ses relevés. Les
+/// témoins qui en dépendent vivent dans `capture_bout_en_bout_2218.rs`.
+fn puits_empreinte() -> CaptureOutput {
+    CaptureOutput::ouvert(FormatOuvert::new(44_100, 2))
 }
 
 /// Le DSP au repos : aucun égaliseur, aucun convolveur, aucun crossfeed,
 /// aucun repli mono. C'est l'état d'une zone qui ne fait que lire — celui où
 /// « pas un octet de différence » est vérifiable à l'octet près.
-struct DspAuRepos {
+pub(super) struct DspAuRepos {
     eq: std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
     convolver: std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
@@ -79,7 +57,7 @@ struct DspAuRepos {
 }
 
 impl DspAuRepos {
-    fn neuf() -> Self {
+    pub(super) fn neuf() -> Self {
         Self {
             eq: std::sync::Mutex::new(None),
             convolver: std::sync::Mutex::new(None),
@@ -109,7 +87,11 @@ impl DspAuRepos {
 }
 
 /// Un étage monté comme `play_url` le monte, sur un format source donné.
-fn etage<'a>(
+///
+/// `pub(super)` depuis T8 (#2218) : `capture_bout_en_bout_2218.rs` monte la
+/// même chaîne, et deux constructeurs d'étage dans le même module seraient
+/// deux endroits où l'ordre des conversions pourrait diverger.
+pub(super) fn etage<'a>(
     dsp: &'a DspAuRepos,
     octets: Vec<u8>,
     sample_rate: u32,
@@ -153,7 +135,7 @@ fn pcm16(trames: usize, channels: u16) -> Vec<u8> {
 }
 
 /// Pousse tout ce qui est poussable et rend l'empreinte du puits.
-fn pousser_tout(etage: &mut EtageDeConversion<'_>, puits: &mut PuitsEmpreinte) -> u64 {
+fn pousser_tout(etage: &mut EtageDeConversion<'_>, puits: &mut CaptureOutput) -> u64 {
     let mut refus = |_dop: bool, _sr: u32, _ch: u16| false;
     loop {
         match etage.pousser(puits, &mut refus, &mut |_| {}) {
@@ -163,7 +145,7 @@ fn pousser_tout(etage: &mut EtageDeConversion<'_>, puits: &mut PuitsEmpreinte) -
             PousseeVersLePuits::PorteurDopRefuse => panic!("aucun porteur DoP dans ce flux"),
         }
     }
-    puits.empreinte
+    puits.empreinte()
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -178,11 +160,12 @@ fn pousser_tout(etage: &mut EtageDeConversion<'_>, puits: &mut PuitsEmpreinte) -
 fn le_puits_recoit_exactement_les_memes_octets_sans_conversion() {
     let dsp = DspAuRepos::neuf();
     let mut e = etage(&dsp, pcm16(2048, 2), 44_100, 2, 16, 44_100, 2);
-    let mut puits = PuitsEmpreinte::neuf();
+    let mut puits = puits_empreinte();
     let empreinte = pousser_tout(&mut e, &mut puits);
 
     assert_eq!(
-        puits.mots, 4096,
+        puits.mots(),
+        4096,
         "2048 trames stéréo font 4096 mots : le puits doit tout recevoir"
     );
     assert_eq!(
@@ -199,10 +182,10 @@ fn le_puits_recoit_exactement_les_memes_octets_sans_conversion() {
 fn le_puits_recoit_les_memes_octets_apres_adaptation_de_canaux() {
     let dsp = DspAuRepos::neuf();
     let mut e = etage(&dsp, pcm16(2048, 2), 44_100, 2, 16, 44_100, 1);
-    let mut puits = PuitsEmpreinte::neuf();
+    let mut puits = puits_empreinte();
     let empreinte = pousser_tout(&mut e, &mut puits);
 
-    assert_eq!(puits.mots, 2048, "stéréo → mono : moitié moins de mots");
+    assert_eq!(puits.mots(), 2048, "stéréo → mono : moitié moins de mots");
     assert_eq!(
         empreinte, EMPREINTE_ADAPTATION_STEREO_VERS_MONO,
         "l'adaptation de canaux ne rend plus les mêmes octets qu'avant la \
@@ -234,11 +217,11 @@ fn le_puits_recoit_les_memes_octets_apres_reechantillonnage() {
         )
         .expect("le rééchantillonneur 44,1 → 48 kHz se construit"),
     );
-    let mut puits = PuitsEmpreinte::neuf();
+    let mut puits = puits_empreinte();
     let empreinte = pousser_tout(&mut e, &mut puits);
 
     assert!(
-        puits.mots > 0,
+        puits.mots() > 0,
         "le rééchantillonneur doit rendre du signal, pas du vide"
     );
     assert_eq!(
@@ -282,11 +265,12 @@ fn le_puits_recoit_les_memes_octets_apres_adaptation_puis_reechantillonnage() {
         )
         .expect("le rééchantillonneur mono 44,1 → 48 kHz se construit"),
     );
-    let mut puits = PuitsEmpreinte::neuf();
+    let mut puits = puits_empreinte();
     let empreinte = pousser_tout(&mut e, &mut puits);
 
     assert_eq!(
-        puits.mots, 8914,
+        puits.mots(),
+        8914,
         "stéréo → mono PUIS 44,1 → 48 kHz : le compte de mots dit déjà si \
          l'ordre a changé"
     );
@@ -309,8 +293,8 @@ fn le_puits_recoit_les_memes_octets_apres_adaptation_puis_reechantillonnage() {
 fn un_puits_qui_ne_consomme_plus_est_rapporte_au_producteur() {
     let dsp = DspAuRepos::neuf();
     let mut e = etage(&dsp, pcm16(2048, 2), 44_100, 2, 16, 44_100, 2);
-    let mut puits = PuitsEmpreinte::neuf();
-    puits.vivant = false;
+    let mut puits = puits_empreinte();
+    puits.declarer_mort();
     let mut refus = |_dop: bool, _sr: u32, _ch: u16| false;
 
     match e.pousser(&mut puits, &mut refus, &mut |_| {}) {
@@ -334,7 +318,7 @@ fn un_puits_qui_ne_consomme_plus_est_rapporte_au_producteur() {
 fn un_porteur_dop_refuse_n_ecrit_rien_dans_le_puits() {
     let dsp = DspAuRepos::neuf();
     let mut e = etage(&dsp, pcm16(2048, 2), 44_100, 2, 16, 48_000, 2);
-    let mut puits = PuitsEmpreinte::neuf();
+    let mut puits = puits_empreinte();
     let mut refus = |_dop: bool, _sr: u32, _ch: u16| true;
 
     match e.pousser(&mut puits, &mut refus, &mut |_| {}) {
@@ -342,10 +326,11 @@ fn un_porteur_dop_refuse_n_ecrit_rien_dans_le_puits() {
         _ => panic!("le refus du porteur DoP doit court-circuiter l'écriture"),
     }
     assert_eq!(
-        puits.blocs, 0,
+        puits.blocs(),
+        0,
         "le puits ne doit avoir reçu AUCUN bloc : le refus tombe avant lui"
     );
-    assert_eq!(puits.mots, 0, "ni aucun mot");
+    assert_eq!(puits.mots(), 0, "ni aucun mot");
 }
 
 /// Le tampon d'attente conserve le reliquat non aligné d'un bloc à l'autre.
@@ -361,18 +346,19 @@ fn un_flux_coupe_en_deux_rend_la_meme_empreinte_qu_entier() {
 
     let dsp_entier = DspAuRepos::neuf();
     let mut e = etage(&dsp_entier, octets.clone(), 44_100, 2, 16, 44_100, 2);
-    let mut puits_entier = PuitsEmpreinte::neuf();
+    let mut puits_entier = puits_empreinte();
     let entier = pousser_tout(&mut e, &mut puits_entier);
 
     let dsp_coupe = DspAuRepos::neuf();
     let mut d = etage(&dsp_coupe, debut.to_vec(), 44_100, 2, 16, 44_100, 2);
-    let mut puits_coupe = PuitsEmpreinte::neuf();
+    let mut puits_coupe = puits_empreinte();
     pousser_tout(&mut d, &mut puits_coupe);
     d.en_attente.extend_from_slice(fin);
     let coupe = pousser_tout(&mut d, &mut puits_coupe);
 
     assert_eq!(
-        puits_coupe.mots, puits_entier.mots,
+        puits_coupe.mots(),
+        puits_entier.mots(),
         "le reliquat non aligné doit être reporté, pas jeté"
     );
     assert_eq!(

@@ -10399,3 +10399,12 @@ mod pcm_materiel_a_la_resolution_i1655;
 
 #[cfg(test)]
 mod empreinte_du_puits_r1;
+
+/// T8 de #2218 — le puits de capture branché sur une VRAIE piste.
+///
+/// R1 garde la conversion contre des relevés pris sur la version d'avant ; T1
+/// garde le décodeur contre `flac -d`. Ce module relie les deux : une fixture
+/// du banc jouée jusqu'au puits, et l'empreinte livrée comparée à celle du
+/// décodeur de référence. Voir son en-tête pour ce qu'il ne couvre pas.
+#[cfg(test)]
+mod capture_bout_en_bout_2218;
