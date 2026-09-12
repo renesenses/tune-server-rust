@@ -55,6 +55,10 @@ const LOCAL_RS: &str = include_str!("../../tune-core/src/outputs/local.rs");
 // la fermeture `refuser_le_porteur_dop` et l'étage restent dans `local.rs`.
 // La garde lit les deux fichiers concaténés, jamais l'un à la place de l'autre.
 const BACKEND_RS: &str = include_str!("../../tune-core/src/outputs/local/backend.rs");
+// REF-8 (#2219) : la SECONDE route « décision DoP », celle des bras Windows
+// exclusifs sur anneau entier (`local/etage_natif.rs`). Elle ne refuse pas le
+// porteur : elle le porte. Voir `la_route_native_porte_le_porteur_dop_et_le_dit`.
+const ETAGE_NATIF_RS: &str = include_str!("../../tune-core/src/outputs/local/etage_natif.rs");
 
 /// La production seule : `local.rs` se termine par `#[cfg(test)] mod tests`,
 /// dont le texte citerait nos propres motifs et rendrait la garde complaisante.
@@ -352,4 +356,78 @@ fn la_decision_de_cadence_reste_branchee_et_le_filtre_tautologique_n_est_pas_rev
         "#3233 — une décision qui change ce qui part au DAC doit atteindre le \
          client : sans `note_rate_decision`, il ne reste que le journal"
     );
+}
+
+/// REF-8 (#2219) — la SECONDE route « décision DoP », nommée.
+///
+/// La route cpal partagée REFUSE le porteur DoP avant toute conversion : le
+/// sinc le détruirait. La route native des bras Windows exclusifs (WASAPI,
+/// ASIO natif) n'a ni sinc ni adaptation de canaux : le mot part entier,
+/// aligné à gauche, jusqu'au DAC. Elle ne refuse donc PAS le porteur — elle
+/// le **détecte** (`is_dop_pcm` sur la première fenêtre 24 bits, verrouillé
+/// par `dop_latched`), le **porte** tel quel (branche brute de
+/// `prepare_windows_native_pcm` : ni volume, ni DSP) et le **dit** (`dop`
+/// dans `EcritureNative::Poussee`). Ce test verrouille ces trois gestes, pour
+/// qu'une « unification » des deux routes ne fasse pas refuser à WASAPI un
+/// DoP qu'il joue aujourd'hui — ni ne fasse taire la décision.
+///
+/// La preuve d'exécution vit sur Shrek : `empreinte_wasapi_f70496` joue la
+/// fixture DoP versionnée à travers l'étage, le puits, l'anneau et
+/// `pop_pcm_bytes`, octet pour octet.
+#[test]
+fn la_route_native_porte_le_porteur_dop_et_le_dit() {
+    let etage = sans_commentaires_ni_blancs(
+        ETAGE_NATIF_RS
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("etage_natif.rs garde son `mod tests` en fin de fichier"),
+    );
+    let corps = etage
+        .split("fndecoder_et_pousser(")
+        .nth(1)
+        .and_then(|s| s.split("fnrendre_la_queue(").next())
+        .expect("REF-8 — `EtageNatif::decoder_et_pousser` doit rester identifiable");
+    assert!(
+        corps.contains("prepare_windows_native_pcm(")
+            && corps.contains("self.must_classify_24_bit,")
+            && corps.contains("self.dop_latched,"),
+        "REF-8 — la route native ne décide plus le DoP par `prepare_windows_native_pcm` \
+         (sonde 24 bits + verrou) : un porteur DoP serait traité comme du PCM, volume et DSP \
+         compris, et le DAC quitterait le mode DSD"
+    );
+    assert!(
+        corps.contains("self.dop_latched=prepared.dop;"),
+        "REF-8 — la décision DoP n'est plus verrouillée : un flux mal formé pourrait \
+         basculer à une frontière de bloc"
+    );
+    assert!(
+        !corps.contains("refuser_le_porteur_dop") && !corps.contains("PorteurDopRefuse"),
+        "REF-8 — la route native REFUSE le porteur DoP : elle le portait tel quel, et c'est \
+         ce que les testeurs WASAPI écoutent (Pierre M, fil 1043)"
+    );
+    assert!(
+        corps.contains("dop:prepared.dop,"),
+        "REF-8 — la route native ne dit plus si elle porte du DoP : la zone ne peut plus \
+         afficher le mode DSD ni caler le volume dessus"
+    );
+
+    // La branche brute de la préparation : DoP ⇒ `bit_perfect`, donc aucune
+    // arithmétique — c'est `local.rs` qui la tient, et elle doit y rester.
+    let preparation = sans_commentaires_ni_blancs(&production());
+    let corps = preparation
+        .split("fnprepare_windows_native_pcm(")
+        .nth(1)
+        .and_then(|s| s.split("Some(PreparedNativePcm{").next())
+        .expect("#3233 — `prepare_windows_native_pcm` doit rester identifiable");
+    assert!(
+        corps
+            .contains("letdop=dop_latched||(bit_depth==24&&is_dop_pcm(bytes,bit_depth,channels));")
+            && la_branche_brute_protege_le_dop(corps),
+        "REF-8 — la branche brute de `prepare_windows_native_pcm` ne protège plus le DoP du \
+         volume et du DSP"
+    );
+}
+
+fn la_branche_brute_protege_le_dop(corps: &str) -> bool {
+    corps.contains("letbit_perfect=dop||(volume_units==1000&&local_dsp_is_identity(")
 }

@@ -39,6 +39,19 @@ fn bras(nom: &str) -> String {
     })
 }
 
+/// L'étage natif des bras Windows (REF-8, #2219) : `local/etage_natif.rs`,
+/// coupé à son `mod tests`. C'est lui qui prépare (`prepare_windows_native_pcm`)
+/// et qui draine (`flush_local_dsp`) pour WASAPI ; le bras ne fait plus que
+/// l'appeler. Un appel par fichier, chemin en clair, comme `bras`.
+fn etage_natif() -> String {
+    let lu = std::fs::read_to_string(Path::new("src/outputs/local/etage_natif.rs"))
+        .expect("src/outputs/local/etage_natif.rs doit être lisible depuis la racine du crate");
+    lu.split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap_or(&lu)
+        .to_string()
+}
+
 /// La production seule : `mod tests` contient les mêmes appels et rendrait
 /// toute assertion de comptage triviale. Ma première version de
 /// `la_boucle_gapless_applique_le_dsp` allait jusqu'à la fin du fichier et
@@ -88,15 +101,19 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     let bras_coreaudio = bras("coreaudio");
     let bras_asio = bras("asio");
     let bras_wasapi = bras("wasapi");
+    let etage_natif = etage_natif();
 
     // R6 bis (#2219) : la définition et les deux drainages du chemin cpal
     // partagé (transition gapless, fin de chaîne) restent dans `local.rs` ;
     // chaque bras exclusif porte le sien dans son module. Le plancher ne
     // bouge pas : cinq chemins, cinq drainages, quel que soit le fichier.
+    // REF-8 : le drainage de WASAPI vit dans l'étage natif (`rendre_la_queue`),
+    // que le bras appelle ; il compte pour lui.
     let drainages = prod.matches("flush_local_dsp(").count() - 1 // moins la définition
         + bras_coreaudio.matches("flush_local_dsp(").count()
         + bras_asio.matches("flush_local_dsp(").count()
-        + bras_wasapi.matches("flush_local_dsp(").count();
+        + bras_wasapi.matches("flush_local_dsp(").count()
+        + etage_natif.matches("flush_local_dsp(").count();
     assert!(
         drainages >= 5,
         "les cinq chemins de lecture locale doivent drainer, {drainages} trouvé(s)"
@@ -182,10 +199,36 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         "play_url n'appelle plus le bras WASAPI exclusif : un module écrit mais pas \
          branché ne draine rien (R6 bis, #2219)"
     );
+    // REF-8 (#2219) : le bras WASAPI ne prépare ni ne draine en ligne — il
+    // monte l'étage natif, lui fait décoder et pousser chaque lecture, puis
+    // lui fait rendre la queue du DSP. La préparation entière et le drainage
+    // vivent dans l'étage ; un bras qui n'appellerait plus l'un des deux, ou
+    // un étage qui ne les contiendrait plus, rougit nommément.
     assert!(
-        bras_wasapi.contains("feed_windows_native_exclusive_leftover(")
-            && bras_wasapi.contains("flush_local_dsp("),
-        "WASAPI doit passer par la préparation entière puis drainer sa fin de piste"
+        bras_wasapi.contains("etage.decoder_et_pousser(")
+            && bras_wasapi.contains("etage.rendre_la_queue("),
+        "WASAPI doit faire décoder et pousser par l'étage natif, puis lui faire rendre la \
+         queue du DSP en fin de piste (REF-8, #2219)"
+    );
+    let decoder = etage_natif
+        .split("fn decoder_et_pousser(")
+        .nth(1)
+        .and_then(|s| s.split("fn rendre_la_queue(").next())
+        .expect("l'étage natif doit garder `decoder_et_pousser` avant `rendre_la_queue`");
+    assert!(
+        decoder.contains("prepare_windows_native_pcm("),
+        "l'étage natif ne passe plus par la préparation entière : DoP, volume et DSP ne \
+         sont plus résolus avant l'anneau (REF-8, #2219)"
+    );
+    let queue = etage_natif
+        .split("fn rendre_la_queue(")
+        .nth(1)
+        .and_then(|s| s.split("fn vider(").next())
+        .expect("l'étage natif doit garder `rendre_la_queue` avant `vider`");
+    assert!(
+        queue.contains("flush_local_dsp(") && queue.contains("f32_to_native_i32("),
+        "l'étage natif ne draine plus le convolveur vers l'anneau entier en fin de piste \
+         (#2209) : la queue de la convolution ne part jamais au DAC"
     );
 
     let partage = prod
