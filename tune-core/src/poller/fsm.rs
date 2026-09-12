@@ -985,3 +985,351 @@ mod tests {
         );
     }
 }
+
+// ── REF-9 (#2219) — les 22 transitions nommées, en ombre ────────────────
+//
+// Une variante par ligne de la table « Table des transitions proposée » de
+// `docs/refonte/ref9-etats-du-sondeur.md`. `tick` appelle
+// `ps.transition(Transition::X)` juste APRÈS l'écriture de drapeau qui, chez
+// lui, constitue la transition ; il ne lit jamais `etat`. La table `suivant`
+// n'a aucun bras `_` : une transition depuis un état où elle n'est pas
+// prévue est une `Incoherence` rapportée, pas un silence.
+
+use super::etat::{Armement, CauseDeCoupure, Depuis, EtatDeLecture, Incoherence, Issue, MotifFin};
+use super::{ArmedNext, ZonePollState};
+
+/// Ce qui fait passer [`EtatDeLecture`] d'une variante à l'autre. Le numéro
+/// est celui de la ligne dans la table du document ; la ligne `tick.rs:`
+/// est le site où `tick` l'appelle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Transition {
+    /// 1 — génération changée : tout est rabattu (bloc
+    /// `poller_track_generation_changed_resetting_state`).
+    NouvellePiste,
+    /// 2 — premier échantillon plausible : `stale_start_position` ne l'a
+    /// pas écarté.
+    PremierEchantillonPlausible,
+    /// 3 — fenêtre des 30 s : `SetNext` accepté, ou renoncé sur sortie
+    /// exclusive.
+    Armement { armement: Armement },
+    /// 4 — durée changée + position qui confirme, ou position remise à
+    /// zéro : le renderer a enchaîné.
+    TransitionDetectee,
+    /// 5 — armement expiré (> 200 s) ou file changée sous l'armement
+    /// (#3026) : on désarme, le même tour ré-arme.
+    Desarmement,
+    /// 6 — `Stopped` dans la garde des 15 s, assez joué : on attend que le
+    /// renderer rejoue.
+    ArretDansLaGarde,
+    /// 7 — `Stopped` alors que Tune joue : un tick d'arrêt de plus.
+    RendererArrete,
+    /// 8 — le compte d'arrêt est effacé : le renderer joue (ou est en
+    /// pause, ou Tune ne joue plus, ou une grâce masque l'arrêt).
+    ArretEfface,
+    /// 9 — `Stopped` × 5, fin naturelle, armé, sortie capable : on attend
+    /// l'enchaînement.
+    FinNaturelleEnAttenteDEnchainement,
+    /// 10 — `Stopped` × 5, fin naturelle, flux servi : la piste est finie.
+    FinNaturelleApresArret,
+    /// 11 — la zone est coupée : fin refusée dix fois sur flux incomplet,
+    /// ou `Stopped` × 30 avec compteur d'octets MESURÉ à sec.
+    PanneDeLecture { cause: CauseDeCoupure },
+    /// 12 — `Stopped` × 30, octets consommés ou inconnus : on attend
+    /// encore (#2394).
+    AttenteProlongee,
+    /// 13 — le renderer rejoue alors qu'une avance est pendante :
+    /// enchaînement confirmé.
+    EnchainementConfirme,
+    /// 14 — refroidissement écoulé, deux tours bloqués : fin forcée.
+    EnchainementBloque,
+    /// 15 — position > durée + 3 s pendant trois tours (ou horloge murale).
+    PositionAuDelaDeLaFin,
+    /// 16 — la sortie signale la fin avant le seuil : `ended_naturally`
+    /// plausible, ou DSD sur DLNA au pic.
+    FinConstateeAvantLeSeuil { motif: MotifFin },
+    /// 17 — `Playing` × 30 sans progrès ni octets : la zone est coupée.
+    LectureSansProgres,
+    /// 18 — la sonde a rendu `Err`.
+    SondeEnEchec,
+    /// 19 — sonde en échec, DLNA, horloge écoulée : la fin est prononcée
+    /// (l'état survit, l'emprunt interdit son retrait).
+    FinParHorlogeMurale,
+    /// 20 — la sonde a rendu `Ok` : l'état d'avant la panne est restitué.
+    SondeRetablie,
+    /// 21 — `now_playing.source == "radio"`.
+    SourceRadio,
+    /// 22 — radio : six ticks `Stopped` sans position, ou station refusée.
+    RadioAbandonnee,
+}
+
+fn inattendue(etat: &EtatDeLecture, t: Transition) -> Result<EtatDeLecture, Incoherence> {
+    Err(Incoherence::TransitionInattendue {
+        etat: format!("{etat:?}"),
+        transition: format!("{t:?}"),
+    })
+}
+
+/// La table : l'état APRÈS `t` depuis `etat`, ou l'incohérence. Pure.
+pub(super) fn suivant(etat: &EtatDeLecture, t: Transition) -> Result<EtatDeLecture, Incoherence> {
+    use EtatDeLecture::*;
+    match t {
+        Transition::NouvellePiste => match etat {
+            Neuve
+            | Lecture
+            | Armee { .. }
+            | Arretee { .. }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => Ok(Neuve),
+        },
+        Transition::PremierEchantillonPlausible => match etat {
+            Neuve => Ok(Lecture),
+            Lecture | Armee { .. } | Arretee { .. } | AvancePendante => Ok(etat.clone()),
+            Radio | SondageEnEchec { .. } | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::Armement { armement } => match etat {
+            Lecture => Ok(Armee { armement }),
+            Neuve
+            | Armee { .. }
+            | Arretee { .. }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::TransitionDetectee => match etat {
+            Armee { .. }
+            | Arretee {
+                depuis: Depuis::Armee(_),
+            } => Ok(Lecture),
+            Neuve
+            | Lecture
+            | Arretee {
+                depuis: Depuis::Lecture,
+            }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::Desarmement => match etat {
+            Armee { .. } => Ok(Lecture),
+            Neuve
+            | Lecture
+            | Arretee { .. }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::ArretDansLaGarde => match etat {
+            Armee {
+                armement: Armement::Accepte { .. },
+            } => Ok(AvancePendante),
+            Neuve
+            | Lecture
+            | Armee {
+                armement: Armement::Renonce,
+            }
+            | Arretee { .. }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::RendererArrete => match etat {
+            Lecture => Ok(Arretee {
+                depuis: Depuis::Lecture,
+            }),
+            Armee { armement } => Ok(Arretee {
+                depuis: Depuis::Armee(*armement),
+            }),
+            Arretee { .. } => Ok(etat.clone()),
+            Neuve | AvancePendante | Radio | SondageEnEchec { .. } | Terminee(_) => {
+                inattendue(etat, t)
+            }
+        },
+        Transition::ArretEfface => match etat {
+            Arretee {
+                depuis: Depuis::Lecture,
+            } => Ok(Lecture),
+            Arretee {
+                depuis: Depuis::Armee(armement),
+            } => Ok(Armee {
+                armement: *armement,
+            }),
+            Lecture | Armee { .. } | AvancePendante => Ok(etat.clone()),
+            Neuve | Radio | SondageEnEchec { .. } | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::FinNaturelleEnAttenteDEnchainement => match etat {
+            Arretee {
+                depuis: Depuis::Armee(_),
+            } => Ok(AvancePendante),
+            Neuve
+            | Lecture
+            | Armee { .. }
+            | Arretee {
+                depuis: Depuis::Lecture,
+            }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::FinNaturelleApresArret => match etat {
+            Arretee { .. } => Ok(Terminee(Issue::Finie(MotifFin::FinNaturelleApresArret))),
+            Neuve
+            | Lecture
+            | Armee { .. }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::PanneDeLecture { cause } => match etat {
+            Arretee { .. } => Ok(Terminee(Issue::Coupee(cause))),
+            Neuve
+            | Lecture
+            | Armee { .. }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::AttenteProlongee => match etat {
+            Arretee { .. } => Ok(etat.clone()),
+            Neuve
+            | Lecture
+            | Armee { .. }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::EnchainementConfirme => match etat {
+            AvancePendante => Ok(Lecture),
+            Neuve
+            | Lecture
+            | Armee { .. }
+            | Arretee { .. }
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::EnchainementBloque => match etat {
+            AvancePendante => Ok(Terminee(Issue::Finie(MotifFin::AvanceGaplessBloquee))),
+            Neuve
+            | Lecture
+            | Armee { .. }
+            | Arretee { .. }
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::PositionAuDelaDeLaFin => match etat {
+            Lecture | Armee { .. } => Ok(Terminee(Issue::Finie(MotifFin::PositionAuDelaDeLaFin))),
+            Neuve
+            | Arretee { .. }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::FinConstateeAvantLeSeuil { motif } => match etat {
+            Lecture | Armee { .. } | Arretee { .. } => Ok(Terminee(Issue::Finie(motif))),
+            Neuve | AvancePendante | Radio | SondageEnEchec { .. } | Terminee(_) => {
+                inattendue(etat, t)
+            }
+        },
+        Transition::LectureSansProgres => match etat {
+            Lecture | Armee { .. } => {
+                Ok(Terminee(Issue::Coupee(CauseDeCoupure::LectureSansProgres)))
+            }
+            Neuve
+            | Arretee { .. }
+            | AvancePendante
+            | Radio
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::SondeEnEchec => match etat {
+            Neuve | Lecture | Armee { .. } | Arretee { .. } | AvancePendante | Radio => {
+                Ok(SondageEnEchec {
+                    precedent: Box::new(etat.clone()),
+                })
+            }
+            // Une panne qui dure garde l'état d'avant ; un état terminal
+            // survivant (fin par horloge murale) le reste.
+            SondageEnEchec { .. } | Terminee(_) => Ok(etat.clone()),
+        },
+        Transition::FinParHorlogeMurale => match etat {
+            SondageEnEchec { .. } => Ok(Terminee(Issue::Finie(
+                MotifFin::HorlogeMuraleSurSondeEnEchec,
+            ))),
+            Neuve
+            | Lecture
+            | Armee { .. }
+            | Arretee { .. }
+            | AvancePendante
+            | Radio
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::SondeRetablie => match etat {
+            SondageEnEchec { precedent } => Ok((**precedent).clone()),
+            // Chaque sondage réussi remet `consecutive_errors` à zéro :
+            // hors panne, c'est une identité.
+            Neuve
+            | Lecture
+            | Armee { .. }
+            | Arretee { .. }
+            | AvancePendante
+            | Radio
+            | Terminee(_) => Ok(etat.clone()),
+        },
+        Transition::SourceRadio => match etat {
+            Neuve | Radio => Ok(Radio),
+            Lecture
+            | Armee { .. }
+            | Arretee { .. }
+            | AvancePendante
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+        Transition::RadioAbandonnee => match etat {
+            Radio => Ok(Terminee(Issue::Coupee(CauseDeCoupure::RadioAbandonnee))),
+            Neuve
+            | Lecture
+            | Armee { .. }
+            | Arretee { .. }
+            | AvancePendante
+            | SondageEnEchec { .. }
+            | Terminee(_) => inattendue(etat, t),
+        },
+    }
+}
+
+impl ZonePollState {
+    /// Fait passer `etat` d'une variante à l'autre. Une transition imprévue
+    /// depuis l'état courant est RAPPORTÉE (`poller_etat_transition_inattendue`)
+    /// et laisse `etat` tel quel : c'est [`ZonePollState::coherent`] qui, en
+    /// fin de tour, dira si les drapeaux ont divergé. Aucune décision de
+    /// `tick` n'en dépend, en debug comme en release.
+    pub(super) fn transition(&mut self, t: Transition) {
+        match suivant(&self.etat, t) {
+            Ok(etat) => self.etat = etat,
+            Err(incoherence) => tracing::warn!(
+                track_generation = self.track_generation,
+                %incoherence,
+                "poller_etat_transition_inattendue"
+            ),
+        }
+    }
+}
+
+/// Ce que `Transition::Armement` reçoit de `GaplessPrep::Armed(arme)`.
+pub(super) fn armement_accepte(ligne: Option<ArmedNext>) -> Transition {
+    Transition::Armement {
+        armement: Armement::Accepte { ligne },
+    }
+}

@@ -285,3 +285,140 @@ passe à `fsm::classify_stopped` / `classify_playing` ou au prédicat de
 avec leur ligne) et observe l'état après ; il vérifie en outre que l'écriture
 recopiée figure bien dans `tick.rs` à quelques lignes du journal qui nomme la
 branche, pour que le miroir ne survive pas à un `tick` qui change.
+
+## Décisions du 12/09 (par défaut, arbitrage de Bertrand attendu)
+
+Nuit du 12 au 13/09, agent E, sur `batch/bugs-12` à `c503d33a` (les lignes
+de `tick.rs` citées plus haut valent +6 sur cette base). Aucun comportement
+ne change : l'énumération est **en ombre**, écrite par `tick`, jamais lue par
+lui. Les trois points ouverts sont tranchés par défaut, pour que le dessin
+se discute sur du code qui tourne :
+
+1. **« Arrêtée » est un état** : `Arretee { depuis: Depuis }`, avec
+   `Depuis::Lecture | Depuis::Armee(Armement)`. L'arrêt retient d'où il
+   vient, parce que l'armement survit à l'arrêt (armé, garde expirée,
+   `Stopped` × 5 → attente d'enchaînement, ligne 1652).
+2. **Le second sens de `gapless_sent` est une variante distincte** :
+   `Armee { armement: Armement }` avec `Armement::Accepte { ligne }`
+   (`SetNext` accepté, `ligne` = ce que `gapless_armed` porte) et
+   `Armement::Renonce` (sortie exclusive, rien n'est parti, 2147). La
+   cohérence exige `gapless_armed == None` et `gapless_sent_at == None`
+   sous `Renonce`.
+3. **Le retrait depuis la branche d'erreur passe par une transition
+   nommée** : `FinParHorlogeMurale` fait passer `SondageEnEchec` à
+   `Terminee(Finie(HorlogeMuraleSurSondeEnEchec))`. L'état survit à
+   l'emprunt (674) ; c'est le seul état terminal qui survive à un tour, et
+   le seul qui ait le droit de porter `wall_clock_end_fired = true`. Depuis
+   `Terminee`, seules `SondeEnEchec`, `SondeRetablie` (identités) et
+   `NouvellePiste` sont admises : un état terminal ne « joue » plus.
+
+Une variante ne porte que ce qui la **distingue** ; les compteurs et
+horloges que la proposition lui attribuait restent dans les 39 champs tant
+que l'ombre ne pilote rien — les recopier ferait deux écrivains pour un même
+fait, et c'est précisément ce que l'invariant doit rendre impossible.
+
+### L'énumération (`poller/etat.rs`)
+
+| Variante | Champs portés | Ce que les drapeaux doivent dire (`coherent()`) |
+|---|---|---|
+| `Neuve` | — | `gapless_sent=false`, `gapless_armed=None`, `gapless_sent_at=None`, `gapless_advance_pending=false`, `stopped_ticks=0` |
+| `Lecture` | — | idem |
+| `Armee { armement }` | `Accepte { ligne: Option<ArmedNext> }` ou `Renonce` | `gapless_sent=true`, `gapless_armed == ligne` (ou `None` + pas d'horodatage sous `Renonce`), `pending=false`, `stopped_ticks=0` |
+| `Arretee { depuis }` | `Depuis::Lecture` ou `Depuis::Armee(armement)` | `stopped_ticks > 0`, `pending=false`, et les drapeaux de `depuis` |
+| `AvancePendante` | — | `gapless_advance_pending=true`, désarmé, `stopped_ticks=0` |
+| `Radio` | — | comme `Lecture` |
+| `SondageEnEchec { precedent }` | l'état d'avant, restitué au prochain `Ok` | `consecutive_errors > 0`, et les drapeaux de `precedent` |
+| `Terminee(Issue)` | `Finie(MotifFin)` (5 motifs de `motif_fin` + horloge murale) ou `Coupee(CauseDeCoupure)` (4 causes) | retiré dans le tour ; sauf horloge murale : `wall_clock_end_fired=true` |
+
+Hors état terminal, `wall_clock_end_fired` doit être faux. `ZonePollState`
+gagne le champ `etat: EtatDeLecture` **à côté** des 39 champs — aucun
+retiré, aucun renommé. Les cinq littéraux `ZonePollState { … }` de
+`poller/tests.rs` reçoivent la ligne `etat: EtatDeLecture::Neuve` (ils ne
+passent jamais par `tick`).
+
+### Les 22 transitions (`poller/fsm.rs`) et leurs sites dans `tick`
+
+`fn transition(&mut self, t: Transition)` applique la table `suivant` —
+**sans bras `_`** : chaque couple (état, transition) est écrit ; un état de
+départ imprévu est une `Incoherence::TransitionInattendue` journalisée
+(`poller_etat_transition_inattendue`) qui laisse `etat` tel quel. Sites
+instrumentés sur `batch/bugs-12` après insertion (un appel ajouté juste
+après l'écriture, aucune écriture ni condition modifiée, aucune ligne
+déplacée) :
+
+| # | Transition | De → vers | `tick.rs:` (après insertion) |
+|--:|---|---|---|
+| 1 | `NouvellePiste` | tout → `Neuve` | 466 |
+| 2 | `PremierEchantillonPlausible` | `Neuve` → `Lecture` (identité ensuite) | 1212 |
+| 3 | `Armement { armement }` | `Lecture` → `Armee` | 2196 (`Renonce`), 2217 (`Accepte`) |
+| 4 | `TransitionDetectee` | `Armee` / `Arretee{Armee}` → `Lecture` | 1336, 2061 |
+| 5 | `Desarmement` | `Armee` → `Lecture` | 2102, 2151 |
+| 6 | `ArretDansLaGarde` | `Armee{Accepte}` → `AvancePendante` | 1543 |
+| 7 | `RendererArrete` | `Lecture` / `Armee` → `Arretee{depuis}` | 1622 |
+| 8 | `ArretEfface` | `Arretee{depuis}` → `depuis` | 1411, 1491, 1500, 1511, 1900, 2493 |
+| 9 | `FinNaturelleEnAttenteDEnchainement` | `Arretee{Armee}` → `AvancePendante` | 1700 |
+| 10 | `FinNaturelleApresArret` | `Arretee` → `Terminee(Finie)` | 1732 |
+| 11 | `PanneDeLecture { cause }` | `Arretee` → `Terminee(Coupee)` | 1762 (`RendererCale`), 1844 (`FluxASec`) |
+| 12 | `AttenteProlongee` | `Arretee` → `Arretee` | 1799, 1818 |
+| 13 | `EnchainementConfirme` | `AvancePendante` → `Lecture` | 1942 |
+| 14 | `EnchainementBloque` | `AvancePendante` → `Terminee(Finie)` | 1564 |
+| 15 | `PositionAuDelaDeLaFin` | `Lecture` / `Armee` → `Terminee(Finie)` | 2353 |
+| 16 | `FinConstateeAvantLeSeuil { motif }` | `Lecture` / `Armee` / `Arretee` → `Terminee(Finie)` | 1593, 1614 |
+| 17 | `LectureSansProgres` | `Lecture` / `Armee` → `Terminee(Coupee)` | 2468 |
+| 18 | `SondeEnEchec` | tout → `SondageEnEchec{precedent}` | 662 |
+| 19 | `FinParHorlogeMurale` | `SondageEnEchec` → `Terminee(Finie)` | 722 |
+| 20 | `SondeRetablie` | `SondageEnEchec{p}` → `p` (identité ailleurs) | 634 |
+| 21 | `SourceRadio` | `Neuve` / `Radio` → `Radio` | 832 |
+| 22 | `RadioAbandonnee` | `Radio` → `Terminee(Coupee)` | 1031 |
+
+**22 transitions sur 22 instrumentées, 33 appels.** Trois remarques :
+
+- La naissance (`or_insert_with(ZonePollState::new)`, 350 et 404) n'est pas
+  un appel : `new` construit `Neuve`.
+- `ArretEfface` couvre six sites de `stopped_ticks = 0` (renderer qui joue,
+  pause, Tune qui ne joue plus, trois grâces) : c'est le même geste, et la
+  table du document ne nommait que le premier (1860).
+- Les transitions **non témoignables sans sonde** (2165, 2147, 183, 1697,
+  712 — voir plus haut) sont instrumentées quand même : l'appel ne dépend
+  pas de la sonde, seulement de l'écriture qu'il suit. Aucune n'est « non
+  atteignable » pour l'ombre. `tenue_signalee` et
+  `depassement_duree_signale` restent hors machine, comme proposé.
+
+### L'invariant
+
+`fn coherent(&self) -> Result<(), Incoherence>` dans `etat.rs`, table
+ci-dessus ; `Incoherence::Drapeau` nomme l'état, le drapeau, l'attendu et
+le lu. Vérifié à **un seul site**, à la fin de `tick`, sous
+`cfg(debug_assertions)` : pour chaque zone encore sondée,
+`debug_assert!(verdict.is_ok(), "poller_etat_incoherent zone_id=… : …")`.
+Aucune décision de `tick` ne lit `etat` ; en release rien n'est vérifié,
+seules les transitions inattendues sont journalisées.
+
+### Témoins (`poller/temoins_de_transitions_ref9.rs`)
+
+T1-T11 inchangés. E0 (la table n'a pas de bras muet ; l'invariant nomme
+l'état et le drapeau ; le site unique du `debug_assert!`), E1-E22 (un par
+transition : état construit, décision de `fsm`/`decisions`, miroir des
+écritures, **l'incohérence que l'invariant rendrait sans l'appel**, la
+transition, `coherent()`, et l'ancrage de l'appel `ps.transition(…)` au
+texte de `tick.rs`), E23 (le `tick` de production sur un renderer factice :
+`Neuve` → `Lecture` → `Arretee` → `Lecture`, le `debug_assert!` de fin de
+tour traversé à chaque tick). Le banc `lire_ensuite_dans_la_fenetre_gapless`
+traverse le même `debug_assert!` sur l'armement et la transition détectée.
+
+Contre-épreuve : retirer l'appel `TransitionDetectee` du site
+`gapless_position_reset_detected` (1336) fait rougir E4 (« sans cet appel,
+l'invariant rend : etat=Arretee drapeau=gapless_sent attendu=true
+lu=false ») **et** le banc #3026 (`poller_etat_incoherent … etat=Armee
+drapeau=gapless_sent attendu=true lu=false`, dans `tick` lui-même) ; la
+restauration par `cp` rend les deux verts. Sorties collées dans la PR.
+
+### Ce qui attend l'arbitrage
+
+Rien de `tick` ne lit `etat`. Basculer une lecture (par exemple
+`if ps.gapless_sent` → `matches!(ps.etat, Armee { .. })`), retirer un
+drapeau absorbé (`gapless_sent`, `gapless_advance_pending`,
+`wall_clock_end_fired`), ou déplacer un compteur dans sa variante : chacun
+de ces gestes change une décision et attend le dessin arrêté. La
+proposition ci-dessus reste une proposition ; l'ombre ne fait que la
+mesurer.
