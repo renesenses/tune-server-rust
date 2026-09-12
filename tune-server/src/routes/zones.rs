@@ -1146,6 +1146,11 @@ mod aac_passthrough_tests;
 #[cfg(test)]
 mod patch_zone_error_guard;
 
+/// REF-4 phase 2 (#2219) — les familles de `persister_le_patch` qu'aucun test
+/// ne traversait par la route (réseau DLNA, UPnP), écrites AVANT la découpe.
+#[cfg(test)]
+mod persister_le_patch_tests;
+
 /// Garde-fou #2092 : les charges utiles d'une zone ne doivent plus diverger.
 ///
 /// L'état d'aléatoire et de répétition appartient à la zone et **survit aux
