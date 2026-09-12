@@ -104,8 +104,12 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     // partagé (transition gapless, fin de chaîne) restent dans `local.rs` ;
     // chaque bras exclusif porte le sien dans son module. Le plancher ne
     // bouge pas : cinq chemins, cinq drainages, quel que soit le fichier.
+    // REF-8 (#2219) : le bras CoreAudio draine par le geste de l'étage,
+    // `etage.rendre_la_queue_du_dsp(` — qui tire la queue par `flush_local_dsp`
+    // (vérifié plus bas sur le corps du geste). C'est cet appel qui compte
+    // pour lui.
     let drainages = prod.matches("flush_local_dsp(").count() - 1 // moins la définition
-        + bras_coreaudio.matches("flush_local_dsp(").count()
+        + bras_coreaudio.matches("etage.rendre_la_queue_du_dsp(").count()
         + bras_asio.matches("flush_local_dsp(").count()
         + bras_wasapi.matches("flush_local_dsp(").count();
     assert!(
@@ -136,10 +140,19 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         "play_url n'appelle plus le bras CoreAudio exclusif : un module écrit mais pas \
          branché ne draine rien (R6 bis, #2219)"
     );
+    // REF-8 (#2219) : le bras CoreAudio n'appelle plus `process_pcm_chunk` en
+    // ligne — comme le chemin partagé depuis R1, il MONTE la frontière PCM
+    // commune dans son étage de conversion, amorce par `etage.pousser`, puis
+    // passe par la boucle producteur commune (`.tourner(`), et drainer sa fin
+    // de piste. L'exigence est la même, et plus forte : une seule route.
     assert!(
-        bras_coreaudio.contains("pcm_processor.process_pcm_chunk(")
-            && bras_coreaudio.contains("flush_local_dsp("),
-        "CoreAudio exclusif doit traverser la frontière PCM commune puis drainer sa fin de piste"
+        bras_coreaudio.contains("pcm: LocalPcmProcessor {")
+            && bras_coreaudio.contains("etage.pousser(")
+            && bras_coreaudio.contains(".tourner(")
+            && bras_coreaudio.contains("&mut etage,")
+            && bras_coreaudio.contains("etage.rendre_la_queue_du_dsp("),
+        "CoreAudio exclusif doit traverser la frontière PCM commune (étage + boucle commune) \
+         puis drainer sa fin de piste"
     );
 
     let preparation_windows = prod

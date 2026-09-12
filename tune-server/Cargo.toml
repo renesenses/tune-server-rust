@@ -297,6 +297,21 @@ path = "tests/base_unique_lancement_i3185.rs"
 name = "refus_de_lecture_audible_3733"
 path = "tests/refus_de_lecture_audible_3733.rs"
 
+# #3108 : les gardes de SITE des trois transports exclusifs (CoreAudio, ASIO,
+# WASAPI) et de la boucle producteur commune. Le fichier existe depuis #3108 et
+# n'a JAMAIS eu de cible : `autotests = false` en tete de ce manifeste le
+# laissait hors compilation, sur main comme sur tous les lots. Huit essais
+# ecrits, aucun execute — le cas exact que les commentaires voisins decrivent,
+# vert contre rien, et la raison pour laquelle la fusion de #4013 a pu en
+# perdre une assertion sans qu'aucune porte ne rougisse.
+#
+# Que du texte (`include_str!` sur les sources de `tune-core`) : aucun
+# `AppState`, aucune feature, il s'execute sur Linux comme sur macOS. Pose ICI,
+# au milieu du fichier, et non a la fin — meme raison que `borne_smart_collections_2732`.
+[[test]]
+name = "refus_exclusif_dit_sa_cause_i3108"
+path = "tests/refus_exclusif_dit_sa_cause_i3108.rs"
+
 # #3810 : la route du bouton « Enrichir les metadonnees » n'ecrivait rien a
 # l'entree — sa seule trace etait la fin de passe, qui sur 262 858 pistes
 # arrive dans plusieurs semaines — et un refus de quota partait en 429 muet.

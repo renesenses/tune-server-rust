@@ -440,7 +440,10 @@ fn chaque_chemin_douverture_enregistre_le_peripherique_ouvert() {
         let debut = bras
             .find(marqueur)
             .unwrap_or_else(|| panic!("marqueur {marqueur} introuvable dans {chemin}"));
-        let fenetre = &bras[debut..bras.len().min(debut + 900)];
+        // REF-8 (#2219) : une fenêtre de 900 CARACTÈRES, pas 900 octets — un
+        // découpage par octet tombait au milieu d'un « ─ » du bras CoreAudio
+        // et faisait paniquer la garde au lieu de la faire juger.
+        let fenetre: String = bras[debut..].chars().take(900).collect();
         assert!(
             fenetre.contains("note_opened_device(") && fenetre.contains(&format!("\"{backend}\"")),
             "le chemin {marqueur} joue sans dire QUEL périphérique il a ouvert \
