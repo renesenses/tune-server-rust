@@ -11,6 +11,8 @@ mod aucune_fuite_de_temporaires;
 mod audio_integration;
 #[path = "crossfade_pas_de_rampe_de_volume.rs"]
 mod crossfade_pas_de_rampe_de_volume;
+#[path = "dsd_empreintes_reference.rs"]
+mod dsd_empreintes_reference;
 #[path = "dsd_streaming_repro.rs"]
 mod dsd_streaming_repro;
 #[path = "dsp_track_boundary.rs"]
