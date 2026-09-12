@@ -39,8 +39,9 @@
 //! est créé par `ExclusiveOutput::new` (`coreaudio_exclusive.rs`), et il passe
 //! par la boucle producteur commune de `local.rs`. Les maillons 2 et 3 sont
 //! donc relus sur ce que le bras fait MAINTENANT — le verdict de blocage
-//! remonte par le puits (`PuitsAnneauCoreAudio`), le bras le relit et le
-//! rapporte sous son nom ; le vidage borné est `drainer`. Rien n'est affaibli :
+//! remonte par le puits (`PuitsAnneauCoreAudio`), la boucle commune le
+//! rapporte une fois sous le nom que le backend lui donne (REF-7), le bras
+//! le relit ; le vidage borné est `drainer`. Rien n'est affaibli :
 //! chaque assertion d'avant a son équivalent, et la contenance de l'anneau
 //! est suivie dans le fichier qui la porte désormais.
 
@@ -220,10 +221,12 @@ fn les_trois_transports_exclusifs_arment_le_canal_sur_un_refus_d_ouverture() {
 /// se remplit une fois, `feed_ring_abortable` rend `false`, et ce verdict était
 /// JETÉ aux sites de ce chemin — seul de tout le fichier à l'ignorer.
 ///
-/// REF-8 (#2219) : le verdict traverse maintenant trois maillons au lieu d'un
-/// drapeau local — le puits du backend le rend ET le mémorise, la boucle
-/// commune s'arrête dessus, le bras le relit et le rapporte sous son nom.
-/// Chacun est tenu ; en perdre un rend le blocage muet.
+/// REF-8 + REF-7 (#2219) : le verdict traverse trois maillons au lieu d'un
+/// drapeau local — le puits du backend le rend ET le mémorise ; la boucle
+/// commune s'arrête dessus et rapporte la famine UNE fois, sous le nom que
+/// le backend lui donne (`BackendLocal::nom` → « CoreAudio ») ; le bras relit
+/// le témoin pour ne rien rendre de plus à un rappel mort. Chacun est tenu ;
+/// en perdre un rend le blocage muet, ou le nomme d'un autre nom.
 #[test]
 fn le_chemin_coreaudio_exclusif_lit_le_verdict_de_blocage_au_lieu_de_le_jeter() {
     // (a) Le puits rend le verdict de `feed_ring_abortable` — il ne le jette
@@ -242,44 +245,38 @@ fn le_chemin_coreaudio_exclusif_lit_le_verdict_de_blocage_au_lieu_de_le_jeter() 
          vivant et attendrait 5 s à CHAQUE bloc, position figée (#3108)"
     );
 
-    // (b) Le bras arme le drapeau aux deux endroits où un puits mort se
-    // constate : à l'amorce (verdict de `pousser`) et après la boucle
-    // commune (mémoire du puits). C'étaient les `feed_stalled = true` d'avant.
+    // (b) Le bras passe par la boucle commune, et lui donne SON nom : c'est
+    // elle qui appelle `record_feed_stall_failure(self.backend, …)` (vérifié
+    // par `le_chemin_partage_et_son_enchainement_rapportent_aussi_leur_blocage`).
     let bloc = bloc_coreaudio_exclusif();
-    let armements = bloc.matches("feed_stalled = true").count();
     assert!(
-        armements >= 2,
-        "le chemin CoreAudio exclusif n'arme le drapeau de blocage qu'à {armements} site(s) : \
-         un puits mort à l'amorce ou pendant la boucle rend la zone muette et figée sur la \
-         position atteinte (#3108)"
+        bloc.contains("backend: backend.nom(),") && bloc.contains(".tourner("),
+        "le bras CoreAudio n'appelle plus la boucle commune avec le nom de son backend : \
+         le blocage serait rapporté sous un autre nom, ou pas du tout (#3108, REF-7)"
     );
     assert!(
-        bloc.contains("PousseeVersLePuits::PuitsMort { trames_source } =>")
-            && bloc.contains("if backend.puits_bloque() {"),
-        "le bras ne relit plus le verdict du puits (amorce : `PuitsMort` ; boucle : \
-         `puits_bloque()`) : le blocage n'est plus constaté (#3108, REF-8)"
+        appelle_avec(
+            BRAS_COREAUDIO,
+            "fn nom(&self) -> &'static str {",
+            "CoreAudio"
+        ),
+        "`BackendCoreAudio::nom` ne dit plus « CoreAudio » : le rapport de famine de ce \
+         chemin porterait un autre nom que celui que les journaux ont toujours porté (#3108)"
     );
-    // (c) Et il ne lance la boucle commune que sur un puits vivant, puis
-    // relit le drapeau à la sortie.
+    // …et il ne rapporte PAS lui-même : la famine est dite une fois.
     assert!(
-        bloc.contains("if !feed_stalled {") && bloc.contains(".tourner("),
-        "la boucle commune n'est plus gardée par le drapeau de blocage, ou n'est plus appelée \
-         (#3108, REF-8)"
+        !bloc.contains("record_feed_stall_failure("),
+        "le bras CoreAudio rapporte la famine en plus de la boucle commune : deux rapports \
+         pour un blocage, le second écrase le premier (#3108, REF-7)"
     );
+    // (c) Et il relit le témoin du puits à la sortie de la boucle : rien de
+    // plus n'est rendu à un rappel mort.
     assert!(
-        bloc.contains("if feed_stalled {"),
-        "le drapeau de blocage n'est plus relu à la sortie de la boucle : plus personne ne \
-         rapporte le blocage (#3108)"
-    );
-    assert!(
-        appelle_avec(bloc, "record_feed_stall_failure(", "CoreAudio"),
-        "le chemin CoreAudio exclusif ne rapporte plus son blocage par \
-         `record_feed_stall_failure` : c'est exactement le silence du constat du 01/09 (#3108)"
-    );
-    assert!(
-        bloc.contains("position_ms.load("),
-        "le rapport de blocage ne porte plus la position où l'écran s'est figé — le seul \
-         chiffre qui relie ce que le testeur voit (« 2 s ») à ce que le journal dit (#3108)"
+        bloc.contains("let feed_stalled = backend.puits_bloque();")
+            && bloc.contains("if !feed_stalled {")
+            && bloc.contains("etage.rendre_la_queue_du_dsp("),
+        "le bras ne relit plus le verdict du puits avant de rendre la queue du DSP : il \
+         attendrait 5 s de plus sur un rappel mort (#3108, REF-8)"
     );
 }
 
@@ -374,11 +371,16 @@ fn le_vidage_de_l_anneau_coreaudio_exclusif_reste_borne() {
 #[test]
 fn le_chemin_partage_et_son_enchainement_rapportent_aussi_leur_blocage() {
     let boucle = LOCAL
-        .split("    fn tourner(")
+        .split("    fn tourner<E: Etage>(")
         .nth(1)
         .and_then(|s| s.split("\n#[async_trait::async_trait]").next())
         .expect("la boucle producteur commune doit rester identifiable (#3108)");
 
+    // REF-7 (#2219) : la boucle est commune à tous les backends, le nom ne
+    // l'est pas. Elle rapporte avec `self.backend`, que `play_url` remplit par
+    // `BackendLocal::nom()` — et c'est `BackendCpal::nom` qui dit « CPAL ».
+    // Trois maillons, tous vérifiés : le littéral seul dans la boucle serait
+    // redevenu faux dès le second backend.
     assert!(
         boucle.contains("record_feed_stall_failure(")
             && boucle[boucle
@@ -387,9 +389,21 @@ fn le_chemin_partage_et_son_enchainement_rapportent_aussi_leur_blocage() {
                 .chars()
                 .take(240)
                 .collect::<String>()
-                .contains("\"CPAL\""),
-        "la boucle producteur commune ne rapporte plus le blocage de l'anneau : une piste qui \
-         meurt sur un rappel de rendu mort s'arrête sans un mot (#3108)"
+                .contains("self.backend,"),
+        "la boucle producteur commune ne rapporte plus le blocage de l'anneau avec le nom de \
+         son backend : une piste qui meurt sur un rappel de rendu mort s'arrête sans un mot, \
+         ou sous un nom qui n'est pas le sien (#3108, REF-7)"
+    );
+    assert!(
+        appelle_avec(BACKEND, "fn nom(&self) -> &'static str {", "CPAL"),
+        "`BackendCpal::nom` ne dit plus « CPAL » : le rapport de famine du chemin partagé \
+         porterait un autre nom que celui que les journaux ont toujours porté (#3108, REF-7)"
+    );
+    assert_eq!(
+        LOCAL.matches("backend: backend.nom(),").count(),
+        2,
+        "les DEUX boucles producteur de `play_url` — piste initiale, piste enchaînée — doivent \
+         recevoir le nom du backend par `BackendLocal::nom()` (#3108, REF-7)"
     );
 
     // Et elle le rapporte pour les DEUX pistes : les deux noms d'événement

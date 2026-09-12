@@ -29,6 +29,12 @@
 //! (`new` sans démarrage, `start`, `ring`, `format_info`) vit dans
 //! `coreaudio_exclusive.rs`.
 //!
+//! Après #4013 (REF-7, agent A) : la boucle producteur est générique sur le
+//! trait `Etage`, et c'est ELLE qui rapporte la famine, une fois, avec le nom
+//! que ce backend lui donne (`BackendLocal::nom` → « CoreAudio »). Le bras
+//! n'appelle plus `record_feed_stall_failure` lui-même ; il relit le témoin du
+//! puits pour ne pas rendre la queue du DSP à un rappel mort.
+//!
 //! Compilé par la seule porte macOS (`macos-pr` de `ci.yml`) : Shrek ne voit
 //! pas ce fichier. Les gardes de texte qui le lisent (`dsp_track_boundary`,
 //! `refus_exclusif_dit_sa_cause_i3108`, `backend_fallback_tests`) le relisent
@@ -99,9 +105,9 @@ pub(super) struct EntreesCoreAudio {
 /// leurs propres témoins.
 ///
 /// Le verdict est en plus MÉMORISÉ dans `bloque` : la boucle commune le
-/// traduit en `FinDeBoucle::Interrompue`, indistinguable d'un stop, et c'est
-/// ce drapeau qui permet au bras de rapporter le blocage sous SON nom
-/// (`record_feed_stall_failure("CoreAudio", …)`, #3108).
+/// traduit en `FinDeBoucle::Interrompue`, indistinguable d'un stop — elle a
+/// déjà rapporté la famine sous le nom de ce backend (#3108, REF-7) ; le
+/// drapeau dit au bras de ne pas rendre la queue du DSP à un rappel mort.
 struct PuitsAnneauCoreAudio<'a> {
     anneau: Arc<RingBuf>,
     stop_rx: &'a std::sync::mpsc::Receiver<()>,
@@ -152,8 +158,9 @@ impl BackendCoreAudio<'_> {
         &self.sortie.format_info().device_name
     }
 
-    /// Le puits a-t-il constaté un rappel de rendu mort ? Hors trait : c'est
-    /// le nom du backend que le rapport doit porter, et lui seul le connaît.
+    /// Le puits a-t-il constaté un rappel de rendu mort ? Hors trait : la
+    /// boucle commune l'a déjà rapporté ; le bras s'en sert pour ne rien
+    /// rendre de plus à un rappel qui ne tire plus.
     fn puits_bloque(&self) -> bool {
         self.bloque.load(Ordering::SeqCst)
     }
@@ -216,6 +223,13 @@ impl<'a> BackendLocal<'a> for BackendCoreAudio<'a> {
 
     fn format_ouvert(&self) -> FormatOuvert {
         self.format
+    }
+
+    /// Le nom que la boucle producteur commune met dans son rapport de
+    /// famine (REF-7) — celui que `record_feed_stall_failure("CoreAudio", …)`
+    /// a toujours porté sur ce chemin.
+    fn nom(&self) -> &'static str {
+        "CoreAudio"
     }
 
     fn puits(&self) -> Puits<'a> {
@@ -469,16 +483,15 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
     // d'audio (sa contenance, dans `ExclusiveOutput::new`), il se
     // remplit une fois, le rappel de rendu ne tire rien, et la
     // position reste sur 2 000 ms pour toujours — sans un mot.
-    let mut feed_stalled = false;
+    // Depuis REF-7 c'est la boucle commune qui le lit et le DIT :
+    // un puits déjà mort à l'amorçage est constaté par elle, pas
+    // ici, comme sur le chemin partagé.
     match etage.pousser(&mut *puits, &mut refuser_le_porteur_dop, &mut |_| {}) {
-        PousseeVersLePuits::Poussee { trames_source } => {
+        // L'amorce comptait ses trames sans regarder le verdict : ce
+        // compte est la position rapportée, il ne change pas.
+        PousseeVersLePuits::Poussee { trames_source }
+        | PousseeVersLePuits::PuitsMort { trames_source } => {
             total_frames_fed += trames_source;
-        }
-        PousseeVersLePuits::PuitsMort { trames_source } => {
-            // L'amorce comptait ses trames sans regarder le verdict : ce
-            // compte est la position rapportée, il ne change pas.
-            total_frames_fed += trames_source;
-            feed_stalled = true;
         }
         PousseeVersLePuits::RienAPousser => {}
         PousseeVersLePuits::PorteurDopRefuse => {
@@ -489,11 +502,13 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
     // ── La boucle producteur commune ───────────────────────────────────
     //
     // Celle de `local.rs`, la même que les deux pistes du chemin partagé :
-    // `stop_rx`, `force_silent`, EOF et le puits mort sont SES témoins. La
-    // clé de flux (#3318) est celle de l'URL tirée : les erreurs de lecture
-    // de ce bras la portent désormais, comme celles du chemin partagé.
+    // `stop_rx`, `force_silent`, EOF et le puits mort sont SES témoins, et
+    // c'est elle qui rapporte la famine, sous le nom de ce backend (REF-7).
+    // La clé de flux (#3318) est celle de l'URL tirée : les erreurs de
+    // lecture de ce bras la portent désormais, comme celles du chemin partagé.
     let cle_de_flux = crate::poller::decisions::stream_id_de_l_uri(Some(&url));
     let producteur = BoucleProducteur {
+        backend: backend.nom(),
         role: RoleDeLaBoucle::PisteInitiale,
         device_name: &device_name,
         cle_de_flux: cle_de_flux.as_deref(),
@@ -513,45 +528,32 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         premiere_donnee_journalisee: false,
     };
     let mut http_eof_excl = false;
-    if !feed_stalled {
-        let fin = producteur.tourner(
-            &mut reader,
-            &mut read_buf,
-            &mut etage,
-            &mut *puits,
-            &mut refuser_le_porteur_dop,
-            &mut compteurs,
-            &mut |_| true,
-        );
-        match fin {
-            FinDeBoucle::FinDeFlux => http_eof_excl = true,
-            // Arrêt demandé, silence forcé — ou puits mort : la boucle ne
-            // distingue pas, le puits l'a mémorisé.
-            FinDeBoucle::Interrompue => {}
-            FinDeBoucle::PorteurDopRefuse | FinDeBoucle::Abandon => {
-                unreachable!("ni refus DoP ni abandon possibles : les deux rappels sont constants")
-            }
+    let fin = producteur.tourner(
+        &mut reader,
+        &mut read_buf,
+        &mut etage,
+        &mut *puits,
+        &mut refuser_le_porteur_dop,
+        &mut compteurs,
+        &mut |_| true,
+    );
+    match fin {
+        FinDeBoucle::FinDeFlux => http_eof_excl = true,
+        // Arrêt demandé, silence forcé — ou puits mort : la boucle ne
+        // distingue pas, mais elle a déjà rapporté le blocage
+        // (`record_feed_stall_failure`, au nom de `backend.nom()`), et le
+        // puits l'a mémorisé pour la suite.
+        FinDeBoucle::Interrompue => {}
+        FinDeBoucle::PorteurDopRefuse | FinDeBoucle::Abandon => {
+            unreachable!("ni refus DoP ni abandon possibles : les deux rappels sont constants")
         }
     }
     total_frames_fed = compteurs.total_frames_fed;
-    if backend.puits_bloque() {
-        feed_stalled = true;
-    }
-
-    if feed_stalled {
-        // La piste n'a PAS fini : `http_eof_excl` reste faux, donc
-        // aucune fin naturelle n'est signalée et la file n'avance
-        // pas vers un morceau qui heurterait le même périphérique
-        // mort. Le seul mot dit à l'utilisateur part d'ici — sous le
-        // nom de CE backend. (La boucle commune a déjà écrit le sien,
-        // au nom de CPAL ; ce rapport le remplace dans le créneau.)
-        record_feed_stall_failure(
-            "CoreAudio",
-            &device_name,
-            position_ms.load(Ordering::Relaxed),
-            &open_failure,
-        );
-    }
+    // La piste n'a PAS fini sur un puits mort : `http_eof_excl` reste
+    // faux, donc aucune fin naturelle n'est signalée et la file n'avance
+    // pas vers un morceau qui heurterait le même périphérique mort — et
+    // rien de plus n'est rendu à un rappel qui ne tire plus.
+    let feed_stalled = backend.puits_bloque();
 
     if http_eof_excl {
         report_incomplete_local_pcm_probe(etage.pcm_kind, etage.en_attente.len());
@@ -561,18 +563,13 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
     // retient encore. Sans ça, `latency_frames()` trames restaient
     // dans le moteur et la fin de chaque piste était tronquée
     // (#2209, revue JP Robbe — la fonction etait morte).
-    let queue = flush_local_dsp(
-        &convolver,
-        &crossfeed,
-        &pure_bypass,
-        &mono_downmix,
-        channels,
-        dop_active.load(Ordering::Relaxed),
-    );
-    if !queue.is_empty() && !feed_stalled {
-        let trames_de_queue = (queue.len() / channels.max(1) as usize) as u64;
-        etage.rendre_la_queue_du_dsp(&mut *puits, queue);
-        total_frames_fed += trames_de_queue;
+    // REF-7 : c'est le geste de l'étage, qui tire lui-même la queue par
+    // `flush_local_dsp` et la livre par son unique site d'écriture. Les
+    // trames de la queue ne sont plus ajoutées à `total_frames_fed` :
+    // ce compte ne servait plus qu'au journal de sortie, et l'étage ne
+    // rend pas leur nombre.
+    if !feed_stalled {
+        etage.rendre_la_queue_du_dsp(&mut *puits);
     }
 
     // Signal natural track end BEFORE draining when the HTTP

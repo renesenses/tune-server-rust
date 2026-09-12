@@ -77,8 +77,8 @@
 
 use md5::{Digest, Md5};
 
-use super::PousseeVersLePuits;
 use super::empreinte_du_puits_r1::{DspAuRepos, etage};
+use super::{Etage, PousseeVersLePuits};
 use crate::outputs::traits::{CaptureOutput, FormatOuvert};
 
 /// Taille des tranches poussées dans l'étage.

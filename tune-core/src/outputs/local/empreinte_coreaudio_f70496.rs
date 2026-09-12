@@ -30,10 +30,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use super::empreinte_du_puits_r1::{DspAuRepos, etage};
 use super::{
-    BoucleProducteur, CompteursDePiste, EtageDeConversion, FinDeBoucle, PousseeVersLePuits,
+    BoucleProducteur, CompteursDePiste, Etage, EtageDeConversion, FinDeBoucle, PousseeVersLePuits,
     RoleDeLaBoucle,
 };
-use crate::outputs::traits::{CaptureOutput, FormatOuvert};
+use crate::outputs::traits::{CaptureOutput, FormatOuvert, PuitsDEchantillons};
 
 /// La coupure de l'amorce : 4 096 octets lus pour l'en-tête, moins un
 /// en-tête WAV canonique de 44 octets.
@@ -105,7 +105,8 @@ fn route_du_bras(
     let mut refus = |_dop: bool, _sr: u32, _ch: u16| false;
 
     let mut trames = 0u64;
-    match e.pousser(&mut puits, &mut refus, &mut |_| {}) {
+    let puits_dyn: &mut dyn PuitsDEchantillons = &mut puits;
+    match e.pousser(puits_dyn, &mut refus, &mut |_| {}) {
         PousseeVersLePuits::Poussee { trames_source }
         | PousseeVersLePuits::PuitsMort { trames_source } => trames += trames_source,
         PousseeVersLePuits::RienAPousser => {}
@@ -118,6 +119,7 @@ fn route_du_bras(
     let position_ms = AtomicU64::new(0);
     let open_failure = std::sync::Mutex::new(None);
     let producteur = BoucleProducteur {
+        backend: "CoreAudio",
         role: RoleDeLaBoucle::PisteInitiale,
         device_name: "témoin CoreAudio",
         cle_de_flux: None,
@@ -142,7 +144,7 @@ fn route_du_bras(
         &mut lecture,
         &mut tampon,
         &mut e,
-        &mut puits,
+        puits_dyn,
         &mut refus,
         &mut compteurs,
         &mut |_| true,
