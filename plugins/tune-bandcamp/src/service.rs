@@ -41,10 +41,14 @@
 //!   `source: "bandcamp"` répondra « Bandcamp ne fournit pas de playlists » au
 //!   lieu du 400 `unknown service` d'avant : l'échec est NOMMÉ.
 //!
-//!   🔴 #859 — ce refus est un [`TuneError::Unsupported`], et la frontière
-//!   HTTP le sort en **501 Not Implemented**. Il sortait en **502 Bad
-//!   Gateway**, ce qui envoyait chercher une passerelle en panne alors
-//!   qu'aucun aller-retour réseau n'avait eu lieu (mesuré en 4 ms sur le .18).
+//!   🔴 #859 — ce refus est un [`TuneError::Unsupported`]. Les routes
+//!   `/api/v1/streaming/…` le sortent en **501 Not Implemented** ; elles le
+//!   sortaient en **502 Bad Gateway**, ce qui envoyait chercher une passerelle
+//!   en panne alors qu'aucun aller-retour réseau n'avait eu lieu (mesuré en
+//!   4 ms sur le .18). ⚠️ `POST /zones/{id}/play`, lui, garde son 502 : il
+//!   n'emprunte pas `svc_response` mais son propre `BAD_GATEWAY` en dur
+//!   (`tune-server/src/routes/playback.rs:1438` et `:1540`), que trois essais
+//!   figent encore. Deuxième surface, deuxième PR.
 //! - **Pistes de recherche** : `autocomplete_elastic` ne rend aucune URL de
 //!   flux. Une `StreamTrack` bâtie dessus aurait un `id` injouable ;
 //!   [`BandcampService::search`] ne rend donc que des albums et des artistes,
