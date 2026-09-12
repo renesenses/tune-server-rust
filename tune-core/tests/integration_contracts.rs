@@ -13,6 +13,8 @@ mod crossfade_pas_de_rampe_de_volume;
 mod dsd_streaming_repro;
 #[path = "dsp_track_boundary.rs"]
 mod dsp_track_boundary;
+#[path = "flac_empreintes_reference.rs"]
+mod flac_empreintes_reference;
 #[path = "migration_on_real_db.rs"]
 mod migration_on_real_db;
 #[path = "no_blind_ffmpeg.rs"]
