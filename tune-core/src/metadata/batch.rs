@@ -123,6 +123,25 @@ pub fn rename_artist(db: &SqliteDb, request: &RenameArtistRequest) -> BatchResul
     BatchResult { updated, errors }
 }
 
+/// ⛔ `t.file_path IS NOT NULL` RESTE. Ne pas retomber sur `cue_media_path`.
+///
+/// Cette fonction fabrique des ORDRES D'ÉCRITURE dans les fichiers de
+/// l'utilisateur : chaque [`TagWriteJob`] porte un `file_path` et le titre,
+/// l'interprète, l'album, le numéro de piste à y inscrire.
+///
+/// Les quinze pistes d'une feuille CUE partagent UNE image. Faire entrer les
+/// pistes CUE ici produirait quinze travaux visant le MÊME fichier avec des
+/// valeurs différentes : quatorze écrasements, et l'image finirait étiquetée
+/// « piste 15 ». Le rangement de l'utilisateur — un disque, une image, une
+/// feuille — serait détruit par une passe censée le ranger.
+///
+/// Ce qu'il faudrait d'abord, et ce n'est pas un détail d'implémentation :
+/// décider ce que « écrire les étiquettes d'une tranche » veut dire. Réécrire
+/// la FEUILLE `.cue` plutôt que l'image en est la seule réponse sensée, et
+/// c'est un chantier avec sa propre garde sur de vrais fichiers.
+///
+/// Même refus, même raison, dans `routes/library/write_tags.rs` et
+/// `library/lyrics_pass.rs:1023` (#3998).
 pub fn batch_write_tags_list(db: &SqliteDb, track_ids: &[i64]) -> Vec<TagWriteJob> {
     let conn = db.connection().lock().unwrap();
     let mut jobs = Vec::new();

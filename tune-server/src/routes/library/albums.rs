@@ -1552,6 +1552,25 @@ pub(crate) fn grouper_les_albums_eclates(
 
 /// `GET /library/albums/eclates` — les albums éclatés présumés (BIB-A2, phase 0).
 /// Lecture seule ; la bibliothèque entière est lue une fois (une requête).
+///
+/// ⛔ `t.file_path IS NOT NULL` RESTE. Ne pas retomber sur `cue_media_path`.
+///
+/// « Lecture seule » ne veut pas dire sans conséquence : cet écran est la
+/// SURFACE du geste d'absorption (`POST …/absorber`, `repo.absorber`), qui
+/// fusionne deux albums pour de bon. Ce qu'il propose, l'utilisateur le
+/// déclenche.
+///
+/// Or le discriminant de la phase 0 est le DOSSIER (`dossier_de` sur le chemin
+/// de piste). Un coffret rangé en images CUE — le cas le plus courant du
+/// format : `Disc1.flac` + `Disc1.cue`, `Disc2.flac` + `Disc2.cue` dans UN
+/// dossier — ferait tomber deux albums réellement distincts dans le même
+/// dossier, avec des numéros de piste complémentaires : la définition même
+/// d'un « album éclaté ». L'écran proposerait de fusionner les deux disques
+/// d'un coffret, et l'utilisateur n'aurait aucune raison de refuser.
+///
+/// Ce qu'il faudrait d'abord : que le discriminant descende du dossier à
+/// l'IMAGE (`cue_media_path`) pour les pistes qui en ont une. C'est un
+/// chantier de la phase 0, pas un `COALESCE`.
 pub(super) async fn albums_eclates(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let sql = "SELECT t.album_id, al.title, ar.name, al.year, t.file_path, t.track_number, \
                       COALESCE(al.cover_path, '') \
@@ -1588,6 +1607,21 @@ pub(super) async fn albums_eclates(State(state): State<AppState>) -> Result<Json
 }
 
 /// Les dossiers (au sens `dossier_de`) où vivent les pistes d'un album.
+///
+/// ⛔ `file_path IS NOT NULL` RESTE. **Ceci alimente une GARDE, pas un
+/// affichage.**
+///
+/// L'appelant est le contrôle « dossiers_differents » de l'absorption : deux
+/// albums sans aucun dossier en commun ne sont pas les éclats d'un même
+/// disque, et la fusion est REFUSÉE. Élargir l'entrée d'une garde, c'est
+/// élargir ce qu'elle laisse passer.
+///
+/// Un coffret rangé en images CUE met `Disc1.flac`/`Disc1.cue` et
+/// `Disc2.flac`/`Disc2.cue` dans UN dossier. En retombant sur
+/// `cue_media_path`, les deux albums partageraient ce dossier, le refus
+/// tomberait, et `repo.absorber` fusionnerait deux disques distincts — une
+/// perte irréversible pour l'utilisateur, déclenchée par une garde qu'on
+/// croyait améliorer.
 fn dossiers_de_l_album(state: &AppState, album_id: i64) -> std::collections::BTreeSet<String> {
     let p1 = match state.backend.engine() {
         Engine::Postgres => PostgresDialect.placeholder(1),

@@ -34,11 +34,71 @@ pub(super) struct EnrichAllBody {
     pub(super) path: Option<String>,
 }
 
-/// Index de `t.file_path` dans la sélection de candidats de
+/// Index du chemin OUVRABLE dans la sélection de candidats de
 /// [`enrich_all_library`]. Nommé parce que la boucle ET la portée le lisent :
 /// un `SELECT` réordonné doit se voir ici, pas filtrer en silence sur la
 /// mauvaise colonne.
+///
+/// ⚠️ La colonne n'est plus `t.file_path` mais
+/// `db::track_repo::sql::CHEMIN_OUVRABLE` : sur une piste de feuille CUE,
+/// `file_path` est NUL et le chemin vit dans `cue_media_path`. Sans ce
+/// changement, élargir le seul `WHERE` aurait fait entrer les pistes CUE dans
+/// la sélection pour que [`restreindre_a_la_portee`] les rejette aussitôt —
+/// un correctif à moitié qui n'aurait rien changé pour l'utilisateur qui
+/// enrichit un répertoire.
 const COL_FILE_PATH: usize = 4;
+
+/// La sélection des candidats de `POST /library/enrich-all`.
+///
+/// Sortie de la fonction pour être EXÉCUTABLE par un témoin : c'est une
+/// requête, pas un texte, et un témoin qui n'en comparerait que la chaîne ne
+/// prouverait pas qu'elle rend la bonne ligne.
+///
+/// 🔴 `A_UN_FICHIER`, pas `t.file_path IS NOT NULL`. Une piste découpée par
+/// une feuille CUE porte `file_path = NULL` par construction : elle n'a jamais
+/// été candidate à l'enrichissement MusicBrainz, alors que la feuille lui
+/// donne précisément ce qu'il faut pour l'interroger — un titre, un interprète,
+/// un album.
+///
+/// Ce que la passe fait de la ligne, et pourquoi l'élargir ne risque rien :
+/// elle lit `title`, `artist`, `album` (colonnes 1 à 3), interroge
+/// MusicBrainz, et écrit par `metadata::enrichment::write_track_enrichment` —
+/// **en base seulement**. Le chemin lui-même n'est jamais ouvert (`_file_path`
+/// est lié puis ignoré) : rien n'est décodé, rien n'est écrit dans le fichier
+/// de l'utilisateur. Le `mb_id` obtenu est celui du TITRE de la tranche, donc
+/// propre à elle : aucune identité ne conflue.
+fn sql_candidats_enrichissement() -> String {
+    let chemin = tune_core::db::track_repo::sql::CHEMIN_OUVRABLE;
+    let a_un_fichier = tune_core::db::track_repo::sql::A_UN_FICHIER;
+    format!(
+        // artist_name / album_title are NOT columns of `tracks` — they are
+        // only derived via joins (artists.name / albums.title). Selecting
+        // them off `t` made the prepare fail with "no such column:
+        // t.artist_name", which .unwrap_or_default() swallowed to an empty
+        // Vec → total=0, so enrich-all silently did nothing for everyone
+        // (Fabien, v0.9.0). Join albums and read the joined columns.
+        //
+        // `t.composer` compte parmi les champs manquants qui rendent une
+        // piste candidate. Sans lui, une piste deja pourvue en mb_id,
+        // genre, annee et label n'entrait meme pas dans la selection :
+        // corriger la boucle en aval n'aurait servi a rien, elle n'y
+        // serait jamais parvenue (#1890).
+        "SELECT t.id, t.title, a.name, al.title, {chemin}, \
+         t.musicbrainz_recording_id, t.genre, t.year, t.label, t.composer, t.album_id, \
+         t.artist_id, a.musicbrainz_id \
+         FROM tracks t \
+         LEFT JOIN artists a ON a.id = t.artist_id \
+         LEFT JOIN albums al ON al.id = t.album_id \
+         WHERE {a_un_fichier} AND ( \
+           t.musicbrainz_recording_id IS NULL OR t.musicbrainz_recording_id = '' \
+           OR t.genre IS NULL OR t.genre = '' \
+           OR t.year IS NULL \
+           OR t.label IS NULL OR t.label = '' \
+           OR t.composer IS NULL OR t.composer = '' \
+           OR (t.artist_id IS NOT NULL AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')) \
+         )"
+    )
+}
 
 /// Restreint les pistes candidates à celles qui vivent sous le répertoire
 /// demandé (#1660).
@@ -157,35 +217,7 @@ pub(super) async fn enrich_all_library(
         let _task_guard = task_guard; // ends the task when this future completes
         // Find tracks with missing metadata: no MB ID OR missing genre/year/label
         let track_rows: Vec<Vec<tune_core::db::backend::SqlValue>> = backend2
-            .query_many(
-                // artist_name / album_title are NOT columns of `tracks` — they are
-                // only derived via joins (artists.name / albums.title). Selecting
-                // them off `t` made the prepare fail with "no such column:
-                // t.artist_name", which .unwrap_or_default() swallowed to an empty
-                // Vec → total=0, so enrich-all silently did nothing for everyone
-                // (Fabien, v0.9.0). Join albums and read the joined columns.
-                //
-                // `t.composer` compte parmi les champs manquants qui rendent une
-                // piste candidate. Sans lui, une piste deja pourvue en mb_id,
-                // genre, annee et label n'entrait meme pas dans la selection :
-                // corriger la boucle en aval n'aurait servi a rien, elle n'y
-                // serait jamais parvenue (#1890).
-                "SELECT t.id, t.title, a.name, al.title, t.file_path, \
-                 t.musicbrainz_recording_id, t.genre, t.year, t.label, t.composer, t.album_id, \
-                 t.artist_id, a.musicbrainz_id \
-                 FROM tracks t \
-                 LEFT JOIN artists a ON a.id = t.artist_id \
-                 LEFT JOIN albums al ON al.id = t.album_id \
-                 WHERE t.file_path IS NOT NULL AND ( \
-                   t.musicbrainz_recording_id IS NULL OR t.musicbrainz_recording_id = '' \
-                   OR t.genre IS NULL OR t.genre = '' \
-                   OR t.year IS NULL \
-                   OR t.label IS NULL OR t.label = '' \
-                   OR t.composer IS NULL OR t.composer = '' \
-                   OR (t.artist_id IS NOT NULL AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')) \
-                 )",
-                &[],
-            )
+            .query_many(&sql_candidats_enrichissement(), &[])
             .unwrap_or_else(|e| {
                 // Never swallow a query failure to total=0 again — surface it.
                 warn!(error = %e, "enrich_all query failed — reporting 0 tracks");
@@ -880,6 +912,96 @@ mod tests_portee_repertoire {
         let sortie = restreindre_a_la_portee(rows, Some(&portee("/musique/jazz")));
         assert_eq!(chemins(&sortie), vec!["/musique/jazz/a.flac"]);
         assert_eq!(sortie.len(), 1, "la ligne sans chemin est écartée");
+    }
+}
+
+/// Les pistes de feuille CUE dans la sélection de `/library/enrich-all`.
+///
+/// La requête est EXÉCUTÉE contre une vraie base : un témoin qui se
+/// contenterait de chercher `cue_media_path` dans la chaîne SQL resterait vert
+/// contre une requête qui ne rend rien.
+#[cfg(test)]
+mod tests_candidats_cue {
+    use super::*;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::metadata::enrich_scope::EnrichScope;
+
+    /// Une image CUE sous `/music/Jazz`, deux tranches, plus une piste
+    /// ordinaire — le témoin anti-régression du cas qui marchait déjà.
+    ///
+    /// 🔴 `file_path` NUL sur les deux tranches : c'est ÇA le témoin. Une
+    /// fixture qui le renseignerait décrirait le cas ordinaire et resterait
+    /// verte contre n'importe quel code.
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        backend
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (1, 'Keith Jarrett'); \
+                 INSERT INTO albums (id, title, artist_id) VALUES (1, 'Live 1975', 1); \
+                 INSERT INTO tracks (id, title, album_id, artist_id, file_path, source) \
+                   VALUES (10, 'Ordinaire', 1, 1, '/music/Jazz/ord.flac', 'local'); \
+                 INSERT INTO tracks \
+                   (id, title, album_id, artist_id, file_path, source, cue_media_path, cue_start_ms) \
+                   VALUES (20, 'Part I', 1, 1, NULL, 'local', '/music/Jazz/Live 1975/image.flac', 0); \
+                 INSERT INTO tracks \
+                   (id, title, album_id, artist_id, file_path, source, cue_media_path, cue_start_ms) \
+                   VALUES (21, 'Part II', 1, 1, NULL, 'local', '/music/Jazz/Live 1975/image.flac', 1620000);",
+            )
+            .unwrap();
+        backend
+    }
+
+    fn candidats(backend: &Arc<dyn DbBackend>) -> Vec<Vec<tune_core::db::backend::SqlValue>> {
+        backend
+            .query_many(&sql_candidats_enrichissement(), &[])
+            .expect("la requête de candidats doit s'exécuter sur les deux moteurs")
+    }
+
+    /// 🔴 LES TRANCHES D'UNE FEUILLE CUE SONT CANDIDATES À L'ENRICHISSEMENT.
+    ///
+    /// Avec `WHERE t.file_path IS NOT NULL`, la sélection rendait UNE ligne
+    /// sur trois : les deux tranches, qui portent pourtant un titre et un
+    /// interprète venus de la feuille — exactement ce dont MusicBrainz a
+    /// besoin —, n'ont jamais été interrogées.
+    #[test]
+    fn les_tranches_cue_entrent_dans_la_selection() {
+        let backend = base();
+        let ids: Vec<i64> = candidats(&backend)
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![10, 20, 21],
+            "la piste ordinaire ET les deux tranches de l'image"
+        );
+    }
+
+    /// La MOITIÉ que la sélection seule ne règle pas : la colonne lue par la
+    /// portée doit porter le chemin OUVRABLE.
+    ///
+    /// Élargir le `WHERE` en laissant `t.file_path` dans la projection ferait
+    /// entrer les tranches pour que `restreindre_a_la_portee` les rejette
+    /// aussitôt — vert sur le témoin ci-dessus, sans rien changer pour qui
+    /// enrichit un répertoire.
+    #[test]
+    fn la_portee_situe_une_tranche_cue_par_son_image() {
+        let backend = base();
+        let portee = EnrichScope::from_directory(&backend, "/music/Jazz/Live 1975");
+        let retenus: Vec<i64> = restreindre_a_la_portee(candidats(&backend), Some(&portee))
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        assert_eq!(
+            retenus,
+            vec![20, 21],
+            "les deux tranches vivent sous le répertoire de leur image ; la piste ordinaire non"
+        );
     }
 }
 

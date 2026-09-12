@@ -436,6 +436,21 @@ mod comptes_par_sous_dossier_tests {
 /// LCP(all) == LCP(min, max), so two aggregates suffice — no full scan. Returns
 /// the directory (trailing separator dropped), or None if the library is empty
 /// or the common prefix has no separator.
+///
+/// ⛔ `file_path IS NOT NULL` RESTE. Ne pas retomber sur `cue_media_path` ICI.
+///
+/// La tentation est forte : une bibliothèque entièrement rangée en images CUE
+/// rend `None`, et les vues « Répertoires » n'ont plus de racine de repli. Mais
+/// la racine n'est qu'une entrée : **tout ce qui pend dessous compte sur
+/// `t.file_path`**. `routes/library/browse.rs` compte ses pistes par
+/// `WHERE file_path LIKE <racine>%`, et `folder_facet::where_with_prefix`
+/// ajoute le même `t.file_path LIKE …` à chaque dénombrement.
+///
+/// Élargir la seule dérivation de racine rendrait donc un dossier que l'écran
+/// affiche avec **zéro piste** et où le clic ne mène nulle part — pire que
+/// l'absence de repli, parce que ça ressemble à une bibliothèque vide plutôt
+/// qu'à une vue non gérée. Le chantier est la vue Répertoires ENTIÈRE
+/// (dérivation, `LIKE`, dénombrements, fil d'Ariane), pas cette fonction.
 pub fn derive_common_root(backend: &dyn DbBackend) -> Option<String> {
     let agg = |f: &str| -> Option<String> {
         backend
@@ -819,6 +834,21 @@ pub mod sql {
         )
     }
 
+    /// ⚠️ Rien à corriger ICI pour les pistes CUE — et rien à corriger EN AMONT
+    /// non plus, pour l'instant.
+    ///
+    /// Cet ordre n'a pas de sélection : il écrit par `id`. Le site aveugle
+    /// serait la passe qui CHOISIT les pistes à mesurer. Or il n'y en a pas :
+    /// `audio::analyzer::detect_trailing_silence` n'a **aucun appelant** dans
+    /// le dépôt (mesuré le 12/09/2026), et `set_trailing_silence` non plus hors
+    /// de ses propres témoins.
+    ///
+    /// Et le jour où une passe naîtra, elle relèvera du piège nº2 : la
+    /// signature est `detect_trailing_silence(file_path, threshold_db)` — un
+    /// chemin, pas de bornes. Sur une image CUE elle mesurerait le silence de
+    /// fin du DISQUE et l'attribuerait aux quinze tranches. La borne
+    /// `(chemin, debut_s, duree_s)` est le préalable, comme pour l'empreinte
+    /// acoustique (#3998).
     pub fn set_trailing_silence<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE tracks SET trailing_silence_ms = {} WHERE id = {}",
@@ -843,6 +873,16 @@ pub mod sql {
     }
 
     /// BIB-B2 : l'empreinte du contenu audio decode, forme serialisee versionnee.
+    ///
+    /// ⚠️ Rien à corriger ICI pour les pistes CUE : cet ordre écrit par `id`,
+    /// il ne sélectionne rien. La sélection est
+    /// `audio::replaygain::CANDIDATS_EMPREINTE_WHERE`, que #3998 a **laissée**
+    /// à dessein — elle exige le témoin `rg_analyzed`, que seule la passe
+    /// ReplayGain pose, et cette passe-là mesure le fichier ENTIER depuis 0 s.
+    /// L'empreinte prise sur une image serait identique pour ses quinze
+    /// tranches, alors que `scan_fingerprint_duplicates` regroupe justement
+    /// dessus : les quinze pistes du disque se déclareraient doublons
+    /// les unes des autres.
     pub fn set_audio_fingerprint<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE tracks SET audio_fingerprint = {} WHERE id = {}",
@@ -860,6 +900,22 @@ pub mod sql {
         )
     }
 
+    /// ⛔ `t.file_path IS NOT NULL` RESTE — et pour une raison qui n'est pas
+    /// celle qu'on croit.
+    ///
+    /// `list_unidentified` n'a **aucun appelant** : ni route, ni passe de fond,
+    /// ni témoin (mesuré le 12/09/2026 — `grep -rn '\.list_unidentified('`
+    /// rend la seule définition). Élargir une sélection que personne
+    /// n'exécute ne se prouve pas : le témoin serait **vert à vide**, et un
+    /// vert à vide ne garde rien.
+    ///
+    /// Le jour où un appelant apparaîtra, c'est le piège nº2 qui se posera :
+    /// la requête sert le verrou d'IDENTIFICATION, `acoustid_fingerprint IS
+    /// NULL`, et une empreinte AcoustID se calcule en décodant. Prise sur
+    /// l'image, elle serait identique pour ses quinze tranches, qui
+    /// s'identifieraient toutes comme le même enregistrement. La borne
+    /// `(chemin, debut_s, duree_s)` est le préalable, comme pour l'empreinte
+    /// acoustique (#3998).
     pub fn list_unidentified<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} WHERE (t.title LIKE 'Track %' OR t.title LIKE 'Unknown%' \
@@ -880,6 +936,19 @@ pub mod sql {
         )
     }
 
+    /// ⛔ `file_path IS NOT NULL` RESTE.
+    ///
+    /// La colonne rendue EST l'ensemble des `file_path` connus — c'est un
+    /// index de la clé `tracks.file_path UNIQUE`, pas un inventaire de
+    /// fichiers. Y verser des `cue_media_path` mélangerait deux espaces de
+    /// clés dans un même `HashSet<String>` : quinze tranches y déposeraient
+    /// une seule et même chaîne, et un appelant qui y cherche « ce chemin
+    /// est-il déjà pris ? » recevrait « oui » pour un fichier que la
+    /// contrainte d'unicité, elle, laisse parfaitement passer.
+    ///
+    /// Accessoirement, `get_all_paths` n'a plus d'appelant de production
+    /// (mesuré le 12/09/2026 : ses témoins et `postgres_e2e`) : l'élargir ne
+    /// se prouverait que par un témoin **vert à vide**.
     pub fn get_all_paths() -> &'static str {
         "SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL"
     }
@@ -900,6 +969,22 @@ pub mod sql {
     /// lignes que le scan a lui-même posées. Le second filtre ici,
     /// explicitement, au lieu de compter sur une requête qui ne dit pas
     /// laquelle des deux questions elle répond.
+    ///
+    /// ⛔ `file_path IS NOT NULL` RESTE, et `scanner::cue_bibliotheque` en
+    /// dépend explicitement.
+    ///
+    /// Cette carte est la tenue de compte du SCAN : elle dit quelles lignes
+    /// correspondent à un fichier vu sur le disque, et ce qui n'y figure plus
+    /// est ÉLAGUÉ. L'identité d'une piste virtuelle n'est pas un chemin mais
+    /// le couple `(cue_media_path, cue_start_ms)` — l'index unique partiel
+    /// `idx_tracks_cue_identity`. Quinze tranches rendraient ici quinze lignes
+    /// portant le MÊME chemin : la carte, un `HashMap` par chemin, n'en
+    /// garderait qu'une, et les quatorze autres seraient déclarées absentes du
+    /// disque puis supprimées à chaque scan.
+    ///
+    /// L'élagage des pistes CUE existe déjà et vit ailleurs, précisément pour
+    /// cette raison : `cue_bibliotheque::elaguer_les_pistes_cue`, dont l'en-tête
+    /// de module nomme ce filtre-ci comme la raison de son existence.
     pub fn get_all_file_info_by_path() -> &'static str {
         "SELECT id, file_path, file_mtime, file_size, source FROM tracks WHERE file_path IS NOT NULL"
     }
@@ -2699,6 +2784,24 @@ impl TrackRepo {
 
     /// List all local tracks (with file_path set). Used by rescan-metadata to
     /// re-read tags from disk without doing a full library scan.
+    ///
+    /// ⛔ `t.file_path IS NOT NULL` RESTE. Ne pas retomber sur `cue_media_path`.
+    ///
+    /// Le consommateur qui donne son nom à cette fonction —
+    /// `routes/library/tracks.rs`, « relire les étiquettes » — fait, pour
+    /// chaque ligne : `read_metadata(chemin)` puis
+    /// `apply_metadata_to_track(&mut t, &meta)` puis `track_repo.update(&t)`.
+    /// Sur une piste de feuille CUE, le chemin ouvrable est l'IMAGE : les
+    /// quinze tranches recevraient le titre, l'interprète et le numéro de
+    /// piste de l'image, écrasant en base ce que la FEUILLE — leur unique
+    /// source de métadonnées, c'est tout son objet — leur avait donné. Un
+    /// « Part I / Part II / Part III » deviendrait quinze fois le titre du
+    /// disque.
+    ///
+    /// L'autre consommateur, `library::playlist_scan`, y gagnerait (il
+    /// n'indexe que titre/interprète/album pour l'appariement approché des
+    /// `.m3u`) : c'est LUI qu'il faudra servir, par une sélection à part, sans
+    /// entraîner la relecture d'étiquettes avec.
     pub fn list_all_local(&self) -> Result<Vec<Track>, TuneError> {
         let sql = format!(
             "{} WHERE t.file_path IS NOT NULL AND t.file_path != ''",
@@ -2744,6 +2847,22 @@ impl TrackRepo {
         Ok(paths)
     }
 
+    /// ⛔ `file_path IS NOT NULL` RESTE — et le retirer serait **invisible**
+    /// aujourd'hui, ce qui est le vrai danger.
+    ///
+    /// Les pistes de feuille CUE ne portent pas de `audio_hash` :
+    /// `scanner::cue_bibliotheque::piste_virtuelle` ne le renseigne jamais, et
+    /// #3998 a tranché que le condensat de l'IMAGE n'a rien à faire dans la
+    /// colonne d'identité d'une TRANCHE. Le `audio_hash IS NOT NULL` de cette
+    /// requête les écarte donc déjà, quoi qu'on fasse du `file_path` : un
+    /// témoin posé sur l'élargissement serait **vert à vide**, il ne garderait
+    /// rien.
+    ///
+    /// Et le jour où un condensat serait écrit, l'élargissement deviendrait
+    /// nuisible : le consommateur est le veilleur (`auto_scan.rs`), qui prend
+    /// ces chemins comme candidats à `find_byte_identical_path` et **saute**
+    /// le fichier qui s'y apparie. L'image se comparerait à elle-même, octet
+    /// pour octet, et le disque entier serait déclaré doublon de lui-même.
     pub fn paths_by_audio_hash_and_album(
         &self,
         audio_hash: &str,
@@ -2768,6 +2887,26 @@ impl TrackRepo {
             .collect())
     }
 
+    /// ⛔ `file_path IS NOT NULL` RESTE. **Cette fonction SUPPRIME des lignes.**
+    ///
+    /// Elle finit par `DELETE FROM tracks WHERE id = ?` sur tout ce qu'elle a
+    /// jugé doublon. Deux verrous protègent aujourd'hui les pistes de feuille
+    /// CUE, et il faut les deux :
+    ///
+    /// * `audio_hash IS NOT NULL` — une tranche n'en a pas
+    ///   (`scanner::cue_bibliotheque`), donc l'élargissement du `file_path`
+    ///   seul ne changerait **rien** : un témoin posé dessus serait vert à
+    ///   vide ;
+    /// * le regroupement se fait sur le seul condensat, puis départage par
+    ///   `files_are_byte_identical` sur les CHEMINS. Quinze tranches rendant
+    ///   le même chemin, la comparaison octet pour octet réussirait quinze
+    ///   fois : quatorze pistes DISTINCTES supprimées par un contrôle qui
+    ///   comparait un fichier à lui-même.
+    ///
+    /// C'est exactement le dégât que `library::duplicate_detector` évite en
+    /// clefant sur `(condensat, Option<cue_start_ms>)` (#3998). Cette
+    /// fonction-ci n'a pas cette clef ; tant qu'elle ne l'a pas, elle ne doit
+    /// pas voir les pistes CUE.
     pub fn deduplicate(&self) -> Result<i64, TuneError> {
         let rows = self.db.query_many(
             "SELECT id, audio_hash, file_path FROM tracks \
