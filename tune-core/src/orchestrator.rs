@@ -1341,6 +1341,12 @@ mod plafond_16_bits_tests;
 #[cfg(test)]
 mod transcodage_de_sortie_tests;
 
+/// REF-2 phase 2 (#2219) — `decode_radio_stream_to_pcm` décodé jusqu'au PCM
+/// depuis une station factice locale : la preuve que la boucle `'reconnect`
+/// rend la même chose une fois découpée en temps nommés.
+#[cfg(test)]
+mod decode_radio_temoins;
+
 #[cfg(test)]
 mod tests;
 
