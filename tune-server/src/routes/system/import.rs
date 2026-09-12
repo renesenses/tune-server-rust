@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::RequestExt;
-use axum::extract::{Multipart, Path, Request, State};
+use axum::extract::{Multipart, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -10,7 +10,9 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
-use tune_core::library::importer::{ImportedTrack, parse_plex_xml, parse_roon_csv};
+use tune_core::library::importer::{
+    ImportReport, ImportedTrack, MatchResult, match_tracks, parse_plex_xml, parse_roon_csv,
+};
 
 use crate::state::AppState;
 
@@ -208,6 +210,9 @@ pub(super) async fn import_roon(
                     "skipped": skipped,
                     "errors": errors.len(),
                     "error_details": errors.iter().take(20).collect::<Vec<_>>(),
+                    // #3914 (R5) : la marque d'origine, pour que le suivi de
+                    // tache rende un `source` et non une chaine vide.
+                    "source": "roon_import",
                 })
                 .to_string(),
             )
@@ -400,6 +405,9 @@ pub(super) async fn import_plex(
                     "skipped": skipped,
                     "errors": errors.len(),
                     "error_details": errors.iter().take(20).collect::<Vec<_>>(),
+                    // #3914 (R5) : la marque d'origine, pour que le suivi de
+                    // tache rende un `source` et non une chaine vide.
+                    "source": "plex_import",
                 })
                 .to_string(),
             )
@@ -561,6 +569,267 @@ fn entree_depuis_piste_importee(piste: ImportedTrack) -> ImportTrackEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// L'APERÇU et le RAPPORT — #3914 (R4 et R5)
+//
+// R4. L'écran appelle `importRoon(file, true)` — donc `?preview=true` — pour
+// MONTRER ce qu'un import ferait, avant de le faire (`SettingsView.svelte`,
+// étape « preview »). Ce paramètre n'était lu par personne : les points
+// d'entrée n'avaient aucun extracteur `Query`. Cliquer sur « aperçu » lançait
+// un import RÉEL, en tâche détachée. L'utilisateur croyait regarder ; Tune
+// écrivait.
+//
+// R5. Et quand l'import réel aboutissait, l'écran affichait un rapport vide :
+// trois formes de réponse coexistaient — `202 {status, task_id}` en fin de
+// route, `{imported, skipped, errors}` au suivi de tâche — et l'écran en lit
+// une QUATRIÈME, `ImportReport` (`tune-web-client/src/lib/api.ts:4692`) :
+// `total_rows`, `matched`, `unmatched`, `play_counts_updated`,
+// `ratings_updated`, `history_entries_added`, `playlists_created`,
+// `details[]`. Aucun de ces noms n'était rendu nulle part : tout arrivait
+// `undefined`.
+//
+// L'analyseur n'était pas le seul existant à brancher. Le RAPPORT existait
+// aussi : `tune_core::library::importer::ImportReport` porte exactement les
+// champs que l'écran lit, et `match_tracks` rapproche les lignes importées de
+// la bibliothèque. Ni l'un ni l'autre n'était construit ni appelé par quoi que
+// ce soit. Même leçon qu'en R3 — chercher l'existant avant d'écrire.
+// ---------------------------------------------------------------------------
+
+/// Les options de la requête d'import. Pour l'instant, l'aperçu seul.
+#[derive(Deserialize)]
+pub(super) struct OptionsDImport {
+    /// `?preview=true` : CALCULER le rapport, n'écrire RIEN.
+    preview: Option<bool>,
+}
+
+/// Lire `?preview=` sans toucher au corps.
+///
+/// `Query::try_from_uri` lit la requête, pas le flux : l'extracteur de corps
+/// (`Json` ou `Multipart`) reste libre de le consommer ensuite, et l'ordre des
+/// deux n'a pas à être négocié.
+///
+/// Un `?preview=peut-etre` sort en refus NOMMÉ plutôt qu'en retombant en
+/// silence sur `false` : un aperçu mal orthographié qui se transforme en import
+/// réel est exactement le défaut que cette tranche corrige. Le doute va vers le
+/// refus, jamais vers l'écriture.
+fn options_dimport(req: &Request) -> Result<OptionsDImport, Response> {
+    Query::<OptionsDImport>::try_from_uri(req.uri())
+        .map(|Query(options)| options)
+        .map_err(|e| {
+            refus_dimport(
+                StatusCode::BAD_REQUEST,
+                "preview_illisible",
+                format!(
+                    "`?preview=` n'accepte que `true` ou `false` ; rien n'a été \
+                     importé. Détail : {e}"
+                ),
+            )
+        })
+}
+
+/// `?preview=true` hors d'un fichier téléversé : refusé, et RIEN n'est écrit.
+///
+/// L'aperçu se calcule sur les lignes d'un fichier. Le chemin JSON n'en porte
+/// pas toujours — `roon_db_path` désigne une base à ouvrir, le chemin Plex un
+/// serveur à interroger : il n'y a rien à montrer avant d'être allé le
+/// chercher. Refuser vaut mieux que l'ancien comportement, où `?preview=true`
+/// lançait un import réel sans le dire.
+fn refus_apercu_hors_televersement() -> Response {
+    refus_dimport(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "apercu_sans_fichier",
+        "`?preview=true` ne s'applique qu'à un fichier téléversé (multipart, \
+         partie « file ») — c'est ce que fait l'écran d'import. Rien n'a été \
+         importé."
+            .to_string(),
+    )
+}
+
+/// Les deux index que `match_tracks` demande : par chemin, puis par
+/// (titre, artiste, album) en minuscules.
+type IndexDeBibliotheque = (
+    std::collections::HashMap<String, i64>,
+    std::collections::HashMap<(String, String, String), i64>,
+);
+
+/// Indexer la bibliothèque telle qu'elle est AVANT l'import.
+///
+/// `match_tracks` demande deux index : par chemin, et par (titre, artiste,
+/// album) en minuscules. Les construire coûte une passe paginée sur la table
+/// des pistes, là où interroger la base ligne à ligne coûterait une requête par
+/// ligne de l'export.
+///
+/// ⚠️ L'ordre compte. Le rapport se calcule AVANT l'écriture : sinon chaque
+/// ligne se rapprocherait de la piste que l'import vient tout juste de créer,
+/// et `matched` vaudrait toujours `total_rows` — un rapport qui ne dirait plus
+/// rien.
+fn indexer_la_bibliotheque(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> IndexDeBibliotheque {
+    const PAGE: i64 = 5_000;
+    let track_repo = TrackRepo::with_backend(backend.clone());
+    let mut par_chemin = std::collections::HashMap::new();
+    let mut flou = std::collections::HashMap::new();
+    let mut offset = 0i64;
+    loop {
+        let pistes = match track_repo.list(PAGE, offset) {
+            Ok(pistes) => pistes,
+            Err(e) => {
+                // Un index incomplet ferait un rapport FAUX (tout en
+                // « unmatched »), pas un rapport vide : le dire.
+                tracing::warn!(erreur = %e, offset, "import_index_bibliotheque_interrompu");
+                break;
+            }
+        };
+        let lues = pistes.len() as i64;
+        for piste in pistes {
+            let Some(id) = piste.id else { continue };
+            if let Some(ref chemin) = piste.file_path {
+                par_chemin.insert(chemin.clone(), id);
+            }
+            let titre = piste.title.to_lowercase();
+            if !titre.is_empty() {
+                flou.insert(
+                    (
+                        titre,
+                        piste.artist_name.unwrap_or_default().to_lowercase(),
+                        piste.album_title.unwrap_or_default().to_lowercase(),
+                    ),
+                    id,
+                );
+            }
+        }
+        if lues < PAGE {
+            break;
+        }
+        offset += lues;
+    }
+    (par_chemin, flou)
+}
+
+/// Le rapport qu'attend l'écran, calculé sur la bibliothèque d'AVANT.
+///
+/// `play_counts_updated`, `ratings_updated` et `history_entries_added` valent
+/// `0`, et ce n'est pas un oubli. L'import ENTRE des pistes ; il ne reporte
+/// encore ni les écoutes ni les notes de l'export sur les pistes déjà là. Les
+/// analyseurs les lisent pourtant (`ImportedTrack::play_count`, `rating`,
+/// `last_played`) — c'est une tranche à venir. Annoncer « 5 écoutes reportées »
+/// quand aucune ne l'est serait un rapport fabriqué ; l'écran n'affiche ces
+/// trois lignes que si elles sont non nulles, un zéro sincère ne montre donc
+/// rien du tout, ce qui est exact.
+///
+/// `playlists_created` vaut `0` pour la même raison : ni `parse_roon_csv` ni
+/// `parse_plex_xml` ne créent de liste de lecture sur ces deux routes.
+fn rapport_dimport(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    source: &str,
+    pistes: &[ImportedTrack],
+) -> (ImportReport, Vec<MatchResult>) {
+    let (par_chemin, flou) = indexer_la_bibliotheque(backend);
+    let rapprochements = match_tracks(pistes, &par_chemin, &flou);
+    let matched = rapprochements.iter().filter(|m| m.matched).count();
+    let rapport = ImportReport {
+        source: source.to_string(),
+        total_rows: pistes.len(),
+        matched,
+        unmatched: rapprochements.len().saturating_sub(matched),
+        play_counts_updated: 0,
+        ratings_updated: 0,
+        history_entries_added: 0,
+        playlists_created: 0,
+    };
+    (rapport, rapprochements)
+}
+
+/// Le rapport, sous les noms EXACTS que l'écran lit (`api.ts:4692`).
+///
+/// Les champs de `MatchResult` ne portent pas les noms de la table d'aperçu
+/// (`imported_title` contre `title`) : la correspondance se fait ici, une fois,
+/// plutôt que de renommer une structure publique de `tune-core` que d'autres
+/// pourraient lire.
+fn json_du_rapport(rapport: &ImportReport, details: &[MatchResult]) -> Value {
+    json!({
+        "source": rapport.source,
+        "total_rows": rapport.total_rows,
+        "matched": rapport.matched,
+        "unmatched": rapport.unmatched,
+        "play_counts_updated": rapport.play_counts_updated,
+        "ratings_updated": rapport.ratings_updated,
+        "history_entries_added": rapport.history_entries_added,
+        "playlists_created": rapport.playlists_created,
+        "details": details
+            .iter()
+            .map(|m| {
+                json!({
+                    "title": m.imported_title,
+                    "artist": m.imported_artist,
+                    "album": m.imported_album,
+                    "matched": m.matched,
+                    "match_method": m.match_method,
+                    "tune_track_id": m.tune_track_id,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// `?preview=true` — RIEN n'est écrit, et le rapport part tout de suite.
+///
+/// Synchrone, à dessein : l'écran attend le rapport dans la réponse elle-même
+/// (`importRoon(file, true)` lit `res.json()` comme un `ImportReport`). Aucune
+/// tâche détachée n'est lancée, aucun `task_id` n'est rendu — il n'y a aucune
+/// tâche à suivre. C'est la différence de fond avec l'import réel, qui ne peut
+/// PAS devenir synchrone : sur 50 000 lignes, il doit rendre `202` puis
+/// travailler derrière.
+///
+/// 🔴 Le témoin décisif de cette tranche n'est pas le code de statut : c'est
+/// `SELECT COUNT(*) FROM tracks`, INCHANGÉ après l'appel.
+fn apercu_dimport(state: &AppState, source: &str, pistes: &[ImportedTrack]) -> Response {
+    let (rapport, details) = rapport_dimport(&state.backend, source, pistes);
+    tracing::info!(
+        source,
+        total_rows = rapport.total_rows,
+        matched = rapport.matched,
+        unmatched = rapport.unmatched,
+        "import_apercu_rendu_sans_ecriture"
+    );
+    (StatusCode::OK, Json(json_du_rapport(&rapport, &details))).into_response()
+}
+
+/// Les champs d'`ImportReport` pour une tâche suivie — #3914 (R5).
+///
+/// Quand la tâche vient du chemin « fichier téléversé », le rapport a été
+/// calculé avant l'écriture et rangé tel quel : on le rend.
+///
+/// Les chemins plus anciens (JSON, base Roon, serveur Plex) ne rangent que
+/// leurs compteurs. Plutôt que d'inventer, on rend ce que ces compteurs disent
+/// vraiment, et la relation est exacte, pas approchée : `ecrire_les_pistes` ne
+/// saute une ligne que si son `file_path` est DÉJÀ en base. Donc « sautée » =
+/// « déjà là » = `matched`, et « écrite » = « absente » = `unmatched`.
+///
+/// `details` reste vide dans le suivi de tâche : l'écran ne dresse la table
+/// ligne à ligne qu'à l'étape d'aperçu (`SettingsView.svelte:4345`), et ranger
+/// 50 000 lignes dans une ligne de réglages pour ne les afficher jamais serait
+/// payer cher un champ que personne ne lit.
+fn champs_du_rapport(range: &Value) -> Value {
+    if range["report"].is_object() {
+        return range["report"].clone();
+    }
+    let compte = |nom: &str| range[nom].as_u64().unwrap_or(0) as usize;
+    let (ecrites, sautees, echecs) = (compte("imported"), compte("skipped"), compte("errors"));
+    json!({
+        "source": range["source"].as_str().unwrap_or_default(),
+        "total_rows": ecrites + sautees + echecs,
+        "matched": sautees,
+        "unmatched": ecrites,
+        "play_counts_updated": 0,
+        "ratings_updated": 0,
+        "history_entries_added": 0,
+        "playlists_created": 0,
+        "details": [],
+    })
+}
+
 /// Lancer l'import d'une liste de pistes DÉJÀ analysée, sous sa marque
 /// d'origine.
 ///
@@ -586,12 +855,15 @@ async fn lancer_import_de_pistes(
         .ok();
 
     tokio::spawn(async move {
+        // #3914 (R5) — le rapport se calcule ICI, avant la moindre écriture :
+        // c'est la seule fenêtre où « déjà en bibliothèque » veut encore dire
+        // quelque chose. Voir `rapport_dimport`.
+        let (rapport, _details) = rapport_dimport(&backend, source, &pistes);
         let entrees: Vec<ImportTrackEntry> = pistes
             .into_iter()
             .map(entree_depuis_piste_importee)
             .collect();
         let (imported, skipped, errors) = ecrire_les_pistes(&backend, source, &entrees);
-
         let settings = SettingsRepo::with_backend(backend.clone());
         let status = if errors.is_empty() {
             "completed"
@@ -607,6 +879,9 @@ async fn lancer_import_de_pistes(
                     "skipped": skipped,
                     "errors": errors.len(),
                     "error_details": errors.iter().take(20).collect::<Vec<_>>(),
+                    // #3914 (R5) : les champs que l'écran lit, rangés tels
+                    // quels — `import_status` les rend sans les recalculer.
+                    "report": json_du_rapport(&rapport, &[]),
                 })
                 .to_string(),
             )
@@ -617,6 +892,8 @@ async fn lancer_import_de_pistes(
             imported,
             skipped,
             errors = errors.len(),
+            total_rows = rapport.total_rows,
+            matched = rapport.matched,
             "import_televerse_complete"
         );
         annoncer_bibliotheque_modifiee(&event_bus, source, imported.into());
@@ -643,7 +920,15 @@ async fn lancer_import_de_pistes(
 /// pourquoi un en-tête non reconnu sort ici en **422 nommé, avec l'en-tête
 /// reçu** — et non en import silencieux de zéro piste.
 pub(super) async fn import_roon_entree(State(state): State<AppState>, req: Request) -> Response {
+    let options = match options_dimport(&req) {
+        Ok(options) => options,
+        Err(refus) => return refus,
+    };
+    let apercu = options.preview.unwrap_or(false);
     if !est_un_televersement(&req) {
+        if apercu {
+            return refus_apercu_hors_televersement();
+        }
         return match req.extract::<Json<ImportRoonRequest>, _>().await {
             Ok(Json(body)) => import_roon(State(state), Json(body)).await.into_response(),
             Err(rejet) => rejet.into_response(),
@@ -667,6 +952,10 @@ pub(super) async fn import_roon_entree(State(state): State<AppState>, req: Reque
             ),
         );
     }
+    // #3914 (R4) — l'aperçu s'arrête ici : le rapport part, rien n'est écrit.
+    if apercu {
+        return apercu_dimport(&state, "roon_import", &pistes);
+    }
     lancer_import_de_pistes(state, "roon_import", pistes).await
 }
 
@@ -675,7 +964,15 @@ pub(super) async fn import_roon_entree(State(state): State<AppState>, req: Reque
 /// Même défaut, même correctif que Roon : l'écran y téléverse aussi un fichier.
 /// Le chemin JSON (interrogation d'un serveur Plex par son jeton) est inchangé.
 pub(super) async fn import_plex_entree(State(state): State<AppState>, req: Request) -> Response {
+    let options = match options_dimport(&req) {
+        Ok(options) => options,
+        Err(refus) => return refus,
+    };
+    let apercu = options.preview.unwrap_or(false);
     if !est_un_televersement(&req) {
+        if apercu {
+            return refus_apercu_hors_televersement();
+        }
         return match req.extract::<Json<ImportPlexRequest>, _>().await {
             Ok(Json(body)) => import_plex(State(state), Json(body)).await.into_response(),
             Err(rejet) => rejet.into_response(),
@@ -699,6 +996,10 @@ pub(super) async fn import_plex_entree(State(state): State<AppState>, req: Reque
                 debut_du_fichier(&texte)
             ),
         );
+    }
+    // #3914 (R4) — même garde que Roon : l'aperçu ne touche pas la base.
+    if apercu {
+        return apercu_dimport(&state, "plex_import", &pistes);
     }
     lancer_import_de_pistes(state, "plex_import", pistes).await
 }
@@ -775,6 +1076,17 @@ pub(super) async fn import_playlists_file() -> Json<Value> {
     }))
 }
 
+/// `GET /system/import/status/{task_id}` — l'état de la tâche, ET son rapport.
+///
+/// 🔴 #3914 (R5) : c'est ce point d'accès qui porte le rapport, et pas la
+/// réponse initiale. L'import ne peut pas devenir synchrone — sur 50 000
+/// lignes, la route doit rendre `202 {task_id}` tout de suite — donc les
+/// champs que l'écran lit n'ont qu'un seul endroit où vivre : ici.
+///
+/// Les quatre champs historiques (`imported`, `skipped`, `errors`,
+/// `error_details`) restent rendus, au même nom : ils disent ce qui a été
+/// ÉCRIT, là où `ImportReport` dit ce qui a été RECONNU. Les deux réponses à
+/// deux questions différentes, aucune ne remplace l'autre.
 pub(super) async fn import_status(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
@@ -783,14 +1095,26 @@ pub(super) async fn import_status(
     let key = format!("import_task_{task_id}");
     if let Some(data) = settings.get(&key).ok().flatten() {
         if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
-            return Json(json!({
+            let mut reponse = json!({
                 "task_id": task_id,
                 "status": parsed["status"],
                 "imported": parsed["imported"],
                 "skipped": parsed["skipped"],
                 "errors": parsed["errors"],
                 "error_details": parsed["error_details"],
-            }));
+            });
+            // Les champs d'`ImportReport` montent au PREMIER niveau : c'est là
+            // que l'écran les lit (`importReport.total_rows`, et non
+            // `importReport.report.total_rows`).
+            if let (Some(cible), Some(rapport)) = (
+                reponse.as_object_mut(),
+                champs_du_rapport(&parsed).as_object(),
+            ) {
+                for (nom, valeur) in rapport {
+                    cible.insert(nom.clone(), valeur.clone());
+                }
+            }
+            return Json(reponse);
         }
     }
     Json(json!({
