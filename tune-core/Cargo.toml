@@ -365,6 +365,14 @@ path = "tests/temoin_resolution_streaming.rs"
 name = "temoin_resolution_locale"
 path = "tests/temoin_resolution_locale.rs"
 
+# #2218 T9 — marge, écrêtage, crête vraie et dither, par les portes PUBLIQUES
+# de `audio::{replaygain, eq, mixer, convolver, crossfeed, decode}`. Aucune
+# caractéristique requise : tourne sur toute PR Rust. `autotests = false` plus
+# haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "marge_et_crete_2218"
+path = "tests/marge_et_crete_2218.rs"
+
 # #2060 / #3522 — une balise « Track N » ne doit pas voler la place du nom de
 # fichier. `autotests = false` plus haut : sans cette cible, le fichier ne
 # serait jamais compilé.
