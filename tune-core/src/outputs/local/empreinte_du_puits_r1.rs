@@ -18,7 +18,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
-use super::{EtageDeConversion, LocalPcmKind, LocalPcmProcessor, PousseeVersLePuits};
+use super::{Etage, EtageDeConversion, LocalPcmKind, LocalPcmProcessor, PousseeVersLePuits};
 use crate::outputs::traits::{AudioSpec, CaptureOutput, FormatOuvert};
 
 /// Le puits qui n'écrit nulle part et **hache** ce qu'il reçoit.

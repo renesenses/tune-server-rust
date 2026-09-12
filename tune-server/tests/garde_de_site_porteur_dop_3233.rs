@@ -149,7 +149,10 @@ fn motif_de_la_route() -> String {
         // conversion, jamais la suivre.
         "lettrames_source=bloc.source_frames;",
         "letmots=self.convertir(bloc.samples);",
-        "ifpuits.ecrire(&mots){",
+        // REF-7 (#2219) : la route n'écrit plus elle-même, elle LIVRE par
+        // l'unique site d'écriture de l'étage — voir
+        // `l_etage_flottant_n_a_qu_un_seul_site_d_ecriture`.
+        "ifSelf::livrer(puits,&mots){",
     ]
     .concat()
 }
@@ -271,9 +274,11 @@ fn la_route_ne_refuse_pas_le_porteur_dop_apres_la_conversion() {
     let conversion = corps
         .find("self.convertir(")
         .expect("#3233 — la route ne convertit plus : le motif à garder a disparu");
+    // REF-7 (#2219) : l'écriture de la route est un appel à `livrer`, l'unique
+    // site d'écriture de l'étage — c'est le test suivant qui le prouve.
     let ecriture = corps
-        .find("puits.ecrire(")
-        .expect("#3233 — la route n'écrit plus au puits");
+        .find("Self::livrer(puits,")
+        .expect("#3233 — la route ne livre plus au puits");
 
     assert!(
         refus < conversion && conversion < ecriture,
@@ -281,6 +286,46 @@ fn la_route_ne_refuse_pas_le_porteur_dop_apres_la_conversion() {
          réécrit le porteur DoP, le refus arrive trop tard et le DAC est muet \
          quoi qu'on journalise (refus={refus}, conversion={conversion}, \
          écriture={ecriture})"
+    );
+}
+
+/// REF-7 (#2219) — l'étage flottant n'a qu'UN site d'écriture au puits.
+///
+/// La garde de positions ci-dessus enferme l'ordre refus < conversion <
+/// écriture DANS la route. Elle ne dit rien d'une écriture qui vivrait
+/// AILLEURS — un `puits.ecrire(` posé dans `play_url` ou dans un autre geste
+/// de l'étage, sans garde DoP ni conversion. Avant cette PR il y en avait
+/// quatre (la route, la queue du DSP, les deux vidages du rééchantillonneur) ;
+/// il n'en reste qu'un, `livrer`, et les trois gestes l'appellent. Un
+/// cinquième chemin vers le DAC ne peut donc plus s'écrire sans rougir ici.
+#[test]
+fn l_etage_flottant_n_a_qu_un_seul_site_d_ecriture() {
+    let source = sans_commentaires_ni_blancs(&production());
+    let ecritures = source.matches(".ecrire(").count();
+    assert_eq!(
+        ecritures, 1,
+        "REF-7 — la production du chemin CPAL partagé (`local.rs` + `backend.rs`) \
+         doit contenir exactement UN `.ecrire(`, celui de `livrer` ; j'en compte \
+         {ecritures}. Une écriture de plus est un chemin vers le DAC qui \
+         contourne la garde DoP (#3233) et la conversion"
+    );
+    let livrer = source
+        .split("fnlivrer(")
+        .nth(1)
+        .and_then(|s| s.split("fn").next())
+        .expect("REF-7 — `EtageDeConversion::livrer` doit rester identifiable");
+    assert!(
+        livrer.contains("puits.ecrire(mots)"),
+        "REF-7 — l'unique `.ecrire(` doit être celui de `livrer` : ailleurs, il \
+         échappe à la route"
+    );
+    // Et les trois gestes qui livrent — la route, la queue du DSP, le vidage
+    // du rééchantillonneur — passent tous par lui.
+    assert_eq!(
+        source.matches("Self::livrer(puits,").count(),
+        3,
+        "REF-7 — `pousser`, `rendre_la_queue_du_dsp` et `vider` doivent tous \
+         trois livrer par `livrer`"
     );
 }
 
