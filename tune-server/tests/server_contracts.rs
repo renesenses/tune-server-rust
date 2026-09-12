@@ -94,6 +94,12 @@ mod garde_de_site_porteur_dop_3233;
 mod generateur_playlists_sans_ia;
 #[path = "http_client_seam.rs"]
 mod http_client_seam;
+// #3914 : la route d'import Roon refusait en 415 le multipart que le client
+// envoie, AVANT d'entrer dans le gestionnaire. Les essais unitaires
+// d'`import.rs` appellent le gestionnaire directement : ils ne traversent
+// jamais cette frontière-là.
+#[path = "import_roon_multipart_3914.rs"]
+mod import_roon_multipart_3914;
 #[path = "integration.rs"]
 mod integration;
 #[path = "journal_pcm_alsa_ouvert.rs"]
