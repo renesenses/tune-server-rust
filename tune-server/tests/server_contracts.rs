@@ -129,6 +129,10 @@ mod output_provider_seam;
 mod paroles_ecriture_fichiers;
 #[path = "paroles_source_lrclib.rs"]
 mod paroles_source_lrclib;
+// #2373 (T4) : un partage de playlist se REPREND. Le parcours entier passe
+// par le routeur — partager, lire, revoquer, puis 404 sur le MEME jeton.
+#[path = "partage_playlist_revoque_2373.rs"]
+mod partage_playlist_revoque_2373;
 #[path = "piste_artiste_par_id.rs"]
 mod piste_artiste_par_id;
 #[path = "plafond_zones_gratuit.rs"]
