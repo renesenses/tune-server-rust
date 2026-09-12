@@ -1241,6 +1241,87 @@ where
     }))
 }
 
+/// Chronometre du segment que le journal ne couvrait pas.
+///
+/// #2352 — la mesure du 03/09/2026 (journal de Dominique COMET, fil 1653,
+/// Tune 0.9.132, `DirettaRenderer/1.0`) a etabli deux bornes : Tune envoie son
+/// `Play` entre 129 ms et 1244 ms (`playback_timing`), et le renderer ouvre le
+/// flux HTTP dans les 2 ms (`stream_request`). Les « plus de 30 secondes »
+/// vecues se jouent donc **apres le premier octet servi** — et AUCUNE ligne du
+/// journal ne couvrait ce segment : `build_file_body` incrementait
+/// `bytes_sent` sans jamais dire en combien de temps.
+///
+/// Ce que cette ligne separe, et que rien ne separait :
+///
+/// * `premier_octet_ms` eleve, debit ensuite normal ⇒ Tune a mis du temps a
+///   OUVRIR et lire la source (montage NAS, fichier temporaire de
+///   transcodage). La lenteur est en amont du renderer.
+/// * `premier_octet_ms` immediat, `debit_kio_s` bas ⇒ c'est le renderer qui
+///   tire lentement : le corps est servi par contre-pression HTTP, donc le
+///   debit mesure ici est **celui que le consommateur impose**, pas une
+///   capacite de Tune.
+/// * `complet=false` ⇒ le renderer a laché la connexion avant la fin.
+///
+/// Le `Drop` est deliberé : il couvre la connexion abandonnee en cours de
+/// route aussi bien que le service mene a son terme. Une piste que le renderer
+/// abandonne au bout de 30 s ne laissait, elle non plus, aucune trace.
+struct ChronoServiceFichier {
+    stream_id: String,
+    demande: u64,
+    servis: u64,
+    debut: std::time::Instant,
+    premier_octet_ms: Option<u64>,
+}
+
+impl ChronoServiceFichier {
+    fn new(stream_id: String, demande: u64) -> Self {
+        Self {
+            stream_id,
+            demande,
+            servis: 0,
+            debut: std::time::Instant::now(),
+            premier_octet_ms: None,
+        }
+    }
+
+    fn compter(&mut self, n: u64) {
+        if self.premier_octet_ms.is_none() {
+            self.premier_octet_ms = Some(self.debut.elapsed().as_millis() as u64);
+        }
+        self.servis += n;
+    }
+}
+
+impl Drop for ChronoServiceFichier {
+    fn drop(&mut self) {
+        let elapsed_ms = self.debut.elapsed().as_millis() as u64;
+        // Sous la milliseconde, le quotient s'envole : une rafale d'amorcage
+        // rapportee a 0 ms donnerait un debit a cinq chiffres. On ne publie
+        // pas un chiffre qu'on n'a pas mesure — meme contrat que le
+        // `bitrate_kbps` de `network-health` (#2275, f1b8b396), qui rend
+        // `null` plutot que de remplir le silence. Un `None` n'imprime PAS le
+        // champ : la ligne dit alors « je ne sais pas », pas « zero ».
+        let debit_kio_s = if elapsed_ms > 0 {
+            Some(
+                ((self.servis as f64 / 1024.0) / (elapsed_ms as f64 / 1000.0) * 10.0).round()
+                    / 10.0,
+            )
+        } else {
+            None
+        };
+        info!(
+            stream_id = %self.stream_id,
+            octets = self.servis,
+            demande = self.demande,
+            premier_octet_ms = self.premier_octet_ms,
+            elapsed_ms,
+            debit_kio_s,
+            complet = self.servis >= self.demande,
+            "service_fichier_termine"
+        );
+    }
+}
+
 fn build_file_body(
     faststart: Option<tune_core::audio::faststart::FaststartMap>,
     path: String,
@@ -1249,6 +1330,7 @@ fn build_file_body(
     byte_counter: std::sync::Arc<StreamSession>,
 ) -> Body {
     use std::sync::atomic::Ordering::Relaxed;
+    let mut chrono = ChronoServiceFichier::new(byte_counter.id.clone(), length);
     Body::from_stream(async_stream::stream! {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let mut remaining = length;
@@ -1261,6 +1343,7 @@ fn build_file_body(
                 let n = ((header_len - vpos).min(remaining)) as usize;
                 let s = vpos as usize;
                 byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                chrono.compter(n as u64);
                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&map.header[s..s + n]));
                 vpos += n as u64;
                 remaining -= n as u64;
@@ -1282,6 +1365,7 @@ fn build_file_body(
                                 Ok(n) => {
                                     remaining -= n as u64;
                                     byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                    chrono.compter(n as u64);
                                     yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
                                 }
                                 Err(e) => { warn!(error = %e, "file_read_error"); break; }
@@ -1306,6 +1390,7 @@ fn build_file_body(
                             Ok(n) => {
                                 remaining -= n as u64;
                                 byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                chrono.compter(n as u64);
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
                             }
                             Err(e) => { warn!(error = %e, "file_read_error"); break; }
