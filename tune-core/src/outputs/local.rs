@@ -3612,6 +3612,9 @@ enum FinDeBoucle {
 /// de lui brancher un second puits sans la toucher.
 struct BoucleProducteur<'a> {
     role: RoleDeLaBoucle,
+    /// Le nom du backend qui tient le puits (`BackendLocal::nom`), pour le
+    /// rapport de famine : la boucle est commune, le nom ne l'est pas.
+    backend: &'a str,
     device_name: &'a str,
     cle_de_flux: Option<&'a str>,
     stop_rx: &'a std::sync::mpsc::Receiver<()>,
@@ -3827,7 +3830,7 @@ impl BoucleProducteur<'_> {
                     }
                     // …et sans celle-ci, il s'arrêtait SANS RIEN DIRE (#3108).
                     record_feed_stall_failure(
-                        "CPAL",
+                        self.backend,
                         self.device_name,
                         self.position_ms.load(Ordering::Relaxed),
                         self.open_failure,
@@ -5205,6 +5208,7 @@ impl OutputTarget for LocalOutput {
             // `etage` et écrit dans `puits`. La piste enchaînée en gapless,
             // plus bas, appelle EXACTEMENT la même boucle.
             let producteur = BoucleProducteur {
+                backend: backend.nom(),
                 role: RoleDeLaBoucle::PisteInitiale,
                 device_name: &device_name,
                 cle_de_flux,
@@ -5610,6 +5614,7 @@ impl OutputTarget for LocalOutput {
                 // l'intérêt — #3108 avait dû être corrigé DEUX fois parce que
                 // ces deux boucles étaient deux copies.
                 let producteur_enchaine = BoucleProducteur {
+                    backend: backend.nom(),
                     role: RoleDeLaBoucle::PisteEnchainee,
                     device_name: &device_name,
                     cle_de_flux,
