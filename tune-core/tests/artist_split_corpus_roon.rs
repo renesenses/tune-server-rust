@@ -11,21 +11,22 @@
 //! Mesure d'origine (main @ 826d5667) :
 //!   - `split_risky = false` → 0 / 594 — mais **sans valeur de preuve** : ce mode
 //!     ne traite que `;` et `feat`, absents du corpus. Voir le premier test.
-//!   - `split_risky = true`  → **8 / 594** ← c'est là que se joue la garde.
+//!   - `split_risky = true`  → **7 / 594** ← c'est là que se joue la garde.
+//!     (8 à l'origine ; `Grover Washington, Jr.` corrigé par le rattachement
+//!     des suffixes générationnels.)
 
 use tune_core::metadata::artist_split::analyze_artist_credit;
 
 const CORPUS: &str = include_str!("fixtures/corpus_artistes_roon.json");
 
-/// Les huit noms que le mode risqué découpe aujourd'hui. Deux sont défendables
+/// Les sept noms que le mode risqué découpe aujourd'hui. Deux sont défendables
 /// (`Jimmy Page & Robert Plant`, `Dave Gahan & Soulsavers` sont de vraies
-/// collaborations) ; les six autres sont des noms de groupe indivisibles.
+/// collaborations) ; les cinq autres sont des noms de groupe indivisibles.
 /// Cette liste est un CLIQUET : elle ne doit que rétrécir.
 const RISQUE_CONNUS: &[&str] = &[
     "Arms and Sleepers",
     "Dave Gahan & Soulsavers",
     "Eko & Vinda Folio",
-    "Grover Washington, Jr.",
     "Iron & Wine",
     "Jimmy Page & Robert Plant",
     "Medeski, Martin & Wood",
