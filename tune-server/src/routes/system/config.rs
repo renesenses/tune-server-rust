@@ -873,6 +873,26 @@ pub(super) async fn update_config(
     // `/music-dirs/remove` et `/music-dirs/purge-orphans` ont été traitées.
     //
     // On lit l'AVANT ici, avant la boucle d'écriture : après, il est perdu.
+    // #3809 — l'annonce SlimProto, lue AVANT la boucle qui consomme le patch.
+    //
+    // Le réglage existait déjà et gouvernait bien le répondeur UDP — mais
+    // seulement au DÉMARRAGE. Un interrupteur à l'écran aurait donc écrit sa
+    // valeur ici et n'aurait rien changé au réseau jusqu'au prochain
+    // redémarrage : le testeur aurait rapporté le MÊME symptôme qu'avant
+    // (« ça ne change rien »), une couche plus loin. C'est le motif que le
+    // dépôt paie en boucle — un réglage écrit, jamais appliqué.
+    let annonce_demandee = values
+        .get(crate::background::CLE_ANNONCE_SLIMPROTO)
+        .map(|v| {
+            // La MÊME normalisation que la boucle d'écriture plus bas : un
+            // `false` JSON et la chaîne « false » doivent décider pareil.
+            let texte = v
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
+            crate::background::annonce_slimproto_activee(Some(&texte))
+        });
+
     let patch_music_dirs = values.get("music_dirs").and_then(dirs_depuis_valeur);
     let racines_avant = if patch_music_dirs.is_some() {
         super::get_music_dirs_list(&state.backend)
@@ -894,7 +914,15 @@ pub(super) async fn update_config(
             return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
         }
     }
+    // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
+    let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
+
     let mut reponse = json!({"ok": true});
+    // Le conteneur porte l'information : le client sait si sa demande a pris
+    // effet tout de suite, et n'a pas à supposer qu'un redémarrage l'attend.
+    if let Some(applique) = annonce_appliquee {
+        reponse["slimproto_discovery_applied"] = json!(applique);
+    }
     // Écho du mode réellement posé : le client n'a pas à relire `GET /config`
     // pour savoir si sa demande a été comprise.
     if let Some(mode) = source_appliquee {
@@ -954,6 +982,139 @@ pub(super) async fn update_config(
     reponse["impact"] = impact_json(&plan);
     reponse["confirm_purge_required"] = json!(plan.tracks);
     Ok(Json(reponse).into_response())
+}
+
+/// Ce qu'il faut faire du répondeur d'annonce, sachant l'état demandé et
+/// l'état réel.
+///
+/// Fonction PURE : elle se vérifie sans réseau, sans base et sans tâche. La
+/// partie qui touche au monde, [`appliquer_annonce_slimproto`], n'a plus qu'à
+/// exécuter la décision — c'est ce découpage qui rend #3809 testable sans
+/// prendre le port 3483 dans la suite de tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActionAnnonce {
+    /// Le réglage passe à vrai et rien ne tourne : armer le répondeur.
+    Armer,
+    /// Le réglage passe à faux et le répondeur tourne : le faire taire.
+    Eteindre,
+    /// L'état demandé est déjà l'état réel.
+    Rien,
+}
+
+pub(crate) fn action_annonce(demandee: bool, armee: bool) -> ActionAnnonce {
+    match (demandee, armee) {
+        (true, false) => ActionAnnonce::Armer,
+        (false, true) => ActionAnnonce::Eteindre,
+        _ => ActionAnnonce::Rien,
+    }
+}
+
+/// Applique l'annonce SlimProto sans redémarrage. Vrai si l'état a changé.
+///
+/// # #3809 — pourquoi la route, et pas seulement le démarrage
+///
+/// `background::spawn_slimproto_server` lit le réglage une fois, au démarrage.
+/// C'était suffisant tant qu'aucun écran ne proposait l'interrupteur ; ça ne
+/// l'est plus dès qu'on en pose un. Sans ce passage, basculer l'interrupteur
+/// écrirait une ligne en base et laisserait Home Assistant continuer à
+/// découvrir Tune en boucle — le testeur ne verrait aucune différence, ce qui
+/// est très exactement sa plainte d'origine.
+///
+/// L'extinction rend le port UDP : un LMS sur la même machine peut le
+/// reprendre sans que Tune redémarre. L'écoute TCP 3483 n'est jamais touchée
+/// (#2938, #2349).
+fn appliquer_annonce_slimproto(annonce: bool, port_http: u16) -> bool {
+    use tune_core::slimproto::discovery;
+    match action_annonce(annonce, discovery::est_armee()) {
+        ActionAnnonce::Armer => {
+            discovery::spawn(crate::background::identite_slimproto(port_http));
+            tracing::info!(
+                reglage = crate::background::CLE_ANNONCE_SLIMPROTO,
+                "slimproto_annonce_rallumee_a_chaud"
+            );
+            true
+        }
+        ActionAnnonce::Eteindre => {
+            let eteinte = discovery::eteindre();
+            tracing::info!(
+                reglage = crate::background::CLE_ANNONCE_SLIMPROTO,
+                "slimproto_annonce_eteinte_a_chaud"
+            );
+            eteinte
+        }
+        ActionAnnonce::Rien => false,
+    }
+}
+
+/// #3809 — l'interrupteur doit agir MAINTENANT.
+#[cfg(test)]
+mod annonce_slimproto_a_chaud_tests {
+    use super::*;
+
+    #[test]
+    fn allumer_ce_qui_dort_arme_le_repondeur() {
+        assert_eq!(action_annonce(true, false), ActionAnnonce::Armer);
+    }
+
+    #[test]
+    fn eteindre_ce_qui_tourne_fait_taire_le_repondeur() {
+        assert_eq!(action_annonce(false, true), ActionAnnonce::Eteindre);
+    }
+
+    /// Deux fois la même demande ne doit pas ouvrir un second répondeur : le
+    /// bind du deuxième échouerait et le journal accuserait un LMS voisin qui
+    /// n'existe pas.
+    #[test]
+    fn redemander_l_etat_courant_ne_fait_rien() {
+        assert_eq!(action_annonce(true, true), ActionAnnonce::Rien);
+        assert_eq!(action_annonce(false, false), ActionAnnonce::Rien);
+    }
+
+    /// Garde de SITE, sur la ROUTE et non sur la fonction.
+    ///
+    /// Une garde qui appellerait elle-même `appliquer_annonce_slimproto`
+    /// prouverait que la fonction marche, pas qu'on s'en sert : c'est le
+    /// défaut « écrit mais pas branché » que #3809 dénonce précisément. Ce
+    /// témoin vérifie donc le CORPS de `update_config`, et rien d'autre.
+    ///
+    /// Les marqueurs sont épelés en deux morceaux pour que ce test ne se
+    /// compte pas lui-même, et le corps est borné à la fonction.
+    #[test]
+    fn la_route_applique_le_reglage_apres_l_avoir_ecrit() {
+        let source = include_str!("config.rs");
+        let debut = source
+            .find(concat!("pub(super) async fn update_", "config("))
+            .expect("la route doit exister");
+        let corps = &source[debut..];
+        let corps = &corps[..corps.find("\n}\n").expect("la route doit se fermer")];
+
+        let pos_lecture = corps
+            .find(concat!("let annonce_", "demandee = values"))
+            .expect(
+                "la route doit lire la clé de l'annonce AVANT la boucle qui consomme \
+                 le patch (#3809)",
+            );
+        let pos_ecriture = corps
+            .find(concat!("for (key, value) in ", "values {"))
+            .expect("la route doit écrire les réglages");
+        let pos_application = corps
+            .find(concat!("appliquer_annonce_", "slimproto("))
+            .expect(
+                "la route doit APPLIQUER l'annonce : sans cet appel, l'interrupteur \
+                 écrit une ligne en base et ne change rien au réseau jusqu'au prochain \
+                 redémarrage (#3809)",
+            );
+
+        assert!(
+            pos_lecture < pos_ecriture,
+            "la clé doit être lue avant la boucle : après, le patch est consommé"
+        );
+        assert!(
+            pos_ecriture < pos_application,
+            "on applique APRÈS avoir persisté : appliquer d'abord laisserait le \
+             réseau et la base en désaccord si l'écriture échoue"
+        );
+    }
 }
 
 /// La valeur `music_dirs` d'un patch, qu'elle arrive en tableau JSON ou en

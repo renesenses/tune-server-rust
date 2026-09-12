@@ -2016,12 +2016,24 @@ fn spawn_slimproto_server(state: &AppState, config: &TuneConfig) {
         );
         return;
     }
-    tune_core::slimproto::discovery::spawn(tune_core::slimproto::discovery::IdentiteServeur {
+    tune_core::slimproto::discovery::spawn(identite_slimproto(config.port));
+}
+
+/// L'identité que Tune annonce sur le réseau — UNE seule définition.
+///
+/// Elle est construite à DEUX endroits depuis #3809 : ici au démarrage, et
+/// dans `PATCH /system/config` quand l'interrupteur rallume l'annonce à chaud.
+/// Deux copies divergeraient à la première retouche, et le réseau verrait deux
+/// Tune différents selon qu'on a redémarré ou basculé l'interrupteur.
+pub(crate) fn identite_slimproto(
+    port_http: u16,
+) -> tune_core::slimproto::discovery::IdentiteServeur {
+    tune_core::slimproto::discovery::IdentiteServeur {
         nom: "Tune".to_string(),
-        port_http: config.port,
+        port_http,
         port_cli: 9090,
         version: tune_core::version().to_string(),
-    });
+    }
 }
 
 /// Le délai avant la reprise des favoris de service : le démarrage a mieux à
