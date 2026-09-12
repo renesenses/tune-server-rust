@@ -271,10 +271,16 @@ fn la_boucle_gapless_applique_le_dsp() {
         .nth(1)
         .and_then(|s| s.split("\n    }").next())
         .expect("EtageDeConversion::pousser doit rester identifiable");
+    // REF-7 (#2219) : la route n'écrit plus elle-même, elle LIVRE par l'unique
+    // site d'écriture de l'étage, `livrer` — qui, lui, écrit au puits.
     assert!(
-        pousser.contains("self.decoder()") && pousser.contains("puits.ecrire("),
+        pousser.contains("self.decoder()") && pousser.contains("Self::livrer(puits,"),
         "la seule route vers le puits doit décoder par la frontière PCM \
          commune AVANT d'écrire (#2296/#2232)"
+    );
+    assert!(
+        methode_de_l_etage(prod, "livrer").contains("puits.ecrire("),
+        "`livrer` n'écrit plus au puits : la route livre dans le vide (REF-7, #2219)"
     );
     let decoder = prod
         .split("    fn decoder(")

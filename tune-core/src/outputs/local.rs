@@ -3389,6 +3389,21 @@ impl EtageDeConversion<'_> {
             || (stereo && pose(self.pcm.crossfeed))
             || (stereo && self.pcm.mono_downmix.load(Ordering::Relaxed))
     }
+
+    /// **L'unique écriture au puits** de l'étage flottant (REF-7, #2219).
+    ///
+    /// Tout ce qui part au DAC par le chemin CPAL partagé — bloc décodé,
+    /// queue du DSP, vidage du rééchantillonneur — passe par cette ligne et
+    /// aucune autre. `garde_de_site_porteur_dop_3233` compte les `.ecrire(`
+    /// de la production et en exige exactement un, ici : une écriture qui
+    /// contournerait la garde DoP ou la conversion ne peut plus être ajoutée
+    /// sans rougir un témoin.
+    ///
+    /// `false` veut dire une seule chose : le puits a cessé de consommer
+    /// (rappel mort, périphérique arraché). Jamais un arrêt demandé.
+    fn livrer(puits: &mut (dyn PuitsDEchantillons + '_), mots: &[f32]) -> bool {
+        puits.ecrire(mots)
+    }
 }
 
 /// L'étage FLOTTANT : celui du chemin DSP, dont le puits range des `f32`.
@@ -3425,7 +3440,7 @@ impl Etage for EtageDeConversion<'_> {
         }
         let trames_source = bloc.source_frames;
         let mots = self.convertir(bloc.samples);
-        if puits.ecrire(&mots) {
+        if Self::livrer(puits, &mots) {
             PousseeVersLePuits::Poussee { trames_source }
         } else {
             PousseeVersLePuits::PuitsMort { trames_source }
@@ -3457,7 +3472,7 @@ impl Etage for EtageDeConversion<'_> {
             return true;
         }
         let mots = self.convertir(queue);
-        puits.ecrire(&mots)
+        Self::livrer(puits, &mots)
     }
 
     /// Vide le rééchantillonneur : le reliquat plus le délai interne du sinc.
@@ -3475,7 +3490,7 @@ impl Etage for EtageDeConversion<'_> {
         if flushed.is_empty() {
             return true;
         }
-        puits.ecrire(&flushed)
+        Self::livrer(puits, &flushed)
     }
 
     fn transformations(&self) -> TransformationsReelles {
