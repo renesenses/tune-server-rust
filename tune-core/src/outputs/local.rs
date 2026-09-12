@@ -3797,6 +3797,60 @@ impl SharedDeviceResolution {
     }
 }
 
+/// Une période du rappel entier local **partagé** (cpal shared), hors de la
+/// fermeture pour être mesurable.
+///
+/// #2218 — ce rappel gardait un `Vec<f32>` capturé et le faisait grandir quand
+/// la période s'allongeait : `scratch.resize(n, 0.0)` appelait l'allocateur
+/// **dans la période audio**, sur le chemin qu'emprunte tout DAC refusant le
+/// flottant. `pop_mapped` écrit la conversion directement dans le tampon fourni
+/// par le backend : plus rien à dimensionner ni à faire grandir ici.
+///
+/// La rampe anti-« ploc » (#1590) garde son contrat mot pour mot : son facteur
+/// multiplie l'échantillon **flottant**, avant la conversion, jamais le mot
+/// entier du DAC — voir [`SoftMuteRamp::apply_mapped`].
+///
+/// [`SoftMuteRamp::apply_mapped`]: crate::audio::soft_mute::SoftMuteRamp::apply_mapped
+#[allow(clippy::too_many_arguments)]
+fn render_local_shared_integer_callback<T>(
+    ring: &RingBuf,
+    volume: &AtomicU32,
+    paused: &AtomicBool,
+    silent: &AtomicBool,
+    data_started: &AtomicBool,
+    ramp: &mut crate::audio::soft_mute::SoftMuteRamp,
+    armed_ms: u32,
+    min_buffer_samples: usize,
+    zero: T,
+    output: &mut [T],
+) -> usize
+where
+    T: Copy,
+    f32: symphonia::core::audio::conv::IntoSample<T>,
+{
+    use symphonia::core::audio::conv::IntoSample;
+    // Rampe anti-« ploc » (#1590). Ce chemin sert les DAC qui refusent le
+    // flottant : la rampe y est armée par la même porte, donc toujours
+    // désarmée sur DoP, en PURE et en sortie exclusive.
+    ramp.arm(armed_ms);
+    let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
+    if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
+        output.fill(zero);
+        return 0;
+    }
+    if !data_started.load(Ordering::Acquire) {
+        if ring.available() < min_buffer_samples {
+            output.fill(zero);
+            return 0;
+        }
+        data_started.store(true, Ordering::Release);
+    }
+    let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+    let read = ramp.apply_mapped(v, |s| s.into_sample(), |map| ring.pop_mapped(output, map));
+    output[read..].fill(zero);
+    read
+}
+
 /// Repli entier, HORS de toute branche : les DEUX chemins de sortie locale
 /// s'en servent.
 ///
@@ -3834,46 +3888,24 @@ where
 {
     use symphonia::core::audio::conv::IntoSample;
     let zero: T = 0.0f32.into_sample();
-    let mut scratch: Vec<f32> = Vec::new();
     let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
     // Prélevé AVANT la fermeture de rendu, qui consomme `ring_cb` (#3205).
     let famine_cb = ring_cb.starvation();
     device.build_output_stream(
         cfg,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let n = data.len();
-            // Rampe anti-« ploc » (#1590). Ce chemin sert les DAC
-            // qui refusent le flottant : la rampe y est armée par la
-            // même porte, donc toujours désarmée sur DoP, en PURE et
-            // en sortie exclusive.
-            ramp_cb.arm(soft_mute_cb.armed_ms());
-            let silence = paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
-            if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-                data.fill(zero);
-                return;
-            }
-            if !ds_cb.load(Ordering::Acquire) {
-                if ring_cb.available() < min_buf {
-                    data.fill(zero);
-                    return;
-                }
-                ds_cb.store(true, Ordering::Release);
-            }
-            if scratch.len() < n {
-                scratch.resize(n, 0.0);
-            }
-            let buf = &mut scratch[..n];
-            let read = ring_cb.pop(buf);
-            let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-            // La rampe module le tampon f32 AVANT la conversion en
-            // mot entier : convertir puis multiplier ferait le
-            // produit dans le format du DAC, hors du contrat de
-            // `IntoSample`.
-            ramp_cb.apply(&mut buf[..read], v);
-            for (o, s) in data[..read].iter_mut().zip(&buf[..read]) {
-                *o = (*s).into_sample();
-            }
-            data[read..].fill(zero);
+            render_local_shared_integer_callback(
+                &ring_cb,
+                &vol_cb,
+                &paused_cb,
+                &silent_cb,
+                &ds_cb,
+                &mut ramp_cb,
+                soft_mute_cb.armed_ms(),
+                min_buf,
+                zero,
+                data,
+            );
         },
         make_stream_error_cb(device_gone, famine_cb),
         None,
