@@ -321,27 +321,48 @@ async fn avtransport_control(
             if session.uri.is_empty() {
                 tune_core::upnp_server::soap_fault(701, "No URI set")
             } else {
-                // Même chemin que la lecture d'un media server externe : le
-                // flux traverse toute la chaîne Tune (EQ, convolveur, trim).
-                let req = tune_core::orchestrator::PlayRequest {
-                    zone_id,
-                    output_device_id: device_id.clone(),
-                    track_id: None,
-                    source: Some("upnp".into()),
-                    source_id: Some(session.uri.clone()),
-                    title: session.title.clone(),
-                    artist_name: session.artist.clone(),
-                    duration_ms: session.duration_ms,
-                    ..Default::default()
-                };
-                match state.orchestrator.play(req).await {
-                    Ok(_) => {
-                        info!(zone_id, uri = %session.uri, "upnp_renderer_play");
-                        upnp_renderer::empty_response("Play")
+                let ps = state.playback.get_state(zone_id).await;
+                let is_paused_same_uri = ps.state == tune_core::playback::PlayState::Paused
+                    && ps
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.source_id.as_deref())
+                        == Some(&session.uri);
+
+                if is_paused_same_uri {
+                    match state.orchestrator.resume(zone_id, device_id.as_deref()).await {
+                        Ok(()) => {
+                            info!(zone_id, uri = %session.uri, "upnp_renderer_play_resumed");
+                            upnp_renderer::empty_response("Play")
+                        }
+                        Err(e) => {
+                            warn!(zone_id, error = %e, "upnp_renderer_resume_failed");
+                            tune_core::upnp_server::soap_fault(701, &e.to_string())
+                        }
                     }
-                    Err(e) => {
-                        warn!(zone_id, error = %e, "upnp_renderer_play_failed");
-                        tune_core::upnp_server::soap_fault(701, &e)
+                } else {
+                    // Même chemin que la lecture d'un media server externe : le
+                    // flux traverse toute la chaîne Tune (EQ, convolveur, trim).
+                    let req = tune_core::orchestrator::PlayRequest {
+                        zone_id,
+                        output_device_id: device_id.clone(),
+                        track_id: None,
+                        source: Some("upnp".into()),
+                        source_id: Some(session.uri.clone()),
+                        title: session.title.clone(),
+                        artist_name: session.artist.clone(),
+                        duration_ms: session.duration_ms,
+                        ..Default::default()
+                    };
+                    match state.orchestrator.play(req).await {
+                        Ok(_) => {
+                            info!(zone_id, uri = %session.uri, "upnp_renderer_play");
+                            upnp_renderer::empty_response("Play")
+                        }
+                        Err(e) => {
+                            warn!(zone_id, error = %e, "upnp_renderer_play_failed");
+                            tune_core::upnp_server::soap_fault(701, &e)
+                        }
                     }
                 }
             }
