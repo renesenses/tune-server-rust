@@ -1592,6 +1592,7 @@ fn decode_via_converter_ffmpeg(
         sample_rate,
         channels,
         duration_s,
+        integrite: Default::default(),
     })
 }
 

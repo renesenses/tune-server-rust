@@ -775,6 +775,7 @@ pub fn decode_ape_to_pcm(
         sample_rate: out_rate,
         channels: out_channels,
         duration_s,
+        integrite: Default::default(),
     })
 }
 

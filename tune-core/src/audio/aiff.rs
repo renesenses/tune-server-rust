@@ -115,10 +115,28 @@ pub fn parse_aiff(path: &str) -> Result<AiffInfo, String> {
             }
             b"SSND" => {
                 let offset_field = u32::from_be_bytes(read_bytes::<4>(&mut f)?);
+                // `blockSize` n'est qu'un indice d'alignement de bloc pour les
+                // écrivains ; aucune donnée n'en dépend à la lecture. Lu pour
+                // avancer le curseur des 8 octets du sous-en-tête, rien de plus.
                 let _block_size = u32::from_be_bytes(read_bytes::<4>(&mut f)?);
                 // PCM data starts after the 8-byte SSND sub-header + offset field
-                let pcm_start = chunk_start + 8 + offset_field as u64;
-                let pcm_size = chunk_size as u64 - 8 - offset_field as u64;
+                //
+                // 🔴 #2218 T4 — cette soustraction était NUE. Un `SSND` dont la
+                // taille annoncée est inférieure à son propre sous-en-tête
+                // (8 octets + `offset`) débordait par le bas : panique en debug,
+                // et en release un `data_size` d'environ 2^64 rendu comme une
+                // taille valide. Le refuser ici, en le NOMMANT, ne tranche rien :
+                // aucun fichier conforme ne peut tomber dans ce cas.
+                let entete = 8u64 + offset_field as u64;
+                if (chunk_size as u64) < entete {
+                    return Err(format!(
+                        "aiff: chunk SSND incohérent — taille annoncée {chunk_size} octets, \
+                         plus petite que son propre sous-en-tête ({entete} octets : 8 + \
+                         offset {offset_field})"
+                    ));
+                }
+                let pcm_start = chunk_start + entete;
+                let pcm_size = chunk_size as u64 - entete;
                 data_offset = Some(pcm_start);
                 data_size = Some(pcm_size);
             }
@@ -203,6 +221,7 @@ pub fn decode_aiff_to_pcm(
             sample_rate: info.sample_rate.round() as u32,
             channels: info.channels as u32,
             duration_s: 0.0,
+            integrite: Default::default(),
         });
     }
 
@@ -325,6 +344,40 @@ pub fn decode_aiff_to_pcm(
 
     let duration_s = max_frames as f64 / info.sample_rate;
 
+    // 🔴 #2218 T4 — l'AIFF ne porte AUCUNE somme de contrôle : ni le FORM, ni
+    // le COMM, ni le SSND. Le seul recoupement possible est structurel, et il
+    // était disponible depuis toujours sans être fait : `COMM.numSampleFrames`
+    // annonce une longueur, `SSND` en annonce une autre par sa taille, et le
+    // décodeur ne lisait que la première — `AiffInfo::data_size` n'avait
+    // AUCUN lecteur dans tout le dépôt.
+    //
+    // La conséquence n'est pas théorique : la lecture ci-dessus est bornée par
+    // `num_frames`, pas par `data_size`. Un COMM qui sur-annonce fait donc
+    // lire AU-DELÀ du SSND, dans le chunk qui suit — un `ID3 ` ou un `APPL`
+    // servi comme de l'audio, à la bonne longueur et sans une erreur. C'est la
+    // forme ALAC du défaut, celle que rien ne distingue d'un flux sain.
+    //
+    // On le SIGNALE. On ne borne pas la lecture : tronquer changerait le PCM
+    // rendu à des fichiers qui se lisent aujourd'hui, et ce choix-là revient à
+    // Bertrand.
+    let trames_ssnd = (frame_size > 0).then(|| info.data_size / frame_size as u64);
+    let mut integrite = super::decode::IntegriteFlux {
+        trames_annoncees: (seek_s <= 0.0 && max_duration_s <= 0.0)
+            .then_some(info.num_frames as u64),
+        trames_rendues: samples.len() as u64 / (info.channels as u64).max(1),
+        ..Default::default()
+    };
+    if let Some(trames_ssnd) = trames_ssnd
+        && trames_ssnd < info.num_frames as u64
+    {
+        integrite.premier_refus = Some(format!(
+            "aiff: le chunk SSND ne porte que {trames_ssnd} trames alors que COMM en \
+             annonce {} — {} trames sont lues HORS du SSND",
+            info.num_frames,
+            info.num_frames as u64 - trames_ssnd
+        ));
+    }
+
     debug!(
         file = path,
         samples = samples.len(),
@@ -342,6 +395,7 @@ pub fn decode_aiff_to_pcm(
         sample_rate: info.sample_rate.round() as u32,
         channels: info.channels as u32,
         duration_s,
+        integrite,
     })
 }
 

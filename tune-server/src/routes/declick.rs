@@ -532,6 +532,7 @@ fn process_single_file(
         sample_rate,
         channels: channels as u32,
         duration_s: slice.len() as f64 / channels as f64 / sample_rate.max(1) as f64,
+        integrite: Default::default(),
     };
     let pcm = trimmed.pcm_bytes();
 

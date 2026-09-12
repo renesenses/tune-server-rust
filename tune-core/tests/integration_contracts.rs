@@ -23,6 +23,10 @@ mod dsd_streaming_repro;
 mod dsp_track_boundary;
 #[path = "flac_empreintes_reference.rs"]
 mod flac_empreintes_reference;
+// Les contrôles d'intégrité que les conteneurs offrent, et ce que le décodeur
+// en fait — tranche T4 de #2218.
+#[path = "integrite_conteneurs_2218_t4.rs"]
+mod integrite_conteneurs_2218_t4;
 #[path = "migration_on_real_db.rs"]
 mod migration_on_real_db;
 #[path = "no_blind_ffmpeg.rs"]
