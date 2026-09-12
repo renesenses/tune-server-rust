@@ -210,8 +210,9 @@ fn le_pcm_flac_est_celui_du_decodeur_de_reference() {
 ///
 /// ⚠️ Ce qu'on exige ici, c'est la DIFFÉRENCE, pas le refus. Voir la note
 /// `decodage_partiel` plus bas : `decode_symphonia` ne remonte pas l'erreur de
-/// trame, il s'arrête. La différence porte alors sur le nombre d'échantillons,
-/// et c'est bien la garde qui rougit — mais pas pour la raison qu'on croirait.
+/// trame, il PERD un bloc et poursuit. La différence porte alors sur le nombre
+/// d'échantillons, et c'est bien la garde qui rougit — mais pas pour la raison
+/// qu'on croirait.
 ///
 /// L'autre moitié de la contre-épreuve ne peut pas vivre dans le dépôt, car
 /// elle demande une SECONDE fixture : le 12/09/2026, la source WAV de
@@ -243,22 +244,55 @@ fn un_octet_abime_fait_rougir_la_garde() {
 
 /// Ce que cette tranche a mesuré et ne corrige PAS.
 ///
-/// `decode_symphonia` avale l'erreur de trame : `Err(_) => continue` sur
-/// `decoder.decode`, `Err(_) => break` sur `format.next_packet`. Une trame FLAC
-/// dont le CRC-16 ne tombe pas juste ne produit donc **aucune erreur** pour
-/// l'appelant — elle produit un PCM plus COURT, et `decode_to_pcm` rend `Ok`.
+/// Une trame FLAC dont le CRC ne tombe pas juste ne produit **aucune erreur**
+/// pour l'appelant — elle produit un PCM plus COURT, et `decode_to_pcm` rend
+/// `Ok`. Mesuré le 12/09/2026 sur `ref_16_44100_stereo.flac`, un octet inversé
+/// au milieu des trames : **27 088 échantillons rendus sur 35 280**.
 ///
-/// Mesuré le 12/09/2026 sur `ref_16_44100_stereo.flac`, un octet inversé au
-/// milieu des trames : **27 088 échantillons rendus sur 35 280**, soit 23,2 %
-/// de la piste perdus, `Ok(_)` en retour et pas une ligne de journal. Sur une
-/// piste de quatre minutes, c'est une minute de musique qui disparaît en
-/// silence — et l'appelant n'a aucun moyen de savoir qu'il sert un tronçon.
+/// # 🔴 Le POURQUOI, remesuré — ce n'est PAS une troncature
 ///
-/// Ce n'est pas le sujet de T1 et ce n'est pas corrigé ici : ce témoin-ci
-/// **constate** le fait, pour qu'il ne se redécouvre pas, et pour qu'une
-/// tranche ultérieure ait un point de départ chiffré. Le jour où le décodeur
-/// remontera l'erreur, ce témoin rougira — et c'est la bonne nouvelle : il
-/// faudra alors le retourner en exigeant le refus.
+/// La première rédaction de cette note désignait les deux `Err(_)` muets de
+/// `decode_symphonia` (`continue` sur `decoder.decode`, `break` sur
+/// `format.next_packet`) comme la cause, et concluait que « sur une piste de
+/// quatre minutes, c'est une minute de musique qui disparaît ». **Les deux
+/// affirmations sont fausses**, et la seconde a été reprise telle quelle dans
+/// les notes de la v0.9.147.
+///
+/// Mesure du 12/09/2026, sur la même copie abîmée :
+///
+/// ```text
+/// paquets_refuses = 0   trames_refusees = 0   premier_refus = None
+/// préfixe commun avec la référence : 8 192 trames
+/// suffixe commun avec la référence : 5 352 trames
+/// préfixe + suffixe = 13 544 = TOUTE la sortie abîmée
+/// ```
+///
+/// **Aucun des deux `Err(_)` ne se déclenche jamais** : le compteur d'`IntegriteFlux`
+/// reste à zéro sur les deux. Et la queue de la piste est **présente et juste**,
+/// bit pour bit. Ce qui manque est **un seul bloc FLAC de 4 096 trames**,
+/// prélevé au milieu : le décodeur se resynchronise tout seul, dans
+/// `symphonia-bundle-flac` — `PacketBuilder::try_build` vide sa file de
+/// fragments (`self.frags.clear()`) dès que le fragment suivant porte un CRC-16
+/// juste, et le fragment abîmé part avec elle, sans un mot.
+///
+/// Le seul contrôle qui voie quoi que ce soit est donc la comparaison de T4,
+/// `STREAMINFO.total samples` face aux trames rendues.
+///
+/// **Le « 23,2 % » n'est pas une propriété du défaut, c'est une propriété de la
+/// fixture** : elle dure 0,4 s, et un bloc EST 23,2 % de 0,4 s. Sur la piste de
+/// quatre minutes de la note d'origine, le même octet abîmé coûte les mêmes
+/// 4 096 trames, soit **92,9 ms — 0,04 %**, et non une minute. L'écart entre
+/// les deux lectures est d'un facteur 600 ; il vient d'avoir extrapolé un
+/// pourcentage mesuré sur une piste de 0,4 s.
+///
+/// Ce que le décodeur fait mal n'est donc pas de s'arrêter trop tôt — il ne
+/// s'arrête pas. C'est de **jeter un bloc en silence**. Le chemin de LECTURE
+/// le journalise depuis `tests/journal_perte_flac_2218.rs` ; le refus, lui,
+/// reste un arbitrage ouvert et n'est tranché nulle part.
+///
+/// Ce témoin-ci **constate** le fait, pour qu'il ne se redécouvre pas. Le jour
+/// où le décodeur remontera l'erreur, il rougira — et c'est la bonne nouvelle :
+/// il faudra alors le retourner en exigeant le refus.
 #[test]
 fn decodage_partiel_une_trame_abimee_ne_remonte_aucune_erreur() {
     let dossier = tune_core::test_scratch::scratch_dir("flac-troncature");
