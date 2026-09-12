@@ -1,22 +1,45 @@
-//! Le bras CoreAudio exclusif de `play_url` (R6 bis, #2219).
+//! Le bras CoreAudio exclusif de `play_url` (R6 bis, puis REF-8, #2219).
 //!
-//! Ce module est le bloc `#[cfg(target_os = "macos")] if exclusive_mode { … }`
-//! de `play_url`, sorti à l'identique : le texte est celui du bloc, ce qu'il
-//! lisait du contexte de `play_url` est devenu [`EntreesCoreAudio`], construit
-//! par `play_url` juste avant l'appel. Le bloc sortait TOUJOURS par `return` :
-//! le bras est terminal, il ne rend rien à la suite de `play_url`, qui fait
-//! `return` après l'appel. Aucune condition ne change — le `if` et sa bannière
-//! restent dans `play_url`.
+//! R6 bis a sorti ce bloc de `play_url` à l'identique, avec sa propre boucle
+//! de lecture. REF-8 (cette tranche) la fait disparaître : le bras est
+//! maintenant **ouvrir → étage de conversion → boucle producteur commune →
+//! drainer**, exactement la suite de gestes du chemin CPAL partagé, sur le
+//! backend [`BackendCoreAudio`] qui implémente [`BackendLocal`].
+//!
+//! Trois décisions, tenues mot pour mot (plan de nuit du 12/09) :
+//!
+//! * **D1 — le mot reste `f32`.** CoreAudio rend du `f32` à l'AudioUnit, qui
+//!   convertit vers le format physique hors du dépôt. Le passer en entier
+//!   changerait le son : c'est une décision d'écoute, pas de nuit. Le backend
+//!   fournit donc [`Puits::Flottant`], et le DoP traverse comme avant : en
+//!   `f32`, reconnu par `process_pcm_chunk` après 32 trames, volume figé à
+//!   l'unité par `sync_volume_to_dop`. Aucun refus, aucun verrou.
+//! * **D2 — le backend possède son anneau.** Il est créé dans
+//!   `ExclusiveOutput::new` (`coreaudio_exclusive.rs`), à la même contenance
+//!   (`cadence × canaux × 2`, deux secondes). Ce module n'en calcule plus.
+//! * **D3 — le volume reste multiplié dans le rappel `Interleaved<f32>`**,
+//!   par valeur, comme aujourd'hui. Le rappel ne voit jamais un trait.
+//!
+//! Le trait `BackendLocal<'a>` est `pub(super)` dans `local::backend` : il
+//! n'est pas nommable depuis `outputs::coreaudio_exclusive`, et sa durée de
+//! vie `'a` est celle des témoins d'arrêt du fil de lecture, que
+//! `ExclusiveOutput` (un type `pub` sans lifetime) n'a aucune raison de
+//! porter. L'implémentation vit donc ICI, sur [`BackendCoreAudio<'a>`], qui
+//! enveloppe l'`ExclusiveOutput` et tient les emprunts ; ce que l'impl appelle
+//! (`new` sans démarrage, `start`, `ring`, `format_info`) vit dans
+//! `coreaudio_exclusive.rs`.
 //!
 //! Compilé par la seule porte macOS (`macos-pr` de `ci.yml`) : Shrek ne voit
-//! pas ce fichier. Les gardes de texte qui comptaient ce bras dans `local.rs`
-//! (`dsp_track_boundary`, `refus_exclusif_dit_sa_cause_i3108`,
-//! `backend_fallback_tests`) le relisent ici.
+//! pas ce fichier. Les gardes de texte qui le lisent (`dsp_track_boundary`,
+//! `refus_exclusif_dit_sa_cause_i3108`, `backend_fallback_tests`) le relisent
+//! sur ce qu'il fait maintenant ; l'empreinte du chemin décoder → étage →
+//! puits est tenue par `empreinte_coreaudio_f70496.rs`, sur Shrek.
 
 // ------- Exclusive mode path (macOS only) -------
 
-use std::io::Read;
-
+use super::backend::{
+    BackendLocal, DemandeDOuverture, Observation, Puits, RefusDOuverture, Vidage,
+};
 use super::*;
 use crate::outputs::coreaudio_exclusive::ExclusiveOutput;
 
@@ -63,6 +86,230 @@ pub(super) struct EntreesCoreAudio {
     pub(super) dop_active: Arc<AtomicBool>,
 }
 
+/// Le puits du bras CoreAudio : l'anneau flottant de l'`ExclusiveOutput`, que
+/// draine le rappel `Interleaved<f32>`.
+///
+/// Écrit sur le modèle de `PuitsAnneauCpal` (`local/backend.rs`) : il porte
+/// les trois témoins d'arrêt parce que l'attente a lieu ICI — quand l'anneau
+/// est plein, c'est `feed_ring_abortable` qui dort. Contrat de `false`, mot
+/// pour mot celui de `PuitsDEchantillons` : rendu UNIQUEMENT quand le
+/// détecteur de blocage s'est déclenché (le rappel de rendu n'a plus tiré
+/// pendant ≥ 5 s — rappel mort, DAC USB arraché, #1626) ; `true` sinon, y
+/// compris sur un arrêt ou un silence forcé, que les appelants détectent par
+/// leurs propres témoins.
+///
+/// Le verdict est en plus MÉMORISÉ dans `bloque` : la boucle commune le
+/// traduit en `FinDeBoucle::Interrompue`, indistinguable d'un stop, et c'est
+/// ce drapeau qui permet au bras de rapporter le blocage sous SON nom
+/// (`record_feed_stall_failure("CoreAudio", …)`, #3108).
+struct PuitsAnneauCoreAudio<'a> {
+    anneau: Arc<RingBuf>,
+    stop_rx: &'a std::sync::mpsc::Receiver<()>,
+    paused: &'a AtomicBool,
+    force_silent: &'a AtomicBool,
+    bloque: Arc<AtomicBool>,
+}
+
+impl PuitsDEchantillons for PuitsAnneauCoreAudio<'_> {
+    fn ecrire(&mut self, mots: &[f32]) -> bool {
+        let vivant = feed_ring_abortable(
+            &self.anneau,
+            mots,
+            self.stop_rx,
+            self.paused,
+            Some(self.force_silent),
+        );
+        if !vivant {
+            self.bloque.store(true, Ordering::SeqCst);
+        }
+        vivant
+    }
+}
+
+/// CoreAudio en mode exclusif (hog) : le backend de la sortie locale sur
+/// macOS quand la zone est réglée « exclusif ».
+///
+/// Il possède l'`ExclusiveOutput`, donc l'anneau (D2) et l'AudioUnit. Le
+/// rappel de rendu est celui d'avant, inchangé : il tire dans l'anneau et
+/// multiplie le volume par valeur (D3).
+pub(super) struct BackendCoreAudio<'a> {
+    sortie: ExclusiveOutput,
+    format: FormatOuvert,
+    device_name: String,
+    stop_rx: &'a std::sync::mpsc::Receiver<()>,
+    paused: &'a AtomicBool,
+    force_silent: &'a AtomicBool,
+    position_ms: &'a AtomicU64,
+    /// Levé par le puits quand le rappel de rendu ne tire plus (#3108).
+    bloque: Arc<AtomicBool>,
+}
+
+impl BackendCoreAudio<'_> {
+    /// Le nom du périphérique que CoreAudio a RÉELLEMENT ouvert
+    /// (`resolve_output_device` retombe sur la sortie système quand le nom
+    /// stocké n'existe plus).
+    fn peripherique_ouvert(&self) -> &str {
+        &self.sortie.format_info().device_name
+    }
+
+    /// Le puits a-t-il constaté un rappel de rendu mort ? Hors trait : c'est
+    /// le nom du backend que le rapport doit porter, et lui seul le connaît.
+    fn puits_bloque(&self) -> bool {
+        self.bloque.load(Ordering::SeqCst)
+    }
+}
+
+impl<'a> BackendLocal<'a> for BackendCoreAudio<'a> {
+    /// `prepare_exclusive_device` (hog, cadence, format physique, rollback)
+    /// puis l'AudioUnit et son rappel — c'est `ExclusiveOutput::new`, qui ne
+    /// démarre plus. Le refus est `OuvertureExclusiveRefusee { "CoreAudio" }`
+    /// et `rapporter` le passe à `record_exclusive_open_failure`, comme le
+    /// bras le faisait en ligne.
+    fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
+        let device_name = demande.device_name.to_string();
+        let sample_rate = demande.spec.cadence();
+        let bit_depth = demande.spec.profondeur().bits_declares();
+        let channels = demande.spec.canaux();
+        // Ce que CoreAudio exclusif ne lit pas : l'endpoint et l'hôte d'origine
+        // (il résout par nom), le backend demandé (le `cfg` et `exclusive_mode`
+        // ont déjà choisi ce bras), la porte de rampe (le rappel n'en a pas),
+        // le témoin de périphérique perdu (aucun rappel d'erreur, #1626).
+        let _ = (
+            demande.endpoint_id,
+            demande.origin_host,
+            demande.audio_backend,
+            demande.exclusive,
+            &demande.soft_mute,
+            demande.device_gone,
+        );
+
+        let sortie = ExclusiveOutput::new(
+            &device_name,
+            sample_rate,
+            bit_depth as u32,
+            channels as u32,
+            demande.starvation.clone(),
+            demande.volume.clone(),
+            demande.paused.clone(),
+        )
+        .map_err(|erreur| RefusDOuverture::OuvertureExclusiveRefusee {
+            backend: "CoreAudio",
+            erreur,
+        })?;
+        // Le contrat physique a été VÉRIFIÉ par lecture (`validate_physical_
+        // format_contract`) : ce que le périphérique a ouvert est ce qui a été
+        // demandé — cadence et canaux de la source.
+        let info = sortie.format_info();
+        let format = FormatOuvert::new(info.sample_rate, info.channels as u16);
+
+        Ok(BackendCoreAudio {
+            sortie,
+            format,
+            device_name,
+            stop_rx: demande.stop_rx,
+            paused: demande.paused.as_ref(),
+            force_silent: demande.force_silent.as_ref(),
+            position_ms: demande.position_ms,
+            bloque: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn format_ouvert(&self) -> FormatOuvert {
+        self.format
+    }
+
+    fn puits(&self) -> Puits<'a> {
+        Puits::Flottant(Box::new(PuitsAnneauCoreAudio {
+            anneau: self.sortie.ring().clone(),
+            stop_rx: self.stop_rx,
+            paused: self.paused,
+            force_silent: self.force_silent,
+            bloque: self.bloque.clone(),
+        }))
+    }
+
+    /// `audio_unit.start()` — la dernière étape de l'ancien `new`. Le refus
+    /// garde le message et le rapporteur d'avant (`record_exclusive_open_
+    /// failure`, via `rapporter`) : c'était un échec d'OUVERTURE pour
+    /// l'utilisateur, il le reste.
+    fn demarrer(&mut self) -> Result<(), RefusDOuverture> {
+        self.sortie
+            .start()
+            .map_err(|erreur| RefusDOuverture::OuvertureExclusiveRefusee {
+                backend: "CoreAudio",
+                erreur,
+            })
+    }
+
+    /// `disponible` et `capacite` seulement. CoreAudio n'a pas de rappel
+    /// d'erreur (#1626) : `peripherique_perdu` est toujours faux. Les
+    /// sous-alimentations du pilote et les erreurs de rappel ne sont pas
+    /// mesurées sur ce chemin : `None`, jamais zéro.
+    fn observer(&self) -> Observation {
+        let anneau = self.sortie.ring();
+        Observation {
+            disponible: anneau.available(),
+            capacite: anneau.capacity(),
+            peripherique_perdu: false,
+            sous_alimentations_pilote: None,
+            erreurs_de_rappel: None,
+        }
+    }
+
+    /// Le vidage borné du bras (#3108) — JAMAIS sans fin : face à un rappel de
+    /// rendu mort, l'anneau ne se vide jamais, et sans échéance le fil restait
+    /// vivant, la zone « en lecture », le réexamen des branchements gelé.
+    /// La borne est calculée par l'appelant (`drain_deadline_for`). Pendant le
+    /// vidage, la position publiée recule vers ce qui est réellement joué
+    /// (alimenté − encore en attente), comme sur le chemin partagé.
+    fn drainer(&mut self, borne: std::time::Duration) -> Vidage {
+        let device_name = &self.device_name;
+        let ring = self.sortie.ring();
+        let stop_rx = self.stop_rx;
+        let force_silent = self.force_silent;
+        let position_ms = self.position_ms;
+        let output_sr = self.format.cadence;
+        let output_ch = self.format.canaux;
+
+        let fed_position_ms = position_ms.load(Ordering::Relaxed);
+        let mut drained_naturally = false;
+        let drain_deadline = borne;
+        let drain_started = std::time::Instant::now();
+        loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            if force_silent.load(Ordering::Relaxed) {
+                break;
+            }
+            let remaining = ring.available();
+            if remaining == 0 {
+                drained_naturally = true;
+                break;
+            }
+            if drain_started.elapsed() >= drain_deadline {
+                warn!(
+                    device = %device_name,
+                    remaining_samples = remaining,
+                    "local_audio_exclusive_drain_timeout"
+                );
+                break;
+            }
+            if output_sr > 0 && output_ch > 0 {
+                let ring_ms =
+                    (remaining as f64 / output_ch as f64 / output_sr as f64 * 1000.0) as u64;
+                position_ms.store(fed_position_ms.saturating_sub(ring_ms), Ordering::Relaxed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Vidage {
+            vide: drained_naturally,
+            restant: ring.available(),
+            position_alimentee_ms: fed_position_ms,
+        }
+    }
+}
+
 /// Joue la piste sur CoreAudio en mode exclusif (hog), au format source,
 /// jusqu'à la fin du flux ou l'ordre d'arrêt. Terminal : quand il rend, le
 /// fil de lecture n'a plus rien à faire.
@@ -100,6 +347,9 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         mono_downmix,
         dop_active,
     } = entrees;
+    // `frame_bytes` était la largeur de trame que la boucle propre du bras
+    // recalculait à chaque lecture ; l'étage la déduit de `spec`.
+    let _ = frame_bytes;
 
     info!(
         device = %device_name,
@@ -109,28 +359,50 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         "local_audio_exclusive_mode_active"
     );
 
-    // Ring buffer: ~2 seconds of audio at source sample rate
-    let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-    starvation.begin_stream(sample_rate, channels);
-    let ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
-    ring.clear(); // Defensive: zero-fill before callback reads
-
-    let exclusive = match ExclusiveOutput::new(
-        &device_name,
-        sample_rate,
-        bit_depth as u32,
-        channels as u32,
-        ring.clone(),
-        volume.clone(),
-        paused.clone(),
-    ) {
-        Ok(ex) => ex,
-        Err(e) => {
-            record_exclusive_open_failure("CoreAudio", &device_name, &e.to_string(), &open_failure);
+    // CoreAudio n'a AUCUN rappel d'erreur (#1626) : ce témoin n'est jamais
+    // levé. La boucle commune le relit ; il reste faux toute la piste.
+    let device_gone = Arc::new(AtomicBool::new(false));
+    // La porte de rampe n'existe que pour le type de la demande : le rappel
+    // CoreAudio n'a pas de rampe, et `ouvrir` ne la lit pas.
+    let soft_mute = crate::audio::soft_mute::SoftMuteGate::new(
+        Arc::new(AtomicU32::new(0)),
+        dop_active.clone(),
+        pure_bypass.clone(),
+        true,
+    );
+    let demande = DemandeDOuverture {
+        spec,
+        device_name: &device_name,
+        endpoint_id: None,
+        origin_host: None,
+        audio_backend: "coreaudio",
+        exclusive: true,
+        stop_rx: &stop_rx,
+        paused: &paused,
+        force_silent: &force_silent,
+        volume: &volume,
+        device_gone: &device_gone,
+        starvation: &starvation,
+        soft_mute,
+        position_ms: &position_ms,
+    };
+    let mut backend = match BackendCoreAudio::ouvrir(&demande) {
+        Ok(backend) => backend,
+        Err(refus) => {
+            refus.rapporter(&device_name, &open_failure);
             playing.store(false, Ordering::SeqCst);
             return;
         }
     };
+    // Le rendu démarre AVANT le premier octet, comme quand `start` était la
+    // dernière étape de `new` : le rappel tire du silence tant que l'anneau
+    // est vide. Rien n'est mis entre l'ouverture et le démarrage.
+    if let Err(refus) = backend.demarrer() {
+        refus.rapporter(&device_name, &open_failure);
+        drop(backend);
+        playing.store(false, Ordering::SeqCst);
+        return;
+    }
 
     info!(device = %device_name, url = %url, "local_audio_exclusive_playing");
     // CoreAudio exclusif : `resolve_output_device` retombe sur le
@@ -141,7 +413,7 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
     note_opened_device(
         "CoreAudio",
         &device_name,
-        &exclusive.format_info().device_name,
+        backend.peripherique_ouvert(),
         None,
     );
 
@@ -156,105 +428,123 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
 
     // Read and feed the rest of the stream
     let mut read_buf = vec![0u8; 65536];
-    let mut leftover = pcm_data;
-    let mut pcm_kind = LocalPcmKind::for_bit_depth(bit_depth);
-    let pcm_processor = LocalPcmProcessor {
-        eq: &eq,
-        convolver: &convolver,
-        crossfeed: &crossfeed,
-        pure_bypass: &pure_bypass,
-        mono_downmix: &mono_downmix,
-        dop_active: &dop_active,
-        volume: &volume,
-        user_volume: &user_volume_ref,
-        rg_factor: &rg_factor_ref,
+
+    // ── La frontière producteur → puits ────────────────────────────────
+    //
+    // Le même étage que le chemin partagé, au format IDENTITÉ : la sortie est
+    // ouverte à la cadence et aux canaux de la source (contrat physique
+    // vérifié), donc ni adaptation de canaux ni rééchantillonnage — `convertir`
+    // rend ses mots tels quels. Le DoP n'est pas refusé sur ce bras : il
+    // traverse en f32 jusqu'à l'AudioUnit, comme avant (D1).
+    let mut etage = EtageDeConversion {
+        pcm: LocalPcmProcessor {
+            eq: &eq,
+            convolver: &convolver,
+            crossfeed: &crossfeed,
+            pure_bypass: &pure_bypass,
+            mono_downmix: &mono_downmix,
+            dop_active: &dop_active,
+            volume: &volume,
+            user_volume: &user_volume_ref,
+            rg_factor: &rg_factor_ref,
+        },
+        en_attente: pcm_data,
+        resampler: None,
+        resample_leftover: Vec::new(),
+        pcm_kind: LocalPcmKind::for_bit_depth(bit_depth),
+        spec,
+        sortie: backend.format_ouvert(),
+        needs_resample: false,
     };
+    let mut puits = match backend.puits() {
+        Puits::Flottant(puits) => puits,
+        Puits::Natif(_) => unreachable!("BackendCoreAudio ne fournit qu'un puits flottant (D1)"),
+    };
+    let mut refuser_le_porteur_dop = |_dop: bool, _src_sr: u32, _src_ch: u16| -> bool { false };
 
     // Process leftover from header read
     // #3108 — le verdict de blocage était JETÉ aux trois sites de
     // ce chemin, seul de tous les chemins de lecture. Conséquence
     // exacte du constat : l'anneau exclusif tient deux secondes
-    // d'audio (`ring_cap` ci-dessus), il se remplit une fois, le
-    // rappel de rendu ne tire rien, et la position reste sur 2 000
-    // ms pour toujours — sans un mot.
+    // d'audio (sa contenance, dans `ExclusiveOutput::new`), il se
+    // remplit une fois, le rappel de rendu ne tire rien, et la
+    // position reste sur 2 000 ms pour toujours — sans un mot.
     let mut feed_stalled = false;
-    if let Some(processed) = pcm_processor.process_pcm_chunk(&mut leftover, spec, &mut pcm_kind) {
-        if !feed_ring_abortable(
-            &ring,
-            &processed.samples,
-            &stop_rx,
-            &paused,
-            Some(&force_silent),
-        ) {
+    match etage.pousser(&mut *puits, &mut refuser_le_porteur_dop, &mut |_| {}) {
+        PousseeVersLePuits::Poussee { trames_source } => {
+            total_frames_fed += trames_source;
+        }
+        PousseeVersLePuits::PuitsMort { trames_source } => {
+            // L'amorce comptait ses trames sans regarder le verdict : ce
+            // compte est la position rapportée, il ne change pas.
+            total_frames_fed += trames_source;
             feed_stalled = true;
         }
-        total_frames_fed += processed.source_frames;
+        PousseeVersLePuits::RienAPousser => {}
+        PousseeVersLePuits::PorteurDopRefuse => {
+            unreachable!("ce bras ne refuse jamais un porteur DoP (D1)")
+        }
     }
 
+    // ── La boucle producteur commune ───────────────────────────────────
+    //
+    // Celle de `local.rs`, la même que les deux pistes du chemin partagé :
+    // `stop_rx`, `force_silent`, EOF et le puits mort sont SES témoins. La
+    // clé de flux (#3318) est celle de l'URL tirée : les erreurs de lecture
+    // de ce bras la portent désormais, comme celles du chemin partagé.
+    let cle_de_flux = crate::poller::decisions::stream_id_de_l_uri(Some(&url));
+    let producteur = BoucleProducteur {
+        role: RoleDeLaBoucle::PisteInitiale,
+        device_name: &device_name,
+        cle_de_flux: cle_de_flux.as_deref(),
+        stop_rx: &stop_rx,
+        force_silent: force_silent.as_ref(),
+        device_gone: device_gone.as_ref(),
+        position_ms: position_ms.as_ref(),
+        open_failure: open_failure.as_ref(),
+        debut_du_flux: std::time::Instant::now(),
+    };
+    let mut compteurs = CompteursDePiste {
+        total_bytes_read: 0,
+        total_frames_fed,
+        seek_offset,
+        skip_bytes: 0,
+        skipped_bytes: 0,
+        premiere_donnee_journalisee: false,
+    };
     let mut http_eof_excl = false;
-    while !feed_stalled {
-        if stop_rx.try_recv().is_ok() {
-            break;
-        }
-        if force_silent.load(Ordering::Relaxed) {
-            debug!("local_audio_exclusive_aborted_by_stop");
-            break;
-        }
-
-        let n = match reader.read(&mut read_buf) {
-            Ok(0) => {
-                http_eof_excl = true;
-                break;
+    if !feed_stalled {
+        let fin = producteur.tourner(
+            &mut reader,
+            &mut read_buf,
+            &mut etage,
+            &mut *puits,
+            &mut refuser_le_porteur_dop,
+            &mut compteurs,
+            &mut |_| true,
+        );
+        match fin {
+            FinDeBoucle::FinDeFlux => http_eof_excl = true,
+            // Arrêt demandé, silence forcé — ou puits mort : la boucle ne
+            // distingue pas, le puits l'a mémorisé.
+            FinDeBoucle::Interrompue => {}
+            FinDeBoucle::PorteurDopRefuse | FinDeBoucle::Abandon => {
+                unreachable!("ni refus DoP ni abandon possibles : les deux rappels sont constants")
             }
-            Ok(n) => n,
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                // Read timeout — check abort flag and retry
-                continue;
-            }
-            Err(e) => {
-                warn!(error = %e, "local_audio_exclusive_read_error");
-                http_eof_excl = true;
-                break;
-            }
-        };
-
-        leftover.extend_from_slice(&read_buf[..n]);
-
-        let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
-        if aligned_len == 0 {
-            continue;
         }
-
-        let Some(processed) = pcm_processor.process_pcm_chunk(&mut leftover, spec, &mut pcm_kind)
-        else {
-            continue;
-        };
-
-        if !feed_ring_abortable(
-            &ring,
-            &processed.samples,
-            &stop_rx,
-            &paused,
-            Some(&force_silent),
-        ) {
-            feed_stalled = true;
-            break;
-        }
-
-        total_frames_fed += processed.source_frames;
-
-        let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64 + seek_offset;
-        position_ms.store(pos, Ordering::Relaxed);
+    }
+    total_frames_fed = compteurs.total_frames_fed;
+    if backend.puits_bloque() {
+        feed_stalled = true;
     }
 
     if feed_stalled {
         // La piste n'a PAS fini : `http_eof_excl` reste faux, donc
         // aucune fin naturelle n'est signalée et la file n'avance
         // pas vers un morceau qui heurterait le même périphérique
-        // mort. Le seul mot dit à l'utilisateur part d'ici.
+        // mort. Le seul mot dit à l'utilisateur part d'ici — sous le
+        // nom de CE backend. (La boucle commune a déjà écrit le sien,
+        // au nom de CPAL ; ce rapport le remplace dans le créneau.)
         record_feed_stall_failure(
             "CoreAudio",
             &device_name,
@@ -264,7 +554,7 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
     }
 
     if http_eof_excl {
-        report_incomplete_local_pcm_probe(pcm_kind, leftover.len());
+        report_incomplete_local_pcm_probe(etage.pcm_kind, etage.en_attente.len());
     }
 
     // Fin de piste : rendre au périphérique ce que le convolveur
@@ -280,8 +570,9 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         dop_active.load(Ordering::Relaxed),
     );
     if !queue.is_empty() && !feed_stalled {
-        feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
-        total_frames_fed += (queue.len() / channels.max(1) as usize) as u64;
+        let trames_de_queue = (queue.len() / channels.max(1) as usize) as u64;
+        etage.rendre_la_queue_du_dsp(&mut *puits, queue);
+        total_frames_fed += trames_de_queue;
     }
 
     // Signal natural track end BEFORE draining when the HTTP
@@ -293,37 +584,21 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         TRACK_END_NOTIFY.notify_one();
     }
 
-    // Wait for ring buffer to drain — JAMAIS sans fin (#3108).
-    // Les chemins ASIO, WASAPI et partagé bornaient déjà leur
-    // vidage ; celui-ci, seul, tournait tant que l'anneau n'était
-    // pas vide. Face à un rappel de rendu mort il ne se vide
-    // jamais : le fil restait vivant, la zone « en lecture », et le
-    // réexamen des branchements gelé avec elle.
-    let drain_deadline = drain_deadline_for(ring.available(), sample_rate as u64, channels as u64);
-    let drain_started = std::time::Instant::now();
-    loop {
-        if stop_rx.try_recv().is_ok() {
-            break;
-        }
-        if force_silent.load(Ordering::Relaxed) {
-            break;
-        }
-        if ring.available() == 0 {
-            break;
-        }
-        if drain_started.elapsed() >= drain_deadline {
-            warn!(
-                device = %device_name,
-                remaining_samples = ring.available(),
-                "local_audio_exclusive_drain_timeout"
-            );
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    // Wait for ring buffer to drain — JAMAIS sans fin (#3108). La boucle
+    // vit dans le backend (`drainer`) ; ici on ne calcule que sa borne, à
+    // partir de ce qu'il observe.
+    let drain_deadline = drain_deadline_for(
+        backend.observer().disponible,
+        sample_rate as u64,
+        channels as u64,
+    );
+    let vidage = backend.drainer(drain_deadline);
+    if http_eof_excl && vidage.vide {
+        position_ms.store(vidage.position_alimentee_ms, Ordering::Relaxed);
     }
 
     // ExclusiveOutput::drop() restores sample rate and releases hog mode
-    drop(exclusive);
+    drop(backend);
     if play_generation.load(Ordering::SeqCst) == my_generation {
         playing.store(false, Ordering::SeqCst);
     }
@@ -332,5 +607,4 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         frames = total_frames_fed,
         "local_audio_exclusive_stopped"
     );
-    return;
 }

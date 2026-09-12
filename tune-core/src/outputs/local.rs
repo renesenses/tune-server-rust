@@ -6361,6 +6361,11 @@ mod pcm_materiel_a_la_resolution_i1655;
 #[cfg(test)]
 mod empreinte_du_puits_r1;
 
+/// REF-8 (#2219) — l'empreinte du bras CoreAudio sur le chemin décoder →
+/// étage → boucle commune → puits, relevée sur la route directe d'avant.
+#[cfg(test)]
+mod empreinte_coreaudio_f70496;
+
 /// T8 de #2218 — le puits de capture branché sur une VRAIE piste.
 ///
 /// R1 garde la conversion contre des relevés pris sur la version d'avant ; T1

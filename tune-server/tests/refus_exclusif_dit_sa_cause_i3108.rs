@@ -33,6 +33,16 @@
 //! (maillon 4) qui ne lirait plus que l'un d'eux perdrait du périmètre en
 //! silence. Et elle vérifie que `play_url` APPELLE le bras CoreAudio : un
 //! module écrit mais pas branché rendrait tout le reste complaisant.
+//!
+//! REF-8 (#2219) : le bras CoreAudio n'a plus de boucle propre. Il implémente
+//! `BackendLocal` (`BackendCoreAudio`, dans `bras_coreaudio.rs`), son anneau
+//! est créé par `ExclusiveOutput::new` (`coreaudio_exclusive.rs`), et il passe
+//! par la boucle producteur commune de `local.rs`. Les maillons 2 et 3 sont
+//! donc relus sur ce que le bras fait MAINTENANT — le verdict de blocage
+//! remonte par le puits (`PuitsAnneauCoreAudio`), le bras le relit et le
+//! rapporte sous son nom ; le vidage borné est `drainer`. Rien n'est affaibli :
+//! chaque assertion d'avant a son équivalent, et la contenance de l'anneau
+//! est suivie dans le fichier qui la porte désormais.
 
 const LOCAL: &str = include_str!("../../tune-core/src/outputs/local.rs");
 const BRAS_COREAUDIO: &str = include_str!("../../tune-core/src/outputs/local/bras_coreaudio.rs");
@@ -41,13 +51,26 @@ const BRAS_WASAPI: &str = include_str!("../../tune-core/src/outputs/local/bras_w
 // REF-8 (#2219) : le backend CPAL partagé (trait `BackendLocal`, anneau, cascade
 // d'ouverture, vidage) — lu EN PLUS de `local.rs`, jamais à sa place.
 const BACKEND: &str = include_str!("../../tune-core/src/outputs/local/backend.rs");
+// REF-8 (#2219) : la sortie CoreAudio exclusive possède son anneau (D2) — sa
+// contenance vit là, et la garde qui la tenait la suit, sans cesser de lire
+// le bras.
+const COREAUDIO_EXCLUSIVE: &str =
+    include_str!("../../tune-core/src/outputs/coreaudio_exclusive.rs");
 
-/// Tout ce qui compose la sortie locale : `local.rs` suivi des trois bras
-/// exclusifs. C'est sur CE texte que portent les assertions qui parlent de
-/// « la sortie locale » en général — présence sur les trois transports,
-/// absence d'un second canal.
+/// Tout ce qui compose la sortie locale : `local.rs`, le backend CPAL, les
+/// trois bras exclusifs et la sortie CoreAudio. C'est sur CE texte que
+/// portent les assertions qui parlent de « la sortie locale » en général —
+/// présence sur les trois transports, absence d'un second canal.
 fn toute_la_sortie_locale() -> String {
-    [LOCAL, BACKEND, BRAS_COREAUDIO, BRAS_ASIO, BRAS_WASAPI].concat()
+    [
+        LOCAL,
+        BACKEND,
+        BRAS_COREAUDIO,
+        BRAS_ASIO,
+        BRAS_WASAPI,
+        COREAUDIO_EXCLUSIVE,
+    ]
+    .concat()
 }
 
 /// Le corps du chemin CoreAudio exclusif, délimité par ses deux journaux
@@ -61,6 +84,24 @@ fn bloc_coreaudio_exclusif() -> &'static str {
     let fin = BRAS_COREAUDIO[debut..]
         .find("\"local_audio_exclusive_stopped\"")
         .expect("le journal de sortie du chemin CoreAudio exclusif a disparu de bras_coreaudio.rs")
+        + debut;
+    &BRAS_COREAUDIO[debut..fin]
+}
+
+/// Le corps d'une méthode ou fonction de `bras_coreaudio.rs`, de sa
+/// signature à la première accolade fermante de même retrait — les impl du
+/// backend y sont indentées d'un niveau, les fonctions libres d'aucun.
+fn corps_dans_le_bras(signature: &str) -> &'static str {
+    let debut = BRAS_COREAUDIO
+        .find(signature)
+        .unwrap_or_else(|| panic!("`{signature}` a disparu de bras_coreaudio.rs"));
+    // Le retrait est celui de la signature elle-même : la fermeture cherchée
+    // est la première accolade posée au même retrait.
+    let retrait = signature.len() - signature.trim_start().len();
+    let fermeture = format!("\n{}}}", " ".repeat(retrait));
+    let fin = BRAS_COREAUDIO[debut..]
+        .find(&fermeture)
+        .unwrap_or_else(|| panic!("`{signature}` ne se referme pas dans bras_coreaudio.rs"))
         + debut;
     &BRAS_COREAUDIO[debut..fin]
 }
@@ -103,15 +144,72 @@ fn appelle_avec(texte: &str, nom: &str, argument: &str) -> bool {
 /// L'issue le dit dans sa portée : « un chemin corrigé et les autres nus » est
 /// une famille de défauts de ce dépôt. Le constat vient de CoreAudio, mais ASIO
 /// et WASAPI ont le même refus et doivent le dire pareil.
+///
+/// REF-8 (#2219) : CoreAudio passe par le trait — son refus est typé
+/// (`OuvertureExclusiveRefusee { backend: "CoreAudio", … }`) et c'est
+/// `RefusDOuverture::rapporter` qui appelle `record_exclusive_open_failure`.
+/// La garde suit les trois maillons de cette chaîne au lieu d'un seul appel ;
+/// ASIO et WASAPI, pas encore migrés, appellent toujours en direct.
 #[test]
 fn les_trois_transports_exclusifs_arment_le_canal_sur_un_refus_d_ouverture() {
     let sortie_locale = toute_la_sortie_locale();
-    for transport in ["CoreAudio", "ASIO", "WASAPI"] {
+    for transport in ["ASIO", "WASAPI"] {
         assert!(
             appelle_avec(&sortie_locale, "record_exclusive_open_failure(", transport),
             "aucun site n'appelle `record_exclusive_open_failure` pour {transport} : un refus \
              d'ouverture exclusive sur ce transport redevient muet, la zone reste figée sans \
              message (#3108)"
+        );
+    }
+
+    // CoreAudio : le refus est CONSTRUIT sous son nom, aux deux sites qui
+    // peuvent refuser (l'ouverture et le démarrage de l'AudioUnit)…
+    let refus_coreaudio = BRAS_COREAUDIO
+        .match_indices("RefusDOuverture::OuvertureExclusiveRefusee {")
+        .filter(|(i, _)| {
+            BRAS_COREAUDIO[*i..]
+                .chars()
+                .take(240)
+                .collect::<String>()
+                .contains("\"CoreAudio\"")
+        })
+        .count();
+    assert!(
+        refus_coreaudio >= 2,
+        "le bras CoreAudio ne construit `OuvertureExclusiveRefusee {{ backend: \"CoreAudio\" }}` \
+         qu'à {refus_coreaudio} site(s) : l'ouverture ET le démarrage doivent refuser sous ce \
+         nom, sinon l'un des deux redevient muet (#3108, REF-8)"
+    );
+    // …le rapporteur du trait le passe au rapporteur historique…
+    let rapporter = BACKEND
+        .split("pub(super) fn rapporter(")
+        .nth(1)
+        .and_then(|s| s.split("\n    }").next())
+        .expect("`RefusDOuverture::rapporter` doit rester identifiable dans backend.rs");
+    assert!(
+        rapporter.contains("RefusDOuverture::OuvertureExclusiveRefusee { backend, erreur } =>")
+            && rapporter.contains(
+                "record_exclusive_open_failure(backend, device_name, erreur, open_failure)"
+            ),
+        "`rapporter` ne passe plus `OuvertureExclusiveRefusee` à `record_exclusive_open_failure` : \
+         le refus CoreAudio typé n'arme plus le canal (#3108, REF-8)"
+    );
+    // …et le bras RAPPORTE chaque refus avant d'éteindre la zone.
+    let bloc = bloc_coreaudio_exclusif();
+    let rapports = bloc
+        .matches(".rapporter(&device_name, &open_failure)")
+        .count();
+    assert!(
+        rapports >= 2,
+        "le bras CoreAudio ne rapporte son refus qu'à {rapports} site(s) : ouverture et \
+         démarrage doivent tous deux passer par `rapporter` avant `playing.store(false` (#3108)"
+    );
+    for (i, _) in bloc.match_indices(".rapporter(&device_name, &open_failure)") {
+        let suite: String = bloc[i..].chars().take(240).collect();
+        assert!(
+            suite.contains("playing.store(false"),
+            "un refus CoreAudio est rapporté sans éteindre la zone : elle resterait « en \
+             lecture » sur un périphérique jamais ouvert (#3108)"
         );
     }
 }
@@ -121,15 +219,52 @@ fn les_trois_transports_exclusifs_arment_le_canal_sur_un_refus_d_ouverture() {
 /// L'ouverture a RÉUSSI et le rappel de rendu CoreAudio ne tire rien. L'anneau
 /// se remplit une fois, `feed_ring_abortable` rend `false`, et ce verdict était
 /// JETÉ aux sites de ce chemin — seul de tout le fichier à l'ignorer.
+///
+/// REF-8 (#2219) : le verdict traverse maintenant trois maillons au lieu d'un
+/// drapeau local — le puits du backend le rend ET le mémorise, la boucle
+/// commune s'arrête dessus, le bras le relit et le rapporte sous son nom.
+/// Chacun est tenu ; en perdre un rend le blocage muet.
 #[test]
 fn le_chemin_coreaudio_exclusif_lit_le_verdict_de_blocage_au_lieu_de_le_jeter() {
+    // (a) Le puits rend le verdict de `feed_ring_abortable` — il ne le jette
+    // pas — et le mémorise pour le bras.
+    let ecrire = corps_dans_le_bras("    fn ecrire(&mut self, mots: &[f32]) -> bool {");
+    assert!(
+        ecrire.contains("feed_ring_abortable(")
+            && ecrire.contains("if !vivant {")
+            && ecrire.contains("self.bloque.store(true"),
+        "le puits CoreAudio ne mémorise plus le verdict de `feed_ring_abortable` : le blocage \
+         de l'anneau retombe dans le vide (#3108, REF-8)"
+    );
+    assert!(
+        ecrire.trim_end().ends_with("vivant"),
+        "le puits CoreAudio ne REND plus le verdict : la boucle commune croirait le rappel \
+         vivant et attendrait 5 s à CHAQUE bloc, position figée (#3108)"
+    );
+
+    // (b) Le bras arme le drapeau aux deux endroits où un puits mort se
+    // constate : à l'amorce (verdict de `pousser`) et après la boucle
+    // commune (mémoire du puits). C'étaient les `feed_stalled = true` d'avant.
     let bloc = bloc_coreaudio_exclusif();
     let armements = bloc.matches("feed_stalled = true").count();
     assert!(
         armements >= 2,
         "le chemin CoreAudio exclusif n'arme le drapeau de blocage qu'à {armements} site(s) : \
-         un `feed_ring_abortable` dont le verdict retombe dans le vide rend la zone muette et \
-         figée sur la position atteinte (#3108)"
+         un puits mort à l'amorce ou pendant la boucle rend la zone muette et figée sur la \
+         position atteinte (#3108)"
+    );
+    assert!(
+        bloc.contains("PousseeVersLePuits::PuitsMort { trames_source } =>")
+            && bloc.contains("if backend.puits_bloque() {"),
+        "le bras ne relit plus le verdict du puits (amorce : `PuitsMort` ; boucle : \
+         `puits_bloque()`) : le blocage n'est plus constaté (#3108, REF-8)"
+    );
+    // (c) Et il ne lance la boucle commune que sur un puits vivant, puis
+    // relit le drapeau à la sortie.
+    assert!(
+        bloc.contains("if !feed_stalled {") && bloc.contains(".tourner("),
+        "la boucle commune n'est plus gardée par le drapeau de blocage, ou n'est plus appelée \
+         (#3108, REF-8)"
     );
     assert!(
         bloc.contains("if feed_stalled {"),
@@ -153,14 +288,41 @@ fn le_chemin_coreaudio_exclusif_lit_le_verdict_de_blocage_au_lieu_de_le_jeter() 
 /// remplit une fois, puis plus rien n'avance. Changer ce facteur change le
 /// chiffre que l'utilisateur voit et que le message rapporte : que ce soit un
 /// geste conscient.
+///
+/// REF-8 (#2219, D2) : l'anneau appartient à la sortie — sa contenance vit
+/// dans `ExclusiveOutput::new` (`coreaudio_exclusive.rs`), et le bras n'en
+/// calcule plus. La garde suit le fichier porteur, et tient que le bras ouvre
+/// bien par là.
 #[test]
 fn l_anneau_coreaudio_exclusif_tient_les_deux_secondes_du_constat() {
-    let bloc = bloc_coreaudio_exclusif();
+    let ouverture = COREAUDIO_EXCLUSIVE
+        .split("    pub fn new(")
+        .nth(1)
+        .and_then(|s| s.split("\n    }").next())
+        .expect("`ExclusiveOutput::new` doit rester identifiable dans coreaudio_exclusive.rs");
     assert!(
-        bloc.contains("let ring_cap = (sample_rate as usize) * (channels as usize) * 2;"),
-        "la contenance de l'anneau CoreAudio exclusif a changé : c'est elle, et non un délai \
-         nommé, qui produit le « figée à 2 s » du constat de #3108 — mettre à jour le message \
-         et cette garde ensemble"
+        ouverture.contains("let ring_cap = (sample_rate as usize) * (channels as usize) * 2;"),
+        "la contenance de l'anneau CoreAudio exclusif a changé ou a quitté \
+         `ExclusiveOutput::new` : c'est elle, et non un délai nommé, qui produit le « figée à \
+         2 s » du constat de #3108 — mettre à jour le message et cette garde ensemble"
+    );
+    assert!(
+        ouverture.contains("RingBuf::new_metered(ring_cap, starvation)"),
+        "l'anneau CoreAudio n'est plus créé à cette contenance dans `ExclusiveOutput::new` \
+         (D2, #2219)"
+    );
+    assert!(
+        !BRAS_COREAUDIO.contains("let ring_cap =") && !BRAS_COREAUDIO.contains("RingBuf::new"),
+        "le bras CoreAudio recalcule ou recrée un anneau : D2 (le backend possède son anneau) \
+         n'est plus tenue"
+    );
+    let ouvrir = corps_dans_le_bras(
+        "    fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {",
+    );
+    assert!(
+        ouvrir.contains("ExclusiveOutput::new("),
+        "`BackendCoreAudio::ouvrir` n'ouvre plus par `ExclusiveOutput::new` : l'anneau de deux \
+         secondes n'est plus celui que le bras alimente (#3108, REF-8)"
     );
 }
 
@@ -168,6 +330,9 @@ fn l_anneau_coreaudio_exclusif_tient_les_deux_secondes_du_constat() {
 /// rendu mort : la zone reste « en lecture », et le réexamen des branchements
 /// gèle avec elle. Les chemins ASIO, WASAPI et partagé bornaient déjà le leur ;
 /// celui-ci, seul, tournait tant que l'anneau n'était pas vide.
+///
+/// REF-8 (#2219) : la boucle de vidage est `BackendCoreAudio::drainer` ; le
+/// bras calcule sa borne par `drain_deadline_for` et la lui passe.
 #[test]
 fn le_vidage_de_l_anneau_coreaudio_exclusif_reste_borne() {
     let bloc = bloc_coreaudio_exclusif();
@@ -178,7 +343,20 @@ fn le_vidage_de_l_anneau_coreaudio_exclusif_reste_borne() {
          lecture » (#3108)"
     );
     assert!(
-        bloc.contains("\"local_audio_exclusive_drain_timeout\""),
+        bloc.contains("backend.drainer(drain_deadline)"),
+        "la borne calculée n'est plus celle que le vidage reçoit : une échéance calculée et \
+         non passée ne borne rien (#3108, REF-8)"
+    );
+    let drainer =
+        corps_dans_le_bras("    fn drainer(&mut self, borne: std::time::Duration) -> Vidage {");
+    assert!(
+        drainer.contains("let drain_deadline = borne;")
+            && drainer.contains("drain_started.elapsed() >= drain_deadline"),
+        "`drainer` ne compare plus le temps écoulé à sa borne : le vidage redevient sans fin \
+         (#3108, REF-8)"
+    );
+    assert!(
+        drainer.contains("\"local_audio_exclusive_drain_timeout\""),
         "l'échéance de vidage ne laisse plus de trace au journal : un vidage abandonné doit \
          être lisible après coup (#3108)"
     );
