@@ -227,6 +227,14 @@ async fn sso_callback(
         }
     };
 
+    // 🔴 AVANT d'écraser `mozaik_user`, et pas après.
+    //
+    // L'adoption reprend le compte DÉJÀ lié — celui d'une installation qui en
+    // portait un avant que `owner_profile_id` n'existe. La placer plus bas la
+    // ferait lire le compte qui vient d'arriver, c'est-à-dire adopter le
+    // nouveau venu : exactement ce qu'elle est là pour empêcher.
+    tune_core::cloud::proprietaire::adopter_le_compte_lie(&settings, &state.backend);
+
     // Store cloud tokens in settings
     settings
         .set("mozaik_access_token", &token.access_token)
@@ -240,29 +248,6 @@ async fn sso_callback(
             &serde_json::to_string(&user).unwrap_or_default(),
         )
         .ok();
-
-    // Unlock premium from the linked account (SSO) when the server reports it.
-    // OR-ed with the license-key path — never downgrades a keyed premium.
-    state
-        .license
-        .set_account_premium(user.premium, user.license_expires_at.clone())
-        .await;
-
-    // Droits de MODULE payants (SKU distincts du palier, ex. la sortie
-    // Diretta). Ils voyagent avec le compte, jamais avec la clé : sans cet
-    // appel, `set_modules` n'avait qu'un seul appelant — le battement de fond
-    // (`background.rs`, HEARTBEAT_INTERVAL = 1 h). Un compte qui vient d'être
-    // lié s'entendait donc répondre « module_not_owned / purchase_module »
-    // pendant une heure pour un module qu'il possède (#2138).
-    state.license.set_modules(user.modules.clone()).await;
-
-    // Qobuz endpoint order (founder flag): persist and push into the live
-    // QobuzService so the order applies without a restart.
-    state
-        .license
-        .set_qobuz_proxy_first(user.qobuz_proxy_first)
-        .await;
-    crate::background::apply_qobuz_proxy_first(&state.services, user.qobuz_proxy_first).await;
 
     // Create or link local profile, then issue a local JWT session
     use tune_core::db::backend::ToSqlValue;
@@ -321,6 +306,56 @@ async fn sso_callback(
             )
             .unwrap_or(0)
     };
+
+    // ── L'état de LICENCE n'appartient qu'au propriétaire ────────────────
+    //
+    // 🔴 Ces trois écritures sont des états de SERVEUR, pas de compte. Tant
+    // qu'elles s'exécutaient à chaque connexion, un second compte gratuit
+    // remettait `mozaik_premium` à faux et effaçait l'échéance — puis le
+    // battement de fond, qui relit le jeton global (désormais celui du second
+    // compte), confirmait le palier gratuit toutes les heures. Le premium par
+    // compte ne redescendait pas le temps d'un rafraîchissement : il restait
+    // par terre.
+    //
+    // Elles sont donc déplacées ici, APRÈS la résolution du profil : on
+    // établit d'abord qui se connecte, on décide ensuite de ce qu'il a le
+    // droit de changer. Le premier compte lié devient propriétaire — d'où
+    // l'invariance sur une installation à un seul compte.
+    let pilote = tune_core::cloud::proprietaire::revendiquer(&settings, profile_id);
+
+    if pilote {
+        // Unlock premium from the linked account (SSO) when the server reports it.
+        // OR-ed with the license-key path — never downgrades a keyed premium.
+        state
+            .license
+            .set_account_premium(user.premium, user.license_expires_at.clone())
+            .await;
+
+        // Droits de MODULE payants (SKU distincts du palier, ex. la sortie
+        // Diretta). Ils voyagent avec le compte, jamais avec la clé : sans cet
+        // appel, `set_modules` n'avait qu'un seul appelant — le battement de fond
+        // (`background.rs`, HEARTBEAT_INTERVAL = 1 h). Un compte qui vient d'être
+        // lié s'entendait donc répondre « module_not_owned / purchase_module »
+        // pendant une heure pour un module qu'il possède (#2138).
+        state.license.set_modules(user.modules.clone()).await;
+
+        // Qobuz endpoint order (founder flag): persist and push into the live
+        // QobuzService so the order applies without a restart.
+        state
+            .license
+            .set_qobuz_proxy_first(user.qobuz_proxy_first)
+            .await;
+        crate::background::apply_qobuz_proxy_first(&state.services, user.qobuz_proxy_first).await;
+    } else {
+        // La liaison RÉUSSIT quand même — identité, photo, préférences. Seule
+        // la licence ne bouge pas. Un refus complet serait pire : il rendrait
+        // le multi-compte impossible pour rien.
+        tracing::info!(
+            profile_id,
+            email = %user.email,
+            "sso_licence_non_pilotee_par_ce_profil"
+        );
+    }
 
     let role = if user.is_admin { "admin" } else { "user" };
     let jwt_secret = match settings.get("jwt_secret").ok().flatten() {
@@ -1393,6 +1428,93 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
 /// Ces essais ne tiennent ni base ni réseau : [`corps_validation`] est pure,
 /// et la garde de site est textuelle. Ils tournent donc dans le job `Test`
 /// (`ci.yml` l. 262, `-p tune-server`), pas seulement dans `ci:full`.
+#[cfg(test)]
+mod tests_licence_proprietaire {
+    /// 🔴 Le garde de CÂBLAGE, et c'est le seul qui voit le vrai défaut.
+    ///
+    /// `tune_core::cloud::proprietaire` a ses propres tests, mais ils restent
+    /// verts si personne n'appelle le module : une règle juste que le chemin
+    /// réel n'emprunte pas ne protège de rien. Même leçon que
+    /// `state.rs::le_demarrage_publie_bien_le_client_de_relais`, où un `.set()`
+    /// retiré laissait la batterie au vert.
+    ///
+    /// La ronde SSO ne peut pas être jouée ici — elle exige mozaiklabs.fr, un
+    /// échange OAuth et une base — donc la garde porte sur la source.
+    #[test]
+    fn la_licence_n_est_ecrite_que_par_le_proprietaire() {
+        let source = include_str!("cloud.rs");
+
+        assert!(
+            source.contains("proprietaire::revendiquer(&settings, profile_id)"),
+            "sso_callback doit demander QUI pilote la licence, et le demander \
+             avec le profil resolu par le COURRIEL (profile_id) — pas avec le \
+             profil choisi a l'ecran"
+        );
+
+        // Les trois ecritures d'etat serveur doivent etre SOUS la condition.
+        let garde = source
+            .find("if pilote {")
+            .expect("le garde `if pilote` a disparu : toute connexion reecrit la licence");
+        let sinon = source[garde..]
+            .find("} else {")
+            .expect("le garde n'a plus de branche `else`");
+        let gardees = &source[garde..garde + sinon];
+        for ecriture in [
+            "set_account_premium",
+            "set_modules",
+            "set_qobuz_proxy_first",
+        ] {
+            assert!(
+                gardees.contains(ecriture),
+                "`{ecriture}` est sortie du garde : un second compte ferait \
+                 retomber le palier de tout le serveur"
+            );
+        }
+    }
+
+    /// 🔴 L'adoption doit lire l'ANCIEN compte lié.
+    ///
+    /// Defaut que je me suis fait a moi-meme le 12/09/2026 en placant l'appel
+    /// apres la mise a jour de `mozaik_user` : l'adoption y lisait le compte
+    /// qui venait d'arriver et adoptait le nouveau venu — soit precisement
+    /// l'inverse de sa raison d'etre, qui est de garder la licence au
+    /// proprietaire historique d'une installation deja liee.
+    #[test]
+    fn l_adoption_precede_l_ecrasement_du_compte() {
+        let source = include_str!("cloud.rs");
+        let adoption = source
+            .find("proprietaire::adopter_le_compte_lie(&settings, &state.backend)")
+            .expect("la reprise des installations existantes a disparu");
+        let ecrasement = source
+            .find(".set(\"mozaik_access_token\"")
+            .expect("l'ecriture du jeton a disparu");
+        assert!(
+            adoption < ecrasement,
+            "l'adoption lit `mozaik_user` APRES sa reecriture : elle adopterait \
+             le compte qui vient de se connecter au lieu de celui deja en place"
+        );
+    }
+
+    /// L'ordre compte : on etablit QUI se connecte avant de decider ce qu'il a
+    /// le droit de changer. Ecrire la licence avant de resoudre le profil
+    /// rendrait le garde impossible a evaluer.
+    #[test]
+    fn le_profil_est_resolu_avant_la_licence() {
+        let source = include_str!("cloud.rs");
+        let profil = source
+            .find("let profile_id = if let Some(id) = existing_id")
+            .expect("la resolution du profil a disparu");
+        let licence = source
+            .find("set_account_premium")
+            .expect("l'ecriture de premium a disparu");
+        assert!(
+            profil < licence,
+            "la licence s'ecrit AVANT que le profil ne soit connu : le garde \
+             de propriete ne peut alors rien decider"
+        );
+    }
+}
+
 #[cfg(test)]
 mod validation_licence_3906 {
     use super::{MotifValidation, corps_validation, message_statut_distant};

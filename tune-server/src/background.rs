@@ -1801,6 +1801,10 @@ async fn refresh_account_premium(
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
 
+    // 🔴 AVANT toute réécriture de `mozaik_user` plus bas : l'adoption doit
+    // voir le compte DÉJÀ lié, pas celui que ce passage vient de revalider.
+    let proprio = tune_core::cloud::proprietaire::adopter_le_compte_lie(&settings, backend);
+
     let token = match settings.get("mozaik_access_token").ok().flatten() {
         Some(t) if !t.is_empty() => t,
         _ => return, // not connected — nothing to refresh
@@ -1854,17 +1858,48 @@ async fn refresh_account_premium(
                 &serde_json::to_string(&user).unwrap_or_default(),
             )
             .ok();
-        license
-            .set_account_premium(user.premium, user.license_expires_at.clone())
-            .await;
-        // Propagate the Qobuz endpoint order (founder flag) so a change picked
-        // up by a re-validation reaches the live QobuzService immediately.
-        license.set_qobuz_proxy_first(user.qobuz_proxy_first).await;
-        apply_qobuz_proxy_first(services, user.qobuz_proxy_first).await;
-        // Paid-module entitlements (separate SKUs, e.g. the Diretta output)
-        // travel with the account validation, like the premium flag above.
-        license.set_modules(user.modules.clone()).await;
-        debug!(premium = user.premium, "mozaik_account_premium_refreshed");
+
+        // 🔴 C'est ICI que le défaut devenait permanent.
+        //
+        // Ce battement relit le jeton GLOBAL. Une fois celui-ci écrasé par un
+        // second compte, il revalidait ce second compte toutes les heures et
+        // réécrivait l'état de licence du serveur à partir de lui — de sorte
+        // qu'un premium par compte, une fois tombé, ne pouvait plus se relever
+        // seul. Refaire la ronde OAuth le relevait, jusqu'à la connexion
+        // suivante de quelqu'un d'autre.
+        //
+        // La revalidation du jeton, elle, reste utile pour tout le monde :
+        // c'est elle qui garde `mozaik_user` à jour. Seule l'écriture de
+        // licence est réservée au propriétaire.
+        let profil = tune_core::cloud::proprietaire::profil_du_courriel(backend, &user.email);
+        let pilote = match profil {
+            Some(p) => tune_core::cloud::proprietaire::pilote_la_licence(proprio, p),
+            // Compte lié dont aucun profil ne porte le courriel : on ne sait
+            // pas qui c'est, donc on ne touche à rien. Seul cas où l'absence
+            // de profil se produit en pratique — une insertion refusée par la
+            // base (#3726) — et laisser passer y reviendrait à confier la
+            // licence à un inconnu.
+            None => false,
+        };
+
+        if pilote {
+            license
+                .set_account_premium(user.premium, user.license_expires_at.clone())
+                .await;
+            // Propagate the Qobuz endpoint order (founder flag) so a change picked
+            // up by a re-validation reaches the live QobuzService immediately.
+            license.set_qobuz_proxy_first(user.qobuz_proxy_first).await;
+            apply_qobuz_proxy_first(services, user.qobuz_proxy_first).await;
+            // Paid-module entitlements (separate SKUs, e.g. the Diretta output)
+            // travel with the account validation, like the premium flag above.
+            license.set_modules(user.modules.clone()).await;
+            debug!(premium = user.premium, "mozaik_account_premium_refreshed");
+        } else {
+            debug!(
+                email = %user.email,
+                "mozaik_account_refresh_sans_licence_profil_non_proprietaire"
+            );
+        }
     }
 }
 
@@ -2825,6 +2860,100 @@ fn spawn_social_sharing_listener(state: &AppState) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests_licence_proprietaire_battement {
+    /// 🔴 Le battement de fond est ce qui rendait le défaut PERMANENT.
+    ///
+    /// Il relit le jeton global toutes les heures. Une fois celui-ci écrasé
+    /// par un second compte, il revalidait ce second compte et réécrivait
+    /// l'état de licence à partir de lui — indéfiniment. Corriger la seule
+    /// connexion SSO aurait laissé le défaut intact : il serait simplement
+    /// revenu au bout d'une heure.
+    ///
+    /// La fonction ne peut pas être appelée ici (elle sort sur le réseau vers
+    /// mozaiklabs.fr), donc la garde porte sur la source.
+    #[test]
+    fn le_battement_n_ecrit_la_licence_que_pour_le_proprietaire() {
+        let source = include_str!("background.rs");
+
+        let debut = source
+            .find("async fn refresh_account_premium")
+            .expect("refresh_account_premium a disparu");
+        let corps = &source[debut..];
+
+        assert!(
+            corps.contains("proprietaire::profil_du_courriel(backend, &user.email)"),
+            "le battement doit resoudre le profil DU COMPTE revalide avant de \
+             toucher a la licence"
+        );
+
+        let garde = corps.find("if pilote {").expect(
+            "le garde `if pilote` a disparu du battement : la licence \
+                     serait reecrite toutes les heures depuis le dernier compte connecte",
+        );
+        let sinon = corps[garde..]
+            .find("} else {")
+            .expect("le garde du battement n'a plus de branche `else`");
+        let gardees = &corps[garde..garde + sinon];
+        for ecriture in [
+            "set_account_premium",
+            "set_modules",
+            "set_qobuz_proxy_first",
+        ] {
+            assert!(
+                gardees.contains(ecriture),
+                "`{ecriture}` est sortie du garde du battement : le palier du \
+                 serveur serait refixe toutes les heures sur le dernier compte lie"
+            );
+        }
+    }
+
+    /// Meme garde d'ordre que dans `cloud.rs` : l'adoption doit lire le compte
+    /// deja lie, pas celui que ce passage vient de revalider.
+    #[test]
+    fn l_adoption_precede_la_reecriture_du_compte() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("async fn refresh_account_premium")
+            .expect("refresh_account_premium a disparu");
+        let corps = &source[debut..];
+        let adoption = corps
+            .find("proprietaire::adopter_le_compte_lie(&settings, backend)")
+            .expect("la reprise des installations existantes a disparu");
+        let ecrasement = corps
+            .find(".set(\n                \"mozaik_user\"")
+            .or_else(|| corps.find("\"mozaik_user\","))
+            .expect("la reecriture du compte a disparu");
+        assert!(
+            adoption < ecrasement,
+            "l'adoption lit `mozaik_user` APRES sa reecriture : elle adopterait \
+             le dernier compte revalide au lieu du proprietaire historique"
+        );
+    }
+
+    /// La revalidation du jeton, elle, reste due a TOUT LE MONDE : c'est elle
+    /// qui garde `mozaik_user` a jour. Seule l'ecriture de licence est
+    /// reservee. Sortir la mise a jour du compte sous le garde priverait les
+    /// autres profils de leur propre identite.
+    #[test]
+    fn la_mise_a_jour_du_compte_reste_hors_du_garde() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("async fn refresh_account_premium")
+            .expect("refresh_account_premium a disparu");
+        let corps = &source[debut..];
+        let compte = corps
+            .find("\"mozaik_user\"")
+            .expect("la mise a jour du compte a disparu");
+        let garde = corps.find("if pilote {").expect("le garde a disparu");
+        assert!(
+            compte < garde,
+            "`mozaik_user` n'est plus rafraichi que pour le proprietaire : les \
+             autres profils verraient leur identite se figer"
+        );
+    }
 }
 
 #[cfg(test)]
