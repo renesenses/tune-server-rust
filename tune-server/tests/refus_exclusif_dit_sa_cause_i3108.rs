@@ -160,19 +160,31 @@ fn les_trois_transports_exclusifs_arment_le_canal_sur_un_refus_d_ouverture() {
 /// doublement borné (`asio_drain_timeout`, dans `drainer`).
 #[test]
 fn le_bras_asio_rapporte_son_blocage_et_borne_son_vidage() {
-    let armements = BRAS_ASIO.matches("feed_stalled = true").count();
+    // REF-7 (#2219) : la famine est rapportée UNE fois, par la boucle commune,
+    // avec le nom que `BackendLocal::nom` rend. Le bras ASIO doit donc
+    // (1) rendre "ASIO", (2) passer par la boucle commune sur ses DEUX routes
+    // avec ce nom — sinon le rapport dit « CPAL » ou ne part pas.
     assert!(
-        armements >= 2,
-        "le bras ASIO n'arme le drapeau de blocage qu'à {armements} site(s) (amorce et \
-         boucle) : un `PuitsMort` dont le verdict retombe dans le vide rend la zone muette \
-         et figée sur la position atteinte (#3108, REF-8)"
+        BRAS_ASIO.contains("fn nom(&self) -> &'static str {\n        \"ASIO\"\n    }"),
+        "le backend ASIO ne dit plus son nom : le rapport de famine de la boucle commune le \
+         nommerait autrement, ou pas du tout (#3108, REF-8)"
     );
     assert!(
-        BRAS_ASIO.contains("if feed_stalled {")
-            && appelle_avec(BRAS_ASIO, "record_feed_stall_failure(", "ASIO")
-            && BRAS_ASIO.contains("position_ms.load("),
-        "le bras ASIO ne rapporte plus son blocage par `record_feed_stall_failure(\"ASIO\", \
-         …, position_ms.load(…), …)` : c'est le silence du constat du 01/09, sur ASIO (#3108)"
+        BRAS_ASIO.contains("backend: backend.nom(),")
+            && BRAS_ASIO.matches(".tourner(").count() >= 2,
+        "le bras ASIO ne passe plus par `BoucleProducteur::tourner` avec `backend.nom()` sur ses \
+         deux routes : un `PuitsMort` dont le verdict retombe dans le vide rend la zone muette \
+         et figée sur la position atteinte (#3108, REF-8)"
+    );
+    let boucle = LOCAL
+        .split("    fn tourner<E: Etage>(")
+        .nth(1)
+        .and_then(|s| s.split("\n#[async_trait::async_trait]").next())
+        .expect("la boucle producteur commune doit rester identifiable (#3108)");
+    assert!(
+        boucle.contains("record_feed_stall_failure(") && boucle.contains("self.backend,"),
+        "la boucle commune ne rapporte plus la famine avec le nom du backend : ASIO redevient \
+         muet (#3108, REF-7)"
     );
     assert!(
         BRAS_ASIO.matches("\"asio_drain_timeout\"").count() >= 2,
@@ -279,11 +291,16 @@ fn le_vidage_de_l_anneau_coreaudio_exclusif_reste_borne() {
 #[test]
 fn le_chemin_partage_et_son_enchainement_rapportent_aussi_leur_blocage() {
     let boucle = LOCAL
-        .split("    fn tourner(")
+        .split("    fn tourner<E: Etage>(")
         .nth(1)
         .and_then(|s| s.split("\n#[async_trait::async_trait]").next())
         .expect("la boucle producteur commune doit rester identifiable (#3108)");
 
+    // REF-7 (#2219) : la boucle est commune à tous les backends, le nom ne
+    // l'est pas. Elle rapporte avec `self.backend`, que `play_url` remplit par
+    // `BackendLocal::nom()` — et c'est `BackendCpal::nom` qui dit « CPAL ».
+    // Trois maillons, tous vérifiés : le littéral seul dans la boucle serait
+    // redevenu faux dès le second backend.
     assert!(
         boucle.contains("record_feed_stall_failure(")
             && boucle[boucle
@@ -292,9 +309,21 @@ fn le_chemin_partage_et_son_enchainement_rapportent_aussi_leur_blocage() {
                 .chars()
                 .take(240)
                 .collect::<String>()
-                .contains("\"CPAL\""),
-        "la boucle producteur commune ne rapporte plus le blocage de l'anneau : une piste qui \
-         meurt sur un rappel de rendu mort s'arrête sans un mot (#3108)"
+                .contains("self.backend,"),
+        "la boucle producteur commune ne rapporte plus le blocage de l'anneau avec le nom de \
+         son backend : une piste qui meurt sur un rappel de rendu mort s'arrête sans un mot, \
+         ou sous un nom qui n'est pas le sien (#3108, REF-7)"
+    );
+    assert!(
+        appelle_avec(BACKEND, "fn nom(&self) -> &'static str {", "CPAL"),
+        "`BackendCpal::nom` ne dit plus « CPAL » : le rapport de famine du chemin partagé \
+         porterait un autre nom que celui que les journaux ont toujours porté (#3108, REF-7)"
+    );
+    assert_eq!(
+        LOCAL.matches("backend: backend.nom(),").count(),
+        2,
+        "les DEUX boucles producteur de `play_url` — piste initiale, piste enchaînée — doivent \
+         recevoir le nom du backend par `BackendLocal::nom()` (#3108, REF-7)"
     );
 
     // Et elle le rapporte pour les DEUX pistes : les deux noms d'événement

@@ -1,33 +1,35 @@
 //! Le bras ASIO exclusif de `play_url` (R6 bis puis REF-8, #2219).
 //!
 //! R6 bis a sorti ce bloc de `play_url` à l'identique. REF-8 le fait passer
-//! par le trait `BackendLocal` (#4009) et par les deux puits de D1 :
+//! par le trait `BackendLocal` (#4009), par le trait `Etage` et la boucle
+//! commune `BoucleProducteur::tourner` (REF-7, #4013), et par les deux puits
+//! de D1 :
 //!
 //! * **route native** (`Native*` : le pilote prend des mots entiers) —
-//!   [`super::etage_natif::EtageNatif`] décode vers des mots `i32` alignés à
-//!   gauche et écrit dans un [`super::etage_natif::PuitsAnneauNatif`] posé sur
-//!   l'anneau natif du backend (`Puits::Natif`). La décision DoP reste dans
-//!   le producteur, le DoP est porté tel quel, le volume s'applique dans
-//!   l'étage — exactement ce que `feed_windows_native_exclusive_leftover`
-//!   faisait ;
+//!   [`super::etage_natif::EtageNatif`] (#4011) décode vers des mots `i32`
+//!   alignés à gauche et écrit dans un [`super::etage_natif::PuitsAnneauNatif`]
+//!   posé sur l'anneau natif du backend (`Puits::Natif`). La décision DoP
+//!   reste dans le producteur, le DoP est porté tel quel, le volume s'applique
+//!   dans l'étage — exactement ce que `feed_windows_native_exclusive_leftover`
+//!   faisait. [`EtageNatifAsio`] est l'enveloppe qui le présente au trait
+//!   `Etage` et qui publie le contrat du signal après chaque bloc ;
 //! * **route traitée** (`Processed*` : le pilote n'accepte qu'un mot qui ne
 //!   tient pas tous les bits de la source) — l'étage de R1
 //!   ([`EtageDeConversion`]) décode vers des `f32` et écrit dans un puits sur
 //!   l'anneau flottant (`Puits::Flottant`) ; le volume reste dans le rappel
 //!   (D3, en `f64`). Le refus DoP de cette route est CONSERVÉ : la fermeture
-//!   passée à `pousser` refuse tout porteur, et le refus est rapporté par
-//!   `record_windows_exclusive_pcm_refusal("ASIO", …)` avec le même motif
-//!   qu'avant (`DopUnsupported`, `DopCheckIncomplete` à l'EOF).
+//!   `refuser_le_porteur_dop` passée à `tourner` refuse tout porteur, et le
+//!   refus est rapporté par `record_windows_exclusive_pcm_refusal("ASIO", …)`
+//!   avec le même motif qu'avant (`DopUnsupported`, `DopCheckIncomplete` à
+//!   l'EOF).
 //!
 //! Le backend ([`BackendAsio`]) POSSÈDE ses deux anneaux à travers
 //! [`AsioExclusiveOutput`] (D2) et retient l'un des deux selon le transport ;
 //! `WindowsExclusiveRingRef` n'a plus d'appelant. Le fil pompe — la lecture
 //! HTTP sur un fil séparé, pour que le fil qui TIENT le périphérique ASIO ne
-//! bloque jamais sur le réseau — devient une source `Read`
-//! ([`SourcePompee`]) ; la boucle de ce bras la lit comme `BoucleProducteur`
-//! lirait n'importe quel amont. La boucle reste ici tant que `tourner` n'est
-//! pas générique sur l'étage (REF-7c, agent A) : elle est écrite pour être
-//! remplacée par un appel.
+//! bloque jamais sur le réseau — est une source `Read` ([`SourcePompee`]) que
+//! `tourner` lit comme n'importe quel amont ; l'EOF par inactivité (5 s) et le
+//! relevé périodique `asio_exclusive_feed_stats` vivent dans la source.
 //!
 //! Compilé par la seule étape « ASIO » du job `windows-pr` de `ci.yml` : ni
 //! Shrek ni le Mac ne voient ce fichier. `super` désigne ici `outputs::local`,
@@ -45,8 +47,12 @@ use super::backend::{
 };
 use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, spec_du_puits_natif};
 use super::*;
-use super::{EtageDeConversion, LocalPcmKind, LocalPcmProcessor, PousseeVersLePuits};
+use super::{
+    BlocDecode, BoucleProducteur, CompteursDePiste, Etage, EtageDeConversion, FinDeBoucle,
+    LocalPcmKind, LocalPcmProcessor, PousseeVersLePuits, RoleDeLaBoucle,
+};
 use crate::outputs::asio_exclusive::AsioExclusiveOutput;
+use crate::outputs::traits::{PuitsNatif, TransformationsReelles};
 
 /// Ce que le bras lisait du contexte de `play_url` — trente-quatre valeurs,
 /// toutes déjà possédées par le fil de lecture. Elles sont DÉPLACÉES, jamais
@@ -295,6 +301,13 @@ impl<'a> BackendLocal<'a> for BackendAsio<'a> {
             position_alimentee_ms: fed_position_ms,
         }
     }
+
+    /// Le nom que la boucle commune met dans son rapport de famine (#3108) :
+    /// c'est le changement de RAPPORT de cette tranche — le verdict de puits
+    /// mort était jeté sur ce chemin, il est dit, avec ce nom.
+    fn nom(&self) -> &'static str {
+        "ASIO"
+    }
 }
 
 /// Le puits de la route traitée : l'anneau flottant que draine un rappel
@@ -322,150 +335,195 @@ impl PuitsDEchantillons for PuitsAnneauFlottantAsio<'_> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// La route : un étage et son puits, du mot que le transport impose.
+// Le contrat du signal, publié après chaque bloc — sur les deux routes.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Ce qu'une poussée a produit, sur l'une ou l'autre route — le vocabulaire
-/// commun des deux étages, tel que la boucle de ce bras le lit.
-enum Poussee {
-    /// Rien d'aligné, ou quarantaine 24 bits encore ouverte.
-    Rien,
-    /// Bloc poussé. Sur la route traitée, `dop` et `bit_perfect` sont faux
-    /// par construction : c'est ce que `feed_windows_exclusive_leftover`
-    /// rendait.
-    Poussee {
-        trames: u64,
-        dop: bool,
-        bit_perfect: bool,
-    },
-    /// Le puits a cessé de consommer : rappel mort (#3108). Les trames sont
-    /// comptées quand même, ce compte est la position.
-    PuitsMort { trames: u64 },
-    /// Route traitée seulement : porteur DoP refusé avant l'anneau flottant
-    /// (`DopUnsupported`).
-    PorteurDopRefuse,
+/// Ce que le bras publiait après chaque bloc poussé : l'état DoP de la piste
+/// (`dop_active`, volume synchronisé), et le contrat du chemin du signal
+/// (`publish_windows_signal_path_status`, journal
+/// `windows_exclusive_signal_contract` — au premier bloc, puis à chaque
+/// changement de verdict).
+struct ContratDuSignal<'a> {
+    signal_path_status: &'a std::sync::Mutex<Option<OutputSignalPathStatus>>,
+    transport_natif: bool,
+    dop_active: &'a AtomicBool,
+    volume: &'a AtomicU32,
+    user_volume: &'a AtomicU32,
+    rg_factor: &'a AtomicU32,
+    eq: &'a std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &'a std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &'a AtomicBool,
+    mono_downmix: &'a AtomicBool,
+    bit_perfect_state: Option<bool>,
 }
 
-/// L'étage et le puits d'une route.
+impl ContratDuSignal<'_> {
+    fn publier(&mut self, dop: bool, bit_perfect: bool) {
+        if self.dop_active.swap(dop, Ordering::SeqCst) != dop {
+            info!(dop, "local_audio_dop_stream_state_changed");
+            sync_volume_to_dop(self.volume, self.user_volume, self.rg_factor, dop);
+        }
+        let volume_units = self.volume.load(Ordering::SeqCst);
+        let runtime = publish_windows_signal_path_status(
+            self.signal_path_status,
+            bit_perfect,
+            self.transport_natif,
+            dop,
+            volume_units,
+            self.eq,
+            self.convolver,
+            self.crossfeed,
+            self.pure_bypass,
+            self.mono_downmix,
+        );
+        if self.bit_perfect_state != Some(runtime.bit_perfect) {
+            self.bit_perfect_state = Some(runtime.bit_perfect);
+            info!(
+                backend = "ASIO",
+                bit_perfect = runtime.bit_perfect,
+                dop,
+                volume_units,
+                reasons = ?runtime.reasons,
+                "windows_exclusive_signal_contract"
+            );
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// La route native vue par le trait `Etage`.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Le bloc que l'observateur de la boucle voit sur la route native : ce que
+/// `EtageNatif::decoder_et_pousser` vient de pousser.
+struct BlocNatif {
+    echantillons: usize,
+    non_nul: bool,
+}
+
+impl BlocDecode for BlocNatif {
+    fn nb_echantillons(&self) -> usize {
+        self.echantillons
+    }
+
+    fn contient_un_echantillon_non_nul(&self) -> bool {
+        self.non_nul
+    }
+}
+
+/// L'étage natif de #4011 présenté au trait `Etage` de #4013, avec le contrat
+/// du signal que le bras publiait après chaque bloc.
+///
+/// Une enveloppe et non un `impl Etage for EtageNatif` : ce fichier n'écrit
+/// pas dans `etage_natif.rs`, et un second `impl` du même trait sur le même
+/// type serait une erreur de compilation le jour où son auteur en pose un.
+/// Quand `EtageNatif` implémentera `Etage` lui-même, l'enveloppe ne gardera
+/// que le contrat.
+///
+/// `recevoir` puis `pousser` séparés, comme le trait le demande :
+/// `decoder_et_pousser` fait les deux d'un coup, l'enveloppe garde les
+/// octets reçus jusqu'à la poussée. La fermeture `refuser_le_porteur_dop` est
+/// reçue et ignorée : la route native ne refuse rien, elle porte le DoP et le
+/// dit.
+struct EtageNatifAsio<'a> {
+    etage: EtageNatif<'a>,
+    recu: Vec<u8>,
+    contrat: ContratDuSignal<'a>,
+    /// Le reliquat 24 bits forcé brut à l'EOF (`vider`), à compter par le
+    /// bras : trames poussées.
+    reliquat_force_brut: Option<u64>,
+}
+
+impl Etage for EtageNatifAsio<'_> {
+    type Puits<'p> = dyn PuitsNatif + 'p;
+    type Bloc = BlocNatif;
+
+    fn recevoir(&mut self, octets: &[u8]) {
+        self.recu.extend_from_slice(octets);
+    }
+
+    fn cadence_source(&self) -> u32 {
+        self.etage.spec().cadence()
+    }
+
+    /// Décoder ce qui est aligné (sonde DoP, volume, DSP, mot natif) et
+    /// pousser, puis publier le contrat du bloc. L'observateur voit le bloc
+    /// APRÈS la poussée — il ne sert qu'au diagnostic de silence initial.
+    fn pousser(
+        &mut self,
+        puits: &mut (dyn PuitsNatif + '_),
+        _refuser_le_porteur_dop: &mut dyn FnMut(bool, u32, u16) -> bool,
+        observer: &mut dyn FnMut(&BlocNatif),
+    ) -> PousseeVersLePuits {
+        let recu = std::mem::take(&mut self.recu);
+        let non_nul = recu.iter().any(|&octet| octet != 0);
+        let canaux = usize::from(self.etage.spec().canaux());
+        match self.etage.decoder_et_pousser(&recu, puits) {
+            EcritureNative::RienAPousser => PousseeVersLePuits::RienAPousser,
+            EcritureNative::Poussee {
+                trames_source,
+                dop,
+                bit_perfect,
+            } => {
+                observer(&BlocNatif {
+                    echantillons: trames_source as usize * canaux,
+                    non_nul,
+                });
+                self.contrat.publier(dop, bit_perfect);
+                PousseeVersLePuits::Poussee { trames_source }
+            }
+            EcritureNative::PuitsMort { trames_source, .. } => {
+                PousseeVersLePuits::PuitsMort { trames_source }
+            }
+        }
+    }
+
+    /// La queue du DSP (#2209) : l'étage vide le convolveur, applique le
+    /// volume et quantifie (D3). `EtageNatif::rendre_la_queue` vide avec
+    /// `dop = false` ; `flush_local_dsp(…, dop = true)` ne rendait RIEN — un
+    /// DoP porté n'a jamais alimenté le convolveur, et un convolveur
+    /// configuré rend `latency_frames()` de silence même à vide. Ne pas
+    /// l'appeler sur DoP est l'équivalent exact de ce que le bras faisait.
+    fn rendre_la_queue_du_dsp(&mut self, puits: &mut (dyn PuitsNatif + '_)) -> bool {
+        if self.contrat.dop_active.load(Ordering::Relaxed) {
+            return true;
+        }
+        self.etage.rendre_la_queue(puits)
+    }
+
+    /// Fin de flux : le reliquat 24 bits jamais classé part brut
+    /// (`windows_exclusive_short_24bit_stream_forced_raw`). Il n'y a pas de
+    /// rééchantillonneur à vider sur cette route.
+    fn vider(&mut self, puits: &mut (dyn PuitsNatif + '_)) -> bool {
+        if let Some(reliquat) = self.etage.vider(puits) {
+            info!(
+                backend = "ASIO",
+                bytes = reliquat.octets,
+                bit_perfect = true,
+                "windows_exclusive_short_24bit_stream_forced_raw"
+            );
+            self.reliquat_force_brut = Some(reliquat.trames);
+        }
+        true
+    }
+
+    fn transformations(&self) -> TransformationsReelles {
+        self.etage.transformations()
+    }
+}
+
+/// L'étage et le puits d'une route, du mot que le transport impose.
 enum Route<'a> {
     Native {
-        etage: EtageNatif<'a>,
-        puits: Box<dyn crate::outputs::traits::PuitsNatif + 'a>,
+        etage: EtageNatifAsio<'a>,
+        puits: Box<dyn PuitsNatif + 'a>,
     },
     Flottante {
         etage: EtageDeConversion<'a>,
         puits: Box<dyn PuitsDEchantillons + 'a>,
+        contrat: ContratDuSignal<'a>,
     },
-}
-
-impl Route<'_> {
-    fn est_native(&self) -> bool {
-        matches!(self, Route::Native { .. })
-    }
-
-    /// Octets reçus et pas encore poussés (la quarantaine 24 bits comprise).
-    fn en_attente(&self) -> usize {
-        match self {
-            Route::Native { etage, .. } => etage.en_attente().len(),
-            Route::Flottante { etage, .. } => etage.en_attente.len(),
-        }
-    }
-
-    /// Le geste élémentaire : ajouter `octets`, décoder ce qui est aligné,
-    /// pousser. Sur la route traitée, la fermeture refuse TOUT porteur DoP —
-    /// c'est le `DopUnsupported` d'avant, avant toute conversion (#3233).
-    fn pousser(&mut self, octets: &[u8]) -> Poussee {
-        match self {
-            Route::Native { etage, puits } => {
-                match etage.decoder_et_pousser(octets, puits.as_mut()) {
-                    EcritureNative::RienAPousser => Poussee::Rien,
-                    EcritureNative::Poussee {
-                        trames_source,
-                        dop,
-                        bit_perfect,
-                    } => Poussee::Poussee {
-                        trames: trames_source,
-                        dop,
-                        bit_perfect,
-                    },
-                    EcritureNative::PuitsMort { trames_source, .. } => Poussee::PuitsMort {
-                        trames: trames_source,
-                    },
-                }
-            }
-            Route::Flottante { etage, puits } => {
-                etage.en_attente.extend_from_slice(octets);
-                match etage.pousser(puits.as_mut(), &mut |dop, _, _| dop, &mut |_| {}) {
-                    PousseeVersLePuits::RienAPousser => Poussee::Rien,
-                    PousseeVersLePuits::Poussee { trames_source } => Poussee::Poussee {
-                        trames: trames_source,
-                        dop: false,
-                        bit_perfect: false,
-                    },
-                    PousseeVersLePuits::PuitsMort { trames_source } => Poussee::PuitsMort {
-                        trames: trames_source,
-                    },
-                    PousseeVersLePuits::PorteurDopRefuse => Poussee::PorteurDopRefuse,
-                }
-            }
-        }
-    }
-
-    /// Fin de flux. Route native : le reliquat 24 bits jamais classé part
-    /// brut (`Some(octets)`, à journaliser). Route traitée : une sonde 24 bits
-    /// restée ouverte avec des octets en attente est un refus
-    /// (`DopCheckIncomplete`).
-    fn vider(&mut self, bit_depth: u16) -> Result<Option<usize>, WindowsExclusivePcmError> {
-        match self {
-            Route::Native { etage, puits } => Ok(etage.vider(puits.as_mut()).map(|reliquat| {
-                info!(
-                    backend = "ASIO",
-                    bytes = reliquat.octets,
-                    bit_perfect = true,
-                    "windows_exclusive_short_24bit_stream_forced_raw"
-                );
-                reliquat.octets
-            })),
-            Route::Flottante { etage, .. } => finish_windows_exclusive_probe(
-                bit_depth,
-                etage.pcm_kind.is_awaiting_probe(),
-                etage.en_attente.len(),
-            )
-            .map(|()| None),
-        }
-    }
-
-    /// La queue du DSP (#2209), au format de la piste qui se termine. Route
-    /// native : l'étage vide le convolveur, applique le volume et quantifie
-    /// (D3). Route traitée : `flush_local_dsp` puis l'étage de R1, sans
-    /// volume — il est dans le rappel.
-    fn rendre_la_queue(&mut self, channels: u16, dop: bool) {
-        match self {
-            Route::Native { etage, puits } => {
-                // `EtageNatif::rendre_la_queue` vide le convolveur avec
-                // `dop = false` ; `flush_local_dsp(…, dop = true)` ne rendait
-                // RIEN — un DoP porté n'a jamais alimenté le convolveur, et un
-                // convolveur configuré rend `latency_frames()` de silence
-                // même à vide. Ne pas l'appeler sur DoP est l'équivalent exact.
-                if !dop {
-                    etage.rendre_la_queue(puits.as_mut());
-                }
-            }
-            Route::Flottante { etage, puits } => {
-                let queue = flush_local_dsp(
-                    etage.pcm.convolver,
-                    etage.pcm.crossfeed,
-                    etage.pcm.pure_bypass,
-                    etage.pcm.mono_downmix,
-                    channels,
-                    dop,
-                );
-                if !queue.is_empty() {
-                    etage.rendre_la_queue_du_dsp(puits.as_mut(), queue);
-                }
-            }
-        }
-    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -487,12 +545,24 @@ impl Route<'_> {
 /// and exits when the receiver drops or the session closes.
 ///
 /// `read` rend ce que la boucle lisait dans le canal : `Ok(0)` à l'EOF
-/// (chunk vide ou pompe partie), `Err(TimedOut)` quand rien n'est venu en
-/// 500 ms — la boucle y applique l'EOF par inactivité —, et l'erreur de
-/// lecture telle quelle (transitoire ou non : c'est la boucle qui trie, comme
-/// avant). Un chunk plus long que le tampon du lecteur est rendu en plusieurs
-/// lectures, sans perte.
-struct SourcePompee {
+/// (chunk vide, pompe partie, ou inactivité — ci-dessous), `Err(TimedOut)`
+/// quand rien n'est venu en 500 ms, et l'erreur de lecture telle quelle
+/// (transitoire ou non : `tourner` trie, comme la boucle d'avant). Un chunk
+/// plus long que le tampon du lecteur est rendu en plusieurs lectures, sans
+/// perte.
+///
+/// **EOF par inactivité.** A streaming HTTP source (transcoded WAV over a
+/// keep-alive connection) may never return a clean EOF: after the last byte
+/// it just keeps timing out. Once data has been delivered AND the ring has
+/// fully drained (everything played), a sustained read idle means the track
+/// ended — signal EOF so the orchestrator can advance/repeat. Without this,
+/// the loop spins forever and end-of-track is never detected on exclusive
+/// ASIO outputs (DEvir: repeat never fired on a clean playthrough). Le
+/// « tout est joué » est demandé au backend (`anneau`) ; le bras d'avant
+/// exigeait aussi `leftover.is_empty()` — moins d'une trame en attente après
+/// cinq secondes sans données, ce que l'anneau vide implique, sauf pour une
+/// quarantaine 24 bits jamais fermée, que `vider` force brute de toute façon.
+struct SourcePompee<'a> {
     rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     /// Approximate depth of the pump→device channel. Incremented by the pump
     /// before each send, decremented here on each successful recv. A high
@@ -504,16 +574,23 @@ struct SourcePompee {
     /// Le chunk en cours de livraison et ce qui en a déjà été rendu.
     en_cours: Vec<u8>,
     rendu: usize,
+    octets_livres: u64,
     /// L'instant de la dernière donnée reçue — l'horloge de l'EOF par
     /// inactivité (5 s).
     derniere_donnee: std::time::Instant,
+    derniers_releves: std::time::Instant,
+    /// Ce que le backend voit de son anneau : (disponible, contenance).
+    anneau: &'a dyn Fn() -> (usize, usize),
 }
 
-impl SourcePompee {
+impl<'a> SourcePompee<'a> {
     /// Démarre le fil pompe sur `reader` ; il s'arrête quand la source rend
     /// EOF, sur une erreur non transitoire, ou quand cette `SourcePompee` est
     /// lâchée (le canal se ferme, `send` échoue).
-    fn demarrer(reader: reqwest::blocking::Response) -> Self {
+    fn demarrer(
+        reader: reqwest::blocking::Response,
+        anneau: &'a dyn Fn() -> (usize, usize),
+    ) -> Self {
         let profondeur = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (pump_tx, pump_rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(64);
         {
@@ -560,18 +637,34 @@ impl SourcePompee {
             profondeur,
             en_cours: Vec::new(),
             rendu: 0,
+            octets_livres: 0,
             derniere_donnee: std::time::Instant::now(),
+            derniers_releves: std::time::Instant::now(),
+            anneau,
         }
     }
 
-    /// Profondeur approximative du canal pompe → périphérique.
-    fn profondeur(&self) -> usize {
-        self.profondeur.load(Ordering::Relaxed)
+    /// Periodic health snapshot (~500ms) so a wedge is diagnosable from
+    /// DEvir's next log: ring full + high pump_depth => the callback stopped
+    /// draining; ring/pump ~empty => starved / EOF never latched (bug-22 /
+    /// #789).
+    fn relever(&mut self) {
+        if self.derniers_releves.elapsed() >= std::time::Duration::from_millis(500) {
+            let (ring_available, ring_capacity) = (self.anneau)();
+            debug!(
+                ring_available,
+                ring_capacity,
+                octets_livres = self.octets_livres,
+                pump_depth = self.profondeur.load(Ordering::Relaxed),
+                "asio_exclusive_feed_stats"
+            );
+            self.derniers_releves = std::time::Instant::now();
+        }
     }
 
-    /// Depuis combien de temps aucune donnée n'est venue de la pompe.
-    fn inactive_depuis(&self) -> std::time::Duration {
-        self.derniere_donnee.elapsed()
+    /// Tout est joué : des données ont été livrées et l'anneau est vide.
+    fn tout_est_joue(&self) -> bool {
+        self.octets_livres > 0 && (self.anneau)().0 == 0
     }
 
     /// Copie ce qui reste du chunk en cours dans `buf`.
@@ -580,15 +673,33 @@ impl SourcePompee {
         let n = reste.len().min(buf.len());
         buf[..n].copy_from_slice(&reste[..n]);
         self.rendu += n;
+        self.octets_livres += n as u64;
         n
+    }
+
+    /// Le délai de lecture : `Err(TimedOut)`, que `tourner` traite en
+    /// rebouclant — sauf si l'inactivité dure depuis cinq secondes et que
+    /// tout est joué : c'est l'EOF.
+    fn delai(&mut self) -> std::io::Result<usize> {
+        if self.derniere_donnee.elapsed() > std::time::Duration::from_secs(5)
+            && self.tout_est_joue()
+        {
+            info!("local_audio_asio_exclusive_stream_idle_eof");
+            return Ok(0);
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "aucune donnée de la pompe depuis 500 ms",
+        ))
     }
 }
 
-impl Read for SourcePompee {
+impl Read for SourcePompee<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.rendu < self.en_cours.len() {
             return Ok(self.servir(buf));
         }
+        self.relever();
         match self.rx.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(recu) => {
                 self.profondeur.fetch_sub(1, Ordering::Relaxed);
@@ -600,13 +711,16 @@ impl Read for SourcePompee {
                         self.rendu = 0;
                         Ok(self.servir(buf))
                     }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        self.delai()
+                    }
                     Err(e) => Err(e),
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "aucune donnée de la pompe depuis 500 ms",
-            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.delai(),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(0),
         }
     }
@@ -631,7 +745,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         data_offset,
         header_buf,
         reader,
-        frame_bytes,
+        frame_bytes: _,
         bytes_per_sample,
         seek_offset,
         pre_seeked,
@@ -715,19 +829,39 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         return;
     }
 
+    let transport_natif = backend.transport_natif();
+    let contrat = || ContratDuSignal {
+        signal_path_status: &signal_path_status,
+        transport_natif,
+        dop_active: &dop_active,
+        volume: &volume,
+        user_volume: &user_volume_ref,
+        rg_factor: &rg_factor_ref,
+        eq: &eq,
+        convolver: &convolver,
+        crossfeed: &crossfeed,
+        pure_bypass: &pure_bypass,
+        mono_downmix: &mono_downmix,
+        bit_perfect_state: None,
+    };
     // D1 : le backend dit quel puits il fournit ; la route suit.
     let mut route = match backend.puits() {
         Puits::Natif(puits) => Route::Native {
-            etage: EtageNatif::monter(
-                spec,
-                backend.format_ouvert(),
-                &volume,
-                &eq,
-                &convolver,
-                &crossfeed,
-                &pure_bypass,
-                &mono_downmix,
-            ),
+            etage: EtageNatifAsio {
+                etage: EtageNatif::monter(
+                    spec,
+                    backend.format_ouvert(),
+                    &volume,
+                    &eq,
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    &mono_downmix,
+                ),
+                recu: Vec::new(),
+                contrat: contrat(),
+                reliquat_force_brut: None,
+            },
             puits,
         },
         Puits::Flottant(puits) => Route::Flottante {
@@ -757,9 +891,9 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
                 needs_resample: false,
             },
             puits,
+            contrat: contrat(),
         },
     };
-    let transport_natif = route.est_native();
     if let Some(reason) = backend.bit_perfect_unavailable_reason() {
         info!(
             backend = "ASIO",
@@ -797,21 +931,16 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
     };
     let mut skipped_bytes_asio: u64 = 0;
 
-    // L'attente d'octets bruts vit dans l'étage : c'est aussi la quarantaine
-    // DoP — aucun échantillon 24 bits initial n'atteint un anneau tant que
-    // 32 trames n'ont pas tranché.
-    let mut bit_perfect_state = None;
-    // #3108 — le verdict de blocage du puits (rappel mort, anneau jamais
-    // drainé) était JETÉ sur ce chemin ; il est relu et rapporté.
-    let mut feed_stalled = false;
-    let mut pcm_refusal = None;
-
     // Track-local contract: never inherit the prior stream's DoP
     // state while the first 24-bit probe is still quarantined.
     if dop_active.swap(false, Ordering::SeqCst) {
         sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
     }
 
+    // L'amorce : ce que la lecture d'en-tête avait déjà lu. L'attente
+    // d'octets bruts vit dans l'étage — c'est aussi la quarantaine DoP :
+    // aucun échantillon 24 bits initial n'atteint un anneau tant que 32
+    // trames n'ont pas tranché.
     let amorce: &[u8] = if !pcm_data.is_empty() {
         let discard = if skip_bytes_asio > skipped_bytes_asio {
             ((skip_bytes_asio - skipped_bytes_asio) as usize).min(pcm_data.len())
@@ -823,52 +952,43 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
     } else {
         &[]
     };
-
-    match route.pousser(amorce) {
-        Poussee::Poussee {
-            trames,
-            dop,
-            bit_perfect,
+    let mut pcm_refusal = None;
+    // Sur la route traitée, TOUT porteur DoP est refusé avant la conversion
+    // flottante (`DopUnsupported`, #3233) ; sur la route native la fermeture
+    // n'est jamais consultée.
+    let mut refuser_tout_porteur = |dop: bool, _: u32, _: u16| dop;
+    let mut ne_rien_refuser = |_: bool, _: u32, _: u16| false;
+    let amorce_poussee = match &mut route {
+        Route::Native { etage, puits } => {
+            etage.recevoir(amorce);
+            etage.pousser(&mut **puits, &mut ne_rien_refuser, &mut |_| {})
+        }
+        Route::Flottante {
+            etage,
+            puits,
+            contrat,
         } => {
-            total_frames_fed += trames;
-            if dop_active.swap(dop, Ordering::SeqCst) != dop {
-                info!(dop, "local_audio_dop_stream_state_changed");
-                sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, dop);
+            etage.recevoir(amorce);
+            let poussee = etage.pousser(&mut **puits, &mut refuser_tout_porteur, &mut |_| {});
+            if matches!(poussee, PousseeVersLePuits::Poussee { .. }) {
+                contrat.publier(false, false);
             }
-            let volume_units = volume.load(Ordering::SeqCst);
-            let runtime = publish_windows_signal_path_status(
-                &signal_path_status,
-                bit_perfect,
-                transport_natif,
-                dop,
-                volume_units,
-                &eq,
-                &convolver,
-                &crossfeed,
-                &pure_bypass,
-                &mono_downmix,
-            );
-            bit_perfect_state = Some(runtime.bit_perfect);
-            info!(
-                backend = "ASIO",
-                bit_perfect = runtime.bit_perfect,
-                dop,
-                volume_units,
-                reasons = ?runtime.reasons,
-                "windows_exclusive_signal_contract"
-            );
+            poussee
         }
-        Poussee::PuitsMort { trames } => {
-            total_frames_fed += trames;
-            feed_stalled = true;
-        }
-        Poussee::Rien => {}
-        Poussee::PorteurDopRefuse => {
+    };
+    match amorce_poussee {
+        // L'amorce comptait ses trames sans regarder le verdict de
+        // l'écriture — un puits déjà mort à l'amorçage est constaté par la
+        // boucle, qui le rapporte (#3108).
+        PousseeVersLePuits::Poussee { trames_source }
+        | PousseeVersLePuits::PuitsMort { trames_source } => total_frames_fed += trames_source,
+        PousseeVersLePuits::RienAPousser => {}
+        PousseeVersLePuits::PorteurDopRefuse => {
             pcm_refusal = Some(WindowsExclusivePcmError::DopUnsupported);
         }
     }
     let quarantaine_ouverte = match &route {
-        Route::Native { etage, .. } => etage.quarantaine_24_bits_ouverte(),
+        Route::Native { etage, .. } => etage.etage.quarantaine_24_bits_ouverte(),
         Route::Flottante { etage, .. } => etage.pcm_kind.is_awaiting_probe(),
     };
     if !quarantaine_ouverte && dop_active.swap(false, Ordering::SeqCst) {
@@ -876,159 +996,98 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
     }
 
+    // La boucle commune (REF-7) : elle lit la source pompée, reçoit, pousse,
+    // compte, publie la position, et rapporte un puits mort avec le nom du
+    // backend. Le fil pompe n'est lancé que si l'amorce n'a rien refusé.
     let mut http_eof_asio = false;
-    let mut source = SourcePompee::demarrer(reader);
-    let mut tampon_de_lecture = vec![0u8; 65536];
-    let mut last_stats_at = std::time::Instant::now();
-    while pcm_refusal.is_none() && !feed_stalled {
-        if stop_rx.try_recv().is_ok() {
-            break;
-        }
-        if force_silent.load(Ordering::Relaxed) {
-            debug!("local_audio_asio_exclusive_aborted_by_stop");
-            break;
-        }
-
-        // Periodic health snapshot (~500ms) so a wedge is diagnosable
-        // from DEvir's next log: ring full + high pump_depth => the
-        // callback stopped draining; ring/pump ~empty => starved / EOF
-        // never latched (bug-22 / #789).
-        if last_stats_at.elapsed() >= std::time::Duration::from_millis(500) {
+    if pcm_refusal.is_none() {
+        let etat_de_l_anneau = || {
             let observation = backend.observer();
-            debug!(
-                ring_available = observation.disponible,
-                ring_capacity = observation.capacite,
-                total_frames_fed,
-                pump_depth = source.profondeur(),
-                leftover_bytes = route.en_attente(),
-                "asio_exclusive_feed_stats"
-            );
-            last_stats_at = std::time::Instant::now();
-        }
-
-        let n = match source.read(&mut tampon_de_lecture) {
-            Ok(0) => {
-                http_eof_asio = true;
-                break;
-            }
-            Ok(n) => n,
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                // A streaming HTTP source (transcoded WAV over a
-                // keep-alive connection) may never return a clean
-                // EOF: after the last byte it just keeps timing out.
-                // Once the whole track has been fed AND the ring has
-                // fully drained (everything played), a sustained read
-                // idle means the track ended — signal EOF so the
-                // orchestrator can advance/repeat. Without this, the
-                // loop spins forever and end-of-track is never
-                // detected on exclusive ASIO outputs (DEvir: repeat
-                // never fired on a clean playthrough).
-                if total_frames_fed > 0
-                    && route.en_attente() == 0
-                    && backend.observer().disponible == 0
-                    && source.inactive_depuis() > std::time::Duration::from_secs(5)
-                {
-                    info!("local_audio_asio_exclusive_stream_idle_eof");
-                    http_eof_asio = true;
-                    break;
-                }
-                continue;
-            }
-            Err(e) => {
-                warn!(error = %e, "local_audio_asio_exclusive_read_error");
-                http_eof_asio = true;
-                break;
-            }
+            (observation.disponible, observation.capacite)
         };
-        let chunk = &tampon_de_lecture[..n];
-
-        let octets: &[u8] = if skip_bytes_asio > 0 && skipped_bytes_asio < skip_bytes_asio {
-            let remaining = (skip_bytes_asio - skipped_bytes_asio) as usize;
-            if n <= remaining {
-                skipped_bytes_asio += n as u64;
-                continue;
-            }
-            skipped_bytes_asio = skip_bytes_asio;
-            &chunk[remaining..]
-        } else {
-            chunk
+        let mut source = SourcePompee::demarrer(reader, &etat_de_l_anneau);
+        let mut tampon_de_lecture = vec![0u8; 65536];
+        let producteur = BoucleProducteur {
+            role: RoleDeLaBoucle::PisteInitiale,
+            backend: backend.nom(),
+            device_name: &device_name,
+            cle_de_flux: None,
+            stop_rx: &stop_rx,
+            force_silent: &*force_silent,
+            device_gone: &*device_gone,
+            position_ms: &*position_ms,
+            open_failure: &*open_failure,
+            debut_du_flux: std::time::Instant::now(),
         };
-
-        match route.pousser(octets) {
-            Poussee::Poussee {
-                trames,
-                dop,
-                bit_perfect,
-            } => {
-                total_frames_fed += trames;
-                if dop_active.swap(dop, Ordering::SeqCst) != dop {
-                    info!(dop, "local_audio_dop_stream_state_changed");
-                    sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, dop);
-                }
-                let volume_units = volume.load(Ordering::SeqCst);
-                let runtime = publish_windows_signal_path_status(
-                    &signal_path_status,
-                    bit_perfect,
-                    transport_natif,
-                    dop,
-                    volume_units,
-                    &eq,
-                    &convolver,
-                    &crossfeed,
-                    &pure_bypass,
-                    &mono_downmix,
-                );
-                if bit_perfect_state != Some(runtime.bit_perfect) {
-                    bit_perfect_state = Some(runtime.bit_perfect);
-                    info!(
-                        backend = "ASIO",
-                        bit_perfect = runtime.bit_perfect,
-                        dop,
-                        volume_units,
-                        reasons = ?runtime.reasons,
-                        "windows_exclusive_signal_contract"
-                    );
-                }
-            }
-            Poussee::PuitsMort { trames } => {
-                total_frames_fed += trames;
-                feed_stalled = true;
-                break;
-            }
-            Poussee::Rien => {}
-            Poussee::PorteurDopRefuse => {
+        let mut compteurs = CompteursDePiste {
+            total_bytes_read: 0,
+            total_frames_fed,
+            seek_offset,
+            skip_bytes: skip_bytes_asio,
+            skipped_bytes: skipped_bytes_asio,
+            premiere_donnee_journalisee: false,
+        };
+        let fin = match &mut route {
+            Route::Native { etage, puits } => producteur.tourner(
+                &mut source,
+                &mut tampon_de_lecture,
+                etage,
+                &mut **puits,
+                &mut ne_rien_refuser,
+                &mut compteurs,
+                &mut |_| true,
+            ),
+            Route::Flottante {
+                etage,
+                puits,
+                contrat,
+            } => producteur.tourner(
+                &mut source,
+                &mut tampon_de_lecture,
+                etage,
+                &mut **puits,
+                &mut refuser_tout_porteur,
+                &mut compteurs,
+                &mut |_| {
+                    // La route traitée n'est jamais bit-perfect et ne porte
+                    // pas de DoP : c'est ce que `feed_windows_exclusive_leftover`
+                    // rendait après chaque bloc.
+                    contrat.publier(false, false);
+                    true
+                },
+            ),
+        };
+        total_frames_fed = compteurs.total_frames_fed;
+        match fin {
+            FinDeBoucle::FinDeFlux => http_eof_asio = true,
+            // Arrêt demandé, ou puits mort — déjà rapporté par la boucle
+            // (`record_feed_stall_failure("ASIO", …)`). `Abandon` ne peut pas
+            // venir : `apres_ecriture` rend toujours `true` ici.
+            FinDeBoucle::Interrompue | FinDeBoucle::Abandon => {}
+            FinDeBoucle::PorteurDopRefuse => {
                 pcm_refusal = Some(WindowsExclusivePcmError::DopUnsupported);
-                break;
             }
         }
-
-        let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64 + seek_offset;
-        position_ms.store(pos, Ordering::Relaxed);
     }
 
-    if pcm_refusal.is_none() && !feed_stalled && http_eof_asio {
-        match route.vider(bit_depth) {
-            Ok(Some(aligned)) => {
-                total_frames_fed += (aligned / frame_bytes) as u64;
+    if pcm_refusal.is_none() && http_eof_asio {
+        match &mut route {
+            Route::Native { etage, puits } => {
+                etage.vider(&mut **puits);
+                if let Some(trames) = etage.reliquat_force_brut.take() {
+                    total_frames_fed += trames;
+                }
             }
-            Ok(None) => {}
-            Err(error) => pcm_refusal = Some(error),
+            Route::Flottante { etage, .. } => {
+                if let Err(error) = finish_windows_exclusive_probe(
+                    bit_depth,
+                    etage.pcm_kind.is_awaiting_probe(),
+                    etage.en_attente.len(),
+                ) {
+                    pcm_refusal = Some(error);
+                }
+            }
         }
-    }
-    if feed_stalled {
-        // La piste n'a PAS fini : `http_eof_asio` reste faux, donc aucune fin
-        // naturelle n'est signalée et la file n'avance pas vers un morceau
-        // qui heurterait le même pilote mort. Le seul mot dit à l'utilisateur
-        // part d'ici (#3108).
-        record_feed_stall_failure(
-            "ASIO",
-            &device_name,
-            position_ms.load(Ordering::Relaxed),
-            &open_failure,
-        );
     }
     if let Some(error) = pcm_refusal {
         record_windows_exclusive_pcm_refusal(error, "ASIO", &device_name, &open_failure);
@@ -1043,9 +1102,15 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         return;
     }
 
-    // Fin de piste : rendre ce que le convolveur retient (#2209).
-    if !feed_stalled {
-        route.rendre_la_queue(channels, dop_active.load(Ordering::Relaxed));
+    // Fin de piste : rendre ce que le convolveur retient (#2209) — le geste
+    // de l'étage, sur les deux routes.
+    match &mut route {
+        Route::Native { etage, puits } => {
+            etage.rendre_la_queue_du_dsp(&mut **puits);
+        }
+        Route::Flottante { etage, puits, .. } => {
+            etage.rendre_la_queue_du_dsp(&mut **puits);
+        }
     }
 
     // Signal natural track end BEFORE draining when the HTTP
