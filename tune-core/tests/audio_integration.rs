@@ -1,8 +1,61 @@
-//! Integration tests for native audio decoders.
+//! Décodage natif : la **dégradation propre**, éprouvée sur des fichiers que ce
+//! module fabrique lui-même.
 //!
-//! These tests generate tiny valid audio files programmatically in a temp
-//! directory, decode them through `decode_to_pcm()`, and verify the output:
-//! correct sample rate, channel count, non-empty samples, reasonable duration.
+//! # Ce que ce fichier prouve — et c'est utile
+//!
+//! Qu'un décodeur natif ne part pas en vrille sur une entrée abîmée :
+//! troncature (`decode_wavpack_truncated_graceful`,
+//! `decode_ape_truncated_graceful`), corruption (`decode_corrupt_wav_graceful`,
+//! `decode_corrupt_aiff_graceful`, `decode_corrupt_dsf_graceful`), fichier vide
+//! (`decode_empty_file_graceful`), fichier absent (les six
+//! `decode_nonexistent_*`), plus la reconnaissance des extensions et les bornes
+//! de `seek` et de durée. Pour éprouver cela, **fabriquer sa propre entrée est
+//! la bonne méthode** : il faut un octet précis à un endroit précis, pas une
+//! œuvre. Les six `create_test_*` sont donc à leur place.
+//!
+//! # Ce que ce fichier NE prouve PAS : la justesse du PCM rendu
+//!
+//! Les 30 témoins écrivent tous leurs fichiers dans un `TempDir`, et pas une
+//! ligne de ce fichier ne touche `tests/fixtures/`. Leurs assertions portent
+//! sur la cadence, le nombre de canaux, la longueur, la durée et « ça ne
+//! panique pas » — jamais sur la VALEUR des échantillons face à une référence
+//! extérieure à ce dépôt. `decode_aiff_sample_values` en a l'air, mais il
+//! compare le décodé aux valeurs que `create_test_aiff` vient d'écrire : c'est
+//! un aller-retour du module avec lui-même, pas une mesure.
+//!
+//! C'est le mécanisme exact qui a laissé le décodeur WavPack rendre du bruit
+//! blanc pendant trois mois (#3849) : `parse_wavpack_header_only` et
+//! `decode_wavpack_truncated_graceful` étaient verts contre l'en-tête de
+//! 32 octets de `create_test_wavpack_header`, pendant que de vrais fichiers
+//! sortaient à -109 dB de SNR. **Aucun des deux n'a bougé, et aucun des deux
+//! n'aurait pu rougir.** Un test qui se nourrit lui-même ne garde pas le
+//! signal ; il garde la robustesse, et il faut le dire.
+//!
+//! # Où la justesse du PCM se prouve
+//!
+//! Dans le banc d'empreintes de #2218, qui compare le PCM rendu **bit pour
+//! bit** à celui du décodeur de RÉFÉRENCE du format, jamais à ce dépôt :
+//!
+//! * `tune-core/tests/flac_empreintes_reference.rs` (tranche T1) — trois
+//!   fixtures FLAC synthétiques contre des empreintes MD5 issues de `flac -d`
+//!   (libFLAC 1.5.0) ;
+//! * `tune-core/tests/alac_aiff_wav_empreintes_reference.rs` (tranche T2) —
+//!   ALAC, AIFF et WAV, même table et même mode d'emploi ;
+//! * `tune-core/tests/dsd_empreintes_reference.rs` (tranche T3) — DSF et DFF,
+//!   contre `wvunpack --raw` ;
+//! * `tests/ape_fixture_i2505.rs` — le fixture `.ape` appairé à son `.wav` ;
+//! * `src/audio/wavpack.rs` — empreintes `wvunpack 5.6.0`.
+//!
+//! Chacun des six formats fabriqués ici porte donc, AILLEURS, une empreinte
+//! contre une référence extérieure. Ce fichier n'en porte aucune, et ce n'est
+//! pas à lui de le faire : sa matière est la dégradation, pas la justesse.
+//!
+//! # La garde
+//!
+//! `tests/audio_integration_perimetre_2218.rs` relit CE fichier en texte et
+//! refuse tout nouveau `create_test_<format>` qui n'aurait pas d'entrée dans sa
+//! table — pour que le prochain fabricant posé ici dise, dès sa naissance, si
+//! le PCM de son format est prouvé quelque part, et où.
 
 use std::io::Write;
 use std::path::Path;
