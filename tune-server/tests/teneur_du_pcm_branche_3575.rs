@@ -23,13 +23,17 @@
 //! parce qu'il est déclaré dans l'agrégateur `server_contracts.rs`.
 
 const LOCAL_RS: &str = include_str!("../../tune-core/src/outputs/local.rs");
+// REF-8 (#2219) : le chemin d'échec du flux WAV (`audio_stream_build_failed_all_formats`)
+// vit dans `BackendCpal::ouvrir` (`local/backend.rs`) ; la garde lit les deux
+// fichiers concaténés, jamais l'un à la place de l'autre.
+const BACKEND_RS: &str = include_str!("../../tune-core/src/outputs/local/backend.rs");
 
 /// La production seule — le `mod tests` de fin citerait nos motifs.
-fn production() -> &'static str {
+fn production() -> String {
     let fin = LOCAL_RS
         .find("#[cfg(test)]\nmod tests")
         .expect("local.rs doit garder son `#[cfg(test)] mod tests` en fin de fichier");
-    &LOCAL_RS[..fin]
+    [&LOCAL_RS[..fin], BACKEND_RS].concat()
 }
 
 /// Texte sans commentaires ni blancs ; `://` épargné (URL, greffons ALSA).
@@ -63,7 +67,7 @@ fn sans_commentaires_ni_blancs(source: &str) -> String {
 /// se lira comme une absence de teneur.
 #[test]
 fn les_deux_chemins_d_echec_relevent_qui_tient_le_pcm() {
-    let source = sans_commentaires_ni_blancs(production());
+    let source = sans_commentaires_ni_blancs(&production());
     // Le motif s'arrête AVANT la parenthèse fermante : rustfmt écrit l'un des
     // deux appels sur une ligne (sans virgule finale) et l'autre en colonne
     // (avec), et une garde qui exigerait la même ponctuation des deux rougirait
@@ -96,7 +100,7 @@ fn les_deux_chemins_d_echec_relevent_qui_tient_le_pcm() {
 /// information alors qu'elle n'en est pas une.
 #[test]
 fn le_releve_ne_se_declenche_que_sur_le_motif_detruit_par_cpal() {
-    let source = sans_commentaires_ni_blancs(production());
+    let source = sans_commentaires_ni_blancs(&production());
     // Tous les appels, gardés ou non — puis les seuls gardés. L'égalité est ce
     // qui interdit d'en ajouter un troisième sans sa condition : compter
     // seulement les gardés laisserait passer un appel nu posé à côté.
