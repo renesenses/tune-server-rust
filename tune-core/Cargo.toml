@@ -380,6 +380,15 @@ path = "tests/marge_et_crete_2218.rs"
 name = "ecretage_compte_2218"
 path = "tests/ecretage_compte_2218.rs"
 
+# #2218 T10 — le rééchantillonneur (`audio::resample`) mesuré contre une
+# référence sinc indépendante écrite dans le test (Kaiser β = 14, 1025
+# coefficients, f64, polyphase exacte), par rapport de cadence. Aucune
+# caractéristique requise : tourne sur toute PR Rust. `autotests = false` plus
+# haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "reechantillonnage_reference_2218"
+path = "tests/reechantillonnage_reference_2218.rs"
+
 # #2060 / #3522 — une balise « Track N » ne doit pas voler la place du nom de
 # fichier. `autotests = false` plus haut : sans cette cible, le fichier ne
 # serait jamais compilé.
