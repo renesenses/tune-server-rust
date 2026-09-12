@@ -163,8 +163,15 @@ pub fn router() -> Router<AppState> {
         .route("/config/export", get(config::export_config))
         .route("/config/import", post(config::import_config))
         // Import routes
-        .route("/import/roon", post(import::import_roon))
-        .route("/import/plex", post(import::import_plex))
+        //
+        // #3914 : l'écran d'import TÉLÉVERSE un fichier (`multipart/form-data`,
+        // partie `file`). Monter ici les gestionnaires `Json<…>` faisait
+        // refuser ce corps par axum AVANT d'y entrer — 415, et un import Roon
+        // qui n'a jamais pu fonctionner. Les entrées ci-dessous choisissent le
+        // format d'après le `Content-Type` : le chemin JSON reste accepté.
+        // Garde de route : `tests/import_roon_multipart_3914.rs`.
+        .route("/import/roon", post(import::import_roon_entree))
+        .route("/import/plex", post(import::import_plex_entree))
         .route("/import/playlists", post(import::import_playlists_file))
         .route("/import/jriver", post(import::import_jriver))
         .route("/import/status/{task_id}", get(import::import_status))
