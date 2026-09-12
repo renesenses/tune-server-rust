@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::db::backend::DbBackend;
+use crate::db::track_repo::sql::chemin_ouvrable;
 
 /// `path` est-il le dossier `dossier` lui-même, ou en dessous ?
 ///
@@ -54,6 +55,26 @@ pub struct EnrichScope {
 impl EnrichScope {
     /// Calcule la portée depuis la table `tracks` (pistes locales seulement,
     /// comme les passes d'enrichissement elles-mêmes).
+    ///
+    /// 🔴 Le chemin passe par [`chemin_ouvrable`], pas par `t.file_path`.
+    ///
+    /// Une piste découpée par une feuille CUE porte `file_path = NULL` **par
+    /// construction** (`scanner::cue_bibliotheque`, `t.file_path = None`) : son
+    /// support est `cue_media_path`. Avec `t.file_path IS NOT NULL`, un album
+    /// entièrement issu d'une image CUE n'entrait dans AUCUNE portée — ni son
+    /// `album_id`, ni ses `artist_ids`. « Enrichir ma collection Jazz » sautait
+    /// donc en silence tous les repiquages de vinyle et tous les concerts du
+    /// dossier, et `track_count` — le chiffre que la réponse HTTP annonce —
+    /// les comptait pour zéro.
+    ///
+    /// Ce qu'on peut élargir ici SANS rien borner : la portée n'est qu'un
+    /// ensemble d'identifiants. Ses consommateurs sont des `retain` sur des
+    /// listes d'albums et d'artistes (`library::artwork`, `metadata::bio_batch`,
+    /// `metadata::matcher`) et deux `contient_chemin` (`routes/library/enrich`,
+    /// `routes/system/enrich`). Aucun ne décode de signal, aucun n'écrit dans
+    /// un fichier. Les quinze tranches d'une image insèrent quinze fois le même
+    /// `album_id` dans un `HashSet` — idempotent — et comptent bien quinze
+    /// pistes, ce qu'elles sont.
     pub fn from_directory(db: &Arc<dyn DbBackend>, dir: &str) -> Self {
         let mut scope = EnrichScope {
             dir: dir.trim_end_matches(['/', '\\']).to_string(),
@@ -61,9 +82,15 @@ impl EnrichScope {
         };
         let rows = db
             .query_many(
-                "SELECT t.file_path, t.album_id, t.artist_id, a.artist_id \
-                 FROM tracks t LEFT JOIN albums a ON a.id = t.album_id \
-                 WHERE t.source = 'local' AND t.file_path IS NOT NULL",
+                concat!(
+                    "SELECT ",
+                    chemin_ouvrable!(),
+                    ", t.album_id, t.artist_id, a.artist_id \
+                     FROM tracks t LEFT JOIN albums a ON a.id = t.album_id \
+                     WHERE t.source = 'local' AND ",
+                    chemin_ouvrable!(),
+                    " IS NOT NULL"
+                ),
                 &[],
             )
             .unwrap_or_default();
@@ -178,6 +205,80 @@ mod tests {
         assert!(!scope.contient_artiste(2), "artiste hors répertoire exclu");
         assert!(scope.contient_chemin("/music/Jazz/Comp/01.flac"));
         assert!(!scope.contient_chemin("/music/Electro/Autobahn/01.flac"));
+    }
+
+    /// La bibliothèque de [`base`], plus UN album de feuille CUE : trois
+    /// tranches d'une même image, sous `/music/Jazz`.
+    ///
+    /// 🔴 `file_path` est NUL sur les trois — c'est ÇA le témoin. Une fixture
+    /// qui le renseignerait décrirait le cas qui marchait déjà et resterait
+    /// verte contre n'importe quel code. Le support commun est
+    /// `/music/Jazz/Live 1975/image.flac`, et les tranches ne se distinguent
+    /// que par `cue_start_ms` : c'est l'identité que porte l'index unique
+    /// partiel `idx_tracks_cue_identity`.
+    fn base_avec_album_cue() -> Arc<dyn DbBackend> {
+        let backend = base();
+        backend
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (4, 'Keith Jarrett'); \
+                 INSERT INTO albums (id, title, artist_id) VALUES (4, 'Live 1975', 4); \
+                 INSERT INTO tracks \
+                   (id, title, album_id, artist_id, file_path, source, cue_media_path, cue_start_ms) \
+                   VALUES (20, 'Part I', 4, 4, NULL, 'local', '/music/Jazz/Live 1975/image.flac', 0); \
+                 INSERT INTO tracks \
+                   (id, title, album_id, artist_id, file_path, source, cue_media_path, cue_start_ms) \
+                   VALUES (21, 'Part II', 4, 4, NULL, 'local', '/music/Jazz/Live 1975/image.flac', 1620000); \
+                 INSERT INTO tracks \
+                   (id, title, album_id, artist_id, file_path, source, cue_media_path, cue_start_ms) \
+                   VALUES (22, 'Part III', 4, 4, NULL, 'local', '/music/Jazz/Live 1975/image.flac', 2940000);",
+            )
+            .unwrap();
+        backend
+    }
+
+    /// 🔴 UN ALBUM DE FEUILLE CUE ENTRE DANS LA PORTÉE DE SON RÉPERTOIRE.
+    ///
+    /// Avec `WHERE t.file_path IS NOT NULL`, aucune des trois tranches n'était
+    /// lue : `album_ids` ne contenait pas l'album 4, `artist_ids` pas
+    /// l'artiste 4, et `track_count` annonçait deux pistes là où il y en a
+    /// cinq. « Enrichir /music/Jazz » sautait donc l'album entier — pochette,
+    /// biographie, appariement — sans que rien ne le signale.
+    #[test]
+    fn from_directory_voit_les_pistes_de_feuille_cue() {
+        let db = base_avec_album_cue();
+        let scope = EnrichScope::from_directory(&db, "/music/Jazz");
+
+        assert_eq!(
+            scope.track_count, 5,
+            "deux pistes ordinaires + les TROIS tranches de l'image CUE"
+        );
+        assert!(
+            scope.contient_album(4),
+            "l'album de feuille CUE doit être dans la portée de son répertoire"
+        );
+        assert!(
+            scope.contient_artiste(4),
+            "et son artiste avec lui, sinon la passe de biographies le saute"
+        );
+        // Le témoin anti-régression : les pistes ordinaires n'ont pas bougé.
+        assert!(scope.contient_album(1));
+        assert!(!scope.contient_album(2), "album hors répertoire exclu");
+    }
+
+    /// Le pendant : une image CUE HORS du répertoire demandé reste dehors.
+    ///
+    /// Sans cette moitié, un `COALESCE` qui rendrait n'importe quoi de non nul
+    /// — ou une garde qui laisserait tout passer — resterait verte au témoin
+    /// ci-dessus.
+    #[test]
+    fn from_directory_exclut_une_image_cue_hors_du_repertoire() {
+        let db = base_avec_album_cue();
+        let scope = EnrichScope::from_directory(&db, "/music/Electro");
+        assert!(
+            !scope.contient_album(4),
+            "l'album CUE vit sous /music/Jazz, pas sous /music/Electro"
+        );
+        assert_eq!(scope.track_count, 1, "la seule piste d'Electro");
     }
 
     /// Une piste de streaming sous aucun chemin ne compte jamais.

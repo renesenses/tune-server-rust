@@ -631,6 +631,21 @@ pub(super) async fn smart_duplicates(
 /// attendre le créneau : c'est ce que rendent ces deux portes. Le rattrapage
 /// forcé reste borné (`max` lots, 40 au plus) et respecte les mêmes gardes que
 /// le fond (analyse désactivée, zone en lecture ⇒ le lot s'arrête).
+///
+/// ⛔ `file_path IS NOT NULL` RESTE dans le dénominateur. Ne pas retomber sur
+/// `cue_media_path`.
+///
+/// Ce chiffre est une JAUGE : son dénominateur doit être le miroir exact de la
+/// population que la passe traite. Cette passe est
+/// `audio::replaygain::CANDIDATS_EMPREINTE_WHERE`, que #3998 a **laissée** à
+/// dessein (elle exige le témoin `rg_analyzed`, posé par une mesure qui n'est
+/// pas bornée à la tranche).
+///
+/// Élargir la seule jauge ferait donc compter des pistes que la passe
+/// n'atteindra jamais : une barre qui n'arrive plus à 100 %, sans que personne
+/// puisse dire pourquoi. C'est le défaut que `embedding_store::ELIGIBLE_WHERE`
+/// a fermé en partageant UN texte entre la requête et son compte. Ici, le
+/// texte partagé ne peut bouger qu'avec la passe.
 pub(super) async fn couverture_empreintes(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
