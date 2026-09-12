@@ -4669,6 +4669,7 @@ impl OutputTarget for LocalOutput {
                     sample_rate,
                     bit_depth,
                     channels,
+                    spec,
                     data_offset,
                     header_buf,
                     reader,
@@ -6379,3 +6380,9 @@ mod capture_bout_en_bout_2218;
 /// au puits natif (`49ecf1fe`) : 16 bits identité, 24 bits identité, DoP.
 #[cfg(test)]
 mod empreinte_wasapi_f70496;
+
+/// REF-8 (#2219) — les empreintes des deux routes du bras ASIO, relevées AVANT
+/// son passage au trait (`49ecf1fe`) : route native 16 et 24 bits identité,
+/// DoP, volume ; route flottante 16 bits par l'étage de R1, refus DoP.
+#[cfg(test)]
+mod empreinte_asio_f70496;

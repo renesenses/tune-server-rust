@@ -180,10 +180,20 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         "play_url n'appelle plus le bras ASIO exclusif : un module écrit mais pas branché \
          ne draine rien (R6 bis, #2219)"
     );
+    // REF-8 (#2219) : ASIO a deux routes, et chacune draine. Route native :
+    // l'étage natif (`EtageNatif`, `local/etage_natif.rs`, qui appelle
+    // `prepare_windows_native_pcm` puis `flush_local_dsp` dans
+    // `rendre_la_queue`) ; route traitée : l'étage de R1 (`EtageDeConversion`)
+    // avec `flush_local_dsp` appelé dans le bras. Les deux doivent être
+    // montées ET drainées : perdre l'une des deux, c'est perdre la fin de
+    // piste sur la moitié des pilotes.
     assert!(
-        bras_asio.contains("feed_selected_windows_exclusive_leftover(")
+        bras_asio.contains("EtageNatif::monter(")
+            && bras_asio.contains(".rendre_la_queue(")
+            && bras_asio.contains("EtageDeConversion {")
             && bras_asio.contains("flush_local_dsp("),
-        "ASIO doit sélectionner la préparation conforme au pilote puis drainer sa fin de piste"
+        "ASIO doit monter l'étage conforme au pilote (natif ou R1) puis drainer sa fin de \
+         piste sur les DEUX routes (REF-8, #2219)"
     );
 
     let wasapi = prod

@@ -153,6 +153,52 @@ fn les_trois_transports_exclusifs_arment_le_canal_sur_un_refus_d_ouverture() {
     );
 }
 
+/// REF-8 (#2219) — le bras ASIO, passé au trait, garde les maillons 2 et 3 :
+/// le verdict de blocage du puits (rappel mort, anneau jamais drainé) est
+/// relu et rapporté avec la position figée — il était JETÉ avant REF-8, seul
+/// chemin de lecture à l'ignorer avec WASAPI —, et le vidage reste
+/// doublement borné (`asio_drain_timeout`, dans `drainer`).
+#[test]
+fn le_bras_asio_rapporte_son_blocage_et_borne_son_vidage() {
+    let armements = BRAS_ASIO.matches("feed_stalled = true").count();
+    assert!(
+        armements >= 2,
+        "le bras ASIO n'arme le drapeau de blocage qu'à {armements} site(s) (amorce et \
+         boucle) : un `PuitsMort` dont le verdict retombe dans le vide rend la zone muette \
+         et figée sur la position atteinte (#3108, REF-8)"
+    );
+    assert!(
+        BRAS_ASIO.contains("if feed_stalled {")
+            && appelle_avec(BRAS_ASIO, "record_feed_stall_failure(", "ASIO")
+            && BRAS_ASIO.contains("position_ms.load("),
+        "le bras ASIO ne rapporte plus son blocage par `record_feed_stall_failure(\"ASIO\", \
+         …, position_ms.load(…), …)` : c'est le silence du constat du 01/09, sur ASIO (#3108)"
+    );
+    assert!(
+        BRAS_ASIO.matches("\"asio_drain_timeout\"").count() >= 2,
+        "le vidage ASIO n'a plus ses deux bornes (échéance ET détecteur de blocage) : face à \
+         un pilote figé il ne se vide jamais et le verrou ASIO reste pris (#789, bug-22)"
+    );
+}
+
+/// La « figée à 2 s » vaut aussi pour ASIO : ses deux anneaux, désormais créés
+/// par `AsioExclusiveOutput::new` (REF-8, D2), tiennent deux secondes à la
+/// cadence de la source. Même garde que pour CoreAudio et CPAL.
+#[test]
+fn l_anneau_asio_exclusif_tient_les_deux_secondes_du_constat() {
+    const ASIO: &str = include_str!("../../tune-core/src/outputs/asio_exclusive.rs");
+    assert!(
+        ASIO.contains("let ring_cap = (sample_rate as usize) * (channels as usize) * 2;"),
+        "la contenance des anneaux ASIO exclusifs a changé : c'est elle qui produit le \
+         « figée à 2 s » du constat de #3108 — mettre à jour le message et cette garde ensemble"
+    );
+    assert!(
+        !BRAS_ASIO.contains("let ring_cap ="),
+        "le bras ASIO recalcule une contenance d'anneau : le backend possède ses anneaux (D2), \
+         `play_url` et ses bras n'en créent plus (REF-8, #2219)"
+    );
+}
+
 /// Maillon 2 — la branche « figée à 2 s » du constat.
 ///
 /// L'ouverture a RÉUSSI et le rappel de rendu CoreAudio ne tire rien. L'anneau

@@ -60,6 +60,12 @@ const BACKEND_RS: &str = include_str!("../../tune-core/src/outputs/local/backend
 // porteur : elle le porte. Voir `la_route_native_porte_le_porteur_dop_et_le_dit`.
 const ETAGE_NATIF_RS: &str = include_str!("../../tune-core/src/outputs/local/etage_natif.rs");
 
+// REF-8 (#2219) : le bras ASIO monte l'étage de R1 sur sa route traitée avec
+// une fermeture qui refuse TOUT porteur DoP — la seconde route « refuser puis
+// convertir », que cette garde doit nommer, et dont elle prouve l'ABSENCE sur
+// la route native (le DoP y est porté, jamais refusé).
+const BRAS_ASIO_RS: &str = include_str!("../../tune-core/src/outputs/local/bras_asio.rs");
+
 /// La production seule : `local.rs` se termine par `#[cfg(test)] mod tests`,
 /// dont le texte citerait nos propres motifs et rendrait la garde complaisante.
 fn production() -> String {
@@ -285,6 +291,57 @@ fn la_route_ne_refuse_pas_le_porteur_dop_apres_la_conversion() {
          réécrit le porteur DoP, le refus arrive trop tard et le DAC est muet \
          quoi qu'on journalise (refus={refus}, conversion={conversion}, \
          écriture={ecriture})"
+    );
+}
+
+/// REF-8 (#2219) — la route TRAITÉE d'ASIO passe par la route unique de R1
+/// avec une fermeture qui refuse tout porteur (`|dop, _, _| dop`), et le
+/// refus est rapporté sous le motif d'avant (`DopUnsupported`, `"ASIO"`).
+/// La route NATIVE, elle, ne refuse rien : un `PorteurDopRefuse` n'y existe
+/// pas, le porteur traverse intact.
+#[test]
+fn la_route_traitee_d_asio_refuse_tout_porteur_et_la_native_n_en_refuse_aucun() {
+    let source = sans_commentaires_ni_blancs(BRAS_ASIO_RS);
+    assert!(
+        source.contains("etage.pousser(puits.as_mut(),&mut|dop,_,_|dop,&mut|_|{})"),
+        "#3233/REF-8 — la route traitée d'ASIO ne passe plus par `EtageDeConversion::pousser` \
+         avec la fermeture qui refuse TOUT porteur DoP : un DoP y traverserait la conversion \
+         flottante et sortirait en bruit blanc"
+    );
+    let flottante = source
+        .split("Route::Flottante{etage,puits}=>{")
+        .nth(1)
+        .and_then(|s| s.split("}}}").next())
+        .expect("la route traitée d'ASIO doit rester identifiable dans `Route::pousser`");
+    assert!(
+        flottante.contains("PousseeVersLePuits::PorteurDopRefuse=>Poussee::PorteurDopRefuse"),
+        "#3233/REF-8 — le refus de l'étage de R1 n'est plus relayé par la route traitée"
+    );
+    assert!(
+        source.contains("Poussee::PorteurDopRefuse=>{pcm_refusal=Some(WindowsExclusivePcmError::DopUnsupported);"),
+        "#3233/REF-8 — le refus DoP de la route traitée n'est plus rapporté sous \
+         `DopUnsupported` : l'écran perd sa cause"
+    );
+    assert!(
+        source.contains("record_windows_exclusive_pcm_refusal(error,\"ASIO\","),
+        "#3233/REF-8 — le refus n'est plus rapporté par `record_windows_exclusive_pcm_refusal` \
+         avec \"ASIO\""
+    );
+    // Borné au bras natif de `Route::pousser`, quelle que soit la mise en
+    // forme de `rustfmt` (bloc ou expression après `=>`).
+    let native = source
+        .split("Route::Native{etage,puits}=>")
+        .nth(1)
+        .and_then(|s| s.split("Route::Flottante{etage,puits}=>{").next())
+        .expect("la route native d'ASIO doit rester identifiable dans `Route::pousser`");
+    assert!(
+        native.contains("etage.decoder_et_pousser("),
+        "#3233/REF-8 — la route native d'ASIO ne passe plus par `EtageNatif::decoder_et_pousser`"
+    );
+    assert!(
+        !native.contains("PorteurDopRefuse") && !native.contains("refuser_le_porteur_dop"),
+        "#3233/REF-8 — la route native d'ASIO refuse un porteur DoP : elle doit le PORTER \
+         (mots entiers, marqueurs intacts), le refus n'appartient qu'à la route flottante"
     );
 }
 

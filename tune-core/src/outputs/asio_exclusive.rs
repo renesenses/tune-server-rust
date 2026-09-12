@@ -25,6 +25,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tracing::{debug, info, warn};
 
 use super::local::{NativePcmRing, RingBuf};
+use super::traits::RingStarvation;
 
 #[derive(Default)]
 struct RealtimeCounters {
@@ -148,14 +149,28 @@ fn teardown_settle_for(sample_rate: u32) -> Duration {
 ///
 /// Holds ownership of the CPAL stream and enough state to restore the
 /// device's original sample rate on drop.
+///
+/// REF-8 (#2219, D2) : il POSSÈDE ses deux anneaux — `float_ring` pour les
+/// quatre transports `Processed*`, `native_ring` pour les trois `Native*` —
+/// de même contenance (`cadence × canaux × 2`, deux secondes à la cadence
+/// source, le « figée à 2 s » de #3108). Le rappel de rendu tient l'autre
+/// bout de celui que le transport retient ; le producteur reçoit un puits sur
+/// le même `Arc` par `BackendLocal::puits` (`local/bras_asio.rs`). Le rappel
+/// ne voit jamais un trait (D3) : les sept variantes de `build_native_stream`
+/// sont celles d'avant, `pop_mapped` et le volume en `f64` compris.
 pub struct AsioExclusiveOutput {
     device_name: String,
     original_sample_rate: Option<u32>,
     current_sample_rate: u32,
+    /// Ce que `find_exclusive_config` a négocié : la cadence demandée et
+    /// `channels.min(config.channels())`. C'est le `FormatOuvert` du backend.
+    opened_sample_rate: u32,
+    opened_channels: u16,
     stream: Option<cpal::Stream>,
-    #[allow(dead_code)]
+    /// Lu par l'anneau retenu (`available`, `capacity`) et prêté au puits
+    /// flottant de la route traitée.
     float_ring: Arc<RingBuf>,
-    #[allow(dead_code)]
+    /// Lu par l'anneau retenu et prêté au puits natif de la route native.
     native_ring: Arc<NativePcmRing>,
     transport: AsioTransport,
     /// Kept alive for the render callback closure.
@@ -236,16 +251,21 @@ pub struct AsioExclusiveFormatInfo {
 
 impl AsioExclusiveOutput {
     /// Open the named ASIO device in exclusive mode and configure it for the
-    /// given sample rate / bit depth / channel count.
+    /// given sample rate / bit depth / channel count. **Ne démarre pas** le
+    /// rendu : c'est [`AsioExclusiveOutput::start`] (REF-8, `demarrer`).
     ///
     /// `device_name` may be `"default"` to use the first ASIO device.
+    ///
+    /// REF-8 (#2219, D2) : les deux anneaux sont créés ICI, à la contenance
+    /// que `play_url` puis `bras_asio.rs` calculaient en ligne, et comptés
+    /// dans `starvation` (#3205) — `begin_stream` y est appelé une fois, comme
+    /// avant, puisque les deux anneaux partagent le compteur.
     pub fn new(
         device_name: &str,
         sample_rate: u32,
         bit_depth: u32,
         channels: u32,
-        float_ring: Arc<RingBuf>,
-        native_ring: Arc<NativePcmRing>,
+        starvation: Arc<RingStarvation>,
         volume: Arc<AtomicU32>,
         paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
@@ -259,6 +279,14 @@ impl AsioExclusiveOutput {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         ensure_com_initialized();
+
+        // Ring buffer: ~2 seconds of audio at source sample rate
+        let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
+        starvation.begin_stream(sample_rate, channels as u16);
+        let float_ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
+        let native_ring = Arc::new(NativePcmRing::new_metered(ring_cap, starvation));
+        float_ring.clear();
+        native_ring.clear();
 
         // -- 1. Get the ASIO host -------------------------------------------
         let host = cpal::host_from_id(cpal::HostId::Asio)
@@ -381,22 +409,12 @@ impl AsioExclusiveOutput {
             counters.clone(),
         )?;
 
-        stream
-            .play()
-            .map_err(|e| format!("Failed to start ASIO stream: {e}"))?;
-
-        info!(
-            device = %resolved_name,
-            sample_rate,
-            bit_depth,
-            channels,
-            "asio_exclusive_started"
-        );
-
         Ok(Self {
             device_name: resolved_name,
             original_sample_rate,
             current_sample_rate: sample_rate,
+            opened_sample_rate: stream_config.sample_rate,
+            opened_channels: stream_config.channels,
             stream: Some(stream),
             float_ring,
             native_ring,
@@ -406,6 +424,74 @@ impl AsioExclusiveOutput {
             counters,
             device_guard,
         })
+    }
+
+    /// Démarre le rendu : `stream.play()`, sorti de `new` (REF-8, #2219) pour
+    /// que le backend ouvre puis démarre en deux gestes, comme le trait le
+    /// demande. ASIO ne pré-remplit pas : le rappel rend du silence tant que
+    /// l'anneau est vide, et `bras_asio.rs` appelle `start` tout de suite
+    /// après `new`, là où `new` appelait `play` — même instant, même journal.
+    ///
+    /// Le texte de l'erreur est celui d'avant, mot pour mot : c'est lui que
+    /// `record_exclusive_open_failure("ASIO", …)` écrit à l'écran.
+    pub fn start(&mut self) -> Result<(), String> {
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| "ASIO stream already released".to_string())?;
+        stream
+            .play()
+            .map_err(|e| format!("Failed to start ASIO stream: {e}"))?;
+        info!(
+            device = %self.device_name,
+            sample_rate = self.current_sample_rate,
+            opened_sample_rate = self.opened_sample_rate,
+            channels = self.opened_channels,
+            "asio_exclusive_started"
+        );
+        Ok(())
+    }
+
+    /// L'anneau flottant, prêté au puits de la route traitée (`Processed*`).
+    pub fn float_ring(&self) -> &Arc<RingBuf> {
+        &self.float_ring
+    }
+
+    /// L'anneau natif, prêté au puits de la route native (`Native*`).
+    pub fn native_ring(&self) -> &Arc<NativePcmRing> {
+        &self.native_ring
+    }
+
+    /// Mots en attente dans l'anneau que le transport retient — l'un des
+    /// deux, jamais les deux : c'est ce que `WindowsExclusiveRingRef::available`
+    /// rendait à `play_url`.
+    pub fn available(&self) -> usize {
+        if self.transport.is_native() {
+            self.native_ring.available()
+        } else {
+            self.float_ring.available()
+        }
+    }
+
+    /// Contenance de l'anneau retenu, en mots.
+    pub fn capacity(&self) -> usize {
+        if self.transport.is_native() {
+            self.native_ring.capacity()
+        } else {
+            self.float_ring.capacity()
+        }
+    }
+
+    /// REF-8 (#2219) — la cadence que `find_exclusive_config` a négociée :
+    /// celle de la source, que le pilote accepte telle quelle ou bascule en
+    /// interne. C'est le `FormatOuvert` que le backend publie.
+    pub fn opened_sample_rate(&self) -> u32 {
+        self.opened_sample_rate
+    }
+
+    /// Les canaux réellement ouverts : `channels.min(config.channels())`.
+    pub fn opened_channels(&self) -> u16 {
+        self.opened_channels
     }
 
     /// Release exclusive mode and stop the stream.
