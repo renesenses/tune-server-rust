@@ -815,6 +815,36 @@ impl Default for PlayMedia<'_> {
     }
 }
 
+/// Le puits d'échantillons : l'extrémité qui reçoit le PCM déjà converti.
+///
+/// C'est la frontière entre le **producteur** — qui lit les octets, décide
+/// PCM ou DoP, applique le DSP, adapte les canaux et rééchantillonne — et le
+/// **backend**, qui n'a plus qu'à ranger des mots flottants entrelacés là où
+/// son pilote viendra les chercher.
+///
+/// Le contrat tient en une phrase : `ecrire` rend la main quand tout `mots` est
+/// rangé, ou quand il est devenu inutile de continuer.
+///
+/// Il vit ici, dans la caisse de contrat **sans aucune fonctionnalité**, et non
+/// derrière `local-audio` : un puits est un point d'extension, au même titre
+/// que [`OutputTarget`], et la porte `test` de toute PR Rust doit le compiler.
+///
+/// Le trait ne dit rien du rythme : un puits peut bloquer (l'anneau CPAL
+/// attend que le rappel draine), écrire sans jamais bloquer (un puits de
+/// capture), ou ne rien faire du tout. Il ne dit rien non plus du format —
+/// cadence et canaux sont convenus à l'ouverture, hors de ce contrat, parce
+/// qu'ils ne changent pas d'un bloc à l'autre.
+pub trait PuitsDEchantillons {
+    /// Range `mots` — du PCM `f32` entrelacé, au format de sortie convenu.
+    ///
+    /// Rend `false` **uniquement** quand le puits a cessé de consommer et que
+    /// le producteur doit se démonter : rappel mort, périphérique arraché.
+    /// Rend `true` dans tous les autres cas, **y compris un arrêt demandé** —
+    /// le producteur détecte l'arrêt par ses propres témoins, jamais par cette
+    /// valeur. Confondre les deux ferait passer une pause pour une panne.
+    fn ecrire(&mut self, mots: &[f32]) -> bool;
+}
+
 #[async_trait::async_trait]
 pub trait OutputTarget: Send + Sync {
     fn name(&self) -> &str;

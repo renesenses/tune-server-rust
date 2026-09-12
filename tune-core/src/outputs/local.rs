@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use super::traits::{
     OutputCapabilities, OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus,
-    OutputStatus, OutputTarget, RingStarvation, TransportState,
+    OutputStatus, OutputTarget, PuitsDEchantillons, RingStarvation, TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -4903,6 +4903,437 @@ fn prepare_windows_native_pcm(
     })
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// La frontière producteur → puits du chemin CPAL partagé.
+//
+// Au-dessus de cette ligne : des octets, un format source, un DSP. En dessous :
+// des mots flottants entrelacés au format du périphérique, et rien d'autre.
+// C'est la seule frontière que `play_url` traverse pour faire du son, et elle
+// est désormais NOMMÉE — condition pour que #2211 (vrai fondu enchaîné) et
+// #2218 (puits de capture) aient un endroit où se brancher.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Le puits du chemin CPAL partagé : l'anneau flottant que draine le rappel.
+///
+/// Il porte les trois témoins d'arrêt du fil de lecture parce que l'attente a
+/// lieu ICI : quand l'anneau est plein, c'est `feed_ring_abortable` qui dort,
+/// et c'est donc lui qu'un arrêt doit pouvoir réveiller. Un puits qui ne
+/// bloque jamais — un puits de capture — n'en aura pas besoin, et c'est
+/// précisément pourquoi ils vivent dans l'implémentation et non dans le trait.
+struct PuitsAnneauCpal<'a> {
+    anneau: &'a RingBuf,
+    stop_rx: &'a std::sync::mpsc::Receiver<()>,
+    paused: &'a AtomicBool,
+    force_silent: &'a AtomicBool,
+}
+
+impl PuitsDEchantillons for PuitsAnneauCpal<'_> {
+    fn ecrire(&mut self, mots: &[f32]) -> bool {
+        feed_ring_abortable(
+            self.anneau,
+            mots,
+            self.stop_rx,
+            self.paused,
+            Some(self.force_silent),
+        )
+    }
+}
+
+/// L'état de conversion source → sortie du chemin partagé.
+///
+/// La même suite de gestes était recopiée à QUATRE endroits de `play_url` —
+/// amorce de la piste initiale, boucle de lecture, amorce de la piste
+/// enchaînée, boucle de la piste enchaînée : décoder ce qui est aligné,
+/// refuser un porteur DoP que ce chemin détruirait, adapter les canaux,
+/// rééchantillonner, écrire. Un seul exemplaire les tient désormais.
+///
+/// L'ordre des deux conversions n'est pas indifférent : l'adaptation de canaux
+/// vient AVANT le rééchantillonnage, parce que le rééchantillonneur est
+/// construit pour `output_ch` canaux.
+struct EtageDeConversion<'a> {
+    pcm: LocalPcmProcessor<'a>,
+    /// Octets reçus de l'amont, pas encore alignés sur une trame source.
+    en_attente: Vec<u8>,
+    resampler: Option<Async<f32>>,
+    resample_leftover: Vec<f32>,
+    pcm_kind: LocalPcmKind,
+    sample_rate: u32,
+    channels: u16,
+    bit_depth: u16,
+    frame_bytes: usize,
+    output_ch: u16,
+    needs_resample: bool,
+    needs_channel_adapt: bool,
+}
+
+/// Ce qu'une poussée vers le puits a produit.
+enum PousseeVersLePuits {
+    /// Rien d'aligné à décoder pour l'instant : il faut lire davantage.
+    RienAPousser,
+    /// Bloc poussé, `trames_source` trames consommées à l'entrée.
+    Poussee { trames_source: u64 },
+    /// Le puits a cessé de consommer (rappel mort, périphérique arraché).
+    /// Les trames sont rendues quand même : les appelants d'amorçage les
+    /// comptaient déjà sans regarder le verdict, et ce compte est la position.
+    PuitsMort { trames_source: u64 },
+    /// Porteur DoP refusé (#3233) : le fil doit se démonter sans rien servir.
+    PorteurDopRefuse,
+}
+
+impl EtageDeConversion<'_> {
+    /// Décode ce qui est aligné dans le tampon d'attente.
+    ///
+    /// `process_pcm_chunk` rend déjà `None` quand rien n'est aligné : la garde
+    /// `aligned_len == 0` que les quatre copies posaient avant l'appel était le
+    /// même calcul, fait deux fois.
+    fn decoder(&mut self) -> Option<ProcessedLocalPcm> {
+        self.pcm.process_pcm_chunk(
+            &mut self.en_attente,
+            self.frame_bytes,
+            self.bit_depth,
+            self.channels,
+            &mut self.pcm_kind,
+        )
+    }
+
+    /// Adaptation de canaux puis rééchantillonnage, dans cet ordre et lui seul.
+    fn convertir(&mut self, mut mots: Vec<f32>) -> Vec<f32> {
+        if self.needs_channel_adapt {
+            mots = adapt_channels(&mots, self.channels, self.output_ch);
+        }
+        if self.needs_resample {
+            mots = rubato_resample_chunk(
+                &mut self.resampler,
+                &mots,
+                self.output_ch,
+                false,
+                &mut self.resample_leftover,
+            );
+        }
+        mots
+    }
+
+    /// Le geste élémentaire du producteur : décoder, refuser un porteur DoP,
+    /// convertir, écrire dans le puits.
+    ///
+    /// `observer` voit le bloc **avant** conversion — c'est là que vivent les
+    /// diagnostics d'amorçage et la détection de silence, qui portent sur le
+    /// PCM source et non sur ce qui sort du sinc.
+    fn pousser(
+        &mut self,
+        puits: &mut dyn PuitsDEchantillons,
+        refuser_le_porteur_dop: &mut dyn FnMut(bool, u32, u16) -> bool,
+        observer: &mut dyn FnMut(&ProcessedLocalPcm),
+    ) -> PousseeVersLePuits {
+        let Some(bloc) = self.decoder() else {
+            return PousseeVersLePuits::RienAPousser;
+        };
+        observer(&bloc);
+        if refuser_le_porteur_dop(bloc.dop, self.sample_rate, self.channels) {
+            return PousseeVersLePuits::PorteurDopRefuse;
+        }
+        let trames_source = bloc.source_frames;
+        let mots = self.convertir(bloc.samples);
+        if puits.ecrire(&mots) {
+            PousseeVersLePuits::Poussee { trames_source }
+        } else {
+            PousseeVersLePuits::PuitsMort { trames_source }
+        }
+    }
+
+    /// Rend la queue du DSP et du rééchantillonneur au puits, au format de la
+    /// piste qui se TERMINE. Utilisé à une frontière gapless qui change de
+    /// format : sans ça, la queue du convolveur partirait au DAC convertie
+    /// avec les paramètres du morceau suivant.
+    fn rendre_la_queue_du_dsp(
+        &mut self,
+        puits: &mut dyn PuitsDEchantillons,
+        queue: Vec<f32>,
+    ) -> bool {
+        if queue.is_empty() {
+            return true;
+        }
+        let mots = self.convertir(queue);
+        puits.ecrire(&mots)
+    }
+}
+
+/// Ce qui distingue la boucle de la piste initiale de celle d'une piste
+/// enchaînée en gapless : **les noms d'événement journalisés**, rien d'autre.
+///
+/// Les deux boucles lisaient, décodaient, convertissaient et écrivaient
+/// exactement pareil. Les garder séparées, c'était garder deux endroits où
+/// corriger un bug de lecture — et #3108 avait déjà dû être corrigé deux fois.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoleDeLaBoucle {
+    PisteInitiale,
+    PisteEnchainee,
+}
+
+/// Pourquoi la boucle producteur s'est arrêtée.
+enum FinDeBoucle {
+    /// L'amont a rendu EOF — ou une erreur de lecture, que les deux boucles
+    /// traitaient déjà comme une fin de flux. La piste peut s'enchaîner.
+    FinDeFlux,
+    /// Arrêt demandé, périphérique perdu, ou puits mort : la piste ne s'est
+    /// pas terminée d'elle-même et ne doit RIEN enchaîner.
+    Interrompue,
+    /// Porteur DoP refusé (#3233). Le fil doit se démonter, et c'est à
+    /// l'appelant de baisser `playing` — sous la garde de génération, pour ne
+    /// pas éteindre une lecture PLUS RÉCENTE qui nous a déjà supplantés.
+    PorteurDopRefuse,
+    /// Le fil doit se démonter immédiatement. `playing` a DÉJÀ été baissé par
+    /// le rappel qui a échoué (`apres_ecriture`).
+    Abandon,
+}
+
+/// La boucle qui tire les octets de l'amont et les pousse dans le puits.
+///
+/// **Sortie de `play_url`**, où elle existait en deux exemplaires. Elle ne
+/// connaît ni cpal, ni anneau, ni périphérique : elle connaît un `Read`, un
+/// [`EtageDeConversion`] et un [`PuitsDEchantillons`]. C'est ce qui permettra
+/// de lui brancher un second puits sans la toucher.
+struct BoucleProducteur<'a> {
+    role: RoleDeLaBoucle,
+    device_name: &'a str,
+    cle_de_flux: Option<&'a str>,
+    stop_rx: &'a std::sync::mpsc::Receiver<()>,
+    force_silent: &'a AtomicBool,
+    device_gone: &'a AtomicBool,
+    position_ms: &'a AtomicU64,
+    open_failure: &'a std::sync::Mutex<Option<String>>,
+    /// Départ du chronomètre du flux. Fourni par l'appelant et non pris à
+    /// l'entrée de la boucle : la piste initiale l'arme AVANT de tester le
+    /// pré-remplissage déjà acquis, et les durées journalisées comptent à
+    /// partir de là.
+    debut_du_flux: std::time::Instant,
+}
+
+/// Les compteurs d'une piste, que la boucle fait avancer.
+struct CompteursDePiste {
+    total_bytes_read: u64,
+    total_frames_fed: u64,
+    seek_offset: u64,
+    /// Octets PCM à jeter avant d'atteindre la position demandée. Zéro pour
+    /// une piste enchaînée, qui repart toujours de son début.
+    skip_bytes: u64,
+    skipped_bytes: u64,
+    /// Faux tant que l'arrivée des premières données n'a pas été journalisée.
+    premiere_donnee_journalisee: bool,
+}
+
+impl BoucleProducteur<'_> {
+    /// Tourne jusqu'à la fin du flux ou jusqu'à une interruption.
+    ///
+    /// `apres_ecriture` est appelé après chaque bloc réellement poussé : c'est
+    /// par là que la piste initiale démarre le flux cpal une fois le
+    /// pré-remplissage atteint. Il rend `false` pour demander l'abandon du fil.
+    #[allow(clippy::too_many_arguments)]
+    fn tourner(
+        &self,
+        amont: &mut dyn std::io::Read,
+        tampon_de_lecture: &mut [u8],
+        etage: &mut EtageDeConversion,
+        puits: &mut dyn PuitsDEchantillons,
+        refuser_le_porteur_dop: &mut dyn FnMut(bool, u32, u16) -> bool,
+        compteurs: &mut CompteursDePiste,
+        apres_ecriture: &mut dyn FnMut(&CompteursDePiste) -> bool,
+    ) -> FinDeBoucle {
+        let initiale = self.role == RoleDeLaBoucle::PisteInitiale;
+        let debut_du_flux = self.debut_du_flux;
+        loop {
+            // Arrêt demandé. La piste initiale nomme les deux témoins
+            // séparément — c'est son journal de diagnostic historique ; la
+            // piste enchaînée sort sans un mot, comme avant.
+            if self.stop_rx.try_recv().is_ok() {
+                if initiale {
+                    debug!(
+                        total_bytes_read = compteurs.total_bytes_read,
+                        total_frames_fed = compteurs.total_frames_fed,
+                        "local_audio_stopped_by_signal"
+                    );
+                }
+                return FinDeBoucle::Interrompue;
+            }
+            if self.force_silent.load(Ordering::Relaxed) {
+                if initiale {
+                    debug!(
+                        total_bytes_read = compteurs.total_bytes_read,
+                        total_frames_fed = compteurs.total_frames_fed,
+                        "local_audio_stopped_by_abort_flag"
+                    );
+                }
+                return FinDeBoucle::Interrompue;
+            }
+            // Périphérique disparu en cours de piste (USB arraché, #1626) :
+            // arrêter de lire, personne ne jouera jamais ces échantillons. Pas
+            // de fin naturelle : on n'enchaîne pas la file sur un mort.
+            if self.device_gone.load(Ordering::Relaxed) {
+                // Les deux noms d'événement sont conservés MOT POUR MOT : ce
+                // sont eux qu'on cherche dans les journaux d'un testeur, et une
+                // réorganisation n'a pas à renommer ce qui se lit dehors.
+                if initiale {
+                    warn!(
+                        device = %self.device_name,
+                        total_bytes_read = compteurs.total_bytes_read,
+                        "local_audio_stopped_device_lost"
+                    );
+                } else {
+                    warn!(
+                        device = %self.device_name,
+                        total_bytes_read = compteurs.total_bytes_read,
+                        "local_audio_gapless_stopped_device_lost"
+                    );
+                }
+                return FinDeBoucle::Interrompue;
+            }
+
+            let debut_de_lecture = std::time::Instant::now();
+            let lus = match amont.read(tampon_de_lecture) {
+                Ok(0) => {
+                    if initiale {
+                        debug!(
+                            total_bytes_read = compteurs.total_bytes_read,
+                            total_frames_fed = compteurs.total_frames_fed,
+                            elapsed_ms = debut_du_flux.elapsed().as_millis() as u64,
+                            "local_audio_stream_eof"
+                        );
+                    } else {
+                        debug!(
+                            total_bytes_read = compteurs.total_bytes_read,
+                            total_frames_fed = compteurs.total_frames_fed,
+                            "local_audio_gapless_track_eof"
+                        );
+                    }
+                    return FinDeBoucle::FinDeFlux;
+                }
+                Ok(n) => n,
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    // Délai de lecture : reboucler pour revoir les témoins.
+                    continue;
+                }
+                Err(e) => {
+                    if initiale {
+                        journaliser_erreur_de_lecture(
+                            self.device_name,
+                            self.cle_de_flux,
+                            &e.to_string(),
+                            compteurs.total_bytes_read,
+                        );
+                    } else {
+                        warn!(error = %e, "local_audio_gapless_read_error");
+                    }
+                    // Les deux boucles traitaient déjà une erreur de lecture
+                    // comme une fin de flux : la piste a joué ce qu'elle avait.
+                    return FinDeBoucle::FinDeFlux;
+                }
+            };
+            let duree_de_lecture = debut_de_lecture.elapsed();
+
+            if initiale {
+                if !compteurs.premiere_donnee_journalisee {
+                    info!(
+                        bytes = lus,
+                        wait_ms = debut_du_flux.elapsed().as_millis() as u64,
+                        "local_audio_first_pcm_data_received"
+                    );
+                    compteurs.premiere_donnee_journalisee = true;
+                } else if duree_de_lecture.as_millis() > 5000 {
+                    journaliser_lecture_lente(
+                        self.device_name,
+                        self.cle_de_flux,
+                        lus,
+                        duree_de_lecture.as_millis() as u64,
+                        compteurs.total_bytes_read,
+                    );
+                }
+            }
+
+            compteurs.total_bytes_read += lus as u64;
+
+            // Saut de position : jeter les octets PCM jusqu'à l'offset demandé.
+            if compteurs.skip_bytes > 0 && compteurs.skipped_bytes < compteurs.skip_bytes {
+                let reste_a_jeter = (compteurs.skip_bytes - compteurs.skipped_bytes) as usize;
+                if lus <= reste_a_jeter {
+                    compteurs.skipped_bytes += lus as u64;
+                    continue;
+                }
+                compteurs.skipped_bytes = compteurs.skip_bytes;
+                etage
+                    .en_attente
+                    .extend_from_slice(&tampon_de_lecture[reste_a_jeter..lus]);
+            } else {
+                etage
+                    .en_attente
+                    .extend_from_slice(&tampon_de_lecture[..lus]);
+            }
+
+            let premiere_donnee = compteurs.premiere_donnee_journalisee;
+            let trames_deja_servies = compteurs.total_frames_fed;
+            let pousse = etage.pousser(puits, refuser_le_porteur_dop, &mut |bloc| {
+                // Silence total au démarrage : le signe d'un décodage qui a
+                // échoué. Diagnostic de la piste initiale seule, comme avant.
+                if initiale && (!premiere_donnee || trames_deja_servies == 0) {
+                    let non_nul = bloc.samples.iter().any(|&s| s != 0.0);
+                    if !non_nul && !bloc.samples.is_empty() {
+                        warn!(
+                            sample_count = bloc.samples.len(),
+                            "local_audio_first_samples_all_zero"
+                        );
+                    }
+                }
+            });
+
+            let trames_source = match pousse {
+                PousseeVersLePuits::RienAPousser => continue,
+                PousseeVersLePuits::PorteurDopRefuse => return FinDeBoucle::PorteurDopRefuse,
+                PousseeVersLePuits::PuitsMort { .. } => {
+                    // Blocage : le rappel de rendu ne draine plus (flux mort
+                    // après un arrachage USB sur macOS, où AUCUN rappel
+                    // d'erreur ne se déclenche, #1626). Sans cette sortie, la
+                    // boucle attendait 5 s à CHAQUE bloc, position figée.
+                    if initiale {
+                        warn!(
+                            device = %self.device_name,
+                            total_bytes_read = compteurs.total_bytes_read,
+                            "local_audio_stopped_feed_stall"
+                        );
+                    } else {
+                        warn!(
+                            device = %self.device_name,
+                            total_bytes_read = compteurs.total_bytes_read,
+                            "local_audio_gapless_stopped_feed_stall"
+                        );
+                    }
+                    // …et sans celle-ci, il s'arrêtait SANS RIEN DIRE (#3108).
+                    record_feed_stall_failure(
+                        "CPAL",
+                        self.device_name,
+                        self.position_ms.load(Ordering::Relaxed),
+                        self.open_failure,
+                    );
+                    return FinDeBoucle::Interrompue;
+                }
+                PousseeVersLePuits::Poussee { trames_source } => trames_source,
+            };
+
+            compteurs.total_frames_fed += trames_source;
+
+            if !apres_ecriture(compteurs) {
+                return FinDeBoucle::Abandon;
+            }
+
+            let position = (compteurs.total_frames_fed as f64 / etage.sample_rate as f64 * 1000.0)
+                as u64
+                + compteurs.seek_offset;
+            self.position_ms.store(position, Ordering::Relaxed);
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl OutputTarget for LocalOutput {
     fn name(&self) -> &str {
@@ -5275,7 +5706,7 @@ impl OutputTarget for LocalOutput {
             // instead of waiting forever on a ring buffer nobody drains.
             let device_gone = Arc::new(AtomicBool::new(false));
 
-            let (mut channels, mut sample_rate, mut bit_depth, data_offset) = if let Some(parsed) =
+            let (channels, sample_rate, bit_depth, data_offset) = if let Some(parsed) =
                 parse_wav_header(&header_buf)
             {
                 info!(
@@ -5791,7 +6222,7 @@ impl OutputTarget for LocalOutput {
             } else {
                 (bit_depth / 8) as usize
             };
-            let mut frame_bytes = channels as usize * bytes_per_sample;
+            let frame_bytes = channels as usize * bytes_per_sample;
 
             // ------- Exclusive mode path (macOS only) -------
             #[cfg(target_os = "macos")]
@@ -7480,9 +7911,9 @@ impl OutputTarget for LocalOutput {
             } else {
                 0
             };
-            let mut skipped_bytes: u64 = 0;
-            let mut needs_resample = output_sr != sample_rate;
-            let mut needs_channel_adapt = output_ch != channels;
+            let skipped_bytes: u64 = 0;
+            let needs_resample = output_sr != sample_rate;
+            let needs_channel_adapt = output_ch != channels;
             // #3233 — Pierre M, fil 1043 : « DSD : le temps défile, pas de
             // son ». Un porteur DoP ne survit ni au sinc ni à l'adaptation de
             // canaux : le marqueur 0x05/0xFA alterne à CHAQUE trame, c'est un
@@ -7494,7 +7925,7 @@ impl OutputTarget for LocalOutput {
             // `ResampleToDeviceRate` est réellement prise sur WASAPI — le cas
             // est donc devenu ATTEIGNABLE, et il faut le nommer plutôt que de
             // servir au DAC un signal dont il ne reste rien.
-            let refuser_le_porteur_dop = |dop: bool, src_sr: u32, src_ch: u16| -> bool {
+            let mut refuser_le_porteur_dop = |dop: bool, src_sr: u32, src_ch: u16| -> bool {
                 let Some(rupture) = crate::audio::dsd_to_dop::rupture_du_porteur_dop(
                     dop, src_sr, output_sr, src_ch, output_ch,
                 ) else {
@@ -7512,7 +7943,7 @@ impl OutputTarget for LocalOutput {
 
             // Create rubato sinc resampler once for the entire track.
             // Using FixedAsync::Input so we feed fixed-size input chunks.
-            let mut resampler: Option<Async<f32>> = if needs_resample {
+            let resampler: Option<Async<f32>> = if needs_resample {
                 let ratio = output_sr as f64 / sample_rate as f64;
                 // Adaptive resampler params based on conversion ratio:
                 //   ratio ≤ 2.0 (e.g. 96kHz→48kHz): quality params, plenty of CPU budget
@@ -7564,85 +7995,98 @@ impl OutputTarget for LocalOutput {
             } else {
                 None
             };
-            // Buffer for resampler frame leftover: holds samples that don't
-            // fill a complete resampler block, carried over to the next read.
-            let mut resample_leftover: Vec<f32> = Vec::new();
-
             // Read and feed the rest of the stream
             let mut read_buf = vec![0u8; 65536];
-            // Seed the leftover buffer with any unaligned remainder from the
-            // initial header read so byte alignment is preserved across reads.
-            // Previously the remainder was silently dropped, causing every
-            // subsequent 24-bit sample to be read from the wrong byte offset
-            // (white noise).
-            let mut leftover = pcm_data;
-            let mut pcm_kind = LocalPcmKind::for_bit_depth(bit_depth);
-            let pcm_processor = LocalPcmProcessor {
-                eq: &eq,
-                convolver: &convolver,
-                crossfeed: &crossfeed,
-                pure_bypass: &pure_bypass,
-                mono_downmix: &mono_downmix,
-                dop_active: &dop_active,
-                volume: &volume,
-                user_volume: &user_volume_ref,
-                rg_factor: &rg_factor_ref,
+
+            // ── La frontière producteur → puits ────────────────────────────
+            //
+            // `etage` tient tout ce qui transforme des octets source en mots de
+            // sortie ; `puits` tient l'anneau et rien d'autre. Tout ce qui part
+            // au DAC par ce chemin passe par `etage.pousser(&mut puits, …)` —
+            // il n'existe plus d'autre route.
+            //
+            // Le tampon d'attente est amorcé avec le reliquat non aligné de la
+            // lecture d'en-tête : sans lui, chaque mot 24 bits suivant serait lu
+            // au mauvais décalage d'octet (bruit blanc).
+            let mut etage = EtageDeConversion {
+                pcm: LocalPcmProcessor {
+                    eq: &eq,
+                    convolver: &convolver,
+                    crossfeed: &crossfeed,
+                    pure_bypass: &pure_bypass,
+                    mono_downmix: &mono_downmix,
+                    dop_active: &dop_active,
+                    volume: &volume,
+                    user_volume: &user_volume_ref,
+                    rg_factor: &rg_factor_ref,
+                },
+                en_attente: pcm_data,
+                resampler,
+                // Reliquat du rééchantillonneur : les échantillons qui ne
+                // remplissent pas un bloc complet, reportés sur la lecture
+                // suivante.
+                resample_leftover: Vec::new(),
+                pcm_kind: LocalPcmKind::for_bit_depth(bit_depth),
+                sample_rate,
+                channels,
+                bit_depth,
+                frame_bytes,
+                output_ch,
+                needs_resample,
+                needs_channel_adapt,
+            };
+            let mut puits = PuitsAnneauCpal {
+                anneau: ring.as_ref(),
+                stop_rx: &stop_rx,
+                paused: paused.as_ref(),
+                force_silent: force_silent.as_ref(),
             };
 
             // Process leftover from header read
-            if let Some(processed) = pcm_processor.process_pcm_chunk(
-                &mut leftover,
-                frame_bytes,
-                bit_depth,
-                channels,
-                &mut pcm_kind,
-            ) {
-                let mut samples = processed.samples;
-
-                // Diagnostic: log first few f32 samples and detect anomalies.
-                // White noise manifests as high-amplitude random values in
-                // what should be a gentle attack.
-                if !samples.is_empty() {
-                    let first_8: Vec<f32> = samples.iter().take(8).copied().collect();
-                    let max_abs = samples
-                        .iter()
-                        .take(200)
-                        .fold(0.0f32, |m, &s| m.max(s.abs()));
-                    let non_zero = samples.iter().take(200).filter(|&&s| s != 0.0).count();
-                    info!(
-                        first_samples = ?first_8,
-                        max_abs_200 = max_abs,
-                        non_zero_in_200 = non_zero,
-                        total_samples = samples.len(),
-                        bit_depth,
-                        frame_bytes,
-                        dop = processed.dop,
-                        "local_audio_initial_samples_diagnostic"
-                    );
-                }
-
-                // #3233 : le porteur DoP ne survit pas a ce chemin — refuser
-                // AVANT que le premier echantillon parte au DAC.
-                if refuser_le_porteur_dop(processed.dop, sample_rate, channels) {
+            let amorce = etage.pousser(
+                &mut puits,
+                &mut refuser_le_porteur_dop,
+                &mut |bloc: &ProcessedLocalPcm| {
+                    // Diagnostic: log first few f32 samples and detect
+                    // anomalies. White noise manifests as high-amplitude random
+                    // values in what should be a gentle attack.
+                    if !bloc.samples.is_empty() {
+                        let first_8: Vec<f32> = bloc.samples.iter().take(8).copied().collect();
+                        let max_abs = bloc
+                            .samples
+                            .iter()
+                            .take(200)
+                            .fold(0.0f32, |m, &s| m.max(s.abs()));
+                        let non_zero = bloc.samples.iter().take(200).filter(|&&s| s != 0.0).count();
+                        info!(
+                            first_samples = ?first_8,
+                            max_abs_200 = max_abs,
+                            non_zero_in_200 = non_zero,
+                            total_samples = bloc.samples.len(),
+                            bit_depth,
+                            frame_bytes,
+                            dop = bloc.dop,
+                            "local_audio_initial_samples_diagnostic"
+                        );
+                    }
+                },
+            );
+            match amorce {
+                PousseeVersLePuits::PorteurDopRefuse => {
                     if play_generation.load(Ordering::SeqCst) == my_generation {
                         playing.store(false, Ordering::SeqCst);
                     }
                     return;
                 }
-                if needs_channel_adapt {
-                    samples = adapt_channels(&samples, channels, output_ch);
+                // L'amorce comptait ses trames SANS regarder le verdict de
+                // l'écriture — un puits déjà mort à l'amorçage est constaté par
+                // la boucle, pas ici. Conservé tel quel : la position rapportée
+                // pour ce bloc ne doit pas changer.
+                PousseeVersLePuits::Poussee { trames_source }
+                | PousseeVersLePuits::PuitsMort { trames_source } => {
+                    total_frames_fed += trames_source;
                 }
-                if needs_resample {
-                    samples = rubato_resample_chunk(
-                        &mut resampler,
-                        &samples,
-                        output_ch,
-                        false,
-                        &mut resample_leftover,
-                    );
-                }
-                feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
-                total_frames_fed += processed.source_frames;
+                PousseeVersLePuits::RienAPousser => {}
             }
             // ── #3318 — LA CLÉ QUI MANQUAIT ────────────────────────────
             //
@@ -7669,7 +8113,7 @@ impl OutputTarget for LocalOutput {
             let cle_de_flux = cle_de_flux.as_deref();
 
             let mut total_bytes_read: u64 = 0;
-            let mut first_data_logged = false;
+            let first_data_logged = false;
             let stream_start = std::time::Instant::now();
 
             // Pre-fill the ring buffer before starting the cpal stream.
@@ -7699,187 +8143,48 @@ impl OutputTarget for LocalOutput {
             // Only when http_eof=true do we signal track_ended_naturally.
             let mut http_eof = false;
 
-            loop {
-                // Check for stop signal (non-blocking)
-                if stop_rx.try_recv().is_ok() {
-                    debug!(
-                        total_bytes_read,
-                        total_frames_fed, "local_audio_stopped_by_signal"
-                    );
-                    break;
-                }
-                // Check abort flag (set by stop() to force immediate exit)
-                if force_silent.load(Ordering::Relaxed) {
-                    debug!(
-                        total_bytes_read,
-                        total_frames_fed, "local_audio_stopped_by_abort_flag"
-                    );
-                    break;
-                }
-                // Device vanished mid-track (USB DAC unplugged, #1626): stop
-                // reading — nobody will ever play these samples. http_eof stays
-                // false so no natural track end is signalled (we must not chain
-                // the queue onto a dead device).
-                if device_gone.load(Ordering::Relaxed) {
-                    warn!(
-                        device = %device_name,
-                        total_bytes_read,
-                        "local_audio_stopped_device_lost"
-                    );
-                    break;
-                }
-
-                let read_start = std::time::Instant::now();
-                let n = match reader.read(&mut read_buf) {
-                    Ok(0) => {
-                        debug!(
-                            total_bytes_read,
-                            total_frames_fed,
-                            elapsed_ms = stream_start.elapsed().as_millis() as u64,
-                            "local_audio_stream_eof"
-                        );
-                        http_eof = true;
-                        break; // EOF
+            // ── La boucle producteur, une seule pour les deux pistes ───────
+            //
+            // Elle ne sait rien de cpal : elle lit un `Read`, décode par
+            // `etage` et écrit dans `puits`. La piste enchaînée en gapless,
+            // plus bas, appelle EXACTEMENT la même boucle.
+            let producteur = BoucleProducteur {
+                role: RoleDeLaBoucle::PisteInitiale,
+                device_name: &device_name,
+                cle_de_flux,
+                stop_rx: &stop_rx,
+                force_silent: force_silent.as_ref(),
+                device_gone: device_gone.as_ref(),
+                position_ms: position_ms.as_ref(),
+                open_failure: open_failure.as_ref(),
+                debut_du_flux: stream_start,
+            };
+            let mut compteurs = CompteursDePiste {
+                total_bytes_read,
+                total_frames_fed,
+                seek_offset,
+                skip_bytes,
+                skipped_bytes,
+                premiere_donnee_journalisee: first_data_logged,
+            };
+            let fin = producteur.tourner(
+                &mut reader,
+                &mut read_buf,
+                &mut etage,
+                &mut puits,
+                &mut refuser_le_porteur_dop,
+                &mut compteurs,
+                &mut |compteurs| {
+                    // Démarrer le flux cpal une fois le pré-remplissage atteint.
+                    // Le périphérique ne tire ainsi jamais d'un anneau vide ou
+                    // clairsemé — c'était le bruit blanc en début de piste.
+                    if stream_started || ring.available() < prefill_target {
+                        return true;
                     }
-                    Ok(n) => n,
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        // Read timeout — loop back to check abort flag
-                        continue;
-                    }
-                    Err(e) => {
-                        journaliser_erreur_de_lecture(
-                            &device_name,
-                            cle_de_flux,
-                            &e.to_string(),
-                            total_bytes_read,
-                        );
-                        http_eof = true;
-                        break;
-                    }
-                };
-                let read_elapsed = read_start.elapsed();
-
-                // Log first data arrival and any suspiciously slow reads
-                if !first_data_logged {
-                    info!(
-                        bytes = n,
-                        wait_ms = stream_start.elapsed().as_millis() as u64,
-                        "local_audio_first_pcm_data_received"
-                    );
-                    first_data_logged = true;
-                } else if read_elapsed.as_millis() > 5000 {
-                    journaliser_lecture_lente(
-                        &device_name,
-                        cle_de_flux,
-                        n,
-                        read_elapsed.as_millis() as u64,
-                        total_bytes_read,
-                    );
-                }
-
-                total_bytes_read += n as u64;
-
-                // Seek skip: discard PCM bytes until we reach the seek offset
-                if skip_bytes > 0 && skipped_bytes < skip_bytes {
-                    let remaining_to_skip = (skip_bytes - skipped_bytes) as usize;
-                    if n <= remaining_to_skip {
-                        skipped_bytes += n as u64;
-                        continue;
-                    }
-                    // Partial skip: some bytes to discard, rest to process
-                    let start = remaining_to_skip;
-                    skipped_bytes = skip_bytes;
-                    leftover.extend_from_slice(&read_buf[start..n]);
-                } else {
-                    leftover.extend_from_slice(&read_buf[..n]);
-                }
-
-                let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
-                if aligned_len == 0 {
-                    continue;
-                }
-
-                let Some(processed) = pcm_processor.process_pcm_chunk(
-                    &mut leftover,
-                    frame_bytes,
-                    bit_depth,
-                    channels,
-                    &mut pcm_kind,
-                ) else {
-                    continue;
-                };
-                let mut samples = processed.samples;
-
-                // Detect all-zero samples (silence from decode failure)
-                if !first_data_logged || total_frames_fed == 0 {
-                    let non_zero = samples.iter().any(|&s| s != 0.0);
-                    if !non_zero && !samples.is_empty() {
-                        warn!(
-                            sample_count = samples.len(),
-                            "local_audio_first_samples_all_zero"
-                        );
-                    }
-                }
-
-                // #3233 : le porteur DoP ne survit pas a ce chemin — refuser
-                // AVANT que le premier echantillon parte au DAC.
-                if refuser_le_porteur_dop(processed.dop, sample_rate, channels) {
-                    if play_generation.load(Ordering::SeqCst) == my_generation {
-                        playing.store(false, Ordering::SeqCst);
-                    }
-                    return;
-                }
-                if needs_channel_adapt {
-                    samples = adapt_channels(&samples, channels, output_ch);
-                }
-                if needs_resample {
-                    samples = rubato_resample_chunk(
-                        &mut resampler,
-                        &samples,
-                        output_ch,
-                        false,
-                        &mut resample_leftover,
-                    );
-                }
-
-                let fed =
-                    feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
-                if !fed {
-                    // Wedge: the render callback stopped draining the ring
-                    // (dead stream after a USB DAC unplug on macOS, where no
-                    // error callback fires, #1626). Without this check the loop
-                    // stalled 5s on EVERY chunk while the position stood still.
-                    warn!(
-                        device = %device_name,
-                        total_bytes_read,
-                        "local_audio_stopped_feed_stall"
-                    );
-                    // …et sans celle-ci, il s'arrêtait SANS RIEN DIRE (#3108).
-                    // `device_gone` ne comble pas le trou : sur macOS le rappel
-                    // d'erreur cpal ne se déclenche jamais à l'arrachage, donc
-                    // le seul témoin est le blocage qu'on vient de constater.
-                    record_feed_stall_failure(
-                        "CPAL",
-                        &device_name,
-                        position_ms.load(Ordering::Relaxed),
-                        &open_failure,
-                    );
-                    break;
-                }
-
-                total_frames_fed += processed.source_frames;
-
-                // Start the cpal stream once enough data has been pre-filled.
-                // This ensures the audio device never pulls from an empty/sparse
-                // ring buffer, eliminating white noise at track start.
-                if !stream_started && ring.available() >= prefill_target {
                     if let Err(e) = stream.play() {
                         warn!(error = %e, "audio_stream_play_failed");
                         playing.store(false, Ordering::SeqCst);
-                        return;
+                        return false;
                     }
                     stream_started = true;
                     info!(
@@ -7887,20 +8192,29 @@ impl OutputTarget for LocalOutput {
 
                         device = %device_name,
                         prefill_samples = ring.available(),
-                        total_bytes_read,
+                        total_bytes_read = compteurs.total_bytes_read,
                         elapsed_ms = stream_start.elapsed().as_millis() as u64,
                         "local_audio_playing_after_prefill"
                     );
+                    true
+                },
+            );
+            total_bytes_read = compteurs.total_bytes_read;
+            total_frames_fed = compteurs.total_frames_fed;
+            match fin {
+                FinDeBoucle::FinDeFlux => http_eof = true,
+                FinDeBoucle::Interrompue => {}
+                FinDeBoucle::PorteurDopRefuse => {
+                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    return;
                 }
-
-                // Update position
-                let pos =
-                    (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64 + seek_offset;
-                position_ms.store(pos, Ordering::Relaxed);
+                FinDeBoucle::Abandon => return,
             }
 
             if http_eof {
-                report_incomplete_local_pcm_probe(pcm_kind, leftover.len());
+                report_incomplete_local_pcm_probe(etage.pcm_kind, etage.en_attente.len());
             }
 
             // If the stream was never started (very short track or error),
@@ -8041,15 +8355,15 @@ impl OutputTarget for LocalOutput {
                     new_sr,
                     new_ch,
                     new_bd,
-                    prev_sr = sample_rate,
-                    prev_ch = channels,
-                    prev_bd = bit_depth,
+                    prev_sr = etage.sample_rate,
+                    prev_ch = etage.channels,
+                    prev_bd = etage.bit_depth,
                     "local_audio_gapless_next_track_format"
                 );
 
-                let prev_sr = sample_rate;
-                let prev_ch = channels;
-                let prev_needs_resample = needs_resample;
+                let prev_sr = etage.sample_rate;
+                let prev_ch = etage.channels;
+                let prev_needs_resample = etage.needs_resample;
                 let next_needs_resample = output_sr != new_sr;
                 let convolver_format_changed = new_sr != prev_sr || new_ch != prev_ch;
 
@@ -8058,8 +8372,13 @@ impl OutputTarget for LocalOutput {
                 // même adaptation/rééchantillonnage que la piste qui se termine.
                 // À format identique on ne touche à rien : son état fait partie
                 // de la continuité gapless.
+                //
+                // `etage` porte encore le format de la piste QUI SE TERMINE —
+                // il n'est mis à jour que plus bas : `rendre_la_queue_du_dsp`
+                // applique donc exactement l'adaptation et le rééchantillonnage
+                // de cette piste-là, comme les quatre lignes qu'il remplace.
                 if convolver_format_changed {
-                    let mut queue = flush_local_dsp(
+                    let queue = flush_local_dsp(
                         &convolver,
                         &crossfeed,
                         &pure_bypass,
@@ -8067,21 +8386,7 @@ impl OutputTarget for LocalOutput {
                         prev_ch,
                         dop_active.load(Ordering::Relaxed),
                     );
-                    if !queue.is_empty() {
-                        if needs_channel_adapt {
-                            queue = adapt_channels(&queue, prev_ch, output_ch);
-                        }
-                        if prev_needs_resample {
-                            queue = rubato_resample_chunk(
-                                &mut resampler,
-                                &queue,
-                                output_ch,
-                                false,
-                                &mut resample_leftover,
-                            );
-                        }
-                        feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
-                    }
+                    etage.rendre_la_queue_du_dsp(&mut puits, queue);
                 }
 
                 // À cadence source identique, le resampler fait partie du flux
@@ -8093,36 +8398,34 @@ impl OutputTarget for LocalOutput {
                 // quand la requête suivante échouait.
                 if prev_needs_resample && (new_sr != prev_sr || !next_needs_resample) {
                     let flushed = rubato_resample_chunk(
-                        &mut resampler,
+                        &mut etage.resampler,
                         &[],
                         output_ch,
                         true,
-                        &mut resample_leftover,
+                        &mut etage.resample_leftover,
                     );
                     if !flushed.is_empty() {
-                        feed_ring_abortable(
-                            &ring,
-                            &flushed,
-                            &stop_rx,
-                            &paused,
-                            Some(&force_silent),
-                        );
+                        puits.ecrire(&flushed);
                     }
                 }
 
-                // Update source format variables for the new track
-                sample_rate = new_sr;
-                channels = new_ch;
-                bit_depth = new_bd;
+                // Update source format variables for the new track.
+                // Le format source vit dans `etage` : c'est lui, et lui seul,
+                // que la boucle producteur consulte pour décoder et convertir.
+                etage.sample_rate = new_sr;
+                etage.channels = new_ch;
+                etage.bit_depth = new_bd;
                 let new_bps = if new_bd == 0 {
                     4
                 } else {
                     (new_bd / 8) as usize
                 };
-                frame_bytes = new_ch as usize * new_bps;
-                needs_channel_adapt = output_ch != new_ch;
-                needs_resample = next_needs_resample;
-                pcm_kind = LocalPcmKind::for_bit_depth(new_bd);
+                etage.frame_bytes = new_ch as usize * new_bps;
+                etage.needs_channel_adapt = output_ch != new_ch;
+                etage.needs_resample = next_needs_resample;
+                etage.pcm_kind = LocalPcmKind::for_bit_depth(new_bd);
+                let sample_rate = etage.sample_rate;
+                let channels = etage.channels;
                 current_format.store(
                     LocalOutput::pack_format(sample_rate, channels),
                     Ordering::Relaxed,
@@ -8149,9 +8452,9 @@ impl OutputTarget for LocalOutput {
                 }
 
                 // Recreate the resampler if the source sample rate changed
-                if needs_resample && new_sr != prev_sr {
+                if etage.needs_resample && new_sr != prev_sr {
                     // Sample rate changed — flush old resampler residuals
-                    resample_leftover.clear();
+                    etage.resample_leftover.clear();
                     let ratio = output_sr as f64 / new_sr as f64;
                     let inv_ratio = 1.0 / ratio;
                     let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
@@ -8168,7 +8471,7 @@ impl OutputTarget for LocalOutput {
                         oversampling_factor,
                         window,
                     };
-                    resampler = match Async::<f32>::new_sinc(
+                    etage.resampler = match Async::<f32>::new_sinc(
                         ratio,
                         1.1,
                         &params,
@@ -8186,14 +8489,14 @@ impl OutputTarget for LocalOutput {
                         }
                         Err(e) => {
                             warn!(error = %e, "local_audio_gapless_resampler_failed");
-                            needs_resample = false;
+                            etage.needs_resample = false;
                             None
                         }
                     };
-                    resample_leftover.clear();
-                } else if !needs_resample && resampler.is_some() {
-                    resampler = None;
-                    resample_leftover.clear();
+                    etage.resample_leftover.clear();
+                } else if !etage.needs_resample && etage.resampler.is_some() {
+                    etage.resampler = None;
+                    etage.resample_leftover.clear();
                 }
 
                 // L'enchaînement est acquis : le flux suivant répond et porte un
@@ -8219,8 +8522,10 @@ impl OutputTarget for LocalOutput {
                 // Reset per-track counters
                 total_frames_fed = 0;
                 total_bytes_read = 0;
-                leftover.clear();
-                http_eof = false;
+                etage.en_attente.clear();
+                // `http_eof` n'est plus remis à zéro ici : la boucle producteur
+                // le repose à CHAQUE sortie, sans exception. Le laisser ferait
+                // croire qu'un chemin l'oublie.
 
                 // Process initial PCM data from the header read
                 let gapless_pcm = if new_data_offset < next_header.len() {
@@ -8228,152 +8533,82 @@ impl OutputTarget for LocalOutput {
                 } else {
                     Vec::new()
                 };
-                leftover.extend_from_slice(&gapless_pcm);
-                if let Some(processed) = pcm_processor.process_pcm_chunk(
-                    &mut leftover,
-                    frame_bytes,
-                    bit_depth,
-                    channels,
-                    &mut pcm_kind,
-                ) {
-                    let mut smp = processed.samples;
-                    // Même frontière que la piste initiale : la piste chaînée
-                    // conserve l'état du DSP mais prend une nouvelle décision
-                    // PCM/DoP avant son premier échantillon (#2296/#2232).
-                    // #3233 : le porteur DoP ne survit pas a ce chemin — refuser
-                    // AVANT que le premier echantillon parte au DAC.
-                    if refuser_le_porteur_dop(processed.dop, sample_rate, channels) {
+                etage.en_attente.extend_from_slice(&gapless_pcm);
+                // Même frontière que la piste initiale : la piste chaînée
+                // conserve l'état du DSP mais prend une nouvelle décision
+                // PCM/DoP avant son premier échantillon (#2296/#2232).
+                // #3233 : le porteur DoP ne survit pas a ce chemin — refuser
+                // AVANT que le premier echantillon parte au DAC.
+                let amorce_enchainee =
+                    etage.pousser(&mut puits, &mut refuser_le_porteur_dop, &mut |_| {});
+                match amorce_enchainee {
+                    PousseeVersLePuits::PorteurDopRefuse => {
                         if play_generation.load(Ordering::SeqCst) == my_generation {
                             playing.store(false, Ordering::SeqCst);
                         }
                         return;
                     }
-                    if needs_channel_adapt {
-                        smp = adapt_channels(&smp, channels, output_ch);
+                    // Comme l'amorce de la piste initiale : les trames sont
+                    // comptées sans regarder le verdict de l'écriture.
+                    PousseeVersLePuits::Poussee { trames_source }
+                    | PousseeVersLePuits::PuitsMort { trames_source } => {
+                        total_frames_fed += trames_source;
                     }
-                    if needs_resample {
-                        smp = rubato_resample_chunk(
-                            &mut resampler,
-                            &smp,
-                            output_ch,
-                            false,
-                            &mut resample_leftover,
-                        );
-                    }
-                    feed_ring_abortable(&ring, &smp, &stop_rx, &paused, Some(&force_silent));
-                    total_frames_fed += processed.source_frames;
+                    PousseeVersLePuits::RienAPousser => {}
                 }
 
-                // Main read loop for the gapless-chained track
+                // Main read loop for the gapless-chained track.
+                //
+                // La MÊME boucle que la piste initiale : seul le rôle change,
+                // et il ne choisit que les noms d'événement. C'est tout
+                // l'intérêt — #3108 avait dû être corrigé DEUX fois parce que
+                // ces deux boucles étaient deux copies.
+                let producteur_enchaine = BoucleProducteur {
+                    role: RoleDeLaBoucle::PisteEnchainee,
+                    device_name: &device_name,
+                    cle_de_flux,
+                    stop_rx: &stop_rx,
+                    force_silent: force_silent.as_ref(),
+                    device_gone: device_gone.as_ref(),
+                    position_ms: position_ms.as_ref(),
+                    open_failure: open_failure.as_ref(),
+                    debut_du_flux: std::time::Instant::now(),
+                };
                 let mut gapless_read_buf = vec![0u8; 65536];
-                loop {
-                    if stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed) {
-                        break;
+                let mut compteurs_enchaines = CompteursDePiste {
+                    total_bytes_read,
+                    total_frames_fed,
+                    seek_offset,
+                    // Une piste enchaînée repart de son début : rien à jeter.
+                    skip_bytes: 0,
+                    skipped_bytes: 0,
+                    premiere_donnee_journalisee: true,
+                };
+                let fin_enchainee = producteur_enchaine.tourner(
+                    &mut next_reader,
+                    &mut gapless_read_buf,
+                    &mut etage,
+                    &mut puits,
+                    &mut refuser_le_porteur_dop,
+                    &mut compteurs_enchaines,
+                    &mut |_| true,
+                );
+                total_bytes_read = compteurs_enchaines.total_bytes_read;
+                total_frames_fed = compteurs_enchaines.total_frames_fed;
+                match fin_enchainee {
+                    FinDeBoucle::FinDeFlux => http_eof = true,
+                    FinDeBoucle::Interrompue => http_eof = false,
+                    FinDeBoucle::PorteurDopRefuse => {
+                        if play_generation.load(Ordering::SeqCst) == my_generation {
+                            playing.store(false, Ordering::SeqCst);
+                        }
+                        return;
                     }
-                    // Device lost mid-chain (#1626): abort without signalling
-                    // a natural end, like the main read loop above.
-                    if device_gone.load(Ordering::Relaxed) {
-                        warn!(
-                            device = %device_name,
-                            total_bytes_read,
-                            "local_audio_gapless_stopped_device_lost"
-                        );
-                        http_eof = false;
-                        break;
-                    }
-                    match next_reader.read(&mut gapless_read_buf) {
-                        Ok(0) => {
-                            debug!(
-                                total_bytes_read,
-                                total_frames_fed, "local_audio_gapless_track_eof"
-                            );
-                            http_eof = true;
-                            break;
-                        }
-                        Ok(n) => {
-                            total_bytes_read += n as u64;
-                            leftover.extend_from_slice(&gapless_read_buf[..n]);
-                            if (leftover.len() / frame_bytes) * frame_bytes == 0 {
-                                continue;
-                            }
-                            let Some(processed) = pcm_processor.process_pcm_chunk(
-                                &mut leftover,
-                                frame_bytes,
-                                bit_depth,
-                                channels,
-                                &mut pcm_kind,
-                            ) else {
-                                continue;
-                            };
-                            let mut smp = processed.samples;
-                            // #3233 : le porteur DoP ne survit pas a ce chemin — refuser
-                            // AVANT que le premier echantillon parte au DAC.
-                            if refuser_le_porteur_dop(processed.dop, sample_rate, channels) {
-                                if play_generation.load(Ordering::SeqCst) == my_generation {
-                                    playing.store(false, Ordering::SeqCst);
-                                }
-                                return;
-                            }
-                            if needs_channel_adapt {
-                                smp = adapt_channels(&smp, channels, output_ch);
-                            }
-                            if needs_resample {
-                                smp = rubato_resample_chunk(
-                                    &mut resampler,
-                                    &smp,
-                                    output_ch,
-                                    false,
-                                    &mut resample_leftover,
-                                );
-                            }
-                            let fed = feed_ring_abortable(
-                                &ring,
-                                &smp,
-                                &stop_rx,
-                                &paused,
-                                Some(&force_silent),
-                            );
-                            if !fed {
-                                // Dead consumer (see main loop, #1626).
-                                warn!(
-                                    device = %device_name,
-                                    total_bytes_read,
-                                    "local_audio_gapless_stopped_feed_stall"
-                                );
-                                // Même canal que la boucle principale (#3108) :
-                                // une piste enchaînée qui meurt en silence est
-                                // aussi muette qu'une première piste.
-                                record_feed_stall_failure(
-                                    "CPAL",
-                                    &device_name,
-                                    position_ms.load(Ordering::Relaxed),
-                                    &open_failure,
-                                );
-                                http_eof = false;
-                                break;
-                            }
-                            total_frames_fed += processed.source_frames;
-                            let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0)
-                                as u64
-                                + seek_offset;
-                            position_ms.store(pos, Ordering::Relaxed);
-                        }
-                        Err(ref e)
-                            if e.kind() == std::io::ErrorKind::TimedOut
-                                || e.kind() == std::io::ErrorKind::WouldBlock =>
-                        {
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "local_audio_gapless_read_error");
-                            http_eof = true;
-                            break;
-                        }
-                    }
+                    FinDeBoucle::Abandon => return,
                 }
 
                 if http_eof {
-                    report_incomplete_local_pcm_probe(pcm_kind, leftover.len());
+                    report_incomplete_local_pcm_probe(etage.pcm_kind, etage.en_attente.len());
                 }
 
                 // If this track also reached clean EOF, loop back to check
@@ -8422,48 +8657,35 @@ impl OutputTarget for LocalOutput {
                 && !force_silent.load(Ordering::Relaxed)
                 && !device_gone.load(Ordering::Relaxed)
             {
-                let mut queue = flush_local_dsp(
+                let queue = flush_local_dsp(
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
                     &mono_downmix,
-                    channels,
+                    etage.channels,
                     dop_active.load(Ordering::Relaxed),
                 );
-                if !queue.is_empty() {
-                    if needs_channel_adapt {
-                        queue = adapt_channels(&queue, channels, output_ch);
-                    }
-                    if needs_resample {
-                        // La queue est d'abord un bloc normal. `flush = true`
-                        // ignore son argument `samples` et la jetterait.
-                        queue = rubato_resample_chunk(
-                            &mut resampler,
-                            &queue,
-                            output_ch,
-                            false,
-                            &mut resample_leftover,
-                        );
-                    }
-                    feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
-                }
+                // La queue est d'abord un bloc normal : elle traverse la MÊME
+                // conversion que l'audio qui la précède. `flush = true` ignore
+                // son argument `samples` et la jetterait.
+                etage.rendre_la_queue_du_dsp(&mut puits, queue);
             }
 
             // Flush the resampler: process any leftover frames + drain internal delay
             if http_eof
-                && needs_resample
+                && etage.needs_resample
                 && !force_silent.load(Ordering::Relaxed)
                 && !device_gone.load(Ordering::Relaxed)
             {
                 let flushed = rubato_resample_chunk(
-                    &mut resampler,
+                    &mut etage.resampler,
                     &[],
                     output_ch,
                     true,
-                    &mut resample_leftover,
+                    &mut etage.resample_leftover,
                 );
                 if !flushed.is_empty() {
-                    feed_ring_abortable(&ring, &flushed, &stop_rx, &paused, Some(&force_silent));
+                    puits.ecrire(&flushed);
                 }
             }
 
@@ -10174,3 +10396,6 @@ mod parc_lisible_sans_attendre_i3730;
 
 #[cfg(test)]
 mod pcm_materiel_a_la_resolution_i1655;
+
+#[cfg(test)]
+mod empreinte_du_puits_r1;

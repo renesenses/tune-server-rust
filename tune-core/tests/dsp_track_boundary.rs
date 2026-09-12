@@ -145,8 +145,13 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         .split("// ------- Open cpal device (shared mode) -------")
         .nth(1)
         .expect("le chemin cpal partagé doit rester identifiable");
+    // R1 (#2219) : le chemin partagé n'appelle plus `process_pcm_chunk` en
+    // ligne — il MONTE la frontière PCM commune dans son étage de conversion,
+    // et tout ce qui part au DAC traverse `etage.pousser`. L'exigence est la
+    // même, et elle est même plus forte : il n'existe plus qu'UNE route.
     assert!(
-        partage.contains("pcm_processor.process_pcm_chunk(")
+        partage.contains("pcm: LocalPcmProcessor {")
+            && partage.contains("etage.pousser(")
             && partage.contains("flush_local_dsp("),
         "cpal partagé doit traverser la frontière PCM commune puis drainer la fin de chaîne"
     );
@@ -161,6 +166,13 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
 ///
 /// Ce défaut est antérieur à #2290 — il ne venait pas du drainage, mais il ne
 /// se voyait pas tant que personne ne regardait la chaîne complète.
+///
+/// ⚠️ R1 (#2219) a supprimé la duplication que ce test comptait. Les deux
+/// sites existent toujours — amorce de la piste chaînée et boucle de lecture —
+/// mais ils ne recopient plus la chaîne : ils passent tous deux par
+/// `EtageDeConversion::pousser`, seule route vers le puits. On ne compte donc
+/// plus des copies, on verrouille la route UNIQUE : c'est strictement plus
+/// fort, parce qu'un troisième site ne pourrait pas la contourner.
 #[test]
 fn la_boucle_gapless_applique_le_dsp() {
     let src = source();
@@ -168,16 +180,41 @@ fn la_boucle_gapless_applique_le_dsp() {
     let debut = prod
         .find("local_audio_gapless_chaining_next_track")
         .expect("le point de chaînage gapless doit exister");
+    let gapless = &prod[debut..];
 
-    assert_eq!(
-        prod[debut..]
-            .matches("pcm_processor.process_pcm_chunk(")
-            .count(),
-        2,
-        "les deux sites de la boucle gapless — premier bloc et boucle \
-         principale — doivent traverser la frontière PCM qui applique le DSP, \
-         sinon une correction de pièce cesse de s'appliquer après la première \
-         piste d'un album (#2296/#2232)"
+    assert!(
+        gapless.contains("etage.pousser("),
+        "l'amorce de la piste chaînée doit traverser la frontière PCM qui \
+         applique le DSP, sinon une correction de pièce cesse de s'appliquer \
+         après la première piste d'un album (#2296/#2232)"
+    );
+    assert!(
+        gapless.contains("producteur_enchaine.tourner(") && gapless.contains("&mut etage,"),
+        "la boucle de lecture de la piste chaînée doit passer par le MÊME \
+         étage de conversion que la piste initiale (#2296/#2232)"
+    );
+
+    // La route elle-même : `pousser` décode par la frontière PCM commune —
+    // celle qui applique le DSP — avant d'écrire quoi que ce soit au puits.
+    let pousser = prod
+        .split("    fn pousser(")
+        .nth(1)
+        .and_then(|s| s.split("\n    }").next())
+        .expect("EtageDeConversion::pousser doit rester identifiable");
+    assert!(
+        pousser.contains("self.decoder()") && pousser.contains("puits.ecrire("),
+        "la seule route vers le puits doit décoder par la frontière PCM \
+         commune AVANT d'écrire (#2296/#2232)"
+    );
+    let decoder = prod
+        .split("    fn decoder(")
+        .nth(1)
+        .and_then(|s| s.split("\n    }").next())
+        .expect("EtageDeConversion::decoder doit rester identifiable");
+    assert!(
+        decoder.contains("process_pcm_chunk("),
+        "le décodage de l'étage doit rester la frontière PCM commune, celle \
+         qui applique le DSP (#2296/#2232)"
     );
 }
 
@@ -256,8 +293,9 @@ fn le_drainage_attend_la_fin_reelle_de_la_chaine() {
 fn le_gapless_preserve_le_resampler_si_la_cadence_ne_change_pas() {
     let src = source();
     let prod = production(&src);
+    // R1 (#2219) : le format source vit dans l'étage de conversion.
     let debut = prod
-        .find("let prev_sr = sample_rate")
+        .find("let prev_sr = etage.sample_rate")
         .expect("la transition doit mémoriser la cadence précédente");
     let fin = prod[debut..]
         .find("L'enchaînement est acquis")
@@ -342,10 +380,27 @@ fn aucun_vidage_du_resampleur_ne_recoit_d_echantillons() {
         reste = &apres[fin..];
     }
 
+    // R1 (#2219) : les quatre appels `flush = false` de `play_url` — amorce et
+    // boucle, pour la piste initiale comme pour la piste chaînée — étaient la
+    // MÊME ligne recopiée. Ils n'en font plus qu'un, dans
+    // `EtageDeConversion::convertir`. Le plancher descend donc de 6 à 3, et il
+    // ne peut pas devenir un vert contre rien : l'assertion suivante exige que
+    // l'unique appel non-vidage soit bien celui de l'étage, c'est-à-dire que
+    // la baisse vienne de la centralisation et non d'une branche perdue.
     assert!(
-        sites >= 6,
+        sites >= 3,
         "seulement {sites} appel(s) au resampler trouvé(s) : le test ne couvre \
          plus la chaîne locale"
+    );
+    let convertir = prod
+        .split("    fn convertir(")
+        .nth(1)
+        .and_then(|s| s.split("\n    }").next())
+        .expect("EtageDeConversion::convertir doit rester identifiable");
+    assert!(
+        convertir.contains("adapt_channels(") && convertir.contains("rubato_resample_chunk("),
+        "l'unique conversion source → sortie doit adapter les canaux PUIS \
+         rééchantillonner : c'est la ligne que les quatre sites recopiaient"
     );
     assert!(
         vidages >= 2,
