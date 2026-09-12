@@ -234,3 +234,11 @@ scripts/refonte/tests-nominatifs.sh releves          # sur Shrek
 Les inventaires de fonctions par fichier sont un `awk` d'une ligne sur les
 `fn` par indentation ; ils ne sont pas versionnés parce qu'ils se refont en
 une seconde et changent à chaque commit.
+
+## Suite : `play_url` après R6
+
+L'anatomie de `play_url` sur la tête de R6 (#3981), ses cinq chemins, les
+sites dupliqués par geste, la table de migration des trois bras exclusifs
+vers `PuitsNatif` (#3985), le trait backend esquissé pour REF-8 et les
+dix-sept gardes de texte qui lisent `local.rs` : voir
+[`carte-play-url-apres-r6.md`](carte-play-url-apres-r6.md) (12 septembre 2026).
