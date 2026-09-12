@@ -231,6 +231,19 @@ required-features = ["postgres"]
 name = "ajouts_recents_fenetre"
 path = "tests/ajouts_recents_fenetre.rs"
 
+# #3867 : l adresse ANNONCEE gouverne les URL que les taches de fond remettent a
+# un tiers. Trois sites de `background.rs` appelaient `get_local_ip()` brut, a
+# deux fonctions d un annonceur SSDP qui, lui, respecte `advertised_ip`. Le
+# temoin garde les deux sites corriges ET l abstention des deux autres.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Posee ICI, au milieu du fichier, et non a la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent a chaque fois.
+[[test]]
+name = "adresse_annoncee_taches_de_fond_3867"
+path = "tests/adresse_annoncee_dans_les_taches_de_fond_3867.rs"
+
 # #3839 : l ecran Ambiance ne pouvait pas dire que la tour texte du CLAP est
 # anglaise et que la traduction depend d une cle IA — le client ne voit aucune
 # cle. Le statut acoustique le porte desormais. Sans cette cible, `autotests =
