@@ -586,6 +586,31 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // pas via un `CAST(... AS INTEGER)` : `track_metadata.value` est partagée
     // par toutes les clés, et un CAST y ferait tomber la requête entière sur
     // PostgreSQL dès qu'une valeur non numérique existe ailleurs dans la table.
+    // 🔴 PISTES CUE : ÉCARTÉES À DESSEIN, ET PAS PAR OUBLI.
+    //
+    // Une piste découpée par une feuille CUE porte `file_path = NULL` par
+    // construction ; `t.file_path IS NOT NULL` l'exclut donc. Contrairement à
+    // la pochette (`library::artwork`), à l'empreinte acoustique
+    // (`audio::embedding_store::candidats_acoustiques`), au dédoublonnage et
+    // aux playlists de dossier — tous corrigés — la retomber ici sur
+    // `cue_media_path` FERAIT DES DÉGÂTS : `mesurer_intensite_et_plage` ne
+    // prend qu'un chemin et mesure le fichier ENTIER depuis 0 s. Les quinze
+    // pistes d'une même image recevraient le gain, le pic et la plage
+    // dynamique de tout le disque — quinze valeurs identiques, présentées
+    // comme mesurées piste par piste, et un niveau de lecture faux sur
+    // chacune.
+    //
+    // Ce qu'il faudrait d'abord : une mesure BORNÉE
+    // (`mesurer_intensite_et_plage(chemin, debut_s, fin_s)`). Sa boucle
+    // décode déjà par segments de 30 s avec un `seek` — la borner est
+    // mécanique — mais c'est un chantier d'analyseur, avec sa propre garde
+    // sur du vrai signal. Tant qu'il n'existe pas, une piste CUE sans
+    // ReplayGain vaut mieux qu'une piste CUE au mauvais ReplayGain.
+    //
+    // Les deux autres sélections de ce module (`CANDIDATS_EMPREINTE_WHERE`,
+    // `CANDIDATS_DR_WHERE`) sont EN AVAL de celle-ci : elles exigent le témoin
+    // `rg_analyzed`, que seule cette passe pose. Les élargir sans elle ne
+    // sélectionnerait rien.
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
     let rows = match backend.query_many(
         "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels FROM tracks t \
@@ -889,6 +914,16 @@ async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin
 /// compteur (BIB-B2 phase D) : deux textes finiraient par diverger, et la
 /// couverture annoncée ne serait plus celle que le rattrapage traite.
 /// Paramètres, dans l'ordre : motif `VERSION:%`, seuil de report.
+///
+/// 🔴 `t.file_path IS NOT NULL` écarte les pistes CUE, à dessein — deux fois
+/// plutôt qu'une. D'abord parce que ce prédicat exige `rg_analyzed`, que seule
+/// [`analyze_track_batch`] pose et qui n'atteint pas les pistes CUE : élargir
+/// ici ne sélectionnerait rien. Ensuite parce qu'une empreinte prise sur
+/// l'image entière serait IDENTIQUE pour toutes les pistes du disque, et que
+/// `library::duplicate_detector::scan_fingerprint_duplicates` regroupe
+/// justement sur l'empreinte : les quinze pistes seraient proposées à la
+/// suppression les unes contre les autres. Voir le commentaire de
+/// [`analyze_track_batch`].
 const CANDIDATS_EMPREINTE_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' \
            AND (t.audio_fingerprint IS NULL OR t.audio_fingerprint NOT LIKE ?) \
            AND EXISTS (SELECT 1 FROM track_metadata m \
@@ -1012,6 +1047,10 @@ const DR_INDISPONIBLE_KEY: &str = "dr_indisponible";
 /// * un report de chemin encore frais (#1865).
 ///
 /// Paramètre : le seuil de report.
+///
+/// 🔴 Les pistes CUE sont hors de ce prédicat, à dessein : il exige
+/// `rg_analyzed` ou `rg_track_gain`, et la plage dynamique se mesure sur le
+/// MÊME décodage non borné que le ReplayGain. Voir [`analyze_track_batch`].
 const CANDIDATS_DR_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' \
            AND EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key IN ('rg_analyzed', 'rg_track_gain')) \
