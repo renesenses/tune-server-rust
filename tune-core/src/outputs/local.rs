@@ -6298,6 +6298,39 @@ impl OutputTarget for LocalOutput {
             };
             let frame_bytes = channels as usize * bytes_per_sample;
 
+            // Le format source devient un TYPE, ici et une seule fois — AVANT
+            // les branches de plateforme, parce que les quatre chemins en ont
+            // besoin. Le poser plus bas, dans le seul chemin cpal partagé,
+            // laissait le bras exclusif macOS passer des nombres nus : la
+            // compilation macOS l'a dit au premier essai, et elle avait raison.
+            //
+            // Le refus est inatteignable en pratique — `parse_wav_header` ne
+            // rend que 0, 16, 24 ou 32 bits, et un conteneur nul le fait déjà
+            // échouer — mais il remplace deux fins de partie bien pires :
+            // `bit_depth / 8` sur une profondeur inconnue rendait un nombre
+            // d'octets faux (bruit blanc), et zéro canal faisait DIVISER PAR
+            // ZÉRO le calcul d'alignement, qui abattait le fil de lecture.
+            let Some(spec) = AudioSpec::depuis_entete(sample_rate, bit_depth, channels) else {
+                warn!(
+                    device = %device_name,
+                    sample_rate,
+                    bit_depth,
+                    channels,
+                    "local_audio_unsupported_source_format"
+                );
+                if let Ok(mut slot) = open_failure.lock() {
+                    // #3270 : un `return` nu laisse la zone s'arrêter sans que
+                    // l'écran apprenne jamais pourquoi.
+                    *slot = Some(format!(
+                        "« {device_name} » : ce flux annonce un format que Tune ne sait pas \
+                         lire ({bit_depth} bits, {channels} canaux)."
+                    ));
+                }
+                force_silent.store(true, Ordering::SeqCst);
+                playing.store(false, Ordering::SeqCst);
+                return;
+            };
+
             // ------- Exclusive mode path (macOS only) -------
             #[cfg(target_os = "macos")]
             if exclusive_mode {
@@ -6385,13 +6418,9 @@ impl OutputTarget for LocalOutput {
                 // rappel de rendu ne tire rien, et la position reste sur 2 000
                 // ms pour toujours — sans un mot.
                 let mut feed_stalled = false;
-                if let Some(processed) = pcm_processor.process_pcm_chunk(
-                    &mut leftover,
-                    frame_bytes,
-                    bit_depth,
-                    channels,
-                    &mut pcm_kind,
-                ) {
+                if let Some(processed) =
+                    pcm_processor.process_pcm_chunk(&mut leftover, spec, &mut pcm_kind)
+                {
                     if !feed_ring_abortable(
                         &ring,
                         &processed.samples,
@@ -6441,13 +6470,9 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
 
-                    let Some(processed) = pcm_processor.process_pcm_chunk(
-                        &mut leftover,
-                        frame_bytes,
-                        bit_depth,
-                        channels,
-                        &mut pcm_kind,
-                    ) else {
+                    let Some(processed) =
+                        pcm_processor.process_pcm_chunk(&mut leftover, spec, &mut pcm_kind)
+                    else {
                         continue;
                     };
 
@@ -8081,33 +8106,6 @@ impl OutputTarget for LocalOutput {
             // Le tampon d'attente est amorcé avec le reliquat non aligné de la
             // lecture d'en-tête : sans lui, chaque mot 24 bits suivant serait lu
             // au mauvais décalage d'octet (bruit blanc).
-            // Le format source devient un TYPE, ici et une seule fois. Le
-            // refus est inatteignable en pratique — `parse_wav_header` ne rend
-            // que 0, 16, 24 ou 32 bits, et un conteneur nul le fait déjà
-            // échouer — mais il remplace deux fins de partie bien pires :
-            // `bit_depth / 8` sur une profondeur inconnue rendait un nombre
-            // d'octets faux (bruit blanc), et zéro canal faisait diviser par
-            // zéro le calcul d'alignement (le fil de lecture abattu).
-            let Some(spec) = AudioSpec::depuis_entete(sample_rate, bit_depth, channels) else {
-                warn!(
-                    device = %device_name,
-                    sample_rate,
-                    bit_depth,
-                    channels,
-                    "local_audio_unsupported_source_format"
-                );
-                if let Ok(mut slot) = open_failure.lock() {
-                    // #3270 : un `return` nu laisse la zone s'arrêter sans que
-                    // l'écran apprenne jamais pourquoi.
-                    *slot = Some(format!(
-                        "« {device_name} » : ce flux annonce un format que Tune ne sait pas \
-                         lire ({bit_depth} bits, {channels} canaux)."
-                    ));
-                }
-                force_silent.store(true, Ordering::SeqCst);
-                playing.store(false, Ordering::SeqCst);
-                return;
-            };
             let mut etage = EtageDeConversion {
                 pcm: LocalPcmProcessor {
                     eq: &eq,
