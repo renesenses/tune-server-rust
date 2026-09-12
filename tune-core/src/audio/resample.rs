@@ -13,10 +13,124 @@ use tracing::{info, warn};
 
 use super::simple_resample;
 
+// ───────────────────────── le choix du noyau sinc ─────────────────────────
+//
+// Ce qui était faux, et pourquoi (D1 du banc T10, #2218)
+// ------------------------------------------------------
+// Le noyau était choisi sur le RAPPORT des cadences (`inv_ratio > 4` → 512,
+// `> 2` → 256, sinon 128), et sa coupure venait de `calculate_cutoff`. Les
+// deux décisions se trompaient de grandeur.
+//
+// La largeur de transition d'un noyau sinc est fixée par sa DURÉE, soit
+// `sinc_len / from_sr` : elle vaut donc `K · from_sr / sinc_len` hertz, quel
+// que soit le rapport. Et la bande utile disponible est bornée par la plus
+// BASSE des deux cadences, pas par leur rapport. Or c'est à 44,1 kHz que la
+// contrainte est la plus dure de tout l'audio : 20 kHz occupent 90,7 % de
+// Nyquist, il ne reste que 2 050 Hz pour toute la transition. Un rapport
+// proche de 1 — 44,1 → 48 — tombait donc dans la branche « 128 », la plus
+// courte, exactement là où il fallait la plus longue.
+//
+// Mesuré sur Shrek le 13/09 (banc T10, `releve_de_tous_les_rapports`) :
+//
+//   rapport         AVANT (BH², 128/256/512)   APRÈS (Blackman², 256/512)
+//   44,1 → 48       −10,31 dB · 18 550 Hz      −0,00 dB · 20 750 Hz
+//   48 → 44,1        −9,90 dB · 18 450 Hz      −0,00 dB · 20 700 Hz
+//   44,1 → 96       −10,31 dB · 18 550 Hz      −0,00 dB · 20 750 Hz
+//   96 → 48          −0,92 dB · 18 950 Hz      −0,00 dB · 22 050 Hz
+//   44,1 → 192      −10,31 dB · 18 550 Hz      −0,00 dB · 20 750 Hz
+//   176,4 → 48       −0,03 dB · 20 400 Hz      −0,00 dB · 21 150 Hz
+//   192 → 44,1       −0,04 dB · 20 200 Hz      −0,00 dB · 20 600 Hz
+//
+// (gain à 20 kHz · bande à −0,1 dB ; réjection après le correctif : −111 à
+// −146 dB, toujours au-delà des 100 dB visés.)
+//
+// La fenêtre : Blackman au carré, pas Blackman-Harris au carré
+// -------------------------------------------------------------
+// À longueur ÉGALE, Blackman² transite plus vite (sa constante de coupure
+// vaut 9,51 contre 13,75) pour un plancher de lobes secondaires qui reste
+// sous −110 dB. Mesuré à 256 coefficients sur 44,1 → 48 : Blackman² rend
+// 20 750 Hz et −116,4 dB de réjection, Blackman-Harris² 20 300 Hz et
+// −115,8 dB. Même coût, 450 Hz de bande utile en plus, même réjection.
+
+/// La fenêtre du noyau. Voir la note ci-dessus : Blackman² est le meilleur
+/// compromis transition / réjection à longueur donnée pour la contrainte de
+/// 44,1 kHz.
+const FENETRE: WindowFunction = WindowFunction::Blackman2;
+
+/// Les longueurs de noyau proposées, de la moins chère à la plus chère. On
+/// prend la PREMIÈRE qui tient la promesse : un noyau plus long coûte du CPU
+/// dans le chemin du producteur, en temps réel.
+///
+/// Le barème monte jusqu'à 1 024 à cause de deux couples seulement — 352,8 et
+/// 384 → 44,1 kHz, c'est-à-dire le PCM de DSD256 servi à une zone à la cadence
+/// du CD. Ce sont les plus durs du jeu : Nyquist bas à 22,05 kHz (donc 2 050 Hz
+/// pour toute la transition) ET un noyau qui, à 352,8 kHz d'entrée, ne dure que
+/// 1,45 ms à 512 coefficients. 512 y rend 19 698 Hz — sous la promesse.
+/// `le_choix_du_noyau_suit_la_cadence_la_plus_basse` a trouvé ce trou ; il
+/// n'avait été mesuré par aucun des sept rapports du banc T10.
+const NOYAUX: [usize; 4] = [128, 256, 512, 1024];
+
+/// La bande à −0,1 dB visée, marge comprise : 20 kHz est ce que le produit
+/// promet, les 500 Hz au-dessus sont la marge qui empêche un arrondi de
+/// cadence de faire retomber un rapport sous le seuil.
+const BANDE_CIBLE_HZ: f64 = 20_500.0;
+
+/// Distance mesurée entre la coupure du noyau et son point à −0,1 dB,
+/// exprimée en échantillons d'ENTRÉE (la transition vaut
+/// `TRANSITION · from_sr / sinc_len` hertz).
+///
+/// Ce n'est pas un réglage : c'est une constante de la fenêtre, relevée sur
+/// le banc T10. Elle prédit les sept rapports mesurés à moins de 40 Hz près,
+/// et `le_choix_du_noyau_suit_la_cadence_la_plus_basse` la reverrouille.
+const TRANSITION: f64 = 2.82;
+
+/// Nombre de phases de la table sinc. Inchangé : le porter à 512 gagne 7 à
+/// 10 dB de réjection sur les montées (mesuré : −126,2 dB au lieu de
+/// −116,4 dB en 44,1 → 48) mais double la table, et Tune tourne aussi sur des
+/// Raspberry Pi où 512 Kio de table balayée à chaque échantillon coûteraient
+/// plus que les 10 dB ne valent — la réjection est déjà au-delà des 100 dB.
+const SUR_ECHANTILLONNAGE: usize = 256;
+
+/// La bande à −0,1 dB qu'un noyau de `sinc_len` coefficients rend pour ce
+/// couple de cadences, en hertz.
+///
+/// Deux termes, et deux grandeurs différentes : la coupure est relative à la
+/// plus BASSE des deux cadences (rubato met la sienne à l'échelle du rapport
+/// en descente), la transition est relative à la cadence d'ENTRÉE, parce
+/// qu'elle est fixée par la durée du noyau.
+fn bande_a_moins_0_1_db(sinc_len: usize, from_sr: u32, to_sr: u32) -> f64 {
+    let nyquist_bas = 0.5 * from_sr.min(to_sr) as f64;
+    let coupure: f64 = calculate_cutoff(sinc_len, FENETRE);
+    coupure * nyquist_bas - TRANSITION * from_sr as f64 / sinc_len as f64
+}
+
+/// Les paramètres sinc que Tune emploie pour aller de `from_sr` à `to_sr`.
+///
+/// Publique parce que le banc T10 (`reechantillonnage_reference_2218.rs`) doit
+/// mesurer le noyau RÉELLEMENT choisi : il en tenait sa propre copie du
+/// barème, qui pouvait diverger sans que rien ne rougisse.
+pub fn parametres_sinc(from_sr: u32, to_sr: u32) -> SincInterpolationParameters {
+    let sinc_len = NOYAUX
+        .iter()
+        .copied()
+        .find(|&n| bande_a_moins_0_1_db(n, from_sr, to_sr) >= BANDE_CIBLE_HZ)
+        .unwrap_or(NOYAUX[NOYAUX.len() - 1]);
+    SincInterpolationParameters {
+        sinc_len,
+        f_cutoff: calculate_cutoff(sinc_len, FENETRE),
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: SUR_ECHANTILLONNAGE,
+        window: FENETRE,
+    }
+}
+
 /// Build the stateful sinc resampler used by progressive PCM pipelines.
 ///
 /// Callers that promise an exact output rate must propagate this error: using
 /// source-rate samples after announcing `to_sr` would corrupt speed and pitch.
+///
+/// C'est le SEUL constructeur de rééchantillonneur du dépôt : la sortie locale
+/// en tenait deux copies, restées aux 32/64 coefficients d'avant #2711.
 pub fn new_streaming_resampler(
     from_sr: u32,
     to_sr: u32,
@@ -28,26 +142,14 @@ pub fn new_streaming_resampler(
         ));
     }
     let ratio = to_sr as f64 / from_sr as f64;
-    let inv_ratio = 1.0 / ratio;
-    // A fixed short kernel makes the transition band wider in output-Hz as
-    // the decimation ratio grows. At the former 32/64 taps, 48 -> 44.1 kHz
-    // was already down 10.4 dB at 18 kHz (#2711). Scale the kernel at the
-    // supported rate boundaries so every path remains within 0.1 dB there.
-    let (sinc_len, oversampling_factor) = if inv_ratio > 4.0 {
-        (512_usize, 256_usize)
-    } else if inv_ratio > 2.0 {
-        (256_usize, 256_usize)
-    } else {
-        (128_usize, 256_usize)
-    };
-    let window = WindowFunction::BlackmanHarris2;
-    let params = SincInterpolationParameters {
-        sinc_len,
-        f_cutoff: calculate_cutoff(sinc_len, window),
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor,
-        window,
-    };
+    let params = parametres_sinc(from_sr, to_sr);
+    info!(
+        from_sr,
+        to_sr,
+        sinc_len = params.sinc_len,
+        f_cutoff = params.f_cutoff,
+        "sinc_resampler_params"
+    );
     Async::<f32>::new_sinc(
         ratio,
         1.1,
@@ -392,6 +494,67 @@ mod tests {
     const PRODUCT_PCM_SAMPLE_RATES: [u32; 8] = [
         44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
     ];
+
+    /// D1 de T10 (#2218) : le noyau se choisit sur la CADENCE LA PLUS BASSE,
+    /// pas sur le rapport.
+    ///
+    /// Le barème d'avant lisait `inv_ratio` : 44,1 → 48 (rapport 0,92) tombait
+    /// dans la branche la plus courte, alors que c'est le couple le plus
+    /// exigeant de tout le jeu — 20 kHz y occupent 90,7 % de Nyquist. Deux
+    /// choses sont verrouillées ici : la bande tenue sur TOUT le jeu de
+    /// cadences du produit, et le fait qu'on ne paie pas un coefficient de
+    /// plus que nécessaire.
+    #[test]
+    fn le_choix_du_noyau_suit_la_cadence_la_plus_basse() {
+        for de in PRODUCT_PCM_SAMPLE_RATES {
+            for vers in PRODUCT_PCM_SAMPLE_RATES {
+                if de == vers {
+                    continue;
+                }
+                let n = parametres_sinc(de, vers).sinc_len;
+                assert!(
+                    NOYAUX.contains(&n),
+                    "{de} → {vers} : noyau {n} hors du barème {NOYAUX:?}"
+                );
+                let bande = bande_a_moins_0_1_db(n, de, vers);
+                assert!(
+                    bande >= 20_000.0,
+                    "{de} → {vers} : noyau {n}, bande à −0,1 dB = {bande:.0} Hz — \
+                     Tune promet 20 kHz"
+                );
+                // Le noyau retenu est le PREMIER qui tient : celui d'avant lui
+                // dans le barème ne doit pas tenir, sinon on paie pour rien.
+                if let Some(precedent) = NOYAUX.iter().copied().take_while(|&c| c < n).last() {
+                    assert!(
+                        bande_a_moins_0_1_db(precedent, de, vers) < BANDE_CIBLE_HZ,
+                        "{de} → {vers} : le noyau {precedent} suffisait, {n} coûte \
+                         du CPU pour rien"
+                    );
+                }
+            }
+        }
+
+        // Les deux cas qui ont motivé le correctif, nommément.
+        assert_eq!(
+            parametres_sinc(44_100, 48_000).sinc_len,
+            256,
+            "44,1 → 48 kHz est le couple le plus exigeant : il lui faut 256 \
+             coefficients, il en recevait 128"
+        );
+        assert_eq!(
+            parametres_sinc(192_000, 44_100).sinc_len,
+            512,
+            "192 → 44,1 kHz : Nyquist bas à 22,05 kHz ET noyau court en temps"
+        );
+        assert_eq!(
+            parametres_sinc(352_800, 44_100).sinc_len,
+            1_024,
+            "352,8 → 44,1 kHz (PCM de DSD256 vers une zone à la cadence du CD) \
+             est le couple le plus dur du jeu : 512 coefficients n'y rendent que \
+             19 698 Hz. Aucun des sept rapports du banc T10 ne le mesure — \
+             c'est cette boucle qui l'a trouvé"
+        );
+    }
 
     /// 1 s of a 440 Hz sine, stereo interleaved, at `sr`.
     fn sine_stereo(sr: u32) -> Vec<f32> {
