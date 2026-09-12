@@ -16,6 +16,8 @@ pub mod decode_progress;
 pub mod dff;
 #[cfg(test)]
 mod dop_porteur_bout_en_bout;
+#[cfg(test)]
+mod dsd_ordre_canaux_et_phase;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
