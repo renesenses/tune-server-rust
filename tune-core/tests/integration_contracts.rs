@@ -9,6 +9,10 @@ mod alac_aiff_wav_empreintes_reference;
 mod aucune_fuite_de_temporaires;
 #[path = "audio_integration.rs"]
 mod audio_integration;
+// Refuse tout nouveau fabricant de fichier dans audio_integration.rs qui
+// n'annoncerait pas où la justesse du PCM de son format est prouvée (#2218, T5).
+#[path = "audio_integration_perimetre_2218.rs"]
+mod audio_integration_perimetre_2218;
 #[path = "crossfade_pas_de_rampe_de_volume.rs"]
 mod crossfade_pas_de_rampe_de_volume;
 #[path = "dsd_empreintes_reference.rs"]
