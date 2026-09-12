@@ -100,6 +100,13 @@ mod http_client_seam;
 // jamais cette frontière-là.
 #[path = "import_roon_multipart_3914.rs"]
 mod import_roon_multipart_3914;
+// #3914 (R4, R5) : `?preview=` n'etait lu par personne — cliquer sur
+// « apercu » lancait un import REEL — et le suivi de tache ne rendait aucun
+// des champs d'`ImportReport` que l'ecran lit. Meme raison qu'au-dessus de
+// passer par la ROUTE : le temoin decisif est `SELECT COUNT(*) FROM tracks`,
+// pris de part et d'autre de l'appel.
+#[path = "import_apercu_et_rapport_3914.rs"]
+mod import_apercu_et_rapport_3914;
 #[path = "integration.rs"]
 mod integration;
 #[path = "journal_pcm_alsa_ouvert.rs"]
