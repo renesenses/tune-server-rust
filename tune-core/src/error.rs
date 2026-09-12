@@ -26,6 +26,26 @@ pub enum TuneError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// Le service a répondu — en refusant. **Ce n'est pas une panne.**
+    ///
+    /// « Bandcamp ne fournit pas de playlists » n'est pas « la passerelle est
+    /// en panne » : la frontière HTTP doit pouvoir les distinguer, et un
+    /// message libre rangé dans [`TuneError::Other`] ne le permet pas.
+    ///
+    /// 🔴 #859 — mesuré sur le .18 le 12/09/2026 :
+    /// `GET /api/v1/streaming/bandcamp/playlists` sortait en **502 Bad
+    /// Gateway** en 4 ms, corps « Bandcamp ne fournit pas de playlists ».
+    /// Quatre millisecondes : aucun aller-retour réseau n'avait eu lieu. Un
+    /// testeur lisait « Bad Gateway » et signalait une panne serveur ; on
+    /// cherchait une passerelle qui n'avait jamais été sollicitée.
+    ///
+    /// Porte le refus DÉLIBÉRÉ d'un connecteur : la fonctionnalité n'existe
+    /// pas chez ce service, la requête était pourtant recevable. Le texte
+    /// reste celui du refus, sans préfixe — le corps de la réponse HTTP ne
+    /// change pas d'un octet, seul son statut change.
+    #[error("{0}")]
+    Unsupported(String),
+
     #[error("{0}")]
     Other(String),
 }

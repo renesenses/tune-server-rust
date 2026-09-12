@@ -38,8 +38,13 @@
 //! - **Playlists** : Bandcamp n'en a pas. `get_playlist`, `get_playlist_tracks`
 //!   et `get_user_playlists` rendent une erreur qui le nomme. C'est aussi
 //!   pourquoi `POST /zones/{id}/play` avec `streaming_playlist_id` +
-//!   `source: "bandcamp"` répondra 502 « Bandcamp n'a pas de playlists » au
+//!   `source: "bandcamp"` répondra « Bandcamp ne fournit pas de playlists » au
 //!   lieu du 400 `unknown service` d'avant : l'échec est NOMMÉ.
+//!
+//!   🔴 #859 — ce refus est un [`TuneError::Unsupported`], et la frontière
+//!   HTTP le sort en **501 Not Implemented**. Il sortait en **502 Bad
+//!   Gateway**, ce qui envoyait chercher une passerelle en panne alors
+//!   qu'aucun aller-retour réseau n'avait eu lieu (mesuré en 4 ms sur le .18).
 //! - **Pistes de recherche** : `autocomplete_elastic` ne rend aucune URL de
 //!   flux. Une `StreamTrack` bâtie dessus aurait un `id` injouable ;
 //!   [`BandcampService::search`] ne rend donc que des albums et des artistes,
@@ -253,8 +258,13 @@ pub(crate) fn artistes_de_recherche(resultats: &[Value]) -> Vec<StreamArtist> {
 /// Une fonction et non un `Err("…")` répété : le refus doit se lire pareil
 /// partout, et surtout ne jamais être confondu avec « le service a répondu et
 /// n'a rien ».
+///
+/// 🔴 #859 — [`TuneError::Unsupported`] et non `TuneError::from` : la
+/// frontière HTTP ne pouvait pas distinguer ce refus d'une panne d'amont, et
+/// le sortait en **502 Bad Gateway**. Le texte ne change pas ; c'est la
+/// VARIANTE qui porte désormais l'information, et elle seule.
 fn hors_portee(quoi: &str) -> TuneError {
-    TuneError::from(format!("Bandcamp ne fournit pas {quoi}"))
+    TuneError::Unsupported(format!("Bandcamp ne fournit pas {quoi}"))
 }
 
 /// L'échec de résolution d'un album, dit au registre.
@@ -523,16 +533,18 @@ impl StreamingService for BandcampService {
     /// pourquoi, et où le geste existe vraiment.
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let _ = (fav_type, item_id);
-        Err(TuneError::from(
+        Err(TuneError::Unsupported(
             "Bandcamp : ajouter un favori demande une session d'achat, que Tune n'a pas. \
-             La liste de souhaits se modifie sur bandcamp.com ; Tune la lit.",
+             La liste de souhaits se modifie sur bandcamp.com ; Tune la lit."
+                .into(),
         ))
     }
     async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let _ = (fav_type, item_id);
-        Err(TuneError::from(
+        Err(TuneError::Unsupported(
             "Bandcamp : retirer un favori demande une session d'achat, que Tune n'a pas. \
-             La liste de souhaits se modifie sur bandcamp.com ; Tune la lit.",
+             La liste de souhaits se modifie sur bandcamp.com ; Tune la lit."
+                .into(),
         ))
     }
 
@@ -814,6 +826,29 @@ mod tests {
             );
         }
     }
+    /// 🔴 #859 — le refus doit être TYPÉ, pas seulement bien rédigé.
+    ///
+    /// L'essai ci-dessus fige le TEXTE. Celui-ci fige la VARIANTE, qui est ce
+    /// que la frontière HTTP lit pour choisir son statut : reposer
+    /// `TuneError::from` dans [`hors_portee`] ne changerait pas un octet du
+    /// message, et ferait silencieusement ressortir
+    /// `GET /api/v1/streaming/bandcamp/playlists` en 502 Bad Gateway — le
+    /// défaut mesuré sur le .18 le 12/09/2026, en 4 ms, sans un octet de
+    /// réseau.
+    #[tokio::test]
+    async fn le_refus_hors_portee_est_type_et_pas_seulement_redige() {
+        let svc = service_de_test();
+        let erreur = svc
+            .get_user_playlists()
+            .await
+            .expect_err("Bandcamp n'a pas de playlists");
+        assert_eq!(erreur.to_string(), "Bandcamp ne fournit pas de playlists");
+        assert!(
+            matches!(erreur, TuneError::Unsupported(_)),
+            "un refus delibere n'est pas une panne d'amont : {erreur:?}"
+        );
+    }
+
     fn service_de_test() -> BandcampService {
         let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
