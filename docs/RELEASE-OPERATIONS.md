@@ -1,279 +1,315 @@
-# Release operations — runbook
+# Opérations de release — runbook
 
-How to ship a release with the autonomy tooling shipped in v0.8.28.
-Every step is meant to be runnable by a single maintainer without
-coordination, and to be reversible if something goes wrong.
+Ce runbook décrit le circuit courant des quatre dépôts Tune. La doctrine et
+les responsabilités sont fixées dans
+[`tune-gouvernance/regles/RELEASE.md`](https://github.com/renesenses/tune-gouvernance/blob/main/regles/RELEASE.md).
 
-References:
-- Plan : [RELEASE-AUTONOMY-v0.9.50.md](RELEASE-AUTONOMY-v0.9.50.md)
-- Workflows : `.github/workflows/{preflight,changelog,release,docker,rollback}.yml`
-- CLI : `tune release …`
+`release/v0.9`, les tags manuels et la publication directe appartiennent à
+l'ancien circuit. Ne jamais exécuter `git tag` ou `git push --tags` pour une
+release normale.
 
-## TL;DR
+## Vue d'ensemble
 
-```bash
-# 1. Bump version
-tune release bump patch --apply        # or minor / major
+```mermaid
+flowchart LR
+    MAIN0["main — base du train"] -->|"création puis réconciliation par PR"| RC["rc/vX.Y.Z"]
+    WORK["fix/* ou feat/*"] -->|"PR + tests ciblés"| BATCH["batch/* optionnelle"]
+    WORK -->|"PR directe autorisée"| RC
+    BATCH -->|"merge commit"| RC
+    RC -->|"PR + gates complets + merge commit"| MAIN1["main — arbre publié"]
+    MAIN1 -->|"contrôleur en dry-run"| STOP1{{"STOP 1 — accord JP"}}
+    STOP1 -->|"fenêtre de tags"| TAGS["tags web · Universal · OS · serveur"]
+    TAGS -->|"build une fois"| STAGING["releases draft + Docker staging"]
+    STAGING -->|"promotion en dry-run"| STOP2{{"STOP 2 — accord JP"}}
+    STOP2 -->|"promotion unique"| PUBLIC["GitHub · Docker · Homebrew · Tune OS"]
 
-# 2. Commit and tag
-git add Cargo.toml Cargo.lock
-git commit -m "bump v0.8.NN"
-git tag v0.8.NN
-git push origin main --tags
-
-# 3. Watch all five workflows go green
-gh run list --limit 6
-
-# 4. Review and merge the generated tag -> main PR with a merge commit
-#    (never squash/rebase; the workflow never arms auto-merge)
-
-# 5. If something breaks, roll back via the dispatch workflow
-gh workflow run rollback.yml \
-  --field version=v0.8.NN \
-  --field previous_version=v0.8.27 \
-  --field apply=true
+    LEGACY["release/v0.9 — gelée, hors circuit"]
 ```
 
-Everything else is described below.
+### Vue Git — plan de métro
 
-## 1. Pre-flight checks
+Ce graphe superpose le trajet commun des quatre dépôts sur trois trains. Les
+libellés courts gardent les lignes lisibles : `clients` désigne web, Universal
+et OS. La branche `batch/*` est facultative, comme le montre le train `.129`.
 
-The `Release` workflow calls `Preflight` as its first job on every tag push.
-`Preflight` also remains available via manual dispatch for dry runs. The
-release cannot start building if any of the following fails:
+```mermaid
+%%{init: { "gitGraph": { "mainBranchName": "main", "showCommitLabel": true, "rotateCommitLabel": false } } }%%
+gitGraph LR:
+    commit id: "base"
 
-- Tag is not valid semver (`vMAJOR.MINOR.PATCH[-PRE]`)
-- Tag is not strictly greater than the version in `Cargo.toml`
-- Any blocking GitHub issue with label `P0` is open. A P0 whose fix is already
-  merged may carry `release:verification-pending`: it stays open until the
-  published release is verified, but no longer prevents that release from
-  being built. `keep-open`, `en-cours`, assignment and work-lock labels never
-  exempt a P0.
-- Any `TODO(release)` marker is present in source code (docs/ excluded)
-- No `cahier-recette-v{major}.{minor}*.md` exists under `docs/`
-- `cargo audit` reports a CVE in the dependency tree
-- `cargo deny check` reports a license or duplicate-dep issue
-- The CI status for the commit is not green
+    branch rc-128
+    checkout rc-128
+    branch batch-128
+    checkout batch-128
+    branch fix-128-a
+    checkout fix-128-a
+    commit id: "A"
+    checkout batch-128
+    merge fix-128-a id: "PR-A"
+    branch fix-128-b
+    checkout fix-128-b
+    commit id: "B"
+    checkout batch-128
+    merge fix-128-b id: "PR-B"
+    checkout rc-128
+    merge batch-128 id: "lot128"
+    commit id: "gel128" tag: "clients .128"
+    checkout main
+    merge rc-128 id: "main128" tag: "serveur .128"
 
-The workflow surfaces a failed status check on the commit and the `web-client`
-job has an explicit `needs: preflight` dependency. A red preflight therefore
-skips all build and publication jobs. Fix the underlying issue, then retry the
-tag workflow; a red check from a separate workflow is not treated as a gate.
+    branch rc-129
+    checkout rc-129
+    branch fix-129-a
+    checkout fix-129-a
+    commit id: "C"
+    checkout rc-129
+    merge fix-129-a id: "PR-C"
+    commit id: "gel129" tag: "clients .129"
+    checkout main
+    merge rc-129 id: "main129" tag: "serveur .129"
 
-`release:verification-pending` has a deliberately narrow lifecycle: add it
-only after the correcting commit is merged into the release branch and its
-counter-example is green there; remove it if the release proof fails; close
-the issue (which removes it from the preflight query) only after checking the
-published release. The preflight prints these pending issue numbers even when
-it passes, so the release operator retains an explicit verification list.
-
-To run a manual dry-run before tagging:
-
-```bash
-gh workflow run preflight.yml \
-  --field version=v0.8.28 \
-  --field skip_ci_check=true
+    branch rc-130
+    checkout rc-130
+    branch batch-130
+    checkout batch-130
+    branch fix-130-a
+    checkout fix-130-a
+    commit id: "D"
+    checkout batch-130
+    merge fix-130-a id: "PR-D"
+    branch fix-130-b
+    checkout fix-130-b
+    commit id: "E"
+    checkout batch-130
+    merge fix-130-b id: "PR-E"
+    checkout rc-130
+    merge batch-130 id: "lot130"
+    commit id: "gel130" tag: "clients .130"
+    checkout main
+    merge rc-130 id: "main130" tag: "serveur .130"
 ```
 
-Or locally:
+Les tags sont créés après la promotion : le dessin indique leur **cible Git**,
+pas leur instant de création. Web, Universal et OS taguent la tête figée de
+leur RC, désormais ancêtre de `main`; le serveur tague le commit de fusion sur
+`main`. `PR-A` à `PR-E` sont les merges des correctifs ; `lot128` et `lot130`
+sont les merges des branches `batch/*` ; `gel128` à `gel130` portent versions,
+manifeste et preuve complète. `release/v0.9` ne rejoint plus cette ligne.
 
-```bash
-python3 scripts/preflight-check.py --version v0.8.28 --no-ci-check
-```
+Les quatre composants sont `server`, `web`, `os` et `universal`. Le serveur
+porte le manifeste `.release/vX.Y.Z.json` et orchestre les tags ainsi que la
+promotion. Android est hors de ce manifeste : il n'est ni bumpé, ni tagué, ni
+publié automatiquement par ce train.
 
-## Post-release sync to `main`
+## 1. Configuration permanente
 
-After a successful stable `Release` run, `post-release-main-sync.yml` checks
-that the public release has non-empty, SHA-256-addressed assets, then prepares
-or reuses the branch `post-release/<tag>-vers-main` and opens a PR to `main`.
-The operation is idempotent: rerunning it verifies the existing branch and PR;
-it never rewrites the branch and never merges the PR.
+### Branches
 
-Review conflicts and let the complete PR battery finish, then merge by merge
-commit so that the published tag remains an identifiable ancestor of `main`.
-If repository policy forbids `GITHUB_TOKEN` from opening pull requests, provide
-a fine-grained `MAIN_SYNC_TOKEN` with `Contents: write` and
-`Pull requests: write` on this repository. No such token is needed when the
-native Actions permission is enabled.
+Les dépôts publics `tune-server-rust` et `tune-web-client` protègent `main` et
+`rc/*` par ruleset :
 
-## CI batches for bug fixes
+- PR obligatoire et conversations résolues ;
+- seule méthode `merge` ;
+- force-push et suppression interdits ;
+- contrôles requis vérifiés par `audit-protections.yml`.
 
-Bug-fix pull requests can be grouped on an explicit `batch/*` branch. A PR
-whose **base** is `batch/*` runs the fast Rust core only: format, the OAAT test
-suite, Clippy, the security audit and the FFI compile check. This is the only
-case where the specialized suites are skipped.
+Les dépôts privés `tune-os` et `tune-server-universal` relèvent de l'exception
+GitHub Free : seuls JP et Bertrand fusionnent ou taguent. Les agents ne le
+font jamais.
 
-When the fixes in the lot are ready, open one integration PR from `batch/*` to
-`release/v0.9`. That PR runs the complete battery: shipped features,
-audio-embedding, Windows + ASIO, macOS and PostgreSQL in addition to the core.
-Merging it also triggers the five-target delivery matrix on the release-branch
-push.
+### Environnements et armements
 
-Add the `ci:full` label to a bug-fix PR when its risk warrants the complete
-battery immediately. Direct PRs to `release/v0.9`, `main` or any non-`batch/*`
-branch are complete by default. Unknown events and classifier errors are also
-complete: a routing fault may consume extra runners, but cannot suppress a
-check.
+Le dépôt serveur porte trois environnements :
 
-Typical flow:
-
-```bash
-git switch -c batch/v0.9-audio origin/release/v0.9
-git push -u origin batch/v0.9-audio
-
-# Open each fix PR with batch/v0.9-audio as its base, then integrate the lot:
-gh pr create --base release/v0.9 --head batch/v0.9-audio
-```
-
-## 2. Bump
-
-`tune release bump <patch|minor|major>` rewrites `Cargo.toml` and
-regenerates `Cargo.lock`. It runs in dry-run mode by default; pass
-`--apply` to actually mutate the tree.
-
-```bash
-$ tune release bump patch
-  Current : 0.8.27
-  Bump    : patch
-  Next    : 0.8.28
-
-Dry run. Pass --apply to actually rewrite Cargo.toml + Cargo.lock.
-```
-
-The workspace `version` is the only authoritative value; sub-crates
-inherit via `version.workspace = true`. If you want to audit other
-files that might carry the version (NSIS installer, Tauri config,
-Homebrew formula in another repo), run:
-
-```bash
-bash scripts/find-version-strings.sh
-```
-
-## 3. Tag and push
-
-```bash
-git add Cargo.toml Cargo.lock
-git commit -m "bump v0.8.NN"
-git tag v0.8.NN
-git push origin main --tags
-```
-
-The tag push starts the following release-related workflows:
-
-| Workflow | Purpose |
+| environnement | rôle |
 |---|---|
-| `Release` | Calls `Preflight` first; only after it passes, builds 6 platform binaries (Linux x64/arm64 GNU/arm64 musl, macOS x64/arm64, Windows x64), creates the GitHub Release, then runs the Homebrew + Forum jobs |
-| `Docker` | Builds multi-arch image (linux/amd64 + linux/arm64) and pushes to `renesenses/tune:vN.N.N` + `:latest` on Docker Hub |
-| `Changelog` | Generates `RELEASE_NOTES.md` via git-cliff, opens a PR back to main that refreshes `CHANGELOG.md` |
-| `Tests (PostgreSQL)` | Runs the engine + postgres-skeleton tests against a live `postgres:16-alpine` service container |
-| `CI` | The usual Format / Clippy / Test matrix |
+| `release-dry-run` | lecture et validation, sans approbation |
+| `release` | création des quatre tags, avec approbation JP ou Bertrand |
+| `release-promotion` | publication des canaux stables, avec approbation |
 
-## 4. Homebrew tap auto-update
+Les variables de dépôt restent désarmées hors de leur fenêtre :
 
-The `homebrew` job in `release.yml` runs after `release`. It:
-
-1. Fetches the source tarball from `https://github.com/renesenses/tune-server-rust/archive/refs/tags/vN.N.N.tar.gz`
-2. Computes SHA256
-3. Clones `renesenses/homebrew-tap` via the `HOMEBREW_TAP_TOKEN` secret
-4. Rewrites `Formula/tune-server.rb` (`url`, `sha256`, `version` lines)
-5. Commits `tune-server vN.N.N` and pushes
-
-Users see the new version on `brew upgrade tune-server` (after at most
-a `brew update`). Re-tap is not required.
-
-## 5. Forum announcement
-
-The `forum` job in `release.yml` runs after `release`. It:
-
-1. Builds release notes with `git-cliff --tag vN.N.N --latest`
-2. Posts a new **pinned** thread to `mozaiklabs.fr/api/v1/forum/threads`
-   titled `[Release] tune-server vN.N.N disponible`
-3. Body includes the changelog section + download links + Docker pull
-   instructions + Homebrew install command
-
-The thread is created in the `releases` category by default.
-
-## 6. Rollback
-
-When a release turns out broken after publication, the `Rollback`
-workflow walks back the five publication surfaces. It is opt-in and
-defaults to dry-run.
-
-```bash
-gh workflow run rollback.yml \
-  --field version=v0.8.28 \
-  --field previous_version=v0.8.27 \
-  --field apply=false                  # dry-run first
+```text
+RELEASE_CONTROLLER_ENABLED=false
+RELEASE_PROMOTION_ENABLED=false
 ```
 
-A dry-run prints what would happen at each step. Re-run with
-`apply=true` to actually mutate state.
+`RELEASE_CONTROLLER_TOKEN` est un secret d'environnement : lecture seule dans
+`release-dry-run`, lecture/écriture des références dans `release`. Les deux
+jetons voient les quatre dépôts. Les autres secrets de build et de publication
+restent dans leurs environnements existants.
 
-Optional inputs:
+## 2. Préparer un train
 
-- `delete_tag=true` — also force-deletes the git tag on the remote.
-  Default: keep the tag for traceability.
-- `forum_thread_id=12345` — post an erratum reply on the original
-  announcement thread. Leave blank to skip.
+1. Créer `rc/vX.Y.Z` dans chacun des quatre dépôts depuis la base décidée.
+2. Faire viser les PR de travail vers leur branche de lot ou la RC assignée.
+   Les PR unitaires exécutent leurs tests ciblés.
+3. Intégrer chaque lot dans la RC par commit de fusion. La RC porte la batterie
+   d'intégration, pas chaque petit correctif pris isolément.
+4. Réconcilier chaque RC avec son `main` par PR. Une RC ne doit retirer aucun
+   correctif déjà présent dans `main`.
+5. Bumper les versions web et serveur dans leurs fichiers canoniques.
+6. Relever les têtes exactes des RC web, OS et Universal dans
+   `.release/vX.Y.Z.json`. Le serveur conserve `"sha": "self"`.
+7. Passer `ready=true` seulement quand les quatre RC sont figées.
 
-What gets reverted:
+Avec `ready=true`, une RC qui avance rend l'audit rouge. Mettre le SHA à jour
+par PR et rejouer les gates ; ne jamais ignorer cet échec.
 
-| Surface | Action |
-|---|---|
-| GitHub Release | Marked as draft (assets stay reachable) |
-| Git tag | Optional `git push --delete` |
-| Homebrew tap | `git revert` of the bump commit |
-| Docker Hub | Drop the bad tag + re-point `:latest` via `buildx imagetools` |
-| Forum | Erratum reply posted on the original thread |
+## 3. Auditer puis promouvoir vers `main`
 
-## 7. Required secrets
+Lancer l'audit depuis la RC serveur :
 
-Configured on `renesenses/tune-server-rust`:
+```bash
+gh workflow run audit-protections.yml \
+  --repo renesenses/tune-server-rust \
+  --ref rc/vX.Y.Z \
+  --field version=X.Y.Z
+```
 
-| Secret | Used by | Notes |
-|---|---|---|
-| `GITHUB_TOKEN` | preflight, release, changelog, rollback | Provided automatically by Actions |
-| `DOCKERHUB_USERNAME` | docker, rollback | docker.io login |
-| `DOCKERHUB_TOKEN` | docker, rollback | docker.io PAT |
-| `HOMEBREW_TAP_TOKEN` | release.homebrew, rollback | Write access to `renesenses/homebrew-tap` |
-| `FORUM_TOKEN` | release.forum, forum-watch, rollback | Bearer for mozaiklabs forum API |
-| Apple signing | release | DMG signing (see existing secrets `APPLE_*`) |
+Il doit confirmer les rulesets publics, leurs paramètres, les armements à
+`false`, l'absence de tag et l'alignement du manifeste. OS et Universal
+peuvent apparaître `NON VÉRIFIÉ` avec `github.token` ; le contrôleur les lira
+ensuite avec son jeton inter-dépôts.
 
-## 8. Conventional commits
+Ouvrir et fusionner par commit de fusion les promotions dans cet ordre :
 
-Phase 3 (auto-changelog) relies on commit messages following the
-[conventional commits](https://www.conventionalcommits.org/) shape:
+1. web `rc/vX.Y.Z` vers `main` (`npm test`, build de production et références
+   d'issues) ;
+2. Universal `rc/vX.Y.Z` vers `main` ;
+3. OS `rc/vX.Y.Z` vers `main` ;
+4. serveur `rc/vX.Y.Z` vers `main` en dernier, avec la batterie complète,
+   `Test (PostgreSQL)`, `Issues déclarées corrigées` et `release-gate` verts.
 
-- `feat:` — new feature
-- `fix:` — bug fix
-- `perf:` — performance improvement
-- `docs:` — documentation
-- `refactor:` — code restructuring
-- `test:` — test changes
-- `ci:` — CI/build
-- `chore:` — chores (boring stuff)
-- `style:` — formatting
+Les SHA web, OS et Universal du manifeste sont alors des ancêtres identifiables
+de leurs `main`. Le contrôleur résout `server:self` vers la tête exacte du
+`main` serveur.
 
-Commits that don't match end up in the "Other" group. Bump commits
-matching `^bump v[0-9]` and `^Merge branch` lines are skipped from the
-changelog by design.
+## 4. Premier dry-run et premier STOP
 
-## 9. Manual override paths
+Depuis `main` serveur :
 
-If you really need to bypass automation:
+```bash
+gh workflow run release-controller.yml \
+  --repo renesenses/tune-server-rust \
+  --ref main \
+  --field version=X.Y.Z \
+  --field dry_run=true
+```
 
-- **Preflight has no implicit bypass**: resolve the blocking condition and
-  rerun the tag workflow. An emergency bypass requires a reviewed workflow
-  change; ignoring a red check cannot publish a release.
-- **Skip Homebrew**: comment out `secrets.HOMEBREW_TAP_TOKEN` in the
-  job's `if`, or simply don't have the secret set.
-- **Skip Forum**: same pattern with `FORUM_TOKEN`.
-- **Skip Docker**: the `Docker` workflow is independent; just don't
-  push the tag, or push to a non-`v*` ref.
+Le run doit :
 
-The rollback workflow is also gated on `apply=true` so the only way
-to accidentally mutate state is to explicitly opt in.
+- lire les quatre dépôts, privés compris ;
+- vérifier que chaque SHA est contenu dans `main` ;
+- refuser un tag existant sur un autre SHA ;
+- annoncer les quatre tags qu'il créerait ;
+- ne rien modifier.
 
----
+Conserver le rapport et vérifier indépendamment : aucun tag, gel actif,
+`RELEASE_CONTROLLER_ENABLED=false` et `RELEASE_PROMOTION_ENABLED=false`.
 
-*Document évolutif. Dernière mise à jour : 2026-06-03.*
+**STOP. Aucun tag sans accord explicite de JP.**
+
+## 5. Créer les tags et construire le staging
+
+Après accord explicite seulement :
+
+1. noter l'état du ruleset de gel des tags et ouvrir uniquement cette fenêtre ;
+2. passer `RELEASE_CONTROLLER_ENABLED=true` ;
+3. lancer le contrôleur avec `dry_run=false` depuis le même `main` ;
+4. approuver l'environnement `release` ;
+5. laisser le contrôleur créer, dans l'ordre, les tags web, Universal, OS puis
+   serveur ;
+6. repasser immédiatement l'armement à `false` et remettre le gel, même après
+   un échec partiel.
+
+```bash
+gh workflow run release-controller.yml \
+  --repo renesenses/tune-server-rust \
+  --ref main \
+  --field version=X.Y.Z \
+  --field dry_run=false
+```
+
+Le tag serveur est posé en dernier et déclenche le train. Le staging attendu
+est :
+
+- release serveur en brouillon, matrice complète, checksums et signatures ;
+- Docker uniquement sous `staging-vX.Y.Z` ;
+- release Tune OS en brouillon avec les trois images et leurs sommes ;
+- aucun déplacement de `latest`, Homebrew ou autre canal stable.
+
+Le contrôleur est idempotent : un tag déjà placé sur le SHA attendu est
+accepté. Un tag divergent bloque et ne doit jamais être déplacé en silence.
+
+## 6. Vérifier le staging et second STOP
+
+Quand tous les builds sont terminés :
+
+```bash
+gh workflow run promote-release.yml \
+  --repo renesenses/tune-server-rust \
+  --ref main \
+  --field version=X.Y.Z \
+  --field dry_run=true
+```
+
+Le workflow vérifie notamment :
+
+- les quatre cibles de tags ;
+- le manifeste contenu dans le tag serveur ;
+- tous les actifs serveur, checksums et signature Minisign ;
+- les trois images OS et leurs sommes ;
+- l'image Docker `staging-vX.Y.Z` ;
+- la formule Homebrew calculée depuis les checksums staged.
+
+**STOP. Aucune publication publique sans un second accord explicite de JP.**
+
+## 7. Promouvoir une seule fois
+
+Après ce second accord :
+
+1. passer `RELEASE_PROMOTION_ENABLED=true` ;
+2. lancer `promote-release.yml` avec `dry_run=false` ;
+3. approuver `release-promotion` ;
+4. repasser immédiatement l'armement à `false`.
+
+La promotion recopie le digest Docker staged vers `vX.Y.Z` et `latest`, publie
+les releases OS et serveur, met Homebrew à jour puis envoie la notification.
+Elle ne reconstruit pas les binaires.
+
+## 8. Vérification et clôture
+
+Une release est terminée après preuve des éléments suivants :
+
+- les quatre tags pointent les SHA du rapport ;
+- les releases GitHub et leurs actifs sont publics et complets ;
+- les sommes et signatures sont valides ;
+- Docker `vX.Y.Z` et `latest` portent le digest staged ;
+- Homebrew référence la bonne version et les bonnes sommes ;
+- Tune OS installe le serveur épinglé, sans résoudre `releases/latest` ;
+- les deux variables sont à `false` et le gel des tags est actif.
+
+Supprimer les RC et fermer les issues de vérification seulement après ces
+preuves.
+
+## 9. Échec et reprise
+
+- Avant les tags : corriger par PR, refaire le manifeste et le dry-run.
+- Pendant les tags : désarmer, remettre le gel, relever les tags déjà créés,
+  corriger la cause puis relancer le contrôleur idempotent.
+- Pendant le staging : ne publier aucun canal ; corriger ou retirer le train.
+- Après publication : lancer d'abord `rollback.yml` en dry-run, faire valider
+  son rapport, puis seulement appliquer le rollback autorisé.
+
+Ne jamais supprimer ou déplacer un tag publié pour rendre un rapport vert.
+
+## 10. Règle pour les agents
+
+Un agent OpenAI ou Claude peut préparer du code, des tests et une PR vers la
+base assignée. Sans instruction humaine explicite portant sur l'étape précise,
+il ne fusionne pas une promotion, ne touche pas aux rulesets, environnements,
+secrets ou armements, ne crée aucun tag et ne publie rien.
+
+Les fichiers `AGENTS.md` et `CLAUDE.md` des quatre dépôts renvoient à cette
+règle. La procédure complète n'y est pas dupliquée.
