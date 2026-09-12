@@ -426,9 +426,15 @@ pub fn parse_renderer_command(soap_body: &str) -> RendererCommand {
         }
         "GetMute" => RendererCommand::GetMute,
         "SetMute" => {
-            let m = text_of(soap_body, "DesiredMute")
-                .map(|s| matches!(s.trim(), "1" | "true" | "True" | "TRUE"));
-            RendererCommand::SetMute(m.unwrap_or(false))
+            let m = text_of(soap_body, "DesiredMute").and_then(|s| match s.trim() {
+                "1" | "true" | "True" | "TRUE" => Some(true),
+                "0" | "false" | "False" | "FALSE" => Some(false),
+                _ => None,
+            });
+            match m {
+                Some(m) => RendererCommand::SetMute(m),
+                None => RendererCommand::Unsupported("SetMute".into()),
+            }
         }
         other => RendererCommand::Unsupported(other.to_string()),
     }
@@ -695,6 +701,30 @@ mod tests {
 </u:SetVolume></s:Body></s:Envelope>"#
         );
         assert_eq!(parse_renderer_command(&vol), RendererCommand::SetVolume(37));
+    }
+
+    #[test]
+    fn parse_set_mute_validation() {
+        let mute_true = soap("SetMute", "<DesiredMute>1</DesiredMute>");
+        assert_eq!(parse_renderer_command(&mute_true), RendererCommand::SetMute(true));
+
+        let mute_false = soap("SetMute", "<DesiredMute>0</DesiredMute>");
+        assert_eq!(parse_renderer_command(&mute_false), RendererCommand::SetMute(false));
+
+        let mute_text_false = soap("SetMute", "<DesiredMute>false</DesiredMute>");
+        assert_eq!(parse_renderer_command(&mute_text_false), RendererCommand::SetMute(false));
+
+        let mute_invalid = soap("SetMute", "<DesiredMute>invalid</DesiredMute>");
+        assert_eq!(
+            parse_renderer_command(&mute_invalid),
+            RendererCommand::Unsupported("SetMute".into())
+        );
+
+        let mute_missing = soap("SetMute", "");
+        assert_eq!(
+            parse_renderer_command(&mute_missing),
+            RendererCommand::Unsupported("SetMute".into())
+        );
     }
 
     #[test]
