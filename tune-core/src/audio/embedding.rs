@@ -16,7 +16,7 @@ use ort::session::Session;
 use ort::value::Tensor;
 use tracing::{info, warn};
 
-use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
+use crate::db::backend::{DbBackend, SqlValue};
 use crate::db::track_metadata_repo::TrackMetadataRepo;
 use crate::library::local_path::{
     LocalPath, deferral_stamp, deferral_threshold, resolve_local_path,
@@ -149,29 +149,6 @@ impl DecodeFailure {
             Self::Interrupted(e) => format!("fil de décodage interrompu : {e}"),
             Self::Decode(e) => format!("décodage impossible : {e}"),
         }
-    }
-}
-
-/// Résultat de la lecture d'une ligne candidate.
-///
-/// La requête garantit normalement un identifiant et un chemin non vide. On
-/// garde néanmoins la distinction : avec un identifiant, une ligne
-/// inexploitable peut être marquée comme traitée ; sans identifiant, aucune
-/// sentinelle ne peut être écrite et l'invariant de base doit être signalé.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EmbeddingCandidate {
-    Ready { track_id: i64, path: String },
-    MissingPath { track_id: i64 },
-    MissingTrackId,
-}
-
-fn embedding_candidate(row: &[SqlValue]) -> EmbeddingCandidate {
-    let Some(track_id) = row.first().and_then(SqlValue::as_i64) else {
-        return EmbeddingCandidate::MissingTrackId;
-    };
-    match row.get(1).and_then(SqlValue::as_string) {
-        Some(path) if !path.is_empty() => EmbeddingCandidate::Ready { track_id, path },
-        _ => EmbeddingCandidate::MissingPath { track_id },
     }
 }
 
@@ -311,7 +288,7 @@ fn process_rss_mb() -> Option<u64> {
 }
 
 // Storage layout, constants and cosine live in the always-compiled read side.
-use super::embedding_store::{self, EMBED_DIM, MODEL_ID};
+use super::embedding_store::{self, CandidatAcoustique, EMBED_DIM, MODEL_ID};
 
 /// A loaded CLAP audio embedder. Cheap to reuse across many tracks in the
 /// background analysis pass; `embed` is the per-track hot path.
@@ -468,30 +445,19 @@ pub async fn analyze_embedding_batch(
             .map(|d| d.as_secs())
             .unwrap_or(0) as i64,
     );
-    let rows = match backend.query_many(
-        "SELECT t.id, t.file_path FROM tracks t \
-         WHERE t.file_path IS NOT NULL AND t.file_path != '' \
-           AND (t.format IS NULL OR \
-                lower(t.format) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff')) \
-           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
-                 WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed' \
-                   AND m.value = ?) \
-           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
-                 WHERE m.track_id = t.id AND m.key = 'audio_embed_path_unresolved' \
-                   AND m.value > ?) \
-         LIMIT ?",
-        &[
-            &MODEL_ID as &dyn ToSqlValue,
-            &seuil_report as &dyn ToSqlValue,
-            &(TRACK_BATCH as i64) as &dyn ToSqlValue,
-        ],
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(error = %e, "audio_embed_candidate_query_failed");
-            return 0;
-        }
-    };
+    //
+    // La sélection elle-même vit dans `embedding_store` — toujours compilée,
+    // là où la porte `Test` de la CI peut la garder — et partage son prédicat
+    // avec le dénominateur `eligible_count`. Elle rend aussi le DÉBUT du
+    // segment à décoder : une piste de feuille CUE n'a pas de fichier à elle.
+    let rows =
+        match embedding_store::candidats_acoustiques(backend, &seuil_report, TRACK_BATCH as i64) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "audio_embed_candidate_query_failed");
+                return 0;
+            }
+        };
     if rows.is_empty() {
         return 0;
     }
@@ -528,25 +494,27 @@ pub async fn analyze_embedding_batch(
             );
             break;
         }
-        let (track_id, path) = match embedding_candidate(r) {
-            EmbeddingCandidate::Ready { track_id, path } => (track_id, path),
-            EmbeddingCandidate::MissingPath { track_id } => {
+        let (track_id, path, debut_s, duree_s) = match r {
+            CandidatAcoustique::Pret {
+                track_id,
+                chemin,
+                debut_s,
+                duree_s,
+            } => (*track_id, chemin.clone(), *debut_s, *duree_s),
+            CandidatAcoustique::SansChemin { track_id } => {
                 invalid_rows += 1;
                 warn!(
                     track_id,
                     "audio_embed_candidate_missing_path_marked_processed"
                 );
-                if stamp_embedding_processed(&repo, track_id) {
+                if stamp_embedding_processed(&repo, *track_id) {
                     done += 1;
                 }
                 continue;
             }
-            EmbeddingCandidate::MissingTrackId => {
+            CandidatAcoustique::SansIdentifiant => {
                 invalid_rows += 1;
-                warn!(
-                    row = ?r,
-                    "audio_embed_candidate_missing_track_id_unmarkable"
-                );
+                warn!("audio_embed_candidate_missing_track_id_unmarkable");
                 continue;
             }
         };
@@ -575,8 +543,13 @@ pub async fn analyze_embedding_batch(
         };
         let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
 
-        // Decode the first 10 s at 48 kHz mono (CLAP's window) off the async
-        // runtime; the returned samples carry the source bit depth for scaling.
+        // Decode CLAP's 10 s window at 48 kHz mono off the async runtime; the
+        // returned samples carry the source bit depth for scaling.
+        //
+        // 🔴 `debut_s`, PAS `0.0`. Sur une piste de feuille CUE le fichier
+        // ouvert est l'IMAGE entière : décoder depuis son début donnerait à
+        // toutes les pistes du disque le même vecteur — quinze pistes
+        // acoustiquement identiques, et une ambiance qui tourne en rond.
         // A hard timeout guards against a decoder that spins on a pathological
         // file: on elapse we abandon the await (the blocking thread cannot be
         // cancelled, but one leaked thread is survivable) and move on, stamping
@@ -587,7 +560,7 @@ pub async fn analyze_embedding_batch(
         let decoded = tokio::time::timeout(
             std::time::Duration::from_secs(DECODE_TIMEOUT_SECS),
             tokio::task::spawn_blocking(move || {
-                crate::audio::decode::decode_to_pcm(&p, Some(48_000), Some(1), 0.0, 10.0)
+                crate::audio::decode::decode_to_pcm(&p, Some(48_000), Some(1), debut_s, duree_s)
             }),
         )
         .await;
@@ -1702,24 +1675,10 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn candidate_row_preserves_the_id_when_only_the_path_is_invalid() {
-        assert_eq!(
-            embedding_candidate(&[SqlValue::Int(42), SqlValue::Text("/music/a.flac".into())]),
-            EmbeddingCandidate::Ready {
-                track_id: 42,
-                path: "/music/a.flac".into(),
-            }
-        );
-        assert_eq!(
-            embedding_candidate(&[SqlValue::Int(42), SqlValue::Text(String::new())]),
-            EmbeddingCandidate::MissingPath { track_id: 42 }
-        );
-        assert_eq!(
-            embedding_candidate(&[SqlValue::Text("not-an-id".into()), SqlValue::Null]),
-            EmbeddingCandidate::MissingTrackId
-        );
-    }
+    // `candidate_row_preserves_the_id_when_only_the_path_is_invalid` a suivi la
+    // lecture de ligne dans `embedding_store` (toujours compilé, donc EXÉCUTÉ
+    // par la porte `Test`), sous le nom
+    // `une_ligne_candidate_garde_l_identifiant_quand_seul_le_chemin_est_invalide`.
 
     #[test]
     fn an_unusable_candidate_with_an_id_can_be_stamped_out_of_the_next_batch() {

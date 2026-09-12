@@ -531,6 +531,40 @@ mod like_escape_tests {
 pub mod sql {
     use super::SqlDialect;
 
+    /// Le chemin **ouvrable** d'une piste, en SQL — pour une table aliasée `t`.
+    ///
+    /// 🔴 `t.file_path` NE SUFFIT PAS. Une piste découpée par une feuille CUE
+    /// est une tranche à l'intérieur d'un autre fichier : elle n'a pas de
+    /// fichier à elle et porte `file_path = NULL` **par construction**, son
+    /// support étant `cue_media_path`. Toute passe dont la sélection s'écrit
+    /// `WHERE t.file_path IS NOT NULL` écarte donc en silence TOUTES les
+    /// pistes CUE — un rangement courant chez les audiophiles (repiquages de
+    /// vinyle, concerts).
+    ///
+    /// C'est le pendant SQL de `library::artwork::chemin_sur_disque`, qui fut
+    /// longtemps le SEUL endroit du dépôt à retomber sur `cue_media_path`.
+    /// Une seule écriture du motif, pour que les passes qui le partagent ne
+    /// puissent pas diverger.
+    ///
+    /// ⚠️ Sélectionner la piste ne suffit pas : ce que le chemin rendu désigne
+    /// est le fichier **entier**, pas la tranche. Toute passe qui MESURE le
+    /// signal (ReplayGain, plage dynamique, empreinte) doit en plus borner son
+    /// décodage à `cue_start_ms`/`cue_end_ms`, sinon les quinze pistes d'une
+    /// même image reçoivent toutes la même valeur.
+    macro_rules! chemin_ouvrable {
+        () => {
+            "COALESCE(NULLIF(t.file_path, ''), NULLIF(t.cue_media_path, ''))"
+        };
+    }
+    pub(crate) use chemin_ouvrable;
+
+    /// Le prédicat « cette piste a un fichier qu'on peut ouvrir » — le
+    /// remplaçant de `t.file_path IS NOT NULL AND t.file_path <> ''`.
+    pub const A_UN_FICHIER: &str = concat!(chemin_ouvrable!(), " IS NOT NULL");
+
+    /// [`chemin_ouvrable`] sous forme de constante, pour les projections.
+    pub const CHEMIN_OUVRABLE: &str = chemin_ouvrable!();
+
     /// Le corps `FROM` des requêtes de pistes, sans la projection.
     ///
     /// Isolé pour que les COMPTAGES portent les MÊMES jointures que la liste
