@@ -188,6 +188,20 @@ path = "tests/journal_insertion_par_lot.rs"
 name = "niveaux_sortie_pull_3807"
 path = "tests/niveaux_sortie_pull_3807.rs"
 
+# #2373 T2 — la reconciliation du catalogue en ligne, exercee A BLANC, n'ecrit
+# rien. `autotests = false` en tete de ce manifeste : sans cette cible, le
+# fichier ne serait JAMAIS compile et la porte rendrait un vert contre rien.
+#
+# Binaire A LUI SEUL, et non un `mod` de `integration_contracts` : la
+# reconciliation interroge `scanner::activite::scan_bibliotheque_en_cours()`,
+# un compteur de PROCESSUS. Un voisin qui balaie une bibliotheque dans le meme
+# binaire ferait refuser la reconciliation et rendrait ce temoin intermittent.
+# Declaree ici, au MILIEU du manifeste, et non en queue ou tous les lots
+# ajoutent la leur.
+[[test]]
+name = "reconciliation_a_blanc_2373"
+path = "tests/reconciliation_a_blanc_2373.rs"
+
 # #3907 — ce que l analyse spectrale du serveur resout vraiment. Meme raison :
 # `autotests = false`. Cible minuscule, elle ne tire que tune_core.
 [[test]]
