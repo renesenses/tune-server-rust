@@ -41,13 +41,24 @@ const BRAS_WASAPI: &str = include_str!("../../tune-core/src/outputs/local/bras_w
 // REF-8 (#2219) : le backend CPAL partagé (trait `BackendLocal`, anneau, cascade
 // d'ouverture, vidage) — lu EN PLUS de `local.rs`, jamais à sa place.
 const BACKEND: &str = include_str!("../../tune-core/src/outputs/local/backend.rs");
+// REF-8 (#2219) : l'étage natif des bras Windows (`local/etage_natif.rs`) —
+// la préparation, la queue du DSP et le puits d'anneau de WASAPI y vivent.
+const ETAGE_NATIF: &str = include_str!("../../tune-core/src/outputs/local/etage_natif.rs");
 
 /// Tout ce qui compose la sortie locale : `local.rs` suivi des trois bras
 /// exclusifs. C'est sur CE texte que portent les assertions qui parlent de
 /// « la sortie locale » en général — présence sur les trois transports,
 /// absence d'un second canal.
 fn toute_la_sortie_locale() -> String {
-    [LOCAL, BACKEND, BRAS_COREAUDIO, BRAS_ASIO, BRAS_WASAPI].concat()
+    [
+        LOCAL,
+        BACKEND,
+        ETAGE_NATIF,
+        BRAS_COREAUDIO,
+        BRAS_ASIO,
+        BRAS_WASAPI,
+    ]
+    .concat()
 }
 
 /// Le corps du chemin CoreAudio exclusif, délimité par ses deux journaux
@@ -106,14 +117,40 @@ fn appelle_avec(texte: &str, nom: &str, argument: &str) -> bool {
 #[test]
 fn les_trois_transports_exclusifs_arment_le_canal_sur_un_refus_d_ouverture() {
     let sortie_locale = toute_la_sortie_locale();
+    // REF-8 (#2219) : un bras qui implémente `BackendLocal` ne rapporte plus
+    // en ligne — il rend `RefusDOuverture::OuvertureExclusiveRefusee { backend:
+    // "<transport>", … }` et `play_url` appelle `rapporter`, qui passe par
+    // `record_exclusive_open_failure(backend, …)`. Les deux formes valent, à
+    // condition que la seconde soit réellement branchée : le bras du
+    // `match` de `rapporter` doit appeler le rapporteur.
+    let rapporter_branche = {
+        let sans_blancs: String = BACKEND.chars().filter(|c| !c.is_whitespace()).collect();
+        sans_blancs.contains(
+            "RefusDOuverture::OuvertureExclusiveRefusee{backend,erreur}=>{\
+             record_exclusive_open_failure(backend,device_name,erreur,open_failure);",
+        )
+    };
     for transport in ["CoreAudio", "ASIO", "WASAPI"] {
+        let en_ligne = appelle_avec(&sortie_locale, "record_exclusive_open_failure(", transport);
+        let type_ = rapporter_branche
+            && appelle_avec(&sortie_locale, "OuvertureExclusiveRefusee {", transport);
         assert!(
-            appelle_avec(&sortie_locale, "record_exclusive_open_failure(", transport),
-            "aucun site n'appelle `record_exclusive_open_failure` pour {transport} : un refus \
-             d'ouverture exclusive sur ce transport redevient muet, la zone reste figée sans \
-             message (#3108)"
+            en_ligne || type_,
+            "aucun site n'appelle `record_exclusive_open_failure` pour {transport}, ni en \
+             ligne ni par `RefusDOuverture::OuvertureExclusiveRefusee` + `rapporter` : un \
+             refus d'ouverture exclusive sur ce transport redevient muet, la zone reste \
+             figée sans message (#3108)"
         );
     }
+    // WASAPI a DEUX sites de refus, `new` et `start` (carte §1.2, l. 5473 et
+    // 5777 sur `210e2a81`) : les deux doivent rendre le refus typé.
+    assert_eq!(
+        BRAS_WASAPI.matches("backend: \"WASAPI\",").count(),
+        2,
+        "le bras WASAPI doit rendre `OuvertureExclusiveRefusee {{ backend: \"WASAPI\", … }}` \
+         sur ses DEUX sites de refus, `ouvrir` (`new`) et `demarrer` (`start`) — l'un des \
+         deux est redevenu muet (#3108, REF-8)"
+    );
 }
 
 /// Maillon 2 — la branche « figée à 2 s » du constat.
