@@ -794,3 +794,391 @@ pub(crate) fn renderer_safe_wav_rate(source_rate: u32) -> u32 {
         source_rate
     }
 }
+
+// ---------------------------------------------------------------------------
+// Règles pures de `decider_la_lecture_locale` (REF-2 phase 2, #2219).
+//
+// Sorties du corps de la méthode lors de sa découpe en temps nommés : chacune
+// est une condition qui ne lisait ni `self` ni la base, recopiée telle quelle.
+// Leur table de vérité est fixée dans `lecture_locale_tests`, en bas.
+// ---------------------------------------------------------------------------
+
+/// La demande adresse-t-elle une sortie OAAT (un point de terminaison ou un
+/// groupe) ? Se lit dans le préfixe de l'identifiant de périphérique.
+pub(super) fn est_sortie_oaat(output_device_id: Option<&str>) -> bool {
+    output_device_id.is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"))
+}
+
+/// La demande adresse-t-elle la sortie locale (cpal) ?
+pub(super) fn est_sortie_locale(output_device_id: Option<&str>) -> bool {
+    output_device_id.is_some_and(|id| id.starts_with("local:"))
+}
+
+/// Une zone navigateur doit-elle recevoir la source décodée en WAV ? Oui pour
+/// tout format que `<audio>` ne décode pas — DSD avant tout (Reivax66, 0.9.44),
+/// WavPack, APE, WMA, AIFF, ALAC. Les codecs web restent servis direct.
+pub(super) fn navigateur_exige_le_wav(
+    is_browser_output: bool,
+    source_format: Option<AudioFormat>,
+) -> bool {
+    is_browser_output
+        && matches!(
+            source_format,
+            Some(AudioFormat::Dsd)
+                | Some(AudioFormat::WavPack)
+                | Some(AudioFormat::Ape)
+                | Some(AudioFormat::Wma)
+                | Some(AudioFormat::Aiff)
+                | Some(AudioFormat::Alac)
+        )
+}
+
+/// L'identifiant du renderer à sonder : celui de la demande, sinon celui que
+/// la zone a enregistré, sinon vide — et « vide » veut dire « pas de sonde ».
+pub(super) fn identifiant_du_renderer<'a>(
+    demande: Option<&'a str>,
+    zone: Option<&'a str>,
+) -> &'a str {
+    demande.or(zone).unwrap_or("")
+}
+
+/// Ce qui partira sur le fil sera-t-il du FLAC ? Oui si la source en est, ou si
+/// elle doit être transcodée pour la sortie et que sa cible DLNA est le FLAC.
+pub(super) fn sera_du_flac(
+    source_format: Option<AudioFormat>,
+    needs_transcode_for_output: bool,
+) -> bool {
+    source_format == Some(AudioFormat::Flac)
+        || (needs_transcode_for_output
+            && source_format
+                .map(|f| f.dlna_transcode_target() == AudioFormat::Flac)
+                .unwrap_or(false))
+}
+
+/// La sortie va-t-elle CHERCHER le flux elle-même sans que rien ne le décode
+/// côté serveur ? La famille de [`is_pull_dsp_output_type`], moins `local` et
+/// `oaat` qui décodent déjà pour alimenter leur périphérique (#3807).
+pub(super) fn la_sortie_tire_le_flux(
+    output_type: Option<&str>,
+    is_local_output: bool,
+    is_oaat_output: bool,
+) -> bool {
+    is_pull_dsp_output_type(output_type) && !is_local_output && !is_oaat_output
+}
+
+/// Un traitement actif (égaliseur, réponse impulsionnelle, ReplayGain) peut-il
+/// forcer le transcodage sur CETTE sortie ? Oui pour le réseau, le navigateur
+/// et la sortie qui tire le flux — jamais sur un passthrough DSD ou ALAC voulu
+/// (#1216, #1430). La lecture des réglages, elle, reste chez l'appelant : elle
+/// ne se fait que si cette porte est ouverte.
+pub(super) fn sortie_sujette_au_traitement(
+    is_network_output: bool,
+    is_browser_output: bool,
+    is_pull_dsp_output: bool,
+    dsd_passthrough: bool,
+    alac_passthrough: bool,
+) -> bool {
+    (is_network_output || is_browser_output || is_pull_dsp_output)
+        && !dsd_passthrough
+        && !alac_passthrough
+}
+
+/// Les motifs qui, chacun seul, exigent le transcodage d'une piste locale.
+/// Les noms sont ceux des drapeaux de `decider_la_lecture_locale`.
+pub(super) struct MotifsDeTranscodage {
+    pub(super) needs_transcode_for_output: bool,
+    pub(super) oaat_needs_wav: bool,
+    pub(super) local_needs_wav: bool,
+    pub(super) browser_needs_wav: bool,
+    pub(super) needs_downsample: bool,
+    pub(super) dlna_needs_wav: bool,
+    pub(super) eq_forces_transcode: bool,
+    pub(super) dsp_progressif_wav: bool,
+    /// Le plafond 16 bits ne force le transcodage QUE si le fil aurait porté
+    /// du FLAC direct (`will_be_flac`) : l'ALAC transcode déjà, le plafond
+    /// ayant désarmé son passthrough.
+    pub(super) dlna_cap_16bit: bool,
+    pub(super) will_be_flac: bool,
+    /// #3631 — une tranche de feuille CUE ne se sert jamais telle quelle.
+    pub(super) est_une_tranche_cue: bool,
+}
+
+/// La piste doit-elle être transcodée ? Un OU de tous les motifs, dans l'ordre
+/// où la méthode les additionnait.
+pub(super) fn transcodage_requis(motifs: &MotifsDeTranscodage) -> bool {
+    motifs.needs_transcode_for_output
+        || motifs.oaat_needs_wav
+        || motifs.local_needs_wav
+        || motifs.browser_needs_wav
+        || motifs.needs_downsample
+        || motifs.dlna_needs_wav
+        || motifs.eq_forces_transcode
+        || motifs.dsp_progressif_wav
+        || (motifs.dlna_cap_16bit && motifs.will_be_flac)
+        || motifs.est_une_tranche_cue
+}
+
+#[cfg(test)]
+mod lecture_locale_tests {
+    use super::*;
+
+    #[test]
+    fn la_sortie_oaat_se_lit_dans_le_prefixe_de_l_identifiant() {
+        assert!(est_sortie_oaat(Some("oaat:salon")));
+        assert!(est_sortie_oaat(Some("oaat-group:maison")));
+        assert!(
+            !est_sortie_oaat(Some("oaat")),
+            "sans les deux-points, ce n'est pas un OAAT"
+        );
+        assert!(!est_sortie_oaat(Some("local:default")));
+        assert!(!est_sortie_oaat(Some("uuid:renderer")));
+        assert!(!est_sortie_oaat(Some("")));
+        assert!(!est_sortie_oaat(None));
+    }
+
+    #[test]
+    fn la_sortie_locale_se_lit_dans_le_prefixe_de_l_identifiant() {
+        assert!(est_sortie_locale(Some("local:default")));
+        assert!(est_sortie_locale(Some("local:")));
+        assert!(!est_sortie_locale(Some("local")));
+        assert!(!est_sortie_locale(Some("oaat:salon")));
+        assert!(!est_sortie_locale(Some("uuid:renderer")));
+        assert!(!est_sortie_locale(None));
+    }
+
+    #[test]
+    fn le_navigateur_exige_le_wav_pour_l_exotique_seulement() {
+        for exotique in [
+            AudioFormat::Dsd,
+            AudioFormat::WavPack,
+            AudioFormat::Ape,
+            AudioFormat::Wma,
+            AudioFormat::Aiff,
+            AudioFormat::Alac,
+        ] {
+            assert!(
+                navigateur_exige_le_wav(true, Some(exotique)),
+                "{exotique:?} n'est pas décodé par <audio>"
+            );
+            assert!(
+                !navigateur_exige_le_wav(false, Some(exotique)),
+                "{exotique:?} : hors navigateur, cette règle ne dit rien"
+            );
+        }
+        for natif in [
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+            AudioFormat::Mp3,
+            AudioFormat::Aac,
+            AudioFormat::Ogg,
+            AudioFormat::Opus,
+        ] {
+            assert!(
+                !navigateur_exige_le_wav(true, Some(natif)),
+                "{natif:?} est un codec web : servi direct"
+            );
+        }
+        assert!(
+            !navigateur_exige_le_wav(true, None),
+            "format inconnu : servi tel quel"
+        );
+    }
+
+    #[test]
+    fn l_identifiant_du_renderer_prend_la_demande_puis_la_zone_puis_rien() {
+        assert_eq!(
+            identifiant_du_renderer(Some("uuid:demande"), Some("uuid:zone")),
+            "uuid:demande"
+        );
+        assert_eq!(
+            identifiant_du_renderer(None, Some("uuid:zone")),
+            "uuid:zone"
+        );
+        assert_eq!(
+            identifiant_du_renderer(Some("uuid:demande"), None),
+            "uuid:demande"
+        );
+        assert_eq!(identifiant_du_renderer(None, None), "");
+    }
+
+    #[test]
+    fn le_fil_porte_du_flac_pour_une_source_flac_ou_une_cible_flac() {
+        assert!(sera_du_flac(Some(AudioFormat::Flac), false));
+        assert!(sera_du_flac(Some(AudioFormat::Flac), true));
+        // Une source exotique transcodée pour la sortie vise le FLAC…
+        assert!(sera_du_flac(Some(AudioFormat::Ape), true));
+        assert!(sera_du_flac(Some(AudioFormat::Alac), true));
+        // …mais pas si elle n'est pas transcodée pour la sortie.
+        assert!(!sera_du_flac(Some(AudioFormat::Ape), false));
+        // Le WAV et le MP3 ne deviennent jamais du FLAC par cette règle.
+        assert!(!sera_du_flac(Some(AudioFormat::Wav), false));
+        assert!(!sera_du_flac(Some(AudioFormat::Mp3), false));
+        assert!(!sera_du_flac(None, true), "format inconnu : aucune cible");
+        assert!(!sera_du_flac(None, false));
+    }
+
+    #[test]
+    fn la_sortie_tire_le_flux_hors_local_et_oaat() {
+        assert!(la_sortie_tire_le_flux(Some("diretta"), false, false));
+        assert!(la_sortie_tire_le_flux(Some("hqplayer"), false, false));
+        assert!(
+            !la_sortie_tire_le_flux(Some("diretta"), true, false),
+            "local décode déjà"
+        );
+        assert!(
+            !la_sortie_tire_le_flux(Some("diretta"), false, true),
+            "OAAT décode déjà"
+        );
+        assert!(
+            !la_sortie_tire_le_flux(Some("dlna"), false, false),
+            "le réseau n'est pas la famille pull"
+        );
+        assert!(!la_sortie_tire_le_flux(Some("browser"), false, false));
+        assert!(!la_sortie_tire_le_flux(None, false, false));
+    }
+
+    #[test]
+    fn le_traitement_ne_touche_que_les_sorties_qui_ne_decodent_pas_et_jamais_un_passthrough_voulu()
+    {
+        // Chacune des trois familles ouvre la porte.
+        assert!(sortie_sujette_au_traitement(
+            true, false, false, false, false
+        ));
+        assert!(sortie_sujette_au_traitement(
+            false, true, false, false, false
+        ));
+        assert!(sortie_sujette_au_traitement(
+            false, false, true, false, false
+        ));
+        // Aucune : la sortie locale décode déjà, rien à forcer.
+        assert!(!sortie_sujette_au_traitement(
+            false, false, false, false, false
+        ));
+        // Un passthrough voulu ferme la porte, quelle que soit la famille.
+        assert!(!sortie_sujette_au_traitement(
+            true, false, false, true, false
+        ));
+        assert!(!sortie_sujette_au_traitement(
+            true, false, false, false, true
+        ));
+        assert!(!sortie_sujette_au_traitement(true, true, true, true, true));
+    }
+
+    fn aucun_motif() -> MotifsDeTranscodage {
+        MotifsDeTranscodage {
+            needs_transcode_for_output: false,
+            oaat_needs_wav: false,
+            local_needs_wav: false,
+            browser_needs_wav: false,
+            needs_downsample: false,
+            dlna_needs_wav: false,
+            eq_forces_transcode: false,
+            dsp_progressif_wav: false,
+            dlna_cap_16bit: false,
+            will_be_flac: false,
+            est_une_tranche_cue: false,
+        }
+    }
+
+    #[test]
+    fn sans_motif_la_piste_part_telle_quelle() {
+        assert!(!transcodage_requis(&aucun_motif()));
+        // `will_be_flac` seul n'est pas un motif : c'est le passthrough FLAC ordinaire.
+        assert!(!transcodage_requis(&MotifsDeTranscodage {
+            will_be_flac: true,
+            ..aucun_motif()
+        }));
+    }
+
+    #[test]
+    fn chaque_motif_seul_exige_le_transcodage() {
+        let seuls: [(&str, MotifsDeTranscodage); 9] = [
+            (
+                "needs_transcode_for_output",
+                MotifsDeTranscodage {
+                    needs_transcode_for_output: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                "oaat_needs_wav",
+                MotifsDeTranscodage {
+                    oaat_needs_wav: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                "local_needs_wav",
+                MotifsDeTranscodage {
+                    local_needs_wav: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                "browser_needs_wav",
+                MotifsDeTranscodage {
+                    browser_needs_wav: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                "needs_downsample",
+                MotifsDeTranscodage {
+                    needs_downsample: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                "dlna_needs_wav",
+                MotifsDeTranscodage {
+                    dlna_needs_wav: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                "eq_forces_transcode",
+                MotifsDeTranscodage {
+                    eq_forces_transcode: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                "dsp_progressif_wav",
+                MotifsDeTranscodage {
+                    dsp_progressif_wav: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                "tranche_cue",
+                MotifsDeTranscodage {
+                    est_une_tranche_cue: true,
+                    ..aucun_motif()
+                },
+            ),
+        ];
+        for (nom, motif) in &seuls {
+            assert!(
+                transcodage_requis(motif),
+                "{nom} seul doit forcer le transcodage"
+            );
+        }
+    }
+
+    #[test]
+    fn le_plafond_16_bits_ne_force_que_sur_un_fil_flac() {
+        assert!(transcodage_requis(&MotifsDeTranscodage {
+            dlna_cap_16bit: true,
+            will_be_flac: true,
+            ..aucun_motif()
+        }));
+        assert!(
+            !transcodage_requis(&MotifsDeTranscodage {
+                dlna_cap_16bit: true,
+                will_be_flac: false,
+                ..aucun_motif()
+            }),
+            "plafond sans FLAC direct : l'ALAC transcode déjà par ailleurs (#1137)"
+        );
+    }
+}
