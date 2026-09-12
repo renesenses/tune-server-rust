@@ -64,6 +64,13 @@ const ARTICLES: &[&str] = &[
 /// Strong separators — these essentially never occur inside a single legitimate
 /// artist name, so we always split on them (case-insensitive, space-padded so
 /// `ft.` doesn't match inside a word).
+/// Generational and honorific suffixes that follow a comma but belong to the
+/// SAME person: `"Grover Washington, Jr."` is one artist, not two. Same family
+/// as the `"X, The"` sort form undone by [`reorder_sort_form`].
+const NAME_SUFFIXES: &[&str] = &[
+    "jr", "jr.", "sr", "sr.", "jnr", "jnr.", "snr", "snr.", "ii", "iii", "iv",
+];
+
 const STRONG_MARKERS: &[&str] = &[
     " featuring ",
     " feat. ",
@@ -164,6 +171,23 @@ fn reorder_sort_form(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+/// Re-attach a bare generational suffix to the part before it, mirroring how
+/// [`split_ampersand`] re-attaches an article-led ensemble to its leader.
+fn reattach_name_suffixes(parts: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in parts {
+        let key = p.trim().to_lowercase();
+        if NAME_SUFFIXES.contains(&key.as_str()) {
+            if let Some(last) = out.last_mut() {
+                *last = format!("{last}, {}", p.trim());
+                continue;
+            }
+        }
+        out.push(p);
+    }
+    out
 }
 
 /// Split on ` & ` / ` and `, but keep `X & The/His/Her Y` together (band name:
@@ -273,12 +297,19 @@ pub fn analyze_artist_credit(
             continue;
         }
         let comma_parts: Vec<String> = if piece.contains(',') {
-            separators.push(Separator::Comma);
-            piece
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
+            let parts = reattach_name_suffixes(
+                piece
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
+            // Une virgule qui ne separe rien (suffixe rattache) n'est pas un
+            // separateur : ne pas l'inscrire, sinon le rapport ment.
+            if parts.len() > 1 {
+                separators.push(Separator::Comma);
+            }
+            parts
         } else {
             vec![piece.clone()]
         };
