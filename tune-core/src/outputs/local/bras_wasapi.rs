@@ -261,6 +261,17 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
             position_alimentee_ms: fed_position_ms,
         }
     }
+
+    /// Le nom que la boucle commune met dans son rapport de famine (REF-7,
+    /// #3108). `74b7247e` a été écrit AVANT que #4013 n'ajoute `nom` au trait,
+    /// et la fusion `96025275` n'a adapté que le bras ASIO : l'impl WASAPI est
+    /// restée sans cette méthode. Ni Shrek ni le Mac ne compilent ce fichier
+    /// (`cfg(target_os = "windows")` + feature `local-audio`), et l'étape
+    /// « Windows livré sans ASIO » ne l'active pas non plus — seule l'étape
+    /// « ASIO » du job `windows-pr` l'a vu, en E0046.
+    fn nom(&self) -> &'static str {
+        "WASAPI"
+    }
 }
 
 /// Joue la piste sur WASAPI en mode exclusif événementiel, au format source,
