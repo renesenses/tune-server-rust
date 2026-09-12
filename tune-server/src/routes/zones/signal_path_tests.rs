@@ -2067,3 +2067,156 @@ fn un_dsp_et_une_adaptation_de_canaux_mesures_portent_chacun_leur_etape() {
         Some("2 \u{2192} 8 canaux (mesuré)")
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// REF-6b côté PRODUCTEUR (#2219, REF-7) — la sortie locale remplit le contrat
+// que #3987 avait posé sans producteur : `EtageDeConversion::transformations()`
+// -> `publier_les_transformations` -> `LocalOutput::transformations_reelles()`
+// -> sondeur -> `ZoneState::transformations_reelles` -> cette route.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Une zone LOCALE dont le périphérique a ouvert 48 kHz sur une source 44,1 :
+/// la mesure que l'étage rend pour cette ouverture — au bit près celle que
+/// `une_source_44_1_sur_un_peripherique_ouvert_a_48_declare_le_reechantillonnage`
+/// (`tune-core`, `local/transformations_reelles_de_l_etage_ref6b.rs`) vérifie —
+/// fait tomber le verdict et nomme l'étape mesurée.
+///
+/// Sans producteur, la même zone rendait `bit_perfect = true` : aucun plafond,
+/// aucun DSP, la déduction ne voit pas qu'un DAC ouvert à 48 kHz a
+/// rééchantillonné le 44,1.
+#[test]
+fn une_zone_locale_ouverte_a_48_khz_sur_une_source_44_1_rend_le_reechantillonnage_mesure() {
+    use tune_core::outputs::traits::{AudioSpec, FormatOuvert, ProfondeurPcm};
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = flac_playing();
+    if let Some(np) = ps.now_playing.as_mut() {
+        np.sample_rate = Some(44_100);
+        np.bit_depth = Some(16);
+    }
+    // Ce que l'étage flottant rend pour (44,1 kHz / 16 bits / stéréo) ouvert à
+    // (48 kHz / stéréo) sans DSP — la valeur du témoin tune-core, recopiée.
+    ps.transformations_reelles = Some(TransformationsReelles::nouvelles(
+        AudioSpec::nouvelle(44_100, ProfondeurPcm::Entier16, 2).unwrap(),
+        FormatOuvert::new(48_000, 2),
+        false,
+    ));
+
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CPAL",
+        Some(&wire("flac", 44_100, 16)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        sp.get("bit_perfect").and_then(|b| b.as_bool()),
+        Some(false),
+        "le périphérique a ouvert 48 kHz : le 44,1 est rééchantillonné, le verdict tombe"
+    );
+    assert_eq!(
+        step_desc(&sp, "Resampler").as_deref(),
+        Some("44kHz \u{2192} 48kHz (mesuré)"),
+        "l'étape nomme la cadence réellement ouverte et dit qu'elle est mesurée"
+    );
+    assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+
+    // Contre-témoin dans le même test : la même zone SANS mesure garde la
+    // déduction — et la déduction, ici, ne voit rien.
+    ps.transformations_reelles = None;
+    let sans = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CPAL",
+        Some(&wire("flac", 44_100, 16)),
+    )
+    .unwrap();
+    assert_eq!(
+        sans.get("bit_perfect").and_then(|b| b.as_bool()),
+        Some(true),
+        "sans producteur, la route ne peut pas savoir : c'est exactement le trou que \
+         REF-7 côté producteur ferme"
+    );
+}
+
+/// Les SITES de publication, gardés par texte — `local.rs` vit derrière
+/// `local-audio`, que le job `Test` n'active pas (#2816, témoin endormi) ; ce
+/// test-ci s'exécute sur chaque PR.
+///
+/// Deux publications, pas une de plus ni de moins : à l'ouverture (dès que
+/// l'étage existe, AVANT que le puits ne soit pris, donc avant la première
+/// trame), et à la frontière gapless (dès que l'étage porte le format de la
+/// piste enchaînée, AVANT la reconstruction du convolveur). Et `LocalOutput`
+/// rend le créneau par la méthode du contrat.
+#[test]
+fn le_fil_de_lecture_local_publie_ses_transformations_a_l_ouverture_et_a_chaque_frontiere_gapless()
+{
+    const LOCAL_RS: &str = include_str!("../../../../tune-core/src/outputs/local.rs");
+    const PUBLICATION: &str = "publier_les_transformations(&transformations_reelles, &etage);";
+    let production = LOCAL_RS
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .expect("local.rs doit garder son `#[cfg(test)] mod tests`");
+
+    assert_eq!(
+        production.matches(PUBLICATION).count(),
+        2,
+        "REF-6b — `play_url` doit publier les transformations de l'étage à DEUX endroits : \
+         l'ouverture et la frontière gapless"
+    );
+
+    let ouverture = production
+        .find("sortie: FormatOuvert::new(output_sr, output_ch),")
+        .expect("la construction de l'étage à l'ouverture doit rester identifiable");
+    let apres_ouverture = &production[ouverture..];
+    let publiee = apres_ouverture
+        .find(PUBLICATION)
+        .expect("REF-6b — aucune publication après la construction de l'étage");
+    let puits_pris = apres_ouverture
+        .find("let mut puits = match backend.puits()")
+        .expect("la prise du puits doit rester identifiable");
+    assert!(
+        publiee < puits_pris,
+        "REF-6b — la publication d'ouverture doit précéder la prise du puits, donc la \
+         première trame servie : l'écran ne doit pas voir une déduction pendant que le DAC \
+         joue déjà une mesure"
+    );
+
+    let gapless = production
+        .find("etage.spec = nouvelle_spec;")
+        .expect("la mise à jour gapless de l'étage doit rester identifiable");
+    let apres_gapless = &production[gapless..];
+    let republiee = apres_gapless
+        .find(PUBLICATION)
+        .expect("REF-6b — aucune publication après la mise à jour gapless de l'étage");
+    let reconstruction = apres_gapless
+        .find("rebuild_local_convolver(")
+        .expect("la reconstruction du convolveur doit rester identifiable");
+    assert!(
+        republiee < reconstruction,
+        "REF-6b — la publication gapless doit suivre immédiatement la nouvelle spec, avant \
+         la reconstruction du convolveur"
+    );
+
+    assert!(
+        production
+            .contains("fn transformations_reelles(&self) -> Option<TransformationsReelles> {")
+            && production.contains("self.transformations_reelles.lock().ok().and_then(|t| *t)"),
+        "REF-6b — `LocalOutput` doit rendre le créneau par `OutputTarget::transformations_reelles`"
+    );
+    for effacement in ["fn stop(", "async fn play_url("] {
+        let debut = production
+            .find(effacement)
+            .unwrap_or_else(|| panic!("`{effacement}` doit rester identifiable"));
+        let fenetre = &production[debut..(debut + 12_000).min(production.len())];
+        assert!(
+            fenetre.contains("if let Ok(mut slot) = self.transformations_reelles.lock() {"),
+            "REF-6b — `{effacement}` doit effacer le créneau : une mesure de la piste \
+             précédente ne doit pas survivre à son arrêt"
+        );
+    }
+}

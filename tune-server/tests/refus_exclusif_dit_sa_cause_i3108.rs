@@ -196,11 +196,16 @@ fn le_vidage_de_l_anneau_coreaudio_exclusif_reste_borne() {
 #[test]
 fn le_chemin_partage_et_son_enchainement_rapportent_aussi_leur_blocage() {
     let boucle = LOCAL
-        .split("    fn tourner(")
+        .split("    fn tourner<E: Etage>(")
         .nth(1)
         .and_then(|s| s.split("\n#[async_trait::async_trait]").next())
         .expect("la boucle producteur commune doit rester identifiable (#3108)");
 
+    // REF-7 (#2219) : la boucle est commune à tous les backends, le nom ne
+    // l'est pas. Elle rapporte avec `self.backend`, que `play_url` remplit par
+    // `BackendLocal::nom()` — et c'est `BackendCpal::nom` qui dit « CPAL ».
+    // Trois maillons, tous vérifiés : le littéral seul dans la boucle serait
+    // redevenu faux dès le second backend.
     assert!(
         boucle.contains("record_feed_stall_failure(")
             && boucle[boucle
@@ -209,9 +214,21 @@ fn le_chemin_partage_et_son_enchainement_rapportent_aussi_leur_blocage() {
                 .chars()
                 .take(240)
                 .collect::<String>()
-                .contains("\"CPAL\""),
-        "la boucle producteur commune ne rapporte plus le blocage de l'anneau : une piste qui \
-         meurt sur un rappel de rendu mort s'arrête sans un mot (#3108)"
+                .contains("self.backend,"),
+        "la boucle producteur commune ne rapporte plus le blocage de l'anneau avec le nom de \
+         son backend : une piste qui meurt sur un rappel de rendu mort s'arrête sans un mot, \
+         ou sous un nom qui n'est pas le sien (#3108, REF-7)"
+    );
+    assert!(
+        appelle_avec(BACKEND, "fn nom(&self) -> &'static str {", "CPAL"),
+        "`BackendCpal::nom` ne dit plus « CPAL » : le rapport de famine du chemin partagé \
+         porterait un autre nom que celui que les journaux ont toujours porté (#3108, REF-7)"
+    );
+    assert_eq!(
+        LOCAL.matches("backend: backend.nom(),").count(),
+        2,
+        "les DEUX boucles producteur de `play_url` — piste initiale, piste enchaînée — doivent \
+         recevoir le nom du backend par `BackendLocal::nom()` (#3108, REF-7)"
     );
 
     // Et elle le rapporte pour les DEUX pistes : les deux noms d'événement
