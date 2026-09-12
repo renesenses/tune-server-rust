@@ -28,7 +28,7 @@ pub fn select_host(backend: &str) -> cpal::Host {
     #[cfg(all(target_os = "windows", feature = "asio"))]
     {
         #[cfg(all(target_os = "windows", feature = "asio"))]
-        super::asio_exclusive::ensure_com_initialized();
+        crate::outputs::asio_exclusive::ensure_com_initialized();
         match backend_lower.as_str() {
             "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
                 Ok(host) => {

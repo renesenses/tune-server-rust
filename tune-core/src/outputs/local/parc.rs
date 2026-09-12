@@ -116,7 +116,7 @@ pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
         static ASIO_DEVICE_CACHE: StdMutex<Option<Vec<AsioDeviceInfo>>> = StdMutex::new(None);
 
         let enumerate = || -> Vec<AsioDeviceInfo> {
-            super::asio_exclusive::ensure_com_initialized();
+            crate::outputs::asio_exclusive::ensure_com_initialized();
             let host = match cpal::host_from_id(cpal::HostId::Asio) {
                 Ok(h) => h,
                 Err(e) => {
@@ -199,7 +199,7 @@ pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
         // churns it — on SOtM Diretta it never finishes locking (endless
         // connect → getBufferSize → disconnect cycles, never reaching
         // createBuffers/start). When the device is busy, serve the cache.
-        match super::asio_exclusive::try_with_asio_device_lock(enumerate) {
+        match crate::outputs::asio_exclusive::try_with_asio_device_lock(enumerate) {
             Some(devices) => {
                 *ASIO_DEVICE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(devices.clone());
@@ -640,7 +640,7 @@ pub fn plan_audio_enumeration(backend: &str, asio_device_busy: bool) -> AsioEnum
 pub(super) fn asio_device_busy() -> bool {
     #[cfg(all(target_os = "windows", feature = "asio"))]
     {
-        super::asio_exclusive::asio_device_is_busy()
+        crate::outputs::asio_exclusive::asio_device_is_busy()
     }
     #[cfg(not(all(target_os = "windows", feature = "asio")))]
     {
