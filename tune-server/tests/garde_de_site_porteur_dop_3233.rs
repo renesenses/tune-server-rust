@@ -99,8 +99,11 @@ fn sans_commentaires_ni_blancs(source: &str) -> String {
 /// contre-épreuve de ce fichier.
 fn corps_de_la_fermeture() -> &'static str {
     let production = production();
+    // R1 (#2219) : la fermeture est passée à un puits par `&mut dyn FnMut`,
+    // ce qui impose de la DÉCLARER `mut`. L'aiguille est donc l'affectation
+    // elle-même, sans le mot-clé qui la précède.
     let debut = production
-        .find("let refuser_le_porteur_dop = |")
+        .find("refuser_le_porteur_dop = |")
         .expect("#3233 — la fermeture `refuser_le_porteur_dop` a disparu de `local.rs`");
     let corps = &production[debut..];
     // La fermeture est déclarée à 12 espaces d'indentation : elle se referme
@@ -111,54 +114,88 @@ fn corps_de_la_fermeture() -> &'static str {
     &corps[..fin]
 }
 
-/// Les quatre sites, écrits comme un seul motif — et assemblés à l'exécution.
+/// LA route, écrite comme un seul motif — et assemblée à l'exécution.
 ///
-/// Écrit en clair, ce motif figurerait dans CE fichier ; il n'y serait pas lu
-/// (la garde lit `local.rs`, pas sa propre source), mais l'idiome du dépôt
-/// assemble par principe : un jour où quelqu'un déplacera la garde dans
-/// `local.rs` lui-même, la précaution vaudra.
-fn motif_du_site() -> String {
+/// ⚠️ R1 (#2219) a supprimé les quatre copies que ce motif comptait. Les
+/// quatre entrées PCM du chemin partagé existent toujours — piste initiale
+/// WAV, piste initiale compressée, et les deux entrées de la piste enchaînée —
+/// mais elles ne recopient plus la chaîne : toutes passent par
+/// `EtageDeConversion::pousser`, seule route entre des octets décodés et le
+/// puits. On ne compte donc plus des copies, on verrouille la route unique.
+///
+/// C'est strictement plus fort qu'un comptage : une CINQUIÈME entrée ne
+/// pourrait pas contourner la garde, alors qu'avant elle n'avait qu'à oublier
+/// de recopier les quatre lignes — ce qui est exactement le défaut que #3233
+/// décrit.
+fn motif_de_la_route() -> String {
     [
-        "ifrefuser_le_porteur_dop(processed.dop,sample_rate,channels){",
-        "ifplay_generation.load(Ordering::SeqCst)==my_generation{",
-        "playing.store(false,Ordering::SeqCst);",
-        "}return;}",
-        // Ce qui SUIT est la moitié qui compte : la garde doit précéder
-        // l'adaptation de canaux et le rééchantillonnage, jamais les suivre.
-        "ifneeds_channel_adapt{",
+        "ifrefuser_le_porteur_dop(bloc.dop,self.sample_rate,self.channels){",
+        "returnPousseeVersLePuits::PorteurDopRefuse;",
+        "}",
+        // Ce qui SUIT est la moitié qui compte : la garde doit précéder la
+        // conversion, jamais la suivre.
+        "lettrames_source=bloc.source_frames;",
+        "letmots=self.convertir(bloc.samples);",
+        "ifpuits.ecrire(&mots){",
     ]
     .concat()
 }
 
-/// LE verrou : quatre sites, et chacun placé AVANT la conversion.
+/// LE verrou : une route, et la garde placée AVANT la conversion.
 ///
 /// Compter les appels ne suffirait pas. Le défaut que #3233 décrit n'est pas
 /// « la garde manque » mais « le porteur DoP est détruit avant qu'on le
-/// refuse » : une garde déplacée SOUS `needs_resample` compterait pareil et ne
+/// refuse » : une garde déplacée SOUS la conversion compterait pareil et ne
 /// protégerait plus rien. Le motif enferme donc l'ordre.
 #[test]
-fn les_quatre_sites_refusent_le_porteur_dop_avant_toute_conversion() {
+fn la_route_unique_refuse_le_porteur_dop_avant_toute_conversion() {
     let source = sans_commentaires_ni_blancs(production());
-    let sites = source.matches(&motif_du_site()).count();
+    let routes = source.matches(&motif_de_la_route()).count();
     assert_eq!(
-        sites, 4,
-        "#3233 — le chemin cpal PARTAGÉ compte quatre entrées PCM (piste \
-         initiale WAV, piste initiale compressée, et les deux entrées de la \
-         piste enchaînée sans blanc). Chacune doit refuser le porteur DoP \
-         AVANT `adapt_channels` et `rubato_resample_chunk`, et rendre la main \
-         en arrêtant la zone. J'en compte {sites}. Un site retiré, déplacé \
-         sous la conversion, ou dont les arguments ont changé, rend le DAC \
-         muet sans un mot : le sinc réécrit le marqueur 0x05/0xFA du porteur, \
-         le DAC quitte le mode DSD et le temps défile (Pierre M, fil 1043)."
+        routes, 1,
+        "#3233 — le chemin cpal PARTAGÉ doit refuser le porteur DoP AVANT la \
+         conversion, et n'avoir qu'UN endroit où le faire. J'en compte \
+         {routes}. Une route retirée, déplacée sous la conversion, ou dont les \
+         arguments ont changé, rend le DAC muet sans un mot : le sinc réécrit \
+         le marqueur 0x05/0xFA du porteur, le DAC quitte le mode DSD et le \
+         temps défile (Pierre M, fil 1043)."
+    );
+
+    // La conversion, elle, doit rester DERRIÈRE cette route : `adapt_channels`
+    // et `rubato_resample_chunk` ne doivent pas réapparaître en ligne dans une
+    // entrée PCM qui se passerait de la garde.
+    let convertir = source
+        .split("fnconvertir(&mutself,mutmots:Vec<f32>)->Vec<f32>{")
+        .nth(1)
+        .and_then(|s| s.split("fn").next())
+        .expect("#3233 — `EtageDeConversion::convertir` doit rester identifiable");
+    assert!(
+        convertir.contains("adapt_channels(&mots,self.channels,self.output_ch)")
+            && convertir.contains("rubato_resample_chunk("),
+        "#3233 — la conversion source → sortie doit rester dans l'étage, \
+         derrière la garde : l'en sortir rouvrirait la porte à une entrée PCM \
+         qui convertit avant de refuser"
+    );
+
+    // Et les quatre entrées PCM doivent toutes y mener : deux amorces
+    // (piste initiale, piste enchaînée) et la boucle commune qui sert les deux.
+    assert!(
+        source.matches("etage.pousser(").count() >= 2,
+        "#3233 — les amorces des deux pistes doivent passer par la route unique"
+    );
+    assert!(
+        source.contains("etage.pousser(puits,refuser_le_porteur_dop,&mut|bloc|{"),
+        "#3233 — la boucle producteur commune doit passer par la route unique, \
+         sans quoi la lecture continue court-circuiterait la garde"
     );
 }
 
 /// La garde ne doit pas seulement être appelée : quand elle refuse, elle doit
 /// DIRE pourquoi et couper le son plutôt que d'envoyer du bruit au DAC.
 ///
-/// C'est la définition de la fermeture, celle que les quatre sites partagent.
-/// Sans ce second verrou, une fermeture vidée de son corps laisserait les
-/// quatre appels en place et le test ci-dessus vert.
+/// C'est la définition de la fermeture, celle que la route partage.
+/// Sans ce second verrou, une fermeture vidée de son corps laisserait l'appel
+/// en place et le test ci-dessus vert.
 ///
 /// ⚠️ La contre-épreuve de ce test a d'abord été NÉGATIVE, et pour la raison
 /// la plus banale qui soit : cherchées dans le fichier ENTIER, les aiguilles
@@ -198,29 +235,40 @@ fn la_fermeture_refusante_journalise_force_le_silence_et_retombe_le_dop() {
 /// Le retour en arrière EXACT : refuser APRÈS avoir converti.
 ///
 /// Ce n'est pas une redite du premier test. Celui-ci rougit sur une forme que
-/// le comptage laisserait passer — quatre appels toujours là, mais rangés
-/// derrière le rééchantillonneur, où le porteur est déjà détruit.
+/// le motif laisserait passer — la garde toujours là, mais rangée derrière la
+/// conversion, où le porteur est déjà détruit.
+///
+/// ⚠️ R1 (#2219) : ce test cherchait deux motifs littéraux, qui portaient sur
+/// des lignes que la réorganisation a supprimées. Cherchés tels quels, ils ne
+/// se trouvaient plus — et le test restait VERT contre rien. Il compare
+/// désormais des POSITIONS dans le corps de la route : un ordre ne peut pas
+/// devenir vide.
 #[test]
-fn aucun_site_ne_refuse_le_porteur_dop_apres_le_reechantillonnage() {
+fn la_route_ne_refuse_pas_le_porteur_dop_apres_la_conversion() {
     let source = sans_commentaires_ni_blancs(production());
-    // ⚠️ La contre-épreuve de CE test a d'abord été NÉGATIVE : écrit sans
-    // l'accolade fermante, le motif ne trouvait rien alors que la garde venait
-    // d'être déplacée sous le rééchantillonneur. Le `}` qui referme
-    // `if needs_resample {` s'intercale, et sans lui ce témoin était une garde
-    // qui ne pouvait pas refuser. Il a été corrigé, puis re-prouvé rouge.
-    for retour_en_arriere in [
-        "samples=rubato_resample_chunk(&mutresampler,&samples,output_ch,false,&mutresample_leftover,);}\
-         ifrefuser_le_porteur_dop(",
-        "smp=rubato_resample_chunk(&mutresampler,&smp,output_ch,false,&mutresample_leftover,);}\
-         ifrefuser_le_porteur_dop(",
-    ] {
-        assert!(
-            !source.contains(retour_en_arriere),
-            "#3233 — la garde est passée SOUS `rubato_resample_chunk` : le sinc a \
-             déjà réécrit le porteur DoP, le refus arrive trop tard et le DAC \
-             est muet quoi qu'on journalise"
-        );
-    }
+    let corps = source
+        .split("fnpousser(")
+        .nth(1)
+        .and_then(|s| s.split("fnrendre_la_queue_du_dsp(").next())
+        .expect("#3233 — `EtageDeConversion::pousser` doit rester identifiable");
+
+    let refus = corps
+        .find("ifrefuser_le_porteur_dop(")
+        .expect("#3233 — la route ne refuse plus le porteur DoP du tout");
+    let conversion = corps
+        .find("self.convertir(")
+        .expect("#3233 — la route ne convertit plus : le motif à garder a disparu");
+    let ecriture = corps
+        .find("puits.ecrire(")
+        .expect("#3233 — la route n'écrit plus au puits");
+
+    assert!(
+        refus < conversion && conversion < ecriture,
+        "#3233 — la garde est passée SOUS la conversion : le sinc a déjà \
+         réécrit le porteur DoP, le refus arrive trop tard et le DAC est muet \
+         quoi qu'on journalise (refus={refus}, conversion={conversion}, \
+         écriture={ecriture})"
+    );
 }
 
 /// Le TITRE de #3233 : « le filtre de cadence est TAUTOLOGIQUE quand
