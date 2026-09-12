@@ -307,72 +307,54 @@ fn un_octet_abime_fait_rougir_la_garde() {
     }
 }
 
-/// Ce que cette tranche a MESURÉ et ne corrige PAS.
+/// Ce que T3 avait MESURÉ, et que T4 a corrigé.
 ///
-/// `parse_dff` ne respecte pas le remplissage IFF à l'octet pair sur les
+/// `parse_dff` ne respectait pas le remplissage IFF à l'octet pair sur les
 /// sous-chunks qu'il CONNAÎT. Les trois branches `FS  `, `CHNL` et `CMPR`
-/// avancent de `sub_size - n` octets ; seule la branche `_` des sous-chunks
-/// inconnus arrondit, avec `(sub_size + 1) & !1`. Un sous-chunk de taille
+/// avançaient de `sub_size - n` octets ; seule la branche des sous-chunks
+/// inconnus arrondissait, avec `(sub_size + 1) & !1`. Un sous-chunk de taille
 /// impaire — que l'IFF autorise explicitement, à charge pour le lecteur de
-/// sauter l'octet de remplissage — désaligne donc l'analyseur d'un octet. Le
-/// `sub_size` suivant est alors lu sur des octets qui n'en sont pas, et le
-/// `seek` de la branche `_` part avec une valeur absurde.
-///
-/// Mesuré le 12/09/2026 sur `ref_dsd64_stereo_cmpr_impair.dff` (258 o.,
-/// identique à `ref_dsd64_stereo.dff` à une seule différence près : le pstring
-/// `compressionName` de `CMPR` n'est pas complété à l'octet pair, donc
-/// `CMPR` fait 19 octets au lieu de 20) :
+/// sauter l'octet de remplissage — désalignait donc l'analyseur d'un octet, le
+/// `sub_size` suivant était lu sur des octets qui n'en sont pas, et le `seek`
+/// partait avec une valeur absurde :
 ///
 /// ```text
 /// parse_dff → Err("dff skip sub-chunk: Invalid argument (os error 22)")
 /// ```
 ///
-/// Deux choses à retenir, et aucune n'est corrigée ici :
+/// T3 avait retenu deux choses de ce refus : il était SÛR — rien n'atteignait
+/// le DAC — mais son message était illisible pour qui le recevait. « Invalid
+/// argument (os error 22) » sur un `.dff` ne dit ni ce qui manque, ni que le
+/// fichier est en cause.
 ///
-/// 1. **Le refus est SÛR** — rien n'atteint le DAC, et c'est ce qui compte le
-///    plus. Un désalignement qui aurait LU le fichier aurait envoyé des
-///    en-têtes ASCII dans `DsdToPcmStreamer` : du bruit blanc pleine échelle.
-/// 2. **Le message est illisible pour qui l'a reçu.** « Invalid argument
-///    (os error 22) » sur un `.dff` ne dit ni ce qui manque, ni que le fichier
-///    est en cause. Un testeur qui remonte ça ne sera pas diagnostiqué.
-///
-/// Portée réelle : les fichiers conformes ne sont pas touchés — `FS  ` fait 4
-/// octets, `CHNL` 2 + 4 × canaux, et `CMPR` 4 + un pstring complété, tous
-/// pairs. WavPack 5.8.1 écrit bien `CMPR` de taille 20. Le défaut n'atteint
-/// donc qu'un encodeur qui ne complète pas son pstring — mais le format
-/// l'autorise, et c'est exactement la famille de fautes qui produit un
-/// signalement de terrain impossible à reproduire.
-///
-/// Le jour où `parse_dff` arrondira ses trois branches connues, ce témoin
-/// rougira — et c'est la bonne nouvelle : il faudra alors le retourner en
-/// exigeant la LECTURE, et ajouter la fixture à la table ci-dessus.
+/// T4 arrondit les trois branches connues (`dff.rs`,
+/// `taille_avec_remplissage`), et ce témoin est retourné comme T3 le
+/// demandait : il exige désormais la LECTURE. La fixture reste hors de la
+/// table `FIXTURES` — elle ne porte que 258 octets de charge utile, trop peu
+/// pour une empreinte de train DSD, et son objet est l'analyseur, pas le
+/// décodeur.
 #[test]
-fn constat_un_chunk_cmpr_de_taille_impaire_fait_echouer_parse_dff() {
+fn un_chunk_cmpr_de_taille_impaire_se_lit_desormais() {
     let chemin = chemin_fixture("ref_dsd64_stereo_cmpr_impair.dff");
     assert!(
         std::path::Path::new(&chemin).exists(),
         "fixture absente : {chemin}"
     );
 
-    match tune_core::audio::dff::parse_dff(&chemin) {
-        Err(e) => {
-            assert!(
-                e.contains("sub-chunk"),
-                "le refus ne vient plus du saut de sous-chunk mais de « {e} » — \
-                 relire ce constat avant de le croire encore valable"
-            );
-            eprintln!(
-                "T3 #2218 — DSDIFF à sous-chunk de taille impaire (CMPR = 19 o.) : \
-                 `parse_dff` refuse par « {e} ». Refus sûr, message illisible. \
-                 Non corrigé par cette tranche."
-            );
-        }
-        Ok(info) => panic!(
-            "`parse_dff` lit désormais un DSDIFF dont le sous-chunk CMPR est de \
-             taille impaire ({} canaux, {} o. de données) — le défaut constaté le \
-             12/09/2026 est corrigé. Retourner ce témoin en exigeant la lecture, \
-             et porter la fixture dans la table FIXTURES.",
-            info.channels, info.data_size
-        ),
-    }
+    let info = tune_core::audio::dff::parse_dff(&chemin).unwrap_or_else(|e| {
+        panic!(
+            "`parse_dff` refuse un DSDIFF dont le sous-chunk CMPR est de taille \
+             impaire (19 o. au lieu de 20) : « {e} ». Le remplissage IFF n'est \
+             plus appliqué aux sous-chunks connus — c'est la régression du \
+             correctif T4 (#2218)."
+        )
+    });
+    assert_eq!(info.channels, 2, "canaux relus après le remplissage");
+    assert_eq!(info.sample_rate, 2_822_400, "cadence DSD relue");
+    assert_eq!(
+        info.compression.trim_end(),
+        "DSD",
+        "la compression relue n'est plus du DSD brut — l'analyseur est désaligné \
+         d'un octet"
+    );
 }

@@ -1503,6 +1503,7 @@ pub fn decode_wavpack_to_pcm(
         sample_rate: source_rate,
         channels: source_channels,
         duration_s,
+        integrite: Default::default(),
     })
 }
 // ── Tests ──────────────────────────────────────────────────────────────

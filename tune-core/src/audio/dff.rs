@@ -22,6 +22,49 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
+/// Taille RÉELLEMENT occupée par un chunk IFF, en-tête exclu (#2218 T4).
+///
+/// Le DSDIFF hérite de l'IFF : un chunk de taille IMPAIRE porte un octet de
+/// remplissage que le lecteur doit sauter. `parse_dff` arrondissait déjà sur
+/// les branches inconnues (`(sub_size + 1) & !1`), mais PAS sur les trois
+/// sous-chunks qu'il connaît — `FS  `, `CHNL` et `CMPR`. Un `CMPR` de 19
+/// octets désalignait donc l'analyseur d'un octet, le `sub_size` suivant était
+/// lu sur des octets qui n'en sont pas, et le `seek` partait avec une valeur
+/// absurde : `Invalid argument (os error 22)`, mesuré le 12/09/2026 sur
+/// `tests/fixtures/dsd/ref_dsd64_stereo_cmpr_impair.dff`.
+///
+/// `saturating_add` plutôt que `+` : un `sub_size` de `u64::MAX` — que rien
+/// n'empêche d'apparaître dans un en-tête abîmé — débordait en `0`, ce qui
+/// faisait relire le même sous-chunk à l'infini.
+fn taille_avec_remplissage(taille: u64) -> u64 {
+    taille.saturating_add(1) & !1
+}
+
+/// Refuse, EN LE NOMMANT, un chunk qui déborde de son parent.
+///
+/// Sans cette borne, `seek(SeekFrom::Current(padded as i64))` recevait la
+/// valeur brute : au-delà de 2^63 elle devient un déplacement NÉGATIF, et
+/// l'OS répond « Invalid argument (os error 22) » — un message qui ne dit ni
+/// quel chunk est en cause, ni que le fichier l'est. Le refus était sûr ; il
+/// était illisible. Améliorer le message n'arbitre rien : on refusait déjà.
+fn borner_dans_le_parent(
+    id: &[u8; 4],
+    annonce: u64,
+    occupe: u64,
+    restant: u64,
+    parent: &str,
+) -> Result<(), String> {
+    if occupe > restant {
+        return Err(format!(
+            "dff: en-tête DSDIFF incohérent — le chunk « {} » annonce {annonce} octets \
+             (soit {occupe} avec le remplissage IFF) alors qu'il ne reste que {restant} \
+             octets dans {parent}",
+            String::from_utf8_lossy(id).trim_end()
+        ));
+    }
+    Ok(())
+}
+
 /// Parsed DFF (DSDIFF) file header information.
 #[derive(Debug, Clone)]
 pub struct DffInfo {
@@ -202,6 +245,19 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
 
                     let sub_id = [sub_header[0], sub_header[1], sub_header[2], sub_header[3]];
                     let sub_size = read_u64_be(&sub_header, 4);
+                    // Le remplissage IFF s'applique à TOUS les sous-chunks, pas
+                    // seulement à ceux qu'on ne connaît pas (#2218 T4).
+                    let occupe = taille_avec_remplissage(sub_size);
+                    let apres_entete = file
+                        .stream_position()
+                        .map_err(|e| format!("dff pos: {e}"))?;
+                    borner_dans_le_parent(
+                        &sub_id,
+                        sub_size,
+                        occupe,
+                        prop_end.saturating_sub(apres_entete),
+                        "le chunk PROP",
+                    )?;
 
                     match &sub_id {
                         b"FS  " => {
@@ -210,7 +266,7 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
                                 .map_err(|e| format!("dff read FS: {e}"))?;
                             sample_rate = Some(read_u32_be(&fs_buf, 0));
                             // Skip any remaining bytes in this sub-chunk
-                            let skip = sub_size.saturating_sub(4);
+                            let skip = occupe.saturating_sub(4);
                             if skip > 0 {
                                 file.seek(SeekFrom::Current(skip as i64))
                                     .map_err(|e| format!("dff skip FS extra: {e}"))?;
@@ -222,7 +278,7 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
                                 .map_err(|e| format!("dff read CHNL: {e}"))?;
                             channels = Some(read_u16_be(&chnl_buf, 0) as u32);
                             // Skip channel ID bytes
-                            let skip = sub_size.saturating_sub(2);
+                            let skip = occupe.saturating_sub(2);
                             if skip > 0 {
                                 file.seek(SeekFrom::Current(skip as i64))
                                     .map_err(|e| format!("dff skip CHNL ids: {e}"))?;
@@ -234,7 +290,7 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
                                 .map_err(|e| format!("dff read CMPR: {e}"))?;
                             compression = Some(String::from_utf8_lossy(&cmpr_buf).to_string());
                             // Skip any remaining bytes (e.g. compression name string)
-                            let skip = sub_size.saturating_sub(4);
+                            let skip = occupe.saturating_sub(4);
                             if skip > 0 {
                                 file.seek(SeekFrom::Current(skip as i64))
                                     .map_err(|e| format!("dff skip CMPR extra: {e}"))?;
@@ -242,9 +298,7 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
                         }
                         _ => {
                             // Skip unknown sub-chunk
-                            // Pad to even boundary (IFF rule)
-                            let padded = (sub_size + 1) & !1;
-                            file.seek(SeekFrom::Current(padded as i64))
+                            file.seek(SeekFrom::Current(occupe as i64))
                                 .map_err(|e| format!("dff skip sub-chunk: {e}"))?;
                         }
                     }
@@ -296,7 +350,7 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
                         break; // seul FRTE nous intéresse dans l'en-tête
                     }
 
-                    let padded = (sub_size + 1) & !1;
+                    let padded = taille_avec_remplissage(sub_size);
                     file.seek(SeekFrom::Current(padded as i64))
                         .map_err(|e| format!("dff skip DST sub-chunk: {e}"))?;
                 }
@@ -306,7 +360,7 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
             }
             _ => {
                 // Skip unknown chunk (pad to even boundary per IFF spec)
-                let padded = (chunk_size + 1) & !1;
+                let padded = taille_avec_remplissage(chunk_size);
                 file.seek(SeekFrom::Current(padded as i64))
                     .map_err(|e| format!("dff skip chunk: {e}"))?;
             }
@@ -515,6 +569,20 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
 
                     let sub_id = [sub_header[0], sub_header[1], sub_header[2], sub_header[3]];
                     let sub_size = read_u64_be(&sub_header, 4);
+                    // Jumeau en mémoire du correctif de `parse_dff` : les deux
+                    // analyseurs doivent refuser et lire les mêmes octets, sans
+                    // quoi un `.dff` se lirait par un chemin et pas par l'autre.
+                    let occupe = taille_avec_remplissage(sub_size);
+                    let apres_entete = cursor
+                        .stream_position()
+                        .map_err(|e| format!("dff pos: {e}"))?;
+                    borner_dans_le_parent(
+                        &sub_id,
+                        sub_size,
+                        occupe,
+                        prop_end.saturating_sub(apres_entete),
+                        "le chunk PROP",
+                    )?;
 
                     match &sub_id {
                         b"FS  " => {
@@ -523,7 +591,7 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
                                 .read_exact(&mut fs_buf)
                                 .map_err(|e| format!("dff read FS: {e}"))?;
                             sample_rate = Some(read_u32_be(&fs_buf, 0));
-                            let skip = sub_size.saturating_sub(4);
+                            let skip = occupe.saturating_sub(4);
                             if skip > 0 {
                                 cursor
                                     .seek(SeekFrom::Current(skip as i64))
@@ -536,7 +604,7 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
                                 .read_exact(&mut chnl_buf)
                                 .map_err(|e| format!("dff read CHNL: {e}"))?;
                             channels = Some(read_u16_be(&chnl_buf, 0) as u32);
-                            let skip = sub_size.saturating_sub(2);
+                            let skip = occupe.saturating_sub(2);
                             if skip > 0 {
                                 cursor
                                     .seek(SeekFrom::Current(skip as i64))
@@ -549,7 +617,7 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
                                 .read_exact(&mut cmpr_buf)
                                 .map_err(|e| format!("dff read CMPR: {e}"))?;
                             compression = Some(String::from_utf8_lossy(&cmpr_buf).to_string());
-                            let skip = sub_size.saturating_sub(4);
+                            let skip = occupe.saturating_sub(4);
                             if skip > 0 {
                                 cursor
                                     .seek(SeekFrom::Current(skip as i64))
@@ -557,9 +625,8 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
                             }
                         }
                         _ => {
-                            let padded = (sub_size + 1) & !1;
                             cursor
-                                .seek(SeekFrom::Current(padded as i64))
+                                .seek(SeekFrom::Current(occupe as i64))
                                 .map_err(|e| format!("dff skip: {e}"))?;
                         }
                     }
@@ -598,7 +665,7 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
                         break;
                     }
 
-                    let padded = (sub_size + 1) & !1;
+                    let padded = taille_avec_remplissage(sub_size);
                     cursor
                         .seek(SeekFrom::Current(padded as i64))
                         .map_err(|e| format!("dff skip: {e}"))?;
@@ -608,7 +675,7 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
                 break;
             }
             _ => {
-                let padded = (chunk_size + 1) & !1;
+                let padded = taille_avec_remplissage(chunk_size);
                 cursor
                     .seek(SeekFrom::Current(padded as i64))
                     .map_err(|e| format!("dff skip: {e}"))?;
