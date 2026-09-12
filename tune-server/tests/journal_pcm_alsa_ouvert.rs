@@ -21,7 +21,12 @@
 //! Ce qu'elle attrape : un site d'ouverture — celui-ci ou un NOUVEAU — qui
 //! resout un peripherique puis ouvre le flux sans avoir journalise le PCM.
 
-const SOURCE: &str = include_str!("../../tune-core/src/outputs/local.rs");
+// REF-8 (#2219) : le site d'ouverture du flux WAV — résolution, décision de
+// cadence, cascade — vit dans `BackendCpal::ouvrir` (`local/backend.rs`). La
+// garde lit les DEUX fichiers, concaténés : jamais l'un à la place de l'autre.
+const LOCAL: &str = include_str!("../../tune-core/src/outputs/local.rs");
+const BACKEND: &str = include_str!("../../tune-core/src/outputs/local/backend.rs");
+static SOURCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| [LOCAL, BACKEND].concat());
 
 /// Les offsets des APPELS a `find_device_with_fallback` — pas sa definition,
 /// ni les aiguilles que les tests de `local.rs` en font.
@@ -79,8 +84,8 @@ fn chaque_site_d_ouverture_locale_journalise_le_pcm() {
         let ligne = SOURCE[..site].lines().count();
         assert!(
             reste[..fin].contains(trace.as_str()),
-            "site d'ouverture #{rang} (tune-core/src/outputs/local.rs, vers la ligne \
-             {ligne}) : le peripherique est resolu puis ouvert sans que le journal dise \
+            "site d'ouverture #{rang} (local.rs puis local/backend.rs concaténés, vers la \
+             ligne {ligne}) : le peripherique est resolu puis ouvert sans que le journal dise \
              QUEL PCM. Sous Linux c'est toute la difference entre `hw:CARD=…` — le DAC — \
              et `dmix:`/`plughw:`/`default`, qui reechantillonnent en silence. Sans cette \
              ligne, aucun releve de terrain ne peut trancher (#3209, #1655)"

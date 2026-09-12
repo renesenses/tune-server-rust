@@ -38,13 +38,16 @@ const LOCAL: &str = include_str!("../../tune-core/src/outputs/local.rs");
 const BRAS_COREAUDIO: &str = include_str!("../../tune-core/src/outputs/local/bras_coreaudio.rs");
 const BRAS_ASIO: &str = include_str!("../../tune-core/src/outputs/local/bras_asio.rs");
 const BRAS_WASAPI: &str = include_str!("../../tune-core/src/outputs/local/bras_wasapi.rs");
+// REF-8 (#2219) : le backend CPAL partagé (trait `BackendLocal`, anneau, cascade
+// d'ouverture, vidage) — lu EN PLUS de `local.rs`, jamais à sa place.
+const BACKEND: &str = include_str!("../../tune-core/src/outputs/local/backend.rs");
 
 /// Tout ce qui compose la sortie locale : `local.rs` suivi des trois bras
 /// exclusifs. C'est sur CE texte que portent les assertions qui parlent de
 /// « la sortie locale » en général — présence sur les trois transports,
 /// absence d'un second canal.
 fn toute_la_sortie_locale() -> String {
-    [LOCAL, BRAS_COREAUDIO, BRAS_ASIO, BRAS_WASAPI].concat()
+    [LOCAL, BACKEND, BRAS_COREAUDIO, BRAS_ASIO, BRAS_WASAPI].concat()
 }
 
 /// Le corps du chemin CoreAudio exclusif, délimité par ses deux journaux
@@ -248,5 +251,35 @@ fn la_remontee_passe_par_le_canal_deja_ouvert_et_pas_par_un_second() {
         !toute_la_sortie_locale().contains(".emit("),
         "la sortie locale émet elle-même sur le bus d'événements : c'est un SECOND canal, en \
          doublon de `take_output_failure()` que le poller draine déjà à chaque tour (#3108)"
+    );
+}
+
+/// REF-8 (#2219) — l'anneau du chemin CPAL partagé tient aussi deux secondes.
+///
+/// D2 : le backend possède son anneau, et `play_url` ne calcule plus sa
+/// contenance. Elle a suivi le déplacement telle quelle : `cadence × canaux ×
+/// 2`, aux deux cadences de la cascade. C'est elle qui produit le « figée à
+/// 2 s » de #3108 quand le rappel meurt ; la garde suit le fichier qui la
+/// porte désormais, `local/backend.rs`, sans cesser de lire `local.rs`.
+#[test]
+fn l_anneau_cpal_partage_tient_aussi_les_deux_secondes_du_constat() {
+    let sans_blancs: String = BACKEND.chars().filter(|c| !c.is_whitespace()).collect();
+    for contenance in [
+        "letring_cap=(output_config.sample_rateasusize)*(output_config.channelsasusize)*2;",
+        "letring_cap_fb=(source_cfg.sample_rateasusize)*(source_cfg.channelsasusize)*2;",
+        "letcap=(cand.sample_rateasusize)*(cand.channelsasusize)*2;",
+    ] {
+        assert!(
+            sans_blancs.contains(contenance),
+            "la contenance de l'anneau CPAL partagé a changé ou a quitté \
+             `local/backend.rs` (`{contenance}` introuvable) : c'est elle, et non un \
+             délai nommé, qui produit le « figée à 2 s » du constat de #3108 — mettre \
+             à jour le message et cette garde ensemble"
+        );
+    }
+    assert!(
+        !LOCAL.contains("let ring_cap ="),
+        "`play_url` recalcule une contenance d'anneau : D2 (le backend possède son \
+         anneau) n'est plus tenue"
     );
 }

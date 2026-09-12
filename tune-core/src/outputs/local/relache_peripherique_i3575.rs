@@ -214,13 +214,17 @@ fn la_sentinelle_retombe_aussi_quand_le_fil_sort_avant_d_ouvrir() {
 
 /// La partie de `local.rs` qui est du code de PRODUCTION, modules d'épreuves
 /// exclus — même découpe que `repli_format_compresse_i3618`.
-fn code_de_production() -> &'static str {
+fn code_de_production() -> String {
     const TOUT: &str = include_str!("../local.rs");
+    // REF-8 (#2219) : la sonde de cadence du chemin PCM vit dans
+    // `BackendCpal::ouvrir` (`local/backend.rs`) — lu EN PLUS de `local.rs`,
+    // jamais à sa place. `backend.rs` n'a pas de module de test.
+    const BACKEND: &str = include_str!("backend.rs");
     const BORNE: &str = "mod relache_peripherique_i3575";
     let fin = TOUT
         .find(BORNE)
         .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
-    &TOUT[..fin]
+    [&TOUT[..fin], BACKEND].concat()
 }
 
 /// `device_default_sr=None` est la SEULE trace que le relevé de Yacine porte
