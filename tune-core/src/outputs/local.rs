@@ -311,6 +311,12 @@ mod bras_coreaudio;
 #[cfg(target_os = "windows")]
 mod bras_wasapi;
 
+// REF-8 (#2219) : le trait backend minimal et son premier implémenteur, CPAL
+// partagé. Le bras CPAL de `play_url` l'appelle : ouvrir, puits, démarrer,
+// observer, drainer.
+mod backend;
+use backend::{BackendCpal, BackendLocal, DemandeDOuverture, Puits};
+
 // ---------------------------------------------------------------------------
 // Gapless: pending next track for seamless chaining
 // ---------------------------------------------------------------------------
@@ -3247,32 +3253,6 @@ fn prepare_windows_native_pcm(
 // #2218 (puits de capture) aient un endroit où se brancher.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Le puits du chemin CPAL partagé : l'anneau flottant que draine le rappel.
-///
-/// Il porte les trois témoins d'arrêt du fil de lecture parce que l'attente a
-/// lieu ICI : quand l'anneau est plein, c'est `feed_ring_abortable` qui dort,
-/// et c'est donc lui qu'un arrêt doit pouvoir réveiller. Un puits qui ne
-/// bloque jamais — un puits de capture — n'en aura pas besoin, et c'est
-/// précisément pourquoi ils vivent dans l'implémentation et non dans le trait.
-struct PuitsAnneauCpal<'a> {
-    anneau: &'a RingBuf,
-    stop_rx: &'a std::sync::mpsc::Receiver<()>,
-    paused: &'a AtomicBool,
-    force_silent: &'a AtomicBool,
-}
-
-impl PuitsDEchantillons for PuitsAnneauCpal<'_> {
-    fn ecrire(&mut self, mots: &[f32]) -> bool {
-        feed_ring_abortable(
-            self.anneau,
-            mots,
-            self.stop_rx,
-            self.paused,
-            Some(self.force_silent),
-        )
-    }
-}
-
 /// L'état de conversion source → sortie du chemin partagé.
 ///
 /// La même suite de gestes était recopiée à QUATRE endroits de `play_url` —
@@ -4755,489 +4735,41 @@ impl OutputTarget for LocalOutput {
                 });
                 return;
             }
-            #[cfg(not(any(target_os = "macos", all(target_os = "windows", feature = "asio"))))]
-            let _ = exclusive_mode;
-
             // ------- Open cpal device (shared mode) -------
-            let host = select_host(&audio_backend);
-            // Nom de la VARIANTE cpal ("Wasapi", "Alsa", "Asio", "CoreAudio").
-            // `&'static str`, donc aucun emprunt sur `host`.
-            let host_id_name: &'static str = host.id().name();
-            let Some((device, fell_back)) = find_device_with_fallback(
-                &host,
-                &device_name,
-                endpoint_id.as_deref(),
-                origin_host.as_deref(),
-            ) else {
-                record_shared_device_not_found(
-                    SharedDeviceResolution::WavStreamNotFound,
-                    &device_name,
-                    &open_failure,
-                );
-                playing.store(false, Ordering::SeqCst);
-                return;
+            //
+            // R8 (#2219) : la résolution du périphérique, la décision de
+            // cadence et la cascade f32 → i32 → i16 vivent dans
+            // `BackendCpal::ouvrir` (`local/backend.rs`). `play_url` ne crée
+            // plus d'anneau et n'en passe plus d'`Arc` (D2) : il reçoit un
+            // backend, lui demande son format, son puits et une observation.
+            let demande = DemandeDOuverture {
+                spec,
+                device_name: &device_name,
+                endpoint_id: endpoint_id.as_deref(),
+                origin_host: origin_host.as_deref(),
+                audio_backend: &audio_backend,
+                exclusive: exclusive_mode,
+                stop_rx: &stop_rx,
+                paused: &paused,
+                force_silent: &force_silent,
+                volume: &volume,
+                device_gone: &device_gone,
+                starvation: &starvation,
+                soft_mute: soft_mute.clone(),
+                position_ms: &position_ms,
             };
-            if fell_back {
-                info!(
-                    original = %device_name,
-                    "audio_device_fallback_used_for_wav_stream"
-                );
-            }
-
-            // Determine the output config for shared mode.
-            //
-            // Strategy: prefer the device's default/native sample rate and
-            // resample with rubato when the source rate differs.  This is more
-            // reliable than trying to open the device at the source rate:
-            //
-            // - On macOS, cpal's CoreAudio backend does NOT call
-            //   `set_sample_rate` for output streams (only for input).  So
-            //   `build_output_stream` at 96 kHz "succeeds" (CoreAudio inserts
-            //   an internal converter), but the conversion is unreliable on
-            //   many devices/macOS versions and produces white noise.
-            //
-            // - On Windows WASAPI shared mode, the system mixer runs at a
-            //   fixed rate (usually 48 kHz); requesting a different rate may
-            //   be rejected or silently mis-converted.
-            //
-            // By always opening at the device's native rate and doing our own
-            // high-quality sinc resampling (rubato), we guarantee correct
-            // output on all platforms.
-            //
-            // If the source rate happens to match the device rate, no
-            // resampling occurs (zero overhead).
-            //
-            // #3575 - le PCM reellement OUVERT, retenu HORS du bloc de decision
-            // de cadence : opened_endpoint_id meurt avec ce bloc, et le chemin
-            // d'echec qui en a besoin est 300 lignes plus bas.
-            #[cfg(target_os = "linux")]
-            let pcm_ouvert = device.id().map(|id| id.to_string()).unwrap_or_default();
-            let output_config = {
-                // First, get the device's default config (reflects actual
-                // operating rate on most platforms).
-                let default_cfg = match device.default_output_config() {
-                    Ok(c) => Some(c.config()),
-                    Err(e) => {
-                        // #3575 — `device_default_sr=None` était une ABSENCE, et
-                        // une absence ne prouve rien : elle se lisait « ce
-                        // périphérique n'annonce pas de cadence par défaut »
-                        // alors qu'elle veut dire « on vient d'échouer à
-                        // l'ouvrir ». Sur ALSA cette sonde ouvre le MÊME PCM que
-                        // la lecture (`cpal-0.17.3/src/host/alsa/mod.rs:457`) :
-                        // son échec EST le premier `EBUSY`, quelques
-                        // millisecondes avant celui qui arrêtera la zone.
-                        //
-                        // Relevé de Belkadi Yacine, 13 ouvertures sur 13 :
-                        // `None` sur les DIX échecs, une cadence réellement lue
-                        // sur les TROIS réussites. La ligne, elle, manquait.
-                        warn!(
-                            device = %device_name,
-                            error = %e,
-                            "local_audio_default_config_probe_failed"
-                        );
-                        None
-                    }
-                };
-                let default_sr = default_cfg.as_ref().map(|c| c.sample_rate);
-
-                // Ce que l'énumération de cpal RÉPOND. Le filtre est
-                // TAUTOLOGIQUE quand l'énumération est fabriquée :
-                // `find_matching_config` recopie la cadence demandée dans le
-                // `StreamConfig` qu'il rend, donc `c.sample_rate ==
-                // sample_rate` est vrai par construction dès qu'une plage
-                // quelconque a été retenue — et sur WASAPI toutes les plages
-                // sont retenues sans test (#2862). Cette réponse n'est donc
-                // plus qu'une ENTRÉE de la décision (#3233) : c'est
-                // `decide_local_rate_opening` qui tranche, en regardant ce que
-                // la réponse vaut. Elle n'est calculée que si le périphérique
-                // n'est pas déjà à la bonne cadence — sur WASAPI l'énumération
-                // déroule 147 formats, sur ASIO elle touche le pilote.
-                let enumerated = if default_sr == Some(sample_rate) {
-                    None
-                } else {
-                    find_matching_config(&device, channels, sample_rate)
-                        .filter(|c| c.sample_rate == sample_rate)
-                };
-                // Sur ALSA, `endpoint_id` est le nom de PCM (`hw:CARD=…`,
-                // `dmix:CARD=…`) : c'est LUI qui dit si le « oui » vient du
-                // pilote ou d'un rééchantillonneur (#1655). Le journaliser
-                // ici est la ligne qui manquait pour trancher un relevé de
-                // terrain sans y retourner.
-                let opened_endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
-                let rate_evidence =
-                    sample_rate_evidence_for_device(host_id_name, &opened_endpoint_id, true);
-                let decision = decide_local_rate_opening(
-                    sample_rate,
-                    default_sr,
-                    enumerated.is_some(),
-                    rate_evidence,
-                );
-
-                // Ce que la décision ouvre RÉELLEMENT — la seule chose qu'on ait
-                // le droit de remonter.
-                let (chosen, opened_sr, reason) = match (decision, default_cfg, enumerated) {
-                    // Le périphérique y est déjà : aucune conversion, et rien à
-                    // régler côté matériel.
-                    (LocalRateOpening::DeviceAlreadyAtSourceRate, Some(cfg), _) => {
-                        // Le bras NOMINAL — et le plus frequent : le DAC est
-                        // deja a la cadence de la source. Les trois autres bras
-                        // journalisent `endpoint_id` depuis #1655 ; celui-ci ne
-                        // disait rien, si bien qu'un releve de terrain n'aurait
-                        // vu QUE les cas anormaux et aurait conclu de travers
-                        // sur la part de `hw:` dans le parc (#3209).
-                        info!(
-                            source_sr = sample_rate,
-                            backend = %host_id_name,
-                            endpoint_id = %opened_endpoint_id,
-                            rate_support_measured = rate_evidence.is_measured(),
-                            "local_audio_open_device_already_at_source_rate"
-                        );
-                        (cfg, sample_rate, None)
-                    }
-                    // L'énumération est une MESURE et elle retient la cadence :
-                    // on ouvre à la cadence de la source, exactement comme
-                    // avant. Témoin du cas nominal.
-                    //
-                    // A DSD256 file decodes to 352.8kHz; on a DAC left at
-                    // 44.1kHz by the OS the old code resampled 352.8k→44.1k in
-                    // real time, the sinc resampler underran and no sound came
-                    // out (Cyrille, FiiO K3 which natively supports 352.8kHz,
-                    // iFi Neo iDSD).
-                    (LocalRateOpening::AtSourceRateMeasured, _, Some(cfg)) => {
-                        info!(
-                            source_sr = sample_rate,
-                            device_default_sr = ?default_sr,
-                            backend = %host_id_name,
-                            endpoint_id = %opened_endpoint_id,
-                            rate_support_measured = rate_evidence.is_measured(),
-                            "local_audio_open_at_source_rate_reported_supported"
-                        );
-                        // macOS: cpal's CoreAudio backend does NOT switch the
-                        // device's hardware nominal rate for output streams (see
-                        // the note above), so opening the cpal stream "at the
-                        // source rate" leaves the DAC clocked at the OS rate and
-                        // CoreAudio silently converts — which yields SILENCE for
-                        // high-rate DSD→PCM (DSD128/256/512 all decode to
-                        // 352.8kHz; only DSD64's 176.4k survived). We reach this
-                        // branch precisely when the device SUPPORTS the source
-                        // rate but its default differs, so set the hardware
-                        // nominal rate explicitly (what the exclusive/hog path
-                        // already does) — the DAC then actually clocks at
-                        // 352.8kHz. Best-effort: if the device can't be
-                        // resolved/set we fall through to today's behavior (no
-                        // regression). Cyrille: iFi Neo iDSD / FiiO K3, DSD128+
-                        // silent.
-                        #[cfg(target_os = "macos")]
-                        {
-                            use coreaudio::audio_unit::macos_helpers;
-                            if let Some(dev_id) =
-                                macos_helpers::get_device_id_from_name(&device_name, false)
-                            {
-                                let want = cfg.sample_rate as f64;
-                                match macos_helpers::set_device_sample_rate(dev_id, want) {
-                                    Ok(_) => info!(
-                                        device = %device_name,
-                                        to = cfg.sample_rate,
-                                        "local_audio_coreaudio_nominal_rate_set_shared"
-                                    ),
-                                    Err(e) => warn!(
-                                        error = %e,
-                                        wanted = cfg.sample_rate,
-                                        "local_audio_coreaudio_set_rate_failed"
-                                    ),
-                                }
-                            }
-                        }
-                        (cfg, sample_rate, None)
-                    }
-                    // On refuse la cadence de la source : rubato convertit. Une
-                    // décision qui change ce qui part au DAC ne passe jamais en
-                    // silence (#3209, #1655, #3233).
-                    (
-                        LocalRateOpening::ResampleToDeviceRate {
-                            device_sample_rate,
-                            reason,
-                        },
-                        Some(cfg),
-                        _,
-                    ) => {
-                        warn!(
-                            source_sr = sample_rate,
-                            device_sr = device_sample_rate,
-                            backend = %host_id_name,
-                            endpoint_id = %opened_endpoint_id,
-                            rate_support_measured = rate_evidence.is_measured(),
-                            reason = reason.code(),
-                            "local_audio_rate_mismatch_will_resample"
-                        );
-                        (cfg, device_sample_rate, Some(reason))
-                    }
-                    // Aucune cadence de périphérique connue : rien vers quoi
-                    // rééchantillonner, on ouvre à la cadence de la source en
-                    // dernier recours (PipeWire, etc.). Les bras `Some(cfg)`
-                    // ci-dessus étant exhaustifs pour `default_cfg = Some(..)`,
-                    // ce bras ne se prend qu'avec `default_cfg = None` — sauf
-                    // `AtSourceRateMeasured` sans `enumerated`, que
-                    // `decide_local_rate_opening` ne peut pas produire.
-                    _ => {
-                        let cfg = find_matching_config(&device, channels, sample_rate).unwrap_or(
-                            cpal::StreamConfig {
-                                channels,
-                                sample_rate,
-                                buffer_size: cpal::BufferSize::Default,
-                            },
-                        );
-                        let opened = cfg.sample_rate;
-                        info!(
-                            source_sr = sample_rate,
-                            opened_sr = opened,
-                            backend = %host_id_name,
-                            endpoint_id = %opened_endpoint_id,
-                            "local_audio_rate_last_resort_no_device_default"
-                        );
-                        (cfg, opened, None)
-                    }
-                };
-                note_rate_decision(ObservedRate {
-                    source_sample_rate: sample_rate,
-                    opened_sample_rate: opened_sr,
-                    reason,
-                    evidence_measured: rate_evidence.is_measured(),
-                });
-                chosen
-            };
-
-            // Build output stream at the chosen rate.
-            let silent_cb_outer = force_silent.clone();
-            // Gate: the cpal callback outputs silence until enough real data
-            // has been buffered in the ring buffer.  This prevents stale or
-            // garbage audio from reaching the DAC during track transitions.
-            let data_started_shared = Arc::new(AtomicBool::new(false));
-            let build_stream =
-                |cfg: &cpal::StreamConfig,
-                 ring_cb: Arc<RingBuf>,
-                 vol_cb: Arc<AtomicU32>,
-                 paused_cb: Arc<AtomicBool>,
-                 _finished_cb: Arc<AtomicBool>,
-                 silent_cb: Arc<AtomicBool>,
-                 ds_cb: Arc<AtomicBool>,
-                 min_buf: usize,
-                 soft_mute_cb: crate::audio::soft_mute::SoftMuteGate| {
-                    let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
-                    // Prélevé AVANT la fermeture de rendu (#3205).
-                    let famine_cb = ring_cb.starvation();
-                    device.build_output_stream(
-                        cfg,
-                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            // Rampe anti-« ploc » (#1590) — voir le callback du
-                            // chemin compressé pour le détail. `arm(0)` rétablit la
-                            // coupure franche sur DoP, PURE et sortie exclusive.
-                            ramp_cb.arm(soft_mute_cb.armed_ms());
-                            let silence = paused_cb.load(Ordering::Relaxed)
-                                || silent_cb.load(Ordering::Relaxed);
-                            if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent
-                            {
-                                data.fill(0.0);
-                                return;
-                            }
-                            // Wait for a minimum amount of data before starting
-                            // to read from the ring buffer. This prevents the
-                            // audio device from playing stale/garbage samples
-                            // during track transitions.
-                            if !ds_cb.load(Ordering::Acquire) {
-                                if ring_cb.available() < min_buf {
-                                    data.fill(0.0);
-                                    return;
-                                }
-                                ds_cb.store(true, Ordering::Release);
-                            }
-                            let read = ring_cb.pop(data);
-                            let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                            ramp_cb.apply(&mut data[..read], v);
-                            if read < data.len() {
-                                data[read..].fill(0.0);
-                            }
-                        },
-                        make_stream_error_cb(device_gone.clone(), famine_cb),
-                        None,
-                    )
-                };
-
-            let finished_flag = Arc::new(AtomicBool::new(false));
-
-            let ring_cap =
-                (output_config.sample_rate as usize) * (output_config.channels as usize) * 2;
-            starvation.begin_stream(output_config.sample_rate, output_config.channels);
-            let ring_buf = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
-            ring_buf.clear(); // Defensive: zero-fill before callback can read
-            // Minimum buffer: ~200ms of audio before the callback starts reading.
-            // sr * ch / 5 = 200ms of interleaved samples.
-            let min_buffer =
-                (output_config.sample_rate as usize) * (output_config.channels as usize) / 5;
-            let stream_result = build_stream(
-                &output_config,
-                ring_buf.clone(),
-                volume.clone(),
-                paused.clone(),
-                finished_flag.clone(),
-                silent_cb_outer.clone(),
-                data_started_shared.clone(),
-                min_buffer,
-                soft_mute.clone(),
-            );
-
-            let (stream, actual_config, ring) = match stream_result {
-                Ok(s) => (s, output_config, ring_buf),
-                Err(first_err) => {
-                    // Last resort: try the source sample rate directly —
-                    // some platforms (PipeWire) accept arbitrary rates.
-                    let source_cfg = cpal::StreamConfig {
-                        channels,
-                        sample_rate,
-                        buffer_size: cpal::BufferSize::Default,
-                    };
-                    let ring_cap_fb =
-                        (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) * 2;
-                    starvation.begin_stream(source_cfg.sample_rate, source_cfg.channels);
-                    let ring_fb = Arc::new(RingBuf::new_metered(ring_cap_fb, starvation.clone()));
-                    ring_fb.clear();
-                    data_started_shared.store(false, Ordering::SeqCst);
-                    let min_buffer_fb =
-                        (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) / 2;
-                    match build_stream(
-                        &source_cfg,
-                        ring_fb.clone(),
-                        volume.clone(),
-                        paused.clone(),
-                        finished_flag.clone(),
-                        silent_cb_outer.clone(),
-                        data_started_shared.clone(),
-                        min_buffer_fb,
-                        soft_mute.clone(),
-                    ) {
-                        Ok(s) => {
-                            info!(
-                                source_sr = sample_rate,
-                                "local_audio_fallback_to_source_rate"
-                            );
-                            (s, source_cfg, ring_fb)
-                        }
-                        Err(second_err) => {
-                            // Both f32 attempts failed. The hardware likely rejects
-                            // float (bit-perfect integer-only DAC). Cascade integer
-                            // formats — i32 then i16 — at the chosen rate, then the
-                            // source rate. First one the device accepts wins.
-                            let mut candidates: Vec<cpal::StreamConfig> =
-                                vec![output_config.clone()];
-                            if source_cfg.sample_rate != output_config.sample_rate
-                                || source_cfg.channels != output_config.channels
-                            {
-                                candidates.push(source_cfg.clone());
-                            }
-                            let mut built: Option<(
-                                cpal::Stream,
-                                cpal::StreamConfig,
-                                Arc<RingBuf>,
-                            )> = None;
-                            'int_cascade: for cand in &candidates {
-                                let cap =
-                                    (cand.sample_rate as usize) * (cand.channels as usize) * 2;
-                                let min_buf =
-                                    (cand.sample_rate as usize) * (cand.channels as usize) / 5;
-                                for is_i32 in [true, false] {
-                                    starvation.begin_stream(cand.sample_rate, cand.channels);
-                                    let r = Arc::new(RingBuf::new_metered(cap, starvation.clone()));
-                                    r.clear();
-                                    data_started_shared.store(false, Ordering::SeqCst);
-                                    let res = if is_i32 {
-                                        build_int_stream::<i32>(
-                                            &device,
-                                            cand,
-                                            r.clone(),
-                                            volume.clone(),
-                                            paused.clone(),
-                                            silent_cb_outer.clone(),
-                                            data_started_shared.clone(),
-                                            min_buf,
-                                            device_gone.clone(),
-                                            soft_mute.clone(),
-                                        )
-                                    } else {
-                                        build_int_stream::<i16>(
-                                            &device,
-                                            cand,
-                                            r.clone(),
-                                            volume.clone(),
-                                            paused.clone(),
-                                            silent_cb_outer.clone(),
-                                            data_started_shared.clone(),
-                                            min_buf,
-                                            device_gone.clone(),
-                                            soft_mute.clone(),
-                                        )
-                                    };
-                                    if let Ok(s) = res {
-                                        info!(
-                                            format = if is_i32 { "i32" } else { "i16" },
-                                            sample_rate = cand.sample_rate,
-                                            "local_audio_fallback_to_integer_format"
-                                        );
-                                        built = Some((s, cand.clone(), r));
-                                        break 'int_cascade;
-                                    }
-                                }
-                            }
-                            match built {
-                                Some(t) => t,
-                                None => {
-                                    // Every format was refused, so the fault is
-                                    // the device itself, not the encoding. Name
-                                    // the likely cause: the raw ALSA string
-                                    // ("Host is down (112)" — Yacine) reads as a
-                                    // network error and sends people hunting in
-                                    // the wrong place, when it is what the
-                                    // PipeWire ALSA plugin returns if it cannot
-                                    // reach the daemon — typically a server
-                                    // started outside the user session, or a
-                                    // USB DAC that went away.
-                                    let cause = classify_open_failure(&first_err.to_string());
-                                    // #3575 — quand cpal a DÉTRUIT le motif,
-                                    // aller chercher dans /proc qui tient le
-                                    // nœud PCM, au lieu d'attendre un
-                                    // `fuser -v /dev/snd/*` que personne ne
-                                    // tapera.
-                                    #[cfg(target_os = "linux")]
-                                    if cause == OpenFailure::IndisponibleMotifPerdu {
-                                        journaliser_les_teneurs_du_pcm(&pcm_ouvert, &device_name);
-                                    }
-                                    warn!(
-                                        device = %device_name,
-                                        first_error = %first_err,
-                                        second_error = %second_err,
-                                        hint = %cause.log_hint(),
-                                        "audio_stream_build_failed_all_formats"
-                                    );
-                                    // Hand the poller something to say. Without
-                                    // this the zone plays on in silence until the
-                                    // stall heuristics fire ~73 s later, with no
-                                    // message anywhere the user can see.
-                                    if let Ok(mut slot) = open_failure.lock() {
-                                        *slot = Some(format!(
-                                            "Sortie « {device_name} » : {}.",
-                                            cause.user_message()
-                                        ));
-                                    }
-                                    playing.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            }
-                        }
-                    }
+            let mut backend = match BackendCpal::ouvrir(&demande) {
+                Ok(backend) => backend,
+                Err(refus) => {
+                    refus.rapporter(&device_name, &open_failure);
+                    playing.store(false, Ordering::SeqCst);
+                    return;
                 }
             };
+            let sortie = backend.format_ouvert();
 
-            let output_sr = actual_config.sample_rate;
-            let output_ch = actual_config.channels;
+            let output_sr = sortie.cadence;
+            let output_ch = sortie.canaux;
 
             info!(
                 device = %device_name,
@@ -5365,7 +4897,7 @@ impl OutputTarget for LocalOutput {
             //
             // `etage` tient tout ce qui transforme des octets source en mots de
             // sortie ; `puits` tient l'anneau et rien d'autre. Tout ce qui part
-            // au DAC par ce chemin passe par `etage.pousser(&mut puits, …)` —
+            // au DAC par ce chemin passe par `etage.pousser(&mut *puits, …)` —
             // il n'existe plus d'autre route.
             //
             // Le tampon d'attente est amorcé avec le reliquat non aligné de la
@@ -5394,16 +4926,18 @@ impl OutputTarget for LocalOutput {
                 sortie: FormatOuvert::new(output_sr, output_ch),
                 needs_resample,
             };
-            let mut puits = PuitsAnneauCpal {
-                anneau: ring.as_ref(),
-                stop_rx: &stop_rx,
-                paused: paused.as_ref(),
-                force_silent: force_silent.as_ref(),
+            // R8 : le puits vient du backend (D1). CPAL partagé n'en fournit
+            // qu'un, flottant — c'est le chemin DSP, le mot y est `f32` par
+            // construction ; un puits natif ici n'est pas une erreur à
+            // rapporter mais une impossibilité de type.
+            let mut puits = match backend.puits() {
+                Puits::Flottant(puits) => puits,
+                Puits::Natif(_) => unreachable!("BackendCpal ne fournit qu'un puits flottant"),
             };
 
             // Process leftover from header read
             let amorce = etage.pousser(
-                &mut puits,
+                &mut *puits,
                 &mut refuser_le_porteur_dop,
                 &mut |bloc: &ProcessedLocalPcm| {
                     // Diagnostic: log first few f32 samples and detect
@@ -5481,8 +5015,8 @@ impl OutputTarget for LocalOutput {
             let mut stream_started = false;
 
             // Check if initial header data was enough to meet the prefill target
-            if ring.available() >= prefill_target {
-                if let Err(e) = stream.play() {
+            if backend.observer().disponible >= prefill_target {
+                if let Err(e) = backend.demarrer() {
                     warn!(error = %e, "audio_stream_play_failed");
                     playing.store(false, Ordering::SeqCst);
                     return;
@@ -5492,7 +5026,7 @@ impl OutputTarget for LocalOutput {
                     demarrage_ms = chrono_demarrage.elapsed().as_millis() as u64,
 
                     device = %device_name,
-                    prefill_samples = ring.available(),
+                    prefill_samples = backend.observer().disponible,
                     "local_audio_playing_after_prefill"
                 );
             }
@@ -5530,17 +5064,17 @@ impl OutputTarget for LocalOutput {
                 &mut reader,
                 &mut read_buf,
                 &mut etage,
-                &mut puits,
+                &mut *puits,
                 &mut refuser_le_porteur_dop,
                 &mut compteurs,
                 &mut |compteurs| {
                     // Démarrer le flux cpal une fois le pré-remplissage atteint.
                     // Le périphérique ne tire ainsi jamais d'un anneau vide ou
                     // clairsemé — c'était le bruit blanc en début de piste.
-                    if stream_started || ring.available() < prefill_target {
+                    if stream_started || backend.observer().disponible < prefill_target {
                         return true;
                     }
-                    if let Err(e) = stream.play() {
+                    if let Err(e) = backend.demarrer() {
                         warn!(error = %e, "audio_stream_play_failed");
                         playing.store(false, Ordering::SeqCst);
                         return false;
@@ -5550,7 +5084,7 @@ impl OutputTarget for LocalOutput {
                     demarrage_ms = chrono_demarrage.elapsed().as_millis() as u64,
 
                         device = %device_name,
-                        prefill_samples = ring.available(),
+                        prefill_samples = backend.observer().disponible,
                         total_bytes_read = compteurs.total_bytes_read,
                         elapsed_ms = stream_start.elapsed().as_millis() as u64,
                         "local_audio_playing_after_prefill"
@@ -5595,14 +5129,14 @@ impl OutputTarget for LocalOutput {
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }
-                if let Err(e) = stream.play() {
+                if let Err(e) = backend.demarrer() {
                     warn!(error = %e, "audio_stream_play_failed_final");
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }
                 info!(
                     device = %device_name,
-                    ring_available = ring.available(),
+                    ring_available = backend.observer().disponible,
                     "local_audio_playing_short_track_or_eof"
                 );
             }
@@ -5756,7 +5290,7 @@ impl OutputTarget for LocalOutput {
                         prev_ch,
                         dop_active.load(Ordering::Relaxed),
                     );
-                    etage.rendre_la_queue_du_dsp(&mut puits, queue);
+                    etage.rendre_la_queue_du_dsp(&mut *puits, queue);
                 }
 
                 // À cadence source identique, le resampler fait partie du flux
@@ -5906,7 +5440,7 @@ impl OutputTarget for LocalOutput {
                 // #3233 : le porteur DoP ne survit pas a ce chemin — refuser
                 // AVANT que le premier echantillon parte au DAC.
                 let amorce_enchainee =
-                    etage.pousser(&mut puits, &mut refuser_le_porteur_dop, &mut |_| {});
+                    etage.pousser(&mut *puits, &mut refuser_le_porteur_dop, &mut |_| {});
                 match amorce_enchainee {
                     PousseeVersLePuits::PorteurDopRefuse => {
                         if play_generation.load(Ordering::SeqCst) == my_generation {
@@ -5954,7 +5488,7 @@ impl OutputTarget for LocalOutput {
                     &mut next_reader,
                     &mut gapless_read_buf,
                     &mut etage,
-                    &mut puits,
+                    &mut *puits,
                     &mut refuser_le_porteur_dop,
                     &mut compteurs_enchaines,
                     &mut |_| true,
@@ -6034,7 +5568,7 @@ impl OutputTarget for LocalOutput {
                 // La queue est d'abord un bloc normal : elle traverse la MÊME
                 // conversion que l'audio qui la précède. `flush = true` ignore
                 // son argument `samples` et la jetterait.
-                etage.rendre_la_queue_du_dsp(&mut puits, queue);
+                etage.rendre_la_queue_du_dsp(&mut *puits, queue);
             }
 
             // Flush the resampler: process any leftover frames + drain internal delay
@@ -6055,9 +5589,6 @@ impl OutputTarget for LocalOutput {
                 }
             }
 
-            // Signal that HTTP reading is done
-            finished_flag.store(true, Ordering::SeqCst);
-
             // Wait for the ring buffer to drain (real playback) before signalling
             // the natural track end. The HTTP thread finishes FEEDING all samples
             // well before the DAC has PLAYED them — up to ~2s at the output rate
@@ -6075,54 +5606,24 @@ impl OutputTarget for LocalOutput {
             // (force_silent/stop_rx), the queue already moved on (force_silent is
             // only set by a fresh play_url) — so we must NOT emit a natural end for
             // this superseded track.
-            let fed_position_ms = position_ms.load(Ordering::Relaxed);
-            let mut drained_naturally = false;
             // NEVER drain forever: with a dead render callback (USB DAC hot-
             // unplugged, #1626 — on macOS no error callback ever fires) the
             // ring stays full and this loop used to spin until restart, keeping
             // the zone "Playing" and freezing the hotplug rescan. Deadline =
             // queued audio duration + 5s margin (same guard as the ASIO
             // exclusive path's asio_drain_timeout).
-            let drain_deadline =
-                drain_deadline_for(ring.available(), output_sr as u64, output_ch as u64);
-            let drain_started = std::time::Instant::now();
-            loop {
-                if stop_rx.try_recv().is_ok() {
-                    break;
-                }
-                if force_silent.load(Ordering::Relaxed) {
-                    break;
-                }
-                let remaining = ring.available();
-                if remaining == 0 {
-                    drained_naturally = true;
-                    break;
-                }
-                if device_gone.load(Ordering::Relaxed) || drain_started.elapsed() >= drain_deadline
-                {
-                    // No natural end: the tail was never actually played, and
-                    // advancing the queue would immediately hit the same dead
-                    // device.
-                    warn!(
-                        device = %device_name,
-                        remaining_samples = remaining,
-                        device_gone = device_gone.load(Ordering::Relaxed),
-                        "local_audio_drain_timeout"
-                    );
-                    break;
-                }
-                // Report real playback: subtract the still-queued ring content
-                // (interleaved f32 samples at the output rate/channels).
-                if output_sr > 0 && output_ch > 0 {
-                    let ring_ms =
-                        (remaining as f64 / output_ch as f64 / output_sr as f64 * 1000.0) as u64;
-                    position_ms.store(fed_position_ms.saturating_sub(ring_ms), Ordering::Relaxed);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            //
+            // R8 : la boucle de vidage vit dans le backend (`drainer`) ; ici
+            // on ne calcule que sa borne, à partir de ce qu'il observe.
+            let drain_deadline = drain_deadline_for(
+                backend.observer().disponible,
+                output_sr as u64,
+                output_ch as u64,
+            );
+            let vidage = backend.drainer(drain_deadline);
 
-            if http_eof && drained_naturally {
-                position_ms.store(fed_position_ms, Ordering::Relaxed);
+            if http_eof && vidage.vide {
+                position_ms.store(vidage.position_alimentee_ms, Ordering::Relaxed);
                 track_ended_naturally.store(true, Ordering::SeqCst);
                 track_ended_generation.store(my_generation, Ordering::SeqCst);
                 TRACK_END_NOTIFY.notify_one();
@@ -6149,7 +5650,7 @@ impl OutputTarget for LocalOutput {
                 }
             }
 
-            drop(stream);
+            drop(backend);
             if play_generation.load(Ordering::SeqCst) == my_generation {
                 playing.store(false, Ordering::SeqCst);
             } else {
