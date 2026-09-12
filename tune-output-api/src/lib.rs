@@ -8,6 +8,24 @@
 //! `tune-output-api = { git = "https://github.com/renesenses/tune-server-rust" }`
 //! — instead of vendoring a copy of the trait; tune-core re-exports it from
 //! `outputs::traits` so in-tree code is unaffected.
+//!
+//! # Les deux puits (#2218, #2219)
+//!
+//! La caisse porte aussi les deux extrémités de PCM du chemin local, et elles
+//! ne sont pas interchangeables :
+//!
+//! * [`PuitsDEchantillons`] est le puits **flottant** : des `f32` sortis du
+//!   décodage, du DSP et du rééchantillonnage, sur le chemin CPAL partagé. Il
+//!   RESTE le chemin DSP ; rien ici ne le remplace.
+//! * [`PuitsNatif`] est le puits des mots **entiers** : un [`BlocPcm`] — des
+//!   octets et leur [`AudioSpec`], indissociables — rangé octet pour octet,
+//!   sans conversion. Il existe pour les bras exclusifs de REF-8 (CoreAudio,
+//!   ASIO, WASAPI), qui transportent des mots natifs dont des trames DoP
+//!   qu'un puits flottant ne peut pas porter, et pour le banc de #2218 qui
+//!   doit mesurer ce qui part réellement au DAC sur ces bras.
+//!   [`CaptureOutputNatif`] est sa capture. Il ne fait **aucune** conversion
+//!   et ne prend **aucune** décision DoP : les marqueurs le traversent sans
+//!   être lus.
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -1183,6 +1201,23 @@ pub const EMPREINTE_DU_VIDE: u64 = 0xcbf2_9ce4_8422_2325;
 
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// Un tour de FNV-1a 64 bits par octet : XOR puis multiplication.
+///
+/// C'est la **seule** implémentation du hachage de la caisse. [`CaptureOutput`]
+/// la nourrit des octets petit-boutistes de chaque `f32`,
+/// [`CaptureOutputNatif`] des octets tels qu'ils arrivent. Deux copies
+/// auraient pu diverger d'un tour — et les relevés de R1 ne diraient plus
+/// rien de l'une des deux.
+const fn hacher_fnv1a(mut empreinte: u64, octets: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < octets.len() {
+        empreinte ^= octets[i] as u64;
+        empreinte = empreinte.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    empreinte
+}
+
 /// Le puits de capture : il **hache les mots livrés** et publie le **format
 /// réellement ouvert**.
 ///
@@ -1340,10 +1375,7 @@ impl PuitsDEchantillons for CaptureOutput {
         }
         self.mots += mots.len() as u64;
         for mot in mots {
-            for octet in mot.to_bits().to_le_bytes() {
-                self.empreinte ^= u64::from(octet);
-                self.empreinte = self.empreinte.wrapping_mul(FNV_PRIME);
-            }
+            self.empreinte = hacher_fnv1a(self.empreinte, &mot.to_bits().to_le_bytes());
         }
         if let Some(retenue) = self.retenue.as_mut() {
             let place = self.plafond_de_retenue.saturating_sub(retenue.len());
@@ -1351,6 +1383,295 @@ impl PuitsDEchantillons for CaptureOutput {
                 self.retenue_complete = false;
             }
             retenue.extend_from_slice(&mots[..place.min(mots.len())]);
+        }
+        self.vivant
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// REF-8 préparatoire de #2219 — le puits des mots ENTIERS.
+//
+// [`PuitsDEchantillons`] est le puits FLOTTANT : celui du chemin CPAL partagé,
+// où décodage → DSP → rééchantillonnage rendent des `f32`. Les trois bras
+// exclusifs (CoreAudio, ASIO, WASAPI) n'y passent pas : ils transportent des
+// mots entiers tels que lus, dont des trames DoP — un train DSD emballé dans
+// du PCM 24 bits, reconnu à son marqueur alternant `0x05`/`0xFA` dans l'octet
+// de poids fort. Un mot DoP converti en `f32` puis reconverti n'est plus
+// garanti octet pour octet, et le DAC, qui ne voit plus le marqueur, se coupe.
+// Un puits flottant ne PEUT donc pas porter ces bras.
+//
+// R1 (#3958) a nommé la frontière et refusé, explicitement, de choisir le type
+// de mot. Le choix est ici, et c'est l'option A : un **second trait**, qui
+// reçoit un [`BlocPcm`] — des octets ET leur [`AudioSpec`], indissociables
+// (R5, #3965) — et non un trait générique sur le type de mot. Trois raisons :
+//
+//   * un `BlocPcm` ne se réétiquette pas : le puits SAIT dans quel format sont
+//     les octets, et peut refuser ceux qui ne sont pas au format ouvert. Un
+//     `&[i32]` ou un `&[u8]` nu ne le pourrait pas ;
+//   * les octets traversent tels quels : aucune conversion, donc le DoP reste
+//     intact par construction, pas par précaution ;
+//   * le puits flottant RESTE le chemin DSP. Un trait générique aurait invité à
+//     unifier les deux, et c'est précisément ce que la tranche interdit.
+//
+// Ce que ce code sert : le banc de #2218 (mesurer ce qui part au DAC) étendu
+// aux bras exclusifs, que REF-8 migrera un par un — CoreAudio d'abord. Aucun
+// bras n'est migré ici ; aucun ne touche `outputs::local`.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Le puits des mots **entiers** : l'extrémité qui reçoit des octets PCM déjà
+/// au format du périphérique, sans conversion.
+///
+/// C'est le pendant de [`PuitsDEchantillons`] pour les bras exclusifs : là où
+/// le puits flottant reçoit des `f32` sortis du DSP, celui-ci reçoit un
+/// [`BlocPcm`] — des octets et le format qui leur donne un sens — et les range
+/// **octet pour octet** là où le pilote viendra les chercher. C'est ce qui
+/// laisse une trame DoP traverser avec son marqueur.
+///
+/// # Ce que ce trait ne fait PAS
+///
+/// * Aucune conversion : ni profondeur, ni cadence, ni canaux. Le format est
+///   convenu à l'ouverture, hors de ce contrat, et un bloc qui ne le respecte
+///   pas est un défaut du producteur — voir [`CaptureOutputNatif`] pour la
+///   réponse que la capture y donne.
+/// * Aucune décision DoP : le puits ne renifle pas les marqueurs et ne sait
+///   pas s'il porte du DSD ou du PCM. C'est le producteur qui le sait, et le
+///   DAC qui le reconnaît.
+/// * Il ne remplace pas le puits flottant : le chemin DSP reste
+///   [`PuitsDEchantillons`].
+///
+/// Le trait ne dit rien du rythme, comme son jumeau : un puits peut bloquer,
+/// écrire sans jamais bloquer, ou ne rien faire du tout.
+pub trait PuitsNatif {
+    /// Range `bloc` — des octets PCM entrelacés, au format de sortie convenu.
+    ///
+    /// Rend `false` **uniquement** quand le puits a cessé de consommer et que
+    /// le producteur doit se démonter : rappel mort, périphérique arraché.
+    /// Rend `true` dans tous les autres cas, **y compris un arrêt demandé** —
+    /// le producteur détecte l'arrêt par ses propres témoins, jamais par cette
+    /// valeur. Confondre les deux ferait passer une pause pour une panne.
+    fn ecrire(&mut self, bloc: BlocPcm<'_>) -> bool;
+}
+
+/// Pourquoi [`CaptureOutputNatif`] a refusé un bloc.
+///
+/// **Aucun bras `_` nulle part** : à l'image de `MixError` (R3), un motif
+/// ajouté ici est réclamé par le compilateur partout où il change quelque
+/// chose. Le motif est lisible par [`CaptureOutputNatif::dernier_refus`] et
+/// s'affiche avec les deux formats en clair — celui attendu, celui venu —
+/// parce qu'un « spec différente » sans les deux valeurs ne se diagnostique
+/// pas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusNatif {
+    /// Le bloc porte un autre [`AudioSpec`] que celui ouvert.
+    ///
+    /// Ce n'est pas une conversion manquée, c'est un producteur qui a changé
+    /// d'étiquette sans rouvrir le puits. Continuer hacherait un mélange de
+    /// deux formats, et l'empreinte ne dirait plus rien de l'un ni de l'autre.
+    SpecDifferente {
+        /// Le format fixé à l'ouverture.
+        attendue: AudioSpec,
+        /// Le format que le bloc refusé portait.
+        recue: AudioSpec,
+    },
+}
+
+impl std::fmt::Display for RefusNatif {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SpecDifferente { attendue, recue } => write!(
+                f,
+                "bloc refusé : spec {recue:?} reçue, spec {attendue:?} attendue à l'ouverture"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RefusNatif {}
+
+/// Le puits de capture des mots entiers : il **hache les octets livrés**, tels
+/// quels, au format fixé à l'ouverture.
+///
+/// C'est [`CaptureOutput`] pour les bras exclusifs : même hachage
+/// (`hacher_fnv1a`, une seule implémentation dans la caisse), mêmes comptes,
+/// même contrat de `false`. Ce qui change est ce qu'il reçoit — un
+/// [`BlocPcm`], et non des `f32` — et ce qu'il en fait : rien. Aucune
+/// conversion, aucune décision DoP ; un marqueur `0x05`/`0xFA` entre et sort
+/// sans être lu.
+///
+/// # Le format est fixé à l'ouverture, et un bloc qui le contredit est REFUSÉ
+///
+/// [`CaptureOutputNatif::ouvrir`] prend l'[`AudioSpec`] attendu. Un bloc dont
+/// la spec diffère rend `false`, n'est **pas** haché, est compté dans
+/// [`CaptureOutputNatif::blocs_refuses`], et laisse son motif dans
+/// [`CaptureOutputNatif::dernier_refus`]. Le puits est alors **mort** : le
+/// contrat de `ecrire` ne connaît qu'un sens à `false` — « le puits a cessé de
+/// consommer » — et un refus qui rendrait `false` en restant vivant lui en
+/// donnerait un second. Un producteur qui change d'étiquette sans rouvrir a
+/// rompu le contrat ; ce que le puits mesure ensuite n'aurait plus de sens.
+///
+/// # Le reste non aligné est GARDÉ, jamais jeté
+///
+/// Un bloc dont la longueur n'est pas un multiple de la trame est haché
+/// entièrement — FNV-1a avance octet par octet, les frontières de blocs lui
+/// sont invisibles — et compté dans [`CaptureOutputNatif::blocs_non_alignes`]
+/// d'après sa propre partition ([`BlocPcm::reste_non_aligne`] non vide). Les
+/// octets qui ne complètent pas une trame sont retenus dans
+/// [`CaptureOutputNatif::reste_en_attente`] et complétés par le bloc suivant :
+/// les trames se comptent sur le flux, pas sur le bloc. C'est le geste que la
+/// doc de [`BlocPcm`] réclame — « à REPORTER sur la lecture suivante » — fait
+/// par le puits lui-même, pour qu'un témoin voie que rien n'a été perdu.
+///
+/// # Ce qu'il n'alloue pas
+///
+/// Un seul `Vec` de capacité `octets_par_trame() - 1`, à l'ouverture. Il ne
+/// grandit jamais : le reste en attente tient toujours sous une trame. Aucune
+/// allocation par bloc.
+pub struct CaptureOutputNatif {
+    spec: AudioSpec,
+    empreinte: u64,
+    octets: u64,
+    trames: u64,
+    blocs: u64,
+    blocs_vides: u64,
+    blocs_non_alignes: u64,
+    blocs_refuses: u64,
+    dernier_refus: Option<RefusNatif>,
+    reste: Vec<u8>,
+    vivant: bool,
+}
+
+impl CaptureOutputNatif {
+    /// Ouvre le puits sur CE format : tout bloc qui en porte un autre sera
+    /// refusé.
+    pub fn ouvrir(spec: AudioSpec) -> Self {
+        Self {
+            spec,
+            empreinte: EMPREINTE_DU_VIDE,
+            octets: 0,
+            trames: 0,
+            blocs: 0,
+            blocs_vides: 0,
+            blocs_non_alignes: 0,
+            blocs_refuses: 0,
+            dernier_refus: None,
+            reste: Vec::with_capacity(spec.octets_par_trame() - 1),
+            vivant: true,
+        }
+    }
+
+    /// Le format fixé à l'ouverture.
+    pub fn spec(&self) -> AudioSpec {
+        self.spec
+    }
+
+    /// L'empreinte FNV-1a de tous les octets acceptés, dans l'ordre de
+    /// livraison, reste en attente compris.
+    pub fn empreinte(&self) -> u64 {
+        self.empreinte
+    }
+
+    /// Le nombre d'octets acceptés, reste en attente compris.
+    pub fn octets(&self) -> u64 {
+        self.octets
+    }
+
+    /// Le nombre de trames COMPLÈTES reçues, comptées sur le flux : un reste
+    /// complété par le bloc suivant fait une trame, pas deux morceaux.
+    pub fn trames(&self) -> u64 {
+        self.trames
+    }
+
+    /// Le nombre d'appels à `ecrire`, blocs vides et blocs refusés compris.
+    pub fn blocs(&self) -> u64 {
+        self.blocs
+    }
+
+    /// Les appels à `ecrire` qui n'ont apporté aucun octet.
+    pub fn blocs_vides(&self) -> u64 {
+        self.blocs_vides
+    }
+
+    /// Les blocs acceptés dont la longueur n'était pas un multiple de la trame,
+    /// d'après leur propre partition.
+    pub fn blocs_non_alignes(&self) -> u64 {
+        self.blocs_non_alignes
+    }
+
+    /// Les blocs refusés pour spec différente. Chacun a tué le puits.
+    pub fn blocs_refuses(&self) -> u64 {
+        self.blocs_refuses
+    }
+
+    /// Le motif du dernier refus, ou `None` si rien n'a été refusé.
+    pub fn dernier_refus(&self) -> Option<RefusNatif> {
+        self.dernier_refus
+    }
+
+    /// Les octets reçus qui ne complètent pas encore une trame. Toujours plus
+    /// court qu'une trame.
+    pub fn reste_en_attente(&self) -> &[u8] {
+        &self.reste
+    }
+
+    /// La durée acceptée, en millisecondes, à la cadence ouverte.
+    pub fn duree_livree_ms(&self) -> u64 {
+        if self.spec.cadence() == 0 {
+            return 0;
+        }
+        self.trames * 1000 / u64::from(self.spec.cadence())
+    }
+
+    /// Déclare le puits mort : les écritures suivantes rendront `false`.
+    pub fn declarer_mort(&mut self) {
+        self.vivant = false;
+    }
+
+    /// Le puits consomme-t-il encore ?
+    pub fn vivant(&self) -> bool {
+        self.vivant
+    }
+}
+
+impl PuitsNatif for CaptureOutputNatif {
+    fn ecrire(&mut self, bloc: BlocPcm<'_>) -> bool {
+        self.blocs += 1;
+        if bloc.spec() != self.spec {
+            self.blocs_refuses += 1;
+            self.dernier_refus = Some(RefusNatif::SpecDifferente {
+                attendue: self.spec,
+                recue: bloc.spec(),
+            });
+            self.vivant = false;
+            return false;
+        }
+        let octets = bloc.octets();
+        if octets.is_empty() {
+            self.blocs_vides += 1;
+            return self.vivant;
+        }
+        if !bloc.reste_non_aligne().is_empty() {
+            self.blocs_non_alignes += 1;
+        }
+        self.empreinte = hacher_fnv1a(self.empreinte, octets);
+        self.octets += octets.len() as u64;
+
+        // Les trames se comptent sur le flux : reste en attente + ce bloc.
+        let par_trame = self.spec.octets_par_trame();
+        let en_flux = self.reste.len() + octets.len();
+        let trames = en_flux / par_trame;
+        let reste = en_flux % par_trame;
+        self.trames += trames as u64;
+        if trames == 0 {
+            // Le bloc entier tient sous une trame avec ce qui l'attendait :
+            // le reste s'allonge, et reste sous `par_trame` par construction.
+            self.reste.extend_from_slice(octets);
+        } else {
+            // Au moins une trame est complète : le nouveau reste est la queue
+            // de CE bloc (`reste < par_trame <= octets.len() + reste.len()`
+            // garantit `reste <= octets.len()`).
+            self.reste.clear();
+            self.reste
+                .extend_from_slice(&octets[octets.len() - reste..]);
         }
         self.vivant
     }
