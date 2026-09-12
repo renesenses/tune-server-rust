@@ -14,7 +14,14 @@
 //!
 //! Les constantes ne sont donc pas des valeurs « attendues » qu'on ajusterait
 //! si le test rougissait : ce sont des RELEVÉS. Si l'une d'elles ne tombe plus,
-//! la réorganisation a changé le rendu, et c'est elle qui a tort.
+//! le rendu a changé, et c'est le changement qui doit se justifier.
+//!
+//! **Une seule chose peut légitimement les faire bouger** : un changement de
+//! rendu VOULU et MESURÉ ailleurs. C'est arrivé une fois, le 13/09/2026, avec
+//! le correctif D1 de #2218 (le rééchantillonneur rendait 20 kHz 10 dB trop
+//! bas aux sources 44,1 kHz) ; les deux empreintes qui rééchantillonnent ont
+//! été remesurées, les deux autres n'ont pas bougé d'un bit. Voir le bloc de
+//! constantes en fin de fichier.
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
@@ -204,21 +211,8 @@ fn le_puits_recoit_les_memes_octets_apres_reechantillonnage() {
     let dsp = DspAuRepos::neuf();
     let mut e = etage(&dsp, pcm16(8192, 2), 44_100, 2, 16, 48_000, 2);
     e.resampler = Some(
-        rubato::Async::<f32>::new_sinc(
-            48_000.0 / 44_100.0,
-            1.1,
-            &rubato::SincInterpolationParameters {
-                sinc_len: 64,
-                f_cutoff: rubato::calculate_cutoff(64, rubato::WindowFunction::BlackmanHarris2),
-                interpolation: rubato::SincInterpolationType::Linear,
-                oversampling_factor: 128,
-                window: rubato::WindowFunction::BlackmanHarris2,
-            },
-            1024,
-            2,
-            rubato::FixedAsync::Input,
-        )
-        .expect("le rééchantillonneur 44,1 → 48 kHz se construit"),
+        crate::audio::resample::new_streaming_resampler(44_100, 48_000, 2)
+            .expect("le rééchantillonneur 44,1 → 48 kHz se construit"),
     );
     let mut puits = puits_empreinte();
     let empreinte = pousser_tout(&mut e, &mut puits);
@@ -229,8 +223,10 @@ fn le_puits_recoit_les_memes_octets_apres_reechantillonnage() {
     );
     assert_eq!(
         empreinte, EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000,
-        "le rééchantillonnage ne rend plus les mêmes octets qu'avant la \
-         réorganisation"
+        "le rééchantillonnage ne rend plus les mêmes octets que le relevé du \
+         13/09 : le noyau de `new_streaming_resampler` a changé. Si c'est \
+         voulu, c'est un changement de RENDU — il se mesure au banc T10 \
+         (`reechantillonnage_reference_2218.rs`) avant d'être acté ici"
     );
 }
 
@@ -252,21 +248,8 @@ fn le_puits_recoit_les_memes_octets_apres_adaptation_puis_reechantillonnage() {
     let dsp = DspAuRepos::neuf();
     let mut e = etage(&dsp, pcm16(8192, 2), 44_100, 2, 16, 48_000, 1);
     e.resampler = Some(
-        rubato::Async::<f32>::new_sinc(
-            48_000.0 / 44_100.0,
-            1.1,
-            &rubato::SincInterpolationParameters {
-                sinc_len: 64,
-                f_cutoff: rubato::calculate_cutoff(64, rubato::WindowFunction::BlackmanHarris2),
-                interpolation: rubato::SincInterpolationType::Linear,
-                oversampling_factor: 128,
-                window: rubato::WindowFunction::BlackmanHarris2,
-            },
-            1024,
-            1,
-            rubato::FixedAsync::Input,
-        )
-        .expect("le rééchantillonneur mono 44,1 → 48 kHz se construit"),
+        crate::audio::resample::new_streaming_resampler(44_100, 48_000, 1)
+            .expect("le rééchantillonneur mono 44,1 → 48 kHz se construit"),
     );
     let mut puits = puits_empreinte();
     let empreinte = pousser_tout(&mut e, &mut puits);
@@ -280,9 +263,10 @@ fn le_puits_recoit_les_memes_octets_apres_adaptation_puis_reechantillonnage() {
     assert_eq!(
         empreinte, EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE,
         "la chaîne complète — adaptation de canaux PUIS rééchantillonnage — ne \
-         rend plus les mêmes octets qu'avant la réorganisation. Si l'ordre a \
-         été inversé, le rééchantillonneur reçoit deux canaux entrelacés là \
-         où il en attend un."
+         rend plus les mêmes octets que le relevé du 13/09. Si l'ordre a été \
+         inversé, le rééchantillonneur reçoit deux canaux entrelacés là où il \
+         en attend un — mais le compte de mots ci-dessus l'aurait déjà dit. \
+         Sinon, c'est le noyau sinc qui a changé : voir le banc T10."
     );
 }
 
@@ -371,9 +355,33 @@ fn un_flux_coupe_en_deux_rend_la_meme_empreinte_qu_entier() {
     );
 }
 
-// Les relevés eux-mêmes. Voir l'en-tête du fichier : ce sont des MESURES
-// prises sur la version d'avant, pas des valeurs à ajuster.
+// Les relevés eux-mêmes. Voir l'en-tête du fichier : ce sont des MESURES,
+// pas des valeurs à ajuster.
+//
+// Les deux PREMIERS datent de `5318d073`, la chaîne en ligne d'avant la
+// réorganisation, et n'ont jamais bougé : aucune conversion de cadence ne les
+// traverse. C'est ce qui rend la suite lisible.
+//
+// Les deux DERNIERS ont été remesurés le 13/09/2026, et il faut dire
+// exactement pourquoi.
+//
+// Ces deux témoins-là injectaient leur PROPRE rééchantillonneur, écrit à la
+// main à 64 coefficients — une valeur qui n'existait déjà plus nulle part en
+// production. Ils imageaient donc un filtre imaginaire : le correctif D1 de
+// #2218 aurait pu changer tout le rendu du produit sans qu'aucun des deux ne
+// bronche. Ils prennent désormais `new_streaming_resampler`, le constructeur
+// de la production, et leurs empreintes suivent le filtre réel — c'est le
+// seul montage où « l'empreinte n'a pas bougé » veut dire quelque chose.
+//
+// Ce qui a changé dans le son, et RIEN d'autre : la fenêtre du noyau passe de
+// Blackman-Harris² à Blackman² et sa longueur de 64 à 256 coefficients, ce
+// qui rend 20 kHz aux sources 44,1 kHz (−10,31 dB → −0,00 dB). L'ORDRE des
+// étages est intact — c'est ce que ces deux témoins gardent, et le compte de
+// mots, lui, n'a pas bougé d'une unité (8 914 pour la chaîne complète) : un
+// ordre inversé le ferait sauter avant même l'empreinte.
 const EMPREINTE_IDENTITE_16_BITS_STEREO: u64 = 0x1433_8456_2279_0c63;
 const EMPREINTE_ADAPTATION_STEREO_VERS_MONO: u64 = 0x3557_16d1_b565_a7d6;
-const EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000: u64 = 0x4491_3fae_738e_a9ee;
-const EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE: u64 = 0x8c1c_f175_68c3_9aaa;
+// Était 0x4491_3fae_738e_a9ee avec le noyau 64 écrit à la main.
+const EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000: u64 = 0x7d6d_2c8f_4cee_4f8d;
+// Était 0x8c1c_f175_68c3_9aaa avec le noyau 64 écrit à la main.
+const EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE: u64 = 0x6cc3_fd32_3965_25ed;
