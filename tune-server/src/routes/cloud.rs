@@ -39,6 +39,7 @@ pub fn router() -> Router<AppState> {
         .route("/library-sync/status", get(library_sync_status))
         .route("/library-sync/trigger", post(library_sync_trigger))
         .route("/library-sync/full-sync", post(library_sync_full))
+        .route("/library-sync/reconcile", post(library_sync_reconcile))
 }
 
 // ---------------------------------------------------------------------------
@@ -1680,6 +1681,109 @@ async fn library_sync_status(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// Corps de `POST /cloud/library-sync/reconcile`.
+#[derive(serde::Deserialize, Default)]
+struct ReconcileBody {
+    /// Mettre reellement les suppressions en file. Par defaut `false` : on
+    /// regarde le plan avant de l'executer.
+    #[serde(default)]
+    apply: bool,
+    /// Inclure les pistes. Par defaut `false` : 235 pages sous un plafond de
+    /// 60 requetes par minute, pour un ecart mesure de -1.
+    #[serde(default)]
+    tracks: bool,
+}
+
+/// Le mode que le corps de la requete demande.
+///
+/// `Mode::ABlanc` sauf demande EXPLICITE. Extrait en fonction PURE parce
+/// qu'une garde qui lit la source ne prouve pas grand-chose : elle se fait
+/// aveugler des qu'un module de test etranger est pose plus haut dans le
+/// fichier (mesure le 12/09/2026 — #3906 a insere `validation_licence_3906`
+/// AVANT ce point d'appel, et la coupe a `#[cfg(test)]` amputait tout le
+/// reste). Ici, le test APPELLE cette fonction : plus rien a grepper.
+///
+/// Le type — et non un second `bool` colle a `body.tracks` — interdit en
+/// outre d'echanger les deux arguments a l'appel de `reconcilier()`.
+fn mode_demande(body: &ReconcileBody) -> tune_core::cloud::library_reconcile::Mode {
+    use tune_core::cloud::library_reconcile::Mode;
+    if body.apply {
+        Mode::Appliquer
+    } else {
+        Mode::ABlanc
+    }
+}
+
+/// POST /cloud/library-sync/reconcile — effacer du cloud ce que le serveur ne
+/// possede plus.
+///
+/// A BLANC par defaut. Le rapport dit alors ce qui SERAIT supprime, et le
+/// journal porte le plan (`cloud_library_reconcile_plan`). Passer
+/// `{"apply": true}` met les suppressions en file ; c'est le passage de
+/// synchro suivant qui les pousse.
+///
+/// Manuelle et non automatique, deliberement : declencher une suppression de
+/// masse au demarrage sans l'avoir vue tourner une fois serait imprudent.
+async fn library_sync_reconcile(
+    State(state): State<AppState>,
+    body: Option<Json<ReconcileBody>>,
+) -> impl IntoResponse {
+    if let Err(resp) = crate::premium_guard::require_premium(
+        &state.license,
+        tune_core::license::Feature::CloudBackup,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    let Json(body) = body.unwrap_or_default();
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
+    let token = match settings.get("mozaik_access_token").ok().flatten() {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(json!({"error": "No Mozaik access token — log in via SSO first"})),
+            )
+                .into_response();
+        }
+    };
+    if server_id.is_empty() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({"error": "No server_id configured"})),
+        )
+            .into_response();
+    }
+
+    let mode = mode_demande(&body);
+
+    let rapport = tune_core::cloud::library_reconcile::reconcilier(
+        &state.backend,
+        &state.http_client,
+        tune_core::cloud::library_reconcile::CLOUD_LIBRARY_API,
+        &server_id,
+        &token,
+        body.tracks,
+        mode,
+    )
+    .await;
+
+    Json(json!({
+        "dry_run": rapport.a_blanc,
+        "artists": rapport.artistes_orphelins,
+        "albums": rapport.albums_orphelins,
+        "tracks": rapport.pistes_orphelines,
+        "total": rapport.total(),
+        "refused": rapport.refus,
+        "pending_after": tune_core::cloud::library_sync::pending_count(&state.backend),
+    }))
+    .into_response()
+}
+
 /// POST /cloud/library-sync/trigger — triggers immediate sync (premium only).
 async fn library_sync_trigger(State(state): State<AppState>) -> impl IntoResponse {
     if let Err(resp) = crate::premium_guard::require_premium(
@@ -1827,4 +1931,115 @@ async fn library_sync_full(State(state): State<AppState>) -> impl IntoResponse {
         "message": "Full library sync has been queued in the background",
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+
+    /// La propriete qui compte : un appel sans corps, ou avec un corps qui ne
+    /// dit rien, ne doit RIEN supprimer. La route passe `!body.apply` au
+    /// module, donc `apply = false` signifie « a blanc ».
+    ///
+    /// Si ce booleen s'inverse un jour, un simple `curl -X POST` sur la route
+    /// viderait le catalogue en ligne de tout ce que le serveur ne possede
+    /// plus — sans que personne l'ait demande.
+    #[test]
+    fn la_reconciliation_est_a_blanc_par_defaut() {
+        assert!(
+            !ReconcileBody::default().apply,
+            "le defaut doit etre `a blanc`"
+        );
+
+        let vide: ReconcileBody = serde_json::from_str("{}").expect("corps vide");
+        assert!(!vide.apply, "un corps vide doit rester `a blanc`");
+        assert!(
+            !vide.tracks,
+            "un corps vide ne doit pas parcourir les pistes"
+        );
+
+        let demande: ReconcileBody =
+            serde_json::from_str(r#"{"apply":true}"#).expect("corps explicite");
+        assert!(
+            demande.apply,
+            "seule une demande EXPLICITE doit mettre en file"
+        );
+    }
+
+    /// La source de ce fichier, amputee de CE module de test.
+    ///
+    /// La coupe doit ignorer le module de test lui-meme : sinon la chaine
+    /// cherchee apparait dans sa propre assertion et la garde se satisfait
+    /// toute seule. Contre-epreuve du 04/09/2026 : sans cette coupe, retirer
+    /// la negation dans la route laissait le test VERT.
+    ///
+    /// 🔴 Elle coupait au PREMIER `#[cfg(test)]` du fichier. Mesure le
+    /// 12/09/2026 : #3906 a depuis pose `validation_licence_3906` a la ligne
+    /// 1396, soit AVANT le gestionnaire de reconciliation — la tranche
+    /// inspectee s'arretait donc bien avant lui, et la garde du mode par
+    /// defaut rougissait sans qu'aucune regression n'ait eu lieu. La coupe se
+    /// fait desormais sur CE module, nomme, quel que soit le nombre de
+    /// modules de test poses plus haut.
+    fn source_hors_tests() -> &'static str {
+        let source = include_str!("cloud.rs");
+        match source.find("mod reconcile_tests") {
+            Some(i) => &source[..i],
+            None => panic!("`mod reconcile_tests` introuvable — coupe impossible"),
+        }
+    }
+
+    #[test]
+    fn la_route_de_reconciliation_est_montee() {
+        let source = source_hors_tests();
+        assert!(
+            source.contains(r#".route("/library-sync/reconcile", post(library_sync_reconcile))"#),
+            "la route /library-sync/reconcile doit etre montee sur le routeur"
+        );
+
+        // Et que le gestionnaire decide bien son mode par `mode_demande` —
+        // dont le test ci-dessous eprouve le defaut. Sans ce lien, la
+        // fonction pourrait etre juste et le gestionnaire ne pas s'en servir.
+        assert!(
+            source.contains("let mode = mode_demande(&body);"),
+            "le gestionnaire doit prendre son mode de `mode_demande`"
+        );
+    }
+
+    /// 🔴 La propriete qui compte cote route : sans demande EXPLICITE, le mode
+    /// est `ABlanc`. Eprouvee en APPELANT la production, pas en lisant sa
+    /// source.
+    ///
+    /// Ce que ce test ne prouve pas : que le mode a blanc n'ecrit rien. Ca,
+    /// c'est `tune-core/tests/reconciliation_a_blanc_2373.rs` qui l'exerce,
+    /// en faisant agir `reconcilier()` contre un cloud simule puis en
+    /// relisant `sync_changelog`.
+    #[test]
+    fn sans_demande_explicite_le_mode_est_a_blanc() {
+        use tune_core::cloud::library_reconcile::Mode;
+
+        assert_eq!(mode_demande(&ReconcileBody::default()), Mode::ABlanc);
+
+        let vide: ReconcileBody = serde_json::from_str("{}").expect("corps vide");
+        assert_eq!(
+            mode_demande(&vide),
+            Mode::ABlanc,
+            "un `curl -X POST` sans corps doit simuler, jamais supprimer"
+        );
+
+        let autre_chose: ReconcileBody =
+            serde_json::from_str(r#"{"tracks":true}"#).expect("corps sans `apply`");
+        assert_eq!(
+            mode_demande(&autre_chose),
+            Mode::ABlanc,
+            "un corps qui ne dit rien d`apply` doit rester a blanc"
+        );
+
+        let demande: ReconcileBody =
+            serde_json::from_str(r#"{"apply":true}"#).expect("demande explicite");
+        assert_eq!(
+            mode_demande(&demande),
+            Mode::Appliquer,
+            "seule une demande EXPLICITE doit mettre en file"
+        );
+    }
 }
