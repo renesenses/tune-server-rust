@@ -405,6 +405,22 @@ fn le_chemin_partage_et_son_enchainement_rapportent_aussi_leur_blocage() {
         "les DEUX boucles producteur de `play_url` — piste initiale, piste enchaînée — doivent \
          recevoir le nom du backend par `BackendLocal::nom()` (#3108, REF-7)"
     );
+    // REF-8 (#2219) : le rapport porte aussi la POSITION où l'écran s'est figé.
+    // Cette garde vivait sur le rapport propre du bras CoreAudio, qui n'existe
+    // plus depuis que la famine est dite UNE fois par la boucle ; elle suit le
+    // rapport jusqu'à son unique site, sans rien perdre.
+    assert!(
+        boucle[boucle
+            .find("record_feed_stall_failure(")
+            .expect("site de blocage")..]
+            .chars()
+            .take(240)
+            .collect::<String>()
+            .contains("self.position_ms.load("),
+        "le rapport de blocage de la boucle commune ne porte plus la position où l'écran s'est \
+         figé — le seul chiffre qui relie ce que le testeur voit (« 2 s ») à ce que le journal \
+         dit (#3108, REF-8)"
+    );
 
     // Et elle le rapporte pour les DEUX pistes : les deux noms d'événement
     // vivent au même endroit, sous le rôle de la boucle. C'est ce que les deux
