@@ -63,7 +63,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     );
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
-    spawn_slimproto_server(state, config.port);
+    spawn_slimproto_server(state, config);
     spawn_social_sharing_listener(state);
     crate::routes::developer_api::spawn_webhook_dispatcher(state);
     #[cfg(feature = "oaat")]
@@ -442,7 +442,14 @@ async fn spawn_relay_client(state: &AppState) {
     }
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    if let Some(_client) = tune_core::cloud::relay::spawn_relay_client(&settings, state.port) {
+    if let Some(client) = tune_core::cloud::relay::spawn_relay_client(&settings, state.port) {
+        // Ranger l'Arc : sans cela le client tourne, mais
+        // `/cloud/relay/status` lit un emplacement vide et annonce
+        // `connected: false` a vie. Garde : `publication_du_relais` dans
+        // state.rs.
+        if state.relay_client.set(client).is_err() {
+            warn!("relay client already published — spawn called twice");
+        }
         info!("cloud relay client spawned");
     }
 }
@@ -976,6 +983,41 @@ async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
     }
 }
 
+/// La base d'URL du proxy Deezer, REMISE aux lecteurs du réseau.
+///
+/// #3867 — ce site lisait `get_local_ip()` brut, deux fonctions sous un
+/// annonceur SSDP qui, lui, respecte `advertised_ip`. Sur un hôte
+/// multi-domicilié (VPN, NordVPN, plusieurs cartes réseau), Tune s'annonçait
+/// donc à la bonne adresse et remettait en même temps des URL portant l'autre :
+/// le lecteur recevait une adresse qu'il ne sait pas joindre.
+///
+/// Le CONSOMMATEUR est `DeezerService::get_track_url`
+/// (`tune-core/src/streaming/deezer.rs`), qui bâtit `{base}/deezer/{id}.{ext}`
+/// et le rend comme `StreamUrl`. Pour une zone réseau (DLNA/UPnP), cette URL
+/// est celle que le renderer va chercher LUI-MÊME, depuis une autre machine :
+/// elle doit donc porter l'adresse par laquelle on nous joint.
+///
+/// Fonction et non expression en ligne, pour qu'un témoin puisse APPELER la
+/// décision réelle plutôt que d'en recopier les termes.
+pub fn base_du_proxy_deezer(config: &TuneConfig) -> String {
+    format!("http://{}:{}/deezer-proxy", config.server_ip(), config.port)
+}
+
+/// L'adresse que le serveur SlimProto REMET aux contrôleurs distants.
+///
+/// #3867, même défaut et même remède. Le CONSOMMATEUR est le serveur CLI du
+/// port 9090 (`tune-core/src/slimproto/cli_server.rs`), qui recopie cette
+/// adresse dans le `player_ip:{ip}:3483` de sa réponse d'état — une chaîne qui
+/// part sur le réseau, vers un contrôleur tiers (Squeeze-LX, Home Assistant).
+///
+/// Elle n'est PAS l'adresse attendue par `SlimProtoState::server_ip` : voir le
+/// commentaire de [`spawn_slimproto_server`], qui sépare les deux.
+///
+/// Fonction et non expression en ligne, pour la même raison que ci-dessus.
+pub fn adresse_slimproto_remise_aux_controleurs(config: &TuneConfig) -> String {
+    config.server_ip()
+}
+
 async fn configure_deezer_proxy(state: &AppState, config: &TuneConfig) {
     let registry = state.services.lock().await;
     if let Some(svc) = registry.get("deezer") {
@@ -984,13 +1026,7 @@ async fn configure_deezer_proxy(state: &AppState, config: &TuneConfig) {
             .as_any_mut()
             .downcast_mut::<tune_core::streaming::deezer::DeezerService>()
         {
-            let server_ip = tune_core::discovery::ssdp::get_local_ip()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "127.0.0.1".into());
-            deezer.set_proxy_base_url(Some(format!(
-                "http://{}:{}/deezer-proxy",
-                server_ip, config.port
-            )));
+            deezer.set_proxy_base_url(Some(base_du_proxy_deezer(config)));
             info!("deezer_proxy_configured");
         }
     }
@@ -1006,6 +1042,20 @@ fn spawn_alarm_scheduler(state: &AppState) {
 
 fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {
     if tune_core::notifications::is_enabled() {
+        // Site LAISSÉ sur l'autodétection, délibérément (#3867).
+        //
+        // Cette base ne part PAS sur le réseau. Son unique consommateur est
+        // `download_icon` (`tune-core/src/notifications.rs`), qui préfixe un
+        // `cover_path` en `/api/…` pour aller chercher la pochette SUR CE
+        // SERVEUR, depuis CE processus, la ranger dans un cache local, puis la
+        // passer à `show_notification` — AppleScript, toast Windows,
+        // `notify-send` : une notification affichée sur cette machine-ci.
+        //
+        // `advertised_ip` répond à « par quelle adresse me joint-ON ? ». Elle
+        // peut légitimement valoir une adresse NAT, publique ou de pair VPN que
+        // cet hôte ne sait pas joindre lui-même. Y basculer casserait une
+        // pochette qui s'affiche aujourd'hui, pour corriger un défaut que ce
+        // site n'a pas.
         let server_ip = tune_core::discovery::ssdp::get_local_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".into());
@@ -1851,8 +1901,70 @@ fn gethostname() -> Option<String> {
         })
 }
 
-fn spawn_slimproto_server(state: &AppState, port_http: u16) {
-    let local_ip = tune_core::discovery::ssdp::get_local_ip()
+/// La clé du réglage qui décide si Tune s'ANNONCE comme serveur Squeezebox.
+///
+/// Volontairement distincte de `squeezebox_enabled`, qui gouverne l'autre sens
+/// du protocole — voir [`annonce_slimproto_activee`].
+pub(crate) const CLE_ANNONCE_SLIMPROTO: &str = "slimproto_discovery_enabled";
+
+/// Tune doit-il répondre aux recherches de serveurs Squeezebox du réseau ?
+///
+/// # #3809 — le réglage que le testeur cochait ne gouvernait pas ce chemin
+///
+/// Un testeur (fil `bug-bonjour-4s0m58`, v0.9.145) voit Home Assistant se
+/// remplir de découvertes Squeezebox pointant sur son PC dès que Tune démarre,
+/// et s'arrêter dès qu'il l'arrête. Il écrit : *« Que je coche ou pas la
+/// découverte Squeezebox dans Tune ne change rien. »*
+///
+/// Il a raison, et le code le dit. L'unique interrupteur portant ce nom à
+/// l'écran — `settings.squeezeboxEnabled`, « Activer la découverte
+/// Squeezebox » — écrit `squeezebox_enabled`, dont les SEULS consommateurs sont
+/// `spawn_squeezebox_poller` (ce fichier) et la page d'état
+/// `routes/squeezebox.rs`. Tous deux gouvernent Tune **client** d'un Lyrion
+/// Music Server : ils vont chercher les platines qu'un LMS déclare. Le répondeur
+/// UDP du port 3483, lui — Tune **serveur**, celui que Home Assistant trouve —
+/// n'était gouverné par rien du tout : `spawn_slimproto_server` armait
+/// `discovery::spawn` à chaque démarrage, sans condition.
+///
+/// Les deux directions portent le même mot « découverte » et sont opposées.
+/// C'est ce malentendu que ce réglage sépare.
+///
+/// # Pourquoi vrai par défaut, et pourquoi seulement l'annonce
+///
+/// Le port 3483 a DEUX volets : la connexion de contrôle en TCP, par laquelle
+/// une platine Squeezebox pilote Tune, et le répondeur UDP qui permet à cette
+/// platine de trouver Tune toute seule. #2938 et #2349 ont coûté cher sur ce
+/// point précis — cinq testeurs dont le bind 3483 échouait, plus aucune platine
+/// ne voyant Tune. Ce réglage ne touche donc QUE l'annonce : le TCP reste armé
+/// quoi qu'il arrive, et la valeur par défaut laisse le comportement
+/// exactement tel qu'il est aujourd'hui. Seul un `false` explicite fait taire
+/// l'annonce.
+pub(crate) fn annonce_slimproto_activee(valeur: Option<&str>) -> bool {
+    !matches!(valeur.map(str::trim), Some("false") | Some("0"))
+}
+
+fn spawn_slimproto_server(state: &AppState, config: &TuneConfig) {
+    // DEUX adresses, et non plus une — elles ne répondent pas à la même
+    // question (#3867).
+    //
+    // Celle-ci est REMISE à un tiers : le contrôleur distant qui interroge le
+    // serveur CLI du port 9090. Elle respecte donc le réglage d'adresse
+    // annoncée, comme l'annonceur SSDP de `spawn_upnp_advertiser`.
+    let adresse_remise = adresse_slimproto_remise_aux_controleurs(config);
+
+    // Celle-là, non, et c'est délibéré. `SlimProtoState::server_ip` n'a qu'UN
+    // consommateur dans le dépôt : `sonder_qui_tient_le_port`
+    // (`tune-core/src/slimproto/mod.rs`), qui tente une connexion TCP pour
+    // nommer QUI tient le port 3483 SUR CETTE MACHINE quand le bind échoue
+    // (#2938, #2349) — « un socket lié à 192.168.x.y:3483 seul refuse notre
+    // bind sur 0.0.0.0 sans jamais répondre sur 127.0.0.1 ». Le `strm s` de
+    // démarrage, lui, écrit `server_ip = 0` : le lecteur réutilise l'adresse
+    // de sa connexion de contrôle et ne lit jamais ce champ, malgré ce que
+    // dit encore la doc du champ là-bas.
+    //
+    // Y mettre l'adresse annoncée ferait sonder une AUTRE machine, et
+    // nommerait « un autre serveur écoute » un port pourtant libre ici.
+    let ip_sondee_localement = tune_core::discovery::ssdp::get_local_ip()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
@@ -1861,7 +1973,7 @@ fn spawn_slimproto_server(state: &AppState, port_http: u16) {
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
     let outputs = state.outputs.clone();
-    let server_ip = local_ip.clone();
+    let server_ip = ip_sondee_localement;
     tokio::spawn(async move {
         let server = Arc::new(tune_core::slimproto::SlimProtoServer::new_with_state(
             db, event_bus, outputs, server_ip,
@@ -1874,7 +1986,7 @@ fn spawn_slimproto_server(state: &AppState, port_http: u16) {
         players: tune_core::slimproto::new_player_registry(),
         server_name: "Tune".to_string(),
         server_version: tune_core::version().to_string(),
-        local_ip,
+        local_ip: adresse_remise,
     });
     tokio::spawn(tune_core::slimproto::cli_server::start_cli_server(
         cli_state,
@@ -1883,9 +1995,30 @@ fn spawn_slimproto_server(state: &AppState, port_http: u16) {
     // Le volet UDP du port 3483 : sans lui, une Squeezebox ou un squeezelite
     // en decouverte automatique ne trouve jamais Tune — il fallait donner
     // l'adresse a la main. Le TCP seul est une porte sans sonnette.
+    //
+    // #3809 — mais une sonnette qui sonne chez le voisin. Sur un réseau qui
+    // porte déjà un LMS, Home Assistant redécouvre Tune en boucle comme second
+    // serveur Squeezebox. Ce chemin n'avait AUCUN interrupteur : celui que le
+    // testeur cochait gouverne l'autre sens du protocole. Voir
+    // `annonce_slimproto_activee` — l'annonce seule est gouvernée, jamais
+    // l'écoute TCP armée plus haut (#2938, #2349).
+    let annonce = annonce_slimproto_activee(
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .get(CLE_ANNONCE_SLIMPROTO)
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
+    if !annonce {
+        info!(
+            reglage = CLE_ANNONCE_SLIMPROTO,
+            "slimproto_annonce_desactivee — Tune ne repond plus aux recherches              de serveurs Squeezebox ; l'ecoute TCP 3483 reste armee"
+        );
+        return;
+    }
     tune_core::slimproto::discovery::spawn(tune_core::slimproto::discovery::IdentiteServeur {
         nom: "Tune".to_string(),
-        port_http,
+        port_http: config.port,
         port_cli: 9090,
         version: tune_core::version().to_string(),
     });
@@ -2252,6 +2385,80 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         Err(_) => return,
     };
 
+    {
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
+        // créer quoi que ce soit.
+        //
+        // Une zone locale est identifiée par `local:{nom}`. Quand le pilote
+        // renomme l'endpoint — Windows le fait au changement de taux
+        // d'échantillonnage — la boucle ci-dessous ne reconnaît plus
+        // `local:{nouveau nom}` et offre à l'appareil une zone NEUVE, à côté
+        // de l'ancienne restée orpheline avec tous ses réglages. Cette passe
+        // fait suivre la zone à son appareil, par l'identifiant d'endpoint
+        // stable qu'elle a enregistré.
+        //
+        // La RÈGLE est ailleurs — `outputs::identite_de_sortie`, une fonction
+        // pure : liste BLANCHE de backends (WASAPI et CoreAudio seulement, cf.
+        // sa table), quatre refus nommés, aucune fusion de zones. Ici on ne
+        // fait que lui donner le parc et journaliser ce qu'elle a décidé.
+        //
+        // ⚠️ Elle ne fait pas revenir un appareil DÉBRANCHÉ : un périphérique
+        // absent de `devices` reste introuvable, identifiant ou pas.
+        let parc_pour_identite: Vec<tune_core::outputs::identite_de_sortie::SortieEnumeree> =
+            devices
+                .iter()
+                .map(
+                    |dev| tune_core::outputs::identite_de_sortie::SortieEnumeree {
+                        nom: dev.name.clone(),
+                        endpoint_id: dev.endpoint_id.clone(),
+                    },
+                )
+                .collect();
+        match zone_repo.appliquer_identite_de_sortie(&parc_pour_identite) {
+            Ok(rapport) => {
+                for r in &rapport.reassociees {
+                    info!(
+                        zone_id = r.zone_id,
+                        ancien = %r.ancien_device_id,
+                        nouveau = %r.nouveau_device_id,
+                        endpoint_id = %r.endpoint_id,
+                        "zone_locale_reassociee_par_identifiant_stable"
+                    );
+                }
+                // Les refus sont DITS. Une zone qui ne retrouve pas son
+                // appareil alors qu'elle en connaît l'identifiant est
+                // exactement ce qu'un rapport de bogue doit pouvoir nommer.
+                for (zone_id, motif) in &rapport.refus {
+                    warn!(
+                        zone_id,
+                        motif = %motif,
+                        "reassociation_de_zone_locale_refusee"
+                    );
+                }
+                if !rapport.apprises.is_empty() {
+                    info!(
+                        zones = rapport.apprises.len(),
+                        "identifiant_de_sortie_locale_appris"
+                    );
+                }
+                // Les télécommandes sont connectées, elles : une zone qui
+                // change d'appareil doit se rafraîchir à l'écran, sans quoi
+                // elles gardent l'ancien identifiant jusqu'au prochain
+                // rechargement complet.
+                for r in &rapport.reassociees {
+                    state.event_bus.emit_typed(
+                        tune_core::event_types::EventType::ZoneUpdated,
+                        serde_json::json!({
+                            "zone_id": r.zone_id,
+                            "device_id": r.nouveau_device_id,
+                        }),
+                    );
+                }
+            }
+            Err(e) => warn!(error = %e, "identite_de_sortie_locale_non_appliquee"),
+        }
+    }
     // Collect new device IDs first (no lock needed)
     let new_device_ids: std::collections::HashSet<String> = devices
         .iter()
@@ -3396,6 +3603,150 @@ mod exclusif_par_peripherique_i3245 {
             nombre_de_sites_i3245(&avec_tests),
             1,
             "un site cité dans un module de test ne doit pas être compté"
+        );
+    }
+}
+
+/// #2269 — la passe d'identité doit courir AVANT l'enregistrement, aux DEUX
+/// points qui enregistrent une sortie locale.
+///
+/// « Écrit mais pas branché » est le défaut le plus cher de ce dépôt : une
+/// règle correcte, éprouvée, que personne n'appelle. Ici, l'ordre compte
+/// autant que l'appel — appliquer l'identité APRÈS la boucle
+/// d'enregistrement laisserait la zone neuve déjà créée, et la
+/// ré-association n'aurait plus qu'un doublon à contempler.
+#[cfg(test)]
+mod identite_de_sortie_branchee {
+    /// ⚠️ #2082 — ce fichier est inclus en ENTIER, ce module compris. Un motif
+    /// écrit d'un bloc se trouverait LUI-MÊME et rendrait le garde vrai quoi
+    /// qu'il arrive. Les deux motifs sont donc assemblés à la compilation.
+    const APPEL: &str = concat!("appliquer_identite_de_sortie(&", "parc_pour_identite)");
+    const CONSTRUCTEUR: &str = concat!("LocalOutput::with_options_and_", "endpoint(");
+
+    #[test]
+    fn les_deux_points_denregistrement_appliquent_lidentite_avant_denregistrer() {
+        for (fichier, source) in [
+            ("startup.rs", include_str!("startup.rs")),
+            ("background.rs", include_str!("background.rs")),
+        ] {
+            let appel = source.find(APPEL).unwrap_or_else(|| {
+                panic!(
+                    "{fichier} enregistre une sortie locale sans appliquer \
+                     l'identité de zone : un DAC revenu sous un autre nom y \
+                     recevrait une zone NEUVE à côté de l'ancienne (#2269)."
+                )
+            });
+            let construction = source.find(CONSTRUCTEUR).unwrap_or_else(|| {
+                panic!(
+                    "{fichier} ne construit plus de sortie locale : ce garde \
+                     ne garde plus rien tant qu'il n'a pas suivi."
+                )
+            });
+            assert!(
+                appel < construction,
+                "{fichier} applique l'identité APRÈS avoir enregistré la \
+                 sortie : la zone neuve est déjà créée, et la ré-association \
+                 n'a plus qu'un doublon à contempler (#2269)."
+            );
+        }
+    }
+}
+
+/// #3809 — l'annonce SlimProto, et l'interrupteur qui ne la gouvernait pas.
+#[cfg(test)]
+mod annonce_slimproto_tests {
+    use super::*;
+
+    #[test]
+    fn sans_reglage_l_annonce_reste_armee_comme_avant() {
+        assert!(
+            annonce_slimproto_activee(None),
+            "un parc installé ne doit pas perdre la découverte de ses platines \
+             sur une mise à jour (#2938, #2349)"
+        );
+    }
+
+    #[test]
+    fn seul_un_refus_explicite_fait_taire_l_annonce() {
+        assert!(!annonce_slimproto_activee(Some("false")));
+        assert!(!annonce_slimproto_activee(Some("0")));
+        assert!(!annonce_slimproto_activee(Some("  false  ")));
+    }
+
+    #[test]
+    fn toute_autre_valeur_laisse_l_annonce_armee() {
+        for valeur in ["true", "1", "", "oui", "False"] {
+            assert!(
+                annonce_slimproto_activee(Some(valeur)),
+                "« {valeur} » n'est pas un refus : l'annonce reste armée"
+            );
+        }
+    }
+
+    /// La clé du réglage de l'annonce n'est PAS celle de l'intégration LMS.
+    ///
+    /// Les deux portent le mot « découverte » et vont en sens inverse : c'est
+    /// le malentendu exact que #3809 relève. Les confondre rebrancherait le
+    /// répondeur UDP sur un réglage dont la valeur par défaut est `false` —
+    /// plus aucune platine Squeezebox ne trouverait Tune (#2938, #2349).
+    #[test]
+    fn l_annonce_et_l_integration_lms_ne_partagent_pas_leur_cle() {
+        assert_ne!(CLE_ANNONCE_SLIMPROTO, "squeezebox_enabled");
+    }
+
+    /// Garde de SITE : sans appelant, `annonce_slimproto_activee` serait un
+    /// réglage de plus qui ne gouverne rien — exactement le défaut que #3809
+    /// dénonce. Le dépôt a déjà payé ce motif neuf fois en v0.9.146.
+    ///
+    /// Le marqueur est épelé en deux morceaux pour que ce test ne se compte pas
+    /// lui-même.
+    #[test]
+    fn le_repondeur_udp_ne_part_qu_apres_la_lecture_du_reglage() {
+        let source = include_str!("background.rs");
+        let lecture = concat!("annonce_slimproto_", "activee(");
+        let armement = concat!("slimproto::discovery::", "spawn(");
+        let pos_lecture = source
+            .find(&format!("    let annonce = {lecture}"))
+            .expect("le réglage doit être lu dans `spawn_slimproto_server` (#3809)");
+        let pos_armement = source
+            .find(&format!("    tune_core::{armement}"))
+            .expect("le répondeur UDP doit rester armé quelque part (#2938)");
+        assert!(
+            pos_lecture < pos_armement,
+            "le répondeur UDP s'armait avant toute lecture du réglage : \
+             l'annonce n'était gouvernée par rien (#3809)"
+        );
+    }
+
+    /// Le réglage ne doit toucher QUE l'annonce.
+    ///
+    /// `SlimProtoServer::spawn` (TCP 3483) et le serveur CLI 9090 sont armés
+    /// plus haut dans la même fonction, avant le `return` du refus : les
+    /// déplacer sous la garde couperait la joignabilité des platines, ce que
+    /// #2938 et #2349 interdisent.
+    #[test]
+    fn l_ecoute_tcp_reste_armee_meme_quand_l_annonce_se_tait() {
+        // ⚠️ Le corps est borné à la FONCTION, et chaque marqueur épelé en deux
+        // morceaux. Écrit autrement, ce témoin lisait le fichier entier — donc
+        // ses propres marqueurs — et restait VERT sur son propre sabotage :
+        // mesuré le 11/09, la garde retirée de la fonction ne le faisait pas
+        // rougir.
+        let source = include_str!("background.rs");
+        let debut = source
+            .find(concat!("fn spawn_slimproto_", "server(state: &AppState"))
+            .expect("la fonction doit exister");
+        let corps = &source[debut..];
+        let corps = &corps[..corps.find("\n}\n").expect("la fonction doit se fermer")];
+        let pos_tcp = corps
+            .find(concat!("SlimProtoServer::", "new_with_state"))
+            .expect("le serveur TCP doit être armé dans cette fonction (#2938)");
+        let pos_garde = corps
+            .find(concat!("if !", "annonce {"))
+            .expect("la garde de l'annonce doit exister dans cette fonction (#3809)");
+        assert!(
+            pos_tcp < pos_garde,
+            "l'écoute TCP 3483 doit être armée AVANT la garde : sans elle, \
+             aucune platine Squeezebox ne peut plus piloter Tune (#2938, #2349)"
         );
     }
 }

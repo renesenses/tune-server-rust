@@ -34,6 +34,51 @@ impl DsfInfo {
         (self.sample_rate > 0)
             .then(|| self.total_samples.saturating_mul(1000) / self.sample_rate as u64)
     }
+
+    /// Octets de données DSD que le chunk `fmt ` implique, tous canaux
+    /// confondus : `total_samples` est un compte PAR CANAL, à 8 échantillons
+    /// l'octet.
+    pub fn octets_attendus(&self) -> u64 {
+        self.total_samples
+            .div_ceil(8)
+            .saturating_mul(self.channels as u64)
+    }
+
+    /// 🔴 Le seul recoupement qu'un DSF permette (#2218 T4).
+    ///
+    /// Le DSF ne porte AUCUNE somme de contrôle — ni CRC, ni MD5. Mais il
+    /// annonce sa longueur DEUX fois : le chunk `fmt ` par `total_samples`
+    /// (par canal), le chunk `data` par sa taille en octets. Ces deux
+    /// annonces n'étaient jamais confrontées.
+    ///
+    /// Ce que ça coûtait : `read_dsf_blocks` alloue sa sortie sur la PREMIÈRE
+    /// annonce (`vec![0u8; total_bytes_per_channel * channels]`) et lit borné
+    /// par la SECONDE. Quand `data` est trop court, la boucle s'arrête et la
+    /// queue reste à ZÉRO — rendue en `Ok(_)`, sans un mot.
+    ///
+    /// En DSD, une queue de zéros n'est pas du silence. Le démodulateur lit
+    /// chaque bit à 0 comme un `-1.0` (`dsd_to_pcm.rs`) : c'est du CONTINU À
+    /// PLEINE ÉCHELLE. Des trois formes de perte que le banc #2218 a mesurées,
+    /// c'est la plus violente — et le seul contrôle capable de la voir était à
+    /// portée de main.
+    ///
+    /// ⛔ Cette fonction ne refuse rien et ne tronque rien : elle DÉCRIT. Le
+    /// choix de refuser revient à Bertrand (« D1 »).
+    pub fn incoherence_de_longueur(&self) -> Option<String> {
+        let attendus = self.octets_attendus();
+        (self.data_size < attendus).then(|| {
+            format!(
+                "dsf: le chunk `data` ne porte que {} octets là où `fmt ` en implique \
+                 {attendus} ({} échantillons par canal sur {} canaux) — les {} octets \
+                 manquants seront rendus à ZÉRO, c'est-à-dire en continu à pleine \
+                 échelle après démodulation",
+                self.data_size,
+                self.total_samples,
+                self.channels,
+                attendus - self.data_size
+            )
+        })
+    }
 }
 
 /// Read a little-endian u32 from a byte slice at the given offset.
@@ -144,7 +189,7 @@ pub fn parse_dsf(path: &str) -> Result<DsfInfo, String> {
         .stream_position()
         .map_err(|e| format!("dsf stream_position: {e}"))?;
 
-    Ok(DsfInfo {
+    let info = DsfInfo {
         channels,
         sample_rate,
         bits_per_sample,
@@ -152,7 +197,17 @@ pub fn parse_dsf(path: &str) -> Result<DsfInfo, String> {
         block_size,
         data_offset,
         data_size,
-    })
+    };
+
+    // Le CONSOMMATEUR du recoupement (#2218 T4). À `warn`, donc présent dans
+    // le journal exporté par « Diagnostics » — une ligne `debug` n'y figure
+    // pas. Ici et nulle part ailleurs : `parse_dsf` est le passage obligé des
+    // trois bras (métadonnées, lecture par lots, lecture progressive).
+    if let Some(motif) = info.incoherence_de_longueur() {
+        tracing::warn!(file = path, motif, "dsf_longueurs_annoncees_incoherentes");
+    }
+
+    Ok(info)
 }
 
 /// Read all DSD sample blocks from a DSF file.

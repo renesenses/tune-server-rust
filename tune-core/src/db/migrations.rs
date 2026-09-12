@@ -1761,6 +1761,61 @@ CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(i
         // possible.
         up: include_str!("../../migrations/radios/annuaire_mozaiklabs_2026_09_09.sql"),
     },
+    Migration {
+        version: 99,
+        name: "zones_output_endpoint_id",
+        // #2269 — `zones.output_endpoint_id`, l'identifiant d'endpoint STABLE
+        // du backend pour une sortie locale.
+        //
+        // `output_device_id` vaut `local:{nom du peripherique}` : l'identite
+        // d'une zone locale est son NOM. Windows renomme l'endpoint au
+        // changement de taux d'echantillonnage et la zone ne retrouve plus
+        // rien. L'identifiant qui traverse un renommage existe pourtant depuis
+        // #2403 (`AudioDevice::endpoint_id`, capture a la decouverte, lu EN
+        // PREMIER par `resolve_device`) — rien ne le persistait.
+        //
+        // La colonne ne REMPLACE pas `output_device_id` : celui-ci reste
+        // l'identite de la zone, et tout ce qui s'y accroche — reglages, file,
+        // volume, index unique partiel `idx_zones_output_device_id` — reste en
+        // place. AUCUNE ligne existante n'est modifiee par cette migration :
+        // NULL veut dire « pas encore appris », jamais « inconnu donc
+        // n'importe lequel ». La valeur ne s'ecrit qu'au moment ou
+        // l'enumeration montre l'appareil sous le nom que la zone porte DEJA
+        // (`identite_de_sortie::Decision::Apprend`).
+        //
+        // TEXT des deux cotes : rien a rattraper en parite de types PG.
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95
+        // et 96.
+        up: "",
+    },
+    // #2001, piste 2 — l'ordre manuel des favoris.
+    //
+    // Le tri par champ (piste 1) est arrive avec la PR #2829 ; il ne rend pas
+    // le geste de Tades, qui voulait DEPLACER un favori a la souris. Il faut
+    // pour cela un rang ecrit par l'utilisateur, et donc une colonne.
+    //
+    // `position` est NULLABLE, et NULL veut dire « jamais range a la main » :
+    // c'est l'etat de TOUTES les lignes existantes, et le tri manuel les met en
+    // fin de liste (regle 2 de `favorites_sort`). Aucune valeur par defaut : un
+    // `DEFAULT 0` donnerait a tout le parc le meme rang, donc un ordre manuel
+    // qui ne range rien tout en pretendant exister.
+    //
+    // Les deux tables que Tune POSSEDE la recoivent — `favorites` (bibliotheque
+    // locale) et `streaming_favorites` (favoris de service enregistres chez
+    // Tune). Les favoris lus en direct chez Qobuz/Tidal n'ont pas de ligne ici
+    // et restent donc hors du rang manuel : arbitrage non rendu.
+    //
+    // Colonnes posees par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95, 96 et 99 :
+    // l'ALTER planterait le runner en « duplicate column name » sur une base
+    // qui les a deja, donc au premier demarrage apres mise a jour.
+    Migration {
+        version: 100,
+        name: "favoris_ordre_manuel",
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2853,6 +2908,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "mac", "TEXT");
     // DUP-1 (phase 2) : derniere reponse de l'appareil, ISO 8601 UTC, NULL = jamais vue.
     add_column_if_missing(db, "zones", "last_seen_at", "TEXT");
+    // #2269 : identifiant d'endpoint stable de la sortie locale, NULL pour
+    // l'existant. Voir la migration 99 et `outputs::identite_de_sortie`.
+    add_column_if_missing(db, "zones", "output_endpoint_id", "TEXT");
     // BIB-B2 : empreinte du contenu audio decode, versionnee (env100ms-v1:<hex>).
     add_column_if_missing(db, "tracks", "audio_fingerprint", "TEXT");
 
@@ -2902,6 +2960,21 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "favorites", "item_name", "TEXT");
     add_column_if_missing(db, "favorites", "item_artist", "TEXT");
     add_column_if_missing(db, "favorites", "item_path", "TEXT");
+
+    // Rang manuel des favoris (migration 100, #2001 piste 2). NULL = jamais
+    // range a la main, ce qui est l'etat de toutes les lignes existantes et
+    // renvoie le favori en fin d'ordre manuel. Passe de surete du meme ordre
+    // que `is_compilation` ci-dessus, et pour la meme raison : les requetes de
+    // tri (`list_favorites_*_pour_tri`) NOMMENT la colonne — une base qui
+    // arriverait ici sans elle rendrait la liste des favoris vide des qu'un
+    // client demanderait un tri. PG : migration 057.
+    add_column_if_missing(db, "favorites", "position", "INTEGER");
+    // La jumelle sur `streaming_favorites` est posee PLUS BAS, apres le
+    // `CREATE TABLE IF NOT EXISTS streaming_favorites` de rattrapage : ici la
+    // table peut ne pas encore exister sur une base qui a saute la migration 58,
+    // et `add_column_if_missing` avale l'echec (`.ok()`) — la colonne
+    // manquerait alors en silence, et la requete de tri qui la NOMME rendrait
+    // une liste vide.
 
     // Provenance d'un embedding CLAP (#1732 phase 1) : NULL = analysé sur le
     // fichier, 'inherited:<id>' = copié depuis une jumelle (le DSD est exclu
@@ -2979,6 +3052,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         );",
     )
     .ok();
+    // Rang manuel des favoris de service (migration 100, #2001 piste 2) —
+    // jumelle de `favorites.position` posee plus haut, mais ICI parce que la
+    // table vient seulement d'etre garantie. PG : migration 057.
+    add_column_if_missing(db, "streaming_favorites", "position", "INTEGER");
+
     // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
     // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
     // on DBs that skipped the numbered unified-queue migration.
@@ -3453,6 +3531,29 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
              VALUES (54, 'semis_radios_paradise_annuaire_2026_09_09') \
              ON CONFLICT (version) DO NOTHING;\n"
         ),
+    ),
+    // Jumelle PostgreSQL de la migration SQLite 99 (#2269). Sans elle, tout le
+    // parc PostgreSQL (.15, .18, Docker) n'aurait pas la colonne et la lecture
+    // de `output_endpoint_id` y renverrait « column does not exist » — donc
+    // aucune re-association nulle part, en silence.
+    (
+        55,
+        "zones_output_endpoint_id",
+        include_str!("../../migrations/postgres/055_zones_output_endpoint_id.sql"),
+    ),
+    (
+        56,
+        "zones_drapeaux_entiers",
+        include_str!("../../migrations/postgres/056_zones_drapeaux_entiers.sql"),
+    ),
+    // Jumelle de la migration SQLite 100 (#2001, piste 2) : le rang manuel des
+    // favoris. Sans elle, la colonne n'atteindrait jamais une base PostgreSQL
+    // deja creee — et les requetes de tri, qui la NOMMENT des cette version,
+    // y rendraient une erreur SQL, donc une liste de favoris vide (#2111).
+    (
+        57,
+        "favoris_ordre_manuel",
+        include_str!("../../migrations/postgres/057_favoris_ordre_manuel.sql"),
     ),
 ];
 
@@ -4142,6 +4243,117 @@ mod tests {
         // Ni le NUL ni le vide ne deviennent une date inventee.
         assert_eq!(lire("Sans heure"), None);
         assert_eq!(lire("Vide").as_deref(), Some(""));
+    }
+
+    /// #2269 — une base NÉE AVANT la colonne gagne `output_endpoint_id`, et
+    /// n'y perd aucune ligne.
+    ///
+    /// ⚠️ C'est le SEUL témoin qui éprouve ce chemin. Les témoins de
+    /// `zone_repo` partent d'un `init_schema()`, où `CORE_SCHEMA` pose déjà la
+    /// colonne : débrancher `add_column_if_missing` les laisse tous VERTS.
+    /// Sur le terrain, la base d'un testeur ne passe jamais par `CORE_SCHEMA`
+    /// — elle existe déjà — et c'est `add_column_if_missing` seul qui lui pose
+    /// la colonne. Sans lui, `sorties_locales_et_leur_identite` rend une liste
+    /// vide à jamais (« no such column »), et RIEN ne se ré-associe, en
+    /// silence : exactement le défaut « écrit mais pas branché ».
+    ///
+    /// Le compte des collisions sur la nouvelle clef est mesuré ici aussi :
+    /// après migration, aucune ligne ne porte de valeur, donc aucune n'entre
+    /// en collision — c'est ce qui autorise à poser la colonne sans arbitrer
+    /// quoi que ce soit sur la base des testeurs.
+    #[test]
+    fn une_base_ancienne_gagne_lidentifiant_dendpoint_sans_perdre_de_ligne() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        // La forme d'avant #2269 : `zones` sans `output_endpoint_id`, avec des
+        // réglages accrochés à la ligne.
+        db.execute_batch(
+            "CREATE TABLE zones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                output_type TEXT,
+                output_device_id TEXT,
+                volume REAL DEFAULT 100,
+                is_hidden INTEGER DEFAULT 0
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id
+                ON zones(output_device_id) WHERE output_device_id IS NOT NULL;
+            INSERT INTO zones (name, output_type, output_device_id, volume)
+                VALUES ('Salon', 'local', 'local:audio-gd USB audio', 37.5),
+                       ('Chambre', 'local', 'local:Haut-parleurs', 70.0);",
+        )
+        .unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(zones)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "output_endpoint_id"),
+            "`output_endpoint_id` manque après migration sur une base ANTÉRIEURE \
+             à la colonne : la ré-association ne pourra jamais rien lire, et \
+             `sorties_locales_et_leur_identite` rendra une liste vide à \
+             jamais (#2269). Colonnes : {cols:?}"
+        );
+
+        // AUCUNE ligne perdue, et les réglages restent accrochés là où ils sont.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM zones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "des zones ont disparu à la migration");
+        let volume: f64 = conn
+            .query_row(
+                "SELECT volume FROM zones WHERE output_device_id = 'local:audio-gd USB audio'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(volume, 37.5, "le volume de la zone a bougé");
+
+        // La valeur naît NULLE : « pas encore appris », jamais devinée.
+        let apprises: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zones WHERE output_endpoint_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            apprises, 0,
+            "la migration a INVENTÉ un identifiant : elle ne doit modifier \
+             aucune ligne"
+        );
+
+        // Le compte des collisions sur la NOUVELLE clef, mesuré et non supposé.
+        let collisions: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM zones \
+                 WHERE output_endpoint_id IS NOT NULL GROUP BY output_endpoint_id \
+                 HAVING COUNT(*) > 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            collisions, 0,
+            "la nouvelle clef entrerait en collision : la colonne ne peut pas \
+             être posée sans arbitrage"
+        );
+
+        // Et la lecture que le dépôt exécute vraiment passe.
+        conn.query_row(
+            "SELECT id, output_device_id, COALESCE(output_endpoint_id, ''), \
+             COALESCE(is_hidden, 0) FROM zones WHERE output_device_id LIKE 'local:%' \
+             ORDER BY id",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("le SELECT de `sorties_locales_et_leur_identite` doit passer");
     }
 
     #[test]
@@ -5256,7 +5468,42 @@ mod tests {
         // pas, et cette entree est la PLUS HAUTE : sans marque, `MAX(version)`
         // resterait a 53 et le semis serait rejoue a chaque demarrage (defaut
         // de la 052, #3699).
-        assert_eq!(pg_latest_version(), 54, "latest PG migration must be 54");
+        // 55 : `zones_output_endpoint_id` (#2269). Jumelle SQLite : la 99.
+        // L'identifiant d'endpoint stable d'une sortie locale, la seule
+        // identite qui traverse un renommage. TEXT des deux cotes, NULL pour
+        // l'existant — aucune ligne n'est modifiee, `output_device_id` reste
+        // l'identite de la zone.
+        // 56 : `zones_drapeaux_entiers` (#3726). PAS de jumelle SQLite :
+        // migration de RATTRAPAGE, comme la 53. QUATRE drapeaux ramenes a
+        // SMALLINT, chacun apres que son redacteur ait ete repare dans le MEME
+        // commit — c'est l'ordre que #3726 exige, et c'est la reparation du
+        // redacteur qui rend la conversion possible.
+        // `zones.is_hidden` : TEXT sur les DEUX chemins (aucun script numerote
+        // ne la declarait, seul `ENSURE_COLUMNS`), et NEUF des onze requetes
+        // qui la touchent tombaient — `list()` se rabattait sur `list_all()`,
+        // donc une zone supprimee reparaissait, et les trois comptes de zones
+        // rendaient 0. `zones.online` et `zones.dsp_enabled` : TEXT sur le
+        // chemin migre, et leurs redacteurs liaient une CHAINE dans une colonne
+        // SMALLINT sur le chemin natif. `profiles.is_admin` : `routes/cloud.rs`
+        // liait un BOOLEEN, donc la creation de profil SSO echouait en natif et
+        // ecrivait le litteral `true` en migre — ou `as_bool()` rend `None`,
+        // donc un administrateur se connectait avec le role `user`.
+        // 55 est prise par `zones_output_endpoint_id` (#2269, PR #3758).
+        // Arbitrage du 11/09/2026 : cette migration-ci passe en 56, l'autre
+        // garde 55 — anteriorite et maturite. Le numero libre a ete remesure
+        // DANS LE CODE, pas dans le repertoire : la jumelle PostgreSQL du
+        // semis Radio Paradise (54) est une entree `concat!` de cette liste
+        // et ne porte AUCUN fichier `054_*.sql` — un `ls migrations/postgres`
+        // affiche 053 comme dernier et fait viser un numero deja pris.
+        // 57 : `favoris_ordre_manuel` (#2001, piste 2), jumelle de la SQLite
+        // 100. Pose `position` sur `favorites` ET `streaming_favorites` ; sans
+        // elle, aucune base PostgreSQL deja creee ne recevrait la colonne, que
+        // les requetes de tri NOMMENT desormais. Le 47 que le commit d'origine
+        // visait est pris depuis par `listen_history_album_id_bigint` (#2860) :
+        // le numero libre a ete remesure DANS LE CODE, entree par entree de
+        // PG_MIGRATIONS, et non par un `ls migrations/postgres` que la 54 —
+        // une entree `concat!` sans fichier — rendrait faux.
+        assert_eq!(pg_latest_version(), 57, "latest PG migration must be 57");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

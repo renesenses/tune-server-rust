@@ -308,3 +308,134 @@ SDK de référence refuse qu'un lecteur annonce `opus` : « only PCM and FLAC ar
 supported ». L'obligation porte sur le serveur, pas sur le lecteur — mais cela
 dit qu'en pratique FLAC et PCM suffisent aujourd'hui, ce qui allège S2-c :
 l'encodeur Opus n'est pas sur le chemin critique.
+
+## 12. Le mode de transition, mesuré et livré (11/09/2026)
+
+Le § 11.4 posait la question sans la trancher : « Faut-il implémenter le mode de
+transition ? » **Bertrand a tranché le 11/09/2026 : oui.** Ce qui suit est ce
+qui a été mesuré pour l'écrire, contre le paquet **publié** `aiosendspin` 6.0.5
+(celui dont dépend le lecteur de référence `sendspin` 7.5.0) et contre le
+serveur de référence au dépôt git.
+
+### 12.1 Ce que le lecteur PUBLIÉ ne sait pas faire
+
+Paquet téléchargé depuis PyPI et inspecté le 11/09/2026 :
+
+| Mesure | Résultat |
+|---|---|
+| Modules dont le nom contient `noise` | **aucun** (0 sur 77 fichiers) |
+| Occurrences de `client/init` | **aucune** |
+| Occurrences de `server/activate` | **aucune** |
+| Valeurs de `ConnectionReason` | **`discovery`, `playback`** — deux, là où le dépôt git en a quatre |
+
+Ce n'est donc pas seulement « le chiffrement manque » : le lecteur publié ignore
+jusqu'au vocabulaire de la séquence chiffrée. Il ouvre par un `client/hello` en
+clair et attend un `server/hello` en clair, point.
+
+### 12.2 La forme exacte de la branche en clair
+
+Relevée dans `SendspinConnection._establish_transport` et `_exchange_hellos` du
+serveur de référence :
+
+1. **L'aiguillage se fait sur le TYPE du premier message**, jamais sur un échec.
+   `client/init` → poignée de main Noise. `client/hello` → clair, **si et
+   seulement si** `allow_unencrypted`. Autre chose → fermeture.
+2. **Le drapeau est faux par défaut** : « Accept legacy unencrypted clients over
+   the non-spec transition-mode hello, off by default. Enable it only to bridge
+   pre-encryption clients during migration. »
+3. **La réponse n'est pas le `server/hello` chiffré.** C'est un message
+   différent, que le code de référence nomme `LegacyServerHelloMessage` : même
+   `type: "server/hello"`, mais **cinq champs tous obligatoires** — `server_id`,
+   `name`, `version`, `active_roles`, `connection_reason`. Aucun n'a de valeur
+   par défaut côté lecteur.
+4. **Aucun `server/activate` ne suit** : « the legacy hello replaces
+   server/hello plus activate ». Le hello hérité porte lui-même `active_roles`.
+5. `connection_reason` est **ramené à `discovery`** pour un lecteur hérité :
+   « Legacy clients parse the enum strictly and predate the other reasons. »
+6. Le `client_id` et la `version` arrivent **dans le hello**, faute de
+   `client/init`. Le `client_id` d'une session en clair n'est donc qu'une
+   **prétention** : rien ne la vérifie.
+7. Un lecteur en clair voit ses **rôles exigeant un appairage retirés** :
+   « Legacy unencrypted is never paired. »
+
+Conséquence pratique qu'on ne devine pas : omettre un seul des cinq champs ne
+produit **aucune erreur sur le fil**. Le lecteur échoue à désérialiser en
+silence, et sa poignée de main expire au bout de 10 s. C'est mesuré, et c'est la
+raison d'être du témoin
+`le_server_hello_herite_porte_les_cinq_champs_obligatoires`.
+
+### 12.3 La protection contre la RÉTROGRADATION
+
+Le point le moins visible et le plus important du serveur de référence
+(`_admit_legacy_client_id`) : un `client/hello` en clair qui **prétend** à un
+`client_id` déjà connu comme capable de se connecter chiffré est **refusé**.
+
+> « A paired, pairing-staged, or trusted-unpaired client has proven it can
+> connect encrypted (its static key authenticated the Noise handshake); never
+> admit it unencrypted (downgrade protection). »
+
+Sans cette garde, le mode de transition offre à n'importe qui sur le réseau
+local le moyen d'usurper une enceinte connue : il suffit de recopier son
+identifiant dans un hello en clair.
+
+Tune n'a pas encore de magasin d'appairage — c'est S2-b. Il transpose donc la
+garde sur ce qu'il a : **le registre des pairs**, qui note désormais par quel
+transport chaque session est passée. Un `client_id` vu en Noise ne redescend
+jamais en clair. **Limite assumée et écrite** : la mémoire du registre s'arrête
+au processus, et S2-a ne persiste aucune identité — un redémarrage de Tune
+rouvre la fenêtre jusqu'à la prochaine connexion chiffrée du pair.
+
+### 12.4 Ce que Tune livre
+
+- `tune_core::sendspin::transition::ModeTransition`, réglé par
+  **`TUNE_SENDSPIN_ALLOW_UNENCRYPTED`**, **fermé par défaut**.
+- L'aiguillage sur le type du premier message, dans
+  `tune-server/src/routes/sendspin.rs`. **Ce n'est pas un repli** : il n'existe
+  aucune arête qui mène d'un échec du chiffré au clair.
+- Le `server/hello` hérité à cinq champs, en trame **TEXTE**, sans
+  `server/activate`, avec `active_roles: []` et `connection_reason:
+  "discovery"`.
+- Le registre nomme chaque session : `encrypted`, `transport`
+  (`noise` / `clair`), `suite` nulle en clair. `authenticated` reste **faux**
+  dans les deux cas.
+- `GET /devices/sendspin` publie `transition_mode` : le nom du réglage, le mode,
+  et `peer_authenticated: false`.
+
+### 12.5 Ce que le mode de transition ne répare pas, et aggrave
+
+Chiffré, la PSK employée est la **Sentinelle**, une constante publiée : le canal
+est confidentiel, **le pair n'est pas authentifié**. En clair, il n'y a même
+plus de canal, et le `client_id` est une prétention.
+
+**Le mode de transition n'y change rien — il l'aggrave.** S2-b (appairage CPace,
+PSK `lt`/`pr`) doit précéder tout branchement d'audio réel, et à plus forte
+raison sur ce chemin-là. Tant que S2-b n'est pas livrée, la bonne lecture est :
+le mode de transition sert à **voir** des enceintes et à récolter leurs
+capacités, pas à leur envoyer quoi que ce soit.
+
+### 12.6 La porte de sortie, franchie
+
+Le lecteur **publié** (`aiosendspin` 6.0.5, code identique à celui de `sendspin`
+7.5.0) a mené sa poignée de main jusqu'au bout contre le vrai point d'accès de
+Tune, le 11/09/2026 :
+
+```
+INFO:aiosendspin.client.client:Connected to server 'Tune (shrek)'
+      (ySJDpxY6vFaLtkZb2LVNAuVpUPqkMmxmyC7l9G7hN1w) version 1
+INFO:aiosendspin.client.client:Handshake with server complete
+  connected         = True
+  connection_reason = ConnectionReason.DISCOVERY
+```
+
+Et, mode fermé (le défaut), le même lecteur échoue — ce qui mesure exactement ce
+que le réglage coûte et ce qu'il achète :
+
+```
+RESULTAT: ECHEC DE CONNEXION -> TimeoutError: Timed out waiting for server/hello response
+```
+
+côté Tune :
+
+```
+WARN sendspin_client_hello_en_clair_refuse reglage="TUNE_SENDSPIN_ALLOW_UNENCRYPTED"
+```

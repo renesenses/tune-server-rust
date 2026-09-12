@@ -469,6 +469,15 @@ pub fn router_with_plugins(
             "/deezer-proxy/{filename}",
             get(deezer_proxy_handler::handle_deezer_proxy),
         )
+        // #3865 : `DeezerService::get_track_url` emet `{base}/deezer/{id}.{ext}`
+        // — DEUX segments — et `{filename}` n'en traverse qu'UN en axum 0.8.
+        // Ces URL tombaient donc dans le repli statique et les lecteurs
+        // recevaient `index.html` etiquete `audio/flac`. Les deux formes
+        // menent au meme gestionnaire : il ne lit que le dernier segment.
+        .route(
+            "/deezer-proxy/deezer/{filename}",
+            get(deezer_proxy_handler::handle_deezer_proxy),
+        )
         .with_state(state.services.clone());
 
     // Collect mountable skins before state is moved
@@ -481,7 +490,17 @@ pub fn router_with_plugins(
         // `/api/v1` : le TXT mDNS annonce `/sendspin`, et une enceinte ne
         // connaît pas nos préfixes. Pas d'extracteur `WsAuthorized` non
         // plus — c'est la couche Noise qui authentifie, pas axum.
-        .nest("/sendspin", sendspin::router())
+        //
+        // Le mode de transition est LU ICI, une fois, depuis le réglage du
+        // processus. Il n'est jamais forcé : écrire une valeur en dur à cette
+        // ligne ouvrirait un point d'accès en clair sans que personne ne l'ait
+        // demandé, et le témoin
+        // `le_point_d_acces_monte_lit_le_reglage_et_ne_force_pas_le_clair`
+        // garde cette ligne pour ça.
+        .nest(
+            "/sendspin",
+            sendspin::router(tune_core::sendspin::ModeTransition::en_vigueur()),
+        )
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
         .with_state(state.clone())
@@ -562,6 +581,53 @@ mod escape_tests {
         );
         assert_eq!(html_escape("O'Brien"), "O&#x27;Brien");
         assert_eq!(html_escape("plain radio"), "plain radio");
+    }
+}
+
+/// Pendant du temoin `la_forme_de_l_url_proxy_suit_les_routes_declarees` de
+/// `tune-core/src/streaming/deezer.rs` (#3865).
+#[cfg(test)]
+mod deezer_proxy_route_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// Les DEUX formes d'URL doivent atteindre le gestionnaire du proxy
+    /// Deezer au lieu de tomber dans le repli statique — le defaut d'origine
+    /// servait `index.html` a un lecteur qui attendait du FLAC.
+    ///
+    /// « upstream not available » est la reponse du gestionnaire quand le
+    /// service Deezer enregistre n'a pas d'ARL (`AppState::new` l'enregistre,
+    /// `state.rs:349`) : ce corps-la prouve que la route a matche ET que le
+    /// gestionnaire a tourne. Le repli, lui, rendrait du HTML ou un 404 nu.
+    /// Aucun appel reseau : `gw_api_call` refuse des l'absence d'ARL.
+    #[tokio::test]
+    async fn les_deux_formes_atteignent_le_gestionnaire_deezer() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let app = super::router(state);
+
+        for chemin in [
+            // Forme declaree depuis que la route existe.
+            "/deezer-proxy/92720184.flac",
+            // Forme reellement emise par `DeezerService::get_track_url`.
+            "/deezer-proxy/deezer/92720184.flac",
+        ] {
+            let reponse = app
+                .clone()
+                .oneshot(Request::get(chemin).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = reponse.status();
+            let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let corps = String::from_utf8_lossy(&corps);
+            assert_eq!(
+                (status, corps.as_ref()),
+                (StatusCode::NOT_FOUND, "upstream not available"),
+                "{chemin} n'a pas atteint le gestionnaire du proxy Deezer (#3865)"
+            );
+        }
     }
 }
 

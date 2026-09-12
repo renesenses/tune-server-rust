@@ -444,24 +444,32 @@ pub trait StreamingService: Send + Sync {
         _name: &str,
         _description: Option<&str>,
     ) -> Result<String, TuneError> {
-        Err("create_playlist not supported by this service".into())
+        Err(TuneError::Unsupported(
+            "create_playlist not supported by this service".into(),
+        ))
     }
     async fn add_tracks_to_playlist(
         &self,
         _playlist_id: &str,
         _track_ids: &[String],
     ) -> Result<usize, TuneError> {
-        Err("add_tracks_to_playlist not supported by this service".into())
+        Err(TuneError::Unsupported(
+            "add_tracks_to_playlist not supported by this service".into(),
+        ))
     }
     async fn delete_playlist(&self, _playlist_id: &str) -> Result<(), TuneError> {
-        Err("delete_playlist not supported by this service".into())
+        Err(TuneError::Unsupported(
+            "delete_playlist not supported by this service".into(),
+        ))
     }
     async fn remove_tracks_from_playlist(
         &self,
         _playlist_id: &str,
         _track_ids: &[String],
     ) -> Result<usize, TuneError> {
-        Err("remove_tracks_from_playlist not supported by this service".into())
+        Err(TuneError::Unsupported(
+            "remove_tracks_from_playlist not supported by this service".into(),
+        ))
     }
     fn supports_write(&self) -> bool {
         false
@@ -497,7 +505,9 @@ pub trait StreamingService: Send + Sync {
     /// returns it with its full catalogue. Album-based so the shared
     /// `StreamAlbum` model need not carry a label id.
     async fn get_album_label(&self, _album_id: &str) -> Result<LabelInfo, TuneError> {
-        Err("labels not supported for this service".into())
+        Err(TuneError::Unsupported(
+            "labels not supported for this service".into(),
+        ))
     }
     /// Editorial playlist tags/categories (moods, "Focus", genres…).
     async fn get_playlist_tags(&self) -> Result<Vec<PlaylistTag>, TuneError> {
@@ -527,7 +537,9 @@ pub trait StreamingService: Send + Sync {
     }
     /// Discovery context (genre + label) of an album, resolved from the album.
     async fn get_album_context(&self, _album_id: &str) -> Result<AlbumContext, TuneError> {
-        Err("album context not supported for this service".into())
+        Err(TuneError::Unsupported(
+            "album context not supported for this service".into(),
+        ))
     }
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         Ok(vec![])
@@ -572,11 +584,11 @@ pub trait StreamingService: Send + Sync {
     }
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let _ = (fav_type, item_id);
-        Err("not supported".into())
+        Err(TuneError::Unsupported("not supported".into()))
     }
     async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let _ = (fav_type, item_id);
-        Err("not supported".into())
+        Err(TuneError::Unsupported("not supported".into()))
     }
 
     fn save_tokens(&self) -> Option<serde_json::Value> {

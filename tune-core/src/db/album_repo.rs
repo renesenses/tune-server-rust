@@ -530,8 +530,15 @@ pub struct DynamicRangeAlbum {
     /// structure.
     pub valeur: i64,
     /// `true` quand au moins une piste porte le tag d'album `ALBUM DYNAMIC
-    /// RANGE` ; `false` quand la valeur est la moyenne arrondie des tags
-    /// `DYNAMIC RANGE` des pistes.
+    /// RANGE` ; `false` quand la valeur est la moyenne arrondie des `dr_track`
+    /// des pistes.
+    ///
+    /// ⚠️ « Moyenne des pistes » ne veut plus dire « moyenne de TAGS » depuis
+    /// la v0.9.145 : `dr_track` a deux producteurs, le tag du fichier et le
+    /// calcul de la passe d'analyse (`audio::replaygain`). Cette étiquette dit
+    /// donc d'où sort l'agrégat — le tag d'album, ou les pistes — et JAMAIS
+    /// d'où sortent les pistes. Cette seconde question se lit piste par piste,
+    /// sous `dynamic_range_source` (#3924).
     pub depuis_le_tag_album: bool,
 }
 

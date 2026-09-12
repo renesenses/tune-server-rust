@@ -489,11 +489,13 @@ impl PositionPoller {
                     np.duration_ms,
                     zone_state.position_ms,
                 ) {
-                    self.orchestrator.dispatch_scrobble(
-                        &np.title,
-                        np.artist_name.as_deref(),
-                        np.album_title.as_deref(),
-                    );
+                    self.orchestrator
+                        .dispatch_scrobble(
+                            &np.title,
+                            np.artist_name.as_deref(),
+                            np.album_title.as_deref(),
+                        )
+                        .await;
                     ps.scrobbled_key = Some(key);
                 }
             }

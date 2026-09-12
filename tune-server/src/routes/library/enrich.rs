@@ -105,11 +105,29 @@ pub(super) async fn enrich_all_library(
     // Full-library MusicBrainz enrichment is the same class of operation as the
     // premium-gated /system/enrich-metadata, so gate it the same way (premium
     // unlimited, free daily quota) instead of leaving it a free bypass (#6).
-    if let Err(resp) = crate::routes::system::gate_enrichment(&state).await {
-        return resp;
-    }
+    let premium = match crate::routes::system::gate_enrichment(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let scope_tache = scope.clone();
     let task_id = uuid::Uuid::new_v4().to_string();
+
+    // #3810 — la passe dit qu'elle PART.
+    //
+    // Tades, 0.9.145, 262 858 pistes : « enrichissement toujours pas
+    // possible ». Son rapport de diagnostic ne porte aucune ligne
+    // d'enrichissement, et c'est ce qui a fermé l'enquête — à tort. Cette
+    // route n'écrivait RIEN à l'entrée : sa seule trace était le
+    // `enrich_all_library done` de la fin, et sur 262 858 pistes à ~1,1 s par
+    // aller-retour MusicBrainz cette fin arrive dans plusieurs semaines.
+    // L'absence de ligne ne distinguait donc pas « il n'a pas cliqué » de
+    // « il a cliqué et la passe tourne depuis ».
+    info!(
+        task_id = %task_id,
+        premium,
+        portee = ?scope.as_ref().map(|s| s.dir.clone()),
+        "enrich_all_demarre"
+    );
     let backend = state.backend.clone();
     let http_client = state.http_client.clone();
 
@@ -180,13 +198,20 @@ pub(super) async fn enrich_all_library(
         // pour aucune autre (#1660).
         let track_rows = restreindre_a_la_portee(track_rows, scope_tache.as_ref());
         let total = track_rows.len();
-        if let Some(s) = scope_tache.as_ref() {
-            info!(
-                dir = %s.dir,
-                candidats = total,
-                "enrich_all_library limité à un répertoire"
-            );
-        }
+        // #3810 — le compte de candidats, INCONDITIONNELLEMENT.
+        //
+        // Il n'était journalisé que sur une passe limitée à un répertoire : la
+        // passe complète, celle du bouton, n'annonçait son ampleur nulle part.
+        // C'est pourtant le seul chiffre qui sépare « ça ne démarre pas » de
+        // « ça n'a pas fini » — à ~1,1 s par piste, 262 858 candidats font
+        // plusieurs semaines, et ce que le testeur appelle « pas possible »
+        // est alors une passe qui tourne.
+        info!(
+            task_id = %task_id_clone,
+            candidats = total,
+            portee = ?scope_tache.as_ref().map(|s| s.dir.clone()),
+            "enrich_all_candidats"
+        );
 
         // Publish the total as soon as it is known: the next periodic write
         // only happens every 50 enriched tracks, and with the ~1 req/s

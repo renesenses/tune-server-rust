@@ -50,24 +50,50 @@ pub async fn translate_query(settings: &SettingsRepo, query: &str) -> Option<Str
     Some(t)
 }
 
-async fn call_provider(settings: &SettingsRepo, q: &str) -> Option<String> {
-    let key_of = |name: &str| {
+/// Les cles API que la traduction sait employer, dans l'ordre de preference :
+/// la premiere configuree gagne.
+///
+/// UNE seule liste, pour deux lecteurs — `call_provider`, qui s'en sert pour
+/// choisir le fournisseur, et [`cle_disponible`], qui s'en sert pour repondre
+/// « oui » ou « non ». Deux listes auraient derive, et l'ecran Ambiance se
+/// serait mis a promettre une traduction que personne n'aurait faite (#3839).
+pub const CLES_DE_TRADUCTION: [&str; 3] = ["anthropic_api_key", "openai_api_key", "gemini_api_key"];
+
+/// La premiere cle de traduction configuree : son nom de reglage et sa valeur.
+///
+/// « Configuree » veut dire NON VIDE : un reglage pose puis efface laisse une
+/// chaine blanche, qui ne traduit rien et ne doit donc pas compter.
+fn cle_configuree(settings: &SettingsRepo) -> Option<(&'static str, String)> {
+    CLES_DE_TRADUCTION.iter().find_map(|nom| {
         settings
-            .get(name)
+            .get(nom)
             .ok()
             .flatten()
             .filter(|v| !v.trim().is_empty())
-    };
-    if let Some(key) = key_of("anthropic_api_key") {
-        return anthropic_translate(&key, q).await;
+            .map(|v| (*nom, v))
+    })
+}
+
+/// Ce serveur peut-il traduire une requete d'ambiance ?
+///
+/// C'est la seule information dont l'ecran Ambiance a besoin et qu'il ne peut
+/// PAS obtenir autrement : les cles API ne sortent d'aucune route, et le
+/// client n'a donc aucun moyen de distinguer « deja en anglais » de « pas de
+/// cle, requete envoyee brute ». Sans elle, l'ecran ne peut ni conseiller
+/// l'anglais ni renvoyer aux reglages — il se tait, et deux libelles du meme
+/// genre rendent deux listes sans que rien ne l'explique (#3839, fil 1751).
+pub fn cle_disponible(settings: &SettingsRepo) -> bool {
+    cle_configuree(settings).is_some()
+}
+
+async fn call_provider(settings: &SettingsRepo, q: &str) -> Option<String> {
+    let (nom, key) = cle_configuree(settings)?;
+    match nom {
+        "anthropic_api_key" => anthropic_translate(&key, q).await,
+        "openai_api_key" => openai_translate(&key, q).await,
+        "gemini_api_key" => gemini_translate(&key, q).await,
+        _ => None,
     }
-    if let Some(key) = key_of("openai_api_key") {
-        return openai_translate(&key, q).await;
-    }
-    if let Some(key) = key_of("gemini_api_key") {
-        return gemini_translate(&key, q).await;
-    }
-    None
 }
 
 async fn anthropic_translate(key: &str, q: &str) -> Option<String> {
@@ -209,6 +235,30 @@ mod tests {
         }
         cache_put(&s, "après la purge", "after");
         assert_eq!(cache_get(&s, "après la purge").as_deref(), Some("after"));
+    }
+
+    /// #3839 — JeromeQ, fil 1751 : « Progressive rock » et « Rock progressif »
+    /// rendent deux listes. Sans cle, la seconde part BRUTE dans une tour texte
+    /// entrainee en anglais. L'ecran ne peut le dire que si le serveur le dit :
+    /// les cles API ne sortent d'aucune route.
+    #[test]
+    fn la_cle_de_traduction_se_voit_des_qu_une_seule_est_posee_et_non_blanche() {
+        let s = repo();
+        assert!(
+            !cle_disponible(&s),
+            "aucune cle : l'ecran doit conseiller l'anglais, pas promettre une traduction"
+        );
+        for nom in CLES_DE_TRADUCTION {
+            s.set(nom, "   ").unwrap();
+            assert!(
+                !cle_disponible(&s),
+                "une cle BLANCHE ne traduit rien, elle ne doit pas compter ({nom})"
+            );
+            s.set(nom, "sk-temoin").unwrap();
+            assert!(cle_disponible(&s), "cle posee sur {nom}");
+            s.delete(nom).unwrap();
+            assert!(!cle_disponible(&s), "cle retiree de {nom}");
+        }
     }
 
     #[tokio::test]

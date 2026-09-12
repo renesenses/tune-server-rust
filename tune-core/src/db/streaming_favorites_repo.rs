@@ -91,6 +91,49 @@ pub mod sql {
             d.placeholder(2)
         )
     }
+
+    /// Mêmes lignes, plus le **rang manuel** en colonne 10 (#2001, piste 2).
+    ///
+    /// Requête séparée, et non `position` ajouté à `SELECT_COLS` : la colonne
+    /// n'est lue que par le tri manuel et n'entre JAMAIS dans
+    /// `StreamingFavorite`, donc la forme du JSON rendu au client ne bouge pas.
+    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, position \
+         FROM streaming_favorites";
+
+    pub fn list_all_pour_rang<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{SELECT_COLS_POUR_RANG} WHERE profile_id = {} ORDER BY created_at DESC",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn list_by_type_pour_rang<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{SELECT_COLS_POUR_RANG} WHERE profile_id = {} AND item_type = {} ORDER BY created_at DESC",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// Efface le rang manuel de tout un onglet avant d'en reposer un.
+    pub fn raz_ordre_manuel<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE streaming_favorites SET position = NULL WHERE profile_id = {} AND item_type = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn poser_rang_manuel<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE streaming_favorites SET position = {} WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5)
+        )
+    }
 }
 
 pub struct StreamingFavoritesRepo {
@@ -210,6 +253,27 @@ impl StreamingFavoritesRepo {
         item_type: Option<&str>,
         tri: TriFavoris,
     ) -> Result<Vec<StreamingFavorite>, String> {
+        // Le rang manuel n'est pas dans `StreamingFavorite` (il ne part pas au
+        // client) : il faut donc relire les lignes avec leur colonne 10 et
+        // ranger AVANT de construire les structures.
+        if tri.cle == CleDeTri::Manuel {
+            let pid = profile_id.to_string();
+            let mut rows = if let Some(t) = item_type {
+                let sql =
+                    self.dialect_sql(sql::list_by_type_pour_rang, sql::list_by_type_pour_rang);
+                let params: [&dyn ToSqlValue; 2] = [&pid, &t];
+                self.db.query_many(&sql, &params)?
+            } else {
+                let sql = self.dialect_sql(sql::list_all_pour_rang, sql::list_all_pour_rang);
+                let params: [&dyn ToSqlValue; 1] = [&pid];
+                self.db.query_many(&sql, &params)?
+            };
+            favorites_sort::trier_par_rang(&mut rows, tri.sens, |r| {
+                r.get(10).and_then(|v| v.as_i64())
+            });
+            return Ok(rows.iter().map(row_to_streaming_favorite).collect());
+        }
+
         let mut items = self.list(profile_id, item_type)?;
         match tri.cle {
             CleDeTri::Ajout => favorites_sort::appliquer_ajout(&mut items, tri.sens),
@@ -218,8 +282,56 @@ impl StreamingFavoritesRepo {
                 favorites_sort::trier_par(&mut items, tri.sens, |f| f.artist.clone())
             }
             CleDeTri::Album => favorites_sort::trier_par(&mut items, tri.sens, |f| f.album.clone()),
+            // Traité au-dessus par le retour anticipé : ce bras est
+            // inatteignable. Laissé SANS EFFET plutôt qu'en `unreachable!()` —
+            // si un remaniement futur retirait le retour anticipé, une route de
+            // lecture rendrait l'ordre d'ajout, pas un 500.
+            CleDeTri::Manuel => {}
         }
         Ok(items)
+    }
+
+    /// Pose l'ordre manuel d'un onglet de favoris de service (#2001, piste 2).
+    ///
+    /// Jumelle de [`super::profile_repo::ProfileRepo::reorder_favorites`], dont
+    /// elle reprend les trois garanties — onglet entier, retiré-puis-rajouté en
+    /// fin de liste, dernier écrivain gagnant en entier — la seule différence
+    /// étant la clé de l'élément : ici `(service, service_id)` et non un
+    /// `item_id` entier.
+    ///
+    /// Rend le nombre de favoris effectivement rangés. Une référence inconnue
+    /// du profil ne fait pas d'erreur et n'est pas comptée.
+    pub fn reorder(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        items: &[(String, String)],
+    ) -> Result<usize, String> {
+        let mut vus = std::collections::HashSet::new();
+        let uniques: Vec<&(String, String)> = items
+            .iter()
+            .filter(|cle| vus.insert((*cle).clone()))
+            .collect();
+
+        let pid = profile_id.to_string();
+        let raz = self.dialect_sql(sql::raz_ordre_manuel, sql::raz_ordre_manuel);
+        let pose = self.dialect_sql(sql::poser_rang_manuel, sql::poser_rang_manuel);
+
+        let mut ranges = 0usize;
+        self.db.write_tx(&mut |tx| {
+            ranges = 0;
+            let params: [&dyn ToSqlValue; 2] = [&pid, &item_type];
+            tx.execute(&raz, &params)?;
+            for (rang, (service, service_id)) in uniques.iter().enumerate() {
+                // Rang lié en TEXTE : la colonne est TEXT sur le miroir
+                // PostgreSQL, comme `profile_id` juste à côté.
+                let rang = (rang as i64 + 1).to_string();
+                let params: [&dyn ToSqlValue; 5] = [&rang, &pid, &item_type, service, service_id];
+                ranges += tx.execute(&pose, &params)?;
+            }
+            Ok(())
+        })?;
+        Ok(ranges)
     }
 }
 
@@ -360,6 +472,115 @@ mod tests {
         assert_eq!(range(&repo, "album", "asc"), ["s1", "s2", "s3", "s4"]);
         // Ajout croissant = l'ordre dans lequel ils ont ete enregistres.
         assert_eq!(range(&repo, "added", "asc"), ["s1", "s2", "s3", "s4"]);
+    }
+
+    // --- Ordre manuel (#2001, piste 2) ---------------------------------
+
+    fn qobuz(ids: &[&str]) -> Vec<(String, String)> {
+        ids.iter()
+            .map(|i| ("qobuz".to_string(), (*i).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn l_ordre_manuel_se_relit_sur_les_favoris_de_service() {
+        let repo = repo_a_trier();
+        // Un ordre qu'aucun champ ne produit : ni titre, ni artiste, ni album,
+        // ni date d'ajout ne rendent s3, s1, s4, s2.
+        assert_eq!(
+            repo.reorder(1, "track", &qobuz(&["s3", "s1", "s4", "s2"]))
+                .unwrap(),
+            4
+        );
+        assert_eq!(range(&repo, "manual", "asc"), ["s3", "s1", "s4", "s2"]);
+        assert_eq!(range(&repo, "manual", "desc"), ["s2", "s4", "s1", "s3"]);
+    }
+
+    /// Temoin anti-regression : poser un rang ne change RIEN aux chemins
+    /// existants, et n'ajoute aucun champ a la reponse JSON.
+    #[test]
+    fn poser_un_ordre_manuel_ne_change_ni_l_ordre_par_defaut_ni_la_forme() {
+        let repo = repo_a_trier();
+        let avant = ids(repo.list(1, None).unwrap());
+        let forme_avant = serde_json::to_value(&repo.list(1, None).unwrap()[0]).unwrap();
+        repo.reorder(1, "track", &qobuz(&["s3", "s1", "s4", "s2"]))
+            .unwrap();
+        assert_eq!(ids(repo.list(1, None).unwrap()), avant);
+        assert_eq!(range(&repo, "added", "asc"), ["s1", "s2", "s3", "s4"]);
+        assert_eq!(range(&repo, "title", "asc"), ["s2", "s1", "s3", "s4"]);
+        let forme_apres = serde_json::to_value(&repo.list(1, None).unwrap()[0]).unwrap();
+        assert_eq!(
+            forme_avant.as_object().unwrap().keys().collect::<Vec<_>>(),
+            forme_apres.as_object().unwrap().keys().collect::<Vec<_>>(),
+            "le rang ne doit pas fuir dans la reponse"
+        );
+    }
+
+    #[test]
+    fn un_favori_de_service_retire_puis_rajoute_revient_en_fin() {
+        let repo = repo_a_trier();
+        repo.reorder(1, "track", &qobuz(&["s3", "s1", "s4", "s2"]))
+            .unwrap();
+        repo.remove(1, "track", "qobuz", "s3").unwrap();
+        repo.add(1, "track", "qobuz", "s3", Some("Zorro"), None, None, None)
+            .unwrap();
+        // s3 etait PREMIER : sa ligne est partie, son rang avec elle.
+        let ordre = range(&repo, "manual", "asc");
+        assert_eq!(&ordre[..3], &["s1", "s4", "s2"]);
+        assert_eq!(ordre[3], "s3");
+    }
+
+    #[test]
+    fn reordonner_un_onglet_de_service_ne_touche_pas_les_autres() {
+        let repo = repo_a_trier();
+        for a in ["a1", "a2"] {
+            repo.add(1, "album", "qobuz", a, None, None, None, None)
+                .unwrap();
+        }
+        repo.reorder(1, "track", &qobuz(&["s3", "s1", "s4", "s2"]))
+            .unwrap();
+        repo.reorder(1, "album", &qobuz(&["a2", "a1"])).unwrap();
+
+        let tri = TriFavoris::depuis(Some("manual"), Some("asc")).unwrap();
+        assert_eq!(
+            ids(repo.list_sorted(1, Some("track"), tri).unwrap()),
+            ["s3", "s1", "s4", "s2"]
+        );
+        assert_eq!(
+            ids(repo.list_sorted(1, Some("album"), tri).unwrap()),
+            ["a2", "a1"]
+        );
+    }
+
+    #[test]
+    fn une_reference_inconnue_est_ignoree_sans_erreur() {
+        let repo = repo_a_trier();
+        assert_eq!(
+            repo.reorder(1, "track", &qobuz(&["s2", "inconnu", "s1"]))
+                .unwrap(),
+            2
+        );
+        assert_eq!(&range(&repo, "manual", "asc")[..2], &["s2", "s1"]);
+        // Meme service_id chez un AUTRE service : ce n'est pas le meme favori.
+        assert_eq!(
+            repo.reorder(1, "track", &[("tidal".into(), "s1".into())])
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn sql_du_rang_manuel_emet_les_placeholders_du_moteur() {
+        assert!(sql::poser_rang_manuel(&SqliteDialect).ends_with(
+            "WHERE profile_id = ? AND item_type = ? AND service = ? AND service_id = ?"
+        ));
+        assert!(sql::poser_rang_manuel(&PostgresDialect).ends_with(
+            "WHERE profile_id = $2 AND item_type = $3 AND service = $4 AND service_id = $5"
+        ));
+        // Le rang doit etre LU, et seulement par la requete dediee : la
+        // requete ordinaire ne le nomme pas, donc la forme du JSON ne bouge pas.
+        assert!(sql::list_by_type_pour_rang(&SqliteDialect).contains("created_at, position"));
+        assert!(!sql::list_by_type(&SqliteDialect).contains("position"));
     }
 
     #[test]

@@ -879,11 +879,11 @@ pub async fn handle_stream(
             // côté ; toute connexion suivante partant de l'octet 0 le reçoit
             // d'abord. `bytes=44-` dit explicitement « je l'ai déjà » : on ne
             // le renvoie pas.
-            let saute_entete = req_headers
+            let debut_demande = req_headers
                 .get("Range")
                 .and_then(|v| v.to_str().ok())
-                .and_then(parse_range_start)
-                .is_some_and(|s| s >= 44);
+                .and_then(parse_range_start);
+            let saute_entete = debut_demande.is_some_and(|s| s >= 44);
             if is_wav
                 && wav_header_included
                 && !saute_entete
@@ -891,6 +891,31 @@ pub async fn handle_stream(
             {
                 yield Ok(bytes::Bytes::from(entete.clone()));
             }
+
+            // ── La reprise annonce N ; le tuyau en est ailleurs ──
+            //
+            // Le 206 ci-dessus dit `Content-Range: bytes N-…`, et le renderer
+            // range les octets reçus À PARTIR DE N. Un canal ne rejoue rien :
+            // il rend l'octet où il en est. L'écart s'entend comme un saut sur
+            // du PCM, mais il DÉTRUIT un porteur DoP dès qu'il n'est pas un
+            // multiple de la trame — mesuré : `bytes=8236-` sur une session
+            // DoP stéréo 24 bits rendait les octets de l'offset 44, soit
+            // 8192 octets d'écart, 2 modulo la trame de 6 ; le marqueur
+            // `0x05`/`0xFA` ne tombait plus sur l'octet de poids fort d'aucun
+            // mot, et le DAC jouait le train DSD comme du PCM (#1894).
+            //
+            // On ne rattrape pas la position, on rattrape la PHASE : au plus
+            // `trame - 1` octets jetés une seule fois. Voir `rognage_de_phase`.
+            let trame_de_sortie = if is_wav && wav_header_included {
+                u64::from(session.info.channels) * u64::from(session.info.bit_depth / 8)
+            } else {
+                0
+            };
+            let mut a_remettre_en_phase =
+                debut_demande.filter(|_| saute_entete && trame_de_sortie > 1);
+            // Le doublon d'en-tête ne se juge que sur le PREMIER bloc du canal :
+            // au-delà, `RIFF` au début d'un bloc est de l'audio.
+            let mut doublon_d_entete_juge = false;
 
             loop {
                 let superseded = session.consumer_supersede.notified();
@@ -980,7 +1005,7 @@ pub async fn handle_stream(
                             );
                         }
                         attente_transport = std::time::Duration::ZERO;
-                        let Some(chunk) = maybe_chunk else {
+                        let Some(mut chunk) = maybe_chunk else {
                             // Canal fermé : fin de piste. Vider ce qui reste.
                             if !coalesce_buf.is_empty() {
                                 let restant = std::mem::take(&mut coalesce_buf);
@@ -988,6 +1013,45 @@ pub async fn handle_stream(
                             }
                             break; // fin de flux : plus rien à mesurer.
                         };
+                        // ── Deux en-têtes WAV : le nommer, et n'en servir qu'un ──
+                        //
+                        // Quand la session ne DÉCLARE pas que son producteur
+                        // émet l'en-tête, ce corps en a préfixé un plus haut. Si
+                        // le canal en apporte un second, le renderer prend 44
+                        // octets d'en-tête pour de l'audio et TOUT ce qui suit
+                        // est décalé de 44 octets — 2 modulo une trame de 6, la
+                        // mort d'un porteur DoP (#1894).
+                        //
+                        // Un défaut de producteur, mais qui ne doit plus être
+                        // SILENCIEUX : il a vécu trois semaines sans laisser une
+                        // ligne de journal. On jette le doublon et on le nomme.
+                        if is_wav
+                            && !wav_header_included
+                            && !doublon_d_entete_juge
+                            && chunk.len() >= 44
+                            && chunk.starts_with(b"RIFF")
+                            && &chunk[8..12] == b"WAVE"
+                        {
+                            doublon_d_entete_juge = true;
+                            warn!(
+                                stream_id = %session.id,
+                                "double_entete_wav — le producteur a émis son propre en-tête WAV \
+                                 sans que la session le déclare (`wav_header_included`) : un \
+                                 second en-tête a déjà été préfixé. Le doublon est écarté ; sans \
+                                 cela tout le flux partait décalé de 44 octets (#1894)"
+                            );
+                            if chunk.len() == 44 {
+                                continue;
+                            }
+                            chunk.drain(..44);
+                        }
+                        doublon_d_entete_juge = true;
+                        // Où ce bloc se trouve-t-il DANS LE FLUX ? Le compteur
+                        // avance de tout ce qui est tiré du canal, en-tête
+                        // compris : c'est la position du tuyau.
+                        let debut_du_bloc = session
+                            .octets_du_canal
+                            .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         // Mettre l'en-tête de côté au passage, pour les
                         // connexions suivantes. `set` n'écrit qu'une fois.
                         if is_wav
@@ -1001,7 +1065,15 @@ pub async fn handle_stream(
                             // PAS l'en-tête : on ne transmet que la suite.
                             if saute_entete {
                                 if chunk.len() > 44 {
-                                    coalesce_buf.extend_from_slice(&chunk[44..]);
+                                    let suite = &chunk[44..];
+                                    let garde = rogner_pour_la_phase(
+                                        &session,
+                                        &mut a_remettre_en_phase,
+                                        trame_de_sortie,
+                                        debut_du_bloc + 44,
+                                        suite,
+                                    );
+                                    coalesce_buf.extend_from_slice(&suite[garde..]);
                                 }
                                 while coalesce_buf.len() >= MIN_HTTP_CHUNK {
                                     let flushed: Vec<u8> = coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
@@ -1012,7 +1084,14 @@ pub async fn handle_stream(
                                 continue;
                             }
                         }
-                        coalesce_buf.extend_from_slice(&chunk);
+                        let garde = rogner_pour_la_phase(
+                            &session,
+                            &mut a_remettre_en_phase,
+                            trame_de_sortie,
+                            debut_du_bloc,
+                            &chunk,
+                        );
+                        coalesce_buf.extend_from_slice(&chunk[garde..]);
                         while coalesce_buf.len() >= MIN_HTTP_CHUNK {
                             let flushed: Vec<u8> = coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
                             session.debut_attente_transport();
@@ -1162,6 +1241,87 @@ where
     }))
 }
 
+/// Chronometre du segment que le journal ne couvrait pas.
+///
+/// #2352 — la mesure du 03/09/2026 (journal de Dominique COMET, fil 1653,
+/// Tune 0.9.132, `DirettaRenderer/1.0`) a etabli deux bornes : Tune envoie son
+/// `Play` entre 129 ms et 1244 ms (`playback_timing`), et le renderer ouvre le
+/// flux HTTP dans les 2 ms (`stream_request`). Les « plus de 30 secondes »
+/// vecues se jouent donc **apres le premier octet servi** — et AUCUNE ligne du
+/// journal ne couvrait ce segment : `build_file_body` incrementait
+/// `bytes_sent` sans jamais dire en combien de temps.
+///
+/// Ce que cette ligne separe, et que rien ne separait :
+///
+/// * `premier_octet_ms` eleve, debit ensuite normal ⇒ Tune a mis du temps a
+///   OUVRIR et lire la source (montage NAS, fichier temporaire de
+///   transcodage). La lenteur est en amont du renderer.
+/// * `premier_octet_ms` immediat, `debit_kio_s` bas ⇒ c'est le renderer qui
+///   tire lentement : le corps est servi par contre-pression HTTP, donc le
+///   debit mesure ici est **celui que le consommateur impose**, pas une
+///   capacite de Tune.
+/// * `complet=false` ⇒ le renderer a laché la connexion avant la fin.
+///
+/// Le `Drop` est deliberé : il couvre la connexion abandonnee en cours de
+/// route aussi bien que le service mene a son terme. Une piste que le renderer
+/// abandonne au bout de 30 s ne laissait, elle non plus, aucune trace.
+struct ChronoServiceFichier {
+    stream_id: String,
+    demande: u64,
+    servis: u64,
+    debut: std::time::Instant,
+    premier_octet_ms: Option<u64>,
+}
+
+impl ChronoServiceFichier {
+    fn new(stream_id: String, demande: u64) -> Self {
+        Self {
+            stream_id,
+            demande,
+            servis: 0,
+            debut: std::time::Instant::now(),
+            premier_octet_ms: None,
+        }
+    }
+
+    fn compter(&mut self, n: u64) {
+        if self.premier_octet_ms.is_none() {
+            self.premier_octet_ms = Some(self.debut.elapsed().as_millis() as u64);
+        }
+        self.servis += n;
+    }
+}
+
+impl Drop for ChronoServiceFichier {
+    fn drop(&mut self) {
+        let elapsed_ms = self.debut.elapsed().as_millis() as u64;
+        // Sous la milliseconde, le quotient s'envole : une rafale d'amorcage
+        // rapportee a 0 ms donnerait un debit a cinq chiffres. On ne publie
+        // pas un chiffre qu'on n'a pas mesure — meme contrat que le
+        // `bitrate_kbps` de `network-health` (#2275, f1b8b396), qui rend
+        // `null` plutot que de remplir le silence. Un `None` n'imprime PAS le
+        // champ : la ligne dit alors « je ne sais pas », pas « zero ».
+        let debit_kio_s = if elapsed_ms > 0 {
+            Some(
+                ((self.servis as f64 / 1024.0) / (elapsed_ms as f64 / 1000.0) * 10.0).round()
+                    / 10.0,
+            )
+        } else {
+            None
+        };
+        info!(
+            stream_id = %self.stream_id,
+            octets = self.servis,
+            demande = self.demande,
+            premier_octet_ms = self.premier_octet_ms,
+            elapsed_ms,
+            debit_kio_s,
+            complet = self.servis >= self.demande,
+            "service_fichier_termine"
+        );
+    }
+}
+
 fn build_file_body(
     faststart: Option<tune_core::audio::faststart::FaststartMap>,
     path: String,
@@ -1170,6 +1330,7 @@ fn build_file_body(
     byte_counter: std::sync::Arc<StreamSession>,
 ) -> Body {
     use std::sync::atomic::Ordering::Relaxed;
+    let mut chrono = ChronoServiceFichier::new(byte_counter.id.clone(), length);
     Body::from_stream(async_stream::stream! {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let mut remaining = length;
@@ -1182,6 +1343,7 @@ fn build_file_body(
                 let n = ((header_len - vpos).min(remaining)) as usize;
                 let s = vpos as usize;
                 byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                chrono.compter(n as u64);
                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&map.header[s..s + n]));
                 vpos += n as u64;
                 remaining -= n as u64;
@@ -1203,6 +1365,7 @@ fn build_file_body(
                                 Ok(n) => {
                                     remaining -= n as u64;
                                     byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                    chrono.compter(n as u64);
                                     yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
                                 }
                                 Err(e) => { warn!(error = %e, "file_read_error"); break; }
@@ -1227,6 +1390,7 @@ fn build_file_body(
                             Ok(n) => {
                                 remaining -= n as u64;
                                 byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                chrono.compter(n as u64);
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
                             }
                             Err(e) => { warn!(error = %e, "file_read_error"); break; }
@@ -1249,6 +1413,71 @@ fn parse_range_start(range: &str) -> Option<u64> {
         return None;
     }
     start.parse::<u64>().ok()
+}
+
+/// Combien d'octets rogner en tête du prochain bloc pour que l'octet livré
+/// tombe LÀ OÙ LE RENDERER L'ATTEND dans sa grille de trames.
+///
+/// Une session de conversion est un tuyau : elle ne rejoue pas un octet passé.
+/// Le corps HTTP honore pourtant les reprises `Range: bytes=N-` par un vrai 206
+/// — sans quoi l'Eversolo DMP-A8 jette la réponse et redemande le même offset
+/// en boucle. Le 206 annonce N ; le tuyau, lui, en est à `offset_reel`.
+///
+/// Le renderer place les octets reçus à partir de N. Tant que l'écart
+/// `N - offset_reel` est un multiple de la trame, il n'entend qu'un saut. S'il
+/// ne l'est pas, TOUS les mots sont déphasés — et sur un porteur DoP c'est
+/// fatal : le marqueur `0x05`/`0xFA` vit dans l'octet de poids fort du mot de
+/// 24 bits, il ne tombe plus au bon endroit, le DAC ne verrouille pas en DSD et
+/// joue le train DSD comme du PCM, c'est-à-dire du bruit blanc (#1894).
+///
+/// On ne rattrape donc PAS la position — un tuyau ne le peut pas — mais la
+/// PHASE, en jetant au plus `trame - 1` octets. Le saut résiduel est celui
+/// qu'on avait déjà ; le porteur, lui, redevient lisible.
+///
+/// `trame <= 1` (sortie 8 bits mono, format inconnu) : rien à remettre en
+/// phase, tout octet est une trame.
+fn rognage_de_phase(offset_annonce: u64, offset_reel: u64, trame: u64) -> usize {
+    if trame <= 1 {
+        return 0;
+    }
+    (i128::from(offset_annonce) - i128::from(offset_reel)).rem_euclid(i128::from(trame)) as usize
+}
+
+/// Applique [`rognage_de_phase`] au premier bloc livré d'une reprise, et le
+/// trace. Rend le nombre d'octets à sauter en tête de `bloc`.
+///
+/// La dette est consommée dès qu'elle est payable ; un bloc plus court que le
+/// rognage la reporte au suivant, où l'offset réel aura avancé d'autant — le
+/// calcul reste juste sans mémoire supplémentaire.
+fn rogner_pour_la_phase(
+    session: &StreamSession,
+    a_remettre_en_phase: &mut Option<u64>,
+    trame: u64,
+    offset_reel: u64,
+    bloc: &[u8],
+) -> usize {
+    let Some(offset_annonce) = *a_remettre_en_phase else {
+        return 0;
+    };
+    let rognage = rognage_de_phase(offset_annonce, offset_reel, trame);
+    if rognage >= bloc.len() {
+        // Bloc trop court pour payer la dette : on le jette en entier et on
+        // garde la dette. Ne peut arriver que sur un bloc de moins de 6 octets.
+        return bloc.len();
+    }
+    *a_remettre_en_phase = None;
+    if rognage > 0 {
+        info!(
+            stream_id = %session.id,
+            offset_annonce,
+            offset_reel,
+            trame,
+            rognage,
+            "reprise_remise_en_phase — le 206 annonce un offset que le canal n'a plus ; \
+             la phase de trame est rétablie pour que le porteur reste lisible (#1894)"
+        );
+    }
+    rognage
 }
 
 // ─── HTTPS→HTTP proxy ───────────────────────────────────────────
@@ -3227,6 +3456,308 @@ mod tests {
         let sorties = decoupe_icy(&[0u8; 10], &mut depuis, &bloc);
         assert_eq!(sorties.iter().map(|b| b.len()).sum::<usize>(), 10);
         assert_eq!(depuis, 10);
+    }
+    // ───────────────────── #1894 — le porteur DoP et les reprises ─────────────────────
+
+    /// Un porteur DoP fabriqué par l'encodeur DE PRODUCTION, à partir d'un
+    /// train DSD dont chaque octet est identifiable.
+    ///
+    /// L'objet éprouvé ici est le TRANSPORT HTTP, pas l'encodeur : la charge
+    /// utile vient donc du chemin de production, et la règle qui la juge
+    /// (`porteur_dop_lisible`) est écrite depuis la spécification DoP, jamais
+    /// depuis le module transporté.
+    fn porteur_dop_de_production(trames: usize) -> Vec<u8> {
+        let mut dsd = Vec::with_capacity(trames * 4);
+        for i in 0..(trames * 4) {
+            dsd.push((i % 251) as u8);
+        }
+        let mut encodeur = tune_core::audio::dsd_to_dop::DsdToDoP::new(2, false);
+        encodeur.feed(&dsd)
+    }
+
+    /// La condition de VERROUILLAGE d'un DAC en DoP, écrite depuis la spec.
+    ///
+    /// Un mot de 24 bits little-endian par canal : `[dsd_bas, dsd_haut,
+    /// marqueur]`. Le marqueur vaut `0x05` ou `0xFA`, il est COMMUN aux canaux
+    /// d'une même trame et il ALTERNE d'une trame à la suivante. Si l'une des
+    /// trois conditions tombe, le DAC ne verrouille pas, joue le train DSD
+    /// comme du PCM, et c'est du bruit blanc.
+    ///
+    /// Lu sur la grille DU RENDERER : il place le premier octet reçu à
+    /// l'offset ANNONCÉ, puis se recale sur la prochaine frontière de trame.
+    fn porteur_dop_lisible(recu: &[u8], offset_annonce: u64, canaux: usize) -> Result<(), String> {
+        let trame = 3 * canaux;
+        let dans_les_donnees = offset_annonce.saturating_sub(44);
+        let recalage = ((trame as u64 - dans_les_donnees % trame as u64) % trame as u64) as usize;
+        let corps = recu
+            .get(recalage..)
+            .ok_or_else(|| format!("moins de {recalage} octets reçus"))?;
+        let n = corps.len() / trame;
+        if n < 4 {
+            return Err(format!("{n} trames seulement : rien à juger"));
+        }
+        let mut attendu: Option<u8> = None;
+        for t in 0..n {
+            let marqueur = corps[t * trame + 2];
+            if marqueur != 0x05 && marqueur != 0xFA {
+                return Err(format!(
+                    "trame {t} : l'octet de poids fort vaut 0x{marqueur:02X}, ni 0x05 ni 0xFA — \
+                     le DAC ne verrouille pas"
+                ));
+            }
+            for ch in 1..canaux {
+                let m = corps[t * trame + ch * 3 + 2];
+                if m != marqueur {
+                    return Err(format!(
+                        "trame {t} : canal 0 porte 0x{marqueur:02X} et canal {ch} 0x{m:02X} — \
+                         le marqueur doit être commun à la trame"
+                    ));
+                }
+            }
+            if let Some(a) = attendu
+                && marqueur != a
+            {
+                return Err(format!(
+                    "trame {t} : marqueur 0x{marqueur:02X} au lieu de 0x{a:02X} — \
+                     l'alternance 0x05/0xFA est rompue"
+                ));
+            }
+            attendu = Some(if marqueur == 0x05 { 0xFA } else { 0x05 });
+        }
+        Ok(())
+    }
+
+    /// Sert un porteur DoP sur une session de conversion, puis demande une
+    /// reprise `Range: bytes={offset}-`. Rend les octets du corps.
+    async fn reprise_sur_une_session_dop(offset: u64, charge: &[u8]) -> (String, Vec<u8>) {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 176_400,
+            channels: 2,
+            bit_depth: 24,
+            duration_ms: Some(600_000),
+            ..StreamInfo::default()
+        };
+        let id = format!("dop{offset}");
+        let session = std::sync::Arc::new(StreamSession::new(id.clone(), info, true, 64));
+        session.wav_header_included.store(true, SeqCst);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        session.close_sender().await;
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [(id.clone(), session)].into_iter().collect(),
+        ));
+
+        tx.send(super::build_wav_header(2, 176_400, 24, None).to_vec())
+            .await
+            .expect("entête");
+        for bloc in charge.chunks(4096) {
+            tx.send(bloc.to_vec()).await.expect("charge");
+        }
+        drop(tx);
+
+        let mut req = axum::http::HeaderMap::new();
+        req.insert("Range", format!("bytes={offset}-").parse().unwrap());
+        let rep = super::handle_stream(Path(format!("{id}.wav")), State(sessions), req).await;
+        let plage = rep
+            .headers()
+            .get("Content-Range")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let mut corps = rep.into_body().into_data_stream();
+        let mut recu = Vec::new();
+        while let Ok(Some(Ok(b))) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), corps.next()).await
+        {
+            recu.extend_from_slice(&b);
+        }
+        (plage, recu)
+    }
+
+    /// #1894 — GARDE DE COMPORTEMENT.
+    ///
+    /// Une session de conversion est un tuyau : elle ne rejoue pas un octet
+    /// passé. Le corps HTTP honore pourtant `Range: bytes=N-` par un vrai 206
+    /// (sans quoi l'Eversolo DMP-A8 boucle), et le renderer range alors les
+    /// octets reçus À PARTIR DE N.
+    ///
+    /// MESURE du défaut : sur une session DoP stéréo 24 bits, `bytes=8236-`
+    /// rendait les octets de l'offset 44 — 8 192 octets d'écart, soit **2
+    /// modulo la trame de 6**. Sur la grille du renderer, plus un seul octet de
+    /// poids fort ne portait `0x05`/`0xFA` : le DAC ne verrouillait pas en DSD
+    /// et jouait le train DSD comme du PCM, c'est-à-dire du bruit blanc.
+    ///
+    /// La position ne se rattrape pas ; la PHASE, si. Les quatre offsets
+    /// couvrent les résidus 0, 2, 3 et 5 de la trame — un rognage nul et trois
+    /// rognages différents.
+    #[tokio::test]
+    async fn une_reprise_dop_rend_un_porteur_lisible_sur_la_grille_annoncee() {
+        let charge = porteur_dop_de_production(8192);
+        porteur_dop_lisible(&charge, 44, 2)
+            .expect("l'encodeur de production doit rendre un porteur DoP valide");
+
+        // Les six résidus de la trame de 6 : 0, 1, 2, 4, 5, 3.
+        for offset in [8_234u64, 8_235, 8_236, 8_238, 12_289, 20_483] {
+            let (plage, recu) = reprise_sur_une_session_dop(offset, &charge).await;
+            assert!(
+                plage.starts_with(&format!("bytes {offset}-")),
+                "le 206 doit annoncer l'offset demandé, il annonce « {plage} »"
+            );
+            assert!(
+                recu.len() > 1024,
+                "reprise à {offset} : {} octets reçus, rien à juger",
+                recu.len()
+            );
+            if let Err(pourquoi) = porteur_dop_lisible(&recu, offset, 2) {
+                panic!(
+                    "reprise `Range: bytes={offset}-` : le porteur DoP est illisible sur la \
+                     grille que le 206 annonce — {pourquoi}. C'est exactement le bruit blanc \
+                     de #1894."
+                );
+            }
+        }
+    }
+
+    /// #1894 — GARDE DE COMPORTEMENT : jamais deux en-têtes WAV.
+    ///
+    /// LA CAUSE MESURÉE du bruit blanc. `anticiper_le_dop` émet son propre
+    /// en-tête WAV comme premier bloc du canal, mais sa session ne l'a jamais
+    /// DÉCLARÉ (`wav_header_included`) — contrairement aux deux autres sessions
+    /// de conversion. Ce corps en préfixait donc un second :
+    ///
+    /// ```text
+    /// EN-TETES RIFF A    = [0, 44]
+    /// LA CHARGE DoP COMMENCE A L'OCTET 88 (attendu : 44)
+    /// DECALAGE = 44 octets, soit 2 modulo la trame de 6
+    /// ```
+    ///
+    /// 44 octets d'en-tête pris pour de l'audio, puis TOUT le porteur décalé de
+    /// 2 modulo la trame : le marqueur `0x05`/`0xFA` ne tombe sur l'octet de
+    /// poids fort d'aucun mot de 24 bits, le DAC ne verrouille pas en DSD et
+    /// joue le train DSD comme du PCM — du bruit blanc, dès le premier
+    /// échantillon et sur toute la piste.
+    ///
+    /// La session est ici bâtie EXACTEMENT comme `anticiper_le_dop` la bâtit,
+    /// drapeau non posé : c'est le filet du transport qui est éprouvé, celui
+    /// qui nomme le défaut au journal au lieu de le laisser muet.
+    #[tokio::test]
+    async fn un_producteur_qui_emet_son_entete_n_en_fait_jamais_servir_deux() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use tune_core::http::streamer::SharedSessions;
+
+        let charge = porteur_dop_de_production(4096);
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 176_400,
+            bit_depth: 24,
+            channels: 2,
+            file_size: None,
+            duration_ms: Some(300_000),
+            ..StreamInfo::default()
+        };
+        // `create_session(wav_info, true, 128)` : `wav_header_included` reste
+        // FAUX. On ne le pose PAS ici — c'est tout l'objet de la garde.
+        let session = std::sync::Arc::new(StreamSession::new("dopreel".into(), info, true, 128));
+        let tx = session.tx.lock().await.clone().expect("tx");
+        session.close_sender().await;
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [("dopreel".to_string(), session)].into_iter().collect(),
+        ));
+        tx.send(super::build_wav_header(2, 176_400, 24, None).to_vec())
+            .await
+            .expect("l'en-tête du producteur");
+        for bloc in charge.chunks(4096) {
+            tx.send(bloc.to_vec()).await.expect("charge");
+        }
+        drop(tx);
+
+        let rep = super::handle_stream(
+            Path("dopreel.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+        let mut recu = Vec::new();
+        while let Ok(Some(Ok(b))) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), corps.next()).await
+        {
+            recu.extend_from_slice(&b);
+        }
+
+        let entetes: Vec<usize> = recu
+            .windows(12)
+            .enumerate()
+            .filter(|(_, w)| &w[0..4] == b"RIFF" && &w[8..12] == b"WAVE")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            entetes,
+            vec![0],
+            "un seul en-tête WAV, à l'octet 0 — il y en a à {entetes:?}"
+        );
+
+        let debut = recu
+            .windows(24)
+            .position(|w| w == &charge[..24])
+            .expect("la charge DoP doit être servie");
+        assert_eq!(
+            debut,
+            44,
+            "la charge DoP doit commencer juste après l'en-tête : elle commence à {debut},              soit {} octets trop loin — {} modulo la trame de 6",
+            debut - 44,
+            (debut - 44) % 6
+        );
+
+        if let Err(pourquoi) = porteur_dop_lisible(&recu[44..], 44, 2) {
+            panic!(
+                "le porteur DoP servi est illisible pour un renderer qui lit l'en-tête —                  {pourquoi}. C'est le bruit blanc de #1894."
+            );
+        }
+    }
+
+    /// #1894 — GARDE DE SOURCE : le rognage est bien celui qui remet la grille
+    /// du renderer en phase, quel que soit le sens de l'écart.
+    ///
+    /// Elle tient l'arithmétique seule, sans HTTP : un `%` sur des `u64` là où
+    /// l'écart peut être négatif rendrait un résidu faux sans rien casser
+    /// d'autre, et la garde de comportement ci-dessus ne le verrait que sur un
+    /// des quatre offsets.
+    #[test]
+    fn le_rognage_remet_la_grille_du_renderer_en_phase() {
+        // Trame de 6 octets : DoP stéréo 24 bits.
+        for annonce in 0u64..24 {
+            for reel in 0u64..24 {
+                let k = super::rognage_de_phase(annonce, reel, 6);
+                assert!(k < 6, "le rognage ne doit jamais dépasser la trame : {k}");
+                assert_eq!(
+                    (reel + k as u64) % 6,
+                    annonce % 6,
+                    "annoncé {annonce}, réel {reel} : après {k} octets rognés la grille doit \
+                     coïncider"
+                );
+            }
+        }
+        // Le canal EN AVANCE sur l'offset annoncé (le cas d'une connexion
+        // avortée dont le tampon de coalescence a emporté des octets) : l'écart
+        // est négatif, le rognage reste positif et juste.
+        assert_eq!(super::rognage_de_phase(100, 104, 6), 2);
+        // Le cas réel : une connexion avortée a emporté 65 536 octets dans son
+        // tampon. 65 536 % 6 == 4, donc deux octets à rogner.
+        assert_eq!(super::rognage_de_phase(44, 44 + 65_536, 6), 2);
+        // Une avance qui tombe juste sur la trame ne coûte rien.
+        assert_eq!(super::rognage_de_phase(44, 44 + 65_538, 6), 0);
+        // Trame de 1 : rien à remettre en phase.
+        assert_eq!(super::rognage_de_phase(7, 3, 1), 0);
+        assert_eq!(super::rognage_de_phase(7, 3, 0), 0);
     }
 }
 

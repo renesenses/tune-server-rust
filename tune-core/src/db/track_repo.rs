@@ -114,6 +114,320 @@ pub fn like_escape_clause() -> &'static str {
     " ESCAPE '\\'"
 }
 
+/// Les comptes rendus par [`compter_pistes_par_sous_dossier`], indexés par nom
+/// de sous-dossier.
+///
+/// Le repli de clé n'est pas cosmétique : il est ce qui rend le résultat
+/// **identique** à la boucle de `COUNT(*) … LIKE` qu'il remplace, moteur par
+/// moteur. Voir la note « La casse » de [`compter_pistes_par_sous_dossier`].
+#[derive(Debug, Default, Clone)]
+pub struct ComptesParSousDossier {
+    comptes: HashMap<String, i64>,
+    replier_la_casse: bool,
+}
+
+impl ComptesParSousDossier {
+    /// Le nombre de pistes sous le sous-dossier `nom`, récursivement. Un
+    /// sous-dossier sans aucune piste est absent de la table : il rend `0`,
+    /// comme le `COUNT(*)` qu'il remplace.
+    pub fn get(&self, nom: &str) -> i64 {
+        use unicode_normalization::UnicodeNormalization as _;
+        // `nom` vient du DISQUE (`read_dir`), donc potentiellement en NFD ;
+        // `tracks.file_path` est écrit en NFC par le scanner. Même repli que
+        // [`folder_like_pattern`], pour la même raison.
+        let nfc: String = nom.nfc().collect();
+        let clef = if self.replier_la_casse {
+            nfc.to_ascii_lowercase()
+        } else {
+            nfc
+        };
+        self.comptes.get(&clef).copied().unwrap_or(0)
+    }
+
+    /// Nombre de sous-dossiers effectivement peuplés. Sert aux tests et au
+    /// journal ; l'écran, lui, interroge [`Self::get`] pour chaque entrée que
+    /// `read_dir` lui a rendue.
+    pub fn nb_dossiers_peuples(&self) -> usize {
+        self.comptes.len()
+    }
+}
+
+/// Le nombre de pistes sous **chaque sous-dossier direct** de `parent`, en
+/// **une seule** requête.
+///
+/// # Ce que ça remplace, et ce que ça coûtait (#3857)
+///
+/// `GET /library/browse/dir` listait les sous-dossiers par `read_dir`, puis
+/// lançait `SELECT COUNT(*) FROM tracks WHERE file_path LIKE '<sous-dossier>%'`
+/// **une fois par sous-dossier**, séquentiellement. Et
+/// [`like_escape_clause`] le dit déjà en toutes lettres : sur SQLite ce `LIKE`
+/// **ne peut pas** s'appuyer sur l'index de `file_path`, « le plan est un
+/// parcours complet avant comme après, mesuré ». Le coût d'un niveau était
+/// donc « nombre de sous-dossiers × toute la table » — pour Pierre M (fil
+/// forum 1671), 155 829 lignes parcourues autant de fois qu'un dossier a
+/// d'enfants, dont un coffret de 63 dossiers `CDxx`.
+///
+/// Ici : **un** parcours. On coupe `file_path` après le préfixe du parent et on
+/// groupe sur le premier segment du reste. Une piste posée directement dans
+/// `parent` n'a pas de séparateur dans son reste : elle n'est comptée nulle
+/// part, exactement comme avec la boucle, dont le motif exigeait un séparateur
+/// après le nom du sous-dossier.
+///
+/// # La casse — pourquoi le résultat est identique, et pas seulement voisin
+///
+/// Sur SQLite, `LIKE` est insensible à la casse ASCII : `LIKE 'p/Sub/%'`
+/// comptait aussi les pistes de `p/sub/`. Le regroupement SQL, lui, est
+/// sensible à la casse. [`ComptesParSousDossier`] replie donc ses clés en
+/// minuscules ASCII quand le moteur est SQLite, ce qui **additionne** `Sub` et
+/// `sub` dans le même seau — soit exactement le total que rendait la boucle.
+/// Sur Postgres `LIKE` est sensible à la casse, et la clé est prise telle
+/// quelle. Sans ce repli, le remplacement aurait rendu `0` là où la boucle
+/// rendait un compte, sur toute bibliothèque dont la casse en base diffère de
+/// celle du disque.
+///
+/// # Deux détails qui ne se voient pas
+///
+/// * `substr` compte en **caractères** sur les deux moteurs, jamais en octets :
+///   le départ est donc `chars().count()`, sans quoi un seul dossier accentué
+///   dans le chemin du parent décalerait la coupe de tous ses enfants.
+/// * `instr` (SQLite) et `strpos` (Postgres) sont le même appel sous deux noms ;
+///   c'est la seule divergence de dialecte de cette requête.
+pub fn compter_pistes_par_sous_dossier(
+    backend: &dyn DbBackend,
+    parent: &str,
+) -> Result<ComptesParSousDossier, String> {
+    use unicode_normalization::UnicodeNormalization as _;
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+    let base: String = parent.trim_end_matches(['/', '\\']).nfc().collect();
+    // 1-indexé : le premier caractère APRÈS « <parent><séparateur> ».
+    let depart = base.chars().count() + sep.chars().count() + 1;
+    let motif = folder_like_pattern(parent);
+    let postgres = backend.engine() == Engine::Postgres;
+    let (p1, p2, pos) = if postgres {
+        ("$1", "$2", "strpos")
+    } else {
+        ("?1", "?2", "instr")
+    };
+    let sql = format!(
+        "SELECT substr(reste, 1, {pos}(reste, {p2}) - 1) AS segment, COUNT(*) \
+         FROM (SELECT substr(file_path, {depart}) AS reste FROM tracks \
+         WHERE file_path LIKE {p1}{esc}) AS sous \
+         WHERE {pos}(reste, {p2}) > 0 GROUP BY segment",
+        esc = like_escape_clause()
+    );
+    let params: [&dyn ToSqlValue; 2] = [&motif, &sep];
+    let rows = backend.query_many(&sql, &params)?;
+    let mut comptes: HashMap<String, i64> = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let Some(segment) = row.first().and_then(|v| v.as_string()) else {
+            continue;
+        };
+        if segment.is_empty() {
+            continue;
+        }
+        let n = row.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+        let clef = if postgres {
+            segment
+        } else {
+            segment.to_ascii_lowercase()
+        };
+        *comptes.entry(clef).or_insert(0) += n;
+    }
+    Ok(ComptesParSousDossier {
+        comptes,
+        replier_la_casse: !postgres,
+    })
+}
+
+/// #3857 — le témoin de l'équivalence entre la requête groupée et la boucle
+/// qu'elle remplace.
+///
+/// Il ne compare pas à des nombres écrits à la main : il rejoue, pour chaque
+/// sous-dossier, **le `SELECT COUNT(*) … LIKE` d'origine** et exige le même
+/// total. Un témoin qui affirmerait « 2 » ne garderait que l'arithmétique du
+/// cas qu'on a imaginé ; celui-ci garde le contrat : *remplacer N requêtes par
+/// une seule ne change aucun compte*.
+#[cfg(test)]
+mod comptes_par_sous_dossier_tests {
+    use super::*;
+    use crate::db::models::Track;
+
+    fn base() -> SqliteDb {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db
+    }
+
+    fn s() -> char {
+        std::path::MAIN_SEPARATOR
+    }
+
+    fn poser(db: &SqliteDb, chemins: &[String]) {
+        let repo = TrackRepo::new(db.clone());
+        for (i, c) in chemins.iter().enumerate() {
+            let mut t = Track::new(format!("piste {i}"));
+            t.file_path = Some(c.clone());
+            repo.create(&t).unwrap();
+        }
+    }
+
+    /// La boucle d'AVANT, mot pour mot : un `COUNT(*) … LIKE` sur le motif de
+    /// [`folder_like_pattern`] du sous-dossier. C'est la référence.
+    fn compte_de_reference(db: &SqliteDb, dossier: &str) -> i64 {
+        let motif = folder_like_pattern(dossier);
+        let sql = format!(
+            "SELECT COUNT(*) FROM tracks WHERE file_path LIKE ?1{}",
+            like_escape_clause()
+        );
+        db.query_one(&sql, &[&motif as &dyn ToSqlValue])
+            .unwrap()
+            .unwrap()
+            .first()
+            .and_then(|v| v.as_i64())
+            .unwrap()
+    }
+
+    /// Compare, sous-dossier par sous-dossier, la table groupée à la référence.
+    fn exiger_l_equivalence(db: &SqliteDb, parent: &str, sous_dossiers: &[&str]) {
+        let comptes = compter_pistes_par_sous_dossier(db, parent).unwrap();
+        for nom in sous_dossiers {
+            let attendu = compte_de_reference(db, &format!("{parent}{}{nom}", s()));
+            assert_eq!(
+                comptes.get(nom),
+                attendu,
+                "sous-dossier « {nom} » de « {parent} » : la requête groupée doit \
+                 rendre exactement ce que rendait le COUNT(*) … LIKE"
+            );
+        }
+    }
+
+    #[test]
+    fn une_seule_requete_rend_les_memes_comptes_que_la_boucle() {
+        let db = base();
+        let (sep, racine) = (s(), "/music".to_string());
+        poser(
+            &db,
+            &[
+                format!("{racine}{sep}Artiste A{sep}Album 1{sep}01.flac"),
+                format!("{racine}{sep}Artiste A{sep}Album 1{sep}02.flac"),
+                format!("{racine}{sep}Artiste A{sep}Album 2{sep}01.flac"),
+                format!("{racine}{sep}Artiste B{sep}01.flac"),
+                // Une piste posée DIRECTEMENT dans le parent : elle n'appartient
+                // à aucun sous-dossier et ne doit gonfler aucun compte.
+                format!("{racine}{sep}seul.flac"),
+            ],
+        );
+        exiger_l_equivalence(&db, &racine, &["Artiste A", "Artiste B"]);
+        let comptes = compter_pistes_par_sous_dossier(&db, &racine).unwrap();
+        assert_eq!(comptes.get("Artiste A"), 3, "le compte est RÉCURSIF");
+        assert_eq!(comptes.get("Artiste B"), 1);
+        assert_eq!(
+            comptes.nb_dossiers_peuples(),
+            2,
+            "la piste posée dans le parent n'ouvre aucun seau"
+        );
+        assert_eq!(
+            comptes.get("Artiste C"),
+            0,
+            "un sous-dossier sans piste rend 0, comme le COUNT(*) qu'il remplace"
+        );
+    }
+
+    /// Le départ de `substr` se compte en CARACTÈRES. Mesuré avec un parent
+    /// accentué : `Béla Bartók` fait 11 caractères et 13 octets. Une coupe en
+    /// octets décalerait de 2 et le premier segment deviendrait « atuors ».
+    #[test]
+    fn un_parent_accentue_ne_decale_pas_la_coupe() {
+        let db = base();
+        let (sep, racine) = (s(), "/musique/Béla Bartók".to_string());
+        assert_ne!(
+            racine.chars().count(),
+            racine.len(),
+            "le cas ne vaut que si le parent n'est pas ASCII"
+        );
+        poser(
+            &db,
+            &[
+                format!("{racine}{sep}Quatuors{sep}n4.flac"),
+                format!("{racine}{sep}Quatuors{sep}n5.flac"),
+                format!("{racine}{sep}Concertos{sep}n2.flac"),
+            ],
+        );
+        exiger_l_equivalence(&db, &racine, &["Quatuors", "Concertos"]);
+        let comptes = compter_pistes_par_sous_dossier(&db, &racine).unwrap();
+        assert_eq!(comptes.get("Quatuors"), 2);
+        assert_eq!(comptes.get("Concertos"), 1);
+    }
+
+    /// Sur SQLite `LIKE` est insensible à la casse ASCII : la boucle comptait
+    /// `Sub` et `sub` ENSEMBLE. Le regroupement SQL, lui, les sépare. Sans le
+    /// repli de clé, l'écran aurait affiché la moitié du dossier.
+    #[test]
+    fn la_casse_est_repliee_comme_like_le_faisait() {
+        let db = base();
+        let (sep, racine) = (s(), "/casse".to_string());
+        poser(
+            &db,
+            &[
+                format!("{racine}{sep}Sub{sep}a.flac"),
+                format!("{racine}{sep}sub{sep}b.flac"),
+                format!("{racine}{sep}SUB{sep}c.flac"),
+            ],
+        );
+        assert_eq!(
+            compte_de_reference(&db, &format!("{racine}{sep}Sub")),
+            3,
+            "la boucle d'origine comptait bien les trois graphies"
+        );
+        exiger_l_equivalence(&db, &racine, &["Sub", "sub", "SUB"]);
+    }
+
+    /// `%` et `_` sont les jokers de `LIKE`. [`folder_like_pattern`] les
+    /// échappe ; la requête groupée, elle, ne les interprète pas du tout — mais
+    /// son motif de parent passe toujours par le même échappement, et le
+    /// segment est comparé comme du texte.
+    #[test]
+    fn les_jokers_d_un_nom_de_dossier_ne_sur_apparient_pas() {
+        let db = base();
+        let (sep, racine) = (s(), "/jokers".to_string());
+        poser(
+            &db,
+            &[
+                format!("{racine}{sep}100% Live{sep}a.flac"),
+                format!("{racine}{sep}a_b{sep}b.flac"),
+                format!("{racine}{sep}axb{sep}c.flac"),
+            ],
+        );
+        let comptes = compter_pistes_par_sous_dossier(&db, &racine).unwrap();
+        assert_eq!(comptes.get("100% Live"), 1);
+        assert_eq!(comptes.get("a_b"), 1, "« a_b » ne ramasse pas « axb »");
+        assert_eq!(comptes.get("axb"), 1);
+    }
+
+    /// Le parent porte lui-même un joker : c'est le motif du `LIKE` qui doit
+    /// tenir, et c'est [`folder_like_pattern`] qui le tient.
+    #[test]
+    fn un_parent_qui_porte_un_joker_ne_ramasse_pas_ses_voisins() {
+        let db = base();
+        let sep = s();
+        poser(
+            &db,
+            &[
+                format!("/j/100% Live{sep}Sous{sep}a.flac"),
+                format!("/j/100xLive{sep}Sous{sep}b.flac"),
+                format!("/j/100xLive{sep}Sous{sep}c.flac"),
+            ],
+        );
+        let comptes = compter_pistes_par_sous_dossier(&db, "/j/100% Live").unwrap();
+        assert_eq!(
+            comptes.get("Sous"),
+            1,
+            "« 100% Live » ne doit pas avaler « 100xLive »"
+        );
+        exiger_l_equivalence(&db, "/j/100% Live", &["Sous"]);
+    }
+}
+
 /// The longest common directory prefix of all `tracks.file_path` — the real
 /// library root inferred from the data. Fallback for the folder views (Oxygen
 /// facet, browse "Répertoires") when `music_dirs` is stale and its configured

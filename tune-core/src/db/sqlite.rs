@@ -174,8 +174,32 @@ impl SqliteDb {
             read_pool.push(Arc::new(Mutex::new(rc)));
         }
 
+        // #2718 — dire QUEL fichier a été ouvert.
+        //
+        // Sur Linux, `db_path` vaut « tune.db » et se résout contre le
+        // RÉPERTOIRE COURANT du processus : Windows et macOS ont été relocalisés
+        // (#3185), Linux ne l'a jamais été. Le même binaire lancé depuis un
+        // autre dossier — ou sous un autre compte — ouvre donc un AUTRE
+        // `tune.db`, que `SQLITE_OPEN_CREATE` (plus haut) crée vide sans un mot.
+        // C'est « la bibliothèque a disparu » sans qu'une seule ligne n'ait été
+        // effacée, et c'est la première hypothèse à écarter chez un testeur
+        // Linux.
+        //
+        // Ce journal annonçait le chemin BRUT, « tune.db », qui ne désigne rien :
+        // il ne permettait même pas de savoir LAQUELLE des deux bases avait été
+        // ouverte. `std::path::absolute` le résout contre le répertoire courant
+        // sans toucher au disque — contrairement à `canonicalize`, qui suivrait
+        // les liens symboliques (ce qu'on veut justement voir, pas masquer) et
+        // qui échouerait sur un fichier créé à l'instant même.
+        //
+        // `path` est CONSERVÉ à côté : c'est la valeur telle qu'elle a été
+        // configurée, et la comparer à l'absolu est ce qui montre la résolution.
+        let chemin_absolu = std::path::absolute(path)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.to_string());
         info!(
             path,
+            chemin_absolu,
             readers = READ_POOL_SIZE,
             journal = if reliable_fs { "WAL" } else { "DELETE" },
             "sqlite_opened"
@@ -508,7 +532,16 @@ CREATE TABLE IF NOT EXISTS zones (
     lyrics_offset_ms INTEGER NOT NULL DEFAULT 0,
     -- DUP-1 (phase 2) : dernière fois que l'appareil a répondu (ISO 8601 UTC).
     -- NULL = jamais vue depuis la pose de la colonne. TEXT des deux côtés.
-    last_seen_at TEXT
+    last_seen_at TEXT,
+    -- #2269 — l'identifiant d'endpoint STABLE du backend, pour une sortie
+    -- locale : `wasapi:{0.0.0.00000000}.{guid}`, `coreaudio:<UID>`… C'est la
+    -- seule identité qui traverse un renommage, et `output_device_id` n'en
+    -- porte aucune : il vaut `local:{nom}`, donc un NOM. NULL = zone née avant
+    -- la colonne, ou périphérique jamais énuméré depuis ; jamais inventé.
+    -- Ne remplace PAS `output_device_id`, qui reste l'identité de la zone :
+    -- le réécrire renverrait tous les réglages accrochés sur une clef neuve.
+    -- Voir `outputs::identite_de_sortie` pour ce qui a le droit de s'en servir.
+    output_endpoint_id TEXT
 );
 
 -- Unified queue (v0.9 rc.2): a single ordered queue per zone holding both

@@ -24,6 +24,22 @@ struct DecisionLocale {
     is_chromecast: bool,
     is_local_output: bool,
     is_network_output: bool,
+    /// La sortie va CHERCHER le flux elle-même : elle reçoit une URL et lit
+    /// nos octets sans que rien ne les décode côté serveur. C'est la
+    /// TROISIÈME famille, celle qui n'est ni réseau ni navigateur ni locale
+    /// (`diretta`, `hqplayer`, `airplay2`, tout greffon hors dépôt) —
+    /// [`is_pull_dsp_output_type`], moins `local` et `oaat` qui, eux,
+    /// décodent déjà pour alimenter leur périphérique.
+    ///
+    /// Pourquoi ce champ existe : le décodage-pour-niveaux du passthrough
+    /// (`servir_en_passthrough`) ne s'arme que si PERSONNE ne décode côté
+    /// serveur, et son prédicat ne connaissait que « réseau || navigateur ».
+    /// Une zone Diretta tombait donc dans le bras « quelqu'un décode déjà »
+    /// alors que personne ne décode : aucun `playback.audio_levels` n'était
+    /// émis, VU-mètres et barregraphe restaient morts (#3807, Dominique
+    /// COMET, 0.9.144, fil 1742). Même trou que #1216/#1430 sur l'égaliseur,
+    /// une famille de sortie oubliée d'un prédicat binaire.
+    sortie_tire_le_flux: bool,
     local_needs_wav: bool,
     needs_downsample: bool,
     needs_transcode_for_output: bool,
@@ -860,6 +876,15 @@ impl PlaybackOrchestrator {
             is_oaat_output,
             source_format,
         );
+        // Même famille que `is_pull_dsp_output`, SANS sa condition de format :
+        // le décodage-pour-niveaux ne dépend pas de ce qu'on transcode, mais
+        // seulement de QUI décode. `pull_output_needs_dsp_transcode` écarte en
+        // plus le DSD et le format inconnu — deux exclusions qui ont leur sens
+        // pour le DSP et aucun ici, où le DSD est déjà écarté par
+        // `skip_passthrough_levels`.
+        let sortie_tire_le_flux = is_pull_dsp_output_type(zone_output_type.as_deref())
+            && !is_local_output
+            && !is_oaat_output;
         let eq_forces_transcode = (is_network_output || is_browser_output || is_pull_dsp_output)
             && !dsd_passthrough
             && !alac_passthrough
@@ -994,6 +1019,7 @@ impl PlaybackOrchestrator {
             dsp_progressif_wav,
             ape_flux_wav,
             is_network_output,
+            sortie_tire_le_flux,
             local_needs_wav,
             needs_downsample,
             needs_transcode_for_output,
@@ -1096,6 +1122,43 @@ impl PlaybackOrchestrator {
             let (session_id, tx, data_ready) =
                 self.streamer.create_session(wav_info, true, 128).await;
 
+            // ── L'en-tête WAV part DANS le canal : le dire, sinon il en part DEUX ──
+            //
+            // La tâche ci-dessous envoie `build_wav_header(...)` comme premier
+            // bloc du canal. Sans ce drapeau, `handle_stream` croit le canal nu
+            // et PRÉFIXE son propre en-tête : le renderer reçoit 44 octets
+            // d'en-tête, puis 44 octets d'en-tête pris pour de l'audio, puis le
+            // porteur DoP — décalé de 44 octets, soit **2 modulo la trame de 6**
+            // (2 canaux x 24 bits).
+            //
+            // Le marqueur `0x05`/`0xFA` ne tombe alors sur l'octet de poids fort
+            // d'AUCUN mot de 24 bits : le DAC ne verrouille pas en DSD et joue le
+            // train DSD comme du PCM, c'est-à-dire du bruit blanc, dès le premier
+            // échantillon et sur toute la piste (#1894, Marco Polo, WiiM Pro ;
+            // #2369 sur la sortie locale — les deux tickets ne partagent que ce
+            // segment).
+            //
+            // Mesuré sur banc : `EN-TETES RIFF A = [0, 44]`, charge utile à
+            // l'octet 88. Les TROIS autres sessions de conversion posent ce
+            // drapeau — dont une dans ce même fichier, quelques centaines de
+            // lignes plus bas (le transcodage progressif), plus
+            // `resolve_stream.rs:485` et `:1577`. Celle-ci, née avec #1830 en
+            // 0.9.82, ne l'a jamais posé — c'est la date de la régression.
+            //
+            // Il rend aussi son office à la réserve d'en-tête
+            // (`wav_header_stash`), qu'un canal non déclaré ne remplit jamais :
+            // un renderer qui sonde avant de jouer consommait l'en-tête sur une
+            // connexion qu'il referme.
+            {
+                let sessions = self.streamer.sessions_state();
+                let sessions = sessions.lock().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    session
+                        .wav_header_included
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+
             info!(
                 file = %file_path,
                 dsd_rate,
@@ -1111,9 +1174,25 @@ impl PlaybackOrchestrator {
                 .and_then(|e| e.to_str())
                 .unwrap_or("dsf")
                 .to_lowercase();
+            let duree_ms = track.duration_ms as u64;
             tokio::task::spawn_blocking(move || {
                 // Send WAV header first
-                let wav_hdr = crate::audio::wav::build_wav_header(dop_channels, dop_rate, 24);
+                //
+                // AVEC la durée. `handle_stream` préfixait jusqu'ici son propre
+                // en-tête, bâti sur `StreamInfo` — donc avec `duration_ms` —, et
+                // c'était CELUI-LÀ que le renderer lisait. L'en-tête du canal,
+                // lui, partait sans durée : `UNKNOWN_DATA_SIZE`, soit un bloc
+                // `data` de ~2 Gio. Maintenant que la session déclare son
+                // en-tête, c'est celui-ci que le renderer lit : il doit dire la
+                // même chose qu'avant, sans quoi ce correctif échangerait un
+                // défaut contre un autre — une taille de 2 Gio là où le
+                // `Content-Length` annonce la vraie longueur.
+                let wav_hdr = crate::audio::wav::build_wav_header_with_duration(
+                    dop_channels,
+                    dop_rate,
+                    24,
+                    Some(duree_ms),
+                );
                 let rt = tokio::runtime::Handle::current();
                 let _ = rt.block_on(tx.send(wav_hdr.to_vec()));
                 data_ready.notify_one();
@@ -2385,6 +2464,7 @@ impl PlaybackOrchestrator {
             channels,
             is_browser_output,
             is_network_output,
+            sortie_tire_le_flux,
             sample_rate,
             source_format,
             track_duration_ms,
@@ -2512,7 +2592,15 @@ impl PlaybackOrchestrator {
             // ~65 evenements/s au lieu de ~32, avec des horodatages qui
             // divergent apres un seek (l'un part du seek, l'autre de 0) et,
             // depuis #1106, des fenetres dupliquees sur le tap PCM (#1110).
-            let output_decodes_server_side = !(is_network_output || is_browser_output);
+            // Une sortie PULL hors dépôt — `diretta`, `hqplayer`,
+            // `airplay2` — n'est NI réseau NI navigateur, mais elle reçoit
+            // elle aussi une URL et va chercher le flux : rien ne le décode
+            // côté serveur, donc personne n'émet de niveaux. Elle manquait à
+            // ce prédicat binaire, et les VU-mètres comme le barregraphe
+            // restaient morts sur toute la famille (#3807). `local` et `oaat`
+            // restent exclus par `sortie_tire_le_flux` : eux décodent déjà.
+            let output_decodes_server_side =
+                !(is_network_output || is_browser_output || sortie_tire_le_flux);
             if !skip_passthrough_levels
                 && !output_decodes_server_side
                 && self.levels_attach_allowed(req.zone_id)

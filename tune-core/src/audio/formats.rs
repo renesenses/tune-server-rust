@@ -50,6 +50,23 @@ impl AudioFormat {
             "aiff" | "aif" => Some(Self::Aiff),
             "dsf" | "dff" | "dst" | "dsd" => Some(Self::Dsd),
             "wv" => Some(Self::WavPack),
+            // 🔴 #3849 — `tracks.format` ne contient PAS toujours une extension.
+            //
+            // Sur un fichier ÉTIQUETÉ, `metadata::read_metadata` écrit le nom
+            // du type détecté par lofty : `format!("{:?}", file_type)` en
+            // minuscules. Pour un `.wv` avec tags — un rip EAC, par exemple —
+            // cela donne « wavpack », et pour un `.ogg` Vorbis « vorbis ».
+            // Aucun des deux n'est une extension, donc cette fonction rendait
+            // `None`, et la conséquence était mesurée chez Marco Polo : sans
+            // format source, `needs_transcode_for_output` est faux, la piste
+            // prend la branche « servir le fichier brut », et le MIME retombe
+            // sur `audio/flac` — un `.wv` livré tel quel au Denon sous
+            // l'étiquette FLAC.
+            //
+            // Les reconnaître ici répare AUSSI les lignes déjà écrites, ce
+            // qu'une correction limitée au scanner ne ferait pas.
+            "wavpack" => Some(Self::WavPack),
+            "vorbis" => Some(Self::Ogg),
             "ape" => Some(Self::Ape),
             "wma" | "asf" => Some(Self::Wma),
             _ => None,

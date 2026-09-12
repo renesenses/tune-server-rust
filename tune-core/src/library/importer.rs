@@ -27,6 +27,14 @@ pub struct MatchResult {
     pub match_method: Option<String>,
 }
 
+/// Le rapport que l'écran d'import affiche — #3914 (R5).
+///
+/// Cette structure portait déjà, mot pour mot, les champs que
+/// `tune-web-client/src/lib/api.ts` déclare sous le nom `ImportReport` — à un
+/// près, `history_entries_added`, qui manquait ici. Elle n'était construite
+/// NULLE PART : aucune route ne la rendait, et l'écran lisait donc `undefined`
+/// partout. C'est le même défaut que l'analyseur CSV de R3, « écrit mais pas
+/// branché », un cran plus loin dans la chaîne.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportReport {
     pub source: String,
@@ -35,6 +43,10 @@ pub struct ImportReport {
     pub unmatched: usize,
     pub play_counts_updated: usize,
     pub ratings_updated: usize,
+    /// Reste `0` tant que l'import ne reporte pas l'historique d'écoute de
+    /// l'export sur la bibliothèque : `ImportedTrack::last_played` est LU par
+    /// les analyseurs, mais rien ne l'écrit encore.
+    pub history_entries_added: usize,
     pub playlists_created: usize,
 }
 
@@ -317,6 +329,23 @@ pub fn match_tracks(
     path_index: &HashMap<String, i64>,
     fuzzy_index: &HashMap<(String, String, String), i64>,
 ) -> Vec<MatchResult> {
+    // Les deux relâchements ci-dessous — « titre + artiste », puis « titre
+    // seul, s'il est unique » — parcouraient `fuzzy_index` EN ENTIER, pour
+    // chaque ligne importée. Tant que personne n'appelait cette fonction, cela
+    // ne coûtait rien. L'aperçu de #3914 (R4) l'appelle, et il est SYNCHRONE :
+    // un export de 50 000 lignes contre une bibliothèque de 50 000 pistes
+    // faisait 2,5 milliards de comparaisons, la requête ne rendait jamais la
+    // main. Les mêmes relâchements se lisent dans deux index construits UNE
+    // fois — mêmes candidats, même résultat, en une passe au lieu d'une par
+    // ligne.
+    let mut par_titre_artiste: HashMap<(&str, &str), i64> = HashMap::new();
+    let mut par_titre: HashMap<&str, Vec<i64>> = HashMap::new();
+    for ((titre, artiste, _album), &id) in fuzzy_index {
+        par_titre_artiste
+            .entry((titre.as_str(), artiste.as_str()))
+            .or_insert(id);
+        par_titre.entry(titre.as_str()).or_default().push(id);
+    }
     imported
         .iter()
         .map(|imp| {
@@ -362,25 +391,17 @@ pub fn match_tracks(
                 }
 
                 // Relax: title + artist only
-                if !key.1.is_empty() {
-                    for (fk, &fid) in fuzzy_index {
-                        if fk.0 == key.0 && fk.1 == key.1 {
-                            mr.tune_track_id = Some(fid);
-                            mr.matched = true;
-                            mr.match_method = Some("fuzzy".into());
-                            return mr;
-                        }
-                    }
+                if !key.1.is_empty()
+                    && let Some(&fid) = par_titre_artiste.get(&(key.0.as_str(), key.1.as_str()))
+                {
+                    mr.tune_track_id = Some(fid);
+                    mr.matched = true;
+                    mr.match_method = Some("fuzzy".into());
+                    return mr;
                 }
-
                 // Relax: title only (unique match)
-                let candidates: Vec<i64> = fuzzy_index
-                    .iter()
-                    .filter(|(fk, _)| fk.0 == key.0)
-                    .map(|(_, &fid)| fid)
-                    .collect();
-                if candidates.len() == 1 {
-                    mr.tune_track_id = Some(candidates[0]);
+                if let Some([seul]) = par_titre.get(key.0.as_str()).map(|v| v.as_slice()) {
+                    mr.tune_track_id = Some(*seul);
                     mr.matched = true;
                     mr.match_method = Some("fuzzy".into());
                 }

@@ -105,11 +105,67 @@ impl TypeFavori {
     }
 }
 
-/// Convert a service method result into a JSON response (OK -> 200, Err -> 502).
-fn svc_response<R: serde::Serialize, E: std::fmt::Display>(result: Result<R, E>) -> Response {
+/// Le statut HTTP que l'erreur PORTE, ou `None` quand elle ne dit rien de plus
+/// que « ça a échoué » — l'appelant garde alors son statut par défaut.
+///
+/// # Le défaut (#859)
+///
+/// [`svc_response`] sortait **tout** `Err` en `502 BAD_GATEWAY`. Or 502
+/// signifie précisément « la passerelle en amont est en panne ». Mesuré sur le
+/// .18 le 12/09/2026, trois essais sur trois :
+///
+/// ```text
+/// GET /api/v1/streaming/bandcamp/playlists → 502 en 5,1 / 8,5 / 4,6 ms
+/// corps : « Bandcamp ne fournit pas de playlists »
+/// ```
+///
+/// Quatre à huit millisecondes : aucun aller-retour réseau n'a eu lieu.
+/// Ce n'est pas une passerelle en panne, c'est `get_user_playlists` qui refuse
+/// délibérément — et le refus était maquillé en panne d'infrastructure. Un
+/// testeur qui lit « 502 Bad Gateway » signale une panne serveur ; on cherche
+/// une passerelle, un réseau, un service tiers, pour un serveur qui a
+/// simplement dit non.
+///
+/// # Pourquoi une variante et pas le message
+///
+/// Le message est libre et traduit ; le lire pour décider d'un statut
+/// redériverait à la première reformulation. C'est
+/// [`TuneError::Unsupported`] — posée par les refus délibérés eux-mêmes — qui
+/// porte l'information, et elle seule.
+///
+/// # Pourquoi 501 et pas 400
+///
+/// La requête était RECEVABLE : bien formée, sur une route qui existe, pour un
+/// service qui existe. Ce n'est donc pas un `400`. C'est le serveur qui
+/// n'implémente pas la fonctionnalité pour ce service — la définition même du
+/// `501` (RFC 9110 §15.6.2).
+///
+/// # Ce qui NE bouge pas
+///
+/// Tout le reste — réseau injoignable, JSON illisible, erreur rendue par le
+/// service, cas inconnu — reste une panne d'amont. `None` ici, et l'appelant
+/// garde son 502. Remplacer un mensonge par un autre n'aurait rien réparé.
+fn statut_porte_par_l_erreur(e: &tune_core::TuneError) -> Option<StatusCode> {
+    match e {
+        tune_core::TuneError::Unsupported(_) => Some(StatusCode::NOT_IMPLEMENTED),
+        _ => None,
+    }
+}
+
+/// Convert a service method result into a JSON response (OK -> 200, Err ->
+/// 502, sauf refus délibéré -> 501 ; voir [`statut_porte_par_l_erreur`]).
+///
+/// Le paramètre d'erreur est `TuneError` et non plus un `E: Display` : c'est
+/// ce qui permet de lire la VARIANTE au lieu de deviner sur le texte. Les 28
+/// gestionnaires qui passent par ici rendent tous déjà un `TuneError`.
+fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) -> Response {
     match result {
         Ok(data) => Json(json!(data)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        Err(e) => (
+            statut_porte_par_l_erreur(&e).unwrap_or(StatusCode::BAD_GATEWAY),
+            e.to_string(),
+        )
+            .into_response(),
     }
 }
 
@@ -132,8 +188,8 @@ const CACHE_EDITORIAL: &str = "private, max-age=1800";
 ///
 /// Une erreur n'est pas mise en cache : un 502 passager deviendrait une panne
 /// de trente minutes.
-fn svc_response_editorial<R: serde::Serialize, E: std::fmt::Display>(
-    result: Result<R, E>,
+fn svc_response_editorial<R: serde::Serialize>(
+    result: Result<R, tune_core::TuneError>,
 ) -> Response {
     let est_ok = result.is_ok();
     let mut response = svc_response(result);
@@ -1476,7 +1532,8 @@ mod tests_cache_editorial {
     /// Une réponse éditorielle valide autorise le navigateur à la resservir.
     #[test]
     fn une_reponse_editoriale_valide_est_cachable() {
-        let r: Result<serde_json::Value, String> = Ok(serde_json::json!({"albums": []}));
+        let r: Result<serde_json::Value, tune_core::TuneError> =
+            Ok(serde_json::json!({"albums": []}));
         let reponse = svc_response_editorial(r);
         assert_eq!(
             reponse
@@ -1492,7 +1549,8 @@ mod tests_cache_editorial {
     /// moyen de la faire cesser.
     #[test]
     fn une_erreur_n_est_jamais_mise_en_cache() {
-        let r: Result<serde_json::Value, String> = Err("upstream 502".into());
+        let r: Result<serde_json::Value, tune_core::TuneError> =
+            Err(tune_core::TuneError::Streaming("upstream 502".into()));
         let reponse = svc_response_editorial(r);
         assert!(
             reponse
@@ -1509,7 +1567,7 @@ mod tests_cache_editorial {
     /// « pour uniformiser », il échoue.
     #[test]
     fn la_reponse_ordinaire_ne_pose_aucune_politique() {
-        let r: Result<serde_json::Value, String> = Ok(serde_json::json!([]));
+        let r: Result<serde_json::Value, tune_core::TuneError> = Ok(serde_json::json!([]));
         let reponse = svc_response(r);
         assert!(
             reponse
@@ -2195,5 +2253,320 @@ mod tests_favoris_dates {
             pistes.iter().all(|p| p.get("created_at").is_none()),
             "aucune date inventee la ou le service n'en donne pas"
         );
+    }
+}
+
+/// 🔴 #859 — un refus délibéré ne sort plus en `502 Bad Gateway`, et une vraie
+/// panne de passerelle y sort toujours.
+///
+/// # Ce qui était mesuré
+///
+/// Sur le .18 en marche, le 12/09/2026, trois essais sur trois :
+///
+/// ```text
+/// GET /api/v1/streaming/bandcamp/playlists → 502 en 5,1 / 8,5 / 4,6 ms
+/// corps : « Bandcamp ne fournit pas de playlists »           (36 octets)
+/// ```
+///
+/// Quatre à huit millisecondes : aucun aller-retour réseau. Le témoin de
+/// contraste, pris au même moment : `GET /streaming/qobuz/playlists` → 200 en
+/// 208 ms, 57 199 octets. Le 502 ne décrivait donc rien de ce qui s'était
+/// passé — et une issue a été ouverte sur ce seul motif.
+///
+/// # Les deux directions, et pourquoi les deux
+///
+/// Sans le second essai on aurait remplacé un mensonge par un autre : tout
+/// sortir en 501 serait aussi faux que tout sortir en 502. Le premier essai
+/// rougit si le 502 universel revient ; le second rougit si le 501 devient
+/// universel.
+///
+/// # Ce que ces essais couvrent que le seul `svc_response` ne couvrirait pas
+///
+/// Le refus du premier essai n'est PAS fabriqué ici : `service_album_label`
+/// tombe sur le défaut du trait `get_album_label` (`tune-core`), que le
+/// connecteur simulé ne surcharge pas. Le vert prouve donc les DEUX moitiés du
+/// correctif — le producteur pose bien un [`tune_core::TuneError::Unsupported`]
+/// ET la frontière HTTP le traduit. Reposer le `.into()` d'avant dans
+/// `traits.rs` suffit à faire rougir, sans toucher à `svc_response`.
+#[cfg(test)]
+mod temoin_statut_du_refus_i859 {
+    use super::*;
+    use tune_core::TuneError;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack,
+        StreamUrl,
+    };
+
+    /// Ce que le connecteur simulé fait de `get_user_playlists`.
+    #[derive(Clone, Copy)]
+    enum Humeur {
+        /// « Ce service ne fournit pas de playlists » — le refus délibéré,
+        /// posé exactement comme `hors_portee` de `tune-bandcamp` le pose.
+        Refuse,
+        /// L'amont est injoignable — la seule situation qu'un 502 décrit.
+        PasserelleEnPanne,
+    }
+
+    const REFUS: &str = "Bandcamp ne fournit pas de playlists";
+    const PANNE: &str = "error sending request for url (https://bandcamp.com/api)";
+
+    struct ServiceDHumeur {
+        nom: String,
+        humeur: Humeur,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServiceDHumeur {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            &self.nom
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _e: bool) {}
+        async fn authenticate(&mut self, _c: &Value) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        /// La route MESURÉE sur le .18 : `GET /streaming/{svc}/playlists`.
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            match self.humeur {
+                Humeur::Refuse => Err(TuneError::Unsupported(REFUS.into())),
+                Humeur::PasserelleEnPanne => Err(TuneError::Streaming(PANNE.into())),
+            }
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        // `get_album_label` n'est PAS surchargé : c'est le défaut du trait —
+        // le vrai producteur de refus — que l'essai du label interroge.
+    }
+
+    /// Chaque essai a SON nom de service : le cache de contenu utilisateur est
+    /// un `static` partagé par tout le processus de test.
+    fn etat(nom: &'static str, humeur: Humeur) -> (StreamingHttpState, String) {
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServiceDHumeur {
+            nom: nom.to_string(),
+            humeur,
+        }));
+        let etat = StreamingHttpState::new(
+            backend,
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        );
+        (etat, nom.to_string())
+    }
+
+    async fn texte(r: Response) -> String {
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 20)
+            .await
+            .expect("corps lisible");
+        String::from_utf8_lossy(&octets).into_owned()
+    }
+
+    /// Le défaut mesuré : `GET /streaming/{service}/playlists` sur un
+    /// connecteur qui REFUSE. 502 avant, 501 maintenant.
+    #[tokio::test]
+    async fn un_refus_du_connecteur_ne_sort_plus_en_502() {
+        let (etat, nom) = etat("refus-playlists", Humeur::Refuse);
+        let r = service_playlists(State(etat), Path(nom)).await;
+        let statut = r.status();
+        let corps = texte(r).await;
+        assert_ne!(
+            statut,
+            StatusCode::BAD_GATEWAY,
+            "« {corps} » n'est pas une passerelle en panne : le serveur a dit non, \
+             en 4 ms et sans un octet de reseau (mesure .18 du 12/09/2026)"
+        );
+        assert_eq!(
+            statut,
+            StatusCode::NOT_IMPLEMENTED,
+            "un refus delibere sort en 501 Not Implemented, corps rendu : « {corps} »"
+        );
+        assert_eq!(
+            corps, REFUS,
+            "le corps ne change pas d'un octet : seul le statut change"
+        );
+    }
+
+    /// L'autre direction, sans laquelle on aurait remplacé un mensonge par un
+    /// autre : l'amont injoignable reste un 502, c'est ce que 502 veut dire.
+    #[tokio::test]
+    async fn une_vraie_panne_de_passerelle_sort_toujours_en_502() {
+        let (etat, nom) = etat("panne-playlists", Humeur::PasserelleEnPanne);
+        let r = service_playlists(State(etat), Path(nom)).await;
+        let statut = r.status();
+        let corps = texte(r).await;
+        assert_eq!(
+            statut,
+            StatusCode::BAD_GATEWAY,
+            "l'amont injoignable EST une passerelle en panne ; corps rendu : « {corps} »"
+        );
+        assert!(
+            corps.contains("error sending request"),
+            "le corps doit rester celui du service : « {corps} »"
+        );
+    }
+
+    /// Le refus posé par le DÉFAUT DU TRAIT — pas par cet essai — traverse la
+    /// route jusqu'au 501. Reposer `"…".into()` dans `traits.rs` fait rougir
+    /// ici sans que `svc_response` ait bougé.
+    #[tokio::test]
+    async fn le_refus_par_defaut_du_trait_sort_aussi_en_501() {
+        let (etat, nom) = etat("refus-label", Humeur::PasserelleEnPanne);
+        let r = service_album_label(State(etat), Path((nom, String::from("a1")))).await;
+        let statut = r.status();
+        let corps = texte(r).await;
+        assert_eq!(
+            statut,
+            StatusCode::NOT_IMPLEMENTED,
+            "« {corps} » est le refus par defaut du trait, pas une panne d'amont"
+        );
+        assert_eq!(corps, "labels not supported for this service");
+    }
+
+    /// **Les HUIT** refus par défaut du trait, pas seulement celui que la route
+    /// du label emprunte.
+    ///
+    /// L'essai précédent n'en interroge qu'un. Reposer `"…".into()` sur
+    /// `create_playlist` — ou sur n'importe lequel des sept autres — ferait
+    /// silencieusement redescendre sa route en 502 sans qu'aucun rouge ne
+    /// vienne. Un rouge qui ne vient pas est un défaut du témoin : celui-ci
+    /// ferme les huit.
+    ///
+    /// Le connecteur simulé ne surcharge AUCUNE de ces méthodes : c'est bien le
+    /// défaut de `tune-core` qui répond.
+    #[tokio::test]
+    async fn les_huit_refus_par_defaut_du_trait_sont_types() {
+        let mut svc = ServiceDHumeur {
+            nom: "essai-defauts".into(),
+            humeur: Humeur::PasserelleEnPanne,
+        };
+        let refus: Vec<(&str, TuneError)> = vec![
+            (
+                "create_playlist",
+                svc.create_playlist("x", None).await.unwrap_err(),
+            ),
+            (
+                "add_tracks_to_playlist",
+                svc.add_tracks_to_playlist("p", &[]).await.unwrap_err(),
+            ),
+            (
+                "delete_playlist",
+                svc.delete_playlist("p").await.unwrap_err(),
+            ),
+            (
+                "remove_tracks_from_playlist",
+                svc.remove_tracks_from_playlist("p", &[]).await.unwrap_err(),
+            ),
+            (
+                "get_album_label",
+                svc.get_album_label("a").await.unwrap_err(),
+            ),
+            (
+                "get_album_context",
+                svc.get_album_context("a").await.unwrap_err(),
+            ),
+            (
+                "add_favorite",
+                svc.add_favorite("albums", "i").await.unwrap_err(),
+            ),
+            (
+                "remove_favorite",
+                svc.remove_favorite("albums", "i").await.unwrap_err(),
+            ),
+        ];
+        assert_eq!(refus.len(), 8, "les huit defauts, pas sept");
+        for (methode, erreur) in refus {
+            assert!(
+                matches!(erreur, TuneError::Unsupported(_)),
+                "le defaut de `{methode}` est un refus delibere, pas une panne \
+                 d'amont : {erreur:?}"
+            );
+            assert_eq!(
+                statut_porte_par_l_erreur(&erreur),
+                Some(StatusCode::NOT_IMPLEMENTED),
+                "et sa route doit donc sortir en 501 : `{methode}`"
+            );
+        }
+    }
+
+    /// Une réponse ÉDITORIALE refusée passe par `svc_response_editorial`, qui
+    /// délègue à `svc_response`. Sans cet essai, la moitié éditoriale des
+    /// routes pourrait garder le 502 sans que rien ne rougisse.
+    #[tokio::test]
+    async fn le_chemin_editorial_classe_le_refus_comme_l_autre() {
+        let r = svc_response_editorial::<Value>(Err(TuneError::Unsupported(REFUS.into())));
+        assert_eq!(r.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            r.headers().get(axum::http::header::CACHE_CONTROL).is_none(),
+            "un refus ne se met pas en cache trente minutes"
+        );
+    }
+
+    /// Le 502 reste le DÉFAUT. Aucune autre variante ne doit être promue en
+    /// douce : cet essai fige la frontière, variante par variante.
+    #[test]
+    fn seule_la_variante_du_refus_porte_un_statut() {
+        assert_eq!(
+            statut_porte_par_l_erreur(&TuneError::Unsupported("x".into())),
+            Some(StatusCode::NOT_IMPLEMENTED)
+        );
+        for panne in [
+            TuneError::Streaming("x".into()),
+            TuneError::Json(serde_json::from_str::<Value>("{").unwrap_err()),
+            TuneError::Db("x".into()),
+            TuneError::Config("x".into()),
+            TuneError::NotFound("x".into()),
+            TuneError::Other("x".into()),
+        ] {
+            assert_eq!(
+                statut_porte_par_l_erreur(&panne),
+                None,
+                "{panne} doit garder le statut par defaut de l'appelant"
+            );
+        }
     }
 }

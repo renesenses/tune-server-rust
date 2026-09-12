@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::audio::mixer::PcmMixer;
 
@@ -179,7 +179,16 @@ impl DualDeckPlayer {
         let gain_a = self.deck_a.lock().await.gain * cf_a;
         let gain_b = self.deck_b.lock().await.gain * cf_b;
 
-        self.mixer.mix_buffers(&[buf_a, buf_b], &[gain_a, gain_b])
+        // `MIX_BIT_DEPTH` est une constante de ce fichier : `mix_buffers`
+        // ne peut pas refuser ici aujourd'hui. Le bras est journalise
+        // plutot que muet pour que le refus se VOIE le jour ou la
+        // profondeur devient un reglage (#2219, R3).
+        self.mixer
+            .mix_buffers(&[buf_a, buf_b], &[gain_a, gain_b])
+            .unwrap_or_else(|e| {
+                warn!(zone_id = self.zone_id, erreur = %e, "dj_mix_refuse");
+                Vec::new()
+            })
     }
 
     pub async fn status(&self) -> serde_json::Value {

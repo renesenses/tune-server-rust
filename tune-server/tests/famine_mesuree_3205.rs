@@ -230,6 +230,7 @@ async fn un_zero_mesure_se_distingue_d_une_absence_de_mesure() {
                 events: 0,
                 missing_samples: 0,
                 served_samples: 96_000,
+                driver_underruns: 0,
                 stream_ms: 1_000,
             },
         ))
@@ -270,6 +271,7 @@ async fn les_compteurs_de_la_sortie_arrivent_entiers_sur_les_deux_routes() {
                 events: 7,
                 missing_samples: 12_345,
                 served_samples: 33_816_156,
+                driver_underruns: 0,
                 stream_ms: 352_251,
             },
         ))

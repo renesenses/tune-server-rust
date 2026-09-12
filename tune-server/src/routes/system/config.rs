@@ -306,6 +306,13 @@ pub(super) async fn get_config(
         ("discovery_enabled", json!(true)),
         ("zone_auto_create", json!(true)),
         ("squeezebox_enabled", json!(false)),
+        // #3809 — l'ANNONCE de Tune comme serveur Squeezebox, à ne pas
+        // confondre avec la ligne ci-dessus : celle-là gouverne Tune client
+        // d'un LMS. Vrai par défaut, le comportement d'avant ; un `false`
+        // explicite fait taire le répondeur UDP 3483 sans toucher à l'écoute
+        // TCP du même port (#2938, #2349). Voir
+        // `background::annonce_slimproto_activee`.
+        (crate::background::CLE_ANNONCE_SLIMPROTO, json!(true)),
         ("db_engine", json!(state.backend.engine().as_str())),
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),

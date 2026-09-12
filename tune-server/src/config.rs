@@ -182,6 +182,34 @@ impl Default for TuneConfig {
     }
 }
 
+/// L'adresse annoncee, resolue depuis les DEUX orthographes d'environnement.
+///
+/// #3867 : quatre reponses coexistaient a « quelle est mon adresse ? ». Celle
+/// qui compte — `TuneConfig::advertised_ip` — n'etait alimentee que par
+/// `TUNE_ADVERTISED_IP` (avec D). `TUNE_ADVERTISE_IP` (sans D) n'etait lu que
+/// par `routes::system::server_urls` et la fiche systeme : une adresse posee
+/// sous ce nom s'affichait a l'ecran sans jamais etre annoncee en SSDP, ni
+/// portee par les URL de flux remises aux lecteurs.
+///
+/// Fonction PURE : elle ne lit pas l'environnement, pour etre eprouvee sans
+/// `set_var` (qui casserait la suite `--workspace` en parallele).
+///
+/// Rend `(adresse, l_ancien_nom_a_servi)`. Le nom publie l'emporte quand les
+/// deux sont poses ; une valeur vide ne compte pour aucun des deux ; `None`
+/// laisse intacte la valeur venue de `tune.toml`.
+pub(crate) fn adresse_annoncee_depuis_env(
+    avec_d: Option<&str>,
+    sans_d: Option<&str>,
+) -> (Option<String>, bool) {
+    if let Some(ip) = avec_d.filter(|ip| !ip.is_empty()) {
+        return (Some(ip.to_string()), false);
+    }
+    if let Some(ip) = sans_d.filter(|ip| !ip.is_empty()) {
+        return (Some(ip.to_string()), true);
+    }
+    (None, false)
+}
+
 impl TuneConfig {
     pub fn server_ip(&self) -> String {
         if let Some(ref ip) = self.advertised_ip {
@@ -333,9 +361,24 @@ impl TuneConfig {
         {
             config.openai_api_key = Some(v);
         }
-        if let Ok(v) = std::env::var("TUNE_ADVERTISED_IP")
-            && !v.is_empty()
-        {
+        // #3867 — une seule notion d'adresse annoncee, deux orthographes
+        // d'environnement. `TUNE_ADVERTISED_IP` est le nom publie
+        // (`.env.tune.example`) ; `TUNE_ADVERTISE_IP` (sans D) a vecu sa propre
+        // vie dans `server_urls` et la fiche systeme, sans jamais atteindre ce
+        // champ — c'est-a-dire sans jamais atteindre SSDP, les zones ni
+        // l'orchestrateur. Les deux alimentent desormais le MEME champ, seule
+        // source de verite ; l'ancien nom est accepte et signale.
+        let (ip_annoncee, ancien_nom) = adresse_annoncee_depuis_env(
+            std::env::var("TUNE_ADVERTISED_IP").ok().as_deref(),
+            std::env::var("TUNE_ADVERTISE_IP").ok().as_deref(),
+        );
+        if let Some(v) = ip_annoncee {
+            if ancien_nom {
+                warn!(
+                    adresse = %v,
+                    "TUNE_ADVERTISE_IP est obsolete (sans D) : renommer en TUNE_ADVERTISED_IP"
+                );
+            }
             config.advertised_ip = Some(v);
         }
         if let Ok(v) = std::env::var("TUNE_DATABASE_URL")
@@ -936,5 +979,64 @@ mod port_documente_guard {
             tune_core::streaming::spotify::default_redirect_uri(port),
             format!("http://127.0.0.1:{port}/api/v1/streaming/spotify/callback")
         );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// #3867 — l'adresse annoncee n'a qu'une seule destination
+// ───────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod adresse_annoncee_3867 {
+    use super::adresse_annoncee_depuis_env;
+
+    /// Le defaut mesure : `TUNE_ADVERTISE_IP` (sans D) etait lu par
+    /// `server_urls` et la fiche systeme, et par RIEN d'autre. L'annonceur
+    /// SSDP (`background.rs`, via `config.advertised_ip`), les URL de flux des
+    /// zones (`routes/zones.rs`) et l'orchestrateur (`orchestrator/commun.rs`)
+    /// lisent tous `advertised_ip` : une adresse posee sous l'ancien nom ne les
+    /// atteignait jamais. Elle doit desormais y arriver, et etre signalee.
+    #[test]
+    fn l_ancien_nom_sans_d_alimente_le_champ_annonce() {
+        let (ip, ancien) = adresse_annoncee_depuis_env(None, Some("192.168.1.100"));
+        assert_eq!(
+            ip.as_deref(),
+            Some("192.168.1.100"),
+            "TUNE_ADVERTISE_IP (sans D) doit alimenter advertised_ip : sans cela \
+             l'adresse s'affiche a l'ecran mais n'est ni annoncee en SSDP ni \
+             portee par les URL de flux (#3867)"
+        );
+        assert!(ancien, "l'emploi de l'ancien nom doit etre signale");
+    }
+
+    /// Le nom publie (`.env.tune.example`) l'emporte quand les deux sont poses,
+    /// et ne declenche aucun avertissement.
+    #[test]
+    fn le_nom_publie_l_emporte_sans_avertissement() {
+        let (ip, ancien) = adresse_annoncee_depuis_env(Some("10.0.0.1"), Some("192.168.1.100"));
+        assert_eq!(ip.as_deref(), Some("10.0.0.1"));
+        assert!(!ancien, "TUNE_ADVERTISED_IP ne doit rien deprecier");
+    }
+
+    /// Une variable posee mais VIDE ne vaut pas une adresse — sans quoi
+    /// `advertised_ip = Some("")` ferait annoncer `http://:8888`, et le repli
+    /// d'autodetection ne s'appliquerait jamais.
+    #[test]
+    fn une_valeur_vide_ne_compte_pour_aucun_des_deux_noms() {
+        assert_eq!(adresse_annoncee_depuis_env(Some(""), None), (None, false));
+        assert_eq!(adresse_annoncee_depuis_env(None, Some("")), (None, false));
+        let (ip, ancien) = adresse_annoncee_depuis_env(Some(""), Some("192.168.1.100"));
+        assert_eq!(
+            ip.as_deref(),
+            Some("192.168.1.100"),
+            "un TUNE_ADVERTISED_IP vide ne doit pas masquer l'ancien nom"
+        );
+        assert!(ancien);
+    }
+
+    /// Rien dans l'environnement : la valeur de `tune.toml` doit survivre.
+    /// `load()` n'ecrit le champ que sur un `Some`.
+    #[test]
+    fn sans_environnement_la_valeur_de_tune_toml_survit() {
+        assert_eq!(adresse_annoncee_depuis_env(None, None), (None, false));
     }
 }

@@ -253,6 +253,28 @@ pub(super) async fn browse_directory(
             unreadable = Some(e.to_string());
         }
         Ok(entries) => {
+            // UNE requete pour TOUT le niveau, au lieu d'un
+            // `SELECT COUNT(*) … LIKE` par sous-dossier (#3857). Le commentaire
+            // de `like_escape_clause` dit pourquoi la boucle coutait si cher :
+            // ce `LIKE` ne peut pas s'appuyer sur l'index de `file_path`, donc
+            // chaque compte parcourait toute la table. Mesure sur 155 829
+            // pistes (la bibliotheque de Pierre M, fil forum 1671) : un coffret
+            // de 63 dossiers `CDxx` passe de 1 166 ms a 21 ms, et une racine de
+            // 11 891 dossiers d'artistes de 303 965 ms a 187 ms.
+            //
+            // L'echec est journalise UNE fois et rend une table vide : chaque
+            // sous-dossier retombe alors a 0, soit exactement ce que la boucle
+            // faisait de son cote sur `browse_dir_count_failed`.
+            let comptes = match tune_core::db::track_repo::compter_pistes_par_sous_dossier(
+                state.backend.as_ref(),
+                &normalized_query,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(path = %normalized_query, error = %e, "browse_dir_count_failed");
+                    tune_core::db::track_repo::ComptesParSousDossier::default()
+                }
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
@@ -265,26 +287,7 @@ pub(super) async fn browse_directory(
                     if name.starts_with('.') {
                         continue;
                     }
-                    let pattern = tune_core::db::track_repo::folder_like_pattern(&dir_path);
-                    let track_count: i64 = match state.backend.query_one(
-                        &format!(
-                            "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}{}",
-                            if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
-                                "$1"
-                            } else {
-                                "?1"
-                            },
-                            tune_core::db::track_repo::like_escape_clause()
-                        ),
-                        &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
-                    ) {
-                        Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
-                        Ok(None) => 0,
-                        Err(e) => {
-                            warn!(path = %dir_path, error = %e, "browse_dir_count_failed");
-                            0
-                        }
-                    };
+                    let track_count: i64 = comptes.get(&name);
                     subdirs.push(
                         json!({ "name": name, "path": dir_path, "track_count": track_count }),
                     );
@@ -325,11 +328,27 @@ pub(super) async fn browse_directory(
     // pistes restait vide. Les deux points manquants sont repliés ici.
     let repertoire_nfc: String = normalized_query.nfc().collect();
     let dir_prefix = tune_core::db::track_repo::folder_like_pattern(&repertoire_nfc);
-    let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
-        "$1"
+    let postgres = state.backend.engine() == tune_core::db::engine::Engine::Postgres;
+    let (ph, ph2, pos) = if postgres {
+        ("$1", "$2", "strpos")
     } else {
-        "?1"
+        ("?1", "?2", "instr")
     };
+    // Le `LIKE` est RÉCURSIF : il ramène aussi les pistes des sous-dossiers,
+    // que `est_enfant_direct` écarte ensuite une par une. Sur la racine d'une
+    // grande bibliothèque, c'était donc TOUTE la bibliothèque rapatriée — seize
+    // colonnes et deux jointures — pour n'en garder que les quelques fichiers
+    // posés à la racine. Mesure sur 155 829 pistes (#3857, Pierre M) :
+    // 155 829 lignes en 343 ms, contre 0 ligne en 103 ms une fois le « pas de
+    // séparateur après le préfixe » poussé dans le SQL.
+    //
+    // Ce n'est qu'un PRÉ-filtre : `est_enfant_direct` reste l'autorité, plus
+    // bas, et il est plus strict (il compare les deux chemins repliés en NFC).
+    // Un pré-filtre plus strict que lui perdrait des pistes ; celui-ci ne peut
+    // qu'en laisser passer.
+    let sep_txt = std::path::MAIN_SEPARATOR.to_string();
+    let depart_enfant =
+        repertoire_nfc.trim_end_matches(['/', '\\']).chars().count() + sep_txt.chars().count() + 1;
     let sql = format!(
         "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, \
                t.disc_number, t.track_number, t.duration_ms, t.file_path, \
@@ -337,6 +356,7 @@ pub(super) async fn browse_directory(
                FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
                LEFT JOIN artists ar ON t.artist_id = ar.id \
                WHERE t.file_path LIKE {ph}{esc} \
+               AND {pos}(substr(t.file_path, {depart_enfant}), {ph2}) = 0 \
                ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
         esc = tune_core::db::track_repo::like_escape_clause()
     );
@@ -344,7 +364,10 @@ pub(super) async fn browse_directory(
         .backend
         .query_many(
             &sql,
-            &[&dir_prefix as &dyn tune_core::db::backend::ToSqlValue],
+            &[
+                &dir_prefix as &dyn tune_core::db::backend::ToSqlValue,
+                &sep_txt as &dyn tune_core::db::backend::ToSqlValue,
+            ],
         )
         .ou_defaut_journalise();
     let tracks: Vec<Value> = rows

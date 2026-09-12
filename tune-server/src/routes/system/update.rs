@@ -1347,6 +1347,173 @@ fn checker_for(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) 
 /// Distincte de `last_update_result`, qui porte le résultat de la DERNIÈRE
 /// installation appliquée : confondre les deux ferait passer une simple
 /// disponibilité pour une mise à jour effectuée.
+/// La version qui tournait AVANT celle-ci.
+///
+/// #2266 — DEvir demande de pouvoir revenir a la version precedente « sans
+/// naviguer dans l'historique ou les tags de GitHub ». Le premier obstacle
+/// n'est pas le mecanisme d'echange du binaire : c'est que **le serveur ne
+/// sait pas d'ou il vient**. Aucune des traces existantes ne le dit —
+/// `last_update_result` ne porte que la version COURANTE (et, en cas d'echec,
+/// celle qu'on ATTENDAIT), et le binaire parque en `<exe>.old` par
+/// [`install_unix`] survit bien mais sans etiquette de version.
+///
+/// Cette cle porte un FAIT, pas une promesse : elle ne dit pas qu'un retour
+/// arriere est possible — il ne l'est pas encore, et la migration de base a
+/// rebours reste la question ouverte du ticket. Elle dit d'ou l'on vient, ce
+/// qui est le minimum sans lequel un ecran ne peut proposer NI le binaire
+/// parque, NI la release GitHub correspondante.
+pub(crate) const CLE_VERSION_PRECEDENTE: &str = "previous_version";
+
+/// La version constatee au demarrage precedent. Sert uniquement a detecter le
+/// changement ; c'est [`CLE_VERSION_PRECEDENTE`] que l'ecran lit.
+pub(crate) const CLE_VERSION_VUE: &str = "last_seen_version";
+
+/// Ce que le demarrage doit retenir, au vu de la version constatee la fois
+/// d'avant. `None` = ne rien ecrire.
+///
+/// Fonction pure, pour que la regle soit eprouvable sans base ni disque.
+///
+/// Trois cas, et le troisieme est celui qui compte :
+///
+/// - **Premiere mise en route** (`vue` absente ou vide) : on ne vient de nulle
+///   part, il n'y a rien a dire.
+/// - **La version a change** : c'est le seul moment ou l'on APPREND quelque
+///   chose, et `vue` est justement la version que l'on quitte.
+/// - **Redemarrage sur la meme version** : `None`. Ne rien ecrire est ici le
+///   comportement a TENIR, pas une paresse. Un testeur qui vient de subir une
+///   mauvaise mise a jour redemarre plusieurs fois avant de demander de
+///   l'aide ; recalculer la cle a chaque demarrage effacerait, des le premier
+///   de ces redemarrages, la seule trace de ce qu'il cherche a retrouver.
+///
+/// Une RETROGRADATION est traitee comme une montee : revenir de 0.9.140 a
+/// 0.9.139 enregistre 0.9.140. Le champ repond « quelle version tournait juste
+/// avant », pas « quelle version etait la plus recente » — et c'est bien la
+/// premiere question qu'on se pose quand on veut annuler le geste qu'on vient
+/// de faire, dans un sens comme dans l'autre.
+pub(crate) fn version_precedente(vue: Option<&str>, courante: &str) -> Option<String> {
+    let vue = vue.map(str::trim).filter(|v| !v.is_empty())?;
+    (vue != courante.trim()).then(|| vue.to_string())
+}
+
+#[cfg(test)]
+mod version_precedente_tests {
+    use super::{CLE_VERSION_PRECEDENTE, CLE_VERSION_VUE, version_precedente};
+
+    #[test]
+    fn premiere_mise_en_route_ne_vient_de_nulle_part() {
+        assert_eq!(version_precedente(None, "0.9.140"), None);
+        assert_eq!(version_precedente(Some(""), "0.9.140"), None);
+        assert_eq!(version_precedente(Some("   "), "0.9.140"), None);
+    }
+
+    #[test]
+    fn une_montee_de_version_enregistre_celle_qu_on_quitte() {
+        assert_eq!(
+            version_precedente(Some("0.9.139"), "0.9.140"),
+            Some("0.9.139".to_string())
+        );
+    }
+
+    /// Le cas qui a motive la cle. Un redemarrage ne doit RIEN ecrire : sinon
+    /// `previous_version` vaudrait la version courante des le premier
+    /// redemarrage, et l'ecran proposerait de « revenir » a la version que
+    /// l'utilisateur veut precisement quitter.
+    #[test]
+    fn un_redemarrage_sur_la_meme_version_n_ecrit_rien() {
+        assert_eq!(version_precedente(Some("0.9.140"), "0.9.140"), None);
+        // Un reglage recopie a la main ne fabrique pas un faux changement.
+        assert_eq!(version_precedente(Some(" 0.9.140 "), "0.9.140"), None);
+    }
+
+    #[test]
+    fn une_retrogradation_enregistre_aussi_la_version_quittee() {
+        assert_eq!(
+            version_precedente(Some("0.9.140"), "0.9.139"),
+            Some("0.9.140".to_string())
+        );
+    }
+
+    /// Les deux cles sont des noms de reglages PERSISTES : les changer rendrait
+    /// illisibles les bases deja ecrites. Figees ici pour que le changement
+    /// soit un geste delibere.
+    #[test]
+    fn les_cles_de_reglage_sont_figees() {
+        assert_eq!(CLE_VERSION_PRECEDENTE, "previous_version");
+        assert_eq!(CLE_VERSION_VUE, "last_seen_version");
+    }
+
+    /// Garde de cablage, cote LECTURE : une cle ecrite qu'aucune route ne rend
+    /// serait « ecrite mais pas branchee ».
+    ///
+    /// L'ancrage se fait sur la SIGNATURE ENTIERE, pas sur `pub(super) async fn
+    /// update_status`. Ce fragment-la apparait QUATRE fois dans ce fichier —
+    /// deux gardes de cablage qui le citent (dont celle-ci), la vraie
+    /// definition, et un extrait de code factice dans
+    /// `scan_guard_tests`. Un `find` dessus s'arretait sur le premier, et le
+    /// bloc examine englobait alors le source de CE test : l'assertion sur
+    /// `CLE_VERSION_PRECEDENTE` se satisfaisait de sa propre mention et ne
+    /// pouvait plus rougir. Mesure faite : sous sabotage (ligne
+    /// `previous_version` retiree de la route), elle restait VERTE. La
+    /// signature complete, elle, est unique.
+    #[test]
+    fn update_status_publie_la_version_precedente() {
+        let source = include_str!("update.rs");
+        // Assemblee par `concat!` et JAMAIS ecrite d'un seul tenant : ecrite
+        // en clair, la signature apparaitrait deux fois dans ce fichier — la
+        // vraie definition et cette constante — et le temoin d'unicite
+        // ci-dessous rougirait sur sa propre copie. Mesure faite : il a
+        // effectivement rougi, sur un fichier par ailleurs intact.
+        const SIGNATURE: &str = concat!(
+            "pub(super) async fn update_status(State(state): ",
+            "State<AppState>) -> Json<Value> {"
+        );
+        assert_eq!(
+            source.matches(SIGNATURE).count(),
+            1,
+            "temoin : la signature d'ancrage doit etre unique dans ce fichier"
+        );
+        let debut = source.find(SIGNATURE).expect("temoin : signature trouvee");
+        let fin = source[debut..]
+            .find("\n/// Compare the version an in-progress update")
+            .map(|f| debut + f)
+            .expect("temoin : la borne de fin de la route doit exister");
+        let bloc = &source[debut..fin];
+        // Temoin : le bloc examine est bien le CORPS DE LA ROUTE, et non un
+        // morceau de ce module de tests.
+        assert!(
+            bloc.contains("\"current_version\": tune_core::version()"),
+            "temoin : le bloc examine doit etre le corps de `update_status`"
+        );
+        assert!(
+            !bloc.contains("fn update_status_publie_la_version_precedente"),
+            "temoin : le bloc ne doit pas contenir le source de ce test"
+        );
+        assert!(
+            bloc.contains("CLE_VERSION_PRECEDENTE"),
+            "`update_status` doit relire la version precedente (#2266)"
+        );
+        assert!(
+            bloc.contains("\"previous_version\""),
+            "`update_status` doit publier la cle JSON `previous_version` (#2266)"
+        );
+    }
+
+    /// Garde de cablage, cote ECRITURE : sans appel au demarrage, la cle n'est
+    /// jamais posee et la route publierait eternellement `null`.
+    #[test]
+    fn le_demarrage_note_la_version_vue() {
+        let startup = include_str!("../../startup.rs");
+        assert!(
+            startup.contains("pub async fn init_state"),
+            "temoin : le fichier lu doit etre celui qui initialise l'etat"
+        );
+        assert!(
+            startup.contains("update::noter_la_version_vue(state)"),
+            "`init_state` doit appeler `noter_la_version_vue` (#2266)"
+        );
+    }
+}
+
 pub(crate) const CLE_MISE_A_JOUR_DISPONIBLE: &str = "update_available_release";
 
 /// Délai avant le premier contrôle après le démarrage.
@@ -2922,6 +3089,11 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
         "update_in_progress": phase.is_some() && !is_failed,
         "last_update_result": last_update_result,
         "available_update": available_update,
+        // #2266 — d'ou vient ce serveur. Un FAIT, pas un bouton : l'ecran peut
+        // enfin NOMMER la version precedente (et pointer sa release) au lieu
+        // de renvoyer l'utilisateur aux tags de GitHub. `null` sur une
+        // installation qui n'a jamais change de version.
+        "previous_version": settings.get(CLE_VERSION_PRECEDENTE).ok().flatten(),
         // `null` hors de la phase de report : rien à dire, rien à afficher.
         "restart_pending_zones": restart_pending_zones,
         "recovery_hint": recovery_hint,
@@ -2953,6 +3125,40 @@ fn swap_took(expected: &str, actual: &str) -> Option<bool> {
 /// bat-swap failure (#1220): the binary swap could be blocked (antivirus, a
 /// locked/relaunched .exe) and the server would come back on the OLD version
 /// with no error anywhere — "the update did nothing". Consumes the markers.
+/// Tenir a jour « d'ou vient ce serveur » (#2266).
+///
+/// Appelee au demarrage a cote de [`record_post_update_result`], et
+/// deliberement SEPAREE d'elle. Deux raisons, et la seconde est un defaut
+/// evite :
+///
+/// - Cette comptabilite ne depend d'AUCUN marqueur laisse sur le disque par un
+///   installeur, donc d'aucune plateforme. Elle vaut sous Windows — dont le
+///   `.bat` fait `del` de l'ancien binaire, qu'aucun `<exe>.old` ne survit —
+///   comme sous Homebrew et sous Docker, ou l'echange se fait hors de Tune.
+/// - `record_post_update_result` rend la main TOT : des que `current_exe()`
+///   echoue, et des qu'un marqueur d'echec de `.bat` est present. Y greffer ce
+///   calcul l'aurait rendu muet exactement dans les cas d'echec ou savoir d'ou
+///   l'on vient sert le plus.
+///
+/// Aucune erreur n'est propagee : ne pas savoir d'ou l'on vient ne doit pas
+/// empecher un serveur de demarrer.
+pub fn noter_la_version_vue(state: &AppState) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let courante = tune_core::version();
+    let vue = settings.get(CLE_VERSION_VUE).ok().flatten();
+    if let Some(precedente) = version_precedente(vue.as_deref(), courante) {
+        info!(
+            previous = %precedente,
+            current = courante,
+            "version_changed_since_last_start"
+        );
+        let _ = settings.set(CLE_VERSION_PRECEDENTE, &precedente);
+    }
+    // Ecrite a CHAQUE demarrage, y compris le tout premier : c'est elle qui
+    // fera la comparaison la prochaine fois.
+    let _ = settings.set(CLE_VERSION_VUE, courante);
+}
+
 pub fn record_post_update_result(state: &AppState) {
     let Ok(exe) = std::env::current_exe() else {
         return;

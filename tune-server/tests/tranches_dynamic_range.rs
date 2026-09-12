@@ -56,13 +56,23 @@ async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
 /// qui se trompe de clé.
 fn bibliotheque() -> axum::Router {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-    for (n, (titre, dr, dr_piste)) in [
-        ("Alpha", Some("6"), Some("7")),
-        ("Bravo", Some("14"), Some("14")),
-        ("Charlie", Some("9"), None),
-        ("Delta", None, None),
-        ("Echo", Some("DR12.5"), None),
-        ("Foxtrot", Some("0"), Some("0")),
+    for (n, (titre, dr, dr_piste, dr_provenance)) in [
+        // Alpha : un DR de piste SANS `dr_source` — toute base antérieure à
+        // la v0.9.145, où la lecture du tag était le seul producteur et ne
+        // marquait rien. La valeur sort, la provenance se tait (#3924).
+        ("Alpha", Some("6"), Some("7"), None),
+        // Bravo : CALCULÉ par la passe d'analyse.
+        ("Bravo", Some("14"), Some("14"), Some("analysis")),
+        ("Charlie", Some("9"), None, None),
+        ("Delta", None, None, None),
+        // Echo : une provenance ORPHELINE — `dr_source` en base, aucun
+        // `dr_track`. Une ligne comme celle-ci naît d'un `dr_track` effacé à
+        // la main ou d'une piste ré-étiquetée hors de Tune ; la route ne doit
+        // PAS annoncer d'où vient une valeur qu'elle ne sert pas. C'est le
+        // seul cas qui éprouve l'appariement de `provenance_du_dr`.
+        ("Echo", Some("DR12.5"), None, Some("analysis")),
+        // Foxtrot : LU DANS LE TAG du fichier, et DR0 est une mesure.
+        ("Foxtrot", Some("0"), Some("0"), Some("tag")),
     ]
     .into_iter()
     .enumerate()
@@ -116,6 +126,21 @@ fn bibliotheque() -> axum::Router {
                 )
                 .expect("insertion du tag DR de piste");
         }
+        if let Some(v) = dr_provenance {
+            // #3924 — `dr_source` : « tag » quand le scan a lu la valeur dans
+            // le fichier, « analysis » quand la passe d'analyse l'a calculée
+            // sur les échantillons (`tune-core/src/audio/replaygain.rs`).
+            state
+                .backend
+                .execute(
+                    &format!(
+                        "INSERT INTO track_metadata (track_id, key, value) \
+                         VALUES ({id}, 'dr_source', '{v}')"
+                    ),
+                    &[],
+                )
+                .expect("insertion de la provenance du DR");
+        }
     }
     tune_server::routes::router(state)
 }
@@ -138,6 +163,16 @@ fn dr_de(t: &Value) -> Option<String> {
     t.get("dynamic_range").map(|v| {
         v.as_str()
             .unwrap_or_else(|| panic!("`dynamic_range` doit être une chaîne, vu {v}"))
+            .to_string()
+    })
+}
+
+/// La PROVENANCE annoncée pour une piste : `Some(étiquette)`, ou `None` quand
+/// la clé est ABSENTE — ce qui veut dire « inconnue », jamais « du tag ».
+fn source_de(t: &Value) -> Option<String> {
+    t.get("dynamic_range_source").map(|v| {
+        v.as_str()
+            .unwrap_or_else(|| panic!("`dynamic_range_source` doit être une chaîne, vu {v}"))
             .to_string()
     })
 }
@@ -507,5 +542,150 @@ async fn les_pistes_d_un_album_rendent_toujours_leur_dr_2809() {
         dr_de(&pistes[0]),
         None,
         "album DR9, piste non taguée : rien ne se recopie"
+    );
+}
+
+/// #3924 — LA TABLE DES TITRES DIT D'OÙ SORT LE DR QU'ELLE AFFICHE.
+///
+/// Patatorz, fil 1683, 11/09/2026 : « il serait bon de clarifier comment les
+/// dynamic range albums et titres sont mesurés, calculés ou juste reportés.
+/// Je sais comment je mesure les miens […] il serait donc bon de comprendre
+/// d'où ça sort. » Il n'y avait aucune réponse à lui donner : `dr_source`
+/// existait en base depuis la v0.9.145 — écrit par la passe d'analyse — et
+/// AUCUNE route ne le servait.
+///
+/// L'épreuve porte sur la VALEUR rendue, jamais sur un code HTTP : la route
+/// répondait déjà 200 avant, en taisant le champ.
+#[tokio::test]
+async fn la_table_des_titres_dit_d_ou_sort_le_dr_3924() {
+    let app = bibliotheque();
+    let (status, body) = get(&app, "/api/v1/library/tracks?limit=50").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(total(&body), 6, "la table des titres reste entière");
+    assert_eq!(
+        source_de(&piste(&body, "Bravo")).as_deref(),
+        Some("analysis"),
+        "DR14 CALCULÉ par la passe d'analyse : la route doit le dire, sinon \
+         l'écran l'annonce comme une mesure du disque"
+    );
+    assert_eq!(
+        source_de(&piste(&body, "Foxtrot")).as_deref(),
+        Some("tag"),
+        "DR0 LU dans le tag du fichier — et DR0 est une mesure, pas une absence"
+    );
+    // La valeur, elle, n'a pas bougé : la provenance s'ajoute, elle ne
+    // remplace rien.
+    assert_eq!(dr_de(&piste(&body, "Bravo")).as_deref(), Some("14"));
+    assert_eq!(dr_de(&piste(&body, "Foxtrot")).as_deref(), Some("0"));
+}
+
+/// TÉMOIN VERT de #3924 : une provenance INCONNUE se tait, elle ne s'invente
+/// pas.
+///
+/// Deux absences distinctes, et aucune des deux ne doit produire de clé :
+///
+/// * **Alpha** porte un `dr_track` sans `dr_source` — l'état de toute base
+///   antérieure à la v0.9.145, où lire le tag était le seul producteur. Lui
+///   attribuer « tag » serait plausible et FAUX : un rattrapage de DR a pu
+///   depuis recalculer la ligne.
+/// * **Charlie** et **Delta** n'ont aucun DR de piste. Une provenance sans
+///   valeur décrirait le vide.
+#[tokio::test]
+async fn une_provenance_inconnue_ne_s_invente_pas_3924() {
+    let app = bibliotheque();
+    let (status, body) = get(&app, "/api/v1/library/tracks?limit=50").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        dr_de(&piste(&body, "Alpha")).as_deref(),
+        Some("7"),
+        "témoin : la valeur sort toujours"
+    );
+    assert_eq!(
+        source_de(&piste(&body, "Alpha")),
+        None,
+        "`dr_track` sans `dr_source` : la provenance est INCONNUE et la clé \
+         reste absente — jamais « tag » par défaut"
+    );
+    assert_eq!(source_de(&piste(&body, "Charlie")), None);
+    assert_eq!(source_de(&piste(&body, "Delta")), None);
+    assert_eq!(
+        dr_de(&piste(&body, "Echo")),
+        None,
+        "témoin : Echo n'a pas de DR de piste"
+    );
+    assert_eq!(
+        source_de(&piste(&body, "Echo")),
+        None,
+        "`dr_source` ORPHELIN, sans `dr_track` : la route ne doit pas dire \
+         d'où vient une valeur qu'elle ne sert pas — c'est l'appariement que \
+         `provenance_du_dr` fait, et sans lui l'écran annonce « calculé par \
+         Tune » à côté d'un champ vide"
+    );
+    assert!(
+        piste(&body, "Delta").get("dynamic_range_source").is_none(),
+        "la clé ne doit pas apparaître à `null`"
+    );
+}
+
+/// #3924 sur les DEUX autres surfaces : la fiche d'une piste, et les pistes
+/// d'un album.
+///
+/// Elles sérialisent par deux chemins différents — `joindre_dr_par_piste`
+/// (`routes/library/tracks.rs`) et `album_tracks` (`routes/library/albums.rs`)
+/// — et c'est exactement le partage qui a failli manquer à #1388 : une colonne
+/// qui dit la provenance sur un écran et se tait sur l'autre est pire qu'une
+/// colonne absente.
+#[tokio::test]
+async fn la_fiche_et_les_pistes_d_un_album_disent_aussi_la_provenance_3924() {
+    let app = bibliotheque();
+
+    let (status, bravo) = get(&app, "/api/v1/library/tracks/2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(source_de(&bravo).as_deref(), Some("analysis"));
+    assert_eq!(bravo["title"], "Bravo — piste", "la fiche reste la fiche");
+
+    let (_, alpha) = get(&app, "/api/v1/library/tracks/1").await;
+    assert_eq!(
+        source_de(&alpha),
+        None,
+        "témoin vert : provenance inconnue, aucune clé"
+    );
+
+    let (status, pistes) = get(&app, "/api/v1/library/albums/6/tracks").await;
+    assert_eq!(status, StatusCode::OK);
+    let pistes = pistes.as_array().expect("un tableau de pistes");
+    assert_eq!(pistes.len(), 1);
+    assert_eq!(
+        source_de(&pistes[0]).as_deref(),
+        Some("tag"),
+        "les pistes d'un album passent par `album_tracks`, un SECOND chemin de \
+         sérialisation : il doit porter le même champ sous le même nom"
+    );
+    assert_eq!(dr_de(&pistes[0]).as_deref(), Some("0"));
+
+    let (_, charlie) = get(&app, "/api/v1/library/albums/3/tracks").await;
+    let charlie = charlie.as_array().expect("un tableau de pistes");
+    assert_eq!(
+        source_de(&charlie[0]),
+        None,
+        "album DR9, piste non taguée : ni valeur ni provenance"
+    );
+}
+
+/// #3924 — le chemin FILTRÉ de la table des titres sert le même champ.
+///
+/// `list_tracks` a deux branches qui sérialisent chacune de leur côté ; c'est
+/// le piège que #1388 a déjà rencontré ici même. Une provenance qui disparaît
+/// dès qu'une pastille du rail est cochée serait une régression invisible.
+#[tokio::test]
+async fn le_chemin_filtre_sert_aussi_la_provenance_3924() {
+    let app = bibliotheque();
+    let (status, body) = get(&app, "/api/v1/library/tracks?limit=50&dr=14").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(total(&body), 1, "la tranche DR14 ne retient que Bravo");
+    assert_eq!(
+        source_de(&piste(&body, "Bravo")).as_deref(),
+        Some("analysis"),
+        "le chemin filtré doit porter la provenance comme le chemin nu"
     );
 }

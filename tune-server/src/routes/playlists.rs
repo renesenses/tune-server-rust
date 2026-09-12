@@ -95,7 +95,12 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/tracks/remove", post(remove_track))
         .route("/{id}/duplicate", post(duplicate_playlist))
         .route("/{id}/export", get(export_m3u))
-        .route("/{id}/share", post(share_playlist))
+        .route(
+            "/{id}/share",
+            post(share_playlist)
+                .get(get_playlist_share)
+                .delete(unshare_playlist),
+        )
         .route("/{id}/recover", post(recover_playlist))
         .route("/{id}/recover/apply", post(apply_recovery))
         .route(
@@ -1253,6 +1258,71 @@ async fn share_playlist(
         "url": format!("/api/v1/playlists/shared/{token}"),
     }))
     .into_response()
+}
+
+/// `GET /playlists/{id}/share` — l'état du partage, pour le propriétaire seul.
+///
+/// Rien ne relisait le jeton écrit par [`share_playlist`] : l'écran du
+/// gestionnaire de playlists ne pouvait pas savoir qu'une playlist était déjà
+/// partagée, et n'avait donc aucun état à partir duquel offrir le retrait.
+///
+/// Contrat de statut : celui de toutes les routes privées par id — `404` si la
+/// playlist n'existe pas **ou** n'appartient pas au profil appelant, jamais
+/// `403` (#2794). Distinguer les deux cas rendrait l'énumération d'ids
+/// exploitable : « pas à vous » dit que l'id existe.
+///
+/// Le jeton n'est rendu qu'à ce propriétaire-là. Il n'est écrit dans aucun
+/// journal : c'est l'autorisation elle-même.
+async fn get_playlist_share(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
+    if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
+        return r;
+    }
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    match settings.get(&format!("playlist_share_{id}")) {
+        Ok(Some(token)) => Json(json!({
+            "shared": true,
+            "token": token,
+            "url": format!("/api/v1/playlists/shared/{token}"),
+        }))
+        .into_response(),
+        Ok(None) => Json(json!({ "shared": false })).into_response(),
+        Err(e) => AppError::internal(e).into_response(),
+    }
+}
+
+/// `DELETE /playlists/{id}/share` — reprendre le lien public.
+///
+/// [`share_playlist`] écrivait `playlist_share_{id}` et **aucune route ne
+/// l'effaçait** : une playlist partagée une seule fois l'était pour toujours.
+/// Le lien donné à quelqu'un restait lisible sans limite, sans moyen de le
+/// reprendre — ni depuis l'interface, ni par l'API.
+///
+/// Effacer la clé suffit à révoquer : [`get_shared_playlist`] résout un jeton
+/// en parcourant les réglages, il ne trouve donc plus rien et rend `404`.
+///
+/// Idempotent — retirer un partage absent rend le même `204`. Le `404` reste
+/// réservé au contrat #2794 (playlist absente ou d'un autre profil) ; s'en
+/// servir aussi pour « pas partagée » obligerait l'écran à distinguer deux
+/// réponses qui veulent dire la même chose : il n'y a plus de lien.
+async fn unshare_playlist(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
+    if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
+        return r;
+    }
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    match settings.delete(&format!("playlist_share_{id}")) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => AppError::internal(e).into_response(),
+    }
 }
 
 async fn get_shared_playlist(

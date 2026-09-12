@@ -1,5 +1,18 @@
 use super::*;
 
+/// Le format source de ces témoins, monté comme `play_url` le monte.
+///
+/// R5 (#2219) : `process_pcm_chunk` ne prend plus `(frame_bytes, bit_depth,
+/// channels)` nus mais un [`AudioSpec`], qui déduit lui-même les octets par
+/// trame. Les six appels d'ici passaient ce quatrième nombre à la main — et le
+/// compilateur les a tous réclamés d'un coup, ce qu'aucun témoin n'aurait su
+/// faire. La cadence n'entre dans aucun de ces calculs ; 44,1 kHz est le format
+/// de leurs fixtures.
+fn spec_de_test(bits_declares: u16, canaux: u16) -> AudioSpec {
+    AudioSpec::depuis_entete(44_100, bits_declares, canaux)
+        .expect("format de fixture dans le jeu fermé")
+}
+
 // -----------------------------------------------------------------------
 // Fin de piste sur le chemin cpal partagé (#1919, Alain — #2047)
 //
@@ -2894,7 +2907,11 @@ fn local_pcm_processing_is_identical_across_the_header_boundary() {
     let mut baseline_staged = bytes.clone();
     let mut baseline_kind = LocalPcmKind::for_bit_depth(16);
     let baseline = baseline_processor
-        .process_pcm_chunk(&mut baseline_staged, 4, 16, 2, &mut baseline_kind)
+        .process_pcm_chunk(
+            &mut baseline_staged,
+            spec_de_test(16, 2),
+            &mut baseline_kind,
+        )
         .expect("chunk de référence");
     assert!(baseline_staged.is_empty());
 
@@ -2922,11 +2939,11 @@ fn local_pcm_processing_is_identical_across_the_header_boundary() {
     let mut split_staged = bytes[..header_bytes].to_vec();
     let mut split_kind = LocalPcmKind::for_bit_depth(16);
     let first = split_processor
-        .process_pcm_chunk(&mut split_staged, 4, 16, 2, &mut split_kind)
+        .process_pcm_chunk(&mut split_staged, spec_de_test(16, 2), &mut split_kind)
         .expect("bloc PCM de l'en-tête");
     split_staged.extend_from_slice(&bytes[header_bytes..]);
     let second = split_processor
-        .process_pcm_chunk(&mut split_staged, 4, 16, 2, &mut split_kind)
+        .process_pcm_chunk(&mut split_staged, spec_de_test(16, 2), &mut split_kind)
         .expect("bloc PCM suivant");
 
     let mut split_output = first.samples;
@@ -2966,7 +2983,7 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
     let mut staged = fixture[..first_31_frames].to_vec();
     let mut kind = LocalPcmKind::for_bit_depth(24);
 
-    let pending = processor.process_pcm_chunk(&mut staged, 6, 24, 2, &mut kind);
+    let pending = processor.process_pcm_chunk(&mut staged, spec_de_test(24, 2), &mut kind);
     assert!(pending.is_none());
     assert_eq!(staged.len(), first_31_frames);
     assert_eq!(ring.available(), 0);
@@ -2974,7 +2991,7 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
 
     staged.extend_from_slice(&fixture[first_31_frames..]);
     let prepared = processor
-        .process_pcm_chunk(&mut staged, 6, 24, 2, &mut kind)
+        .process_pcm_chunk(&mut staged, spec_de_test(24, 2), &mut kind)
         .expect("sonde DoP devenue concluante");
     assert!(prepared.dop);
     assert_eq!(kind, LocalPcmKind::Dop);
@@ -2990,7 +3007,7 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
     let continuation = real_dop_bytes(4, 2);
     staged.extend_from_slice(&continuation);
     let continued = processor
-        .process_pcm_chunk(&mut staged, 6, 24, 2, &mut kind)
+        .process_pcm_chunk(&mut staged, spec_de_test(24, 2), &mut kind)
         .expect("classification DoP verrouillée pour la piste");
     assert!(continued.dop);
     assert_eq!(continued.samples, pcm_bytes_to_f32(&continuation, 24));
@@ -3134,7 +3151,7 @@ fn header_read_retries_only_transient_kinds() {
 #[test]
 fn device_not_available_flags_device_gone() {
     let gone = Arc::new(AtomicBool::new(false));
-    let mut cb = make_stream_error_cb(gone.clone());
+    let mut cb = make_stream_error_cb(gone.clone(), Arc::new(RingStarvation::new()));
     cb(cpal::StreamError::DeviceNotAvailable);
     assert!(gone.load(Ordering::SeqCst));
     // Repeated invocations (WASAPI fires once, but belt-and-suspenders)
@@ -3143,12 +3160,68 @@ fn device_not_available_flags_device_gone() {
     assert!(gone.load(Ordering::SeqCst));
 }
 
+/// #3205 — un `BufferUnderrun` doit être COMPTÉ, et ne doit pas démonter le
+/// flux.
+///
+/// C'est le signal que cpal remonte quand ALSA a sous-alimenté le DAC : le
+/// processus n'a pas été ordonnancé à temps. Le `warn!` qui le journalise est
+/// plafonné à une ligne par seconde ; sans ce compteur, une heure à 5 000
+/// sous-alimentations et une heure à 3 600 rendent le même journal, et le
+/// chiffre dont #3205 fait dépendre le sort du noyau `PREEMPT_RT` de Tune OS
+/// n'existe pas.
+#[test]
+fn buffer_underrun_est_compte_sans_demonter_le_flux() {
+    let gone = Arc::new(AtomicBool::new(false));
+    let famine = Arc::new(RingStarvation::new());
+    let mut cb = make_stream_error_cb(gone.clone(), famine.clone());
+
+    cb(cpal::StreamError::BufferUnderrun);
+    cb(cpal::StreamError::BufferUnderrun);
+
+    assert_eq!(
+        famine.snapshot().driver_underruns,
+        2,
+        "les sous-alimentations du pilote ne sont pas comptées"
+    );
+    assert!(
+        !gone.load(Ordering::SeqCst),
+        "un underrun ALSA est routinier : il ne doit pas démonter le flux"
+    );
+    assert_eq!(
+        famine.snapshot().events,
+        0,
+        "l'underrun du PILOTE a été porté au compte de la famine de l'ANNEAU"
+    );
+}
+
+/// #3205 — seul `BufferUnderrun` compte. Un débranchement d'USB ou une erreur
+/// de backend ne doit pas gonfler le chiffre qui décide du noyau RT.
+#[test]
+fn les_autres_erreurs_ne_comptent_aucune_sous_alimentation() {
+    let gone = Arc::new(AtomicBool::new(false));
+    let famine = Arc::new(RingStarvation::new());
+    let mut cb = make_stream_error_cb(gone.clone(), famine.clone());
+
+    cb(cpal::StreamError::DeviceNotAvailable);
+    cb(cpal::StreamError::BackendSpecific {
+        err: cpal::BackendSpecificError {
+            description: "autre chose".into(),
+        },
+    });
+
+    assert_eq!(
+        famine.snapshot().driver_underruns,
+        0,
+        "une erreur qui n'est pas une sous-alimentation a été comptée comme telle"
+    );
+}
+
 /// Other stream errors (ALSA underruns are routine) must NOT tear down
 /// playback.
 #[test]
 fn generic_stream_error_does_not_flag_device_gone() {
     let gone = Arc::new(AtomicBool::new(false));
-    let mut cb = make_stream_error_cb(gone.clone());
+    let mut cb = make_stream_error_cb(gone.clone(), Arc::new(RingStarvation::new()));
     cb(cpal::StreamError::BackendSpecific {
         err: cpal::BackendSpecificError {
             description: "underrun".into(),

@@ -41,6 +41,8 @@ mod collections_ids_orphelins;
 mod collections_ordre_albums;
 #[path = "compilation_dans_les_reponses_album.rs"]
 mod compilation_dans_les_reponses_album;
+#[path = "comptes_sous_dossiers_3857.rs"]
+mod comptes_sous_dossiers_3857;
 #[path = "config_secrets_et_roles.rs"]
 mod config_secrets_et_roles;
 #[path = "consommateur_hors_arbre.rs"]
@@ -51,6 +53,8 @@ mod contexte_de_session;
 mod credits_enrichissement_statut;
 #[path = "crossfeed_dit_son_indisponibilite.rs"]
 mod crossfeed_dit_son_indisponibilite;
+#[path = "dsp_egaliseur_dans_le_rapport_3479.rs"]
+mod dsp_egaliseur_dans_le_rapport_3479;
 #[path = "echec_de_decodage_dit_pourquoi_i3270.rs"]
 mod echec_de_decodage_dit_pourquoi_i3270;
 #[path = "enrich_artiste_langue_entete.rs"]
@@ -72,6 +76,8 @@ mod extraction_cd_ne_promet_pas_ce_qu_elle_ne_fait_pas;
 mod facettes_multivaleurs;
 #[path = "famine_mesuree_3205.rs"]
 mod famine_mesuree_3205;
+#[path = "famine_pilote_3205.rs"]
+mod famine_pilote_3205;
 #[path = "favoris_cloisonnement_par_profil.rs"]
 mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
@@ -82,10 +88,25 @@ mod features_livrees_3355;
 mod file_promet_l_enchainement;
 #[path = "fonds_communautaire_par_mbid.rs"]
 mod fonds_communautaire_par_mbid;
+#[path = "garde_de_site_porteur_dop_3233.rs"]
+mod garde_de_site_porteur_dop_3233;
 #[path = "generateur_playlists_sans_ia.rs"]
 mod generateur_playlists_sans_ia;
 #[path = "http_client_seam.rs"]
 mod http_client_seam;
+// #3914 : la route d'import Roon refusait en 415 le multipart que le client
+// envoie, AVANT d'entrer dans le gestionnaire. Les essais unitaires
+// d'`import.rs` appellent le gestionnaire directement : ils ne traversent
+// jamais cette frontière-là.
+#[path = "import_roon_multipart_3914.rs"]
+mod import_roon_multipart_3914;
+// #3914 (R4, R5) : `?preview=` n'etait lu par personne — cliquer sur
+// « apercu » lancait un import REEL — et le suivi de tache ne rendait aucun
+// des champs d'`ImportReport` que l'ecran lit. Meme raison qu'au-dessus de
+// passer par la ROUTE : le temoin decisif est `SELECT COUNT(*) FROM tracks`,
+// pris de part et d'autre de l'appel.
+#[path = "import_apercu_et_rapport_3914.rs"]
+mod import_apercu_et_rapport_3914;
 #[path = "integration.rs"]
 mod integration;
 #[path = "journal_pcm_alsa_ouvert.rs"]
@@ -115,6 +136,10 @@ mod output_provider_seam;
 mod paroles_ecriture_fichiers;
 #[path = "paroles_source_lrclib.rs"]
 mod paroles_source_lrclib;
+// #2373 (T4) : un partage de playlist se REPREND. Le parcours entier passe
+// par le routeur — partager, lire, revoquer, puis 404 sur le MEME jeton.
+#[path = "partage_playlist_revoque_2373.rs"]
+mod partage_playlist_revoque_2373;
 #[path = "piste_artiste_par_id.rs"]
 mod piste_artiste_par_id;
 #[path = "plafond_zones_gratuit.rs"]
@@ -156,6 +181,8 @@ mod refus_de_peripherique_partage_dit_pourquoi;
 mod refus_exclusif_dit_sa_cause_i3108;
 #[path = "reidentification_album.rs"]
 mod reidentification_album;
+#[path = "reinitialisation_documentee_3854.rs"]
+mod reinitialisation_documentee_3854;
 #[path = "reprise_position_au_demarrage.rs"]
 mod reprise_position_au_demarrage;
 #[path = "rustsec_allowlists.rs"]
@@ -172,6 +199,8 @@ mod support_journaux_joints;
 mod support_relais_diagnostic_sortant;
 #[path = "support_relais_marquer_lu.rs"]
 mod support_relais_marquer_lu;
+#[path = "teneur_du_pcm_branche_3575.rs"]
+mod teneur_du_pcm_branche_3575;
 #[path = "tests_orphelins.rs"]
 mod tests_orphelins;
 #[path = "tranches_dynamic_range.rs"]
