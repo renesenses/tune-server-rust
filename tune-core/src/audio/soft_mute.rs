@@ -252,13 +252,64 @@ impl SoftMuteRamp {
             for s in &mut buf[i..end] {
                 *s *= g;
             }
-            self.gain = if self.target > self.gain {
-                (self.gain + self.step_per_frame).min(self.target)
-            } else {
-                (self.gain - self.step_per_frame).max(self.target)
-            };
+            self.gain = advance_gain(self.gain, self.target, self.step_per_frame);
             i = end;
         }
+    }
+
+    /// La même rampe, mais **sans tampon `f32` à multiplier sur place** :
+    /// l'échantillon est tiré, pondéré, converti et écrit en un seul passage
+    /// dans le tampon du backend (#2218).
+    ///
+    /// `pull` est le tirage du ring — il reçoit la fonction d'échantillon et
+    /// rend le nombre d'échantillons réellement écrits. `convert` est la
+    /// conversion vers le format natif du périphérique : elle reçoit
+    /// l'échantillon **déjà pondéré**, donc la multiplication reste dans le
+    /// domaine flottant, jamais dans le mot entier du DAC.
+    ///
+    /// La rampe avance exactement comme dans [`apply`](Self::apply) : à chaque
+    /// frontière de trame, et une dernière fois si la période se termine sur
+    /// une trame partielle. Aucune allocation : le compteur de trame et le gain
+    /// vivent dans la pile du rappel.
+    pub fn apply_mapped<T>(
+        &mut self,
+        base_gain: f32,
+        mut convert: impl FnMut(f32) -> T,
+        pull: impl FnOnce(&mut dyn FnMut(f32) -> T) -> usize,
+    ) -> usize {
+        let ch = self.channels;
+        let (target, step) = (self.target, self.step_per_frame);
+        let mut gain = self.gain;
+        let mut index = 0usize;
+        let read = {
+            let mut map = |sample: f32| -> T {
+                let g = base_gain * gain;
+                index += 1;
+                if index % ch == 0 {
+                    gain = advance_gain(gain, target, step);
+                }
+                convert(sample * g)
+            };
+            pull(&mut map)
+        };
+        // Trame partielle finale : `apply` avance aussi après elle.
+        if read % ch != 0 {
+            gain = advance_gain(gain, target, step);
+        }
+        self.gain = gain;
+        read
+    }
+}
+
+/// Un pas de rampe vers la cible, borné par elle. Seul endroit où le gain
+/// bouge : [`SoftMuteRamp::apply`] et [`SoftMuteRamp::apply_mapped`] doivent le
+/// MÊME facteur aux mêmes échantillons, sans quoi le chemin entier et le chemin
+/// flottant ne rampent plus pareil.
+fn advance_gain(gain: f32, target: f32, step: f32) -> f32 {
+    if target > gain {
+        (gain + step).min(target)
+    } else {
+        (gain - step).max(target)
     }
 }
 
@@ -530,6 +581,69 @@ mod tests {
             max_step_per_channel(&joined, 2) <= 1.0 / 800.0,
             "marche à la jointure de deux tampons"
         );
+    }
+
+    /// #2218 — `apply_mapped` est le chemin du rappel entier local, qui écrit
+    /// directement dans le tampon du backend. Il doit rendre EXACTEMENT les
+    /// mêmes échantillons que `apply` suivi d'une conversion, et laisser la
+    /// rampe dans EXACTEMENT le même état : sans cela, le repli entier ne
+    /// ramperait plus comme le chemin flottant.
+    ///
+    /// Les tailles couvrent la trame partielle finale (5, 7 échantillons sur
+    /// 2 canaux) et la période plus grande que le ring (le tirage rend alors
+    /// moins que la longueur demandée).
+    #[test]
+    fn apply_mapped_rend_les_memes_echantillons_et_le_meme_etat_que_apply() {
+        for periodes in [
+            vec![8usize, 8, 8],
+            vec![5, 7, 3, 64],
+            vec![1, 1, 1, 1, 1],
+            vec![256, 128],
+        ] {
+            let mut reference = SoftMuteRamp::new(44_100, 2);
+            let mut mesure = SoftMuteRamp::new(44_100, 2);
+            reference.arm(armed_ms(SOFT_MUTE_DEFAULT_MS, false, false, false));
+            mesure.arm(armed_ms(SOFT_MUTE_DEFAULT_MS, false, false, false));
+            assert_eq!(reference.begin(true), mesure.begin(true));
+
+            for (rang, n) in periodes.iter().copied().enumerate() {
+                // Le ring rend moins que demandé une période sur trois : c'est
+                // la famine, et c'est là que vit la trame partielle.
+                let dispo = if rang % 3 == 2 {
+                    n.saturating_sub(1)
+                } else {
+                    n
+                };
+                let source: Vec<f32> = (0..dispo).map(|i| 1.0 - (i as f32) / 512.0).collect();
+                let base_gain = 0.75;
+
+                let mut attendu = source.clone();
+                reference.apply(&mut attendu, base_gain);
+                let attendu: Vec<i32> = attendu.iter().map(|s| (*s * 1000.0) as i32).collect();
+
+                let mut obtenu = vec![0i32; n];
+                let lus = mesure.apply_mapped(
+                    base_gain,
+                    |s| (s * 1000.0) as i32,
+                    |map| {
+                        let mut pris = 0usize;
+                        for (case, brut) in obtenu.iter_mut().zip(source.iter()) {
+                            *case = map(*brut);
+                            pris += 1;
+                        }
+                        pris
+                    },
+                );
+
+                assert_eq!(lus, dispo, "période {rang} de {n}");
+                assert_eq!(obtenu[..lus], attendu[..], "période {rang} de {n}");
+                assert_eq!(
+                    mesure.gain().to_bits(),
+                    reference.gain().to_bits(),
+                    "la rampe n'a pas avancé pareil après la période {rang} de {n}"
+                );
+            }
+        }
     }
 
     #[test]
