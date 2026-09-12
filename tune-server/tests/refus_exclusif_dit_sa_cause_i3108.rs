@@ -25,22 +25,59 @@
 //!      reste « en lecture ») ;
 //!   4. tout passe par le canal DÉJÀ ouvert (`open_failure` →
 //!      `take_output_failure()`), jamais par un second.
+//!
+//! R6 bis (#2219) : les trois bras exclusifs de `play_url` vivent chacun dans
+//! leur module sous `tune-core/src/outputs/local/` (`bras_coreaudio.rs`,
+//! `bras_asio.rs`, `bras_wasapi.rs`). La garde lit donc `local.rs` ET les
+//! trois modules — concaténés, jamais remplacés : une assertion d'ABSENCE
+//! (maillon 4) qui ne lirait plus que l'un d'eux perdrait du périmètre en
+//! silence. Et elle vérifie que `play_url` APPELLE le bras CoreAudio : un
+//! module écrit mais pas branché rendrait tout le reste complaisant.
 
 const LOCAL: &str = include_str!("../../tune-core/src/outputs/local.rs");
+const BRAS_COREAUDIO: &str = include_str!("../../tune-core/src/outputs/local/bras_coreaudio.rs");
+const BRAS_ASIO: &str = include_str!("../../tune-core/src/outputs/local/bras_asio.rs");
+const BRAS_WASAPI: &str = include_str!("../../tune-core/src/outputs/local/bras_wasapi.rs");
+
+/// Tout ce qui compose la sortie locale : `local.rs` suivi des trois bras
+/// exclusifs. C'est sur CE texte que portent les assertions qui parlent de
+/// « la sortie locale » en général — présence sur les trois transports,
+/// absence d'un second canal.
+fn toute_la_sortie_locale() -> String {
+    [LOCAL, BRAS_COREAUDIO, BRAS_ASIO, BRAS_WASAPI].concat()
+}
 
 /// Le corps du chemin CoreAudio exclusif, délimité par ses deux journaux
-/// d'entrée et de sortie. Borner la recherche évite qu'un appel d'un AUTRE
-/// chemin (ASIO, WASAPI, cpal partagé) fasse passer une garde qui prétend
-/// parler de celui-ci.
+/// d'entrée et de sortie, dans SON module. Borner la recherche évite qu'un
+/// appel d'un AUTRE chemin (ASIO, WASAPI, cpal partagé) fasse passer une garde
+/// qui prétend parler de celui-ci.
 fn bloc_coreaudio_exclusif() -> &'static str {
-    let debut = LOCAL
+    let debut = BRAS_COREAUDIO
         .find("\"local_audio_exclusive_mode_active\"")
-        .expect("le journal d'entrée du chemin CoreAudio exclusif a disparu de local.rs");
-    let fin = LOCAL[debut..]
+        .expect("le journal d'entrée du chemin CoreAudio exclusif a disparu de bras_coreaudio.rs");
+    let fin = BRAS_COREAUDIO[debut..]
         .find("\"local_audio_exclusive_stopped\"")
-        .expect("le journal de sortie du chemin CoreAudio exclusif a disparu de local.rs")
+        .expect("le journal de sortie du chemin CoreAudio exclusif a disparu de bras_coreaudio.rs")
         + debut;
-    &LOCAL[debut..fin]
+    &BRAS_COREAUDIO[debut..fin]
+}
+
+/// Le module du bras CoreAudio n'est une garde de rien s'il n'est pas appelé :
+/// `play_url` doit l'invoquer sous sa bannière, là où le bloc vivait.
+#[test]
+fn play_url_appelle_le_bras_coreaudio_exclusif() {
+    let debut = LOCAL
+        .find("// ------- Exclusive mode path (macOS only) -------")
+        .expect("la bannière du bras CoreAudio exclusif a disparu de play_url");
+    let fin = LOCAL[debut..]
+        .find("// ------- Exclusive mode path (Windows ASIO) -------")
+        .expect("la bannière du bras ASIO a disparu de play_url")
+        + debut;
+    assert!(
+        LOCAL[debut..fin].contains("bras_coreaudio::jouer_via_coreaudio("),
+        "play_url n'appelle plus `bras_coreaudio::jouer_via_coreaudio` : les maillons 2 et 3 \
+         de cette garde parlent d'un module que personne n'exécute (R6 bis, #2219)"
+    );
 }
 
 /// Un appel à `nom` dont les 240 octets suivants contiennent le littéral
@@ -65,9 +102,10 @@ fn appelle_avec(texte: &str, nom: &str, argument: &str) -> bool {
 /// et WASAPI ont le même refus et doivent le dire pareil.
 #[test]
 fn les_trois_transports_exclusifs_arment_le_canal_sur_un_refus_d_ouverture() {
+    let sortie_locale = toute_la_sortie_locale();
     for transport in ["CoreAudio", "ASIO", "WASAPI"] {
         assert!(
-            appelle_avec(LOCAL, "record_exclusive_open_failure(", transport),
+            appelle_avec(&sortie_locale, "record_exclusive_open_failure(", transport),
             "aucun site n'appelle `record_exclusive_open_failure` pour {transport} : un refus \
              d'ouverture exclusive sur ce transport redevient muet, la zone reste figée sans \
              message (#3108)"
@@ -204,8 +242,10 @@ fn la_remontee_passe_par_le_canal_deja_ouvert_et_pas_par_un_second() {
     // pour dire OÙ va le canal — une mention documentaire, pas une émission.
     // La première rédaction de cette garde cherchait le nom nu et partait
     // rouge sur du texte de commentaire.
+    // R6 bis (#2219) : l'absence se vérifie sur `local.rs` ET les trois bras —
+    // ne lire que l'un d'eux laisserait un `.emit(` s'installer dans un autre.
     assert!(
-        !LOCAL.contains(".emit("),
+        !toute_la_sortie_locale().contains(".emit("),
         "la sortie locale émet elle-même sur le bus d'événements : c'est un SECOND canal, en \
          doublon de `take_output_failure()` que le poller draine déjà à chaque tour (#3108)"
     );

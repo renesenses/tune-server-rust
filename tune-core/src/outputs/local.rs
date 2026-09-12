@@ -301,6 +301,16 @@ pub use etat_backend::*;
 mod parc;
 pub use parc::*;
 
+// R6 bis (#2219) : les trois bras exclusifs de `play_url`, un module chacun,
+// sous le MÊME `cfg` que le bloc qu'ils remplacent. Le bras cpal partagé reste
+// dans `play_url` (fil de R1/R7).
+#[cfg(all(target_os = "windows", feature = "asio"))]
+mod bras_asio;
+#[cfg(target_os = "macos")]
+mod bras_coreaudio;
+#[cfg(target_os = "windows")]
+mod bras_wasapi;
+
 // ---------------------------------------------------------------------------
 // Gapless: pending next track for seamless chaining
 // ---------------------------------------------------------------------------
@@ -4624,1161 +4634,126 @@ impl OutputTarget for LocalOutput {
             // ------- Exclusive mode path (macOS only) -------
             #[cfg(target_os = "macos")]
             if exclusive_mode {
-                use super::coreaudio_exclusive::ExclusiveOutput;
-
-                info!(
-                    device = %device_name,
+                // R6 bis (#2219) : le bras vit dans `local/bras_coreaudio.rs`.
+                // Tout ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
+                bras_coreaudio::jouer_via_coreaudio(bras_coreaudio::EntreesCoreAudio {
+                    device_name,
+                    url,
                     sample_rate,
                     bit_depth,
                     channels,
-                    "local_audio_exclusive_mode_active"
-                );
-
-                // Ring buffer: ~2 seconds of audio at source sample rate
-                let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                starvation.begin_stream(sample_rate, channels);
-                let ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
-                ring.clear(); // Defensive: zero-fill before callback reads
-
-                let exclusive = match ExclusiveOutput::new(
-                    &device_name,
-                    sample_rate,
-                    bit_depth as u32,
-                    channels as u32,
-                    ring.clone(),
-                    volume.clone(),
-                    paused.clone(),
-                ) {
-                    Ok(ex) => ex,
-                    Err(e) => {
-                        record_exclusive_open_failure(
-                            "CoreAudio",
-                            &device_name,
-                            &e.to_string(),
-                            &open_failure,
-                        );
-                        playing.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                };
-
-                info!(device = %device_name, url = %url, "local_audio_exclusive_playing");
-                // CoreAudio exclusif : `resolve_output_device` retombe sur le
-                // périphérique système quand le nom stocké n'existe plus (DAC
-                // débranché, renommé, routage macOS changé). `opened_id` reste
-                // `None` : l'`AudioDeviceID` est un entier réattribué au
-                // redémarrage, ce n'est pas une identité qu'on peut afficher.
-                note_opened_device(
-                    "CoreAudio",
-                    &device_name,
-                    &exclusive.format_info().device_name,
-                    None,
-                );
-
-                // Feed audio data (no resampling needed -- hardware is set to source rate)
-                let pcm_data = if data_offset < header_buf.len() {
-                    header_buf[data_offset..].to_vec()
-                } else {
-                    Vec::new()
-                };
-
-                let mut total_frames_fed: u64 = 0;
-
-                // Read and feed the rest of the stream
-                let mut read_buf = vec![0u8; 65536];
-                let mut leftover = pcm_data;
-                let mut pcm_kind = LocalPcmKind::for_bit_depth(bit_depth);
-                let pcm_processor = LocalPcmProcessor {
-                    eq: &eq,
-                    convolver: &convolver,
-                    crossfeed: &crossfeed,
-                    pure_bypass: &pure_bypass,
-                    mono_downmix: &mono_downmix,
-                    dop_active: &dop_active,
-                    volume: &volume,
-                    user_volume: &user_volume_ref,
-                    rg_factor: &rg_factor_ref,
-                };
-
-                // Process leftover from header read
-                // #3108 — le verdict de blocage était JETÉ aux trois sites de
-                // ce chemin, seul de tous les chemins de lecture. Conséquence
-                // exacte du constat : l'anneau exclusif tient deux secondes
-                // d'audio (`ring_cap` ci-dessus), il se remplit une fois, le
-                // rappel de rendu ne tire rien, et la position reste sur 2 000
-                // ms pour toujours — sans un mot.
-                let mut feed_stalled = false;
-                if let Some(processed) =
-                    pcm_processor.process_pcm_chunk(&mut leftover, spec, &mut pcm_kind)
-                {
-                    if !feed_ring_abortable(
-                        &ring,
-                        &processed.samples,
-                        &stop_rx,
-                        &paused,
-                        Some(&force_silent),
-                    ) {
-                        feed_stalled = true;
-                    }
-                    total_frames_fed += processed.source_frames;
-                }
-
-                let mut http_eof_excl = false;
-                while !feed_stalled {
-                    if stop_rx.try_recv().is_ok() {
-                        break;
-                    }
-                    if force_silent.load(Ordering::Relaxed) {
-                        debug!("local_audio_exclusive_aborted_by_stop");
-                        break;
-                    }
-
-                    let n = match reader.read(&mut read_buf) {
-                        Ok(0) => {
-                            http_eof_excl = true;
-                            break;
-                        }
-                        Ok(n) => n,
-                        Err(ref e)
-                            if e.kind() == std::io::ErrorKind::TimedOut
-                                || e.kind() == std::io::ErrorKind::WouldBlock =>
-                        {
-                            // Read timeout — check abort flag and retry
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "local_audio_exclusive_read_error");
-                            http_eof_excl = true;
-                            break;
-                        }
-                    };
-
-                    leftover.extend_from_slice(&read_buf[..n]);
-
-                    let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
-                    if aligned_len == 0 {
-                        continue;
-                    }
-
-                    let Some(processed) =
-                        pcm_processor.process_pcm_chunk(&mut leftover, spec, &mut pcm_kind)
-                    else {
-                        continue;
-                    };
-
-                    if !feed_ring_abortable(
-                        &ring,
-                        &processed.samples,
-                        &stop_rx,
-                        &paused,
-                        Some(&force_silent),
-                    ) {
-                        feed_stalled = true;
-                        break;
-                    }
-
-                    total_frames_fed += processed.source_frames;
-
-                    let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
-                        + seek_offset;
-                    position_ms.store(pos, Ordering::Relaxed);
-                }
-
-                if feed_stalled {
-                    // La piste n'a PAS fini : `http_eof_excl` reste faux, donc
-                    // aucune fin naturelle n'est signalée et la file n'avance
-                    // pas vers un morceau qui heurterait le même périphérique
-                    // mort. Le seul mot dit à l'utilisateur part d'ici.
-                    record_feed_stall_failure(
-                        "CoreAudio",
-                        &device_name,
-                        position_ms.load(Ordering::Relaxed),
-                        &open_failure,
-                    );
-                }
-
-                if http_eof_excl {
-                    report_incomplete_local_pcm_probe(pcm_kind, leftover.len());
-                }
-
-                // Fin de piste : rendre au périphérique ce que le convolveur
-                // retient encore. Sans ça, `latency_frames()` trames restaient
-                // dans le moteur et la fin de chaque piste était tronquée
-                // (#2209, revue JP Robbe — la fonction etait morte).
-                let queue = flush_local_dsp(
-                    &convolver,
-                    &crossfeed,
-                    &pure_bypass,
-                    &mono_downmix,
-                    channels,
-                    dop_active.load(Ordering::Relaxed),
-                );
-                if !queue.is_empty() && !feed_stalled {
-                    feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
-                    total_frames_fed += (queue.len() / channels.max(1) as usize) as u64;
-                }
-
-                // Signal natural track end BEFORE draining when the HTTP
-                // stream reached EOF, so the orchestrator can detect
-                // end-of-track even if force_silent is set during slow drain.
-                if http_eof_excl {
-                    track_ended_naturally.store(true, Ordering::SeqCst);
-                    track_ended_generation.store(my_generation, Ordering::SeqCst);
-                    TRACK_END_NOTIFY.notify_one();
-                }
-
-                // Wait for ring buffer to drain — JAMAIS sans fin (#3108).
-                // Les chemins ASIO, WASAPI et partagé bornaient déjà leur
-                // vidage ; celui-ci, seul, tournait tant que l'anneau n'était
-                // pas vide. Face à un rappel de rendu mort il ne se vide
-                // jamais : le fil restait vivant, la zone « en lecture », et le
-                // réexamen des branchements gelé avec elle.
-                let drain_deadline =
-                    drain_deadline_for(ring.available(), sample_rate as u64, channels as u64);
-                let drain_started = std::time::Instant::now();
-                loop {
-                    if stop_rx.try_recv().is_ok() {
-                        break;
-                    }
-                    if force_silent.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if ring.available() == 0 {
-                        break;
-                    }
-                    if drain_started.elapsed() >= drain_deadline {
-                        warn!(
-                            device = %device_name,
-                            remaining_samples = ring.available(),
-                            "local_audio_exclusive_drain_timeout"
-                        );
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-
-                // ExclusiveOutput::drop() restores sample rate and releases hog mode
-                drop(exclusive);
-                if play_generation.load(Ordering::SeqCst) == my_generation {
-                    playing.store(false, Ordering::SeqCst);
-                }
-                info!(
-                    device = %device_name,
-                    frames = total_frames_fed,
-                    "local_audio_exclusive_stopped"
-                );
+                    data_offset,
+                    header_buf,
+                    reader,
+                    frame_bytes,
+                    spec,
+                    seek_offset,
+                    my_generation,
+                    starvation,
+                    volume,
+                    user_volume_ref,
+                    rg_factor_ref,
+                    paused,
+                    playing,
+                    force_silent,
+                    stop_rx,
+                    open_failure,
+                    position_ms,
+                    play_generation,
+                    track_ended_naturally,
+                    track_ended_generation,
+                    eq,
+                    convolver,
+                    crossfeed,
+                    pure_bypass,
+                    mono_downmix,
+                    dop_active,
+                });
                 return;
             }
 
             // ------- Exclusive mode path (Windows ASIO) -------
             #[cfg(all(target_os = "windows", feature = "asio"))]
             if exclusive_mode && audio_backend == "asio" {
-                use super::asio_exclusive::AsioExclusiveOutput;
-
-                info!(
-                    device = %device_name,
+                // R6 bis (#2219) : le bras vit dans `local/bras_asio.rs`. Tout
+                // ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
+                bras_asio::jouer_via_asio(bras_asio::EntreesAsio {
+                    device_name,
+                    url,
                     sample_rate,
                     bit_depth,
                     channels,
-                    "local_audio_asio_exclusive_mode_active"
-                );
-
-                // Ring buffer: ~2 seconds of audio at source sample rate
-                let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                starvation.begin_stream(sample_rate, channels);
-                let float_ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
-                let native_ring =
-                    Arc::new(NativePcmRing::new_metered(ring_cap, starvation.clone()));
-                float_ring.clear();
-                native_ring.clear();
-
-                let exclusive = match AsioExclusiveOutput::new(
-                    &device_name,
-                    sample_rate,
-                    bit_depth as u32,
-                    channels as u32,
-                    float_ring.clone(),
-                    native_ring.clone(),
-                    volume.clone(),
-                    paused.clone(),
-                ) {
-                    Ok(ex) => ex,
-                    Err(e) => {
-                        record_exclusive_open_failure(
-                            "ASIO",
-                            &device_name,
-                            &e.to_string(),
-                            &open_failure,
-                        );
-                        playing.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                };
-
-                let selected_ring = if exclusive.uses_native_transport() {
-                    WindowsExclusiveRingRef::Native(&native_ring)
-                } else {
-                    WindowsExclusiveRingRef::Float(&float_ring)
-                };
-                if let Some(reason) = exclusive.bit_perfect_unavailable_reason() {
-                    info!(
-                        backend = "ASIO",
-                        device = %device_name,
-                        bit_perfect = false,
-                        reason,
-                        "windows_exclusive_signal_contract"
-                    );
-                }
-
-                info!(device = %device_name, url = %url, "local_audio_asio_exclusive_playing");
-                // ASIO exclusif : résolution par sous-chaîne, et `"default"`
-                // prend le premier pilote listé. `opened_id` reste `None` :
-                // ASIO n'expose aucun identifiant d'endpoint.
-                note_opened_device("ASIO", &device_name, exclusive.opened_device_name(), None);
-
-                // Feed audio data (no resampling needed -- hardware is set to source rate)
-                let pcm_data = if data_offset < header_buf.len() {
-                    header_buf[data_offset..].to_vec()
-                } else {
-                    Vec::new()
-                };
-
-                let mut total_frames_fed: u64 = 0;
-
-                // Only skip bytes if the stream was NOT pre-seeked by the
-                // decoder. When pre_seeked=true, the decoder already produced
-                // audio starting at the seek position — skipping would discard
-                // the entire stream (double-seek bug reported by DEvir).
-                let skip_bytes_asio: u64 = if seek_offset > 0 && !pre_seeked {
-                    let skip_frames = (seek_offset as f64 / 1000.0 * sample_rate as f64) as u64;
-                    skip_frames * channels as u64 * bytes_per_sample as u64
-                } else {
-                    0
-                };
-                let mut skipped_bytes_asio: u64 = 0;
-
-                // Read and feed the rest of the stream. The raw-byte staging
-                // buffer is also the DoP quarantine: no initial 24-bit sample
-                // may reach the f32 ring until 32 frames have ruled DoP out.
-                let mut leftover: Vec<u8> = Vec::new();
-                let mut must_classify_24_bit = bit_depth == 24;
-                let mut dop_latched = false;
-                let mut bit_perfect_state = None;
-
-                // Track-local contract: never inherit the prior stream's DoP
-                // state while the first 24-bit probe is still quarantined.
-                if dop_active.swap(false, Ordering::SeqCst) {
-                    sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
-                }
-
-                if !pcm_data.is_empty() {
-                    let discard = if skip_bytes_asio > skipped_bytes_asio {
-                        ((skip_bytes_asio - skipped_bytes_asio) as usize).min(pcm_data.len())
-                    } else {
-                        0
-                    };
-                    skipped_bytes_asio += discard as u64;
-                    leftover.extend_from_slice(&pcm_data[discard..]);
-                }
-
-                match feed_selected_windows_exclusive_leftover(
-                    &mut leftover,
+                    data_offset,
+                    header_buf,
+                    reader,
                     frame_bytes,
-                    bit_depth,
-                    channels,
-                    &mut must_classify_24_bit,
-                    &mut dop_latched,
-                    volume.load(Ordering::SeqCst),
-                    &eq,
-                    &convolver,
-                    &crossfeed,
-                    &pure_bypass,
-                    &mono_downmix,
-                    selected_ring,
-                    &stop_rx,
-                    &paused,
-                    &force_silent,
-                ) {
-                    Ok(Some(outcome)) => {
-                        total_frames_fed += outcome.frames;
-                        if dop_active.swap(outcome.dop, Ordering::SeqCst) != outcome.dop {
-                            info!(dop = outcome.dop, "local_audio_dop_stream_state_changed");
-                            sync_volume_to_dop(
-                                &volume,
-                                &user_volume_ref,
-                                &rg_factor_ref,
-                                outcome.dop,
-                            );
-                        }
-                        let volume_units = volume.load(Ordering::SeqCst);
-                        let runtime = publish_windows_signal_path_status(
-                            &signal_path_status,
-                            outcome.bit_perfect,
-                            matches!(selected_ring, WindowsExclusiveRingRef::Native(_)),
-                            outcome.dop,
-                            volume_units,
-                            &eq,
-                            &convolver,
-                            &crossfeed,
-                            &pure_bypass,
-                            &mono_downmix,
-                        );
-                        bit_perfect_state = Some(runtime.bit_perfect);
-                        info!(
-                            backend = "ASIO",
-                            bit_perfect = runtime.bit_perfect,
-                            dop = outcome.dop,
-                            volume_units,
-                            reasons = ?runtime.reasons,
-                            "windows_exclusive_signal_contract"
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        record_windows_exclusive_pcm_refusal(
-                            error,
-                            "ASIO",
-                            &device_name,
-                            &open_failure,
-                        );
-                        force_silent.store(true, Ordering::SeqCst);
-                        dop_active.store(false, Ordering::SeqCst);
-                        sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
-                        drop(exclusive);
-                        if play_generation.load(Ordering::SeqCst) == my_generation {
-                            playing.store(false, Ordering::SeqCst);
-                        }
-                        return;
-                    }
-                }
-                if !must_classify_24_bit && dop_active.swap(false, Ordering::SeqCst) {
-                    info!(dop = false, "local_audio_dop_stream_state_changed");
-                    sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
-                }
-
-                let mut http_eof_asio = false;
-                let mut last_data_at = std::time::Instant::now();
-                // Pump thread: it owns the blocking HTTP read so the thread
-                // that HOLDS THE ASIO DEVICE never blocks on the network.
-                // Before this, stop() set force_silent but the device thread
-                // sat in reader.read() until the HTTP session died as a side
-                // effect of the NEXT play — it then released the ASIO lock
-                // ~2.5s INTO the new play. Two repeats survived by timing;
-                // the 3rd hit the wrong interleaving: silent output and the
-                // poller oscillating at EOF (DEvir, Fireface ASIO, repeat-all,
-                // v0.9.0). With the pump, the device thread polls a channel
-                // (500ms) and honours stop within one tick; the pump thread
-                // may linger in a blocked read but only owns the socket, and
-                // exits when the receiver drops or the session closes.
-                // Approximate depth of the pump→device channel. Incremented by
-                // the pump before each send, decremented by the device loop on
-                // each successful recv. A high steady depth means the device
-                // thread is NOT draining (ring full / callback dead); a depth of
-                // ~0 means the device is starved (EOF never latches). Surfaced in
-                // the periodic `asio_exclusive_feed_stats` log (DEvir bug-22).
-                let pump_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let (pump_tx, pump_rx) =
-                    std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(64);
-                {
-                    let pump_depth = pump_depth.clone();
-                    std::thread::spawn(move || {
-                        let mut reader = reader;
-                        let mut buf = vec![0u8; 65536];
-                        loop {
-                            match reader.read(&mut buf) {
-                                Ok(0) => {
-                                    pump_depth.fetch_add(1, Ordering::Relaxed);
-                                    if pump_tx.send(Ok(Vec::new())).is_err() {
-                                        pump_depth.fetch_sub(1, Ordering::Relaxed);
-                                    }
-                                    break;
-                                }
-                                Ok(n) => {
-                                    pump_depth.fetch_add(1, Ordering::Relaxed);
-                                    if pump_tx.send(Ok(buf[..n].to_vec())).is_err() {
-                                        pump_depth.fetch_sub(1, Ordering::Relaxed);
-                                        break; // receiver gone — playback stopped
-                                    }
-                                }
-                                Err(e) => {
-                                    let transient = matches!(
-                                        e.kind(),
-                                        std::io::ErrorKind::TimedOut
-                                            | std::io::ErrorKind::WouldBlock
-                                    );
-                                    pump_depth.fetch_add(1, Ordering::Relaxed);
-                                    if pump_tx.send(Err(e)).is_err() {
-                                        pump_depth.fetch_sub(1, Ordering::Relaxed);
-                                        break;
-                                    }
-                                    if !transient {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-                let mut last_stats_at = std::time::Instant::now();
-                let mut pcm_refusal = None;
-                loop {
-                    if stop_rx.try_recv().is_ok() {
-                        break;
-                    }
-                    if force_silent.load(Ordering::Relaxed) {
-                        debug!("local_audio_asio_exclusive_aborted_by_stop");
-                        break;
-                    }
-
-                    // Periodic health snapshot (~500ms) so a wedge is diagnosable
-                    // from DEvir's next log: ring full + high pump_depth => the
-                    // callback stopped draining; ring/pump ~empty => starved / EOF
-                    // never latched (bug-22 / #789).
-                    if last_stats_at.elapsed() >= std::time::Duration::from_millis(500) {
-                        debug!(
-                            ring_available = selected_ring.available(),
-                            ring_capacity = selected_ring.capacity(),
-                            total_frames_fed,
-                            pump_depth = pump_depth.load(Ordering::Relaxed),
-                            leftover_bytes = leftover.len(),
-                            "asio_exclusive_feed_stats"
-                        );
-                        last_stats_at = std::time::Instant::now();
-                    }
-
-                    let recv = pump_rx.recv_timeout(std::time::Duration::from_millis(500));
-                    if recv.is_ok() {
-                        pump_depth.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    let chunk = match recv {
-                        Ok(Ok(data)) if data.is_empty() => {
-                            http_eof_asio = true;
-                            break;
-                        }
-                        Ok(Ok(data)) => {
-                            last_data_at = std::time::Instant::now();
-                            data
-                        }
-                        Ok(Err(ref e))
-                            if e.kind() == std::io::ErrorKind::TimedOut
-                                || e.kind() == std::io::ErrorKind::WouldBlock =>
-                        {
-                            // A streaming HTTP source (transcoded WAV over a
-                            // keep-alive connection) may never return a clean
-                            // EOF: after the last byte it just keeps timing out.
-                            // Once the whole track has been fed AND the ring has
-                            // fully drained (everything played), a sustained read
-                            // idle means the track ended — signal EOF so the
-                            // orchestrator can advance/repeat. Without this, the
-                            // loop spins forever and end-of-track is never
-                            // detected on exclusive ASIO outputs (DEvir: repeat
-                            // never fired on a clean playthrough).
-                            if total_frames_fed > 0
-                                && leftover.is_empty()
-                                && selected_ring.available() == 0
-                                && last_data_at.elapsed() > std::time::Duration::from_secs(5)
-                            {
-                                info!("local_audio_asio_exclusive_stream_idle_eof");
-                                http_eof_asio = true;
-                                break;
-                            }
-                            continue;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            // Same sustained-idle EOF heuristic as the
-                            // transient-read-error arm above.
-                            if total_frames_fed > 0
-                                && leftover.is_empty()
-                                && selected_ring.available() == 0
-                                && last_data_at.elapsed() > std::time::Duration::from_secs(5)
-                            {
-                                info!("local_audio_asio_exclusive_stream_idle_eof");
-                                http_eof_asio = true;
-                                break;
-                            }
-                            continue;
-                        }
-                        Ok(Err(e)) => {
-                            warn!(error = %e, "local_audio_asio_exclusive_read_error");
-                            http_eof_asio = true;
-                            break;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            http_eof_asio = true;
-                            break;
-                        }
-                    };
-                    let n = chunk.len();
-
-                    if skip_bytes_asio > 0 && skipped_bytes_asio < skip_bytes_asio {
-                        let remaining = (skip_bytes_asio - skipped_bytes_asio) as usize;
-                        if n <= remaining {
-                            skipped_bytes_asio += n as u64;
-                            continue;
-                        }
-                        skipped_bytes_asio = skip_bytes_asio;
-                        leftover.extend_from_slice(&chunk[remaining..]);
-                    } else {
-                        leftover.extend_from_slice(&chunk);
-                    }
-
-                    match feed_selected_windows_exclusive_leftover(
-                        &mut leftover,
-                        frame_bytes,
-                        bit_depth,
-                        channels,
-                        &mut must_classify_24_bit,
-                        &mut dop_latched,
-                        volume.load(Ordering::SeqCst),
-                        &eq,
-                        &convolver,
-                        &crossfeed,
-                        &pure_bypass,
-                        &mono_downmix,
-                        selected_ring,
-                        &stop_rx,
-                        &paused,
-                        &force_silent,
-                    ) {
-                        Ok(Some(outcome)) => {
-                            total_frames_fed += outcome.frames;
-                            if dop_active.swap(outcome.dop, Ordering::SeqCst) != outcome.dop {
-                                info!(dop = outcome.dop, "local_audio_dop_stream_state_changed");
-                                sync_volume_to_dop(
-                                    &volume,
-                                    &user_volume_ref,
-                                    &rg_factor_ref,
-                                    outcome.dop,
-                                );
-                            }
-                            let volume_units = volume.load(Ordering::SeqCst);
-                            let runtime = publish_windows_signal_path_status(
-                                &signal_path_status,
-                                outcome.bit_perfect,
-                                matches!(selected_ring, WindowsExclusiveRingRef::Native(_)),
-                                outcome.dop,
-                                volume_units,
-                                &eq,
-                                &convolver,
-                                &crossfeed,
-                                &pure_bypass,
-                                &mono_downmix,
-                            );
-                            if bit_perfect_state != Some(runtime.bit_perfect) {
-                                bit_perfect_state = Some(runtime.bit_perfect);
-                                info!(
-                                    backend = "ASIO",
-                                    bit_perfect = runtime.bit_perfect,
-                                    dop = outcome.dop,
-                                    volume_units,
-                                    reasons = ?runtime.reasons,
-                                    "windows_exclusive_signal_contract"
-                                );
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            pcm_refusal = Some(error);
-                            break;
-                        }
-                    }
-
-                    let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
-                        + seek_offset;
-                    position_ms.store(pos, Ordering::Relaxed);
-                }
-
-                if pcm_refusal.is_none() && http_eof_asio {
-                    match selected_ring {
-                        WindowsExclusiveRingRef::Float(_) => {
-                            if let Err(error) = finish_windows_exclusive_probe(
-                                bit_depth,
-                                must_classify_24_bit,
-                                leftover.len(),
-                            ) {
-                                pcm_refusal = Some(error);
-                            }
-                        }
-                        WindowsExclusiveRingRef::Native(ring)
-                            if must_classify_24_bit && !leftover.is_empty() =>
-                        {
-                            let aligned = (leftover.len() / frame_bytes) * frame_bytes;
-                            let native = pcm_bytes_to_native_i32(&leftover[..aligned], bit_depth);
-                            feed_native_ring_abortable(
-                                ring,
-                                &native,
-                                &stop_rx,
-                                &paused,
-                                Some(&force_silent),
-                            );
-                            leftover.drain(..aligned);
-                            total_frames_fed += (aligned / frame_bytes) as u64;
-                            info!(
-                                backend = "ASIO",
-                                bytes = aligned,
-                                bit_perfect = true,
-                                "windows_exclusive_short_24bit_stream_forced_raw"
-                            );
-                        }
-                        WindowsExclusiveRingRef::Native(_) => {}
-                    }
-                }
-                if let Some(error) = pcm_refusal {
-                    record_windows_exclusive_pcm_refusal(
-                        error,
-                        "ASIO",
-                        &device_name,
-                        &open_failure,
-                    );
-                    force_silent.store(true, Ordering::SeqCst);
-                    dop_active.store(false, Ordering::SeqCst);
-                    sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
-                    drop(exclusive);
-                    if play_generation.load(Ordering::SeqCst) == my_generation {
-                        playing.store(false, Ordering::SeqCst);
-                    }
-                    return;
-                }
-
-                // Fin de piste : rendre ce que le convolveur retient (#2209).
-                let queue = flush_local_dsp(
-                    &convolver,
-                    &crossfeed,
-                    &pure_bypass,
-                    &mono_downmix,
-                    channels,
-                    dop_active.load(Ordering::Relaxed),
-                );
-                if !queue.is_empty() {
-                    feed_selected_windows_exclusive_tail(
-                        selected_ring,
-                        queue,
-                        bit_depth,
-                        volume.load(Ordering::SeqCst),
-                        &stop_rx,
-                        &paused,
-                        &force_silent,
-                    );
-                }
-
-                // Signal natural track end BEFORE draining when the HTTP
-                // stream reached EOF, so the orchestrator can detect
-                // end-of-track even if force_silent is set during slow drain.
-                if http_eof_asio {
-                    track_ended_naturally.store(true, Ordering::SeqCst);
-                    track_ended_generation.store(my_generation, Ordering::SeqCst);
-                    TRACK_END_NOTIFY.notify_one();
-                }
-
-                // Wait for the ring to drain — but NEVER block forever. If the
-                // ASIO render callback stops consuming (RME driver wedged after a
-                // stop→start reopen at a Repeat loop point — DEvir bug-22, the
-                // #789 regression), `ring.available()` never reaches 0 and this
-                // loop used to spin indefinitely, stranding this thread AND the
-                // process-wide ASIO_DEVICE_LOCK (held until `exclusive` is dropped
-                // just below). Bound it two ways: a hard wall-clock deadline of
-                // ~2× the ring's time-capacity, and a stall detector that bails if
-                // `available()` has not decreased for ~1.5s.
-                let ring_capacity_ms = if sample_rate > 0 && channels > 0 {
-                    (selected_ring.capacity() as u64 * 1000)
-                        / (sample_rate as u64 * channels as u64)
-                } else {
-                    0
-                };
-                let drain_deadline =
-                    std::time::Duration::from_millis((ring_capacity_ms * 2).max(1000));
-                let drain_started = std::time::Instant::now();
-                let mut last_avail = selected_ring.available();
-                let mut last_progress_at = std::time::Instant::now();
-                loop {
-                    if stop_rx.try_recv().is_ok() {
-                        break;
-                    }
-                    if force_silent.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let avail = selected_ring.available();
-                    if avail == 0 {
-                        break;
-                    }
-                    if avail < last_avail {
-                        last_avail = avail;
-                        last_progress_at = std::time::Instant::now();
-                    } else if last_progress_at.elapsed() >= std::time::Duration::from_millis(1500) {
-                        warn!(
-                            device = %device_name,
-                            ring_available = avail,
-                            total_frames_fed,
-                            "asio_drain_timeout"
-                        );
-                        break;
-                    }
-                    if drain_started.elapsed() >= drain_deadline {
-                        warn!(
-                            device = %device_name,
-                            ring_available = avail,
-                            elapsed_ms = drain_started.elapsed().as_millis() as u64,
-                            "asio_drain_timeout"
-                        );
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-
-                // AsioExclusiveOutput::drop() releases the ASIO device and, with
-                // it, the process-wide ASIO_DEVICE_LOCK. Both loops above are now
-                // bounded and any panic unwinds through this owned local, so this
-                // drop runs on EVERY exit path — the lock can never be stranded.
-                drop(exclusive);
-                if play_generation.load(Ordering::SeqCst) == my_generation {
-                    playing.store(false, Ordering::SeqCst);
-                }
-                info!(
-                    device = %device_name,
-                    frames = total_frames_fed,
-                    "local_audio_asio_exclusive_stopped"
-                );
+                    bytes_per_sample,
+                    seek_offset,
+                    pre_seeked,
+                    my_generation,
+                    starvation,
+                    volume,
+                    user_volume_ref,
+                    rg_factor_ref,
+                    paused,
+                    playing,
+                    force_silent,
+                    stop_rx,
+                    open_failure,
+                    signal_path_status,
+                    position_ms,
+                    play_generation,
+                    track_ended_naturally,
+                    track_ended_generation,
+                    eq,
+                    convolver,
+                    crossfeed,
+                    pure_bypass,
+                    mono_downmix,
+                    dop_active,
+                });
                 return;
             }
 
             // ------- WASAPI Exclusive mode path (Windows, non-ASIO) -------
             #[cfg(target_os = "windows")]
             if exclusive_mode && audio_backend != "asio" {
-                use super::wasapi_exclusive::WasapiExclusiveOutput;
-
-                info!(
-                    device = %device_name,
+                // R6 bis (#2219) : le bras vit dans `local/bras_wasapi.rs`.
+                // Tout ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
+                bras_wasapi::jouer_via_wasapi(bras_wasapi::EntreesWasapi {
+                    device_name,
+                    endpoint_id,
                     sample_rate,
                     bit_depth,
                     channels,
-                    "local_audio_wasapi_exclusive_mode_active"
-                );
-
-                let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                starvation.begin_stream(sample_rate, channels);
-                let ring = Arc::new(NativePcmRing::new_metered(ring_cap, starvation.clone()));
-                ring.clear();
-
-                match WasapiExclusiveOutput::new(
-                    &device_name,
-                    endpoint_id.as_deref(),
-                    sample_rate,
-                    bit_depth as u32,
-                    channels as u32,
-                    ring.clone(),
-                    paused.clone(),
-                ) {
-                    Ok(mut wasapi) => {
-                        if let Err(e) = wasapi.start() {
-                            record_exclusive_open_failure(
-                                "WASAPI",
-                                &device_name,
-                                &e,
-                                &open_failure,
-                            );
-                            playing.store(false, Ordering::SeqCst);
-                            return;
-                        } else {
-                            info!(
-                                requested_device = %device_name,
-                                device = %wasapi.opened_device_name(),
-                                endpoint_id = %wasapi.opened_device_id(),
-                                info = %wasapi.format_info(),
-                                "wasapi_exclusive_playing"
-                            );
-                            // Ces deux accesseurs existaient depuis #2207 et
-                            // n'avaient que cette ligne de journal pour
-                            // lecteur. La zone les porte désormais.
-                            note_opened_device(
-                                "WASAPI",
-                                &device_name,
-                                wasapi.opened_device_name(),
-                                Some(wasapi.opened_device_id()),
-                            );
-
-                            let pcm_data = if data_offset < header_buf.len() {
-                                header_buf[data_offset..].to_vec()
-                            } else {
-                                Vec::new()
-                            };
-
-                            let mut total_frames_fed: u64 = 0;
-                            let mut read_buf = vec![0u8; 65536];
-                            let mut leftover = pcm_data;
-                            let mut must_classify_24_bit = bit_depth == 24;
-                            let mut dop_latched = false;
-                            let mut bit_perfect_state = None;
-
-                            // A new track never inherits the DoP/volume state
-                            // of the previous one while its first 24-bit probe
-                            // is still quarantined.
-                            if dop_active.swap(false, Ordering::SeqCst) {
-                                sync_volume_to_dop(
-                                    &volume,
-                                    &user_volume_ref,
-                                    &rg_factor_ref,
-                                    false,
-                                );
-                            }
-
-                            if let Some(outcome) = feed_windows_native_exclusive_leftover(
-                                &mut leftover,
-                                frame_bytes,
-                                bit_depth,
-                                channels,
-                                &mut must_classify_24_bit,
-                                &mut dop_latched,
-                                volume.load(Ordering::SeqCst),
-                                &eq,
-                                &convolver,
-                                &crossfeed,
-                                &pure_bypass,
-                                &mono_downmix,
-                                &ring,
-                                &stop_rx,
-                                &paused,
-                                &force_silent,
-                            ) {
-                                total_frames_fed += outcome.frames;
-                                if dop_active.swap(outcome.dop, Ordering::SeqCst) != outcome.dop {
-                                    info!(
-                                        dop = outcome.dop,
-                                        "local_audio_dop_stream_state_changed"
-                                    );
-                                    sync_volume_to_dop(
-                                        &volume,
-                                        &user_volume_ref,
-                                        &rg_factor_ref,
-                                        outcome.dop,
-                                    );
-                                }
-                                let volume_units = volume.load(Ordering::SeqCst);
-                                let runtime = publish_windows_signal_path_status(
-                                    &signal_path_status,
-                                    outcome.bit_perfect,
-                                    true,
-                                    outcome.dop,
-                                    volume_units,
-                                    &eq,
-                                    &convolver,
-                                    &crossfeed,
-                                    &pure_bypass,
-                                    &mono_downmix,
-                                );
-                                if bit_perfect_state != Some(runtime.bit_perfect) {
-                                    bit_perfect_state = Some(runtime.bit_perfect);
-                                    info!(
-                                        backend = "WASAPI",
-                                        bit_perfect = runtime.bit_perfect,
-                                        dop = outcome.dop,
-                                        volume_units,
-                                        reasons = ?runtime.reasons,
-                                        "windows_exclusive_signal_contract"
-                                    );
-                                }
-                            }
-                            if !must_classify_24_bit && dop_active.swap(false, Ordering::SeqCst) {
-                                info!(dop = false, "local_audio_dop_stream_state_changed");
-                                sync_volume_to_dop(
-                                    &volume,
-                                    &user_volume_ref,
-                                    &rg_factor_ref,
-                                    false,
-                                );
-                            }
-
-                            let mut http_eof_wasapi = false;
-                            loop {
-                                if stop_rx.try_recv().is_ok() {
-                                    break;
-                                }
-                                if force_silent.load(Ordering::Relaxed) {
-                                    debug!("local_audio_wasapi_exclusive_aborted_by_stop");
-                                    break;
-                                }
-
-                                match reader.read(&mut read_buf) {
-                                    Ok(0) => {
-                                        http_eof_wasapi = true;
-                                        break;
-                                    }
-                                    Ok(n) => {
-                                        leftover.extend_from_slice(&read_buf[..n]);
-                                        if let Some(outcome) =
-                                            feed_windows_native_exclusive_leftover(
-                                                &mut leftover,
-                                                frame_bytes,
-                                                bit_depth,
-                                                channels,
-                                                &mut must_classify_24_bit,
-                                                &mut dop_latched,
-                                                volume.load(Ordering::SeqCst),
-                                                &eq,
-                                                &convolver,
-                                                &crossfeed,
-                                                &pure_bypass,
-                                                &mono_downmix,
-                                                &ring,
-                                                &stop_rx,
-                                                &paused,
-                                                &force_silent,
-                                            )
-                                        {
-                                            total_frames_fed += outcome.frames;
-                                            if dop_active.swap(outcome.dop, Ordering::SeqCst)
-                                                != outcome.dop
-                                            {
-                                                info!(
-                                                    dop = outcome.dop,
-                                                    "local_audio_dop_stream_state_changed"
-                                                );
-                                                sync_volume_to_dop(
-                                                    &volume,
-                                                    &user_volume_ref,
-                                                    &rg_factor_ref,
-                                                    outcome.dop,
-                                                );
-                                            }
-                                            let volume_units = volume.load(Ordering::SeqCst);
-                                            let runtime = publish_windows_signal_path_status(
-                                                &signal_path_status,
-                                                outcome.bit_perfect,
-                                                true,
-                                                outcome.dop,
-                                                volume_units,
-                                                &eq,
-                                                &convolver,
-                                                &crossfeed,
-                                                &pure_bypass,
-                                                &mono_downmix,
-                                            );
-                                            if bit_perfect_state != Some(runtime.bit_perfect) {
-                                                bit_perfect_state = Some(runtime.bit_perfect);
-                                                info!(
-                                                    backend = "WASAPI",
-                                                    bit_perfect = runtime.bit_perfect,
-                                                    dop = outcome.dop,
-                                                    volume_units,
-                                                    reasons = ?runtime.reasons,
-                                                    "windows_exclusive_signal_contract"
-                                                );
-                                            }
-                                        }
-
-                                        let pos = (total_frames_fed as f64 / sample_rate as f64
-                                            * 1000.0)
-                                            as u64
-                                            + seek_offset;
-                                        position_ms.store(pos, Ordering::Relaxed);
-                                    }
-                                    Err(ref e)
-                                        if e.kind() == std::io::ErrorKind::TimedOut
-                                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                                    {
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "local_audio_wasapi_exclusive_read_error");
-                                        http_eof_wasapi = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Less than 32 initial 24-bit frames cannot be
-                            // classified, but the integer ring can still carry
-                            // them safely. Keep them raw and at unity rather
-                            // than guessing PCM and applying sample arithmetic.
-                            if http_eof_wasapi && must_classify_24_bit && !leftover.is_empty() {
-                                let aligned = (leftover.len() / frame_bytes) * frame_bytes;
-                                let native =
-                                    pcm_bytes_to_native_i32(&leftover[..aligned], bit_depth);
-                                feed_native_ring_abortable(
-                                    &ring,
-                                    &native,
-                                    &stop_rx,
-                                    &paused,
-                                    Some(&force_silent),
-                                );
-                                leftover.drain(..aligned);
-                                total_frames_fed += (aligned / frame_bytes) as u64;
-                                info!(
-                                    backend = "WASAPI",
-                                    bytes = aligned,
-                                    "windows_exclusive_short_24bit_stream_forced_raw"
-                                );
-                            }
-
-                            // WASAPI exclusive now follows the same DSP tail
-                            // contract as the other local PCM paths (#2209).
-                            let queue = flush_local_dsp(
-                                &convolver,
-                                &crossfeed,
-                                &pure_bypass,
-                                &mono_downmix,
-                                channels,
-                                false,
-                            );
-                            if !queue.is_empty() {
-                                let volume_factor = volume.load(Ordering::SeqCst) as f32 / 1000.0;
-                                let mut queue = queue;
-                                if volume_factor != 1.0 {
-                                    for sample in &mut queue {
-                                        *sample *= volume_factor;
-                                    }
-                                }
-                                let native = f32_to_native_i32(&queue, bit_depth);
-                                feed_native_ring_abortable(
-                                    &ring,
-                                    &native,
-                                    &stop_rx,
-                                    &paused,
-                                    Some(&force_silent),
-                                );
-                            }
-
-                            // Signal natural track end BEFORE draining when
-                            // the HTTP stream reached EOF, so the orchestrator
-                            // can detect end-of-track even if force_silent is
-                            // set during slow drain (e.g. 44.1→192 kHz resample).
-                            if http_eof_wasapi {
-                                track_ended_naturally.store(true, Ordering::SeqCst);
-                                track_ended_generation.store(my_generation, Ordering::SeqCst);
-                                TRACK_END_NOTIFY.notify_one();
-                            }
-
-                            // Wait for ring buffer to drain
-                            loop {
-                                if stop_rx.try_recv().is_ok() {
-                                    break;
-                                }
-                                if force_silent.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                if ring.available() == 0 {
-                                    break;
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                            }
-
-                            wasapi.stop();
-                            if play_generation.load(Ordering::SeqCst) == my_generation {
-                                playing.store(false, Ordering::SeqCst);
-                            }
-                            info!(
-                                device = %device_name,
-                                frames = total_frames_fed,
-                                "local_audio_wasapi_exclusive_stopped"
-                            );
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        record_exclusive_open_failure("WASAPI", &device_name, &e, &open_failure);
-                        playing.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                }
+                    data_offset,
+                    header_buf,
+                    reader,
+                    frame_bytes,
+                    seek_offset,
+                    my_generation,
+                    starvation,
+                    volume,
+                    user_volume_ref,
+                    rg_factor_ref,
+                    paused,
+                    playing,
+                    force_silent,
+                    stop_rx,
+                    open_failure,
+                    signal_path_status,
+                    position_ms,
+                    play_generation,
+                    track_ended_naturally,
+                    track_ended_generation,
+                    eq,
+                    convolver,
+                    crossfeed,
+                    pure_bypass,
+                    mono_downmix,
+                    dop_active,
+                });
+                return;
             }
             #[cfg(not(any(target_os = "macos", all(target_os = "windows", feature = "asio"))))]
             let _ = exclusive_mode;
