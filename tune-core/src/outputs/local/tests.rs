@@ -1440,10 +1440,14 @@ fn la_charge_utile_dit_si_les_cadences_ont_ete_mesurees() {
 #[test]
 fn l_indice_de_mesure_est_calcule_et_non_ecrit_en_dur() {
     let source = include_str!("../local.rs");
+    // R6 (#2219) : le littéral `AudioDevice` de l'énumération vit dans
+    // `local/parc.rs` ; la branche « ouvrir à la cadence source » reste dans
+    // `play_url`, donc dans `local.rs`.
+    let parc = include_str!("parc.rs");
 
     let champ_derive = ["sample_rates_measured: ", "rates_evidence.is_measured(),"].concat();
     assert!(
-        source.contains(&champ_derive),
+        parc.contains(&champ_derive),
         "le seul site qui construit un AudioDevice de production doit \
          dériver `sample_rates_measured` de `sample_rate_evidence` ; écrit \
          en dur, il redit « mesuré » sur WASAPI (#2862)"
@@ -2406,7 +2410,8 @@ fn chaque_motif_de_repli_de_peripherique_est_cable() {
 /// `terminologie_eq.rs` et `position_publiee_guard`.
 #[test]
 fn find_device_with_fallback_passe_bien_l_hote_d_origine() {
-    let source = include_str!("../local.rs");
+    // R6 (#2219) : `find_device_with_fallback` vit dans `local/resolution.rs`.
+    let source = include_str!("resolution.rs");
     let debut = source
         .find("fn find_device_with_fallback(")
         .expect("find_device_with_fallback introuvable");

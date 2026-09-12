@@ -390,6 +390,10 @@ fn la_charge_utile_json_porte_les_deux_noms() {
 fn chaque_chemin_douverture_enregistre_le_peripherique_ouvert() {
     let src = std::fs::read_to_string(std::path::Path::new("src/outputs/local.rs"))
         .expect("local.rs doit être lisible depuis la racine du crate");
+    // R6 (#2219) : `find_device_with_fallback` vit dans `local/resolution.rs`.
+    let resolution =
+        std::fs::read_to_string(std::path::Path::new("src/outputs/local/resolution.rs"))
+            .expect("local/resolution.rs doit être lisible depuis la racine du crate");
 
     // 1. Les trois chemins EXCLUSIFS : chacun annonce sa lecture par une
     //    ligne `…_playing`, chacun doit enregistrer juste après.
@@ -416,14 +420,14 @@ fn chaque_chemin_douverture_enregistre_le_peripherique_ouvert() {
     //    seule qui n'ouvre rien), repli sur le périphérique système
     //    (#2207). Les quatre doivent enregistrer : une sortie muette, c'est
     //    une zone qui affiche la consigne au lieu de la vérité.
-    let debut = src
+    let debut = resolution
         .find("fn find_device_with_fallback(")
         .expect("find_device_with_fallback introuvable");
-    let fin = src[debut..]
+    let fin = resolution[debut..]
         .find("\n/// Probe a device's capabilities")
         .map(|i| debut + i)
         .expect("le corps de find_device_with_fallback doit précéder `Probe a device`");
-    let corps = &src[debut..fin];
+    let corps = &resolution[debut..fin];
     let enregistrements = corps.matches("note_opened_device(").count()
         + corps.matches("note_device_outcome(").count();
     assert_eq!(
@@ -457,8 +461,10 @@ fn chaque_chemin_douverture_enregistre_le_peripherique_ouvert() {
 /// la source, faute de pouvoir l'exécuter.
 #[test]
 fn chaque_sortie_de_select_host_enregistre_le_backend_ouvert() {
-    let src = std::fs::read_to_string(std::path::Path::new("src/outputs/local.rs"))
-        .expect("local.rs doit être lisible depuis la racine du crate");
+    // R6 (#2219) : `select_host` et `OBSERVED_BACKEND` vivent dans
+    // `local/etat_backend.rs`.
+    let src = std::fs::read_to_string(std::path::Path::new("src/outputs/local/etat_backend.rs"))
+        .expect("local/etat_backend.rs doit être lisible depuis la racine du crate");
     let debut = src
         .find("pub fn select_host(")
         .expect("select_host introuvable");

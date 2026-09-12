@@ -1,13 +1,9 @@
-/// ⚠️ `include_str!` rend le fichier ENTIER. On coupe à ce module pour que
-/// les motifs cherchés ne puissent pas se trouver eux-mêmes dans les
-/// messages d'assertion ni dans les épreuves qui suivent (#2082).
+/// R6 (#2219) : l'énumération vit dans `local/parc.rs`, un module de
+/// production sans aucun test — les motifs cherchés ne peuvent donc pas s'y
+/// trouver eux-mêmes (#2082). Avant R6 on coupait `local.rs` à la
+/// déclaration de ce module pour la même raison.
 fn code_de_production() -> &'static str {
-    const TOUT: &str = include_str!("../local.rs");
-    const BORNE: &str = "mod renseignement_materiel_guard";
-    let fin = TOUT
-        .find(BORNE)
-        .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
-    &TOUT[..fin]
+    include_str!("parc.rs")
 }
 
 #[test]
