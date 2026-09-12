@@ -1051,3 +1051,11 @@ mod position_publiee_guard;
 /// avance n'est, elle, ni abandonnée ni refusée.
 #[cfg(test)]
 mod relance_radio_bornee_3756;
+
+/// REF-9 préparatoire (#2219) — témoins des transitions de `ZonePollState`.
+///
+/// Un témoin par transition nommée dans `docs/refonte/ref9-etats-du-sondeur.md` :
+/// l'état de sondage avant, la décision de `fsm` / `decisions`, l'état après.
+/// Aucune ligne de production : ce module ne vit que sous `cfg(test)`.
+#[cfg(test)]
+mod temoins_de_transitions_ref9;

@@ -155,6 +155,7 @@ par `scripts/refonte/gardes.sh`.
 | Fichier | Déjà fait | Reste | Gardes |
 |---|---|---|---|
 | `poller.rs` | `mod decisions` 956 l. et `mod fsm` 1 011 l. existent : la moitié de REF-1 est livrée depuis juillet. | `impl PositionPoller` 3 620 l., dont `tick` **2 344**, `handle_track_end` 350, `prepare_gapless` 246. `ZonePollState` 155 l. de flags, cible de REF-9. | 4 internes + `tests/poller_bascule.rs` + `tests/octets_servis_inconnus_2394.rs` |
+| `poller/etat.rs` | REF-9 préparatoire : les 39 champs de `ZonePollState`, leurs 163 sites d'écriture, les transitions que `tick` prend et une proposition d'énumération à arbitrer — voir [`ref9-etats-du-sondeur.md`](ref9-etats-du-sondeur.md). | La machine à états elle-même. | `poller/temoins_de_transitions_ref9.rs` (11 témoins) |
 | `routes/zones.rs` | #2769 fusionnée, plus rien d'ouvert dessus. | `build_signal_path` **760** et `patch_zone` 528 portent la moitié de la production. `signal_path_tests` 1 580 l. | `zone_manager.rs:1329`, trois internes dont une lit `playback.rs` |
 
 ## Trois décisions que cette carte appelle
