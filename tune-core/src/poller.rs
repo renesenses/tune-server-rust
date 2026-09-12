@@ -1063,3 +1063,14 @@ mod relance_radio_bornee_3756;
 /// Aucune ligne de production : ce module ne vit que sous `cfg(test)`.
 #[cfg(test)]
 mod temoins_de_transitions_ref9;
+
+/// La position publiée ne porte jamais la piste PRÉCÉDENTE
+/// (renesenses/tune-web-client#954).
+///
+/// Le sondeur publie l'échantillon de la sortie AVANT de décider s'il est
+/// recevable : entre le basculement de `now_playing` et le démarrage réel du
+/// nouveau flux, la sortie rend encore la position de la piste d'avant, et
+/// cette valeur périmée devient l'état servi par `GET /zones`. Les témoins
+/// montent le vrai `tick` et rejouent la séquence.
+#[cfg(test)]
+mod position_de_la_piste_precedente_954;
