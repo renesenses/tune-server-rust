@@ -3,6 +3,8 @@
 //! Les cas restent séparés par module et conservent leurs fixtures. Les réunir
 //! évite de lier sept fois la même crate de 185 000 lignes.
 
+#[path = "alac_aiff_wav_empreintes_reference.rs"]
+mod alac_aiff_wav_empreintes_reference;
 #[path = "aucune_fuite_de_temporaires.rs"]
 mod aucune_fuite_de_temporaires;
 #[path = "audio_integration.rs"]
