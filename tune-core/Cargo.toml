@@ -373,6 +373,13 @@ path = "tests/temoin_resolution_locale.rs"
 name = "marge_et_crete_2218"
 path = "tests/marge_et_crete_2218.rs"
 
+# #2218 (suite de T9) — l'écrêtage est COMPTÉ et DIT, sans changer un
+# échantillon : compteurs, lignes `dsp_ecretage`, empreintes FNV des octets de
+# sortie relevées AVANT le comptage. Aucune caractéristique requise.
+[[test]]
+name = "ecretage_compte_2218"
+path = "tests/ecretage_compte_2218.rs"
+
 # #2218 T10 — le rééchantillonneur (`audio::resample`) mesuré contre une
 # référence sinc indépendante écrite dans le test (Kaiser β = 14, 1025
 # coefficients, f64, polyphase exacte), par rapport de cadence. Aucune

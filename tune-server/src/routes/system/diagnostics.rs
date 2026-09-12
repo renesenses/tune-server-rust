@@ -639,6 +639,12 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // lui-même, sur un anneau qui n'a pas eu faim. `eq_overs` dit
         // l'inverse, la saturation. Les deux étaient mesurés et invisibles.
         "dsp_egaliseur": dsp_egaliseur,
+        // #2218 (T9 suite) — ce que chaque étage a ÉCRÊTÉ depuis le démarrage,
+        // compté là où le clamp a lieu (ReplayGain, égaliseur, mixeur), sans
+        // le changer. Par processus, pas par zone : ces étages ne connaissent
+        // pas leur zone. Le journal porte `dsp_ecretage` au premier écrêtage
+        // d'une piste et à sa fin.
+        "dsp_ecretage": tune_core::audio::ecretage::releve(),
         // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
         // une ligne WARN que l'utilisateur ne verra jamais.
         "asio_warm_scan": crate::startup::asio_warm_status(),
@@ -1894,6 +1900,29 @@ instable ; l'anneau reste alimente et le DAC recoit du silence. A ne pas \
 confondre avec la famine de l'anneau, comptee au-dessus)\n\n",
         );
     }
+    // #2218 (T9 suite) : ReplayGain sans pic tague ecretait 66 % d'un sinus a
+    // −0,1 dBFS sans compteur ni journal ; l'egaliseur comptait ses overs sans
+    // les dire. Chaque etage compte desormais la ou son clamp a lieu, sans le
+    // changer. Par processus depuis le demarrage, pas par zone.
+    let dsp_ecretage = tune_core::audio::ecretage::releve();
+    md.push_str("## DSP — ecretage (compte la ou le clamp a lieu, #2218)\n");
+    for (nom, e) in dsp_ecretage.etages() {
+        md.push_str(&format!(
+            "- {nom} : {} echantillon(s) ecrete(s) sur {} ({} %), exces max {} LSB, {} bloc(s) ecretant(s), {} piste(s) close(s) avec ecretage, {} ligne(s) dsp_ecretage\n",
+            e.echantillons_ecretes,
+            e.echantillons_vus,
+            e.pourcentage,
+            e.exces_max_lsb,
+            e.appels_ecretants,
+            e.pistes_ecretees,
+            e.lignes_journal,
+        ));
+    }
+    md.push_str(
+        "  (compte depuis le demarrage du processus, tous flux confondus ; le \
+journal porte `dsp_ecretage` au premier ecretage d'une piste et a sa fin, \
+jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
+    );
     md.push_str("## Database\n");
     // #3182 : c'était `format!("- Engine: sqlite\n")` — un `format!` sans
     // argument, donc une chaîne littérale, et toute installation PostgreSQL
@@ -2000,6 +2029,8 @@ confondre avec la famine de l'anneau, comptee au-dessus)\n\n",
         "ring_starvation": ring_starvation,
         // Le pendant JSON de la section markdown ci-dessus (#3479).
         "dsp_egaliseur": dsp_egaliseur,
+        // Le pendant JSON de la section « DSP — ecretage » (#2218).
+        "dsp_ecretage": dsp_ecretage,
         "database": {
             // #3182 : même mensonge que la ligne markdown ci-dessus, dans le
             // corps JSON que le client lit.

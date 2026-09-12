@@ -400,6 +400,16 @@ pub struct EqProcessor {
     /// Cumulative runtime diagnostics since this processor was built for the
     /// current stream. Read by the output telemetry path (#2212).
     process_stats: EqProcessStats,
+    /// #2218 (T9, défaut B) — les `overs` étaient comptés, jamais dits. Ce
+    /// compteur suit `process_stats.overs` là où il est incrémenté, avec
+    /// l'excès et l'index du premier, et porte les DEUX lignes `dsp_ecretage`
+    /// de la piste : `ecretage_premier_dit` après le premier bloc qui écrête,
+    /// la fin dans `Drop`. `ecretage_fin_dite` est atomique parce que
+    /// `inherit_state_from` doit faire taire un processeur qu'elle ne tient
+    /// que par `&` : relayé, il ne clôt pas une piste qui continue.
+    ecretage: crate::audio::ecretage::CompteurDEcretage,
+    ecretage_premier_dit: bool,
+    ecretage_fin_dite: std::sync::atomic::AtomicBool,
     channels: u16,
     enabled: bool,
 }
@@ -477,8 +487,35 @@ impl EqProcessor {
                 .map(|channel| 0x9e37_79b9_7f4a_7c15_u64 ^ (u64::from(channel) + 1))
                 .collect(),
             process_stats: EqProcessStats::default(),
+            ecretage: crate::audio::ecretage::CompteurDEcretage::default(),
+            ecretage_premier_dit: false,
+            ecretage_fin_dite: std::sync::atomic::AtomicBool::new(false),
             channels,
             enabled,
+        }
+    }
+
+    /// #2218 — le compteur d'écrêtage de la piste : `echantillons_ecretes`
+    /// vaut exactement `process_stats().overs`, avec en plus l'excès maximal,
+    /// la crête et l'index du premier.
+    pub fn ecretage(&self) -> crate::audio::ecretage::CompteurDEcretage {
+        self.ecretage
+    }
+
+    /// Après un bloc : cumule le delta dans le registre du processus et dit
+    /// le premier écrêtage de la piste UNE fois. Jamais dans la boucle
+    /// d'échantillons.
+    fn apres_le_bloc(&mut self, avant: &crate::audio::ecretage::CompteurDEcretage) {
+        crate::audio::ecretage::REGISTRE
+            .egaliseur
+            .absorber(avant, &self.ecretage);
+        if !self.ecretage_premier_dit && self.ecretage.echantillons_ecretes > 0 {
+            self.ecretage_premier_dit = true;
+            crate::audio::ecretage::dire_premier(
+                crate::audio::ecretage::EtageEcretant::Egaliseur,
+                crate::audio::ecretage::Portee::Piste,
+                &self.ecretage,
+            );
         }
     }
 
@@ -492,8 +529,14 @@ impl EqProcessor {
 
         let bytes_per_sample = (bit_depth / 8) as usize;
         let frame_size = bytes_per_sample * self.channels as usize;
+        // #2218 — l'excès en LSB de la profondeur traitée ; `base` place le
+        // premier écrêtage dans la piste, pas dans le bloc.
+        let max_val = (1i64 << (bit_depth - 1)) as f64;
+        let avant = self.ecretage;
+        let base = avant.echantillons_vus;
+        let canaux = self.channels as u64;
 
-        for frame in pcm.chunks_exact_mut(frame_size) {
+        for (fi, frame) in pcm.chunks_exact_mut(frame_size).enumerate() {
             for ch in 0..self.channels as usize {
                 let offset = ch * bytes_per_sample;
                 let sample = read_sample_f64(&frame[offset..], bytes_per_sample, bit_depth)
@@ -511,18 +554,26 @@ impl EqProcessor {
                     s = 0.0;
                 } else if !(-1.0..1.0).contains(&s) {
                     stats.overs += 1;
+                    self.ecretage.noter_ecrete(
+                        base + fi as u64 * canaux + ch as u64,
+                        (s.abs() - 1.0) * max_val,
+                        s.abs(),
+                    );
                 }
 
                 let dither = tpdf_dither(&mut self.dither_states[ch]);
                 write_sample_f64(&mut frame[offset..], s, bytes_per_sample, bit_depth, dither);
             }
         }
+        self.ecretage
+            .noter_vus((pcm.len() / frame_size) as u64 * canaux);
 
         self.process_stats.overs = self.process_stats.overs.saturating_add(stats.overs);
         self.process_stats.non_finite_samples = self
             .process_stats
             .non_finite_samples
             .saturating_add(stats.non_finite_samples);
+        self.apres_le_bloc(&avant);
         stats
     }
 
@@ -550,7 +601,14 @@ impl EqProcessor {
             return stats;
         }
 
-        for frame in samples.chunks_exact_mut(ch_count) {
+        // #2218 — ce chemin ne sature PAS (T9 : crête ×3,95 laissée passer) ;
+        // il compte les overs comme `process_pcm`, avec un LSB de référence à
+        // 24 bits faute de profondeur.
+        const LSB_REFERENCE: f64 = 8_388_608.0;
+        let avant = self.ecretage;
+        let base = avant.echantillons_vus;
+
+        for (fi, frame) in samples.chunks_exact_mut(ch_count).enumerate() {
             for (ch, sample) in frame.iter_mut().enumerate() {
                 let state = &mut self.states[ch];
                 let cascade = &self.filters[ch];
@@ -567,16 +625,23 @@ impl EqProcessor {
                     s = 0.0;
                 } else if !(-1.0..1.0).contains(&s) {
                     stats.overs += 1;
+                    self.ecretage.noter_ecrete(
+                        base + (fi * ch_count + ch) as u64,
+                        (s.abs() - 1.0) * LSB_REFERENCE,
+                        s.abs(),
+                    );
                 }
                 *sample = s as f32;
             }
         }
+        self.ecretage.noter_vus(samples.len() as u64);
 
         self.process_stats.overs = self.process_stats.overs.saturating_add(stats.overs);
         self.process_stats.non_finite_samples = self
             .process_stats
             .non_finite_samples
             .saturating_add(stats.non_finite_samples);
+        self.apres_le_bloc(&avant);
         stats
     }
 
@@ -659,6 +724,40 @@ impl EqProcessor {
         // Aucun échantillon n'est touché : `process_stats` ne sort que par
         // `dsp_metrics()`, vers `/zones/{id}/signal-path` et le rapport.
         self.process_stats = previous.process_stats;
+        // #2218 — et le compteur d'écrêtage, avec ses deux « déjà dit » : le
+        // relayé ne clôt pas la piste (elle continue dans `self`), et `self`
+        // ne redit pas un premier écrêtage déjà dit.
+        self.ecretage = previous.ecretage;
+        self.ecretage_premier_dit = previous.ecretage_premier_dit;
+        previous
+            .ecretage_fin_dite
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// #2218 — la fin de la piste : UNE ligne `dsp_ecretage` avec le total, si
+/// quelque chose a été écrêté, et rien sinon. Un processeur relayé par
+/// `inherit_state_from` se tait : sa piste continue ailleurs.
+///
+/// Le processeur est détruit côté producteur (`set_eq` / `replace_eq_live`
+/// de la sortie locale, fin du relais du bras progressif), jamais dans le
+/// rappel cpal, qui ne fait que vider l'anneau.
+impl Drop for EqProcessor {
+    fn drop(&mut self) {
+        if self
+            .ecretage_fin_dite
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        if self.ecretage.echantillons_ecretes > 0 {
+            crate::audio::ecretage::REGISTRE.egaliseur.piste_close();
+        }
+        crate::audio::ecretage::dire_fin(
+            crate::audio::ecretage::EtageEcretant::Egaliseur,
+            crate::audio::ecretage::Portee::Piste,
+            &self.ecretage,
+        );
     }
 }
 
