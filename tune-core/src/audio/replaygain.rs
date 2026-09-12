@@ -14,6 +14,7 @@
 //! ReplayGain tags always win: a track that already has `rg_track_gain` is never
 //! recomputed.
 
+use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
 use crate::db::track_metadata_repo::TrackMetadataRepo;
@@ -1847,40 +1848,177 @@ pub fn gain_factor(gain: TrackGain, settings: ReplayGainSettings) -> f64 {
 /// themselves: the gain has to be baked in here or it never happens.
 /// Saturating on the way out — a sample pushed past full scale wraps around
 /// into a loud click if it is simply truncated.
+///
+/// #2218 (T9, défaut A) : cette porte ne connaît ni la piste ni la zone — le
+/// bras progressif lui passe un `f64` nu, bloc par bloc. Elle COMPTE donc ses
+/// écrêtés par appel dans le registre du processus
+/// (`audio::ecretage::REGISTRE`, section `dsp_ecretage` du rapport) et ne
+/// dit qu'UNE ligne `dsp_ecretage`, au premier bloc du processus qui écrête :
+/// une ligne par bloc noierait le journal. Les lignes par piste (premier
+/// écrêtage, fin) sont portées par [`GainReplay`], qui sait où une piste
+/// commence et finit. Les échantillons produits sont ceux d'avant, à l'octet
+/// (empreintes dans `tune-core/tests/ecretage_compte_2218.rs`).
 pub fn apply_gain_pcm(pcm: &mut [u8], bit_depth: u16, factor: f64) {
+    let mut compteur = CompteurDEcretage::default();
+    apply_gain_pcm_compte(pcm, bit_depth, factor, &mut compteur);
+    let premier_du_processus = crate::audio::ecretage::REGISTRE
+        .replaygain
+        .absorber(&CompteurDEcretage::default(), &compteur);
+    if premier_du_processus {
+        crate::audio::ecretage::dire_premier(
+            crate::audio::ecretage::EtageEcretant::ReplayGain,
+            crate::audio::ecretage::Portee::Processus,
+            &compteur,
+        );
+    }
+}
+
+/// [`apply_gain_pcm`] qui COMPTE dans `compteur` chaque échantillon que le
+/// clamp ramène au rail — la condition du clamp, ni plus ni moins — sans
+/// changer un échantillon : même produit, même `clamp`, même `as i16` /
+/// `as i32` (troncature vers zéro, défaut E de T9, inchangé). Zéro
+/// allocation : un compteur à champs simples, deux comparaisons par
+/// échantillon, une addition par bloc.
+pub fn apply_gain_pcm_compte(
+    pcm: &mut [u8],
+    bit_depth: u16,
+    factor: f64,
+    compteur: &mut CompteurDEcretage,
+) {
     if pcm.is_empty() || (factor - 1.0).abs() < 1e-9 {
         return;
     }
+    let base = compteur.echantillons_vus;
     match bit_depth {
         16 => {
-            for s in pcm.chunks_exact_mut(2) {
+            const MAX: f64 = i16::MAX as f64;
+            const MIN: f64 = i16::MIN as f64;
+            const PLEINE_ECHELLE: f64 = 32_768.0;
+            for (i, s) in pcm.chunks_exact_mut(2).enumerate() {
                 let v = i16::from_le_bytes([s[0], s[1]]) as f64 * factor;
+                if v > MAX {
+                    compteur.noter_ecrete(base + i as u64, v - MAX, v / PLEINE_ECHELLE);
+                } else if v < MIN {
+                    compteur.noter_ecrete(base + i as u64, MIN - v, -v / PLEINE_ECHELLE);
+                }
                 let clamped = v.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
                 s.copy_from_slice(&clamped.to_le_bytes());
             }
+            compteur.noter_vus((pcm.len() / 2) as u64);
         }
         24 => {
             const MAX: f64 = 8_388_607.0;
             const MIN: f64 = -8_388_608.0;
-            for s in pcm.chunks_exact_mut(3) {
+            const PLEINE_ECHELLE: f64 = 8_388_608.0;
+            for (i, s) in pcm.chunks_exact_mut(3).enumerate() {
                 // Sign-extend the 24-bit little-endian sample into an i32.
                 let raw = ((s[2] as i32) << 24 | (s[1] as i32) << 16 | (s[0] as i32) << 8) >> 8;
-                let v = (raw as f64 * factor).clamp(MIN, MAX) as i32;
+                let ideal = raw as f64 * factor;
+                if ideal > MAX {
+                    compteur.noter_ecrete(base + i as u64, ideal - MAX, ideal / PLEINE_ECHELLE);
+                } else if ideal < MIN {
+                    compteur.noter_ecrete(base + i as u64, MIN - ideal, -ideal / PLEINE_ECHELLE);
+                }
+                let v = ideal.clamp(MIN, MAX) as i32;
                 s[0] = (v & 0xFF) as u8;
                 s[1] = ((v >> 8) & 0xFF) as u8;
                 s[2] = ((v >> 16) & 0xFF) as u8;
             }
+            compteur.noter_vus((pcm.len() / 3) as u64);
         }
         32 => {
-            for s in pcm.chunks_exact_mut(4) {
+            const MAX: f64 = i32::MAX as f64;
+            const MIN: f64 = i32::MIN as f64;
+            const PLEINE_ECHELLE: f64 = 2_147_483_648.0;
+            for (i, s) in pcm.chunks_exact_mut(4).enumerate() {
                 let raw = i32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                let v = (raw as f64 * factor).clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+                let ideal = raw as f64 * factor;
+                if ideal > MAX {
+                    compteur.noter_ecrete(base + i as u64, ideal - MAX, ideal / PLEINE_ECHELLE);
+                } else if ideal < MIN {
+                    compteur.noter_ecrete(base + i as u64, MIN - ideal, -ideal / PLEINE_ECHELLE);
+                }
+                let v = ideal.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
                 s.copy_from_slice(&v.to_le_bytes());
             }
+            compteur.noter_vus((pcm.len() / 4) as u64);
         }
         // 8-bit and anything exotic: leave the audio strictly alone rather
         // than guess at its encoding.
         _ => {}
+    }
+}
+
+/// Le ReplayGain d'UNE piste, avec son compteur d'écrêtage (#2218, T9 A).
+///
+/// C'est ce qu'un porteur DSP devrait tenir à la place d'un `f64` nu : il
+/// sait où la piste commence (sa construction) et où elle finit (sa
+/// destruction), donc il peut dire `dsp_ecretage` UNE fois au premier
+/// écrêtage et UNE fois à la fin avec le total — jamais par bloc. Les
+/// échantillons sortent de [`apply_gain_pcm_compte`], à l'octet près ceux de
+/// [`apply_gain_pcm`]. Le bras progressif (`StreamingDsp.replaygain:
+/// Option<f64>`, `orchestrator.rs`) ne le porte pas encore : c'est l'écrivain
+/// de l'orchestrateur qui branche.
+pub struct GainReplay {
+    facteur: f64,
+    ecretage: CompteurDEcretage,
+    premier_dit: bool,
+    fin_dite: bool,
+}
+
+impl GainReplay {
+    /// Un facteur linéaire, tel que [`gain_factor`] le rend.
+    pub fn new(facteur: f64) -> Self {
+        Self {
+            facteur,
+            ecretage: CompteurDEcretage::default(),
+            premier_dit: false,
+            fin_dite: false,
+        }
+    }
+
+    pub fn facteur(&self) -> f64 {
+        self.facteur
+    }
+
+    /// Le compteur de la piste, tel qu'il est.
+    pub fn ecretage(&self) -> CompteurDEcretage {
+        self.ecretage
+    }
+
+    /// Un bloc de la piste, en place. Compte, et dit le premier écrêtage
+    /// UNE fois — après le bloc, jamais dans la boucle d'échantillons.
+    pub fn process(&mut self, pcm: &mut [u8], bit_depth: u16) {
+        let avant = self.ecretage;
+        apply_gain_pcm_compte(pcm, bit_depth, self.facteur, &mut self.ecretage);
+        crate::audio::ecretage::REGISTRE
+            .replaygain
+            .absorber(&avant, &self.ecretage);
+        if !self.premier_dit && self.ecretage.echantillons_ecretes > 0 {
+            self.premier_dit = true;
+            crate::audio::ecretage::dire_premier(
+                crate::audio::ecretage::EtageEcretant::ReplayGain,
+                crate::audio::ecretage::Portee::Piste,
+                &self.ecretage,
+            );
+        }
+    }
+}
+
+impl Drop for GainReplay {
+    fn drop(&mut self) {
+        if self.fin_dite {
+            return;
+        }
+        self.fin_dite = true;
+        if self.ecretage.echantillons_ecretes > 0 {
+            crate::audio::ecretage::REGISTRE.replaygain.piste_close();
+        }
+        crate::audio::ecretage::dire_fin(
+            crate::audio::ecretage::EtageEcretant::ReplayGain,
+            crate::audio::ecretage::Portee::Piste,
+            &self.ecretage,
+        );
     }
 }
 

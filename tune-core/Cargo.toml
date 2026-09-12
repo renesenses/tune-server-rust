@@ -373,6 +373,13 @@ path = "tests/temoin_resolution_locale.rs"
 name = "marge_et_crete_2218"
 path = "tests/marge_et_crete_2218.rs"
 
+# #2218 (suite de T9) — l'écrêtage est COMPTÉ et DIT, sans changer un
+# échantillon : compteurs, lignes `dsp_ecretage`, empreintes FNV des octets de
+# sortie relevées AVANT le comptage. Aucune caractéristique requise.
+[[test]]
+name = "ecretage_compte_2218"
+path = "tests/ecretage_compte_2218.rs"
+
 # #2060 / #3522 — une balise « Track N » ne doit pas voler la place du nom de
 # fichier. `autotests = false` plus haut : sans cette cible, le fichier ne
 # serait jamais compilé.

@@ -21,6 +21,7 @@ mod dsd_ordre_canaux_et_phase;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
+pub mod ecretage;
 #[cfg(feature = "audio-embedding")]
 pub mod embedding;
 /// READ side of audio embeddings (storage + cosine) — always compiled, no ort.
