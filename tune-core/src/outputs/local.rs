@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use super::traits::{
     AudioSpec, BlocPcm, FormatOuvert, OutputCapabilities, OutputDspMetrics, OutputRingStarvation,
     OutputSignalPathStatus, OutputStatus, OutputTarget, PuitsDEchantillons, RingStarvation,
-    TransportState,
+    TransformationsReelles, TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -3305,7 +3305,10 @@ struct EtageDeConversion<'a> {
 }
 
 /// Ce qu'une poussée vers le puits a produit.
-enum PousseeVersLePuits {
+///
+/// REF-7 (#2219) : `pub(super)`, parce que c'est le verdict que rend
+/// [`Etage::pousser`] et que les étages des bras Windows le rendent aussi.
+pub(super) enum PousseeVersLePuits {
     /// Rien d'aligné à décoder pour l'instant : il faut lire davantage.
     RienAPousser,
     /// Bloc poussé, `trames_source` trames consommées à l'entrée.
@@ -3367,6 +3370,40 @@ impl EtageDeConversion<'_> {
         mots
     }
 
+    /// Le DSP touche-t-il les échantillons de cette piste ? La MÊME décision
+    /// qu'`apply_local_dsp`, lue au lieu d'être appliquée : rien sous DoP ni
+    /// en contournement pur ; sinon un égaliseur, un convolveur, un crossfeed
+    /// (stéréo seulement) ou le repli mono (stéréo seulement) posés.
+    fn dsp_actif(&self) -> bool {
+        fn pose<T>(m: &std::sync::Mutex<Option<T>>) -> bool {
+            m.lock().map(|g| g.is_some()).unwrap_or(false)
+        }
+        if self.pcm.dop_active.load(Ordering::Relaxed)
+            || self.pcm.pure_bypass.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        let stereo = self.spec.canaux() == 2;
+        pose(self.pcm.eq)
+            || pose(self.pcm.convolver)
+            || (stereo && pose(self.pcm.crossfeed))
+            || (stereo && self.pcm.mono_downmix.load(Ordering::Relaxed))
+    }
+}
+
+/// L'étage FLOTTANT : celui du chemin DSP, dont le puits range des `f32`.
+impl Etage for EtageDeConversion<'_> {
+    type Puits<'p> = dyn PuitsDEchantillons + 'p;
+    type Bloc = ProcessedLocalPcm;
+
+    fn recevoir(&mut self, octets: &[u8]) {
+        self.en_attente.extend_from_slice(octets);
+    }
+
+    fn cadence_source(&self) -> u32 {
+        self.sample_rate()
+    }
+
     /// Le geste élémentaire du producteur : décoder, refuser un porteur DoP,
     /// convertir, écrire dans le puits.
     ///
@@ -3375,7 +3412,7 @@ impl EtageDeConversion<'_> {
     /// PCM source et non sur ce qui sort du sinc.
     fn pousser(
         &mut self,
-        puits: &mut dyn PuitsDEchantillons,
+        puits: &mut (dyn PuitsDEchantillons + '_),
         refuser_le_porteur_dop: &mut dyn FnMut(bool, u32, u16) -> bool,
         observer: &mut dyn FnMut(&ProcessedLocalPcm),
     ) -> PousseeVersLePuits {
@@ -3395,21 +3432,132 @@ impl EtageDeConversion<'_> {
         }
     }
 
-    /// Rend la queue du DSP et du rééchantillonneur au puits, au format de la
-    /// piste qui se TERMINE. Utilisé à une frontière gapless qui change de
-    /// format : sans ça, la queue du convolveur partirait au DAC convertie
-    /// avec les paramètres du morceau suivant.
-    fn rendre_la_queue_du_dsp(
-        &mut self,
-        puits: &mut dyn PuitsDEchantillons,
-        queue: Vec<f32>,
-    ) -> bool {
+    /// Rend la queue du DSP au puits, au format de la piste qui se TERMINE —
+    /// celui que `self.spec` porte encore à l'instant de l'appel. Utilisé à
+    /// une frontière gapless qui change de format et à la fin de la chaîne :
+    /// sans ça, la queue du convolveur partirait au DAC convertie avec les
+    /// paramètres du morceau suivant, ou pas du tout.
+    ///
+    /// REF-7 (#2219) : la queue est tirée ICI, par l'étage, qui tient déjà les
+    /// références du DSP — `play_url` la lui passait toute faite, et c'était
+    /// la même ligne recopiée à deux endroits, avec les mêmes arguments.
+    fn rendre_la_queue_du_dsp(&mut self, puits: &mut (dyn PuitsDEchantillons + '_)) -> bool {
+        let queue = flush_local_dsp(
+            self.pcm.convolver,
+            self.pcm.crossfeed,
+            self.pcm.pure_bypass,
+            self.pcm.mono_downmix,
+            self.spec.canaux(),
+            self.pcm.dop_active.load(Ordering::Relaxed),
+        );
+        // La queue est d'abord un bloc normal : elle traverse la MÊME
+        // conversion que l'audio qui la précède. `flush = true` ignore son
+        // argument `samples` et la jetterait.
         if queue.is_empty() {
             return true;
         }
         let mots = self.convertir(queue);
         puits.ecrire(&mots)
     }
+
+    /// Vide le rééchantillonneur : le reliquat plus le délai interne du sinc.
+    /// C'est à l'appelant de décider QUAND — fin de chaîne, ou frontière
+    /// gapless qui change de cadence ; à cadence identique le rééchantillonneur
+    /// fait partie du flux continu et ne se vide pas.
+    fn vider(&mut self, puits: &mut (dyn PuitsDEchantillons + '_)) -> bool {
+        let flushed = rubato_resample_chunk(
+            &mut self.resampler,
+            &[],
+            self.sortie.canaux,
+            true,
+            &mut self.resample_leftover,
+        );
+        if flushed.is_empty() {
+            return true;
+        }
+        puits.ecrire(&flushed)
+    }
+
+    fn transformations(&self) -> TransformationsReelles {
+        TransformationsReelles::nouvelles(self.spec, self.sortie, self.dsp_actif())
+    }
+}
+
+/// Un bloc que l'étage vient de décoder, tel que la boucle producteur le
+/// regarde : elle ne connaît ni `f32` ni `i32`, elle demande seulement s'il y
+/// a quelque chose dedans et si c'est du silence — c'est tout ce que son
+/// diagnostic `local_audio_first_samples_all_zero` a besoin de savoir.
+pub(super) trait BlocDecode {
+    fn nb_echantillons(&self) -> usize;
+    fn contient_un_echantillon_non_nul(&self) -> bool;
+}
+
+impl BlocDecode for ProcessedLocalPcm {
+    fn nb_echantillons(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn contient_un_echantillon_non_nul(&self) -> bool {
+        self.samples.iter().any(|&s| s != 0.0)
+    }
+}
+
+/// REF-7 (#2219) — l'ÉTAGE, ce qui sépare les octets de la source du puits.
+///
+/// [`BoucleProducteur::tourner`] est générique sur ce trait et ne sait rien du
+/// mot que le puits range : l'étage flottant ([`EtageDeConversion`]) décode
+/// vers des `f32` et son puits est un [`PuitsDEchantillons`] ; l'étage des
+/// bras Windows décode vers des mots natifs et son puits est un
+/// [`super::traits::PuitsNatif`]. C'est le type associé `Puits` qui le dit,
+/// et c'est lui qui rend la boucle indifférente à la route — sans un `match`
+/// par bloc sur un puits qui n'est jamais de l'autre sorte.
+///
+/// Un étage sait QUATRE choses, et c'est tout ce que la boucle lui demande :
+/// recevoir des octets source, les décoder et les pousser vers SON puits
+/// (la garde DoP y est appelée AVANT la conversion, #3233), rendre la queue
+/// de son DSP, vider son rééchantillonneur. Et une cinquième pour l'écran :
+/// dire ce qu'il fait réellement au signal (REF-6b, #3987).
+///
+/// Déclaré APRÈS son premier implémenteur, et ce n'est pas un hasard : les
+/// gardes de texte (`garde_de_site_porteur_dop_3233`, `dsp_track_boundary`)
+/// coupent au PREMIER `fn pousser(` du fichier et doivent tomber sur le corps
+/// réel, pas sur une signature sans corps.
+pub(super) trait Etage {
+    /// Le puits que cet étage alimente — `dyn PuitsDEchantillons + 'p` pour
+    /// le chemin flottant, `dyn PuitsNatif + 'p` pour le chemin natif.
+    ///
+    /// `'p` est la durée de vie de l'objet : le puits d'un backend emprunte
+    /// les témoins d'arrêt de `play_url` (`Puits<'a>`, #4009) et n'est donc
+    /// jamais `'static` — un `type Puits = dyn …` sans durée de vie le serait,
+    /// et forcerait tous les témoins à l'être aussi.
+    type Puits<'p>: ?Sized;
+    /// Le bloc décodé, tel que l'observateur d'amorçage le voit.
+    type Bloc: BlocDecode;
+
+    /// Range des octets SOURCE reçus de l'amont, pas encore alignés.
+    fn recevoir(&mut self, octets: &[u8]);
+
+    /// Cadence de la SOURCE, en hertz : c'est elle qui convertit les trames
+    /// servies en position.
+    fn cadence_source(&self) -> u32;
+
+    /// Décode ce qui est aligné, refuse un porteur DoP, convertit, écrit.
+    fn pousser(
+        &mut self,
+        puits: &mut Self::Puits<'_>,
+        refuser_le_porteur_dop: &mut dyn FnMut(bool, u32, u16) -> bool,
+        observer: &mut dyn FnMut(&Self::Bloc),
+    ) -> PousseeVersLePuits;
+
+    /// Rend la queue du DSP au puits, au format de la piste qui se termine.
+    /// Rend `false` uniquement quand le puits a cessé de consommer.
+    fn rendre_la_queue_du_dsp(&mut self, puits: &mut Self::Puits<'_>) -> bool;
+
+    /// Vide le rééchantillonneur dans le puits. Même contrat de retour.
+    fn vider(&mut self, puits: &mut Self::Puits<'_>) -> bool;
+
+    /// Ce que cet étage fait RÉELLEMENT au signal, à cet instant.
+    fn transformations(&self) -> TransformationsReelles;
 }
 
 /// Ce qui distingue la boucle de la piste initiale de celle d'une piste
@@ -3482,13 +3630,17 @@ impl BoucleProducteur<'_> {
     /// `apres_ecriture` est appelé après chaque bloc réellement poussé : c'est
     /// par là que la piste initiale démarre le flux cpal une fois le
     /// pré-remplissage atteint. Il rend `false` pour demander l'abandon du fil.
+    ///
+    /// REF-7 (#2219) : générique sur l'[`Etage`]. La boucle ne sait pas si le
+    /// puits range des `f32` ou des mots natifs — elle reçoit, pousse, compte
+    /// et publie la position ; tout ce qui touche au mot est dans l'étage.
     #[allow(clippy::too_many_arguments)]
-    fn tourner(
+    fn tourner<E: Etage>(
         &self,
         amont: &mut dyn std::io::Read,
         tampon_de_lecture: &mut [u8],
-        etage: &mut EtageDeConversion,
-        puits: &mut dyn PuitsDEchantillons,
+        etage: &mut E,
+        puits: &mut E::Puits<'_>,
         refuser_le_porteur_dop: &mut dyn FnMut(bool, u32, u16) -> bool,
         compteurs: &mut CompteursDePiste,
         apres_ecriture: &mut dyn FnMut(&CompteursDePiste) -> bool,
@@ -3616,13 +3768,9 @@ impl BoucleProducteur<'_> {
                     continue;
                 }
                 compteurs.skipped_bytes = compteurs.skip_bytes;
-                etage
-                    .en_attente
-                    .extend_from_slice(&tampon_de_lecture[reste_a_jeter..lus]);
+                etage.recevoir(&tampon_de_lecture[reste_a_jeter..lus]);
             } else {
-                etage
-                    .en_attente
-                    .extend_from_slice(&tampon_de_lecture[..lus]);
+                etage.recevoir(&tampon_de_lecture[..lus]);
             }
 
             let premiere_donnee = compteurs.premiere_donnee_journalisee;
@@ -3631,10 +3779,10 @@ impl BoucleProducteur<'_> {
                 // Silence total au démarrage : le signe d'un décodage qui a
                 // échoué. Diagnostic de la piste initiale seule, comme avant.
                 if initiale && (!premiere_donnee || trames_deja_servies == 0) {
-                    let non_nul = bloc.samples.iter().any(|&s| s != 0.0);
-                    if !non_nul && !bloc.samples.is_empty() {
+                    let non_nul = bloc.contient_un_echantillon_non_nul();
+                    if !non_nul && bloc.nb_echantillons() != 0 {
                         warn!(
-                            sample_count = bloc.samples.len(),
+                            sample_count = bloc.nb_echantillons(),
                             "local_audio_first_samples_all_zero"
                         );
                     }
@@ -3680,8 +3828,8 @@ impl BoucleProducteur<'_> {
                 return FinDeBoucle::Abandon;
             }
 
-            let position = (compteurs.total_frames_fed as f64 / etage.sample_rate() as f64 * 1000.0)
-                as u64
+            let position = (compteurs.total_frames_fed as f64 / etage.cadence_source() as f64
+                * 1000.0) as u64
                 + compteurs.seek_offset;
             self.position_ms.store(position, Ordering::Relaxed);
         }
@@ -5279,18 +5427,10 @@ impl OutputTarget for LocalOutput {
                 //
                 // `etage` porte encore le format de la piste QUI SE TERMINE —
                 // il n'est mis à jour que plus bas : `rendre_la_queue_du_dsp`
-                // applique donc exactement l'adaptation et le rééchantillonnage
-                // de cette piste-là, comme les quatre lignes qu'il remplace.
+                // tire la queue avec les canaux de cette piste-là et lui
+                // applique exactement son adaptation et son rééchantillonnage.
                 if convolver_format_changed {
-                    let queue = flush_local_dsp(
-                        &convolver,
-                        &crossfeed,
-                        &pure_bypass,
-                        &mono_downmix,
-                        prev_ch,
-                        dop_active.load(Ordering::Relaxed),
-                    );
-                    etage.rendre_la_queue_du_dsp(&mut *puits, queue);
+                    etage.rendre_la_queue_du_dsp(&mut *puits);
                 }
 
                 // À cadence source identique, le resampler fait partie du flux
@@ -5301,16 +5441,7 @@ impl OutputTarget for LocalOutput {
                 // faire dès qu'un `next_media` existe insérait du silence même
                 // quand la requête suivante échouait.
                 if prev_needs_resample && (new_sr != prev_sr || !next_needs_resample) {
-                    let flushed = rubato_resample_chunk(
-                        &mut etage.resampler,
-                        &[],
-                        output_ch,
-                        true,
-                        &mut etage.resample_leftover,
-                    );
-                    if !flushed.is_empty() {
-                        puits.ecrire(&flushed);
-                    }
+                    etage.vider(&mut *puits);
                 }
 
                 // Update source format variables for the new track.
@@ -5557,18 +5688,7 @@ impl OutputTarget for LocalOutput {
                 && !force_silent.load(Ordering::Relaxed)
                 && !device_gone.load(Ordering::Relaxed)
             {
-                let queue = flush_local_dsp(
-                    &convolver,
-                    &crossfeed,
-                    &pure_bypass,
-                    &mono_downmix,
-                    etage.channels(),
-                    dop_active.load(Ordering::Relaxed),
-                );
-                // La queue est d'abord un bloc normal : elle traverse la MÊME
-                // conversion que l'audio qui la précède. `flush = true` ignore
-                // son argument `samples` et la jetterait.
-                etage.rendre_la_queue_du_dsp(&mut *puits, queue);
+                etage.rendre_la_queue_du_dsp(&mut *puits);
             }
 
             // Flush the resampler: process any leftover frames + drain internal delay
@@ -5577,16 +5697,7 @@ impl OutputTarget for LocalOutput {
                 && !force_silent.load(Ordering::Relaxed)
                 && !device_gone.load(Ordering::Relaxed)
             {
-                let flushed = rubato_resample_chunk(
-                    &mut etage.resampler,
-                    &[],
-                    output_ch,
-                    true,
-                    &mut etage.resample_leftover,
-                );
-                if !flushed.is_empty() {
-                    puits.ecrire(&flushed);
-                }
+                etage.vider(&mut *puits);
             }
 
             // Wait for the ring buffer to drain (real playback) before signalling

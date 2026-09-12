@@ -196,7 +196,7 @@ fn le_vidage_de_l_anneau_coreaudio_exclusif_reste_borne() {
 #[test]
 fn le_chemin_partage_et_son_enchainement_rapportent_aussi_leur_blocage() {
     let boucle = LOCAL
-        .split("    fn tourner(")
+        .split("    fn tourner<E: Etage>(")
         .nth(1)
         .and_then(|s| s.split("\n#[async_trait::async_trait]").next())
         .expect("la boucle producteur commune doit rester identifiable (#3108)");
