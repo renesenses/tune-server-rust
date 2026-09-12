@@ -1677,6 +1677,88 @@ impl PuitsNatif for CaptureOutputNatif {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// REF-6b de #2219 — ce que la sortie a RÉELLEMENT fait au signal.
+//
+// Le chemin du signal affiché (`tune-server`, `signal_path.rs`) PRÉDIT les
+// transformations depuis les réglages de zone : plafond de cadence, égaliseur
+// armé, repli mono. Chaque règle y est un miroir de l'orchestrateur, et chaque
+// miroir prend du retard. Ce type est l'autre bout : la sortie déclare ce
+// qu'elle a fait, et le consommateur préfère cette déclaration à sa
+// déduction quand elle existe.
+//
+// Il réunit deux types qui existent déjà et ne se doublent pas : [`AudioSpec`]
+// (ce qui est ENTRÉ dans la sortie : cadence, profondeur, canaux) et
+// [`FormatOuvert`] (ce que le périphérique a OUVERT : cadence, canaux). Les
+// deux écarts qui en découlent — rééchantillonnage, adaptation de canaux —
+// sont DÉDUITS de ces deux formats, jamais rangés à part : une déclaration
+// « pas de rééchantillonnage » entre 44,1 et 48 kHz ne peut pas exister.
+// Seul le DSP est déclaré, parce qu'aucun format ne le trahit.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Les transformations qu'une sortie a **réellement** appliquées au flux en
+/// cours, telles qu'elle les observe elle-même.
+///
+/// Rendu par [`OutputTarget::transformations_reelles`] ; `None` par défaut,
+/// donc une sortie qui ne sait pas encore les dire ne change rien à
+/// l'affichage. Côté consommateur, `resampling_active` et le verdict
+/// bit-perfect en découlent quand elles sont présentes.
+///
+/// Les champs sont privés : les deux écarts se lisent, ils ne se posent pas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransformationsReelles {
+    entree: AudioSpec,
+    ouvert: FormatOuvert,
+    dsp_actif: bool,
+}
+
+impl TransformationsReelles {
+    /// L'unique constructeur. `entree` ne peut être qu'un [`AudioSpec`]
+    /// valide — c'est son constructeur qui refuse le zéro canal, et il n'y a
+    /// aucun autre chemin jusqu'ici.
+    #[must_use]
+    pub const fn nouvelles(entree: AudioSpec, ouvert: FormatOuvert, dsp_actif: bool) -> Self {
+        Self {
+            entree,
+            ouvert,
+            dsp_actif,
+        }
+    }
+
+    /// Le format entré dans la sortie.
+    #[must_use]
+    pub const fn entree(&self) -> AudioSpec {
+        self.entree
+    }
+
+    /// Le format que le périphérique a ouvert.
+    #[must_use]
+    pub const fn ouvert(&self) -> FormatOuvert {
+        self.ouvert
+    }
+
+    /// La sortie a-t-elle changé la cadence ? Vrai dès que le périphérique
+    /// n'a pas ouvert la cadence entrée.
+    #[must_use]
+    pub const fn reechantillonnage(&self) -> bool {
+        self.entree.cadence() != self.ouvert.cadence
+    }
+
+    /// Un traitement du signal (égaliseur, convolution, crossfeed…) a-t-il
+    /// touché les échantillons ?
+    #[must_use]
+    pub const fn dsp_actif(&self) -> bool {
+        self.dsp_actif
+    }
+
+    /// La sortie a-t-elle changé le nombre de canaux ? Vrai dès que le
+    /// périphérique n'a pas ouvert le nombre de canaux entré.
+    #[must_use]
+    pub const fn adaptation_canaux(&self) -> bool {
+        self.entree.canaux() != self.ouvert.canaux
+    }
+}
+
 #[async_trait::async_trait]
 pub trait OutputTarget: Send + Sync {
     fn name(&self) -> &str;
@@ -1873,6 +1955,17 @@ pub trait OutputTarget: Send + Sync {
     /// affamer. Défaut `None`, donc une sortie hors-arbre existante compile et
     /// se comporte exactement comme avant.
     fn ring_starvation(&self) -> Option<OutputRingStarvation> {
+        None
+    }
+
+    /// Les transformations que cette sortie a RÉELLEMENT appliquées au flux
+    /// en cours (REF-6b, #2219), ou `None` quand elle ne sait pas les dire.
+    /// Défaut `None` : une sortie existante compile et s'affiche exactement
+    /// comme avant, le chemin du signal garde alors sa déduction depuis les
+    /// réglages. Même contrat additif que [`Self::signal_path_status`] et
+    /// [`Self::dsp_metrics`] — et pour la même raison, PAS un champ de
+    /// [`OutputStatus`], que treize sorties construisent par littéral.
+    fn transformations_reelles(&self) -> Option<TransformationsReelles> {
         None
     }
 }

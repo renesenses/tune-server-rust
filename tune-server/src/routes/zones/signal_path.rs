@@ -416,6 +416,11 @@ pub(super) fn build_signal_path(
         .then(|| ps.output_signal_path.as_ref())
         .flatten();
 
+    // REF-6b (#2219) : ce que la sortie déclare avoir RÉELLEMENT fait au
+    // flux. Aucune condition sur le type de sortie : seule une sortie qui a
+    // mesuré le publie, et `None` laisse chaque verdict à sa déduction.
+    let transformations_reelles = ps.transformations_reelles.as_ref();
+
     let traitements = relever_les_traitements(backend, zone, np, output_type, runtime_signal_path);
     let forcages = decider_les_forcages(
         zone,
@@ -432,7 +437,14 @@ pub(super) fn build_signal_path(
         &source,
         &forcages,
     );
-    let verdicts = rendre_les_verdicts(np, &source, transport_bit_perfect, &forcages, &traitements);
+    let verdicts = rendre_les_verdicts(
+        np,
+        &source,
+        transport_bit_perfect,
+        &forcages,
+        &traitements,
+        transformations_reelles,
+    );
 
     let analyse = Analyse {
         source,
@@ -440,6 +452,7 @@ pub(super) fn build_signal_path(
         forcages,
         transport: (transport_bit_perfect, transport_desc, output_format_name),
         verdicts,
+        transformations_reelles,
     };
     let bit_perfect = analyse.verdicts.bit_perfect;
     let is_lossless = analyse.source.is_lossless;
@@ -476,6 +489,8 @@ struct Analyse<'a> {
     /// (bit-perfect, libellé du transport, format émis).
     transport: (bool, &'a str, &'static str),
     verdicts: Verdicts,
+    /// Ce que la sortie a réellement fait (REF-6b) ; `None` = non publié.
+    transformations_reelles: Option<&'a TransformationsReelles>,
 }
 
 /// Les étapes affichées, le résumé et les métriques DSP.
@@ -533,6 +548,7 @@ fn assembler_les_etapes(
         bit_perfect,
         bitrate_label,
     } = analyse.verdicts;
+    let reel = analyse.transformations_reelles;
     let source_desc = if is_dsd {
         // DSD rates are in MHz range — display as e.g. "DSD64 2.8 MHz" or "DSD128 5.6 MHz"
         dsd_resolution_label(sample_rate)
@@ -621,8 +637,18 @@ fn assembler_les_etapes(
         }));
     }
 
-    // Resampler step (when the effective max_sample_rate caps the output)
-    if let Some(max_sr) = max_sample_rate.filter(|_| resampling_active) {
+    // Resampler step. MESURÉ d'abord (REF-6b) : la sortie a dit ce qu'elle a
+    // ouvert, et c'est cet écart-là qui est nommé, pas le plafond réglé.
+    // Sans déclaration, la règle historique : le plafond effectif de cadence.
+    if let Some(t) = reel.filter(|t| t.reechantillonnage()) {
+        let src_khz = t.entree().cadence() / 1000;
+        let dst_khz = t.ouvert().cadence / 1000;
+        steps.push(json!({
+            "name": "Resampler",
+            "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz (mesuré)"),
+            "bit_perfect": false,
+        }));
+    } else if let Some(max_sr) = max_sample_rate.filter(|_| resampling_active) {
         let src_khz = sample_rate / 1000;
         let dst_khz = max_sr / 1000;
         steps.push(json!({
@@ -709,6 +735,18 @@ fn assembler_les_etapes(
                 "metrics": dsp_metrics.clone(),
             }));
         }
+    } else if reel.is_some_and(|t| t.dsp_actif()) {
+        // MESURÉ (REF-6b) : la sortie déclare avoir touché les échantillons.
+        // Prime sur toute déduction depuis les réglages, contournement DSD
+        // compris — si le DSP a tourné, il n'a pas été contourné.
+        steps.push(json!({
+            "name": "DSP",
+            "description": format!(
+                "{} (mesuré)",
+                eq_step_description.as_deref().unwrap_or("DSP appliqué")
+            ),
+            "bit_perfect": false,
+        }));
     } else if dsp_contourne_par_le_dsd {
         // DIRE le contournement plutôt que de le taire. L'auditeur a un
         // égaliseur ARMÉ et n'entend rien changer : c'est exactement ce qu'Eric
@@ -747,6 +785,22 @@ fn assembler_les_etapes(
         steps.push(json!({
             "name": "Mono",
             "description": desc,
+            "bit_perfect": false,
+        }));
+    }
+
+    // Adaptation de canaux MESURÉE (REF-6b) : le périphérique n'a pas ouvert
+    // le nombre de canaux entré (une stéréo sur une carte 8 voies, un mono
+    // dédoublé). Rien ne la prédit depuis les réglages : sans déclaration,
+    // pas d'étape — comme avant.
+    if let Some(t) = reel.filter(|t| t.adaptation_canaux()) {
+        steps.push(json!({
+            "name": "Canaux",
+            "description": format!(
+                "{} \u{2192} {} canaux (mesuré)",
+                t.entree().canaux(),
+                t.ouvert().canaux
+            ),
             "bit_perfect": false,
         }));
     }
@@ -800,6 +854,7 @@ fn rendre_les_verdicts(
     transport_bit_perfect: bool,
     forcages: &Forcages,
     traitements: &Traitements,
+    transformations_reelles: Option<&TransformationsReelles>,
 ) -> Verdicts {
     let Source {
         is_dsd,
@@ -817,10 +872,26 @@ fn rendre_les_verdicts(
     // Sur le plafond EFFECTIF (`Forcages::max_sample_rate`, zone et catalogue
     // combinés), pas sur le seul réglage de zone : c'est celui que
     // `resolve_local_track` applique (#3183).
-    let resampling_active = !is_dsd
-        && forcages
-            .max_sample_rate
-            .is_some_and(|max| (sample_rate as u32) > max);
+    //
+    // REF-6b (#2219) : quand la sortie a publié ce qu'elle a réellement
+    // ouvert, c'est ELLE qui dit s'il y a eu rééchantillonnage — dans les
+    // deux sens. Le plafond n'est plus qu'une prédiction, utile seulement
+    // tant que personne n'a mesuré.
+    let resampling_active = match transformations_reelles {
+        Some(reel) => reel.reechantillonnage(),
+        None => {
+            !is_dsd
+                && forcages
+                    .max_sample_rate
+                    .is_some_and(|max| (sample_rate as u32) > max)
+        }
+    };
+    // Un DSP ou une adaptation de canaux DÉCLARÉS par la sortie font tomber
+    // le verdict, quoi que les réglages aient prédit ; leur absence ne le
+    // relève jamais — la sortie n'observe pas ce que fait l'orchestrateur
+    // en amont (ReplayGain, repli mono, transcodage).
+    let transformation_reelle_declaree =
+        transformations_reelles.is_some_and(|reel| reel.dsp_actif() || reel.adaptation_canaux());
 
     // Overall bit-perfect: lossless source + no transcoding + no DSP + no
     // resampling + no ReplayGain. Volume is excluded — it's a user preference,
@@ -838,6 +909,7 @@ fn rendre_les_verdicts(
         && transport_bit_perfect
         && !dsp_applique
         && !resampling_active
+        && !transformation_reelle_declaree
         && replaygain_step.is_none()
         && mono_downmix_step.is_none();
 

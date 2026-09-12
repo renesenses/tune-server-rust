@@ -16,6 +16,7 @@ use tune_core::http::streamer::StreamInfo;
 use tune_core::outputs::dlna::DlnaOutput;
 use tune_core::outputs::traits::{
     OutputDspState, OutputSignalPathStatus, OutputSignalReason, OutputVolumeState,
+    TransformationsReelles,
 };
 use tune_core::playback::{PlayState, ZoneState};
 

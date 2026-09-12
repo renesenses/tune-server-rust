@@ -27,7 +27,7 @@ use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
 use crate::outputs::traits::{
     OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    TransportState,
+    TransformationsReelles, TransportState,
 };
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 
@@ -71,6 +71,7 @@ async fn get_status_with_signal_path_bounded(
         Option<OutputSignalPathStatus>,
         Option<OutputDspMetrics>,
         Option<OutputRingStarvation>,
+        Option<TransformationsReelles>,
     ),
     String,
 > {
@@ -82,6 +83,9 @@ async fn get_status_with_signal_path_bounded(
             output.signal_path_status(),
             output.dsp_metrics(),
             output.ring_starvation(),
+            // Même verrou, même tick (REF-6b, #2219) : ce que la sortie a
+            // réellement fait au flux se relève à côté de sa sonde.
+            output.transformations_reelles(),
         ))
     };
     match timeout {
