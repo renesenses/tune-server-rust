@@ -25,6 +25,9 @@ use crate::db::settings_repo::SettingsRepo;
 /// Réglage global par défaut : le mode PURE impose-t-il le volume à 100 % ?
 pub const SETTING_LOCK_VOLUME: &str = "audiophile_lock_volume";
 
+/// Réglage global : interdire tout rééchantillonnage pour garantir le bit-perfect strict
+pub const SETTING_STRICT_BITPERFECT: &str = "audiophile_strict_bitperfect";
+
 /// La zone est-elle en mode PURE (audiophile) ?
 ///
 /// Valeur stockée sous forme d'objet JSON `{"enabled": true}` — un réglage
@@ -91,6 +94,54 @@ pub fn effective_volume(db: &Arc<dyn DbBackend>, zone_id: i64, requested: f64) -
     }
     requested.clamp(0.0, 1.0)
 }
+
+/// Le mode Bit-Perfect Strict global est-il actif ?
+pub fn global_strict_bitperfect_enabled(db: &Arc<dyn DbBackend>) -> bool {
+    SettingsRepo::with_backend(db.clone())
+        .get(SETTING_STRICT_BITPERFECT)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+}
+
+/// Surcharge du bit-perfect strict propre a une zone.
+pub fn strict_bitperfect_override(db: &Arc<dyn DbBackend>, zone_id: i64) -> Option<bool> {
+    SettingsRepo::with_backend(db.clone())
+        .get(&format!("zone_{zone_id}_audiophile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("strict_bitperfect").and_then(|e| e.as_bool()))
+}
+
+/// Indique si la zone impose un bit-perfect strict sans aucun reechantillonnage.
+pub fn strict_bitperfect_enabled(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
+    zone_enabled(db, zone_id)
+        && strict_bitperfect_override(db, zone_id)
+            .unwrap_or_else(|| global_strict_bitperfect_enabled(db))
+}
+
+/// Valide si une frequence d'echantillonnage peut etre diffusee en bit-perfect pur.
+/// Renvoie une erreur explicite si le mode strict est actif et que la frequence n'est pas nativement supportee.
+pub fn validate_bitperfect_sample_rate(
+    zone_id: i64,
+    requested_sr: u32,
+    supported_rates: &[u32],
+    is_strict: bool,
+) -> Result<(), String> {
+    if !is_strict || supported_rates.is_empty() {
+        return Ok(());
+    }
+    if supported_rates.contains(&requested_sr) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Bit-perfect strict viole sur la zone {zone_id} : le materiel ne supporte pas {requested_sr} Hz nativement (taux supportes : {supported_rates:?})"
+        ))
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -234,5 +285,29 @@ mod tests {
         let db = mem_db();
         assert_eq!(effective_volume(&db, 1, 1.8), 1.0);
         assert_eq!(effective_volume(&db, 1, -0.5), 0.0);
+    }
+
+    #[test]
+    fn strict_bitperfect_policy_enforcement() {
+        let db = mem_db();
+        // Par defaut inactif
+        assert!(!strict_bitperfect_enabled(&db, 1));
+
+        // Active via zone override avec mode pure actif
+        set(&db, "zone_1_audiophile", r#"{"enabled":true,"strict_bitperfect":true}"#);
+        assert!(strict_bitperfect_enabled(&db, 1));
+
+        // Zone ordinaire : meme avec le flag global, ne s'active pas si pure n'est pas actif
+        set(&db, SETTING_STRICT_BITPERFECT, "true");
+        assert!(!strict_bitperfect_enabled(&db, 2));
+
+        // Validation des taux d'echantillonnage
+        let supported = vec![44100, 48000, 96000, 192000];
+        assert!(validate_bitperfect_sample_rate(1, 192000, &supported, true).is_ok());
+        assert!(validate_bitperfect_sample_rate(1, 44100, &supported, true).is_ok());
+        // 352.8 kHz non supporte en mode strict -> Erreur
+        assert!(validate_bitperfect_sample_rate(1, 352800, &supported, true).is_err());
+        // Non strict -> Toujours Ok (autorise sinc resampler)
+        assert!(validate_bitperfect_sample_rate(1, 352800, &supported, false).is_ok());
     }
 }
