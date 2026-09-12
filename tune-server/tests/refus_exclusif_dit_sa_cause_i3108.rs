@@ -145,26 +145,47 @@ fn le_vidage_de_l_anneau_coreaudio_exclusif_reste_borne() {
 
 /// Le chemin cpal partagé — celui de l'arrachage d'un DAC USB sur macOS, où le
 /// rappel d'erreur ne se déclenche jamais — et son enchaînement sans blanc
-/// doivent rapporter le même blocage. Deux sites, tous deux livrés par le même
-/// correctif, tous deux hors de portée de la CI.
+/// doivent rapporter le même blocage.
+///
+/// ⚠️ R1 (#2219) : les deux sites que ce test comptait étaient la MÊME ligne,
+/// recopiée dans deux boucles jumelles. Il n'y en a plus qu'une, dans la
+/// boucle producteur commune, et c'est elle qui sert les deux pistes. Compter
+/// les copies ne veut donc plus rien dire ; on vérifie que le site unique
+/// rapporte bien POUR LES DEUX — c'est ce que le comptage cherchait à dire.
 #[test]
 fn le_chemin_partage_et_son_enchainement_rapportent_aussi_leur_blocage() {
-    let sites = LOCAL
-        .match_indices("record_feed_stall_failure(")
-        .filter(|(i, _)| {
-            LOCAL[*i..]
+    let boucle = LOCAL
+        .split("    fn tourner(")
+        .nth(1)
+        .and_then(|s| s.split("\n#[async_trait::async_trait]").next())
+        .expect("la boucle producteur commune doit rester identifiable (#3108)");
+
+    assert!(
+        boucle.contains("record_feed_stall_failure(")
+            && boucle[boucle
+                .find("record_feed_stall_failure(")
+                .expect("site de blocage")..]
                 .chars()
                 .take(240)
                 .collect::<String>()
-                .contains("\"CPAL\"")
-        })
-        .count();
-    assert!(
-        sites >= 2,
-        "seulement {sites} site(s) cpal rapportent un blocage d'anneau : il en faut deux — la \
-         boucle de lecture principale ET l'enchaînement sans blanc, sans quoi une piste \
-         enchaînée qui meurt est aussi muette qu'une première piste (#3108)"
+                .contains("\"CPAL\""),
+        "la boucle producteur commune ne rapporte plus le blocage de l'anneau : une piste qui \
+         meurt sur un rappel de rendu mort s'arrête sans un mot (#3108)"
     );
+
+    // Et elle le rapporte pour les DEUX pistes : les deux noms d'événement
+    // vivent au même endroit, sous le rôle de la boucle. C'est ce que les deux
+    // sites d'avant garantissaient en se recopiant.
+    for evenement in [
+        "\"local_audio_stopped_feed_stall\"",
+        "\"local_audio_gapless_stopped_feed_stall\"",
+    ] {
+        assert!(
+            boucle.contains(evenement),
+            "la boucle producteur ne journalise plus {evenement} : une piste enchaînée qui \
+             meurt serait aussi muette qu'une première piste (#3108)"
+        );
+    }
 }
 
 /// Maillon 4 — un seul canal. `take_output_failure()` est décrit dans le code

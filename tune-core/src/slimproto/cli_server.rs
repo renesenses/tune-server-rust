@@ -55,11 +55,12 @@ pub async fn start_cli_server(state: Arc<CliState>) {
             }
             Err(e) => {
                 warn!(error = %e, "lms_cli_accept_error");
-                // Back off before retrying: a persistent accept() error (e.g.
-                // EMFILE / ENFILE when fd's are exhausted) returns immediately,
-                // so looping straight back would busy-spin a core and flood the
-                // log. A short sleep yields the CPU until the condition clears.
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // Le raisonnement de ce delai — EMFILE/ENFILE rendus
+                // immediatement, un coeur brule, le journal noye — vaut pour
+                // les trois autres boucles d'ecoute. Il vit desormais dans
+                // `temporisation_reseau`, en un seul endroit, plutot que
+                // recopie quatre fois. Meme valeur, meme effet (#2156).
+                crate::temporisation_reseau::temporiser_apres_erreur_reseau().await;
             }
         }
     }

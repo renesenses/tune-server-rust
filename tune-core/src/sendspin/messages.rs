@@ -41,6 +41,23 @@ pub struct EnveloppeBrute {
     pub payload: Value,
 }
 
+/// Lit le seul champ `type` d'une trame texte, sans rien décider d'autre.
+///
+/// C'est ce qui rend l'aiguillage du point d'accès HONNÊTE : Tune choisit la
+/// branche chiffrée ou la branche en clair sur ce que le pair a **demandé**,
+/// jamais sur un échec. Un JSON illisible, un JSON qui n'est pas un objet, ou
+/// un objet sans `type` rendent `None` — et `None` ne mène à aucune branche.
+///
+/// L'implémentation de référence fait exactement ça (`_peek_message_type`).
+#[must_use]
+pub fn type_du_message(texte: &str) -> Option<String> {
+    serde_json::from_str::<Value>(texte)
+        .ok()?
+        .get("type")?
+        .as_str()
+        .map(str::to_string)
+}
+
 pub const TYPE_CLIENT_INIT: &str = "client/init";
 pub const TYPE_SERVER_INIT: &str = "server/init";
 pub const TYPE_NOISE_HANDSHAKE: &str = "noise/handshake";
@@ -91,6 +108,37 @@ pub struct ServerHello {
     pub languages: Option<Vec<String>>,
 }
 
+/// `server/hello` **du mode de transition** — la variante que comprend un
+/// lecteur d'avant le chiffrement.
+///
+/// Ce n'est pas [`ServerHello`] avec un champ de plus : c'est un message
+/// **différent**, mesuré le 11/09/2026 dans `aiosendspin` 6.0.5, qui porte le
+/// même `type` mais cinq champs **tous obligatoires** — `server_id`, `name`,
+/// `version`, `active_roles`, `connection_reason`. Aucun n'a de valeur par
+/// défaut côté lecteur : en omettre un fait échouer sa désérialisation, donc
+/// expirer sa poignée de main au bout de 10 s, sans le moindre message d'erreur
+/// sur le fil.
+///
+/// Il **remplace** `server/hello` *et* `server/activate` : mesuré, `client/init`
+/// et `server/activate` n'apparaissent nulle part dans `aiosendspin` 6.0.5.
+/// Envoyer un `server/activate` à un lecteur de transition serait parler dans le
+/// vide — l'implémentation de référence ne l'envoie pas non plus.
+///
+/// `connection_reason` : l'énumération de 6.0.5 ne connaît que `discovery` et
+/// `playback` (celle du dépôt git en a quatre) et le lecteur la lit
+/// strictement. Tune n'a rien à jouer à ce stade : c'est `discovery`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerHelloHerite {
+    pub server_id: String,
+    pub name: String,
+    pub version: u32,
+    pub active_roles: Vec<String>,
+    pub connection_reason: String,
+}
+
+/// La seule raison de connexion que Tune déclare tant qu'il ne joue rien.
+pub const RAISON_CONNEXION_DECOUVERTE: &str = "discovery";
+
 /// `client/hello` — **la réponse qui fait la porte de sortie de S2-a**.
 ///
 /// C'est ici que l'enceinte dit qui elle est et ce qu'elle sait faire. La
@@ -108,6 +156,20 @@ pub struct ServerHello {
 pub struct ClientHello {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// **Uniquement sur le chemin en clair.** Une enceinte qui a mené la
+    /// poignée de main Noise n'a pas à se nommer : son identité EST sa clé
+    /// publique, et elle l'a prouvée. Un lecteur d'avant le chiffrement, lui,
+    /// écrit son `client_id` ici — c'est alors une simple **prétention**, que
+    /// rien ne vérifie.
+    ///
+    /// Mesuré le 11/09/2026 : `aiosendspin` 6.0.5 le rend obligatoire dans son
+    /// `ClientHelloPayload`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// **Uniquement sur le chemin en clair**, pour la même raison : sur le
+    /// chemin chiffré la version voyage dans `client/init`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
     /// Les rôles versionnés (`player@v1`, `metadata@v1`, …).
     #[serde(default)]
     pub supported_roles: Vec<String>,
@@ -314,6 +376,90 @@ mod tests {
         );
         assert!(texte.contains(r#""type":"server/activate""#));
         assert!(texte.contains(r#""activities":[]"#));
+    }
+
+    #[test]
+    fn le_server_hello_herite_porte_les_cinq_champs_obligatoires() {
+        // Mesure du 11/09/2026 : `ServerHelloPayload` d'aiosendspin 6.0.5 a
+        // CINQ champs sans valeur par defaut. En omettre un ne produit aucune
+        // erreur sur le fil : le lecteur echoue a desserialiser en silence et
+        // sa poignee de main expire au bout de 10 s. Ce temoin garde la forme.
+        let herite = ServerHelloHerite {
+            server_id: "un-identifiant".into(),
+            name: "Tune".into(),
+            version: 1,
+            active_roles: vec![],
+            connection_reason: RAISON_CONNEXION_DECOUVERTE.into(),
+        };
+        let texte = serde_json::to_string(&Enveloppe::nouvelle(TYPE_SERVER_HELLO, herite))
+            .expect("serialisation");
+        let v: Value = serde_json::from_str(&texte).expect("relecture");
+        assert_eq!(v["type"], serde_json::json!("server/hello"));
+        for champ in [
+            "server_id",
+            "name",
+            "version",
+            "active_roles",
+            "connection_reason",
+        ] {
+            assert!(
+                v["payload"].get(champ).is_some(),
+                "un lecteur de transition exige {champ} : {texte}"
+            );
+        }
+        // L'enumeration de 6.0.5 ne connait QUE `discovery` et `playback` ;
+        // celle du depot git en a quatre. Envoyer `management` a un lecteur
+        // publie le ferait echouer.
+        assert!(
+            matches!(
+                v["payload"]["connection_reason"].as_str(),
+                Some("discovery" | "playback")
+            ),
+            "raison hors de ce que lit un lecteur publie : {texte}"
+        );
+    }
+
+    #[test]
+    fn un_client_hello_en_clair_porte_son_identite_et_sa_version() {
+        // Sur le chemin en clair il n'y a pas eu de `client/init` : le
+        // `client_id` et la `version` arrivent DANS le hello. Sans ces deux
+        // champs declares, ils tombaient dans `reste` et le point d'acces ne
+        // savait pas a qui il parlait.
+        let brut = r#"{
+            "client_id": "lecteur-du-salon",
+            "name": "Salon",
+            "version": 1,
+            "supported_roles": ["player@v1"]
+        }"#;
+        let hello: ClientHello = serde_json::from_str(brut).expect("lecture");
+        assert_eq!(hello.client_id.as_deref(), Some("lecteur-du-salon"));
+        assert_eq!(hello.version, Some(1));
+    }
+
+    #[test]
+    fn le_type_du_message_ne_decide_que_sur_un_objet_lisible() {
+        assert_eq!(
+            type_du_message(r#"{"type":"client/hello","payload":{}}"#).as_deref(),
+            Some(TYPE_CLIENT_HELLO)
+        );
+        assert_eq!(
+            type_du_message(r#"{"type":"client/init"}"#).as_deref(),
+            Some(TYPE_CLIENT_INIT)
+        );
+        // Aucun de ces cas ne doit mener a une branche : ni la chiffree, ni la
+        // claire. `None` ferme.
+        for illisible in [
+            "ceci n'est pas du JSON",
+            "[]",
+            "\"client/hello\"",
+            "{}",
+            r#"{"type":42}"#,
+        ] {
+            assert!(
+                type_du_message(illisible).is_none(),
+                "{illisible:?} ne doit ouvrir aucune branche"
+            );
+        }
     }
 
     #[test]

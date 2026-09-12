@@ -22,6 +22,29 @@
 //! bibliothèque — la connexion s'arrête juste après `server/activate`. Le jour
 //! où S2-c y branchera de l'audio, S2-b devra avoir apporté les PSK `lt`/`pr`.
 //!
+//! ## Le mode de transition (11/09/2026)
+//!
+//! Ce point d'accès a désormais **deux entrées**, et l'aiguillage se fait sur le
+//! TYPE du premier message reçu, comme dans l'implémentation de référence :
+//!
+//! | Premier message | Ce qui se passe |
+//! |---|---|
+//! | `client/init` | poignée de main Noise — **toujours**, mode ou pas |
+//! | `client/hello` | admis **en clair** si et seulement si le mode de transition est armé |
+//! | autre chose | fermeture, sans message applicatif |
+//!
+//! Trois points sur lesquels ce fichier ne transige pas :
+//!
+//! 1. **Ce n'est pas un repli.** Il n'existe aucun chemin où un échec de la
+//!    branche chiffrée fait retomber en clair. Un pair qui envoie `client/init`
+//!    obtient Noise ou rien. Le témoin
+//!    `avec_le_mode_de_transition_un_client_capable_de_noise_negocie_quand_meme_noise`
+//!    garde exactement ce point.
+//! 2. **Le défaut est le refus** ([`ModeTransition::ChiffrementSeul`]).
+//! 3. **Une session en clair se nomme.** `warn!` au journal, `encrypted: false`
+//!    et `transport: "clair"` au registre, mode publié par
+//!    `GET /devices/sendspin`.
+//!
 //! ## Ce qui est délibérément absent
 //!
 //! Pas d'`OutputTarget`, pas d'enregistrement de sortie, pas de zone. Deux
@@ -35,8 +58,9 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use tracing::{debug, info, warn};
 
+use tune_core::sendspin::transition::{self, ModeTransition};
 use tune_core::sendspin::{
-    ErreurSendspin, PoigneeServeur, identite_du_serveur, messages, psk, registre,
+    ErreurSendspin, PoigneeServeur, VERSION_PROTOCOLE, identite_du_serveur, messages, psk, registre,
 };
 
 /// Délai maximal d'attente d'un message du pair.
@@ -53,32 +77,66 @@ const DELAI_MESSAGE: std::time::Duration = std::time::Duration::from_secs(10);
 /// zones. Le rendre générique n'est pas de la coquetterie : c'est ce qui
 /// permet au témoin de monter la VRAIE route, sans fabriquer un `AppState`
 /// complet dont la séquence ne dépend pas.
-pub fn router<S>() -> Router<S>
+///
+/// Le mode est un **argument**, pas une lecture d'environnement enfouie ici.
+/// C'est la forme qu'a l'implémentation de référence (`allow_unencrypted` est
+/// un paramètre du constructeur de son serveur), et c'est ce qui permet à un
+/// témoin de mesurer les deux modes sans toucher à l'environnement du
+/// processus — `std::env::set_var` dans un test casse la suite `--workspace`.
+pub fn router<S>(mode: ModeTransition) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    Router::new().route("/", get(point_d_acces))
+    Router::new().route(
+        "/",
+        get(move |ws: WebSocketUpgrade| async move { point_d_acces(ws, mode).await }),
+    )
 }
 
-async fn point_d_acces(ws: WebSocketUpgrade) -> impl IntoResponse {
+async fn point_d_acces(ws: WebSocketUpgrade, mode: ModeTransition) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = conduire(socket).await {
+        if let Err(e) = conduire(socket, mode).await {
             // La specification n'a AUCUN message d'erreur applicatif : la seule
             // reaction admise est de fermer sans rien dire au pair. Le motif
             // reste donc chez nous, dans le journal.
-            warn!(error = %e, "sendspin_poignee_echouee");
+            warn!(error = %e, mode = mode.nom(), "sendspin_poignee_echouee");
         }
     })
 }
 
-/// Mène la séquence complète de S2-a.
+/// Aiguille sur le TYPE du premier message, et rien d'autre.
+///
+/// Mesuré le 11/09/2026 dans `aiosendspin` (git, `_establish_transport`) :
+/// c'est exactement cette forme. Le point important est que la décision se
+/// prend sur ce que le pair **demande**, jamais sur un échec : il n'existe
+/// aucune arête qui mène de « Noise a raté » à « tant pis, en clair ».
+async fn conduire(mut socket: WebSocket, mode: ModeTransition) -> Result<(), ErreurSendspin> {
+    let premier = lire_texte(&mut socket, "premier message").await?;
+    match messages::type_du_message(&premier).as_deref() {
+        Some(messages::TYPE_CLIENT_INIT) => conduire_chiffre(socket, premier).await,
+        Some(messages::TYPE_CLIENT_HELLO) => conduire_en_clair(socket, premier, mode).await,
+        autre => Err(ErreurSendspin::MessageIllisible(format!(
+            "premier message : {} attendu ou {} (mode de transition), recu {}",
+            messages::TYPE_CLIENT_INIT,
+            messages::TYPE_CLIENT_HELLO,
+            autre.unwrap_or("un message sans type lisible")
+        ))),
+    }
+}
+
+/// Mène la séquence complète de S2-a, **chiffrée**.
 ///
 /// `client/init` → `server/init` → `noise/handshake` ×2 → `server/hello` →
 /// `client/hello` → `server/activate`.
-async fn conduire(mut socket: WebSocket) -> Result<(), ErreurSendspin> {
+///
+/// Rien ici n'a changé avec le mode de transition, et c'est délibéré : la porte
+/// supplémentaire ne doit pas assouplir d'un pouce celle qui existait.
+async fn conduire_chiffre(
+    mut socket: WebSocket,
+    client_init_texte: String,
+) -> Result<(), ErreurSendspin> {
     // 1. `client/init`, en clair. Le texte est garde TEL QUEL : il entre dans
     //    le prologue Noise octet pour octet.
-    let client_init_texte = lire_texte(&mut socket, "client/init").await?;
     debug!(
         taille = client_init_texte.len(),
         "sendspin_client_init_recu"
@@ -158,7 +216,10 @@ async fn conduire(mut socket: WebSocket) -> Result<(), ErreurSendspin> {
 
     registre::enregistrer(registre::PairVu {
         client_id: infos.client_id.clone(),
-        suite: infos.suite.to_string(),
+        suite: Some(infos.suite.to_string()),
+        // Noise a mené jusqu'au bout : le `client_id` est une clé publique
+        // PROUVÉE, et les trames sont chiffrées.
+        chiffre: true,
         nom: client_hello.name.clone(),
         roles: client_hello.supported_roles.clone(),
         player_support: client_hello.support_du_lecteur().cloned(),
@@ -184,6 +245,135 @@ async fn conduire(mut socket: WebSocket) -> Result<(), ErreurSendspin> {
 
     // 8. Fin de S2-a. Rien a jouer, donc on rend la main proprement plutot que
     //    de tenir une connexion qui ne servirait a rien.
+    let _ = socket.send(Message::Close(None)).await;
+    Ok(())
+}
+
+/// Le **mode de transition** : un `client/hello` en clair comme premier message.
+///
+/// ## Ce que cette branche fait, et pourquoi exactement cette forme
+///
+/// Tout ce qui suit est **mesuré** le 11/09/2026, pas déduit : sur le paquet
+/// publié `aiosendspin` 6.0.5 (celui dont dépend le lecteur de référence
+/// `sendspin` 7.5.0) et sur le serveur de référence au dépôt git.
+///
+/// 1. Le pair n'a pas mené de poignée de main : son `client_id` et sa `version`
+///    voyagent **dans le hello**. Le lecteur publié les rend obligatoires.
+/// 2. La réponse est un `server/hello` **hérité** — cinq champs, tous
+///    obligatoires — envoyé en trame **TEXTE**, pas en binaire chiffré.
+/// 3. **Aucun `server/activate` ne suit** : ni `client/init` ni `server/activate`
+///    n'apparaissent dans 6.0.5. Le hello hérité porte à lui seul
+///    `active_roles` et `connection_reason`. Le serveur de référence écrit la
+///    même chose : « the legacy hello replaces server/hello plus activate ».
+///
+/// ## Ce que cette branche refuse
+///
+/// - Tout, si le mode n'est pas armé — et c'est le défaut.
+/// - Une **rétrogradation** : un `client_id` déjà vu en Noise ne revient pas en
+///   clair (le serveur de référence fait le même refus contre son magasin
+///   d'appairage).
+/// - Une version de protocole autre que 1.
+async fn conduire_en_clair(
+    mut socket: WebSocket,
+    hello_texte: String,
+    mode: ModeTransition,
+) -> Result<(), ErreurSendspin> {
+    if !mode.accepte_le_clair() {
+        // Le refus est l'etat NORMAL, pas une panne : il se journalise en
+        // disant quoi armer, sinon un testeur passe une heure a chercher
+        // pourquoi son enceinte ne repond pas.
+        warn!(
+            reglage = transition::VARIABLE_ENVIRONNEMENT,
+            "sendspin_client_hello_en_clair_refuse"
+        );
+        return Err(ErreurSendspin::ClairRefuse);
+    }
+
+    let brute: messages::EnveloppeBrute = serde_json::from_str(&hello_texte)
+        .map_err(|e| ErreurSendspin::MessageIllisible(format!("client/hello en clair : {e}")))?;
+    let hello_brut = brute.payload.clone();
+    let client_hello: messages::ClientHello =
+        serde_json::from_value(brute.payload).map_err(|e| {
+            ErreurSendspin::MessageIllisible(format!("charge client/hello en clair : {e}"))
+        })?;
+
+    // La version voyage ICI faute de `client/init`. Absente, on ne la reproche
+    // pas — le serveur de reference se contente de noter l'ecart ; presente et
+    // fausse, on ferme, comme lui.
+    if let Some(version) = client_hello.version
+        && version != VERSION_PROTOCOLE
+    {
+        return Err(ErreurSendspin::VersionInconnue(version));
+    }
+
+    let Some(client_id) = client_hello.client_id.clone() else {
+        return Err(ErreurSendspin::IdentifiantInvalide(
+            "client/hello en clair sans client_id : aucune poignee de main n'a \
+             pu en fournir un"
+                .into(),
+        ));
+    };
+
+    // PROTECTION CONTRE LA RETROGRADATION. Un pair qui a deja prouve qu'il sait
+    // parler Noise ne redescend pas en clair : sinon n'importe qui sur le
+    // reseau local usurperait une enceinte connue en recopiant son identifiant.
+    if registre::deja_vu_chiffre(&client_id) {
+        warn!(%client_id, "sendspin_retrogradation_refusee");
+        return Err(ErreurSendspin::RetrogradationRefusee(client_id));
+    }
+
+    // `warn!`, pas `info!` : une session en clair est un ECART, meme voulu. Le
+    // serveur de reference journalise au meme niveau (« Accepting unencrypted
+    // legacy connection »).
+    warn!(
+        %client_id,
+        nom = ?client_hello.name,
+        roles = ?client_hello.supported_roles,
+        reglage = transition::VARIABLE_ENVIRONNEMENT,
+        "sendspin_connexion_en_clair_acceptee"
+    );
+    info!(
+        %client_id,
+        sait_jouer = client_hello.sait_jouer(),
+        player_support = %client_hello
+            .support_du_lecteur()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_else(|| "absent".into()),
+        hello = %hello_brut,
+        "sendspin_client_hello_en_clair_recu"
+    );
+
+    registre::enregistrer(registre::PairVu {
+        client_id: client_id.clone(),
+        // Aucune suite : il n'y a rien de chiffre. Annoncer un nom de suite ici
+        // ferait croire au contraire.
+        suite: None,
+        chiffre: false,
+        nom: client_hello.name.clone(),
+        roles: client_hello.supported_roles.clone(),
+        player_support: client_hello.support_du_lecteur().cloned(),
+        hello_brut,
+        vu_a: registre::maintenant(),
+    });
+
+    let herite = messages::Enveloppe::nouvelle(
+        messages::TYPE_SERVER_HELLO,
+        messages::ServerHelloHerite {
+            server_id: identite_du_serveur().id(),
+            name: format!("Tune ({})", tune_core::discovery::system_hostname()),
+            version: VERSION_PROTOCOLE,
+            // Aucun role actif : S2-a ne joue rien, et une connexion en clair
+            // ne doit de toute facon jamais porter d'audio tant que S2-b n'a
+            // pas apporte l'authentification du pair.
+            active_roles: Vec::new(),
+            connection_reason: messages::RAISON_CONNEXION_DECOUVERTE.to_string(),
+        },
+    );
+    let texte = serde_json::to_string(&herite)
+        .map_err(|e| ErreurSendspin::MessageIllisible(format!("server/hello herite : {e}")))?;
+    envoyer_texte(&mut socket, texte).await?;
+    info!(%client_id, "sendspin_server_hello_herite_envoye");
+
     let _ = socket.send(Message::Close(None)).await;
     Ok(())
 }

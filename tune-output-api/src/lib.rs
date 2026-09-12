@@ -373,9 +373,17 @@ pub struct OutputDspMetrics {
 ///
 /// « Famine » désigne ici une chose précise et une seule : le pilote a réclamé
 /// N échantillons au rappel, l'anneau en a rendu moins, et le manque a été
-/// comblé par des **zéros**. C'est un trou audible, et c'est le seul chiffre
-/// qui dise que l'audio a réellement sauté — quelle qu'en soit la cause :
-/// ordonnancement du noyau, réseau, décodage ou convolution.
+/// comblé par des **zéros**. C'est un trou audible, et il dit que le
+/// PRODUCTEUR n'a pas suivi : réseau, décodage ou convolution.
+///
+/// 🔴 **Il ne dit RIEN de l'ordonnancement du noyau**, contrairement à ce que
+/// ce commentaire a affirmé jusqu'ici. Quand le noyau réveille le fil de
+/// sortie trop tard, ALSA a déjà sous-alimenté le DAC ; cpal signale
+/// `StreamError::BufferUnderrun`, recouvre, et **saute le rappel de données**
+/// (`cpal/src/host/alsa/mod.rs`, branche `PollDescriptorsFlow::XRun`). Le
+/// rappel n'est jamais appelé, l'anneau est resté PLEIN, et `events` ne bouge
+/// pas d'un cran pendant que le DAC encaisse un trou. Le chiffre qui voit
+/// cet incident-là est [`driver_underruns`](Self::driver_underruns).
 ///
 /// ⚠️ **À ne pas confondre avec l'« underrun » ALSA** que cpal remonte en
 /// `StreamError` et que `make_stream_error_cb` laisse délibérément passer sans
@@ -401,6 +409,23 @@ pub struct OutputRingStarvation {
     /// Échantillons entrelacés réclamés par le pilote depuis le démarrage.
     /// Dénominateur de `missing_samples`.
     pub served_samples: u64,
+    /// Sous-alimentations du PILOTE depuis le démarrage du flux (#3205).
+    ///
+    /// Le pilote a réclamé des échantillons et le processus n'était pas là
+    /// pour les fournir : le fil de sortie n'a pas été ordonnancé à temps.
+    /// C'est LE chiffre qui décide du sort du noyau `PREEMPT_RT` de Tune OS —
+    /// s'il reste à zéro une heure de lecture sur noyau standard, le noyau RT
+    /// est un coût sans gain, et le Secure Boot revient.
+    ///
+    /// Jamais additionné à `events` : les deux décrivent des pannes disjointes
+    /// et une somme ne s'interpréterait plus (voir l'avertissement du type).
+    ///
+    /// `serde(default)` : cette structure est le contrat des greffons de sortie
+    /// HORS ARBRE. Un relevé sérialisé par un greffon construit avant ce champ
+    /// doit continuer à se relire — sans quoi l'ajout casserait les greffons
+    /// tiers, et en silence.
+    #[serde(default)]
+    pub driver_underruns: u64,
     /// Durée d'audio écoulée depuis le démarrage du flux, en millisecondes,
     /// déduite de `served_samples` et de la cadence (taux × canaux).
     ///
@@ -435,6 +460,10 @@ pub struct RingStarvation {
     events: AtomicU64,
     missing_samples: AtomicU64,
     served_samples: AtomicU64,
+    /// Sous-alimentations du pilote (#3205). Alimenté par le rappel d'ERREUR
+    /// du backend, pas par le rappel de données — c'est tout l'intérêt : sur
+    /// un XRun, le rappel de données n'est pas appelé.
+    driver_underruns: AtomicU64,
     /// Échantillons entrelacés par seconde (taux × canaux). Posé hors du
     /// rappel par [`begin_stream`](Self::begin_stream).
     samples_per_second: AtomicU32,
@@ -452,6 +481,7 @@ impl RingStarvation {
         self.events.store(0, Ordering::Relaxed);
         self.missing_samples.store(0, Ordering::Relaxed);
         self.served_samples.store(0, Ordering::Relaxed);
+        self.driver_underruns.store(0, Ordering::Relaxed);
         self.samples_per_second.store(
             sample_rate.saturating_mul(u32::from(channels)),
             Ordering::Relaxed,
@@ -483,6 +513,25 @@ impl RingStarvation {
         }
     }
 
+    /// Comptabiliser UNE sous-alimentation du pilote, telle que le backend la
+    /// remonte dans son rappel d'ERREUR (#3205).
+    ///
+    /// Volontairement séparé de [`record`](Self::record) : sur un XRun ALSA,
+    /// cpal saute le rappel de données, donc `record` n'est PAS appelé et
+    /// l'anneau paraît sain. Sans ce compteur-ci, un incident d'ordonnancement
+    /// ne laisse aucune trace chiffrée.
+    ///
+    /// Même contrat temps réel que `record` : un seul atomique `Relaxed`, rien
+    /// d'autre. Le rappel d'erreur tourne sur le fil de sortie du backend.
+    ///
+    /// Pas de garde `armed` ici, contrairement à `record` : un XRun ne peut pas
+    /// se produire avant que le pilote ait commencé à tirer des données, donc
+    /// il n'y a pas de silence de démarrage à écarter.
+    #[inline]
+    pub fn record_driver_underrun(&self) {
+        self.driver_underruns.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Relevé hors chemin temps réel.
     pub fn snapshot(&self) -> OutputRingStarvation {
         let served = self.served_samples.load(Ordering::Relaxed);
@@ -491,12 +540,132 @@ impl RingStarvation {
             events: self.events.load(Ordering::Relaxed),
             missing_samples: self.missing_samples.load(Ordering::Relaxed),
             served_samples: served,
+            driver_underruns: self.driver_underruns.load(Ordering::Relaxed),
             stream_ms: if cadence == 0 {
                 0
             } else {
                 served.saturating_mul(1000) / cadence
             },
         }
+    }
+}
+
+/// #3205 — la sous-alimentation du PILOTE et la famine de l'ANNEAU sont deux
+/// pannes disjointes, et le compteur doit les garder disjointes.
+///
+/// Ce module est EXÉCUTÉ à chaque PR : `tune-output-api` figure dans le `-p` du
+/// job `Test` de `ci.yml` et ne porte aucune feature. C'est délibéré — le
+/// câblage côté `local.rs` vit derrière `local-audio`, que ce job n'active pas,
+/// et n'est donc gardé que par un témoin de TEXTE
+/// (`tune-server/tests/famine_pilote_3205.rs`). Le contrat du compteur, lui,
+/// se teste pour de vrai, ici.
+#[cfg(test)]
+mod famine_pilote_3205 {
+    use super::*;
+
+    /// Le scénario exact d'un incident d'ORDONNANCEMENT, tel que cpal le
+    /// produit : le noyau réveille le fil de sortie trop tard, ALSA a déjà
+    /// sous-alimenté le DAC, cpal signale l'erreur, recouvre — et **saute le
+    /// rappel de données**. L'anneau, lui, est resté PLEIN.
+    ///
+    /// C'est la raison d'être de ce compteur : avant lui, cet incident-là ne
+    /// laissait aucun chiffre derrière lui, et c'est pourtant le seul qui
+    /// puisse décider du noyau `PREEMPT_RT` de Tune OS.
+    #[test]
+    fn un_incident_d_ordonnancement_ne_touche_pas_la_famine_de_l_anneau() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+
+        // Le flux tourne, l'anneau sert tout ce qu'on lui demande.
+        compteur.record(1_024, 1_024);
+        compteur.record(1_024, 1_024);
+
+        // XRun : cpal appelle le rappel d'ERREUR, jamais le rappel de données.
+        compteur.record_driver_underrun();
+
+        let releve = compteur.snapshot();
+        assert_eq!(
+            releve.driver_underruns, 1,
+            "la sous-alimentation du pilote n'est pas comptée : un trou audible              d'origine ordonnancement ne laisse aucune trace chiffrée, et #3205              redevient immesurable"
+        );
+        assert_eq!(
+            releve.events, 0,
+            "l'incident du PILOTE a été compté comme une famine de l'ANNEAU. Les              deux pannes sont disjointes — producteur en retard d'un côté,              processus pas ordonnancé de l'autre — et les confondre rend le              chiffre ininterprétable, donc inutile à l'arbitrage du noyau RT"
+        );
+        assert_eq!(
+            releve.missing_samples, 0,
+            "aucun échantillon n'a manqué DANS L'ANNEAU : le rappel de données              n'a même pas été appelé"
+        );
+    }
+
+    /// La réciproque : un producteur en retard ne doit pas gonfler le compteur
+    /// du pilote. Sans cette moitié, fusionner les deux compteurs passerait.
+    #[test]
+    fn une_famine_d_anneau_ne_compte_aucune_sous_alimentation_du_pilote() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+        compteur.record(1_024, 1_024);
+        compteur.record(1_024, 300);
+
+        let releve = compteur.snapshot();
+        assert_eq!(releve.events, 1);
+        assert_eq!(releve.missing_samples, 724);
+        assert_eq!(
+            releve.driver_underruns, 0,
+            "une famine de l'ANNEAU a été comptée comme une sous-alimentation du              PILOTE : le chiffre qui décide du noyau RT se met à monter quand              c'est le réseau ou le décodage qui est en retard"
+        );
+    }
+
+    /// Un flux neuf repart de zéro. #3205 veut un TAUX par heure de lecture ;
+    /// un compteur qui cumule des pistes sans rapport ne se compare à rien.
+    #[test]
+    fn un_flux_neuf_remet_le_compteur_du_pilote_a_zero() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+        compteur.record(512, 512);
+        compteur.record_driver_underrun();
+        compteur.record_driver_underrun();
+        assert_eq!(compteur.snapshot().driver_underruns, 2);
+
+        compteur.begin_stream(48_000, 2);
+        assert_eq!(
+            compteur.snapshot().driver_underruns,
+            0,
+            "un flux neuf hérite des sous-alimentations du précédent : le taux              par heure de lecture cumule des pistes sans rapport"
+        );
+    }
+
+    /// Le chiffre doit SORTIR. Un compteur que la route ne publie pas ne mesure
+    /// rien pour le testeur qui colle son rapport de diagnostic sur le forum —
+    /// et c'est ce rapport, sur un parc réel, qui doit trancher #3205.
+    #[test]
+    fn le_compteur_du_pilote_est_serialise_et_tolere_un_releve_ancien() {
+        let releve = OutputRingStarvation {
+            events: 0,
+            missing_samples: 0,
+            served_samples: 1,
+            driver_underruns: 7,
+            stream_ms: 0,
+        };
+        let json = serde_json::to_value(releve).unwrap();
+        assert_eq!(
+            json["driver_underruns"], 7,
+            "le compteur n'atteint pas la route : invisible dans le rapport de              diagnostic, donc inexistant pour la mesure"
+        );
+
+        // Un greffon de sortie hors arbre, construit avant ce champ, sérialise
+        // un relevé sans lui. Il doit continuer à se relire.
+        let ancien: OutputRingStarvation = serde_json::from_value(serde_json::json!({
+            "events": 3,
+            "missing_samples": 12,
+            "served_samples": 400,
+            "stream_ms": 9,
+        }))
+        .expect(
+            "un relevé produit par un greffon antérieur à ce champ ne se relit              plus : l'ajout casse les greffons de sortie hors arbre",
+        );
+        assert_eq!(ancien.driver_underruns, 0);
+        assert_eq!(ancien.events, 3);
     }
 }
 
@@ -643,6 +812,547 @@ impl Default for PlayMedia<'_> {
             disc_number: None,
             byte_seekable: true,
         }
+    }
+}
+
+/// Le puits d'échantillons : l'extrémité qui reçoit le PCM déjà converti.
+///
+/// C'est la frontière entre le **producteur** — qui lit les octets, décide
+/// PCM ou DoP, applique le DSP, adapte les canaux et rééchantillonne — et le
+/// **backend**, qui n'a plus qu'à ranger des mots flottants entrelacés là où
+/// son pilote viendra les chercher.
+///
+/// Le contrat tient en une phrase : `ecrire` rend la main quand tout `mots` est
+/// rangé, ou quand il est devenu inutile de continuer.
+///
+/// Il vit ici, dans la caisse de contrat **sans aucune fonctionnalité**, et non
+/// derrière `local-audio` : un puits est un point d'extension, au même titre
+/// que [`OutputTarget`], et la porte `test` de toute PR Rust doit le compiler.
+///
+/// Le trait ne dit rien du rythme : un puits peut bloquer (l'anneau CPAL
+/// attend que le rappel draine), écrire sans jamais bloquer (un puits de
+/// capture), ou ne rien faire du tout. Il ne dit rien non plus du format —
+/// cadence et canaux sont convenus à l'ouverture, hors de ce contrat, parce
+/// qu'ils ne changent pas d'un bloc à l'autre.
+pub trait PuitsDEchantillons {
+    /// Range `mots` — du PCM `f32` entrelacé, au format de sortie convenu.
+    ///
+    /// Rend `false` **uniquement** quand le puits a cessé de consommer et que
+    /// le producteur doit se démonter : rappel mort, périphérique arraché.
+    /// Rend `true` dans tous les autres cas, **y compris un arrêt demandé** —
+    /// le producteur détecte l'arrêt par ses propres témoins, jamais par cette
+    /// valeur. Confondre les deux ferait passer une pause pour une panne.
+    fn ecrire(&mut self, mots: &[f32]) -> bool;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// T8 de #2218 — le puits de CAPTURE.
+//
+// R1 (#3958) a nommé la frontière producteur → puits et l'a démontrée avec un
+// puits jetable, `PuitsEmpreinte`, qui vivait dans son propre fichier de
+// témoins. Ce qui suit est ce puits-là, devenu un type de première classe de
+// la caisse de contrat : le MÊME hachage, aux mêmes octets près — les quatre
+// relevés de R1 tombent dessus sans être retouchés —, plus les deux choses
+// qu'un puits de capture doit rendre et qu'un puits jetable n'avait pas :
+//
+//   * le **format réellement ouvert**, qui n'est pas celui de la source. Une
+//     piste 44,1 kHz servie sur un périphérique ouvert à 48 kHz est livrée à
+//     48 kHz, et rien dans le dépôt ne le publiait : `audio/tap.rs` publie
+//     depuis le DÉCODAGE (`send_windowed_pcm`, appelé neuf fois depuis
+//     `audio/decode.rs` et zéro fois depuis la boucle producteur, relevé le
+//     12/09/2026), donc au format SOURCE. Un consommateur qui croit voir ce
+//     qui part au DAC voit en fait ce qui entre dans la conversion ;
+//   * la **retenue** des mots, pour qu'un témoin puisse comparer le signal
+//     livré à une référence externe et pas seulement une empreinte à une
+//     empreinte.
+//
+// Pourquoi ici, et pas derrière `local-audio` : cette caisse n'a AUCUNE
+// fonctionnalité et figure dans le `-p` du job `Test` de `ci.yml` (ligne 262),
+// qui tourne sur toutes les PR Rust. Tout ce qui est ici est donc exécuté à
+// chaque PR ; tout ce qui reste dans `outputs::local` ne l'est que sous
+// `ci:full`. C'est la raison d'être de ce découpage.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Le format que la sortie a **réellement ouvert**, à l'autre bout du puits.
+///
+/// Ce n'est pas le format du fichier : entre les deux il y a l'adaptation de
+/// canaux et le rééchantillonnage. C'est le seul format dans lequel les mots
+/// d'un [`PuitsDEchantillons`] ont un sens — les interpréter avec la cadence
+/// de la source donne une durée fausse, et les désentrelacer avec le nombre de
+/// canaux de la source intervertit les voies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatOuvert {
+    /// Cadence du périphérique, en hertz.
+    pub cadence: u32,
+    /// Nombre de canaux entrelacés dans chaque bloc livré.
+    pub canaux: u16,
+}
+
+impl FormatOuvert {
+    pub fn new(cadence: u32, canaux: u16) -> Self {
+        Self { cadence, canaux }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// R5 de #2219 — le format SOURCE, porté par un type.
+//
+// [`FormatOuvert`] dit ce que le périphérique a ouvert, à la SORTIE du puits :
+// des `f32`, une cadence, des canaux. Il ne dit rien de l'entrée, et il ne le
+// peut pas — à l'entrée il y a des OCTETS, et des octets ne se lisent pas sans
+// profondeur. C'est ce que [`AudioSpec`] ajoute, et c'est tout ce qu'il ajoute :
+// les deux types sont les deux bouts de la conversion, pas deux façons de dire
+// la même chose.
+//
+// Ce qu'il remplace : `sample_rate: u32`, `bit_depth: u16`, `channels: u16` et
+// `frame_bytes: usize` circulant NUS et séparément. Quatre nombres dont trois
+// sont des étiquettes et le quatrième leur conséquence — que rien n'obligeait à
+// recalculer quand une étiquette changeait, et dont deux, tous deux `u16`,
+// s'intervertissaient sans un mot du compilateur.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Comment un mot PCM est écrit dans les octets d'un flux.
+///
+/// **Le jeu est FERMÉ, et aucune méthode de ce type n'a de bras `_`.** Ce n'est
+/// pas une commodité : `parse_wav_header` ne rend jamais rien d'autre que `0`,
+/// `16`, `24` ou `32`, et tout le chemin de lecture locale — octets par
+/// échantillon, octets par trame, alignement des trames, conversion en `f32`,
+/// conversion en `i32` natif — n'énumère que ces quatre-là. Une cinquième
+/// valeur n'est pas « moins précise », elle est **incohérente**, et de deux
+/// façons opposées selon le chemin : bruit blanc d'un côté, silence de l'autre.
+///
+/// Une profondeur ajoutée ici est donc réclamée par le compilateur partout où
+/// elle change quelque chose, au lieu de se glisser sous un repli silencieux.
+///
+/// # Le piège que ce type ferme
+///
+/// [`Self::FlottantIeee32`] et [`Self::Entier32`] font tous deux **quatre
+/// octets** et ne se décodent pas du tout pareil. Tant que la profondeur était
+/// un `u16`, le flottant se disait « 0 » — le sentinelle des en-têtes WAV — et
+/// `bit_depth == 32` était donc faux pour lui, tandis que `bit_depth / 8`
+/// rendait `0` octet. Chaque appelant devait se souvenir du cas particulier.
+/// Ici les deux sont des variantes distinctes de même largeur, et
+/// [`Self::octets`] répond `4` pour les deux sans que personne ait à y penser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProfondeurPcm {
+    /// Flottant IEEE 754 32 bits, petit-boutien. Se dit `0` dans un en-tête WAV
+    /// tel que ce dépôt le lit : c'est un sentinelle, pas une largeur.
+    FlottantIeee32,
+    /// Entier signé 16 bits, petit-boutien.
+    Entier16,
+    /// Entier signé 24 bits, petit-boutien, trois octets par mot.
+    Entier24,
+    /// Entier signé 32 bits, petit-boutien.
+    Entier32,
+}
+
+impl ProfondeurPcm {
+    /// Largeur d'un mot, en octets. Jamais nulle.
+    #[must_use]
+    pub const fn octets(self) -> usize {
+        match self {
+            Self::FlottantIeee32 => 4,
+            Self::Entier16 => 2,
+            Self::Entier24 => 3,
+            Self::Entier32 => 4,
+        }
+    }
+
+    /// La valeur telle qu'un en-tête WAV la déclare dans ce dépôt — `0` pour le
+    /// flottant.
+    ///
+    /// Existe pour les fonctions qui prennent encore un `u16` et qu'on ne
+    /// réécrit pas ici. Chaque appel est un endroit où l'étiquette redevient un
+    /// nombre nu : ils se comptent, et ils doivent diminuer.
+    #[must_use]
+    pub const fn bits_declares(self) -> u16 {
+        match self {
+            Self::FlottantIeee32 => 0,
+            Self::Entier16 => 16,
+            Self::Entier24 => 24,
+            Self::Entier32 => 32,
+        }
+    }
+
+    /// L'inverse, **partiel** : hors du jeu fermé, il n'y a pas de réponse.
+    ///
+    /// `None` n'est pas « on ne sait pas faire » mais « ce flux ne se décode
+    /// pas ici » : le seul geste sûr est de le refuser avant qu'un octet ne
+    /// parte au DAC.
+    #[must_use]
+    pub const fn depuis_bits_declares(bits: u16) -> Option<Self> {
+        match bits {
+            0 => Some(Self::FlottantIeee32),
+            16 => Some(Self::Entier16),
+            24 => Some(Self::Entier24),
+            32 => Some(Self::Entier32),
+            _ => None,
+        }
+    }
+}
+
+/// Le format d'un flux PCM : ce qu'il faut, et il faut tout, pour donner un
+/// sens à une suite d'octets.
+///
+/// # Pourquoi les champs sont PRIVÉS
+///
+/// C'est la raison d'être du type. `octets_par_trame` n'est pas rangé à côté
+/// des trois autres : il est **calculé** à chaque demande, à partir de la
+/// profondeur et des canaux. Il ne peut donc pas leur survivre.
+///
+/// Le défaut que cela ferme est réel et daté : à une frontière gapless,
+/// `local.rs` posait quatre affectations de suite — cadence, canaux,
+/// profondeur, puis `frame_bytes` recalculé à la main. Oublier la quatrième, ou
+/// la calculer avec l'ancienne profondeur, ne cassait aucune compilation :
+/// c'était un flux 24 bits lu par trames de 16, c'est-à-dire tout le reste de
+/// la piste décalé d'un octet — le bruit blanc de #3849. Ici la quatrième
+/// n'existe pas, et les trois autres ne se posent qu'ensemble.
+///
+/// La deuxième chose qui change : intervertir la profondeur et les canaux.
+/// Ils étaient tous deux `u16` et voisins dans quatre signatures.
+///
+/// Il faut être exact sur ce qui est gagné, parce que ce n'est pas le même
+/// verrou des deux côtés :
+///
+/// * par [`AudioSpec::nouvelle`], l'interversion est une **erreur de type** —
+///   [`ProfondeurPcm`] n'est pas un `u16`, le compilateur refuse ;
+/// * par [`AudioSpec::depuis_entete`], qui prend encore deux `u16` parce
+///   qu'un en-tête WAV rend deux nombres, l'interversion compile toujours.
+///   Elle est rattrapée à l'exécution par le jeu fermé : un flux stéréo
+///   intervertit ses arguments en « 2 bits », qui n'existe pas, et le format
+///   est REFUSÉ au lieu d'être mal lu. Mesuré — voir le témoin
+///   `une_profondeur_hors_du_jeu_ferme_est_refusee_pas_approchee`.
+///
+/// Ce qui reste ouvert, et qu'il faut nommer plutôt que taire : un flux à 16,
+/// 24 ou 32 CANAUX dont les arguments seraient intervertis passerait la porte.
+/// C'est la seule fenêtre, elle tient en une ligne de code, et elle disparaîtra
+/// le jour où `parse_wav_header` rendra directement un [`AudioSpec`].
+///
+/// # Ce que ce type ne prétend PAS
+///
+/// Il ne vérifie pas que les octets qu'on lui associe sont vraiment dans ce
+/// format-là. Une `AudioSpec` construite sur un mensonge reste un mensonge —
+/// aucun type ne lit à la place de l'en-tête. Ce qu'il garantit, c'est qu'à
+/// partir du moment où l'étiquette est posée, **plus personne ne la contredit
+/// en aval**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AudioSpec {
+    cadence: u32,
+    profondeur: ProfondeurPcm,
+    canaux: u16,
+}
+
+impl AudioSpec {
+    /// L'unique constructeur. `None` quand `canaux` est nul.
+    ///
+    /// Zéro canal n'est pas un format « vide » : c'est un diviseur nul.
+    /// `octets_par_trame` vaudrait `0`, et le calcul d'alignement qui suit —
+    /// `octets.len() / octets_par_trame` — **divise par zéro**, ce qui abat le
+    /// fil de lecture. Refuser ici, une fois, vaut mieux que porter la garde
+    /// dans chaque calcul : c'est l'invariant qui rend [`BlocPcm::trames`]
+    /// total.
+    #[must_use]
+    pub const fn nouvelle(cadence: u32, profondeur: ProfondeurPcm, canaux: u16) -> Option<Self> {
+        if canaux == 0 {
+            return None;
+        }
+        Some(Self {
+            cadence,
+            profondeur,
+            canaux,
+        })
+    }
+
+    /// Le même, depuis les trois nombres qu'un en-tête WAV rend.
+    ///
+    /// `None` dès que l'un des deux refus tombe : profondeur hors du jeu fermé,
+    /// ou zéro canal. C'est la porte d'entrée du type, et la seule : tout ce qui
+    /// entre dans le chemin de conversion passe par un de ces deux
+    /// constructeurs.
+    #[must_use]
+    pub const fn depuis_entete(cadence: u32, bits_declares: u16, canaux: u16) -> Option<Self> {
+        match ProfondeurPcm::depuis_bits_declares(bits_declares) {
+            Some(profondeur) => Self::nouvelle(cadence, profondeur, canaux),
+            None => None,
+        }
+    }
+
+    /// Cadence d'échantillonnage de la source, en hertz.
+    #[must_use]
+    pub const fn cadence(self) -> u32 {
+        self.cadence
+    }
+
+    /// Comment un mot est écrit dans les octets.
+    #[must_use]
+    pub const fn profondeur(self) -> ProfondeurPcm {
+        self.profondeur
+    }
+
+    /// Nombre de canaux entrelacés. Toujours au moins 1.
+    #[must_use]
+    pub const fn canaux(self) -> u16 {
+        self.canaux
+    }
+
+    /// Octets d'une trame complète — **déduit, jamais rangé**. Toujours ≥ 1.
+    #[must_use]
+    pub const fn octets_par_trame(self) -> usize {
+        self.profondeur.octets() * self.canaux as usize
+    }
+
+    /// Étiquette ces octets avec CE format, et rien d'autre.
+    ///
+    /// C'est le seul moyen d'obtenir un [`BlocPcm`], et un `BlocPcm` n'a aucun
+    /// moyen de changer d'étiquette ensuite.
+    #[must_use]
+    pub const fn bloc(self, octets: &[u8]) -> BlocPcm<'_> {
+        BlocPcm { spec: self, octets }
+    }
+}
+
+/// Des octets PCM **et** le format dans lequel ils ont un sens, indissociables.
+///
+/// # Ce que ce type interdit
+///
+/// De réétiqueter un bloc. `spec` est privé et n'a pas de mutateur ; il n'existe
+/// aucun `BlocPcm { .. }` littéral hors de cette caisse, et
+/// [`BlocPcm::spec`] rend une **copie**. Écrire dessus ne change rien au bloc —
+/// le compilateur refuse même d'essayer, puisqu'il n'y a rien à qui affecter.
+///
+/// Ce que cela vaut, concrètement : un bloc de 48 octets stéréo fait 12 trames
+/// en 16 bits, 8 en 24 bits et 6 en 32. Les trois lectures sont plausibles ; une
+/// seule est la bonne, et c'est celle du format qui a produit le bloc. Tant que
+/// les octets et le format voyageaient séparément, tenir les deux ensemble était
+/// une discipline. Ici c'est le type.
+///
+/// # La partition, qui n'est pas un détail
+///
+/// [`Self::octets_alignes`] et [`Self::reste_non_aligne`] découpent les octets en
+/// DEUX, sans recouvrement ni perte. Le reste est celui qu'une lecture réseau
+/// laisse à chaque tour — la trame coupée en deux par la frontière du tampon.
+/// Le jeter, c'est décaler tout le flux qui suit : le bruit blanc 24 bits de
+/// #3849. Le rendre explicitement, c'est obliger l'appelant à en faire quelque
+/// chose.
+#[derive(Debug, Clone, Copy)]
+pub struct BlocPcm<'a> {
+    spec: AudioSpec,
+    octets: &'a [u8],
+}
+
+impl<'a> BlocPcm<'a> {
+    /// Le format de ce bloc. Une copie : l'écrire ne réétiquette rien.
+    #[must_use]
+    pub const fn spec(&self) -> AudioSpec {
+        self.spec
+    }
+
+    /// Tous les octets du bloc, alignés ou non.
+    #[must_use]
+    pub const fn octets(&self) -> &'a [u8] {
+        self.octets
+    }
+
+    /// Le préfixe qui fait un nombre entier de trames. Décodable tel quel.
+    #[must_use]
+    pub fn octets_alignes(&self) -> &'a [u8] {
+        &self.octets[..self.trames() * self.spec.octets_par_trame()]
+    }
+
+    /// Le suffixe qui ne complète pas une trame : à REPORTER sur la lecture
+    /// suivante, jamais à jeter.
+    #[must_use]
+    pub fn reste_non_aligne(&self) -> &'a [u8] {
+        &self.octets[self.trames() * self.spec.octets_par_trame()..]
+    }
+
+    /// Nombre de trames complètes. Total : `octets_par_trame()` ne peut pas
+    /// être nul, l'invariant de [`AudioSpec::nouvelle`] s'en charge.
+    #[must_use]
+    pub fn trames(&self) -> usize {
+        self.octets.len() / self.spec.octets_par_trame()
+    }
+}
+
+/// L'état initial de l'empreinte : le décalage de base de FNV-1a 64 bits.
+///
+/// Publié parce qu'il est la réponse à « ce puits n'a rien reçu » — un témoin
+/// qui exige `empreinte() != EMPREINTE_DU_VIDE` dit exactement cela, là où
+/// `mots() > 0` dirait la même chose deux fois.
+pub const EMPREINTE_DU_VIDE: u64 = 0xcbf2_9ce4_8422_2325;
+
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Le puits de capture : il **hache les mots livrés** et publie le **format
+/// réellement ouvert**.
+///
+/// Il ne joue rien, ne bloque jamais et n'alloue rien en régime permanent
+/// quand la retenue est désactivée. Branché à la place de l'anneau cpal, il
+/// transforme la chaîne de lecture en instrument de mesure : ce qui aurait été
+/// envoyé au DAC devient une empreinte comparable.
+///
+/// # Ce que l'empreinte hache
+///
+/// Les **octets** des `f32`, petit-boutistes, pas leur valeur. Deux nombres
+/// mathématiquement égaux mais de représentations différentes — `0.0` et
+/// `-0.0`, deux `NaN` — doivent se voir, parce qu'un DAC les voit. C'est
+/// FNV-1a 64 bits, à l'identique de ce que R1 a mesuré ; les relevés de
+/// `empreinte_du_puits_r1.rs` sont donc valides sur ce type sans être repris.
+///
+/// # Ce que ce puits ne fait PAS
+///
+/// Il n'implémente pas [`OutputTarget`] : une sortie, c'est un transport, une
+/// file, des commandes et un état ; un puits, c'est une extrémité de PCM. Les
+/// deux se rencontrent dans `outputs::local`, pas ici. Il n'est pas non plus
+/// partageable entre fils — le trait prend `&mut self`, et le producteur est
+/// seul à écrire.
+pub struct CaptureOutput {
+    format: FormatOuvert,
+    empreinte: u64,
+    mots: u64,
+    blocs: u64,
+    blocs_vides: u64,
+    blocs_non_alignes: u64,
+    retenue: Option<Vec<f32>>,
+    plafond_de_retenue: usize,
+    retenue_complete: bool,
+    vivant: bool,
+}
+
+impl CaptureOutput {
+    /// Un puits qui ne retient rien : il ne garde que l'empreinte et les
+    /// comptes. C'est la forme utilisable sur une piste entière.
+    pub fn ouvert(format: FormatOuvert) -> Self {
+        Self {
+            format,
+            empreinte: EMPREINTE_DU_VIDE,
+            mots: 0,
+            blocs: 0,
+            blocs_vides: 0,
+            blocs_non_alignes: 0,
+            retenue: None,
+            plafond_de_retenue: 0,
+            retenue_complete: true,
+            vivant: true,
+        }
+    }
+
+    /// Un puits qui retient en plus les `plafond_de_retenue` premiers mots.
+    ///
+    /// Le plafond est explicite et son dépassement est **constaté**, jamais
+    /// silencieux : [`CaptureOutput::retenue_complete`] passe à `false` dès
+    /// qu'un mot livré n'a pas été retenu. Une retenue tronquée sans le dire
+    /// ferait comparer une référence entière à un tronçon, et c'est
+    /// exactement la forme de faux vert que cette tranche existe pour éviter.
+    pub fn avec_retenue(format: FormatOuvert, plafond_de_retenue: usize) -> Self {
+        let mut puits = Self::ouvert(format);
+        puits.retenue = Some(Vec::new());
+        puits.plafond_de_retenue = plafond_de_retenue;
+        puits
+    }
+
+    /// Le format réellement ouvert, tel qu'il a été convenu à l'ouverture.
+    pub fn format(&self) -> FormatOuvert {
+        self.format
+    }
+
+    /// L'empreinte de tout ce qui a été livré, dans l'ordre de livraison.
+    pub fn empreinte(&self) -> u64 {
+        self.empreinte
+    }
+
+    /// Le nombre de mots livrés — canaux compris.
+    pub fn mots(&self) -> u64 {
+        self.mots
+    }
+
+    /// Le nombre d'appels à `ecrire`, blocs vides compris.
+    pub fn blocs(&self) -> u64 {
+        self.blocs
+    }
+
+    /// Les appels à `ecrire` qui n'ont apporté aucun mot.
+    pub fn blocs_vides(&self) -> u64 {
+        self.blocs_vides
+    }
+
+    /// Les blocs dont la longueur n'est **pas** un multiple du nombre de
+    /// canaux ouverts.
+    ///
+    /// Un seul suffit à décaler toutes les trames suivantes : la voie gauche
+    /// part à droite et n'y revient jamais. Aucun anneau ne le signale — il
+    /// range des mots, pas des trames — et c'est donc au puits de le compter.
+    pub fn blocs_non_alignes(&self) -> u64 {
+        self.blocs_non_alignes
+    }
+
+    /// Le nombre de trames livrées, au format ouvert.
+    pub fn trames(&self) -> u64 {
+        if self.format.canaux == 0 {
+            return 0;
+        }
+        self.mots / u64::from(self.format.canaux)
+    }
+
+    /// La durée livrée, en millisecondes, **à la cadence ouverte**.
+    ///
+    /// C'est le chiffre que la cadence source rendrait faux : 8,7 % d'écart
+    /// entre 44,1 et 48 kHz.
+    pub fn duree_livree_ms(&self) -> u64 {
+        if self.format.cadence == 0 {
+            return 0;
+        }
+        self.trames() * 1000 / u64::from(self.format.cadence)
+    }
+
+    /// Les mots retenus, ou `None` si ce puits ne retient rien.
+    pub fn mots_livres(&self) -> Option<&[f32]> {
+        self.retenue.as_deref()
+    }
+
+    /// Faux dès qu'un mot livré n'a pas tenu sous le plafond de retenue.
+    pub fn retenue_complete(&self) -> bool {
+        self.retenue_complete
+    }
+
+    /// Déclare le puits mort : les écritures suivantes rendront `false`.
+    ///
+    /// C'est le rappel arraché du monde réel (#1626), reproductible sans
+    /// périphérique.
+    pub fn declarer_mort(&mut self) {
+        self.vivant = false;
+    }
+
+    /// Le puits consomme-t-il encore ?
+    pub fn vivant(&self) -> bool {
+        self.vivant
+    }
+}
+
+impl PuitsDEchantillons for CaptureOutput {
+    fn ecrire(&mut self, mots: &[f32]) -> bool {
+        self.blocs += 1;
+        if mots.is_empty() {
+            self.blocs_vides += 1;
+        }
+        if self.format.canaux != 0 && mots.len() % usize::from(self.format.canaux) != 0 {
+            self.blocs_non_alignes += 1;
+        }
+        self.mots += mots.len() as u64;
+        for mot in mots {
+            for octet in mot.to_bits().to_le_bytes() {
+                self.empreinte ^= u64::from(octet);
+                self.empreinte = self.empreinte.wrapping_mul(FNV_PRIME);
+            }
+        }
+        if let Some(retenue) = self.retenue.as_mut() {
+            let place = self.plafond_de_retenue.saturating_sub(retenue.len());
+            if place < mots.len() {
+                self.retenue_complete = false;
+            }
+            retenue.extend_from_slice(&mots[..place.min(mots.len())]);
+        }
+        self.vivant
     }
 }
 

@@ -34,6 +34,11 @@ const TRACK_BATCH: usize = 25;
 /// Provenance d'un `dr_track` CALCULÉ par cette passe, par opposition à celui
 /// lu dans les tags du fichier au scan. Voir l'écriture dans
 /// `analyze_track_batch`.
+///
+/// Jumeau de [`crate::metadata::DR_SOURCE_TAG`], écrit par le scan sur la
+/// valeur qu'il LIT dans le fichier (#3924). Les deux producteurs de
+/// `dr_track` marquent désormais la clef `dr_source` ; sans le second, une
+/// valeur non marquée ne se distinguait pas d'une valeur d'avant la clef.
 const DR_SOURCE_ANALYSIS: &str = "analysis";
 
 /// La plage calculée a-t-elle le droit de s'écrire ?
@@ -1198,11 +1203,37 @@ pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
 /// Album gain uses the duration-weighted energy mean of the tracks' loudness
 /// (recovered from each `rg_track_gain`), matching how ReplayGain 2.0 shares one
 /// gain across an album to preserve inter-track dynamics; album peak is the max
-/// track peak. Written to EVERY track of the album (ReplayGain album tags are
+/// track peak. Written to the tracks of the album (ReplayGain album tags are
 /// per-track).
+///
+/// # Deux gardes, et pourquoi
+///
+/// La première version prenait un album dès qu'**une** piste lui manquait un
+/// gain d'album, puis moyennait les seules pistes qui avaient un
+/// `rg_track_gain` **à cet instant** — parfois une sur douze — et écrivait le
+/// résultat sur toutes. Ce gain-là ne se recalculait jamais : toutes les
+/// pistes portant désormais un `rg_album_gain`, l'album sortait
+/// définitivement de la sélection. Mesuré sur le .18 : **179 albums,
+/// 2 385 pistes**, dont un album de 64 pistes dont le gain vient de 2.
+///
+/// * **Complétude, à la SÉLECTION** — un album n'est pris que lorsque
+///   *toutes* ses pistes ont un `rg_track_gain`. Même raisonnement que
+///   `true_peak_complete` plus bas, qui refuse déjà un `rg_album_true_peak`
+///   tiré d'un maximum partiel : une moyenne partielle n'est pas une moyenne.
+///   La garde est dans la requête, et pas dans la boucle, pour que l'album
+///   incomplet ne soit pas RECHOISI à chaque tour — il affamerait tous les
+///   autres.
+/// * **Provenance, à l'ÉCRITURE** — voir [`peut_ecrire_le_gain_album`]. Les
+///   tags du fichier et la mesure de Tune s'écrivent sous la même clé ; une
+///   valeur qui n'est pas estampillée de notre main ne s'écrase pas.
 pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // An album that has track gains but no album gain yet. One at a time keeps
     // it cheap (pure arithmetic, no decode) and interleaved with the track pass.
+    //
+    // 🔴 GARDE DE COMPLÉTUDE : le troisième `NOT EXISTS` écarte l'album dont
+    // une seule piste n'a pas encore son `rg_track_gain`. Sans lui, le gain
+    // d'album se calculait sur le sous-ensemble analysé à cet instant, puis se
+    // figeait pour toujours.
     let album_row = backend
         .query_one(
             "SELECT t.album_id FROM tracks t \
@@ -1210,6 +1241,11 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
              WHERE t.album_id IS NOT NULL \
                AND NOT EXISTS (SELECT 1 FROM track_metadata a \
                      WHERE a.track_id = t.id AND a.key = 'rg_album_gain') \
+               AND NOT EXISTS (SELECT 1 FROM tracks t2 \
+                     WHERE t2.album_id = t.album_id \
+                       AND NOT EXISTS (SELECT 1 FROM track_metadata g2 \
+                             WHERE g2.track_id = t2.id \
+                               AND g2.key = 'rg_track_gain')) \
              LIMIT 1",
             &[],
         )
@@ -1225,7 +1261,9 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
         "SELECT t.id, t.duration_ms, \
                 (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_gain'), \
                 (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_peak'), \
-                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_true_peak') \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_true_peak'), \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_album_gain'), \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_album_source') \
          FROM tracks t WHERE t.album_id = ?",
         &[&album_id as &dyn ToSqlValue],
     ) {
@@ -1247,6 +1285,9 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let mut n = 0usize;
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut track_ids: Vec<i64> = Vec::new();
+    // Les pistes sur lesquelles il est LICITE d'écrire le gain d'album : les
+    // autres portent une valeur venue des tags du fichier.
+    let mut ecrivables: Vec<i64> = Vec::new();
 
     for r in &rows {
         let tid = match r.first().and_then(|v| v.as_i64()) {
@@ -1254,6 +1295,11 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
             None => continue,
         };
         track_ids.push(tid);
+        let gain_album_en_place = r.get(5).and_then(|v| v.as_string());
+        let temoin_album = r.get(6).and_then(|v| v.as_string());
+        if peut_ecrire_le_gain_album(gain_album_en_place.as_deref(), temoin_album.as_deref()) {
+            ecrivables.push(tid);
+        }
         let dur = r.get(1).and_then(|v| v.as_i64()).unwrap_or(0).max(1) as f64;
         // gain string like "-6.50 dB" → lufs = REFERENCE - gain
         if let Some(gain) = r.get(2).and_then(|v| v.as_string()).and_then(parse_gain_db) {
@@ -1292,7 +1338,18 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let true_peak_str =
         (true_peak_complete && true_peak_max > 0.0).then(|| format_peak(true_peak_max));
 
-    for tid in &track_ids {
+    // 🔴 GARDE DE PROVENANCE : `ecrivables`, et non `track_ids`. Une piste dont
+    // le `rg_album_gain` vient des tags du fichier garde sa valeur — et ne
+    // reçoit surtout pas l'estampille `ALBUM_SOURCE_KEY`, qui la ferait passer
+    // pour une mesure de Tune au tour suivant.
+    if ecrivables.is_empty() {
+        debug!(
+            album_id,
+            "replaygain_album_tout_vient_des_tags — rien à écrire"
+        );
+        return 0;
+    }
+    for tid in &ecrivables {
         let _ = repo.set(*tid, "rg_album_gain", &gain_str);
         let _ = repo.set(*tid, "rg_album_peak", &peak_str);
         if let Some(tp) = &true_peak_str {
@@ -1304,8 +1361,34 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
         // d'album, elle, est de Tune.
         let _ = repo.set(*tid, ALBUM_SOURCE_KEY, SOURCE_ANALYSIS);
     }
-    info!(album_id, tracks = track_ids.len(), gain = %gain_str, "replaygain_album");
+    info!(
+        album_id,
+        tracks = track_ids.len(),
+        ecrites = ecrivables.len(),
+        gain = %gain_str,
+        "replaygain_album"
+    );
     1
+}
+
+/// Le gain d'album déjà posé sur cette piste est-il à nous ?
+///
+/// Jumeau album de [`peut_ecrire_le_dr`] : une valeur déjà présente ne
+/// s'écrase pas. Les tags du fichier et la mesure de Tune s'écrivent sous la
+/// **même** clé `rg_album_gain` — le scan y verse ce qu'il lit dans le fichier
+/// (`crate::metadata`) — et seule l'estampille [`ALBUM_SOURCE_KEY`] à
+/// [`SOURCE_ANALYSIS`] dit que la valeur en place vient d'ici. Sans elle, on
+/// est devant un tag de l'utilisateur : on n'y touche pas.
+///
+/// Le refus est par PISTE, et non par album : les pistes encore vierges
+/// reçoivent le gain calculé, donc l'album sort de la sélection au tour
+/// suivant. Un refus par album, lui, le ferait rechoisir indéfiniment.
+fn peut_ecrire_le_gain_album(gain_existant: Option<&str>, temoin: Option<&str>) -> bool {
+    match gain_existant {
+        None => true,
+        Some(v) if v.trim().is_empty() => true,
+        Some(_) => temoin.is_some_and(|t| t.trim() == SOURCE_ANALYSIS),
+    }
 }
 
 /// Parse a ReplayGain gain string ("-6.50 dB", "+3.2", "-6.50dB") to dB.
@@ -3078,6 +3161,207 @@ mod tests {
         let e = (10f64.powf(-12.0 / 10.0) + 10f64.powf(-18.0 / 10.0)) / 2.0;
         let album_lufs = 10.0 * e.log10();
         assert!(album_lufs < -12.0 && album_lufs > -18.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Le gain d'album, figé sur un sous-ensemble et écrasant les tags
+    // -----------------------------------------------------------------------
+
+    /// Une base minimale avec de VRAIS albums : des pistes, leurs gains de
+    /// piste, et rien d'autre. Aucune de ces valeurs n'est produite par la
+    /// passe elle-même — c'est l'état de départ d'une bibliothèque à moitié
+    /// analysée, la forme exacte du .18.
+    fn base_albums() -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE tracks (id INTEGER PRIMARY KEY, album_id INTEGER, file_path TEXT,
+                                  duration_ms INTEGER, sample_rate INTEGER, channels INTEGER);
+             CREATE TABLE track_metadata (track_id INTEGER NOT NULL, key TEXT NOT NULL,
+                                          value TEXT NOT NULL, PRIMARY KEY (track_id, key));",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        (db, backend)
+    }
+
+    fn piste(db: &crate::db::sqlite::SqliteDb, id: i64, album: i64) {
+        let chemin = format!("/album{album}/{id}.flac");
+        db.execute(
+            "INSERT INTO tracks (id, album_id, file_path, duration_ms, sample_rate, channels) \
+             VALUES (?, ?, ?, 300000, 44100, 2)",
+            &[&id, &album, &chemin],
+        )
+        .unwrap();
+    }
+
+    fn gain_album(meta: &TrackMetadataRepo, id: i64) -> Option<String> {
+        meta.get_all(id).unwrap().get("rg_album_gain").cloned()
+    }
+
+    /// 🔴 LE DÉFAUT №1 — la sélection prenait un album dès qu'UNE piste lui
+    /// manquait un gain d'album, puis moyennait les seules pistes qui avaient
+    /// un `rg_track_gain` à cet instant. Le résultat, écrit sur toutes les
+    /// pistes, sortait l'album de la sélection : il ne se recalculait plus
+    /// jamais. Mesuré sur la base du .18 le 12/09/2026 : **179 albums,
+    /// 2 385 pistes**, dont un album de 64 pistes dont le gain vient de 2.
+    ///
+    /// La garde est dans la REQUÊTE, et le témoin le vérifie deux fois : un
+    /// album incomplet ne doit pas recevoir de gain, et il ne doit pas non
+    /// plus affamer les albums complets en se faisant rechoisir sans fin.
+    #[test]
+    fn le_gain_dalbum_attend_que_toutes_les_pistes_soient_analysees() {
+        let (db, backend) = base_albums();
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+
+        // Album 1 : trois pistes, UNE SEULE analysée.
+        for id in 1..=3 {
+            piste(&db, id, 1);
+        }
+        meta.set(1, "rg_track_gain", "-6.00 dB").unwrap();
+        meta.set(1, "rg_track_peak", "0.98").unwrap();
+
+        // Album 2 : deux pistes, toutes deux analysées.
+        for id in 11..=12 {
+            piste(&db, id, 2);
+        }
+        meta.set(11, "rg_track_gain", "-9.00 dB").unwrap();
+        meta.set(11, "rg_track_peak", "0.90").unwrap();
+        meta.set(12, "rg_track_gain", "-5.00 dB").unwrap();
+        meta.set(12, "rg_track_peak", "0.99").unwrap();
+
+        // Plusieurs tours : l'ordre que rend la requête ne doit rien changer.
+        let mut traites = 0;
+        for _ in 0..4 {
+            traites += analyze_album_batch(&backend);
+        }
+
+        for id in 1..=3 {
+            assert_eq!(
+                gain_album(&meta, id),
+                None,
+                "piste {id} : l'album 1 est incomplet (1 piste analysée sur 3), \
+                 il ne doit porter AUCUN gain d'album"
+            );
+        }
+        assert_eq!(
+            traites, 1,
+            "l'album 2 est complet : l'album incomplet ne doit pas l'affamer"
+        );
+        for id in 11..=12 {
+            assert!(
+                gain_album(&meta, id).is_some(),
+                "piste {id} : album complet, gain d'album attendu"
+            );
+        }
+    }
+
+    /// 🔴 LE DÉFAUT №2 — `rg_album_gain` et `rg_album_peak` étaient écrits
+    /// INCONDITIONNELLEMENT sur toutes les pistes de l'album. Or le scan
+    /// verse sous ces MÊMES clés ce qu'il lit dans les tags du fichier : la
+    /// valeur de l'utilisateur disparaissait sans un mot, et recevait même
+    /// l'estampille `rg_album_source = analysis` qui la faisait passer pour
+    /// une mesure de Tune au tour suivant.
+    #[test]
+    fn le_gain_dalbum_venu_des_tags_nest_pas_ecrase() {
+        let (db, backend) = base_albums();
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        for id in 1..=3 {
+            piste(&db, id, 1);
+        }
+        for (id, g, p) in [
+            (1i64, "-6.00 dB", "0.98"),
+            (2, "-8.00 dB", "0.91"),
+            (3, "-4.00 dB", "0.99"),
+        ] {
+            meta.set(id, "rg_track_gain", g).unwrap();
+            meta.set(id, "rg_track_peak", p).unwrap();
+        }
+        // La piste 1 porte un gain d'album VENU DU FICHIER. Ce qui le dit :
+        // l'ABSENCE de témoin `rg_album_source` à côté.
+        meta.set(1, "rg_album_gain", "-9.99 dB").unwrap();
+        meta.set(1, "rg_album_peak", "0.55").unwrap();
+
+        assert_eq!(analyze_album_batch(&backend), 1, "l'album est complet");
+
+        let m1 = meta.get_all(1).unwrap();
+        assert_eq!(
+            m1.get("rg_album_gain").map(String::as_str),
+            Some("-9.99 dB"),
+            "le gain d'album lu dans les tags du fichier ne doit PAS être écrasé"
+        );
+        assert_eq!(
+            m1.get("rg_album_peak").map(String::as_str),
+            Some("0.55"),
+            "son pic d'album non plus"
+        );
+        assert!(
+            !m1.contains_key(ALBUM_SOURCE_KEY),
+            "et il ne doit surtout pas être estampillé comme une mesure de Tune"
+        );
+
+        // Les pistes vierges, elles, reçoivent le calcul : sans quoi l'album
+        // serait rechoisi à chaque tour, indéfiniment.
+        for id in 2..=3 {
+            let m = meta.get_all(id).unwrap();
+            assert!(
+                m.get("rg_album_gain").is_some_and(|v| v != "-9.99 dB"),
+                "piste {id} : gain d'album calculé attendu, vu {:?}",
+                m.get("rg_album_gain")
+            );
+            assert_eq!(
+                m.get(ALBUM_SOURCE_KEY).map(String::as_str),
+                Some(SOURCE_ANALYSIS),
+                "piste {id} : ce que Tune écrit, Tune l'estampille"
+            );
+        }
+    }
+
+    /// La garde de provenance ne doit pas geler NOS propres valeurs : une
+    /// piste estampillée `rg_album_source = analysis` reste reprenable, sans
+    /// quoi aucun gain d'album ne pourrait plus jamais être corrigé.
+    #[test]
+    fn notre_propre_gain_dalbum_reste_recalculable() {
+        let (db, backend) = base_albums();
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        for id in 1..=3 {
+            piste(&db, id, 1);
+        }
+        for (id, g, p) in [
+            (1i64, "-6.00 dB", "0.98"),
+            (2, "-8.00 dB", "0.91"),
+            (3, "-4.00 dB", "0.99"),
+        ] {
+            meta.set(id, "rg_track_gain", g).unwrap();
+            meta.set(id, "rg_track_peak", p).unwrap();
+        }
+        meta.set(1, "rg_album_gain", "-9.99 dB").unwrap();
+        meta.set(1, ALBUM_SOURCE_KEY, SOURCE_ANALYSIS).unwrap();
+
+        assert_eq!(analyze_album_batch(&backend), 1);
+        assert!(
+            gain_album(&meta, 1).is_some_and(|v| v != "-9.99 dB"),
+            "une valeur que Tune a écrite lui-même doit rester reprenable"
+        );
+    }
+
+    /// Le cœur de la garde de provenance, isolé.
+    #[test]
+    fn peut_ecrire_le_gain_album_ne_cede_quau_temoin() {
+        assert!(peut_ecrire_le_gain_album(None, None), "rien en place");
+        assert!(peut_ecrire_le_gain_album(Some("  "), None), "valeur vide");
+        assert!(
+            !peut_ecrire_le_gain_album(Some("-9.99 dB"), None),
+            "sans témoin, la valeur vient des tags du fichier"
+        );
+        assert!(
+            !peut_ecrire_le_gain_album(Some("-9.99 dB"), Some("tag")),
+            "un témoin qui ne dit pas « analysis » ne nous autorise rien"
+        );
+        assert!(
+            peut_ecrire_le_gain_album(Some("-9.99 dB"), Some(SOURCE_ANALYSIS)),
+            "notre propre mesure se reprend"
+        );
     }
     // -----------------------------------------------------------------------
     // #2496 — « Désactivé » doit désactiver

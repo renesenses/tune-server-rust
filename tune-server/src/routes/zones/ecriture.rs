@@ -527,6 +527,20 @@ async fn persister_le_patch(
         };
         ecrire!("model", model, r);
     }
+    // #3660 — le vide FORCÉ. La chaîne vide ci-dessus efface l'OVERRIDE et
+    // laisse revenir la détection ; ce drapeau-ci récuse la DÉTECTION. Deux
+    // gestes distincts, parce que ce sont deux intentions distinctes : « je
+    // n'ai plus d'avis » et « cet appareil n'est pas celui-là ».
+    if let Some(efface) = body.identite_appareil_effacee {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = super::cle_identite_effacee(id);
+        let r = if efface {
+            settings.set(&key, "true")
+        } else {
+            settings.delete(&key)
+        };
+        ecrire!("identite_appareil_effacee", efface, r);
+    }
     // Opt-in MediaRenderer UPnP (#1750) → setting zone_{id}_upnp_renderer.
     if let Some(enabled) = body.upnp_renderer {
         let settings = SettingsRepo::with_backend(state.backend.clone());

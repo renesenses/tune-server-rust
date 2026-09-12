@@ -145,8 +145,13 @@ const BUG_REPORT_MAX_BODY_CHARS: usize = 49_000;
 ///
 /// Ce qui est compté : un rappel du pilote à qui l'anneau a rendu MOINS
 /// d'échantillons qu'il n'en demandait, le reste étant parti en zéros vers le
-/// DAC. C'est un trou audible, et il capture toutes les causes à la fois —
-/// ordonnancement du noyau, réseau, décodage, convolution.
+/// DAC. C'est un trou audible, et il dit qu'un PRODUCTEUR n'a pas suivi —
+/// réseau, décodage, convolution.
+///
+/// 🔴 Il ne capture PAS l'ordonnancement du noyau, contrairement à ce que ce
+/// commentaire affirmait : sur un XRun, cpal saute le rappel de données, donc
+/// l'anneau reste plein et ce compteur ne bouge pas. `driver_underruns`, plus
+/// bas, est le chiffre qui voit cet incident-là.
 ///
 /// Ce qui n'est PAS compté ici : l'« underrun » ALSA que cpal remonte en
 /// `StreamError` et que la sortie locale laisse délibérément passer sans
@@ -180,8 +185,70 @@ async fn releve_famine_anneau(state: &AppState) -> Vec<Value> {
                 "output_name": output.name(),
                 "ring_starvation_events": famine.events,
                 "ring_starvation_missing_samples": famine.missing_samples,
+                "driver_underruns": famine.driver_underruns,
                 "served_samples": famine.served_samples,
                 "stream_ms": famine.stream_ms,
+            }))
+        })
+        .collect()
+}
+
+/// #3479 — ce que l'étage d'égalisation PRODUIT, et pas seulement ce qu'il
+/// annonce.
+///
+/// `eq_change_journal` (v0.9.141) et `duree_ms` / `amortissement` (v0.9.145)
+/// mesurent l'INSTALLATION de l'étage : famille de sortie, format avant et
+/// après, pré-gain, premier échec. Reivax66 en a déposé 25 lignes, toutes
+/// concordantes — `premier_echec="-"`, `format_avant == format_apres`, aucune
+/// famine d'anneau — pendant que son symptôme était « l'égaliseur coupe le son
+/// mais n'interrompt pas la lecture ».
+///
+/// Ces deux faits ne se contredisent pas : ils portent sur deux choses
+/// différentes. Un étage qui s'installe sans erreur peut rendre du **silence**
+/// échantillon par échantillon, et `EqProcessor` sait exactement quand cela
+/// arrive — `process_interleaved` compte `non_finite_samples` et remet le
+/// sample à zéro (`audio/eq.rs`). Une cascade de biquads devenue instable
+/// (coefficients extrêmes, Q élevé à cadence basse) produit des `NaN` en
+/// chaîne : l'anneau reste alimenté, servi à l'heure, et le DAC reçoit des
+/// zéros. C'est le seul mécanisme INTERNE à l'étage qui rende exactement le
+/// symptôme décrit.
+///
+/// Ce compteur existe depuis longtemps et atteint déjà
+/// `/zones/{id}/signal-path`. Mais le rapport de diagnostic — **ce que le
+/// testeur dépose** — ne le portait pas, et aucune ligne de journal ne le dit
+/// non plus. Il était donc mesuré et illisible, exactement comme la famine de
+/// l'anneau avant #3205.
+///
+/// ⚠️ Un `0` ici n'innocente pas l'égaliseur : il écarte le repliement sur
+/// zéro, pas un pré-gain mal calculé ni un étage en aval. Il retire une
+/// hypothèse de la liste, ce qui est tout ce qu'on lui demande.
+///
+/// ⚠️ **Ce que ce chiffre compte, exactement.** `process_stats` compte depuis
+/// la construction de l'`EqProcessor`. Sur le chemin `local_a_chaud`, un
+/// processeur neuf est bâti à chaque cran de curseur — sept en 1,5 s dans
+/// l'export de Reivax66 — et `inherit_state_from` lui transmet désormais les
+/// compteurs avec l'historique des filtres, faute de quoi le nombre repartait
+/// de zéro au moment même que le ticket décrit. Il reste remis à zéro quand la
+/// **forme** de la cascade change (une bande qui sort par `is_neutral()`,
+/// un changement de nombre de canaux) et à chaque nouvelle piste : ce n'est
+/// alors plus le même étage.
+///
+/// `try_lock` et non `lock`, même raison que [`releve_famine_anneau`] : un
+/// diagnostic n'attend jamais derrière une sortie en train de jouer.
+async fn releve_dsp_egaliseur(state: &AppState) -> Vec<Value> {
+    let outputs = state.outputs.lock().await;
+    outputs
+        .list()
+        .iter()
+        .filter_map(|id| {
+            let output = outputs.get(id)?;
+            let output = output.try_lock().ok()?;
+            let metriques = output.dsp_metrics()?;
+            Some(json!({
+                "output_id": id,
+                "output_name": output.name(),
+                "eq_overs": metriques.eq_overs,
+                "eq_non_finite_samples": metriques.eq_non_finite_samples,
             }))
         })
         .collect()
@@ -329,10 +396,33 @@ fn hote_de_zone(
 /// eteinte, pas remplacee.
 fn groupe_json(motif: &str, cle: &str, zones: &[&ZoneVue]) -> Value {
     let en_ligne = zones.iter().filter(|z| z.online).count();
+    // #3747 — un groupe NOMMÉ n'est pas un groupe FUSIONNABLE.
+    //
+    // `POST /zones/{doublon}/fusionner-dans/{cible}` exige que les deux zones
+    // rendent la MÊME clé `cle_appareil`, non nulle ; elle refuse tout le
+    // reste par `409 zones_distinctes`. Or la SECONDE règle de ce rapport
+    // groupe par HÔTE, et par construction aucune de ses zones ne partage de
+    // clé d'appareil avec une autre : celles qui en partagent une sont déjà
+    // sorties par la première règle, et sont dans `deja`.
+    //
+    // Un groupe « même hôte, deux protocoles » sortait donc avec exactement la
+    // forme d'une famille fusionnable, alors qu'AUCUNE action ne peut le
+    // suivre : un Eversolo vu en SSDP/DLNA et en mDNS/AirPlay est deux espaces
+    // d'identifiants disjoints. Le refus de la route est correct ; c'est le
+    // rapport qui promettait ce qu'il ne pouvait pas tenir. Il le dit
+    // maintenant lui-même, et dit POURQUOI.
+    let fusionnable = !cle.starts_with("hote:");
     json!({
         "motif": motif,
         "cle": cle,
         "en_ligne": en_ligne,
+        "fusionnable": fusionnable,
+        "fusion_refusee_motif": (!fusionnable).then_some(
+            "deux protocoles de découverte différents sur le même hôte : \
+             SSDP/DLNA et mDNS/AirPlay n'ont aucun identifiant commun, et la \
+             fusion serait refusée (409 zones_distinctes). Supprimez la zone \
+             dont vous ne voulez pas ; ses réglages ne sont pas reportés.",
+        ),
         "zones": zones.iter().map(|z| json!({
             "id": z.id,
             "name": z.name,
@@ -492,6 +582,8 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
 
     // #3205 — le seul chiffre qui dise si l'audio a réellement sauté.
     let ring_starvation = releve_famine_anneau(&state).await;
+    // #3479 — ce que l'étage d'égalisation a réellement produit.
+    let dsp_egaliseur = releve_dsp_egaliseur(&state).await;
 
     // DB backend — #3182.
     //
@@ -542,6 +634,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // / `stream_ms` donnent le dénominateur qui rend le taux calculable.
         // À NE PAS confondre avec l'underrun ALSA : voir `releve_famine_anneau`.
         "ring_starvation": ring_starvation,
+        // #3479 — `eq_non_finite_samples` > 0 dit que l'étage d'égalisation a
+        // remis des échantillons à ZÉRO : c'est du silence produit par l'EQ
+        // lui-même, sur un anneau qui n'a pas eu faim. `eq_overs` dit
+        // l'inverse, la saturation. Les deux étaient mesurés et invisibles.
+        "dsp_egaliseur": dsp_egaliseur,
         // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
         // une ligne WARN que l'utilisateur ne verra jamais.
         "asio_warm_scan": crate::startup::asio_warm_status(),
@@ -1567,6 +1664,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
 
     // Build markdown text
     let ring_starvation = releve_famine_anneau(&state).await;
+    let dsp_egaliseur = releve_dsp_egaliseur(&state).await;
     let mut md = String::new();
     md.push_str("# Tune Bug Report\n\n");
     md.push_str(&format!(
@@ -1759,17 +1857,41 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         md.push_str("## Ring starvation (famine de l'anneau audio)\n");
         for s in &ring_starvation {
             md.push_str(&format!(
-                "- {} : {} événement(s), {} échantillon(s) manquant(s) sur {} servis ({} ms de flux)\n",
+                "- {} : {} événement(s), {} échantillon(s) manquant(s) sur {} servis ({} ms de flux) ; {} sous-alimentation(s) du pilote\n",
                 s["output_name"].as_str().unwrap_or("?"),
                 s["ring_starvation_events"].as_u64().unwrap_or(0),
                 s["ring_starvation_missing_samples"].as_u64().unwrap_or(0),
                 s["served_samples"].as_u64().unwrap_or(0),
                 s["stream_ms"].as_u64().unwrap_or(0),
+                s["driver_underruns"].as_u64().unwrap_or(0),
             ));
         }
         md.push_str(
-            "  (un événement = un rappel audio comblé par des zéros ; sans rapport avec \
-             l'underrun ALSA, routinier et compté ailleurs)\n\n",
+            "  (un événement = un rappel audio comblé par des zéros, donc un \
+             PRODUCTEUR en retard ; la sous-alimentation du pilote est l'autre \
+             panne — le processus pas ordonnancé à temps — et c'est elle qui \
+             décide du noyau RT de Tune OS)\n\n",
+        );
+    }
+    // #3479 : sans cette section, un etage d'egalisation qui rend du SILENCE
+    // ne laissait aucune trace dans ce que le testeur depose — ni ici, ni dans
+    // le journal. Reivax66 a fourni 25 lignes `eq_change_journal` toutes
+    // saines pendant que son son disparaissait : elles disent que l'etage
+    // s'installe, jamais ce qu'il produit.
+    if !dsp_egaliseur.is_empty() {
+        md.push_str("## DSP — egaliseur (ce que l'etage PRODUIT)\n");
+        for d in &dsp_egaliseur {
+            md.push_str(&format!(
+                "- {} : {} echantillon(s) remis a ZERO (non finis), {} saturation(s)\n",
+                d["output_name"].as_str().unwrap_or("?"),
+                d["eq_non_finite_samples"].as_u64().unwrap_or(0),
+                d["eq_overs"].as_u64().unwrap_or(0),
+            ));
+        }
+        md.push_str(
+            "  (un echantillon « remis a zero » = une cascade de biquads devenue \
+instable ; l'anneau reste alimente et le DAC recoit du silence. A ne pas \
+confondre avec la famine de l'anneau, comptee au-dessus)\n\n",
         );
     }
     md.push_str("## Database\n");
@@ -1876,6 +1998,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         },
         "oaat_endpoints": oaat_endpoints,
         "ring_starvation": ring_starvation,
+        // Le pendant JSON de la section markdown ci-dessus (#3479).
+        "dsp_egaliseur": dsp_egaliseur,
         "database": {
             // #3182 : même mensonge que la ligne markdown ci-dessus, dans le
             // corps JSON que le client lit.
@@ -3508,5 +3632,119 @@ mod tests_doublons_de_zones {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, [6, 8, 9], "les trois lignes sont un seul appareil");
+    }
+
+    /// La garde de `fusionner_zones`, recalculée ici : les deux zones doivent
+    /// rendre la MÊME clé d'appareil, non nulle. Tout le reste est
+    /// `409 zones_distinctes`.
+    ///
+    /// Le témoin ne relit donc pas le drapeau qu'il vient de poser : il
+    /// compare `fusionnable` à ce que la ROUTE ferait.
+    fn la_route_accepterait(groupe: &serde_json::Value, appareils: &[DiscoveredDevice]) -> bool {
+        let zones: Vec<ZoneVue> = groupe["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|z| {
+                zone(
+                    z["id"].as_i64().unwrap(),
+                    z["name"].as_str().unwrap(),
+                    z["output_type"].as_str().unwrap(),
+                    z["output_device_id"].as_str().unwrap(),
+                    z["online"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        let cles: Vec<Option<String>> = zones.iter().map(|z| cle_appareil(z, appareils)).collect();
+        cles[0].is_some() && cles.iter().all(|c| *c == cles[0])
+    }
+
+    /// #3747 — le rapport ne propose plus une fusion que la route refusera.
+    ///
+    /// Mesuré le 09/09 : un Eversolo vu en DLNA (SSDP, `uuid:…`) et en AirPlay
+    /// (mDNS, `airplay-<MAC>`) sort dans un groupe « même hôte, deux
+    /// protocoles ». Les deux zones ne partagent AUCUN identifiant, et la
+    /// route répond `409 zones_distinctes` — correctement. Ce qui manquait,
+    /// c'est que le rapport le dise AVANT.
+    #[test]
+    fn un_groupe_de_meme_hote_est_nomme_mais_pas_fusionnable() {
+        let zones = vec![
+            zone(
+                10,
+                "Eversolo",
+                "dlna",
+                "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE",
+                true,
+            ),
+            zone(
+                11,
+                "Eversolo",
+                "airplay2",
+                "airplay-AA:BB:CC:DD:EE:01",
+                true,
+            ),
+        ];
+        let dlna = DiscoveredDevice::new(
+            "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE".into(),
+            "Eversolo".into(),
+            OutputType::Dlna,
+            "192.168.1.17".into(),
+            49152,
+        );
+        let airplay = DiscoveredDevice::new(
+            "airplay-AA:BB:CC:DD:EE:01".into(),
+            "Eversolo".into(),
+            OutputType::Airplay,
+            "192.168.1.17".into(),
+            7000,
+        );
+        let appareils = vec![dlna, airplay];
+        let groupes = doublons_de_zones(&zones, &appareils);
+        assert_eq!(groupes.len(), 1, "{groupes:#?}");
+        let g = &groupes[0];
+        assert!(
+            g["cle"].as_str().unwrap().starts_with("hote:"),
+            "le groupe attendu est celui de la règle par hôte : {g:#?}"
+        );
+        assert!(
+            !la_route_accepterait(g, &appareils),
+            "prémisse du témoin : la route DOIT refuser ce groupe"
+        );
+        assert_eq!(
+            g["fusionnable"],
+            serde_json::json!(false),
+            "un groupe que la route refuse ne doit pas être annoncé fusionnable : {g:#?}"
+        );
+        assert!(
+            g["fusion_refusee_motif"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("zones_distinctes"),
+            "le refus doit être nommé, pas laissé à deviner : {g:#?}"
+        );
+    }
+
+    /// L'autre sens, et il est indispensable : un groupe RÉELLEMENT
+    /// fusionnable reste annoncé fusionnable, et sans motif de refus. Sans ce
+    /// témoin, poser `fusionnable: false` partout resterait vert.
+    #[test]
+    fn un_groupe_de_meme_appareil_reste_fusionnable() {
+        let zones = vec![
+            zone(8, "Chambre", "dlna", "uuid:RINCON_ABC", true),
+            zone(6, "Chambre", "dlna", "uuid:RINCON_ABC_MR", false),
+        ];
+        let groupes = doublons_de_zones(&zones, &[]);
+        assert_eq!(groupes.len(), 1, "{groupes:#?}");
+        let g = &groupes[0];
+        assert!(
+            la_route_accepterait(g, &[]),
+            "prémisse du témoin : la route DOIT accepter ce groupe"
+        );
+        assert_eq!(g["fusionnable"], serde_json::json!(true), "{g:#?}");
+        assert_eq!(
+            g["fusion_refusee_motif"],
+            serde_json::Value::Null,
+            "rien à refuser, donc aucun motif : {g:#?}"
+        );
     }
 }

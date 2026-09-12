@@ -308,7 +308,18 @@ async fn aucune_route_de_la_famille_favoris_ne_disparait_en_silence() {
         );
     }
 
-    let ecritures: [(&str, Value); 7] = [
+    let ecritures: [(&str, Value); 9] = [
+        // #2001 piste 2 — l'ordre manuel. Sans cette ligne, retirer un
+        // `.route(...)` de `profiles::router()` ne ferait rougir que les tests
+        // de comportement, jamais le contrat de la famille.
+        (
+            "/api/v1/profiles/1/favorites/reorder",
+            json!({"item_type": "track", "item_ids": [1]}),
+        ),
+        (
+            "/api/v1/profiles/1/favorites/streaming/reorder",
+            json!({"item_type": "album", "items": [{"service": "qobuz", "service_id": "abc"}]}),
+        ),
         (
             "/api/v1/profiles/1/favorites/add",
             json!({"item_type": "track", "item_id": 1}),
@@ -499,4 +510,180 @@ async fn la_route_des_favoris_locaux_accepte_le_tri_sans_changer_sa_reponse() {
         "l'instantané d'identité sert au tri, il ne doit PAS fuir dans la réponse"
     );
     assert_eq!(trie.as_array().unwrap().len(), 3);
+}
+
+// --- #2001, piste 2 : l'ordre MANUEL ------------------------------------
+//
+// Le tri par champ (PR #2829) range d'après une donnée. Tades, lui, essayait de
+// DÉPLACER un favori à la souris — un ordre qu'aucun champ ne produit. Ces
+// tests vérifient la jonction complète : la route de réordonnancement existe,
+// ce qu'elle écrit se relit par `sort=manual`, et l'absence du paramètre laisse
+// tout comme avant.
+
+fn identifiants_locaux(corps: &Value) -> Vec<i64> {
+    corps
+        .as_array()
+        .expect("la route rend une liste")
+        .iter()
+        .map(|f| f["item_id"].as_i64().unwrap_or_default())
+        .collect()
+}
+
+async fn trois_favoris_locaux(app: &axum::Router) {
+    for item_id in [7, 8, 9] {
+        let (status, _) = post(
+            app,
+            "/api/v1/profiles/1/favorites/add",
+            json!({"item_type": "track", "item_id": item_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+}
+
+#[tokio::test]
+async fn l_ordre_manuel_pose_par_la_route_se_relit_par_la_route() {
+    let app = app();
+    trois_favoris_locaux(&app).await;
+
+    let (status, corps) = post(
+        &app,
+        "/api/v1/profiles/1/favorites/reorder",
+        json!({"item_type": "track", "item_ids": [8, 9, 7]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(corps["ordered"], json!(3), "les trois favoris sont rangés");
+
+    let (status, corps) = get(
+        &app,
+        "/api/v1/profiles/1/favorites?item_type=track&sort=manual&order=asc",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(identifiants_locaux(&corps), vec![8, 9, 7]);
+
+    let (_, corps) = get(
+        &app,
+        "/api/v1/profiles/1/favorites?item_type=track&sort=manual&order=desc",
+    )
+    .await;
+    assert_eq!(identifiants_locaux(&corps), vec![7, 9, 8]);
+}
+
+/// Témoin anti-régression : un ordre manuel posé ne doit rien changer à ce que
+/// la route rend **sans** `sort`. La colonne `position` n'est lue que par
+/// `sort=manual`, et elle ne fuit pas dans la réponse.
+#[tokio::test]
+async fn l_ordre_manuel_ne_change_ni_la_liste_par_defaut_ni_sa_forme() {
+    let app = app();
+    trois_favoris_locaux(&app).await;
+
+    let (_, avant) = get(&app, "/api/v1/profiles/1/favorites?item_type=track").await;
+    post(
+        &app,
+        "/api/v1/profiles/1/favorites/reorder",
+        json!({"item_type": "track", "item_ids": [8, 9, 7]}),
+    )
+    .await;
+    let (status, apres) = get(&app, "/api/v1/profiles/1/favorites?item_type=track").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        identifiants_locaux(&avant),
+        identifiants_locaux(&apres),
+        "sans `sort`, l'ordre servi doit rester exactement celui d'avant"
+    );
+
+    let cles = |v: &Value| -> Vec<String> {
+        let mut k: Vec<String> = v.as_array().unwrap()[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        k.sort();
+        k
+    };
+    let (_, manuel) = get(
+        &app,
+        "/api/v1/profiles/1/favorites?item_type=track&sort=manual",
+    )
+    .await;
+    assert_eq!(
+        cles(&apres),
+        cles(&manuel),
+        "le rang manuel sert au tri, il ne doit PAS fuir dans la réponse"
+    );
+}
+
+/// L'ordre manuel des favoris de service traverse sa propre route — la clé
+/// n'est pas un `item_id` entier mais `(service, service_id)`.
+#[tokio::test]
+async fn l_ordre_manuel_traverse_la_route_des_favoris_de_service() {
+    let app = app();
+    trois_favoris_de_service(&app).await;
+
+    let (status, corps) = post(
+        &app,
+        "/api/v1/profiles/1/favorites/streaming/reorder",
+        json!({"item_type": "track", "items": [
+            {"service": "qobuz", "service_id": "s3"},
+            {"service": "qobuz", "service_id": "s1"},
+            {"service": "qobuz", "service_id": "s2"}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(corps["ordered"], json!(3));
+
+    let (status, corps) = get(
+        &app,
+        "/api/v1/profiles/1/favorites/streaming?item_type=track&sort=manual",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(identifiants(&corps), ["s3", "s1", "s2"]);
+}
+
+/// Le rang est par ONGLET : ranger les albums ne défait pas l'ordre des pistes.
+/// C'est le motif « un chemin corrigé, les autres nus » appliqué aux onglets
+/// des favoris — vérifié à travers la route, pas seulement dans le dépôt.
+#[tokio::test]
+async fn reordonner_un_onglet_ne_defait_pas_l_autre_a_travers_la_route() {
+    let app = app();
+    trois_favoris_locaux(&app).await;
+    for item_id in [21, 22] {
+        post(
+            &app,
+            "/api/v1/profiles/1/favorites/add",
+            json!({"item_type": "album", "item_id": item_id}),
+        )
+        .await;
+    }
+
+    post(
+        &app,
+        "/api/v1/profiles/1/favorites/reorder",
+        json!({"item_type": "track", "item_ids": [8, 9, 7]}),
+    )
+    .await;
+    post(
+        &app,
+        "/api/v1/profiles/1/favorites/reorder",
+        json!({"item_type": "album", "item_ids": [22, 21]}),
+    )
+    .await;
+
+    let (_, pistes) = get(
+        &app,
+        "/api/v1/profiles/1/favorites?item_type=track&sort=manual",
+    )
+    .await;
+    assert_eq!(identifiants_locaux(&pistes), vec![8, 9, 7]);
+    let (_, albums) = get(
+        &app,
+        "/api/v1/profiles/1/favorites?item_type=album&sort=manual",
+    )
+    .await;
+    assert_eq!(identifiants_locaux(&albums), vec![22, 21]);
 }

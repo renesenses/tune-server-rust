@@ -152,6 +152,29 @@ pub struct StreamSession {
     /// PCM nu, sans RIFF. Le consommateur qui voit passer l'en-tête le range
     /// ici ; chaque nouvelle connexion partant de l'octet 0 le reçoit d'abord.
     pub wav_header_stash: std::sync::OnceLock<Vec<u8>>,
+    /// Position, DANS LE FLUX, du prochain octet que le canal rendra.
+    ///
+    /// Un canal de conversion est un TUYAU : il ne connaît qu'un sens et ne
+    /// rejoue pas un octet passé. Le corps HTTP honore pourtant les reprises
+    /// `Range: bytes=N-` par un vrai 206 (l'Eversolo DMP-A8 jette un 200 et
+    /// redemande le même offset en boucle — la « boucle de 4-7 s » des DSD
+    /// convertis). Le 206 annonce donc N ; les octets, eux, sortent d'où le
+    /// tuyau en est.
+    ///
+    /// Sur du PCM ordinaire l'écart s'entend comme un saut. Sur un porteur DoP
+    /// il est FATAL : le marqueur `0x05`/`0xFA` vit dans l'octet de poids fort
+    /// d'un mot de 24 bits, et le renderer place les octets reçus sur la grille
+    /// de trames que l'offset ANNONCÉ implique. Un écart qui n'est pas un
+    /// multiple de la trame décale chaque mot, le marqueur ne tombe plus au bon
+    /// endroit, le DAC ne verrouille pas en DSD et joue le train DSD comme du
+    /// PCM — du bruit blanc (#1894).
+    ///
+    /// Ce compteur donne au corps HTTP l'offset réel de chaque bloc reçu, dont
+    /// il déduit le rognage de phase (`rognage_de_phase`, `tune-stream-http`).
+    /// Il compte les octets TIRÉS du canal, en-tête WAV compris : c'est la
+    /// position du tuyau, pas celle des octets livrés — ceux qu'une connexion
+    /// avortée a emportés dans son tampon de coalescence sont bien consommés.
+    pub octets_du_canal: std::sync::atomic::AtomicU64,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
     /// Comptabilité du ramasse-miettes — voir `cleanup_stale_sessions_with`.
@@ -332,6 +355,7 @@ impl StreamSession {
             detected_channels: std::sync::atomic::AtomicU16::new(0),
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
             wav_header_stash: std::sync::OnceLock::new(),
+            octets_du_canal: std::sync::atomic::AtomicU64::new(0),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
             gc_seen_bytes: std::sync::atomic::AtomicU64::new(0),

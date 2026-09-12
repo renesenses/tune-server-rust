@@ -247,8 +247,12 @@ fn les_deux_ecritures_sont_appelees_avec_la_cle_et_l_appareil() {
              repartirait sans de quoi la joindre au producteur (#3318). \
              Appel lu : {appel}"
         );
+        // R1 (#2219) : le producteur porte désormais le nom d'appareil comme
+        // CHAMP (`self.device_name`, déjà un `&str`) au lieu de l'emprunter à
+        // une variable locale. L'exigence est inchangée — l'appareil doit être
+        // un argument de l'appel — seule l'esperluette a disparu.
         assert!(
-            appel.contains("&device_name"),
+            appel.contains("device_name"),
             "{symptome} est journalisée SANS l'appareil : on ne saurait pas \
              laquelle des sorties a lâché (#3318). Appel lu : {appel}"
         );

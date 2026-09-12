@@ -274,6 +274,36 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib pg_ensure_schema_parity -- --nocapture --test-threads=1
 
+      # #3726 — les ECRITURES, et non plus seulement les schemas.
+      #
+      # Les trois portes ci-dessus comparent des SCHEMAS entre eux. Aucune ne
+      # voit un REDACTEUR : le jour ou quelqu'un reecrit
+      # `let val: String = if online …`, le schema ne bouge pas, les trois
+      # portes restent VERTES, et l'ecriture redevient muette sur tout le parc.
+      #
+      # MESURE du 11/09/2026 sur PostgreSQL 16.15, avant correctif :
+      #   * six reglages de zone (`muted`, `online`, `gapless_enabled`,
+      #     `fixed_volume`, `autoplay_enabled`, DSP) liaient une CHAINE dans une
+      #     colonne SMALLINT/INTEGER — morts sur toute installation NATIVE ;
+      #   * `update_dsp` etait mort sur les DEUX chemins (`dsp_preset_id` est
+      #     BIGINT et recevait un `String`) ;
+      #   * NEUF des onze requetes qui touchent `zones.is_hidden` tombaient, sur
+      #     les deux chemins : `list()` se rabattait alors sur `list_all()` et
+      #     une zone SUPPRIMEE reparaissait ;
+      #   * `execute_returning_id` envoyait le SQL BRUT a PostgreSQL (la poignee
+      #     de transaction ne traduisait pas les `?`) — neuf sites de production
+      #     dont la creation de profil SSO et l'inscription locale ;
+      #   * `profiles_id_seq` restait a 1 apres le semis de la 005, donc la
+      #     toute premiere creation de profil rendait `duplicate key`.
+      #
+      # Le temoin porte ses TROIS contre-epreuves : il rejoue les formes d'avant
+      # et exige l'erreur PostgreSQL litterale. Sans cette etape il serait
+      # compile et jamais execute — le defaut meme que #3715 a mesure.
+      - name: Écritures de zone et de profil sur PostgreSQL (#3726)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib pg_3726 -- --nocapture --test-threads=1
+
       # #3123 — les requetes de tune-server, ENFIN executees sur PostgreSQL.
       #
       # Toutes les etapes ci-dessus visent `tune-core`. Les 419 litteraux SQL
@@ -367,6 +397,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test comptes_par_source_2147 i2147_pg -- --nocapture --test-threads=1
 
+      # #3857 — la requete groupee des comptes de sous-dossiers et le
+      # pre-filtre d'enfant direct ont DEUX ecritures : `instr`/`?n` sur
+      # SQLite, `strpos`/`$n` sur Postgres. Les neuf epreuves du fichier
+      # montent toutes `:memory:` : sans cette etape, la seconde ecriture
+      # serait compilee et JAMAIS executee.
+      - name: Comptes de sous-dossiers sur PostgreSQL (#3857)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test server_contracts pg_3857 -- --nocapture --test-threads=1
       - name: Versions par piste sur PostgreSQL (#2372)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

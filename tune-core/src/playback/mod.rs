@@ -876,6 +876,28 @@ impl PlaybackManager {
             .output_dsp_metrics = value;
     }
 
+    /// Deux instantanés « en cours de lecture » désignent-ils la MÊME piste ?
+    ///
+    /// Conservateur par construction : la réponse n'est `false` que sur une
+    /// différence d'identité POSITIVE — la source, puis `track_id`, puis
+    /// `source_id`. À défaut d'identifiant des deux côtés (radio, flux sans
+    /// identifiant), on retombe sur le titre. Sert à distinguer une recréation
+    /// de flux (même piste) d'un vrai changement de piste (#3884).
+    fn meme_piste(a: &NowPlaying, b: &NowPlaying) -> bool {
+        if a.source != b.source {
+            return false;
+        }
+        match (a.track_id, b.track_id) {
+            (Some(x), Some(y)) => return x == y,
+            (Some(_), None) | (None, Some(_)) => return false,
+            (None, None) => {}
+        }
+        match (a.source_id.as_deref(), b.source_id.as_deref()) {
+            (Some(x), Some(y)) => x == y,
+            _ => a.title == b.title,
+        }
+    }
+
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -889,10 +911,34 @@ impl PlaybackManager {
         // stay there until the seek grace period ends. Detect a recent seek and
         // preserve the seeked position; only a genuine track change (no recent
         // seek) resets to 0.
-        let is_recent_seek = state
+        //
+        // #3884 - la fenêtre de 5 s NE SUFFIT PAS à reconnaître une recréation
+        // de flux. Levente Toth (fil 1764, 0.9.145, ALSA local) : après un
+        // saut, un VRAI changement de piste survenu moins de 5 s plus tard
+        // tombait lui aussi dans cette fenêtre. La barre gardait alors la
+        // position de la piste PRÉCÉDENTE — journal du 11/09 12:40:13, où
+        // `position_ms=95025` (la position de la piste d'avant) est publié pour
+        // une piste démarrée à `position_ms=2044`. Et `last_seek_at` n'était
+        // même pas effacé, ce qui propageait la méprise à la garde de 10 s du
+        // sondeur (`poller/tick.rs`), qui laissait `peak_position_ms`,
+        // `scrobbled_key` et `track_started_at` sur la piste précédente.
+        //
+        // Le critère qui manquait est une CERTITUDE, pas un délai : une
+        // recréation de flux rejoue la MÊME piste, un changement de piste en
+        // joue une autre. La condition n'est donc plus le délai seul, mais le
+        // délai ET l'identité. C'est un RESSERREMENT strict — une conjonction
+        // ajoutée : tout cas dont le verdict change est un cas où l'ancien
+        // verdict était faux ; aucun cas aujourd'hui correct ne peut basculer.
+        let saut_recent = state
             .last_seek_at
             .map(|t| t.elapsed().as_secs() < 5)
             .unwrap_or(false);
+        let est_la_meme_piste = state
+            .now_playing
+            .as_ref()
+            .map(|ancienne| Self::meme_piste(ancienne, &np))
+            .unwrap_or(false);
+        let is_recent_seek = saut_recent && est_la_meme_piste;
         // La recherche est finie : on tient une URL jouable, c'est tout l'objet
         // de cet appel. Sans cette ligne le drapeau levé par l'orchestrateur
         // avant `resolve_stream` n'était JAMAIS abaissé sur le chemin qui
@@ -2053,6 +2099,159 @@ mod tests {
             8_000,
             "une secousse isolée redevient inoffensive après que le plancher a cédé"
         );
+    }
+
+    // ── #3884 — un changement de piste juste après un saut ──────────────────
+    //
+    // Levente Toth, fil 1764, 11/09/2026, Tune 0.9.145, Linux ALSA, sortie
+    // locale : « The next track will start after clicking, but the timeline
+    // will stay in the same place, or jump a bit. After the 3rd - 4th track
+    // change the line resets correctly. »
+    //
+    // La chronologie exacte de son journal, zone 5, le 11/09 :
+    //
+    //   12:40:07.793  seek_local_output_recreating_stream  position_ms=89094
+    //   12:40:08.161  seek_local_output_complete           position_ms=89094
+    //   12:40:13.016  transcode_required  …/Sure the Sun Will Rise.flac
+    //   12:40:13.285  poller_generation_changed_during_seek_preserving_position
+    //                                                      position_ms=95025
+    //
+    // 4,86 s séparent la fin du saut du VRAI changement de piste : sous la
+    // fenêtre de 5 s. La position publiée pour la piste neuve est celle de la
+    // piste d'avant (95 025 ms ≈ le 1:36 de sa capture), alors que le flux
+    // démarrait à 2 044 ms.
+
+    /// « Before Midnight Tonight », la piste sur laquelle il a bougé le curseur.
+    fn piste_du_saut() -> NowPlaying {
+        NowPlaying {
+            track_id: Some(1764),
+            title: "Before Midnight Tonight".into(),
+            source: "local".into(),
+            source_id: Some("/musique/03. Before Midnight Tonight.flac".into()),
+            duration_ms: 316_781,
+            ..Default::default()
+        }
+    }
+
+    /// « Sure the Sun Will Rise », la piste SUIVANTE — celle de sa capture.
+    fn piste_suivante() -> NowPlaying {
+        NowPlaying {
+            track_id: Some(1765),
+            title: "Sure the Sun Will Rise".into(),
+            source: "local".into(),
+            source_id: Some("/musique/04. Sure the Sun Will Rise.flac".into()),
+            duration_ms: 295_693,
+            ..Default::default()
+        }
+    }
+
+    /// Le cas que la fenêtre de 5 s protège, et qui doit le rester : le saut
+    /// recrée le flux, `play()` rejoue la MÊME piste, le curseur ne retombe
+    /// pas à 0:00.
+    #[tokio::test]
+    async fn la_recreation_de_flux_d_un_saut_garde_la_position() {
+        let pm = super::PlaybackManager::new();
+        pm.play(5, piste_du_saut()).await;
+        pm.update_position(5, 12_000).await;
+
+        // Le geste de l'utilisateur : `transport::seek` pose la cible…
+        pm.seek(5, 89_094).await;
+        // …puis `replay_zone_at_position` recrée le flux, ce qui repasse par
+        // `play()` avec la MÊME piste (transport.rs:1546-1553 recopie
+        // `track_id`, `source` et `source_id` de la `NowPlaying` courante dans
+        // la `PlayRequest`, et `composer_le_now_playing` les rend tels quels).
+        pm.play(5, piste_du_saut()).await;
+
+        assert_eq!(
+            pm.get_state(5).await.position_ms,
+            89_094,
+            "la recréation de flux d'un saut ne doit PAS renvoyer le curseur à 0"
+        );
+        assert!(
+            pm.get_state(5).await.last_seek_at.is_some(),
+            "la grâce du sondeur doit couvrir toute la recréation de flux"
+        );
+    }
+
+    /// Le défaut de Levente : moins de 5 s plus tard, une AUTRE piste démarre.
+    /// Elle doit repartir de zéro — et la marque de saut doit tomber, sans
+    /// quoi la garde de 10 s du sondeur hérite de la méprise.
+    #[tokio::test]
+    async fn un_changement_de_piste_moins_de_cinq_secondes_apres_un_saut_repart_de_zero() {
+        let pm = super::PlaybackManager::new();
+        pm.play(5, piste_du_saut()).await;
+        pm.seek(5, 89_094).await;
+        pm.play(5, piste_du_saut()).await; // recréation de flux du saut
+        pm.update_position(5, 95_025).await; // la barre avance, 12:40:13
+
+        // 4,86 s après le saut : la piste SUIVANTE. Aucun `sleep` — c'est bien
+        // dans la fenêtre de 5 s que le cas doit être jugé correctement.
+        pm.play(5, piste_suivante()).await;
+
+        let etat = pm.get_state(5).await;
+        assert_eq!(
+            etat.position_ms, 0,
+            "une piste neuve repart de 0:00, pas de la position de la précédente (#3884)"
+        );
+        assert!(
+            etat.last_seek_at.is_none(),
+            "la marque de saut doit tomber, sinon la garde de 10 s du sondeur \
+             garde `peak_position_ms` / `scrobbled_key` de la piste d'avant"
+        );
+    }
+
+    /// Passé la fenêtre, rien ne change : c'est le comportement d'avant, et il
+    /// était déjà correct (12:40:17 et 12:40:18 dans son journal).
+    #[tokio::test]
+    async fn sans_saut_recent_un_changement_de_piste_repart_de_zero() {
+        let pm = super::PlaybackManager::new();
+        pm.play(5, piste_du_saut()).await;
+        pm.update_position(5, 120_000).await;
+        pm.play(5, piste_suivante()).await;
+        assert_eq!(pm.get_state(5).await.position_ms, 0);
+    }
+
+    /// `meme_piste` ne répond « autre piste » que sur une différence qu'elle
+    /// peut PROUVER. Les deux pistes du fil 1764 se distinguent par leur
+    /// `track_id` ; une radio, qui n'en a pas, se distingue par son titre.
+    #[test]
+    fn meme_piste_ne_tranche_que_sur_une_difference_positive() {
+        let a = piste_du_saut();
+        assert!(super::PlaybackManager::meme_piste(&a, &a));
+        assert!(!super::PlaybackManager::meme_piste(&a, &piste_suivante()));
+
+        // Même piste, habillage re-résolu autrement (durée, pochette) : la
+        // recréation de flux repasse par la résolution, et ces champs-là ne
+        // doivent pas peser sur l'identité.
+        let mut rehabille = piste_du_saut();
+        rehabille.duration_ms = 316_000;
+        rehabille.cover_path = Some("/covers/x.jpg".into());
+        rehabille.stream_id = Some("flux-neuf".into());
+        assert!(super::PlaybackManager::meme_piste(&a, &rehabille));
+
+        // Un identifiant d'un côté seulement : on ne peut rien affirmer de
+        // commun, c'est une autre piste.
+        let mut sans_id = piste_du_saut();
+        sans_id.track_id = None;
+        assert!(!super::PlaybackManager::meme_piste(&a, &sans_id));
+
+        // Sans identifiant des deux côtés — une radio : le titre tranche.
+        let radio = NowPlaying {
+            track_id: None,
+            source: "radio".into(),
+            source_id: None,
+            title: "FIP".into(),
+            ..Default::default()
+        };
+        let mut autre_radio = radio.clone();
+        autre_radio.title = "FIP Rock".into();
+        assert!(super::PlaybackManager::meme_piste(&radio, &radio));
+        assert!(!super::PlaybackManager::meme_piste(&radio, &autre_radio));
+
+        // Deux sources différentes ne sont jamais la même piste.
+        let mut qobuz = piste_du_saut();
+        qobuz.source = "qobuz".into();
+        assert!(!super::PlaybackManager::meme_piste(&a, &qobuz));
     }
 }
 

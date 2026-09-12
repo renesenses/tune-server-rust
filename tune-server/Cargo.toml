@@ -135,6 +135,13 @@ tokio = { workspace = true, features = ["test-util"] }
 name = "sendspin_point_d_acces_s2a"
 path = "tests/sendspin_point_d_acces_s2a.rs"
 
+# #3326 — le mode de transition (un `client/hello` en clair). `autotests =
+# false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
+# la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
+[[test]]
+name = "sendspin_mode_transition"
+path = "tests/sendspin_mode_transition.rs"
+
 [[test]]
 name = "server_contracts"
 path = "tests/server_contracts.rs"
@@ -224,6 +231,27 @@ required-features = ["postgres"]
 name = "ajouts_recents_fenetre"
 path = "tests/ajouts_recents_fenetre.rs"
 
+# #3867 : l adresse ANNONCEE gouverne les URL que les taches de fond remettent a
+# un tiers. Trois sites de `background.rs` appelaient `get_local_ip()` brut, a
+# deux fonctions d un annonceur SSDP qui, lui, respecte `advertised_ip`. Le
+# temoin garde les deux sites corriges ET l abstention des deux autres.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Posee ICI, au milieu du fichier, et non a la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent a chaque fois.
+[[test]]
+name = "adresse_annoncee_taches_de_fond_3867"
+path = "tests/adresse_annoncee_dans_les_taches_de_fond_3867.rs"
+
+# #3839 : l ecran Ambiance ne pouvait pas dire que la tour texte du CLAP est
+# anglaise et que la traduction depend d une cle IA — le client ne voit aucune
+# cle. Le statut acoustique le porte desormais. Sans cette cible, `autotests =
+# false` plus haut laisserait ce fichier JAMAIS compile : un faux vert.
+[[test]]
+name = "ambiance_traduction_annoncee_3839"
+path = "tests/ambiance_traduction_annoncee_3839.rs"
+
 # #3101 : la portée de répertoire de l'audit de bibliothèque. Le motif LIKE de
 # `GET /export/library-audit.csv?dir=…` était écrit à la main, sans séparateur :
 # auditer `…/Rock` ramenait `…/Rockabilly` et le déclarait fantôme. Le témoin
@@ -258,6 +286,38 @@ path = "tests/portee_unicite_file_path_2939.rs"
 [[test]]
 name = "base_unique_lancement_i3185"
 path = "tests/base_unique_lancement_i3185.rs"
+
+# #3733 : `POST /zones/{id}/play` rendait `400 "no tracks to play"` sans AUCUNE
+# ligne de journal, et la v2 avale l'erreur — serveur muet + client muet, et
+# « lecture des albums impossible » n'etait instruisable par personne. Abonne
+# `tracing` GLOBAL, donc un binaire a lui seul et un seul essai dedans (lecon
+# de `panne_sql_journalisee`). `autotests = false` plus haut — sans cette
+# cible, le fichier ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "refus_de_lecture_audible_3733"
+path = "tests/refus_de_lecture_audible_3733.rs"
+
+# #3810 : la route du bouton « Enrichir les metadonnees » n'ecrivait rien a
+# l'entree — sa seule trace etait la fin de passe, qui sur 262 858 pistes
+# arrive dans plusieurs semaines — et un refus de quota partait en 429 muet.
+# Meme raison que ci-dessus pour le binaire dedie : abonne `tracing` GLOBAL,
+# un binaire, un essai. `autotests = false` plus haut — sans cette cible, le
+# fichier ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "enrichissement_audible_3810"
+path = "tests/enrichissement_audible_3810.rs"
+
+# #2718 : sur Linux `db_path` vaut « tune.db » et se resout contre le REPERTOIRE
+# COURANT (Windows et macOS ont ete relocalises par #3185, Linux jamais), et
+# `SQLITE_OPEN_CREATE` cree une base vide en silence — « la bibliotheque a
+# disparu » sans qu'une ligne soit effacee. `sqlite_opened` annoncait le chemin
+# BRUT, qui ne designe aucun fichier. Binaire dedie pour DEUX raisons cumulees :
+# abonne `tracing` global, et `set_current_dir` global au processus.
+# `autotests = false` plus haut — sans cette cible, le fichier ne serait jamais
+# compile, donc vert contre rien.
+[[test]]
+name = "base_ouverte_nommee_2718"
+path = "tests/base_ouverte_nommee_2718.rs"
 
 # La migration Windows vers %LOCALAPPDATA% copiait le `.db` SEUL, sans son
 # `-wal` ni son `-shm`. `autotests = false` plus haut — sans cette cible, le

@@ -22,3 +22,8 @@ bytes = { workspace = true }
 # n'entre que dans les cibles de test : le binaire publié ne le compile pas.
 # Même déclaration que `tune-core` et `tune-server` (#2073, #3140).
 tokio = { workspace = true, features = ["test-util"] }
+# Test-only : la garde de #2352 lit le JOURNAL, pas une valeur de retour. Elle
+# pose un abonne global et relit la ligne `service_fichier_termine`. Meme
+# declaration que `tune-core` et `tune-server`, qui portent deja des gardes
+# de journal (#3180, #3479, #3568).
+tracing-subscriber = { workspace = true }

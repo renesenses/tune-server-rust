@@ -1261,7 +1261,39 @@ struct PgTxHandle<'a> {
 impl DbTxHandle for PgTxHandle<'_> {
     fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {
         let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
-        let mut sql_owned = sql.to_string();
+        // Les `?` deviennent `$1, $2, …` ICI aussi, exactement comme dans
+        // `PostgresBackend::execute`. Ce `to_string()` nu était le défaut : la
+        // poignée de transaction envoyait le SQL BRUT à PostgreSQL, et
+        // `execute_returning_id` passe par elle (l'implémentation par défaut du
+        // trait l'enveloppe dans `write_tx`). Toute écriture rédigée avec des
+        // `?` et posée par `execute_returning_id` échouait donc sur PostgreSQL :
+        //
+        //   syntax error at or near ","
+        //
+        // MESURE du 11/09/2026, relevé DOUZE sites de production, comptés par
+        // balayage de `tune-core/src` et `tune-server/src` (tout appel à
+        // `execute_returning_id` dont le littéral SQL porte un `?`) :
+        //
+        //   routes/cloud.rs:317          profils — création de profil SSO (#3726)
+        //   auth.rs:607                  profils — inscription locale
+        //   routes/network.rs:137        network_mounts — ajout d'un partage
+        //   routes/playback.rs:3846      alarms
+        //   routes/radios.rs:2605        alarms
+        //   routes/radios.rs:1969        radio_favorites
+        //   routes/offline.rs:212        offline_cache
+        //   user_profiles.rs:144         user_profiles
+        //   library/smart_collections.rs:281  smart_collections
+        //   metadata/suggestions.rs:117  metadata_suggestions
+        //   playback_history.rs:89       playback_history
+        //   config_backup.rs:820         playlists — restauration de sauvegarde
+        //
+        // Presque tous avalent l'erreur par un `.unwrap_or(0)` ou un `.ok()`,
+        // ce qui rendait le défaut MUET.
+        //
+        // Les dépôts qui construisent leur SQL par `SqlDialect::placeholder`
+        // écrivent déjà `$1` : la traduction les laisse INTACTS, elle ne touche
+        // que le `?`.
+        let mut sql_owned = PostgresBackend::translate_placeholders(sql);
         let last_id_handle = self.last_id.clone();
 
         // Auto-append RETURNING id for bare INSERTs (same logic as
@@ -1349,7 +1381,10 @@ impl DbTxHandle for PgTxHandle<'_> {
         params: &[&dyn ToSqlValue],
     ) -> Result<Option<Vec<SqlValue>>, String> {
         let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
-        let sql_owned = sql.to_string();
+        // Même traduction que `PostgresBackend::query_one` / `query_many` : une
+        // lecture posée dans une transaction doit accepter le même dialecte
+        // qu'une lecture posée hors transaction.
+        let sql_owned = PostgresBackend::translate_placeholders(sql);
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -1376,7 +1411,10 @@ impl DbTxHandle for PgTxHandle<'_> {
         params: &[&dyn ToSqlValue],
     ) -> Result<Vec<Vec<SqlValue>>, String> {
         let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
-        let sql_owned = sql.to_string();
+        // Même traduction que `PostgresBackend::query_one` / `query_many` : une
+        // lecture posée dans une transaction doit accepter le même dialecte
+        // qu'une lecture posée hors transaction.
+        let sql_owned = PostgresBackend::translate_placeholders(sql);
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {

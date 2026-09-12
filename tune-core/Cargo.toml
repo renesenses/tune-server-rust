@@ -180,6 +180,34 @@ path = "tests/journal_descriptif_illisible.rs"
 name = "journal_insertion_par_lot"
 path = "tests/journal_insertion_par_lot.rs"
 
+# #3807 — VU-metres et barregraphe morts sur une zone Diretta. `autotests =
+# false` en tete de ce manifeste : sans cette cible, le fichier ne serait
+# JAMAIS compile et la porte rendrait un vert contre rien. Declaree ici, au
+# MILIEU du manifeste, et non en queue ou tous les lots ajoutent la leur.
+[[test]]
+name = "niveaux_sortie_pull_3807"
+path = "tests/niveaux_sortie_pull_3807.rs"
+
+# #2373 T2 — la reconciliation du catalogue en ligne, exercee A BLANC, n'ecrit
+# rien. `autotests = false` en tete de ce manifeste : sans cette cible, le
+# fichier ne serait JAMAIS compile et la porte rendrait un vert contre rien.
+#
+# Binaire A LUI SEUL, et non un `mod` de `integration_contracts` : la
+# reconciliation interroge `scanner::activite::scan_bibliotheque_en_cours()`,
+# un compteur de PROCESSUS. Un voisin qui balaie une bibliotheque dans le meme
+# binaire ferait refuser la reconciliation et rendrait ce temoin intermittent.
+# Declaree ici, au MILIEU du manifeste, et non en queue ou tous les lots
+# ajoutent la leur.
+[[test]]
+name = "reconciliation_a_blanc_2373"
+path = "tests/reconciliation_a_blanc_2373.rs"
+
+# #3907 — ce que l analyse spectrale du serveur resout vraiment. Meme raison :
+# `autotests = false`. Cible minuscule, elle ne tire que tune_core.
+[[test]]
+name = "spectre_resolution_serveur_3907"
+path = "tests/spectre_resolution_serveur_3907.rs"
+
 # Meme famille, meme raison (#2566) : abonne `tracing` GLOBAL, donc un binaire
 # a lui seul. Il compte les lignes qu une panne de sondage coute au journal —
 # 79 avant, 9 apres — sans toucher au reseau ni au recul exponentiel.
@@ -361,3 +389,14 @@ path = "tests/reprise_favoris_streaming.rs"
 [[test]]
 name = "journal_latence_demarrage_local_i3568"
 path = "tests/journal_latence_demarrage_local_i3568.rs"
+
+# #2219, tranche R3 — le mélangeur PCM rend un MÉLANGE ou une erreur nommée.
+# Binaire à lui seul : il pose un `#[global_allocator]` qui compte les
+# allocations de `PcmMixer::mix_into`, et la cible d'essais de la bibliothèque
+# en porte déjà un (`outputs::local::ringbuf_tests`) — deux allocateurs globaux
+# dans le même binaire ne compilent pas. `autotests = false` en tête de ce
+# manifeste : sans cette cible, le fichier ne serait JAMAIS compilé et la porte
+# rendrait un vert contre rien.
+[[test]]
+name = "melangeur_multi_producteurs_r3"
+path = "tests/melangeur_multi_producteurs_r3.rs"

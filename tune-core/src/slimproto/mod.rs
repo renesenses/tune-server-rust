@@ -920,6 +920,12 @@ impl SlimProtoServer {
                 }
                 Err(e) => {
                     warn!(error = %e, "slimproto_accept_error");
+                    // Sans ce delai, une erreur PERSISTANTE (EMFILE/ENFILE :
+                    // table de descripteurs pleine) rend la main
+                    // immediatement, a chaque tour : un coeur sature et un
+                    // journal qui grossit a la vitesse du disque, au repos et
+                    // sans qu'aucune lecture soit en cours (#2156).
+                    crate::temporisation_reseau::temporiser_apres_erreur_reseau().await;
                 }
             }
         }

@@ -530,11 +530,11 @@ impl StreamingService for AmazonMusicService {
     }
 
     async fn get_playlist(&self, _playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
-        Err("not implemented".into())
+        Err(TuneError::Unsupported("not implemented".into()))
     }
 
     async fn get_playlist_tracks(&self, _playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        Err("not implemented".into())
+        Err(TuneError::Unsupported("not implemented".into()))
     }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {

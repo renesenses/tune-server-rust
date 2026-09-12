@@ -1,5 +1,5 @@
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::traits::{OutputStatus, PlayMedia, TransportState};
@@ -135,6 +135,37 @@ impl GaplessHandler {
                             debug!(error = %e, "gapless_set_next_failed");
                         }
                     }
+                } else {
+                    // #2270 — la seule branche qui laissait une session-canal
+                    // vivante SANS ecrire une seule ligne.
+                    //
+                    // `resolve_queue_item_url` ci-dessus a deja cree la session
+                    // (`stream_session_created`). Si la sortie n'est pas dans
+                    // le registre vivant a cet instant, ce `if let` tombait a
+                    // cote sans `else` : la session n'etait remise a personne,
+                    // personne ne la lisait, et le seul indice restant etait
+                    // `stale_session_removed` une demi-heure plus tard. C'est
+                    // mot pour mot la sequence de journal de Dimitri.
+                    //
+                    // Le chien de garde `local_stream_never_consumed` (#2653)
+                    // ne couvre pas ce cas et ne le peut pas : il est arme dans
+                    // `orchestrator::transport`, juste avant `send_to_output`,
+                    // et son commentaire dit exclure les sessions « merely
+                    // prepared in advance for gapless playback ». Un flux
+                    // prepare pour une sortie absente n'arme donc RIEN.
+                    //
+                    // `warn!` et non `debug!` : le niveau par defaut est `info`
+                    // (tune-server/src/config.rs), donc un `debug!` ici serait
+                    // une trace que le terrain ne remonte jamais — c'est deja
+                    // le cas de `gapless_set_next_failed` et de
+                    // `play_not_announced_output_not_sent`.
+                    warn!(
+                        zone_id,
+                        next_pos,
+                        device_id = %device_id,
+                        stream_id = ?resolved.stream_id,
+                        "gapless_sortie_absente_du_registre_session_orpheline"
+                    );
                 }
             }
             Err(e) => {
@@ -424,5 +455,39 @@ mod tests {
         h.on_play_start().await;
         let state = h.state.lock().await.clone();
         assert_eq!(state, GaplessState::Idle);
+    }
+
+    /// Le pre-armement NOMME la sortie absente au lieu de se taire (#2270).
+    ///
+    /// `resolve_queue_item_url` a deja cree une session-canal quand on arrive
+    /// a `outputs.get(device_id)`. Quand ce `if let` tombe a cote, la session
+    /// reste vivante, personne ne la lit, et avant le 11/09/2026 il n'y avait
+    /// RIEN dans le journal avant `stale_session_removed`, une demi-heure plus
+    /// tard — la sequence exacte du signalement de Dimitri.
+    ///
+    /// Garde de cablage, faible et assumee : elle relit le texte du module.
+    /// C'est le seul filet possible ici. Le chien de garde
+    /// `local_stream_never_consumed` (#2653) ne couvre pas cette branche et ne
+    /// le peut pas : il est arme dans `orchestrator::transport`, juste avant
+    /// `send_to_output`, et son commentaire dit exclure les sessions « merely
+    /// prepared in advance for gapless playback ». Et reproduire le cas
+    /// demanderait une sortie qui disparait du registre entre la resolution et
+    /// le pre-armement, hors de portee sans materiel audio.
+    #[test]
+    fn le_prearmement_gapless_nomme_la_sortie_absente() {
+        let source = include_str!("gapless.rs");
+        assert!(
+            source.contains("\"gapless_sortie_absente_du_registre_session_orpheline\""),
+            "le pre-armement gapless est redevenu muet quand la sortie manque \
+             au registre : la session-canal deja creee reste orpheline et le \
+             journal ne portera plus que `stale_session_removed`, trente \
+             minutes trop tard (#2270)"
+        );
+        assert!(
+            source.contains("warn!("),
+            "le marqueur existe mais plus au niveau `warn` : le niveau par \
+             defaut est `info`, un `debug!` ne remonterait jamais du terrain \
+             (#2270)"
+        );
     }
 }

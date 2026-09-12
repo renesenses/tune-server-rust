@@ -153,15 +153,12 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
     // à un entier est prouvée dans le code. Leur absence de cette liste est
     // volontaire.
     //
-    // `zones.is_hidden` n'est visée par aucune migration de rattrapage, sur
-    // aucun des deux chemins : elle n'existe que dans `ENSURE_COLUMNS`, en
-    // TEXT DEFAULT '0'.
-    (
-        "native",
-        "zones",
-        "is_hidden",
-        "TEXT vs INTEGER — posée seulement par ENSURE_COLUMNS, aucune conversion (#2995)",
-    ),
+    // `zones.is_hidden` était ici, sur les DEUX chemins. Elle est CONVERTIE
+    // par la migration 056 (#3726) : `ENSURE_COLUMNS` la déclare désormais en
+    // SMALLINT, et la 056 convertit les bases existantes. Son absence de cette
+    // liste est volontaire — elle n'avait aucun rédacteur à réparer (les cinq
+    // écritures du dépôt posent le littéral 0 ou 1), et NEUF des onze requêtes
+    // qui la touchent tombaient tant qu'elle restait TEXT.
     // ── Base MIGRÉE (bascule SQLite→PG) ────────────────────────────────────
     // La migration 032 AJOUTE ces réglages en INTEGER au lieu de les
     // CONVERTIR : sur une base migrée `PG_FULL_SCHEMA` les a déjà posés en
@@ -222,18 +219,11 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
         "muted",
         "TEXT vs INTEGER — jamais convertie sur le chemin migré (#2995)",
     ),
-    (
-        "migree",
-        "zones",
-        "online",
-        "TEXT vs INTEGER — jamais convertie sur le chemin migré (#2995)",
-    ),
-    (
-        "migree",
-        "zones",
-        "is_hidden",
-        "TEXT vs INTEGER — posée seulement par ENSURE_COLUMNS, aucune conversion (#2995)",
-    ),
+    // `zones.online` était ici : CONVERTIE par la 056 (#3726). Ses deux
+    // rédacteurs (`update_online`, `set_online_by_device`) liaient une CHAÎNE,
+    // donc ils étaient morts sur le chemin NATIF où la colonne est SMALLINT —
+    // aucune zone n'y était jamais marquée en ligne. Ils lient un `i64` depuis
+    // le même commit, ce qui est ce qui autorise la conversion.
     (
         "migree",
         "zones",
@@ -320,17 +310,12 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
          sur le chemin NATIF, en sens INVERSE : la reparation est TEXT des deux \
          cotes, pas INTEGER (#3715)",
     ),
-    (
-        "migree",
-        "profiles",
-        "is_admin",
-        "TEXT vs INTEGER — NE PAS convertir seule. MESURE : `boolean -> smallint` \
-         est REFUSE en affectation et `routes/cloud.rs` lie `user.is_admin` en \
-         booleen — la conversion tuerait la creation de profil SSO sur le parc \
-         migre. Degat actuel MESURE : `as_bool()` rend `None` sur un \
-         `SqlValue::Text`, donc `GET /auth/me` rend `is_admin: null` au lieu de \
-         true/false sur toute base migree. Reparer la liaison d'abord (#3715)",
-    ),
+    // `profiles.is_admin` était ici, avec pour motif « réparer la liaison
+    // d'abord ». C'est fait : `routes/cloud.rs` lie un `i64` depuis le même
+    // commit, et la 056 convertit la colonne (#3726). Le dégât mesuré allait
+    // au-delà de `GET /auth/me` : `POST /auth/login` lit `is_admin` par
+    // `as_bool().unwrap_or(false)`, qui rend `None` sur un `SqlValue::Text` —
+    // un administrateur se connectait donc avec le rôle `user`, en silence.
     (
         "migree",
         "radio_stations",
@@ -341,16 +326,87 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
          donne le meme ordre sur '0'/'1' que sur 0/1. Convertible sans urgence \
          mesuree, apres verification de chaque redacteur (#3715)",
     ),
+    // `zones.dsp_enabled` était ici, avec pour motif « réparer `update_dsp`
+    // d'abord ». C'est fait dans le même commit : `update_dsp` lie désormais
+    // `Option<i64>` et `i64` — il était mort sur TOUT PostgreSQL, natif compris,
+    // parce que `dsp_preset_id` est BIGINT des deux côtés et recevait un
+    // `String`. La 056 convertit la colonne (#3726).
+    // ── #2001 piste 2 — le rang manuel des favoris, mesuré le 12/09/2026 ───
+    //
+    // Le rang manuel (`favorites.position` et `streaming_favorites.position`,
+    // PR #3943, migration SQLite 100 / PG 057) est DÉLIBÉRÉMENT TEXT côté
+    // PostgreSQL, sur les deux chemins. C'est l'écart en sens INVERSE de celui
+    // que cette porte cherche : ce n'est pas une conversion oubliée, c'est le
+    // seul type que les rédacteurs acceptent.
+    //
+    // Les trois faits MESURÉS le 12/09/2026 sur la tête de `batch/bugs-11`,
+    // qui sont ce qui autorise ces quatre lignes :
+    //
+    // 1. **Les deux rédacteurs lient une CHAÎNE.** `reorder_favorites`
+    //    (db/profile_repo.rs) et `StreamingFavoritesRepo::reorder`
+    //    (db/streaming_favorites_repo.rs) posent le rang par
+    //    `(rang as i64 + 1).to_string()`. La règle qui gouverne cette liste —
+    //    « une colonne TEXT
+    //    ne se convertit que si TOUS ses rédacteurs lient déjà un entier » —
+    //    interdit donc la conversion : en BIGINT, PostgreSQL rendrait
+    //    « column "position" is of type bigint but expression is of type text »
+    //    et le réordonnancement serait mort sur tout le parc PostgreSQL.
+    //    C'est le sens de l'écart, pas son existence, qui diffère des lignes
+    //    ci-dessus.
+    // 2. **AUCUN `ORDER BY position` ne touche ces deux tables.** Vérifié sur
+    //    tout le dépôt : les quatre requêtes de lecture du rang
+    //    (`list_favorites_*_pour_tri`, `list_*_pour_rang`) rangent par
+    //    `created_at DESC` ; les seuls `ORDER BY position` du dépôt portent sur
+    //    `queue_items`, `playlist_tracks` et `track_credits`, et les `ORDER BY`
+    //    bâtis (album_repo, smart_collections, smart_playlists, smart_ai) ne
+    //    nomment jamais ces tables. L'ordre ne dépend donc PAS du moteur.
+    // 3. **Le rang est comparé EN RUST.** `favorites_sort::trier_par_rang`
+    //    reçoit `r.get(7)`/`r.get(10)` passé par `SqlValue::as_i64()`, qui
+    //    reparse le TEXT (`s.parse().ok()`). Un NULL — « jamais rangé à la
+    //    main » — et une valeur non numérique rendent tous deux `None`, que
+    //    `comparer_rang` envoie en FIN de liste dans les deux sens : le même
+    //    ordre sur PostgreSQL et sur SQLite.
+    //
+    // Ces lignes partiront le jour où les deux rédacteurs lieront un entier —
+    // et il faudra alors une conversion gardée sur le chemin migré, pas un
+    // `ADD COLUMN … BIGINT` (no-op sur `PG_FULL_SCHEMA`).
+    (
+        "native",
+        "favorites",
+        "position",
+        "TEXT vs INTEGER — DELIBERE, migration PG 057 (#2001 piste 2). MESURE le \
+         12/09/2026 : les deux redacteurs du rang lient `(rang).to_string()`, donc \
+         une colonne BIGINT rendrait « column \"position\" is of type bigint but \
+         expression is of type text » et tuerait le reordonnancement. Aucun \
+         `ORDER BY position` ne touche cette table : le rang est relu par \
+         `as_i64()` et compare en Rust (`favorites_sort::trier_par_rang`), donc \
+         l'ordre est le meme sur les deux moteurs",
+    ),
+    (
+        "native",
+        "streaming_favorites",
+        "position",
+        "TEXT vs INTEGER — DELIBERE, meme motif que `favorites.position`. Ici la \
+         colonne nait de `ENSURE_TABLES` (postgres.rs), ou TOUTE la table est en \
+         TEXT, `id` et `profile_id` compris (voir les deux lignes de #3715 \
+         ci-dessus). `StreamingFavoritesRepo::reorder` lie le rang en chaine \
+         (#2001 piste 2)",
+    ),
     (
         "migree",
-        "zones",
-        "dsp_enabled",
-        "TEXT vs INTEGER — NE PAS convertir seule. MESURE : `text -> smallint` est \
-         REFUSE en affectation et `ZoneRepo::update_dsp` lie `en: String` — la \
-         conversion echangerait la lecture fausse (`COALESCE types text and integer \
-         cannot be matched` sur `get_dsp_config`) contre une ecriture refusee. Au \
-         passage, MESURE : `update_dsp` est DEJA mort sur TOUT PostgreSQL, natif \
-         compris — `dsp_preset_id` est bigint et recoit un `String` (#3715)",
+        "favorites",
+        "position",
+        "TEXT vs INTEGER — DELIBERE, `PG_FULL_SCHEMA` porte toute cette table en \
+         TEXT parce que la copie SQLite->PG lie chaque valeur en texte. Meme \
+         motif que le chemin natif : redacteurs en chaine, lecture par `as_i64()`, \
+         tri en Rust, aucun `ORDER BY position` (#2001 piste 2)",
+    ),
+    (
+        "migree",
+        "streaming_favorites",
+        "position",
+        "TEXT vs INTEGER — DELIBERE, meme motif que les trois lignes ci-dessus \
+         (#2001 piste 2)",
     ),
 ];
 
@@ -701,13 +757,21 @@ fn l_inventaire_des_ecarts_toleres_est_propre() {
     // exactement l'affaissement silencieux que ce garde-fou combat.
     assert_eq!(
         ECARTS_TOLERES.len(),
-        23,
-        // 3 côté natif, 20 côté migré. Le 31/08/2026 il valait 16 ; #3715 en a
+        22,
+        // 4 côté natif, 18 côté migré. Le 31/08/2026 il valait 16 ; #3715 en a
         // retiré 2 (tolérances périmées, `zones.dlna_wav24` et
         // `zones.dlna_play_delay_ms`, réparées depuis) et inscrit les 9
-        // divergences que la migration 053 ne convertit pas. Compte MESURÉ par
-        // `parite_des_types_pg_sqlite` et `aucune_exception_perimee` sur le
-        // PostgreSQL 16 de la CI, pas estimé à la lecture des sources.
+        // divergences que la migration 053 ne convertit pas, d'où 23 ; #3726 en
+        // retire 5 — `zones.is_hidden` (les deux chemins), `zones.online`,
+        // `zones.dsp_enabled` et `profiles.is_admin` —, converties par la
+        // migration 056 APRÈS réparation de leurs rédacteurs dans le même
+        // commit, d'où 18. Le 12/09/2026, #2001 piste 2 en ajoute 4 — le rang
+        // manuel des favoris sur les DEUX tables et les DEUX chemins —, d'où
+        // 22. Ces quatre-là ne sont pas un oubli : la migration 057 choisit
+        // TEXT, et la mesure qui l'autorise est écrite au-dessus de leurs
+        // lignes. Compte MESURÉ par `parite_des_types_pg_sqlite` et
+        // `aucune_exception_perimee` sur un PostgreSQL 16 réel, pas estimé à la
+        // lecture des sources.
         "le nombre d'écarts tolérés a changé — mettre à jour ce compte ET #2995"
     );
 }

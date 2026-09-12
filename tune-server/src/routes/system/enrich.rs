@@ -82,6 +82,18 @@ pub(crate) async fn gate_enrichment(state: &AppState) -> Result<bool, (StatusCod
     if !is_premium {
         let (used, limit) = get_daily_enrichment_usage(&settings);
         if used >= limit {
+            // #3810 — un refus de quota cesse d'être muet côté serveur.
+            //
+            // Le 429 partait sans une ligne de journal, et l'interface v2
+            // avale le corps de l'erreur pour afficher un « échec du
+            // démarrage » générique (#3732). Le testeur lisait donc un message
+            // qui ne nomme pas la cause, et le serveur n'en gardait aucune
+            // trace : le refus était invisible des DEUX côtés.
+            tracing::warn!(
+                used,
+                limit,
+                "enrichissement_refuse_quota_gratuit — palier gratuit, quota du jour épuisé"
+            );
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({

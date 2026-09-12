@@ -457,6 +457,16 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     #[cfg(not(feature = "audio-embedding"))]
     let paused_reason: Option<&str> = None;
 
+    // #3839 — la tour texte du CLAP est entrainee en anglais. Une requete
+    // francaise n'est traduite que si l'utilisateur a configure une cle IA, et
+    // le client n'a AUCUN moyen de le savoir : les cles ne sortent d'aucune
+    // route. Sans cette ligne, l'ecran Ambiance ne peut ni conseiller l'anglais
+    // ni renvoyer aux reglages — c'est le silence que JeromeQ a rencontre
+    // (fil 1751). Le serveur SAIT ; il le dit ici.
+    let translation_available = tune_core::ai::translate::cle_disponible(
+        &tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone()),
+    );
+
     Json(json!({
         "available": available,
         "enabled": enabled,
@@ -477,5 +487,8 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         // et la jauge ne finissait jamais (#1819).
         "pending_tracks": (eligible - processed).max(0),
         "throttle": throttle,
+        // Une requete libre en francais est-elle traduite avant d'atteindre la
+        // tour texte ? `false` = elle part brute, et l'ecran doit le dire.
+        "translation_available": translation_available,
     }))
 }

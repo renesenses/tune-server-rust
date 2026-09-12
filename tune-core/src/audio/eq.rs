@@ -638,6 +638,27 @@ impl EqProcessor {
         }
         self.states.clone_from(&previous.states);
         self.dither_states.clone_from(&previous.dither_states);
+        // #3479 — et les COMPTEURS avec l'historique.
+        //
+        // `process_stats` comptait depuis la construction du processeur. Or sur
+        // le chemin `local_a_chaud` un `EqProcessor` neuf est bâti à CHAQUE
+        // cran de curseur, délibérément et sans amortissement (#1725) :
+        // l'export de Reivax66 en montre sept en 1,5 s. Le compteur repartait
+        // donc de zéro exactement au moment que le ticket décrit — « activer
+        // l'égaliseur coupe le son » — et le nombre d'échantillons remis à zéro
+        // lu dans le rapport de diagnostic pouvait être nul pour la seule
+        // raison que l'étage venait d'être remplacé.
+        //
+        // Un compteur qui se tait au moment qu'on l'a mis là pour observer ne
+        // vaut pas mieux que pas de compteur. Il suit donc l'historique des
+        // filtres, dans le seul cas où celui-ci est transposable : même forme
+        // de cascade, c'est-à-dire précisément le glissement de curseur. Quand
+        // la forme change, l'historique ET les compteurs repartent à zéro —
+        // c'est un autre étage, et le dire serait faux.
+        //
+        // Aucun échantillon n'est touché : `process_stats` ne sort que par
+        // `dsp_metrics()`, vers `/zones/{id}/signal-path` et le rapport.
+        self.process_stats = previous.process_stats;
     }
 }
 
@@ -1234,6 +1255,61 @@ mod tests {
             fresh.states,
             EqProcessor::new(&two_bands, 44100, 2).states,
             "état repris d'une cascade de taille différente"
+        );
+    }
+
+    /// #3479 — le compteur d'échantillons remis à ZÉRO survit au remplacement
+    /// à chaud, sinon il se tait au moment précis qu'il est là pour observer.
+    ///
+    /// Sur le chemin `local_a_chaud`, un `EqProcessor` neuf est bâti à CHAQUE
+    /// cran de curseur — sept en 1,5 s dans l'export de Reivax66. Un compteur
+    /// qui repart de zéro à chaque cran rendrait `0` au rapport de diagnostic
+    /// pour la seule raison que l'étage vient d'être remplacé, et ce `0` se
+    /// lirait comme « l'égaliseur n'a rien mis à zéro ».
+    #[test]
+    fn les_compteurs_survivent_au_remplacement_a_chaud() {
+        let profile = shelf_profile();
+        let mut premier = EqProcessor::new(&profile, 44_100, 2);
+        // Une charge utile qui FAIT compter : deux `NaN`, un par canal.
+        let mut souille = vec![f32::NAN, f32::NAN, 0.1, 0.1];
+        premier.process_interleaved(&mut souille);
+        assert_eq!(
+            premier.process_stats().non_finite_samples,
+            2,
+            "le banc doit d'abord faire compter quelque chose"
+        );
+
+        let mut second = EqProcessor::new(&profile, 44_100, 2);
+        second.inherit_state_from(&premier);
+
+        assert_eq!(
+            second.process_stats().non_finite_samples,
+            2,
+            "#3479 — un cran de curseur ne doit pas effacer ce que l'étage \
+             précédent a mesuré : le rapport de diagnostic lirait un `0` qui \
+             ne veut rien dire"
+        );
+    }
+
+    /// La contre-épreuve : quand la forme de la cascade CHANGE, l'historique
+    /// n'est pas transposable — et les compteurs non plus. Ce n'est plus le
+    /// même étage, et le prétendre serait faux.
+    #[test]
+    fn les_compteurs_ne_survivent_pas_a_un_changement_de_forme() {
+        let profile = shelf_profile();
+        let mut stereo = EqProcessor::new(&profile, 44_100, 2);
+        let mut souille = vec![f32::NAN, f32::NAN];
+        stereo.process_interleaved(&mut souille);
+        assert_eq!(stereo.process_stats().non_finite_samples, 2);
+
+        let mut mono = EqProcessor::new(&profile, 44_100, 1);
+        mono.inherit_state_from(&stereo);
+
+        assert_eq!(
+            mono.process_stats().non_finite_samples,
+            0,
+            "une cascade d'une autre forme est un autre étage : reprendre ses \
+             compteurs attribuerait à l'un ce que l'autre a fait"
         );
     }
 

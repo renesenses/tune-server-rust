@@ -74,6 +74,7 @@ fn releve(served: u64, evenements: u64, manquants: u64) -> OutputRingStarvation 
         events: evenements,
         missing_samples: manquants,
         served_samples: served,
+        driver_underruns: 0,
         stream_ms: served * 1000 / CADENCE,
     }
 }

@@ -181,6 +181,23 @@ struct PatchZone {
     /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
     /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
     model: Option<String>,
+    /// #3660 — « cet appareil n'EST PAS un Eversolo ».
+    ///
+    /// La chaîne vide sur `brand` / `model` efface l'OVERRIDE, et c'est juste :
+    /// on retombe sur la détection UPnP. Mais rien ne permettait de récuser la
+    /// DÉTECTION elle-même, qui se repeuple au balayage suivant. Treize zones
+    /// sur quatorze, mesurées sur le .18 le 08/09, n'ont QUE leur détection —
+    /// dont un `detected_model = "AV Renderer Device"` qui ne désigne aucun
+    /// modèle et sert pourtant de clef.
+    ///
+    /// Ce drapeau est le vide FORCÉ que le ticket demande : persisté en
+    /// setting `zone_{id}_identite_effacee`, il survit à une redécouverte
+    /// (aucun chemin du balayage n'écrit dans `settings`), et il ne touche
+    /// PAS l'override — qui garde sa priorité s'il existe. Ce qu'il supprime,
+    /// c'est la RETOMBÉE sur la détection : `detected_manufacturer` et
+    /// `detected_model` sortent à `null`, et le catalogue communautaire n'est
+    /// plus interrogé ni nourri sur la foi d'une identité récusée.
+    identite_appareil_effacee: Option<bool>,
     /// Sortie mono : sommer `M = (L + R) / 2` et émettre `M` sur les DEUX voies
     /// de la zone (#2362). Persisté en setting `zone_{id}_mono_downmix` ; défaut
     /// off, donc le comportement d'aujourd'hui ne change pas d'un bit tant que
@@ -226,6 +243,27 @@ fn fixed_volume_confirmation_required(zone: &Zone, body: &PatchZone) -> bool {
 ///
 /// Le client affiche en priorité l'override utilisateur, sinon la détection
 /// UPnP (override > détection).
+/// #3660 — la clé du vide forcé sur l'identité d'appareil d'une zone.
+///
+/// Une seule définition : la route qui l'écrit, la lecture qui la publie et le
+/// catalogue qui s'y réfère lisent la MÊME chaîne.
+pub(crate) fn cle_identite_effacee(zone_id: i64) -> String {
+    format!("zone_{zone_id}_identite_effacee")
+}
+
+/// L'utilisateur a-t-il récusé l'identité DÉTECTÉE de cette zone ?
+pub(crate) fn identite_appareil_effacee(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> bool {
+    SettingsRepo::with_backend(backend.clone())
+        .get(&cle_identite_effacee(zone_id))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+}
+
 fn inject_device_identity(
     obj: &mut serde_json::Map<String, Value>,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
@@ -308,13 +346,24 @@ fn inject_device_identity(
             tune_core::audio::audiophile::zone_enabled(backend, zone_id),
         )),
     );
+    // #3660 — le vide FORCÉ. La détection n'est pas effacée de la DÉCOUVERTE
+    // (le balayage la reverra, et la page Appareils en vit) : elle cesse
+    // d'être l'identité DE CETTE ZONE. Le drapeau est publié à côté, sans quoi
+    // un écran ne saurait pas distinguer « rien n'a été détecté » de « ce qui
+    // a été détecté a été récusé », ni comment revenir en arrière.
+    let effacee = identite_appareil_effacee(backend, zone_id);
+    obj.insert("identite_appareil_effacee".into(), json!(effacee));
     obj.insert(
         "detected_manufacturer".into(),
-        json!(detected.and_then(|d| d.manufacturer.clone())),
+        json!(
+            detected
+                .filter(|_| !effacee)
+                .and_then(|d| d.manufacturer.clone())
+        ),
     );
     obj.insert(
         "detected_model".into(),
-        json!(detected.and_then(|d| d.model.clone())),
+        json!(detected.filter(|_| !effacee).and_then(|d| d.model.clone())),
     );
 }
 
@@ -389,6 +438,8 @@ mod debit_de_zone_tests;
 
 #[cfg(test)]
 mod fusion_tests;
+#[cfg(test)]
+mod identite_appareil_tests;
 #[cfg(test)]
 mod sante_reseau_de_zone_tests;
 

@@ -2507,6 +2507,81 @@ mod tests {
         );
     }
 
+    /// #3633 — un `.mkv` ressort du parcours AVEC un compteur et un motif.
+    ///
+    /// Même défaut que #2060 pour `.oga`, sur une autre extension : `.mkv`
+    /// n'était dans AUCUNE des trois listes de `audio::support`. Il retombait
+    /// donc sur `LibraryAudioSupport::NotAudio`, c'est-à-dire le `continue`
+    /// muet de la classification — aucune piste, aucun compteur, aucune ligne
+    /// de rapport. Un testeur qui a des MKV de concert constatait « des
+    /// fichiers absents », sans rien pour les chercher.
+    ///
+    /// Le témoin `concert.mka` est le jumeau exact : MÊME conteneur Matroska,
+    /// même dossier, même appel, et il était DÉJÀ compté. S'il tombait avec
+    /// `.mkv`, ce test mesurerait la fixture et non le défaut. Le témoin
+    /// `album.flac` garde l'autre bord : le correctif ne doit pas avoir rendu
+    /// la liste des non lus assez large pour avaler un format catalogué.
+    #[test]
+    fn un_fichier_mkv_est_compte_dans_le_rapport_comme_son_jumeau_mka() {
+        // Pas sous temp_dir() : `is_tune_temp_file` y écarte TOUT.
+        let base = crate::test_scratch::scratch_dir_in(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+            "walker-mkv-3633",
+        );
+        for name in ["concert.mka", "concert.mkv", "album.flac"] {
+            std::fs::write(base.join(name), b"fixture").unwrap();
+        }
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+
+        // Témoin haut : le format catalogué entre toujours en bibliothèque.
+        let noms: Vec<String> = result
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            noms.iter().any(|n| n == "album.flac"),
+            "témoin album.flac perdu — la fixture ou le parcours est en cause, \
+             pas .mkv : {noms:?}"
+        );
+
+        // Témoin bas : le jumeau `.mka` était déjà compté, il doit le rester.
+        assert_eq!(
+            result.skipped_by_ext.get("mka"),
+            Some(&1),
+            "témoin .mka : le jumeau Matroska était déjà compté avant ce \
+             correctif — s'il tombe, c'est la liste entière qui a régressé : {:?}",
+            result.skipped_by_ext
+        );
+
+        // LE DÉFAUT : `.mkv` doit être compté ET porter un motif.
+        assert_eq!(
+            result.skipped_by_ext.get("mkv"),
+            Some(&1),
+            "un .mkv sort du parcours SANS COMPTEUR : `NotAudio` est un \
+             `continue` muet, le fichier disparaît sans une ligne de rapport \
+             où le chercher (#3633) — compteurs mesurés : {:?}",
+            result.skipped_by_ext
+        );
+        assert!(
+            result
+                .skipped_reasons
+                .get("mkv")
+                .is_some_and(|motif| motif.contains("non pris en charge")),
+            "un compteur sans motif ne dit pas POURQUOI le fichier manque \
+             (#3633) — motifs mesurés : {:?}",
+            result.skipped_reasons
+        );
+
+        // Et il ne devient pas une piste cliquable impossible à décoder :
+        // symphonia démuxe le Matroska mais n'a aucun codec AC-3/TrueHD.
+        assert!(
+            !noms.iter().any(|n| n == "concert.mkv"),
+            "un .mkv ne doit PAS entrer au catalogue : aucun décodeur livré \
+             ne lit son contenu — il serait une piste muette : {noms:?}"
+        );
+    }
+
     /// Le parcours retient les DOSSIERS porteurs de feuilles CUE (#1763).
     ///
     /// Une feuille est la seule chose qui explique un album entier absent, et

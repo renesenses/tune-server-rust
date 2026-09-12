@@ -11,6 +11,23 @@ enum ResoluOuFini {
     Fini(PlayResult),
 }
 
+/// Le nom d'appareil à MONTRER dans un refus, ou `None` s'il n'y en a pas.
+///
+/// Un identifiant de sortie locale porte le nom que l'utilisateur voit dans son
+/// panneau son : `local:audio-gd USB audio`. Le nommer répond à la seule
+/// question qu'il se pose — lequel de mes appareils ? Un identifiant DLNA,
+/// AirPlay ou Chromecast porte un UUID : l'afficher serait du bruit, et le
+/// message générique reste alors le bon.
+///
+/// Rien n'est INVENTÉ ici : la fonction ne rend un nom que si elle en a un.
+pub(crate) fn nom_lisible_de_l_appareil(dev_id: &str) -> Option<String> {
+    let reste = dev_id.strip_prefix("local:")?.trim();
+    if reste.is_empty() {
+        return None;
+    }
+    Some(reste.to_string())
+}
+
 /// Ce que la demande impose par-dessus le flux résolu : pochette et album
 /// demandés, sinon ceux du flux. Relevés une fois, lus par trois temps.
 pub(super) struct Habillage {
@@ -200,17 +217,51 @@ impl PlaybackOrchestrator {
             return Ok(Some(new_id));
         }
 
-        let msg = format!(
-            "zone_output_unavailable:La sortie de cette zone n'est plus disponible. Choisissez une sortie dans les réglages de la zone « {} ».",
-            zone.name
+        // 🔴 #3737 — nommer l'APPAREIL, pas seulement la zone.
+        //
+        // Jean-Luc Cassé a DEUX zones nommées « audio-gd USB audio (local) » :
+        // le nom de zone ne lui dit pas laquelle est en cause, ni ce qui a
+        // disparu. Le serveur, lui, connaît les deux bouts — il les écrit déjà
+        // au journal juste au-dessus. Les mettre dans le message ne coûte rien
+        // et transforme « une sortie » en « votre DAC ».
+        let msg = match nom_lisible_de_l_appareil(dev_id) {
+            Some(appareil) => format!(
+                "zone_output_unavailable:La sortie « {appareil} » de la zone « {} » n'est plus disponible. \
+                 Vérifiez qu'elle est branchée et allumée, ou choisissez une autre sortie dans les réglages de la zone.",
+                zone.name
+            ),
+            None => format!(
+                "zone_output_unavailable:La sortie de cette zone n'est plus disponible. \
+                 Choisissez une sortie dans les réglages de la zone « {} ».",
+                zone.name
+            ),
+        };
+        warn!(
+            zone_id,
+            zone_name = %zone.name,
+            device = dev_id,
+            "play_rejected_zone_offline"
         );
-        warn!(zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
         if let Some(ref bus) = self.event_bus {
             bus.emit(
                 "zone.playback_error",
                 serde_json::json!({
                     "zone_id": zone_id,
                     "error": msg,
+                    // 🔴 #3737 — SANS ce drapeau, le message n'atteint personne.
+                    //
+                    // Le client ouvre une fenêtre de grâce de 30 s AVANT l'appel
+                    // HTTP (`playAndSync`), pour qu'un pré-transcodage lent se
+                    // lise « chargement… » plutôt que « panne » (#1146). Ce refus
+                    // arrive systématiquement DEDANS — il est synchrone — donc il
+                    // y était avalé et l'auditeur restait sur un rouet.
+                    //
+                    // C'est mot pour mot ce que `poller/tick.rs` dit qu'il ne
+                    // faut pas faire, quinze lignes de commentaire à l'appui, et
+                    // ce que ses deux émetteurs évitent en posant `fatal: true`.
+                    // Une sortie disparue ne revient pas dans les 30 s : ce refus
+                    // est fatal par nature.
+                    "fatal": true,
                 }),
             );
         }
@@ -936,8 +987,16 @@ impl PlaybackOrchestrator {
             // `output_ms` ne compte plus l'attente de pré-tampon : les trois
             // termes s'additionnent maintenant pour donner `total_ms`, et un
             // blanc s'impute à la bonne étape sans relire la source.
+            // `stream_id` : #2352. `playback_timing` portait le `zone_id` et
+            // PAS le `stream_id` ; `stream_request` (tune-stream-http) porte
+            // l'inverse. Dans l'export d'un testeur, rattacher un demarrage a
+            // la connexion du renderer qui le sert se faisait donc par
+            // adjacence temporelle — ce qui ne tient plus des que deux zones
+            // demarrent dans la meme seconde. Les deux lignes portent
+            // desormais la meme clef, et `service_fichier_termine` aussi.
             info!(
                 zone_id = req.zone_id,
+                stream_id = resolved.stream_id.as_deref(),
                 resolve_ms,
                 prebuffer_ms,
                 output_ms = total_ms
@@ -1078,7 +1137,8 @@ impl PlaybackOrchestrator {
                 &resolved.title,
                 resolved.artist.as_deref(),
                 habillage.album.as_deref(),
-            );
+            )
+            .await;
         }
 
         // `record_listen` alimente `listen_history`, la statistique locale. Il
@@ -1229,21 +1289,37 @@ impl PlaybackOrchestrator {
     ) -> (bool, Option<String>) {
         let device_name = device_id.strip_prefix("local:").unwrap_or(device_id);
         // Les réglages, pas des littéraux : voir `reglages_sortie_locale`
-        // (#1770). `endpoint_id` et `origin_host` restent absents — les deux
-        // ne viennent QUE d'une énumération de périphériques
-        // (`AudioDevice::endpoint_id` / `.backend`), rien ne les persiste, et
-        // ce chemin n'en a pas : il existe précisément parce que le
-        // périphérique n'est PAS énumérable à cet instant. Les inventer serait
-        // pire que de les laisser vides.
+        // (#1770).
+        //
+        // #2269 — `endpoint_id` n'est plus absent. Il vient de la ZONE, où la
+        // passe d'identité l'a écrit la dernière fois que l'énumération a
+        // montré cet appareil (`zones.output_endpoint_id`). C'est le seul
+        // renseignement qui puisse arriver ici : ce chemin existe précisément
+        // parce que le périphérique n'est PAS énumérable à cet instant, et
+        // sans lui c'est le NOM qui part en résolution — d'où le
+        // `requested_device="audio-gd USB audio"` du journal de Jean-Luc.
+        //
+        // ⚠️ Cela ne fait pas revenir un appareil débranché : `resolve_device`
+        // et `select_wasapi_endpoint` ne cherchent que parmi les périphériques
+        // énumérés à l'instant. Ce que ça change, c'est le VERDICT — la zone
+        // dit quel endpoint elle possède, au lieu de dire quel nom elle
+        // cherche — et le retour de l'appareil sous un autre nom.
+        //
+        // `origin_host`, lui, reste absent : rien ne le persiste, et l'inventer
+        // serait pire que de le laisser vide.
         let (exclusive_mode, audio_backend) = self.reglages_sortie_locale();
+        let endpoint_id = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .endpoint_id_de_la_sortie(device_id);
         info!(
             device_id,
             exclusive_mode,
             audio_backend = %audio_backend,
+            endpoint_id = endpoint_id.as_deref().unwrap_or("<aucun>"),
             "output_not_found_recreating_local_output"
         );
-        let local_out = crate::outputs::local::LocalOutput::with_options(
+        let local_out = crate::outputs::local::LocalOutput::with_options_and_endpoint(
             device_name.to_string(),
+            endpoint_id,
             exclusive_mode,
             &audio_backend,
         );

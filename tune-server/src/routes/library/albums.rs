@@ -344,7 +344,13 @@ pub(super) async fn get_album(
             // `dynamic_range_source` dit d'OÙ sort la valeur (#1388) :
             // `album_tag` quand une piste porte `ALBUM DYNAMIC RANGE`,
             // `track_average` quand Tune l'a déduite de la moyenne arrondie des
-            // `DYNAMIC RANGE` des pistes. Les deux clés apparaissent et
+            // `dr_track` des pistes.
+            //
+            // ⚠️ `track_average` ne dit RIEN de la provenance de ces pistes :
+            // depuis la v0.9.145 un `dr_track` peut venir du tag du fichier ou
+            // du calcul de la passe d'analyse. Cette seconde question se lit
+            // piste par piste, sur les listes de pistes, sous la clé de même
+            // nom `dynamic_range_source` (#3924). Les deux clés apparaissent et
             // disparaissent ENSEMBLE : un client qui ne connaît que la première
             // ne voit aucun changement, celui qui lit la seconde peut annoncer
             // une mesure ou une déduction plutôt que de les confondre.
@@ -407,9 +413,15 @@ pub(super) async fn album_tracks(
         .get_key_for_tracks("dr_track", &track_ids)
         .ou_defaut_journalise();
 
+    // #3924 — et D'OU elle sort. Voir `provenance_du_dr`.
+    let dr_source = provenance_du_dr(&meta_repo, &track_ids, &dynamic_range);
     let mut items = attach_track_tags(
         items,
-        &[("grouping", &grouping), ("dynamic_range", &dynamic_range)],
+        &[
+            ("grouping", &grouping),
+            ("dynamic_range", &dynamic_range),
+            ("dynamic_range_source", &dr_source),
+        ],
     );
     // #3518 — « # Plays » et « Last Played », deux colonnes de la maquette V1
     // (Levente, 07/09/2026) que la route ne portait pas. C'est LE SITE D'APPEL :
@@ -418,6 +430,49 @@ pub(super) async fn album_tracks(
     // `indisponible` côté client.
     attacher_ecoutes(&state, &mut items);
     Json(json!(items))
+}
+
+/// La PROVENANCE du Dynamic Range par piste, appariée à sa valeur (#3924).
+///
+/// `track_metadata['dr_source']` dit laquelle des deux fabriques a produit le
+/// `dr_track` de la ligne : `"tag"` quand le scan l'a lu dans le fichier,
+/// `"analysis"` quand la passe d'analyse l'a calculé sur les échantillons
+/// (`tune-core/src/audio/replaygain.rs`). Patatorz, fil 1683, pose exactement
+/// cette question — « mesurés, calculés ou juste reportés » — et aucune route
+/// ne portait la réponse : la clef existait en base et n'était servie nulle
+/// part.
+///
+/// # Pourquoi un appariement, et pas la carte brute
+///
+/// La clef de sortie `dynamic_range_source` ne doit JAMAIS apparaître sans
+/// `dynamic_range` : une provenance seule décrirait une valeur que la charge
+/// utile ne porte pas, et l'écran afficherait « calculé par Tune » à côté
+/// d'un champ vide. C'est le même contrat que la fiche d'album, dont les deux
+/// clefs apparaissent et disparaissent ensemble (`album_detail`).
+///
+/// L'inverse reste permis et ne se comble PAS : un `dr_track` écrit avant que
+/// `dr_source` existe (toute base antérieure à la v0.9.145) n'a pas de
+/// provenance connue, et en inventer une — « tag », puisque c'était le seul
+/// producteur d'alors — serait un affichage fabriqué sur une base qu'un
+/// rattrapage a pu depuis recalculer. La valeur sort, la provenance se tait.
+///
+/// ⚠️ Fonction partagée, et non deux lectures écrites côte à côte : les deux
+/// surfaces de pistes (`albums::album_tracks` et `tracks::joindre_dr_par_piste`)
+/// servent le MÊME champ sous le MÊME nom, et c'est exactement l'argument que
+/// porte déjà `attach_track_tags` juste en dessous.
+pub(super) fn provenance_du_dr(
+    repo: &TrackMetadataRepo,
+    track_ids: &[i64],
+    dr: &std::collections::HashMap<i64, String>,
+) -> std::collections::HashMap<i64, String> {
+    // `ou_defaut_journalise` et non `unwrap_or_default` (#2861) : une panne de
+    // base rendrait ici une carte VIDE, indiscernable d'une bibliothèque sans
+    // provenance connue, et sans une ligne de journal.
+    let mut source = repo
+        .get_key_for_tracks("dr_source", track_ids)
+        .ou_defaut_journalise();
+    source.retain(|track_id, _| dr.contains_key(track_id));
+    source
 }
 
 /// Recopie des tags étendus (`track_metadata`) sur les pistes sérialisées
@@ -1280,6 +1335,54 @@ fn tranches_complementaires<'a>(
         .all(|numeros| numeros.iter().any(|n| *n > 0))
         && numeros_complementaires(numeros_par_album)
 }
+/// La fiche d'un membre de faisceau : titre, artiste, année, numéros de piste.
+type FicheDEclat = (String, String, Option<i64>, std::collections::BTreeSet<i64>);
+/// Les membres d'un faisceau, rangés par identifiant d'album.
+type MembresDuFaisceau = std::collections::BTreeMap<i64, FicheDEclat>;
+/// Les membres d'un faisceau qui RESTENT après l'arbitrage de l'utilisateur.
+///
+/// ## Ce qui manquait (#3396)
+///
+/// Le ticket demande « de quoi **écarter** un groupe, pour qu'un faux positif
+/// ne revienne pas indéfiniment ». Le geste existait déjà — `POST
+/// /library/albums/{id}/distinct/{autre}` (#1276), que
+/// [`super::albums::absorber_album`] relit pour refuser l'absorption —, mais
+/// la phase 0 ne le relisait PAS : le faux positif écarté était reproposé à
+/// chaque analyse, et l'écran n'offrait que de le réécarter. `albums_grouped`,
+/// `merge_duplicate_albums_route` et `album_editions` consultent tous les trois
+/// `album_distinct_pairs` ; `albums_eclates` était le seul rapprochement à ne
+/// pas le faire.
+///
+/// ## La règle
+///
+/// Un membre n'est retenu que s'il n'est déclaré distinct d'AUCUN membre déjà
+/// retenu. L'arbitrage porte sur une PAIRE : aucune paire arbitrée ne doit
+/// survivre dans un groupe rendu, et un groupe de trois dont une seule paire
+/// est arbitrée continue d'exister, amputé de ce seul membre.
+///
+/// C'est un filtre d'AFFICHAGE, et rien d'autre : aucune écriture, aucune
+/// ligne `albums` ne disparaît, aucune identité n'est perdue. `DELETE
+/// /library/albums/{id}/distinct/{autre}` révoque l'arbitrage et le groupe
+/// revient tel quel.
+fn membres_retenus<'a>(
+    albums: &'a MembresDuFaisceau,
+    distinctes: &DistinctPairSet,
+) -> Vec<(i64, &'a FicheDEclat)> {
+    if distinctes.is_empty() {
+        return albums.iter().map(|(id, fiche)| (*id, fiche)).collect();
+    }
+    let mut gardes: Vec<(i64, &FicheDEclat)> = Vec::new();
+    for (id, fiche) in albums {
+        if gardes
+            .iter()
+            .any(|(deja, _)| distinctes.contains(*deja, *id))
+        {
+            continue;
+        }
+        gardes.push((*id, fiche));
+    }
+    gardes
+}
 /// BIB-A2, phase 0 : les groupes d'albums qui sont PROBABLEMENT un seul album
 /// éclaté. Deux faisceaux, jamais mélangés :
 ///
@@ -1307,11 +1410,12 @@ fn tranches_complementaires<'a>(
 /// garde. Avec elle, il faut que les deux albums ne partagent AUCUN numéro de
 /// piste — ce que deux éditions du même disque ne font jamais, puisqu'elles
 /// commencent toutes deux à 1.
-pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
+pub(crate) fn grouper_les_albums_eclates(
+    pistes: &[PisteVue],
+    distinctes: &DistinctPairSet,
+) -> Vec<Value> {
     use std::collections::{BTreeMap, BTreeSet};
-    // album_id → fiche (titre, artiste, année, numéros)
-    type Fiche = (String, String, Option<i64>, BTreeSet<i64>);
-    type Membres = BTreeMap<i64, Fiche>;
+    type Membres = MembresDuFaisceau;
     let mut faisceaux: BTreeMap<(String, String), Membres> = BTreeMap::new();
     // Condensat de pochette → membres. Renseigné en même temps que le premier
     // faisceau : une seule traversée des pistes.
@@ -1355,8 +1459,8 @@ pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
             .3
             .insert(p.track_number);
     }
-    let fiches_json = |albums: &Membres| {
-        albums
+    let fiches_json = |membres: &[(i64, &FicheDEclat)]| {
+        membres
             .iter()
             .map(|(id, (titre, artiste, annee, numeros))| {
                 json!({
@@ -1376,13 +1480,17 @@ pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
     // gestes à faire.
     let mut deja_vus: BTreeSet<Vec<i64>> = BTreeSet::new();
     for ((dossier, cle), albums) in &faisceaux {
-        if albums.len() < 2 {
+        // #3396 : les paires que l'utilisateur a déclarées distinctes sortent
+        // du faisceau AVANT tout calcul — la complémentarité, le total et
+        // l'année ne doivent décrire que ce qui est rendu.
+        let membres = membres_retenus(albums, distinctes);
+        if membres.len() < 2 {
             continue;
         }
-        let complementaires = numeros_complementaires(albums.values().map(|a| &a.3));
-        let annees: BTreeSet<Option<i64>> = albums.values().map(|a| a.2).collect();
-        let total: usize = albums.values().map(|a| a.3.len()).sum();
-        deja_vus.insert(albums.keys().copied().collect());
+        let complementaires = numeros_complementaires(membres.iter().map(|(_, a)| &a.3));
+        let annees: BTreeSet<Option<i64>> = membres.iter().map(|(_, a)| a.2).collect();
+        let total: usize = membres.iter().map(|(_, a)| a.3.len()).sum();
+        deja_vus.insert(membres.iter().map(|(id, _)| *id).collect());
         groupes.push(json!({
             "indice": INDICE_DOSSIER_ET_TITRE,
             "dossier": dossier,
@@ -1390,22 +1498,27 @@ pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
             "numeros_complementaires": complementaires,
             "meme_annee": annees.len() == 1,
             "pistes": total,
-            "albums": fiches_json(albums),
+            "albums": fiches_json(&membres),
         }));
     }
     for (condensat, albums) in &par_pochette {
-        if albums.len() < 2 {
+        // Même retrait qu'au-dessus, et pour la même raison — mais ici il doit
+        // précéder `tranches_complementaires` : un faisceau amputé d'un membre
+        // n'est plus le même faisceau, et le garde-fou doit porter sur ce qui
+        // sera rendu.
+        let membres = membres_retenus(albums, distinctes);
+        if membres.len() < 2 {
             continue;
         }
-        if !tranches_complementaires(albums.values().map(|a| &a.3)) {
+        if !tranches_complementaires(membres.iter().map(|(_, a)| &a.3)) {
             continue;
         }
-        let ids: Vec<i64> = albums.keys().copied().collect();
+        let ids: Vec<i64> = membres.iter().map(|(id, _)| *id).collect();
         if !deja_vus.insert(ids) {
             continue;
         }
-        let annees: BTreeSet<Option<i64>> = albums.values().map(|a| a.2).collect();
-        let total: usize = albums.values().map(|a| a.3.len()).sum();
+        let annees: BTreeSet<Option<i64>> = membres.iter().map(|(_, a)| a.2).collect();
+        let total: usize = membres.iter().map(|(_, a)| a.3.len()).sum();
         groupes.push(json!({
             "indice": INDICE_POCHETTE_IDENTIQUE,
             "pochette": condensat,
@@ -1417,7 +1530,7 @@ pub(crate) fn grouper_les_albums_eclates(pistes: &[PisteVue]) -> Vec<Value> {
             "numeros_complementaires": true,
             "meme_annee": annees.len() == 1,
             "pistes": total,
-            "albums": fiches_json(albums),
+            "albums": fiches_json(&membres),
         }));
     }
     // Les plus sûrs d'abord : complémentaires et de même année, puis les plus gros.
@@ -1463,7 +1576,10 @@ pub(super) async fn albums_eclates(State(state): State<AppState>) -> Result<Json
             })
         })
         .collect();
-    let groupes = grouper_les_albums_eclates(&pistes);
+    // #3396 : l'arbitrage de l'utilisateur (#1276) est lu ICI, comme
+    // `albums_grouped` et `album_editions` le font déjà. Une requête, un
+    // ensemble en mémoire : le coût par faisceau reste nul.
+    let groupes = grouper_les_albums_eclates(&pistes, &paires_distinctes(&state));
     Ok(Json(json!({
         "count": groupes.len(),
         "albums_concernes": groupes.iter().map(|g| g["albums"].as_array().map(|a| a.len()).unwrap_or(0)).sum::<usize>(),
@@ -2348,7 +2464,7 @@ mod tests_editions {
 
 #[cfg(test)]
 mod tests_albums_eclates {
-    use super::{PisteVue, cle_titre, dossier_de, grouper_les_albums_eclates};
+    use super::{DistinctPairSet, PisteVue, cle_titre, dossier_de, grouper_les_albums_eclates};
 
     fn piste(
         album_id: i64,
@@ -2444,7 +2560,7 @@ mod tests_albums_eclates {
                 1,
             ),
         ];
-        let g = grouper_les_albums_eclates(&pistes);
+        let g = grouper_les_albums_eclates(&pistes, &DistinctPairSet::default());
         assert_eq!(g.len(), 2, "{g:#?}");
         assert_eq!(g[0]["dossier"], "/m/Beatles/Abbey Road");
         assert_eq!(g[0]["numeros_complementaires"], true);
@@ -2546,7 +2662,7 @@ mod tests_albums_eclates {
                 &p,
             ),
         ];
-        let g = grouper_les_albums_eclates(&pistes);
+        let g = grouper_les_albums_eclates(&pistes, &DistinctPairSet::default());
         assert_eq!(g.len(), 1, "{g:#?}");
         assert_eq!(g[0]["indice"], super::INDICE_POCHETTE_IDENTIQUE);
         assert_eq!(g[0]["pochette"], p);
@@ -2606,7 +2722,7 @@ mod tests_albums_eclates {
             ),
         ];
         assert!(
-            grouper_les_albums_eclates(&pistes).is_empty(),
+            grouper_les_albums_eclates(&pistes, &DistinctPairSet::default()).is_empty(),
             "une réédition ne se fusionne pas avec son original"
         );
     }
@@ -2622,7 +2738,7 @@ mod tests_albums_eclates {
                 piste_pochette(2, "Deux", "B", Some(2000), "/m/B/1.flac", 2, valeur),
             ];
             assert!(
-                grouper_les_albums_eclates(&pistes).is_empty(),
+                grouper_les_albums_eclates(&pistes, &DistinctPairSet::default()).is_empty(),
                 "« {valeur} » n'est pas une identité d'image"
             );
         }
@@ -2642,7 +2758,7 @@ mod tests_albums_eclates {
             piste_pochette(2, "Sans titre B", "B", None, "/m/B/1.flac", 0, &p),
         ];
         assert!(
-            grouper_les_albums_eclates(&pistes).is_empty(),
+            grouper_les_albums_eclates(&pistes, &DistinctPairSet::default()).is_empty(),
             "la complémentarité vide ne fonde rien"
         );
 
@@ -2654,7 +2770,7 @@ mod tests_albums_eclates {
             piste_pochette(2, "Sans titre B", "B", None, "/m/B/1.flac", 0, &p),
         ];
         assert!(
-            grouper_les_albums_eclates(&pistes).is_empty(),
+            grouper_les_albums_eclates(&pistes, &DistinctPairSet::default()).is_empty(),
             "un membre non numéroté n'apporte aucune preuve"
         );
     }
@@ -2685,7 +2801,7 @@ mod tests_albums_eclates {
                 &p,
             ),
         ];
-        let g = grouper_les_albums_eclates(&pistes);
+        let g = grouper_les_albums_eclates(&pistes, &DistinctPairSet::default());
         assert_eq!(g.len(), 1, "{g:#?}");
         assert_eq!(g[0]["indice"], super::INDICE_DOSSIER_ET_TITRE);
     }

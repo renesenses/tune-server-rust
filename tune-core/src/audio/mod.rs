@@ -16,6 +16,8 @@ pub mod decode_progress;
 pub mod dff;
 #[cfg(test)]
 mod dop_porteur_bout_en_bout;
+#[cfg(test)]
+mod dsd_ordre_canaux_et_phase;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
@@ -40,6 +42,9 @@ pub mod mixer;
 /// réglage `zone_{id}_mono_downmix` (#2362).
 pub mod mono_downmix;
 pub mod opus_ogg;
+/// Qui tient le PCM ALSA que nous n'arrivons pas à ouvrir (#3575) — lecture
+/// de /proc, aucun effet sur la chaîne audio.
+pub mod pcm_teneur;
 pub mod pipeline;
 pub mod replaygain;
 pub mod resample;

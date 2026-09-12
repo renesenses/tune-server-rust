@@ -180,12 +180,90 @@ fn rebuild_decoder_after_ogg_chain_reset(
     Some((track.id, decoder))
 }
 
+/// Ce que le CONTENEUR annonce du flux, confronté à ce qui a réellement été
+/// décodé (#2218 T4).
+///
+/// # Pourquoi cette structure existe
+///
+/// Le banc d'empreintes de la nuit du 11 au 12/09/2026 a mesuré trois défauts
+/// de la même forme : *le conteneur porte l'information, le code ne la fait
+/// pas remonter*. Le pire est FLAC — un octet abîmé au milieu des trames a
+/// coûté **27 088 échantillons sur 35 280** (23,2 % de la piste), et
+/// `decode_to_pcm` a rendu `Ok(_)` sans une ligne de journal, parce que
+/// `decode_symphonia` avalait l'erreur de trame (`Err(_) => continue`,
+/// `Err(_) => break`).
+///
+/// C'est le mécanisme du défaut WavPack : le format portait un CRC par bloc,
+/// `audio/wavpack.rs` le lisait dans un champ `_crc: u32`, et le décodeur a
+/// rendu du bruit blanc pendant trois mois sans que rien ne rougisse.
+///
+/// # Ce que cette structure ne fait PAS
+///
+/// Elle ne refuse RIEN. Aucun fichier qui se lisait hier ne cesse de se lire.
+/// Le seul arbitrage possible — refuser un fichier abîmé, ou le lire en
+/// signalant — est celui de Bertrand (« D1 »), et il n'est pas tranché. Ce
+/// qu'on livre ici est la moitié qui n'a besoin d'aucun arbitrage : rendre la
+/// perte LISIBLE, dans le journal et dans le retour de la fonction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntegriteFlux {
+    /// Trames (échantillons PAR CANAL) que le conteneur annonce, quand il en
+    /// annonce : `STREAMINFO.total samples` pour FLAC, `stts` pour MP4/ALAC,
+    /// `data` pour WAV, `COMM.numSampleFrames` pour AIFF. `None` quand le
+    /// conteneur n'annonce rien d'exploitable (un MP3 sans tag Xing).
+    ///
+    /// Renseigné UNIQUEMENT sur un décodage complet — cadre borné ou départ
+    /// décalé, la comparaison n'aurait aucun sens.
+    pub trames_annoncees: Option<u64>,
+    /// Trames réellement rendues.
+    pub trames_rendues: u64,
+    /// Paquets que le démultiplexeur a refusés. C'est ici qu'atterrit le
+    /// CRC-32 de page Ogg (vérifié par symphonia, `page.rs:241`) et le CRC-8
+    /// d'en-tête de trame FLAC (`frame.rs:211`).
+    pub paquets_refuses: u32,
+    /// Trames que le décodeur a refusées après un paquet pourtant accepté.
+    pub trames_refusees: u32,
+    /// Le PREMIER refus, mot pour mot. C'est lui qui NOMME le contrôle :
+    /// « ogg: crc mismatch », « flac: computed frame header CRC does not match
+    /// expected CRC ». Sans lui, un compteur ne dit pas ce qui a lâché.
+    pub premier_refus: Option<String>,
+}
+
+impl IntegriteFlux {
+    /// Vrai dès qu'un refus a été compté ou que le compte de trames est
+    /// inférieur à ce que le conteneur annonce.
+    ///
+    /// La borne inférieure seule est significative : un décodeur peut rendre
+    /// quelques trames de PLUS que l'annonce (dernier paquet complété par le
+    /// codec), et ce n'est pas une perte.
+    pub fn perte_detectee(&self) -> bool {
+        if self.paquets_refuses > 0 || self.trames_refusees > 0 || self.premier_refus.is_some() {
+            return true;
+        }
+        matches!(self.trames_annoncees, Some(n) if self.trames_rendues < n)
+    }
+
+    /// Part de la piste manquante, en pour-cent, quand le conteneur annonce
+    /// une longueur. `None` sinon.
+    pub fn perte_pour_cent(&self) -> Option<f64> {
+        let annonce = self.trames_annoncees?;
+        if annonce == 0 || self.trames_rendues >= annonce {
+            return Some(0.0);
+        }
+        Some(100.0 * (1.0 - self.trames_rendues as f64 / annonce as f64))
+    }
+}
+
 pub struct DecodedAudio {
     pub samples_i32: Vec<i32>,
     pub bit_depth: u16,
     pub sample_rate: u32,
     pub channels: u32,
     pub duration_s: f64,
+    /// Ce que le conteneur disait du flux, face à ce qui en est sorti.
+    ///
+    /// Par défaut « rien à signaler » : un chemin de décodage qui ne sait pas
+    /// mesurer l'intégrité laisse ce champ vide plutôt que de mentir.
+    pub integrite: IntegriteFlux,
 }
 
 impl DecodedAudio {
@@ -280,6 +358,12 @@ fn adapt_decoded_audio(
         sample_rate: output_rate,
         channels: output_channels as u32,
         duration_s,
+        // Le constat d'intégrité porte sur le CONTENEUR, pas sur le rendu :
+        // rééchantillonner ou remixer ne répare pas une trame perdue et n'en
+        // invente pas. Le reporter tel quel est la seule lecture juste — le
+        // laisser à `Default` ici effacerait, à l'étage d'après, ce que le
+        // décodeur vient de mesurer (#2218 T4).
+        integrite: decoded.integrite,
     })
 }
 
@@ -1241,6 +1325,38 @@ pub fn decode_to_pcm(
         }
     }?;
 
+    // Le CONSOMMATEUR de `DecodedAudio::integrite` (#2218 T4).
+    //
+    // Un contrôle mesuré dont personne ne lit le résultat ne garde rien —
+    // c'est exactement ce qui est arrivé au CRC WavPack, rangé trois mois
+    // durant dans un champ `_crc: u32`. Le point unique où toutes les branches
+    // de décodage se rejoignent est ici ; une seule ligne y suffit pour que
+    // TOUS les formats deviennent lisibles en panne.
+    //
+    // À `warn` et non à `debug` : le journal exporté par « Diagnostics » est
+    // filtré à `info`, et une ligne `debug` n'y figurerait pas — la panne
+    // resterait muette pour le seul lecteur qui compte, le testeur qui la
+    // remonte (même raison que `ape_ouvert`, #3311).
+    //
+    // ⛔ Aucun refus. Un fichier légèrement abîmé qui s'écoutait hier
+    // s'écoute encore ; il laisse désormais une trace.
+    let integrite = &decoded.integrite;
+    if integrite.perte_detectee() {
+        tracing::warn!(
+            file = file_path,
+            trames_annoncees = integrite.trames_annoncees,
+            trames_rendues = integrite.trames_rendues,
+            perte_pour_cent = integrite.perte_pour_cent(),
+            paquets_refuses = integrite.paquets_refuses,
+            trames_refusees = integrite.trames_refusees,
+            controle = integrite
+                .premier_refus
+                .as_deref()
+                .unwrap_or("le conteneur annonce plus de trames que le décodeur n'en a rendues"),
+            "decodage_incomplet_le_conteneur_annoncait_plus"
+        );
+    }
+
     adapt_decoded_audio(decoded, target_sample_rate, target_channels)
 }
 
@@ -1313,6 +1429,14 @@ fn decode_opus_to_pcm(
     // Timebase to map packet.pts → sample index @ 48 kHz. Opus is always
     // 1/48000, but honour the container's declared timebase if present.
     let mut time_base = track.time_base;
+    // Longueur annoncée par le conteneur, relevée AVANT le `format.seek` qui
+    // suit : `track` emprunte `format`, et le lire après empêcherait l'emprunt
+    // mutable du seek.
+    let trames_annoncees = if seek_s <= 0.0 && max_duration_s <= 0.0 {
+        track.num_frames
+    } else {
+        None
+    };
     let ch: usize = match &track.codec_params {
         Some(CodecParameters::Audio(p)) => {
             p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
@@ -1351,6 +1475,13 @@ fn decode_opus_to_pcm(
     // 120 ms is the largest Opus frame @ 48 kHz (5760 samples/channel).
     let mut out_buf = vec![0i16; 5760 * ch];
     let mut samples_i32: Vec<i32> = Vec::new();
+    // Même constat qu'en FLAC (#2218 T4) : l'Ogg porte un CRC-32 par page que
+    // symphonia vérifie, et cette boucle en jetait le verdict dans deux
+    // `Err(_)` muets. On compte, on nomme ; on ne refuse rien de plus.
+    let mut integrite = IntegriteFlux {
+        trames_annoncees,
+        ..Default::default()
+    };
     // `as usize` saturates the f64 (e.g. `f64::MAX` from the converter's
     // "decode everything" call); the multiply must saturate too or debug
     // builds panic on overflow.
@@ -1410,7 +1541,11 @@ fn decode_opus_to_pcm(
                 debug!(file = file_path, track_id, "ogg_opus_chain_decoder_rebuilt");
                 continue;
             }
-            Err(_) => break,
+            Err(e) => {
+                integrite.paquets_refuses = integrite.paquets_refuses.saturating_add(1);
+                integrite.premier_refus.get_or_insert_with(|| e.to_string());
+                break;
+            }
         };
         if packet.track_id != track_id {
             continue;
@@ -1437,7 +1572,11 @@ fn decode_opus_to_pcm(
         // peut porter des pages parasites à la jonction de deux flux.
         let n = match decoder.decode(&packet.data, &mut out_buf, false) {
             Ok(n) => n,
-            Err(_) => continue,
+            Err(e) => {
+                integrite.trames_refusees = integrite.trames_refusees.saturating_add(1);
+                integrite.premier_refus.get_or_insert_with(|| e.to_string());
+                continue;
+            }
         };
         // Per-channel frame count decoded from this packet.
         let n = n.min(out_buf.len() / ch);
@@ -1462,12 +1601,14 @@ fn decode_opus_to_pcm(
         return Err("opus: decoded no audio".into());
     }
     let duration_s = (samples_i32.len() / ch) as f64 / 48000.0;
+    integrite.trames_rendues = (samples_i32.len() / ch) as u64;
     Ok(DecodedAudio {
         samples_i32,
         bit_depth: 16,
         sample_rate: 48000,
         channels: ch as u32,
         duration_s,
+        integrite,
     })
 }
 
@@ -2660,6 +2801,7 @@ fn decode_ape_to_pcm(
         sample_rate: header.sample_rate,
         channels: header.channels,
         duration_s,
+        integrite: Default::default(),
     })
 }
 
@@ -3140,6 +3282,21 @@ fn decode_symphonia(
         Some(CodecParameters::Audio(params)) => params.clone(),
         _ => return Err("track has no audio codec parameters".into()),
     };
+    // Ce que le CONTENEUR annonce comme longueur (#2218 T4).
+    //
+    // Pour FLAC c'est `STREAMINFO.total samples`, lu par le démultiplexeur de
+    // symphonia ; pour WAV la taille du chunk `data` ; pour MP4/ALAC la table
+    // `stts`. C'est le seul contrôle de longueur dont TOUS ces conteneurs
+    // disposent — et il ne coûte rien : il est déjà lu, il n'était juste
+    // jamais COMPARÉ à ce qui sortait.
+    //
+    // `None` dès que le décodage est borné ou décalé : comparer une fenêtre à
+    // la longueur totale de la piste ne voudrait rien dire.
+    let trames_annoncees = if seek_s <= 0.0 && max_duration_s <= 0.0 {
+        track.num_frames
+    } else {
+        None
+    };
     let mut track_id = track.id;
     let source_rate = audio_params.sample_rate.unwrap_or(44100);
     let source_channels = audio_params
@@ -3190,6 +3347,7 @@ fn decode_symphonia(
                 sample_rate: source_rate,
                 channels: source_channels,
                 duration_s: 0.0,
+                integrite: Default::default(),
             });
         }
     }
@@ -3199,6 +3357,15 @@ fn decode_symphonia(
         (max_duration_s * source_rate as f64 * source_channels as f64) as usize
     } else {
         usize::MAX
+    };
+    // 🔴 #2218 T4 — les deux `Err(_)` muets de cette boucle sont la CAUSE
+    // mesurée du défaut FLAC : un octet abîmé au milieu des trames coûtait
+    // 23,2 % de la piste, `decode_to_pcm` rendait `Ok(_)`, et pas une ligne
+    // de journal ne le disait. Ils ne refusent toujours rien — on compte, on
+    // nomme, et `decode_to_pcm` le journalise.
+    let mut integrite = IntegriteFlux {
+        trames_annoncees,
+        ..Default::default()
     };
 
     loop {
@@ -3231,7 +3398,13 @@ fn decode_symphonia(
                     None => break,
                 }
             }
-            Err(_) => break,
+            Err(e) => {
+                // C'est ICI qu'arrive le CRC-32 de page Ogg, vérifié par
+                // symphonia (`ogg/page.rs:241`) puis jeté par cette branche.
+                integrite.paquets_refuses = integrite.paquets_refuses.saturating_add(1);
+                integrite.premier_refus.get_or_insert_with(|| e.to_string());
+                break;
+            }
         };
 
         if packet.track_id != track_id {
@@ -3240,7 +3413,13 @@ fn decode_symphonia(
 
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
-            Err(_) => continue,
+            Err(e) => {
+                // Et ICI le CRC-8 d'en-tête de trame FLAC
+                // (`bundle-flac/frame.rs:211`).
+                integrite.trames_refusees = integrite.trames_refusees.saturating_add(1);
+                integrite.premier_refus.get_or_insert_with(|| e.to_string());
+                continue;
+            }
         };
 
         let mut packet_samples: Vec<i32> = Vec::new();
@@ -3294,6 +3473,7 @@ fn decode_symphonia(
     let out_channels = source_channels;
     let total_frames = all_samples.len() as f64 / source_channels as f64;
     let duration_s = total_frames / source_rate as f64;
+    integrite.trames_rendues = total_frames as u64;
 
     debug!(
         file = file_path,
@@ -3310,6 +3490,7 @@ fn decode_symphonia(
         sample_rate: out_rate,
         channels: out_channels,
         duration_s,
+        integrite,
     })
 }
 
@@ -3787,6 +3968,7 @@ fn decode_dsd_to_pcm(
         sample_rate: output_rate,
         channels: channels as u32,
         duration_s: actual_duration,
+        integrite: Default::default(),
     })
 }
 

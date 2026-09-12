@@ -80,6 +80,124 @@ pub fn downmix_i16_bytes(data: &[u8], source_channels: u16, target_channels: u16
     output
 }
 
+/// Pourquoi un mélange n'a pas eu lieu.
+///
+/// #2219, tranche R3 — jusqu'ici `PcmMixer::mix_buffers` répondait au bras `_`
+/// en rendant le PREMIER tampon. En 32 bits, le second producteur était donc
+/// **jeté en silence** : aucune erreur, aucune ligne de journal, un mélange qui
+/// n'en est pas un. Le défaut est resté dormant parce que le mélangeur n'a
+/// qu'un appelant hors essais — `playback::dj_player`, qui fixe `MIX_BIT_DEPTH`
+/// à 16 — et il devient fatal au premier second producteur (tranche R4).
+///
+/// Une profondeur que le mélangeur ne sait pas additionner se refuse désormais
+/// par ce motif nommé, au lieu de rendre une réponse fausse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixError {
+    /// Profondeur d'échantillon hors du contrat : 16, 24 ou 32 bits ENTIERS.
+    ///
+    /// Le PCM flottant n'est pas de ce nombre, et ce n'est pas un oubli : dans
+    /// cette caisse il ne se porte JAMAIS par un `bit_depth: u16`. `downmix`
+    /// ci-dessus prend des `&[f32]` ; `outputs::local` reconnaît le flottant au
+    /// `WAVE_FORMAT_IEEE_FLOAT` de l'en-tête et `audio::convolver` à son
+    /// `format_tag == 3`, jamais à une profondeur. `PcmMixer` ne porte aucun de
+    /// ces drapeaux : lui faire dire « 32 » pour du f32 confondrait deux
+    /// encodages de même largeur et rendrait du bruit. Tant qu'aucun appelant
+    /// ne demande un mélange flottant, il se refuse ici.
+    UnsupportedBitDepth(u16),
+    /// Le tampon fourni par l'appelant ne peut pas contenir le mélange.
+    OutputTooSmall { needed: usize, provided: usize },
+}
+
+impl std::fmt::Display for MixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedBitDepth(bits) => write!(
+                f,
+                "profondeur non mélangeable : {bits} bits (attendu 16, 24 ou 32 entiers)"
+            ),
+            Self::OutputTooSmall { needed, provided } => write!(
+                f,
+                "tampon de sortie trop court : {needed} octets nécessaires, {provided} fournis"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MixError {}
+
+/// Encodage d'un échantillon PCM entier petit-boutien.
+///
+/// Aucun bras `_` ici : c'est `from_bit_depth` qui tranche une fois pour
+/// toutes, et il RÉPOND par une erreur nommée. Le reste du chemin est
+/// exhaustif, donc une quatrième profondeur ajoutée à l'énumération ne peut
+/// plus se glisser sous un repli silencieux — le compilateur la réclame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleFormat {
+    I16,
+    I24,
+    I32,
+}
+
+impl SampleFormat {
+    fn from_bit_depth(bit_depth: u16) -> Result<Self, MixError> {
+        match bit_depth {
+            16 => Ok(Self::I16),
+            24 => Ok(Self::I24),
+            32 => Ok(Self::I32),
+            other => Err(MixError::UnsupportedBitDepth(other)),
+        }
+    }
+
+    const fn bytes(self) -> usize {
+        match self {
+            Self::I16 => 2,
+            Self::I24 => 3,
+            Self::I32 => 4,
+        }
+    }
+
+    /// Bornes de saturation, dans l'ordre (plancher, plafond).
+    const fn range(self) -> (f64, f64) {
+        match self {
+            Self::I16 => (i16::MIN as f64, i16::MAX as f64),
+            Self::I24 => (-8_388_608.0, 8_388_607.0),
+            Self::I32 => (i32::MIN as f64, i32::MAX as f64),
+        }
+    }
+
+    /// Lit un échantillon. `bytes` fait AU MOINS `self.bytes()` octets.
+    fn read(self, bytes: &[u8]) -> i32 {
+        match self {
+            Self::I16 => i16::from_le_bytes([bytes[0], bytes[1]]) as i32,
+            Self::I24 => {
+                let raw = ((bytes[2] as i32) << 16) | ((bytes[1] as i32) << 8) | (bytes[0] as i32);
+                if raw & 0x0080_0000 != 0 {
+                    raw | !0x00FF_FFFF
+                } else {
+                    raw
+                }
+            }
+            Self::I32 => i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        }
+    }
+
+    /// Écrit un échantillon saturé. `out` fait AU MOINS `self.bytes()` octets.
+    fn write(self, value: f64, out: &mut [u8]) {
+        let (lo, hi) = self.range();
+        let clamped = value.clamp(lo, hi);
+        match self {
+            Self::I16 => out[..2].copy_from_slice(&(clamped as i16).to_le_bytes()),
+            Self::I24 => {
+                let v = clamped as i32;
+                out[0] = (v & 0xFF) as u8;
+                out[1] = ((v >> 8) & 0xFF) as u8;
+                out[2] = ((v >> 16) & 0xFF) as u8;
+            }
+            Self::I32 => out[..4].copy_from_slice(&(clamped as i32).to_le_bytes()),
+        }
+    }
+}
+
 pub struct PcmMixer {
     channels: u16,
     bit_depth: u16,
@@ -95,104 +213,84 @@ impl PcmMixer {
         }
     }
 
-    pub fn mix_buffers(&self, buffers: &[&[u8]], gains: &[f32]) -> Vec<u8> {
-        if buffers.is_empty() {
-            return Vec::new();
-        }
-
+    /// Nombre d'octets que `mix_into` écrira pour ces tampons.
+    ///
+    /// C'est aussi la porte de la profondeur : elle refuse ici, une seule fois,
+    /// ce que le reste du chemin ne saurait pas additionner.
+    pub fn mixed_len(&self, buffers: &[&[u8]]) -> Result<usize, MixError> {
+        let format = SampleFormat::from_bit_depth(self.bit_depth)?;
         let max_len = buffers.iter().map(|b| b.len()).max().unwrap_or(0);
-
-        match self.bit_depth {
-            16 => self.mix_16bit(buffers, gains, max_len),
-            24 => self.mix_24bit(buffers, gains, max_len),
-            _ => buffers.first().map(|b| b.to_vec()).unwrap_or_default(),
-        }
+        // Un échantillon incomplet en fin de tampon n'est pas interprétable :
+        // on s'arrête à la dernière frontière entière, comme avant.
+        Ok(max_len - (max_len % format.bytes()))
     }
 
-    fn mix_16bit(&self, buffers: &[&[u8]], gains: &[f32], max_len: usize) -> Vec<u8> {
-        let sample_count = max_len / 2;
-        let mut output = vec![0u8; sample_count * 2];
+    /// Mélange dans un tampon FOURNI par l'appelant, sans allouer.
+    ///
+    /// Rend le nombre d'octets écrits. Le rappel temps réel d'une sortie ne
+    /// peut pas se permettre le `Vec<u8>` que `mix_buffers` construit à chaque
+    /// appel : c'est cette variante-là qu'il doit appeler, avec un tampon
+    /// dimensionné une fois par `mixed_len`.
+    ///
+    /// Gardé par `aucune_allocation_dans_mix_into`
+    /// (`tune-core/tests/melangeur_multi_producteurs_r3.rs`).
+    pub fn mix_into(
+        &self,
+        buffers: &[&[u8]],
+        gains: &[f32],
+        out: &mut [u8],
+    ) -> Result<usize, MixError> {
+        let format = SampleFormat::from_bit_depth(self.bit_depth)?;
+        let needed = self.mixed_len(buffers)?;
+        if out.len() < needed {
+            return Err(MixError::OutputTooSmall {
+                needed,
+                provided: out.len(),
+            });
+        }
 
+        let width = format.bytes();
+        let sample_count = needed / width;
         for i in 0..sample_count {
-            let mut sum: f64 = 0.0;
+            let pos = i * width;
+            let mut sum = 0.0f64;
             for (buf_idx, buf) in buffers.iter().enumerate() {
                 let gain = gains.get(buf_idx).copied().unwrap_or(1.0) as f64;
-                let byte_pos = i * 2;
-                if byte_pos + 1 < buf.len() {
-                    let sample = i16::from_le_bytes([buf[byte_pos], buf[byte_pos + 1]]);
-                    sum += sample as f64 * gain;
+                if pos + width <= buf.len() {
+                    sum += format.read(&buf[pos..pos + width]) as f64 * gain;
                 }
             }
-
-            let clamped = sum.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-            let bytes = clamped.to_le_bytes();
-            output[i * 2] = bytes[0];
-            output[i * 2 + 1] = bytes[1];
+            format.write(sum, &mut out[pos..pos + width]);
         }
 
-        output
+        Ok(needed)
     }
 
-    fn mix_24bit(&self, buffers: &[&[u8]], gains: &[f32], max_len: usize) -> Vec<u8> {
-        let sample_count = max_len / 3;
-        let mut output = vec![0u8; sample_count * 3];
-
-        for i in 0..sample_count {
-            let mut sum: f64 = 0.0;
-            for (buf_idx, buf) in buffers.iter().enumerate() {
-                let gain = gains.get(buf_idx).copied().unwrap_or(1.0) as f64;
-                let byte_pos = i * 3;
-                if byte_pos + 2 < buf.len() {
-                    let raw = ((buf[byte_pos + 2] as i32) << 16)
-                        | ((buf[byte_pos + 1] as i32) << 8)
-                        | (buf[byte_pos] as i32);
-                    let sample = if raw & 0x800000 != 0 {
-                        raw | !0xFFFFFF
-                    } else {
-                        raw
-                    };
-                    sum += sample as f64 * gain;
-                }
-            }
-
-            let clamped = sum.clamp(-8388608.0, 8388607.0) as i32;
-            output[i * 3] = (clamped & 0xFF) as u8;
-            output[i * 3 + 1] = ((clamped >> 8) & 0xFF) as u8;
-            output[i * 3 + 2] = ((clamped >> 16) & 0xFF) as u8;
-        }
-
-        output
+    /// Mélange en allouant le tampon de sortie.
+    ///
+    /// Confort pour les appels hors rappel temps réel. Le rappel, lui, appelle
+    /// `mix_into`.
+    pub fn mix_buffers(&self, buffers: &[&[u8]], gains: &[f32]) -> Result<Vec<u8>, MixError> {
+        let needed = self.mixed_len(buffers)?;
+        let mut output = vec![0u8; needed];
+        let written = self.mix_into(buffers, gains, &mut output)?;
+        debug_assert_eq!(written, needed);
+        Ok(output)
     }
 
-    pub fn apply_gain(data: &mut [u8], gain: f32, bit_depth: u16) {
-        match bit_depth {
-            16 => {
-                for chunk in data.chunks_exact_mut(2) {
-                    let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                    let adjusted =
-                        (sample as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                    let bytes = adjusted.to_le_bytes();
-                    chunk[0] = bytes[0];
-                    chunk[1] = bytes[1];
-                }
-            }
-            24 => {
-                for chunk in data.chunks_exact_mut(3) {
-                    let raw =
-                        ((chunk[2] as i32) << 16) | ((chunk[1] as i32) << 8) | (chunk[0] as i32);
-                    let sample = if raw & 0x800000 != 0 {
-                        raw | !0xFFFFFF
-                    } else {
-                        raw
-                    };
-                    let adjusted = (sample as f32 * gain).clamp(-8388608.0, 8388607.0) as i32;
-                    chunk[0] = (adjusted & 0xFF) as u8;
-                    chunk[1] = ((adjusted >> 8) & 0xFF) as u8;
-                    chunk[2] = ((adjusted >> 16) & 0xFF) as u8;
-                }
-            }
-            _ => {}
+    /// Applique un gain en place.
+    ///
+    /// Rend une erreur nommée plutôt que de ne rien faire : un `_ => {}` ici
+    /// laissait le tampon INCHANGÉ, ce qui se lit à l'oreille comme un gain
+    /// ignoré et à la lecture du code comme un succès.
+    pub fn apply_gain(data: &mut [u8], gain: f32, bit_depth: u16) -> Result<(), MixError> {
+        let format = SampleFormat::from_bit_depth(bit_depth)?;
+        let width = format.bytes();
+        for chunk in data.chunks_exact_mut(width) {
+            let value = format.read(chunk) as f64 * gain as f64;
+            format.write(value, chunk);
         }
+        Ok(())
     }
 
     pub fn silence(&self, duration_ms: u64) -> Vec<u8> {
@@ -219,7 +317,7 @@ mod tests {
         let buf1: Vec<u8> = 1000i16.to_le_bytes().to_vec();
         let buf2: Vec<u8> = 2000i16.to_le_bytes().to_vec();
 
-        let mixed = mixer.mix_buffers(&[&buf1, &buf2], &[1.0, 1.0]);
+        let mixed = mixer.mix_buffers(&[&buf1, &buf2], &[1.0, 1.0]).unwrap();
         let result = i16::from_le_bytes([mixed[0], mixed[1]]);
         assert_eq!(result, 3000);
     }
@@ -230,7 +328,7 @@ mod tests {
         let buf1: Vec<u8> = 1000i16.to_le_bytes().to_vec();
         let buf2: Vec<u8> = 1000i16.to_le_bytes().to_vec();
 
-        let mixed = mixer.mix_buffers(&[&buf1, &buf2], &[0.5, 0.5]);
+        let mixed = mixer.mix_buffers(&[&buf1, &buf2], &[0.5, 0.5]).unwrap();
         let result = i16::from_le_bytes([mixed[0], mixed[1]]);
         assert_eq!(result, 1000);
     }
@@ -241,7 +339,7 @@ mod tests {
         let buf1: Vec<u8> = 30000i16.to_le_bytes().to_vec();
         let buf2: Vec<u8> = 30000i16.to_le_bytes().to_vec();
 
-        let mixed = mixer.mix_buffers(&[&buf1, &buf2], &[1.0, 1.0]);
+        let mixed = mixer.mix_buffers(&[&buf1, &buf2], &[1.0, 1.0]).unwrap();
         let result = i16::from_le_bytes([mixed[0], mixed[1]]);
         assert_eq!(result, i16::MAX);
     }
@@ -249,9 +347,30 @@ mod tests {
     #[test]
     fn apply_gain_16bit() {
         let mut data: Vec<u8> = 1000i16.to_le_bytes().to_vec();
-        PcmMixer::apply_gain(&mut data, 0.5, 16);
+        PcmMixer::apply_gain(&mut data, 0.5, 16).unwrap();
         let result = i16::from_le_bytes([data[0], data[1]]);
         assert_eq!(result, 500);
+    }
+
+    /// Même famille que le bras `_` de `mix_buffers` : `apply_gain` ne faisait
+    /// RIEN en 32 bits, ce qui se lit comme un succès.
+    #[test]
+    fn apply_gain_32bit() {
+        let mut data: Vec<u8> = 1_000_000i32.to_le_bytes().to_vec();
+        PcmMixer::apply_gain(&mut data, 0.5, 32).unwrap();
+        let result = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        assert_eq!(result, 500_000, "le gain 32 bits ne doit pas être ignoré");
+    }
+
+    #[test]
+    fn apply_gain_refuse_une_profondeur_hors_contrat() {
+        let mut data = vec![1u8, 2, 3, 4];
+        let avant = data.clone();
+        assert_eq!(
+            PcmMixer::apply_gain(&mut data, 0.5, 8),
+            Err(MixError::UnsupportedBitDepth(8))
+        );
+        assert_eq!(data, avant, "un refus ne doit rien modifier");
     }
 
     #[test]
@@ -272,7 +391,7 @@ mod tests {
     #[test]
     fn empty_mix() {
         let mixer = PcmMixer::new(2, 16, 44100);
-        let result = mixer.mix_buffers(&[], &[]);
+        let result = mixer.mix_buffers(&[], &[]).unwrap();
         assert!(result.is_empty());
     }
 
@@ -282,7 +401,7 @@ mod tests {
         let buf1 = vec![0x00u8, 0x10, 0x00]; // 4096
         let buf2 = vec![0x00u8, 0x10, 0x00]; // 4096
 
-        let mixed = mixer.mix_buffers(&[&buf1, &buf2], &[1.0, 1.0]);
+        let mixed = mixer.mix_buffers(&[&buf1, &buf2], &[1.0, 1.0]).unwrap();
         let val = (mixed[0] as i32) | ((mixed[1] as i32) << 8) | ((mixed[2] as i32) << 16);
         assert_eq!(val, 8192);
     }

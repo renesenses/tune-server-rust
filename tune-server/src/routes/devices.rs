@@ -96,6 +96,11 @@ async fn list_sendspin_players(State(state): State<AppState>) -> Json<Value> {
         // aucune zone Sendspin ne doit naître de cette liste.
         "playback_supported": false,
         "reason": tune_core::discovery::sendspin::MOTIF_PHASE_DECOUVERTE,
+        // #3326 — le MODE DE TRANSITION, publié ici pour qu'on puisse répondre
+        // à « ce serveur accepte-t-il du non chiffré ? » sans lire le code ni
+        // le journal. Le nom du réglage part avec l'état : sinon la réponse
+        // « oui » ne dit pas quoi changer.
+        "transition_mode": tune_core::sendspin::ModeTransition::en_vigueur().decrire(),
         "count": players.len(),
         "players": players,
         "handshaked_count": pairs.len(),
@@ -1555,6 +1560,7 @@ fn compteurs_de_famine(famine: Option<tune_core::outputs::traits::OutputRingStar
         return json!({
             "total_underruns": Value::Null,
             "ring_starvation_missing_samples": Value::Null,
+            "driver_underruns": Value::Null,
             "served_samples": Value::Null,
             "stream_ms": Value::Null,
         });
@@ -1562,6 +1568,11 @@ fn compteurs_de_famine(famine: Option<tune_core::outputs::traits::OutputRingStar
     json!({
         "total_underruns": f.events,
         "ring_starvation_missing_samples": f.missing_samples,
+        // #3205 — le compteur qui décide du noyau RT. `total_underruns` garde
+        // son nom historique et son sens : la famine de l'ANNEAU. Celui-ci
+        // compte les fois où le PILOTE n'a pas été servi à temps, ce qu'aucun
+        // chiffre ne disait jusqu'ici.
+        "driver_underruns": f.driver_underruns,
         "served_samples": f.served_samples,
         "stream_ms": f.stream_ms,
     })

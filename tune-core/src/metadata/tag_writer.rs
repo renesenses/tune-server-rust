@@ -550,6 +550,13 @@ mod tests {
             // Same for `dr_album` / `dr_track` (Vorbis DYNAMIC RANGE): a measured
             // value produced by an external analyser, not something Tune should
             // let a user overwrite from the tag editor.
+            //
+            // `dr_source` (#3924) has no mapping either, and must not get one:
+            // it is not a tag at all. It is Tune's own note of WHICH of the two
+            // producers wrote `dr_track` — the file tag, or the analysis pass —
+            // and writing it into the file would invent a `DR_SOURCE` field
+            // that no tagger reads and that would come back as a tag on the
+            // next scan.
             "rg_track_gain",
             "rg_track_peak",
             "rg_album_gain",

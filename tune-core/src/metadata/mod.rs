@@ -476,6 +476,16 @@ pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
         }
         // lofty may report "alac" directly for some M4A files
         "alac" => "alac".to_string(),
+        // 🔴 #3849 — les deux noms de types lofty qui ne sont pas des
+        // extensions. `FileType::WavPack` s'imprime « wavpack » et
+        // `FileType::Vorbis` « vorbis » ; ni l'un ni l'autre n'est reconnu par
+        // `AudioFormat::from_extension`, qui connaît « wv » et « ogg ».
+        // Écrire l'extension rend `tracks.format` homogène avec ce que le
+        // chemin SANS étiquette écrit déjà pour les mêmes fichiers.
+        //
+        // Garde : `tout_type_lofty_catalogue_donne_un_format_reconnu`.
+        "wavpack" => "wv".to_string(),
+        "vorbis" => "ogg".to_string(),
         other => other.to_string(),
     }
 }
@@ -2664,6 +2674,15 @@ fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
     None
 }
 
+/// Provenance d'un `dr_track` LU DANS LE TAG du fichier (#3924).
+///
+/// Jumeau de `crate::audio::replaygain::DR_SOURCE_ANALYSIS`, qui marque la
+/// valeur CALCULEE par la passe d'analyse. Les deux vivent a cote de leur
+/// ecrivain plutot que dans un module commun : chacune est lue par un seul
+/// point de code, et aucun consommateur ne les compare — les routes qui les
+/// servent recopient la chaine sans l'interpreter (`dynamic_range_source`).
+pub(crate) const DR_SOURCE_TAG: &str = "tag";
+
 /// Reduce a Dynamic Range tag to its bare digits.
 ///
 /// Tools disagree on the form: DROffline MK2 and foobar2000 write `12`, `DR12`
@@ -3286,7 +3305,32 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         if let Some(v) = find_vorbis_comment(&header, "DYNAMIC RANGE")
             .or_else(|| find_vorbis_comment(&header, "DR"))
         {
-            meta.insert("dr_track".into(), normalise_dr(&v));
+            let dr = normalise_dr(&v);
+            // #3924 — LA PROVENANCE S'ECRIT AVEC LA VALEUR, jamais apres.
+            //
+            // Depuis la v0.9.145, `dr_track` a DEUX producteurs : cette
+            // lecture-ci, qui prend le tag du fichier, et la passe d'analyse
+            // (`audio::replaygain`), qui CALCULE la valeur et se marque
+            // `dr_source = "analysis"`. Sans le pendant ici, la clef ne
+            // couvrait qu'un producteur sur deux, et l'ecart se payait deux
+            // fois :
+            //
+            // * une valeur venue du tag n'etait separable d'une valeur venue
+            //   d'un calcul par AUCUNE lecture — c'est le fil 1683, ou
+            //   Patatorz, qui mesure ses DR lui-meme, demande « d'ou ca
+            //   sort » et ou personne ne peut lui repondre ;
+            // * pire, un fichier analyse PUIS retague gardait
+            //   `dr_source = "analysis"` sur une valeur desormais lue dans le
+            //   tag : la clef ne se contentait plus de manquer, elle mentait.
+            //
+            // Rien n'est ecrit sur une valeur VIDE (`DYNAMIC RANGE=` existe
+            // sur des fichiers mal etiquetes) : la meme regle que
+            // `replaygain::peut_ecrire_le_dr`, une valeur vide n'est pas une
+            // valeur et n'a donc pas de provenance.
+            if !dr.trim().is_empty() {
+                meta.insert("dr_source".into(), DR_SOURCE_TAG.into());
+            }
+            meta.insert("dr_track".into(), dr);
         }
     }
     if let Some(v) = get(ItemKey::CopyrightMessage) {
@@ -4328,6 +4372,124 @@ mod tests {
         assert_eq!(update.year, Some(2024));
     }
 
+    /// 🔴 CONTRE-ÉPREUVE #3849, depuis le FICHIER — un `.wv` ÉTIQUETÉ doit
+    /// laisser en base un format que la résolution de lecture comprend.
+    ///
+    /// Le témoin voisin part d'une chaîne ; celui-ci part des octets. Un
+    /// fichier SANS étiquette prend le chemin `tagless_fallback`, qui écrit
+    /// l'extension (« wv ») — ce n'est pas là que le défaut vit. Un fichier
+    /// ÉTIQUETÉ — un rip EAC, comme les 13 albums de Marco Polo — prend le
+    /// chemin lofty, qui écrit `format!("{:?}", file_type)` en minuscules.
+    ///
+    /// Les deux fixtures portent le MÊME PCM (empreinte
+    /// `b0bf58385502cddf726dd94e6a542ae0` des deux côtés, mesurée avec
+    /// `wvunpack` 5.6.0) : seule l'étiquette APEv2 en queue les sépare, posée
+    /// par `wvtag` 5.6.0. Le témoin isole donc bien l'étiquette, et rien
+    /// d'autre.
+    ///
+    /// Mesuré avant correction sur ce fichier exact :
+    /// `tracks.format = Some("wavpack")`, `from_extension(...) = None`.
+    /// Conséquence en lecture (`resolve_local.rs` : `let fmt =
+    /// track.format...; let source_format = AudioFormat::from_extension(&fmt)`)
+    /// : pas de format source, donc pas de transcodage, branche « servir le
+    /// fichier brut », et MIME de repli `audio/flac`. Le Denon de Marco Polo
+    /// recevait un `.wv` annoncé FLAC.
+    ///
+    /// ⚠️ Le témoin ne pose PAS l'étiquette lui-même : `write_metadata` rend
+    /// `Err("no primary tag")` sur un `.wv` qui n'en a pas encore. C'est un
+    /// défaut distinct, non traité ici.
+    #[test]
+    fn un_wavpack_etiquete_laisse_en_base_un_format_que_la_lecture_comprend() {
+        use crate::audio::formats::AudioFormat;
+
+        let nu = format!(
+            "{}/tests/fixtures/wavpack/rip_16_44100_stereo.wv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let etiquete = format!(
+            "{}/tests/fixtures/wavpack/rip_16_44100_stereo_etiquete.wv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+
+        // Le chemin SANS étiquette n'a jamais eu le défaut : il sert de repère.
+        let format_nu = read_metadata(std::path::Path::new(&nu))
+            .and_then(|m| m.format)
+            .expect("aucune métadonnée lue sur le .wv nu");
+        assert!(
+            AudioFormat::from_extension(&format_nu).is_some(),
+            "repère cassé : le .wv NU laisse déjà un format inconnu ({format_nu})"
+        );
+
+        let lu = read_metadata(std::path::Path::new(&etiquete))
+            .expect("aucune métadonnée lue sur le .wv étiqueté");
+        assert_eq!(
+            lu.title.as_deref(),
+            Some("Lento lugubre"),
+            "la fixture doit bien être étiquetée, sinon le témoin mesure l'autre chemin"
+        );
+        let format = lu.format.expect("aucun format lu sur le .wv étiqueté");
+        assert!(
+            AudioFormat::from_extension(&format).is_some(),
+            "un .wv étiqueté laisse `tracks.format = {format:?}`, que la résolution de \
+             lecture ne reconnaît pas : la piste part BRUTE, annoncée audio/flac (#3849)"
+        );
+    }
+
+    /// 🔴 GARDE #3849 — tout type lofty d'un format CATALOGUÉ doit ressortir
+    /// de `normalize_format` sous un nom que `AudioFormat::from_extension`
+    /// reconnaît.
+    ///
+    /// Le chemin étiqueté de `read_metadata` écrit littéralement
+    /// `format!("{:?}", tagged.file_type()).to_lowercase()` dans
+    /// `tracks.format`. Deux de ces noms ne sont PAS des extensions —
+    /// « wavpack » et « vorbis » — et `from_extension` rendait `None` pour
+    /// eux. Mesuré chez Marco Polo : sans format source, la piste prend la
+    /// branche « servir le fichier brut » et le MIME retombe sur
+    /// `audio/flac` ; son Denon recevait un `.wv` annoncé FLAC.
+    ///
+    /// Le témoin part de `LIBRARY_AUDIO_EXTENSIONS`, pas d'une liste recopiée :
+    /// un format ajouté au catalogue demain est couvert sans qu'on y pense.
+    ///
+    /// Sabotage : retirer `"wavpack" => "wv"` de `normalize_format` ET
+    /// `"wavpack" => Some(Self::WavPack)` de `from_extension` — le témoin
+    /// rougit en nommant `wv`/`wavpack`.
+    #[test]
+    fn tout_type_lofty_catalogue_donne_un_format_reconnu() {
+        use crate::audio::formats::AudioFormat;
+        use crate::audio::support::LIBRARY_AUDIO_EXTENSIONS;
+
+        let mut vus = 0usize;
+        for ext in LIBRARY_AUDIO_EXTENSIONS {
+            // `iso` est extrait en DSF par le parcours, et le DSD emprunte un
+            // chemin de métadonnées qui écrit l'extension telle quelle.
+            if matches!(*ext, "iso" | "dsf" | "dff") {
+                continue;
+            }
+            let Some(ft) = lofty::file::FileType::from_ext(ext) else {
+                continue;
+            };
+            vus += 1;
+
+            // EXACTEMENT l'expression du chemin étiqueté de `read_metadata`.
+            let brut = format!("{ft:?}").to_lowercase();
+
+            for profondeur in [None, Some(16u8), Some(24u8)] {
+                let normalise = normalize_format(&brut, profondeur);
+                assert!(
+                    AudioFormat::from_extension(&normalise).is_some(),
+                    "`.{ext}` -> lofty {ft:?} -> normalize_format(\"{brut}\", {profondeur:?}) \
+                     = \"{normalise}\", que `AudioFormat::from_extension` ne reconnaît PAS. \
+                     Une piste portant ce format en base est servie BRUTE, avec le MIME de \
+                     repli `audio/flac` (#3849)."
+                );
+            }
+        }
+        assert!(
+            vus >= 8,
+            "le témoin doit couvrir tout le catalogue, seulement {vus} types lofty vus"
+        );
+    }
+
     #[test]
     fn normalize_format_mpeg_to_mp3() {
         assert_eq!(normalize_format("mpeg", None), "mp3");
@@ -5355,6 +5517,131 @@ mod tests {
 /// est du Jazz ET de la Fusion » s'écrit de deux façons légitimes selon le
 /// format et l'étiqueteur, et Tune n'en lisait qu'une.
 ///
+/// #3924 — LA PROVENANCE DU DYNAMIC RANGE, ÉCRITE PAR LE SCAN.
+///
+/// Patatorz (fil forum 1683, 11/09/2026) mesure ses DR lui-même et demande si
+/// le nombre que Tune affiche est le sien ou celui de Tune : « il serait bon
+/// de comprendre d'où ça sort ». Depuis la v0.9.145 les deux existent —
+/// `dr_track` a un second producteur, la passe d'analyse, qui se marque
+/// `dr_source = "analysis"` — mais le premier, cette lecture-ci, ne marquait
+/// RIEN : une valeur sans marque ne se distinguait pas d'une valeur d'avant
+/// la clef, et un fichier analysé puis retagué gardait « analysis » sur une
+/// valeur venue du tag.
+///
+/// L'épreuve ouvre un VRAI conteneur — la fixture FLAC du dépôt, avec un
+/// `DYNAMIC RANGE` écrit par lofty — et relit par la fonction de production.
+/// Un test sur une chaîne ne dirait rien du chemin réel : le bloc de DR est
+/// lu par `read_vorbis_header`, à côté de lofty, et c'est cette conjonction
+/// que le témoin traverse.
+#[cfg(test)]
+mod provenance_du_dr_3924 {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::VorbisComments;
+
+    /// Une copie de la fixture FLAC, éventuellement taguée `DYNAMIC RANGE`.
+    ///
+    /// `scratch_file` et non un chemin nu : le fichier disparaît à la sortie
+    /// de portée même quand l'épreuve échoue, et son nom porte le pid — deux
+    /// binaires de test concurrents sur la même machine de compilation ne
+    /// peuvent pas se voler leur copie (#2864, #3030).
+    fn gabarit(dr: Option<&str>, epreuve: &str) -> crate::test_scratch::ScratchFile {
+        let source =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        let copie = crate::test_scratch::scratch_file(&format!("dr3924-{epreuve}"), "-test.flac");
+        std::fs::copy(&source, &copie).expect("copie du gabarit");
+        if let Some(v) = dr {
+            // `FlacFile` et le bloc Vorbis Comment BRUT, pas l'API générique
+            // de lofty : `DYNAMIC RANGE` n'a aucun `ItemKey` — c'est
+            // précisément pourquoi `read_extended_metadata` le lit à côté de
+            // lofty, par `read_vorbis_header`. Un tag générique ne pourrait
+            // pas l'écrire, et le témoin se validerait contre rien.
+            let chemin: &std::path::Path = &copie;
+            let mut fh = std::fs::File::open(chemin).expect("ouverture du gabarit");
+            let mut flac = FlacFile::read_from(&mut fh, ParseOptions::new()).expect("lecture FLAC");
+            drop(fh);
+            if flac.vorbis_comments().is_none() {
+                flac.set_vorbis_comments(VorbisComments::default());
+            }
+            flac.vorbis_comments_mut()
+                .expect("bloc Vorbis Comment")
+                .insert("DYNAMIC RANGE".to_string(), v.to_string());
+            flac.save_to_path(chemin, WriteOptions::default())
+                .expect("écriture du tag");
+        }
+        copie
+    }
+
+    /// Le cas du fil 1683 : le fichier porte le DR que son propriétaire a
+    /// mesuré. La valeur sort — et elle sort DITE.
+    #[test]
+    fn un_dr_lu_dans_le_tag_sort_avec_sa_provenance_3924() {
+        let chemin = gabarit(Some("DR14"), "tag");
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("dr_track").map(String::as_str),
+            Some("14"),
+            "témoin : le tag doit d'abord être lu. Relevé : {meta:?}"
+        );
+        assert_eq!(
+            meta.get("dr_source").map(String::as_str),
+            Some("tag"),
+            "#3924 — le scan doit MARQUER la provenance en même temps que la \
+             valeur. Sans cette marque, rien ne sépare ce 14 mesuré par \
+             Patatorz d'un 14 calculé par la passe d'analyse. Relevé : {meta:?}"
+        );
+    }
+
+    /// TÉMOIN VERT — un fichier sans tag de DR n'annonce aucune provenance.
+    ///
+    /// Sans lui, écrire `dr_source` inconditionnellement passerait : la clef
+    /// décrirait alors une valeur qui n'existe pas, et la fiche afficherait
+    /// « lue dans les tags » à côté d'un champ vide.
+    #[test]
+    fn sans_tag_de_dr_aucune_provenance_n_est_inventee_3924() {
+        let chemin = gabarit(None, "sans-tag");
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("dr_track"),
+            None,
+            "témoin : la fixture ne porte pas de DR. Relevé : {meta:?}"
+        );
+        assert_eq!(
+            meta.get("dr_source"),
+            None,
+            "une provenance sans valeur décrirait le vide. Relevé : {meta:?}"
+        );
+    }
+
+    // ── PAS D'ÉPREUVE POUR LE TAG VIDE, ET C'EST MESURÉ ───────────────────
+    //
+    // `read_extended_metadata` refuse d'écrire une provenance sur une valeur
+    // vide (`!dr.trim().is_empty()`). Cette branche n'a PAS de témoin ici, et
+    // ce n'est pas un oubli : elle est inatteignable par un vrai fichier
+    // écrit avec lofty.
+    //
+    // Mesure du 11/09/2026, sur ce banc même, avec `gabarit(Some("   "))` :
+    //
+    //     left:  None          (ce que la lecture rend pour `dr_track`)
+    //     right: Some("")      (ce qu'un tag blanc devrait donner)
+    //
+    // Deux verrous en amont, et il suffit du premier :
+    //
+    // * `find_vorbis_comment` (plus haut) écarte déjà une valeur VIDE
+    //   (`if !value.is_empty()`), donc `DYNAMIC RANGE=` ne franchit jamais la
+    //   lecture ;
+    // * lofty ne persiste pas une valeur purement blanche : le `"   "` écrit
+    //   ci-dessus n'est pas ressorti du fichier.
+    //
+    // Écrire malgré tout une épreuve sur ce cas aurait donné un témoin VERT
+    // qui ne prouve rien — il resterait vert si l'on retirait la garde du
+    // code, puisque la valeur n'arrive pas jusqu'à elle. La garde reste
+    // néanmoins écrite : un fichier étiqueté par un autre outil, ou un
+    // `normalise_dr` retouché, peut rendre ce cas atteignable, et alors c'est
+    // elle qui empêche d'annoncer la provenance d'un vide.
+}
+
 /// Ces épreuves construisent de VRAIS fichiers dans les trois conteneurs qui
 /// couvrent la bibliothèque d'un testeur — FLAC (Vorbis Comment), M4A (atomes
 /// MP4) et MP3 (trames ID3v2) — parce qu'un garde-fou qui ne monterait qu'un

@@ -1,3 +1,4 @@
+pub(crate) mod cause_de_connexion;
 pub(crate) mod helpers;
 mod integration_test;
 mod multiroom;
