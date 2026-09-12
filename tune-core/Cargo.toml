@@ -375,3 +375,14 @@ path = "tests/reprise_favoris_streaming.rs"
 [[test]]
 name = "journal_latence_demarrage_local_i3568"
 path = "tests/journal_latence_demarrage_local_i3568.rs"
+
+# #2219, tranche R3 — le mélangeur PCM rend un MÉLANGE ou une erreur nommée.
+# Binaire à lui seul : il pose un `#[global_allocator]` qui compte les
+# allocations de `PcmMixer::mix_into`, et la cible d'essais de la bibliothèque
+# en porte déjà un (`outputs::local::ringbuf_tests`) — deux allocateurs globaux
+# dans le même binaire ne compilent pas. `autotests = false` en tête de ce
+# manifeste : sans cette cible, le fichier ne serait JAMAIS compilé et la porte
+# rendrait un vert contre rien.
+[[test]]
+name = "melangeur_multi_producteurs_r3"
+path = "tests/melangeur_multi_producteurs_r3.rs"
