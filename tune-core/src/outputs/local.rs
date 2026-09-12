@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::traits::{
-    OutputCapabilities, OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus,
-    OutputStatus, OutputTarget, PuitsDEchantillons, RingStarvation, TransportState,
+    AudioSpec, BlocPcm, FormatOuvert, OutputCapabilities, OutputDspMetrics, OutputRingStarvation,
+    OutputSignalPathStatus, OutputStatus, OutputTarget, PuitsDEchantillons, RingStarvation,
+    TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -3562,6 +3563,25 @@ pub(crate) fn is_dop_pcm(bytes: &[u8], bit_depth: u16, channels: u16) -> bool {
     true
 }
 
+/// [`is_dop_pcm`], appelé sur un bloc qui porte son propre format.
+///
+/// Le seul appel du fichier qui ne puisse plus intervertir la profondeur et le
+/// nombre de canaux : les deux sortent du même [`AudioSpec`], dans cet ordre,
+/// et ils n'y sont pas du même type. Les deux autres appels — les branches
+/// exclusives Windows — prennent encore leurs `u16` nus ; c'est leur tour dans
+/// une tranche suivante, et ils sont hors du chemin du puits.
+///
+/// Seuls les octets ALIGNÉS sont sondés : le marqueur DoP est l'octet haut d'un
+/// mot 24 bits, et un reliquat de trame coupée le placerait au mauvais endroit.
+fn bloc_est_porteur_dop(bloc: &BlocPcm<'_>) -> bool {
+    let spec = bloc.spec();
+    is_dop_pcm(
+        bloc.octets_alignes(),
+        spec.profondeur().bits_declares(),
+        spec.canaux(),
+    )
+}
+
 /// Classification stable du porteur PCM pendant une piste.
 ///
 /// Un flux 24 bits reste en quarantaine jusqu'a ce que 32 trames permettent
@@ -3616,27 +3636,40 @@ struct LocalPcmProcessor<'a> {
 }
 
 impl LocalPcmProcessor<'_> {
+    /// `spec` remplace le triplet `(frame_bytes, bit_depth, channels)` que
+    /// cette fonction recevait nu.
+    ///
+    /// Ce n'est pas un regroupement de confort : `frame_bytes` était le SEUL
+    /// des trois à ne pas être une étiquette — il en était la conséquence, et
+    /// rien n'obligeait l'appelant à le recalculer quand les deux autres
+    /// changeaient. Il n'est plus passé du tout : [`AudioSpec`] le déduit.
+    /// Quant à `bit_depth` et `channels`, tous deux `u16` et voisins, leur
+    /// interversion compilait ; elle est maintenant une erreur de type.
     fn process_pcm_chunk(
         &self,
         staged: &mut Vec<u8>,
-        frame_bytes: usize,
-        bit_depth: u16,
-        channels: u16,
+        spec: AudioSpec,
         kind: &mut LocalPcmKind,
     ) -> Option<ProcessedLocalPcm> {
-        let aligned_len = (staged.len() / frame_bytes) * frame_bytes;
+        // `bloc` tient les octets ET leur format : le découpage en trames ne
+        // peut plus être fait avec une autre largeur que celle de `spec`.
+        let bloc = spec.bloc(staged);
+        let aligned_len = bloc.octets_alignes().len();
+        let source_frames = bloc.trames() as u64;
         if aligned_len == 0 {
             return None;
         }
 
         if kind.is_awaiting_probe() {
-            let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
+            // `.max(1)` a disparu avec le besoin : `AudioSpec` refuse zéro
+            // canal à la construction, parce que ce serait un diviseur nul.
+            let probe_bytes = DOP_DETECT_FRAMES * spec.canaux() as usize * 3;
             if aligned_len < probe_bytes {
                 // Ne rien convertir ni publier : l'octet marqueur n'existe
                 // plus comme tel une fois le mot 24 bits passe en f32.
                 return None;
             }
-            *kind = if is_dop_pcm(&staged[..aligned_len], bit_depth, channels) {
+            *kind = if bloc_est_porteur_dop(&bloc) {
                 LocalPcmKind::Dop
             } else {
                 LocalPcmKind::Pcm
@@ -3649,7 +3682,8 @@ impl LocalPcmProcessor<'_> {
             sync_volume_to_dop(self.volume, self.user_volume, self.rg_factor, dop);
         }
 
-        let mut samples = pcm_bytes_to_f32(&staged[..aligned_len], bit_depth);
+        let mut samples =
+            pcm_bytes_to_f32(bloc.octets_alignes(), spec.profondeur().bits_declares());
         apply_local_dsp(
             &mut samples,
             self.eq,
@@ -3657,14 +3691,14 @@ impl LocalPcmProcessor<'_> {
             self.crossfeed,
             self.pure_bypass,
             self.mono_downmix,
-            channels,
+            spec.canaux(),
             dop,
         );
         staged.drain(..aligned_len);
 
         Some(ProcessedLocalPcm {
             samples,
-            source_frames: (aligned_len / frame_bytes) as u64,
+            source_frames,
             dop,
         })
     }
@@ -4949,7 +4983,33 @@ impl PuitsDEchantillons for PuitsAnneauCpal<'_> {
 ///
 /// L'ordre des deux conversions n'est pas indifférent : l'adaptation de canaux
 /// vient AVANT le rééchantillonnage, parce que le rééchantillonneur est
-/// construit pour `output_ch` canaux.
+/// construit pour les canaux de `sortie`.
+///
+/// R5 de #2219 — le format source tient maintenant en UN champ, `spec`, et le
+/// format de sortie en un autre, `sortie`.
+///
+/// Ce qui a disparu, et pourquoi :
+///
+/// * `sample_rate`, `channels`, `bit_depth` → [`AudioSpec`], dont les champs
+///   sont privés et dans une autre caisse. Les trois étiquettes ne se posent
+///   plus qu'ensemble, et la profondeur n'est plus un `u16` qui s'intervertit
+///   avec les canaux ;
+/// * `frame_bytes` → **supprimé**. Ce n'était pas une étiquette mais sa
+///   conséquence, recalculée à la main à chaque changement de format. La
+///   frontière gapless posait quatre affectations de suite dont celle-là ;
+///   oublier la quatrième, c'était lire un flux 24 bits par trames de 16 et
+///   décaler toute la piste — et cela compilait ;
+/// * `output_ch` → [`FormatOuvert`], le type que T8 (#3961) a déjà posé pour
+///   dire ce que le périphérique a réellement ouvert. Le puits le publie déjà
+///   sous ce nom ; l'étage n'avait aucune raison d'en tenir une deuxième
+///   version en pièces détachées ;
+/// * `needs_channel_adapt` → **déduit** de `sortie` et de `spec`. Ses deux
+///   seules affectations étaient le même `output_ch != channels`.
+///
+/// `needs_resample` reste un champ, et ce n'est pas un oubli : ce n'est pas une
+/// conséquence du format mais une **décision**. Quand la construction du
+/// rééchantillonneur échoue, la frontière gapless le repose à `false` alors que
+/// les deux cadences diffèrent toujours — le déduire effacerait ce repli.
 struct EtageDeConversion<'a> {
     pcm: LocalPcmProcessor<'a>,
     /// Octets reçus de l'amont, pas encore alignés sur une trame source.
@@ -4957,13 +5017,11 @@ struct EtageDeConversion<'a> {
     resampler: Option<Async<f32>>,
     resample_leftover: Vec<f32>,
     pcm_kind: LocalPcmKind,
-    sample_rate: u32,
-    channels: u16,
-    bit_depth: u16,
-    frame_bytes: usize,
-    output_ch: u16,
+    /// Le format de la SOURCE : celui dans lequel `en_attente` se lit.
+    spec: AudioSpec,
+    /// Le format réellement OUVERT par le périphérique, à l'autre bout.
+    sortie: FormatOuvert,
     needs_resample: bool,
-    needs_channel_adapt: bool,
 }
 
 /// Ce qu'une poussée vers le puits a produit.
@@ -4981,31 +5039,47 @@ enum PousseeVersLePuits {
 }
 
 impl EtageDeConversion<'_> {
+    /// Cadence de la source, en hertz.
+    fn sample_rate(&self) -> u32 {
+        self.spec.cadence()
+    }
+
+    /// Canaux de la source.
+    fn channels(&self) -> u16 {
+        self.spec.canaux()
+    }
+
+    /// Profondeur de la source, telle qu'un en-tête WAV la déclare.
+    fn bit_depth(&self) -> u16 {
+        self.spec.profondeur().bits_declares()
+    }
+
+    /// Faut-il adapter les canaux ? **Déduit**, jamais rangé : la source et la
+    /// sortie se comparent, il n'y a rien à tenir à jour.
+    fn needs_channel_adapt(&self) -> bool {
+        self.sortie.canaux != self.spec.canaux()
+    }
+
     /// Décode ce qui est aligné dans le tampon d'attente.
     ///
     /// `process_pcm_chunk` rend déjà `None` quand rien n'est aligné : la garde
     /// `aligned_len == 0` que les quatre copies posaient avant l'appel était le
     /// même calcul, fait deux fois.
     fn decoder(&mut self) -> Option<ProcessedLocalPcm> {
-        self.pcm.process_pcm_chunk(
-            &mut self.en_attente,
-            self.frame_bytes,
-            self.bit_depth,
-            self.channels,
-            &mut self.pcm_kind,
-        )
+        self.pcm
+            .process_pcm_chunk(&mut self.en_attente, self.spec, &mut self.pcm_kind)
     }
 
     /// Adaptation de canaux puis rééchantillonnage, dans cet ordre et lui seul.
     fn convertir(&mut self, mut mots: Vec<f32>) -> Vec<f32> {
-        if self.needs_channel_adapt {
-            mots = adapt_channels(&mots, self.channels, self.output_ch);
+        if self.needs_channel_adapt() {
+            mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
         if self.needs_resample {
             mots = rubato_resample_chunk(
                 &mut self.resampler,
                 &mots,
-                self.output_ch,
+                self.sortie.canaux,
                 false,
                 &mut self.resample_leftover,
             );
@@ -5029,7 +5103,7 @@ impl EtageDeConversion<'_> {
             return PousseeVersLePuits::RienAPousser;
         };
         observer(&bloc);
-        if refuser_le_porteur_dop(bloc.dop, self.sample_rate, self.channels) {
+        if refuser_le_porteur_dop(bloc.dop, self.sample_rate(), self.channels()) {
             return PousseeVersLePuits::PorteurDopRefuse;
         }
         let trames_source = bloc.source_frames;
@@ -5326,7 +5400,7 @@ impl BoucleProducteur<'_> {
                 return FinDeBoucle::Abandon;
             }
 
-            let position = (compteurs.total_frames_fed as f64 / etage.sample_rate as f64 * 1000.0)
+            let position = (compteurs.total_frames_fed as f64 / etage.sample_rate() as f64 * 1000.0)
                 as u64
                 + compteurs.seek_offset;
             self.position_ms.store(position, Ordering::Relaxed);
@@ -7913,7 +7987,6 @@ impl OutputTarget for LocalOutput {
             };
             let skipped_bytes: u64 = 0;
             let needs_resample = output_sr != sample_rate;
-            let needs_channel_adapt = output_ch != channels;
             // #3233 — Pierre M, fil 1043 : « DSD : le temps défile, pas de
             // son ». Un porteur DoP ne survit ni au sinc ni à l'adaptation de
             // canaux : le marqueur 0x05/0xFA alterne à CHAQUE trame, c'est un
@@ -8008,6 +8081,33 @@ impl OutputTarget for LocalOutput {
             // Le tampon d'attente est amorcé avec le reliquat non aligné de la
             // lecture d'en-tête : sans lui, chaque mot 24 bits suivant serait lu
             // au mauvais décalage d'octet (bruit blanc).
+            // Le format source devient un TYPE, ici et une seule fois. Le
+            // refus est inatteignable en pratique — `parse_wav_header` ne rend
+            // que 0, 16, 24 ou 32 bits, et un conteneur nul le fait déjà
+            // échouer — mais il remplace deux fins de partie bien pires :
+            // `bit_depth / 8` sur une profondeur inconnue rendait un nombre
+            // d'octets faux (bruit blanc), et zéro canal faisait diviser par
+            // zéro le calcul d'alignement (le fil de lecture abattu).
+            let Some(spec) = AudioSpec::depuis_entete(sample_rate, bit_depth, channels) else {
+                warn!(
+                    device = %device_name,
+                    sample_rate,
+                    bit_depth,
+                    channels,
+                    "local_audio_unsupported_source_format"
+                );
+                if let Ok(mut slot) = open_failure.lock() {
+                    // #3270 : un `return` nu laisse la zone s'arrêter sans que
+                    // l'écran apprenne jamais pourquoi.
+                    *slot = Some(format!(
+                        "« {device_name} » : ce flux annonce un format que Tune ne sait pas \
+                         lire ({bit_depth} bits, {channels} canaux)."
+                    ));
+                }
+                force_silent.store(true, Ordering::SeqCst);
+                playing.store(false, Ordering::SeqCst);
+                return;
+            };
             let mut etage = EtageDeConversion {
                 pcm: LocalPcmProcessor {
                     eq: &eq,
@@ -8027,13 +8127,9 @@ impl OutputTarget for LocalOutput {
                 // suivante.
                 resample_leftover: Vec::new(),
                 pcm_kind: LocalPcmKind::for_bit_depth(bit_depth),
-                sample_rate,
-                channels,
-                bit_depth,
-                frame_bytes,
-                output_ch,
+                spec,
+                sortie: FormatOuvert::new(output_sr, output_ch),
                 needs_resample,
-                needs_channel_adapt,
             };
             let mut puits = PuitsAnneauCpal {
                 anneau: ring.as_ref(),
@@ -8351,18 +8447,29 @@ impl OutputTarget for LocalOutput {
                     break;
                 };
 
+                // Le format de la piste enchaînée devient un TYPE avant qu'une
+                // seule de ses trames ne soit décodée, et AVANT que la queue du
+                // DSP ne soit rendue : un refus ici laisse la piste courante se
+                // terminer proprement, exactement comme un en-tête illisible.
+                // Inatteignable en pratique — `parse_wav_header` ne rend que 0,
+                // 16, 24 ou 32 bits et jamais zéro canal.
+                let Some(nouvelle_spec) = AudioSpec::depuis_entete(new_sr, new_bd, new_ch) else {
+                    info!("local_audio_gapless_next_not_wav_falling_back");
+                    break;
+                };
+
                 info!(
                     new_sr,
                     new_ch,
                     new_bd,
-                    prev_sr = etage.sample_rate,
-                    prev_ch = etage.channels,
-                    prev_bd = etage.bit_depth,
+                    prev_sr = etage.sample_rate(),
+                    prev_ch = etage.channels(),
+                    prev_bd = etage.bit_depth(),
                     "local_audio_gapless_next_track_format"
                 );
 
-                let prev_sr = etage.sample_rate;
-                let prev_ch = etage.channels;
+                let prev_sr = etage.sample_rate();
+                let prev_ch = etage.channels();
                 let prev_needs_resample = etage.needs_resample;
                 let next_needs_resample = output_sr != new_sr;
                 let convolver_format_changed = new_sr != prev_sr || new_ch != prev_ch;
@@ -8412,20 +8519,16 @@ impl OutputTarget for LocalOutput {
                 // Update source format variables for the new track.
                 // Le format source vit dans `etage` : c'est lui, et lui seul,
                 // que la boucle producteur consulte pour décoder et convertir.
-                etage.sample_rate = new_sr;
-                etage.channels = new_ch;
-                etage.bit_depth = new_bd;
-                let new_bps = if new_bd == 0 {
-                    4
-                } else {
-                    (new_bd / 8) as usize
-                };
-                etage.frame_bytes = new_ch as usize * new_bps;
-                etage.needs_channel_adapt = output_ch != new_ch;
+                // R5 : UNE affectation là où il y en avait SIX. Les trois
+                // étiquettes ne se posent plus qu'ensemble, les octets par
+                // trame en découlent, et l'adaptation de canaux se déduit de la
+                // comparaison avec le format ouvert. Il n'y a plus de
+                // quatrième ligne à oublier.
+                etage.spec = nouvelle_spec;
                 etage.needs_resample = next_needs_resample;
                 etage.pcm_kind = LocalPcmKind::for_bit_depth(new_bd);
-                let sample_rate = etage.sample_rate;
-                let channels = etage.channels;
+                let sample_rate = etage.sample_rate();
+                let channels = etage.channels();
                 current_format.store(
                     LocalOutput::pack_format(sample_rate, channels),
                     Ordering::Relaxed,
@@ -8662,7 +8765,7 @@ impl OutputTarget for LocalOutput {
                     &crossfeed,
                     &pure_bypass,
                     &mono_downmix,
-                    etage.channels,
+                    etage.channels(),
                     dop_active.load(Ordering::Relaxed),
                 );
                 // La queue est d'abord un bloc normal : elle traverse la MÊME

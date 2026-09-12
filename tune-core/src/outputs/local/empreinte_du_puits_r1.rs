@@ -19,7 +19,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use super::{EtageDeConversion, LocalPcmKind, LocalPcmProcessor, PousseeVersLePuits};
-use crate::outputs::traits::{CaptureOutput, FormatOuvert};
+use crate::outputs::traits::{AudioSpec, CaptureOutput, FormatOuvert};
 
 /// Le puits qui n'écrit nulle part et **hache** ce qu'il reçoit.
 ///
@@ -91,6 +91,17 @@ impl DspAuRepos {
 /// `pub(super)` depuis T8 (#2218) : `capture_bout_en_bout_2218.rs` monte la
 /// même chaîne, et deux constructeurs d'étage dans le même module seraient
 /// deux endroits où l'ordre des conversions pourrait diverger.
+///
+/// R5 (#2219) n'a touché que le CORPS : la signature — les sept mêmes
+/// arguments, dans le même ordre — est inchangée, et aucun des témoins de ce
+/// fichier ni de `capture_bout_en_bout_2218.rs` n'a bougé d'un caractère. Les
+/// quatre relevés tombent donc sur la chaîne typée sans être retouchés, ce qui
+/// est la seule preuve qui vaille que le rendu n'a pas changé.
+///
+/// Les octets par trame ne sont plus calculés ici : [`AudioSpec`] les déduit de
+/// la profondeur et des canaux. Cette fonction en tenait sa propre copie —
+/// `bytes_per_sample`, le même `if bit_depth == 0 { 4 }` qu'ailleurs — et
+/// c'était un troisième endroit où la même conséquence pouvait diverger.
 pub(super) fn etage<'a>(
     dsp: &'a DspAuRepos,
     octets: Vec<u8>,
@@ -100,24 +111,16 @@ pub(super) fn etage<'a>(
     output_sr: u32,
     output_ch: u16,
 ) -> EtageDeConversion<'a> {
-    let bytes_per_sample = if bit_depth == 0 {
-        4
-    } else {
-        (bit_depth / 8) as usize
-    };
     EtageDeConversion {
         pcm: dsp.processeur(),
         en_attente: octets,
         resampler: None,
         resample_leftover: Vec::new(),
         pcm_kind: LocalPcmKind::for_bit_depth(bit_depth),
-        sample_rate,
-        channels,
-        bit_depth,
-        frame_bytes: channels as usize * bytes_per_sample,
-        output_ch,
+        spec: AudioSpec::depuis_entete(sample_rate, bit_depth, channels)
+            .expect("format source hors du jeu fermé (0, 16, 24, 32 bits) ou sans canal"),
+        sortie: FormatOuvert::new(output_sr, output_ch),
         needs_resample: output_sr != sample_rate,
-        needs_channel_adapt: output_ch != channels,
     }
 }
 

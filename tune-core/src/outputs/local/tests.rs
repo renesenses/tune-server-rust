@@ -1,5 +1,18 @@
 use super::*;
 
+/// Le format source de ces témoins, monté comme `play_url` le monte.
+///
+/// R5 (#2219) : `process_pcm_chunk` ne prend plus `(frame_bytes, bit_depth,
+/// channels)` nus mais un [`AudioSpec`], qui déduit lui-même les octets par
+/// trame. Les six appels d'ici passaient ce quatrième nombre à la main — et le
+/// compilateur les a tous réclamés d'un coup, ce qu'aucun témoin n'aurait su
+/// faire. La cadence n'entre dans aucun de ces calculs ; 44,1 kHz est le format
+/// de leurs fixtures.
+fn spec_de_test(bits_declares: u16, canaux: u16) -> AudioSpec {
+    AudioSpec::depuis_entete(44_100, bits_declares, canaux)
+        .expect("format de fixture dans le jeu fermé")
+}
+
 // -----------------------------------------------------------------------
 // Fin de piste sur le chemin cpal partagé (#1919, Alain — #2047)
 //
@@ -2894,7 +2907,11 @@ fn local_pcm_processing_is_identical_across_the_header_boundary() {
     let mut baseline_staged = bytes.clone();
     let mut baseline_kind = LocalPcmKind::for_bit_depth(16);
     let baseline = baseline_processor
-        .process_pcm_chunk(&mut baseline_staged, 4, 16, 2, &mut baseline_kind)
+        .process_pcm_chunk(
+            &mut baseline_staged,
+            spec_de_test(16, 2),
+            &mut baseline_kind,
+        )
         .expect("chunk de référence");
     assert!(baseline_staged.is_empty());
 
@@ -2922,11 +2939,11 @@ fn local_pcm_processing_is_identical_across_the_header_boundary() {
     let mut split_staged = bytes[..header_bytes].to_vec();
     let mut split_kind = LocalPcmKind::for_bit_depth(16);
     let first = split_processor
-        .process_pcm_chunk(&mut split_staged, 4, 16, 2, &mut split_kind)
+        .process_pcm_chunk(&mut split_staged, spec_de_test(16, 2), &mut split_kind)
         .expect("bloc PCM de l'en-tête");
     split_staged.extend_from_slice(&bytes[header_bytes..]);
     let second = split_processor
-        .process_pcm_chunk(&mut split_staged, 4, 16, 2, &mut split_kind)
+        .process_pcm_chunk(&mut split_staged, spec_de_test(16, 2), &mut split_kind)
         .expect("bloc PCM suivant");
 
     let mut split_output = first.samples;
@@ -2966,7 +2983,7 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
     let mut staged = fixture[..first_31_frames].to_vec();
     let mut kind = LocalPcmKind::for_bit_depth(24);
 
-    let pending = processor.process_pcm_chunk(&mut staged, 6, 24, 2, &mut kind);
+    let pending = processor.process_pcm_chunk(&mut staged, spec_de_test(24, 2), &mut kind);
     assert!(pending.is_none());
     assert_eq!(staged.len(), first_31_frames);
     assert_eq!(ring.available(), 0);
@@ -2974,7 +2991,7 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
 
     staged.extend_from_slice(&fixture[first_31_frames..]);
     let prepared = processor
-        .process_pcm_chunk(&mut staged, 6, 24, 2, &mut kind)
+        .process_pcm_chunk(&mut staged, spec_de_test(24, 2), &mut kind)
         .expect("sonde DoP devenue concluante");
     assert!(prepared.dop);
     assert_eq!(kind, LocalPcmKind::Dop);
@@ -2990,7 +3007,7 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
     let continuation = real_dop_bytes(4, 2);
     staged.extend_from_slice(&continuation);
     let continued = processor
-        .process_pcm_chunk(&mut staged, 6, 24, 2, &mut kind)
+        .process_pcm_chunk(&mut staged, spec_de_test(24, 2), &mut kind)
         .expect("classification DoP verrouillée pour la piste");
     assert!(continued.dop);
     assert_eq!(continued.samples, pcm_bytes_to_f32(&continuation, 24));
