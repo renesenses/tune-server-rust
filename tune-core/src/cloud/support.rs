@@ -142,10 +142,39 @@ pub async fn create_ticket_multipart(
     files: Vec<AttachmentUpload>,
     base_url: Option<&str>,
 ) -> SupportResult {
-    let mut form = reqwest::multipart::Form::new()
-        .text("tune_version", crate::version())
-        .text("platform", std::env::consts::OS);
+    // La version de Tune et l'OS d'abord : ce sont eux qui alimentent la
+    // signature `*Signalé depuis Tune (…)*` du miroir forum.
+    let form = multipart_form(
+        reqwest::multipart::Form::new()
+            .text("tune_version", crate::version())
+            .text("platform", std::env::consts::OS),
+        fields,
+        files,
+    )?;
 
+    let resp = auth
+        .apply(http_client.post(tickets_url(base_url)))
+        .multipart(form)
+        .timeout(TIMEOUT)
+        .send()
+        .await
+        .map_err(request_error)?;
+
+    parse(resp).await
+}
+
+/// Complète un formulaire sortant : les champs texte tels quels, puis chaque
+/// fichier sous `attachments[]` — le nom qu'attend la règle Laravel
+/// `attachments.*`, à l'ouverture d'un ticket comme sur une réponse.
+///
+/// Partagé par [`create_ticket_multipart`] et [`reply_multipart`] : les deux
+/// chemins doivent poser les pièces sous le MÊME nom, sans quoi mozaiklabs
+/// accepte la requête et jette silencieusement les fichiers.
+fn multipart_form(
+    mut form: reqwest::multipart::Form,
+    fields: Vec<(String, String)>,
+    files: Vec<AttachmentUpload>,
+) -> Result<reqwest::multipart::Form, (u16, Value)> {
     for (name, value) in fields {
         form = form.text(name, value);
     }
@@ -160,19 +189,10 @@ pub async fn create_ticket_multipart(
                     json!({ "error": "attachment_invalid_mime", "detail": e.to_string() }),
                 )
             })?;
-        // mozaiklabs attend `attachments[]` (règle Laravel `attachments.*`).
         form = form.part("attachments[]", part);
     }
 
-    let resp = auth
-        .apply(http_client.post(tickets_url(base_url)))
-        .multipart(form)
-        .timeout(TIMEOUT)
-        .send()
-        .await
-        .map_err(request_error)?;
-
-    parse(resp).await
+    Ok(form)
 }
 
 /// Liste les tickets du compte premium.
@@ -219,6 +239,40 @@ pub async fn reply(
     let resp = auth
         .apply(http_client.post(reply_url(base_url, id)))
         .json(&json!({ "body": body }))
+        .timeout(TIMEOUT)
+        .send()
+        .await
+        .map_err(request_error)?;
+
+    parse(resp).await
+}
+
+/// Ajoute une réponse client AVEC pièces jointes : relaie un
+/// `multipart/form-data` vers `…/{id}/reply`.
+///
+/// mozaiklabs les attend depuis toujours sur ce chemin —
+/// `ReplySupportTicketRequest` valide `attachments[]` (5 fichiers, 50 Mo, mêmes
+/// extensions qu'à la création) et `AddSupportMessage` les range avec le
+/// message. C'est le relais Tune qui ne savait pas les émettre : le PREMIER
+/// message d'un testeur pouvait porter son journal, le DEUXIÈME ne pouvait
+/// rien porter du tout (#3871).
+///
+/// Ni `tune_version` ni `platform` ne sont injectés ici, à la différence de
+/// [`create_ticket_multipart`] : la requête de réponse ne les valide pas, et
+/// le ticket les porte déjà depuis son ouverture.
+pub async fn reply_multipart(
+    http_client: &reqwest::Client,
+    auth: &SupportAuth,
+    id: i64,
+    fields: Vec<(String, String)>,
+    files: Vec<AttachmentUpload>,
+    base_url: Option<&str>,
+) -> SupportResult {
+    let form = multipart_form(reqwest::multipart::Form::new(), fields, files)?;
+
+    let resp = auth
+        .apply(http_client.post(reply_url(base_url, id)))
+        .multipart(form)
         .timeout(TIMEOUT)
         .send()
         .await

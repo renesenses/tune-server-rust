@@ -243,9 +243,10 @@ fn multipart_ct() -> String {
 /// **Le fait de base.** Le deuxième message du testeur part avec sa pièce
 /// jointe, à l'adresse `…/{id}/reply`, sous le nom que Laravel attend.
 ///
-/// Avant : `reply` n'acceptait que du JSON. Un multipart était rejeté par
-/// l'extracteur, le nuage ne voyait **aucun appel**, et le testeur n'avait
-/// aucun moyen de joindre quoi que ce soit à une réponse — pas même au ticket.
+/// Avant : `reply` n'acceptait que du JSON. Le multipart repartait en **415
+/// Unsupported Media Type**, posé par l'extracteur `Json<ReplyBody>` ; le nuage
+/// ne voyait **aucun appel**, et le testeur n'avait aucun moyen de joindre quoi
+/// que ce soit à une réponse — pas même au ticket que le SAV lit.
 #[tokio::test]
 async fn une_reponse_peut_porter_le_fichier_du_testeur() {
     let (base, journal, _tache) = nuage_simule().await;
@@ -342,10 +343,15 @@ async fn la_reponse_json_historique_traverse_toujours() {
     assert_eq!(recu["body"], CORPS_REPONSE);
 }
 
-/// **Témoin** — vert avant comme après. Sans clé de licence ni jeton, la
-/// réponse est refusée par 412 **avant toute sortie réseau**. Sans lui, les
-/// épreuves ci-dessus pourraient passer sur un montage qui appelle le nuage à
-/// tort et à travers.
+/// **Témoin d'auth.** Sans clé de licence ni jeton, la réponse est refusée par
+/// 412 **avant toute sortie réseau** : sans lui, les épreuves ci-dessus
+/// pourraient passer sur un montage qui appelle le nuage à tort et à travers.
+///
+/// Rouge avant le correctif, mais pour une AUTRE raison, et c'est elle qui
+/// nomme le défaut : le relais rendait **415 Unsupported Media Type**.
+/// L'extracteur `Json<ReplyBody>` refusait le multipart avant même que le garde
+/// d'auth ne soit consulté — la requête n'atteignait jamais le corps du
+/// gestionnaire.
 #[tokio::test]
 async fn sans_identifiants_aucune_reponse_ne_sort() {
     let (base, journal, _tache) = nuage_simule().await;
@@ -368,6 +374,9 @@ async fn sans_identifiants_aucune_reponse_ne_sort() {
 /// **avant** que le moindre octet ne parte — même liste, même refus qu'à la
 /// création. Sans ce témoin, un relais qui laisserait tout passer rendrait
 /// l'épreuve principale verte sans rien garder.
+///
+/// Rouge avant, en 415 comme les autres : le filtre n'existait pas sur ce
+/// chemin, faute de chemin.
 #[tokio::test]
 async fn une_piece_interdite_ne_quitte_pas_la_machine() {
     let (base, journal, _tache) = nuage_simule().await;
@@ -388,7 +397,7 @@ async fn une_piece_interdite_ne_quitte_pas_la_machine() {
 
 /// **Contre-épreuve du corps vide.** Une réponse sans texte est refusée ici :
 /// `ReplySupportTicketRequest` la rejetterait en 422, et un aller-retour réseau
-/// pour apprendre une règle qu'on connaît ne sert personne.
+/// pour apprendre une règle qu'on connaît ne sert personne. Rouge avant, en 415.
 #[tokio::test]
 async fn une_reponse_sans_texte_est_refusee_avant_le_reseau() {
     let (base, journal, _tache) = nuage_simule().await;
