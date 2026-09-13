@@ -2131,13 +2131,38 @@ impl StreamingService for QobuzService {
         Ok(tracks)
     }
 
+    /// La fiche d'un artiste Qobuz — SANS `extra`.
+    ///
+    /// 🔴 Cet appel demandait `extra=biography`, et Qobuz le REFUSE. Toute
+    /// fiche artiste Qobuz rendait donc 400 côté service, converti en 502 pour
+    /// le client — pour tout artiste, sans intermittence. Mesuré sur la .18 le
+    /// 13/09/2026 :
+    ///
+    /// ```text
+    /// GET /api/v1/streaming/qobuz/artists/610403        → 502
+    ///     qobuz /artist/get: 400 {"status":"error","code":400,
+    ///       "message":"Invalid argument: extra (accepted values are albums,
+    ///        tracks, playlists, tracks_appears_on, albums_with_last_release,
+    ///        focus, focusAll)"}
+    /// GET /api/v1/streaming/qobuz/artists/610403/albums → 200
+    /// ```
+    ///
+    /// `extra` joint des LISTES liées — albums, pistes, playlists. La
+    /// biographie, elle, est un champ de l'objet artiste : c'est ainsi que
+    /// `map_artist` la lit (`item["biography"]["content"]`), et elle arrive
+    /// sans qu'on la demande.
+    ///
+    /// Le même piège avait déjà été rencontré ici sur `extra=similarArtists`
+    /// (voir `get_artist_top_tracks`), dont le 400 énumérait lui-même les
+    /// valeurs acceptées. `biography`, juste à côté, était passée à travers.
+    ///
+    /// Ce que cet échec coûtait, au-delà du bandeau rouge : la biographie
+    /// était perdue, et surtout la reprise de cette bio dans l'artiste local
+    /// (`tune-streaming-http`, « persist a streaming editorial bio into a
+    /// name-matched local artist ») est gardée par `if let Ok(…)` — elle n'a
+    /// donc JAMAIS tourné.
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
-        let data = self
-            .api_get(
-                "/artist/get",
-                &[("artist_id", artist_id), ("extra", "biography")],
-            )
-            .await?;
+        let data = self.api_get("/artist/get", &[("artist_id", artist_id)]).await?;
         Ok(Self::map_artist(&data))
     }
 
