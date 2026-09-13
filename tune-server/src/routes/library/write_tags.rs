@@ -79,6 +79,25 @@ pub(crate) async fn write_tags_to_files(
 
     tokio::spawn(async move {
         let _garde_tache = garde_tache; // libère la tâche à la fin de ce futur
+        // ⛔ `file_path IS NOT NULL` RESTE dans les TROIS sélections ci-dessous.
+        // Ne pas retomber sur `cue_media_path`.
+        //
+        // Cette passe ÉCRIT DANS LES FICHIERS DE L'UTILISATEUR : titre,
+        // interprète, album, numéro de piste, genre, compositeur, année,
+        // commentaire. Les quinze pistes d'une feuille CUE partagent UNE image.
+        // Les faire entrer ici produirait quinze écritures successives sur le
+        // même fichier : quatorze écrasements, et l'image finirait étiquetée
+        // avec les valeurs de la dernière tranche traitée. Le rangement même
+        // que l'utilisateur a choisi — un disque, une image, une feuille —
+        // serait détruit par la passe censée le mettre au propre.
+        //
+        // Ce n'est pas un oubli de portée : c'est le refus nº1. La réponse
+        // sensée serait de réécrire la FEUILLE `.cue`, pas l'image, et c'est
+        // un chantier avec sa propre garde sur de vrais fichiers.
+        //
+        // Même refus, même raison : `tune_core::metadata::batch::batch_write_tags_list`
+        // et `library::lyrics_pass.rs:1023` (#3998).
+        //
         // Build the SQL query based on whether specific track IDs were given
         let track_rows = if let Some(ref ids) = track_ids {
             if ids.is_empty() {
