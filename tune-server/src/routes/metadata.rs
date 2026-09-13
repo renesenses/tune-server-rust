@@ -204,15 +204,36 @@ fn extract_year_from_path(path: &str) -> Option<u32> {
     best
 }
 
+/// La requête de [`albums_missing_year`], sortie pour être EXÉCUTABLE par un
+/// témoin sans construire un `AppState`.
+///
+/// 🔴 `A_UN_FICHIER`, pas `t.file_path IS NOT NULL`. Une piste de feuille CUE
+/// porte `file_path = NULL` par construction : un album entièrement issu d'une
+/// image — un repiquage de vinyle, un concert — ne pouvait JAMAIS voir son
+/// année remplie depuis les balises, même quand l'image en porte une.
+///
+/// Pourquoi l'élargir ne risque rien, alors que la passe OUVRE le fichier :
+/// ce qu'elle en lit est l'année, et ce qu'elle écrit est `albums.year` —
+/// **une valeur d'ALBUM**. Un album, une image : les quinze tranches donnent
+/// le même chemin, `MIN(...)` en retient un, et la valeur obtenue est celle de
+/// l'album entier. Aucune identité ne conflue, contrairement à une valeur PAR
+/// PISTE (cf. `read_extended_metadata` dans `routes/system/enrich.rs`).
+/// Rien n'est décodé — `try_read_metadata` lit les balises — et rien n'est
+/// écrit dans le fichier.
+fn sql_albums_missing_year() -> String {
+    let chemin = tune_core::db::track_repo::sql::CHEMIN_OUVRABLE;
+    let a_un_fichier = tune_core::db::track_repo::sql::A_UN_FICHIER;
+    format!(
+        "SELECT al.id, MIN({chemin}) FROM albums al \
+         JOIN tracks t ON t.album_id = al.id \
+         WHERE (al.year IS NULL OR al.year = 0) AND {a_un_fichier} \
+         GROUP BY al.id"
+    )
+}
+
 /// Albums with no year, each joined to one of its track file paths.
 fn albums_missing_year(state: &AppState) -> Result<Vec<(i64, String)>, String> {
-    let rows = state.backend.query_many(
-        "SELECT al.id, MIN(t.file_path) FROM albums al \
-         JOIN tracks t ON t.album_id = al.id \
-         WHERE (al.year IS NULL OR al.year = 0) AND t.file_path IS NOT NULL AND t.file_path <> '' \
-         GROUP BY al.id",
-        &[],
-    )?;
+    let rows = state.backend.query_many(&sql_albums_missing_year(), &[])?;
     Ok(rows
         .into_iter()
         .filter_map(|r| {
@@ -277,6 +298,21 @@ fn anomalie(track_id: i64, chemin: &str, motifs: Vec<&str>) -> serde_json::Value
 }
 
 /// Les pistes MP3 de la bibliotheque : (id, chemin, duree, taille).
+///
+/// ⛔ `file_path IS NOT NULL` RESTE, et ce n'est pas un oubli.
+///
+/// Une piste de feuille CUE porte `file_path = NULL` et son support dans
+/// `cue_media_path` ; retomber dessus la ferait entrer ici. Ce serait un
+/// défaut, pas un correctif : ce détecteur confronte `duration_ms` — la durée
+/// de la TRANCHE — à `file_size` — la taille du FICHIER. Sur une image
+/// découpée en quinze pistes, la taille est celle du disque entier et la durée
+/// celle d'un morceau : l'écart est de un à quinze, et le contrôle signalerait
+/// les quinze tranches comme rognées. Un rapport d'anomalies faux à 100 %.
+///
+/// Ce qu'il faudrait d'abord : que le contrôle raisonne sur la durée sondée du
+/// SEGMENT et sur la fraction de fichier qu'il occupe, pas sur `file_size` nue.
+/// Tant que ce n'est pas fait, la sélection étroite est ce qui protège
+/// l'écran Métadonnées.
 fn pistes_mp3(state: &AppState) -> Vec<(i64, String, Option<i64>, Option<i64>)> {
     state
         .backend
@@ -2641,18 +2677,38 @@ fn known_genres(state: &AppState) -> Vec<String> {
         .collect()
 }
 
+/// La requête de [`tracks_missing_genre`], sortie pour être EXÉCUTABLE par un
+/// témoin.
+///
+/// 🔴 `A_UN_FICHIER`, pas `file_path IS NOT NULL`. Les colonnes sont préfixées
+/// `t.` parce que le motif l'exige : `chemin_ouvrable!()` s'écrit sur une table
+/// aliasée `t`. Une piste de feuille CUE porte `file_path = NULL` : sans
+/// genre dans la feuille (`REM GENRE` absent), elle n'avait aucun moyen d'en
+/// recevoir un.
+///
+/// Pourquoi l'élargir ne risque rien : le consommateur
+/// [`reclassify_genres_by_path`] ne lit PAS le fichier. Il découpe le CHEMIN
+/// en segments et compare chaque segment aux genres déjà connus de la
+/// bibliothèque, puis écrit `UPDATE tracks SET genre` — en base seulement.
+/// Les quinze tranches d'une image partagent un chemin, donc un dossier, donc
+/// le même genre : c'est le résultat voulu, pas une confluence — elles sont
+/// bien dans le même dossier.
+fn sql_tracks_missing_genre() -> String {
+    let chemin = tune_core::db::track_repo::sql::CHEMIN_OUVRABLE;
+    let a_un_fichier = tune_core::db::track_repo::sql::A_UN_FICHIER;
+    format!(
+        "SELECT t.id, t.title, {chemin} FROM tracks t \
+         WHERE (t.genre IS NULL OR t.genre = '') AND {a_un_fichier}"
+    )
+}
+
 /// Les pistes sans genre, avec leur chemin — ce sont les seules concernées.
 /// Écraser un genre existant d'après un nom de dossier serait une perte
 /// d'information : le tag est une donnée, le dossier une commodité.
 fn tracks_missing_genre(state: &AppState) -> Vec<(i64, String, String)> {
     state
         .backend
-        .query_many(
-            "SELECT id, title, file_path FROM tracks \
-             WHERE (genre IS NULL OR genre = '') \
-               AND file_path IS NOT NULL AND file_path <> ''",
-            &[],
-        )
+        .query_many(&sql_tracks_missing_genre(), &[])
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
@@ -2915,5 +2971,124 @@ mod langue_des_bios {
                 "«{langue}» doit garder l'anglais en repli universel"
             );
         }
+    }
+}
+
+/// Les pistes de feuille CUE dans les deux passes de l'écran Métadonnées qui
+/// les voient enfin : l'année d'album depuis les balises, et le genre depuis
+/// le chemin.
+///
+/// Les requêtes sont EXÉCUTÉES contre une vraie base. Un témoin qui se
+/// contenterait de chercher `cue_media_path` dans la chaîne SQL resterait vert
+/// contre une requête qui ne rend rien.
+#[cfg(test)]
+mod tests_pistes_cue {
+    use super::{sql_albums_missing_year, sql_tracks_missing_genre};
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+
+    /// Deux albums sans année ni genre : l'un ordinaire, l'autre entièrement
+    /// issu d'une image CUE (deux tranches).
+    ///
+    /// 🔴 `file_path` NUL sur les tranches — c'est ÇA le témoin. Une fixture
+    /// qui le renseignerait décrirait le cas qui marchait déjà.
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        backend
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (1, 'Keith Jarrett'); \
+                 INSERT INTO albums (id, title, artist_id, year) VALUES (1, 'Ordinaire', 1, NULL); \
+                 INSERT INTO albums (id, title, artist_id, year) VALUES (2, 'Live 1975', 1, NULL); \
+                 INSERT INTO tracks (id, title, album_id, artist_id, file_path, source) \
+                   VALUES (10, 'Ordinaire', 1, 1, '/music/Jazz/ord.flac', 'local'); \
+                 INSERT INTO tracks \
+                   (id, title, album_id, artist_id, file_path, source, cue_media_path, cue_start_ms) \
+                   VALUES (20, 'Part I', 2, 1, NULL, 'local', '/music/Jazz/Live 1975/image.flac', 0); \
+                 INSERT INTO tracks \
+                   (id, title, album_id, artist_id, file_path, source, cue_media_path, cue_start_ms) \
+                   VALUES (21, 'Part II', 2, 1, NULL, 'local', '/music/Jazz/Live 1975/image.flac', 1620000);",
+            )
+            .unwrap();
+        backend
+    }
+
+    /// 🔴 UN ALBUM DE FEUILLE CUE PEUT ENFIN RECEVOIR SON ANNÉE.
+    ///
+    /// Avec `t.file_path IS NOT NULL`, `GROUP BY al.id` ne rendait aucune
+    /// ligne pour l'album 2 : `fix-years-tags` n'avait pas de fichier à ouvrir
+    /// et l'album restait sans année pour toujours. La ligne rendue porte le
+    /// chemin de l'IMAGE — le fichier dont on lira la balise.
+    #[test]
+    fn un_album_cue_est_candidat_a_l_annee_par_les_balises() {
+        let backend = base();
+        let rows = backend
+            .query_many(&sql_albums_missing_year(), &[])
+            .expect("la requête doit s'exécuter");
+        let mut vus: Vec<(i64, String)> = rows
+            .iter()
+            .filter_map(|r| Some((r.first()?.as_i64()?, r.get(1).and_then(|v| v.as_string())?)))
+            .collect();
+        vus.sort();
+        assert_eq!(
+            vus,
+            vec![
+                (1, "/music/Jazz/ord.flac".to_string()),
+                (2, "/music/Jazz/Live 1975/image.flac".to_string()),
+            ],
+            "l'album CUE doit être candidat, avec le chemin de son IMAGE"
+        );
+    }
+
+    /// 🔴 LES TRANCHES CUE PEUVENT ENFIN RECEVOIR UN GENRE PAR LE CHEMIN.
+    ///
+    /// Le chemin rendu est celui de l'image : c'est le dossier qui porte le
+    /// nom de genre, et les deux tranches partagent le même — le résultat
+    /// voulu, elles sont bien dans le même dossier.
+    #[test]
+    fn les_tranches_cue_sont_candidates_au_genre_par_le_chemin() {
+        let backend = base();
+        let rows = backend
+            .query_many(&sql_tracks_missing_genre(), &[])
+            .expect("la requête doit s'exécuter");
+        let mut vus: Vec<(i64, String)> = rows
+            .iter()
+            .filter_map(|r| Some((r.first()?.as_i64()?, r.get(2).and_then(|v| v.as_string())?)))
+            .collect();
+        vus.sort();
+        assert_eq!(
+            vus,
+            vec![
+                (10, "/music/Jazz/ord.flac".to_string()),
+                (20, "/music/Jazz/Live 1975/image.flac".to_string()),
+                (21, "/music/Jazz/Live 1975/image.flac".to_string()),
+            ],
+            "les deux tranches, avec le chemin de leur image"
+        );
+    }
+
+    /// Le pendant : une piste qui a DÉJÀ un genre n'est pas candidate, image
+    /// CUE ou pas. Sans cette moitié, un prédicat qui laisserait tout passer
+    /// resterait vert au témoin ci-dessus.
+    #[test]
+    fn une_tranche_cue_deja_pourvue_n_est_pas_candidate() {
+        let backend = base();
+        backend
+            .execute_batch("UPDATE tracks SET genre = 'Jazz' WHERE id = 20;")
+            .unwrap();
+        let ids: Vec<i64> = backend
+            .query_many(&sql_tracks_missing_genre(), &[])
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        assert!(
+            !ids.contains(&20),
+            "la tranche déjà pourvue en genre n'est plus candidate ; vues : {ids:?}"
+        );
+        assert!(ids.contains(&21), "l'autre tranche l'est toujours");
     }
 }

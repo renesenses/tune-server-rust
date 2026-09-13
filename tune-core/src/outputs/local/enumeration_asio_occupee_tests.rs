@@ -54,7 +54,8 @@ fn les_autres_backends_sondent_meme_pilote_asio_occupe() {
 /// Même procédé que `chaque_sortie_de_select_host_enregistre_le_backend_ouvert`.
 #[test]
 fn list_audio_devices_with_backend_consulte_le_plan_avant_de_sonder() {
-    let source = include_str!("../local.rs");
+    // R6 (#2219) : l'énumération vit dans `local/parc.rs`.
+    let source = include_str!("parc.rs");
     let debut = source
         .find("pub fn list_audio_devices_with_backend(")
         .expect("list_audio_devices_with_backend introuvable");

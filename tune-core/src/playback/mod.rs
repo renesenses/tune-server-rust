@@ -277,6 +277,12 @@ pub struct ZoneState {
     /// Compteurs DSP observés par la sortie pendant la piste courante.
     #[serde(skip)]
     pub output_dsp_metrics: Option<crate::outputs::traits::OutputDspMetrics>,
+    /// Ce que la sortie a RÉELLEMENT fait au flux en cours (REF-6b, #2219) :
+    /// format entré, format ouvert, DSP. `None` tant que la sortie ne le
+    /// publie pas ; les routes gardent alors leur déduction depuis les
+    /// réglages. Interne au serveur, comme `output_signal_path`.
+    #[serde(skip)]
+    pub transformations_reelles: Option<crate::outputs::traits::TransformationsReelles>,
     /// Monotonically increasing counter bumped on each `play()` call.
     /// The poller uses this to detect track changes and reset its state
     /// (peak_position, gapless flags, etc.) so stale data from the
@@ -519,6 +525,7 @@ impl Default for ZoneState {
             dop_active: false,
             output_signal_path: None,
             output_dsp_metrics: None,
+            transformations_reelles: None,
             position_ms: 0,
             reculs_de_position: 0,
             pending_resume_ms: None,
@@ -876,6 +883,23 @@ impl PlaybackManager {
             .output_dsp_metrics = value;
     }
 
+    /// Reporte ce que la sortie déclare avoir RÉELLEMENT fait au flux
+    /// (REF-6b, #2219), même chemin que `set_output_signal_path`.
+    pub async fn set_transformations_reelles(
+        &self,
+        zone_id: i64,
+        value: Option<crate::outputs::traits::TransformationsReelles>,
+    ) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .transformations_reelles = value;
+    }
+
     /// Deux instantanés « en cours de lecture » désignent-ils la MÊME piste ?
     ///
     /// Conservateur par construction : la réponse n'est `false` que sur une
@@ -960,6 +984,7 @@ impl PlaybackManager {
         // annoncer « non observé » que réutiliser la promesse de la piste
         // précédente.
         state.output_signal_path = None;
+        state.transformations_reelles = None;
         state.paused_at = None;
         if !is_recent_seek {
             state.position_ms = 0;
@@ -1043,6 +1068,7 @@ impl PlaybackManager {
             state.resolving = false;
             state.state = PlayState::Stopped;
             state.output_signal_path = None;
+            state.transformations_reelles = None;
             state.paused_at = None;
             state.last_seek_at = None;
             state.derniere_avance_de_position = None;
@@ -1525,6 +1551,7 @@ mod tests {
             dop_active: false,
             output_signal_path: None,
             output_dsp_metrics: None,
+            transformations_reelles: None,
             now_playing: Some(NowPlaying {
                 track_id: Some(42),
                 title: "Song".into(),

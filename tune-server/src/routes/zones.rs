@@ -16,6 +16,7 @@ use tune_core::http::streamer::StreamInfo;
 use tune_core::outputs::dlna::DlnaOutput;
 use tune_core::outputs::traits::{
     OutputDspState, OutputSignalPathStatus, OutputSignalReason, OutputVolumeState,
+    TransformationsReelles,
 };
 use tune_core::playback::{PlayState, ZoneState};
 
@@ -1144,6 +1145,11 @@ mod aac_passthrough_tests;
 /// justement le genre qu'un nouveau champ ajouté par copier-coller ré-introduit.
 #[cfg(test)]
 mod patch_zone_error_guard;
+
+/// REF-4 phase 2 (#2219) — les familles de `persister_le_patch` qu'aucun test
+/// ne traversait par la route (réseau DLNA, UPnP), écrites AVANT la découpe.
+#[cfg(test)]
+mod persister_le_patch_tests;
 
 /// Garde-fou #2092 : les charges utiles d'une zone ne doivent plus diverger.
 ///

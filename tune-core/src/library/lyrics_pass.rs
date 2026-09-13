@@ -332,6 +332,25 @@ pub struct LocalIndexReport {
 /// de `.lrc` connu. Les paroles LRCLIB ne disqualifient pas : un `.lrc` posé
 /// par l'utilisateur prime sur ce qu'on avait téléchargé, et l'indicateur doit
 /// le dire.
+///
+/// 🔴 PISTES CUE : ÉCARTÉES À DESSEIN.
+///
+/// Une piste de feuille CUE porte `file_path = NULL` par construction, donc
+/// `t.file_path IS NOT NULL` l'exclut. Ce n'est PAS un oubli du même genre
+/// que la pochette ou l'empreinte acoustique, qui ont reçu leur repli sur
+/// `cue_media_path` : ici le repli casserait deux choses.
+///
+/// 1. Le `.lrc` voisin d'une image se nomme `image.lrc` : il n'y en a qu'UN
+///    pour tout le disque. L'inscrire pour chaque tranche afficherait les
+///    mêmes paroles sur les quinze pistes, horodatées sur l'image et donc
+///    décalées de `cue_start_ms` sur chacune.
+/// 2. `HAS_LRC` deviendrait vrai pour ces pistes, et [`ou_candidates`] —
+///    la passe LRCLIB, qui interroge par TITRE et ARTISTE et fonctionne DÉJÀ
+///    sur les pistes CUE — cesserait de leur chercher leurs vraies paroles.
+///
+/// Autrement dit : les pistes CUE ont bien des paroles aujourd'hui, par
+/// LRCLIB. Ce sont les paroles de FICHIER qui ne les concernent pas. Il
+/// faudrait d'abord savoir découper un `.lrc` d'image par tranche.
 fn local_index_candidates(
     db: &Arc<dyn DbBackend>,
     after_id: i64,
@@ -1005,6 +1024,15 @@ pub struct ExportCandidate {
 /// (`HAS_LRC`), en étiquette celles qui ont déjà une étiquette
 /// (`HAS_TAG`). Écrire l'un n'empêche donc jamais d'écrire l'autre plus
 /// tard.
+///
+/// 🔴 PISTES CUE : ÉCARTÉES À DESSEIN, et ici c'est la protection la plus
+/// nette du lot. Cette passe ÉCRIT dans les fichiers de l'utilisateur. Les
+/// quinze tranches d'une feuille CUE partagent UN fichier : en cible
+/// `Sidecar`, elles écriraient les unes par-dessus les autres dans le même
+/// `image.lrc` ; en cible `Tag`, la dernière traitée imposerait ses paroles à
+/// l'USLT de l'image, donc à tout le disque. Un repli sur `cue_media_path`
+/// ici abîmerait la bibliothèque. On n'écrit pas dans un fichier qu'on
+/// partage.
 pub fn export_candidates(
     db: &Arc<dyn DbBackend>,
     target: WriteTarget,

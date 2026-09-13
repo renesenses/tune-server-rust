@@ -247,6 +247,26 @@ pub(super) async fn enrich_bios(
 // POST /system/enrich-metadata — extended file metadata extraction
 // ---------------------------------------------------------------------------
 
+/// ⛔ `file_path IS NOT NULL` RESTE dans la sélection ci-dessous. Ne pas
+/// retomber sur `cue_media_path` — ni ici, ni dans le jumeau de
+/// `run_enrichment` plus bas, qui exécute la même passe.
+///
+/// La passe lit `metadata::read_extended_metadata(chemin)` et range le
+/// résultat dans `track_metadata`, **une ligne PAR PISTE**. Or ce que cette
+/// lecture rend est du PAR-PISTE : `isrc` (l'identifiant d'un enregistrement),
+/// `lyrics` (l'USLT), `composer`, `bpm`, `dr_track` avec sa provenance,
+/// `mood`, `comment`.
+///
+/// Les quinze tranches d'une image partagent un fichier. Les faire entrer ici
+/// donnerait aux quinze le MÊME ISRC — quinze enregistrements distincts sous
+/// un seul identifiant —, le même DR mesuré sur le disque entier, et les
+/// paroles de l'image sur chaque piste. C'est mot pour mot le refus que #3998
+/// a opposé à `lyrics_pass.rs:343`, et il vaut pour tout le magasin étendu.
+///
+/// Ce qu'il faudrait d'abord : trier ces clefs entre ce qui appartient au
+/// SUPPORT (encodeur, media, code-barres, `dr_album`) et ce qui appartient à
+/// la PISTE, puis n'écrire que les premières depuis une image. Tant que le tri
+/// n'existe pas, la sélection étroite est ce qui protège la base.
 pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> impl IntoResponse {
     let is_premium = match gate_enrichment(&state).await {
         Ok(p) => p,
@@ -650,6 +670,11 @@ pub(super) async fn enrichment_run(
     });
 
     // 4. Extended file metadata
+    //
+    // ⛔ `file_path IS NOT NULL` RESTE ici aussi : c'est la MÊME passe que
+    // `enrich_extended_metadata`, dont l'en-tête porte la raison mesurée
+    // (ISRC, paroles et DR sont du PAR-PISTE ; une image CUE est partagée par
+    // quinze pistes). Deux copies de la sélection, un seul refus.
     let ext_db = state.backend.clone();
     let scope_ext = scope.clone();
     let tache_metadonnees = tokio::spawn(async move {

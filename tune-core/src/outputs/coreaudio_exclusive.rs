@@ -38,6 +38,7 @@ use objc2_core_audio_types::{AudioStreamBasicDescription, kAudioFormatLinearPCM}
 use tracing::{info, warn};
 
 use super::local::RingBuf;
+use super::traits::RingStarvation;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -47,6 +48,15 @@ use super::local::RingBuf;
 ///
 /// Holds ownership of the hog mode claim, the AudioUnit, and enough state to
 /// restore the device's original sample rate on drop.
+///
+/// REF-8 (#2219, D2) : la sortie POSSÈDE son anneau flottant — il est créé
+/// dans [`ExclusiveOutput::new`], à la contenance de toujours (deux secondes
+/// à la cadence de la source), et le rappel de rendu en est le seul lecteur.
+/// Le producteur (`local/bras_coreaudio.rs`) l'atteint par [`ExclusiveOutput::ring`]
+/// pour y écrire, jamais pour le créer. Le démarrage du rendu est une étape
+/// SÉPARÉE, [`ExclusiveOutput::start`] : `new` réserve le périphérique et
+/// pose le rappel, `start` fait tourner l'AudioUnit — l'ordre des appels au
+/// HAL est celui d'avant, seule la frontière de fonction a bougé.
 pub struct ExclusiveOutput {
     device_id: u32,
     original_sample_rate: f64,
@@ -430,12 +440,18 @@ impl ExclusiveOutput {
     /// given sample rate / bit depth / channel count.
     ///
     /// `device_name` may be `"default"` to use the system default output.
+    ///
+    /// Ne DÉMARRE PAS le rendu : le rappel est posé sur l'AudioUnit, l'anneau
+    /// est créé et vide, et c'est [`ExclusiveOutput::start`] qui fait tourner
+    /// le tout. Avant REF-8 le `start` vivait ici, en dernière étape ; le
+    /// bras l'appelle maintenant juste après `new`, sans rien entre les deux,
+    /// et le HAL voit exactement la même suite d'appels.
     pub fn new(
         device_name: &str,
         sample_rate: u32,
         bit_depth: u32,
         channels: u32,
-        ring: Arc<RingBuf>,
+        starvation: Arc<RingStarvation>,
         volume: Arc<std::sync::atomic::AtomicU32>,
         paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
@@ -444,6 +460,14 @@ impl ExclusiveOutput {
             bit_depth,
             channels,
         };
+
+        // Ring buffer: ~2 seconds of audio at source sample rate.
+        // D2 (#2219) : l'anneau est à la sortie, plus au bras. Sa contenance
+        // n'a pas bougé — c'est elle qui fait le « figée à 2 s » de #3108.
+        let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
+        starvation.begin_stream(sample_rate, channels as u16);
+        let ring = Arc::new(RingBuf::new_metered(ring_cap, starvation));
+        ring.clear(); // Defensive: zero-fill before callback reads
         let mut hal = SystemCoreAudioHal;
         let prepared = prepare_exclusive_device(&mut hal, device_name, requested)?;
         let device_id = prepared.device_id;
@@ -539,19 +563,6 @@ impl ExclusiveOutput {
             return Err(format!("Failed to set render callback: {error}"));
         }
 
-        if let Err(error) = audio_unit.start() {
-            rollback_exclusive_setup(&mut hal, &prepared);
-            return Err(format!("Failed to start AudioUnit: {error}"));
-        }
-
-        info!(
-            device = %resolved_name,
-            sample_rate = prepared.format_info.sample_rate,
-            bit_depth = prepared.format_info.bit_depth,
-            channels = prepared.format_info.channels,
-            "coreaudio_exclusive_started"
-        );
-
         Ok(Self {
             device_id,
             original_sample_rate: prepared.original_sample_rate,
@@ -563,6 +574,32 @@ impl ExclusiveOutput {
             volume,
             paused,
         })
+    }
+
+    /// Démarre le rendu : l'AudioUnit commence à tirer dans l'anneau.
+    ///
+    /// C'était la dernière étape de `new`. Sur refus, l'AudioUnit jamais
+    /// démarré est lâché sans `stop`, et c'est `Drop` — c'est-à-dire
+    /// [`ExclusiveOutput::release`] — qui rend au périphérique son format, sa
+    /// cadence et son hog, comme `rollback_exclusive_setup` le faisait en
+    /// ligne. Le message d'erreur est celui d'avant, mot pour mot.
+    pub fn start(&mut self) -> Result<(), String> {
+        let Some(audio_unit) = self.audio_unit.as_mut() else {
+            return Err("Failed to start AudioUnit: AudioUnit already released".to_string());
+        };
+        if let Err(error) = audio_unit.start() {
+            self.audio_unit = None;
+            return Err(format!("Failed to start AudioUnit: {error}"));
+        }
+
+        info!(
+            device = %self.format_info.device_name,
+            sample_rate = self.format_info.sample_rate,
+            bit_depth = self.format_info.bit_depth,
+            channels = self.format_info.channels,
+            "coreaudio_exclusive_started"
+        );
+        Ok(())
     }
 
     /// Release exclusive mode and restore the device to its original state.

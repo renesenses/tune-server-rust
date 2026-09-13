@@ -10,8 +10,12 @@ fn corps_du_handler() -> String {
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/zones/ecriture.rs"))
             .expect("lecture de zones/ecriture.rs");
     // REF-4 phase 2 (#2219) : `patch_zone` se lit en quatre corps, dans
-    // l'ordre d'appel — l'hôte, puis valider, commander, persister. Les
-    // positions comparées ci-dessous gardent leur sens sur la concaténation.
+    // l'ordre d'appel — l'hôte, puis valider, commander, persister — et
+    // `persister_le_patch` en sept familles de clés, dans l'ordre des
+    // écritures. Les positions comparées ci-dessous gardent leur sens sur la
+    // concaténation. Sans les familles, le corps de `persister_le_patch` ne
+    // porte plus un seul `ecrire!(` et les trois derniers témoins sont rouges :
+    // la liste est la garde, pas un confort.
     let corps_de = |signature: &str| -> String {
         let debut = source.find(signature).unwrap_or_else(|| {
             panic!("`{signature}` a été renommé — ce garde-fou ne garde plus rien")
@@ -27,6 +31,13 @@ fn corps_du_handler() -> String {
         "fn valider_le_patch(",
         "async fn commander_la_sortie(",
         "async fn persister_le_patch(",
+        "fn persister_la_zone_et_sa_sortie(",
+        "async fn persister_le_volume_fixe(",
+        "fn persister_la_lecture(",
+        "async fn persister_le_reseau(",
+        "fn persister_la_marque_et_le_modele(",
+        "async fn persister_l_upnp(",
+        "async fn persister_le_son(",
     ]
     .into_iter()
     .map(corps_de)

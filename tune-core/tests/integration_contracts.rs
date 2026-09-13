@@ -5,6 +5,11 @@
 
 #[path = "alac_aiff_wav_empreintes_reference.rs"]
 mod alac_aiff_wav_empreintes_reference;
+// Garde de non-regression du decoupeur d'artistes contre un corpus REEL :
+// les 594 noms d'un Core Roon, que Roon a deja consolides. Contre-epreuve
+// faite : en neutralisant `is_allowlisted`, la garde du mode risque tombe.
+#[path = "artist_split_corpus_roon.rs"]
+mod artist_split_corpus_roon;
 #[path = "aucune_fuite_de_temporaires.rs"]
 mod aucune_fuite_de_temporaires;
 #[path = "audio_integration.rs"]

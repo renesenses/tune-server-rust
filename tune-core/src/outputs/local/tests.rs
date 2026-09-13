@@ -1439,11 +1439,16 @@ fn la_charge_utile_dit_si_les_cadences_ont_ete_mesurees() {
 /// source.
 #[test]
 fn l_indice_de_mesure_est_calcule_et_non_ecrit_en_dur() {
-    let source = include_str!("../local.rs");
+    // R6 (#2219) : le littéral `AudioDevice` de l'énumération vit dans
+    // `local/parc.rs`. REF-8 : la branche « ouvrir à la cadence source » vit
+    // dans `BackendCpal::ouvrir` (`local/backend.rs`) ; la garde lit `local.rs`
+    // ET `backend.rs`, concaténés, jamais l'un à la place de l'autre.
+    let source = [include_str!("../local.rs"), include_str!("backend.rs")].concat();
+    let parc = include_str!("parc.rs");
 
     let champ_derive = ["sample_rates_measured: ", "rates_evidence.is_measured(),"].concat();
     assert!(
-        source.contains(&champ_derive),
+        parc.contains(&champ_derive),
         "le seul site qui construit un AudioDevice de production doit \
          dériver `sample_rates_measured` de `sample_rate_evidence` ; écrit \
          en dur, il redit « mesuré » sur WASAPI (#2862)"
@@ -1751,7 +1756,10 @@ fn la_decision_de_cadence_est_branchee_sur_le_chemin_reel() {
     // Source normalisée : on retire tous les blancs, pour que la garde
     // survive à un passage de rustfmt qui recasserait les lignes — même
     // idiome que `les_quatre_charges_utiles_de_zone_appellent_le_contrat`.
-    let source: String = include_str!("../local.rs")
+    // REF-8 (#2219) : l'appel vit dans `BackendCpal::ouvrir` (`local/backend.rs`) ;
+    // on lit `local.rs` ET `backend.rs`, concaténés.
+    let source: String = [include_str!("../local.rs"), include_str!("backend.rs")]
+        .concat()
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
@@ -2406,7 +2414,8 @@ fn chaque_motif_de_repli_de_peripherique_est_cable() {
 /// `terminologie_eq.rs` et `position_publiee_guard`.
 #[test]
 fn find_device_with_fallback_passe_bien_l_hote_d_origine() {
-    let source = include_str!("../local.rs");
+    // R6 (#2219) : `find_device_with_fallback` vit dans `local/resolution.rs`.
+    let source = include_str!("resolution.rs");
     let debut = source
         .find("fn find_device_with_fallback(")
         .expect("find_device_with_fallback introuvable");
