@@ -406,6 +406,21 @@ fn dispositions_de(entrees: &[Value], device_id: &str) -> Vec<String> {
 
 // ---------------------------------------------------------------------------
 // #3322 — le parc local, et la quatrième surface
+//
+// Tout ce qui suit exige `local-audio`, et le dire est la moitié du sujet.
+// Le parc audio n'existe QUE derrière cette fonctionnalité :
+// `zones::canaux_des_peripheriques_locaux` rend `Vec::new()` sans elle, et le
+// handler de `GET /devices/audio` rend `devices: []`. Un binaire sans
+// `local-audio` — l'image Docker, exemption motivée — publie donc `[]`
+// partout, et c'est le comportement CORRECT : sans énumération, le serveur ne
+// sait rien des canaux de l'appareil.
+//
+// Ces témoins ne peuvent donc pas tourner dans le job `test` de la CI, qui
+// compile `--no-default-features --features oaat,cloud-relay,bandcamp`. Ils
+// tournent dans le jeu LIVRÉ : `cargo test --workspace` (les défauts de
+// `tune-server` portent `local-audio`) et le job `test-shipped-features`, qui
+// demande `ci:full`. Les témoins d'AU-DESSUS, eux, reçoivent le parc en
+// paramètre et restent couverts dans les deux jeux.
 // ---------------------------------------------------------------------------
 
 /// Le parc que TOUS les témoins de ce fichier posent.
@@ -417,6 +432,7 @@ fn dispositions_de(entrees: &[Value], device_id: &str) -> Vec<String> {
 /// Les deux entrées couvrent les deux moitiés de la règle : un appareil dont
 /// on connaît la capacité, et un appareil dont on ne la connaît pas
 /// (`max_channels == 0`), qui doit publier `[]` et jamais « mono ».
+#[cfg(feature = "local-audio")]
 fn amorcer_le_parc_temoin() {
     let appareil = |nom: &str, max_channels: u16| tune_core::outputs::local::AudioDevice {
         name: nom.to_string(),
@@ -436,6 +452,7 @@ fn amorcer_le_parc_temoin() {
 
 /// Les quatre dispositions d'un appareil 8 canaux, dans le vocabulaire du
 /// serveur — et rien d'autre : « 7 canaux » n'existe pas.
+#[cfg(feature = "local-audio")]
 fn huit_voies() -> Vec<String> {
     vec![
         "mono".to_string(),
@@ -455,6 +472,7 @@ fn huit_voies() -> Vec<String> {
 /// c'est-à-dire précisément la « plage libre 0–32 » que l'issue interdit.
 ///
 /// Témoin sur la route MONTÉE, avec un parc connu.
+#[cfg(feature = "local-audio")]
 #[tokio::test]
 async fn le_parc_local_publie_ses_dispositions_sur_devices_audio() {
     let banc = Banc::neuf();
@@ -502,6 +520,7 @@ async fn le_parc_local_publie_ses_dispositions_sur_devices_audio() {
 /// Ici la sortie ne déclare RIEN : tout ce que le client reçoit vient du parc,
 /// par le chemin de production `output_capabilities` →
 /// `canaux_des_peripheriques_locaux` → `cached_audio_devices`.
+#[cfg(feature = "local-audio")]
 #[tokio::test]
 async fn la_route_montee_zones_enrichit_une_sortie_locale() {
     let banc = Banc::neuf();
