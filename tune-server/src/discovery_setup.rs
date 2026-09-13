@@ -125,6 +125,41 @@ type RegistreServeursMultimedia = Arc<
     >,
 >;
 
+/// Verser une PREMIÈRE observation dans le registre durable (#2219, phase 1).
+///
+/// Erreur journalisée, jamais propagée : la découverte ne doit pas s'arrêter
+/// parce que la base est occupée. Un serveur absent de la table réapparaîtra à
+/// la prochaine synchronisation de la route.
+fn enregistrer_serveur_multimedia_en_base(
+    db: &Arc<dyn DbBackend>,
+    ms: &tune_core::discovery::ssdp::MediaServerInfo,
+) {
+    use tune_core::db::media_server_repo::{MediaServerRepo, ObservationServeurRecue};
+    let obs = ObservationServeurRecue {
+        udn: ms.id.clone(),
+        name: ms.name.clone(),
+        manufacturer: Some(ms.manufacturer.clone()).filter(|s| !s.is_empty()),
+        model: Some(ms.model.clone()).filter(|s| !s.is_empty()),
+        device_type: "upnp_media_server".into(),
+        location: ms.location.clone(),
+        content_directory_url: Some(ms.content_directory_url.clone()).filter(|s| !s.is_empty()),
+        host: Some(ms.host.clone()).filter(|s| !s.is_empty()),
+        port: Some(i64::from(ms.port)),
+        max_age_secs: None,
+    };
+    if let Err(e) = MediaServerRepo::with_backend(db.clone()).enregistrer_observation(&obs) {
+        warn!(id = %ms.id, error = %e, "media_server_registre_ecriture_echouee");
+    }
+}
+
+/// Marquer un serveur ABSENT en base, sans supprimer sa ligne.
+fn marquer_serveur_multimedia_absent(db: &Arc<dyn DbBackend>, udn: &str, raison: &str) {
+    use tune_core::db::media_server_repo::MediaServerRepo;
+    if let Err(e) = MediaServerRepo::with_backend(db.clone()).marquer_absent(udn, raison) {
+        warn!(id = %udn, error = %e, "media_server_registre_absence_non_ecrite");
+    }
+}
+
 /// Retirer un serveur multimédia du registre et prévenir les clients.
 ///
 /// C'est le SEUL retrait du registre `media_servers`, et il n'arrive que sur
@@ -139,9 +174,13 @@ type RegistreServeursMultimedia = Arc<
 /// - **aucune lecture en cours** n'en dépend — `play_media_server_item`
 ///   (`routes/network.rs`) répond `not_implemented` ; seuls `browse` et
 ///   `search` lisent le registre, et à la demande ;
-/// - **aucune ligne en base** — le registre est une carte en mémoire,
-///   reconstruite au démarrage par la découverte. Pas de table, pas de
-///   migration.
+/// - **la ligne en base SURVIT, et c'est voulu** — depuis #2219 phase 1 le
+///   registre est aussi une table (`media_servers`, migration SQLite 101 / PG
+///   058). Ce retrait-ci ne vide que la carte en mémoire ; l'appelant a
+///   d'abord marqué la ligne `absent` avec sa raison
+///   (`marquer_serveur_multimedia_absent`). Supprimer la ligne ferait perdre
+///   la date de PREMIÈRE observation, donc l'histoire du serveur — et
+///   contredirait la doctrine du fil forum 1425.
 ///
 /// Rend `true` si une entrée a effectivement été retirée.
 async fn retirer_serveur_multimedia(
@@ -411,10 +450,25 @@ pub fn spawn_ssdp_handler(
                         continue;
                     }
                     let id = ms.id.clone();
+                    // #2219 phase 1 — le registre DURABLE. Le serveur entre en
+                    // base a sa premiere apparition ; les reannonces suivantes
+                    // sont versees par `synchroniser_le_registre`
+                    // (`routes/network.rs`), parce que la couche SSDP les
+                    // traite EN PLACE sans emettre d'evenement
+                    // (`discovery/ssdp.rs:1367-1371`).
+                    enregistrer_serveur_multimedia_en_base(&db, &ms);
                     media_servers.lock().await.insert(id.clone(), ms);
                     info!(id = %id, "media_server_registered");
                 }
                 SsdpEvent::MediaServerLost(id) => {
+                    // La ligne en base n'est PAS supprimee : elle passe
+                    // `absent`, avec sa raison. C'est la doctrine du fil forum
+                    // 1425 — « marquer ceux qui ne repondent plus plutot que
+                    // de les retirer » — appliquee la ou elle manquait, et le
+                    // motif est un CONSTAT (byebye verifie par sonde unicast,
+                    // ou max-age ecoule puis sonde echouee), jamais une
+                    // deduction sur l'horloge.
+                    marquer_serveur_multimedia_absent(&db, &id, "disparition_confirmee");
                     retirer_serveur_multimedia(&media_servers, &event_bus, &id).await;
                 }
             }
